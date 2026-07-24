@@ -1,0 +1,51 @@
+# Local conformance environment: a NATS/JetStream cluster + the MQTT broker.
+# Bring up with:  docker compose -f test/conformance/docker-compose.yml up --build
+name: mqtt-nats-conformance
+
+services:
+  nats:
+    image: nats:latest
+    command: ["-c", "/etc/nats/nats.conf", "-sd", "/data"]
+    volumes:
+      - nats-data:/data
+      - ./nats.conf:/etc/nats/nats.conf:ro
+    ports:
+      - "4222:4222"
+    healthcheck:
+      test: ["CMD", "nats-server", "--help"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  broker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      - nats
+    environment:
+      # Service connection (JetStream assets) uses the full-rights "service" user.
+      # Keep the URL credential-less: DialClient reuses MQTTNB_NATS_URLS for every
+      # per-client auth-passthrough dial, and a URL-embedded userinfo would win
+      # over the per-client UserInfo (nats.go connectProto), so all clients would
+      # inherit the service rights. Service creds go via MQTTNB_NATS_USER/PASS.
+      MQTTNB_NATS_URLS: "nats://nats:4222"
+      MQTTNB_NATS_USER: "service"
+      MQTTNB_NATS_PASS: "service"
+      MQTTNB_HOST: "0.0.0.0"
+      MQTTNB_PORT: "1883"
+      MQTTNB_LOG_LEVEL: "info"
+      # Auth passthrough so NATS enforces per-client permissions. Anonymous MQTT
+      # clients (the Paho suite connects without credentials) dial as the "mqtt"
+      # user, which is denied subscribe on test/nosubscribe (test_subscribe_failure).
+      MQTTNB_AUTH_PASSTHROUGH: "true"
+      MQTTNB_DEFAULT_USER: "mqtt"
+      MQTTNB_DEFAULT_PASS: "mqtt"
+      # Server Keep Alive cap the Paho test_server_keep_alive expects (== 60).
+      MQTTNB_KEEPALIVE_MAX: "60"
+    ports:
+      - "1883:1883"
+      - "8080:8080"
+
+volumes:
+  nats-data:

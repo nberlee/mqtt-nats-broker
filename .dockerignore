@@ -1,0 +1,8 @@
+.git
+.github
+dist
+docs
+test/conformance
+*.md
+!go.mod
+!go.sum

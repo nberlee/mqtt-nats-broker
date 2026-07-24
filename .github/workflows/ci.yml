@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: build (default tree)
+        run: go build ./...
+      - name: test
+        run: go test -race -count=1 ./...
+
+  fulltests:
+    name: test (upstream suite)
+    runs-on: ubuntu-latest
+    # Ported upstream nats-server MQTT regression suite, run against the
+    # standalone broker via an embedded nats-server test harness
+    # (fulltests_harness_test.go). Split from build-test since it's a large,
+    # separate suite; see docs/PORTING.md ("Testing strategy").
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: go vet
+        run: go vet -tags mqttport_fulltests ./...
+      - name: test
+        run: go test -tags mqttport_fulltests -race -count=1 ./internal/mqtt/
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  docker:
+    name: docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: build multi-arch (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+
+  conformance:
+    name: MQTT conformance (vibesrc/mqttconformance)
+    runs-on: ubuntu-latest
+    # Baseline is 0 failures (124/124 v3.1.1, 106/106 v5); run.sh gates on
+    # regressions vs test/conformance/baseline/conformance-v{3,5}.txt.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26', cache: true }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: start NATS with JetStream
+        run: docker run -d --name nats -p 4222:4222 nats:latest -js
+      - name: build broker
+        run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
+      - name: build mqtt-conformance
+        run: |
+          git clone --depth 1 https://github.com/vibesrc/mqttconformance /tmp/mc
+          (cd /tmp/mc && cargo build --release)
+          echo "/tmp/mc/target/release" >> "$GITHUB_PATH"
+      - name: run broker
+        run: |
+          ./mqtt-nats-bridge -nats nats://127.0.0.1:4222 -port 1883 -auth-passthrough=false -log-level warn &
+          echo $! > broker.pid
+          for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
+      - name: run conformance suites
+        run: ./test/conformance/run.sh
+      - name: stop broker
+        if: always()
+        run: kill "$(cat broker.pid)" 2>/dev/null || true
+
+  paho:
+    name: MQTT conformance (Eclipse Paho interop)
+    runs-on: ubuntu-latest
+    # Runs the Paho MQTT 5.0 interoperability suite against an auth-passthrough
+    # broker backed by a NATS server whose "mqtt" user is denied subscribe on
+    # test/nosubscribe (test_subscribe_failure). run.sh gates on regressions vs
+    # test/conformance/baseline/paho.txt.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26', cache: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: start NATS with JetStream + deny ACL
+        run: |
+          docker run -d --name nats -p 4222:4222 \
+            -v "$PWD/test/conformance/nats.conf:/etc/nats/nats.conf:ro" \
+            nats:latest -c /etc/nats/nats.conf
+      - name: build broker
+        run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
+      - name: run broker (auth passthrough + deny)
+        run: |
+          ./mqtt-nats-bridge -nats nats://127.0.0.1:4222 \
+            -nats-user service -nats-pass service \
+            -port 1883 -auth-passthrough -default-user mqtt -default-pass mqtt \
+            -keepalive-max 60 -log-level warn &
+          echo $! > broker.pid
+          for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
+      - name: run Paho interoperability suite
+        run: SUITES=paho ./test/conformance/run.sh
+      - name: stop broker
+        if: always()
+        run: kill "$(cat broker.pid)" 2>/dev/null || true

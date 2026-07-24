@@ -1,0 +1,3 @@
+# Known-failure baseline for vibesrc/mqttconformance (v5).
+# One normative-requirement ID per line. CI fails on NEW failures; may only shrink.
+# Last full run: 0 failures (124/124 v3.1.1, 106/106 v5).

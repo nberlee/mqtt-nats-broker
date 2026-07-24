@@ -1,0 +1,2 @@
+# Known-failure baseline for the natstest suite.
+# One test/requirement ID per line. CI fails on NEW failures; this list may only shrink.

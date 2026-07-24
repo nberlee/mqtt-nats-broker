@@ -1,0 +1,75 @@
+# Contributing
+
+Thanks for helping build `mqtt-nats-bridge`.
+
+## Dev setup
+
+- Go **1.26+**.
+- A local NATS with JetStream for integration work:
+  ```sh
+  docker compose -f test/conformance/docker-compose.yml up nats
+  ```
+  Unit tests spin up an in-process JetStream server, so Docker is not required
+  for `go test`.
+
+## Build, test, lint
+
+```sh
+make test        # unit tests (default tree)
+make vet lint    # static analysis
+make build       # host binary
+```
+
+## Code layout
+
+```
+cmd/mqtt-nats-bridge   entrypoint: config, backend connect, health, shutdown
+internal/config        flags/env configuration
+internal/backend       NATS/JetStream service conn + per-client auth-passthrough dial
+internal/conn          (planned) TCP/TLS accept + per-connection read/write loop
+internal/mqtt          MQTT protocol core (ported from NATS-server; see below)
+test/conformance       compose env + conformance runner + baselines
+```
+
+## The ported MQTT core
+
+`internal/mqtt` is a port of NATS-server's `server/mqtt.go`. It builds and serves
+in the default tree; the behavioral shims that replace NATS-server's runtime live
+in `shim_*.go` and the vendored helpers in `compat_*.go`.
+
+- **Do not hand-edit** `mqtt.go` (the upstream port), `compat_*.go` (vendored
+  helpers), or the aliased wire types beyond what is needed — keep them diff-able
+  against upstream. These are excluded from lint for that reason.
+- The upstream regression/conformance suite (`mqtt_test.go`, `mqtt_v5_test.go`,
+  `mqtt_ex_*`) is retained behind the `mqttport_fulltests` tag until its NATS
+  test-server harness is ported:
+
+  ```sh
+  make full-suite   # go test -tags mqttport_fulltests ./internal/mqtt/
+  ```
+
+- The port mapping and remaining work are documented in
+  [docs/PORTING.md](docs/PORTING.md).
+
+### Syncing with upstream NATS
+
+The core mirrors nats-server. When NATS patches its MQTT 3.1.1 behavior, diff the
+relevant hunks from `github.com/nats-io/nats-server/v2/server/mqtt.go` against
+`internal/mqtt/mqtt.go` and forward-port. Record the upstream commit you synced
+to in the PR description.
+
+## Conformance
+
+CI gates on three suites via `test/conformance/run.sh`
+(`vibesrc/mqttconformance`, `nats-io/mqtt-test`, Eclipse Paho interop). Each suite
+has a **known-failures baseline** under `test/conformance/baseline/`.
+
+- CI fails only on **new** failures (regressions).
+- A PR may **only shrink** a baseline, never grow it. If you fix a conformance
+  test, remove its ID from the baseline in the same PR.
+
+## Commit / PR conventions
+
+- Keep the default tree green: `make vet test` must pass.
+- Conventional-commit style messages are appreciated (`feat:`, `fix:`, `docs:`…).
+- One logical change per PR.

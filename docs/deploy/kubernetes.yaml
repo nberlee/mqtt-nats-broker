@@ -1,0 +1,64 @@
+# Example Kubernetes deployment: N stateless MQTT frontends in front of an
+# external NATS/JetStream cluster. Adjust image tag, NATS URLs, and credentials.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqtt-nats-bridge
+  labels: { app: mqtt-nats-bridge }
+spec:
+  replicas: 3 # stateless — scale freely
+  selector:
+    matchLabels: { app: mqtt-nats-bridge }
+  template:
+    metadata:
+      labels: { app: mqtt-nats-bridge }
+    spec:
+      # Must exceed drain-delay + the broker's internal shutdownDrainTimeout (10s)
+      # with headroom, so a graceful drain completes before the kubelet SIGKILLs.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: bridge
+          image: ghcr.io/nberlee/mqtt-nats-bridge:latest
+          args: ["-nats", "nats://nats:4222"]
+          env:
+            - name: MQTTNB_LOG_LEVEL
+              value: "info"
+            # Grace period after SIGTERM before clients are disconnected. On
+            # shutdown /readyz flips to 503 immediately; this delay lets the
+            # Service/EndpointSlice deregister this pod (best-effort: it must
+            # exceed the readiness probe period plus propagation) before existing
+            # MQTT connections are drained. Set to 0 for single-instance deploys.
+            - name: MQTTNB_DRAIN_DELAY
+              value: "10s"
+            # For auth passthrough with a service account creds file, mount it
+            # and set MQTTNB_NATS_CREDS to the path.
+          ports:
+            - { name: mqtt, containerPort: 1883 }
+            - { name: health, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            # Short period so a drain (readiness -> 503) is observed quickly and
+            # the endpoint is removed within the drain-delay window.
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mqtt-nats-bridge
+spec:
+  # A TCP/L4 load balancer round-robins MQTT clients across frontends; sessions
+  # survive reconnects to any instance (state lives in JetStream).
+  type: LoadBalancer
+  selector: { app: mqtt-nats-bridge }
+  ports:
+    - { name: mqtt, port: 1883, targetPort: mqtt }

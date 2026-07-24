@@ -1,0 +1,14 @@
+# Known-failure baseline for the Eclipse Paho MQTT 5.0 interoperability suite.
+# One test method name per line. CI (test/conformance/run.sh) fails on NEW
+# failures; this list may only shrink. Each entry below is a deliberate,
+# documented divergence -- a spec-permitted choice, a suite timing assumption,
+# or an out-of-scope feature -- not a latent bug. See docs/CONFORMANCE.md.
+
+# Spec-permitted delivery choice. The suite requires a message matching several
+# overlapping subscriptions on ONE client to arrive as a SINGLE PUBLISH carrying
+# every matching Subscription Identifier. The broker instead delivers one PUBLISH
+# per matching subscription, each with its own identifier -- explicitly allowed
+# by MQTT 5.0 [3.8.4] and the behavior of EMQX, Mosquitto 2.1+, and NATS.
+# Deduplicating overlapping deliveries across independent JetStream consumers is
+# a substantial, race-prone change we deliberately do not make.
+test_subscribe_identifiers

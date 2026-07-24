@@ -1,0 +1,11533 @@
+// Copyright 2020-2026 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package mqtt
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats-server/v2/server/gsl"
+	"github.com/nats-io/nats-server/v2/server/stree"
+	"github.com/nats-io/nuid"
+)
+
+// References to "spec" here is from https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.pdf
+
+const (
+	mqttPacketConnect    = byte(0x10)
+	mqttPacketConnectAck = byte(0x20)
+	mqttPacketPub        = byte(0x30)
+	mqttPacketPubAck     = byte(0x40)
+	mqttPacketPubRec     = byte(0x50)
+	mqttPacketPubRel     = byte(0x60)
+	mqttPacketPubComp    = byte(0x70)
+	mqttPacketSub        = byte(0x80)
+	mqttPacketSubAck     = byte(0x90)
+	mqttPacketUnsub      = byte(0xa0)
+	mqttPacketUnsubAck   = byte(0xb0)
+	mqttPacketPing       = byte(0xc0)
+	mqttPacketPingResp   = byte(0xd0)
+	mqttPacketDisconnect = byte(0xe0)
+	mqttPacketAuth       = byte(0xf0) // MQTT 5.0 only
+	mqttPacketMask       = byte(0xf0)
+	mqttPacketFlagMask   = byte(0x0f)
+
+	// Protocol levels. 0x4 is MQTT 3.1.1, 0x5 is MQTT 5.0.
+	mqttProtoLevel  = byte(0x4)
+	mqttProtoLevel5 = byte(0x5)
+
+	// mqttSessionNeverExpire is the MQTT 5.0 Session Expiry Interval value that
+	// means the session never expires. It is also the effective value we map a
+	// persistent (non-clean) 3.1.1 session to. Spec5 [3.1.2.11.2].
+	mqttSessionNeverExpire = uint32(0xFFFFFFFF)
+
+	// Connect flags
+	mqttConnFlagReserved     = byte(0x1)
+	mqttConnFlagCleanSession = byte(0x2)
+	mqttConnFlagWillFlag     = byte(0x04)
+	mqttConnFlagWillQoS      = byte(0x18)
+	mqttConnFlagWillRetain   = byte(0x20)
+	mqttConnFlagPasswordFlag = byte(0x40)
+	mqttConnFlagUsernameFlag = byte(0x80)
+
+	// Publish flags
+	mqttPubFlagRetain = byte(0x01)
+	mqttPubFlagQoS    = byte(0x06)
+	mqttPubFlagDup    = byte(0x08)
+	mqttPubQos1       = byte(0x1 << 1)
+	mqttPubQoS2       = byte(0x2 << 1)
+
+	// Subscribe flags
+	mqttSubscribeFlags = byte(0x2)
+	mqttSubAckFailure  = byte(0x80)
+
+	// Unsubscribe flags
+	mqttUnsubscribeFlags = byte(0x2)
+
+	// ConnAck returned codes (MQTT 3.1.1)
+	mqttConnAckRCConnectionAccepted          = byte(0x0)
+	mqttConnAckRCUnacceptableProtocolVersion = byte(0x1)
+	mqttConnAckRCIdentifierRejected          = byte(0x2)
+	mqttConnAckRCServerUnavailable           = byte(0x3)
+	mqttConnAckRCBadUserOrPassword           = byte(0x4)
+	mqttConnAckRCNotAuthorized               = byte(0x5)
+	mqttConnAckRCQoS2WillRejected            = byte(0x10)
+
+	// MQTT 5.0 reason codes. The success range (< 0x80) is context dependent
+	// (Success, Normal disconnection, Granted QoS 0, ...). Codes >= 0x80 are
+	// failures. Only the subset used by this implementation is defined here.
+	// Spec [MQTT-2.4].
+	mqttReasonSuccess                     = byte(0x00) // also Normal disconnection / Granted QoS 0
+	mqttReasonGrantedQoS1                 = byte(0x01)
+	mqttReasonGrantedQoS2                 = byte(0x02)
+	mqttReasonDisconnectWithWill          = byte(0x04)
+	mqttReasonNoMatchingSubscribers       = byte(0x10)
+	mqttReasonNoSubscriptionExisted       = byte(0x11)
+	mqttReasonUnspecifiedError            = byte(0x80)
+	mqttReasonMalformedPacket             = byte(0x81)
+	mqttReasonProtocolError               = byte(0x82)
+	mqttReasonImplementationSpecificError = byte(0x83)
+	mqttReasonUnsupportedProtocolVersion  = byte(0x84)
+	mqttReasonClientIDNotValid            = byte(0x85)
+	mqttReasonBadUserOrPassword           = byte(0x86)
+	mqttReasonNotAuthorized               = byte(0x87)
+	mqttReasonServerUnavailable           = byte(0x88)
+	mqttReasonServerBusy                  = byte(0x89)
+	mqttReasonServerShuttingDown          = byte(0x8b)
+	mqttReasonBadAuthMethod               = byte(0x8c)
+	mqttReasonSessionTakenOver            = byte(0x8e)
+	mqttReasonTopicNameInvalid            = byte(0x90)
+	mqttReasonTopicFilterInvalid          = byte(0x8f)
+	mqttReasonPacketIDInUse               = byte(0x91)
+	mqttReasonPacketIDNotFound            = byte(0x92)
+	mqttReasonReceiveMaxExceeded          = byte(0x93)
+	mqttReasonTopicAliasInvalid           = byte(0x94)
+	mqttReasonPacketTooLarge              = byte(0x95)
+	mqttReasonQuotaExceeded               = byte(0x97)
+	mqttReasonPayloadFormatInvalid        = byte(0x99)
+	mqttReasonQoSNotSupported             = byte(0x9b)
+	mqttReasonSharedSubNotSupported       = byte(0x9e)
+	mqttReasonSubIDNotSupported           = byte(0xa1)
+	mqttReasonWildcardSubNotSupported     = byte(0xa2)
+
+	// MQTT 5.0 property identifiers. Spec [MQTT-2.2.2.2].
+	mqttPropPayloadFormat        = byte(0x01) // byte
+	mqttPropMessageExpiry        = byte(0x02) // 4-byte int
+	mqttPropContentType          = byte(0x03) // UTF-8 string
+	mqttPropResponseTopic        = byte(0x08) // UTF-8 string
+	mqttPropCorrelationData      = byte(0x09) // binary
+	mqttPropSubscriptionID       = byte(0x0b) // variable int (repeatable)
+	mqttPropSessionExpiry        = byte(0x11) // 4-byte int
+	mqttPropAssignedClientID     = byte(0x12) // UTF-8 string
+	mqttPropServerKeepAlive      = byte(0x13) // 2-byte int
+	mqttPropAuthMethod           = byte(0x15) // UTF-8 string
+	mqttPropAuthData             = byte(0x16) // binary
+	mqttPropRequestProblemInfo   = byte(0x17) // byte
+	mqttPropWillDelay            = byte(0x18) // 4-byte int
+	mqttPropRequestResponseInfo  = byte(0x19) // byte
+	mqttPropResponseInfo         = byte(0x1a) // UTF-8 string
+	mqttPropServerReference      = byte(0x1c) // UTF-8 string
+	mqttPropReasonString         = byte(0x1f) // UTF-8 string
+	mqttPropReceiveMaximum       = byte(0x21) // 2-byte int
+	mqttPropTopicAliasMax        = byte(0x22) // 2-byte int
+	mqttPropTopicAlias           = byte(0x23) // 2-byte int
+	mqttPropMaxQoS               = byte(0x24) // byte
+	mqttPropRetainAvailable      = byte(0x25) // byte
+	mqttPropUserProperty         = byte(0x26) // UTF-8 string pair (repeatable)
+	mqttPropMaxPacketSize        = byte(0x27) // 4-byte int
+	mqttPropWildcardSubAvailable = byte(0x28) // byte
+	mqttPropSubIDAvailable       = byte(0x29) // byte
+	mqttPropSharedSubAvailable   = byte(0x2a) // byte
+
+	// Maximum payload size of a control packet
+	mqttMaxPayloadSize = 0xFFFFFFF
+
+	// Largest legal full control packet: the Remaining Length ceiling plus the
+	// fixed header (type/flags byte + up-to-4-byte Remaining Length varint).
+	// Maximum Packet Size counts the full packet, not just Remaining Length.
+	// Spec5 [2.1.4], [3.1.2.11.4].
+	mqttMaxControlPacketSize = mqttMaxPayloadSize + 5
+
+	// Largest value representable as an MQTT variable byte integer (4 bytes),
+	// also the maximum valid Subscription Identifier. Spec5 [1.5.5], [3.8.2.1.2].
+	mqttMaxVarInt = 0xFFFFFFF
+
+	// Topic/Filter characters
+	mqttTopicLevelSep = '/'
+	mqttSingleLevelWC = '+'
+	mqttMultiLevelWC  = '#'
+	mqttReservedPre   = '$'
+
+	// This is appended to the sid of a subscription that is
+	// created on the upper level subject because of the MQTT
+	// wildcard '#' semantic.
+	mqttMultiLevelSidSuffix = " fwc"
+
+	// This is the prefix used for all subjects used by MQTT code.
+	mqttPrefix = "$MQTT."
+
+	// This is the prefix for NATS subscriptions subjects associated as delivery
+	// subject of JS consumer. We want to make them unique so will prevent users
+	// MQTT subscriptions to start with this.
+	mqttSubPrefix = mqttPrefix + "sub."
+
+	// Stream name for MQTT messages on a given account
+	mqttStreamName          = "$MQTT_msgs"
+	mqttStreamSubjectPrefix = mqttPrefix + "msgs."
+
+	// Stream name for MQTT retained messages on a given account
+	mqttRetainedMsgsStreamName    = "$MQTT_rmsgs"
+	mqttRetainedMsgsStreamSubject = mqttPrefix + "rmsgs."
+
+	// Stream name for MQTT sessions on a given account
+	mqttSessStreamName          = "$MQTT_sess"
+	mqttSessStreamSubjectPrefix = mqttPrefix + "sess."
+
+	// Stream name prefix for MQTT sessions on a given account
+	mqttSessionsStreamNamePrefix = "$MQTT_sess_"
+
+	// Stream name and subject for incoming MQTT QoS2 messages
+	mqttQoS2IncomingMsgsStreamName          = "$MQTT_qos2in"
+	mqttQoS2IncomingMsgsStreamSubjectPrefix = mqttPrefix + "qos2.in."
+
+	// Stream name and subjects for outgoing MQTT QoS (PUBREL) messages
+	mqttOutStreamName               = "$MQTT_out"
+	mqttOutSubjectPrefix            = mqttPrefix + "out."
+	mqttPubRelSubjectPrefix         = mqttPrefix + "out.pubrel."
+	mqttPubRelDeliverySubjectPrefix = mqttPrefix + "deliver.pubrel."
+	mqttPubRelConsumerDurablePrefix = "$MQTT_PUBREL_"
+
+	// Internal names for MQTT 5.0 Shared Subscriptions ("$share/{ShareName}/
+	// {filter}"). All three are derived deterministically from a hash of the
+	// ShareName and the underlying NATS subject (see mqttSharedNames), so every
+	// group member across the cluster converges on a single JetStream consumer.
+	// The deliver subject lives under the $MQTT. prefix so it is treated as an
+	// internal subject users cannot subscribe to. Spec5 [4.8.2].
+	mqttSharedSubDeliverPrefix      = mqttPrefix + "qsub." // "$MQTT.qsub."
+	mqttSharedConsumerDurablePrefix = "$MQTT_SHARED_"
+	// mqttSharedQueuePrefix marks the generated NATS queue-group name as
+	// server-internal so an MQTT client cannot allow/deny it and cannot join a
+	// plain NATS queue group by naming it. Used as the DeliverGroup and as the
+	// queue name on both the raw QoS0 sub and the shared deliver subscription.
+	mqttSharedQueuePrefix = "$mqttshare."
+
+	// As per spec, MQTT server may not redeliver QoS 1 and 2 messages to
+	// clients, except after client reconnects. However, NATS Server will
+	// redeliver unacknowledged messages after this default interval. This can
+	// be changed with the server.Options.MQTT.AckWait option.
+	mqttDefaultAckWait = 30 * time.Second
+
+	// This is the default for the outstanding number of pending QoS 1
+	// messages sent to a session with QoS 1 subscriptions.
+	mqttDefaultMaxAckPending = 1024
+
+	// Default MQTT 5.0 Receive Maximum advertised to v5 clients when the
+	// receive_maximum option is unset: the in-flight QoS 1/2 window a compliant
+	// client self-limits to, of which the server enforces the observable part
+	// (QoS 2 held awaiting PUBREL). Symmetric with the outbound
+	// mqttDefaultMaxAckPending. Spec5 [3.2.2.3.3].
+	mqttDefaultReceiveMax = 1024
+
+	// Default MQTT 5.0 Topic Alias Maximum advertised to (and accepted from)
+	// v5 clients when the topic_alias_maximum option is unset. Bounds the
+	// per-connection alias map. For reference, mosquitto defaults to 10.
+	// Spec5 [3.2.2.3.2].
+	mqttDefaultTopicAliasMax = 64
+
+	// A session's list of subscriptions cannot have a cumulative MaxAckPending
+	// of more than this limit.
+	mqttMaxAckTotalLimit = 0xFFFF
+
+	// Prefix of the reply subject for JS API requests.
+	mqttJSARepliesPrefix = mqttPrefix + "JSA."
+
+	// Those are tokens that are used for the reply subject of JS API requests.
+	// For instance "$MQTT.JSA.<node id>.SC.<number>" is the reply subject
+	// for a request to create a stream (where <node id> is the server name hash),
+	// while "$MQTT.JSA.<node id>.SL.<number>" is for a stream lookup, etc...
+	mqttJSAIdTokenPos     = 3
+	mqttJSATokenPos       = 4
+	mqttJSAClientIDPos    = 5
+	mqttJSAStreamCreate   = "SC"
+	mqttJSAStreamUpdate   = "SU"
+	mqttJSAStreamLookup   = "SL"
+	mqttJSAStreamDel      = "SD"
+	mqttJSAStreamPurge    = "SPU"
+	mqttJSAConsumerCreate = "CC"
+	mqttJSAConsumerLookup = "CL"
+	mqttJSAConsumerDel    = "CD"
+	mqttJSAMsgStore       = "MS"
+	mqttJSAMsgLoad        = "ML"
+	mqttJSAMsgDelete      = "MD"
+	mqttJSASessPersist    = "SP"
+	mqttJSARetainedMsgDel = "RD"
+	mqttJSAStreamNames    = "SN"
+	mqttJSAConsumerList   = "CLS"
+
+	// This is how long to keep a client in the flappers map before closing the
+	// connection. This prevent quick reconnect from those clients that keep
+	// wanting to connect with a client ID already in use.
+	mqttSessFlappingJailDur = time.Second
+
+	// This is how frequently the timer to cleanup the sessions flappers map is firing.
+	mqttSessFlappingCleanupInterval = 5 * time.Second
+
+	// Default retry delay if transfer of old session streams to new one fails
+	mqttDefaultTransferRetry = 5 * time.Second
+
+	// For Websocket URLs
+	mqttWSPath = "/mqtt"
+
+	mqttInitialPubHeader        = 16 // An overkill, should need 7 bytes max
+	mqttProcessSubTooLong       = 100 * time.Millisecond
+	mqttDefaultRetainedCacheTTL = 2 * time.Minute
+	mqttRetainedTransferTimeout = 10 * time.Second
+	mqttDefaultJSAPITimeout     = 5 * time.Second
+	mqttRetainedFlagDelMarker   = '-'
+)
+
+const (
+	sparkbNBIRTH = "NBIRTH"
+	sparkbDBIRTH = "DBIRTH"
+	sparkbNDEATH = "NDEATH"
+	sparkbDDEATH = "DDEATH"
+)
+
+var (
+	sparkbNamespaceTopicPrefix    = []byte("spBv1.0/")
+	sparkbCertificatesTopicPrefix = []byte("$sparkplug/certificates/")
+)
+
+var (
+	mqttPingResponse     = []byte{mqttPacketPingResp, 0x0}
+	mqttProtoName        = []byte("MQTT")
+	mqttOldProtoName     = []byte("MQIsdp")
+	mqttSessJailDur      = mqttSessFlappingJailDur
+	mqttFlapCleanItvl    = mqttSessFlappingCleanupInterval
+	mqttRetainedCacheTTL = mqttDefaultRetainedCacheTTL
+	// How often to re-run the session-expiry sweep for an account. A var so
+	// tests can shorten it.
+	mqttSessionExpirySweepInterval = 15 * time.Minute
+	// How old a consumer must be before the orphan sweep may delete it: a plain
+	// session durable is created before the record save that references it, so a
+	// young unreferenced consumer may just be mid-SUBSCRIBE. A var so tests can
+	// shorten it.
+	mqttOrphanSweepGrace = 5 * time.Minute
+	// Test hook: when set, sess.save() consults it and fails with the returned
+	// error instead of persisting. Used to exercise persistence-failure rollback.
+	mqttTestSessSaveHook func(sess *mqttSession) error
+)
+
+var (
+	errMQTTNotWebsocketPort           = errors.New("MQTT clients over websocket must connect to the Websocket port, not the MQTT port")
+	errMQTTTopicFilterCannotBeEmpty   = errors.New("topic filter cannot be empty")
+	errMQTTMalformedVarInt            = errors.New("malformed variable int")
+	errMQTTSecondConnectPacket        = errors.New("received a second CONNECT packet")
+	errMQTTServerNameMustBeSet        = errors.New("mqtt requires server name to be explicitly set")
+	errMQTTUserMixWithUsersNKeys      = errors.New("mqtt authentication username not compatible with presence of users/nkeys")
+	errMQTTTokenMixWIthUsersNKeys     = errors.New("mqtt authentication token not compatible with presence of users/nkeys")
+	errMQTTAckWaitMustBePositive      = errors.New("ack wait must be a positive value")
+	errMQTTJSAPITimeoutMustBePositive = errors.New("JS API timeout must be a positive value")
+	errMQTTStandaloneNeedsJetStream   = errors.New("mqtt requires JetStream to be enabled if running in standalone mode")
+	errMQTTConnFlagReserved           = errors.New("connect flags reserved bit not set to 0")
+	errMQTTWillAndRetainFlag          = errors.New("if Will flag is set to 0, Will Retain flag must be 0 too")
+	errMQTTPasswordFlagAndNoUser      = errors.New("password flag set but username flag is not")
+	errMQTTCIDEmptyNeedsCleanFlag     = errors.New("when client ID is empty, clean session flag must be set to 1")
+	errMQTTEmptyWillTopic             = errors.New("empty Will topic not allowed")
+	errMQTTEmptyUsername              = errors.New("empty user name not allowed")
+	errMQTTTopicIsEmpty               = errors.New("topic cannot be empty")
+	errMQTTPacketIdentifierIsZero     = errors.New("packet identifier cannot be 0")
+	errMQTTUnsupportedCharacters      = errors.New("character not supported for MQTT topics")
+	errMQTTInvalidSession             = errors.New("invalid MQTT session")
+	errMQTTInvalidRetainFlags         = errors.New("invalid retained message flags")
+	errMQTTSessionCollision           = errors.New("stored session does not match client ID")
+	errMQTTInvalidPublishLength       = errors.New("invalid publish message, variable header exceeds remaining length")
+	errMQTTMalformedProperties        = errors.New("malformed properties")
+	errMQTTProtocolError              = errors.New("protocol error")
+	errMQTTDuplicateProperty          = errors.New("duplicate property")
+	errMQTTUnknownProperty            = errors.New("unknown property identifier")
+	errMQTTPropertyNotAllowed         = errors.New("property not allowed for this packet type")
+	errMQTTAuthMethodNotSupported     = errors.New("enhanced authentication (auth method) is not supported")
+	errMQTTUnsupportedSubOption       = errors.New("unsupported MQTT 5.0 subscription option")
+	errMQTTMalformedSubOption         = errors.New("malformed MQTT 5.0 subscription option")
+	errMQTTMalformedSharedSub         = errors.New("malformed shared subscription")
+	errMQTTTopicAliasInvalid          = errors.New("topic alias invalid")
+	errMQTTReceiveMaxExceeded         = errors.New("receive maximum exceeded")
+	errMQTTPayloadFormatInvalid       = errors.New("payload format invalid")
+	errMQTTNotAuthorizedToSubscribe   = errors.New("not authorized to subscribe")
+	errMQTTMalformedPacket            = errors.New("malformed packet")
+)
+
+type srvMQTT struct {
+	listener     net.Listener
+	listenerErr  error
+	authOverride bool
+	sessmgr      mqttSessionManager
+	// v5Enabled caches whether this server accepts MQTT 5.0 (max_protocol_version
+	// == 5), set once at startup and read lock-free thereafter. It lets v5-only
+	// machinery be skipped entirely on a 3.1.1-only server.
+	v5Enabled bool
+	// originKey is a per-server-run random secret keying the HMAC that
+	// authenticates the No Local origin marker stamped on stored QoS 1/2 (and
+	// retained) messages. It is never sent to clients, so a client that can write
+	// the MQTT stream subjects still cannot forge a marker for a victim's session;
+	// an unauthenticated or unverifiable origin is simply not suppressed (No Local
+	// fails open, never dropping a legitimate message). Because the key is not
+	// persisted or shared across the cluster, a self-published message that
+	// outlives its stamping server-run — a retained/QoS message replayed after a
+	// restart, or delivered after the persistent session reconnects to another
+	// node — no longer verifies and is delivered rather than suppressed. That is
+	// an accepted, safe degradation of No Local for persisted messages across a
+	// restart/failover, not a security gap. Spec5 [3.8.3.1].
+	originKey []byte
+}
+
+type mqttSessionManager struct {
+	mu       sync.RWMutex
+	sessions map[string]*mqttAccountSessionManager // key is account name
+}
+
+type mqttAccountSessionManager struct {
+	mu         sync.RWMutex
+	sessions   map[string]*mqttSession // key is MQTT client ID
+	sessByHash map[string]*mqttSession // key is MQTT client ID hash
+	sessLocked map[string]struct{}     // key is MQTT client ID and indicate that a session can not be taken by a new client at this time
+	flappers   map[string]time.Time    // When connection connects with client ID already in use
+	flapTimer  *time.Timer             // Timer to perform some cleanup of the flappers map
+	// Pending delayed Will deliveries, keyed by MQTT client ID, so a reconnect
+	// to the same session can cancel them. MQTT 5.0 Will Delay Interval,
+	// Spec5 [3.1.3.2.2], [MQTT-3.1.2-8]. Guarded by mu.
+	pendingWills map[string]*mqttPendingWill
+	// Pending session-expiry timers, keyed by MQTT client ID hash, that clean up a
+	// session once its MQTT 5.0 Session Expiry Interval elapses after the
+	// connection closes. A reconnect (local or remote takeover) cancels them.
+	// Spec5 [3.1.2.11.2]. Guarded by mu.
+	pendingExpiries map[string]*time.Timer
+	retmsgs         *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
+	rmsCache        *sync.Map                              // map[subject]mqttRetainedMsg
+	jsa             mqttJSA
+	domainTk        string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+
+	// Degraded mode, set once at creation (read without lock): per-message TTL
+	// could not be enabled on a pre-existing stream, so stored messages must
+	// not carry a Nats-TTL header (JetStream would reject them). Delivery-side
+	// expiry checks still apply; only storage reaping is lost.
+	msgsStreamNoTTL  bool
+	rmsgsStreamNoTTL bool
+}
+
+type mqttJSAResponse struct {
+	reply string // will be used to map to the original request in jsa.NewRequestExMulti
+	value any
+}
+
+type mqttJSA struct {
+	mu        sync.Mutex
+	id        string
+	c         *client
+	sendq     *ipQueue[*mqttJSPubMsg]
+	rplyr     string
+	replies   sync.Map // [string]chan *mqttJSAResponse
+	nuid      *nuid.NUID
+	quitCh    chan struct{}
+	domain    string // Domain or possibly empty. This is added to session subject.
+	domainSet bool   // covers if domain was set, even to empty
+	timeout   time.Duration
+
+	// subsBarrier lets QoS 1/2 message stores wait out any SUBSCRIBE that is
+	// still being processed in this account. See mqttSubsBarrier.
+	subsBarrier mqttSubsBarrier
+}
+
+// mqttSubsBarrier prevents a PUBLISH from racing a concurrent SUBSCRIBE into
+// the JetStream messages stream. $MQTT_msgs uses interest-based retention: a
+// message stored while a subscription's JetStream consumer create is still in
+// flight finds no interest and is discarded outright by the stream (the
+// sequence is burned, nothing is stored), leaving it permanently invisible to
+// the new subscription. SUBSCRIBE processing holds the barrier for its
+// duration; a QoS 1/2 store calls wait() first, so any SUBSCRIBE the server
+// began processing before the publish has its consumer — and therefore stream
+// interest — registered by the time the message is stored. MQTT does not
+// require delivery to a subscription whose SUBSCRIBE is still in flight, but
+// brokers that register subscriptions synchronously do deliver in this
+// window, and the Eclipse Paho interop suite relies on it
+// (test_request_response, test_subscribe_options). The zero value is ready to
+// use.
+type mqttSubsBarrier struct {
+	mu sync.Mutex
+	ch chan struct{} // non-nil while n > 0; closed when n drops back to 0
+	n  int
+}
+
+func (b *mqttSubsBarrier) enter() {
+	b.mu.Lock()
+	if b.n == 0 {
+		b.ch = make(chan struct{})
+	}
+	b.n++
+	b.mu.Unlock()
+}
+
+func (b *mqttSubsBarrier) leave() {
+	b.mu.Lock()
+	b.n--
+	if b.n == 0 {
+		close(b.ch)
+		b.ch = nil
+	}
+	b.mu.Unlock()
+}
+
+// wait blocks until every SUBSCRIBE in flight when wait sampled the barrier
+// has finished processing. SUBSCRIBEs entering afterwards are deliberately
+// not waited for: the publish preceded them, so it owes them nothing.
+func (b *mqttSubsBarrier) wait() {
+	b.mu.Lock()
+	ch := b.ch
+	b.mu.Unlock()
+	if ch != nil {
+		<-ch
+	}
+}
+
+type mqttJSPubMsg struct {
+	subj  string
+	reply string
+	hdr   int
+	msg   []byte
+}
+
+type mqttRetMsgDel struct {
+	Subject string `json:"subject"`
+	Seq     uint64 `json:"seq"`
+}
+
+type mqttSession struct {
+	// subsMu is a "quick" version of the session lock, sufficient for the QoS0
+	// callback. It only guarantees that a new subscription is initialized, and
+	// its retained messages if any have been queued up for delivery. The QoS12
+	// callback uses the session lock.
+	mu     sync.Mutex
+	subsMu sync.RWMutex
+
+	id          string // client ID
+	idHash      string // client ID hash
+	c           *client
+	jsa         *mqttJSA
+	subs        map[string]byte     // Key is MQTT SUBSCRIBE filter, value is the subscription QoS
+	noLocalSubs map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 No Local option
+	rapSubs     map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 Retain As Published option
+	subIDs      map[string]int      // SUBSCRIBE filter -> v5 Subscription Identifier (absent = none)
+	// sharedSubs holds MQTT 5.0 Shared Subscriptions, keyed by session key
+	// ("$share/{ShareName}/{NATS subject}") so distinct groups (and a plain
+	// subscription) on the same subject do not collide. Kept separate from subs
+	// so an older server reading the persisted record never subscribes to a
+	// "$share/..." key as a literal topic. rapSubs/subIDs are shared with plain
+	// subscriptions but keyed by session key (collision-free). Spec5 [4.8.2].
+	sharedSubs map[string]byte
+
+	cons map[string]*ConsumerConfig
+	// sharedCharged tracks the MaxAckPending this session has added to tmaxack
+	// for each shared group durable it joined (durable -> amount), so a release
+	// subtracts exactly what was charged and only once. In-memory only. Spec5 [4.8.2].
+	sharedCharged          map[string]int
+	pubRelConsumer         *ConsumerConfig
+	pubRelSubscribed       bool
+	pubRelDeliverySubject  string
+	pubRelDeliverySubjectB []byte
+	pubRelSubject          string
+	seq                    uint64
+
+	// pendingPublish maps packet identifiers (PI) to JetStream ACK subjects for
+	// QoS1 and 2 PUBLISH messages pending delivery to the session's client.
+	pendingPublish map[uint16]*mqttPending
+
+	// pendingPubRel maps PIs to JetStream ACK subjects for QoS2 PUBREL
+	// messages pending delivery to the session's client.
+	pendingPubRel map[uint16]*mqttPending
+
+	// cpending maps delivery attempts (that come with a JS ACK subject) to
+	// existing PIs.
+	cpending map[string]map[uint64]uint16 // composite key: jsDur, sseq
+
+	// deferred tracks QoS 1/2 deliveries withheld by trackPublish because the
+	// session was at its effective in-flight cap (Receive Maximum /
+	// MaxAckPending). Keyed by JS durable + stream sequence; the value is the
+	// latest delivery attempt's JS ack subject, NAK'd to force prompt
+	// redelivery when the client frees a slot (Spec5 [4.9]). In-memory only,
+	// naturally bounded by the consumers' MaxAckPending.
+	deferred map[mqttDeferredKey]string
+
+	// "Last used" publish packet identifier (PI). starting point searching for the next available.
+	last_pi uint16
+
+	// Maximum number of pending acks for this session.
+	maxp uint16
+	// rmax is the current connection's MQTT 5.0 Receive Maximum: the max number
+	// of unacknowledged QoS1/2 PUBLISH the server may have in flight to the
+	// client. 0 means no client-imposed limit (3.1.1, or not sent). The
+	// effective in-flight cap is min(maxp, rmax). Set on each CONNECT.
+	rmax    uint16
+	tmaxack int
+	clean   bool
+	// expiryInterval is the effective MQTT 5.0 Session Expiry Interval in seconds:
+	// 0 means the session ends when the connection closes, mqttSessionNeverExpire
+	// means it never expires, any other value keeps the session for that many
+	// seconds after the connection closes. For 3.1.1 this is derived from the
+	// Clean Session flag (clean => 0, persistent => mqttSessionNeverExpire). Set on
+	// each CONNECT and possibly overridden by a v5 DISCONNECT. Spec5 [3.1.2.11.2].
+	expiryInterval uint32
+	// disconnectedAt is the Unix time the client disconnected with a finite expiry
+	// interval pending (0 while connected). Persisted so the deadline survives a restart.
+	disconnectedAt int64
+	domainTk       string
+
+	// will is the session's pending delayed Will, persisted with the record so
+	// it survives a server restart during the Will Delay Interval. nil when no
+	// Will is pending. Spec5 [3.1.3.2.2].
+	will *mqttPersistedWill
+}
+
+type mqttPersistedSession struct {
+	Origin string          `json:"origin,omitempty"`
+	ID     string          `json:"id,omitempty"`
+	Clean  bool            `json:"clean,omitempty"`
+	Subs   map[string]byte `json:"subs,omitempty"`
+	// NoLocal and RetainAsPublished are the sets of Subs filters that carry the
+	// v5 No Local / Retain As Published options; SubIDs maps a Subs filter to its
+	// v5 Subscription Identifier. All kept separate from Subs (rather than packed
+	// into its QoS byte) so an older server reading this record still sees a valid
+	// 0..2 QoS and simply ignores these fields. Spec5 [3.8.3.1], [3.8.2.1.2].
+	NoLocal           []string       `json:"no_local,omitempty"`
+	RetainAsPublished []string       `json:"retain_as_published,omitempty"`
+	SubIDs            map[string]int `json:"sub_ids,omitempty"`
+	// SharedSubs is the sole persisted authority for MQTT 5.0 Shared
+	// Subscriptions (session key -> QoS). The group consumer's durable, deliver
+	// subject, and queue name are all derived deterministically from each key
+	// (see mqttSharedNames), so no consumer config is persisted for them — and
+	// they are deliberately excluded from Cons, since an older server would
+	// otherwise delete the group durable in clear(). Spec5 [4.8.2].
+	SharedSubs map[string]byte            `json:"shared_subs,omitempty"`
+	Cons       map[string]*ConsumerConfig `json:"cons,omitempty"`
+	PubRel     *ConsumerConfig            `json:"pubrel,omitempty"`
+	Will       *mqttPersistedWill         `json:"will,omitempty"`
+	// Session Expiry Interval (seconds) and disconnect Unix time (0 while
+	// connected): together the expiry deadline, restart-safe. Spec5 [3.1.2.11.2].
+	ExpiryInterval uint32 `json:"expiry,omitempty"`
+	DisconnectedAt int64  `json:"disconnected,omitempty"`
+}
+
+// mqttPersistedWill is a delayed Will stored in the session record so it still
+// fires if the server restarts during its Will Delay Interval. Publisher
+// permissions are not serializable, so the Will's publish permission is
+// checked before persisting and a denied Will is never stored. Spec5
+// [3.1.3.2.2].
+type mqttPersistedWill struct {
+	Topic  string `json:"topic"`
+	Msg    []byte `json:"msg,omitempty"`
+	QoS    byte   `json:"qos,omitempty"`
+	Retain bool   `json:"retain,omitempty"`
+	Props  []byte `json:"props,omitempty"` // encoded forwardable properties block
+	User   string `json:"user,omitempty"`
+	FireAt int64  `json:"fire,omitempty"` // Unix nanoseconds to publish at (truncation could fire early)
+}
+
+type mqttRetainedMsg struct {
+	Origin  string `json:"origin,omitempty"`
+	Subject string `json:"subject,omitempty"`
+	Topic   string `json:"topic,omitempty"`
+	Msg     []byte `json:"msg,omitempty"`
+	Flags   byte   `json:"flags,omitempty"`
+	Source  string `json:"source,omitempty"`
+	// Props is the raw MQTT 5.0 properties block captured from the retained
+	// PUBLISH, forwarded to v5 subscribers when the message is replayed. Empty
+	// for messages published by 3.1.1 clients or without properties.
+	Props []byte `json:"props,omitempty"`
+
+	// SessionHash is the authenticated No Local origin marker (HMAC of the
+	// publishing session hash, subject, and payload under a per-server secret)
+	// for the session that published this retained message, so No Local can
+	// suppress replaying it to that same session without trusting a forgeable
+	// header. Empty when v5 is disabled or there is no publishing session. Spec5
+	// [3.8.3.1].
+	SessionHash string `json:"session_hash,omitempty"`
+
+	// expires is the absolute deadline after which this retained message must no
+	// longer be delivered, when it was published with an MQTT 5.0 Message Expiry
+	// Interval. Zero when the message has no expiry. Persisted with the stored
+	// message via the mqttNatsRetainedMessageExpiry header (not JSON). Spec5
+	// [3.3.2.3.3].
+	expires time.Time
+
+	expiresFromCache time.Time
+}
+
+type mqttRetainedMsgRef struct {
+	sseq uint64
+}
+
+// mqttSub contains fields associated with a MQTT subscription, and is added to
+// the main subscription struct for MQTT message delivery subscriptions. The
+// delivery callbacks may get invoked before sub.mqtt is set up, so they should
+// acquire either sess.mu or sess.subsMu before accessing it.
+type mqttSub struct {
+	// The sub's QOS and the JS durable name. They can change when
+	// re-subscribing, and are used in the delivery callbacks. They can be
+	// quickly accessed using sess.subsMu.RLock, or under the main session lock.
+	qos   byte
+	jsDur string
+
+	// shared marks this subscription as belonging to an MQTT 5.0 Shared
+	// Subscription group. Read in the delivery callbacks like qos. When set on a
+	// QoS0 (raw-subject) sub, the callback must not deliver stored (QoS 1/2
+	// published) messages — those arrive through the shared JS consumer instead.
+	// Spec5 [4.8.2].
+	shared bool
+
+	// closed marks the subscription as torn down (QoS downgrade to 0, or
+	// unsubscribe) so QoS 1/2 delivery callbacks stop tracking new messages for
+	// it. Guarded like qos/jsDur (sess.mu or sess.subsMu). Unlike clearing
+	// sub.mqtt, this keeps the struct valid for an in-flight enqueue.
+	closed bool
+
+	// Pending serialization of retained messages to be sent when subscription
+	// is registered. The sub's delivery callbacks must wait until `prm` is
+	// ready (can block on sess.mu for that, too).
+	prm [][]byte
+
+	// If this subscription needs to be checked for being reserved. E.g. '#' or
+	// '*' or '*/'.  It is set up at the time of subscription and is immutable
+	// after that.
+	reserved bool
+
+	// noLocal is the v5 No Local subscription option: when set, a message
+	// published by this same session's connection must not be delivered to this
+	// subscription. Read in the delivery callbacks under sess.subsMu/sess.mu,
+	// like qos. Spec5 [3.8.3.1].
+	noLocal bool
+
+	// retainAsPublished is the v5 Retain As Published subscription option: when
+	// set, a live-forwarded message keeps the RETAIN flag it was published with
+	// instead of having it cleared. Read in the delivery callbacks like noLocal.
+	// Spec5 [3.8.3.1].
+	retainAsPublished bool
+
+	// subID is the v5 Subscription Identifier for this subscription (0 = none).
+	// The server injects it into every PUBLISH delivered because of this sub.
+	// Read in the delivery callbacks like noLocal. Spec5 [3.8.2.1.2].
+	subID int
+}
+
+type mqtt struct {
+	r    *mqttReader
+	cp   *mqttConnectProto
+	pp   *mqttPublish
+	asm  *mqttAccountSessionManager // quick reference to account session manager, immutable after processConnect()
+	sess *mqttSession               // quick reference to session, immutable after processConnect()
+	cid  string                     // client ID
+
+	// proto is the negotiated protocol level: mqttProtoLevel (3.1.1) or
+	// mqttProtoLevel5 (5.0). Set during CONNECT parsing and immutable after.
+	// It outlives individual packets so that ACK/DISCONNECT handlers running
+	// long after CONNECT can select the proper wire framing.
+	proto byte
+
+	// pubOrigin is the authenticated No Local origin marker (or empty) resolved
+	// for the message currently being delivered. Set by
+	// mqttInitiateMsgDeliveryJSA before onward processing so mqttHandlePubRetain
+	// stamps a retained copy with the same value the live delivery used — in
+	// particular empty for a server-originated Will, whatever path delivers it.
+	// Valid only for the duration of that call. Spec5 [3.8.3.1].
+	pubOrigin string
+
+	// maxPacketSize is the current connection's MQTT 5.0 Maximum Packet Size:
+	// the largest PUBLISH (whole control packet) the client is willing to
+	// accept. 0 means no client-imposed limit (3.1.1, or not sent). Set at
+	// CONNECT parse time (so even a rejection CONNACK honors it) and read
+	// lock-free on the delivery and ack paths like proto. Unlike the session's
+	// Receive Maximum (rmax), this lives on the per-connection client: it must
+	// gate the QoS0 direct-delivery path, which runs without the session lock.
+	// Spec5 [3.1.2.11.4].
+	maxPacketSize uint32
+
+	// maxInPacketSize is the server's MQTT 5.0 Maximum Packet Size advertised in
+	// this connection's success CONNACK and enforced on inbound packets in the
+	// read loop; a larger packet gets a DISCONNECT 0x95. 0 means nothing is
+	// advertised or enforced (3.1.1, or no configured limit). Captured once in
+	// mqttProcessConnect so the encoded value and the enforced value are always
+	// identical even if a config reload changes c.mpay. Read lock-free on the
+	// read-loop goroutine like proto. Spec5 [3.2.2.3.6], [MQTT-3.2.2-15].
+	maxInPacketSize uint32
+
+	// noProblemInfo is true when the v5 client sent Request Problem Information 0:
+	// the server must then not attach a Reason String (or User Property) to any
+	// packet other than CONNACK/DISCONNECT. Absent means 1 (allowed). Set at
+	// CONNECT parse time, read lock-free on the ack paths like proto. Spec5
+	// [3.1.2.11.7].
+	noProblemInfo bool
+
+	// cidGenerated is true when the client sent an empty client ID and the
+	// server assigned one. For v5 it must be echoed back in the CONNACK as the
+	// Assigned Client Identifier property. Spec5 [3.2.2.3.7].
+	cidGenerated bool
+
+	// topicAliasMax is the inbound MQTT 5.0 Topic Alias Maximum this server
+	// accepts from this connection, resolved from Options at CONNECT and
+	// advertised in the CONNACK. 0 means aliases are not accepted (property
+	// omitted, absent => 0). Set during CONNECT, read lock-free on the parse path
+	// like proto. The outbound direction (aliases the server sends) is
+	// outTopicAliasMax. Spec5 [3.2.2.3.2], [3.3.2.3.4].
+	topicAliasMax uint16
+
+	// topicAliases maps a client-assigned Topic Alias to the (copied) pre-mapping
+	// wire topic it was last bound to. Lazily allocated on first bind, bounded by
+	// topicAliasMax entries. Aliases are connection-scoped and never survive a
+	// reconnect or session takeover (c.mqtt is rebuilt per connection). Only
+	// accessed from the read loop. Spec5 [3.3.2.3.4].
+	topicAliases map[uint16][]byte
+
+	// outTopicAliasMax is how many MQTT 5.0 Topic Aliases the server may use on
+	// PUBLISH packets it sends TO this connection: the client's CONNECT Topic
+	// Alias Maximum bounded by the server-side cap (the min of the two, so a
+	// client advertising 65535 cannot force the server to hold 65535 topics).
+	// 0 => the server sends no aliases. Set once during CONNECT, read lock-free
+	// on delivery goroutines like maxPacketSize. Spec5 [3.1.2.11.2], [3.3.2.3.4].
+	outTopicAliasMax uint16
+
+	// outTopicAliases maps a full MQTT topic to the outbound alias the server
+	// bound it to on this connection. Guarded by the client lock (c.mu): deliveries
+	// arrive on multiple publisher goroutines, and the alias assignment must be
+	// atomic with queueOutbound so the binding PUBLISH (full topic + alias) is
+	// always buffered before any alias-only PUBLISH referencing it. Lazily
+	// allocated on first bind; first-come-first-served, values 1..outTopicAliasMax,
+	// no eviction (a topic beyond the table is sent unaliased). Connection-scoped:
+	// aliases never survive a reconnect or session takeover. Spec5 [3.3.2.3.4].
+	outTopicAliases map[string]uint16
+
+	// serverKeepAlive is the keep alive (seconds) this server enforces when it
+	// overrides a v5 client's requested value; advertised in the CONNACK Server
+	// Keep Alive property. 0 = no override (property omitted). Set during
+	// CONNECT, read on the CONNACK path only. Spec5 [3.2.2.3.14].
+	serverKeepAlive uint16
+
+	// responseInfo is the CONNACK Response Information string to return to this
+	// client. Set during CONNECT only when the client's Request Response
+	// Information is 1 and the server is configured with a base response topic;
+	// empty otherwise. Read on the CONNACK path only. Spec5 [3.2.2.3.15].
+	responseInfo string
+
+	// recvMaxIn is the server's Receive Maximum advertised in this connection's
+	// success CONNACK and enforced on inbound QoS 1/2 PUBLISH. 0 => not advertised
+	// or enforced (3.1.1, or disabled). Resolved once at CONNECT (like
+	// topicAliasMax) so the advertised and enforced values match across a reload.
+	// Read loop only. Spec5 [3.2.2.3.3], [4.9].
+	recvMaxIn uint16
+
+	// qos2InFlight holds the inbound QoS 2 packet identifiers between PUBREC and
+	// PUBREL: the portion of the client's consumed send quota the server can
+	// durably observe, checked against recvMaxIn [MQTT-4.9]. QoS 1 is not
+	// tracked: its quota slot is returned when the client receives the PUBACK,
+	// which the server cannot observe (no post-PUBACK signal flows back), so pure
+	// QoS 1 overrun is left to the client's own compliance (and a flood to the
+	// slow-consumer limits); a QoS 1 PUBLISH is still rejected when held QoS 2
+	// messages already fill the quota. Lazily allocated, bounded by recvMaxIn,
+	// connection-scoped (c.mqtt is rebuilt per connection => a fresh quota each
+	// network connection). Read loop only.
+	qos2InFlight map[uint16]struct{}
+
+	// rejectQoS2Pub tells the MQTT client to not accept QoS2 PUBLISH, instead
+	// error and terminate the connection.
+	rejectQoS2Pub bool
+
+	// downgradeQOS2Sub tells the MQTT client to downgrade QoS2 SUBSCRIBE
+	// requests to QoS1.
+	downgradeQoS2Sub bool
+}
+
+// mqttProperties holds the parsed MQTT 5.0 variable-header properties for a
+// packet. Only the fields needed by the current implementation are tracked;
+// recognized-but-unused properties are validated then discarded. Spec
+// [MQTT-2.2.2].
+type mqttProperties struct {
+	sessionExpiry    uint32
+	receiveMax       uint16
+	maxPacketSize    uint32
+	topicAliasMax    uint16
+	topicAlias       uint16
+	willDelay        uint32
+	messageExpiry    uint32
+	serverKeepAlive  uint16
+	maxQoS           byte
+	payloadFormat    byte
+	requestProblem   byte
+	requestResponse  byte
+	retainAvailable  byte
+	wildcardSubAvail byte
+	subIDAvail       byte
+	sharedSubAvail   byte
+	subIDs           []int
+	assignedClientID string
+	authMethod       string
+	contentType      string
+	responseTopic    string
+	responseInfo     string
+	reasonString     string
+	correlationData  []byte
+	authData         []byte
+	user             []mqttUserProperty
+	// Tracks which scalar properties were present, so we can reject illegal
+	// duplicates and tell "absent" apart from "explicit zero".
+	present map[byte]bool
+}
+
+type mqttUserProperty struct {
+	key   string
+	value string
+}
+
+type mqttPending struct {
+	sseq         uint64 // stream sequence
+	jsAckSubject string // the ACK subject to send the ack to
+	jsDur        string // JS durable name
+}
+
+// mqttDeferredKey identifies a JS message delivery withheld by outbound flow
+// control: the consumer durable it came from and its stream sequence.
+type mqttDeferredKey struct {
+	jsDur string
+	sseq  uint64
+}
+
+type mqttConnectProto struct {
+	rd    time.Duration
+	ka    uint16 // client-requested keep alive (seconds), 0 = none
+	will  *mqttWill
+	flags byte
+	// MQTT 5.0 CONNECT properties (nil for 3.1.1).
+	props *mqttProperties
+}
+
+type mqttIOReader interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
+type mqttReader struct {
+	reader mqttIOReader
+	buf    []byte
+	pos    int
+	pstart int
+	pbuf   []byte
+}
+
+type mqttWriter struct {
+	bytes.Buffer
+}
+
+type mqttWill struct {
+	topic   []byte
+	subject []byte
+	mapped  []byte
+	message []byte
+	qos     byte
+	retain  bool
+	// MQTT 5.0 Will properties (nil for 3.1.1).
+	props *mqttProperties
+}
+
+// mqttPendingWill is a Will Message whose publication has been deferred by the
+// MQTT 5.0 Will Delay Interval. The timer fires the will once the delay elapses,
+// unless a new connection to the same session cancels it first. Spec5
+// [3.1.3.2.2], [MQTT-3.1.2-8].
+type mqttPendingWill struct {
+	timer *time.Timer
+	will  *mqttWill    // parse-time copies, safe to use after the client is gone
+	props []byte       // encoded forwardable Will properties block (pp.props format)
+	acc   *Account     // account to publish the delayed will into
+	perms *permissions // publisher's permissions, so the delayed publish is still permission-checked
+	user  string       // publisher's username, recorded as the source of a retained will
+}
+
+// mqttSharedSubPrefix is the MQTT 5.0 Shared Subscription topic filter prefix
+// ("$share/{ShareName}/{filter}"). Spec5 [4.8.2].
+var mqttSharedSubPrefix = []byte("$share/")
+
+// mqttSharedNames returns the deterministic, cluster-wide names for a shared
+// subscription group on a given underlying NATS subject: the queue-group name
+// (also used as the JS consumer DeliverGroup), the consumer's deliver subject,
+// and the durable consumer name. Keyed by a hash of ShareName + subject so all
+// members converge on one consumer; 16 chars to make an accidental collision
+// (which would merge two distinct shared subscriptions) negligible. Spec5 [4.8.2].
+func mqttSharedNames(group, subject string) (queue, deliver, durable string) {
+	qkey := getHashSize(group+" "+subject, 16)
+	queue = mqttSharedQueuePrefix + qkey
+	deliver = mqttSharedSubDeliverPrefix + qkey
+	durable = mqttSharedConsumerDurablePrefix + qkey
+	return queue, deliver, durable
+}
+
+type mqttFilter struct {
+	filter string
+	qos    byte
+	// v5 Retain Handling subscription option (bits 4-5 of the options byte):
+	// 0 = send retained at subscribe, 1 = send only if the subscription is new,
+	// 2 = never. Zero value (0) matches 3.1.1 behavior. Spec5 [3.8.3.1].
+	retainHandling byte
+	// v5 No Local subscription option (bit 2): when set, a message must not be
+	// delivered back to the connection that published it. Spec5 [3.8.3.1].
+	noLocal bool
+	// v5 Retain As Published subscription option (bit 3): when set, a
+	// live-forwarded message keeps the RETAIN flag it was published with. Spec5
+	// [3.8.3.1].
+	retainAsPublished bool
+	// v5 Subscription Identifier from the SUBSCRIBE properties block (0 = none).
+	// The packet's single identifier applies to every filter it carries. Spec5
+	// [3.8.2.1.2].
+	subID int
+	// v5 (UN)SUBACK reason code for this filter (zero value is success).
+	reason byte
+	// v5 human-readable failure detail, set where a filter is rejected. The
+	// (UN)SUBACK packet-level Reason String carries the first failed filter's
+	// text. Spec5 [3.9.2.2.2].
+	reasonStr string
+	// shared is set when the filter is an MQTT 5.0 Shared Subscription
+	// ("$share/{ShareName}/{filter}", v5 only). group holds the ShareName. When
+	// shared, filter holds the NATS subject of the underlying topic filter only
+	// (the "$share/" prefix and ShareName are stripped), so all existing
+	// per-subject logic applies unchanged. Spec5 [4.8.2].
+	shared bool
+	group  string
+	// Used only for tracing and should not be used after parsing of (un)sub protocols.
+	ttopic []byte
+}
+
+// sessionKey returns the key used for this filter in the session's subscription
+// maps and as the NATS subscription sid. A shared subscription embeds its
+// ShareName so distinct groups (and a plain subscription) on the same subject do
+// not collide; a plain subscription just uses its NATS subject (which never
+// contains '/'). Spec5 [4.8.2].
+func (f *mqttFilter) sessionKey() string {
+	if f.shared {
+		return string(mqttSharedSubPrefix) + f.group + "/" + f.filter
+	}
+	return f.filter
+}
+
+type mqttPublish struct {
+	topic   []byte
+	subject []byte
+	mapped  []byte
+	msg     []byte
+	sz      int
+	pi      uint16
+	flags   byte
+	// props is the raw MQTT 5.0 properties block (variable-int length prefix +
+	// body, exactly as received on the wire), captured so it can be forwarded
+	// unaltered to v5 subscribers. nil when absent or empty (3.1.1, or a v5
+	// PUBLISH with no properties). Spec5 [3.3.2.3].
+	props []byte
+}
+
+// When we re-encode incoming MQTT PUBLISH messages for NATS delivery, we add
+// the following headers:
+//   - "Nmqtt-Pub" (*always) indicates that the message originated from MQTT, and
+//     contains the original message QoS.
+//   - "Nmqtt-Subject" contains the original MQTT subject from mqttParsePub.
+//   - "Nmqtt-Mapped" contains the mapping during mqttParsePub.
+//
+// When we submit a PUBREL for delivery, we add a "Nmqtt-PubRel" header that
+// contains the PI.
+const (
+	// NATS header that indicates that the message originated from MQTT and
+	// stores the published message QOS.
+	mqttNatsHeader = "Nmqtt-Pub"
+
+	// NATS headers to store retained message metadata (along with the original
+	// message as binary).
+	mqttNatsRetainedMessageTopic  = "Nmqtt-RTopic"
+	mqttNatsRetainedMessageOrigin = "Nmqtt-ROrigin"
+	mqttNatsRetainedMessageFlags  = "Nmqtt-RFlags"
+	mqttNatsRetainedMessageSource = "Nmqtt-RSource"
+	// Authenticated No Local origin marker for the session that published the
+	// retained message (see mqttNatsHeaderOrigin). Absent for older stored
+	// messages or when v5 is disabled.
+	mqttNatsRetainedMessageSessionHash = "Nmqtt-RSession"
+	// Raw MQTT 5.0 properties block for a retained message (base64), so v5
+	// properties are replayed to subscribers. Absent for older stored messages.
+	mqttNatsRetainedMessageProps = "Nmqtt-RProps"
+
+	// Absolute expiry deadline (Unix nanoseconds, decimal) for a retained message
+	// that was published with an MQTT 5.0 Message Expiry Interval. Carried with
+	// the stored message so the remaining interval can be computed on replay
+	// regardless of which server (or cache) serves it. Absent when the retained
+	// message has no expiry. Spec5 [3.3.2.3.3].
+	mqttNatsRetainedMessageExpiry = "Nmqtt-RExp"
+
+	// NATS header that indicates that the message is an MQTT PubRel and stores
+	// the PI.
+	mqttNatsPubRelHeader = "Nmqtt-PubRel"
+
+	// NATS headers to store the original MQTT subject and the subject mapping.
+	mqttNatsHeaderSubject = "Nmqtt-Subject"
+	mqttNatsHeaderMapped  = "Nmqtt-Mapped"
+
+	// NATS header carrying the raw MQTT 5.0 PUBLISH properties block
+	// (base64-encoded, since the block is binary and NATS header values are
+	// CRLF-delimited text) so end-to-end properties survive the NATS/JetStream
+	// hop and can be re-emitted to v5 subscribers.
+	mqttNatsHeaderProps = "Nmqtt-Props"
+
+	// NATS header carrying an authenticated No Local origin marker (an HMAC of
+	// the publishing session hash, subject, and payload under a per-server
+	// secret), so the v5 No Local option can suppress delivering a QoS 1/2
+	// message back to the connection that published it after it crosses the
+	// JetStream store, where the origin client is otherwise lost. Because it is
+	// an HMAC, a client that can write the stream subjects cannot forge it. Absent
+	// when the publisher
+	// has no session (e.g. an internal Will client) or v5 is off. Spec5 [3.8.3.1].
+	mqttNatsHeaderOrigin = "Nmqtt-Origin"
+
+	// NATS header (value "1") marking that the message was published with the
+	// RETAIN flag set, so the v5 Retain As Published subscription option can keep
+	// that flag on a live forward after the original flag is cleared for normal
+	// delivery. Present only for retained publishes when v5 is enabled. Spec5
+	// [3.8.3.1].
+	mqttNatsHeaderRetain = "Nmqtt-Ret"
+)
+
+type mqttParsedPublishNATSHeader struct {
+	qos      byte
+	subject  []byte
+	mapped   []byte
+	retained bool   // published with RETAIN set (from Nmqtt-Ret), for Retain As Published
+	props    []byte // raw MQTT 5.0 properties block (decoded from Nmqtt-Props)
+	origin   []byte // authenticated No Local origin marker (from Nmqtt-Origin)
+}
+
+func (s *Server) startMQTT() {
+	if s.isShuttingDown() {
+		return
+	}
+
+	sopts := s.getOpts()
+	o := &sopts.MQTT
+
+	var hl net.Listener
+	var err error
+
+	port := o.Port
+	if port == -1 {
+		port = 0
+	}
+	hp := net.JoinHostPort(o.Host, strconv.Itoa(port))
+	s.mu.Lock()
+	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+	// MQTT 5.0 is always enabled in mqtt-nats-bridge.
+	s.mqtt.v5Enabled = true
+	// Per-server secret keying the No Local origin HMAC. Best-effort: if the read
+	// fails the key stays nil and No Local simply never suppresses (fail-open).
+	if s.mqtt.originKey == nil {
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err == nil {
+			s.mqtt.originKey = key
+		}
+	}
+	hl, err = natsListen("tcp", hp)
+	s.mqtt.listenerErr = err
+	if err != nil {
+		s.mu.Unlock()
+		s.Fatalf("Unable to listen for MQTT connections: %v", err)
+		return
+	}
+	if port == 0 {
+		o.Port = hl.Addr().(*net.TCPAddr).Port
+	}
+	s.mqtt.listener = hl
+	scheme := "mqtt"
+	if o.TLSConfig != nil {
+		scheme = "tls"
+	}
+	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
+	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) }, nil)
+	s.mu.Unlock()
+}
+
+// This is similar to createClient() but has some modifications specifi to MQTT clients.
+// The comments have been kept to minimum to reduce code size. Check createClient() for
+// more details.
+func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
+	opts := s.getOpts()
+
+	maxPay := int32(opts.MaxPayload)
+	maxSubs := int32(opts.MaxSubs)
+	if maxSubs == 0 {
+		maxSubs = -1
+	}
+	now := time.Now()
+
+	mqtt := &mqtt{
+		rejectQoS2Pub:    opts.MQTT.rejectQoS2Pub,
+		downgradeQoS2Sub: opts.MQTT.downgradeQoS2Sub,
+	}
+	c := &client{srv: s, nc: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt, ws: ws}
+	c.headers = true
+	c.mqtt.pp = &mqttPublish{}
+	// MQTT clients don't send NATS CONNECT protocols. So make it an "echo"
+	// client, but disable verbose and pedantic (by not setting them).
+	c.opts.Echo = true
+
+	c.registerWithAccount(s.globalAccount())
+
+	s.mu.Lock()
+	// Check auth, override if applicable.
+	authRequired := s.info.AuthRequired || s.mqtt.authOverride
+	s.totalClients++
+	s.mu.Unlock()
+
+	c.mu.Lock()
+	if authRequired {
+		c.flags.set(expectConnect)
+	}
+	c.initClient()
+	c.Debugf("Client connection created")
+	c.mu.Unlock()
+
+	s.mu.Lock()
+	if !s.isRunning() || s.ldm {
+		if s.isShuttingDown() {
+			conn.Close()
+		}
+		s.mu.Unlock()
+		return c
+	}
+
+	if opts.MaxConn < 0 || (opts.MaxConn > 0 && len(s.clients) >= opts.MaxConn) {
+		s.mu.Unlock()
+		c.maxConnExceeded()
+		return nil
+	}
+	s.clients[c.cid] = c
+	// Reserve the shutdown-drain lifecycle token under the same s.mu that makes
+	// the client visible to a Shutdown snapshot; released via c.finish() from
+	// readLoop's defer or abortSetup. Every early return below goes through
+	// abortSetup so the token is never leaked.
+	s.clientWG.Add(1)
+
+	// Websocket TLS handshake is already done when getting to this function.
+	tlsRequired := opts.MQTT.TLSConfig != nil && ws == nil
+	s.mu.Unlock()
+
+	c.mu.Lock()
+
+	// In case connection has already been closed
+	if c.isClosed() {
+		c.mu.Unlock()
+		c.abortSetup(WriteError)
+		return nil
+	}
+
+	var pre []byte
+	if tlsRequired && opts.AllowNonTLS {
+		pre = make([]byte, 4)
+		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.MQTT.TLSTimeout)))
+		n, _ := io.ReadFull(c.nc, pre[:])
+		c.nc.SetReadDeadline(time.Time{})
+		pre = pre[:n]
+		if n > 0 && pre[0] == 0x16 {
+			tlsRequired = true
+		} else {
+			tlsRequired = false
+		}
+	}
+
+	if tlsRequired {
+		if len(pre) > 0 {
+			c.nc = &tlsMixConn{c.nc, bytes.NewBuffer(pre)}
+			pre = nil
+		}
+
+		// Perform server-side TLS handshake.
+		if err := c.doTLSServerHandshake(tlsHandshakeMQTT, opts.MQTT.TLSConfig, opts.MQTT.TLSTimeout, opts.MQTT.TLSPinnedCerts); err != nil {
+			c.mu.Unlock()
+			c.abortSetup(TLSHandshakeError)
+			return nil
+		}
+	}
+
+	if authRequired {
+		timeout := opts.AuthTimeout
+		// Possibly override with MQTT specific value.
+		if opts.MQTT.AuthTimeout != 0 {
+			timeout = opts.MQTT.AuthTimeout
+		}
+		c.setAuthTimer(secondsToDuration(timeout))
+	}
+
+	// No Ping timer for MQTT clients...
+
+	// readLoop is tracked by clientWG (token reserved at registration, released
+	// by its defer via c.finish), so Shutdown Phase 1 can wait for client cleanup
+	// independently of the background grWG goroutines. writeLoop stays on grWG.
+	go c.readLoop(pre)
+	s.startGoRoutine(func() { c.writeLoop() })
+
+	if tlsRequired {
+		c.Debugf("TLS handshake complete")
+		cs := c.nc.(*tls.Conn).ConnectionState()
+		c.Debugf("TLS version %s, cipher suite %s", tlsVersion(cs.Version), tls.CipherSuiteName(cs.CipherSuite))
+	}
+
+	c.mu.Unlock()
+
+	return c
+}
+
+// Given the mqtt options, we check if any auth configuration
+// has been provided. If so, possibly create users/nkey users and
+// store them in s.mqtt.users/nkeys.
+// Also update a boolean that indicates if auth is required for
+// mqtt clients.
+// Server lock is held on entry.
+func (s *Server) mqttConfigAuth(opts *MQTTOpts) {
+	mqtt := &s.mqtt
+	// If any of those is specified, we consider that there is an override.
+	mqtt.authOverride = opts.Username != _EMPTY_ || opts.Token != _EMPTY_ || opts.NoAuthUser != _EMPTY_
+}
+
+// Validate the mqtt related options.
+func validateMQTTOptions(o *Options) error {
+	mo := &o.MQTT
+	// If no port is defined, we don't care about other options
+	if mo.Port == 0 {
+		return nil
+	}
+	// We have to force the server name to be explicitly set and be unique when
+	// in cluster mode.
+	if o.ServerName == _EMPTY_ && (o.Cluster.Port != 0 || o.Gateway.Port != 0) {
+		return errMQTTServerNameMustBeSet
+	}
+	// If there is a NoAuthUser, we need to have Users defined and
+	// the user to be present.
+	if mo.NoAuthUser != _EMPTY_ {
+		if err := validateNoAuthUser(o, mo.NoAuthUser); err != nil {
+			return err
+		}
+	}
+	// Token/Username not possible if there are users/nkeys
+	if len(o.Users) > 0 || len(o.Nkeys) > 0 {
+		if mo.Username != _EMPTY_ {
+			return errMQTTUserMixWithUsersNKeys
+		}
+		if mo.Token != _EMPTY_ {
+			return errMQTTTokenMixWIthUsersNKeys
+		}
+	}
+	if mo.AckWait < 0 {
+		return errMQTTAckWaitMustBePositive
+	}
+	if mo.JSAPITimeout < 0 {
+		return errMQTTJSAPITimeoutMustBePositive
+	}
+	// Validate the max protocol version for all configuration paths (config
+	// file parsing already checks this, but programmatic Options do not). 0
+	// means default (3.1.1 only); 4 and 5 are the supported explicit values.
+	// Any other value would make the runtime cap reject even 3.1.1 connects.
+	switch mo.MaxProtocolVersion {
+	case 0, mqttProtoLevel, mqttProtoLevel5:
+	default:
+		return fmt.Errorf("mqtt max_protocol_version must be 0 (default), 4 or 5, got %d", mo.MaxProtocolVersion)
+	}
+	// Topic Alias Maximum: 0 = use default, -1 = disabled, 1..65535 explicit.
+	// Config-file parsing already checks this; programmatic Options do not.
+	if mo.TopicAliasMaximum < -1 || mo.TopicAliasMaximum > 0xFFFF {
+		return fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultTopicAliasMax, mo.TopicAliasMaximum)
+	}
+	// Receive Maximum: 0 = use default, -1 (or config 0) = disabled, 1..65535
+	// explicit. Config-file parsing already checks this; programmatic Options do
+	// not.
+	if mo.ReceiveMaximum < -1 || mo.ReceiveMaximum > 0xFFFF {
+		return fmt.Errorf("mqtt receive_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultReceiveMax, mo.ReceiveMaximum)
+	}
+	// Keep Alive Maximum: 0 = no override, 1..65535 explicit. No -1 sentinel is
+	// needed (unlike topic_alias_maximum): there is no non-zero default, so
+	// unset and disabled are the same thing.
+	if mo.KeepAliveMaximum < 0 || mo.KeepAliveMaximum > 0xFFFF {
+		return fmt.Errorf("mqtt keep_alive_maximum must be in [0..%d] (0 = no override), got %d", 0xFFFF, mo.KeepAliveMaximum)
+	}
+	// If strictly standalone and there is no JS enabled, then it won't work...
+	// For leafnodes, we could either have remote(s) and it would be ok, or no
+	// remote but accept from a remote side that has "hub" property set, which
+	// then would ok too. So we fail only if we have no leafnode config at all.
+	if !o.JetStream && o.Cluster.Port == 0 && o.Gateway.Port == 0 &&
+		o.LeafNode.Port == 0 && len(o.LeafNode.Remotes) == 0 {
+		return errMQTTStandaloneNeedsJetStream
+	}
+	if err := validatePinnedCerts(mo.TLSPinnedCerts); err != nil {
+		return fmt.Errorf("mqtt: %v", err)
+	}
+	if mo.ConsumerReplicas > 0 && mo.StreamReplicas > 0 && mo.ConsumerReplicas > mo.StreamReplicas {
+		return fmt.Errorf("mqtt: consumer_replicas (%v) cannot be higher than stream_replicas (%v)",
+			mo.ConsumerReplicas, mo.StreamReplicas)
+	}
+	return nil
+}
+
+// Returns true if this connection is from a MQTT client.
+// Lock held on entry.
+func (c *client) isMqtt() bool {
+	return c.mqtt != nil
+}
+
+// If this is an MQTT client, returns the session client ID,
+// otherwise returns the empty string.
+// Lock held on entry
+func (c *client) getMQTTClientID() string {
+	if !c.isMqtt() {
+		return _EMPTY_
+	}
+	return c.mqtt.cid
+}
+
+// Parse protocols inside the given buffer.
+// This is invoked from the readLoop.
+func (c *client) mqttParse(buf []byte) error {
+	c.mu.Lock()
+	s := c.srv
+	trace := c.trace
+	connected := c.flags.isSet(connectReceived)
+	mqtt := c.mqtt
+	r := mqtt.r
+	var rd time.Duration
+	if mqtt.cp != nil {
+		rd = mqtt.cp.rd
+		if rd > 0 {
+			r.reader.SetReadDeadline(time.Time{})
+		}
+	}
+	hasMappings := c.in.flags.isSet(hasMappings)
+	c.mu.Unlock()
+
+	r.reset(buf)
+
+	var err error
+	var b byte
+	var pl int
+	var complete bool
+
+	for err == nil && r.hasMore() {
+
+		// Keep track of the starting of the packet, in case we have a partial
+		r.pstart = r.pos
+
+		// Read packet type and flags
+		if b, err = r.readByte("packet type"); err != nil {
+			break
+		}
+
+		// Packet type
+		pt := b & mqttPacketMask
+
+		// If client was not connected yet, the first packet must be
+		// a mqttPacketConnect otherwise we fail the connection.
+		if !connected && pt != mqttPacketConnect {
+			// If the buffer indicates that it may be a websocket handshake
+			// but the client is not websocket, it means that the client
+			// connected to the MQTT port instead of the Websocket port.
+			if bytes.HasPrefix(buf, []byte("GET ")) && !c.isWebsocket() {
+				err = errMQTTNotWebsocketPort
+			} else {
+				err = fmt.Errorf("the first packet should be a CONNECT (%v), got %v", mqttPacketConnect, pt)
+			}
+			break
+		}
+		if err = mqttCheckFixedHeaderFlags(pt, b&mqttPacketFlagMask); err != nil {
+			break
+		}
+
+		maxLen := int32(jwt.NoLimit)
+		if !connected {
+			maxLen = atomic.LoadInt32(&c.mpay)
+		} else if mps := c.mqtt.maxInPacketSize; mps > 0 {
+			// Enforce the Maximum Packet Size advertised in the CONNACK. A larger
+			// packet is cut off before its body is buffered. [MQTT-3.2.2-15].
+			maxLen = int32(mps)
+		}
+		pl, complete, err = r.readPacketLen(maxLen)
+		if err != nil || !complete {
+			if err == ErrMaxPayload {
+				// Tell a connected v5 client why before the close (no-op for 3.1.1
+				// and pre-CONNECT); maxPayloadViolation then logs and closes.
+				if connected {
+					c.mqttEnqueueDisconnect(mqttReasonPacketTooLarge,
+						fmt.Sprintf("packet size %d exceeds maximum packet size %d", pl, maxLen))
+				}
+				c.maxPayloadViolation(pl, maxLen)
+			}
+			break
+		}
+		if err = mqttCheckRemainingLength(pt, c.mqtt.proto, pl); err != nil {
+			break
+		}
+
+		switch pt {
+		// Packets that we receive back when we act as the "sender": PUBACK,
+		// PUBREC, PUBCOMP.
+		case mqttPacketPubAck:
+			var pi uint16
+			pi, _, err = mqttParsePubResponsePacket(r, c.mqtt.proto, pl)
+			if trace {
+				c.traceInOp("PUBACK", errOrTrace(err, fmt.Sprintf("pi=%v", pi)))
+			}
+			if err == nil {
+				err = c.mqttProcessPubAck(pi)
+			}
+
+		case mqttPacketPubRec:
+			var pi uint16
+			var reason byte
+			pi, reason, err = mqttParsePubResponsePacket(r, c.mqtt.proto, pl)
+			if trace {
+				c.traceInOp("PUBREC", errOrTrace(err, fmt.Sprintf("pi=%v", pi)))
+			}
+			if err == nil {
+				err = c.mqttProcessPubRec(pi, reason)
+			}
+
+		case mqttPacketPubComp:
+			var pi uint16
+			pi, _, err = mqttParsePubResponsePacket(r, c.mqtt.proto, pl)
+			if trace {
+				c.traceInOp("PUBCOMP", errOrTrace(err, fmt.Sprintf("pi=%v", pi)))
+			}
+			if err == nil {
+				c.mqttProcessPubComp(pi)
+			}
+
+		// Packets where we act as the "receiver": PUBLISH, PUBREL, SUBSCRIBE, UNSUBSCRIBE.
+		case mqttPacketPub:
+			pp := c.mqtt.pp
+			pp.flags = b & mqttPacketFlagMask
+			err = c.mqttParsePub(r, pl, pp, hasMappings)
+			if trace {
+				c.traceInOp("PUBLISH", errOrTrace(err, mqttPubTrace(pp)))
+				if err == nil {
+					c.mqttTraceMsg(pp.msg)
+				}
+			}
+			if err == nil {
+				err = s.mqttProcessPub(c, pp, trace)
+			}
+
+		case mqttPacketPubRel:
+			var pi uint16
+			pi, _, err = mqttParsePubResponsePacket(r, c.mqtt.proto, pl)
+			if trace {
+				c.traceInOp("PUBREL", errOrTrace(err, fmt.Sprintf("pi=%v", pi)))
+			}
+			if err == nil {
+				err = s.mqttProcessPubRel(c, pi, trace)
+			}
+
+		case mqttPacketSub:
+			var pi uint16 // packet identifier
+			var filters []*mqttFilter
+			var subs []*subscription
+			pi, filters, err = c.mqttParseSubs(r, b, pl)
+			if trace {
+				c.traceInOp("SUBSCRIBE", errOrTrace(err, mqttSubscribeTrace(pi, filters)))
+			}
+			if err == nil {
+				subs, err = c.mqttProcessSubs(filters)
+			}
+			if err == nil {
+				// Trace only if the SUBACK was actually sent (a tiny client
+				// Maximum Packet Size can suppress it).
+				if c.mqttEnqueueSubAck(pi, filters) && trace {
+					c.traceOutOp("SUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
+				}
+				c.mqttSendRetainedMsgsToNewSubs(subs)
+			}
+
+		case mqttPacketUnsub:
+			var pi uint16 // packet identifier
+			var filters []*mqttFilter
+			pi, filters, err = c.mqttParseUnsubs(r, b, pl)
+			if trace {
+				c.traceInOp("UNSUBSCRIBE", errOrTrace(err, mqttUnsubscribeTrace(pi, filters)))
+			}
+			if err == nil {
+				err = c.mqttProcessUnsubs(filters)
+			}
+			if err == nil {
+				// Trace only if the UNSUBACK was actually sent (a tiny client
+				// Maximum Packet Size can suppress it).
+				if c.mqttEnqueueUnsubAck(pi, filters) && trace {
+					c.traceOutOp("UNSUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
+				}
+			}
+
+		// Packets that we get both as a receiver and sender: PING, CONNECT, DISCONNECT
+		case mqttPacketPing:
+			if trace {
+				c.traceInOp("PINGREQ", nil)
+			}
+			c.mqttEnqueuePingResp()
+			if trace {
+				c.traceOutOp("PINGRESP", nil)
+			}
+
+		case mqttPacketConnect:
+			// It is an error to receive a second connect packet
+			if connected {
+				err = errMQTTSecondConnectPacket
+				break
+			}
+			var rc byte
+			var cp *mqttConnectProto
+			var sessp bool
+			start := r.pos
+			rc, cp, err = c.mqttParseConnect(r, hasMappings)
+			// CONNECT has no trailing length check of its own; a lying
+			// properties length would silently desync the packet stream.
+			if err == nil && rc == 0 && r.pos-start != pl {
+				err = fmt.Errorf("connect packet length mismatch: consumed %v bytes, remaining length is %v", r.pos-start, pl)
+			}
+			// Add the client id to the client's string, regardless of error.
+			// We may still get the client_id if the call above fails somewhere
+			// after parsing the client ID itself.
+			c.ncs.Store(fmt.Sprintf("%s - %q", c, c.mqtt.cid))
+			if trace && cp != nil {
+				c.traceInOp("CONNECT", errOrTrace(err, c.mqttConnectTrace(cp)))
+			}
+			if rc != 0 {
+				var rs string
+				if err != nil {
+					rs = err.Error()
+				}
+				sent, _ := c.mqttEnqueueConnAck(rc, sessp, rs)
+				if sent && trace {
+					c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
+				}
+			} else if err != nil {
+				// A malformed CONNECT has no return code. v5 expects a CONNACK
+				// with the failure reason before the close; 3.1.1 just closes.
+				// Spec5 [3.1.4.1], [MQTT-3.1.2-19].
+				if c.mqtt.proto == mqttProtoLevel5 {
+					reason := mqttConnAckReasonFromConnectErr(err)
+					sent, _ := c.mqttEnqueueConnAck(reason, false, err.Error())
+					if sent && trace {
+						c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", false, reason)))
+					}
+				}
+			} else {
+				if err = s.mqttProcessConnect(c, cp, trace); err != nil {
+					err = fmt.Errorf("unable to connect: %v", err)
+					// If the success CONNACK already went out, mark connected so
+					// the v5 error path below sends a DISCONNECT with the reason
+					// instead of a bare close. Read under the client lock: the
+					// writeLoop mutates c.flags while flushing that CONNACK.
+					c.mu.Lock()
+					connected = c.flags.isSet(connectReceived)
+					c.mu.Unlock()
+				} else {
+					// Add this debug statement so users running in Debug mode
+					// will have the client id printed here for the first time.
+					c.Debugf("Client connected")
+					connected = true
+					rd = cp.rd
+				}
+			}
+
+		case mqttPacketDisconnect:
+			// By default a DISCONNECT discards the Will. Spec [MQTT-3.1.2-8].
+			discardWill := true
+			if c.mqtt.proto == mqttProtoLevel5 && pl > 0 {
+				// v5 DISCONNECT carries a reason code and optional properties.
+				// Spec5 [3.14]. Reason 0x04 ("Disconnect with Will Message")
+				// instructs the server to publish the Will instead.
+				var rcode byte
+				if rcode, err = r.readByte("disconnect reason code"); err != nil {
+					break
+				}
+				var props *mqttProperties
+				if pl > 1 {
+					if props, err = r.readProperties(mqttPacketDisconnect); err != nil {
+						break
+					}
+				}
+				if rcode == mqttReasonDisconnectWithWill {
+					discardWill = false
+				}
+				// Spec5 [3.14.2.2.2]: a DISCONNECT may update the Session Expiry
+				// Interval. Raising it from 0 is a Protocol Error; ignore that
+				// override rather than fail an already-closing connection.
+				if props != nil && props.present[mqttPropSessionExpiry] {
+					c.mu.Lock()
+					sess := c.mqtt.sess
+					c.mu.Unlock()
+					if sess != nil {
+						sess.mu.Lock()
+						// Only if this client still owns the session: after a takeover
+						// sess.c is the new client, and a late DISCONNECT from the old
+						// connection must not clobber the live session's interval.
+						if sess.c == c && (sess.expiryInterval != 0 || props.sessionExpiry == 0) {
+							sess.expiryInterval = props.sessionExpiry
+						}
+						sess.mu.Unlock()
+					}
+				}
+			}
+			if trace {
+				c.traceInOp("DISCONNECT", nil)
+			}
+			if discardWill {
+				c.mu.Lock()
+				if c.mqtt.cp != nil {
+					c.mqtt.cp.will = nil
+				}
+				c.mu.Unlock()
+			}
+			s.mqttHandleClosedClient(c)
+			c.closeConnection(ClientClosed)
+			return nil
+
+		default:
+			err = fmt.Errorf("%w: received unknown packet type %d", errMQTTMalformedPacket, pt>>4)
+		}
+	}
+	if err == nil && rd > 0 {
+		r.reader.SetReadDeadline(time.Now().Add(rd))
+	} else if err != nil && err != ErrMaxPayload && connected && c.mqtt.proto == mqttProtoLevel5 {
+		// Best-effort: tell the v5 client why we are about to close. The read
+		// loop closes the connection right after this returns. ErrMaxPayload is
+		// excluded: it already sent a DISCONNECT 0x95 and closed above.
+		c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(err), err.Error())
+	}
+	return err
+}
+
+func mqttCheckFixedHeaderFlags(packetType, flags byte) error {
+	var expected byte
+	switch packetType {
+	case mqttPacketConnect, mqttPacketPubAck, mqttPacketPubRec, mqttPacketPubComp,
+		mqttPacketPing, mqttPacketDisconnect:
+		expected = 0
+	case mqttPacketPubRel, mqttPacketSub, mqttPacketUnsub:
+		expected = 0x2
+	case mqttPacketPub:
+		return nil
+	default:
+		return nil
+	}
+	if flags != expected {
+		return fmt.Errorf("%w: invalid fixed header flags %x for packet type %x", errMQTTMalformedPacket, flags, packetType)
+	}
+	return nil
+}
+
+func mqttCheckRemainingLength(packetType, proto byte, pl int) error {
+	v5 := proto == mqttProtoLevel5
+	var expected int
+	switch packetType {
+	case mqttPacketConnect, mqttPacketPub, mqttPacketSub, mqttPacketUnsub:
+		return nil
+	case mqttPacketPubAck, mqttPacketPubRec, mqttPacketPubRel, mqttPacketPubComp:
+		if v5 {
+			// v5: packet identifier (2) + optional reason code + optional
+			// properties. Spec5 [3.4.2.1].
+			if pl < 2 {
+				return fmt.Errorf("%w: invalid remaining length %d for packet type %x", errMQTTMalformedPacket, pl, packetType)
+			}
+			return nil
+		}
+		expected = 2
+	case mqttPacketDisconnect:
+		if v5 {
+			// v5: 0 (normal disconnect) or reason code + optional properties.
+			// Spec5 [3.14.2.1].
+			return nil
+		}
+		expected = 0
+	case mqttPacketPing:
+		expected = 0
+	default:
+		return nil
+	}
+	if pl != expected {
+		return fmt.Errorf("%w: invalid remaining length %d for packet type %x", errMQTTMalformedPacket, pl, packetType)
+	}
+	return nil
+}
+
+func (c *client) mqttTraceMsg(msg []byte) {
+	maxTrace := c.srv.getOpts().MaxTracedMsgLen
+	if maxTrace > 0 && len(msg) > maxTrace {
+		c.Tracef("<<- MSG_PAYLOAD: [\"%s...\"]", msg[:maxTrace])
+	} else {
+		c.Tracef("<<- MSG_PAYLOAD: [%q]", msg)
+	}
+}
+
+// The MQTT client connection has been closed, or the DISCONNECT packet was received.
+// For a "clean" session, we will delete the session, otherwise, simply removing
+// the binding. We will also send the "will" message if applicable.
+//
+// Runs from the client's readLoop.
+// No lock held on entry.
+func (s *Server) mqttHandleClosedClient(c *client) {
+	c.mu.Lock()
+	asm := c.mqtt.asm
+	sess := c.mqtt.sess
+	c.mu.Unlock()
+
+	// If asm or sess are nil, it means that we have failed a client
+	// before it was associated with a session, so nothing more to do.
+	if asm == nil || sess == nil {
+		return
+	}
+
+	// Add this session to the locked map for the rest of the execution.
+	if err := asm.lockSession(sess, c); err != nil {
+		return
+	}
+	defer asm.unlockSession(sess)
+
+	asm.mu.Lock()
+	// Clear the client from the session, but session may stay.
+	sess.mu.Lock()
+	sess.c = nil
+	// The Session Expiry Interval (set at CONNECT, possibly updated by a v5
+	// DISCONNECT) is authoritative here: 0 means the session ends at connection
+	// close. For 3.1.1 this is 0 iff the session is clean, so behavior is unchanged.
+	expiry := sess.expiryInterval
+	idHash := sess.idHash
+	sess.mu.Unlock()
+	doClean := expiry == 0
+	// If the session ends at connection close, then we remove from the account
+	// manager, and we will call clear() outside of any lock.
+	if doClean {
+		asm.removeSession(sess, false)
+	}
+	// Remove in case it was in the flappers map.
+	asm.removeSessFromFlappers(sess.id)
+	asm.mu.Unlock()
+
+	// This needs to be done outside of any lock.
+	if doClean {
+		if err := sess.clear(true); err != nil {
+			c.Errorf("%s", err.Error())
+		}
+	} else {
+		// Session survives the disconnect: drop pending QoS 1/2 state for shared
+		// group consumers without acking, so a resume does not NAK-steal messages
+		// that AckWait redelivers to other members (and so PIs are freed). Spec5 [4.8.2].
+		sess.purgeSharedPending()
+	}
+	if !doClean && expiry != mqttSessionNeverExpire {
+		// Finite Session Expiry Interval: keep the session (so a reconnect can
+		// resume it) and arm a cleanup timer. Persist the disconnect time so the
+		// deadline survives a restart; a failed save only loses restart-survival.
+		// Spec5 [3.1.2.11.2].
+		sess.mu.Lock()
+		sess.disconnectedAt = time.Now().Unix()
+		sess.mu.Unlock()
+		if err := sess.save(); err != nil {
+			c.Debugf("Unable to persist session expiry deadline: %v", err)
+		}
+		asm.scheduleSessionExpiry(s, idHash, time.Duration(expiry)*time.Second)
+	}
+
+	// Now handle the "will". This function will be a no-op if there is no "will" to
+	// send. The effective Session Expiry Interval bounds any Will Delay.
+	s.mqttHandleWill(c, expiry)
+}
+
+// Updates the MaxAckPending for all MQTT sessions, updating the
+// JetStream consumers and updating their max ack pending and forcing
+// a expiration of pending messages.
+//
+// Runs from a server configuration reload routine.
+// No lock held on entry.
+func (s *Server) mqttUpdateMaxAckPending(newmaxp uint16) {
+	msm := &s.mqtt.sessmgr
+	s.accounts.Range(func(k, _ any) bool {
+		accName := k.(string)
+		msm.mu.RLock()
+		asm := msm.sessions[accName]
+		msm.mu.RUnlock()
+		if asm == nil {
+			// Move to next account
+			return true
+		}
+		asm.mu.RLock()
+		for _, sess := range asm.sessions {
+			sess.mu.Lock()
+			sess.maxp = newmaxp
+			sess.mu.Unlock()
+		}
+		asm.mu.RUnlock()
+		return true
+	})
+}
+
+func (s *Server) mqttGetJSAForAccount(acc string) *mqttJSA {
+	sm := &s.mqtt.sessmgr
+
+	sm.mu.RLock()
+	asm := sm.sessions[acc]
+	sm.mu.RUnlock()
+
+	if asm == nil {
+		return nil
+	}
+
+	asm.mu.RLock()
+	jsa := &asm.jsa
+	asm.mu.RUnlock()
+	return jsa
+}
+
+func (s *Server) mqttStoreQoSMsgForAccountOnNewSubject(hdr int, msg []byte, acc, subject string) {
+	if s == nil || hdr <= 0 {
+		return
+	}
+	h := mqttParsePublishNATSHeader(msg[:hdr])
+	if h == nil || h.qos == 0 {
+		return
+	}
+	jsa := s.mqttGetJSAForAccount(acc)
+	if jsa == nil {
+		return
+	}
+	jsa.storeMsg(mqttStreamSubjectPrefix+subject, hdr, msg)
+}
+
+func mqttParsePublishNATSHeader(headerBytes []byte) *mqttParsedPublishNATSHeader {
+	if len(headerBytes) == 0 {
+		return nil
+	}
+
+	pubValue := getHeader(mqttNatsHeader, headerBytes)
+	if len(pubValue) == 0 {
+		return nil
+	}
+	h := &mqttParsedPublishNATSHeader{
+		qos:     pubValue[0] - '0',
+		subject: getHeader(mqttNatsHeaderSubject, headerBytes),
+		mapped:  getHeader(mqttNatsHeaderMapped, headerBytes),
+		origin:  getHeader(mqttNatsHeaderOrigin, headerBytes),
+	}
+	// Retain As Published marker: the contract is exactly "1"; anything else
+	// (absent, or a forged Nmqtt-Ret:0 / junk from a NATS publisher) is not
+	// retained. Spec5 [3.8.3.1].
+	if ret := getHeader(mqttNatsHeaderRetain, headerBytes); len(ret) == 1 && ret[0] == '1' {
+		h.retained = true
+	}
+	// MQTT 5.0 properties block, carried base64-encoded. This header can come
+	// from an untrusted source (a NATS publisher can set Nmqtt-Pub/Nmqtt-Props
+	// on a message an MQTT client is subscribed to), so the decoded block is
+	// re-validated before it may be forwarded verbatim into an outbound PUBLISH
+	// (see mqttValidateForwardProps). Best effort: anything invalid is simply
+	// dropped, never a delivery failure and never a malformed outbound packet.
+	if enc := getHeader(mqttNatsHeaderProps, headerBytes); len(enc) > 0 {
+		if raw, err := base64.StdEncoding.DecodeString(string(enc)); err == nil {
+			h.props = mqttValidateForwardProps(raw)
+		}
+	}
+	return h
+}
+
+// mqttValidateForwardProps returns raw only if it is a well-formed MQTT 5.0
+// properties block that is safe to forward to a subscriber: it must parse
+// cleanly with no trailing bytes and must not contain a Topic Alias (hop-by-hop,
+// never forwarded) or a Subscription Identifier (per-hop and server-generated at
+// delivery time; a publisher-supplied block must never smuggle one, so it is
+// disallowed in the inbound PUBLISH context). Otherwise it returns nil so the
+// message is delivered without properties. This protects against a crafted
+// Nmqtt-Props header from a non-MQTT publisher making the server emit a malformed
+// or forbidden PUBLISH.
+func mqttValidateForwardProps(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	r := &mqttReader{}
+	r.reset(raw)
+	props, err := r.readProperties(mqttPacketPub)
+	if err != nil || r.hasMore() {
+		return nil
+	}
+	// Subscription Identifier is already rejected by readProperties (not allowed
+	// in the PUBLISH context); Topic Alias parses but must not be forwarded.
+	if props != nil && props.present[mqttPropTopicAlias] {
+		return nil
+	}
+	return raw
+}
+
+// mqttVarIntFromSlice decodes an MQTT variable byte integer from the front of b.
+// It returns the value and the number of bytes consumed, or (0, -1) if b does
+// not begin with a complete, valid varint. Spec5 [1.5.5].
+func mqttVarIntFromSlice(b []byte) (int, int) {
+	m, v := 1, 0
+	for n := 0; n < len(b) && n < 4; n++ {
+		d := b[n]
+		v += int(d&0x7f) * m
+		if d&0x80 == 0 {
+			return v, n + 1
+		}
+		m *= 0x80
+	}
+	return 0, -1
+}
+
+// mqttPropValueOffset walks a well-formed MQTT 5.0 properties block (length
+// prefix + body) and returns the byte offset of the value of the first
+// occurrence of property target, or -1 if the block carries no such property or
+// cannot be walked. The block is expected to have already been validated (by
+// readProperties / mqttValidateForwardProps), so property lengths are trusted;
+// anything unexpected returns -1 rather than risk a bad rewrite.
+func mqttPropValueOffset(props []byte, target byte) int {
+	plen, n := mqttVarIntFromSlice(props)
+	if n < 0 {
+		return -1
+	}
+	i, end := n, n+plen
+	if end > len(props) {
+		return -1
+	}
+	for i < end {
+		prop := props[i]
+		i++
+		valueOff := i
+		switch prop {
+		case mqttPropPayloadFormat, mqttPropRequestProblemInfo, mqttPropRequestResponseInfo,
+			mqttPropMaxQoS, mqttPropRetainAvailable, mqttPropWildcardSubAvailable,
+			mqttPropSubIDAvailable, mqttPropSharedSubAvailable:
+			i++
+		case mqttPropServerKeepAlive, mqttPropReceiveMaximum, mqttPropTopicAliasMax,
+			mqttPropTopicAlias:
+			i += 2
+		case mqttPropMessageExpiry, mqttPropSessionExpiry, mqttPropWillDelay, mqttPropMaxPacketSize:
+			i += 4
+		case mqttPropContentType, mqttPropResponseTopic, mqttPropAssignedClientID,
+			mqttPropAuthMethod, mqttPropResponseInfo, mqttPropServerReference,
+			mqttPropReasonString, mqttPropCorrelationData, mqttPropAuthData:
+			if i+2 > end {
+				return -1
+			}
+			i += 2 + int(binary.BigEndian.Uint16(props[i:]))
+		case mqttPropUserProperty:
+			// Two length-prefixed strings (key then value).
+			for k := 0; k < 2; k++ {
+				if i+2 > end {
+					return -1
+				}
+				i += 2 + int(binary.BigEndian.Uint16(props[i:]))
+			}
+		case mqttPropSubscriptionID:
+			_, m := mqttVarIntFromSlice(props[i:])
+			if m < 0 {
+				return -1
+			}
+			i += m
+		default:
+			return -1
+		}
+		if i > end {
+			return -1
+		}
+		if prop == target {
+			return valueOff
+		}
+	}
+	return -1
+}
+
+// mqttMessageExpiry returns the Message Expiry Interval (seconds) carried in a
+// raw MQTT 5.0 properties block and whether the property was present. The two
+// differ semantically: an absent property means the message never expires,
+// whereas an explicit value of 0 means it expires immediately. Spec5 [3.3.2.3.3].
+func mqttMessageExpiry(props []byte) (uint32, bool) {
+	off := mqttPropValueOffset(props, mqttPropMessageExpiry)
+	if off < 0 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(props[off:]), true
+}
+
+// mqttMessageExpiryTTL returns the JetStream per-message TTL (seconds) to apply
+// to a stored message given its properties: 0 when the message has no expiry
+// (never reaped by TTL), otherwise at least 1 (JetStream's minimum). Flooring an
+// explicit expiry of 0 to 1s ensures an "expire immediately" message is still
+// reaped rather than kept forever; onward delivery is additionally gated by
+// mqttForwardExpiry. Spec5 [3.3.2.3.3].
+func mqttMessageExpiryTTL(props []byte) uint32 {
+	if me, ok := mqttMessageExpiry(props); ok {
+		if me < 1 {
+			return 1
+		}
+		return me
+	}
+	return 0
+}
+
+// mqttSetMessageExpiry returns a copy of the raw MQTT 5.0 properties block with
+// the Message Expiry Interval value replaced by rem. If the block carries no
+// Message Expiry Interval, props is returned unchanged (no copy), preserving the
+// verbatim fast path for messages that do not use expiry. Spec5 [3.3.2.3.3].
+func mqttSetMessageExpiry(props []byte, rem uint32) []byte {
+	off := mqttPropValueOffset(props, mqttPropMessageExpiry)
+	if off < 0 {
+		return props
+	}
+	out := make([]byte, len(props))
+	copy(out, props)
+	binary.BigEndian.PutUint32(out[off:], rem)
+	return out
+}
+
+// mqttForwardExpiry computes the outbound properties for a stored v5 PUBLISH,
+// honoring the MQTT 5.0 Message Expiry Interval given the message's JetStream
+// store time (storeUnixNano). It returns the (possibly rewritten) properties and
+// whether the message has already expired. Spec5 [3.3.2.3.3]: the PUBLISH sent
+// onward MUST carry the interval reduced by the time waited in the server; if
+// the interval has elapsed before onward delivery the server MUST NOT deliver
+// the message and MUST drop its stored copy. Returns props unchanged when there
+// is no expiry to adjust. Elapsed time is measured on this server's wall clock;
+// as with JetStream per-message TTLs, accuracy across a cluster assumes
+// synchronized clocks.
+func mqttForwardExpiry(props []byte, storeUnixNano int64) (out []byte, expired bool) {
+	off := mqttPropValueOffset(props, mqttPropMessageExpiry)
+	if off < 0 {
+		return props, false
+	}
+	orig := int64(binary.BigEndian.Uint32(props[off:]))
+	// An explicit interval of 0 means the message expires immediately: it is
+	// already expired for any onward (stored) delivery, whatever the elapsed
+	// time. Checked before the elapsed/store-time guards so a same-second
+	// delivery cannot forward it. Spec5 [3.3.2.3.3].
+	if orig == 0 {
+		return props, true
+	}
+	if storeUnixNano <= 0 {
+		return props, false
+	}
+	elapsed := (time.Now().UnixNano() - storeUnixNano) / int64(time.Second)
+	if elapsed <= 0 {
+		return props, false
+	}
+	if elapsed >= orig {
+		return props, true
+	}
+	out = make([]byte, len(props))
+	copy(out, props)
+	binary.BigEndian.PutUint32(out[off:], uint32(orig-elapsed))
+	return out, false
+}
+
+// mqttInjectSubID returns a raw v5 properties block (variable-int length prefix
+// + body) equal to props with a Subscription Identifier property (0x0B, varint
+// id) appended to the body and the length prefix re-encoded, synthesizing a
+// fresh block when props is empty. Offset-based rewrites (mqttSetMessageExpiry /
+// mqttForwardExpiry) must run on the original block first; only a Topic Alias
+// (mqttInjectTopicAlias) may be appended after this. props is returned unchanged
+// when the id is out of range, the block is unsafe to forward (see
+// mqttValidateForwardProps), or the injected block would exceed the maximum
+// varint length. Spec5 [3.8.2.1.2].
+func mqttInjectSubID(props []byte, id int) []byte {
+	if id <= 0 || id > mqttMaxVarInt {
+		return props
+	}
+	// The Subscription Identifier property: id 0x0B followed by its varint value.
+	suffix := newMQTTWriter(5)
+	suffix.WriteByte(mqttPropSubscriptionID)
+	suffix.WriteVarInt(id)
+	sb := suffix.Bytes()
+
+	// An absent (nil) or empty (single 0 length byte) block: synthesize one that
+	// carries just the identifier. Checked before validation so an empty input is
+	// not mistaken for an invalid block.
+	var body []byte
+	if n := len(props); n > 1 {
+		// A publisher-supplied block must be safe to forward verbatim before we
+		// extend it (WritePublishHeader writes the result unchanged); a valid
+		// length prefix can still wrap an invalid or unsafe body.
+		if mqttValidateForwardProps(props) == nil {
+			return props
+		}
+		plen, off := mqttVarIntFromSlice(props)
+		if off < 0 || off+plen != n {
+			return props
+		}
+		body = props[off:]
+	}
+
+	newLen := len(body) + len(sb)
+	if newLen > mqttMaxVarInt {
+		return props
+	}
+	w := newMQTTWriter(5 + newLen)
+	w.WriteVarInt(newLen)
+	w.Write(body)
+	w.Write(sb)
+	return w.Bytes()
+}
+
+// mqttInjectTopicAlias returns a raw v5 properties block (varint length prefix +
+// body) equal to props with a Topic Alias property (0x23, 2-byte value) appended
+// and the length prefix re-encoded, synthesizing a fresh block when props is
+// nil/empty. ok is false (props returned unchanged) when the block cannot be
+// safely extended; the caller must then send the full topic unaliased rather
+// than an empty-topic frame with no alias. Unlike mqttInjectSubID it performs
+// only the structural prefix/length check, NOT mqttValidateForwardProps: it runs
+// after mqttInjectSubID, whose output legitimately carries a Subscription
+// Identifier the forward validator rejects, and every block reaching here was
+// already validated upstream. Caller precondition: props must not already carry
+// a Topic Alias (this appends blindly) — inbound aliases are stripped before
+// forwarding and mqttValidateForwardProps rejects NATS-carried blocks bearing
+// one, so no current caller violates this. Spec5 [3.3.2.3.4].
+func mqttInjectTopicAlias(props []byte, alias uint16) ([]byte, bool) {
+	// The Topic Alias property: id 0x23 followed by its 2-byte value.
+	sb := []byte{mqttPropTopicAlias, byte(alias >> 8), byte(alias)}
+
+	// An absent (nil) or empty (single 0 length byte) block synthesizes one that
+	// carries just the alias; a longer block must have a length prefix consistent
+	// with its size before we extend it.
+	var body []byte
+	if n := len(props); n > 1 {
+		plen, off := mqttVarIntFromSlice(props)
+		if off < 0 || off+plen != n {
+			return props, false
+		}
+		body = props[off:]
+	}
+
+	newLen := len(body) + len(sb)
+	if newLen > mqttMaxVarInt {
+		return props, false
+	}
+	w := newMQTTWriter(5 + newLen)
+	w.WriteVarInt(newLen)
+	w.Write(body)
+	w.Write(sb)
+	return w.Bytes(), true
+}
+
+// mqttStripTopicAlias returns a copy of the raw properties block (varint length
+// prefix + body, the pp.props format) with the Topic Alias property (id +
+// 2-byte value) removed and the length prefix re-encoded. It returns props
+// unchanged when no alias is present, and nil when the alias was the only
+// property (an empty block is never captured). Topic aliases are hop-local and
+// MUST NOT be forwarded to subscribers or into retained storage. The result is
+// always a fresh allocation, which doubles as the required copy out of the
+// transient reader buffer. Spec5 [3.3.2.3.4].
+func mqttStripTopicAlias(props []byte) []byte {
+	off := mqttPropValueOffset(props, mqttPropTopicAlias)
+	if off < 0 {
+		return props
+	}
+	_, n := mqttVarIntFromSlice(props)
+	// Drop the 3 alias bytes: the id byte at off-1 and its 2-byte value. The
+	// body is everything after the length prefix minus those 3 bytes.
+	newLen := len(props) - n - 3
+	if newLen <= 0 {
+		return nil
+	}
+	w := newMQTTWriter(5 + newLen)
+	w.WriteVarInt(newLen)
+	w.Write(props[n : off-1])
+	w.Write(props[off+2:])
+	return w.Bytes()
+}
+
+func mqttParsePubRelNATSHeader(headerBytes []byte) uint16 {
+	if len(headerBytes) == 0 {
+		return 0
+	}
+
+	pubrelValue := getHeader(mqttNatsPubRelHeader, headerBytes)
+	if len(pubrelValue) == 0 {
+		return 0
+	}
+	pi, _ := strconv.ParseUint(string(pubrelValue), 10, 16)
+	return uint16(pi)
+}
+
+// Returns the MQTT sessions manager for a given account.
+// If new, creates the required JetStream streams/consumers
+// for handling of sessions and messages.
+func (s *Server) getOrCreateMQTTAccountSessionManager(c *client) (*mqttAccountSessionManager, error) {
+	sm := &s.mqtt.sessmgr
+
+	c.mu.Lock()
+	acc := c.acc
+	c.mu.Unlock()
+	accName := acc.GetName()
+
+	sm.mu.RLock()
+	asm, ok := sm.sessions[accName]
+	sm.mu.RUnlock()
+
+	if ok {
+		return asm, nil
+	}
+
+	// We will pass the quitCh to the account session manager if we happen to create it.
+	s.mu.Lock()
+	quitCh := s.quitCh
+	s.mu.Unlock()
+
+	// Not found, now take the write lock and check again
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	asm, ok = sm.sessions[accName]
+	if ok {
+		return asm, nil
+	}
+	// Need to create one here.
+	asm, err := s.mqttCreateAccountSessionManager(acc, quitCh)
+	if err != nil {
+		return nil, err
+	}
+	sm.sessions[accName] = asm
+	return asm, nil
+}
+
+// Creates JS streams/consumers for handling of sessions and messages for this account.
+//
+// Global session manager lock is held on entry.
+func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struct{}) (*mqttAccountSessionManager, error) {
+	var err error
+
+	accName := acc.GetName()
+
+	opts := s.getOpts()
+	c := s.createInternalAccountClient()
+	c.acc = acc
+
+	id := s.NodeName()
+
+	mqttJSAPITimeout := opts.MQTT.JSAPITimeout
+	if mqttJSAPITimeout == 0 {
+		mqttJSAPITimeout = mqttDefaultJSAPITimeout
+	}
+
+	replicas := opts.MQTT.StreamReplicas
+	if replicas <= 0 {
+		replicas = s.mqttDetermineReplicas()
+	}
+	qname := fmt.Sprintf("[ACC:%s] MQTT ", accName)
+	as := &mqttAccountSessionManager{
+		sessions:        make(map[string]*mqttSession),
+		sessByHash:      make(map[string]*mqttSession),
+		sessLocked:      make(map[string]struct{}),
+		flappers:        make(map[string]time.Time),
+		pendingWills:    make(map[string]*mqttPendingWill),
+		pendingExpiries: make(map[string]*time.Timer),
+		jsa: mqttJSA{
+			id:      id,
+			c:       c,
+			rplyr:   mqttJSARepliesPrefix + id + ".",
+			sendq:   newIPQueue[*mqttJSPubMsg](s, qname+"send"),
+			nuid:    nuid.New(),
+			quitCh:  quitCh,
+			timeout: mqttJSAPITimeout,
+		},
+		rmsCache: &sync.Map{},
+	}
+	// TODO record domain name in as here
+
+	// The domain to communicate with may be required for JS calls.
+	// Search from specific (per account setting) to generic (mqtt setting)
+	if opts.JsAccDefaultDomain != nil {
+		if d, ok := opts.JsAccDefaultDomain[accName]; ok {
+			if d != _EMPTY_ {
+				as.jsa.domain = d
+			}
+			as.jsa.domainSet = true
+		}
+		// in case domain was set to empty, check if there are more generic domain overwrites
+	}
+	if as.jsa.domain == _EMPTY_ {
+		if d := opts.MQTT.JsDomain; d != _EMPTY_ {
+			as.jsa.domain = d
+			as.jsa.domainSet = true
+		}
+	}
+	// We need to include the domain in the subject prefix used to store sessions in the $MQTT_sess stream.
+	if as.jsa.domainSet {
+		if as.jsa.domain != _EMPTY_ {
+			as.domainTk = as.jsa.domain + "."
+		}
+	} else if d := s.getOpts().JetStreamDomain; d != _EMPTY_ {
+		as.domainTk = d + "."
+	}
+	if as.jsa.domainSet {
+		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q in domain %q", replicas, accName, as.jsa.domain)
+	} else {
+		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q", replicas, accName)
+	}
+
+	var subs []*subscription
+	var success bool
+	closeCh := make(chan struct{})
+
+	defer func() {
+		if success {
+			return
+		}
+		for _, sub := range subs {
+			c.processUnsub(sub.sid)
+		}
+		close(closeCh)
+	}()
+
+	// We create all subscriptions before starting the go routine that will do
+	// sends otherwise we could get races.
+	// Note that using two different clients (one for the subs, one for the
+	// sends) would cause other issues such as registration of recent subs in
+	// the "sub" client would be invisible to the check for GW routed replies
+	// (shouldMapReplyForGatewaySend) since the client there would be the "sender".
+
+	jsa := &as.jsa
+	sid := int64(1)
+	// This is a subscription that will process all JS API replies. We could split to
+	// individual subscriptions if needed, but since there is a bit of common code,
+	// that seemed like a good idea to be all in one place.
+	if err := as.createSubscription(jsa.rplyr+">",
+		as.processJSAPIReplies, &sid, &subs); err != nil {
+		return nil, err
+	}
+
+	// We will listen for replies to session persist requests so that we can
+	// detect the use of a session with the same client ID anywhere in the cluster.
+	//   `$MQTT.JSA.{js-id}.SP.{client-id-hash}.{uuid}`
+	if err := as.createSubscription(mqttJSARepliesPrefix+"*."+mqttJSASessPersist+".*.*",
+		as.processSessionPersist, &sid, &subs); err != nil {
+		return nil, err
+	}
+
+	// We create the subscription on "$MQTT.sub.<nuid>" to limit the subjects
+	// that a user would allow permissions on.
+	rmsubj := mqttSubPrefix + nuid.Next()
+	if err := as.createSubscription(rmsubj, as.processRetainedMsg, &sid, &subs); err != nil {
+		return nil, err
+	}
+
+	// Create a subscription to be notified of retained messages delete requests.
+	rmdelsubj := mqttJSARepliesPrefix + "*." + mqttJSARetainedMsgDel
+	if err := as.createSubscription(rmdelsubj, as.processRetainedMsgDel, &sid, &subs); err != nil {
+		return nil, err
+	}
+
+	// No more creation of subscriptions past this point otherwise RACEs may happen.
+
+	// Start the go routine that will send JS API requests.
+	s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		as.sendJSAPIrequests(s, c, accName, closeCh)
+	})
+
+	// Start the go routine that will clean up cached retained messages that expired.
+	s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		as.cleanupRetainedMessageCache(s, closeCh)
+	})
+
+	lookupStream := func(stream, txt string) (*StreamInfo, error) {
+		si, err := jsa.lookupStream(stream)
+		if err != nil {
+			if IsNatsErr(err, JSStreamNotFoundErr) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("lookup %s stream for account %q: %v", txt, accName, err)
+		}
+		if opts.MQTT.StreamReplicas == 0 {
+			return si, nil
+		}
+		sr := 1
+		if si.Cluster != nil {
+			sr += len(si.Cluster.Replicas)
+		}
+		if replicas != sr {
+			s.Warnf("MQTT %s stream replicas mismatch: current is %v but configuration is %v for '%s > %s'",
+				txt, sr, replicas, accName, stream)
+		}
+		return si, nil
+	}
+
+	if si, err := lookupStream(mqttSessStreamName, "sessions"); err != nil {
+		return nil, err
+	} else if si == nil {
+		// Create the stream for the sessions.
+		cfg := &StreamConfig{
+			Name:       mqttSessStreamName,
+			Subjects:   []string{mqttSessStreamSubjectPrefix + as.domainTk + ">"},
+			Storage:    FileStorage,
+			Retention:  LimitsPolicy,
+			Replicas:   replicas,
+			MaxMsgsPer: 1,
+		}
+		if _, created, err := jsa.createStream(cfg); err == nil && created {
+			as.transferUniqueSessStreamsToMuxed(s)
+		} else if isErrorOtherThan(err, JSStreamNameExistErr) {
+			return nil, fmt.Errorf("create sessions stream for account %q: %v", accName, err)
+		}
+	}
+
+	msi, err := lookupStream(mqttStreamName, "messages")
+	if err != nil {
+		return nil, err
+	}
+	if msi == nil {
+		// Create the stream for the messages.
+		cfg := &StreamConfig{
+			Name:      mqttStreamName,
+			Subjects:  []string{mqttStreamSubjectPrefix + ">"},
+			Storage:   FileStorage,
+			Retention: InterestPolicy,
+			Replicas:  replicas,
+			// Honor MQTT 5.0 Message Expiry Interval: a stored PUBLISH carries a
+			// per-message Nats-TTL so JetStream drops it once its lifetime has
+			// elapsed, even if never delivered. Spec5 [3.3.2.3.3].
+			AllowMsgTTL: true,
+		}
+		if _, _, cerr := jsa.createStream(cfg); cerr != nil {
+			if isErrorOtherThan(cerr, JSStreamNameExistErr) {
+				return nil, fmt.Errorf("create messages stream for account %q: %v", accName, cerr)
+			}
+			// Lost a creation race: re-check what the winner created, it may
+			// be an older stream without per-message TTL.
+			if msi, err = lookupStream(mqttStreamName, "messages"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if msi != nil && !msi.Config.AllowMsgTTL {
+		// Enable per-message TTL on a messages stream created before MQTT 5.0
+		// message expiry support was added, so expiry is honored after upgrade.
+		// Degrade rather than fail: without it MQTT still works, only v5
+		// message expiry of stored messages is not enforced (e.g. while other
+		// servers in a mixed-version cluster do not understand AllowMsgTTL).
+		msi.Config.AllowMsgTTL = true
+		if _, err := jsa.updateStream(&msi.Config); err != nil {
+			msi.Config.AllowMsgTTL = false
+			as.msgsStreamNoTTL = true
+			s.Warnf("MQTT: unable to enable per-message TTL on messages stream for account %q, v5 Message Expiry of stored messages will not be enforced: %v", accName, err)
+		}
+	}
+
+	if si, err := lookupStream(mqttQoS2IncomingMsgsStreamName, "QoS2 incoming messages"); err != nil {
+		return nil, err
+	} else if si == nil {
+		// Create the stream for the incoming QoS2 messages that have not been
+		// PUBREL-ed by the sender. Subject is
+		// "$MQTT.qos2.<session>.<PI>", the .PI is to achieve exactly
+		// once for each PI.
+		cfg := &StreamConfig{
+			Name:          mqttQoS2IncomingMsgsStreamName,
+			Subjects:      []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"},
+			Storage:       FileStorage,
+			Retention:     LimitsPolicy,
+			Discard:       DiscardNew,
+			MaxMsgsPer:    1,
+			DiscardNewPer: true,
+			Replicas:      replicas,
+		}
+		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
+			return nil, fmt.Errorf("create QoS2 incoming messages stream for account %q: %v", accName, err)
+		}
+	}
+
+	if si, err := lookupStream(mqttOutStreamName, "QoS2 outgoing PUBREL"); err != nil {
+		return nil, err
+	} else if si == nil {
+		// Create the stream for the incoming QoS2 messages that have not been
+		// PUBREL-ed by the sender. NATS messages are submitted as
+		// "$MQTT.pubrel.<session hash>"
+		cfg := &StreamConfig{
+			Name:      mqttOutStreamName,
+			Subjects:  []string{mqttOutSubjectPrefix + ">"},
+			Storage:   FileStorage,
+			Retention: InterestPolicy,
+			Replicas:  replicas,
+		}
+		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
+			return nil, fmt.Errorf("create QoS2 outgoing PUBREL stream for account %q: %v", accName, err)
+		}
+	}
+
+	// This is the only case where we need "si" after lookup/create
+	needToTransfer := true
+	si, err := lookupStream(mqttRetainedMsgsStreamName, "retained messages")
+	switch {
+	case err != nil:
+		return nil, err
+
+	case si == nil:
+		// Create the stream for retained messages.
+		cfg := &StreamConfig{
+			Name:       mqttRetainedMsgsStreamName,
+			Subjects:   []string{mqttRetainedMsgsStreamSubject + ">"},
+			Storage:    FileStorage,
+			Retention:  LimitsPolicy,
+			Replicas:   replicas,
+			MaxMsgsPer: 1,
+			// Honor MQTT 5.0 Message Expiry Interval for retained messages via a
+			// per-message Nats-TTL. Spec5 [3.3.2.3.3].
+			AllowMsgTTL: true,
+		}
+		// We will need "si" outside of this block.
+		si, _, err = jsa.createStream(cfg)
+		if err != nil {
+			if isErrorOtherThan(err, JSStreamNameExistErr) {
+				return nil, fmt.Errorf("create retained messages stream for account %q: %v", accName, err)
+			}
+			// Suppose we had a race and the stream was actually created by another
+			// node, we really need "si" after that, so lookup the stream again here.
+			si, err = lookupStream(mqttRetainedMsgsStreamName, "retained messages")
+			if err != nil {
+				return nil, err
+			}
+		}
+		needToTransfer = false
+
+	default:
+		needToTransfer = si.Config.MaxMsgsPer != 1
+	}
+
+	// Doing this check outside of above if/else due to possible race when
+	// creating the stream.
+	wantedSubj := mqttRetainedMsgsStreamSubject + ">"
+	if len(si.Config.Subjects) != 1 || si.Config.Subjects[0] != wantedSubj {
+		// Update only the Subjects at this stage, not MaxMsgsPer yet.
+		si.Config.Subjects = []string{wantedSubj}
+		if si, err = jsa.updateStream(&si.Config); err != nil {
+			return nil, fmt.Errorf("failed to update stream config: %w", err)
+		}
+	}
+
+	transferRMS := func() error {
+		if !needToTransfer {
+			return nil
+		}
+
+		as.transferRetainedToPerKeySubjectStream(s)
+
+		// We need another lookup to have up-to-date si.State values in order
+		// to load all retained messages.
+		si, err = lookupStream(mqttRetainedMsgsStreamName, "retained messages")
+		if err != nil {
+			return err
+		}
+		needToTransfer = false
+		return nil
+	}
+
+	// Attempt to transfer all "single subject" retained messages to new
+	// subjects. It may fail, will log its own error; ignore it the first time
+	// and proceed to updating MaxMsgsPer. Then we invoke transferRMS() again,
+	// which will get another chance to resolve the error; if not we bail there.
+	if err = transferRMS(); err != nil {
+		return nil, err
+	}
+
+	// Now, if the stream does not have MaxMsgsPer set to 1, and there are no
+	// more messages on the single $MQTT.rmsgs subject, update the stream again.
+	if si.Config.MaxMsgsPer != 1 {
+		si.Config.MaxMsgsPer = 1
+		// We will need an up-to-date si, so don't use local variable here.
+		if si, err = jsa.updateStream(&si.Config); err != nil {
+			return nil, fmt.Errorf("failed to update stream config: %w", err)
+		}
+	}
+
+	// Enable per-message TTL on a retained messages stream created before MQTT
+	// 5.0 message expiry support was added, so expiry is honored after upgrade.
+	// Degrade rather than fail (see the messages stream above); expired
+	// retained messages are still withheld from delivery, only their stored
+	// copies are not reaped.
+	if !si.Config.AllowMsgTTL {
+		si.Config.AllowMsgTTL = true
+		if nsi, err := jsa.updateStream(&si.Config); err != nil {
+			si.Config.AllowMsgTTL = false
+			as.rmsgsStreamNoTTL = true
+			s.Warnf("MQTT: unable to enable per-message TTL on retained messages stream for account %q, expired retained messages will not be reaped from storage: %v", accName, err)
+		} else {
+			si = nsi
+		}
+	}
+
+	// If we failed the first time, there is now at most one lingering message
+	// in the old subject. Try again (it will be a NO-OP if succeeded the first
+	// time).
+	if err = transferRMS(); err != nil {
+		return nil, err
+	}
+
+	// Opportunistically delete the old (legacy) consumer, from v2.10.10 and
+	// before. Ignore any errors that might arise.
+	rmLegacyDurName := mqttRetainedMsgsStreamName + "_" + jsa.id
+	jsa.deleteConsumer(mqttRetainedMsgsStreamName, rmLegacyDurName, true)
+
+	// Create a new, uniquely names consumer for retained messages for this
+	// server. The prior one will expire eventually.
+	ccfg := &CreateConsumerRequest{
+		Stream: mqttRetainedMsgsStreamName,
+		Config: ConsumerConfig{
+			Name:              mqttRetainedMsgsStreamName + "_" + nuid.Next(),
+			FilterSubject:     mqttRetainedMsgsStreamSubject + ">",
+			DeliverSubject:    rmsubj,
+			ReplayPolicy:      ReplayInstant,
+			AckPolicy:         AckNone,
+			InactiveThreshold: 5 * time.Minute,
+		},
+	}
+	if _, err := jsa.createEphemeralConsumer(ccfg); err != nil {
+		return nil, fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
+	}
+
+	// Re-arm session-expiry timers and delayed Wills persisted before a
+	// restart, without delaying the connecting client. Then re-sweep
+	// periodically: expiries catch deadlines that never got a timer (e.g.
+	// records orphaned when their owner crashed while the client was
+	// connected), and the orphaned-consumer sweep reconciles durables leaked in
+	// crash windows (re-run so it also catches orphans skipped by the grace
+	// window at startup).
+	s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		as.sweepSessionExpiries(s)
+		as.sweepPendingWills(s)
+		as.sweepOrphanedConsumers(s)
+		tt := time.NewTicker(mqttSessionExpirySweepInterval)
+		defer tt.Stop()
+		for {
+			select {
+			case <-tt.C:
+				as.sweepSessionExpiries(s)
+				as.sweepOrphanedConsumers(s)
+			case <-closeCh:
+				return
+			case <-s.quitCh:
+				return
+			}
+		}
+	})
+
+	// Set this so that on defer we don't cleanup.
+	success = true
+
+	return as, nil
+}
+
+func (s *Server) mqttDetermineReplicas() int {
+	// If not clustered, then replica will be 1.
+	if !s.JetStreamIsClustered() {
+		return 1
+	}
+	opts := s.getOpts()
+	replicas := 0
+	for _, u := range opts.Routes {
+		host := u.Hostname()
+		// If this is an IP just add one.
+		if net.ParseIP(host) != nil {
+			replicas++
+		} else {
+			addrs, _ := net.LookupHost(host)
+			replicas += len(addrs)
+		}
+	}
+	if replicas < 1 {
+		replicas = 1
+	} else if replicas > 3 {
+		replicas = 3
+	}
+	return replicas
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// JS APIs related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (jsa *mqttJSA) newRequest(kind, subject string, hdr int, msg []byte) (any, error) {
+	return jsa.newRequestEx(kind, subject, _EMPTY_, hdr, msg)
+}
+
+func (jsa *mqttJSA) prefixDomain(subject string) string {
+	if jsa.domain != _EMPTY_ {
+		// rewrite js api prefix with domain
+		if sub := strings.TrimPrefix(subject, JSApiPrefix+"."); sub != subject {
+			subject = fmt.Sprintf("$JS.%s.API.%s", jsa.domain, sub)
+		}
+	}
+	return subject
+}
+
+func (jsa *mqttJSA) newRequestEx(kind, subject, cidHash string, hdr int, msg []byte) (any, error) {
+	responses, err := jsa.newRequestExMulti(kind, subject, cidHash, []int{hdr}, [][]byte{msg})
+	if err != nil {
+		return nil, err
+	}
+	if len(responses) != 1 {
+		return nil, fmt.Errorf("unreachable: invalid number of responses (%d)", len(responses))
+	}
+	return responses[0].value, nil
+}
+
+// newRequestExMulti sends multiple messages on the same subject and waits for
+// all responses. It returns the same number of responses in the same order as
+// msgs parameter. In case of a timeout it returns an error as well as all
+// responses received as a sparsely populated array, matching msgs, with nils
+// for the values that have not yet been received.
+//
+// Note that each response may represent an error and should be inspected as
+// such by the caller.
+func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
+	if len(hdrs) != len(msgs) {
+		return nil, fmt.Errorf("unreachable: invalid number of messages (%d) or header offsets (%d)", len(msgs), len(hdrs))
+	}
+	responseCh := make(chan *mqttJSAResponse, len(msgs))
+
+	// Generate and queue all outgoing requests, have all results reported to
+	// responseCh, and store a map of reply subjects to the original subjects'
+	// indices.
+	r2i := map[string]int{}
+	for i, msg := range msgs {
+		hdr := hdrs[i]
+		var sb strings.Builder
+		// Either we use nuid.Next() which uses a global lock, or our own nuid object, but
+		// then it needs to be "write" protected. This approach will reduce across account
+		// contention since we won't use the global nuid's lock.
+		jsa.mu.Lock()
+		uid := jsa.nuid.Next()
+		sb.WriteString(jsa.rplyr)
+		jsa.mu.Unlock()
+
+		sb.WriteString(kind)
+		sb.WriteByte(btsep)
+		if cidHash != _EMPTY_ {
+			sb.WriteString(cidHash)
+			sb.WriteByte(btsep)
+		}
+		sb.WriteString(uid)
+		reply := sb.String()
+
+		// Add responseCh to the reply channel map. It will be cleaned out on
+		// timeout (see below), or in processJSAPIReplies upon receiving the
+		// response.
+		jsa.replies.Store(reply, responseCh)
+
+		subject = jsa.prefixDomain(subject)
+		jsa.sendq.push(&mqttJSPubMsg{
+			subj:  subject,
+			reply: reply,
+			hdr:   hdr,
+			msg:   msg,
+		})
+		r2i[reply] = i
+	}
+
+	// Wait for all responses to come back, or for the timeout to expire. We
+	// don't want to use time.After() which causes memory growth because the
+	// timer can't be stopped and will need to expire to then be garbage
+	// collected.
+	c := 0
+	responses := make([]*mqttJSAResponse, len(msgs))
+	start := time.Now()
+	t := time.NewTimer(jsa.timeout)
+	defer t.Stop()
+	for {
+		select {
+		case r := <-responseCh:
+			i := r2i[r.reply]
+			responses[i] = r
+			c++
+			if c == len(msgs) {
+				return responses, nil
+			}
+
+		case <-jsa.quitCh:
+			return nil, ErrServerNotRunning
+
+		case <-t.C:
+			var reply string
+			now := time.Now()
+			for reply = range r2i { // preserve the last value for Errorf
+				jsa.replies.Delete(reply)
+			}
+
+			if len(msgs) == 1 {
+				return responses, fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, subject, reply)
+			} else {
+				return responses, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, subject, c, len(msgs))
+			}
+		}
+	}
+}
+
+func (jsa *mqttJSA) sendAck(ackSubject string) {
+	// Send to the ack subject with no payload.
+	jsa.sendMsg(ackSubject, nil)
+}
+
+func (jsa *mqttJSA) sendMsg(subj string, msg []byte) {
+	if subj == _EMPTY_ {
+		return
+	}
+	// We pass -1 for the hdr so that the send loop does not need to
+	// add the "client info" header. This is not a JS API request per se.
+	jsa.sendq.push(&mqttJSPubMsg{subj: subj, msg: msg, hdr: -1})
+}
+
+func (jsa *mqttJSA) createEphemeralConsumer(cfg *CreateConsumerRequest) (*JSApiConsumerCreateResponse, error) {
+	cfgb, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	subj := fmt.Sprintf(JSApiConsumerCreateT, cfg.Stream)
+	ccri, err := jsa.newRequest(mqttJSAConsumerCreate, subj, 0, cfgb)
+	if err != nil {
+		return nil, err
+	}
+	ccr := ccri.(*JSApiConsumerCreateResponse)
+	return ccr, ccr.ToError()
+}
+
+func (jsa *mqttJSA) createDurableConsumer(cfg *CreateConsumerRequest) (*JSApiConsumerCreateResponse, error) {
+	cfgb, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	subj := fmt.Sprintf(JSApiDurableCreateT, cfg.Stream, cfg.Config.Durable)
+	ccri, err := jsa.newRequest(mqttJSAConsumerCreate, subj, 0, cfgb)
+	if err != nil {
+		return nil, err
+	}
+	ccr := ccri.(*JSApiConsumerCreateResponse)
+	return ccr, ccr.ToError()
+}
+
+// if noWait is specified, does not wait for the JS response, returns nil
+func (jsa *mqttJSA) deleteConsumer(streamName, consName string, noWait bool) (*JSApiConsumerDeleteResponse, error) {
+	subj := fmt.Sprintf(JSApiConsumerDeleteT, streamName, consName)
+	if noWait {
+		jsa.sendMsg(subj, nil)
+		return nil, nil
+	}
+
+	cdri, err := jsa.newRequest(mqttJSAConsumerDel, subj, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	cdr := cdri.(*JSApiConsumerDeleteResponse)
+	return cdr, cdr.ToError()
+}
+
+func (jsa *mqttJSA) createStream(cfg *StreamConfig) (*StreamInfo, bool, error) {
+	cfgb, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	scri, err := jsa.newRequest(mqttJSAStreamCreate, fmt.Sprintf(JSApiStreamCreateT, cfg.Name), 0, cfgb)
+	if err != nil {
+		return nil, false, err
+	}
+	scr := scri.(*JSApiStreamCreateResponse)
+	return scr.StreamInfo, scr.DidCreate, scr.ToError()
+}
+
+func (jsa *mqttJSA) updateStream(cfg *StreamConfig) (*StreamInfo, error) {
+	cfgb, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	scri, err := jsa.newRequest(mqttJSAStreamUpdate, fmt.Sprintf(JSApiStreamUpdateT, cfg.Name), 0, cfgb)
+	if err != nil {
+		return nil, err
+	}
+	scr := scri.(*JSApiStreamUpdateResponse)
+	return scr.StreamInfo, scr.ToError()
+}
+
+func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
+	slri, err := jsa.newRequest(mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, name), 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	slr := slri.(*JSApiStreamInfoResponse)
+	return slr.StreamInfo, slr.ToError()
+}
+
+func (jsa *mqttJSA) deleteStream(name string) (bool, error) {
+	sdri, err := jsa.newRequest(mqttJSAStreamDel, fmt.Sprintf(JSApiStreamDeleteT, name), 0, nil)
+	if err != nil {
+		return false, err
+	}
+	sdr := sdri.(*JSApiStreamDeleteResponse)
+	return sdr.Success, sdr.ToError()
+}
+
+// purgeStream removes all messages in streamName matching filter (a subject,
+// possibly wildcarded). If noWait, the request is fired without waiting for a
+// response (like deleteConsumer/deleteMsg's no-wait paths).
+func (jsa *mqttJSA) purgeStream(streamName, filter string, noWait bool) error {
+	preq := JSApiStreamPurgeRequest{Subject: filter}
+	req, _ := json.Marshal(preq)
+	subj := jsa.prefixDomain(fmt.Sprintf(JSApiStreamPurgeT, streamName))
+	if noWait {
+		jsa.sendq.push(&mqttJSPubMsg{
+			subj: subj,
+			msg:  req,
+		})
+		return nil
+	}
+	spri, err := jsa.newRequest(mqttJSAStreamPurge, subj, 0, req)
+	if err != nil {
+		return err
+	}
+	spr := spri.(*JSApiStreamPurgeResponse)
+	return spr.ToError()
+}
+
+// consumerList returns ConsumerInfo for every consumer of the stream, walking
+// the paged CONSUMER.LIST API to completion.
+func (jsa *mqttJSA) consumerList(streamName string) ([]*ConsumerInfo, error) {
+	var all []*ConsumerInfo
+	for {
+		req, err := json.Marshal(&JSApiConsumersRequest{ApiPagedRequest: ApiPagedRequest{Offset: len(all)}})
+		if err != nil {
+			return nil, err
+		}
+		cli, err := jsa.newRequest(mqttJSAConsumerList, fmt.Sprintf(JSApiConsumerListT, streamName), 0, req)
+		if err != nil {
+			return nil, err
+		}
+		clr := cli.(*JSApiConsumerListResponse)
+		if clr.Error != nil {
+			return nil, clr.ToError()
+		}
+		all = append(all, clr.Consumers...)
+		if len(all) >= clr.Total || len(clr.Consumers) == 0 {
+			return all, nil
+		}
+	}
+}
+
+func (jsa *mqttJSA) loadLastMsgFor(streamName string, subject string) (*StoredMsg, error) {
+	mreq := &JSApiMsgGetRequest{LastFor: subject}
+	req, err := json.Marshal(mreq)
+	if err != nil {
+		return nil, err
+	}
+	lmri, err := jsa.newRequest(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), 0, req)
+	if err != nil {
+		return nil, err
+	}
+	lmr := lmri.(*JSApiMsgGetResponse)
+	return lmr.Message, lmr.ToError()
+}
+
+func (jsa *mqttJSA) loadLastMsgForMulti(streamName string, subjects []string) ([]*JSApiMsgGetResponse, error) {
+	marshaled := make([][]byte, 0, len(subjects))
+	headerBytes := make([]int, 0, len(subjects))
+	for _, subject := range subjects {
+		mreq := &JSApiMsgGetRequest{LastFor: subject}
+		bb, err := json.Marshal(mreq)
+		if err != nil {
+			return nil, err
+		}
+		marshaled = append(marshaled, bb)
+		headerBytes = append(headerBytes, 0)
+	}
+
+	all, err := jsa.newRequestExMulti(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), _EMPTY_, headerBytes, marshaled)
+	// all has the same order as subjects, preserve it as we unmarshal
+	responses := make([]*JSApiMsgGetResponse, len(all))
+	for i, v := range all {
+		if v != nil {
+			responses[i] = v.value.(*JSApiMsgGetResponse)
+		}
+	}
+	return responses, err
+}
+
+func (jsa *mqttJSA) loadNextMsgFor(streamName string, subject string) (*StoredMsg, error) {
+	mreq := &JSApiMsgGetRequest{NextFor: subject}
+	req, err := json.Marshal(mreq)
+	if err != nil {
+		return nil, err
+	}
+	lmri, err := jsa.newRequest(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), 0, req)
+	if err != nil {
+		return nil, err
+	}
+	lmr := lmri.(*JSApiMsgGetResponse)
+	return lmr.Message, lmr.ToError()
+}
+
+// loadNextMsgFromSeq returns the first message on the given subject (which may
+// contain wildcards) with a sequence >= seq, allowing a bounded walk over all
+// messages of a subject filter.
+func (jsa *mqttJSA) loadNextMsgFromSeq(streamName, subject string, seq uint64) (*StoredMsg, error) {
+	mreq := &JSApiMsgGetRequest{Seq: seq, NextFor: subject}
+	req, err := json.Marshal(mreq)
+	if err != nil {
+		return nil, err
+	}
+	lmri, err := jsa.newRequest(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), 0, req)
+	if err != nil {
+		return nil, err
+	}
+	lmr := lmri.(*JSApiMsgGetResponse)
+	return lmr.Message, lmr.ToError()
+}
+
+func (jsa *mqttJSA) loadMsg(streamName string, seq uint64) (*StoredMsg, error) {
+	mreq := &JSApiMsgGetRequest{Seq: seq}
+	req, err := json.Marshal(mreq)
+	if err != nil {
+		return nil, err
+	}
+	lmri, err := jsa.newRequest(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), 0, req)
+	if err != nil {
+		return nil, err
+	}
+	lmr := lmri.(*JSApiMsgGetResponse)
+	return lmr.Message, lmr.ToError()
+}
+
+func (jsa *mqttJSA) storeMsgNoWait(subject string, hdrLen int, msg []byte) {
+	jsa.sendq.push(&mqttJSPubMsg{
+		subj: subject,
+		msg:  msg,
+		hdr:  hdrLen,
+	})
+}
+
+func (jsa *mqttJSA) storeMsg(subject string, headers int, msg []byte) (*JSPubAckResponse, error) {
+	smri, err := jsa.newRequest(mqttJSAMsgStore, subject, headers, msg)
+	if err != nil {
+		return nil, err
+	}
+	smr := smri.(*JSPubAckResponse)
+	return smr, smr.ToError()
+}
+
+func (jsa *mqttJSA) storeSessionMsg(domainTk, cidHash string, hdr int, msg []byte) (*JSPubAckResponse, error) {
+	// Compute subject where the session is being stored
+	subject := mqttSessStreamSubjectPrefix + domainTk + cidHash
+
+	// Passing cidHash will add it to the JS reply subject, so that we can use
+	// it in processSessionPersist.
+	smri, err := jsa.newRequestEx(mqttJSASessPersist, subject, cidHash, hdr, msg)
+	if err != nil {
+		return nil, err
+	}
+	smr := smri.(*JSPubAckResponse)
+	return smr, smr.ToError()
+}
+
+func (jsa *mqttJSA) loadSessionMsg(domainTk, cidHash string) (*StoredMsg, error) {
+	subject := mqttSessStreamSubjectPrefix + domainTk + cidHash
+	return jsa.loadLastMsgFor(mqttSessStreamName, subject)
+}
+
+func (jsa *mqttJSA) deleteMsg(stream string, seq uint64, wait bool) error {
+	dreq := JSApiMsgDeleteRequest{Seq: seq, NoErase: true}
+	req, _ := json.Marshal(dreq)
+	subj := jsa.prefixDomain(fmt.Sprintf(JSApiMsgDeleteT, stream))
+	if !wait {
+		jsa.sendq.push(&mqttJSPubMsg{
+			subj: subj,
+			msg:  req,
+		})
+		return nil
+	}
+	dmi, err := jsa.newRequest(mqttJSAMsgDelete, subj, 0, req)
+	if err != nil {
+		return err
+	}
+	dm := dmi.(*JSApiMsgDeleteResponse)
+	return dm.ToError()
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// Account Sessions Manager related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+// Returns true if `err` is not nil and does not match the api error with ErrorIdentifier id
+func isErrorOtherThan(err error, id ErrorIdentifier) bool {
+	return err != nil && !IsNatsErr(err, id)
+}
+
+// Process JS API replies.
+//
+// Can run from various go routines (consumer's loop, system send loop, etc..).
+func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *client, _ *Account, subject, _ string, msg []byte) {
+	token := tokenAt(subject, mqttJSATokenPos)
+	if token == _EMPTY_ {
+		return
+	}
+	jsa := &as.jsa
+	chi, ok := jsa.replies.Load(subject)
+	if !ok {
+		return
+	}
+	jsa.replies.Delete(subject)
+	ch := chi.(chan *mqttJSAResponse)
+	out := func(value any) {
+		ch <- &mqttJSAResponse{reply: subject, value: value}
+	}
+	switch token {
+	case mqttJSAStreamCreate:
+		var resp = &JSApiStreamCreateResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAStreamUpdate:
+		var resp = &JSApiStreamUpdateResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAStreamLookup:
+		var resp = &JSApiStreamInfoResponse{}
+		if err := json.Unmarshal(msg, &resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAStreamDel:
+		var resp = &JSApiStreamDeleteResponse{}
+		if err := json.Unmarshal(msg, &resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAStreamPurge:
+		var resp = &JSApiStreamPurgeResponse{}
+		if err := json.Unmarshal(msg, &resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAConsumerCreate:
+		var resp = &JSApiConsumerCreateResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAConsumerDel:
+		var resp = &JSApiConsumerDeleteResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAMsgStore, mqttJSASessPersist:
+		var resp = &JSPubAckResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAMsgLoad:
+		var resp = &JSApiMsgGetResponse{}
+		if err := json.Unmarshal(msg, &resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAStreamNames:
+		var resp = &JSApiStreamNamesResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAConsumerList:
+		var resp = &JSApiConsumerListResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAMsgDelete:
+		var resp = &JSApiMsgDeleteResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	default:
+		pc.Warnf("Unknown reply code %q", token)
+	}
+}
+
+// This will both load all retained messages and process updates from the cluster.
+//
+// Run from various go routines (JS consumer, etc..).
+// No lock held on entry.
+func (as *mqttAccountSessionManager) processRetainedMsg(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	// Unlike upstream, the shim's msgParts (shim_engine.go) returns the pure
+	// payload with no trailing wire-protocol "\r\n" to strip (frameNATSMsg
+	// builds rmsg from nats.go's already-decoded m.Data, which carries no such
+	// terminator) — stripping here would truncate the last 2 payload bytes.
+	h, m := c.msgParts(rmsg)
+	rm, err := mqttDecodeRetainedMessage(subject, h, m)
+	if err != nil {
+		return
+	}
+	if strings.IndexByte(rm.Subject, 0x7f) >= 0 {
+		c.Warnf("Skipping retained message for subject %q: unsupported character 0x7f", rm.Subject)
+		return
+	}
+	// The as.jsa.id is immutable, so no need to have a rlock here.
+	local := rm.Origin == as.jsa.id
+	// Get the stream sequence for this message.
+	seq, _, _, _, _ := ackReplyInfo(reply)
+	if len(m) == 0 {
+		// An empty payload means that we need to remove the retained message.
+		rmSeq := as.removeRetainedMsg(rm.Subject, 0)
+		if local {
+			if rmSeq > 0 {
+				// This is for backward compatibility reasons.
+				// Should be removed in a future release.
+				as.notifyRetainedMsgDeleted(rm.Subject, rmSeq)
+				// Best-effort cleanup of the message this tombstone replaces. The
+				// retained stream is MaxMsgsPer=1 + AllowMsgTTL, and — unlike a
+				// non-empty replacement — storing an empty-body tombstone does NOT
+				// evict the prior message, so it must be deleted explicitly or it
+				// would resurface on a cold restart. We do NOT delete the tombstone
+				// itself: it carries no TTL (delete markers never do) and stays the
+				// subject's last message, so loadRetainedMessages reads it back as
+				// "deleted" and the removal survives a restart even if this async
+				// delete is lost. (Upstream instead deletes the tombstone, relying
+				// on MaxMsgsPer having already evicted the prior — which does not
+				// hold for empty bodies here.) Spec [MQTT-3.3.1-11].
+				as.deleteRetainedMsg(rmSeq)
+			}
+		}
+	} else {
+		// Add this retained message. The `rm.Msg` references some buffer that we
+		// don't own. But addRetainedMsg() will take care of making a copy of
+		// `rm.Msg` it `rm` ends-up being stored in the cache.
+		as.addRetainedMsg(rm.Subject, seq, rm)
+	}
+}
+
+// NOTE: This is maintained for backward compatibility reasons. Should be removed in 2.14/2.15?
+func (as *mqttAccountSessionManager) processRetainedMsgDel(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	idHash := tokenAt(subject, 3)
+	if idHash == _EMPTY_ || idHash == as.jsa.id {
+		return
+	}
+	_, msg := c.msgParts(rmsg)
+	if len(msg) < LEN_CR_LF {
+		return
+	}
+	var drm mqttRetMsgDel
+	if err := json.Unmarshal(msg, &drm); err != nil {
+		return
+	}
+	as.removeRetainedMsg(drm.Subject, drm.Seq)
+}
+
+// This will receive all JS API replies for a request to store a session record,
+// including the reply for our own server, which we will ignore.
+// This allows us to detect that some application somewhere else in the cluster
+// is connecting with the same client ID, and therefore we need to close the
+// connection that is currently using this client ID.
+//
+// Can run from various go routines (system send loop, etc..).
+// No lock held on entry.
+func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *client, _ *Account, subject, _ string, rmsg []byte) {
+	// Ignore our own responses here (they are handled elsewhere)
+	if tokenAt(subject, mqttJSAIdTokenPos) == as.jsa.id {
+		return
+	}
+	cIDHash := tokenAt(subject, mqttJSAClientIDPos)
+	_, msg := pc.msgParts(rmsg)
+	if len(msg) < LEN_CR_LF {
+		return
+	}
+	var par = &JSPubAckResponse{}
+	if err := json.Unmarshal(msg, par); err != nil {
+		return
+	}
+	if err := par.Error; err != nil {
+		return
+	}
+	as.mu.RLock()
+	// Note that as.domainTk includes a terminal '.', so strip to compare to PubAck.Domain.
+	dl := len(as.domainTk)
+	if dl > 0 {
+		dl--
+	}
+	ignore := par.Domain != as.domainTk[:dl]
+	as.mu.RUnlock()
+	if ignore {
+		return
+	}
+
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	// A connection for this client ID started on another server, i.e. a new
+	// connection to this session: cancel any delayed Will pending locally. Done
+	// even when we no longer hold the session (a clean-start client removes it on
+	// disconnect but the pending Will survives on the account manager). Spec5
+	// [MQTT-3.1.2-8].
+	as.cancelWillLocked(cIDHash)
+	sess, ok := as.sessByHash[cIDHash]
+	if !ok {
+		// No local session: cancel any (sweep-armed) expiry timer, the remote save
+		// superseded the record it was armed from. Spec5 [3.1.2.11.2].
+		as.cancelSessionExpiryLocked(cIDHash)
+		return
+	}
+	// If our current session's stream sequence is higher, it means that this
+	// update is stale, so we don't do anything here (and keep our expiry timer).
+	sess.mu.Lock()
+	ignore = par.Sequence < sess.seq
+	sess.mu.Unlock()
+	if ignore {
+		return
+	}
+	// The remote connection owns the session now; our expiry timer must not fire
+	// and delete its state. Spec5 [3.1.2.11.2].
+	as.cancelSessionExpiryLocked(cIDHash)
+	as.removeSession(sess, false)
+	sess.mu.Lock()
+	ec := sess.c
+	if ec != nil {
+		as.addSessToFlappers(sess.id)
+		ec.Warnf("Closing because a remote connection has started with the same client ID: %q", sess.id)
+		// Disassociate the client from the session so that on client close,
+		// nothing will be done with regards to cleaning up the session,
+		// such as deleting stream, etc..
+		sess.c = nil
+	}
+	sess.mu.Unlock()
+	if ec != nil {
+		// Tell the evicted v5 client why before the close (no-op for 3.1.1);
+		// enqueued outside sess.mu since it takes the client lock. Spec5 [3.1.4].
+		ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
+		// Remove in separate go routine.
+		go ec.closeConnection(DuplicateClientID)
+	}
+}
+
+// Adds this client ID to the flappers map, and if needed start the timer
+// for map cleanup.
+//
+// Lock held on entry.
+func (as *mqttAccountSessionManager) addSessToFlappers(clientID string) {
+	as.flappers[clientID] = time.Now()
+	if as.flapTimer == nil {
+		as.flapTimer = time.AfterFunc(mqttFlapCleanItvl, func() {
+			as.mu.Lock()
+			defer as.mu.Unlock()
+			// In case of shutdown, this will be nil
+			if as.flapTimer == nil {
+				return
+			}
+			now := time.Now()
+			for cID, tm := range as.flappers {
+				if now.Sub(tm) > mqttSessJailDur {
+					delete(as.flappers, cID)
+				}
+			}
+			as.flapTimer.Reset(mqttFlapCleanItvl)
+		})
+	}
+}
+
+// Remove this client ID from the flappers map.
+//
+// Lock held on entry.
+func (as *mqttAccountSessionManager) removeSessFromFlappers(clientID string) {
+	delete(as.flappers, clientID)
+	// Do not stop/set timer to nil here. Better leave the timer run at its
+	// regular interval and detect that there is nothing to do. The timer
+	// will be stopped on shutdown.
+}
+
+// scheduleWill defers the delivery of a client's Will Message by the MQTT 5.0
+// Will Delay Interval. The pending will is keyed by the client ID hash (the same
+// token used in the session-persist stream) so both a local reconnect and a
+// remote takeover on another server can cancel it via cancelWill /
+// cancelWillLocked. Spec5 [3.1.3.2.2].
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) scheduleWill(s *Server, idHash string, pw *mqttPendingWill, delay time.Duration) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	// nil map => account manager is shutting down; deliver nothing.
+	if as.pendingWills == nil {
+		return
+	}
+	// Defensive: replace any existing pending will for this client ID.
+	if old, ok := as.pendingWills[idHash]; ok {
+		old.timer.Stop()
+	}
+	pw.timer = time.AfterFunc(delay, func() { as.fireWill(s, idHash, pw) })
+	as.pendingWills[idHash] = pw
+}
+
+// cancelWill stops and removes a pending delayed Will for the given client ID
+// hash, if any. Called when a new connection resumes the session before the Will
+// Delay Interval elapses, which per Spec5 [MQTT-3.1.2-8] means the Will MUST NOT
+// be sent. Returns true if one was cancelled. Idempotent.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) cancelWill(idHash string) bool {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	return as.cancelWillLocked(idHash)
+}
+
+// cancelWillLocked is cancelWill for callers already holding as.mu (e.g. the
+// session-persist callback that cancels on a remote takeover).
+func (as *mqttAccountSessionManager) cancelWillLocked(idHash string) bool {
+	pw, ok := as.pendingWills[idHash]
+	if !ok {
+		return false
+	}
+	pw.timer.Stop()
+	delete(as.pendingWills, idHash)
+	return true
+}
+
+// fireWill publishes a delayed Will once its Will Delay Interval has elapsed,
+// unless it was cancelled or the account manager is shutting down. It runs from
+// the scheduleWill timer, after the originating client is gone, so it delivers
+// using a fresh internal account client for fan-out and the account's JSA for
+// the QoS1/2 store. Spec5 [3.1.3.2.2].
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) fireWill(s *Server, idHash string, expected *mqttPendingWill) {
+	as.mu.Lock()
+	// nil map => account manager shutdown; the entry (if any) is being torn down.
+	if as.pendingWills == nil {
+		as.mu.Unlock()
+		return
+	}
+	pw, ok := as.pendingWills[idHash]
+	// Bail if cancelled, or replaced by a newer Will for the same client ID after
+	// this timer fired but before it acquired the lock (a stale-timer callback
+	// must not fire the replacement early).
+	if !ok || pw != expected {
+		as.mu.Unlock()
+		return
+	}
+	delete(as.pendingWills, idHash)
+	will, acc, perms, user := pw.will, pw.acc, pw.perms, pw.user
+	sess := as.sessByHash[idHash]
+	as.mu.Unlock()
+
+	// The originating client is gone; use a short-lived internal account client
+	// to drive fan-out, and the account JSA for the QoS1/2 store.
+	c := s.createInternalAccountClient()
+	c.acc = acc
+	// Carry the original publisher's permissions and username so the deferred
+	// publish is still permission-checked (a denied Will is dropped, not
+	// delivered or retained) exactly as the immediate path would, and the
+	// retained-Will source is preserved. [MQTT-3.1.2-8].
+	c.perms = perms
+	c.opts.Username = user
+
+	pp := &mqttPublish{
+		topic:   will.topic,
+		subject: will.subject,
+		mapped:  will.mapped,
+		msg:     will.message,
+		sz:      len(will.message),
+		flags:   will.qos << 1,
+		// The Will's own forwardable properties, matching the immediate-publish
+		// path. Spec5 [3.1.3.2].
+		props: pw.props,
+	}
+	if will.retain {
+		pp.flags |= mqttPubFlagRetain
+	}
+	// Publish as an MQTT client so the message framing matches the immediate
+	// path: MQTT payloads carry no trailing CRLF, and the delivery machinery
+	// only accounts for that when the producer is an MQTT client (otherwise the
+	// last two payload bytes are stripped as a protocol CRLF). asm is needed for
+	// a retained Will; proto marks this as v5. Spec5 [3.1.3.2.2].
+	c.mqtt = &mqtt{pp: pp, asm: as, proto: mqttProtoLevel5}
+	// A Will is server-originated: no No Local origin. Spec5 [3.8.3.1].
+	if err := s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp, _EMPTY_); err != nil {
+		s.Warnf("MQTT: failed to deliver delayed Will for client %q: %v", idHash, err)
+	}
+	c.flushClients(0)
+
+	// Drop the persisted copy so a later restart does not fire it again. With a
+	// live session object, save through it to keep its record sequence current;
+	// otherwise rewrite the record directly.
+	if sess != nil {
+		var doSave bool
+		sess.mu.Lock()
+		if sess.will != nil {
+			sess.will = nil
+			doSave = true
+		}
+		sess.mu.Unlock()
+		if doSave {
+			if err := sess.save(); err != nil {
+				s.Debugf("MQTT: unable to clear persisted Will for client %q: %v", idHash, err)
+			}
+		}
+	} else {
+		as.clearPersistedWill(s, idHash)
+	}
+}
+
+// sweepPendingWills re-arms delayed Wills persisted in session records, so a
+// Will pending when this server shut down still fires. In a cluster every node
+// sweeps the same stream, so only the record's owner (Origin) re-arms and the
+// Will fires once; standalone, the node name may be generated (it changes
+// across restarts), so no ownership gate is applied. The Will's publish
+// permission was already checked when it was persisted.
+// Runs once, when the account session manager is created.
+func (as *mqttAccountSessionManager) sweepPendingWills(s *Server) {
+	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
+	origin := s.NodeName()
+	clustered := s.JetStreamIsClustered()
+	acc := as.jsa.c.acc
+	for seq := uint64(1); ; {
+		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			// No (more) messages, or the stream/server is going away: done.
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				s.Debugf("MQTT pending-Will sweep ended: %v", err)
+			}
+			break
+		}
+		seq = smsg.Sequence + 1
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil || ps.Will == nil {
+			continue
+		}
+		if clustered && ps.Origin != origin {
+			continue
+		}
+		w := ps.Will
+		subject, err := mqttTopicToNATSPubSubject([]byte(w.Topic))
+		if err != nil {
+			continue
+		}
+		pw := &mqttPendingWill{
+			will: &mqttWill{
+				topic:   []byte(w.Topic),
+				subject: subject,
+				message: w.Msg,
+				qos:     w.QoS,
+				retain:  w.Retain,
+			},
+			props: w.Props,
+			acc:   acc,
+			user:  w.User,
+		}
+		remaining := time.Until(time.Unix(0, w.FireAt))
+		if remaining < 0 {
+			remaining = 0
+		}
+		as.scheduleWill(s, getHash(ps.ID), pw, remaining)
+	}
+}
+
+// clearPersistedWill removes the pending-Will field from a session record when
+// no in-memory session exists to save through (e.g. a Will restored by the
+// startup sweep whose client never reconnected). The write expects the record
+// sequence it read, so a concurrent writer wins and this clear is dropped.
+func (as *mqttAccountSessionManager) clearPersistedWill(s *Server, idHash string) {
+	smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash)
+	if err != nil || smsg == nil {
+		return
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil || ps.Will == nil {
+		return
+	}
+	if ps.Clean {
+		// The record existed only to carry a clean session's Will: delete it.
+		as.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true)
+		return
+	}
+	ps.Will = nil
+	if err := as.storeSessionRecordCAS(ps, idHash, smsg.Sequence); err != nil {
+		s.Debugf("MQTT: unable to clear persisted Will for session hash %q: %v", idHash, err)
+	}
+}
+
+// storeSessionRecordCAS rewrites a session record expecting the given stream
+// sequence, so a concurrent writer (e.g. a reconnect elsewhere) wins and this
+// rewrite is dropped.
+func (as *mqttAccountSessionManager) storeSessionRecordCAS(ps *mqttPersistedSession, idHash string, seq uint64) error {
+	b, _ := json.Marshal(ps)
+	bb := bytes.Buffer{}
+	bb.WriteString(hdrLine)
+	bb.WriteString(JSExpectedLastSubjSeq)
+	bb.WriteString(":")
+	bb.WriteString(strconv.FormatUint(seq, 10))
+	bb.WriteString(CR_LF)
+	bb.WriteString(CR_LF)
+	hdr := bb.Len()
+	bb.Write(b)
+	_, err := as.jsa.storeSessionMsg(as.domainTk, idHash, hdr, bb.Bytes())
+	return err
+}
+
+// scheduleSessionExpiry arms a timer to clean up a disconnected client's session
+// once its MQTT 5.0 Session Expiry Interval elapses. The timer is keyed by the
+// client ID hash (the same token used in the session-persist stream) so both a
+// local reconnect and a remote takeover on another server can cancel it via
+// cancelSessionExpiry / cancelSessionExpiryLocked. Spec5 [3.1.2.11.2].
+//
+// Deadlines survive a restart via the persisted disconnect time and
+// sweepSessionExpiries. Gap: no other server re-arms the timer if the owner dies
+// while the cluster keeps running; the session lingers until a reconnect or sweep.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) scheduleSessionExpiry(s *Server, idHash string, delay time.Duration) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	// nil map => account manager is shutting down; do not schedule.
+	if as.pendingExpiries == nil {
+		return
+	}
+	// Defensive: replace any existing timer for this client ID hash.
+	if old, ok := as.pendingExpiries[idHash]; ok {
+		old.Stop()
+	}
+	as.pendingExpiries[idHash] = time.AfterFunc(delay, func() { as.expireSession(s, idHash) })
+}
+
+// cancelSessionExpiry stops and removes a pending session-expiry timer for the
+// given client ID hash, if any. Called when a new connection resumes the session
+// before the interval elapses. Returns true if one was cancelled. Idempotent.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) cancelSessionExpiry(idHash string) bool {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	return as.cancelSessionExpiryLocked(idHash)
+}
+
+// cancelSessionExpiryLocked is cancelSessionExpiry for callers already holding
+// as.mu (e.g. the session-persist callback that cancels on a remote takeover).
+func (as *mqttAccountSessionManager) cancelSessionExpiryLocked(idHash string) bool {
+	t, ok := as.pendingExpiries[idHash]
+	if !ok {
+		return false
+	}
+	t.Stop()
+	delete(as.pendingExpiries, idHash)
+	return true
+}
+
+// expireSession removes and clears a session whose Session Expiry Interval has
+// elapsed, unless it was cancelled (reconnect/takeover) or the account manager is
+// shutting down. Reuses the same removeSession + clear path as a clean disconnect.
+// A session not in the in-memory maps (timer re-armed by the startup sweep) is
+// re-verified against the persisted record first. Spec5 [3.1.2.11.2].
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
+	as.mu.Lock()
+	// nil map => account manager shutdown; the entry (if any) is being torn down.
+	if as.pendingExpiries == nil {
+		as.mu.Unlock()
+		return
+	}
+	t, ok := as.pendingExpiries[idHash]
+	if !ok {
+		// Cancelled between the timer firing and acquiring the lock.
+		as.mu.Unlock()
+		return
+	}
+	// We own this expiry now; drop the timer entry so a concurrent reconnect's
+	// cancelSessionExpiry becomes a no-op.
+	t.Stop()
+	delete(as.pendingExpiries, idHash)
+	sess, inMem := as.sessByHash[idHash]
+	as.mu.Unlock()
+	if !inMem {
+		as.expireSessionFromRecord(s, idHash)
+		return
+	}
+
+	// Guard against a concurrent reconnect: lockSession(sess, nil) fails if a
+	// CONNECT is mid-processing or a client is bound — the reconnect then owns it.
+	if err := as.lockSession(sess, nil); err != nil {
+		return
+	}
+	// Re-check that no client re-bound before we acquired the session lock.
+	sess.mu.Lock()
+	rebound := sess.c != nil
+	seq := sess.seq
+	sess.mu.Unlock()
+	if rebound {
+		as.unlockSession(sess)
+		return
+	}
+	// If the persisted record was bumped past our sequence, our in-memory copy is
+	// stale: a resume (and possibly a re-disconnect) happened on another server and
+	// its best-effort cancel to this server may have been lost. Do NOT act on our
+	// stale state — drop the local copy and let the record-based path decide from
+	// the authoritative record: it skips a still-connected or not-yet-due session
+	// (re-arming as needed) and cleans up a due one using the record's own sequence
+	// and consumers. A record that is not newer (or absent from a failed
+	// best-effort disconnect save) leaves our in-memory view authoritative, so the
+	// fired timer still cleans up and finite expiry is never silently skipped.
+	// Spec5 [3.1.2.11.2].
+	superseded := false
+	if smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash); err == nil && smsg.Sequence > seq {
+		superseded = true
+	}
+	if superseded {
+		// Our copy is stale: drop it and hand off to the record-based path, which
+		// guards against a concurrent CONNECT itself (its connecting check and a
+		// sequence-CAS'd delete), so we release the session lock before delegating.
+		as.removeSession(sess, true)
+		as.unlockSession(sess)
+		as.expireSessionFromRecord(s, idHash)
+		return
+	}
+
+	// Authoritative cleanup: hold the session lock through clear() so a concurrent
+	// CONNECT cannot restore the (possibly stale) persisted record and race the
+	// teardown. Delete the session state (consumers, record), matching the
+	// clean-disconnect path in mqttHandleClosedClient.
+	defer as.unlockSession(sess)
+	as.removeSession(sess, true)
+	if err := sess.clear(true); err != nil {
+		s.Warnf("MQTT session expiry cleanup for %q failed: %v", sess.id, err)
+	}
+}
+
+// loadExpiringSessionRecord loads and decodes the persisted record for idHash
+// and reports whether its Session Expiry deadline has elapsed (due). A resume
+// anywhere rewrites the record with DisconnectedAt=0, so a stale timer reading it
+// finds nothing due — the record is authoritative. If the deadline has not yet
+// passed (a newer disconnect refreshed it) it re-arms the timer and returns
+// due=false. Returns the decoded record and its stream sequence for the caller.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) loadExpiringSessionRecord(s *Server, idHash string) (ps *mqttPersistedSession, seq uint64, due bool) {
+	smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash)
+	if err != nil {
+		// Not found => the session was cleared or resumed-then-cleaned; done.
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			s.Warnf("MQTT session expiry: unable to load session record: %v", err)
+		}
+		return nil, 0, false
+	}
+	ps = &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		s.Warnf("MQTT session expiry: unable to decode session record at sequence %v: %v", smsg.Sequence, err)
+		return nil, 0, false
+	}
+	// A connected client (or a session that no longer expires) leaves nothing to do.
+	if ps.DisconnectedAt == 0 || ps.ExpiryInterval == 0 || ps.ExpiryInterval == mqttSessionNeverExpire {
+		return ps, smsg.Sequence, false
+	}
+	// Not due yet (e.g. the record was refreshed by a newer disconnect after this
+	// timer was armed): re-arm for the remainder instead of dropping the cleanup.
+	if remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0)); remaining > 0 {
+		as.scheduleSessionExpiry(s, idHash, remaining)
+		return ps, smsg.Sequence, false
+	}
+	return ps, smsg.Sequence, true
+}
+
+// expireSessionFromRecord handles an expiry timer firing for a session not in
+// the in-memory maps (re-armed by the startup sweep). The persisted record is
+// authoritative: a reconnect anywhere rewrites it with a zero disconnect time,
+// so re-reading it right before acting keeps a stale timer harmless.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash string) {
+	ps, seq, due := as.loadExpiringSessionRecord(s, idHash)
+	if !due {
+		return
+	}
+	// Skip if a CONNECT for this client ID is being processed on this server; its
+	// save will reset the disconnect time (and the record delete below is CAS-ed
+	// on the sequence we just read, so a concurrent remote resume wins).
+	as.mu.Lock()
+	_, connecting := as.sessLocked[ps.ID]
+	as.mu.Unlock()
+	if connecting {
+		return
+	}
+
+	// Build a transient session from the record — enough state for clear() to
+	// delete the consumers and the record itself — and clean up.
+	sess := mqttSessionCreate(&as.jsa, ps.ID, idHash, seq, s.getOpts())
+	sess.domainTk = as.domainTk
+	sess.clean = ps.Clean
+	sess.subs = ps.Subs
+	sess.sharedSubs = ps.SharedSubs
+	sess.cons = ps.Cons
+	sess.pubRelConsumer = ps.PubRel
+	if err := sess.clear(true); err != nil {
+		s.Warnf("MQTT session expiry cleanup for %q failed: %v", ps.ID, err)
+	}
+}
+
+// sweepSessionExpiries re-arms expiry timers from the persisted session records,
+// so deadlines survive a restart; overdue sessions get an immediate timer.
+// expireSession re-verifies each record before deleting anything, so racing a
+// reconnect or another server's sweep is safe. Runs from a go routine at account
+// session manager creation (the first MQTT connect for the account after a
+// restart). Spec5 [3.1.2.11.2].
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
+	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
+	var swept int
+	for seq := uint64(1); ; {
+		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			// No (more) messages, or the stream/server is going away: done.
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				s.Debugf("MQTT session expiry sweep ended: %v", err)
+			}
+			break
+		}
+		seq = smsg.Sequence + 1
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			s.Warnf("MQTT session expiry sweep: unable to decode session record at sequence %v, skipping: %v", smsg.Sequence, err)
+			continue
+		}
+		// Only sessions with a finite interval can expire.
+		if ps.ExpiryInterval == 0 || ps.ExpiryInterval == mqttSessionNeverExpire {
+			continue
+		}
+		idHash := getHash(ps.ID)
+		if ps.DisconnectedAt == 0 {
+			// The record claims a connected client. If we own the record and
+			// have no session for it in memory, the owner (us) went down while
+			// the client was connected and its disconnect was never recorded:
+			// stamp it as of now so the finite interval eventually applies.
+			// The CAS write defers to any concurrent reconnect; an in-memory
+			// session (bound or freshly disconnected) manages its own state.
+			// The ownership gate applies only in a cluster (where every node
+			// sweeps, and server names are explicit): standalone, a generated
+			// node name changes across restarts and would never match.
+			if s.JetStreamIsClustered() && ps.Origin != s.NodeName() {
+				continue
+			}
+			as.mu.RLock()
+			_, inMem := as.sessByHash[idHash]
+			as.mu.RUnlock()
+			if inMem {
+				continue
+			}
+			ps.DisconnectedAt = time.Now().Unix()
+			if err := as.storeSessionRecordCAS(ps, idHash, smsg.Sequence); err != nil {
+				continue
+			}
+		}
+		remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0))
+		if remaining < 0 {
+			remaining = 0
+		}
+		// Arm only if absent: a timer armed by a live disconnect (or an earlier
+		// sweep) is at least as up to date as this record snapshot.
+		as.mu.Lock()
+		if as.pendingExpiries != nil {
+			if _, exists := as.pendingExpiries[idHash]; !exists {
+				as.pendingExpiries[idHash] = time.AfterFunc(remaining, func() { as.expireSession(s, idHash) })
+				swept++
+			}
+		}
+		as.mu.Unlock()
+	}
+	if swept > 0 {
+		s.Debugf("MQTT session expiry sweep re-armed %v timer(s)", swept)
+	}
+}
+
+// sweepOrphanedConsumers deletes MQTT-owned durables on the messages stream
+// that no session references anymore: a crash between a confirmed record
+// save/delete and the consumer teardown (UNSUBSCRIBE, session end, 3.1.1
+// forced leave) leaks the durable forever. Consumers are listed BEFORE the
+// record walk: a shared join persists its record before (re)creating the
+// group durable — and repairs a lost race with a delete by re-issuing the
+// idempotent create — so a listed consumer the walk does not reference was
+// orphaned at list time. Plain session durables are created before the record
+// save that references them, so only consumers older than
+// mqttOrphanSweepGrace are eligible; consumers held by local in-memory
+// sessions count as referenced too. Any indeterminate scan aborts the sweep
+// (fail closed: never delete on a partial view). Runs from the account
+// session manager's sweep go routine. Spec5 [4.8.2].
+func (as *mqttAccountSessionManager) sweepOrphanedConsumers(s *Server) {
+	consumers, err := as.jsa.consumerList(mqttStreamName)
+	if err != nil {
+		s.Debugf("MQTT orphaned consumer sweep ended: %v", err)
+		return
+	}
+	// Candidates: MQTT-shaped (a shared group durable, or a session durable
+	// delivering to "$MQTT.sub.") and older than the grace window. Anything
+	// else on the stream is not ours to judge. A consumer the clustered LIST
+	// could not report (Missing) is not a candidate until a later sweep sees it.
+	cutoff := time.Now().Add(-mqttOrphanSweepGrace)
+	candidates := make(map[string]struct{})
+	for _, ci := range consumers {
+		if ci == nil || ci.Config == nil || !ci.Created.Before(cutoff) {
+			continue
+		}
+		if !strings.HasPrefix(ci.Name, mqttSharedConsumerDurablePrefix) &&
+			!strings.HasPrefix(ci.Config.DeliverSubject, mqttSubPrefix) {
+			continue
+		}
+		candidates[ci.Name] = struct{}{}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	// A local session's in-memory state may be newer than its persisted record
+	// (a save may be in flight); count its consumers as referenced.
+	as.mu.RLock()
+	sesss := make([]*mqttSession, 0, len(as.sessions))
+	for _, sess := range as.sessions {
+		sesss = append(sesss, sess)
+	}
+	as.mu.RUnlock()
+	for _, sess := range sesss {
+		sess.mu.Lock()
+		for _, cc := range sess.cons {
+			delete(candidates, cc.Durable)
+		}
+		for key := range sess.sharedSubs {
+			for _, dur := range mqttSharedDurablesForKey(key) {
+				delete(candidates, dur)
+			}
+		}
+		sess.mu.Unlock()
+	}
+	// Walk every session record; any referenced durable is not an orphan.
+	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
+	for seq := uint64(1); len(candidates) > 0; {
+		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				s.Debugf("MQTT orphaned consumer sweep ended: %v", err)
+				return
+			}
+			break
+		}
+		seq = smsg.Sequence + 1
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			// An undecodable record may still reference candidates: abort.
+			s.Warnf("MQTT orphaned consumer sweep: unable to decode session record at sequence %v: %v", smsg.Sequence, err)
+			return
+		}
+		for _, cc := range ps.Cons {
+			delete(candidates, cc.Durable)
+		}
+		for key := range ps.SharedSubs {
+			for _, dur := range mqttSharedDurablesForKey(key) {
+				delete(candidates, dur)
+			}
+		}
+	}
+	for dur := range candidates {
+		if _, err := as.jsa.deleteConsumer(mqttStreamName, dur, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			s.Warnf("MQTT orphaned consumer sweep: unable to delete consumer %q: %v", dur, err)
+			continue
+		}
+		s.Debugf("MQTT orphaned consumer sweep deleted consumer %q", dur)
+	}
+}
+
+// Helper to create a subscription. It updates the sid and array of subscriptions.
+func (as *mqttAccountSessionManager) createSubscription(subject string, cb msgHandler, sid *int64, subs *[]*subscription) error {
+	sub, err := as.jsa.c.processSub([]byte(subject), nil, []byte(strconv.FormatInt(*sid, 10)), cb, false)
+	if err != nil {
+		return err
+	}
+	*sid++
+	*subs = append(*subs, sub)
+	return nil
+}
+
+// A timer loop to cleanup up expired cached retained messages for a given MQTT account.
+// The closeCh is used by the caller to be able to interrupt this routine
+// if the rest of the initialization fails, since the quitCh is really
+// only used when the server shutdown.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) cleanupRetainedMessageCache(s *Server, closeCh chan struct{}) {
+	tt := time.NewTicker(mqttRetainedCacheTTL)
+	defer tt.Stop()
+	for {
+		select {
+		case <-tt.C:
+			// Set a limit to the number of retained messages to scan since we
+			// lock as for it. Since the map enumeration gives random order we
+			// should eventually clean up everything.
+			i, maxScan := 0, 10*1000
+			now := time.Now()
+			as.rmsCache.Range(func(key, value any) bool {
+				rm := value.(*mqttRetainedMsg)
+				// Evict when the cache entry aged out, or when the message
+				// itself reached its MQTT 5.0 Message Expiry deadline (its
+				// stored copy is TTL-reaped by JetStream at the same time).
+				if now.After(rm.expiresFromCache) ||
+					(!rm.expires.IsZero() && now.After(rm.expires)) {
+					as.rmsCache.Delete(key)
+				}
+				i++
+				return i < maxScan
+			})
+
+		case <-closeCh:
+			return
+		case <-s.quitCh:
+			return
+		}
+	}
+}
+
+// Loop to send JS API requests for a given MQTT account.
+// The closeCh is used by the caller to be able to interrupt this routine
+// if the rest of the initialization fails, since the quitCh is really
+// only used when the server shutdown.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, accName string, closeCh chan struct{}) {
+	var cluster string
+	if s.JetStreamEnabled() && !as.jsa.domainSet {
+		// Only request the own cluster when it is clear that
+		cluster = s.cachedClusterName()
+	}
+	as.mu.RLock()
+	sendq := as.jsa.sendq
+	quitCh := as.jsa.quitCh
+	ci := ClientInfo{Account: accName, Cluster: cluster}
+	acc := c.acc
+	as.mu.RUnlock()
+
+	// The account session manager does not have a suhtdown API per-se, instead,
+	// we will cleanup things when this go routine exits after detecting that the
+	// server is shutdown or the initialization of the account manager failed.
+	defer func() {
+		as.mu.Lock()
+		if as.flapTimer != nil {
+			as.flapTimer.Stop()
+			as.flapTimer = nil
+		}
+		// Stop any pending delayed Wills and disable further scheduling/firing.
+		// Setting the map to nil makes fireWill a no-op for any timer that is
+		// already mid-callback. Spec5 [3.1.3.2.2].
+		for _, pw := range as.pendingWills {
+			pw.timer.Stop()
+		}
+		as.pendingWills = nil
+		// Likewise stop any pending session-expiry timers and disable further
+		// scheduling/firing; the nil map makes expireSession a no-op for a timer
+		// already mid-callback. Spec5 [3.1.2.11.2].
+		for _, t := range as.pendingExpiries {
+			t.Stop()
+		}
+		as.pendingExpiries = nil
+		as.mu.Unlock()
+	}()
+
+	b, _ := json.Marshal(ci)
+	hdrStart := bytes.Buffer{}
+	hdrStart.WriteString(hdrLine)
+	http.Header{ClientInfoHdr: []string{string(b)}}.Write(&hdrStart)
+	hdrStart.WriteString(CR_LF)
+	hdrStart.WriteString(CR_LF)
+	hdrb := hdrStart.Bytes()
+
+	for {
+		select {
+		case <-sendq.ch:
+			pmis := sendq.pop()
+			for _, r := range pmis {
+				var nsize int
+
+				msg := r.msg
+				// If r.hdr is set to -1, it means that there is no need for any header.
+				if r.hdr != -1 {
+					bb := bytes.Buffer{}
+					if r.hdr > 0 {
+						// This means that the header has been set by the caller and is
+						// already part of `msg`, so simply set c.pa.hdr to the given value.
+						c.pa.hdr = r.hdr
+						nsize = len(msg)
+						msg = append(msg, _CRLF_...)
+					} else {
+						// We need the ClientInfo header, so add it here.
+						bb.Write(hdrb)
+						c.pa.hdr = bb.Len()
+						bb.Write(r.msg)
+						nsize = bb.Len()
+						bb.WriteString(_CRLF_)
+						msg = bb.Bytes()
+					}
+					c.pa.hdb = []byte(strconv.Itoa(c.pa.hdr))
+				} else {
+					c.pa.hdr = -1
+					c.pa.hdb = nil
+					nsize = len(msg)
+					msg = append(msg, _CRLF_...)
+				}
+
+				c.pa.subject = []byte(r.subj)
+				c.pa.reply = []byte(r.reply)
+				c.pa.size = nsize
+				c.pa.szb = []byte(strconv.Itoa(nsize))
+				c.pa.mapped = nil
+
+				if acc.hasMappings() {
+					if changed := c.selectMappedSubject(); changed {
+						c.traceOutOp("MAPPINGS", fmt.Appendf(nil, "%s -> %s", c.pa.mapped, c.pa.subject))
+					}
+				}
+				c.processInboundClientMsg(msg)
+				c.flushClients(0)
+			}
+			sendq.recycle(&pmis)
+
+		case <-closeCh:
+			return
+		case <-quitCh:
+			return
+		}
+	}
+}
+
+// Add/Replace this message from the retained messages map.
+// If a message for this topic already existed, the existing record is updated
+// with the provided information.
+// Lock not held on entry.
+func (as *mqttAccountSessionManager) addRetainedMsg(key string, sseq uint64, rm *mqttRetainedMsg) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.retmsgs == nil {
+		as.retmsgs = stree.NewSubjectTree[mqttRetainedMsgRef]()
+	} else {
+		// Check if we already had one retained message. If so, update the existing one.
+		if erf, exists := as.retmsgs.Find(stringToBytes(key)); exists {
+			// Update the stream sequence with the new value.
+			erf.sseq = sseq
+			// Update the in-memory retained message cache but only for messages
+			// that are already in the cache, i.e. have been (recently) used.
+			// If that is the case, we ask setCachedRetainedMsg() to make a copy
+			// of rm.Msg bytes slice.
+			as.setCachedRetainedMsg(key, rm, true, true)
+			return
+		}
+	}
+	as.retmsgs.Insert([]byte(key), mqttRetainedMsgRef{sseq: sseq})
+}
+
+// Remove the retained message stored with the `subject` key from the map/cache.
+// When invoked from the retained message stream's consumer, this function will
+// be called with `seq == 0`, this is because add/remove are serialized in this
+// stream and so the request is to remove the current retained message.
+// But in some conditions, we will invoke this function from some other places
+// with `seq > 0` which means that the retained message will be removed only if
+// its sequence is the same than the provided one.
+// This function returns the sequence associated with the existing retained
+// message that is being removed (used with `seq == 0`) and returns 0 if the
+// retained message was not removed from the map (not found or sequence did not
+// match).
+func (as *mqttAccountSessionManager) removeRetainedMsg(subject string, seq uint64) uint64 {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	rm, ok := as.retmsgs.Find(stringToBytes(subject))
+	if !ok || (seq > 0 && rm.sseq != seq) {
+		return 0
+	}
+	rm, _ = as.retmsgs.Delete(stringToBytes(subject))
+	as.rmsCache.Delete(subject)
+	return rm.sseq
+}
+
+// First check if this session's client ID is already in the "locked" map,
+// which if it is the case means that another client is now bound to this
+// session and this should return an error.
+// If not in the "locked" map, but the client is not bound with this session,
+// then same error is returned.
+// Finally, if all checks ok, then the session's ID is added to the "locked" map.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) lockSession(sess *mqttSession, c *client) error {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	var fail bool
+	if _, fail = as.sessLocked[sess.id]; !fail {
+		sess.mu.Lock()
+		fail = sess.c != c
+		sess.mu.Unlock()
+	}
+	if fail {
+		return fmt.Errorf("another session is in use with client ID %q", sess.id)
+	}
+	as.sessLocked[sess.id] = struct{}{}
+	return nil
+}
+
+// Remove the session from the "locked" map.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) unlockSession(sess *mqttSession) {
+	as.mu.Lock()
+	delete(as.sessLocked, sess.id)
+	as.mu.Unlock()
+}
+
+// Simply adds the session to the various sessions maps.
+// The boolean `lock` indicates if this function should acquire the lock
+// prior to adding to the maps.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) addSession(sess *mqttSession, lock bool) {
+	if lock {
+		as.mu.Lock()
+	}
+	as.sessions[sess.id] = sess
+	as.sessByHash[sess.idHash] = sess
+	if lock {
+		as.mu.Unlock()
+	}
+}
+
+// Simply removes the session from the various sessions maps.
+// The boolean `lock` indicates if this function should acquire the lock
+// prior to removing from the maps.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) removeSession(sess *mqttSession, lock bool) {
+	if lock {
+		as.mu.Lock()
+	}
+	delete(as.sessions, sess.id)
+	delete(as.sessByHash, sess.idHash)
+	if lock {
+		as.mu.Unlock()
+	}
+}
+
+// Helper to set the sub's mqtt fields and possibly serialize (pre-loaded)
+// retained messages.
+//
+// Session lock held on entry. Acquires the subs lock and holds it for
+// the duration. Non-MQTT messages coming into mqttDeliverMsgCbQoS0 will be
+// waiting.
+func (sess *mqttSession) processQOS12Sub(
+	c *client, // subscribing client.
+	subject, sid, queue []byte, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
+) (*subscription, error) {
+	return sess.processSub(c, subject, sid, queue, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
+}
+
+func (sess *mqttSession) processSub(
+	c *client, // subscribing client.
+	subject, sid, queue []byte, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
+	initShadow bool, // do we need to scan for shadow subscriptions? (not for QOS1+)
+	rms map[string]*mqttRetainedMsg, // preloaded rms (can be empty, or missing items if errors)
+	trace bool, // trace serialized retained messages in the log?
+	as *mqttAccountSessionManager, // needed only for rms serialization.
+) (*subscription, error) {
+	start := time.Now()
+	defer func() {
+		elapsed := time.Since(start)
+		if elapsed > mqttProcessSubTooLong {
+			c.Warnf("Took too long to process subscription for %q: %v", subject, elapsed)
+		}
+	}()
+
+	// Hold subsMu to prevent QOS0 messages callback from doing anything until
+	// the (MQTT) sub is initialized.
+	sess.subsMu.Lock()
+	defer sess.subsMu.Unlock()
+
+	sub, err := c.processSub(subject, queue, sid, h, false)
+	if err != nil {
+		// c.processSub already called c.Errorf(), so no need here.
+		return nil, err
+	}
+	subs := []*subscription{sub}
+	if initShadow {
+		subs = append(subs, sub.shadow...)
+	}
+	for _, ss := range subs {
+		if ss.mqtt == nil {
+			// reserved is set only once and once the subscription has been
+			// created it can be considered immutable.
+			ss.mqtt = &mqttSub{
+				reserved: isReserved,
+			}
+		}
+		// QOS and jsDurName can be changed on an existing subscription, so
+		// accessing it later requires a lock.
+		ss.mqtt.qos = qos
+		ss.mqtt.noLocal = noLocal
+		ss.mqtt.retainAsPublished = retainAsPublished
+		ss.mqtt.subID = subID
+		ss.mqtt.jsDur = jsDurName
+		ss.mqtt.shared = shared
+		// A (re)configured subscription is live; clear any prior teardown mark.
+		ss.mqtt.closed = false
+	}
+
+	if len(rms) > 0 {
+		// Only deal with retained messages for the normal subscription,
+		// not the shadow one (which is for a different account and subject).
+		as.serializeRetainedMsgsForSub(rms, sess, c, sub, trace)
+	}
+
+	return sub, nil
+}
+
+// mqttUpdateFilterOptSet adds or removes filter from a per-option filter set to
+// match want, allocating the set on first add. Returns the (possibly new) set
+// and whether it changed, so the caller can flag the session for persistence.
+func mqttUpdateFilterOptSet(set map[string]struct{}, filter string, want bool) (map[string]struct{}, bool) {
+	if _, has := set[filter]; want && !has {
+		if set == nil {
+			set = make(map[string]struct{})
+		}
+		set[filter] = struct{}{}
+		return set, true
+	} else if !want && has {
+		delete(set, filter)
+		return set, true
+	}
+	return set, false
+}
+
+// mqttUpdateFilterSubID records (or, when id is 0, removes) the v5 Subscription
+// Identifier for filter, allocating the map on first add. Returns the (possibly
+// new) map and whether it changed, so the caller can flag the session for
+// persistence.
+func mqttUpdateFilterSubID(m map[string]int, filter string, id int) (map[string]int, bool) {
+	if id != 0 {
+		if cur, has := m[filter]; !has || cur != id {
+			if m == nil {
+				m = make(map[string]int)
+			}
+			m[filter] = id
+			return m, true
+		}
+	} else if _, has := m[filter]; has {
+		delete(m, filter)
+		return m, true
+	}
+	return m, false
+}
+
+// mqttFilterSetToList returns a subscription-filter set as a slice for
+// persistence (nil when empty, to omit the JSON field). Used for the per-option
+// filter sets (No Local, Retain As Published).
+func mqttFilterSetToList(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	l := make([]string, 0, len(set))
+	for f := range set {
+		l = append(l, f)
+	}
+	return l
+}
+
+// mqttFilterSetFromList rebuilds a subscription-filter set from a persisted
+// slice (nil when empty).
+func mqttFilterSetFromList(l []string) map[string]struct{} {
+	if len(l) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(l))
+	for _, f := range l {
+		set[f] = struct{}{}
+	}
+	return set
+}
+
+// mqttShouldSendRetained reports whether retained messages must be replayed for
+// a new subscription with the given v5 Retain Handling option. Spec5 [3.8.3.1]:
+// 0 always sends, 1 sends only when the filter has no current subscription, 2
+// never sends. subs is the session's pre-SUBSCRIBE filter set.
+func mqttShouldSendRetained(retainHandling byte, subs map[string]byte, filter string) bool {
+	switch retainHandling {
+	case 2:
+		return false
+	case 1:
+		_, existed := subs[filter]
+		return !existed
+	default:
+		return true
+	}
+}
+
+// Process subscriptions for the given session/client.
+//
+// When `fromSubProto` is false, it means that this is invoked from the CONNECT
+// protocol, when restoring subscriptions that were saved for this session.
+// In that case, there is no need to update the session record.
+//
+// When `fromSubProto` is true, it means that this call is invoked from the
+// processing of the SUBSCRIBE protocol, which means that the session needs to
+// be updated. It also means that if a subscription on same subject with same
+// QoS already exist, we should not be recreating the subscription/JS durable,
+// since it was already done when processing the CONNECT protocol.
+//
+// Runs from the client's readLoop.
+// Lock not held on entry, but session is in the locked map.
+func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
+	filters []*mqttFilter, fromSubProto, trace bool) ([]*subscription, error) {
+
+	// Hold the subs barrier for the whole SUBSCRIBE (or CONNECT session
+	// restore) processing: concurrent QoS 1/2 stores wait in
+	// mqttInitiateMsgDeliveryJSA until the JetStream consumers created here
+	// have registered interest with the messages stream, so a racing publish
+	// is never discarded by interest-based retention. Deadlock-free: nothing
+	// reachable from here stores to $MQTT_msgs, and a publisher blocked in
+	// wait() holds no locks.
+	as.jsa.subsBarrier.enter()
+	defer as.jsa.subsBarrier.leave()
+
+	// Helper to determine if we need to create a separate top-level
+	// subscription for a wildcard. sid is derived from the passed-in sid (which
+	// for a shared subscription embeds the ShareName) rather than from the
+	// subject, so the level-up sid stays in the same namespace as its parent.
+	fwc := func(subject, sid string) (bool, string, string) {
+		if !mqttNeedSubForLevelUp(subject) {
+			return false, _EMPTY_, _EMPTY_
+		}
+		// Say subject is "foo.>", remove the ".>" so that it becomes "foo"
+		fwcsubject := subject[:len(subject)-2]
+		// Change the sid to "foo fwc" (for a shared sub, "$share/g/foo fwc")
+		fwcsid := sid[:len(sid)-2] + mqttMultiLevelSidSuffix
+
+		return true, fwcsubject, fwcsid
+	}
+
+	rmSubjects := map[string]uint64{}
+	// Preload retained messages for all requested subscriptions.  Also, since
+	// it's the first iteration over the filter list, do some cleanup.
+	for _, f := range filters {
+		// A filter flagged with a failure reason at parse time (e.g. a shared
+		// subscription) is not processed; the code becomes the SUBACK byte.
+		if f.reason >= mqttSubAckFailure {
+			f.qos = f.reason
+			continue
+		}
+		if f.qos > 2 {
+			f.qos = 2
+		}
+		if c.mqtt.downgradeQoS2Sub && f.qos == 2 {
+			c.Warnf("Downgrading subscription QoS2 to QoS1 for %q, as configured", f.filter)
+			f.qos = 1
+		}
+
+		// Do not allow subscribing to our internal subjects.
+		//
+		// TODO: (levb: not sure why since one can subscribe to `#` and it'll
+		// include everything; I guess this would discourage? Otherwise another
+		// candidate for DO NOT DELIVER prefix list).
+		if strings.HasPrefix(f.filter, mqttSubPrefix) ||
+			strings.HasPrefix(f.filter, mqttPubRelDeliverySubjectPrefix) ||
+			strings.HasPrefix(f.filter, mqttSharedSubDeliverPrefix) {
+			f.qos = mqttSubAckFailure
+			f.reasonStr = "cannot subscribe to internal server subject"
+			continue
+		}
+
+		if f.qos == 2 {
+			if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+				c.Errorf("failed to initialize PUBREL processing: %v", err)
+				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
+				continue
+			}
+		}
+
+		// Shared subscriptions never receive retained messages. Spec5 [4.8.2].
+		if f.shared {
+			continue
+		}
+		// Find retained messages. The v5 Retain Handling option controls whether
+		// they are replayed at subscribe time. sess.subs still holds the
+		// pre-SUBSCRIBE state here (sess.update runs at the end), so it is the
+		// right source for the "subscription already exists" test. Spec5 [3.8.3.1].
+		if fromSubProto && mqttShouldSendRetained(f.retainHandling, sess.subs, f.filter) {
+			as.addRetainedSubjectsForSubject(rmSubjects, f.filter)
+			if need, subject, _ := fwc(f.filter, f.filter); need {
+				as.addRetainedSubjectsForSubject(rmSubjects, subject)
+			}
+			// A literal (non-wildcard) filter names one exact subject: force it
+			// into rmSubjects even if the in-memory retained-subjects index
+			// (as.retmsgs, populated asynchronously by processRetainedMsg
+			// reacting to the JetStream store) doesn't have it yet, so
+			// loadRetainedMessages' authoritative "last message for subject"
+			// stream query below still runs for it. Without this, a retained
+			// message published shortly before this SUBSCRIBE can race ahead of
+			// that index and be missed entirely. Wildcard filters still rely on
+			// the index — there is no cheap "list subjects" stream query to
+			// enumerate matches against. Spec5 [3.8.3.1].
+			if _, ok := rmSubjects[f.filter]; !ok && !strings.ContainsAny(f.filter, "*>") {
+				rmSubjects[f.filter] = 0
+			}
+		}
+	}
+
+	var rms map[string]*mqttRetainedMsg
+	if len(rmSubjects) > 0 {
+		// Make the best effort to load retained messages.
+		rms = as.loadRetainedMessages(rmSubjects, c)
+	}
+
+	// Small helper to add the consumer config to the session.
+	addJSConsToSess := func(sid string, cc *ConsumerConfig) {
+		if cc == nil {
+			return
+		}
+		if sess.cons == nil {
+			sess.cons = make(map[string]*ConsumerConfig)
+		}
+		sess.cons[sid] = cc
+	}
+
+	// Snapshot pre-SUBSCRIBE membership AND consumer entries so a final-save
+	// failure can restore both exactly (only meaningful when persisting, i.e.
+	// fromSubProto). Spec5 [4.8.2].
+	var snap *mqttSubSnapshot
+	var consSnap map[string]*ConsumerConfig
+	if fromSubProto {
+		snap = sess.snapshotSubs()
+		sess.mu.Lock()
+		consSnap = make(map[string]*ConsumerConfig, len(sess.cons))
+		for k, v := range sess.cons {
+			consSnap[k] = v
+		}
+		sess.mu.Unlock()
+	}
+	// Irreversible teardown of consumers removed by a QoS downgrade in this
+	// packet is deferred until the final session save is confirmed, so a failed
+	// save can restore the pre-packet consumer instead of having lost its
+	// durable/cursor. Spec5 [4.8.2].
+	type deferredDel struct {
+		sid string
+		cc  *ConsumerConfig
+	}
+	var deferredDels []deferredDel
+
+	var err error
+	subs := make([]*subscription, 0, len(filters))
+	for _, f := range filters {
+		// Skip what's already been identified as a failure (0x80 or any v5
+		// error reason code).
+		if f.qos >= mqttSubAckFailure {
+			continue
+		}
+		subject := f.filter
+		bsubject := []byte(subject)
+		sid := f.sessionKey()
+		bsid := []byte(sid)
+		isReserved := isMQTTReservedSubscription(subject)
+
+		// For a shared subscription the raw QoS0 subscription is a NATS queue
+		// subscription so a QoS0-published message reaches exactly one group
+		// member. The queue name is derived (with the level-up subject handled
+		// below) and doubles as the JS consumer DeliverGroup. Spec5 [4.8.2].
+		var queue []byte
+		if f.shared {
+			q, _, _ := mqttSharedNames(f.group, subject)
+			queue = []byte(q)
+		}
+
+		// Retain Handling is per-subscription, but the preloaded rms is shared
+		// across all filters in this SUBSCRIBE and matched against each sub's
+		// subject at serialization time. Gating only the preload would still leak
+		// a retained message into an RH=1/2 filter when an overlapping filter
+		// (e.g. a wildcard with RH=0) caused that subject to be loaded. So pass
+		// rms only to filters that must replay; nil otherwise. sess.subs is
+		// unchanged until sess.update at the end, so this matches the preload
+		// decision. Shared subscriptions never replay retained. Spec5 [3.8.3.1], [4.8.2].
+		subRMS := rms
+		if f.shared || !mqttShouldSendRetained(f.retainHandling, sess.subs, f.filter) {
+			subRMS = nil
+		}
+
+		// For a shared subscription persist membership BEFORE creating the group
+		// consumer, so a concurrent leaver's last-holder scan (possibly on another
+		// server) sees this joiner. Snapshot the prior state so a later failure of
+		// this filter restores it rather than leaving a phantom member. Spec5 [4.8.2].
+		var priorQoS byte
+		var priorExisted, priorRap bool
+		var priorSubID int
+		if fromSubProto && f.shared {
+			priorQoS, priorExisted = sess.sharedSubs[sid]
+			if priorExisted {
+				_, priorRap = sess.rapSubs[sid]
+				priorSubID = sess.subIDs[sid]
+			}
+			if err := sess.update([]*mqttFilter{f}, true); err != nil {
+				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
+				// update() mutated the in-memory maps before its save failed; revert
+				// them so a later save in this packet cannot persist a phantom
+				// membership. Spec5 [4.8.2].
+				sess.restoreSharedKeyInMemory(sid, priorExisted, priorQoS, priorRap, priorSubID)
+				continue
+			}
+		}
+
+		var jscons *ConsumerConfig
+		var jssub *subscription
+
+		// Note that if a subscription already exists on this subject, the
+		// existing sub is returned. Need to update the qos.
+		var sub *subscription
+		var err error
+
+		// Deferred consumer deletes recorded by THIS filter, so a later per-filter
+		// failure can cancel them (restore the sess.cons entry, keep the durable).
+		filterDefStart := len(deferredDels)
+		cancelFilterDeferred := func() {
+			// The sess.cons entries were never removed (removal happens at
+			// execution time, after the confirmed save), so cancelling is just
+			// dropping this filter's descriptors.
+			deferredDels = deferredDels[:filterDefStart]
+		}
+
+		const processShadowSubs = true
+
+		as.mu.Lock()
+		sess.mu.Lock()
+		sub, err = sess.processSub(c,
+			bsubject, bsid, queue, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // main subject
+			_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
+			processShadowSubs,
+			subRMS, trace, as)
+		sess.mu.Unlock()
+		as.mu.Unlock()
+
+		if err != nil {
+			f.qos = mqttSubAckFailure
+			f.reasonStr = err.Error()
+			cancelFilterDeferred()
+			doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			if rerr != nil {
+				// Rollback persistence not confirmed: hard-error WITHOUT releasing
+				// resources, so we never delete a group durable the record may still
+				// claim membership in. Spec5 [4.8.2].
+				return subs, rerr
+			}
+			if doCleanup {
+				sess.cleanupFailedSub(c, sub, jscons, jssub)
+			}
+			continue
+		}
+
+		// This will create (if not already exist) a JS consumer for
+		// subscriptions of QoS >= 1. But if a JS consumer already exists and
+		// the subscription for same subject is now a QoS==0, then the JS
+		// consumer will be deleted. Shared subscriptions always join the group
+		// consumer (even at QoS0, so stored messages are delivered at QoS0).
+		if f.shared {
+			jscons, jssub, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+		} else {
+			var dd *ConsumerConfig
+			jscons, jssub, dd, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+			if dd != nil {
+				deferredDels = append(deferredDels, deferredDel{sid: sid, cc: dd})
+			}
+		}
+		if err != nil {
+			f.qos = mqttSubAckFailure
+			f.reasonStr = err.Error()
+			cancelFilterDeferred()
+			doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			if rerr != nil {
+				// Rollback persistence not confirmed: hard-error WITHOUT releasing
+				// resources, so we never delete a group durable the record may still
+				// claim membership in. Spec5 [4.8.2].
+				return subs, rerr
+			}
+			if doCleanup {
+				sess.cleanupFailedSub(c, sub, jscons, jssub)
+			}
+			continue
+		}
+
+		// Process the wildcard subject if needed.
+		if need, fwcsubject, fwcsid := fwc(subject, sid); need {
+			var fwjscons *ConsumerConfig
+			var fwjssub *subscription
+			var fwcsub *subscription
+			var fwcqueue []byte
+			if f.shared {
+				q, _, _ := mqttSharedNames(f.group, fwcsubject)
+				fwcqueue = []byte(q)
+			}
+
+			// See note above about existing subscription.
+			as.mu.Lock()
+			sess.mu.Lock()
+			fwcsub, err = sess.processSub(c,
+				[]byte(fwcsubject), []byte(fwcsid), fwcqueue, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // FWC (top-level wildcard) subject
+				_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
+				processShadowSubs,
+				subRMS, trace, as)
+			sess.mu.Unlock()
+			as.mu.Unlock()
+			if err != nil {
+				// c.processSub already called c.Errorf(), so no need here.
+				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
+				cancelFilterDeferred()
+				doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				if rerr != nil {
+					return subs, rerr
+				}
+				if doCleanup {
+					sess.cleanupFailedSub(c, sub, jscons, jssub)
+				}
+				continue
+			}
+
+			if f.shared {
+				fwjscons, fwjssub, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+			} else {
+				var fwdd *ConsumerConfig
+				fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+				if fwdd != nil {
+					deferredDels = append(deferredDels, deferredDel{sid: fwcsid, cc: fwdd})
+				}
+			}
+			if err != nil {
+				// c.processSub already called c.Errorf(), so no need here.
+				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
+				cancelFilterDeferred()
+				doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				if rerr != nil {
+					return subs, rerr
+				}
+				if doCleanup {
+					sess.cleanupFailedSub(c, sub, jscons, jssub)
+					sess.cleanupFailedSub(c, fwcsub, fwjscons, fwjssub)
+				}
+				continue
+			}
+
+			subs = append(subs, fwcsub)
+			addJSConsToSess(fwcsid, fwjscons)
+		}
+
+		subs = append(subs, sub)
+		addJSConsToSess(sid, jscons)
+	}
+
+	if fromSubProto {
+		if err = sess.update(filters, true); err != nil {
+			// The session record could not be persisted. Rather than leave a
+			// partially-applied SUBSCRIBE live with no SUBACK sent, tear down every
+			// subscription and consumer newly created in this packet, restore the
+			// pre-packet membership and consumer entries (deferred downgrade deletes
+			// were never executed, so their durables are intact), then return the
+			// error so the connection closes. Spec5 [4.8.2].
+			sess.rollbackSubscribePacket(c, subs, consSnap, snap)
+		} else {
+			// Save confirmed: now run the irreversible teardown of consumers that
+			// this packet downgraded to QoS0.
+			for _, dd := range deferredDels {
+				sess.execDeferredConsumerDelete(c, dd.sid, dd.cc)
+			}
+		}
+	}
+
+	return subs, err
+}
+
+// rollbackSharedSub undoes the early membership persistence done for a shared
+// filter whose subscribe subsequently failed. A re-SUBSCRIBE of a filter that
+// existed before this packet is restored to its prior QoS/RAP/subID and its
+// membership kept (returns run=false, so the caller does NOT release the shared
+// consumer); a newly-added filter is removed and the caller must release its
+// resources (run=true). For non-shared filters or the CONNECT restore path this
+// is a no-op that just asks the caller to run its normal cleanup. If the rollback
+// persist fails it returns a non-nil error so the caller escalates to a hard
+// processing error rather than leaving a phantom persisted membership. Spec5 [4.8.2].
+func (sess *mqttSession) rollbackSharedSub(c *client, f *mqttFilter, fromSubProto, priorExisted bool, priorQoS byte, priorRap bool, priorSubID int) (run bool, err error) {
+	if !fromSubProto || !f.shared {
+		return true, nil
+	}
+	if priorExisted {
+		restore := &mqttFilter{shared: true, group: f.group, filter: f.filter, qos: priorQoS, retainAsPublished: priorRap, subID: priorSubID}
+		if e := sess.update([]*mqttFilter{restore}, true); e != nil {
+			return false, e
+		}
+		// A failed re-SUBSCRIBE must keep delivering with the OLD state: the
+		// processSub/processSharedJSConsumer refresh already overwrote the live
+		// subscription's QoS/RAP/subID with the attempted values, so restore them.
+		// Spec5 [4.8.2].
+		sess.restoreSharedLiveMetadata(c, f, priorQoS, priorRap, priorSubID)
+		return false, nil
+	}
+	return true, sess.update([]*mqttFilter{f}, false)
+}
+
+// restoreSharedLiveMetadata resets the live QoS/RAP/subID on a shared filter's
+// raw-subject subscription, its level-up subscription (if any), and its group
+// deliver subscription to the given prior values, after a failed re-SUBSCRIBE
+// refreshed them to the attempted values. Spec5 [4.8.2].
+func (sess *mqttSession) restoreSharedLiveMetadata(c *client, f *mqttFilter, qos byte, rap bool, subID int) {
+	sid := f.sessionKey()
+	_, deliver, _ := mqttSharedNames(f.group, f.filter)
+	setFields := func(csid string) {
+		c.mu.Lock()
+		sub := c.subs[csid]
+		c.mu.Unlock()
+		if sub == nil {
+			return
+		}
+		sess.mu.Lock()
+		sess.subsMu.Lock()
+		if sub.mqtt != nil {
+			sub.mqtt.qos = qos
+			sub.mqtt.retainAsPublished = rap
+			sub.mqtt.subID = subID
+		}
+		sess.subsMu.Unlock()
+		sess.mu.Unlock()
+	}
+	setFields(sid)     // raw-subject sub
+	setFields(deliver) // group deliver sub
+	if mqttNeedSubForLevelUp(f.filter) {
+		setFields(sid[:len(sid)-2] + mqttMultiLevelSidSuffix)
+		_, ldeliver, _ := mqttSharedNames(f.group, f.filter[:len(f.filter)-2])
+		setFields(ldeliver)
+	}
+}
+
+// mqttSubSnapshot captures the pre-SUBSCRIBE state of the session's subscription
+// maps so a failed packet can be reverted exactly. Spec5 [4.8.2].
+type mqttSubSnapshot struct {
+	subs    map[string]byte
+	shared  map[string]byte
+	rap     map[string]struct{}
+	noLocal map[string]struct{}
+	subIDs  map[string]int
+}
+
+// snapshotSubs shallow-copies every subscription map under the session lock.
+func (sess *mqttSession) snapshotSubs() *mqttSubSnapshot {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	s := &mqttSubSnapshot{
+		subs:    make(map[string]byte, len(sess.subs)),
+		shared:  make(map[string]byte, len(sess.sharedSubs)),
+		rap:     make(map[string]struct{}, len(sess.rapSubs)),
+		noLocal: make(map[string]struct{}, len(sess.noLocalSubs)),
+		subIDs:  make(map[string]int, len(sess.subIDs)),
+	}
+	for k, v := range sess.subs {
+		s.subs[k] = v
+	}
+	for k, v := range sess.sharedSubs {
+		s.shared[k] = v
+	}
+	for k := range sess.rapSubs {
+		s.rap[k] = struct{}{}
+	}
+	for k := range sess.noLocalSubs {
+		s.noLocal[k] = struct{}{}
+	}
+	for k, v := range sess.subIDs {
+		s.subIDs[k] = v
+	}
+	return s
+}
+
+// restoreSharedKeyInMemory reverts the in-memory shared-subscription maps for one
+// session key to the given prior state, without persisting. Used when an early
+// membership persist failed (update mutates the maps before it saves). Spec5 [4.8.2].
+func (sess *mqttSession) restoreSharedKeyInMemory(sid string, existed bool, qos byte, rap bool, subID int) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if existed {
+		if sess.sharedSubs == nil {
+			sess.sharedSubs = make(map[string]byte)
+		}
+		sess.sharedSubs[sid] = qos
+	} else {
+		delete(sess.sharedSubs, sid)
+	}
+	sess.rapSubs, _ = mqttUpdateFilterOptSet(sess.rapSubs, sid, existed && rap)
+	sess.subIDs, _ = mqttUpdateFilterSubID(sess.subIDs, sid, mqttZeroIf(!existed, subID))
+}
+
+// mqttZeroIf returns 0 when cond is true, else v. Helper for map-key clears.
+func mqttZeroIf(cond bool, v int) int {
+	if cond {
+		return 0
+	}
+	return v
+}
+
+// rollbackSubscribePacket undoes every runtime and persisted change made by a
+// SUBSCRIBE whose final session-record save failed. It restores the pre-packet
+// subscription maps and re-persists them; only if that restore save is confirmed
+// does it tear down the subscriptions and consumers that were NEWLY created in
+// this packet — so a group durable is never deleted while the persisted record
+// might still claim membership. A re-SUBSCRIBE of a pre-existing filter keeps its
+// membership and runtime state. The connection is closing regardless. Spec5 [4.8.2].
+func (sess *mqttSession) rollbackSubscribePacket(c *client, subs []*subscription, consSnap map[string]*ConsumerConfig, snap *mqttSubSnapshot) {
+	// Restore EVERYTHING the packet mutated — the membership maps AND sess.cons —
+	// before the confirm-save, so the record is written from a fully rolled-back
+	// view: a QoS0->QoS1 upgrade's new consumer must not be persisted under the
+	// restored QoS0 subs key, and a QoS1->QoS0 downgrade's restored subscription
+	// must be persisted WITH its pre-existing consumer config (its durable is
+	// intact because downgrade deletes are deferred until a confirmed save, which
+	// did not happen). The pre-packet consumer snapshot is authoritative for these
+	// QoS transitions, which the membership maps alone cannot express. Spec5 [4.8.2].
+	var added []struct {
+		sid string
+		cc  *ConsumerConfig
+	}
+	sess.mu.Lock()
+	for sid, cc := range sess.cons {
+		if _, ok := consSnap[sid]; !ok {
+			added = append(added, struct {
+				sid string
+				cc  *ConsumerConfig
+			}{sid, cc})
+		}
+	}
+	sess.subs = snap.subs
+	sess.sharedSubs = snap.shared
+	sess.rapSubs = snap.rap
+	sess.noLocalSubs = snap.noLocal
+	sess.subIDs = snap.subIDs
+	sess.cons = consSnap
+	sess.mu.Unlock()
+	if err := sess.save(); err != nil {
+		// Could not confirm the rolled-back record. Do not release/delete anything
+		// (a durable could be orphaned while the record still claims membership);
+		// put the packet's consumer entries back so the in-memory view matches the
+		// still-live resources, and let a reconnect reconcile from the record.
+		sess.mu.Lock()
+		if sess.cons == nil {
+			sess.cons = make(map[string]*ConsumerConfig)
+		}
+		for _, a := range added {
+			sess.cons[a.sid] = a.cc
+		}
+		sess.mu.Unlock()
+		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
+		return
+	}
+
+	// A raw subscription "existed before" this packet if the restored membership
+	// still holds its filter. The level-up sid ("<mainsid without .>> fwc") maps
+	// back to the main membership key ("<...>.>").
+	existedBefore := func(sid string) bool {
+		key := sid
+		if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
+			key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
+		}
+		if strings.HasPrefix(key, string(mqttSharedSubPrefix)) {
+			_, ok := snap.shared[key]
+			return ok
+		}
+		_, ok := snap.subs[key]
+		return ok
+	}
+	for _, sub := range subs {
+		if sub != nil && !existedBefore(string(sub.sid)) {
+			c.processUnsub(sub.sid)
+		}
+	}
+	for _, a := range added {
+		if a.cc.DeliverGroup != _EMPTY_ {
+			sess.releaseSharedConsumer(c, a.cc, nil)
+		} else {
+			sess.execDeferredConsumerDelete(c, a.sid, a.cc)
+		}
+	}
+}
+
+// Retained publish messages matching this subscription are serialized in the
+// subscription's `prm` mqtt writer. This buffer will be queued for outbound
+// after the subscription is processed and SUBACK is sent or possibly when
+// server processes an incoming published message matching the newly
+// registered subscription.
+//
+// Runs from the client's readLoop.
+// Account session manager lock held on entry.
+// Session lock held on entry.
+func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]*mqttRetainedMsg, sess *mqttSession, c *client, sub *subscription, trace bool) {
+	if as.retmsgs.Size() == 0 || len(rms) == 0 {
+		return
+	}
+	toTrace := []mqttPublish{}
+	as.retmsgs.Match(sub.subject, func(subj []byte, _ *mqttRetainedMsgRef) {
+		rm := rms[string(subj)]
+		if rm == nil {
+			// This should not happen since we pre-load messages into rms before
+			// calling serialize.
+			return
+		}
+		// MQTT 5.0 Message Expiry Interval: an expired retained message must not be
+		// delivered. The stored copy is reaped by its per-message TTL; this guards
+		// the window where the in-memory ref/cache still points at it. Spec5
+		// [3.3.2.3.3].
+		if !rm.expires.IsZero() && !time.Now().Before(rm.expires) {
+			return
+		}
+		// No Local: do not replay a retained message this same session published.
+		// The stored SessionHash is the authenticated origin marker; recompute it
+		// for this session+subject+payload and suppress only on an authentic
+		// match. Spec5 [3.8.3.1].
+		if sub.mqtt.noLocal {
+			expected := mqttOriginMarker(c.srv.mqtt.originKey, sess.idHash, string(subj), rm.Msg)
+			if mqttNoLocalSuppress(true, rm.SessionHash, expected) {
+				return
+			}
+		}
+		// A broad wildcard subscription can overlap a subscribe deny clause.
+		c.mu.Lock()
+		denied := c.mperms != nil && c.checkDenySub(string(subj))
+		c.mu.Unlock()
+		if denied {
+			return
+		}
+		var pi uint16
+		qos := min(mqttGetQoS(rm.Flags), sub.mqtt.qos)
+		if c.mqtt.rejectQoS2Pub && qos == 2 {
+			c.Warnf("Rejecting retained message with QoS2 for subscription %q, as configured", sub.subject)
+			return
+		}
+		if qos > 0 {
+			pi = sess.trackPublishRetained()
+
+			// If we failed to get a PI for this message, send it as a QoS0, the
+			// best we can do?
+			if pi == 0 {
+				qos = 0
+			}
+		}
+
+		// MQTT 5.0 Message Expiry Interval: a v5 subscriber must receive the
+		// interval reduced by the time the retained message has been waiting in the
+		// server. Spec5 [3.3.2.3.3]. 3.1.1 subscribers get no properties section.
+		v5 := c.mqtt.proto == mqttProtoLevel5
+		props := rm.Props
+		if v5 && !rm.expires.IsZero() {
+			rem := uint32(time.Until(rm.expires).Seconds())
+			if rem < 1 {
+				rem = 1
+			}
+			props = mqttSetMessageExpiry(rm.Props, rem)
+		}
+		// MQTT 5.0 Subscription Identifier: inject the subscription's identifier
+		// (this path builds the header directly, bypassing mqttEnqueuePublishMsgTo).
+		// After the expiry rewrite and before the size check below. Spec5 [3.8.2.1.2].
+		if v5 && sub.mqtt.subID > 0 {
+			props = mqttInjectSubID(props, sub.mqtt.subID)
+		}
+
+		// Need to use the subject for the retained message, not the `sub` subject.
+		// We can find the published retained message in rm.sub.subject.
+		// Set the RETAIN flag: [MQTT-3.3.1-8].
+		// Retained frames are intentionally not aliased: they are buffered into
+		// sub.mqtt.prm here (under the session lock) and flushed later under cc.mu,
+		// so binding an alias here could order the binding after live frames already
+		// queued. A full topic is always legal; the first live message binds instead.
+		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, v5, []byte(rm.Topic), props, len(rm.Msg))
+
+		// MQTT 5.0 Maximum Packet Size: skip a retained message that would exceed
+		// the client's limit rather than send an oversized packet (which a strict
+		// client rejects as a protocol error). Discarding is spec-correct: the
+		// message is treated as delivered. Release the packet identifier if one
+		// was allocated (the session lock is held on entry). Spec5 [3.1.2.11.4].
+		if mp := c.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(rm.Msg) > int(mp) {
+			if pi != 0 {
+				sess.untrackPublish(pi)
+			}
+			return
+		}
+		c.mu.Lock()
+		sub.mqtt.prm = append(sub.mqtt.prm, headerBytes, rm.Msg)
+		c.mu.Unlock()
+		if trace {
+			toTrace = append(toTrace, mqttPublish{
+				topic: []byte(rm.Topic),
+				flags: flags,
+				pi:    pi,
+				sz:    len(rm.Msg),
+			})
+		}
+	})
+	for _, pp := range toTrace {
+		c.traceOutOp("PUBLISH", []byte(mqttPubTrace(&pp)))
+	}
+}
+
+// Appends the stored message subjects for all retained message records that
+// match the given subscription's `subject` (which could have wildcards).
+//
+// Account session manager NOT lock held on entry.
+func (as *mqttAccountSessionManager) addRetainedSubjectsForSubject(list map[string]uint64, topSubject string) {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+
+	if as.retmsgs.Size() == 0 {
+		return
+	}
+
+	as.retmsgs.Match(stringToBytes(topSubject), func(subj []byte, ret *mqttRetainedMsgRef) {
+		subject := string(subj)
+		if _, ok := list[subject]; ok {
+			return
+		}
+		if seq := ret.sseq; seq > 0 {
+			list[subject] = seq
+		}
+	})
+}
+
+type warner interface {
+	Warnf(format string, v ...any)
+}
+
+// Loads a list of retained messages given a list of stored message subjects.
+func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]uint64, w warner) map[string]*mqttRetainedMsg {
+	rms := make(map[string]*mqttRetainedMsg, len(subjects))
+	ss := []string{}
+	for s := range subjects {
+		if rm := as.getCachedRetainedMsg(s); rm != nil {
+			rms[s] = rm
+		} else {
+			ss = append(ss, mqttRetainedMsgsStreamSubject+s)
+		}
+	}
+
+	if len(ss) == 0 {
+		return rms
+	}
+
+	// Although we have the stream sequence for a given subject, we still use
+	// the load with "last for subject" because it will cover the cases where a
+	// new retained message has arrived since we collected the subject/seq pair.
+	// If we were doing a load "by seq" and the message is not found, we would
+	// incorrectly remove the retained message from our map.
+	results, err := as.jsa.loadLastMsgForMulti(mqttRetainedMsgsStreamName, ss)
+	// If an error occurred, warn, but then proceed with what we got.
+	if err != nil {
+		w.Warnf("error loading retained messages: %v", err)
+	}
+	for i, result := range results {
+		if result == nil {
+			continue // skip requests that timed out
+		}
+		if err := result.ToError(); err != nil {
+			// Skip the "$MQTT.rmsgs." prefix...
+			subj := ss[i][len(mqttRetainedMsgsStreamSubject):]
+			if IsNatsErr(err, JSNoMessageFoundErr) {
+				// If there is no message for that subject, delete from our map.
+				// The good thing here is that we handle the race where a retained
+				// message may just arrive and be replacing it in the map. The
+				// removeRetainedMsg() function below will not remove if the sequence
+				// does not match.
+				seq := subjects[subj]
+				as.removeRetainedMsg(subj, seq)
+				// Expected when a per-message TTL reaped an expired retained
+				// message; the stale index entry is cleaned up, no warning.
+				continue
+			}
+			w.Warnf("failed to load retained message for subject %q: %v", subj, err)
+			continue
+		}
+		rm, err := mqttDecodeRetainedMessage(result.Message.Subject, result.Message.Header, result.Message.Data)
+		if err != nil {
+			// Unlikely that we can recover from that, so remove the message.
+			// (see comment above if failing to load the message).
+			subj := ss[i][len(mqttRetainedMsgsStreamSubject):]
+			seq := subjects[subj]
+			as.removeRetainedMsg(subj, seq)
+			w.Warnf("failed to decode retained message for subject %q: %v", subj, err)
+			continue
+		}
+		if len(rm.Msg) == 0 {
+			// An empty body is a delete tombstone (see mqttHandlePubRetain): the
+			// "last message for subject" query can return one directly on a cold
+			// load (no live server has processed it via processRetainedMsg yet to
+			// evict it from the index), so it must be treated the same as "no
+			// retained message" here, not delivered as an empty PUBLISH.
+			subj := ss[i][len(mqttRetainedMsgsStreamSubject):]
+			as.removeRetainedMsg(subj, 0)
+			continue
+		}
+
+		// Add the loaded retained message to the cache, and to the results map.
+		// We don't need setCachedRetainedMsg() to clone the `rm.Msg` bytes slice
+		// since we own it.
+		as.setCachedRetainedMsg(rm.Subject, rm, false, false)
+		rms[rm.Subject] = rm
+	}
+	return rms
+}
+
+// Composes a NATS message for a storeable mqttRetainedMsg.
+// If the body is empty, the flags are encoded in a way that will cause older
+// servers to fail to decode the message in processRetainedMsg callback and
+// will simply ignore it, which is what we want.
+func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen int) {
+	return mqttEncodeRetainedMessageTTL(rm, true)
+}
+
+// withTTL=false skips the JetStream per-message TTL header (degraded mode: the
+// stream does not allow it); the expiry deadline header is still written so
+// delivery-side expiry keeps working.
+func mqttEncodeRetainedMessageTTL(rm *mqttRetainedMsg, withTTL bool) (natsMsg []byte, headerLen int) {
+	delRM := len(rm.Msg) == 0
+
+	// MQTT 5.0 Message Expiry Interval: for a live retained message with an
+	// expiry, carry the absolute deadline (so the remaining interval can be
+	// recomputed on replay) plus a JetStream per-message TTL for the remaining
+	// lifetime (so the stored copy is dropped once it expires). Delete markers
+	// (empty payload) never carry expiry. Spec5 [3.3.2.3.3].
+	var expStr, ttlStr string
+	if !delRM && !rm.expires.IsZero() {
+		expStr = strconv.FormatInt(rm.expires.UnixNano(), 10)
+		// Round the remaining lifetime up so JetStream never deletes the retained
+		// copy before its deadline (truncating a 1.99s remainder to 1s would drop
+		// it almost a second early). At least 1s, JetStream's minimum.
+		secs := int64((time.Until(rm.expires) + time.Second - 1) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		ttlStr = strconv.FormatInt(secs, 10)
+		if !withTTL {
+			ttlStr = _EMPTY_
+		}
+	}
+
+	// No need to encode the subject, we can restore it from topic.
+	l := len(hdrLine)
+	l += len(mqttNatsRetainedMessageTopic) + 1 + len(rm.Topic) + 2 // 1 byte for ':', 2 bytes for CRLF
+	if rm.Origin != _EMPTY_ {
+		l += len(mqttNatsRetainedMessageOrigin) + 1 + len(rm.Origin) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
+	if rm.Source != _EMPTY_ {
+		l += len(mqttNatsRetainedMessageSource) + 1 + len(rm.Source) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
+	if rm.SessionHash != _EMPTY_ {
+		l += len(mqttNatsRetainedMessageSessionHash) + 1 + len(rm.SessionHash) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
+	if len(rm.Props) > 0 {
+		l += len(mqttNatsRetainedMessageProps) + 1 + base64.StdEncoding.EncodedLen(len(rm.Props)) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
+	if expStr != _EMPTY_ {
+		l += len(mqttNatsRetainedMessageExpiry) + 1 + len(expStr) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
+	if ttlStr != _EMPTY_ {
+		l += len(JSMessageTTL) + 1 + len(ttlStr) + 1 + 2 // 1 byte for ':', 1 for 's', 2 bytes for CRLF
+	}
+	l += len(mqttNatsRetainedMessageFlags) + 1 + 2 + 2 // 1 byte for ':', 2 bytes for the flags, 2 bytes for CRLF
+	l += 2                                             // 2 bytes for the extra CRLF after the header
+	if delRM {
+		l++ // Will add the delete marker before the flag
+	} else {
+		l += len(rm.Msg)
+	}
+
+	buf := bytes.NewBuffer(make([]byte, 0, l))
+
+	buf.WriteString(hdrLine)
+
+	buf.WriteString(mqttNatsRetainedMessageTopic)
+	buf.WriteByte(':')
+	buf.WriteString(rm.Topic)
+	buf.WriteString(_CRLF_)
+
+	buf.WriteString(mqttNatsRetainedMessageFlags)
+	buf.WriteByte(':')
+	if delRM {
+		buf.WriteByte(mqttRetainedFlagDelMarker)
+	}
+	buf.WriteString(strconv.FormatUint(uint64(rm.Flags), 16))
+	buf.WriteString(_CRLF_)
+
+	if rm.Origin != _EMPTY_ {
+		buf.WriteString(mqttNatsRetainedMessageOrigin)
+		buf.WriteByte(':')
+		buf.WriteString(rm.Origin)
+		buf.WriteString(_CRLF_)
+	}
+	if rm.Source != _EMPTY_ {
+		buf.WriteString(mqttNatsRetainedMessageSource)
+		buf.WriteByte(':')
+		buf.WriteString(rm.Source)
+		buf.WriteString(_CRLF_)
+	}
+	if rm.SessionHash != _EMPTY_ {
+		buf.WriteString(mqttNatsRetainedMessageSessionHash)
+		buf.WriteByte(':')
+		buf.WriteString(rm.SessionHash)
+		buf.WriteString(_CRLF_)
+	}
+	if len(rm.Props) > 0 {
+		buf.WriteString(mqttNatsRetainedMessageProps)
+		buf.WriteByte(':')
+		buf.WriteString(base64.StdEncoding.EncodeToString(rm.Props))
+		buf.WriteString(_CRLF_)
+	}
+
+	if expStr != _EMPTY_ {
+		buf.WriteString(mqttNatsRetainedMessageExpiry)
+		buf.WriteByte(':')
+		buf.WriteString(expStr)
+		buf.WriteString(_CRLF_)
+	}
+	if ttlStr != _EMPTY_ {
+		buf.WriteString(JSMessageTTL)
+		buf.WriteByte(':')
+		buf.WriteString(ttlStr)
+		buf.WriteByte('s')
+		buf.WriteString(_CRLF_)
+	}
+
+	// End of header, finalize
+	buf.WriteString(_CRLF_)
+	headerLen = buf.Len()
+	buf.Write(rm.Msg)
+	return buf.Bytes(), headerLen
+}
+
+func mqttSliceHeaders(headers map[string][]byte, hdr []byte) {
+	// Skip the hdrLine
+	if !bytes.HasPrefix(hdr, stringToBytes(hdrLine)) {
+		return
+	}
+	crLFAsBytes := stringToBytes(CR_LF)
+	for i := len(hdrLine); i < len(hdr); {
+		// Search for key/val delimiter.
+		del := bytes.IndexByte(hdr[i:], ':')
+		// Not found or key is length 0, we stop.
+		if del < 0 || del == i {
+			break
+		}
+		keyStart := i
+		// Walk back to remove spaces between the key and ':' if applicable.
+		index := keyStart + del - 1
+		for index > keyStart && hdr[index] == ' ' {
+			index--
+		}
+		key := hdr[keyStart : index+1]
+		// If what we had is only spaces, we stop.
+		if len(key) == 0 {
+			break
+		}
+		i += del + 1
+		valStart := i
+		// Search for `\r\n`.
+		nl := bytes.Index(hdr[valStart:], crLFAsBytes)
+		// If we don't find, we stop.
+		if nl < 0 {
+			break
+		}
+		// Look if the caller is interested in this key.
+		if _, ok := headers[bytesToString(key)]; ok {
+			index := valStart
+			// Remove possible spaces between the ':' and the value.
+			for index < valStart+nl && hdr[index] == ' ' {
+				index++
+			}
+			// Create a slice and limit capacity to the value range.
+			val := hdr[index : valStart+nl : valStart+nl]
+			// Record in the caller's map the value for this key.
+			headers[bytesToString(key)] = val
+		}
+		// Reposition to past the `\r\n`.
+		i += nl + 2
+	}
+}
+
+// Decodes a retained message based on the content of the header `h`.
+// The returned `*mqttRetainedMsg` object will hold a reference to `m`.
+// If the buffer `m` is not owned by the caller, it is the caller
+// responsibility to make a copy of the byte slice.
+func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, error) {
+	headers := map[string][]byte{
+		mqttNatsRetainedMessageOrigin:      nil,
+		mqttNatsRetainedMessageFlags:       nil,
+		mqttNatsRetainedMessageSource:      nil,
+		mqttNatsRetainedMessageProps:       nil,
+		mqttNatsRetainedMessageExpiry:      nil,
+		mqttNatsRetainedMessageSessionHash: nil,
+	}
+	var rm *mqttRetainedMsg
+	// Retrieve the values for the above headers.
+	mqttSliceHeaders(headers, h)
+	// Get the flag header.
+	fHeader := headers[mqttNatsRetainedMessageFlags]
+	// If we don't, it could be that this is an old retained message that
+	// was JSON encoded.
+	if len(fHeader) > 0 {
+		if len(fHeader) > 1 && fHeader[0] == mqttRetainedFlagDelMarker {
+			fHeader = fHeader[1:]
+		}
+		flagsUint, err := strconv.ParseUint(bytesToString(fHeader), 16, 8)
+		if err != nil {
+			// Since the error is currently not reported in the server, we
+			// will simply replace with this one.
+			return nil, errMQTTInvalidRetainFlags
+		}
+		rm = &mqttRetainedMsg{
+			Flags:       byte(flagsUint),
+			Origin:      string(headers[mqttNatsRetainedMessageOrigin]),
+			Source:      string(headers[mqttNatsRetainedMessageSource]),
+			SessionHash: string(headers[mqttNatsRetainedMessageSessionHash]),
+			Msg:         m,
+		}
+		// MQTT 5.0 properties block (base64). Absent for older stored messages.
+		// Validate before keeping it: the retained stream could contain a
+		// crafted Nmqtt-RProps from a non-MQTT publisher, and rm.Props is later
+		// written verbatim into outbound PUBLISH packets.
+		if enc := headers[mqttNatsRetainedMessageProps]; len(enc) > 0 {
+			if raw, err := base64.StdEncoding.DecodeString(bytesToString(enc)); err == nil {
+				rm.Props = mqttValidateForwardProps(raw)
+			}
+		}
+		// MQTT 5.0 Message Expiry Interval: absolute deadline (Unix nanoseconds).
+		if exp := headers[mqttNatsRetainedMessageExpiry]; len(exp) > 0 {
+			if ns, err := strconv.ParseInt(bytesToString(exp), 10, 64); err == nil && ns > 0 {
+				rm.expires = time.Unix(0, ns)
+			}
+		}
+	} else {
+		if err := json.Unmarshal(m, &rm); err != nil {
+			return nil, err
+		}
+		// Same validation as the header path above: a JSON record from a
+		// non-MQTT publisher could carry crafted Props.
+		rm.Props = mqttValidateForwardProps(rm.Props)
+	}
+	// Now check that the values are correct.
+	//
+	// For "Flags", anything at or above binary (1111) is too big.
+	if rm.Flags >= mqttPacketFlagMask {
+		return nil, errMQTTInvalidRetainFlags
+	}
+	if qos := mqttGetQoS(rm.Flags); qos > 2 {
+		return nil, errMQTTInvalidRetainFlags
+	}
+	// We store `Topic` in the retained message because we used to store
+	// all retained messages under the same subject `$MQTT_rmsgs` in
+	// the retained messages stream. That is no longer the case, and to
+	// cover setups where the retained message stream is sourced from another
+	// account and has some subject transforms, simply reconstruct the
+	// topic/subject based on the `subject` passed to this function.
+	rm.Subject = strings.TrimPrefix(subject, mqttRetainedMsgsStreamSubject)
+	rm.Topic = bytesToString(natsSubjectStrToMQTTTopic(rm.Subject))
+	return rm, nil
+}
+
+// Creates the session stream (limit msgs of 1) for this client ID if it does
+// not already exist. If it exists, recover the single record to rebuild the
+// state of the session. If there is a session record but this session is not
+// registered in the runtime of this server, then a request is made to the
+// owner to close the client associated with this session since specification
+// [MQTT-3.1.4-2] specifies that if the ClientId represents a Client already
+// connected to the Server then the Server MUST disconnect the existing client.
+//
+// Runs from the client's readLoop.
+// Lock not held on entry, but session is in the locked map.
+func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opts *Options) (*mqttSession, bool, error) {
+	jsa := &as.jsa
+
+	hash := getHash(clientID)
+	smsg, err := jsa.loadSessionMsg(as.domainTk, hash)
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			return nil, false, fmt.Errorf("loading session record: %w", err)
+		}
+		// Message not found, so reate the session...
+		// Create a session and indicate that this session did not exist.
+		sess := mqttSessionCreate(jsa, clientID, hash, 0, opts)
+		sess.domainTk = as.domainTk
+		return sess, false, nil
+	}
+	// We need to recover the existing record now.
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		return nil, false, fmt.Errorf("unmarshal of session record at sequence %v: %w", smsg.Sequence, err)
+	}
+	if ps.ID != clientID {
+		return nil, false, errMQTTSessionCollision
+	}
+
+	// An overdue session must not be resumed, even if this reconnect beats the
+	// startup sweep to it: discard its state and start fresh. Spec5 [3.1.2.11.2].
+	if ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
+		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval) {
+		sess := mqttSessionCreate(jsa, clientID, hash, smsg.Sequence, opts)
+		sess.domainTk = as.domainTk
+		sess.cons = ps.Cons
+		sess.sharedSubs = ps.SharedSubs
+		sess.pubRelConsumer = ps.PubRel
+		// Wait for the deletes (like the clean-start discard): a queued no-wait
+		// delete of the deterministic PUBREL durable could otherwise race the new
+		// session recreating it.
+		if err := sess.clear(false); err != nil {
+			return nil, false, fmt.Errorf("clearing expired session: %w", err)
+		}
+		// clear() reset the state (seq included), so sess is now a fresh session.
+		return sess, false, nil
+	}
+
+	// Restore this session (even if we don't own it), the caller will do the right thing.
+	sess := mqttSessionCreate(jsa, clientID, hash, smsg.Sequence, opts)
+	sess.domainTk = as.domainTk
+	sess.clean = ps.Clean
+	sess.subs = ps.Subs
+	sess.noLocalSubs = mqttFilterSetFromList(ps.NoLocal)
+	sess.rapSubs = mqttFilterSetFromList(ps.RetainAsPublished)
+	sess.subIDs = ps.SubIDs
+	sess.sharedSubs = ps.SharedSubs
+	sess.cons = ps.Cons
+	sess.pubRelConsumer = ps.PubRel
+	sess.expiryInterval = ps.ExpiryInterval
+	sess.disconnectedAt = ps.DisconnectedAt
+	as.addSession(sess, true)
+	return sess, true, nil
+}
+
+// Sends a request to delete a message, but does not wait for the response.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) deleteRetainedMsg(seq uint64) {
+	as.jsa.deleteMsg(mqttRetainedMsgsStreamName, seq, false)
+}
+
+// Sends a message indicating that a retained message on a given subject and stream sequence
+// is being removed.
+// NOTE: This is maintained for backward compatibility reasons. Should be removed in 2.14/2.15?
+func (as *mqttAccountSessionManager) notifyRetainedMsgDeleted(subject string, seq uint64) {
+	req := mqttRetMsgDel{
+		Subject: subject,
+		Seq:     seq,
+	}
+	b, _ := json.Marshal(&req)
+	jsa := &as.jsa
+	jsa.sendq.push(&mqttJSPubMsg{
+		subj: jsa.rplyr + mqttJSARetainedMsgDel,
+		msg:  b,
+	})
+}
+
+func (as *mqttAccountSessionManager) transferUniqueSessStreamsToMuxed(log *Server) {
+	// Set retry to true, will be set to false on success.
+	retry := true
+	defer func() {
+		if retry {
+			next := mqttDefaultTransferRetry
+			log.Warnf("Failed to transfer all MQTT session streams, will try again in %v", next)
+			time.AfterFunc(next, func() { as.transferUniqueSessStreamsToMuxed(log) })
+		}
+	}()
+
+	jsa := &as.jsa
+	sni, err := jsa.newRequestEx(mqttJSAStreamNames, JSApiStreams, _EMPTY_, 0, nil)
+	if err != nil {
+		log.Errorf("Unable to transfer MQTT session streams: %v", err)
+		return
+	}
+	snames := sni.(*JSApiStreamNamesResponse)
+	if snames.Error != nil {
+		log.Errorf("Unable to transfer MQTT session streams: %v", snames.ToError())
+		return
+	}
+	var oldMQTTSessStreams []string
+	for _, sn := range snames.Streams {
+		if strings.HasPrefix(sn, mqttSessionsStreamNamePrefix) {
+			oldMQTTSessStreams = append(oldMQTTSessStreams, sn)
+		}
+	}
+	ns := len(oldMQTTSessStreams)
+	if ns == 0 {
+		// Nothing to do
+		retry = false
+		return
+	}
+	log.Noticef("Transferring %v MQTT session streams...", ns)
+	for _, sn := range oldMQTTSessStreams {
+		log.Noticef("  Transferring stream %q to %q", sn, mqttSessStreamName)
+		smsg, err := jsa.loadLastMsgFor(sn, sn)
+		if err != nil {
+			log.Errorf("   Unable to load session record: %v", err)
+			return
+		}
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			log.Warnf("    Unable to unmarshal the content of this stream, may not be a legitimate MQTT session stream, skipping")
+			continue
+		}
+		// Store record to MQTT session stream
+		if _, err := jsa.storeSessionMsg(as.domainTk, getHash(ps.ID), 0, smsg.Data); err != nil {
+			log.Errorf("    Unable to transfer the session record: %v", err)
+			return
+		}
+		jsa.deleteStream(sn)
+	}
+	log.Noticef("Transfer of %v MQTT session streams done!", ns)
+	retry = false
+}
+
+func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *Server) error {
+	jsa := &as.jsa
+	var processed int
+	var transferred int
+
+	start := time.Now()
+	deadline := start.Add(mqttRetainedTransferTimeout)
+	for {
+		// Try and look up messages on the original undivided "$MQTT.rmsgs" subject.
+		// If nothing is returned here, we assume to have migrated all old messages.
+		smsg, err := jsa.loadNextMsgFor(mqttRetainedMsgsStreamName, "$MQTT.rmsgs")
+		if IsNatsErr(err, JSNoMessageFoundErr) {
+			// We've ran out of messages to transfer, done.
+			break
+		}
+		if err != nil {
+			log.Warnf("    Unable to transfer a retained message: failed to load from '$MQTT.rmsgs': %s", err)
+			return err
+		}
+
+		// Unmarshal the message so that we can obtain the subject name. Do not
+		// use mqttDecodeRetainedMessage() here because these messages are from
+		// older versions, and contain the full JSON encoding in payload.
+		var rmsg mqttRetainedMsg
+		if err = json.Unmarshal(smsg.Data, &rmsg); err == nil {
+			// Store the message again, this time with the new per-key subject.
+			subject := mqttRetainedMsgsStreamSubject + rmsg.Subject
+			if _, err = jsa.storeMsg(subject, 0, smsg.Data); err != nil {
+				log.Errorf("    Unable to transfer the retained message with sequence %d: %v", smsg.Sequence, err)
+			}
+			transferred++
+		} else {
+			log.Warnf("    Unable to unmarshal retained message with sequence %d, skipping", smsg.Sequence)
+		}
+
+		// Delete the original message.
+		if err := jsa.deleteMsg(mqttRetainedMsgsStreamName, smsg.Sequence, true); err != nil {
+			log.Errorf("    Unable to clean up the retained message with sequence %d: %v", smsg.Sequence, err)
+			return err
+		}
+		processed++
+
+		now := time.Now()
+		if now.After(deadline) {
+			err := fmt.Errorf("timed out while transferring retained messages from '$MQTT.rmsgs' after %v, %d processed, %d successfully transferred", now.Sub(start), processed, transferred)
+			log.Noticef("%s", err.Error())
+			return err
+		}
+	}
+	if processed > 0 {
+		log.Noticef("Processed %d messages from '$MQTT.rmsgs', successfully transferred %d in %v", processed, transferred, time.Since(start))
+	} else {
+		log.Debugf("No messages found to transfer from '$MQTT.rmsgs'")
+	}
+	return nil
+}
+
+func (as *mqttAccountSessionManager) getCachedRetainedMsg(subject string) *mqttRetainedMsg {
+	v, ok := as.rmsCache.Load(subject)
+	if !ok {
+		return nil
+	}
+	rm := v.(*mqttRetainedMsg)
+	if rm.expiresFromCache.Before(time.Now()) {
+		as.rmsCache.Delete(subject)
+		return nil
+	}
+	// MQTT 5.0 Message Expiry Interval: drop an expired retained message rather
+	// than serve a stale copy from the cache. Spec5 [3.3.2.3.3].
+	if !rm.expires.IsZero() && !time.Now().Before(rm.expires) {
+		as.rmsCache.Delete(subject)
+		return nil
+	}
+	return rm
+}
+
+// If cache is enabled, the expiration for the `rm` is bumped by
+// `mqttRetainedCacheTTL` seconds.
+// If `onlyReplace` is true, then the `rm` object is stored in the cache using
+// the `subject` key only if there was already an object stored under that key.
+// If `copyMsgBytes` is true, then the `rm.Msg` bytes are copied (because it
+// references some buffer that is not owned by the caller).
+//
+// Note: currently `onlyReplace` and `cloneMsgBytes` always have the same
+// value (all `true` or all `false`) however we use different booleans to
+// better express the intent.
+func (as *mqttAccountSessionManager) setCachedRetainedMsg(subject string, rm *mqttRetainedMsg, onlyReplace, copyMsgBytes bool) {
+	if rm == nil {
+		return
+	}
+	rm.expiresFromCache = time.Now().Add(mqttRetainedCacheTTL)
+	if onlyReplace {
+		if _, ok := as.rmsCache.Load(subject); !ok {
+			return
+		}
+	}
+	if copyMsgBytes {
+		rm.Msg = copyBytes(rm.Msg)
+	}
+	as.rmsCache.Store(subject, rm)
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// MQTT session related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+// mqttTopicAliasMax returns the effective MQTT 5.0 Topic Alias Maximum from
+// Options: 0 (unset) => mqttDefaultTopicAliasMax, negative (explicitly
+// disabled) => 0, otherwise the configured value. Spec5 [3.2.2.3.2].
+func mqttTopicAliasMax(opts *Options) uint16 {
+	tam := opts.MQTT.TopicAliasMaximum
+	switch {
+	case tam == 0:
+		return mqttDefaultTopicAliasMax
+	case tam < 0:
+		return 0
+	default:
+		return uint16(tam)
+	}
+}
+
+// mqttReceiveMax returns the effective MQTT 5.0 Receive Maximum from Options: 0
+// (unset) => mqttDefaultReceiveMax, negative (explicitly disabled) => 0,
+// otherwise the configured value. Spec5 [3.2.2.3.3].
+func mqttReceiveMax(opts *Options) uint16 {
+	rm := opts.MQTT.ReceiveMaximum
+	switch {
+	case rm == 0:
+		return mqttDefaultReceiveMax
+	case rm < 0:
+		return 0
+	default:
+		return uint16(rm)
+	}
+}
+
+// Returns a new mqttSession object with max ack pending set based on
+// option or use mqttDefaultMaxAckPending if no option set.
+func mqttSessionCreate(jsa *mqttJSA, id, idHash string, seq uint64, opts *Options) *mqttSession {
+	maxp := opts.MQTT.MaxAckPending
+	if maxp == 0 {
+		maxp = mqttDefaultMaxAckPending
+	}
+
+	return &mqttSession{
+		jsa:                    jsa,
+		id:                     id,
+		idHash:                 idHash,
+		seq:                    seq,
+		maxp:                   maxp,
+		pubRelSubject:          mqttPubRelSubjectPrefix + idHash,
+		pubRelDeliverySubject:  mqttPubRelDeliverySubjectPrefix + idHash,
+		pubRelDeliverySubjectB: []byte(mqttPubRelDeliverySubjectPrefix + idHash),
+	}
+}
+
+// Persists a session. Note that if the session's current client does not match
+// the given client, nothing is done.
+//
+// Lock not held on entry.
+func (sess *mqttSession) save() error {
+	if h := mqttTestSessSaveHook; h != nil {
+		if err := h(sess); err != nil {
+			return err
+		}
+	}
+	sess.mu.Lock()
+	// Persist only consumer configs that still correspond to a live subscription:
+	//   - Shared (DeliverGroup) consumers are group-owned and reconstructed from
+	//     SharedSubs on restore; never persist them in Cons (an older server would
+	//     delete the group durable in clear()).
+	//   - A plain consumer is persisted only while its subscription exists in Subs,
+	//     so a consumer removed from Subs but not yet torn down (e.g. UNSUBSCRIBE
+	//     persisting before teardown, or a rolled-back failed SUBSCRIBE) is not
+	//     written with no matching Subs entry. The level-up sid "<X> fwc" maps back
+	//     to the main membership key "<X>.>". Spec5 [4.8.2].
+	var cons map[string]*ConsumerConfig
+	if len(sess.cons) > 0 {
+		cons = make(map[string]*ConsumerConfig, len(sess.cons))
+		for sid, cc := range sess.cons {
+			if cc.DeliverGroup != _EMPTY_ {
+				continue
+			}
+			key := sid
+			if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
+				key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
+			}
+			if _, ok := sess.subs[key]; !ok {
+				continue
+			}
+			cons[sid] = cc
+		}
+		if len(cons) == 0 {
+			cons = nil
+		}
+	}
+	ps := mqttPersistedSession{
+		Origin:            sess.jsa.id,
+		ID:                sess.id,
+		Clean:             sess.clean,
+		Subs:              sess.subs,
+		NoLocal:           mqttFilterSetToList(sess.noLocalSubs),
+		RetainAsPublished: mqttFilterSetToList(sess.rapSubs),
+		SubIDs:            sess.subIDs,
+		SharedSubs:        sess.sharedSubs,
+		Cons:              cons,
+		PubRel:            sess.pubRelConsumer,
+		Will:              sess.will,
+		ExpiryInterval:    sess.expiryInterval,
+		DisconnectedAt:    sess.disconnectedAt,
+	}
+	b, _ := json.Marshal(&ps)
+
+	domainTk, cidHash := sess.domainTk, sess.idHash
+	seq := sess.seq
+	sess.mu.Unlock()
+
+	var hdr int
+	if seq != 0 {
+		bb := bytes.Buffer{}
+		bb.WriteString(hdrLine)
+		bb.WriteString(JSExpectedLastSubjSeq)
+		bb.WriteString(":")
+		bb.WriteString(strconv.FormatInt(int64(seq), 10))
+		bb.WriteString(CR_LF)
+		bb.WriteString(CR_LF)
+		hdr = bb.Len()
+		bb.Write(b)
+		b = bb.Bytes()
+	}
+
+	resp, err := sess.jsa.storeSessionMsg(domainTk, cidHash, hdr, b)
+	if err != nil {
+		return fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
+	}
+	sess.mu.Lock()
+	sess.seq = resp.Sequence
+	sess.mu.Unlock()
+	return nil
+}
+
+// Clear the session.
+//
+// Runs from the client's readLoop.
+// Lock not held on entry, but session is in the locked map.
+func (sess *mqttSession) clear(noWait bool) error {
+	var durs []string
+	var sharedDurs []string
+	var pubRelDur string
+
+	sess.mu.Lock()
+	id := sess.id
+	idHash := sess.idHash
+	seq := sess.seq
+	if l := len(sess.cons); l > 0 {
+		durs = make([]string, 0, l)
+	}
+	for sid, cc := range sess.cons {
+		delete(sess.cons, sid)
+		// A shared group consumer is not owned by this session alone; it is
+		// released (deleted only if no other member remains) after our record is
+		// gone, below. Spec5 [4.8.2].
+		if cc.DeliverGroup != _EMPTY_ {
+			continue
+		}
+		durs = append(durs, cc.Durable)
+	}
+	// Derive shared group durables from the persisted authority (sharedSubs),
+	// which also covers transient sessions rebuilt for expiry that carry no
+	// consumer configs in memory. Spec5 [4.8.2].
+	for key := range sess.sharedSubs {
+		sharedDurs = append(sharedDurs, mqttSharedDurablesForKey(key)...)
+	}
+	if sess.pubRelConsumer != nil {
+		pubRelDur = sess.pubRelConsumer.Durable
+	}
+
+	sess.subs = nil
+	sess.noLocalSubs = nil
+	sess.rapSubs = nil
+	sess.subIDs = nil
+	sess.sharedSubs = nil
+	sess.sharedCharged = nil
+	sess.pendingPublish = nil
+	sess.pendingPubRel = nil
+	sess.cpending = nil
+	sess.deferred = nil
+	sess.pubRelConsumer = nil
+	sess.seq = 0
+	sess.tmaxack = 0
+	// Discarded session: reset the PI counter too so a reused session object
+	// does not inherit the previous session's identifiers. Spec [MQTT-3.1.2-6].
+	sess.last_pi = 0
+	sess.mu.Unlock()
+
+	for _, dur := range durs {
+		if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, noWait); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			return fmt.Errorf("unable to delete consumer %q for session %q: %v", dur, sess.id, err)
+		}
+	}
+	if pubRelDur != _EMPTY_ {
+		_, err := sess.jsa.deleteConsumer(mqttOutStreamName, pubRelDur, noWait)
+		if isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			return fmt.Errorf("unable to delete consumer %q for session %q: %v", pubRelDur, sess.id, err)
+		}
+	}
+
+	// Purge this client's inbound QoS2 dedup/hold entries ($MQTT_qos2in,
+	// subject "$MQTT.qos2.in.<idHash>.<PI>"; see mqttQoS2InternalSubject). A
+	// discarded session must not leave these behind: they otherwise collide by
+	// PI with a later session for the same client ID (MaxMsgsPer=1 rejects the
+	// new PUBLISH as a duplicate) and can resurface stale payloads on PUBREL.
+	// Only on discard, never on resume: an inbound QoS2 message pending PUBREL
+	// is session state (Spec5 [4.1]) that a resumed session must keep.
+	if err := sess.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, mqttQoS2IncomingMsgsStreamSubjectPrefix+idHash+".>", noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
+		return fmt.Errorf("unable to purge QoS2 hold entries for session %q: %v", sess.id, err)
+	}
+
+	if seq > 0 {
+		// When shared subscriptions are involved, wait for the record deletion to
+		// be confirmed even on the no-wait path, so the last-holder scan below
+		// cannot observe this session's own stale record and wrongly keep (or, via
+		// another member, delete) a group durable. Spec5 [4.8.2].
+		wait := !noWait || len(sharedDurs) > 0
+		err := sess.jsa.deleteMsg(mqttSessStreamName, seq, wait)
+		// Ignore the various errors indicating that the message (or sequence)
+		// is already deleted, can happen in a cluster.
+		if isErrorOtherThan(err, JSSequenceNotFoundErrF) {
+			if isErrorOtherThan(err, JSStreamMsgDeleteFailedF) || !strings.Contains(err.Error(), ErrStoreMsgNotFound.Error()) {
+				return fmt.Errorf("unable to delete session %q record at sequence %v: %v", id, seq, err)
+			}
+		}
+	}
+
+	// Release shared group consumers only after this session's record is gone, so
+	// the last-holder scan does not count this session; delete each only when no
+	// other member remains. sharedSubs was niled above, so the scan's in-memory
+	// check is empty and only other sessions' records matter. Spec5 [4.8.2].
+	if len(sharedDurs) > 0 {
+		held := sess.sharedDurablesHeldByOthers(sharedDurs)
+		for _, dur := range sharedDurs {
+			if held[dur] {
+				continue
+			}
+			if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, noWait); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+				return fmt.Errorf("unable to delete shared consumer %q for session %q: %v", dur, sess.id, err)
+			}
+		}
+	}
+	return nil
+}
+
+// This will update the session record for this client in the account's MQTT
+// sessions stream if the session had any change in the subscriptions.
+//
+// Runs from the client's readLoop.
+// Lock not held on entry, but session is in the locked map.
+func (sess *mqttSession) update(filters []*mqttFilter, add bool) error {
+	// Evaluate if we need to persist anything.
+	var needUpdate bool
+	for _, f := range filters {
+		// Shared subscriptions live in a separate map keyed by session key; plain
+		// subscriptions in subs keyed by their NATS subject. rapSubs/subIDs are
+		// shared but keyed by session key (collision-free). Spec5 [4.8.2].
+		key := f.sessionKey()
+		if add {
+			if f.qos >= mqttSubAckFailure {
+				continue
+			}
+			if f.shared {
+				if qos, ok := sess.sharedSubs[key]; !ok || qos != f.qos {
+					if sess.sharedSubs == nil {
+						sess.sharedSubs = make(map[string]byte)
+					}
+					sess.sharedSubs[key] = f.qos
+					needUpdate = true
+				}
+			} else if qos, ok := sess.subs[key]; !ok || qos != f.qos {
+				if sess.subs == nil {
+					sess.subs = make(map[string]byte)
+				}
+				sess.subs[key] = f.qos
+				needUpdate = true
+			}
+			// Track No Local and Retain As Published in separate sets so the
+			// persisted QoS byte stays in the 0..2 range older servers understand.
+			// No Local never applies to shared subscriptions. Spec5 [3.8.3.1].
+			var changed bool
+			if !f.shared {
+				if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, key, f.noLocal); changed {
+					needUpdate = true
+				}
+			}
+			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, key, f.retainAsPublished); changed {
+				needUpdate = true
+			}
+			// f.subID == 0 clears any prior identifier: a re-SUBSCRIBE without one
+			// removes it. Spec5 [3.8.2.1.2].
+			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, key, f.subID); changed {
+				needUpdate = true
+			}
+		} else {
+			if f.shared {
+				if _, ok := sess.sharedSubs[key]; ok {
+					delete(sess.sharedSubs, key)
+					needUpdate = true
+				}
+			} else if _, ok := sess.subs[key]; ok {
+				delete(sess.subs, key)
+				needUpdate = true
+			}
+			var changed bool
+			if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, key, false); changed {
+				needUpdate = true
+			}
+			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, key, false); changed {
+				needUpdate = true
+			}
+			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, key, 0); changed {
+				needUpdate = true
+			}
+		}
+	}
+	var err error
+	if needUpdate {
+		err = sess.save()
+	}
+	return err
+}
+
+func (sess *mqttSession) bumpPI() uint16 {
+	var avail bool
+	next := sess.last_pi
+	for i := 0; i < 0xFFFF; i++ {
+		next++
+		if next == 0 {
+			next = 1
+		}
+
+		_, usedInPublish := sess.pendingPublish[next]
+		_, usedInPubRel := sess.pendingPubRel[next]
+		if !usedInPublish && !usedInPubRel {
+			sess.last_pi = next
+			avail = true
+			break
+		}
+	}
+	if !avail {
+		return 0
+	}
+	return sess.last_pi
+}
+
+// effectiveMaxAck returns the maximum number of unacknowledged QoS1/2 PUBLISH
+// this session may have in flight: the configured MaxAckPending, further capped
+// by the client's MQTT 5.0 Receive Maximum when one was advertised (rmax != 0).
+//
+// Lock held on entry.
+func (sess *mqttSession) effectiveMaxAck() int {
+	m := sess.maxp
+	if sess.rmax != 0 && sess.rmax < m {
+		m = sess.rmax
+	}
+	return int(m)
+}
+
+// qos12InflightForCap counts in-flight QoS 1/2 PUBLISHes against effectiveMaxAck.
+// With a Receive Maximum, QoS 2 messages awaiting PUBCOMP (pendingPubRel) still
+// count: Spec5 [4.9] frees the quota only on PUBACK/PUBCOMP or a failed PUBREC.
+// Without one, the cap is JetStream MaxAckPending, which those were acked out of.
+//
+// Lock held on entry
+func (sess *mqttSession) qos12InflightForCap() int {
+	n := len(sess.pendingPublish)
+	if sess.rmax != 0 {
+		n += len(sess.pendingPubRel)
+	}
+	return n
+}
+
+// deferredNaksLocked removes and returns up to (effectiveMaxAck −
+// qos12InflightForCap) deferred ack subjects in ascending stream-sequence
+// order, so NAK-forced redeliveries preserve publication order
+// [MQTT-4.6.0-1]. The caller must send AckNak on each subject AFTER releasing
+// the session lock. A NAK'd message that arrives while the session is again at
+// the cap simply re-enters deferred via trackPublish.
+//
+// Lock held on entry
+func (sess *mqttSession) deferredNaksLocked() []string {
+	if len(sess.deferred) == 0 {
+		return nil
+	}
+	capacity := sess.effectiveMaxAck() - sess.qos12InflightForCap()
+	if capacity <= 0 {
+		return nil
+	}
+	type deferredNak struct {
+		key        mqttDeferredKey
+		ackSubject string
+	}
+	all := make([]deferredNak, 0, len(sess.deferred))
+	for k, subj := range sess.deferred {
+		all = append(all, deferredNak{k, subj})
+	}
+	slices.SortFunc(all, func(a, b deferredNak) int {
+		switch {
+		case a.key.sseq < b.key.sseq:
+			return -1
+		case a.key.sseq > b.key.sseq:
+			return 1
+		default:
+			return 0
+		}
+	})
+	if len(all) > capacity {
+		all = all[:capacity]
+	}
+	subjects := make([]string, 0, len(all))
+	for _, n := range all {
+		delete(sess.deferred, n.key)
+		subjects = append(subjects, n.ackSubject)
+	}
+	return subjects
+}
+
+// dropUnredeliverableRetained releases pending retained (QoS1/2) deliveries,
+// identified by an empty jsAckSubject: they have no JetStream backing and so
+// cannot be redelivered on resume. Keeping them would leak a Receive Maximum
+// slot for the life of a persistent session.
+//
+// Lock held on entry
+func (sess *mqttSession) dropUnredeliverableRetained() {
+	for pi, ack := range sess.pendingPublish {
+		if ack.jsAckSubject == _EMPTY_ {
+			delete(sess.pendingPublish, pi)
+		}
+	}
+}
+
+// trackPublishRetained is invoked when a retained (QoS) message is published. It
+// allocates a new PI and adds it to pendingPublish with an empty value (no
+// JetStream backing). Spec5 [3.3.4].
+//
+// Lock held on entry
+func (sess *mqttSession) trackPublishRetained() uint16 {
+	// Make sure we initialize the tracking maps.
+	if sess.pendingPublish == nil {
+		sess.pendingPublish = make(map[uint16]*mqttPending)
+	}
+	if sess.cpending == nil {
+		sess.cpending = make(map[string]map[uint64]uint16)
+	}
+
+	// Honor the effective in-flight cap (MaxAckPending capped by the client's
+	// Receive Maximum). At the limit, return 0 so the caller downgrades this
+	// retained message to QoS0: it is still delivered, but does not count as an
+	// unacknowledged QoS1/2 PUBLISH. Spec5 [3.3.4].
+	if sess.qos12InflightForCap() >= sess.effectiveMaxAck() {
+		return 0
+	}
+
+	pi := sess.bumpPI()
+	if pi == 0 {
+		return 0
+	}
+	sess.pendingPublish[pi] = &mqttPending{}
+
+	return pi
+}
+
+// trackPublish is invoked when a (QoS) PUBLISH message is to be delivered. It
+// detects an untracked (new) message based on its sequence extracted from its
+// delivery-time jsAckSubject, and adds it to the tracking maps. Returns a PI to
+// use for the message (new, or previously used), and whether this is a
+// duplicate delivery attempt.
+//
+// Lock held on entry
+// The returned started flag is true when the PI was already tracked, i.e. this
+// is a redelivery of a message whose onward delivery already began.
+func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint16, dup, started bool) {
+	var pi uint16
+
+	if jsAckSubject == _EMPTY_ || jsDur == _EMPTY_ {
+		return 0, false, false
+	}
+
+	// Make sure we initialize the tracking maps.
+	if sess.pendingPublish == nil {
+		sess.pendingPublish = make(map[uint16]*mqttPending)
+	}
+	if sess.cpending == nil {
+		sess.cpending = make(map[string]map[uint64]uint16)
+	}
+
+	// Get the stream sequence and duplicate flag from the ack reply subject.
+	sseq, _, dcount, _, _ := ackReplyInfo(jsAckSubject)
+	if dcount > 1 {
+		dup = true
+	}
+
+	var ack *mqttPending
+	sseqToPi, ok := sess.cpending[jsDur]
+	if !ok {
+		sseqToPi = make(map[uint64]uint16)
+		sess.cpending[jsDur] = sseqToPi
+	} else {
+		pi = sseqToPi[sseq]
+	}
+
+	if pi != 0 {
+		// There is a possible race between a PUBLISH re-delivery calling us,
+		// and a PUBREC received already having submitting a PUBREL into JS . If
+		// so, indicate no need for (re-)delivery by returning a PI of 0.
+		_, usedForPubRel := sess.pendingPubRel[pi]
+		if /*dup && */ usedForPubRel {
+			return 0, false, false
+		}
+
+		// We should have a pending JS ACK for this PI. This is a redelivery of a
+		// message already counted against the in-flight cap, so it is not gated
+		// again here. NOTE: if a persistent session accumulated more unacked
+		// messages than a newly-lowered Receive Maximum, redeliveries of those
+		// pre-existing pending messages are not additionally paced on the new
+		// connection (a known limitation; new deliveries below still are, and
+		// the session drains to the cap as PUBACKs arrive).
+		ack = sess.pendingPublish[pi]
+		started = true
+	} else {
+		// Gate new deliveries at the effective cap: MaxAckPending capped by the
+		// client's MQTT 5.0 Receive Maximum. QoS 2 messages awaiting PUBCOMP are
+		// counted too when a Receive Maximum applies (Spec5 [4.9]).
+		if sess.qos12InflightForCap() >= sess.effectiveMaxAck() {
+			// At the in-flight cap: withhold the message and remember its ack
+			// subject so a freed slot can NAK it for prompt redelivery
+			// (deferredNaksLocked); AckWait remains the fallback. Overwrite on
+			// re-deferral: JS ignores acks for superseded delivery attempts, so
+			// only the latest subject is NAK-able. Spec5 [4.9].
+			if sess.deferred == nil {
+				sess.deferred = make(map[mqttDeferredKey]string)
+			}
+			sess.deferred[mqttDeferredKey{jsDur, sseq}] = jsAckSubject
+			return 0, false, false
+		}
+
+		if _, wasDeferred := sess.deferred[mqttDeferredKey{jsDur, sseq}]; wasDeferred {
+			delete(sess.deferred, mqttDeferredKey{jsDur, sseq})
+			// A withheld message was never transmitted, so this is its first
+			// send even though the JS delivery count is > 1 [MQTT-3.3.1-1].
+			dup = false
+		}
+
+		pi = sess.bumpPI()
+		if pi == 0 {
+			return 0, false, false
+		}
+
+		sseqToPi[sseq] = pi
+	}
+
+	if ack == nil {
+		sess.pendingPublish[pi] = &mqttPending{
+			jsDur:        jsDur,
+			sseq:         sseq,
+			jsAckSubject: jsAckSubject,
+		}
+	} else {
+		ack.jsAckSubject = jsAckSubject
+		ack.sseq = sseq
+		ack.jsDur = jsDur
+	}
+
+	return pi, dup, started
+}
+
+// Stops a PI from being tracked as a PUBLISH. It can still be in use for a
+// pending PUBREL.
+//
+// Lock held on entry
+func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject string) {
+	ack, ok := sess.pendingPublish[pi]
+	if !ok {
+		return _EMPTY_
+	}
+
+	delete(sess.pendingPublish, pi)
+	// Do NOT reset last_pi here: it is a monotonic rolling counter (see bumpPI) so
+	// a just-freed id is not reused within a delivery burst, which a client would
+	// read as a duplicate. Spec [MQTT-2.3.1-4].
+
+	if len(sess.cpending) != 0 && ack.jsDur != _EMPTY_ {
+		if sseqToPi := sess.cpending[ack.jsDur]; sseqToPi != nil {
+			delete(sseqToPi, ack.sseq)
+		}
+	}
+
+	return ack.jsAckSubject
+}
+
+// resendPendingRedelivery re-sends the session's unacknowledged QoS 1/2 PUBLISH
+// and PUBREL packets by NAK'ing each on its JS ack subject, forcing immediate
+// redelivery (with the DUP flag set) on session resume as required by spec
+// [MQTT-4.4.0-1], instead of waiting for the JS consumer's AckWait interval.
+// NAKs are ordered by stream sequence so redeliveries preserve original order
+// [MQTT-4.6.0-1], and re-use the original packet identifiers. This only takes
+// effect on a same-server reconnect, where the in-memory tracking maps survive;
+// after a restart or failover, redelivery falls back to the AckWait interval.
+//
+// If the disconnect lasted longer than AckWait, the consumer's own pending
+// check may already redeliver a message as interest is re-established; the NAK
+// then produces one extra copy. That is harmless (same packet identifier, DUP
+// set, so the client dedups) and does not happen on a timely reconnect.
+func (sess *mqttSession) resendPendingRedelivery(c *client) {
+	type pendingNak struct {
+		pi         uint16
+		sseq       uint64
+		ackSubject string
+	}
+	bySeq := func(a, b pendingNak) int {
+		switch {
+		case a.sseq < b.sseq:
+			return -1
+		case a.sseq > b.sseq:
+			return 1
+		default:
+			return 0
+		}
+	}
+	// Snapshot the messages pending AT RESUME first, before any JS round-trip
+	// below: re-establishing subscriptions (processSubs, already done) can trigger
+	// asynchronous fresh deliveries into pendingPublish, and those must not be
+	// NAK'd here (they are already being delivered). PUBLISH and PUBREL live on
+	// different streams (distinct sequence spaces) and are paced differently, so
+	// collect them separately.
+	sess.mu.Lock()
+	jsa := sess.jsa
+	maxAck := sess.effectiveMaxAck()
+	hasReceiveMax := sess.rmax != 0
+	pubNaks := make([]pendingNak, 0, len(sess.pendingPublish))
+	for pi, ack := range sess.pendingPublish {
+		if ack.jsAckSubject != _EMPTY_ {
+			pubNaks = append(pubNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject})
+		}
+	}
+	relNaks := make([]pendingNak, 0, len(sess.pendingPubRel))
+	for _, ack := range sess.pendingPubRel {
+		if ack.jsAckSubject != _EMPTY_ {
+			relNaks = append(relNaks, pendingNak{0, ack.sseq, ack.jsAckSubject})
+		}
+	}
+	// Any pending PUBREL (including a placeholder created at PUBREC before its
+	// delivery recorded an ack subject) needs the PUBREL delivery subscription.
+	hasPendingPubRel := len(sess.pendingPubRel) > 0
+	inflightPubRel := len(sess.pendingPubRel)
+	// Deferred (withheld, never transmitted) deliveries from before the
+	// disconnect should not wait an AckWait either; drain them here too.
+	deferredNaks := make([]pendingNak, 0, len(sess.deferred))
+	for k, subj := range sess.deferred {
+		deferredNaks = append(deferredNaks, pendingNak{0, k.sseq, subj})
+		delete(sess.deferred, k)
+	}
+	sess.mu.Unlock()
+
+	// Reconcile against the messages stream: a QoS1/2 message whose Message Expiry
+	// TTL reaped it while it was delivered-but-unacked is gone from the stream, so
+	// it can neither be redelivered nor PUBACK'd. Such an entry would otherwise
+	// leak a Receive Maximum slot for the life of the session. Drop any snapshot
+	// entry whose message no longer exists — below the stream's first sequence, or
+	// (per-message expiry can leave holes above it) confirmed absent by an exact
+	// lookup — releasing its packet identifier and skipping its NAK. The lookups
+	// run outside the session lock. Spec5 [3.3.2.3.3].
+	if si, err := jsa.lookupStream(mqttStreamName); err == nil && si != nil {
+		firstSeq := si.State.FirstSeq
+		kept := make([]pendingNak, 0, len(pubNaks))
+		var gone []uint16
+		for _, n := range pubNaks {
+			reaped := n.sseq < firstSeq
+			if !reaped {
+				if _, err := jsa.loadMsg(mqttStreamName, n.sseq); err != nil && !isErrorOtherThan(err, JSNoMessageFoundErr) {
+					reaped = true
+				}
+			}
+			if reaped {
+				gone = append(gone, n.pi)
+			} else {
+				kept = append(kept, n)
+			}
+		}
+		if len(gone) > 0 {
+			sess.mu.Lock()
+			for _, pi := range gone {
+				sess.untrackPublish(pi)
+			}
+			sess.mu.Unlock()
+		}
+		pubNaks = kept
+	}
+
+	// Replay pending PUBRELs: they complete already-started QoS2 handshakes (the
+	// client answers PUBCOMP, freeing its Receive Maximum slot) rather than
+	// starting new deliveries. The PUBREL delivery subscription is only (re)created
+	// by the QoS2 subscribe path, so ensure it exists here whenever any PUBREL is
+	// pending (a resume may restore no QoS2 subscription, and a placeholder created
+	// at PUBREC may not yet carry an ack subject). Spec5 [MQTT-4.4.0-1].
+	if hasPendingPubRel {
+		if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+			c.Errorf("Unable to re-establish PUBREL delivery on resume: %v", err)
+		}
+		slices.SortFunc(relNaks, bySeq)
+		for _, n := range relNaks {
+			jsa.sendMsg(n.ackSubject, AckNak)
+		}
+	}
+
+	// PUBLISH redeliveries reuse their packet identifiers and bypass the in-flight
+	// gate, so respect the client's Receive Maximum: NAK at most the effective cap,
+	// in stream order; the JS consumer re-offers the rest via AckWait. When a
+	// Receive Maximum applies, in-flight PUBRELs count against it too, so subtract
+	// them; without one the cap is the JS MaxAckPending, which PUBRELs have already
+	// acked out of. Spec5 [MQTT-3.3.4-9].
+	capacity := maxAck
+	if hasReceiveMax {
+		capacity -= inflightPubRel
+	}
+	if capacity < 0 {
+		capacity = 0
+	}
+	slices.SortFunc(pubNaks, bySeq)
+	if len(pubNaks) > capacity {
+		pubNaks = pubNaks[:capacity]
+	}
+	for _, n := range pubNaks {
+		jsa.sendMsg(n.ackSubject, AckNak)
+	}
+
+	// Deferred (withheld, never transmitted) deliveries fill the capacity left
+	// after pending redeliveries; the rest re-offer via AckWait and re-enter
+	// deferred through trackPublish.
+	if rem := capacity - len(pubNaks); rem > 0 {
+		slices.SortFunc(deferredNaks, bySeq)
+		if len(deferredNaks) > rem {
+			deferredNaks = deferredNaks[:rem]
+		}
+		for _, n := range deferredNaks {
+			jsa.sendMsg(n.ackSubject, AckNak)
+		}
+	}
+}
+
+// trackAsPubRel is invoked in 2 cases: (a) when we receive a PUBREC and we need
+// to change from tracking the PI as a PUBLISH to a PUBREL; and (b) when we
+// attempt to deliver the PUBREL to record the JS ack subject for it.
+//
+// Lock held on entry
+func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
+	if sess.pubRelConsumer == nil {
+		// The cosumer MUST be set up already.
+		return
+	}
+	jsDur := sess.pubRelConsumer.Durable
+
+	if sess.pendingPubRel == nil {
+		sess.pendingPubRel = make(map[uint16]*mqttPending)
+	}
+
+	if jsAckSubject == _EMPTY_ {
+		sess.pendingPubRel[pi] = &mqttPending{
+			jsDur: jsDur,
+		}
+		return
+	}
+
+	sseq, _, _, _, _ := ackReplyInfo(jsAckSubject)
+
+	if sess.cpending == nil {
+		sess.cpending = make(map[string]map[uint64]uint16)
+	}
+	sseqToPi := sess.cpending[jsDur]
+	if sseqToPi == nil {
+		sseqToPi = make(map[uint64]uint16)
+		sess.cpending[jsDur] = sseqToPi
+	}
+	sseqToPi[sseq] = pi
+	sess.pendingPubRel[pi] = &mqttPending{
+		jsDur:        sess.pubRelConsumer.Durable,
+		sseq:         sseq,
+		jsAckSubject: jsAckSubject,
+	}
+}
+
+// Stops a PI from being tracked as a PUBREL.
+//
+// Lock held on entry
+func (sess *mqttSession) untrackPubRel(pi uint16) (jsAckSubject string) {
+	ack, ok := sess.pendingPubRel[pi]
+	if !ok {
+		return _EMPTY_
+	}
+
+	delete(sess.pendingPubRel, pi)
+
+	if sess.pubRelConsumer != nil && len(sess.cpending) > 0 {
+		if sseqToPi := sess.cpending[ack.jsDur]; sseqToPi != nil {
+			delete(sseqToPi, ack.sseq)
+		}
+	}
+
+	return ack.jsAckSubject
+}
+
+// Sends a consumer delete request, but does not wait for response.
+//
+// Lock not held on entry.
+func (sess *mqttSession) deleteConsumer(cc *ConsumerConfig) {
+	sess.mu.Lock()
+	sess.tmaxack -= cc.MaxAckPending
+	sess.jsa.deleteConsumer(mqttStreamName, cc.Durable, true)
+	sess.mu.Unlock()
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// CONNECT protocol related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+// mqttKeepAliveRD returns the read deadline for a keep alive: one and a half
+// times the keep alive interval. Computed in milliseconds to avoid truncating
+// the half second for odd keep alives (e.g. 1s => 1.5s). Spec [MQTT-3.1.2-24].
+func mqttKeepAliveRD(ka uint16) time.Duration {
+	return time.Duration(ka) * 1500 * time.Millisecond
+}
+
+// Parse the MQTT connect protocol
+func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttConnectProto, error) {
+	// Protocol name
+	proto, err := r.readBytes("protocol name", false)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	// Spec [MQTT-3.1.2-1]
+	if !bytes.Equal(proto, mqttProtoName) {
+		// Check proto name against v3.1 to report better error
+		if bytes.Equal(proto, mqttOldProtoName) {
+			return 0, nil, fmt.Errorf("older protocol %q not supported", proto)
+		}
+		return 0, nil, fmt.Errorf("expected connect packet with protocol name %q, got %q", mqttProtoName, proto)
+	}
+
+	// Protocol level
+	level, err := r.readByte("protocol level")
+	if err != nil {
+		return 0, nil, err
+	}
+	// Spec [MQTT-3.1.2-2], spec5 [3.1.2.2]. We support 3.1.1 (0x4) and 5.0 (0x5).
+	switch level {
+	case mqttProtoLevel, mqttProtoLevel5:
+	default:
+		return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("unacceptable protocol version of %v", level)
+	}
+	// Enforce the maximum accepted protocol version. MQTT 5.0 support is still
+	// being completed (e.g. session expiry is not yet honored), so it is opt-in:
+	// unless the operator sets MaxProtocolVersion to 5, the server accepts only
+	// 3.1.1. When rejecting, reply using the framing
+	// the client asked for (set c.mqtt.proto) so it can read the reason code and
+	// fall back.
+	if c.srv != nil {
+		maxv := c.srv.getOpts().MQTT.MaxProtocolVersion
+		if maxv == 0 {
+			// MQTT 5.0 is always enabled in mqtt-nats-bridge.
+			maxv = mqttProtoLevel5
+		}
+		if level > maxv {
+			c.mqtt.proto = level
+			return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("MQTT protocol version %v not accepted (maximum is %v); set mqtt.max_protocol_version to 5 to enable MQTT 5.0", level, maxv)
+		}
+	}
+	// Record the negotiated version; it drives wire framing for the rest of the
+	// connection's lifetime (CONNACK, ACKs, DISCONNECT).
+	c.mqtt.proto = level
+
+	cp := &mqttConnectProto{}
+	// Connect flags
+	cp.flags, err = r.readByte("flags")
+	if err != nil {
+		return 0, nil, err
+	}
+
+	// Spec [MQTT-3.1.2-3]
+	if cp.flags&mqttConnFlagReserved != 0 {
+		return 0, nil, errMQTTConnFlagReserved
+	}
+
+	var hasWill bool
+	wqos := (cp.flags & mqttConnFlagWillQoS) >> 3
+	wretain := cp.flags&mqttConnFlagWillRetain != 0
+	// Spec [MQTT-3.1.2-11]
+	if cp.flags&mqttConnFlagWillFlag == 0 {
+		// Spec [MQTT-3.1.2-13]
+		if wqos != 0 {
+			return 0, nil, fmt.Errorf("if Will flag is set to 0, Will QoS must be 0 too, got %v", wqos)
+		}
+		// Spec [MQTT-3.1.2-15]
+		if wretain {
+			return 0, nil, errMQTTWillAndRetainFlag
+		}
+	} else {
+		// Spec [MQTT-3.1.2-14]
+		if wqos == 3 {
+			return 0, nil, fmt.Errorf("if Will flag is set to 1, Will QoS can be 0, 1 or 2, got %v", wqos)
+		}
+		hasWill = true
+	}
+
+	if c.mqtt.rejectQoS2Pub && hasWill && wqos == 2 {
+		return mqttConnAckRCQoS2WillRejected, nil, fmt.Errorf("server does not accept QoS2 for Will messages")
+	}
+
+	// Spec [MQTT-3.1.2-19]
+	hasUser := cp.flags&mqttConnFlagUsernameFlag != 0
+	// Spec [MQTT-3.1.2-21]
+	hasPassword := cp.flags&mqttConnFlagPasswordFlag != 0
+	// Spec [MQTT-3.1.2-22]
+	if !hasUser && hasPassword {
+		return 0, nil, errMQTTPasswordFlagAndNoUser
+	}
+
+	// Keep alive
+	var ka uint16
+	ka, err = r.readUint16("keep alive")
+	if err != nil {
+		return 0, nil, err
+	}
+	cp.ka = ka
+	// Spec [MQTT-3.1.2-24]
+	if ka > 0 {
+		cp.rd = mqttKeepAliveRD(ka)
+	}
+
+	// MQTT 5.0: the CONNECT variable header ends with a properties block, just
+	// before the payload. Spec5 [3.1.2.11].
+	if level == mqttProtoLevel5 {
+		cp.props, err = r.readProperties(mqttPacketConnect)
+		if err != nil {
+			return 0, nil, err
+		}
+		// Capture at parse time the two properties that gate optional outbound
+		// content, so even a CONNACK that rejects this CONNECT honors them:
+		// Maximum Packet Size bounds every server-generated packet (an optional
+		// Reason String is dropped, and a packet that still overflows is not sent),
+		// and Request Problem Information 0 forbids Reason String/User Property on
+		// packets other than CONNACK/DISCONNECT. If readProperties itself failed
+		// above, cp.props is nil and the client communicated no limit. Spec5
+		// [3.1.2.11.4], [3.1.2.11.7].
+		if cp.props != nil {
+			c.mqtt.maxPacketSize = cp.props.maxPacketSize
+			c.mqtt.noProblemInfo = cp.props.present[mqttPropRequestProblemInfo] && cp.props.requestProblem == 0
+		}
+		// Enhanced authentication (AUTH exchange) is not implemented. If the
+		// client requests an authentication method, reject the connection with
+		// the v5 "bad authentication method" reason. Spec5 [4.12].
+		if cp.props != nil && cp.props.authMethod != _EMPTY_ {
+			return mqttReasonBadAuthMethod, nil, errMQTTAuthMethodNotSupported
+		}
+		// Spec5 [3.1.2.11.10]: Authentication Data without an Authentication
+		// Method is a Protocol Error.
+		if cp.props != nil && cp.props.authData != nil && cp.props.authMethod == _EMPTY_ {
+			return mqttReasonProtocolError, nil, fmt.Errorf("%w: authentication data without authentication method", errMQTTProtocolError)
+		}
+	}
+
+	// Payload starts here and order is mandated by:
+	// Spec [MQTT-3.1.3-1]: client ID, will topic, will message, username, password
+
+	// Client ID
+	c.mqtt.cid, err = r.readString("client ID")
+	if err != nil {
+		return 0, nil, err
+	}
+	// Spec [MQTT-3.1.3-7]
+	if c.mqtt.cid == _EMPTY_ {
+		if cp.flags&mqttConnFlagCleanSession == 0 {
+			return mqttConnAckRCIdentifierRejected, nil, errMQTTCIDEmptyNeedsCleanFlag
+		}
+		// Spec [MQTT-3.1.3-6]
+		c.mqtt.cid = nuid.Next()
+		c.mqtt.cidGenerated = true
+	}
+	// Spec [MQTT-3.1.3-4] and [MQTT-3.1.3-9]
+	//
+	// mqtt-nats-bridge divergence from upstream NATS: we accept any valid-UTF-8
+	// client ID (MQTT 5.0 [3.1.3.1] permits it, and mainstream brokers do too),
+	// rather than requiring a NATS-safe name. The client ID is only used as a
+	// NATS subject token via getHash() (sessions, QoS2 dedup — see
+	// mqttQoS2InternalSubject), so arbitrary characters (spaces, '.', wildcards)
+	// are safe. mqttValidateString still enforces UTF-8 and rejects NUL.
+	if err := mqttValidateString(c.mqtt.cid, "client ID"); err != nil {
+		return mqttConnAckRCIdentifierRejected, nil, err
+	}
+
+	if hasWill {
+		cp.will = &mqttWill{
+			qos:    wqos,
+			retain: wretain,
+		}
+		// MQTT 5.0: Will properties precede the Will topic. Spec5 [3.1.3.2].
+		if level == mqttProtoLevel5 {
+			cp.will.props, err = r.readProperties(mqttPropsContextWill)
+			if err != nil {
+				return 0, nil, err
+			}
+		}
+		var topic []byte
+		// Need to make a copy since we need to hold to this topic after the
+		// parsing of this protocol.
+		topic, err = r.readBytes("Will topic", true)
+		if err != nil {
+			return 0, nil, err
+		}
+		if len(topic) == 0 {
+			return 0, nil, errMQTTEmptyWillTopic
+		}
+		if err := mqttValidateTopic(topic, "Will topic"); err != nil {
+			return 0, nil, err
+		}
+		// Convert MQTT topic to NATS subject
+		cp.will.subject, err = mqttTopicToNATSPubSubject(topic)
+		if err != nil {
+			return 0, nil, err
+		}
+		// Check for subject mapping.
+		if hasMappings {
+			// For selectMappedSubject to work, we need to have c.pa.subject set.
+			// If there is a change, c.pa.mapped will be set after the call.
+			c.pa.subject = cp.will.subject
+			if changed := c.selectMappedSubject(); changed {
+				// We need to keep track of the NATS subject/mapped in the `cp` structure.
+				cp.will.subject = c.pa.subject
+				cp.will.mapped = c.pa.mapped
+				// We also now need to map the original MQTT topic to the new topic
+				// based on the new subject.
+				topic = natsSubjectToMQTTTopic(cp.will.subject)
+			}
+			// Reset those now.
+			c.pa.subject, c.pa.mapped = nil, nil
+		}
+		cp.will.topic = topic
+		// Now "will" message.
+		// Ask for a copy since we need to hold to this after parsing of this protocol.
+		cp.will.message, err = r.readBytes("Will message", true)
+		if err != nil {
+			return 0, nil, err
+		}
+		// MQTT 5.0 Payload Format Indicator on the Will: if the client declares the
+		// Will payload is UTF-8 (PFI=1) but it is not well-formed, reject the CONNECT
+		// with CONNACK 0x99. Spec5 [3.1.3.2.2], [3.3.2.3.2].
+		if level == mqttProtoLevel5 && cp.will.props != nil &&
+			cp.will.props.present[mqttPropPayloadFormat] && cp.will.props.payloadFormat == 1 &&
+			!utf8.Valid(cp.will.message) {
+			return 0, nil, fmt.Errorf("%w: Will payload is not valid UTF-8 but the Payload Format Indicator is 1", errMQTTPayloadFormatInvalid)
+		}
+	}
+
+	if hasUser {
+		c.opts.Username, err = r.readString("user name")
+		if err != nil {
+			return 0, nil, err
+		}
+		if c.opts.Username == _EMPTY_ {
+			return mqttConnAckRCBadUserOrPassword, nil, errMQTTEmptyUsername
+		}
+		// Spec [MQTT-3.1.3-11]
+		if err := mqttValidateString(c.opts.Username, "user name"); err != nil {
+			return mqttConnAckRCBadUserOrPassword, nil, err
+		}
+	}
+
+	if hasPassword {
+		c.opts.Password, err = r.readString("password")
+		if err != nil {
+			return 0, nil, err
+		}
+		c.opts.Token = c.opts.Password
+	}
+	return 0, cp, nil
+}
+
+func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
+	trace := fmt.Sprintf("clientID=%s", c.mqtt.cid)
+	if cp.rd > 0 {
+		trace += fmt.Sprintf(" keepAlive=%v", cp.rd)
+	}
+	if cp.will != nil {
+		trace += fmt.Sprintf(" will=(topic=%s QoS=%v retain=%v)",
+			cp.will.topic, cp.will.qos, cp.will.retain)
+	}
+	if cp.flags&mqttConnFlagCleanSession != 0 {
+		trace += " clean"
+	}
+	if c.opts.Username != _EMPTY_ {
+		trace += fmt.Sprintf(" username=%s", c.opts.Username)
+	}
+	if c.opts.Password != _EMPTY_ {
+		trace += " password=****"
+	}
+	return trace
+}
+
+// Process the CONNECT packet.
+//
+// For the first session on the account, an account session manager will be created,
+// along with the JetStream streams/consumer necessary for the working of MQTT.
+//
+// The session, identified by a client ID, will be registered, or if already existing,
+// will be resumed. If the session exists but is associated with an existing client,
+// the old client is evicted, as per the specifications.
+//
+// Due to specific locking requirements around JS API requests, we cannot hold some
+// locks for the entire duration of processing of some protocols, therefore, we use
+// a map that registers the client ID in a "locked" state. If a different client tries
+// to connect and the server detects that the client ID is in that map, it will try
+// a little bit until it is not, or fail the new client, since we can't protect
+// processing of protocols in the original client. This is not expected to happen often.
+//
+// Runs from the client's readLoop.
+// No lock held on entry.
+func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) error {
+	sendConnAck := func(rc byte, sessp bool, reasonStr string) bool {
+		sent, werr := c.mqttEnqueueConnAck(rc, sessp, reasonStr)
+		// Record a delivered success CONNACK so the shutdown drain knows this
+		// connection completed CONNECT and its negotiated v5 fields are stable.
+		// Only on a clean write: a failed write closes the socket and readLoop
+		// tears the client down.
+		if sent && werr == nil && rc == mqttConnAckRCConnectionAccepted {
+			c.connAckWritten.Store(true)
+		}
+		if sent && trace {
+			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
+		}
+		return sent
+	}
+
+	c.mu.Lock()
+	cid := c.mqtt.cid
+	c.clearAuthTimer()
+	c.mu.Unlock()
+	if !s.isClientAuthorized(c) {
+		// The CONNACK is enqueued inside authViolation; trace it only if sent.
+		sent := c.authViolation()
+		if sent && trace {
+			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", false, mqttConnAckRCNotAuthorized)))
+		}
+		return ErrAuthentication
+	}
+	// Now that we are authenticated, we have the client bound to the account.
+	// Get the account's level MQTT sessions manager. If it does not exists yet,
+	// this will create it along with the streams where sessions and messages
+	// are stored.
+	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
+	if err != nil {
+		return err
+	}
+
+	// Resolve every input the success CONNACK's size depends on, then verify the
+	// frame fits the client's Maximum Packet Size BEFORE touching any session
+	// state. If it cannot fit, the server MUST NOT send it [MQTT-3.1.2-24]; there
+	// is no useful connection to establish, so fail now — before any session
+	// lookup, clear, rebind, live-client eviction or Will handling — so nothing
+	// needs rolling back and no side effects leak. v5 only. Spec5 [3.2.2.3.6].
+	if c.mqtt.proto == mqttProtoLevel5 {
+		// Server Keep Alive: enforce the configured maximum when the client asked
+		// for none (0) or more. Reads only Options and cp.ka. Spec5 [3.1.2.10],
+		// [3.2.2.3.14].
+		if kam := s.getOpts().MQTT.KeepAliveMaximum; kam > 0 && (cp.ka == 0 || cp.ka > uint16(kam)) {
+			c.mqtt.serverKeepAlive = uint16(kam)
+			cp.rd = mqttKeepAliveRD(uint16(kam))
+		}
+		// Response Information: when the client sets Request Response Information = 1
+		// and the server is configured with a base response topic, return it in the
+		// CONNACK so the client can build a request/response topic. Spec5
+		// [3.1.2.11.6], [3.2.2.3.15].
+		if ri := s.getOpts().MQTT.ResponseInformation; ri != _EMPTY_ &&
+			cp.props != nil && cp.props.present[mqttPropRequestResponseInfo] && cp.props.requestResponse == 1 {
+			c.mqtt.responseInfo = ri
+		}
+		// Topic Alias Maximum, both directions. Inbound: the server-side cap for
+		// aliases the client may send us, advertised in the CONNACK. Outbound: the
+		// client's CONNECT Topic Alias Maximum (absent => 0) caps aliases we may
+		// send it, bounded by the same server-side cap to limit per-connection
+		// memory. Spec5 [3.2.2.3.2], [3.1.2.11.2].
+		c.mqtt.topicAliasMax = mqttTopicAliasMax(s.getOpts())
+		if cp.props != nil {
+			c.mqtt.outTopicAliasMax = min(cp.props.topicAliasMax, c.mqtt.topicAliasMax)
+		}
+		// Maximum Packet Size we advertise and enforce on inbound; captured once so
+		// the encoded and enforced values are identical even across a reload.
+		c.mqtt.maxInPacketSize = c.mqttServerMaxPacketSize()
+		// Receive Maximum we advertise and enforce on inbound QoS 1/2 PUBLISH;
+		// captured before the fit check below so its property bytes count toward
+		// the CONNACK size. Spec5 [3.2.2.3.3], [4.9].
+		c.mqtt.recvMaxIn = mqttReceiveMax(s.getOpts())
+		// Frame size is independent of the session present flag, so a placeholder
+		// (0) is fine for the fit check.
+		if frame := c.mqttMakeConnAckV5Frame(mqttConnAckRCConnectionAccepted, 0, _EMPTY_); !c.mqttFitsClientMax(len(frame)) {
+			c.Errorf("Success CONNACK of %d bytes exceeds client Maximum Packet Size %d; closing", len(frame), c.mqtt.maxPacketSize)
+			return fmt.Errorf("CONNACK exceeds client maximum packet size")
+		}
+	}
+
+	// Most of the session state is altered only in the readLoop so does not
+	// need locking. For things that can be access in the readLoop and in
+	// callbacks, we will use explicit locking.
+	// To prevent other clients to connect with the same client ID, we will
+	// add the client ID to a "locked" map so that the connect somewhere else
+	// is put on hold.
+	// This keep track of how many times this client is detecting that its
+	// client ID is in the locked map. After a short amount, the server will
+	// fail this inbound client.
+	locked := 0
+
+CHECK:
+	asm.mu.Lock()
+	// Check if different applications keep trying to connect with the same
+	// client ID at the same time.
+	if tm, ok := asm.flappers[cid]; ok {
+		// If the last time it tried to connect was more than 1 sec ago,
+		// then accept and remove from flappers map.
+		if time.Since(tm) > mqttSessJailDur {
+			asm.removeSessFromFlappers(cid)
+		} else {
+			// Will hold this client for a second and then close it. We
+			// do this so that if the client has a reconnect feature we
+			// don't end-up with very rapid flapping between apps.
+			// We need to wait in place and not schedule the connection
+			// close because if this is a misbehaved client that does
+			// not wait for the CONNACK and sends other protocols, the
+			// server would not have a fully setup client and may panic.
+			asm.mu.Unlock()
+			select {
+			case <-s.quitCh:
+			case <-time.After(mqttSessJailDur):
+			}
+			c.closeConnection(DuplicateClientID)
+			return ErrConnectionClosed
+		}
+	}
+	// If an existing session is in the process of processing some packet, we can't
+	// evict the old client just yet. So try again to see if the state clears, but
+	// if it does not, then we have no choice but to fail the new client instead of
+	// the old one.
+	if _, ok := asm.sessLocked[cid]; ok {
+		asm.mu.Unlock()
+		if locked++; locked == 10 {
+			return fmt.Errorf("other session with client ID %q is in the process of connecting", cid)
+		}
+		time.Sleep(100 * time.Millisecond)
+		goto CHECK
+	}
+
+	// Register this client ID the "locked" map for the duration if this function.
+	asm.sessLocked[cid] = struct{}{}
+	// And remove it on exit, regardless of error or not.
+	defer func() {
+		asm.mu.Lock()
+		delete(asm.sessLocked, cid)
+		asm.mu.Unlock()
+	}()
+
+	// Is the client requesting a clean session (v5: Clean Start) or not.
+	cleanSess := cp.flags&mqttConnFlagCleanSession != 0
+	// MQTT 5.0 Session Expiry Interval: how long the session survives after the
+	// connection closes; orthogonal to Clean Start. 3.1.1 maps clean => 0,
+	// persistent => never. A session ends at connection close iff the interval is
+	// 0 — exactly the legacy meaning of `clean` — so sess.clean is derived from the
+	// interval and all existing clean-based branches work unchanged. Spec5 [3.1.2.11.2].
+	var expiry uint32
+	if !cleanSess {
+		expiry = mqttSessionNeverExpire
+	}
+	if c.mqtt.proto == mqttProtoLevel5 {
+		expiry = 0
+		if cp.props != nil {
+			expiry = cp.props.sessionExpiry
+		}
+	}
+	sessClean := expiry == 0
+	// Session present? Assume false, will be set to true only when applicable.
+	sessp := false
+	// Do we have an existing session for this client ID
+	es, exists := asm.sessions[cid]
+	asm.mu.Unlock()
+	formatError := func(err error) error {
+		return fmt.Errorf("%v for account %q, session %q", err, c.acc.GetName(), cid)
+	}
+
+	// The session is not in the map, but may be on disk, so try to recover
+	// or create the stream if not.
+	if !exists {
+		es, exists, err = asm.createOrRestoreSession(cid, s.getOpts())
+		if err != nil {
+			if err == errMQTTSessionCollision {
+				sendConnAck(mqttConnAckRCIdentifierRejected, false, err.Error())
+			}
+			return formatError(err)
+		}
+	}
+	if exists {
+		// An overdue session must not be resumed even when this reconnect beat
+		// a late expiry timer to the in-memory copy (the record-restore path
+		// has the same check). Spec5 [3.1.2.11.2].
+		es.mu.Lock()
+		overdue := es.disconnectedAt > 0 && es.expiryInterval > 0 &&
+			es.expiryInterval != mqttSessionNeverExpire &&
+			time.Now().Unix() >= es.disconnectedAt+int64(es.expiryInterval)
+		es.mu.Unlock()
+		// Clear the session if client wants a clean session.
+		// Also, Spec [MQTT-3.2.2-1]: don't report session present
+		if cleanSess || es.clean || overdue {
+			// Spec [MQTT-3.1.2-6]: If CleanSession is set to 1, the Client and
+			// Server MUST discard any previous Session and start a new one.
+			// This Session lasts as long as the Network Connection. State data
+			// associated with this Session MUST NOT be reused in any subsequent
+			// Session.
+			if err := es.clear(false); err != nil {
+				asm.removeSession(es, true)
+				return err
+			}
+		} else {
+			// Report to the client that the session was present
+			sessp = true
+		}
+		// Spec [MQTT-3.1.4-2]. If the ClientId represents a Client already
+		// connected to the Server then the Server MUST disconnect the existing
+		// client.
+		// Bind with the new client. This needs to be protected because can be
+		// accessed outside of the readLoop.
+		es.mu.Lock()
+		ec := es.c
+		es.c = c
+		es.clean = sessClean
+		es.expiryInterval = expiry
+		es.disconnectedAt = 0
+		// Clear this flag so we resubscribe to PUBREL subject is needed.
+		es.pubRelSubscribed = false
+		if sessp {
+			// Resumed session: release retained (QoS1/2) deliveries with no
+			// JetStream backing. They cannot be redelivered, so keeping them would
+			// leak a Receive Maximum slot for the life of the session.
+			es.dropUnredeliverableRetained()
+		}
+		es.mu.Unlock()
+		if ec != nil {
+			// Remove "will" of existing client before closing
+			ec.mu.Lock()
+			ec.mqtt.cp.will = nil
+			ec.mu.Unlock()
+			// Add to the map of the flappers
+			asm.mu.Lock()
+			asm.addSessToFlappers(cid)
+			asm.mu.Unlock()
+			c.Warnf("Replacing old client %q since both have the same client ID %q", ec, cid)
+			// Tell the evicted v5 client why before the close (no-op for
+			// 3.1.1). Spec5 [3.1.4].
+			ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
+			// Close old client in separate go routine
+			go ec.closeConnection(DuplicateClientID)
+		}
+	} else {
+		// Spec [MQTT-3.2.2-3]: if the Server does not have stored Session state,
+		// it MUST set Session Present to 0 in the CONNACK packet.
+		es.mu.Lock()
+		es.c, es.clean = c, sessClean
+		es.expiryInterval = expiry
+		es.disconnectedAt = 0
+		es.mu.Unlock()
+		// Now add this new session into the account sessions
+		asm.addSession(es, true)
+	}
+	// MQTT 5.0 Receive Maximum: cap the number of in-flight unacknowledged
+	// QoS1/2 PUBLISH we will send to this client. Re-evaluated on every CONNECT
+	// since a resumed session may be taken over by a client with a different
+	// (or no) limit. 0 means no client-imposed limit.
+	var rmax uint16
+	if cp.props != nil {
+		rmax = cp.props.receiveMax
+	}
+	es.mu.Lock()
+	es.rmax = rmax
+	// A new connection cancels any pending delayed Will (cancelWill below);
+	// drop its persisted copy with the save that follows. Spec5 [MQTT-3.1.2-8].
+	es.will = nil
+	es.mu.Unlock()
+
+	// Server Keep Alive, Topic Alias Maximum and the advertised Maximum Packet
+	// Size were resolved on entry (before any session state), so the CONNACK could
+	// be size-checked against the client's Maximum Packet Size before committing.
+
+	// We would need to save only if it did not exist previously, but we save
+	// always in case we are running in cluster mode. This will notify other
+	// running servers that this session is being used.
+	if err := es.save(); err != nil {
+		asm.removeSession(es, true)
+		return err
+	}
+	// The connection is now accepted (session saved). A new connection for this
+	// client ID cancels any delayed Will pending from a previous connection,
+	// whether or not its session still existed (a clean-start client removes its
+	// session on disconnect). Done only on success so a failed CONNECT does not
+	// suppress the prior Will. Keyed by client ID hash. Spec5 [MQTT-3.1.2-8].
+	asm.cancelWill(getHash(cid))
+	// Likewise cancel any pending session-expiry timer: this connection has resumed
+	// (or replaced) the session before it expired. Spec5 [3.1.2.11.2].
+	asm.cancelSessionExpiry(getHash(cid))
+	c.mu.Lock()
+	c.flags.set(connectReceived)
+	c.mqtt.cp = cp
+	c.mqtt.asm = asm
+	c.mqtt.sess = es
+	c.mu.Unlock()
+
+	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.
+	// The entry fit check used the identical frame builder and captured values, so
+	// this send is guaranteed to fit; the guard is defensive.
+	if !sendConnAck(mqttConnAckRCConnectionAccepted, sessp, _EMPTY_) {
+		return fmt.Errorf("CONNACK exceeds client maximum packet size")
+	}
+
+	// A resuming MQTT 3.1.1 client cannot express, observe, or UNSUBSCRIBE a
+	// "$share/..." filter (shared-subscription parsing is v5-only), so restoring
+	// shared membership would create deliveries it can never manage and a phantom
+	// holder no UNSUBSCRIBE could clear. Force-leave any persisted shared
+	// subscriptions instead: remove them (transactionally) and release the group
+	// consumers. On save failure keep membership and close the connection so a
+	// later reconnect retries. Spec5 [4.8.2].
+	if c.mqtt.proto != mqttProtoLevel5 && len(es.sharedSubs) > 0 {
+		es.mu.Lock()
+		prior := es.sharedSubs
+		es.sharedSubs = nil
+		es.mu.Unlock()
+		if err := es.save(); err != nil {
+			es.mu.Lock()
+			es.sharedSubs = prior
+			es.mu.Unlock()
+			return formatError(err)
+		}
+		// Also drop the resident session's in-memory shared consumer state
+		// (cons entries, tmaxack charge, pending deliveries): a later v5
+		// resubscribe of the same filter must not find a stale cons entry and
+		// skip recreating a durable this forced leave may delete below.
+		es.mu.Lock()
+		for sid, cc := range es.cons {
+			if cc.DeliverGroup == _EMPTY_ {
+				continue
+			}
+			delete(es.cons, sid)
+			if seqPis, ok := es.cpending[cc.Durable]; ok {
+				delete(es.cpending, cc.Durable)
+				for _, pi := range seqPis {
+					delete(es.pendingPublish, pi)
+				}
+			}
+			if amt, ok := es.sharedCharged[cc.Durable]; ok {
+				es.tmaxack -= amt
+				if es.tmaxack < 0 {
+					es.tmaxack = 0
+				}
+				delete(es.sharedCharged, cc.Durable)
+			}
+		}
+		es.mu.Unlock()
+		var durs []string
+		for key := range prior {
+			durs = append(durs, mqttSharedDurablesForKey(key)...)
+		}
+		held := es.sharedDurablesHeldByOthers(durs)
+		for _, dur := range durs {
+			if held[dur] {
+				continue
+			}
+			if _, err := es.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+				c.Errorf("MQTT: unable to delete shared consumer %q on 3.1.1 forced leave: %v", dur, err)
+			}
+		}
+		c.Warnf("MQTT: dropped %d shared subscription(s) not supported for a 3.1.1 session resume", len(prior))
+	}
+
+	// Process possible saved subscriptions.
+	if l := len(es.subs) + len(es.sharedSubs); l > 0 {
+		filters := make([]*mqttFilter, 0, l)
+		for subject, qos := range es.subs {
+			_, noLocal := es.noLocalSubs[subject]
+			_, rap := es.rapSubs[subject]
+			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal, retainAsPublished: rap, subID: es.subIDs[subject]})
+		}
+		// Restore shared subscriptions (v5 only; a 3.1.1 resume force-left them
+		// above). The persisted key is the sole authority; parse it back into
+		// group + underlying subject. Spec5 [4.8.2].
+		for key, qos := range es.sharedSubs {
+			if group, subject, ok := mqttParseSharedKey(key); ok {
+				_, rap := es.rapSubs[key]
+				filters = append(filters, &mqttFilter{shared: true, group: group, filter: subject, qos: qos, retainAsPublished: rap, subID: es.subIDs[key]})
+			}
+		}
+		if _, err := asm.processSubs(es, c, filters, false, trace); err != nil {
+			return err
+		}
+	}
+	// Re-send unacked QoS 1/2 messages (and reconcile any that expired while
+	// offline) on resume, whether or not saved subscriptions were restored: a
+	// session can carry unacknowledged PUBRELs with no active subscription.
+	es.resendPendingRedelivery(c)
+	return nil
+}
+
+// mqttConnAckReasonFromRC maps a 3.1.1 CONNACK return code to the equivalent
+// MQTT 5.0 reason code. Codes already in the v5 failure range (>= 0x80) are
+// passed through, which lets callers inject v5-only reasons (e.g. bad auth
+// method) without a 3.1.1 equivalent. Spec5 [3.2.2.2].
+func mqttConnAckReasonFromRC(rc byte) byte {
+	switch rc {
+	case mqttConnAckRCConnectionAccepted:
+		return mqttReasonSuccess
+	case mqttConnAckRCUnacceptableProtocolVersion:
+		return mqttReasonUnsupportedProtocolVersion
+	case mqttConnAckRCIdentifierRejected:
+		return mqttReasonClientIDNotValid
+	case mqttConnAckRCServerUnavailable:
+		return mqttReasonServerUnavailable
+	case mqttConnAckRCBadUserOrPassword:
+		return mqttReasonBadUserOrPassword
+	case mqttConnAckRCNotAuthorized:
+		return mqttReasonNotAuthorized
+	case mqttConnAckRCQoS2WillRejected:
+		return mqttReasonQoSNotSupported
+	}
+	if rc >= 0x80 {
+		return rc
+	}
+	return mqttReasonUnspecifiedError
+}
+
+// mqttEnqueueConnAck enqueues a CONNACK and reports whether it was sent. A v5
+// CONNACK is suppressed (returns false) when it cannot fit the client's Maximum
+// Packet Size even after dropping its Reason String; the 3.1.1 path always sends.
+// It returns whether the CONNACK was sent (false only when a v5 frame exceeds
+// the client's Maximum Packet Size even after dropping its Reason String) and
+// the socket write error, so the caller can record a delivered success CONNACK
+// (connAckWritten) or abort CONNECT on a write failure.
+func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr string) (bool, error) {
+	// Spec [MQTT-3.2.2-4], spec5 [3.2.2.1.1]: when the (reason) code indicates
+	// failure, the session present flag must be 0.
+	sp := byte(0)
+	if rc == 0 && sessionPresent {
+		sp = 1
+	}
+
+	if c.mqtt.proto == mqttProtoLevel5 {
+		frame := c.mqttMakeConnAckV5Frame(rc, sp, reasonStr)
+		if !c.mqttFitsClientMax(len(frame)) {
+			c.Debugf("Suppressing MQTT CONNACK of %d bytes exceeding client Maximum Packet Size %d", len(frame), c.mqtt.maxPacketSize)
+			return false, nil
+		}
+		c.mu.Lock()
+		err := c.enqueueProtoErr(frame)
+		c.mu.Unlock()
+		return true, err
+	}
+
+	proto := [4]byte{mqttPacketConnectAck, 2, sp, rc}
+	c.mu.Lock()
+	err := c.enqueueProtoErr(proto[:])
+	c.mu.Unlock()
+	return true, err
+}
+
+// mqttMakeConnAckV5Frame builds an MQTT 5.0 CONNACK frame: a reason code, the
+// session present flag, and a properties block advertising the server's
+// capabilities. On a failure reason, reasonStr (when set and it fits) is added
+// as a Reason String. The frame size is independent of sp (one byte either way),
+// so the accept path can size it before knowing session present. Spec5 [3.2.2].
+func (c *client) mqttMakeConnAckV5Frame(rc, sp byte, reasonStr string) []byte {
+	reason := mqttConnAckReasonFromRC(rc)
+	success := reason == mqttReasonSuccess
+
+	props := &mqttProperties{present: map[byte]bool{}}
+	// Advertise the capabilities of the current implementation. Properties left
+	// absent take their spec defaults, which already describe us correctly, so
+	// we MUST NOT send them with an explicit value:
+	//   - Maximum QoS: absent => QoS 2 supported. (A value of 2 is illegal in
+	//     this property: spec5 [3.2.2.3.4] allows only 0 or 1.)
+	//   - Retain Available: absent => retained messages supported.
+	//   - Wildcard Subscription Available: absent => wildcards supported.
+	// We only emit the properties whose truthful value differs from the default.
+	//   - Shared Subscription Available: absent => available. We implement them,
+	//     so we emit nothing. Spec5 [3.2.2.3.11], [4.8.2].
+	//   - Subscription Identifiers: absent => available (implemented), emit nothing.
+	// Spec5 [3.2.2.3].
+	// Topic Alias Maximum: advertise the (configured) number of inbound topic
+	// aliases we accept. Success only (resolved on the accept path); omitted when
+	// disabled: absent => 0, i.e. the client must not send any alias. Spec5
+	// [3.2.2.3.2].
+	if tam := c.mqtt.topicAliasMax; success && tam > 0 {
+		props.topicAliasMax = tam
+		props.present[mqttPropTopicAliasMax] = true
+	}
+	// Server Keep Alive: sent only when the server overrides the client's
+	// requested keep alive (resolved on the accept path); absent => the client's
+	// value applies. Spec5 [3.2.2.3.14].
+	if ska := c.mqtt.serverKeepAlive; success && ska > 0 {
+		props.serverKeepAlive = ska
+		props.present[mqttPropServerKeepAlive] = true
+	}
+	// Maximum Packet Size: advertise the server's inbound limit (captured on the
+	// accept path). Truthful: a packet over it gets a DISCONNECT 0x95 at the
+	// framing layer, and an in-range PUBLISH whose NATS re-encoding exceeds the
+	// account max payload gets a non-fatal 0x97 rather than being rejected here.
+	// Omitted (absent => no limit) when there is none. Spec5 [3.2.2.3.6].
+	if mps := c.mqtt.maxInPacketSize; success && mps > 0 {
+		props.maxPacketSize = mps
+		props.present[mqttPropMaxPacketSize] = true
+	}
+	// Receive Maximum: advertise how many inbound QoS 1/2 PUBLISH the server
+	// processes concurrently (resolved on the accept path). Omitted when disabled:
+	// absent => 65535, which the 16-bit packet identifier space can never exceed,
+	// so not enforcing is truthful. Spec5 [3.2.2.3.3].
+	if rm := c.mqtt.recvMaxIn; success && rm > 0 {
+		props.receiveMax = rm
+		props.present[mqttPropReceiveMaximum] = true
+	}
+	// Echo a server-assigned client identifier. Spec5 [3.2.2.3.7].
+	if success && c.mqtt.cidGenerated {
+		props.assignedClientID = c.mqtt.cid
+	}
+	// Response Information: returned only when the client requested it and the
+	// server is configured with a base response topic (resolved on the accept
+	// path). Spec5 [3.2.2.3.15].
+	if success && c.mqtt.responseInfo != _EMPTY_ {
+		props.responseInfo = c.mqtt.responseInfo
+	}
+	// On a failure reason, explain why with a Reason String (CONNACK is exempt
+	// from Request Problem Information). Spec5 [3.2.2.3.9].
+	if reason >= 0x80 {
+		props.reasonString = c.mqttReasonString(mqttPacketConnectAck, reasonStr)
+	}
+
+	// Variable header = session present (1) + reason code (1) + properties.
+	frame := func() []byte {
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketConnectAck)
+		var vh mqttWriter
+		vh.WriteByte(sp)
+		vh.WriteByte(reason)
+		vh.writeProperties(props)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		return w.Bytes()
+	}
+	buf := frame()
+	// Drop the Reason String (only) if it pushed the packet past the client's
+	// Maximum Packet Size. Spec5 [3.1.2.11.4].
+	if props.reasonString != _EMPTY_ && !c.mqttFitsClientMax(len(buf)) {
+		props.reasonString = _EMPTY_
+		buf = frame()
+	}
+	return buf
+}
+
+// Reason String sent with the DISCONNECT to a client whose session is taken
+// over by a new connection with the same client ID. Spec5 [3.1.4].
+const mqttReasonStrSessionTakenOver = "session taken over by a new connection"
+
+// Reason String sent with the DISCONNECT to every connected client when the
+// broker is draining connections for shutdown. Spec5 [3.14.2.1].
+const mqttReasonStrServerShuttingDown = "server shutting down"
+
+// mqttReasonString returns reasonStr if it may accompany a server-generated
+// packet of type pktType, or empty otherwise: v5 only; a client that sent
+// Request Problem Information 0 gets one only on CONNACK/DISCONNECT (where the
+// server MAY send it regardless); and it must be a valid MQTT UTF-8 string
+// ([MQTT-1.5.4-1]) no longer than an MQTT UTF-8 string can encode (the writer
+// lays down a uint16 length, so an over-long string would wrap it and corrupt
+// the block). Callers may pass client-derived error text, so both checks matter.
+// Spec5 [1.5.4], [3.1.2.11.7].
+func (c *client) mqttReasonString(pktType byte, reasonStr string) string {
+	if reasonStr == _EMPTY_ || c.mqtt == nil || c.mqtt.proto != mqttProtoLevel5 {
+		return _EMPTY_
+	}
+	if c.mqtt.noProblemInfo && pktType != mqttPacketConnectAck && pktType != mqttPacketDisconnect {
+		return _EMPTY_
+	}
+	if len(reasonStr) > 0xFFFF || mqttValidateString(reasonStr, "reason string") != nil {
+		return _EMPTY_
+	}
+	return reasonStr
+}
+
+// mqttFitsClientMax reports whether a framed packet of n bytes fits the client's
+// MQTT 5.0 Maximum Packet Size (0 = no limit). An oversized packet must drop its
+// Reason String rather than be sent. Spec5 [3.1.2.11.4].
+func (c *client) mqttFitsClientMax(n int) bool {
+	return c.mqtt == nil || c.mqtt.maxPacketSize == 0 || uint32(n) <= c.mqtt.maxPacketSize
+}
+
+// mqttEnqueueFittingProto enqueues buf unless it would exceed the client's
+// Maximum Packet Size; the server MUST NOT send such a packet [MQTT-3.1.2-24].
+// Returns whether it was enqueued.
+func (c *client) mqttEnqueueFittingProto(buf []byte) bool {
+	if !c.mqttFitsClientMax(len(buf)) {
+		c.Debugf("Suppressing MQTT packet of %d bytes exceeding client Maximum Packet Size %d", len(buf), c.mqtt.maxPacketSize)
+		return false
+	}
+	c.mu.Lock()
+	c.enqueueProto(buf)
+	c.mu.Unlock()
+	return true
+}
+
+// mqttServerMaxPacketSize returns the server's MQTT 5.0 Maximum Packet Size for
+// this connection, derived from the account max payload, or 0 when there is no
+// effective limit (unlimited, or a limit at/above the largest legal control
+// packet). Spec5 [3.2.2.3.6].
+func (c *client) mqttServerMaxPacketSize() uint32 {
+	mpay := atomic.LoadInt32(&c.mpay)
+	if mpay <= 0 || mpay > mqttMaxControlPacketSize {
+		return 0
+	}
+	return uint32(mpay)
+}
+
+// mqttReasonProps returns a properties block carrying reasonStr as a Reason
+// String for a server-generated packet of type pktType, or nil (which encodes as
+// a single zero length byte, byte-identical to no properties) when the string is
+// empty or not permitted. Spec5 [3.9.2.2.2].
+func (c *client) mqttReasonProps(pktType byte, reasonStr string) *mqttProperties {
+	if rs := c.mqttReasonString(pktType, reasonStr); rs != _EMPTY_ {
+		return &mqttProperties{reasonString: rs}
+	}
+	return nil
+}
+
+// mqttEnqueueDisconnect sends an MQTT 5.0 DISCONNECT with the given reason code
+// (and, when allowed and it fits, a Reason String) to the client, before the
+// connection is closed on a protocol/processing error. It is a no-op for 3.1.1
+// connections, which have no server-initiated DISCONNECT. Spec5 [3.14].
+func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
+	pkt := c.mqttBuildDisconnect(reason, reasonStr)
+	if pkt == nil {
+		return
+	}
+	c.mu.Lock()
+	c.enqueueProto(pkt)
+	c.mu.Unlock()
+}
+
+// mqttBuildDisconnect returns the wire bytes for a server-initiated MQTT 5.0
+// DISCONNECT with the given reason code (and, when allowed and it fits, a Reason
+// String), or nil for a 3.1.1 connection (which has no server DISCONNECT) or
+// when even the 3-byte short form would exceed the client's Maximum Packet Size.
+// It builds only; the caller enqueues (mqttEnqueueDisconnect) or writes it
+// directly under a deadline (shutdownDisconnect). Spec5 [3.14].
+func (c *client) mqttBuildDisconnect(reason byte, reasonStr string) []byte {
+	if c.mqtt == nil || c.mqtt.proto != mqttProtoLevel5 {
+		return nil
+	}
+	if rs := c.mqttReasonString(mqttPacketDisconnect, reasonStr); rs != _EMPTY_ {
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketDisconnect)
+		var vh mqttWriter
+		vh.WriteByte(reason)
+		vh.writeProperties(&mqttProperties{reasonString: rs})
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		if c.mqttFitsClientMax(w.Len()) {
+			return w.Bytes()
+		}
+		// Falls through to the short form when the Reason String would overflow.
+	}
+	// Remaining length of 1: just the reason code, properties omitted (allowed
+	// when there are no properties). Suppressed if even this doesn't fit (only
+	// possible before a success CONNACK bounds the client's tiny limit); the
+	// connection closes regardless. Spec5 [3.14.2.2.1].
+	proto := [3]byte{mqttPacketDisconnect, 1, reason}
+	if !c.mqttFitsClientMax(len(proto)) {
+		return nil
+	}
+	return append([]byte(nil), proto[:]...)
+}
+
+// mqttDisconnectReasonFromErr picks a v5 DISCONNECT reason code for a parse or
+// processing error. Spec5 [3.14.2.1].
+func mqttDisconnectReasonFromErr(err error) byte {
+	switch {
+	case errors.Is(err, errMQTTMalformedVarInt), errors.Is(err, errMQTTMalformedProperties),
+		errors.Is(err, errMQTTMalformedSubOption), errors.Is(err, errMQTTMalformedSharedSub),
+		errors.Is(err, errMQTTMalformedPacket), errors.Is(err, errMQTTTopicFilterCannotBeEmpty),
+		errors.Is(err, errMQTTUnsupportedCharacters), errors.Is(err, errMQTTInvalidPublishLength):
+		return mqttReasonMalformedPacket
+	case errors.Is(err, errMQTTUnknownProperty), errors.Is(err, errMQTTPropertyNotAllowed),
+		errors.Is(err, errMQTTDuplicateProperty), errors.Is(err, errMQTTProtocolError),
+		errors.Is(err, errMQTTSecondConnectPacket), errors.Is(err, errMQTTTopicIsEmpty):
+		return mqttReasonProtocolError
+	case errors.Is(err, errMQTTTopicAliasInvalid):
+		return mqttReasonTopicAliasInvalid
+	case errors.Is(err, errMQTTReceiveMaxExceeded):
+		return mqttReasonReceiveMaxExceeded
+	case errors.Is(err, errMQTTPayloadFormatInvalid):
+		return mqttReasonPayloadFormatInvalid
+	}
+	return mqttReasonUnspecifiedError
+}
+
+// mqttConnAckReasonFromConnectErr picks a v5 CONNACK reason code for a CONNECT
+// that failed to parse without a return code: property errors are Protocol
+// Error (0x82), everything else Malformed Packet (0x81). Spec5 [3.1.4.1].
+func mqttConnAckReasonFromConnectErr(err error) byte {
+	switch {
+	case errors.Is(err, errMQTTPayloadFormatInvalid):
+		return mqttReasonPayloadFormatInvalid
+	case errors.Is(err, errMQTTUnknownProperty), errors.Is(err, errMQTTPropertyNotAllowed),
+		errors.Is(err, errMQTTDuplicateProperty), errors.Is(err, errMQTTProtocolError):
+		return mqttReasonProtocolError
+	}
+	return mqttReasonMalformedPacket
+}
+
+// mqttPayloadFormatIsUTF8 reports whether a raw MQTT 5.0 properties block carries
+// a Payload Format Indicator of 1 (the payload is declared UTF-8). Spec5
+// [3.3.2.3.2].
+func mqttPayloadFormatIsUTF8(props []byte) bool {
+	off := mqttPropValueOffset(props, mqttPropPayloadFormat)
+	return off >= 0 && off < len(props) && props[off] == 1
+}
+
+// mqttHandleWill publishes a disconnected client's Will Message, if any. For an
+// MQTT 5.0 client that set a Will Delay Interval on a session that survives the
+// connection, publication is deferred so a timely reconnect can cancel it. Spec5
+// [3.1.3.2.2], [MQTT-3.1.2-8].
+func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32) {
+	c.mu.Lock()
+	if c.mqtt.cp == nil {
+		c.mu.Unlock()
+		return
+	}
+	will := c.mqtt.cp.will
+	if will == nil {
+		c.mu.Unlock()
+		return
+	}
+	// MQTT 5.0 Will Delay Interval: defer publication when a delay is set and the
+	// session survives the connection. The session survives iff its (effective)
+	// Session Expiry Interval is non-zero; a zero interval ends the session at
+	// connection close, so the Will is published immediately. The pending Will is
+	// tracked on the account manager keyed by client ID (not on the session object,
+	// which a clean-start client removes on disconnect) so a reconnect can cancel
+	// it. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
+	if c.mqtt.proto == mqttProtoLevel5 && will.props != nil && will.props.willDelay > 0 && sessionExpiry > 0 {
+		asm := c.mqtt.asm
+		sess := c.mqtt.sess
+		// Spec5 [3.1.3.2.2]: publish at the Will Delay Interval OR when the session
+		// ends, whichever is first, so cap the delay at the Session Expiry Interval.
+		// (mqttSessionNeverExpire, being the max uint32, never lowers the delay.)
+		effDelay := will.props.willDelay
+		if sessionExpiry < effDelay {
+			effDelay = sessionExpiry
+		}
+		delay := time.Duration(effDelay) * time.Second
+		// Capture the publisher's identity so the deferred publish is still
+		// permission-checked once the client is gone. Keyed by client ID hash so
+		// a remote takeover (session-persist callback) can also cancel it.
+		pw := &mqttPendingWill{will: will, props: mqttWillForwardProps(will.props),
+			acc: c.acc, perms: c.perms, user: c.opts.Username}
+		idHash := getHash(c.mqtt.cid)
+		// A restored Will cannot re-check publish permissions at fire time
+		// (they are not serializable), so evaluate them now, with the same
+		// permission set the in-memory fire-time check would use, and never
+		// persist a denied Will.
+		willAllowed := c.pubAllowedFullCheck(string(will.subject), false, true)
+		c.mu.Unlock()
+		if asm != nil {
+			asm.scheduleWill(s, idHash, pw, delay)
+			// Persist the pending Will with the session record so a restart
+			// during the delay window still fires it. A clean session's record
+			// was just deleted (above us); this save re-creates a minimal
+			// record that only carries the Will and is deleted once the Will
+			// fires or is cancelled.
+			if sess != nil && willAllowed {
+				sess.mu.Lock()
+				sess.will = &mqttPersistedWill{
+					Topic:  string(will.topic),
+					Msg:    will.message,
+					QoS:    will.qos,
+					Retain: will.retain,
+					Props:  pw.props,
+					User:   pw.user,
+					FireAt: time.Now().Add(delay).UnixNano(),
+				}
+				sess.mu.Unlock()
+				if err := sess.save(); err != nil {
+					s.Warnf("MQTT: unable to persist delayed Will for client ID hash %q: %v", idHash, err)
+				}
+			}
+		}
+		return
+	}
+	pp := c.mqtt.pp
+	pp.topic = will.topic
+	pp.subject = will.subject
+	pp.mapped = will.mapped
+	pp.msg = will.message
+	pp.sz = len(will.message)
+	pp.pi = 0
+	pp.flags = will.qos << 1
+	if will.retain {
+		pp.flags |= mqttPubFlagRetain
+	}
+	// pp is the shared publish struct; replace any properties left over from
+	// the client's last PUBLISH with the Will's own. Spec5 [3.1.3.2].
+	pp.props = mqttWillForwardProps(will.props)
+	c.mu.Unlock()
+	// A Will is server-originated: no No Local origin, matching the delayed Will
+	// path so suppression does not depend on the Will Delay Interval. Spec5 [3.8.3.1].
+	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_)
+	c.flushClients(0)
+}
+
+// mqttWillForwardProps encodes a Will's properties as the raw block (length
+// prefix + body, the pp.props format) to attach to the Will PUBLISH. Will Delay
+// Interval is consumed by the server and has no encode case, so it is never
+// forwarded. Spec5 [3.1.3.2].
+func mqttWillForwardProps(p *mqttProperties) []byte {
+	if p == nil {
+		return nil
+	}
+	w := newMQTTWriter(0)
+	w.writeProperties(p)
+	// Just the zero-length varint: nothing to forward.
+	if w.Len() <= 1 {
+		return nil
+	}
+	return w.Bytes()
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// PUBLISH protocol related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMappings bool) error {
+	qos := mqttGetQoS(pp.flags)
+	if qos > 2 {
+		return fmt.Errorf("%w: QoS=%v is invalid in MQTT", errMQTTMalformedPacket, qos)
+	}
+
+	if c.mqtt.rejectQoS2Pub && qos == 2 {
+		return fmt.Errorf("QoS=2 is disabled for PUBLISH messages")
+	}
+
+	// Keep track of where we are when starting to read the variable header
+	start := r.pos
+
+	var err error
+	pp.topic, err = r.readBytes("topic", false)
+	if err != nil {
+		return err
+	}
+	v5 := c.mqtt.proto == mqttProtoLevel5
+	// For v5 an empty topic is legal when a previously bound Topic Alias
+	// resolves it, so defer the check until after properties are read. 3.1.1
+	// has no aliases, so reject an empty topic immediately.
+	if len(pp.topic) == 0 && !v5 {
+		return errMQTTTopicIsEmpty
+	}
+
+	if qos > 0 {
+		pp.pi, err = r.readUint16("packet identifier")
+		if err != nil {
+			return err
+		}
+		if pp.pi == 0 {
+			return fmt.Errorf("with QoS=%v, packet identifier cannot be 0", qos)
+		}
+	} else {
+		pp.pi = 0
+	}
+
+	// MQTT 5.0: PUBLISH properties follow the packet identifier (or topic, for
+	// QoS 0) and precede the payload. Spec5 [3.3.2.3]. Reading here also
+	// advances the reader so the payload-size computation below is correct.
+	// pp is reused across packets (c.mqtt.pp), so pp.props is assigned on every
+	// path below, never left carrying the previous packet's block.
+	pp.props = nil
+	if v5 {
+		propStart := r.pos
+		props, perr := r.readProperties(mqttPacketPub)
+		if perr != nil {
+			return perr
+		}
+		// Raw block (length prefix + body) as received: forwarded verbatim to v5
+		// subscribers unless it carries a Topic Alias, which is hop-local and
+		// stripped below. An inbound client PUBLISH can otherwise only carry
+		// forwardable properties (Subscription Identifier is server->client
+		// only), so verbatim re-emit is spec-correct. Spec5 [3.3.2.3].
+		raw := r.buf[propStart:r.pos]
+		if props != nil && props.present[mqttPropTopicAlias] {
+			// A Topic Alias of 0, or above the maximum we advertised, is
+			// invalid; this also covers the disabled case (maximum 0). Spec5
+			// [3.3.2.3.4].
+			alias := props.topicAlias
+			if alias == 0 || alias > c.mqtt.topicAliasMax {
+				return fmt.Errorf("%w: %d (maximum %d)", errMQTTTopicAliasInvalid, alias, c.mqtt.topicAliasMax)
+			}
+			if len(pp.topic) > 0 {
+				// Bind (or re-bind, which the spec allows) the alias to this
+				// topic. Copy: the reader buffer is transient.
+				if c.mqtt.topicAliases == nil {
+					c.mqtt.topicAliases = make(map[uint16][]byte)
+				}
+				c.mqtt.topicAliases[alias] = copyBytes(pp.topic)
+			} else {
+				// Alias-only PUBLISH: resolve to the bound topic. An unknown
+				// alias with an empty topic is a Protocol Error. Spec5 [3.3.2.3.4].
+				topic, ok := c.mqtt.topicAliases[alias]
+				if !ok {
+					return fmt.Errorf("%w: unknown topic alias %d", errMQTTProtocolError, alias)
+				}
+				pp.topic = topic
+			}
+			// Strip the alias so it is never forwarded or stored (hop-local).
+			pp.props = mqttStripTopicAlias(raw)
+		} else {
+			if len(pp.topic) == 0 {
+				return errMQTTTopicIsEmpty
+			}
+			// Keep the block only if it carries something (more than the single
+			// zero length byte). Copy: the reader buffer is transient.
+			if len(raw) > 1 {
+				pp.props = copyBytes(raw)
+			}
+		}
+	}
+
+	if err := mqttValidateTopic(pp.topic, "topic"); err != nil {
+		return err
+	}
+	// Convert the topic to a NATS subject. This call will also check that
+	// there is no MQTT wildcards (Spec [MQTT-3.3.2-2] and [MQTT-4.7.1-1])
+	// Note that this may not result in a copy if there is no conversion.
+	// It is good because after the message is processed we won't have a
+	// reference to the buffer and we save a copy.
+	pp.subject, err = mqttTopicToNATSPubSubject(pp.topic)
+	if err != nil {
+		return err
+	}
+
+	// Check for subject mapping. pp is reused across packets, so reset mapped
+	// unconditionally: it is only set when a mapping applies, and a stale value
+	// from a prior mapped publish must not leak into this one.
+	pp.mapped = nil
+	if hasMappings {
+		// For selectMappedSubject to work, we need to have c.pa.subject set.
+		// If there is a change, c.pa.mapped will be set after the call.
+		c.pa.subject = pp.subject
+		if changed := c.selectMappedSubject(); changed {
+			// We need to keep track of the NATS subject/mapped in the `pp` structure.
+			pp.subject = c.pa.subject
+			pp.mapped = c.pa.mapped
+			// We also now need to map the original MQTT topic to the new topic
+			// based on the new subject.
+			pp.topic = natsSubjectToMQTTTopic(pp.subject)
+		}
+		// Reset those now.
+		c.pa.subject, c.pa.mapped = nil, nil
+	}
+
+	// The message payload will be the total packet length minus
+	// what we have consumed for the variable header
+	payloadSize := pl - (r.pos - start)
+	if payloadSize < 0 {
+		return fmt.Errorf("%w: invalid remaining length %d for PUBLISH packet", errMQTTMalformedPacket, pl)
+	}
+	pp.sz = payloadSize
+	if pp.sz > 0 {
+		start = r.pos
+		r.pos += pp.sz
+		pp.msg = r.buf[start:r.pos]
+	} else if pp.sz == 0 {
+		pp.msg = nil
+	} else {
+		return errMQTTInvalidPublishLength
+	}
+	return nil
+}
+
+func mqttValidateTopic(topic []byte, field string) error {
+	if !utf8.Valid(topic) {
+		return fmt.Errorf("%w: invalid utf8 for %s %q", errMQTTMalformedPacket, field, topic)
+	}
+	if bytes.IndexByte(topic, 0) >= 0 {
+		return fmt.Errorf("%w: invalid null character in %s %q", errMQTTMalformedPacket, field, topic)
+	}
+	return nil
+}
+
+func mqttValidateString(value string, field string) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%w: invalid utf8 for %s %q", errMQTTMalformedPacket, field, value)
+	}
+	if strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("%w: invalid null character in %s %q", errMQTTMalformedPacket, field, value)
+	}
+	return nil
+}
+
+func mqttPubTrace(pp *mqttPublish) string {
+	dup := pp.flags&mqttPubFlagDup != 0
+	qos := mqttGetQoS(pp.flags)
+	retain := mqttIsRetained(pp.flags)
+	var piStr string
+	if pp.pi > 0 {
+		piStr = fmt.Sprintf(" pi=%v", pp.pi)
+	}
+	return fmt.Sprintf("%s dup=%v QoS=%v retain=%v size=%v%s",
+		pp.topic, dup, qos, retain, pp.sz, piStr)
+}
+
+// mqttOriginMarker returns the authenticated No Local origin marker for a
+// message published by session idHash on subject with the given payload: an
+// HMAC of (idHash, subject, payload) under the server's per-run secret.
+//
+// It authenticates only a narrow claim used by the No Local decision — "this
+// subscriber's own session published this subject+payload" — not that the whole
+// stored message is server-created or fresh. Because the secret never leaves the
+// server, a client cannot forge a marker for a session it does not control. The
+// marker is deterministic (hence emitted in a readable header and observable),
+// so it can be replayed; that is not a weakness here, because the marker is
+// keyed by the origin idHash: replaying a victim's marker can only re-assert the
+// victim's own origin for that same subject+payload, which No Local suppresses
+// anyway, while an independently-authored message carries a different origin's
+// marker and is delivered. Empty when there is no key or no session (nothing to
+// authenticate). idHash and subject contain no NUL, so the NUL separators
+// delimit the fields unambiguously. Spec5 [3.8.3.1].
+func mqttOriginMarker(key []byte, idHash, subject string, payload []byte) string {
+	if len(key) == 0 || idHash == _EMPTY_ {
+		return _EMPTY_
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(idHash))
+	mac.Write([]byte{0})
+	mac.Write([]byte(subject))
+	mac.Write([]byte{0})
+	mac.Write(payload)
+	// 16 bytes of tag is ample against forgery and keeps the header small.
+	return base64.RawStdEncoding.EncodeToString(mac.Sum(nil)[:16])
+}
+
+// mqttStampedOrigin is the origin marker to stamp on a message this client is
+// publishing on subject with payload, or empty when the server does not run v5
+// (no No Local subscription can exist) or the client has no session (e.g. an
+// internal Will-delivery client, so a Will is never treated as self-published).
+// Spec5 [3.8.3.1].
+func (c *client) mqttStampedOrigin(subject string, payload []byte) string {
+	if c.mqtt == nil || c.mqtt.sess == nil || c.srv == nil || !c.srv.mqtt.v5Enabled {
+		return _EMPTY_
+	}
+	return mqttOriginMarker(c.srv.mqtt.originKey, c.mqtt.sess.idHash, subject, payload)
+}
+
+// mqttOriginRetained reports whether pp was published with the RETAIN flag and
+// v5 is enabled on this server, so its original RETAIN should be recorded (in
+// the Nmqtt-Ret header) for the Retain As Published subscription option. Must be
+// called while pp.flags still carries the original RETAIN (before fan-out clears
+// it). A 3.1.1-only server records nothing. Spec5 [3.8.3.1].
+func (c *client) mqttOriginRetained(pp *mqttPublish) bool {
+	return c.srv != nil && c.srv.mqtt.v5Enabled && mqttIsRetained(pp.flags)
+}
+
+// mqttNoLocalSuppress reports whether a No Local subscription must drop this
+// delivery: the message was published by the same session (its ID hash matches
+// the subscriber's). An unknown origin (empty hash) never suppresses. Spec5
+// [3.8.3.1].
+func mqttNoLocalSuppress(noLocal bool, originHash, subHash string) bool {
+	return noLocal && originHash != _EMPTY_ && originHash == subHash
+}
+
+// mqttComputeNatsMsgSize computes the size the NATS message to be delivered
+// based on a MQTT PUBLISH packet.
+// encodePP: whether to encode complete MQTT PUBLISH packet header information
+//   - false: initial delivery (QoS 0/1) needs only base header
+//   - true: QoS2 storage needs to encode Nmqtt-Subject and Nmqtt-Mapped
+func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool) int {
+	size := len(hdrLine) +
+		len(mqttNatsHeader) + 2 + 2 + // 2 for ':<qos>', and 2 for CRLF
+		2 + // end-of-header CRLF
+		pp.sz
+	if len(origin) > 0 {
+		size += len(mqttNatsHeaderOrigin) + 1 + // +1 for ':'
+			len(origin) + 2 // 2 for CRLF
+	}
+	if retained {
+		size += len(mqttNatsHeaderRetain) + 1 + 1 + 2 // ':' + "1" + CRLF
+	}
+	if encodePP {
+		size += len(mqttNatsHeaderSubject) + 1 + // +1 for ':'
+			len(pp.subject) + 2 // 2 for CRLF
+
+		if len(pp.mapped) > 0 {
+			size += len(mqttNatsHeaderMapped) + 1 + // +1 for ':'
+				len(pp.mapped) + 2 // 2 for CRLF
+		}
+	}
+	// MQTT 5.0 properties are carried (base64) so they can be forwarded to v5
+	// subscribers. Independent of encodePP: needed for both delivery and storage.
+	if len(pp.props) > 0 {
+		size += len(mqttNatsHeaderProps) + 1 + // +1 for ':'
+			base64.StdEncoding.EncodedLen(len(pp.props)) + 2 // 2 for CRLF
+	}
+	// MQTT 5.0 Message Expiry Interval maps to a JetStream per-message TTL so the
+	// stored copy is dropped once its lifetime elapses. Spec5 [3.3.2.3.3].
+	if ttl > 0 {
+		size += len(JSMessageTTL) + 1 + // +1 for ':'
+			len(strconv.FormatUint(uint64(ttl), 10)) + 1 + 2 // +1 for 's', 2 for CRLF
+	}
+	return size
+}
+
+// Composes a NATS message from a MQTT PUBLISH packet. The message includes an
+// internal header containint the original packet's QoS, and for QoS2 packets
+// the original subject.
+//
+// Example (QoS2, subject: "foo.bar"):
+//
+//	NATS/1.0\r\n
+//	Nmqtt-Pub:2foo.bar\r\n
+//	\r\n
+func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool) (natsMsg []byte, headerLen int) {
+	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, origin, retained)
+
+	buf := bytes.NewBuffer(make([]byte, 0, size))
+
+	qos := mqttGetQoS(pp.flags)
+
+	buf.WriteString(hdrLine)
+	buf.WriteString(mqttNatsHeader)
+	buf.WriteByte(':')
+	buf.WriteByte(qos + '0')
+	buf.WriteString(_CRLF_)
+
+	// Authenticated No Local origin marker. Absent when the publisher has no
+	// session or v5 is off. Spec5 [3.8.3.1].
+	if len(origin) > 0 {
+		buf.WriteString(mqttNatsHeaderOrigin)
+		buf.WriteByte(':')
+		buf.WriteString(origin)
+		buf.WriteString(_CRLF_)
+	}
+
+	// Original RETAIN flag, for the Retain As Published subscription option.
+	// Spec5 [3.8.3.1].
+	if retained {
+		buf.WriteString(mqttNatsHeaderRetain)
+		buf.WriteByte(':')
+		buf.WriteByte('1')
+		buf.WriteString(_CRLF_)
+	}
+
+	if encodePP {
+		buf.WriteString(mqttNatsHeaderSubject)
+		buf.WriteByte(':')
+		buf.Write(pp.subject)
+		buf.WriteString(_CRLF_)
+
+		if len(pp.mapped) > 0 {
+			buf.WriteString(mqttNatsHeaderMapped)
+			buf.WriteByte(':')
+			buf.Write(pp.mapped)
+			buf.WriteString(_CRLF_)
+		}
+	}
+
+	if len(pp.props) > 0 {
+		buf.WriteString(mqttNatsHeaderProps)
+		buf.WriteByte(':')
+		buf.WriteString(base64.StdEncoding.EncodeToString(pp.props))
+		buf.WriteString(_CRLF_)
+	}
+
+	// MQTT 5.0 Message Expiry Interval: attach a JetStream per-message TTL so the
+	// stored copy expires after the requested lifetime. This is server-internal
+	// metadata (not one of the forwarded Nmqtt-* headers). Spec5 [3.3.2.3.3].
+	if ttl > 0 {
+		buf.WriteString(JSMessageTTL)
+		buf.WriteByte(':')
+		buf.WriteString(strconv.FormatUint(uint64(ttl), 10))
+		buf.WriteByte('s')
+		buf.WriteString(_CRLF_)
+	}
+
+	// End of header
+	buf.WriteString(_CRLF_)
+
+	headerLen = buf.Len()
+
+	buf.Write(pp.msg)
+	return buf.Bytes(), headerLen
+}
+
+// Composes a NATS message for a pending PUBREL packet. The message includes an
+// internal header containing the PI for PUBREL/PUBCOMP.
+//
+// Example (PI:123):
+//
+//		NATS/1.0\r\n
+//	 	Nmqtt-PubRel:123\r\n
+//		\r\n
+func mqttNewDeliverablePubRel(pi uint16) (natsMsg []byte, headerLen int) {
+	size := len(hdrLine) +
+		len(mqttNatsPubRelHeader) + 6 + 2 + // 6 for ':65535', and 2 for CRLF
+		2 // end-of-header CRLF
+	buf := bytes.NewBuffer(make([]byte, 0, size))
+	buf.WriteString(hdrLine)
+	buf.WriteString(mqttNatsPubRelHeader)
+	buf.WriteByte(':')
+	buf.WriteString(strconv.FormatInt(int64(pi), 10))
+	buf.WriteString(_CRLF_)
+	buf.WriteString(_CRLF_)
+	return buf.Bytes(), buf.Len()
+}
+
+// Process the PUBLISH packet.
+//
+// Runs from the client's readLoop.
+// No lock held on entry.
+func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
+	qos := mqttGetQoS(pp.flags)
+
+	// Reject a client PUBLISH into the broker's internal subject namespace
+	// ("$MQTT.*"). An MQTT client can map a "$MQTT/..." topic onto e.g.
+	// "$MQTT.JSA.<...>.SP.<hash>.<uuid>" and forge session-persist / JSA traffic
+	// to evict or corrupt other sessions. The broker's own internal publishes go
+	// through the internal client's processInboundClientMsg, never this client
+	// PUBLISH path, so this only blocks external clients from the reserved
+	// namespace. Defense in depth: production should ALSO have the NATS account
+	// used for auth passthrough deny publish to "$MQTT.>", but the broker must
+	// not depend on that config being correct. Drop the message (do not deliver
+	// or store); ack QoS>0 with Not authorized (0x87) so the client's flow stays
+	// consistent, and do not disconnect on QoS0. Spec5 [3.3.5], reason 0x87.
+	if bytes.HasPrefix(pp.subject, []byte(mqttPrefix)) {
+		c.Warnf("Rejecting PUBLISH to reserved internal subject %q", pp.subject)
+		switch qos {
+		case 1:
+			c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonNotAuthorized, "publish to reserved topic not allowed", trace)
+		case 2:
+			c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonNotAuthorized, "publish to reserved topic not allowed", trace)
+		}
+		return nil
+	}
+
+	// MQTT 5.0 flow control [MQTT-4.9]: the server enforces the portion of the
+	// client's send quota it can observe — the QoS 2 messages held between PUBREC
+	// and PUBREL. Any QoS>0 PUBLISH arriving while those fill the quota is a
+	// violation => DISCONNECT 0x93 via the read loop's error exit. Pure QoS 1
+	// overrun is not reliably observable (the slot is returned when the client
+	// receives the PUBACK, which the server cannot see) and is not policed here.
+	// A DUP re-send of an already-held QoS 2 PI is not a new send and must not
+	// double-count. Checked before the message is examined so a flow-control
+	// violation trumps any per-message reason.
+	if qos > 0 && c.mqtt.recvMaxIn > 0 {
+		if _, held := c.mqtt.qos2InFlight[pp.pi]; !(qos == 2 && held) &&
+			len(c.mqtt.qos2InFlight) >= int(c.mqtt.recvMaxIn) {
+			return fmt.Errorf("%w: %d QoS 2 messages already await PUBREL, receive maximum is %d",
+				errMQTTReceiveMaxExceeded, len(c.mqtt.qos2InFlight), c.mqtt.recvMaxIn)
+		}
+	}
+
+	// Authenticated No Local origin marker for this publish, stamped on the
+	// delivered/stored message and read back by both delivery callbacks
+	// (mqttDeliverMsgCbQoS0, mqttDeliverMsgCbQoS12) to suppress self-delivery.
+	// Computed for every QoS (including plain QoS0): unlike upstream, where a
+	// QoS0 delivery runs in-process with a genuine *client identifying the
+	// publisher (so No Local needs no header marker there), this standalone
+	// broker's QoS0 fan-out always travels over a real NATS subscription whose
+	// callback never carries real publisher identity (see
+	// mqttDeliverMsgCbQoS0's non-MQTT branch) — the marker is the only way QoS0
+	// No Local can work here. Empty for 3.1.1 or when v5 is off. Spec5
+	// [3.8.3.1].
+	origin := c.mqttStampedOrigin(string(pp.subject), pp.msg)
+
+	// Enforce max_payload using existing client max payload logic (mpay) by
+	// checking the largest NATS message size that would be processed, including
+	// the Nats-TTL header that a Message Expiry Interval adds to the stored
+	// message. QoS2 is first held with the PUBLISH subject headers (no TTL) and
+	// later delivered with the TTL header (no subject headers); the two header
+	// sets never coexist, so we compare the two actual forms rather than sum them.
+	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
+		// The delivered form carries the Nmqtt-Origin header; the QoS2 hold copy
+		// does not (origin is re-derived from the client on PUBREL release). Both
+		// carry the Nmqtt-Ret marker for a retained publish (the hold copy so it
+		// survives to PUBREL).
+		retained := c.mqttOriginRetained(pp)
+		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin, retained)
+		if qos == 2 {
+			if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained); hold > total {
+				total = hold
+			}
+		}
+		if total > int(maxPayload) {
+			// A v5 PUBLISH within the advertised Maximum Packet Size can still
+			// exceed the account max payload once re-encoded as a NATS message
+			// (header overhead). Rather than close the connection, discard the
+			// message and report a non-fatal Quota Exceeded so the advertised
+			// packet-size limit stays truthful. QoS0 has no ack, so drop silently.
+			// Spec5 [3.4.2.1], [3.5.2.1], reason 0x97.
+			if c.mqtt.proto == mqttProtoLevel5 {
+				rs := fmt.Sprintf("message size %d exceeds server maximum of %d after encoding", total, maxPayload)
+				switch qos {
+				case 1:
+					c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonQuotaExceeded, rs, trace)
+				case 2:
+					c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonQuotaExceeded, rs, trace)
+				default:
+					c.Debugf("Discarding QoS0 PUBLISH: %s", rs)
+				}
+				return nil
+			}
+			c.maxPayloadViolation(total, maxPayload)
+			return ErrMaxPayload
+		}
+	}
+
+	// MQTT 5.0 Payload Format Indicator: when the publisher declares the payload
+	// is UTF-8 (PFI=1) but it is not well-formed, this is a Payload Format Invalid
+	// error. Like Quota Exceeded above it is non-fatal for QoS>0 (the ack carries
+	// reason 0x99 and the message is discarded); a QoS0 violation cannot be acked,
+	// so the connection is closed with DISCONNECT 0x99. Spec5 [3.3.2.3.2], reason
+	// 0x99. Only v5 carries the property; 3.1.1 has no PFI.
+	if c.mqtt.proto == mqttProtoLevel5 && mqttPayloadFormatIsUTF8(pp.props) && !utf8.Valid(pp.msg) {
+		rs := "payload is not valid UTF-8 but the Payload Format Indicator is 1"
+		switch qos {
+		case 1:
+			c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonPayloadFormatInvalid, rs, trace)
+			return nil
+		case 2:
+			c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonPayloadFormatInvalid, rs, trace)
+			return nil
+		default:
+			return fmt.Errorf("%w: %s", errMQTTPayloadFormatInvalid, rs)
+		}
+	}
+
+	switch qos {
+	case 0:
+		return s.mqttInitiateMsgDelivery(c, pp, origin)
+
+	case 1:
+		// [MQTT-4.3.2-2]. Initiate onward delivery of the Application Message,
+		// Send PUBACK.
+		//
+		// The receiver is not required to complete delivery of the Application
+		// Message before sending the PUBACK. When its original sender receives
+		// the PUBACK packet, ownership of the Application Message is
+		// transferred to the receiver.
+		err := s.mqttInitiateMsgDelivery(c, pp, origin)
+		if err == nil {
+			c.mqttEnqueuePubResponse(mqttPacketPubAck, pp.pi, trace)
+		}
+		return err
+
+	case 2:
+		// [MQTT-4.3.3-2]. Method A, Store message, send PUBREC.
+		//
+		// The receiver is not required to complete delivery of the Application
+		// Message before sending the PUBREC or PUBCOMP. When its original
+		// sender receives the PUBREC packet, ownership of the Application
+		// Message is transferred to the receiver.
+		err := s.mqttStoreQoS2MsgOnce(c, pp)
+		if err == nil {
+			// A success PUBREC leaves the client's quota slot occupied until the
+			// matching PUBREL frees it. A DUP re-store returns nil too, so re-adding
+			// the PI is idempotent. Only tracked when a Receive Maximum applies.
+			// Spec5 [4.9].
+			if c.mqtt.recvMaxIn > 0 {
+				if c.mqtt.qos2InFlight == nil {
+					c.mqtt.qos2InFlight = make(map[uint16]struct{})
+				}
+				c.mqtt.qos2InFlight[pp.pi] = struct{}{}
+			}
+			c.mqttEnqueuePubResponse(mqttPacketPubRec, pp.pi, trace)
+		}
+		return err
+
+	default:
+		return fmt.Errorf("unreachable: invalid QoS in mqttProcessPub: %v", qos)
+	}
+}
+
+// mqttStoredMsgTTL returns the JetStream per-message TTL to attach to pp's
+// stored copy: its MQTT 5.0 Message Expiry Interval, or 0 in degraded mode
+// (the messages stream refused AllowMsgTTL and would reject the header).
+func (c *client) mqttStoredMsgTTL(pp *mqttPublish) uint32 {
+	if asm := c.mqtt.asm; asm != nil && asm.msgsStreamNoTTL {
+		return 0
+	}
+	return mqttMessageExpiryTTL(pp.props)
+}
+
+func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, origin string) error {
+	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, origin)
+}
+
+// mqttInitiateMsgDeliveryJSA is mqttInitiateMsgDelivery with an explicit
+// JetStream access handle for the QoS1/2 store step, instead of taking it from
+// c.mqtt.sess. This lets a delayed Will (MQTT 5.0 Will Delay Interval,
+// [MQTT-3.1.2-8]) be published after its originating client is gone, using the
+// account's internal client and JSA.
+//
+// origin is the authenticated No Local origin marker stamped for the No Local
+// option, passed explicitly so it does not depend on which client (real or
+// internal) drives delivery: a normal PUBLISH passes c.mqttStampedOrigin(subj),
+// while a Will is server-originated and passes _EMPTY_. Spec5 [3.8.3.1].
+func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, origin string) error {
+	// A stored (QoS 1/2) PUBLISH carrying an MQTT 5.0 Message Expiry Interval is
+	// given a matching JetStream per-message TTL so it is dropped from the
+	// delivery stream once its lifetime elapses. Spec5 [3.3.2.3.3]. Degraded
+	// mode drops the header; delivery-side expiry checks still apply.
+	//
+	// pp.flags still carries the original RETAIN flag here (it is cleared later,
+	// during fan-out); record it for the Retain As Published option when v5 is
+	// enabled. Spec5 [3.8.3.1].
+	retained := c.mqttOriginRetained(pp)
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin, retained)
+
+	// Set the client's pubarg for processing.
+	c.pa.subject = pp.subject
+	c.pa.mapped = pp.mapped
+	c.pa.reply = nil
+	c.pa.hdr = headerLen
+	c.pa.hdb = []byte(strconv.FormatInt(int64(c.pa.hdr), 10))
+	c.pa.size = len(natsMsg)
+	c.pa.szb = []byte(strconv.FormatInt(int64(c.pa.size), 10))
+	// Expose the resolved No Local origin so mqttHandlePubRetain (invoked inside
+	// processInboundClientMsg for a retained PUBLISH) stamps the stored copy with
+	// the same value as the live delivery header. Spec5 [3.8.3.1].
+	c.mqtt.pubOrigin = origin
+	defer func() {
+		c.pa.subject = nil
+		c.pa.mapped = nil
+		c.pa.reply = nil
+		c.pa.hdr = -1
+		c.pa.hdb = nil
+		c.pa.size = 0
+		c.pa.szb = nil
+		c.mqtt.pubOrigin = _EMPTY_
+	}()
+
+	_, permIssue := c.processInboundClientMsg(natsMsg)
+	if permIssue {
+		return nil
+	}
+
+	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
+	// JetStream under "$MQTT.msgs.<delivery-subject>"
+	if qos := mqttGetQoS(pp.flags); qos == 0 {
+		return nil
+	}
+
+	// We need to call flushClients now since this we may have called c.addToPCD
+	// with destination clients (possibly a route). Without calling flushClients
+	// the following call may then be stuck waiting for a reply that may never
+	// come because the destination is not flushed (due to c.out.fsp > 0,
+	// see addToPCD and writeLoop for details).
+	c.flushClients(0)
+
+	// Wait out any SUBSCRIBE currently being processed in this account before
+	// storing: $MQTT_msgs uses interest-based retention, and a message stored
+	// before a racing SUBSCRIBE's consumer registers interest would be
+	// discarded outright — permanently invisible to the new subscription. See
+	// mqttSubsBarrier.
+	jsa.subsBarrier.wait()
+
+	_, err := jsa.storeMsg(mqttStreamSubjectPrefix+string(c.pa.subject), headerLen, natsMsg)
+
+	return err
+}
+
+var mqttMaxMsgErrPattern = fmt.Sprintf("%s (%v)", ErrMaxMsgsPerSubject.Error(), JSStreamStoreFailedF)
+
+func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
+	// `true` means encode the MQTT PUBLISH packet in the NATS message header. No
+	// TTL here: this is the QoS2 dedup hold stream (no AllowMsgTTL); the expiry
+	// TTL is applied when the message is moved to the delivery stream on PUBREL.
+	// The original RETAIN flag is recorded so Retain As Published survives the
+	// hold and is restored on PUBREL. Spec5 [3.8.3.1].
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_, c.mqttOriginRetained(pp))
+
+	// Do not broadcast the message until it has been deduplicated and released
+	// by the sender. Instead store this QoS2 message as
+	// "$MQTT.qos2.<client-id>.<PI>". If the message is a duplicate, we get back
+	// a ErrMaxMsgsPerSubject, otherwise it does not change the flow, still need
+	// to send a PUBREC back to the client. The original subject (translated
+	// from MQTT topic) is included in the NATS header of the stored message to
+	// use for latter delivery.
+	_, err := c.mqtt.sess.jsa.storeMsg(c.mqttQoS2InternalSubject(pp.pi), headerLen, natsMsg)
+
+	// TODO: would prefer a more robust and performant way of checking the
+	// error, but it comes back wrapped as an API result.
+	if err != nil &&
+		(isErrorOtherThan(err, JSStreamStoreFailedF) || err.Error() != mqttMaxMsgErrPattern) {
+		return err
+	}
+
+	return nil
+}
+
+func (c *client) mqttQoS2InternalSubject(pi uint16) string {
+	// Hash the client ID into a NATS-safe token (as sessions do): the raw client
+	// ID may contain characters invalid in a NATS subject now that arbitrary
+	// UTF-8 client IDs are accepted. mqtt-nats-bridge divergence from upstream.
+	return mqttQoS2IncomingMsgsStreamSubjectPrefix + getHash(c.mqtt.cid) + "." + strconv.FormatUint(uint64(pi), 10)
+}
+
+// Process a PUBREL packet (QoS2, acting as Receiver).
+//
+// Runs from the client's readLoop.
+// No lock held on entry.
+func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
+	// Return the client's send-quota slot: any PUBCOMP (sent unconditionally
+	// below, with any reason including 0x92) frees it. A no-op for an unknown PI
+	// or one held on a previous connection. Spec5 [4.9].
+	delete(c.mqtt.qos2InFlight, pi)
+
+	// Once done with the processing, send a PUBCOMP back to the client.
+	reason := mqttReasonSuccess
+	var reasonStr string
+	defer func() { c.mqttEnqueuePubResponseReason(mqttPacketPubComp, pi, reason, reasonStr, trace) }()
+
+	// See if there is a message pending for this pi. All failures are treated
+	// as "not found".
+	asm := c.mqtt.asm
+	stored, _ := asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, c.mqttQoS2InternalSubject(pi))
+
+	if stored == nil {
+		// No message found: no session state for this PI, which a v5 PUBCOMP
+		// reports as 0x92. Spec5 [MQTT-4.3.3-1].
+		reason = mqttReasonPacketIDNotFound
+		reasonStr = "no message found for the packet identifier"
+		return nil
+	}
+	// Best attempt to delete the message from the QoS2 stream.
+	asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, stored.Sequence, true)
+
+	// only MQTT QoS2 messages should be here, and they must have a subject.
+	h := mqttParsePublishNATSHeader(stored.Header)
+	if h == nil || h.qos != 2 || len(h.subject) == 0 {
+		return errors.New("invalid message in QoS2 PUBREL stream")
+	}
+
+	pp := &mqttPublish{
+		topic:   natsSubjectToMQTTTopic(h.subject),
+		subject: h.subject,
+		mapped:  h.mapped,
+		msg:     stored.Data,
+		sz:      len(stored.Data),
+		pi:      pi,
+		flags:   h.qos << 1,
+		props:   h.props, // forward v5 properties captured at store time
+	}
+	// Restore the original RETAIN flag recorded at store time so Retain As
+	// Published works for a QoS2 retained publish released on PUBREL. Spec5
+	// [3.8.3.1].
+	if h.retained {
+		pp.flags |= mqttPubFlagRetain
+	}
+
+	// MQTT 5.0 Message Expiry Interval: a QoS2 message ages while it waits in the
+	// server for the PUBREL. Measure the interval from the original PUBLISH
+	// receipt (the hold-stream store time) rather than restarting it here: age
+	// the carried interval by the time already elapsed, and drop the message if
+	// it has expired before release. Spec5 [3.3.2.3.3].
+	var expired bool
+	if pp.props, expired = mqttForwardExpiry(pp.props, stored.Time.UnixNano()); expired {
+		return nil
+	}
+
+	return s.mqttInitiateMsgDelivery(c, pp, c.mqttStampedOrigin(string(pp.subject), pp.msg))
+}
+
+// Invoked when processing an inbound client message. If the "retain" flag is
+// set, the message is stored so it can be later resent to (re)starting
+// subscriptions that match the subject.
+//
+// Invoked from the MQTT publisher's readLoop. No client lock is held on entry.
+func (c *client) mqttHandlePubRetain() {
+	pp := c.mqtt.pp
+	retainMQTT := mqttIsRetained(pp.flags)
+	isBirth, _, isCertificate := sparkbParseBirthDeathTopic(pp.topic)
+	retainSparkbBirth := isBirth && !isCertificate
+
+	// [tck-id-topics-nbirth-mqtt] NBIRTH messages MUST be published with MQTT
+	// QoS equal to 0 and retain equal to false.
+	//
+	// [tck-id-conformance-mqtt-aware-nbirth-mqtt-retain] A Sparkplug Aware MQTT
+	// Server MUST make NBIRTH messages available on the topic:
+	// $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id with the
+	// MQTT retain flag set to true.
+	if retainMQTT == retainSparkbBirth {
+		// (retainSparkbBirth && retainMQTT) : not valid, so ignore altogether.
+		// (!retainSparkbBirth && !retainMQTT) : nothing to do.
+		return
+	}
+
+	asm := c.mqtt.asm
+	key := string(pp.subject)
+
+	// Always clear the retain flag to deliver a normal published message.
+	defer func() {
+		pp.flags &= ^mqttPubFlagRetain
+	}()
+
+	// Spec [MQTT-3.3.1-11]. Payload of size 0 removes the retained message, but
+	// should still be delivered as a normal message.
+	//
+	// We used to delete the message here from our map, the stream, and notify
+	// the network about the delete. We no longer do that. Instead, we store
+	// the message with an empty body. When servers will get the empty body
+	// in processRetainedMsg, then will remove the message from their map. This
+	// effectively serializes all add/remove of retained messages without the
+	// need for "network" notifications about deletes (we still support that
+	// for backward compatibility but will be pulled in future releases).
+
+	rm := &mqttRetainedMsg{
+		Origin: asm.jsa.id,
+		Msg:    pp.msg, // will copy these bytes later as we process rm.
+		Flags:  pp.flags,
+		Source: c.opts.Username,
+		Props:  pp.props, // v5 properties to replay to subscribers
+		// Same No Local origin the live delivery used (empty for a Will), so
+		// retained replay is suppressed under No Local consistently. Spec5 [3.8.3.1].
+		SessionHash: c.mqtt.pubOrigin,
+	}
+
+	// MQTT 5.0 Message Expiry Interval on a retained message: record the absolute
+	// deadline so the remaining interval can be recomputed on replay and the
+	// stored message dropped once it expires. A present interval of 0 means the
+	// message expires immediately, so the deadline is "now" (distinct from an
+	// absent interval, which never expires and leaves the deadline zero). Spec5
+	// [3.3.2.3.3].
+	if me, ok := mqttMessageExpiry(pp.props); ok {
+		rm.expires = time.Now().Add(time.Duration(me) * time.Second)
+	}
+
+	if retainSparkbBirth {
+		// [tck-id-conformance-mqtt-aware-store] A Sparkplug Aware MQTT Server
+		// MUST store NBIRTH and DBIRTH messages as they pass through the MQTT
+		// Server.
+		//
+		// [tck-id-conformance-mqtt-aware-nbirth-mqtt-topic]. A Sparkplug Aware
+		// MQTT Server MUST make NBIRTH messages available on a topic of the
+		// form: $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id
+		//
+		// [tck-id-conformance-mqtt-aware-dbirth-mqtt-topic] A Sparkplug Aware
+		// MQTT Server MUST make DBIRTH messages available on a topic of the
+		// form:
+		// $sparkplug/certificates/namespace/group_id/DBIRTH/edge_node_id/device_id
+		topic := append(sparkbCertificatesTopicPrefix, pp.topic...)
+		subject, _ := mqttTopicToNATSPubSubject(topic)
+		rm.Topic = string(topic)
+		rm.Subject = string(subject)
+
+		// will use to save the retained message.
+		key = string(subject)
+
+		// Store the retained message with the RETAIN flag set.
+		rm.Flags |= mqttPubFlagRetain
+
+		if pp.sz > 0 {
+			// Copy the payload out of pp since we will be sending the message
+			// asynchronously.
+			msg := make([]byte, pp.sz)
+			copy(msg, pp.msg[:pp.sz])
+			asm.jsa.sendMsg(key, msg)
+		}
+
+	} else { // isRetained
+		// Spec [MQTT-3.3.1-5]. Store the retained message with its QoS.
+		//
+		// When coming from a publish protocol, `pp` is referencing a stack
+		// variable that itself possibly references the read buffer.
+		rm.Topic = string(pp.topic)
+	}
+
+	// Set the key to the subject of the message for retained, or the composed
+	// $sparkplug subject for sparkB.
+	rm.Subject = key
+	rmBytes, hdr := mqttEncodeRetainedMessageTTL(rm, !asm.rmsgsStreamNoTTL) // will copy the payload bytes
+	resp, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, hdr, rmBytes)
+	if err != nil {
+		c.mu.Lock()
+		acc := c.acc
+		c.mu.Unlock()
+		c.Errorf("unable to store retained message for account %q, subject %q: %v",
+			acc.GetName(), key, err)
+		return
+	}
+
+	// Seed the local retained index synchronously with the just-stored message.
+	// The index (as.retmsgs / rmsCache) is otherwise only populated by
+	// processRetainedMsg reacting to the retained-messages stream — a real NATS
+	// round trip in this standalone broker (unlike upstream's in-process hop),
+	// so a SUBSCRIBE arriving right after this PUBLISH could miss the retained
+	// message. Seeding here makes retained-then-subscribe deterministic on the
+	// publishing node; the later processRetainedMsg callback re-applies the same
+	// add/remove idempotently. An empty body is a delete tombstone [MQTT-3.3.1-11].
+	if len(rm.Msg) == 0 {
+		asm.removeRetainedMsg(key, 0)
+	} else {
+		asm.addRetainedMsg(key, resp.Sequence, rm)
+	}
+}
+
+// After a config reload, it is possible that the source of a publish retained
+// message is no longer allowed to publish on the given topic. If that is the
+// case, the retained message is removed from the map and will no longer be
+// sent to (re)starting subscriptions.
+//
+// Server lock MUST NOT be held on entry.
+func (s *Server) mqttCheckPubRetainedPerms() {
+	sm := &s.mqtt.sessmgr
+	sm.mu.RLock()
+	done := len(sm.sessions) == 0
+	sm.mu.RUnlock()
+
+	if done {
+		return
+	}
+
+	s.mu.Lock()
+	users := make(map[string]*User, len(s.users))
+	for un, u := range s.users {
+		users[un] = u
+	}
+	s.mu.Unlock()
+
+	// First get a list of all of the sessions.
+	sm.mu.RLock()
+	asms := make([]*mqttAccountSessionManager, 0, len(sm.sessions))
+	for _, asm := range sm.sessions {
+		asms = append(asms, asm)
+	}
+	sm.mu.RUnlock()
+
+	// For each session we will obtain a list of retained messages.
+	var _rms [128]uint64
+	rms := _rms[:0]
+	for _, asm := range asms {
+		// Get all of the retained messages. Then we will sort them so
+		// that they are in sequence order, which should help the file
+		// store to not have to load out-of-order blocks so often.
+		asm.mu.RLock()
+		rms = rms[:0] // reuse slice
+		// Copy the sequence out of the tree. The tree entry itself can be
+		// updated concurrently by addRetainedMsg() after we release the lock,
+		// so keeping a pointer here would race with the later sort.
+		asm.retmsgs.IterOrdered(func(_ []byte, rm *mqttRetainedMsgRef) bool {
+			rms = append(rms, rm.sseq)
+			return true
+		})
+		jsaID := asm.jsa.id
+		asm.mu.RUnlock()
+		slices.Sort(rms)
+
+		perms := map[string]*mqttPerm{}
+		for _, rf := range rms {
+			jsm, err := asm.jsa.loadMsg(mqttRetainedMsgsStreamName, rf)
+			if err != nil || jsm == nil {
+				continue
+			}
+			rm, err := mqttDecodeRetainedMessage(jsm.Subject, jsm.Header, jsm.Data)
+			if err != nil {
+				continue
+			}
+			// We deal only with messages that have a source (the username that produced
+			// this message) and were produced on this server.
+			if rm.Source == _EMPTY_ || rm.Origin != jsaID {
+				continue
+			}
+			// Lookup source from global users.
+			u := users[rm.Source]
+			if u != nil {
+				p, ok := perms[rm.Source]
+				if !ok {
+					p = generatePubPerms(u.Permissions)
+					perms[rm.Source] = p // possibly nil
+				}
+				// If there is permission and no longer allowed to publish in
+				// the subject, remove the publish retained message from the map.
+				if p != nil && !pubAllowed(p, rm.Subject) {
+					u = nil
+				}
+			}
+
+			// Not present or permissions have changed such that the source can't
+			// publish on that subject anymore: delete this retained message.
+			if u == nil {
+				// Set the payload to empty to notify that we are deleting this
+				// retained message. We will send this message async.
+				rm.Msg = nil
+				rmBytes, hdrLen := mqttEncodeRetainedMessage(rm)
+				asm.jsa.storeMsgNoWait(mqttRetainedMsgsStreamSubject+rm.Subject, hdrLen, rmBytes)
+			}
+		}
+	}
+}
+
+// Helper to generate only pub permissions from a Permissions object
+type mqttPerm struct {
+	allow *gsl.SimpleSublist
+	deny  *gsl.SimpleSublist
+}
+
+func generatePubPerms(perms *Permissions) *mqttPerm {
+	// If given permissions is `nil`, then it means that permissions block
+	// has been removed (so the user is now allowed to publish on everything)
+	// or was never there in the first place. Returning `nil` will let the
+	// caller know that there are no permissions to enforce.
+	if perms == nil {
+		return nil
+	}
+	var p *mqttPerm
+	if perms.Publish.Allow != nil {
+		p = &mqttPerm{}
+		p.allow = gsl.NewSimpleSublist()
+		for _, pubSubject := range perms.Publish.Allow {
+			_ = p.allow.Insert(pubSubject, struct{}{})
+		}
+	}
+	if len(perms.Publish.Deny) > 0 {
+		if p == nil {
+			p = &mqttPerm{}
+		}
+		p.deny = gsl.NewSimpleSublist()
+		for _, pubSubject := range perms.Publish.Deny {
+			_ = p.deny.Insert(pubSubject, struct{}{})
+		}
+	}
+	return p
+}
+
+// Helper that checks if given `perms` allow to publish on the given `subject`
+func pubAllowed(perms *mqttPerm, subject string) bool {
+	if perms == nil {
+		return true
+	}
+	allowed := true
+	if perms.allow != nil {
+		allowed = perms.allow.HasInterest(subject)
+	}
+	// If we have a deny list and are currently allowed, check that as well.
+	if allowed && perms.deny != nil {
+		allowed = !perms.deny.HasInterest(subject)
+	}
+	return allowed
+}
+
+func (c *client) mqttEnqueuePubResponse(packetType byte, pi uint16, trace bool) {
+	c.mqttEnqueuePubResponseReason(packetType, pi, mqttReasonSuccess, _EMPTY_, trace)
+}
+
+func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason byte, reasonStr string, trace bool) {
+	proto := [5]byte{packetType, 0x2, 0, 0, 0}
+	proto[2] = byte(pi >> 8)
+	proto[3] = byte(pi)
+	n := 4
+	// A non-success reason needs the longer v5 form: PI + reason code,
+	// properties omitted. Spec5 [3.4.2.1]. 3.1.1 has no reason codes.
+	if reason != mqttReasonSuccess && c.mqtt.proto == mqttProtoLevel5 {
+		proto[1] = 0x3
+		proto[4] = reason
+		n = 5
+	}
+
+	// Bits 3,2,1 and 0 of the fixed header in the PUBREL Control Packet are
+	// reserved and MUST be set to 0,0,1 and 0 respectively. The Server MUST treat
+	// any other value as malformed and close the Network Connection [MQTT-3.6.1-1].
+	if packetType == mqttPacketPubRel {
+		proto[0] |= 0x2
+	}
+
+	// A failure reason may carry a Reason String when the client permits it and
+	// it fits; otherwise fall back to the fixed short form. Spec5 [3.4.2.2].
+	buf := proto[:n]
+	if n == 5 {
+		if rs := c.mqttReasonString(packetType, reasonStr); rs != _EMPTY_ {
+			w := newMQTTWriter(0)
+			w.WriteByte(proto[0])
+			var vh mqttWriter
+			vh.WriteUint16(pi)
+			vh.WriteByte(reason)
+			vh.writeProperties(&mqttProperties{reasonString: rs})
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			if c.mqttFitsClientMax(w.Len()) {
+				buf = w.Bytes()
+			}
+		}
+	}
+
+	// Unreachable in practice: a connected client's Maximum Packet Size is bounded
+	// below by its success CONNACK (~15+ bytes) so a 4/5-byte response always fits.
+	// The check keeps every enqueue site provably compliant. [MQTT-3.1.2-24].
+	if !c.mqttEnqueueFittingProto(buf) {
+		return
+	}
+
+	if trace {
+		name := "(???)"
+		switch packetType {
+		case mqttPacketPubAck:
+			name = "PUBACK"
+		case mqttPacketPubRec:
+			name = "PUBREC"
+		case mqttPacketPubRel:
+			name = "PUBREL"
+		case mqttPacketPubComp:
+			name = "PUBCOMP"
+		}
+		if n == 5 {
+			c.traceOutOp(name, []byte(fmt.Sprintf("pi=%v rc=%v", pi, reason)))
+		} else {
+			c.traceOutOp(name, []byte(fmt.Sprintf("pi=%v", pi)))
+		}
+	}
+}
+
+func mqttParsePIPacket(r *mqttReader) (uint16, error) {
+	pi, err := r.readUint16("packet identifier")
+	if err != nil {
+		return 0, err
+	}
+	if pi == 0 {
+		return 0, errMQTTPacketIdentifierIsZero
+	}
+	return pi, nil
+}
+
+// mqttParsePubResponsePacket parses an inbound PUBACK/PUBREC/PUBREL/PUBCOMP. In
+// MQTT 5.0 these packets may carry a reason code and a properties block after
+// the packet identifier. The reason code is returned so the caller can honor
+// failure codes (e.g. a PUBREC >= 0x80 must not be answered with a PUBREL,
+// Spec5 [4.3.3]); an absent reason code (short form, or 3.1.1) is Success
+// (0x00). It consumes exactly pl bytes so the reader is positioned at the start
+// of the next packet. Spec5 [3.4.2.1] and following.
+func mqttParsePubResponsePacket(r *mqttReader, proto byte, pl int) (uint16, byte, error) {
+	end := r.pos + pl
+	pi, err := mqttParsePIPacket(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	reason := mqttReasonSuccess
+	if proto == mqttProtoLevel5 {
+		// Optional reason code (1 byte).
+		if r.pos < end {
+			if reason, err = r.readByte("reason code"); err != nil {
+				return 0, 0, err
+			}
+		}
+		// Optional properties. The allowed property set (Reason String, User
+		// Property) is identical across the four pub-response packets, so the
+		// PUBACK context is sufficient for validation.
+		if r.pos < end {
+			if _, err = r.readProperties(mqttPacketPubAck); err != nil {
+				return 0, 0, err
+			}
+		}
+	}
+	if r.pos != end {
+		return 0, 0, fmt.Errorf("%w: invalid remaining length %d for pub-response packet", errMQTTMalformedPacket, pl)
+	}
+	return pi, reason, nil
+}
+
+// Process a PUBACK (QoS1) or a PUBREC (QoS2) packet, acting as Sender. Set
+// isPubRec to false to process as a PUBACK. reason is the MQTT 5.0 reason code
+// (Success for 3.1.1 or the short form). A PUBREC carrying a failure code
+// (>= 0x80) means the receiver rejected the QoS2 message: per Spec5 [4.3.3] the
+// sender MUST NOT send a PUBREL and treats the message as unacknowledged/done,
+// so we release the packet identifier and stop redelivery without moving it
+// into the PUBREL (awaiting-PUBCOMP) state.
+//
+// Runs from the client's readLoop. No lock held on entry.
+func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byte) (err error) {
+	sess := c.mqtt.sess
+	if sess == nil {
+		return errMQTTInvalidSession
+	}
+
+	pubRecFailed := isPubRec && reason >= 0x80
+
+	var jsAckSubject string
+	sess.mu.Lock()
+	// Must be the same client, and the session must have been setup for QoS2.
+	if sess.c != c {
+		sess.mu.Unlock()
+		return errMQTTInvalidSession
+	}
+	if isPubRec && !pubRecFailed {
+		// The JS ACK subject for the PUBREL will be filled in at the delivery
+		// attempt.
+		sess.trackAsPubRel(pi, _EMPTY_)
+	}
+	jsAckSubject = sess.untrackPublish(pi)
+	// PUBACK / failed PUBREC freed an in-flight slot (a successful PUBREC is
+	// net-zero under a Receive Maximum and yields no NAKs): release withheld
+	// deliveries promptly. Spec5 [4.9].
+	deferredNaks := sess.deferredNaksLocked()
+	sess.mu.Unlock()
+
+	if isPubRec && !pubRecFailed {
+		natsMsg, headerLen := mqttNewDeliverablePubRel(pi)
+		_, err = sess.jsa.storeMsg(sess.pubRelSubject, headerLen, natsMsg)
+		if err != nil {
+			// Failure to send out PUBREL will terminate the connection.
+			return err
+		}
+	}
+
+	// Send the ack to JS to remove the pending message from the consumer. On a
+	// failed PUBREC this still applies: the receiver has rejected the message,
+	// so it must not be redelivered.
+	sess.jsa.sendAck(jsAckSubject)
+	for _, subj := range deferredNaks {
+		sess.jsa.sendMsg(subj, AckNak)
+	}
+	return nil
+}
+
+func (c *client) mqttProcessPubAck(pi uint16) error {
+	return c.mqttProcessPublishReceived(pi, false, mqttReasonSuccess)
+}
+
+func (c *client) mqttProcessPubRec(pi uint16, reason byte) error {
+	return c.mqttProcessPublishReceived(pi, true, reason)
+}
+
+// Runs from the client's readLoop. No lock held on entry.
+func (c *client) mqttProcessPubComp(pi uint16) {
+	sess := c.mqtt.sess
+	if sess == nil {
+		return
+	}
+
+	var jsAckSubject string
+	sess.mu.Lock()
+	if sess.c != c {
+		sess.mu.Unlock()
+		return
+	}
+	jsAckSubject = sess.untrackPubRel(pi)
+	deferredNaks := sess.deferredNaksLocked()
+	sess.mu.Unlock()
+
+	// Send the ack to JS to remove the pending message from the consumer.
+	sess.jsa.sendAck(jsAckSubject)
+	for _, subj := range deferredNaks {
+		sess.jsa.sendMsg(subj, AckNak)
+	}
+}
+
+// Return the QoS from the given PUBLISH protocol's flags
+func mqttGetQoS(flags byte) byte {
+	return flags & mqttPubFlagQoS >> 1
+}
+
+func mqttIsRetained(flags byte) bool {
+	return flags&mqttPubFlagRetain != 0
+}
+
+func sparkbParseBirthDeathTopic(topic []byte) (isBirth, isDeath, isCertificate bool) {
+	if bytes.HasPrefix(topic, sparkbCertificatesTopicPrefix) {
+		isCertificate = true
+		topic = topic[len(sparkbCertificatesTopicPrefix):]
+	}
+	if !bytes.HasPrefix(topic, sparkbNamespaceTopicPrefix) {
+		return false, false, false
+	}
+	topic = topic[len(sparkbNamespaceTopicPrefix):]
+
+	parts := bytes.Split(topic, []byte{'/'})
+	if len(parts) < 3 || len(parts) > 4 {
+		return false, false, false
+	}
+	typ := bytesToString(parts[1])
+	switch typ {
+	case sparkbNBIRTH, sparkbDBIRTH:
+		isBirth = true
+	case sparkbNDEATH, sparkbDDEATH:
+		isDeath = true
+	default:
+		return false, false, false
+	}
+	return isBirth, isDeath, isCertificate
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// SUBSCRIBE related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (c *client) mqttParseSubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFilter, error) {
+	return c.mqttParseSubsOrUnsubs(r, b, pl, true)
+}
+
+func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) (uint16, []*mqttFilter, error) {
+	var expectedFlag byte
+	var action string
+	if sub {
+		expectedFlag = mqttSubscribeFlags
+	} else {
+		expectedFlag = mqttUnsubscribeFlags
+		action = "un"
+	}
+	// Spec [MQTT-3.8.1-1], [MQTT-3.10.1-1]
+	if rf := b & 0xf; rf != expectedFlag {
+		return 0, nil, fmt.Errorf("%w: wrong %ssubscribe reserved flags: %x", errMQTTMalformedPacket, action, rf)
+	}
+	pi, err := mqttParsePIPacket(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	// end is the absolute end of this packet. It is unaffected by the v5
+	// properties block below, which only advances r.pos within [r.pos, end).
+	end := r.pos + (pl - 2)
+	// MQTT 5.0: a properties block follows the packet identifier in both
+	// SUBSCRIBE and UNSUBSCRIBE. Spec5 [3.8.2.1], [3.10.2.1].
+	// subID is the packet's single v5 Subscription Identifier (0 = none); it
+	// applies to every filter the packet carries. Spec5 [3.8.2.1.2].
+	var subID int
+	if c.mqtt.proto == mqttProtoLevel5 {
+		ctx := mqttPacketSub
+		if !sub {
+			ctx = mqttPacketUnsub
+		}
+		props, perr := r.readProperties(ctx)
+		if perr != nil {
+			return 0, nil, perr
+		}
+		// readProperties accepts repeated Subscription Identifiers because a
+		// delivered PUBLISH may legitimately carry several; in a SUBSCRIBE more
+		// than one is a Protocol Error. A value of 0 is already rejected there.
+		// Spec5 [MQTT-3.8.2.1.2].
+		if sub && props != nil {
+			if len(props.subIDs) > 1 {
+				return 0, nil, fmt.Errorf("%w: more than one subscription identifier in SUBSCRIBE", errMQTTProtocolError)
+			}
+			if len(props.subIDs) == 1 {
+				subID = props.subIDs[0]
+			}
+		}
+	}
+	var filters []*mqttFilter
+	for r.pos < end {
+		// Don't make a copy now because, this will happen during conversion
+		// or when processing the sub.
+		topic, err := r.readBytes("topic filter", false)
+		if err != nil {
+			return 0, nil, err
+		}
+		if len(topic) == 0 {
+			return 0, nil, errMQTTTopicFilterCannotBeEmpty
+		}
+		// Spec [MQTT-3.8.3-1], [MQTT-3.10.3-1]
+		if err := mqttValidateTopic(topic, "topic filter"); err != nil {
+			return 0, nil, err
+		}
+		// MQTT 5.0 Shared Subscription: "$share/{ShareName}/{filter}". v5 only;
+		// for 3.1.1 "$share/..." has no special meaning and is treated as a
+		// literal topic filter. Detect and strip the prefix + ShareName before
+		// conversion so all downstream per-subject logic sees only the underlying
+		// filter. Applies to both SUBSCRIBE and UNSUBSCRIBE. Spec5 [4.8.2].
+		var shared bool
+		var shareName []byte
+		innerTopic := topic
+		if c.mqtt.proto == mqttProtoLevel5 && bytes.HasPrefix(topic, mqttSharedSubPrefix) {
+			rest := topic[len(mqttSharedSubPrefix):]
+			idx := bytes.IndexByte(rest, mqttTopicLevelSep)
+			// ShareName must be non-empty, must not contain '+' or '#', and must
+			// be followed by a non-empty topic filter. Any violation is a
+			// Malformed Packet (fail the whole packet). Spec5 [MQTT-4.8.2-1],
+			// [MQTT-4.8.2-2].
+			if idx <= 0 || idx == len(rest)-1 ||
+				bytes.IndexByte(rest[:idx], mqttSingleLevelWC) >= 0 ||
+				bytes.IndexByte(rest[:idx], mqttMultiLevelWC) >= 0 {
+				return 0, nil, fmt.Errorf("%w: %q", errMQTTMalformedSharedSub, topic)
+			}
+			shared = true
+			shareName = rest[:idx]
+			innerTopic = rest[idx+1:]
+		}
+		var qos, reason byte
+		var reasonStr string
+		var retainHandling byte
+		var noLocal bool
+		var retainAsPublished bool
+		// We are going to report if we had an error during the conversion,
+		// but we don't fail the parsing. When processing the sub, we will
+		// have an error then, and the processing of subs code will send
+		// the proper mqttSubAckFailure flag for this given subscription.
+		filter, err := mqttFilterToNATSSubject(innerTopic)
+		if err != nil {
+			c.Errorf("invalid topic %q: %v", topic, err)
+			reason = mqttSubAckFailure
+			reasonStr = err.Error()
+		}
+		if sub {
+			if c.mqtt.proto == mqttProtoLevel5 {
+				// v5 replaces the single QoS byte with a Subscription Options
+				// byte: bits 0-1 QoS, 2 No Local, 3 Retain As Published, 4-5
+				// Retain Handling, 6-7 reserved. Spec5 [3.8.3.1].
+				var opts byte
+				opts, err = r.readByte("subscription options")
+				if err != nil {
+					return 0, nil, err
+				}
+				// Reserved bits set is a Malformed Packet [MQTT-3-8.3-5].
+				if opts&0xC0 != 0 {
+					return 0, nil, fmt.Errorf("%w: reserved bits set in options byte 0x%x", errMQTTMalformedSubOption, opts)
+				}
+				retainHandling = (opts >> 4) & 0x03
+				// Retain Handling 3 is reserved; sending it is a Protocol Error.
+				// Checked before the No Local / Retain As Published rejection so a
+				// reserved value is always classified as a Protocol Error, even
+				// when those bits are also set. Spec5 [3.8.3.1].
+				if retainHandling == 3 {
+					return 0, nil, fmt.Errorf("%w: retain handling value 3 is reserved", errMQTTProtocolError)
+				}
+				noLocal = opts&0x04 != 0
+				retainAsPublished = opts&0x08 != 0
+				// No Local on a Shared Subscription is a Protocol Error
+				// [MQTT-3.8.3-4]: fail the whole packet.
+				if noLocal && shared {
+					return 0, nil, fmt.Errorf("%w: No Local set on a shared subscription", errMQTTProtocolError)
+				}
+				qos = opts & 0x03
+			} else {
+				qos, err = r.readByte("QoS")
+				if err != nil {
+					return 0, nil, err
+				}
+			}
+			// Spec [MQTT-3-8.3-4].
+			if qos > 2 {
+				return 0, nil, fmt.Errorf("%w: subscribe QoS value must be 0, 1 or 2, got %v", errMQTTMalformedSubOption, qos)
+			}
+		}
+		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, subID: subID, reason: reason, reasonStr: reasonStr, shared: shared, group: string(shareName)}
+		filters = append(filters, f)
+	}
+	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
+	if len(filters) == 0 {
+		return 0, nil, fmt.Errorf("%w: %ssubscribe protocol must contain at least 1 topic filter", errMQTTProtocolError, action)
+	}
+	return pi, filters, nil
+}
+
+func mqttSubscribeTrace(pi uint16, filters []*mqttFilter) string {
+	var sep string
+	sb := &strings.Builder{}
+	sb.WriteString("[")
+	for i, f := range filters {
+		sb.WriteString(sep)
+		sb.Write(f.ttopic)
+		sb.WriteString(" (")
+		sb.WriteString(f.filter)
+		sb.WriteString(") QoS=")
+		sb.WriteString(fmt.Sprintf("%v", f.qos))
+		if i == 0 {
+			sep = ", "
+		}
+	}
+	sb.WriteString(fmt.Sprintf("] pi=%v", pi))
+	return sb.String()
+}
+
+// For a MQTT QoS0 subscription, we create a single NATS subscription on the
+// actual subject, for instance "foo.bar".
+//
+// For a MQTT QoS1+ subscription, we create 2 subscriptions, one on "foo.bar"
+// (as for QoS0, but sub.mqtt.qos will be 1 or 2), and one on the subject
+// "$MQTT.sub.<uid>" which is the delivery subject of the JS durable consumer
+// with the filter subject "$MQTT.msgs.foo.bar".
+//
+// This callback delivers messages to the client as QoS0 messages, either
+// because: (a) they have been produced as MQTT QoS0 messages (and therefore
+// only this callback can receive them); (b) they are MQTT QoS1+ published
+// messages but this callback is for a subscription that is QoS0; or (c) the
+// published messages come from (other) NATS publishers on the subject.
+//
+// This callback must reject a message if it is known to be a QoS1+ published
+// message and this is the callback for a QoS1+ subscription because in that
+// case, it will be handled by the other callback. This avoid getting duplicate
+// deliveries.
+func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
+	if pc.kind == JETSTREAM && len(reply) > 0 && strings.HasPrefix(reply, jsAckPre) {
+		return
+	}
+
+	// This is the client associated with the subscription.
+	cc := sub.client
+
+	// This is immutable
+	sess := cc.mqtt.sess
+
+	// Lock here, otherwise we may be called with sub.mqtt == nil. Ignore
+	// wildcard subscriptions if this subject starts with '$', per Spec
+	// [MQTT-4.7.2-1].
+	sess.subsMu.RLock()
+	subQoS := sub.mqtt.qos
+	noLocal := sub.mqtt.noLocal
+	retainAsPublished := sub.mqtt.retainAsPublished
+	subID := sub.mqtt.subID
+	// For a shared subscription the raw-subject sub must deliver only
+	// QoS0-published messages; stored (QoS 1/2 published) messages arrive through
+	// the shared JS consumer instead, so treat shared like a QoS1+ sub below when
+	// deciding to defer to the QoS 1/2 callback. Spec5 [4.8.2].
+	shared := sub.mqtt.shared
+	ignore := mqttMustIgnoreForReservedSub(sub, subject)
+	sess.subsMu.RUnlock()
+
+	if ignore {
+		return
+	}
+
+	hdr, msg := pc.msgParts(rmsg)
+	var topic []byte
+	var props []byte
+	// originHash identifies the publishing session for the No Local option, set
+	// only when the publisher is a local MQTT client on this server. It is never
+	// taken from the message header on this direct path (see the non-MQTT branch
+	// below for why a stamped header is not trusted here). Spec5 [3.8.3.1].
+	var originHash string
+	// origRetain is the original RETAIN flag, for the Retain As Published option.
+	// It always comes from the stamped Nmqtt-Ret header (the publisher's live
+	// pp.flags RETAIN is cleared before fan-out); parsed only when the sub wants
+	// it, since a retained publish is uncommon.
+	var origRetain bool
+	if pc.isMqtt() {
+		// This is an MQTT publisher directly connected to this server.
+
+		// Check the subscription's QoS. If the message was published with a
+		// QoS>0 and the sub has the QoS>0 then the message will be delivered by
+		// mqttDeliverMsgCbQoS12.
+		msgQoS := mqttGetQoS(pc.mqtt.pp.flags)
+		if (subQoS > 0 || shared) && msgQoS > 0 {
+			return
+		}
+		topic = pc.mqtt.pp.topic
+		props = pc.mqtt.pp.props
+		// If the subject is different than the one in pp.subject, then some
+		// mapping/transform occurred and we need to recreate the topic.
+		if subject != bytesToString(pc.mqtt.pp.subject) {
+			topic = natsSubjectStrToMQTTTopic(subject)
+		}
+		if noLocal && pc.mqtt.sess != nil {
+			originHash = pc.mqtt.sess.idHash
+		}
+		if retainAsPublished {
+			if h := mqttParsePublishNATSHeader(hdr); h != nil {
+				origRetain = h.retained
+			}
+		}
+
+	} else {
+		// Non MQTT client, could be NATS publisher, or ROUTER, etc.. In the
+		// standalone broker this is also the path for a genuine local MQTT
+		// publisher: unlike upstream (where the MQTT connection is an in-process
+		// client and pc is that same object for a same-server delivery), every
+		// delivery here — including a client's own QoS0 publish echoed back to
+		// its own subscription — arrives over the real NATS wire through a
+		// synthetic per-subscription client (see (*client).processSub,
+		// shim_engine.go), so pc.isMqtt() never reports true for a live message.
+		h := mqttParsePublishNATSHeader(hdr)
+
+		// Check the subscription's QoS. If the message was published with a
+		// QoS>0 (in the header) and the sub has the QoS>0 then the message will
+		// be delivered by mqttDeliverMsgCbQoS12.
+		if (subQoS > 0 || shared) && h != nil && h.qos > 0 {
+			return
+		}
+
+		// No Local: same authenticated-marker check as mqttDeliverMsgCbQoS12. The
+		// stored/live origin is an HMAC over (publisher's idHash, subject,
+		// payload); recomputing it for the subscribing session and comparing
+		// proves self-authorship without trusting a client-forgeable header
+		// value directly. Spec5 [3.8.3.1].
+		if noLocal && h != nil {
+			expected := mqttOriginMarker(cc.srv.mqtt.originKey, sess.idHash, subject, msg)
+			if mqttNoLocalSuppress(true, string(h.origin), expected) {
+				return
+			}
+		}
+
+		// If size is more than what a MQTT client can handle, we should probably reject,
+		// for now just truncate.
+		if len(msg) > mqttMaxPayloadSize {
+			msg = msg[:mqttMaxPayloadSize]
+		}
+		topic = natsSubjectStrToMQTTTopic(subject)
+		if h != nil {
+			props = h.props
+			origRetain = h.retained
+		}
+	}
+
+	// No Local: drop a message published by this same session. Spec5 [3.8.3.1].
+	if mqttNoLocalSuppress(noLocal, originHash, sess.idHash) {
+		return
+	}
+
+	// MQTT 5.0 Message Expiry Interval of 0 expires the message immediately, so
+	// it must not reach any subscriber, whatever its protocol level. This live
+	// path otherwise waits ~0s, so no interval rewrite is needed. Spec5
+	// [3.3.2.3.3].
+	if len(props) > 0 {
+		if _, expired := mqttForwardExpiry(props, 0); expired {
+			return
+		}
+	}
+
+	// Message never has a packet identifier nor is marked as duplicate. A QoS0
+	// message dropped for exceeding the client's Maximum Packet Size needs no
+	// completion (it is not JetStream-backed here), so the result is ignored.
+	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPublished && origRetain, subID, topic, msg, props)
+}
+
+// This is the callback attached to a JS durable subscription for a MQTT QoS 1+
+// sub. Only JETSTREAM should be sending a message to this subject (the delivery
+// subject associated with the JS durable consumer), but in cluster mode, this
+// can be coming from a route, gw, etc... We make sure that if this is the case,
+// the message contains a NATS/MQTT header that indicates that this is a
+// published QoS1+ message.
+func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
+	// Message on foo.bar is stored under $MQTT.msgs.foo.bar, so the subject has to be
+	// at least as long as the stream subject prefix "$MQTT.msgs.", and after removing
+	// the prefix, has to be at least 1 character long.
+	if len(subject) < len(mqttStreamSubjectPrefix)+1 {
+		return
+	}
+
+	hdr, msg := pc.msgParts(rmsg)
+	h := mqttParsePublishNATSHeader(hdr)
+	if pc.kind != JETSTREAM && (h == nil || h.qos == 0) {
+		// MQTT QoS 0 messages must be ignored, they will be delivered by the
+		// other callback, the direct NATS subscription. All JETSTREAM messages
+		// will have the header.
+		return
+	}
+
+	// This is the client associated with the subscription.
+	cc := sub.client
+
+	// This is immutable
+	sess := cc.mqtt.sess
+
+	// We lock to check some of the subscription's fields and if we need to keep
+	// track of pending acks, etc. There is no need to acquire the subsMu RLock
+	// since sess.Lock is overarching for modifying subscriptions.
+	sess.mu.Lock()
+	if sess.c != cc || sub.mqtt == nil || sub.mqtt.closed {
+		sess.mu.Unlock()
+		return
+	}
+
+	// In this callback we handle only QoS-published messages to QoS
+	// subscriptions. Ignore if either is 0, will be delivered by the other
+	// callback, mqttDeliverMsgCbQos1.
+	var qos byte
+	if h != nil {
+		qos = h.qos
+	}
+	if qos > sub.mqtt.qos {
+		qos = sub.mqtt.qos
+	}
+	// A QoS0 member of a shared subscription still consumes stored messages
+	// through the group consumer; it just delivers them at QoS0 and acks the JS
+	// message (handled below after the reserved/deny checks). For a non-shared
+	// QoS0 result the direct NATS subscription delivers instead. Spec5 [4.8.2].
+	sharedQoS0 := qos == 0 && sub.mqtt.shared
+	if qos == 0 && !sharedQoS0 {
+		sess.mu.Unlock()
+		return
+	}
+
+	// Check for reserved subject violation. If so, we will send the ack to
+	// remove the message, and do nothing else.
+	strippedSubj := subject[len(mqttStreamSubjectPrefix):]
+	if mqttMustIgnoreForReservedSub(sub, strippedSubj) {
+		sess.mu.Unlock()
+		sess.jsa.sendAck(reply)
+		return
+	}
+
+	// A broad wildcard subscription can overlap a subscribe deny clause.
+	cc.mu.Lock()
+	denied := cc.mperms != nil && cc.checkDenySub(strippedSubj)
+	cc.mu.Unlock()
+	if denied {
+		sess.mu.Unlock()
+		sess.jsa.sendAck(reply)
+		return
+	}
+
+	// No Local: a message published by this same session must not be delivered
+	// to this subscription. Ack it so the JS consumer does not redeliver it.
+	if sub.mqtt.noLocal {
+		// The stored origin is an HMAC authenticating "this session published this
+		// payload on this subject". Recompute it for the subscribing session; a
+		// match proves authenticity (a forged/replayed header cannot reproduce the
+		// server secret for a different payload) and self-authorship. A mismatch or
+		// absent marker delivers. Spec5 [3.8.3.1].
+		var marker string
+		if h != nil {
+			marker = string(h.origin)
+		}
+		expected := mqttOriginMarker(cc.srv.mqtt.originKey, sess.idHash, strippedSubj, msg)
+		if mqttNoLocalSuppress(true, marker, expected) {
+			sess.mu.Unlock()
+			sess.jsa.sendAck(reply)
+			return
+		}
+	}
+
+	// Retain As Published: capture the option under the lock; the delivered
+	// message keeps the original RETAIN flag (from the stored Nmqtt-Ret header)
+	// only when the subscription set it. Spec5 [3.8.3.1].
+	retainAsPub := sub.mqtt.retainAsPublished && h != nil && h.retained
+	// Subscription Identifier: capture under the lock, injected on enqueue below.
+	// Spec5 [3.8.2.1.2].
+	subID := sub.mqtt.subID
+
+	if sharedQoS0 {
+		// Deliver at QoS0 (no packet identifier, no tracking) and ack the JS
+		// message so the group consumer does not redeliver it. Spec5 [4.8.2].
+		sess.mu.Unlock()
+		originalTopic := natsSubjectStrToMQTTTopic(strippedSubj)
+		var props []byte
+		if h != nil {
+			props = h.props
+		}
+		if len(props) > 0 {
+			_, _, _, ts, _ := ackReplyInfo(reply)
+			if p, expired := mqttForwardExpiry(props, ts); expired {
+				sess.jsa.sendAck(reply)
+				return
+			} else {
+				props = p
+			}
+		}
+		pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPub, subID, originalTopic, msg, props)
+		sess.jsa.sendAck(reply)
+		return
+	}
+
+	pi, dup, started := sess.trackPublish(sub.mqtt.jsDur, reply)
+	sess.mu.Unlock()
+
+	if pi == 0 {
+		// We have reached max pending, don't send the message now.
+		// JS will cause a redelivery and if by then the number of pending
+		// messages has fallen below threshold, the message will be resent.
+		return
+	}
+
+	originalTopic := natsSubjectStrToMQTTTopic(strippedSubj)
+	var props []byte
+	if h != nil {
+		props = h.props
+	}
+	// MQTT 5.0 Message Expiry Interval: a v5 subscriber must receive the interval
+	// reduced by the time the message waited in the server; if it has already
+	// elapsed the message must not be delivered and its stored copy dropped. The
+	// store timestamp is carried in the JetStream ack reply subject. Expiry is a
+	// property of the message, so it equally gates delivery to a 3.1.1
+	// subscriber (whose properties are then stripped on the wire).
+	// Only a message whose onward delivery has NOT started may be dropped on
+	// expiry; a redelivery of an already-sent PUBLISH must be resent, not dropped.
+	// Spec5 [3.3.2.3.3], [MQTT-4.4.0-1].
+	if len(props) > 0 && !started {
+		_, _, _, ts, _ := ackReplyInfo(reply)
+		var expired bool
+		if props, expired = mqttForwardExpiry(props, ts); expired {
+			sess.mu.Lock()
+			sess.untrackPublish(pi)
+			sess.mu.Unlock()
+			sess.jsa.sendAck(reply)
+			return
+		}
+	}
+	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, subID, originalTopic, msg, props) {
+		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
+		// it and complete the delivery so JetStream does not redeliver it forever:
+		// release the packet identifier and ack the JS message. Spec5 [3.1.2.11.4].
+		sess.mu.Lock()
+		sess.untrackPublish(pi)
+		sess.mu.Unlock()
+		sess.jsa.sendAck(reply)
+	}
+}
+
+func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
+	if sub.client.mqtt == nil || sub.client.mqtt.sess == nil || reply == _EMPTY_ {
+		return
+	}
+
+	hdr, _ := pc.msgParts(rmsg)
+	pi := mqttParsePubRelNATSHeader(hdr)
+	if pi == 0 {
+		return
+	}
+
+	// This is the client associated with the subscription.
+	cc := sub.client
+
+	// This is immutable
+	sess := cc.mqtt.sess
+
+	sess.mu.Lock()
+	if sess.c != cc || sess.pubRelConsumer == nil {
+		sess.mu.Unlock()
+		return
+	}
+	sess.trackAsPubRel(pi, reply)
+	trace := cc.trace
+	sess.mu.Unlock()
+
+	cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
+}
+
+// The MQTT Server MUST NOT match Topic Filters starting with a wildcard
+// character (# or +) with Topic Names beginning with a $ character, Spec
+// [MQTT-4.7.2-1]. We will return true if there is a violation.
+//
+// Session or subMu lock must be held on entry to protect access to sub.mqtt.
+func mqttMustIgnoreForReservedSub(sub *subscription, subject string) bool {
+	// If the subject does not start with $ nothing to do here.
+	if !sub.mqtt.reserved || len(subject) == 0 || subject[0] != mqttReservedPre {
+		return false
+	}
+	return true
+}
+
+// Check if a sub is a reserved wildcard. E.g. '#', '*', or '*/" prefix.
+func isMQTTReservedSubscription(subject string) bool {
+	if len(subject) == 1 && (subject[0] == fwc || subject[0] == pwc) {
+		return true
+	}
+	// Match "*.<>"
+	if len(subject) > 1 && (subject[0] == pwc && subject[1] == btsep) {
+		return true
+	}
+	return false
+}
+
+func sparkbReplaceDeathTimestamp(msg []byte) []byte {
+	const VARINT = 0
+	const TIMESTAMP = 1
+
+	orig := msg
+	buf := bytes.NewBuffer(make([]byte, 0, len(msg)+16)) // 16 bytes should be enough if we need to add a timestamp
+	writeDeathTimestamp := func() {
+		// [tck-id-conformance-mqtt-aware-ndeath-timestamp] A Sparkplug Aware
+		// MQTT Server MAY replace the timestamp of NDEATH messages. If it does,
+		// it MUST set the timestamp to the UTC time at which it attempts to
+		// deliver the NDEATH to subscribed clients
+		//
+		// sparkB spec: 6.4.1. Google Protocol Buffer Schema
+		//      optional uint64 timestamp = 1; // Timestamp at message sending time
+		//
+		// SparkplugB timestamps are milliseconds since epoch, represented as
+		// uint64 in go, transmitted as protobuf varint.
+		ts := uint64(time.Now().UnixMilli())
+		buf.Write(protoEncodeVarint(TIMESTAMP<<3 | VARINT))
+		buf.Write(protoEncodeVarint(ts))
+	}
+
+	for len(msg) > 0 {
+		fieldNumericID, fieldType, size, err := protoScanField(msg)
+		if err != nil {
+			return orig
+		}
+		if fieldType != VARINT || fieldNumericID != TIMESTAMP {
+			// Add the field as is
+			buf.Write(msg[:size])
+			msg = msg[size:]
+			continue
+		}
+
+		writeDeathTimestamp()
+
+		// Add the rest of the message as is, we are done
+		buf.Write(msg[size:])
+		return buf.Bytes()
+	}
+
+	// Add timestamp if we did not find one.
+	writeDeathTimestamp()
+
+	return buf.Bytes()
+}
+
+// Common function to mqtt delivery callbacks to serialize and send the message
+// to the `cc` client.
+// mqttEnqueuePublishMsgTo frames and queues an outbound PUBLISH to cc. It
+// returns false without sending when the packet would exceed the client's MQTT
+// 5.0 Maximum Packet Size; the caller is then responsible for completing the
+// message (for QoS1/2, acking the JS delivery so it is not redelivered).
+// subID is the subscription's v5 Subscription Identifier (0 = none), injected
+// into the properties block for a v5 receiver. Spec5 [3.8.2.1.2].
+func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup, retainAsPub bool, subID int, topic, msg, props []byte) bool {
+	// [tck-id-conformance-mqtt-aware-nbirth-mqtt-retain] A Sparkplug Aware
+	// MQTT Server MUST make NBIRTH messages available on the topic:
+	// $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id with
+	// the MQTT retain flag set to true
+	//
+	// [tck-id-conformance-mqtt-aware-dbirth-mqtt-retain] A Sparkplug Aware
+	// MQTT Server MUST make DBIRTH messages available on the topic:
+	// $sparkplug/certificates/namespace/group_id/DBIRTH/edge_node_id/device_id
+	// with the MQTT retain flag set to true
+	//
+	// $sparkplug/certificates messages are sent as NATS messages, so we
+	// need to add the retain flag when sending them to MQTT clients.
+
+	// retainAsPub keeps the original RETAIN flag for a v5 Retain As Published
+	// subscription. Spec5 [3.8.3.1].
+	retain := retainAsPub
+	isBirth, isDeath, isCertificate := sparkbParseBirthDeathTopic(topic)
+	if isBirth && qos == 0 {
+		retain = retain || isCertificate
+	} else if isDeath && !isCertificate {
+		msg = sparkbReplaceDeathTimestamp(msg)
+	}
+
+	// MQTT 5.0 Subscription Identifier: inject the subscription's identifier into
+	// the delivered PUBLISH's properties. Only for a v5 receiver (a 3.1.1 receiver
+	// gets no properties section) and before the size check below so the extra
+	// bytes count against Maximum Packet Size. Spec5 [3.8.2.1.2].
+	v5 := cc.mqtt.proto == mqttProtoLevel5
+	if v5 && subID > 0 {
+		props = mqttInjectSubID(props, subID)
+	}
+
+	// MQTT 5.0 outbound Topic Alias: for a v5 client that advertised a Topic Alias
+	// Maximum, the alias table lookup/assignment and framing must be atomic with
+	// queueOutbound so a binding PUBLISH (full topic + alias) is always buffered
+	// before any alias-only PUBLISH referencing it. That work moves under cc.mu
+	// below. Every other receiver keeps the original path: frame and size-check
+	// before the lock. Spec5 [3.3.2.3.4].
+	useAlias := v5 && cc.mqtt.outTopicAliasMax > 0 && len(topic) > 0
+
+	var flags byte
+	var headerBytes []byte
+	var alias uint16
+	if !useAlias {
+		flags, headerBytes = mqttMakePublishHeader(pi, qos, dup, retain, v5, topic, props, len(msg))
+		// MQTT 5.0 Maximum Packet Size: never send a PUBLISH larger than the client
+		// is willing to accept. Discard it instead and let the caller complete the
+		// delivery. Spec5 [3.1.2.11.4]. mqtt.maxPacketSize is 0 for 3.1.1 or when the
+		// client did not advertise a limit.
+		if mp := cc.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(msg) > int(mp) {
+			return false
+		}
+	}
+
+	cc.mu.Lock()
+	if useAlias {
+		// Build under the lock so the binding commit and queueOutbound cannot be
+		// interleaved by a concurrent delivery on the same topic. ok is false only
+		// when even the plain full-topic frame exceeds Maximum Packet Size, matching
+		// the pre-lock discard above; a fresh binding is committed only when its
+		// frame is actually queued.
+		var ok bool
+		flags, headerBytes, alias, ok = cc.mqttMakeAliasedPublishHeader(pi, qos, dup, retain, topic, props, len(msg))
+		if !ok {
+			cc.mu.Unlock()
+			return false
+		}
+	}
+	if sub.mqtt.prm != nil {
+		for _, data := range sub.mqtt.prm {
+			cc.queueOutbound(data)
+		}
+		sub.mqtt.prm = nil
+	}
+	cc.queueOutbound(headerBytes)
+	cc.queueOutbound(msg)
+	c.addToPCD(cc)
+	trace := cc.trace
+	cc.mu.Unlock()
+
+	if trace {
+		pp := mqttPublish{
+			topic: topic,
+			flags: flags,
+			pi:    pi,
+			sz:    len(msg),
+		}
+		// Trace the resolved full topic (clearer than the empty wire topic) and note
+		// the alias when one was used.
+		tr := mqttPubTrace(&pp)
+		if alias > 0 {
+			tr += fmt.Sprintf(" alias=%v", alias)
+		}
+		cc.traceOutOp("PUBLISH", []byte(tr))
+	}
+	return true
+}
+
+// Serializes to the given writer the message for the given subject.
+func (w *mqttWriter) WritePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic, props []byte, msgLen int) byte {
+	// Compute len (will have to add packet id if message is sent as QoS>=1)
+	pkLen := 2 + len(topic) + msgLen
+	var flags byte
+
+	// Set flags for dup/retained/qos1
+	if dup {
+		flags |= mqttPubFlagDup
+	}
+	if retained {
+		flags |= mqttPubFlagRetain
+	}
+	if qos > 0 {
+		pkLen += 2
+		flags |= qos << 1
+	}
+	// MQTT 5.0 PUBLISH carries a properties section after the packet identifier.
+	// props (when set) is the raw block from the publisher, including its length
+	// prefix, forwarded verbatim; otherwise a single 0 length byte. For 3.1.1
+	// receivers (v5 false) there is no properties section, which is how
+	// properties get stripped when delivering to a 3.1.1 subscriber. Spec5 [3.3.2.3].
+	if v5 {
+		if len(props) > 0 {
+			pkLen += len(props)
+		} else {
+			pkLen++
+		}
+	}
+
+	w.WriteByte(mqttPacketPub | flags)
+	w.WriteVarInt(pkLen)
+	w.WriteBytes(topic)
+	if qos > 0 {
+		w.WriteUint16(pi)
+	}
+	if v5 {
+		if len(props) > 0 {
+			w.Write(props)
+		} else {
+			w.WriteByte(0)
+		}
+	}
+
+	return flags
+}
+
+// Serializes to the given writer the message for the given subject. For v5
+// receivers it appends the properties section (props, if any, else empty).
+func mqttMakePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic, props []byte, msgLen int) (byte, []byte) {
+	headerBuf := newMQTTWriter(mqttInitialPubHeader + len(topic) + len(props))
+	flags := headerBuf.WritePublishHeader(pi, qos, dup, retained, v5, topic, props, msgLen)
+	return flags, headerBuf.Bytes()
+}
+
+// mqttMakeAliasedPublishHeader frames an outbound v5 PUBLISH applying this
+// connection's outbound Topic Alias table, returning the flags, header, the
+// alias used (0 = none/full topic), and ok=false when the packet must be dropped
+// because even the plain full-topic frame exceeds the client's Maximum Packet
+// Size. cc.mu must be held: the table read/write is atomic with the caller's
+// queueOutbound so a binding frame is buffered before any alias-only frame that
+// references it, and a fresh alias is committed only once its binding frame has
+// passed the size check. Aliasing never causes an extra drop — the plain frame
+// is always the fallback. Spec5 [3.3.2.3.4].
+func (cc *client) mqttMakeAliasedPublishHeader(pi uint16, qos byte, dup, retain bool, topic, props []byte, msgLen int) (byte, []byte, uint16, bool) {
+	mp := int(cc.mqtt.maxPacketSize)
+	fits := func(h []byte) bool { return mp == 0 || len(h)+msgLen <= mp }
+
+	// Already bound: send an empty topic + the alias. The alias-only frame can be
+	// larger than the plain frame for a 1-2 byte topic (+3 alias bytes, -len(topic)
+	// topic bytes), so it too is size-checked; on overflow fall through to the
+	// plain frame while keeping the binding.
+	if a, bound := cc.mqtt.outTopicAliases[string(topic)]; bound {
+		if ap, ok := mqttInjectTopicAlias(props, a); ok {
+			flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, nil, ap, msgLen)
+			if fits(h) {
+				return flags, h, a, true
+			}
+		}
+	} else if len(cc.mqtt.outTopicAliases) < int(cc.mqtt.outTopicAliasMax) {
+		// Unbound with room: bind the next alias (FCFS, table size + 1, never 0 and
+		// never above the client's max since outTopicAliasMax = min(client, server)).
+		// The binding frame carries the full topic; commit only if it fits.
+		a := uint16(len(cc.mqtt.outTopicAliases) + 1)
+		if ap, ok := mqttInjectTopicAlias(props, a); ok {
+			flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, topic, ap, msgLen)
+			if fits(h) {
+				if cc.mqtt.outTopicAliases == nil {
+					cc.mqtt.outTopicAliases = make(map[string]uint16)
+				}
+				cc.mqtt.outTopicAliases[string(topic)] = a
+				return flags, h, a, true
+			}
+		}
+	}
+
+	// Table full, injection failed, or an aliased frame did not fit: send the plain
+	// full-topic frame. alias is 0 so the trace does not claim an alias was sent.
+	flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, topic, props, msgLen)
+	return flags, h, 0, fits(h)
+}
+
+// Process the SUBSCRIBE packet.
+//
+// Process the list of subscriptions and update the given filter
+// with the QoS that has been accepted (or failure).
+//
+// Spec [MQTT-3.8.4-3] says that if an exact same subscription is
+// found, it needs to be replaced with the new one (possibly updating
+// the qos) and that the flow of publications must not be interrupted,
+// which I read as the replacement cannot be a "remove then add" if there
+// is a chance that in between the 2 actions, published messages
+// would be "lost" because there would not be any matching subscription.
+//
+// Run from client's readLoop.
+// No lock held on entry.
+func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error) {
+	// Those things are immutable, but since processing subs is not
+	// really in the fast path, let's get them under the client lock.
+	c.mu.Lock()
+	asm := c.mqtt.asm
+	sess := c.mqtt.sess
+	trace := c.trace
+	c.mu.Unlock()
+
+	if err := asm.lockSession(sess, c); err != nil {
+		return nil, err
+	}
+	defer asm.unlockSession(sess)
+	return asm.processSubs(sess, c, filters, true, trace)
+}
+
+// Cleanup that is performed in processSubs if there was an error.
+//
+// Runs from client's readLoop.
+// Lock not held on entry, but session is in the locked map.
+func (sess *mqttSession) cleanupFailedSub(c *client, sub *subscription, cc *ConsumerConfig, jssub *subscription) {
+	if sub != nil {
+		c.processUnsub(sub.sid)
+	}
+	if jssub != nil {
+		c.processUnsub(jssub.sid)
+	}
+	if cc != nil {
+		// A shared group consumer must never be deleted outright on a local
+		// failure — other members may hold it. Route through the last-holder
+		// release (the caller has already rolled back this session's membership).
+		// Spec5 [4.8.2].
+		if cc.DeliverGroup != _EMPTY_ {
+			sess.releaseSharedConsumer(c, cc, nil)
+		} else {
+			sess.deleteConsumer(cc)
+		}
+	}
+}
+
+// Make sure we are set up to deliver PUBREL messages to this QoS2-subscribed
+// session.
+func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
+
+	sess.mu.Lock()
+	pubRelSubscribed := sess.pubRelSubscribed
+	pubRelDeliverySubjectB := sess.pubRelDeliverySubjectB
+	pubRelDeliverySubject := sess.pubRelDeliverySubject
+	pubRelConsumer := sess.pubRelConsumer
+	sess.mu.Unlock()
+
+	// Subscribe before the consumer is created so we don't loose any messages.
+	if !pubRelSubscribed {
+		_, err := c.processSub(pubRelDeliverySubjectB, nil, pubRelDeliverySubjectB, mqttDeliverPubRelCb, false)
+		if err != nil {
+			c.Errorf("Unable to create subscription for JetStream consumer on %q: %v", pubRelDeliverySubject, err)
+			return err
+		}
+		sess.mu.Lock()
+		sess.pubRelSubscribed = true
+		sess.mu.Unlock()
+	}
+
+	// If the JS consumer already exists, we are done.
+	if pubRelConsumer != nil {
+		return nil
+	}
+
+	opts := c.srv.getOpts()
+	ackWait := opts.MQTT.AckWait
+	if ackWait == 0 {
+		ackWait = mqttDefaultAckWait
+	}
+	maxAckPending := int(opts.MQTT.MaxAckPending)
+	if maxAckPending == 0 {
+		maxAckPending = mqttDefaultMaxAckPending
+	}
+
+	sess.mu.Lock()
+	pubRelSubject := sess.pubRelSubject
+	tmaxack := sess.tmaxack
+	idHash := sess.idHash
+	id := sess.id
+	sess.mu.Unlock()
+
+	// Check that the limit of subs' maxAckPending are not going over the limit
+	if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
+		return fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
+			after, mqttMaxAckTotalLimit)
+	}
+
+	ccr := &CreateConsumerRequest{
+		Stream: mqttOutStreamName,
+		Config: ConsumerConfig{
+			DeliverSubject: pubRelDeliverySubject,
+			Durable:        mqttPubRelConsumerDurablePrefix + idHash,
+			AckPolicy:      AckExplicit,
+			DeliverPolicy:  DeliverNew,
+			FilterSubject:  pubRelSubject,
+			AckWait:        ackWait,
+			MaxAckPending:  maxAckPending,
+			MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
+		},
+	}
+	if opts.MQTT.ConsumerInactiveThreshold > 0 {
+		ccr.Config.InactiveThreshold = opts.MQTT.ConsumerInactiveThreshold
+	}
+	if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
+		c.Errorf("Unable to add JetStream consumer for PUBREL for client %q: err=%v", id, err)
+		return err
+	}
+	pubRelConsumer = &ccr.Config
+	tmaxack += maxAckPending
+
+	sess.mu.Lock()
+	sess.pubRelConsumer = pubRelConsumer
+	sess.tmaxack = tmaxack
+	sess.mu.Unlock()
+
+	return nil
+}
+
+// When invoked with a QoS of 0, looks for an existing JS durable consumer for
+// the given sid and if one is found, delete the JS durable consumer and unsub
+// the NATS subscription on the delivery subject.
+//
+// With a QoS > 0, creates or update the existing JS durable consumer along with
+// its NATS subscription on a delivery subject.
+//
+// Session lock is acquired and released as needed. Session is in the locked
+// map.
+func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
+	qos byte, noLocal, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, *ConsumerConfig, error) {
+
+	sess.mu.Lock()
+	cc, exists := sess.cons[sid]
+	tmaxack := sess.tmaxack
+	idHash := sess.idHash
+	rmax := sess.rmax
+	sess.mu.Unlock()
+
+	// Check if we are already a JS consumer for this SID.
+	if exists {
+		// If current QoS is 0, it means that we need to delete the existing
+		// one (that was QoS > 0)
+		if qos == 0 {
+			// When processing a SUBSCRIBE packet, DEFER the whole teardown
+			// (including removing the sess.cons entry) until the packet's final
+			// session save is confirmed: the save can still fail and its rollback
+			// must restore the pre-packet QoS1/2 state, and any save issued
+			// mid-packet (a later shared filter's early persist) must serialize a
+			// record consistent with reality — Subs still says QoS1/2 until the
+			// final update, so the consumer entry must stay alongside it. The
+			// caller executes execDeferredConsumerDelete after the confirmed save.
+			// Spec5 [4.8.2].
+			if fromSubProto {
+				return nil, nil, cc, nil
+			}
+			sess.execDeferredConsumerDelete(c, sid, cc)
+			return nil, nil, nil, nil
+		}
+		// If this is called when processing SUBSCRIBE protocol, then if
+		// the JS consumer already exists, we are done (it was created
+		// during the processing of CONNECT).
+		if fromSubProto {
+			// A re-SUBSCRIBE to an existing QoS 1/2 filter can change the QoS, the
+			// No Local option, and the Subscription Identifier, all read by the QoS
+			// 1/2 delivery callback off the delivery subscription. The durable
+			// consumer itself is unchanged, so refresh those fields here so the new
+			// values take effect. Spec5 [MQTT-3.8.4-3], [3.8.3.1], [3.8.2.1.2].
+			c.mu.Lock()
+			sub := c.subs[cc.DeliverSubject]
+			c.mu.Unlock()
+			if sub != nil {
+				// The QoS 1/2 callback reads these under sess.mu; the QoS0
+				// callback (on the shadow sub) under subsMu. Write under both, as
+				// processSub does, so both readers see a consistent value.
+				sess.mu.Lock()
+				sess.subsMu.Lock()
+				if sub.mqtt != nil {
+					sub.mqtt.qos = qos
+					sub.mqtt.noLocal = noLocal
+					sub.mqtt.retainAsPublished = retainAsPublished
+					sub.mqtt.subID = subID
+				}
+				sess.subsMu.Unlock()
+				sess.mu.Unlock()
+			}
+			return nil, nil, nil, nil
+		}
+	}
+	// Here it means we don't have a JS consumer and if we are QoS 0,
+	// we have nothing to do.
+	if qos == 0 {
+		return nil, nil, nil, nil
+	}
+	var err error
+	var inbox string
+	if exists {
+		inbox = cc.DeliverSubject
+	} else {
+		inbox = mqttSubPrefix + nuid.Next()
+		opts := c.srv.getOpts()
+		ackWait := opts.MQTT.AckWait
+		if ackWait == 0 {
+			ackWait = mqttDefaultAckWait
+		}
+		maxAckPending := int(opts.MQTT.MaxAckPending)
+		if maxAckPending == 0 {
+			maxAckPending = mqttDefaultMaxAckPending
+		}
+		// Pace JetStream delivery to the client's Receive Maximum so the
+		// in-flight gate rarely drops at the cap (a drop waits out AckWait and
+		// reorders). The gate stays the hard bound across subscriptions; a
+		// consumer that outlives this connection keeps this cap until deleted.
+		if rmax != 0 && int(rmax) < maxAckPending {
+			maxAckPending = int(rmax)
+		}
+
+		// Check that the limit of subs' maxAckPending are not going over the limit
+		if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
+			return nil, nil, nil, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
+				after, mqttMaxAckTotalLimit)
+		}
+
+		durName := idHash + "_" + nuid.Next()
+		ccr := &CreateConsumerRequest{
+			Stream: mqttStreamName,
+			Config: ConsumerConfig{
+				DeliverSubject: inbox,
+				Durable:        durName,
+				AckPolicy:      AckExplicit,
+				DeliverPolicy:  DeliverNew,
+				FilterSubject:  mqttStreamSubjectPrefix + subject,
+				AckWait:        ackWait,
+				MaxAckPending:  maxAckPending,
+				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
+			},
+		}
+		if opts.MQTT.ConsumerInactiveThreshold > 0 {
+			ccr.Config.InactiveThreshold = opts.MQTT.ConsumerInactiveThreshold
+		}
+		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
+			c.Errorf("Unable to add JetStream consumer for subscription on %q: err=%v", subject, err)
+			return nil, nil, nil, err
+		}
+		cc = &ccr.Config
+		tmaxack += maxAckPending
+	}
+
+	// This is an internal subscription on subject like "$MQTT.sub.<nuid>" that is setup
+	// for the JS durable's deliver subject.
+	sess.mu.Lock()
+	sess.tmaxack = tmaxack
+	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil,
+		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID, cc.Durable, mqttDeliverMsgCbQoS12)
+	sess.mu.Unlock()
+
+	if err != nil {
+		sess.deleteConsumer(cc)
+		c.Errorf("Unable to create subscription for JetStream consumer on %q: %v", subject, err)
+		return nil, nil, nil, err
+	}
+	return cc, sub, nil, nil
+}
+
+// execDeferredConsumerDelete performs the irreversible teardown of a plain
+// QoS1/2 consumer whose session entry was already removed (QoS downgrade to 0):
+// mark its delivery subscription closed, purge its pending QoS 1/2 deliveries
+// (so the packet identifiers do not leak against the in-flight cap), delete the
+// durable, and unsubscribe the delivery subject. deleteConsumer is asynchronous,
+// so an in-flight delivery callback could re-populate the maps after the purge;
+// the closed flag (guarded by sess.mu and sess.subsMu, same as delivery) makes
+// mqttDeliverMsgCbQoS12 skip instead while leaving sub.mqtt valid for an
+// already-committed enqueue.
+func (sess *mqttSession) execDeferredConsumerDelete(c *client, sid string, cc *ConsumerConfig) {
+	c.mu.Lock()
+	sub := c.subs[cc.DeliverSubject]
+	c.mu.Unlock()
+
+	sess.mu.Lock()
+	// The entry stays in sess.cons until this irreversible teardown actually
+	// runs, so any save issued in between persists a record that still
+	// references the (still-existing) durable. Remove it only when present and
+	// still pointing at this consumer (a rollback may have reconciled the map).
+	if cur, ok := sess.cons[sid]; ok && cur == cc {
+		delete(sess.cons, sid)
+	}
+	if sub != nil && sub.mqtt != nil {
+		sess.subsMu.Lock()
+		sub.mqtt.closed = true
+		sess.subsMu.Unlock()
+	}
+	if seqPis, ok := sess.cpending[cc.Durable]; ok {
+		delete(sess.cpending, cc.Durable)
+		for _, pi := range seqPis {
+			delete(sess.pendingPublish, pi)
+		}
+	}
+	sess.mu.Unlock()
+
+	sess.deleteConsumer(cc)
+	if sub != nil {
+		c.processUnsub(sub.sid)
+	}
+}
+
+// processSharedJSConsumer creates (or joins) the single JetStream consumer that
+// backs an MQTT 5.0 Shared Subscription group for a (ShareName, subject) pair,
+// and subscribes this session to its deliver subject as a queue member so
+// JetStream delivers each stored message to exactly one connected member.
+//
+// The durable, deliver subject, and queue/DeliverGroup are all deterministic
+// (mqttSharedNames), so members across the cluster converge on one consumer. All
+// members join regardless of granted QoS: a QoS0 member still receives stored
+// (QoS 1/2 published) messages through this consumer, delivered at QoS0 (the raw
+// subject queue sub only carries QoS0-published messages). The consumer config
+// is derived from server options only — never the member's Receive Maximum —
+// since CreateOrUpdate would let each joiner rewrite the shared config. No
+// InactiveThreshold is set, so an all-offline group stalls and keeps its backlog
+// rather than being reaped. On the subscribe failure path the consumer is
+// returned so the caller's cleanup can release it. Spec5 [4.8.2].
+//
+// Runs from the client's readLoop. sess.mu not held on entry.
+func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
+	qos byte, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
+
+	sess.mu.Lock()
+	cc, exists := sess.cons[sid]
+	tmaxack := sess.tmaxack
+	sess.mu.Unlock()
+
+	queue, deliver, durable := mqttSharedNames(group, subject)
+
+	// Already a member with a live deliver subscription (re-SUBSCRIBE): just
+	// refresh the mutable per-subscription fields read by the delivery callback.
+	if exists {
+		c.mu.Lock()
+		sub := c.subs[cc.DeliverSubject]
+		c.mu.Unlock()
+		if sub != nil {
+			sess.mu.Lock()
+			sess.subsMu.Lock()
+			if sub.mqtt != nil {
+				sub.mqtt.qos = qos
+				sub.mqtt.retainAsPublished = retainAsPublished
+				sub.mqtt.subID = subID
+			}
+			sess.subsMu.Unlock()
+			sess.mu.Unlock()
+			return cc, sub, nil
+		}
+		// exists but no live deliver sub (session resume on a new connection):
+		// fall through to (re)subscribe without recreating or recharging.
+	}
+
+	opts := c.srv.getOpts()
+	maxAckPending := int(opts.MQTT.MaxAckPending)
+	if maxAckPending == 0 {
+		maxAckPending = mqttDefaultMaxAckPending
+	}
+	var charged bool
+	if !exists {
+		// A stream-level consumer InactiveThreshold would give the group durable
+		// a delete timer, reaping it while all members are offline. Check the
+		// LIVE stream config (it can change after startup) and refuse rather
+		// than create a reapable shared consumer. FAIL CLOSED: if the lookup
+		// itself fails we cannot prove the limit is absent, so refuse the join
+		// (the client can retry) instead of risking a reapable durable. Spec5 [4.8.2].
+		si, err := sess.jsa.lookupStream(mqttStreamName)
+		if err != nil || si == nil {
+			return nil, nil, fmt.Errorf("shared subscriptions unavailable: unable to verify messages stream consumer limits: %v", err)
+		}
+		if si.Config.ConsumerLimits.InactiveThreshold != 0 {
+			return nil, nil, fmt.Errorf("shared subscriptions unavailable: messages stream imposes a consumer inactivity limit")
+		}
+		ackWait := opts.MQTT.AckWait
+		if ackWait == 0 {
+			ackWait = mqttDefaultAckWait
+		}
+		if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
+			return nil, nil, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
+				after, mqttMaxAckTotalLimit)
+		}
+		ccr := &CreateConsumerRequest{
+			Stream: mqttStreamName,
+			Config: ConsumerConfig{
+				DeliverSubject: deliver,
+				DeliverGroup:   queue,
+				Durable:        durable,
+				AckPolicy:      AckExplicit,
+				DeliverPolicy:  DeliverNew,
+				FilterSubject:  mqttStreamSubjectPrefix + subject,
+				AckWait:        ackWait,
+				MaxAckPending:  maxAckPending,
+				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
+			},
+		}
+		// Create before subscribing: a pre-existing group durable must not deliver
+		// to (or be ack-consumed by) this member until the join is proven. Create
+		// is idempotent (ActionCreateOrUpdate). Spec5 [4.8.2].
+		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
+			c.Errorf("Unable to add shared JetStream consumer for subscription on %q: err=%v", subject, err)
+			return nil, nil, err
+		}
+		cc = &ccr.Config
+		sess.mu.Lock()
+		sess.tmaxack = tmaxack + maxAckPending
+		if sess.sharedCharged == nil {
+			sess.sharedCharged = make(map[string]int)
+		}
+		sess.sharedCharged[durable] = maxAckPending
+		sess.mu.Unlock()
+		charged = true
+	}
+
+	sess.mu.Lock()
+	sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), []byte(queue),
+		isMQTTReservedSubscription(subject), qos, false, retainAsPublished, true, subID, durable, mqttDeliverMsgCbQoS12)
+	sess.mu.Unlock()
+	if err != nil {
+		c.Errorf("Unable to create subscription for shared JetStream consumer on %q: %v", subject, err)
+		// Return cc (only when we created it this call) so the caller's cleanup,
+		// after rolling back the early-persisted membership, can release it.
+		if charged {
+			return cc, nil, err
+		}
+		return nil, nil, err
+	}
+	// Verify/repair the join: a concurrent leaver whose last-holder scan finished
+	// before this session's membership was persisted may have issued a (queued,
+	// fire-and-forget) delete of the group durable that landed AFTER our create.
+	// Re-issue the idempotent CreateOrUpdate now that our membership is persisted
+	// and the queue interest is up: it recreates the durable if it was deleted and
+	// is a no-op otherwise, closing the join/leave race window. Spec5 [4.8.2].
+	if charged {
+		ccr := &CreateConsumerRequest{Stream: mqttStreamName, Config: *cc}
+		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
+			c.Warnf("Unable to verify shared JetStream consumer for subscription on %q: %v", subject, err)
+		}
+	}
+	return cc, sub, nil
+}
+
+// releaseSharedConsumer removes this session's local delivery subscription and
+// pending state for a shared-subscription group consumer, and deletes the group
+// durable only if no other session still references it. Pending QoS 1/2
+// deliveries are purged WITHOUT acking, so any in-flight messages redeliver to
+// the remaining group members via AckWait. The caller must have already removed
+// the leaving filter from sess.sharedSubs so the last-holder scan does not count
+// it. Spec5 [4.8.2].
+//
+// Runs from the client's readLoop. sess.mu not held on entry.
+func (sess *mqttSession) releaseSharedConsumer(c *client, cc *ConsumerConfig, held map[string]bool) {
+	if cc == nil || cc.DeliverGroup == _EMPTY_ {
+		return
+	}
+	var sub *subscription
+	if c != nil {
+		c.mu.Lock()
+		sub = c.subs[cc.DeliverSubject]
+		c.mu.Unlock()
+	}
+	sess.mu.Lock()
+	if sub != nil && sub.mqtt != nil {
+		sess.subsMu.Lock()
+		sub.mqtt.closed = true
+		sess.subsMu.Unlock()
+	}
+	if seqPis, ok := sess.cpending[cc.Durable]; ok {
+		delete(sess.cpending, cc.Durable)
+		for _, pi := range seqPis {
+			delete(sess.pendingPublish, pi)
+		}
+	}
+	if amt, ok := sess.sharedCharged[cc.Durable]; ok {
+		sess.tmaxack -= amt
+		if sess.tmaxack < 0 {
+			sess.tmaxack = 0
+		}
+		delete(sess.sharedCharged, cc.Durable)
+	}
+	sess.mu.Unlock()
+	if c != nil && sub != nil {
+		c.processUnsub(sub.sid)
+	}
+
+	// Delete the group durable only if no other session still references it. A
+	// caller releasing several durables in one operation passes one precomputed
+	// scan result (held); nil means scan for this durable alone.
+	if held == nil {
+		held = sess.sharedDurablesHeldByOthers([]string{cc.Durable})
+	}
+	if !held[cc.Durable] {
+		if _, err := sess.jsa.deleteConsumer(mqttStreamName, cc.Durable, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			c.Errorf("Unable to delete shared consumer %q: %v", cc.Durable, err)
+		}
+	}
+}
+
+// purgeSharedPending drops this session's pending QoS 1/2 delivery state for its
+// shared group consumers WITHOUT acking. Called when the session survives a
+// disconnect, so a resume does not NAK-steal group messages (which AckWait
+// redelivers to other members) and so the packet identifiers are freed. Spec5 [4.8.2].
+func (sess *mqttSession) purgeSharedPending() {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for _, cc := range sess.cons {
+		if cc.DeliverGroup == _EMPTY_ {
+			continue
+		}
+		if seqPis, ok := sess.cpending[cc.Durable]; ok {
+			delete(sess.cpending, cc.Durable)
+			for _, pi := range seqPis {
+				delete(sess.pendingPublish, pi)
+			}
+		}
+	}
+}
+
+// sharedConsumerHasOtherHolders reports whether any session still holds a shared
+// subscription that maps to the given group durable. See sharedDurablesHeldByOthers.
+func (sess *mqttSession) sharedConsumerHasOtherHolders(durable string) bool {
+	return sess.sharedDurablesHeldByOthers([]string{durable})[durable]
+}
+
+// sharedDurablesHeldByOthers returns which of the given group durables some
+// session still holds: this session's own remaining in-memory shared
+// subscriptions, or any other session's persisted record (which covers the
+// cluster). One record walk answers for all durables, so a caller releasing
+// several in one operation (clear, forced leave, UNSUBSCRIBE) pays a single
+// scan. Spec5 [4.8.2].
+func (sess *mqttSession) sharedDurablesHeldByOthers(durables []string) map[string]bool {
+	held := make(map[string]bool, len(durables))
+	uniq := make([]string, 0, len(durables))
+	for _, d := range durables {
+		if _, ok := held[d]; !ok {
+			held[d] = false
+			uniq = append(uniq, d)
+		}
+	}
+	pending := len(uniq)
+	markOwned := func(key string) {
+		for _, d := range uniq {
+			if !held[d] && mqttSharedKeyOwnsDurable(key, d) {
+				held[d] = true
+				pending--
+			}
+		}
+	}
+
+	sess.mu.Lock()
+	for key := range sess.sharedSubs {
+		markOwned(key)
+	}
+	sess.mu.Unlock()
+
+	filter := mqttSessStreamSubjectPrefix + sess.domainTk + ">"
+	for seq := uint64(1); pending > 0; {
+		smsg, err := sess.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			// Only "no more messages" means the scan definitively found no other
+			// holder. Any other error (JS API timeout, meta-leader failover) is
+			// indeterminate — FAIL CLOSED and report every durable held, so the
+			// caller never deletes a group durable other members may still hold.
+			// Spec5 [4.8.2].
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				for _, d := range uniq {
+					held[d] = true
+				}
+			}
+			break
+		}
+		seq = smsg.Sequence + 1
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			continue
+		}
+		// This session's own record is covered by the in-memory check above; it
+		// may also be stale relative to a just-completed remove.
+		if ps.ID == sess.id {
+			continue
+		}
+		for key := range ps.SharedSubs {
+			markOwned(key)
+		}
+	}
+	return held
+}
+
+// mqttSharedDurablesForKey returns the group durable name(s) a shared
+// subscription session key maps to: the main durable, plus the level-up
+// durable for a "foo.>" filter ('#' semantics). Nil if the key does not parse.
+func mqttSharedDurablesForKey(key string) []string {
+	group, subject, ok := mqttParseSharedKey(key)
+	if !ok {
+		return nil
+	}
+	_, _, dur := mqttSharedNames(group, subject)
+	durs := []string{dur}
+	if mqttNeedSubForLevelUp(subject) {
+		_, _, ldur := mqttSharedNames(group, subject[:len(subject)-2])
+		durs = append(durs, ldur)
+	}
+	return durs
+}
+
+// mqttParseSharedKey splits a shared-subscription session key
+// ("$share/{ShareName}/{NATS subject}") back into its ShareName and subject.
+func mqttParseSharedKey(key string) (group, subject string, ok bool) {
+	if !strings.HasPrefix(key, string(mqttSharedSubPrefix)) {
+		return _EMPTY_, _EMPTY_, false
+	}
+	rest := key[len(mqttSharedSubPrefix):]
+	idx := strings.IndexByte(rest, mqttTopicLevelSep)
+	if idx <= 0 || idx == len(rest)-1 {
+		return _EMPTY_, _EMPTY_, false
+	}
+	return rest[:idx], rest[idx+1:], true
+}
+
+// mqttSharedKeyOwnsDurable reports whether a session holding the given shared
+// subscription key owns the given group durable. A "foo.>" filter owns both its
+// own durable and the level-up ("foo") durable created for '#' semantics.
+func mqttSharedKeyOwnsDurable(key, durable string) bool {
+	group, subject, ok := mqttParseSharedKey(key)
+	if !ok {
+		return false
+	}
+	if _, _, d := mqttSharedNames(group, subject); d == durable {
+		return true
+	}
+	if mqttNeedSubForLevelUp(subject) {
+		if _, _, d := mqttSharedNames(group, subject[:len(subject)-2]); d == durable {
+			return true
+		}
+	}
+	return false
+}
+
+// Queues the published retained messages for each subscription and signals
+// the writeLoop.
+func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
+	c.mu.Lock()
+	for _, sub := range subs {
+		if sub.mqtt != nil && sub.mqtt.prm != nil {
+			for _, data := range sub.mqtt.prm {
+				c.queueOutbound(data)
+			}
+			sub.mqtt.prm = nil
+		}
+	}
+	c.flushSignal()
+	c.mu.Unlock()
+}
+
+// mqttEnqueueSubAck enqueues a SUBACK and reports whether it was sent. A v5
+// SUBACK whose reason-code payload alone exceeds the client's Maximum Packet Size
+// is suppressed (returns false); the 3.1.1 path always sends.
+func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) bool {
+	w := newMQTTWriter(7 + len(filters))
+	w.WriteByte(mqttPacketSubAck)
+	// The per-filter byte (f.qos) is a granted QoS (0/1/2) or a failure reason
+	// code (0x80, or a more specific v5 code such as 0x9E); these are valid
+	// SUBACK reason codes, so the payload byte is identical for both protocol
+	// levels. v5 only adds a properties block before the reason codes.
+	if c.mqtt.proto == mqttProtoLevel5 {
+		// Carry the first failed filter's detail as the packet-level Reason
+		// String, when the client permits it. Spec5 [3.9.2.2.2].
+		var reasonStr string
+		for _, f := range filters {
+			if f.qos >= mqttSubAckFailure && f.reasonStr != _EMPTY_ {
+				reasonStr = f.reasonStr
+				break
+			}
+		}
+		props := c.mqttReasonProps(mqttPacketSubAck, reasonStr)
+		frame := func() []byte {
+			var vh mqttWriter
+			vh.WriteUint16(pi)
+			vh.writeProperties(props)
+			for _, f := range filters {
+				vh.WriteByte(f.qos)
+			}
+			w.Reset()
+			w.WriteByte(mqttPacketSubAck)
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			return w.Bytes()
+		}
+		buf := frame()
+		// Drop the Reason String (only) if it overflows the client's max.
+		if props != nil && !c.mqttFitsClientMax(len(buf)) {
+			props = nil
+			buf = frame()
+		}
+		// If the reason-code payload alone still overflows, the SUBACK cannot be
+		// sent [MQTT-3.1.2-24]; the subscription side effects stand.
+		return c.mqttEnqueueFittingProto(buf)
+	}
+	// packet length is 2 (for packet identifier) and 1 byte per filter.
+	w.WriteVarInt(2 + len(filters))
+	w.WriteUint16(pi)
+	for _, f := range filters {
+		w.WriteByte(f.qos)
+	}
+	c.mu.Lock()
+	c.enqueueProto(w.Bytes())
+	c.mu.Unlock()
+	return true
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// UNSUBSCRIBE related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (c *client) mqttParseUnsubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFilter, error) {
+	return c.mqttParseSubsOrUnsubs(r, b, pl, false)
+}
+
+// Process the UNSUBSCRIBE packet.
+//
+// Given the list of topics, this is going to unsubscribe the low level NATS subscriptions
+// and delete the JS durable consumers when applicable.
+//
+// Runs from the client's readLoop.
+// No lock held on entry.
+func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
+	// Those things are immutable, but since processing unsubs is not
+	// really in the fast path, let's get them under the client lock.
+	c.mu.Lock()
+	asm := c.mqtt.asm
+	sess := c.mqtt.sess
+	c.mu.Unlock()
+
+	if err := asm.lockSession(sess, c); err != nil {
+		return err
+	}
+	defer asm.unlockSession(sess)
+
+	// One record scan (heldShared, computed after the record save below) decides
+	// every shared durable this packet may release.
+	var heldShared map[string]bool
+	removeJSCons := func(sid string) {
+		cc, ok := sess.cons[sid]
+		if !ok {
+			// A shared filter's group durable must be released even without a
+			// local consumer entry (e.g. a per-filter restore failure left the
+			// membership persisted with no live join): derive the durable(s) from
+			// the session key — the persisted authority — like clear() does, and
+			// delete each that has no remaining holder. The membership was already
+			// removed and persisted above, so the scan is correct. Spec5 [4.8.2].
+			if strings.HasPrefix(sid, string(mqttSharedSubPrefix)) && !strings.HasSuffix(sid, mqttMultiLevelSidSuffix) {
+				for _, dur := range mqttSharedDurablesForKey(sid) {
+					if heldShared[dur] {
+						continue
+					}
+					if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+						c.Errorf("Unable to delete shared consumer %q: %v", dur, err)
+					}
+				}
+			}
+			return
+		}
+		delete(sess.cons, sid)
+		// A shared group consumer is released (deleted only if no other member
+		// remains); the leaving filter has already been removed from sharedSubs
+		// and persisted below, so the last-holder scan is correct. Spec5 [4.8.2].
+		if cc.DeliverGroup != _EMPTY_ {
+			sess.releaseSharedConsumer(c, cc, heldShared)
+			return
+		}
+		sess.deleteConsumer(cc)
+
+		c.mu.Lock()
+		sub := c.subs[cc.DeliverSubject]
+		c.mu.Unlock()
+
+		// Need lock here since these are accessed by callbacks
+		sess.mu.Lock()
+		// Mark the delivery sub closed so an in-flight QoS 1/2 callback stops
+		// tracking new messages after the purge (deleteConsumer is async);
+		// same barrier as the QoS 0 downgrade path in processJSConsumer.
+		if sub != nil && sub.mqtt != nil {
+			sess.subsMu.Lock()
+			sub.mqtt.closed = true
+			sess.subsMu.Unlock()
+		}
+		if seqPis, ok := sess.cpending[cc.Durable]; ok {
+			delete(sess.cpending, cc.Durable)
+			for _, pi := range seqPis {
+				delete(sess.pendingPublish, pi)
+			}
+			// last_pi stays monotonic (see untrackPublish); do not reset here.
+		}
+		sess.mu.Unlock()
+	}
+	// v5 UNSUBACK reports whether each subscription existed; the session maps are
+	// guarded by the session-manager lock held here. Spec5 [3.11.3].
+	for _, f := range filters {
+		sid := f.sessionKey()
+		var ok bool
+		if f.shared {
+			_, ok = sess.sharedSubs[sid]
+		} else {
+			_, ok = sess.subs[sid]
+		}
+		if !ok {
+			f.reason = mqttReasonNoSubscriptionExisted
+			f.reasonStr = "no matching subscription existed"
+		}
+	}
+	// UNSUBSCRIBE is transactional: persist the removals FIRST, and only tear down
+	// the NATS subscriptions and (shared) consumers once the record save is
+	// confirmed. Otherwise a failed save could leave the record claiming a
+	// subscription whose live join and group durable were already removed.
+	// Snapshot every affected map so a save failure fully rolls back in memory.
+	// Spec5 [4.8.2], [3.11.3].
+	snap := sess.snapshotSubs()
+	if err := sess.update(filters, false); err != nil {
+		// Roll back the in-memory removals; nothing was torn down yet.
+		sess.mu.Lock()
+		sess.subs = snap.subs
+		sess.sharedSubs = snap.shared
+		sess.rapSubs = snap.rap
+		sess.noLocalSubs = snap.noLocal
+		sess.subIDs = snap.subIDs
+		sess.mu.Unlock()
+		// v5 reports the failure per-filter (0x83) and still sends the UNSUBACK;
+		// 3.1.1 has no per-filter code, so surface the error (connection closes).
+		if c.mqtt.proto == mqttProtoLevel5 {
+			for _, f := range filters {
+				f.reason = mqttReasonImplementationSpecificError
+				f.reasonStr = "unable to persist unsubscribe"
+			}
+			return nil
+		}
+		return err
+	}
+	// Persist confirmed: tear down each filter's subscriptions/consumers. The
+	// leaving filters are already out of sharedSubs and persisted, so one scan
+	// now decides every shared durable this packet may release; keys the session
+	// still holds (e.g. "$share/g/foo" while "$share/g/foo.>" leaves) count as
+	// holders. Spec5 [4.8.2].
+	var sharedDurs []string
+	for _, f := range filters {
+		if f.shared {
+			sharedDurs = append(sharedDurs, mqttSharedDurablesForKey(f.sessionKey())...)
+		}
+	}
+	if len(sharedDurs) > 0 {
+		heldShared = sess.sharedDurablesHeldByOthers(sharedDurs)
+	}
+	for _, f := range filters {
+		sid := f.sessionKey()
+		removeJSCons(sid)
+		if err := c.processUnsub([]byte(sid)); err != nil {
+			c.Errorf("error unsubscribing from %q: %v", sid, err)
+		}
+		if mqttNeedSubForLevelUp(sid) {
+			subject := sid[:len(sid)-2]
+			sid = sid[:len(sid)-2] + mqttMultiLevelSidSuffix
+			removeJSCons(sid)
+			if err := c.processUnsub([]byte(sid)); err != nil {
+				c.Errorf("error unsubscribing from %q: %v", subject, err)
+			}
+		}
+	}
+	return nil
+}
+
+// mqttEnqueueUnsubAck enqueues an UNSUBACK and reports whether it was sent. A v5
+// UNSUBACK whose reason-code payload alone exceeds the client's Maximum Packet
+// Size is suppressed (returns false); the 3.1.1 path always sends.
+func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) bool {
+	if c.mqtt.proto == mqttProtoLevel5 {
+		// v5 UNSUBACK adds a properties block and one reason code per filter.
+		// Spec5 [3.11].
+		w := newMQTTWriter(7 + len(filters))
+		// Carry the first failed filter's detail as the packet-level Reason
+		// String, when the client permits it. Spec5 [3.11.2.1.2].
+		var reasonStr string
+		for _, f := range filters {
+			if f.reason != 0 && f.reasonStr != _EMPTY_ {
+				reasonStr = f.reasonStr
+				break
+			}
+		}
+		props := c.mqttReasonProps(mqttPacketUnsubAck, reasonStr)
+		frame := func() []byte {
+			var vh mqttWriter
+			vh.WriteUint16(pi)
+			vh.writeProperties(props)
+			for _, f := range filters {
+				vh.WriteByte(f.reason)
+			}
+			w.Reset()
+			w.WriteByte(mqttPacketUnsubAck)
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			return w.Bytes()
+		}
+		buf := frame()
+		// Drop the Reason String (only) if it overflows the client's max.
+		if props != nil && !c.mqttFitsClientMax(len(buf)) {
+			props = nil
+			buf = frame()
+		}
+		// If the reason-code payload alone still overflows, the UNSUBACK cannot be
+		// sent [MQTT-3.1.2-24]; the unsubscribe side effects stand.
+		return c.mqttEnqueueFittingProto(buf)
+	}
+	w := newMQTTWriter(4)
+	w.WriteByte(mqttPacketUnsubAck)
+	w.WriteVarInt(2)
+	w.WriteUint16(pi)
+	c.mu.Lock()
+	c.enqueueProto(w.Bytes())
+	c.mu.Unlock()
+	return true
+}
+
+func mqttUnsubscribeTrace(pi uint16, filters []*mqttFilter) string {
+	var sep string
+	sb := strings.Builder{}
+	sb.WriteString("[")
+	for i, f := range filters {
+		sb.WriteString(sep)
+		sb.Write(f.ttopic)
+		sb.WriteString(" (")
+		sb.WriteString(f.filter)
+		sb.WriteString(")")
+		if i == 0 {
+			sep = ", "
+		}
+	}
+	sb.WriteString(fmt.Sprintf("] pi=%v", pi))
+	return sb.String()
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// PINGREQ/PINGRESP related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (c *client) mqttEnqueuePingResp() {
+	// 2 bytes; always fits a connected client's Maximum Packet Size, checked for
+	// uniformity. [MQTT-3.1.2-24].
+	c.mqttEnqueueFittingProto(mqttPingResponse)
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// Trace functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func errOrTrace(err error, trace string) []byte {
+	if err != nil {
+		return []byte(err.Error())
+	}
+	return []byte(trace)
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// Subject/Topic conversion functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+// Converts an MQTT Topic Name to a NATS Subject (used by PUBLISH)
+// See mqttToNATSSubjectConversion() for details.
+func mqttTopicToNATSPubSubject(mt []byte) ([]byte, error) {
+	return mqttToNATSSubjectConversion(mt, false)
+}
+
+// Converts an MQTT Topic Filter to a NATS Subject (used by SUBSCRIBE)
+// See mqttToNATSSubjectConversion() for details.
+func mqttFilterToNATSSubject(filter []byte) ([]byte, error) {
+	return mqttToNATSSubjectConversion(filter, true)
+}
+
+// Converts an MQTT Topic Name or Filter to a NATS Subject.
+// In MQTT:
+// - a Topic Name does not have wildcard (PUBLISH uses only topic names).
+// - a Topic Filter can include wildcards (SUBSCRIBE uses those).
+// - '+' and '#' are wildcard characters (single and multiple levels respectively)
+// - '/' is the topic level separator.
+//
+// Conversion that occurs:
+//   - '/' is replaced with '/.' if it is the first character in mt
+//   - '/' is replaced with './' if the last or next character in mt is '/'
+//     For instance, foo//bar would become foo./.bar
+//   - '/' is replaced with '.' for all other conditions (foo/bar -> foo.bar)
+//   - '.' is replaced with '//'.
+//   - ' ' cause an error to be returned.
+//
+// If there is no need to convert anything (say "foo" remains "foo"), then
+// the no memory is allocated and the returned slice is the original `mt`.
+func mqttToNATSSubjectConversion(mt []byte, wcOk bool) ([]byte, error) {
+	var cp bool
+	var j int
+	res := mt
+
+	makeCopy := func(i int) {
+		cp = true
+		res = make([]byte, 0, len(mt)+10)
+		if i > 0 {
+			res = append(res, mt[:i]...)
+		}
+	}
+
+	end := len(mt) - 1
+	for i := 0; i < len(mt); i++ {
+		switch mt[i] {
+		case mqttTopicLevelSep:
+			if i == 0 || res[j-1] == btsep {
+				if !cp {
+					makeCopy(0)
+				}
+				res = append(res, mqttTopicLevelSep, btsep)
+				j++
+			} else if i == end || mt[i+1] == mqttTopicLevelSep {
+				if !cp {
+					makeCopy(i)
+				}
+				res = append(res, btsep, mqttTopicLevelSep)
+				j++
+			} else {
+				if !cp {
+					makeCopy(i)
+				}
+				res = append(res, btsep)
+			}
+		case ' ', '\t', '\n', '\r', '\f':
+			// We cannot support whitespace in the MQTT topic/filter — these
+			// characters would also corrupt the NATS wire protocol when the
+			// subject is forwarded to other connection types (e.g. leaf
+			// nodes) where the resulting control line could be split.
+			return nil, errMQTTUnsupportedCharacters
+		case 0x7f:
+			// SubjectTree uses DEL as an internal pivot marker, so retained
+			// subjects containing it cannot be indexed safely, including
+			// legacy retained messages recovered from the retained-message
+			// stream.
+			return nil, errMQTTUnsupportedCharacters
+		case btsep:
+			if !cp {
+				makeCopy(i)
+			}
+			res = append(res, mqttTopicLevelSep, mqttTopicLevelSep)
+			j++
+		case mqttSingleLevelWC, mqttMultiLevelWC:
+			if !wcOk {
+				// Spec [MQTT-3.3.2-2] and [MQTT-4.7.1-1]
+				// The wildcard characters can be used in Topic Filters, but MUST NOT be used within a Topic Name
+				return nil, fmt.Errorf("%w: wildcards not allowed in publish's topic: %q", errMQTTMalformedPacket, mt)
+			}
+			// Spec [MQTT-4.7.1-3]: '#' must be on its own or follow a level
+			// separator, and in either case must be the LAST character of the
+			// filter (no further levels after it). Checked here — rather than
+			// relying on the embedded nats-server's internal subject validator
+			// the way upstream implicitly does — because in the standalone
+			// broker a malformed subject reaches nats.go's Subscribe() over a
+			// real connection (nats.go's own client-side check does not catch
+			// this), and letting it through disrupts that shared connection's
+			// other in-flight requests rather than failing this one filter.
+			if mt[i] == mqttMultiLevelWC && (i != end || (i > 0 && mt[i-1] != mqttTopicLevelSep)) {
+				return nil, fmt.Errorf("%w: multi-level wildcard must be the last character in filter: %q", errMQTTMalformedPacket, mt)
+			}
+			if !cp {
+				makeCopy(i)
+			}
+			if mt[i] == mqttSingleLevelWC {
+				res = append(res, pwc)
+			} else {
+				res = append(res, fwc)
+			}
+		default:
+			if cp {
+				res = append(res, mt[i])
+			}
+		}
+		j++
+	}
+	if cp && res[j-1] == btsep {
+		res = append(res, mqttTopicLevelSep)
+		j++
+	}
+	return res[:j], nil
+}
+
+// Converts a NATS subject to MQTT topic. This is for publish
+// messages only, so there is no checking for wildcards.
+// Rules are reversed of mqttToNATSSubjectConversion.
+func natsSubjectStrToMQTTTopic(subject string) []byte {
+	return natsSubjectToMQTTTopic(stringToBytes(subject))
+}
+
+func natsSubjectToMQTTTopic(subject []byte) []byte {
+	topic := make([]byte, len(subject))
+	end := len(subject) - 1
+	var j int
+	for i := 0; i < len(subject); i++ {
+		switch subject[i] {
+		case mqttTopicLevelSep:
+			if i < end {
+				switch c := subject[i+1]; c {
+				case btsep, mqttTopicLevelSep:
+					if c == btsep {
+						topic[j] = mqttTopicLevelSep
+					} else {
+						topic[j] = btsep
+					}
+					j++
+					i++
+				default:
+				}
+			}
+		case btsep:
+			topic[j] = mqttTopicLevelSep
+			j++
+		default:
+			topic[j] = subject[i]
+			j++
+		}
+	}
+	return topic[:j]
+}
+
+// Returns true if the subject has more than 1 token and ends with ".>"
+func mqttNeedSubForLevelUp(subject string) bool {
+	if len(subject) < 3 {
+		return false
+	}
+	end := len(subject)
+	if subject[end-2] == '.' && subject[end-1] == fwc {
+		return true
+	}
+	return false
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// MQTT Reader functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (r *mqttReader) reset(buf []byte) {
+	if l := len(r.pbuf); l > 0 {
+		tmp := make([]byte, l+len(buf))
+		copy(tmp, r.pbuf)
+		copy(tmp[l:], buf)
+		buf = tmp
+		r.pbuf = nil
+	}
+	r.buf = buf
+	r.pos = 0
+	r.pstart = 0
+}
+
+func (r *mqttReader) hasMore() bool {
+	return r.pos != len(r.buf)
+}
+
+func (r *mqttReader) readByte(field string) (byte, error) {
+	if r.pos == len(r.buf) {
+		return 0, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.EOF)
+	}
+	b := r.buf[r.pos]
+	r.pos++
+	return b, nil
+}
+
+func (r *mqttReader) readPacketLen(maxLen int32) (int, bool, error) {
+	v, complete, err := r.readVarInt()
+	if err != nil {
+		return 0, false, err
+	}
+	if complete {
+		packetEnd := r.pos + v
+		packetLen := packetEnd - r.pstart
+		if maxLen != jwt.NoLimit && int64(packetLen) > int64(maxLen) {
+			return packetLen, false, ErrMaxPayload
+		}
+		if packetEnd <= len(r.buf) {
+			return v, true, nil
+		}
+	}
+	r.pbuf = make([]byte, len(r.buf)-r.pstart)
+	copy(r.pbuf, r.buf[r.pstart:])
+	return 0, false, nil
+}
+
+func (r *mqttReader) readVarInt() (int, bool, error) {
+	m := 1
+	v := 0
+	for {
+		var b byte
+		if r.pos != len(r.buf) {
+			b = r.buf[r.pos]
+			r.pos++
+		} else {
+			break
+		}
+		v += int(b&0x7f) * m
+		if (b & 0x80) == 0 {
+			return v, true, nil
+		}
+		m *= 0x80
+		if m > 0x200000 {
+			return 0, false, errMQTTMalformedVarInt
+		}
+	}
+	return 0, false, nil
+}
+
+func (r *mqttReader) readString(field string) (string, error) {
+	var s string
+	bs, err := r.readBytes(field, false)
+	if err == nil {
+		s = string(bs)
+	}
+	return s, err
+}
+
+func (r *mqttReader) readBytes(field string, cp bool) ([]byte, error) {
+	luint, err := r.readUint16(field)
+	if err != nil {
+		return nil, err
+	}
+	l := int(luint)
+	if l == 0 {
+		return nil, nil
+	}
+	start := r.pos
+	if start+l > len(r.buf) {
+		return nil, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.ErrUnexpectedEOF)
+	}
+	r.pos += l
+	b := r.buf[start:r.pos]
+	if cp {
+		b = copyBytes(b)
+	}
+	return b, nil
+}
+
+func (r *mqttReader) readUint16(field string) (uint16, error) {
+	if len(r.buf)-r.pos < 2 {
+		return 0, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.ErrUnexpectedEOF)
+	}
+	start := r.pos
+	r.pos += 2
+	return binary.BigEndian.Uint16(r.buf[start:r.pos]), nil
+}
+
+func (r *mqttReader) readUint32(field string) (uint32, error) {
+	if len(r.buf)-r.pos < 4 {
+		return 0, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.ErrUnexpectedEOF)
+	}
+	start := r.pos
+	r.pos += 4
+	return binary.BigEndian.Uint32(r.buf[start:r.pos]), nil
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// MQTT Writer functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (w *mqttWriter) WriteUint16(i uint16) {
+	w.WriteByte(byte(i >> 8))
+	w.WriteByte(byte(i))
+}
+
+func (w *mqttWriter) WriteUint32(i uint32) {
+	w.WriteByte(byte(i >> 24))
+	w.WriteByte(byte(i >> 16))
+	w.WriteByte(byte(i >> 8))
+	w.WriteByte(byte(i))
+}
+
+func (w *mqttWriter) WriteString(s string) {
+	w.WriteBytes([]byte(s))
+}
+
+func (w *mqttWriter) WriteBytes(bs []byte) {
+	w.WriteUint16(uint16(len(bs)))
+	w.Write(bs)
+}
+
+func (w *mqttWriter) WriteVarInt(value int) {
+	for {
+		b := byte(value & 0x7f)
+		value >>= 7
+		if value > 0 {
+			b |= 0x80
+		}
+		w.WriteByte(b)
+		if value == 0 {
+			break
+		}
+	}
+}
+
+func newMQTTWriter(cap int) *mqttWriter {
+	w := &mqttWriter{}
+	w.Grow(cap)
+	return w
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// MQTT 5.0 properties codec
+//
+// References to "spec5" here are from
+// https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html
+//
+//////////////////////////////////////////////////////////////////////////////
+
+// mqttPropertyKnown reports whether prop is a property identifier defined by
+// MQTT 5.0. Used to give a clearer error for genuinely unknown identifiers.
+func mqttPropertyKnown(prop byte) bool {
+	switch prop {
+	case mqttPropPayloadFormat, mqttPropMessageExpiry, mqttPropContentType,
+		mqttPropResponseTopic, mqttPropCorrelationData, mqttPropSubscriptionID,
+		mqttPropSessionExpiry, mqttPropAssignedClientID, mqttPropServerKeepAlive,
+		mqttPropAuthMethod, mqttPropAuthData, mqttPropRequestProblemInfo,
+		mqttPropWillDelay, mqttPropRequestResponseInfo, mqttPropResponseInfo,
+		mqttPropServerReference, mqttPropReasonString, mqttPropReceiveMaximum,
+		mqttPropTopicAliasMax, mqttPropTopicAlias, mqttPropMaxQoS,
+		mqttPropRetainAvailable, mqttPropUserProperty, mqttPropMaxPacketSize,
+		mqttPropWildcardSubAvailable, mqttPropSubIDAvailable, mqttPropSharedSubAvailable:
+		return true
+	}
+	return false
+}
+
+// mqttPropsContextWill is a pseudo "packet type" used to validate Will
+// properties, which travel inside a CONNECT payload but have their own allowed
+// property set. It cannot collide with real packet types (multiples of 0x10).
+const mqttPropsContextWill = byte(0x01)
+
+// mqttPropsContextPubOut is a pseudo "packet type" for a server-to-client
+// (outbound) PUBLISH, which unlike an inbound PUBLISH may carry a server-injected
+// Subscription Identifier and a server-assigned Topic Alias. Used to
+// parse/validate delivered PUBLISH blocks (e.g. in tests). It cannot collide
+// with real packet types (multiples of 0x10).
+const mqttPropsContextPubOut = byte(0x02)
+
+// mqttPropertyAllowed reports whether property prop may appear in the given
+// context (a packet type, or mqttPropsContextWill / mqttPropsContextPubOut).
+// Spec5 [2.2.2.2] table of which properties belong to which packets.
+func mqttPropertyAllowed(prop, ctx byte) bool {
+	switch prop {
+	case mqttPropPayloadFormat, mqttPropMessageExpiry, mqttPropContentType,
+		mqttPropResponseTopic, mqttPropCorrelationData:
+		return ctx == mqttPacketPub || ctx == mqttPropsContextWill || ctx == mqttPropsContextPubOut
+	case mqttPropSubscriptionID:
+		// A Subscription Identifier is valid on a SUBSCRIBE and, from the server,
+		// on a delivered PUBLISH (mqttPropsContextPubOut). A client-to-server
+		// PUBLISH MUST NOT carry one (spec5 [MQTT-3.3.4-6]); inbound PUBLISH
+		// properties and forwarded blocks are validated with the mqttPacketPub
+		// context, so a client-supplied identifier is still rejected.
+		return ctx == mqttPacketSub || ctx == mqttPropsContextPubOut
+	case mqttPropSessionExpiry:
+		return ctx == mqttPacketConnect || ctx == mqttPacketConnectAck || ctx == mqttPacketDisconnect
+	case mqttPropAssignedClientID, mqttPropServerKeepAlive, mqttPropResponseInfo,
+		mqttPropMaxQoS, mqttPropRetainAvailable, mqttPropWildcardSubAvailable,
+		mqttPropSubIDAvailable, mqttPropSharedSubAvailable:
+		return ctx == mqttPacketConnectAck
+	case mqttPropAuthMethod, mqttPropAuthData:
+		return ctx == mqttPacketConnect || ctx == mqttPacketConnectAck || ctx == mqttPacketAuth
+	case mqttPropRequestProblemInfo, mqttPropRequestResponseInfo:
+		return ctx == mqttPacketConnect
+	case mqttPropWillDelay:
+		return ctx == mqttPropsContextWill
+	case mqttPropServerReference:
+		return ctx == mqttPacketConnectAck || ctx == mqttPacketDisconnect
+	case mqttPropReasonString:
+		switch ctx {
+		case mqttPacketConnectAck, mqttPacketPubAck, mqttPacketPubRec, mqttPacketPubRel,
+			mqttPacketPubComp, mqttPacketSubAck, mqttPacketUnsubAck, mqttPacketDisconnect,
+			mqttPacketAuth:
+			return true
+		}
+		return false
+	case mqttPropReceiveMaximum, mqttPropTopicAliasMax, mqttPropMaxPacketSize:
+		return ctx == mqttPacketConnect || ctx == mqttPacketConnectAck
+	case mqttPropTopicAlias:
+		// Valid on a client PUBLISH and, from the server, on a delivered PUBLISH
+		// (mqttPropsContextPubOut). mqttValidateForwardProps still rejects a
+		// publisher-smuggled alias via the mqttPacketPub context.
+		return ctx == mqttPacketPub || ctx == mqttPropsContextPubOut
+	case mqttPropUserProperty:
+		// Allowed in every packet that carries a properties section.
+		return true
+	}
+	return false
+}
+
+// readProperties parses an MQTT 5.0 properties block from the reader for the
+// given context (packet type or mqttPropsContextWill). The whole packet is
+// already buffered by the dispatch loop, so the var-int length must complete.
+// It validates length, identifiers, packet-context, and illegal duplicates.
+// Returns nil (no error) when the block is present but empty.
+// readPropString reads a UTF-8 Encoded String property value and enforces the
+// well-formedness rules of Spec5 [MQTT-1.5.4-1]/[MQTT-1.5.4-2] (valid UTF-8, no
+// U+0000). Ill-formed values are a Malformed Packet; without this check the
+// server would relay protocol-violating bytes on to subscribers.
+func (r *mqttReader) readPropString(field string) (string, error) {
+	s, err := r.readString(field)
+	if err != nil {
+		return _EMPTY_, err
+	}
+	if err = mqttValidateString(s, field); err != nil {
+		return _EMPTY_, fmt.Errorf("%w: %v", errMQTTMalformedProperties, err)
+	}
+	return s, nil
+}
+
+func (r *mqttReader) readProperties(ctx byte) (*mqttProperties, error) {
+	plen, complete, err := r.readVarInt()
+	if err != nil {
+		return nil, err
+	}
+	if !complete {
+		return nil, errMQTTMalformedProperties
+	}
+	if plen == 0 {
+		return nil, nil
+	}
+	end := r.pos + plen
+	if end > len(r.buf) {
+		return nil, errMQTTMalformedProperties
+	}
+	props := &mqttProperties{present: make(map[byte]bool)}
+	for r.pos < end {
+		prop, err := r.readByte("property id")
+		if err != nil {
+			return nil, err
+		}
+		if !mqttPropertyAllowed(prop, ctx) {
+			if !mqttPropertyKnown(prop) {
+				return nil, fmt.Errorf("%w: 0x%x", errMQTTUnknownProperty, prop)
+			}
+			return nil, fmt.Errorf("%w: 0x%x", errMQTTPropertyNotAllowed, prop)
+		}
+		// All properties are non-repeatable except User Property and
+		// Subscription Identifier. Spec5 [2.2.2.1].
+		if prop != mqttPropUserProperty && prop != mqttPropSubscriptionID {
+			if props.present[prop] {
+				return nil, fmt.Errorf("%w: 0x%x", errMQTTDuplicateProperty, prop)
+			}
+			props.present[prop] = true
+		}
+		switch prop {
+		case mqttPropPayloadFormat:
+			props.payloadFormat, err = r.readByte("payload format indicator")
+			if err == nil && props.payloadFormat > 1 {
+				// Spec5 [3.3.2.3.2]: only 0 or 1 are defined.
+				err = fmt.Errorf("%w: payload format indicator %d", errMQTTProtocolError, props.payloadFormat)
+			}
+		case mqttPropRequestProblemInfo:
+			props.requestProblem, err = r.readByte("request problem information")
+			if err == nil && props.requestProblem > 1 {
+				// Spec5 [3.1.2.11.7]: a value other than 0 or 1 is a Protocol Error.
+				err = fmt.Errorf("%w: request problem information %d", errMQTTProtocolError, props.requestProblem)
+			}
+		case mqttPropRequestResponseInfo:
+			props.requestResponse, err = r.readByte("request response information")
+			if err == nil && props.requestResponse > 1 {
+				// Spec5 [3.1.2.11.6]: a value other than 0 or 1 is a Protocol Error.
+				err = fmt.Errorf("%w: request response information %d", errMQTTProtocolError, props.requestResponse)
+			}
+		case mqttPropMaxQoS:
+			props.maxQoS, err = r.readByte("maximum qos")
+		case mqttPropRetainAvailable:
+			props.retainAvailable, err = r.readByte("retain available")
+		case mqttPropWildcardSubAvailable:
+			props.wildcardSubAvail, err = r.readByte("wildcard subscription available")
+		case mqttPropSubIDAvailable:
+			props.subIDAvail, err = r.readByte("subscription identifier available")
+		case mqttPropSharedSubAvailable:
+			props.sharedSubAvail, err = r.readByte("shared subscription available")
+		case mqttPropServerKeepAlive:
+			props.serverKeepAlive, err = r.readUint16("server keep alive")
+		case mqttPropReceiveMaximum:
+			if props.receiveMax, err = r.readUint16("receive maximum"); err == nil && props.receiveMax == 0 {
+				// Spec5 [3.1.2.11.3]: a Receive Maximum value of 0 is a Protocol
+				// Error. (Absent means no property, i.e. the default, which we
+				// treat as no client-imposed limit.)
+				err = fmt.Errorf("%w: receive maximum of 0", errMQTTProtocolError)
+			}
+		case mqttPropTopicAliasMax:
+			props.topicAliasMax, err = r.readUint16("topic alias maximum")
+		case mqttPropTopicAlias:
+			props.topicAlias, err = r.readUint16("topic alias")
+		case mqttPropMessageExpiry:
+			props.messageExpiry, err = r.readUint32("message expiry interval")
+		case mqttPropSessionExpiry:
+			props.sessionExpiry, err = r.readUint32("session expiry interval")
+		case mqttPropWillDelay:
+			props.willDelay, err = r.readUint32("will delay interval")
+		case mqttPropMaxPacketSize:
+			// The client is telling us the largest packet it will accept. We honor
+			// this on every server-generated packet: an outbound PUBLISH exceeding
+			// it is discarded (mqttEnqueuePublishMsgTo, serializeRetainedMsgsForSub),
+			// and any other packet drops its Reason String or, failing that, is not
+			// sent (mqttEnqueueFittingProto). Stored as c.mqtt.maxPacketSize. Spec5
+			// [3.1.2.11.4].
+			if props.maxPacketSize, err = r.readUint32("maximum packet size"); err == nil && props.maxPacketSize == 0 {
+				// Spec5 [3.1.2.11.4]: a Maximum Packet Size of 0 is a Protocol
+				// Error. (Absent means no property, i.e. no client-imposed limit.)
+				err = fmt.Errorf("%w: maximum packet size of 0", errMQTTProtocolError)
+			}
+		case mqttPropContentType:
+			props.contentType, err = r.readPropString("content type")
+		case mqttPropResponseTopic:
+			props.responseTopic, err = r.readPropString("response topic")
+			if err == nil && strings.ContainsAny(props.responseTopic, "+#") {
+				// Spec5 [3.3.2.3.5]: the Response Topic must not contain
+				// wildcard characters; treat it as a Protocol Error.
+				err = fmt.Errorf("%w: wildcard in response topic %q", errMQTTProtocolError, props.responseTopic)
+			}
+		case mqttPropAssignedClientID:
+			props.assignedClientID, err = r.readPropString("assigned client identifier")
+		case mqttPropAuthMethod:
+			props.authMethod, err = r.readPropString("authentication method")
+		case mqttPropResponseInfo:
+			props.responseInfo, err = r.readPropString("response information")
+		case mqttPropServerReference:
+			_, err = r.readPropString("server reference")
+		case mqttPropReasonString:
+			props.reasonString, err = r.readPropString("reason string")
+		case mqttPropCorrelationData:
+			props.correlationData, err = r.readBytes("correlation data", true)
+		case mqttPropAuthData:
+			props.authData, err = r.readBytes("authentication data", true)
+		case mqttPropSubscriptionID:
+			var v int
+			var complete bool
+			v, complete, err = r.readVarInt()
+			if err == nil && !complete {
+				err = errMQTTMalformedProperties
+			}
+			if err == nil {
+				// Spec5 [3.3.2.3.8]/[3.8.2.1.2]: a value of 0 is a Protocol Error.
+				if v == 0 {
+					return nil, fmt.Errorf("%w: subscription identifier of 0", errMQTTProtocolError)
+				}
+				props.subIDs = append(props.subIDs, v)
+			}
+		case mqttPropUserProperty:
+			var k, val string
+			if k, err = r.readPropString("user property key"); err == nil {
+				val, err = r.readPropString("user property value")
+			}
+			if err == nil {
+				props.user = append(props.user, mqttUserProperty{key: k, value: val})
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	// A property that lied about its length will have advanced past the
+	// declared end; reject such packets as malformed. Spec5 [2.2.2.1].
+	if r.pos != end {
+		return nil, errMQTTMalformedProperties
+	}
+	return props, nil
+}
+
+// encode writes the set properties as a properties body (without the leading
+// length). Scalar/byte/int properties are written only when flagged present;
+// strings/slices when non-empty. Used by the server to emit properties.
+func (p *mqttProperties) encode(w *mqttWriter) {
+	if p == nil {
+		return
+	}
+	wb := func(id, v byte) {
+		w.WriteByte(id)
+		w.WriteByte(v)
+	}
+	w16 := func(id byte, v uint16) {
+		w.WriteByte(id)
+		w.WriteUint16(v)
+	}
+	w32 := func(id byte, v uint32) {
+		w.WriteByte(id)
+		w.WriteUint32(v)
+	}
+	if p.present[mqttPropPayloadFormat] {
+		wb(mqttPropPayloadFormat, p.payloadFormat)
+	}
+	if p.present[mqttPropMessageExpiry] {
+		w32(mqttPropMessageExpiry, p.messageExpiry)
+	}
+	if p.present[mqttPropContentType] {
+		w.WriteByte(mqttPropContentType)
+		w.WriteString(p.contentType)
+	}
+	if p.present[mqttPropResponseTopic] {
+		w.WriteByte(mqttPropResponseTopic)
+		w.WriteString(p.responseTopic)
+	}
+	if p.present[mqttPropCorrelationData] {
+		w.WriteByte(mqttPropCorrelationData)
+		w.WriteBytes(p.correlationData)
+	}
+	if p.present[mqttPropSessionExpiry] {
+		w32(mqttPropSessionExpiry, p.sessionExpiry)
+	}
+	if p.present[mqttPropReceiveMaximum] {
+		w16(mqttPropReceiveMaximum, p.receiveMax)
+	}
+	if p.present[mqttPropMaxQoS] {
+		wb(mqttPropMaxQoS, p.maxQoS)
+	}
+	if p.present[mqttPropRetainAvailable] {
+		wb(mqttPropRetainAvailable, p.retainAvailable)
+	}
+	if p.present[mqttPropMaxPacketSize] {
+		w32(mqttPropMaxPacketSize, p.maxPacketSize)
+	}
+	if p.assignedClientID != _EMPTY_ {
+		w.WriteByte(mqttPropAssignedClientID)
+		w.WriteString(p.assignedClientID)
+	}
+	if p.responseInfo != _EMPTY_ {
+		w.WriteByte(mqttPropResponseInfo)
+		w.WriteString(p.responseInfo)
+	}
+	if p.present[mqttPropTopicAliasMax] {
+		w16(mqttPropTopicAliasMax, p.topicAliasMax)
+	}
+	if p.present[mqttPropServerKeepAlive] {
+		w16(mqttPropServerKeepAlive, p.serverKeepAlive)
+	}
+	if p.reasonString != _EMPTY_ {
+		w.WriteByte(mqttPropReasonString)
+		w.WriteString(p.reasonString)
+	}
+	if p.present[mqttPropWildcardSubAvailable] {
+		wb(mqttPropWildcardSubAvailable, p.wildcardSubAvail)
+	}
+	if p.present[mqttPropSubIDAvailable] {
+		wb(mqttPropSubIDAvailable, p.subIDAvail)
+	}
+	if p.present[mqttPropSharedSubAvailable] {
+		wb(mqttPropSharedSubAvailable, p.sharedSubAvail)
+	}
+	for _, up := range p.user {
+		w.WriteByte(mqttPropUserProperty)
+		w.WriteString(up.key)
+		w.WriteString(up.value)
+	}
+}
+
+// writeProperties writes a length-prefixed MQTT 5.0 properties block. A nil
+// (or empty) set is encoded as a single 0 length byte, which is mandatory in
+// every v5 packet that has a properties section. Spec5 [2.2.2.1].
+func (w *mqttWriter) writeProperties(p *mqttProperties) {
+	if p == nil {
+		w.WriteVarInt(0)
+		return
+	}
+	body := newMQTTWriter(0)
+	p.encode(body)
+	b := body.Bytes()
+	w.WriteVarInt(len(b))
+	w.Write(b)
+}

@@ -1,0 +1,17 @@
+mqtt-nats-bridge
+Copyright 2026 The mqtt-nats-bridge Authors
+
+This product includes software developed at The NATS Authors.
+
+Substantial portions of this software — in particular the MQTT protocol
+implementation under internal/mqtt/ (mqtt.go, the vendored helpers in
+compat_*.go, and the aliased wire types) — are derived from NATS server
+(https://github.com/nats-io/nats-server), which is licensed under the
+Apache License, Version 2.0.
+
+    Copyright 2012-2026 The NATS Authors
+    Licensed under the Apache License, Version 2.0
+
+The original NATS source files retain their upstream copyright headers. This
+project adapts that code to run as a standalone MQTT broker against an external
+NATS/JetStream cluster.

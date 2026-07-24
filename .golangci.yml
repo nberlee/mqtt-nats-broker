@@ -1,0 +1,22 @@
+# golangci-lint configuration.
+run:
+  timeout: 5m
+
+issues:
+  exclude-rules:
+    # The ported NATS-server MQTT core and vendored helpers are kept faithful to
+    # upstream (diff-able), so they are not subject to this repo's lint style.
+    - path: 'internal/mqtt/(mqtt|compat_.*)\.go'
+      linters: [govet, staticcheck, gocritic, revive, stylecheck, gosec, errcheck, ineffassign, unused]
+
+linters:
+  enable:
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - errcheck
+    - misspell
+    - bodyclose
+    - gofmt
+    - goimports
