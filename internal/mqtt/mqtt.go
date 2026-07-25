@@ -450,6 +450,12 @@ type mqttAccountSessionManager struct {
 	// expiry checks still apply; only storage reaping is lost.
 	msgsStreamNoTTL  bool
 	rmsgsStreamNoTTL bool
+
+	// testPublishWill, when non-nil, replaces the delayed-Will publication for
+	// THIS account manager only (instance-scoped, so parallel tests stay
+	// isolated). Set/read under mu. Used to inject publish failures and verify
+	// cross-replica recovery. Nil in production. See publishWillRecord.
+	testPublishWill func(rec *mqttWillOutbox) error
 }
 
 type mqttJSAResponse struct {

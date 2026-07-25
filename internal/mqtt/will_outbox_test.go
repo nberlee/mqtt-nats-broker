@@ -250,6 +250,106 @@ func TestMQTTWillOutboxShutdownUnblocksBarrier(t *testing.T) {
 	}
 }
 
+// TestMQTTWillOutboxPublishFailureRecovery: when a claimant fails during
+// publication (before any message is delivered), the record stays publishing and
+// a surviving replica reclaims it on lease expiry and publishes the Will — proving
+// the durable outbox's central recovery promise (a Will is not lost on claimant
+// failure). Uses an instance-scoped publish seam so the injected failure is
+// isolated to a specific broker, not a package global.
+func TestMQTTWillOutboxPublishFailureRecovery(t *testing.T) {
+	oA := testMQTTDefaultOptionsV5()
+	sA := testMQTTRunServer(t, oA)
+	sB, oB := runSharedReplica(t, oA)
+	defer testMQTTShutdownServer(sB) // shared-NATS owner: LIFO runs this last
+	defer sA.Shutdown()              // idempotent; A is also stopped mid-test
+
+	asmA := testMQTTGetGlobalASM(t, sA)
+	asmB := testMQTTGetGlobalASM(t, sB)
+
+	// Inject a publish failure BEFORE any delivery on both replicas, so whichever
+	// wins pending->publishing fails and leaves the record publishing.
+	failPublish := func(rec *mqttWillOutbox) error { return fmt.Errorf("injected publish failure") }
+	setWillPublishHook(asmA, failPublish)
+	setWillPublishHook(asmB, failPublish)
+
+	// Subscriber on the survivor (B), which must receive the recovered Will.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "pfrsub", cleanStart: true}, oB.MQTT.Host, oB.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/pfr", opts: 0}})
+
+	// Enqueue a due delayed Will via a client disconnect on A.
+	will := &mqttWill{topic: []byte("will/pfr"), message: []byte("survives"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "pfrpub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(60)}, oA.MQTT.Host, oA.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	// A claimant took the record and its publish failed: the record must remain in
+	// publishing (not deleted, not done), and nothing was delivered.
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		if !testMQTTHasWillState(t, asmB, mqttWillPublishing) {
+			return fmt.Errorf("record not in publishing state yet")
+		}
+		return nil
+	})
+	if testMQTTHasWillState(t, asmB, mqttWillDone) {
+		t.Fatal("record was marked done despite the injected publish failure")
+	}
+	testMQTTExpectNothing(t, rs)
+
+	// Recovery: clear B's failure and stop A, so B is the sole replica that will
+	// reclaim the expired-lease publishing record and publish the Will.
+	setWillPublishHook(asmB, nil)
+	sA.Shutdown()
+
+	// The survivor publishes the Will exactly once.
+	testMQTTReadPublishV5(t, rs, "will/pfr", []byte("survives"))
+	testMQTTExpectNothing(t, rs)
+
+	// The successful native record is eventually removed.
+	checkFor(t, 3*time.Second, 20*time.Millisecond, func() error {
+		if n := testMQTTCountWillRecords(t, asmB); n != 0 {
+			return fmt.Errorf("expected outbox record removed after publish, got %d", n)
+		}
+		return nil
+	})
+}
+
+// setWillPublishHook installs (or clears) the instance-scoped publish seam on asm.
+func setWillPublishHook(asm *mqttAccountSessionManager, fn func(rec *mqttWillOutbox) error) {
+	asm.mu.Lock()
+	asm.testPublishWill = fn
+	asm.mu.Unlock()
+}
+
+// testMQTTGetGlobalASM returns the eager-initialized global account session
+// manager for s (available after Start without any client).
+func testMQTTGetGlobalASM(t testing.TB, s *Server) *mqttAccountSessionManager {
+	t.Helper()
+	sm := &s.mqtt.sessmgr
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	asm := sm.sessions[s.globalAccount().GetName()]
+	require_NotNil(t, asm)
+	return asm
+}
+
+// testMQTTCountWillRecords returns the number of outbox records for the account.
+func testMQTTCountWillRecords(t testing.TB, asm *mqttAccountSessionManager) int {
+	t.Helper()
+	n := 0
+	for seq := uint64(1); ; {
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttWillQStreamName, mqttWillQAccountFilter(asm.domainTk), seq)
+		if err != nil {
+			break
+		}
+		seq = smsg.Sequence + 1
+		n++
+	}
+	return n
+}
+
 // testMQTTHasWillState reports whether any outbox record for the account is in
 // the given state.
 func testMQTTHasWillState(t testing.TB, asm *mqttAccountSessionManager, want mqttWillState) bool {

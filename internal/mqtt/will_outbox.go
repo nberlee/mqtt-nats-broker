@@ -370,6 +370,15 @@ func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string
 // by the JSA request timeout; this is the same publish core the immediate-Will
 // path uses, so it inherits that path's bounding rather than blocking forever.
 func (as *mqttAccountSessionManager) publishWillRecord(s *Server, rec *mqttWillOutbox) error {
+	// Instance-scoped test seam: replace the actual publication for this account
+	// manager only (used to inject publish failures in recovery tests). Nil in
+	// production.
+	as.mu.RLock()
+	hook := as.testPublishWill
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(rec)
+	}
 	subject, err := mqttTopicToNATSPubSubject([]byte(rec.Topic))
 	if err != nil {
 		// A malformed topic can never be published; drop it rather than retry
