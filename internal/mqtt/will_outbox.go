@@ -179,7 +179,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash strin
 	}
 	var err error
 	for attempt := 0; attempt < mqttWillEnqueueAttempts; attempt++ {
-		if _, err = as.jsa.storeWillOutboxCAS(subject, 0, rec); err == nil {
+		if _, err = as.storeWillEnqueueCAS(subject, 0, rec); err == nil {
 			return nil
 		}
 		// The create-only CAS may have failed because our own earlier attempt's
@@ -199,6 +199,21 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash strin
 		return perr
 	}
 	return nil
+}
+
+// storeWillEnqueueCAS performs the enqueue's create-only CAS store, honoring an
+// instance-scoped test seam that can inject a store failure to drive the
+// immediate-publish fail-safe. Nil seam in production delegates straight to the
+// JSA. Only the enqueue path is routed through here so an injected failure never
+// perturbs the cancel/fire/migration stores on the same account manager.
+func (as *mqttAccountSessionManager) storeWillEnqueueCAS(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error) {
+	as.mu.RLock()
+	hook := as.testEnqueueStore
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(subject, expectSeq, rec)
+	}
+	return as.jsa.storeWillOutboxCAS(subject, expectSeq, rec)
 }
 
 // cancelWillOutbox suppresses a reconnecting client's pending delayed Wills by

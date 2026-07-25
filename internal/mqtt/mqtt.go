@@ -456,6 +456,12 @@ type mqttAccountSessionManager struct {
 	// isolated). Set/read under mu. Used to inject publish failures and verify
 	// cross-replica recovery. Nil in production. See publishWillRecord.
 	testPublishWill func(rec *mqttWillOutbox) error
+
+	// testEnqueueStore, when non-nil, replaces the durable enqueue store for THIS
+	// account manager only (instance-scoped). Set/read under mu. Used to force the
+	// enqueue CAS to fail so the immediate-publish fail-safe is exercised. Nil in
+	// production. See storeWillEnqueueCAS / enqueueDelayedWill.
+	testEnqueueStore func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)
 }
 
 type mqttJSAResponse struct {

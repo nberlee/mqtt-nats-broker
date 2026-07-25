@@ -465,10 +465,65 @@ func TestMQTTWillOutboxOverlappingGenerations(t *testing.T) {
 	}
 }
 
+// TestMQTTWillOutboxEnqueueExhaustionImmediatePublish: when the durable enqueue
+// of a delayed Will cannot be confirmed after the bounded retries, the Will must
+// not be lost — enqueueDelayedWill publishes it IMMEDIATELY as a fail-safe,
+// sacrificing the delay. A store seam forces every enqueue CAS to fail, so a Will
+// with a long delay is nonetheless delivered promptly and leaves no outbox record
+// behind (nothing was ever durably written to fire again).
+func TestMQTTWillOutboxEnqueueExhaustionImmediatePublish(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	asm := testMQTTGetGlobalASM(t, s)
+
+	// Force every enqueue store to fail so the retry budget is exhausted and the
+	// immediate-publish fail-safe runs. The real load then finds nothing (nothing
+	// was written), so the "did our write land" recheck cannot mask the failure.
+	setWillEnqueueStoreHook(asm, func(string, uint64, *mqttWillOutbox) (uint64, error) {
+		return 0, fmt.Errorf("injected enqueue store failure")
+	})
+	defer setWillEnqueueStoreHook(asm, nil)
+
+	// Subscriber for the Will topic.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "exhsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/exh", opts: 0}})
+
+	// Will client with a LONG delay (30s): a genuinely delayed publication would not
+	// arrive within the read timeout, so a prompt delivery proves the fail-safe fired.
+	will := &mqttWill{topic: []byte("will/exh"), message: []byte("failsafe"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "exhpub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(30), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	// Delivered immediately despite the 30s delay (the durable enqueue never confirmed).
+	testMQTTReadPublishV5(t, rs, "will/exh", []byte("failsafe"))
+
+	// Nothing durable was left behind: every enqueue store failed, so there is no
+	// outbox record for a claim loop to fire again.
+	if n := testMQTTCountWillRecords(t, asm); n != 0 {
+		t.Fatalf("expected no outbox record after fail-safe publish, got %d", n)
+	}
+	// And the Will is delivered exactly once.
+	testMQTTExpectNothing(t, rs)
+}
+
 // setWillPublishHook installs (or clears) the instance-scoped publish seam on asm.
 func setWillPublishHook(asm *mqttAccountSessionManager, fn func(rec *mqttWillOutbox) error) {
 	asm.mu.Lock()
 	asm.testPublishWill = fn
+	asm.mu.Unlock()
+}
+
+// setWillEnqueueStoreHook installs (or clears) the instance-scoped enqueue-store
+// seam on asm.
+func setWillEnqueueStoreHook(asm *mqttAccountSessionManager, fn func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)) {
+	asm.mu.Lock()
+	asm.testEnqueueStore = fn
 	asm.mu.Unlock()
 }
 
