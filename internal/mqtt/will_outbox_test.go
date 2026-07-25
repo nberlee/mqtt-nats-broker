@@ -11,6 +11,7 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -316,6 +317,154 @@ func TestMQTTWillOutboxPublishFailureRecovery(t *testing.T) {
 	})
 }
 
+// TestMQTTWillOutboxOverlappingGenerations exercises the central reason the
+// outbox keys a subject per WillID rather than per client: a generation that has
+// won pending->publishing is irrevocably due and must survive a reconnect, while
+// the newer generation that same reconnect enqueues is an independent record a
+// later reconnect can still cancel. Neither can evict the other, and their CAS
+// state machines advance independently.
+//
+// It pins generation N in the publishing state with the instance-scoped publish
+// seam (blocking, not failing), creates generation N+1 alongside it via a second
+// disconnect, cancels N+1 with a third reconnect, then releases N. The publish
+// path is stubbed by the seam, so verification is by outbox state and the seam's
+// per-WillID publish counter, not end-to-end delivery (covered by the handoff /
+// no-double-fire tests). N is asserted to publish at least once — a parked worker
+// whose 2s test lease lapses is re-fired and re-published, the documented
+// at-least-once behavior — while N+1, once cancelled, must publish exactly zero
+// times.
+func TestMQTTWillOutboxOverlappingGenerations(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	asm := testMQTTGetGlobalASM(t, s)
+
+	// Park every Will publication on a per-WillID gate. releaseAll on return so a
+	// failed assertion below cannot leave a worker blocked in the seam and wedge
+	// the deferred shutdown (LIFO: this runs before testMQTTShutdownServer).
+	gate := newWillPublishGate()
+	defer gate.releaseAll()
+	setWillPublishHook(asm, gate.hook)
+
+	// Generation N: connect with a short-delay Will, then drop the connection.
+	willN := &mqttWill{topic: []byte("will/ov"), message: []byte("gen-N"), qos: 0}
+	cN, rN := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ovpub", cleanStart: true, will: willN,
+		willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rN)
+	cN.Close()
+
+	// N fires: the claim loop CAS-transitions it pending->publishing and its worker
+	// parks in the gate. Capture N's WillID and subject from the publishing record.
+	var subjN, widN string
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		for _, w := range testMQTTListWillRecords(t, asm) {
+			if w.rec.State == mqttWillPublishing {
+				subjN, widN = w.subject, w.rec.WillID
+				return nil
+			}
+		}
+		return fmt.Errorf("generation N not publishing yet")
+	})
+	// Parked, not published: the worker is blocked in the seam, so N has not fired.
+	if n := gate.publishedCount(widN); n != 0 {
+		t.Fatalf("generation N published %d time(s) while its worker should be parked", n)
+	}
+
+	// Reconnect the same client WITH another delayed Will, then drop it. The
+	// reconnect's cancel scan must leave N alone (it is publishing, irrevocably
+	// due), and the drop enqueues generation N+1 as an independent pending record.
+	willNp1 := &mqttWill{topic: []byte("will/ov"), message: []byte("gen-Np1"), qos: 0}
+	cN1, rN1 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ovpub", cleanStart: true, will: willNp1,
+		willProps: mqttV5WillDelayProps(30), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rN1)
+	cN1.Close()
+
+	// Both generations now coexist on DISTINCT subjects: N publishing, N+1 pending.
+	// This is the per-WillID isolation the single-subject-per-client design lacked.
+	var subjNp1, widNp1 string
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		recs := testMQTTListWillRecords(t, asm)
+		if len(recs) != 2 {
+			return fmt.Errorf("expected 2 coexisting generations, got %d", len(recs))
+		}
+		var pubOK, penOK bool
+		for _, w := range recs {
+			switch w.rec.State {
+			case mqttWillPublishing:
+				if w.rec.WillID != widN {
+					return fmt.Errorf("publishing generation changed WillID: %s != %s", w.rec.WillID, widN)
+				}
+				pubOK = true
+			case mqttWillPending:
+				subjNp1, widNp1 = w.subject, w.rec.WillID
+				penOK = true
+			default:
+				return fmt.Errorf("unexpected state %q for %s", w.rec.State, w.rec.WillID)
+			}
+		}
+		if !pubOK || !penOK {
+			return fmt.Errorf("want one publishing + one pending, got %+v", recs)
+		}
+		return nil
+	})
+	if subjNp1 == subjN {
+		t.Fatalf("generations N and N+1 share subject %q — per-WillID subject isolation is broken", subjN)
+	}
+	if widNp1 == widN {
+		t.Fatalf("generations N and N+1 share WillID %q", widN)
+	}
+
+	// Cancel N+1 with a third reconnect (no Will, kept open so it enqueues nothing).
+	// Only the pending N+1 is CAS'd pending->cancelled; publishing N is untouched.
+	cN2, rN2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ovpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cN2.Close()
+	testMQTTReadConnAckV5(t, rN2)
+
+	// N+1 leaves the pending set (cancelled, then reaped), while N stays publishing
+	// throughout — a newer generation's cancellation never disturbs the in-flight one.
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		var nPublishing bool
+		for _, w := range testMQTTListWillRecords(t, asm) {
+			switch {
+			case w.rec.WillID == widN && w.rec.State == mqttWillPublishing:
+				nPublishing = true
+			case w.rec.WillID == widNp1 && w.rec.State == mqttWillPending:
+				return fmt.Errorf("generation N+1 still pending after reconnect")
+			}
+		}
+		if !nPublishing {
+			return fmt.Errorf("generation N lost its publishing claim")
+		}
+		return nil
+	})
+	// N+1 must never have reached the publish path.
+	if n := gate.publishedCount(widNp1); n != 0 {
+		t.Fatalf("cancelled generation N+1 was published %d time(s); it must never fire", n)
+	}
+
+	// Release N: its parked worker(s) return and finalize the record (delete).
+	gate.release(widN)
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		if n := gate.publishedCount(widN); n < 1 {
+			return fmt.Errorf("generation N not published after release")
+		}
+		return nil
+	})
+
+	// Terminal cleanup: N's published record is deleted and N+1's cancelled record
+	// is reaped, draining the outbox. N+1 stayed at zero publications throughout.
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		if n := testMQTTCountWillRecords(t, asm); n != 0 {
+			return fmt.Errorf("expected outbox drained, got %d record(s)", n)
+		}
+		return nil
+	})
+	if n := gate.publishedCount(widNp1); n != 0 {
+		t.Fatalf("cancelled generation N+1 was published %d time(s); it must never fire", n)
+	}
+}
+
 // setWillPublishHook installs (or clears) the instance-scoped publish seam on asm.
 func setWillPublishHook(asm *mqttAccountSessionManager, fn func(rec *mqttWillOutbox) error) {
 	asm.mu.Lock()
@@ -348,6 +497,114 @@ func testMQTTCountWillRecords(t testing.TB, asm *mqttAccountSessionManager) int 
 		n++
 	}
 	return n
+}
+
+// testWillRec pairs an outbox record with the subject it lives on.
+type testWillRec struct {
+	subject string
+	rec     *mqttWillOutbox
+}
+
+// testMQTTListWillRecords returns every outbox record for the account paired with
+// its subject, in stream order.
+func testMQTTListWillRecords(t testing.TB, asm *mqttAccountSessionManager) []testWillRec {
+	t.Helper()
+	var out []testWillRec
+	for seq := uint64(1); ; {
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttWillQStreamName, mqttWillQAccountFilter(asm.domainTk), seq)
+		if err != nil {
+			break
+		}
+		seq = smsg.Sequence + 1
+		rec := &mqttWillOutbox{}
+		if json.Unmarshal(smsg.Data, rec) != nil {
+			continue
+		}
+		out = append(out, testWillRec{subject: smsg.Subject, rec: rec})
+	}
+	return out
+}
+
+// willPublishGate is an instance-scoped publish seam that parks each Will
+// publication on a per-WillID channel until the test releases it, so a test can
+// pin one generation in the publishing state while it manipulates others. Keying
+// on WillID lets overlapping generations of a single client be controlled
+// independently. It records a per-WillID publish count (a released worker that
+// returns success), so a test can assert at-least-once for a released generation
+// and exactly-zero for a suppressed one.
+type willPublishGate struct {
+	mu        sync.Mutex
+	gates     map[string]chan struct{} // WillID -> closed to release its publication
+	published map[string]int           // WillID -> successful (released) publications
+	openAll   bool                     // after releaseAll, never block a new caller again
+}
+
+func newWillPublishGate() *willPublishGate {
+	return &willPublishGate{gates: map[string]chan struct{}{}, published: map[string]int{}}
+}
+
+// hook is the testPublishWill seam: it blocks the calling worker on the WillID's
+// gate until released (or the gate has been globally opened), then records the
+// publication and returns success without performing a real publish.
+func (g *willPublishGate) hook(rec *mqttWillOutbox) error {
+	g.mu.Lock()
+	if g.openAll {
+		g.published[rec.WillID]++
+		g.mu.Unlock()
+		return nil
+	}
+	ch, ok := g.gates[rec.WillID]
+	if !ok {
+		ch = make(chan struct{})
+		g.gates[rec.WillID] = ch
+	}
+	g.mu.Unlock()
+	<-ch
+	g.mu.Lock()
+	g.published[rec.WillID]++
+	g.mu.Unlock()
+	return nil
+}
+
+// release opens the gate for one WillID so its parked worker(s) proceed. Any
+// later worker for the same WillID (e.g. a lease-expiry re-fire) passes straight
+// through. Idempotent.
+func (g *willPublishGate) release(willID string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ch, ok := g.gates[willID]
+	if !ok {
+		ch = make(chan struct{})
+		g.gates[willID] = ch
+	}
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+}
+
+// releaseAll opens every existing gate and stops blocking future callers, so a
+// failed assertion cannot leave a worker parked in the seam and wedge shutdown.
+func (g *willPublishGate) releaseAll() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.openAll = true
+	for _, ch := range g.gates {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+}
+
+// publishedCount returns how many times the given WillID's publication was
+// released through the gate.
+func (g *willPublishGate) publishedCount(willID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.published[willID]
 }
 
 // testMQTTHasWillState reports whether any outbox record for the account is in
