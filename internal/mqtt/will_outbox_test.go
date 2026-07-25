@@ -201,3 +201,68 @@ func containsJSONKey(data []byte, key string) bool {
 	v, ok := m[key]
 	return ok && string(v) != "null"
 }
+
+// TestMQTTWillOutboxShutdownUnblocksBarrier: a delayed-Will publisher worker
+// blocked in the subscribe barrier when shutdown begins must be unblocked by the
+// Phase-2 dispatch-stop signal (willClaimStopCh), so the shutdown lifecycle
+// actually completes (shutdownDone closes) instead of hanging on willWorkerWG.
+func TestMQTTWillOutboxShutdownUnblocksBarrier(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s) // NATS cleanup; s.Shutdown is idempotent
+
+	// A live client to reach the account manager (and its subs barrier).
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "bbsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	asm := testMQTTGetAccountSessionManager(t, s, "bbsub")
+
+	// Hold the subscribe barrier open so the QoS 1 Will publisher worker blocks in
+	// mqttSubsBarrier.wait() rather than completing. Released at test end.
+	asm.jsa.subsBarrier.enter()
+	defer asm.jsa.subsBarrier.leave()
+
+	// Enqueue a due delayed Will (QoS 1 so publication reaches the barrier).
+	will := &mqttWill{topic: []byte("will/bb"), message: []byte("bye"), qos: 1}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "bbpub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	// Wait until the claim loop has claimed and dispatched a worker: the record is
+	// transitioned to publishing before the worker calls wait(), so this confirms
+	// a worker is now (about to be) blocked in the held barrier.
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		if !testMQTTHasWillState(t, asm, mqttWillPublishing) {
+			return fmt.Errorf("no will record in publishing state yet")
+		}
+		return nil
+	})
+
+	// Begin shutdown: Phase 2 closes willClaimStopCh, which must abort the worker's
+	// barrier wait so it completes and Phase 3 drains. If the abort did not work,
+	// shutdownDone would never close and this times out.
+	done := s.BeginShutdown()
+	select {
+	case <-done:
+	case <-time.After(shutdownDrainTimeout + 3*time.Second):
+		t.Fatal("shutdown did not complete: publisher worker stuck in the subscribe barrier")
+	}
+}
+
+// testMQTTHasWillState reports whether any outbox record for the account is in
+// the given state.
+func testMQTTHasWillState(t testing.TB, asm *mqttAccountSessionManager, want mqttWillState) bool {
+	t.Helper()
+	for seq := uint64(1); ; {
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttWillQStreamName, mqttWillQAccountFilter(asm.domainTk), seq)
+		if err != nil {
+			return false
+		}
+		seq = smsg.Sequence + 1
+		rec := &mqttWillOutbox{}
+		if json.Unmarshal(smsg.Data, rec) == nil && rec.State == want {
+			return true
+		}
+	}
+}
