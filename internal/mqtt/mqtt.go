@@ -216,6 +216,14 @@ const (
 	// Stream name prefix for MQTT sessions on a given account
 	mqttSessionsStreamNamePrefix = "$MQTT_sess_"
 
+	// Stream name and subject prefix for the delayed-Will durable outbox
+	// (Layer 2). One subject per Will event: <prefix><domainTk><cidHash>.<willID>,
+	// MaxMsgsPer:1, so each generation is an independent CAS target and an
+	// in-flight publication survives a fresh reconnect+disconnect. See
+	// will_outbox.go.
+	mqttWillQStreamName    = "$MQTT_willq"
+	mqttWillQSubjectPrefix = mqttPrefix + "willq."
+
 	// Stream name and subject for incoming MQTT QoS2 messages
 	mqttQoS2IncomingMsgsStreamName          = "$MQTT_qos2in"
 	mqttQoS2IncomingMsgsStreamSubjectPrefix = mqttPrefix + "qos2.in."
@@ -424,10 +432,8 @@ type mqttAccountSessionManager struct {
 	sessLocked map[string]struct{}     // key is MQTT client ID and indicate that a session can not be taken by a new client at this time
 	flappers   map[string]time.Time    // When connection connects with client ID already in use
 	flapTimer  *time.Timer             // Timer to perform some cleanup of the flappers map
-	// Pending delayed Will deliveries, keyed by MQTT client ID, so a reconnect
-	// to the same session can cancel them. MQTT 5.0 Will Delay Interval,
-	// Spec5 [3.1.3.2.2], [MQTT-3.1.2-8]. Guarded by mu.
-	pendingWills map[string]*mqttPendingWill
+	// Delayed Wills are no longer tracked in memory here: they live on the durable
+	// $MQTT_willq outbox and are driven by the claim loop. See will_outbox.go.
 	// Pending session-expiry timers, keyed by MQTT client ID hash, that clean up a
 	// session once its MQTT 5.0 Session Expiry Interval elapses after the
 	// connection closes. A reconnect (local or remote takeover) cancels them.
@@ -511,12 +517,22 @@ func (b *mqttSubsBarrier) leave() {
 // wait blocks until every SUBSCRIBE in flight when wait sampled the barrier
 // has finished processing. SUBSCRIBEs entering afterwards are deliberately
 // not waited for: the publish preceded them, so it owes them nothing.
-func (b *mqttSubsBarrier) wait() {
+//
+// abort (when non-nil) unblocks the wait early on shutdown: a delayed-Will
+// publisher worker passes willClaimStopCh (closed in shutdown Phase 2) so it
+// cannot stay blocked here past Phase 3's wait. Skipping the barrier only risks a
+// racing SUBSCRIBE missing this message, and that subscriber is being drained
+// anyway. Normal operation passes an open channel, so behavior is unchanged.
+func (b *mqttSubsBarrier) wait(abort <-chan struct{}) {
 	b.mu.Lock()
 	ch := b.ch
 	b.mu.Unlock()
-	if ch != nil {
-		<-ch
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-abort:
 	}
 }
 
@@ -963,19 +979,6 @@ type mqttWill struct {
 	retain  bool
 	// MQTT 5.0 Will properties (nil for 3.1.1).
 	props *mqttProperties
-}
-
-// mqttPendingWill is a Will Message whose publication has been deferred by the
-// MQTT 5.0 Will Delay Interval. The timer fires the will once the delay elapses,
-// unless a new connection to the same session cancels it first. Spec5
-// [3.1.3.2.2], [MQTT-3.1.2-8].
-type mqttPendingWill struct {
-	timer *time.Timer
-	will  *mqttWill    // parse-time copies, safe to use after the client is gone
-	props []byte       // encoded forwardable Will properties block (pp.props format)
-	acc   *Account     // account to publish the delayed will into
-	perms *permissions // publisher's permissions, so the delayed publish is still permission-checked
-	user  string       // publisher's username, recorded as the source of a retained will
 }
 
 // mqttSharedSubPrefix is the MQTT 5.0 Shared Subscription topic filter prefix
@@ -2354,7 +2357,6 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		sessByHash:      make(map[string]*mqttSession),
 		sessLocked:      make(map[string]struct{}),
 		flappers:        make(map[string]time.Time),
-		pendingWills:    make(map[string]*mqttPendingWill),
 		pendingExpiries: make(map[string]*time.Timer),
 		jsa: mqttJSA{
 			id:      id,
@@ -2504,6 +2506,26 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			as.transferUniqueSessStreamsToMuxed(s)
 		} else if isErrorOtherThan(err, JSStreamNameExistErr) {
 			return nil, fmt.Errorf("create sessions stream for account %q: %v", accName, err)
+		}
+	}
+
+	// Delayed-Will durable outbox stream (Layer 2). Separate from the sessions
+	// stream so its per-Will subjects and sequences never interfere with the
+	// in-memory session record's CAS token (sess.seq). MaxMsgsPer:1 makes each
+	// per-Will subject a single-record CAS slot. See will_outbox.go.
+	if si, err := lookupStream(mqttWillQStreamName, "will outbox"); err != nil {
+		return nil, err
+	} else if si == nil {
+		cfg := &StreamConfig{
+			Name:       mqttWillQStreamName,
+			Subjects:   []string{mqttWillQSubjectPrefix + as.domainTk + ">"},
+			Storage:    FileStorage,
+			Retention:  LimitsPolicy,
+			Replicas:   replicas,
+			MaxMsgsPer: 1,
+		}
+		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
+			return nil, fmt.Errorf("create will outbox stream for account %q: %v", accName, err)
 		}
 	}
 
@@ -2719,17 +2741,14 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		return nil, fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 	}
 
-	// Re-arm session-expiry timers and delayed Wills persisted before a
-	// restart, without delaying the connecting client. Then re-sweep
-	// periodically: expiries catch deadlines that never got a timer (e.g.
-	// records orphaned when their owner crashed while the client was
-	// connected), and the orphaned-consumer sweep reconciles durables leaked in
-	// crash windows (re-run so it also catches orphans skipped by the grace
-	// window at startup).
+	// Re-arm session-expiry timers, without delaying the connecting client. Then
+	// re-sweep periodically: expiries catch deadlines that never got a timer (e.g.
+	// records orphaned when their owner crashed while the client was connected),
+	// and the orphaned-consumer sweep reconciles durables leaked in crash windows
+	// (re-run so it also catches orphans skipped by the grace window at startup).
 	s.startGoRoutine(func() {
 		defer s.grWG.Done()
 		as.sweepSessionExpiries(s)
-		as.sweepPendingWills(s)
 		as.sweepOrphanedConsumers(s)
 		tt := time.NewTicker(mqttSessionExpirySweepInterval)
 		defer tt.Stop()
@@ -2745,6 +2764,15 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			}
 		}
 	})
+
+	// Migrate any legacy in-record delayed Wills to the durable outbox, then run
+	// the delayed-Will claim loop on its own cadence. Tracked by willClaimWG (not
+	// grWG) so shutdown Phase 2 drains it before waiting on publisher workers.
+	s.willClaimWG.Add(1)
+	go func() {
+		as.migrateWillsToOutbox(s)
+		as.willClaimLoop(s, closeCh)
+	}()
 
 	// Set this so that on defer we don't cleanup.
 	success = true
@@ -3401,11 +3429,9 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	// A connection for this client ID started on another server, i.e. a new
-	// connection to this session: cancel any delayed Will pending locally. Done
-	// even when we no longer hold the session (a clean-start client removes it on
-	// disconnect but the pending Will survives on the account manager). Spec5
-	// [MQTT-3.1.2-8].
-	as.cancelWillLocked(cIDHash)
+	// connection to this session. Below we evict our displaced local connection;
+	// the reconnecting broker also cancels the outbox from mqttProcessConnect.
+	// Spec5 [MQTT-3.1.2-8].
 	sess, ok := as.sessByHash[cIDHash]
 	if !ok {
 		// No local session: cancel any (sweep-armed) expiry timer, the remote save
@@ -3443,6 +3469,25 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 		// Remove in separate go routine.
 		go ec.closeConnection(DuplicateClientID)
 	}
+	// Cancel any delayed Will the displaced local connection enqueued. Together
+	// with the eviction above this closes the reconnect race for both orderings:
+	// a not-yet-run local close now fails its lockSession (sess.c was cleared) and
+	// never enqueues, while a close that already enqueued its Will has it
+	// cancelled here — covering the window where the enqueue landed after the
+	// reconnecting broker's own cancel scan. Async so the JSA delivery goroutine
+	// is not blocked on the bounded cancel scan, but ADMITTED through the Will
+	// dispatch gate first so it is tracked (willWorkerWG) and drained before
+	// shutdown tears down the JSA: admission fails once shutdown Phase 2 has closed
+	// the gate, in which case we skip it (the process is stopping). The delivery
+	// client (pc) has no server ref, so use the account JSA client's.
+	// Spec5 [MQTT-3.1.2-8].
+	s := as.jsa.c.srv
+	if s.admitWillWorker() {
+		go func() {
+			defer s.willWorkerWG.Done()
+			_ = as.cancelWillOutbox(s, cIDHash)
+		}()
+	}
 }
 
 // Adds this client ID to the flappers map, and if needed start the timer
@@ -3478,215 +3523,6 @@ func (as *mqttAccountSessionManager) removeSessFromFlappers(clientID string) {
 	// Do not stop/set timer to nil here. Better leave the timer run at its
 	// regular interval and detect that there is nothing to do. The timer
 	// will be stopped on shutdown.
-}
-
-// scheduleWill defers the delivery of a client's Will Message by the MQTT 5.0
-// Will Delay Interval. The pending will is keyed by the client ID hash (the same
-// token used in the session-persist stream) so both a local reconnect and a
-// remote takeover on another server can cancel it via cancelWill /
-// cancelWillLocked. Spec5 [3.1.3.2.2].
-//
-// No lock held on entry.
-func (as *mqttAccountSessionManager) scheduleWill(s *Server, idHash string, pw *mqttPendingWill, delay time.Duration) {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	// nil map => account manager is shutting down; deliver nothing.
-	if as.pendingWills == nil {
-		return
-	}
-	// Defensive: replace any existing pending will for this client ID.
-	if old, ok := as.pendingWills[idHash]; ok {
-		old.timer.Stop()
-	}
-	pw.timer = time.AfterFunc(delay, func() { as.fireWill(s, idHash, pw) })
-	as.pendingWills[idHash] = pw
-}
-
-// cancelWill stops and removes a pending delayed Will for the given client ID
-// hash, if any. Called when a new connection resumes the session before the Will
-// Delay Interval elapses, which per Spec5 [MQTT-3.1.2-8] means the Will MUST NOT
-// be sent. Returns true if one was cancelled. Idempotent.
-//
-// No lock held on entry.
-func (as *mqttAccountSessionManager) cancelWill(idHash string) bool {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	return as.cancelWillLocked(idHash)
-}
-
-// cancelWillLocked is cancelWill for callers already holding as.mu (e.g. the
-// session-persist callback that cancels on a remote takeover).
-func (as *mqttAccountSessionManager) cancelWillLocked(idHash string) bool {
-	pw, ok := as.pendingWills[idHash]
-	if !ok {
-		return false
-	}
-	pw.timer.Stop()
-	delete(as.pendingWills, idHash)
-	return true
-}
-
-// fireWill publishes a delayed Will once its Will Delay Interval has elapsed,
-// unless it was cancelled or the account manager is shutting down. It runs from
-// the scheduleWill timer, after the originating client is gone, so it delivers
-// using a fresh internal account client for fan-out and the account's JSA for
-// the QoS1/2 store. Spec5 [3.1.3.2.2].
-//
-// No lock held on entry.
-func (as *mqttAccountSessionManager) fireWill(s *Server, idHash string, expected *mqttPendingWill) {
-	as.mu.Lock()
-	// nil map => account manager shutdown; the entry (if any) is being torn down.
-	if as.pendingWills == nil {
-		as.mu.Unlock()
-		return
-	}
-	pw, ok := as.pendingWills[idHash]
-	// Bail if cancelled, or replaced by a newer Will for the same client ID after
-	// this timer fired but before it acquired the lock (a stale-timer callback
-	// must not fire the replacement early).
-	if !ok || pw != expected {
-		as.mu.Unlock()
-		return
-	}
-	delete(as.pendingWills, idHash)
-	will, acc, perms, user := pw.will, pw.acc, pw.perms, pw.user
-	sess := as.sessByHash[idHash]
-	as.mu.Unlock()
-
-	// The originating client is gone; use a short-lived internal account client
-	// to drive fan-out, and the account JSA for the QoS1/2 store.
-	c := s.createInternalAccountClient()
-	c.acc = acc
-	// Carry the original publisher's permissions and username so the deferred
-	// publish is still permission-checked (a denied Will is dropped, not
-	// delivered or retained) exactly as the immediate path would, and the
-	// retained-Will source is preserved. [MQTT-3.1.2-8].
-	c.perms = perms
-	c.opts.Username = user
-
-	pp := &mqttPublish{
-		topic:   will.topic,
-		subject: will.subject,
-		mapped:  will.mapped,
-		msg:     will.message,
-		sz:      len(will.message),
-		flags:   will.qos << 1,
-		// The Will's own forwardable properties, matching the immediate-publish
-		// path. Spec5 [3.1.3.2].
-		props: pw.props,
-	}
-	if will.retain {
-		pp.flags |= mqttPubFlagRetain
-	}
-	// Publish as an MQTT client so the message framing matches the immediate
-	// path: MQTT payloads carry no trailing CRLF, and the delivery machinery
-	// only accounts for that when the producer is an MQTT client (otherwise the
-	// last two payload bytes are stripped as a protocol CRLF). asm is needed for
-	// a retained Will; proto marks this as v5. Spec5 [3.1.3.2.2].
-	c.mqtt = &mqtt{pp: pp, asm: as, proto: mqttProtoLevel5}
-	// A Will is server-originated: no No Local origin. Spec5 [3.8.3.1].
-	if err := s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp, _EMPTY_); err != nil {
-		s.Warnf("MQTT: failed to deliver delayed Will for client %q: %v", idHash, err)
-	}
-	c.flushClients(0)
-
-	// Drop the persisted copy so a later restart does not fire it again. With a
-	// live session object, save through it to keep its record sequence current;
-	// otherwise rewrite the record directly.
-	if sess != nil {
-		var doSave bool
-		sess.mu.Lock()
-		if sess.will != nil {
-			sess.will = nil
-			doSave = true
-		}
-		sess.mu.Unlock()
-		if doSave {
-			if err := sess.save(); err != nil {
-				s.Debugf("MQTT: unable to clear persisted Will for client %q: %v", idHash, err)
-			}
-		}
-	} else {
-		as.clearPersistedWill(s, idHash)
-	}
-}
-
-// sweepPendingWills re-arms delayed Wills persisted in session records, so a
-// Will pending when this server shut down still fires. In a cluster every node
-// sweeps the same stream, so only the record's owner (Origin) re-arms and the
-// Will fires once; standalone, the node name may be generated (it changes
-// across restarts), so no ownership gate is applied. The Will's publish
-// permission was already checked when it was persisted.
-// Runs once, when the account session manager is created.
-func (as *mqttAccountSessionManager) sweepPendingWills(s *Server) {
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
-	origin := s.NodeName()
-	clustered := s.JetStreamIsClustered()
-	acc := as.jsa.c.acc
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			// No (more) messages, or the stream/server is going away: done.
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT pending-Will sweep ended: %v", err)
-			}
-			break
-		}
-		seq = smsg.Sequence + 1
-		ps := &mqttPersistedSession{}
-		if err := json.Unmarshal(smsg.Data, ps); err != nil || ps.Will == nil {
-			continue
-		}
-		if clustered && ps.Origin != origin {
-			continue
-		}
-		w := ps.Will
-		subject, err := mqttTopicToNATSPubSubject([]byte(w.Topic))
-		if err != nil {
-			continue
-		}
-		pw := &mqttPendingWill{
-			will: &mqttWill{
-				topic:   []byte(w.Topic),
-				subject: subject,
-				message: w.Msg,
-				qos:     w.QoS,
-				retain:  w.Retain,
-			},
-			props: w.Props,
-			acc:   acc,
-			user:  w.User,
-		}
-		remaining := time.Until(time.Unix(0, w.FireAt))
-		if remaining < 0 {
-			remaining = 0
-		}
-		as.scheduleWill(s, getHash(ps.ID), pw, remaining)
-	}
-}
-
-// clearPersistedWill removes the pending-Will field from a session record when
-// no in-memory session exists to save through (e.g. a Will restored by the
-// startup sweep whose client never reconnected). The write expects the record
-// sequence it read, so a concurrent writer wins and this clear is dropped.
-func (as *mqttAccountSessionManager) clearPersistedWill(s *Server, idHash string) {
-	smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash)
-	if err != nil || smsg == nil {
-		return
-	}
-	ps := &mqttPersistedSession{}
-	if err := json.Unmarshal(smsg.Data, ps); err != nil || ps.Will == nil {
-		return
-	}
-	if ps.Clean {
-		// The record existed only to carry a clean session's Will: delete it.
-		as.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true)
-		return
-	}
-	ps.Will = nil
-	if err := as.storeSessionRecordCAS(ps, idHash, smsg.Sequence); err != nil {
-		s.Debugf("MQTT: unable to clear persisted Will for session hash %q: %v", idHash, err)
-	}
 }
 
 // storeSessionRecordCAS rewrites a session record expecting the given stream
@@ -4151,14 +3987,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 			as.flapTimer.Stop()
 			as.flapTimer = nil
 		}
-		// Stop any pending delayed Wills and disable further scheduling/firing.
-		// Setting the map to nil makes fireWill a no-op for any timer that is
-		// already mid-callback. Spec5 [3.1.3.2.2].
-		for _, pw := range as.pendingWills {
-			pw.timer.Stop()
-		}
-		as.pendingWills = nil
-		// Likewise stop any pending session-expiry timers and disable further
+		// Stop any pending session-expiry timers and disable further
 		// scheduling/firing; the nil map makes expireSession a no-op for a timer
 		// already mid-callback. Spec5 [3.1.2.11.2].
 		for _, t := range as.pendingExpiries {
@@ -7228,8 +7057,14 @@ CHECK:
 	// client ID cancels any delayed Will pending from a previous connection,
 	// whether or not its session still existed (a clean-start client removes its
 	// session on disconnect). Done only on success so a failed CONNECT does not
-	// suppress the prior Will. Keyed by client ID hash. Spec5 [MQTT-3.1.2-8].
-	asm.cancelWill(getHash(cid))
+	// suppress the prior Will. This is the authoritative cross-replica
+	// cancellation (CAS pending->cancelled on the outbox), regardless of which
+	// broker enqueued the Will. Keyed by client ID hash. Spec5 [MQTT-3.1.2-8].
+	// cancelWillOutbox retries internally and logs on exhausted retries; proceed
+	// with the reconnect regardless — blocking CONNECT on a JetStream outage would
+	// be worse than the rare chance the prior Will still fires under sustained
+	// unavailability. Spec5 [MQTT-3.1.2-8].
+	_ = asm.cancelWillOutbox(s, getHash(cid))
 	// Likewise cancel any pending session-expiry timer: this connection has resumed
 	// (or replaced) the session before it expired. Spec5 [3.1.2.11.2].
 	asm.cancelSessionExpiry(getHash(cid))
@@ -7677,7 +7512,6 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32) {
 	// it. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
 	if c.mqtt.proto == mqttProtoLevel5 && will.props != nil && will.props.willDelay > 0 && sessionExpiry > 0 {
 		asm := c.mqtt.asm
-		sess := c.mqtt.sess
 		// Spec5 [3.1.3.2.2]: publish at the Will Delay Interval OR when the session
 		// ends, whichever is first, so cap the delay at the Session Expiry Interval.
 		// (mqttSessionNeverExpire, being the max uint32, never lowers the delay.)
@@ -7685,42 +7519,22 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32) {
 		if sessionExpiry < effDelay {
 			effDelay = sessionExpiry
 		}
-		delay := time.Duration(effDelay) * time.Second
-		// Capture the publisher's identity so the deferred publish is still
-		// permission-checked once the client is gone. Keyed by client ID hash so
-		// a remote takeover (session-persist callback) can also cancel it.
-		pw := &mqttPendingWill{will: will, props: mqttWillForwardProps(will.props),
-			acc: c.acc, perms: c.perms, user: c.opts.Username}
+		fireAt := time.Now().Add(time.Duration(effDelay) * time.Second).UnixNano()
+		props := mqttWillForwardProps(will.props)
+		user := c.opts.Username
 		idHash := getHash(c.mqtt.cid)
-		// A restored Will cannot re-check publish permissions at fire time
-		// (they are not serializable), so evaluate them now, with the same
-		// permission set the in-memory fire-time check would use, and never
-		// persist a denied Will.
+		// A delayed Will cannot re-check publish permissions at fire time (they are
+		// not serializable), so evaluate them now and never enqueue a denied Will.
 		willAllowed := c.pubAllowedFullCheck(string(will.subject), false, true)
 		c.mu.Unlock()
-		if asm != nil {
-			asm.scheduleWill(s, idHash, pw, delay)
-			// Persist the pending Will with the session record so a restart
-			// during the delay window still fires it. A clean session's record
-			// was just deleted (above us); this save re-creates a minimal
-			// record that only carries the Will and is deleted once the Will
-			// fires or is cancelled.
-			if sess != nil && willAllowed {
-				sess.mu.Lock()
-				sess.will = &mqttPersistedWill{
-					Topic:  string(will.topic),
-					Msg:    will.message,
-					QoS:    will.qos,
-					Retain: will.retain,
-					Props:  pw.props,
-					User:   pw.user,
-					FireAt: time.Now().Add(delay).UnixNano(),
-				}
-				sess.mu.Unlock()
-				if err := sess.save(); err != nil {
-					s.Warnf("MQTT: unable to persist delayed Will for client ID hash %q: %v", idHash, err)
-				}
-			}
+		// Record the Will on the durable outbox ($MQTT_willq) so a surviving
+		// replica fires it if this broker exits during the delay. Every replica's
+		// claim loop drives it to publication once FireAt passes; a reconnect
+		// cancels it. See will_outbox.go. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
+		if asm != nil && willAllowed {
+			// enqueueDelayedWill retries internally and logs on exhausted retries;
+			// there is nothing further to do on the disconnect path.
+			_ = asm.enqueueDelayedWill(s, idHash, will, props, user, fireAt)
 		}
 		return
 	}
@@ -8397,8 +8211,13 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// storing: $MQTT_msgs uses interest-based retention, and a message stored
 	// before a racing SUBSCRIBE's consumer registers interest would be
 	// discarded outright — permanently invisible to the new subscription. See
-	// mqttSubsBarrier.
-	jsa.subsBarrier.wait()
+	// mqttSubsBarrier. The abort channel lets a delayed-Will worker unblock on
+	// shutdown so it cannot hang Phase 3 (nil-safe: a nil server means no abort).
+	var barrierAbort <-chan struct{}
+	if c.srv != nil {
+		barrierAbort = c.srv.willClaimStopCh
+	}
+	jsa.subsBarrier.wait(barrierAbort)
 
 	_, err := jsa.storeMsg(mqttStreamSubjectPrefix+string(c.pa.subject), headerLen, natsMsg)
 

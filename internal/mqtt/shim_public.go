@@ -11,6 +11,11 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// mqttTestDisableEagerInit, when set by a test, makes Start() skip the eager
+// account-manager initialization so a test can observe the legacy lazy
+// first-connect stream migration path (see TestMQTTRetainedMsgMigration).
+var mqttTestDisableEagerInit bool
+
 // shutdownDrainTimeout bounds how long the convenience Shutdown() blocks waiting
 // for the asynchronous shutdown lifecycle to complete. Timing out does not tear
 // dependencies down under still-running cleanup; the lifecycle keeps running in
@@ -38,6 +43,9 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 		shutdownDone:    make(chan struct{}),
 		willClaimStopCh: make(chan struct{}),
 		willTimers:      make(map[*time.Timer]struct{}),
+		// Initialized here so globalAccount() never lazily writes s.gacc: the eager
+		// account-manager init and the accept loop reach it concurrently.
+		gacc: &Account{name: "$G"},
 	}
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	s.running.Store(true)
@@ -50,6 +58,19 @@ func (s *Server) Start() error {
 	s.startMQTT()
 	if s.mqtt.listenerErr != nil {
 		return s.mqtt.listenerErr
+	}
+	// Eagerly initialize the (single global) account session manager so every
+	// replica runs the delayed-Will claim loop regardless of client traffic —
+	// otherwise a surviving replica would not fire a handed-off Will until some
+	// client happened to initialize the account. See will_outbox.go.
+	if !mqttTestDisableEagerInit {
+		if _, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient()); err != nil {
+			// Atomic startup contract: tear down the already-open listener and any
+			// account-manager goroutines before returning, so a failed Start leaves
+			// nothing running for direct callers (not just serveMQTT).
+			s.Shutdown()
+			return err
+		}
 	}
 	return nil
 }
@@ -120,35 +141,44 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 //	  managers.
 //	Phase 2 closes the Will dispatch gate and drains both dispatch sources (fire
 //	  timers and claim loops) so no publisher worker Add can race Phase 3's Wait.
-//	Phase 3 waits for active publisher workers (each with independent lease
-//	  renewal) to complete.
+//	Phase 3 waits for active publisher workers (willWorkerWG) to complete; each
+//	  publish is bounded by the JSA request timeout, well under the claim lease.
 //	Phase 4 finally stops the JSA/account infrastructure (quitCh) and the
 //	  remaining background goroutines (grWG).
 //
-// NOTE: Phases 2 and 3 are scaffolding for the Layer 2 delayed-Will outbox and
-// are currently DORMANT — nothing yet calls admitWillWorker/trackWillTimer, so
-// their wait groups are zero and closeWillDispatch stops no tracked timers. The
-// legacy delayed-Will timers (as.pendingWills) are still stopped, as before, by
-// the account-manager goroutine's defer when Phase 4 closes quitCh; those
-// pending Wills are dropped on shutdown until Layer 2 makes them durable.
+// Phases 2 and 3 drive the Layer 2 delayed-Will outbox: the claim loops
+// (willClaimWG) stop on the dispatch gate and publisher workers (willWorkerWG,
+// admitted via admitWillWorker) drain before quitCh closes. The willTimers path
+// (trackWillTimer) is currently unused — the outbox fires on the claim ticker,
+// not per-Will timers — so willTimerWG stays at zero.
 func (s *Server) runShutdown() {
 	defer close(s.shutdownDone)
 
 	deadline := time.Now().Add(shutdownDrainTimeout)
 
-	// Phase 1.
+	// Phase waits are UNBOUNDED so shutdownDone closes only on true completion:
+	// the caller (main) tears down the backend when it closes, so a premature
+	// close would reintroduce the dependency-teardown race. Only the convenience
+	// Shutdown() bounds its own return; a genuinely wedged goroutine is bounded by
+	// the orchestrator's process deadline (k8s SIGKILL). To keep a graceful drain
+	// from actually depending on SIGKILL, the publish path honors willClaimStopCh
+	// (closed in Phase 2) so a worker blocked in the subscribe barrier unblocks
+	// before Phase 3 waits on it — see mqttSubsBarrier.wait.
+
+	// Phase 1: disconnect clients and wait for readLoop cleanup while quitCh is open.
 	s.drainClients(deadline)
 	s.clientWG.Wait()
 
-	// Phase 2.
+	// Phase 2: stop Will dispatch (claim loops + timers) and unblock the subscribe
+	// barrier so in-flight publishers can finish.
 	s.closeWillDispatch()
 	s.willTimerWG.Wait()
 	s.willClaimWG.Wait()
 
-	// Phase 3.
+	// Phase 3: wait for publisher workers (and tracked control ops) to complete.
 	s.willWorkerWG.Wait()
 
-	// Phase 4.
+	// Phase 4: stop JSA/account infrastructure and remaining background goroutines.
 	s.mu.Lock()
 	quitCh := s.quitCh
 	s.mu.Unlock()
@@ -166,8 +196,6 @@ func (s *Server) runShutdown() {
 // Returns false if the gate is already closed (shutdown Phase 2 has begun), in
 // which case the caller must not dispatch. On true the caller owns one
 // willWorkerWG token and must call s.willWorkerWG.Done() when the worker exits.
-//
-//nolint:unused // Layer 2 delayed-Will outbox dispatch; dormant until wired.
 func (s *Server) admitWillWorker() bool {
 	s.willDispatchMu.Lock()
 	defer s.willDispatchMu.Unlock()

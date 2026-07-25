@@ -915,15 +915,39 @@ func mqttV5ConnPropsSessionExpiry(secs uint32) []byte {
 	return body.Bytes()
 }
 
+func init() {
+	// Speed up the delayed-Will claim loop for tests: firing granularity is the
+	// scan interval (production defaults are 5s/30s), so a short interval keeps
+	// will-delay tests fast while keeping the lease safely above it.
+	mqttWillClaimInterval = 50 * time.Millisecond
+	mqttWillClaimLease = 2 * time.Second
+}
+
 // testMQTTNumPendingWills returns the number of delayed Wills currently pending
-// on the account session manager, reached via a live client sharing the account.
+// on the durable outbox for the account, reached via a live client sharing it.
+// Pending = enqueued and not yet fired/cancelled (a fired native record is
+// deleted; a cancelled native record is reaped by the claim loop).
 func testMQTTNumPendingWills(t testing.TB, s *Server, liveClientID string) int {
 	t.Helper()
 	c := testMQTTGetClient(t, s, liveClientID)
 	asm := c.mqtt.asm
-	asm.mu.Lock()
-	defer asm.mu.Unlock()
-	return len(asm.pendingWills)
+	filter := mqttWillQAccountFilter(asm.domainTk)
+	n := 0
+	for seq := uint64(1); ; {
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, seq)
+		if err != nil {
+			break
+		}
+		seq = smsg.Sequence + 1
+		rec := &mqttWillOutbox{}
+		if err := json.Unmarshal(smsg.Data, rec); err != nil {
+			continue
+		}
+		if rec.State == mqttWillPending {
+			n++
+		}
+	}
+	return n
 }
 
 // The MQTT 5.0 Will Delay Interval defers publication of a client's Will until
@@ -5584,11 +5608,12 @@ func TestMQTTv5WillDelayForwardsOwnProps(t *testing.T) {
 	testMQTTCheckFwdProps(t, props)
 }
 
-// A delayed Will pending at shutdown is persisted with the session record and
-// re-armed on restart, so it still fires. Spec5 [3.1.3.2.2] whichever-first.
-// Covered for both a durable session and a clean-start one (whose Will rides a
-// minimal record created just for it), and with a generated server name (the
-// standalone default), which changes across restarts.
+// A delayed Will pending at shutdown is persisted on the durable outbox and
+// fired by the restarted server's claim loop, so it still fires. Spec5
+// [3.1.3.2.2] whichever-first. Covered for both a durable session and a
+// clean-start one, and with a generated server name (the standalone default),
+// which changes across restarts (so the pre-Layer-2 Origin gate would have
+// dropped it).
 func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -5613,16 +5638,16 @@ func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
 			testMQTTReadConnAckV5(t, rw)
 			cw.Close()
 
-			// Wait for the pending Will to land in the persisted session record.
+			// Wait for the pending Will to land on the durable outbox.
 			nc, js := jsClientConnect(t, s)
-			sessSubj := mqttSessStreamSubjectPrefix + getHash("wdrpub")
+			willFilter := mqttWillQSubjectPrefix + getHash("wdrpub") + ".*"
 			checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
-				m, err := js.GetLastMsg(mqttSessStreamName, sessSubj)
+				m, err := js.GetLastMsg(mqttWillQStreamName, willFilter)
 				if err != nil {
-					return err
+					return fmt.Errorf("no pending will outbox record yet: %v", err)
 				}
-				if !bytes.Contains(m.Data, []byte(`"will"`)) {
-					return fmt.Errorf("session record has no pending will yet")
+				if !bytes.Contains(m.Data, []byte(`"state":"pending"`)) {
+					return fmt.Errorf("will outbox record not pending yet: %s", m.Data)
 				}
 				return nil
 			})
@@ -5645,17 +5670,17 @@ func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
 
 			testMQTTReadPublishV5(t, rs, "wdr/t", []byte("late-bye"))
 
-			// Once fired, the persisted Will must be gone (for a clean session,
-			// its carrier record with it) so it cannot fire again.
+			// Once fired, the native outbox record must be deleted (no longer
+			// pending) so it cannot fire again.
 			nc2, js2 := jsClientConnect(t, s)
 			defer nc2.Close()
-			checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
-				m, err := js2.GetLastMsg(mqttSessStreamName, sessSubj)
+			checkFor(t, 3*time.Second, 50*time.Millisecond, func() error {
+				m, err := js2.GetLastMsg(mqttWillQStreamName, willFilter)
 				if err != nil {
-					return nil // record deleted entirely: fine (clean session)
+					return nil // record deleted: fine
 				}
-				if bytes.Contains(m.Data, []byte(`"will"`)) {
-					return fmt.Errorf("session record still has the fired will")
+				if bytes.Contains(m.Data, []byte(`"state":"pending"`)) {
+					return fmt.Errorf("will outbox record still pending after fire: %s", m.Data)
 				}
 				return nil
 			})

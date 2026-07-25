@@ -2279,6 +2279,14 @@ func testMQTTConnectDisconnect(t *testing.T, o *Options, clientID string, clean 
 }
 
 func TestMQTTRetainedMsgMigration(t *testing.T) {
+	// This test injects a legacy retained-messages stream AFTER the server starts
+	// and relies on the account manager (and its streams) not being created until
+	// the first client connects. Disable eager account-manager init so that lazy
+	// first-connect migration path is exercised. Real upgrades have the legacy
+	// stream present before start, which eager init migrates the same way.
+	mqttTestDisableEagerInit = true
+	defer func() { mqttTestDisableEagerInit = false }()
+
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

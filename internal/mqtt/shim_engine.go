@@ -233,10 +233,9 @@ type Server struct {
 	// claim loops both dispatch publisher workers; shutdown Phase 2 closes the
 	// admission gate and drains both dispatch sources (willTimerWG, willClaimWG)
 	// before Phase 3 waits on willWorkerWG, so no worker Add races a zero-count
-	// Wait. willClaimStopCh signals the claim loops to stop.
-	//
-	// DORMANT until Layer 2: admitWillWorker/trackWillTimer have no callers yet,
-	// so these wait groups stay at zero and the gate drains nothing.
+	// Wait. willClaimStopCh signals the claim loops to stop. The willTimers path
+	// (trackWillTimer) is unused — the outbox fires on the claim ticker, not
+	// per-Will timers — so willTimerWG stays at zero.
 	willDispatchMu     sync.Mutex
 	willDispatchClosed bool
 	willTimers         map[*time.Timer]struct{}
@@ -260,6 +259,9 @@ func (s *Server) getOpts() *Options {
 	return s.opts
 }
 
+// globalAccount returns the single account. gacc is initialized in NewServer so
+// this is a race-free read: the eager account-manager init (Start) and the
+// accept loop both reach it concurrently, so it must not lazily write s.gacc.
 func (s *Server) globalAccount() *Account {
 	if s.gacc == nil {
 		s.gacc = &Account{name: "$G"}
