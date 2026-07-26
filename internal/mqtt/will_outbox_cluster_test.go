@@ -186,6 +186,90 @@ func TestMQTTWillOutboxReplicatedLeaderFailover(t *testing.T) {
 	testMQTTExpectNothingFor(t, rs, mqttWillClaimLease+mqttWillClaimInterval)
 }
 
+// TestMQTTWillOutboxReplicatedNodeCatchup: a follower that is OFFLINE while the
+// surviving quorum publishes and deletes a delayed Will must, after it restarts and
+// catches up, converge to an empty outbox — the record must not resurrect and the
+// Will must not re-fire. Gated: restart + Raft catch-up is slow under -race.
+func TestMQTTWillOutboxReplicatedNodeCatchup(t *testing.T) {
+	if os.Getenv("MQTTNB_CLUSTER_FAILOVER_TESTS") != "1" {
+		t.Skip("set MQTTNB_CLUSTER_FAILOVER_TESTS=1 to run cluster failover tests")
+	}
+
+	// The Will fires ~10s out; widen the default 10s read deadline (flaky under -race).
+	oldTimeout := testMQTTTimeout
+	testMQTTTimeout = 40 * time.Second
+	defer func() { testMQTTTimeout = oldTimeout }()
+
+	c := testNewJetStreamCluster(t, 3)
+	b := c.startBroker(t, 0)
+
+	// Subscriber and Will client both through the single bridge.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "cusub", cleanStart: true}, b.opts.MQTT.Host, b.opts.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/catchup", opts: 0}})
+
+	will := &mqttWill{topic: []byte("will/catchup"), message: []byte("from-bridge"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "cupub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(10), props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	// Exactly one outbox record, and it is pending (count alone would not prove state).
+	asm := testMQTTGetGlobalASM(t, b.s)
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		recs := testMQTTListWillRecords(t, asm)
+		if len(recs) != 1 {
+			return fmt.Errorf("want 1 outbox record, got %d\n%s", len(recs), c.describe())
+		}
+		if recs[0].rec.State != mqttWillPending {
+			return fmt.Errorf("want pending record, got state %q\n%s", recs[0].rec.State, c.describe())
+		}
+		return nil
+	})
+	c.waitStreamCurrent(t, testGlobalAccount, mqttWillQStreamName)
+
+	// Pick a victim FOLLOWER: neither the stream leader nor the node serving the
+	// bridge's NATS connection, so its restart cannot trigger an election or a bridge
+	// reconnect and the test isolates pure replica catch-up.
+	leader := c.waitStreamLeader(t, testGlobalAccount, mqttWillQStreamName)
+	bridgeNode := b.nc.ConnectedServerName()
+	var victim *testJSClusterNode
+	for _, n := range c.nodes {
+		if n.running && n.name != leader.name && n.name != bridgeNode {
+			victim = n
+			break
+		}
+	}
+	if victim == nil {
+		t.Fatalf("no eligible follower: leader=%q bridge=%q\n%s", leader.name, bridgeNode, c.describe())
+	}
+	t.Logf("stopping follower %q (leader=%q bridge=%q)", victim.name, leader.name, bridgeNode)
+	c.stopNode(victim) // its local store keeps the pending record
+
+	// The surviving quorum (leader + other follower) claims, publishes and deletes.
+	testMQTTReadPublishV5(t, rs, "will/catchup", []byte("from-bridge"))
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		if n := testMQTTCountWillRecords(t, asm); n != 0 {
+			return fmt.Errorf("outbox record not removed after publish, got %d\n%s", n, c.describe())
+		}
+		return nil
+	})
+
+	// Restart the stale follower; it must rejoin and catch up the publish+delete it
+	// missed while offline.
+	c.restartNode(t, victim)
+	c.waitFormed(t, 3)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttWillQStreamName)
+
+	// The caught-up replica must not resurrect the record...
+	if n := testMQTTCountWillRecords(t, asm); n != 0 {
+		t.Fatalf("outbox not empty after follower catch-up, got %d\n%s", n, c.describe())
+	}
+	// ...nor re-fire the Will across a full lease-recovery window.
+	testMQTTExpectNothingFor(t, rs, mqttWillClaimLease+mqttWillClaimInterval)
+}
+
 // testMQTTExpectNothingFor asserts no packet arrives on r for the full window d.
 // Unlike testMQTTExpectNothing (~100ms) it spans a lease-recovery interval, and it
 // treats ONLY a read-deadline timeout as success: EOF, connection reset, or any

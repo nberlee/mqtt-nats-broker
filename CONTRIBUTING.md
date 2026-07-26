@@ -52,8 +52,9 @@ in `shim_*.go` and the vendored helpers in `compat_*.go`.
   same tag. They launch **three embedded nats-server processes** joined into one
   cluster so `$MQTT_willq` is genuinely `R3`. The cheap R3 smoke test
   (`TestMQTTWillOutboxReplicatedStream`) runs in the normal `make full-suite`; the
-  slow failure-injection tests (leader-node loss, `TestMQTTWillOutboxReplicated…`)
-  self-skip unless `MQTTNB_CLUSTER_FAILOVER_TESTS=1`:
+  slow failure-injection tests self-skip unless `MQTTNB_CLUSTER_FAILOVER_TESTS=1` and
+  cover both **stream-leader node loss** (`…ReplicatedLeaderFailover`) and
+  **stale-replica restart/catch-up** (`…ReplicatedNodeCatchup`):
 
   ```sh
   make cluster-failover-tests   # MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/

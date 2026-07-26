@@ -35,8 +35,14 @@ const testGlobalAccount = "$G"
 
 // testJSClusterNode is one embedded nats-server in the cluster.
 type testJSClusterNode struct {
-	name    string
-	ns      *natsserver.Server
+	name string
+	ns   *natsserver.Server
+	// opts is the pristine restart template. natsserver.NewServer mutates the
+	// Options it is handed, so this is NEVER the value passed to NewServer — each
+	// (re)start gets opts.Clone(). Its ServerName, StoreDir, cluster endpoint and
+	// route list are fixed at creation; the bound client Port is stamped in after
+	// first start so a restart re-binds the same endpoint.
+	opts    *natsserver.Options
 	running bool
 }
 
@@ -115,20 +121,50 @@ func (c *testJetStreamCluster) newNode(t *testing.T, clusterPort int, routes []*
 		},
 		Routes: routes,
 	}
-	ns, err := natsserver.NewServer(opts)
+	// Keep opts as the pristine restart template; hand NewServer a clone (it mutates
+	// what it is given).
+	ns, err := natsserver.NewServer(opts.Clone())
 	if err != nil {
 		t.Fatalf("create cluster node %q: %v", opts.ServerName, err)
 	}
 	// Register BEFORE Start so a readiness-timeout Fatal still lets c.cleanup stop
 	// this server (t.Cleanup ran before the wait); otherwise it would leak.
-	n := &testJSClusterNode{name: opts.ServerName, ns: ns, running: true}
+	n := &testJSClusterNode{name: opts.ServerName, ns: ns, opts: opts, running: true}
 	c.nodes = append(c.nodes, n)
 	go ns.Start()
 	if !ns.ReadyForConnections(10 * time.Second) {
 		t.Fatalf("cluster node %q not ready: running=%v addr=%v clusterAddr=%v",
 			opts.ServerName, ns.Running(), ns.Addr(), ns.ClusterAddr())
 	}
+	// Stamp the bound client port into the template so a restart re-binds the same
+	// endpoint (equivalence only — cluster rejoin/catch-up relies on the preserved
+	// ServerName, cluster port and StoreDir, not on the client port).
+	opts.Port = ns.Addr().(*net.TCPAddr).Port
 	return n
+}
+
+// restartNode brings a stopped node back with the SAME ServerName, cluster endpoint,
+// route list and StoreDir, so JetStream restores it from its persisted state and it
+// rejoins the existing cluster (state restoration, not literal peer identity — a
+// fresh nkey is minted). Creates no new node entry, store dir, name or port. Callers
+// follow with waitFormed + waitStreamCurrent to confirm rejoin and catch-up.
+func (c *testJetStreamCluster) restartNode(t *testing.T, n *testJSClusterNode) {
+	t.Helper()
+	if n.running {
+		t.Fatalf("restartNode: node %q is already running", n.name)
+	}
+	ns, err := natsserver.NewServer(n.opts.Clone())
+	if err != nil {
+		t.Fatalf("restart cluster node %q: %v", n.name, err)
+	}
+	// Mark running BEFORE Start so cluster cleanup owns a partially-started process.
+	n.ns = ns
+	n.running = true
+	go ns.Start()
+	if !ns.ReadyForConnections(10 * time.Second) {
+		t.Fatalf("restarted node %q not ready: running=%v addr=%v clusterAddr=%v\n%s",
+			n.name, ns.Running(), ns.Addr(), ns.ClusterAddr(), c.describe())
+	}
 }
 
 // waitFormed blocks until every running node has size-1 routes, JetStream is
