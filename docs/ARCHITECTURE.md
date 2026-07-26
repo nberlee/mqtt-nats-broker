@@ -57,6 +57,33 @@ regression-tested under the `mqttport_fulltests` tag — the shared-store simula
 in `will_outbox_test.go` and the real 3-node cluster in
 `jetstream_cluster_harness_test.go` (see [CONTRIBUTING.md](../CONTRIBUTING.md)).
 
+Two refinements keep the guarantee tight:
+
+- **Durable termination.** A successful publish is committed `publishing -> done`
+  (retried against the record's latest sequence) *before* any cleanup; only then is
+  a native record deleted or a migrated record's tombstone kept. Committing `done`
+  first means a failed delete cannot leave a re-fireable `publishing` record — the
+  scanner reaps the `done` record instead.
+- **Takeover fence.** Each delayed Will records the session-record sequence of the
+  connection that created it (`OriginSessionSeq`). Before firing (and, best effort,
+  right after enqueue) the fence re-reads the session record and suppresses the Will
+  only when a newer record (sequence > `OriginSessionSeq`) shows *a newer accepted
+  connection without a later finite-disconnect stamp* (`DisconnectedAt == 0`) — a
+  real takeover. A newer-but-disconnected record fires like an absent one, so a
+  legitimately delayed Will is never lost. This closes the window where a reconnect's
+  cancel scan runs before the displaced connection's enqueue lands.
+
+Residuals that keep literal exactly-once impossible, classified distinctly:
+
+- *At-least-once duplicate* — a crash between the external publish and the `done`
+  commit republishes after the lease expires (the sanctioned duplicate).
+- *Reconnect-suppression miss* — an obsolete Will can still fire after a reconnect
+  that is then followed by a finite-expiry disconnect, or by deletion/absence of the
+  session record before the fence observes the reconnect. A never-expire
+  reconnect-then-disconnect keeps `DisconnectedAt == 0` and stays suppressible. A
+  persisted per-connection generation token would close this fully; that is a larger
+  design deliberately out of scope.
+
 ## Backend seams (see docs/PORTING.md)
 
 | Concern            | Mechanism                                             |

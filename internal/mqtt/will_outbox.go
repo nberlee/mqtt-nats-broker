@@ -23,6 +23,35 @@
 // republish (the at-least-once duplicate). A reconnect CAS-transitions the
 // client's pending records to cancelled; fire and reconnect compete for the same
 // pending sequence and the CAS winner is authoritative.
+//
+// Durable termination: a successful publish is made durably terminal
+// (publishing->done, retried against the record's latest sequence) BEFORE any
+// cleanup. Only then is a native record deleted (at the done sequence) and a
+// migrated record's tombstone kept. Because done is committed first, a failed
+// native delete cannot leave a re-fireable publishing record — the scanner reaps
+// the done record instead. See finalizeWillPublish.
+//
+// Takeover suppression is fenced by session generation: each delayed Will records
+// the persisted session-record sequence of the connection that created it
+// (OriginSessionSeq). Before the initial pending->publishing claim (and, best
+// effort, right after enqueue), the fence re-reads the current session record and
+// suppresses the Will iff a newer record (sequence > OriginSessionSeq) shows a
+// newer accepted connection without a later finite-disconnect stamp
+// (DisconnectedAt == 0). This closes the window where a reconnect's cancel scan
+// runs before the displaced connection's enqueue lands. A newer-but-disconnected
+// record fires like an absent one, so a legitimately delayed Will is never lost.
+// See willTakeoverFence.
+//
+// Residuals (why literal exactly-once remains impossible), classified distinctly:
+//   - at-least-once duplicate: a crash between the external publish and the done
+//     commit republishes after the lease expires. This is the sanctioned duplicate.
+//   - reconnect-suppression residual: an obsolete Will can still fire after a
+//     reconnect when the fence sees a newer-but-disconnected record — a reconnect
+//     followed by a finite-expiry disconnect, or by deletion/absence of the record
+//     before the fence observes the reconnect. (A never-expire reconnect-then-
+//     disconnect keeps DisconnectedAt == 0 and stays suppressible.) A persisted
+//     per-connection generation token would close this fully; that is a larger
+//     design deliberately out of scope here.
 
 package mqtt
 
@@ -65,6 +94,11 @@ var (
 const (
 	mqttWillEnqueueAttempts = 3
 	mqttWillCancelAttempts  = 3
+	// Bounded retry for the terminal publishing->done CAS. A transient/ambiguous
+	// terminal failure must not leave a published record able to re-fire, so the
+	// commit is retried against the record's latest sequence before giving up and
+	// leaving it publishing for lease-expiry recovery (at-least-once, never loss).
+	mqttWillFinalizeAttempts = 3
 )
 
 // mqttWillOutbox is a single delayed-Will event persisted on $MQTT_willq. One
@@ -85,6 +119,14 @@ type mqttWillOutbox struct {
 	ClaimUntil   int64         `json:"until,omitempty"`    // unix nanoseconds publish lease expiry
 	Migrated     bool          `json:"migrated,omitempty"` // legacy-migrated: terminal records are tombstoned, not deleted
 	Account      string        `json:"acct,omitempty"`     // diagnostic only
+	// OriginSessionSeq is the persisted session-record stream sequence captured at
+	// the disconnect that created this delayed Will (0 for legacy-migrated records,
+	// whose originating generation is unknown). It fences the takeover late-enqueue
+	// window: if, before this Will fires, a newer session record exists (sequence >
+	// OriginSessionSeq) AND that record shows a newer accepted connection without a
+	// later finite-disconnect stamp (DisconnectedAt == 0), a reconnect/takeover has
+	// superseded this connection and the Will is suppressed. See willTakeoverFence.
+	OriginSessionSeq uint64 `json:"oseq,omitempty"`
 }
 
 // leaseValid reports whether the publishing claim lease is still valid at now.
@@ -161,33 +203,51 @@ func (jsa *mqttJSA) loadWillOutbox(subject string) (*mqttWillOutbox, uint64, err
 // success). If the durable enqueue still cannot be confirmed after the bounded
 // retries, the Will is published IMMEDIATELY as a fail-safe (trading the Will
 // Delay for not losing the Will) rather than left with no authority to fire it.
-func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash string, will *mqttWill, props []byte, user string, fireAt int64) error {
+func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64) error {
 	willID := nuid.Next()
 	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
 	rec := &mqttWillOutbox{
-		WillID:       willID,
-		ClientIDHash: cidHash,
-		Topic:        string(will.topic),
-		Msg:          will.message,
-		QoS:          will.qos,
-		Retain:       will.retain,
-		Props:        props,
-		User:         user,
-		FireAt:       fireAt,
-		State:        mqttWillPending,
-		Account:      as.jsa.c.acc.GetName(),
+		WillID:           willID,
+		ClientIDHash:     cidHash,
+		Topic:            string(will.topic),
+		Msg:              will.message,
+		QoS:              will.qos,
+		Retain:           will.retain,
+		Props:            props,
+		User:             user,
+		FireAt:           fireAt,
+		State:            mqttWillPending,
+		Account:          as.jsa.c.acc.GetName(),
+		OriginSessionSeq: originSessionSeq,
 	}
 	var err error
 	for attempt := 0; attempt < mqttWillEnqueueAttempts; attempt++ {
-		if _, err = as.storeWillEnqueueCAS(subject, 0, rec); err == nil {
+		newSeq, serr := as.storeWillEnqueueCAS(subject, 0, rec)
+		if serr == nil {
+			// Durability CONFIRMED by the create CAS. From here NO failure may fall
+			// back to the immediate-publish fail-safe below, or the durable pending
+			// record would fire AND the fail-safe would publish. Run the best-effort
+			// early cancel on the known pending snapshot; any failure inside it is
+			// swallowed and the claimant-side fence remains the durable safety net.
+			as.earlyCancelIfSuperseded(s, subject, rec, newSeq)
 			return nil
 		}
+		err = serr
 		// The create-only CAS may have failed because our own earlier attempt's
-		// write landed but its ack was lost: if the subject already holds this
-		// event, the enqueue succeeded.
-		if existing, _, lerr := as.jsa.loadWillOutbox(subject); lerr == nil && existing != nil && existing.WillID == willID {
-			return nil
+		// write landed but its ack was lost: re-read to resolve the ambiguity.
+		existing, exSeq, lerr := as.jsa.loadWillOutbox(subject)
+		if lerr != nil || existing == nil || existing.WillID != willID {
+			continue // enqueue UNCONFIRMED: retry, else fall to the fail-safe
 		}
+		// Enqueue CONFIRMED (durable). Reconcile by the record's current state.
+		if existing.State == mqttWillPending {
+			// Still ours to suppress: run the best-effort early cancel. If a
+			// claimant has since advanced it to publishing/done/cancelled we must
+			// NOT write cancelled over it (that would revoke an irrevocable claim),
+			// which is exactly what the state guard here and inside the fence avoid.
+			as.earlyCancelIfSuperseded(s, subject, existing, exSeq)
+		}
+		return nil
 	}
 	// Fail-safe: durable enqueue not confirmed. Publish now so the Will is not
 	// lost; the delay is sacrificed. (For QoS 0 this succeeds even if the willq
@@ -216,6 +276,23 @@ func (as *mqttAccountSessionManager) storeWillEnqueueCAS(subject string, expectS
 	return as.jsa.storeWillOutboxCAS(subject, expectSeq, rec)
 }
 
+// earlyCancelIfSuperseded runs the takeover fence right after a confirmed enqueue
+// and, if a live takeover already superseded this connection, CAS-cancels the
+// just-created pending record. Best-effort optimization only: a cancel CAS that
+// loses to a concurrent state advance is harmless, and a defer (indeterminate
+// session read) leaves the record pending — the claimant-side fence in tryFireWill
+// is the durable safety net. rec must be pending on entry and is at CAS sequence
+// seq.
+func (as *mqttAccountSessionManager) earlyCancelIfSuperseded(s *Server, subject string, rec *mqttWillOutbox, seq uint64) {
+	if as.willTakeoverFence(rec) != willFenceCancel {
+		return
+	}
+	rec.State = mqttWillCancelled
+	if _, err := as.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
+		s.Debugf("MQTT: early-cancel of superseded delayed Will %q lost/failed (claimant fence will resolve): %v", rec.WillID, err)
+	}
+}
+
 // cancelWillOutbox suppresses a reconnecting client's pending delayed Wills by
 // CAS-transitioning each pending record to cancelled. A record already
 // publishing is irrevocable (that generation is due) and is left alone; the
@@ -225,6 +302,15 @@ func (as *mqttAccountSessionManager) storeWillEnqueueCAS(subject string, expectS
 // error is returned if it could not confirm every pending record was resolved
 // (cancelled, or already firing). Runs without locks (JSA I/O).
 func (as *mqttAccountSessionManager) cancelWillOutbox(s *Server, cidHash string) error {
+	// Instance-scoped test observer: fires after this cancel pass so the takeover
+	// late-enqueue test can confirm the displaced broker's async cancel completed on
+	// the empty outbox before a late enqueue is released. Nil in production.
+	as.mu.RLock()
+	done := as.testCancelWillDone
+	as.mu.RUnlock()
+	if done != nil {
+		defer done()
+	}
 	filter := mqttWillQClientFilter(as.domainTk, cidHash)
 	var err error
 	for attempt := 0; attempt < mqttWillCancelAttempts; attempt++ {
@@ -331,12 +417,97 @@ func (as *mqttAccountSessionManager) scanWillOutbox(s *Server) {
 	}
 }
 
+// willFenceDecision is the tri-state outcome of the takeover fence.
+type willFenceDecision int
+
+const (
+	willFenceProceed willFenceDecision = iota // fire: no superseding live connection observed
+	willFenceCancel                           // suppress: a live takeover superseded this connection
+	willFenceDefer                            // indeterminate: session record unreadable; resolve later
+)
+
+// loadFenceSession loads and decodes the persisted session record for a client
+// hash, honoring the instance-scoped test seam. Returns (nil, 0, nil) when no
+// record exists (absent). A load error, or a JSON decode failure (malformed
+// record), is surfaced as an error so the fence treats it as indeterminate
+// (defer) and never as "absent".
+func (as *mqttAccountSessionManager) loadFenceSession(cidHash string) (*mqttPersistedSession, uint64, error) {
+	as.mu.RLock()
+	hook := as.testSessionLoad
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(cidHash)
+	}
+	smsg, err := as.jsa.loadSessionMsg(as.domainTk, cidHash)
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			return nil, 0, err // indeterminate load
+		}
+		return nil, 0, nil // absent
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		return nil, 0, err // malformed: indeterminate
+	}
+	return ps, smsg.Sequence, nil
+}
+
+// willTakeoverFence decides whether a delayed Will must be suppressed because a
+// reconnect/takeover superseded the connection that created it. Migrated records
+// (OriginSessionSeq == 0) always proceed: their originating generation is unknown.
+// Otherwise it reads the current session record:
+//   - cancel: a newer record (sequence > OriginSessionSeq) shows a currently
+//     connected generation (DisconnectedAt == 0) — a real takeover. (DisconnectedAt
+//     == 0 does not literally mean "connected now": a never-expire disconnect skips
+//     its disconnect save and also leaves it 0; combined with the newer sequence it
+//     proves a newer accepted connection without a later finite-disconnect stamp,
+//     which is exactly what to suppress.)
+//   - proceed: the record is absent, unchanged, or newer-but-disconnected
+//     (DisconnectedAt > 0 — e.g. the expiry sweep stamped it, or a reconnect that
+//     has since taken a finite-expiry disconnect). A newer-but-disconnected record
+//     must still fire, like an absent one, or a legitimate Will would be lost.
+//   - defer: the session record could not be read (load/decode error); never act
+//     on a record we could not read.
+func (as *mqttAccountSessionManager) willTakeoverFence(rec *mqttWillOutbox) willFenceDecision {
+	if rec.OriginSessionSeq == 0 {
+		return willFenceProceed
+	}
+	ps, seq, err := as.loadFenceSession(rec.ClientIDHash)
+	if err != nil {
+		return willFenceDefer
+	}
+	if ps == nil || seq <= rec.OriginSessionSeq {
+		return willFenceProceed
+	}
+	if ps.DisconnectedAt == 0 {
+		return willFenceCancel
+	}
+	return willFenceProceed
+}
+
 // tryFireWill claims a due/recoverable record by CAS-transitioning it to
 // publishing with a fresh lease, then dispatches a publisher worker through the
 // shutdown-aware admission gate. A lost CAS (a reconnect cancelled it, or a peer
 // claimed it) is a no-op. If the gate is closed (shutdown Phase 2), the record
 // is left publishing for post-restart recovery.
 func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec *mqttWillOutbox, seq uint64, now time.Time) {
+	// Fence only the initial pending->publishing claim. A record that is already
+	// publishing (crashed-publisher recovery) is an irrevocable, due generation:
+	// the fence must never cancel a record a peer was mid-publishing.
+	if rec.State == mqttWillPending {
+		switch as.willTakeoverFence(rec) {
+		case willFenceCancel:
+			rec.State = mqttWillCancelled
+			if _, err := as.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
+				// Lost to a concurrent fire/cancel, or a transient write failure: a
+				// later scan re-resolves. Harmless either way.
+				s.Debugf("MQTT: unable to cancel superseded delayed Will %q: %v", rec.WillID, err)
+			}
+			return
+		case willFenceDefer:
+			return // indeterminate session read: leave pending for a later scan
+		}
+	}
 	rec.State = mqttWillPublishing
 	rec.ClaimOwner = s.NodeName()
 	rec.ClaimUntil = now.Add(mqttWillClaimLease).UnixNano()
@@ -352,9 +523,12 @@ func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec 
 
 // willPublishWorker publishes a claimed Will and then finalizes its record.
 // Tracked by willWorkerWG (admitted by tryFireWill). On a publish error the
-// record is left publishing so its lease expiry drives a retry (at-least-once);
-// on success a native record is deleted and a migrated record is tombstoned as
-// done.
+// record is left publishing so its lease expiry drives a retry (at-least-once).
+// On success the record is made durably terminal (publishing->done) BEFORE any
+// cleanup: only then is a native record deleted (at the done sequence) and a
+// migrated record's tombstone kept. Committing done first means a failed native
+// delete can no longer leave a re-fireable publishing record — the scanner reaps
+// the done record instead.
 //
 // The worker does not renew its lease: the lease (mqttWillClaimLease, 30s) is
 // sized well above the publish timeout (the JSA request timeout, seconds), so a
@@ -367,16 +541,87 @@ func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string
 		s.Warnf("MQTT: delayed Will %q publish failed, will retry after lease expiry: %v", rec.WillID, err)
 		return
 	}
-	if rec.Migrated {
-		rec.State = mqttWillDone
-		if _, err := as.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
-			s.Debugf("MQTT: unable to tombstone migrated Will %q: %v", rec.WillID, err)
-		}
+	doneSeq, ok := as.finalizeWillPublish(s, subject, rec, seq)
+	if !ok {
+		// Terminal state could not be confirmed. Leave the record publishing so its
+		// lease expiry drives recovery: a post-lease duplicate is permitted, message
+		// loss is not.
 		return
 	}
-	if err := as.jsa.deleteMsg(mqttWillQStreamName, seq, true); err != nil {
+	if rec.Migrated {
+		return // migrated terminal records are tombstoned (done), never deleted
+	}
+	if doneSeq == 0 {
+		return // native record already gone (a peer finalized+deleted it)
+	}
+	if err := as.jsa.deleteMsg(mqttWillQStreamName, doneSeq, true); err != nil {
 		s.Debugf("MQTT: unable to delete published Will %q: %v", rec.WillID, err)
 	}
+}
+
+// finalizeWillPublish commits a just-published record publishing->done and returns
+// the stream sequence of the durable done record (and ok==true) so the caller can
+// clean up at the authoritative sequence rather than the now-stale claim sequence.
+// On a CAS failure it re-reads and reconciles (same WillID throughout):
+//   - done: the write landed (ours, or a peer that also published) -> success at
+//     the re-read sequence.
+//   - native record absent: already finalized and deleted by a peer -> success
+//     with seq 0 (nothing left to delete).
+//   - still publishing (our own failed/ambiguous CAS left it unchanged, or a peer
+//     reclaimed it after lease expiry): retry the done CAS at the re-read sequence.
+//   - a foreign WillID, or an unexpected state (cancelled/pending): abandon
+//     (ok==false); the record is not ours to finalize.
+//
+// If done cannot be confirmed within the bounded budget, returns ok==false and the
+// caller leaves the record publishing for lease-expiry recovery.
+func (as *mqttAccountSessionManager) finalizeWillPublish(s *Server, subject string, rec *mqttWillOutbox, seq uint64) (uint64, bool) {
+	rec.State = mqttWillDone
+	for attempt := 0; attempt < mqttWillFinalizeAttempts; attempt++ {
+		newSeq, err := as.storeWillFinalizeCAS(subject, seq, rec)
+		if err == nil {
+			return newSeq, true
+		}
+		// CAS failed (transiently, on a stale sequence, or via an ambiguous seam
+		// that may have written anyway). Re-read to learn the durable truth.
+		cur, curSeq, lerr := as.jsa.loadWillOutbox(subject)
+		if lerr != nil {
+			continue // indeterminate load: retry
+		}
+		if cur == nil {
+			if !rec.Migrated {
+				return 0, true // native record already finalized+deleted by a peer
+			}
+			continue // a migrated tombstone should never vanish: retry
+		}
+		if cur.WillID != rec.WillID {
+			s.Warnf("MQTT: delayed Will %q finalize found a foreign record on %q (state %q, wid %q); abandoning finalize", rec.WillID, subject, cur.State, cur.WillID)
+			return 0, false
+		}
+		switch cur.State {
+		case mqttWillDone:
+			return curSeq, true // the done write landed (ours or a peer's)
+		case mqttWillPublishing:
+			seq = curSeq // retry the commit at the record's current sequence
+		default:
+			s.Warnf("MQTT: delayed Will %q finalize found unexpected state %q on %q; abandoning finalize", rec.WillID, cur.State, subject)
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// storeWillFinalizeCAS performs the terminal publishing->done CAS store, honoring
+// an instance-scoped test seam. Nil seam in production delegates straight to the
+// JSA. Only the finalize path is routed through here so an injected failure never
+// perturbs the enqueue/cancel/claim stores on the same account manager.
+func (as *mqttAccountSessionManager) storeWillFinalizeCAS(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error) {
+	as.mu.RLock()
+	hook := as.testFinalizeStore
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(subject, expectSeq, rec)
+	}
+	return as.jsa.storeWillOutboxCAS(subject, expectSeq, rec)
 }
 
 // publishWillRecord publishes a Will record, honoring the instance-scoped test
@@ -464,6 +709,8 @@ func (as *mqttAccountSessionManager) migrateWillsToOutbox(s *Server) {
 			State:        mqttWillPending,
 			Migrated:     true,
 			Account:      as.jsa.c.acc.GetName(),
+			// OriginSessionSeq left 0: a legacy Will's originating connection
+			// generation is unknown, so migrated records bypass the takeover fence.
 		}
 		// Create-only CAS. The legacy copy may be cleared ONLY once the outbox
 		// durably holds this event — otherwise a transient store failure would

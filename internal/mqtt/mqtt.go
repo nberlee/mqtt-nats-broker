@@ -462,6 +462,27 @@ type mqttAccountSessionManager struct {
 	// enqueue CAS to fail so the immediate-publish fail-safe is exercised. Nil in
 	// production. See storeWillEnqueueCAS / enqueueDelayedWill.
 	testEnqueueStore func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)
+
+	// testFinalizeStore, when non-nil, replaces the terminal publishing->done CAS
+	// store for THIS account manager only (instance-scoped). Set/read under mu.
+	// Used to fail or ambiguate the terminal commit and verify the finalizer's
+	// re-read/reconcile path. Nil in production. See finalizeWillPublish.
+	testFinalizeStore func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)
+
+	// testSessionLoad, when non-nil, replaces the session-record load used by the
+	// delayed-Will takeover fence for THIS account manager only (instance-scoped).
+	// Set/read under mu. Used to drive the fence decision (a connected/disconnected
+	// newer generation) and to inject a load error so the fence defers on an
+	// indeterminate read. Nil in production. See loadFenceSession.
+	testSessionLoad func(cidHash string) (*mqttPersistedSession, uint64, error)
+
+	// testCancelWillDone, when non-nil, is invoked after each cancelWillOutbox pass
+	// for THIS account manager only (instance-scoped). Set/read under mu. Lets the
+	// takeover late-enqueue test wait until the displaced broker's asynchronous
+	// cancel scan (processSessionPersist) has completed on the still-empty outbox
+	// before releasing the blocked enqueue, so a stray old cancel cannot be mistaken
+	// for the new enqueue-side fence. Nil in production.
+	testCancelWillDone func()
 }
 
 type mqttJSAResponse struct {
@@ -1884,9 +1905,20 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		asm.scheduleSessionExpiry(s, idHash, time.Duration(expiry)*time.Second)
 	}
 
+	// Capture the persisted session-record sequence as the delayed-Will takeover
+	// fence baseline. For a finite-expiry session the disconnect save above bumped
+	// it; for a never-expire session no disconnect save runs, so it is the last
+	// prior save's sequence — still a valid baseline, since any reconnect/takeover
+	// saves again with a strictly higher sequence. Captured here (post-save, before
+	// any reconnect) so a later higher session sequence means reconnect/takeover or
+	// a sweep, never an ordinary in-connection save. See mqttWillOutbox.OriginSessionSeq.
+	sess.mu.Lock()
+	originSessionSeq := sess.seq
+	sess.mu.Unlock()
+
 	// Now handle the "will". This function will be a no-op if there is no "will" to
 	// send. The effective Session Expiry Interval bounds any Will Delay.
-	s.mqttHandleWill(c, expiry)
+	s.mqttHandleWill(c, expiry, originSessionSeq)
 }
 
 // Updates the MaxAckPending for all MQTT sessions, updating the
@@ -7504,7 +7536,7 @@ func mqttPayloadFormatIsUTF8(props []byte) bool {
 // MQTT 5.0 client that set a Will Delay Interval on a session that survives the
 // connection, publication is deferred so a timely reconnect can cancel it. Spec5
 // [3.1.3.2.2], [MQTT-3.1.2-8].
-func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32) {
+func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, originSessionSeq uint64) {
 	c.mu.Lock()
 	if c.mqtt.cp == nil {
 		c.mu.Unlock()
@@ -7546,7 +7578,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32) {
 		if asm != nil && willAllowed {
 			// enqueueDelayedWill retries internally and logs on exhausted retries;
 			// there is nothing further to do on the disconnect path.
-			_ = asm.enqueueDelayedWill(s, idHash, will, props, user, fireAt)
+			_ = asm.enqueueDelayedWill(s, idHash, will, props, user, fireAt, originSessionSeq)
 		}
 		return
 	}
