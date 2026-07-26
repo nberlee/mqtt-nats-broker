@@ -192,6 +192,118 @@ func TestMQTTWillOutboxLegacyMigration(t *testing.T) {
 	})
 }
 
+// TestMQTTWillOutboxMigratedTombstoneNoRecreate: a legacy-migrated Will that has
+// already fired leaves a done tombstone (kept, not deleted, because Migrated is
+// set), so a lagging migrator that still holds the pre-clear legacy copy cannot
+// resurrect and re-fire it. After the migrated Will fires once, re-seeding the
+// same legacy record and running migration again must hit the tombstone via the
+// deterministic-WillID create-only CAS and NOT re-enqueue: no second delivery,
+// the tombstone untouched, and the re-seeded legacy Will cleared again.
+func TestMQTTWillOutboxMigratedTombstoneNoRecreate(t *testing.T) {
+	oA := testMQTTDefaultOptionsV5()
+	sA := testMQTTRunServer(t, oA)
+	defer testMQTTShutdownServer(sA)
+
+	// Subscriber for the migrated Will topic.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mtssub", cleanStart: true}, oA.MQTT.Host, oA.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/mts", opts: 0}})
+
+	nc, js := jsClientConnect(t, sA)
+	defer nc.Close()
+
+	// A fixed FireAt keeps the derived WillID identical across the original seed and
+	// the re-seed, so the re-migration targets the very subject the tombstone holds.
+	cidHash := getHash("mtspub")
+	fireAt := time.Now().Add(200 * time.Millisecond).UnixNano()
+	seedLegacy := func() {
+		ps := mqttPersistedSession{
+			Origin:         "old-node",
+			ID:             "mtspub",
+			Will:           &mqttPersistedWill{Topic: "will/mts", Msg: []byte("legacy-once"), QoS: 0, FireAt: fireAt},
+			ExpiryInterval: 300,
+		}
+		b, _ := json.Marshal(&ps)
+		if _, err := js.Publish(mqttSessStreamSubjectPrefix+cidHash, b); err != nil {
+			t.Fatalf("seed legacy session record: %v", err)
+		}
+	}
+	seedLegacy()
+
+	// Second replica (started after the seed): its eager init migrates the legacy
+	// Will to the outbox, which then fires exactly once.
+	sB, _ := runSharedReplica(t, oA)
+	defer sB.Shutdown()
+	asmB := testMQTTGetGlobalASM(t, sB)
+
+	testMQTTReadPublishV5(t, rs, "will/mts", []byte("legacy-once"))
+
+	// The fired migrated Will leaves exactly one record: a done+migrated tombstone.
+	var tombSubj string
+	var tombSeq uint64
+	checkFor(t, 3*time.Second, 20*time.Millisecond, func() error {
+		recs := testMQTTListWillRecords(t, asmB)
+		if len(recs) != 1 {
+			return fmt.Errorf("want exactly 1 outbox record (the tombstone), got %d", len(recs))
+		}
+		w := recs[0]
+		if w.rec.State != mqttWillDone || !w.rec.Migrated {
+			return fmt.Errorf("want done+migrated tombstone, got state=%q migrated=%v", w.rec.State, w.rec.Migrated)
+		}
+		tombSubj, tombSeq = w.subject, w.seq
+		return nil
+	})
+
+	// The first migration cleared the legacy Will from the session record.
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		m, err := js.GetLastMsg(mqttSessStreamName, mqttSessStreamSubjectPrefix+cidHash)
+		if err != nil {
+			return nil // record gone entirely: fine
+		}
+		if json.Valid(m.Data) && containsJSONKey(m.Data, "will") {
+			return fmt.Errorf("legacy will not cleared after first migration: %s", m.Data)
+		}
+		return nil
+	})
+
+	// Re-seed the same legacy Will (simulating a lagging migrator's stale copy) and
+	// run migration again. The create-only CAS must hit the existing done tombstone
+	// and treat it as already-migrated — no resurrection to pending.
+	seedLegacy()
+	asmB.migrateWillsToOutbox(sB)
+
+	// No second delivery.
+	testMQTTExpectNothing(t, rs)
+
+	// Still exactly one record, and it is the unchanged tombstone (same subject and
+	// sequence — never rewritten to pending).
+	recs := testMQTTListWillRecords(t, asmB)
+	if len(recs) != 1 {
+		t.Fatalf("re-migration changed the record set: want 1 (the tombstone), got %d: %+v", len(recs), recs)
+	}
+	w := recs[0]
+	if w.rec.State != mqttWillDone || !w.rec.Migrated {
+		t.Fatalf("tombstone mutated: state=%q migrated=%v", w.rec.State, w.rec.Migrated)
+	}
+	if w.subject != tombSubj || w.seq != tombSeq {
+		t.Fatalf("tombstone rewritten (%s#%d -> %s#%d): re-migration must not touch it", tombSubj, tombSeq, w.subject, w.seq)
+	}
+
+	// The re-seeded legacy Will was cleared again (migration saw the tombstone and
+	// finalized the legacy record rather than leaving a dangling Will).
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		m, err := js.GetLastMsg(mqttSessStreamName, mqttSessStreamSubjectPrefix+cidHash)
+		if err != nil {
+			return nil
+		}
+		if json.Valid(m.Data) && containsJSONKey(m.Data, "will") {
+			return fmt.Errorf("re-seeded legacy will not cleared by re-migration: %s", m.Data)
+		}
+		return nil
+	})
+}
+
 // containsJSONKey reports whether the JSON object bytes contain a non-null value
 // for key (a cheap check sufficient for these tests).
 func containsJSONKey(data []byte, key string) bool {
@@ -554,14 +666,16 @@ func testMQTTCountWillRecords(t testing.TB, asm *mqttAccountSessionManager) int 
 	return n
 }
 
-// testWillRec pairs an outbox record with the subject it lives on.
+// testWillRec pairs an outbox record with the subject and stream sequence it
+// lives on.
 type testWillRec struct {
 	subject string
+	seq     uint64
 	rec     *mqttWillOutbox
 }
 
 // testMQTTListWillRecords returns every outbox record for the account paired with
-// its subject, in stream order.
+// its subject and stream sequence, in stream order.
 func testMQTTListWillRecords(t testing.TB, asm *mqttAccountSessionManager) []testWillRec {
 	t.Helper()
 	var out []testWillRec
@@ -575,7 +689,7 @@ func testMQTTListWillRecords(t testing.TB, asm *mqttAccountSessionManager) []tes
 		if json.Unmarshal(smsg.Data, rec) != nil {
 			continue
 		}
-		out = append(out, testWillRec{subject: smsg.Subject, rec: rec})
+		out = append(out, testWillRec{subject: smsg.Subject, seq: smsg.Sequence, rec: rec})
 	}
 	return out
 }
