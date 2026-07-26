@@ -379,21 +379,26 @@ func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string
 	}
 }
 
-// publishWillRecord fans the Will out via a short-lived internal account client
-// and the account JSA (mirroring the immediate-Will path), tagging nothing with
-// a No Local origin since a Will is server-originated. The QoS1/2 store is bound
-// by the JSA request timeout; this is the same publish core the immediate-Will
-// path uses, so it inherits that path's bounding rather than blocking forever.
+// publishWillRecord publishes a Will record, honoring the instance-scoped test
+// seam. In production (nil seam) it delegates straight to deliverWillRecord; a
+// test seam may replace the publication entirely, or call deliverWillRecord
+// itself (e.g. to deliver for real and then report an ambiguous outcome).
 func (as *mqttAccountSessionManager) publishWillRecord(s *Server, rec *mqttWillOutbox) error {
-	// Instance-scoped test seam: replace the actual publication for this account
-	// manager only (used to inject publish failures in recovery tests). Nil in
-	// production.
 	as.mu.RLock()
 	hook := as.testPublishWill
 	as.mu.RUnlock()
 	if hook != nil {
 		return hook(rec)
 	}
+	return as.deliverWillRecord(s, rec)
+}
+
+// deliverWillRecord fans the Will out via a short-lived internal account client
+// and the account JSA (mirroring the immediate-Will path), tagging nothing with
+// a No Local origin since a Will is server-originated. The QoS1/2 store is bound
+// by the JSA request timeout; this is the same publish core the immediate-Will
+// path uses, so it inherits that path's bounding rather than blocking forever.
+func (as *mqttAccountSessionManager) deliverWillRecord(s *Server, rec *mqttWillOutbox) error {
 	subject, err := mqttTopicToNATSPubSubject([]byte(rec.Topic))
 	if err != nil {
 		// A malformed topic can never be published; drop it rather than retry

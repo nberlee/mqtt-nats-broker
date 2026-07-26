@@ -624,6 +624,79 @@ func TestMQTTWillOutboxEnqueueExhaustionImmediatePublish(t *testing.T) {
 	testMQTTExpectNothing(t, rs)
 }
 
+// TestMQTTWillOutboxAmbiguousPublishDuplicateRecovery: a claimant whose publish
+// actually reaches subscribers but whose OUTCOME is reported as a failure — an
+// ambiguous publication — leaves the record publishing, so a later reclaim
+// republishes it. That duplicate is exactly what the at-least-once guarantee
+// permits. The test asserts the Will is never lost (delivered on the ambiguous
+// publish), that recovery redelivers it (a second, duplicate copy), and that
+// once the ambiguity clears the record reaches a clean terminal state (deleted).
+//
+// A single broker claims strictly sequentially (the scan re-fires only a
+// publishing record whose lease has lapsed, and a fresh claim resets that lease),
+// so the duplicates come from successive lease-expiry cycles, never from two live
+// claimants racing the same record.
+func TestMQTTWillOutboxAmbiguousPublishDuplicateRecovery(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	asm := testMQTTGetGlobalASM(t, s)
+
+	// Ambiguous publish: deliver for real, count it, then report failure so the
+	// worker leaves the record publishing for lease-expiry recovery. Cleared later
+	// so a clean reclaim finally finalizes (deletes) the record.
+	var mu sync.Mutex
+	deliveries := 0
+	setWillPublishHook(asm, func(rec *mqttWillOutbox) error {
+		_ = asm.deliverWillRecord(s, rec) // the message really reaches subscribers
+		mu.Lock()
+		deliveries++
+		mu.Unlock()
+		return fmt.Errorf("ambiguous publish outcome")
+	})
+
+	// Subscriber.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ambsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/amb", opts: 0}})
+
+	// Enqueue a due delayed Will.
+	will := &mqttWill{topic: []byte("will/amb"), message: []byte("dup"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ambpub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	// No loss: the ambiguous publish still delivered the Will.
+	testMQTTReadPublishV5(t, rs, "will/amb", []byte("dup"))
+	// Recovery: the record stayed publishing, so once the lease lapses a reclaim
+	// republishes it — a second, duplicate delivery (allowed under at-least-once).
+	testMQTTReadPublishV5(t, rs, "will/amb", []byte("dup"))
+
+	// The record never left the publishing state (never lost, never prematurely done).
+	if !testMQTTHasWillState(t, asm, mqttWillPublishing) {
+		t.Fatal("record not publishing during the ambiguous-recovery cycle")
+	}
+
+	// Clear the ambiguity: the next reclaim publishes cleanly and deletes the record.
+	setWillPublishHook(asm, nil)
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		if n := testMQTTCountWillRecords(t, asm); n != 0 {
+			return fmt.Errorf("outbox not drained after ambiguity cleared, got %d", n)
+		}
+		return nil
+	})
+
+	mu.Lock()
+	got := deliveries
+	mu.Unlock()
+	if got < 2 {
+		t.Fatalf("expected at least 2 real deliveries (ambiguous publish + recovery), got %d", got)
+	}
+}
+
 // setWillPublishHook installs (or clears) the instance-scoped publish seam on asm.
 func setWillPublishHook(asm *mqttAccountSessionManager, fn func(rec *mqttWillOutbox) error) {
 	asm.mu.Lock()
