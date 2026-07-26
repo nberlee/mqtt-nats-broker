@@ -439,10 +439,20 @@ type mqttAccountSessionManager struct {
 	// connection closes. A reconnect (local or remote takeover) cancels them.
 	// Spec5 [3.1.2.11.2]. Guarded by mu.
 	pendingExpiries map[string]*time.Timer
-	retmsgs         *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
-	rmsCache        *sync.Map                              // map[subject]mqttRetainedMsg
-	jsa             mqttJSA
-	domainTk        string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+	// Per-client reconciliation ordering state, keyed by MQTT client ID hash and
+	// guarded by mu. A remote session persist observed by processSessionPersist
+	// hands the expiry reconciliation to a spawned worker; because each worker
+	// loads the record before taking mu, worker completion order can reverse the
+	// (ordered) delivery order. latest is the highest observed PubAck sequence for
+	// the client, inFlight counts admitted-but-not-yet-completed workers. A worker
+	// applies its decision only if it is still the latest observation, and the
+	// entry is pruned only once inFlight drops to zero so a worker parked before mu
+	// cannot resume into a pruned-away watermark. See reconcileRemoteSessionExpiry.
+	reconcileWM map[string]*sessionReconcileState
+	retmsgs     *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
+	rmsCache    *sync.Map                              // map[subject]mqttRetainedMsg
+	jsa         mqttJSA
+	domainTk    string // Domain (with trailing "."), or possibly empty. This is added to session subject.
 
 	// Degraded mode, set once at creation (read without lock): per-message TTL
 	// could not be enabled on a pre-existing stream, so stored messages must
@@ -483,6 +493,22 @@ type mqttAccountSessionManager struct {
 	// before releasing the blocked enqueue, so a stray old cancel cannot be mistaken
 	// for the new enqueue-side fence. Nil in production.
 	testCancelWillDone func()
+
+	// testReconcilePause, when non-nil, is invoked by a remote-expiry reconciliation
+	// worker for THIS account manager only (instance-scoped) AFTER it has loaded the
+	// record but just BEFORE it takes mu to apply its decision. Set/read under mu.
+	// Lets the worker-ordering tests park a stale worker while a newer worker (or a
+	// local reconnect/re-disconnect) races ahead, so the ordering/ownership guards
+	// are exercised deterministically. Nil in production. See
+	// reconcileRemoteSessionExpiry.
+	testReconcilePause func(idHash string)
+}
+
+// sessionReconcileState orders remote-expiry reconciliation workers for a single
+// client ID hash. Guarded by mqttAccountSessionManager.mu.
+type sessionReconcileState struct {
+	latest   uint64 // highest observed PubAck sequence for this client
+	inFlight uint64 // admitted-but-not-yet-completed reconciliation workers
 }
 
 type mqttJSAResponse struct {
@@ -2402,6 +2428,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		sessLocked:      make(map[string]struct{}),
 		flappers:        make(map[string]time.Time),
 		pendingExpiries: make(map[string]*time.Timer),
+		reconcileWM:     make(map[string]*sessionReconcileState),
 		jsa: mqttJSA{
 			id:      id,
 			c:       c,
@@ -3435,9 +3462,15 @@ func (as *mqttAccountSessionManager) processRetainedMsgDel(_ *subscription, c *c
 
 // This will receive all JS API replies for a request to store a session record,
 // including the reply for our own server, which we will ignore.
-// This allows us to detect that some application somewhere else in the cluster
-// is connecting with the same client ID, and therefore we need to close the
-// connection that is currently using this client ID.
+//
+// It has two responsibilities for a remote persist. When we own a local session
+// for the client ID, a store elsewhere means an application somewhere else in the
+// cluster is connecting with the same client ID, so we evict our displaced local
+// connection (takeover). When we do NOT own a local session, we reconcile our
+// local session-expiry timer from the authoritative persisted record on a spawned
+// worker, so a surviving replica cleans up a remotely disconnected session near
+// its original deadline instead of waiting for the periodic sweep.
+// Spec5 [MQTT-3.1.2-8], [3.1.2.11.2].
 //
 // Can run from various go routines (system send loop, etc..).
 // No lock held on entry.
@@ -3472,15 +3505,54 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 
 	as.mu.Lock()
 	defer as.mu.Unlock()
+	// The delivery client (pc) has no server ref, so use the account JSA client's.
+	s := as.jsa.c.srv
+	// Advance the per-client reconciliation watermark for this observation, before
+	// choosing the takeover vs no-local path, so a newer observation handled by the
+	// takeover branch still supersedes an older in-flight reconciliation worker.
+	// Only the no-local branch creates an entry, so advancing an existing one here
+	// never leaks state for a client that has no worker in flight. Delivery is
+	// serialized on one subscription goroutine but need not match stream-sequence
+	// order, so advance with a max rather than last-write-wins.
+	if st := as.reconcileWM[cIDHash]; st != nil && par.Sequence > st.latest {
+		st.latest = par.Sequence
+	}
 	// A connection for this client ID started on another server, i.e. a new
 	// connection to this session. Below we evict our displaced local connection;
 	// the reconnecting broker also cancels the outbox from mqttProcessConnect.
 	// Spec5 [MQTT-3.1.2-8].
 	sess, ok := as.sessByHash[cIDHash]
 	if !ok {
-		// No local session: cancel any (sweep-armed) expiry timer, the remote save
-		// superseded the record it was armed from. Spec5 [3.1.2.11.2].
-		as.cancelSessionExpiryLocked(cIDHash)
+		// No local session: reconcile this session's expiry deadline from the
+		// authoritative persisted record on a spawned, ADMITTED worker. Re-reading
+		// the record is a synchronous JSA request that must not run on this
+		// subscription delivery goroutine — it would head-of-line-stall further
+		// persist observations up to the JSA timeout. Admission through the Will
+		// dispatch gate also keeps the worker tracked (willWorkerWG) and drained
+		// before shutdown tears down the JSA; admission fails once shutdown Phase 2
+		// closed the gate, in which case we skip (the process is stopping). The
+		// worker arms or cancels the local timer from the record, so a surviving
+		// replica cleans up near the original deadline instead of waiting for the
+		// periodic sweep. Spec5 [3.1.2.11.2].
+		if as.reconcileWM != nil && s.admitWillWorker() {
+			st := as.reconcileWM[cIDHash]
+			if st == nil {
+				st = &sessionReconcileState{}
+				as.reconcileWM[cIDHash] = st
+			}
+			if par.Sequence > st.latest {
+				st.latest = par.Sequence
+			}
+			// Increment synchronously, in delivery order, before the go so a newer
+			// observation cannot complete and prune this entry before the worker
+			// runs. The worker decrements it on every exit path.
+			st.inFlight++
+			observedSeq := par.Sequence
+			go func() {
+				defer s.willWorkerWG.Done()
+				as.reconcileRemoteSessionExpiry(s, cIDHash, observedSeq, st)
+			}()
+		}
 		return
 	}
 	// If our current session's stream sequence is higher, it means that this
@@ -3522,16 +3594,112 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 	// is not blocked on the bounded cancel scan, but ADMITTED through the Will
 	// dispatch gate first so it is tracked (willWorkerWG) and drained before
 	// shutdown tears down the JSA: admission fails once shutdown Phase 2 has closed
-	// the gate, in which case we skip it (the process is stopping). The delivery
-	// client (pc) has no server ref, so use the account JSA client's.
+	// the gate, in which case we skip it (the process is stopping).
 	// Spec5 [MQTT-3.1.2-8].
-	s := as.jsa.c.srv
 	if s.admitWillWorker() {
 		go func() {
 			defer s.willWorkerWG.Done()
 			_ = as.cancelWillOutbox(s, cIDHash)
 		}()
 	}
+}
+
+// reconcileRemoteSessionExpiry reconciles this replica's local session-expiry
+// timer from the authoritative persisted record after processSessionPersist
+// observed a remote session persist for a client this replica does not own
+// locally. It runs on a spawned, admitted worker (never inline in the delivery
+// callback) because loadSessionMsg is a blocking JSA request.
+//
+// st is the *sessionReconcileState the callback incremented for idHash; it is
+// passed in (not re-fetched) so the inFlight decrement targets exactly that entry.
+// observedSeq is the PubAck sequence the callback saw. All timer decisions are made
+// atomically under as.mu: a newer observation (watermark) or a live local session
+// (ownership) makes this worker leave the timer untouched, because expireSession's
+// in-memory path does not re-validate the deadline and could otherwise clear a
+// newer generation early. Spec5 [3.1.2.11.2].
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) reconcileRemoteSessionExpiry(s *Server, idHash string, observedSeq uint64, st *sessionReconcileState) {
+	// Lifecycle-tied prune: decrement the exact state the callback incremented, and
+	// delete the map entry once no worker is in flight. Runs on every exit path, so a
+	// worker parked before mu keeps its own entry alive and can never resume into a
+	// pruned-away watermark. The map-identity check guards a future refactor from
+	// deleting a replacement entry; delete on a nil map (shutdown) is a no-op.
+	defer func() {
+		as.mu.Lock()
+		if st.inFlight > 0 {
+			st.inFlight--
+		}
+		if st.inFlight == 0 && as.reconcileWM[idHash] == st {
+			delete(as.reconcileWM, idHash)
+		}
+		as.mu.Unlock()
+	}()
+
+	// Re-read the authoritative record. Missing/undecodable leaves nothing to
+	// reconcile (mirrors loadExpiringSessionRecord's warning behavior).
+	smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash)
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			s.Warnf("MQTT remote session-expiry reconciliation: unable to load session record: %v", err)
+		}
+		return
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		s.Warnf("MQTT remote session-expiry reconciliation: unable to decode session record at sequence %v: %v", smsg.Sequence, err)
+		return
+	}
+	// Defensive: never arm from a snapshot older than the write we observed. In
+	// practice loadSessionMsg returns the subject's last message, whose sequence is
+	// >= observedSeq unless the record was deleted (handled above as not-found), so
+	// this is a guard rather than a live path.
+	if smsg.Sequence < observedSeq {
+		return
+	}
+
+	// Test seam: park after the load, before the decision lock, so worker-ordering
+	// tests can race a newer worker or a local reconnect/re-disconnect ahead.
+	as.mu.RLock()
+	pause := as.testReconcilePause
+	as.mu.RUnlock()
+	if pause != nil {
+		pause(idHash)
+	}
+
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	// Shutdown: do not install new timers.
+	if as.pendingExpiries == nil {
+		return
+	}
+	// Worker-ordering guard: a newer observation for this client supersedes us. Equal
+	// is fine — a duplicate observation applies the same decision idempotently.
+	if observedSeq < st.latest {
+		return
+	}
+	// Ownership guard: a local session appeared after the callback handed work off (a
+	// reconnect, possibly followed by a local re-disconnect that already armed the
+	// correct later timer). Its lifecycle owns the timer; leave it untouched.
+	if _, ok := as.sessByHash[idHash]; ok {
+		return
+	}
+	// Decide from the authoritative record.
+	if ps.DisconnectedAt == 0 || ps.ExpiryInterval == 0 || ps.ExpiryInterval == mqttSessionNeverExpire {
+		// Connected, zero-expiry, or never-expire: nothing should expire this
+		// session; drop any local timer armed from a superseded record.
+		as.cancelSessionExpiryLocked(idHash)
+		return
+	}
+	if remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0)); remaining > 0 {
+		as.scheduleSessionExpiryLocked(s, idHash, remaining)
+		return
+	}
+	// Already due: arm a 0-delay timer that fires on its own goroutine into the
+	// record-based cleanup path (its own connecting guard + sequence-targeted
+	// delete). Do not call expireSessionFromRecord inline — it would re-enter mu and
+	// issue JSA requests under the lock.
+	as.scheduleSessionExpiryLocked(s, idHash, 0)
 }
 
 // Adds this client ID to the flappers map, and if needed start the timer
@@ -3594,13 +3762,22 @@ func (as *mqttAccountSessionManager) storeSessionRecordCAS(ps *mqttPersistedSess
 // cancelSessionExpiry / cancelSessionExpiryLocked. Spec5 [3.1.2.11.2].
 //
 // Deadlines survive a restart via the persisted disconnect time and
-// sweepSessionExpiries. Gap: no other server re-arms the timer if the owner dies
-// while the cluster keeps running; the session lingers until a reconnect or sweep.
+// sweepSessionExpiries. A surviving replica also re-arms the timer when it
+// observes the persisted disconnect: processSessionPersist reconciles the
+// deadline for a session it does not own locally, so the session no longer
+// lingers until a reconnect or the periodic sweep if the owning broker dies.
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) scheduleSessionExpiry(s *Server, idHash string, delay time.Duration) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
+	as.scheduleSessionExpiryLocked(s, idHash, delay)
+}
+
+// scheduleSessionExpiryLocked is scheduleSessionExpiry for callers already holding
+// as.mu (e.g. the remote-expiry reconciliation worker, which must decide and arm
+// atomically under the lock). Spec5 [3.1.2.11.2].
+func (as *mqttAccountSessionManager) scheduleSessionExpiryLocked(s *Server, idHash string, delay time.Duration) {
 	// nil map => account manager is shutting down; do not schedule.
 	if as.pendingExpiries == nil {
 		return
@@ -3790,7 +3967,13 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 // expireSession re-verifies each record before deleting anything, so racing a
 // reconnect or another server's sweep is safe. Runs from a go routine at account
 // session manager creation (the first MQTT connect for the account after a
-// restart). Spec5 [3.1.2.11.2].
+// restart) and then periodically. Spec5 [3.1.2.11.2].
+//
+// This is fallback and startup recovery, not the normal cross-replica handoff:
+// when a broker dies with the cluster still running, processSessionPersist's
+// remote-expiry reconciliation re-arms surviving replicas near the original
+// deadline. The sweep still catches sessions no replica observed (e.g. a persist
+// that landed before an account manager existed on any survivor).
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
@@ -4038,6 +4221,11 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 			t.Stop()
 		}
 		as.pendingExpiries = nil
+		// Drop reconciliation ordering state. Any worker still in flight holds its
+		// own *sessionReconcileState pointer and decrements it directly, and its
+		// map-identity check finds this nil map (delete on nil is a no-op), so
+		// nilling here is safe. New workers cannot start: admitWillWorker is closed.
+		as.reconcileWM = nil
 		as.mu.Unlock()
 	}()
 

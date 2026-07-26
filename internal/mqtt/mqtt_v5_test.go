@@ -6321,6 +6321,536 @@ func TestMQTTv5SessionExpiryOwnerCrashSweep(t *testing.T) {
 	})
 }
 
+// testMQTTLoadSessionRecord loads and decodes the persisted session record for
+// targetClientID via the account session manager reachable from liveClientID.
+func testMQTTLoadSessionRecord(t testing.TB, s *Server, liveClientID, targetClientID string) (*mqttPersistedSession, uint64, bool) {
+	t.Helper()
+	c := testMQTTGetClient(t, s, liveClientID)
+	asm := c.mqtt.asm
+	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, getHash(targetClientID))
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			t.Fatalf("Error loading session record for %q: %v", targetClientID, err)
+		}
+		return nil, 0, false
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		t.Fatalf("Error decoding session record for %q: %v", targetClientID, err)
+	}
+	return ps, smsg.Sequence, true
+}
+
+// testMQTTSessionDurables returns the durable consumer names recorded in a
+// persisted session's Cons map.
+func testMQTTSessionDurables(ps *mqttPersistedSession) []string {
+	var out []string
+	for _, cc := range ps.Cons {
+		if cc != nil && cc.Durable != "" {
+			out = append(out, cc.Durable)
+		}
+	}
+	return out
+}
+
+// testMQTTConsumerExists reports whether a durable consumer is present on the
+// $MQTT_msgs stream, queried via the account session manager reachable from
+// liveClientID.
+func testMQTTConsumerExists(t testing.TB, s *Server, liveClientID, durable string) bool {
+	t.Helper()
+	c := testMQTTGetClient(t, s, liveClientID)
+	asm := c.mqtt.asm
+	cons, err := asm.jsa.consumerList(mqttStreamName)
+	if err != nil {
+		t.Fatalf("Error listing consumers: %v", err)
+	}
+	for _, ci := range cons {
+		if ci.Name == durable {
+			return true
+		}
+	}
+	return false
+}
+
+// A surviving replica must clean up a remotely disconnected finite-expiry session
+// near its original deadline when the broker that accepted the disconnect exits,
+// instead of leaving the record and its durable consumers until the 15-minute
+// periodic sweep. The disconnecting broker's session-persist ack is observed by a
+// replica that owns no local session, which reconciles a local expiry timer from
+// the authoritative persisted deadline. Spec5 [3.1.2.11.2].
+func TestMQTTv5SessionExpiryCrossReplicaHandoff(t *testing.T) {
+	oA := testMQTTDefaultOptionsV5()
+	sA := testMQTTRunServer(t, oA)
+	sB, oB := runSharedReplica(t, oA)
+	// B owns the shared embedded NATS teardown (deferred first, so LIFO runs it
+	// last). A is stopped intentionally mid-test; this defensive defer idempotently
+	// drains A on any early failure so it cannot leak, and — deferred after B's —
+	// runs before B tears the shared NATS down. Waiting on the channel (not the
+	// bounded Shutdown) blocks until A's drain completes.
+	defer testMQTTShutdownServer(sB)
+	defer func() { <-sA.BeginShutdown() }()
+
+	// A probe on each broker, in the same (default) account, so each account session
+	// manager exists and B's session-persist reply subscription is observing before A
+	// writes the disconnect record.
+	cpA, rpA := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "xraprobe", cleanStart: true}, oA.MQTT.Host, oA.MQTT.Port)
+	defer cpA.Close()
+	testMQTTReadConnAckV5(t, rpA)
+	cpB, rpB := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "xrbprobe", cleanStart: true}, oB.MQTT.Host, oB.MQTT.Port)
+	defer cpB.Close()
+	testMQTTReadConnAckV5(t, rpB)
+
+	const target = "xrhandoff"
+	const expiry = uint32(5) // seconds: long enough to stop A before the deadline
+
+	// Connect the expiring client to A and subscribe at QoS 1 so the session owns a
+	// durable consumer whose removal can be asserted independently of the record.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: target, cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(expiry)}, oA.MQTT.Host, oA.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "xr/handoff", opts: 1}})
+
+	// Capture the connected record's sequence and durable name (read via the shared
+	// JetStream through A's probe) before closing the client.
+	connPS, connSeq, ok := testMQTTLoadSessionRecord(t, sA, "xraprobe", target)
+	if !ok {
+		t.Fatalf("expected a connected session record for %q", target)
+	}
+	durables := testMQTTSessionDurables(connPS)
+	if len(durables) != 1 {
+		t.Fatalf("expected exactly one QoS1 durable consumer, Cons=%v", connPS.Cons)
+	}
+	durable := durables[0]
+	c.Close()
+
+	// Wait until the authoritative persisted record shows the finite disconnect at a
+	// newer sequence than the connected record.
+	var deadline time.Time
+	checkFor(t, testMQTTTimeout, 15*time.Millisecond, func() error {
+		ps, seq, ok := testMQTTLoadSessionRecord(t, sB, "xrbprobe", target)
+		if !ok {
+			return fmt.Errorf("session record for %q not found yet", target)
+		}
+		if ps.DisconnectedAt == 0 {
+			return fmt.Errorf("record not yet marked disconnected")
+		}
+		if ps.ExpiryInterval != expiry {
+			return fmt.Errorf("expected ExpiryInterval=%d, got %d", expiry, ps.ExpiryInterval)
+		}
+		if seq <= connSeq {
+			return fmt.Errorf("expected a disconnect sequence newer than the connected %d, got %d", connSeq, seq)
+		}
+		deadline = time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0)
+		return nil
+	})
+
+	// A armed its own timer, and B reconciled and armed its own from the observed
+	// remote disconnect. The B-armed checkpoint is part of the regression contract:
+	// it proves the handoff happened, not some unrelated cleanup path.
+	checkFor(t, testMQTTTimeout, 15*time.Millisecond, func() error {
+		if !testMQTTHasPendingExpiry(t, sA, "xraprobe", target) {
+			return fmt.Errorf("expected A to arm a pending expiry for %q", target)
+		}
+		if !testMQTTHasPendingExpiry(t, sB, "xrbprobe", target) {
+			return fmt.Errorf("expected B to reconcile and arm a pending expiry for %q", target)
+		}
+		return nil
+	})
+
+	// Before the deadline the record and durable consumer must still exist.
+	if time.Now().After(deadline) {
+		t.Fatalf("test too slow: deadline %v already passed before stopping A", deadline)
+	}
+	if !testMQTTSessionRecordExists(t, sB, "xrbprobe", target) {
+		t.Fatal("expected the session record to still exist before the deadline")
+	}
+	if !testMQTTConsumerExists(t, sB, "xrbprobe", durable) {
+		t.Fatalf("expected the durable consumer %q to still exist before the deadline", durable)
+	}
+
+	// Stop only broker A (its MQTT layer), well before the deadline. Waiting on the
+	// channel guarantees A's shutdown lifecycle completed — pendingExpiries nilled and
+	// A's timers stopped — so A cannot perform the cleanup. The shared NATS and B stay
+	// up.
+	<-sA.BeginShutdown()
+
+	// B still holds its own pending expiry after A has fully stopped: the handoff does
+	// not depend on A staying up.
+	if !testMQTTHasPendingExpiry(t, sB, "xrbprobe", target) {
+		t.Fatal("expected B to retain its pending expiry after A stopped")
+	}
+
+	// Near the deadline, B deletes the record and the durable consumer, and removes
+	// its pending expiry entry after the timer fires. Bound the wait to a few seconds
+	// past the finite deadline and far below the 15-minute sweep, so a pass proves the
+	// handoff and not a sweep.
+	waitBudget := time.Until(deadline) + 3*time.Second
+	start := time.Now()
+	checkFor(t, waitBudget, 25*time.Millisecond, func() error {
+		if testMQTTSessionRecordExists(t, sB, "xrbprobe", target) {
+			return fmt.Errorf("session record still present %v after close (deadline %v)", time.Since(start), deadline)
+		}
+		if testMQTTConsumerExists(t, sB, "xrbprobe", durable) {
+			return fmt.Errorf("durable consumer %q still present %v after close (deadline %v)", durable, time.Since(start), deadline)
+		}
+		if testMQTTHasPendingExpiry(t, sB, "xrbprobe", target) {
+			return fmt.Errorf("B still has a pending expiry entry after the timer should have fired")
+		}
+		return nil
+	})
+}
+
+// testMQTTPlantSessionRecord stores a persisted session record for id via a raw
+// JetStream client and returns its stream sequence, so the reconciliation unit
+// tests can drive reconcileRemoteSessionExpiry against known record generations.
+func testMQTTPlantSessionRecord(t testing.TB, js nats.JetStreamContext, domainTk, id string, ps *mqttPersistedSession) uint64 {
+	t.Helper()
+	ps.ID = id
+	b, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatalf("marshal session record: %v", err)
+	}
+	ack, err := js.Publish(mqttSessStreamSubjectPrefix+domainTk+getHash(id), b)
+	if err != nil {
+		t.Fatalf("plant session record for %q: %v", id, err)
+	}
+	return ack.Sequence
+}
+
+// testMQTTRunReconcile mirrors processSessionPersist's synchronous bookkeeping
+// (register/advance the per-client watermark and increment inFlight) and returns
+// the shared *sessionReconcileState plus a runner that executes the worker to
+// completion. Registering several workers before running any lets a test drive a
+// deterministic worker-completion order.
+func testMQTTRunReconcile(t testing.TB, asm *mqttAccountSessionManager, s *Server, idHash string, observedSeq uint64) (*sessionReconcileState, func()) {
+	t.Helper()
+	asm.mu.Lock()
+	st := asm.reconcileWM[idHash]
+	if st == nil {
+		st = &sessionReconcileState{}
+		asm.reconcileWM[idHash] = st
+	}
+	if observedSeq > st.latest {
+		st.latest = observedSeq
+	}
+	st.inFlight++
+	asm.mu.Unlock()
+	return st, func() { asm.reconcileRemoteSessionExpiry(s, idHash, observedSeq, st) }
+}
+
+// testMQTTStartParkedReconcile registers a reconcile worker (mirroring the
+// callback's synchronous watermark/inFlight bookkeeping) and starts it on a
+// goroutine that parks at the load/decision seam — after it has loaded its
+// snapshot of the CURRENT record, before it takes as.mu to decide. This lets a
+// test give the stale worker a genuinely older snapshot than a newer worker (or a
+// local reconnect) that runs while it is parked. The returned release closes the
+// seam; done closes when the worker returns. The pause hook is cleared once this
+// worker is parked, so any worker started afterward does not park.
+func testMQTTStartParkedReconcile(t testing.TB, asm *mqttAccountSessionManager, s *Server, idHash string, observedSeq uint64) (release, done chan struct{}) {
+	t.Helper()
+	loaded := make(chan struct{})
+	release = make(chan struct{})
+	done = make(chan struct{})
+	asm.mu.Lock()
+	asm.testReconcilePause = func(string) {
+		close(loaded)
+		<-release
+	}
+	asm.mu.Unlock()
+	_, run := testMQTTRunReconcile(t, asm, s, idHash, observedSeq)
+	go func() { defer close(done); run() }()
+	<-loaded
+	// The parked worker already captured its pause closure; clear the hook so the
+	// newer worker (or later run) does not park too.
+	asm.mu.Lock()
+	asm.testReconcilePause = nil
+	asm.mu.Unlock()
+	return release, done
+}
+
+func testMQTTPendingExpiryTimer(asm *mqttAccountSessionManager, idHash string) *time.Timer {
+	asm.mu.Lock()
+	defer asm.mu.Unlock()
+	return asm.pendingExpiries[idHash]
+}
+
+func testMQTTReconcileEntryPresent(asm *mqttAccountSessionManager, idHash string) bool {
+	asm.mu.Lock()
+	defer asm.mu.Unlock()
+	_, ok := asm.reconcileWM[idHash]
+	return ok
+}
+
+// A replica observing a remote session persist for a client it does not own
+// locally reconciles its local expiry timer from the authoritative record.
+func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "recprobe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	asm := testMQTTGetClient(t, s, "recprobe").mqtt.asm
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	now := time.Now().Unix()
+
+	t.Run("finite arms", func(t *testing.T) {
+		id := "recfinite"
+		h := getHash(id)
+		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		_, run := testMQTTRunReconcile(t, asm, s, h, seq)
+		run()
+		if testMQTTPendingExpiryTimer(asm, h) == nil {
+			t.Fatal("expected a pending expiry timer to be armed from the finite record")
+		}
+		if testMQTTReconcileEntryPresent(asm, h) {
+			t.Fatal("expected the reconcile watermark entry to be pruned once the worker completed")
+		}
+	})
+
+	t.Run("connected cancels", func(t *testing.T) {
+		id := "recconn"
+		h := getHash(id)
+		asm.scheduleSessionExpiry(s, h, time.Hour) // a stale (sweep-armed) timer
+		if testMQTTPendingExpiryTimer(asm, h) == nil {
+			t.Fatal("precondition: expected a pre-armed timer")
+		}
+		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: 0})
+		_, run := testMQTTRunReconcile(t, asm, s, h, seq)
+		run()
+		if testMQTTPendingExpiryTimer(asm, h) != nil {
+			t.Fatal("expected the connected record to cancel the stale expiry timer")
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		expiry uint32
+	}{
+		{"zero expiry no arm", 0},
+		{"never expire no arm", mqttSessionNeverExpire},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "rec" + tc.name
+			h := getHash(id)
+			seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: tc.expiry})
+			_, run := testMQTTRunReconcile(t, asm, s, h, seq)
+			run()
+			if testMQTTPendingExpiryTimer(asm, h) != nil {
+				t.Fatalf("expected no timer armed for expiry=%d", tc.expiry)
+			}
+		})
+	}
+
+	t.Run("older than observed no-op", func(t *testing.T) {
+		id := "recold"
+		h := getHash(id)
+		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		// Observe a sequence newer than the record: the worker must not arm from a
+		// snapshot that cannot include the write it observed.
+		_, run := testMQTTRunReconcile(t, asm, s, h, seq+50)
+		run()
+		if testMQTTPendingExpiryTimer(asm, h) != nil {
+			t.Fatal("expected no timer armed from a record older than the observed sequence")
+		}
+		if testMQTTReconcileEntryPresent(asm, h) {
+			t.Fatal("expected the watermark entry pruned even on the defensive no-op path")
+		}
+	})
+
+	t.Run("already due cleans up via record path", func(t *testing.T) {
+		id := "recdue"
+		h := getHash(id)
+		subj := mqttSessStreamSubjectPrefix + asm.domainTk + h
+		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now - 100, ExpiryInterval: 1})
+		_, run := testMQTTRunReconcile(t, asm, s, h, seq)
+		run()
+		// The already-due path arms a 0-delay timer that fires into the record-based
+		// cleanup, deleting the record.
+		checkFor(t, testMQTTTimeout, 15*time.Millisecond, func() error {
+			if _, err := js.GetLastMsg(mqttSessStreamName, subj); err == nil {
+				return fmt.Errorf("expected the overdue record to be deleted")
+			}
+			return nil
+		})
+	})
+}
+
+// Reconciliation workers for the same client ID must apply in observation order
+// even when they complete out of order, and their ordering state must be pruned
+// only when no worker is in flight.
+func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ordprobe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	asm := testMQTTGetClient(t, s, "ordprobe").mqtt.asm
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	now := time.Now().Unix()
+
+	// Each reversed sub-case parks a stale worker AFTER it loads a genuinely older
+	// snapshot, then plants the newer record and runs the newer worker to install the
+	// authoritative timer, then releases the stale worker. Its own inFlight keeps the
+	// watermark entry alive while parked, and the watermark rejects its (older)
+	// decision on resume, so the newer timer survives unchanged.
+	t.Run("stale connected snapshot cannot cancel newer finite timer", func(t *testing.T) {
+		id := "ordcancel"
+		h := getHash(id)
+		// Old snapshot: connected (its decision would be cancel-the-timer).
+		seqOld := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: 0})
+		release, done := testMQTTStartParkedReconcile(t, asm, s, h, seqOld)
+		if !testMQTTReconcileEntryPresent(asm, h) {
+			t.Fatal("expected the parked stale worker's watermark entry to be present (inFlight keeps it alive)")
+		}
+		// Newer generation: a finite disconnect. Its worker arms the authoritative timer.
+		seqNew := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		_, runNew := testMQTTRunReconcile(t, asm, s, h, seqNew)
+		runNew()
+		armed := testMQTTPendingExpiryTimer(asm, h)
+		if armed == nil {
+			t.Fatal("expected the newer finite worker to arm a timer")
+		}
+		// Release the stale worker; its connected snapshot must NOT cancel the timer.
+		close(release)
+		<-done
+		if got := testMQTTPendingExpiryTimer(asm, h); got == nil {
+			t.Fatal("stale connected snapshot wrongly cancelled the newer finite timer")
+		} else if got != armed {
+			t.Fatal("stale worker wrongly replaced the newer finite timer")
+		}
+		if testMQTTReconcileEntryPresent(asm, h) {
+			t.Fatal("expected the watermark entry pruned once all workers completed")
+		}
+	})
+
+	t.Run("stale longer-deadline snapshot cannot replace newer shorter timer", func(t *testing.T) {
+		id := "ordreplace"
+		h := getHash(id)
+		// Old snapshot: a long finite deadline (its decision would re-arm long).
+		seqOld := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100000})
+		release, done := testMQTTStartParkedReconcile(t, asm, s, h, seqOld)
+		if !testMQTTReconcileEntryPresent(asm, h) {
+			t.Fatal("expected the parked stale worker's watermark entry to be present (inFlight keeps it alive)")
+		}
+		// Newer generation: a shorter finite deadline. Its worker arms the authoritative timer.
+		seqNew := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		_, runNew := testMQTTRunReconcile(t, asm, s, h, seqNew)
+		runNew()
+		armed := testMQTTPendingExpiryTimer(asm, h)
+		if armed == nil {
+			t.Fatal("expected the newer shorter-deadline worker to arm a timer")
+		}
+		// Release the stale worker; its longer-deadline snapshot must NOT replace the
+		// shorter timer (exact pointer identity proves no replacement).
+		close(release)
+		<-done
+		if got := testMQTTPendingExpiryTimer(asm, h); got != armed {
+			t.Fatal("stale longer-deadline snapshot wrongly replaced the newer shorter timer")
+		}
+		if testMQTTReconcileEntryPresent(asm, h) {
+			t.Fatal("expected the watermark entry pruned once all workers completed")
+		}
+	})
+
+	t.Run("shutdown prevents installing a timer", func(t *testing.T) {
+		id := "ordshutdown"
+		h := getHash(id)
+		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		st, run := testMQTTRunReconcile(t, asm, s, h, seq)
+		// Simulate the account-manager teardown (nil pendingExpiries) for the duration
+		// of this worker, then restore it.
+		asm.mu.Lock()
+		saved := asm.pendingExpiries
+		asm.pendingExpiries = nil
+		asm.mu.Unlock()
+		run()
+		asm.mu.Lock()
+		armed := asm.pendingExpiries // still nil: nothing installed
+		asm.pendingExpiries = saved
+		inFlight := st.inFlight
+		asm.mu.Unlock()
+		if armed != nil {
+			t.Fatal("expected no timer installed during shutdown")
+		}
+		if inFlight != 0 {
+			t.Fatalf("expected inFlight decremented to 0, got %d", inFlight)
+		}
+	})
+}
+
+// A reconciliation worker that loaded an older remote disconnect must not clean up
+// a session that a local reconnect + finite re-disconnect subsequently created,
+// even though the worker's snapshot is disconnected and its stream sequence equals
+// the worker's observation. The in-memory expiry path does not re-validate the
+// deadline, so correctness here comes from the ownership guard, not the fire-time
+// re-read. The newer local timer must survive unchanged. Spec5 [3.1.2.11.2].
+func TestMQTTv5RemoteExpiryReconcileLocalReconnectRace(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "lrprobe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	asm := testMQTTGetClient(t, s, "lrprobe").mqtt.asm
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	now := time.Now().Unix()
+
+	id := "lrtarget"
+	h := getHash(id)
+	// A remote disconnect record this replica does not own locally (finite, not due).
+	seqOld := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+
+	// Park a stale worker holding that old disconnected snapshot (loaded before the
+	// local session appears).
+	release, done := testMQTTStartParkedReconcile(t, asm, s, h, seqOld)
+	if !testMQTTReconcileEntryPresent(asm, h) {
+		t.Fatal("expected the parked worker's watermark entry present (inFlight keeps it alive)")
+	}
+
+	// A local session now appears: the client reconnects (resuming the record) and
+	// re-disconnects with a finite expiry, arming a NEW local timer that owns the
+	// deadline.
+	c, r := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: id, props: mqttV5ConnPropsSessionExpiry(100)}, o.MQTT.Host, o.MQTT.Port, 3)
+	testMQTTReadConnAckV5(t, r)
+	c.Close()
+	var localTimer *time.Timer
+	checkFor(t, testMQTTTimeout, 15*time.Millisecond, func() error {
+		localTimer = testMQTTPendingExpiryTimer(asm, h)
+		if localTimer == nil {
+			return fmt.Errorf("expected the local re-disconnect to arm a timer")
+		}
+		return nil
+	})
+	asm.mu.RLock()
+	_, inMem := asm.sessByHash[h]
+	asm.mu.RUnlock()
+	if !inMem {
+		t.Fatal("precondition: expected the re-disconnected session to remain in memory")
+	}
+
+	// Release the stale worker: the ownership guard must leave the newer local timer
+	// untouched (pointer identity proves neither cancel nor replace).
+	close(release)
+	<-done
+	if got := testMQTTPendingExpiryTimer(asm, h); got != localTimer {
+		t.Fatal("stale worker wrongly cancelled or replaced the newer local session's timer")
+	}
+	if testMQTTReconcileEntryPresent(asm, h) {
+		t.Fatal("expected the watermark entry pruned once the stale worker completed")
+	}
+}
+
 // ---- v5 Subscription Identifier ----
 
 // mqttV5SubIDProps builds a SUBSCRIBE properties block carrying a single
