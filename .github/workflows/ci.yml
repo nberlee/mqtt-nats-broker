@@ -47,6 +47,27 @@ jobs:
       - name: test
         run: go test -tags mqttport_fulltests -race -count=1 ./internal/mqtt/
 
+  cluster-failover:
+    name: test (cluster Will failover)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Gated 3-node embedded-JetStream (R3) Will-outbox failover tests
+    # (jetstream_cluster_harness_test.go). Split into its own job because it
+    # spins up three nats-server processes per test and drives Raft leader
+    # elections, so it is slower and flakier than the single-node fulltests job.
+    # The tests self-skip unless MQTTNB_CLUSTER_FAILOVER_TESTS=1, so the normal
+    # fulltests job runs only the cheap R3 smoke test.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: test
+        env:
+          MQTTNB_CLUSTER_FAILOVER_TESTS: '1'
+        run: go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest

@@ -48,6 +48,17 @@ in `shim_*.go` and the vendored helpers in `compat_*.go`.
   make full-suite   # go test -tags mqttport_fulltests ./internal/mqtt/
   ```
 
+- The delayed-Will outbox also has **real replicated-JetStream** tests behind the
+  same tag. They launch **three embedded nats-server processes** joined into one
+  cluster so `$MQTT_willq` is genuinely `R3`. The cheap R3 smoke test
+  (`TestMQTTWillOutboxReplicatedStream`) runs in the normal `make full-suite`; the
+  slow failure-injection tests (leader-node loss, `TestMQTTWillOutboxReplicated…`)
+  self-skip unless `MQTTNB_CLUSTER_FAILOVER_TESTS=1`:
+
+  ```sh
+  make cluster-failover-tests   # MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
+  ```
+
 - The port mapping and remaining work are documented in
   [docs/PORTING.md](docs/PORTING.md).
 

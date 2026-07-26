@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-bridge
 
-.PHONY: build test vet lint core-build core-test run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint core-build core-test full-suite cluster-failover-tests run docker docker-multiarch conformance tidy clean
 
 build: ## Build the binary for the host platform
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
@@ -18,6 +18,9 @@ lint: ## Run golangci-lint
 
 full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 	go test -tags mqttport_fulltests ./internal/mqtt/
+
+cluster-failover-tests: ## Run the gated 3-node JetStream Will-outbox failover tests.
+	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
 
 run: build ## Build and run against a local NATS on :4222 (serves MQTT on :1883)
 	./mqtt-nats-bridge

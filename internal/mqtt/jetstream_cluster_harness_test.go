@@ -1,0 +1,315 @@
+//go:build mqttport_fulltests
+
+// Real replicated-JetStream cluster harness for the delayed-Will outbox tests.
+//
+// Unlike will_outbox_test.go — which models two brokers in front of ONE embedded
+// JetStream by sharing a StoreDir — this harness stands up three genuine
+// nats-server processes joined into one cluster, so the $MQTT_willq stream is
+// created with Replicas=3 and its claim/publish/delete lifecycle can be exercised
+// across a real Raft leader failover.
+//
+// It deliberately does NOT use the single-node pairing registry
+// (testEmbeddedNATSByDir) or testMQTTShutdownServer: those own the 1:1
+// shim-Server-to-embedded-nats model and their restart idiom would corrupt
+// cluster state. Cluster nodes and cluster-backed brokers are torn down by their
+// own t.Cleanup closures registered here.
+
+package mqtt
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nuid"
+)
+
+// testGlobalAccount is the nats-server default global account ("$G"), the account
+// the MQTT streams live under when the embedded servers run without accounts.
+const testGlobalAccount = "$G"
+
+// testJSClusterNode is one embedded nats-server in the cluster.
+type testJSClusterNode struct {
+	name    string
+	ns      *natsserver.Server
+	running bool
+}
+
+// testJetStreamCluster is a set of embedded nats-server processes joined into one
+// JetStream cluster. All methods run on the test goroutine (checkFor polls
+// inline), so no locking is needed.
+type testJetStreamCluster struct {
+	name  string
+	nodes []*testJSClusterNode
+}
+
+// testNewJetStreamCluster starts a size-node JetStream cluster and blocks until it
+// has formed (full route mesh, a metadata leader, all nodes current). Cleanup is
+// registered before the formation wait so a partial start is still torn down.
+//
+// Clustered JetStream requires every node (including the seed) to have configured
+// routes — enableJetStreamClustering rejects a node with none. So cluster ports are
+// reserved up front and every node is given the SAME full route list (a node's
+// route to itself is ignored); this avoids the dynamic-port chicken-and-egg where
+// a seed with Cluster.Port:-1 would have no route to advertise.
+func testNewJetStreamCluster(t *testing.T, size int) *testJetStreamCluster {
+	t.Helper()
+	c := &testJetStreamCluster{name: "JSC-" + nuid.Next()}
+	t.Cleanup(c.cleanup)
+
+	clusterPorts := make([]int, size)
+	routeURLs := make([]string, size)
+	for i := range clusterPorts {
+		clusterPorts[i] = testFreePort(t)
+		routeURLs[i] = fmt.Sprintf("nats://127.0.0.1:%d", clusterPorts[i])
+	}
+	routes := natsserver.RoutesFromStr(strings.Join(routeURLs, ","))
+
+	for i := 0; i < size; i++ {
+		c.newNode(t, clusterPorts[i], routes)
+	}
+
+	c.waitFormed(t, size)
+	return c
+}
+
+// testFreePort reserves an ephemeral TCP port by binding and immediately closing,
+// so it can be handed to nats-server as an explicit cluster port. There is a small
+// reuse window, acceptable for tests.
+func testFreePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve free port: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port
+}
+
+// newNode creates, starts and registers one embedded nats-server bound to the given
+// explicit cluster port, with the shared full route list.
+func (c *testJetStreamCluster) newNode(t *testing.T, clusterPort int, routes []*url.URL) *testJSClusterNode {
+	t.Helper()
+	opts := &natsserver.Options{
+		ServerName: "N-" + nuid.Next(),
+		Host:       "127.0.0.1",
+		Port:       -1,
+		JetStream:  true,
+		StoreDir:   t.TempDir(),
+		NoSigs:     true, // three in-process servers must not each grab signal handlers
+		NoLog:      true, // per-node current-state checks are the diagnostics, not logs
+		Cluster: natsserver.ClusterOpts{
+			Name: c.name,
+			Host: "127.0.0.1",
+			Port: clusterPort,
+			// Disable route pooling: nats-server defaults PoolSize to
+			// DEFAULT_ROUTE_POOL_SIZE, which would make NumRoutes()==size-1
+			// non-deterministic. -1 gives exactly one route per peer.
+			PoolSize: -1,
+		},
+		Routes: routes,
+	}
+	ns, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("create cluster node %q: %v", opts.ServerName, err)
+	}
+	// Register BEFORE Start so a readiness-timeout Fatal still lets c.cleanup stop
+	// this server (t.Cleanup ran before the wait); otherwise it would leak.
+	n := &testJSClusterNode{name: opts.ServerName, ns: ns, running: true}
+	c.nodes = append(c.nodes, n)
+	go ns.Start()
+	if !ns.ReadyForConnections(10 * time.Second) {
+		t.Fatalf("cluster node %q not ready: running=%v addr=%v clusterAddr=%v",
+			opts.ServerName, ns.Running(), ns.Addr(), ns.ClusterAddr())
+	}
+	return n
+}
+
+// waitFormed blocks until every running node has size-1 routes, JetStream is
+// current on all of them, and exactly one metadata leader exists.
+func (c *testJetStreamCluster) waitFormed(t *testing.T, size int) {
+	t.Helper()
+	checkFor(t, 30*time.Second, 250*time.Millisecond, func() error {
+		leaders := 0
+		for _, n := range c.nodes {
+			if !n.running {
+				continue
+			}
+			if nr := n.ns.NumRoutes(); nr != size-1 {
+				return fmt.Errorf("node %q has %d routes, want %d\n%s", n.name, nr, size-1, c.describe())
+			}
+			if !n.ns.JetStreamIsCurrent() {
+				return fmt.Errorf("node %q JetStream not current\n%s", n.name, c.describe())
+			}
+			if n.ns.JetStreamIsLeader() {
+				leaders++
+			}
+		}
+		if leaders != 1 {
+			return fmt.Errorf("want exactly 1 metadata leader, got %d\n%s", leaders, c.describe())
+		}
+		return nil
+	})
+}
+
+// orderedURLs returns the running nodes' client URLs with the preferred node
+// first, so a broker using nats.DontRandomize() places deterministically.
+func (c *testJetStreamCluster) orderedURLs(preferred int) []string {
+	var urls []string
+	if preferred >= 0 && preferred < len(c.nodes) && c.nodes[preferred].running {
+		urls = append(urls, c.nodes[preferred].ns.ClientURL())
+	}
+	for i, n := range c.nodes {
+		if i == preferred || !n.running {
+			continue
+		}
+		urls = append(urls, n.ns.ClientURL())
+	}
+	return urls
+}
+
+// streamLeader returns the node currently leading the stream, or nil if none.
+func (c *testJetStreamCluster) streamLeader(account, stream string) *testJSClusterNode {
+	for _, n := range c.nodes {
+		if n.running && n.ns.JetStreamIsStreamLeader(account, stream) {
+			return n
+		}
+	}
+	return nil
+}
+
+// waitStreamLeader blocks until some running node leads the stream and returns it.
+func (c *testJetStreamCluster) waitStreamLeader(t *testing.T, account, stream string) *testJSClusterNode {
+	t.Helper()
+	var ldr *testJSClusterNode
+	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+		if ldr = c.streamLeader(account, stream); ldr == nil {
+			return fmt.Errorf("no leader for stream %q yet\n%s", stream, c.describe())
+		}
+		return nil
+	})
+	return ldr
+}
+
+// waitStreamCurrent blocks until the stream is current on every running node.
+func (c *testJetStreamCluster) waitStreamCurrent(t *testing.T, account, stream string) {
+	t.Helper()
+	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+		for _, n := range c.nodes {
+			if !n.running {
+				continue
+			}
+			if !n.ns.JetStreamIsStreamCurrent(account, stream) {
+				return fmt.Errorf("stream %q not current on node %q\n%s", stream, n.name, c.describe())
+			}
+		}
+		return nil
+	})
+}
+
+// stopNode shuts one node down and marks it stopped. Callers must never stop more
+// than one node of a 3-node cluster at once, or JetStream loses quorum.
+func (c *testJetStreamCluster) stopNode(n *testJSClusterNode) {
+	if !n.running {
+		return
+	}
+	n.ns.Shutdown()
+	n.ns.WaitForShutdown()
+	n.running = false
+}
+
+// describe returns a one-shot diagnostic snapshot for embedding in polling errors:
+// per-node route count, JetStream-current, metadata-leader, and $MQTT_willq
+// leader/current state.
+func (c *testJetStreamCluster) describe() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "cluster %q:", c.name)
+	for _, n := range c.nodes {
+		if !n.running {
+			fmt.Fprintf(&b, "\n  node %q: STOPPED", n.name)
+			continue
+		}
+		fmt.Fprintf(&b, "\n  node %q: routes=%d jsCurrent=%v metaLeader=%v willqLeader=%v willqCurrent=%v",
+			n.name, n.ns.NumRoutes(), n.ns.JetStreamIsCurrent(), n.ns.JetStreamIsLeader(),
+			n.ns.JetStreamIsStreamLeader(testGlobalAccount, mqttWillQStreamName),
+			n.ns.JetStreamIsStreamCurrent(testGlobalAccount, mqttWillQStreamName))
+	}
+	return b.String()
+}
+
+// cleanup shuts every still-running node down in reverse start order. Idempotent.
+func (c *testJetStreamCluster) cleanup() {
+	for i := len(c.nodes) - 1; i >= 0; i-- {
+		n := c.nodes[i]
+		if !n.running {
+			continue
+		}
+		n.ns.Shutdown()
+		n.ns.WaitForShutdown()
+		n.running = false
+	}
+}
+
+// testClusterBroker is a standalone MQTT bridge connected to the cluster.
+type testClusterBroker struct {
+	s    *Server
+	nc   *nats.Conn
+	opts *Options
+}
+
+// startBroker starts an MQTT bridge whose NATS connection prefers the given node
+// index (deterministic initial placement). The willq and other MQTT streams are
+// created R3 (MQTT.StreamReplicas=3), which requires the cluster to be formed
+// first. Cleanup is completion-aware and never touches the shared cluster.
+func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int) *testClusterBroker {
+	t.Helper()
+	urls := strings.Join(c.orderedURLs(preferred), ",")
+	nc, err := nats.Connect(urls,
+		nats.DontRandomize(),   // honor the preferred-first ordering
+		nats.MaxReconnects(-1), // survive node loss / failover
+		nats.ReconnectWait(100*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("broker NATS connect: %v", err)
+	}
+
+	node := "bridge-" + nuid.Next()
+	// Build on the v5 helper so cluster tests share the exact protocol config the
+	// other v5 tests use, then set replicas and override the listener.
+	opts := testMQTTDefaultOptionsV5()
+	opts.ServerName = node
+	opts.MQTT.StreamReplicas = 3 // willq path reads this (mqtt.go)
+	opts.StreamReplicas = 3      // belt-and-suspenders
+
+	s := NewServer(nc, opts, node)
+	if err := s.Start(); err != nil {
+		nc.Close()
+		t.Fatalf("broker start: %v", err)
+	}
+	if err := s.readyForConnections(5 * time.Second); err != nil {
+		<-s.BeginShutdown() // completion-aware: finish the drain before dropping nc
+		nc.Close()
+		t.Fatalf("broker not ready: %v", err)
+	}
+	// testMQTTConnectV5 dials host:port literally, so publish the bound port.
+	opts.MQTT.Port = s.Addr().(*net.TCPAddr).Port
+
+	b := &testClusterBroker{s: s, nc: nc, opts: opts}
+	t.Cleanup(b.cleanup)
+	return b
+}
+
+// cleanup awaits full shutdown completion BEFORE closing the NATS connection.
+// Server.Shutdown() is only a bounded waiter that can return while the phased
+// drain still uses nc; closing nc then would race teardown. BeginShutdown()'s
+// channel closes only once every phase has finished with nc.
+func (b *testClusterBroker) cleanup() {
+	<-b.s.BeginShutdown()
+	b.nc.Close()
+}

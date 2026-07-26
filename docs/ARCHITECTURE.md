@@ -32,6 +32,31 @@ NATS/JetStream cluster as its backend.
 - HA/durability guarantees come from JetStream **replicas** (`R3`/`R5`). Size the
   NATS cluster, not the bridge.
 
+### Two distinct handoff mechanisms
+
+These are independent and easy to conflate:
+
+- **Bridge-replica handoff** — a *bridge* instance dies; another bridge picks up
+  the work. Any bridge can serve any client and claim any durable task because all
+  state is in JetStream. This works even against a single-node JetStream.
+- **JetStream R3 leader failover** — a *NATS* node dies. The stream's Raft group
+  elects a new leader among the surviving replicas and continues committing, as
+  long as quorum survives. This is a property of the NATS cluster, not the bridge.
+
+The **delayed-Will outbox** (`$MQTT_willq`, MQTT 5.0 Will Delay with a surviving
+session) exercises both: a Will enqueued on one bridge is fired by a surviving
+bridge (bridge-replica handoff), and its claim/publish/delete lifecycle keeps
+committing across a NATS-node loss (R3 leader failover). The guarantee is
+**at-least-once** *once the outbox record is durably acknowledged and while quorum
+and storage remain available*: per-subject JetStream CAS serialises each state
+transition, so a recovered duplicate is possible. It is not unconditional no-loss —
+QoS 0 is best-effort, a sustained JetStream outage can defeat the immediate-publish
+fallback, and a forced process kill can interrupt persistence before the record is
+acknowledged. Both mechanisms are
+regression-tested under the `mqttport_fulltests` tag — the shared-store simulation
+in `will_outbox_test.go` and the real 3-node cluster in
+`jetstream_cluster_harness_test.go` (see [CONTRIBUTING.md](../CONTRIBUTING.md)).
+
 ## Backend seams (see docs/PORTING.md)
 
 | Concern            | Mechanism                                             |
