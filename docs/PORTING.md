@@ -16,6 +16,14 @@ go test  ./...                                  # transport/session/e2e/auth tes
 go test  -tags mqttport_fulltests ./internal/mqtt/   # upstream suite
 ```
 
+> **Design boundary:** this port history does not create an upstream source-
+> compatibility requirement. Keeping ported files easy to compare with NATS is
+> useful when it does not compromise the bridge design, but divergence is
+> allowed. The bridge is also pre-release: internal MQTT persistence and
+> `$MQTT_*` stream formats need no legacy readers, migrations, or mixed-version
+> support yet. Backend work targets only the latest JetStream behavior exercised
+> by the `nats-server/v2` version currently pinned in `go.mod` and CI.
+
 ## What's already done
 
 - **Alias layer** (`shim_natsalias.go`): 76 exported NATS-server symbols (wire

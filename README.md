@@ -7,7 +7,8 @@ retained messages, QoS1/2 persistence, and message routing.
 [![CI](https://github.com/nberlee/mqtt-nats-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/nberlee/mqtt-nats-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **Status: working broker.** The default build serves MQTT 3.1.1/5.0
+> **Status: pre-release working broker.** There is no public bridge release or
+> supported persisted-state format yet. The default build serves MQTT 3.1.1/5.0
 > end-to-end — CONNECT, SUBSCRIBE, PUBLISH (QoS0), retained/sessions via
 > JetStream, and NATS-enforced auth passthrough — verified with a real MQTT
 > client in CI. The upstream regression suite runs in CI against the
@@ -29,6 +30,10 @@ durable state lives in JetStream, so any client can reconnect to any frontend an
 sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quickstart
+
+The bridge targets the latest JetStream behavior provided by the
+`nats-server/v2` version pinned in `go.mod`; older JetStream releases are not a
+supported compatibility target.
 
 Run a broker + NATS locally:
 

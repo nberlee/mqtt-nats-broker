@@ -22,6 +22,24 @@ built on will not be merged upstream, so instead of maintaining a fork of the
 whole server, the MQTT layer runs as a separate service that uses an external
 NATS/JetStream cluster as its backend.
 
+## Compatibility boundary
+
+The bridge is **pre-release** and is being designed for its first public
+release. Its internal persisted MQTT state and `$MQTT_*` JetStream stream
+schemas do not have a backward-compatibility contract yet. During this phase,
+schema changes may require development streams to be recreated; designs should
+not carry migration, legacy-format, or mixed-version rolling-upgrade machinery
+unless a concrete released contract is identified first.
+
+The backend support target is the **latest JetStream** represented by the
+current `nats-server/v2` dependency in `go.mod` and exercised in CI. The bridge
+does not maintain alternate code paths for older JetStream APIs or semantics.
+When the dependency advances, plans may adopt the new current behavior directly.
+
+This boundary applies only to bridge persistence and its JetStream backend. MQTT
+3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
+covered by the conformance suites.
+
 ## High availability
 
 - The bridge is **stateless**: all durable state (sessions, retained messages,
