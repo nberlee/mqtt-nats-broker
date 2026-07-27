@@ -62,6 +62,28 @@ behavior when no container limit is configured.
 - [ ] Do not preserve file layout merely to keep a line-by-line upstream diff;
   maintainability of this broker is the controlling requirement.
 
+### Performance and resource audits
+
+- [ ] Audit every JetStream query and request pattern inherited from the early
+  NATS Server MQTT implementation against current JetStream APIs and behavior.
+  Look for avoidable request/reply round trips, repeated stream or consumer
+  lookups, serial operations that can be batched or run concurrently, full
+  scans where direct lookups are available, and polling that can be replaced by
+  push or event-driven behavior.
+- [ ] Benchmark the current and proposed JetStream paths under connect,
+  subscribe, publish, reconnect, retained-message, and session-recovery loads.
+  Record request counts, transferred bytes, latency, and NATS/JetStream load;
+  change a query path only when measurements show an improvement without
+  weakening MQTT semantics, authorization, consistency, or HA behavior.
+- [ ] Perform a full memory and resource-lifetime scan of the broker. Cover
+  clients, sessions, subscriptions, retained-message caches, QoS state,
+  JetStream request state, timers, goroutines, channels, buffers, NATS
+  connections/subscriptions, TLS reload state, and shutdown paths.
+- [ ] Add churn and soak tests that repeatedly connect, subscribe, publish,
+  disconnect, expire sessions, fail over, and reload TLS. Use heap and goroutine
+  profiles plus leak detection to prove memory and resource counts return to a
+  stable baseline after work drains; fix every confirmed leak before alpha.
+
 ## 3. Add MQTT transports
 
 ### TLS and certificate rollover
