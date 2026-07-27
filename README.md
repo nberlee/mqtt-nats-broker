@@ -111,13 +111,8 @@ expiry, and reconnect-to-a-different-instance takeover.)
 
 ## Roadmap
 
-1. ✅ Port the protocol core off NATS-server internals; serve MQTT 3.1.1 + genuine 5.0 end-to-end ([docs/PORTING.md](docs/PORTING.md)).
-2. ✅ Stored delivery, HA takeover, shared subscriptions, message expiry, wills — verified with real clients.
-3. ✅ Conformance gate wired: `vibesrc/mqttconformance` passes **124/124** (3.1.1) and **106/106** (5.0). See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
-4. MQTT-over-WebSocket transport.
-5. split up mqtt golang files
-6. Helm Chart published
-7. Container image from scratch
+The authoritative pre-alpha release checklist is maintained in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Development
 
