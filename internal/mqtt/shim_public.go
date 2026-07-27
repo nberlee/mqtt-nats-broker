@@ -36,7 +36,7 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 	s := &Server{
 		nrc:             nc,
 		opts:            opts,
-		clusterName:     nodeName,
+		nodeName:        nodeName,
 		clients:         make(map[uint64]*client),
 		users:           make(map[string]*User),
 		quitCh:          make(chan struct{}),

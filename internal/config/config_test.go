@@ -122,6 +122,86 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestValidateJSDomain pins the rule documented on validateJSDomain: a single
+// subject token, rejecting the separator and wildcards plus every invisible
+// character, while still accepting ordinary non-ASCII (which the NATS server
+// itself accepts).
+func TestValidateJSDomain(t *testing.T) {
+	valid := []string{"", "HUB", "hub-1", "_x", "leaf_2", "京都"}
+	for _, d := range valid {
+		t.Run("valid/"+d, func(t *testing.T) {
+			c := Default()
+			c.JSDomain = d
+			if err := c.Validate(); err != nil {
+				t.Errorf("JSDomain %q: unexpected error: %v", d, err)
+			}
+		})
+	}
+
+	invalid := map[string]string{
+		"dot":            "a.b",
+		"star":           "a*",
+		"gt":             "a>",
+		"space":          "a b",
+		"tab":            "a\tb",
+		"newline":        "a\nb",
+		"carriage":       "a\rb",
+		"nul":            "a\x00b",
+		"nbsp":           "a b",
+		"leading space":  " HUB",
+		"trailing space": "HUB ",
+		"bad utf8":       "\xff\xfe",
+	}
+	for name, d := range invalid {
+		t.Run("invalid/"+name, func(t *testing.T) {
+			c := Default()
+			c.JSDomain = d
+			if err := c.Validate(); err == nil {
+				t.Errorf("JSDomain %q: expected a validation error", d)
+			}
+		})
+	}
+}
+
+// TestLoadJSDomain covers both configuration surfaces for the domain.
+func TestLoadJSDomain(t *testing.T) {
+	c, err := Load([]string{"-js-domain", "HUB"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.JSDomain != "HUB" {
+		t.Errorf("JSDomain = %q, want HUB", c.JSDomain)
+	}
+
+	t.Setenv("MQTTNB_JS_DOMAIN", "SPOKE")
+	c, err = Load(nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.JSDomain != "SPOKE" {
+		t.Errorf("JSDomain = %q, want SPOKE", c.JSDomain)
+	}
+
+	// The flag wins over the environment.
+	c, err = Load([]string{"-js-domain", "HUB"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.JSDomain != "HUB" {
+		t.Errorf("JSDomain = %q, want the flag to win over the env", c.JSDomain)
+	}
+
+	// Load validates, so a bad domain fails startup rather than surfacing later
+	// as unroutable JS API subjects.
+	if _, err := Load([]string{"-js-domain", "a.b"}); err == nil {
+		t.Error("expected -js-domain a.b to be rejected at load")
+	}
+	t.Setenv("MQTTNB_JS_DOMAIN", "a b")
+	if _, err := Load(nil); err == nil {
+		t.Error("expected MQTTNB_JS_DOMAIN 'a b' to be rejected at load")
+	}
+}
+
 // tlsFixture writes a CA plus a matching server keypair into a temp dir and
 // returns their paths, along with an unrelated keypair whose key does not match
 // the server certificate.

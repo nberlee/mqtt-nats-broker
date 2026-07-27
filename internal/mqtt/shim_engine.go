@@ -100,10 +100,8 @@ type Options struct {
 
 	MaxTracedMsgLen int
 
-	JetStream          bool
-	JetStreamDomain    string
-	JsAccDefaultDomain map[string]string
-	StreamReplicas     int
+	JetStream      bool
+	StreamReplicas int
 
 	// StoreDir, NoLog, Debug, Trace: test-suite compatibility with the upstream
 	// embedded-server harness (mqttport_fulltests); unused by the broker itself
@@ -257,8 +255,10 @@ type Server struct {
 	willClaimWG        sync.WaitGroup
 	willWorkerWG       sync.WaitGroup
 
-	ldm         bool
-	clusterName string
+	ldm bool
+	// nodeName identifies this bridge instance (see NodeName). It is not a NATS
+	// cluster name and must never be presented as one.
+	nodeName string
 
 	running atomic.Bool
 	gacc    *Account
@@ -313,22 +313,15 @@ func (s *Server) startGoRoutine(f func()) bool {
 func (s *Server) NodeName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.clusterName == _EMPTY_ {
-		s.clusterName = "mnb-" + nuid.Next()
+	if s.nodeName == _EMPTY_ {
+		s.nodeName = "mnb-" + nuid.Next()
 	}
-	return s.clusterName
+	return s.nodeName
 }
 
-func (s *Server) cachedClusterName() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.clusterName
-}
-
-// JetStreamEnabled / JetStreamIsClustered: the standalone broker always runs
-// against external JetStream; clustering is a property of that cluster, exposed
-// via config/replicas rather than an embedded server.
-func (s *Server) JetStreamEnabled() bool     { return true }
+// JetStreamIsClustered: the standalone broker always runs against external
+// JetStream; clustering is a property of that cluster, exposed via
+// config/replicas rather than an embedded server.
 func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas > 1 }
 
 // isClientAuthorized implements auth passthrough: it dials a per-client NATS
@@ -909,7 +902,27 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 	}
 
 	sub := &subscription{client: c, subject: subject, queue: queue, sid: sid, icb: cb}
-	if c.nrc != nil && cb != nil {
+	// Internal plumbing rides the service connection, user topics ride the
+	// client's own. The broker creates several subscriptions on behalf of a
+	// client that are not user topics at all -- the QoS 1/2 deliver subject
+	// ($MQTT.sub.<nuid>), PUBREL delivery ($MQTT.deliver.pubrel.<hash>) and the
+	// shared-subscription deliver subject ($MQTT.qsub.<key>). Creating those on
+	// the permission-scoped per-client connection had two costs: the client's
+	// NATS identity could read them directly, bypassing MQTT entirely; and it
+	// made "deny subscribe: [$MQTT.>]" undeployable, since NATS evaluates deny
+	// before allow so the three could not be carved back out. Putting them on the
+	// service connection closes the namespace to client credentials and lets the
+	// account deny the whole prefix.
+	//
+	// Routing is unchanged: sub.client is still c and the handler closes over
+	// sub, so deliveries reach the right MQTT client, and teardown still runs
+	// through c.subs (see closeConnection, which unsubscribes every stored nsub
+	// rather than relying on the connection closing).
+	nrc := c.nrc
+	if bytes.HasPrefix(subject, []byte(mqttPrefix)) && c.srv != nil && c.srv.nrc != nil {
+		nrc = c.srv.nrc
+	}
+	if nrc != nil && cb != nil {
 		// Per-subscription delivery client carries the pubArg (header length)
 		// that msgParts needs. nats.go dispatches a subscription's messages on a
 		// single goroutine, so mutating dc.pa here is race-free.
@@ -924,9 +937,9 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 			err error
 		)
 		if len(queue) > 0 {
-			ns, err = c.nrc.QueueSubscribe(string(subject), string(queue), handler)
+			ns, err = nrc.QueueSubscribe(string(subject), string(queue), handler)
 		} else {
-			ns, err = c.nrc.Subscribe(string(subject), handler)
+			ns, err = nrc.Subscribe(string(subject), handler)
 		}
 		if err != nil {
 			return nil, err
@@ -940,10 +953,11 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 		// before the NATS server has registered the interest — a message published
 		// immediately after the SUBACK then misses the consumer's first delivery
 		// attempt and waits out AckWait. Flush here so interest provably exists
-		// before the SUBSCRIBE handler emits SUBACK, regardless of which
-		// connection (per-client or shared service) carries the subscription.
+		// before the SUBSCRIBE handler emits SUBACK. Flush the connection the
+		// subscription was actually created on (for a $MQTT. subject that is the
+		// service connection), or the round-trip proves nothing.
 		if bytes.HasPrefix(subject, []byte(mqttSubPrefix)) {
-			if ferr := c.nrc.Flush(); ferr != nil {
+			if ferr := nrc.Flush(); ferr != nil {
 				_ = ns.Unsubscribe()
 				return nil, ferr
 			}
@@ -957,10 +971,13 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 		// permission-violation LastError observable synchronously; we surface it as
 		// a subscribe error, which the SUBSCRIBE handler turns into a SUBACK failure
 		// (0x80). Only per-client connections are permission-scoped; the shared
-		// service connection has full rights. Internal delivery subjects ($MQTT.*,
-		// e.g. PUBREL delivery) are the bridge's own plumbing, not user topics, so
-		// they are exempt from the check (and a user SUBSCRIBE to them is already
-		// rejected earlier).
+		// service connection has full rights.
+		//
+		// The $MQTT. exclusion is structural rather than an exemption: such a
+		// subject was just routed to the service connection above, so it is never
+		// on a permission-scoped connection and there is nothing to check. It also
+		// means the account may safely deny subscribe on "$MQTT.>" for client
+		// identities -- the broker's own plumbing does not go through them.
 		if c.ownNRC && !bytes.HasPrefix(subject, []byte(mqttPrefix)) {
 			before := c.nrc.LastError()
 			if ferr := c.nrc.Flush(); ferr != nil {

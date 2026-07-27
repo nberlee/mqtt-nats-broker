@@ -20,10 +20,10 @@ func newBringUpServer(t *testing.T) (*Server, *client, *nats.Conn) {
 	t.Helper()
 	_, nc := runNATS(t)
 	s := &Server{
-		nrc:         nc,
-		opts:        &Options{},
-		quitCh:      make(chan struct{}),
-		clusterName: "node1",
+		nrc:      nc,
+		opts:     &Options{},
+		quitCh:   make(chan struct{}),
+		nodeName: "node1",
 	}
 	s.running.Store(true)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
@@ -155,7 +155,7 @@ func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
 	}
 
 	newServerOn := func(name string) (*Server, *client) {
-		s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), clusterName: name}
+		s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: name}
 		s.running.Store(true)
 		s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 		s.mqtt.sessmgr.testSessCreateGate = gate
@@ -218,7 +218,7 @@ func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
 		t.Fatalf("delete session stream: %v", err)
 	}
 
-	s2 := &Server{nrc: nc1, opts: &Options{}, quitCh: make(chan struct{}), clusterName: "node2"}
+	s2 := &Server{nrc: nc1, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "node2"}
 	s2.running.Store(true)
 	s2.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	c2 := s2.createInternalAccountClient()

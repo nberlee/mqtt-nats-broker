@@ -18,9 +18,17 @@ is fixed before feature work continues.
   certificate-rollover behavior. The README now documents working TLS and mTLS
   and states explicitly that live rollover is not implemented; rollover itself
   remains tracked under "TLS and certificate rollover" below.
-- [ ] Resolve the MQTT core TODO concerning JetStream domain assignment.
-- [ ] Resolve and document the policy for subscriptions to internal MQTT
-  subjects.
+- [x] Resolve the MQTT core TODO concerning JetStream domain assignment.
+  `-js-domain` is now the single validated source of truth (the unreachable
+  per-account and server-level branches are gone), and the broker no longer
+  fabricates a `ClientInfo.Cluster` from its node name.
+- [x] Resolve and document the policy for subscriptions to internal MQTT
+  subjects. SUBSCRIBE now denies the whole reserved `$MQTT.>` namespace (not
+  only the three delivery prefixes), legacy entries are purged from resumed
+  session records, reserved Will topics are rejected at CONNECT, and the
+  broker's own delivery subscriptions moved to the service connection so a
+  full-namespace deny is deployable. Documented under "Reserved `$MQTT.>`
+  namespace" in `docs/ARCHITECTURE.md`.
 - [ ] Replace brittle JetStream error-string matching in the QoS 2 path with a
   robust error classification.
 - [ ] Decide and test the expected QoS 2 behavior for an unacknowledged PUBLISH
@@ -163,8 +171,10 @@ behavior when no container limit is configured.
   authentication passthrough separately.
 - [ ] Provide NATS user/password and JWT/account examples for MQTT
   authentication and publish/subscribe authorization.
-- [ ] Document MQTT-topic to NATS-subject mapping and denial of the internal
-  `$MQTT.>` namespace.
+- [x] Document MQTT-topic to NATS-subject mapping and denial of the internal
+  `$MQTT.>` namespace. See "Reserved `$MQTT.>` namespace" in
+  `docs/ARCHITECTURE.md`; the migration guide should link it rather than restate
+  it.
 - [ ] Include Kubernetes Secret and live TLS rollover examples.
 
 ## 7. Finish provenance and release documentation

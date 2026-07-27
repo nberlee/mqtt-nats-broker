@@ -66,7 +66,7 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-nats-creds` | `MQTTNB_NATS_CREDS` | | NATS `.creds` file (service conn) |
 | `-nats-user` / `-nats-pass` | `MQTTNB_NATS_USER` / `_PASS` | | NATS user/password (service conn); keep URL credential-less under auth passthrough |
 | `-nats-name` | `MQTTNB_NATS_NAME` | `mqtt-nats-bridge` | Connection name |
-| `-js-domain` | `MQTTNB_JS_DOMAIN` | | JetStream domain |
+| `-js-domain` | `MQTTNB_JS_DOMAIN` | | JetStream domain; a single subject token. Baked into session subjects, so changing it later orphans existing sessions ([details](docs/ARCHITECTURE.md#jetstream-domain)) |
 | `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | `0` (auto) | JetStream stream replicas |
 | `-consumer-replicas` | `MQTTNB_CONSUMER_REPLICAS` | `0` | JetStream consumer replicas |
 | `-host` | `MQTTNB_HOST` | `0.0.0.0` | MQTT listen host |
@@ -102,6 +102,13 @@ dedicated `*nats.Conn`, so NATS enforces that client's publish/subscribe
 permissions on every topic. Anonymous clients use the configured default
 credentials. In v1, all MQTT users share the service connection's NATS account
 (session/retained/QoS streams are account-scoped).
+
+The broker reserves `$MQTT.>` for its own state and refuses client publishes,
+subscribes, and Will topics that target it. Deny both directions on that prefix
+for the MQTT client identity as well — the broker's checks bind MQTT clients,
+the ACL binds anyone using the same credentials to reach NATS directly. See
+[Reserved `$MQTT.>` namespace](docs/ARCHITECTURE.md#reserved-mqtt-namespace) for
+the topic mapping and the exact permissions.
 
 ## Feature matrix
 

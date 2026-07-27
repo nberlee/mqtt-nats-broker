@@ -375,10 +375,27 @@ var (
 	// young unreferenced consumer may just be mid-SUBSCRIBE. A var so tests can
 	// shorten it.
 	mqttOrphanSweepGrace = 5 * time.Minute
-	// Test hook: when set, sess.save() consults it and fails with the returned
-	// error instead of persisting. Used to exercise persistence-failure rollback.
-	mqttTestSessSaveHook func(sess *mqttSession) error
 )
+
+// Test hook: when set, sess.save() consults it and fails with the returned error
+// instead of persisting. Used to exercise persistence-failure rollback.
+//
+// Held in an atomic because saves run on server goroutines that outlive the
+// client connection a test just closed: clearing a plain global in a deferred
+// cleanup races a disconnect-path save still in flight.
+var mqttTestSessSaveHookV atomic.Pointer[func(sess *mqttSession) error]
+
+// setMQTTTestSessSaveHook installs (or, with nil, clears) the save hook and
+// returns a function that restores the previous value.
+func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
+	prev := mqttTestSessSaveHookV.Load()
+	if h == nil {
+		mqttTestSessSaveHookV.Store(nil)
+	} else {
+		mqttTestSessSaveHookV.Store(&h)
+	}
+	return func() { mqttTestSessSaveHookV.Store(prev) }
+}
 
 var (
 	errMQTTNotWebsocketPort           = errors.New("MQTT clients over websocket must connect to the Websocket port, not the MQTT port")
@@ -586,17 +603,19 @@ type mqttJSAResponse struct {
 }
 
 type mqttJSA struct {
-	mu        sync.Mutex
-	id        string
-	c         *client
-	sendq     *ipQueue[*mqttJSPubMsg]
-	rplyr     string
-	replies   sync.Map // [string]chan *mqttJSAResponse
-	nuid      *nuid.NUID
-	quitCh    chan struct{}
-	domain    string // Domain or possibly empty. This is added to session subject.
-	domainSet bool   // covers if domain was set, even to empty
-	timeout   time.Duration
+	mu      sync.Mutex
+	id      string
+	c       *client
+	sendq   *ipQueue[*mqttJSPubMsg]
+	rplyr   string
+	replies sync.Map // [string]chan *mqttJSAResponse
+	nuid    *nuid.NUID
+	quitCh  chan struct{}
+	// domain is the JetStream domain from -js-domain, or empty for the domain of
+	// the NATS server we are connected to. When set it both prefixes the JS API
+	// subjects (see prefixDomain) and is added to the session subject.
+	domain  string
+	timeout time.Duration
 
 	// subsBarrier lets QoS 1/2 message stores wait out any SUBSCRIBE that is
 	// still being processed in this account. See mqttSubsBarrier.
@@ -2511,34 +2530,19 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		},
 		rmsCache: &sync.Map{},
 	}
-	// TODO record domain name in as here
-
-	// The domain to communicate with may be required for JS calls.
-	// Search from specific (per account setting) to generic (mqtt setting)
-	if opts.JsAccDefaultDomain != nil {
-		if d, ok := opts.JsAccDefaultDomain[accName]; ok {
-			if d != _EMPTY_ {
-				as.jsa.domain = d
-			}
-			as.jsa.domainSet = true
-		}
-		// in case domain was set to empty, check if there are more generic domain overwrites
-	}
-	if as.jsa.domain == _EMPTY_ {
-		if d := opts.MQTT.JsDomain; d != _EMPTY_ {
-			as.jsa.domain = d
-			as.jsa.domainSet = true
-		}
-	}
-	// We need to include the domain in the subject prefix used to store sessions in the $MQTT_sess stream.
-	if as.jsa.domainSet {
-		if as.jsa.domain != _EMPTY_ {
-			as.domainTk = as.jsa.domain + "."
-		}
-	} else if d := s.getOpts().JetStreamDomain; d != _EMPTY_ {
-		as.domainTk = d + "."
-	}
-	if as.jsa.domainSet {
+	// JetStream domain. Unlike the NATS Server this code came from, the broker is
+	// a plain client of exactly one external JetStream, so there is a single
+	// source of truth: -js-domain (MQTTNB_JS_DOMAIN). There are no leafnode or
+	// per-account topologies to resolve between. Empty means the domain of the
+	// server we are connected to, which is the common case.
+	//
+	// The value is validated at startup (config.Validate) as a single subject
+	// token, because it is interpolated both into the JS API subjects
+	// ($JS.<domain>.API.*, see prefixDomain) and into the session subject prefix
+	// used to store sessions in the $MQTT_sess stream.
+	as.jsa.domain = opts.MQTT.JsDomain
+	if as.jsa.domain != _EMPTY_ {
+		as.domainTk = as.jsa.domain + "."
 		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q in domain %q", replicas, accName, as.jsa.domain)
 	} else {
 		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q", replicas, accName)
@@ -4310,6 +4314,32 @@ func (as *mqttAccountSessionManager) cleanupRetainedMessageCache(s *Server, clos
 	}
 }
 
+// mqttJSARequestHeader builds the fixed Nats-Request-Info header prefixed to
+// every JS API request for an account.
+//
+// The ClientInfo names the account and nothing else -- in particular it must
+// never carry a Cluster. Upstream set ClientInfo.Cluster from its own cluster
+// name so an embedded, clustered JetStream would place assets locally. This
+// broker has no cluster of its own: the only value available here is its node id
+// (a hostname, or a generated "mnb-<nuid>"), which is not a NATS cluster name
+// and would be nonsense to a server reading it for placement.
+//
+// Nothing was ever actually misrouted by the old code, because
+// processInboundClientMsg strips this header before publishing (it is a trusted
+// server-internal header, meaningless from an external client). But serializing
+// a fabricated cluster name into every request was dead weight waiting to be
+// believed the moment that strip moved or a code path bypassed it. The broker is
+// a plain client; the server places.
+func mqttJSARequestHeader(accName string) []byte {
+	b, _ := json.Marshal(ClientInfo{Account: accName})
+	hdrStart := bytes.Buffer{}
+	hdrStart.WriteString(hdrLine)
+	http.Header{ClientInfoHdr: []string{string(b)}}.Write(&hdrStart)
+	hdrStart.WriteString(CR_LF)
+	hdrStart.WriteString(CR_LF)
+	return hdrStart.Bytes()
+}
+
 // Loop to send JS API requests for a given MQTT account.
 // The closeCh is used by the caller to be able to interrupt this routine
 // if the rest of the initialization fails, since the quitCh is really
@@ -4317,15 +4347,9 @@ func (as *mqttAccountSessionManager) cleanupRetainedMessageCache(s *Server, clos
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, accName string, closeCh chan struct{}) {
-	var cluster string
-	if s.JetStreamEnabled() && !as.jsa.domainSet {
-		// Only request the own cluster when it is clear that
-		cluster = s.cachedClusterName()
-	}
 	as.mu.RLock()
 	sendq := as.jsa.sendq
 	quitCh := as.jsa.quitCh
-	ci := ClientInfo{Account: accName, Cluster: cluster}
 	acc := c.acc
 	as.mu.RUnlock()
 
@@ -4353,13 +4377,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 		as.mu.Unlock()
 	}()
 
-	b, _ := json.Marshal(ci)
-	hdrStart := bytes.Buffer{}
-	hdrStart.WriteString(hdrLine)
-	http.Header{ClientInfoHdr: []string{string(b)}}.Write(&hdrStart)
-	hdrStart.WriteString(CR_LF)
-	hdrStart.WriteString(CR_LF)
-	hdrb := hdrStart.Bytes()
+	hdrb := mqttJSARequestHeader(accName)
 
 	for {
 		select {
@@ -4728,6 +4746,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 	}
 
 	rmSubjects := map[string]uint64{}
+	// Filters denied for being in the reserved namespace. On the CONNECT restore
+	// path these come from the persisted record and are purged from it below.
+	var denied []*mqttFilter
 	// Preload retained messages for all requested subscriptions.  Also, since
 	// it's the first iteration over the filter list, do some cleanup.
 	for _, f := range filters {
@@ -4745,16 +4766,32 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			f.qos = 1
 		}
 
-		// Do not allow subscribing to our internal subjects.
+		// Deny the whole reserved "$MQTT.>" namespace, not just the delivery
+		// subjects. Upstream rejected only $MQTT.sub., $MQTT.deliver.pubrel. and
+		// $MQTT.qsub., with a TODO asking why it bothered when "one can subscribe
+		// to `#` and it'll include everything". The answer: a wildcard filter
+		// cannot reach a $-topic ([MQTT-4.7.2-1], enforced at delivery by
+		// mqttMustIgnoreForReservedSub), but an *explicit* "$MQTT/..." filter is
+		// not "reserved" by that rule and is delivered normally.
 		//
-		// TODO: (levb: not sure why since one can subscribe to `#` and it'll
-		// include everything; I guess this would discourage? Otherwise another
-		// candidate for DO NOT DELIVER prefix list).
-		if strings.HasPrefix(f.filter, mqttSubPrefix) ||
-			strings.HasPrefix(f.filter, mqttPubRelDeliverySubjectPrefix) ||
-			strings.HasPrefix(f.filter, mqttSharedSubDeliverPrefix) {
+		// That matters here because the broker's own state moves as ordinary NATS
+		// publishes on these subjects: every QoS 1/2 PUBLISH is stored to
+		// $MQTT.msgs.<subject> and every retained message to $MQTT.rmsgs.<key>,
+		// alongside $MQTT.sess.*, $MQTT.JSA.*, $MQTT.willq.*, $MQTT.willcancel.*,
+		// $MQTT.qos2.in.* and $MQTT.out.*. So a client subscribing to
+		// "$MQTT/msgs/#" would read every QoS 1/2 message in the account
+		// regardless of its own per-topic NATS permissions -- a read-side bypass
+		// of its subscribe ACL. Deny the prefix outright; the three delivery
+		// subjects are covered by it.
+		//
+		// Defense in depth: the NATS account should ALSO deny subscribe on
+		// "$MQTT.>" (the broker's internal subscriptions live on the service
+		// connection, so that deny is safe -- see processSub). The broker must not
+		// depend on that config being correct.
+		if strings.HasPrefix(f.filter, mqttPrefix) {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = "cannot subscribe to internal server subject"
+			denied = append(denied, f)
 			continue
 		}
 
@@ -5045,6 +5082,10 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		addJSConsToSess(sid, jscons)
 	}
 
+	if !fromSubProto && len(denied) > 0 {
+		sess.purgeReservedSubs(c, denied)
+	}
+
 	if fromSubProto {
 		if err = sess.update(filters, true); err != nil {
 			// The session record could not be persisted. Rather than leave a
@@ -5125,6 +5166,104 @@ func (sess *mqttSession) restoreSharedLiveMetadata(c *client, f *mqttFilter, qos
 		_, ldeliver, _ := mqttSharedNames(f.group, f.filter[:len(f.filter)-2])
 		setFields(ldeliver)
 	}
+}
+
+// purgeReservedSubs removes filters in the reserved "$MQTT.>" namespace from a
+// resumed session record and releases their consumer state.
+//
+// Such a filter can only be a legacy entry, persisted before the broker denied
+// the whole namespace at SUBSCRIBE. Denying it at restore is not enough on its
+// own: processSubs skips a denied filter without touching the record (only the
+// fromSubProto path calls sess.update), so the entry would sit in the session
+// forever and be re-denied on every single reconnect.
+//
+// Transactional, following the UNSUBSCRIBE path: persist the removals FIRST and
+// tear down consumers only once the save is confirmed, so a failed save cannot
+// leave the record claiming a subscription whose durable is already gone. The
+// maps must NOT be pre-cleared -- sess.update detects entries as it deletes
+// them, so a pre-emptied map leaves needUpdate false and silently skips the
+// save. A failure here is logged, not fatal: the filter is denied either way and
+// the next resume retries the cleanup. Spec5 [4.8.2].
+func (sess *mqttSession) purgeReservedSubs(c *client, denied []*mqttFilter) {
+	snap := sess.snapshotSubs()
+	if err := sess.update(denied, false); err != nil {
+		sess.mu.Lock()
+		sess.subs = snap.subs
+		sess.sharedSubs = snap.shared
+		sess.rapSubs = snap.rap
+		sess.noLocalSubs = snap.noLocal
+		sess.subIDs = snap.subIDs
+		sess.mu.Unlock()
+		c.Errorf("MQTT: unable to purge %d legacy reserved-namespace subscription(s) from the session record: %v", len(denied), err)
+		return
+	}
+
+	// Persist confirmed. The memberships are already out of the record, so one
+	// scan now decides every shared durable this purge may release.
+	var sharedDurs []string
+	for _, f := range denied {
+		if f.shared {
+			sharedDurs = append(sharedDurs, mqttSharedDurablesForKey(f.sessionKey())...)
+		}
+	}
+	var heldShared map[string]bool
+	if len(sharedDurs) > 0 {
+		heldShared = sess.sharedDurablesHeldByOthers(sharedDurs)
+	}
+
+	// dropCons releases one sid's consumer state, mirroring removeJSCons in
+	// processUnsubs. A shared filter's group durable must be released even with
+	// no local cons entry: buildPersistedSessionLocked never persists shared
+	// consumers, so the realistic legacy record carries the membership and no
+	// entry at all.
+	dropCons := func(sid string) {
+		sess.mu.Lock()
+		cc, ok := sess.cons[sid]
+		if ok {
+			delete(sess.cons, sid)
+		}
+		sess.mu.Unlock()
+		if !ok {
+			if strings.HasPrefix(sid, string(mqttSharedSubPrefix)) && !strings.HasSuffix(sid, mqttMultiLevelSidSuffix) {
+				for _, dur := range mqttSharedDurablesForKey(sid) {
+					if heldShared[dur] {
+						continue
+					}
+					if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+						c.Errorf("MQTT: unable to delete shared consumer %q while purging a reserved subscription: %v", dur, err)
+					}
+				}
+			}
+			return
+		}
+		// Both helpers also drop the durable's pending deliveries; the shared one
+		// additionally returns its tmaxack charge and only deletes the group
+		// durable when no other member still holds it.
+		if cc.DeliverGroup != _EMPTY_ {
+			sess.releaseSharedConsumer(c, cc, heldShared)
+			return
+		}
+		sess.deleteConsumer(cc)
+		sess.mu.Lock()
+		if seqPis, ok := sess.cpending[cc.Durable]; ok {
+			delete(sess.cpending, cc.Durable)
+			for _, pi := range seqPis {
+				delete(sess.pendingPublish, pi)
+			}
+		}
+		sess.mu.Unlock()
+	}
+
+	for _, f := range denied {
+		sid := f.sessionKey()
+		dropCons(sid)
+		// A multi-level filter also owns a synthetic level-up consumer; leaving it
+		// behind leaks a durable after the membership is gone.
+		if mqttNeedSubForLevelUp(sid) {
+			dropCons(sid[:len(sid)-2] + mqttMultiLevelSidSuffix)
+		}
+	}
+	c.Warnf("MQTT: purged %d subscription(s) to the reserved %s namespace from the session record", len(denied), mqttPrefix)
 }
 
 // mqttSubSnapshot captures the pre-SUBSCRIBE state of the session's subscription
@@ -6118,8 +6257,8 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 //
 // Lock not held on entry.
 func (sess *mqttSession) save() error {
-	if h := mqttTestSessSaveHook; h != nil {
-		if err := h(sess); err != nil {
+	if h := mqttTestSessSaveHookV.Load(); h != nil {
+		if err := (*h)(sess); err != nil {
 			return err
 		}
 	}
@@ -7059,6 +7198,21 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 			}
 			// Reset those now.
 			c.pa.subject, c.pa.mapped = nil, nil
+		}
+		// A Will may not target the broker's reserved namespace. This is the same
+		// rule mqttProcessPub enforces for a client PUBLISH, applied here because
+		// a Will never goes through that path: the immediate Will is delivered by
+		// mqttInitiateMsgDelivery, and a delayed Will is replayed from the outbox
+		// over the *service* connection, where the client's own NATS permissions
+		// no longer apply. Without this check a Will topic is the one remaining
+		// way for a client to publish into $MQTT.>.
+		//
+		// Checked after subject mapping so a mapping cannot land in the namespace
+		// either. Rejecting the CONNECT (rather than dropping the Will silently)
+		// tells the client its Will will not be honoured; 0x05 in 3.1.1, mapped to
+		// 0x87 Not authorized for v5 by mqttConnAckReasonFromRC.
+		if bytes.HasPrefix(cp.will.subject, []byte(mqttPrefix)) {
+			return mqttConnAckRCNotAuthorized, nil, fmt.Errorf("Will topic %q targets the reserved %s namespace", topic, mqttPrefix)
 		}
 		cp.will.topic = topic
 		// Now "will" message.

@@ -134,6 +134,52 @@ All notable changes to this project are documented here. The format is based on
   See `docs/PORTING.md` ("Testing strategy").
 
 ### Fixed
+- **An MQTT client could read the entire internal `$MQTT.>` namespace by
+  subscribing to it.** Only three delivery prefixes (`$MQTT.sub.`,
+  `$MQTT.deliver.pubrel.`, `$MQTT.qsub.`) were rejected, carrying an upstream
+  TODO wondering why it bothered "since one can subscribe to `#`". A wildcard
+  filter indeed cannot match a `$`-topic ([MQTT-4.7.2-1]), but an *explicit*
+  filter is not "reserved" by that rule — and the broker's state moves as
+  ordinary NATS traffic on those subjects, so `$MQTT/msgs/#` yielded every
+  QoS 1/2 message in the account and `$MQTT/rmsgs/#` every retained message,
+  regardless of the client's own per-topic NATS permissions. SUBSCRIBE now
+  rejects the whole reserved prefix with SUBACK 0x80. A legacy subscription
+  found in a resumed session record is purged from the record (transactionally,
+  releasing its consumers including the level-up durable) rather than merely
+  skipped, which would have re-denied it on every reconnect forever.
+  **Security fix.**
+- **A Will topic could still publish into `$MQTT.>`.** `mqttProcessPub` rejects
+  a client PUBLISH into the reserved prefix, but a Will never goes through that
+  path: the immediate Will is delivered by `mqttInitiateMsgDelivery`, and a
+  delayed Will is replayed from the outbox over the **service** connection,
+  where the client's own NATS permissions do not apply at all. The Will topic is
+  now checked at CONNECT — after subject mapping, so a mapping cannot land in
+  the namespace either — and rejected with CONNACK 0x05 (3.1.1) / 0x87 (5.0),
+  which also means no outbox record is ever created. **Security fix.**
+- **The broker's internal delivery subscriptions moved off the per-client NATS
+  connection** onto the service connection. They are not user topics, but
+  creating them on the permission-scoped connection meant a client's NATS
+  identity could read them directly (`$MQTT.sub.>` is a JetStream push
+  consumer's deliver subject, i.e. every QoS 1/2 delivery in the account), and
+  it made `deny subscribe: ["$MQTT.>"]` undeployable — NATS evaluates deny
+  before allow, so the three prefixes could not be carved back out. The
+  recommended ACL now denies the whole namespace in both directions, and
+  `test/conformance/nats.conf` ships it so the suite proves it does not break
+  QoS 2, retained replay, or shared subscriptions. **Security fix.**
+- **The JetStream domain is resolved from one source and validated.** The MQTT
+  core carried an upstream `TODO record domain name in as here` in front of a
+  three-branch resolution of which only one branch was reachable: `-js-domain`.
+  The other two (`Options.JetStreamDomain`, `Options.JsAccDefaultDomain`) exist
+  for leafnode and per-account topologies a standalone broker cannot have and
+  were never populated outside tests; they are removed. `-js-domain` is now
+  validated at startup as a single subject token — it is interpolated into both
+  `$JS.<domain>.API.*` and the persisted session subject, where a dot, wildcard,
+  or invisible character silently yields unroutable requests and a session
+  namespace that can never be read back. The broker also no longer builds a
+  `ClientInfo.Cluster` from its own node name (a hostname or `mnb-<nuid>`, never
+  a NATS cluster name); nothing was misrouted, since the `Nats-Request-Info`
+  header is stripped before publishing, but the value was dead weight waiting to
+  be believed.
 - A QoS 1/2 publish racing a still-in-flight SUBSCRIBE from another client
   could be **permanently lost** to the new subscription: the messages stream
   uses interest-based retention, and a message stored before the

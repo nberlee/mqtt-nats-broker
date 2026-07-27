@@ -126,6 +126,99 @@ Operational constraints for the marker:
   ID ever seen (no `MaxAge`). Monitor `$MQTT_willcancel` message count and storage;
   administrative pruning weakens the guarantee for the pruned client IDs.
 
+## Reserved `$MQTT.>` namespace
+
+MQTT topics map to NATS subjects by swapping the separators: `/` becomes `.`, so
+`foo/bar` is published as `foo.bar` and read back as `foo/bar`. MQTT wildcards
+map the same way (`+` to `*`, `#` to `>`).
+
+The broker reserves `$MQTT.>` for its own state, and that state moves as ordinary
+NATS traffic on those subjects:
+
+| Subject | Contents |
+|---|---|
+| `$MQTT.msgs.<subject>` | every QoS 1/2 message (the `$MQTT_msgs` stream) |
+| `$MQTT.rmsgs.<subject>` | every retained message |
+| `$MQTT.sess.<domain>.<hash>` | session records |
+| `$MQTT.JSA.<...>` | JetStream API replies and session-persist broadcasts |
+| `$MQTT.willq.*`, `$MQTT.willcancel.*` | delayed-Will outbox and cancel watermarks |
+| `$MQTT.qos2.in.*`, `$MQTT.out.*` | QoS 2 inbound dedup and PUBREL state |
+| `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.qsub.*` | per-client delivery subjects |
+
+Anything able to read `$MQTT.msgs.>` reads every QoS 1/2 message in the account,
+so the namespace is closed on every path a client can reach:
+
+- **PUBLISH** into it is always dropped. MQTT 5.0 QoS 1/2 gets reason `0x87`
+  (Not authorized) in the PUBACK/PUBREC. **MQTT 3.1.1 QoS 1/2 gets an ordinary
+  success PUBACK/PUBREC**, because 3.1.1 has no reason codes -- the message is
+  still discarded, and the broker logs a warning, but a 3.1.1 publisher cannot
+  tell. QoS 0 is dropped silently in both versions.
+- **SUBSCRIBE** to it is rejected with SUBACK `0x80` in both versions (5.0 also
+  carries a reason string). This covers the whole prefix, not just the delivery
+  subjects: a wildcard filter such as `#` already cannot match a `$`-topic
+  ([MQTT-4.7.2-1]), but an explicit `$MQTT/msgs/#` filter is not "reserved" by
+  that rule and would otherwise be honoured. A legacy subscription found in a
+  resumed session record is dropped from the record, not merely ignored.
+- **Will topics** in the namespace are rejected at CONNECT: `0x05` in 3.1.1,
+  `0x87` in 5.0. A Will never passes through the PUBLISH path, and a *delayed*
+  Will is replayed from the outbox over the service connection where the client's
+  own NATS permissions no longer apply, so it is refused up front.
+
+### Recommended NATS permissions
+
+Deny both directions on the whole prefix for the identity MQTT clients
+authenticate as:
+
+```
+publish:   { allow: [">"], deny: ["$MQTT.>"] }
+subscribe: { allow: [">"], deny: ["$MQTT.>"] }
+```
+
+Both layers are required and neither is redundant. The broker's own checks bind
+anything speaking MQTT; the ACL is what binds someone who takes the same
+credentials and connects to NATS directly. Under auth passthrough an MQTT client
+holds real NATS credentials, so that is not a hypothetical.
+
+This deny is safe because the broker creates its own delivery subscriptions
+(`$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.qsub.*`) on the **service**
+connection rather than on the per-client one. If they were on the client
+connection this ACL would break QoS 2 delivery and retained replay, and NATS
+evaluates deny before allow, so the three could not be carved back out. The
+conformance environment (`test/conformance/nats.conf`) ships this exact ACL, so
+the suite passing is what keeps that separation honest.
+
+## JetStream domain
+
+The broker is a plain client of exactly one external JetStream, so `-js-domain`
+(`MQTTNB_JS_DOMAIN`) is the single source of truth. There are no leafnode or
+per-account topologies to resolve between, unlike the NATS Server this code came
+from. Empty -- the common case -- means the domain of the server the bridge is
+connected to.
+
+The value is used in two places that must agree:
+
+- **JS API subjects.** Requests are rewritten from `$JS.API.<x>` to
+  `$JS.<domain>.API.<x>`.
+- **Session subjects.** Sessions are stored at
+  `$MQTT.sess.<domain>.<client-id-hash>` in `$MQTT_sess`.
+
+Because the domain is part of the session subject, **changing `-js-domain` on an
+existing deployment orphans every existing session**: the records remain in the
+stream under the old token and the broker looks for them under the new one.
+Treat a domain change as a session reset, not a configuration tweak.
+
+The same setting also drives the `internal/backend` JetStream client
+(`jetstream.NewWithDomain`), so both paths address the same domain.
+
+`-js-domain` must be a **single subject token**: no `.`, `*` or `>`, no
+whitespace, no control characters. This is deliberately narrower than the NATS
+Server, which rejects `.`, `*` and `>` but would accept a domain containing
+invisible whitespace or control characters -- such a value looks right in config
+and logs while silently producing a JS API prefix and a session namespace that
+are not what anyone typed. Ordinary non-ASCII is accepted, so a legitimate
+Unicode domain the server would take is not refused here. Invalid values fail at
+startup rather than surfacing later as unroutable requests.
+
 ## Backend seams (see docs/PORTING.md)
 
 | Concern            | Mechanism                                             |

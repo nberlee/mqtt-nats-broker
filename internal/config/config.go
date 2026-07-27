@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Config is the full runtime configuration of the broker frontend.
@@ -21,7 +23,7 @@ type Config struct {
 	NATSUser    string        // username for the service connection (user/password auth)
 	NATSPass    string        // password for the service connection (user/password auth)
 	NATSName    string        // connection name reported to NATS
-	JSDomain    string        // optional JetStream domain
+	JSDomain    string        // optional JetStream domain; a single subject token (see validateJSDomain)
 	JSTimeout   time.Duration // JetStream API request timeout
 	StreamReps  int           // JetStream stream replicas (0 = auto)
 	ConsumerRep int           // JetStream consumer replicas (0 = follow stream)
@@ -164,7 +166,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.NATSUser, "nats-user", c.NATSUser, "NATS username for the service connection")
 	fs.StringVar(&c.NATSPass, "nats-pass", c.NATSPass, "NATS password for the service connection")
 	fs.StringVar(&c.NATSName, "nats-name", c.NATSName, "NATS connection name")
-	fs.StringVar(&c.JSDomain, "js-domain", c.JSDomain, "JetStream domain (optional)")
+	fs.StringVar(&c.JSDomain, "js-domain", c.JSDomain, "JetStream domain, a single subject token (optional; empty=the connected server's domain)")
 	fs.IntVar(&c.StreamReps, "stream-replicas", c.StreamReps, "JetStream stream replicas (0=auto)")
 	fs.IntVar(&c.ConsumerRep, "consumer-replicas", c.ConsumerRep, "JetStream consumer replicas (0=follow stream)")
 	fs.StringVar(&c.MQTTHost, "host", c.MQTTHost, "MQTT listen host")
@@ -205,6 +207,9 @@ func (c *Config) Validate() error {
 	if c.DrainDelay < 0 {
 		return fmt.Errorf("invalid drain-delay %s (must be >= 0)", c.DrainDelay)
 	}
+	if err := validateJSDomain(c.JSDomain); err != nil {
+		return err
+	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		return fmt.Errorf("tls-cert and tls-key must be set together")
 	}
@@ -218,6 +223,38 @@ func (c *Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("invalid log level %q", c.LogLevel)
+	}
+	return nil
+}
+
+// validateJSDomain checks that a JetStream domain is usable as a single subject
+// token. The value is interpolated into the JetStream API subjects
+// ($JS.<domain>.API.*) and into the persisted MQTT session subject, so a bad one
+// produces unroutable requests and a session namespace that can never be found
+// again -- both of which fail silently and long after startup.
+//
+// This is deliberately narrower than the NATS server, which rejects ".", "*" and
+// ">" but would accept a domain containing invisible whitespace or control
+// characters. Such a domain looks correct in config and logs while not being
+// what anyone typed. Ordinary non-ASCII is accepted, so a legitimate Unicode
+// domain the server would take is not refused here.
+func validateJSDomain(d string) error {
+	if d == "" {
+		return nil
+	}
+	const flags = "js-domain (MQTTNB_JS_DOMAIN)"
+	if !utf8.ValidString(d) {
+		return fmt.Errorf("invalid %s %q: must be valid UTF-8", flags, d)
+	}
+	for _, r := range d {
+		switch {
+		case r == '.' || r == '*' || r == '>':
+			return fmt.Errorf("invalid %s %q: must be a single subject token, so it may not contain %q", flags, d, string(r))
+		case unicode.IsSpace(r):
+			return fmt.Errorf("invalid %s %q: may not contain whitespace (found %U)", flags, d, r)
+		case unicode.IsControl(r):
+			return fmt.Errorf("invalid %s %q: may not contain control characters (found %U)", flags, d, r)
+		}
 	}
 	return nil
 }

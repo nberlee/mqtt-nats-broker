@@ -76,7 +76,10 @@ CI gates on *new* failures only:
   only to surface permission violations on user subjects). A publish arriving
   between SUBACK and interest registration missed the consumer's delivery attempt
   and waited out AckWait (30 s). `processSub` now flushes `$MQTT.sub.*`
-  subscriptions too, so SUBACK implies the subscription is deliverable.
+  subscriptions too, so SUBACK implies the subscription is deliverable. (These
+  internal delivery subjects now live on the service connection rather than the
+  per-client one, and the flush follows them — see
+  [Reserved `$MQTT.>` namespace](ARCHITECTURE.md#reserved-mqtt-namespace).)
   Regression test: `TestV5SubscribeThenImmediatePublish` (`internal/mqtt/v5_test.go`).
   The remaining pre-SUBACK race is closed by the subs barrier below.
 - **QoS 1/2 publishes wait out in-flight SUBSCRIBEs** (`test_request_response`,

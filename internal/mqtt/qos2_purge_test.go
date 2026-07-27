@@ -23,10 +23,10 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 	_, nc := runNATS(t)
 
 	s := &Server{
-		nrc:         nc,
-		opts:        &Options{},
-		quitCh:      make(chan struct{}),
-		clusterName: "node1",
+		nrc:      nc,
+		opts:     &Options{},
+		quitCh:   make(chan struct{}),
+		nodeName: "node1",
 	}
 	s.running.Store(true)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)

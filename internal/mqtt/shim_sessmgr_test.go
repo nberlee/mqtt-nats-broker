@@ -18,10 +18,10 @@ func TestSessionManagerBringUp(t *testing.T) {
 	_, nc := runNATS(t)
 
 	s := &Server{
-		nrc:         nc,
-		opts:        &Options{},
-		quitCh:      make(chan struct{}),
-		clusterName: "node1", // JSA reply routing id; must be non-empty & unique per instance
+		nrc:      nc,
+		opts:     &Options{},
+		quitCh:   make(chan struct{}),
+		nodeName: "node1", // JSA reply routing id; must be non-empty & unique per instance
 	}
 	s.running.Store(true)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)

@@ -623,7 +623,7 @@ func TestMQTTv5SharedSubscriptionFailedJoinRollback(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
-	defer func() { mqttTestSessSaveHook = nil }()
+	defer setMQTTTestSessSaveHook(nil)()
 
 	_, _, durable := mqttSharedNames("g", "foo")
 	consumerExists := func() bool {
@@ -647,14 +647,14 @@ func TestMQTTv5SharedSubscriptionFailedJoinRollback(t *testing.T) {
 	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fjB", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cb.Close()
 	testMQTTReadConnAckV5(t, rb)
-	mqttTestSessSaveHook = func(sess *mqttSession) error {
+	setMQTTTestSessSaveHook(func(sess *mqttSession) error {
 		if sess.id == "fjB" {
 			return fmt.Errorf("injected save failure")
 		}
 		return nil
-	}
+	})
 	codes := testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
-	mqttTestSessSaveHook = nil
+	setMQTTTestSessSaveHook(nil)
 	if len(codes) != 1 || codes[0] != mqttSubAckFailure {
 		t.Fatalf("Expected SUBACK [0x%x], got %v", mqttSubAckFailure, codes)
 	}
@@ -690,7 +690,7 @@ func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
-	defer func() { mqttTestSessSaveHook = nil }()
+	defer setMQTTTestSessSaveHook(nil)()
 
 	// Count consumers on the messages stream whose filter matches the given NATS
 	// subject (subject-scoped so subtests do not interfere).
@@ -725,7 +725,7 @@ func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
 	// the rollback's own confirm-save — succeed).
 	failNthSave := func(id string, n int) {
 		var count int
-		mqttTestSessSaveHook = func(sess *mqttSession) error {
+		setMQTTTestSessSaveHook(func(sess *mqttSession) error {
 			if sess.id != id {
 				return nil
 			}
@@ -734,7 +734,7 @@ func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
 				return fmt.Errorf("injected save failure")
 			}
 			return nil
-		}
+		})
 	}
 
 	t.Run("mixed shared and plain", func(t *testing.T) {
@@ -764,7 +764,7 @@ func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
 			t.Fatalf("Expected no SUBACK, got one")
 		}
 		c.Close()
-		mqttTestSessSaveHook = nil
+		setMQTTTestSessSaveHook(nil)
 
 		// Resume: neither filter is present, and no consumers remain.
 		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
@@ -812,7 +812,7 @@ func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 		c.Close()
-		mqttTestSessSaveHook = nil
+		setMQTTTestSessSaveHook(nil)
 		// The upgrade's consumer must have been torn down.
 		checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
 			if n := consumersFor("up.x"); n != 0 {
@@ -865,7 +865,7 @@ func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 		c.Close()
-		mqttTestSessSaveHook = nil
+		setMQTTTestSessSaveHook(nil)
 		// The pre-existing durable must have survived the failed downgrade.
 		if n := consumersFor("down.x"); n != 1 {
 			t.Fatalf("expected the pre-existing consumer to survive, got %d", n)
