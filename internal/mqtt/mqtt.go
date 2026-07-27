@@ -334,6 +334,12 @@ const (
 	// For Websocket URLs
 	mqttWSPath = "/mqtt"
 
+	// Default bound (in seconds) on the server-side TLS handshake for an MQTT
+	// connection when MQTTOpts.TLSTimeout is unset. Matches nats-server's default
+	// so a client that opens a socket and then stalls cannot pin a connection
+	// slot indefinitely.
+	mqttDefaultTLSTimeout = 2.0
+
 	mqttInitialPubHeader        = 16 // An overkill, should need 7 bytes max
 	mqttProcessSubTooLong       = 100 * time.Millisecond
 	mqttDefaultRetainedCacheTTL = 2 * time.Minute
@@ -1324,7 +1330,7 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 		rejectQoS2Pub:    opts.MQTT.rejectQoS2Pub,
 		downgradeQoS2Sub: opts.MQTT.downgradeQoS2Sub,
 	}
-	c := &client{srv: s, nc: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt, ws: ws}
+	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt, ws: ws}
 	c.headers = true
 	c.mqtt.pp = &mqttPublish{}
 	// MQTT clients don't send NATS CONNECT protocols. So make it an "echo"
@@ -1384,7 +1390,7 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 	var pre []byte
 	if tlsRequired && opts.AllowNonTLS {
 		pre = make([]byte, 4)
-		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.MQTT.TLSTimeout)))
+		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(mqttTLSTimeout(opts.MQTT.TLSTimeout))))
 		n, _ := io.ReadFull(c.nc, pre[:])
 		c.nc.SetReadDeadline(time.Time{})
 		pre = pre[:n]

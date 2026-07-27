@@ -224,6 +224,19 @@ type Server struct {
 	// enqueue delayed Wills; grWG (background/JSA goroutines) is waited later.
 	clientWG sync.WaitGroup
 
+	// connSetupWG tracks accepted connections whose setup goroutine is still
+	// running, i.e. the whole of createMQTTClient — including the TLS handshake,
+	// which is why shutdown waits on it only AFTER draining clients (see
+	// runShutdown): a client parked in its handshake is already registered, so the
+	// drain closing its socket is what lets setup finish. Waiting earlier would
+	// deadlock the drain against that socket, and would let a blocking handshake
+	// hold up shutdown indefinitely. The group exists so no setup goroutine
+	// outlives the lifecycle; connGateClosed (guarded by s.mu, mirroring the Will
+	// dispatch gate) refuses admissions once shutdown starts and orders the close
+	// after every Add, so no Add can race the zero-count Wait.
+	connSetupWG    sync.WaitGroup
+	connGateClosed bool
+
 	// Shutdown lifecycle (see shim_public.go). shutdownOnce guards a single run
 	// of the four-phase lifecycle; shutdownDone closes when every phase finished.
 	shutdownOnce sync.Once
@@ -359,6 +372,17 @@ func (s *Server) SetClientDialer(fn func(clientID, user, pass string) (*nats.Con
 
 // acceptConnections runs the listener accept loop, handing each connection to
 // createFn (which builds the MQTT client and starts its read/write loops).
+//
+// createFn runs on its own goroutine (as upstream nats-server does): it performs
+// the TLS handshake, so calling it inline would let a single client that connects
+// and never sends a ClientHello stall every subsequent accept for the whole
+// handshake timeout. Accepting serially is the problem — the loop cannot reach
+// the next connection until the current one finishes its handshake — and MaxConn
+// does not make that safe: it caps how many clients are registered, not how long
+// one of them may hold up the loop, and it is unlimited by default. Each dispatch
+// holds a connSetupWG token so shutdown can wait for in-flight setups; when the
+// gate is already closed the connection is closed immediately rather than left
+// hanging.
 func (s *Server) acceptConnections(l net.Listener, name string, createFn func(net.Conn), errFn func(error)) {
 	for {
 		conn, err := l.Accept()
@@ -375,8 +399,38 @@ func (s *Server) acceptConnections(l net.Listener, name string, createFn func(ne
 			}
 			return
 		}
-		createFn(conn)
+		if !s.admitConnSetup() {
+			conn.Close()
+			return
+		}
+		go func() {
+			defer s.connSetupWG.Done()
+			createFn(conn)
+		}()
 	}
+}
+
+// admitConnSetup reserves a connection-setup token unless shutdown has closed
+// the gate. On true the caller owns one connSetupWG token and must release it
+// with s.connSetupWG.Done() when setup finishes; on false the caller must not
+// proceed and should close the connection.
+func (s *Server) admitConnSetup() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connGateClosed {
+		return false
+	}
+	s.connSetupWG.Add(1)
+	return true
+}
+
+// closeConnSetupGate refuses further connection-setup admissions. Taking s.mu
+// orders it after every successful admitConnSetup Add, so the subsequent
+// connSetupWG.Wait cannot race an Add on a zero counter.
+func (s *Server) closeConnSetupGate() {
+	s.mu.Lock()
+	s.connGateClosed = true
+	s.mu.Unlock()
 }
 
 // createInternalAccountClient returns an internal client bound to the global
@@ -413,13 +467,26 @@ type outbound struct {
 }
 
 type client struct {
-	mu   sync.Mutex
-	srv  *Server
-	acc  *Account
-	nc   net.Conn
-	cid  uint64
-	kind int
-	ncs  atomic.Value // string label, lazily set
+	mu  sync.Mutex
+	srv *Server
+	acc *Account
+	// nc is the protocol-facing connection: the raw socket, or the TLS wrapper
+	// once the handshake has upgraded it. It is written only by the setup
+	// goroutine (createMQTTClient) before readLoop starts, and every later reader
+	// is ordered after that write, so it needs no lock — but that also means
+	// nothing may touch it concurrently with setup.
+	nc net.Conn
+	// rawConn is the accepted socket, assigned once at construction and never
+	// replaced. Teardown paths close THIS rather than nc: the drain runs
+	// concurrently with a client that may still be completing its TLS handshake
+	// (registration precedes the handshake), so reading nc there would race the
+	// upgrade. Closing the underlying socket tears down the TLS connection layered
+	// on it just the same, and needs no lock, which keeps the drain from having to
+	// wait on a handshake that holds c.mu.
+	rawConn net.Conn
+	cid     uint64
+	kind    int
+	ncs     atomic.Value // string label, lazily set
 
 	opts    clientOpts
 	flags   clientFlag
@@ -605,7 +672,47 @@ func (c *client) maxPayloadViolation(sz int, max int32) {
 	c.closeConnection(WriteError)
 }
 func (c *client) authViolation() bool { c.closeConnection(WriteError); return true }
+
+// doTLSServerHandshake upgrades the client socket to TLS (nats-server:
+// server.go). It is called from createMQTTClient before the readLoop goroutine
+// is started, and every reader of c.nc is ordered after that point, so replacing
+// c.nc needs no lock. This holds only because concurrent teardown (the shutdown
+// drain, which by design does not take c.mu) closes c.rawConn instead of reading
+// c.nc — see the field comment.
+//
+// A nil cfg is an error rather than a pass-through: the caller only reaches this
+// function when TLS is required, and continuing in the clear there would serve
+// plaintext on a listener the operator configured for TLS. c.nc is replaced only
+// after a successful handshake, so every subsequent read/write goes through TLS
+// and the *tls.Conn assertion made by the caller holds.
+//
+// pinned is accepted for signature compatibility with the upstream call site;
+// certificate pinning is not implemented in this broker (validatePinnedCerts is
+// a no-op).
 func (c *client) doTLSServerHandshake(kind string, cfg *tls.Config, timeout float64, pinned PinnedCertSet) error {
+	if cfg == nil {
+		err := fmt.Errorf("%s: TLS required but no TLS configuration is set", kind)
+		c.Errorf("TLS handshake error: %v", err)
+		return err
+	}
+	tlsConn := tls.Server(c.nc, cfg)
+	deadline := time.Now().Add(secondsToDuration(mqttTLSTimeout(timeout)))
+	if err := tlsConn.SetDeadline(deadline); err != nil {
+		tlsConn.Close()
+		c.Errorf("TLS handshake error on %s connection: %v", kind, err)
+		return err
+	}
+	if err := tlsConn.Handshake(); err != nil {
+		tlsConn.Close()
+		c.Errorf("TLS handshake error on %s connection: %v", kind, err)
+		return err
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		tlsConn.Close()
+		c.Errorf("TLS handshake error on %s connection: %v", kind, err)
+		return err
+	}
+	c.nc = tlsConn
 	return nil
 }
 
@@ -652,8 +759,8 @@ func (c *client) writeDirect(data []byte, deadline time.Time) error {
 // single, ordered teardown (mqttHandleClosedClient before closeConnection). A
 // double socket close is harmless.
 func (c *client) queueOutbound(data []byte) {
-	if err := c.writeSocket(data, time.Time{}); err != nil && c.nc != nil {
-		_ = c.nc.Close()
+	if err := c.writeSocket(data, time.Time{}); err != nil && c.rawConn != nil {
+		_ = c.rawConn.Close()
 	}
 }
 func (c *client) enqueueProto(data []byte) { c.queueOutbound(data) }
@@ -663,8 +770,8 @@ func (c *client) enqueueProto(data []byte) { c.queueOutbound(data) }
 // records successful delivery and must distinguish a write failure from success.
 func (c *client) enqueueProtoErr(data []byte) error {
 	err := c.writeSocket(data, time.Time{})
-	if err != nil && c.nc != nil {
-		_ = c.nc.Close()
+	if err != nil && c.rawConn != nil {
+		_ = c.rawConn.Close()
 	}
 	return err
 }
@@ -685,8 +792,8 @@ func (c *client) closeConnection(reason ClosedState) {
 	if c.authTimer != nil {
 		c.authTimer.Stop()
 	}
-	if c.nc != nil {
-		_ = c.nc.Close()
+	if c.rawConn != nil {
+		_ = c.rawConn.Close()
 	}
 	if c.srv != nil && c.cid != 0 {
 		c.srv.mu.Lock()
@@ -755,8 +862,11 @@ func (c *client) shutdownDisconnect(deadline time.Time) {
 	if len(pkt) > 0 {
 		_ = c.writeDirect(pkt, deadline) // best effort; the socket close follows regardless
 	}
-	if c.nc != nil {
-		_ = c.nc.Close()
+	// Close the raw socket, never c.nc: this runs concurrently with a client that
+	// may still be upgrading c.nc to TLS. Closing the socket underneath the TLS
+	// layer aborts that handshake just as effectively.
+	if c.rawConn != nil {
+		_ = c.rawConn.Close()
 	}
 }
 
@@ -1009,6 +1119,17 @@ func tlsVersion(ver uint16) string { return tls.VersionName(ver) }
 
 // tlsHandshakeMQTT is the handshake-kind label passed to doTLSServerHandshake.
 const tlsHandshakeMQTT = "mqtt"
+
+// mqttTLSTimeout returns the effective TLS handshake bound in seconds:
+// MQTTOpts.TLSTimeout when set, mqttDefaultTLSTimeout otherwise. Resolving at
+// the point of use (rather than mutating Options at startup) matches the other
+// MQTT option defaults, e.g. mqttReceiveMax.
+func mqttTLSTimeout(timeout float64) float64 {
+	if timeout <= 0 {
+		return mqttDefaultTLSTimeout
+	}
+	return timeout
+}
 
 // tlsMixConn lets a connection replay bytes already read before the TLS upgrade
 // (nats-server: server.go).

@@ -7,6 +7,32 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **Working MQTT TLS and mutual TLS listener, failing closed.** The server-side TLS
+  handshake was a no-op stub: a listener configured with `-tls-cert`/`-tls-key`
+  logged `tls://` but never upgraded the connection, and then panicked on the
+  `*tls.Conn` assertion made after client setup. The handshake is now real
+  (`tls.Server` under a bounded deadline, default 2s via `MQTTOpts.TLSTimeout`,
+  socket replaced only after the handshake succeeds), so `-tls-ca` produces genuine
+  verified mTLS. Startup now fails closed as well: the listener TLS configuration is
+  resolved immediately after config load — before the NATS connection and the health
+  listener — so an invalid or unreadable certificate, key, or client CA aborts the
+  process instead of silently serving plaintext, and is reported even when NATS is
+  unreachable. `-tls-ca` without a certificate and key is rejected in validation
+  rather than accepted and ignored. The broker still serves a single listener:
+  `-port` selects it in either mode (use `-port 8883` for TLS).
+- **Connection setup no longer runs on the accept loop.** With a real handshake in
+  place, accepting a connection inline meant one client that connected and sent no
+  ClientHello stalled every subsequent accept for the whole handshake timeout, so a
+  few idle sockets could keep the listener unavailable. `MaxConn` is no defense: it
+  bounds how many clients are registered, not how long one of them can hold up the
+  accept loop, and it is unlimited by default. Setup is now dispatched per
+  connection, as upstream nats-server does, with a shutdown-safe admission gate that
+  refuses new setups once shutdown starts and ensures none outlive the lifecycle.
+  Shutdown drains clients before waiting on in-flight setups: a client parked in its
+  handshake is already registered, so closing its socket is what lets that setup
+  finish. Teardown paths close the raw accepted socket rather than the
+  protocol-facing connection, so the drain cannot race a handshake swapping in the
+  TLS wrapper.
 - **Durable delayed-Will cancellation watermark.** Closes the reconnect-suppression
   residual in the Layer-2 delayed-Will outbox: an obsolete Will could still fire
   after a newer CONNECT that later finite-disconnected or deleted its session record.

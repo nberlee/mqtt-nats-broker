@@ -1,8 +1,11 @@
 package config
 
 import (
+	"crypto/tls"
 	"testing"
 	"time"
+
+	"github.com/nberlee/mqtt-nats-bridge/internal/testcerts"
 )
 
 func TestLoadDrainDelay(t *testing.T) {
@@ -104,6 +107,7 @@ func TestValidate(t *testing.T) {
 		"empty nats":        func(c *Config) { c.NATSURLs = "" },
 		"bad loglevel":      func(c *Config) { c.LogLevel = "trace" },
 		"tls half-set":      func(c *Config) { c.TLSCert = "x" },
+		"tls ca only":       func(c *Config) { c.TLSCA = "x" },
 		"keepalive neg":     func(c *Config) { c.KeepAliveMax = -1 },
 		"keepalive too big": func(c *Config) { c.KeepAliveMax = 70000 },
 	}
@@ -113,6 +117,120 @@ func TestValidate(t *testing.T) {
 			mut(c)
 			if err := c.Validate(); err == nil {
 				t.Errorf("expected validation error for %q", name)
+			}
+		})
+	}
+}
+
+// tlsFixture writes a CA plus a matching server keypair into a temp dir and
+// returns their paths, along with an unrelated keypair whose key does not match
+// the server certificate.
+type tlsFixture struct {
+	caPath, certPath, keyPath string
+	otherKeyPath              string
+	emptyCAPath               string
+}
+
+func newTLSFixture(t *testing.T) tlsFixture {
+	t.Helper()
+	dir := t.TempDir()
+	ca, err := testcerts.NewAuthority("test-ca")
+	if err != nil {
+		t.Fatalf("NewAuthority: %v", err)
+	}
+	certPEM, keyPEM, err := ca.Issue("server", "127.0.0.1", "localhost")
+	if err != nil {
+		t.Fatalf("Issue server: %v", err)
+	}
+	_, otherKeyPEM, err := ca.Issue("other", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("Issue other: %v", err)
+	}
+	var f tlsFixture
+	write := func(name string, data []byte) string {
+		t.Helper()
+		p, err := testcerts.Write(dir, name, data)
+		if err != nil {
+			t.Fatalf("Write %s: %v", name, err)
+		}
+		return p
+	}
+	f.caPath = write("ca.pem", ca.CertPEM)
+	f.certPath = write("server.pem", certPEM)
+	f.keyPath = write("server.key", keyPEM)
+	f.otherKeyPath = write("other.key", otherKeyPEM)
+	f.emptyCAPath = write("empty-ca.pem", []byte("not a certificate\n"))
+	return f
+}
+
+func TestTLSConfigDisabled(t *testing.T) {
+	c := Default()
+	tc, err := c.TLSConfig()
+	if err != nil {
+		t.Fatalf("TLSConfig: %v", err)
+	}
+	if tc != nil {
+		t.Errorf("TLSConfig = %v, want nil when no TLS is configured", tc)
+	}
+}
+
+func TestTLSConfigValid(t *testing.T) {
+	f := newTLSFixture(t)
+
+	c := Default()
+	c.TLSCert, c.TLSKey = f.certPath, f.keyPath
+	tc, err := c.TLSConfig()
+	if err != nil {
+		t.Fatalf("TLSConfig: %v", err)
+	}
+	if tc == nil || len(tc.Certificates) != 1 {
+		t.Fatalf("TLSConfig = %v, want one certificate", tc)
+	}
+	if tc.ClientAuth != tls.NoClientCert {
+		t.Errorf("ClientAuth = %v, want NoClientCert without a client CA", tc.ClientAuth)
+	}
+
+	// Adding the client CA must turn on verified mTLS.
+	c.TLSCA = f.caPath
+	tc, err = c.TLSConfig()
+	if err != nil {
+		t.Fatalf("TLSConfig with CA: %v", err)
+	}
+	if tc.ClientCAs == nil {
+		t.Error("ClientCAs = nil, want the configured client CA")
+	}
+	if tc.ClientAuth != tls.RequireAndVerifyClientCert {
+		t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", tc.ClientAuth)
+	}
+}
+
+// TestTLSConfigErrors covers the failure modes that must abort startup: none of
+// them may yield a usable (plaintext-implying) nil config with a nil error.
+func TestTLSConfigErrors(t *testing.T) {
+	f := newTLSFixture(t)
+	missing := f.certPath + ".missing"
+
+	cases := map[string]func(*Config){
+		"missing cert": func(c *Config) { c.TLSCert, c.TLSKey = missing, f.keyPath },
+		"missing key":  func(c *Config) { c.TLSCert, c.TLSKey = f.certPath, missing },
+		"key mismatch": func(c *Config) { c.TLSCert, c.TLSKey = f.certPath, f.otherKeyPath },
+		"missing ca": func(c *Config) {
+			c.TLSCert, c.TLSKey, c.TLSCA = f.certPath, f.keyPath, missing
+		},
+		"ca without certificates": func(c *Config) {
+			c.TLSCert, c.TLSKey, c.TLSCA = f.certPath, f.keyPath, f.emptyCAPath
+		},
+	}
+	for name, mut := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := Default()
+			mut(c)
+			tc, err := c.TLSConfig()
+			if err == nil {
+				t.Fatalf("TLSConfig = %v, nil error; want an error for %q", tc, name)
+			}
+			if tc != nil {
+				t.Errorf("TLSConfig = %v on error, want nil", tc)
 			}
 		})
 	}

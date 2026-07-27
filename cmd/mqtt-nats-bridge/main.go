@@ -42,6 +42,15 @@ func run(args []string) error {
 	log := newLogger(cfg.LogLevel)
 	log.Info("starting mqtt-nats-bridge", "version", version)
 
+	// Resolve the listener TLS configuration before anything observable starts:
+	// a broken certificate, key, or client CA must fail startup outright rather
+	// than degrade to a plaintext listener, and must be reported even when NATS
+	// is unreachable.
+	tlsCfg, err := resolveTLS(cfg)
+	if err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -73,7 +82,7 @@ func run(args []string) error {
 	// Start the MQTT listener backed by the NATS/JetStream connection. On failure
 	// the deferred be.Close() and the explicit HTTP shutdown keep cleanup
 	// reachable so a failed startup leaks nothing.
-	srv, err := serveMQTT(cfg, be, log)
+	srv, err := serveMQTT(cfg, be, tlsCfg, log)
 	if err != nil {
 		shutdownHTTP()
 		return err

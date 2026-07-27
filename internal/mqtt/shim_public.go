@@ -166,8 +166,24 @@ func (s *Server) runShutdown() {
 	// before Phase 3 waits on it — see mqttSubsBarrier.wait.
 
 	// Phase 1: disconnect clients and wait for readLoop cleanup while quitCh is open.
+	//
+	// Ordering note: the connection-setup gate is closed first, but its Wait comes
+	// LAST. A setup token spans the whole of createMQTTClient, including the TLS
+	// handshake, so waiting on it before draining would deadlock the drain against
+	// the very socket it needs to close: a client parked in its handshake is
+	// already registered (registration precedes the handshake), and closing its
+	// socket is what makes the handshake return. Draining first therefore unblocks
+	// setup rather than waiting on it.
+	//
+	// Nothing can register behind the drain snapshot: registration happens under
+	// s.mu behind an isRunning check, and running was set false before this
+	// lifecycle started, so a setup goroutine reaching that section after the
+	// snapshot closes its connection instead of registering. The final wait is
+	// therefore only about not leaving setup goroutines running past shutdown.
+	s.closeConnSetupGate()
 	s.drainClients(deadline)
 	s.clientWG.Wait()
+	s.connSetupWG.Wait()
 
 	// Phase 2: stop Will dispatch (claim loops + timers) and unblock the subscribe
 	// barrier so in-flight publishers can finish.

@@ -208,6 +208,12 @@ func (c *Config) Validate() error {
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		return fmt.Errorf("tls-cert and tls-key must be set together")
 	}
+	// A client CA on its own expresses mTLS intent but produces no TLS listener,
+	// so accepting it would serve plaintext while the operator believes client
+	// certificates are being verified.
+	if c.TLSCA != "" && !c.TLSEnabled() {
+		return fmt.Errorf("tls-ca requires tls-cert and tls-key")
+	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:

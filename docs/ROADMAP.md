@@ -11,11 +11,13 @@ is fixed before feature work continues.
 
 ## 0. Resolve known findings
 
-- [ ] Remove the accidental review sentence from the README attribution section.
-- [ ] Make MQTT TLS startup fail closed. An invalid or unreadable certificate,
+- [x] Remove the accidental review sentence from the README attribution section.
+- [x] Make MQTT TLS startup fail closed. An invalid or unreadable certificate,
   key, or CA must never result in a plaintext listener.
-- [ ] Reconcile the README TLS/mTLS feature claim with the parked TLS reference
-  tests and the missing certificate-rollover behavior.
+- [x] Reconcile the README TLS/mTLS feature claim with the missing
+  certificate-rollover behavior. The README now documents working TLS and mTLS
+  and states explicitly that live rollover is not implemented; rollover itself
+  remains tracked under "TLS and certificate rollover" below.
 - [ ] Resolve the MQTT core TODO concerning JetStream domain assignment.
 - [ ] Resolve and document the policy for subscriptions to internal MQTT
   subjects.
@@ -88,7 +90,12 @@ behavior when no container limit is configured.
 
 ### TLS and certificate rollover
 
-- [ ] Support MQTT TLS and mutual TLS as tested production listener modes.
+- [x] Support MQTT TLS and mutual TLS as tested production listener modes.
+- [x] Expose TLS on a second listener, or document why a single configurable
+  listener (`-port`, plaintext or TLS) is sufficient. Decided and documented in
+  the README: one listener, `-port` selects it in either mode, no implicit port
+  change when TLS flags are set, and TLS deployments use `-port 8883`. Serving
+  1883 and 8883 at once would need multiple listeners and is not supported.
 - [ ] Reload certificate, private-key, and client-CA changes from projected
   Kubernetes Secrets without restarting the process or pod.
 - [ ] Do not require Stakater Reloader or another rollout controller.

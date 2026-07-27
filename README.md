@@ -76,10 +76,24 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-default-user` / `-default-pass` | `MQTTNB_DEFAULT_USER` / `_PASS` | | NATS creds for anonymous MQTT clients |
 | `-keepalive-max` | `MQTTNB_KEEPALIVE_MAX` | `0` (no override) | MQTT 5.0 Server Keep Alive cap (seconds) |
 | `-response-info` | `MQTTNB_RESPONSE_INFO` | | MQTT 5.0 Response Information base topic |
-| `-tls-cert` / `-tls-key` | `MQTTNB_TLS_CERT` / `_KEY` | | MQTT listener TLS |
-| `-tls-ca` | `MQTTNB_TLS_CA` | | Client-CA → enables mTLS |
+| `-tls-cert` / `-tls-key` | `MQTTNB_TLS_CERT` / `_KEY` | | MQTT listener TLS (set `-port 8883`) |
+| `-tls-ca` | `MQTTNB_TLS_CA` | | Client-CA → enables mTLS (requires cert+key) |
 | `-log-level` | `MQTTNB_LOG_LEVEL` | `info` | `debug`\|`info`\|`warn`\|`error` |
 | `-http-addr` | `MQTTNB_HTTP_ADDR` | `:8080` | Health/readiness (`/healthz`, `/readyz`) |
+
+### TLS
+
+Setting `-tls-cert` and `-tls-key` turns the MQTT listener into a TLS listener;
+adding `-tls-ca` additionally requires and verifies client certificates (mTLS).
+The broker serves **one** listener: `-port` selects it in either mode, and there
+is no implicit port change when the TLS flags are set — TLS deployments should
+pass `-port 8883` (the conventional MQTT-over-TLS port). Serving plaintext 1883
+and TLS 8883 simultaneously is not supported.
+
+TLS configuration fails closed: an unreadable or invalid certificate, key, or
+client CA aborts startup before anything is bound, so a broken TLS setup can
+never fall back to a plaintext listener. Certificate rollover without a restart
+is not implemented yet — see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Authentication
 
