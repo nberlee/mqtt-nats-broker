@@ -244,12 +244,20 @@ type Server struct {
 	// claim loops both dispatch publisher workers; shutdown Phase 2 closes the
 	// admission gate and drains both dispatch sources (willTimerWG, willClaimWG)
 	// before Phase 3 waits on willWorkerWG, so no worker Add races a zero-count
-	// Wait. willClaimStopCh signals the claim loops to stop. The willTimers path
-	// (trackWillTimer) is unused — the outbox fires on the claim ticker, not
-	// per-Will timers — so willTimerWG stays at zero.
+	// Wait. willClaimStopCh signals the claim loops to stop; willTimers holds the
+	// armed per-Will fire timers (scheduleWillTimer), which closeWillDispatch
+	// stops. The timer is the promptness path — it fires a Will at its Will Delay
+	// Interval — and the claim loop is the backstop for a peer's records, a crash
+	// during the delay, or a lost claim race.
+	//
+	// Keyed by the Will's outbox subject (unique per Will event) so a cancelled
+	// Will can release its timer immediately. Without that identity a cancelled
+	// record's timer would live until its original FireAt, and MQTT permits a Will
+	// Delay of 0xFFFFFFFF seconds (~136 years), so reconnect churn would retain
+	// timers, callbacks and account-manager references for the process lifetime.
 	willDispatchMu     sync.Mutex
 	willDispatchClosed bool
-	willTimers         map[*time.Timer]struct{}
+	willTimers         map[string]*time.Timer
 	willClaimStopCh    chan struct{}
 	willTimerWG        sync.WaitGroup
 	willClaimWG        sync.WaitGroup

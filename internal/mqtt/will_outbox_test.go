@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nuid"
 )
 
 // runSharedReplica starts a second broker instance bound to the same embedded
@@ -1238,5 +1240,546 @@ func testMQTTHasWillState(t testing.TB, asm *mqttAccountSessionManager, want mqt
 		if json.Unmarshal(smsg.Data, rec) == nil && rec.State == want {
 			return true
 		}
+	}
+}
+
+// withLongWillScan pins the claim-scan interval far above any delay a test
+// uses, so a Will that arrives on time proves the LOCAL FIRE TIMER delivered it
+// rather than a lucky scan tick. It must be called before the server starts:
+// the claim ticker begins with account-manager creation, so changing the
+// interval afterwards leaves tick phase in the assertion.
+//
+// mqttWillClaimInterval is a package global (mqtt_v5_test.go's init() drops it
+// to 50ms for the whole package), so a test using this must not run in
+// parallel. Nothing in this package calls t.Parallel.
+func withLongWillScan(t *testing.T) {
+	t.Helper()
+	prevInterval, prevLease := mqttWillClaimInterval, mqttWillClaimLease
+	mqttWillClaimInterval = 30 * time.Second
+	// Keep the lease above the interval, as production does.
+	mqttWillClaimLease = 60 * time.Second
+	t.Cleanup(func() {
+		mqttWillClaimInterval, mqttWillClaimLease = prevInterval, prevLease
+	})
+}
+
+// testWillTimerCount reports how many delayed-Will fire timers are armed.
+func testWillTimerCount(s *Server) int {
+	s.willDispatchMu.Lock()
+	defer s.willDispatchMu.Unlock()
+	return len(s.willTimers)
+}
+
+// TestMQTTWillOutboxTimerLatency is the regression guard for the conformance
+// failure: a delayed Will must fire at its Will Delay Interval, not at the next
+// outbox scan. With the scan pinned to 30s and a 1s delay, only the local fire
+// timer can deliver in time -- before the fix the Will waited out the scan
+// interval, which is exactly what made Paho's test_will_delay fail.
+func TestMQTTWillOutboxTimerLatency(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tlsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/latency", opts: 0}})
+
+	will := &mqttWill{topic: []byte("will/latency"), message: []byte("prompt"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tlpub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+
+	start := time.Now()
+	cw.Close()
+	testMQTTReadPublishV5(t, rs, "will/latency", []byte("prompt"))
+	elapsed := time.Since(start)
+
+	if elapsed < time.Second {
+		t.Errorf("delayed Will fired after %s, before its 1s Will Delay Interval", elapsed)
+	}
+	// Generous ceiling: the point is that it did not wait out the 30s scan.
+	if elapsed > 10*time.Second {
+		t.Errorf("delayed Will took %s for a 1s delay; it waited for the outbox scan instead of its fire timer", elapsed)
+	}
+}
+
+// TestMQTTWillOutboxAmbiguousEnqueueAckTimer covers the second durability path.
+// enqueueDelayedWill also treats an enqueue as confirmed when the create CAS
+// errors but a re-read finds the record already written (a lost ack). That
+// branch returns without a clean CAS result, so arming only on the clean path
+// would leave these Wills with the full scan-interval latency.
+func TestMQTTWillOutboxAmbiguousEnqueueAckTimer(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "aesub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/ambig", opts: 0}})
+
+	asm := testMQTTGetAccountSessionManager(t, s, "aesub")
+	// Perform the real store, then report a lost ack. The record IS durable and
+	// pending, so enqueueDelayedWill must take the re-read confirmation branch.
+	var injected atomic.Bool
+	setWillEnqueueStoreHook(asm, func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error) {
+		if _, err := asm.jsa.storeWillOutboxCAS(subject, expectSeq, rec); err != nil {
+			return 0, err
+		}
+		injected.Store(true)
+		return 0, fmt.Errorf("injected lost ack")
+	})
+	defer setWillEnqueueStoreHook(asm, nil)
+
+	will := &mqttWill{topic: []byte("will/ambig"), message: []byte("ambiguous"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "aepub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+
+	start := time.Now()
+	cw.Close()
+	testMQTTReadPublishV5(t, rs, "will/ambig", []byte("ambiguous"))
+	elapsed := time.Since(start)
+
+	if !injected.Load() {
+		t.Fatal("the enqueue seam never ran; the ambiguous-ack branch was not exercised")
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("Will confirmed via the lost-ack re-read took %s for a 1s delay; no fire timer was armed on that path", elapsed)
+	}
+}
+
+// TestMQTTWillOutboxTimerShutdownDrains checks the drain contract the new timer
+// participates in: shutdown Phase 2 must stop every armed fire timer and release
+// its willTimerWG token, so Phase 3 is not held by a Will that is not due for
+// minutes. The durable record stays pending for a peer or a restart.
+func TestMQTTWillOutboxTimerShutdownDrains(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	// Idempotent, and needed on the failure path: if the lifecycle wait below
+	// t.Fatals, the explicit teardown never runs and this server plus its embedded
+	// NATS would leak into every later test in the package.
+	defer testMQTTShutdownServer(s)
+
+	will := &mqttWill{topic: []byte("will/drain"), message: []byte("later"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "drainpub", cleanStart: true, will: will,
+		willProps: mqttV5WillDelayProps(300), props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	// Wait for the timer to be armed.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if testWillTimerCount(s) == 0 {
+			return fmt.Errorf("no fire timer armed yet")
+		}
+		return nil
+	})
+
+	// A 5-minute Will must not hold shutdown open. Wait on BeginShutdown's channel
+	// rather than Shutdown()/testMQTTShutdownServer: those return after the
+	// shutdownDrainTimeout whether or not the lifecycle finished, so a leaked
+	// willTimerWG token would look like a pass.
+	lifecycleDone := s.BeginShutdown()
+	select {
+	case <-lifecycleDone:
+	case <-time.After(shutdownDrainTimeout + 5*time.Second):
+		t.Fatal("shutdown lifecycle never completed; an armed fire timer was not stopped and its willTimerWG token not released")
+	}
+	// Only now tear down the embedded NATS.
+	testMQTTShutdownServer(s)
+
+	if n := testWillTimerCount(s); n != 0 {
+		t.Errorf("%d fire timer(s) still tracked after shutdown", n)
+	}
+}
+
+// TestMQTTWillOutboxTimerReconnectCancels checks that reconnect suppression
+// still holds now that a fire timer races the reconnect: with the scan pinned
+// long, a timer is armed, the client reconnects inside the delay, and nothing is
+// published past FireAt.
+//
+// It does NOT cover the callback: reconnect cancellation stops and untracks the
+// timer, so the callback never runs. TestMQTTWillOutboxTimerOnCancelledRecord
+// covers that path, and TestMQTTWillOutboxTimerReleasedOnCancel covers the
+// release itself.
+func TestMQTTWillOutboxTimerReconnectCancels(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "trcsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/trc", opts: 0}})
+
+	will := &mqttWill{topic: []byte("will/trc"), message: []byte("suppressed"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "trcpub", cleanStart: false, will: will,
+		willProps: mqttV5WillDelayProps(2), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	// A timer must actually be armed before the reconnect, or the rest of this
+	// test would pass with no timer at all and only re-test durable cancellation.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if testWillTimerCount(s) == 0 {
+			return fmt.Errorf("no fire timer armed for the delayed Will")
+		}
+		return nil
+	})
+
+	// Reconnect well inside the delay: this cancels the pending record.
+	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "trcpub", cleanStart: false,
+		props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	defer cw2.Close()
+	testMQTTReadConnAckV5(t, rw2)
+
+	// Wait past the original FireAt and confirm nothing is published. The timer
+	// was already stopped by the cancellation, and the scan is pinned to 30s, so
+	// neither dispatch source can deliver it.
+	time.Sleep(3 * time.Second)
+	testMQTTExpectNothing(t, rs)
+}
+
+// TestMQTTWillOutboxTimerReleasedOnCancel is the retention guard. A cancelled
+// Will must release its fire timer immediately, not keep it armed until FireAt:
+// MQTT permits a Will Delay of 0xFFFFFFFF seconds (~136 years), so a retained
+// timer -- and the account manager its callback captures -- would accumulate for
+// the life of the process under ordinary reconnect churn, even though the
+// cancelled records themselves are reaped within seconds.
+//
+// The delay here must be long enough that the timer cannot possibly self-release
+// by firing; otherwise the assertion cannot tell "released on cancel" from
+// "released when it fired", which is exactly the trap the short-delay
+// cancellation test above falls into.
+func TestMQTTWillOutboxTimerReleasedOnCancel(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	will := &mqttWill{topic: []byte("will/release"), message: []byte("never"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "relpub", cleanStart: false, will: will,
+		willProps: mqttV5WillDelayProps(300), props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if testWillTimerCount(s) == 0 {
+			return fmt.Errorf("no fire timer armed for the delayed Will")
+		}
+		return nil
+	})
+
+	// Reconnect cancels the record. With a 300s delay the timer cannot fire, so
+	// the only way the count reaches zero is the cancel path releasing it.
+	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "relpub", cleanStart: false,
+		props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
+	defer cw2.Close()
+	testMQTTReadConnAckV5(t, rw2)
+
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		if n := testWillTimerCount(s); n != 0 {
+			return fmt.Errorf("%d fire timer(s) still armed after the reconnect cancelled the Will; it would be retained until FireAt (300s here, up to ~136 years in the protocol)", n)
+		}
+		return nil
+	})
+}
+
+// TestMQTTWillOutboxTimerOnCancelledRecord covers the fire path the two
+// cancellation tests above never reach. A normal reconnect stops and untracks
+// the timer, so its callback does not run; here the record is CAS-cancelled
+// directly, bypassing cancelWillOutbox, so the timer stays armed and the
+// callback really does execute after FireAt. It must publish nothing and release
+// its own token.
+//
+// Note what this does NOT prove. The callback reloads the record rather than
+// trusting its enqueue-time snapshot, but that is defence in depth, not the
+// safety property: a stale snapshot carries a stale sequence, so the
+// pending->publishing CAS in tryFireWill fails and nothing is published either
+// way. Substituting a snapshot for the reload keeps this test passing. The CAS
+// is the guard; the reload just avoids a pointless fence and round trip.
+func TestMQTTWillOutboxTimerOnCancelledRecord(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rldsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/reload", opts: 0}})
+
+	will := &mqttWill{topic: []byte("will/reload"), message: []byte("stale"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rldpub", cleanStart: false, will: will,
+		willProps: mqttV5WillDelayProps(2), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	asm := testMQTTGetAccountSessionManager(t, s, "rldsub")
+	filter := mqttWillQClientFilter(asm.domainTk, getHash("rldpub"))
+
+	// Wait for the pending record and its armed timer.
+	var subject string
+	var rec *mqttWillOutbox
+	var seq uint64
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, 1)
+		if err != nil {
+			return fmt.Errorf("no outbox record yet: %v", err)
+		}
+		r := &mqttWillOutbox{}
+		if err := json.Unmarshal(smsg.Data, r); err != nil {
+			return err
+		}
+		if r.State != mqttWillPending {
+			return fmt.Errorf("record is %q, want pending", r.State)
+		}
+		if testWillTimerCount(s) == 0 {
+			return fmt.Errorf("no fire timer armed yet")
+		}
+		subject, rec, seq = smsg.Subject, r, smsg.Sequence
+		return nil
+	})
+
+	// Cancel the record durably WITHOUT going through cancelWillOutbox, so
+	// cancelWillTimer is never called and the timer stays armed.
+	rec.State = mqttWillCancelled
+	if _, err := asm.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
+		t.Fatalf("direct cancel CAS: %v", err)
+	}
+	if n := testWillTimerCount(s); n != 1 {
+		t.Fatalf("timer count = %d, want the timer still armed: this test needs the callback to run", n)
+	}
+
+	// Past FireAt the callback runs. Reloading, it sees cancelled and publishes
+	// nothing; then it untracks itself, which is how we know it actually ran.
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		if n := testWillTimerCount(s); n != 0 {
+			return fmt.Errorf("%d fire timer(s) still armed; the callback has not run yet", n)
+		}
+		return nil
+	})
+	testMQTTExpectNothing(t, rs)
+}
+
+// TestMQTTWillOutboxTimerReleasedWhenRecordReaped covers the interleaving the
+// per-record cleanup cannot see:
+//
+//	A arms a long fire timer.
+//	A peer cancels the durable record and a claim loop reaps it.
+//	A's takeover cancellation then scans and finds nothing.
+//
+// The scan completes successfully having never returned the subject, so the
+// per-record cancelWillTimer never fires for it. Timers are keyed by exact
+// subject, so A can no longer name its own timer: without the captured sweep on
+// a conclusively completed scan it stays armed until FireAt, which the protocol
+// allows to be ~136 years out.
+//
+// The reap is simulated by deleting the record outright, which is what the claim
+// loop does to a terminal record.
+func TestMQTTWillOutboxTimerReleasedWhenRecordReaped(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "reapsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+
+	// Long delay: the timer cannot self-release by firing.
+	will := &mqttWill{topic: []byte("will/reap"), message: []byte("never"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "reappub", cleanStart: false, will: will,
+		willProps: mqttV5WillDelayProps(300), props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+
+	asm := testMQTTGetAccountSessionManager(t, s, "reapsub")
+	filter := mqttWillQClientFilter(asm.domainTk, getHash("reappub"))
+
+	var recSeq uint64
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, 1)
+		if err != nil {
+			return fmt.Errorf("no outbox record yet: %v", err)
+		}
+		if testWillTimerCount(s) == 0 {
+			return fmt.Errorf("no fire timer armed yet")
+		}
+		recSeq = smsg.Sequence
+		return nil
+	})
+
+	// Reap the record before any cancellation scan can observe it.
+	if err := asm.jsa.deleteMsg(mqttWillQStreamName, recSeq, true); err != nil {
+		t.Fatalf("reap record: %v", err)
+	}
+	if n := testWillTimerCount(s); n != 1 {
+		t.Fatalf("timer count = %d before the cancel scan, want 1", n)
+	}
+
+	// The reconnect's cancellation scan now finds nothing at all.
+	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "reappub", cleanStart: false,
+		props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
+	defer cw2.Close()
+	testMQTTReadConnAckV5(t, rw2)
+
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		if n := testWillTimerCount(s); n != 0 {
+			return fmt.Errorf("%d fire timer(s) retained after the record was reaped; the completed scan never saw the subject, so only the captured sweep can release it", n)
+		}
+		return nil
+	})
+}
+
+// TestMQTTWillTimerSweepExcludesLaterArmings pins the ordering rule that makes
+// the post-scan sweep safe: it releases only timers captured BEFORE the
+// cancellation scan, never one armed while the scan ran.
+//
+// That window is reachable in production. On the remote-takeover path the old
+// connection's delayed-Will enqueue can be blocked behind the asynchronous
+// cancellation; the scan observes no records and returns, the enqueue then lands
+// and arms a timer for a record that IS still pending. Sweeping everything
+// matching the client prefix at that point would stop the new timer and drop the
+// Will back to the 5s scan latency this change exists to remove.
+//
+// Driven at the Server primitives rather than through the broker, because the
+// interleaving is exactly "between scan completion and the sweep" and cannot be
+// staged reliably from the protocol surface.
+func TestMQTTWillTimerSweepExcludesLaterArmings(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const prefix = "$MQTT.willq.sweepcid."
+	base := testWillTimerCount(s)
+
+	// Armed before the capture: the sweep owns this one.
+	older := prefix + "older"
+	if !s.scheduleWillTimer(older, time.Hour, func() {}) {
+		t.Fatal("could not arm the pre-capture timer")
+	}
+
+	captured := s.snapshotWillTimersWithPrefix(prefix)
+	if len(captured) != 1 {
+		t.Fatalf("captured %d timers, want 1", len(captured))
+	}
+
+	// Armed after the capture, standing in for an enqueue that landed once the
+	// scan had already completed.
+	newer := prefix + "newer"
+	if !s.scheduleWillTimer(newer, time.Hour, func() {}) {
+		t.Fatal("could not arm the post-capture timer")
+	}
+
+	s.stopWillTimers(captured)
+
+	s.willDispatchMu.Lock()
+	_, olderStillArmed := s.willTimers[older]
+	_, newerStillArmed := s.willTimers[newer]
+	s.willDispatchMu.Unlock()
+
+	if olderStillArmed {
+		t.Error("the captured timer survived the sweep")
+	}
+	if !newerStillArmed {
+		t.Error("the sweep stopped a timer armed after the capture; a Will still pending would fall back to the 5s scan")
+	}
+	if n := testWillTimerCount(s); n != base+1 {
+		t.Errorf("timer count = %d, want %d (only the post-capture timer left)", n, base+1)
+	}
+
+	// Leave nothing armed for the shutdown drain to trip over.
+	s.cancelWillTimer(newer)
+}
+
+// TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel drives the
+// reconciliation branch in earlyCancelIfSuperseded: its cancel CAS fails, and
+// the re-read shows the record is no longer pending, so the local fire timer
+// must be released rather than left armed until FireAt.
+//
+// The lost-ack enqueue test does not reach here -- its re-read finds the record
+// still pending and takes the ordinary path. This drives the failure branch
+// directly instead, with a deliberately stale sequence.
+func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
+	withLongWillScan(t)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "aecsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	asm := testMQTTGetAccountSessionManager(t, s, "aecsub")
+
+	cidHash := getHash("aec-pub")
+	subject := mqttWillQSubject(asm.domainTk, cidHash, "aec-wid")
+	// A valid epoch from a DIFFERENT incarnation than the account's, so the
+	// watermark path below decides cancel.
+	originEpoch := mqttSessEpochNUIDPrefix + nuid.Next()
+
+	// Seed a pending record far in the future and keep its sequence.
+	pending := &mqttWillOutbox{
+		WillID: "aec-wid", ClientIDHash: cidHash, Topic: "will/aec", Msg: []byte("x"), QoS: 0,
+		FireAt: time.Now().Add(time.Hour).UnixNano(), State: mqttWillPending,
+		OriginSessionSeq: 1, OriginSessEpoch: originEpoch,
+	}
+	staleSeq, err := asm.jsa.storeWillOutboxCAS(subject, 0, pending)
+	if err != nil {
+		t.Fatalf("seed pending record: %v", err)
+	}
+
+	// Arm the fire timer for that subject, as a real enqueue would.
+	asm.armDelayedWillTimer(s, subject, pending.FireAt)
+	if n := testWillTimerCount(s); n != 1 {
+		t.Fatalf("timer count = %d, want 1 armed", n)
+	}
+
+	// Advance the record to publishing, making staleSeq stale.
+	publishing := *pending
+	publishing.State = mqttWillPublishing
+	publishing.ClaimOwner = "someone-else"
+	publishing.ClaimUntil = time.Now().Add(mqttWillClaimLease).UnixNano()
+	if _, err := asm.jsa.storeWillOutboxCAS(subject, staleSeq, &publishing); err != nil {
+		t.Fatalf("advance record to publishing: %v", err)
+	}
+
+	// Force the takeover fence to decide cancel: a valid watermark whose epoch
+	// differs from the record's origin epoch is a different incarnation.
+	setWillCancelWatermarkLoadHook(asm, func(string) (*mqttWillCancelWatermark, uint64, mqttWillCancelStatus) {
+		return &mqttWillCancelWatermark{ClientIDHash: cidHash, SessionSeq: 1, SessEpoch: asm.sessStreamEpoch}, 1, mqttWillCancelValid
+	})
+	defer setWillCancelWatermarkLoadHook(asm, nil)
+
+	// Early-cancel with the stale sequence: the CAS loses, and the re-read sees
+	// publishing. The record is no longer this broker's to fire, so the timer
+	// must go.
+	stale := *pending
+	asm.earlyCancelIfSuperseded(s, subject, &stale, staleSeq)
+
+	if n := testWillTimerCount(s); n != 0 {
+		t.Errorf("%d fire timer(s) still armed after an ambiguous early-cancel whose re-read found the record non-pending; it would be retained until FireAt", n)
+	}
+
+	// The losing CAS must not have rewritten the record.
+	cur, _, err := asm.jsa.loadWillOutbox(subject)
+	if err != nil || cur == nil {
+		t.Fatalf("reload record: %v", err)
+	}
+	if cur.State != mqttWillPublishing {
+		t.Errorf("record state = %q, want publishing: the stale CAS must not have overwritten a claimed record", cur.State)
 	}
 }

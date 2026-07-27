@@ -6,6 +6,7 @@ package mqtt
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -42,7 +43,7 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 		quitCh:          make(chan struct{}),
 		shutdownDone:    make(chan struct{}),
 		willClaimStopCh: make(chan struct{}),
-		willTimers:      make(map[*time.Timer]struct{}),
+		willTimers:      make(map[string]*time.Timer),
 		// Initialized here so globalAccount() never lazily writes s.gacc: the eager
 		// account-manager init and the accept loop reach it concurrently.
 		gacc: &Account{name: "$G"},
@@ -146,11 +147,10 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 //	Phase 4 finally stops the JSA/account infrastructure (quitCh) and the
 //	  remaining background goroutines (grWG).
 //
-// Phases 2 and 3 drive the Layer 2 delayed-Will outbox: the claim loops
-// (willClaimWG) stop on the dispatch gate and publisher workers (willWorkerWG,
-// admitted via admitWillWorker) drain before quitCh closes. The willTimers path
-// (trackWillTimer) is currently unused — the outbox fires on the claim ticker,
-// not per-Will timers — so willTimerWG stays at zero.
+// Phases 2 and 3 drive the Layer 2 delayed-Will outbox: both dispatch sources
+// stop on the gate — the claim loops (willClaimWG) and the per-Will fire timers
+// (willTimerWG, armed via scheduleWillTimer) — and publisher workers
+// (willWorkerWG, admitted via admitWillWorker) drain before quitCh closes.
 func (s *Server) runShutdown() {
 	defer close(s.shutdownDone)
 
@@ -222,35 +222,145 @@ func (s *Server) admitWillWorker() bool {
 	return true
 }
 
-// trackWillTimer registers a fire timer so shutdown can stop and drain it before
-// waiting on publisher workers. Returns false if the gate is already closed, in
-// which case the caller must not arm the timer. On true the caller owns one
-// willTimerWG token, released via untrackWillTimer.
+// scheduleWillTimer arms a delayed-Will fire timer, keyed by the Will's outbox
+// subject, that shutdown can stop and drain before it waits on publisher
+// workers. Returns false if the dispatch gate is already closed (shutdown Phase
+// 2 has begun), in which case nothing is armed and the caller must leave the
+// durable record for the claim loop or a peer.
 //
-//nolint:unused // Layer 2 delayed-Will outbox dispatch; dormant until wired.
-func (s *Server) trackWillTimer(t *time.Timer) bool {
+// Creation, registration and the willTimerWG Add all happen under
+// willDispatchMu, giving this and closeWillDispatch a single linearization
+// point: shutdown either closes the gate before the timer exists, or finds it in
+// willTimers. Taking an already-created *time.Timer instead would be unsound —
+// time.AfterFunc arms immediately, so a zero (or already-elapsed) delay could
+// fire before registration and escape the drain entirely.
+//
+// The callback cannot run its body until registration completes: it first blocks
+// on the registered channel, which is closed only after the map insert and the
+// Add. That is what makes a zero-duration timer safe without depending on
+// scheduler timing. The callback then releases its own token exactly once.
+//
+// Returns false if a timer is already armed for the key, leaving the existing
+// one in place. Outbox subjects embed a fresh WillID per Will event, so one key
+// is armed at most once; rejecting rather than replacing keeps the token
+// accounting trivially correct (a displaced timer has no unambiguous owner for
+// its release once its map entry is gone).
+func (s *Server) scheduleWillTimer(key string, delay time.Duration, fire func()) bool {
+	if delay < 0 {
+		delay = 0
+	}
+	registered := make(chan struct{})
+
 	s.willDispatchMu.Lock()
 	defer s.willDispatchMu.Unlock()
 	if s.willDispatchClosed {
 		return false
 	}
-	s.willTimers[t] = struct{}{}
+	if _, exists := s.willTimers[key]; exists {
+		return false
+	}
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
+		<-registered
+		defer s.untrackWillTimer(key, t)
+		fire()
+	})
+	s.willTimers[key] = t
 	s.willTimerWG.Add(1)
+	close(registered)
 	return true
 }
 
 // untrackWillTimer removes a fire timer from the tracked set and releases its
 // willTimerWG token exactly once. Safe to call whether the timer fired or was
-// stopped by closeWillDispatch.
-func (s *Server) untrackWillTimer(t *time.Timer) {
+// stopped by closeWillDispatch. The identity check means a callback for a
+// displaced timer cannot remove the entry that replaced it.
+func (s *Server) untrackWillTimer(key string, t *time.Timer) {
 	s.willDispatchMu.Lock()
-	_, ok := s.willTimers[t]
+	cur, ok := s.willTimers[key]
+	ok = ok && cur == t
 	if ok {
-		delete(s.willTimers, t)
+		delete(s.willTimers, key)
 	}
 	s.willDispatchMu.Unlock()
 	if ok {
 		s.willTimerWG.Done()
+	}
+}
+
+// cancelWillTimer stops and releases the fire timer for an outbox subject whose
+// record is no longer pending (cancelled by a reconnect or takeover, or already
+// claimed). Without this a cancelled Will's timer would survive until its
+// original FireAt, which MQTT allows to be ~136 years out — reconnect churn
+// would then retain timers and their captured account-manager references for the
+// lifetime of the process, even though the durable records are reaped in seconds.
+//
+// A no-op when no timer is armed for the subject, which is the normal case on a
+// peer broker: only the enqueueing broker holds the local timer.
+func (s *Server) cancelWillTimer(key string) {
+	s.willDispatchMu.Lock()
+	t, ok := s.willTimers[key]
+	s.willDispatchMu.Unlock()
+	if !ok {
+		return
+	}
+	// Same ownership rule as closeWillDispatch: only a Stop() that actually
+	// prevented the callback makes us the releaser. The entry must stay in the map
+	// until that is known — deleting first would strand the token when the
+	// callback had already won, because its untrackWillTimer would find nothing.
+	if t.Stop() {
+		s.untrackWillTimer(key, t)
+	}
+}
+
+// willTimerRef identifies one armed fire timer: its outbox subject and the exact
+// timer object, so a later release can verify identity rather than just the key.
+type willTimerRef struct {
+	key string
+	t   *time.Timer
+}
+
+// snapshotWillTimersWithPrefix captures the fire timers whose outbox subject
+// starts with prefix — every armed Will for one client — WITHOUT stopping them.
+//
+// Pairs with stopWillTimers around a cancellation scan. The capture must happen
+// BEFORE the scan: a successful scan only proves no record was pending while it
+// ran, and that proof is already stale by the time it returns. A delayed-Will
+// enqueue blocked behind the scan can land immediately after, arm its timer, and
+// still hold a genuinely pending record — sweeping "everything matching the
+// prefix" after the scan would stop that new timer and drop the Will back to the
+// 5s scan latency this whole change exists to remove. Capturing first excludes
+// anything armed during or after the scan.
+func (s *Server) snapshotWillTimersWithPrefix(prefix string) []willTimerRef {
+	s.willDispatchMu.Lock()
+	defer s.willDispatchMu.Unlock()
+	var matched []willTimerRef
+	for key, t := range s.willTimers {
+		if strings.HasPrefix(key, prefix) {
+			matched = append(matched, willTimerRef{key, t})
+		}
+	}
+	return matched
+}
+
+// stopWillTimers releases a previously captured set of fire timers.
+//
+// This is the backstop for a record the cancellation scan never returned: one
+// cancelled by a peer and then reaped by a claim loop is already gone when this
+// broker scans, so the scan completes having never seen the subject. Timers are
+// keyed by exact subject, so without this the origin broker could not name its
+// own timer and it would stay armed until FireAt — up to ~136 years out. Records
+// the scan did see are already handled per-record; this is idempotent over them.
+//
+// Only call after a scan that conclusively completed: a transient failure may
+// have left records pending, and their timers must survive.
+func (s *Server) stopWillTimers(refs []willTimerRef) {
+	for _, ref := range refs {
+		// Same ownership rule as everywhere else: only a Stop() that actually
+		// prevented the callback makes us the releaser.
+		if ref.t.Stop() {
+			s.untrackWillTimer(ref.key, ref.t)
+		}
 	}
 }
 
@@ -267,19 +377,16 @@ func (s *Server) closeWillDispatch() {
 	}
 	s.willDispatchClosed = true
 	close(s.willClaimStopCh)
-	timers := make([]*time.Timer, 0, len(s.willTimers))
-	for t := range s.willTimers {
-		timers = append(timers, t)
+	timers := make([]willTimerRef, 0, len(s.willTimers))
+	for key, t := range s.willTimers {
+		timers = append(timers, willTimerRef{key, t})
 	}
 	s.willDispatchMu.Unlock()
 
 	// Stop each tracked timer. A timer we successfully Stop() will not fire, so
 	// its callback will not run untrackWillTimer; release its token here. A timer
 	// that already fired (Stop returns false) releases its own token from the
-	// callback, so skip it.
-	for _, t := range timers {
-		if t.Stop() {
-			s.untrackWillTimer(t)
-		}
-	}
+	// callback, so skip it. Nothing can arm behind this: the gate is closed above,
+	// so scheduleWillTimer refuses.
+	s.stopWillTimers(timers)
 }

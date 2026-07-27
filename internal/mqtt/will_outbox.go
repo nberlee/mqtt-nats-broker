@@ -150,6 +150,14 @@ func mqttWillQClientFilter(domainTk, cidHash string) string {
 	return mqttWillQSubjectPrefix + domainTk + cidHash + ".*"
 }
 
+// mqttWillQClientSubjectPrefix is the literal (non-wildcard) prefix every Will
+// subject for one client hash shares. Used to sweep local fire timers by client,
+// which mqttWillQClientFilter cannot do: that is a NATS subject filter, not a
+// string prefix.
+func mqttWillQClientSubjectPrefix(domainTk, cidHash string) string {
+	return mqttWillQSubjectPrefix + domainTk + cidHash + "."
+}
+
 // mqttWillQAccountFilter matches every Will event for the account (claim scan).
 func mqttWillQAccountFilter(domainTk string) string {
 	return mqttWillQSubjectPrefix + domainTk + ">"
@@ -196,8 +204,41 @@ func (jsa *mqttJSA) loadWillOutbox(subject string) (*mqttWillOutbox, uint64, err
 	return rec, smsg.Sequence, nil
 }
 
-// enqueueDelayedWill writes a new pending outbox record for a delayed Will. The
-// claim loops (on every replica, including this one) fire it once FireAt passes.
+// armDelayedWillTimer schedules a local fire timer for a confirmed-pending
+// outbox record, so the Will is published at its Will Delay Interval rather than
+// whenever the claim loop next scans. The scan interval (mqttWillClaimInterval,
+// 5s) is the fire granularity without this, which makes a short delay late by up
+// to a full interval.
+//
+// Promptness only: the durable outbox stays the authority. If the gate is closed
+// (shutdown), if the reload fails, or if the claim is lost, nothing is written
+// and the record remains pending for a later scan or a peer.
+func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject string, fireAt int64) {
+	delay := time.Until(time.Unix(0, fireAt))
+	s.scheduleWillTimer(subject, delay, func() {
+		// Reload rather than closing over the enqueue-time snapshot: a reconnect
+		// may have cancelled the record and a peer may have claimed it, so the
+		// snapshot's state and sequence can both be stale. This mirrors what
+		// scanWillOutbox does for a single record.
+		rec, seq, err := as.jsa.loadWillOutbox(subject)
+		if err != nil || rec == nil {
+			// Transient load failure or already reaped; the scan retries.
+			return
+		}
+		now := time.Now()
+		if rec.State != mqttWillPending || rec.FireAt > now.UnixNano() {
+			return
+		}
+		// tryFireWill owns the takeover fence, the pending->publishing CAS, worker
+		// admission and dispatch. Its willScanAbort result only tells a multi-record
+		// scan to stop, so it is not meaningful for this single record.
+		_ = as.tryFireWill(s, subject, rec, seq, now)
+	})
+}
+
+// enqueueDelayedWill writes a new pending outbox record for a delayed Will. A
+// local fire timer publishes it at FireAt; the claim loops (on every replica,
+// including this one) are the backstop and fire it once FireAt passes.
 // Called from the disconnect path; the Will's publish permission was checked
 // before this and a denied Will is never enqueued.
 //
@@ -235,6 +276,11 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash strin
 			// record would fire AND the fail-safe would publish. Run the best-effort
 			// early cancel on the known pending snapshot; any failure inside it is
 			// swallowed and the claimant-side fence remains the durable safety net.
+			// Arm BEFORE the early cancel so a cancel that lands releases the timer
+			// (earlyCancelIfSuperseded -> cancelWillTimer). Arming afterwards would
+			// leave a timer for an already-cancelled record alive until its FireAt,
+			// which a long Will Delay makes effectively permanent.
+			as.armDelayedWillTimer(s, subject, rec.FireAt)
 			as.earlyCancelIfSuperseded(s, subject, rec, newSeq)
 			return nil
 		}
@@ -251,6 +297,13 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash strin
 			// claimant has since advanced it to publishing/done/cancelled we must
 			// NOT write cancelled over it (that would revoke an irrevocable claim),
 			// which is exactly what the state guard here and inside the fence avoid.
+			// This record is durable and still pending, so it needs the same fire
+			// timer the clean-CAS path gets; without it a Will whose ack was merely
+			// lost would silently keep the full scan-interval latency. Only for a
+			// pending record: a claimant that already advanced it to
+			// publishing/cancelled/done does not need an initial fire. Armed before
+			// the early cancel for the same reason as the clean-CAS path above.
+			as.armDelayedWillTimer(s, subject, existing.FireAt)
 			as.earlyCancelIfSuperseded(s, subject, existing, exSeq)
 		}
 		return nil
@@ -296,7 +349,21 @@ func (as *mqttAccountSessionManager) earlyCancelIfSuperseded(s *Server, subject 
 	rec.State = mqttWillCancelled
 	if _, err := as.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
 		s.Debugf("MQTT: early-cancel of superseded delayed Will %q lost/failed (claimant fence will resolve): %v", rec.WillID, err)
+		// The CAS outcome is ambiguous: the cancelled write may have landed with a
+		// lost ack, or another writer may have advanced or deleted the record. In
+		// either of those the record is no longer pending and the timer is dead
+		// weight until FireAt. Re-read to tell them apart, and keep the timer only
+		// when the record is confirmed still pending (or the re-read itself is
+		// indeterminate, where the claimant fence remains the safety net).
+		cur, _, lerr := as.jsa.loadWillOutbox(subject)
+		if lerr == nil && (cur == nil || cur.State != mqttWillPending) {
+			s.cancelWillTimer(subject)
+		}
+		return
 	}
+	// Cancelled: release the local fire timer rather than leaving it armed until
+	// FireAt for a record that will never fire.
+	s.cancelWillTimer(subject)
 }
 
 // cancelWillOutbox suppresses a reconnecting client's pending delayed Wills by
@@ -318,9 +385,23 @@ func (as *mqttAccountSessionManager) cancelWillOutbox(s *Server, cidHash string)
 		defer done()
 	}
 	filter := mqttWillQClientFilter(as.domainTk, cidHash)
+	prefix := mqttWillQClientSubjectPrefix(as.domainTk, cidHash)
 	var err error
 	for attempt := 0; attempt < mqttWillCancelAttempts; attempt++ {
+		// Capture this client's armed fire timers BEFORE the scan. A record the
+		// scan never returns (cancelled by a peer, then reaped by a claim loop)
+		// leaves a timer whose exact subject this broker can no longer name, so it
+		// needs a sweep — but the sweep must not reach a timer armed after the
+		// capture. The remote-takeover path really does interleave that way: an
+		// enqueue blocked behind this scan can land right after it and arm a timer
+		// for a record that is still pending, and stopping it would drop that Will
+		// back to the 5s scan latency.
+		captured := s.snapshotWillTimersWithPrefix(prefix)
 		if err = as.cancelWillOutboxOnce(s, filter); err == nil {
+			// Conclusively completed: nothing captured before the scan can still be
+			// wanted. Deliberately not done after a failed pass — an indeterminate
+			// scan may have left records pending, and their timers must survive.
+			s.stopWillTimers(captured)
 			return nil
 		}
 	}
@@ -343,7 +424,13 @@ func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter stri
 		}
 		seq = smsg.Sequence + 1
 		rec := &mqttWillOutbox{}
-		if err := json.Unmarshal(smsg.Data, rec); err != nil || rec.State != mqttWillPending {
+		if err := json.Unmarshal(smsg.Data, rec); err != nil {
+			continue
+		}
+		if rec.State != mqttWillPending {
+			// Already resolved by a fire or a peer: nothing to cancel, but if this
+			// broker enqueued it we still hold a useless fire timer.
+			s.cancelWillTimer(smsg.Subject)
 			continue
 		}
 		rec.State = mqttWillCancelled
@@ -358,7 +445,15 @@ func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter stri
 			if cur != nil && cur.State == mqttWillPending {
 				return werr
 			}
+			s.cancelWillTimer(smsg.Subject)
+			continue
 		}
+		// Cancelled durably. Release the local fire timer so a long Will Delay does
+		// not retain it (and the account manager it captures) until FireAt. A no-op
+		// on a broker that did not enqueue this Will. This covers both a local
+		// reconnect and a remote takeover, since the origin broker runs this scan
+		// on the remote-disconnect path too.
+		s.cancelWillTimer(smsg.Subject)
 	}
 }
 
