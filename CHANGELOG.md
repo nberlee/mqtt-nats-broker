@@ -7,6 +7,22 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **Durable delayed-Will cancellation watermark.** Closes the reconnect-suppression
+  residual in the Layer-2 delayed-Will outbox: an obsolete Will could still fire
+  after a newer CONNECT that later finite-disconnected or deleted its session record.
+  A permanent per-client marker on a dedicated `$MQTT_willcancel` stream
+  (`MaxMsgsPer:1`, no age/size limits) is advanced at every accepted CONNECT as a
+  gating write — no success CONNACK until it lands, with a rollback transaction that
+  rejects the CONNECT and reconciles local state if it cannot. Sequences are compared
+  only within one `$MQTT_sess` incarnation, identified by a generated epoch
+  (`nuid:<NUID>`) stored in the session-stream metadata (`mqtt_sess_epoch`) and
+  carried on both the marker and each Will (`OriginSessEpoch`). When no marker is
+  present the fence falls back to the prior session-record rule; a marker-stream
+  outage defers pending Wills (never lost) until it recovers. **First-release storage
+  format:** the pre-release in-record Will migration path (`Migrated` field, migration
+  worker, terminal tombstones) is removed, and a `$MQTT_sess` stream without a valid
+  generated epoch is rejected with recreate guidance. Back up/restore/recreate
+  `$MQTT_sess` and `$MQTT_willcancel` as one unit.
 - Project scaffold: Go module, config (`internal/config`), NATS/JetStream backend
   with auth-passthrough dial (`internal/backend`), runnable entrypoint with
   health/readiness endpoints.

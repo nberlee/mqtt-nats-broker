@@ -224,6 +224,24 @@ const (
 	mqttWillQStreamName    = "$MQTT_willq"
 	mqttWillQSubjectPrefix = mqttPrefix + "willq."
 
+	// Stream name and subject prefix for the durable per-client delayed-Will
+	// cancellation watermark (one subject per client, MaxMsgsPer:1, permanent
+	// retention). A CONNECT-accept advances the client's watermark to its session
+	// save sequence; the takeover fence suppresses any older-generation Will whose
+	// origin sequence is below it, even after the session record is gone. Kept on a
+	// dedicated stream so the willq claim/cancel scans are not slowed by permanent
+	// per-client markers. See will_outbox.go.
+	mqttWillCancelStreamName    = "$MQTT_willcancel"
+	mqttWillCancelSubjectPrefix = mqttPrefix + "willcancel."
+
+	// Reserved $MQTT_sess metadata key holding the generated stream-incarnation
+	// epoch, and the only valid epoch form: "nuid:<22-character NUID>". The epoch
+	// is an identity token (equality only), so a session sequence is comparable to
+	// a watermark or Will origin sequence only when their epochs match. See
+	// resolveSessStreamEpoch.
+	mqttSessEpochMetaKey    = "mqtt_sess_epoch"
+	mqttSessEpochNUIDPrefix = "nuid:"
+
 	// Stream name and subject for incoming MQTT QoS2 messages
 	mqttQoS2IncomingMsgsStreamName          = "$MQTT_qos2in"
 	mqttQoS2IncomingMsgsStreamSubjectPrefix = mqttPrefix + "qos2.in."
@@ -423,6 +441,16 @@ type srvMQTT struct {
 type mqttSessionManager struct {
 	mu       sync.RWMutex
 	sessions map[string]*mqttAccountSessionManager // key is account name
+
+	// testSessCreateGate / testSessCreateObserve are instance-scoped test seams,
+	// nil in production. The gate is invoked after the $MQTT_sess lookup reports the
+	// stream absent and BEFORE createStream, so a test can barrier two racing
+	// managers at the exact lookup->create boundary; the observer receives the
+	// createStream outcome (created, err) so a test can prove exactly one manager
+	// won the create and the other saw JSStreamNameExistErr. See
+	// mqttCreateAccountSessionManager.
+	testSessCreateGate    func()
+	testSessCreateObserve func(created bool, err error)
 }
 
 type mqttAccountSessionManager struct {
@@ -453,6 +481,15 @@ type mqttAccountSessionManager struct {
 	rmsCache    *sync.Map                              // map[subject]mqttRetainedMsg
 	jsa         mqttJSA
 	domainTk    string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+
+	// sessStreamEpoch is the $MQTT_sess incarnation identity resolved once at
+	// account-manager init from the stream's mqtt_sess_epoch metadata (form
+	// "nuid:<NUID>"). It stamps every watermark (SessEpoch) and native Will record
+	// (OriginSessEpoch); a sequence is only comparable across the two when the
+	// epochs are equal. Immutable after init (read without lock). If a valid epoch
+	// cannot be resolved, the account manager is not published. See
+	// resolveSessStreamEpoch, willTakeoverFence.
+	sessStreamEpoch string
 
 	// Degraded mode, set once at creation (read without lock): per-message TTL
 	// could not be enabled on a pre-existing stream, so stored messages must
@@ -502,6 +539,32 @@ type mqttAccountSessionManager struct {
 	// are exercised deterministically. Nil in production. See
 	// reconcileRemoteSessionExpiry.
 	testReconcilePause func(idHash string)
+
+	// testCancelWatermarkLoad / testCancelWatermarkStore, when non-nil, replace the
+	// per-client cancel-watermark load / CAS store for THIS account manager only
+	// (instance-scoped). Set/read under mu. Used to drive the takeover fence off a
+	// planted/stale/corrupt watermark and to fail the CONNECT-side advance so the
+	// gating and failure transaction are exercised. Nil in production. See
+	// loadWillCancelWatermark / storeWillCancelWatermarkCAS.
+	testCancelWatermarkLoad  func(cidHash string) (*mqttWillCancelWatermark, uint64, mqttWillCancelStatus)
+	testCancelWatermarkStore func(subject string, expectSeq uint64, wm *mqttWillCancelWatermark) (uint64, error)
+
+	// testRollbackSessionStore / testRollbackSessionLoad, when non-nil, replace the
+	// session-record CAS store / load used ONLY by the CONNECT-accept watermark
+	// failure transaction (instance-scoped). Set/read under mu. Routed only through
+	// the rollback path so a test can fail the rollback (and its confirming re-read)
+	// without perturbing the initial es.save() or unrelated fence loads, exercising
+	// the rollbackIndeterminate classification. Nil in production. See
+	// rollbackAcceptedSession.
+	testRollbackSessionStore func(ps *mqttPersistedSession, idHash string, seq uint64) error
+	testRollbackSessionLoad  func(cidHash string) (*mqttPersistedSession, uint64, error)
+
+	// testRollbackDone, when non-nil, is invoked at the end of the CONNECT-accept
+	// watermark-failure transaction with the detached session and its classified
+	// result, so a test can assert the unconditional guarantees (es.c == nil, the
+	// result classification) precisely. Instance-scoped, set/read under mu, nil in
+	// production. See rollbackAcceptedSession.
+	testRollbackDone func(es *mqttSession, result rollbackResult)
 }
 
 // sessionReconcileState orders remote-expiry reconciliation workers for a single
@@ -1937,14 +2000,16 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 	// prior save's sequence — still a valid baseline, since any reconnect/takeover
 	// saves again with a strictly higher sequence. Captured here (post-save, before
 	// any reconnect) so a later higher session sequence means reconnect/takeover or
-	// a sweep, never an ordinary in-connection save. See mqttWillOutbox.OriginSessionSeq.
+	// a sweep, never an ordinary in-connection save. The epoch names the incarnation
+	// so the fence only compares this sequence within it. See mqttWillOutbox.
 	sess.mu.Lock()
 	originSessionSeq := sess.seq
 	sess.mu.Unlock()
+	originSessEpoch := asm.sessStreamEpoch
 
 	// Now handle the "will". This function will be a no-op if there is no "will" to
 	// send. The effective Session Expiry Interval bounds any Will Delay.
-	s.mqttHandleWill(c, expiry, originSessionSeq)
+	s.mqttHandleWill(c, expiry, originSessionSeq, originSessEpoch)
 }
 
 // Updates the MaxAckPending for all MQTT sessions, updating the
@@ -2564,7 +2629,10 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	if si, err := lookupStream(mqttSessStreamName, "sessions"); err != nil {
 		return nil, err
 	} else if si == nil {
-		// Create the stream for the sessions.
+		// Create the stream for the sessions. A generated incarnation epoch is
+		// stamped into the stream metadata at creation (the linearization point):
+		// whichever replica wins the create sets the authoritative epoch, and a
+		// create-race loser adopts it via the re-read in resolveSessStreamEpoch.
 		cfg := &StreamConfig{
 			Name:       mqttSessStreamName,
 			Subjects:   []string{mqttSessStreamSubjectPrefix + as.domainTk + ">"},
@@ -2572,13 +2640,32 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			Retention:  LimitsPolicy,
 			Replicas:   replicas,
 			MaxMsgsPer: 1,
+			Metadata:   map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 		}
-		if _, created, err := jsa.createStream(cfg); err == nil && created {
+		if gate := s.mqtt.sessmgr.testSessCreateGate; gate != nil {
+			gate() // test seam: barrier racing managers at the lookup->create boundary
+		}
+		_, created, cerr := jsa.createStream(cfg)
+		if observe := s.mqtt.sessmgr.testSessCreateObserve; observe != nil {
+			observe(created, cerr)
+		}
+		if cerr == nil && created {
 			as.transferUniqueSessStreamsToMuxed(s)
-		} else if isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create sessions stream for account %q: %v", accName, err)
+		} else if isErrorOtherThan(cerr, JSStreamNameExistErr) {
+			return nil, fmt.Errorf("create sessions stream for account %q: %v", accName, cerr)
 		}
 	}
+	// Resolve the authoritative session-stream incarnation epoch. This is a
+	// first-release requirement: a pre-existing $MQTT_sess without a valid
+	// generated epoch (e.g. development data from before this feature) fails
+	// initialization with actionable recreate guidance rather than being mutated
+	// or silently trusted. On success every accepted CONNECT and every native Will
+	// record is stamped with this identity. See resolveSessStreamEpoch.
+	epoch, eerr := resolveSessStreamEpoch(jsa)
+	if eerr != nil {
+		return nil, fmt.Errorf("resolve session-stream epoch for account %q: %w", accName, eerr)
+	}
+	as.sessStreamEpoch = epoch
 
 	// Delayed-Will durable outbox stream (Layer 2). Separate from the sessions
 	// stream so its per-Will subjects and sequences never interfere with the
@@ -2597,6 +2684,39 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		}
 		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
 			return nil, fmt.Errorf("create will outbox stream for account %q: %v", accName, err)
+		}
+	}
+
+	// Durable per-client delayed-Will cancellation watermark stream. Permanent
+	// per-client retention (MaxMsgsPer:1, no global message/byte/age limits so a
+	// marker is never evicted; DiscardOld so a CAS replacement of a client's prior
+	// watermark is never rejected). Creation success, a create-race loss, and the
+	// pre-existing-stream path all converge on an authoritative StreamInfo re-read
+	// and validateWillCancelStream: an incompatible development stream fails
+	// initialization with recreate guidance rather than being mutated in place.
+	{
+		cfg := &StreamConfig{
+			Name:       mqttWillCancelStreamName,
+			Subjects:   []string{mqttWillCancelSubjectPrefix + as.domainTk + ">"},
+			Storage:    FileStorage,
+			Retention:  LimitsPolicy,
+			Discard:    DiscardOld,
+			Replicas:   replicas,
+			MaxMsgsPer: 1,
+		}
+		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
+			return nil, fmt.Errorf("create will-cancel stream for account %q: %v", accName, err)
+		}
+		si, err := jsa.lookupStream(mqttWillCancelStreamName)
+		if err != nil {
+			return nil, fmt.Errorf("lookup will-cancel stream for account %q: %v", accName, err)
+		}
+		wantReplicas := 0
+		if opts.MQTT.StreamReplicas != 0 {
+			wantReplicas = replicas
+		}
+		if verr := validateWillCancelStream(si, as.domainTk, wantReplicas); verr != nil {
+			return nil, fmt.Errorf("will-cancel stream for account %q is not usable: %w; recreate $MQTT_willcancel with the required permanent-marker configuration", accName, verr)
 		}
 	}
 
@@ -2836,12 +2956,10 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		}
 	})
 
-	// Migrate any legacy in-record delayed Wills to the durable outbox, then run
-	// the delayed-Will claim loop on its own cadence. Tracked by willClaimWG (not
-	// grWG) so shutdown Phase 2 drains it before waiting on publisher workers.
+	// Run the delayed-Will claim loop on its own cadence. Tracked by willClaimWG
+	// (not grWG) so shutdown Phase 2 drains it before waiting on publisher workers.
 	s.willClaimWG.Add(1)
 	go func() {
-		as.migrateWillsToOutbox(s)
 		as.willClaimLoop(s, closeCh)
 	}()
 
@@ -5937,26 +6055,21 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash string, seq uint64, opts *Option
 	}
 }
 
-// Persists a session. Note that if the session's current client does not match
-// the given client, nothing is done.
+// buildPersistedSessionLocked builds the on-stream persisted form of the session.
+// sess.mu must be held. Shared by save() and the CONNECT-accept watermark-failure
+// rollback, so a rejected session is re-persisted (as disconnected) with its full
+// resumable state rather than a partial record.
 //
-// Lock not held on entry.
-func (sess *mqttSession) save() error {
-	if h := mqttTestSessSaveHook; h != nil {
-		if err := h(sess); err != nil {
-			return err
-		}
-	}
-	sess.mu.Lock()
-	// Persist only consumer configs that still correspond to a live subscription:
-	//   - Shared (DeliverGroup) consumers are group-owned and reconstructed from
-	//     SharedSubs on restore; never persist them in Cons (an older server would
-	//     delete the group durable in clear()).
-	//   - A plain consumer is persisted only while its subscription exists in Subs,
-	//     so a consumer removed from Subs but not yet torn down (e.g. UNSUBSCRIBE
-	//     persisting before teardown, or a rolled-back failed SUBSCRIBE) is not
-	//     written with no matching Subs entry. The level-up sid "<X> fwc" maps back
-	//     to the main membership key "<X>.>". Spec5 [4.8.2].
+// Persist only consumer configs that still correspond to a live subscription:
+//   - Shared (DeliverGroup) consumers are group-owned and reconstructed from
+//     SharedSubs on restore; never persist them in Cons (an older server would
+//     delete the group durable in clear()).
+//   - A plain consumer is persisted only while its subscription exists in Subs,
+//     so a consumer removed from Subs but not yet torn down (e.g. UNSUBSCRIBE
+//     persisting before teardown, or a rolled-back failed SUBSCRIBE) is not
+//     written with no matching Subs entry. The level-up sid "<X> fwc" maps back
+//     to the main membership key "<X>.>". Spec5 [4.8.2].
+func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 	var cons map[string]*ConsumerConfig
 	if len(sess.cons) > 0 {
 		cons = make(map[string]*ConsumerConfig, len(sess.cons))
@@ -5977,7 +6090,7 @@ func (sess *mqttSession) save() error {
 			cons = nil
 		}
 	}
-	ps := mqttPersistedSession{
+	return mqttPersistedSession{
 		Origin:            sess.jsa.id,
 		ID:                sess.id,
 		Clean:             sess.clean,
@@ -5992,6 +6105,20 @@ func (sess *mqttSession) save() error {
 		ExpiryInterval:    sess.expiryInterval,
 		DisconnectedAt:    sess.disconnectedAt,
 	}
+}
+
+// Persists a session. Note that if the session's current client does not match
+// the given client, nothing is done.
+//
+// Lock not held on entry.
+func (sess *mqttSession) save() error {
+	if h := mqttTestSessSaveHook; h != nil {
+		if err := h(sess); err != nil {
+			return err
+		}
+	}
+	sess.mu.Lock()
+	ps := sess.buildPersistedSessionLocked()
 	b, _ := json.Marshal(&ps)
 
 	domainTk, cidHash := sess.domainTk, sess.idHash
@@ -7285,6 +7412,26 @@ CHECK:
 		asm.removeSession(es, true)
 		return err
 	}
+	cidHash := getHash(cid)
+	// Durably advance this client's delayed-Will cancellation watermark to the
+	// session sequence just saved, BEFORE the success CONNACK. This is the
+	// authoritative, permanent suppression of any older-generation Will: unlike the
+	// best-effort cancelWillOutbox below, and unlike the session record (which a
+	// finite disconnect or clean start later removes), the watermark survives and
+	// keeps an obsolete Will suppressed. The CONNACK is therefore gated on this
+	// write (strict: no acknowledgement unless the suppression is durable). On
+	// failure the accepted session is rolled back to a well-defined, non-falsely-
+	// connected state and the CONNECT is rejected; the client retries. Note that
+	// c.mqtt.cp is still unset here, so the failing connection's own Will does not
+	// fire (mqttHandleWill no-ops on a nil cp). See advanceWillCancelWatermark.
+	es.mu.Lock()
+	candidate := es.seq
+	es.mu.Unlock()
+	if werr := asm.advanceWillCancelWatermark(cidHash, candidate); werr != nil {
+		s.Warnf("MQTT: rejecting CONNECT for client %q: could not durably advance delayed-Will cancel watermark: %v", cid, werr)
+		asm.rollbackAcceptedSession(s, es, cidHash, candidate, expiry)
+		return werr
+	}
 	// The connection is now accepted (session saved). A new connection for this
 	// client ID cancels any delayed Will pending from a previous connection,
 	// whether or not its session still existed (a clean-start client removes its
@@ -7296,7 +7443,7 @@ CHECK:
 	// with the reconnect regardless — blocking CONNECT on a JetStream outage would
 	// be worse than the rare chance the prior Will still fires under sustained
 	// unavailability. Spec5 [MQTT-3.1.2-8].
-	_ = asm.cancelWillOutbox(s, getHash(cid))
+	_ = asm.cancelWillOutbox(s, cidHash)
 	// Likewise cancel any pending session-expiry timer: this connection has resumed
 	// (or replaced) the session before it expired. Spec5 [3.1.2.11.2].
 	asm.cancelSessionExpiry(getHash(cid))
@@ -7724,7 +7871,7 @@ func mqttPayloadFormatIsUTF8(props []byte) bool {
 // MQTT 5.0 client that set a Will Delay Interval on a session that survives the
 // connection, publication is deferred so a timely reconnect can cancel it. Spec5
 // [3.1.3.2.2], [MQTT-3.1.2-8].
-func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, originSessionSeq uint64) {
+func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, originSessionSeq uint64, originSessEpoch string) {
 	c.mu.Lock()
 	if c.mqtt.cp == nil {
 		c.mu.Unlock()
@@ -7766,7 +7913,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, originSessionSe
 		if asm != nil && willAllowed {
 			// enqueueDelayedWill retries internally and logs on exhausted retries;
 			// there is nothing further to do on the disconnect path.
-			_ = asm.enqueueDelayedWill(s, idHash, will, props, user, fireAt, originSessionSeq)
+			_ = asm.enqueueDelayedWill(s, idHash, will, props, user, fireAt, originSessionSeq, originSessEpoch)
 		}
 		return
 	}

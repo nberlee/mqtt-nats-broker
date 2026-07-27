@@ -26,32 +26,35 @@
 //
 // Durable termination: a successful publish is made durably terminal
 // (publishing->done, retried against the record's latest sequence) BEFORE any
-// cleanup. Only then is a native record deleted (at the done sequence) and a
-// migrated record's tombstone kept. Because done is committed first, a failed
-// native delete cannot leave a re-fireable publishing record — the scanner reaps
-// the done record instead. See finalizeWillPublish.
+// cleanup. Only then is the record deleted (at the done sequence). Because done is
+// committed first, a failed delete cannot leave a re-fireable publishing record —
+// the scanner reaps the done record instead. See finalizeWillPublish.
 //
-// Takeover suppression is fenced by session generation: each delayed Will records
-// the persisted session-record sequence of the connection that created it
-// (OriginSessionSeq). Before the initial pending->publishing claim (and, best
-// effort, right after enqueue), the fence re-reads the current session record and
-// suppresses the Will iff a newer record (sequence > OriginSessionSeq) shows a
-// newer accepted connection without a later finite-disconnect stamp
-// (DisconnectedAt == 0). This closes the window where a reconnect's cancel scan
-// runs before the displaced connection's enqueue lands. A newer-but-disconnected
-// record fires like an absent one, so a legitimately delayed Will is never lost.
-// See willTakeoverFence.
+// Takeover suppression has two layers. The primary is a durable per-client
+// cancellation watermark on the dedicated $MQTT_willcancel stream: every accepted
+// CONNECT advances the client's marker to its session save sequence (a gating
+// write — no success CONNACK until it lands), stamped with the $MQTT_sess
+// incarnation epoch. Each delayed Will records the origin connection's session
+// sequence and epoch (OriginSessionSeq / OriginSessEpoch); the claimant fence
+// suppresses the Will when a current-epoch marker is strictly beyond it
+// (SessionSeq > OriginSessionSeq — the connection's own Will still fires), or when
+// the marker is from a different incarnation. This survives finite-disconnect and
+// session-record deletion, closing the reconnect-suppression residual that a
+// session-record fence alone could not. The secondary, unchanged layer is the
+// numeric session-record fence, used only as a fallback when no marker is present
+// (administrative marker loss): it suppresses iff a newer record (sequence >
+// OriginSessionSeq) shows a still-connected generation (DisconnectedAt == 0). See
+// willTakeoverFence and will_cancel.go.
 //
-// Residuals (why literal exactly-once remains impossible), classified distinctly:
+// Residual (why literal exactly-once remains impossible):
 //   - at-least-once duplicate: a crash between the external publish and the done
 //     commit republishes after the lease expires. This is the sanctioned duplicate.
-//   - reconnect-suppression residual: an obsolete Will can still fire after a
-//     reconnect when the fence sees a newer-but-disconnected record — a reconnect
-//     followed by a finite-expiry disconnect, or by deletion/absence of the record
-//     before the fence observes the reconnect. (A never-expire reconnect-then-
-//     disconnect keeps DisconnectedAt == 0 and stays suppressible.) A persisted
-//     per-connection generation token would close this fully; that is a larger
-//     design deliberately out of scope here.
+//
+// The reconnect-suppression residual is closed by the watermark and reopens only
+// under administrative loss of $MQTT_willcancel (documented as a degradation, not a
+// supported migration). This is a first-release format: pre-Layer-2 in-record
+// Wills, migrated outbox records, and a session stream without a valid generated
+// epoch are unsupported and rejected rather than carried forward.
 
 package mqtt
 
@@ -115,18 +118,20 @@ type mqttWillOutbox struct {
 	User         string        `json:"user,omitempty"`
 	FireAt       int64         `json:"fire"` // unix nanoseconds to publish at
 	State        mqttWillState `json:"state"`
-	ClaimOwner   string        `json:"owner,omitempty"`    // node name of the current publisher
-	ClaimUntil   int64         `json:"until,omitempty"`    // unix nanoseconds publish lease expiry
-	Migrated     bool          `json:"migrated,omitempty"` // legacy-migrated: terminal records are tombstoned, not deleted
-	Account      string        `json:"acct,omitempty"`     // diagnostic only
-	// OriginSessionSeq is the persisted session-record stream sequence captured at
-	// the disconnect that created this delayed Will (0 for legacy-migrated records,
-	// whose originating generation is unknown). It fences the takeover late-enqueue
-	// window: if, before this Will fires, a newer session record exists (sequence >
-	// OriginSessionSeq) AND that record shows a newer accepted connection without a
-	// later finite-disconnect stamp (DisconnectedAt == 0), a reconnect/takeover has
-	// superseded this connection and the Will is suppressed. See willTakeoverFence.
+	ClaimOwner   string        `json:"owner,omitempty"` // node name of the current publisher
+	ClaimUntil   int64         `json:"until,omitempty"` // unix nanoseconds publish lease expiry
+	Account      string        `json:"acct,omitempty"`  // diagnostic only
+	// OriginSessionSeq and OriginSessEpoch identify the accepted generation that
+	// created this delayed Will: the persisted session-record stream sequence and
+	// the $MQTT_sess incarnation epoch captured at the disconnect (mqtt.go:1942).
+	// A sequence is comparable only within one incarnation, so the fence compares
+	// OriginSessionSeq against a watermark/session sequence only when the epochs are
+	// equal. Every native record carries a nonzero sequence and a valid epoch; a
+	// zero sequence or empty/malformed epoch is corrupt and defers (there is no
+	// legacy/migrated compatibility path in the first release). See
+	// willTakeoverFence.
 	OriginSessionSeq uint64 `json:"oseq,omitempty"`
+	OriginSessEpoch  string `json:"oep,omitempty"`
 }
 
 // leaseValid reports whether the publishing claim lease is still valid at now.
@@ -203,7 +208,7 @@ func (jsa *mqttJSA) loadWillOutbox(subject string) (*mqttWillOutbox, uint64, err
 // success). If the durable enqueue still cannot be confirmed after the bounded
 // retries, the Will is published IMMEDIATELY as a fail-safe (trading the Will
 // Delay for not losing the Will) rather than left with no authority to fire it.
-func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64) error {
+func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
 	willID := nuid.Next()
 	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
 	rec := &mqttWillOutbox{
@@ -219,6 +224,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash strin
 		State:            mqttWillPending,
 		Account:          as.jsa.c.acc.GetName(),
 		OriginSessionSeq: originSessionSeq,
+		OriginSessEpoch:  originSessEpoch,
 	}
 	var err error
 	for attempt := 0; attempt < mqttWillEnqueueAttempts; attempt++ {
@@ -381,13 +387,23 @@ func (as *mqttAccountSessionManager) willClaimLoop(s *Server, closeCh chan struc
 
 // scanWillOutbox walks every outbox record for the account and acts per state:
 // a due pending record (or a publishing record whose lease expired) is claimed
-// via CAS pending/publishing->publishing and dispatched to a worker; a native
-// terminal record (cancelled/done) is deleted; migrated terminal records are
-// tombstoned (kept) so a lagging migrator cannot resurrect a fired Will.
+// via CAS pending/publishing->publishing and dispatched to a worker; a terminal
+// record (cancelled/done) is deleted. A tryFireWill that returns willScanAbort
+// (a transient/global cancel-watermark load failure) stops the scan after leaving
+// the record pending, so a marker-stream outage costs at most one JSA timeout per
+// scan rather than one per due record; the next interval retries. willClaimStopCh
+// is checked between records so Phase-2 shutdown does not continue a long scan.
 func (as *mqttAccountSessionManager) scanWillOutbox(s *Server) {
 	filter := mqttWillQAccountFilter(as.domainTk)
 	now := time.Now()
 	for seq := uint64(1); ; {
+		select {
+		case <-s.willClaimStopCh:
+			return
+		case <-s.quitCh:
+			return
+		default:
+		}
 		smsg, err := as.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, seq)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
@@ -403,27 +419,38 @@ func (as *mqttAccountSessionManager) scanWillOutbox(s *Server) {
 		switch rec.State {
 		case mqttWillPending:
 			if rec.FireAt <= now.UnixNano() {
-				as.tryFireWill(s, smsg.Subject, rec, smsg.Sequence, now)
+				if as.tryFireWill(s, smsg.Subject, rec, smsg.Sequence, now) == willScanAbort {
+					return
+				}
 			}
 		case mqttWillPublishing:
 			if !rec.leaseValid(now) {
 				as.tryFireWill(s, smsg.Subject, rec, smsg.Sequence, now) // crashed-publisher recovery
 			}
 		case mqttWillCancelled, mqttWillDone:
-			if !rec.Migrated {
-				_ = as.jsa.deleteMsg(mqttWillQStreamName, smsg.Sequence, false)
-			}
+			_ = as.jsa.deleteMsg(mqttWillQStreamName, smsg.Sequence, false)
 		}
 	}
 }
 
-// willFenceDecision is the tri-state outcome of the takeover fence.
+// willFenceDecision is the outcome of the takeover fence.
 type willFenceDecision int
 
 const (
-	willFenceProceed willFenceDecision = iota // fire: no superseding live connection observed
-	willFenceCancel                           // suppress: a live takeover superseded this connection
-	willFenceDefer                            // indeterminate: session record unreadable; resolve later
+	willFenceProceed willFenceDecision = iota // fire: no superseding generation observed
+	willFenceCancel                           // suppress: a newer generation superseded this connection
+	willFenceDefer                            // indeterminate/corrupt for THIS record: resolve later
+	willFenceAbort                            // transient/global watermark-load failure: stop the scan
+)
+
+// willScanResult tells scanWillOutbox whether to keep walking records after a
+// pending-record claim attempt, or to stop because a transient/global
+// cancel-watermark load failure would otherwise cost one JSA timeout per record.
+type willScanResult int
+
+const (
+	willScanContinue willScanResult = iota
+	willScanAbort
 )
 
 // loadFenceSession loads and decodes the persisted session record for a client
@@ -453,25 +480,61 @@ func (as *mqttAccountSessionManager) loadFenceSession(cidHash string) (*mqttPers
 }
 
 // willTakeoverFence decides whether a delayed Will must be suppressed because a
-// reconnect/takeover superseded the connection that created it. Migrated records
-// (OriginSessionSeq == 0) always proceed: their originating generation is unknown.
-// Otherwise it reads the current session record:
-//   - cancel: a newer record (sequence > OriginSessionSeq) shows a currently
-//     connected generation (DisconnectedAt == 0) — a real takeover. (DisconnectedAt
-//     == 0 does not literally mean "connected now": a never-expire disconnect skips
-//     its disconnect save and also leaves it 0; combined with the newer sequence it
-//     proves a newer accepted connection without a later finite-disconnect stamp,
-//     which is exactly what to suppress.)
-//   - proceed: the record is absent, unchanged, or newer-but-disconnected
-//     (DisconnectedAt > 0 — e.g. the expiry sweep stamped it, or a reconnect that
-//     has since taken a finite-expiry disconnect). A newer-but-disconnected record
-//     must still fire, like an absent one, or a legitimate Will would be lost.
-//   - defer: the session record could not be read (load/decode error); never act
-//     on a record we could not read.
+// newer generation superseded the connection that created it. The durable
+// per-client cancel watermark (advanced at every accepted CONNECT) is the
+// authoritative signal; the session record is only a fallback when no usable
+// watermark exists. Epoch is an identity: a sequence is comparable only within the
+// incarnation named by its epoch.
+//
+//   - defer: the record's origin is invalid (zero sequence, or empty/malformed
+//     epoch). Every native record is epoch-known; acting on an invalid origin could
+//     lose a legitimate Will or publish a suppressed one. There is no legacy/migrated
+//     compatibility path in the first release.
+//   - abort: the watermark load was transiently/globally indeterminate. The caller
+//     stops the scan so a marker outage costs one JSA timeout, not one per record.
+//   - defer: the watermark record itself is corrupt (this record only).
+//   - cancel: a valid current-epoch watermark proves a newer accepted generation —
+//     same epoch with SessionSeq > OriginSessionSeq, or a different (other-
+//     incarnation) origin epoch, which a current-epoch CONNECT necessarily supersedes.
+//   - otherwise (absent/stale watermark, or same-epoch watermark not newer): fall
+//     back to the session record via sessionRecordFence.
 func (as *mqttAccountSessionManager) willTakeoverFence(rec *mqttWillOutbox) willFenceDecision {
-	if rec.OriginSessionSeq == 0 {
-		return willFenceProceed
+	if rec.OriginSessionSeq == 0 || !mqttValidSessEpoch(rec.OriginSessEpoch) {
+		return willFenceDefer
 	}
+	wm, _, status := as.loadWillCancelWatermark(rec.ClientIDHash)
+	switch status {
+	case mqttWillCancelIndeterminate:
+		return willFenceAbort
+	case mqttWillCancelCorrupt:
+		return willFenceDefer
+	case mqttWillCancelValid:
+		// wmValid implies wm.SessEpoch == as.sessStreamEpoch. If the Will's origin
+		// epoch differs, it is from another incarnation and is superseded; if it
+		// matches, compare sequences within that incarnation.
+		if wm.SessEpoch != rec.OriginSessEpoch {
+			return willFenceCancel
+		}
+		if wm.SessionSeq > rec.OriginSessionSeq {
+			return willFenceCancel
+		}
+		return as.sessionRecordFence(rec)
+	default: // mqttWillCancelAbsent, mqttWillCancelStaleEpoch
+		return as.sessionRecordFence(rec)
+	}
+}
+
+// sessionRecordFence is the pre-watermark session-record fence, retained as the
+// fallback when no usable watermark exists (absent or stale epoch). It reads the
+// current session record: a newer record (sequence > OriginSessionSeq) with
+// DisconnectedAt == 0 (a newer accepted connection without a later finite-disconnect
+// stamp) is a takeover -> cancel; absent/unchanged/newer-but-disconnected -> proceed;
+// an unreadable record -> defer. Its numeric comparison is only meaningful within
+// one $MQTT_sess incarnation; when the marker stream and session stream are recreated
+// together (the supported operation) the origin epoch keeps the watermark path exact,
+// and this fallback carries the documented residual only for unsupported partial
+// recreation.
+func (as *mqttAccountSessionManager) sessionRecordFence(rec *mqttWillOutbox) willFenceDecision {
 	ps, seq, err := as.loadFenceSession(rec.ClientIDHash)
 	if err != nil {
 		return willFenceDefer
@@ -489,8 +552,10 @@ func (as *mqttAccountSessionManager) willTakeoverFence(rec *mqttWillOutbox) will
 // publishing with a fresh lease, then dispatches a publisher worker through the
 // shutdown-aware admission gate. A lost CAS (a reconnect cancelled it, or a peer
 // claimed it) is a no-op. If the gate is closed (shutdown Phase 2), the record
-// is left publishing for post-restart recovery.
-func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec *mqttWillOutbox, seq uint64, now time.Time) {
+// is left publishing for post-restart recovery. Returns willScanAbort only when the
+// pending-record fence hit a transient/global watermark-load failure, so the caller
+// stops the scan; every other outcome returns willScanContinue.
+func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec *mqttWillOutbox, seq uint64, now time.Time) willScanResult {
 	// Fence only the initial pending->publishing claim. A record that is already
 	// publishing (crashed-publisher recovery) is an irrevocable, due generation:
 	// the fence must never cancel a record a peer was mid-publishing.
@@ -503,9 +568,11 @@ func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec 
 				// later scan re-resolves. Harmless either way.
 				s.Debugf("MQTT: unable to cancel superseded delayed Will %q: %v", rec.WillID, err)
 			}
-			return
+			return willScanContinue
 		case willFenceDefer:
-			return // indeterminate session read: leave pending for a later scan
+			return willScanContinue // indeterminate/corrupt for this record: leave pending
+		case willFenceAbort:
+			return willScanAbort // transient/global marker outage: stop the scan
 		}
 	}
 	rec.State = mqttWillPublishing
@@ -513,22 +580,22 @@ func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec 
 	rec.ClaimUntil = now.Add(mqttWillClaimLease).UnixNano()
 	newSeq, err := as.jsa.storeWillOutboxCAS(subject, seq, rec)
 	if err != nil {
-		return
+		return willScanContinue
 	}
 	if !s.admitWillWorker() {
-		return
+		return willScanContinue
 	}
 	go as.willPublishWorker(s, subject, rec, newSeq)
+	return willScanContinue
 }
 
 // willPublishWorker publishes a claimed Will and then finalizes its record.
 // Tracked by willWorkerWG (admitted by tryFireWill). On a publish error the
 // record is left publishing so its lease expiry drives a retry (at-least-once).
 // On success the record is made durably terminal (publishing->done) BEFORE any
-// cleanup: only then is a native record deleted (at the done sequence) and a
-// migrated record's tombstone kept. Committing done first means a failed native
-// delete can no longer leave a re-fireable publishing record — the scanner reaps
-// the done record instead.
+// cleanup: only then is the record deleted (at the done sequence). Committing done
+// first means a failed delete can no longer leave a re-fireable publishing record —
+// the scanner reaps the done record instead.
 //
 // The worker does not renew its lease: the lease (mqttWillClaimLease, 30s) is
 // sized well above the publish timeout (the JSA request timeout, seconds), so a
@@ -548,11 +615,8 @@ func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string
 		// loss is not.
 		return
 	}
-	if rec.Migrated {
-		return // migrated terminal records are tombstoned (done), never deleted
-	}
 	if doneSeq == 0 {
-		return // native record already gone (a peer finalized+deleted it)
+		return // record already gone (a peer finalized+deleted it)
 	}
 	if err := as.jsa.deleteMsg(mqttWillQStreamName, doneSeq, true); err != nil {
 		s.Debugf("MQTT: unable to delete published Will %q: %v", rec.WillID, err)
@@ -565,8 +629,8 @@ func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string
 // On a CAS failure it re-reads and reconciles (same WillID throughout):
 //   - done: the write landed (ours, or a peer that also published) -> success at
 //     the re-read sequence.
-//   - native record absent: already finalized and deleted by a peer -> success
-//     with seq 0 (nothing left to delete).
+//   - record absent: already finalized and deleted by a peer -> success with seq 0
+//     (nothing left to delete).
 //   - still publishing (our own failed/ambiguous CAS left it unchanged, or a peer
 //     reclaimed it after lease expiry): retry the done CAS at the re-read sequence.
 //   - a foreign WillID, or an unexpected state (cancelled/pending): abandon
@@ -588,10 +652,7 @@ func (as *mqttAccountSessionManager) finalizeWillPublish(s *Server, subject stri
 			continue // indeterminate load: retry
 		}
 		if cur == nil {
-			if !rec.Migrated {
-				return 0, true // native record already finalized+deleted by a peer
-			}
-			continue // a migrated tombstone should never vanish: retry
+			return 0, true // record already finalized+deleted by a peer
 		}
 		if cur.WillID != rec.WillID {
 			s.Warnf("MQTT: delayed Will %q finalize found a foreign record on %q (state %q, wid %q); abandoning finalize", rec.WillID, subject, cur.State, cur.WillID)
@@ -647,7 +708,7 @@ func (as *mqttAccountSessionManager) deliverWillRecord(s *Server, rec *mqttWillO
 	subject, err := mqttTopicToNATSPubSubject([]byte(rec.Topic))
 	if err != nil {
 		// A malformed topic can never be published; drop it rather than retry
-		// forever. Returning nil lets the caller finalize (delete/tombstone).
+		// forever. Returning nil lets the caller finalize (delete).
 		s.Warnf("MQTT: dropping delayed Will %q with invalid topic %q: %v", rec.WillID, rec.Topic, err)
 		return nil
 	}
@@ -669,79 +730,4 @@ func (as *mqttAccountSessionManager) deliverWillRecord(s *Server, rec *mqttWillO
 	err = s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp, _EMPTY_)
 	c.flushClients(0)
 	return err
-}
-
-// migrateWillsToOutbox converts delayed Wills persisted in legacy session records
-// (mqttPersistedSession.Will, written by a pre-Layer-2 build) into outbox events,
-// then clears the Will from the session record. Idempotent across replicas and
-// restarts: the WillID is derived deterministically from the account, client
-// hash, and FireAt, and creation is create-only CAS, so at most one replica wins
-// and a terminal tombstone blocks re-creation of an already-fired Will. Runs once
-// at account-manager start, before the claim loop's first scan.
-func (as *mqttAccountSessionManager) migrateWillsToOutbox(s *Server) {
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT legacy-Will migration scan ended: %v", err)
-			}
-			return
-		}
-		seq = smsg.Sequence + 1
-		ps := &mqttPersistedSession{}
-		if err := json.Unmarshal(smsg.Data, ps); err != nil || ps.Will == nil {
-			continue
-		}
-		cidHash := getHash(ps.ID)
-		w := ps.Will
-		willID := "mig-" + getHash(as.domainTk+cidHash+strconv.FormatInt(w.FireAt, 10))
-		rec := &mqttWillOutbox{
-			WillID:       willID,
-			ClientIDHash: cidHash,
-			Topic:        w.Topic,
-			Msg:          w.Msg,
-			QoS:          w.QoS,
-			Retain:       w.Retain,
-			Props:        w.Props,
-			User:         w.User,
-			FireAt:       w.FireAt,
-			State:        mqttWillPending,
-			Migrated:     true,
-			Account:      as.jsa.c.acc.GetName(),
-			// OriginSessionSeq left 0: a legacy Will's originating connection
-			// generation is unknown, so migrated records bypass the takeover fence.
-		}
-		// Create-only CAS. The legacy copy may be cleared ONLY once the outbox
-		// durably holds this event — otherwise a transient store failure would
-		// remove the sole durable copy of the Will. On a create error, verify the
-		// subject already holds the matching event (a peer migrated it, or a
-		// terminal tombstone from a fired migrated Will); if not (transient
-		// failure), leave the legacy record for a later migration pass (a
-		// subsequent account-manager start).
-		subject := mqttWillQSubject(as.domainTk, cidHash, willID)
-		if _, err := as.jsa.storeWillOutboxCAS(subject, 0, rec); err != nil {
-			existing, _, lerr := as.jsa.loadWillOutbox(subject)
-			if lerr != nil || existing == nil || existing.WillID != willID {
-				continue // indeterminate: keep the legacy Will for a later pass
-			}
-		}
-		as.clearLegacyWill(s, ps, cidHash, smsg.Sequence)
-	}
-}
-
-// clearLegacyWill removes the Will from a legacy session record after migration:
-// a clean-session record that existed only to carry the Will is deleted, else the
-// Will field is cleared with an expected-sequence CAS (a concurrent writer wins).
-func (as *mqttAccountSessionManager) clearLegacyWill(s *Server, ps *mqttPersistedSession, cidHash string, seq uint64) {
-	if ps.Clean {
-		if err := as.jsa.deleteMsg(mqttSessStreamName, seq, true); err != nil {
-			s.Debugf("MQTT: unable to delete migrated clean-session Will record for %q: %v", ps.ID, err)
-		}
-		return
-	}
-	ps.Will = nil
-	if err := as.storeSessionRecordCAS(ps, cidHash, seq); err != nil {
-		s.Debugf("MQTT: unable to clear migrated legacy Will for %q: %v", ps.ID, err)
-	}
 }

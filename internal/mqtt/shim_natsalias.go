@@ -35,6 +35,7 @@ type (
 	StoredMsg                   = server.StoredMsg
 	StreamConfig                = server.StreamConfig
 	StreamInfo                  = server.StreamInfo
+	StreamSource                = server.StreamSource
 	User                        = server.User
 )
 
@@ -47,6 +48,7 @@ const (
 	MAX_CONTROL_LINE_SIZE    = server.MAX_CONTROL_LINE_SIZE
 	DeliverNew               = server.DeliverNew
 	DiscardNew               = server.DiscardNew
+	DiscardOld               = server.DiscardOld
 	DuplicateClientID        = server.DuplicateClientID
 	FileStorage              = server.FileStorage
 	InterestPolicy           = server.InterestPolicy
@@ -75,6 +77,7 @@ const (
 	JSStreamStoreFailedF     = server.JSStreamStoreFailedF
 	LEN_CR_LF                = server.LEN_CR_LF
 	LimitsPolicy             = server.LimitsPolicy
+	MemoryStorage            = server.MemoryStorage
 	ReplayInstant            = server.ReplayInstant
 	ServerShutdown           = server.ServerShutdown
 	TLSHandshakeError        = server.TLSHandshakeError

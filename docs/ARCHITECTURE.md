@@ -79,28 +79,52 @@ Two refinements keep the guarantee tight:
 
 - **Durable termination.** A successful publish is committed `publishing -> done`
   (retried against the record's latest sequence) *before* any cleanup; only then is
-  a native record deleted or a migrated record's tombstone kept. Committing `done`
-  first means a failed delete cannot leave a re-fireable `publishing` record — the
-  scanner reaps the `done` record instead.
-- **Takeover fence.** Each delayed Will records the session-record sequence of the
-  connection that created it (`OriginSessionSeq`). Before firing (and, best effort,
-  right after enqueue) the fence re-reads the session record and suppresses the Will
-  only when a newer record (sequence > `OriginSessionSeq`) shows *a newer accepted
-  connection without a later finite-disconnect stamp* (`DisconnectedAt == 0`) — a
-  real takeover. A newer-but-disconnected record fires like an absent one, so a
-  legitimately delayed Will is never lost. This closes the window where a reconnect's
-  cancel scan runs before the displaced connection's enqueue lands.
+  the record deleted (at the `done` sequence). Committing `done` first means a failed
+  delete cannot leave a re-fireable `publishing` record — the scanner reaps the
+  `done` record instead.
+- **Takeover fence (durable cancellation watermark).** The primary suppression is a
+  permanent per-client marker on the dedicated `$MQTT_willcancel` stream
+  (`MaxMsgsPer:1`, no age/size limits). Every accepted CONNECT advances the client's
+  marker to its session save sequence — a *gating* write: no success CONNACK is sent
+  until it lands (and a failed advance runs a rollback transaction that rejects the
+  CONNECT). Sequences are comparable only within one `$MQTT_sess` incarnation,
+  identified by a generated epoch (`nuid:<NUID>`) stored in the session-stream
+  metadata and carried on both the marker (`SessEpoch`) and each Will
+  (`OriginSessionSeq`, `OriginSessEpoch`). The claimant fence suppresses a Will when a
+  current-epoch marker is *strictly beyond* its origin sequence
+  (`SessionSeq > OriginSessionSeq` — the connection's own delayed Will, at an equal or
+  higher origin, still fires), or when the marker is from a different incarnation.
+  Because the marker is permanent, this holds even after the newer connection
+  finite-disconnects or its session record is deleted — the residual a session-record
+  fence alone could not close. When no marker is present (administrative loss), the
+  fence falls back to the numeric session-record rule (suppress iff a newer record
+  with `DisconnectedAt == 0`), and a marker-stream outage defers pending Wills (never
+  lost) until it recovers.
 
-Residuals that keep literal exactly-once impossible, classified distinctly:
+Residual that keeps literal exactly-once impossible:
 
 - *At-least-once duplicate* — a crash between the external publish and the `done`
   commit republishes after the lease expires (the sanctioned duplicate).
-- *Reconnect-suppression miss* — an obsolete Will can still fire after a reconnect
-  that is then followed by a finite-expiry disconnect, or by deletion/absence of the
-  session record before the fence observes the reconnect. A never-expire
-  reconnect-then-disconnect keeps `DisconnectedAt == 0` and stays suppressible. A
-  persisted per-connection generation token would close this fully; that is a larger
-  design deliberately out of scope.
+
+The reconnect-suppression miss is now closed by the durable watermark; it reopens
+only under administrative loss of `$MQTT_willcancel` (a documented degradation, not a
+supported migration). This is a first-release storage format: pre-Layer-2 in-record
+Wills, migrated outbox records, and a `$MQTT_sess` stream without a valid generated
+epoch are unsupported and rejected with recreate guidance rather than carried forward.
+
+Operational constraints for the marker:
+
+- **Back up, restore, delete, or recreate `$MQTT_sess` and `$MQTT_willcancel` as one
+  logical unit.** Recreating only `$MQTT_willcancel` loses suppression evidence and
+  reopens the residual until each affected client reconnects.
+- **Recreating `$MQTT_sess` requires restarting every bridge serving the account
+  before MQTT traffic resumes.** The incarnation epoch is captured once per account
+  manager (`as.sessStreamEpoch`); a live manager that outlives stream recreation
+  retains the stale epoch and stale session-CAS state. A process restart recreates the
+  manager and adopts the new epoch.
+- **Retention is intentionally unbounded**: one permanent marker per distinct client
+  ID ever seen (no `MaxAge`). Monitor `$MQTT_willcancel` message count and storage;
+  administrative pruning weakens the guarantee for the pruned client IDs.
 
 ## Backend seams (see docs/PORTING.md)
 

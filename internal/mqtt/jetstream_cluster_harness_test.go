@@ -271,10 +271,12 @@ func (c *testJetStreamCluster) describe() string {
 			fmt.Fprintf(&b, "\n  node %q: STOPPED", n.name)
 			continue
 		}
-		fmt.Fprintf(&b, "\n  node %q: routes=%d jsCurrent=%v metaLeader=%v willqLeader=%v willqCurrent=%v",
+		fmt.Fprintf(&b, "\n  node %q: routes=%d jsCurrent=%v metaLeader=%v willqLeader=%v willqCurrent=%v willcancelLeader=%v willcancelCurrent=%v",
 			n.name, n.ns.NumRoutes(), n.ns.JetStreamIsCurrent(), n.ns.JetStreamIsLeader(),
 			n.ns.JetStreamIsStreamLeader(testGlobalAccount, mqttWillQStreamName),
-			n.ns.JetStreamIsStreamCurrent(testGlobalAccount, mqttWillQStreamName))
+			n.ns.JetStreamIsStreamCurrent(testGlobalAccount, mqttWillQStreamName),
+			n.ns.JetStreamIsStreamLeader(testGlobalAccount, mqttWillCancelStreamName),
+			n.ns.JetStreamIsStreamCurrent(testGlobalAccount, mqttWillCancelStreamName))
 	}
 	return b.String()
 }

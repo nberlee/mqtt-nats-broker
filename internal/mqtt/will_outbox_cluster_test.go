@@ -300,3 +300,115 @@ func testMQTTExpectNothingFor(t testing.TB, r *mqttReader, d time.Duration) {
 		t.Fatalf("connection ended while checking for duplicate: %v", err)
 	}
 }
+
+// TestMQTTWillOutboxReplicatedWatermark (plan test 16, always-run): the durable
+// per-client cancellation marker stream $MQTT_willcancel is created R3 and current
+// on every node, and a watermark advanced through the bridge is replicated and
+// readable back as a valid current-epoch marker.
+func TestMQTTWillOutboxReplicatedWatermark(t *testing.T) {
+	c := testNewJetStreamCluster(t, 3)
+	b := c.startBroker(t, 0)
+
+	js, err := b.nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream context: %v", err)
+	}
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+		si, err := js.StreamInfo(mqttWillCancelStreamName)
+		if err != nil {
+			return fmt.Errorf("marker stream info: %w", err)
+		}
+		if si.Config.Replicas != 3 {
+			return fmt.Errorf("Config.Replicas=%d, want 3", si.Config.Replicas)
+		}
+		if si.Config.MaxMsgsPerSubject != 1 {
+			return fmt.Errorf("MaxMsgsPerSubject=%d, want 1", si.Config.MaxMsgsPerSubject)
+		}
+		if si.Cluster == nil || si.Cluster.Leader == "" || len(si.Cluster.Replicas) != 2 {
+			return fmt.Errorf("marker stream not R3-clustered: %+v", si.Cluster)
+		}
+		return nil
+	})
+	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
+
+	// Advance a watermark through the bridge and prove it replicated + reads back.
+	asm := testMQTTGetGlobalASM(t, b.s)
+	cidHash := "wmrepl-" + nuid.Next()
+	if err := asm.advanceWillCancelWatermark(cidHash, 42); err != nil {
+		t.Fatalf("advance watermark: %v", err)
+	}
+	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
+	wm, _, status := asm.loadWillCancelWatermark(cidHash)
+	if status != mqttWillCancelValid || wm.SessionSeq != 42 || wm.SessEpoch != asm.sessStreamEpoch {
+		t.Fatalf("watermark not durable/valid after replication: status=%v wm=%+v", status, wm)
+	}
+}
+
+// TestMQTTWillOutboxReplicatedWatermarkLeaderFailover (plan test 16, gated): a
+// watermark committed to the R3 marker stream remains authoritative across the loss
+// of its stream-leader node, and CONNECT-side advances recover after the election.
+func TestMQTTWillOutboxReplicatedWatermarkLeaderFailover(t *testing.T) {
+	if os.Getenv("MQTTNB_CLUSTER_FAILOVER_TESTS") != "1" {
+		t.Skip("set MQTTNB_CLUSTER_FAILOVER_TESTS=1 to run cluster failover tests")
+	}
+
+	c := testNewJetStreamCluster(t, 3)
+	b := c.startBroker(t, 0)
+
+	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
+	asm := testMQTTGetGlobalASM(t, b.s)
+	cidHash := "wmfailover-" + nuid.Next()
+	if err := asm.advanceWillCancelWatermark(cidHash, 7); err != nil {
+		t.Fatalf("advance watermark: %v", err)
+	}
+	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
+
+	// Stop ONLY the marker stream leader (2/3 quorum preserved).
+	leader := c.waitStreamLeader(t, testGlobalAccount, mqttWillCancelStreamName)
+	t.Logf("stopping $MQTT_willcancel stream-leader node %q", leader.name)
+	c.stopNode(leader)
+
+	// A new leader is elected among survivors and the marker stream is current.
+	newLeader := c.waitStreamLeader(t, testGlobalAccount, mqttWillCancelStreamName)
+	t.Logf("new $MQTT_willcancel stream-leader node %q", newLeader.name)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
+
+	// The pre-failover watermark is still authoritative.
+	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+		wm, _, status := asm.loadWillCancelWatermark(cidHash)
+		if status != mqttWillCancelValid || wm.SessionSeq != 7 {
+			return fmt.Errorf("watermark lost across failover: status=%v wm=%+v\n%s", status, wm, c.describe())
+		}
+		return nil
+	})
+
+	// A CONNECT-side advance recovers post-election (monotonic raise to 9).
+	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+		if err := asm.advanceWillCancelWatermark(cidHash, 9); err != nil {
+			return fmt.Errorf("advance after failover: %w\n%s", err, c.describe())
+		}
+		return nil
+	})
+	if wm, _, status := asm.loadWillCancelWatermark(cidHash); status != mqttWillCancelValid || wm.SessionSeq != 9 {
+		t.Fatalf("post-failover advance not durable: status=%v wm=%+v", status, wm)
+	}
+
+	// A REAL CONNECT through the surviving broker must succeed post-election — the
+	// gating watermark advance on the production path works after the leader loss.
+	oldTimeout := testMQTTTimeout
+	testMQTTTimeout = 30 * time.Second
+	defer func() { testMQTTTimeout = oldTimeout }()
+	checkFor(t, 25*time.Second, 250*time.Millisecond, func() error {
+		if !b.nc.IsConnected() {
+			return fmt.Errorf("broker not connected yet\n%s", c.describe())
+		}
+		return nil
+	})
+	cc, cr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wmfailover-real", cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
+	defer cc.Close()
+	testMQTTReadConnAckV5(t, cr)
+	if _, _, status := asm.loadWillCancelWatermark(getHash("wmfailover-real")); status != mqttWillCancelValid {
+		t.Fatalf("real post-election CONNECT must have advanced a valid marker, got %v", status)
+	}
+}
