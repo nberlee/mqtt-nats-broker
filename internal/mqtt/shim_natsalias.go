@@ -32,7 +32,9 @@ type (
 	JSPubAckResponse            = server.JSPubAckResponse
 	NkeyUser                    = server.NkeyUser
 	Permissions                 = server.Permissions
+	RePublish                   = server.RePublish
 	SubjectPermission           = server.SubjectPermission
+	SubjectTransformConfig      = server.SubjectTransformConfig
 	StoredMsg                   = server.StoredMsg
 	StreamConfig                = server.StreamConfig
 	StreamInfo                  = server.StreamInfo
@@ -43,10 +45,12 @@ type (
 const (
 	AckExplicit              = server.AckExplicit
 	AckNone                  = server.AckNone
+	AsyncPersistMode         = server.AsyncPersistMode
 	ClientClosed             = server.ClientClosed
 	ClientInfoHdr            = server.ClientInfoHdr
 	CR_LF                    = server.CR_LF
 	MAX_CONTROL_LINE_SIZE    = server.MAX_CONTROL_LINE_SIZE
+	DefaultPersistMode       = server.DefaultPersistMode
 	DeliverNew               = server.DeliverNew
 	DiscardNew               = server.DiscardNew
 	DiscardOld               = server.DiscardOld
@@ -70,19 +74,26 @@ const (
 	JSConsumerNotFoundErr    = server.JSConsumerNotFoundErr
 	JSExpectedLastSubjSeq    = server.JSExpectedLastSubjSeq
 	JSMessageTTL             = server.JSMessageTTL
+	JSMsgId                  = server.JSMsgId
 	JSNoMessageFoundErr      = server.JSNoMessageFoundErr
 	JSSequenceNotFoundErrF   = server.JSSequenceNotFoundErrF
 	JSStreamMsgDeleteFailedF = server.JSStreamMsgDeleteFailedF
 	JSStreamNameExistErr     = server.JSStreamNameExistErr
 	JSStreamNotFoundErr      = server.JSStreamNotFoundErr
 	JSStreamStoreFailedF     = server.JSStreamStoreFailedF
-	LEN_CR_LF                = server.LEN_CR_LF
-	LimitsPolicy             = server.LimitsPolicy
-	MemoryStorage            = server.MemoryStorage
-	ReplayInstant            = server.ReplayInstant
-	ServerShutdown           = server.ServerShutdown
-	TLSHandshakeError        = server.TLSHandshakeError
-	WriteError               = server.WriteError
+	// The two structural outcomes of a rejected expected-last-subject-sequence
+	// CAS: 10071 from the single-writer check, 10164 from the clustered inflight
+	// contention branches. Both mean "the subject is not at the expected
+	// sequence", never "the write landed".
+	JSStreamWrongLastSequenceConstantErr = server.JSStreamWrongLastSequenceConstantErr
+	JSStreamWrongLastSequenceErrF        = server.JSStreamWrongLastSequenceErrF
+	LEN_CR_LF                            = server.LEN_CR_LF
+	LimitsPolicy                         = server.LimitsPolicy
+	MemoryStorage                        = server.MemoryStorage
+	ReplayInstant                        = server.ReplayInstant
+	ServerShutdown                       = server.ServerShutdown
+	TLSHandshakeError                    = server.TLSHandshakeError
+	WriteError                           = server.WriteError
 )
 
 var (

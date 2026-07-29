@@ -134,6 +134,45 @@ All notable changes to this project are documented here. The format is based on
   See `docs/PORTING.md` ("Testing strategy").
 
 ### Fixed
+- **Inbound QoS 2 PUBREL could lose the message outright.** `mqttProcessPubRel`
+  removed the hold record *before* the onward store, so three windows discarded the
+  message and then told the client the exactly-once exchange had succeeded: a delete
+  JetStream committed while its response was lost (or a crash right after the
+  commit), a delete that succeeded followed by a failing onward store, and a
+  malformed record already deleted by the time its parse failed. The retry found
+  nothing and was answered `0x92`.
+
+  The hold record is now a two-state machine (`internal/mqtt/qos2_move.go`): a
+  create-only CAS writes `held`, the message is delivered onward **first**, and only
+  then does a CAS at the held record's exact sequence replace it with a terminal
+  `delivered` tombstone. A PUBREL that finds the tombstone answers `0x00` without
+  re-delivering — indefinitely, and independently of any deduplication window. Every
+  record carries an immutable `Nmqtt-Q2Gen` generation ID: the subject
+  `$MQTT.qos2.in.<hash>.<pi>` is reused across session generations, so a stream
+  sequence is not an identity, and the finalizer reconciles by generation and
+  abandons without mutating when it finds a foreign one rather than overwriting a
+  newer generation's undelivered payload. A record with no usable generation is
+  classified `corrupt` and disposed of, never mistaken for a duplicate. Cleanup that
+  leaves a *nonterminal* record now withholds the PUBCOMP until the delete is
+  confirmed, because a PUBCOMP frees the packet identifier; only the inert tombstone
+  is reaped asynchronously. Duplicate-PUBLISH detection moved from a brittle
+  `10077` + cause-text match to the structural CAS-rejection codes. The onward store
+  carries a stable `Nats-Msg-Id` derived from the generation, which narrows (but is
+  not relied on for) duplication of the *stored* copy on a retry.
+
+  Costs no extra round trips on the success path (load + store + commit, where the
+  old path was load + delete + store). Residual, documented in
+  `docs/CONFORMANCE.md`: the live core-NATS fan-out is at-least-once across the
+  store-to-commit interval, and the duplicate stored copy is suppressed only while
+  JetStream deduplication survives — which it does across a broker restart and a
+  stream-leader failover, but not across a nats-server process restart.
+
+  **Operational note:** `$MQTT_qos2in` changes from `DiscardNew`/`DiscardNewPer` to
+  `DiscardOld` so the terminal CAS replaces rather than being rejected. A stream that
+  does not match the required configuration now **fails broker startup** with
+  recreate guidance instead of being updated in place. Upgrading an existing
+  development store means stopping **all** brokers for the account and recreating the
+  stream — **this is not a rolling upgrade**.
 - **An MQTT client could read the entire internal `$MQTT.>` namespace by
   subscribing to it.** Only three delivery prefixes (`$MQTT.sub.`,
   `$MQTT.deliver.pubrel.`, `$MQTT.qsub.`) were rejected, carrying an upstream

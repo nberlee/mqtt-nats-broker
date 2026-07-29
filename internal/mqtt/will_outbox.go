@@ -822,7 +822,7 @@ func (as *mqttAccountSessionManager) deliverWillRecord(s *Server, rec *mqttWillO
 		pp.flags |= mqttPubFlagRetain
 	}
 	c.mqtt = &mqtt{pp: pp, asm: as, proto: mqttProtoLevel5}
-	err = s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp, _EMPTY_)
+	err = s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp, _EMPTY_, _EMPTY_)
 	c.flushClients(0)
 	return err
 }

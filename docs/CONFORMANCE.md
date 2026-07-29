@@ -197,32 +197,68 @@ Plain (non-shared) subscriptions have their own open item: an unacknowledged
 QoS 1/2 PUBLISH is currently dropped on UNSUBSCRIBE. The decided fix is a durable
 drain; see `docs/ROADMAP.md`.
 
-### Inbound QoS 2 PUBREL is not idempotent across the hold-record move
+### Inbound QoS 2 PUBREL is at-least-once across the unresolved move interval
 
-`mqttProcessPubRel` removes the QoS 2 hold record before storing the message for
-onward delivery. Two windows lose the message rather than duplicating it:
+The destructive move window that used to lose messages here is closed. The QoS 2
+hold record on `$MQTT_qos2in` is a two-state machine
+(`internal/mqtt/qos2_move.go`): a create-only CAS writes `held`, PUBREL delivers
+the message onward **first**, and only then does a CAS at the held record's exact
+sequence replace it with a terminal `delivered` tombstone. A later PUBREL that
+finds the tombstone answers `0x00` without re-delivering.
 
-- the delete is committed by JetStream but its response is lost, or the process
-  crashes immediately after the commit;
-- the delete succeeds and the onward store then fails.
+The guarantee, stated exactly:
 
-In both cases the hold record is gone with nothing delivered, so the client's
-PUBREL retry is answered `0x92` (packet identifier not found). Reversing the
-order would trade this for duplicate onward delivery, which QoS 2 forbids; a
-recoverable move protocol is required.
+> No silent loss on any PUBREL path. Once the terminal state commits, suppression
+> of re-delivery is indefinite and independent of the deduplication window, the
+> broker's lifetime, and the nats-server's. Across the *unresolved* interval
+> between the onward store and that commit, the durable (QoS 1/2 subscriber) path
+> is exactly-once only while deduplication survives; otherwise it is
+> at-least-once. The live core-NATS fan-out is at-least-once in that same interval
+> and cannot be made otherwise.
 
-What *is* handled: a hold lookup that fails for any reason other than "not
-found", and a hold delete that fails before JetStream acted on it, both suppress
-the PUBCOMP and close the connection instead of reporting `0x92`, so the client
-retries against intact session state.
+This is **not** "exactly-once across a nats-server restart", and should not be
+described that way.
 
-A hold record that was already removed between the lookup and the delete is
-reported as `0x92` and the loaded copy is not delivered. Both removers are
-possible — a concurrent PUBREL for the same packet identifier, which does deliver
-onward, and a session discard, which purges hold entries without delivering — so
-this is a choice between two wrong outcomes rather than a delegation of the
-delivery. Delivering the loaded copy would risk duplicating a concurrent PUBREL's
-delivery or resurrecting a message from a discarded session, which QoS 2 must not
-do; `0x92` states accurately that no session state for that identifier remains.
-When the remover was a session discard the message is dropped, which is a
-property of discarding the session, not of this branch.
+The deviations that remain:
+
+- **At-least-once live fan-out.** A failure between the core-NATS fan-out and the
+  terminal commit re-runs the fan-out on the PUBREL retry, so QoS 0 MQTT
+  subscribers, plain NATS subscribers and the retained store may see the message
+  twice. "I fanned out" cannot be committed atomically with the fan-out; the
+  window is one JetStream round trip wide and cannot be closed.
+- **Best-effort suppression of the duplicate stored copy in that same window.**
+  Each PUBREL attempt of one generation stores with the same `Nats-Msg-Id`
+  (derived from the record's immutable `Nmqtt-Q2Gen`), so JetStream deduplicates
+  the retry. That window is authoritative across a broker restart and a
+  stream-leader failover, but not across a nats-server process restart in which
+  the first copy had already been consumed and acked — `$MQTT_msgs` is
+  interest-retention, so the deduplication rebuild cannot see it. QoS 1/2
+  subscribers may then receive the message twice.
+- **A delivered exchange whose tombstone was already reaped answers a later PUBREL
+  `0x92`** rather than `0x00`. Absence is indistinguishable from never-existed,
+  and Spec5 sanctions `0x92` during recovery.
+- **A PUBREL racing a cross-broker session discard can deliver a message from a
+  discarded session once.** Narrow; the fix is a `held -> releasing` claim that
+  competes with the discard transition.
+- **A superseded PUBREL is answered `0x92` after its message was in fact
+  delivered.** When a newer session generation has taken the same
+  `(client, packet identifier)` subject, the finalizer abandons without mutating
+  anything and reports the identifier as gone. No loss, and the newer
+  generation's payload is untouched.
+
+What is handled rather than deviating: a hold lookup that fails for any reason
+other than "not found", a failed onward store, and an unconfirmed terminal commit
+all suppress the PUBCOMP and close the connection instead of reporting a result,
+so the client retries against intact session state. A record that cannot be
+identified or cannot be parsed, and one whose Message Expiry Interval elapsed
+while it was held, are each **released with a confirmed delete before** the client
+is answered — an unconfirmed cleanup withholds the PUBCOMP, because a PUBCOMP
+frees the packet identifier and the client's next PUBLISH on it would otherwise be
+matched against the surviving record.
+
+Operational note: `$MQTT_qos2in` requires `DiscardOld` and `MaxMsgsPer: 1` (plus
+the write, CAS, subject, acknowledgement, retention, deletion and purge semantics
+the protocol depends on). A non-conforming stream fails broker startup with
+recreate guidance rather than being mutated in place. Upgrading a pre-existing
+development store therefore means stopping **all** brokers for the account and
+recreating the stream; it is not a rolling upgrade.

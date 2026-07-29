@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +68,15 @@ type testJetStreamCluster struct {
 func testNewJetStreamCluster(t *testing.T, size int) *testJetStreamCluster {
 	t.Helper()
 	c := &testJetStreamCluster{name: "JSC-" + nuid.Next()}
+
+	// One store root for the whole cluster, taken BEFORE c.cleanup is registered.
+	// t.Cleanup is LIFO, so this ordering is what guarantees the directory removal
+	// runs AFTER every node has been shut down. Calling t.TempDir() per node (which
+	// registers its own removal later, and therefore runs earlier) deletes store
+	// directories out from under still-running servers: JetStream keeps writing
+	// during the removal and RemoveAll fails with "directory not empty" — a teardown
+	// failure that looks like a test failure and hides real ones.
+	root := t.TempDir()
 	t.Cleanup(c.cleanup)
 
 	clusterPorts := make([]int, size)
@@ -77,7 +88,7 @@ func testNewJetStreamCluster(t *testing.T, size int) *testJetStreamCluster {
 	routes := natsserver.RoutesFromStr(strings.Join(routeURLs, ","))
 
 	for i := 0; i < size; i++ {
-		c.newNode(t, clusterPorts[i], routes)
+		c.newNode(t, root, clusterPorts[i], routes)
 	}
 
 	c.waitFormed(t, size)
@@ -100,14 +111,21 @@ func testFreePort(t *testing.T) int {
 
 // newNode creates, starts and registers one embedded nats-server bound to the given
 // explicit cluster port, with the shared full route list.
-func (c *testJetStreamCluster) newNode(t *testing.T, clusterPort int, routes []*url.URL) *testJSClusterNode {
+func (c *testJetStreamCluster) newNode(t *testing.T, storeRoot string, clusterPort int, routes []*url.URL) *testJSClusterNode {
 	t.Helper()
+	name := "N-" + nuid.Next()
+	// A subdirectory of the cluster-wide root rather than its own t.TempDir(), so
+	// removal is ordered after node shutdown — see testNewJetStreamCluster.
+	storeDir := filepath.Join(storeRoot, name)
+	if err := os.MkdirAll(storeDir, 0o750); err != nil {
+		t.Fatalf("create store dir for node %q: %v", name, err)
+	}
 	opts := &natsserver.Options{
-		ServerName: "N-" + nuid.Next(),
+		ServerName: name,
 		Host:       "127.0.0.1",
 		Port:       -1,
 		JetStream:  true,
-		StoreDir:   t.TempDir(),
+		StoreDir:   storeDir,
 		NoSigs:     true, // three in-process servers must not each grab signal handlers
 		NoLog:      true, // per-node current-state checks are the diagnostics, not logs
 		Cluster: natsserver.ClusterOpts{
@@ -261,9 +279,16 @@ func (c *testJetStreamCluster) stopNode(n *testJSClusterNode) {
 }
 
 // describe returns a one-shot diagnostic snapshot for embedding in polling errors:
-// per-node route count, JetStream-current, metadata-leader, and $MQTT_willq
-// leader/current state.
+// per-node route count, JetStream-current, metadata-leader, and the
+// leader/current state of every MQTT stream a cluster test can hinge on.
+//
+// $MQTT_msgs and $MQTT_qos2in are included because the QoS 2 move tests are
+// otherwise undiagnosable on failure: "the subscriber saw two copies" is a
+// symptom of a $MQTT_msgs leader change (the deduplication story) and "the
+// terminal commit never landed" is a symptom of a $MQTT_qos2in one, and neither
+// can be told apart from a plain timeout without this.
 func (c *testJetStreamCluster) describe() string {
+	streams := []string{mqttWillQStreamName, mqttWillCancelStreamName, mqttStreamName, mqttQoS2IncomingMsgsStreamName}
 	var b strings.Builder
 	fmt.Fprintf(&b, "cluster %q:", c.name)
 	for _, n := range c.nodes {
@@ -271,12 +296,13 @@ func (c *testJetStreamCluster) describe() string {
 			fmt.Fprintf(&b, "\n  node %q: STOPPED", n.name)
 			continue
 		}
-		fmt.Fprintf(&b, "\n  node %q: routes=%d jsCurrent=%v metaLeader=%v willqLeader=%v willqCurrent=%v willcancelLeader=%v willcancelCurrent=%v",
-			n.name, n.ns.NumRoutes(), n.ns.JetStreamIsCurrent(), n.ns.JetStreamIsLeader(),
-			n.ns.JetStreamIsStreamLeader(testGlobalAccount, mqttWillQStreamName),
-			n.ns.JetStreamIsStreamCurrent(testGlobalAccount, mqttWillQStreamName),
-			n.ns.JetStreamIsStreamLeader(testGlobalAccount, mqttWillCancelStreamName),
-			n.ns.JetStreamIsStreamCurrent(testGlobalAccount, mqttWillCancelStreamName))
+		fmt.Fprintf(&b, "\n  node %q: routes=%d jsCurrent=%v metaLeader=%v",
+			n.name, n.ns.NumRoutes(), n.ns.JetStreamIsCurrent(), n.ns.JetStreamIsLeader())
+		for _, sn := range streams {
+			fmt.Fprintf(&b, " %s{leader=%v current=%v}", sn,
+				n.ns.JetStreamIsStreamLeader(testGlobalAccount, sn),
+				n.ns.JetStreamIsStreamCurrent(testGlobalAccount, sn))
+		}
 	}
 	return b.String()
 }

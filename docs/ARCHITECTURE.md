@@ -142,7 +142,7 @@ NATS traffic on those subjects:
 | `$MQTT.sess.<domain>.<hash>` | session records |
 | `$MQTT.JSA.<...>` | JetStream API replies and session-persist broadcasts |
 | `$MQTT.willq.*`, `$MQTT.willcancel.*` | delayed-Will outbox and cancel watermarks |
-| `$MQTT.qos2.in.*`, `$MQTT.out.*` | QoS 2 inbound dedup and PUBREL state |
+| `$MQTT.qos2.in.<hash>.<pi>`, `$MQTT.out.*` | inbound QoS 2 move state and outbound PUBREL state |
 | `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.qsub.*` | per-client delivery subjects |
 
 Anything able to read `$MQTT.msgs.>` reads every QoS 1/2 message in the account,
@@ -186,6 +186,51 @@ connection this ACL would break QoS 2 delivery and retained replay, and NATS
 evaluates deny before allow, so the three could not be carved back out. The
 conformance environment (`test/conformance/nats.conf`) ships this exact ACL, so
 the suite passing is what keeps that separation honest.
+
+## Inbound QoS 2 move protocol
+
+An inbound QoS 2 PUBLISH is **held** on `$MQTT_qos2in` under
+`$MQTT.qos2.in.<client-id-hash>.<packet-identifier>` and **moved** onto
+`$MQTT_msgs` when the client sends PUBREL. The move is recoverable rather than
+destructive: the message is delivered onward **first**, and only then is the hold
+record replaced. Implementation and the design invariants it obeys are in
+`internal/mqtt/qos2_move.go`.
+
+One subject carries two record states, and the same subject is reused across
+session generations (a session discard purges by client hash, while the subject is
+keyed by client hash *and* packet identifier):
+
+| state | shape | written by |
+|---|---|---|
+| `held` | the encoded PUBLISH plus `Nmqtt-Q2Gen: <22-char NUID>` | a **create-only** CAS (expected last subject sequence 0) |
+| `delivered` | empty body, the same `Nmqtt-Q2Gen` plus `Nmqtt-Q2Done: 1` | a CAS at the held record's **exact** sequence |
+
+`Nmqtt-Q2Gen` is the exchange's immutable identity, stamped once at PUBLISH time
+and never rewritten. Because subjects are reused, a stream sequence is **not** an
+identity: the finalizer compares generations and abandons without mutating
+anything when it finds a foreign one, so it can never replace a newer session
+generation's undelivered payload with its own tombstone. A record whose generation
+is missing, malformed, or declared more than once is classified `corrupt` — never
+`held` — and is disposed of rather than mistaken for a duplicate.
+
+The terminal tombstone is what makes a PUBREL retry safe indefinitely: a retry
+that finds it is answered `0x00` with no second delivery, independently of any
+deduplication window. The `Nats-Msg-Id` carried on the onward store (derived from
+the generation, so it is identical across every retry of one exchange) only
+narrows the window in which a retry duplicates the *stored* copy; correctness does
+not depend on it. See `docs/CONFORMANCE.md` for the exact guarantee and its
+residual deviations.
+
+`$MQTT_qos2in` must be `LimitsPolicy` + `DiscardOld` + `MaxMsgsPer: 1` (`DiscardOld`
+is what makes the terminal CAS a *replacement*; `MaxMsgsPer: 1` is what stops it
+appending and leaving a stale `held` record underneath), and must not withdraw the
+write, CAS, subject, acknowledgement, retention, deletion or purge semantics the
+protocol depends on. A stream that does not match **fails broker startup** with
+recreate guidance rather than being updated in place — updating it would be
+actively unsafe, since a broker still running the pre-move code would silently
+overwrite held records once the discard policy flipped. Upgrading a development
+store therefore means stopping **all** brokers for the account and recreating the
+stream, under the compatibility boundary above. This is not a rolling upgrade.
 
 ## JetStream domain
 

@@ -39,15 +39,26 @@ is fixed before feature work continues.
   API error identity no longer depends on the rendered `ApiError.Error()` form,
   but a change to the flattened cause wording itself would still defeat
   recognition.
-- [ ] Close the destructive PUBREL move window: `mqttProcessPubRel` removes the
-  QoS 2 hold record before the onward store, so a delete that JetStream commits
-  while its response is lost (or a crash right after the commit), and a delete
-  that succeeds followed by a failing onward store, both leave the hold gone with
-  nothing delivered. The client's PUBREL retry is then answered `0x92` and the
-  message is lost; a retry cannot be relied on in either case. Reversing the
-  order only trades this for duplicate onward delivery. Needs a recoverable move
-  protocol: a `Nats-Msg-Id` deduplication window on `$MQTT_msgs`, or a two-phase
-  move like the delayed-Will outbox.
+- [x] Close the destructive PUBREL move window. The QoS 2 hold record is now a
+  two-state machine (`internal/mqtt/qos2_move.go`): a create-only CAS writes
+  `held`, the message is delivered onward FIRST, and only then does a CAS at the
+  held record's exact sequence replace it with a terminal `delivered` tombstone. A
+  PUBREL that finds the tombstone answers `0x00` without re-delivering, for as
+  long as the tombstone exists — indefinitely, and independently of any
+  deduplication window. Every record carries an immutable `Nmqtt-Q2Gen` generation
+  ID; the finalizer reconciles by generation and abandons without mutating when it
+  finds a foreign one, so it can never overwrite a newer session generation's
+  record on a reused `(client, packet identifier)` subject. A stable
+  `Nats-Msg-Id` on `$MQTT_msgs` (whose deduplication window is a nats-server
+  default) narrows the remaining window in which a retry duplicates the *stored*
+  copy, but correctness does not rest on it. `$MQTT_qos2in` moved from
+  `DiscardNew`/`DiscardNewPer` to `DiscardOld` so the CAS is a replacement rather
+  than a rejection, and a non-conforming stream now fails startup with recreate
+  guidance — **this is not a rolling broker upgrade**. Residual: the live
+  core-NATS fan-out is at-least-once across the store-to-commit interval, and the
+  duplicate *stored* copy is suppressed only while deduplication survives (not
+  across a nats-server process restart). See "Inbound QoS 2 PUBREL is
+  at-least-once across the unresolved move interval" in `docs/CONFORMANCE.md`.
 - [ ] Keep a started QoS 2 delivery with its chosen shared-subscription client.
   `releaseSharedConsumer` discards a leaving member's QoS 1 *and* QoS 2 pending
   state, so a QoS 2 message the broker had already started sending is
@@ -70,6 +81,27 @@ is fixed before feature work continues.
   rather than deleting one. The plain-consumer drain alone must not tick this
   item as universally compliant — it closes only once the shared QoS 2 item above
   is also resolved.
+- [ ] Serialize session discard against inbound QoS 2 PUBREL release. A PUBREL
+  racing a cross-broker session discard can deliver a message from a discarded
+  session once (residual 4 of the move protocol). The intended fix is a
+  `held -> releasing` CAS claim on the hold record that competes with the
+  discard/cancel transition, so exactly one of "release it" and "discard it" wins.
+  Narrow and not a regression — the pre-move code had the same race with a worse
+  outcome — so it is a follow-up rather than a blocker.
+- [ ] Reap orphaned inbound QoS 2 hold records. Nothing reaps a `held` record whose
+  session record was lost, so it wedges its packet identifier until a later PUBLISH
+  on that identifier reaps it. Pre-existing: neither created nor worsened by the
+  move protocol, which added the terminal tombstone but no new leak.
+- [ ] Audit the remaining `$MQTT_*` streams for protocol prerequisites, deriving
+  each list from what that stream's owner actually does rather than copying
+  `validateQoS2InStream` wholesale — the required set genuinely differs per stream.
+  `$MQTT_willcancel` does CAS writes and permanent retention but never deletes or
+  purges by design, so `DenyDelete`/`DenyPurge` are *not* prerequisites there, while
+  `NoAck`, `Sealed`, `SubjectTransform`, `MaxMsgSize` and the other write/CAS-affecting
+  settings are; `validateWillCancelStream` currently checks state shape only.
+  `$MQTT_willq` does CAS writes plus terminal deletion, so deletion prerequisites do
+  apply. `$MQTT_sess` does CAS writes, deletion and cleanup. `$MQTT_willq` and
+  `$MQTT_sess` have no validator at all today.
 
 ## 1. Settle release decisions
 

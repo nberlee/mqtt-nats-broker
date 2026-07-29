@@ -14,25 +14,27 @@ import (
 )
 
 // Coverage for the JetStream error classification in the QoS 2 path: the
-// isJSErrCausedBy classifier itself, the inbound dedup store that depends on it,
-// and the PUBREL lookup/delete failures that must not be reported to the client
-// as 0x92 "packet identifier not found".
+// isJSErrCausedBy classifier itself, the inbound hold store, and the PUBREL
+// lookup failure that must not be reported to the client as 0x92 "packet
+// identifier not found".
 //
-// Not covered here, deliberately:
-//   - The ambiguous delete (JetStream committed the removal but the response was
-//     lost, or the process crashed after the commit). The hooks below fail before
-//     the request is issued, which is the only outcome a test can arrange; the
-//     ambiguous one is a tracked release blocker in docs/ROADMAP.md, not
-//     something these tests can assert.
-//   - The two PUBCOMP exits mqttProcessPubRel did not change: an expiry-dropped
-//     hold is already covered by TestMQTTv5QoS2ExpiryAgesDuringPubRel, and a
-//     malformed hold record is a broken-invariant path. Both keep answering the
-//     client because the single gated defer in mqttProcessPubRel clears
-//     sendPubComp only in the two classified-failure branches.
+// The ambiguous-delete gap this file used to declare uncovered is now covered
+// elsewhere: the move protocol makes a lost delete response survivable rather
+// than fatal, and the clustered tests in qos2_move_cluster_test.go exercise the
+// real thing (a node killed around the commit) instead of a hook that can only
+// fail before the request is issued. The move protocol's own branches — corrupt,
+// terminal, malformed, expired, store and commit — live in qos2_move_test.go.
 
 // A JetStream API error whose real cause is only present as interpolated text
 // must be classified by error code plus a confined cause comparison — never by
 // the rendered ApiError.Error() form, and never by a bare substring of it.
+//
+// The move protocol retired the store-failed/ErrMaxMsgsPerSubject row's
+// PRODUCTION use (duplicate PUBLISH is now a structural CAS rejection, see
+// isQoS2CASRejection), but the classifier itself is still load-bearing: it is how
+// releaseQoS2Record recognises a confirmed absence from a delete-failed error.
+// The rows are kept as classifier coverage, deliberately, not as a claim about
+// which path constructs them.
 func TestQoS2JSErrClassifier(t *testing.T) {
 	storeFailed := func(cause error) error {
 		return natsserver.NewJSStreamStoreFailedError(cause)
@@ -117,9 +119,10 @@ func TestQoS2JSErrClassifier(t *testing.T) {
 }
 
 // A DUP re-PUBLISH of a held QoS 2 packet identifier is rejected by the hold
-// stream's MaxMsgsPer=1 as a generic "store failed" carrying
-// ErrMaxMsgsPerSubject. That is the duplicate signal, so it must still produce a
-// PUBREC, and the message must be delivered onward exactly once on PUBREL.
+// record's create-only CAS (expected last subject sequence 0) with a structural
+// wrong-last-sequence code; the re-read that follows classifies the subject as
+// still `held`, which is the duplicate signal. It must still produce a PUBREC,
+// and the message must be delivered onward exactly once on PUBREL.
 func TestQoS2DupPublishStoresOnce(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -187,17 +190,41 @@ func testQoS2ExpectClientGone(t testing.TB, s *Server, clientID string) {
 	})
 }
 
-// testQoS2HoldEntry reports whether the QoS 2 hold entry on subject exists. It
-// takes the JSA rather than looking the client up, because the interesting checks
-// happen after the failing PUBREL has closed the connection. Any installed fault
-// hook must be cleared first (the callers do that).
+// testQoS2HoldEntry reports whether a HELD QoS 2 record exists on subject — not
+// merely any record. The distinction matters now that the same subject also
+// carries the terminal tombstone a committed move leaves behind: "something is
+// there" would conflate a message still awaiting release with one already
+// delivered, which is the difference these tests exist to pin down.
+//
+// It takes the JSA rather than looking the client up, because the interesting
+// checks happen after the failing PUBREL has closed the connection. Any installed
+// fault hook must be cleared first (the callers do that).
 func testQoS2HoldEntry(t testing.TB, jsa *mqttJSA, subject string) bool {
 	t.Helper()
-	stored, err := jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, subject)
-	if err != nil && isErrorOtherThan(err, JSNoMessageFoundErr) {
-		t.Fatalf("Unable to look up QoS2 hold entry on %q: %v", subject, err)
+	rec, _, err := jsa.loadQoS2Record(subject)
+	if err != nil {
+		t.Fatalf("Unable to look up QoS2 hold record on %q: %v", subject, err)
 	}
-	return stored != nil
+	return rec != nil && rec.state == mqttQoS2Held
+}
+
+// testQoS2NoRecord waits until subject carries no record at all. Terminal
+// tombstone cleanup is deliberately asynchronous (invariant 4 in qos2_move.go), so
+// a completed exchange leaves the subject empty only eventually; asserting it
+// synchronously would be a flake, and asserting nothing would let a leaked
+// tombstone pass unnoticed.
+func testQoS2NoRecord(t testing.TB, jsa *mqttJSA, subject string) {
+	t.Helper()
+	checkFor(t, testMQTTTimeout, 20*time.Millisecond, func() error {
+		rec, _, err := jsa.loadQoS2Record(subject)
+		if err != nil {
+			return fmt.Errorf("looking up %q: %w", subject, err)
+		}
+		if rec != nil {
+			return fmt.Errorf("subject %q still carries a %s record", subject, rec.state)
+		}
+		return nil
+	})
 }
 
 // A broker-side JetStream failure while releasing an inbound QoS 2 message must
@@ -221,21 +248,15 @@ func TestQoS2PubRelLookupFailureSuppressesPubComp(t *testing.T) {
 		})
 }
 
-// Same for a failure to remove the hold entry. The onward delivery must not
-// happen either: releasing the message while its hold entry survives would let a
-// later PUBLISH reusing the packet identifier be rejected as a duplicate, or
-// replay this payload on the next PUBREL.
-func TestQoS2PubRelDeleteFailureSuppressesPubComp(t *testing.T) {
-	testQoS2PubRelFailureSuppressesPubComp(t, "delete",
-		func(t *testing.T, stream, subject string, pi uint16) func() {
-			return setMQTTTestDeleteMsgHook(func(gotStream string, _ uint64) error {
-				if gotStream == stream {
-					return natsserver.NewJSStreamNotFoundError()
-				}
-				return nil
-			})
-		})
-}
+// The companion delete-failure test that used to live here has been retired
+// rather than renamed. Its premise inverted: the hold record is no longer deleted
+// BEFORE the onward delivery, so a failing delete on the happy path is not a
+// pre-dispatch failure at all. What replaces it is strictly stronger —
+// TestQoS2PubRelDoneRecordAnsweredWithoutRedelivery asserts that a failed
+// terminal cleanup leaves a tombstone that answers the retry 0x00 with NO second
+// delivery, and TestQoS2ExpiredReleaseFailureBlocksPIReuse asserts that a failed
+// NONterminal release withholds the PUBCOMP so the identifier cannot be reused
+// under a stale record.
 
 func testQoS2PubRelFailureSuppressesPubComp(t *testing.T, name string,
 	install func(t *testing.T, stream, subject string, pi uint16) func()) {
@@ -293,8 +314,7 @@ func testQoS2PubRelFailureSuppressesPubComp(t *testing.T, name string,
 
 	restoreOnce()
 
-	// The hold entry survived the failure, so the retry can complete. (Only the
-	// pre-dispatch failure is asserted here; see the file comment.)
+	// The hold record survived the failure, so the retry can complete.
 	if !testQoS2HoldEntry(t, jsa, subject) {
 		t.Fatalf("Expected the QoS2 hold entry to survive the %s failure", name)
 	}
@@ -315,85 +335,24 @@ func testQoS2PubRelFailureSuppressesPubComp(t *testing.T, name string,
 	testMQTTSendPIPacket(mqttPacketPubComp, t, cs, subPI)
 	testMQTTExpectNothing(t, rs)
 
-	if testQoS2HoldEntry(t, jsa, subject) {
-		t.Fatal("Expected the QoS2 hold entry to be released after the successful retry")
-	}
+	// The move committed, so the record must not be held any more; the tombstone
+	// it left behind is reaped asynchronously.
+	testQoS2NoRecord(t, jsa, subject)
 }
 
-// A hold record removed between the lookup and the delete (a concurrent PUBREL,
-// or a session discard purging it) must be answered 0x92 with the loaded copy NOT
-// delivered — not a suppressed PUBCOMP and a dropped connection, which would turn
-// a benign clustered race into a disconnect. See the tradeoff described at the
-// branch in mqttProcessPubRel: delivering could duplicate a concurrent PUBREL's
-// delivery or resurrect a discarded session's message.
-func TestQoS2PubRelHoldAlreadyDeletedReports92(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "raced-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer cs.Close()
-	testMQTTReadConnAckV5(t, rs)
-	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "raced/topic", opts: 2}})
-
-	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "raced-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer cp.Close()
-	testMQTTReadConnAckV5(t, rp)
-
-	pi := uint16(19)
-	testMQTTPublishV5(t, cp, 2, pi, "raced/topic", []byte("raced"))
-	testMQTTReadPIPacket(mqttPacketPubRec, t, rp, pi)
-
-	cl := testMQTTGetClient(t, s, "raced-pub")
-	jsa := cl.mqtt.sess.jsa
-	subject := cl.mqttQoS2InternalSubject(pi)
-	stored, err := jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, subject)
-	if err != nil || stored == nil {
-		t.Fatalf("Expected a QoS2 hold entry after PUBREC: stored=%v err=%v", stored, err)
-	}
-
-	// Model the race exactly: the PUBREL's lookup must SUCCEED (so the branch
-	// under test is the delete's, not the missing-PI one), and the entry must then
-	// be gone by the time the delete runs. The hook removes it for real — clearing
-	// itself first so the inner call goes through — and returns the same
-	// already-deleted error JetStream produces (a generic 10057 whose only record
-	// of the reason is ErrStoreMsgNotFound in its Description).
-	var once sync.Once
-	var restore func()
-	restore = setMQTTTestDeleteMsgHook(func(gotStream string, seq uint64) error {
-		if gotStream != mqttQoS2IncomingMsgsStreamName || seq != stored.Sequence {
-			return nil
-		}
-		var ret error
-		once.Do(func() {
-			restore()
-			if err := jsa.deleteMsg(gotStream, seq, true); err != nil {
-				ret = fmt.Errorf("test hook could not remove the hold entry: %w", err)
-				return
-			}
-			ret = natsserver.NewJSStreamMsgDeleteFailedError(ErrStoreMsgNotFound)
-		})
-		return ret
-	})
-	t.Cleanup(func() { setMQTTTestDeleteMsgHook(nil) })
-
-	testQoS2SendPubRel(t, cp, pi)
-	if reason, _ := testMQTTReadPubCompV5(t, rp, pi); reason != mqttReasonPacketIDNotFound {
-		t.Fatalf("Expected reason 0x%x for an already-removed hold entry, got 0x%x",
-			mqttReasonPacketIDNotFound, reason)
-	}
-	// The loaded copy must not have been delivered onward.
-	testMQTTExpectNothing(t, rs)
-	// And the connection stays up: a second PUBREL is answered the same way (the
-	// hook has fired and cleared itself, so this one takes the missing-PI path).
-	testQoS2SendPubRel(t, cp, pi)
-	if reason, _ := testMQTTReadPubCompV5(t, rp, pi); reason != mqttReasonPacketIDNotFound {
-		t.Fatalf("Expected reason 0x%x on retry, got 0x%x", mqttReasonPacketIDNotFound, reason)
-	}
-	if testQoS2HoldEntry(t, jsa, subject) {
-		t.Fatal("Expected the hold entry to be gone")
-	}
-}
+// The "hold record removed between the lookup and the delete" test has been
+// retired rather than renamed. Its mechanism no longer exists: it drove the race
+// through the deleteMsg hook, but after the reorder deleteMsg on the success path
+// is terminal cleanup that runs AFTER the commit, so the hook can no longer remove
+// or replace the held record in the load..commit window where that race lives.
+// Renaming it and keeping the hook would have produced a test that still passed
+// while exercising nothing.
+//
+// The two outcomes it was reaching for are now driven deterministically through
+// the pre-finalize seam, which is the only thing that can reach into that window:
+// TestQoS2FinalizeGoneAfterPurge (the record raced away) and
+// TestQoS2FinalizeDoesNotMutateNewGeneration (a newer generation took the
+// subject). Both live in qos2_move_test.go.
 
 // A PUBREL for a packet identifier the broker has no state for is a genuine
 // "not found" and keeps reporting 0x92 — the classification must not turn an

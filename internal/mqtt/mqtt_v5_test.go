@@ -3033,7 +3033,7 @@ func TestMQTTv5MaxPacketSizeQuotaExceeded(t *testing.T) {
 	// are larger. Setting max_payload one below this smallest form puts every QoS
 	// over the quota, while the raw PUBLISH packet (no NATS headers) stays under
 	// the advertised limit and so reaches the quota check, not the framing limit.
-	minEnc := mqttComputeNatsMsgSize(pp, false, 0, _EMPTY_, false)
+	minEnc := mqttComputeNatsMsgSize(pp, false, 0, _EMPTY_, false, _EMPTY_, _EMPTY_)
 
 	pubOver := func(t *testing.T, c net.Conn, qos byte, pi uint16) {
 		testMQTTPublishV5(t, c, qos, pi, "foo", payload)
@@ -3693,7 +3693,7 @@ func TestMQTTv5ServerReceiveMaximumRejectedPubNoSlot(t *testing.T) {
 		t.Fatalf("subject conversion: %v", err)
 	}
 	pp := &mqttPublish{topic: []byte("foo"), subject: subj, msg: big, sz: len(big)}
-	minEnc := mqttComputeNatsMsgSize(pp, false, 0, _EMPTY_, false)
+	minEnc := mqttComputeNatsMsgSize(pp, false, 0, _EMPTY_, false, _EMPTY_, _EMPTY_)
 
 	o := testMQTTDefaultOptionsV5()
 	o.MaxPayload = int32(minEnc - 1)
@@ -5387,8 +5387,18 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 	// QoS2 dedup-hold copy carries none. Match production so the boundary is exact.
 	origin := mqttOriginMarker([]byte("k"), "id", "subj", []byte("p"))
 	// This publish is not retained, so no Nmqtt-Ret header on either form.
-	delivery := mqttComputeNatsMsgSize(pp, false, mqttMessageExpiryTTL(props), origin, false) // QoS0/1 store form, QoS2 delivery form
-	hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, false)                               // QoS2 dedup-hold form
+	//
+	// The QoS 0/1 store form and the QoS 2 release form are no longer the same
+	// size: the inbound QoS 2 move protocol adds a Nats-Msg-Id to the release form
+	// so a retried PUBREL does not duplicate the stored copy. Compute the three
+	// QoS 2 forms separately and exactly as the preflight does, or this test would
+	// mask the stuck-loop failure it exists to guard (a PUBLISH accepted at PUBREC
+	// time and then permanently rejected by a later, larger form).
+	delivery := mqttComputeNatsMsgSize(pp, false, mqttMessageExpiryTTL(props), origin, false, _EMPTY_, _EMPTY_) // QoS0/1 store form
+	release := delivery + mqttQoS2MsgIdHeaderMax                                                                // QoS2 release form
+	hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, false, _EMPTY_, _EMPTY_) +
+		mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax // QoS2 dedup-hold form
+	terminal := mqttQoS2TerminalRecordMax() // QoS2 terminal tombstone form
 
 	sendPub := func(t *testing.T, c net.Conn, qos byte) {
 		vh := newMQTTWriter(0)
@@ -5436,12 +5446,14 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 		testMQTTPubV5Props(t, c, r, 1, false, 7, "foo", payload, props) // completes with PUBACK
 	})
 
-	// max_payload set to the larger of the two actual QoS2 forms. The message
+	// max_payload set to the largest of the THREE actual QoS2 forms. The message
 	// fits; only the old buggy sum (hold headers + TTL header) would reject it.
 	t.Run("qos2 not over-rejected", func(t *testing.T) {
 		maxp := hold
-		if delivery > maxp {
-			maxp = delivery
+		for _, form := range []int{release, terminal} {
+			if form > maxp {
+				maxp = form
+			}
 		}
 		o := testMQTTDefaultOptionsV5()
 		o.MaxPayload = int32(maxp)

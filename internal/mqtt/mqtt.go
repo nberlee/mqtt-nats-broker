@@ -407,9 +407,16 @@ func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
 // JetStream requests concurrently from other goroutines, and a blanket hook
 // would fail those too and turn these tests into misleading noise. Atomics for
 // the same reason as the save hook above.
+// mqttTestStoreMsgHookV is the same idea for storeMsg, predicated on the publish
+// subject (so a test can target only "$MQTT.msgs.>" or only "$MQTT.qos2.in.>" and
+// leave session persistence and JSA traffic alone). It also receives the encoded
+// message, which lets a test OBSERVE what was written — the Nats-Msg-Id stability
+// assertions need that and cannot get it any other way. Returning a non-nil error
+// fails the store without issuing the request; returning nil lets it proceed.
 var (
 	mqttTestLoadLastMsgHookV atomic.Pointer[func(stream, subject string) error]
 	mqttTestDeleteMsgHookV   atomic.Pointer[func(stream string, seq uint64) error]
+	mqttTestStoreMsgHookV    atomic.Pointer[func(subject string, hdrLen int, msg []byte) error]
 )
 
 // setMQTTTestLoadLastMsgHook installs (or, with nil, clears) the loadLastMsgFor
@@ -434,6 +441,18 @@ func setMQTTTestDeleteMsgHook(h func(stream string, seq uint64) error) func() {
 		mqttTestDeleteMsgHookV.Store(&h)
 	}
 	return func() { mqttTestDeleteMsgHookV.Store(prev) }
+}
+
+// setMQTTTestStoreMsgHook installs (or, with nil, clears) the storeMsg hook and
+// returns a function that restores the previous value.
+func setMQTTTestStoreMsgHook(h func(subject string, hdrLen int, msg []byte) error) func() {
+	prev := mqttTestStoreMsgHookV.Load()
+	if h == nil {
+		mqttTestStoreMsgHookV.Store(nil)
+	} else {
+		mqttTestStoreMsgHookV.Store(&h)
+	}
+	return func() { mqttTestStoreMsgHookV.Store(prev) }
 }
 
 var (
@@ -610,6 +629,36 @@ type mqttAccountSessionManager struct {
 	// loadWillCancelWatermark / storeWillCancelWatermarkCAS.
 	testCancelWatermarkLoad  func(cidHash string) (*mqttWillCancelWatermark, uint64, mqttWillCancelStatus)
 	testCancelWatermarkStore func(subject string, expectSeq uint64, wm *mqttWillCancelWatermark) (uint64, error)
+
+	// testQoS2HoldStore / testQoS2FinalizeStore / testQoS2Load, when non-nil,
+	// replace the inbound QoS 2 move protocol's create-only hold CAS, its terminal
+	// held->delivered CAS, and its classified record load, for THIS account manager
+	// only (instance-scoped). Set/read under mu. Each is routed separately so a test
+	// can fail exactly one step of the move — the reconcile loops only make sense
+	// when the OTHER steps still reach real JetStream. Nil in production. See
+	// qos2_move.go.
+	testQoS2HoldStore     func(subject string, expectSeq uint64, hdrLen int, msg []byte) (uint64, error)
+	testQoS2FinalizeStore func(subject, gen string, expectSeq uint64) (uint64, error)
+	testQoS2Load          func(subject string) (*mqttQoS2Record, uint64, error)
+
+	// testQoS2FinalizeDone, when non-nil, is invoked with the RESOLVED status of every
+	// terminal commit on THIS account manager (instance-scoped). Set/read under mu.
+	// It is the only way to assert what a finalize decided when its client cannot be
+	// asked: a cross-broker takeover closes the connection whatever the finalize
+	// concluded, so the wire carries no evidence, and a stalled finalize is
+	// indistinguishable from a displaced one to a reader. Nil in production. See
+	// finalizeQoS2Move.
+	testQoS2FinalizeDone func(subject, gen string, status mqttQoS2FinalizeStatus)
+
+	// testQoS2PreFinalize, when non-nil, is invoked immediately BEFORE the terminal
+	// held->delivered CAS, with the generation and sequence the PUBREL loaded. This
+	// is the only seam that can reach into the load..commit window, which is where
+	// every interesting race lives: a test uses it to purge the held record (driving
+	// Gone) or to replace it with a NEW generation (driving Superseded). The
+	// pre-existing deleteMsg hook cannot do either — after the reorder deleteMsg is
+	// terminal cleanup that runs AFTER the commit. A returned error aborts the
+	// finalize as indeterminate. Nil in production. See finalizeQoS2Move.
+	testQoS2PreFinalize func(subject, gen string, seq uint64) error
 
 	// testRollbackSessionStore / testRollbackSessionLoad, when non-nil, replace the
 	// session-record CAS store / load used ONLY by the CONNECT-accept watermark
@@ -2811,25 +2860,50 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		}
 	}
 
-	if si, err := lookupStream(mqttQoS2IncomingMsgsStreamName, "QoS2 incoming messages"); err != nil {
-		return nil, err
-	} else if si == nil {
-		// Create the stream for the incoming QoS2 messages that have not been
-		// PUBREL-ed by the sender. Subject is
-		// "$MQTT.qos2.<session>.<PI>", the .PI is to achieve exactly
-		// once for each PI.
+	// Inbound QoS 2 hold state. One record per (client, packet identifier) subject
+	// (MaxMsgsPer:1), holding either a `held` PUBLISH awaiting its PUBREL or the
+	// terminal `delivered` tombstone that a committed move leaves behind. DiscardOld
+	// is load-bearing, not a preference: the tombstone is written by a CAS at the
+	// held record's exact sequence, and the previous DiscardNew/DiscardNewPer
+	// configuration would REJECT that replacement instead of performing it.
+	//
+	// Losing DiscardNew also removes a backstop — an unguarded plain store on a hold
+	// subject would now silently overwrite live session state rather than being
+	// refused. storeQoS2HoldCAS and storeQoS2DoneCAS are therefore the only writers
+	// of these subjects; nothing else may store here.
+	//
+	// Creation success, a create-race loss, and the pre-existing-stream path all
+	// converge on an authoritative StreamInfo re-read and validateQoS2InStream: an
+	// incompatible development stream fails initialization with recreate guidance
+	// rather than being mutated in place. Mutating it would be actively unsafe —
+	// the moment one upgraded broker flipped the stream to DiscardOld, any old
+	// broker still running the pre-move plain store would silently overwrite held
+	// records instead of getting its duplicate rejection. This is NOT a rolling
+	// broker upgrade; see docs/ARCHITECTURE.md ("Compatibility boundary").
+	{
 		cfg := &StreamConfig{
-			Name:          mqttQoS2IncomingMsgsStreamName,
-			Subjects:      []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"},
-			Storage:       FileStorage,
-			Retention:     LimitsPolicy,
-			Discard:       DiscardNew,
-			MaxMsgsPer:    1,
-			DiscardNewPer: true,
-			Replicas:      replicas,
+			Name:       mqttQoS2IncomingMsgsStreamName,
+			Subjects:   []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"},
+			Storage:    FileStorage,
+			Retention:  LimitsPolicy,
+			Discard:    DiscardOld,
+			MaxMsgsPer: 1,
+			Replicas:   replicas,
 		}
 		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
 			return nil, fmt.Errorf("create QoS2 incoming messages stream for account %q: %v", accName, err)
+		}
+		si, err := jsa.lookupStream(mqttQoS2IncomingMsgsStreamName)
+		if err != nil {
+			return nil, fmt.Errorf("lookup QoS2 incoming messages stream for account %q: %v", accName, err)
+		}
+		wantReplicas := 0
+		if opts.MQTT.StreamReplicas != 0 {
+			wantReplicas = replicas
+		}
+		if verr := validateQoS2InStream(si, wantReplicas); verr != nil {
+			return nil, fmt.Errorf("QoS2 incoming messages stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required move-protocol configuration (this is not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
+				accName, verr, mqttQoS2IncomingMsgsStreamName)
 		}
 	}
 
@@ -3410,6 +3484,11 @@ func (jsa *mqttJSA) storeMsgNoWait(subject string, hdrLen int, msg []byte) {
 }
 
 func (jsa *mqttJSA) storeMsg(subject string, headers int, msg []byte) (*JSPubAckResponse, error) {
+	if h := mqttTestStoreMsgHookV.Load(); h != nil {
+		if err := (*h)(subject, headers, msg); err != nil {
+			return nil, err
+		}
+	}
 	smri, err := jsa.newRequest(mqttJSAMsgStore, subject, headers, msg)
 	if err != nil {
 		return nil, err
@@ -6451,13 +6530,21 @@ func (sess *mqttSession) clear(noWait bool) error {
 		}
 	}
 
-	// Purge this client's inbound QoS2 dedup/hold entries ($MQTT_qos2in,
-	// subject "$MQTT.qos2.in.<idHash>.<PI>"; see mqttQoS2InternalSubject). A
-	// discarded session must not leave these behind: they otherwise collide by
-	// PI with a later session for the same client ID (MaxMsgsPer=1 rejects the
-	// new PUBLISH as a duplicate) and can resurface stale payloads on PUBREL.
-	// Only on discard, never on resume: an inbound QoS2 message pending PUBREL
-	// is session state (Spec5 [4.1]) that a resumed session must keep.
+	// Purge this client's inbound QoS2 records ($MQTT_qos2in, subject
+	// "$MQTT.qos2.in.<idHash>.<PI>"; see mqttQoS2InternalSubject). The wildcard
+	// covers BOTH record states — held PUBLISHes and terminal tombstones — which is
+	// what the move protocol needs: a discarded session must leave neither behind.
+	// They otherwise collide by PI with a later session for the same client ID and
+	// can resurface stale payloads on PUBREL. Only on discard, never on resume: an
+	// inbound QoS2 message pending PUBREL is session state (Spec5 [4.1]) that a
+	// resumed session must keep.
+	//
+	// Note the scope mismatch this creates, which is why hold records carry an
+	// immutable generation ID: this purge is keyed by CLIENT HASH, while the hold
+	// subject is keyed by client hash AND packet identifier, so one subject is
+	// reused across session generations. A stream sequence is therefore not an
+	// identity here, and a CAS that keyed on one could overwrite a newer
+	// generation's record. See qos2_move.go, invariant 1.
 	if err := sess.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, mqttQoS2IncomingMsgsStreamSubjectPrefix+idHash+".>", noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
 		return fmt.Errorf("unable to purge QoS2 hold entries for session %q: %v", sess.id, err)
 	}
@@ -8457,7 +8544,14 @@ func mqttNoLocalSuppress(noLocal bool, originHash, subHash string) bool {
 // encodePP: whether to encode complete MQTT PUBLISH packet header information
 //   - false: initial delivery (QoS 0/1) needs only base header
 //   - true: QoS2 storage needs to encode Nmqtt-Subject and Nmqtt-Mapped
-func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool) int {
+//
+// msgId and q2Gen are the inbound-QoS 2 move protocol's two headers and are
+// mutually exclusive by construction: msgId (Nats-Msg-Id) rides the RELEASE form
+// stored onto $MQTT_msgs, q2Gen (Nmqtt-Q2Gen) rides the HOLD form stored onto
+// $MQTT_qos2in. Every other call site passes _EMPTY_ for both. This function must
+// stay byte-exact with mqttNewDeliverableMessage below: a disagreement makes
+// headerLen wrong and the stored message corrupt.
+func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool, msgId, q2Gen string) int {
 	size := len(hdrLine) +
 		len(mqttNatsHeader) + 2 + 2 + // 2 for ':<qos>', and 2 for CRLF
 		2 + // end-of-header CRLF
@@ -8490,6 +8584,20 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin s
 		size += len(JSMessageTTL) + 1 + // +1 for ':'
 			len(strconv.FormatUint(uint64(ttl), 10)) + 1 + 2 // +1 for 's', 2 for CRLF
 	}
+	// Inbound QoS 2 move protocol. See qos2_move.go: msgId makes a repeated
+	// RELEASE store non-duplicating for stream-backed subscribers, q2Gen is the
+	// hold record's immutable identity. Both are bounded by named constants that
+	// the max_payload preflight uses (mqttQoS2MsgIdHeaderMax /
+	// mqttQoS2GenHeaderMax), so a value longer than its bound would be accepted
+	// here and then rejected by the broker — only ever pass the fixed forms.
+	if len(msgId) > 0 {
+		size += len(JSMsgId) + 1 + // +1 for ':'
+			len(msgId) + 2 // 2 for CRLF
+	}
+	if len(q2Gen) > 0 {
+		size += len(mqttQoS2GenHeader) + 1 + // +1 for ':'
+			len(q2Gen) + 2 // 2 for CRLF
+	}
 	return size
 }
 
@@ -8502,8 +8610,8 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin s
 //	NATS/1.0\r\n
 //	Nmqtt-Pub:2foo.bar\r\n
 //	\r\n
-func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool) (natsMsg []byte, headerLen int) {
-	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, origin, retained)
+func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool, msgId, q2Gen string) (natsMsg []byte, headerLen int) {
+	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, origin, retained, msgId, q2Gen)
 
 	buf := bytes.NewBuffer(make([]byte, 0, size))
 
@@ -8562,6 +8670,26 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origi
 		buf.WriteByte(':')
 		buf.WriteString(strconv.FormatUint(uint64(ttl), 10))
 		buf.WriteByte('s')
+		buf.WriteString(_CRLF_)
+	}
+
+	// Inbound QoS 2 move protocol headers, sized identically above. Nats-Msg-Id
+	// on the RELEASE form gives the $MQTT_msgs store a deduplication key that is
+	// stable across every PUBREL retry of one hold generation; Nmqtt-Q2Gen on the
+	// HOLD form is that generation. This function is the SOLE writer of
+	// Nmqtt-Q2Gen onto a held record — storeQoS2HoldCAS adds only the expected-
+	// sequence header, and emitting the generation in both places would double it
+	// and invalidate every size bound. See qos2_move.go.
+	if len(msgId) > 0 {
+		buf.WriteString(JSMsgId)
+		buf.WriteByte(':')
+		buf.WriteString(msgId)
+		buf.WriteString(_CRLF_)
+	}
+	if len(q2Gen) > 0 {
+		buf.WriteString(mqttQoS2GenHeader)
+		buf.WriteByte(':')
+		buf.WriteString(q2Gen)
 		buf.WriteString(_CRLF_)
 	}
 
@@ -8660,17 +8788,39 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	// the Nats-TTL header that a Message Expiry Interval adds to the stored
 	// message. QoS2 is first held with the PUBLISH subject headers (no TTL) and
 	// later delivered with the TTL header (no subject headers); the two header
-	// sets never coexist, so we compare the two actual forms rather than sum them.
+	// sets never coexist, so we compare the actual forms rather than sum them.
+	//
+	// For QoS 2 there are THREE forms, and every one of them must fit: accepting a
+	// PUBLISH at PUBREC time that a later form then pushes past max_payload leaves
+	// the client retrying an identical packet forever with its hold record never
+	// released, which is worse than the loss this protocol fixes. Bounds come from
+	// named constants shared with the encoders (qos2_move.go), never from live
+	// values, because the preflight runs before either the generation or the hold
+	// record's sequence exists.
 	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
 		// The delivered form carries the Nmqtt-Origin header; the QoS2 hold copy
 		// does not (origin is re-derived from the client on PUBREL release). Both
 		// carry the Nmqtt-Ret marker for a retained publish (the hold copy so it
 		// survives to PUBREL).
 		retained := c.mqttOriginRetained(pp)
-		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin, retained)
+		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin, retained, _EMPTY_, _EMPTY_)
 		if qos == 2 {
-			if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained); hold > total {
+			// RELEASE form: the delivered form plus the Nats-Msg-Id that makes a
+			// repeated onward store non-duplicating.
+			total += mqttQoS2MsgIdHeaderMax
+			// HOLD form: the subject-encoded form plus the immutable generation header
+			// and the create-only expected-sequence header. The CAS header is NOT
+			// stripped before storage, so it counts.
+			if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained, _EMPTY_, _EMPTY_) +
+				mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax; hold > total {
 				total = hold
+			}
+			// TERMINAL form: an empty body, so its size does not depend on pp at all —
+			// for a small payload with a short topic it can be the largest of the three.
+			// Its failure mode is the worst available: the onward store succeeds, the
+			// commit is rejected for size, and every retry repeats the delivery.
+			if terminal := mqttQoS2TerminalRecordMax(); terminal > total {
+				total = terminal
 			}
 		}
 		if total > int(maxPayload) {
@@ -8774,7 +8924,17 @@ func (c *client) mqttStoredMsgTTL(pp *mqttPublish) uint32 {
 }
 
 func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, origin string) error {
-	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, origin)
+	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, origin, _EMPTY_)
+}
+
+// mqttInitiateMsgDeliveryDedup is mqttInitiateMsgDelivery for the inbound QoS 2
+// PUBREL release: the stored copy carries a Nats-Msg-Id derived from the hold
+// record's immutable generation, so a PUBREL retried after an unconfirmed move
+// does not write a second copy onto $MQTT_msgs. Best effort by design — the move
+// protocol's durable terminal state is what actually prevents re-delivery, and
+// the deduplication window only narrows the unresolved interval. See qos2_move.go.
+func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, origin, msgId string) error {
+	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, origin, msgId)
 }
 
 // mqttInitiateMsgDeliveryJSA is mqttInitiateMsgDelivery with an explicit
@@ -8787,7 +8947,12 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, origin stri
 // option, passed explicitly so it does not depend on which client (real or
 // internal) drives delivery: a normal PUBLISH passes c.mqttStampedOrigin(subj),
 // while a Will is server-originated and passes _EMPTY_. Spec5 [3.8.3.1].
-func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, origin string) error {
+//
+// msgId, when non-empty, is a Nats-Msg-Id for the $MQTT_msgs store so a repeated
+// store of the same logical message is deduplicated by JetStream. Only the
+// inbound QoS 2 PUBREL release passes one (see mqttInitiateMsgDeliveryDedup); it
+// is NOT set on the live fan-out's behalf, which is at-least-once regardless.
+func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, origin, msgId string) error {
 	// A stored (QoS 1/2) PUBLISH carrying an MQTT 5.0 Message Expiry Interval is
 	// given a matching JetStream per-message TTL so it is dropped from the
 	// delivery stream once its lifetime elapses. Spec5 [3.3.2.3.3]. Degraded
@@ -8797,7 +8962,7 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// during fan-out); record it for the Retain As Published option when v5 is
 	// enabled. Spec5 [3.8.3.1].
 	retained := c.mqttOriginRetained(pp)
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin, retained)
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin, retained, msgId, _EMPTY_)
 
 	// Set the client's pubarg for processing.
 	c.pa.subject = pp.subject
@@ -8857,32 +9022,103 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	return err
 }
 
+// mqttStoreQoS2MsgOnce stores an inbound QoS 2 PUBLISH as a HELD record on
+// $MQTT_qos2in, so it is not broadcast until the sender releases it with PUBREL.
+// Returning nil means "the client may be sent PUBREC": either this payload is now
+// durably held, or an identical held record for this packet identifier already is
+// (a DUP PUBLISH).
+//
+// This is a bounded create-and-reconcile loop, mirroring enqueueDelayedWill. The
+// create is a create-only CAS (expected last subject sequence 0), so a rejection
+// means "the subject is occupied" or "transient contention" — never "the write
+// landed". Only a re-read can tell those apart, and the re-read's classification
+// then decides:
+//
+//   - absent: the record raced away between the CAS and the read; retry the create.
+//   - corrupt: unusable, and checked BEFORE held — see below. Reap it and retry.
+//   - delivered: a tombstone from a completed earlier exchange on this identifier
+//     that terminal cleanup has not reaped yet. Reap it and retry; misreading it as
+//     a duplicate would silently lose THIS payload.
+//   - held: a genuine DUP PUBLISH; answer PUBREC without storing again.
+//
+// The held case is safe to treat as a duplicate because no path lets a client
+// believe an exchange finished while a held record survives (the corrupt, malformed
+// and expired branches all confirm their cleanup before PUBCOMP — invariant 3) and
+// clear() purges hold state on session discard. So a held record on this subject
+// always belongs to the exchange the client is currently retrying.
+//
+// Reaping is what must NOT be assumed: an unconfirmed reap leaves a nonterminal or
+// unidentifiable record in place, so it withholds PUBREC entirely (invariant 3, one
+// packet earlier) rather than proceeding.
 func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
+	asm := c.mqtt.asm
+	subject := c.mqttQoS2InternalSubject(pp.pi)
+
+	// The record's immutable identity for the whole exchange: it gates the terminal
+	// CAS (invariant 1) and becomes the onward store's Nats-Msg-Id. Generated once
+	// per PUBLISH, never rewritten.
+	gen := nuid.Next()
+
 	// `true` means encode the MQTT PUBLISH packet in the NATS message header. No
 	// TTL here: this is the QoS2 dedup hold stream (no AllowMsgTTL); the expiry
 	// TTL is applied when the message is moved to the delivery stream on PUBREL.
 	// The original RETAIN flag is recorded so Retain As Published survives the
 	// hold and is restored on PUBREL. Spec5 [3.8.3.1].
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_, c.mqttOriginRetained(pp))
+	//
+	// mqttNewDeliverableMessage is the sole writer of Nmqtt-Q2Gen onto the held
+	// record; storeQoS2HoldCAS adds only the expected-sequence header. Emitting the
+	// generation in both places would double the header and invalidate the
+	// max_payload bounds computed in mqttProcessPub.
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_, c.mqttOriginRetained(pp), _EMPTY_, gen)
 
-	// Do not broadcast the message until it has been deduplicated and released
-	// by the sender. Instead store this QoS2 message as
-	// "$MQTT.qos2.<client-id>.<PI>". If the message is a duplicate, we get back
-	// a ErrMaxMsgsPerSubject, otherwise it does not change the flow, still need
-	// to send a PUBREC back to the client. The original subject (translated
-	// from MQTT topic) is included in the NATS header of the stored message to
-	// use for latter delivery.
-	_, err := c.mqtt.sess.jsa.storeMsg(c.mqttQoS2InternalSubject(pp.pi), headerLen, natsMsg)
-
-	// The duplicate is detected as the hold stream's MaxMsgsPer=1 rejection,
-	// which JetStream reports as a generic "store failed" (10077) carrying
-	// ErrMaxMsgsPerSubject as its flattened cause. Classify it structurally: a
-	// duplicate is not an error here, the client still gets its PUBREC.
-	if err != nil && !isJSErrCausedBy(err, JSStreamStoreFailedF, ErrMaxMsgsPerSubject) {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < mqttQoS2StoreAttempts; attempt++ {
+		_, err := asm.storeQoS2HoldCAS(subject, 0, headerLen, natsMsg)
+		if err == nil {
+			return nil // freshly held; PUBREC
+		}
+		lastErr = err
+		if !isQoS2CASRejection(err) {
+			// A real store failure, not a contested subject. No PUBREC; the client
+			// retries the PUBLISH.
+			return err
+		}
+		rec, seq, lerr := asm.loadQoS2Record(subject)
+		if lerr != nil {
+			// Indeterminate: never guessed into an absence, because retrying the
+			// create-only CAS against a subject that actually holds a record would
+			// just fail again, and treating it as a duplicate would answer PUBREC for
+			// a payload we did not store.
+			return lerr
+		}
+		if rec == nil {
+			continue // raced away; retry the create
+		}
+		switch rec.state {
+		case mqttQoS2Corrupt:
+			// Checked before held, and it must never fall through to held: a record we
+			// cannot identify is not this PUBLISH's payload, and answering PUBREC for
+			// it means the following PUBREL releases the OLD record and reports 0x92
+			// while this payload is lost.
+			c.Errorf("Reaping unusable QoS2 hold record (%s)",
+				mqttQoS2CorruptDetail(subject, rec.stored, "no valid generation, or a malformed done marker"))
+			if st, rerr := asm.releaseQoS2Record(seq); st != mqttQoS2Released {
+				return rerr
+			}
+		case mqttQoS2Done:
+			// A leftover tombstone whose asynchronous cleanup has not landed yet
+			// (invariant 4 permits that). Reap it so this identifier is usable again.
+			if st, rerr := asm.releaseQoS2Record(seq); st != mqttQoS2Released {
+				return rerr
+			}
+		default: // mqttQoS2Held
+			return nil // genuine DUP PUBLISH; PUBREC
+		}
 	}
-
-	return nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("QoS2 hold not confirmed after %d attempts", mqttQoS2StoreAttempts)
+	}
+	return lastErr
 }
 
 func (c *client) mqttQoS2InternalSubject(pi uint16) string {
@@ -8894,18 +9130,33 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 
 // Process a PUBREL packet (QoS2, acting as Receiver).
 //
+// This is the recoverable MOVE half of the inbound QoS 2 exchange: the held record
+// is delivered onward FIRST and only then replaced by a terminal tombstone, so no
+// window can delete the message and then fail to deliver it. The branch order is
+// load, corrupt, delivered, malformed, expired, store, commit; see qos2_move.go for
+// the state machine, the four design invariants it obeys, and the honest guarantee
+// (no silent loss; exactly-once for durable subscribers only while deduplication
+// survives the unresolved store..commit interval).
+//
 // Runs from the client's readLoop.
 // No lock held on entry.
 func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// A PUBCOMP (with any reason, including 0x92) ends the exchange and returns
 	// the client's send-quota slot, so the two travel together: sendPubComp
 	// gates both. It stays true for every outcome that answers the client —
-	// success, an unknown PI, a malformed hold record, an expiry-dropped hold,
-	// and the onward-delivery result — and is cleared ONLY where a broker-side
-	// JetStream failure means the exchange is unfinished (below), because MQTT 5
+	// success, an unknown PI, a released corrupt or malformed record, an
+	// expiry-dropped hold, and a superseded finalize — and is cleared ONLY where a
+	// broker-side JetStream failure means the exchange is unfinished (an
+	// indeterminate lookup, a failed onward store, an unconfirmed terminal commit,
+	// or an unconfirmed nonterminal release), because MQTT 5
 	// gives PUBCOMP no reason code for "the broker failed" (only 0x00 and 0x92
 	// are defined) and answering anyway would tell the client an exactly-once
 	// exchange completed for a message still held. Spec5 [4.9], [MQTT-4.3.3-1].
+	//
+	// Freeing the identifier is exactly what makes unconfirmed cleanup unsafe, so
+	// the corrupt, malformed and expired branches below clear sendPubComp when their
+	// delete cannot be confirmed (invariant 3), while the terminal tombstone's
+	// delete is allowed to be asynchronous (invariant 4).
 	sendPubComp := true
 	reason := mqttReasonSuccess
 	var reasonStr string
@@ -8917,66 +9168,90 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		c.mqttEnqueuePubResponseReason(mqttPacketPubComp, pi, reason, reasonStr, trace)
 	}()
 
-	// See if there is a message pending for this pi.
+	subject := c.mqttQoS2InternalSubject(pi)
 	asm := c.mqtt.asm
-	stored, err := asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, c.mqttQoS2InternalSubject(pi))
+
+	// releaseNonterminal disposes of a record that is NOT a terminal tombstone
+	// (corrupt, malformed, or expiry-dropped) and reports whether the client may be
+	// answered. An unconfirmed delete must not be reported as done: PUBCOMP frees
+	// the packet identifier, and the client's next PUBLISH on it would then be
+	// matched against the surviving record and silently lost. Invariant 3.
+	releaseNonterminal := func(seq uint64, what string) error {
+		st, rerr := asm.releaseQoS2Record(seq)
+		if st == mqttQoS2Released {
+			return nil
+		}
+		sendPubComp = false
+		c.Errorf("Unable to release %s QoS2 hold record for packet identifier %v: %v", what, pi, rerr)
+		return rerr
+	}
+
+	// L: load and classify the current record on this identifier's hold subject.
+	rec, seq, err := asm.loadQoS2Record(subject)
 	switch {
-	case isErrorOtherThan(err, JSNoMessageFoundErr):
+	case err != nil:
 		// A broker-side lookup failure, NOT a missing PI. Nothing has been
-		// deleted or delivered yet, so the hold record is still there: suppress
-		// the PUBCOMP and close the connection so the client retries PUBREL with
-		// its session state intact.
+		// delivered or removed yet, so the record is still there: suppress the
+		// PUBCOMP and close the connection so the client retries PUBREL with its
+		// session state intact.
 		sendPubComp = false
 		c.Errorf("Unable to look up QoS2 hold entry for packet identifier %v: %v", pi, err)
 		return err
-	case stored == nil:
-		// No message found: no session state for this PI, which a v5 PUBCOMP
-		// reports as 0x92. Spec5 [MQTT-4.3.3-1].
+	case rec == nil:
+		// No record found: no session state for this PI, which a v5 PUBCOMP
+		// reports as 0x92. This includes an exchange that DID complete whose
+		// tombstone has since been reaped — absence is indistinguishable from
+		// never-existed, and Spec5 sanctions 0x92 during recovery. Spec5
+		// [MQTT-4.3.3-1].
 		reason = mqttReasonPacketIDNotFound
 		reasonStr = "no message found for the packet identifier"
 		return nil
 	}
 
-	// Remove the hold entry before the onward delivery below. A failure here
-	// must abort: leaving the entry behind while delivering onward would let a
-	// later PUBLISH reusing this packet identifier be rejected as a duplicate,
-	// or replay this payload on the next PUBREL. As above, the client retries.
-	//
-	// This is NOT a general idempotency guarantee for inbound PUBREL: the delete
-	// is a request/response round trip, so a lost response (or a crash) can
-	// leave it committed with nothing delivered, and the same is true if the
-	// onward store below fails after a successful delete. The retry then finds
-	// no hold entry and is answered 0x92, losing the message. Closing that
-	// window needs a recoverable move protocol (a Nats-Msg-Id dedup window on
-	// the messages stream, or a two-phase move like the delayed-Will outbox) and
-	// is tracked as a release blocker in docs/ROADMAP.md.
-	if err := asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, stored.Sequence, true); err != nil {
-		// Already deleted between the lookup and here: in a cluster another actor
-		// removed the entry — a concurrent PUBREL for this PI, which does deliver
-		// onward, or a session discard, which purges hold entries WITHOUT
-		// delivering (see clear()). So this is not a claim that someone else owns
-		// the delivery; it is a choice between two wrong outcomes for the copy
-		// already loaded above. Delivering it risks duplicating a concurrent
-		// PUBREL's delivery or resurrecting a message from a discarded session,
-		// which QoS 2 must not do; reporting 0x92 admits the session state for
-		// this PI is gone, which it demonstrably is. The purge case can therefore
-		// drop the message — that is a property of the discard, not of this
-		// branch.
-		if !isErrorOtherThan(err, JSSequenceNotFoundErrF) ||
-			isJSErrCausedBy(err, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
-			reason = mqttReasonPacketIDNotFound
-			reasonStr = "no message found for the packet identifier"
-			return nil
+	// K: the record carries no usable identity (missing/duplicated/malformed
+	// generation, or a done marker we cannot attribute). It can be neither released
+	// as ours nor delivered as a message, so dispose of it and admit the identifier's
+	// state is gone. Metadata only in the log line: the body is an application
+	// payload and can be as large as max_payload.
+	if rec.state == mqttQoS2Corrupt {
+		c.Errorf("Discarding unusable QoS2 hold record (%s)",
+			mqttQoS2CorruptDetail(subject, rec.stored, "no valid generation, or a malformed done marker"))
+		if rerr := releaseNonterminal(seq, "unusable"); rerr != nil {
+			return rerr
 		}
-		sendPubComp = false
-		c.Errorf("Unable to release QoS2 hold entry for packet identifier %v: %v", pi, err)
-		return err
+		reason = mqttReasonPacketIDNotFound
+		reasonStr = "no message found for the packet identifier"
+		return nil
 	}
 
-	// only MQTT QoS2 messages should be here, and they must have a subject.
+	// T: the terminal tombstone. This exchange already delivered onward and
+	// committed, so answer success WITHOUT re-delivering — indefinitely, and
+	// independently of any deduplication window. This branch is what the whole
+	// protocol buys. Reap the tombstone asynchronously (invariant 4): a surviving
+	// tombstone is inert, since this branch answers from it and a later PUBLISH on
+	// this identifier reaps it.
+	if rec.state == mqttQoS2Done {
+		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, seq, false)
+		return nil
+	}
+
+	stored := rec.stored
+	gen := rec.gen
+
+	// V: only MQTT QoS2 messages should be here, and they must have a subject. The
+	// generation IS valid here (K already handled the case where it is not), so this
+	// is a record we can prove is ours but cannot deliver. Release it before
+	// answering, for the same reason as K. Metadata only, again.
 	h := mqttParsePublishNATSHeader(stored.Header)
 	if h == nil || h.qos != 2 || len(h.subject) == 0 {
-		return errors.New("invalid message in QoS2 PUBREL stream")
+		c.Errorf("Discarding QoS2 hold record with malformed publish headers (%s)",
+			mqttQoS2CorruptDetail(subject, stored, "missing or invalid Nmqtt-Pub/Nmqtt-Subject"))
+		if rerr := releaseNonterminal(seq, "malformed"); rerr != nil {
+			return rerr
+		}
+		reason = mqttReasonPacketIDNotFound
+		reasonStr = "no message found for the packet identifier"
+		return nil
 	}
 
 	pp := &mqttPublish{
@@ -8996,17 +9271,66 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		pp.flags |= mqttPubFlagRetain
 	}
 
-	// MQTT 5.0 Message Expiry Interval: a QoS2 message ages while it waits in the
-	// server for the PUBREL. Measure the interval from the original PUBLISH
-	// receipt (the hold-stream store time) rather than restarting it here: age
-	// the carried interval by the time already elapsed, and drop the message if
-	// it has expired before release. Spec5 [3.3.2.3.3].
+	// X: MQTT 5.0 Message Expiry Interval. A QoS2 message ages while it waits in the
+	// server for the PUBREL. Measure the interval from the original PUBLISH receipt
+	// (the hold-stream store time) rather than restarting it here: age the carried
+	// interval by the time already elapsed, and drop the message if it has expired
+	// before release. The drop is this path's own responsibility — release the record
+	// before answering, again per invariant 3. Spec5 [3.3.2.3.3].
 	var expired bool
 	if pp.props, expired = mqttForwardExpiry(pp.props, stored.Time.UnixNano()); expired {
+		if rerr := releaseNonterminal(seq, "expired"); rerr != nil {
+			return rerr
+		}
 		return nil
 	}
 
-	return s.mqttInitiateMsgDelivery(c, pp, c.mqttStampedOrigin(string(pp.subject), pp.msg))
+	// S: the onward store, carrying a Nats-Msg-Id derived from the immutable
+	// generation. A failure here means the exchange is unfinished and the record is
+	// still held: suppress the PUBCOMP so the client retries. (Before this fix the
+	// failure was returned with sendPubComp still true, telling the client an
+	// exactly-once exchange had completed over a message that existed nowhere.)
+	//
+	// Note that the live core-NATS fan-out happens INSIDE this call, before the
+	// stream store. A retry therefore repeats the fan-out: QoS 0 subscribers, plain
+	// NATS subscribers and the retained store may see the message twice. That
+	// duplicate is irreducible (see residual 1 in qos2_move.go); the msgId is what
+	// keeps the stored copy single for stream-backed subscribers.
+	if err := s.mqttInitiateMsgDeliveryDedup(c, pp,
+		c.mqttStampedOrigin(string(pp.subject), pp.msg), mqttQoS2ReleaseMsgId(gen)); err != nil {
+		sendPubComp = false
+		c.Errorf("Unable to deliver released QoS2 message for packet identifier %v: %v", pi, err)
+		return err
+	}
+
+	// C: commit the terminal state. Only now is it safe to leave `held`, and only
+	// against our own generation (invariant 1).
+	status, doneSeq, ferr := asm.finalizeQoS2Move(s, subject, gen, seq)
+	switch status {
+	case mqttQoS2FinalizeCommitted:
+		// Terminal state is durable, so the tombstone's own removal is inert
+		// (invariant 4): push it without waiting.
+		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, doneSeq, false)
+		return nil
+	case mqttQoS2FinalizeGone:
+		// Our generation is already absent and the onward store succeeded, so the
+		// exchange is complete. Nothing left to clean up.
+		return nil
+	case mqttQoS2FinalizeSuperseded:
+		// A newer generation owns this subject and was NOT touched. Our message was
+		// delivered, but this identifier's state is no longer ours to close, so 0x92
+		// is the honest answer (residual 5).
+		reason = mqttReasonPacketIDNotFound
+		reasonStr = "no message found for the packet identifier"
+		return nil
+	default: // mqttQoS2FinalizeIndeterminate
+		// Delivery happened but the terminal state is unconfirmed. Suppress the
+		// PUBCOMP: the client retries, and the retry either finds the tombstone (T,
+		// answered 0x00 with no re-delivery) or re-delivers with the same msgId.
+		sendPubComp = false
+		c.Errorf("Unable to commit QoS2 move for packet identifier %v: %v", pi, ferr)
+		return ferr
+	}
 }
 
 // Invoked when processing an inbound client message. If the "retain" flag is
