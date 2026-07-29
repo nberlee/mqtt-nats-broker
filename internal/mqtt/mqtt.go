@@ -3423,6 +3423,48 @@ func isErrorOtherThan(err error, id ErrorIdentifier) bool {
 	return err != nil && !IsNatsErr(err, id)
 }
 
+// jsAPIError extracts the JetStream API error from err, seeing through %w
+// wrapping. IsNatsErr does a bare type assertion and therefore does not.
+func jsAPIError(err error) *ApiError {
+	var ae *ApiError
+	if errors.As(err, &ae) {
+		return ae
+	}
+	return nil
+}
+
+// isJSErrCausedBy reports whether err is the JetStream API error identified by
+// id whose interpolated cause is `cause`.
+//
+// A few JetStream API errors are generic containers: JSStreamStoreFailedF
+// (10077) and JSStreamMsgDeleteFailedF (10057) both have Description "{err}",
+// so the only record of what actually went wrong is the cause flattened into
+// ApiError.Description. The error identity is matched structurally on ErrCode;
+// the cause then needs a text comparison, which nats-server gives no way to
+// avoid. Confining it here is the point of this helper: comparing the RENDERED
+// ApiError.Error() ("<description> (<code>)") instead — as the QoS2 dedup path
+// used to — breaks on any change to the outer formatting, and a bare substring
+// match over-matches (a cause that merely mentions the sentinel text is not the
+// sentinel). So: exact Description, or the ": "+cause suffix a cause wrapped
+// before ApiError construction produces. Nothing else.
+//
+// A change to the flattened cause wording itself still defeats recognition.
+func isJSErrCausedBy(err error, id ErrorIdentifier, cause error) bool {
+	if err == nil || cause == nil {
+		return false
+	}
+	ae := jsAPIError(err)
+	if ae == nil {
+		return false
+	}
+	want, ok := ApiErrors[id]
+	if !ok || want == nil || ae.ErrCode != want.ErrCode {
+		return false
+	}
+	ct := cause.Error()
+	return ae.Description == ct || strings.HasSuffix(ae.Description, ": "+ct)
+}
+
 // Process JS API replies.
 //
 // Can run from various go routines (consumer's loop, system send loop, etc..).
@@ -6378,12 +6420,15 @@ func (sess *mqttSession) clear(noWait bool) error {
 		// another member, delete) a group durable. Spec5 [4.8.2].
 		wait := !noWait || len(sharedDurs) > 0
 		err := sess.jsa.deleteMsg(mqttSessStreamName, seq, wait)
-		// Ignore the various errors indicating that the message (or sequence)
-		// is already deleted, can happen in a cluster.
-		if isErrorOtherThan(err, JSSequenceNotFoundErrF) {
-			if isErrorOtherThan(err, JSStreamMsgDeleteFailedF) || !strings.Contains(err.Error(), ErrStoreMsgNotFound.Error()) {
-				return fmt.Errorf("unable to delete session %q record at sequence %v: %v", id, seq, err)
-			}
+		// Ignore the various errors indicating that the message (or sequence) is
+		// already deleted, which can happen in a cluster. JetStream reports it
+		// either as JSSequenceNotFoundErrF (the delete removed nothing) or as a
+		// generic "message delete failed" (10057) carrying ErrStoreMsgNotFound as
+		// its flattened cause; both mean the record is gone, which is what this
+		// call wanted.
+		if isErrorOtherThan(err, JSSequenceNotFoundErrF) &&
+			!isJSErrCausedBy(err, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
+			return fmt.Errorf("unable to delete session %q record at sequence %v: %v", id, seq, err)
 		}
 	}
 
@@ -8763,8 +8808,6 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	return err
 }
 
-var mqttMaxMsgErrPattern = fmt.Sprintf("%s (%v)", ErrMaxMsgsPerSubject.Error(), JSStreamStoreFailedF)
-
 func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 	// `true` means encode the MQTT PUBLISH packet in the NATS message header. No
 	// TTL here: this is the QoS2 dedup hold stream (no AllowMsgTTL); the expiry
@@ -8782,10 +8825,11 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 	// use for latter delivery.
 	_, err := c.mqtt.sess.jsa.storeMsg(c.mqttQoS2InternalSubject(pp.pi), headerLen, natsMsg)
 
-	// TODO: would prefer a more robust and performant way of checking the
-	// error, but it comes back wrapped as an API result.
-	if err != nil &&
-		(isErrorOtherThan(err, JSStreamStoreFailedF) || err.Error() != mqttMaxMsgErrPattern) {
+	// The duplicate is detected as the hold stream's MaxMsgsPer=1 rejection,
+	// which JetStream reports as a generic "store failed" (10077) carrying
+	// ErrMaxMsgsPerSubject as its flattened cause. Classify it structurally: a
+	// duplicate is not an error here, the client still gets its PUBREC.
+	if err != nil && !isJSErrCausedBy(err, JSStreamStoreFailedF, ErrMaxMsgsPerSubject) {
 		return err
 	}
 

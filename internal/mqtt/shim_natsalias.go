@@ -5,6 +5,7 @@ import server "github.com/nats-io/nats-server/v2/server"
 
 type (
 	closedStateAlias            = server.ClosedState
+	ApiError                    = server.ApiError
 	ApiPagedRequest             = server.ApiPagedRequest
 	ApiResponse                 = server.ApiResponse
 	ClientInfo                  = server.ClientInfo
