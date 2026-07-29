@@ -397,6 +397,45 @@ func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
 	return func() { mqttTestSessSaveHookV.Store(prev) }
 }
 
+// Test hooks: when set and returning a non-nil error, loadLastMsgFor and
+// deleteMsg fail with it WITHOUT issuing the JetStream request, so the stream
+// is left exactly as it was and a retry can still succeed. Used to exercise the
+// QoS2 PUBREL failure classification.
+//
+// Deliberately per-operation and predicated on (stream, subject) / (stream,
+// sequence) rather than one hook on jsa.newRequest: the broker issues unrelated
+// JetStream requests concurrently from other goroutines, and a blanket hook
+// would fail those too and turn these tests into misleading noise. Atomics for
+// the same reason as the save hook above.
+var (
+	mqttTestLoadLastMsgHookV atomic.Pointer[func(stream, subject string) error]
+	mqttTestDeleteMsgHookV   atomic.Pointer[func(stream string, seq uint64) error]
+)
+
+// setMQTTTestLoadLastMsgHook installs (or, with nil, clears) the loadLastMsgFor
+// hook and returns a function that restores the previous value.
+func setMQTTTestLoadLastMsgHook(h func(stream, subject string) error) func() {
+	prev := mqttTestLoadLastMsgHookV.Load()
+	if h == nil {
+		mqttTestLoadLastMsgHookV.Store(nil)
+	} else {
+		mqttTestLoadLastMsgHookV.Store(&h)
+	}
+	return func() { mqttTestLoadLastMsgHookV.Store(prev) }
+}
+
+// setMQTTTestDeleteMsgHook installs (or, with nil, clears) the deleteMsg hook
+// and returns a function that restores the previous value.
+func setMQTTTestDeleteMsgHook(h func(stream string, seq uint64) error) func() {
+	prev := mqttTestDeleteMsgHookV.Load()
+	if h == nil {
+		mqttTestDeleteMsgHookV.Store(nil)
+	} else {
+		mqttTestDeleteMsgHookV.Store(&h)
+	}
+	return func() { mqttTestDeleteMsgHookV.Store(prev) }
+}
+
 var (
 	errMQTTNotWebsocketPort           = errors.New("MQTT clients over websocket must connect to the Websocket port, not the MQTT port")
 	errMQTTTopicFilterCannotBeEmpty   = errors.New("topic filter cannot be empty")
@@ -3275,6 +3314,11 @@ func (jsa *mqttJSA) consumerList(streamName string) ([]*ConsumerInfo, error) {
 }
 
 func (jsa *mqttJSA) loadLastMsgFor(streamName string, subject string) (*StoredMsg, error) {
+	if h := mqttTestLoadLastMsgHookV.Load(); h != nil {
+		if err := (*h)(streamName, subject); err != nil {
+			return nil, err
+		}
+	}
 	mreq := &JSApiMsgGetRequest{LastFor: subject}
 	req, err := json.Marshal(mreq)
 	if err != nil {
@@ -3394,6 +3438,11 @@ func (jsa *mqttJSA) loadSessionMsg(domainTk, cidHash string) (*StoredMsg, error)
 }
 
 func (jsa *mqttJSA) deleteMsg(stream string, seq uint64, wait bool) error {
+	if h := mqttTestDeleteMsgHookV.Load(); h != nil {
+		if err := (*h)(stream, seq); err != nil {
+			return err
+		}
+	}
 	dreq := JSApiMsgDeleteRequest{Seq: seq, NoErase: true}
 	req, _ := json.Marshal(dreq)
 	subj := jsa.prefixDomain(fmt.Sprintf(JSApiMsgDeleteT, stream))
@@ -8848,30 +8897,81 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 // Runs from the client's readLoop.
 // No lock held on entry.
 func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
-	// Return the client's send-quota slot: any PUBCOMP (sent unconditionally
-	// below, with any reason including 0x92) frees it. A no-op for an unknown PI
-	// or one held on a previous connection. Spec5 [4.9].
-	delete(c.mqtt.qos2InFlight, pi)
-
-	// Once done with the processing, send a PUBCOMP back to the client.
+	// A PUBCOMP (with any reason, including 0x92) ends the exchange and returns
+	// the client's send-quota slot, so the two travel together: sendPubComp
+	// gates both. It stays true for every outcome that answers the client —
+	// success, an unknown PI, a malformed hold record, an expiry-dropped hold,
+	// and the onward-delivery result — and is cleared ONLY where a broker-side
+	// JetStream failure means the exchange is unfinished (below), because MQTT 5
+	// gives PUBCOMP no reason code for "the broker failed" (only 0x00 and 0x92
+	// are defined) and answering anyway would tell the client an exactly-once
+	// exchange completed for a message still held. Spec5 [4.9], [MQTT-4.3.3-1].
+	sendPubComp := true
 	reason := mqttReasonSuccess
 	var reasonStr string
-	defer func() { c.mqttEnqueuePubResponseReason(mqttPacketPubComp, pi, reason, reasonStr, trace) }()
+	defer func() {
+		if !sendPubComp {
+			return
+		}
+		delete(c.mqtt.qos2InFlight, pi)
+		c.mqttEnqueuePubResponseReason(mqttPacketPubComp, pi, reason, reasonStr, trace)
+	}()
 
-	// See if there is a message pending for this pi. All failures are treated
-	// as "not found".
+	// See if there is a message pending for this pi.
 	asm := c.mqtt.asm
-	stored, _ := asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, c.mqttQoS2InternalSubject(pi))
-
-	if stored == nil {
+	stored, err := asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, c.mqttQoS2InternalSubject(pi))
+	switch {
+	case isErrorOtherThan(err, JSNoMessageFoundErr):
+		// A broker-side lookup failure, NOT a missing PI. Nothing has been
+		// deleted or delivered yet, so the hold record is still there: suppress
+		// the PUBCOMP and close the connection so the client retries PUBREL with
+		// its session state intact.
+		sendPubComp = false
+		c.Errorf("Unable to look up QoS2 hold entry for packet identifier %v: %v", pi, err)
+		return err
+	case stored == nil:
 		// No message found: no session state for this PI, which a v5 PUBCOMP
 		// reports as 0x92. Spec5 [MQTT-4.3.3-1].
 		reason = mqttReasonPacketIDNotFound
 		reasonStr = "no message found for the packet identifier"
 		return nil
 	}
-	// Best attempt to delete the message from the QoS2 stream.
-	asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, stored.Sequence, true)
+
+	// Remove the hold entry before the onward delivery below. A failure here
+	// must abort: leaving the entry behind while delivering onward would let a
+	// later PUBLISH reusing this packet identifier be rejected as a duplicate,
+	// or replay this payload on the next PUBREL. As above, the client retries.
+	//
+	// This is NOT a general idempotency guarantee for inbound PUBREL: the delete
+	// is a request/response round trip, so a lost response (or a crash) can
+	// leave it committed with nothing delivered, and the same is true if the
+	// onward store below fails after a successful delete. The retry then finds
+	// no hold entry and is answered 0x92, losing the message. Closing that
+	// window needs a recoverable move protocol (a Nats-Msg-Id dedup window on
+	// the messages stream, or a two-phase move like the delayed-Will outbox) and
+	// is tracked as a release blocker in docs/ROADMAP.md.
+	if err := asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, stored.Sequence, true); err != nil {
+		// Already deleted between the lookup and here: in a cluster another actor
+		// removed the entry — a concurrent PUBREL for this PI, which does deliver
+		// onward, or a session discard, which purges hold entries WITHOUT
+		// delivering (see clear()). So this is not a claim that someone else owns
+		// the delivery; it is a choice between two wrong outcomes for the copy
+		// already loaded above. Delivering it risks duplicating a concurrent
+		// PUBREL's delivery or resurrecting a message from a discarded session,
+		// which QoS 2 must not do; reporting 0x92 admits the session state for
+		// this PI is gone, which it demonstrably is. The purge case can therefore
+		// drop the message — that is a property of the discard, not of this
+		// branch.
+		if !isErrorOtherThan(err, JSSequenceNotFoundErrF) ||
+			isJSErrCausedBy(err, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
+			reason = mqttReasonPacketIDNotFound
+			reasonStr = "no message found for the packet identifier"
+			return nil
+		}
+		sendPubComp = false
+		c.Errorf("Unable to release QoS2 hold entry for packet identifier %v: %v", pi, err)
+		return err
+	}
 
 	// only MQTT QoS2 messages should be here, and they must have a subject.
 	h := mqttParsePublishNATSHeader(stored.Header)
