@@ -173,3 +173,56 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 (`mqttQoS2InternalSubject`) — so arbitrary characters are safe. See
 `internal/mqtt/mqtt.go` (`mqttParseConnect`, `mqttQoS2InternalSubject`) and
 `internal/mqtt/clientid_test.go`.
+
+## Known deviations
+
+Both are tracked as release blockers in `docs/ROADMAP.md`.
+
+### Started QoS 2 delivery to a shared-subscription member
+
+When a client unsubscribes from (or leaves) a Shared Subscription while the
+broker has already started sending it a QoS 2 message, that message does not stay
+with the client the exchange began with. `releaseSharedConsumer` drops the
+leaving member's pending QoS 1 and QoS 2 state, so the message is re-offered to
+another group member, and it is dropped outright if the leaver was the last
+holder of the group durable.
+
+Redistribution after a connection loss is permitted for QoS 1. It is not a
+general override for UNSUBSCRIBE, and a redistributed QoS 2 message does not
+satisfy the requirement to complete the delivery to the chosen client
+([MQTT-3.10.4-3], and the chosen-client affinity of MQTT 5.0 [4.8.2]). Resolving
+it needs session-affine ownership of a started delivery.
+
+Plain (non-shared) subscriptions have their own open item: an unacknowledged
+QoS 1/2 PUBLISH is currently dropped on UNSUBSCRIBE. The decided fix is a durable
+drain; see `docs/ROADMAP.md`.
+
+### Inbound QoS 2 PUBREL is not idempotent across the hold-record move
+
+`mqttProcessPubRel` removes the QoS 2 hold record before storing the message for
+onward delivery. Two windows lose the message rather than duplicating it:
+
+- the delete is committed by JetStream but its response is lost, or the process
+  crashes immediately after the commit;
+- the delete succeeds and the onward store then fails.
+
+In both cases the hold record is gone with nothing delivered, so the client's
+PUBREL retry is answered `0x92` (packet identifier not found). Reversing the
+order would trade this for duplicate onward delivery, which QoS 2 forbids; a
+recoverable move protocol is required.
+
+What *is* handled: a hold lookup that fails for any reason other than "not
+found", and a hold delete that fails before JetStream acted on it, both suppress
+the PUBCOMP and close the connection instead of reporting `0x92`, so the client
+retries against intact session state.
+
+A hold record that was already removed between the lookup and the delete is
+reported as `0x92` and the loaded copy is not delivered. Both removers are
+possible — a concurrent PUBREL for the same packet identifier, which does deliver
+onward, and a session discard, which purges hold entries without delivering — so
+this is a choice between two wrong outcomes rather than a delegation of the
+delivery. Delivering the loaded copy would risk duplicating a concurrent PUBREL's
+delivery or resurrecting a message from a discarded session, which QoS 2 must not
+do; `0x92` states accurately that no session state for that identifier remains.
+When the remover was a session discard the message is dropped, which is a
+property of discarding the session, not of this branch.

@@ -29,10 +29,47 @@ is fixed before feature work continues.
   broker's own delivery subscriptions moved to the service connection so a
   full-namespace deny is deployable. Documented under "Reserved `$MQTT.>`
   namespace" in `docs/ARCHITECTURE.md`.
-- [ ] Replace brittle JetStream error-string matching in the QoS 2 path with a
-  robust error classification.
+- [x] Replace brittle JetStream error-string matching in the QoS 2 path with a
+  robust error classification. `isJSErrCausedBy` matches the JetStream API error
+  code structurally and confines the unavoidable cause-text comparison to the
+  generic `{err}` errors (`JSStreamStoreFailedF`, `JSStreamMsgDeleteFailedF`),
+  which carry their real reason only in `ApiError.Description`; the QoS 2 dedup
+  store and the session-record delete now go through it, and `mqttProcessPubRel`
+  classifies its hold lookup and hold delete instead of discarding both errors.
+  API error identity no longer depends on the rendered `ApiError.Error()` form,
+  but a change to the flattened cause wording itself would still defeat
+  recognition.
+- [ ] Close the destructive PUBREL move window: `mqttProcessPubRel` removes the
+  QoS 2 hold record before the onward store, so a delete that JetStream commits
+  while its response is lost (or a crash right after the commit), and a delete
+  that succeeds followed by a failing onward store, both leave the hold gone with
+  nothing delivered. The client's PUBREL retry is then answered `0x92` and the
+  message is lost; a retry cannot be relied on in either case. Reversing the
+  order only trades this for duplicate onward delivery. Needs a recoverable move
+  protocol: a `Nats-Msg-Id` deduplication window on `$MQTT_msgs`, or a two-phase
+  move like the delayed-Will outbox.
+- [ ] Keep a started QoS 2 delivery with its chosen shared-subscription client.
+  `releaseSharedConsumer` discards a leaving member's QoS 1 *and* QoS 2 pending
+  state, so a QoS 2 message the broker had already started sending is
+  redistributed to the group — or dropped outright when the leaver was the last
+  holder — instead of remaining with the client the exchange began with.
+  Redistribution after connection loss is permitted for QoS 1 and is not a
+  general override for UNSUBSCRIBE. Resolve either by session-affine ownership of
+  a started delivery (a durable move off the queue-delivered group durable onto a
+  session-owned path) or by an accepted, published deviation.
 - [ ] Decide and test the expected QoS 2 behavior for an unacknowledged PUBLISH
-  after UNSUBSCRIBE.
+  after UNSUBSCRIBE. Decided: comply with [MQTT-3.10.4-3] for plain consumers by
+  draining — the durable and its delivery subscription survive the UNSUBSCRIBE
+  while deliveries already started remain pending, and fresh deliveries are
+  discarded. That needs a durable state machine (staged and committed drain
+  states, a persist-before-ack transition on every pending removal, QoS 2 commit
+  only after the PUBREL store succeeds, persisted delivery metadata, and recovery
+  that reconciles against consumer pending state), so it is planned and reviewed
+  separately. The QoS 1/2 to QoS 0 re-SUBSCRIBE downgrade
+  (`execDeferredConsumerDelete`) is out of scope: it replaces a subscription
+  rather than deleting one. The plain-consumer drain alone must not tick this
+  item as universally compliant — it closes only once the shared QoS 2 item above
+  is also resolved.
 
 ## 1. Settle release decisions
 
