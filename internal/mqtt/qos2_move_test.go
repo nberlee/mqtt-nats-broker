@@ -1395,17 +1395,8 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 	pp := &mqttPublish{topic: []byte("mp"), subject: subj, msg: payload, sz: len(payload)}
 	origin := mqttOriginMarker([]byte("k"), "id", "subj", []byte("p"))
 
-	release := mqttComputeNatsMsgSize(pp, false, 0, origin, false, _EMPTY_, _EMPTY_) + mqttQoS2MsgIdHeaderMax
-	hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, false, _EMPTY_, _EMPTY_) +
-		mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax
-	terminal := mqttQoS2TerminalRecordMax()
-
-	largest := release
-	for _, f := range []int{hold, terminal} {
-		if f > largest {
-			largest = f
-		}
-	}
+	delivered := mqttComputeNatsMsgSize(pp, false, 0, origin, false, _EMPTY_, _EMPTY_)
+	largest := mqttMaxQoS2FormSize(pp, delivered, false)
 
 	// At exactly the largest form the exchange must COMPLETE. One byte below it,
 	// the PUBLISH must be refused at PUBREC with no backend write attempted.
@@ -1459,47 +1450,30 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 		testMQTTFlush(t, c, nil, r)
 	})
 
-	// The terminal form is the one an implementation is most likely to forget: its
-	// body is empty, so for a small payload with a short topic it is the LARGEST of
-	// the three, and its failure repeats the onward delivery on every retry.
-	t.Run("terminal form is budgeted even when it dominates", func(t *testing.T) {
+	// Which form dominates is header-size dependent, and the forms whose size does
+	// NOT scale with the payload (the terminal tombstone, whose body is empty, and
+	// the affine copy, whose identity headers are fixed-width) are the ones an
+	// implementation forgets. Assert directly that the admission budget covers each
+	// of them for a tiny publish, where they dominate — the server rows above
+	// cannot isolate a single form once more than one exceeds the budget.
+	t.Run("every form is budgeted for a tiny publish", func(t *testing.T) {
 		tiny := &mqttPublish{topic: []byte("t"), subject: []byte("t"), msg: []byte("y"), sz: 1}
-		tinyRelease := mqttComputeNatsMsgSize(tiny, false, 0, _EMPTY_, false, _EMPTY_, _EMPTY_) + mqttQoS2MsgIdHeaderMax
-		tinyHold := mqttComputeNatsMsgSize(tiny, true, 0, _EMPTY_, false, _EMPTY_, _EMPTY_) +
-			mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax
-		if terminal <= tinyRelease || terminal <= tinyHold {
-			t.Skipf("terminal form (%d) does not dominate for a tiny publish (release %d, hold %d); "+
-				"the ordering is header-size dependent and this case is then covered by the rows above",
-				terminal, tinyRelease, tinyHold)
-		}
-		o := testMQTTDefaultOptionsV5()
-		o.MaxPayload = int32(terminal - 1)
-		s := testMQTTRunServer(t, o)
-		defer testMQTTShutdownServer(s)
-
-		var wrote atomic.Bool
-		restore := setMQTTTestStoreMsgHook(func(subject string, _ int, _ []byte) error {
-			if strings.HasPrefix(subject, mqttQoS2IncomingMsgsStreamSubjectPrefix) ||
-				strings.HasPrefix(subject, mqttStreamSubjectPrefix) {
-				wrote.Store(true)
+		tinyDelivered := mqttComputeNatsMsgSize(tiny, false, 0, _EMPTY_, false, _EMPTY_, _EMPTY_)
+		budget := mqttMaxQoS2FormSize(tiny, tinyDelivered, false)
+		for _, f := range []struct {
+			name string
+			size int
+		}{
+			{"release", tinyDelivered + mqttQoS2MsgIdHeaderMax},
+			{"hold", mqttComputeNatsMsgSize(tiny, true, 0, _EMPTY_, false, _EMPTY_, _EMPTY_) +
+				mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax},
+			{"terminal", mqttQoS2TerminalRecordMax()},
+			{"affine", mqttQ2AffineFormMax(tiny, false)},
+		} {
+			if f.size > budget {
+				t.Fatalf("the %s form is %d bytes but the admission budget is only %d", f.name, f.size, budget)
 			}
-			return nil
-		})
-		defer restore()
-
-		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mp-term", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-		defer c.Close()
-		testMQTTReadConnAckV5(t, r)
-		pi := uint16(43)
-		testMQTTPublishV5(t, c, 2, pi, "t", []byte("y"))
-		if reason, _ := testMQTTReadPubRecV5(t, r, pi); reason != mqttReasonQuotaExceeded {
-			t.Fatalf("Expected PUBREC 0x%x when only the terminal form exceeds the budget, got 0x%x",
-				mqttReasonQuotaExceeded, reason)
 		}
-		if wrote.Load() {
-			t.Fatal("A PUBLISH rejected on the terminal form's account must not be stored")
-		}
-		testMQTTFlush(t, c, nil, r)
 	})
 }
 

@@ -59,15 +59,25 @@ is fixed before feature work continues.
   duplicate *stored* copy is suppressed only while deduplication survives (not
   across a nats-server process restart). See "Inbound QoS 2 PUBREL is
   at-least-once across the unresolved move interval" in `docs/CONFORMANCE.md`.
-- [ ] Keep a started QoS 2 delivery with its chosen shared-subscription client.
-  `releaseSharedConsumer` discards a leaving member's QoS 1 *and* QoS 2 pending
-  state, so a QoS 2 message the broker had already started sending is
-  redistributed to the group — or dropped outright when the leaver was the last
-  holder — instead of remaining with the client the exchange began with.
-  Redistribution after connection loss is permitted for QoS 1 and is not a
-  general override for UNSUBSCRIBE. Resolve either by session-affine ownership of
-  a started delivery (a durable move off the queue-delivered group durable onto a
-  session-owned path) or by an accepted, published deviation.
+- [x] Keep a started QoS 2 delivery with its chosen shared-subscription client.
+  Resolved by session-affine ownership (`internal/mqtt/qos2_shared_affine.go`). A
+  create-only CAS on the new `$MQTT_qos2assign` stream elects one winner per
+  `(group durable, source sequence)` and every contender honors that claim
+  **indefinitely**; the message is copied onto the winner's own
+  generation-scoped `$MQTT_out` subject and delivered by a durable only that
+  session generation can read, so the exchange completes off the queue-delivered
+  group durable entirely. The group delivery is acked only once the claim proves
+  the copy exists, and that ack is proven by a JetStream double ack before any
+  claim is reaped — a queued ack would let a lost ack reopen the assignment.
+  Assignment deliberately does **not** rest on the `Nats-Msg-Id` deduplication
+  window (finite; using it recreates the violation). Completion facts are
+  orthogonal and monotonic, so a discard can never stand in for an unproven
+  source ack. Residuals, both stated in `docs/CONFORMANCE.md`: packet-identifier
+  continuity across a broker restart or failover (the message stays
+  session-affine and is neither lost nor redistributed, but is redelivered with
+  DUP=1 and a fresh identifier), and mixed-version operation — the storage schema
+  is rolling-compatible, the delivery protocol is not, so affinity holds only once
+  every broker that can serve the group is q2aff-aware.
 - [ ] Decide and test the expected QoS 2 behavior for an unacknowledged PUBLISH
   after UNSUBSCRIBE. Decided: comply with [MQTT-3.10.4-3] for plain consumers by
   draining — the durable and its delivery subscription survive the UNSUBSCRIBE
@@ -92,6 +102,22 @@ is fixed before feature work continues.
   session record was lost, so it wedges its packet identifier until a later PUBLISH
   on that identifier reaps it. Pre-existing: neither created nor worsened by the
   move protocol, which added the terminal tombstone but no new leak.
+  Extend the same sweep to the two structures session-affine shared QoS 2 adds:
+  an orphaned `$MQTT_Q2AFF_*` consumer whose session record is gone (an older
+  broker in a mixed-version window ignores `Q2Aff` entirely), and an assignment
+  claim whose winner generation no longer exists and which no contender happens
+  to revisit. Neither loses a message — a stalled claim is honored, not
+  released — but both accumulate.
+- [ ] Give outbound QoS 1/2 in-flight deliveries a durable identity, so a packet
+  identifier survives a broker restart or failover rather than only a same-process
+  reconnect. Today `pendingPublish`/`cpending` are memory-only, so after a restart
+  a started delivery is re-offered with DUP set and a **freshly allocated**
+  identifier, and a client is entitled to treat that as a new message. This is the
+  single remaining cause of the HA exactly-once deviation, and it is not specific
+  to shared subscriptions: it applies to every QoS 1/2 outbound path. A fix has to
+  persist the identifier together with the source durable and sequence, the
+  PUBLISH-versus-PUBREL phase, and a recovery ordering — which is why it is its
+  own item rather than a detail of the shared-subscription work that surfaced it.
 - [ ] Audit the remaining `$MQTT_*` streams for protocol prerequisites, deriving
   each list from what that stream's owner actually does rather than copying
   `validateQoS2InStream` wholesale — the required set genuinely differs per stream.

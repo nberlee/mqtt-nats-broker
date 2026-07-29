@@ -176,22 +176,55 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 
 ## Known deviations
 
-Both are tracked as release blockers in `docs/ROADMAP.md`.
+All are tracked in `docs/ROADMAP.md`.
 
-### Started QoS 2 delivery to a shared-subscription member
+### Shared-subscription QoS 2: affinity holds; packet-identifier continuity does not
 
-When a client unsubscribes from (or leaves) a Shared Subscription while the
-broker has already started sending it a QoS 2 message, that message does not stay
-with the client the exchange began with. `releaseSharedConsumer` drops the
-leaving member's pending QoS 1 and QoS 2 state, so the message is re-offered to
-another group member, and it is dropped outright if the leaver was the last
-holder of the group durable.
+A QoS 2 message the broker has started sending to a Shared Subscription member
+now stays with that member. Ownership is a durable assignment claim on
+`$MQTT_qos2assign`, elected by a create-only CAS per
+`(group durable, source stream sequence)` and honored by every contender
+indefinitely; the message is copied onto the owning session's own
+generation-scoped `$MQTT_out` subject and delivered by a durable only that
+session generation can read (`internal/mqtt/qos2_shared_affine.go`). So:
 
-Redistribution after a connection loss is permitted for QoS 1. It is not a
-general override for UNSUBSCRIBE, and a redistributed QoS 2 message does not
-satisfy the requirement to complete the delivery to the chosen client
-([MQTT-3.10.4-3], and the chosen-client affinity of MQTT 5.0 [4.8.2]). Resolving
-it needs session-affine ownership of a started delivery.
+- UNSUBSCRIBE, disconnect, or the owner being the last holder of the group
+  durable no longer re-offers the message to another member;
+- the exchange completes with the client it began with when that client returns;
+- if the owner's session ends, the message dies with it — which MQTT 5.0 [4.8.2]
+  permits — rather than being redistributed.
+
+One failure mode is outside the protocol's control and is recorded rather than
+hidden: if the session's affine JetStream consumer is destroyed out of band,
+`$MQTT_out`'s interest retention deletes the copies it still held, and those
+QoS 2 messages are lost. Because the affine side of an assignment is recorded
+**before** its copy is acked, that outcome is distinguishable from a completed
+delivery in the durable state alone — no broker has to have witnessed the
+consumer disappear — and each affected assignment is marked `Lost`: a terminal
+state that is deliberately **not** reapable, so the record survives for an
+operator to find instead of being written off as a completed delivery.
+
+Two deviations remain.
+
+**Packet-identifier continuity across a broker restart or failover.** A
+same-process reconnect reuses the original packet identifier. After a broker
+restart, a failover, or a resume on a different broker, the started delivery is
+re-offered to the *same session* with DUP set but a **freshly allocated**
+identifier, because outbound in-flight identifiers are held in memory only. A
+strict client may treat that as a new message, so the exchange is exactly-once
+only within one broker process. The message is never lost and never
+redistributed; only the identifier is not continuous. Removing this needs durable
+outbound in-flight identity for **all** QoS 1/2 paths, which is a separate
+roadmap item — this is not specific to shared subscriptions.
+
+**Mixed-version operation.** The storage schema is rolling-compatible: an older
+broker simply ignores the new stream and the new session-record fields. The
+delivery *protocol* is not. An older broker serving the same shared group never
+consults `$MQTT_qos2assign`, so during a rolling upgrade it can still redistribute
+a started delivery that a newer broker has claimed. Shared-subscription QoS 2
+affinity holds only once **every** broker that can serve the group runs a
+q2aff-aware version. There is no runtime enforcement of this today; a
+cluster-wide capability gate is noted as a possible follow-up.
 
 Plain (non-shared) subscriptions have their own open item: an unacknowledged
 QoS 1/2 PUBLISH is currently dropped on UNSUBSCRIBE. The decided fix is a durable

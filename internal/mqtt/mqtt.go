@@ -253,6 +253,25 @@ const (
 	mqttPubRelDeliverySubjectPrefix = mqttPrefix + "deliver.pubrel."
 	mqttPubRelConsumerDurablePrefix = "$MQTT_PUBREL_"
 
+	// Stream name and subject prefix for shared-subscription QoS 2 assignment
+	// claims: one durable record per (group durable, source sequence) naming the
+	// session generation that owns a STARTED delivery. Permanent retention,
+	// MaxMsgsPer:1, read by direct subject lookup and never consumed. This is the
+	// arbitration record that keeps a started shared QoS 2 delivery with its
+	// chosen client for as long as it exists. See qos2_shared_affine.go.
+	mqttQoS2AssignStreamName          = "$MQTT_qos2assign"
+	mqttQoS2AssignStreamSubjectPrefix = mqttPrefix + "qos2.assign."
+
+	// Generation-scoped names for a session's affine QoS 2 delivery path on
+	// $MQTT_out: the per-claim copy subject prefix, the internal deliver subject
+	// prefix, and the consumer durable prefix. All three embed the session's
+	// durable generation so a leaked consumer from an earlier generation of the
+	// same client ID can neither read a new generation's copies nor inject into
+	// its delivery subscription. See qos2_shared_affine.go.
+	mqttQ2AffineSubjectPrefix         = mqttPrefix + "out.q2."
+	mqttQ2AffineDeliverPrefix         = mqttPrefix + "deliver.q2."
+	mqttQ2AffineConsumerDurablePrefix = "$MQTT_Q2AFF_"
+
 	// Internal names for MQTT 5.0 Shared Subscriptions ("$share/{ShareName}/
 	// {filter}"). All three are derived deterministically from a hash of the
 	// ShareName and the underlying NATS subject (see mqttSharedNames), so every
@@ -319,6 +338,12 @@ const (
 	mqttJSARetainedMsgDel = "RD"
 	mqttJSAStreamNames    = "SN"
 	mqttJSAConsumerList   = "CLS"
+	// mqttJSAAckConfirm is the JetStream "double ack": the acknowledgement of a
+	// delivery, sent WITH a reply subject so JetStream answers once it has been
+	// applied. The ordinary sendAck path is fire-and-forget, which is fine when a
+	// lost ack only costs a redelivery — but not when a durable record is deleted
+	// on the strength of it. See qos2_shared_affine.go.
+	mqttJSAAckConfirm = "AC"
 
 	// This is how long to keep a client in the flappers map before closing the
 	// connection. This prevent quick reconnect from those clients that keep
@@ -660,6 +685,31 @@ type mqttAccountSessionManager struct {
 	// finalize as indeterminate. Nil in production. See finalizeQoS2Move.
 	testQoS2PreFinalize func(subject, gen string, seq uint64) error
 
+	// Seams for the shared-subscription QoS 2 session-affine move
+	// (qos2_shared_affine.go), instance-scoped and set/read under mu. Each step is
+	// routed separately because every interesting failure here is "this ONE
+	// operation did not commit while the others did": a claim CAS that is rejected
+	// or lost, a copy store that succeeds while its response is lost, or a load
+	// that is indeterminate rather than absent. Nil in production.
+	testQ2AffClaimStore func(subject string, expectSeq uint64, rec *mqttQ2AffClaim) (uint64, error)
+	testQ2AffClaimLoad  func(subject string) (*mqttQ2AffClaim, uint64, error)
+	testQ2AffCopyStore  func(subject string, hdrLen int, msg []byte) (uint64, error)
+	testQ2AffCopyLoad   func(subject string) (*StoredMsg, error)
+
+	// testQ2AffMoveDone, when non-nil, reports the resolved disposition of every
+	// shared QoS 2 move attempt on this account manager. Like testQoS2FinalizeDone,
+	// it exists because the decision is often unobservable on the wire: a contender
+	// that correctly declines to deliver sends nothing at all, and "declined" and
+	// "still running" look identical to a reader. Nil in production.
+	testQ2AffMoveDone func(claimSubject string, res mqttQ2AffMoveResult)
+
+	// testQ2AffPreMaterialize, when non-nil, runs immediately BEFORE the
+	// claimed->materialized CAS, after the copy has been stored. It is the only
+	// seam inside the window where the copy is visible to a live affine consumer
+	// but the claim does not yet authorize delivery — the window the delivery gate
+	// exists for. A returned error abandons the transition. Nil in production.
+	testQ2AffPreMaterialize func(claimSubject string, seq uint64) error
+
 	// testRollbackSessionStore / testRollbackSessionLoad, when non-nil, replace the
 	// session-record CAS store / load used ONLY by the CONNECT-accept watermark
 	// failure transaction (instance-scoped). Set/read under mu. Routed only through
@@ -791,10 +841,15 @@ type mqttSession struct {
 	mu     sync.Mutex
 	subsMu sync.RWMutex
 
-	id          string // client ID
-	idHash      string // client ID hash
-	c           *client
-	jsa         *mqttJSA
+	id     string // client ID
+	idHash string // client ID hash
+	c      *client
+	jsa    *mqttJSA
+	// asm is the account session manager this session belongs to. Needed by the
+	// shared QoS 2 affinity protocol, whose durable state (the assignment claims)
+	// is account-scoped and reached through instance-scoped helpers, from paths
+	// like clear() that are handed no other account context.
+	asm         *mqttAccountSessionManager
 	subs        map[string]byte     // Key is MQTT SUBSCRIBE filter, value is the subscription QoS
 	noLocalSubs map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 No Local option
 	rapSubs     map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 Retain As Published option
@@ -818,6 +873,35 @@ type mqttSession struct {
 	pubRelDeliverySubjectB []byte
 	pubRelSubject          string
 	seq                    uint64
+
+	// Session-affine delivery of started shared-subscription QoS 2 messages.
+	// q2AffGen is this session incarnation's durable generation: it namespaces the
+	// copy subject, the consumer durable and the deliver subject, because idHash
+	// alone is reused by a later clean session of the same client ID. Minted at
+	// first provisioning, persisted, restored, and dropped by clear().
+	//
+	// q2AffReady is the ONLY thing a move may consult. It means "the consumer and
+	// its delivery subscription exist AND the session record naming them is
+	// saved" — a non-nil config proves neither, and $MQTT_out is interest-retained,
+	// so a copy stored before the consumer exists is silently discarded by a store
+	// that returns success. Every restore starts it false. See
+	// ensureQ2AffineConsumerSubscription and qos2_shared_affine.go.
+	q2AffGen              string
+	q2AffConsumer         *ConsumerConfig
+	q2AffSubscribed       bool
+	q2AffDeliverySubject  string
+	q2AffDeliverySubjectB []byte
+	q2AffReady            bool
+	// q2AffClosing / q2AffInFlight / q2AffCond are the move-operation lifecycle
+	// fence. A move captures readiness under mu, releases it, then performs
+	// JetStream operations, so a delayed claim CAS could otherwise land AFTER
+	// clear() finished — creating a claim for a terminated generation that stalls
+	// the group delivery forever, since contenders wait on a `claimed` record.
+	// clear() sets q2AffClosing (no new move may start), then waits on q2AffCond
+	// until q2AffInFlight drains, and only then scans and terminates the claims.
+	q2AffClosing  bool
+	q2AffInFlight int
+	q2AffCond     *sync.Cond
 
 	// pendingPublish maps packet identifiers (PI) to JetStream ACK subjects for
 	// QoS1 and 2 PUBLISH messages pending delivery to the session's client.
@@ -891,7 +975,15 @@ type mqttPersistedSession struct {
 	SharedSubs map[string]byte            `json:"shared_subs,omitempty"`
 	Cons       map[string]*ConsumerConfig `json:"cons,omitempty"`
 	PubRel     *ConsumerConfig            `json:"pubrel,omitempty"`
-	Will       *mqttPersistedWill         `json:"will,omitempty"`
+	// Q2Aff / Q2AffGen are the session-affine QoS 2 delivery path for shared
+	// subscriptions: the consumer that delivers copies of started deliveries this
+	// session owns, and the generation that namespaces all three of its names. An
+	// older server ignores both, which leaks the consumer but can never expose one
+	// session's in-flight message to another (the generation is in every name).
+	// Spec5 [4.8.2]; see qos2_shared_affine.go.
+	Q2Aff    *ConsumerConfig    `json:"q2aff,omitempty"`
+	Q2AffGen string             `json:"q2affgen,omitempty"`
+	Will     *mqttPersistedWill `json:"will,omitempty"`
 	// Session Expiry Interval (seconds) and disconnect Unix time (0 while
 	// connected): together the expiry deadline, restart-safe. Spec5 [3.1.2.11.2].
 	ExpiryInterval uint32 `json:"expiry,omitempty"`
@@ -1170,6 +1262,12 @@ type mqttPending struct {
 	sseq         uint64 // stream sequence
 	jsAckSubject string // the ACK subject to send the ack to
 	jsDur        string // JS durable name
+	// q2AffClaim is the subject of the assignment claim that authorized this
+	// delivery, set only for a session-affine shared QoS 2 copy. It travels with
+	// the pending entry because the claim's affine-side completion can only be
+	// recorded from the terminal paths (PUBREC, expiry, oversize discard), which
+	// see the packet identifier and nothing else. See qos2_shared_affine.go.
+	q2AffClaim string
 }
 
 // mqttDeferredKey identifies a JS message delivery withheld by outbound flow
@@ -2907,21 +3005,80 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		}
 	}
 
-	if si, err := lookupStream(mqttOutStreamName, "QoS2 outgoing PUBREL"); err != nil {
-		return nil, err
-	} else if si == nil {
-		// Create the stream for the incoming QoS2 messages that have not been
-		// PUBREL-ed by the sender. NATS messages are submitted as
-		// "$MQTT.pubrel.<session hash>"
+	// Shared-subscription QoS 2 assignment claims. A durable record per
+	// (group durable, source sequence) elects and then holds the session that owns
+	// a STARTED delivery, indefinitely and independently of any deduplication
+	// window. Kept on its own stream rather than widened onto an existing one: a
+	// NEW stream is schema-compatible with an older broker (which simply ignores
+	// it), while changing another stream's subject list is not. Note that schema
+	// compatibility is NOT protocol compatibility — an older broker serving the
+	// same shared group never reads these claims. See qos2_shared_affine.go and
+	// docs/ARCHITECTURE.md ("Compatibility boundary").
+	{
 		cfg := &StreamConfig{
-			Name:      mqttOutStreamName,
-			Subjects:  []string{mqttOutSubjectPrefix + ">"},
-			Storage:   FileStorage,
-			Retention: InterestPolicy,
-			Replicas:  replicas,
+			Name:       mqttQoS2AssignStreamName,
+			Subjects:   []string{mqttQoS2AssignStreamSubjectPrefix + ">"},
+			Storage:    FileStorage,
+			Retention:  LimitsPolicy,
+			Discard:    DiscardOld,
+			MaxMsgsPer: 1,
+			Replicas:   replicas,
 		}
 		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create QoS2 outgoing PUBREL stream for account %q: %v", accName, err)
+			return nil, fmt.Errorf("create QoS2 shared assignment stream for account %q: %v", accName, err)
+		}
+		si, err := jsa.lookupStream(mqttQoS2AssignStreamName)
+		if err != nil {
+			return nil, fmt.Errorf("lookup QoS2 shared assignment stream for account %q: %v", accName, err)
+		}
+		wantReplicas := 0
+		if opts.MQTT.StreamReplicas != 0 {
+			wantReplicas = replicas
+		}
+		if verr := validateQoS2AssignStream(si, wantReplicas); verr != nil {
+			return nil, fmt.Errorf("QoS2 shared assignment stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required configuration (see docs/ARCHITECTURE.md \"Compatibility boundary\")",
+				accName, verr, mqttQoS2AssignStreamName)
+		}
+	}
+
+	// $MQTT_out carries both the pending PUBREL records and the session-affine
+	// copies of started shared-subscription QoS 2 deliveries. Its InterestPolicy
+	// retention is load-bearing in both directions: it is how a discarded session's
+	// undelivered copies disappear with its consumer, and it is why a copy must
+	// never be stored before that consumer exists (a store with no interest returns
+	// success and keeps nothing). Validate it for the same reason $MQTT_qos2in is
+	// validated — an unknown-good configuration is a startup failure, not something
+	// to accommodate.
+	{
+		si, err := lookupStream(mqttOutStreamName, "QoS2 outgoing PUBREL")
+		if err != nil {
+			return nil, err
+		}
+		if si == nil {
+			// Create the stream for the incoming QoS2 messages that have not been
+			// PUBREL-ed by the sender. NATS messages are submitted as
+			// "$MQTT.pubrel.<session hash>"
+			cfg := &StreamConfig{
+				Name:      mqttOutStreamName,
+				Subjects:  []string{mqttOutSubjectPrefix + ">"},
+				Storage:   FileStorage,
+				Retention: InterestPolicy,
+				Replicas:  replicas,
+			}
+			if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
+				return nil, fmt.Errorf("create QoS2 outgoing PUBREL stream for account %q: %v", accName, err)
+			}
+			if si, err = jsa.lookupStream(mqttOutStreamName); err != nil {
+				return nil, fmt.Errorf("lookup QoS2 outgoing stream for account %q: %v", accName, err)
+			}
+		}
+		wantReplicas := 0
+		if opts.MQTT.StreamReplicas != 0 {
+			wantReplicas = replicas
+		}
+		if verr := validateOutStream(si, wantReplicas); verr != nil {
+			return nil, fmt.Errorf("QoS2 outgoing stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required configuration (see docs/ARCHITECTURE.md \"Compatibility boundary\")",
+				accName, verr, mqttOutStreamName)
 		}
 	}
 
@@ -3244,6 +3401,24 @@ func (jsa *mqttJSA) sendAck(ackSubject string) {
 	jsa.sendMsg(ackSubject, nil)
 }
 
+// confirmAck acknowledges a delivery and WAITS for JetStream to confirm the ack
+// was applied (the JetStream "double ack"): the ack is published with a reply
+// subject, and JetStream answers on it once the consumer state has advanced.
+//
+// sendAck above is fire-and-forget, which is the right trade almost everywhere:
+// a lost ack costs one redelivery. It is the WRONG trade wherever a durable
+// record is deleted because "the message was acked" — a lost ack would then
+// leave the delivery re-offerable with the state that governs it already gone.
+// Only such call sites should use this; it costs a JS API round trip.
+func (jsa *mqttJSA) confirmAck(ackSubject string) error {
+	if ackSubject == _EMPTY_ {
+		return fmt.Errorf("no ack subject")
+	}
+	// hdr -1: an ack is not a JS API request and must carry no client-info header.
+	_, err := jsa.newRequest(mqttJSAAckConfirm, ackSubject, -1, AckAck)
+	return err
+}
+
 func (jsa *mqttJSA) sendMsg(subj string, msg []byte) {
 	if subj == _EMPTY_ {
 		return
@@ -3361,6 +3536,22 @@ func (jsa *mqttJSA) purgeStream(streamName, filter string, noWait bool) error {
 	}
 	spr := spri.(*JSApiStreamPurgeResponse)
 	return spr.ToError()
+}
+
+// lookupConsumer returns the ConsumerInfo for one durable, or an error. A
+// JSConsumerNotFoundErr is an AUTHORITATIVE absence and is returned as such by
+// the callers that need to tell "gone" from "could not tell"; every other error
+// is indeterminate.
+func (jsa *mqttJSA) lookupConsumer(streamName, consName string) (*ConsumerInfo, error) {
+	cii, err := jsa.newRequest(mqttJSAConsumerLookup, fmt.Sprintf(JSApiConsumerInfoT, streamName, consName), 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	cir := cii.(*JSApiConsumerInfoResponse)
+	if err := cir.ToError(); err != nil {
+		return nil, err
+	}
+	return cir.ConsumerInfo, nil
 }
 
 // consumerList returns ConsumerInfo for every consumer of the stream, walking
@@ -3672,6 +3863,12 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 			resp.Error = NewJSInvalidJSONError(err)
 		}
 		out(resp)
+	case mqttJSAConsumerLookup:
+		var resp = &JSApiConsumerInfoResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
 	case mqttJSAConsumerList:
 		var resp = &JSApiConsumerListResponse{}
 		if err := json.Unmarshal(msg, resp); err != nil {
@@ -3684,6 +3881,11 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 			resp.Error = NewJSInvalidJSONError(err)
 		}
 		out(resp)
+	case mqttJSAAckConfirm:
+		// A double-ack confirmation carries no body: its ARRIVAL is the answer.
+		// Anything else would be a protocol change, so nothing is parsed here —
+		// there is no error form to misread as a success.
+		out(nil)
 	default:
 		pc.Warnf("Unknown reply code %q", token)
 	}
@@ -4249,12 +4451,15 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	// Build a transient session from the record — enough state for clear() to
 	// delete the consumers and the record itself — and clean up.
 	sess := mqttSessionCreate(&as.jsa, ps.ID, idHash, seq, s.getOpts())
+	sess.asm = as
 	sess.domainTk = as.domainTk
 	sess.clean = ps.Clean
 	sess.subs = ps.Subs
 	sess.sharedSubs = ps.SharedSubs
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
+	sess.q2AffConsumer = ps.Q2Aff
+	sess.q2AffGen = ps.Q2AffGen
 	if err := sess.clear(true); err != nil {
 		s.Warnf("MQTT session expiry cleanup for %q failed: %v", ps.ID, err)
 	}
@@ -4916,6 +5121,17 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 	}
 
 	rmSubjects := map[string]uint64{}
+	// Whether this session already had a session-affine QoS 2 delivery path, taken
+	// BEFORE the loop below can provision one. It is captured here rather than
+	// alongside the subscription snapshot further down because the loop provisions
+	// it, and a rollback must be able to tell "this packet built it" from "it was
+	// already there". Spec5 [4.8.2].
+	var q2AffPrePacket bool
+	if fromSubProto {
+		sess.mu.Lock()
+		q2AffPrePacket = sess.q2AffGen != _EMPTY_
+		sess.mu.Unlock()
+	}
 	// Filters denied for being in the reserved namespace. On the CONNECT restore
 	// path these come from the persisted record and are purged from it below.
 	var denied []*mqttFilter
@@ -4971,6 +5187,23 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
 				continue
+			}
+			// A SHARED QoS 2 subscription additionally needs this session's affine
+			// delivery path, because a started delivery is moved off the group
+			// durable onto it. Provisioned only for shared filters: a plain QoS 2
+			// subscription never moves anything and must not be charged an extra
+			// consumer. Unlike the PUBREL consumer above, it participates in this
+			// packet's rollback (q2AffPrePacket): it costs a consumer, a
+			// MaxAckPending charge and a persisted generation, none of which a
+			// SUBSCRIBE that never took effect should leave behind. Spec5 [4.8.2];
+			// see qos2_shared_affine.go.
+			if f.shared {
+				if err := sess.ensureQ2AffineConsumerSubscription(c); err != nil {
+					c.Errorf("failed to initialize session-affine QoS 2 delivery: %v", err)
+					f.qos = mqttSubAckFailure
+					f.reasonStr = err.Error()
+					continue
+				}
 			}
 		}
 
@@ -5264,12 +5497,30 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			// pre-packet membership and consumer entries (deferred downgrade deletes
 			// were never executed, so their durables are intact), then return the
 			// error so the connection closes. Spec5 [4.8.2].
-			sess.rollbackSubscribePacket(c, subs, consSnap, snap)
+			sess.rollbackSubscribePacket(c, subs, consSnap, snap, q2AffPrePacket)
 		} else {
 			// Save confirmed: now run the irreversible teardown of consumers that
 			// this packet downgraded to QoS0.
 			for _, dd := range deferredDels {
 				sess.execDeferredConsumerDelete(c, dd.sid, dd.cc)
+			}
+			// The affine path is provisioned in the first loop, before any filter is
+			// known to succeed, so a packet whose shared QoS 2 filters all failed
+			// per-filter (a failed membership persist, a failed group-consumer
+			// create, a failed subscription) would otherwise keep a consumer, a
+			// generation and a MaxAckPending charge for a subscription that does not
+			// exist. Only ever unwinds a path THIS packet built. Spec5 [4.8.2].
+			if !q2AffPrePacket && !sess.hasSharedQoS2Sub() {
+				// Same commit order as the rollback path: detach, persist a record
+				// that no longer names it, and only then delete.
+				if u := sess.prepareQ2AffineUnwind(c); u.prepared {
+					if serr := sess.save(); serr != nil {
+						sess.restoreQ2AffineUnwind(u)
+						c.Errorf("MQTT: unable to persist the removal of an unused affine QoS 2 path for %q: %v", sess.id, serr)
+					} else {
+						sess.finishQ2AffineUnwind(c, u)
+					}
+				}
 			}
 		}
 	}
@@ -5508,7 +5759,7 @@ func mqttZeroIf(cond bool, v int) int {
 // this packet — so a group durable is never deleted while the persisted record
 // might still claim membership. A re-SUBSCRIBE of a pre-existing filter keeps its
 // membership and runtime state. The connection is closing regardless. Spec5 [4.8.2].
-func (sess *mqttSession) rollbackSubscribePacket(c *client, subs []*subscription, consSnap map[string]*ConsumerConfig, snap *mqttSubSnapshot) {
+func (sess *mqttSession) rollbackSubscribePacket(c *client, subs []*subscription, consSnap map[string]*ConsumerConfig, snap *mqttSubSnapshot, q2AffPrePacket bool) {
 	// Restore EVERYTHING the packet mutated — the membership maps AND sess.cons —
 	// before the confirm-save, so the record is written from a fully rolled-back
 	// view: a QoS0->QoS1 upgrade's new consumer must not be persisted under the
@@ -5537,6 +5788,15 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, subs []*subscription
 	sess.subIDs = snap.subIDs
 	sess.cons = consSnap
 	sess.mu.Unlock()
+	// Detach a session-affine QoS 2 path this packet provisioned, BEFORE the
+	// confirm-save: the restored record must not name a consumer that is about to
+	// be deleted. The deletion itself waits for that save to be confirmed, exactly
+	// as the packet's other consumers do. A path that predates the packet is left
+	// alone. Spec5 [4.8.2].
+	var q2AffUnwind mqttQ2AffUnwind
+	if !q2AffPrePacket {
+		q2AffUnwind = sess.prepareQ2AffineUnwind(c)
+	}
 	if err := sess.save(); err != nil {
 		// Could not confirm the rolled-back record. Do not release/delete anything
 		// (a durable could be orphaned while the record still claims membership);
@@ -5550,9 +5810,13 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, subs []*subscription
 			sess.cons[a.sid] = a.cc
 		}
 		sess.mu.Unlock()
+		// Same reasoning for the affine path: nothing was deleted, so the session
+		// must go back to describing the resources that are still live.
+		sess.restoreQ2AffineUnwind(q2AffUnwind)
 		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
 		return
 	}
+	sess.finishQ2AffineUnwind(c, q2AffUnwind)
 
 	// A raw subscription "existed before" this packet if the restored membership
 	// still holds its filter. The level-up sid ("<mainsid without .>> fwc") maps
@@ -6083,6 +6347,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		// Message not found, so reate the session...
 		// Create a session and indicate that this session did not exist.
 		sess := mqttSessionCreate(jsa, clientID, hash, 0, opts)
+		sess.asm = as
 		sess.domainTk = as.domainTk
 		return sess, false, nil
 	}
@@ -6100,10 +6365,13 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	if ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
 		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval) {
 		sess := mqttSessionCreate(jsa, clientID, hash, smsg.Sequence, opts)
+		sess.asm = as
 		sess.domainTk = as.domainTk
 		sess.cons = ps.Cons
 		sess.sharedSubs = ps.SharedSubs
 		sess.pubRelConsumer = ps.PubRel
+		sess.q2AffConsumer = ps.Q2Aff
+		sess.q2AffGen = ps.Q2AffGen
 		// Wait for the deletes (like the clean-start discard): a queued no-wait
 		// delete of the deterministic PUBREL durable could otherwise race the new
 		// session recreating it.
@@ -6116,6 +6384,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 
 	// Restore this session (even if we don't own it), the caller will do the right thing.
 	sess := mqttSessionCreate(jsa, clientID, hash, smsg.Sequence, opts)
+	sess.asm = as
 	sess.domainTk = as.domainTk
 	sess.clean = ps.Clean
 	sess.subs = ps.Subs
@@ -6125,6 +6394,13 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.sharedSubs = ps.SharedSubs
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
+	// A persisted affine consumer proves only that one once existed: it may have
+	// been deleted, may have drifted, or may never have been honored by an older
+	// broker. q2AffReady therefore stays FALSE here and is set only by
+	// ensureQ2AffineConsumerSubscription, after the delivery subscription is
+	// installed and the real consumer is create-or-update verified.
+	sess.q2AffConsumer = ps.Q2Aff
+	sess.q2AffGen = ps.Q2AffGen
 	sess.expiryInterval = ps.ExpiryInterval
 	sess.disconnectedAt = ps.DisconnectedAt
 	as.addSession(sess, true)
@@ -6416,6 +6692,8 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 		SharedSubs:        sess.sharedSubs,
 		Cons:              cons,
 		PubRel:            sess.pubRelConsumer,
+		Q2Aff:             sess.q2AffConsumer,
+		Q2AffGen:          sess.q2AffGen,
 		Will:              sess.will,
 		ExpiryInterval:    sess.expiryInterval,
 		DisconnectedAt:    sess.disconnectedAt,
@@ -6473,6 +6751,14 @@ func (sess *mqttSession) clear(noWait bool) error {
 	var sharedDurs []string
 	var pubRelDur string
 
+	// Close the session-affine QoS 2 fence FIRST and wait for every in-flight move
+	// to finish. A move captures readiness under the lock and then performs
+	// JetStream round trips, so without this a delayed claim CAS could land after
+	// the scan below and leave a `claimed` record naming a generation that no
+	// longer exists — which contenders would honor forever, stalling a live
+	// message on a dead session. See qos2_shared_affine.go.
+	q2AffGen, q2AffDur := sess.closeQ2AffAndDrain()
+
 	sess.mu.Lock()
 	id := sess.id
 	idHash := sess.idHash
@@ -6511,6 +6797,18 @@ func (sess *mqttSession) clear(noWait bool) error {
 	sess.cpending = nil
 	sess.deferred = nil
 	sess.pubRelConsumer = nil
+	sess.q2AffConsumer = nil
+	sess.q2AffGen = _EMPTY_
+	sess.q2AffSubscribed = false
+	sess.q2AffDeliverySubject = _EMPTY_
+	sess.q2AffDeliverySubjectB = nil
+	// Reopen the move fence. clear() is not only a teardown: the expired-session
+	// path reuses this very object as a fresh session, and a permanently closed
+	// fence would make every later shared QoS 2 subscribe on it fail. Safe here
+	// because the fence only has to hold across the drain above — from this point
+	// on there is no generation and no readiness, so beginQ2AffOp admits nothing
+	// regardless.
+	sess.q2AffClosing = false
 	sess.seq = 0
 	sess.tmaxack = 0
 	// Discarded session: reset the PI counter too so a reused session object
@@ -6527,6 +6825,24 @@ func (sess *mqttSession) clear(noWait bool) error {
 		_, err := sess.jsa.deleteConsumer(mqttOutStreamName, pubRelDur, noWait)
 		if isErrorOtherThan(err, JSConsumerNotFoundErr) {
 			return fmt.Errorf("unable to delete consumer %q for session %q: %v", pubRelDur, sess.id, err)
+		}
+	}
+
+	// Terminate this session's shared QoS 2 assignments BEFORE its record is
+	// deleted (terminal cleanup precedes completion): a discarded claim is what
+	// tells a contender the delivery died with its session rather than being
+	// available to redistribute. The claims are marked, never released, and the
+	// undelivered copies are dropped by $MQTT_out's interest retention when the
+	// affine durable goes. Spec5 [MQTT-4.8.2-6].
+	if q2AffGen != _EMPTY_ && sess.asm != nil {
+		if err := sess.asm.discardQ2AffClaimsFor(sess.idHash, q2AffGen); err != nil {
+			return fmt.Errorf("unable to terminate the shared QoS 2 assignments of session %q: %w", sess.id, err)
+		}
+	}
+	if q2AffDur != _EMPTY_ {
+		_, err := sess.jsa.deleteConsumer(mqttOutStreamName, q2AffDur, noWait)
+		if isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			return fmt.Errorf("unable to delete affine QoS 2 consumer %q for session %q: %v", q2AffDur, sess.id, err)
 		}
 	}
 
@@ -6911,11 +7227,18 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 // Stops a PI from being tracked as a PUBLISH. It can still be in use for a
 // pending PUBREL.
 //
+// Also returns the affine assignment claim this delivery came from, when it came
+// from one: every terminal path for a session-affine shared QoS 2 delivery
+// (PUBREC, expiry, Maximum Packet Size discard) has to record the affine side as
+// complete on that claim, and the claim identity is only reachable through the
+// pending entry being removed here. Empty for every ordinary delivery. See
+// qos2_shared_affine.go.
+//
 // Lock held on entry
-func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject string) {
+func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject, q2AffClaim string) {
 	ack, ok := sess.pendingPublish[pi]
 	if !ok {
-		return _EMPTY_
+		return _EMPTY_, _EMPTY_
 	}
 
 	delete(sess.pendingPublish, pi)
@@ -6929,7 +7252,7 @@ func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject string) {
 		}
 	}
 
-	return ack.jsAckSubject
+	return ack.jsAckSubject, ack.q2AffClaim
 }
 
 // resendPendingRedelivery re-sends the session's unacknowledged QoS 1/2 PUBLISH
@@ -6950,6 +7273,13 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 		pi         uint16
 		sseq       uint64
 		ackSubject string
+		// jsDur is which consumer the sequence belongs to. Required, not
+		// decorative: the reap reconciliation below checks sequences against
+		// $MQTT_msgs, and a session-affine shared QoS 2 entry's sequence is a
+		// $MQTT_out sequence in a completely different sequence space. Checking one
+		// against the other would misread a live copy as reaped, release its packet
+		// identifier and skip its redelivery. See qos2_shared_affine.go.
+		jsDur string
 	}
 	bySeq := func(a, b pendingNak) int {
 		switch {
@@ -6974,14 +7304,23 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 	pubNaks := make([]pendingNak, 0, len(sess.pendingPublish))
 	for pi, ack := range sess.pendingPublish {
 		if ack.jsAckSubject != _EMPTY_ {
-			pubNaks = append(pubNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject})
+			pubNaks = append(pubNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject, ack.jsDur})
 		}
 	}
 	relNaks := make([]pendingNak, 0, len(sess.pendingPubRel))
 	for _, ack := range sess.pendingPubRel {
 		if ack.jsAckSubject != _EMPTY_ {
-			relNaks = append(relNaks, pendingNak{0, ack.sseq, ack.jsAckSubject})
+			relNaks = append(relNaks, pendingNak{0, ack.sseq, ack.jsAckSubject, _EMPTY_})
 		}
+	}
+	// The affine QoS 2 delivery path has to be re-established on resume for the
+	// same reason the PUBREL one does: its consumer may hold a started delivery
+	// this session owns, and nothing else recreates the delivery subscription when
+	// the resumed session restores no shared QoS 2 subscription.
+	q2AffGen := sess.q2AffGen
+	q2AffDur := _EMPTY_
+	if sess.q2AffConsumer != nil {
+		q2AffDur = sess.q2AffConsumer.Durable
 	}
 	// Any pending PUBREL (including a placeholder created at PUBREC before its
 	// delivery recorded an ack subject) needs the PUBREL delivery subscription.
@@ -6991,7 +7330,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 	// disconnect should not wait an AckWait either; drain them here too.
 	deferredNaks := make([]pendingNak, 0, len(sess.deferred))
 	for k, subj := range sess.deferred {
-		deferredNaks = append(deferredNaks, pendingNak{0, k.sseq, subj})
+		deferredNaks = append(deferredNaks, pendingNak{0, k.sseq, subj, k.jsDur})
 		delete(sess.deferred, k)
 	}
 	sess.mu.Unlock()
@@ -7009,6 +7348,13 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 		kept := make([]pendingNak, 0, len(pubNaks))
 		var gone []uint16
 		for _, n := range pubNaks {
+			if n.jsDur == q2AffDur && q2AffDur != _EMPTY_ {
+				// A session-affine QoS 2 copy: its sequence is a $MQTT_out sequence,
+				// so the $MQTT_msgs checks below say nothing about it. NAK it directly
+				// (JetStream ignores an ack for a delivery it does not recognize).
+				kept = append(kept, n)
+				continue
+			}
 			reaped := n.sseq < firstSeq
 			if !reaped {
 				if _, err := jsa.loadMsg(mqttStreamName, n.sseq); err != nil && !isErrorOtherThan(err, JSNoMessageFoundErr) {
@@ -7037,6 +7383,18 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 	// by the QoS2 subscribe path, so ensure it exists here whenever any PUBREL is
 	// pending (a resume may restore no QoS2 subscription, and a placeholder created
 	// at PUBREC may not yet carry an ack subject). Spec5 [MQTT-4.4.0-1].
+	if q2AffGen != _EMPTY_ {
+		if err := sess.ensureQ2AffineConsumerSubscription(c); err != nil {
+			c.Errorf("Unable to re-establish session-affine QoS 2 delivery on resume: %v", err)
+		} else if sess.asm != nil {
+			// Reconcile the assignments this generation still owns: complete the ones
+			// whose copy is already gone, and reap the ones whose source message no
+			// longer exists. Both would otherwise sit forever, and a stalled claim
+			// makes every contender wait on a winner with nothing left to deliver.
+			sess.asm.recoverQ2AffClaims(sess.idHash, q2AffGen)
+		}
+	}
+
 	if hasPendingPubRel {
 		if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
 			c.Errorf("Unable to re-establish PUBREL delivery on resume: %v", err)
@@ -7691,8 +8049,16 @@ CHECK:
 		es.clean = sessClean
 		es.expiryInterval = expiry
 		es.disconnectedAt = 0
-		// Clear this flag so we resubscribe to PUBREL subject is needed.
+		// Clear these flags so we resubscribe to the PUBREL and session-affine QoS 2
+		// delivery subjects if needed: both subscriptions belonged to the previous
+		// connection and went with it, while the consumers behind them (and their
+		// pending deliveries) are session state that survives.
 		es.pubRelSubscribed = false
+		es.q2AffSubscribed = false
+		// A resumed session must re-prove its affine delivery path before any move
+		// may use it: the persisted consumer config is not evidence that the
+		// consumer still exists. See ensureQ2AffineConsumerSubscription.
+		es.q2AffReady = false
 		if sessp {
 			// Resumed session: release retained (QoS1/2) deliveries with no
 			// JetStream backing. They cannot be redelivered, so keeping them would
@@ -8601,6 +8967,54 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin s
 	return size
 }
 
+// mqttMaxQoS2FormSize returns the largest NATS message a QoS 2 PUBLISH will ever
+// be encoded as. delivered is the size of the ordinary delivered/stored form
+// (already computed by the caller, since it is the QoS-independent baseline).
+//
+// Every form must fit the account's max payload, and the check has to happen at
+// admission: accepting a PUBLISH at PUBREC time that a LATER form then pushes
+// past max_payload leaves the client retrying an identical packet forever with
+// its hold record never released — worse than the losses these protocols exist
+// to fix. Bounds come from named constants shared with the encoders, never from
+// live values, because the preflight runs before any generation, claim or stream
+// sequence exists.
+//
+// Extracted from mqttProcessPub so each form can be compared against the others
+// directly in a test: several of them do not scale with the payload, so which one
+// dominates is header-size dependent, and a form that is only reachable for
+// (say) a tiny payload with a short topic is exactly the one an implementation
+// forgets to budget.
+func mqttMaxQoS2FormSize(pp *mqttPublish, delivered int, retained bool) int {
+	// RELEASE form: the delivered form plus the Nats-Msg-Id that makes a repeated
+	// onward store non-duplicating. See qos2_move.go.
+	total := delivered + mqttQoS2MsgIdHeaderMax
+	// HOLD form: the subject-encoded form plus the immutable generation header and
+	// the create-only expected-sequence header. The CAS header is NOT stripped
+	// before storage, so it counts.
+	if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained, _EMPTY_, _EMPTY_) +
+		mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax; hold > total {
+		total = hold
+	}
+	// TERMINAL form: an empty body, so its size does not depend on pp at all — for
+	// a small payload with a short topic it can be the largest. Its failure mode is
+	// the worst available: the onward store succeeds, the commit is rejected for
+	// size, and every retry repeats the delivery.
+	if terminal := mqttQoS2TerminalRecordMax(); terminal > total {
+		total = terminal
+	}
+	// AFFINE form: the copy written when this message is delivered to a shared
+	// subscription at effective QoS 2 and moved onto the chosen session's own
+	// subject. Same class of eternal wedge: the claim never materializes, the group
+	// delivery is never acked, and AckWait retries forever. The subscription
+	// identifier and Retain As Published option that size it belong to a SUBSCRIBE
+	// that has not happened yet, so both are budgeted at their maximum. See
+	// qos2_shared_affine.go.
+	if affine := mqttQ2AffineFormMax(pp, retained); affine > total {
+		total = affine
+	}
+	return total
+}
+
 // Composes a NATS message from a MQTT PUBLISH packet. The message includes an
 // internal header containint the original packet's QoS, and for QoS2 packets
 // the original subject.
@@ -8790,13 +9204,8 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	// later delivered with the TTL header (no subject headers); the two header
 	// sets never coexist, so we compare the actual forms rather than sum them.
 	//
-	// For QoS 2 there are THREE forms, and every one of them must fit: accepting a
-	// PUBLISH at PUBREC time that a later form then pushes past max_payload leaves
-	// the client retrying an identical packet forever with its hold record never
-	// released, which is worse than the loss this protocol fixes. Bounds come from
-	// named constants shared with the encoders (qos2_move.go), never from live
-	// values, because the preflight runs before either the generation or the hold
-	// record's sequence exists.
+	// For QoS 2 there are FOUR forms, and every one of them must fit; see
+	// mqttMaxQoS2FormSize.
 	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
 		// The delivered form carries the Nmqtt-Origin header; the QoS2 hold copy
 		// does not (origin is re-derived from the client on PUBREL release). Both
@@ -8805,23 +9214,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		retained := c.mqttOriginRetained(pp)
 		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin, retained, _EMPTY_, _EMPTY_)
 		if qos == 2 {
-			// RELEASE form: the delivered form plus the Nats-Msg-Id that makes a
-			// repeated onward store non-duplicating.
-			total += mqttQoS2MsgIdHeaderMax
-			// HOLD form: the subject-encoded form plus the immutable generation header
-			// and the create-only expected-sequence header. The CAS header is NOT
-			// stripped before storage, so it counts.
-			if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained, _EMPTY_, _EMPTY_) +
-				mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax; hold > total {
-				total = hold
-			}
-			// TERMINAL form: an empty body, so its size does not depend on pp at all —
-			// for a small payload with a short topic it can be the largest of the three.
-			// Its failure mode is the worst available: the onward store succeeds, the
-			// commit is rejected for size, and every retry repeats the delivery.
-			if terminal := mqttQoS2TerminalRecordMax(); terminal > total {
-				total = terminal
-			}
+			total = mqttMaxQoS2FormSize(pp, total, retained)
 		}
 		if total > int(maxPayload) {
 			// A v5 PUBLISH within the advertised Maximum Packet Size can still
@@ -9744,7 +10137,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 
 	pubRecFailed := isPubRec && reason >= 0x80
 
-	var jsAckSubject string
+	var jsAckSubject, q2AffClaim string
 	sess.mu.Lock()
 	// Must be the same client, and the session must have been setup for QoS2.
 	if sess.c != c {
@@ -9756,7 +10149,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// attempt.
 		sess.trackAsPubRel(pi, _EMPTY_)
 	}
-	jsAckSubject = sess.untrackPublish(pi)
+	jsAckSubject, q2AffClaim = sess.untrackPublish(pi)
 	// PUBACK / failed PUBREC freed an in-flight slot (a successful PUBREC is
 	// net-zero under a Receive Maximum and yields no NAKs): release withheld
 	// deliveries promptly. Spec5 [4.9].
@@ -9775,7 +10168,16 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// Send the ack to JS to remove the pending message from the consumer. On a
 	// failed PUBREC this still applies: the receiver has rejected the message,
 	// so it must not be redelivered.
-	sess.jsa.sendAck(jsAckSubject)
+	//
+	// A session-affine shared QoS 2 copy takes the confirmed route instead: its
+	// assignment claim may only be reaped once the affine side is PROVEN complete,
+	// and a queued ack proves nothing. Ordered after the PUBREL store above, so the
+	// copy is never released before the exchange has somewhere to continue from.
+	if q2AffClaim != _EMPTY_ {
+		c.mqttFinishQ2AffineDelivery(q2AffClaim, jsAckSubject)
+	} else {
+		sess.jsa.sendAck(jsAckSubject)
+	}
 	for _, subj := range deferredNaks {
 		sess.jsa.sendMsg(subj, AckNak)
 	}
@@ -10306,6 +10708,36 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		}
 		pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPub, subID, originalTopic, msg, props)
 		sess.jsa.sendAck(reply)
+		return
+	}
+
+	// A shared-subscription delivery at effective QoS 2 is MOVED, never tracked
+	// here: the exchange has to complete with the client the server chose, and a
+	// message pending on the group durable is redelivered to whichever member
+	// AckWait reaches next. The move takes durable ownership of it and hands it to
+	// this session's own consumer. Spec5 [MQTT-4.8.2-5], [MQTT-4.8.2-6]; see
+	// qos2_shared_affine.go.
+	//
+	// Unconditional, deliberately: there is no "only if this delivery already
+	// started" test, because `started` reads in-memory tracking maps that say
+	// nothing after a restart, a failover, or on another broker.
+	if sub.mqtt.shared && qos == 2 {
+		groupDurable := sub.mqtt.jsDur
+		sess.mu.Unlock()
+		var props []byte
+		if h != nil {
+			props = h.props
+		}
+		sess.moveStartedSharedQoS2(cc.srv, cc.mqtt.asm, &mqttQ2AffMoveInput{
+			groupDurable: groupDurable,
+			natsSubject:  strippedSubj,
+			reply:        reply,
+			props:        props,
+			msg:          msg,
+			retained:     retainAsPub,
+			subID:        subID,
+			maxPayload:   atomic.LoadInt32(&cc.mpay),
+		})
 		return
 	}
 

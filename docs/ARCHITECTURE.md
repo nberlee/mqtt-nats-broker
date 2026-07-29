@@ -142,8 +142,9 @@ NATS traffic on those subjects:
 | `$MQTT.sess.<domain>.<hash>` | session records |
 | `$MQTT.JSA.<...>` | JetStream API replies and session-persist broadcasts |
 | `$MQTT.willq.*`, `$MQTT.willcancel.*` | delayed-Will outbox and cancel watermarks |
-| `$MQTT.qos2.in.<hash>.<pi>`, `$MQTT.out.*` | inbound QoS 2 move state and outbound PUBREL state |
-| `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.qsub.*` | per-client delivery subjects |
+| `$MQTT.qos2.in.<hash>.<pi>`, `$MQTT.out.*` | inbound QoS 2 move state, outbound PUBREL state, and session-affine shared QoS 2 copies |
+| `$MQTT.qos2.assign.<group-durable>.<seq>` | shared-subscription QoS 2 assignment claims |
+| `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.deliver.q2.*`, `$MQTT.qsub.*` | per-client delivery subjects |
 
 Anything able to read `$MQTT.msgs.>` reads every QoS 1/2 message in the account,
 so the namespace is closed on every path a client can reach:
@@ -231,6 +232,89 @@ actively unsafe, since a broker still running the pre-move code would silently
 overwrite held records once the discard policy flipped. Upgrading a development
 store therefore means stopping **all** brokers for the account and recreating the
 stream, under the compatibility boundary above. This is not a rolling upgrade.
+
+## Session-affine shared-subscription QoS 2
+
+A QoS 2 message delivered to an MQTT 5.0 Shared Subscription is pending on the
+queue-delivered **group** durable from the moment its PUBLISH is sent until the
+client's PUBREC. Left there, a member leaving in that window makes AckWait offer
+the started message to a different member — which MQTT 5.0 [4.8.2] forbids. The
+broker therefore takes durable ownership of a started delivery and moves it off
+the group durable entirely. Implementation and its invariants are in
+`internal/mqtt/qos2_shared_affine.go`.
+
+Two durable pieces:
+
+| what | where | written by |
+|---|---|---|
+| assignment claim, one per `(group durable, source sequence)` | `$MQTT_qos2assign`, `$MQTT.qos2.assign.<group-durable>.<seq>` | a **create-only** CAS elects the winner; every later transition is a CAS at the record's exact sequence |
+| affine copy of the message | `$MQTT_out`, `$MQTT.out.q2.<client-id-hash>.<generation>.<claim-hash>` | a **create-only** CAS, so exactly one of several legitimate materializers wins |
+
+The claim is the arbitration record and it is honored **indefinitely** — not for
+the lifetime of a deduplication window. `Nats-Msg-Id` on the copy store is an
+optimization that narrows a duplicate-copy window; ownership never rests on it,
+for the same reason the inbound move protocol does not rest on it.
+
+**Session generation.** `<client-id-hash>` is a hash of the client ID, so a later
+clean session of the same client reuses it. A random 22-character generation,
+persisted with the session record, therefore scopes all three affine names — the
+copy subject, the consumer durable `$MQTT_Q2AFF_<hash>_<generation>`, and its
+deliver subject `$MQTT.deliver.q2.<hash>.<generation>` — so a leaked consumer from
+an earlier generation can neither read a new generation's copies nor inject into
+its delivery subscription. On resume the three are validated together and a
+mismatch **fails closed**: the consumer that cannot be accounted for may still
+hold an in-flight PUBLISH, so it is preserved for diagnosis rather than replaced.
+
+**Claim state.** A claim carries a monotonic phase (`claimed` → `materialized`,
+"does a copy provably exist?") plus three independent completion facts:
+`SourceAcked` (the group delivery's ack is proven committed), `AffineDone` (the
+copy reached a terminal state) and `Discarded` (the owning session ended). Every
+transition preserves facts already proven, and a claim may be deleted only when
+`SourceAcked ∧ (AffineDone ∨ (Discarded ∧ the copy is authoritatively absent))`.
+`Discarded` deliberately does **not** imply `SourceAcked`: reaping a discarded
+claim whose group ack never committed would let the source redelivery elect a
+fresh winner. For the same reason the group ack is proven by a JetStream double
+ack (`jsa.confirmAck`), not by the ordinary fire-and-forget `sendAck`.
+
+A fifth field, `Lost`, records the one outcome that is neither completion nor a
+permitted discard: the affine consumer was destroyed out of band, and interest
+retention took its pending copies with it, so a QoS 2 message the broker accepted
+was never delivered. `Lost` is terminal (no contender waits on it, and the group
+delivery is released) but never reapable, because the record is the only durable
+evidence that the loss happened and a clean reap would erase it. `Lost` and
+`AffineDone` are mutually exclusive and are not independently merged: whichever
+the durable record already proved stands.
+
+Telling the two apart is a matter of WRITE ORDER, not of observation. `AffineDone`
+is recorded **before** the copy is acked, so an absent copy under a claim that
+never reached `AffineDone` was never acked by a delivery — it was dropped with its
+consumer. Every broker reads that identically, which an "I saw the consumer
+disappear" flag could not: the broker that observed it may be gone, or the
+consumer may have been recreated, by the time anyone reconciles. The inverted
+window (recorded, not yet acked) is benign and self-correcting: the copy stays
+live, a live copy always keeps its claim (`reapable` requires the copy to be
+authoritatively absent), and the redelivered copy is disposed of by the delivery
+gate's terminal branch.
+
+**Stream prerequisites.** `$MQTT_qos2assign` must be `LimitsPolicy` +
+`DiscardOld` + `MaxMsgsPer: 1` — permanent retention is as load-bearing as the
+per-subject singleton, because claims are read by direct subject lookup and are
+never consumed, so interest or work-queue retention would drop them. `$MQTT_out`
+must stay `InterestPolicy`: that is how a discarded session's undelivered copies
+disappear with its consumer, and it is why a copy must never be stored before its
+consumer exists (a store with no interest returns success and keeps nothing). Both
+have validators (`validateQoS2AssignStream`, `validateOutStream`) that **fail
+broker startup** rather than update a non-conforming stream in place, and the two
+lists differ deliberately: each is derived from what that stream's owner actually
+does.
+
+**Mixed version.** The storage schema is rolling-compatible — an older broker
+ignores the new stream and the new session-record fields. The delivery *protocol*
+is not: an older broker serving the same shared group never consults
+`$MQTT_qos2assign` and will redistribute a started delivery a newer broker has
+claimed. Shared QoS 2 affinity holds only once every broker that can serve the
+group is q2aff-aware. See `docs/CONFORMANCE.md` for this and for the
+packet-identifier residual.
 
 ## JetStream domain
 

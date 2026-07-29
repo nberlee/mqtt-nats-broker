@@ -16,6 +16,7 @@ type (
 	PubAck                      = server.PubAck
 	JSApiConsumerCreateResponse = server.JSApiConsumerCreateResponse
 	JSApiConsumerDeleteResponse = server.JSApiConsumerDeleteResponse
+	JSApiConsumerInfoResponse   = server.JSApiConsumerInfoResponse
 	JSApiConsumerListResponse   = server.JSApiConsumerListResponse
 	JSApiConsumersRequest       = server.JSApiConsumersRequest
 	JSApiMsgDeleteRequest       = server.JSApiMsgDeleteRequest
@@ -60,6 +61,7 @@ const (
 	JETSTREAM                = server.JETSTREAM
 	JSApiConsumerCreateT     = server.JSApiConsumerCreateT
 	JSApiConsumerDeleteT     = server.JSApiConsumerDeleteT
+	JSApiConsumerInfoT       = server.JSApiConsumerInfoT
 	JSApiConsumerListT       = server.JSApiConsumerListT
 	JSApiDurableCreateT      = server.JSApiDurableCreateT
 	JSApiMsgDeleteT          = server.JSApiMsgDeleteT
@@ -97,6 +99,7 @@ const (
 )
 
 var (
+	AckAck                = server.AckAck
 	AckNak                = server.AckNak
 	ApiErrors             = server.ApiErrors
 	ErrAuthentication     = server.ErrAuthentication

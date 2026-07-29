@@ -5446,14 +5446,14 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 		testMQTTPubV5Props(t, c, r, 1, false, 7, "foo", payload, props) // completes with PUBACK
 	})
 
-	// max_payload set to the largest of the THREE actual QoS2 forms. The message
-	// fits; only the old buggy sum (hold headers + TTL header) would reject it.
+	// max_payload set to the largest of the actual QoS2 forms (release, hold,
+	// terminal, affine). The message fits; only the old buggy sum (hold headers +
+	// TTL header) would reject it.
 	t.Run("qos2 not over-rejected", func(t *testing.T) {
-		maxp := hold
-		for _, form := range []int{release, terminal} {
-			if form > maxp {
-				maxp = form
-			}
+		maxp := mqttMaxQoS2FormSize(pp, delivery, false)
+		if maxp < hold || maxp < release || maxp < terminal {
+			t.Fatalf("the admission budget %d does not cover every form (release %d, hold %d, terminal %d)",
+				maxp, release, hold, terminal)
 		}
 		o := testMQTTDefaultOptionsV5()
 		o.MaxPayload = int32(maxp)
