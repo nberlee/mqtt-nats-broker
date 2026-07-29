@@ -1,22 +1,79 @@
-# golangci-lint configuration.
-run:
-  timeout: 5m
-
-issues:
-  exclude-rules:
-    # The ported NATS-server MQTT core and vendored helpers are kept faithful to
-    # upstream (diff-able), so they are not subject to this repo's lint style.
-    - path: 'internal/mqtt/(mqtt|compat_.*)\.go'
-      linters: [govet, staticcheck, gocritic, revive, stylecheck, gosec, errcheck, ineffassign, unused]
+# golangci-lint configuration (schema v2 — golangci-lint 2.x).
+#
+# Migrated from the v1 schema, which a v2 binary rejects outright with
+# "unsupported version of the configuration", making `make lint` a target that
+# always failed without ever linting anything. Keep `version` in step with the
+# binary CI installs.
+version: "2"
 
 linters:
+  # errcheck, govet, ineffassign, staticcheck and unused are enabled by default
+  # in v2 and are deliberately not repeated here.
   enable:
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
-    - errcheck
-    - misspell
     - bodyclose
+    - misspell
+
+  settings:
+    misspell:
+      # Eclipse Mosquitto, the broker. A proper noun, not a misspelling of the
+      # insect.
+      ignore-rules:
+        - mosquitto
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # QF1001 (apply De Morgan's law) fires on the NUID base-62 alphabet tests in
+      # mqttValidQoS2Gen and mqttValidSessEpoch. Those read as "c is NOT in the
+      # alphabet"; distributing the negation over three range comparisons says the
+      # same thing far less clearly for a character-class predicate.
+      #
+      # Excluded by text rather than via linters.settings.staticcheck.checks: that
+      # setting REPLACES golangci-lint's default check list, which already omits
+      # ST1000/ST1003/ST1016/ST1020/ST1021/ST1022, so writing ["all", "-QF1001"]
+      # silently switches those style checks on across the whole repo.
+      - linters:
+          - staticcheck
+        text: 'QF1001'
+
+      # The ported NATS-server MQTT core and vendored helpers are kept faithful to
+      # upstream (diff-able), so they are not subject to this repo's lint style.
+      - linters:
+          - errcheck
+          - gocritic
+          - gosec
+          - govet
+          - ineffassign
+          - revive
+          - staticcheck
+          - unused
+        path: internal/mqtt/(mqtt|compat_.*)\.go
+
+      # The behavioral shims replace nats-server internals and keep upstream's
+      # shape so they stay diff-able (see docs/PORTING.md): unexported helpers,
+      # flag methods and struct fields are retained even where this broker does
+      # not call them yet. Only `unused` is excluded — every other linter still
+      # applies, because these files carry real, actively-edited logic.
+      - linters:
+          - unused
+        path: internal/mqtt/shim_.*\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
     - gofmt
     - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
