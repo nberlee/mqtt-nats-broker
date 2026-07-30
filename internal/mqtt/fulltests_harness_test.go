@@ -274,6 +274,29 @@ func checkClientsCount(t testing.TB, s *Server, expected int) {
 	})
 }
 
+// testMQTTWaitRetained blocks until the broker's retained-message index carries
+// an entry for the given NATS subject (the dotted form of the MQTT topic).
+//
+// A retained message is stored after its live fan-out, so observing the live
+// PUBLISH does not mean a subscribe issued straight afterwards would replay it.
+// This waits for the store instead of resubscribing until one happens to catch
+// it, which conflates store readiness with subscription behaviour.
+func testMQTTWaitRetained(t testing.TB, s *Server, subject string) {
+	t.Helper()
+	asm := testMQTTGetGlobalASM(t, s)
+	checkFor(t, testMQTTTimeout, 10*time.Millisecond, func() error {
+		asm.mu.RLock()
+		defer asm.mu.RUnlock()
+		if asm.retmsgs == nil {
+			return fmt.Errorf("no retained index yet")
+		}
+		if _, ok := asm.retmsgs.Find([]byte(subject)); !ok {
+			return fmt.Errorf("no retained message for %q yet", subject)
+		}
+		return nil
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Embedded-server pairing: the upstream suite assumes the MQTT *Server it
 // drives IS an embedded nats-server. Here each shim Server started by

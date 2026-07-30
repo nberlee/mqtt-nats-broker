@@ -79,39 +79,76 @@ func testNewJetStreamCluster(t *testing.T, size int) *testJetStreamCluster {
 	root := t.TempDir()
 	t.Cleanup(c.cleanup)
 
-	clusterPorts := make([]int, size)
+	var err error
+	for attempt := 1; attempt <= testClusterStartAttempts; attempt++ {
+		if err = c.startNodes(t, root, size); err == nil {
+			c.waitFormed(t, size)
+			return c
+		}
+		// A lost port is not a cluster that will ever form. Tear the partial one
+		// down and start over with fresh ports. See startNodes.
+		t.Logf("cluster %q start attempt %d/%d: %v", c.name, attempt, testClusterStartAttempts, err)
+		c.cleanup()
+		c.nodes = nil
+	}
+	t.Fatalf("cluster %q never started: %v", c.name, err)
+	return nil
+}
+
+// testClusterStartAttempts bounds how many times a cluster start is retried when a
+// node loses its reserved cluster port to another process.
+const testClusterStartAttempts = 3
+
+// startNodes reserves cluster ports and brings up size nodes on them.
+//
+// A port is only reserved until the reservation is closed, and the server that
+// wants it does not bind until it starts, so there is always a window in which
+// another process can take it. Losing it is silent: the node's client listener
+// comes up, its cluster listener does not, and the node never reports ready. The
+// window is kept as short as possible here — every reservation is held open until
+// the moment its own server is started — and the caller retries with fresh ports
+// if a node loses it anyway. (Reserving all the ports and only then constructing
+// and starting three servers, as this used to, leaves the last node's reservation
+// closed for as long as the first two take to start, which on a loaded machine is
+// long enough to lose regularly.)
+func (c *testJetStreamCluster) startNodes(t *testing.T, root string, size int) error {
+	t.Helper()
+	reservations := make([]net.Listener, size)
 	routeURLs := make([]string, size)
-	for i := range clusterPorts {
-		clusterPorts[i] = testFreePort(t)
-		routeURLs[i] = fmt.Sprintf("nats://127.0.0.1:%d", clusterPorts[i])
+	defer func() {
+		for _, l := range reservations {
+			if l != nil {
+				_ = l.Close()
+			}
+		}
+	}()
+	for i := range reservations {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve free port: %v", err)
+		}
+		reservations[i] = l
+		routeURLs[i] = fmt.Sprintf("nats://127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port)
 	}
 	routes := natsserver.RoutesFromStr(strings.Join(routeURLs, ","))
 
 	for i := 0; i < size; i++ {
-		c.newNode(t, root, clusterPorts[i], routes)
+		port := reservations[i].Addr().(*net.TCPAddr).Port
+		// Release this node's own port immediately before it is started, so the
+		// gap between "nobody holds it" and "this server holds it" is as narrow as
+		// it can be. The others stay reserved meanwhile.
+		_ = reservations[i].Close()
+		reservations[i] = nil
+		if err := c.newNode(t, root, port, routes); err != nil {
+			return err
+		}
 	}
-
-	c.waitFormed(t, size)
-	return c
-}
-
-// testFreePort reserves an ephemeral TCP port by binding and immediately closing,
-// so it can be handed to nats-server as an explicit cluster port. There is a small
-// reuse window, acceptable for tests.
-func testFreePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve free port: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
+	return nil
 }
 
 // newNode creates, starts and registers one embedded nats-server bound to the given
 // explicit cluster port, with the shared full route list.
-func (c *testJetStreamCluster) newNode(t *testing.T, storeRoot string, clusterPort int, routes []*url.URL) *testJSClusterNode {
+func (c *testJetStreamCluster) newNode(t *testing.T, storeRoot string, clusterPort int, routes []*url.URL) error {
 	t.Helper()
 	name := "N-" + nuid.Next()
 	// A subdirectory of the cluster-wide root rather than its own t.TempDir(), so
@@ -151,14 +188,17 @@ func (c *testJetStreamCluster) newNode(t *testing.T, storeRoot string, clusterPo
 	c.nodes = append(c.nodes, n)
 	go ns.Start()
 	if !ns.ReadyForConnections(10 * time.Second) {
-		t.Fatalf("cluster node %q not ready: running=%v addr=%v clusterAddr=%v",
+		// A nil cluster address with the client listener up means the cluster port
+		// was taken between reservation and bind; the caller retries the cluster
+		// with fresh ports. Returned rather than fatal for exactly that reason.
+		return fmt.Errorf("cluster node %q not ready: running=%v addr=%v clusterAddr=%v",
 			opts.ServerName, ns.Running(), ns.Addr(), ns.ClusterAddr())
 	}
 	// Stamp the bound client port into the template so a restart re-binds the same
 	// endpoint (equivalence only — cluster rejoin/catch-up relies on the preserved
 	// ServerName, cluster port and StoreDir, not on the client port).
 	opts.Port = ns.Addr().(*net.TCPAddr).Port
-	return n
+	return nil
 }
 
 // restartNode brings a stopped node back with the SAME ServerName, cluster endpoint,

@@ -296,6 +296,13 @@ const (
 	// messages sent to a session with QoS 1 subscriptions.
 	mqttDefaultMaxAckPending = 1024
 
+	// How long a closing connection's teardown waits out contention on the
+	// session gate before concluding it will not get it. Mirrors the CONNECT
+	// side's own spin, so neither starves the other. See
+	// lockSessionForTeardown.
+	mqttTeardownLockAttempts = 10
+	mqttTeardownLockItvl     = 100 * time.Millisecond
+
 	// Default MQTT 5.0 Receive Maximum advertised to v5 clients when the
 	// receive_maximum option is unset: the in-flight QoS 1/2 window a compliant
 	// client self-limits to, of which the server enforces the observable part
@@ -748,6 +755,29 @@ type mqttAccountSessionManager struct {
 	// before releasing the blocked enqueue, so a stray old cancel cannot be mistaken
 	// for the new enqueue-side fence. Nil in production.
 	testCancelWillDone func()
+
+	// testBeforeTeardownLock, when non-nil, is invoked by mqttHandleClosedClient for
+	// THIS account manager only (instance-scoped) after the closing connection has
+	// recorded what its Will is owed, but BEFORE it takes the session gate. Set/read
+	// under mu. Lets a test park the teardown there and drive a same-client-ID
+	// CONNECT to completion, so "the close was observed first, then the session was
+	// rebound" is an ordering rather than a probability. Nil in production.
+	testBeforeTeardownLock func(clientID string)
+
+	// testBeforeTakeoverDiscard, when non-nil, is invoked by mqttProcessConnect for
+	// THIS account manager only (instance-scoped) after a takeover has rebound the
+	// session to the new connection and before it decides the displaced
+	// connection's Will. Set/read under mu. That gap is the window in which the
+	// displaced connection can classify its own Will, so a test needs to hold it
+	// open to pin which interval that classification uses. Nil in production.
+	testBeforeTakeoverDiscard func(clientID string)
+
+	// testBeforeResumeNaks, when non-nil, is invoked on the resume path for THIS
+	// account manager only (instance-scoped) after subscriptions have been restored
+	// and before resendPendingRedelivery runs. Set/read under mu. Lets a test hold
+	// the resume open until a fresh delivery has certainly landed in the pending
+	// map, which is the window in which a NAK would duplicate it. Nil in production.
+	testBeforeResumeNaks func(clientID string)
 
 	// testReconcilePause, when non-nil, is invoked by a remote-expiry reconciliation
 	// worker for THIS account manager only (instance-scoped) AFTER it has loaded the
@@ -1280,6 +1310,148 @@ type mqttSub struct {
 	subID int
 }
 
+// mqttWillDisposition is what is owed to one connection's Will Message. (Not to
+// be confused with mqttWillState, the durable state of an outbox record.)
+//
+// A Will starts armed: the connection is up, nothing is owed yet, and a
+// same-client-ID CONNECT taking the session over discards it (a takeover is not
+// one of the events that publishes a Will, and it is the takeover itself that
+// closes the old connection). Observing the connection close is what makes the
+// Will owed, and an owed immediate Will can no longer be cancelled by a
+// reconnect: the Will Delay Interval it would have to be cancelled within has
+// already elapsed. Spec5 [3.1.2.5], [3.14.4], [MQTT-3.1.2-8].
+type mqttWillDisposition uint8
+
+const (
+	// mqttWillArmed is a Will on a live connection: publishable if the connection
+	// drops, discardable by a normal DISCONNECT or by a takeover.
+	mqttWillArmed mqttWillDisposition = iota
+	// mqttWillOwedNow is a Will whose connection has closed with no Will Delay
+	// Interval left to run. It must be published; a reconnect cannot cancel it.
+	mqttWillOwedNow
+	// mqttWillOwedDelayed is a Will whose connection has closed but whose Will
+	// Delay Interval is still running. It is enqueued on the durable outbox by the
+	// normal teardown, and a reconnect within the interval still cancels it.
+	mqttWillOwedDelayed
+	// mqttWillDischarged is terminal: the Will has been published, enqueued or
+	// discarded, and must not be acted on again.
+	mqttWillDischarged
+)
+
+// mqttWillIsDelayed reports whether a Will's publication has to wait out a Will
+// Delay Interval instead of happening when the connection closes. The interval
+// only defers a Will while the session outlives the connection: a zero Session
+// Expiry Interval ends the session at close, and the session ending is itself a
+// publication trigger. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
+func mqttWillIsDelayed(proto byte, will *mqttWill, sessionExpiry uint32) bool {
+	return proto == mqttProtoLevel5 && will != nil && will.props != nil &&
+		will.props.willDelay > 0 && sessionExpiry > 0
+}
+
+// mqttSessionExpiry reads THIS connection's effective Session Expiry Interval —
+// deliberately its own copy and not the session's, which a replacement
+// connection may already have overwritten (see mqtt.sessionExpiry). 0 for a
+// connection that never completed CONNECT, which also means "the session ends
+// when this connection closes", so its Will is due immediately: the right
+// default.
+//
+// No lock held on entry.
+func (c *client) mqttSessionExpiry() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mqtt == nil {
+		return 0
+	}
+	return c.mqtt.sessionExpiry
+}
+
+// mqttOweWill records that this connection's close has been observed, moving an
+// armed Will to owed. sessionExpiry is the session's effective Session Expiry
+// Interval, read by the caller while the session is still unambiguously this
+// connection's; it decides whether the Will is due now or after its delay.
+//
+// A no-op unless the Will is still armed, which is what keeps a
+// takeover-initiated close silent: the takeover discharged the Will before
+// closing the connection it displaces.
+//
+// No lock held on entry.
+func (c *client) mqttOweWill(sessionExpiry uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mqtt == nil || c.mqtt.cp == nil || c.mqtt.cp.will == nil ||
+		c.mqtt.willDisposition != mqttWillArmed {
+		return
+	}
+	if mqttWillIsDelayed(c.mqtt.proto, c.mqtt.cp.will, sessionExpiry) {
+		c.mqtt.willDisposition = mqttWillOwedDelayed
+	} else {
+		c.mqtt.willDisposition = mqttWillOwedNow
+	}
+}
+
+// mqttDiscardWill drops this connection's Will without publishing it. A normal
+// DISCONNECT does this. Spec [MQTT-3.1.2-8].
+//
+// No lock held on entry.
+func (c *client) mqttDiscardWill() {
+	c.mu.Lock()
+	c.mqttDiscardWillLocked()
+	c.mu.Unlock()
+}
+
+// Lock held on entry.
+func (c *client) mqttDiscardWillLocked() {
+	if c.mqtt == nil || c.mqtt.cp == nil {
+		return
+	}
+	c.mqtt.cp.will = nil
+	c.mqtt.willDisposition = mqttWillDischarged
+}
+
+// mqttDiscardWillOnTakeover drops the Will of a connection being displaced by a
+// new one with the same client ID. A takeover is not a Will publication trigger,
+// and it is the takeover that closes this connection, so an armed Will goes away
+// with it. A Will already owed immediately is not the takeover's to cancel: that
+// connection closed first, and the Will Delay Interval a reconnect would have to
+// cancel it within has already run out. A delayed one still is. Spec5 [3.1.2.5].
+//
+// No lock held on entry.
+func (c *client) mqttDiscardWillOnTakeover() {
+	c.mu.Lock()
+	if c.mqtt != nil && c.mqtt.willDisposition != mqttWillOwedNow {
+		c.mqttDiscardWillLocked()
+	}
+	c.mu.Unlock()
+}
+
+// mqttTakeWill consumes this connection's Will, returning it together with the
+// disposition it was consumed in; a nil Will means there is nothing left to do.
+//
+// Every path that discharges a Will goes through here, because more than one
+// runs: mqttHandleClosedClient is invoked twice for a graceful DISCONNECT (once
+// from the packet, once when the socket closes), the deferred-disconnect capture
+// takes over responsibility for an unresolved session, and a takeover races all
+// of them. "Has this already been discharged?" can only be answered by the same
+// transition that hands the Will over.
+//
+// No lock held on entry.
+func (c *client) mqttTakeWill() (*mqttWill, mqttWillDisposition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mqttTakeWillLocked()
+}
+
+// Lock held on entry.
+func (c *client) mqttTakeWillLocked() (*mqttWill, mqttWillDisposition) {
+	if c.mqtt == nil || c.mqtt.cp == nil || c.mqtt.cp.will == nil {
+		return nil, mqttWillDischarged
+	}
+	will, disposition := c.mqtt.cp.will, c.mqtt.willDisposition
+	c.mqtt.cp.will = nil
+	c.mqtt.willDisposition = mqttWillDischarged
+	return will, disposition
+}
+
 type mqtt struct {
 	r    *mqttReader
 	cp   *mqttConnectProto
@@ -1293,6 +1465,25 @@ type mqtt struct {
 	// It outlives individual packets so that ACK/DISCONNECT handlers running
 	// long after CONNECT can select the proper wire framing.
 	proto byte
+
+	// sessionExpiry is the effective Session Expiry Interval THIS connection
+	// negotiated (a v5 DISCONNECT may update it). It duplicates the session's own
+	// field on purpose: the session's belongs to whichever connection currently
+	// holds it, and a same-client-ID CONNECT overwrites it at the moment it
+	// rebinds — before the connection it displaces has finished closing. Deciding
+	// a displaced connection's Will delay from the replacement's interval gets it
+	// backwards in both directions (publishing a delayed Will the reconnect should
+	// have cancelled, or discarding an immediate one). Set under c.mu at CONNECT,
+	// read by mqttSessionExpiry. Spec5 [3.1.2.11.2].
+	sessionExpiry uint32
+
+	// willDisposition tracks what is owed to this connection's Will. It exists
+	// because two goroutines decide the Will's fate concurrently — this
+	// connection's teardown and a same-client-ID CONNECT taking the session over —
+	// and the answer depends on which of them observed the close first, which the
+	// Will pointer alone cannot express. Transitioned only under c.mu; consumed
+	// exactly once by mqttTakeWill. See mqttHandleClosedClient, mqttHandleWill.
+	willDisposition mqttWillDisposition
 
 	// pubOrigin is the authenticated No Local origin marker (or empty) resolved
 	// for the message currently being delivered. Set by
@@ -1457,6 +1648,31 @@ type mqttPending struct {
 	// recorded from the terminal paths (PUBREC, expiry, oversize discard), which
 	// see the packet identifier and nothing else. See qos2_shared_affine.go.
 	q2AffClaim string
+}
+
+// mqttPendingRef identifies one in-flight QoS 1/2 delivery. A packet identifier
+// alone does not: identifiers are released and reused, so the same number can
+// name a different delivery a moment later. The (durable, stream sequence) it
+// was delivered from is what makes it the same delivery.
+type mqttPendingRef struct {
+	pi    uint16
+	sseq  uint64
+	jsDur string
+}
+
+// mqttPendingRefs snapshots the identities currently tracked in a pending map.
+// Returns nil for an empty map, which reads the same as "nothing was pending".
+//
+// Session lock held on entry.
+func mqttPendingRefs(pending map[uint16]*mqttPending) map[mqttPendingRef]struct{} {
+	if len(pending) == 0 {
+		return nil
+	}
+	refs := make(map[mqttPendingRef]struct{}, len(pending))
+	for pi, ack := range pending {
+		refs[mqttPendingRef{pi, ack.sseq, ack.jsDur}] = struct{}{}
+	}
+	return refs
 }
 
 // mqttDeferredKey identifies a JS message delivery withheld by outbound flow
@@ -2223,6 +2439,12 @@ func (c *client) mqttParse(buf []byte) error {
 				if props != nil && props.present[mqttPropSessionExpiry] {
 					c.mu.Lock()
 					sess := c.mqtt.sess
+					// The connection's own copy moves with it, whether or not it still
+					// owns the session below: it is what classifies this connection's
+					// Will. Same Protocol Error rule, applied to its own value.
+					if c.mqtt.sessionExpiry != 0 || props.sessionExpiry == 0 {
+						c.mqtt.sessionExpiry = props.sessionExpiry
+					}
 					c.mu.Unlock()
 					if sess != nil {
 						sess.mu.Lock()
@@ -2240,11 +2462,13 @@ func (c *client) mqttParse(buf []byte) error {
 				c.traceInOp("DISCONNECT", nil)
 			}
 			if discardWill {
-				c.mu.Lock()
-				if c.mqtt.cp != nil {
-					c.mqtt.cp.will = nil
-				}
-				c.mu.Unlock()
+				c.mqttDiscardWill()
+			} else {
+				// Reason 0x04 makes the Will owed from this point, recorded before
+				// the teardown below runs and before any same-client-ID CONNECT can
+				// take the session over: from here the Will is no longer a takeover's
+				// to discard. Spec5 [3.14.4].
+				c.mqttOweWill(c.mqttSessionExpiry())
 			}
 			s.mqttHandleClosedClient(c)
 			c.closeConnection(ClientClosed)
@@ -2345,8 +2569,21 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		return
 	}
 
+	// Whatever closed this connection, classify what its Will is owed BEFORE
+	// contending for the session gate below. A same-client-ID CONNECT may be
+	// taking the session over right now, and both sides decide the Will's fate;
+	// this is the transition that settles which of them observed the close first.
+	// Already terminal (a normal DISCONNECT, or a takeover that discarded it) is
+	// a no-op. Spec5 [3.1.2.5].
+	c.mqttOweWill(c.mqttSessionExpiry())
+	asm.beforeTeardownLock(sess.id)
+
 	// Add this session to the locked map for the rest of the execution.
-	if err := asm.lockSession(sess, c); err != nil {
+	if err := asm.lockSessionForTeardown(sess, c); err != nil {
+		// The session now belongs to another connection, so none of the teardown
+		// below is ours to do — but an owed Will still has to be discharged, and
+		// nothing else will do it. See mqttPublishOwedWill.
+		s.mqttPublishOwedWill(c, asm)
 		return
 	}
 	defer asm.unlockSession(sess)
@@ -5190,6 +5427,77 @@ func (as *mqttAccountSessionManager) lockSession(sess *mqttSession, c *client) e
 	}
 	as.sessLocked[sess.id] = struct{}{}
 	return nil
+}
+
+// lockSessionForTeardown takes the session gate on behalf of a closing
+// connection, retrying for as long as that connection is still the session's
+// owner.
+//
+// lockSession fails for two very different reasons: the session has been rebound
+// to another connection (a takeover — nothing below is this connection's to do
+// any more), or the gate is merely held for a moment by another ownership-gated
+// operation, such as an uncertain-record resolution pass. Only the first is a
+// reason to give up. Giving up on the second would silently drop this
+// connection's whole teardown — including the Will it owes — over contention
+// that was about to clear.
+//
+// Bounded, and mirrors the CONNECT side's own spin (mqttProcessConnect). It
+// cannot deadlock: nothing that holds the gate waits on this teardown, and a
+// CONNECT registers the gate before it rebinds the session, so a teardown
+// waiting on a CONNECT observes the rebind on its next attempt.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) lockSessionForTeardown(sess *mqttSession, c *client) error {
+	var err error
+	for attempt := 0; attempt < mqttTeardownLockAttempts; attempt++ {
+		if err = as.lockSession(sess, c); err == nil {
+			return nil
+		}
+		sess.mu.Lock()
+		rebound := sess.c != c
+		sess.mu.Unlock()
+		if rebound {
+			return err
+		}
+		time.Sleep(mqttTeardownLockItvl)
+	}
+	return err
+}
+
+// beforeTeardownLock runs the teardown-ordering test seam, if one is installed.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) beforeTeardownLock(clientID string) {
+	as.mu.RLock()
+	hook := as.testBeforeTeardownLock
+	as.mu.RUnlock()
+	if hook != nil {
+		hook(clientID)
+	}
+}
+
+// beforeTakeoverDiscard runs the takeover-ordering test seam, if one is installed.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) beforeTakeoverDiscard(clientID string) {
+	as.mu.RLock()
+	hook := as.testBeforeTakeoverDiscard
+	as.mu.RUnlock()
+	if hook != nil {
+		hook(clientID)
+	}
+}
+
+// beforeResumeNaks runs the resume-ordering test seam, if one is installed.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) beforeResumeNaks(clientID string) {
+	as.mu.RLock()
+	hook := as.testBeforeResumeNaks
+	as.mu.RUnlock()
+	if hook != nil {
+		hook(clientID)
+	}
 }
 
 // Remove the session from the "locked" map.
@@ -8059,11 +8367,18 @@ func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
 // effect on a same-server reconnect, where the in-memory tracking maps survive;
 // after a restart or failover, redelivery falls back to the AckWait interval.
 //
+// resumePubs/resumeRels are the pending identities captured when the session was
+// attached to this connection, BEFORE any subscription was restored. Only those
+// are eligible: restoring subscriptions re-establishes interest, so by the time
+// this runs the consumer may already have pushed brand new deliveries into the
+// pending maps, and NAK'ing one of those redelivers a message that is on its way
+// to the client for the first time — a duplicate the client never asked for.
+//
 // If the disconnect lasted longer than AckWait, the consumer's own pending
 // check may already redeliver a message as interest is re-established; the NAK
 // then produces one extra copy. That is harmless (same packet identifier, DUP
 // set, so the client dedups) and does not happen on a timely reconnect.
-func (sess *mqttSession) resendPendingRedelivery(c *client) {
+func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRels map[mqttPendingRef]struct{}) {
 	type pendingNak struct {
 		pi         uint16
 		sseq       uint64
@@ -8086,10 +8401,11 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 			return 0
 		}
 	}
-	// Snapshot the messages pending AT RESUME first, before any JS round-trip
-	// below: re-establishing subscriptions (processSubs, already done) can trigger
-	// asynchronous fresh deliveries into pendingPublish, and those must not be
-	// NAK'd here (they are already being delivered). PUBLISH and PUBREL live on
+	// Keep only what was pending when the session was resumed. processSubs has
+	// already run, so the maps below can also hold deliveries this connection
+	// started moments ago; those are being transmitted for the first time and a
+	// NAK would duplicate them. The resume snapshot is the discriminator — the
+	// maps themselves cannot tell the two apart. PUBLISH and PUBREL live on
 	// different streams (distinct sequence spaces) and are paced differently, so
 	// collect them separately.
 	sess.mu.Lock()
@@ -8098,14 +8414,24 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 	hasReceiveMax := sess.rmax != 0
 	pubNaks := make([]pendingNak, 0, len(sess.pendingPublish))
 	for pi, ack := range sess.pendingPublish {
+		if _, atResume := resumePubs[mqttPendingRef{pi, ack.sseq, ack.jsDur}]; !atResume {
+			continue
+		}
 		if ack.jsAckSubject != _EMPTY_ {
 			pubNaks = append(pubNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject, ack.jsDur})
 		}
 	}
+	// Everything in flight that is NOT being NAK'd still occupies a slot at the
+	// client (a fresh delivery, or a pre-resume entry with no ack subject to NAK),
+	// so it has to come off the redelivery budget computed below.
+	notNakedPubs := len(sess.pendingPublish) - len(pubNaks)
 	relNaks := make([]pendingNak, 0, len(sess.pendingPubRel))
-	for _, ack := range sess.pendingPubRel {
+	for pi, ack := range sess.pendingPubRel {
+		if _, atResume := resumeRels[mqttPendingRef{pi, ack.sseq, ack.jsDur}]; !atResume {
+			continue
+		}
 		if ack.jsAckSubject != _EMPTY_ {
-			relNaks = append(relNaks, pendingNak{0, ack.sseq, ack.jsAckSubject, _EMPTY_})
+			relNaks = append(relNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject, _EMPTY_})
 		}
 	}
 	// The affine QoS 2 delivery path has to be re-established on resume for the
@@ -8209,11 +8535,12 @@ func (sess *mqttSession) resendPendingRedelivery(c *client) {
 
 	// PUBLISH redeliveries reuse their packet identifiers and bypass the in-flight
 	// gate, so respect the client's Receive Maximum: NAK at most the effective cap,
-	// in stream order; the JS consumer re-offers the rest via AckWait. When a
-	// Receive Maximum applies, in-flight PUBRELs count against it too, so subtract
-	// them; without one the cap is the JS MaxAckPending, which PUBRELs have already
-	// acked out of. Spec5 [MQTT-3.3.4-9].
-	capacity := maxAck
+	// in stream order; the JS consumer re-offers the rest via AckWait. Deliveries
+	// already in flight and not part of this NAK set hold slots of their own, so
+	// they come off the budget first. When a Receive Maximum applies, in-flight
+	// PUBRELs count against it too, so subtract them; without one the cap is the JS
+	// MaxAckPending, which PUBRELs have already acked out of. Spec5 [MQTT-3.3.4-9].
+	capacity := maxAck - notNakedPubs
 	if hasReceiveMax {
 		capacity -= inflightPubRel
 	}
@@ -8835,6 +9162,10 @@ CHECK:
 	sessClean := expiry == 0
 	// Session present? Assume false, will be set to true only when applicable.
 	sessp := false
+	// The QoS 1/2 deliveries this session already had in flight when it was bound
+	// to this connection, filled in by the resume path below and consumed by
+	// resendPendingRedelivery. Empty for a session that was not resumed.
+	var resumePubs, resumeRels map[mqttPendingRef]struct{}
 	// Do we have an existing session for this client ID
 	es, exists := asm.sessions[cid]
 	asm.mu.Unlock()
@@ -8948,12 +9279,19 @@ CHECK:
 			// leak a Receive Maximum slot for the life of the session.
 			es.dropUnredeliverableRetained()
 		}
+		// What this session already had in flight, captured before any subscription
+		// is restored — the only point at which "pending" unambiguously means
+		// "pending from before the disconnect". resendPendingRedelivery NAKs exactly
+		// these; anything the restored consumers push from here on is a first
+		// transmission that must not be redelivered on top of itself.
+		resumePubs, resumeRels = mqttPendingRefs(es.pendingPublish), mqttPendingRefs(es.pendingPubRel)
 		es.mu.Unlock()
 		if ec != nil {
-			// Remove "will" of existing client before closing
-			ec.mu.Lock()
-			ec.mqtt.cp.will = nil
-			ec.mu.Unlock()
+			asm.beforeTakeoverDiscard(cid)
+			// Remove the "will" of the existing client before closing it — unless
+			// that connection already closed and owes an immediate Will, which this
+			// takeover is too late to cancel. See mqttDiscardWillOnTakeover.
+			ec.mqttDiscardWillOnTakeover()
 			// Add to the map of the flappers
 			asm.mu.Lock()
 			asm.addSessToFlappers(cid)
@@ -9064,6 +9402,9 @@ CHECK:
 	c.mqtt.cp = cp
 	c.mqtt.asm = asm
 	c.mqtt.sess = es
+	// This connection's own copy of the interval, set in the same critical section
+	// as the Will it classifies. See mqtt.sessionExpiry.
+	c.mqtt.sessionExpiry = expiry
 	c.mu.Unlock()
 
 	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.
@@ -9221,10 +9562,11 @@ CHECK:
 	es.recoverDrains(c, skipDrains)
 	es.restoreDrains(c, skipDrains)
 
+	asm.beforeResumeNaks(cid)
 	// Re-send unacked QoS 1/2 messages (and reconcile any that expired while
 	// offline) on resume, whether or not saved subscriptions were restored: a
 	// session can carry unacknowledged PUBRELs with no active subscription.
-	es.resendPendingRedelivery(c)
+	es.resendPendingRedelivery(c, resumePubs, resumeRels)
 	return nil
 }
 
@@ -9553,11 +9895,10 @@ func mqttPayloadFormatIsUTF8(props []byte) bool {
 // [3.1.3.2.2], [MQTT-3.1.2-8].
 func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, sessGen string, originSessionSeq uint64, originSessEpoch string) {
 	c.mu.Lock()
-	if c.mqtt.cp == nil {
-		c.mu.Unlock()
-		return
-	}
-	will := c.mqtt.cp.will
+	// Consume the Will under the same lock the disposition is transitioned under:
+	// this runs twice for a graceful DISCONNECT (see mqttHandleClosedClient), and
+	// only the first invocation may act on it.
+	will, disposition := c.mqttTakeWillLocked()
 	if will == nil {
 		c.mu.Unlock()
 		return
@@ -9569,7 +9910,14 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, sessGen string,
 	// tracked on the account manager keyed by client ID (not on the session object,
 	// which a clean-start client removes on disconnect) so a reconnect can cancel
 	// it. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
-	if c.mqtt.proto == mqttProtoLevel5 && will.props != nil && will.props.willDelay > 0 && sessionExpiry > 0 {
+	//
+	// The close classified this already; recompute only for a Will that somehow
+	// reached here still armed, so the two can never disagree.
+	delayed := disposition == mqttWillOwedDelayed
+	if disposition == mqttWillArmed {
+		delayed = mqttWillIsDelayed(c.mqtt.proto, will, sessionExpiry)
+	}
+	if delayed {
 		asm := c.mqtt.asm
 		// Spec5 [3.1.3.2.2]: publish at the Will Delay Interval OR when the session
 		// ends, whichever is first, so cap the delay at the Session Expiry Interval.
@@ -9616,6 +9964,45 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, sessGen string,
 	// path so suppression does not depend on the Will Delay Interval. Spec5 [3.8.3.1].
 	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_)
 	c.flushClients(0)
+}
+
+// mqttPublishOwedWill discharges the Will of a connection whose teardown could
+// not take the session gate because the session has been rebound to a newer
+// connection. Nothing else will: the teardown that would have published it is
+// the one that just gave up, and the takeover deliberately does not publish the
+// Will of the connection it displaces.
+//
+// Only an immediate Will is published here. A delayed one is precisely what a
+// reconnect is entitled to cancel, and the reconnect that took this session over
+// is that cancellation — it advanced the durable cancel watermark before its
+// CONNACK. Spec5 [3.1.2.5].
+//
+// Publication goes through the account's internal client rather than this dying
+// one, whose NATS connection the concurrent takeover close may be tearing down
+// underneath it (mqttProcessConnect closes the displaced client asynchronously).
+//
+// No lock held on entry.
+func (s *Server) mqttPublishOwedWill(c *client, asm *mqttAccountSessionManager) {
+	c.mu.Lock()
+	if c.mqtt == nil || c.mqtt.willDisposition != mqttWillOwedNow {
+		c.mu.Unlock()
+		return
+	}
+	will, _ := c.mqttTakeWillLocked()
+	user := c.opts.Username
+	// The internal account client publishes with permissions of its own, so the
+	// dying connection's are checked here, while it is still around to ask —
+	// exactly as the delayed path does before it enqueues.
+	allowed := will != nil && c.pubAllowedFullCheck(string(will.subject), false, true)
+	c.mu.Unlock()
+	if will == nil || !allowed {
+		return
+	}
+	rec := &mqttWillOutbox{WillID: nuid.Next(), Account: asm.jsa.c.acc.GetName()}
+	willOutboxMessage(rec, will, mqttWillForwardProps(will.props), user)
+	if err := asm.deliverWillRecord(s, rec); err != nil {
+		c.Errorf("Unable to publish the Will of a session taken over mid-disconnect: %v", err)
+	}
 }
 
 // mqttWillForwardProps encodes a Will's properties as the raw block (length

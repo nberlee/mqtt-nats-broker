@@ -270,18 +270,13 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash, sess
 		WillID:           willID,
 		ClientIDHash:     cidHash,
 		Gen:              sessGen,
-		Topic:            string(will.topic),
-		Msg:              will.message,
-		QoS:              will.qos,
-		Retain:           will.retain,
-		Props:            props,
-		User:             user,
 		FireAt:           fireAt,
 		State:            mqttWillPending,
 		Account:          as.jsa.c.acc.GetName(),
 		OriginSessionSeq: originSessionSeq,
 		OriginSessEpoch:  originSessEpoch,
 	}
+	willOutboxMessage(rec, will, props, user)
 	var err error
 	for attempt := 0; attempt < mqttWillEnqueueAttempts; attempt++ {
 		newSeq, serr := as.storeWillEnqueueCAS(subject, 0, rec)
@@ -862,6 +857,20 @@ func (as *mqttAccountSessionManager) storeWillFinalizeCAS(subject string, expect
 		return hook(subject, expectSeq, rec)
 	}
 	return as.jsa.storeWillOutboxCAS(subject, expectSeq, rec)
+}
+
+// willOutboxMessage fills in the message-shaped fields of an outbox record from
+// a Will: what has to be published, independent of when or under whose claim.
+// Shared by the durable delayed-Will enqueue and by the immediate publication a
+// teardown makes when it has lost the session gate (mqttPublishOwedWill), so
+// both describe the same Will the same way.
+func willOutboxMessage(rec *mqttWillOutbox, will *mqttWill, props []byte, user string) {
+	rec.Topic = string(will.topic)
+	rec.Msg = will.message
+	rec.QoS = will.qos
+	rec.Retain = will.retain
+	rec.Props = props
+	rec.User = user
 }
 
 // publishWillRecord publishes a Will record, honoring the instance-scoped test

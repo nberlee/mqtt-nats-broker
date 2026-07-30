@@ -2225,6 +2225,14 @@ func TestMQTTv5NoLocal(t *testing.T) {
 	// with the same client ID as the Will owner, using No Local, must still
 	// receive the retained Will. Spec5 [3.8.3.1].
 	t.Run("retained will is not subject to No Local", func(t *testing.T) {
+		// A witness on a different client ID, subscribed before the Will fires. It
+		// turns "the Will was published" from something to poll for into something
+		// this test observes, so the same-ID reconnect below cannot race it.
+		wit, rwit := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wnl-witness", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer wit.Close()
+		testMQTTReadConnAckV5(t, rwit)
+		testMQTTSubV5(t, wit, rwit, 1, []mqttV5SubFilter{{topic: "wnl/topic", opts: 0}})
+
 		retWill := &mqttWill{topic: []byte("wnl/topic"), message: []byte("gone"), qos: 0, retain: true}
 		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wnl", cleanStart: true, will: retWill}, o.MQTT.Host, o.MQTT.Port)
 		testMQTTReadConnAckV5(t, rw)
@@ -2233,6 +2241,12 @@ func TestMQTTv5NoLocal(t *testing.T) {
 			t.Fatalf("Error writing DISCONNECT: %v", err)
 		}
 		cw.Close()
+		testMQTTReadPublishV5(t, rwit, "wnl/topic", []byte("gone"))
+
+		// The retained copy is stored after the live fan-out (mqttHandlePubRetain
+		// runs once the message is on its way), so wait for the store itself rather
+		// than for a subscribe to happen to catch it.
+		testMQTTWaitRetained(t, s, "wnl.topic")
 
 		// Reconnect with the same client ID and a No Local subscription. The Will
 		// is server-originated (no origin stamped, on either the live header or the
@@ -2240,19 +2254,8 @@ func TestMQTTv5NoLocal(t *testing.T) {
 		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wnl", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 		defer cs.Close()
 		testMQTTReadConnAckV5(t, rs)
-		// The retained Will store is asynchronous with no ack to wait on, so poll:
-		// re-subscribing replays retained at RH=0. A PUBLISH arriving proves the
-		// Will was not suppressed by this same-ID No Local subscription.
-		var delivered bool
-		for i := 0; i < 20 && !delivered; i++ {
-			testMQTTSubV5(t, cs, rs, uint16(i+1), []mqttV5SubFilter{{topic: "wnl/topic", opts: noLocalBit}})
-			if b, _, ok := testMQTTReadPacketReady(rs, 150*time.Millisecond); ok && b&mqttPacketMask == mqttPacketPub {
-				delivered = true
-			}
-		}
-		if !delivered {
-			t.Fatal("retained Will was not delivered to a same-ID No Local subscription")
-		}
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "wnl/topic", opts: noLocalBit}})
+		testMQTTReadPublishV5(t, rs, "wnl/topic", []byte("gone"))
 	})
 }
 

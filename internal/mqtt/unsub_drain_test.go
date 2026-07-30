@@ -580,14 +580,20 @@ func TestMQTTDrainDurablesDeletedOnCleanStart(t *testing.T) {
 func TestMQTTDrainSurvivesOrphanSweep(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
 
 	// Every consumer is old enough to be a candidate, so the grace window cannot
 	// make this test pass by simply skipping the drain.
+	//
+	// Overridden BEFORE the server starts and restored by a defer registered
+	// before the shutdown one: deferred calls run last-registered-first, so this
+	// ordering is what puts the restore AFTER the server (and the periodic sweep
+	// goroutine that reads this variable) has stopped.
 	origGrace := mqttOrphanSweepGrace
 	mqttOrphanSweepGrace = -time.Second
 	defer func() { mqttOrphanSweepGrace = origGrace }()
+
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
 
 	conn, sess, pi := testDrainSetup(t, s, o, "sweep", "sweep/topic", 1)
 	defer conn.c.Close()

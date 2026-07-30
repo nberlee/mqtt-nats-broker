@@ -549,13 +549,17 @@ func (s *Server) mqttDeferDisconnect(c *client, asm *mqttAccountSessionManager, 
 	action.willSessEpoch = asm.sessStreamEpoch
 
 	c.mu.Lock()
-	if c.mqtt.cp != nil && c.mqtt.cp.will != nil {
-		will := c.mqtt.cp.will
+	// Consume it: from here this deferred action owns the Will, and no other
+	// teardown path may publish it as well. See mqttTakeWill.
+	if will, disposition := c.mqttTakeWillLocked(); will != nil {
 		// Same rule as mqttHandleWill: a v5 Will Delay on a session that survives
 		// the connection defers publication, capped at the Session Expiry Interval;
-		// anything else is due immediately.
-		delayed := c.mqtt.proto == mqttProtoLevel5 && will.props != nil &&
-			will.props.willDelay > 0 && action.expiryInterval > 0
+		// anything else is due immediately. The close already classified it unless
+		// it somehow arrived here still armed.
+		delayed := disposition == mqttWillOwedDelayed
+		if disposition == mqttWillArmed {
+			delayed = mqttWillIsDelayed(c.mqtt.proto, will, action.expiryInterval)
+		}
 		if !c.pubAllowedFullCheck(string(will.subject), false, true) {
 			// Denied: never captured, so it can never be published later either.
 			will = nil

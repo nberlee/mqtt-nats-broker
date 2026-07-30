@@ -187,17 +187,21 @@ func TestQ2AffineReplicatedAssignmentStream(t *testing.T) {
 
 	_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rs, testMQTTTimeout)
 	if !ok || qos != 2 || string(payload) != "replicated" {
-		t.Fatalf("shared QoS 2 delivery: ok=%v qos=%d payload=%q", ok, qos, payload)
+		// A delivery that never arrives says nothing on its own: it can mean the
+		// arbitration lost the message or that the cluster was not in a state to
+		// deliver anything. Report which.
+		t.Fatalf("shared QoS 2 delivery: ok=%v qos=%d payload=%q\nclaims=%d\n%s",
+			ok, qos, payload, len(testQ2AffClusterClaims(t, b)), c.describe())
 	}
 	if n := len(testQ2AffClusterClaims(t, b)); n != 1 {
-		t.Fatalf("expected exactly one assignment claim on the replicated stream, got %d", n)
+		t.Fatalf("expected exactly one assignment claim on the replicated stream, got %d\n%s", n, c.describe())
 	}
 	c.waitStreamCurrent(t, testGlobalAccount, mqttQoS2AssignStreamName)
 
 	testQ2AffClusterComplete(t, cs, rs, pi)
 	checkFor(t, testMQTTTimeout, 100*time.Millisecond, func() error {
 		if n := len(testQ2AffClusterClaims(t, b)); n != 0 {
-			return fmt.Errorf("%d assignment claims survived a completed exchange", n)
+			return fmt.Errorf("%d assignment claims survived a completed exchange\n%s", n, c.describe())
 		}
 		return nil
 	})
