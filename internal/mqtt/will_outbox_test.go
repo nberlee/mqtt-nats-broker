@@ -1783,3 +1783,88 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 		t.Errorf("record state = %q, want publishing: the stale CAS must not have overwritten a claimed record", cur.State)
 	}
 }
+
+// TestMQTTWillOutboxDisplacedCancelIsGenerationScoped: the displaced-broker
+// cancel must only cancel the Wills its own evicted incarnation enqueued.
+//
+// Regression (a cross-incarnation data loss in the same class as the late-delete
+// race that generations exist to close): the displaced broker's cancel is
+// dispatched asynchronously from mqttHandleRemoteSessionPersist, so it can land
+// after the client has reconnected on another broker and disconnected again with a
+// NEW delayed Will. An unscoped cancel then destroys that Will, and nothing
+// recovers it — the reconnect watermark sits BELOW its origin sequence, so the
+// claimant fence lets it fire, but there is no longer a pending record to fire.
+//
+// The reconnect cancel on the CONNECT path stays deliberately unscoped, which the
+// second half asserts: a reconnect supersedes every earlier incarnation.
+func TestMQTTWillOutboxDisplacedCancelIsGenerationScoped(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	nc, _ := testMQTTConnect(t, &mqttConnInfo{clientID: "genscope", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer nc.Close()
+	asm := testMQTTGetGlobalASM(t, s)
+
+	cidHash := getHash("genscope")
+	retiredGen, freshGen := mqttNewSessGen(), mqttNewSessGen()
+
+	// Two pending records for the same client, from two incarnations. FireAt is far
+	// out so no claim loop resolves them underneath the test.
+	fireAt := time.Now().Add(time.Hour).UnixNano()
+	enqueue := func(gen string, originSeq uint64) string {
+		t.Helper()
+		willID := nuid.Next()
+		subject := mqttWillQSubject(asm.domainTk, cidHash, willID)
+		rec := &mqttWillOutbox{
+			WillID: willID, ClientIDHash: cidHash, Gen: gen,
+			Topic: "will/genscope", Msg: []byte(gen), FireAt: fireAt,
+			State: mqttWillPending, OriginSessionSeq: originSeq, OriginSessEpoch: asm.sessStreamEpoch,
+		}
+		if _, err := asm.jsa.storeWillOutboxCAS(subject, 0, rec); err != nil {
+			t.Fatalf("enqueue pending record for generation %q: %v", gen, err)
+		}
+		return subject
+	}
+	const displacedSeq = uint64(10)
+	retiredSubject, freshSubject := enqueue(retiredGen, displacedSeq), enqueue(freshGen, displacedSeq)
+	// The case a generation-only scope cannot see: the SAME session resumed on
+	// another broker, disconnected again, and enqueued a new Will. A persistent
+	// session keeps its incarnation across reconnects, so this record carries the
+	// retired generation too — only its origin sequence, advanced past the
+	// displaced broker's view by the resuming broker's own takeover save,
+	// distinguishes it.
+	resumedSubject := enqueue(retiredGen, displacedSeq+1)
+
+	stateOf := func(subject string) mqttWillState {
+		t.Helper()
+		rec, _, err := asm.jsa.loadWillOutbox(subject)
+		if err != nil || rec == nil {
+			t.Fatalf("reload %q: rec=%v err=%v", subject, rec, err)
+		}
+		return rec.State
+	}
+
+	// The displaced broker's late cancel, scoped to the connection it evicted.
+	if err := asm.cancelWillOutboxForIncarnation(s, cidHash, retiredGen, displacedSeq); err != nil {
+		t.Fatalf("cancelWillOutboxForIncarnation: %v", err)
+	}
+	if got := stateOf(retiredSubject); got != mqttWillCancelled {
+		t.Errorf("retired incarnation's Will state = %q, want cancelled", got)
+	}
+	if got := stateOf(freshSubject); got != mqttWillPending {
+		t.Errorf("later incarnation's Will state = %q, want pending: a displaced broker's cancel destroyed a Will it does not own", got)
+	}
+	if got := stateOf(resumedSubject); got != mqttWillPending {
+		t.Errorf("resumed connection's Will state = %q, want pending: the same session keeps its generation across a reconnect, "+
+			"so a generation-only scope destroys a Will enqueued after the displacement", got)
+	}
+
+	// A reconnect, by contrast, supersedes every incarnation.
+	if err := asm.cancelWillOutbox(s, cidHash); err != nil {
+		t.Fatalf("cancelWillOutbox: %v", err)
+	}
+	if got := stateOf(freshSubject); got != mqttWillCancelled {
+		t.Errorf("later incarnation's Will state = %q after an unscoped reconnect cancel, want cancelled", got)
+	}
+}

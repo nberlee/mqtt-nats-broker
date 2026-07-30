@@ -311,14 +311,31 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 	// orthogonal in MQTT 5, mirroring mqttHandleClosedClient's doClean = expiry==0):
 	// zero expiry deletes the record (it ends at connection close); any positive
 	// expiry re-saves it disconnected so a later reconnect can still resume it.
+	//
+	// Both are record writes, so they run in a record transaction like every other
+	// (I8) — opened before the mutation the re-save persists. It is uncontended: the
+	// CONNECT that owns this session released its accept transaction before calling
+	// here, and the client is already detached.
+	//
+	// This path deliberately does NOT take a teardown claim. It removes only the
+	// record, at an exact sequence, and its outcome is decided by the authoritative
+	// re-read below — which is the substance of the release protocol — while it
+	// deletes no consumers, so it has nothing it could wrongly delete. Widening it
+	// into a full teardown would change guarantees this function documents.
+	tok := es.beginRecordTx()
+	defer func() {
+		if terr := es.endRecordTx(tok); terr != nil {
+			s.Errorf("MQTT: %v", terr)
+		}
+	}()
 	if expiry == 0 {
-		_ = as.jsa.deleteMsg(mqttSessStreamName, candidate, true)
+		_ = as.rollbackDeleteSession(es, tok, candidate)
 	} else {
 		es.mu.Lock()
 		es.disconnectedAt = time.Now().Unix()
 		ps := es.buildPersistedSessionLocked()
 		es.mu.Unlock()
-		_ = as.rollbackStoreSession(&ps, cidHash, candidate)
+		_ = as.rollbackStoreSession(es, tok, &ps, cidHash, candidate)
 	}
 
 	// Classify by an authoritative re-read. A successful re-save lands at a NEW
@@ -392,7 +409,16 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 // rollbackStoreSession performs the rollback re-save CAS, honoring the instance-
 // scoped test seam so a test can fail the rollback without failing the initial
 // es.save() or unrelated stores.
-func (as *mqttAccountSessionManager) rollbackStoreSession(ps *mqttPersistedSession, idHash string, seq uint64) error {
+//
+// tok authorizes the write, as for every record write (I8): a rollback from a
+// terminated generation must not recreate the record.
+func (as *mqttAccountSessionManager) rollbackStoreSession(es *mqttSession, tok recordTx, ps *mqttPersistedSession, idHash string, seq uint64) error {
+	es.mu.Lock()
+	terr := es.validateRecordTxLocked(tok)
+	es.mu.Unlock()
+	if terr != nil {
+		return fmt.Errorf("refusing to roll back the record of session %q: %w", ps.ID, terr)
+	}
 	as.mu.RLock()
 	hook := as.testRollbackSessionStore
 	as.mu.RUnlock()
@@ -400,6 +426,18 @@ func (as *mqttAccountSessionManager) rollbackStoreSession(ps *mqttPersistedSessi
 		return hook(ps, idHash, seq)
 	}
 	return as.storeSessionRecordCAS(ps, idHash, seq)
+}
+
+// rollbackDeleteSession removes the candidate record at its exact sequence, under
+// the same authorization rule.
+func (as *mqttAccountSessionManager) rollbackDeleteSession(es *mqttSession, tok recordTx, seq uint64) error {
+	es.mu.Lock()
+	terr := es.validateRecordTxLocked(tok)
+	es.mu.Unlock()
+	if terr != nil {
+		return fmt.Errorf("refusing to roll back the record of session %q: %w", es.id, terr)
+	}
+	return as.jsa.deleteMsg(mqttSessStreamName, seq, true)
 }
 
 // rollbackLoadSession loads the current session record for the rollback

@@ -132,6 +132,20 @@ type mqttWillOutbox struct {
 	// willTakeoverFence.
 	OriginSessionSeq uint64 `json:"oseq,omitempty"`
 	OriginSessEpoch  string `json:"oep,omitempty"`
+	// Gen is the enqueuing session INCARNATION's generation (mqttSession.gen; see
+	// sess_incarnation.go). Empty means either a legacy session that predates
+	// generations or a record written by an older broker — both are one bucket, and
+	// both are matched only by an empty scope.
+	//
+	// It exists so the DISPLACED-broker cancel can say what it means. That scan's
+	// job is to cancel the Will its own evicted connection enqueued, but it is
+	// dispatched asynchronously and could otherwise land after the client has
+	// reconnected elsewhere and disconnected again — cancelling a LATER
+	// incarnation's Will, which the reconnect watermark does not suppress (that
+	// Will's origin sequence is beyond the marker) and no other layer recovers.
+	// The reconnect cancel on the CONNECT path is deliberately NOT scoped: a
+	// reconnect supersedes every earlier incarnation. See cancelWillOutbox.
+	Gen string `json:"gen,omitempty"`
 }
 
 // leaseValid reports whether the publishing claim lease is still valid at now.
@@ -249,12 +263,13 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 // success). If the durable enqueue still cannot be confirmed after the bounded
 // retries, the Will is published IMMEDIATELY as a fail-safe (trading the Will
 // Delay for not losing the Will) rather than left with no authority to fire it.
-func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
+func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash, sessGen string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
 	willID := nuid.Next()
 	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
 	rec := &mqttWillOutbox{
 		WillID:           willID,
 		ClientIDHash:     cidHash,
+		Gen:              sessGen,
 		Topic:            string(will.topic),
 		Msg:              will.message,
 		QoS:              will.qos,
@@ -366,7 +381,46 @@ func (as *mqttAccountSessionManager) earlyCancelIfSuperseded(s *Server, subject 
 	s.cancelWillTimer(subject)
 }
 
-// cancelWillOutbox suppresses a reconnecting client's pending delayed Wills by
+// cancelWillOutbox suppresses a reconnecting client's pending delayed Wills, in
+// EVERY incarnation: a reconnect supersedes all of them. See
+// cancelWillOutboxScoped for the semantics.
+func (as *mqttAccountSessionManager) cancelWillOutbox(s *Server, cidHash string) error {
+	return as.cancelWillOutboxScoped(s, cidHash, nil)
+}
+
+// willCancelScope names the exact set of delayed Wills a displaced broker may
+// cancel: those its own evicted connection enqueued.
+//
+// The generation alone is NOT that set. A persistent session keeps its incarnation
+// across reconnects (only a discard re-mints it), so broker B resuming the same
+// session, disconnecting, and enqueuing a NEW Will produces a record with the very
+// same generation — which a generation-only scan would then destroy, long after A
+// was displaced. maxOriginSeq closes that: it is the session-record sequence A
+// knew when it was displaced, and B's newer Will necessarily carries a higher one,
+// because B's own takeover save advanced the record past it. Sequences are
+// comparable only within one incarnation epoch, which is exactly the condition the
+// generation match already establishes.
+type willCancelScope struct {
+	gen string
+	// maxOriginSeq is inclusive. Zero means "no upper bound", used only by the
+	// unscoped reconnect cancel, which is entitled to everything.
+	maxOriginSeq uint64
+}
+
+// cancelWillOutboxForIncarnation cancels only the pending delayed Wills this
+// broker's displaced connection enqueued. That scan is dispatched asynchronously
+// and can land after the client has reconnected elsewhere and disconnected again,
+// so an unscoped cancel would destroy the newer Will — a loss no other layer
+// recovers, since the reconnect watermark sits BELOW that Will's origin sequence.
+//
+// Scoped by generation AND by an upper origin-sequence bound; see willCancelScope
+// for why the generation alone is not enough. sessGen may be _EMPTY_ (a legacy
+// incarnation), which matches only records that carry no generation.
+func (as *mqttAccountSessionManager) cancelWillOutboxForIncarnation(s *Server, cidHash, sessGen string, maxOriginSeq uint64) error {
+	return as.cancelWillOutboxScoped(s, cidHash, &willCancelScope{gen: sessGen, maxOriginSeq: maxOriginSeq})
+}
+
+// cancelWillOutboxScoped suppresses a client's pending delayed Wills by
 // CAS-transitioning each pending record to cancelled. A record already
 // publishing is irrevocable (that generation is due) and is left alone; the
 // claim loop later reaps cancelled native records. It is the authoritative
@@ -374,7 +428,10 @@ func (as *mqttAccountSessionManager) earlyCancelIfSuperseded(s *Server, subject 
 // completed cancellation: the scan is retried a bounded number of times and an
 // error is returned if it could not confirm every pending record was resolved
 // (cancelled, or already firing). Runs without locks (JSA I/O).
-func (as *mqttAccountSessionManager) cancelWillOutbox(s *Server, cidHash string) error {
+//
+// onlyGen nil cancels every incarnation's records; non-nil restricts to records
+// whose Gen equals *onlyGen.
+func (as *mqttAccountSessionManager) cancelWillOutboxScoped(s *Server, cidHash string, scope *willCancelScope) error {
 	// Instance-scoped test observer: fires after this cancel pass so the takeover
 	// late-enqueue test can confirm the displaced broker's async cancel completed on
 	// the empty outbox before a late enqueue is released. Nil in production.
@@ -396,8 +453,18 @@ func (as *mqttAccountSessionManager) cancelWillOutbox(s *Server, cidHash string)
 		// enqueue blocked behind this scan can land right after it and arm a timer
 		// for a record that is still pending, and stopping it would drop that Will
 		// back to the 5s scan latency.
-		captured := s.snapshotWillTimersWithPrefix(prefix)
-		if err = as.cancelWillOutboxOnce(s, filter); err == nil {
+		//
+		// The sweep is by CLIENT HASH, which a scoped cancel is not entitled to, so
+		// it is skipped there: an unreturned record is either another incarnation's
+		// (whose timer must survive) or already reaped (whose timer fires, finds
+		// nothing and stops — the same harmless posture as a failed pass here). The
+		// records this pass DID resolve had their timers cancelled by subject inside
+		// the scan.
+		var captured []willTimerRef
+		if scope == nil {
+			captured = s.snapshotWillTimersWithPrefix(prefix)
+		}
+		if err = as.cancelWillOutboxOnce(s, filter, scope); err == nil {
 			// Conclusively completed: nothing captured before the scan can still be
 			// wanted. Deliberately not done after a failed pass — an indeterminate
 			// scan may have left records pending, and their timers must survive.
@@ -413,7 +480,12 @@ func (as *mqttAccountSessionManager) cancelWillOutbox(s *Server, cidHash string)
 // only on an indeterminate outcome (a transient scan/load failure, or a CAS
 // write failure where the record is still pending); a CAS lost to a concurrent
 // fire (the record is no longer pending) is a resolved, non-error outcome.
-func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter string) error {
+//
+// scope, when non-nil, restricts the pass to records enqueued by that session
+// incarnation up to its origin-sequence bound. A skipped record is not an
+// unresolved one — it was never in scope — so it does not make the pass
+// indeterminate.
+func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter string, scope *willCancelScope) error {
 	for seq := uint64(1); ; {
 		smsg, err := as.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, seq)
 		if err != nil {
@@ -425,6 +497,18 @@ func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter stri
 		seq = smsg.Sequence + 1
 		rec := &mqttWillOutbox{}
 		if err := json.Unmarshal(smsg.Data, rec); err != nil {
+			continue
+		}
+		if scope != nil && rec.Gen != scope.gen {
+			// Another incarnation's Will. Out of scope, and its local fire timer must
+			// be left armed — this pass has no authority over either.
+			continue
+		}
+		if scope != nil && scope.maxOriginSeq != 0 && rec.OriginSessionSeq > scope.maxOriginSeq {
+			// Same generation, but enqueued by a LATER connection of that session —
+			// its origin sequence is past the record this broker was displaced at, so
+			// it cannot be ours. A persistent session keeps its generation across
+			// reconnects, which is precisely why the generation alone cannot decide.
 			continue
 		}
 		if rec.State != mqttWillPending {

@@ -816,8 +816,11 @@ func TestQ2AffineClearLeavesSessionReusable(t *testing.T) {
 	if gen != _EMPTY_ || ready {
 		t.Fatalf("clear() left affine state behind: gen=%q ready=%v", gen, ready)
 	}
-	// And the cleared object really can provision again.
-	if err := sess.ensureQ2AffineConsumerSubscription(cl); err != nil {
+	// And the cleared object really can provision again — at its NEW record
+	// generation, since clear() ended the old one.
+	if err := testSessRecordTx(t, sess, func(tok recordTx) error {
+		return sess.ensureQ2AffineConsumerSubscription(cl, tok)
+	}); err != nil {
 		t.Fatalf("a cleared session could not re-provision its affine path: %v", err)
 	}
 	sess.mu.Lock()
@@ -853,7 +856,9 @@ func TestQ2AffineUnaccountableConsumerFailsClosed(t *testing.T) {
 	}
 	sess.mu.Unlock()
 
-	if err := sess.ensureQ2AffineConsumerSubscription(cl); err == nil {
+	if err := testSessRecordTx(t, sess, func(tok recordTx) error {
+		return sess.ensureQ2AffineConsumerSubscription(cl, tok)
+	}); err == nil {
 		t.Fatal("an unaccountable affine consumer was accepted; it must fail closed")
 	} else if !strings.Contains(err.Error(), "unaccountable") {
 		t.Fatalf("unexpected failure reason: %v", err)

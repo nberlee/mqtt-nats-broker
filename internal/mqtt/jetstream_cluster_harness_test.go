@@ -331,7 +331,7 @@ type testClusterBroker struct {
 // index (deterministic initial placement). The willq and other MQTT streams are
 // created R3 (MQTT.StreamReplicas=3), which requires the cluster to be formed
 // first. Cleanup is completion-aware and never touches the shared cluster.
-func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int) *testClusterBroker {
+func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int, tweaks ...func(*Options)) *testClusterBroker {
 	t.Helper()
 	urls := strings.Join(c.orderedURLs(preferred), ",")
 	nc, err := nats.Connect(urls,
@@ -350,6 +350,11 @@ func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int) *testClu
 	opts.ServerName = node
 	opts.MQTT.StreamReplicas = 3 // willq path reads this (mqtt.go)
 	opts.StreamReplicas = 3      // belt-and-suspenders
+	// Applied before Start, so anything baked into consumers at creation time (the
+	// AckWait a drain's redelivery waits out, say) takes effect.
+	for _, tweak := range tweaks {
+		tweak(opts)
+	}
 
 	s := NewServer(nc, opts, node)
 	if err := s.Start(); err != nil {

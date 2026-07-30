@@ -1005,8 +1005,13 @@ func (sess *mqttSession) closeQ2AffAndDrain() (gen, durable string) {
 // subscription) instead of re-provisioning: the config we cannot account for may
 // belong to a consumer that still holds an in-flight PUBLISH.
 //
+// tok identifies the caller's open record transaction. This runs both inside a
+// SUBSCRIBE packet (whose token it is handed) and standalone from
+// resendPendingRedelivery (which opens its own first), so ownership is passed
+// explicitly rather than inferred — see sess_recordtx.go.
+//
 // Runs from the client's readLoop. sess.mu not held on entry.
-func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client) error {
+func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recordTx) error {
 	sess.mu.Lock()
 	if sess.q2AffClosing {
 		sess.mu.Unlock()
@@ -1177,9 +1182,24 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client) error {
 	// that no record names is unfindable after a restart, so its copies would be
 	// stored into a subject nothing will ever deliver from.
 	if existing == nil {
-		if err := sess.save(); err != nil {
+		outcome, err := sess.saveClassified(tok)
+		if err != nil {
 			c.Errorf("Unable to persist the affine QoS 2 consumer for client %q: %v", id, err)
-			rollback()
+			// Undo only when the write DEFINITELY did not land. An ambiguous one may
+			// have stored a record that names this consumer, and detaching it in
+			// memory would leave that record pointing at something the session no
+			// longer knows about. Which way memory reconciles is the readback's to
+			// decide, not the failing writer's. See sess_uncertain.go.
+			switch outcome {
+			case saveDefinitelyFailed:
+				rollback()
+			case saveMaybeLanded:
+				// The record may name the consumer, so keep the view — the reconciliation
+				// depends on an outcome nobody knows yet — and let the readback detach it
+				// if it proves the write never landed: a record that does not name this
+				// consumer must not be paired with a session that does.
+				sess.retainOnUncertain(func(recordTx) { rollback() }, nil)
+			}
 			return err
 		}
 	}

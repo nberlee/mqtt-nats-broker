@@ -31,9 +31,14 @@ sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Quickstart
 
-The bridge targets the latest JetStream behavior provided by the
-`nats-server/v2` version pinned in `go.mod`; older JetStream releases are not a
-supported compatibility target.
+**Requires nats-server 2.14 or newer.** Releases before 2.14 are explicitly
+unsupported — not degraded, not fallback-handled. The bridge's durability
+guarantees rest on specific JetStream behaviors (per-subject CAS, interest
+retention, deduplication, per-message TTL, double ack); those are asserted against
+2.14 and validated at startup rather than worked around. `go.mod` pins the exact
+version tested. See "JetStream behaviors this design depends on" in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the list a version bump has to
+re-verify.
 
 Run a broker + NATS locally:
 

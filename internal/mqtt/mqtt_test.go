@@ -3954,8 +3954,7 @@ func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
 
 	subPI1 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data1"))
 	subPI2 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data2"))
-	// subPI3 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data3"))
-	_ = testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data3"))
+	subPI3 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data3"))
 
 	// fully receive first message
 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI1)
@@ -3969,16 +3968,17 @@ func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
 	// Unsubscribe
 	testMQTTUnsub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: qos2}})
 
-	// We expect that PI2 and PI3 will continue to be delivered, from their
-	// respective states.
+	// PI2 and PI3 both continue from their respective states, which is what
+	// [MQTT-3.10.4-3] requires: PI2 is past PUBREC so only its PUBREL replays,
+	// while PI3 was transmitted but never acknowledged, so its PUBLISH is
+	// redelivered and the whole exchange completes. The consumer survives the
+	// UNSUBSCRIBE as a DRAIN precisely so this can happen; before that it was torn
+	// down and PI3 was silently lost. See internal/mqtt/unsub_drain.go.
 	gotPI2PubRel := false
-
-	// TODO: Currently, we do not get the unacknowledged PUBLISH re-delivered
-	// after an UNSUBSCRIBE. Ongoing discussion if we should/must.
-	// gotPI3Publish := false
-	// gotPI3PubRel := false
-	for !gotPI2PubRel /* || !gotPI3Publish || !gotPI3PubRel */ {
-		b, _ /* len */ := testMQTTReadPacket(t, r)
+	gotPI3Publish := false
+	gotPI3PubRel := false
+	for !gotPI2PubRel || !gotPI3Publish || !gotPI3PubRel {
+		b, pl := testMQTTReadPacket(t, r)
 		switch b & mqttPacketMask {
 		case mqttPacketPubRel:
 			pi, err := r.readUint16("packet identifier")
@@ -3989,20 +3989,23 @@ func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
 			case subPI2:
 				testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
 				gotPI2PubRel = true
-			// case subPI3:
-			// 	testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
-			// 	gotPI3PubRel = true
+			case subPI3:
+				if !gotPI3Publish {
+					t.Fatalf("got the PUBREL for PI %v before its PUBLISH was redelivered", pi)
+				}
+				testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
+				gotPI3PubRel = true
 			default:
-				t.Fatalf("Expected PI %v got: %v", subPI2, pi)
+				t.Fatalf("Expected PI %v or %v got: %v", subPI2, subPI3, pi)
 			}
 
-		// case mqttPacketPub:
-		// 	_, pi, _ := testMQTTGetPubMsgExEx(t, c, r, b, len, "foo", []byte("data3"))
-		// 	if pi != subPI3 {
-		// 		t.Fatalf("Expected PI %v got: %v", subPI3, pi)
-		// 	}
-		// 	gotPI3Publish = true
-		// 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI3)
+		case mqttPacketPub:
+			_, pi, _, _ := testMQTTGetPubMsgExEx(t, c, r, b, pl, "foo", []byte("data3"))
+			if pi != subPI3 {
+				t.Fatalf("Expected PI %v got: %v", subPI3, pi)
+			}
+			gotPI3Publish = true
+			testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI3)
 
 		default:
 			t.Fatalf("Unexpected packet type: %v", b&mqttPacketMask)
@@ -4268,16 +4271,45 @@ func TestMQTTUnsubscribeWithPendingAcks(t *testing.T) {
 	testMQTTUnsub(t, 1, c, r, []*mqttFilter{{filter: "foo"}})
 	testMQTTFlush(t, c, nil, r)
 
+	// DIVERGENCE FROM UPSTREAM, deliberately inverting this assertion: upstream
+	// expects the pending ack map to be EMPTY here, i.e. the started QoS 1 PUBLISH
+	// was dropped by the UNSUBSCRIBE. [MQTT-3.10.4-3] forbids that — the server
+	// must complete the delivery of a QoS 1/2 message it has already started
+	// sending — so the consumer survives as a DRAIN instead and the delivery is
+	// still owed. See internal/mqtt/unsub_drain.go and docs/ROADMAP.md.
 	mc := testMQTTGetClient(t, s, "sub")
 	mc.mu.Lock()
 	sess := mc.mqtt.sess
+	mc.mu.Unlock()
 	sess.mu.Lock()
 	pal := len(sess.pendingPublish)
+	draining := len(sess.drainByDur)
 	sess.mu.Unlock()
-	mc.mu.Unlock()
-	if pal != 0 {
-		t.Fatalf("Expected pending ack map to be empty, got %v", pal)
+	if pal != 1 {
+		t.Fatalf("Expected the started QoS 1 delivery to still be pending, got %v", pal)
 	}
+	if draining != 1 {
+		t.Fatalf("Expected the consumer to be draining, got %v drain(s)", draining)
+	}
+
+	// It really is still deliverable: it is redelivered (DUP set) and PUBACK
+	// completes it.
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1|mqttPubFlagDup, []byte("msg"))
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+
+	// Completing the last claim retires the drain and its durable: the record no
+	// longer references it, so nothing is left behind.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if n := len(sess.drainByDur); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		if n := len(sess.pendingPublish); n != 0 {
+			return fmt.Errorf("delivery still pending (%d)", n)
+		}
+		return nil
+	})
 }
 
 func TestMQTTMaxAckPending(t *testing.T) {

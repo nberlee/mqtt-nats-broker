@@ -78,19 +78,217 @@ is fixed before feature work continues.
   DUP=1 and a fresh identifier), and mixed-version operation — the storage schema
   is rolling-compatible, the delivery protocol is not, so affinity holds only once
   every broker that can serve the group is q2aff-aware.
-- [ ] Decide and test the expected QoS 2 behavior for an unacknowledged PUBLISH
-  after UNSUBSCRIBE. Decided: comply with [MQTT-3.10.4-3] for plain consumers by
-  draining — the durable and its delivery subscription survive the UNSUBSCRIBE
-  while deliveries already started remain pending, and fresh deliveries are
-  discarded. That needs a durable state machine (staged and committed drain
-  states, a persist-before-ack transition on every pending removal, QoS 2 commit
-  only after the PUBREL store succeeds, persisted delivery metadata, and recovery
-  that reconciles against consumer pending state), so it is planned and reviewed
-  separately. The QoS 1/2 to QoS 0 re-SUBSCRIBE downgrade
-  (`execDeferredConsumerDelete`) is out of scope: it replaces a subscription
-  rather than deleting one. The plain-consumer drain alone must not tick this
-  item as universally compliant — it closes only once the shared QoS 2 item above
-  is also resolved.
+- [x] Arbitrate session teardown across brokers, and stop deriving deterministic
+  resource names from the client hash alone. Found while planning the UNSUBSCRIBE
+  drain, which the race would have applied to a drain durable as well. `clear()`
+  deleted a session's resources with no cross-broker arbitration — the record
+  transaction and `lockSession` are in-process — so after broker A resolved
+  against record sequence S, broker B could take the session over and save a newer
+  record before A reached its deletions. A then deleted the durables B had just
+  restored (the plain ones share their names, since B restores `Cons` verbatim,
+  and the PUBREL durable was deterministic) and finally deleted sequence S, which
+  `MaxMsgsPer: 1` had already removed — so the delete reported "sequence not
+  found", which `clear()` read as success. B was left holding a valid record
+  referencing deleted consumers, and on the interest-retained streams the messages
+  they held went with them. Not specific to any one path: clean start, session
+  expiry and takeover-discard all took it.
+
+  Fixed in two parts, of which the naming one is load-bearing. (1) A persisted
+  **session-incarnation generation** now scopes every name that used to derive from
+  the client hash alone — the PUBREL durable, subject and delivery subject, the
+  inbound QoS 2 hold subjects and their purge filter, and each delayed-Will
+  outbox record — so a delete issued by a retired incarnation can only name a
+  resource that no longer exists. A claim alone could not have achieved that: a
+  nonce re-check before each delete is a check-then-act, and a paused broker can
+  verify its claim, let a peer finish the entire teardown and create a fresh
+  session, and only then complete its delete. (2) A **teardown claim** on the
+  record itself (`Teardown{Origin, Nonce, StartedAt}`, CAS'd at the sequence the
+  broker resolved against) keeps two brokers from tearing down and resuming the
+  same record at once: a lost claim deletes *nothing*, and the release —
+  a sequence-targeted delete — is classified by re-reading rather than assumed
+  (absent means done, our nonce means retry, a foreign nonce or no marker means a
+  newer owner exists). Every CONNECT that finds a marker **finishes** it and then
+  starts fresh with a fresh generation and Session Present false, which also makes
+  a crashed teardown self-healing instead of leaking until the orphan sweep.
+
+  Residuals, both in `docs/CONFORMANCE.md`: sessions written before this carry no
+  generation, keep the legacy hash-only names and stay exposed to the race until
+  they are next discarded (which re-mints them); and, like the affine protocol,
+  both halves hold only once every broker in the cluster understands them — an
+  older broker ignores `Teardown` and would overwrite a marker, and uses the old
+  names.
+- [x] Decide and test the expected QoS 2 behavior for an unacknowledged
+  PUBLISH after UNSUBSCRIBE. Decided and implemented:
+  comply with [MQTT-3.10.4-3] for
+  plain consumers by **draining** (`internal/mqtt/unsub_drain.go`). The durable
+  and its delivery subscription survive the UNSUBSCRIBE while deliveries already
+  started remain pending; messages published to the filter afterwards are
+  discarded. The drain is a session-record field, so it survives disconnect,
+  restart and failover, and it lives until every started delivery completes or the
+  session ends.
+
+  Closed by two halves: the plain drain here, and session-affine shared QoS 2 in
+  `ee80a5c`. Shared QoS 1 redistribution to another member remains permitted and
+  documented rather than changed, and the QoS 1/2 to QoS 0 re-SUBSCRIBE downgrade
+  (`execDeferredConsumerDelete`) stays out of scope: it replaces a subscription
+  rather than removing one.
+
+  The state machine rests on: persist-before-ack on every claim removal (one
+  helper owns every such ack); a durable **PUBREL intent** written *before* the
+  store, which is what makes recovery positive rather than a guess; a three-valued
+  phase, because "a PUBREL exists" and "the store outcome is unknown" must not
+  authorize the same actions; single ownership, so a drained consumer is invisible
+  in `sess.cons` and a re-SUBSCRIBE **adopts** it instead of building a second
+  durable on the same filter; and a resume **barrier** that reconstructs each
+  phase before any source interest exists, so a restart cannot resend the payload
+  of an exchange already past PUBREC. A recreated PUBREL is verified by presence at
+  its returned sequence, never by the store response, and escapes a poisoned
+  deduplication identity by bumping a persisted attempt counter.
+
+  Two previously-disabled assertions in
+  `TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe` are now enabled, and
+  `TestMQTTUnsubscribeWithPendingAcks` is inverted (upstream expects the started
+  delivery to be dropped, which [MQTT-3.10.4-3] forbids). Residuals are in
+  `docs/CONFORMANCE.md`: an offline backlog on the drained filter, a refusal to
+  drain at all where `$MQTT_msgs` carries a stream-level
+  `ConsumerLimits.InactiveThreshold` (which no consumer config can escape, so
+  UNSUBSCRIBE falls back to today's destructive teardown and warns), a
+  best-effort clear of the escapable *per-consumer* inactivity timer whose failure
+  leaves the durable reapable while offline (reported as loss, never as
+  completion), packet-identifier continuity across a restart, and mixed-version
+  operation — an older broker ignores `Drains` and its orphan sweep can delete a
+  drained durable.
+  **Verification.** The acceptance matrix from the implementation plan is complete
+  and every case is mutation-checked — a mutation that breaks the behavior must
+  fail its test, or the test is not evidence. Four test files:
+
+  - `unsub_drain_test.go` — fresh-message discard, reconnect survival, adoption and
+    its consumer accounting (`consCharged`/`tmaxack` unchanged, no double charge),
+    a QoS 0 re-SUBSCRIBE **not** adopting, the withheld-delivery rule (I5),
+    `clear()` deleting drain durables, `sweepOrphanedConsumers` treating a drain as
+    referenced, offline-backlog discard, a `foo/#` filter draining both its main
+    sid and its `fwc` companion, survival of an offline period longer than the
+    per-consumer inactivity threshold and that clear retried on resume, refusal
+    under a stream-level `ConsumerLimits.InactiveThreshold` with the warning
+    asserted and the destructive fallback observed, stage-time rollback (v5 0x83),
+    completion-save failure, and a restored claim redelivered with DUP across a
+    restart.
+  - `unsub_drain_pubrel_test.go` — the combined restart state (no subscription, a
+    QoS 2 drain **and** a stored PUBREL); the resume barrier finalizing a stored
+    PUBREL with PUBREL delivery deliberately stalled so the source redelivery gets
+    its chance first; persist-before-forward proven by PUBCOMP-then-crash;
+    recreation from a persisted intent under the original identifier; both
+    deduplication-poisoning shapes (record deleted with its entry surviving, and a
+    store *skipped* for lack of interest); the barrier failing closed on an
+    unreadable scan; definite and ambiguous intent-write failure, the latter
+    proving the three-way readback adopts its own record rather than rejecting the
+    first same-broker reconnect; and a restored claim carrying a Message Expiry
+    Interval redelivered with DUP rather than dropped by the `!started` gate.
+  - `unsub_drain_recovery_test.go` (default tree) — reconciliation and record-fence
+    rules: an intent-bearing claim is never pruned, barrier-skipped durables are
+    left alone, a failed save is undone, the fence opens before any mutation, and a
+    message absent above `FirstSeq` is pruned by the exact lookup.
+  - `unsub_drain_cluster_test.go` (R3, two brokers) — resume of a PUBLISH-phase
+    claim on a different broker; a PUBREC-to-PUBCOMP exchange completed by a broker
+    that never saw it, under the **original** packet identifier; and a superseded
+    broker's late PUBREL store collapsing into the peer's recreate, so exactly one
+    PUBREL reaches the client.
+
+  Writing these, and the reviews around them, found a series of implementation
+  defects — all fixed and mutation-pinned.
+
+  In the drain itself: a successful PUBREL **store response** finalized and acked a
+  drained source, so on the interest-retained `$MQTT_out` a store with no consumer
+  discarded the payload for a PUBREL that was never kept (only a confirmed PUBREL
+  may release the claim — I2b, I12); reconciling on `NumAckPending == 0` deleted
+  every claim and its durable on **every broker restart**, because a push consumer
+  with no subscriber reports zero pending for deliveries merely reset to
+  not-yet-delivered; the per-consumer inactivity clear was never retried after a
+  failure; and a failed re-SUBSCRIBE both lost the drain (the SUBSCRIBE snapshot
+  did not carry it) and DELETED its durable, by counting the adopted consumer among
+  the ones that packet had created.
+
+  Around the record fence: definite rollbacks ran *after* `endRecordTx`, leaving a
+  window in which another writer could persist the state being undone. And — the
+  largest class — **ambiguous** record writes were rolled back in memory as if they
+  had definitely failed. An ambiguous write may have landed, so memory must end up
+  agreeing with whichever outcome the readback proves: rolling back immediately
+  commits to "it did not land" at the one moment nobody can know that, and if it did
+  land the next write overwrites it. (The write's identity is safe either way — the
+  digest is copied into `pendingWrite` when the failure is recorded, so later memory
+  changes cannot alter what the readback compares against. The problem is purely
+  that memory has to be reconciled differently in the two cases.) That is why
+  keeping the mutation is only half the answer: `retainOnUncertain` registers how to
+  undo it, and the readback runs those undos when it proves the record is still at
+  the base sequence, or discards them when the stored bytes match. Without that,
+  "keep it" silently means "assume it landed" — and for a drain claim, an
+  unconfirmed removal that is treated as durable gets the message **acked away**
+  (I1), or lets a forwarded PUBREL complete an exchange the record still owes (I10).
+  A retained removal is therefore also marked `unclaimUnconfirmed`, which the two
+  delivery callbacks check before doing anything irreversible — the QoS 1/2 callback
+  before acking a redelivery, the PUBREL callback before forwarding — because each
+  makes its own decision after the helper returns and would otherwise act on
+  in-memory "not claimed".
+
+  Resolution is itself a record-state transition, not a read that observes one: it
+  takes the record fence (never waiting — a caller may hold one on the same
+  goroutine), decides, clears the uncertainty and runs the retained continuations all
+  under it, and re-validates that the attempt it read is still the live one before
+  applying anything. Continuations receive the resolver's token and must write under
+  it. A **foreign** verdict goes through one ownership-gated disposition that detaches,
+  evicts by identity and closes the stale connection, so it can neither damage a
+  replacement session a competing CONNECT installed nor leave a live client acting on
+  an evicted one.
+
+  Resolution is driven rather than waited for, because an unresolved session cannot
+  persist anything at all — every later save is refused — so "wait for the
+  disconnect" bounds nothing on a connection that stays open. The periodic resolver
+  therefore handles BOUND sessions too, taking the ownership gate as the bound client
+  (so a CONNECT still wins), and each ambiguous path also resolves immediately;
+  redeliveries of an unconfirmed sequence, on both the source and the PUBREL
+  consumer, act as the retry clock when a readback itself fails. A **foreign**
+  verdict goes through one ownership-gated disposition: it detaches, evicts by
+  identity (never by client ID, or a replacement a competing CONNECT installed is the
+  thing removed), cancels the expiry timer only when that removal applies, and closes
+  the stale connection — leaving it merely detached would let a live client keep
+  publishing and acking against an evicted session.
+
+  A caller that keeps a mutation also owes the readback its **landed** continuation
+  wherever its success path does work after the save: UNSUBSCRIBE commits the staged
+  drains, clears their inactivity timers, releases shared durables and drops the
+  client-facing subscriptions, and skipping that for a write that did land would
+  leave the record saying "unsubscribed" over a half-applied runtime.
+  `saveOutcome` distinguishes the
+  two, and each of these callers classifies its own write and rolls back only a
+  definite failure: the five drain paths (`finalizeDrainDelivery`, `recoverDrains`,
+  `recordPubRelIntent`, `bumpDrainPubRelAttempt`, `recoverDrainPubRels`),
+  `mqttProcessUnsubs`, the SUBSCRIBE packet's final `update` and
+  `rollbackSubscribePacket`, its per-filter shared membership save (which now
+  ABANDONS the packet rather than reporting a failure for a membership that is
+  durably stored), `rollbackSharedSub` — which is itself a mutate-before-save caller,
+  in both its remove-new and restore-prior branches — `purgeReservedSubs`, the
+  affine unwind in `processSubs`, `ensureQ2AffineConsumerSubscription`, and the
+  3.1.1 forced shared leave.
+
+  That list is the audited set, not a claim about every future caller: the rule is a
+  discipline each new mutate-then-save site has to apply, and nothing in the type
+  system enforces it. A new one is easy to spot — it mutates session state, calls
+  `save`/`update`, and has an error branch that puts the state back.
+
+  Two further findings outside the drain: the displaced-broker Will cancel was
+  scoped by session generation alone, but a persistent session KEEPS its generation
+  across reconnects — so a later connection's Will could be destroyed; it is now
+  bounded by the record sequence the displaced broker knew. And a stored incarnation
+  generation was never validated before names and **purge filters** were built from
+  it, which a malformed value could have widened across other incarnations.
+
+  Two narrow test seams were added rather than accepting a nondeterministic
+  assertion: PUBREL delivery can be stalled (the barrier is otherwise
+  indistinguishable from its callback, which always wins the race), and the
+  JetStream per-message TTL derived from a Message Expiry Interval can be
+  suppressed, since otherwise "expired for delivery" and "still in the stream"
+  coexist only during the reaper's lag.
+
 - [ ] Serialize session discard against inbound QoS 2 PUBREL release. A PUBREL
   racing a cross-broker session discard can deliver a message from a discarded
   session once (residual 4 of the move protocol). The intended fix is a
@@ -127,7 +325,14 @@ is fixed before feature work continues.
   settings are; `validateWillCancelStream` currently checks state shape only.
   `$MQTT_willq` does CAS writes plus terminal deletion, so deletion prerequisites do
   apply. `$MQTT_sess` does CAS writes, deletion and cleanup. `$MQTT_willq` and
-  `$MQTT_sess` have no validator at all today.
+  `$MQTT_sess` have no validator at all today. Note also the new
+  `$MQTT_qos2in` subject layout: hold subjects are now
+  `$MQTT.qos2.in.<idHash>.<gen>.<PI>` (see "Session incarnations and teardown" in
+  `docs/ARCHITECTURE.md`), so any prerequisite derived from the old
+  `<idHash>.<PI>` shape must be re-derived. `$MQTT_msgs` gains one the drain
+  depends on: a stream-level `ConsumerLimits.InactiveThreshold` would reap a
+  drained durable while its session is offline and take its started deliveries
+  with it, so draining must refuse rather than degrade where one is set.
 
 ## 1. Settle release decisions
 

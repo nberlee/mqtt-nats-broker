@@ -36,9 +36,49 @@ current `nats-server/v2` dependency in `go.mod` and exercised in CI. The bridge
 does not maintain alternate code paths for older JetStream APIs or semantics.
 When the dependency advances, plans may adopt the new current behavior directly.
 
+The floor is **nats-server 2.14**. Older releases are unsupported outright: there
+are no fallbacks, and where a behavior below is load-bearing it is validated at
+startup and failed closed rather than degraded.
+
 This boundary applies only to bridge persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
 covered by the conformance suites.
+
+### JetStream behaviors this design depends on
+
+Correctness rests on these specific semantics, each stated as the contract the
+code assumes. This is the list a version bump has to re-verify — it is what makes
+the "no fallbacks" stance reviewable rather than implicit.
+
+- **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
+  is accepted only if the subject's last sequence matches, giving every state
+  machine its linearization point. A rejection is reported structurally
+  (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
+  contention). 10164 means *transient contention*, not "the subject moved", so
+  every rejection is resolved by re-reading rather than classified directly.
+- **`MaxMsgsPer: 1`** turns a subject into a single-slot register: a new record
+  evicts the old one, so a stream sequence names a record, never a subject.
+- **Interest retention.** A store with no matching consumer interest **succeeds and
+  keeps nothing** — the server skips the message, still records its dedupe entry,
+  and returns an *ordinary* success acknowledgment carrying a sequence that holds
+  nothing. A publish response therefore never proves a record exists; only delivery
+  or a presence check at the returned sequence does. Correspondingly, deleting a
+  consumer deletes the messages it still held, so "absent" never proves
+  "delivered".
+- **Deduplication entries outlive their messages.** `deleteMsg` does not clear a
+  `Nats-Msg-Id` entry, so re-storing under the same id inside the window can be
+  accepted as a duplicate that stores nothing. Anything that must exist is verified
+  by presence, and identities that need to be re-attempted carry an attempt
+  counter.
+- **`PubAck.Duplicate`** flags a deduplication hit. Useful diagnostically; it does
+  not remove the need for the presence check, because a no-interest skip is an
+  unflagged success.
+- **Per-message TTL** and **JetStream double ack** (`AckPolicy` explicit with a
+  confirmed acknowledgment), used where a cleanup must be known to have landed.
+- **Consumer inactivity limits.** `InactiveThreshold` gives a durable a delete
+  timer; a stream-level `ConsumerLimits.InactiveThreshold` imposes one that a
+  consumer cannot opt out of. Where a durable must survive an offline session, the
+  stream is checked and the feature is refused rather than silently reaped.
 
 ## High availability
 
@@ -315,6 +355,120 @@ is not: an older broker serving the same shared group never consults
 claimed. Shared QoS 2 affinity holds only once every broker that can serve the
 group is q2aff-aware. See `docs/CONFORMANCE.md` for this and for the
 packet-identifier residual.
+
+## UNSUBSCRIBE drain
+
+[MQTT-3.10.4-3] requires the server to complete the delivery of any QoS 1/2
+message it has already **started** sending, even after the client unsubscribes.
+UNSUBSCRIBE used to tear the plain consumer down immediately, and since
+`$MQTT_msgs` is interest-retained, deleting the durable deleted the messages it
+still held: the started PUBLISH was simply lost.
+
+A **drain** is what that teardown becomes when started deliveries remain
+(`internal/mqtt/unsub_drain.go`). The durable and its delivery subscription
+survive; already-started deliveries keep being redelivered and completed; fresh
+messages on the filter are discarded. The drain is a field on the session record
+(`Drains`), so it survives disconnect, restart and failover, and it lives until
+every started delivery completes or the session ends. It is deliberately kept
+**out** of the record's `Cons` map: an older broker restoring it there would find
+`cons[sid]` on a re-SUBSCRIBE, take the early return, and never create a delivery
+subscription.
+
+The invariants, in the order they matter:
+
+- **Persist before ack.** A delivery of a claimed sequence is acked only after a
+  *confirmed* save in which the drain no longer claims it. One helper owns every
+  such ack; a refused fence or failed save acks nothing and the message is simply
+  redelivered.
+- **The commit points.** QoS 1 has one phase. For QoS 2 the durable **PUBREL
+  intent** — written *before* the PUBREL is stored — commits the exit from the
+  PUBLISH phase, and only a **confirmed** PUBREL (stored *and* in delivery)
+  authorizes removing and acking the source claim. The phase is three-valued, not
+  a boolean, because "a PUBREL exists" and "the store outcome is unknown" must not
+  authorize the same actions.
+- **Only transmitted deliveries drain.** A message withheld by the in-flight cap
+  was never sent, so it is discarded rather than enrolled.
+- **Single ownership.** From staging, a drained consumer lives exclusively in
+  `sess.drains` and its `cons[sid]` entry is gone, so nothing can reach it through
+  `cons` and create a second durable on the same filter. A re-SUBSCRIBE therefore
+  **adopts** the drain explicitly.
+
+Recovery is positive, never an inference from absence. Because the phase is
+memory-only, a restart would otherwise establish source interest and resend the
+payload of an exchange already past PUBREC — before the correlated PUBREL callback
+ever ran. So a barrier runs **before any source interest exists**: it reads the
+persisted intent, indexes the PUBREL records still on the session's subject (they
+are unacked, hence incomplete), and resolves each claim. Intent with a record →
+confirmed. Intent without one → recreate it under the *original* identifier,
+having first verified the PUBREL durable exists and then checking **presence at
+the returned sequence** rather than trusting the store response. A missing record
+can never mean "already completed", because the callback removes claim and intent
+before forwarding. No intent → the client provably never PUBREC'd durably, so the
+payload is redelivered with DUP and the exchange completes. Any failure withholds
+that drain's source interest for the connection rather than denying the CONNECT.
+
+A stored PUBREL names its source (`Nmqtt-Q2SrcDur` / `Nmqtt-Q2SrcSeq`), which is
+what links it back after a restart — `cpending` is memory-only. A **drained**
+PUBREL additionally carries a deduplication identity scoped by an attempt counter,
+so a superseded broker's late store collapses into it; the ordinary path
+deliberately carries none, because there the only legitimate re-store is the
+post-restart one after a redelivery, and a surviving dedupe entry would silently
+swallow it.
+
+## Session incarnations and teardown
+
+A client ID hashes to a stable token, and a session's JetStream resources used to
+be named from that hash alone. But the hash is reused: a clean start, a session
+expiry and a takeover-discard each destroy one session and let a later one adopt
+the same hash. A deterministic name is therefore **not an identity**, and a
+teardown issued by a superseded broker could delete a resource a fresh session had
+just created.
+
+**Incarnation generations** (`internal/mqtt/sess_incarnation.go`) fix that
+structurally. Each session carries a persisted generation (record field `gen`) that
+scopes every otherwise-hash-only name: the PUBREL durable, its `$MQTT_out` subject
+and its delivery subject; the `$MQTT_qos2in` hold subjects and the filters a
+discard purges; and each `$MQTT_willq` outbox record. It is minted when a session
+is first created and re-minted by `clear()` — which every discard path runs,
+including the two that *reuse* the session object as a fresh session — while a
+plain reconnect or resume **preserves** it, because a resumed session must still
+find its own PUBRELs, QoS 2 holds and Will. A late delete from a retired
+incarnation can then only name something that is already gone.
+
+This is the same conclusion the QoS 2 move protocol and the affine delivery path
+reached independently, and it is why the fix is naming rather than a lock: a nonce
+re-check before each delete is a check-then-act, and no in-process lock arbitrates
+anything against another broker.
+
+**The teardown claim** (`internal/mqtt/sess_teardown.go`) covers what naming
+cannot: two brokers tearing down and resuming the same record at once. Before
+deleting anything, a discard CASes a `Teardown{Origin, Nonce, StartedAt}` marker
+onto the record at the sequence it resolved against, preserving the record's
+content so any broker can finish the job and so the orphan sweep still reads its
+durables as referenced. Losing that CAS means a newer owner exists, and the loser
+deletes **nothing** — a complete outcome, not a failure. Releasing is a
+sequence-targeted delete whose result is classified by **re-reading**, because
+`MaxMsgsPer: 1` may already have removed that sequence on a peer's behalf: absent
+means done, our own nonce means retry, and a foreign nonce or no marker means a
+newer owner exists. The release is always confirmed even on the no-wait discard
+path, since an unclassifiable release is not a release.
+
+Nobody resumes a marked record. Every CONNECT (and the record-driven expiry path)
+that finds a marker **finishes** the teardown — repeating the idempotent,
+generation-scoped deletions and releasing the record — and only then starts a fresh
+session with a fresh generation and Session Present false. That also makes a
+crashed teardown self-healing instead of leaking until the orphan sweep.
+
+Shared group durables stay outside all of this: they are not owned by one session
+and are released last, by the existing last-holder record scan, only once this
+session's record is gone.
+
+**Mixed version and legacy records.** A record with no `gen` means "legacy
+hash-only names": such a session keeps working, stays exposed to the original race,
+and leaves that exposure the first time it is discarded. An older broker ignores
+the `Teardown` marker and would overwrite it, and uses the old names — so, as with
+the affine protocol, both halves hold only once every broker understands them. See
+`docs/CONFORMANCE.md`.
 
 ## JetStream domain
 

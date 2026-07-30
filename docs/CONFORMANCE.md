@@ -226,9 +226,89 @@ affinity holds only once **every** broker that can serve the group runs a
 q2aff-aware version. There is no runtime enforcement of this today; a
 cluster-wide capability gate is noted as a possible follow-up.
 
-Plain (non-shared) subscriptions have their own open item: an unacknowledged
-QoS 1/2 PUBLISH is currently dropped on UNSUBSCRIBE. The decided fix is a durable
-drain; see `docs/ROADMAP.md`.
+Plain (non-shared) subscriptions no longer drop an unacknowledged QoS 1/2 PUBLISH
+on UNSUBSCRIBE — see the next section.
+
+### UNSUBSCRIBE completes what it started
+
+An UNSUBSCRIBE that leaves started QoS 1/2 deliveries behind converts the
+consumer into a **drain** rather than tearing it down
+(`internal/mqtt/unsub_drain.go`). The durable and its delivery subscription
+survive, already-started deliveries keep being redelivered and completed, and
+messages published to the filter afterwards are discarded — the client
+unsubscribed, so it is not owed them. This is what [MQTT-3.10.4-3] requires, and
+it holds across a disconnect, a broker restart and a failover, because the drain
+is part of the persisted session.
+
+Only deliveries actually put on the wire are drained. One withheld by the
+session's in-flight cap was never sent, so it is discarded rather than kept alive.
+A re-SUBSCRIBE to a draining filter reclaims the drain instead of building a
+second consumer beside it.
+
+Residuals:
+
+- **Offline backlog.** A drain's durable still holds interest in its filter while
+  the session is disconnected, so messages published meanwhile accumulate in
+  `$MQTT_msgs` until the next connection discards them or the drain is reaped.
+  Bounded by the stream limits and the Session Expiry Interval.
+- **Stream-level consumer inactivity limits.** A drain must outlive an offline
+  period, and `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs` gives every
+  consumer a deletion timer that no consumer config can opt out of. Where that
+  limit is set — or cannot be read — the broker **refuses to drain**: UNSUBSCRIBE
+  tears the consumer down immediately, as it did before, so a started QoS 1/2
+  delivery is dropped and [MQTT-3.10.4-3] is not honored on such a stream. It logs
+  a warning naming the limit. Running `$MQTT_msgs` without a stream-level consumer
+  inactivity limit is therefore a deployment requirement, exactly as it already is
+  for shared subscriptions.
+- **Per-consumer inactivity timers.** A consumer created under the broker's own
+  `consumer_inactive_threshold` carries the same timer per consumer. That one *is*
+  escapable, so the broker clears it when the drain is committed, and retries at
+  every resume while it is still set. The clear is best-effort: if it fails, the
+  drained durable keeps its timer and can be reaped while the session is offline.
+  Its started deliveries go with it, and that outcome is reported as **loss**,
+  never as completion.
+- **A drained QoS 2 source is held until its PUBREL is proven.** An ordinary QoS 2
+  PUBREC acknowledges the stored message as soon as the PUBREL is stored. A
+  *drained* one does not: on the interest-retained `$MQTT_out` a store with no
+  consumer succeeds while keeping nothing, so the claim is released only once the
+  PUBREL has been delivered, or found present at its sequence by the resume
+  barrier. The cost is one redelivery of the source in the rare case where the
+  store landed but its delivery did not; the alternative is losing the message.
+- **Packet-identifier continuity** across a restart or failover, as for every
+  QoS 1/2 path: a drained delivery is re-offered with DUP set and a freshly
+  allocated identifier. Past the QoS 2 PUBREC intent the exchange does complete
+  under its **original** identifier, even across a failover.
+- **Mixed-version operation.** An older broker ignores the `Drains` record field,
+  so its orphan sweep can delete a drained durable and lose its started messages.
+  Same class as the affine residual above.
+- An unbounded drain is deliberate: a client that never acknowledges holds one
+  durable per drained filter until its session ends.
+
+The QoS 1/2 → QoS 0 re-SUBSCRIBE downgrade is out of scope — it replaces a
+subscription rather than removing one — and shared-subscription QoS 1
+redistribution to another member remains permitted.
+
+### Session teardown: arbitrated across brokers, with two upgrade-window residuals
+
+Discarding a session (clean start, a v5 DISCONNECT with expiry 0, session expiry,
+takeover-discard) now runs under a durable **teardown claim** on the session record
+and deletes only resources named after the **retiring session incarnation**
+(`internal/mqtt/sess_teardown.go`, `sess_incarnation.go`). A broker that loses the
+claim deletes nothing; the release is a sequence-targeted delete whose outcome is
+classified by re-reading, never assumed; and a CONNECT that finds a claim finishes
+it before starting fresh, so a crashed teardown self-heals rather than leaking.
+
+Two residuals, both confined to upgrade windows:
+
+- **Sessions created before this change carry no generation.** They keep the legacy
+  hash-only resource names and stay exposed to the original race — a teardown from
+  a superseded broker can delete a resource a fresh session of the same client ID
+  recreated — until they are next discarded, which re-mints them. Every session
+  created afterwards is safe by construction.
+- **Mixed-version operation.** An older broker ignores the `Teardown` marker (it
+  would overwrite it) and uses the old names, so both halves hold only once every
+  broker in the cluster understands them — the same rule as the shared-subscription
+  affinity protocol above.
 
 ### Inbound QoS 2 PUBREL is at-least-once across the unresolved move interval
 

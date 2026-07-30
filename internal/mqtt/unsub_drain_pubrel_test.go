@@ -1,0 +1,1109 @@
+//go:build mqttport_fulltests
+
+package mqtt
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// testDrainQoS2Restart shuts the broker down and brings it back on the same store,
+// which is what clears every in-memory shortcut and forces the resume path to
+// rebuild from the record alone.
+func testDrainQoS2Restart(t *testing.T, s *Server, o *Options) *Server {
+	t.Helper()
+	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
+	s.Shutdown()
+	o.Port = -1
+	o.MQTT.Port = -1
+	o.StoreDir = dir
+	return testMQTTRunServer(t, o)
+}
+
+// TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel is plan test 16 in its exact
+// combined shape: after the restart the session restores NO subscription, one QoS 2
+// drain still claiming a PUBLISH-phase delivery, AND a stored PUBREL for a
+// different exchange that is already past PUBREC.
+//
+// The two halves travel different paths — the PUBREL replays from $MQTT_out, the
+// claim is redelivered from $MQTT_msgs — and both have to work with nothing in
+// memory to help. This is also the case that catches a resume which establishes
+// PUBREL delivery only when it finds a drain, or source interest only when it finds
+// a subscription.
+func TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "q2restart"}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "q2restart/topic", qos: 2}}, []byte{2})
+	testMQTTFlush(t, c, nil, r)
+
+	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "q2restartpub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pc.Close()
+	testMQTTCheckConnAck(t, pr, mqttConnAckRCConnectionAccepted, false)
+	for i, payload := range []string{"past-pubrec", "still-publish"} {
+		testMQTTSendPublishPacket(t, pc, 2, false, false, "q2restart/topic", uint16(i+1), []byte(payload))
+		testMQTTReadPIPacket(mqttPacketPubRec, t, pr, uint16(i+1))
+		testQoS2SendPubRel(t, pc, uint16(i+1))
+		testMQTTReadPIPacket(mqttPacketPubComp, t, pr, uint16(i+1))
+	}
+
+	// Both are delivered and unacknowledged.
+	piA := testMQTTCheckPubMsgNoAck(t, c, r, "q2restart/topic", mqttPubQoS2, []byte("past-pubrec"))
+	piB := testMQTTCheckPubMsgNoAck(t, c, r, "q2restart/topic", mqttPubQoS2, []byte("still-publish"))
+
+	// Take A past PUBREC — its PUBREL is now stored and delivered, and deliberately
+	// not PUBCOMP'd — while B stays in the PUBLISH phase.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, piA)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, piA)
+
+	// UNSUBSCRIBE now: only B is still started, so the drain claims exactly it.
+	testMQTTUnsub(t, 2, c, r, []*mqttFilter{{filter: "q2restart/topic"}})
+	testMQTTFlush(t, c, nil, r)
+
+	sess := testMQTTResidentSession(t, s, "q2restart")
+	if n := testDrainCount(sess); n != 1 {
+		t.Fatalf("expected one draining consumer, got %v", n)
+	}
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("expected exactly the PUBLISH-phase delivery to be claimed, got %d claims", n)
+	}
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	s = testDrainQoS2Restart(t, s, o)
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "q2restart", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	// Both obligations are honored. The order between the two paths is not fixed,
+	// so accept either and complete each in its own protocol.
+	var gotPubRel, gotPublish bool
+	for i := 0; i < 2; i++ {
+		b, pl := testMQTTReadPacket(t, r2)
+		switch b & mqttPacketMask {
+		case mqttPacketPubRel:
+			pi, err := r2.readUint16("packet identifier")
+			if err != nil {
+				t.Fatalf("reading the PUBREL identifier: %v", err)
+			}
+			if pi != piA {
+				t.Fatalf("the replayed PUBREL must keep its original identifier, got %v want %v", pi, piA)
+			}
+			testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+			gotPubRel = true
+		case mqttPacketPub:
+			flags, pi, topic, payload := testMQTTGetPubMsgExEx(t, nil, r2, b, pl, "q2restart/topic", nil)
+			if string(payload) != "still-publish" {
+				t.Fatalf("only the PUBLISH-phase claim may be resent, got %q", payload)
+			}
+			if flags&mqttPubFlagDup == 0 {
+				t.Errorf("a delivery transmitted before the restart must carry DUP, flags=%x", flags)
+			}
+			_ = topic
+			testMQTTSendPIPacket(mqttPacketPubRec, t, c2, pi)
+			testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
+			testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+			gotPublish = true
+		default:
+			t.Fatalf("unexpected packet type %x", b&mqttPacketMask)
+		}
+	}
+	if !gotPubRel {
+		t.Fatal("the stored PUBREL was never replayed: the client cannot complete that exchange")
+	}
+	if !gotPublish {
+		t.Fatal("the drained PUBLISH-phase claim was never redelivered")
+	}
+	_ = piB
+
+	sess2 := testMQTTResidentSession(t, s, "q2restart")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+	testMQTTExpectNothing(t, r2)
+}
+
+// TestMQTTDrainPubRelRecreatedFromIntent is plan test 17(d): the intent is
+// persisted BEFORE the PUBREL is stored, so a store that never lands leaves a
+// positive record of an exchange that is past PUBREC.
+//
+// Recovery must act on that fact rather than infer from the record's absence that
+// nothing is owed: it recreates the PUBREL under the ORIGINAL packet identifier,
+// so the client completes the exchange it is actually holding open. Reading the
+// absence the other way would either strand the client forever or resend a payload
+// whose exchange has moved on.
+func TestMQTTDrainPubRelRecreatedFromIntent(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	conn, sess, pi := testDrainSetup(t, s, o, "intentonly", "intentonly/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "intentonly/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	if n := testDrainCount(sess); n != 1 {
+		t.Fatalf("expected one draining consumer, got %v", n)
+	}
+
+	// Fail only the PUBREL store. The intent is written first, so it lands; the
+	// record does not.
+	restore := setMQTTTestStoreMsgHook(func(subject string, _ int, _ []byte) error {
+		if strings.HasPrefix(subject, mqttPubRelSubjectPrefix) {
+			return errors.New("test: PUBREL store refused")
+		}
+		return nil
+	})
+	// The store error closes the connection, as any storage failure does; the
+	// session stays resident, so the intent is observed there.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	// Synchronise on the CONNECTION CLOSE, not on the in-memory intent flag: that
+	// flag is set inside the record transaction, so observing it can race the save
+	// and a restart would then lose the very intent this test needs. The store
+	// failure closes the connection, and that happens only after the save.
+	testDrainWaitConnClosed(t, conn.r)
+	restore()
+	if !testDrainIntentRecorded(sess) {
+		t.Fatal("the intent must have been persisted before the failing store")
+	}
+
+	conn.c.Close()
+	s = testDrainQoS2Restart(t, s, o)
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "intentonly", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	// The PUBREL is recreated under the ORIGINAL identifier, not a fresh exchange.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+	testMQTTFlush(t, c2, nil, r2)
+
+	// The payload is never resent: its exchange is past PUBREC. Wait past AckWait,
+	// since a resend would only appear then.
+	testMQTTExpectNothingFor(t, r2, 3*time.Second)
+
+	sess2 := testMQTTResidentSession(t, s, "intentonly")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+}
+
+// testDrainIntentRecorded reports whether any drained sequence carries a persisted
+// PUBREL intent.
+func testDrainIntentRecorded(sess *mqttSession) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for _, d := range sess.drainByDur {
+		for _, st := range d.seqs {
+			if st.intent {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestMQTTDrainBarrierFinalizesAStoredPubRel is plan test 17(a): the PUBREL record
+// exists but its delivery callback never ran, so nothing finalized the claim
+// before the broker went away — the crash point between the store and its
+// callback.
+//
+// On resume the barrier must reconstruct that exchange's phase from intent PLUS
+// record, BEFORE any source interest exists. Without it, creating the delivery
+// subscription redelivers the pending PUBLISH immediately and resends the payload
+// of an exchange the client has already PUBREC'd: a duplicate exactly-once
+// delivery. The claim is finalized here rather than waiting on the asynchronous
+// callback, which is why the barrier — not the callback — is what makes the
+// restart safe.
+func TestMQTTDrainBarrierFinalizesAStoredPubRel(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	conn, sess, pi := testDrainSetup(t, s, o, "ambig", "ambig/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "ambig/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	if n := testDrainCount(sess); n != 1 {
+		t.Fatalf("expected one draining consumer, got %v", n)
+	}
+
+	// Suppress the store, so the intent lands and the claim survives — the callback
+	// never runs and nothing is finalized.
+	restore := setMQTTTestStoreMsgHook(func(subject string, _ int, _ []byte) error {
+		if strings.HasPrefix(subject, mqttPubRelSubjectPrefix) {
+			return errors.New("test: PUBREL store suppressed")
+		}
+		return nil
+	})
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	// Synchronise on the CONNECTION CLOSE, not on the in-memory intent flag: that
+	// flag is set inside the record transaction, so observing it can race the save
+	// and a restart would then lose the very intent this test needs. The store
+	// failure closes the connection, and that happens only after the save.
+	testDrainWaitConnClosed(t, conn.r)
+	restore()
+	if !testDrainIntentRecorded(sess) {
+		t.Fatal("the intent must have been persisted before the failing store")
+	}
+
+	// Now put the record where a landed store would have left it, so the resume
+	// faces intent AND record with the claim still held: the state a crash between
+	// the store and its callback produces.
+	_ = testDrainStorePubRelRecord(t, sess)
+
+	conn.c.Close()
+	s = testDrainQoS2Restart(t, s, o)
+
+	// Stall PUBREL delivery for longer than an AckWait, so the SOURCE redelivery
+	// gets its chance first. Without this the callback always wins the race and the
+	// barrier looks redundant — which is exactly the failure mode the barrier
+	// exists for, since that callback is asynchronous and nothing orders it.
+	restoreDelay := setMQTTTestPubRelDeliveryDelay(func() { time.Sleep(3 * time.Second) })
+	defer restoreDelay()
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "ambig", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	// While the PUBREL is stalled, the source interest is live and its AckWait
+	// elapses: nothing may be resent, because the barrier already removed the claim.
+	testMQTTExpectNothingFor(t, r2, 2*time.Second)
+
+	// Then the PUBREL arrives and completes the original exchange.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+	testMQTTFlush(t, c2, nil, r2)
+	testMQTTExpectNothingFor(t, r2, 2*time.Second)
+
+	sess2 := testMQTTResidentSession(t, s, "ambig")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+}
+
+// TestMQTTDrainBarrierFailsClosed is plan test 17(g): an unreadable scan is never
+// evidence of absence.
+//
+// If the walk over the session's PUBREL records cannot be completed, the broker
+// cannot know which claims are past PUBREC — so it must install NO source interest
+// for those drains and keep every claim, rather than redelivering payloads whose
+// exchanges may already have moved on. Denying the whole CONNECT would turn a
+// JetStream hiccup into an outage, so interest is withheld instead and the next
+// resume retries.
+func TestMQTTDrainBarrierFailsClosed(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	conn, sess, pi := testDrainSetup(t, s, o, "failclosed", "failclosed/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "failclosed/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+
+	restore := setMQTTTestStoreMsgHook(func(subject string, _ int, _ []byte) error {
+		if strings.HasPrefix(subject, mqttPubRelSubjectPrefix) {
+			return errors.New("test: PUBREL store suppressed")
+		}
+		return nil
+	})
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	// Synchronise on the CONNECTION CLOSE, not on the in-memory intent flag: that
+	// flag is set inside the record transaction, so observing it can race the save
+	// and a restart would then lose the very intent this test needs. The store
+	// failure closes the connection, and that happens only after the save.
+	testDrainWaitConnClosed(t, conn.r)
+	restore()
+	if !testDrainIntentRecorded(sess) {
+		t.Fatal("the intent must have been persisted before the failing store")
+	}
+	conn.c.Close()
+
+	s = testDrainQoS2Restart(t, s, o)
+
+	// Make the barrier's scan unreadable for this connection only.
+	var scanned atomic.Bool
+	restoreScan := setMQTTTestLoadNextMsgHook(func(stream, subject string, _ uint64) error {
+		if stream == mqttOutStreamName && strings.HasPrefix(subject, mqttPubRelSubjectPrefix) {
+			scanned.Store(true)
+			return errors.New("test: PUBREL scan unavailable")
+		}
+		return nil
+	})
+
+	// Deferred as well as lifted explicitly below, so an early failure cannot leave
+	// the scan broken for every test that follows in this package.
+	defer restoreScan()
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "failclosed", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	// The resume work runs asynchronously with respect to the CONNACK, so wait for
+	// the scan rather than racing it.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if !scanned.Load() {
+			return errors.New("the resume has not attempted the PUBREL scan yet")
+		}
+		return nil
+	})
+
+	// Nothing is resent and nothing is completed while the state is unknown.
+	testMQTTExpectNothing(t, r2)
+
+	sess2 := testMQTTResidentSession(t, s, "failclosed")
+	if n := testDrainClaims(sess2); n != 1 {
+		t.Fatalf("an unresolved barrier must keep every claim, got %d", n)
+	}
+	restoreScan()
+
+	// The next resume, with the scan readable again, completes the exchange.
+	testMQTTDisconnect(t, c2, nil)
+	c2.Close()
+	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: "failclosed", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c3.Close()
+	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r3, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c3, pi)
+	testMQTTFlush(t, c3, nil, r3)
+}
+
+// testDrainStorePubRelRecord writes the correlated PUBREL record for the session's
+// single intent-bearing drained sequence, exactly as a landed store would have.
+func testDrainStorePubRelRecord(t *testing.T, sess *mqttSession) uint64 {
+	t.Helper()
+	sess.mu.Lock()
+	var (
+		dur     string
+		sseq    uint64
+		pi      uint16
+		attempt uint64
+	)
+	for _, d := range sess.drainByDur {
+		for seq, st := range d.seqs {
+			if st.intent {
+				dur, sseq, pi, attempt = d.cc.Durable, seq, st.pi, st.attempt
+			}
+		}
+	}
+	idHash, subject := sess.idHash, sess.pubRelSubject
+	sess.mu.Unlock()
+	if dur == _EMPTY_ {
+		t.Fatal("no intent-bearing drained sequence to write a PUBREL for")
+	}
+	msgId := mqttPubRelMsgId(idHash, dur, sseq, attempt)
+	natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, dur, sseq, msgId)
+	resp, err := sess.jsa.storeMsg(subject, headerLen, natsMsg)
+	if err != nil {
+		t.Fatalf("storing the correlated PUBREL record: %v", err)
+	}
+	return resp.Sequence
+}
+
+// TestMQTTDrainPubRelRecreateEscapesDeduplication is plan test 17(d2): a store
+// response is not a record.
+//
+// A JetStream deduplication entry OUTLIVES the message it was recorded for, so
+// re-storing a PUBREL under the same Nats-Msg-Id is accepted as a duplicate while
+// storing nothing at all. Trusting that response would finalize the claim and ack
+// the source for a PUBREL that does not exist — the client waits forever for a
+// PUBCOMP exchange nothing can advance. Presence at the returned sequence is the
+// only proof, and escaping the poisoned identity needs a fresh attempt generation.
+func TestMQTTDrainPubRelRecreateEscapesDeduplication(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	conn, sess, pi := testDrainSetup(t, s, o, "dedupe", "dedupe/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "dedupe/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+
+	restore := setMQTTTestStoreMsgHook(func(subject string, _ int, _ []byte) error {
+		if strings.HasPrefix(subject, mqttPubRelSubjectPrefix) {
+			return errors.New("test: PUBREL store suppressed")
+		}
+		return nil
+	})
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	// Synchronise on the CONNECTION CLOSE, not on the in-memory intent flag: that
+	// flag is set inside the record transaction, so observing it can race the save
+	// and a restart would then lose the very intent this test needs. The store
+	// failure closes the connection, and that happens only after the save.
+	testDrainWaitConnClosed(t, conn.r)
+	restore()
+	if !testDrainIntentRecorded(sess) {
+		t.Fatal("the intent must have been persisted before the failing store")
+	}
+	conn.c.Close()
+
+	// Store the record the intent names — which also records its deduplication
+	// identity — then delete the record. The dedupe entry survives, so the identity
+	// is now poisoned: a recreate under it stores nothing and reports success.
+	seq := testDrainStorePubRelRecord(t, sess)
+	if err := sess.jsa.deleteMsg(mqttOutStreamName, seq, true); err != nil {
+		t.Fatalf("deleting the stored PUBREL: %v", err)
+	}
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "dedupe", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	// The recreate must notice it stored nothing, bump its attempt, and try again
+	// under a fresh identity — so the client still gets its PUBREL.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+	testMQTTFlush(t, c2, nil, r2)
+
+	sess2 := testMQTTResidentSession(t, s, "dedupe")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+}
+
+// TestMQTTDrainDefiniteIntentFailureUnwedgesIdentifier is plan test 17(e): an
+// intent write that DEFINITELY did not land must leave the session exactly as it
+// was before the PUBREC.
+//
+// The in-memory state moves first — the PUBLISH tracking is dropped and a PUBREL
+// placeholder installed — so a failure that is not rolled back wedges that packet
+// identifier for the life of the session. A same-process reconnect reuses the very
+// same session object, which is what makes the in-memory rollback load-bearing
+// rather than cosmetic: nothing rereads the record to correct it.
+func TestMQTTDrainDefiniteIntentFailureUnwedgesIdentifier(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	conn, sess, pi := testDrainSetup(t, s, o, "definite", "definite/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "definite/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+
+	// A definite failure: the record write is refused outright.
+	restore := setMQTTTestSessSaveHook(func(*mqttSession) error { return errDrainTestSaveFailed })
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	// A storage failure terminates the connection, and that close is the signal
+	// that the PUBREC really was processed. Waiting on "no intent recorded" would
+	// be satisfied by the state we started in, and would lift the hook before the
+	// PUBREC ever reached the broker.
+	testDrainWaitConnClosed(t, conn.r)
+	restore()
+	conn.c.Close()
+
+	if testDrainIntentRecorded(sess) {
+		t.Fatal("an intent write that was refused must leave no intent behind")
+	}
+
+	sess.mu.Lock()
+	_, wedged := sess.pendingPubRel[pi]
+	claims := 0
+	for _, d := range sess.drainByDur {
+		claims += d.claimedCount()
+	}
+	sess.mu.Unlock()
+	if wedged {
+		t.Fatalf("identifier %v is wedged in pendingPubRel: nothing will ever fill it, so it can never be reused", pi)
+	}
+	if claims != 1 {
+		t.Fatalf("the source claim must survive an intent that did not land, got %d claims", claims)
+	}
+
+	// The same session object is reused by the reconnect, so a wedged identifier or
+	// a lost claim would show up right here.
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "definite", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	flags, pi2, topic, payload := testMQTTReadPubPacket(t, r2)
+	if topic != "definite/topic" || string(payload) != "payload" {
+		t.Fatalf("expected the payload to be redelivered, got %q %q", topic, payload)
+	}
+	if flags&mqttPubFlagDup == 0 {
+		t.Errorf("the redelivery must carry DUP, flags=%x", flags)
+	}
+	// The whole exchange completes this time.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c2, pi2)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi2)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi2)
+	testMQTTFlush(t, c2, nil, r2)
+
+	sess2 := testMQTTResidentSession(t, s, "definite")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+}
+
+// testDrainWaitConnClosed blocks until the broker closes the connection, which is
+// how a storage failure surfaces to the client.
+func testDrainWaitConnClosed(t *testing.T, r *mqttReader) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var buf [256]byte
+	for time.Now().Before(deadline) {
+		if err := r.reader.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		_, err := r.reader.Read(buf[:])
+		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			r.reader.SetReadDeadline(time.Time{}) //nolint:errcheck
+			return
+		}
+	}
+	t.Fatal("the broker never closed the connection, so the failing write was never exercised")
+}
+
+// TestMQTTDrainClaimSurvivesMessageExpiry is plan test 17's expiry case: a
+// restored claim carrying a v5 Message Expiry Interval must be REDELIVERED with
+// DUP, not discarded by the `!started` expiry gate.
+//
+// Expiry may drop a message whose onward delivery has not begun; a delivery
+// already put on the wire must be completed ([MQTT-3.10.4-3], Spec5 [3.3.2.3.3]).
+// After a restart the in-memory tracking is empty, so the delivery path would
+// infer `started=false` and discard it — the record is what says otherwise.
+//
+// The interval normally drives BOTH the delivery-side check and the JetStream
+// per-message TTL, so "expired for delivery" and "still in the stream" coexist
+// only during the reaper's lag. The TTL is therefore suppressed here (see
+// mqttStoredMsgTTL) so the invariant is tested below that boundary rather than
+// against a race.
+func TestMQTTDrainClaimSurvivesMessageExpiry(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	mqttTestSuppressMsgTTLV.Store(true)
+	defer mqttTestSuppressMsgTTLV.Store(false)
+
+	const topic = "expiry/topic"
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "expiry"}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: topic, qos: 1}}, []byte{1})
+	testMQTTFlush(t, c, nil, r)
+
+	// A v5 publisher, so the stored copy carries a Message Expiry Interval; two
+	// seconds, short enough to elapse across the restart below.
+	pc, pr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "expirypub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pc.Close()
+	if _, reason, _ := testMQTTReadConnAckV5(t, pr); reason != mqttReasonSuccess {
+		t.Fatalf("CONNACK for the publisher: reason=%v", reason)
+	}
+	props := testDrainMessageExpiryProps(2)
+	testMQTTPublishV5Props(t, pc, 1, 1, topic, props, []byte("payload"))
+	testMQTTReadPubAck(t, pr, 1)
+
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, topic, mqttPubQos1, []byte("payload"))
+	_ = pi
+
+	testMQTTUnsub(t, 2, c, r, []*mqttFilter{{filter: topic}})
+	testMQTTFlush(t, c, nil, r)
+	sess := testMQTTResidentSession(t, s, "expiry")
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("expected the started delivery to be claimed, got %d", n)
+	}
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	s = testDrainQoS2Restart(t, s, o)
+
+	// Let the interval elapse, so the delivery-side check really does see an
+	// expired message — the discard this test must NOT observe.
+	time.Sleep(2500 * time.Millisecond)
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "expiry", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	flags, pi2, gotTopic, payload := testMQTTReadPubPacket(t, r2)
+	if gotTopic != topic || string(payload) != "payload" {
+		t.Fatalf("expected the started delivery to be redelivered, got %q %q", gotTopic, payload)
+	}
+	if flags&mqttPubFlagDup == 0 {
+		t.Errorf("a delivery transmitted before the restart must carry DUP, flags=%x", flags)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, pi2)
+
+	sess2 := testMQTTResidentSession(t, s, "expiry")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+}
+
+// TestMQTTDrainNoResendAfterPubCompThenCrash is plan test 17(b): persist before
+// forward.
+//
+// The client PUBCOMPs, which acks the PUBREL record away, and only then does the
+// broker die. If the claim removal had been persisted AFTER forwarding the PUBREL,
+// the record would still claim a sequence whose exchange is complete — and with
+// the PUBREL gone there would be nothing left to correlate it to, so the resume
+// would redeliver the PAYLOAD and the client would receive the message twice. The
+// ordering is what makes that unreachable rather than unlikely.
+func TestMQTTDrainNoResendAfterPubCompThenCrash(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	// A LONG AckWait deliberately: with a short one the source redelivery also
+	// finalizes the claim (the confirmed-phase branch of the delivery path), which
+	// masks the callback and makes this test unable to tell the two orderings
+	// apart. Here the callback is the only thing that can have removed the claim
+	// before the crash.
+	o.MQTT.AckWait = 30 * time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	conn, sess, pi := testDrainSetup(t, s, o, "pubcomp", "pubcomp/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "pubcomp/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("expected the started delivery to be claimed, got %d", n)
+	}
+
+	// The ordering is checked IN the window it exists in: the hook fires after the
+	// claim removal is persisted and before the PUBREL goes out, so the assertion
+	// reads the PERSISTED RECORD at the one instant where a forward-first
+	// implementation would still be claiming the sequence. Waiting for the
+	// in-memory claim to clear afterwards would not distinguish the two orderings —
+	// both reach that state.
+	var persistedClaims int
+	var checked bool
+	restoreHook := setMQTTTestPubRelPreForwardHook(func() {
+		if checked {
+			return
+		}
+		checked = true
+		persistedClaims = testPersistedDrainClaims(t, sess)
+	})
+	defer restoreHook()
+
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, conn.r, pi)
+	if !checked {
+		t.Fatal("the pre-forward hook never fired, so this test proves nothing about the ordering")
+	}
+	if persistedClaims != 0 {
+		t.Fatalf("the session record still claimed %d source(s) when the PUBREL was forwarded: "+
+			"a client PUBCOMP can now ack the PUBREL away before that removal is durable, and the resume resends the payload",
+			persistedClaims)
+	}
+	restoreHook()
+
+	testMQTTSendPIPacket(mqttPacketPubComp, t, conn.c, pi)
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	conn.c.Close()
+
+	s = testDrainQoS2Restart(t, s, o)
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "pubcomp", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	// Nothing at all: no payload, no PUBREL. Waited past AckWait, since a resend
+	// would only appear then.
+	testMQTTExpectNothingFor(t, r2, 3*time.Second)
+}
+
+// TestMQTTDrainRecreateEscapesASkippedStore is plan test 17(d2) shape (ii): the
+// ORIGINAL store was skipped for lack of interest, so only a deduplication entry
+// exists — no record ever did.
+//
+// $MQTT_out is interest-retained: with no consumer, a store succeeds, keeps
+// nothing, and still records its Nats-Msg-Id. That is the case a successful PubAck
+// most obviously misleads, because nothing was deleted and nothing failed. The
+// recreate must therefore verify presence and escape the poisoned identity, or the
+// source is acked for a PUBREL that never existed.
+func TestMQTTDrainRecreateEscapesASkippedStore(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	conn, sess, pi := testDrainSetup(t, s, o, "skipped", "skipped/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "skipped/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+
+	if n := testDrainCount(sess); n != 1 {
+		t.Fatalf("expected one draining consumer, got %v", n)
+	}
+
+	// Remove the PUBREL consumer, so the interest-retained stream keeps nothing the
+	// PUBREC is about to store.
+	sess.mu.Lock()
+	pubRelDur := ""
+	if sess.pubRelConsumer != nil {
+		pubRelDur = sess.pubRelConsumer.Durable
+	}
+	sess.mu.Unlock()
+	if pubRelDur == "" {
+		t.Fatal("a QoS 2 subscription should have created the PUBREL consumer")
+	}
+	if _, err := sess.jsa.deleteConsumer(mqttOutStreamName, pubRelDur, true); err != nil {
+		t.Fatalf("deleting the PUBREL consumer: %v", err)
+	}
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if ci, err := sess.jsa.lookupConsumer(mqttOutStreamName, pubRelDur); err == nil && ci != nil {
+			return errors.New("the PUBREL consumer is still present")
+		}
+		return nil
+	})
+
+	// The store SUCCEEDS and keeps nothing. No error, no rollback, no flag.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if !testDrainIntentRecorded(sess) {
+			return errors.New("the intent has not been persisted yet")
+		}
+		return nil
+	})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("a skipped store must not finalize the claim, got %d claims", n)
+	}
+	conn.c.Close()
+
+	// Resume: the PUBREL path is verified and recreated first, then the barrier has
+	// to notice its recreate stored nothing and retry under a fresh identity.
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "skipped", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+	testMQTTFlush(t, c2, nil, r2)
+
+	sess2 := testMQTTResidentSession(t, s, "skipped")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+}
+
+// testDrainMessageExpiryProps builds a v5 PUBLISH properties body carrying only a
+// Message Expiry Interval.
+func testDrainMessageExpiryProps(secs uint32) []byte {
+	body := newMQTTWriter(0)
+	body.WriteByte(mqttPropMessageExpiry)
+	body.WriteUint32(secs)
+	return body.Bytes()
+}
+
+// TestMQTTDrainAmbiguousIntentSaveAdoptsItsOwnRecord is plan test 17(e2): an
+// intent write that LANDED with its response lost.
+//
+// sess.seq is now stale, and a same-process reconnect reuses this very session
+// object — so its CONNECT accept save would CAS against a sequence the record has
+// already moved past and the reconnect would be rejected, before any recovery
+// could run. The readback has to classify the write: same base sequence means it
+// did not land, a newer record whose bytes match ours means it did (adopt it), and
+// anything else belongs to somebody else. This exercises the middle case, which is
+// the one that must not be mistaken for either neighbour.
+func TestMQTTDrainAmbiguousIntentSaveAdoptsItsOwnRecord(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	conn, sess, pi := testDrainSetup(t, s, o, "ambigsave", "ambigsave/topic", 2)
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "ambigsave/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("expected the started delivery to be claimed, got %d", n)
+	}
+
+	sess.mu.Lock()
+	seqBefore := sess.seq
+	sess.mu.Unlock()
+
+	// The record write LANDS; only its response is replaced by a non-CAS error, so
+	// this broker cannot tell whether it did.
+	var once atomicBoolOnce
+	restore := setMQTTTestSessStoreResultHook(func(_ *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+		if err == nil && once.set() {
+			return nil, errors.New("test: session record response lost")
+		}
+		return resp, err
+	})
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	testDrainWaitConnClosed(t, conn.r)
+	restore()
+	conn.c.Close()
+
+	sess.mu.Lock()
+	uncertain := sess.seqUncertain
+	sess.mu.Unlock()
+	if !uncertain {
+		t.Fatal("an ambiguous record write must leave the session unresolved, or nothing drives the readback")
+	}
+
+	// The FIRST same-broker reconnect must succeed: the readback recognises our own
+	// bytes at a newer sequence and adopts it. A stale CAS would reject this.
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "ambigsave", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	sess.mu.Lock()
+	stillUncertain, seqAfter := sess.seqUncertain, sess.seq
+	sess.mu.Unlock()
+	if stillUncertain {
+		t.Fatal("the reconnect must resolve the uncertain write before it accepts the session")
+	}
+	if seqAfter <= seqBefore {
+		t.Fatalf("the readback must adopt the record's newer sequence, got %v (was %v)", seqAfter, seqBefore)
+	}
+
+	// And the intent that landed is honored: the exchange completes under its
+	// original identifier, with the payload never resent.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+	testMQTTFlush(t, c2, nil, r2)
+
+	sess2 := testMQTTResidentSession(t, s, "ambigsave")
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if n := testDrainCount(sess2); n != 0 {
+			return fmt.Errorf("drain still present (%d)", n)
+		}
+		return nil
+	})
+}
+
+// atomicBoolOnce fires exactly once, so a hook can corrupt a single write.
+type atomicBoolOnce struct{ done atomic.Bool }
+
+func (o *atomicBoolOnce) set() bool { return o.done.CompareAndSwap(false, true) }
+
+// testPersistedDrainClaims counts the claims the STORED session record carries —
+// the only view that can prove an ordering against a durable write.
+func testPersistedDrainClaims(t *testing.T, sess *mqttSession) int {
+	t.Helper()
+	subject := mqttSessStreamSubjectPrefix + sess.domainTk + sess.idHash
+	smsg, err := sess.jsa.loadLastMsgFor(mqttSessStreamName, subject)
+	if err != nil || smsg == nil {
+		t.Fatalf("loading the persisted session record: %v", err)
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		t.Fatalf("decoding the persisted session record: %v", err)
+	}
+	n := 0
+	for _, pd := range ps.Drains {
+		if pd != nil {
+			n += len(pd.Started)
+		}
+	}
+	return n
+}
+
+// TestMQTTDrainAmbiguousCompletionThroughTheRealCallbacks drives the REAL delivery
+// and PUBREL callbacks, not the helpers they call.
+//
+// A unit test that calls finalizeDrainDelivery and confirmDrainPubRel directly
+// proves only that those helpers behave. Each callback then makes its own decision
+// afterwards, and either can act on in-memory "not claimed": the delivery path by
+// ACKING a redelivery, the PUBREL path by FORWARDING. Both are irreversible —
+// acking destroys a message the stored record may still claim (I1), and forwarding
+// lets the client PUBCOMP an exchange the record still owes (I10).
+//
+// The exchange is taken past PUBREC normally, so the completion write is the one
+// the PUBREL callback performs. Its record write is then suppressed AND its readback
+// made unavailable, holding the removal unconfirmed while the assertions run.
+func TestMQTTDrainAmbiguousCompletionThroughTheRealCallbacks(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	conn, sess, pi := testDrainSetup(t, s, o, "ambreal", "ambreal/topic", 2)
+	defer conn.c.Close()
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "ambreal/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("expected the started delivery to be claimed, got %d", n)
+	}
+
+	// Target the PUBREL callback's COMPLETION write, and only it. The intent write
+	// must succeed — an ambiguous intent closes the connection, which is a different
+	// path — and the two are distinguishable by what they are about to store: the
+	// intent write still carries the claim, the completion write no longer does.
+	// The readback is disabled from the same moment, so the removal stays
+	// unconfirmed while the assertions run.
+	var suppressing atomic.Bool
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
+		if stream == mqttSessStreamName && suppressing.Load() {
+			return errors.New("test: readback unavailable")
+		}
+		return nil
+	})
+	restoreStore := setMQTTTestSessStoreResultHook(func(sp *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+		if err != nil {
+			return resp, err
+		}
+		if testDrainClaims(sp) == 0 {
+			suppressing.Store(true)
+			return nil, errors.New("test: session record response lost")
+		}
+		return resp, err
+	})
+
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	checkFor(t, 10*time.Second, 20*time.Millisecond, func() error {
+		if !suppressing.Load() {
+			return errors.New("the completion write has not been attempted yet")
+		}
+		return nil
+	})
+
+	// The PUBREL callback now runs: its completion write is ambiguous, so it must
+	// forward NOTHING. A forwarded PUBREL here would let the client PUBCOMP an
+	// exchange the stored record still claims.
+	testMQTTExpectNothingFor(t, conn.r, 2*time.Second)
+
+	sess.mu.Lock()
+	var unconfirmed, claimed bool
+	for _, d := range sess.drainByDur {
+		for _, st := range d.seqs {
+			unconfirmed = unconfirmed || st.unclaimUnconfirmed
+			claimed = claimed || st.claimed
+		}
+	}
+	sess.mu.Unlock()
+	if !unconfirmed && !claimed {
+		t.Fatal("the source removal is neither claimed nor marked unconfirmed, so the callbacks are free to ack and forward it " +
+			"even though no record is known to carry the removal")
+	}
+
+	// Let it resolve: the write never landed, so the claim comes back and the
+	// exchange completes through the ordinary path. Nothing was lost.
+	restoreStore()
+	suppressing.Store(false)
+	restoreRead()
+	// Deliberately NOT resolved by the test: production has to do it, or a client
+	// that stays connected leaves the drain stuck forever. The redelivery path is
+	// the retry clock.
+	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
+		if sess.isSeqUncertain() {
+			return errors.New("still unresolved: nothing in production is retrying the readback")
+		}
+		return nil
+	})
+
+	testMQTTReadPIPacket(mqttPacketPubRel, t, conn.r, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, conn.c, pi)
+	testMQTTFlush(t, conn.c, nil, conn.r)
+}
+
+// TestMQTTDrainUnconfirmedRemovalIsNotAckedByTheDeliveryCallback covers the QoS 1
+// delivery callback, which is the other place an unconfirmed removal can be acted
+// on irreversibly.
+//
+// The callback's own "fresh or already finalized" branch acks the message. For a
+// sequence whose removal is UNCONFIRMED that ack would destroy a message the stored
+// record may still claim (I1) — and unlike a forward, there is nothing left
+// afterwards to recover it from.
+func TestMQTTDrainUnconfirmedRemovalIsNotAckedByTheDeliveryCallback(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	// Short, so the redelivery that exercises the branch arrives inside the test.
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	conn, sess, pi := testDrainSetup(t, s, o, "ackgate", "ackgate/topic", 1)
+	defer conn.c.Close()
+
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "ackgate/topic"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("expected the started delivery to be claimed, got %d", n)
+	}
+
+	// The PUBACK's completion write lands nowhere and stays unresolved, so the
+	// removal is held unconfirmed while redeliveries keep arriving.
+	var suppressing atomic.Bool
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
+		if stream == mqttSessStreamName && suppressing.Load() {
+			return errors.New("test: readback unavailable")
+		}
+		return nil
+	})
+	suppressing.Store(true)
+	mqttTestSessStoreSuppressV.Store(true)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, pi)
+
+	// Give AckWait several windows: each redelivery reaches the drain branch with
+	// claimed == false and unclaimUnconfirmed == true, and must NOT be acked.
+	time.Sleep(2 * time.Second)
+	mqttTestSessStoreSuppressV.Store(false)
+
+	ci, err := sess.jsa.lookupConsumer(mqttStreamName, testDrainOnlyDurable(t, sess))
+	if err != nil || ci == nil {
+		t.Fatalf("lookupConsumer: %v", err)
+	}
+	if ci.NumAckPending == 0 && ci.AckFloor.Stream >= 1 {
+		t.Fatal("the source was acked while its removal was unconfirmed: the stored record may still claim it, " +
+			"and there is nothing left to recover the message from (I1)")
+	}
+
+	// Resolving proves the write never landed, so the claim comes back and the
+	// message is still there to be completed.
+	suppressing.Store(false)
+	restoreRead()
+	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
+		if sess.isSeqUncertain() {
+			return errors.New("still unresolved: nothing in production is retrying the readback")
+		}
+		return nil
+	})
+	if n := testDrainClaims(sess); n != 1 {
+		t.Fatalf("the record's claim must be restored once the write is proven not to have landed, got %d", n)
+	}
+}
+
+// testDrainOnlyDurable returns the single draining durable's name.
+func testDrainOnlyDurable(t *testing.T, sess *mqttSession) string {
+	t.Helper()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if len(sess.drainByDur) != 1 {
+		t.Fatalf("expected exactly one draining durable, got %d", len(sess.drainByDur))
+	}
+	for dur := range sess.drainByDur {
+		return dur
+	}
+	return _EMPTY_
+}

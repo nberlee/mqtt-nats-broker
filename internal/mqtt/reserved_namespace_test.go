@@ -357,7 +357,7 @@ func testReservedSessionRecordEx(t *testing.T, s *Server, o *Options, seed func(
 	sess.mu.Lock()
 	seed(asm, sess)
 	sess.mu.Unlock()
-	if err := sess.save(); err != nil {
+	if err := testSessSave(t, sess); err != nil {
 		t.Fatalf("seed save: %v", err)
 	}
 	testMQTTDisconnect(t, c, nil)
