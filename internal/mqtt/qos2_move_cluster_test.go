@@ -783,3 +783,210 @@ func TestQoS2MoveConcurrentPubRelSameGeneration(t *testing.T) {
 		return nil
 	})
 }
+
+// testQoS2WatchClaim records the resolved status of every release claim on one
+// account manager, keyed by hold subject.
+//
+// It exists for the same reason testQoS2FinalizeWatcher does: the losing side of
+// a cross-broker discard cannot be asked what it decided. The takeover closes its
+// connection regardless, so its PUBCOMP may never reach the wire — and a releaser
+// that correctly declines to deliver sends nothing at all, which is
+// indistinguishable from a stalled one to a reader.
+type testQoS2ClaimWatcher struct {
+	mu   sync.Mutex
+	seen map[string]mqttQoS2ClaimStatus
+}
+
+func testQoS2WatchClaim(t *testing.T, asm *mqttAccountSessionManager) *testQoS2ClaimWatcher {
+	t.Helper()
+	w := &testQoS2ClaimWatcher{seen: make(map[string]mqttQoS2ClaimStatus)}
+	asm.mu.Lock()
+	asm.testQoS2ClaimDone = func(holdSubject, _ string, status mqttQoS2ClaimStatus) {
+		w.mu.Lock()
+		w.seen[holdSubject] = status
+		w.mu.Unlock()
+	}
+	asm.mu.Unlock()
+	t.Cleanup(func() {
+		asm.mu.Lock()
+		asm.testQoS2ClaimDone = nil
+		asm.mu.Unlock()
+	})
+	return w
+}
+
+// requireStatus waits for the claim on subject to resolve and asserts its status.
+// A claim that never resolves fails here rather than being silently accepted as a
+// displaced connection.
+func (w *testQoS2ClaimWatcher) requireStatus(t *testing.T, subject string, want mqttQoS2ClaimStatus, what string) {
+	t.Helper()
+	for deadline := time.Now().Add(testMQTTTimeout); time.Now().Before(deadline); {
+		w.mu.Lock()
+		got, ok := w.seen[subject]
+		w.mu.Unlock()
+		if ok {
+			if got != want {
+				t.Fatalf("%s: claim on %q resolved as %v, want %v", what, subject, got, want)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s: no claim resolved for %q within %v — it stalled or was never attempted, "+
+		"which a silent reader would have accepted as a displaced connection", what, subject, testMQTTTimeout)
+}
+
+// TestQoS2ReleaseClusterDiscardBeatsRelease is the cross-broker form of the
+// behavioral pin. Broker A is parked between loading the held record and claiming
+// the release; broker B takes the session over with a clean start, which discards
+// it. When A resumes, its claim must resolve Discarded and it must deliver
+// nothing.
+//
+// A's own connection is closed by the takeover, so the verdict is read through the
+// claim watcher rather than off the wire — the wire carries no evidence either way.
+func TestQoS2ReleaseClusterDiscardBeatsRelease(t *testing.T) {
+	if os.Getenv("MQTTNB_CLUSTER_FAILOVER_TESTS") != "1" {
+		t.Skip("set MQTTNB_CLUSTER_FAILOVER_TESTS=1 to run cluster failover tests")
+	}
+	oldTimeout := testMQTTTimeout
+	testMQTTTimeout = 40 * time.Second
+	defer func() { testMQTTTimeout = oldTimeout }()
+
+	cl := testNewJetStreamCluster(t, 3)
+	bA := cl.startBroker(t, 0)
+	bB := cl.startBroker(t, 1)
+
+	const topic = "q2relclaim/topic"
+	const clientID = "q2relclaim-pub"
+	cs, rs := testQoS2ClusterSub(t, bB, "q2relclaim-sub", topic)
+	defer cs.Close()
+
+	cpA, rpA := testQoS2ClusterPub(t, bA, clientID)
+	defer cpA.Close()
+	pi := uint16(61)
+	testMQTTPublishV5(t, cpA, 2, pi, topic, []byte("discarded-across-brokers"))
+	testMQTTReadPubRecV5(t, rpA, pi)
+	subject := testMQTTGetClient(t, bA.s, clientID).mqttQoS2InternalSubject(pi)
+
+	asmA := testMQTTGetGlobalASM(t, bA.s)
+	watcher := testQoS2WatchClaim(t, asmA)
+
+	// Park A between its load and its claim, and let B discard the session there.
+	// The takeover has to complete before A's claim runs, or the race under test is
+	// not the one exercised — so the seam blocks on it rather than merely starting it.
+	discarded := make(chan struct{})
+	asmA.mu.Lock()
+	asmA.testQoS2PreClaim = func(holdSubject, _ string, _ uint64) error {
+		if holdSubject != subject {
+			return nil
+		}
+		select {
+		case <-discarded:
+		case <-time.After(testMQTTTimeout):
+			t.Errorf("the takeover never completed; the race under test was not exercised")
+		}
+		return nil
+	}
+	asmA.mu.Unlock()
+	t.Cleanup(func() {
+		asmA.mu.Lock()
+		asmA.testQoS2PreClaim = nil
+		asmA.mu.Unlock()
+	})
+
+	go func() {
+		testQoS2SendPubRel(t, cpA, pi)
+	}()
+
+	// B takes the session over with a clean start, which discards it: the discard
+	// claims each release before destroying its hold, so A's later claim must lose.
+	cpB, rpB := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   clientID,
+		cleanStart: true,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, bB.opts.MQTT.Host, bB.opts.MQTT.Port)
+	defer cpB.Close()
+	testMQTTReadConnAckV5(t, rpB)
+	close(discarded)
+
+	watcher.requireStatus(t, subject, mqttQoS2ClaimDiscarded, "release racing a cross-broker discard")
+
+	// The message was NOT delivered out of the discarded session. This is the whole
+	// point: before the claim, A would have fanned out here and read the resulting
+	// absence as proof the exchange completed.
+	testMQTTExpectNothingFor(t, rs, 3*time.Second)
+
+	// And the discard marker survives, so a still later releaser would lose too.
+	asmB := testMQTTGetGlobalASM(t, bB.s)
+	cur, _, err := asmB.jsa.loadQoS2RelClaim(mqttQoS2ClaimSubjectFor(subject))
+	if err != nil {
+		t.Fatalf("load claim: %v", err)
+	}
+	if cur == nil || cur.State != mqttQoS2RelStateDiscarded {
+		t.Fatalf("claim = %+v, want the discard marker to survive\n%s", cur, cl.describe())
+	}
+}
+
+// TestQoS2ReleaseClusterReleaseBeatsDiscard is the mirror order, and pins the half
+// that protects the message rather than the session: when the releaser claims
+// first, a discard on another broker must NOT destroy the hold record. Its payload
+// is what a retry delivers if the releasing broker dies mid-release, so destroying
+// it would turn this spec deviation into silent loss.
+//
+// The discard waits briefly for the release to finish, so the exchange completes
+// normally and exactly one delivery reaches the witness.
+func TestQoS2ReleaseClusterReleaseBeatsDiscard(t *testing.T) {
+	if os.Getenv("MQTTNB_CLUSTER_FAILOVER_TESTS") != "1" {
+		t.Skip("set MQTTNB_CLUSTER_FAILOVER_TESTS=1 to run cluster failover tests")
+	}
+	oldTimeout := testMQTTTimeout
+	testMQTTTimeout = 40 * time.Second
+	defer func() { testMQTTTimeout = oldTimeout }()
+
+	cl := testNewJetStreamCluster(t, 3)
+	bA := cl.startBroker(t, 0)
+	bB := cl.startBroker(t, 1)
+
+	const topic = "q2relwin/topic"
+	const clientID = "q2relwin-pub"
+	cs, rs := testQoS2ClusterSub(t, bB, "q2relwin-sub", topic)
+	defer cs.Close()
+
+	cpA, rpA := testQoS2ClusterPub(t, bA, clientID)
+	defer cpA.Close()
+	pi := uint16(62)
+	testMQTTPublishV5(t, cpA, 2, pi, topic, []byte("release-wins"))
+	testMQTTReadPubRecV5(t, rpA, pi)
+	subject := testMQTTGetClient(t, bA.s, clientID).mqttQoS2InternalSubject(pi)
+
+	// A claims first and completes the exchange.
+	testQoS2SendPubRel(t, cpA, pi)
+	if reason, _ := testMQTTReadPubCompV5(t, rpA, pi); reason != mqttReasonSuccess {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonSuccess, reason)
+	}
+	testQoS2ClusterConsume(t, cs, rs, topic, "release-wins")
+
+	// Now B discards the session. A's exchange already completed, so there is
+	// nothing left to preserve and nothing more to deliver.
+	cpB, rpB := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   clientID,
+		cleanStart: true,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, bB.opts.MQTT.Host, bB.opts.MQTT.Port)
+	defer cpB.Close()
+	testMQTTReadConnAckV5(t, rpB)
+
+	testMQTTExpectNothingFor(t, rs, 3*time.Second)
+
+	asmB := testMQTTGetGlobalASM(t, bB.s)
+	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
+		rec, _, err := asmB.jsa.loadQoS2Record(subject)
+		if err != nil {
+			return err
+		}
+		if rec != nil && rec.state == mqttQoS2Held {
+			return fmt.Errorf("a completed exchange left a held record behind\n%s", cl.describe())
+		}
+		return nil
+	})
+}

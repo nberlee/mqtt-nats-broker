@@ -252,7 +252,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 		}
 	}
 
-	// Purge this incarnation's inbound QoS2 records ($MQTT_qos2in, subject
+	// Destroy this incarnation's inbound QoS2 records ($MQTT_qos2in, subject
 	// "$MQTT.qos2.in.<idHash>.<gen>.<PI>"; see mqttQoS2HoldSubject). Both record
 	// states are covered — held PUBLISHes and terminal tombstones — which is what the
 	// move protocol needs: a discarded session must leave neither behind. They
@@ -261,16 +261,23 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// inbound QoS2 message pending PUBREL is session state (Spec5 [4.1]) that a
 	// resumed session must keep.
 	//
-	// The filters are GENERATION-scoped (plus the legacy single-token range, so
-	// records orphaned by a pre-upgrade incarnation are still reaped). That is what
-	// makes this purge safe to issue late: it can no longer reach a newer
-	// incarnation's holds, which the old hash-wide filter could. It is also why the
-	// hold records still carry their own immutable generation ID — the purge is keyed
-	// by subject, while a CAS on one of these subjects needs an identity a stream
-	// sequence cannot give it. See sess_incarnation.go and qos2_move.go, invariant 1.
-	for _, filter := range mqttQoS2HoldPurgeFilters(t.idHash, t.gen) {
-		if err := sess.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, filter, noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
-			return fmt.Errorf("unable to purge QoS2 hold entries for session %q: %v", t.id, err)
+	// This ARBITRATES per subject rather than purging by filter, because a purge
+	// competes with nothing: a PUBREL that had merely READ a held record went on to
+	// fan out, and its finalize read the resulting absence as proof the exchange had
+	// completed — a message delivered out of a session already reported discarded. So
+	// the discard now claims each release before destroying its hold, and where a
+	// releaser claimed first it waits briefly and then leaves both records rather than
+	// destroying a payload a crashed releaser's retry still needs. It reads no
+	// payloads at all. See qos2_release_claim.go.
+	// There is deliberately NO blind filter purge left beside this. Every hold
+	// subject of this incarnation is reached by the arbitration, and a filter purge
+	// alongside it could only destroy what the arbitration decided to preserve: a
+	// held payload whose releaser claimed it (and which its retry still needs after a
+	// crash), or the claim records themselves — including the `discarded` markers
+	// that are the only durable proof a late releaser must lose.
+	if sess.asm != nil {
+		if err := sess.asm.arbitrateQoS2ReleaseClaims(sess.asm.server(), t.idHash, t.gen); err != nil {
+			return fmt.Errorf("unable to arbitrate the inbound QoS2 releases of session %q: %w", t.id, err)
 		}
 	}
 	return nil

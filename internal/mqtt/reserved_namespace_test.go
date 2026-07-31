@@ -423,6 +423,12 @@ func testWriteLegacyPersistedSession(t *testing.T, asm *mqttAccountSessionManage
 	t.Helper()
 	ps.ID = cid
 	ps.Origin = asm.jsa.id
+	// "Legacy" here means the pre-reserved-namespace SUBSCRIPTION format, not a
+	// record predating incarnation generations: those are rejected outright, so the
+	// fixture carries a well-formed generation like any real record.
+	if ps.Gen == _EMPTY_ {
+		ps.Gen = mqttNewSessGen()
+	}
 	b, err := json.Marshal(ps)
 	if err != nil {
 		t.Fatalf("marshal legacy session: %v", err)

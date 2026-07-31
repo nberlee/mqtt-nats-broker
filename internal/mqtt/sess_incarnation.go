@@ -20,19 +20,23 @@
 // reconnect or resume preserves it, because a resumed session must still find its
 // own PUBRELs, QoS 2 holds and Will.
 //
-// Migration: a record written before this existed carries no generation, which
-// means "legacy hash-only names". Such a session keeps working on the old names
-// and is re-minted the first time it is discarded; it stays exposed to the
-// late-delete race until then. The rename also means a broker on the old naming
-// and one on the new naming do not see each other's PUBRELs for the same session,
-// so — like the affine protocol — this only fully holds once every broker in the
-// cluster understands it.
+// EVERY session carries one. A record without a generation is rejected rather
+// than accommodated (mqttSessGenFromRecord), because the bridge is pre-release and
+// its `$MQTT_*` schemas carry no compatibility contract yet — see "Compatibility
+// boundary" in docs/ARCHITECTURE.md, which says designs must not carry legacy-format
+// machinery. That is not merely tidiness here: a hash-only session would have no
+// identity to scope an arbitration with, so the inbound QoS 2 release claim could
+// not be arbitrated for it (qos2_release_claim.go) and the discard would fall back
+// to a blind hash-wide purge — which can destroy a held payload whose releaser
+// claimed it and then died, turning a narrow ordering deviation into silent loss.
+// A partially-arbitrated path is worse than no path.
 
 package mqtt
 
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/nats-io/nuid"
 )
@@ -47,8 +51,9 @@ func mqttNewSessGen() string { return nuid.Next() }
 // mqttValidSessGen reports whether s is a well-formed incarnation generation:
 // exactly mqttSessGenLen characters of the NUID base-62 alphabet. Same rule, and
 // same reasoning, as mqttValidQ2AffGen — an out-of-alphabet body of the right
-// length must not be admitted into the identity space, and empty must not
-// collapse "legacy, no identity" into it.
+// length must not be admitted into the identity space, and empty must not collapse
+// "no identity" into it — which is also why an absent generation is rejected rather
+// than accepted as a distinct, unscoped mode.
 func mqttValidSessGen(s string) bool {
 	if len(s) != mqttSessGenLen {
 		return false
@@ -62,17 +67,18 @@ func mqttValidSessGen(s string) bool {
 	return true
 }
 
-// mqttSessGenTk returns the subject/durable token for a generation: the empty
-// string for a legacy session (so its names are byte-identical to what an older
-// broker wrote), otherwise the generation preceded by its separator.
+// mqttSessGenTk returns the subject/durable token for a generation: the generation
+// preceded by its separator.
 //
 // sep is "." inside a subject and "_" inside a durable name, both of which a
 // generation's alphabet excludes, so the token can never be mistaken for part of
 // the hash.
+//
+// gen is always a well-formed generation: it is either freshly minted or came
+// through mqttSessGenFromRecord, which rejects an absent one. There is deliberately
+// no empty-string branch — a name built from one would be a malformed subject
+// (`…HASH..1`) or, worse, a filter that widens across incarnations.
 func mqttSessGenTk(gen, sep string) string {
-	if gen == _EMPTY_ {
-		return _EMPTY_
-	}
 	return sep + gen
 }
 
@@ -94,54 +100,88 @@ func mqttPubRelNames(idHash, gen string) (subject, deliverSubject, durable strin
 
 // mqttQoS2HoldSubject returns the $MQTT_qos2in subject holding an inbound QoS 2
 // PUBLISH for one packet identifier of one session incarnation
-// ("$MQTT.qos2.in.<idHash>.<gen>.<PI>"; legacy: "$MQTT.qos2.in.<idHash>.<PI>").
+// ("$MQTT.qos2.in.<idHash>.<gen>.<PI>").
 func mqttQoS2HoldSubject(idHash, gen string, pi uint16) string {
 	return mqttQoS2IncomingMsgsStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") +
 		"." + strconv.FormatUint(uint64(pi), 10)
 }
 
-// mqttQoS2HoldPurgeFilters returns the subject filters a discarded session must
-// purge from $MQTT_qos2in. They cover both record states — held PUBLISHes and
-// terminal tombstones — which is what the move protocol needs: a discarded session
-// must leave neither behind, or they collide by packet identifier with a later
-// session for the same client ID.
+// mqttQoS2ClaimSubjectToken is the last token of a release-claim subject, and
+// mqttQoS2ClaimSubjectSuffix the token with its separator. A hold subject's last
+// token is always a decimal packet identifier, so it can never be this token —
+// which is what lets a filter over $MQTT.qos2.in.> tell the two record kinds apart
+// by the token itself rather than by counting, which a wildcard depth change would
+// silently invalidate.
+const (
+	mqttQoS2ClaimSubjectToken  = "rel"
+	mqttQoS2ClaimSubjectSuffix = "." + mqttQoS2ClaimSubjectToken
+)
+
+// mqttQoS2ClaimSubject returns the $MQTT_qos2in subject carrying the RELEASE
+// CLAIM for one packet identifier of one session incarnation: the hold subject
+// plus a "rel" token ("$MQTT.qos2.in.<idHash>.<gen>.<PI>.rel").
 //
-// A generation-scoped session purges its OWN generation, plus the legacy
-// single-token range "<idHash>.*". That second filter matters and is precisely
-// scoped: a legacy record's subject is "<idHash>.<PI>", exactly one token past the
-// hash, so the filter reaps records orphaned by a pre-upgrade incarnation (which
-// today's hash-wide purge would have cleaned up) while being unable to match any
-// generation-scoped subject, which always has two.
+// It is a sibling of the hold subject, not part of it: MaxMsgsPer:1 makes each a
+// single-slot register of its own, and loadLastMsgFor on the hold subject is an
+// exact-subject lookup that cannot see the claim. See qos2_release_claim.go.
+func mqttQoS2ClaimSubject(idHash, gen string, pi uint16) string {
+	return mqttQoS2ClaimSubjectFor(mqttQoS2HoldSubject(idHash, gen, pi))
+}
+
+// mqttQoS2ClaimSubjectFor returns the claim subject for a hold subject. The
+// discard walk has the subject rather than the packet identifier, and must never
+// have to parse one back out of it.
+func mqttQoS2ClaimSubjectFor(holdSubject string) string {
+	return holdSubject + mqttQoS2ClaimSubjectSuffix
+}
+
+// mqttQoS2IsClaimSubject reports whether subject is a release-claim subject
+// rather than a hold subject.
+func mqttQoS2IsClaimSubject(subject string) bool {
+	return strings.HasSuffix(subject, mqttQoS2ClaimSubjectSuffix)
+}
+
+// mqttQoS2HoldWalkFilter returns the filter enumerating one incarnation's HOLD
+// subjects, and only those: exactly one token past the generation, so a claim
+// subject (two) cannot match.
 //
-// A legacy session has no identity to scope with, so it keeps the old hash-wide
-// filter and stays able to purge a newer generation's holds — the pre-existing
-// exposure, and the reason such a session is only safe once it has been discarded
-// and re-minted.
-func mqttQoS2HoldPurgeFilters(idHash, gen string) []string {
-	base := mqttQoS2IncomingMsgsStreamSubjectPrefix + idHash
-	if gen == _EMPTY_ {
-		return []string{base + ".>"}
-	}
-	return []string{base + ".*", base + "." + gen + ".>"}
+// Excluding claims is not merely tidiness. The response is a subject list, and
+// JetStream pages it above JSMaxSubjectDetails (100_000) entries; a packet
+// identifier is 16 bits, so holds alone are bounded by 65_535 and one request
+// always returns the whole set, while holds plus claims could in principle
+// exceed the limit and need paging. The walk is also uninterested in a claim
+// whose hold record is gone: qos2_release_claim.go gives those a different owner.
+func mqttQoS2HoldWalkFilter(idHash, gen string) string {
+	return mqttQoS2IncomingMsgsStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") + ".*"
 }
 
 // mqttSessGenFromRecord validates a generation read from a persisted session
 // record before anything derives a NAME from it.
 //
 // Everything downstream — the PUBREL durable, subject and delivery subject, the
-// inbound QoS 2 hold subjects and, critically, the purge FILTERS — is built by
-// concatenation. A stored value carrying "." or a wildcard would either produce an
-// unusable name or widen a purge filter across other incarnations, deleting
-// records this session has no claim on. The record is not a trusted input: it can
-// be written by an older broker, a future one, or hand-edited.
+// inbound QoS 2 hold subjects and their release claims, and the discard's
+// enumeration FILTER — is built by concatenation. A stored value carrying "." or a
+// wildcard would either produce an unusable name or widen that filter across other
+// incarnations, reaching records this session has no claim on. The record is not a
+// trusted input: it can be written by a future broker, or hand-edited.
 //
-// Empty is the legacy form and stays legal (those sessions keep the hash-only
-// names until they are next discarded). Anything else must be a well-formed
-// generation, and a malformed one fails CLOSED rather than being coerced to the
-// legacy form — silently widening a purge is the outcome this exists to prevent.
+// Absent and malformed both fail CLOSED. Absent is the shape a record written
+// before incarnation generations existed has, and admitting it was the whole
+// legacy path: such a session has no identity to scope an arbitration with, so its
+// inbound QoS 2 release could not be arbitrated against a discard and the discard
+// would fall back to a blind hash-wide purge — which destroys a held payload whose
+// releaser claimed it and then died. That is silent loss, strictly worse than the
+// ordering deviation the claim exists to fix, so the path is rejected rather than
+// half-supported. The bridge is pre-release and its `$MQTT_*` schemas carry no
+// compatibility contract (docs/ARCHITECTURE.md, "Compatibility boundary"): such a
+// record means the development store predates this design and must be recreated.
 func mqttSessGenFromRecord(gen string) (string, error) {
-	if gen == _EMPTY_ || mqttValidSessGen(gen) {
+	if mqttValidSessGen(gen) {
 		return gen, nil
+	}
+	if gen == _EMPTY_ {
+		return _EMPTY_, fmt.Errorf("session record carries no incarnation generation: it predates " +
+			"generation-scoped resource naming, and the $MQTT_* streams must be recreated")
 	}
 	return _EMPTY_, fmt.Errorf("session record carries a malformed incarnation generation %q", gen)
 }

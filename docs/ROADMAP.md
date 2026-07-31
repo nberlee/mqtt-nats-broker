@@ -111,9 +111,10 @@ is fixed before feature work continues.
   starts fresh with a fresh generation and Session Present false, which also makes
   a crashed teardown self-healing instead of leaking until the orphan sweep.
 
-  Residuals, both in `docs/CONFORMANCE.md`: sessions written before this carry no
-  generation, keep the legacy hash-only names and stay exposed to the race until
-  they are next discarded (which re-mints them); and, like the affine protocol,
+  Residuals, both in `docs/CONFORMANCE.md`: a session record written before this
+  carries no generation and is now **rejected** rather than resumed on hash-only
+  names (see the release-claim item below, which is what made a hash-only session
+  unsafe rather than merely unprotected); and, like the affine protocol,
   both halves hold only once every broker in the cluster understands them — an
   older broker ignores `Teardown` and would overwrite a marker, and uses the old
   names.
@@ -289,13 +290,83 @@ is fixed before feature work continues.
   suppressed, since otherwise "expired for delivery" and "still in the stream"
   coexist only during the reaper's lag.
 
-- [ ] Serialize session discard against inbound QoS 2 PUBREL release. A PUBREL
-  racing a cross-broker session discard can deliver a message from a discarded
-  session once (residual 4 of the move protocol). The intended fix is a
-  `held -> releasing` CAS claim on the hold record that competes with the
-  discard/cancel transition, so exactly one of "release it" and "discard it" wins.
-  Narrow and not a regression — the pre-move code had the same race with a worse
-  outcome — so it is a follow-up rather than a blocker.
+- [x] Serialize session discard against inbound QoS 2 PUBREL release. A PUBREL
+  racing a cross-broker session discard could deliver a message from a discarded
+  session once (residual 4 of the move protocol), and record that as success: the
+  hold record's only arbitration point was the terminal CAS, which runs *after* the
+  onward delivery, while the discard side was a blanket `STREAM.PURGE` that competed
+  with nothing. A PUBREL that had merely *read* the held record fanned out anyway,
+  and its finalizer then read the resulting absence as `Gone` — "the exchange
+  completed".
+
+  Fixed by a **release claim** (`internal/mqtt/qos2_release_claim.go`): a create-only
+  CAS on a sibling of the hold subject (`…<pi>.rel`), which the releaser writes as
+  `releasing` before the onward store and a discard writes as `discarded` before it
+  destroys the hold. Exactly one create can succeed, so the loser does nothing
+  irreversible. The discard now arbitrates **per subject** — one `STREAM.INFO` with a
+  subjects filter, then a claim and an exact-subject purge per hold — instead of
+  purging by filter, and reads no payloads at all.
+
+  This item originally prescribed a `held -> releasing` CAS **on the hold record**.
+  That was rejected during implementation review, for reasons worth keeping: it
+  removes the only code that reclaims `$MQTT_qos2in` while making the record left
+  behind payload-sized (the stream forbids every limit that could evict it); adding a
+  state to `mqttQoS2State` makes `finalizeQoS2MoveInner`'s `default: Superseded` arm
+  reachable, and that arm sends PUBCOMP over a surviving nonterminal record, so an
+  omitted switch case costs a message; and re-encoding the record from a
+  reconstructed `pp` is a lossy projection that would durably drop properties failing
+  `mqttValidateForwardProps` and re-base the Message Expiry Interval on every hop. A
+  sibling register leaves the hold record byte-identical for the whole exchange, and
+  is the shape the Will outbox, the affine claim and the teardown marker already use.
+
+  The claim alone is not sufficient, and the pairing is the load-bearing part. A
+  releaser that stalls after loading the held record while a peer commits the
+  tombstone and reaps both records finds an **empty** claim subject, so its
+  create-only claim *succeeds* and it would fan out a second time from the payload it
+  still holds in memory — a hazard the pre-change code had too. So the claim is
+  followed by an authoritative re-read requiring both the original sequence and the
+  original generation, in which **every** accepting outcome is generation-qualified:
+  a later exchange's tombstone on the same packet identifier is not proof that this
+  one completed. Neither fence substitutes for the other — the claim fences a
+  *discard*, which a re-read cannot because read-then-fan-out is check-then-act; the
+  re-read fences an *already-completed exchange*, which the claim cannot because
+  there is nothing left to contend with.
+
+  Also load-bearing: every claim delete targets the **exact sequence** of the claim
+  being reaped, or a delayed reaper removes a later exchange's claim on a reused
+  identifier; the discard claims strictly **before** it purges, which is what lets a
+  releaser holding the claim read absence as "terminated" rather than "discarded";
+  a `discarded` marker is reaped by **nobody** at teardown time, since "no releaser is
+  still in flight" is not provable; that a session record carrying **no** generation
+  is now rejected outright (`mqttSessGenFromRecord`) rather than resumed on hash-only
+  names, because such a session cannot be arbitrated and the discard would fall back
+  to a blind hash-wide purge that destroys a claimed hold — silent loss, and worse
+  than the deviation being fixed, so the whole legacy path and its filters are gone;
+  and `Origin` is sanitized and truncated rather
+  than derived from the local node name, because names differ per broker and a bound
+  taken from one would not hold on the broker that releases. `At` is required but
+  never gates readability — the unreadable path drops a message — so a malformed one
+  falls back to the record's own store time. A same-broker discard additionally
+  refuses to admit a release at all (`closeQoS2ReleaseAndDrain`, mirroring
+  `closeQ2AffAndDrain`), closing the local case outright.
+
+  Residual, reworded rather than removed in `docs/CONFORMANCE.md`: a release that
+  already won its claim may still fan out after the discard completed. The delivery
+  *decision* is ordered against the discard; the wire is not. A discard that observes
+  a claim waits briefly, which covers every case where the releasing broker is alive,
+  but a broker that dies mid-release cannot be waited out.
+
+  **Verification.** `qos2_release_claim_test.go` (default tree) covers the
+  create-only CAS exclusivity as a dependency contract, subject naming, identity
+  validation, the `At`/`Origin` rules, both reconciliation tables, non-mutating
+  defaults, the arbitration table, the claim-before-purge ordering, that the discard
+  loads no hold records, and that a stale reaper cannot remove a newer claim.
+  `qos2_release_claim_e2e_test.go` drives real exchanges against a witness
+  subscriber; `qos2_move_cluster_test.go` adds two R3 two-broker tests. Every
+  assertion was mutation-checked: removing the claim makes the discard test deliver
+  the message, removing only the re-read makes the stalled-loader test deliver it
+  twice, reaping by subject instead of by sequence destroys a newer claim, and
+  widening the unarbitrated purge filters back over the live generation breaks three.
 - [ ] Reap orphaned inbound QoS 2 hold records. Nothing reaps a `held` record whose
   session record was lost, so it wedges its packet identifier until a later PUBLISH
   on that identifier reaps it. Pre-existing: neither created nor worsened by the
@@ -306,6 +377,15 @@ is fixed before feature work continues.
   claim whose winner generation no longer exists and which no contender happens
   to revisit. Neither loses a message — a stalled claim is honored, not
   released — but both accumulate.
+  Extend it again to the inbound QoS 2 **release claims** the serialization above
+  adds: a `discarded` marker, which no live path may ever reap (it is the only proof
+  a late releaser must lose), and a `releasing` claim whose broker died between the
+  claim and the commit, together with the hold record it protects. Age them by the
+  record's own JetStream store time rather than by the claim's `At` field — a
+  self-reported timestamp from a possibly skewed broker clock cannot be validated,
+  while the store time is assigned by one stream leader and cannot be forged. `At`
+  is required and range-checked, but it is forensic: if a sweep is ever made to rely
+  on it, an implausible value must not be resolvable into "reap it now".
 - [ ] Give outbound QoS 1/2 in-flight deliveries a durable identity, so a packet
   identifier survives a broker restart or failover rather than only a same-process
   reconnect. Today `pendingPublish`/`cpending` are memory-only, so after a restart

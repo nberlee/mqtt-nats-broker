@@ -827,6 +827,31 @@ type mqttAccountSessionManager struct {
 	// finalize as indeterminate. Nil in production. See finalizeQoS2Move.
 	testQoS2PreFinalize func(subject, gen string, seq uint64) error
 
+	// Seams for the inbound QoS 2 RELEASE CLAIM (qos2_release_claim.go),
+	// instance-scoped and set/read under mu. Routed separately from the move
+	// protocol's seams because the claim is a different register on a different
+	// subject: a test must be able to fail or observe the claim while the hold
+	// store, the terminal commit and the record loads all still reach real
+	// JetStream. Nil in production.
+	testQoS2ClaimStore func(subject string, expectSeq uint64, c *mqttQoS2RelClaim) (uint64, error)
+	testQoS2ClaimLoad  func(subject string) (*mqttQoS2RelClaim, *StoredMsg, error)
+
+	// testQoS2ClaimDone, when non-nil, is invoked with the RESOLVED status of every
+	// release claim on THIS account manager. Same reason as testQoS2FinalizeDone: a
+	// releaser that correctly declines to deliver sends nothing at all, and on a
+	// takeover its connection is already closed, so the wire carries no evidence of
+	// what it decided. Nil in production. See claimQoS2Release.
+	testQoS2ClaimDone func(holdSubject, gen string, status mqttQoS2ClaimStatus)
+
+	// testQoS2PreClaim, when non-nil, is invoked immediately BEFORE the first
+	// create-only claim CAS, with the generation and hold sequence the PUBREL loaded.
+	// It is the only seam inside the load..claim window, which is where the race this
+	// protocol arbitrates lives: a test uses it to discard the exchange from another
+	// broker (driving Discarded), or to let a peer complete and reap the whole
+	// exchange (driving the stalled-loader case that the post-claim re-read catches).
+	// A returned error abandons the claim as indeterminate. Nil in production.
+	testQoS2PreClaim func(holdSubject, gen string, holdSeq uint64) error
+
 	// Seams for the shared-subscription QoS 2 session-affine move
 	// (qos2_shared_affine.go), instance-scoped and set/read under mu. Each step is
 	// routed separately because every interesting failure here is "this ONE
@@ -1099,6 +1124,18 @@ type mqttSession struct {
 	q2AffClosing  bool
 	q2AffInFlight int
 	q2AffCond     *sync.Cond
+
+	// qos2RelClosing / qos2RelInFlight / qos2RelCond are the same fence for the
+	// INBOUND QoS 2 release (qos2_release_claim.go), and exist for the same reason:
+	// a PUBREL claims the release and then performs JetStream round trips, so
+	// without this a release admitted before clear() could still fan out after the
+	// discard finished and its CONNACK reported Session Present false. The durable
+	// claim arbitrates that across brokers; this closes it outright on THIS one,
+	// where it can be closed. clear() sets qos2RelClosing (no new release may start)
+	// and waits on qos2RelCond until qos2RelInFlight drains, before it scans.
+	qos2RelClosing  bool
+	qos2RelInFlight int
+	qos2RelCond     *sync.Cond
 
 	// pendingPublish maps packet identifiers (PI) to JetStream ACK subjects for
 	// QoS1 and 2 PUBLISH messages pending delivery to the session's client.
@@ -3963,6 +4000,37 @@ func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 	}
 	slr := slri.(*JSApiStreamInfoResponse)
 	return slr.StreamInfo, slr.ToError()
+}
+
+// streamSubjects returns the subjects in streamName matching filter, mapped to
+// their message counts, via STREAM.INFO's subjects_filter. It reads no message
+// bodies at all, which is the whole reason the release claim lives on a sibling
+// subject: the discard has to enumerate a session's inbound QoS 2 state without
+// pulling every held payload (up to max_payload each) across the JS API on a
+// disconnect path.
+//
+// A nil map means the filter matched nothing. Callers must keep their filter
+// narrow enough that the response cannot be paged: JetStream truncates the list
+// at JSMaxSubjectDetails and reports the remainder only through the paging
+// fields, which this deliberately does not follow (see mqttQoS2HoldWalkFilter,
+// whose subject space is bounded by the 16-bit packet identifier).
+func (jsa *mqttJSA) streamSubjects(streamName, filter string) (map[string]uint64, error) {
+	req, err := json.Marshal(&JSApiStreamInfoRequest{SubjectsFilter: filter})
+	if err != nil {
+		return nil, err
+	}
+	slri, err := jsa.newRequest(mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, streamName), 0, req)
+	if err != nil {
+		return nil, err
+	}
+	slr := slri.(*JSApiStreamInfoResponse)
+	if err := slr.ToError(); err != nil {
+		return nil, err
+	}
+	if slr.StreamInfo == nil {
+		return nil, fmt.Errorf("stream info for %q unavailable", streamName)
+	}
+	return slr.StreamInfo.State.Subjects, nil
 }
 
 func (jsa *mqttJSA) deleteStream(name string) (bool, error) {
@@ -7541,9 +7609,10 @@ func mqttReceiveMax(opts *Options) uint16 {
 // option or use mqttDefaultMaxAckPending if no option set.
 //
 // gen is the session incarnation generation every hash-derived name is scoped by:
-// a freshly minted one for a session that did not exist, the record's own for a
-// restore, and _EMPTY_ for a legacy record that predates generations (keeping the
-// old hash-only names). See sess_incarnation.go.
+// a freshly minted one for a session that did not exist, and the record's own for a
+// restore. It is never empty — a record carrying no generation is rejected by
+// mqttSessGenFromRecord rather than resumed on hash-only names. See
+// sess_incarnation.go.
 func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, opts *Options) *mqttSession {
 	maxp := opts.MQTT.MaxAckPending
 	if maxp == 0 {
@@ -7782,6 +7851,17 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// longer exists — which contenders would honor forever, stalling a live
 	// message on a dead session. See qos2_shared_affine.go.
 	q2AffGen, q2AffDur := sess.closeQ2AffAndDrain()
+
+	// Same fence for the INBOUND QoS 2 release, and for the same reason: a PUBREL
+	// admitted before this point performs JetStream round trips between its claim and
+	// its fan-out, so without this it could deliver a message out of this session
+	// after the discard completed. Its durable claim arbitrates that against a peer
+	// broker; here it can simply be prevented. See qos2_release_claim.go.
+	//
+	// Reopened on EVERY exit path, because two callers reuse this object as a fresh
+	// session; the re-mint below is what makes that safe.
+	sess.closeQoS2ReleaseAndDrain()
+	defer sess.reopenQoS2ReleaseFence()
 
 	sess.mu.Lock()
 	id := sess.id
@@ -10362,6 +10442,15 @@ func mqttMaxQoS2FormSize(pp *mqttPublish, delivered int, retained bool) int {
 	if terminal := mqttQoS2TerminalRecordMax(); terminal > total {
 		total = terminal
 	}
+	// CLAIM form: the release claim written on a sibling of the hold subject before
+	// the onward delivery. Payload-independent like the terminal form, so it too can
+	// dominate for a small payload with a short topic, and the same eternal wedge if
+	// it is not budgeted: the PUBLISH is accepted at PUBREC time and its PUBREL can
+	// then never write the claim it must hold before delivering. See
+	// qos2_release_claim.go.
+	if claim := mqttQoS2ClaimRecordMax(); claim > total {
+		total = claim
+	}
 	// AFFINE form: the copy written when this message is delivered to a shared
 	// subscription at effective QoS 2 and moved onto the chosen session's own
 	// subject. Same class of eternal wedge: the claim never materializes, the group
@@ -10909,10 +10998,18 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 // This is the recoverable MOVE half of the inbound QoS 2 exchange: the held record
 // is delivered onward FIRST and only then replaced by a terminal tombstone, so no
 // window can delete the message and then fail to deliver it. The branch order is
-// load, corrupt, delivered, malformed, expired, store, commit; see qos2_move.go for
-// the state machine, the four design invariants it obeys, and the honest guarantee
-// (no silent loss; exactly-once for durable subscribers only while deduplication
-// survives the unresolved store..commit interval).
+// load, corrupt, delivered, malformed, expired, claim, prove, store, commit; see
+// qos2_move.go for the state machine, the four design invariants it obeys, and the
+// honest guarantee (no silent loss; exactly-once for durable subscribers only while
+// deduplication survives the unresolved store..commit interval).
+//
+// The claim (R) and the proof (P) are the two fences that serialize this release
+// against a concurrent session discard, and neither substitutes for the other: the
+// claim fences a DISCARD, which a re-read cannot because read-then-fan-out is
+// check-then-act, and the proof fences an ALREADY-COMPLETED exchange, which the
+// claim cannot because a completed exchange leaves nothing to contend with. Both
+// must precede the onward store, whose fan-out cannot be taken back. See
+// qos2_release_claim.go.
 //
 // Runs from the client's readLoop.
 // No lock held on entry.
@@ -10921,10 +11018,11 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// the client's send-quota slot, so the two travel together: sendPubComp
 	// gates both. It stays true for every outcome that answers the client —
 	// success, an unknown PI, a released corrupt or malformed record, an
-	// expiry-dropped hold, and a superseded finalize — and is cleared ONLY where a
-	// broker-side JetStream failure means the exchange is unfinished (an
-	// indeterminate lookup, a failed onward store, an unconfirmed terminal commit,
-	// or an unconfirmed nonterminal release), because MQTT 5
+	// expiry-dropped hold, a release the discard won, and a superseded finalize — and
+	// is cleared ONLY where a broker-side JetStream failure means the exchange is
+	// unfinished (an indeterminate lookup, an unresolved claim or proof, a failed
+	// onward store, an unconfirmed terminal commit, or an unconfirmed nonterminal
+	// release), because MQTT 5
 	// gives PUBCOMP no reason code for "the broker failed" (only 0x00 and 0x92
 	// are defined) and answering anyway would tell the client an exactly-once
 	// exchange completed for a message still held. Spec5 [4.9], [MQTT-4.3.3-1].
@@ -11061,6 +11159,88 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		return nil
 	}
 
+	// R: the release claim — fence 1, and the last point at which a concurrent
+	// session discard can still win. It is a create-only CAS on a sibling of the hold
+	// subject, so exactly one of "release it" and "discard it" can ever succeed and
+	// the loser does nothing irreversible. It must precede everything below: the
+	// fan-out inside the onward store cannot be taken back. See qos2_release_claim.go.
+	if sess := c.mqtt.sess; sess != nil {
+		if !sess.beginQoS2ReleaseOp() {
+			// This session is being discarded on this broker. Deliver nothing and claim
+			// nothing: the discard is about to destroy this hold, and the client's
+			// session state with it. Answering 0x92 is the same answer the durable claim
+			// would have produced had the discard been on another broker.
+			reason = mqttReasonPacketIDNotFound
+			reasonStr = "no message found for the packet identifier"
+			return nil
+		}
+		defer sess.endQoS2ReleaseOp()
+	}
+
+	claimStatus, claimSeq, cerr := asm.claimQoS2Release(s, subject, gen, seq)
+	switch claimStatus {
+	case mqttQoS2ClaimClaimed, mqttQoS2ClaimAlreadyClaimed:
+		// Ours. AlreadyClaimed is not an error and not a conflict: the generation
+		// identifies the EXCHANGE, not the broker, so it means our own earlier attempt
+		// or a peer releasing the same exchange. The claim is discard-exclusive, never
+		// releaser-exclusive.
+	case mqttQoS2ClaimDiscarded, mqttQoS2ClaimUnreadable:
+		// A discard won, or a record we cannot attribute holds the claim subject.
+		// Nothing may be delivered. Release the hold record before answering
+		// (invariant 3) and report the identifier as gone. The CLAIM is deliberately
+		// not reaped: a `discarded` claim is the only durable proof that a later
+		// releaser must lose, and an unreadable one may be a corrupted instance of one.
+		if rerr := releaseNonterminal(seq, "discarded"); rerr != nil {
+			return rerr
+		}
+		reason = mqttReasonPacketIDNotFound
+		reasonStr = "no message found for the packet identifier"
+		return nil
+	default: // mqttQoS2ClaimIndeterminate
+		// We cannot prove we hold the claim, so we must not deliver, and the exchange
+		// is unfinished: suppress the PUBCOMP and let the client retry.
+		sendPubComp = false
+		c.Errorf("Unable to claim the QoS2 release for packet identifier %v: %v", pi, cerr)
+		return cerr
+	}
+
+	// P: prove the exchange is still the one we loaded — fence 2. The claim cannot
+	// catch a peer that completed this exchange and reaped both records while we were
+	// between the load and the claim: our create-only claim then SUCCEEDS against an
+	// empty subject and we would fan out a second time from the payload we still hold
+	// in memory. Every accepting outcome is generation-qualified.
+	vStatus, vSeq, verr := asm.verifyQoS2HoldForRelease(subject, gen, seq)
+	switch vStatus {
+	case mqttQoS2VerifyHeld:
+		// Our record, at our sequence. Nothing can remove it now: a discard must win
+		// the claim before it purges, and we hold the claim.
+	case mqttQoS2VerifyDelivered:
+		// Our generation's own tombstone: a peer completed this exchange. Answer from
+		// it without re-delivering, exactly as branch T does, and reap both records
+		// asynchronously (invariant 4).
+		asm.reapQoS2RelClaim(claimSeq)
+		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, vSeq, false)
+		return nil
+	case mqttQoS2VerifyGone:
+		// Terminated and already reaped. Absence means terminated rather than
+		// discarded precisely because a discard claims before it purges, and we hold
+		// the claim.
+		asm.reapQoS2RelClaim(claimSeq)
+		return nil
+	case mqttQoS2VerifySuperseded:
+		// A foreign generation holds the subject and was NOT touched. Our exchange's
+		// state is no longer ours to close, so 0x92 is the honest answer; our own claim
+		// is stale and can go.
+		asm.reapQoS2RelClaim(claimSeq)
+		reason = mqttReasonPacketIDNotFound
+		reasonStr = "no message found for the packet identifier"
+		return nil
+	default: // mqttQoS2VerifyIndeterminate
+		sendPubComp = false
+		c.Errorf("Unable to verify the QoS2 hold record for packet identifier %v before release: %v", pi, verr)
+		return verr
+	}
+
 	// S: the onward store, carrying a Nats-Msg-Id derived from the immutable
 	// generation. A failure here means the exchange is unfinished and the record is
 	// still held: suppress the PUBCOMP so the client retries. (Before this fix the
@@ -11085,24 +11265,31 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	switch status {
 	case mqttQoS2FinalizeCommitted:
 		// Terminal state is durable, so the tombstone's own removal is inert
-		// (invariant 4): push it without waiting.
+		// (invariant 4): push it without waiting. The claim goes the same way, and only
+		// now — reaping it before the commit would let a peer stalled since before our
+		// claim win a fresh one (fence 2 would still stop it delivering, but the claim
+		// must not be the thing that stops working).
+		asm.reapQoS2RelClaim(claimSeq)
 		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, doneSeq, false)
 		return nil
 	case mqttQoS2FinalizeGone:
 		// Our generation is already absent and the onward store succeeded, so the
-		// exchange is complete. Nothing left to clean up.
+		// exchange is complete. Only our claim may be left.
+		asm.reapQoS2RelClaim(claimSeq)
 		return nil
 	case mqttQoS2FinalizeSuperseded:
 		// A newer generation owns this subject and was NOT touched. Our message was
 		// delivered, but this identifier's state is no longer ours to close, so 0x92
-		// is the honest answer (residual 5).
+		// is the honest answer (residual 5). Our own claim is stale and can go.
+		asm.reapQoS2RelClaim(claimSeq)
 		reason = mqttReasonPacketIDNotFound
 		reasonStr = "no message found for the packet identifier"
 		return nil
 	default: // mqttQoS2FinalizeIndeterminate
 		// Delivery happened but the terminal state is unconfirmed. Suppress the
 		// PUBCOMP: the client retries, and the retry either finds the tombstone (T,
-		// answered 0x00 with no re-delivery) or re-delivers with the same msgId.
+		// answered 0x00 with no re-delivery) or re-delivers with the same msgId. The
+		// claim STAYS: the retry adopts it, and while it stands a discard still loses.
 		sendPubComp = false
 		c.Errorf("Unable to commit QoS2 move for packet identifier %v: %v", pi, ferr)
 		return ferr

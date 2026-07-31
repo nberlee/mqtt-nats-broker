@@ -298,13 +298,18 @@ claim deletes nothing; the release is a sequence-targeted delete whose outcome i
 classified by re-reading, never assumed; and a CONNECT that finds a claim finishes
 it before starting fresh, so a crashed teardown self-heals rather than leaking.
 
-Two residuals, both confined to upgrade windows:
+One residual, confined to an upgrade window, and one hard requirement:
 
-- **Sessions created before this change carry no generation.** They keep the legacy
-  hash-only resource names and stay exposed to the original race — a teardown from
-  a superseded broker can delete a resource a fresh session of the same client ID
-  recreated — until they are next discarded, which re-mints them. Every session
-  created afterwards is safe by construction.
+- **A session record without a generation is rejected, not resumed.** Records
+  written before generation-scoped naming existed carry no `gen`, and a CONNECT that
+  finds one fails with recreate guidance rather than falling back to hash-only
+  names. That fallback is not a weaker form of the same safety: such a session has
+  no identity to scope an arbitration with, so its inbound QoS 2 release could not
+  be arbitrated against a session discard, and the discard would blind-purge a held
+  payload whose releaser had already claimed it — silent loss, and strictly worse
+  than the ordering deviation the claim exists to fix. The bridge is pre-release and
+  its `$MQTT_*` schemas carry no compatibility contract, so the remedy is to
+  recreate the development store.
 - **Mixed-version operation.** An older broker ignores the `Teardown` marker (it
   would overwrite it) and uses the old names, so both halves hold only once every
   broker in the cluster understands them — the same rule as the shared-subscription
@@ -350,9 +355,26 @@ The deviations that remain:
 - **A delivered exchange whose tombstone was already reaped answers a later PUBREL
   `0x92`** rather than `0x00`. Absence is indistinguishable from never-existed,
   and Spec5 sanctions `0x92` during recovery.
-- **A PUBREL racing a cross-broker session discard can deliver a message from a
-  discarded session once.** Narrow; the fix is a `held -> releasing` claim that
-  competes with the discard transition.
+- **A release that has already won its claim may still fan out after the discard
+  completed.** A PUBREL now takes a durable **release claim** before delivering
+  anything (`internal/mqtt/qos2_release_claim.go`): a create-only CAS on a sibling
+  of the hold subject, which a session discard competes for and which exactly one
+  of them can win. So a discard that observes no claim can never be followed by a
+  delivery of that message, and the finalizer can no longer read a purge's absence
+  as proof the exchange completed. What the claim does not order is the wire: a
+  releaser that claimed before the discard observed the register is committed, and
+  its live core-NATS fan-out may reach subscribers after the discard released the
+  session record and its CONNACK reported Session Present false. The delivery
+  *decision* is ordered against the discard; the delivery is not. A discard that
+  observes a claim waits briefly for the exchange to terminate, and on the same
+  broker an in-process fence closes the window outright — but a broker that dies
+  mid-release cannot be waited out.
+- **A discarded session leaves one small claim record per inbound QoS 2 exchange
+  that was in flight.** The `discarded` marker is the only durable proof that a
+  late releaser must lose, so nothing may reap it at teardown time — "no releaser
+  is still in flight" is not provable. It is inert (roughly 150 bytes, on a subject
+  scoped to the retired incarnation) and is reaped by age. A session with no
+  exchanges in flight leaves nothing.
 - **A superseded PUBREL is answered `0x92` after its message was in fact
   delivered.** When a newer session generation has taken the same
   `(client, packet identifier)` subject, the finalizer abandons without mutating
@@ -360,14 +382,24 @@ The deviations that remain:
   generation's payload is untouched.
 
 What is handled rather than deviating: a hold lookup that fails for any reason
-other than "not found", a failed onward store, and an unconfirmed terminal commit
-all suppress the PUBCOMP and close the connection instead of reporting a result,
-so the client retries against intact session state. A record that cannot be
-identified or cannot be parsed, and one whose Message Expiry Interval elapsed
-while it was held, are each **released with a confirmed delete before** the client
-is answered — an unconfirmed cleanup withholds the PUBCOMP, because a PUBCOMP
-frees the packet identifier and the client's next PUBLISH on it would otherwise be
-matched against the surviving record.
+other than "not found", an unresolved release claim or an unresolved proof of the
+hold record, a failed onward store, and an unconfirmed terminal commit all
+suppress the PUBCOMP and close the connection instead of reporting a result, so
+the client retries against intact session state. A record that cannot be
+identified or cannot be parsed, one whose Message Expiry Interval elapsed while it
+was held, and one whose release a discard won, are each **released with a
+confirmed delete before** the client is answered — an unconfirmed cleanup
+withholds the PUBCOMP, because a PUBCOMP frees the packet identifier and the
+client's next PUBLISH on it would otherwise be matched against the surviving
+record.
+
+A releaser that stalls while a peer completes the same exchange delivers nothing:
+after taking its claim it re-reads the hold record and requires both the sequence
+and the generation it originally loaded, so an exchange already committed and
+reaped is answered `0x00` from the peer's work rather than fanned out a second
+time. That check is generation-qualified in every accepting case, including the
+tombstone — a later exchange's tombstone on the same packet identifier is
+**not** proof that this one completed.
 
 Operational note: `$MQTT_qos2in` requires `DiscardOld` and `MaxMsgsPer: 1` (plus
 the write, CAS, subject, acknowledgement, retention, deletion and purge semantics

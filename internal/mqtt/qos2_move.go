@@ -30,11 +30,13 @@
 //
 // # Design invariants
 //
-// Four scoped rules govern every mutation here. Every other comment in this
+// Five scoped rules govern every mutation here. Every other comment in this
 // change must use these scopes rather than a broader paraphrase.
 //
 //  1. A CAS or replacement mutation may target only a record whose immutable
-//     generation matches. This is finalizeQoS2Move alone.
+//     generation matches. On the HOLD RECORD this is finalizeQoS2Move alone. (The
+//     release claim in qos2_release_claim.go is a different register on a sibling
+//     subject, and carries its own scope rules.)
 //  2. Cleanup may delete only the exact sequence loaded. Safe without a
 //     generation check, because deleting an exact sequence cannot reach a newer
 //     one — and required without one, since a malformed hold record may carry no
@@ -47,6 +49,11 @@
 //  4. Terminal tombstone cleanup may be asynchronous. The terminal delete may stay
 //     a sendq push, because a surviving tombstone is inert: a later PUBREL answers
 //     from it and a later PUBLISH reaps it.
+//  5. Nothing may fan out or store onward before the release CLAIM commits and the
+//     hold record is then PROVEN unchanged. The claim is what a session discard
+//     competes for; the proof is what stops a releaser stalled since before a
+//     peer's completion from delivering twice. Neither substitutes for the other,
+//     and both live in qos2_release_claim.go.
 //
 // Why identity is a generation ID and not a stream sequence: mqttSession.clear()
 // purges hold records by client hash, while the hold subject is keyed by client ID
@@ -78,9 +85,14 @@
 //  3. A delivered exchange whose tombstone was already reaped answers a later
 //     PUBREL 0x92 rather than 0x00. Absence is indistinguishable from
 //     never-existed.
-//  4. A PUBREL racing a cross-broker session discard can deliver a message from a
-//     discarded session once. Narrow; the fix is a held->releasing claim that
-//     competes with the discard transition, filed as a follow-up.
+//  4. A release that has already won its claim may still fan out after the discard
+//     completed. The delivery DECISION is now arbitrated against a session discard
+//     by a create-only claim taken before the onward store (qos2_release_claim.go),
+//     so a discard that observes no claim can never be followed by a delivery. The
+//     wire is not ordered by it: a releaser that claimed first is committed, and
+//     its live fan-out may land after the discard released the session record. A
+//     discard that observes a claim waits briefly, and on the same broker an
+//     in-process fence closes the window outright.
 //  5. A superseded PUBREL is answered 0x92 after its message was in fact
 //     delivered. Honest about the identifier's state; no loss, and the
 //     superseding generation's payload is untouched.

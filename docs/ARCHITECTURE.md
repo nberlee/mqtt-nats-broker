@@ -182,7 +182,7 @@ NATS traffic on those subjects:
 | `$MQTT.sess.<domain>.<hash>` | session records |
 | `$MQTT.JSA.<...>` | JetStream API replies and session-persist broadcasts |
 | `$MQTT.willq.*`, `$MQTT.willcancel.*` | delayed-Will outbox and cancel watermarks |
-| `$MQTT.qos2.in.<hash>.<pi>`, `$MQTT.out.*` | inbound QoS 2 move state, outbound PUBREL state, and session-affine shared QoS 2 copies |
+| `$MQTT.qos2.in.<hash>.<gen>.<pi>[.rel]`, `$MQTT.out.*` | inbound QoS 2 move state and its release claim, outbound PUBREL state, and session-affine shared QoS 2 copies |
 | `$MQTT.qos2.assign.<group-durable>.<seq>` | shared-subscription QoS 2 assignment claims |
 | `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.deliver.q2.*`, `$MQTT.qsub.*` | per-client delivery subjects |
 
@@ -231,15 +231,15 @@ the suite passing is what keeps that separation honest.
 ## Inbound QoS 2 move protocol
 
 An inbound QoS 2 PUBLISH is **held** on `$MQTT_qos2in` under
-`$MQTT.qos2.in.<client-id-hash>.<packet-identifier>` and **moved** onto
-`$MQTT_msgs` when the client sends PUBREL. The move is recoverable rather than
-destructive: the message is delivered onward **first**, and only then is the hold
-record replaced. Implementation and the design invariants it obeys are in
+`$MQTT.qos2.in.<client-id-hash>.<generation>.<packet-identifier>` and **moved**
+onto `$MQTT_msgs` when the client sends PUBREL. The move is recoverable rather
+than destructive: the message is delivered onward **first**, and only then is the
+hold record replaced. Implementation and the design invariants it obeys are in
 `internal/mqtt/qos2_move.go`.
 
-One subject carries two record states, and the same subject is reused across
-session generations (a session discard purges by client hash, while the subject is
-keyed by client hash *and* packet identifier):
+One subject carries two record states, and it is reused by every exchange that uses
+the same packet identifier within one incarnation — a client is free to reuse an
+identifier as soon as its exchange completes:
 
 | state | shape | written by |
 |---|---|---|
@@ -248,11 +248,17 @@ keyed by client hash *and* packet identifier):
 
 `Nmqtt-Q2Gen` is the exchange's immutable identity, stamped once at PUBLISH time
 and never rewritten. Because subjects are reused, a stream sequence is **not** an
-identity: the finalizer compares generations and abandons without mutating
-anything when it finds a foreign one, so it can never replace a newer session
-generation's undelivered payload with its own tombstone. A record whose generation
-is missing, malformed, or declared more than once is classified `corrupt` — never
+identity: the finalizer compares generations and abandons without mutating anything
+when it finds a foreign one, so it can never replace a **later exchange's**
+undelivered payload with its own tombstone. The same comparison is what makes the
+release claim's post-claim re-read safe (below). A record whose generation is
+missing, malformed, or declared more than once is classified `corrupt` — never
 `held` — and is disposed of rather than mistaken for a duplicate.
+
+The subject also carries the **session incarnation generation**, so it is never
+reused across incarnations and a discard names each hold subject exactly. The two
+generations answer different questions and both are needed: the incarnation scopes
+the subject, the exchange identity scopes the record on it.
 
 The terminal tombstone is what makes a PUBREL retry safe indefinitely: a retry
 that finds it is answered `0x00` with no second delivery, independently of any
@@ -262,11 +268,49 @@ narrows the window in which a retry duplicates the *stored* copy; correctness do
 not depend on it. See `docs/CONFORMANCE.md` for the exact guarantee and its
 residual deviations.
 
+### The release claim
+
+Delivering onward first makes the move recoverable, but it also means the hold
+record's arbitration point comes *after* the irreversible act. A session discard
+used to purge these subjects by filter, which competes with nothing: a PUBREL that
+had merely *read* a held record went on to fan out, and its finalizer then read the
+resulting absence as proof the exchange had completed. So a **release claim**
+(`internal/mqtt/qos2_release_claim.go`) sits in front of the delivery — a small
+create-only CAS record on a sibling subject, the hold subject plus a `rel` token:
+
+| writer | value | when |
+|---|---|---|
+| the releasing PUBREL | `releasing` + the exchange generation | before the onward store |
+| a session discard | `discarded` | before it destroys the hold |
+
+Exactly one create can succeed, so exactly one of "release it" and "discard it"
+wins and the loser does nothing irreversible. The claim is **discard-exclusive, not
+releaser-exclusive**: the generation identifies the exchange rather than the broker,
+so a second releaser of the same exchange reads its own generation back and
+proceeds. Because the claim is a sibling record, the hold record is never
+rewritten — its payload, properties and store time (which ages the Message Expiry
+Interval) stay as the PUBLISH left them — and a discard can enumerate a session's
+inbound QoS 2 state through `STREAM.INFO` without reading a single payload.
+
+The claim is paired with an authoritative **re-read** of the hold record, and
+neither replaces the other: the claim fences a *discard*, which a re-read cannot,
+because read-then-fan-out is check-then-act; the re-read fences an
+*already-completed* exchange, which the claim cannot, because a peer that committed
+and reaped leaves nothing to contend with, so a stalled releaser's create-only claim
+would simply succeed. A discard that finds a `releasing` claim waits briefly and
+then leaves both records rather than destroying a payload a crashed releaser's retry
+still needs; on the same broker an in-process fence refuses to admit a release at
+all. A `discarded` marker is never reaped by a releaser or by the discard itself —
+it is the only durable proof that a late releaser must lose — and is left to be
+aged out.
+
 `$MQTT_qos2in` must be `LimitsPolicy` + `DiscardOld` + `MaxMsgsPer: 1` (`DiscardOld`
 is what makes the terminal CAS a *replacement*; `MaxMsgsPer: 1` is what stops it
 appending and leaving a stale `held` record underneath), and must not withdraw the
 write, CAS, subject, acknowledgement, retention, deletion or purge semantics the
-protocol depends on. A stream that does not match **fails broker startup** with
+protocol depends on. The claim adds no requirement of its own: it lives inside the
+stream's existing subject space and needs the same single-slot CAS semantics the
+hold record already does. A stream that does not match **fails broker startup** with
 recreate guidance rather than being updated in place — updating it would be
 actively unsafe, since a broker still running the pre-move code would silently
 overwrite held records once the discard policy flipped. Upgrading a development
@@ -463,12 +507,18 @@ Shared group durables stay outside all of this: they are not owned by one sessio
 and are released last, by the existing last-holder record scan, only once this
 session's record is gone.
 
-**Mixed version and legacy records.** A record with no `gen` means "legacy
-hash-only names": such a session keeps working, stays exposed to the original race,
-and leaves that exposure the first time it is discarded. An older broker ignores
-the `Teardown` marker and would overwrite it, and uses the old names — so, as with
-the affine protocol, both halves hold only once every broker understands them. See
-`docs/CONFORMANCE.md`.
+**Every session carries a generation.** A record without one is **rejected** at the
+boundary rather than resumed on hash-only names: it predates this design, and under
+the compatibility boundary above the development store is recreated. Accommodating
+it would not be a smaller version of the same safety — a hash-only session has no
+identity to scope an arbitration with, so the inbound QoS 2 release claim could not
+be arbitrated for it and the discard would fall back to a blind hash-wide purge,
+which destroys a held payload whose releaser claimed it and then died. A
+partially-arbitrated path is worse than a rejected one.
+
+**Mixed version.** An older broker ignores the `Teardown` marker and would
+overwrite it, and uses the old names — so, as with the affine protocol, both halves
+hold only once every broker understands them. See `docs/CONFORMANCE.md`.
 
 ## JetStream domain
 

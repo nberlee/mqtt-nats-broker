@@ -6,12 +6,15 @@ import (
 	"testing"
 )
 
-// TestSessGenNamingIsScopedAndLegacyCompatible pins the two properties every
-// generation-scoped name must have: a generation makes the name distinct from
-// every other incarnation's, and no generation reproduces the pre-upgrade name
-// byte for byte (a legacy record must keep working, and an older broker's names
-// must stay reachable).
-func TestSessGenNamingIsScopedAndLegacyCompatible(t *testing.T) {
+// TestSessGenNamingIsScoped pins the property every generation-scoped name must
+// have: a generation makes the name distinct from every other incarnation's, so a
+// delete issued by a retired incarnation can only ever name a resource that no
+// longer exists.
+//
+// There is no legacy counterpart to be compatible with. An absent generation is
+// rejected at the record boundary (mqttSessGenFromRecord), so no live session can
+// carry one, and no name here is ever built without one.
+func TestSessGenNamingIsScoped(t *testing.T) {
 	const idHash = "abcdefghijklmnop"
 	g1, g2 := mqttNewSessGen(), mqttNewSessGen()
 	if g1 == g2 {
@@ -34,57 +37,46 @@ func TestSessGenNamingIsScopedAndLegacyCompatible(t *testing.T) {
 		}
 	}
 
-	legacySubj, legacyDeliver, legacyDur := mqttPubRelNames(idHash, _EMPTY_)
-	if legacySubj != mqttPubRelSubjectPrefix+idHash ||
-		legacyDeliver != mqttPubRelDeliverySubjectPrefix+idHash ||
-		legacyDur != mqttPubRelConsumerDurablePrefix+idHash {
-		t.Fatalf("an empty generation must reproduce the legacy names exactly, got %q/%q/%q",
-			legacySubj, legacyDeliver, legacyDur)
-	}
-
 	s1, d1, du1 := mqttPubRelNames(idHash, g1)
 	s2, d2, du2 := mqttPubRelNames(idHash, g2)
 	for _, p := range []struct {
-		what, a, b, legacy string
+		what, a, b, unscoped string
 	}{
-		{"pubrel subject", s1, s2, legacySubj},
-		{"pubrel delivery subject", d1, d2, legacyDeliver},
-		{"pubrel durable", du1, du2, legacyDur},
+		{"pubrel subject", s1, s2, mqttPubRelSubjectPrefix + idHash},
+		{"pubrel delivery subject", d1, d2, mqttPubRelDeliverySubjectPrefix + idHash},
+		{"pubrel durable", du1, du2, mqttPubRelConsumerDurablePrefix + idHash},
 	} {
 		if p.a == p.b {
 			t.Fatalf("%s is shared across incarnations: %q", p.what, p.a)
 		}
-		if p.a == p.legacy || p.b == p.legacy {
-			t.Fatalf("%s collides with the legacy name %q", p.what, p.legacy)
+		if p.a == p.unscoped || p.b == p.unscoped {
+			t.Fatalf("%s collides with the unscoped hash-only name %q", p.what, p.unscoped)
 		}
-		if !strings.HasPrefix(p.a, p.legacy) {
-			t.Fatalf("%s %q must extend the legacy name %q so the reserved-namespace prefix checks still match",
-				p.what, p.a, p.legacy)
+		if !strings.HasPrefix(p.a, p.unscoped) {
+			t.Fatalf("%s %q must extend the hash-only name %q so the reserved-namespace prefix checks still match",
+				p.what, p.a, p.unscoped)
 		}
 	}
 
-	// A hold subject must be scoped by generation, and the legacy purge filter must
-	// be unable to reach a generation-scoped one (that is the whole point: exactly
-	// one token past the hash).
+	// A hold subject and its release claim must both be scoped by generation, and
+	// the discard's enumeration filter must reach one incarnation's holds and no
+	// other's — it is the only thing that touches $MQTT_qos2in on a discard now, so
+	// a filter that widened would destroy another incarnation's session state.
 	if a, b := mqttQoS2HoldSubject(idHash, g1, 7), mqttQoS2HoldSubject(idHash, g2, 7); a == b {
 		t.Fatalf("hold subject is shared across incarnations: %q", a)
 	}
-	genFilters := mqttQoS2HoldPurgeFilters(idHash, g1)
-	if len(genFilters) != 2 {
-		t.Fatalf("a generation-scoped purge needs its own range plus the legacy single-token range, got %v", genFilters)
+	if a, b := mqttQoS2ClaimSubject(idHash, g1, 7), mqttQoS2ClaimSubject(idHash, g2, 7); a == b {
+		t.Fatalf("release claim subject is shared across incarnations: %q", a)
 	}
-	legacyRange, ownRange := genFilters[0], genFilters[1]
-	if !testSubjectMatchesFilter(mqttQoS2HoldSubject(idHash, _EMPTY_, 7), legacyRange) {
-		t.Fatalf("%q must match the orphaned legacy hold subject", legacyRange)
+	own := mqttQoS2HoldWalkFilter(idHash, g1)
+	if !testSubjectMatchesFilter(mqttQoS2HoldSubject(idHash, g1, 7), own) {
+		t.Fatalf("%q must match its own incarnation's hold subject", own)
 	}
-	if testSubjectMatchesFilter(mqttQoS2HoldSubject(idHash, g2, 7), legacyRange) {
-		t.Fatalf("%q must NOT be able to reach another incarnation's hold subject", legacyRange)
+	if testSubjectMatchesFilter(mqttQoS2HoldSubject(idHash, g2, 7), own) {
+		t.Fatalf("%q must NOT be able to reach another incarnation's hold subject", own)
 	}
-	if !testSubjectMatchesFilter(mqttQoS2HoldSubject(idHash, g1, 7), ownRange) {
-		t.Fatalf("%q must match its own incarnation's hold subject", ownRange)
-	}
-	if testSubjectMatchesFilter(mqttQoS2HoldSubject(idHash, g2, 7), ownRange) {
-		t.Fatalf("%q must NOT be able to reach another incarnation's hold subject", ownRange)
+	if testSubjectMatchesFilter(mqttQoS2ClaimSubject(idHash, g1, 7), own) {
+		t.Fatalf("%q must NOT match a release claim; claims are not walked as holds", own)
 	}
 }
 
@@ -110,8 +102,8 @@ func testSubjectMatchesFilter(subject, filter string) bool {
 
 // TestSessGenContinuity is test 0f: a persistent session keeps its incarnation
 // generation across a resume — so it still finds its own PUBRELs and QoS 2 holds —
-// and gets a new one only when it is discarded. A legacy record with no generation
-// keeps working on the old names.
+// and gets a new one only when it is discarded. A record carrying no generation is
+// refused outright.
 func TestSessGenContinuity(t *testing.T) {
 	_, nc := runNATS(t)
 
@@ -183,38 +175,26 @@ func TestSessGenContinuity(t *testing.T) {
 		t.Fatal("clear() re-minted the generation but left the derived PUBREL names on the retired one")
 	}
 
-	// A legacy record (written before generations existed) keeps working, on the
-	// legacy names, until it is discarded.
-	const legacyID = "legacy"
-	legacyHash := getHash(legacyID)
-	ps := mqttPersistedSession{ID: legacyID, Subs: map[string]byte{"foo": 1}}
+	// A record written before generations existed is REJECTED rather than resumed on
+	// hash-only names. Such a session has no identity to scope an arbitration with,
+	// so its inbound QoS 2 release could not be arbitrated against a discard and the
+	// discard would fall back to a blind hash-wide purge — destroying a held payload
+	// whose releaser claimed it and then died. Refusing the record is the alternative
+	// to that silent loss; the bridge is pre-release, so the store is recreated.
+	const noGenID = "no-generation"
+	ps := mqttPersistedSession{ID: noGenID, Subs: map[string]byte{"foo": 1}}
 	b, err := json.Marshal(&ps)
 	if err != nil {
-		t.Fatalf("marshal legacy record: %v", err)
+		t.Fatalf("marshal generation-less record: %v", err)
 	}
 	if bytes := string(b); strings.Contains(bytes, `"gen"`) {
 		t.Fatalf("an empty generation must be omitted from the record, got %s", bytes)
 	}
-	if _, err := asm.jsa.storeSessionMsg(asm.domainTk, legacyHash, 0, b); err != nil {
-		t.Fatalf("store legacy session record: %v", err)
+	if _, err := asm.jsa.storeSessionMsg(asm.domainTk, getHash(noGenID), 0, b); err != nil {
+		t.Fatalf("store generation-less session record: %v", err)
 	}
-	legacy, existed, err := asm.createOrRestoreSession(legacyID, opts)
-	if err != nil || !existed {
-		t.Fatalf("createOrRestoreSession (legacy): existed=%v err=%v", existed, err)
-	}
-	if legacy.gen != _EMPTY_ {
-		t.Fatalf("a legacy record must not be given a generation on resume, got %q", legacy.gen)
-	}
-	if legacy.pubRelSubject != mqttPubRelSubjectPrefix+legacyHash ||
-		legacy.pubRelDeliverySubject != mqttPubRelDeliverySubjectPrefix+legacyHash {
-		t.Fatalf("a legacy session must keep the legacy PUBREL names, got %q/%q",
-			legacy.pubRelSubject, legacy.pubRelDeliverySubject)
-	}
-	if err := legacy.clear(false); err != nil {
-		t.Fatalf("clear legacy: %v", err)
-	}
-	if !mqttValidSessGen(legacy.gen) {
-		t.Fatalf("a discarded legacy session must be re-minted onto generation-scoped names, got %q", legacy.gen)
+	if _, _, err := asm.createOrRestoreSession(noGenID, opts); err == nil {
+		t.Fatal("a session record with no incarnation generation must fail closed, not resume on hash-only names")
 	}
 }
 
@@ -224,19 +204,23 @@ func TestSessGenContinuity(t *testing.T) {
 // The record is not a trusted input — an older broker, a future one, or a hand
 // edit can put anything there — and everything downstream is built by
 // concatenation. A value carrying a wildcard or a subject separator would either
-// produce an unusable durable name or, far worse, WIDEN the QoS 2 hold purge
-// filter beyond this incarnation, deleting records the session has no claim on.
-// Empty stays legal: that is the legacy hash-only form.
+// produce an unusable durable name or, far worse, WIDEN the QoS 2 hold
+// enumeration filter beyond this incarnation, reaching records the session has no
+// claim on.
+//
+// EMPTY fails closed too, and that is deliberate rather than incidental: it is the
+// shape of a record written before generations existed, and such a session has no
+// identity to scope an arbitration with — so its inbound QoS 2 release could not be
+// arbitrated against a discard, and the discard would fall back to a blind
+// hash-wide purge that destroys a held payload whose releaser claimed it and then
+// died. Rejecting the record is the alternative to that silent loss.
 func TestSessGenFromRecordFailsClosed(t *testing.T) {
 	good := mqttNewSessGen()
 	if got, err := mqttSessGenFromRecord(good); err != nil || got != good {
 		t.Fatalf("a well-formed generation must be accepted, got %q err=%v", got, err)
 	}
-	if got, err := mqttSessGenFromRecord(_EMPTY_); err != nil || got != _EMPTY_ {
-		t.Fatalf("the legacy (empty) form must stay legal, got %q err=%v", got, err)
-	}
-
 	for _, bad := range []string{
+		_EMPTY_,
 		"*",
 		">",
 		"a.b",
@@ -255,14 +239,15 @@ func TestSessGenFromRecordFailsClosed(t *testing.T) {
 		}
 	}
 
-	// The specific hazard, stated as the property it protects: whatever a record
-	// carries, the purge filters must never reach outside this client's namespace.
-	for _, gen := range []string{good, _EMPTY_} {
-		for _, f := range mqttQoS2HoldPurgeFilters("HASH", gen) {
-			if !strings.HasPrefix(f, mqttQoS2IncomingMsgsStreamSubjectPrefix+"HASH.") {
-				t.Fatalf("purge filter %q escapes the client's namespace", f)
-			}
-		}
+	// The specific hazard, stated as the property it protects: an accepted
+	// generation's enumeration filter must never reach outside this client's
+	// namespace, nor past this one incarnation.
+	f := mqttQoS2HoldWalkFilter("HASH", good)
+	if !strings.HasPrefix(f, mqttQoS2IncomingMsgsStreamSubjectPrefix+"HASH.") {
+		t.Fatalf("walk filter %q escapes the client's namespace", f)
+	}
+	if testSubjectMatchesFilter(mqttQoS2HoldSubject("HASH", mqttNewSessGen(), 1), f) {
+		t.Fatalf("walk filter %q reaches another incarnation's hold subject", f)
 	}
 }
 

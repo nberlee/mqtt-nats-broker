@@ -25,6 +25,7 @@ type (
 	JSApiMsgGetResponse         = server.JSApiMsgGetResponse
 	JSApiStreamCreateResponse   = server.JSApiStreamCreateResponse
 	JSApiStreamDeleteResponse   = server.JSApiStreamDeleteResponse
+	JSApiStreamInfoRequest      = server.JSApiStreamInfoRequest
 	JSApiStreamInfoResponse     = server.JSApiStreamInfoResponse
 	JSApiStreamNamesResponse    = server.JSApiStreamNamesResponse
 	JSApiStreamPurgeRequest     = server.JSApiStreamPurgeRequest

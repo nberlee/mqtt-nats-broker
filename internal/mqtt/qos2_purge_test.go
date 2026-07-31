@@ -1,7 +1,6 @@
 package mqtt
 
 import (
-	"strconv"
 	"testing"
 
 	"github.com/nats-io/nuid"
@@ -53,21 +52,12 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 	if !mqttValidSessGen(sess.gen) {
 		t.Fatalf("a freshly created session must carry a minted incarnation generation, got %q", sess.gen)
 	}
-	subject := mqttQoS2HoldSubject(sess.idHash, sess.gen, pi)
+	retiringGen := sess.gen // clear() re-mints, so capture it before the discard
+	subject := mqttQoS2HoldSubject(sess.idHash, retiringGen, pi)
 	if _, err := sess.jsa.storeMsg(subject, 0, []byte("stale")); err != nil {
 		t.Fatalf("store QoS2 hold entry: %v", err)
 	}
 
-	// A record left behind by a PRE-UPGRADE incarnation, on the legacy hash-only
-	// subject shape. Nothing names it any more, so the discard purge has to reap it
-	// explicitly or it would leak forever under MaxMsgsPer=1.
-	legacySubject := mqttQoS2IncomingMsgsStreamSubjectPrefix + sess.idHash + "." + strconv.FormatUint(uint64(pi), 10)
-	if legacySubject == subject {
-		t.Fatalf("the generation-scoped hold subject must differ from the legacy one, both are %q", subject)
-	}
-	if _, err := sess.jsa.storeMsg(legacySubject, 0, []byte("orphan")); err != nil {
-		t.Fatalf("store legacy QoS2 hold entry: %v", err)
-	}
 	if _, err := sess.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, subject); err != nil {
 		t.Fatalf("expected QoS2 hold entry to be stored before clear: %v", err)
 	}
@@ -77,7 +67,7 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 	// originally written for. Written through the real encoder at the sequence the
 	// tombstone would replace, which is 0 here (nothing on that subject yet).
 	const donePI = uint16(2)
-	doneSubject := mqttQoS2HoldSubject(sess.idHash, sess.gen, donePI)
+	doneSubject := mqttQoS2HoldSubject(sess.idHash, retiringGen, donePI)
 	if _, err := sess.jsa.storeQoS2DoneCAS(doneSubject, nuid.Next(), 0); err != nil {
 		t.Fatalf("store QoS2 terminal record: %v", err)
 	}
@@ -98,10 +88,6 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 	if rec, _, err := sess.jsa.loadQoS2Record(doneSubject); err != nil || rec != nil {
 		t.Fatalf("expected the terminal QoS2 record to be purged by sess.clear, got rec=%v err=%v", rec, err)
 	}
-	if _, err := sess.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, legacySubject); err == nil {
-		t.Fatal("expected the orphaned legacy QoS2 hold entry to be purged by sess.clear, but it is still present")
-	}
-
 	// clear() re-minted the incarnation, so a later session for the same client ID
 	// hashes to the same idHash but holds on a DIFFERENT subject. That is what makes
 	// a late purge from the discarded incarnation harmless: it can no longer name
@@ -131,12 +117,12 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 		t.Fatalf("payload = %q, want %q (stale entry from the discarded session leaked through)", stored.Data, "fresh")
 	}
 
-	// Re-running the RETIRED incarnation's purge — the late-delete window a nonce
-	// re-check cannot close — must not touch the new incarnation's record.
-	for _, filter := range mqttQoS2HoldPurgeFilters(sess.idHash, sess.gen) {
-		if err := sess.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, filter, false); err != nil {
-			t.Fatalf("replaying the retired incarnation's purge on %q: %v", filter, err)
-		}
+	// Re-running the RETIRED incarnation's destruction — the late-delete window a
+	// nonce re-check cannot close — must not touch the new incarnation's record.
+	// This is the arbitration walk now, and it is scoped by the retired generation,
+	// so it can only name subjects that no longer exist.
+	if err := asm.arbitrateQoS2ReleaseClaims(s, sess.idHash, retiringGen); err != nil {
+		t.Fatalf("replaying the retired incarnation's arbitration: %v", err)
 	}
 	if stored, err = sess2.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, subject2); err != nil {
 		t.Fatalf("the new incarnation's hold entry was deleted by the retired incarnation's purge: %v", err)
