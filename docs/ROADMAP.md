@@ -345,10 +345,13 @@ is fixed before feature work continues.
   and `Origin` is sanitized and truncated rather
   than derived from the local node name, because names differ per broker and a bound
   taken from one would not hold on the broker that releases. `At` is required but
-  never gates readability — the unreadable path drops a message — so a malformed one
-  falls back to the record's own store time. A same-broker discard additionally
-  refuses to admit a release at all (`closeQoS2ReleaseAndDrain`, mirroring
-  `closeQ2AffAndDrain`), closing the local case outright.
+  never gates readability — the unreadable path drops a message. It originally fell
+  back to the record's store time for the then-unwritten orphan sweep; that helper is
+  **gone** (see the sweep item below), because no two JetStream timestamps come from
+  one clock, so no stored timestamp participates in eligibility at all and `At` is now
+  write-only forensic data. A same-broker discard additionally refuses to admit a
+  release at all (`closeQoS2ReleaseAndDrain`, mirroring `closeQ2AffAndDrain`),
+  closing the local case outright.
 
   Residual, reworded rather than removed in `docs/CONFORMANCE.md`: a release that
   already won its claim may still fan out after the discard completed. The delivery
@@ -367,25 +370,128 @@ is fixed before feature work continues.
   the message, removing only the re-read makes the stalled-loader test deliver it
   twice, reaping by subject instead of by sequence destroys a newer claim, and
   widening the unarbitrated purge filters back over the live generation breaks three.
-- [ ] Reap orphaned inbound QoS 2 hold records. Nothing reaps a `held` record whose
-  session record was lost, so it wedges its packet identifier until a later PUBLISH
-  on that identifier reaps it. Pre-existing: neither created nor worsened by the
-  move protocol, which added the terminal tombstone but no new leak.
-  Extend the same sweep to the two structures session-affine shared QoS 2 adds:
-  an orphaned `$MQTT_Q2AFF_*` consumer whose session record is gone (an older
-  broker in a mixed-version window ignores `Q2Aff` entirely), and an assignment
-  claim whose winner generation no longer exists and which no contender happens
-  to revisit. Neither loses a message — a stalled claim is honored, not
-  released — but both accumulate.
-  Extend it again to the inbound QoS 2 **release claims** the serialization above
-  adds: a `discarded` marker, which no live path may ever reap (it is the only proof
-  a late releaser must lose), and a `releasing` claim whose broker died between the
-  claim and the commit, together with the hold record it protects. Age them by the
-  record's own JetStream store time rather than by the claim's `At` field — a
-  self-reported timestamp from a possibly skewed broker clock cannot be validated,
-  while the store time is assigned by one stream leader and cannot be forged. `At`
-  is required and range-checked, but it is forensic: if a sweep is ever made to rely
-  on it, an implausible value must not be resolvable into "reap it now".
+- [x] Reap orphaned inbound QoS 2 hold records, the two structures session-affine
+  shared QoS 2 adds (an `$MQTT_Q2AFF_*` consumer whose session record is gone, and
+  an assignment claim whose winner generation no longer exists), and the inbound
+  release claims the discard serialization adds. None of them loses a message — a
+  stalled claim is honored, not released — but all of them accumulate.
+
+  Implemented as a per-account periodic sweep (`internal/mqtt/orphan_qos2_sweep.go`)
+  running beside `sweepSessionExpiries` and `sweepOrphanedConsumers`. See
+  "Orphan reconciliation" in `docs/ARCHITECTURE.md`.
+
+  The item's original wording described the symptom as a **wedged packet
+  identifier**. That has not been true since incarnation generations landed: a hold
+  subject carries its generation and the next CONNECT mints a new one, so a lost
+  record wedges nothing. The real symptom is unbounded accumulation, and the
+  end-to-end test asserts that instead — retired-generation records gone, a
+  concurrently live generation's untouched — because the packet-identifier
+  assertion would have passed with the whole sweep deleted.
+
+  Load-bearing, in the order it matters. **A teardown marker is adopted first**:
+  a marked record reads as a reference to everything it names, so without that pass
+  a never-returning client's QoS 2 state could never become eligible. **Candidates
+  are listed before a complete `$MQTT_sess` walk**, with local in-memory sessions
+  counted as references; any incomplete or uninterpretable part of that walk aborts
+  the whole destructive pass. **Ownership is `(hash, generation)`**, never the hash.
+  **The hold is destroyed before its fence**: that ordering is the sole licence for
+  ever retiring a `discarded` marker, because a late releaser then re-reads the hold
+  as `Gone` instead of `Held`; reversed, it fans the message out a second time. That
+  applies to an *unreadable* claim record too — it is every bit as effective a fence,
+  since the claim write is a create-only CAS — so it is purged behind and then
+  removed at its exact sequence, never deleted first and replaced with a fresh marker.
+  **An assignment is committed `Discarded` before its consumer is deleted**, since
+  `$MQTT_out` is interest-retained and the delete drops the copies it held.
+
+  **Nothing subtracts two timestamps.** The claim's `At` was rejected because a
+  self-reported timestamp from a possibly skewed broker clock cannot be validated —
+  and the same objection defeats every other pairing. A JetStream store time comes
+  from whichever server led that stream's Raft group at that instant; four streams are
+  four groups, and one stream spans several clocks across a leadership change, so a
+  fast leader's timestamp minus a slow leader's says nothing about elapsed time.
+  Comparing either against the bridge's own `time.Now()` is worse still.
+
+  So a grace is a **stable-observation span** on the sweeping process's monotonic
+  clock. A candidate qualifies only once it has been seen, unchanged and
+  authoritatively orphaned, for at least that long — and never on the pass that first
+  saw it: the first valid observation records the identity and authorizes nothing, and
+  a later complete authoritative pass is what may qualify it. Identity changes restart
+  the wait (stream sequence for records, durable plus `Created` for consumers, nonce
+  for teardown markers), as does the resource becoming referenced again. Failed or
+  incomplete scans record nothing and authorize nothing, and the mutation is still
+  revalidated at the moment it happens. Stored timestamps are diagnostic only.
+  Restarting loses quarantine and therefore delays cleanup, which is the safe
+  direction; convergence takes several passes rather than one. The table is bounded
+  and **refuses** new entries when full rather than evicting — a deterministic scan
+  would otherwise evict each candidate just before its second sighting, so nothing
+  past the cap could ever qualify.
+
+  Eight defects three Codex reviews caught after the first implementation, all fixed
+  and each pinned by a mutation-checked test: teardown adoption validated the record's
+  incarnation generation but not its affine pair, so a record naming a foreign
+  `Q2Aff.Durable` would have had that consumer deleted (and its interest-retained
+  copies with it) — the validation is now shared with the reference walk rather than
+  duplicated; the per-tick mutation budget was charged for already-`Discarded`
+  claims even though `advanceQ2AffClaim` writes nothing for them, so an inventory
+  headed by a budget's worth of retained-by-design claims starved everything behind
+  it; and the quarantine table evicted rather than refused when full. `mqttQoS2RelClaimAt`
+  and `mqttQoS2ClaimAtFloor` are **removed** rather than reused: the helper preferred
+  a plausible `At` over the record's store time — and neither belongs in this
+  decision, since no two JetStream timestamps come from one clock — and
+  keeping a range check would have meant putting `At` inside the readability predicate
+  it must stay out of (the unreadable disposition drops a message). `At` is now
+  write-only forensic data, and scope rule 5 of `qos2_release_claim.go` says so.
+
+  Two grace policies, deliberately different: five minutes for construction-window
+  state (teardown markers, holds, assignments, affine consumers) and one hour for
+  release claims, which arbitrate against a releaser that may be paused between
+  loading a payload and delivering it. No stream gains a `MaxAge`; age eviction
+  cannot honour the orderings above.
+
+  The sweep-only affine validator (`validateOrphanQ2AffClaim`) checks every derived
+  name, but is deliberately **not** folded into `mqttQ2AffClaimIdentityOK`. That
+  predicate gates session resume and `clear()`, where one failure anywhere in an
+  account-wide scan aborts the caller — and for `clear()` that fails the discard,
+  strands the teardown marker and locks the client ID out of its next CONNECT. Since
+  the new checks are derivations from naming helpers, folding them in would turn any
+  future change to `mqttQ2AffineNames` into an account-wide teardown outage instead
+  of one deferred sweep pass. Changes to those helpers must be coordinated with the
+  orphan validator.
+
+  Two new conformance residuals, both recorded in `docs/CONFORMANCE.md`: a releaser
+  that preloaded a hold answers `0x00` rather than the marker-backed `0x92` once the
+  marker has been retired (nothing delivered, nothing lost, only a more optimistic
+  reason code); and once a session record is gone, a genuinely `Lost` affine copy is
+  indistinguishable from a permitted session teardown, so reconciliation records
+  `Discarded`. `docs/ARCHITECTURE.md`'s `Lost` discriminator is qualified accordingly
+  — it is authoritative only while the owning record still exists.
+
+  Also fixed in passing: `mqttSessionExpirySweepInterval` became an atomic accessor.
+  Every account manager's sweep goroutine reads it and those goroutines outlive the
+  test that created them, so the existing plain-var swap was a latent data race that
+  this item's tests made reproducible.
+
+  **Verification.** `orphan_qos2_sweep_test.go` (default tree) covers the strict
+  subject/durable parsers, the fail-closed age policy, both graces applied
+  independently, the full inbound disposition table, exact-sequence reaping, the
+  reference snapshot aborting on six kinds of uninterpretable record, cursor seeding
+  and sequential resume, the derived-name validator and its boundary against the
+  shared floor, absent-winner reconciliation preserving proven facts, `Lost`
+  retention, and the consumer barrier in all four ways it can come up short.
+  `orphan_qos2_sweep_e2e_test.go` (`mqttport_fulltests`) drives real exchanges and
+  adds five two-broker R3 races: a release claim aging under a releaser parked in its
+  load..claim window, a teardown marker adopted while its owner resumes, a session
+  resume racing the final revalidation, a late assignment claim written by the other
+  broker between the inventory and verification scans, and two sweepers reconciling
+  the same state concurrently.
+
+  Mutation-checked rather than assumed. Performing the fence steps in the forbidden
+  order must make the stalled releaser observe `mqttQoS2VerifyHeld`; deleting an
+  unreadable claim before its hold must trip the delete-ordering hook; and trusting
+  the first inventory instead of re-scanning must delete a consumer whose generation
+  another broker has just claimed. Each of those was run against the mutated code and
+  fails, and the ordering test additionally asserts its own hook fired so it cannot
+  pass vacuously.
 - [ ] Give outbound QoS 1/2 in-flight deliveries a durable identity, so a packet
   identifier survives a broker restart or failover rather than only a same-process
   reconnect. Today `pendingPublish`/`cpending` are memory-only, so after a restart

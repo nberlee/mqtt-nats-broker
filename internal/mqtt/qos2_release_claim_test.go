@@ -253,11 +253,14 @@ func TestQoS2RelClaimIdentityValidation(t *testing.T) {
 
 // TestQoS2RelClaimAtAndOrigin pins the two forensic fields.
 //
-// At is required and non-zero on every writer, but it must NEVER decide whether a
-// claim is readable: the unreadable disposition drops a message, so a malformed
-// diagnostic field must not be able to cause that. Its age therefore falls back to
-// the record's own store time, which always exists and cannot be forged — without
-// which an accepted `discarded` marker could be permanently unreapable.
+// At is stamped by every writer and read by NOTHING (scope rule 5). It must never
+// decide whether a claim is readable — the unreadable disposition drops a message,
+// so a malformed diagnostic field must not be able to cause that — and it must never
+// decide eligibility either. Nor does any other timestamp take its place: the orphan
+// sweep requires a claim to be stably OBSERVED for its grace, keyed on the record's
+// sequence, so no stored time participates at all. There is deliberately no range
+// check anywhere, because the only predicate a range check could live in is the
+// readability one it has to stay out of.
 func TestQoS2RelClaimAtAndOrigin(t *testing.T) {
 	before := time.Now().Unix()
 	for _, c := range []*mqttQoS2RelClaim{
@@ -269,25 +272,21 @@ func TestQoS2RelClaimAtAndOrigin(t *testing.T) {
 		}
 	}
 
-	// A missing or implausible At is still a perfectly readable claim, and its age
-	// comes from the record instead.
-	stored := &StoredMsg{Time: time.Unix(1_700_000_000, 0)}
+	// Any At at all — absent, implausible, negative, far future — leaves the claim
+	// perfectly readable. Nothing else consults it.
 	for _, tc := range []struct {
 		name string
 		at   int64
-		want time.Time
 	}{
-		{"plausible", 1_800_000_000, time.Unix(1_800_000_000, 0)},
-		{"absent", 0, stored.Time},
-		{"below the floor", 42, stored.Time},
-		{"negative", -1, stored.Time},
+		{"plausible", 1_800_000_000},
+		{"absent", 0},
+		{"implausibly old", 42},
+		{"negative", -1},
+		{"far future", 1 << 60},
 	} {
 		c := &mqttQoS2RelClaim{State: mqttQoS2RelStateDiscarded, At: tc.at}
 		if !mqttQoS2RelClaimIdentityOK(c) {
 			t.Fatalf("%s: a claim must stay readable whatever its At", tc.name)
-		}
-		if got := mqttQoS2RelClaimAt(c, stored); !got.Equal(tc.want) {
-			t.Fatalf("%s: age = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 

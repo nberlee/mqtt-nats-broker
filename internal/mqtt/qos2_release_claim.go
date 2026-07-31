@@ -57,16 +57,33 @@
 //     is reused by a later exchange. Naming suffices for one; only sequencing
 //     suffices for the other.
 //  3. A DISCARD NEVER REAPS ITS OWN `discarded` CLAIM. It is the only durable
-//     proof that a late releaser must lose, so reaping it re-opens exactly the
-//     window this file closes — the same rule as discardQ2AffClaimsFor, where
-//     claims are marked and never released. Nothing can license reaping it at
-//     teardown time, because "no releaser is still in flight" is not provable. It
-//     is left to the orphan sweep filed in docs/ROADMAP.md, which ages a claim by
-//     mqttQoS2RelClaimAt.
+//     proof that a late releaser must lose, so reaping it at teardown time re-opens
+//     exactly the window this file closes — the same rule as discardQ2AffClaimsFor,
+//     where claims are marked and never released. Nothing can license reaping it
+//     THERE, because "no releaser is still in flight" is not provable.
+//     The aged orphan sweep (orphan_qos2_sweep.go) may retire one, and only under
+//     an ordering teardown cannot offer: it destroys the HOLD RECORD FIRST and
+//     confirms it gone, then removes the claim. A late releaser that preloaded the
+//     payload and resumes afterwards wins a fresh create-only claim against the
+//     empty subject, but its mandatory authoritative re-read
+//     (verifyQoS2HoldForRelease) then returns mqttQoS2VerifyGone, so it answers the
+//     client and delivers nothing. Delete the claim before the hold and that same
+//     re-read returns mqttQoS2VerifyHeld and the message is fanned out again.
+//     Eligibility is a stable observation on the sweeper's monotonic clock; no stored
+//     timestamp participates, and At is never consulted (rule 5).
 //  4. NON-MUTATING DEFAULTS. Every switch over a claim state or a verdict resolves
 //     an unhandled value to Indeterminate — suppress PUBCOMP, the client retries —
 //     never to a verdict that answers the client or deletes anything. An omitted
 //     case then costs a retry instead of a message.
+//  5. `At` IS WRITE-ONLY FORENSIC DATA. It is stamped by mqttNewQoS2RelClaim and
+//     never read: not for readability (a malformed diagnostic field must not be able
+//     to drop a message), not for identity, and not for cleanup. Nor does any OTHER
+//     timestamp take its place — a JetStream store time is assigned by whichever
+//     server led that stream's Raft group, so no two are from one clock. The orphan
+//     sweep instead requires a claim to be stably OBSERVED for its grace, and keys
+//     that on the record's sequence. At is deliberately not range-checked anywhere,
+//     because the only place a range check could live is the readability predicate it
+//     must stay out of.
 //
 // # Residual
 //
@@ -107,14 +124,6 @@ const (
 	// mqttQoS2ClaimOriginMax bounds the sanitized origin. See mqttQoS2SanitizeOrigin
 	// for why it cannot be derived from the local node name.
 	mqttQoS2ClaimOriginMax = 64
-
-	// mqttQoS2ClaimAtFloor is the oldest timestamp a claim's At may carry
-	// (2020-01-01T00:00:00Z). A value below it is not a plausible claim time, so the
-	// age falls back to the record's own store time. There is deliberately no
-	// CEILING: an implausibly FUTURE value only delays the reap of a small record,
-	// while a ceiling would have to guess how far a broker's clock may legitimately
-	// lead the stream's.
-	mqttQoS2ClaimAtFloor = 1577836800
 
 	// Bounded budgets. Every loop here re-reads and reconciles rather than blindly
 	// retrying, so a small budget suffices; exhaustion is reported as a failure (no
@@ -211,7 +220,12 @@ type mqttQoS2RelClaim struct {
 	State  string `json:"state"`
 	Gen    string `json:"gen,omitempty"` // the exchange generation: required for releasing, absent for discarded
 	Origin string `json:"origin"`
-	At     int64  `json:"at"`
+	// At is WRITE-ONLY (scope rule 5): stamped here, read by nothing, and replaced by
+	// no other timestamp either. A self-reported time from a possibly skewed broker
+	// clock cannot be validated, and an implausible value must never be resolvable
+	// into "reap it now"; the orphan sweep answers that question by stable
+	// OBSERVATION instead, keyed on the record's sequence.
+	At int64 `json:"at"`
 }
 
 // mqttQoS2RelClaimIdentityOK reports whether a decoded claim carries a usable
@@ -261,18 +275,6 @@ func mqttQoS2SanitizeOrigin(s string) string {
 		}
 	}
 	return b.String()
-}
-
-// mqttQoS2RelClaimAt returns the age of a claim record: its own At when that is
-// plausible, and otherwise the record's JetStream store time, which always exists,
-// is assigned by one stream leader and cannot be forged. Without the fallback a
-// malformed diagnostic field could make an accepted `discarded` claim permanently
-// unreapable; with it, the sweep always has an answer.
-func mqttQoS2RelClaimAt(c *mqttQoS2RelClaim, smsg *StoredMsg) time.Time {
-	if c != nil && c.At >= mqttQoS2ClaimAtFloor {
-		return time.Unix(c.At, 0)
-	}
-	return smsg.Time
 }
 
 // mqttNewQoS2RelClaim builds a claim. gen must be empty for a discard and a valid

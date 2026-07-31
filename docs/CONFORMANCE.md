@@ -204,6 +204,16 @@ consumer disappear — and each affected assignment is marked `Lost`: a terminal
 state that is deliberately **not** reapable, so the record survives for an
 operator to find instead of being written off as a completed delivery.
 
+That discrimination holds **while the owning session record still exists**. If the
+record disappears first — the session expired, or a broker died without tearing it
+down — a legitimate teardown deleting the consumer and an out-of-band destruction
+of it look identical, so orphan reconciliation records `Discarded` (which
+MQTT 5.0 [4.8.2] permits) rather than `Lost`. A `Lost` flag already committed is
+never automatically removed; what cannot always be recovered afterwards is a loss
+that occurred before the record vanished and that no broker had yet recorded. A
+discarded assignment is itself retained until the source is proven closed, so
+reaping it can never let a redelivery elect a second winner.
+
 Two deviations remain.
 
 **Packet-identifier continuity across a broker restart or failover.** A
@@ -373,8 +383,28 @@ The deviations that remain:
   that was in flight.** The `discarded` marker is the only durable proof that a
   late releaser must lose, so nothing may reap it at teardown time — "no releaser
   is still in flight" is not provable. It is inert (roughly 150 bytes, on a subject
-  scoped to the retired incarnation) and is reaped by age. A session with no
+  scoped to the retired incarnation). It is retired by the periodic orphan sweep
+  once it has been **continuously observed as an orphan**, unchanged, for a
+  deliberately long grace (one hour, against five minutes for construction-window
+  state) and only **after** the hold record it fences has been destroyed and
+  confirmed gone. The grace is a stable-observation span on the sweeping broker's
+  monotonic clock, not an age: no two JetStream timestamps are from one clock, so
+  none is ever subtracted. This is explicit
+  reconciliation, not stream expiry: `$MQTT_qos2in` continues to reject any
+  `MaxAge > 0`, because age eviction cannot honour that ordering. A session with no
   exchanges in flight leaves nothing.
+- **After an aged `discarded` marker is retired, a releaser that preloaded the hold
+  answers `0x00` where it would previously have answered `0x92`.** With the marker
+  intact such a releaser observes it and reports the identifier as gone; once the
+  sweep has destroyed the hold and removed the marker, it wins a fresh claim,
+  re-reads the hold as absent, and reports success. Nothing is delivered and
+  nothing is lost either way — only the reason code is more optimistic than the
+  marker-backed one.
+- **A `releasing` claim whose broker died is retired the same way**, hold first.
+  This does not prove a paused process can never resume; it preserves the ordering
+  that already governs one. A releaser that has not passed its authoritative
+  re-read delivers nothing, and one already beyond it is inside the post-claim
+  delivery-ordering residual above. Age cleanup is not exactly-once coordination.
 - **A superseded PUBREL is answered `0x92` after its message was in fact
   delivered.** When a newer session generation has taken the same
   `(client, packet identifier)` subject, the finalizer abandons without mutating

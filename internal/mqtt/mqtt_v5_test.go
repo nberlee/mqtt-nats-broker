@@ -6297,9 +6297,7 @@ func TestMQTTv5SessionExpiryOverdueInMemoryResume(t *testing.T) {
 // the client was connected is stamped by the periodic sweep and expired, so a
 // finite Session Expiry Interval is eventually honored.
 func TestMQTTv5SessionExpiryOwnerCrashSweep(t *testing.T) {
-	old := mqttSessionExpirySweepInterval
-	mqttSessionExpirySweepInterval = 250 * time.Millisecond
-	defer func() { mqttSessionExpirySweepInterval = old }()
+	defer setMQTTSessionExpirySweepInterval(250 * time.Millisecond)()
 
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)

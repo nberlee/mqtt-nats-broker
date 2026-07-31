@@ -399,15 +399,37 @@ var (
 	mqttSessJailDur      = mqttSessFlappingJailDur
 	mqttFlapCleanItvl    = mqttSessFlappingCleanupInterval
 	mqttRetainedCacheTTL = mqttDefaultRetainedCacheTTL
-	// How often to re-run the session-expiry sweep for an account. A var so
-	// tests can shorten it.
-	mqttSessionExpirySweepInterval = 15 * time.Minute
 	// How old a consumer must be before the orphan sweep may delete it: a plain
 	// session durable is created before the record save that references it, so a
 	// young unreferenced consumer may just be mid-SUBSCRIBE. A var so tests can
-	// shorten it.
+	// shorten it; the orphan QoS 2 sweep additionally supports an instance-scoped
+	// override, because it is read by a goroutine a test cannot synchronize with.
 	mqttOrphanSweepGrace = 5 * time.Minute
 )
+
+// How often to re-run the session-expiry sweep for an account.
+//
+// Atomic rather than a plain var: every account manager's sweep goroutine reads
+// this, and those goroutines outlive the test that created them, so a test
+// shortening the interval would otherwise race every sweeper still draining from an
+// earlier test. Only the ticker construction reads it, so a change takes effect for
+// account managers created afterwards.
+var mqttSessionExpirySweepIntervalNS = func() *atomic.Int64 {
+	v := &atomic.Int64{}
+	v.Store(int64(15 * time.Minute))
+	return v
+}()
+
+func mqttSessionExpirySweepInterval() time.Duration {
+	return time.Duration(mqttSessionExpirySweepIntervalNS.Load())
+}
+
+// setMQTTSessionExpirySweepInterval installs a new interval and returns the restore
+// func. Test-only, but it lives here beside the value it guards.
+func setMQTTSessionExpirySweepInterval(d time.Duration) func() {
+	old := mqttSessionExpirySweepIntervalNS.Swap(int64(d))
+	return func() { mqttSessionExpirySweepIntervalNS.Store(old) }
+}
 
 // Test hook: when set, sess.save() consults it and fails with the returned error
 // instead of persisting. Used to exercise persistence-failure rollback.
@@ -893,6 +915,35 @@ type mqttAccountSessionManager struct {
 	// result classification) precisely. Instance-scoped, set/read under mu, nil in
 	// production. See rollbackAcceptedSession.
 	testRollbackDone func(es *mqttSession, result rollbackResult)
+
+	// qos2SweepCursor is the orphan QoS 2 sweep's position in $MQTT_qos2in, and
+	// qos2SweepSeeded whether it has been seeded yet. Scheduling state only: every
+	// candidate it discovers is authoritatively revalidated before any mutation, so
+	// losing, wrapping or reseeding the cursor changes only which records a given
+	// pass looks at. Guarded by mu. See orphan_qos2_sweep.go.
+	qos2SweepCursor uint64
+	qos2SweepSeeded bool
+
+	// testQoS2SweepSeed, when non-nil, chooses the sweep cursor's initial position
+	// instead of the pseudo-random seed, so a test can make one pass deterministic.
+	// Instance-scoped, set/read under mu, nil in production.
+	testQoS2SweepSeed func(firstSeq, lastSeq uint64) uint64
+
+	// Instance-scoped overrides for the orphan sweep's age policies and discovery
+	// budget. Pointers, because zero is a value a test legitimately wants to set.
+	// Set/read under mu, nil in production — package-level knobs cannot be used here
+	// because the account manager's sweep goroutine reads them concurrently with any
+	// test that would swap them.
+	testOrphanGrace          *time.Duration
+	testQoS2ReleaseGrace     *time.Duration
+	testQoS2SweepRecordLimit *int
+	testQoS2SweepByteLimit   *int64
+
+	// sweepQuarantine records how long each orphan-sweep candidate has been
+	// continuously observed as an orphan, on this process's monotonic clock. Created
+	// on first use; see orphan_qos2_sweep.go for why no JetStream timestamp can serve
+	// that purpose.
+	sweepQuarantine *mqttSweepQuarantine
 }
 
 // sessionReconcileState orders remote-expiry reconciliation workers for a single
@@ -3715,7 +3766,8 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		defer s.grWG.Done()
 		as.sweepSessionExpiries(s)
 		as.sweepOrphanedConsumers(s)
-		tt := time.NewTicker(mqttSessionExpirySweepInterval)
+		as.sweepOrphanedQoS2State(s)
+		tt := time.NewTicker(mqttSessionExpirySweepInterval())
 		defer tt.Stop()
 		for {
 			select {
@@ -3723,6 +3775,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 				as.retryUncertainSessions(s)
 				as.sweepSessionExpiries(s)
 				as.sweepOrphanedConsumers(s)
+				as.sweepOrphanedQoS2State(s)
 			case <-closeCh:
 				return
 			case <-s.quitCh:
@@ -11225,6 +11278,14 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// Terminated and already reaped. Absence means terminated rather than
 		// discarded precisely because a discard claims before it purges, and we hold
 		// the claim.
+		//
+		// One further case reaches here and answers 0x00 for an exchange that was in
+		// fact DISCARDED: the orphan sweep retires an aged `discarded` marker, but only
+		// after destroying the hold and confirming it gone, so a releaser that preloaded
+		// the payload and resumed later finds an empty claim subject and then an absent
+		// record. Nothing is delivered and nothing is lost — only the reason code is
+		// more optimistic than the marker-backed 0x92. See orphan_qos2_sweep.go and the
+		// residual in docs/CONFORMANCE.md.
 		asm.reapQoS2RelClaim(claimSeq)
 		return nil
 	case mqttQoS2VerifySuperseded:

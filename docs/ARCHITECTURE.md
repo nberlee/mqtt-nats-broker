@@ -374,7 +374,15 @@ is recorded **before** the copy is acked, so an absent copy under a claim that
 never reached `AffineDone` was never acked by a delivery — it was dropped with its
 consumer. Every broker reads that identically, which an "I saw the consumer
 disappear" flag could not: the broker that observed it may be gone, or the
-consumer may have been recreated, by the time anyone reconciles. The inverted
+consumer may have been recreated, by the time anyone reconciles.
+
+That inference is authoritative **while the owning session record still exists**.
+Once it is gone, a legitimate teardown deleting the consumer and an out-of-band
+destruction of it are indistinguishable — both leave a materialized claim with no
+copy and no `AffineDone` — so orphan reconciliation records `Discarded` rather
+than `Lost`. A `Lost` flag already committed is permanent and never reaped; what
+cannot always be recovered is a loss that happened before the session record
+disappeared and was never observed by the owner. See "Orphan reconciliation". The inverted
 window (recorded, not yet acked) is benign and self-correcting: the copy stays
 live, a live copy always keeps its claim (`reapable` requires the copy to be
 authoritatively absent), and the redelivered copy is disposed of by the delivery
@@ -519,6 +527,131 @@ partially-arbitrated path is worse than a rejected one.
 **Mixed version.** An older broker ignores the `Teardown` marker and would
 overwrite it, and uses the old names — so, as with the affine protocol, both halves
 hold only once every broker understands them. See `docs/CONFORMANCE.md`.
+
+## Orphan reconciliation
+
+A broker that dies in the wrong window leaves durable state nothing else ever
+revisits: an inbound QoS 2 hold and its release claim on `$MQTT_qos2in`, a
+session-affine `$MQTT_Q2AFF_*` consumer on `$MQTT_out`, an assignment claim on
+`$MQTT_qos2assign`, and the teardown marker that pins all three in place. None of
+them loses a message — a stalled claim is honored, never released — but all of
+them accumulate. A periodic per-account sweep converges them
+(`internal/mqtt/orphan_qos2_sweep.go`), beside the existing session-expiry and
+orphaned-consumer sweeps.
+
+**Teardown markers are adopted first.** A marked record deliberately reads as a
+reference to everything it names, so until it is finished none of that session's
+QoS 2 state can become eligible. Once the marker has been *stably observed* for the
+grace — keyed by the record's sequence and teardown nonce, so a resave or a peer's
+teardown restarts the wait — the sweep re-reads it, requires that same sequence and
+nonce, and runs `finishAdoptedTeardown`. No stored timestamp participates: neither
+the record's store time nor `Teardown.StartedAt`. A young marker, an unreadable
+record or a failed adoption leaves everything referenced.
+
+**Absence is proven, never inferred.** Candidates are listed *before* a complete
+walk of `$MQTT_sess`, so a resource created between the two is never judged
+against a snapshot that predates it; local in-memory sessions count as references,
+covering the create-before-save window on this broker. Ownership is the
+`(client-ID hash, generation)` pair carried in the subject or durable name, never
+the hash alone. An incomplete walk, an undecodable record, a client ID that does
+not hash back to its subject token, or an unvalidatable generation aborts the
+whole destructive pass.
+
+**Two grace policies, and neither is an age.** `mqttOrphanSweepGrace` (five
+minutes) covers construction windows — a resource created just before the record
+save that references it — and applies to teardown markers, holds, assignments and
+affine consumers. `mqttQoS2ReleaseOrphanGrace` (one hour) applies to release
+claims, which arbitrate against a releaser that may be paused between loading a
+payload and delivering it.
+
+**Nothing subtracts two timestamps.** There is no clock to compare against: a
+JetStream store time is assigned by whichever server led that stream's Raft group
+at that instant, four streams are four groups, and one stream spans several clocks
+across a leadership change — so a fast leader's timestamp minus a slow leader's
+says nothing about elapsed time. Comparing either against the bridge's own
+`time.Now()` is worse, for the reason the release claim's self-reported `At` was
+rejected: the bridge is an external client on its own host.
+
+So a grace is a **stable-observation requirement** measured on this process's
+monotonic clock. A candidate becomes eligible only once it has been seen,
+unchanged and authoritatively orphaned, across a monotonic span at least as long
+as the grace — and **never on the pass that first saw it**: the first valid
+observation only records the identity, and a later complete authoritative pass is
+what may qualify it. Any identity change restarts the wait (a record's stream
+sequence, a consumer's durable plus `Created`, a teardown nonce), as does the
+resource becoming referenced again. Stored timestamps are diagnostic only. Failed
+or incomplete scans record nothing and authorize nothing, and a mutation is still
+revalidated at the moment it happens, separately from that eligibility check.
+
+The observation table is bounded, and when it is full it **refuses new entries
+rather than evicting**. Evicting is what a cache does and is exactly wrong here: a
+deterministic scan revisits candidates in the same order, so admitting each new key
+by evicting the one due next would make every sighting look like a first sighting
+and nothing past the cap could ever qualify. Refusing keeps a stable resident
+cohort that ages, is acted on, and releases its slot; entries nobody has revisited
+in a very long time are pruned so a vanished resource cannot hold a slot forever.
+State that is **retained by design** — a `Lost` assignment, or a `Discarded` one
+whose source is not yet proven closed — is resolved before any observation and
+holds no slot at all: it needs no wait, since it is already durably terminal, and
+it is exactly what accumulates. Letting it occupy the table would let one account
+fill it and refuse every other candidate permanently.
+
+Two consequences, both erring towards leaving state alone: a broker that restarts
+more often than the grace never reaps, because quarantine is in-memory and starts
+over; and convergence takes several passes rather than one.
+
+**The hold dies before its fence.** A `discarded` marker is reaped by nobody at
+teardown time — it is the only durable proof that a late releaser must lose — and
+the sweep may retire an aged one **only** after destroying the hold record and
+confirming it gone. A releaser that preloaded the payload and resumes afterwards
+then wins a fresh create-only claim against an empty subject, but its mandatory
+authoritative re-read returns `mqttQoS2VerifyGone`, so it delivers nothing.
+Reversing the two steps returns `mqttQoS2VerifyHeld` and fans the message out
+again. An unclaimed hold is fenced by a fresh `discarded` marker before it is
+purged, and every claim delete targets the exact sequence just read.
+
+A record that cannot be *read* is still a fence — the claim write is a create-only
+CAS, which fails while any record occupies the subject — so an aged unreadable
+claim retires by the same route: purge behind it, then delete its exact sequence.
+It is deliberately not deleted first and replaced with a fresh marker, because
+that empties the subject while the payload is still there.
+
+**One definition of an interpretable record, shared by every path that reads one.**
+The reference walk fails closed on a record it cannot interpret, but the
+post-snapshot re-reads are what actually authorize a mutation — so they apply the
+same validation, not a subset of it. A record written after the walk whose client
+ID does not hash back to its subject, whose generation is malformed, or whose
+affine pair is inconsistent is **indeterminate**, never proof of absence: reading
+it as "a valid record for a different generation" would discard a live assignment
+or delete a referenced consumer along with its interest-retained copies.
+
+**Every deletion target is validated against the record that names it.** A teardown
+adoption deletes the `Cons`, `Drains`, `PubRel` and `Q2Aff` durables a marked record
+carries, all copied verbatim, so a record naming another session's durable would
+have that consumer deleted and its interest-retained messages with it. Each name is
+bound to its session — a plain durable is `<idHash>_<nuid>`, the PUBREL and affine
+ones are fully derived — and adoption checks all four. An affine consumer is
+additionally re-looked-up immediately before deletion and must still be the same
+instance quarantine observed: one deleted and recreated under the same name is a
+different consumer, and deleting it by name would destroy a peer's fresh consumer
+inside the very create-before-save window the wait exists to protect.
+
+**The affine side is the mirror image.** An assignment is committed `Discarded`
+*before* its consumer is deleted, because `$MQTT_out` is interest-retained and
+deleting the consumer drops the copies it still held. The consumer is deleted only
+after a complete assignment inventory, a second complete inventory as a
+verification barrier, and a final re-read of the session record; a capped or
+failed scan authorizes nothing. Assignments are deleted only through
+`reapQ2AffClaim`, whose existing predicate refuses a claim marked `Lost`.
+
+No stream gains a `MaxAge`: JetStream age eviction cannot perform this ordering or
+these cross-stream proofs, so protocol state stays explicitly reconciled. The
+inbound walk is bounded per tick by both a record count and a byte budget (the
+message-get API returns whole records, so scanning a hold transfers its payload),
+with a cursor seeded pseudo-randomly once per process and advanced sequentially
+from there — random so a restart loop does not rescan the same prefix forever,
+sequential so coverage inside one process is linear. The cursor is scheduling
+state only.
 
 ## JetStream domain
 

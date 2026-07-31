@@ -1896,6 +1896,24 @@ func mqttQ2AffClaimIdentityOK(c *mqttQ2AffClaim) bool {
 // still named that generation — contenders honor such a claim indefinitely, so its
 // source delivery would stall forever with nothing left able to complete it.
 func (as *mqttAccountSessionManager) scanQ2AffClaims(fn func(subject string, claim *mqttQ2AffClaim, seq uint64) error) error {
+	return as.scanQ2AffClaimRecords(func(claim *mqttQ2AffClaim, smsg *StoredMsg) error {
+		return fn(smsg.Subject, claim, smsg.Sequence)
+	})
+}
+
+// scanQ2AffClaimRecords is scanQ2AffClaims with the stored message exposed, for the
+// one caller that needs a claim's JetStream STORE TIME (the orphan sweep ages a
+// claim by it, never by anything self-reported).
+//
+// It enforces mqttQ2AffClaimIdentityOK and nothing more. That predicate is the
+// SHARED ATTRIBUTION FLOOR for every full scan, and it is deliberately not where
+// stricter, derived-name checks belong: the production callers above are a session
+// resume and clear(), where one failure anywhere in this account-wide walk already
+// aborts the caller — and for clear() that fails the discard, strands the teardown
+// marker and locks the client ID out of its next CONNECT. A derived-name mismatch
+// must not be able to do that to unrelated sessions, so the orphan sweep layers its
+// own validator (validateOrphanQ2AffClaim) over each decoded claim instead.
+func (as *mqttAccountSessionManager) scanQ2AffClaimRecords(fn func(claim *mqttQ2AffClaim, smsg *StoredMsg) error) error {
 	filter := mqttQoS2AssignStreamSubjectPrefix + ">"
 	for seq := uint64(1); ; {
 		smsg, err := as.jsa.loadNextMsgFromSeq(mqttQoS2AssignStreamName, filter, seq)
@@ -1917,7 +1935,7 @@ func (as *mqttAccountSessionManager) scanQ2AffClaims(fn func(subject string, cla
 			return fmt.Errorf("assignment claim on %q at sequence %d carries no usable identity (winner %q, generation %q, group %q, source sequence %d)",
 				smsg.Subject, smsg.Sequence, claim.Winner, claim.Gen, claim.GroupDurable, claim.SourceSeq)
 		}
-		if ferr := fn(smsg.Subject, claim, smsg.Sequence); ferr != nil {
+		if ferr := fn(claim, smsg); ferr != nil {
 			return ferr
 		}
 	}
