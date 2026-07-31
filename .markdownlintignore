@@ -1,0 +1,8 @@
+# Third-party Markdown this project vendors but does not own. Reformatting it
+# would make the vendored tree harder to diff against upstream, and its style is
+# upstream's decision rather than ours.
+test/conformance/paho/
+
+# Generated / transient
+test/conformance/results/
+node_modules/

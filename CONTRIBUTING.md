@@ -6,9 +6,11 @@ Thanks for helping build `mqtt-nats-bridge`.
 
 - Go **1.26+**.
 - A local NATS with JetStream for integration work:
+
   ```sh
   docker compose -f test/conformance/docker-compose.yml up nats
   ```
+
   Unit tests spin up an in-process JetStream server, so Docker is not required
   for `go test`.
 
@@ -16,13 +18,18 @@ Thanks for helping build `mqtt-nats-bridge`.
 
 ```sh
 make test        # unit tests (default tree)
-make vet lint    # static analysis
+make vet lint    # static analysis: go vet, golangci-lint, markdownlint
 make build       # host binary
 ```
 
+`make lint` covers Markdown as well as Go (`make lint-go` / `make lint-md` run
+them separately). Markdown rules live in `.markdownlint.jsonc`; vendored
+third-party docs are excluded via `.markdownlintignore`, since their style is
+upstream's decision. CI runs the same linter and configuration.
+
 ## Code layout
 
-```
+```text
 cmd/mqtt-nats-bridge   entrypoint: config, backend connect, health, shutdown
 internal/config        flags/env configuration
 internal/backend       NATS/JetStream service conn + per-client auth-passthrough dial
@@ -104,6 +111,29 @@ has a **known-failures baseline** under `test/conformance/baseline/`.
 - CI fails only on **new** failures (regressions).
 - A PR may **only shrink** a baseline, never grow it. If you fix a conformance
   test, remove its ID from the baseline in the same PR.
+
+## Investigating an intermittent test failure
+
+`make soak` runs the same gated selector against the working tree and a clean
+baseline worktree, alternating the two arms, and compares failure rates:
+
+```sh
+make soak                                    # 20 runs per arm of TestQoS2Move
+SOAK_RUNS=40 SOAK_RUN='TestQoS2Move' make soak
+SOAK_BASE=HEAD~1 make soak                   # compare against the previous commit
+```
+
+It exists because a single red run proves nothing on its own, and the tempting
+conclusion — "that one is a known flake" — is exactly the one that hides a real
+regression. A failure rate is only meaningful next to the rate the *same* command
+produces on a tree without the change. Two things it enforces that are easy to get
+wrong by hand: the arms alternate, so a slow patch of machine time cannot land on
+one of them; and every run must execute at least one test, because a gated suite
+whose environment variable is missing skips everything and exits 0 — "0 failures"
+would then mean "nothing ran".
+
+Note that `git stash` does **not** isolate a baseline: untracked files stay
+behind and leak into it. `make soak` uses a detached worktree instead.
 
 ## Commit / PR conventions
 

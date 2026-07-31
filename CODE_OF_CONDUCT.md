@@ -12,4 +12,4 @@ Advisory or direct contact. Maintainers may remove, edit, or reject
 contributions and comments that violate this Code of Conduct.
 
 The full text is available at
-https://www.contributor-covenant.org/version/2/1/code_of_conduct/.
+<https://www.contributor-covenant.org/version/2/1/code_of_conduct/>.

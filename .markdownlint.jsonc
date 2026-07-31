@@ -1,0 +1,34 @@
+// markdownlint configuration for `make lint`.
+//
+// The rules below are relaxed only where this repository has a deliberate,
+// consistently applied convention that differs from the default. Everything
+// else is left at its default so the linter keeps catching real mistakes
+// (broken nesting, missing blank lines, bare URLs) rather than being a
+// rubber stamp.
+{
+  "default": true,
+
+  // Prose here is hand-wrapped at roughly 80 columns, which is a house style
+  // rather than a hard limit: a handful of paragraphs run to ~87 to avoid
+  // breaking an identifier or a spec reference across lines. 90 keeps that
+  // habit enforceable while still catching a genuinely runaway line.
+  //
+  // Tables and code blocks are exempt because neither can be wrapped without
+  // changing what it means: a table row is one record, and a fenced block is
+  // reproduced verbatim (subject names, JetStream headers and shell commands
+  // must stay copy-pasteable).
+  "MD013": {
+    "line_length": 90,
+    "tables": false,
+    "code_blocks": false
+  },
+
+  // Table pipe spacing. The docs use the compact separator form (|---|---|),
+  // which MD060 flags under its default "spaces" expectation. This is purely
+  // cosmetic and the existing form is applied consistently.
+  "MD060": false,
+
+  // Duplicate headings are legitimate here: several documents repeat a
+  // "Residuals" or "Verification" heading under different top-level sections.
+  "MD024": { "siblings_only": true }
+}

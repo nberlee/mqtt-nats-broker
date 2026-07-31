@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+
 - **Working MQTT TLS and mutual TLS listener, failing closed.** The server-side TLS
   handshake was a no-op stub: a listener configured with `-tls-cert`/`-tls-key`
   logged `tls://` but never upgraded the connection, and then panicked on the
@@ -134,6 +135,7 @@ All notable changes to this project are documented here. The format is based on
   See `docs/PORTING.md` ("Testing strategy").
 
 ### Fixed
+
 - **Inbound QoS 2 PUBREL could lose the message outright.** `mqttProcessPubRel`
   removed the hold record *before* the onward store, so three windows discarded the
   message and then told the client the exactly-once exchange had succeeded: a delete
@@ -313,11 +315,14 @@ All notable changes to this project are documented here. The format is based on
   production log improvements: client log lines carry the client id, a
   readLoop parse failure is logged at Error (protocol violations should be
   visible), and `closeConnection` logs "Client connection closed".
-- Test-harness bug (not shipped code): the ported suite's `s.Shutdown(); o.StoreDir = <same dir>; s = testMQTTRunServer(t, o)` restart idiom started a
-  second embedded nats-server against the same on-disk store while the first
-  was still running, corrupting JetStream state. `testMQTTRunServer` now
-  reuses the still-live instance for a StoreDir it already has one for.
+- Test-harness bug (not shipped code): the ported suite's
+  `s.Shutdown(); o.StoreDir = <same dir>; s = testMQTTRunServer(t, o)` restart
+  idiom started a second embedded nats-server against the same on-disk store
+  while the first was still running, corrupting JetStream state.
+  `testMQTTRunServer` now reuses the still-live instance for a StoreDir it
+  already has one for.
 
 ### Notes
+
 - MQTT 5.0 is always enabled (no experimental flag).
 - The MQTT listener is not yet served pending completion of the core port.

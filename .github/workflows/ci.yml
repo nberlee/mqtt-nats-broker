@@ -69,7 +69,7 @@ jobs:
         run: go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
 
   lint:
-    name: golangci-lint
+    name: lint (go, markdown)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,6 +80,12 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+      # Same linter and configuration as `make lint-md`, so a docs change that
+      # passes locally cannot fail here (or the reverse).
+      - name: markdownlint
+        run: |
+          npm install -g markdownlint-cli
+          markdownlint '**/*.md'
 
   docker:
     name: docker image builds

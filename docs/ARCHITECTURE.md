@@ -1,6 +1,6 @@
 # Architecture
 
-```
+```text
         MQTT clients (3.1.1 / 5.0)
      │        │        │        │
      ▼        ▼        ▼        ▼
@@ -210,7 +210,7 @@ so the namespace is closed on every path a client can reach:
 Deny both directions on the whole prefix for the identity MQTT clients
 authenticate as:
 
-```
+```text
 publish:   { allow: [">"], deny: ["$MQTT.>"] }
 subscribe: { allow: [">"], deny: ["$MQTT.>"] }
 ```
