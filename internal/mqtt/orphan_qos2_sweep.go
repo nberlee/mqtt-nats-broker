@@ -159,6 +159,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	// not reference was already unreferenced when it was listed; the reverse order
 	// would classify a resource created after the walk.
 	inbound, ierr := as.collectInboundQoS2Candidates(s)
+	inflight, flerr := as.collectInflightCandidates(s)
 	inventory, cerr := as.collectQ2AffInventory()
 	consumers, conserr := as.jsa.consumerList(mqttOutStreamName)
 
@@ -174,6 +175,17 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 		s.Debugf("MQTT orphaned QoS 2 sweep: inbound scan ended: %v", ierr)
 	} else {
 		as.reconcileInboundQoS2(s, inbound, refs)
+	}
+
+	// Outbound in-flight registers. Ordered here rather than with the affine phases
+	// because it shares nothing with them: it needs no inventory, no second barrier
+	// and no ordering against a consumer delete. It does share the mutation budget,
+	// so one class cannot starve the others.
+	inflightBudget := mqttQ2AffSweepMutationBudget
+	if flerr != nil {
+		s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan ended: %v", flerr)
+	} else {
+		as.reconcileOrphanInflight(s, inflight, refs, &inflightBudget)
 	}
 
 	if cerr != nil {
@@ -367,6 +379,7 @@ func mqttQuarantineClaimKey(subject string) string    { return "claim|" + subjec
 func mqttQuarantineTeardownKey(idHash string) string  { return "teardown|" + idHash }
 func mqttQuarantineAssignKey(subject string) string   { return "assign|" + subject }
 func mqttQuarantineConsumerKey(durable string) string { return "q2aff|" + durable }
+func mqttQuarantineInflightKey(subject string) string { return "inflight|" + subject }
 
 func mqttQuarantineSeqFP(seq uint64) string { return strconv.FormatUint(seq, 10) }
 
@@ -1094,6 +1107,177 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 		q.forget(mqttQuarantineHoldKey(n.hold))
 		q.forget(mqttQuarantineClaimKey(n.claim))
 		return mqttQoS2SweepReaped
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Outbound in-flight registers
+// ---------------------------------------------------------------------------
+
+// mqttInflightCandidate is one in-flight register the walk discovered, with the
+// SEQUENCE of the record it saw — the quarantine fingerprint, for the same reason the
+// inbound candidates carry theirs.
+type mqttInflightCandidate struct {
+	name *mqttInflightName
+	seq  uint64
+}
+
+// collectInflightCandidates walks $MQTT.inflight.> once and returns every register it
+// could attribute to an (idHash, generation) pair.
+//
+// Bounded by the same per-tick record budget as the inbound walk, and with the same
+// wrapping cursor, for the same reason: an account with a large leaked history must
+// not move it all in one pass. There is no byte budget because a register is a small
+// fixed-shape record — unlike a hold, which carries a PUBLISH payload.
+func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mqttInflightCandidate, error) {
+	si, err := as.jsa.lookupStream(mqttInflightStreamName)
+	if err != nil {
+		if isErrorOtherThan(err, JSStreamNotFoundErr) {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if si == nil || si.State.Msgs == 0 || si.State.LastSeq < si.State.FirstSeq {
+		return nil, nil
+	}
+	start := as.inflightSweepStart(si.State.FirstSeq, si.State.LastSeq)
+	recordLimit := as.qos2SweepRecordLimit()
+
+	filter := mqttInflightStreamSubjectPrefix + ">"
+	out := make([]*mqttInflightCandidate, 0, 16)
+	records := 0
+	last := start
+
+	// [start, LastSeq] then [FirstSeq, start): one wrap, so a full pass covers the
+	// stream exactly once.
+	spans := [][2]uint64{{start, si.State.LastSeq}}
+	if start > si.State.FirstSeq {
+		spans = append(spans, [2]uint64{si.State.FirstSeq, start - 1})
+	}
+	exhausted := false
+	for _, span := range spans {
+		if exhausted {
+			break
+		}
+		for seq := span[0]; seq <= span[1]; {
+			smsg, err := as.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, seq)
+			if err != nil {
+				if isErrorOtherThan(err, JSNoMessageFoundErr) {
+					return nil, err
+				}
+				break
+			}
+			if smsg.Sequence > span[1] {
+				break
+			}
+			seq = smsg.Sequence + 1
+			last = smsg.Sequence
+			records++
+
+			if name, perr := mqttParseInflightSubject(smsg.Subject); perr != nil {
+				// Retained, never swept: an unattributable subject has no provable owner,
+				// so nothing here may decide it is an orphan.
+				s.Warnf("MQTT orphaned QoS 2 sweep: retaining an unattributable in-flight register on %q at sequence %d: %v",
+					smsg.Subject, smsg.Sequence, perr)
+			} else {
+				out = append(out, &mqttInflightCandidate{name: name, seq: smsg.Sequence})
+			}
+
+			if records >= recordLimit {
+				exhausted = true
+				break
+			}
+		}
+	}
+
+	next := last + 1
+	if next > si.State.LastSeq {
+		next = si.State.FirstSeq
+	}
+	as.mu.Lock()
+	as.inflightSweepCursor = next
+	as.mu.Unlock()
+
+	s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan visited %d record(s), %d candidate(s)",
+		records, len(out))
+	return out, nil
+}
+
+// inflightSweepStart returns this pass's starting sequence in $MQTT_inflight, seeded
+// and advanced exactly as the inbound cursor is (qos2SweepStart), and scheduling
+// state only: every candidate is authoritatively revalidated before deletion.
+func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64) uint64 {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.inflightSweepSeeded && as.inflightSweepCursor >= firstSeq && as.inflightSweepCursor <= lastSeq {
+		return as.inflightSweepCursor
+	}
+	if as.inflightSweepSeeded && as.inflightSweepCursor < firstSeq {
+		as.inflightSweepCursor = firstSeq
+		return firstSeq
+	}
+	span := lastSeq - firstSeq + 1
+	var start uint64
+	if seed := as.testQoS2SweepSeed; seed != nil {
+		start = seed(firstSeq, lastSeq)
+		if start < firstSeq || start > lastSeq {
+			start = firstSeq
+		}
+	} else {
+		start = firstSeq + uint64(rand.Int63n(int64(min(span, 1<<62))))
+	}
+	as.inflightSweepCursor, as.inflightSweepSeeded = start, true
+	return start
+}
+
+// reconcileOrphanInflight deletes in-flight registers whose owning session
+// incarnation is authoritatively absent.
+//
+// This is the simplest class in the sweep, and deliberately so. A register has no
+// second party — nothing claims it, waits on it, or reads it as proof of anything —
+// so there is no ordering to preserve and no fence to keep in place: once the
+// incarnation that owned it provably does not exist, the record is inert bookkeeping
+// about an identifier space nobody will ever consult again. What it shares with every
+// other class is the part that matters: absence is proven by the complete session
+// walk, never inferred, and eligibility is a STABLE OBSERVATION on this process's
+// monotonic clock rather than any stored timestamp.
+//
+// The construction grace applies (not the longer release-claim one): a register is
+// written moments before the delivery it names, so the window it has to survive is the
+// ordinary create-before-save one.
+func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, candidates []*mqttInflightCandidate, refs *mqttSessRefs, budget *int) {
+	grace, q := as.orphanGrace(), as.quarantine()
+	var deleted int
+	for _, cand := range candidates {
+		n := cand.name
+		if refs.hasInbound(n.idHash, n.gen) {
+			// A live incarnation owns this identifier. Drop any wait accumulated while
+			// it looked absent: a session that came back must not inherit it.
+			q.forget(mqttQuarantineInflightKey(n.subject))
+			continue
+		}
+		if !q.observedOrphanFor(mqttQuarantineInflightKey(n.subject), mqttQuarantineSeqFP(cand.seq), grace) {
+			continue
+		}
+		if *budget <= 0 {
+			return
+		}
+		// Revalidated at the moment of the mutation: the snapshot is older than the
+		// record, and a register rewritten since (a later exchange on the same
+		// identifier, of a generation that has since come back) must not be deleted on
+		// the strength of a stale read. The exact sequence is what makes that safe (R4).
+		cur, smsg, lerr := as.loadInflightRecord(n.subject)
+		if lerr != nil || smsg == nil || smsg.Sequence != cand.seq {
+			continue
+		}
+		_ = cur // readability is irrelevant here: an unreadable orphan is still an orphan
+		*budget--
+		as.deleteInflightRegister(cand.seq)
+		q.forget(mqttQuarantineInflightKey(n.subject))
+		deleted++
+	}
+	if deleted > 0 {
+		s.Debugf("MQTT orphaned QoS 2 sweep: deleted %d orphaned in-flight register(s)", deleted)
 	}
 }
 

@@ -1786,7 +1786,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 	}
 
 	sess.mu.Lock()
-	pi, dup, started := sess.trackPublish(jsDur, reply)
+	pi, dup, started, isNew := sess.trackPublish(jsDur, reply)
 	if pi != 0 {
 		if p := sess.pendingPublish[pi]; p != nil {
 			// Carry the claim into the pending entry: the terminal paths (PUBREC,
@@ -1794,6 +1794,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 			p.q2AffClaim = claimSubject
 		}
 	}
+	sseq, _, _, _, _ := ackReplyInfo(reply)
 	sess.mu.Unlock()
 	if pi == 0 {
 		return
@@ -1805,11 +1806,26 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
 			sess.mu.Lock()
-			sess.untrackPublish(pi)
+			removed := sess.untrackPublishEntry(pi)
 			sess.mu.Unlock()
+			// The identifier is released, so its register goes with it (R5), before the
+			// confirmed copy ack below. Normally a no-op, since expiry is decided before
+			// the register is written.
+			sess.deleteInflightRegisterFor(removed)
 			cc.mqttFinishQ2AffineDelivery(claimSubject, reply)
 			return
 		}
+	}
+
+	// A newly allocated identifier is not sendable until its in-flight register is
+	// confirmed (R1, inflight_register.go), and no earlier than it has to be: a
+	// message discarded on expiry above never pays for one. The register carries the
+	// claim subject, which is not decoration here — after a restart the recovered
+	// pending entry is the only route by which the claim reaches the terminal paths
+	// above, so a register without it would leave a post-restart PUBREC unable to
+	// record AffineDone.
+	if isNew && !sess.storeInflightRegister(cc, pi, 2, jsDur, sseq, claimSubject) {
+		return
 	}
 	topic := natsSubjectStrToMQTTTopic(string(h.subject))
 	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, 2, dup, h.retained, subID, topic, msg, props) {
@@ -1817,8 +1833,9 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 		// complete the delivery. It dies with this session, never redistributed.
 		// Spec5 [3.1.2.11.4].
 		sess.mu.Lock()
-		sess.untrackPublish(pi)
+		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
+		sess.deleteInflightRegisterFor(removed)
 		cc.mqttFinishQ2AffineDelivery(claimSubject, reply)
 	}
 }

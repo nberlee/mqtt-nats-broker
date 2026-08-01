@@ -492,16 +492,239 @@ is fixed before feature work continues.
   another broker has just claimed. Each of those was run against the mutated code and
   fails, and the ordering test additionally asserts its own hook fired so it cannot
   pass vacuously.
-- [ ] Give outbound QoS 1/2 in-flight deliveries a durable identity, so a packet
+- [x] Give outbound QoS 1/2 in-flight deliveries a durable identity, so a packet
   identifier survives a broker restart or failover rather than only a same-process
-  reconnect. Today `pendingPublish`/`cpending` are memory-only, so after a restart
-  a started delivery is re-offered with DUP set and a **freshly allocated**
-  identifier, and a client is entitled to treat that as a new message. This is the
-  single remaining cause of the HA exactly-once deviation, and it is not specific
-  to shared subscriptions: it applies to every QoS 1/2 outbound path. A fix has to
-  persist the identifier together with the source durable and sequence, the
-  PUBLISH-versus-PUBREL phase, and a recovery ordering — which is why it is its
-  own item rather than a detail of the shared-subscription work that surfaced it.
+  reconnect. `pendingPublish`/`cpending` were memory-only, so after a restart a started
+  delivery was re-offered with DUP set and a **freshly allocated** identifier, and a
+  client is entitled to treat that as a new message. This was the single remaining
+  cause of the HA exactly-once deviation, and it was never specific to shared
+  subscriptions: it applied to every QoS 1/2 outbound path.
+
+  Implemented as an **in-flight register** (`internal/mqtt/inflight_register.go`): one
+  small record per started PUBLISH-phase delivery on the new `$MQTT_inflight` stream,
+  at `$MQTT.inflight.<idHash>.<gen>.<PI>`, naming the source durable and stream
+  sequence. See "Outbound in-flight registers" in `docs/ARCHITECTURE.md`.
+
+  The phase split is what keeps it small. Past PUBREC the correlated PUBREL record on
+  `$MQTT_out` already owned the identifier and already survived restarts
+  (`pubrel_correlation.go`), so only the PUBLISH phase was missing a durable fact. The
+  handoff is the PUBREL store; where both exist at recovery the PUBREL record wins.
+
+  Load-bearing, in the order it matters. **Persist before send**: the PUBLISH is not
+  transmitted until the register is confirmed at a sequence, and between allocation and
+  confirmation the entry is unsendable by *anyone* — a concurrent redelivery declines
+  it, the resume NAK path skips it, `stageDrain` does not enrol it. That is also the
+  takeover fence: an identifier the client can be holding implies a confirmed register,
+  hence one the next broker's scan sees, so a superseded broker's late write is inert.
+  **Reserve before interest**: the barrier runs ahead of the CONNACK, not merely ahead
+  of `processSubs`, because a client may publish the instant its CONNACK lands and
+  every JetStream round trip in between widens the window in which a QoS 0 subscription
+  does not yet exist (adding it after the CONNACK made `TestMQTTPersistedSession` fail
+  reliably). **Absence is proven, not inferred**: a register is dropped only where its
+  source is acknowledged or authoritatively absent *while its consumer still exists* —
+  a source whose consumer is gone was lost rather than finished, so its identifier stays
+  reserved, and a record whose BODY is unreadable still reserves the identifier its
+  SUBJECT names rather than being deleted as uninterpretable — reading "I cannot
+  interpret this" as "nothing is in flight" is how an identifier the client holds gets
+  handed to a second message. Two review rounds were needed there: the first
+  implementation freed such identifiers, and the fix for that reserved the identifier
+  but still let the register's SOURCE redeliver under a fresh one, putting the same
+  message in flight under two (two exchanges for one message, at QoS 2). An
+  unreadable register therefore also marks the identifier space incomplete — and a
+  third round found that the condition has to read what the walk FOUND, not what the
+  pass installed: on a same-broker reconnect the session object survives, so the
+  reservation is already in place, nothing is installed, and counting installations
+  silently lifted the restriction on the second resume. A fourth round replaced the
+  duplicate-source rule: two registers naming ONE delivery on different identifiers used
+  to converge on the newest, but a stream sequence orders the WRITES and not the sends —
+  by R1 each writer confirmed before transmitting, so the later record may belong to the
+  earlier send, and restoring it can re-offer under an identifier the client never saw.
+  That now fails closed like an unreadable register: every identifier reserved, every
+  record kept, the source mapped to none of them, allocation withheld. The same round
+  found that `clear()` never reset the restriction, so a reused session object could
+  never allocate again — a permanent outbound QoS 1/2 outage for that client — and that
+  an unproven source acknowledgement on the PUBREC path had to suppress its source's
+  redelivery, which PUBREC leaves unsuppressed: without it the re-offered source re-sends
+  a payload already past PUBREC. A FIFTH round rejected the first attempt at that, which
+  restored the source's link to its identifier — that works only until PUBCOMP, because
+  PUBCOMP removes the pending-PUBREL entry the in-flight guard tests, and from then on
+  the payload of a COMPLETED exchange is re-sent. The fact is now recorded against the
+  SOURCE (`srcAckOwed`), so it outlives the identifier's bookkeeping: the next delivery
+  attempt of a retired source is acknowledged with confirmation and discarded, which
+  suppresses the duplicate and settles the message in one step. That is the same shape
+  the affine path already uses with its claim's `AffineDone`. A SIXTH round then found
+  that a memory-only retirement is lost across a restart — and that leaving the source
+  deliberately unacknowledged is what makes that window reachable — so the register now
+  carries a `Retired` mark, written in memory first and durably second, and recovery
+  routes a retired register into the retirement instead of reserving it as
+  PUBLISH-phase state. Without the mark, a resume sees an ordinary register over a live
+  source and re-sends a completed payload. A SEVENTH round closed the last gap in that:
+  the mark was best-effort, so a write failure was a residual. It is not, because a second
+  piece of durable evidence exists — while the exchange's PUBREL RECORD survives, recovery
+  reads register-plus-PUBREL as "past PUBREC" and writes the mark itself. So the ordering
+  rule is that the second evidence is not destroyed before the first exists: a PUBCOMP does
+  not acknowledge its PUBREL away while the retirement it covers is unmarked, and the
+  register+PUBREL recovery rule no longer DELETES the register (which would destroy the
+  record that has to carry the mark) unless the source is provably complete. The cost of
+  withholding is a legitimate PUBREL redelivery, which brings the client's next PUBCOMP
+  round to retry. An abandoned register also
+  marks its sequence withheld, so the eventual first transmission carries DUP=0
+  ([MQTT-3.3.1-1]) rather than inheriting a delivery count above one.
+  **Every delete targets the exact sequence**, because the subject is reused
+  by later exchanges on the same identifier and only the record's immutable nonce
+  proves ownership.
+
+  Two design points were changed during implementation, both because the first answer
+  was wrong. A scan that cannot complete originally **denied the CONNECT**; it now
+  withholds *allocation* only (`piSpaceIncomplete`), leaving QoS 0 flowing and reserved
+  exchanges completing. Allocation is the sole operation an unknown identifier space
+  makes unsafe, and denying the connection both takes a session offline over a
+  transient failure and contradicts the drain barrier's contract, which withholds a
+  durable's interest rather than the connection. And the QoS 2 source ack was described
+  as preventing a completed exchange from being re-offered; it does not — a lost source
+  ack means JetStream redelivers regardless. It is confirmed (`jsa.confirmAck`) because
+  a durable record is deleted on its strength, which buys *continuity*: the register is
+  never removed over a source that was not released. What actually stops a completed
+  exchange being resurrected is the source-completeness proof above.
+
+  Also closed in passing: a fresh allocation could previously mint an identifier that an
+  unreplayed PUBREL record still owned, because `pendingPubRel` was empty until that
+  record was delivered. And `dropUnredeliverableRetained` identified retained sends by
+  an empty ack subject alone, which a recovered entry also has — it now requires an
+  empty durable too, or the barrier's work would be undone on the next reconnect.
+
+  Residuals, all in `docs/CONFORMANCE.md`: retained-message sends (no JetStream
+  backing, so nothing to redeliver and no register); promptness after a restart, which
+  still waits out `AckWait` because a recovered entry has no per-attempt ack subject to
+  NAK; the withheld-allocation degradation above; one identifier reserved for the life
+  of the session per delivery lost out of band; and mixed-version operation, since an
+  older broker never reads `$MQTT_inflight`.
+
+  **Verification.** `inflight_register_test.go` (default tree) covers naming, the
+  strict subject parser, record identity and codec, the derived source stream, the
+  validator table (every rejected knob, and the deliberate non-check of
+  `ConsumerLimits.InactiveThreshold` — nothing consumes this stream), the store's
+  reconcile table (create, ambiguous-resolved-by-nonce, definite failure, a live
+  foreign register refused, a provably complete one reaped), the terminal and
+  consumer-purge deletes, and the recovery table: identifier restored, completed source
+  dropped, consumer-gone identifier retained, PUBREL identifiers reserved with their
+  sources, PUBREL-beats-register precedence, duplicate sources keeping the newest, an
+  unusable register deleted, in-memory state winning, and the withheld-allocation
+  degradation with its recovery. `inflight_register_e2e_test.go` (`mqttport_fulltests`)
+  drives real clients across a real restart: QoS 1 and QoS 2 identifiers surviving,
+  the PUBREL reservation blocking a colliding allocation, a stale register leaving no
+  phantom Receive Maximum slot, and a retained send writing no register.
+  A late round corrected a mistake of my own worth recording, because it was tempting and
+  wrong: a delivery whose consumer had vanished was briefly exempted from Receive Maximum,
+  on the reasoning that it could never complete and so should not hold a slot forever. But
+  that limit bounds what the CLIENT holds unacknowledged, and a consumer disappearing
+  proves nothing about the client — the exemption let the broker exceed the negotiated
+  limit. Only a delivery provably never transmitted may free anything, so the cancellation
+  path now writes a durable tombstone on the register when its deletion cannot be proven,
+  and that tombstone is what licenses recovery to free the identifier. Where neither the
+  delete nor the tombstone can be written, the obligation is carried on the session record
+  (`OwedRegs`), since an in-memory list does not survive the restart that makes the leftover
+  register harmful in the first place. That persistence took a further round of its own,
+  because "I tried to save" is not durability: the obligation is added by a delivery
+  goroutine while the UNSUBSCRIBE that cancelled the delivery holds the record fence, so the
+  addition is refused its own save and can also be missed by a transaction that has already
+  marshalled its record. It is now tracked as a revision the record is known to carry and
+  retried at every convergence point, including the tail of the UNSUBSCRIBE; and an
+  obligation stays in the list until its delete is proven, because clearing the list first
+  lets a concurrent save persist a record that has forgotten it. A further round closed the
+  crash window on the other side of the same handoff: the cancelling UNSUBSCRIBE can persist
+  its removal and delete the consumer while the register's CAS is still on the wire, so the
+  cancellation is now recorded as a register **nonce** on the session record inside that
+  packet's own transaction — durable before the consumer goes. Keyed by nonce because the
+  cancellation frees the identifier for reuse and the drained source is re-offered under a
+  new one, so both of the obvious keys would eventually name a genuine later delivery.
+
+  Eight final rounds generalised that. The other consumer-teardown paths — a QoS
+  downgrade's deferred delete, a forced shared leave, a shared release — all run after
+  their packet's save, so a cancellation recorded on the session record could not be
+  durable in time; each now writes the cancellation tombstone itself, before the
+  consumer goes, and holds the identifier reserved until the store settles so nothing
+  else can take the subject. Because such a tombstone can outlive its owner, the next
+  allocation of that identifier reaps a cancelled occupant rather than refusing it. And
+  an ambiguous obligation save is resolved after the fence is released rather than
+  inside it (where resolution is simply refused), with the readback's not-landed verdict
+  re-saving under the resolver's own token: leaving that continuation empty is how a
+  proven-unlanded obligation ends up durable nowhere. And the cancellation is now
+  written by the transaction that removes the consumer's MEMBERSHIP, not by the teardown
+  that follows it: after that write there is no subscription left to redeliver through,
+  so a register that lands later strands its identifier whether or not the durable
+  survives — which is also why withholding the consumer delete was the wrong remedy and
+  is not what ships. The staging is preceded by the delivery barrier — the doomed
+  consumer's subscription is marked closed under the same lock — because a snapshot
+  taken while the callback is still live is only current, not complete, and the rollback
+  lifts the barrier again. Both halves of a multi-level filter stage through one helper,
+  since the level-up companion of a "foo/#" filter is a consumer in its own right and
+  its registrations could otherwise miss that write; and a barrier lowered for a filter
+  that then FAILS is lifted again with the rest of that filter, or the surviving QoS 1/2
+  subscription would silently stop delivering until the client reconnected. Finally the
+  teardown's own register removals became CONFIRMED and ordered before the consumer
+  delete, with an unproven one recorded as an owed sequence: fire-and-forget is safe
+  only while the source stays classifiable, which is exactly what deleting the consumer
+  ends. The last round replaced the unprovable part of that with a RULE: the same write
+  records the durable as abandoned, which nothing on the live path acts on and every
+  resume re-reads, so no delete request has to survive — and a durable the session holds
+  overrides the verdict, since shared group durables are named deterministically and a
+  rejoin must not inherit a leave's conclusion. It also fixed a panic on the way: the
+  cleanup helpers log on failure paths and a surviving disconnect's shared purge calls
+  them with no bound client. A last pass hardened the rule itself: it is withdrawn only
+  by a scan that finds no register naming the durable (the deletes are asynchronous),
+  and its live-durable override reads sharedSubs rather than Cons, since a shared
+  consumer is never persisted there and a restored rejoin would otherwise look
+  abandoned.
+
+  Two further review rounds hardened the lifecycle rather than the protocol, and their
+  findings are worth naming because each is a way for register ownership to be silently
+  dropped: a **drained** QoS 2 exchange now records its register's sequence in its own
+  persisted state and releases it in its finalizer (nothing else can, since its claim is
+  held until the PUBREL is proven), with the retry accepting both "already absent" answers
+  so a crash between delete and save cannot withhold completion forever; an UNSUBSCRIBE
+  racing a first-delivery register write **cancels** that allocation rather than skipping
+  it, records it as withheld so a rolled-back save keeps DUP=0, and its register removal is
+  confirmed, retried and kept as an obligation until proven; a consumer teardown releases
+  its **retired** sources, which are not in `cpending` at all; and where several registers
+  name one drained delivery — a superseded broker's second write — recovery fails closed
+  rather than releasing one and orphaning the rest. Resume also stopped reading
+  one-record-at-a-time: it enumerates subjects in one request and loads registers,
+  consumer info and source messages in bounded batches, because the barrier runs before the
+  CONNACK and a session may hold up to 65_535 identifiers. Batching had to be taught the
+  same distinction the serial path already made — only "no message found" proves absence,
+  and one shared classifier now enforces it for both batched paths.
+
+  `inflight_register_cluster_test.go` adds the case the item is actually about — a
+  client resuming on a **different** broker of a real R3 cluster, which has none of the
+  first one's memory, for QoS 1 and QoS 2 — plus an always-run assertion that
+  `$MQTT_inflight` really is `Replicas=3` and current on every node, without which
+  those two could pass against a single-replica stream and prove nothing about HA.
+
+  Sixty-eight mutations were run against the code and each fails its test: skipping the
+  recovery barrier, removing the register write, dropping the PUBREL reservation loop,
+  removing the source-completeness proof, reverting the retained-send predicate,
+  removing the `regPending` send fence, removing the teardown purge, making
+  `bumpPI` ignore the incomplete-space flag, deleting an unreadable register instead of
+  reserving its identifier, letting an unreadable register leave allocation enabled,
+  governing that restriction by installations rather than findings, dropping the
+  register-sequence exclusion from `dropUnredeliverableRetained`, converging duplicate
+  registers on the newest instead of failing closed, dropping the `clear()` reset,
+  dropping the source retirement on an unproven acknowledgement, keying that
+  retirement by identifier rather than by source, making the durable `Retired` mark a
+  no-op, having recovery ignore that mark, acknowledging a PUBREL away while its
+  retirement is unmarked, having recovery delete a register a surviving PUBREL still needs,
+  and dropping the withheld marker when abandoning a register.
+  Three tests were rewritten *because* a
+  mutation exposed them as vacuous: the restart tests originally used packet identifier
+  1, which a fresh allocator produces anyway; the completed-exchange test asserted
+  a silence that JetStream guarantees on its own; and the unproven-acknowledgement test
+  first scanned every consumer's correlation, so it passed on the PUBREL's own entry
+  while the SOURCE's was missing (and was then rewritten again when the mechanism moved
+  from the identifier to the source, and a third time when the retirement turned out to
+  be transient by design — the settling redelivery removes it — so asserting on it needed
+  the default AckWait rather than a shortened one, with the redelivery itself covered by
+  the restart test).
 - [ ] Audit the remaining `$MQTT_*` streams for protocol prerequisites, deriving
   each list from what that stream's owner actually does rather than copying
   `validateQoS2InStream` wholesale — the required set genuinely differs per stream.
@@ -519,6 +742,12 @@ is fixed before feature work continues.
   depends on: a stream-level `ConsumerLimits.InactiveThreshold` would reap a
   drained durable while its session is offline and take its started deliveries
   with it, so draining must refuse rather than degrade where one is set.
+  `$MQTT_inflight` needs nothing here: it ships with `validateInflightStream`, whose
+  list is derived from what its owner does (create-only CAS, per-subject singleton,
+  exact-sequence deletes, a per-incarnation filter purge — so unlike
+  `$MQTT_willcancel` it requires both deletion and purging) and which deliberately
+  omits `ConsumerLimits.InactiveThreshold`, since nothing ever creates a consumer on
+  it.
 
 ## 1. Settle release decisions
 

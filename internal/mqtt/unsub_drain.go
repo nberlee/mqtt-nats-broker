@@ -116,6 +116,16 @@ type mqttPersistedDrainSeq struct {
 	PubRel  bool   `json:"pubrel,omitempty"`
 	PI      uint16 `json:"pi,omitempty"`
 	Attempt uint64 `json:"attempt,omitempty"`
+	// RegSeq is the exact sequence of this delivery's outbound in-flight register on
+	// $MQTT_inflight, so the drain can RELEASE it when the exchange completes. Without
+	// it the register outlives the drain's consumer, and the next resume — finding a
+	// register whose consumer is gone — reserves its identifier indefinitely, which under
+	// a Receive Maximum of 1 stops the session delivering anything at all.
+	//
+	// Optional: a record written before this field existed carries none, and the resume
+	// barrier repairs it from the register scan rather than treating it as "no register".
+	// See inflight_register.go.
+	RegSeq uint64 `json:"reg_seq,omitempty"`
 }
 
 // drainSeq is the in-memory state of one drained sequence.
@@ -149,6 +159,9 @@ type drainSeq struct {
 	// ack is the latest JetStream ack subject seen for this sequence, so a
 	// finalize can ack the delivery that is actually outstanding.
 	ack string
+	// regSeq is this delivery's in-flight register (see mqttPersistedDrainSeq.RegSeq).
+	// The drain owns it from staging until the exchange completes, and releases it there.
+	regSeq uint64
 }
 
 // mqttDrain is a draining consumer in memory.
@@ -170,6 +183,13 @@ type mqttDrain struct {
 	// never charged, matching restored consumers.
 	charged bool
 
+	// cancelled names the sequences whose in-flight registration this staging cancelled,
+	// each with the withheld marker installed for it. A ROLLBACK keeps those markers, so a
+	// later first transmission still carries DUP=0; a COMMIT drops them, because the
+	// consumer is gone by then and nothing will ever re-offer the sequence. Staging state
+	// only, never persisted.
+	cancelled map[mqttDeferredKey]string
+
 	// seqs is the ONE map of per-sequence state. There is deliberately no second
 	// "finalizing" map to fall out of sync with it.
 	seqs map[uint64]*drainSeq
@@ -188,7 +208,7 @@ func (d *mqttDrain) startedSeqs() []mqttPersistedDrainSeq {
 			continue
 		}
 		out = append(out, mqttPersistedDrainSeq{
-			Seq: seq, PubRel: st.intent, PI: st.pi, Attempt: st.attempt,
+			Seq: seq, PubRel: st.intent, PI: st.pi, Attempt: st.attempt, RegSeq: st.regSeq,
 		})
 	}
 	if len(out) == 0 {
@@ -250,7 +270,9 @@ func mqttDrainFromPersisted(pd *mqttPersistedDrain) *mqttDrain {
 		}
 		// The INTENT is what says this exchange is past PUBREC — never the mere
 		// presence of a packet identifier, which a PUBLISH-phase delivery also has.
-		d.seqs[s.Seq] = &drainSeq{claimed: true, intent: s.owesPubRel(), pi: s.PI, attempt: s.Attempt}
+		d.seqs[s.Seq] = &drainSeq{
+			claimed: true, intent: s.owesPubRel(), pi: s.PI, attempt: s.Attempt, regSeq: s.RegSeq,
+		}
 	}
 	return d
 }
@@ -301,10 +323,50 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	}
 	// The started set is exactly the durable's pending deliveries: each is a
 	// sequence that was put on the wire and has not been acknowledged.
+	//
+	// cancelled collects the sequences whose registration was still in flight, with the
+	// ack subject each was last offered on, so their withheld markers can be (re)installed
+	// AFTER the I5 drop below rather than being deleted by it.
+	cancelled := map[mqttDeferredKey]string{}
 	for sseq, pi := range seqPis {
+		ack := sess.pendingPublish[pi]
+		if ack != nil && ack.regPending {
+			// Allocated, but its in-flight register is not yet confirmed, so it has NOT
+			// been transmitted (R1, inflight_register.go). [MQTT-3.10.4-3] covers started
+			// deliveries only — the same rule as the withheld ones below.
+			//
+			// CANCELLED, not merely skipped. Skipping leaves the entry in place, and the
+			// delivery callback still waiting in storeInflightRegister would then confirm
+			// its CAS and enqueue the PUBLISH — after this UNSUBSCRIBE has committed and
+			// purged the consumer and its tracking, leaving the client holding an exchange
+			// nothing on this side remembers. Removing the entry hands the decision to
+			// that callback's own ownership revalidation: confirmInflightRegister finds no
+			// entry, deletes the register it just wrote and refuses the send.
+			//
+			// It is also recorded as WITHHELD, below, which keeps the DUP flag honest if
+			// this staging is rolled back: nothing was transmitted, so the eventual first
+			// transmission must carry DUP=0 ([MQTT-3.3.1-1]) — but its redelivery arrives
+			// with a JetStream delivery count above one, and trackPublish derives dup from
+			// that count unless the sequence is known to have been withheld. Exactly the
+			// state, and the marker, that a delivery withheld at the in-flight cap has.
+			cancelled[mqttDeferredKey{cc.Durable, sseq}] = ack.jsAckSubject
+			// The cancellation is recorded DURABLY too, keyed by the allocation's nonce.
+			// The handoff above is in-memory only, and this packet is about to persist its
+			// removal and delete the consumer while that store may still be on the wire: if
+			// the CAS lands and this broker dies before the confirmation runs, nothing
+			// written anywhere says the delivery was never transmitted. Being inside this
+			// packet's own record transaction is what makes it durable before the consumer
+			// goes. See cancelRegPendingLocked.
+			sess.cancelRegPendingLocked(ack)
+			sess.untrackPublishEntry(pi)
+			continue
+		}
 		d.seqs[sseq] = &drainSeq{claimed: true, pi: pi}
-		if ack := sess.pendingPublish[pi]; ack != nil {
+		if ack != nil {
 			d.seqs[sseq].ack = ack.jsAckSubject
+			// The register of a transmitted delivery, so the drain can release it when
+			// the exchange completes (finding 1 below).
+			d.seqs[sseq].regSeq = ack.regSeq
 		}
 	}
 	// Withheld deliveries were never transmitted, so [MQTT-3.10.4-3] does not
@@ -314,6 +376,28 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			delete(sess.deferred, k)
 		}
 	}
+	// The cancelled registrations go in AFTER that drop, which is why they were collected
+	// rather than recorded in place. They are withheld in exactly the I5 sense — never
+	// transmitted — and the marker is what makes their eventual first transmission carry
+	// DUP=0 if this staging is rolled back. A COMMITTED teardown drops them again, in
+	// commitDrains for a staged drain and in purgeConsumerPendingLocked otherwise, since
+	// the consumer is gone by then and nothing will ever re-offer the sequence.
+	//
+	// BEFORE the "nothing staged" return below, not after: when every entry was cancelled
+	// there is no drain to stage, but the DUP rule is unchanged.
+	for k, ackSubject := range cancelled {
+		if ackSubject == _EMPTY_ {
+			continue // nothing to NAK, and an empty subject must never reach sendMsg
+		}
+		if sess.deferred == nil {
+			sess.deferred = make(map[mqttDeferredKey]string)
+		}
+		sess.deferred[k] = ackSubject
+	}
+	if len(d.seqs) == 0 {
+		return false // nothing provably started; ordinary teardown
+	}
+	d.cancelled = cancelled
 
 	if sess.drains == nil {
 		sess.drains = make(map[string]*mqttDrain)
@@ -342,6 +426,13 @@ func (sess *mqttSession) commitDrains() []*mqttDrain {
 			continue
 		}
 		d.staged = false
+		// The teardown is committed, so the cancelled sequences' consumer is gone and
+		// nothing will ever re-offer them: their withheld markers have no first transmission
+		// left to protect and would otherwise linger. Only a rollback keeps them.
+		for k := range d.cancelled {
+			delete(sess.deferred, k)
+		}
+		d.cancelled = nil
 		if d.cc != nil && d.cc.InactiveThreshold != 0 {
 			timed = append(timed, d)
 		}
@@ -510,8 +601,40 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	if ackSubject != _EMPTY_ {
 		st.ack = ackSubject
 	}
-	ack := st.ack
+	ack, regSeq := st.ack, st.regSeq
 	sess.mu.Unlock()
+
+	// Release this delivery's in-flight register FIRST, and confirm it. The drain owns
+	// that register from staging (stageDrain) until here, because the ordinary
+	// terminal-path delete cannot run for a drained QoS 2 source: its claim is held until
+	// the PUBREL is proven, so nothing else reaches this point. Left behind, the register
+	// outlives the drain consumer that finishDrainIfEmpty deletes below, and the next
+	// resume — finding a register whose consumer is gone, which is deliberately NOT read
+	// as "complete" — reserves its identifier for the life of the session. Under a Receive
+	// Maximum of 1 that stops the session receiving anything at all.
+	//
+	// Before the claim removal, the source ack and the PUBREL forward, for the reason every
+	// ordering here has: an unconfirmed delete followed by a completed exchange is exactly
+	// the state that leaves a phantom behind. A failure withholds the whole finalize, so
+	// the next redelivery retries it — nothing is acked and nothing is lost.
+	if regSeq != 0 && sess.asm != nil {
+		// The CONFIRMED helper, which retries a genuine failure and treats an
+		// already-absent sequence as SUCCESS. That second part is load-bearing: if the
+		// delete lands and this broker dies before persisting the claim removal, recovery
+		// restores the record's old reg_seq with no register left to repair it from, and a
+		// retry that read "sequence not found" as a failure would withhold this exchange's
+		// completion forever.
+		if err := sess.asm.deleteInflightRegisterConfirmed(regSeq); err != nil {
+			c.Warnf("MQTT: withholding the completion of drained sequence %d for client %q: "+
+				"its in-flight register could not be released: %v", sseq, sess.id, err)
+			return true
+		}
+		sess.mu.Lock()
+		if cur := d.seqs[sseq]; cur != nil {
+			cur.regSeq = 0 // released; a retry must not delete a sequence again
+		}
+		sess.mu.Unlock()
+	}
 
 	tok, ok := sess.tryBeginRecordTx()
 	if !ok {
@@ -1284,6 +1407,56 @@ var (
 // Returns the set of durables whose source subscriptions must be skipped.
 //
 // No lock held on entry. The PUBREL path must already be ready.
+// mqttStoredPubRel is one PUBREL record found on a session's PUBREL subject: its
+// stream sequence, the packet identifier it will be re-sent under, and the source
+// delivery it completes (correlated records only — an uncorrelated one carries no
+// source and srcDur is empty).
+type mqttStoredPubRel struct {
+	seq    uint64
+	pi     uint16
+	srcDur string
+	srcSeq uint64
+}
+
+// mqttPubRelSourceKey keys a source delivery for the indexes built over these
+// records.
+func mqttPubRelSourceKey(dur string, seq uint64) string {
+	return dur + "/" + strconv.FormatUint(seq, 10)
+}
+
+// scanPubRelRecords lists every PUBREL record still on one session incarnation's
+// PUBREL subject. They are unacked by construction — an acked one is removed from the
+// interest-retained $MQTT_out — so each is an exchange past PUBREC and not yet
+// complete.
+//
+// Shared by the drain's past-PUBREC barrier and by the in-flight register recovery,
+// which need the same walk for different questions: "does the PUBREL this intent
+// promised exist?" and "which packet identifiers are already owned by a PUBREL rather
+// than by a register?". ok is false when the walk could not be completed, and a
+// partial walk is NEVER evidence of absence for either caller.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) scanPubRelRecords(pubRelSubject string) (records []mqttStoredPubRel, ok bool) {
+	if pubRelSubject == _EMPTY_ {
+		return nil, true
+	}
+	for seq := uint64(1); ; {
+		smsg, err := sess.jsa.loadNextMsgFromSeq(mqttOutStreamName, pubRelSubject, seq)
+		if err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				return records, false
+			}
+			return records, true
+		}
+		seq = smsg.Sequence + 1
+		r := mqttStoredPubRel{seq: smsg.Sequence, pi: mqttParsePubRelNATSHeader(smsg.Header)}
+		if corr := mqttParsePubRelCorrelation(smsg.Header); corr.Ok {
+			r.srcDur, r.srcSeq = corr.SrcDur, corr.SrcSeq
+		}
+		records = append(records, r)
+	}
+}
+
 func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 	sess.mu.Lock()
 	type claim struct {
@@ -1316,22 +1489,14 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 
 	// Index every PUBREL record still on this session's subject by the source it
 	// names. An unreadable scan is never evidence of absence.
-	found := make(map[string]uint64)
-	key := func(dur string, seq uint64) string { return dur + "/" + strconv.FormatUint(seq, 10) }
-	scanned := true
-	for seq := uint64(1); ; {
-		smsg, err := sess.jsa.loadNextMsgFromSeq(mqttOutStreamName, pubRelSubject, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				c.Errorf("MQTT: unable to scan the PUBREL records of client %q: %v", sess.id, err)
-				scanned = false
-			}
-			break
-		}
-		seq = smsg.Sequence + 1
-		if corr := mqttParsePubRelCorrelation(smsg.Header); corr.Ok {
-			found[key(corr.SrcDur, corr.SrcSeq)] = smsg.Sequence
-		}
+	records, scanned := sess.scanPubRelRecords(pubRelSubject)
+	if !scanned {
+		c.Errorf("MQTT: unable to scan the PUBREL records of client %q", sess.id)
+	}
+	found := make(map[string]uint64, len(records))
+	key := mqttPubRelSourceKey
+	for _, r := range records {
+		found[key(r.srcDur, r.srcSeq)] = r.seq
 	}
 
 	skip := make(map[string]bool)

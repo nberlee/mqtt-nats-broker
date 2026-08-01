@@ -4699,14 +4699,23 @@ func TestMQTTSessionDropUnredeliverableRetained(t *testing.T) {
 		pendingPublish: map[uint16]*mqttPending{
 			1: {jsDur: "d", sseq: 10, jsAckSubject: "$JS.ACK.x"},
 			2: {}, // retained, no backing
+			// Recovered from a durable in-flight register: no per-attempt ack subject
+			// YET, but a real JetStream-backed delivery whose identifier must survive.
+			// An empty ack subject alone is therefore not the test — dropping this
+			// would undo the resume barrier on the next reconnect. See
+			// inflight_register.go.
+			3: {jsDur: "d", sseq: 11, regSeq: 7, regNonce: "n"},
 		},
 	}
 	sess.dropUnredeliverableRetained()
 	if _, ok := sess.pendingPublish[2]; ok {
-		t.Fatal("expected retained entry (empty jsAckSubject) to be dropped")
+		t.Fatal("expected retained entry (no ack subject, no durable) to be dropped")
 	}
 	if _, ok := sess.pendingPublish[1]; !ok {
 		t.Fatal("expected JS-backed entry to be kept")
+	}
+	if _, ok := sess.pendingPublish[3]; !ok {
+		t.Fatal("expected an entry recovered from an in-flight register to be kept")
 	}
 }
 
@@ -4720,14 +4729,26 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 	sess := &mqttSession{maxp: 10}
 	const dur = "S_C"
 	// $JS.ACK.<stream>.<consumer>.<deliveries>.<streamseq>.<consumerseq>.<ts>.<pending>
-	pi1, dup1, started1 := sess.trackPublish(dur, "$JS.ACK.S.C.1.100.1.0.0")
-	if pi1 == 0 || dup1 || started1 {
-		t.Fatalf("first delivery: pi=%d dup=%v started=%v", pi1, dup1, started1)
+	pi1, dup1, started1, isNew1 := sess.trackPublish(dur, "$JS.ACK.S.C.1.100.1.0.0")
+	if pi1 == 0 || dup1 || started1 || !isNew1 {
+		t.Fatalf("first delivery: pi=%d dup=%v started=%v isNew=%v", pi1, dup1, started1, isNew1)
 	}
+	// A newly allocated identifier is regPending until its in-flight register is
+	// confirmed, and nothing may send under it meanwhile (R1,
+	// inflight_register.go) — including a redelivery of the very same sequence.
+	if !sess.pendingPublish[pi1].regPending {
+		t.Fatalf("a newly allocated identifier must be regPending")
+	}
+	if pi, _, _, _ := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0"); pi != 0 {
+		t.Fatalf("redelivery of an unconfirmed allocation: pi=%d (want 0)", pi)
+	}
+	// Confirm the register, as storeInflightRegister does.
+	sess.pendingPublish[pi1].regPending = false
+
 	// Redelivery of the same stream sequence (deliveries=2).
-	pi2, dup2, started2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0")
-	if pi2 != pi1 || !dup2 || !started2 {
-		t.Fatalf("redelivery: pi=%d (want %d) dup=%v started=%v", pi2, pi1, dup2, started2)
+	pi2, dup2, started2, isNew2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0")
+	if pi2 != pi1 || !dup2 || !started2 || isNew2 {
+		t.Fatalf("redelivery: pi=%d (want %d) dup=%v started=%v isNew=%v", pi2, pi1, dup2, started2, isNew2)
 	}
 }
 

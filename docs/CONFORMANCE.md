@@ -214,18 +214,12 @@ that occurred before the record vanished and that no broker had yet recorded. A
 discarded assignment is itself retained until the source is proven closed, so
 reaping it can never let a redelivery elect a second winner.
 
-Two deviations remain.
+One deviation remains.
 
-**Packet-identifier continuity across a broker restart or failover.** A
-same-process reconnect reuses the original packet identifier. After a broker
-restart, a failover, or a resume on a different broker, the started delivery is
-re-offered to the *same session* with DUP set but a **freshly allocated**
-identifier, because outbound in-flight identifiers are held in memory only. A
-strict client may treat that as a new message, so the exchange is exactly-once
-only within one broker process. The message is never lost and never
-redistributed; only the identifier is not continuous. Removing this needs durable
-outbound in-flight identity for **all** QoS 1/2 paths, which is a separate
-roadmap item — this is not specific to shared subscriptions.
+Packet-identifier continuity across a broker restart or failover is **no longer** a
+deviation, here or on any other outbound path: a started delivery's identifier is
+durable and is restored before the redelivery. See "Outbound in-flight identifiers"
+below.
 
 **Mixed-version operation.** The storage schema is rolling-compatible: an older
 broker simply ignores the new stream and the new session-record fields. The
@@ -284,10 +278,6 @@ Residuals:
   PUBREL has been delivered, or found present at its sequence by the resume
   barrier. The cost is one redelivery of the source in the rare case where the
   store landed but its delivery did not; the alternative is losing the message.
-- **Packet-identifier continuity** across a restart or failover, as for every
-  QoS 1/2 path: a drained delivery is re-offered with DUP set and a freshly
-  allocated identifier. Past the QoS 2 PUBREC intent the exchange does complete
-  under its **original** identifier, even across a failover.
 - **Mixed-version operation.** An older broker ignores the `Drains` record field,
   so its orphan sweep can delete a drained durable and lose its started messages.
   Same class as the affine residual above.
@@ -297,6 +287,71 @@ Residuals:
 The QoS 1/2 → QoS 0 re-SUBSCRIBE downgrade is out of scope — it replaces a
 subscription rather than removing one — and shared-subscription QoS 1
 redistribution to another member remains permitted.
+
+### Outbound in-flight identifiers survive a restart and a failover
+
+An unacknowledged outbound QoS 1/2 delivery is re-offered under its **original**
+packet identifier after a broker restart, a failover, or a resume on a different
+broker — not only on a same-process reconnect. [MQTT-4.4.0-1] requires exactly that,
+for PUBLISH and PUBREL alike, and it now holds on every outbound path: plain
+subscriptions, shared-subscription QoS 2, and drained filters.
+
+The identity is durable. A started PUBLISH-phase delivery has an **in-flight
+register** on `$MQTT_inflight` naming its packet identifier and source delivery, and
+the PUBLISH is not transmitted until that record is confirmed; past PUBREC the
+correlated PUBREL record owns the identifier, as it already did. On resume both are
+read back before any source interest exists, so the redelivery reuses the identifier
+the client is holding and a fresh allocation can never collide with one. See
+"Outbound in-flight registers" in `docs/ARCHITECTURE.md`.
+
+What this closes, beyond the deviation itself: an allocation could previously mint an
+identifier that an unreplayed PUBREL record still owned, because the in-memory PUBREL
+map was empty until that record was delivered.
+
+Residuals:
+
+- **Retained-message deliveries are not covered.** A retained QoS 1/2 send has no
+  JetStream backing at all, so it has no register and cannot be redelivered after a
+  restart in the first place; it is released on resume rather than kept (which is
+  unchanged, and is what stops it leaking a Receive Maximum slot).
+- **Promptness, not continuity, still depends on the reconnect being same-process.**
+  The identifier is restored either way, but the immediate NAK-driven redelivery needs
+  a live per-attempt JetStream ack subject, which a recovered entry does not have — so
+  after a restart the redelivery waits out `AckWait`.
+- **An unaccountable identifier space withholds new QoS 1/2 deliveries rather than
+  refusing the session.** If the durable identifier space cannot be fully accounted for
+  on resume — the walk failed, a register's body is corrupt, or two registers name one
+  delivery on different identifiers — the session stops allocating identifiers until a
+  later resume reads it cleanly: QoS 0 keeps flowing and reserved exchanges complete,
+  but new QoS 1/2 deliveries are withheld and redelivered by AckWait. This is a
+  deliberate choice over denying the CONNECT, and over letting a redelivery proceed
+  under an identifier that cannot be proven to be the one the client holds. A session
+  discard lifts it, since the identifier space it protected is retired with the
+  incarnation.
+- **A source acknowledgement that cannot be confirmed costs one discarded
+  redelivery.** On the QoS 2 PUBREC path the source ack is confirmed; if that
+  confirmation fails the source is *retired* — left unacknowledged on purpose, so
+  JetStream re-offers it once more, and that attempt is acknowledged and discarded rather
+  than delivered. The client never sees the payload twice: not before its PUBCOMP, not
+  after it, and not after a broker restart, because the retirement is recorded on the
+  in-flight register as well as in memory. If that record cannot be written, the
+  exchange's PUBREL is **not** acknowledged away — while it survives, recovery reads it as
+  proof the exchange is past PUBREC and writes the mark itself — so the protection does
+  not degrade to best-effort; the cost is a legitimate PUBREL redelivery until the mark
+  lands. The retirement is released when the source's acknowledgement is confirmed, so it
+  is bounded by failures rather than by traffic.
+- **A delivery lost out of band keeps its identifier reserved.** If the consumer
+  behind a started delivery is destroyed externally, the delivery was lost rather than
+  completed and the client may still hold its identifier, so the identifier is not
+  reclaimed for the life of the session. The same applies to a register whose body
+  cannot be read: its subject still names the identifier, so that identifier is
+  reserved and the record kept. Either way it costs one reserved identifier and one
+  Receive Maximum slot — the safe direction, since reusing it would put a second
+  message on an identifier the client still has in use.
+- **Mixed-version operation.** As with the affine and teardown protocols: an older
+  broker never reads `$MQTT_inflight`, so it re-offers a started delivery under a
+  fresh identifier and its orphan sweep does not know the stream. Continuity holds
+  once every broker serving the account understands it.
 
 ### Session teardown: arbitrated across brokers, with two upgrade-window residuals
 

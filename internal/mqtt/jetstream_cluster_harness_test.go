@@ -328,7 +328,8 @@ func (c *testJetStreamCluster) stopNode(n *testJSClusterNode) {
 // terminal commit never landed" is a symptom of a $MQTT_qos2in one, and neither
 // can be told apart from a plain timeout without this.
 func (c *testJetStreamCluster) describe() string {
-	streams := []string{mqttWillQStreamName, mqttWillCancelStreamName, mqttStreamName, mqttQoS2IncomingMsgsStreamName}
+	streams := []string{mqttWillQStreamName, mqttWillCancelStreamName, mqttStreamName,
+		mqttQoS2IncomingMsgsStreamName, mqttInflightStreamName}
 	var b strings.Builder
 	fmt.Fprintf(&b, "cluster %q:", c.name)
 	for _, n := range c.nodes {

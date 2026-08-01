@@ -280,6 +280,26 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 			return fmt.Errorf("unable to arbitrate the inbound QoS2 releases of session %q: %w", t.id, err)
 		}
 	}
+
+	// Destroy this incarnation's OUTBOUND in-flight registers ($MQTT_inflight,
+	// subject "$MQTT.inflight.<idHash>.<gen>.<PI>"). The session is being discarded,
+	// so every identifier it was holding is void: Spec5 [4.1] makes an unacknowledged
+	// outbound QoS 1/2 delivery session state, and a discard destroys it rather than
+	// carrying it into whatever session next uses this client ID.
+	//
+	// A blind filter purge is CORRECT here, and the contrast with the arbitrated hold
+	// walk above is the point. A register has no second party: nothing else claims it,
+	// waits on it, or reads it as proof — it is one session's private note about its
+	// own identifier space, whereas a hold record is a payload another broker's
+	// releaser may still be committed to delivering. And the filter names the RETIRING
+	// generation, which clear() re-mints before this runs, so even a badly delayed
+	// purge can only name subjects no live session can ever occupy.
+	if t.idHash != _EMPTY_ && t.gen != _EMPTY_ {
+		filter := mqttInflightWalkFilter(t.idHash, t.gen)
+		if err := sess.jsa.purgeStream(mqttInflightStreamName, filter, noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
+			return fmt.Errorf("unable to purge the outbound in-flight registers of session %q: %v", t.id, err)
+		}
+	}
 	return nil
 }
 

@@ -2207,7 +2207,7 @@ func TestMQTTTrackPendingOverrun(t *testing.T) {
 	for i := 1; i <= 0xFFFF; i++ {
 		sess.pendingPublish[uint16(i)] = p
 	}
-	pi, _, _ = sess.trackPublish("test", "test")
+	pi, _, _, _ = sess.trackPublish("test", "test")
 	if pi != 0 {
 		t.Fatalf("Expected 0, got %v", pi)
 	}

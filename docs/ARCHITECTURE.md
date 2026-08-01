@@ -184,6 +184,7 @@ NATS traffic on those subjects:
 | `$MQTT.willq.*`, `$MQTT.willcancel.*` | delayed-Will outbox and cancel watermarks |
 | `$MQTT.qos2.in.<hash>.<gen>.<pi>[.rel]`, `$MQTT.out.*` | inbound QoS 2 move state and its release claim, outbound PUBREL state, and session-affine shared QoS 2 copies |
 | `$MQTT.qos2.assign.<group-durable>.<seq>` | shared-subscription QoS 2 assignment claims |
+| `$MQTT.inflight.<hash>.<gen>.<pi>` | outbound in-flight registers: the durable identity of a started QoS 1/2 delivery |
 | `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.deliver.q2.*`, `$MQTT.qsub.*` | per-client delivery subjects |
 
 Anything able to read `$MQTT.msgs.>` reads every QoS 1/2 message in the account,
@@ -466,6 +467,291 @@ so a superseded broker's late store collapses into it; the ordinary path
 deliberately carries none, because there the only legitimate re-store is the
 post-restart one after a redelivery, and a surviving dedupe entry would silently
 swallow it.
+
+## Outbound in-flight registers
+
+`pendingPublish`, `pendingPubRel`, `cpending` and the packet-identifier allocator
+were memory-only. A same-process reconnect therefore re-sent a started QoS 1/2
+delivery under its original packet identifier, but a broker restart, a failover, or a
+resume on another broker did not: the tracking maps came back empty, the delivery
+looked unstarted, and the redelivery went out with DUP set under a **freshly
+allocated** identifier — which a client is entitled to read as a new message.
+[MQTT-4.4.0-1] requires both sides to re-send unacknowledged PUBLISH *and* PUBREL
+packets under their **original** identifiers, so this bounded the broker's
+exactly-once guarantee to one process lifetime, for QoS 1 as much as QoS 2.
+
+An **in-flight register** supplies the missing durable fact
+(`internal/mqtt/inflight_register.go`): one small record per started PUBLISH-phase
+delivery on `$MQTT_inflight`, at `$MQTT.inflight.<idHash>.<gen>.<PI>`, naming the
+source durable and stream sequence it came from. Keyed by the identifier, so the
+create-only CAS is an allocation arbitration as well as a record, and so one
+incarnation is bounded at 65 535 subjects — the same bound, for the same paging
+reason, as the inbound hold walk. The record carries an immutable nonce, because the
+subject is reused by later exchanges on the same identifier and a stream sequence is
+therefore not an identity.
+
+It is a stream of its own for two reasons that are not preferences: `$MQTT_out` is
+interest-retained, so a store with no consumer succeeds and keeps nothing, and a
+register has no consumer by design; and a per-delivery write to the session record
+would put every outbound QoS 1/2 message behind the record CAS and the record fence.
+
+| phase | who owns the identifier |
+|---|---|
+| PUBLISH sent, not yet acknowledged | the in-flight register |
+| past PUBREC | the correlated PUBREL record on `$MQTT_out` (unchanged) |
+
+The handoff is the PUBREL store. On that path the source acknowledgement is
+**confirmed** before the register is deleted — the standing rule wherever a durable
+record is deleted on the strength of an ack — which keeps the register from being
+removed over a source that was never actually released, and so keeps the redelivery's
+identifier. Where a register and a PUBREL record name the same source at recovery,
+the PUBREL record wins.
+
+An acknowledgement that cannot be confirmed needs one more thing. The source may still
+be pending, so JetStream will re-offer it — and its payload is past PUBREC, so sending
+it again is a duplicate. The source is therefore **retired**: the next delivery attempt
+of it is acknowledged (with confirmation, under that attempt's own reply subject) and
+discarded rather than delivered, which both suppresses the duplicate and settles the
+message.
+
+The fact is recorded against the **source**, not against the packet identifier, and that
+distinction is the whole design. Re-establishing the source's link to its identifier
+would make the ordinary in-flight guard suppress the redelivery — but only until
+PUBCOMP, because PUBCOMP removes the pending-PUBREL entry that guard tests. From then on
+the payload of an exchange the client has already *completed* would simply be re-sent. A
+fact about the source outlives the identifier's bookkeeping; this is the same shape the
+affine path already uses (its claim's `AffineDone`) and for the same reason.
+
+It is recorded in **both** places, in that order: in memory first, because the PUBREL
+whose delivery is already in flight can bring a redelivery at any moment and the
+suppression has to be in place before this path spends a round trip; then on the
+register, as a `Retired` mark written by a CAS at its exact sequence. The durable half is
+not optional. Without it the next resume sees an ordinary PUBLISH-phase register over a
+still-live source — indistinguishable from a delivery that never reached PUBREC — and
+re-sends a payload the client has already completed. Leaving the source deliberately
+unacknowledged is precisely what makes that window reachable.
+
+That mark is not best-effort either, and the reason is worth following. While the
+exchange's **PUBREL record** exists a restart is safe whatever the register says, because
+recovery reads register-plus-PUBREL as "past PUBREC" — and converts it into the mark it
+could not write earlier. So there are two pieces of durable evidence, and the rule is
+simply that the second is not destroyed before the first exists: a PUBCOMP does **not**
+acknowledge its PUBREL away while the retirement it covers is not durably recorded. The
+cost of withholding is a PUBREL redelivery, which [MQTT-4.4.0-1] makes legitimate and
+which the client answers with another PUBCOMP — bringing the broker back to retry, paced
+by AckWait. Persist before ack, the same rule the UNSUBSCRIBE drain follows.
+
+The source is left unacknowledged at PUBREC rather than retried best-effort: a retry that
+landed would settle the message but strand its retirement, since nothing else would drain
+it. One discarded redelivery settles the source, releases the retirement, and deletes the
+register.
+
+The invariants, in the order they matter:
+
+- **Persist before send.** A PUBLISH under a new identifier goes on the wire only
+  after its register is confirmed at a sequence. Between allocation and confirmation
+  the entry is *unsendable by anyone*: a concurrent redelivery declines it, the resume
+  NAK path skips it, and an UNSUBSCRIBE drain does not enrol it. A definite store
+  failure releases the identifier and sends nothing, which is safe precisely because
+  nothing could have sent it. An ambiguous store is resolved by re-reading the subject
+  and matching the nonce, never by the shape of the response. This is also what makes
+  a superseded broker's late register write inert: an identifier the client can be
+  holding implies a confirmed register, so it implies the next broker's scan sees it.
+- **Reserve before interest.** On resume every identifier named by a register or by a
+  PUBREL record is reserved *before* any source interest exists — the barrier runs
+  ahead of the CONNACK, both because a client may publish the instant its CONNACK
+  lands and because the drain barrier stores PUBRELs under recorded identifiers that
+  must already be reserved. This also closes a pre-existing hazard: `pendingPubRel`
+  was empty until the PUBREL callback replayed a record, so a fresh allocation could
+  mint an identifier an unreplayed PUBREL still owned.
+- **An incomplete identifier space withholds allocation, not the connection.** The
+  session stops *allocating* new identifiers while everything else keeps working:
+  QoS 0 flows, reserved exchanges complete, and drained PUBRELs are still recreated
+  under their recorded identifiers. Allocation is the only operation an unknown space
+  makes unsafe, and a withheld QoS 1/2 delivery is redelivered by AckWait exactly as
+  one withheld at the in-flight cap is. Denying the CONNECT was rejected: it takes a
+  whole session offline over a transient failure, and it contradicts the drain
+  barrier's contract. Three conditions trigger it, and they are one condition in
+  different clothes — the identifier space cannot be fully accounted for: a walk that
+  could not complete (identifiers may be in use that were never seen); a register whose
+  body is unreadable (the identifier is known, the delivery that owns it is not); and
+  two registers naming one source on different identifiers (both identifiers are known,
+  but which one the client holds is not, because a stream sequence orders the *writes*
+  and not the sends). In each case reserving identifiers is necessary but not
+  sufficient — what stays dangerous is issuing a new one, or re-sending a source under
+  a guess. A session discard lifts the restriction along with the incarnation whose
+  space it protected.
+- **Absence is proven, not inferred.** A register is dropped only where its source is
+  provably finished — acknowledged, or authoritatively absent while the consumer that
+  would have delivered it still exists. A source whose *consumer* is gone is not
+  "complete": that delivery was lost rather than finished, and the client may still
+  hold its identifier, so the identifier stays reserved. The same rule covers a record
+  whose *body* is unreadable: its subject still names an identifier this incarnation
+  wrote, so the identifier is reserved and the record kept, rather than deleted as
+  uninterpretable. Reading "I cannot interpret this" as "nothing is in flight" is how
+  an identifier the client is holding gets handed to a second message — and because
+  such a record's *source* cannot be identified either, it additionally makes the
+  identifier space incomplete (above).
+- **Every terminal path deletes the register**, at its exact sequence: PUBACK, a
+  failed PUBREC, the PUBREL store, Message Expiry, Maximum Packet Size, and every
+  consumer teardown that abandons started deliveries. A failed delete costs a stale
+  record that the store path's reconcile, the next resume scan, or the orphan sweep
+  removes; it never wedges an identifier.
+- **A surviving register is assumed client-held unless it proves otherwise.** Two very
+  different things can leave a register behind: a delivery that really went out and whose
+  consumer was later destroyed, and one whose allocation was withdrawn before it was ever
+  sent. The first must keep both its identifier and its Receive Maximum slot — that limit
+  bounds what the *client* is holding unacknowledged, and a consumer disappearing proves
+  nothing about the client — so a session stuck this way is a lost message being reported
+  honestly, not an accounting bug. The second must keep neither. Since a confirmed register
+  otherwise means "about to be sent", the only thing that can tell them apart is a durable
+  **cancellation tombstone**, written on the record when its deletion could not be proven;
+  recovery then frees that identifier outright. And where neither the deletion nor the
+  tombstone can be written — one JetStream outage covers both — the obligation is persisted
+  with the session record rather than held in memory, because a restart would otherwise
+  lose it and leave exactly the register it was meant to remove. Two things about that
+  persistence are easy to get subtly wrong, and both were. Attempting the record write is
+  not the same as landing it: the writer is a delivery goroutine, the UNSUBSCRIBE that
+  cancelled the delivery holds the record fence, and that transaction may already have
+  marshalled its record — so the addition is refused its own save *and* missed by the save
+  that does happen. Durability is therefore tracked as a revision the record is known to
+  carry, and every convergence point (each later register store, each resume, and the tail
+  of the UNSUBSCRIBE itself) retries until the two agree. And an obligation stays visible
+  in the list until its delete is **proven**: emptying the list first and putting the failures
+  back afterwards lets any save falling in that window persist a record with no obligations
+  in it, leaving the entry that comes back in memory only.
+- **The cancellation is durable one step before its sequence exists.** The in-memory
+  handoff covers everything except a crash: the cancelling UNSUBSCRIBE persists its
+  removal and deletes the consumer while the register's CAS may still be on the wire, so
+  if that write lands and the broker dies before its confirmation runs, no tombstone and
+  no owed sequence was ever written — and recovery then finds an ordinary register whose
+  consumer is gone. So the cancellation is also recorded as a **nonce** on the session
+  record, inside the UNSUBSCRIBE's own transaction, which is what makes it durable
+  before the consumer goes. It is keyed by nonce and not by packet identifier or by
+  source because the cancellation frees the identifier for immediate reuse and a drained
+  source is re-offered under a new one: either would eventually name a genuine later
+  delivery and read it as never transmitted. The nonce is minted with the allocation for
+  exactly this reason, one step ahead of the store that writes it. Recovery treats such
+  a register as a tombstoned one, deletes it with proof, and releases the intent only
+  against that proof — restating it as an owed sequence when the delete fails, since one
+  mutation must never leave the record holding neither.
+- **A consumer teardown writes the tombstone itself, and holds the identifier while it
+  does.** The session record is the wrong home for this fact on the generic teardown
+  paths (a QoS downgrade's deferred consumer delete, a forced shared leave, a shared
+  release): each runs AFTER its packet's save, so an intent recorded there may not reach
+  the record for a while. A tombstone at the register's own subject needs no fence and
+  no packet, so it is durable exactly when it has to be — which is before the consumer
+  that would classify the register's source is destroyed. The identifier stays RESERVED
+  across the in-flight store rather than being freed at once, because a new delivery
+  could otherwise take it and write its own register at the same subject, and nothing
+  would then tell that record from the tombstone. The write is create-only first and a
+  replacement at the exact sequence its own nonce is found at; a foreign occupant is a
+  failure, never a success. And because such a tombstone can outlive its owner — where
+  the teardown wins the race, the store returns without ever writing — the next
+  allocation of that identifier REAPS a cancelled occupant instead of refusing it. A
+  record that says "never transmitted" cannot be holding an identifier.
+- **The cancellation goes in the write that removes the membership.** Recording it in
+  the teardown instead cannot be made equivalent, and keeping the consumer does not
+  redeem it: once the membership is gone there is no subscription left to redeliver
+  through, so a register that lands afterwards holds its identifier and its Receive
+  Maximum slot for the life of the session whatever becomes of the durable — under a
+  Receive Maximum of 1, a session that can no longer deliver at all. So every
+  transaction that removes a consumer's membership (an UNSUBSCRIBE, a reserved-namespace
+  purge, a QoS downgrade, a 3.1.1 forced shared leave, a SUBSCRIBE rollback) withdraws
+  that consumer's in-flight registrations first, and its own save carries both facts.
+  The drained sids are exempt because stageDrain already did it and their consumer
+  survives. What the teardown itself then finds can only be a registration that arrived
+  after the staging, for which the tombstone is written and the obligation is otherwise
+  left to the convergence points — the consumer is deleted anyway, since keeping an
+  unreferenced durable nothing reaps makes no identifier recoverable.
+- **The delivery barrier comes down before the snapshot.** Staging is only a moment in
+  time otherwise: the delivery callback stays live until the packet commits, so a
+  message arriving after the snapshot allocates an identifier whose cancellation misses
+  the write that was supposed to carry it. Marking the doomed consumer's delivery
+  subscription closed first — under the same lock the snapshot is taken with, and the
+  same lock the callback tests it under — is what makes the snapshot complete rather
+  than current. A rollback lifts the barrier again, because a packet whose write did not
+  land leaves those subscriptions the client's. Two details of that reversal are
+  load-bearing: it is scoped per FILTER, because one filter of a SUBSCRIBE can fail
+  while the packet succeeds and its membership then survives unchanged; and both halves
+  of a multi-level filter go through the same staging helper, since the level-up
+  companion is a consumer in its own right.
+- **A teardown's register removals are proven, not fired and forgotten.** The rule above
+  — most register deletes may be fire-and-forget — holds only because the record left
+  behind names a source that stays live and classifiable. A consumer teardown breaks
+  that premise on purpose: it is about to delete the very consumer that would classify
+  those sources, after which a surviving register is deliberately not read as complete.
+  So these deletes are confirmed, they run BEFORE the consumer goes, and one that cannot
+  be proven becomes an owed sequence on the session record, saved under the caller's
+  transaction and retried at every convergence point.
+- **What cannot be proven is stated as a rule, not as an instruction.** The confirmed
+  delete and the owed sequence are both instructions, and an instruction nobody proved
+  is an instruction nobody has: with JetStream unavailable for the delete AND for the
+  record save, a crash leaves a register whose consumer is gone and whose identifier is
+  therefore held for the life of the session. So the transaction that removes a
+  consumer's membership also records the durable as **abandoned** — a verdict, not a
+  task. Nothing on the live path acts on it, which is exactly why it can be written
+  before the teardown runs (an instruction staged that early could delete a live
+  delivery's register), and every later resume reaches the same conclusion whatever
+  became of any delete request. It is withdrawn when the packet rolls back, and a
+  durable the session HOLDS overrides it at the point it is read: shared group durables
+  are named deterministically, so a leave-then-rejoin brings the same name back, and
+  honouring a stale verdict there would free an identifier the client is holding — the
+  reverse of the bug, and a worse one. Two details decide whether the rule is safe. It
+  is spent only when a pass finds NO register naming its durable — withdrawing it in the
+  pass that issued the deletes would let a lost delete plus a persisted withdrawal bring
+  the phantom back — and the live-durable override reads the shared MEMBERSHIP, not the
+  consumer map, because a shared consumer is deliberately never persisted in Cons: a
+  restored session holds the group in sharedSubs with no cons entry, which a cons-only
+  check would read as abandoned.
+- **Cleanup that cannot be reconciled later is confirmed and retried.** Most register
+  deletes may be fire-and-forget, because the record left behind names a source that stays
+  live and classifiable. Two cannot: a **drained** exchange's release (whose retry must
+  also accept both authoritative "already absent" answers, or a crash between the delete
+  and the claim save withholds that exchange forever) and a **cancelled** registration's,
+  whose consumer is being deleted in the same breath — that obligation is kept and retried
+  at every later register store and every resume until absence is proven.
+- **Ownership transfers explicitly, it is never assumed.** Three teardown paths take a
+  register out of the ordinary terminal path's reach, and each takes the delete with it.
+  A **drained** QoS 2 exchange holds its source claim until its PUBREL is proven, so
+  nothing else reaches the delete: the drain records the register's sequence in its own
+  state (persisted, so it survives a restart) and releases it — confirmed, before the
+  claim removal and the ack — in its finalizer. A **consumer teardown** releases both the
+  registers its `cpending` entries name and those of its *retired* sources, which are not
+  in `cpending` at all. And an **UNSUBSCRIBE that races a first-delivery register write**
+  cancels that allocation rather than skipping it, so the store's own ownership
+  revalidation refuses the send instead of putting a PUBLISH on the wire whose tracking
+  the UNSUBSCRIBE has just destroyed. A register left behind by any of them outlives its
+  consumer, and a consumer-gone source is deliberately not read as complete — so the next
+  resume would reserve that identifier for the life of the session.
+- **Registered if and only if transmitted.** A delivery withheld by the in-flight cap
+  was never sent, so it is never registered. A retained-message send has no JetStream
+  backing at all, so it has no register and no post-restart redelivery.
+
+A session discard purges the retiring incarnation's registers by filter. That blind
+purge is correct here and the contrast with the arbitrated inbound hold walk is the
+point: a register has no second party that could still be committed to acting on it,
+and the filter names a generation `clear()` has already re-minted.
+
+**Cost, stated plainly.** One create-only CAS round trip per *first* transmission of
+every outbound QoS 1/2 message, one delete per completion, and on QoS 2 a confirmed
+rather than fire-and-forget source ack. Redeliveries and recovered deliveries pay
+nothing. Batching the *writes* was rejected because it would delay first transmissions
+behind a batch, and registering *after* sending is not a cheaper version of this design
+but a reintroduction of the deviation as a narrower window.
+
+**Resume reads are batched, and that is a correctness-adjacent property.** The barrier
+runs before the CONNACK, and a session may legitimately hold up to 65 535 in-flight
+identifiers, so one request per record would put tens of thousands of serial round trips
+in front of every reconnect — pushing restart recovery past ordinary client timeouts and
+making failover impractical for exactly the sessions that need it most. Instead the
+registers are enumerated by subject in one request (the identifier's 16 bits bound the
+filter below JetStream's subject-detail truncation point, which is why this enumeration
+is safe here although the account-wide orphan sweep refuses it) and loaded in bounded
+batches; sources are then classified once per *source*, with one consumer lookup per
+durable and batched message reads. Every uncertainty is preserved exactly as the
+one-at-a-time path preserved it: a missing response, an unreadable consumer and a
+consumer that is gone are all "unknown", never "complete".
 
 ## Session incarnations and teardown
 

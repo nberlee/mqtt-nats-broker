@@ -262,6 +262,17 @@ const (
 	mqttQoS2AssignStreamName          = "$MQTT_qos2assign"
 	mqttQoS2AssignStreamSubjectPrefix = mqttPrefix + "qos2.assign."
 
+	// Stream name and subject prefix for OUTBOUND in-flight registers: one tiny
+	// record per started QoS 1/2 PUBLISH, naming the packet identifier it was sent
+	// under together with the source durable and stream sequence it came from
+	// (MaxMsgsPer:1, keyed by the identifier). This is what makes an outbound
+	// identifier survive a broker restart or a failover instead of only a
+	// same-process reconnect. Kept on its own stream: $MQTT_out is interest-retained
+	// and would keep nothing, and a per-message write to the session record would
+	// serialize every delivery on the record CAS. See inflight_register.go.
+	mqttInflightStreamName          = "$MQTT_inflight"
+	mqttInflightStreamSubjectPrefix = mqttPrefix + "inflight."
+
 	// Generation-scoped names for a session's affine QoS 2 delivery path on
 	// $MQTT_out: the per-claim copy subject prefix, the internal deliver subject
 	// prefix, and the consumer durable prefix. All three embed the session's
@@ -916,6 +927,38 @@ type mqttAccountSessionManager struct {
 	// production. See rollbackAcceptedSession.
 	testRollbackDone func(es *mqttSession, result rollbackResult)
 
+	// Seams for the outbound in-flight register (inflight_register.go),
+	// instance-scoped and set/read under mu. Routed only through the register's own
+	// store and load so a test can fail, stall or observe the write that must
+	// PRECEDE a send while the source delivery, the PUBREL store and every unrelated
+	// load still reach real JetStream. A store hook that reports success models
+	// "landed, response lost", which is the ambiguous outcome the nonce re-read
+	// resolves. Nil in production.
+	testInflightStore func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error)
+	testInflightLoad  func(subject string) (*mqttInflightRecord, *StoredMsg, error)
+
+	// testInflightEnumerate, when non-nil, replaces the resume barrier's subject
+	// enumeration. Routed separately from the loads because "the identifier space could
+	// not be read at all" and "one register could not be loaded" are different failures
+	// with the same remedy, and a test needs to reach each on its own. Nil in production.
+	testInflightEnumerate func(filter string) (map[string]uint64, error)
+
+	// testInflightSourceAck, when non-nil, replaces the CONFIRMED source acknowledgement
+	// on the QoS 2 PUBREC path — the one that licenses deleting the in-flight register.
+	// It exists because that failure is unobservable from outside: a confirmation that
+	// does not land looks exactly like one that does, and what the broker must then do
+	// (keep the register, and keep the source correlated so its redelivery is
+	// suppressed) is visible only in what does NOT appear on the wire. Nil in
+	// production.
+	testInflightSourceAck func(ackSubject string) error
+
+	// testInflightDelete, when non-nil, replaces the exact-sequence register delete.
+	// It exists because R5's failure mode is unobservable on the wire: a delete that
+	// never lands leaves a stale record that only a later scan reveals, so a test
+	// that wants to reach the "completed exchange, register survived" state has to
+	// suppress the delete rather than race it. Nil in production.
+	testInflightDelete func(seq uint64) error
+
 	// qos2SweepCursor is the orphan QoS 2 sweep's position in $MQTT_qos2in, and
 	// qos2SweepSeeded whether it has been seeded yet. Scheduling state only: every
 	// candidate it discovers is authoritatively revalidated before any mutation, so
@@ -923,6 +966,14 @@ type mqttAccountSessionManager struct {
 	// pass looks at. Guarded by mu. See orphan_qos2_sweep.go.
 	qos2SweepCursor uint64
 	qos2SweepSeeded bool
+
+	// inflightSweepCursor / inflightSweepSeeded are the same scheduling state for the
+	// $MQTT_inflight walk. Separate from the inbound pair because the two streams have
+	// independent sequence spaces and independent budgets; sharing one cursor would
+	// make each pass's coverage of one stream depend on the other's size. Guarded by
+	// mu. See orphan_qos2_sweep.go.
+	inflightSweepCursor uint64
+	inflightSweepSeeded bool
 
 	// testQoS2SweepSeed, when non-nil, chooses the sweep cursor's initial position
 	// instead of the pseudo-random seed, so a test can make one pass deterministic.
@@ -1200,6 +1251,54 @@ type mqttSession struct {
 	// existing PIs.
 	cpending map[string]map[uint64]uint16 // composite key: jsDur, sseq
 
+	// srcAckOwed names QoS 2 source deliveries that are past PUBREC but whose
+	// acknowledgement could not be proven. Their payload must never be sent again — the
+	// client already answered it — so the next delivery attempt of each is acknowledged
+	// instead of delivered, and the entry is released once that acknowledgement is
+	// confirmed. Keyed by the SOURCE rather than the packet identifier on purpose: the
+	// guard in trackPublish tests pendingPubRel, which PUBCOMP removes, so an
+	// identifier-keyed suppression stops working exactly when the exchange completes.
+	// Created on first use; bounded by unproven acknowledgements, not by traffic. See
+	// retireSourceLocked.
+	srcAckOwed map[mqttDeferredKey]*mqttRetiredSource
+
+	// owedRegisterDeletes holds in-flight register sequences whose CONFIRMED removal has
+	// not been proven yet. Only the cancellation path adds to it: that register's source
+	// consumer is usually deleted in the same breath, and a register whose consumer is gone
+	// is deliberately not read as complete, so a lost delete would reserve an identifier for
+	// the life of the session with nothing able to resolve it. Retried at every later
+	// register store and at every resume. Guarded by mu. See retryOwedRegisterDeletes.
+	owedRegisterDeletes []uint64
+
+	// cancelledRegNonces holds the nonces of allocations withdrawn while their register
+	// store was still in flight — the same obligation as owedRegisterDeletes one step
+	// earlier, before any sequence exists to name. Recovery reads a register carrying one of
+	// these exactly as it reads a cancellation tombstone: never transmitted, so its
+	// identifier and Receive Maximum slot are released rather than held. Guarded by mu, and
+	// persisted as mqttPersistedSession.CancelledRegs, which is what covers the window
+	// between the store's CAS landing and its confirmation running. See cancelRegPendingLocked.
+	cancelledRegNonces map[string]struct{}
+
+	// owedRegsRev counts changes to owedRegisterDeletes and cancelledRegNonces, and
+	// owedRegsSavedRev is the highest
+	// revision PROVEN to be in the session record. They are not a bool because the writer
+	// cannot see the race it loses: an off-readLoop cancellation appends while a readLoop
+	// transaction that has already marshalled its record holds the fence, so that
+	// transaction commits without the entry and the append was refused its own save. Driving
+	// persistence off the gap between the two — rather than off "did I just change
+	// something" — is what makes every convergence point retry until the record agrees.
+	// Both guarded by mu. See persistOwedRegisterDeletes.
+	owedRegsRev      uint64
+	owedRegsSavedRev uint64
+
+	// piSpaceIncomplete is set when a resume could not fully reconstruct the durable
+	// outbound identifier space, so some identifier the client holds may be unknown
+	// here. While it is set bumpPI allocates NOTHING: a new identifier could collide
+	// with a register or an unreplayed PUBREL that still owns it. Nothing else is
+	// restricted, and a later resume that completes both scans clears it. See
+	// inflight_register.go (R3).
+	piSpaceIncomplete bool
+
 	// deferred tracks QoS 1/2 deliveries withheld by trackPublish because the
 	// session was at its effective in-flight cap (Receive Maximum /
 	// MaxAckPending). Keyed by JS durable + stream sequence; the value is the
@@ -1282,6 +1381,33 @@ type mqttPersistedSession struct {
 	// there would find cons[sid] on a re-SUBSCRIBE, take the fromSubProto early
 	// return and never create a delivery subscription. See unsub_drain.go.
 	Drains map[string]*mqttPersistedDrain `json:"drains,omitempty"`
+
+	// OwedRegs are outbound in-flight register sequences whose removal is owed but not yet
+	// proven. Only the CANCELLATION path writes them — a delivery whose allocation was
+	// withdrawn before it was ever sent — and only where neither the confirmed delete nor
+	// the cancellation tombstone could be written, which in practice means JetStream was
+	// unavailable for both.
+	//
+	// Persisted because the alternative is losing the obligation on a restart: the
+	// surviving register is then indistinguishable from a started delivery, and once its
+	// consumer is gone its identifier and its Receive Maximum slot are consumed for the
+	// life of the session. Deleting a sequence that is already gone is harmless, so a stale
+	// entry costs nothing. See inflight_register.go.
+	OwedRegs []uint64 `json:"owed_regs,omitempty"`
+	// CancelledRegs are register NONCES whose allocation was withdrawn while its register
+	// store was still in flight, so no sequence is known for them yet. It is the same fact
+	// as OwedRegs one step earlier, and it exists because the in-memory handoff has a crash
+	// window: the cancelling UNSUBSCRIBE can persist its removal and delete the consumer
+	// while the store's CAS is still on the wire, and if that CAS lands and the broker dies
+	// before the confirmation runs, no tombstone and no OwedRegs entry was ever written.
+	// Recovery would then find an ordinary register whose consumer is gone and hold its
+	// identifier — and its Receive Maximum slot — for the life of the session.
+	//
+	// Keyed by nonce, never by packet identifier or by source: the cancellation FREES the
+	// identifier for immediate reuse, and a drained source is re-offered under a new
+	// identifier, so both would make a stale entry read a genuine later delivery as never
+	// transmitted. A nonce is minted with the allocation and never reused.
+	CancelledRegs []string `json:"cancelled_regs,omitempty"`
 	// Teardown, when present, means a broker has CLAIMED this record's teardown and
 	// may be part way through deleting the incarnation's resources. Nobody may
 	// resume that state: every reader finishes the teardown (the deletions are
@@ -1736,6 +1862,39 @@ type mqttPending struct {
 	// recorded from the terminal paths (PUBREC, expiry, oversize discard), which
 	// see the packet identifier and nothing else. See qos2_shared_affine.go.
 	q2AffClaim string
+
+	// regSeq is the stream sequence of this delivery's durable in-flight register on
+	// $MQTT_inflight, and regNonce the register's immutable identity. Every delete
+	// targets regSeq exactly, because the register's subject is reused by later
+	// exchanges on the same identifier (R4). Zero/empty for a delivery with no
+	// register: a retained send (no JetStream backing at all), or one recovered from
+	// a PUBREL record, which is past the PUBLISH phase and whose identity lives in
+	// that record instead (R2).
+	//
+	// regNonce is minted with the ALLOCATION, one step ahead of the store that writes
+	// it, so an allocation cancelled while its store is in flight can be named durably
+	// before any sequence for it exists. regSeq appears only on confirmation.
+	regSeq   uint64
+	regNonce string
+
+	// (see the session's piSpaceIncomplete for the other half of R3)
+	//
+	// regPending marks an identifier that has been ALLOCATED but whose register is
+	// not yet confirmed, so the PUBLISH has not been transmitted and must not be
+	// (R1). Nothing else may act on the entry while it is set: a concurrent
+	// redelivery declines it, resendPendingRedelivery does not NAK it, and
+	// stageDrain does not enrol it. Cleared by the register store's owner on a
+	// confirmed write; on a definite failure the entry is removed outright.
+	regPending bool
+
+	// regCancelled marks a regPending entry a consumer teardown has WITHDRAWN. It stays
+	// in pendingPublish, inert, until the store settles, and that is deliberate: freeing
+	// the identifier immediately would let a new delivery take it and write its own
+	// register at the same subject, and the cancellation tombstone written before the
+	// consumer delete would then be indistinguishable from that new delivery's record.
+	// Holding it costs one in-flight store's round trip. Released by
+	// confirmInflightRegister, which is the only thing that knows the store is over.
+	regCancelled bool
 }
 
 // mqttPendingRef identifies one in-flight QoS 1/2 delivery. A packet identifier
@@ -2420,6 +2579,11 @@ func (c *client) mqttParse(buf []byte) error {
 			if err == nil {
 				err = c.mqttProcessUnsubs(filters)
 				c.mqttResolveAfterPacket()
+				// Unconditional: an UNSUBSCRIBE that cancelled a register-pending
+				// delivery leaves the cleanup obligation with the delivery goroutine,
+				// which was refused the fence while this packet held it — and that is
+				// true whether the packet itself succeeded.
+				c.mqttFlushOwedRegisterDeletes()
 			}
 			if err == nil {
 				// Trace only if the UNSUBACK was actually sent (a tiny client
@@ -3582,6 +3746,42 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		}
 	}
 
+	// Outbound in-flight registers. One record per started QoS 1/2 PUBLISH, keyed by
+	// the packet identifier it went out under (MaxMsgsPer:1), so an identifier
+	// survives a broker restart or a failover instead of only a same-process
+	// reconnect. Its own stream for two reasons that are not preferences: $MQTT_out
+	// is interest-retained and would keep nothing, and a per-delivery write to the
+	// session record would put every outbound QoS 1/2 message behind the record CAS.
+	// A new stream is also the schema-compatible shape — an older broker simply never
+	// reads it — though as everywhere here, schema compatibility is not protocol
+	// compatibility. See inflight_register.go.
+	{
+		cfg := &StreamConfig{
+			Name:       mqttInflightStreamName,
+			Subjects:   []string{mqttInflightStreamSubjectPrefix + ">"},
+			Storage:    FileStorage,
+			Retention:  LimitsPolicy,
+			Discard:    DiscardOld,
+			MaxMsgsPer: 1,
+			Replicas:   replicas,
+		}
+		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
+			return nil, fmt.Errorf("create outbound in-flight register stream for account %q: %v", accName, err)
+		}
+		si, err := jsa.lookupStream(mqttInflightStreamName)
+		if err != nil {
+			return nil, fmt.Errorf("lookup outbound in-flight register stream for account %q: %v", accName, err)
+		}
+		wantReplicas := 0
+		if opts.MQTT.StreamReplicas != 0 {
+			wantReplicas = replicas
+		}
+		if verr := validateInflightStream(si, wantReplicas); verr != nil {
+			return nil, fmt.Errorf("outbound in-flight register stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required configuration (see docs/ARCHITECTURE.md \"Compatibility boundary\")",
+				accName, verr, mqttInflightStreamName)
+		}
+	}
+
 	// $MQTT_out carries both the pending PUBREL records and the session-affine
 	// copies of started shared-subscription QoS 2 deliveries. Its InterestPolicy
 	// retention is load-bearing in both directions: it is how a discarded session's
@@ -3862,8 +4062,25 @@ func (jsa *mqttJSA) newRequestEx(kind, subject, cidHash string, hdr int, msg []b
 // Note that each response may represent an error and should be inspected as
 // such by the caller.
 func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
-	if len(hdrs) != len(msgs) {
-		return nil, fmt.Errorf("unreachable: invalid number of messages (%d) or header offsets (%d)", len(msgs), len(hdrs))
+	subjects := make([]string, len(msgs))
+	for i := range subjects {
+		subjects[i] = subject
+	}
+	return jsa.newRequestExMultiSubjectsCID(kind, cidHash, subjects, hdrs, msgs)
+}
+
+// newRequestExMultiSubjects is newRequestExMulti with a PER-REQUEST subject, which a
+// batch of consumer-info lookups needs: each names its own consumer in the subject rather
+// than in a body. Same pipelining, same all-or-timeout semantics; a nil response entry
+// means that one request went unanswered.
+func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
+	return jsa.newRequestExMultiSubjectsCID(kind, _EMPTY_, subjects, hdrs, msgs)
+}
+
+func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
+	if len(hdrs) != len(msgs) || len(subjects) != len(msgs) {
+		return nil, fmt.Errorf("unreachable: invalid number of messages (%d), subjects (%d) or header offsets (%d)",
+			len(msgs), len(subjects), len(hdrs))
 	}
 	responseCh := make(chan *mqttJSAResponse, len(msgs))
 
@@ -3896,9 +4113,8 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 		// response.
 		jsa.replies.Store(reply, responseCh)
 
-		subject = jsa.prefixDomain(subject)
 		jsa.sendq.push(&mqttJSPubMsg{
-			subj:  subject,
+			subj:  jsa.prefixDomain(subjects[i]),
 			reply: reply,
 			hdr:   hdr,
 			msg:   msg,
@@ -3935,10 +4151,14 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 				jsa.replies.Delete(reply)
 			}
 
+			var first string
+			if len(subjects) > 0 {
+				first = subjects[0]
+			}
 			if len(msgs) == 1 {
-				return responses, fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, subject, reply)
+				return responses, fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, first, reply)
 			} else {
-				return responses, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, subject, c, len(msgs))
+				return responses, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs))
 			}
 		}
 	}
@@ -4135,6 +4355,47 @@ func (jsa *mqttJSA) lookupConsumer(streamName, consName string) (*ConsumerInfo, 
 
 // consumerList returns ConsumerInfo for every consumer of the stream, walking
 // the paged CONSUMER.LIST API to completion.
+// lookupConsumersMulti fetches several consumers' info in ONE pipelined batch, in the
+// order given. Each entry is nil where that consumer does not exist; ok is false for any
+// request whose response could not be read, so a caller can tell "gone" from "unknown"
+// — a distinction the resume path turns into a delivery decision.
+//
+// The serial sibling above is fine for one lookup. This exists because the resume barrier
+// needs one per DURABLE before the CONNACK, and a session with a few thousand
+// subscriptions would otherwise pay a few thousand serial round trips to reconnect.
+func (jsa *mqttJSA) lookupConsumersMulti(streamName string, durables []string) (infos []*ConsumerInfo, ok []bool, err error) {
+	subjects := make([]string, 0, len(durables))
+	hdrs := make([]int, 0, len(durables))
+	msgs := make([][]byte, 0, len(durables))
+	for _, dur := range durables {
+		subjects = append(subjects, fmt.Sprintf(JSApiConsumerInfoT, streamName, dur))
+		hdrs = append(hdrs, 0)
+		msgs = append(msgs, nil)
+	}
+	all, err := jsa.newRequestExMultiSubjects(mqttJSAConsumerLookup, subjects, hdrs, msgs)
+	infos = make([]*ConsumerInfo, len(durables))
+	ok = make([]bool, len(durables))
+	for i, v := range all {
+		if i >= len(durables) || v == nil {
+			continue // no response: not ok, so the caller treats it as indeterminate
+		}
+		cir, isCIR := v.value.(*JSApiConsumerInfoResponse)
+		if !isCIR {
+			continue
+		}
+		if aerr := cir.ToError(); aerr != nil {
+			// Only "consumer not found" proves absence; anything else is a failed read.
+			if isErrorOtherThan(aerr, JSConsumerNotFoundErr) {
+				continue
+			}
+			ok[i] = true // absent, authoritatively
+			continue
+		}
+		infos[i], ok[i] = cir.ConsumerInfo, true
+	}
+	return infos, ok, err
+}
+
 func (jsa *mqttJSA) consumerList(streamName string) ([]*ConsumerInfo, error) {
 	var all []*ConsumerInfo
 	for {
@@ -4174,6 +4435,34 @@ func (jsa *mqttJSA) loadLastMsgFor(streamName string, subject string) (*StoredMs
 	}
 	lmr := lmri.(*JSApiMsgGetResponse)
 	return lmr.Message, lmr.ToError()
+}
+
+// loadMsgsMulti loads messages by EXACT sequence in one pipelined batch, preserving the
+// order of seqs in the result. The by-subject sibling below cannot serve this: a source
+// delivery is identified by its stream sequence, not by a subject.
+//
+// Used by the resume barrier, where the alternative is one synchronous round trip per
+// in-flight delivery before the CONNACK. A nil entry means that request produced no
+// response, which the caller must treat as indeterminate rather than as absence.
+func (jsa *mqttJSA) loadMsgsMulti(streamName string, seqs []uint64) ([]*JSApiMsgGetResponse, error) {
+	marshaled := make([][]byte, 0, len(seqs))
+	headerBytes := make([]int, 0, len(seqs))
+	for _, seq := range seqs {
+		bb, err := json.Marshal(&JSApiMsgGetRequest{Seq: seq})
+		if err != nil {
+			return nil, err
+		}
+		marshaled = append(marshaled, bb)
+		headerBytes = append(headerBytes, 0)
+	}
+	all, err := jsa.newRequestExMulti(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), _EMPTY_, headerBytes, marshaled)
+	responses := make([]*JSApiMsgGetResponse, len(all))
+	for i, v := range all {
+		if v != nil {
+			responses[i] = v.value.(*JSApiMsgGetResponse)
+		}
+	}
+	return responses, err
 }
 
 func (jsa *mqttJSA) loadLastMsgForMulti(streamName string, subjects []string) ([]*JSApiMsgGetResponse, error) {
@@ -5111,6 +5400,11 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	sess.subs = ps.Subs
 	sess.sharedSubs = ps.SharedSubs
 	sess.cons = ps.Cons
+	// The restored lists came OUT of the record, so they are already durable there; only
+	// a later change reopens the gap.
+	sess.owedRegisterDeletes = ps.OwedRegs
+	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
+	sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
 	sess.restoreDrainsFromRecord(ps)
 	sess.pubRelConsumer = ps.PubRel
 	sess.q2AffConsumer = ps.Q2Aff
@@ -6048,6 +6342,13 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		cc  *ConsumerConfig
 	}
 	var deferredDels []deferredDel
+	// Registrations this packet withdraws, cancelled inside its own transaction, and the
+	// delivery subscriptions closed so nothing can allocate behind that snapshot.
+	var stagedCancels []mqttRegCancellation
+	var closedDeliveries []*subscription
+	// Verdicts on TRANSMITTED registers, withdrawn if this packet (or this filter) rolls
+	// back: those deliveries stay live and still owe their identifiers.
+	var voidedSent []string
 
 	var err error
 	subs := make([]*subscription, 0, len(filters))
@@ -6137,11 +6438,22 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// Deferred consumer deletes recorded by THIS filter, so a later per-filter
 		// failure can cancel them (restore the sess.cons entry, keep the durable).
 		filterDefStart := len(deferredDels)
+		// And the same boundary for what the deferral staged: the delivery barriers it
+		// lowered, and the registrations it withdrew. A filter that FAILS keeps its
+		// original QoS 1/2 membership — the final update simply skips it — so a barrier
+		// left down would silently stop that subscription delivering until the client
+		// reconnects.
+		filterClosedStart := len(closedDeliveries)
+		filterVoidedStart := len(voidedSent)
 		cancelFilterDeferred := func() {
 			// The sess.cons entries were never removed (removal happens at
 			// execution time, after the confirmed save), so cancelling is just
 			// dropping this filter's descriptors.
 			deferredDels = deferredDels[:filterDefStart]
+			sess.reopenTeardownDelivery(closedDeliveries[filterClosedStart:])
+			closedDeliveries = closedDeliveries[:filterClosedStart]
+			sess.unvoidRegNonces(voidedSent[filterVoidedStart:])
+			voidedSent = voidedSent[:filterVoidedStart]
 		}
 
 		const processShadowSubs = true
@@ -6168,7 +6480,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				return subs, rerr
 			}
 			if doCleanup {
-				sess.cleanupFailedSub(c, sub, jscons, jssub)
+				sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
 			}
 			continue
 		}
@@ -6182,9 +6494,23 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			jscons, jssub, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
 		} else {
 			var dd *ConsumerConfig
-			jscons, jssub, dd, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+			jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
 			if dd != nil {
 				deferredDels = append(deferredDels, deferredDel{sid: sid, cc: dd})
+				// The teardown itself is deferred to the confirmed save, but the
+				// CANCELLATION is not: it belongs in the write that downgrades this
+				// filter, or the identifier it withdraws has nothing to recover it.
+				// The delivery barrier comes first, so nothing allocates a further
+				// identifier behind the snapshot; a rollback reopens it, because the
+				// QoS 1/2 subscription is then still the client's.
+				sess.mu.Lock()
+				ddCancels, ddSub, ddSent := sess.stageDeferredDeleteLocked(c, dd)
+				sess.mu.Unlock()
+				stagedCancels = append(stagedCancels, ddCancels...)
+				voidedSent = append(voidedSent, ddSent...)
+				if ddSub != nil {
+					closedDeliveries = append(closedDeliveries, ddSub)
+				}
 			}
 		}
 		if err != nil {
@@ -6199,7 +6525,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				return subs, rerr
 			}
 			if doCleanup {
-				sess.cleanupFailedSub(c, sub, jscons, jssub)
+				sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
 			}
 			continue
 		}
@@ -6235,7 +6561,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					return subs, rerr
 				}
 				if doCleanup {
-					sess.cleanupFailedSub(c, sub, jscons, jssub)
+					sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
 				}
 				continue
 			}
@@ -6244,9 +6570,20 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				fwjscons, fwjssub, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
 			} else {
 				var fwdd *ConsumerConfig
-				fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+				fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
 				if fwdd != nil {
+					// The same staging as the main half, through the same helper: the
+					// companion is a consumer in its own right and owes exactly what it
+					// does.
 					deferredDels = append(deferredDels, deferredDel{sid: fwcsid, cc: fwdd})
+					sess.mu.Lock()
+					fwCancels, fwSub, fwSent := sess.stageDeferredDeleteLocked(c, fwdd)
+					sess.mu.Unlock()
+					stagedCancels = append(stagedCancels, fwCancels...)
+					voidedSent = append(voidedSent, fwSent...)
+					if fwSub != nil {
+						closedDeliveries = append(closedDeliveries, fwSub)
+					}
 				}
 			}
 			if err != nil {
@@ -6259,8 +6596,8 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					return subs, rerr
 				}
 				if doCleanup {
-					sess.cleanupFailedSub(c, sub, jscons, jssub)
-					sess.cleanupFailedSub(c, fwcsub, fwjscons, fwjssub)
+					sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
+					sess.cleanupFailedSub(c, tok, fwcsub, fwjscons, fwjssub)
 				}
 				continue
 			}
@@ -6307,7 +6644,16 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// (this packet's own transaction is still open on this goroutine when the
 				// resolution below runs). See resolveUncertainWrite.
 				sess.retainOnUncertain(func(rtok recordTx) {
+					// The downgraded subscriptions are the client's again, so their
+					// delivery barrier is lifted with the rest of the packet.
+					sess.reopenTeardownDelivery(closedDeliveries)
+					sess.unvoidRegNonces(voidedSent)
 					sess.rollbackSubscribePacket(c, rtok, subs, consSnap, snap, q2AffPrePacket)
+					// The withdrawn allocations stay withdrawn — a cancellation is never
+					// rolled back, the source is simply re-offered under a fresh one — so
+					// their registers are still owed. The rolled-back record carries the
+					// nonces; this just lets them go now.
+					sess.secureRegCancellations(c, rtok, stagedCancels)
 				}, nil)
 				// Not resolved here: the packet's transaction is still open and the
 				// resolver must hold the fence. The readLoop resolves after it closes.
@@ -6315,12 +6661,18 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state for the readback: %v", sess.id, err)
 				return nil, err
 			}
+			sess.reopenTeardownDelivery(closedDeliveries)
+			sess.unvoidRegNonces(voidedSent)
 			sess.rollbackSubscribePacket(c, tok, subs, consSnap, snap, q2AffPrePacket)
+			sess.secureRegCancellations(c, tok, stagedCancels)
 		} else {
 			// Save confirmed: now run the irreversible teardown of consumers that
 			// this packet downgraded to QoS0.
+			// Durable in the packet's record already; this lets the registers go now
+			// rather than at the next resume.
+			sess.secureRegCancellations(c, tok, stagedCancels)
 			for _, dd := range deferredDels {
-				sess.execDeferredConsumerDelete(c, dd.sid, dd.cc)
+				sess.execDeferredConsumerDelete(c, tok, dd.sid, dd.cc)
 			}
 			// The affine path is provisioned in the first loop, before any filter is
 			// known to succeed, so a packet whose shared QoS 2 filters all failed
@@ -6396,7 +6748,35 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 	// must be undone to leave the earlier attempt's bytes in place for its readback.
 	// Without the sample, that refusal would read as "this write may have landed".
 	wasUncertain := sess.isSeqUncertain()
-	restoreCur := func() { sess.restoreSharedKeyInMemory(sid, curExisted, curQoS, curRap, curSubID) }
+	// The no-prior branch below REMOVES this membership, and its group durables are
+	// released once that write is known durable — so their registers are voided in the same
+	// write, with the delivery barrier down first. The prior-existing branch restores an
+	// earlier membership instead: nothing is abandoned there, so nothing is voided.
+	var voidedSent []string
+	var closed []*subscription
+	var sharedCancels []mqttRegCancellation
+	if !priorExisted {
+		sess.mu.Lock()
+		for _, dur := range mqttSharedDurablesForKey(sid) {
+			for _, cc := range sess.cons {
+				if cc != nil && cc.Durable == dur {
+					if sub := sess.closeTeardownDeliveryLocked(c, cc); sub != nil {
+						closed = append(closed, sub)
+					}
+				}
+			}
+			cancels, sent := sess.voidRegistrationsLocked(dur)
+			sharedCancels = append(sharedCancels, cancels...)
+			voidedSent = append(voidedSent, sent...)
+		}
+		sess.mu.Unlock()
+	}
+	restoreCur := func() {
+		sess.restoreSharedKeyInMemory(sid, curExisted, curQoS, curRap, curSubID)
+		// The membership is back, so the durables are not abandoned after all.
+		sess.reopenTeardownDelivery(closed)
+		sess.unvoidRegNonces(voidedSent)
+	}
 	undo := func(e error) {
 		switch sess.classifySave(wasUncertain, e) {
 		case saveDefinitelyFailed:
@@ -6407,7 +6787,7 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 			// the release is owed here, from the readback. Nothing else would do it, and
 			// the durable plus its MaxAckPending charge would outlive the membership.
 			sess.retainOnUncertain(func(recordTx) { restoreCur() },
-				func(recordTx) { sess.releaseFailedSharedFilter(c, f) })
+				func(rtok recordTx) { sess.releaseFailedSharedFilter(c, rtok, f) })
 		}
 	}
 
@@ -6428,6 +6808,9 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 		undo(e)
 		return true, e
 	}
+	// The removal is durable, so a tombstone can release the cancelled registers now
+	// instead of leaving them to the next resume.
+	sess.secureRegCancellations(c, tok, sharedCancels)
 	return true, nil
 }
 
@@ -6446,7 +6829,7 @@ type addedCons struct {
 // left alone.
 //
 // No lock held on entry.
-func (sess *mqttSession) releaseFailedSharedFilter(c *client, f *mqttFilter) {
+func (sess *mqttSession) releaseFailedSharedFilter(c *client, tok recordTx, f *mqttFilter) {
 	durs := mqttSharedDurablesForKey(f.sessionKey())
 	if len(durs) == 0 {
 		return
@@ -6467,7 +6850,7 @@ func (sess *mqttSession) releaseFailedSharedFilter(c *client, f *mqttFilter) {
 		}
 		sess.mu.Unlock()
 		if cc != nil {
-			sess.releaseSharedConsumer(c, cc, nil)
+			sess.releaseSharedConsumer(c, tok, cc, nil)
 			continue
 		}
 		if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
@@ -6527,11 +6910,19 @@ func (sess *mqttSession) restoreSharedLiveMetadata(c *client, f *mqttFilter, qos
 // the next resume retries the cleanup. Spec5 [4.8.2].
 func (sess *mqttSession) purgeReservedSubs(c *client, tok recordTx, denied []*mqttFilter) {
 	snap := sess.snapshotSubs()
+	// Cancelled in the same write that removes the memberships, for the reason given in
+	// cancelPendingRegistrationsLocked: after that write there is no subscription left to
+	// redeliver a stranded identifier through.
+	sess.mu.Lock()
+	stagedCancels, _, voidedSent := sess.stageUnsubCancellationsLocked(nil, denied, nil)
+	sess.mu.Unlock()
 	// Everything the purge does once its record write is CONFIRMED, as a closure so a
 	// readback that later proves an ambiguous write landed can run it too. Skipping it
 	// then would leave the record without the reserved memberships while their
 	// consumers and group durables stayed behind, referenced by nothing.
 	commitPurge := func() {
+		// Durable in this purge's own record already; the tombstone is cleanup.
+		sess.secureRegCancellations(c, tok, stagedCancels)
 		// Persist confirmed. The memberships are already out of the record, so one
 		// scan now decides every shared durable this purge may release.
 		var sharedDurs []string
@@ -6574,18 +6965,24 @@ func (sess *mqttSession) purgeReservedSubs(c *client, tok recordTx, denied []*mq
 			// additionally returns its tmaxack charge and only deletes the group
 			// durable when no other member still holds it.
 			if cc.DeliverGroup != _EMPTY_ {
-				sess.releaseSharedConsumer(c, cc, heldShared)
+				sess.releaseSharedConsumer(c, tok, cc, heldShared)
 				return
 			}
-			sess.deleteConsumer(cc)
 			sess.mu.Lock()
-			if seqPis, ok := sess.cpending[cc.Durable]; ok {
-				delete(sess.cpending, cc.Durable)
-				for _, pi := range seqPis {
-					delete(sess.pendingPublish, pi)
-				}
-			}
+			regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
 			sess.mu.Unlock()
+			// Ordered before the consumer delete, not after it: a register whose store
+			// is still in flight must have something durable calling it cancelled
+			// before the consumer that would classify its source disappears — and when
+			// that cannot be achieved the durable stays rather than the identifier.
+			if !sess.secureRegCancellations(c, tok, cancels) {
+				c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for "+
+					"client %q are not durably recorded yet", cc.Durable, sess.id)
+			}
+			// Both before the consumer goes: after that, an unremoved register can no
+			// longer be classified and its identifier is reserved for good.
+			sess.deleteInflightRegisters(c, tok, regs)
+			sess.deleteConsumer(cc)
 		}
 
 		for _, f := range denied {
@@ -6612,6 +7009,8 @@ func (sess *mqttSession) purgeReservedSubs(c *client, tok recordTx, denied []*mq
 			sess.noLocalSubs = snap.noLocal
 			sess.subIDs = snap.subIDs
 			sess.mu.Unlock()
+			// The memberships are back, so their transmitted deliveries are live again.
+			sess.unvoidRegNonces(voidedSent)
 		}
 		switch sess.classifySave(wasUncertain, err) {
 		case saveDefinitelyFailed:
@@ -6747,6 +7146,26 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 		}
 		added = append(added, addedCons{sid, cc})
 	}
+	// The consumers this packet created are about to be released, and the restored record is
+	// written just below — so their registers are voided HERE, in that same write. Afterwards
+	// the membership is the pre-packet one, which never named these durables, so nothing
+	// would be left to explain a register that outlives them. The delivery barrier goes down
+	// first, for the reason given in closeTeardownDeliveryLocked: a callback still live
+	// during this snapshot would allocate behind it.
+	var rollbackCancels []mqttRegCancellation
+	var rollbackClosed []*subscription
+	var rollbackVoided []string
+	for _, a := range added {
+		if a.cc == nil {
+			continue
+		}
+		if sub := sess.closeTeardownDeliveryLocked(c, a.cc); sub != nil {
+			rollbackClosed = append(rollbackClosed, sub)
+		}
+		cancels, sent := sess.voidRegistrationsLocked(a.cc.Durable)
+		rollbackCancels = append(rollbackCancels, cancels...)
+		rollbackVoided = append(rollbackVoided, sent...)
+	}
 	sess.subs = snap.subs
 	sess.sharedSubs = snap.shared
 	sess.rapSubs = snap.rap
@@ -6788,6 +7207,12 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 				sess.cons[a.sid] = a.cc
 			}
 			sess.mu.Unlock()
+			// These consumers are still live, so they must deliver again. (The voided
+			// registers stay voided: a withdrawn allocation is never reinstated — the
+			// source is simply re-offered under a fresh one — and a transmitted register
+			// source is simply re-offered under a fresh one.)
+			sess.reopenTeardownDelivery(rollbackClosed)
+			sess.unvoidRegNonces(rollbackVoided)
 			// Same reasoning for the affine path: nothing was deleted, so the session
 			// must go back to describing the resources that are still live.
 			sess.restoreQ2AffineUnwind(q2AffUnwind)
@@ -6800,12 +7225,14 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 			// rolled-back session and the releases below are owed — nothing else resumes
 			// them, so the packet's consumers and their charges would be leaked.
 			sess.retainOnUncertain(func(recordTx) { readd() },
-				func(recordTx) { sess.finishSubscribeRollback(c, subs, added, snap, q2AffUnwind) })
+				func(rtok recordTx) {
+					sess.finishSubscribeRollback(c, rtok, subs, added, rollbackCancels, snap, q2AffUnwind)
+				})
 		}
 		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
 		return
 	}
-	sess.finishSubscribeRollback(c, subs, added, snap, q2AffUnwind)
+	sess.finishSubscribeRollback(c, tok, subs, added, rollbackCancels, snap, q2AffUnwind)
 }
 
 // finishSubscribeRollback releases what a SUBSCRIBE packet created, once the
@@ -6815,8 +7242,10 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 // its raw subscriptions stay behind, referenced by nothing.
 //
 // No lock held on entry.
-func (sess *mqttSession) finishSubscribeRollback(c *client, subs []*subscription, added []addedCons,
-	snap *mqttSubSnapshot, q2AffUnwind mqttQ2AffUnwind) {
+func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs []*subscription, added []addedCons,
+	cancels []mqttRegCancellation, snap *mqttSubSnapshot, q2AffUnwind mqttQ2AffUnwind) {
+	// Durable in the rolled-back record already; the tombstone is cleanup.
+	sess.secureRegCancellations(c, tok, cancels)
 	sess.finishQ2AffineUnwind(c, q2AffUnwind)
 
 	// A raw subscription "existed before" this packet if the restored membership
@@ -6841,9 +7270,9 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, subs []*subscription
 	}
 	for _, a := range added {
 		if a.cc.DeliverGroup != _EMPTY_ {
-			sess.releaseSharedConsumer(c, a.cc, nil)
+			sess.releaseSharedConsumer(c, tok, a.cc, nil)
 		} else {
-			sess.execDeferredConsumerDelete(c, a.sid, a.cc)
+			sess.execDeferredConsumerDelete(c, tok, a.sid, a.cc)
 		}
 	}
 }
@@ -7395,6 +7824,10 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		sess.asm = as
 		sess.domainTk = as.domainTk
 		sess.cons = ps.Cons
+		// Already durable: they came out of the record. See owedRegsRev.
+		sess.owedRegisterDeletes = ps.OwedRegs
+		sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
+		sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
 		sess.restoreDrainsFromRecord(ps)
 		sess.sharedSubs = ps.SharedSubs
 		sess.pubRelConsumer = ps.PubRel
@@ -7424,6 +7857,11 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.subIDs = ps.SubIDs
 	sess.sharedSubs = ps.SharedSubs
 	sess.cons = ps.Cons
+	// The restored lists came OUT of the record, so they are already durable there; only
+	// a later change reopens the gap.
+	sess.owedRegisterDeletes = ps.OwedRegs
+	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
+	sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
 	sess.restoreDrainsFromRecord(ps)
 	sess.pubRelConsumer = ps.PubRel
 	// A persisted affine consumer proves only that one once existed: it may have
@@ -7770,6 +8208,8 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 		Q2Aff:             sess.q2AffConsumer,
 		Q2AffGen:          sess.q2AffGen,
 		Gen:               sess.gen,
+		OwedRegs:          sess.owedRegisterDeletes,
+		CancelledRegs:     mqttSortedNonces(sess.cancelledRegNonces),
 		Drains:            drains,
 		Will:              sess.will,
 		ExpiryInterval:    sess.expiryInterval,
@@ -7970,6 +8410,22 @@ func (sess *mqttSession) clear(noWait bool) error {
 	sess.pendingPubRel = nil
 	sess.cpending = nil
 	sess.deferred = nil
+	// Retired sources belonged to the discarded incarnation's consumers, which are being
+	// deleted: nothing can redeliver them, so nothing needs settling.
+	sess.srcAckOwed = nil
+	// The whole generation's registers are purged by the teardown, so nothing is owed.
+	sess.owedRegisterDeletes = nil
+	sess.cancelledRegNonces = nil
+	sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
+	// The identifier space of the RETIRING incarnation is gone with the maps above, so
+	// the restriction that protected it must go too. Two paths REUSE the session object
+	// as a fresh session, and a fresh one reports Session Present false, so it never
+	// runs the resume barrier that would otherwise clear this — left set, bumpPI would
+	// return 0 for the whole life of the new session and it could never deliver a
+	// single outbound QoS 1/2 message. Safe because the new incarnation has a new
+	// generation: nothing the old one could not account for can name a subject the new
+	// one uses. See inflight_register.go (R3).
+	sess.piSpaceIncomplete = false
 	sess.pubRelConsumer = nil
 	sess.pubRelVerified = false
 	// The PUBREL delivery subject is RE-MINTED below with the new incarnation, so a
@@ -8170,6 +8626,15 @@ func (sess *mqttSession) update(tok recordTx, filters []*mqttFilter, add bool) e
 }
 
 func (sess *mqttSession) bumpPI() uint16 {
+	if sess.piSpaceIncomplete {
+		// The durable identifier space could not be fully reconstructed on resume, so
+		// some identifiers the client may be holding are unknown to us. Allocating one
+		// could collide with a register or an unreplayed PUBREL that still owns it
+		// ([MQTT-2.3.1-4]). Withhold instead: the caller treats 0 exactly as it treats
+		// the in-flight cap, and AckWait re-offers the delivery. See
+		// inflight_register.go (R3).
+		return 0
+	}
 	var avail bool
 	next := sess.last_pi
 	for i := 0; i < 0xFFFF; i++ {
@@ -8213,6 +8678,16 @@ func (sess *mqttSession) effectiveMaxAck() int {
 // Lock held on entry
 func (sess *mqttSession) qos12InflightForCap() int {
 	n := len(sess.pendingPublish)
+	// Nothing is exempt. It is tempting to discount a delivery whose consumer is gone,
+	// since it can never complete — but Receive Maximum bounds what the CLIENT is holding
+	// unacknowledged, and a consumer disappearing does not prove the client completed
+	// anything. Discounting it would let the broker send another PUBLISH while the client
+	// still holds the first, breaking the negotiated limit (Spec5 [4.9]). A session stuck
+	// this way is a lost message being reported honestly, not an accounting bug.
+	//
+	// A delivery that was provably NEVER TRANSMITTED is a different matter, and it does not
+	// reach here at all: its register carries a cancellation tombstone, so recovery frees
+	// the identifier outright rather than reserving it. See inflight_register.go.
 	if sess.rmax != 0 {
 		n += len(sess.pendingPubRel)
 	}
@@ -8264,15 +8739,27 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 	return subjects
 }
 
-// dropUnredeliverableRetained releases pending retained (QoS1/2) deliveries,
-// identified by an empty jsAckSubject: they have no JetStream backing and so
-// cannot be redelivered on resume. Keeping them would leak a Receive Maximum
-// slot for the life of a persistent session.
+// dropUnredeliverableRetained releases pending retained (QoS1/2) deliveries: they
+// have no JetStream backing and so cannot be redelivered on resume. Keeping them
+// would leak a Receive Maximum slot for the life of a persistent session.
+//
+// A retained send is identified by having NO ack subject, NO durable and NO in-flight
+// register — trackPublishRetained records a wholly empty entry. Each exclusion is
+// load-bearing, because a resumed entry can lack the first two:
+//
+//   - an empty ack subject alone is not the test: a delivery recovered from an
+//     in-flight register has none until its first redelivery arrives;
+//   - an empty durable alone is not either: an entry reserved from an UNREADABLE
+//     register has no source to name, and it is precisely the identifier that must
+//     not be handed out again.
+//
+// Dropping either would undo the resume barrier on the next reconnect. See
+// inflight_register.go.
 //
 // Lock held on entry
 func (sess *mqttSession) dropUnredeliverableRetained() {
 	for pi, ack := range sess.pendingPublish {
-		if ack.jsAckSubject == _EMPTY_ {
+		if ack.jsAckSubject == _EMPTY_ && ack.jsDur == _EMPTY_ && ack.regSeq == 0 {
 			delete(sess.pendingPublish, pi)
 		}
 	}
@@ -8318,11 +8805,17 @@ func (sess *mqttSession) trackPublishRetained() uint16 {
 // Lock held on entry
 // The returned started flag is true when the PI was already tracked, i.e. this
 // is a redelivery of a message whose onward delivery already began.
-func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint16, dup, started bool) {
+//
+// isNew is true only where this call ALLOCATED the identifier, which is exactly the
+// set of deliveries owing a durable in-flight register (R1/R6). Such an entry is
+// returned marked regPending and MUST NOT be transmitted until
+// storeInflightRegister has confirmed it — the caller either confirms it or removes
+// it. See inflight_register.go.
+func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint16, dup, started, isNew bool) {
 	var pi uint16
 
 	if jsAckSubject == _EMPTY_ || jsDur == _EMPTY_ {
-		return 0, false, false
+		return 0, false, false, false
 	}
 
 	// Make sure we initialize the tracking maps.
@@ -8354,7 +8847,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		// so, indicate no need for (re-)delivery by returning a PI of 0.
 		_, usedForPubRel := sess.pendingPubRel[pi]
 		if /*dup && */ usedForPubRel {
-			return 0, false, false
+			return 0, false, false, false
 		}
 
 		// We should have a pending JS ACK for this PI. This is a redelivery of a
@@ -8365,6 +8858,15 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		// connection (a known limitation; new deliveries below still are, and
 		// the session drains to the cap as PUBACKs arrive).
 		ack = sess.pendingPublish[pi]
+		// A register store is in flight for this identifier, so its FIRST
+		// transmission has not happened yet (R1). Decline: acting here would either
+		// put the payload on the wire before its identity is durable, or — if the
+		// store then fails definitively and untracks the identifier — send under an
+		// identifier no record names. AckWait re-offers the sequence, by which time
+		// the owner has resolved it either way.
+		if ack != nil && ack.regPending {
+			return 0, false, false, false
+		}
 		started = true
 	} else {
 		// Gate new deliveries at the effective cap: MaxAckPending capped by the
@@ -8380,7 +8882,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 				sess.deferred = make(map[mqttDeferredKey]string)
 			}
 			sess.deferred[mqttDeferredKey{jsDur, sseq}] = jsAckSubject
-			return 0, false, false
+			return 0, false, false, false
 		}
 
 		if _, wasDeferred := sess.deferred[mqttDeferredKey{jsDur, sseq}]; wasDeferred {
@@ -8392,25 +8894,37 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 
 		pi = sess.bumpPI()
 		if pi == 0 {
-			return 0, false, false
+			return 0, false, false, false
 		}
 
 		sseqToPi[sseq] = pi
+		isNew = true
 	}
 
 	if ack == nil {
-		sess.pendingPublish[pi] = &mqttPending{
+		entry := &mqttPending{
 			jsDur:        jsDur,
 			sseq:         sseq,
 			jsAckSubject: jsAckSubject,
+			// This allocation owes a register, and nothing may send under the
+			// identifier until it is confirmed (R1).
+			regPending: isNew,
 		}
+		if isNew {
+			// The register's identity is minted WITH the allocation, not with the store,
+			// so a cancellation that happens while the store is in flight has something
+			// immutable to name it by. Neither the identifier nor the source works there:
+			// the cancellation frees the one and the other is re-offered.
+			entry.regNonce = mqttNewInflightNonce()
+		}
+		sess.pendingPublish[pi] = entry
 	} else {
 		ack.jsAckSubject = jsAckSubject
 		ack.sseq = sseq
 		ack.jsDur = jsDur
 	}
 
-	return pi, dup, started
+	return pi, dup, started, isNew
 }
 
 // Stops a PI from being tracked as a PUBLISH. It can still be in use for a
@@ -8462,6 +8976,119 @@ func (sess *mqttSession) untrackPublishEntry(pi uint16) *mqttPending {
 	return ack
 }
 
+// mqttRetiredSource is one QoS 2 source that is past PUBREC while its acknowledgement is
+// unproven: its payload must never be sent again, and its next delivery attempt is to be
+// acknowledged rather than delivered.
+//
+// It carries what is needed to make the fact DURABLE later as well as to act on it now.
+// durable says whether the register already records the retirement; while it is false the
+// exchange's PUBREL record is the only cross-restart evidence, so that PUBREL must not be
+// acknowledged away (see mqttProcessPubComp).
+type mqttRetiredSource struct {
+	pi         uint16 // the identifier whose exchange retired this source
+	regSeq     uint64 // the register's current sequence: CAS base while unmarked, delete target once settled
+	nonce      string // the register's identity, so a later CAS can prove the record is ours
+	q2AffClaim string // preserved across the rewrite; empty for an ordinary delivery
+	durable    bool
+}
+
+// retireSourceLocked records that a QoS 2 source delivery is past PUBREC while its
+// acknowledgement is NOT proven: its payload must never be sent again, and the next
+// delivery attempt is to be acknowledged rather than delivered.
+//
+// Keyed by the SOURCE, deliberately, and not by the packet identifier. The obvious
+// alternative — restoring the source's cpending link so the usedForPubRel guard in
+// trackPublish suppresses the redelivery — works only until PUBCOMP: untrackPubRel
+// removes the pendingPubRel entry the guard tests, and the very next redelivery then
+// re-sends the payload of an exchange the client has already COMPLETED. A fact about
+// the source has to outlive the identifier's bookkeeping, which is the same shape the
+// affine path already uses (its claim's AffineDone flag) and for the same reason.
+//
+// The set is drained by mqttSourceRetired, which is why it cannot grow with traffic: an
+// entry costs one map slot until the first delivery attempt whose acknowledgement is
+// CONFIRMED, and it is only ever created when an acknowledgement could not be proven.
+//
+// Idempotent: a same-broker reconnect re-runs the resume barrier while an existing
+// retirement is still in place, and re-recording one must not undo what is already known
+// about it (in particular that it is already durable).
+//
+// Lock held on entry.
+func (sess *mqttSession) retireSourceLocked(jsDur string, sseq uint64, rs *mqttRetiredSource) {
+	if jsDur == _EMPTY_ || sseq == 0 || rs == nil {
+		return
+	}
+	if sess.srcAckOwed == nil {
+		sess.srcAckOwed = make(map[mqttDeferredKey]*mqttRetiredSource)
+	}
+	key := mqttDeferredKey{jsDur, sseq}
+	if cur := sess.srcAckOwed[key]; cur != nil {
+		if rs.durable {
+			cur.durable = true
+			cur.regSeq = rs.regSeq
+		}
+		return
+	}
+	sess.srcAckOwed[key] = rs
+}
+
+// retiredSourceForLocked finds the retirement an exchange's packet identifier created, so
+// PUBCOMP can secure it before destroying the PUBREL that also evidences it. The map holds
+// one entry per unproven acknowledgement, so the scan is over a handful of entries at most.
+//
+// Lock held on entry.
+func (sess *mqttSession) retiredSourceForLocked(pi uint16) (mqttDeferredKey, bool) {
+	for key, rs := range sess.srcAckOwed {
+		if rs != nil && rs.pi == pi && !rs.durable {
+			return key, true
+		}
+	}
+	return mqttDeferredKey{}, false
+}
+
+// sourceRetiredLocked reports whether a delivery attempt belongs to a source that is
+// already past PUBREC with an unproven acknowledgement. Such an attempt must not be
+// tracked and must not be delivered; the caller settles it with settleRetiredSource
+// once it has released the lock.
+//
+// Lock held on entry.
+func (sess *mqttSession) sourceRetiredLocked(jsDur string, sseq uint64) bool {
+	if len(sess.srcAckOwed) == 0 {
+		return false
+	}
+	_, owed := sess.srcAckOwed[mqttDeferredKey{jsDur, sseq}]
+	return owed
+}
+
+// settleRetiredSource acknowledges a retired source's delivery attempt with
+// CONFIRMATION, using THIS attempt's reply subject — never the stale one whose
+// acknowledgement could not be proven — and releases the entry only once that lands. A
+// failure leaves the entry in place so the next redelivery retries; nothing is
+// delivered either way, which is the whole point.
+//
+// Lock NOT held on entry: this issues a JetStream request.
+func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint64, reply string) {
+	if err := sess.jsa.confirmAck(reply); err != nil {
+		c.Warnf("MQTT: discarded a redelivery of retired QoS 2 source %s/%d for client %q, but its acknowledgement is still unproven: %v",
+			jsDur, sseq, sess.id, err)
+		return
+	}
+	key := mqttDeferredKey{jsDur, sseq}
+	sess.mu.Lock()
+	var regSeq uint64
+	if rs := sess.srcAckOwed[key]; rs != nil {
+		regSeq = rs.regSeq
+	}
+	delete(sess.srcAckOwed, key)
+	sess.mu.Unlock()
+	// The source is provably gone, so the retired register has nothing left to protect
+	// and is removed at its exact sequence — otherwise every retirement would leave a
+	// record behind for the orphan sweep to collect much later.
+	if regSeq != 0 && sess.asm != nil {
+		sess.asm.deleteInflightRegister(regSeq)
+	}
+	c.Debugf("MQTT: settled retired QoS 2 source %s/%d for client %q", jsDur, sseq, sess.id)
+}
+
 // retrackPublishLocked reinstates an entry removed by untrackPublishEntry, under
 // the SAME packet identifier, restoring both maps. Used to roll back a PUBREC
 // whose PUBREL store failed: without it the identifier stays wedged in
@@ -8496,9 +9123,15 @@ func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
 // redelivery (with the DUP flag set) on session resume as required by spec
 // [MQTT-4.4.0-1], instead of waiting for the JS consumer's AckWait interval.
 // NAKs are ordered by stream sequence so redeliveries preserve original order
-// [MQTT-4.6.0-1], and re-use the original packet identifiers. This only takes
-// effect on a same-server reconnect, where the in-memory tracking maps survive;
-// after a restart or failover, redelivery falls back to the AckWait interval.
+// [MQTT-4.6.0-1], and re-use the original packet identifiers.
+//
+// The NAK — the PROMPTNESS of the redelivery — is a same-server-reconnect
+// optimization: it needs a live per-attempt JetStream ack subject, and an entry
+// rebuilt by the resume barrier from its durable in-flight register has none until
+// its first redelivery arrives, so after a restart or a failover redelivery falls
+// back to the AckWait interval. The packet IDENTIFIER no longer depends on any of
+// this: it is restored from the register itself, before any source interest exists.
+// See inflight_register.go.
 //
 // resumePubs/resumeRels are the pending identities captured when the session was
 // attached to this connection, BEFORE any subscription was restored. Only those
@@ -8548,6 +9181,12 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	pubNaks := make([]pendingNak, 0, len(sess.pendingPublish))
 	for pi, ack := range sess.pendingPublish {
 		if _, atResume := resumePubs[mqttPendingRef{pi, ack.sseq, ack.jsDur}]; !atResume {
+			continue
+		}
+		if ack.regPending {
+			// Allocated but not yet durable, so never transmitted (R1). Forcing a
+			// redelivery would achieve nothing — trackPublish declines a regPending
+			// entry — and the identifier may still be released if the store fails.
 			continue
 		}
 		if ack.jsAckSubject != _EMPTY_ {
@@ -9540,6 +10179,29 @@ CHECK:
 	c.mqtt.sessionExpiry = expiry
 	c.mu.Unlock()
 
+	// Rebuild the outbound in-flight identifier space from durable state (R3,
+	// inflight_register.go), BEFORE the CONNACK. Two orderings depend on it: no source
+	// interest may exist yet (processSubs below installs it), and recoverDrainPubRels
+	// stores PUBRELs under recorded identifiers that must already be reserved.
+	//
+	// Before the CONNACK rather than beside those steps, for a reason that is not
+	// aesthetic: a client may publish the instant its CONNACK lands, and every
+	// JetStream round trip taken after the CONNACK but before processSubs widens the
+	// window in which a QoS 0 subscription does not yet exist and a message is simply
+	// dropped. It also reads better as a rule — the identifier space is reconstructed
+	// before the session is declared usable at all.
+	//
+	// A failure REFUSES the CONNECT: unlike a drain, whose barrier can withhold one
+	// durable's interest, the identifier space is a single shared resource and half of
+	// it cannot be used safely. Only reads JetStream and writes session memory, so it
+	// takes no record transaction and is safe inside the accept transaction.
+	if sessp {
+		if err := es.recoverInflightRegisters(c); err != nil {
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, err)
+			return formatError(err)
+		}
+	}
+
 	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.
 	// The entry fit check used the identical frame builder and captured values, so
 	// this send is guaranteed to fit; the guard is defensive.
@@ -9558,6 +10220,25 @@ CHECK:
 		es.mu.Lock()
 		prior := es.sharedSubs
 		es.sharedSubs = nil
+		// In the same breath as the membership removal, and before the save that
+		// persists it: see voidRegistrationsLocked.
+		var leaveCancels []mqttRegCancellation
+		var leaveVoided []string
+		voidLeave := func(dur string) {
+			cancels, sent := es.voidRegistrationsLocked(dur)
+			leaveCancels = append(leaveCancels, cancels...)
+			leaveVoided = append(leaveVoided, sent...)
+		}
+		for _, cc := range es.cons {
+			if cc.DeliverGroup != _EMPTY_ {
+				voidLeave(cc.Durable)
+			}
+		}
+		for key := range prior {
+			for _, dur := range mqttSharedDurablesForKey(key) {
+				voidLeave(dur)
+			}
+		}
 		es.mu.Unlock()
 		// Everything the forced leave does once its record write is CONFIRMED. A
 		// closure, because that confirmation can also arrive later from a readback:
@@ -9571,17 +10252,16 @@ CHECK:
 			// resubscribe of the same filter must not find a stale cons entry and
 			// skip recreating a durable this forced leave may delete below.
 			es.mu.Lock()
+			var regs []uint64
+			var cancels []mqttRegCancellation
 			for sid, cc := range es.cons {
 				if cc.DeliverGroup == _EMPTY_ {
 					continue
 				}
 				delete(es.cons, sid)
-				if seqPis, ok := es.cpending[cc.Durable]; ok {
-					delete(es.cpending, cc.Durable)
-					for _, pi := range seqPis {
-						delete(es.pendingPublish, pi)
-					}
-				}
+				pregs, pcancels := es.purgeConsumerPendingLocked(cc.Durable)
+				regs = append(regs, pregs...)
+				cancels = append(cancels, pcancels...)
 				if amt, ok := es.sharedCharged[cc.Durable]; ok {
 					es.tmaxack -= amt
 					if es.tmaxack < 0 {
@@ -9591,6 +10271,17 @@ CHECK:
 				}
 			}
 			es.mu.Unlock()
+			es.deleteInflightRegisters(c, acceptTok, regs)
+			// The staged cancellations are already in this CONNECT's record; anything the
+			// purge just found arrived after that write, and the group durables below stay
+			// while such a cancellation is unaccounted for — an unexplained register costs
+			// an identifier for the life of the session, a surviving durable only costs
+			// resources.
+			es.secureRegCancellations(c, acceptTok, leaveCancels)
+			if !es.secureRegCancellations(c, acceptTok, cancels) {
+				c.Errorf("MQTT: the cancelled in-flight registration(s) of client %q are not "+
+					"durably recorded yet on a 3.1.1 forced leave", es.id)
+			}
 			var durs []string
 			for key := range prior {
 				durs = append(durs, mqttSharedDurablesForKey(key)...)
@@ -9617,6 +10308,7 @@ CHECK:
 				es.mu.Lock()
 				es.sharedSubs = prior
 				es.mu.Unlock()
+				es.unvoidRegNonces(leaveVoided)
 			}
 			switch outcome {
 			case saveDefinitelyFailed:
@@ -11884,15 +12576,110 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// assignment claim may only be reaped once the affine side is PROVEN complete,
 	// and a queued ack proves nothing. Ordered after the PUBREL store above, so the
 	// copy is never released before the exchange has somewhere to continue from.
+	// Whichever branch runs, the identifier has been released, so its durable
+	// in-flight register goes with it (R5). Ordered per branch below rather than
+	// once here, because on the QoS 2 path the delete is what completes the handoff
+	// of the identifier's authority to the PUBREL record and may only follow a
+	// CONFIRMED source ack.
 	switch {
 	case q2AffClaim != _EMPTY_:
 		c.mqttFinishQ2AffineDelivery(q2AffClaim, jsAckSubject)
+		sess.deleteInflightRegisterFor(removed)
 	case drainedPubRel:
-		// Deliberately nothing. See the intent block above: the claim and its
-		// JetStream delivery are held until the PUBREL is proven to exist, so a
-		// PUBREL that was silently kept nowhere costs a redelivery rather than the
-		// message. A non-drained QoS 2 source still acks here, as it always has.
-	case !sess.finalizeDrainSource(c, removed):
+		// Deliberately nothing — not even the register delete. See the intent block
+		// above: the claim and its JetStream delivery are held until the PUBREL is
+		// proven to exist, so a PUBREL that was silently kept nowhere costs a
+		// redelivery rather than the message. The register is that redelivery's
+		// identity and must outlive an unproven PUBREL; the drain's own completion
+		// path releases it. A non-drained QoS 2 source still acks here, as it always
+		// has.
+	case sess.finalizeDrainSource(c, removed):
+		// A drained source, already resolved (or resolving) by the drain state
+		// machine, which owns the ack. Only the register is ours to remove.
+		sess.deleteInflightRegisterFor(removed)
+	case isPubRec && !pubRecFailed && removed != nil && removed.regSeq != 0:
+		// The PUBLISH phase is over and the identifier's durable authority has moved
+		// to the PUBREL record stored above (R2). Deleting the register completes that
+		// handoff, and the source ack is what licenses the delete — so here, and only
+		// here, the ack is CONFIRMED (the jsa.confirmAck rule: a durable record is
+		// being deleted on the strength of an ack).
+		//
+		// What the confirmation buys is CONTINUITY, not the absence of a duplicate: it
+		// keeps the register from being removed over a source that was never actually
+		// released, which would cost the redelivery its original identifier. A source
+		// ack that never lands means JetStream redelivers regardless — that was true
+		// before the register existed.
+		if aerr := sess.confirmInflightSourceAck(jsAckSubject); aerr != nil {
+			// The ack is unproven, so the source may still be pending and will be
+			// re-offered. Two things have to happen, and the second is the one that is
+			// easy to miss.
+			//
+			// The register is KEPT, so a later resume can restore this identifier.
+			//
+			// And the SOURCE is retired: its payload is past PUBREC and must never be
+			// sent again, so the next delivery attempt is acknowledged instead of
+			// delivered. Without that, the re-offered source is delivered again — before
+			// PUBCOMP under a fresh identifier (the cpending link is gone), and after
+			// PUBCOMP under any identifier at all, because the guard that would have
+			// suppressed it tests pendingPubRel, which PUBCOMP removes. Retiring the
+			// source is keyed by the source rather than by the identifier precisely so it
+			// outlives the identifier's bookkeeping. See retireSourceLocked.
+			//
+			// The source is deliberately left UNACKNOWLEDGED here, with no best-effort
+			// retry. A retry that happened to land would settle the message but strand its
+			// retirement for the life of the session, because nothing else would ever drain
+			// it. Leaving the source unacked instead means JetStream re-offers it exactly
+			// once more, and settleRetiredSource then acknowledges that attempt WITH
+			// CONFIRMATION — under a fresh reply subject rather than the stale one that just
+			// failed — and releases both the retirement and the register.
+			//
+			// The retirement is recorded in BOTH places, and it has to be. In memory it
+			// suppresses every redelivery on this broker. On the register it survives a
+			// restart: without the durable half the next resume sees an ordinary
+			// PUBLISH-phase register over a live source — indistinguishable from a delivery
+			// that never reached PUBREC — and re-sends a payload the client has already
+			// completed. Leaving the source deliberately unacked is exactly what makes that
+			// window reachable, so the durable mark is not optional.
+			// In memory FIRST, then durably. The in-memory half is what suppresses a
+			// redelivery arriving on this broker, and the PUBREL whose delivery is already
+			// in flight can bring one at any moment — so it must be in place before this
+			// path spends a JetStream round trip on the durable half.
+			//
+			// The durable half is attempted here and, if it does not land, AGAIN at PUBCOMP,
+			// which is the moment the alternative evidence disappears: while this exchange's
+			// PUBREL record exists a restart is safe anyway, because recovery reads
+			// register-plus-PUBREL as "past PUBREC". So this attempt failing is recoverable
+			// rather than a residual.
+			sess.mu.Lock()
+			sess.retireSourceLocked(removed.jsDur, removed.sseq, &mqttRetiredSource{
+				pi:         pi,
+				regSeq:     removed.regSeq,
+				nonce:      removed.regNonce,
+				q2AffClaim: removed.q2AffClaim,
+			})
+			sess.mu.Unlock()
+			// An unproven acknowledgement is AMBIGUOUS, and most often it landed with only
+			// its confirmation lost. Read the source before making anything durable: if it
+			// is provably complete the retirement has nothing to suppress and is dropped
+			// here, which is what keeps a retirement from outliving its exchange and being
+			// re-established by every later resume. Only a source that is still live (or
+			// unprovable) is worth a durable mark.
+			retiredKey := mqttDeferredKey{removed.jsDur, removed.sseq}
+			if !sess.resolveRetiredSource(c, retiredKey) {
+				sess.secureRetiredSource(c, retiredKey)
+			}
+			c.Warnf("MQTT: keeping the in-flight register of packet identifier %d for client %q and retiring its source %s/%d: "+
+				"the source acknowledgement was not confirmed: %v", pi, sess.id, removed.jsDur, removed.sseq, aerr)
+			break
+		}
+		sess.deleteInflightRegisterFor(removed)
+	default:
+		// QoS 1, a failed PUBREC, and any QoS 2 source that carried no register. The
+		// register goes first, then the ordinary fire-and-forget ack: a lost ack here
+		// costs one duplicate PUBLISH, which QoS 1 permits and which [MQTT-4.4.0-1]
+		// does not bind — it governs UNACKNOWLEDGED messages — so a confirmed round
+		// trip on the hottest path would buy nothing.
+		sess.deleteInflightRegisterFor(removed)
 		sess.jsa.sendAck(jsAckSubject)
 	}
 	for _, subj := range deferredNaks {
@@ -11923,8 +12710,31 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 		return
 	}
 	jsAckSubject = sess.untrackPubRel(pi)
+	// Does this exchange still hold the ONLY durable evidence that its source is past
+	// PUBREC? Looked up before the ack below, because that ack is what destroys it.
+	retiredKey, insecure := sess.retiredSourceForLocked(pi)
 	deferredNaks := sess.deferredNaksLocked()
 	sess.mu.Unlock()
+
+	// A retired source whose register does not yet record the retirement is protected
+	// across a restart only by this exchange's PUBREL record: recovery reads
+	// register-plus-PUBREL as "past PUBREC" and suppresses the source, while an unmarked
+	// register ALONE looks like an ordinary owed delivery and its payload is re-sent. So
+	// the evidence is not destroyed until the retirement is durable — persist before ack,
+	// the same rule the UNSUBSCRIBE drain follows.
+	//
+	// Withholding the acknowledgement costs a PUBREL redelivery, which [MQTT-4.4.0-1]
+	// makes legitimate and which the client answers with another PUBCOMP; that brings us
+	// back here to retry. Paced by AckWait, and self-healing.
+	if insecure && !sess.secureRetiredSource(c, retiredKey) {
+		c.Warnf("MQTT: withholding the acknowledgement of the PUBREL for packet identifier %d of client %q: "+
+			"its retired source %s/%d is not durably recorded yet, and this record is the only other evidence of it",
+			pi, sess.id, retiredKey.jsDur, retiredKey.sseq)
+		for _, subj := range deferredNaks {
+			sess.jsa.sendMsg(subj, AckNak)
+		}
+		return
+	}
 
 	// Send the ack to JS to remove the pending message from the consumer.
 	sess.jsa.sendAck(jsAckSubject)
@@ -12515,22 +13325,47 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		return
 	}
 
-	pi, dup, started := sess.trackPublish(sub.mqtt.jsDur, reply)
+	sseq, _, _, _, _ := ackReplyInfo(reply)
+	// A source RETIRED by an unproven acknowledgement is past PUBREC: its payload must
+	// never go out again, whatever the identifier bookkeeping now says. Tested BEFORE
+	// trackPublish, because after PUBCOMP nothing in those maps remembers the exchange
+	// and the payload would simply be re-sent under a fresh identifier. Not applied to a
+	// drain-managed sequence: there the drain state machine owns both the decision and
+	// the acknowledgement.
+	if !drainClaimed && sess.sourceRetiredLocked(sub.mqtt.jsDur, sseq) {
+		sess.mu.Unlock()
+		sess.settleRetiredSource(cc, sub.mqtt.jsDur, sseq, reply)
+		return
+	}
+
+	pi, dup, started, isNew := sess.trackPublish(sub.mqtt.jsDur, reply)
 	if drainClaimed && pi != 0 {
 		// The RECORD says this delivery was already transmitted, so override what
-		// the in-memory maps inferred: after a restart cpending is empty, so
-		// trackPublish reports started=false and derives dup only from JetStream's
-		// delivery count. started=true keeps the message out of the !started expiry
-		// discard below, and dup=true is simply correct — it WAS sent before.
+		// the in-memory maps inferred: on a broker that has not recovered this
+		// delivery's register cpending is empty, so trackPublish reports
+		// started=false and derives dup only from JetStream's delivery count.
+		// started=true keeps the message out of the !started expiry discard below,
+		// and dup=true is simply correct — it WAS sent before.
 		started, dup = true, true
 		if d := sess.drainByDur[sub.mqtt.jsDur]; d != nil {
-			sseq, _, _, _, _ := ackReplyInfo(reply)
 			if st := d.seqs[sseq]; st != nil {
 				st.ack = reply
-				// The identifier is freshly allocated after a restart (the documented
-				// packet-identifier-continuity deviation); keep the record in step so a
-				// later intent names the identifier actually on the wire.
+				// Normally a reconciliation of equal values: the resume barrier restored
+				// the identifier from this delivery's in-flight register before any source
+				// interest existed, so trackPublish returned the very identifier the
+				// record already names. It still assigns, because where the register was
+				// legitimately absent — a claim that never got one, or one dropped as
+				// provably complete — a later PUBREL intent must name the identifier
+				// actually on the wire.
 				st.pi = pi
+				// Repair the register sequence from the live entry. A drain record written
+				// before RegSeq existed carries none, and a drain that acquired its register
+				// through recovery rather than through staging has it only here. The drain
+				// releases the register when the exchange completes, so a zero left in place
+				// would leak it (finalizeDrainDelivery).
+				if ack := sess.pendingPublish[pi]; ack != nil && ack.regSeq != 0 {
+					st.regSeq = ack.regSeq
+				}
 			}
 		}
 	}
@@ -12564,11 +13399,32 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			sess.mu.Lock()
 			removed := sess.untrackPublishEntry(pi)
 			sess.mu.Unlock()
+			// The identifier is released, so its register must go with it (R5). Ordered
+			// before the source ack, so a crash in between leaves a register over a
+			// source that is still live rather than one over a completed delivery.
+			// Normally a no-op: expiry is decided BEFORE the register is written, so a
+			// message dropped here never paid for one. It runs anyway because `started`
+			// is not the only way an entry can carry a register — a drain-claimed
+			// redelivery reaches this point with one.
+			sess.deleteInflightRegisterFor(removed)
 			if !sess.finalizeDrainSource(cc, removed) {
 				sess.jsa.sendAck(reply)
 			}
 			return
 		}
+	}
+
+	// A newly allocated identifier is not sendable until its durable in-flight
+	// register is confirmed (R1, inflight_register.go). Synchronous, as the shared
+	// QoS 2 move above already is on this same path: the identifier the client is
+	// about to hold has to survive this broker.
+	//
+	// As late as possible, and after the expiry check above: a message that is
+	// discarded rather than sent has no identifier to make durable, so it should not
+	// pay a round trip for one. Still strictly BEFORE the enqueue below, which is the
+	// send.
+	if isNew && !sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, _EMPTY_) {
+		return
 	}
 	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, subID, originalTopic, msg, props) {
 		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
@@ -12577,6 +13433,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
+		sess.deleteInflightRegisterFor(removed)
 		if !sess.finalizeDrainSource(cc, removed) {
 			sess.jsa.sendAck(reply)
 		}
@@ -12987,6 +13844,27 @@ func (c *client) mqttResolveAfterPacket() {
 	sess.resolveUncertainNow(c)
 }
 
+// mqttFlushOwedRegisterDeletes persists an outbound in-flight register cleanup the packet
+// that just finished may have left un-recorded.
+//
+// It belongs here for the same reason mqttResolveAfterPacket does: an UNSUBSCRIBE that
+// cancels a register-pending delivery makes the delivery goroutine own the cleanup, and that
+// goroutine is refused the fence for as long as the UNSUBSCRIBE holds it — while the
+// UNSUBSCRIBE's own record write may already have been marshalled without the entry. This is
+// the first moment the fence is free again, so it is where the obligation becomes durable
+// rather than waiting for the session's next register store or resume.
+//
+// Runs from the client's readLoop, with no transaction held.
+func (c *client) mqttFlushOwedRegisterDeletes() {
+	c.mu.Lock()
+	sess := c.mqtt.sess
+	c.mu.Unlock()
+	if sess == nil {
+		return
+	}
+	sess.persistOwedRegisterDeletes(c)
+}
+
 func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error) {
 	// Those things are immutable, but since processing subs is not
 	// really in the fast path, let's get them under the client lock.
@@ -13017,7 +13895,7 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error)
 //
 // Runs from client's readLoop.
 // Lock not held on entry, but session is in the locked map.
-func (sess *mqttSession) cleanupFailedSub(c *client, sub *subscription, cc *ConsumerConfig, jssub *subscription) {
+func (sess *mqttSession) cleanupFailedSub(c *client, tok recordTx, sub *subscription, cc *ConsumerConfig, jssub *subscription) {
 	if sub != nil {
 		c.processUnsub(sub.sid)
 	}
@@ -13030,7 +13908,7 @@ func (sess *mqttSession) cleanupFailedSub(c *client, sub *subscription, cc *Cons
 		// release (the caller has already rolled back this session's membership).
 		// Spec5 [4.8.2].
 		if cc.DeliverGroup != _EMPTY_ {
-			sess.releaseSharedConsumer(c, cc, nil)
+			sess.releaseSharedConsumer(c, tok, cc, nil)
 		} else {
 			sess.deleteConsumer(cc)
 		}
@@ -13158,7 +14036,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 //
 // Session lock is acquired and released as needed. Session is in the locked
 // map.
-func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
+func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid string,
 	qos byte, noLocal, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, *ConsumerConfig, error) {
 
 	sess.mu.Lock()
@@ -13195,7 +14073,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 			if fromSubProto {
 				return nil, nil, cc, nil
 			}
-			sess.execDeferredConsumerDelete(c, sid, cc)
+			sess.execDeferredConsumerDelete(c, tok, sid, cc)
 			return nil, nil, nil, nil
 		}
 		// If this is called when processing SUBSCRIBE protocol, then if
@@ -13321,7 +14199,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 // the closed flag (guarded by sess.mu and sess.subsMu, same as delivery) makes
 // mqttDeliverMsgCbQoS12 skip instead while leaving sub.mqtt valid for an
 // already-committed enqueue.
-func (sess *mqttSession) execDeferredConsumerDelete(c *client, sid string, cc *ConsumerConfig) {
+func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid string, cc *ConsumerConfig) {
 	c.mu.Lock()
 	sub := c.subs[cc.DeliverSubject]
 	c.mu.Unlock()
@@ -13339,14 +14217,22 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, sid string, cc *C
 		sub.mqtt.closed = true
 		sess.subsMu.Unlock()
 	}
-	if seqPis, ok := sess.cpending[cc.Durable]; ok {
-		delete(sess.cpending, cc.Durable)
-		for _, pi := range seqPis {
-			delete(sess.pendingPublish, pi)
-		}
-	}
+	regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
 	sess.mu.Unlock()
+	sess.deleteInflightRegisters(c, tok, regs)
 
+	// Anything the purge found here arrived AFTER this packet staged its cancellations
+	// (a delivery already in the callback when the durable's subscription was closed),
+	// so its cancellation missed the membership-removal write. Keeping the consumer
+	// would not redeem that: the membership is gone either way, so a register that lands
+	// has nothing to redeliver through whether the durable lives or not — and an
+	// unreferenced durable nothing reaps is worse than none. So it is reported and the
+	// obligation is left to the convergence points.
+	if !sess.secureRegCancellations(c, tok, cancels) {
+		c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for client %q "+
+			"are not durably recorded yet; their identifiers stay reserved until the cleanup "+
+			"is discharged", cc.Durable, sess.id)
+	}
 	sess.deleteConsumer(cc)
 	if sub != nil {
 		c.processUnsub(sub.sid)
@@ -13499,7 +14385,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 // it. Spec5 [4.8.2].
 //
 // Runs from the client's readLoop. sess.mu not held on entry.
-func (sess *mqttSession) releaseSharedConsumer(c *client, cc *ConsumerConfig, held map[string]bool) {
+func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *ConsumerConfig, held map[string]bool) {
 	if cc == nil || cc.DeliverGroup == _EMPTY_ {
 		return
 	}
@@ -13515,12 +14401,7 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, cc *ConsumerConfig, he
 		sub.mqtt.closed = true
 		sess.subsMu.Unlock()
 	}
-	if seqPis, ok := sess.cpending[cc.Durable]; ok {
-		delete(sess.cpending, cc.Durable)
-		for _, pi := range seqPis {
-			delete(sess.pendingPublish, pi)
-		}
-	}
+	regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
 	if amt, ok := sess.sharedCharged[cc.Durable]; ok {
 		sess.tmaxack -= amt
 		if sess.tmaxack < 0 {
@@ -13529,6 +14410,14 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, cc *ConsumerConfig, he
 		delete(sess.sharedCharged, cc.Durable)
 	}
 	sess.mu.Unlock()
+	sess.deleteInflightRegisters(c, tok, regs)
+	// As in execDeferredConsumerDelete: anything found here arrived after the staging,
+	// and keeping the durable would not make its identifier recoverable.
+	if !sess.secureRegCancellations(c, tok, cancels) && c != nil {
+		c.Errorf("MQTT: the cancelled in-flight registration(s) of shared consumer %q for client %q "+
+			"are not durably recorded yet; their identifiers stay reserved until the cleanup "+
+			"is discharged", cc.Durable, sess.id)
+	}
 	if c != nil && sub != nil {
 		c.processUnsub(sub.sid)
 	}
@@ -13552,18 +14441,22 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, cc *ConsumerConfig, he
 // redelivers to other members) and so the packet identifiers are freed. Spec5 [4.8.2].
 func (sess *mqttSession) purgeSharedPending() {
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
+	var regs []uint64
+	var cancels []mqttRegCancellation
 	for _, cc := range sess.cons {
 		if cc.DeliverGroup == _EMPTY_ {
 			continue
 		}
-		if seqPis, ok := sess.cpending[cc.Durable]; ok {
-			delete(sess.cpending, cc.Durable)
-			for _, pi := range seqPis {
-				delete(sess.pendingPublish, pi)
-			}
-		}
+		pregs, pcancels := sess.purgeConsumerPendingLocked(cc.Durable)
+		regs = append(regs, pregs...)
+		cancels = append(cancels, pcancels...)
 	}
+	sess.mu.Unlock()
+	// No consumer is destroyed here — the group durable survives — but the identifiers
+	// are freed, so a register that lands afterwards would have the next resume reserve
+	// one the session has already given up.
+	sess.secureRegCancellations(nil, recordTx{}, cancels)
+	sess.deleteInflightRegisters(nil, recordTx{}, regs)
 }
 
 // sharedConsumerHasOtherHolders reports whether any session still holds a shared
@@ -13827,10 +14720,9 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 		// remains); the leaving filter has already been removed from sharedSubs
 		// and persisted below, so the last-holder scan is correct. Spec5 [4.8.2].
 		if cc.DeliverGroup != _EMPTY_ {
-			sess.releaseSharedConsumer(c, cc, heldShared)
+			sess.releaseSharedConsumer(c, tok, cc, heldShared)
 			return
 		}
-		sess.deleteConsumer(cc)
 
 		c.mu.Lock()
 		sub := c.subs[cc.DeliverSubject]
@@ -13846,14 +14738,19 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 			sub.mqtt.closed = true
 			sess.subsMu.Unlock()
 		}
-		if seqPis, ok := sess.cpending[cc.Durable]; ok {
-			delete(sess.cpending, cc.Durable)
-			for _, pi := range seqPis {
-				delete(sess.pendingPublish, pi)
-			}
-			// last_pi stays monotonic (see untrackPublish); do not reset here.
-		}
+		regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
 		sess.mu.Unlock()
+		// The consumer delete moved BELOW the purge, which is also what the barrier
+		// above always wanted: the closed flag is now set before the durable goes, and
+		// a cancelled registration is durably named before the consumer that would
+		// classify its source disappears.
+		if !sess.secureRegCancellations(c, tok, cancels) {
+			c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for client %q "+
+				"are not durably recorded yet", cc.Durable, sess.id)
+		}
+		// Before the consumer, for the reason given in deleteInflightRegisters.
+		sess.deleteInflightRegisters(c, tok, regs)
+		sess.deleteConsumer(cc)
 	}
 	// v5 UNSUBACK reports whether each subscription existed; the session maps are
 	// guarded by the session-manager lock held here. Spec5 [3.11.3].
@@ -13908,6 +14805,7 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 			}
 		}
 	}
+	stagedCancels, closedDeliveries, voidedSent := sess.stageUnsubCancellationsLocked(c, filters, drainedSids)
 	sess.mu.Unlock()
 
 	// Everything the UNSUBSCRIBE does AFTER its record write is confirmed. It is a
@@ -13917,6 +14815,9 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 	// subscriptions, the consumers and the staged (uncommitted) drains — a
 	// half-applied packet with nothing left to finish it.
 	commitUnsub := func() {
+		// The staged cancellations are durable in the packet's own record now, so this
+		// is cleanup: a tombstone lets the register go without waiting for a resume.
+		sess.secureRegCancellations(c, tok, stagedCancels)
 		// The leaving filters are already out of sharedSubs and persisted, so one scan
 		// now decides every shared durable this packet may release; keys the session
 		// still holds (e.g. "$share/g/foo" while "$share/g/foo.>" leaves) count as
@@ -13965,6 +14866,11 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 		// session is unresolved until the readback settles it, so nothing else can
 		// be persisted meanwhile. See sess_uncertain.go.
 		undoUnsub := func() {
+			// The delivery barrier goes back too: nothing was persisted, so these
+			// subscriptions are still the client's and must keep delivering, and their
+			// transmitted deliveries still owe their identifiers.
+			sess.reopenTeardownDelivery(closedDeliveries)
+			sess.unvoidRegNonces(voidedSent)
 			sess.mu.Lock()
 			sess.subs = snap.subs
 			sess.sharedSubs = snap.shared

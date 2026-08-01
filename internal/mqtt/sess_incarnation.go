@@ -155,6 +155,32 @@ func mqttQoS2HoldWalkFilter(idHash, gen string) string {
 	return mqttQoS2IncomingMsgsStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") + ".*"
 }
 
+// mqttInflightSubject returns the $MQTT_inflight subject carrying the durable
+// IN-FLIGHT REGISTER for one outbound packet identifier of one session incarnation
+// ("$MQTT.inflight.<idHash>.<gen>.<PI>").
+//
+// Keyed by the packet identifier, which is what makes the create-only CAS on it an
+// allocation arbitration as well as a record: two brokers cannot both believe they
+// own the same identifier. A 16-bit identifier also bounds one incarnation at 65_535
+// subjects, so the recovery walk's filter always returns the whole set in one
+// request — the same bound, for the same reason, as mqttQoS2HoldWalkFilter.
+//
+// The generation scopes it for the reason every other name here is scoped: a
+// register left behind by a retired incarnation can only ever name a subject a
+// live session does not use, so a late write or delete from one is harmless by
+// construction. See inflight_register.go.
+func mqttInflightSubject(idHash, gen string, pi uint16) string {
+	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") +
+		"." + strconv.FormatUint(uint64(pi), 10)
+}
+
+// mqttInflightWalkFilter returns the filter enumerating one incarnation's in-flight
+// registers, and only those: exactly one token past the generation. Used by the
+// resume barrier and by the teardown purge.
+func mqttInflightWalkFilter(idHash, gen string) string {
+	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") + ".*"
+}
+
 // mqttSessGenFromRecord validates a generation read from a persisted session
 // record before anything derives a NAME from it.
 //
