@@ -1787,6 +1787,13 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 
 	sess.mu.Lock()
 	pi, dup, started, isNew := sess.trackPublish(jsDur, reply)
+	// The allocation's nonce, read under the allocating lock (see mqttDeliverMsgCbQoS12).
+	var regNonce string
+	if isNew {
+		if ack := sess.pendingPublish[pi]; ack != nil {
+			regNonce = ack.regNonce
+		}
+	}
 	if pi != 0 {
 		if p := sess.pendingPublish[pi]; p != nil {
 			// Carry the claim into the pending entry: the terminal paths (PUBREC,
@@ -1824,7 +1831,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 	// pending entry is the only route by which the claim reaches the terminal paths
 	// above, so a register without it would leave a post-restart PUBREC unable to
 	// record AffineDone.
-	if isNew && !sess.storeInflightRegister(cc, pi, 2, jsDur, sseq, claimSubject) {
+	if isNew && !sess.storeInflightRegister(cc, pi, 2, jsDur, sseq, regNonce, claimSubject) {
 		return
 	}
 	topic := natsSubjectStrToMQTTTopic(string(h.subject))

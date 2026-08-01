@@ -444,23 +444,72 @@ func (sess *mqttSession) voidRegNonceLocked(nonce string) {
 		return
 	}
 	if sess.cancelledRegNonces == nil {
-		sess.cancelledRegNonces = make(map[string]struct{}, 1)
+		sess.cancelledRegNonces = make(map[string]uint64, 1)
 	}
-	sess.cancelledRegNonces[nonce] = struct{}{}
-	sess.owedRegsRev++
+	sess.voidedRegsRev++
+	// Stamped with the revision of ITS OWN insertion: a save captures the revision before
+	// it marshals, so a landed save with captured revision r carried every nonce stamped
+	// <= r. That stamp, against voidedRegsSavedRev, is what proves THIS verdict durable
+	// rather than merely present beside one that is.
+	sess.cancelledRegNonces[nonce] = sess.voidedRegsRev
 }
 
-// releaseCancelledReservation frees an identifier a consumer teardown withdrew, once its
-// register store is over. Held until then so that no other delivery can take the subject
-// while a tombstone for the old one is being written to it (see mqttPending.regCancelled).
+// releaseCancelledReservation frees an identifier a consumer teardown withdrew, for the one
+// caller that can prove no register will ever carry its nonce: storeInflightRegister's entry
+// check, which runs BEFORE any CAS is issued. With no write ever attempted there is nothing a
+// crash could resurrect, so neither rung of the ladder is owed and the identifier is free —
+// and the VERDICT is retired on the same proof, or a nonce no register can ever carry would
+// sit in the record forever (recovery keeps verdicts whose register it has not seen, because
+// scan-time absence cannot rule out a late CAS; this is the one place absence is provable).
+//
+// Every other settle point goes through confirmInflightRegister/abandonInflightRegister,
+// which release only against a proven durable rung (see releaseSettledVoidReservationsLocked).
+//
+// nonce is the CALLER'S allocation identity, and the release happens only when the
+// reservation carries it: after a stall the identifier may have been freed, reused and
+// cancelled again, and the reservation then belongs to a newer allocation whose CAS is
+// still out — precisely the write this proof does not cover.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) releaseCancelledReservation(pi uint16) {
+func (sess *mqttSession) releaseCancelledReservation(pi uint16, nonce string) {
+	if nonce == _EMPTY_ {
+		return
+	}
 	sess.mu.Lock()
-	if ack := sess.pendingPublish[pi]; ack != nil && ack.regCancelled {
+	if ack := sess.pendingPublish[pi]; ack != nil && ack.regCancelled && ack.regNonce == nonce {
+		if _, held := sess.cancelledRegNonces[nonce]; held {
+			delete(sess.cancelledRegNonces, nonce)
+			sess.voidedRegsRev++
+		}
 		delete(sess.pendingPublish, pi)
 	}
 	sess.mu.Unlock()
+}
+
+// releaseSettledVoidReservationsLocked frees the identifiers of cancelled reservations whose
+// store has SETTLED (regPending dropped at the settle point) now that their verdicts are
+// provably on the session record. Until both held — store settled, verdict durable — the
+// identifier stayed reserved: released early, a new allocation could take the subject while
+// the old CAS was still in flight, or a crash could resurrect the register as an ordinary
+// delivery with nothing anywhere calling it void.
+//
+// sess.mu must be held, with voidedRegsSavedRev already advanced: every nonce in the set is
+// durable at that moment, so membership is the proof.
+func (sess *mqttSession) releaseSettledVoidReservationsLocked() {
+	for nonce, pi := range sess.settledVoidReservations {
+		insertRev, held := sess.cancelledRegNonces[nonce]
+		if held && insertRev > sess.voidedRegsSavedRev {
+			// Only a verdict the landed save provably SERIALIZED: one recorded after
+			// that save's marshal is durable nowhere yet, however recently a different
+			// save landed, and releasing on membership alone would free its identifier
+			// with a crash still able to resurrect the register.
+			continue
+		}
+		if ack := sess.pendingPublish[pi]; ack != nil && ack.regCancelled && ack.regNonce == nonce {
+			delete(sess.pendingPublish, pi)
+		}
+		delete(sess.settledVoidReservations, nonce)
+	}
 }
 
 // forgetCancelledReg drops a cancellation intent whose register is provably dealt with:
@@ -474,28 +523,71 @@ func (sess *mqttSession) forgetCancelledReg(nonce string) {
 	sess.mu.Lock()
 	if _, ok := sess.cancelledRegNonces[nonce]; ok {
 		delete(sess.cancelledRegNonces, nonce)
-		sess.owedRegsRev++
+		sess.voidedRegsRev++
+	}
+	// Retirement is itself a release edge. A reservation that SETTLED while the verdict
+	// was still unproven parks waiting for the verdict's save — and a stream-rung proof
+	// arriving after the settle (recovery deleting the register, a securing retry landing
+	// its tombstone) removes the very membership that save-keyed release requires. Nothing
+	// later re-examines the reservation, so the retirement must. Through the index, not a
+	// pendingPublish walk: this runs once per voided register in a teardown, and walking a
+	// map that can hold tens of thousands of live deliveries per nonce is quadratic.
+	if pi, parked := sess.settledVoidReservations[nonce]; parked {
+		if ack := sess.pendingPublish[pi]; ack != nil && ack.regCancelled && ack.regNonce == nonce {
+			delete(sess.pendingPublish, pi)
+		}
+		delete(sess.settledVoidReservations, nonce)
 	}
 	sess.mu.Unlock()
+}
+
+// parkSettledVoidReservationLocked records a settled-but-unproven reservation in the index
+// the proof edges release from.
+//
+// sess.mu must be held.
+func (sess *mqttSession) parkSettledVoidReservationLocked(nonce string, pi uint16) {
+	if nonce == _EMPTY_ {
+		return
+	}
+	if sess.settledVoidReservations == nil {
+		sess.settledVoidReservations = make(map[string]uint16, 1)
+	}
+	sess.settledVoidReservations[nonce] = pi
+}
+
+// voidVerdictProvenLocked reports whether a reservation's verdict is durably proven — by a
+// register-stream rung (the nonce was retired: a landed tombstone or a confirmed delete) or
+// by the session record (its insertion revision is at or below the revision a landed save is
+// known to carry). It is the ONE predicate every release edge shares, because the two proofs
+// and the store's settlement race freely: a verdict can be durable before the settle (no
+// later save will come round to release), and a rung can retire the nonce after it (removing
+// the membership the save-keyed release would need).
+//
+// sess.mu must be held.
+func (sess *mqttSession) voidVerdictProvenLocked(nonce string) bool {
+	insertRev, held := sess.cancelledRegNonces[nonce]
+	return !held || insertRev <= sess.voidedRegsSavedRev
 }
 
 // mqttNonceSet and mqttSortedNonces convert between the in-memory set and the record's
 // list form. The list is sorted so an unchanged set marshals identically, which keeps a
 // record write from looking like a change when it is not.
-func mqttNonceSet(list []string) map[string]struct{} {
+// Restored entries carry insertion revision 0: they came OUT of the record, so they are
+// durable by construction and every savedRev comparison passes.
+func mqttNonceSet(list []string) map[string]uint64 {
 	if len(list) == 0 {
 		return nil
 	}
-	set := make(map[string]struct{}, len(list))
+	set := make(map[string]uint64, len(list))
 	for _, n := range list {
 		if n != _EMPTY_ {
-			set[n] = struct{}{}
+			set[n] = 0
 		}
 	}
 	return set
 }
 
-func mqttSortedNonces(set map[string]struct{}) []string {
+func mqttSortedNonces(set map[string]uint64) []string {
 	if len(set) == 0 {
 		return nil
 	}
@@ -522,65 +614,37 @@ func mqttErrorf(c *client, format string, args ...any) {
 	}
 }
 
-func mqttDebugf(c *client, format string, args ...any) {
-	if c != nil {
-		c.Debugf(format, args...)
-	}
-}
-
-// oweRegisterDelete records a register whose removal is owed, in memory and then durably.
+// persistVoidedRegs writes the void-register verdicts to the session record when the record
+// is not already known to carry them, and reports whether it now provably does.
 //
-// Two things about the ordering are deliberate. The list is mutated BEFORE the fence is
-// taken, which inverts the usual discipline, and it is safe here for a reason that does not
-// generalise: the mutation is purely additive, and no outcome ever undoes it. A concurrent
-// fence holder observing the addition and persisting it early is the desired result, not a
-// half-applied transaction, because the obligation is a fact about JetStream that exists
-// whether or not the record mentions it.
+// Two things about the ordering are deliberate. The nonce set is mutated BEFORE the fence is
+// taken (voidRegNonceLocked), which inverts the usual discipline, and it is safe here for a
+// reason that does not generalise: the mutation is purely additive on this path, and a
+// concurrent fence holder observing the addition and persisting it early is the desired
+// result, not a half-applied transaction — the verdict is a fact about the register that
+// exists whether or not the record mentions it yet.
 //
 // And the addition can lose a race it cannot see: a readLoop transaction that has already
 // marshalled its record commits without the new entry, while this off-readLoop writer was
-// refused the fence. So durability is tracked by a revision counter rather than assumed
-// from "I just tried to save" — see persistOwedRegisterDeletes.
-//
-// The nonce, when given, is the cancellation intent this obligation supersedes: both changes
-// are made in ONE mutation, so no save can leave the record holding neither.
-//
-// Session lock NOT held on entry.
-func (sess *mqttSession) oweRegisterDelete(c *client, regSeq uint64, nonce string) {
-	if regSeq == 0 {
-		return
-	}
-	sess.mu.Lock()
-	sess.owedRegisterDeletes = append(sess.owedRegisterDeletes, regSeq)
-	if nonce != _EMPTY_ {
-		delete(sess.cancelledRegNonces, nonce)
-	}
-	sess.owedRegsRev++
-	sess.mu.Unlock()
-	sess.persistOwedRegisterDeletes(c)
-}
-
-// persistOwedRegisterDeletes writes the owed-cleanup list to the session record when the
-// record is not already known to carry it, and reports whether it now provably does.
-//
-// The revision it captures before saving is the one it may later declare durable, never the
-// list's current revision: an addition that lands after the marshal must stay unsaved, and
-// an addition that lands before it is merely re-saved later, which costs nothing. Only
-// saveLanded licenses the claim — an ambiguous write is resolved by a readback, and the
-// cheaper answer for an unresolved one is to save again.
+// refused the fence. So durability is tracked by a revision counter rather than assumed from
+// "I just tried to save". The revision captured before saving is the one that may later be
+// declared durable, never the set's current revision: an addition that lands after the
+// marshal must stay unsaved, and one that lands before it is merely re-saved later, which
+// costs nothing. Only saveLanded licenses the claim — an ambiguous write is resolved by a
+// readback.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) persistOwedRegisterDeletes(c *client) bool {
+func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 	sess.mu.Lock()
-	rev, saved := sess.owedRegsRev, sess.owedRegsSavedRev
+	rev, saved := sess.voidedRegsRev, sess.voidedRegsSavedRev
 	sess.mu.Unlock()
 	if rev == saved {
 		return true
 	}
 	// tryBeginRecordTx, never the blocking form: this runs on a delivery goroutine, and a
-	// refused fence must leave the obligation pending rather than block. The flag stays
-	// set, so the next convergence point retries — including the one at the end of the
-	// UNSUBSCRIBE that is usually the holder here.
+	// refused fence must leave the verdict pending rather than block. The revision gap
+	// stays open, so the next convergence point retries — including the one at the end of
+	// the UNSUBSCRIBE that is usually the holder here.
 	tok, ok := sess.tryBeginRecordTx()
 	if !ok {
 		return false
@@ -589,25 +653,26 @@ func (sess *mqttSession) persistOwedRegisterDeletes(c *client) bool {
 	switch outcome {
 	case saveLanded:
 		sess.mu.Lock()
-		if sess.owedRegsSavedRev < rev {
-			sess.owedRegsSavedRev = rev
+		if sess.voidedRegsSavedRev < rev {
+			sess.voidedRegsSavedRev = rev
 		}
+		sess.releaseSettledVoidReservationsLocked()
 		sess.mu.Unlock()
 	case saveDefinitelyFailed:
-		// Nothing landed. The in-memory list still drives this connection's retries, and
-		// the record is not credited with an obligation it never recorded.
-		mqttWarnf(c, "MQTT: could not persist the deferred cleanup of in-flight registers for client %q: %v",
+		// Nothing landed. The in-memory set still drives this connection's behaviour, and
+		// the record is not credited with a verdict it never recorded.
+		mqttWarnf(c, "MQTT: could not persist the void-register verdicts for client %q: %v",
 			sess.id, err)
 	case saveMaybeLanded:
-		// The obligation exists either way and a duplicate delete is harmless, so nothing
-		// is undone. The REVISION is a different matter: it may be claimed only on proof,
-		// so the readback's continuations carry that decision. Registering neither — and
-		// leaving the revision unclaimed unconditionally — would be safe but wasteful;
-		// registering only the landed one would be wrong on the other branch.
-		sess.retainOnUncertain(sess.owedRegsUncertainActions(c, rev))
+		// The verdict exists either way, so nothing is undone. The REVISION is a different
+		// matter: it may be claimed only on proof, so the readback's continuations carry
+		// that decision. Registering neither — and leaving the revision unclaimed
+		// unconditionally — would be safe but wasteful; registering only the landed one
+		// would be wrong on the other branch.
+		sess.retainOnUncertain(sess.voidedRegsUncertainActions(c, rev))
 	}
 	if terr := sess.endRecordTx(tok); terr != nil {
-		mqttErrorf(c, "MQTT: record transaction not released after deferring register cleanup for client %q: %v", sess.id, terr)
+		mqttErrorf(c, "MQTT: record transaction not released after recording void-register verdicts for client %q: %v", sess.id, terr)
 	}
 	if outcome == saveMaybeLanded {
 		// AFTER the fence is released, never inside it: resolution takes the fence for the
@@ -619,97 +684,35 @@ func (sess *mqttSession) persistOwedRegisterDeletes(c *client) bool {
 	return outcome == saveLanded
 }
 
-// owedRegsUncertainActions is what the readback owes an obligation whose save was
-// ambiguous, as a pair the resolver runs exactly one of.
+// voidedRegsUncertainActions is what the readback owes a verdict whose save was ambiguous,
+// as a pair the resolver runs exactly one of.
 //
 // The not-landed verdict is the dangerous one, and an empty continuation is not an answer to
-// it: the obligation would then be durable nowhere, and nothing would notice, because a
-// convergence point that finds the list unchanged since its last attempt makes none. So the
+// it: the void verdict would then be durable nowhere, and nothing would notice, because a
+// convergence point that finds the set unchanged since its last attempt makes none. So the
 // retry happens THERE, under the resolver's token — the only writer allowed at that moment,
 // and the reason these continuations are handed one at all. Uncertainty is cleared before
 // reverts run, so that save is not refused at entry.
 //
-// Neither continuation undoes anything: the obligation exists whatever the record says, and
-// a duplicate delete is harmless. All they decide is whether rev may be called durable.
-func (sess *mqttSession) owedRegsUncertainActions(c *client, rev uint64) (onNotLanded, onLanded func(recordTx)) {
+// Neither continuation undoes anything: the verdict exists whatever the record says. All
+// they decide is whether rev may be called durable.
+func (sess *mqttSession) voidedRegsUncertainActions(c *client, rev uint64) (onNotLanded, onLanded func(recordTx)) {
 	markSaved := func() {
 		sess.mu.Lock()
-		if sess.owedRegsSavedRev < rev {
-			sess.owedRegsSavedRev = rev
+		if sess.voidedRegsSavedRev < rev {
+			sess.voidedRegsSavedRev = rev
 		}
+		sess.releaseSettledVoidReservationsLocked()
 		sess.mu.Unlock()
 	}
 	return func(tok recordTx) {
 		if serr := sess.save(tok); serr != nil {
-			mqttWarnf(c, "MQTT: could not persist the deferred cleanup of in-flight registers for client %q "+
+			mqttWarnf(c, "MQTT: could not persist the void-register verdicts for client %q "+
 				"after an unlanded write: %v", sess.id, serr)
 			return
 		}
 		markSaved()
 	}, func(recordTx) { markSaved() }
-}
-
-// retryOwedRegisterDeletes re-attempts register deletes whose confirmed removal has not yet
-// been proven, and drops only the ones it proves.
-//
-// A cancelled registration's register cannot be reconciled by anything else: the consumer
-// that would classify its source is deleted by the same UNSUBSCRIBE, and a register whose
-// consumer is gone is deliberately not read as complete, so it would reserve an identifier
-// for the life of the session. Logging and forgetting the obligation is therefore not
-// enough. Driven from the places that are guaranteed to come round again on a live session —
-// every register store, every resume, and the tail of every UNSUBSCRIBE — so it converges
-// without a timer.
-//
-// An entry stays visible in the list until its delete is PROVEN. Emptying the list first and
-// putting the failures back afterwards looks equivalent and is not: a concurrent session
-// save falling in that window persists a list with no obligations in it, and the entry that
-// comes back is then in memory only, which is exactly the state a restart discards.
-//
-// Session lock NOT held on entry.
-func (sess *mqttSession) retryOwedRegisterDeletes(c *client) {
-	sess.mu.Lock()
-	owed := append([]uint64(nil), sess.owedRegisterDeletes...)
-	sess.mu.Unlock()
-	if len(owed) > 0 && sess.asm != nil {
-		var done []uint64
-		for _, seq := range owed {
-			if err := sess.asm.deleteInflightRegisterConfirmed(seq); err != nil {
-				continue
-			}
-			done = append(done, seq)
-			mqttDebugf(c, "MQTT: removed a deferred in-flight register at sequence %d for client %q", seq, sess.id)
-		}
-		if len(done) > 0 {
-			sess.mu.Lock()
-			// Filtered against the CURRENT list, not the snapshot: another cancellation may
-			// have appended while the deletes were in flight.
-			sess.owedRegisterDeletes = filterOutSeqs(sess.owedRegisterDeletes, done)
-			sess.owedRegsRev++
-			sess.mu.Unlock()
-		}
-	}
-	// Unconditional, because "nothing was discharged" does not mean "the record already
-	// says what it needs to": the addition may never have reached it.
-	sess.persistOwedRegisterDeletes(c)
-}
-
-// filterOutSeqs returns seqs with every member of drop removed. Lists here are the size of
-// one connection's cancelled registrations, so the quadratic scan is the cheap answer.
-func filterOutSeqs(seqs, drop []uint64) []uint64 {
-	var out []uint64
-	for _, seq := range seqs {
-		gone := false
-		for _, d := range drop {
-			if seq == d {
-				gone = true
-				break
-			}
-		}
-		if !gone {
-			out = append(out, seq)
-		}
-	}
-	return out
 }
 
 // deleteInflightRegisterFor removes the register of a pending entry a terminal path
@@ -945,40 +948,82 @@ func (sess *mqttSession) confirmInflightSourceAck(ackSubject string) error {
 	return as.jsa.confirmAck(ackSubject)
 }
 
-// deleteInflightRegisters removes a batch of registers at their exact sequences, PROVING each
-// removal and recording an obligation for any it cannot.
+// mqttVoidedReg is one register a consumer teardown gave up, in the form the cleanup ladder
+// needs: the exact sequence to delete, the nonce that names the verdict, and the identity
+// fields a tombstone rewrite requires.
+type mqttVoidedReg struct {
+	seq   uint64
+	nonce string
+	pi    uint16
+	dur   string
+	sseq  uint64
+	// retired marks a register that is a QoS 2 retirement rather than a PUBLISH-phase
+	// claim. Its cleanup is delete-or-leave: a Cancelled tombstone would overwrite the
+	// suppression it carries, and recovery would then drop it without reinstating the
+	// retirement — resurrecting a completed payload if the source is still re-offerable.
+	retired bool
+}
+
+// deleteInflightRegisters removes a teardown's registers at their exact sequences, walking
+// the same durable ladder everywhere: (1) confirmed delete, (2) Cancelled tombstone at the
+// exact sequence, (3) the nonce verdict persisted with the session record.
 //
 // Confirmed rather than fire-and-forget, unlike the ordinary terminal deletes, and the
 // difference is what happens next: a terminal path leaves behind a record whose source stays
 // live and classifiable, so the store's reconcile, the next resume or the orphan sweep will
-// remove it. These sequences come from a consumer TEARDOWN, and the consumer that would
+// remove it. These registers come from a consumer TEARDOWN, and the consumer that would
 // classify their sources is about to disappear — after which a surviving register is
-// deliberately not read as complete, so a single lost delete reserves an identifier for the
-// life of the session. Under a Receive Maximum of 1 that is the session.
+// deliberately not read as complete, so a single lost delete would reserve an identifier for
+// the life of the session. Under a Receive Maximum of 1 that is the session.
 //
-// A failure therefore becomes an owed delete, persisted under the caller's transaction (tok
-// may be zero where there is none) and retried at every convergence point. Callers run this
-// BEFORE the consumer delete.
+// A proven rung ends the entry's story: a deleted register needs no verdict, a tombstoned
+// one IS its own verdict, and either way the nonce is forgotten so the record's verdict set
+// stays bounded across a client that subscribes and unsubscribes forever. Only when both
+// register-stream rungs fail — one storage domain, so they usually fail together — does the
+// session record carry the verdict, kept until a later scan proves the register gone.
 //
-// Session lock NOT held on entry: each of these issues a JetStream request.
-func (sess *mqttSession) deleteInflightRegisters(c *client, tok recordTx, seqs []uint64) {
-	if len(seqs) == 0 || sess.asm == nil {
+// tok is the caller's open transaction (zero where there is none). Callers run this BEFORE
+// the consumer delete.
+//
+// Session lock NOT held on entry: each of these issues JetStream requests.
+func (sess *mqttSession) deleteInflightRegisters(c *client, tok recordTx, voided []mqttVoidedReg) {
+	if len(voided) == 0 || sess.asm == nil {
 		return
 	}
-	owed := false
-	for _, seq := range seqs {
-		if err := sess.asm.deleteInflightRegisterConfirmed(seq); err != nil {
-			mqttWarnf(c, "MQTT: deferring the removal of in-flight register %d for client %q: %v", seq, sess.id, err)
-			sess.mu.Lock()
-			sess.owedRegisterDeletes = append(sess.owedRegisterDeletes, seq)
-			sess.owedRegsRev++
-			sess.mu.Unlock()
-			owed = true
+	unproven := false
+	for _, v := range voided {
+		if err := sess.asm.deleteInflightRegisterConfirmed(v.seq); err == nil {
+			sess.forgetCancelledReg(v.nonce)
+			continue
 		}
+		if v.retired {
+			// Delete-or-leave, never tombstone and never a verdict: this register IS the
+			// durable suppression of a completed exchange, and both alternatives would
+			// have recovery drop it without reinstating the retirement — resurrecting the
+			// payload if the source is still re-offerable. Left in place, recovery
+			// re-reads it as a retirement; the residue when the consumer is also gone is
+			// a parked retirement, which reserves no identifier and no Receive Maximum
+			// slot.
+			mqttWarnf(c, "MQTT: leaving the retired-source register at sequence %d for client %q to a later scan", v.seq, sess.id)
+			continue
+		}
+		if v.nonce != _EMPTY_ && v.pi != 0 {
+			if merr := sess.markInflightRegisterCancelled(c, v.pi, v.dur, v.sseq, v.seq, v.nonce); merr == nil {
+				// The tombstone is on the register itself, which is strictly stronger
+				// than a nonce recorded beside it.
+				sess.forgetCancelledReg(v.nonce)
+				continue
+			}
+		}
+		mqttWarnf(c, "MQTT: deferring the removal of in-flight register %d for client %q", v.seq, sess.id)
+		sess.mu.Lock()
+		sess.voidRegNonceLocked(v.nonce)
+		sess.mu.Unlock()
+		unproven = true
 	}
-	if owed && !sess.proveOwedRegs(c, tok) {
-		mqttErrorf(c, "MQTT: the deferred in-flight register removal(s) of client %q are not durably "+
-			"recorded yet; their identifiers stay reserved until the cleanup is discharged", sess.id)
+	if unproven && !sess.proveVoidedRegs(c, tok) {
+		mqttErrorf(c, "MQTT: the void-register verdict(s) of client %q are not durably recorded yet; "+
+			"the next convergence point retries", sess.id)
 	}
 }
 
@@ -1016,12 +1061,21 @@ func (sess *mqttSession) deleteInflightRegisters(c *client, tok recordTx, seqs [
 //
 // sess.mu must be held.
 func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCancellation, []string) {
-	seqPis := sess.cpending[durable]
-	if len(seqPis) == 0 {
-		return nil, nil
-	}
 	var out []mqttRegCancellation
 	var transmitted []string
+	// RETIRED QoS 2 sources (srcAckOwed) are deliberately NOT voided here, although the
+	// teardown will delete their registers too. A retirement's register is not a claim on
+	// an identifier — it is the durable SUPPRESSION of a completed-but-unproven exchange —
+	// and a void verdict would have recovery drop it without reinstating that suppression.
+	// A crash between this packet's save and the consumer delete then leaves the source
+	// live and re-offerable, and the completed payload goes out again: a QoS 2 duplicate,
+	// which is the worse trade. Left unvoided, the failure residue is instead a register
+	// recovery re-reads as a retirement (reinstated, still suppressing) — at worst a
+	// permanently parked retirement when the consumer is also gone, which is bounded stale
+	// metadata, not a wedged identifier: a retirement reserves no packet identifier and
+	// consumes no Receive Maximum slot. deleteInflightRegisters skips the tombstone rung
+	// for these for the same reason.
+	seqPis := sess.cpending[durable]
 	for sseq, pi := range seqPis {
 		ack := sess.pendingPublish[pi]
 		if ack == nil || ack.regCancelled || ack.regNonce == _EMPTY_ {
@@ -1043,7 +1097,7 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCance
 			sess.deferred[mqttDeferredKey{durable, sseq}] = ack.jsAckSubject
 		}
 		delete(seqPis, sseq)
-		sess.pendingPublish[pi] = &mqttPending{regPending: true, regCancelled: true}
+		sess.pendingPublish[pi] = &mqttPending{regPending: true, regCancelled: true, regNonce: ack.regNonce}
 	}
 	if len(seqPis) == 0 {
 		delete(sess.cpending, durable)
@@ -1064,7 +1118,7 @@ func (sess *mqttSession) unvoidRegNonces(nonces []string) {
 	for _, n := range nonces {
 		if _, ok := sess.cancelledRegNonces[n]; ok {
 			delete(sess.cancelledRegNonces, n)
-			sess.owedRegsRev++
+			sess.voidedRegsRev++
 		}
 	}
 	sess.mu.Unlock()
@@ -1214,26 +1268,30 @@ type mqttRegCancellation struct {
 // reserve its identifier indefinitely.
 //
 // Lock held on entry.
-func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]uint64, []mqttRegCancellation) {
+func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoidedReg, []mqttRegCancellation) {
 	seen := make(map[uint64]struct{})
-	var regs []uint64
+	var regs []mqttVoidedReg
 	var cancels []mqttRegCancellation
-	addReg := func(seq uint64) {
-		if seq == 0 {
+	// The sequence→nonce association is kept through the purge, because it is what lets a
+	// PROVEN delete forget its verdict (deleteInflightRegisters): without it the verdict set
+	// would grow without bound across a client that subscribes and unsubscribes forever.
+	// The identity fields ride along for the tombstone rung.
+	addReg := func(v mqttVoidedReg) {
+		if v.seq == 0 {
 			return
 		}
-		if _, dup := seen[seq]; dup {
+		if _, dup := seen[v.seq]; dup {
 			return
 		}
-		seen[seq] = struct{}{}
-		regs = append(regs, seq)
+		seen[v.seq] = struct{}{}
+		regs = append(regs, v)
 	}
 
 	if seqPis, ok := sess.cpending[durable]; ok {
 		delete(sess.cpending, durable)
 		for sseq, pi := range seqPis {
 			if ack := sess.pendingPublish[pi]; ack != nil {
-				addReg(ack.regSeq)
+				addReg(mqttVoidedReg{seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: durable, sseq: sseq})
 				if ack.regPending {
 					// An allocation whose register store is still in flight has no sequence
 					// to collect, so the register it may be about to write would survive
@@ -1245,7 +1303,7 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]uint64, [
 					cancels = append(cancels, mqttRegCancellation{
 						pi: pi, nonce: ack.regNonce, durable: durable, sseq: sseq,
 					})
-					sess.pendingPublish[pi] = &mqttPending{regPending: true, regCancelled: true}
+					sess.pendingPublish[pi] = &mqttPending{regPending: true, regCancelled: true, regNonce: ack.regNonce}
 					continue
 				}
 			}
@@ -1267,7 +1325,7 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]uint64, [
 			continue
 		}
 		if rs != nil {
-			addReg(rs.regSeq)
+			addReg(mqttVoidedReg{seq: rs.regSeq, nonce: rs.nonce, pi: rs.pi, dur: key.jsDur, sseq: key.sseq, retired: true})
 		}
 		delete(sess.srcAckOwed, key)
 	}
@@ -1325,33 +1383,35 @@ func (sess *mqttSession) secureRegCancellations(c *client, tok recordTx, cancels
 	if !owed {
 		return true
 	}
-	return sess.proveOwedRegs(c, tok)
+	return sess.proveVoidedRegs(c, tok)
 }
 
-// proveOwedRegs reports whether the session record is KNOWN to carry the deferred in-flight
-// cleanup, saving it if it does not.
+// proveVoidedRegs reports whether the session record is KNOWN to carry the void-register
+// verdicts, saving it if it does not.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) proveOwedRegs(c *client, tok recordTx) bool {
+func (sess *mqttSession) proveVoidedRegs(c *client, tok recordTx) bool {
 	sess.mu.Lock()
-	rev, saved := sess.owedRegsRev, sess.owedRegsSavedRev
+	rev, saved := sess.voidedRegsRev, sess.voidedRegsSavedRev
 	sess.mu.Unlock()
 	if rev == saved {
 		return true
 	}
 	if tok == (recordTx{}) {
-		return sess.persistOwedRegisterDeletes(c)
+		return sess.persistVoidedRegs(c)
 	}
-	// The caller's transaction, for the reason given above. An ambiguous outcome counts as
-	// not proven: the caller withholds its irreversible step and the readback settles it.
+	// The caller's transaction, since these paths hold their packet's fence and a
+	// transaction of our own would simply be refused. An ambiguous outcome counts as not
+	// proven: the caller withholds its irreversible step and the readback settles it.
 	if err := sess.save(tok); err != nil {
-		mqttWarnf(c, "MQTT: could not persist the deferred in-flight cleanup of client %q: %v", sess.id, err)
+		mqttWarnf(c, "MQTT: could not persist the void-register verdicts of client %q: %v", sess.id, err)
 		return false
 	}
 	sess.mu.Lock()
-	if sess.owedRegsSavedRev < rev {
-		sess.owedRegsSavedRev = rev
+	if sess.voidedRegsSavedRev < rev {
+		sess.voidedRegsSavedRev = rev
 	}
+	sess.releaseSettledVoidReservationsLocked()
 	sess.mu.Unlock()
 	return true
 }
@@ -1673,35 +1733,41 @@ func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) 
 //     and destroying it would strand the identifier the client is holding.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, jsDur string, sseq uint64, q2AffClaim string) bool {
+func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim string) bool {
 	as := sess.asm
-	// Opportunistic, and cheap when there is nothing owed: this is one of the two points
-	// guaranteed to come round again on a live session.
-	sess.retryOwedRegisterDeletes(c)
+	// Opportunistic, and free when nothing is pending: one of the convergence points that
+	// is guaranteed to come round again on a live session, so a void verdict whose save was
+	// refused earlier still reaches the record.
+	sess.persistVoidedRegs(c)
 	sess.mu.Lock()
 	idHash, gen := sess.idHash, sess.gen
 	ack := sess.pendingPublish[pi]
-	stillOurs := ack != nil && ack.regPending && ack.jsDur == jsDur && ack.sseq == sseq
-	var nonce string
-	if stillOurs {
-		nonce = ack.regNonce
-	}
+	// The caller's nonce — read under the lock that ALLOCATED the entry — is the identity
+	// every check here keys on. The identifier alone cannot be: this goroutine can stall
+	// (the persist above is a round trip) across a cancellation, a settle, a reuse and a
+	// second cancellation, and by then pendingPublish[pi] describes someone else's
+	// allocation, whose reservation a stale store must not touch.
+	stillOurs := ack != nil && ack.regPending && !ack.regCancelled &&
+		ack.jsDur == jsDur && ack.sseq == sseq && ack.regNonce == nonce
 	sess.mu.Unlock()
 	if as == nil || idHash == _EMPTY_ || gen == _EMPTY_ {
 		// Unreachable for a real session: every session carries an incarnation
 		// generation (mqttSessGenFromRecord rejects a record without one) and an
 		// account manager. Fail closed rather than sending under an identifier nothing
 		// records.
-		sess.abandonInflightRegister(pi, jsDur, sseq)
+		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 		return false
 	}
 	if !stillOurs {
 		// The entry went away under us (a discard, or a terminal path) or is no longer
 		// the allocation we were asked to persist. Nothing to confirm and nothing to
-		// send — but a cancelled reservation still has to be released, because this is
+		// send — but OUR cancelled reservation still has to be released, because this is
 		// the same "the store is over" moment confirmInflightRegister represents, reached
-		// when the teardown won the race to the entry before the first read.
-		sess.releaseCancelledReservation(pi)
+		// when the teardown won the race to the entry before the first read. Keyed by the
+		// nonce: a reservation carrying a DIFFERENT one belongs to a newer allocation
+		// whose own store is still out, and releasing it would free that identifier with
+		// its CAS still on the wire.
+		sess.releaseCancelledReservation(pi, nonce)
 		return false
 	}
 
@@ -1709,7 +1775,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		// Unreachable: trackPublish mints the nonce with every allocation that owes a
 		// register. Fail closed rather than write a record with no identity — a nonce is
 		// what proves a landed write is ours and what a cancellation names it by.
-		sess.abandonInflightRegister(pi, jsDur, sseq)
+		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 		return false
 	}
 	subject := mqttInflightSubject(idHash, gen, pi)
@@ -1763,7 +1829,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			if derr := as.deleteInflightRegisterConfirmed(smsg.Sequence); derr != nil {
 				c.Errorf("MQTT: unable to reap a cancelled in-flight register on %q for client %q: %v",
 					subject, sess.id, derr)
-				sess.abandonInflightRegister(pi, jsDur, sseq)
+				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 				return false
 			}
 		case cur == nil:
@@ -1771,7 +1837,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// proven stale either — and it occupies an identifier we must not use.
 			c.Warnf("MQTT: refusing packet identifier %d for client %q: an unreadable in-flight register occupies %q at sequence %d",
 				pi, sess.id, subject, smsg.Sequence)
-			sess.abandonInflightRegister(pi, jsDur, sseq)
+			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 			return false
 		default:
 			if as.inflightSourceState(cur) != mqttInflightSourceComplete {
@@ -1779,7 +1845,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				// another broker this record is that delivery's only durable identity.
 				c.Warnf("MQTT: refusing packet identifier %d for client %q: %q still names delivery %s/%d",
 					pi, sess.id, subject, cur.Dur, cur.Seq)
-				sess.abandonInflightRegister(pi, jsDur, sseq)
+				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 				return false
 			}
 			// Provably finished: a register whose delete was lost. Reaping must be
@@ -1790,7 +1856,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			if derr := as.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); derr != nil {
 				c.Errorf("MQTT: unable to reap a stale in-flight register on %q for client %q: %v",
 					subject, sess.id, derr)
-				sess.abandonInflightRegister(pi, jsDur, sseq)
+				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 				return false
 			}
 		}
@@ -1800,7 +1866,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 	}
 	c.Errorf("MQTT: unable to record the in-flight register for packet identifier %d of client %q: %v",
 		pi, sess.id, lastErr)
-	sess.abandonInflightRegister(pi, jsDur, sseq)
+	sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 	return false
 }
 
@@ -1815,12 +1881,6 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 	sess.mu.Lock()
 	ack := sess.pendingPublish[pi]
 	if ack == nil || !ack.regPending || ack.jsDur != jsDur || ack.sseq != sseq {
-		// A cancelled RESERVATION is released here: a consumer teardown keeps the
-		// identifier so that nothing can take the subject while this store is in flight,
-		// and this is the moment that stops being true.
-		if ack != nil && ack.regCancelled {
-			delete(sess.pendingPublish, pi)
-		}
 		sess.mu.Unlock()
 		// The allocation was CANCELLED under us — an UNSUBSCRIBE staging a drain, a
 		// discard, a takeover — so this register describes a delivery that will never be
@@ -1830,6 +1890,14 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 		// in the same breath, and a register whose consumer is gone is deliberately NOT read
 		// as complete — so a lost delete leaves an identifier reserved for the life of the
 		// session, with no later pass able to resolve it.
+		//
+		// proven means SOME durable rung of the ladder holds: the register is gone, or it
+		// is tombstoned, or its nonce verdict landed on the session record. The
+		// reservation the teardown left on this identifier is released only then — the
+		// store has settled here, which is the other half of the release condition, but a
+		// PI freed with no durable verdict anywhere would let a crash resurrect this
+		// register as an ordinary delivery holding a Receive Maximum slot forever.
+		proven := false
 		if sess.asm != nil {
 			if derr := sess.asm.deleteInflightRegisterConfirmed(regSeq); derr != nil {
 				// The delete is what this path wants, and it could not be proven. So the fact
@@ -1840,30 +1908,48 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 				// source is deleted in the same breath — its identifier would be reserved,
 				// and its Receive Maximum slot consumed, for the life of the session.
 				if merr := sess.markInflightRegisterCancelled(c, pi, jsDur, sseq, regSeq, nonce); merr != nil {
-					// Neither could be proven, which in practice means JetStream was unavailable
-					// for both. The obligation is kept — in memory for this connection, and
-					// PERSISTED with the session record so a restart cannot lose it. Without
-					// that, an UNSUBSCRIBE completing its consumer delete leaves a register
-					// indistinguishable from a started delivery, whose identifier and Receive
-					// Maximum slot are then consumed for the life of the session.
+					// Neither register-stream rung could be proven — one storage domain, so
+					// they usually fail together. The NONCE verdict is the remaining home:
+					// kept in memory for this connection and persisted with the session
+					// record, so a restart still knows this register describes a delivery
+					// that was never transmitted.
 					c.Warnf("MQTT: deferring cleanup of the in-flight register of cancelled packet identifier %d for client %q: %v (%v)",
 						pi, sess.id, derr, merr)
-					// The owed sequence REPLACES the cancellation intent, in one mutation, so
-					// the record can never hold neither: a save that fails leaves the nonce
-					// where it was, and one that lands carries the sequence instead. A
-					// sequence is the more specific of the two — it says what to delete
-					// rather than what to disregard.
-					sess.oweRegisterDelete(c, regSeq, nonce)
+					sess.mu.Lock()
+					sess.voidRegNonceLocked(nonce)
+					sess.mu.Unlock()
+					proven = sess.persistVoidedRegs(c)
 				} else {
 					// The tombstone is on the register itself, which is strictly stronger than
 					// a nonce recorded beside it.
 					sess.forgetCancelledReg(nonce)
+					proven = true
 				}
 			} else {
 				// Provably gone. There is nothing left for recovery to misread.
 				sess.forgetCancelledReg(nonce)
+				proven = true
 			}
 		}
+		sess.mu.Lock()
+		// Only OUR reservation: after a stall the identifier may already belong to a
+		// newer allocation's cancellation, whose own settle point owes this decision.
+		if cur := sess.pendingPublish[pi]; cur != nil && cur.regCancelled && cur.regNonce == nonce {
+			if proven || sess.voidVerdictProvenLocked(nonce) {
+				// Proven by this ladder, or by a rung an earlier pass ran (a securing
+				// tombstone retires the nonce, and the save-keyed release can never
+				// fire for a nonce that is no longer in the set).
+				delete(sess.pendingPublish, pi)
+			} else {
+				// SETTLED but unproven: the store is over, so regPending drops, but the
+				// identifier stays held until the verdict's save lands —
+				// persistVoidedRegs releases these on proof. See
+				// releaseSettledVoidReservationsLocked.
+				cur.regPending = false
+				sess.parkSettledVoidReservationLocked(nonce, pi)
+			}
+		}
+		sess.mu.Unlock()
 		return false
 	}
 	ack.regSeq, ack.regNonce, ack.regPending = regSeq, nonce, false
@@ -1886,16 +1972,33 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 // count unless the sequence is known to have been withheld. This is the same state, for
 // the same reason, as a delivery withheld at the in-flight cap, so it uses the same
 // marker; the NAK it may attract simply retries the register sooner.
-func (sess *mqttSession) abandonInflightRegister(pi uint16, jsDur string, sseq uint64) {
+func (sess *mqttSession) abandonInflightRegister(pi uint16, jsDur string, sseq uint64, nonce string) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	ack := sess.pendingPublish[pi]
-	if ack == nil || !ack.regPending || ack.jsDur != jsDur || ack.sseq != sseq {
-		// A cancelled reservation fails this check by design, and it is released rather
-		// than left: the store this attempt owned is over either way, and that is the
-		// one thing the reservation was waiting for.
-		if ack != nil && ack.regCancelled {
-			delete(sess.pendingPublish, pi)
+	if ack == nil || !ack.regPending || ack.regCancelled || ack.jsDur != jsDur || ack.sseq != sseq || ack.regNonce != nonce {
+		// A cancelled reservation fails this check by design. The store this attempt
+		// owned is over — but one of its failed attempts may have LANDED ambiguously, so
+		// a register can exist with no proven rung. Mark the reservation settled and let
+		// the verdict's save release it (releaseSettledVoidReservationsLocked); freeing
+		// the identifier here would let a crash resurrect that register as an ordinary
+		// delivery.
+		//
+		// UNLESS the verdict is already retired: a nonce absent from the set was proven
+		// by a register-stream rung (a landed tombstone, or a confirmed delete) while the
+		// store was still out. The save-keyed release can never fire for it — there is
+		// nothing left to save — so withholding here would park the reservation, and its
+		// Receive Maximum slot, for the life of the session.
+		//
+		// And only OUR reservation, by nonce: after a stall this identifier may already
+		// carry a newer allocation's cancellation, whose settle point owes this decision.
+		if ack != nil && ack.regCancelled && ack.regNonce == nonce {
+			if sess.voidVerdictProvenLocked(nonce) {
+				delete(sess.pendingPublish, pi)
+			} else {
+				ack.regPending = false
+				sess.parkSettledVoidReservationLocked(nonce, pi)
+			}
 		}
 		return
 	}
@@ -2034,10 +2137,6 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 		sess.setPISpaceIncomplete(c, "the session carries no incarnation identity")
 		return nil
 	}
-
-	// Anything owed from a cancelled registration goes first, so a register that should not
-	// exist is gone before the classification below could reserve its identifier.
-	sess.retryOwedRegisterDeletes(c)
 
 	// (1) The PUBREL records: identifiers already past PUBREC.
 	rels, ok := sess.scanPubRelRecords(pubRelSubject)
@@ -2266,9 +2365,14 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 			// the store was still in flight. A nonce is safe to match on where an identifier
 			// or a source would not be — the cancellation frees the identifier for reuse and
 			// the source is re-offered, so either could name a genuine later delivery.
-			if !fr.rec.Cancelled {
-				// Named by a nonce alone, so its delete must be PROVEN before that nonce is
-				// released: an unproven one would leave a register nothing anywhere explains.
+			if cancelledNonces[fr.rec.Nonce] {
+				// The verdict set names this register — whether or not it is ALSO
+				// tombstoned — so its delete must be PROVEN before the nonce is retired.
+				// The tombstoned-and-in-set case matters: it is what a crash between the
+				// teardown's tombstone rung and the forget's save leaves behind, and
+				// routing it to the fire-and-forget list would keep the verdict on the
+				// record forever. The register is right here, so retiring against its
+				// confirmed deletion needs no absence reasoning at all.
 				dropByNonce = append(dropByNonce, cancelledDrop{fr.seq, fr.rec.Nonce})
 				continue
 			}
@@ -2526,38 +2630,37 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 	for _, seq := range drop {
 		as.deleteInflightRegister(seq)
 	}
-	// A register the cancelled set named is deleted with PROOF, and its intent released only
+	// A register the verdict set named is deleted with PROOF, and its verdict released only
 	// against that proof. Forgetting it after a fire-and-forget delete would leave a register
 	// nothing anywhere explains — an ordinary-looking one whose consumer is gone, which is
-	// the exact state the intent exists to prevent. A failed delete restates the intent as an
-	// owed sequence, which says the same thing more precisely.
+	// the exact state the verdict exists to prevent. A failed delete simply KEEPS the
+	// verdict: it is already durable (this pass read it from the record), and the next scan
+	// retries the delete against it.
 	for _, cd := range dropByNonce {
 		if derr := as.deleteInflightRegisterConfirmed(cd.seq); derr != nil {
-			c.Warnf("MQTT: deferring removal of a cancelled in-flight register at sequence %d for client %q: %v",
+			c.Warnf("MQTT: keeping the void-register verdict for sequence %d of client %q: %v",
 				cd.seq, sess.id, derr)
-			sess.oweRegisterDelete(c, cd.seq, cd.nonce)
 			continue
 		}
 		sess.forgetCancelledReg(cd.nonce)
 	}
-	// Intents whose register was never found have nothing left to protect: this pass
-	// enumerated the whole incarnation and read every record it named, so no register
-	// carrying them exists. Only when nothing was opaque — an unreadable body is precisely
-	// the case where a nonce cannot be compared, so its intent must be kept.
-	if len(opaque) == 0 {
-		found := make(map[string]bool, len(regs))
-		for _, fr := range regs {
-			found[fr.rec.Nonce] = true
-		}
-		for nonce := range cancelledNonces {
-			if !found[nonce] {
-				sess.forgetCancelledReg(nonce)
-			}
-		}
-	}
+	// A verdict whose register was NOT found is deliberately kept, not retired. Absence at
+	// this scan is not proof that no register will ever carry the nonce: R1 permits a
+	// superseded broker's create-only CAS to land LATE, after a takeover's resume has
+	// already run, and retiring the verdict on this scan's emptiness would leave that
+	// late register ordinary — an abandoned consumer's register nothing anywhere calls
+	// void, holding its identifier at every later resume. Kept, the verdict is
+	// self-healing instead: the scan that finally SEES the late register deletes it with
+	// proof (the loop above) and retires the verdict then. The residue is a nonce whose
+	// register never lands at all, which is bounded stale metadata: the no-CAS-issued
+	// path retires its own verdict (releaseCancelledReservation), so what remains is one
+	// entry per store whose every attempt definitively failed.
+	//
+	// (This replaced an absence-based cleanup that a review showed to be exactly the
+	// late-CAS hazard above.)
 	// Whatever the loops above changed should reach the record. Refused while the
 	// CONNECT holds the fence, which costs nothing: the resume's own save carries it.
-	sess.persistOwedRegisterDeletes(c)
+	sess.persistVoidedRegs(c)
 	if restoredPubs+restoredRels+len(opaque)+len(retired)+len(drop)+len(dropByNonce)+skipped > 0 {
 		c.Debugf("MQTT: restored %d in-flight PUBLISH and %d PUBREL identifier(s) for client %q, "+
 			"re-retired %d source(s), found %d unreadable register(s) (%d newly reserved), "+

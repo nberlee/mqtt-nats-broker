@@ -280,10 +280,22 @@ func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte)
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
 	}
-	if !e.sess.storeInflightRegister(e.c, pi, qos, dur, sseq, _EMPTY_) {
+	if !e.sess.storeInflightRegister(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("storeInflightRegister(%d, %s/%d) refused", pi, dur, sseq)
 	}
 	return pi
+}
+
+// nonceOf reads an allocation's register nonce, the identity every reservation touch is
+// keyed by. Reading it at the call site mirrors what the delivery callbacks do under the
+// allocating lock.
+func (e *testInflightEnv) nonceOf(pi uint16) string {
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	if ack := e.sess.pendingPublish[pi]; ack != nil {
+		return ack.regNonce
+	}
+	return _EMPTY_
 }
 
 func (e *testInflightEnv) loadRegister(t *testing.T, pi uint16) (*mqttInflightRecord, *StoredMsg) {
@@ -412,7 +424,7 @@ func TestMQTTInflightStoreDefiniteFailureUntracks(t *testing.T) {
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
 	}
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 300, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 300, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("an unrecordable identifier must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -450,7 +462,7 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 	if pi != 42 || !isNew {
 		t.Fatalf("expected the allocation to land on 42, got pi=%d isNew=%v", pi, isNew)
 	}
-	if e.sess.storeInflightRegister(e.c, pi, 2, dur, 500, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, 500, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("an identifier held by a live foreign register must be refused")
 	}
 	// The foreign record is untouched: it may be a live delivery's identity.
@@ -494,7 +506,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	}
 	// The stale record's source (sequence 7) is absent from an empty stream while its
 	// consumer exists, so it is provably complete.
-	if !e.sess.storeInflightRegister(e.c, pi, 1, dur, 600, _EMPTY_) {
+	if !e.sess.storeInflightRegister(e.c, pi, 1, dur, 600, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("a stale register must not block its identifier")
 	}
 	rec, smsg := e.loadRegister(t, 11)
@@ -1252,7 +1264,7 @@ func TestMQTTInflightAbandonedRegisterKeepsFirstSendDupClear(t *testing.T) {
 	e.sess.mu.Lock()
 	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1500, 1))
 	e.sess.mu.Unlock()
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1500, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1500, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("an unrecordable identifier must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -1389,7 +1401,7 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 	}
 
 	// And the store's ownership revalidation refuses the send.
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1600, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1600, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 }
@@ -1588,7 +1600,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 2000, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 2000, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	rec, _ := e.loadRegister(t, pi)
@@ -1621,51 +1633,129 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 	e.waitRegisterCount(t, 0)
 }
 
-// An owed cleanup is PERSISTED, so a restart cannot lose it.
+// A teardown whose register-stream rungs both fail leaves a PERSISTED nonce verdict, and
+// recovery frees the identifier through it.
 //
-// This is the last fallback, reached only when neither the confirmed delete nor the
-// cancellation tombstone can be written — in practice a JetStream outage covering both. If
-// the obligation were memory-only, an UNSUBSCRIBE that then completed its consumer delete
-// would leave a register indistinguishable from a started delivery, whose identifier and
-// Receive Maximum slot are consumed for the life of the session.
+// The ladder is delete -> tombstone -> persisted nonce, and the first two share a storage
+// domain ($MQTT_inflight), so they usually fail together — which is exactly when the session
+// record must carry the verdict. Without it, a crash leaves a register whose consumer is
+// gone, which recovery deliberately does not read as complete: its identifier and its
+// Receive Maximum slot would be reserved for the life of the session.
 //
-// Mutation check: drop OwedRegs from the persisted record (or from the restore) and the
-// obligation does not survive.
-func TestMQTTInflightOwedRegisterDeletePersists(t *testing.T) {
-	e := testNewInflightEnv(t, "client-owed-persist")
+// Mutation checks: skip the verdict on the double-failure branch of deleteInflightRegisters,
+// or drop CancelledRegs from the persisted record, and the identifier stays reserved.
+func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
+	const clientID = "client-ladder-verdict"
+	e := testNewInflightEnv(t, clientID)
+	dur := e.sess.idHash + "_" + nuid.Next()
+	burnDur := e.sess.idHash + "_" + nuid.Next()
 
-	// Record an owed cleanup the way the doubly-failed cancellation path does.
-	e.sess.oweRegisterDelete(e.c, 4242, _EMPTY_)
+	// Burn one identifier on a separate durable so a fresh allocator could not produce the
+	// one under test by accident (the trap in the file header).
+	sseqBurn := e.publishSource(t, burnDur)
+	e.track(t, burnDur, sseqBurn, 1)
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
 	e.sess.mu.Lock()
-	owed := len(e.sess.owedRegisterDeletes)
+	nonce := e.sess.pendingPublish[pi].regNonce
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
-	if owed != 1 {
-		t.Fatalf("the obligation must be held in memory, got %d", owed)
+	if len(regs) != 1 || regs[0].nonce != nonce {
+		t.Fatalf("the teardown must report the register of its transmitted delivery, got %+v", regs)
 	}
 
-	// It is in the RECORD, which is what survives a restart.
+	// The whole register stream is unavailable: neither the delete nor the tombstone lands.
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
+	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
+		return 0, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		return nil, nil, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.mu.Unlock()
+
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+
+	// The verdict is durable on the session record.
 	ps, _, err := e.asm.loadFenceSession(idHash)
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps == nil {
-		t.Fatalf("no session record")
-	}
-	if len(ps.OwedRegs) != 1 || ps.OwedRegs[0] != 4242 {
-		t.Fatalf("the record must carry the owed cleanup, got %v", ps.OwedRegs)
+	if ps == nil || len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != nonce {
+		t.Fatalf("the record must carry the verdict, got %v", ps)
 	}
 
-	// A restore — the restart — brings it back, so the retry can still discharge it.
-	restored, _, err := e.asm.createOrRestoreSession("client-owed-persist", e.s.getOpts())
+	// The broker restarts with the register still there; recovery frees the identifier.
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete, e.asm.testInflightStore, e.asm.testInflightLoad = nil, nil, nil
+	e.asm.mu.Unlock()
+	restored, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
+	if err := restored.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
 	restored.mu.Lock()
-	back := restored.owedRegisterDeletes
+	_, reserved := restored.pendingPublish[pi]
 	restored.mu.Unlock()
-	if len(back) != 1 || back[0] != 4242 {
-		t.Fatalf("a restored session must carry the owed cleanup, got %v", back)
+	if reserved {
+		t.Fatalf("identifier %d was given up by the teardown and must not be reserved", pi)
+	}
+	e.waitRegisterCount(t, 1) // the burner's register alone
+}
+
+// A teardown whose delete fails but whose TOMBSTONE lands needs no session-record verdict,
+// and the verdict set stays bounded.
+//
+// The tombstone is on the register itself, which is strictly stronger than a nonce recorded
+// beside it — and forgetting the nonce on that proof is what keeps CancelledRegs from
+// growing without bound across a client that subscribes and unsubscribes forever.
+//
+// Mutation checks: skip the tombstone rung, or skip the forget on its success, and the
+// record still carries a verdict it no longer needs.
+func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
+	e := testNewInflightEnv(t, "client-ladder-tombstone")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+	e.sess.mu.Lock()
+	nonce := e.sess.pendingPublish[pi].regNonce
+	// The staging half records the verdict — this is what the proven rung must retire.
+	_, transmitted := e.sess.voidRegistrationsLocked(dur)
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	idHash := e.sess.idHash
+	e.sess.mu.Unlock()
+	if len(transmitted) != 1 || transmitted[0] != nonce {
+		t.Fatalf("the staging must void the transmitted register, got %v", transmitted)
+	}
+
+	// Only the DELETE fails; the tombstone CAS still works.
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
+	e.asm.mu.Unlock()
+
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+
+	rec, smsg := e.loadRegister(t, pi)
+	if rec == nil || smsg == nil || !rec.Cancelled || rec.Nonce != nonce {
+		t.Fatalf("the register must carry its cancellation tombstone, got %+v", rec)
+	}
+	e.sess.mu.Lock()
+	verdicts := len(e.sess.cancelledRegNonces)
+	e.sess.mu.Unlock()
+	if verdicts != 0 {
+		t.Fatalf("a tombstoned register needs no session-record verdict, %d left", verdicts)
+	}
+	ps, _, err := e.asm.loadFenceSession(idHash)
+	if err != nil {
+		t.Fatalf("load the session record: %v", err)
+	}
+	if ps != nil && len(ps.CancelledRegs) != 0 {
+		t.Fatalf("the record must not accumulate spent verdicts, got %v", ps.CancelledRegs)
 	}
 }
 
@@ -1747,7 +1837,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 
 	// The store settles: it refuses the send, removes the record, and releases the
 	// reserved identifier.
-	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -1985,7 +2075,7 @@ func TestMQTTInflightRolledBackTeardownRestoresTransmittedRegister(t *testing.T)
 // log sites is on a FAILURE path — so a bare c.Warnf there panics the broker on exactly the
 // transient JetStream failure it was trying to report, while a session is disconnecting.
 //
-// Mutation check: log through c directly in persistOwedRegisterDeletes (or in
+// Mutation check: log through c directly in persistVoidedRegs (or in
 // deleteInflightRegisters) and this panics.
 func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 	e := testNewInflightEnv(t, "client-no-logger")
@@ -1995,6 +2085,7 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 	pi := e.track(t, dur, sseq, 2)
 	e.sess.mu.Lock()
 	regSeq := e.sess.pendingPublish[pi].regSeq
+	nonce := e.sess.pendingPublish[pi].regNonce
 	e.sess.mu.Unlock()
 
 	// Every write this path attempts fails, which is what drives it onto the log sites.
@@ -2003,6 +2094,9 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
 		return 0, fmt.Errorf("test: register stream unavailable")
 	}
+	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		return nil, nil, fmt.Errorf("test: register stream unavailable")
+	}
 	e.asm.mu.Unlock()
 	restore := setMQTTTestSessSaveHook(func(*mqttSession) error {
 		return fmt.Errorf("test: session record unavailable")
@@ -2010,83 +2104,21 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 	defer restore()
 
 	// No client, as purgeSharedPending has none.
-	e.sess.deleteInflightRegisters(nil, recordTx{}, []uint64{regSeq})
+	e.sess.deleteInflightRegisters(nil, recordTx{}, []mqttVoidedReg{
+		{seq: regSeq, nonce: nonce, pi: pi, dur: dur, sseq: sseq},
+	})
 	e.sess.secureRegCancellations(nil, recordTx{}, []mqttRegCancellation{
 		{pi: pi, nonce: "nonce-x", durable: dur, sseq: sseq},
 	})
-	e.sess.retryOwedRegisterDeletes(nil)
-	e.sess.oweRegisterDelete(nil, regSeq, _EMPTY_)
+	e.sess.persistVoidedRegs(nil)
 
-	// The obligation is still there, which is the point of surviving at all.
+	// The verdict is still there, which is the point of surviving at all.
 	e.sess.mu.Lock()
-	owed := len(e.sess.owedRegisterDeletes)
+	_, held := e.sess.cancelledRegNonces[nonce]
 	e.sess.mu.Unlock()
-	if owed == 0 {
-		t.Fatalf("the unproven removal must stay owed")
+	if !held {
+		t.Fatalf("the unproven removal must keep its verdict")
 	}
-}
-
-// A teardown's register removals are PROVEN, and an unproven one becomes a persisted
-// obligation rather than a lost request.
-//
-// The ordinary terminal deletes may be fire-and-forget: the record they leave behind names a
-// source that stays live and classifiable, so the store's reconcile, the next resume or the
-// orphan sweep removes it. A teardown's cannot, because the consumer that would classify
-// those sources is about to be deleted — after which a surviving register is deliberately not
-// read as complete, and one lost delete request reserves an identifier for the life of the
-// session.
-//
-// Mutation check: use the unconfirmed helper (or drop the owed-delete recording) and the
-// obligation is not kept.
-func TestMQTTInflightTeardownProvesRegisterRemoval(t *testing.T) {
-	e := testNewInflightEnv(t, "client-teardown-proof")
-	dur := e.sess.idHash + "_" + nuid.Next()
-
-	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 2)
-	e.sess.mu.Lock()
-	regSeq := e.sess.pendingPublish[pi].regSeq
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
-	e.sess.mu.Unlock()
-	if len(regs) != 1 || regs[0] != regSeq {
-		t.Fatalf("the teardown must report the register of its transmitted delivery, got %v", regs)
-	}
-
-	// The delete cannot be proven.
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
-	e.asm.mu.Unlock()
-
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
-
-	e.sess.mu.Lock()
-	owed := append([]uint64(nil), e.sess.owedRegisterDeletes...)
-	idHash := e.sess.idHash
-	e.sess.mu.Unlock()
-	if len(owed) != 1 || owed[0] != regSeq {
-		t.Fatalf("an unproven teardown delete must stay owed, got %v", owed)
-	}
-	// And durably, so a restart still discharges it.
-	ps, _, err := e.asm.loadFenceSession(idHash)
-	if err != nil {
-		t.Fatalf("load the session record: %v", err)
-	}
-	if ps == nil || len(ps.OwedRegs) != 1 || ps.OwedRegs[0] != regSeq {
-		t.Fatalf("the record must carry the owed removal, got %v", ps)
-	}
-
-	// It converges: the next convergence point discharges it.
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = nil
-	e.asm.mu.Unlock()
-	e.sess.retryOwedRegisterDeletes(e.c)
-	e.sess.mu.Lock()
-	left := len(e.sess.owedRegisterDeletes)
-	e.sess.mu.Unlock()
-	if left != 0 {
-		t.Fatalf("the owed removal must be discharged once the delete works, %d left", left)
-	}
-	e.waitRegisterCount(t, 0)
 }
 
 // A deferred consumer delete stages the same way for both halves of a multi-level filter,
@@ -2287,67 +2319,58 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	}
 }
 
-// An obligation recorded while another writer holds the record fence still reaches the
-// record, at the next convergence point.
+// A verdict recorded while another writer holds the record fence still reaches the record,
+// at the next convergence point.
 //
-// The delivery goroutine that owns a cancelled register's cleanup is refused the fence for as
+// The delivery goroutine that owns a cancelled register's verdict is refused the fence for as
 // long as the UNSUBSCRIBE that cancelled it holds one — and that transaction may already have
 // marshalled its record, so it commits without the entry. Treating "I attempted a save" as
-// durability, or treating "nothing was discharged" as "the record already says what it needs
-// to", both leave the obligation in memory only, which a restart discards.
+// durability would leave the verdict in memory only, which a restart discards.
 //
-// Mutation check: skip the save in retryOwedRegisterDeletes when no obligation was
-// discharged, and the record never learns about it.
-func TestMQTTInflightOwedRegisterDeletePersistsAfterBusyFence(t *testing.T) {
-	e := testNewInflightEnv(t, "client-owed-busy-fence")
+// Mutation check: mark the revision saved on a refused fence in persistVoidedRegs, and the
+// record never learns about it.
+func TestMQTTInflightVoidVerdictPersistsAfterBusyFence(t *testing.T) {
+	e := testNewInflightEnv(t, "client-void-busy-fence")
 
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
-	e.asm.mu.Unlock()
-
-	// Another writer holds the fence, exactly as an UNSUBSCRIBE does.
+	// Another writer holds the fence, exactly as an UNSUBSCRIBE does, while the verdict is
+	// recorded and its first save attempted.
 	tok := e.sess.beginRecordTx()
-	e.sess.oweRegisterDelete(e.c, 5150, _EMPTY_)
-
 	e.sess.mu.Lock()
-	owed := len(e.sess.owedRegisterDeletes)
+	e.sess.voidRegNonceLocked("nonce-busy-fence")
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
-	if owed != 1 {
-		t.Fatalf("a refused fence must still leave the obligation pending, got %d", owed)
+	if e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("a refused fence must not report the verdict durable")
 	}
 	if err := e.sess.endRecordTx(tok); err != nil {
 		t.Fatalf("endRecordTx: %v", err)
 	}
 
-	// The next convergence point. Its deletes still fail, so nothing is discharged — and
-	// that is precisely when the record must be brought up to date.
-	e.sess.retryOwedRegisterDeletes(e.c)
-
+	// The next convergence point (the packet tail, a register store, a resume) retries.
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("the convergence point must persist the deferred verdict")
+	}
 	ps, _, err := e.asm.loadFenceSession(idHash)
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps == nil {
-		t.Fatalf("no session record")
-	}
-	if len(ps.OwedRegs) != 1 || ps.OwedRegs[0] != 5150 {
-		t.Fatalf("the record must carry an obligation the busy fence deferred, got %v", ps.OwedRegs)
+	if ps == nil || len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != "nonce-busy-fence" {
+		t.Fatalf("the record must carry a verdict the busy fence deferred, got %v", ps)
 	}
 }
 
-// An obligation whose save turns out NOT to have landed is re-saved by the readback, not
-// left in memory.
+// A verdict whose save turns out NOT to have landed is re-saved by the readback, not left in
+// memory.
 //
-// An ambiguous write is kept and resolved later, and for this obligation "resolved: it never
-// landed" is the dangerous verdict: the entry is then durable nowhere, and nothing else will
-// notice — the convergence points skip a session whose list has not changed since its last
+// An ambiguous write is kept and resolved later, and for this verdict "resolved: it never
+// landed" is the dangerous outcome: the entry is then durable nowhere, and nothing else will
+// notice — the convergence points skip a session whose set has not changed since its last
 // attempt. So the retry happens inside the resolver's own transaction, which is the only
 // writer allowed at that moment and the reason continuations are handed a token at all.
 //
 // Mutation check: leave the not-landed continuation empty and the record never gets it.
-func TestMQTTInflightOwedRegisterDeleteUnlandedSaveRetries(t *testing.T) {
-	e := testNewInflightEnv(t, "client-owed-unlanded")
+func TestMQTTInflightVoidVerdictUnlandedSaveRetries(t *testing.T) {
+	e := testNewInflightEnv(t, "client-void-unlanded")
 	// So sess.seq names the record the readback will find.
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("initial save: %v", err)
@@ -2359,14 +2382,13 @@ func TestMQTTInflightOwedRegisterDeleteUnlandedSaveRetries(t *testing.T) {
 	// record's sequence with this base and its digest with this body, so it can only
 	// conclude that nothing landed.
 	e.sess.markWriteUncertainLocked(base, []byte(`{"attempted":"never-landed"}`))
-	// The obligation the ambiguous save was carrying.
-	e.sess.owedRegisterDeletes = append(e.sess.owedRegisterDeletes, 7370)
-	e.sess.owedRegsRev++
-	rev := e.sess.owedRegsRev
+	// The verdict the ambiguous save was carrying.
+	e.sess.voidRegNonceLocked("nonce-unlanded")
+	rev := e.sess.voidedRegsRev
 	e.sess.mu.Unlock()
 
-	// Exactly what persistOwedRegisterDeletes hands the readback on saveMaybeLanded.
-	e.sess.retainOnUncertain(e.sess.owedRegsUncertainActions(e.c, rev))
+	// Exactly what persistVoidedRegs hands the readback on saveMaybeLanded.
+	e.sess.retainOnUncertain(e.sess.voidedRegsUncertainActions(e.c, rev))
 
 	res, err := e.sess.resolveUncertainWrite()
 	if err != nil {
@@ -2376,99 +2398,48 @@ func TestMQTTInflightOwedRegisterDeleteUnlandedSaveRetries(t *testing.T) {
 		t.Fatalf("resolution = %v, want ours", res)
 	}
 
-	// The record carries it, because the not-landed verdict re-saved it.
+	// The record carries it, because the not-landed continuation re-saved it.
 	ps, _, err := e.asm.loadFenceSession(idHash)
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps == nil {
-		t.Fatalf("no session record")
-	}
-	if len(ps.OwedRegs) != 1 || ps.OwedRegs[0] != 7370 {
-		t.Fatalf("an unlanded obligation save must be retried by the readback, got %v", ps.OwedRegs)
+	if ps == nil || len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != "nonce-unlanded" {
+		t.Fatalf("an unlanded verdict save must be retried by the readback, got %v", ps)
 	}
 	e.sess.mu.Lock()
-	saved := e.sess.owedRegsSavedRev
+	saved := e.sess.voidedRegsSavedRev
 	e.sess.mu.Unlock()
 	if saved != rev {
-		t.Fatalf("the obligation is durable, so it must be marked saved: rev %d, saved %d", rev, saved)
+		t.Fatalf("the verdict is durable, so it must be marked saved: rev %d, saved %d", rev, saved)
 	}
 }
 
-// An unproven delete keeps its obligation VISIBLE, so a concurrent session save cannot
-// persist a record that has forgotten it.
+// A cancelled register whose ladder keeps failing keeps its VERDICT, and the next register
+// store persists it.
 //
-// Emptying the list before the deletes and putting the failures back afterwards looks
-// equivalent and is not: any save falling in that window writes a record with no obligations
-// in it, and the entry that comes back is then in memory only.
+// This is the late-cancellation window: the entry was withdrawn while its store was in
+// flight, and when the store settled neither the delete nor the tombstone could be written.
+// The nonce verdict is the remaining home, and the register-store convergence point is what
+// carries it to the record on a session that keeps publishing.
 //
-// Mutation check: clear owedRegisterDeletes before the delete attempts and restore the
-// failures afterwards, and the concurrent save wipes the obligation from the record.
-func TestMQTTInflightOwedRegisterDeleteSurvivesConcurrentSave(t *testing.T) {
-	e := testNewInflightEnv(t, "client-owed-concurrent-save")
-
-	e.sess.oweRegisterDelete(e.c, 6260, _EMPTY_)
-	e.sess.mu.Lock()
-	idHash := e.sess.idHash
-	e.sess.mu.Unlock()
-
-	// The delete fails, and while it is in flight an unrelated writer saves the session
-	// record — the window the old ordering exposed.
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = func(uint64) error {
-		tok, ok := e.sess.tryBeginRecordTx()
-		if !ok {
-			t.Errorf("the retry must not hold the record fence while deleting")
-			return fmt.Errorf("test: delete unavailable")
-		}
-		if _, serr := e.sess.saveClassified(tok); serr != nil {
-			t.Errorf("concurrent save: %v", serr)
-		}
-		if terr := e.sess.endRecordTx(tok); terr != nil {
-			t.Errorf("endRecordTx: %v", terr)
-		}
-		return fmt.Errorf("test: delete unavailable")
-	}
-	e.asm.mu.Unlock()
-
-	e.sess.retryOwedRegisterDeletes(e.c)
-
-	e.sess.mu.Lock()
-	owed := len(e.sess.owedRegisterDeletes)
-	e.sess.mu.Unlock()
-	if owed != 1 {
-		t.Fatalf("an unproven delete must stay owed in memory, got %d", owed)
-	}
-	ps, _, err := e.asm.loadFenceSession(idHash)
-	if err != nil {
-		t.Fatalf("load the session record: %v", err)
-	}
-	if ps == nil {
-		t.Fatalf("no session record")
-	}
-	if len(ps.OwedRegs) != 1 || ps.OwedRegs[0] != 6260 {
-		t.Fatalf("a save racing an unproven delete must still record the obligation, got %v", ps.OwedRegs)
-	}
-}
-
-// A cancelled register whose confirmed delete keeps failing stays OWED, and is retried at
-// the next register store rather than forgotten.
-//
-// Mutation check: log and drop the obligation (the original) and the register survives.
-func TestMQTTInflightOwedRegisterDeleteIsRetried(t *testing.T) {
-	e := testNewInflightEnv(t, "client-owed")
+// Mutation check: drop the verdict on the double-failure branch of confirmInflightRegister
+// (the original logged and forgot) and the record never learns the register is void.
+func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
+	e := testNewInflightEnv(t, "client-late-cancel")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	e.sess.mu.Lock()
 	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1900, 1))
+	nonce := e.sess.pendingPublish[pi].regNonce
+	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
 
 	failDeletes := true
 	e.asm.mu.Lock()
 	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
 		if r.Cancelled {
-			// The tombstone cannot be written either, so the obligation has nowhere durable
-			// to go and must be kept in memory.
+			// The tombstone cannot be written either, so the verdict has nowhere durable
+			// to go but the session record.
 			return 0, fmt.Errorf("test: cancellation mark unavailable")
 		}
 		seq, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
@@ -2492,17 +2463,18 @@ func TestMQTTInflightOwedRegisterDeleteIsRetried(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1900, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1900, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
-	owed := len(e.sess.owedRegisterDeletes)
+	_, held := e.sess.cancelledRegNonces[nonce]
 	e.sess.mu.Unlock()
-	if owed != 1 {
-		t.Fatalf("an unproven cancellation delete must stay owed, got %d", owed)
+	if !held {
+		t.Fatalf("an unproven cancellation must keep its verdict")
 	}
 
-	// The next register store retries it, and this time the delete works.
+	// The next register store persists the verdict; the register itself is reaped by
+	// the next recovery scan, not here.
 	failDeletes = false
 	e.asm.mu.Lock()
 	e.asm.testInflightStore, e.asm.testInflightLoad = nil, nil
@@ -2510,15 +2482,799 @@ func TestMQTTInflightOwedRegisterDeleteIsRetried(t *testing.T) {
 	e.sess.mu.Lock()
 	pi2, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1901, 1))
 	e.sess.mu.Unlock()
-	if !e.sess.storeInflightRegister(e.c, pi2, 1, dur, 1901, _EMPTY_) {
+	if !e.sess.storeInflightRegister(e.c, pi2, 1, dur, 1901, e.nonceOf(pi2), _EMPTY_) {
 		t.Fatalf("the follow-up delivery must register normally")
 	}
-	e.sess.mu.Lock()
-	owed = len(e.sess.owedRegisterDeletes)
-	e.sess.mu.Unlock()
-	if owed != 0 {
-		t.Fatalf("the owed delete must be retried and cleared, %d left", owed)
+	ps, _, err := e.asm.loadFenceSession(idHash)
+	if err != nil {
+		t.Fatalf("load the session record: %v", err)
 	}
+	if ps == nil {
+		t.Fatalf("no session record")
+	}
+	found := false
+	for _, n := range ps.CancelledRegs {
+		if n == nonce {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the register-store convergence point must persist the verdict, got %v", ps.CancelledRegs)
+	}
+}
+
+// A cancelled reservation is held while its register store is UNSETTLED, however durable the
+// verdict already is.
+//
+// Even with the nonce verdict on the record, the original create-only CAS may still be in
+// flight: freeing the identifier lets a new allocation take the subject, reap what it finds
+// there, and then race that old CAS onto the same subject — two writers for one identifier.
+// The reservation drops only at a settle point (confirm/abandon), and this test pins the
+// unsettled half.
+//
+// Mutation check: drop the regPending guard from releaseSettledVoidReservationsLocked and
+// the identifier is freed while the store is still out.
+func TestMQTTInflightStalledStoreHoldsReservation(t *testing.T) {
+	e := testNewInflightEnv(t, "client-stalled-store")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// An allocation whose store never settles in this test: allocated, then withdrawn by a
+	// teardown while "in flight".
+	e.sess.mu.Lock()
+	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3100, 1))
+	cancels, _ := e.sess.voidRegistrationsLocked(dur)
+	e.sess.mu.Unlock()
+	if len(cancels) != 1 {
+		t.Fatalf("the staging must withdraw the pending registration, got %+v", cancels)
+	}
+
+	// The verdict becomes durable — and the identifier must STILL be held.
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("the verdict save must land")
+	}
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if ack == nil || !ack.regCancelled || !ack.regPending {
+		t.Fatalf("a durable verdict alone must not release an unsettled reservation, got %+v", ack)
+	}
+}
+
+// A settled-but-unproven cancellation keeps its identifier until the verdict's save lands.
+//
+// The settle point (the store's confirmation) can find every durable rung failing — the
+// register stream down for the delete AND the tombstone, the session record down for the
+// verdict. Releasing the identifier there hands it to a new delivery while nothing durable
+// anywhere calls the old register void; a crash then resurrects it as an ordinary delivery
+// holding a Receive Maximum slot forever. The release belongs to the save that proves the
+// verdict.
+//
+// Mutation check: release the reservation unconditionally at the settle point and the
+// identifier is freed with no rung proven.
+func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
+	e := testNewInflightEnv(t, "client-unproven-settle")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	e.sess.mu.Lock()
+	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3200, 1))
+	nonce := e.sess.pendingPublish[pi].regNonce
+	cancels, _ := e.sess.voidRegistrationsLocked(dur)
+	idHash, gen := e.sess.idHash, e.sess.gen
+	e.sess.mu.Unlock()
+	if len(cancels) != 1 || cancels[0].nonce != nonce {
+		t.Fatalf("the staging must withdraw the pending registration, got %+v", cancels)
+	}
+
+	// The CAS that was in flight LANDS...
+	seq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{
+		PI: pi, Dur: dur, Seq: 3200, QoS: 2, Nonce: nonce,
+	})
+	if err != nil {
+		t.Fatalf("land the in-flight register: %v", err)
+	}
+	// ...and the settle point finds every durable rung failing.
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
+	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
+		return 0, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		return nil, nil, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.mu.Unlock()
+	restoreSave := setMQTTTestSessSaveHook(func(*mqttSession) error {
+		return fmt.Errorf("test: session record unavailable")
+	})
+	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce) {
+		t.Fatalf("a cancelled allocation must not be released for sending")
+	}
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if ack == nil || !ack.regCancelled {
+		t.Fatalf("an unproven settle must keep the reservation, got %+v", ack)
+	}
+	if ack.regPending {
+		t.Fatalf("the settle point must mark the store over")
+	}
+
+	// The record heals; the save that proves the verdict is what releases the identifier.
+	restoreSave()
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("the verdict save must land once the record heals")
+	}
+	e.sess.mu.Lock()
+	_, stillHeld := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if stillHeld {
+		t.Fatalf("a proven verdict on a settled store must release the identifier")
+	}
+}
+
+// A RETIRED register is never tombstoned and never voided: its cleanup is delete-or-leave.
+//
+// The register is not a claim on an identifier — it is the durable suppression of a
+// completed-but-unproven QoS 2 exchange. A Cancelled rewrite (or a nonce verdict) would have
+// recovery drop it without reinstating that suppression, and if the teardown crashed before
+// its consumer delete the source is still re-offerable: the completed payload would go out
+// again. Left alone, recovery re-reads it as a retirement and the suppression survives.
+//
+// Mutation check: run the tombstone rung for a retired register (or void its nonce at
+// staging) and the restart loses the retirement.
+func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
+	const clientID = "client-retired-ladder"
+	e := testNewInflightEnv(t, clientID)
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[pi]
+	regSeq, nonce := ack.regSeq, ack.regNonce
+	e.sess.untrackPublishEntry(pi)
+	e.sess.retireSourceLocked(dur, sseq, &mqttRetiredSource{
+		pi: pi, regSeq: regSeq, nonce: nonce, durable: true,
+	})
+	e.sess.mu.Unlock()
+	// The record's copy carries the retirement mark, as secureRetiredSource would leave it.
+	if newSeq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, regSeq, nonce, _EMPTY_); !ok {
+		t.Fatalf("the retirement must be durable for this test")
+	} else {
+		regSeq = newSeq
+		e.sess.mu.Lock()
+		if rs := e.sess.srcAckOwed[mqttDeferredKey{dur, sseq}]; rs != nil {
+			rs.regSeq = newSeq
+		}
+		e.sess.mu.Unlock()
+	}
+
+	// The teardown stages and purges; the register delete fails.
+	e.sess.mu.Lock()
+	_, transmitted := e.sess.voidRegistrationsLocked(dur)
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	verdicts := len(e.sess.cancelledRegNonces)
+	e.sess.mu.Unlock()
+	if len(transmitted) != 0 || verdicts != 0 {
+		t.Fatalf("a retirement must not be voided at staging, got %v (%d verdicts)", transmitted, verdicts)
+	}
+	found := false
+	for _, v := range regs {
+		if v.seq == regSeq && v.retired {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the purge must report the retired register as retired, got %+v", regs)
+	}
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
+	e.asm.mu.Unlock()
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	// The session record exists, so the restart below resumes THIS incarnation rather than
+	// minting a new generation whose register walk would find nothing.
+	if err := testSessSave(t, e.sess); err != nil {
+		t.Fatalf("persist the session record: %v", err)
+	}
+
+	// The register survives UNCHANGED: still a retirement, not a tombstone.
+	rec, _ := e.loadRegister(t, pi)
+	if rec == nil || !rec.Retired || rec.Cancelled {
+		t.Fatalf("a retired register must survive a failed delete unchanged, got %+v", rec)
+	}
+
+	// And a restart reinstates the suppression rather than dropping it.
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = nil
+	e.asm.mu.Unlock()
+	restored, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
+	if err != nil {
+		t.Fatalf("createOrRestoreSession: %v", err)
+	}
+	if err := restored.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	restored.mu.Lock()
+	rs := restored.srcAckOwed[mqttDeferredKey{dur, sseq}]
+	restored.mu.Unlock()
+	if rs == nil {
+		t.Fatalf("the restart must reinstate the retirement, or the completed payload is resent")
+	}
+}
+
+// A surviving disconnect's shared purge walks the same ladder and never deletes a consumer.
+//
+// The path frees this session's shared packet identifiers without acking, so a resume does
+// not NAK-steal group messages — but the group durable itself must survive (other members
+// hold it, and this session's membership stays on the record). The never-deletes-consumer
+// invariant is what the reconciliation analysis rests on; the ladder is what keeps a failed
+// register delete from stranding an identifier: the verdict lands durably and the next
+// restart frees it.
+//
+// Mutation checks: delete the consumer in purgeSharedPending and the first assertion fails;
+// skip the ladder (call the deletes fire-and-forget) and the verdict never reaches the
+// record.
+func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
+	e := testNewInflightEnv(t, "client-shared-purge")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sid = "$share/g/foo"
+
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+	e.sess.mu.Lock()
+	nonce := e.sess.pendingPublish[pi].regNonce
+	e.sess.cons = map[string]*ConsumerConfig{sid: {Durable: dur, DeliverGroup: "g",
+		DeliverSubject: mqttSubPrefix + nuid.Next()}}
+	idHash := e.sess.idHash
+	e.sess.mu.Unlock()
+
+	// Both register-stream rungs fail; only the session record is reachable.
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
+	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
+		return 0, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		return nil, nil, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.mu.Unlock()
+
+	e.sess.purgeSharedPending()
+
+	// The consumer survives: other members may hold it, and the membership does.
+	if _, err := e.asm.jsa.lookupConsumer(mqttStreamName, dur); err != nil {
+		t.Fatalf("purgeSharedPending must never delete a consumer: %v", err)
+	}
+	// The identifier is freed for this session...
+	e.sess.mu.Lock()
+	_, held := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if held {
+		t.Fatalf("the purge must free the shared identifier")
+	}
+	// ...and the verdict reached the record, so a restart frees it too instead of
+	// restoring a pending entry another member may complete.
+	ps, _, err := e.asm.loadFenceSession(idHash)
+	if err != nil {
+		t.Fatalf("load the session record: %v", err)
+	}
+	if ps == nil {
+		t.Fatalf("no session record")
+	}
+	found := false
+	for _, n := range ps.CancelledRegs {
+		if n == nonce {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the record must carry the verdict of the unremovable register, got %v", ps.CancelledRegs)
+	}
+}
+
+// A proven rung-1 delete forgets its verdict, so the record's verdict set stays bounded.
+//
+// The verdict is recorded at staging (the membership-removal write carries it) and the
+// register is deleted moments later; without the forget, every subscribe/unsubscribe cycle
+// leaves one more nonce in CancelledRegs forever.
+//
+// Mutation check: skip forgetCancelledReg on the confirmed-delete rung and the record still
+// carries a verdict its register no longer needs.
+func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
+	e := testNewInflightEnv(t, "client-rung1-bounds")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+	e.sess.mu.Lock()
+	nonce := e.sess.pendingPublish[pi].regNonce
+	// The staging half: the transmitted register is voided in the membership write...
+	_, transmitted := e.sess.voidRegistrationsLocked(dur)
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	idHash := e.sess.idHash
+	e.sess.mu.Unlock()
+	if len(transmitted) != 1 || transmitted[0] != nonce {
+		t.Fatalf("the staging must void the transmitted register, got %v", transmitted)
+	}
+	if err := testSessSave(t, e.sess); err != nil {
+		t.Fatalf("persist the staged verdict: %v", err)
+	}
+
+	// ...and the teardown's delete then SUCCEEDS, which is the proof that retires it.
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.mu.Lock()
+	verdicts := len(e.sess.cancelledRegNonces)
+	e.sess.mu.Unlock()
+	if verdicts != 0 {
+		t.Fatalf("a proven delete must forget its verdict, %d left", verdicts)
+	}
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("the shortened verdict set must persist")
+	}
+	ps, _, err := e.asm.loadFenceSession(idHash)
+	if err != nil {
+		t.Fatalf("load the session record: %v", err)
+	}
+	if ps != nil && len(ps.CancelledRegs) != 0 {
+		t.Fatalf("the record must not accumulate spent verdicts, got %v", ps.CancelledRegs)
+	}
+	e.waitRegisterCount(t, 0)
+}
+
+// A verdict on an OLD register cannot touch a NEW delivery on the same reused durable name.
+//
+// Shared group durables are named deterministically, so a leave followed by a rejoin brings
+// the same name back. This is the case that killed every durable-scoped rule this feature
+// tried: "everything on this durable is void" either resurrects the abandoned register or
+// destroys the genuine new one. A nonce is minted with its allocation and never reused, so
+// the old verdict names exactly the old register, whatever the durable is called.
+//
+// Mutation check: key the recovery drop by DURABLE (drop every register whose durable has
+// any voided nonce) and the rejoined delivery's identifier is freed while the client holds
+// it.
+func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
+	const clientID = "client-rejoin-nonce"
+	e := testNewInflightEnv(t, clientID)
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// The OLD membership's delivery: transmitted, then the leave voids it and the delete
+	// fails, so the verdict is what survives.
+	sseqOld := e.publishSource(t, dur)
+	piOld := e.track(t, dur, sseqOld, 2)
+	e.sess.mu.Lock()
+	nonceOld := e.sess.pendingPublish[piOld].regNonce
+	_, transmitted := e.sess.voidRegistrationsLocked(dur)
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	e.sess.mu.Unlock()
+	if len(transmitted) != 1 || transmitted[0] != nonceOld {
+		t.Fatalf("the leave must void the old register, got %v", transmitted)
+	}
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
+	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
+		return 0, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		return nil, nil, fmt.Errorf("test: register stream unavailable")
+	}
+	e.asm.mu.Unlock()
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete, e.asm.testInflightStore, e.asm.testInflightLoad = nil, nil, nil
+	e.asm.mu.Unlock()
+
+	// The REJOIN, same durable name, and a new delivery under a new nonce.
+	sseqNew := e.publishSource(t, dur)
+	piNew := e.track(t, dur, sseqNew, 2)
+	if err := testSessSave(t, e.sess); err != nil {
+		t.Fatalf("persist the session: %v", err)
+	}
+
+	// The restart must free the OLD identifier and keep the NEW one.
+	restored, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
+	if err != nil {
+		t.Fatalf("createOrRestoreSession: %v", err)
+	}
+	if err := restored.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	restored.mu.Lock()
+	_, oldHeld := restored.pendingPublish[piOld]
+	_, newHeld := restored.pendingPublish[piNew]
+	restored.mu.Unlock()
+	if oldHeld {
+		t.Fatalf("the old register was voided; identifier %d must not be reserved", piOld)
+	}
+	if !newHeld {
+		t.Fatalf("the rejoined delivery's identifier %d must stay reserved: the old verdict cannot touch it", piNew)
+	}
+}
+
+// A landed save releases only the reservations whose verdicts it provably SERIALIZED.
+//
+// The revision a save captures precedes its marshal, so a verdict recorded by a concurrent
+// teardown after that capture is durable nowhere when the save lands — and a release keyed
+// on set membership alone would free its identifier with a crash still able to resurrect the
+// register. Each verdict therefore carries the revision of its own insertion, and release
+// requires it to be at or below the revision proven saved.
+//
+// Mutation check: release on membership alone (drop the insertion-revision comparison) and
+// the unserialized verdict's identifier is freed.
+func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
+	e := testNewInflightEnv(t, "client-serialized-release")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// Verdict A is recorded and provably saved.
+	e.sess.mu.Lock()
+	e.sess.voidRegNonceLocked("nonce-A")
+	e.sess.mu.Unlock()
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("verdict A's save must land")
+	}
+
+	// Verdict B arrives AFTER that save, with a settled reservation waiting on it — the
+	// state a concurrent teardown leaves between the marshal and the next save.
+	e.sess.mu.Lock()
+	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4100, 1))
+	cancels, _ := e.sess.voidRegistrationsLocked(dur)
+	if ack := e.sess.pendingPublish[pi]; ack != nil {
+		// Settled exactly as the settle points do it: regPending drops and the
+		// reservation is parked in the index the proof edges release from.
+		ack.regPending = false
+		e.sess.parkSettledVoidReservationLocked(ack.regNonce, pi)
+	}
+	// The release pass runs on the strength of verdict A's landed save.
+	e.sess.releaseSettledVoidReservationsLocked()
+	_, held := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if len(cancels) != 1 {
+		t.Fatalf("the staging must withdraw the registration, got %+v", cancels)
+	}
+	if !held {
+		t.Fatalf("verdict B was never serialized by the landed save; its identifier must stay held")
+	}
+
+	// Once B's own save lands, the release follows.
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("verdict B's save must land")
+	}
+	e.sess.mu.Lock()
+	_, held = e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if held {
+		t.Fatalf("a serialized verdict on a settled store must release the identifier")
+	}
+}
+
+// A reservation whose verdict was already proven by a register-stream rung is released at
+// the settle point, not parked forever.
+//
+// A securing tombstone retires the nonce while the original store is still out. When that
+// store then settles through ABANDONMENT (its retries exhausted, its reconcile unreadable),
+// the save-keyed release can never fire — there is nothing left to save — so the settle
+// point itself must recognise the retired verdict as proof. Withheld, the reservation and
+// its Receive Maximum slot survive for the life of the session; at a Receive Maximum of 1
+// that is a session that can no longer deliver, with every durable rung PROVEN.
+//
+// Mutation check: always park at the abandon settle point (drop the retired-verdict escape)
+// and the reservation survives its own proof.
+func TestMQTTInflightAbandonReleasesProvenReservation(t *testing.T) {
+	e := testNewInflightEnv(t, "client-abandon-proven")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	e.sess.mu.Lock()
+	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4200, 1))
+	nonce := e.sess.pendingPublish[pi].regNonce
+	e.sess.mu.Unlock()
+
+	// The teardown withdraws the allocation and SECURES it: the tombstone lands, which
+	// retires the nonce.
+	e.sess.mu.Lock()
+	regs, cancels := e.sess.purgeConsumerPendingLocked(dur)
+	e.sess.mu.Unlock()
+	if len(regs) != 0 || len(cancels) != 1 || cancels[0].nonce != nonce {
+		t.Fatalf("the purge must report the pending cancellation, got %v / %v", regs, cancels)
+	}
+	if !e.sess.secureRegCancellations(e.c, recordTx{}, cancels) {
+		t.Fatalf("the tombstone must land")
+	}
+	e.sess.mu.Lock()
+	_, stillVoid := e.sess.cancelledRegNonces[nonce]
+	e.sess.mu.Unlock()
+	if stillVoid {
+		t.Fatalf("a landed tombstone must retire the nonce verdict")
+	}
+
+	// The original store settles by ABANDONMENT — and the proof must release it.
+	e.sess.abandonInflightRegister(pi, dur, 4200, nonce)
+	e.sess.mu.Lock()
+	_, held := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if held {
+		t.Fatalf("a proven reservation must be released when its store settles")
+	}
+}
+
+// A verdict whose register was not seen is KEPT by the scan, and retired only when the
+// register finally lands and is deleted with proof.
+//
+// Scan-time absence cannot rule out a late create-only CAS: a superseded broker's store can
+// land after a takeover's resume has already walked the stream. A verdict retired on that
+// emptiness leaves the late register ordinary — an abandoned consumer's register nothing
+// anywhere calls void — and every later resume reserves its identifier. Kept, the verdict is
+// self-healing: the scan that finally sees the register deletes it and retires the verdict
+// against that proof.
+//
+// The one place absence IS provable retires its own verdict: a store that was cancelled
+// before any CAS was issued (releaseCancelledReservation) can never produce a register.
+//
+// Mutation checks: retire absent verdicts at scan (the removed cleanup) and the late
+// register survives as an ordinary delivery; drop the no-CAS forget and a nonce no register
+// can carry stays on the record.
+func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
+	const clientID = "client-late-cas"
+	e := testNewInflightEnv(t, clientID)
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// The verdict of a register the scan has never seen (the takeover shape: the old
+	// broker's CAS is still in flight). A well-formed nonce, since an ill-formed one makes
+	// the register unreadable rather than voided.
+	nonce := mqttNewInflightNonce()
+	e.sess.mu.Lock()
+	e.sess.voidRegNonceLocked(nonce)
+	pi := e.sess.bumpPI()
+	idHash, gen := e.sess.idHash, e.sess.gen
+	e.sess.mu.Unlock()
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("the verdict must be durable")
+	}
+
+	// First resume: the register is absent, and the verdict must SURVIVE the scan.
+	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	e.sess.mu.Lock()
+	_, kept := e.sess.cancelledRegNonces[nonce]
+	e.sess.mu.Unlock()
+	if !kept {
+		t.Fatalf("scan-time absence is not proof; the verdict must survive the scan")
+	}
+
+	// The late CAS lands...
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{
+		PI: pi, Dur: dur, Seq: 4300, QoS: 2, Nonce: nonce,
+	}); err != nil {
+		t.Fatalf("land the late register: %v", err)
+	}
+	// ...and the next scan retires the verdict against the proof of its deletion.
+	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters (second): %v", err)
+	}
+	e.sess.mu.Lock()
+	_, kept = e.sess.cancelledRegNonces[nonce]
+	_, reserved := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if kept {
+		t.Fatalf("a register seen and deleted must retire its verdict")
+	}
+	if reserved {
+		t.Fatalf("the late register was voided; identifier %d must not be reserved", pi)
+	}
+	e.waitRegisterCount(t, 0)
+
+	// And the provable-absence path: a cancellation whose store never issued a CAS
+	// retires its own verdict.
+	e.sess.mu.Lock()
+	pi2, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4400, 1))
+	nonce2 := e.sess.pendingPublish[pi2].regNonce
+	e.sess.voidRegistrationsLocked(dur)
+	e.sess.mu.Unlock()
+	if e.sess.storeInflightRegister(e.c, pi2, 1, dur, 4400, e.nonceOf(pi2), _EMPTY_) {
+		t.Fatalf("a cancelled allocation must not be released for sending")
+	}
+	e.sess.mu.Lock()
+	_, kept2 := e.sess.cancelledRegNonces[nonce2]
+	_, held2 := e.sess.pendingPublish[pi2]
+	e.sess.mu.Unlock()
+	if kept2 || held2 {
+		t.Fatalf("no CAS was ever issued: the verdict and the reservation must both go (kept=%v held=%v)", kept2, held2)
+	}
+}
+
+// A STALE store's settle cannot release a newer allocation's reservation.
+//
+// A store call can stall (its convergence-point persist is a round trip) across the
+// cancellation of its own allocation, that reservation's release, the identifier's REUSE by
+// a new allocation, and a second cancellation. When it finally reads the entry, the
+// reservation it finds belongs to the NEW allocation — whose own CAS is still on the wire.
+// Releasing it would free the identifier for a third allocation to race that CAS onto the
+// same subject, and forgetting its verdict would leave whatever lands unexplained. Every
+// reservation touch is therefore keyed by the toucher's own nonce.
+//
+// Mutation check: drop the nonce comparison from releaseCancelledReservation and the newer
+// allocation's reservation (and verdict) are destroyed by the stale settle.
+func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
+	e := testNewInflightEnv(t, "client-stale-settle")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// Allocation A, whose store is "stalled": trackPublish ran, storeInflightRegister has
+	// not read the entry yet.
+	e.sess.mu.Lock()
+	piA, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5100, 1))
+	nonceA := e.sess.pendingPublish[piA].regNonce
+	// Its allocation is cancelled and the reservation settles and releases, freeing the
+	// identifier...
+	e.sess.voidRegistrationsLocked(dur)
+	if ack := e.sess.pendingPublish[piA]; ack == nil || !ack.regCancelled {
+		e.sess.mu.Unlock()
+		t.Fatalf("the cancellation must leave a reservation")
+	}
+	delete(e.sess.pendingPublish, piA) // A's release, proven elsewhere
+	e.sess.last_pi = piA - 1           // ...and REUSED by allocation B under the same number
+	piB, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5200, 1))
+	nonceB := e.sess.pendingPublish[piB].regNonce
+	// B is cancelled too, with ITS store still out: the state the stale settle meets.
+	e.sess.voidRegistrationsLocked(dur)
+	e.sess.mu.Unlock()
+	if piB != piA {
+		t.Fatalf("the test needs the identifier reused, got %d then %d", piA, piB)
+	}
+	if nonceB == nonceA {
+		t.Fatalf("nonces must differ across allocations")
+	}
+
+	// A's stale store finally settles. It must not touch B's reservation or verdict.
+	if e.sess.storeInflightRegister(e.c, piA, 1, dur, 5100, nonceA, _EMPTY_) {
+		t.Fatalf("a cancelled allocation must not be released for sending")
+	}
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[piB]
+	_, verdictHeld := e.sess.cancelledRegNonces[nonceB]
+	e.sess.mu.Unlock()
+	if ack == nil || !ack.regCancelled || ack.regNonce != nonceB {
+		t.Fatalf("the newer allocation's reservation must survive a stale settle, got %+v", ack)
+	}
+	if !verdictHeld {
+		t.Fatalf("the newer allocation's verdict must survive a stale settle")
+	}
+}
+
+// The reservation release is ORDER-INDEPENDENT between the verdict's proof and the store's
+// settlement, in both directions.
+//
+// The two race freely, and each ordering has a wedge if release is checked at only one edge.
+// Verdict durable FIRST, settle second: the settle parks the reservation waiting for "the
+// save that proves the verdict" — but that save already happened, and with the revision gap
+// closed no later save comes round. Settle FIRST, stream-rung proof second: recovery (or a
+// securing retry) retires the nonce, removing the very membership the save-keyed release
+// requires, and nothing later re-examines the reservation. Either way the identifier and its
+// Receive Maximum slot are consumed for the life of the session; at a Receive Maximum of 1,
+// the whole session.
+//
+// Mutation checks: drop the savedRev comparison from voidVerdictProvenLocked and ordering A
+// wedges; drop the release sweep from forgetCancelledReg and ordering B wedges.
+func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
+	// Ordering A: the verdict's save lands BEFORE the store settles.
+	t.Run("verdict-durable-then-settle", func(t *testing.T) {
+		e := testNewInflightEnv(t, "client-order-a")
+		dur := e.sess.idHash + "_" + nuid.Next()
+
+		e.sess.mu.Lock()
+		pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5300, 1))
+		nonce := e.sess.pendingPublish[pi].regNonce
+		e.sess.voidRegistrationsLocked(dur)
+		e.sess.mu.Unlock()
+
+		// The verdict becomes durable while the store is still out.
+		if !e.sess.persistVoidedRegs(e.c) {
+			t.Fatalf("the verdict save must land")
+		}
+		e.sess.mu.Lock()
+		stillHeld := e.sess.pendingPublish[pi] != nil
+		e.sess.mu.Unlock()
+		if !stillHeld {
+			t.Fatalf("an unsettled reservation must survive the save")
+		}
+
+		// The store then settles by ABANDONMENT. The proof already exists; parking here
+		// waits for a save that will never come.
+		e.sess.abandonInflightRegister(pi, dur, 5300, nonce)
+		e.sess.mu.Lock()
+		_, held := e.sess.pendingPublish[pi]
+		e.sess.mu.Unlock()
+		if held {
+			t.Fatalf("a settle after a durable verdict must release the identifier")
+		}
+	})
+
+	// Ordering B: the store settles, and a stream-rung proof then retires the nonce.
+	t.Run("settle-then-rung-proof", func(t *testing.T) {
+		e := testNewInflightEnv(t, "client-order-b")
+		dur := e.sess.idHash + "_" + nuid.Next()
+
+		e.sess.mu.Lock()
+		pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5400, 1))
+		nonce := e.sess.pendingPublish[pi].regNonce
+		e.sess.voidRegistrationsLocked(dur)
+		e.sess.mu.Unlock()
+
+		// Settles first, with the verdict unproven (no save has landed).
+		restore := setMQTTTestSessSaveHook(func(*mqttSession) error {
+			return fmt.Errorf("test: session record unavailable")
+		})
+		e.sess.abandonInflightRegister(pi, dur, 5400, nonce)
+		restore()
+		e.sess.mu.Lock()
+		ack := e.sess.pendingPublish[pi]
+		e.sess.mu.Unlock()
+		if ack == nil || !ack.regCancelled || ack.regPending {
+			t.Fatalf("an unproven settle must park the reservation, got %+v", ack)
+		}
+
+		// A stream-rung proof arrives after the settle: recovery deletes the register (or
+		// a securing retry lands its tombstone) and retires the nonce. That retirement is
+		// the last edge that will ever look at this reservation.
+		e.sess.forgetCancelledReg(nonce)
+		e.sess.mu.Lock()
+		_, held := e.sess.pendingPublish[pi]
+		e.sess.mu.Unlock()
+		if held {
+			t.Fatalf("a rung proof after the settle must release the identifier")
+		}
+	})
+}
+
+// A verdict whose register is FOUND tombstoned is retired against that register's confirmed
+// deletion, not kept forever.
+//
+// This is the state a crash leaves between the teardown's tombstone rung and the forget's
+// save: the verdict is on the record AND the Cancelled register is on the stream. The
+// verdict-keeping absence policy does not apply — the register is right here, so proof needs
+// no absence reasoning — and routing it to the fire-and-forget list instead would keep the
+// nonce in CancelledRegs forever, one entry per such crash, growing the session record
+// without bound.
+//
+// Mutation check: route a tombstoned in-set register to the fire-and-forget drop list (the
+// original ordering) and the verdict survives its own proof.
+func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
+	const clientID = "client-tombstone-retire"
+	e := testNewInflightEnv(t, clientID)
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// The crash residue: verdict durable, register tombstoned, forget's save never ran.
+	nonce := mqttNewInflightNonce()
+	e.sess.mu.Lock()
+	e.sess.voidRegNonceLocked(nonce)
+	pi := e.sess.bumpPI()
+	idHash, gen := e.sess.idHash, e.sess.gen
+	e.sess.mu.Unlock()
+	if !e.sess.persistVoidedRegs(e.c) {
+		t.Fatalf("the verdict must be durable")
+	}
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{
+		PI: pi, Dur: dur, Seq: 4500, QoS: 1, Nonce: nonce, Cancelled: true,
+	}); err != nil {
+		t.Fatalf("land the tombstone: %v", err)
+	}
+
+	// The restart's scan finds the register and retires the verdict against its deletion.
+	restored, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
+	if err != nil {
+		t.Fatalf("createOrRestoreSession: %v", err)
+	}
+	if err := restored.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	restored.mu.Lock()
+	_, kept := restored.cancelledRegNonces[nonce]
+	_, reserved := restored.pendingPublish[pi]
+	restored.mu.Unlock()
+	if kept {
+		t.Fatalf("a tombstoned register is proof in hand; its verdict must be retired")
+	}
+	if reserved {
+		t.Fatalf("a tombstoned register frees its identifier, %d must not be reserved", pi)
+	}
+	e.waitRegisterCount(t, 0)
 }
 
 // Tearing a consumer down releases its RETIRED sources too, not just its cpending
@@ -2561,8 +3317,8 @@ func TestMQTTInflightConsumerPurgeReleasesRetiredSources(t *testing.T) {
 		t.Fatalf("the retirement must go with the consumer that could have settled it")
 	}
 	var found bool
-	for _, seq := range regs {
-		if seq == regSeq {
+	for _, v := range regs {
+		if v.seq == regSeq {
 			found = true
 		}
 	}
@@ -2831,7 +3587,7 @@ func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1700, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1700, e.nonceOf(pi), _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	if len(deleted) < 2 {
@@ -2979,8 +3735,15 @@ func TestMQTTInflightOrphanReconcile(t *testing.T) {
 		t.Fatalf("the first sighting of an orphan must not delete it")
 	}
 	pass()
-	if e.registerPresent(t, subject) {
-		t.Fatalf("an orphaned register must be retired once stably observed")
+	// The sweep's delete is deliberately fire-and-forget, so absence is polled rather
+	// than asserted on the send: asserting immediately races the send queue, which is
+	// exactly the flake a paired soak run caught here.
+	deadline := time.Now().Add(5 * time.Second)
+	for e.registerPresent(t, subject) {
+		if time.Now().After(deadline) {
+			t.Fatalf("an orphaned register must be retired once stably observed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

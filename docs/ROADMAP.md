@@ -614,68 +614,50 @@ is fixed before feature work continues.
   drives real clients across a real restart: QoS 1 and QoS 2 identifiers surviving,
   the PUBREL reservation blocking a colliding allocation, a stale register leaving no
   phantom Receive Maximum slot, and a retained send writing no register.
-  A late round corrected a mistake of my own worth recording, because it was tempting and
-  wrong: a delivery whose consumer had vanished was briefly exempted from Receive Maximum,
-  on the reasoning that it could never complete and so should not hold a slot forever. But
-  that limit bounds what the CLIENT holds unacknowledged, and a consumer disappearing
-  proves nothing about the client — the exemption let the broker exceed the negotiated
-  limit. Only a delivery provably never transmitted may free anything, so the cancellation
-  path now writes a durable tombstone on the register when its deletion cannot be proven,
-  and that tombstone is what licenses recovery to free the identifier. Where neither the
-  delete nor the tombstone can be written, the obligation is carried on the session record
-  (`OwedRegs`), since an in-memory list does not survive the restart that makes the leftover
-  register harmful in the first place. That persistence took a further round of its own,
-  because "I tried to save" is not durability: the obligation is added by a delivery
-  goroutine while the UNSUBSCRIBE that cancelled the delivery holds the record fence, so the
-  addition is refused its own save and can also be missed by a transaction that has already
-  marshalled its record. It is now tracked as a revision the record is known to carry and
-  retried at every convergence point, including the tail of the UNSUBSCRIBE; and an
-  obligation stays in the list until its delete is proven, because clearing the list first
-  lets a concurrent save persist a record that has forgotten it. A further round closed the
-  crash window on the other side of the same handoff: the cancelling UNSUBSCRIBE can persist
-  its removal and delete the consumer while the register's CAS is still on the wire, so the
-  cancellation is now recorded as a register **nonce** on the session record inside that
-  packet's own transaction — durable before the consumer goes. Keyed by nonce because the
-  cancellation frees the identifier for reuse and the drained source is re-offered under a
-  new one, so both of the obvious keys would eventually name a genuine later delivery.
+  A late round corrected a mistake of my own worth recording, because it was tempting
+  and wrong: a delivery whose consumer had vanished was briefly exempted from Receive
+  Maximum, on the reasoning that it could never complete and so should not hold a slot
+  forever. But that limit bounds what the CLIENT holds unacknowledged, and a consumer
+  disappearing proves nothing about the client — the exemption let the broker exceed the
+  negotiated limit. Only a delivery this session provably gave up may free anything.
 
-  Eight final rounds generalised that. The other consumer-teardown paths — a QoS
-  downgrade's deferred delete, a forced shared leave, a shared release — all run after
-  their packet's save, so a cancellation recorded on the session record could not be
-  durable in time; each now writes the cancellation tombstone itself, before the
-  consumer goes, and holds the identifier reserved until the store settles so nothing
-  else can take the subject. Because such a tombstone can outlive its owner, the next
-  allocation of that identifier reaps a cancelled occupant rather than refusing it. And
-  an ambiguous obligation save is resolved after the fence is released rather than
-  inside it (where resolution is simply refused), with the readback's not-landed verdict
-  re-saving under the resolver's own token: leaving that continuation empty is how a
-  proven-unlanded obligation ends up durable nowhere. And the cancellation is now
-  written by the transaction that removes the consumer's MEMBERSHIP, not by the teardown
-  that follows it: after that write there is no subscription left to redeliver through,
-  so a register that lands later strands its identifier whether or not the durable
-  survives — which is also why withholding the consumer delete was the wrong remedy and
-  is not what ships. The staging is preceded by the delivery barrier — the doomed
-  consumer's subscription is marked closed under the same lock — because a snapshot
-  taken while the callback is still live is only current, not complete, and the rollback
-  lifts the barrier again. Both halves of a multi-level filter stage through one helper,
-  since the level-up companion of a "foo/#" filter is a consumer in its own right and
-  its registrations could otherwise miss that write; and a barrier lowered for a filter
-  that then FAILS is lifted again with the rest of that filter, or the surviving QoS 1/2
-  subscription would silently stop delivering until the client reconnected. Finally the
-  teardown's own register removals became CONFIRMED and ordered before the consumer
-  delete, with an unproven one recorded as an owed sequence: fire-and-forget is safe
-  only while the source stays classifiable, which is exactly what deleting the consumer
-  ends. The last round replaced the unprovable part of that with a RULE: the same write
-  records the durable as abandoned, which nothing on the live path acts on and every
-  resume re-reads, so no delete request has to survive — and a durable the session holds
-  overrides the verdict, since shared group durables are named deterministically and a
-  rejoin must not inherit a leave's conclusion. It also fixed a panic on the way: the
-  cleanup helpers log on failure paths and a surviving disconnect's shared purge calls
-  them with no bound client. A last pass hardened the rule itself: it is withdrawn only
-  by a scan that finds no register naming the durable (the deletes are asynchronous),
-  and its live-durable override reads sharedSubs rather than Cons, since a shared
-  consumer is never persisted there and a restored rejoin would otherwise look
-  abandoned.
+  The review rounds that followed kept finding gaps in one failure mode — a register
+  outliving the consumer that would classify its source — and the eventual fix was to
+  remove a mechanism rather than add one. An intermediate design carried a
+  sequence-scoped delete obligation (`OwedRegs`) beside the evidence, and about half the
+  findings were against it; it never shipped and is gone. What ships is two durable
+  homes for one fact, chosen because they fail in different windows: a **cancellation
+  tombstone** on the register itself, which needs no record fence and so covers a
+  cancellation that lands while the store's CAS is still on the wire, and a
+  **void-register verdict** — the register's NONCE in the session record's
+  `CancelledRegs` — staged by the same transaction that removes the consumer's
+  membership, so the write that abandons the delivery is the write that says so.
+  Nonce-keyed because every other identity is recycled (the identifier is freed for
+  reuse, subjects are reused within a generation, shared group durables return on a
+  rejoin under the same deterministic name); durable-scoped verdicts were tried and
+  either resurrected an abandoned register or condemned a genuine new one. Verdict
+  durability is a tracked revision retried at every convergence point, since the
+  recording goroutine is often refused the fence by the very packet that caused the
+  cancellation; a verdict is retired only against proof (the delete confirmed, the
+  tombstone landed, or a complete scan finding no register carrying it), which also
+  bounds `CancelledRegs` across a client that subscribes and unsubscribes forever.
+
+  Teardown itself walks one ladder — confirmed delete, then tombstone at the exact
+  sequence, then persisted verdict — before the consumer is deleted, with two deliberate
+  exceptions. A RETIRED QoS 2 register is delete-or-leave: it is the durable suppression
+  of a completed-but-unproven exchange, and a tombstone or verdict would have recovery
+  drop it without reinstating the suppression, resending the completed payload if the
+  crash preceded the consumer delete. And a withdrawn allocation's identifier is
+  released only SETTLED and PROVEN: before the store settles, a new allocation could
+  race the old CAS onto the same subject; before some rung is proven, a crash could
+  resurrect the register as an ordinary delivery holding a Receive Maximum slot forever.
+  The staging is preceded by the delivery barrier (closed under the same lock the
+  snapshot is taken with, reopened per filter on rollback, both halves of a "foo/#"
+  filter through one helper), rollback withdraws the verdicts of transmitted deliveries
+  — they are live again and still owe their identifiers — while cancelled allocations
+  stay void on every branch, and a surviving disconnect's shared purge walks the same
+  ladder without ever deleting a consumer. A panic was fixed on the way: the cleanup
+  helpers log on failure paths, and that shared purge calls them with no bound client.
 
   Two further review rounds hardened the lifecycle rather than the protocol, and their
   findings are worth naming because each is a way for register ownership to be silently
@@ -685,7 +667,7 @@ is fixed before feature work continues.
   so a crash between delete and save cannot withhold completion forever; an UNSUBSCRIBE
   racing a first-delivery register write **cancels** that allocation rather than skipping
   it, records it as withheld so a rolled-back save keeps DUP=0, and its register removal is
-  confirmed, retried and kept as an obligation until proven; a consumer teardown releases
+  confirmed, with the verdict standing until it is proven; a consumer teardown releases
   its **retired** sources, which are not in `cpending` at all; and where several registers
   name one drained delivery — a superseded broker's second write — recovery fails closed
   rather than releasing one and orphaning the rest. Resume also stopped reading
@@ -701,7 +683,7 @@ is fixed before feature work continues.
   `$MQTT_inflight` really is `Replicas=3` and current on every node, without which
   those two could pass against a single-replica stream and prove nothing about HA.
 
-  Sixty-eight mutations were run against the code and each fails its test: skipping the
+  Eighty-four mutations were run against the code and each fails its test: skipping the
   recovery barrier, removing the register write, dropping the PUBREL reservation loop,
   removing the source-completeness proof, reverting the retained-send predicate,
   removing the `regPending` send fence, removing the teardown purge, making
@@ -715,6 +697,43 @@ is fixed before feature work continues.
   no-op, having recovery ignore that mark, acknowledging a PUBREL away while its
   retirement is unmarked, having recovery delete a register a surviving PUBREL still needs,
   and dropping the withheld marker when abandoning a register.
+  The stabilization pass re-ran every mutation touching the reworked teardown functions
+  and added its own: recovery ignoring the nonce verdicts, the record not carrying them,
+  the staging voiding nothing, each rung of the ladder skipped (the double-failure
+  verdict, the tombstone's forget, the proven delete's forget), the busy-fence and
+  unlanded-save persistence paths, the rollback unvoid as a no-op, the delivery barrier
+  not closed and not reopened, the settled-release guard dropped and the settle-point
+  release made unconditional, a retired register tombstoned like any other, the shared
+  purge deleting its consumer, and the recovery drop keyed by durable instead of nonce —
+  the durable-scoped mistake, kept as a mutation so it cannot come back quietly.
+
+  The holistic review then found three races the matrix had missed, each fixed and
+  mutation-pinned: a landed save released reservations for verdicts a concurrent
+  teardown recorded after its marshal (verdicts now carry their insertion revision); the
+  scan retired absent verdicts that a superseded broker's late CAS could still
+  contradict (absence now retires nothing — the verdict waits for its register to be
+  seen and deleted, and only the provably-no-CAS path retires its own); and a securing
+  tombstone's proof could park its reservation forever, because the settle point
+  recognised only save-keyed proof. A stop-time review added a fourth: a STALE store's
+  settle — stalled across its allocation's cancellation, release, and the identifier's
+  reuse — could release the newer allocation's reservation and forget its verdict while
+  that allocation's CAS was still on the wire; every reservation touch is now keyed by
+  the toucher's own nonce, read under the lock that allocated it. And a fifth: release
+  had to become order-independent between proof and settlement, since a verdict durable
+  before the settle leaves no later save to release, while a stream-rung proof after the
+  settle retires the membership a save-keyed release would need — one predicate now
+  serves every edge, and retirement itself releases the settled reservations, through a
+  small nonce-keyed index rather than a pendingPublish walk (once per voided register
+  against a map that can hold tens of thousands of live deliveries is quadratic
+  teardown work). A verdict whose register is found TOMBSTONED is likewise retired
+  against that register's confirmed deletion — the register is proof in hand, so the
+  keep-on-absence policy does not apply, and keeping it would leak one record entry per
+  crash between the tombstone rung and the forget's save. What remains unreclaimable is
+  the sliver where the register was confirmed-DELETED and the broker crashed before the
+  very next session save: retiring that verdict on scan-time absence would need a fence
+  against a superseded broker's late CAS, and a time-based one would rest a
+  release-blocking invariant on a timing assumption. One nonce per such crash, stated as
+  the residual.
   Three tests were rewritten *because* a
   mutation exposed them as vacuous: the restart tests originally used packet identifier
   1, which a fresh allocator produces anyway; the completed-exchange test asserted
@@ -748,6 +767,37 @@ is fixed before feature work continues.
   `$MQTT_willcancel` it requires both deletion and purging) and which deliberately
   omits `ConsumerLimits.InactiveThreshold`, since nothing ever creates a consumer on
   it.
+
+- [ ] Work the follow-ups the in-flight-register stabilization pass deliberately
+  deferred. The pass ran under a stopping rule — release-block only on identifier
+  reuse, identifier loss, QoS 2 duplication, phantom Receive Maximum consumption, or
+  crash loss of a committed teardown verdict; record everything else here instead of
+  reopening the design — and these are what it recorded:
+  - Rename the verdict surfaces to match what they became: the persisted field is
+    still `CancelledRegs` and the session set `cancelledRegNonces`, kept that pass to
+    minimize churn, but they now hold void-register verdicts for TRANSMITTED
+    deliveries too, not only cancelled allocations. Schema renames are still free
+    pre-release (see the compatibility boundary).
+  - Retire the crash-window verdict residual properly: a verdict whose register was
+    confirmed-deleted just before a crash is kept forever, because retiring it on
+    scan-time absence needs a fence proving a superseded broker's late create-only
+    CAS can no longer land, and a time-based fence would rest a correctness invariant
+    on a timing assumption. Design a real settlement fence (for example, condemned
+    verdicts retired only by a later incarnation's scan once cross-broker writer
+    liveness is provable) instead of a window.
+  - Reap parked retirements: a retired QoS 2 register whose consumer is gone is
+    deliberately left in place (delete-or-leave — a tombstone would destroy the
+    suppression), which can park a retirement and its register forever. It reserves
+    no identifier and no Receive Maximum slot, so it is stale metadata, but the
+    orphan sweep could learn to reconcile it against source absence.
+  - Verdicts for registers whose every store attempt definitively failed linger
+    until a scan happens to see a register that will never exist; the store loop
+    could prove "no attempt was ambiguous" and retire its own verdict at abandonment,
+    the same proof `releaseCancelledReservation` already uses for the no-CAS case.
+  - Drive the UNSUBSCRIBE ambiguous-save continuations (`undoUnsub`/`commitUnsub`
+    reopening the delivery barrier and withdrawing transmitted verdicts) through a
+    packet-level readback test; the behavior is pinned at the unit level today, and
+    the wiring only by the definite-failure path.
 
 ## 1. Settle release decisions
 

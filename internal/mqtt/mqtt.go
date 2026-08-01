@@ -1262,34 +1262,42 @@ type mqttSession struct {
 	// retireSourceLocked.
 	srcAckOwed map[mqttDeferredKey]*mqttRetiredSource
 
-	// owedRegisterDeletes holds in-flight register sequences whose CONFIRMED removal has
-	// not been proven yet. Only the cancellation path adds to it: that register's source
-	// consumer is usually deleted in the same breath, and a register whose consumer is gone
-	// is deliberately not read as complete, so a lost delete would reserve an identifier for
-	// the life of the session with nothing able to resolve it. Retried at every later
-	// register store and at every resume. Guarded by mu. See retryOwedRegisterDeletes.
-	owedRegisterDeletes []uint64
+	// cancelledRegNonces holds the nonces of registers this session has given up — the
+	// VOID-register verdicts. A teardown that abandons a register voids its nonce, whether
+	// the allocation was still storing or already transmitted; recovery reads a register
+	// carrying one of these exactly as it reads a cancellation tombstone: never owed to the
+	// client, so its identifier and Receive Maximum slot are released rather than held. A
+	// nonce is minted with its allocation and never reused, which is what a subject, a
+	// packet identifier or a (deterministically named) shared group durable could not
+	// offer. Guarded by mu, and persisted as mqttPersistedSession.CancelledRegs. See
+	// voidRegNonceLocked and voidRegistrationsLocked.
+	// The VALUE is the voidedRegsRev at which the nonce was recorded, and it is what a
+	// landed save may claim: a save whose captured revision is r provably carried every
+	// nonce recorded at or before r, and none recorded after — so a release keyed on
+	// membership alone would free a reservation whose verdict a CONCURRENT save never
+	// serialized. See releaseSettledVoidReservationsLocked.
+	cancelledRegNonces map[string]uint64
 
-	// cancelledRegNonces holds the nonces of allocations withdrawn while their register
-	// store was still in flight — the same obligation as owedRegisterDeletes one step
-	// earlier, before any sequence exists to name. Recovery reads a register carrying one of
-	// these exactly as it reads a cancellation tombstone: never transmitted, so its
-	// identifier and Receive Maximum slot are released rather than held. Guarded by mu, and
-	// persisted as mqttPersistedSession.CancelledRegs, which is what covers the window
-	// between the store's CAS landing and its confirmation running. See cancelRegPendingLocked.
-	cancelledRegNonces map[string]struct{}
+	// settledVoidReservations indexes, by nonce, the cancelled reservations whose store
+	// has SETTLED but whose verdict is not yet proven — the only reservations a later
+	// proof edge (a landed save, a stream-rung retirement) still has to release. An index
+	// rather than a pendingPublish walk, because retirement runs once per voided register
+	// in a teardown and pendingPublish can legitimately hold tens of thousands of
+	// entries: walking it per nonce is quadratic teardown work. Entries are rare — only a
+	// cancellation whose every durable rung failed at its settle point parks here.
+	// Guarded by mu. See voidVerdictProvenLocked and releaseSettledVoidReservationsLocked.
+	settledVoidReservations map[string]uint16
 
-	// owedRegsRev counts changes to owedRegisterDeletes and cancelledRegNonces, and
-	// owedRegsSavedRev is the highest
-	// revision PROVEN to be in the session record. They are not a bool because the writer
-	// cannot see the race it loses: an off-readLoop cancellation appends while a readLoop
-	// transaction that has already marshalled its record holds the fence, so that
-	// transaction commits without the entry and the append was refused its own save. Driving
-	// persistence off the gap between the two — rather than off "did I just change
+	// voidedRegsRev counts changes to cancelledRegNonces, and voidedRegsSavedRev is the
+	// highest revision PROVEN to be in the session record. They are not a bool because the
+	// writer cannot see the race it loses: an off-readLoop teardown appends while a
+	// readLoop transaction that has already marshalled its record holds the fence, so that
+	// transaction commits without the entry and the append was refused its own save.
+	// Driving persistence off the gap between the two — rather than off "did I just change
 	// something" — is what makes every convergence point retry until the record agrees.
-	// Both guarded by mu. See persistOwedRegisterDeletes.
-	owedRegsRev      uint64
-	owedRegsSavedRev uint64
+	// Both guarded by mu. See persistVoidedRegs.
+	voidedRegsRev      uint64
+	voidedRegsSavedRev uint64
 
 	// piSpaceIncomplete is set when a resume could not fully reconstruct the durable
 	// outbound identifier space, so some identifier the client holds may be unknown
@@ -1382,31 +1390,19 @@ type mqttPersistedSession struct {
 	// return and never create a delivery subscription. See unsub_drain.go.
 	Drains map[string]*mqttPersistedDrain `json:"drains,omitempty"`
 
-	// OwedRegs are outbound in-flight register sequences whose removal is owed but not yet
-	// proven. Only the CANCELLATION path writes them — a delivery whose allocation was
-	// withdrawn before it was ever sent — and only where neither the confirmed delete nor
-	// the cancellation tombstone could be written, which in practice means JetStream was
-	// unavailable for both.
+	// CancelledRegs are the NONCES of registers this session has given up — the
+	// void-register verdicts. Written by the transaction that abandons them (a teardown's
+	// membership-removal write, or a later convergence-point save for a verdict recorded
+	// after that write), and read by recovery, which frees the identifier such a register
+	// names instead of reserving it for the life of the session.
 	//
-	// Persisted because the alternative is losing the obligation on a restart: the
-	// surviving register is then indistinguishable from a started delivery, and once its
-	// consumer is gone its identifier and its Receive Maximum slot are consumed for the
-	// life of the session. Deleting a sequence that is already gone is harmless, so a stale
-	// entry costs nothing. See inflight_register.go.
-	OwedRegs []uint64 `json:"owed_regs,omitempty"`
-	// CancelledRegs are register NONCES whose allocation was withdrawn while its register
-	// store was still in flight, so no sequence is known for them yet. It is the same fact
-	// as OwedRegs one step earlier, and it exists because the in-memory handoff has a crash
-	// window: the cancelling UNSUBSCRIBE can persist its removal and delete the consumer
-	// while the store's CAS is still on the wire, and if that CAS lands and the broker dies
-	// before the confirmation runs, no tombstone and no OwedRegs entry was ever written.
-	// Recovery would then find an ordinary register whose consumer is gone and hold its
-	// identifier — and its Receive Maximum slot — for the life of the session.
-	//
-	// Keyed by nonce, never by packet identifier or by source: the cancellation FREES the
-	// identifier for immediate reuse, and a drained source is re-offered under a new
-	// identifier, so both would make a stale entry read a genuine later delivery as never
-	// transmitted. A nonce is minted with the allocation and never reused.
+	// Keyed by nonce, never by packet identifier, subject or durable: a teardown frees the
+	// identifier for immediate reuse, subjects are reused within a generation, and shared
+	// group durables are named deterministically so the same name returns on a rejoin — a
+	// verdict scoped by any of those would eventually condemn a genuine later delivery. A
+	// nonce is minted with the allocation and never reused. An entry is removed when its
+	// register's deletion is proven, or by a complete resume scan that finds no register
+	// carrying it. See inflight_register.go.
 	CancelledRegs []string `json:"cancelled_regs,omitempty"`
 	// Teardown, when present, means a broker has CLAIMED this record's teardown and
 	// may be part way through deleting the incarnation's resources. Nobody may
@@ -1887,13 +1883,16 @@ type mqttPending struct {
 	// confirmed write; on a definite failure the entry is removed outright.
 	regPending bool
 
-	// regCancelled marks a regPending entry a consumer teardown has WITHDRAWN. It stays
-	// in pendingPublish, inert, until the store settles, and that is deliberate: freeing
-	// the identifier immediately would let a new delivery take it and write its own
-	// register at the same subject, and the cancellation tombstone written before the
-	// consumer delete would then be indistinguishable from that new delivery's record.
-	// Holding it costs one in-flight store's round trip. Released by
-	// confirmInflightRegister, which is the only thing that knows the store is over.
+	// regCancelled marks an entry a consumer teardown has WITHDRAWN. It stays in
+	// pendingPublish, inert, until BOTH release conditions hold: the register store has
+	// SETTLED (freeing the identifier earlier would let a new delivery take the subject
+	// while the old CAS was still in flight, and the cancellation tombstone would then be
+	// indistinguishable from that new delivery's record), and some durable rung of the
+	// cleanup ladder is PROVEN (released with none, a crash could resurrect the register
+	// as an ordinary delivery nothing anywhere calls void). While regPending is still set
+	// the store is unsettled; the settle points drop it, and
+	// releaseSettledVoidReservationsLocked frees the identifier once the verdict's save
+	// lands. Holding it costs one in-flight store's round trip in the common case.
 	regCancelled bool
 }
 
@@ -2583,7 +2582,7 @@ func (c *client) mqttParse(buf []byte) error {
 				// delivery leaves the cleanup obligation with the delivery goroutine,
 				// which was refused the fence while this packet held it — and that is
 				// true whether the packet itself succeeded.
-				c.mqttFlushOwedRegisterDeletes()
+				c.mqttFlushVoidedRegs()
 			}
 			if err == nil {
 				// Trace only if the UNSUBACK was actually sent (a tiny client
@@ -5402,9 +5401,8 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	sess.cons = ps.Cons
 	// The restored lists came OUT of the record, so they are already durable there; only
 	// a later change reopens the gap.
-	sess.owedRegisterDeletes = ps.OwedRegs
 	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
-	sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
+	sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
 	sess.restoreDrainsFromRecord(ps)
 	sess.pubRelConsumer = ps.PubRel
 	sess.q2AffConsumer = ps.Q2Aff
@@ -7824,10 +7822,9 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		sess.asm = as
 		sess.domainTk = as.domainTk
 		sess.cons = ps.Cons
-		// Already durable: they came out of the record. See owedRegsRev.
-		sess.owedRegisterDeletes = ps.OwedRegs
+		// Already durable: they came out of the record. See voidedRegsRev.
 		sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
-		sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
+		sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
 		sess.restoreDrainsFromRecord(ps)
 		sess.sharedSubs = ps.SharedSubs
 		sess.pubRelConsumer = ps.PubRel
@@ -7859,9 +7856,8 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.cons = ps.Cons
 	// The restored lists came OUT of the record, so they are already durable there; only
 	// a later change reopens the gap.
-	sess.owedRegisterDeletes = ps.OwedRegs
 	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
-	sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
+	sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
 	sess.restoreDrainsFromRecord(ps)
 	sess.pubRelConsumer = ps.PubRel
 	// A persisted affine consumer proves only that one once existed: it may have
@@ -8208,7 +8204,6 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 		Q2Aff:             sess.q2AffConsumer,
 		Q2AffGen:          sess.q2AffGen,
 		Gen:               sess.gen,
-		OwedRegs:          sess.owedRegisterDeletes,
 		CancelledRegs:     mqttSortedNonces(sess.cancelledRegNonces),
 		Drains:            drains,
 		Will:              sess.will,
@@ -8414,9 +8409,9 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// deleted: nothing can redeliver them, so nothing needs settling.
 	sess.srcAckOwed = nil
 	// The whole generation's registers are purged by the teardown, so nothing is owed.
-	sess.owedRegisterDeletes = nil
 	sess.cancelledRegNonces = nil
-	sess.owedRegsRev, sess.owedRegsSavedRev = 0, 0
+	sess.settledVoidReservations = nil
+	sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
 	// The identifier space of the RETIRING incarnation is gone with the maps above, so
 	// the restriction that protected it must go too. Two paths REUSE the session object
 	// as a fresh session, and a fresh one reports Session Present false, so it never
@@ -10252,7 +10247,7 @@ CHECK:
 			// resubscribe of the same filter must not find a stale cons entry and
 			// skip recreating a durable this forced leave may delete below.
 			es.mu.Lock()
-			var regs []uint64
+			var regs []mqttVoidedReg
 			var cancels []mqttRegCancellation
 			for sid, cc := range es.cons {
 				if cc.DeliverGroup == _EMPTY_ {
@@ -13339,6 +13334,15 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	}
 
 	pi, dup, started, isNew := sess.trackPublish(sub.mqtt.jsDur, reply)
+	// The allocation's nonce, read under the same lock that allocated it: it is the
+	// identity every later reservation touch is guarded by, and reading it later would
+	// race the teardown that replaces the entry with a reservation.
+	var regNonce string
+	if isNew {
+		if ack := sess.pendingPublish[pi]; ack != nil {
+			regNonce = ack.regNonce
+		}
+	}
 	if drainClaimed && pi != 0 {
 		// The RECORD says this delivery was already transmitted, so override what
 		// the in-memory maps inferred: on a broker that has not recovered this
@@ -13423,7 +13427,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// discarded rather than sent has no identifier to make durable, so it should not
 	// pay a round trip for one. Still strictly BEFORE the enqueue below, which is the
 	// send.
-	if isNew && !sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, _EMPTY_) {
+	if isNew && !sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_) {
 		return
 	}
 	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, subID, originalTopic, msg, props) {
@@ -13844,25 +13848,25 @@ func (c *client) mqttResolveAfterPacket() {
 	sess.resolveUncertainNow(c)
 }
 
-// mqttFlushOwedRegisterDeletes persists an outbound in-flight register cleanup the packet
-// that just finished may have left un-recorded.
+// mqttFlushVoidedRegs persists a void-register verdict the packet that just finished may
+// have left un-recorded.
 //
 // It belongs here for the same reason mqttResolveAfterPacket does: an UNSUBSCRIBE that
-// cancels a register-pending delivery makes the delivery goroutine own the cleanup, and that
+// cancels a register-pending delivery makes the delivery goroutine own the verdict, and that
 // goroutine is refused the fence for as long as the UNSUBSCRIBE holds it — while the
 // UNSUBSCRIBE's own record write may already have been marshalled without the entry. This is
-// the first moment the fence is free again, so it is where the obligation becomes durable
+// the first moment the fence is free again, so it is where the verdict becomes durable
 // rather than waiting for the session's next register store or resume.
 //
 // Runs from the client's readLoop, with no transaction held.
-func (c *client) mqttFlushOwedRegisterDeletes() {
+func (c *client) mqttFlushVoidedRegs() {
 	c.mu.Lock()
 	sess := c.mqtt.sess
 	c.mu.Unlock()
 	if sess == nil {
 		return
 	}
-	sess.persistOwedRegisterDeletes(c)
+	sess.persistVoidedRegs(c)
 }
 
 func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error) {
@@ -14441,7 +14445,7 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *Cons
 // redelivers to other members) and so the packet identifiers are freed. Spec5 [4.8.2].
 func (sess *mqttSession) purgeSharedPending() {
 	sess.mu.Lock()
-	var regs []uint64
+	var regs []mqttVoidedReg
 	var cancels []mqttRegCancellation
 	for _, cc := range sess.cons {
 		if cc.DeliverGroup == _EMPTY_ {
