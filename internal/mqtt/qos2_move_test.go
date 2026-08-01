@@ -467,6 +467,7 @@ func TestValidateQoS2InStream(t *testing.T) {
 		{"republish", func(c *StreamConfig) { c.RePublish = &RePublish{Source: "a", Destination: "b"} }},
 		{"subject delete marker ttl", func(c *StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute }},
 		{"allow msg counter", func(c *StreamConfig) { c.AllowMsgCounter = true }},
+		{"allow rollup", func(c *StreamConfig) { c.AllowRollup = true }},
 		{"async persist mode", func(c *StreamConfig) { c.PersistMode = AsyncPersistMode }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1477,9 +1478,13 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 	})
 }
 
-// $MQTT_msgs must have a deduplication window: the stable Nats-Msg-Id is inert
-// without one, and the window here is an inherited nats-server default (a version
-// bump could change it), so this is the only thing that would notice.
+// The $MQTT_msgs stream the broker creates picks up nats-server's DEFAULT
+// deduplication window, which is what makes the release msgId's best-effort
+// narrowing effective in practice. This is a readback of an inherited default
+// (a version bump could change it), NOT a startup prerequisite: correctness
+// never rests on the window (move-protocol residual 2, see qos2_move.go), so
+// validateMsgsStream deliberately waives Duplicates, and this is the only
+// test that would notice the default disappearing.
 func TestQoS2MsgsStreamHasDuplicateWindow(t *testing.T) {
 	b := testQoS2Setup(t, "dupwin")
 	si, err := b.jsa.lookupStream(mqttStreamName)

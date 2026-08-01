@@ -620,8 +620,14 @@ func (as *mqttAccountSessionManager) releaseQoS2Record(seq uint64) (mqttQoS2Rele
 //
 // Scope note: this list is derived from what THIS protocol does and must not be
 // copied wholesale to another stream. DenyDelete/DenyPurge are fatal here because
-// release, reap, terminal cleanup and the discard purge all delete; they are not
-// fatal to a stream that never deletes.
+// release, reap, terminal cleanup and the hold purge all remove records; they are
+// not fatal to a stream that never deletes.
+//
+// Re-derived for the <idHash>.<gen>.<PI> subject layout and its .rel claim
+// sibling: the field list is unchanged — the subject check is a ">" wildcard
+// spanning both layouts, MaxMsgsPer:1 now makes each of the hold and the claim
+// its own single-slot register, and the walk filter's paging bound is a server
+// constant, not stream config.
 //
 // wantReplicas is 0 when no explicit replica count is configured (skip that check).
 func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
@@ -629,15 +635,11 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
+	if err := validateBrokerOwnedStreamShape(&cfg, mqttQoS2IncomingMsgsStreamSubjectPrefix+">", wantReplicas); err != nil {
+		return err
+	}
 
 	// --- State shape: what makes the two-state machine a state machine. ---
-	wantSubj := mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"
-	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != wantSubj {
-		return fmt.Errorf("subjects %v (want [%q])", cfg.Subjects, wantSubj)
-	}
-	if cfg.Storage != FileStorage {
-		return fmt.Errorf("storage is %v (want file)", cfg.Storage)
-	}
 	if cfg.Retention != LimitsPolicy {
 		return fmt.Errorf("retention is %v (want limits)", cfg.Retention)
 	}
@@ -659,11 +661,8 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict live session state",
 			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
 	}
-	if cfg.Mirror != nil || len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has a mirror or sources (want none): writes would land elsewhere")
-	}
-	if wantReplicas > 0 && cfg.Replicas != wantReplicas {
-		return fmt.Errorf("replicas is %d (want %d)", cfg.Replicas, wantReplicas)
+	if len(cfg.Sources) > 0 {
+		return fmt.Errorf("stream has sources (want none): a foreign record could occupy a hold or claim CAS slot")
 	}
 
 	// --- Protocol prerequisites: settings that leave the shape intact but
@@ -671,32 +670,18 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
 	if cfg.MaxMsgSize > 0 {
 		return fmt.Errorf("max_msg_size is %d (want unlimited): it would independently reject the hold, release or terminal record even when the broker max-payload preflight passed", cfg.MaxMsgSize)
 	}
-	if cfg.NoAck {
-		return fmt.Errorf("no_ack is set: it suppresses the acknowledgements every synchronous CAS and store here depends on")
-	}
 	if cfg.DenyDelete {
 		return fmt.Errorf("deny_delete is set: it blocks release, reap and terminal cleanup")
 	}
 	if cfg.DenyPurge {
-		return fmt.Errorf("deny_purge is set: it blocks a session discard from clearing QoS 2 state")
-	}
-	if cfg.Sealed {
-		return fmt.Errorf("stream is sealed: it blocks all writes")
-	}
-	if cfg.SubjectTransform != nil {
-		return fmt.Errorf("a subject transform is configured: it rewrites the per-client/identifier subject that CAS identity and loadLastMsgFor both depend on")
-	}
-	if cfg.RePublish != nil {
-		return fmt.Errorf("republish is configured: it would mirror internal QoS 2 state onto a user-visible subject")
+		// The purge this protects is purgeQoS2Hold's CONFIRMED exact-subject
+		// purge — the session discard's and the orphan sweep's only removal of a
+		// hold subject. (The discard's blind filter purge is gone; see
+		// qos2_release_claim.go.)
+		return fmt.Errorf("deny_purge is set: it blocks the confirmed exact-subject hold purge the session discard and the orphan sweep perform")
 	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on hold subjects would be classified as records", cfg.SubjectDeleteMarkerTTL)
-	}
-	if cfg.AllowMsgCounter {
-		return fmt.Errorf("allow_msg_counter is set: counter streams do not support the store semantics used here")
-	}
-	if cfg.PersistMode != DefaultPersistMode {
-		return fmt.Errorf("persist_mode is %v (want the default): its durability semantics are unproven for this protocol", cfg.PersistMode)
 	}
 	return nil
 }

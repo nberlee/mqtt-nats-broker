@@ -128,7 +128,8 @@ func TestSessionManagerEpochCreateRaceAdoptsWinner(t *testing.T) {
 // seen the stream absent, then releases them so both call createStream — exactly one
 // wins (created==true) and the other takes the race-loser path
 // (JSStreamNameExistErr). Both must converge on the winner's epoch (the loser adopts
-// it via resolveSessStreamEpoch rather than its own discarded generated value).
+// it from ensureBrokerStream's authoritative re-read rather than its own
+// discarded generated value).
 func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
 	_, nc := runNATS(t)
 
@@ -318,6 +319,13 @@ func TestSessionManagerWillCancelStreamValidation(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "recreate") {
 				t.Fatalf("error must guide recreation, got: %v", err)
+			}
+			// The recovery must be the COUPLED one: recreating the marker stream
+			// alone discards permanent takeover-suppression watermarks
+			// (docs/ARCHITECTURE.md, "Operational constraints for the marker").
+			if !strings.Contains(err.Error(), mqttSessStreamName) || !strings.Contains(err.Error(), "one logical unit") {
+				t.Fatalf("error must direct recreating %s together with %s as one logical unit, got: %v",
+					mqttWillCancelStreamName, mqttSessStreamName, err)
 			}
 		})
 	}

@@ -744,29 +744,77 @@ is fixed before feature work continues.
   be transient by design — the settling redelivery removes it — so asserting on it needed
   the default AckWait rather than a shortened one, with the redelivery itself covered by
   the restart test).
-- [ ] Audit the remaining `$MQTT_*` streams for protocol prerequisites, deriving
+- [x] Audit the remaining `$MQTT_*` streams for protocol prerequisites, deriving
   each list from what that stream's owner actually does rather than copying
-  `validateQoS2InStream` wholesale — the required set genuinely differs per stream.
-  `$MQTT_willcancel` does CAS writes and permanent retention but never deletes or
-  purges by design, so `DenyDelete`/`DenyPurge` are *not* prerequisites there, while
-  `NoAck`, `Sealed`, `SubjectTransform`, `MaxMsgSize` and the other write/CAS-affecting
-  settings are; `validateWillCancelStream` currently checks state shape only.
-  `$MQTT_willq` does CAS writes plus terminal deletion, so deletion prerequisites do
-  apply. `$MQTT_sess` does CAS writes, deletion and cleanup. `$MQTT_willq` and
-  `$MQTT_sess` have no validator at all today. Note also the new
-  `$MQTT_qos2in` subject layout: hold subjects are now
-  `$MQTT.qos2.in.<idHash>.<gen>.<PI>` (see "Session incarnations and teardown" in
-  `docs/ARCHITECTURE.md`), so any prerequisite derived from the old
-  `<idHash>.<PI>` shape must be re-derived. `$MQTT_msgs` gains one the drain
-  depends on: a stream-level `ConsumerLimits.InactiveThreshold` would reap a
-  drained durable while its session is offline and take its started deliveries
-  with it, so draining must refuse rather than degrade where one is set.
-  `$MQTT_inflight` needs nothing here: it ships with `validateInflightStream`, whose
-  list is derived from what its owner does (create-only CAS, per-subject singleton,
-  exact-sequence deletes, a per-incarnation filter purge — so unlike
-  `$MQTT_willcancel` it requires both deletion and purging) and which deliberately
-  omits `ConsumerLimits.InactiveThreshold`, since nothing ever creates a consumer on
-  it.
+  `validateQoS2InStream` wholesale. **Done** — all nine broker-owned streams now
+  validate at startup, provisioned through one convergence shape
+  (`ensureBrokerStream`: create-or-lose → unconditional authoritative re-read →
+  per-owner validation) driven by an ordered spec table no stream can bypass.
+  New validators: `validateSessStream` (including the incarnation epoch,
+  composed onto the same snapshot — `resolveSessStreamEpoch` is gone),
+  `validateWillQStream`, `validateMsgsStream`, `validateRetainedStream`;
+  `validateWillCancelStream` completed beyond state shape via the shared
+  `validateBrokerOwnedStreamShape`, which also rejects `AllowRollup`
+  (reviewer-caught: a rollup header purges up to the whole stream on a plain
+  publish — the evict-live-state hazard class every owner already rejects in
+  global limits). Non-prerequisite findings, waived with
+  written reasons and pinned by acceptance tests: `DenyDelete` on
+  `$MQTT_willcancel` (never deletes) **and on `$MQTT_rmsgs`** (deletes are
+  best-effort compaction; the empty-body tombstone + `MaxMsgsPer:1` replacement
+  carry correctness), `Sources` on `$MQTT_rmsgs` (supported cross-account
+  retained topology), and `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`
+  (the drain and shared/affine RUNTIME refusals remain the authority — that
+  prerequisite was already delivered by `ab683d9`, and the acceptance test now
+  pins it as a non-startup-failure). The `$MQTT_qos2in` list was re-derived for
+  the `<idHash>.<gen>.<PI>` + `.rel` layout: fields unchanged, two stale
+  rationales corrected (the purge `DenyPurge` protects is `purgeQoS2Hold`'s
+  confirmed exact-subject purge; the transform hazard now includes the claim
+  sibling and walk filter). Two existing-code gaps closed:
+  `validateOutStream` gained `ConsumerLimits.MaxAckPending` (fatal only when
+  non-zero and below the broker's effective cap; boundary pinned) and
+  `MaxConsumers > 0`. `$MQTT_msgs`'s `MaxMsgSize` stays a
+  blanket rejection, and the review tested it in both directions: one round
+  proposed a threshold at the broker's max payload (the PUBLISH admission
+  preflight bounds the complete stored form by it, and JetStream's cap
+  compares the same quantity), the next round disproved the threshold — QoS
+  1/2 Will stores bypass the preflight (`mqttHandleWill` /
+  `deliverWillRecord` call `mqttInitiateMsgDelivery` directly), so a cap at
+  the bound can still silently lose an immediate Will and no positive cap is
+  provably inert. Two user-approved scope
+  additions: the `$MQTT_out` fix
+  above, and deletion of the pre-release migration/degrade machinery (the
+  pre-2.10 session-stream and pre-2.10.10 retained-message transfers, the
+  `AllowMsgTTL` degrade mode — `AllowMsgTTL` is now a prerequisite of
+  `$MQTT_msgs`/`$MQTT_rmsgs` on brokers accepting MQTT 5.0, the default; a
+  `max_protocol_version: 4` broker never emits `Nats-TTL` and waives it) under
+  the compatibility boundary: "there is no release yet, so no migration
+  needed". `TestStreamValidatorFieldCoverage`
+  walks every `StreamConfig` field by reflection against every validator
+  (bijection with the mutator table, exactly one disposition per pair, waivers
+  must be accepted, reasons must be non-empty). Residual, stated in
+  `docs/CONFORMANCE.md`: startup validation is a snapshot — post-start config
+  mutation is not re-checked until the next initialization; a nonconforming
+  stream splits a mixed fleet and recovery is stop-all, per the
+  `$MQTT_qos2in` precedent. See "Stream prerequisites" in
+  `docs/ARCHITECTURE.md`.
+- [ ] Verify (or recreate) plain QoS 1/2 durables on session resume instead of
+  trusting the persisted record. Found by the stream-prerequisite audit's
+  review (round 3): a plain subscription's durable reaped by an inactivity
+  threshold — the broker's own `consumer_inactive_threshold` option or a
+  stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, both of
+  which reach consumers that request 0 (`server/consumer.go:658-668`) — is
+  silently trusted on resume: `processJSConsumer`'s exists-branch skips
+  creation and only re-subscribes the recorded deliver subject, and a
+  re-SUBSCRIBE to the same filter returns early on the same `sess.cons` entry,
+  so the subscription is dead until a clean start. The affine QoS 2 consumer
+  already solves this — `q2AffReady` stays false until the real consumer is
+  create-or-update verified on resume — so the fix has a template. This is a
+  pre-existing gap of inactivity-threshold reaping generally, NOT introduced
+  by the audit (the audit's `$MQTT_msgs` waiver keeps the drain/shared runtime
+  refusals as the authority per this section's earlier drain bullet); it needs
+  its own design pass because blind create-or-update on resume changes
+  delivery-start semantics (`DeliverNew` from "now") and interacts with the
+  consumer charge accounting (`refundConsumerChargeLocked`).
 
 - [ ] Work the follow-ups the in-flight-register stabilization pass deliberately
   deferred. The pass ran under a stopping rule — release-block only on identifier
@@ -814,6 +862,26 @@ accurately than `mqtt-nats-bridge`. The process terminates MQTT and owns broker
 semantics; it does not merely relay between two independent brokers.
 `nats-mqtt-broker` is also accurate but may imply that this is an official NATS
 project. Retain `mqtt-nats-bridge` only if continuity outweighs that ambiguity.
+
+### Durable enforcement of the session/marker coupling
+
+- [ ] Decide whether the `$MQTT_sess` + `$MQTT_willcancel` "one logical unit"
+  constraint should be durably enforced at startup rather than documented.
+  Raised by the stream-prerequisite audit's review (round 7): deleting only
+  `$MQTT_sess` mints a new incarnation epoch while permanent watermarks keep
+  the old one; the fence then classifies them stale and falls back to the
+  session-record rule, whose comment already names "unsupported partial
+  recreation" as the carrier of this documented residual
+  (`will_outbox.go`, `sessionRecordFence`). The reviewer proposed echoing the
+  authoritative epoch into `$MQTT_willcancel` metadata and refusing a
+  mismatch before publishing the manager. Deciding needs its own design pass:
+  the echo is new arbitration-bearing durable state (who writes it, create
+  races between initializing brokers, bootstrap when the marker stream is
+  created first, self-heal on the SUPPORTED coupled recreation), and refusal
+  on mismatch inverts `TestSessionManagerEpochRecreationYieldsDifferentEpoch`,
+  which has pinned recreate-then-start since the watermark item landed. Not a
+  release blocker: the exposure requires an administrative action the
+  operational constraints in `docs/ARCHITECTURE.md` already forbid.
 
 ### Memory-limit strategy
 

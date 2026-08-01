@@ -61,6 +61,7 @@ package mqtt
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -918,4 +919,54 @@ func (as *mqttAccountSessionManager) deliverWillRecord(s *Server, rec *mqttWillO
 	err = s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp, _EMPTY_, _EMPTY_)
 	c.flushClients(0)
 	return err
+}
+
+// validateWillQStream verifies a $MQTT_willq stream can carry the delayed-Will
+// outbox. Derived from what this owner does: a create-only CAS enqueue at a
+// per-WillID subject, state-advance CAS transitions, loadLastMsgFor reads,
+// filtered claim/cancel scans, and exact-sequence deletes (confirmed on the
+// terminal path, no-wait in the scan's cleanup). It never purges and never
+// creates a consumer, so DenyPurge, MaxConsumers and ConsumerLimits are
+// audited NON-prerequisites.
+//
+// DenyDelete IS fatal, and the reason is unbounded growth, not re-publication:
+// every outbox subject is per-WillID, so nothing is ever replaced in place and
+// deletion is the only thing that removes a record. The durable
+// publishing->done transition precedes the delete, so a denied delete cannot
+// re-fire a Will — it strands one done record per fired Will forever, and
+// every scan re-walks and re-attempts all of them.
+func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int) error {
+	if si == nil {
+		return fmt.Errorf("stream info unavailable")
+	}
+	cfg := si.Config
+	if err := validateBrokerOwnedStreamShape(&cfg, mqttWillQSubjectPrefix+domainTk+">", wantReplicas); err != nil {
+		return err
+	}
+	if cfg.Retention != LimitsPolicy {
+		return fmt.Errorf("retention is %v (want limits): nothing consumes an outbox record, so any other retention drops it immediately", cfg.Retention)
+	}
+	if cfg.Discard != DiscardOld {
+		return fmt.Errorf("discard is %v (want old): DiscardNew would reject the state-advance CAS on a Will's subject", cfg.Discard)
+	}
+	if cfg.MaxMsgsPer != 1 {
+		return fmt.Errorf("max_msgs_per_subject is %d (want 1): each per-Will subject is a single-record CAS slot the claim transitions depend on", cfg.MaxMsgsPer)
+	}
+	if cfg.MaxMsgs > 0 || cfg.MaxBytes > 0 || cfg.MaxAge > 0 {
+		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict a pending Will before it fires",
+			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
+	}
+	if len(cfg.Sources) > 0 {
+		return fmt.Errorf("stream has sources (want none): a foreign record could occupy a Will's CAS slot")
+	}
+	if cfg.MaxMsgSize > 0 {
+		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject the enqueue of a Will the broker already accepted", cfg.MaxMsgSize)
+	}
+	if cfg.DenyDelete {
+		return fmt.Errorf("deny_delete is set: per-WillID subjects make deletion the only removal, so the outbox would grow without bound and every scan would re-walk every Will ever fired")
+	}
+	if cfg.SubjectDeleteMarkerTTL != 0 {
+		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on outbox subjects would be parsed as Will records", cfg.SubjectDeleteMarkerTTL)
+	}
+	return nil
 }

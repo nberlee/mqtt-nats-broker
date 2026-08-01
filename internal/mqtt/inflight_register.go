@@ -2694,13 +2694,8 @@ func validateInflightStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-
-	wantSubj := mqttInflightStreamSubjectPrefix + ">"
-	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != wantSubj {
-		return fmt.Errorf("subjects %v (want [%q])", cfg.Subjects, wantSubj)
-	}
-	if cfg.Storage != FileStorage {
-		return fmt.Errorf("storage is %v (want file)", cfg.Storage)
+	if err := validateBrokerOwnedStreamShape(&cfg, mqttInflightStreamSubjectPrefix+">", wantReplicas); err != nil {
+		return err
 	}
 	if cfg.Retention != LimitsPolicy {
 		// Nothing consumes a register — they are read by direct lookup and by a
@@ -2727,11 +2722,8 @@ func validateInflightStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict the identity of a live in-flight delivery",
 			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
 	}
-	if cfg.Mirror != nil || len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has a mirror or sources (want none): writes would land elsewhere")
-	}
-	if wantReplicas > 0 && cfg.Replicas != wantReplicas {
-		return fmt.Errorf("replicas is %d (want %d)", cfg.Replicas, wantReplicas)
+	if len(cfg.Sources) > 0 {
+		return fmt.Errorf("stream has sources (want none): a foreign record could occupy an identifier's CAS slot")
 	}
 	if cfg.MaxMsgSize > 0 {
 		// A register is small and fixed-shape, but a cap is not this owner's
@@ -2739,32 +2731,14 @@ func validateInflightStream(si *StreamInfo, wantReplicas int) error {
 		// delivery rather than degrading anything.
 		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject the register write that must precede a send", cfg.MaxMsgSize)
 	}
-	if cfg.NoAck {
-		return fmt.Errorf("no_ack is set: it suppresses the acknowledgement the create-only CAS depends on")
-	}
 	if cfg.DenyDelete {
 		return fmt.Errorf("deny_delete is set: it blocks the exact-sequence delete every terminal path performs")
 	}
 	if cfg.DenyPurge {
 		return fmt.Errorf("deny_purge is set: it blocks the per-incarnation purge a session teardown performs")
 	}
-	if cfg.Sealed {
-		return fmt.Errorf("stream is sealed: it blocks all writes")
-	}
-	if cfg.SubjectTransform != nil {
-		return fmt.Errorf("a subject transform is configured: it rewrites the per-identifier subject that CAS identity and loadLastMsgFor both depend on")
-	}
-	if cfg.RePublish != nil {
-		return fmt.Errorf("republish is configured: it would mirror internal delivery state onto a user-visible subject")
-	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on register subjects would be parsed as records", cfg.SubjectDeleteMarkerTTL)
-	}
-	if cfg.AllowMsgCounter {
-		return fmt.Errorf("allow_msg_counter is set: counter streams do not support the store semantics used here")
-	}
-	if cfg.PersistMode != DefaultPersistMode {
-		return fmt.Errorf("persist_mode is %v (want the default): its durability semantics are unproven for this protocol", cfg.PersistMode)
 	}
 	return nil
 }

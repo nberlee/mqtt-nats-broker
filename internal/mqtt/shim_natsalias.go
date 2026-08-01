@@ -34,6 +34,7 @@ type (
 	JSPubAckResponse            = server.JSPubAckResponse
 	NkeyUser                    = server.NkeyUser
 	Permissions                 = server.Permissions
+	Placement                   = server.Placement
 	RePublish                   = server.RePublish
 	SubjectPermission           = server.SubjectPermission
 	SubjectTransformConfig      = server.SubjectTransformConfig
@@ -94,6 +95,7 @@ const (
 	LimitsPolicy                         = server.LimitsPolicy
 	MemoryStorage                        = server.MemoryStorage
 	ReplayInstant                        = server.ReplayInstant
+	S2Compression                        = server.S2Compression
 	ServerShutdown                       = server.ServerShutdown
 	TLSHandshakeError                    = server.TLSHandshakeError
 	WriteError                           = server.WriteError

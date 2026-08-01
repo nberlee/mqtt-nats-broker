@@ -80,6 +80,74 @@ the "no fallbacks" stance reviewable rather than implicit.
   consumer cannot opt out of. Where a durable must survive an offline session, the
   stream is checked and the feature is refused rather than silently reaped.
 
+### Stream prerequisites
+
+Every broker-owned `$MQTT_*` stream is provisioned through one convergence shape
+(`ensureBrokerStream`, `internal/mqtt/stream_prereqs.go`): create-or-lose, then an
+**unconditional authoritative re-read**, then a per-stream validator over that
+re-read — so a create-race loser (and equally the winner, whose create response is
+not authoritative for what now exists) validates the stream that is actually
+there, never the config it asked for. The nine streams are entries in one ordered
+provisioning table iterated by a single loop, so none can be provisioned outside
+the shape. A stream that fails its validator **fails account-manager
+initialization** with recreate guidance; nothing is repaired or updated in place,
+because a store another broker may still be serving must not be mutated under it
+(see "Compatibility boundary").
+
+Each validator's list is **derived from what that stream's owner actually does**
+— the stores, CAS writes, deletes, purges, consumers and scans in its feature
+file — never copied from another stream's list. A setting absent from a list is
+an audited *non-prerequisite* with a written reason, not an oversight: rejecting
+a setting no owner operation depends on would refuse legitimate deployments.
+`TestStreamValidatorFieldCoverage` enforces the audit — every `StreamConfig`
+field carries exactly one disposition (rejected, waived, or dominated — the last
+meaning its only enabling configuration is already rejected by a named check) for
+every validator.
+
+A shared shape covers what is a prerequisite of *every* owner because it is a
+prerequisite of storing and reading a record at a named subject at all: the exact
+subject space, file storage, no mirror, the configured replica count, not sealed,
+no subject transform, no republish, not a counter stream, acknowledgements on,
+no rollup headers admitted (`AllowRollup` lets any writer with publish
+permission purge up to the whole stream in one `Nats-Rollup` message — the same
+evict-live-state hazard class as the global limits every owner rejects, but
+attacker-triggered), and the default persistence mode. Everything else is
+per-owner:
+
+| Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
+|---|---|---|---|
+| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, rollback); no purge, no consumers | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) | `DenyPurge` (nothing purges); `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | as `$MQTT_sess` minus the epoch; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_willcancel` | per-client watermark CAS and reads — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources` | **`DenyDelete`/`DenyPurge`** (no operation deletes or purges — markers are permanent by design); `SubjectDeleteMarkerTTL` (no delete means no marker can ever be created); `MaxConsumers`/`ConsumerLimits` |
+| `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
+| `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); `loadLastMsgForMulti`/`loadNextMsgFor`; **best-effort no-wait deletes only** (compaction); one ephemeral `AckNone` consumer per broker | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker) | **`DenyDelete`** (deletes are compaction; the tombstone + `MaxMsgsPer: 1` replacement carry correctness, and TTL expiry is store-internal reaping `DenyDelete` does not gate); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
+| `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL` | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
+| `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_inflight` | create-only register CAS, exact-sequence deletes, per-incarnation filter purge (teardown), bounded walk; no consumers | as `$MQTT_qos2in` (`DenyDelete` and `DenyPurge` both fatal) | `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap | `DenyDelete`/`DenyPurge` (interest retention removes messages); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
+
+Three asymmetries in that table are deliberate, and each is pinned by an
+acceptance test so an over-strict "fix" fails:
+
+- **`DenyDelete` is fatal on `$MQTT_sess`/`$MQTT_willq` and waived on
+  `$MQTT_willcancel`/`$MQTT_rmsgs`** — the former have deletion as a record's
+  only exit; the latter never delete for correctness at all.
+- **`ConsumerLimits.InactiveThreshold` is fatal on `$MQTT_out` but waived on
+  `$MQTT_msgs`** — plain subscriptions already run under the broker's own
+  inactive-threshold option there, and the paths that cannot tolerate a
+  stream-forced limit (the UNSUBSCRIBE drain, shared/affine consumers) refuse it
+  at **runtime**, which also covers a limit imposed after startup — a startup
+  check could not (see `docs/CONFORMANCE.md`).
+- **`Sources` is waived on `$MQTT_rmsgs` only** — sourcing is additive, so it is
+  fatal exactly where a foreign record could occupy a protocol CAS slot, and
+  cross-account retained sourcing is a supported topology.
+
+Startup validation is a **snapshot**: a stream config mutated after
+initialization is not re-checked until the next process start or manager
+recreation. The runtime guards above and JetStream's own consumer-create
+rejection (for `MaxAckPending`) are the only live enforcement; the residual is
+recorded in `docs/CONFORMANCE.md`.
+
 ## High availability
 
 - The bridge is **stateless**: all durable state (sessions, retained messages,
@@ -165,6 +233,12 @@ Operational constraints for the marker:
 - **Retention is intentionally unbounded**: one permanent marker per distinct client
   ID ever seen (no `MaxAge`). Monitor `$MQTT_willcancel` message count and storage;
   administrative pruning weakens the guarantee for the pruned client IDs.
+- **The full marker-stream configuration is validated at startup** (see "Stream
+  prerequisites"): `validateWillCancelStream` covers the write/CAS-affecting
+  settings (`NoAck`, `Sealed`, `SubjectTransform`, `MaxMsgSize`, …) beyond the
+  state shape. `DenyDelete`/`DenyPurge` remain deliberately unchecked — no
+  operation ever deletes or purges a watermark, so they are audited
+  non-prerequisites, not oversights.
 
 ## Reserved `$MQTT.>` namespace
 
@@ -309,12 +383,19 @@ aged out.
 is what makes the terminal CAS a *replacement*; `MaxMsgsPer: 1` is what stops it
 appending and leaving a stale `held` record underneath), and must not withdraw the
 write, CAS, subject, acknowledgement, retention, deletion or purge semantics the
-protocol depends on. The claim adds no requirement of its own: it lives inside the
+protocol depends on. The purge that `DenyPurge` would block is `purgeQoS2Hold`'s
+**confirmed exact-subject** purge — the session discard's and the orphan sweep's
+only removal of a hold subject; the discard's earlier blind filter purge is gone.
+The claim adds no requirement of its own: it lives inside the
 stream's existing subject space and needs the same single-slot CAS semantics the
-hold record already does. A stream that does not match **fails broker startup** with
-recreate guidance rather than being updated in place — updating it would be
-actively unsafe, since a broker still running the pre-move code would silently
-overwrite held records once the discard policy flipped. Upgrading a development
+hold record already does — under the `<idHash>.<gen>.<PI>` layout and its `.rel`
+sibling the field list is unchanged, since the subject check is a wildcard
+spanning both layouts and each of the hold and the claim is its own single-slot
+register (see "Stream prerequisites"). A stream that does not match **fails
+broker startup** with recreate guidance rather than being updated in place —
+updating it would be actively unsafe, since a broker still running the
+pre-move code would silently overwrite held records once the discard policy
+flipped. Upgrading a development
 store therefore means stopping **all** brokers for the account and recreating the
 stream, under the compatibility boundary above. This is not a rolling upgrade.
 
@@ -956,7 +1037,9 @@ failed scan authorizes nothing. Assignments are deleted only through
 `reapQ2AffClaim`, whose existing predicate refuses a claim marked `Lost`.
 
 No stream gains a `MaxAge`: JetStream age eviction cannot perform this ordering or
-these cross-stream proofs, so protocol state stays explicitly reconciled. The
+these cross-stream proofs, so protocol state stays explicitly reconciled (every
+stream's startup validator now rejects a global `MaxAge` — see "Stream
+prerequisites"). The
 inbound walk is bounded per tick by both a record count and a byte budget (the
 message-get API returns whole records, so scanning a hold transfers its payload),
 with a cursor seeded pseudo-randomly once per process and advanced sequentially

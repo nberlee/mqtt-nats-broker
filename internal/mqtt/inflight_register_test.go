@@ -206,6 +206,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 		{"republish", func(c *StreamConfig) { c.RePublish = &RePublish{Source: ">", Destination: "pub.>"} }},
 		{"subject delete marker ttl", func(c *StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute }},
 		{"message counter", func(c *StreamConfig) { c.AllowMsgCounter = true }},
+		{"allow rollup", func(c *StreamConfig) { c.AllowRollup = true }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()

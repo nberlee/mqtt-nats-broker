@@ -12,11 +12,6 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// mqttTestDisableEagerInit, when set by a test, makes Start() skip the eager
-// account-manager initialization so a test can observe the legacy lazy
-// first-connect stream migration path (see TestMQTTRetainedMsgMigration).
-var mqttTestDisableEagerInit bool
-
 // shutdownDrainTimeout bounds how long the convenience Shutdown() blocks waiting
 // for the asynchronous shutdown lifecycle to complete. Timing out does not tear
 // dependencies down under still-running cleanup; the lifecycle keeps running in
@@ -64,14 +59,12 @@ func (s *Server) Start() error {
 	// replica runs the delayed-Will claim loop regardless of client traffic —
 	// otherwise a surviving replica would not fire a handed-off Will until some
 	// client happened to initialize the account. See will_outbox.go.
-	if !mqttTestDisableEagerInit {
-		if _, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient()); err != nil {
-			// Atomic startup contract: tear down the already-open listener and any
-			// account-manager goroutines before returning, so a failed Start leaves
-			// nothing running for direct callers (not just serveMQTT).
-			s.Shutdown()
-			return err
-		}
+	if _, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient()); err != nil {
+		// Atomic startup contract: tear down the already-open listener and any
+		// account-manager goroutines before returning, so a failed Start leaves
+		// nothing running for direct callers (not just serveMQTT).
+		s.Shutdown()
+		return err
 	}
 	return nil
 }

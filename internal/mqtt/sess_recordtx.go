@@ -199,3 +199,64 @@ func setMQTTTestRecordTxReleaseHook(h func(sess *mqttSession)) func() {
 	}
 	return func() { mqttTestRecordTxReleaseHookV.Store(prev) }
 }
+
+// validateSessStream verifies a $MQTT_sess stream can carry session records.
+// Derived from what this owner does: a per-subject CAS store (sess.save),
+// loadLastMsgFor reads, filtered forward scans, and exact-sequence CONFIRMED
+// deletes (the teardown release, session expiry, the CONNECT rollback). It
+// never purges and never creates a consumer, so DenyPurge, MaxConsumers and
+// ConsumerLimits are audited NON-prerequisites here — a validator that listed
+// them would refuse legitimate deployments for settings no operation depends
+// on.
+//
+// DenyDelete IS fatal: the teardown release's delete is the only exit a
+// record has, and since nobody resumes a marked record, a client whose
+// teardown cannot delete is locked out permanently — every subsequent CONNECT
+// re-runs the teardown and fails again.
+//
+// The incarnation epoch is validated here, on the same authoritative snapshot
+// the shape is (docs/ARCHITECTURE.md, "Session incarnations and teardown"): a
+// missing, empty, or malformed mqtt_sess_epoch metadata value (e.g. a
+// pre-first-release development stream) is a hard error, because an exact
+// design must never serve CONNECTs with an unknown local epoch and this build
+// does not mutate an existing stream to install one. Unrelated metadata keys
+// are accepted untouched.
+func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error {
+	if si == nil {
+		return fmt.Errorf("stream info unavailable")
+	}
+	cfg := si.Config
+	if err := validateBrokerOwnedStreamShape(&cfg, mqttSessStreamSubjectPrefix+domainTk+">", wantReplicas); err != nil {
+		return err
+	}
+	if cfg.Retention != LimitsPolicy {
+		return fmt.Errorf("retention is %v (want limits): nothing consumes a session record, so any other retention drops it immediately", cfg.Retention)
+	}
+	if cfg.Discard != DiscardOld {
+		return fmt.Errorf("discard is %v (want old): DiscardNew would reject the CAS replacement every session save performs", cfg.Discard)
+	}
+	if cfg.MaxMsgsPer != 1 {
+		return fmt.Errorf("max_msgs_per_subject is %d (want 1): the record CAS and exact-sequence deletes depend on the single-slot register", cfg.MaxMsgsPer)
+	}
+	if cfg.MaxMsgs > 0 || cfg.MaxBytes > 0 || cfg.MaxAge > 0 {
+		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict live session records",
+			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
+	}
+	if len(cfg.Sources) > 0 {
+		return fmt.Errorf("stream has sources (want none): a foreign record could occupy a session's CAS slot")
+	}
+	if cfg.MaxMsgSize > 0 {
+		return fmt.Errorf("max_msg_size is %d (want unlimited): a record grows with subscriptions, drains and verdicts, and a cap would reject a save the protocol cannot skip", cfg.MaxMsgSize)
+	}
+	if cfg.DenyDelete {
+		return fmt.Errorf("deny_delete is set: it blocks the teardown release, permanently locking the client ID out")
+	}
+	if cfg.SubjectDeleteMarkerTTL != 0 {
+		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): a marker after the teardown delete would be read back as an unreadable record", cfg.SubjectDeleteMarkerTTL)
+	}
+	if epoch := cfg.Metadata[mqttSessEpochMetaKey]; !mqttValidSessEpoch(epoch) {
+		return fmt.Errorf("no valid %q metadata (found %q); recreate the session stream/store so a fresh incarnation epoch is generated",
+			mqttSessEpochMetaKey, epoch)
+	}
+	return nil
+}

@@ -369,6 +369,7 @@ func TestValidateQoS2AssignStream(t *testing.T) {
 		{"republish", func(c *StreamConfig) { c.RePublish = &RePublish{Source: "a", Destination: "b"} }},
 		{"subject delete marker ttl", func(c *StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute }},
 		{"allow msg counter", func(c *StreamConfig) { c.AllowMsgCounter = true }},
+		{"allow rollup", func(c *StreamConfig) { c.AllowRollup = true }},
 		{"async persist mode", func(c *StreamConfig) { c.PersistMode = AsyncPersistMode }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -396,13 +397,13 @@ func TestValidateOutStream(t *testing.T) {
 			Replicas:  3,
 		}}
 	}
-	if err := validateOutStream(good(), 3); err != nil {
+	if err := validateOutStream(good(), 3, mqttDefaultMaxAckPending); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateOutStream(good(), 0); err != nil {
+	if err := validateOutStream(good(), 0, mqttDefaultMaxAckPending); err != nil {
 		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
 	}
-	if err := validateOutStream(nil, 0); err == nil {
+	if err := validateOutStream(nil, 0, mqttDefaultMaxAckPending); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -411,11 +412,17 @@ func TestValidateOutStream(t *testing.T) {
 	}{
 		{"deny delete is not a prerequisite", func(c *StreamConfig) { c.DenyDelete = true }},
 		{"deny purge is not a prerequisite", func(c *StreamConfig) { c.DenyPurge = true }},
+		// The explicit boundary of the MaxAckPending threshold form: a stream
+		// limit AT the broker's effective cap changes nothing, so it must start.
+		// Only a limit BELOW the cap makes JetStream reject the consumer creates.
+		{"consumer max_ack_pending at the cap is not a prerequisite", func(c *StreamConfig) {
+			c.ConsumerLimits.MaxAckPending = mqttDefaultMaxAckPending
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateOutStream(si, 3); err != nil {
+			if err := validateOutStream(si, 3, mqttDefaultMaxAckPending); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
@@ -442,13 +449,20 @@ func TestValidateOutStream(t *testing.T) {
 		{"republish", func(c *StreamConfig) { c.RePublish = &RePublish{Source: "a", Destination: "b"} }},
 		{"subject delete marker ttl", func(c *StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute }},
 		{"allow msg counter", func(c *StreamConfig) { c.AllowMsgCounter = true }},
+		{"allow rollup", func(c *StreamConfig) { c.AllowRollup = true }},
 		{"async persist mode", func(c *StreamConfig) { c.PersistMode = AsyncPersistMode }},
 		{"stream-forced consumer inactivity", func(c *StreamConfig) { c.ConsumerLimits.InactiveThreshold = time.Minute }},
+		// Both durables here are per session (PUBREL + affine), so a finite cap
+		// eventually rejects a legitimate session's resume.
+		{"finite max consumers", func(c *StreamConfig) { c.MaxConsumers = 5 }},
+		// Below the effective cap JetStream rejects the durable creates outright,
+		// failing every QoS 2 resume. (At the cap it must be accepted; see above.)
+		{"consumer max_ack_pending below the cap", func(c *StreamConfig) { c.ConsumerLimits.MaxAckPending = 1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateOutStream(si, 3); err == nil {
+			if err := validateOutStream(si, 3, mqttDefaultMaxAckPending); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})

@@ -312,6 +312,16 @@ func TestValidateWillCancelStream(t *testing.T) {
 		{"mirror", func(si *StreamInfo) { si.Config.Mirror = &StreamSource{Name: mqttSessStreamName} }, 0},
 		{"sources", func(si *StreamInfo) { si.Config.Sources = []*StreamSource{{Name: mqttSessStreamName}} }, 0},
 		{"replicamismatch", func(si *StreamInfo) { si.Config.Replicas = 1 }, 3},
+		{"maxmsgsize", func(si *StreamInfo) { si.Config.MaxMsgSize = 1024 }, 0},
+		{"noack", func(si *StreamInfo) { si.Config.NoAck = true }, 0},
+		{"sealed", func(si *StreamInfo) { si.Config.Sealed = true }, 0},
+		{"subjecttransform", func(si *StreamInfo) {
+			si.Config.SubjectTransform = &SubjectTransformConfig{Source: "a", Destination: "b"}
+		}, 0},
+		{"republish", func(si *StreamInfo) { si.Config.RePublish = &RePublish{Source: "a", Destination: "b"} }, 0},
+		{"allowmsgcounter", func(si *StreamInfo) { si.Config.AllowMsgCounter = true }, 0},
+		{"allowrollup", func(si *StreamInfo) { si.Config.AllowRollup = true }, 0},
+		{"asyncpersist", func(si *StreamInfo) { si.Config.PersistMode = AsyncPersistMode }, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var si *StreamInfo
@@ -321,6 +331,28 @@ func TestValidateWillCancelStream(t *testing.T) {
 			}
 			if err := validateWillCancelStream(si, domainTk, tc.want); err == nil {
 				t.Fatalf("expected validation failure for %q", tc.name)
+			}
+		})
+	}
+
+	// The audited NON-prerequisites must be ACCEPTED: no operation ever deletes
+	// or purges on this stream (a watermark is permanent), so a delete marker can
+	// never be created either. Without these rows the audit is unfalsifiable in
+	// the over-strict direction — a future copy-paste from a deleting stream's
+	// validator would lock conforming deployments out.
+	for _, tc := range []struct {
+		name   string
+		mutate func(si *StreamInfo)
+	}{
+		{"denydelete is not a prerequisite", func(si *StreamInfo) { si.Config.DenyDelete = true }},
+		{"denypurge is not a prerequisite", func(si *StreamInfo) { si.Config.DenyPurge = true }},
+		{"subjectdeletemarkerttl is not a prerequisite", func(si *StreamInfo) { si.Config.SubjectDeleteMarkerTTL = time.Minute }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			si := base()
+			tc.mutate(si)
+			if err := validateWillCancelStream(si, domainTk, 0); err != nil {
+				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
 	}

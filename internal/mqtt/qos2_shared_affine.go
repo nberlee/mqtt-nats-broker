@@ -772,13 +772,8 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-
-	wantSubj := mqttQoS2AssignStreamSubjectPrefix + ">"
-	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != wantSubj {
-		return fmt.Errorf("subjects %v (want [%q])", cfg.Subjects, wantSubj)
-	}
-	if cfg.Storage != FileStorage {
-		return fmt.Errorf("storage is %v (want file)", cfg.Storage)
+	if err := validateBrokerOwnedStreamShape(&cfg, mqttQoS2AssignStreamSubjectPrefix+">", wantReplicas); err != nil {
+		return err
 	}
 	if cfg.Retention != LimitsPolicy {
 		// Interest or work-queue retention would drop a claim the moment no
@@ -802,38 +797,17 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict live assignment state",
 			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
 	}
-	if cfg.Mirror != nil || len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has a mirror or sources (want none): writes would land elsewhere")
-	}
-	if wantReplicas > 0 && cfg.Replicas != wantReplicas {
-		return fmt.Errorf("replicas is %d (want %d)", cfg.Replicas, wantReplicas)
+	if len(cfg.Sources) > 0 {
+		return fmt.Errorf("stream has sources (want none): a foreign record could occupy a claim's CAS slot")
 	}
 	if cfg.MaxMsgSize > 0 {
 		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject a claim transition independently of any broker preflight", cfg.MaxMsgSize)
 	}
-	if cfg.NoAck {
-		return fmt.Errorf("no_ack is set: it suppresses the acknowledgements every CAS here depends on")
-	}
 	if cfg.DenyDelete {
 		return fmt.Errorf("deny_delete is set: it blocks the claim reap")
 	}
-	if cfg.Sealed {
-		return fmt.Errorf("stream is sealed: it blocks all writes")
-	}
-	if cfg.SubjectTransform != nil {
-		return fmt.Errorf("a subject transform is configured: it rewrites the per-claim subject that CAS identity and loadLastMsgFor both depend on")
-	}
-	if cfg.RePublish != nil {
-		return fmt.Errorf("republish is configured: it would mirror internal assignment state onto a user-visible subject")
-	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on claim subjects would be parsed as records", cfg.SubjectDeleteMarkerTTL)
-	}
-	if cfg.AllowMsgCounter {
-		return fmt.Errorf("allow_msg_counter is set: counter streams do not support the store semantics used here")
-	}
-	if cfg.PersistMode != DefaultPersistMode {
-		return fmt.Errorf("persist_mode is %v (want the default): its durability semantics are unproven for this protocol", cfg.PersistMode)
 	}
 	return nil
 }
@@ -848,18 +822,22 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
 // session's undelivered copies disappear when its durable is deleted, and it is
 // why a copy must never be stored before its consumer exists — a store with no
 // interest returns success and keeps nothing.
-func validateOutStream(si *StreamInfo, wantReplicas int) error {
+//
+// maxAckPending is the broker's effective per-consumer cap
+// (opts.MQTT.MaxAckPending or mqttDefaultMaxAckPending). A stream
+// ConsumerLimits.MaxAckPending below it makes JetStream reject the PUBREL and
+// affine durable creates outright, so every QoS 2 resume fails; a limit at or
+// above the cap changes nothing, so only a lower one is fatal. A reload that
+// raises the broker cap past the stream limit is not covered by this startup
+// check; the consumer-create rejection remains the backstop (stated residual
+// in docs/CONFORMANCE.md).
+func validateOutStream(si *StreamInfo, wantReplicas, maxAckPending int) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-
-	wantSubj := mqttOutSubjectPrefix + ">"
-	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != wantSubj {
-		return fmt.Errorf("subjects %v (want [%q])", cfg.Subjects, wantSubj)
-	}
-	if cfg.Storage != FileStorage {
-		return fmt.Errorf("storage is %v (want file)", cfg.Storage)
+	if err := validateBrokerOwnedStreamShape(&cfg, mqttOutSubjectPrefix+">", wantReplicas); err != nil {
+		return err
 	}
 	if cfg.Retention != InterestPolicy {
 		return fmt.Errorf("retention is %v (want interest): a discarded session's undelivered copies would not be dropped with its consumer", cfg.Retention)
@@ -874,41 +852,28 @@ func validateOutStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict pending PUBREL or affine QoS 2 state",
 			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
 	}
-	if cfg.Mirror != nil || len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has a mirror or sources (want none): writes would land elsewhere")
-	}
-	if wantReplicas > 0 && cfg.Replicas != wantReplicas {
-		return fmt.Errorf("replicas is %d (want %d)", cfg.Replicas, wantReplicas)
+	if len(cfg.Sources) > 0 {
+		return fmt.Errorf("stream has sources (want none): a foreign record could occupy a copy subject's create-only CAS slot")
 	}
 	if cfg.MaxMsgSize > 0 {
 		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject an affine copy the broker max-payload preflight already admitted", cfg.MaxMsgSize)
 	}
-	if cfg.NoAck {
-		return fmt.Errorf("no_ack is set: it suppresses the acknowledgements the copy store depends on")
-	}
-	if cfg.Sealed {
-		return fmt.Errorf("stream is sealed: it blocks all writes")
-	}
-	if cfg.SubjectTransform != nil {
-		return fmt.Errorf("a subject transform is configured: it rewrites the generation-scoped subject that consumer isolation and the create-only CAS depend on")
-	}
-	if cfg.RePublish != nil {
-		return fmt.Errorf("republish is configured: it would mirror in-flight QoS 2 payloads onto a user-visible subject")
-	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages would be delivered to a session's affine consumer as if they were copies", cfg.SubjectDeleteMarkerTTL)
 	}
-	if cfg.AllowMsgCounter {
-		return fmt.Errorf("allow_msg_counter is set: counter streams do not support the store semantics used here")
-	}
-	if cfg.PersistMode != DefaultPersistMode {
-		return fmt.Errorf("persist_mode is %v (want the default): its durability semantics are unproven for this protocol", cfg.PersistMode)
+	if cfg.MaxConsumers > 0 {
+		// One PUBREL durable and one affine durable per applicable session, so a
+		// finite cap eventually rejects a legitimate session's resume.
+		return fmt.Errorf("max_consumers is %d (want unlimited): the broker creates per-session PUBREL and affine durables, so a cap eventually rejects a legitimate session", cfg.MaxConsumers)
 	}
 	if cfg.ConsumerLimits.InactiveThreshold != 0 {
 		// A stream-forced inactivity threshold would give every session's affine
 		// durable a delete timer, reaping resumable-session state while the client
 		// is offline — exactly what this feature exists to preserve.
 		return fmt.Errorf("stream imposes a consumer inactivity limit (%v): it would reap a disconnected session's affine QoS 2 consumer", cfg.ConsumerLimits.InactiveThreshold)
+	}
+	if l := cfg.ConsumerLimits.MaxAckPending; l != 0 && l < maxAckPending {
+		return fmt.Errorf("stream consumer max_ack_pending limit is %d, below the broker's effective cap %d: JetStream would reject the PUBREL and affine durable creates, failing every QoS 2 resume", l, maxAckPending)
 	}
 	return nil
 }

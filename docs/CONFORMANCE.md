@@ -254,7 +254,9 @@ Residuals:
 - **Offline backlog.** A drain's durable still holds interest in its filter while
   the session is disconnected, so messages published meanwhile accumulate in
   `$MQTT_msgs` until the next connection discards them or the drain is reaped.
-  Bounded by the stream limits and the Session Expiry Interval.
+  Bounded by the Session Expiry Interval and by storage capacity — global stream
+  limits on `$MQTT_msgs` are refused at startup (they would evict undelivered
+  messages), so no stream limit bounds it.
 - **Stream-level consumer inactivity limits.** A drain must outlive an offline
   period, and `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs` gives every
   consumer a deletion timer that no consumer config can opt out of. Where that
@@ -263,7 +265,11 @@ Residuals:
   delivery is dropped and [MQTT-3.10.4-3] is not honored on such a stream. It logs
   a warning naming the limit. Running `$MQTT_msgs` without a stream-level consumer
   inactivity limit is therefore a deployment requirement, exactly as it already is
-  for shared subscriptions.
+  for shared subscriptions. The `$MQTT_msgs` startup validator deliberately adds
+  no check here: the limit can be imposed *after* startup, so these runtime
+  refusals remain the authority (the same field **is** a startup failure on
+  `$MQTT_out`, whose affine durables must survive offline sessions — see
+  "Stream prerequisites" in `docs/ARCHITECTURE.md`).
 - **Per-consumer inactivity timers.** A consumer created under the broker's own
   `consumer_inactive_threshold` carries the same timer per consumer. That one *is*
   escapable, so the broker clears it when the drain is committed, and retries at
@@ -271,6 +277,15 @@ Residuals:
   drained durable keeps its timer and can be reaped while the session is offline.
   Its started deliveries go with it, and that outcome is reported as **loss**,
   never as completion.
+- **A plain QoS 1/2 durable reaped by an inactivity threshold is silently
+  trusted on resume.** Under either source of a threshold — the broker's own
+  `consumer_inactive_threshold` option or a stream-forced
+  `ConsumerLimits.InactiveThreshold` — an offline session's ordinary durable
+  can be deleted, and the resumed session re-subscribes the recorded deliver
+  subject without verifying or recreating the consumer, so the subscription is
+  dead until a clean start. This is a residual of inactivity-threshold reaping
+  itself, present with the broker option alone; fixing the resume path is a
+  release blocker tracked in `docs/ROADMAP.md` section 0.
 - **A drained QoS 2 source is held until its PUBREL is proven.** An ordinary QoS 2
   PUBREC acknowledges the stored message as soon as the PUBREL is stored. A
   *drained* one does not: on the interest-retained `$MQTT_out` a store with no
@@ -492,3 +507,65 @@ the protocol depends on). A non-conforming stream fails broker startup with
 recreate guidance rather than being mutated in place. Upgrading a pre-existing
 development store therefore means stopping **all** brokers for the account and
 recreating the stream; it is not a rolling upgrade.
+
+### Broker-owned stream prerequisites: startup refusal, a snapshot, and dropped fallbacks
+
+Every broker-owned `$MQTT_*` stream is now validated at account-manager
+initialization against the list its own protocol derives (see "Stream
+prerequisites" in `docs/ARCHITECTURE.md`). This extends the startup-refusal
+surface that previously covered five streams to all nine, with the same
+consequences the `$MQTT_qos2in` precedent established:
+
+- **A nonconforming stream fails broker startup**, with an error naming the
+  stream, the offending setting, and the recovery. Nothing is repaired or
+  updated in place.
+- **A nonconforming stream splits a mixed fleet.** An older broker keeps serving
+  the account while an upgraded broker refuses initialization, surfacing as
+  CONNECT failures on the new broker only. The recovery is **stop-all**: stop
+  every broker for the account, recreate or fix the named stream per the
+  error's guidance, then restart. This is not a rolling upgrade. A *conforming*
+  deployment restarts and rolls exactly as before — default broker-created
+  streams are conforming, and so are supported administrative variations such
+  as a source on `$MQTT_rmsgs`.
+- **Startup validation is a snapshot.** A stream config mutated *after*
+  initialization is not re-checked until the next process start or manager
+  recreation. Runtime guards exist exactly where the code already has them: the
+  UNSUBSCRIBE-drain refusal and the shared-subscription guard for a
+  stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, and
+  JetStream's own consumer-create rejection for a `MaxAckPending` limit below
+  the broker's cap. A persisted "validated" flag was considered and rejected:
+  it goes stale against exactly the mutations it claims to cover.
+
+Two pre-release fallbacks were **removed** rather than validated around, under
+the compatibility boundary (no released contract exists for either):
+
+- **The `AllowMsgTTL` degraded mode is gone.** Per-message TTL support on
+  `$MQTT_msgs` and `$MQTT_rmsgs` is a startup prerequisite on every broker that
+  accepts MQTT 5.0 — the default (MQTT 5.0 Message Expiry of stored and
+  retained messages); a stream that refuses it fails initialization instead of
+  silently not reaping expired messages. A `max_protocol_version: 4` broker
+  never emits `Nats-TTL` (Message Expiry is an MQTT 5.0 property), so it
+  accepts a TTL-less pre-existing stream; raising the protocol cap later makes
+  the next initialization refuse that stream, fail-closed. The v4 acceptance
+  presumes the store's history matches the configuration: within this build no
+  sequence of normal operation can pair a TTL-less stream with persisted
+  expiring MQTT 5 state (the broker creates its streams TTL-enabled, and a
+  v5-accepting broker fails closed on a TTL-less stream before it can accept a
+  single v5 CONNECT), but administrative stream recreation under live state or
+  a post-start config/stream mutation can — a persisted expiring v5 Will then
+  stalls with logged store rejections and lease retries (never silently lost)
+  until the stream is fixed. Recreate per the compatibility boundary. The
+  support floor is nats-server 2.14, which always understands `AllowMsgTTL`.
+- **The two inherited upstream migrations are gone.** Pre-2.10 nats-server
+  per-client `$MQTT_sess_<hash>` session streams and pre-2.10.10 single-subject
+  retained messages are no longer transferred at startup — and they are no
+  longer *detected* either: this broker never wrote those formats (only
+  nats-server 2.9-era upstream MQTT did), so a store containing them starts
+  with a fresh, empty `$MQTT_sess` as the authority, the legacy streams are
+  ignored where they stand, and the orphan reconciliation sweeps — which
+  reconcile against that authority — may remove consumers that referenced the
+  ignored state. Pointing this build at such a store without recreating it
+  first is unsupported; recreate the development store per the compatibility
+  boundary. The retained-messages setup no longer rewrites `Subjects` or
+  `MaxMsgsPer` in place either — `$MQTT_rmsgs` is create-then-validate like
+  every other broker-owned stream.

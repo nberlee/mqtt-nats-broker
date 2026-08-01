@@ -89,62 +89,49 @@ func mqttValidSessEpoch(s string) bool {
 	return true
 }
 
-// resolveSessStreamEpoch reads and validates the authoritative $MQTT_sess
-// incarnation epoch from the stream metadata. A missing, empty, or malformed value
-// (e.g. a pre-first-release development stream) is a hard error: an exact design
-// must never serve CONNECTs with an unknown local epoch, and this build does not
-// mutate an existing stream to install one. The caller fails account-manager
-// initialization with actionable recreate guidance.
-func resolveSessStreamEpoch(jsa *mqttJSA) (string, error) {
-	si, err := jsa.lookupStream(mqttSessStreamName)
-	if err != nil {
-		return "", fmt.Errorf("lookup %s: %w", mqttSessStreamName, err)
-	}
-	if si == nil {
-		return "", fmt.Errorf("%s not found", mqttSessStreamName)
-	}
-	epoch := si.Config.Metadata[mqttSessEpochMetaKey]
-	if !mqttValidSessEpoch(epoch) {
-		return "", fmt.Errorf("%s has no valid %q metadata (found %q); recreate the session stream/store so a fresh incarnation epoch is generated",
-			mqttSessStreamName, mqttSessEpochMetaKey, epoch)
-	}
-	return epoch, nil
-}
-
 // validateWillCancelStream verifies a $MQTT_willcancel stream carries the exact
-// permanent-marker configuration. Global message/byte/age limits would eventually
-// evict a permanent marker; DiscardNew would reject a CAS replacement of a client's
-// prior watermark; a mirror/source or wrong subject would land writes elsewhere.
+// permanent-marker configuration. Derived from what this owner does: a
+// per-client watermark CAS (advance / self-heal at a known sequence) and
+// loadLastMsgFor reads — and NOTHING else. Global message/byte/age limits would
+// eventually evict a permanent marker; DiscardNew would reject the CAS
+// replacement of a client's prior watermark; a source could occupy a client's
+// marker slot; a size cap would reject the watermark write that gates every
+// CONNECT.
+//
+// No operation ever deletes or purges on this stream, by design (a watermark
+// is permanent; see docs/ARCHITECTURE.md), so DenyDelete and DenyPurge are
+// audited NON-prerequisites — do not "finish" this list with them. For the
+// same reason SubjectDeleteMarkerTTL is waived: with no delete, no delete
+// marker can ever be created, so the check would not be derived from any owner
+// operation. No consumer is ever created either, so MaxConsumers and
+// ConsumerLimits are equally waived.
+//
 // wantReplicas is 0 when no explicit replica count is configured (skip that check).
 func validateWillCancelStream(si *StreamInfo, domainTk string, wantReplicas int) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	wantSubj := mqttWillCancelSubjectPrefix + domainTk + ">"
-	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != wantSubj {
-		return fmt.Errorf("subjects %v (want [%q])", cfg.Subjects, wantSubj)
-	}
-	if cfg.Storage != FileStorage {
-		return fmt.Errorf("storage is %v (want file)", cfg.Storage)
+	if err := validateBrokerOwnedStreamShape(&cfg, mqttWillCancelSubjectPrefix+domainTk+">", wantReplicas); err != nil {
+		return err
 	}
 	if cfg.Retention != LimitsPolicy {
-		return fmt.Errorf("retention is %v (want limits)", cfg.Retention)
+		return fmt.Errorf("retention is %v (want limits): nothing consumes a watermark, so any other retention drops it immediately", cfg.Retention)
 	}
 	if cfg.Discard != DiscardOld {
-		return fmt.Errorf("discard is %v (want old)", cfg.Discard)
+		return fmt.Errorf("discard is %v (want old): DiscardNew would reject the CAS replacement of a client's prior watermark", cfg.Discard)
 	}
 	if cfg.MaxMsgsPer != 1 {
-		return fmt.Errorf("max_msgs_per_subject is %d (want 1)", cfg.MaxMsgsPer)
+		return fmt.Errorf("max_msgs_per_subject is %d (want 1): the per-client marker is a single-slot register its CAS depends on", cfg.MaxMsgsPer)
 	}
 	if cfg.MaxMsgs > 0 || cfg.MaxBytes > 0 || cfg.MaxAge > 0 {
-		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited)", cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
+		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict a permanent marker", cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
 	}
-	if cfg.Mirror != nil || len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has a mirror or sources (want none)")
+	if len(cfg.Sources) > 0 {
+		return fmt.Errorf("stream has sources (want none): a foreign record could occupy a client's marker slot")
 	}
-	if wantReplicas > 0 && cfg.Replicas != wantReplicas {
-		return fmt.Errorf("replicas is %d (want %d)", cfg.Replicas, wantReplicas)
+	if cfg.MaxMsgSize > 0 {
+		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject the watermark write that gates every CONNECT", cfg.MaxMsgSize)
 	}
 	return nil
 }

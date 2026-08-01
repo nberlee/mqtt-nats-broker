@@ -175,7 +175,7 @@ func TestQ2AffineReplicatedAssignmentStream(t *testing.T) {
 	if err != nil || si == nil {
 		t.Fatalf("lookup %s: si=%v err=%v", mqttOutStreamName, si, err)
 	}
-	if verr := validateOutStream(si, 3); verr != nil {
+	if verr := validateOutStream(si, 3, mqttDefaultMaxAckPending); verr != nil {
 		t.Fatalf("the R3 outgoing stream the broker created does not satisfy its own validator: %v", verr)
 	}
 

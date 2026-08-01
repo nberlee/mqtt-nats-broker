@@ -213,9 +213,6 @@ const (
 	mqttSessStreamName          = "$MQTT_sess"
 	mqttSessStreamSubjectPrefix = mqttPrefix + "sess."
 
-	// Stream name prefix for MQTT sessions on a given account
-	mqttSessionsStreamNamePrefix = "$MQTT_sess_"
-
 	// Stream name and subject prefix for the delayed-Will durable outbox
 	// (Layer 2). One subject per Will event: <prefix><domainTk><cidHash>.<willID>,
 	// MaxMsgsPer:1, so each generation is an independent CAS target and an
@@ -238,7 +235,7 @@ const (
 	// epoch, and the only valid epoch form: "nuid:<22-character NUID>". The epoch
 	// is an identity token (equality only), so a session sequence is comparable to
 	// a watermark or Will origin sequence only when their epochs match. See
-	// resolveSessStreamEpoch.
+	// validateSessStream.
 	mqttSessEpochMetaKey    = "mqtt_sess_epoch"
 	mqttSessEpochNUIDPrefix = "nuid:"
 
@@ -344,7 +341,6 @@ const (
 	mqttJSAStreamCreate   = "SC"
 	mqttJSAStreamUpdate   = "SU"
 	mqttJSAStreamLookup   = "SL"
-	mqttJSAStreamDel      = "SD"
 	mqttJSAStreamPurge    = "SPU"
 	mqttJSAConsumerCreate = "CC"
 	mqttJSAConsumerLookup = "CL"
@@ -354,7 +350,6 @@ const (
 	mqttJSAMsgDelete      = "MD"
 	mqttJSASessPersist    = "SP"
 	mqttJSARetainedMsgDel = "RD"
-	mqttJSAStreamNames    = "SN"
 	mqttJSAConsumerList   = "CLS"
 	// mqttJSAAckConfirm is the JetStream "double ack": the acknowledgement of a
 	// delivery, sent WITH a reply subject so JetStream answers once it has been
@@ -371,9 +366,6 @@ const (
 	// This is how frequently the timer to cleanup the sessions flappers map is firing.
 	mqttSessFlappingCleanupInterval = 5 * time.Second
 
-	// Default retry delay if transfer of old session streams to new one fails
-	mqttDefaultTransferRetry = 5 * time.Second
-
 	// For Websocket URLs
 	mqttWSPath = "/mqtt"
 
@@ -386,7 +378,6 @@ const (
 	mqttInitialPubHeader        = 16 // An overkill, should need 7 bytes max
 	mqttProcessSubTooLong       = 100 * time.Millisecond
 	mqttDefaultRetainedCacheTTL = 2 * time.Minute
-	mqttRetainedTransferTimeout = 10 * time.Second
 	mqttDefaultJSAPITimeout     = 5 * time.Second
 	mqttRetainedFlagDelMarker   = '-'
 )
@@ -746,15 +737,8 @@ type mqttAccountSessionManager struct {
 	// (OriginSessEpoch); a sequence is only comparable across the two when the
 	// epochs are equal. Immutable after init (read without lock). If a valid epoch
 	// cannot be resolved, the account manager is not published. See
-	// resolveSessStreamEpoch, willTakeoverFence.
+	// validateSessStream, willTakeoverFence.
 	sessStreamEpoch string
-
-	// Degraded mode, set once at creation (read without lock): per-message TTL
-	// could not be enabled on a pre-existing stream, so stored messages must
-	// not carry a Nats-TTL header (JetStream would reject them). Delivery-side
-	// expiry checks still apply; only storage reaping is lost.
-	msgsStreamNoTTL  bool
-	rmsgsStreamNoTTL bool
 
 	// testPublishWill, when non-nil, replaces the delayed-Will publication for
 	// THIS account manager only (instance-scoped, so parallel tests stay
@@ -3382,8 +3366,6 @@ func (s *Server) getOrCreateMQTTAccountSessionManager(c *client) (*mqttAccountSe
 //
 // Global session manager lock is held on entry.
 func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struct{}) (*mqttAccountSessionManager, error) {
-	var err error
-
 	accName := acc.GetName()
 
 	opts := s.getOpts()
@@ -3504,452 +3486,37 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.cleanupRetainedMessageCache(s, closeCh)
 	})
 
-	lookupStream := func(stream, txt string) (*StreamInfo, error) {
-		si, err := jsa.lookupStream(stream)
+	// Provision the nine broker-owned $MQTT_* streams through the one
+	// convergence shape (ensureBrokerStream): create-or-lose, an UNCONDITIONAL
+	// authoritative re-read, then per-owner validation over that re-read — a
+	// nonconforming stream is a startup failure with recreate guidance, never
+	// something to mutate in place. The ordered spec table is the only route: a
+	// stream cannot be provisioned outside the helper without deleting its entry,
+	// which the table-coverage test refuses. Per-stream specials (the session
+	// epoch generation, gate hooks and adoption; the retained-messages consumer)
+	// live in the entries, not around this loop.
+	wantReplicas := 0
+	if opts.MQTT.StreamReplicas != 0 {
+		wantReplicas = replicas
+	}
+	maxAckPending := int(opts.MQTT.MaxAckPending)
+	if maxAckPending == 0 {
+		maxAckPending = mqttDefaultMaxAckPending
+	}
+	// A max_protocol_version:4 broker refuses every MQTT 5 CONNECT, so it never
+	// emits a per-message Nats-TTL (Message Expiry) and must not require the
+	// capability of a pre-existing stream. Everything else accepts MQTT 5.0.
+	requireMsgTTL := opts.MQTT.MaxProtocolVersion != mqttProtoLevel
+	for _, spec := range as.brokerStreamSpecs(s, accName, replicas, wantReplicas, maxAckPending, requireMsgTTL, rmsubj) {
+		si, err := ensureBrokerStream(jsa, spec.cfg, spec.validate, spec.preCreate, spec.observe)
 		if err != nil {
-			if IsNatsErr(err, JSStreamNotFoundErr) {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("lookup %s stream for account %q: %v", txt, accName, err)
+			return nil, fmt.Errorf("MQTT %s stream for account %q: %w", spec.txt, accName, err)
 		}
-		if opts.MQTT.StreamReplicas == 0 {
-			return si, nil
-		}
-		sr := 1
-		if si.Cluster != nil {
-			sr += len(si.Cluster.Replicas)
-		}
-		if replicas != sr {
-			s.Warnf("MQTT %s stream replicas mismatch: current is %v but configuration is %v for '%s > %s'",
-				txt, sr, replicas, accName, stream)
-		}
-		return si, nil
-	}
-
-	if si, err := lookupStream(mqttSessStreamName, "sessions"); err != nil {
-		return nil, err
-	} else if si == nil {
-		// Create the stream for the sessions. A generated incarnation epoch is
-		// stamped into the stream metadata at creation (the linearization point):
-		// whichever replica wins the create sets the authoritative epoch, and a
-		// create-race loser adopts it via the re-read in resolveSessStreamEpoch.
-		cfg := &StreamConfig{
-			Name:       mqttSessStreamName,
-			Subjects:   []string{mqttSessStreamSubjectPrefix + as.domainTk + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Replicas:   replicas,
-			MaxMsgsPer: 1,
-			Metadata:   map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
-		}
-		if gate := s.mqtt.sessmgr.testSessCreateGate; gate != nil {
-			gate() // test seam: barrier racing managers at the lookup->create boundary
-		}
-		_, created, cerr := jsa.createStream(cfg)
-		if observe := s.mqtt.sessmgr.testSessCreateObserve; observe != nil {
-			observe(created, cerr)
-		}
-		if cerr == nil && created {
-			as.transferUniqueSessStreamsToMuxed(s)
-		} else if isErrorOtherThan(cerr, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create sessions stream for account %q: %v", accName, cerr)
-		}
-	}
-	// Resolve the authoritative session-stream incarnation epoch. This is a
-	// first-release requirement: a pre-existing $MQTT_sess without a valid
-	// generated epoch (e.g. development data from before this feature) fails
-	// initialization with actionable recreate guidance rather than being mutated
-	// or silently trusted. On success every accepted CONNECT and every native Will
-	// record is stamped with this identity. See resolveSessStreamEpoch.
-	epoch, eerr := resolveSessStreamEpoch(jsa)
-	if eerr != nil {
-		return nil, fmt.Errorf("resolve session-stream epoch for account %q: %w", accName, eerr)
-	}
-	as.sessStreamEpoch = epoch
-
-	// Delayed-Will durable outbox stream (Layer 2). Separate from the sessions
-	// stream so its per-Will subjects and sequences never interfere with the
-	// in-memory session record's CAS token (sess.seq). MaxMsgsPer:1 makes each
-	// per-Will subject a single-record CAS slot. See will_outbox.go.
-	if si, err := lookupStream(mqttWillQStreamName, "will outbox"); err != nil {
-		return nil, err
-	} else if si == nil {
-		cfg := &StreamConfig{
-			Name:       mqttWillQStreamName,
-			Subjects:   []string{mqttWillQSubjectPrefix + as.domainTk + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Replicas:   replicas,
-			MaxMsgsPer: 1,
-		}
-		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create will outbox stream for account %q: %v", accName, err)
-		}
-	}
-
-	// Durable per-client delayed-Will cancellation watermark stream. Permanent
-	// per-client retention (MaxMsgsPer:1, no global message/byte/age limits so a
-	// marker is never evicted; DiscardOld so a CAS replacement of a client's prior
-	// watermark is never rejected). Creation success, a create-race loss, and the
-	// pre-existing-stream path all converge on an authoritative StreamInfo re-read
-	// and validateWillCancelStream: an incompatible development stream fails
-	// initialization with recreate guidance rather than being mutated in place.
-	{
-		cfg := &StreamConfig{
-			Name:       mqttWillCancelStreamName,
-			Subjects:   []string{mqttWillCancelSubjectPrefix + as.domainTk + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Discard:    DiscardOld,
-			Replicas:   replicas,
-			MaxMsgsPer: 1,
-		}
-		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create will-cancel stream for account %q: %v", accName, err)
-		}
-		si, err := jsa.lookupStream(mqttWillCancelStreamName)
-		if err != nil {
-			return nil, fmt.Errorf("lookup will-cancel stream for account %q: %v", accName, err)
-		}
-		wantReplicas := 0
-		if opts.MQTT.StreamReplicas != 0 {
-			wantReplicas = replicas
-		}
-		if verr := validateWillCancelStream(si, as.domainTk, wantReplicas); verr != nil {
-			return nil, fmt.Errorf("will-cancel stream for account %q is not usable: %w; recreate $MQTT_willcancel with the required permanent-marker configuration", accName, verr)
-		}
-	}
-
-	msi, err := lookupStream(mqttStreamName, "messages")
-	if err != nil {
-		return nil, err
-	}
-	if msi == nil {
-		// Create the stream for the messages.
-		cfg := &StreamConfig{
-			Name:      mqttStreamName,
-			Subjects:  []string{mqttStreamSubjectPrefix + ">"},
-			Storage:   FileStorage,
-			Retention: InterestPolicy,
-			Replicas:  replicas,
-			// Honor MQTT 5.0 Message Expiry Interval: a stored PUBLISH carries a
-			// per-message Nats-TTL so JetStream drops it once its lifetime has
-			// elapsed, even if never delivered. Spec5 [3.3.2.3.3].
-			AllowMsgTTL: true,
-		}
-		if _, _, cerr := jsa.createStream(cfg); cerr != nil {
-			if isErrorOtherThan(cerr, JSStreamNameExistErr) {
-				return nil, fmt.Errorf("create messages stream for account %q: %v", accName, cerr)
-			}
-			// Lost a creation race: re-check what the winner created, it may
-			// be an older stream without per-message TTL.
-			if msi, err = lookupStream(mqttStreamName, "messages"); err != nil {
+		if spec.post != nil {
+			if err := spec.post(si); err != nil {
 				return nil, err
 			}
 		}
-	}
-	if msi != nil && !msi.Config.AllowMsgTTL {
-		// Enable per-message TTL on a messages stream created before MQTT 5.0
-		// message expiry support was added, so expiry is honored after upgrade.
-		// Degrade rather than fail: without it MQTT still works, only v5
-		// message expiry of stored messages is not enforced (e.g. while other
-		// servers in a mixed-version cluster do not understand AllowMsgTTL).
-		msi.Config.AllowMsgTTL = true
-		if _, err := jsa.updateStream(&msi.Config); err != nil {
-			msi.Config.AllowMsgTTL = false
-			as.msgsStreamNoTTL = true
-			s.Warnf("MQTT: unable to enable per-message TTL on messages stream for account %q, v5 Message Expiry of stored messages will not be enforced: %v", accName, err)
-		}
-	}
-
-	// Inbound QoS 2 hold state. One record per (client, packet identifier) subject
-	// (MaxMsgsPer:1), holding either a `held` PUBLISH awaiting its PUBREL or the
-	// terminal `delivered` tombstone that a committed move leaves behind. DiscardOld
-	// is load-bearing, not a preference: the tombstone is written by a CAS at the
-	// held record's exact sequence, and the previous DiscardNew/DiscardNewPer
-	// configuration would REJECT that replacement instead of performing it.
-	//
-	// Losing DiscardNew also removes a backstop — an unguarded plain store on a hold
-	// subject would now silently overwrite live session state rather than being
-	// refused. storeQoS2HoldCAS and storeQoS2DoneCAS are therefore the only writers
-	// of these subjects; nothing else may store here.
-	//
-	// Creation success, a create-race loss, and the pre-existing-stream path all
-	// converge on an authoritative StreamInfo re-read and validateQoS2InStream: an
-	// incompatible development stream fails initialization with recreate guidance
-	// rather than being mutated in place. Mutating it would be actively unsafe —
-	// the moment one upgraded broker flipped the stream to DiscardOld, any old
-	// broker still running the pre-move plain store would silently overwrite held
-	// records instead of getting its duplicate rejection. This is NOT a rolling
-	// broker upgrade; see docs/ARCHITECTURE.md ("Compatibility boundary").
-	{
-		cfg := &StreamConfig{
-			Name:       mqttQoS2IncomingMsgsStreamName,
-			Subjects:   []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Discard:    DiscardOld,
-			MaxMsgsPer: 1,
-			Replicas:   replicas,
-		}
-		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create QoS2 incoming messages stream for account %q: %v", accName, err)
-		}
-		si, err := jsa.lookupStream(mqttQoS2IncomingMsgsStreamName)
-		if err != nil {
-			return nil, fmt.Errorf("lookup QoS2 incoming messages stream for account %q: %v", accName, err)
-		}
-		wantReplicas := 0
-		if opts.MQTT.StreamReplicas != 0 {
-			wantReplicas = replicas
-		}
-		if verr := validateQoS2InStream(si, wantReplicas); verr != nil {
-			return nil, fmt.Errorf("QoS2 incoming messages stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required move-protocol configuration (this is not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
-				accName, verr, mqttQoS2IncomingMsgsStreamName)
-		}
-	}
-
-	// Shared-subscription QoS 2 assignment claims. A durable record per
-	// (group durable, source sequence) elects and then holds the session that owns
-	// a STARTED delivery, indefinitely and independently of any deduplication
-	// window. Kept on its own stream rather than widened onto an existing one: a
-	// NEW stream is schema-compatible with an older broker (which simply ignores
-	// it), while changing another stream's subject list is not. Note that schema
-	// compatibility is NOT protocol compatibility — an older broker serving the
-	// same shared group never reads these claims. See qos2_shared_affine.go and
-	// docs/ARCHITECTURE.md ("Compatibility boundary").
-	{
-		cfg := &StreamConfig{
-			Name:       mqttQoS2AssignStreamName,
-			Subjects:   []string{mqttQoS2AssignStreamSubjectPrefix + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Discard:    DiscardOld,
-			MaxMsgsPer: 1,
-			Replicas:   replicas,
-		}
-		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create QoS2 shared assignment stream for account %q: %v", accName, err)
-		}
-		si, err := jsa.lookupStream(mqttQoS2AssignStreamName)
-		if err != nil {
-			return nil, fmt.Errorf("lookup QoS2 shared assignment stream for account %q: %v", accName, err)
-		}
-		wantReplicas := 0
-		if opts.MQTT.StreamReplicas != 0 {
-			wantReplicas = replicas
-		}
-		if verr := validateQoS2AssignStream(si, wantReplicas); verr != nil {
-			return nil, fmt.Errorf("QoS2 shared assignment stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required configuration (see docs/ARCHITECTURE.md \"Compatibility boundary\")",
-				accName, verr, mqttQoS2AssignStreamName)
-		}
-	}
-
-	// Outbound in-flight registers. One record per started QoS 1/2 PUBLISH, keyed by
-	// the packet identifier it went out under (MaxMsgsPer:1), so an identifier
-	// survives a broker restart or a failover instead of only a same-process
-	// reconnect. Its own stream for two reasons that are not preferences: $MQTT_out
-	// is interest-retained and would keep nothing, and a per-delivery write to the
-	// session record would put every outbound QoS 1/2 message behind the record CAS.
-	// A new stream is also the schema-compatible shape — an older broker simply never
-	// reads it — though as everywhere here, schema compatibility is not protocol
-	// compatibility. See inflight_register.go.
-	{
-		cfg := &StreamConfig{
-			Name:       mqttInflightStreamName,
-			Subjects:   []string{mqttInflightStreamSubjectPrefix + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Discard:    DiscardOld,
-			MaxMsgsPer: 1,
-			Replicas:   replicas,
-		}
-		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create outbound in-flight register stream for account %q: %v", accName, err)
-		}
-		si, err := jsa.lookupStream(mqttInflightStreamName)
-		if err != nil {
-			return nil, fmt.Errorf("lookup outbound in-flight register stream for account %q: %v", accName, err)
-		}
-		wantReplicas := 0
-		if opts.MQTT.StreamReplicas != 0 {
-			wantReplicas = replicas
-		}
-		if verr := validateInflightStream(si, wantReplicas); verr != nil {
-			return nil, fmt.Errorf("outbound in-flight register stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required configuration (see docs/ARCHITECTURE.md \"Compatibility boundary\")",
-				accName, verr, mqttInflightStreamName)
-		}
-	}
-
-	// $MQTT_out carries both the pending PUBREL records and the session-affine
-	// copies of started shared-subscription QoS 2 deliveries. Its InterestPolicy
-	// retention is load-bearing in both directions: it is how a discarded session's
-	// undelivered copies disappear with its consumer, and it is why a copy must
-	// never be stored before that consumer exists (a store with no interest returns
-	// success and keeps nothing). Validate it for the same reason $MQTT_qos2in is
-	// validated — an unknown-good configuration is a startup failure, not something
-	// to accommodate.
-	{
-		si, err := lookupStream(mqttOutStreamName, "QoS2 outgoing PUBREL")
-		if err != nil {
-			return nil, err
-		}
-		if si == nil {
-			// Create the stream for the incoming QoS2 messages that have not been
-			// PUBREL-ed by the sender. NATS messages are submitted as
-			// "$MQTT.pubrel.<session hash>"
-			cfg := &StreamConfig{
-				Name:      mqttOutStreamName,
-				Subjects:  []string{mqttOutSubjectPrefix + ">"},
-				Storage:   FileStorage,
-				Retention: InterestPolicy,
-				Replicas:  replicas,
-			}
-			if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-				return nil, fmt.Errorf("create QoS2 outgoing PUBREL stream for account %q: %v", accName, err)
-			}
-			if si, err = jsa.lookupStream(mqttOutStreamName); err != nil {
-				return nil, fmt.Errorf("lookup QoS2 outgoing stream for account %q: %v", accName, err)
-			}
-		}
-		wantReplicas := 0
-		if opts.MQTT.StreamReplicas != 0 {
-			wantReplicas = replicas
-		}
-		if verr := validateOutStream(si, wantReplicas); verr != nil {
-			return nil, fmt.Errorf("QoS2 outgoing stream for account %q is not usable: %w; stop ALL brokers for this account and recreate %s with the required configuration (see docs/ARCHITECTURE.md \"Compatibility boundary\")",
-				accName, verr, mqttOutStreamName)
-		}
-	}
-
-	// This is the only case where we need "si" after lookup/create
-	needToTransfer := true
-	si, err := lookupStream(mqttRetainedMsgsStreamName, "retained messages")
-	switch {
-	case err != nil:
-		return nil, err
-
-	case si == nil:
-		// Create the stream for retained messages.
-		cfg := &StreamConfig{
-			Name:       mqttRetainedMsgsStreamName,
-			Subjects:   []string{mqttRetainedMsgsStreamSubject + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Replicas:   replicas,
-			MaxMsgsPer: 1,
-			// Honor MQTT 5.0 Message Expiry Interval for retained messages via a
-			// per-message Nats-TTL. Spec5 [3.3.2.3.3].
-			AllowMsgTTL: true,
-		}
-		// We will need "si" outside of this block.
-		si, _, err = jsa.createStream(cfg)
-		if err != nil {
-			if isErrorOtherThan(err, JSStreamNameExistErr) {
-				return nil, fmt.Errorf("create retained messages stream for account %q: %v", accName, err)
-			}
-			// Suppose we had a race and the stream was actually created by another
-			// node, we really need "si" after that, so lookup the stream again here.
-			si, err = lookupStream(mqttRetainedMsgsStreamName, "retained messages")
-			if err != nil {
-				return nil, err
-			}
-		}
-		needToTransfer = false
-
-	default:
-		needToTransfer = si.Config.MaxMsgsPer != 1
-	}
-
-	// Doing this check outside of above if/else due to possible race when
-	// creating the stream.
-	wantedSubj := mqttRetainedMsgsStreamSubject + ">"
-	if len(si.Config.Subjects) != 1 || si.Config.Subjects[0] != wantedSubj {
-		// Update only the Subjects at this stage, not MaxMsgsPer yet.
-		si.Config.Subjects = []string{wantedSubj}
-		if si, err = jsa.updateStream(&si.Config); err != nil {
-			return nil, fmt.Errorf("failed to update stream config: %w", err)
-		}
-	}
-
-	transferRMS := func() error {
-		if !needToTransfer {
-			return nil
-		}
-
-		as.transferRetainedToPerKeySubjectStream(s)
-
-		// We need another lookup to have up-to-date si.State values in order
-		// to load all retained messages.
-		si, err = lookupStream(mqttRetainedMsgsStreamName, "retained messages")
-		if err != nil {
-			return err
-		}
-		needToTransfer = false
-		return nil
-	}
-
-	// Attempt to transfer all "single subject" retained messages to new
-	// subjects. It may fail, will log its own error; ignore it the first time
-	// and proceed to updating MaxMsgsPer. Then we invoke transferRMS() again,
-	// which will get another chance to resolve the error; if not we bail there.
-	if err = transferRMS(); err != nil {
-		return nil, err
-	}
-
-	// Now, if the stream does not have MaxMsgsPer set to 1, and there are no
-	// more messages on the single $MQTT.rmsgs subject, update the stream again.
-	if si.Config.MaxMsgsPer != 1 {
-		si.Config.MaxMsgsPer = 1
-		// We will need an up-to-date si, so don't use local variable here.
-		if si, err = jsa.updateStream(&si.Config); err != nil {
-			return nil, fmt.Errorf("failed to update stream config: %w", err)
-		}
-	}
-
-	// Enable per-message TTL on a retained messages stream created before MQTT
-	// 5.0 message expiry support was added, so expiry is honored after upgrade.
-	// Degrade rather than fail (see the messages stream above); expired
-	// retained messages are still withheld from delivery, only their stored
-	// copies are not reaped.
-	if !si.Config.AllowMsgTTL {
-		si.Config.AllowMsgTTL = true
-		if nsi, err := jsa.updateStream(&si.Config); err != nil {
-			si.Config.AllowMsgTTL = false
-			as.rmsgsStreamNoTTL = true
-			s.Warnf("MQTT: unable to enable per-message TTL on retained messages stream for account %q, expired retained messages will not be reaped from storage: %v", accName, err)
-		} else {
-			si = nsi
-		}
-	}
-
-	// If we failed the first time, there is now at most one lingering message
-	// in the old subject. Try again (it will be a NO-OP if succeeded the first
-	// time).
-	if err = transferRMS(); err != nil {
-		return nil, err
-	}
-
-	// Opportunistically delete the old (legacy) consumer, from v2.10.10 and
-	// before. Ignore any errors that might arise.
-	rmLegacyDurName := mqttRetainedMsgsStreamName + "_" + jsa.id
-	jsa.deleteConsumer(mqttRetainedMsgsStreamName, rmLegacyDurName, true)
-
-	// Create a new, uniquely names consumer for retained messages for this
-	// server. The prior one will expire eventually.
-	ccfg := &CreateConsumerRequest{
-		Stream: mqttRetainedMsgsStreamName,
-		Config: ConsumerConfig{
-			Name:              mqttRetainedMsgsStreamName + "_" + nuid.Next(),
-			FilterSubject:     mqttRetainedMsgsStreamSubject + ">",
-			DeliverSubject:    rmsubj,
-			ReplayPolicy:      ReplayInstant,
-			AckPolicy:         AckNone,
-			InactiveThreshold: 5 * time.Minute,
-		},
-	}
-	if _, err := jsa.createEphemeralConsumer(ccfg); err != nil {
-		return nil, fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 	}
 
 	// Re-arm session-expiry timers, without delaying the connecting client. Then
@@ -4303,15 +3870,6 @@ func (jsa *mqttJSA) streamSubjects(streamName, filter string) (map[string]uint64
 		return nil, fmt.Errorf("stream info for %q unavailable", streamName)
 	}
 	return slr.StreamInfo.State.Subjects, nil
-}
-
-func (jsa *mqttJSA) deleteStream(name string) (bool, error) {
-	sdri, err := jsa.newRequest(mqttJSAStreamDel, fmt.Sprintf(JSApiStreamDeleteT, name), 0, nil)
-	if err != nil {
-		return false, err
-	}
-	sdr := sdri.(*JSApiStreamDeleteResponse)
-	return sdr.Success, sdr.ToError()
 }
 
 // purgeStream removes all messages in streamName matching filter (a subject,
@@ -4713,12 +4271,6 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 			resp.Error = NewJSInvalidJSONError(err)
 		}
 		out(resp)
-	case mqttJSAStreamDel:
-		var resp = &JSApiStreamDeleteResponse{}
-		if err := json.Unmarshal(msg, &resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
 	case mqttJSAStreamPurge:
 		var resp = &JSApiStreamPurgeResponse{}
 		if err := json.Unmarshal(msg, &resp); err != nil {
@@ -4746,12 +4298,6 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	case mqttJSAMsgLoad:
 		var resp = &JSApiMsgGetResponse{}
 		if err := json.Unmarshal(msg, &resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
-	case mqttJSAStreamNames:
-		var resp = &JSApiStreamNamesResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
 			resp.Error = NewJSInvalidJSONError(err)
 		}
 		out(resp)
@@ -7502,13 +7048,6 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]ui
 // servers to fail to decode the message in processRetainedMsg callback and
 // will simply ignore it, which is what we want.
 func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen int) {
-	return mqttEncodeRetainedMessageTTL(rm, true)
-}
-
-// withTTL=false skips the JetStream per-message TTL header (degraded mode: the
-// stream does not allow it); the expiry deadline header is still written so
-// delivery-side expiry keeps working.
-func mqttEncodeRetainedMessageTTL(rm *mqttRetainedMsg, withTTL bool) (natsMsg []byte, headerLen int) {
 	delRM := len(rm.Msg) == 0
 
 	// MQTT 5.0 Message Expiry Interval: for a live retained message with an
@@ -7527,9 +7066,6 @@ func mqttEncodeRetainedMessageTTL(rm *mqttRetainedMsg, withTTL bool) (natsMsg []
 			secs = 1
 		}
 		ttlStr = strconv.FormatInt(secs, 10)
-		if !withTTL {
-			ttlStr = _EMPTY_
-		}
 	}
 
 	// No need to encode the subject, we can restore it from topic.
@@ -7894,121 +7430,6 @@ func (as *mqttAccountSessionManager) notifyRetainedMsgDeleted(subject string, se
 		subj: jsa.rplyr + mqttJSARetainedMsgDel,
 		msg:  b,
 	})
-}
-
-func (as *mqttAccountSessionManager) transferUniqueSessStreamsToMuxed(log *Server) {
-	// Set retry to true, will be set to false on success.
-	retry := true
-	defer func() {
-		if retry {
-			next := mqttDefaultTransferRetry
-			log.Warnf("Failed to transfer all MQTT session streams, will try again in %v", next)
-			time.AfterFunc(next, func() { as.transferUniqueSessStreamsToMuxed(log) })
-		}
-	}()
-
-	jsa := &as.jsa
-	sni, err := jsa.newRequestEx(mqttJSAStreamNames, JSApiStreams, _EMPTY_, 0, nil)
-	if err != nil {
-		log.Errorf("Unable to transfer MQTT session streams: %v", err)
-		return
-	}
-	snames := sni.(*JSApiStreamNamesResponse)
-	if snames.Error != nil {
-		log.Errorf("Unable to transfer MQTT session streams: %v", snames.ToError())
-		return
-	}
-	var oldMQTTSessStreams []string
-	for _, sn := range snames.Streams {
-		if strings.HasPrefix(sn, mqttSessionsStreamNamePrefix) {
-			oldMQTTSessStreams = append(oldMQTTSessStreams, sn)
-		}
-	}
-	ns := len(oldMQTTSessStreams)
-	if ns == 0 {
-		// Nothing to do
-		retry = false
-		return
-	}
-	log.Noticef("Transferring %v MQTT session streams...", ns)
-	for _, sn := range oldMQTTSessStreams {
-		log.Noticef("  Transferring stream %q to %q", sn, mqttSessStreamName)
-		smsg, err := jsa.loadLastMsgFor(sn, sn)
-		if err != nil {
-			log.Errorf("   Unable to load session record: %v", err)
-			return
-		}
-		ps := &mqttPersistedSession{}
-		if err := json.Unmarshal(smsg.Data, ps); err != nil {
-			log.Warnf("    Unable to unmarshal the content of this stream, may not be a legitimate MQTT session stream, skipping")
-			continue
-		}
-		// Store record to MQTT session stream
-		if _, err := jsa.storeSessionMsg(as.domainTk, getHash(ps.ID), 0, smsg.Data); err != nil {
-			log.Errorf("    Unable to transfer the session record: %v", err)
-			return
-		}
-		jsa.deleteStream(sn)
-	}
-	log.Noticef("Transfer of %v MQTT session streams done!", ns)
-	retry = false
-}
-
-func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *Server) error {
-	jsa := &as.jsa
-	var processed int
-	var transferred int
-
-	start := time.Now()
-	deadline := start.Add(mqttRetainedTransferTimeout)
-	for {
-		// Try and look up messages on the original undivided "$MQTT.rmsgs" subject.
-		// If nothing is returned here, we assume to have migrated all old messages.
-		smsg, err := jsa.loadNextMsgFor(mqttRetainedMsgsStreamName, "$MQTT.rmsgs")
-		if IsNatsErr(err, JSNoMessageFoundErr) {
-			// We've ran out of messages to transfer, done.
-			break
-		}
-		if err != nil {
-			log.Warnf("    Unable to transfer a retained message: failed to load from '$MQTT.rmsgs': %s", err)
-			return err
-		}
-
-		// Unmarshal the message so that we can obtain the subject name. Do not
-		// use mqttDecodeRetainedMessage() here because these messages are from
-		// older versions, and contain the full JSON encoding in payload.
-		var rmsg mqttRetainedMsg
-		if err = json.Unmarshal(smsg.Data, &rmsg); err == nil {
-			// Store the message again, this time with the new per-key subject.
-			subject := mqttRetainedMsgsStreamSubject + rmsg.Subject
-			if _, err = jsa.storeMsg(subject, 0, smsg.Data); err != nil {
-				log.Errorf("    Unable to transfer the retained message with sequence %d: %v", smsg.Sequence, err)
-			}
-			transferred++
-		} else {
-			log.Warnf("    Unable to unmarshal retained message with sequence %d, skipping", smsg.Sequence)
-		}
-
-		// Delete the original message.
-		if err := jsa.deleteMsg(mqttRetainedMsgsStreamName, smsg.Sequence, true); err != nil {
-			log.Errorf("    Unable to clean up the retained message with sequence %d: %v", smsg.Sequence, err)
-			return err
-		}
-		processed++
-
-		now := time.Now()
-		if now.After(deadline) {
-			err := fmt.Errorf("timed out while transferring retained messages from '$MQTT.rmsgs' after %v, %d processed, %d successfully transferred", now.Sub(start), processed, transferred)
-			log.Noticef("%s", err.Error())
-			return err
-		}
-	}
-	if processed > 0 {
-		log.Noticef("Processed %d messages from '$MQTT.rmsgs', successfully transferred %d in %v", processed, transferred, time.Since(start))
-	} else {
-		log.Debugf("No messages found to transfer from '$MQTT.rmsgs'")
-	}
-	return nil
 }
 
 func (as *mqttAccountSessionManager) getCachedRetainedMsg(subject string) *mqttRetainedMsg {
@@ -11496,12 +10917,10 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 }
 
 // mqttStoredMsgTTL returns the JetStream per-message TTL to attach to pp's
-// stored copy: its MQTT 5.0 Message Expiry Interval, or 0 in degraded mode
-// (the messages stream refused AllowMsgTTL and would reject the header).
+// stored copy: its MQTT 5.0 Message Expiry Interval. AllowMsgTTL is a startup
+// prerequisite of the messages stream (validateMsgsStream), so there is no
+// stream that would reject the header.
 func (c *client) mqttStoredMsgTTL(pp *mqttPublish) uint32 {
-	if asm := c.mqtt.asm; asm != nil && asm.msgsStreamNoTTL {
-		return 0
-	}
 	if mqttTestSuppressMsgTTLV.Load() {
 		// Test seam. The Message Expiry Interval drives BOTH the delivery-side
 		// expiry check and this stored-copy TTL, so a message that is expired for
@@ -12151,7 +11570,7 @@ func (c *client) mqttHandlePubRetain() {
 	// Set the key to the subject of the message for retained, or the composed
 	// $sparkplug subject for sparkB.
 	rm.Subject = key
-	rmBytes, hdr := mqttEncodeRetainedMessageTTL(rm, !asm.rmsgsStreamNoTTL) // will copy the payload bytes
+	rmBytes, hdr := mqttEncodeRetainedMessage(rm) // will copy the payload bytes
 	resp, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, hdr, rmBytes)
 	if err != nil {
 		c.mu.Lock()

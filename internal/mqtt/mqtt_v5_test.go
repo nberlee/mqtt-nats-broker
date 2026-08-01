@@ -5528,93 +5528,26 @@ func TestMQTTv5MessageExpiryZeroAllProtos(t *testing.T) {
 	testMQTTExpectNothing(t, rs0)
 }
 
-// In degraded mode (the retained stream refused AllowMsgTTL) the encoded
-// retained message must omit the Nats-TTL header, which the stream would
-// reject, while keeping the expiry deadline so delivery-side expiry still
-// works.
-func TestMQTTv5RetainedMessageEncodeNoTTL(t *testing.T) {
+// An expiring retained message is encoded with BOTH the JetStream per-message
+// Nats-TTL (so the stored copy is reaped at its deadline — AllowMsgTTL is a
+// startup prerequisite of $MQTT_rmsgs, so no stream can reject the header) and
+// the absolute expiry deadline header (so delivery-side expiry can recompute
+// the remaining interval on replay). Spec5 [3.3.2.3.3].
+func TestMQTTv5RetainedMessageEncodeTTL(t *testing.T) {
 	rm := &mqttRetainedMsg{Topic: "t", Msg: []byte("m"), expires: time.Now().Add(time.Minute)}
-	full, _ := mqttEncodeRetainedMessageTTL(rm, true)
+	full, hdr := mqttEncodeRetainedMessage(rm)
 	if !bytes.Contains(full, []byte(JSMessageTTL)) {
-		t.Fatal("Expected a Nats-TTL header with withTTL=true")
+		t.Fatal("Expected a Nats-TTL header on an expiring retained message")
 	}
-	deg, hdr := mqttEncodeRetainedMessageTTL(rm, false)
-	if bytes.Contains(deg, []byte(JSMessageTTL)) {
-		t.Fatal("Expected no Nats-TTL header with withTTL=false")
+	if !bytes.Contains(full, []byte(mqttNatsRetainedMessageExpiry)) {
+		t.Fatal("Expected the expiry deadline header")
 	}
-	if !bytes.Contains(deg, []byte(mqttNatsRetainedMessageExpiry)) {
-		t.Fatal("Expected the expiry deadline header to be kept")
-	}
-	dec, err := mqttDecodeRetainedMessage(mqttRetainedMsgsStreamSubject+"t", deg[:hdr], deg[hdr:])
+	dec, err := mqttDecodeRetainedMessage(mqttRetainedMsgsStreamSubject+"t", full[:hdr], full[hdr:])
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if dec.expires.IsZero() {
 		t.Fatal("Expected the decoded message to keep its expiry deadline")
-	}
-}
-
-// In degraded mode (the messages stream refused AllowMsgTTL) a stored QoS1/2
-// PUBLISH must omit the Nats-TTL header JetStream would reject; the Message
-// Expiry properties are still stored and forwarded for delivery-side checks.
-func TestMQTTv5MessagesStreamDegradedNoTTL(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "degsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer cs.Close()
-	testMQTTReadConnAckV5(t, rs)
-	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "deg/t", opts: 1}})
-	testMQTTFlush(t, cs, nil, rs)
-
-	meiBlock := func() []byte {
-		p := newMQTTWriter(0)
-		p.WriteByte(mqttPropMessageExpiry)
-		p.WriteUint32(600)
-		b := newMQTTWriter(0)
-		b.WriteVarInt(p.Len())
-		b.Write(p.Bytes())
-		return b.Bytes()
-	}
-
-	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "degpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer cp.Close()
-	testMQTTReadConnAckV5(t, rp)
-
-	nc, js := jsClientConnect(t, s)
-	defer nc.Close()
-
-	// Normal mode: the stored copy carries the per-message TTL. Fetch it
-	// before the subscriber acks (this is an interest stream).
-	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "deg/t", []byte("m1"), meiBlock())
-	msg, err := js.GetLastMsg(mqttStreamName, "$MQTT.msgs.deg.t")
-	if err != nil {
-		t.Fatalf("get stored message: %v", err)
-	}
-	if msg.Header.Get(JSMessageTTL) == "" {
-		t.Fatal("Expected a Nats-TTL header on the stored message in normal mode")
-	}
-	testMQTTReadPubV5Props(t, cs, rs, "deg/t", []byte("m1"))
-
-	// Degraded mode, as set when enabling AllowMsgTTL on the stream failed.
-	asm := testMQTTGetAccountSessionManager(t, s, "degpub")
-	asm.msgsStreamNoTTL = true
-
-	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "deg/t", []byte("m2"), meiBlock())
-	msg, err = js.GetLastMsg(mqttStreamName, "$MQTT.msgs.deg.t")
-	if err != nil {
-		t.Fatalf("get stored message: %v", err)
-	}
-	if string(msg.Data) != "m2" {
-		t.Fatalf("Expected the degraded-mode message to be stored, got %q", msg.Data)
-	}
-	if v := msg.Header.Get(JSMessageTTL); v != "" {
-		t.Fatalf("Expected no Nats-TTL header on the stored message in degraded mode, got %q", v)
-	}
-	props := testMQTTReadPubV5Props(t, cs, rs, "deg/t", []byte("m2"))
-	if props == nil || !props.present[mqttPropMessageExpiry] {
-		t.Fatal("Expected the Message Expiry property to still be forwarded")
 	}
 }
 
