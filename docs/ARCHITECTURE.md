@@ -134,10 +134,12 @@ acceptance test so an over-strict "fix" fails:
   only exit; the latter never delete for correctness at all.
 - **`ConsumerLimits.InactiveThreshold` is fatal on `$MQTT_out` but waived on
   `$MQTT_msgs`** — plain subscriptions already run under the broker's own
-  inactive-threshold option there, and the paths that cannot tolerate a
-  stream-forced limit (the UNSUBSCRIBE drain, shared/affine consumers) refuse it
-  at **runtime**, which also covers a limit imposed after startup — a startup
-  check could not (see `docs/CONFORMANCE.md`).
+  inactive-threshold option there and are verified (or recreated) on every
+  resume (see "Plain QoS 1/2 consumer reconciliation on resume"), and the
+  paths that cannot tolerate a stream-forced limit (the UNSUBSCRIBE drain,
+  shared/affine consumers) refuse it at **runtime**, which also covers a limit
+  imposed after startup — a startup check could not (see
+  `docs/CONFORMANCE.md`).
 - **`Sources` is waived on `$MQTT_rmsgs` only** — sourcing is additive, so it is
   fatal exactly where a foreign record could occupy a protocol CAS slot, and
   cross-account retained sourcing is a supported topology.
@@ -548,6 +550,212 @@ so a superseded broker's late store collapses into it; the ordinary path
 deliberately carries none, because there the only legitimate re-store is the
 post-restart one after a redelivery, and a surviving dedupe entry would silently
 swallow it.
+
+## Plain QoS 1/2 consumer reconciliation on resume
+
+The session record persists each plain QoS 1/2 subscription's JetStream consumer
+config (`Cons`), and the CONNECT restore path used to trust it verbatim: a
+durable reaped by an inactivity threshold — the broker's own
+`consumer_inactive_threshold` or a stream-forced
+`ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, both of which reach
+consumers requesting 0 — was silently restored, and the client got Session
+Present = 1 with a subscription that never delivered again until a clean start.
+
+The fix is a dedicated resume phase (`sess_resume_reconcile.go`), run inside the
+CONNECT's accept transaction **after** register recovery (so every in-flight
+register is classified against the *old* durable names before any repair
+exists) and **before** the CONNACK (so a failure refuses the CONNECT and
+nothing has been transmitted when it fails). It is deliberately CONNECT-only:
+repairing inside SUBSCRIBE processing would make every record-write site in
+that thicket replacement-aware, and the packet's final update may legitimately
+not write at all. Placing the repair before the CONNACK makes its save the
+first record write after the accept save *by construction* — no general
+subscription-processing write can observe a half-committed replacement.
+
+The pass:
+
+1. **Collect.** Every plain (non-shared) QoS 1/2 filter's `(subject, sid)`
+   pairs from the restored subscriptions — the level-up companion of a
+   multi-level filter included, since it is an independent consumer. A QoS 1/2
+   sid with **no** `Cons` entry at all is classified *absent identity* and
+   minted here (left alone, restoration would create its consumer after the
+   CONNACK and never persist it: the restore path runs no final subscription
+   save). Filters in the reserved `$MQTT.>` namespace are excluded — restoration
+   denies and purges them, so the phase never installs interest for them. A
+   stale `Cons` entry with **no** matching subscription is not an active
+   delivery entry and is deliberately not verified (a stated residual in
+   `docs/CONFORMANCE.md`).
+2. **Subscribe everything closed, then batch-verify.** Before any lookup, a
+   **closed, flushed** delivery subscription is installed on every recorded
+   deliver subject, marked *phase-owned* — for present consumers too, because a
+   consumer that is present at lookup can be reaped a moment later (the lookup
+   does not stop the inactivity timer), and its dead recorded deliver subject
+   would then be restored: the original bug, reproduced. The flush is what
+   makes the interest authoritative before the lookup result means anything.
+   It **narrows** that window rather than closing it outright: JetStream checks
+   a consumer's activity, releases its lock, and only then performs the
+   deletion, so interest that registers after the decision cannot revoke it
+   while `ConsumerInfo` still reports the consumer present. A consumer reaped
+   inside that last gap is trusted for this connection and repaired at the next
+   CONNECT — the same disposition as any other out-of-band deletion, and a
+   bounded fraction of the original defect, which persisted until a clean
+   start.
+   Installing interest this early means JetStream immediately pushes the
+   session's whole **offline backlog** into a window in which nothing may be
+   transmitted yet, so a QoS 1/2 delivery arriving there **waits** on the
+   subscription's *phase gate* rather than being dropped: dropping it would
+   hold every queued message until AckWait (30s by default) — turning an
+   immediate resume delivery into a half-minute stall — and then re-send it
+   with DUP set on its **first** transmission to the client. Waiting keeps the
+   backlog first deliveries, in order, at adoption speed. The wait is bounded
+   by the connection's effective **AckWait** (capped by
+   `mqttPhaseGateWaitMax`), which is the deadline past which waiting buys
+   nothing because JetStream re-pushes the message anyway, and which also stops
+   a CONNECT that died without releasing — every ordinary exit releases, so
+   that means a panic — from parking a delivery goroutine. A delivery that does
+   run out its wait, or that belongs to a filter the sweep reclaims unadopted,
+   is **recorded as withheld** exactly as an in-flight-cap deferral is, so the
+   attempt that finally goes out is still marked a first transmission
+   ([MQTT-3.3.1-1]) and a freed slot can NAK it forward instead of waiting out
+   AckWait. Its position in the stream's order is not preserved, which is the
+   ordinary consequence of any redelivery and is recorded as a residual.
+   Then one bounded, batched `lookupConsumersMulti` pass resolves every
+   collected durable: **present** (the closed subscription holds its interest),
+   **absent** (authoritatively gone → repair), or **indeterminate** (a
+   transport failure or unreadable entry → **refuse the CONNECT**; a session
+   resumed with silently dead subscriptions is the bug this phase exists to
+   fix, and nothing is ever recreated over a consumer that may still exist).
+3. **Repair, under a fresh identity.** Recreation never reuses the recorded
+   durable name, because that name is an identity to two mechanisms: an
+   in-flight register naming `(dur X, seq N)` classifies *Lost* while X is
+   authoritatively absent (identifier reserved — the safe direction) but flips
+   to a false *Complete* if a new instance of X reaches `AckFloor.Stream >= N`,
+   freeing identifiers the client may still hold; and recorded `$JS.ACK`/NAK
+   subjects embed the consumer name with per-instance counters. So the repair
+   mints a fresh nuid durable and deliver subject, subscribes it closed
+   **first** (interest exists before the consumer, so the replacement cannot be
+   reaped in the create-to-subscribe gap), retires the stale charge
+   (`refundConsumerChargeLocked` — permanently: it named a consumer that no
+   longer exists, so no failure path re-adds it), creates the durable
+   `DeliverNew`, charges the replacement, and replaces the session's `cons`
+   entry. Any failure undoes exactly the phase's own work — phase subscriptions
+   removed, created durables deleted (refunded exactly once), replaced entries
+   restored **uncharged** — and refuses the CONNECT.
+4. **One repair save, still pre-CONNACK.** Ownership is revalidated by the CAS
+   at that instant — there is no lease. The two wrong-last-sequence kinds are
+   deliberately not equivalent, and the raw store error is captured at the
+   store boundary (`saveWithDetail`) because `save()`'s formatting destroys the
+   kind: **10071** (the single-writer check) means another broker wrote after
+   our accept save — the session was taken over mid-CONNECT — and is disposed
+   through `disposeForeignSessionLocked` in a DISCONNECT-suppressing mode (no
+   success CONNACK was written, so no packet may precede one). **10164**
+   (clustered contention) is a rejection, never a verdict: a bounded re-read
+   loop retries the **identical** base sequence and body bytes while the record
+   provably has not moved, adopts the landed sequence when the re-read finds
+   our exact bytes at a newer one (the response was lost to contention), turns
+   a moved record into the foreign disposition, and turns an unreadable re-read
+   into an explicitly established pending-write state — a CAS rejection is
+   definite, so `save()` deliberately does not mark it uncertain, and the phase
+   must do so itself for the deferred readback to classify anything. An
+   **ambiguous** save refuses the CONNECT with real continuations registered:
+   *not-landed* runs the phase's undo, *landed* keeps the replacements (the
+   record names them; the next resume verifies them present). Resolution is
+   necessarily deferred — the accept transaction is still open — and no traffic
+   is served meanwhile: no CONNACK was sent and every phase subscription is
+   closed.
+5. **Adopt in place.** After the CONNACK, subscription restoration reaches each
+   collected filter through `processJSConsumer`'s restore exists-branch, which
+   — on finding a phase-owned delivery subscription — refreshes the MQTT
+   metadata and clears the closed flag and the marker **on the same
+   subscription object**, under the same dual-lock write the re-SUBSCRIBE
+   refresh uses. Re-issuing it through `processSub` would unsubscribe the old
+   subscription and install a new one, putting a no-interest gap right back
+   into the flow — the exact stream-forced inactivity race the subscribe-first
+   rule closes. The phase gate is released last, in the same critical section,
+   so every delivery parked on it wakes, re-reads the fields just written, and
+   goes out under this filter's live options.
+6. **Sweep what restoration did not adopt.** Restoration can legitimately skip
+   a collected filter after the CONNACK (a PUBREL setup failure fails a QoS 2
+   filter; a raw-subscription failure continues) while the connection stays
+   live — and nothing else would ever remove that subscription: it would sit
+   closed forever, holding consumer interest, and a later re-SUBSCRIBE's
+   metadata refresh does not clear `closed`. So still-phase-owned
+   subscriptions are swept immediately after `processSubs` (before its error
+   is even tested), and an idempotent deferred fallback covers the exits that
+   never reach it (the CONNACK write failure, the 3.1.1 forced-leave failure
+   returns). Every reclamation path — the sweep and the phase's own undo —
+   releases the gate **before** unsubscribing, so a parked delivery wakes,
+   finds the subscription still closed, and skips instead of waiting out the
+   bound. A swept filter stays unavailable until the next CONNECT.
+
+**Pre-CONNACK abort discipline.** Every post-bind failure exit before a
+confirmed success CONNACK — the register-recovery error, the reconciliation
+refusals, the lifetime-grant failure below, the CONNACK size/write failure
+(`sendConnAck` now surfaces its write error, so "a success CONNACK was written"
+is a checked fact) — goes through one abort helper that discards this
+connection's Will and clears the parser's pre-CONNACK connected flag. Without
+it, the readLoop would send a v5 DISCONNECT as the **first** packet
+([MQTT-3.2.0-1]) and close handling could publish the new connection's Will for
+a session that was never granted. The helper deliberately preserves
+`c.mqtt.sess`/`c.mqtt.cp`: for a **local** refusal the ordinary close
+bookkeeping must still run — it is what detaches the client and
+persists/schedules the expiry.
+
+**The requested lifetime is applied only when the resume is granted.** A
+resuming CONNECT does **not** overwrite the session's Session Expiry Interval or
+Clean flag at rebind, because the accept save that follows would persist them —
+and this CONNECT can still be refused. A record describing terms the client was
+never told it has is not harmless: with a requested interval of 0 the close path
+would discard a persistent session outright (`doClean`), and the client's retry
+would find Session Present 0 with its state gone. So the accept save carries the
+lifetime the session already had, which is truthful until something is granted,
+and the requested values are applied — and persisted, in the same breath — at
+the **grant point**, once everything that could refuse the CONNECT has passed
+and immediately before the CONNACK. The write happens only when the terms
+actually changed, so an ordinary reconnect adds none, and it owes the ordinary
+outcome discipline (`grantRequestedLifetime`): a definite failure puts the two
+fields back; an ambiguous one puts them back **immediately** and re-applies the
+grant only once a readback proves the write landed — because a close happening
+while the write is unresolved snapshots the lifetime into its deferred
+teardown, so speculative terms there would let a grant that never landed
+discard the session, and the landed continuation correspondingly retargets that
+snapshot; a 10071 hands the session to the broker that now owns it, with 10164
+resolved by the same bounded re-read the repair save uses. A resume
+refused before this point therefore leaves the session exactly as it found it,
+in memory and in the record, with no repair machinery at all. A session that
+was CLEARED rather than resumed — clean start, a legacy clean session, an
+overdue record — takes the requested terms at rebind instead: it has no prior
+lifetime to protect and its record is created fresh by the accept save.
+
+**Crash windows.** A crash after a create but before the repair save leaves a
+durable with a closed subscription that never transmitted and that no record
+names: the next resume repairs again, and the orphan sweep reclaims the
+abandoned durable after its grace (the sweep's `Created`-age guard covers the
+in-flight construction window). A crash after the confirmed save but before
+the CONNACK leaves the record naming the new durable; the next resume verifies
+it present. A cross-broker takeover between the accept save and the repair
+save CAS-rejects definitively (the later broker accepted *on top of* our
+accept sequence) — our consumer never transmitted and is swept; the winner's
+own resume verified whatever record it read. Register identity is invariant
+throughout: recovery precedes the phase in the same CONNECT, and the old name
+stays absent forever, so *Lost* verdicts stay *Lost*.
+
+**Why re-SUBSCRIBE needs no verification.** After this phase, every `cons`
+entry on a live connection was verified or repaired at its CONNECT — an
+indeterminate verification refused the CONNECT, so no connection carries an
+unverified entry — and a successfully adopted filter's consumer cannot be
+inactivity-reaped mid-connection, because its delivery subscription holds
+interest. The qualification matters: a filter restoration skipped (and the
+sweep reclaimed) holds no interest and stays unavailable until the next
+CONNECT — a live re-SUBSCRIBE cannot recover it, because the exists-branch
+never recreates missing interest. Live re-SUBSCRIBE is **not** a recovery
+mechanism; the recovery for anything that slips through is to reconnect. Drain
+adoption is untouched: a re-SUBSCRIBE that adopts a drain whose durable was
+reaped inherits a dead entry — as today — and the **next CONNECT** repairs it
+(the adopted entry is back in `cons` and its filter in the subscriptions),
+while `recoverDrains` keeps owning drain-side loss reporting. Both stated in
+`docs/CONFORMANCE.md`, together with the delivery-start policy: a replacement
+is `DeliverNew`, and no backlog is guaranteed recoverable across a reap.
 
 ## Outbound in-flight registers
 

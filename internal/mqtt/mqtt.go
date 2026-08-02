@@ -407,7 +407,30 @@ var (
 	// shorten it; the orphan QoS 2 sweep additionally supports an instance-scoped
 	// override, because it is read by a goroutine a test cannot synchronize with.
 	mqttOrphanSweepGrace = 5 * time.Minute
+	// Ceiling on how long a QoS 1/2 delivery waits for the resume reconciliation
+	// phase to release its subscription. The effective bound is the consumer's
+	// AckWait (mqttPhaseGateWaitFor): waiting past it buys nothing, because
+	// JetStream re-pushes the message at exactly that point anyway. The bound
+	// exists so a CONNECT that dies without releasing — every ordinary exit
+	// releases, so that means a panic — cannot park a delivery goroutine
+	// indefinitely. A var so tests can shorten it. See mqttSub.phaseGate.
+	mqttPhaseGateWaitMax = 30 * time.Second
 )
+
+// mqttPhaseGateWaitFor is how long a delivery waits on a reconciliation phase
+// gate: the connection's effective AckWait, capped at mqttPhaseGateWaitMax.
+// Tying it to AckWait is what keeps the wait from changing the outcome — at
+// that deadline JetStream redelivers regardless, and the skipped attempt is
+// recorded so the redelivery is still the client's first transmission.
+func mqttPhaseGateWaitFor(c *client) time.Duration {
+	wait := mqttDefaultAckWait
+	if c != nil && c.srv != nil {
+		if aw := c.srv.getOpts().MQTT.AckWait; aw > 0 {
+			wait = aw
+		}
+	}
+	return min(wait, mqttPhaseGateWaitMax)
+}
 
 // How often to re-run the session-expiry sweep for an account.
 //
@@ -795,6 +818,25 @@ type mqttAccountSessionManager struct {
 	// the resume open until a fresh delivery has certainly landed in the pending
 	// map, which is the window in which a NAK would duplicate it. Nil in production.
 	testBeforeResumeNaks func(clientID string)
+
+	// testResumeReconcileLookup, when non-nil, replaces the resume reconciliation
+	// phase's consumer lookup for THIS account manager only (instance-scoped).
+	// Set/read under mu. It is what lets a test fail (or delay) a chosen batch of
+	// a REAL CONNECT deterministically — the batching helper's function parameter
+	// alone would leave the CONNECT path hardwired. Nil in production. See
+	// reconcileResumedConsumers.
+	testResumeReconcileLookup func(durables []string) ([]*ConsumerInfo, []bool, error)
+
+	// testResumeReconcilePreCreate, when non-nil, is invoked by the resume
+	// reconciliation phase for THIS account manager only (instance-scoped)
+	// immediately before it creates a replacement durable, with the deliver
+	// subject the flushed subscription was installed on. Returning a non-nil
+	// error rejects the create WITHOUT issuing it — the same failure surface as
+	// a JetStream rejection. Set/read under mu. It is the seam that pins
+	// subscribe-BEFORE-create as an ordering assertion rather than a race
+	// against the reaper, and the lever for a forced repair failure. Nil in
+	// production.
+	testResumeReconcilePreCreate func(sess *mqttSession, deliver string) error
 
 	// testReconcilePause, when non-nil, is invoked by a remote-expiry reconciliation
 	// worker for THIS account manager only (instance-scoped) AFTER it has loaded the
@@ -1475,6 +1517,30 @@ type mqttSub struct {
 	// it. Guarded like qos/jsDur (sess.mu or sess.subsMu). Unlike clearing
 	// sub.mqtt, this keeps the struct valid for an in-flight enqueue.
 	closed bool
+
+	// phaseOwned marks a delivery subscription installed CLOSED by the resume
+	// reconciliation phase and not yet adopted by subscription restoration.
+	// Restoration adopts it IN PLACE (clearing closed and this marker together,
+	// so interest never lapses); a marker still standing after processSubs means
+	// restoration skipped the filter and the sweep must reclaim the
+	// subscription, or it would hold consumer interest forever while delivering
+	// nothing. Guarded like closed. See sess_resume_reconcile.go.
+	phaseOwned bool
+
+	// phaseGate is closed when the reconciliation phase releases this
+	// subscription — adopted by restoration, or reclaimed by the sweep/undo. A
+	// QoS 1/2 delivery that arrives while it is still open WAITS for it rather
+	// than being skipped: the interest is installed before the CONNACK, so
+	// JetStream pushes the session's whole offline backlog into that window, and
+	// skipping it would hold every one of those messages until AckWait (30s by
+	// default) — turning an immediate resume delivery into a half-minute stall —
+	// and then re-send them with DUP set, on their FIRST transmission to the
+	// client. Waiting keeps them first deliveries, in order, at adoption speed.
+	// Bounded by mqttPhaseGateWait so a CONNECT that dies without releasing
+	// cannot park a delivery goroutine; past it the delivery falls back to the
+	// closed-subscription skip and AckWait. nil once released (and on every
+	// subscription the phase did not install). Guarded like closed.
+	phaseGate chan struct{}
 
 	// Pending serialization of retained messages to be sent when subscription
 	// is registered. The sub's delivery callbacks must wait until `prm` is
@@ -2814,12 +2880,48 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 	asm.beforeTeardownLock(sess.id)
 
 	// Add this session to the locked map for the rest of the execution.
-	if err := asm.lockSessionForTeardown(sess, c); err != nil {
-		// The session now belongs to another connection, so none of the teardown
-		// below is ours to do — but an owed Will still has to be discharged, and
-		// nothing else will do it. See mqttPublishOwedWill.
-		s.mqttPublishOwedWill(c, asm)
-		return
+	//
+	// A failed acquisition is CLASSIFIED, never assumed: lockSession fails both
+	// for a rebind (a takeover owns everything below) and for plain contention —
+	// and an uncertain-write resolver now holds this gate across a JetStream
+	// readback, which can outlast the bounded retry. Reading that as a takeover
+	// silently dropped the whole teardown of a session that was still ours: no
+	// detach, no persisted disconnect time, no expiry, no Will. So while this
+	// connection is still the owner, contention parks the teardown when the
+	// session is unresolved — exactly what winning the gate would have done, and
+	// the resolver holding it discharges the parked action before releasing —
+	// and otherwise simply keeps trying: every holder is bounded (a CONNECT
+	// rebinds early, flipping the owner check; resolvers are bounded by their
+	// JetStream timeouts), so the loop terminates.
+	for {
+		err := asm.lockSessionForTeardown(sess, c)
+		if err == nil {
+			break
+		}
+		sess.mu.Lock()
+		stillOurs := sess.c == c
+		sess.mu.Unlock()
+		if !stillOurs {
+			// The session now belongs to another connection, so none of the
+			// teardown below is ours to do — but an owed Will still has to be
+			// discharged, and nothing else will do it. See mqttPublishOwedWill.
+			s.mqttPublishOwedWill(c, asm)
+			return
+		}
+		// Still ours and possibly unresolved: the holder is (or is about to be)
+		// a resolver. Park the obligations with their original deadlines, as the
+		// gated path below would; resolution discharges them. Parking needs no
+		// gate — it only writes session memory — but it must be ATOMIC with the
+		// uncertainty check: the gate-holding resolver can clear the uncertainty
+		// and run its final discharge scan at any instant, and an action parked
+		// after that scan would be stranded forever. deferDisconnectIfUncertain
+		// makes check and park one critical section; a refusal because the
+		// session resolved meanwhile falls through to retaking the gate (the
+		// resolver is finishing), with the Will restored for the ordinary
+		// teardown that follows.
+		if s.mqttDeferDisconnectEx(c, asm, sess, true) {
+			return
+		}
 	}
 	defer asm.unlockSession(sess)
 
@@ -5853,14 +5955,23 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	}
 
 	// Small helper to add the consumer config to the session.
+	//
+	// Under sess.mu, like every other writer of cons: the map is read under that
+	// lock by paths that run concurrently with a SUBSCRIBE or a CONNECT restore
+	// — the orphan sweep, the record builder, the resume reconciliation phase —
+	// so an unlocked write here is a data race on session state, not merely a
+	// stale read. Never called with the lock already held (the two call sites sit
+	// between the per-filter processSub calls, which take it internally).
 	addJSConsToSess := func(sid string, cc *ConsumerConfig) {
 		if cc == nil {
 			return
 		}
+		sess.mu.Lock()
 		if sess.cons == nil {
 			sess.cons = make(map[string]*ConsumerConfig)
 		}
 		sess.cons[sid] = cc
+		sess.mu.Unlock()
 	}
 
 	// Snapshot pre-SUBSCRIBE membership AND consumer entries so a final-save
@@ -7643,15 +7754,45 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 //
 // Lock not held on entry.
 func (sess *mqttSession) save(tok recordTx) error {
+	_, err := sess.saveWithDetail(tok)
+	return err
+}
+
+// mqttSessSaveDetail is the raw identity of one attempted record write: the CAS
+// base sequence, the exact bytes (body for the digest a readback compares,
+// framed for a byte-identical retry), and the store-boundary error with its
+// TYPE intact. It exists because save() re-formats the store error with %v,
+// destroying the CAS kind — and 10071 (taken over) versus 10164 (clustered
+// contention) demand opposite dispositions, so a caller that must turn the
+// rejection into a DECISION captures it here, at the boundary, rather than
+// parsing it back out of a string. See sess_resume_reconcile.go.
+type mqttSessSaveDetail struct {
+	baseSeq  uint64
+	body     []byte // the record bytes a readback returns (digest identity)
+	framed   []byte // CAS header + body, exactly as sent (for an identical retry)
+	hdr      int
+	domainTk string
+	cidHash  string
+	rawErr   error // the store-boundary error, type preserved; nil on success
+}
+
+// saveWithDetail is save()'s body; it additionally returns the attempted
+// write's raw identity so a caller can classify a definite CAS rejection by
+// kind and retry (or read back) the exact bytes it sent. The returned error is
+// unchanged from save()'s.
+//
+// Lock not held on entry.
+func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error) {
+	var detail mqttSessSaveDetail
 	if h := mqttTestSessSaveHookV.Load(); h != nil {
 		if err := (*h)(sess); err != nil {
-			return err
+			return detail, err
 		}
 	}
 	sess.mu.Lock()
 	if err := sess.validateRecordTxLocked(tok); err != nil {
 		sess.mu.Unlock()
-		return fmt.Errorf("refusing to persist session %q: %w", sess.id, err)
+		return detail, fmt.Errorf("refusing to persist session %q: %w", sess.id, err)
 	}
 	// An unresolved earlier write means sess.seq may be stale, so this CAS would be
 	// meaningless: it could fail against a record that is in fact ours, or — worse,
@@ -7659,7 +7800,7 @@ func (sess *mqttSession) save(tok recordTx) error {
 	// readback has classified it. See sess_uncertain.go.
 	if sess.seqUncertain {
 		sess.mu.Unlock()
-		return fmt.Errorf("refusing to persist session %q: an earlier record write is unresolved", sess.id)
+		return detail, fmt.Errorf("refusing to persist session %q: an earlier record write is unresolved", sess.id)
 	}
 	ps := sess.buildPersistedSessionLocked()
 	// body is what a readback returns (the CAS header below is a message header,
@@ -7685,12 +7826,17 @@ func (sess *mqttSession) save(tok recordTx) error {
 		bb.Write(b)
 		b = bb.Bytes()
 	}
+	detail = mqttSessSaveDetail{
+		baseSeq: seq, body: body, framed: b, hdr: hdr,
+		domainTk: domainTk, cidHash: cidHash,
+	}
 
 	resp, err := sess.jsa.storeSessionMsg(domainTk, cidHash, hdr, b)
 	if h := mqttTestSessStoreResultHookV.Load(); h != nil {
 		resp, err = (*h)(sess, resp, err)
 	}
 	if err != nil {
+		detail.rawErr = err
 		// A rejected CAS is CERTAIN: nothing was stored, so sess.seq is still right
 		// and the session stays usable. Anything else (a timeout, a lost response)
 		// leaves an outcome nobody can name, and a stale sess.seq would otherwise
@@ -7701,12 +7847,12 @@ func (sess *mqttSession) save(tok recordTx) error {
 			sess.markWriteUncertainLocked(seq, body)
 			sess.mu.Unlock()
 		}
-		return fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
+		return detail, fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
 	}
 	sess.mu.Lock()
 	sess.seq = resp.Sequence
 	sess.mu.Unlock()
-	return nil
+	return detail, nil
 }
 
 // Clear the session: discard everything one session incarnation owns and remove
@@ -8637,10 +8783,18 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	inflightPubRel := len(sess.pendingPubRel)
 	// Deferred (withheld, never transmitted) deliveries from before the
 	// disconnect should not wait an AckWait either; drain them here too.
+	//
+	// The entry is NAK'd but KEPT: it is the only record that this message has
+	// never been on the wire, and the NAK's own redelivery arrives with a
+	// JetStream delivery count above one, so dropping it here would mark that
+	// delivery DUP on the client's FIRST sight of it — the very property this
+	// mechanism is documented to preserve ([MQTT-3.3.1-1]; see the prompt-release
+	// note in docs/CONFORMANCE.md). trackPublish removes the entry when the
+	// message actually goes out, which is the point at which it stops being
+	// never-transmitted; a re-send after that is a genuine DUP.
 	deferredNaks := make([]pendingNak, 0, len(sess.deferred))
 	for k, subj := range sess.deferred {
 		deferredNaks = append(deferredNaks, pendingNak{0, k.sseq, subj, k.jsDur})
-		delete(sess.deferred, k)
 	}
 	sess.mu.Unlock()
 
@@ -9201,7 +9355,11 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		if sent && trace {
 			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
 		}
-		return sent
+		// The write error is part of the verdict: "a success CONNACK was written"
+		// must be a checked fact, because every post-bind failure path decides its
+		// abort discipline by exactly that. A failed write closed the socket, so
+		// nothing was acknowledged.
+		return sent && werr == nil
 	}
 
 	c.mu.Lock()
@@ -9444,8 +9602,23 @@ CHECK:
 		es.mu.Lock()
 		ec := es.c
 		es.c = c
-		es.clean = sessClean
-		es.expiryInterval = expiry
+		// The requested Session Expiry Interval and Clean flag are NOT applied
+		// here. This CONNECT has not been granted yet — the reconciliation phase
+		// below can still refuse it — and the accept save a few lines down would
+		// persist them regardless, leaving the record describing a session the
+		// client was never told it has: with a requested interval of 0 the close
+		// path would then discard a persistent session outright (doClean). They
+		// are applied, and persisted, at the grant point below instead, so a
+		// refused resume changes no lifetime and has nothing to repair.
+		// Spec5 [3.1.2.11.2].
+		// A session that was CLEARED just above is not being resumed: it has no
+		// prior lifetime worth protecting, clear() does not reset these two
+		// fields, and the accept save below is about to create its record from
+		// scratch. So it takes the requested terms immediately; only a genuine
+		// RESUME defers them to the grant point.
+		if !sessp {
+			es.clean, es.expiryInterval = sessClean, expiry
+		}
 		es.disconnectedAt = 0
 		// Clear these flags so we resubscribe to the PUBREL and session-affine QoS 2
 		// delivery subjects if needed: both subscriptions belonged to the previous
@@ -9611,18 +9784,96 @@ CHECK:
 	// durable's interest, the identifier space is a single shared resource and half of
 	// it cannot be used safely. Only reads JetStream and writes session memory, so it
 	// takes no record transaction and is safe inside the accept transaction.
+	//
+	// From here to the success CONNACK, every failure exit goes through
+	// abortAcceptedResume: the client is bound with connectReceived set and its
+	// CONNECT (Will included) installed, so a bare error return would have the
+	// readLoop send a v5 DISCONNECT as the FIRST packet ([MQTT-3.2.0-1]) and
+	// close handling could publish the NEW connection's Will for a session that
+	// was never granted. See sess_resume_reconcile.go.
+	//
+	// It also puts back the session lifetime this CONNECT overwrote. The accept
+	// save has already persisted the requested interval, but the resume was
+	// never acknowledged, so the client cannot know its session was touched —
+	// and a requested interval of 0 would otherwise have the close path discard
+	// a persistent session outright (doClean in mqttHandleClosedClient), after
+	// which the client's retry gets Session Present 0 and the state is gone. The
+	// close path re-persists the restored interval, so memory and record
+	// converge. Spec5 [3.1.2.11.2].
+	// foreign says the session has been disposed of because another owner holds
+	// it: nothing about it may be restored, re-saved or re-armed here.
+	// A refused resume needs no lifetime repair: the requested interval and Clean
+	// flag are not applied until the grant point below, so the session still
+	// holds — and its record still describes — the lifetime it had when this
+	// CONNECT arrived.
+	abortAcceptedResume := func(bool) {
+		c.mqttAbortAcceptedConnect()
+	}
 	if sessp {
 		if err := es.recoverInflightRegisters(c); err != nil {
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, err)
+			abortAcceptedResume(false)
+			return formatError(err)
+		}
+	}
+
+	// Reconcile the plain QoS 1/2 durables the record names BEFORE the CONNACK:
+	// a durable reaped by an inactivity threshold must be repaired (under a
+	// fresh identity) or the CONNECT refused — never silently trusted into a
+	// subscription that will not deliver. After register recovery, so every
+	// in-flight register is classified against the OLD durable names before any
+	// repair exists; before the CONNACK, so a failure refuses the CONNECT and
+	// nothing has been transmitted when it fails. The repair save is, by
+	// construction, the first record write after the accept save. See
+	// sess_resume_reconcile.go.
+	//
+	// The phase's subscriptions are installed CLOSED and phase-owned;
+	// restoration below adopts them in place. The sweep of whatever restoration
+	// did not adopt has an owner on EVERY exit: it always runs right after
+	// processSubs (before its error is even tested), and the deferred fallback
+	// covers the exits that never reach it (the CONNACK failure and the 3.1.1
+	// forced-leave failure returns). Idempotent, so the double run is harmless.
+	var phaseSubs []string
+	if sessp {
+		installed, verdict, rerr := asm.reconcileResumedConsumers(es, c, acceptTok)
+		if verdict != mqttReconcileProceed {
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+			abortAcceptedResume(verdict == mqttReconcileRefuseForeign)
+			return formatError(rerr)
+		}
+		phaseSubs = installed
+		if len(phaseSubs) > 0 {
+			defer es.sweepUnadoptedPhaseSubs(c, phaseSubs)
+		}
+	}
+
+	// GRANT the requested Session Expiry Interval and Clean flag. Everything that
+	// could refuse this CONNECT has now passed, so this is the first moment the
+	// session may take on what the client asked for — and it is persisted here
+	// too, because the accept save deliberately carried the OLD lifetime and a
+	// session whose record disagrees with its memory would be resumed, or
+	// expired, on the wrong terms after a restart. Only when something actually
+	// changed: an ordinary reconnect that keeps its interval writes nothing.
+	//
+	// A failure refuses the CONNECT and puts the two fields back. Nothing else
+	// needs unwinding, because the record was never made to describe the new
+	// lifetime — which is precisely what the earlier restore-after-the-fact
+	// machinery existed to repair. Spec5 [3.1.2.11.2].
+	if sessp {
+		if err := es.grantRequestedLifetime(asm, c, acceptTok, expiry, sessClean); err != nil {
+			c.Errorf("MQTT: refusing to resume session %q: could not grant the requested session lifetime: %v", cid, err)
+			abortAcceptedResume(false)
 			return formatError(err)
 		}
 	}
 
 	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.
 	// The entry fit check used the identical frame builder and captured values, so
-	// this send is guaranteed to fit; the guard is defensive.
+	// this send is guaranteed to fit; the guard is defensive — but the WRITE can
+	// still fail, and an unacknowledged session must not proceed as accepted.
 	if !sendConnAck(mqttConnAckRCConnectionAccepted, sessp, _EMPTY_) {
-		return fmt.Errorf("CONNACK exceeds client maximum packet size")
+		abortAcceptedResume(false)
+		return fmt.Errorf("unable to deliver the success CONNACK")
 	}
 
 	// A resuming MQTT 3.1.1 client cannot express, observe, or UNSUBSCRIBE a
@@ -9759,8 +10010,20 @@ CHECK:
 				filters = append(filters, &mqttFilter{shared: true, group: group, filter: subject, qos: qos, retainAsPublished: rap, subID: es.subIDs[key]})
 			}
 		}
-		if _, err := asm.processSubs(es, c, acceptTok, filters, false, trace); err != nil {
-			return err
+		_, serr := asm.processSubs(es, c, acceptTok, filters, false, trace)
+		// The sweep runs BEFORE the error is tested: a subscription restoration
+		// skipped stays closed and phase-owned, holding consumer interest while
+		// delivering nothing, and nothing later would remove it — the connection
+		// stays live and a re-SUBSCRIBE's metadata refresh does not clear
+		// `closed`. (On this restore path per-filter failures all continue rather
+		// than harden the return, and the hard exits are fromSubProto-only, but
+		// the sweep's promise must not be path-dependent.) The deferred fallback
+		// above stays armed for the exits that never reach here.
+		if len(phaseSubs) > 0 {
+			es.sweepUnadoptedPhaseSubs(c, phaseSubs)
+		}
+		if serr != nil {
+			return serr
 		}
 	}
 	// The CONNECT's record transaction ends HERE, before the resume work below.
@@ -12557,7 +12820,56 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// track of pending acks, etc. There is no need to acquire the subsMu RLock
 	// since sess.Lock is overarching for modifying subscriptions.
 	sess.mu.Lock()
+	// A resume-reconciliation subscription holds its consumer's interest before
+	// the CONNACK, so JetStream pushes the session's offline backlog into a
+	// window in which nothing may be transmitted yet. WAIT for the phase to
+	// release it rather than skipping: these are first transmissions, and
+	// skipping them would stall each until AckWait and then mark it DUP. The
+	// lock is released while waiting — the releasing goroutine needs it — and
+	// every check below is re-evaluated afterwards. See sess_resume_reconcile.go.
+	if sub.mqtt != nil && sub.mqtt.phaseGate != nil {
+		gate := sub.mqtt.phaseGate
+		sess.mu.Unlock()
+		timer := time.NewTimer(mqttPhaseGateWaitFor(cc))
+		select {
+		case <-gate:
+		case <-timer.C:
+		}
+		timer.Stop()
+		sess.mu.Lock()
+	}
 	if sess.c != cc || sub.mqtt == nil || sub.mqtt.closed {
+		// A delivery the phase never released — the wait ran out, or the filter
+		// was reclaimed unadopted — was NEVER TRANSMITTED, so its redelivery is a
+		// first send however many attempts JetStream has counted. Record it the
+		// way an in-flight-cap withholding is recorded, which is what makes
+		// trackPublish clear DUP on the attempt that finally goes out
+		// [MQTT-3.3.1-1] (and lets a freed slot NAK it forward rather than
+		// waiting out AckWait). Only for a phase-owned subscription: an ordinary
+		// closed one was torn down (a QoS downgrade, an UNSUBSCRIBE) and its
+		// messages are not owed to this client at all.
+		// sess.c == nil is the refused-CONNECT case: the connection was detached
+		// before this delivery woke, and the message is still owed to the SESSION,
+		// so the marker belongs to it. A session rebound to a DIFFERENT client is
+		// that connection's to account for, not this stale callback's.
+		//
+		// The nil arm covers a RACE, not a state a test can schedule: a refusal
+		// releases the gates and then detaches, microseconds apart, so whether a
+		// woken delivery sees the client or nil depends on which goroutine takes
+		// sess.mu first. A mutation removing it therefore SURVIVES — the honest
+		// signal that this is defensive breadth rather than a pinned behavior;
+		// without it, the deliveries that lose that race are the ones whose
+		// redelivery reaches the client wrongly marked DUP. Same posture as the
+		// stale-attempt re-validation in sess_uncertain.go.
+		if (sess.c == cc || sess.c == nil) && sub.mqtt != nil && sub.mqtt.phaseOwned && sub.mqtt.jsDur != _EMPTY_ {
+			sseq, _, _, _, _ := ackReplyInfo(reply)
+			if sseq > 0 {
+				if sess.deferred == nil {
+					sess.deferred = make(map[mqttDeferredKey]string)
+				}
+				sess.deferred[mqttDeferredKey{sub.mqtt.jsDur, sseq}] = reply
+			}
+		}
 		sess.mu.Unlock()
 		return
 	}
@@ -13527,6 +13839,44 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 				sess.mu.Unlock()
 			}
 			return nil, nil, nil, nil
+		}
+		// CONNECT restore of an entry the resume reconciliation phase already
+		// verified (or repaired): its delivery subscription was installed CLOSED
+		// and phase-owned, and it is adopted IN PLACE — metadata refreshed and the
+		// gate opened under the same dual-lock write the re-SUBSCRIBE refresh
+		// uses, on the SAME subscription object. Re-issuing it through processSub
+		// would unsubscribe the old subscription and install a new one, putting a
+		// no-interest gap right back into the flow — the exact stream-forced
+		// inactivity race the phase's subscribe-first rule closes. Deliveries that
+		// arrived while closed were skipped unacked; AckWait redelivers them now.
+		// See sess_resume_reconcile.go.
+		c.mu.Lock()
+		phaseSub := c.subs[cc.DeliverSubject]
+		c.mu.Unlock()
+		if phaseSub != nil {
+			adopted := false
+			sess.mu.Lock()
+			sess.subsMu.Lock()
+			if phaseSub.mqtt != nil && phaseSub.mqtt.phaseOwned {
+				phaseSub.mqtt.qos = qos
+				phaseSub.mqtt.noLocal = noLocal
+				phaseSub.mqtt.retainAsPublished = retainAsPublished
+				phaseSub.mqtt.subID = subID
+				phaseSub.mqtt.closed = false
+				phaseSub.mqtt.phaseOwned = false
+				// Released LAST, in the same critical section: a delivery waiting
+				// on the gate re-reads every field above once it wakes, so the
+				// backlog JetStream pushed before the CONNACK is delivered as the
+				// first transmission it is, in order, with this filter's live
+				// options. See mqttSub.phaseGate.
+				mqttReleasePhaseGateLocked(phaseSub)
+				adopted = true
+			}
+			sess.subsMu.Unlock()
+			sess.mu.Unlock()
+			if adopted {
+				return cc, phaseSub, nil, nil
+			}
 		}
 	}
 	// Here it means we don't have a JS consumer and if we are QoS 0,

@@ -797,24 +797,61 @@ is fixed before feature work continues.
   stream splits a mixed fleet and recovery is stop-all, per the
   `$MQTT_qos2in` precedent. See "Stream prerequisites" in
   `docs/ARCHITECTURE.md`.
-- [ ] Verify (or recreate) plain QoS 1/2 durables on session resume instead of
+- [x] Verify (or recreate) plain QoS 1/2 durables on session resume instead of
   trusting the persisted record. Found by the stream-prerequisite audit's
   review (round 3): a plain subscription's durable reaped by an inactivity
   threshold — the broker's own `consumer_inactive_threshold` option or a
   stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, both of
-  which reach consumers that request 0 (`server/consumer.go:658-668`) — is
-  silently trusted on resume: `processJSConsumer`'s exists-branch skips
-  creation and only re-subscribes the recorded deliver subject, and a
-  re-SUBSCRIBE to the same filter returns early on the same `sess.cons` entry,
-  so the subscription is dead until a clean start. The affine QoS 2 consumer
-  already solves this — `q2AffReady` stays false until the real consumer is
-  create-or-update verified on resume — so the fix has a template. This is a
-  pre-existing gap of inactivity-threshold reaping generally, NOT introduced
-  by the audit (the audit's `$MQTT_msgs` waiver keeps the drain/shared runtime
-  refusals as the authority per this section's earlier drain bullet); it needs
-  its own design pass because blind create-or-update on resume changes
-  delivery-start semantics (`DeliverNew` from "now") and interacts with the
-  consumer charge accounting (`refundConsumerChargeLocked`).
+  which reach consumers that request 0 (`server/consumer.go:658-668`) — was
+  silently trusted on resume, so the subscription was dead until a clean
+  start. DONE (2026-08-01, 15 plan-review rounds): a dedicated pre-CONNACK
+  resume phase (`sess_resume_reconcile.go`) collects every plain QoS 1/2 sid
+  (level-up companions and absent-identity minting included), installs
+  closed, flushed, phase-owned delivery subscriptions **before** the bounded
+  batched verification (interest-before-lookup closes the present-consumer
+  TOCTOU), repairs authoritative absence under a **fresh identity** (never
+  the recorded name — a same-name recreation flips *Lost* registers to false
+  *Complete* via the ack floor and reanimates stale ack/NAK subjects;
+  subscribe-first; stale charge permanently retired), and persists the
+  repaired identity in one save that is the first record write after the
+  accept save by construction — 10071 is foreign
+  (`disposeForeignSessionLocked`, DISCONNECT suppressed pre-CONNACK), 10164
+  gets a bounded same-base/same-body re-read-and-retry with sequence
+  adoption, ambiguity refuses with both continuations registered.
+  Restoration adopts the phase's subscriptions **in place**
+  (`processJSConsumer` restore exists-branch); a post-`processSubs` sweep
+  plus a deferred fallback reclaims whatever restoration skipped. Every
+  pre-CONNACK refusal goes through `mqttAbortAcceptedConnect` (no Will, no
+  pre-CONNACK DISCONNECT; `sendConnAck` now surfaces its write error). The
+  scope is deliberately **CONNECT-only** (user-directed after review rounds
+  3-7 dismantled every repair-inside-SUBSCRIBE design against the
+  `processSubs` write surface): live re-SUBSCRIBE is not a recovery
+  mechanism, and broader re-SUBSCRIBE repair is a possible follow-up, not an
+  omission. Residuals stated in `docs/CONFORMANCE.md` (no guaranteed backlog
+  across a reap; loss surfaces as reserved identifiers, never completion;
+  indeterminate verification refuses the CONNECT; mid-connection out-of-band
+  deletion undetected; mixed-version blind trust; adopted-drain and
+  restoration-skip staleness until the next CONNECT; stale unmatched `Cons`
+  entries unverified). Mechanism documented in "Plain QoS 1/2 consumer
+  reconciliation on resume" in `docs/ARCHITECTURE.md`.
+
+- [ ] Make `purgeSharedPending` reach a RECORD-RESTORED session's shared state.
+  Found by the resume-reconciliation review (round 5). It enumerates
+  `sess.cons` (`mqtt.go`), but shared group consumer configs are deliberately
+  excluded from the persisted `Cons` (`buildPersistedSessionLocked`) and are
+  rebuilt only by `processSubs`, so for a session restored from its record the
+  purge walks nothing and returns having freed nothing. Meanwhile
+  `recoverInflightRegisters` reconstructs `pendingPublish`/`cpending` for those
+  same shared deliveries straight from the durable registers, so a session that
+  disconnects (or is refused) before subscription restoration keeps in-memory
+  pending entries the purge was supposed to drop — leaking their packet
+  identifiers and Receive Maximum slots, and risking a resume that NAK-steals
+  group messages AckWait would have redelivered to other members. Pre-existing
+  and independent of the reconciliation phase: the ordinary close path has the
+  same blind spot. The fix is to derive the group durables from `sharedSubs`
+  (as `clear()` already does via `mqttSharedDurablesForKey`) rather than from
+  `cons`, with a test that exercises the restored-session shape rather than
+  populating `cons` by hand. Spec5 [4.8.2].
 
 - [ ] Work the follow-ups the in-flight-register stabilization pass deliberately
   deferred. The pass ran under a stopping rule — release-block only on identifier

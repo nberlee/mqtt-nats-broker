@@ -277,15 +277,72 @@ Residuals:
   drained durable keeps its timer and can be reaped while the session is offline.
   Its started deliveries go with it, and that outcome is reported as **loss**,
   never as completion.
-- **A plain QoS 1/2 durable reaped by an inactivity threshold is silently
-  trusted on resume.** Under either source of a threshold — the broker's own
-  `consumer_inactive_threshold` option or a stream-forced
-  `ConsumerLimits.InactiveThreshold` — an offline session's ordinary durable
-  can be deleted, and the resumed session re-subscribes the recorded deliver
-  subject without verifying or recreating the consumer, so the subscription is
-  dead until a clean start. This is a residual of inactivity-threshold reaping
-  itself, present with the broker option alone; fixing the resume path is a
-  release blocker tracked in `docs/ROADMAP.md` section 0.
+- **Plain QoS 1/2 durables are reconciled at CONNECT, and only there.** A
+  resumed session verifies every plain QoS 1/2 consumer its record names —
+  and recreates a reaped one under a fresh identity — **before the CONNACK**
+  (see "Plain QoS 1/2 consumer reconciliation on resume" in
+  `docs/ARCHITECTURE.md`), so an inactivity-reaped durable no longer leaves a
+  silently dead subscription for the life of the session. What remains:
+  - No backlog is *guaranteed recoverable* across a reap: the replacement is
+    `DeliverNew`, the reaped consumer's pending went with it, and while
+    messages published after the reap may survive because an overlapping
+    consumer retained them, no cursor proves which of them the reaped
+    consumer was owed. The gap is logged, not replayed.
+  - Deliveries the reap destroyed surface as reserved identifiers or reported
+    loss, never as completion.
+  - An indeterminate verification **refuses the CONNECT**: the client must
+    reconnect. Live re-SUBSCRIBE is not a recovery mechanism.
+  - Out-of-band consumer deletion mid-connection is not detected;
+    reconciliation happens at CONNECT. The same applies to the narrow window
+    in which an inactivity reap has already been decided inside JetStream but
+    not yet performed: interest registered after that decision cannot revoke
+    it, and the lookup still reports the consumer present, so it is trusted
+    for that connection and repaired at the next one.
+  - Mixed-version: an unfixed broker still blind-trusts the record, so the
+    gap persists wherever such a broker accepts the resume.
+  - A re-SUBSCRIBE that adopts a drain whose durable was reaped inherits a
+    dead entry until the next CONNECT repairs it.
+  - A backlog delivery that runs out its phase-gate wait (reconciliation
+    slower than the connection's AckWait), or that belongs to a filter the
+    sweep reclaims unadopted, is redelivered rather than delivered in place:
+    it is still marked a first transmission, but it can arrive **after**
+    messages that were pushed later. Ordering across a redelivery is not
+    preserved — the same residual any AckWait or NAK redelivery carries.
+  - A message JetStream pushed into a reconciliation subscription that the
+    broker then loses to a crash is redelivered with DUP set on what is, to
+    the client, its first transmission: nothing durable records that the
+    attempt was never put on the wire. This is the pre-existing behavior of
+    any pushed-but-untransmitted delivery at a crash, not specific to
+    reconciliation.
+  - A backlog large enough to exhaust the NATS client's per-subscription
+    pending-byte limit while deliveries are parked on the phase gate has its
+    excess dropped by the client library before the broker sees it. Nothing is
+    lost — the messages were never acknowledged, so JetStream redelivers them
+    — but those redeliveries carry DUP on their first sight by the client,
+    since the broker never got the chance to record them as withheld.
+  - A resume refused **before the grant point** leaves the session's Session
+    Expiry Interval and Clean flag untouched, in memory and in the record:
+    they are applied only once every check that could refuse the CONNECT has
+    passed. Its expiry clock does restart from the refused connection's close,
+    as it does after any network connection ends, so a client that repeatedly
+    fails to complete a resume keeps its session alive for as long as it keeps
+    trying.
+  - The exception is the last step: once the granted terms are durably
+    stored, a **failure to write the CONNACK itself** leaves the session
+    running under them even though the client never saw the acknowledgement.
+    Undoing them there would mean repairing a record that was correctly
+    written, so the session keeps the terms its client asked for and the
+    client re-grants them on its next connection — which, for a requested
+    interval of 0, means the session ends at that close exactly as the client
+    requested.
+  - A filter subscription restoration skipped after the CONNACK (e.g. its
+    PUBREL setup failed) has its reconciliation subscription swept and stays
+    unavailable until the next CONNECT — a live re-SUBSCRIBE reaches the
+    exists-branch and never recreates missing interest.
+  - A live re-SUBSCRIBE that matches a **stale unmatched `Cons` entry** (an
+    entry with no corresponding subscription, which the reconciliation
+    deliberately does not verify) likewise installs no delivery interest and
+    stays unavailable until a subsequent CONNECT reconciles it.
 - **A drained QoS 2 source is held until its PUBREL is proven.** An ordinary QoS 2
   PUBREC acknowledges the stored message as soon as the PUBREL is stored. A
   *drained* one does not: on the interest-retained `$MQTT_out` a store with no

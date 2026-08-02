@@ -339,18 +339,104 @@ type uncertainOutcomeActions struct {
 //
 // sess.mu must not be held.
 func (sess *mqttSession) resolveUncertainNow(c *client) mqttUncertainResolution {
+	// An UNBOUND session with a PARKED teardown has to resolve and discharge as
+	// one step. Clearing the uncertainty first leaves a window in which a
+	// reconnect binds, and that reconnect skips resolution precisely BECAUSE the
+	// session is no longer uncertain — so nothing ever discharges the action and
+	// it is stranded for good, taking its expiry and its Will with it.
+	//
+	// The ownership gate is what makes the pair atomic. Failing to take it is not
+	// a problem to work around: it means a CONNECT is already in flight, and that
+	// CONNECT still sees an uncertain session, so it resolves and discharges
+	// through resolveUncertainSession itself. Reporting unresolved and leaving it
+	// alone is therefore the correct outcome, not a lost update.
+	// gated records that THIS call holds the ownership gate, which changes how a
+	// foreign verdict must be disposed below: the wrapper form takes the gate
+	// itself and would fail against the one already held here.
+	gated := false
+	if asm := sess.asm; asm != nil {
+		// Claimed as the session's CURRENT owner — the bound client, or nobody for
+		// an unbound one — which is the same claim retryUncertainSessions makes.
+		// Sampling it cannot go stale unnoticed: lockSession re-checks the owner
+		// under its own lock and fails if it moved.
+		//
+		// Taken UNCONDITIONALLY, not only when something is already parked.
+		// Whether a teardown needs discharging is not knowable before the
+		// resolution: a close holding this same gate can park one (and unbind the
+		// session) at any point, so a decision made from a prior sample is a
+		// check-then-act. The gate is what serializes this against that close.
+		//
+		// It never blocks — lockSession fails fast — and a failure means another
+		// ownership-gated operation holds it, which for a CONNECT means the
+		// session is still uncertain when it runs and it resolves and discharges
+		// itself. Reporting unresolved is then the correct outcome.
+		sess.mu.Lock()
+		owner := sess.c
+		sess.mu.Unlock()
+		if err := asm.lockSession(sess, owner); err != nil {
+			return mqttUncertainUnresolved
+		}
+		defer asm.unlockSession(sess)
+		gated = true
+	}
 	res, err := sess.resolveUncertainWrite()
 	if err != nil && c != nil {
 		c.Debugf("MQTT: could not resolve the uncertain record write of session %q: %v", sess.id, err)
 	}
 	if res == mqttUncertainForeign {
-		// Somebody else owns this session now. Disposition goes through the ownership
-		// gate, not inline: doing it here would race a CONNECT that has already
-		// evicted this object and installed a replacement. See
-		// disposeForeignSessionLocked.
-		sess.disposeForeignSession(c)
+		// Somebody else owns this session now. Disposition happens under the
+		// ownership gate — doing it ungated would race a CONNECT that has already
+		// evicted this object and installed a replacement — but this call already
+		// holds that gate, so it must NOT go through the wrapper: lockSession fails
+		// fast on a gate it finds held, including its own, which would silently
+		// skip the disposition and leave a stale client bound to a session another
+		// broker owns. See disposeForeignSessionLocked.
+		if gated {
+			sess.disposeForeignSessionLocked(sess.asm, c)
+		} else {
+			sess.disposeForeignSession(c)
+		}
+		return res
+	}
+	if res == mqttUncertainOurs {
+		// Resolved as ours — which is exactly when a teardown parked by an earlier
+		// close becomes discharge-able, and exactly when nothing else will do it:
+		// clearing the uncertainty removes this session from the periodic pass, and
+		// the next CONNECT skips resolution for the same reason. Only
+		// resolveUncertainSession used to discharge one, and only the paths that go
+		// through it ever reached that. The gate taken above (when there was
+		// anything to discharge) is still held, so no reconnect can have bound
+		// since the resolution.
+		sess.dischargeDeferredIfUnbound(c)
 	}
 	return res
+}
+
+// dischargeDeferredIfUnbound applies a parked deferred disconnect once its
+// session's record state is known again, provided nobody has rebound in the
+// meantime — a reconnect owns the decision itself and applies the reconnect
+// rules (cancelling or retaining the Will), which is why resolveUncertainSession
+// makes the same check.
+//
+// The caller must already hold the ownership gate for an unbound session with a
+// parked action — resolveUncertainNow takes it precisely so that the resolution
+// and this discharge cannot be split by a reconnect.
+//
+// No lock held on entry (other than that gate).
+func (sess *mqttSession) dischargeDeferredIfUnbound(c *client) {
+	asm := sess.asm
+	if asm == nil || c == nil || c.srv == nil {
+		return
+	}
+	sess.mu.Lock()
+	bound, parked := sess.c != nil, sess.deferredDisconnect != nil
+	sess.mu.Unlock()
+	if bound || !parked {
+		return
+	}
+	if action := sess.takeDeferredDisconnect(); action != nil {
+		c.srv.applyDeferredDisconnect(asm, sess, action)
+	}
 }
 
 // disposeForeignSessionLocked is the SINGLE foreign disposition: another owner holds
@@ -372,6 +458,15 @@ func (sess *mqttSession) resolveUncertainNow(c *client) mqttUncertainResolution 
 // The caller must hold the session in asm.sessLocked, which is what serializes this
 // against a concurrent CONNECT. Only the client this disposition observed is closed,
 // so a client that rebound in the meantime is left alone.
+//
+// The takeover DISCONNECT is sent only to a connection that has actually been
+// acknowledged. CONNACK must be the first packet a client sees
+// ([MQTT-3.2.0-1]), so a connection whose success CONNACK was never written —
+// one refused inside its own CONNECT, which mqttAbortAcceptedConnect leaves
+// bound until the readLoop's close bookkeeping detaches it — must be closed
+// silently. That is read from the connection itself rather than passed in by
+// the caller: a resolver reaching a foreign verdict from the periodic pass has
+// no idea which connection it is about to close, and got this wrong.
 //
 // No lock held on entry (other than the ownership gate).
 func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionManager, c *client) {
@@ -404,7 +499,9 @@ func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionMana
 	}
 	if stale != nil {
 		stale.Warnf("MQTT: session %q is now owned elsewhere; closing this connection", sess.id)
-		stale.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
+		if stale.connAckWritten.Load() {
+			stale.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
+		}
 		go stale.closeConnection(DuplicateClientID)
 	}
 }
@@ -479,14 +576,75 @@ func (sess *mqttSession) runUncertainReverts(tok recordTx) {
 //
 // No lock held on entry.
 func (sess *mqttSession) deferDisconnect(action *mqttDeferredDisconnect) bool {
+	parked, _ := sess.deferDisconnectIfUncertain(action, false)
+	return parked
+}
+
+// deferDisconnectIfUncertain is deferDisconnect for a close that does NOT hold
+// the ownership gate, so the uncertainty it is parking against can be resolved
+// out from under it. The check and the park are ONE sess.mu critical section:
+// checked separately, a gate-holding resolver can clear the uncertainty and run
+// its final discharge scan between the two, and an action parked after that
+// scan is stranded forever — the session is no longer uncertain, so neither the
+// periodic pass nor the next CONNECT will ever resolve (and discharge) again.
+//
+// Returns (parked, stillUncertain). Not parked because the session resolved
+// meanwhile (stillUncertain false) means the close must go back to taking the
+// gate and performing an ordinary teardown; not parked because an action
+// already exists (stillUncertain true) keeps the first action's deadlines, as
+// always. requireUncertain false is the gated caller, for whom the check is
+// the caller's own (it holds the gate, so nothing can resolve concurrently).
+//
+// No lock held on entry.
+func (sess *mqttSession) deferDisconnectIfUncertain(action *mqttDeferredDisconnect, requireUncertain bool) (bool, bool) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	if requireUncertain && !sess.seqUncertain {
+		return false, false
+	}
 	if sess.deferredDisconnect != nil {
-		return false
+		return false, true
 	}
 	sess.deferredDisconnect = action
 	sess.c = nil
-	return true
+	return true, true
+}
+
+// retargetDeferredLifetime updates a PARKED deferred disconnect's Session
+// Expiry Interval, for the one case that can invalidate it: a lifetime grant
+// whose write was unresolved when the connection closed, and which a later
+// readback proves LANDED.
+//
+// The close path snapshots the lifetime it can see, which while unresolved is
+// deliberately the last CONFIRMED one — that is what keeps a grant that never
+// landed from discarding the session. When the readback proves the opposite,
+// the snapshot is the stale half: applyDeferredDisconnect decides discard and
+// timer behavior from the action, not from the session, so without this the
+// outcome would depend on whether the close or the readback ran first.
+//
+// prior is whatever was parked when the grant was attempted, and it is what
+// makes this SAFE: an action is only retargeted when it is not that one. A
+// deferred disconnect carries no owner identity, and one parked by an EARLIER
+// connection can outlive its resolution — resolveUncertainNow classifies a write
+// as ours without discharging a parked action, after which the periodic pass
+// skips the session because it is no longer uncertain, and the next CONNECT
+// skips resolution for the same reason. Retargeting blindly would then rewrite
+// a previous connection's teardown terms with this one's. Pointer identity is
+// the exact predicate: the close path installs one action and refuses to
+// replace it, so a different pointer means this connection's close parked it.
+//
+// Only the interval moves. The action's Will is untouched and cannot be
+// inconsistent with it here: a CONNECT refused before its CONNACK has already
+// discarded its Will (mqttAbortAcceptedConnect), so a parked action from that
+// path carries none.
+//
+// No lock held on entry.
+func (sess *mqttSession) retargetDeferredLifetime(prior *mqttDeferredDisconnect, expiry uint32) {
+	sess.mu.Lock()
+	if cur := sess.deferredDisconnect; cur != nil && cur != prior {
+		cur.expiryInterval = expiry
+	}
+	sess.mu.Unlock()
 }
 
 // takeDeferredDisconnect removes and returns the pending deferred action, if any.
@@ -537,6 +695,18 @@ func (a *mqttDeferredDisconnect) willDue(now time.Time) bool {
 //
 // Runs from the client's readLoop. No lock held on entry.
 func (s *Server) mqttDeferDisconnect(c *client, asm *mqttAccountSessionManager, sess *mqttSession) {
+	s.mqttDeferDisconnectEx(c, asm, sess, false)
+}
+
+// mqttDeferDisconnectEx is mqttDeferDisconnect with the park made conditional
+// on the session still being uncertain, for a close that could not take the
+// ownership gate. Returns whether the teardown is now someone's responsibility
+// (parked here, or already parked by an earlier close); false means the session
+// resolved while this close was building the action, so the caller must retake
+// the gate and tear down ordinarily — and the Will this function consumed has
+// been put back exactly as it was, or that ordinary teardown would publish
+// nothing.
+func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager, sess *mqttSession, requireUncertain bool) bool {
 	now := time.Now()
 	sess.mu.Lock()
 	action := &mqttDeferredDisconnect{
@@ -550,8 +720,12 @@ func (s *Server) mqttDeferDisconnect(c *client, asm *mqttAccountSessionManager, 
 
 	c.mu.Lock()
 	// Consume it: from here this deferred action owns the Will, and no other
-	// teardown path may publish it as well. See mqttTakeWill.
+	// teardown path may publish it as well. See mqttTakeWill. taken/takenDisp
+	// remember the pre-take state so a REFUSED park can undo the consumption.
+	var taken *mqttWill
+	var takenDisp mqttWillDisposition
 	if will, disposition := c.mqttTakeWillLocked(); will != nil {
+		taken, takenDisp = will, disposition
 		// Same rule as mqttHandleWill: a v5 Will Delay on a session that survives
 		// the connection defers publication, capped at the Session Expiry Interval;
 		// anything else is due immediately. The close already classified it unless
@@ -582,11 +756,27 @@ func (s *Server) mqttDeferDisconnect(c *client, asm *mqttAccountSessionManager, 
 	}
 	c.mu.Unlock()
 
-	if !sess.deferDisconnect(action) {
-		return // an earlier close already parked its (original) deadlines
+	parked, stillUncertain := sess.deferDisconnectIfUncertain(action, requireUncertain)
+	if !parked {
+		if !stillUncertain {
+			// Resolved while the action was being built: nothing may be parked
+			// (nothing would ever discharge it), and the Will goes back where it
+			// was so the ordinary teardown the caller now performs can publish it.
+			if taken != nil {
+				c.mu.Lock()
+				if c.mqtt != nil && c.mqtt.cp != nil {
+					c.mqtt.cp.will = taken
+					c.mqtt.willDisposition = takenDisp
+				}
+				c.mu.Unlock()
+			}
+			return false
+		}
+		return true // an earlier close already parked its (original) deadlines
 	}
 	asm.removeSessFromFlappers(sess.id)
 	c.Warnf("MQTT: session %q has an unresolved record write; deferring its disconnect handling until it resolves", sess.id)
+	return true
 }
 
 // resolveUncertainSession classifies a parked session's ambiguous write and
@@ -839,4 +1029,16 @@ func (sess *mqttSession) saveClassified(tok recordTx) (saveOutcome, error) {
 	wasUncertain := sess.isSeqUncertain()
 	err := sess.save(tok)
 	return sess.classifySave(wasUncertain, err), err
+}
+
+// saveClassifiedDetail is saveClassified plus the attempted write's raw
+// identity, for the one caller that must turn a DEFINITE CAS rejection into a
+// decision by kind — 10071 (taken over) versus 10164 (contention) — and retry
+// or read back the exact bytes it sent. save() itself re-formats the store
+// error and destroys the kind, which is why the detail is captured at the
+// boundary. See sess_resume_reconcile.go.
+func (sess *mqttSession) saveClassifiedDetail(tok recordTx) (saveOutcome, mqttSessSaveDetail, error) {
+	wasUncertain := sess.isSeqUncertain()
+	detail, err := sess.saveWithDetail(tok)
+	return sess.classifySave(wasUncertain, err), detail, err
 }

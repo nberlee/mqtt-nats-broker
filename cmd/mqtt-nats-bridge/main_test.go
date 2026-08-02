@@ -83,7 +83,7 @@ func TestRunFailsOnBadTLSBeforeStartup(t *testing.T) {
 
 	// Nothing may have been bound on the way to that error.
 	if c, err := net.DialTimeout("tcp", httpAddr, 2*time.Second); err == nil {
-		c.Close()
+		_ = c.Close() // best effort: the probe only had to establish that it connected
 		t.Errorf("health server is listening on %s after a failed startup, want no listener", httpAddr)
 	}
 }

@@ -817,7 +817,7 @@ func (c *client) closeConnection(reason ClosedState) {
 	}
 
 	if c.ownNRC && c.nrc != nil {
-		c.nrc.Drain() //nolint:errcheck // best effort on disconnect
+		_ = c.nrc.Drain() // best effort on disconnect
 	}
 }
 
