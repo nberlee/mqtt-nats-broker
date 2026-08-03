@@ -420,6 +420,41 @@ Residuals:
   reserved and the record kept. Either way it costs one reserved identifier and one
   Receive Maximum slot — the safe direction, since reusing it would put a second
   message on an identifier the client still has in use.
+- **Shared-register takeover arbitration excludes unreadable records.** A resumed
+  session CAS-claims every readable live or retired shared register before installing
+  it, and every nonce-keyed rewrite honors that object claim, so a stale close cannot
+  delete a register the new owner has recovered. An unreadable register cannot be
+  rewritten while preserving its allocation identity, however, so it remains
+  unarbitrated and a stale writer can still know its sequence. This is bounded to the
+  existing corrupt-record state: recovery reserves the identifier, withholds new
+  allocation and reports the condition loudly rather than reusing an identity it cannot
+  prove free.
+- **A crash can lose one surviving disconnect's shared purge.** When a session survives
+  its disconnect, the purge frees its pending shared-group deliveries in memory and then
+  removes their registers. That pair is not atomic: a crash in between leaves the
+  registers intact with no durable verdict, and the next resume can restore those pending
+  entries as ordinary live state wherever their sources are still live or unprovable (a
+  provably complete source is dropped). Only a tombstone or a persisted nonce verdict
+  makes recovery drop a register outright, so what is lost is that close's purge and what
+  returns is the pre-purge state — the identifiers and Receive Maximum slots it had
+  freed. Bounded to one crash per close and self-limiting: the next surviving close
+  purges again. The same window applies to every close, not only the record-restored
+  sessions the purge newly reaches.
+- **A close deferred by an uncertain record write does not run the shared purge.**
+  When the close's own record write is ambiguous the disconnect is parked and applied
+  later, and that path records the disconnect time without purging. Such a session keeps
+  its pending shared-group deliveries — their packet identifiers and Receive Maximum
+  slots — for the rest of its life, and a resume can NAK-steal group messages AckWait
+  would have redelivered to other members. Under a Receive Maximum of 1 that is a session
+  that can no longer deliver at all. The purge cannot simply be called there: it can
+  itself write the record, which would leave the deferred path's own write refused as
+  unresolved, so closing this needs the two to become one classified write.
+- **Recovery's opaque and duplicate-source reservations are never purged.** A register
+  whose body cannot be read, and the loser of a duplicate claim on one source, are held
+  as identifier reservations that carry no durable name — so no durable-keyed purge can
+  reach them, and a surviving disconnect leaves them reserved. Fail-closed by design:
+  the identifier stays out of use rather than being handed to a second message, at the
+  cost of one reserved identifier and one Receive Maximum slot each.
 - **Mixed-version operation.** As with the affine and teardown protocols: an older
   broker never reads `$MQTT_inflight`, so it re-offers a started delivery under a
   fresh identifier and its orphan sweep does not know the stream. Continuity holds

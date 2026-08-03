@@ -1189,6 +1189,11 @@ type mqttSession struct {
 	// legacy record written before generations existed: keep the old names. See
 	// sess_incarnation.go.
 	gen string
+	// regClaim is this session OBJECT's ownership identity for shared-delivery
+	// in-flight registers. Unlike gen it is deliberately not persisted: a resume on
+	// another broker constructs a new object and therefore takes a new claim, while a
+	// same-broker rebind keeps the object and its claim. See inflight_register.go.
+	regClaim string
 
 	cons map[string]*ConsumerConfig
 	// drains holds consumers that survived an UNSUBSCRIBE with started deliveries
@@ -1922,6 +1927,13 @@ type mqttPending struct {
 	// before any sequence for it exists. regSeq appears only on confirmation.
 	regSeq   uint64
 	regNonce string
+	// regForeign marks a reservation left by a LOST shared-claim arbitration: the
+	// register at regSeq is another session object's claimed identity. The identifier
+	// stays reserved (the client may hold it, and the non-zero regSeq keeps
+	// dropUnredeliverableRetained from reading it as a retained send), but no terminal
+	// path may settle the record — deleting a register this object does not own would
+	// destroy the rival's only durable identity. See inflight_register.go.
+	regForeign bool
 
 	// (see the session's piSpaceIncomplete for the other half of R3)
 	//
@@ -7639,11 +7651,12 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, opts *O
 	}
 
 	sess := &mqttSession{
-		jsa:    jsa,
-		id:     id,
-		idHash: idHash,
-		seq:    seq,
-		maxp:   maxp,
+		jsa:      jsa,
+		id:       id,
+		idHash:   idHash,
+		seq:      seq,
+		maxp:     maxp,
+		regClaim: mqttNewInflightNonce(),
 	}
 	sess.setIncarnationLocked(gen)
 	return sess
@@ -12148,6 +12161,20 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		sess.mu.Unlock()
 		return errMQTTInvalidSession
 	}
+	if ack := sess.pendingPublish[pi]; ack != nil && ack.regForeign {
+		// A FOREIGN reservation: the register behind this identifier is another
+		// session object's claimed identity (a lost shared-claim arbitration), so the
+		// exchange is not this object's to advance. Acting here would convert the
+		// reservation into durable state for an exchange this object does not own —
+		// a PUBREC would store an UNCORRELATED PUBREL (the bodyless entry has no
+		// source), which a later resume reads as identifier-first with no source
+		// mapping, and the still-live register then conflicts with it. Decline
+		// instead: the reservation stands, nothing durable is written, and the
+		// client's retransmitted acknowledgement is answered by the owner it ends up
+		// bound to (this object is losing, or has lost, the record arbitration).
+		sess.mu.Unlock()
+		return nil
+	}
 	if isPubRec && !pubRecFailed {
 		// The JS ACK subject for the PUBREL will be filled in at the delivery
 		// attempt.
@@ -14212,17 +14239,53 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *Cons
 // shared group consumers WITHOUT acking. Called when the session survives a
 // disconnect, so a resume does not NAK-steal group messages (which AckWait
 // redelivers to other members) and so the packet identifiers are freed. Spec5 [4.8.2].
+//
+// The targets are derived from the pending state itself, not from either view of the
+// group membership, because both views provably miss real shapes. A session restored
+// from its record has membership without configs — shared configs are excluded from
+// the persisted Cons (buildPersistedSessionLocked) and rebuilt only by processSubs —
+// while recoverInflightRegisters has already rebuilt its pending entries under the
+// deterministic group durable names, so a cons walk purges nothing. A SUBSCRIBE whose
+// rolled-back save failed leaves a config outside the membership (rollbackSubscribePacket's
+// readd restores cons, not sharedSubs), so a sharedSubs walk misses it. A 3.1.1 forced
+// leave, UNSUBSCRIBE's no-cons branch and purgeReservedSubs each strand transmitted
+// entries with NEITHER view left, which is why even the union is not enough.
+//
+// For broker-minted state the durable name IS the protocol fact "deliveries under this
+// consumer are group deliveries": mqttSharedNames is the single source of the prefix, and
+// no other class can collide (plain consumers are idHash_nuid, PUBREL and affine QoS 2
+// copies carry their own prefixes, and a drained consumer keeps its plain name). For
+// state restored from a register the name is trusted, the same trust every other restored
+// identity gets.
 func (sess *mqttSession) purgeSharedPending() {
 	sess.mu.Lock()
 	var regs []mqttVoidedReg
 	var cancels []mqttRegCancellation
-	for _, cc := range sess.cons {
-		if cc.DeliverGroup == _EMPTY_ {
-			continue
+	purged := make(map[string]struct{})
+	purge := func(durable string) {
+		if !strings.HasPrefix(durable, mqttSharedConsumerDurablePrefix) {
+			return
 		}
-		pregs, pcancels := sess.purgeConsumerPendingLocked(cc.Durable)
+		if _, dup := purged[durable]; dup {
+			return
+		}
+		purged[durable] = struct{}{}
+		pregs, pcancels := sess.purgeConsumerPendingLocked(durable)
 		regs = append(regs, pregs...)
 		cancels = append(cancels, pcancels...)
+	}
+	// Every map purgeConsumerPendingLocked removes from is a source of targets, so no
+	// pending entry it would drop is out of the collection's reach. A retirement has no
+	// cpending entry by construction, and a withheld first transmission may outlive the
+	// emptying of its consumer's cpending bucket.
+	for durable := range sess.cpending {
+		purge(durable)
+	}
+	for k := range sess.deferred {
+		purge(k.jsDur)
+	}
+	for key := range sess.srcAckOwed {
+		purge(key.jsDur)
 	}
 	sess.mu.Unlock()
 	// No consumer is destroyed here — the group durable survives — but the identifiers

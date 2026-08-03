@@ -835,23 +835,249 @@ is fixed before feature work continues.
   entries unverified). Mechanism documented in "Plain QoS 1/2 consumer
   reconciliation on resume" in `docs/ARCHITECTURE.md`.
 
-- [ ] Make `purgeSharedPending` reach a RECORD-RESTORED session's shared state.
-  Found by the resume-reconciliation review (round 5). It enumerates
+- [x] Make `purgeSharedPending` reach a RECORD-RESTORED session's shared state.
+  Found by the resume-reconciliation review (round 5). It enumerated
   `sess.cons` (`mqtt.go`), but shared group consumer configs are deliberately
   excluded from the persisted `Cons` (`buildPersistedSessionLocked`) and are
   rebuilt only by `processSubs`, so for a session restored from its record the
-  purge walks nothing and returns having freed nothing. Meanwhile
+  purge walked nothing and returned having freed nothing. Meanwhile
   `recoverInflightRegisters` reconstructs `pendingPublish`/`cpending` for those
   same shared deliveries straight from the durable registers, so a session that
-  disconnects (or is refused) before subscription restoration keeps in-memory
+  disconnected (or was refused) before subscription restoration kept in-memory
   pending entries the purge was supposed to drop — leaking their packet
   identifiers and Receive Maximum slots, and risking a resume that NAK-steals
   group messages AckWait would have redelivered to other members. Pre-existing
-  and independent of the reconciliation phase: the ordinary close path has the
-  same blind spot. The fix is to derive the group durables from `sharedSubs`
-  (as `clear()` already does via `mqttSharedDurablesForKey`) rather than from
-  `cons`, with a test that exercises the restored-session shape rather than
-  populating `cons` by hand. Spec5 [4.8.2].
+  and independent of the reconciliation phase: the ordinary close path had the
+  same blind spot. Spec5 [4.8.2].
+  **Both derivations from a view of the group were wrong**, and the plan review
+  proved each in turn. This bullet's own suggestion — derive from `sharedSubs`
+  via `mqttSharedDurablesForKey` — reopens what the `cons` walk did cover:
+  `rollbackSubscribePacket`'s `readd` restores the packet's `cons` entries and
+  reopens their delivery but does NOT restore the `sharedSubs` key, so a live
+  shared consumer sits outside the membership. The **union** of the two views
+  then still misses the no-`cons` membership removals: the 3.1.1 forced leave
+  (`mqtt.go`) runs before `processSubs`, nils `sharedSubs`, and stages only
+  register verdicts — `voidRegistrationsLocked` deliberately leaves a
+  TRANSMITTED delivery's `cpending`/`pendingPublish` entries "for the teardown's
+  purge to remove" — and UNSUBSCRIBE's no-`cons` branch and `purgeReservedSubs`
+  leave the same shape, after which BOTH views are empty while the pending maps
+  still hold the state. Two rounds each finding one more view the previous
+  view-set missed is the delete-the-redundancy signal, so the fix takes one rule
+  instead of a third view: **the purge derives its targets from the pending
+  state it exists to drop** — every durable named by `cpending`, `deferred` or
+  `srcAckOwed` whose name carries `mqttSharedConsumerDurablePrefix`. That is a
+  superset of the old behavior (`cons` itself holds no pending state) and it
+  covers all four shapes. The name is a sound discriminator because
+  `mqttSharedNames` is the single source of the prefix and no other durable
+  class can collide; qualification stated in `docs/ARCHITECTURE.md`: exclusive
+  for broker-minted state, trusted for state restored from a register.
+  Mutations run, each confirmed to fail its paired test and reverted: revert to
+  the `cons` walk (M1), delete the group consumers (M2), skip
+  `deleteInflightRegisters` (M3), drop the prefix filter (M4), skip the
+  `srcAckOwed` keys (M5), derive from `sharedSubs` membership (M6), skip the
+  `deferred` keys (M7). Residuals stated in `docs/CONFORMANCE.md` (a crash
+  between the in-memory purge and the register deletes loses that close's purge;
+  recovery's opaque/duplicate-source reservations carry no durable and are not
+  purged). Mechanism documented in "Outbound in-flight registers" in
+  `docs/ARCHITECTURE.md`.
+
+  The surviving-close purge is also arbitrated against cross-broker takeover.
+  Every session *object* carries an unpersisted register claim, and every register
+  write stamps it. During the pre-CONNACK barrier a resumed object CAS-claims each
+  readable live or retired shared register at the exact sequence it loaded, in a
+  bounded concurrent window, and installs only the resulting sequence — BEFORE the
+  duplicate-source grouping, because a duplicate group fails closed as reservations
+  and a reservation protects nothing while the registers behind it still sit at
+  sequences a stale close knows: the close would delete one member and the next
+  resume would install the survivor as authoritative, resolving by deletion the
+  ambiguity the group refused to guess about (a review round found exactly that).
+  A live member whose claim FAILS (a concurrent resumer owns it, or it is
+  unreadable) keeps its source identity and poisons its whole group — every member
+  reserved, none installed — because installing the sibling as a singleton would
+  resolve the duplicate by the same guess through the split-claim door (the next
+  review round found exactly that). And the negative dispositions reconcile a
+  REUSED object's memory: "in-memory state wins" is the right install rule, but a
+  consumed close decision retires the live entry it backed, and a poisoned group
+  demotes a live member's entry to a bare reservation and removes the source
+  mapping — nonce-guarded, so a newer allocation is never disturbed — or a
+  same-object barrier re-run keeps delivering under a mapping the arbitration
+  just refused to trust (the round after found exactly that). A reservation left
+  by a LOST arbitration is marked FOREIGN: its sequence may be the rival's, so no
+  terminal path settles the record behind it — the register delete on the
+  completion path carries no nonce or claim check, and without the mark a late
+  PUBACK on the stale object would destroy the rival's only durable identity
+  (the round after that found exactly that). The acknowledgement paths decline a
+  foreign reservation outright: a successful PUBREC would otherwise convert it
+  into an UNCORRELATED durable PUBREL (the bodyless entry has no source), which a
+  later resume reads as identifier-first against the rival's still-live register
+  — QoS 2 duplication either way the conflict resolves (the round after that
+  found exactly that; the reservation stands and the owner answers the
+  retransmission). And a READABLE live record under an ACTIVE rival's claim is not
+  an ambiguity at all: the rival claims only after its own accept save, so
+  observing it mid-barrier is durable displacement proof, and the resume is
+  REFUSED outright rather than binding a client to a superseded session whose
+  foreign reservations would decline acknowledgements forever with only a
+  missable takeover notification left to evict it (the final review round found
+  exactly that). A dead rival's standing claim never trips this — the ordinary
+  CAS at the loaded sequence re-claims it — so foreign reservations arise only
+  from UNREADABLE records, which prove nothing and stay fail-closed. And the
+  claims are ORDERED, or two simultaneous resumers could split a pair of
+  registers and refuse each other forever: each claim carries its accept save's
+  record sequence (unique by record CAS), a contested claim from an OLDER accept
+  is re-targeted and taken over, and only a not-older one displaces — exactly one
+  side of any race is newer, so the contest terminates deterministically (the
+  round after found exactly that). The contest budget is generous and its
+  exhaustion reads as DISPLACEMENT, never as an opaque reservation: contenders
+  are unbounded while any fixed budget is not, and exhausting behind a chain of
+  older claims would otherwise strand the rightful NEWEST owner with its
+  allocation withheld — a refused resume retries into a settled contest instead
+  (the round after that found exactly that). There is deliberately NO own-claim
+  fast path: every shared register is rewritten on every barrier run, because
+  moving the sequence is itself load-bearing — a terminal path that untracked
+  its entry and paused before its durable half holds the OLD sequence, and a
+  same-object rebind would otherwise reinstall an entry whose exchange the
+  paused delete-and-ack then completes invisibly, a permanently consumed
+  Receive Maximum slot. Rewritten, the paused delete no-ops, and registers
+  dropped on PROOF OF COMPLETION reconcile memory exactly as consumed closes do
+  (cancelled reservations exempt: they are held until settled AND proven), so
+  the phantom heals at the next barrier run (the final round found exactly
+  that). And an own-claim re-read proves the rewrite only when the sequence
+  MOVED: with no fast path, the loaded record was own-claimed to begin with, so
+  a CAS that failed without landing re-reads the same record at the unmoved
+  sequence — adopting it would hand the paused delete its target back. Unmoved
+  means retry; the move is the fence — and retry EXHAUSTION refuses the resume
+  rather than falling to an opaque reservation, which would sit at exactly the
+  unfenced sequence a paused terminal delete may hold (the round after found
+  exactly that: a persistent store failure must cost a refused CONNECT whose
+  retry meets a working store, never a permanent Receive Maximum slot — and an
+  INDETERMINATE re-read after a failed claim CAS refuses for the same reason,
+  since sequence movement then cannot be proven either way; the round after
+  found exactly that).
+  That rewrite invalidates the sequence a stale close knows. Conversely, if the
+  close's delete or matching-nonce tombstone won first, recovery consumes that
+  durable decision and
+  frees the identifier. Every nonce-keyed reconcile that could otherwise teach a
+  stale object the moved sequence or let it rewrite the record (store, retirement,
+  cancellation and pending cancellation) additionally requires the current object's
+  claim — and so does the one reconcile the nonce gates cannot cover: the store's
+  same-delivery replacement, whose occupant carries the OTHER writer's nonce, and
+  which would otherwise take the slot back at the claimed sequence in the
+  three-owner interleaving (a review round found exactly that). The complete-source
+  reap is deliberately not gated: a provably complete source means the exchange
+  terminated, and identifier continuity protects only incomplete exchanges. Plain
+  registers are deliberately outside the gate because they are not claimed on
+  resume. The ordinary exact-sequence delete needs no extra read: the claim rewrite
+  itself is its fence. The claim is object identity rather than the persisted
+  session generation, because that generation correctly survives a resume and
+  therefore cannot distinguish the two owners. Each register's close decision is
+  durable and consumed exactly once at its own subject sequence.
+
+  Mutations run for the arbitration, each confirmed to fail its paired test and
+  reverted: remove the claim pass (M9), reconcile cancellation on nonce alone (M10),
+  keep the pre-claim sequence in memory (M11), reconcile a stalled store on nonce
+  alone (M12), reconcile retirement without the claim (M13), reconcile pending
+  cancellation without the claim (M14), reserve rather than drop a register whose
+  claim CAS re-read finds absent (M15), replace a same-delivery occupant without
+  the claim (M16), leave duplicate-source group members unclaimed (M17), strip a
+  claim-failed member to a bodyless reservation before the grouping sees it
+  (M18), skip the consumed-close memory reconciliation (M19), skip the
+  poisoned-group demotion (M20), drop the foreign gate from the terminal
+  register delete (M21), drop the foreign decline from the acknowledgement
+  path (M22), classify a displaced result as opaque instead of refusing the
+  resume (M23), treat an older accept's claim as displacement instead of
+  taking it over (M24), cap the contest at three attempts with exhaustion
+  falling to an opaque reservation (M25), restore the own-claim fast path so
+  the terminal race lands its delete (M26), skip the complete-source memory
+  reconciliation (M27), adopt an own-claim re-read at the unmoved sequence
+  (M28), let unfenced-claim exhaustion fall to an opaque reservation (M29), and
+  let an indeterminate claim re-read fall to an opaque reservation (M30). M1-M7
+  were re-run against the combined tree.
+  Residuals remain stated in `docs/CONFORMANCE.md`: unreadable registers cannot be
+  claimed, the ordinary-close in-memory/delete crash window is unchanged, and the
+  deferred close still does not invoke this purge. Three follow-ups it deliberately
+  leaves are the next three bullets.
+
+- [ ] Call `purgeSharedPending` from the deferred-disconnect close path — as ONE
+  classified operation with that path's own record write, not as a bare call.
+  `applyDeferredDisconnect` (`sess_uncertain.go`, the session-survives branch)
+  records the disconnect time, saves and arms the expiry, and never purges, so
+  the uncertain-write close leaks exactly what `mqttHandleClosedClient` frees:
+  the session's pending shared-group deliveries keep their packet identifiers and
+  Receive Maximum slots, and a resume can NAK-steal group messages AckWait would
+  have redelivered. Under a Receive Maximum of 1 a single stranded entry stops
+  the session delivering at all. Both callers reach the function only for an
+  UNBOUND session holding the ownership gate, so the purge itself would be safe
+  there.
+  **The bare call is not, and a review round proved it** — recorded here so the
+  next attempt does not repeat it. `purgeSharedPending` can itself write the
+  record: when both register-stream rungs fail, `deleteInflightRegisters` falls
+  back to `persistVoidedRegs`, whose `saveClassified` can land ambiguously and
+  set `seqUncertain`. `saveWithDetail` then REFUSES every later write (`mqtt.go`,
+  "an earlier record write is unresolved"), so the branch's own save is refused
+  after `takeDeferredDisconnect` has already consumed the parked action and
+  nothing will retry it: `disconnectedAt` survives in memory only, while the
+  landed purge record still carries `DisconnectedAt=0`, and the expiry then sees
+  a session that looks connected by the record and superseded in memory. So the
+  fix must open the record transaction first, stop the purge from initiating an
+  independent save, persist the fallback nonces and the original disconnect time
+  together, and keep the retry/resolve continuations when that save is ambiguous.
+  Test it with a failed register delete AND tombstone plus a landed-but-lost
+  response, then assert the persisted deadline survives resolution and restart —
+  a test that only covers successful register cleanup proves nothing here.
+  Spec5 [4.8.2], [4.9].
+
+- [ ] Make `readd` restore `sharedSubs` alongside `cons`, or release from both.
+  `rollbackSubscribePacket`'s `readd` (`mqtt.go`) restores the packet's added
+  `cons` entries and reopens their delivery, but not the `sharedSubs` key, so a
+  session can end in a state where a live shared consumer is outside the
+  membership. The pending-state-derived purge above is immune, but `clear()`'s
+  shared-durable RELEASE still derives from `sharedSubs` alone (`mqtt.go`), so
+  such a session never releases the re-added shared consumer's group durable —
+  which `sharedDurablesHeldByOthers` then keeps alive for a member that no
+  longer exists. Either restore both maps in the rollback, or make the release
+  walk both. Found by the plan review of the purge bullet above.
+
+- [ ] Investigate: a reconnect racing its own DISCONNECT(expiry 0) close can
+  resume the session it ended. Observed three times under heavy concurrent
+  load in `TestMQTTv5SessionExpiry/disconnect_overrides_expiry_to_zero`: the
+  reconnect arrives while the old connection is still bound ("Replacing old
+  client" takeover), the old connection's close then finds `sess.c != c` and
+  returns without running the expiry-0 discard, and the CONNACK reports
+  Session Present=true for a session the DISCONNECT ended at close. Spec5
+  [3.1.2.11]: the session must end when the network connection closes.
+  Evidence so far: 3 failures, all on a loaded machine (one in a full-suite
+  run concurrent with a `-race` suite, two in a probe window confounded by
+  compilation); 0 in 120 further targeted runs on the same tree and 0 in 100
+  runs at `ac49002` under controlled identical load, so neither "introduced
+  by the register-claims change" (whose code provably does not execute in
+  this shape) nor "pre-existing" is EVIDENCED yet — the mechanism analysis
+  above says pre-existing, the counts say only "rare and load-sensitive".
+  Needs a deterministic reproduction (hold the old connection's close between
+  the rebind check and the teardown, then CONNECT) before any fix.
+
+- [ ] Investigate: the Phase-2 shutdown scan-stop can miss its between-records
+  window under load. Observed once in a full (sequential) `mqttport_fulltests`
+  run: `TestMQTTWillOutboxWatermarkPhase2ShutdownStopsScan` counted 2 marker
+  loads where the loop-top `willClaimStopCh` check should have stopped the scan
+  after the first record ("scan performed 2 marker loads"). 30/30 standalone
+  passes on the same tree, nine prior full-suite passes, and the Will-cancel
+  machinery is untouched by the register-claims change (last touched b70e9d9 /
+  3a25be2), so this is either a scheduling-sensitive test assumption or a real
+  ordering gap between `closeWillDispatch` and the scan loop's stop check.
+  Needs the same treatment as the expiry-race bullet above: a deterministic
+  reproduction before any fix.
+
+- [ ] Free stranded shared pending state at the membership removal, not at the
+  close. The 3.1.1 forced leave, UNSUBSCRIBE's no-`cons` branch and
+  `purgeReservedSubs` all stage register verdicts and deliberately leave a
+  TRANSMITTED delivery's `cpending`/`pendingPublish` entries behind, because
+  their own purge walks only `cons`-derived durables and a record-restored
+  session has none. The fix above frees them at the close (previously: never),
+  but the removal-to-close hold remains: for the rest of the connection those
+  entries hold packet identifiers and Receive Maximum slots for a subscription
+  that is already gone — under a Receive Maximum of 1, a session that can no
+  longer deliver at all. The removals should purge what they strand, by the same
+  pending-state derivation. Spec5 [4.8.2], [4.9].
 
 - [ ] Work the follow-ups the in-flight-register stabilization pass deliberately
   deferred. The pass ran under a stopping rule — release-block only on identifier

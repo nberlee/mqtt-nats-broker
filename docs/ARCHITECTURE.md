@@ -1038,6 +1038,108 @@ The invariants, in the order they matter:
   the UNSUBSCRIBE has just destroyed. A register left behind by any of them outlives its
   consumer, and a consumer-gone source is deliberately not read as complete — so the next
   resume would reserve that identifier for the life of the session.
+- **A surviving disconnect's shared purge derives its targets from the pending state, not
+  from the group membership.** The purge exists to drop this session's pending group
+  deliveries without acking them, so a resume does not NAK-steal messages AckWait would
+  have redelivered to other members. Neither view of the group can name what it has to
+  reach. A session restored from its record has the membership but no configs — shared
+  consumer configs are deliberately excluded from the persisted `Cons` and rebuilt only by
+  the post-CONNACK subscription restoration — while register recovery has already rebuilt
+  its pending entries under the deterministic group durable names, so a config walk finds
+  nothing. A SUBSCRIBE whose rolled-back save definitely failed leaves the opposite: the
+  re-added configs are live and their group key is not back in the membership, so a
+  membership walk misses them. And a 3.1.1 forced leave, an UNSUBSCRIBE with no config to
+  tear down, and a reserved-namespace purge each strand a TRANSMITTED delivery's entries
+  on purpose — the staging records the verdict and leaves the entry "for the teardown's
+  purge" — with NEITHER view left naming the durable, which is why even the union of the
+  two is not enough. So the purge takes every durable named by the maps it is about to
+  remove from (`cpending`, the withheld markers, and the retired sources) whose name
+  carries the shared-group prefix. For broker-minted state that name IS the protocol fact
+  "deliveries under this consumer are group deliveries": the shared names are minted in
+  one place and no other durable class can collide with the prefix (plain consumers are
+  hash-and-nuid, PUBREL and session-affine QoS 2 copies carry their own prefixes, and a
+  drained consumer keeps its plain name). For state restored from a register the name is
+  trusted rather than re-derived, the same trust every other restored identity gets.
+  Re-purging an entry a removal already voided is idempotent end to end: a known nonce is
+  not re-voided, the delete is at the exact sequence, and both release predicates key on
+  the toucher's own nonce. Only the ORDINARY surviving close runs it today; the deferred
+  close that applies a disconnect parked by an uncertain record write does not, because the
+  purge can itself write the record (the verdict fallback) and so has to be folded into
+  that path's own classified write rather than called ahead of it. Stated in
+  `docs/CONFORMANCE.md` and tracked in the roadmap.
+- **A resume claims the shared registers it recovers before installing them.** A
+  cross-broker takeover constructs a new session object but preserves the session
+  incarnation generation, so that generation correctly finds the durable state but cannot
+  distinguish the two owners. Each object therefore has an unpersisted register claim.
+  Every register write stamps it, and recovery CAS-rewrites each readable live or retired
+  shared register with its claim at the exact sequence it loaded — before the
+  duplicate-source grouping, so that even the members of a group that fails closed have
+  moved: a reservation protects nothing while the registers behind it still sit at
+  sequences a stale close knows, and deleting one would let the next resume install the
+  survivor as authoritative, resolving by deletion the ambiguity the group refused to
+  guess about. A live member whose claim fails — a concurrent resumer owns it, or it is
+  unreadable — keeps its source identity and fails its whole group closed for the same
+  reason: installing the sibling as a singleton would resolve the duplicate by the same
+  guess through the split-claim door. The single-slot subject
+  moves, invalidating every sequence a stale close knows. If the stale close deleted first,
+  or its matching-nonce cancellation tombstone won, recovery consumes that durable close
+  decision and does not install the identifier. The negative dispositions also reconcile
+  a REUSED object's memory, because "in-memory state wins" holds only for records
+  recovery would re-install: a consumed close decision retires the live entry it backed,
+  and a poisoned group demotes a live member's entry to a bare reservation and removes
+  its source mapping — each touch guarded by the record's own nonce, so an entry a newer
+  allocation owns is never disturbed. A reservation left by a LOST arbitration is marked
+  foreign: its sequence may be the rival's, and no terminal path settles a record this
+  object does not own — the completion path's register delete carries no nonce or claim
+  check, so the mark is what keeps a stale object's late acknowledgement off the rival's
+  only durable identity. The acknowledgement paths decline a foreign reservation before
+  any state moves: a successful PUBREC would otherwise store an uncorrelated PUBREL from
+  a bodyless entry, and a later resume would then hold an identifier-first record against
+  the rival's still-live register. The reservation stands, nothing durable is written,
+  and the owner the client ends up bound to answers the retransmission. A READABLE live
+  record under an active rival's claim, observed mid-barrier, is stronger than any of
+  this: the rival claims only after its own accept save, so it is durable displacement
+  proof, and the RESUME IS REFUSED — nothing installs, the CONNECT aborts, and the
+  client's retry binds to the authoritative owner. A dead rival's standing claim never
+  reaches that re-read (the ordinary CAS at the loaded sequence re-claims it), so
+  foreign reservations arise only from unreadable records, which prove nothing and stay
+  fail-closed. There is no own-claim fast path: every shared register is rewritten on
+  every barrier run, because the moved sequence is what turns a terminal path's paused
+  register delete into a no-op — a same-object rebind between an acknowledgement's two
+  halves legitimately reinstalls the entry, and the paused durable half must not then
+  complete the exchange invisibly. Registers dropped on proof of completion reconcile
+  memory exactly as consumed closes do (cancelled reservations exempt), so such an entry
+  is released at the next barrier run rather than counting against Receive Maximum
+  forever. An own-claim re-read is adopted only when the sequence has MOVED from the
+  attempted one: without a fast path the loaded record was own-claimed already, so an
+  unmoved re-read proves nothing about the write and is retried — the move is the
+  fence — and both exhausting those retries and an INDETERMINATE re-read after a failed
+  CAS refuse the resume rather than reserving at an unproven sequence. Every contest
+  therefore ends owned-with-a-moved-sequence, consumed as a close decision, opaque from
+  an unreadable (and therefore rewritten) record, or refused; no outcome leaves an
+  installed entry at a sequence a paused terminal path still holds. Claims are ordered
+  by their accept save's record sequence — unique by
+  record CAS — so a contest between two live resumers has exactly one newer side: the
+  newer takes over an older claim by re-targeting its CAS, the older reads displacement,
+  and the mutual-refusal loop two unordered claimants could otherwise enter cannot
+  happen. The contest budget is generous and exhausts to displacement, never to an
+  opaque reservation: a fixed budget cannot bound unbounded contenders, and the newest
+  owner stranded behind a chain of older claims would otherwise complete CONNECT with
+  its allocation withheld. Every
+  nonce-keyed reconcile on a shared
+  durable — ambiguous first store, retirement, cancellation and pending cancellation —
+  must also match the current claim before it may adopt a sequence or rewrite the record,
+  and so must the store's same-delivery replacement, the one reconcile whose occupant
+  carries the OTHER writer's nonce and which no nonce gate can therefore cover. A
+  mismatch abandons the stale operation without producing a competing session-record
+  verdict. The complete-source reap is deliberately claim-independent: a provably
+  complete source means the exchange terminated, and continuity protects only
+  incomplete exchanges. Plain registers are not claimed and therefore not claim-gated;
+  applying one side without the other would turn a resumed owner's own plain records
+  into foreign state.
+  The ordinary exact-sequence delete needs no added read: the claim rewrite is the fence,
+  and a delete holding the pre-claim sequence removes nothing. Thus each shared register's
+  close-versus-resume decision is durable and consumed once at its own subject sequence.
 - **Registered if and only if transmitted.** A delivery withheld by the in-flight cap
   was never sent, so it is never registered. A retained-message send has no JetStream
   backing at all, so it has no register and no post-restart redelivery.
@@ -1063,9 +1165,17 @@ registers are enumerated by subject in one request (the identifier's 16 bits bou
 filter below JetStream's subject-detail truncation point, which is why this enumeration
 is safe here although the account-wide orphan sweep refuses it) and loaded in bounded
 batches; sources are then classified once per *source*, with one consumer lookup per
-durable and batched message reads. Every uncertainty is preserved exactly as the
-one-at-a-time path preserved it: a missing response, an unreadable consumer and a
+durable and batched message reads. Shared-register claim writes are likewise pipelined in
+a bounded concurrent window; their subjects are distinct and carry no ordering dependency,
+so serializing them would restore the same pre-CONNACK latency problem. Every uncertainty
+is preserved exactly as the one-at-a-time path preserved it: a missing response, an
+unreadable consumer and a
 consumer that is gone are all "unknown", never "complete".
+
+An unreadable register cannot participate in claim arbitration: its body cannot be
+rewritten while preserving the allocation identity, so a stale object may still know its
+sequence. It remains in the existing loud, fail-closed opaque state — the identifier is
+reserved and new allocation is withheld — rather than being guessed owned or closed.
 
 ## Session incarnations and teardown
 
