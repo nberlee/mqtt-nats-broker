@@ -2996,7 +2996,23 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 	// This needs to be done outside of any lock.
 	if doClean {
 		if err := sess.clear(true); err != nil {
-			c.Errorf("%s", err.Error())
+			// A LATE ambiguity — armed after the entry check the discard already passed —
+			// deleted nothing, so the discard is recoverable: park it and restore the
+			// residency removeSession took above. Without that the record, the consumers,
+			// the shared group durables and this generation's registers survive with NO
+			// resident object, and nothing reaps them — retryUncertainSessions and CONNECT
+			// both scan as.sessions, and sweepSessionExpiries skips an ExpiryInterval == 0
+			// record — so only a reconnect on this client ID ever would.
+			//
+			// The Will is NOT parked: mqttHandleWill below still runs and publishes it
+			// immediately, exactly as it does today after a failed clear(). See
+			// reparkRefusedDiscard.
+			//
+			// FALL THROUGH rather than return. The !doClean block is skipped anyway, and
+			// this connection's Will is still owed.
+			if !errors.Is(err, errMQTTClearRefusedUnresolved) || !s.reparkRefusedDiscard(asm, sess, time.Now().Unix()) {
+				c.Errorf("%s", err.Error())
+			}
 		}
 	} else {
 		// Session survives the disconnect: drop pending QoS 1/2 state for shared
@@ -4948,10 +4964,11 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 	if err := as.lockSession(sess, nil); err != nil {
 		return
 	}
-	// Re-check that no client re-bound before we acquired the session lock.
+	// Re-check that no client re-bound before we acquired the session lock. The
+	// binding is the ownership gate's business, which this path holds, so it is
+	// decided here rather than inside the record transaction below.
 	sess.mu.Lock()
 	rebound := sess.c != nil
-	seq := sess.seq
 	sess.mu.Unlock()
 	if rebound {
 		as.unlockSession(sess)
@@ -4967,9 +4984,48 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 	// best-effort disconnect save) leaves our in-memory view authoritative, so the
 	// fired timer still cleans up and finite expiry is never silently skipped.
 	// Spec5 [3.1.2.11.2].
-	superseded := false
-	if smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash); err == nil && smsg.Sequence > seq {
-		superseded = true
+	//
+	// A higher record sequence is NOT evidence of a remote owner while this session's
+	// own write is unresolved: an ambiguous write that actually LANDED with its
+	// response lost leaves sess.seq stale and the record's sequence higher, so this
+	// condition would be true for our own write and would evict the object — with its
+	// pendingWrite, its retained continuations and its staged void-register verdicts —
+	// before clear() could refuse. Sequence is not identity (see sess_uncertain.go,
+	// which classifies by DIGEST); so while unresolved, fall through to the clear()
+	// attempt, which refuses with the sentinel and parks the discard, and let
+	// resolution decide ours-versus-foreign with the test that can actually tell them
+	// apart. A foreign verdict evicts and drops the obligation; an "ours" verdict
+	// adopts the landed sequence and discharges the discard against it.
+	//
+	// ONE uninterrupted record transaction covers the load, the sess.seq read and the
+	// decision. A mutex sample alone is check-then-act — the fence is what serializes
+	// record writers — and arming uncertainty requires a save, which requires this
+	// fence, so nothing can change the decision's inputs underneath it. The seq read
+	// belongs INSIDE for the same reason: a save landing between an outside sample and
+	// the fence advances the real sequence and yields a false "superseded". See
+	// sess_recordtx.go.
+	tok := sess.beginRecordTx()
+	var loadedSeq uint64
+	if smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash); err == nil {
+		loadedSeq = smsg.Sequence
+	}
+	sess.mu.Lock()
+	seq := sess.seq
+	uncertain := sess.seqUncertain
+	sess.mu.Unlock()
+	superseded := !uncertain && loadedSeq > seq
+	// Test seam, fired with the fence still HELD and the load already done, carrying the
+	// sequences the decision was made from: that pair is what states "one uninterrupted
+	// transaction" as an assertion instead of a race.
+	if h := mqttTestExpireDecisionHookV.Load(); h != nil {
+		(*h)(sess, loadedSeq, seq, superseded)
+	}
+	// Released WITHOUT ending the generation — nothing was mutated — and before clear(),
+	// which opens a transaction of its own because it ends the generation. An ambiguity
+	// armed in that gap lands on clear()'s entry or in-fence refusal, so both branches
+	// converge on the sentinel and the recovery below.
+	if terr := sess.endRecordTx(tok); terr != nil {
+		s.Errorf("MQTT: %v", terr)
 	}
 	if superseded {
 		// Our copy is stale: drop it and hand off to the record-based path, which
@@ -4988,8 +5044,40 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 	defer as.unlockSession(sess)
 	as.removeSession(sess, true)
 	if err := sess.clear(true); err != nil {
+		// The refusal deleted nothing, and the evicted object would take the unresolved
+		// write's pendingWrite, its retained continuations and its staged void-register
+		// verdicts with it — all of them lost outright, since only this object can classify
+		// that write. This path has NO early uncertainty check, so the write is often
+		// already unresolved when the timer fires rather than going ambiguous under us;
+		// either way the sentinel says nothing was deleted, which is what makes the discard
+		// recoverable. Park it with the deadline the client actually earned and restore
+		// residency; the deferred as.unlockSession above then releases the gate and runs the
+		// void-verdict handoff for a session that is resident again. Keyed on the SENTINEL
+		// alone. See reparkRefusedDiscard.
+		sess.mu.Lock()
+		disconnectedAt := sess.disconnectedAt
+		sess.mu.Unlock()
+		if errors.Is(err, errMQTTClearRefusedUnresolved) && s.reparkRefusedDiscard(as, sess, disconnectedAt) {
+			s.Warnf("MQTT session expiry for %q found the record state unresolved; the discard stays parked until it is classified", sess.id)
+			return
+		}
 		s.Warnf("MQTT session expiry cleanup for %q failed: %v", sess.id, err)
 	}
+}
+
+// mqttTestExpireDecisionHookV fires inside expireSession's record transaction, immediately
+// after the superseded decision is computed and while the fence is still held. See
+// expireSession.
+var mqttTestExpireDecisionHookV atomic.Pointer[func(sess *mqttSession, loadedSeq, seq uint64, superseded bool)]
+
+func setMQTTTestExpireDecisionHook(h func(sess *mqttSession, loadedSeq, seq uint64, superseded bool)) func() {
+	prev := mqttTestExpireDecisionHookV.Load()
+	if h == nil {
+		mqttTestExpireDecisionHookV.Store(nil)
+	} else {
+		mqttTestExpireDecisionHookV.Store(&h)
+	}
+	return func() { mqttTestExpireDecisionHookV.Store(prev) }
 }
 
 // loadExpiringSessionRecord loads and decodes the persisted record for idHash
@@ -5086,6 +5174,13 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	sess.pubRelConsumer = ps.PubRel
 	sess.q2AffConsumer = ps.Q2Aff
 	sess.q2AffGen = ps.Q2AffGen
+	// clear()'s late-uncertainty refusal is UNREACHABLE here, so no recovery is written
+	// for it: seqUncertain is armed only by a failed save on this very object
+	// (saveWithDetail), and this object is transient — mqttSessionCreate starts no
+	// goroutine, it is registered nowhere, and nothing writes through it before the
+	// clear() below. If that proof were ever wrong the refusal is still fail-closed:
+	// the session is not destroyed on a sequence nobody classified, only left for the
+	// next sweep.
 	if err := sess.clear(true); err != nil {
 		s.Warnf("MQTT session expiry cleanup for %q failed: %v", ps.ID, err)
 	}
@@ -7588,6 +7683,12 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		// Wait for the deletes (like the clean-start discard): a queued no-wait
 		// delete of the deterministic PUBREL durable could otherwise race the new
 		// session recreating it.
+		// As in expireSessionFromRecord, the late-uncertainty refusal is UNREACHABLE on
+		// this object and gets no recovery: it was just built from the record, this
+		// function never returns it resident (only the non-overdue branch below calls
+		// addSession) and nothing writes through it before this call, so no save can have
+		// armed uncertainty. The refusal is retained as a fail-closed invariant — the
+		// CONNECT is refused rather than the session destroyed unclassified.
 		if err := sess.clear(false); err != nil {
 			return nil, false, fmt.Errorf("clearing expired session: %w", err)
 		}
@@ -7986,40 +8087,24 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	return detail, nil
 }
 
-// Clear the session: discard everything one session incarnation owns and remove
-// its record.
+// errMQTTClearRefusedUnresolved is the sentinel clear returns when it refused BEFORE its
+// first deletion because the record state is unresolved. What it encodes is
+// RECOVERABILITY, not timing: nothing was deleted, claimed or reset, so a caller holding an
+// obligation can put it back untouched and a caller holding a client can simply reject.
 //
-// The destructive half runs under a DURABLE TEARDOWN CLAIM, not under the local
-// locks: lockSession and the record transaction fence are in-process, so they
-// arbitrate nothing against a broker that has taken the session over. A lost claim
-// means a newer owner exists and NOTHING is deleted. A release that removes no
-// record is classified by re-reading rather than assumed to be ours. And every
-// resource named here is generation-scoped, so even a delete that lands after a
-// peer finished the whole teardown can only name something that is already gone.
-// See sess_teardown.go.
+// It deliberately says nothing about WHEN the write became unresolved, because both are
+// real. The in-fence refusal is genuinely late — an off-readLoop writer went ambiguous
+// while this call waited for the fence. The entry refusal is not necessarily late at all:
+// expireSession has no early uncertainty check, so it can arrive with the write already
+// unresolved before its timer ever fired.
 //
-// It runs in a record transaction of the OLD generation — its record removal must
-// validate against the epoch it opened with — and ends that generation as it
-// releases the fence, so every token minted before it is dead. That covers the two
-// paths that hand this very object back to be reused as a fresh session: they
-// write normally at the new epoch while any pre-clear() writer is refused. See
-// sess_recordtx.go.
-//
-// Runs from the client's readLoop.
-// Lock not held on entry, but session is in the locked map.
-func (sess *mqttSession) clear(noWait bool) error {
-	return sess.clearEx(noWait, false)
-}
+// It is a distinct error precisely so that recovery is never inferred from an arbitrary
+// clear() failure — a lost teardown claim or a JetStream error means the teardown is
+// another owner's or partly done, and re-parking there would resurrect an obligation
+// nobody owes.
+var errMQTTClearRefusedUnresolved = errors.New("clear refused before deletion: the record state is unresolved")
 
-// errMQTTClearLateUncertain is the sentinel clearEx returns when a record write became
-// unresolved AFTER the discard was authorized: nothing was deleted and nothing was reset,
-// so a caller holding an obligation can put it back untouched. It is a distinct error
-// precisely so that recovery is never inferred from an arbitrary clear() failure — a lost
-// teardown claim or a JetStream error means the teardown is another owner's or partly
-// done, and re-parking there would resurrect an obligation nobody owes.
-var errMQTTClearLateUncertain = errors.New("a record write became unresolved after the discard was authorized")
-
-// mqttTestClearWindowHookV fires at each of clearEx's two decision points, named by the
+// mqttTestClearWindowHookV fires at each of clear's two decision points, named by the
 // window: BEFORE its entry check, and after that check but before it takes the record
 // fence. Both are windows in which another writer's ambiguity is still invisible to the
 // check that follows, and a test arms one positively there instead of sleeping.
@@ -8046,20 +8131,41 @@ func (sess *mqttSession) clearWindowHook(window string) {
 	}
 }
 
-// clearEx is clear() with the late-uncertainty refusal made OPT-IN.
+// Clear the session: discard everything one session incarnation owns and remove
+// its record.
 //
-// refuseLateUncertainty re-checks the unresolved state with the fence HELD, which is the
-// sound check — the entry check below is a check-then-act, because the fence is what
-// serializes writers and an off-readLoop one (a register store settling) can go ambiguous
-// while this call is still waiting for it. Only the DEFERRED DISCHARGE asks for it: it runs
-// with the parked action — deadline and Will — already consumed, so it must be able to put
-// that obligation back rather than tear the session down on a sequence nobody classified.
+// The destructive half runs under a DURABLE TEARDOWN CLAIM, not under the local
+// locks: lockSession and the record transaction fence are in-process, so they
+// arbitrate nothing against a broker that has taken the session over. A lost claim
+// means a newer owner exists and NOTHING is deleted. A release that removes no
+// record is classified by re-reading rather than assumed to be ours. And every
+// resource named here is generation-scoped, so even a delete that lands after a
+// peer finished the whole teardown can only name something that is already gone.
+// See sess_teardown.go.
 //
-// Every other caller keeps the historical behavior deliberately. They evict or log rather
-// than recover, so turning a late ambiguity into a refusal there would strand the object
-// while its record and consumers survive; their exposure to this race is pre-existing,
-// stated in docs/CONFORMANCE.md, and closing it needs per-caller recovery (a roadmap item).
-func (sess *mqttSession) clearEx(noWait, refuseLateUncertainty bool) error {
+// It runs in a record transaction of the OLD generation — its record removal must
+// validate against the epoch it opened with — and ends that generation as it
+// releases the fence, so every token minted before it is dead. That covers the two
+// paths that hand this very object back to be reused as a fresh session: they
+// write normally at the new epoch while any pre-clear() writer is refused. See
+// sess_recordtx.go.
+//
+// BOTH uncertainty refusals are UNCONDITIONAL, and both carry
+// errMQTTClearRefusedUnresolved. The in-fence one re-checks with the fence HELD, which is
+// the sound check — the entry check below is a check-then-act, because the fence is
+// what serializes writers and an off-readLoop one (a register store settling) can go
+// ambiguous while this call is still waiting for it. It was once opt-in, for the
+// deferred discharge alone, because no other caller could act on the sentinel; each
+// reachable caller now acts on the sentinel, though the shared recovery may decline, so
+// the flag was a mechanism that said "true" at every
+// site it could reach. The two callers built from a record just read
+// (expireSessionFromRecord, createOrRestoreSession's overdue discard) cannot arm
+// uncertainty at all — see the proofs beside them — and refuse rather than destroy if
+// that proof were ever wrong.
+//
+// Runs from the client's readLoop.
+// Lock not held on entry, but session is in the locked map.
+func (sess *mqttSession) clear(noWait bool) error {
 	// REFUSE AT ENTRY while an earlier write is unresolved, BEFORE any consumer or
 	// record deletion. sess.seq may be stale, and this path deletes the shared
 	// durables and the record before a stale CAS could fail — so it must not run on
@@ -8067,28 +8173,28 @@ func (sess *mqttSession) clearEx(noWait, refuseLateUncertainty bool) error {
 	// sess_uncertain.go.
 	sess.clearWindowHook(mqttClearWindowPreEntry)
 	if sess.isSeqUncertain() {
-		if refuseLateUncertainty {
-			// The SENTINEL belongs here too, not only on the in-fence refusal. The
-			// caller's own uncertainty check ran before this call and cannot cover the
-			// interval since — the two are not under one fence — so an ambiguity armed in
-			// between arrives at THIS check, and it is every bit as recoverable: nothing
-			// has been deleted. Returning a plain error would have the caller treat it as
-			// a partly-done teardown and drop an obligation it could have put back.
-			return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearLateUncertain)
-		}
-		return fmt.Errorf("refusing to discard session %q: an earlier record write is unresolved", sess.id)
+		// The SENTINEL belongs here too, not only on the in-fence refusal, because what it
+		// encodes is that nothing has been deleted — which is equally true here. Two states
+		// reach this check: a caller whose own uncertainty check ran before this call cannot
+		// cover the interval since (the two are not under one fence), so an ambiguity armed
+		// in between arrives HERE; and expireSession has no early check at all, so it
+		// arrives with the write already unresolved. Returning a plain error would have
+		// either caller treat it as a partly-done teardown and drop an obligation it could
+		// have put back.
+		return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
 	}
 	sess.clearWindowHook(mqttClearWindowPreFence)
 
 	tok := sess.beginRecordTx()
 	// Nothing has been mutated yet, so the fence is released WITHOUT ending the
 	// generation: this session is not being discarded after all, and the next resolution
-	// decides again.
-	if refuseLateUncertainty && sess.isSeqUncertain() {
+	// decides again. endRecordTxNewGeneration would bump recordEpoch and kill every token
+	// minted before it, for a discard that is not happening.
+	if sess.isSeqUncertain() {
 		if terr := sess.endRecordTx(tok); terr != nil {
 			sess.jsa.c.Errorf("MQTT: %v", terr)
 		}
-		return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearLateUncertain)
+		return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
 	}
 	// Released on EVERY exit path, including the error returns below, after which
 	// the in-memory state is already reset and old writers must be dead anyway.
@@ -8206,7 +8312,7 @@ func (sess *mqttSession) clearEx(noWait, refuseLateUncertainty bool) error {
 	//
 	// The CONNECT reuse path happens to clear this again after calling clear(), so
 	// the hazard is not reachable through it today; that is a caller compensating
-	// for state clear() left inconsistent, in one of its five call sites. The
+	// for state clear() left inconsistent, in one of its six call sites. The
 	// invariant belongs here, beside the re-mint that breaks it — exactly as the
 	// affine path already does with q2AffSubscribed below.
 	sess.pubRelSubscribed = false
@@ -9808,6 +9914,19 @@ CHECK:
 			// associated with this Session MUST NOT be reused in any subsequent
 			// Session.
 			if err := es.clear(false); err != nil {
+				if errors.Is(err, errMQTTClearRefusedUnresolved) {
+					// A LATE ambiguity — armed by an off-readLoop writer while this
+					// discard waited for the fence — deleted nothing, so this case gets
+					// the SAME answer as the early one above: reject without evicting,
+					// and let the client retry. Evicting here would drop the retained
+					// continuations, so a mutation the ambiguous write persisted would
+					// never be committed and one that did not land never undone, and the
+					// gate release reads asm.sessions to decide the void-verdict handoff,
+					// which an evicted object never gets. Nothing is parked: this path has
+					// a client waiting for a CONNACK, not an obligation, and the retry's
+					// own uncertainty check resolves the session.
+					return formatError(fmt.Errorf("session record state is unresolved"))
+				}
 				asm.removeSession(es, true)
 				return err
 			}

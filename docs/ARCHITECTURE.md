@@ -1092,15 +1092,53 @@ The invariants, in the order they matter:
   own write ambiguous, and applying the close anyway would have every write refused with
   nothing left holding the original deadlines. The DEFERRED DISCARD branch cannot hold a
   fence across `clear()` — that call ends the record generation and must own its
-  transaction — so it asks `clear` for an OPT-IN late refusal instead: a re-check WITH THE
-  FENCE HELD, before the first deletion, releasing without ending the generation because
-  nothing was mutated, and returning a distinct sentinel. The branch re-parks on that
-  sentinel alone and never on "is the session uncertain now", because any other failure
-  means a lost teardown claim or a half-done teardown, where re-parking would resurrect an
-  obligation that is not this broker's to discharge. The refusal is opt-in because every
-  other `clear` caller evicts or logs rather than recovers: turning a late ambiguity into
-  a refusal there would strand the object while its record and consumers survive. Their
-  exposure to the same race is unchanged and stated in `docs/CONFORMANCE.md`.
+  transaction — so `clear` performs the late refusal itself: a re-check WITH THE FENCE
+  HELD, before the first deletion, releasing without ending the generation because nothing
+  was mutated, and returning a distinct sentinel. The branch re-parks on that sentinel
+  alone and never on "is the session uncertain now", because any other failure means a lost
+  teardown claim or a half-done teardown, where re-parking would resurrect an obligation
+  that is not this broker's to discharge.
+- **`clear()` always refuses before its first deletion on an unclassified sequence.** That
+  is the delivered invariant, and it is unconditional: both refusals — at entry and with the
+  fence held — always carry the sentinel. What each caller then does is NOT uniform, and
+  is enumerated below rather than summarized: the shared recovery can decline, so this
+  section deliberately asserts no universal recovery.
+  The refusal was once opt-in for the deferred discharge alone, because no other caller
+  could act on it; three more now can — four of the six call sites in all — so the flag
+  was a mechanism reading
+  "true" at every site it could reach. The refusal alone is not enough either:
+  "never tear down on an unclassified sequence" would otherwise become "strand the object
+  while its record, its consumers and the shared group durables it owed a release all
+  survive", because those callers evict before clearing. The ORDINARY CLEAN CLOSE and
+  SESSION EXPIRY share one helper
+  (`reparkRefusedDiscard`): it parks a discard-only obligation — `expiryInterval` 0, so the
+  discharge takes the deferred discard branch above — and then RESTORES RESIDENCY, which is
+  what every resolver needs, since the retry pass and CONNECT both scan the resident
+  sessions and the expiry sweep looks at no `ExpiryInterval == 0` record at all. Park
+  first, publish second: the obligation must exist before the object is reachable. The WILL
+  is deliberately NOT parked — a parked Will is memory-only and a remote takeover drops it,
+  regressing a Will the broker delivers today — so the close falls through to
+  `mqttHandleWill`, which publishes immediately for the expiry-0 session a discard always
+  is; expiry has no Will, its own was discharged by the close that started the deadline.
+  The helper ARBITRATES NOTHING against an obligation already parked: it accepts only the
+  shape it would have written itself (ends at disconnect, no Will), never mutating or
+  replacing it, and declines every other shape back to the caller's historical
+  evict-and-log, because a parked action carries no owner identity and nothing there can
+  prove whose deadline or whose Will a retarget would overwrite. CONNECT's clean start
+  instead REJECTS WITHOUT EVICTING, the same answer its early path gives: it has a client
+  waiting for a CONNACK, not an obligation, and the retry's own uncertainty check resolves
+  the session. Session expiry also stops reading a higher record sequence as a remote owner
+  while its own write is unresolved — an ambiguous write that LANDED with its response lost
+  produces exactly that shape, and evicting there would discard the only object that can
+  classify it — so the decision is deferred to the digest classifier, and it is made inside
+  ONE record transaction spanning the load, the `sess.seq` read and the decision, since a
+  mutex sample alone is check-then-act and arming uncertainty requires the fence. The two
+  callers built from a record just read (the record-based expiry, the restore path's
+  overdue discard) cannot reach the sentinel at all: nothing writes through those transient
+  objects before the discard, so no save can have armed uncertainty. They keep the
+  unconditional refusal as a fail-closed invariant and carry the proof as a comment. What
+  the recovery does NOT make durable is stated in `docs/CONFORMANCE.md`: the obligation is
+  memory-only, so a crash or a remote takeover in that window drops it.
 - **Every landed record write credits the verdicts it marshalled.** Durability of a
   verdict is a property of the write that carried it, not of the intent of whoever was
   persisting, so the credit lives at the write: `save` samples the void-register revision

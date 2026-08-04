@@ -1048,7 +1048,7 @@ is fixed before feature work continues.
   resolver re-check sites, the inherited-verdict credit, four contended-save
   credit variants, the rollback exemption, both re-park windows (a discharge that
   finds the state unresolved again at either of ITS two checks, and a discard
-  refused at either of `clearEx`'s), the contention hand-back, and the periodic
+  refused at either of `clear`'s), the contention hand-back, and the periodic
   backstop with its evicted-snapshot arm. Mutations killed by their paired
   test: MU1 (the bare purge), MU2 (no purge), MU3 (stamp the disconnect time after
   the save), MU4 (no continuation), MU5 (a plain re-save), MU6/MU8/MU9 (each
@@ -1058,7 +1058,9 @@ is fixed before feature work continues.
   from both guards), MU14 (no watermark reset in `clear()`), MU15/MU15b (each credit
   site), MU16 (the contended-save credits), MU17 (an ungated attempt) and MU18 (the
   rollback credits), MU19 (no unresolved re-check at the discharge), MU20/MU20b
-  (`clearEx` without its in-fence re-check, and a discharge that does not opt in),
+  (`clear` without its in-fence re-check, and a discharge that does not opt in;
+  MU20b is no longer expressible, the opt-in flag having been deleted by the
+  late-uncertainty-recovery item below),
   MU21 (no re-park on the late-refusal sentinel), MU22 (the entry refusal drops
   that sentinel), MU23 (the handoff recurses through its own releases instead of
   looping), MU24/MU24b (a contended attempt hands its loop ownership back outside
@@ -1096,32 +1098,97 @@ is fixed before feature work continues.
   its three-way register residue).
   Spec5 [4.8.2], [4.9].
 
-- [ ] Give every `clear()` caller a late-uncertainty recovery, so a discard never
-  runs on a sequence nobody has classified. `clear` refuses at ENTRY while a
-  record write is unresolved, and that check is a check-then-act: the fence is
-  what serializes writers, so an off-readLoop one — a register store settling —
-  can arm `seqUncertain` while the call is already waiting for the fence. The
-  deferred discharge now opts into an in-fence re-check (`clearEx`'s
-  `refuseLateUncertainty`, returning `errMQTTClearLateUncertain`) because it can
-  put its consumed action back. The other four callers cannot, and the refusal is
-  deliberately NOT extended to them: `mqttHandleClosedClient` removes the session
-  before clearing and logs, `expireSession` does the same, CONNECT's clean start
-  removes it on error, and the record-restore discard returns the error — so a
-  refusal there would strand the object while its record and consumers survive.
-  Today they instead PROCEED, and their sequence-targeted record delete then
-  removes nothing, leaving a record whose durables are gone until a later
-  reconnect discards it (stated in `docs/CONFORMANCE.md`).
-  The fix is per-caller recovery, each with its own invariant: the ordinary close
-  parks a FULL deferred action (disconnect time and Will) instead of logging, the
-  expiry retains the session and retries the due discard after resolution, CONNECT
-  rejects without evicting the continuation-bearing object, and the restore path
-  keeps the object it was about to discard. Each needs a forced-race test using
-  the clear-window seam (`setMQTTTestClearWindowHook`, whose
-  `mqttClearWindowPreEntry` and `mqttClearWindowPreFence` name the two windows an
-  ambiguity can be armed in) and a mutation that removes
-  only that caller's recovery. Filed as a separate item deliberately: the
-  deferred-close work above proved that widening this refusal without per-caller
-  recovery trades one loss for another.
+- [x] Make the late-uncertainty refusal unconditional in `clear()`, give the three
+  newly-exposed callers a recovery, and prove the two transient ones cannot reach it — so
+  a discard never runs on a sequence nobody has classified. (Retitled at close-out. The
+  original wording promised every `clear()` caller a recovery; two of them ship an
+  unreachability proof plus a fail-closed refusal instead, and the shared helper declines
+  for a parked shape it cannot arbitrate. The delivered invariant is the narrower one in
+  this title, and the reviews that caught both overclaims are in the ledger.)
+  The COMPLETE partition is SIX production call sites, which the plan miscounted as five
+  by omitting the one that already recovered. FOUR are REFUSAL-AWARE: reachable while the
+  record state is unresolved, and each acting on the sentinel rather than destroying. What
+  each then does differs, and none of them recovers unconditionally — the deferred
+  discharge in `sess_uncertain.go` re-parks its consumed action (the pre-existing case this
+  item generalized); CONNECT's clean start rejects without evicting; and the clean close
+  and session expiry park the discard only when the shared helper ACCEPTS, failing closed
+  to the historical evict-and-log when it declines. TWO clear a transient object built
+  from a record just read and carry an unreachability proof.
+  `clear` refused at ENTRY while a record
+  write was unresolved, and that check is a check-then-act: the fence is what
+  serializes writers, so an off-readLoop one — a register store settling — can arm
+  `seqUncertain` while the call is already waiting for the fence. The in-fence
+  re-check was OPT-IN, taken only by the deferred discharge, because it was the one
+  caller that could put its consumed action back.
+  What landed: the opt-in flag is gone and BOTH refusals always return
+  `errMQTTClearRefusedUnresolved`, the in-fence one releasing with `endRecordTx` rather
+  than ending the generation, since nothing was mutated. The
+  ordinary clean close and session expiry share `reparkRefusedDiscard`
+  (`sess_uncertain.go`): park a discard-only obligation (`expiryInterval` 0, so the
+  discharge takes the deferred discard branch) and restore RESIDENCY, which is what
+  the retry pass and CONNECT both need and what an expiry-0 record has no other
+  reaper for. The close does NOT park the Will — a memory-only Will is dropped by a
+  takeover, a regression against today — and falls through to `mqttHandleWill`,
+  which publishes immediately for the expiry-0 session a discard always is. CONNECT's
+  clean start rejects without evicting, exactly as its early path does. The helper is
+  strictly IDEMPOTENT: it accepts an already-parked action only when that action ends
+  at disconnect and carries no Will, never mutating or replacing it, and declines
+  every other shape back to today's evict-and-log — a parked action carries no owner
+  identity, so nothing can prove whose deadline or Will a retarget would overwrite.
+  `expireSession` additionally stops taking its superseded shortcut while its own
+  write is unresolved: an ambiguous write that LANDED with its response lost leaves
+  `sess.seq` stale and the record's sequence higher, so that shortcut evicted the
+  only object able to classify it, making the recovery unreachable for half the
+  ambiguities it exists for. Sequence is not identity; the decision now runs inside
+  ONE record transaction spanning the load, the `sess.seq` read and the decision, and
+  defers ownership to the digest classifier.
+  The TWO transient callers were REFUTED as unexposed, so the original promise that
+  "the restore path keeps the object it was about to discard" is withdrawn rather
+  than implemented: `expireSessionFromRecord` and `createOrRestoreSession`'s overdue
+  discard both clear a transient object built from a record they just read, which is
+  registered nowhere and written through by nobody, so no save can arm uncertainty on
+  it. They keep the unconditional refusal as a fail-closed invariant and carry the
+  proof as a comment. Codex confirmed the refutation independently.
+  Tests: `sess_clear_recovery_test.go` (expiry at both windows, the non-sentinel
+  post-claim failure, unconditional refusal with `recordEpoch` unchanged, the
+  production-shaped re-entry, the declining shapes, the landed-response-lost expiry,
+  and two fence tests) and `sess_clear_recovery_e2e_test.go` under
+  `mqttport_fulltests` (the clean close with its Will over real connections, the
+  rejected clean start, the v5 expiry-override discard reporting Session Present
+  false, and the owed-now Will characterization). Mutations run and KILLED: MU-A,
+  MU-A2, MU-A3, MU-B, MU-B2, MU-B3, MU-C, MU-D (against both the expiry and the close
+  test), MU-E, MU-F, MU-G, MU-G2, MU-H, MU-I, MU-I2, MU-I2a. Two were run and
+  SURVIVED, reported rather than dressed up as kills: MU-J (the helper reads the
+  parked action without `sess.mu`) — every writer of that field is reachable only
+  gate-held or as a singleton check-and-write inside one `sess.mu` section, so no
+  execution overlaps one with the helper's read and `-race` has nothing to observe;
+  and MU-I2b (leaving the `sess.seq` sample outside the fence) — the pre-fence sample
+  normally equals the later value, and `tryBeginRecordTx` reports only that SOME
+  transaction is open, never transaction identity. Both remain as discipline carried
+  on the argument, and the `sess.seq` read still moved inside the fence because the
+  window it closes is real. MU-A3 needed a test the plan did not have, and it is killed
+  as a DEFENSIVE-branch mutation rather than a production-shaped one: with the session
+  RESOLVED the helper's own uncertainty gate already refuses, so only a post-claim failure
+  leaving the session UNRESOLVED separates the caller's sentinel check from that gate —
+  and that state is NOT production-reachable, because `clear()` holds its record
+  transaction from before the in-fence re-check through the claim and the delete, so no
+  writer can arm uncertainty inside it. T3b constructs the state directly and says so;
+  what it pins is that the two checks are distinct facts, not a runtime interleaving.
+  Two mutation-harness faults were found and fixed
+  mid-run — a shell field-split that ran an empty `-run` regex and reported "no tests
+  to run" as a survivor, and an MU-I2a definition that re-acquired the fence and so
+  never modelled deciding outside it.
+  Residuals in `docs/CONFORMANCE.md`: the obligation is memory-only, so a crash or a
+  remote takeover drops it, and a non-discard-only parked action makes the helper
+  DECLINE — a third loss path needing neither, whose reachability is unknown; for the
+  v5 expiry-override close all three leave a record a non-clean reconnect resumes (its
+  own §0 bullet below); the clean close's owed-now WILL is published after the
+  recovery, so the same crash loses it, which is pre-existing and not closable without
+  a durable Will intent; a session whose ambiguity never resolves is held resident
+  rather than reaped by the sweep's stamp-a-new-deadline fallback, with the full
+  retained footprint and the once-per-sweep re-entry stated; and the protection is per
+  owning broker, complete fleet-wide only once every broker serving the account runs
+  this code.
 
 - [ ] Investigate: a definite record-CAS rejection with a MISSED remote-persist
   notification may leave a never-expiring stale local session resident
@@ -1163,6 +1230,75 @@ is fixed before feature work continues.
   above says pre-existing, the counts say only "rare and load-sensitive".
   Needs a deterministic reproduction (hold the old connection's close between
   the rebind check and the teardown, then CONNECT) before any fix.
+  Unchanged by the `clear()`-recovery item above, which narrowed a SIBLING of this
+  defect (below) but does nothing for this one: this window returns at the
+  `sess.c != c` check, before any `clear()` is attempted, so no refusal and no
+  recovery is involved.
+
+- [ ] Persist the v5 DISCONNECT Session-Expiry-Interval override, or make the resume
+  decision stop trusting the record's `Clean` flag alone. A v5 DISCONNECT carrying
+  Session Expiry Interval 0 ends a session that was persistent, but it updates
+  `sess.expiryInterval` and `c.mqtt.sessionExpiry` IN MEMORY ONLY: nothing is
+  persisted and `sess.clean` is not updated either. So the record still says
+  `ExpiryInterval > 0`, `Clean = false`, `DisconnectedAt = 0`, and
+  `createOrRestoreSession` copies those values back on restore — a non-clean
+  reconnect that meets the surviving record fails `cleanSess || es.clean || overdue`
+  and resumes a session the DISCONNECT ended, reporting Session Present true against
+  Spec5 [3.1.2.11]. A SIBLING of the reconnect-race bullet above, not the same
+  defect: that mechanism is entirely in memory (the resident object is resumed and
+  the record plays no part), while this one is a durable record that any broker can
+  meet, including one that never saw the DISCONNECT. It bites whenever the owed
+  discard's in-memory intent is lost, which the `clear()`-recovery item above narrowed
+  from unconditional to three cases: a crash before the discharge, a remote takeover
+  that evicts the object, and — needing neither of those — the recovery helper
+  DECLINING for an already-parked action that is not the discard-only shape, after
+  which the close evicts and logs. The third case's reachability is unknown and is not
+  assumed away; `docs/CONFORMANCE.md` states all three.
+  The obvious fix is not a one-liner, and any plan must start here: the resume
+  decision keys on `es.clean`, not on the interval, and the restore path sets
+  `sess.clean = ps.Clean` separately from `ps.ExpiryInterval`, so persisting the
+  interval alone produces exactly the inconsistent record this gap is about. And a
+  DISCONNECT-time save can itself land ambiguously, which is the state the recovery
+  above exists to handle — so the fix must not assume its own write succeeded.
+  Found by the plan review of the `clear()`-recovery item.
+
+- [ ] Investigate: ONE unidentified `mqttport_fulltests` failure in 21 forced runs on the
+  `clear()`-recovery tree, and the identity was DESTROYED rather than lost to chance.
+  The run that failed (346.1s) was piped through `tail -4`, so its `--- FAIL: <TestName>`
+  line was discarded and cannot be recovered; the same command class that reported "no
+  tests to run" as a passing mutation earlier in that work. Rule that follows from it:
+  never truncate a suite run's output before knowing the outcome — capture the whole log
+  and grep it.
+  NOT reproduced in, all on the same tree and all `-count=1`: 20 further full-suite runs
+  (ten plain, ten `-v`, each executing 786 top-level tests and 2065 including subtests, so
+  none vacuous), 12 runs of the `Expiry|Expire` subset, 20 runs of the change's own 14
+  tests, two `-race` unit suites and two `-race` cluster-failover runs. Rate therefore
+  1/21 (~5%), which is why no cheap paired soak can settle it: distinguishing 5-9% from 0%
+  needs roughly 40 runs per arm, and `test/soak.sh` adds `-race`, putting a whole-suite
+  paired soak near 15 hours. The identity has to come first, and then
+  `SOAK_RUN='<TestName>' SOAK_BASE=HEAD make soak` is minutes and decisive.
+  The failing run overlapped no other suite and no review, so the one known remaining
+  cause in the flakiness notes — starvation above roughly four concurrent suites — does
+  not explain it. First hypothesis to test, and it belongs to that change: `expireSession`
+  now acquires the record fence with the BLOCKING `beginRecordTx` around its record load
+  and superseded decision, where it previously took no fence at all. The plan review
+  cleared that as bounded contention rather than deadlock, which is a statement about
+  SAFETY and not about latency — an expiry that used to proceed immediately can now wait
+  for a readLoop writer. The 12 clean subset runs argue against it without clearing it,
+  since the subset does not reproduce the whole suite's timing or its session population.
+
+- [ ] Fix the `removeSessFromFlappers` data race, with a reproduction first.
+  `mqttDeferDisconnectEx` calls `asm.removeSessFromFlappers` WITHOUT holding
+  `asm.mu` (`sess_uncertain.go`), while that helper documents "Lock held on entry"
+  and deletes from `as.flappers` directly (`mqtt.go`) — and CONNECT reads the same
+  map under `asm.mu`. A real pre-existing race at both of that function's call
+  sites. Found by the plan review of the `clear()`-recovery item and verified
+  against the code; that item's design does not go through
+  `mqttDeferDisconnectEx`, so it neither widens nor fixes it. Needs, in this order:
+  a `-race` reproduction covering BOTH call sites; a lock-order and deadlock
+  analysis for `sess.mu` against `asm.mu`, since the call sites hold or take
+  `sess.mu` and the naive fix takes `asm.mu` inside it; and then a focused fix with
+  a regression test.
 
 - [ ] Investigate: the Phase-2 shutdown scan-stop can miss its between-records
   window under load. Observed once in a full (sequential) `mqttport_fulltests`

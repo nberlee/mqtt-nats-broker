@@ -943,18 +943,18 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		//
 		// clear() must own its own transaction — it ENDS the record generation — so this
 		// branch cannot hold the fence across it the way the surviving branch does. What
-		// makes the discard safe is the OPT-IN in-fence refusal: an ambiguity armed after
-		// the entry check makes clearEx fail before its first deletion rather than tear
-		// down on a stale sequence. The recovery is then ours, because the action is
-		// already consumed: put it back, with the session still RESIDENT, so the next
-		// resolution discharges the discard and its Will.
+		// makes the discard safe is the in-fence refusal: an ambiguity armed after the
+		// entry check makes clear() fail before its first deletion rather than tear down
+		// on a stale sequence. The recovery is then ours, because the action is already
+		// consumed: put it back, with the session still RESIDENT, so the next resolution
+		// discharges the discard and its Will.
 		//
 		// Keyed on the SENTINEL, never on "is the session uncertain now": any other
 		// failure means a lost teardown claim or a partly-done teardown, and re-parking
 		// there would resurrect an obligation that is either another owner's or already
 		// half-discharged. Those keep the historical outcome — the object goes.
-		if err := sess.clearEx(true, true); err != nil {
-			if errors.Is(err, errMQTTClearLateUncertain) {
+		if err := sess.clear(true); err != nil {
+			if errors.Is(err, errMQTTClearRefusedUnresolved) {
 				s.reparkDeferredDisconnect(sess, action)
 				return
 			}
@@ -1116,6 +1116,76 @@ func (s *Server) reparkDeferredDisconnect(sess *mqttSession, action *mqttDeferre
 		return
 	}
 	s.Debugf("MQTT: the deferred disconnect of session %q stays parked; its record state is unresolved again", sess.id)
+}
+
+// reparkRefusedDiscard is the recovery for a discard that clear() REFUSED with
+// errMQTTClearRefusedUnresolved — the ordinary clean close and session expiry both take it.
+// Neither may simply abandon the session: the refusal deleted nothing, so the record, the
+// consumers, the shared group durables the discard owed a release, and the generation's
+// in-flight registers are all still there.
+//
+// It parks the discard as a deferred disconnect with expiryInterval 0, so endsAtDisconnect()
+// is true and the discharge takes applyDeferredDisconnect's discard branch — the same
+// clear(), performed by a caller that has just proved the record state resolved. Then it
+// restores RESIDENCY, which is what every resolver needs: retryUncertainSessions and CONNECT
+// both scan as.sessions, and for an expiry-0 record sweepSessionExpiries looks at nothing at
+// all. Park first, publish second — the obligation must exist before the object is reachable.
+//
+// No WILL goes into the action, deliberately. A parked Will is memory-only and
+// non-transferable: a remote takeover evicts the action under as.mu alone and nothing
+// publishes it, which would regress a Will today's broker delivers. The close publishes its
+// own by falling through to mqttHandleWill; expiry has none, its Will was discharged by the
+// close that started the deadline.
+//
+// The caller must hold the ownership gate, and must key this on errMQTTClearRefusedUnresolved
+// ALONE. Any other clear() failure means a lost teardown claim or a partly-done teardown,
+// where re-parking would resurrect an obligation that is another owner's or already half
+// discharged.
+//
+// Returns whether the discard is now someone's responsibility. False leaves the caller its
+// historical outcome: the session stays evicted and the caller logs.
+//
+// No lock held on entry.
+func (s *Server) reparkRefusedDiscard(asm *mqttAccountSessionManager, sess *mqttSession, disconnectedAt int64) bool {
+	parked, stillUncertain := sess.deferDisconnectIfUncertain(
+		&mqttDeferredDisconnect{disconnectedAt: disconnectedAt, expiryInterval: 0}, true)
+	switch {
+	case !parked && !stillUncertain:
+		// UNREACHABLE while the gate is held: seqUncertain is cleared only by
+		// clearUncertaintyLocked — reached through resolveUncertainNow, which takes the
+		// gate itself, or resolveUncertainSession, whose caller holds it — and by
+		// disposeForeignSessionLocked, which also requires it. Reported rather than
+		// handled, and returning false is what makes a future violation of that invariant
+		// benign (the caller's historical outcome) rather than silent.
+		s.Errorf("MQTT: the refused discard of session %q cannot be parked: the session resolved while the ownership gate was held", sess.id)
+		return false
+	case !parked:
+		// An action is already parked, so this session already owes an end. This helper
+		// ARBITRATES NOTHING. It recognises only the shape it would have written itself —
+		// ends at disconnect AND carries no Will — and in that case the discard IS that
+		// obligation, already recorded: the action is neither mutated nor replaced.
+		//
+		// Every other shape declines. A parked action carries no owner identity, so
+		// nothing here can prove whose deadline or whose Will a retarget would overwrite;
+		// declining keeps today's evict-and-log, which is provably no worse than today
+		// because it IS today. Reachability of those shapes at this point is unknown and
+		// stated as such in docs/CONFORMANCE.md.
+		//
+		// Read under sess.mu, as every other access to this field is.
+		sess.mu.Lock()
+		existing := sess.deferredDisconnect
+		discardOnly := existing != nil && existing.endsAtDisconnect() && existing.will == nil
+		sess.mu.Unlock()
+		if !discardOnly {
+			return false
+		}
+		s.Debugf("MQTT: the refused discard of session %q is already parked as a discard-only obligation", sess.id)
+	}
+	// RESIDENT again, so a resolver can find it. The caller removed it before attempting
+	// the discard, and for the close that removal is what makes the failure a leak: an
+	// expiry-0 record with no resident object has no reaper at all.
+	asm.addSession(sess, true)
+	return true
 }
 
 // retryUncertainSessions is the periodic pass over RESIDENT unresolved sessions.

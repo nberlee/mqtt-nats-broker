@@ -463,17 +463,106 @@ Residuals:
   ambiguously and a readback later proved it — but the Will existed only in the action the
   discharge consumed. Pre-existing: making a parked Will durable earlier is Will-outbox
   scope, not purge scope.
-- **A discard other than the deferred one can still run on an unclassified sequence.**
-  `clear` refuses at entry while a record write is unresolved, and that check is a
-  check-then-act: an off-readLoop writer (a register store settling) can arm the
-  uncertainty while the call is already waiting for the record fence. Only the DEFERRED
-  discharge opts into the in-fence re-check, because it is the one caller that can put its
-  obligation back; an ordinary close, a session expiry, a CONNECT clean start and a
-  record-restore discard proceed, and their sequence-targeted record delete then typically
-  removes nothing — leaving a record whose durables are gone, until a later reconnect
-  discards it. Pre-existing and not widened by the deferred-close work: giving each caller
-  its own recovery (park the full close, retain-and-retry the expiry, reject without
-  evicting) is a roadmap item.
+- **A refused discard's obligation is memory-only, so a crash or a remote takeover in that
+  window drops it.** On a broker running this code, no discard runs on an unclassified
+  sequence: `clear` refuses unconditionally, at entry and again with the record fence
+  held. FOUR of the six call sites are REFUSAL-AWARE, each acting on the sentinel rather
+  than destroying, and what each then does differs: the deferred discharge re-parks its
+  consumed action (pre-existing); CONNECT's clean start rejects without evicting; and the
+  clean close and session expiry park the discard and restore residency only when the
+  shared helper ACCEPTS, failing closed to the historical evict-and-log when it declines.
+  The two remaining callers
+  that clear a transient object built from a record they just read have an unreachability
+  proof rather than a recovery, plus the same fail-closed refusal if that proof were ever
+  wrong; and the parking helper itself DECLINES for an already-parked action that is not
+  the discard-only shape (below). What remains is that the parked discard exists only in
+  session memory, so there are exactly THREE ways to lose it, and every statement below is
+  conditional on all three: a crash before the discharge; a remote persist, which evicts
+  the re-added object under the manager lock alone — correctly, since a record another
+  broker owns is not this one's to delete, but the obligation goes with it; and the helper
+  DECLINING, which needs neither of the other two and whose reachability is unknown. Absent
+  all three, the next successful local classification retries the discard and completes it.
+  A remote persist has two orderings and neither is a guarantee: arriving after the re-add
+  it evicts, and arriving in the window between the caller's `removeSession` and the
+  re-add it takes the no-local-session branch and starts a reconciliation worker that then
+  finds the object resident and deliberately does nothing — so convergence there is
+  eventual, through the uncertainty classification calling the object foreign, not
+  immediate.
+  - For a v5 DISCONNECT that overrode a non-zero Session Expiry Interval to 0, losing the
+    obligation is a spec deviation and not merely a leak. The override is applied to
+    `sess.expiryInterval` and `c.mqtt.sessionExpiry` in memory and never persisted, so the
+    record still says `ExpiryInterval > 0` and `Clean = false`: a non-clean reconnect that
+    meets the surviving record resumes a session the DISCONNECT ended and reports Session
+    Present true, against Spec5 [3.1.2.11]. Same violation as the reconnect-race item in
+    `docs/ROADMAP.md` §0 but a different mechanism — that one is purely in-memory, this one
+    is a durable record on a broker that may never have seen the DISCONNECT — and it has
+    its own §0 bullet there. All three loss paths above reach it, the declined one without
+    any crash or takeover, so the deviation must not be described as crash-or-takeover-only.
+  - A crash in the CLEAN close's window leaves an expiry-0, `Clean = true` record with its
+    consumers: nothing reaps it autonomously (the retry pass needs residency, the expiry
+    sweep skips `ExpiryInterval == 0`, and the consumer sweep reads the record's consumers
+    as referenced), so only a later CONNECT on the same client ID discards it.
+  - **The same crash can lose that close's WILL, because the recovery runs BEFORE the Will
+    is published.** The refusal deliberately keeps the Will out of the parked action — a
+    memory-only Will is dropped by a takeover, which is worse — so the close publishes it
+    by falling through to `mqttHandleWill`, after the recovery has parked the obligation
+    and restored residency. A crash in between loses the Will permanently: no durable
+    intent exists for an owed-now Will. The window is PRE-EXISTING — today a failed
+    `clear()` logs and reaches the same `mqttHandleWill` just as late — and this change
+    keeps the same ORDERING while replacing that log with the recovery's own work: a
+    parking call under `sess.mu` and a residency insert under the manager lock, and no
+    log at all on the path that parks successfully. Whether the window is net wider is
+    not established here and is not claimed. Reordering was
+    considered and not taken: publishing first needs a second `mqttHandleWill` call site
+    with a hand-derived takeover-fence baseline, and deferring the recovery until after
+    the Will only trades this window for a longer one in which the session is evicted
+    with its record intact. Closing it properly needs a durable, cluster-visible Will
+    intent, which is Will-outbox scope. Recorded as a candidate follow-up rather than
+    claimed safe.
+  - A crash in the EXPIRY window can leave a finite record still saying
+    `DisconnectedAt = 0` when the original disconnect save had failed, since that save is
+    best-effort and the timer is armed regardless. An origin or standalone sweep may then
+    stamp a new, LATER disconnect time, and a clustered non-origin broker deliberately will
+    not — so if the origin never returns, the record can read as connected indefinitely.
+    Pre-existing (the failed-disconnect-save residual), reachable through this window too.
+  - A CONNECT refused this way asks the client to retry, and a crash after that rejection
+    still loses the memory-only continuations the rejection preserved. Strictly smaller than
+    the eviction it replaces, which lost them immediately.
+- **For a session whose ambiguity never resolves, the recovery holds the object and the
+  record instead of reaping them.** The expiry sweep's fallback — stamp a disconnect time
+  and expire — is suppressed for a resident session, and that trade is deliberate: the
+  fallback reaps by WRITING a new deadline onto a record nobody has classified, which can
+  turn an ambiguous write that landed into a different record the resolver then calls
+  foreign, dropping the local obligation during foreign disposal. A resident object means
+  a broker is actively retrying, which is the class `retryUncertainSessions` already holds
+  every other unresolvable session in. The cost, in full: growth is unbounded across client
+  IDs (the residency maps have no quota) and each retained object holds its subscriptions,
+  consumers, drains, pending deliveries, retained continuations and its parked action; both
+  the object and the record keep the referenced consumers out of the orphan sweep's reach;
+  and `retryUncertainSessions` performs a synchronous readback per unresolved candidate with
+  no budget, ahead of the expiry, orphan-consumer and orphan-QoS2 sweeps on the same
+  goroutine, so N unresolved sessions delay those three by roughly N × the JetStream API
+  timeout and make shutdown latency linear in the same walk. For a record carrying
+  `DisconnectedAt > 0` the recovery is additionally RE-ENTERED about once per sweep interval
+  — the sweep's residency guard covers only its `DisconnectedAt == 0` branch — costing one
+  record load, a timer, a gate acquisition and one warning line per stuck session per
+  interval. A pass budget for that walk is a candidate follow-up, not part of this change.
+- **The refusal-and-recovery protection is PER BROKER, not fleet-wide during a rolling
+  upgrade.** It adds no stream, subject, record field or cross-broker message, so there
+  is no decoder incompatibility in either direction and both versions read and CAS the
+  same record. But an older broker keeps its own destructive-and-leaky behavior for the
+  sessions it owns, and because the parked obligation is memory-only there is nothing
+  another broker — older or newer — can adopt: a takeover simply evicts it. So the
+  invariant holds for a session whose owning broker runs this code, and holds fleet-wide
+  only once every broker serving the account does. Stated as scope, not as
+  rolling-upgrade safety.
+- **A parked action that is not the discard-only shape has unknown reachability, and keeps
+  the historical evict-and-log outcome.** The shared recovery helper accepts an existing
+  obligation only when it already ends at disconnect AND carries no Will. Anything else —
+  a surviving lifetime, or an expiry-0 action owing a Will — declines: the action carries
+  no owner identity, so nothing there can prove whose deadline or whose Will a retarget would
+  overwrite. Whether those shapes can reach a discard caller at all is not established, and
+  the design deliberately does not depend on the answer.
 - **A void-register verdict staged during the CONNECT accept rollback is lost with the
   aborted object.** The rollback's record snapshot is taken inside the rollback, so a nonce
   staged after it is deliberately not credited (crediting it would claim durable what

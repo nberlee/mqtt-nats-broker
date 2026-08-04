@@ -1548,9 +1548,8 @@ func TestMQTTDeferredDischargeReparksWhenUnresolvedAgain(t *testing.T) {
 // AFTER the entry check.
 //
 // `clear()` cannot run under this branch's fence — it ends the record generation — so the
-// discard's safety rests on the OPT-IN in-fence refusal `clearEx` performs for this one
-// caller, and on this branch putting the consumed action (its Will included) back when the
-// sentinel comes out. Without the in-fence check clear would delete the record and the
+// discard's safety rests on the in-fence refusal `clear` performs, and on this branch
+// putting the consumed action (its Will included) back when the sentinel comes out. Without the in-fence check clear would delete the record and the
 // durables on a sequence nobody has classified; without the re-park the discard obligation
 // and the Will would be gone with the object.
 //
@@ -1586,7 +1585,7 @@ func TestMQTTDeferredDiscardReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 		}
 		armed = true
 		// An off-readLoop register store settled here and its save went ambiguous: after
-		// the discharge and clearEx both passed their entry checks, and before the fence
+		// the discharge and clear() both passed their entry checks, and before the fence
 		// is taken. Only a check made under that fence can still see it.
 		sess.mu.Lock()
 		sess.markWriteUncertainLocked(sess.seq, []byte(`{"competing":"ambiguous"}`), 0)
@@ -1648,16 +1647,15 @@ func TestMQTTDeferredDiscardReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 	}
 }
 
-// T15b: the window BETWEEN the discharge's own uncertainty check and clearEx's entry check.
+// T15b: the window BETWEEN the discharge's own uncertainty check and clear()'s entry check.
 //
 // The two checks are not under one fence, so an off-readLoop register store can go ambiguous
-// in between — and that arrives at clearEx's ENTRY refusal, not its in-fence one. It is
+// in between — and that arrives at clear()'s ENTRY refusal, not its in-fence one. It is
 // exactly as recoverable (nothing has been deleted), so it must carry the same sentinel: a
 // plain error there would have the branch read it as a partly-done teardown, remove the
 // session, and lose the consumed deadline and Will with nothing resident to retry.
 //
-// Mutation MU22: return a plain error from clearEx's entry refusal even when the caller opted
-// in, and the action is dropped.
+// Mutation MU22: return a plain error from clear()'s entry refusal and the action is dropped.
 func TestMQTTDeferredDiscardReparksWhenUnresolvedAtClearEntry(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-discard-entry", "discard.entry")
 	action := &mqttDeferredDisconnect{
@@ -1677,7 +1675,7 @@ func TestMQTTDeferredDiscardReparksWhenUnresolvedAtClearEntry(t *testing.T) {
 		}
 		armed = true
 		// The competing writer lands here: after the discharge's own check, before
-		// clearEx's. This is the window the entry refusal — and its sentinel — owns.
+		// clear()'s. This is the window the entry refusal — and its sentinel — owns.
 		sess.mu.Lock()
 		sess.markWriteUncertainLocked(sess.seq, []byte(`{"competing":"ambiguous"}`), 0)
 		sess.mu.Unlock()
