@@ -1062,11 +1062,106 @@ The invariants, in the order they matter:
   trusted rather than re-derived, the same trust every other restored identity gets.
   Re-purging an entry a removal already voided is idempotent end to end: a known nonce is
   not re-voided, the delete is at the exact sequence, and both release predicates key on
-  the toucher's own nonce. Only the ORDINARY surviving close runs it today; the deferred
-  close that applies a disconnect parked by an uncertain record write does not, because the
-  purge can itself write the record (the verdict fallback) and so has to be folded into
-  that path's own classified write rather than called ahead of it. Stated in
-  `docs/CONFORMANCE.md` and tracked in the roadmap.
+  the toucher's own nonce.
+- **Both surviving closes run the purge, and the DEFERRED one runs it as a single
+  classified write.** A close whose own record write was unresolved is parked and applied
+  later, and that path cannot simply call the purge: the purge's third rung writes the
+  session record, and an independent write of its own can land ambiguously — after which
+  every later write on the session is refused, including the disconnect time's, with the
+  parked action already consumed and nothing left to retry it. The record would then say
+  `DisconnectedAt=0`, i.e. connected, while the deadline existed in memory only: the local
+  timer fires, session expiry finds the record bumped past its stale sequence and delegates
+  to the record, and the record reads as "connected, nothing due" — leaking it until a
+  reconnect that may never come. So the deferred close opens the record transaction BEFORE
+  its first mutation, stamps the ORIGINAL disconnect time, runs the purge in a form that
+  only STAGES (the register-stream rungs, then the nonce in memory), and makes ONE
+  classified save carrying both. An ambiguous save keeps the retry/resolve continuations,
+  so the deadline and the verdicts ride every retry; a definite failure keeps the
+  in-memory purge and the armed timer and loses only restart-survival of the deadline,
+  which is the ordinary close's posture too. The Will's fate is decided on a FRESH clock
+  sample rather than the one taken at entry: the branch's rungs and its save are round
+  trips, and a deadline that passes during them would otherwise read as still future.
+  An already-due Will enqueued into the outbox is cancellable, so a reconnect arriving
+  after the deadline could suppress a Will that was already owed — precisely what the
+  direct publication exists to prevent. And because the parked action is CONSUMED
+  before the discharge runs, the discharge re-checks that the record state is still
+  resolved — once cheaply on entry and again with its own fence held, which is the sound
+  test since the fence is what serializes writers — and RE-PARKS the untouched action if
+  it is not. Holding the ownership gate does not exclude an off-readLoop writer: a
+  register store settling between the resolution and the fence acquisition can leave its
+  own write ambiguous, and applying the close anyway would have every write refused with
+  nothing left holding the original deadlines. The DEFERRED DISCARD branch cannot hold a
+  fence across `clear()` — that call ends the record generation and must own its
+  transaction — so it asks `clear` for an OPT-IN late refusal instead: a re-check WITH THE
+  FENCE HELD, before the first deletion, releasing without ending the generation because
+  nothing was mutated, and returning a distinct sentinel. The branch re-parks on that
+  sentinel alone and never on "is the session uncertain now", because any other failure
+  means a lost teardown claim or a half-done teardown, where re-parking would resurrect an
+  obligation that is not this broker's to discharge. The refusal is opt-in because every
+  other `clear` caller evicts or logs rather than recovers: turning a late ambiguity into
+  a refusal there would strand the object while its record and consumers survive. Their
+  exposure to the same race is unchanged and stated in `docs/CONFORMANCE.md`.
+- **Every landed record write credits the verdicts it marshalled.** Durability of a
+  verdict is a property of the write that carried it, not of the intent of whoever was
+  persisting, so the credit lives at the write: `save` samples the void-register revision
+  in the same critical section that marshals the record, and a CONFIRMED store advances
+  the saved-revision watermark to that sample and releases the reservations it frees. The
+  same sample travels with the attempt's identity, so a readback that finds those exact
+  bytes at a newer sequence credits it, and so does each landed classification of the
+  contention retry — which proves bytes durable without passing through either. Never on
+  an unlanded, unresolved, definitely-failed or FOREIGN outcome: a record that is not ours
+  carries nothing of ours. Crediting only at the paths that set out to record a verdict
+  left the other half open — a reconnect's accept save inherits the staged verdicts and is
+  not a verdict path at all, so it made the fact durable while its identifier stayed
+  reserved in memory with nothing due to look again. The one deliberate exemption is the
+  accept ROLLBACK's raw write: its snapshot is built inside the rollback, so a nonce staged
+  after it is not in the bytes that land, and crediting the then-current revision would
+  claim exactly that nonce durable (`docs/CONFORMANCE.md` states what happens to it).
+- **A lock release is what re-checks a verdict staged behind somebody else's lock.** The
+  stager and the writer are not the same thread of control: a register store settling
+  off-readLoop stages its nonce and finds its own persistence refused, because the record
+  fence — or the ownership gate a resolver needs — is held at that instant. A BOUND session
+  converges through its own packet tails; an UNBOUND one has no traffic, and a
+  never-expiring one no timer, so the identifier could stay reserved for the life of the
+  session. So both canonical releases re-check: the RECORD FENCE release, sampling the
+  decision inside its existing critical section (after the fence is cleared, before the
+  unlock — a decision made after the unlock does not compose atomically with staging), and
+  the OWNERSHIP GATE release, at both forms — `unlockSession` and CONNECT's own inline
+  delete, since a CONNECT does not release through the former. The re-check fires only for
+  a session that is resident, unbound, not uncertain (the uncertainty machinery owns that
+  retry, and its resolver's releases re-check afterwards), not mid-transaction, and whose
+  revision is above the HANDOFF WATERMARK. That watermark advances when an attempt
+  ACQUIRES the fence, never when a release merely decides to try: a trigger that lost the
+  fence to a waiter it just signalled stored nothing, and burning the watermark on it would
+  strand the very nonce it fired for — the fence winner's own release is the next re-check.
+  One attempt per newly staged revision makes the sequence of attempts finite; keeping it
+  to one STACK FRAME is a separate property, and a LOOP is what provides it. The releases
+  inside an attempt would otherwise re-enter the decision in their own frames — once per
+  late staging, each frame holding a JetStream round trip, so a session with many outstanding
+  register stores could build a stack proportional to them. So an attempt marks the session
+  as having a handoff in progress, the releases route work to that loop instead of recursing,
+  and the flag is cleared only in the same critical section that finds nothing left pending,
+  which is what keeps a staging racing the exit from being dropped between the two. A loop
+  that gives up on GATE contention hands that ownership back inside the gate's own critical
+  section, for the mirror-image reason: a gate owner deletes its entry under the manager lock
+  and only then asks whether a loop is running, so a hand-back made after that lock was
+  released could be seen as still running — the owner suppresses itself, the loop exits, and
+  the staged revision has no successor at all.
+  **The releases alone are not the whole liveness argument**, and the gap is the watermark's
+  own doing: a DEFINITE store failure leaves the revision AT the watermark, so no release
+  triggers again, and an unbound never-expiring session may never stage another nonce to lift
+  it. So the periodic pass carries a BACKSTOP — for a resident, unbound, resolved session
+  with an unsaved revision it puts the watermark back below it and runs the ordinary
+  attempt. Re-arming rather than bypassing keeps one path to the store, and the sweep interval
+  is the retry cadence, which is the right one for a failure that did not look transient.
+  The attempt itself runs UNDER the ownership gate, taken fail-fast and
+  skipped on contention: gated, any ambiguity it creates exists only while the gate is
+  held, so a CONNECT that ever holds the gate sees it at its own uncertainty check and
+  resolves it — ungated, an ambiguity landing just after that check would have the CONNECT
+  bind, find its accept save refused, and evict the object holding the continuation. The
+  unbound scoping is equally deliberate: fired at CONNECT's accept-transaction release it
+  could inject uncertainty right behind a success CONNACK, with the gate held and no
+  packet tail yet to resolve it.
 - **A resume claims the shared registers it recovers before installing them.** A
   cross-broker takeover constructs a new session object but preserves the session
   incarnation generation, so that generation correctly finds the durable state but cannot

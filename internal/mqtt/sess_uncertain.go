@@ -43,6 +43,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,14 +54,27 @@ import (
 type mqttPendingWrite struct {
 	baseSeq uint64
 	digest  [sha256.Size]byte
+	// voidedRegsRev is the void-register revision the attempt MARSHALLED, so a
+	// readback that proves those exact bytes durable can credit exactly the
+	// verdicts they carried — no more, whatever has been staged since. Every
+	// landed write credits the revision it marshalled, wherever the proof comes
+	// from; this is that revision travelling with the proof. See
+	// voidRegNonceLocked and releaseSettledVoidReservationsLocked.
+	voidedRegsRev uint64
 }
 
 // mqttUncertainResolution is how a readback classified an ambiguous write.
 type mqttUncertainResolution int
 
 const (
-	// mqttUncertainUnresolved: the readback failed. Nothing may be concluded, so
-	// nothing may be written or deleted; the retry pass tries again.
+	// mqttUncertainUnresolved: this session's durable state is not known, so
+	// nothing may be written or deleted and the retry pass tries again. Two ways
+	// to get here, and callers treat them identically: the readback FAILED, so
+	// nothing was written and any deferred action is still parked; or the readback
+	// succeeded and the work it authorized — a continuation's re-save, a discharged
+	// deferred disconnect — left the session uncertain AGAIN, so the deferred action
+	// was consumed but a NEW attempt is now outstanding. See
+	// resolutionAfterContinuations.
 	mqttUncertainUnresolved mqttUncertainResolution = iota
 	// mqttUncertainOurs: the record is ours, whether or not the write landed.
 	// sess.seq is now correct and the session may write again.
@@ -133,10 +147,15 @@ func mqttRecordDigest(body []byte) [sha256.Size]byte {
 // usable. Only an ambiguous failure — a timeout, a lost response, no responders —
 // leaves an outcome nobody can name.
 //
+// voidedRev is the void-register revision the attempt marshalled, carried so a
+// landed readback can credit it.
+//
 // sess.mu must be held.
-func (sess *mqttSession) markWriteUncertainLocked(baseSeq uint64, body []byte) {
+func (sess *mqttSession) markWriteUncertainLocked(baseSeq uint64, body []byte, voidedRev uint64) {
 	sess.seqUncertain = true
-	sess.pendingWrite = &mqttPendingWrite{baseSeq: baseSeq, digest: mqttRecordDigest(body)}
+	sess.pendingWrite = &mqttPendingWrite{
+		baseSeq: baseSeq, digest: mqttRecordDigest(body), voidedRegsRev: voidedRev,
+	}
 }
 
 // isSeqUncertain reports whether this session has an unresolved record write.
@@ -266,15 +285,25 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// so no other writer can observe or store the intermediate state.
 		sess.clearUncertaintyLocked(pw.baseSeq)
 		sess.runUncertainReverts(tok)
-		return mqttUncertainOurs, nil
+		// Nothing landed, so nothing is credited: the void-register verdicts this
+		// attempt marshalled are still durable nowhere, and the continuation that
+		// re-saves them is what carries them (voidedRegsUncertainAction).
+		return sess.resolutionAfterContinuations(mqttUncertainOurs), nil
 	case smsg.Sequence > pw.baseSeq && mqttRecordDigest(smsg.Data) == pw.digest:
 		// Byte-identical to what we tried to store, at a newer sequence: it landed,
 		// and only the response was lost. Adopt the sequence it landed at and run the
 		// LANDED continuations — memory already matches the record, but every action a
 		// caller withheld for want of proof is now authorized.
 		sess.clearUncertaintyLocked(smsg.Sequence)
+		// These exact bytes are durable, so the void-register verdicts they
+		// marshalled are too — credited here for the same reason a confirmed save
+		// credits its own: the proof is the durability boundary, not the intent of
+		// whoever wrote. See creditVoidedRegsLocked.
+		sess.mu.Lock()
+		sess.creditVoidedRegsLocked(pw.voidedRegsRev)
+		sess.mu.Unlock()
 		sess.commitUncertainWrites(tok)
-		return mqttUncertainOurs, nil
+		return sess.resolutionAfterContinuations(mqttUncertainOurs), nil
 	default:
 		// A newer record with different content, or a sequence below our base. Either
 		// way it is not the write we attempted, so it belongs to another owner. Do
@@ -282,6 +311,30 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// CAS and overwrite whatever that owner has since persisted.
 		return mqttUncertainForeign, nil
 	}
+}
+
+// resolutionAfterContinuations downgrades a resolved verdict to UNRESOLVED when the
+// continuations this resolution just ran left the session uncertain AGAIN.
+//
+// A continuation may write — that is the point of handing it the resolver's token —
+// and its write can itself come back ambiguous, which re-arms seqUncertain and
+// registers a fresh continuation for the NEW attempt. Reporting the original verdict
+// then tells the caller the session is writable when its next write will be refused,
+// and for CONNECT that is destructive rather than merely stale: it binds, its accept
+// save is refused, and mqtt.go's removeSession evicts the only object holding the new
+// continuation — so a deferred disconnect's deadline and its void-register verdicts
+// are lost with no crash anywhere.
+//
+// Unresolved is the honest answer and every caller already handles it: nothing is
+// discharged, nothing evicted, CONNECT rejects and the client retries, and the
+// periodic pass keeps watching a session that is once again in its candidate set.
+//
+// No lock held on entry.
+func (sess *mqttSession) resolutionAfterContinuations(res mqttUncertainResolution) mqttUncertainResolution {
+	if res == mqttUncertainOurs && sess.isSeqUncertain() {
+		return mqttUncertainUnresolved
+	}
+	return res
 }
 
 // clearUncertainty marks the session resolved at seq.
@@ -408,6 +461,13 @@ func (sess *mqttSession) resolveUncertainNow(c *client) mqttUncertainResolution 
 		// anything to discharge) is still held, so no reconnect can have bound
 		// since the resolution.
 		sess.dischargeDeferredIfUnbound(c)
+		// The discharge's own record write can be ambiguous, which leaves this
+		// session unresolved again however cleanly the previous attempt classified.
+		// Reported for the same reason resolveUncertainSession reports it: a caller
+		// told "ours" would act on a session whose next write is refused. This site's
+		// production callers ignore the value, so the honest return is what a test
+		// discriminates rather than a behavior change here.
+		return sess.resolutionAfterContinuations(res)
 	}
 	return res
 }
@@ -550,6 +610,14 @@ func (sess *mqttSession) takeUncertainActions() []uncertainOutcomeActions {
 
 // commitUncertainWrites runs the LANDED continuations, oldest first: the record
 // holds every retained mutation, so the follow-ups they deferred are now owed.
+//
+// Both walkers take the whole list and run it to the end, which is correct only while
+// at most ONE continuation per pending write can re-arm uncertainty (today the
+// void-verdict re-save, which registers itself for the new attempt and is the last
+// thing to run). Register a second re-arming continuation and these walkers must stop
+// at the first re-arm and put the unprocessed tail back: continuations that follow it
+// would write under a token whose session is uncertain again, and every such write is
+// refused at entry — silently, since neither walker looks at an outcome.
 func (sess *mqttSession) commitUncertainWrites(tok recordTx) {
 	for _, a := range sess.takeUncertainActions() {
 		if a.onLanded != nil {
@@ -787,8 +855,12 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 // The caller must hold the session in asm.sessLocked (lockSession), which is what
 // serializes it against a concurrent CONNECT.
 //
-// Returns the resolution. On mqttUncertainUnresolved nothing was written, nothing
-// was deleted, and the deferred action is still parked.
+// Returns the resolution. mqttUncertainUnresolved has the two meanings the enum
+// states: the readback failed, in which case nothing was written, nothing was
+// deleted and the deferred action is still parked; or the DISCHARGE re-armed
+// uncertainty, in which case the action was applied and its own record write is now
+// the outstanding one. Callers must treat both the same way — the session's durable
+// state is unknown either way — and no caller may bind, resume or discard on it.
 //
 // No lock held on entry.
 func (s *Server) resolveUncertainSession(asm *mqttAccountSessionManager, sess *mqttSession) mqttUncertainResolution {
@@ -818,6 +890,13 @@ func (s *Server) resolveUncertainSession(asm *mqttAccountSessionManager, sess *m
 	}
 	if action := sess.takeDeferredDisconnect(); action != nil {
 		s.applyDeferredDisconnect(asm, sess, action)
+		// The discharge writes the record ITSELF, outside resolveUncertainWriteInTx,
+		// so it can leave the session uncertain again after the readback classified
+		// the previous attempt as ours. Re-checking here is what stops a CONNECT
+		// from binding on a stale "ours" and then evicting the session its refused
+		// accept save runs into — taking the deferred deadline and the void-register
+		// verdicts the discharge just staged with it.
+		return sess.resolutionAfterContinuations(res)
 	}
 	return res
 }
@@ -826,28 +905,120 @@ func (s *Server) resolveUncertainSession(asm *mqttAccountSessionManager, sess *m
 // ORIGINAL deadlines: the session gets the lifetime it actually earned, not a
 // fresh interval starting whenever JetStream came back.
 //
+// It is called with the action already CONSUMED, which is what makes the
+// unresolved re-check below load-bearing rather than defensive: nothing here can
+// land while the record state is unresolved — the surviving branch's save is
+// refused at entry and clear() refuses at entry too — and there would be nothing
+// left to retry the close with.
+//
 // No lock held on entry; the session is in the locked map.
 func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *mqttSession, action *mqttDeferredDisconnect) {
 	now := time.Now()
+
+	// The resolution that authorized this discharge released the record fence before
+	// getting here, and holding the ownership gate does not exclude an off-readLoop
+	// writer: a register store settling meanwhile takes the fence with tryBeginRecordTx
+	// and can leave its own write AMBIGUOUS. Put the action back untouched rather than
+	// applying a close whose every write is refused — the session is uncertain again, so
+	// the periodic pass and the next CONNECT resolve and discharge it, with its ORIGINAL
+	// deadlines still intact. The surviving branch re-checks once more under its own
+	// fence, which is the sound test; this one is the cheap early-out that also covers
+	// the discard branch, whose clear() opens a fence of its own.
+	if sess.isSeqUncertain() {
+		s.reparkDeferredDisconnect(sess, action)
+		return
+	}
+	// Test seam, fired in the window between that check and the fence the surviving branch
+	// takes below: an ambiguity armed here is invisible to the check above, which is what
+	// makes the in-fence re-check the sound one rather than a belt-and-braces copy.
+	if h := mqttTestDischargeWindowHookV.Load(); h != nil {
+		(*h)(sess)
+	}
 
 	switch {
 	case action.endsAtDisconnect(), action.expiredBy(now):
 		// The session ended at connection close, or its deadline passed while the
 		// record was unresolved. Either way it is discarded now, not given a fresh
 		// interval.
-		asm.removeSession(sess, true)
-		if err := sess.clear(true); err != nil {
+		//
+		// clear() must own its own transaction — it ENDS the record generation — so this
+		// branch cannot hold the fence across it the way the surviving branch does. What
+		// makes the discard safe is the OPT-IN in-fence refusal: an ambiguity armed after
+		// the entry check makes clearEx fail before its first deletion rather than tear
+		// down on a stale sequence. The recovery is then ours, because the action is
+		// already consumed: put it back, with the session still RESIDENT, so the next
+		// resolution discharges the discard and its Will.
+		//
+		// Keyed on the SENTINEL, never on "is the session uncertain now": any other
+		// failure means a lost teardown claim or a partly-done teardown, and re-parking
+		// there would resurrect an obligation that is either another owner's or already
+		// half-discharged. Those keep the historical outcome — the object goes.
+		if err := sess.clearEx(true, true); err != nil {
+			if errors.Is(err, errMQTTClearLateUncertain) {
+				s.reparkDeferredDisconnect(sess, action)
+				return
+			}
 			s.Warnf("MQTT: deferred discard of session %q failed: %v", sess.id, err)
 		}
+		asm.removeSession(sess, true)
 	default:
-		// Persist the ORIGINAL disconnect time and arm only what remains of the
-		// interval. A never-expiring session gets no timer, as usual.
+		// The session SURVIVES, so this is the deferred form of the ordinary surviving
+		// close and owes everything that close owes: the ORIGINAL disconnect time
+		// persisted, only what remains of the interval armed, and the shared-group
+		// pending deliveries purged so a resume cannot NAK-steal messages AckWait would
+		// redeliver to other members and so the packet identifiers come back
+		// (Spec5 [4.8.2], [4.9]).
+		//
+		// ONE record transaction and ONE classified write for both. The purge is not a
+		// separate operation that happens to run first: when both register-stream rungs
+		// fail it falls back to the session record, and an independent save of its own
+		// can land ambiguously — after which every later write on this session is
+		// refused, including the disconnect time's, with the parked action already
+		// consumed and nothing left to retry it. The deadline would then exist in memory
+		// only while the landed record said DisconnectedAt=0, i.e. connected: the local
+		// timer fires, expireSession finds the record bumped past its stale sequence and
+		// delegates to the record, which reads "connected, nothing due" and drops the
+		// expiry — leaking the record until a reconnect that may never come.
+		//
+		// So the fence opens BEFORE the first mutation, the purge only STAGES (its
+		// fallback verdicts go into cancelledRegNonces, its register-stream rungs need
+		// no record), and one save carries the disconnect time and the verdicts
+		// together.
+		tok := sess.beginRecordTx()
+		// Re-checked with the fence HELD, before the first mutation, and this is the check
+		// that is sound: the early-out above is a check-then-act, because the fence is what
+		// serializes writers and another one can go ambiguous while this call is still
+		// waiting for it. Uncertainty cannot appear from here on — creating it requires a
+		// save, and a save requires this fence.
+		if sess.isSeqUncertain() {
+			if terr := sess.endRecordTx(tok); terr != nil {
+				s.Errorf("MQTT: %v", terr)
+			}
+			s.reparkDeferredDisconnect(sess, action)
+			return
+		}
 		sess.mu.Lock()
 		sess.disconnectedAt = action.disconnectedAt
 		sess.mu.Unlock()
-		tok := sess.beginRecordTx()
-		if err := sess.save(tok); err != nil {
-			s.Debugf("MQTT: unable to persist the deferred disconnect of session %q: %v", sess.id, err)
+		if owed := sess.purgeSharedPendingStaged(nil); owed {
+			s.Debugf("MQTT: the deferred close of session %q carries its void-register verdicts on the session record", sess.id)
+		}
+		outcome, err := sess.saveClassified(tok)
+		switch outcome {
+		case saveMaybeLanded:
+			// Ambiguous: the deadline and the verdicts are both in memory and both ride
+			// the continuation's re-save, so restart-survival is restored the moment the
+			// readback says the write did not land. A landed one needs nothing — the
+			// resolver credits what those bytes carried.
+			sess.retainOnUncertain(sess.voidedRegsUncertainAction(nil), nil)
+			s.Debugf("MQTT: the deferred disconnect of session %q was written ambiguously; the readback will settle it: %v", sess.id, err)
+		case saveDefinitelyFailed:
+			// The in-memory purge stands, the verdicts stay staged for the next
+			// convergence point, and the timer below is still armed. Only
+			// restart-survival of the deadline is lost — the same posture as the
+			// ordinary close's failed disconnect save, and worth a warning because a
+			// lost purge verdict is not a routine debug event.
+			s.Warnf("MQTT: unable to persist the deferred disconnect of session %q; its deadline will not survive a restart: %v", sess.id, err)
 		}
 		if terr := sess.endRecordTx(tok); terr != nil {
 			s.Errorf("MQTT: %v", terr)
@@ -864,6 +1035,15 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 	if action.will == nil {
 		return
 	}
+
+	// RE-SAMPLE the clock. The branch above did JetStream work — the purge's register-stream
+	// rungs and the classified save — and a Will deadline that passed during it must not be
+	// read from the entry sample as still in the future: that would enqueue an already-DUE
+	// Will, and an enqueued record is cancellable, so a reconnect arriving after the deadline
+	// could suppress a Will that was already owed. The direct publication below is exactly
+	// what makes that reconnect rule hold, so the decision has to be made on the time as it
+	// is now, not as it was before the work.
+	now = time.Now()
 
 	// A Will that is already DUE — one with no delay, or a delayed one whose
 	// original deadline passed while the record was unresolved — is published
@@ -906,6 +1086,38 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		action.willUser, action.willDeadline, seq, action.willSessEpoch)
 }
 
+// mqttTestDischargeWindowHookV fires after applyDeferredDisconnect's entry check and before
+// the surviving branch opens its record transaction. See applyDeferredDisconnect.
+var mqttTestDischargeWindowHookV atomic.Pointer[func(sess *mqttSession)]
+
+func setMQTTTestDischargeWindowHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestDischargeWindowHookV.Load()
+	if h == nil {
+		mqttTestDischargeWindowHookV.Store(nil)
+	} else {
+		mqttTestDischargeWindowHookV.Store(&h)
+	}
+	return func() { mqttTestDischargeWindowHookV.Store(prev) }
+}
+
+// reparkDeferredDisconnect puts a consumed action back, for a discharge that found the
+// record state unresolved again. Nothing is undone because nothing was applied, and the
+// action still carries the ORIGINAL deadlines — which is the whole reason it is re-parked
+// rather than rebuilt.
+//
+// A refusal means an action is already parked, which cannot happen for a session nobody
+// can bind (the ownership gate is held), so it is reported rather than handled: the first
+// action holds the earlier deadlines and must win, as always.
+//
+// No lock held on entry.
+func (s *Server) reparkDeferredDisconnect(sess *mqttSession, action *mqttDeferredDisconnect) {
+	if !sess.deferDisconnect(action) {
+		s.Warnf("MQTT: the deferred disconnect of session %q could not be re-parked; another action is already pending", sess.id)
+		return
+	}
+	s.Debugf("MQTT: the deferred disconnect of session %q stays parked; its record state is unresolved again", sess.id)
+}
+
 // retryUncertainSessions is the periodic pass over RESIDENT unresolved sessions.
 //
 // It cannot be folded into sweepSessionExpiries: that walks persisted RECORDS and
@@ -929,6 +1141,10 @@ func (as *mqttAccountSessionManager) retryUncertainSessions(s *Server) {
 
 	for _, sess := range candidates {
 		if !sess.isSeqUncertain() {
+			// Not unresolved, but possibly still owing a void-register verdict: the
+			// BACKSTOP below is what makes the release handoff's liveness claim true
+			// unconditionally.
+			as.flushVoidVerdictGap(sess)
 			continue
 		}
 		// A BOUND session must be resolved too, and it is the harder case: nothing
@@ -969,6 +1185,40 @@ func (as *mqttAccountSessionManager) retryUncertainSessions(s *Server) {
 		}
 		as.unlockSession(sess)
 	}
+}
+
+// flushVoidVerdictGap is the periodic BACKSTOP for the release handoff.
+//
+// The handoff rides lock releases, and one attempt per newly staged revision is what keeps
+// it from retrying in a storm — but the same watermark means a DEFINITE store failure ends
+// the sequence: the revision is no longer above it, so no release triggers again. An
+// unbound, never-expiring session has no traffic and no timer either, so the verdict would
+// stay memory-only until something else happened to stage a nonce, which may be never; a
+// crash then restores the register as an ordinary live delivery, holding its identifier and
+// its Receive Maximum slot. A dependency outage is exactly when that is likeliest.
+//
+// So the periodic pass re-arms it: the watermark is put back below the revision and the
+// ordinary attempt runs, under the same ownership gate and the same trampoline as every
+// other trigger. Re-arming rather than bypassing keeps ONE path to the store; the sweep
+// interval is the retry cadence, which is the right one for a failure that is by definition
+// not transient-looking.
+//
+// Runs from the periodic sweep goroutine, for sessions that are not unresolved (an
+// unresolved one is the resolver's, and its own releases re-check afterwards). No lock held
+// on entry.
+func (as *mqttAccountSessionManager) flushVoidVerdictGap(sess *mqttSession) {
+	sess.mu.Lock()
+	// The pending condition minus the watermark: that is the conjunct being re-armed.
+	owed := !sess.seqUncertain && sess.c == nil && !sess.recordTxOpen && !sess.voidHandoffActive &&
+		sess.voidedRegsRev > sess.voidedRegsSavedRev
+	if owed {
+		sess.voidedRegsHandoffRev = sess.voidedRegsSavedRev
+	}
+	sess.mu.Unlock()
+	if !owed {
+		return
+	}
+	sess.attemptVoidVerdictHandoff(nil)
 }
 
 // ---------------------------------------------------------------------------

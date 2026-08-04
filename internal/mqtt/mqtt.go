@@ -1330,6 +1330,25 @@ type mqttSession struct {
 	voidedRegsRev      uint64
 	voidedRegsSavedRev uint64
 
+	// voidHandoffActive says a release-triggered persistence LOOP is running for this
+	// session (attemptVoidVerdictHandoff). It is what keeps successive late stagings on one
+	// frame: the loop's own fence and gate releases would otherwise re-enter the handoff
+	// decision inside their own frames, recursing once per staged revision with a JetStream
+	// round trip held in each. Cleared only in the same sess.mu critical section that finds
+	// nothing left pending, so no staging can slip between the last check and the exit.
+	// Guarded by mu. See voidVerdictHandoffDueLocked.
+	voidHandoffActive bool
+
+	// voidedRegsHandoffRev is the revision the last release-triggered persistence
+	// ATTEMPT acquired the record fence at — the handoff watermark, and the reason the
+	// handoff makes one attempt per newly staged revision instead of a retry storm or a
+	// synchronous recursion without a bound. It advances only on acquisition, never on
+	// the decision to try: a trigger that lost the fence stored nothing, and burning the
+	// watermark on it would strand the nonce it was firing for. Generation-local, so it
+	// is reset wherever voidedRegsRev is. Guarded by mu. See
+	// voidVerdictHandoffDueLocked.
+	voidedRegsHandoffRev uint64
+
 	// piSpaceIncomplete is set when a resume could not fully reconstruct the durable
 	// outbound identifier space, so some identifier the client holds may be unknown
 	// here. While it is set bumpPI allocates NOTHING: a new identifier could collide
@@ -5062,7 +5081,7 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	// The restored lists came OUT of the record, so they are already durable there; only
 	// a later change reopens the gap.
 	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
-	sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
+	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 	sess.restoreDrainsFromRecord(ps)
 	sess.pubRelConsumer = ps.PubRel
 	sess.q2AffConsumer = ps.Q2Aff
@@ -5502,6 +5521,49 @@ func (as *mqttAccountSessionManager) lockSession(sess *mqttSession, c *client) e
 	return nil
 }
 
+// lockSessionForVoidHandoff takes the session gate as NOBODY for a release-triggered
+// void-verdict attempt and, when it cannot, gives up the handoff loop's ownership IN THE
+// SAME as.mu CRITICAL SECTION.
+//
+// That atomicity is the whole point, and it closes a lost wakeup the two-step form has: a
+// gate owner deletes its sessLocked entry under as.mu and only then asks whether a handoff
+// loop is running. Clearing the flag after as.mu was released lets that owner observe a loop
+// that is about to exit, suppress its own trigger, and leave the staged revision with no
+// successor at all — on an unbound, never-expiring session, indefinitely. Done here instead,
+// the owner either released BEFORE this section — in which case this attempt finds the gate
+// free and wins it — or reads the flag AFTER it, already clear, and fires its own loop.
+//
+// Lock order is the established as.mu → sess.mu, same as lockSession.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) lockSessionForVoidHandoff(sess *mqttSession) error {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	// RESIDENCY by identity, in the same critical section as the gate itself, which is what
+	// makes it a claim rather than a stale sample: a trigger's session pointer can be
+	// evicted before its turn — a remote persist, an accept rollback, an expiry, a foreign
+	// disposition — and that object's record belongs to whoever owns it now. Claiming the
+	// shared client-ID gate for it would hold a replacement CONNECT off across a JetStream
+	// store for a session this broker no longer has. Identity, not client ID: a CONNECT may
+	// already have installed a restored replacement under the same ID.
+	fail := as.sessions[sess.id] != sess
+	if !fail {
+		if _, fail = as.sessLocked[sess.id]; !fail {
+			sess.mu.Lock()
+			fail = sess.c != nil
+			sess.mu.Unlock()
+		}
+	}
+	if fail {
+		sess.mu.Lock()
+		sess.voidHandoffActive = false
+		sess.mu.Unlock()
+		return fmt.Errorf("session %q is in use; its void-verdict handoff yields", sess.id)
+	}
+	as.sessLocked[sess.id] = struct{}{}
+	return nil
+}
+
 // lockSessionForTeardown takes the session gate on behalf of a closing
 // connection, retrying for as long as that connection is still the session's
 // owner.
@@ -5580,6 +5642,40 @@ func (as *mqttAccountSessionManager) unlockSession(sess *mqttSession) {
 	as.mu.Lock()
 	delete(as.sessLocked, sess.id)
 	as.mu.Unlock()
+	as.handoffVoidVerdictsOnGateRelease(sess)
+}
+
+// handoffVoidVerdictsOnGateRelease is the ownership-gate half of the release handoff: a
+// verdict staged while this gate was held could not be persisted by its stager — a
+// resolver's fence and the gate itself both refuse it — and an UNBOUND session has no
+// packet tail that would come back to it. See voidVerdictHandoffDueLocked.
+//
+// Both gate-release forms call it, and that is not redundancy: CONNECT releases through its
+// own inline delete rather than through unlockSession, so naming only unlockSession would
+// leave every CONNECT that ends with the session unbound uncovered.
+//
+// It must be called with as.mu NOT held. The attempt takes the ownership gate, and its own
+// fence release re-enters this decision; doing that under as.mu would deadlock against
+// lockSession.
+//
+// Nonresident objects are skipped, by the attempt's own gate acquisition: a session that has
+// been evicted — a foreign disposition, a rollback, an expiry — has no record of ours to
+// write, because that record belongs to whoever owns it now, and a verdict about a register
+// of a generation nobody resumes is not ours to persist.
+func (as *mqttAccountSessionManager) handoffVoidVerdictsOnGateRelease(sess *mqttSession) {
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	due := sess.voidVerdictHandoffDueLocked()
+	sess.mu.Unlock()
+	if !due {
+		return
+	}
+	// Residency is not checked here: the attempt's gate acquisition checks it by identity,
+	// in the same critical section that claims the gate, which is the only place a
+	// pre-check could not go stale. See lockSessionForVoidHandoff.
+	sess.attemptVoidVerdictHandoff(nil)
 }
 
 // Simply adds the session to the various sessions maps.
@@ -7483,7 +7579,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		sess.cons = ps.Cons
 		// Already durable: they came out of the record. See voidedRegsRev.
 		sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
-		sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
+		sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 		sess.restoreDrainsFromRecord(ps)
 		sess.sharedSubs = ps.SharedSubs
 		sess.pubRelConsumer = ps.PubRel
@@ -7516,7 +7612,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	// The restored lists came OUT of the record, so they are already durable there; only
 	// a later change reopens the gap.
 	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
-	sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
+	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 	sess.restoreDrainsFromRecord(ps)
 	sess.pubRelConsumer = ps.PubRel
 	// A persisted affine consumer proves only that one once existed: it may have
@@ -7787,6 +7883,12 @@ type mqttSessSaveDetail struct {
 	domainTk string
 	cidHash  string
 	rawErr   error // the store-boundary error, type preserved; nil on success
+	// voidedRegsRev is the void-register revision these bytes MARSHALLED, so a
+	// caller that proves them durable outside saveWithDetail's own success arm —
+	// resolveContendedRecordSave classifies a 10164-rejected write landed by an
+	// exact-byte retry or a digest match — credits exactly what they carried. See
+	// mqttPendingWrite.
+	voidedRegsRev uint64
 }
 
 // saveWithDetail is save()'s body; it additionally returns the attempted
@@ -7824,6 +7926,13 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 
 	domainTk, cidHash := sess.domainTk, sess.idHash
 	seq := sess.seq
+	// The void-register revision this write MARSHALLS, sampled in the same critical
+	// section as the marshal, which is what makes it exact: the record above carries
+	// every nonce recorded at or before it and none recorded after, so whoever later
+	// proves these bytes durable can credit precisely this much. EVERY landed save
+	// credits it — the accounting is a property of the durability boundary, not of the
+	// path that happened to be persisting. See mqttPendingWrite.
+	voidedRev := sess.voidedRegsRev
 	sess.mu.Unlock()
 
 	var hdr int
@@ -7841,7 +7950,7 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	}
 	detail = mqttSessSaveDetail{
 		baseSeq: seq, body: body, framed: b, hdr: hdr,
-		domainTk: domainTk, cidHash: cidHash,
+		domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
 	}
 
 	resp, err := sess.jsa.storeSessionMsg(domainTk, cidHash, hdr, b)
@@ -7857,13 +7966,22 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 		// identity so a readback can classify it.
 		if !mqttIsRecordCASRejection(err) {
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(seq, body)
+			sess.markWriteUncertainLocked(seq, body, voidedRev)
 			sess.mu.Unlock()
 		}
 		return detail, fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
 	}
 	sess.mu.Lock()
 	sess.seq = resp.Sequence
+	// A CONFIRMED write is the durability boundary for everything it marshalled, so the
+	// void-register verdicts it carried are credited HERE rather than by whichever caller
+	// happened to want them recorded. Crediting only at the paths that set out to persist
+	// a verdict left the other half open: a save that CARRIES a nonce without crediting it
+	// leaves a settled reservation — a packet identifier and a Receive Maximum slot —
+	// parked in memory although the fact is durable, and on an unbound session nothing
+	// need ever look again. A reconnect's accept save is the case that proves the rule:
+	// it inherits the verdicts and is not a verdict path at all.
+	sess.creditVoidedRegsLocked(voidedRev)
 	sess.mu.Unlock()
 	return detail, nil
 }
@@ -7890,16 +8008,88 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 // Runs from the client's readLoop.
 // Lock not held on entry, but session is in the locked map.
 func (sess *mqttSession) clear(noWait bool) error {
+	return sess.clearEx(noWait, false)
+}
+
+// errMQTTClearLateUncertain is the sentinel clearEx returns when a record write became
+// unresolved AFTER the discard was authorized: nothing was deleted and nothing was reset,
+// so a caller holding an obligation can put it back untouched. It is a distinct error
+// precisely so that recovery is never inferred from an arbitrary clear() failure — a lost
+// teardown claim or a JetStream error means the teardown is another owner's or partly
+// done, and re-parking there would resurrect an obligation nobody owes.
+var errMQTTClearLateUncertain = errors.New("a record write became unresolved after the discard was authorized")
+
+// mqttTestClearWindowHookV fires at each of clearEx's two decision points, named by the
+// window: BEFORE its entry check, and after that check but before it takes the record
+// fence. Both are windows in which another writer's ambiguity is still invisible to the
+// check that follows, and a test arms one positively there instead of sleeping.
+var mqttTestClearWindowHookV atomic.Pointer[func(sess *mqttSession, window string)]
+
+const (
+	mqttClearWindowPreEntry = "pre-entry"
+	mqttClearWindowPreFence = "pre-fence"
+)
+
+func setMQTTTestClearWindowHook(h func(sess *mqttSession, window string)) func() {
+	prev := mqttTestClearWindowHookV.Load()
+	if h == nil {
+		mqttTestClearWindowHookV.Store(nil)
+	} else {
+		mqttTestClearWindowHookV.Store(&h)
+	}
+	return func() { mqttTestClearWindowHookV.Store(prev) }
+}
+
+func (sess *mqttSession) clearWindowHook(window string) {
+	if h := mqttTestClearWindowHookV.Load(); h != nil {
+		(*h)(sess, window)
+	}
+}
+
+// clearEx is clear() with the late-uncertainty refusal made OPT-IN.
+//
+// refuseLateUncertainty re-checks the unresolved state with the fence HELD, which is the
+// sound check — the entry check below is a check-then-act, because the fence is what
+// serializes writers and an off-readLoop one (a register store settling) can go ambiguous
+// while this call is still waiting for it. Only the DEFERRED DISCHARGE asks for it: it runs
+// with the parked action — deadline and Will — already consumed, so it must be able to put
+// that obligation back rather than tear the session down on a sequence nobody classified.
+//
+// Every other caller keeps the historical behavior deliberately. They evict or log rather
+// than recover, so turning a late ambiguity into a refusal there would strand the object
+// while its record and consumers survive; their exposure to this race is pre-existing,
+// stated in docs/CONFORMANCE.md, and closing it needs per-caller recovery (a roadmap item).
+func (sess *mqttSession) clearEx(noWait, refuseLateUncertainty bool) error {
 	// REFUSE AT ENTRY while an earlier write is unresolved, BEFORE any consumer or
 	// record deletion. sess.seq may be stale, and this path deletes the shared
 	// durables and the record before a stale CAS could fail — so it must not run on
 	// a snapshot nobody has classified. The caller defers the discard instead; see
 	// sess_uncertain.go.
+	sess.clearWindowHook(mqttClearWindowPreEntry)
 	if sess.isSeqUncertain() {
+		if refuseLateUncertainty {
+			// The SENTINEL belongs here too, not only on the in-fence refusal. The
+			// caller's own uncertainty check ran before this call and cannot cover the
+			// interval since — the two are not under one fence — so an ambiguity armed in
+			// between arrives at THIS check, and it is every bit as recoverable: nothing
+			// has been deleted. Returning a plain error would have the caller treat it as
+			// a partly-done teardown and drop an obligation it could have put back.
+			return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearLateUncertain)
+		}
 		return fmt.Errorf("refusing to discard session %q: an earlier record write is unresolved", sess.id)
 	}
+	sess.clearWindowHook(mqttClearWindowPreFence)
 
 	tok := sess.beginRecordTx()
+	// Nothing has been mutated yet, so the fence is released WITHOUT ending the
+	// generation: this session is not being discarded after all, and the next resolution
+	// decides again.
+	if refuseLateUncertainty && sess.isSeqUncertain() {
+		if terr := sess.endRecordTx(tok); terr != nil {
+			sess.jsa.c.Errorf("MQTT: %v", terr)
+		}
+		return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearLateUncertain)
+	}
 	// Released on EVERY exit path, including the error returns below, after which
 	// the in-memory state is already reset and old writers must be dead anyway.
 	defer func() {
@@ -7989,9 +8179,13 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// deleted: nothing can redeliver them, so nothing needs settling.
 	sess.srcAckOwed = nil
 	// The whole generation's registers are purged by the teardown, so nothing is owed.
+	// The handoff watermark goes with them, and for the same reason the two paths that
+	// REUSE this object as a fresh session need it: an old generation's value left
+	// standing would suppress the new generation's handoffs until its revisions caught
+	// up. See voidVerdictHandoffDueLocked.
 	sess.cancelledRegNonces = nil
 	sess.settledVoidReservations = nil
-	sess.voidedRegsRev, sess.voidedRegsSavedRev = 0, 0
+	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 	// The identifier space of the RETIRING incarnation is gone with the maps above, so
 	// the restriction that protected it must go too. Two paths REUSE the session object
 	// as a fresh session, and a fresh one reports Session Present false, so it never
@@ -9498,7 +9692,16 @@ CHECK:
 	defer func() {
 		asm.mu.Lock()
 		delete(asm.sessLocked, cid)
+		// The resident session, read in the same critical section as the release, for the
+		// void-verdict re-check below: this is a gate release like unlockSession's and owes
+		// the same handoff, and reading the map here is what keeps it to a RESIDENT object
+		// however this CONNECT ended. A successful CONNECT leaves the session bound, which
+		// the predicate excludes — a bound session converges through its own packet tails,
+		// and firing here (right after the success CONNACK, before any tail exists) could
+		// refuse the resume work behind an already-accepted connection.
+		released := asm.sessions[cid]
 		asm.mu.Unlock()
+		asm.handoffVoidVerdictsOnGateRelease(released)
 	}()
 
 	// Is the client requesting a clean session (v5: Clean Start) or not.
@@ -9564,7 +9767,12 @@ CHECK:
 		case mqttUncertainUnresolved:
 			// Nothing may be concluded about this session's durable state, so it must
 			// not be resumed, discarded, or overwritten. Reject and let the client
-			// retry; the deferred close obligations stay parked.
+			// retry. Two states arrive here and the rejection is right for both: the
+			// readback failed, in which case the deferred close obligations are still
+			// parked; or the resolution's own work — a discharged deferred close, a
+			// continuation's re-save — left a NEW write outstanding, in which case
+			// binding anyway would have the accept save refused and the session evicted
+			// with that write's obligations. See sess_uncertain.go.
 			return formatError(fmt.Errorf("session record state is unresolved"))
 		default:
 			// Resolved as ours, and the deferred close (if any) has been applied. If
@@ -14258,6 +14466,42 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *Cons
 // state restored from a register the name is trusted, the same trust every other restored
 // identity gets.
 func (sess *mqttSession) purgeSharedPending() {
+	regs, cancels := sess.collectSharedPendingPurge()
+	// No consumer is destroyed here — the group durable survives — but the identifiers
+	// are freed, so a register that lands afterwards would have the next resume reserve
+	// one the session has already given up.
+	sess.secureRegCancellations(nil, recordTx{}, cancels)
+	sess.deleteInflightRegisters(nil, recordTx{}, regs)
+}
+
+// purgeSharedPendingStaged is purgeSharedPending for a caller that owns the record
+// write: the in-memory purge and the register-stream rungs run exactly as they do for
+// the ordinary close, but a fallback verdict is only STAGED in memory — no record write
+// happens here — and the caller's own classified save carries it. It reports whether any
+// verdict is so owed.
+//
+// The deferred close is that caller, and the split is what makes its write ONE
+// operation: a purge that saved for itself could land ambiguously and leave the
+// caller's own save refused, with its parked close obligations already consumed. See
+// applyDeferredDisconnect.
+//
+// Session lock NOT held on entry: the rungs issue JetStream requests.
+func (sess *mqttSession) purgeSharedPendingStaged(c *client) bool {
+	regs, cancels := sess.collectSharedPendingPurge()
+	owed := sess.tombstoneCancellationsOnStream(c, cancels)
+	if sess.voidRegistersOnStream(c, regs) {
+		owed = true
+	}
+	return owed
+}
+
+// collectSharedPendingPurge drops the pending state in memory and reports what the
+// register stream still owes for it: the registers to delete and the cancellations to
+// tombstone. It is the derivation both purge forms share, and the rule it encodes is
+// the load-bearing part — see purgeSharedPending.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) collectSharedPendingPurge() ([]mqttVoidedReg, []mqttRegCancellation) {
 	sess.mu.Lock()
 	var regs []mqttVoidedReg
 	var cancels []mqttRegCancellation
@@ -14288,11 +14532,7 @@ func (sess *mqttSession) purgeSharedPending() {
 		purge(key.jsDur)
 	}
 	sess.mu.Unlock()
-	// No consumer is destroyed here — the group durable survives — but the identifiers
-	// are freed, so a register that lands afterwards would have the next resume reserve
-	// one the session has already given up.
-	sess.secureRegCancellations(nil, recordTx{}, cancels)
-	sess.deleteInflightRegisters(nil, recordTx{}, regs)
+	return regs, cancels
 }
 
 // sharedConsumerHasOtherHolders reports whether any session still holds a shared

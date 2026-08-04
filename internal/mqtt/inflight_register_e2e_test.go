@@ -837,3 +837,165 @@ func TestMQTTInflightRetainedSendNotRegistered(t *testing.T) {
 		t.Fatalf("walk the registers: %v", err)
 	}
 }
+
+// A reconnect's ACCEPT SAVE both carries an inherited void-register verdict and CREDITS it.
+//
+// This is the rebind strand of the deferred-close work, end to end through a real CONNECT. The
+// surviving close before it gives up its SHARED group delivery and stages a verdict it cannot
+// persist — both register-stream rungs and the session store are failing — so the session is
+// left with an unsaved revision and a reservation parked on the identifier, and no handoff can
+// have written it because every attempt the close made failed too. The next CONNECT is then the
+// first landed write, and it is not a verdict path at all: it inherits the nonce in the record
+// it marshals. If crediting lived only in the paths that set out to persist a verdict, the fact
+// would be durable while the identifier and its Receive Maximum slot stayed reserved in memory
+// for the life of the session.
+//
+// Mutation checks: drop the marshal-revision credit in saveWithDetail's success arm and the
+// credit assertion fails; skip the shared purge at the close and nothing is staged to inherit.
+func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const clientID = "inflight-inherit-credit"
+	// A Session Expiry Interval is what makes the close a SURVIVING one, which is the close
+	// that purges its shared pending deliveries.
+	props := mqttV5ConnPropsSessionExpiry(3600)
+	sub, subr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, props: props}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, subr)
+	testMQTTSubV5(t, sub, subr, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+
+	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "pub-inherit", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTReadConnAckV5(t, pubr)
+
+	// One group delivery in flight, never acknowledged: that is the register the close gives
+	// up, freeing its identifier without acking.
+	testMQTTPubV5Props(t, pub, pubr, 1, false, 1, "foo", []byte("payload"), nil)
+	testMQTTReadPublishV5(t, subr, "foo", []byte("payload"))
+
+	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the subscriber's session must be resident")
+	}
+
+	// Both register-stream rungs fail, so the close's cleanup has only the session record
+	// left; and the record store fails DEFINITELY, so it cannot get there either. What
+	// remains is a staged verdict with an unsaved revision.
+	asm.mu.Lock()
+	asm.testInflightDelete = func(uint64) error { return errors.New("test: register delete unavailable") }
+	asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
+		return 0, errors.New("test: register stream unavailable")
+	}
+	asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		return nil, nil, errors.New("test: register stream unavailable")
+	}
+	asm.mu.Unlock()
+	// The record store fails for as long as the session is UNBOUND, which is what makes the
+	// attribution positive: every write the close makes — its disconnect save, the purge's
+	// fallback, the gate-release handoff — is refused, so the FIRST landed write on this
+	// session can only be the reconnect's accept save (CONNECT binds before it saves).
+	restoreSave := setMQTTTestSessSaveHook(func(cur *mqttSession) error {
+		if cur != sess {
+			return nil
+		}
+		cur.mu.Lock()
+		unbound := cur.c == nil
+		cur.mu.Unlock()
+		if unbound {
+			return errors.New("test: the session store is unavailable while unbound")
+		}
+		return nil
+	})
+	defer restoreSave()
+	landed := 0
+	restoreCount := setMQTTTestSessStoreResultHook(func(cur *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+		if cur == sess && err == nil {
+			landed++
+		}
+		return resp, err
+	})
+	defer restoreCount()
+
+	sub.Close()
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if sess.c != nil {
+			return fmt.Errorf("the close has not detached the session yet")
+		}
+		if sess.voidedRegsRev <= sess.voidedRegsSavedRev {
+			return fmt.Errorf("no unsaved void-register revision staged")
+		}
+		return nil
+	})
+
+	sess.mu.Lock()
+	rev := sess.voidedRegsRev
+	nonces := mqttSortedNonces(sess.cancelledRegNonces)
+	sess.mu.Unlock()
+	if len(nonces) == 0 {
+		t.Fatal("the close must have staged at least one void-register verdict")
+	}
+
+	// Nothing landed during the whole close, so nothing there can have credited.
+	if landed != 0 {
+		t.Fatalf("no close-path write may have landed, got %d", landed)
+	}
+
+	// The register stream recovers so the resume can run; the record store stays refused
+	// until the reconnect BINDS, so the accept save is the first landed write.
+	asm.mu.Lock()
+	asm.testInflightDelete, asm.testInflightStore, asm.testInflightLoad = nil, nil, nil
+	asm.mu.Unlock()
+
+	sub2, sub2r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, props: props}, o.MQTT.Host, o.MQTT.Port)
+	defer sub2.Close()
+	testMQTTReadConnAckV5(t, sub2r)
+
+	if landed == 0 {
+		t.Fatal("the reconnect's accept save must have landed")
+	}
+
+	// The record it wrote carries the inherited verdict...
+	ps, _, err := asm.loadFenceSession(sess.idHash)
+	if err != nil || ps == nil {
+		t.Fatalf("load the session record after the reconnect: ps=%+v err=%v", ps, err)
+	}
+	for _, n := range nonces {
+		found := false
+		for _, got := range ps.CancelledRegs {
+			if got == n {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("the accept save must carry the inherited verdict %q, got %v", n, ps.CancelledRegs)
+		}
+	}
+	// ...and it credited what it marshalled, releasing the reservation that was waiting on
+	// exactly that proof.
+	asm.mu.RLock()
+	cur := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if cur == nil {
+		t.Fatal("the resumed session must be resident")
+	}
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		cur.mu.Lock()
+		defer cur.mu.Unlock()
+		if cur.voidedRegsSavedRev < rev {
+			return fmt.Errorf("the accept save did not credit the revision it marshalled: rev=%d saved=%d",
+				rev, cur.voidedRegsSavedRev)
+		}
+		if len(cur.settledVoidReservations) != 0 {
+			return fmt.Errorf("%d reservation(s) still parked on a proven verdict", len(cur.settledVoidReservations))
+		}
+		return nil
+	})
+}

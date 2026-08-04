@@ -3474,7 +3474,7 @@ func TestMQTTReconcileResolveAlwaysTakesTheGate(t *testing.T) {
 	// state in which the sampled version skips the gate entirely.
 	sess.mu.Lock()
 	bound := sess.c
-	sess.markWriteUncertainLocked(sess.seq, []byte("an attempt that did not land"))
+	sess.markWriteUncertainLocked(sess.seq, []byte("an attempt that did not land"), 0)
 	parked := sess.deferredDisconnect
 	sess.mu.Unlock()
 	if bound == nil || parked != nil {
@@ -3541,7 +3541,7 @@ func TestMQTTReconcileCloseParksTeardownWhenResolverHoldsGate(t *testing.T) {
 	// An unresolved write whose readback will classify OURS (the base matches
 	// the record), so resolution ends in a discharge rather than a disposition.
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(sess.seq, []byte("attempt that did not land"))
+	sess.markWriteUncertainLocked(sess.seq, []byte("attempt that did not land"), 0)
 	sess.mu.Unlock()
 
 	// Stall the resolver's readback well past the close path's bounded gate

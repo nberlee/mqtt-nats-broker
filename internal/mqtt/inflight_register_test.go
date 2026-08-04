@@ -2432,14 +2432,14 @@ func TestMQTTInflightVoidVerdictUnlandedSaveRetries(t *testing.T) {
 	// An attempted write that will not match the record: the readback compares the
 	// record's sequence with this base and its digest with this body, so it can only
 	// conclude that nothing landed.
-	e.sess.markWriteUncertainLocked(base, []byte(`{"attempted":"never-landed"}`))
+	e.sess.markWriteUncertainLocked(base, []byte(`{"attempted":"never-landed"}`), 0)
 	// The verdict the ambiguous save was carrying.
 	e.sess.voidRegNonceLocked("nonce-unlanded")
 	rev := e.sess.voidedRegsRev
 	e.sess.mu.Unlock()
 
 	// Exactly what persistVoidedRegs hands the readback on saveMaybeLanded.
-	e.sess.retainOnUncertain(e.sess.voidedRegsUncertainActions(e.c, rev))
+	e.sess.retainOnUncertain(e.sess.voidedRegsUncertainAction(e.c), nil)
 
 	res, err := e.sess.resolveUncertainWrite()
 	if err != nil {

@@ -439,16 +439,51 @@ Residuals:
   returns is the pre-purge state — the identifiers and Receive Maximum slots it had
   freed. Bounded to one crash per close and self-limiting: the next surviving close
   purges again. The same window applies to every close, not only the record-restored
-  sessions the purge newly reaches.
-- **A close deferred by an uncertain record write does not run the shared purge.**
-  When the close's own record write is ambiguous the disconnect is parked and applied
-  later, and that path records the disconnect time without purging. Such a session keeps
-  its pending shared-group deliveries — their packet identifiers and Receive Maximum
-  slots — for the rest of its life, and a resume can NAK-steal group messages AckWait
-  would have redelivered to other members. Under a Receive Maximum of 1 that is a session
-  that can no longer deliver at all. The purge cannot simply be called there: it can
-  itself write the record, which would leave the deferred path's own write refused as
-  unresolved, so closing this needs the two to become one classified write.
+  sessions the purge newly reaches — the DEFERRED close included, where the linearization
+  points are the cancellation tombstones (written first), the exact deletes, and the one
+  classified record save: a crash part-way through the rungs leaves some allocations
+  durably tombstoned and others live with no verdict, and a crash after the rungs loses a
+  fallback verdict whose nonce existed only in memory.
+- **A deferred close whose record write DEFINITELY fails loses restart-survival of the
+  deadline.** The in-memory purge stands, the timer is armed, and the verdicts stay staged
+  for the next convergence point, but nothing durable records the disconnect time — so a
+  restart before any later write reads the record as connected and the session waits for a
+  reconnect instead of expiring. The same posture as the ordinary close's failed disconnect
+  save.
+- **A close parked by an uncertain record write is memory-only until it is applied.** The
+  parked action carries the ORIGINAL disconnect time and the Will, both captured while the
+  client still existed, and neither is reconstructible: a crash before the discharge loses
+  the earned deadline and the Will outright, with the record still describing a connected
+  session. For a finite session the origin broker's periodic expiry sweep may later stamp
+  a disconnect time of its own — a LATER deadline than the client earned — and a clustered
+  non-origin broker does not; a never-expiring session is not swept at all. The pending
+  shared state is restored by the next resume and purged by a future surviving close.
+- **A crash after the deferred save has landed but before the Will is published can lose
+  the Will.** The deadline is durable at that point — including when the save landed
+  ambiguously and a readback later proved it — but the Will existed only in the action the
+  discharge consumed. Pre-existing: making a parked Will durable earlier is Will-outbox
+  scope, not purge scope.
+- **A discard other than the deferred one can still run on an unclassified sequence.**
+  `clear` refuses at entry while a record write is unresolved, and that check is a
+  check-then-act: an off-readLoop writer (a register store settling) can arm the
+  uncertainty while the call is already waiting for the record fence. Only the DEFERRED
+  discharge opts into the in-fence re-check, because it is the one caller that can put its
+  obligation back; an ordinary close, a session expiry, a CONNECT clean start and a
+  record-restore discard proceed, and their sequence-targeted record delete then typically
+  removes nothing — leaving a record whose durables are gone, until a later reconnect
+  discards it. Pre-existing and not widened by the deferred-close work: giving each caller
+  its own recovery (park the full close, retain-and-retry the expiry, reject without
+  evicting) is a roadmap item.
+- **A void-register verdict staged during the CONNECT accept rollback is lost with the
+  aborted object.** The rollback's record snapshot is taken inside the rollback, so a nonce
+  staged after it is deliberately not credited (crediting it would claim durable what
+  nothing wrote). What the surviving register then means has three shapes: with a resumable
+  record, a live, lost or unprovable source has its identifier RESERVED fail-closed; a
+  source proven complete has its register scheduled for asynchronous deletion, and a failed
+  no-wait delete simply leaves it for a later reconciliation; and with the record ABSENT
+  after a failed rollback (classified applied) the next CONNECT starts a fresh generation,
+  so the old-generation register is ORPHANED — the orphan sweep's territory — rather than
+  reserved. Pre-existing behavior of the rollback path.
 - **Recovery's opaque and duplicate-source reservations are never purged.** A register
   whose body cannot be read, and the loser of a duplicate claim on one source, are held
   as identifier reservations that carry no durable name — so no durable-keyed purge can

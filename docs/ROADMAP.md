@@ -993,38 +993,147 @@ is fixed before feature work continues.
   let an indeterminate claim re-read fall to an opaque reservation (M30). M1-M7
   were re-run against the combined tree.
   Residuals remain stated in `docs/CONFORMANCE.md`: unreadable registers cannot be
-  claimed, the ordinary-close in-memory/delete crash window is unchanged, and the
-  deferred close still does not invoke this purge. Three follow-ups it deliberately
-  leaves are the next three bullets.
+  claimed and the ordinary-close in-memory/delete crash window is unchanged. The
+  deferred close now runs this purge (next bullet). Three follow-ups it deliberately
+  left are the bullets below.
 
-- [ ] Call `purgeSharedPending` from the deferred-disconnect close path — as ONE
+- [x] Call `purgeSharedPending` from the deferred-disconnect close path — as ONE
   classified operation with that path's own record write, not as a bare call.
-  `applyDeferredDisconnect` (`sess_uncertain.go`, the session-survives branch)
-  records the disconnect time, saves and arms the expiry, and never purges, so
-  the uncertain-write close leaks exactly what `mqttHandleClosedClient` frees:
-  the session's pending shared-group deliveries keep their packet identifiers and
-  Receive Maximum slots, and a resume can NAK-steal group messages AckWait would
-  have redelivered. Under a Receive Maximum of 1 a single stranded entry stops
-  the session delivering at all. Both callers reach the function only for an
-  UNBOUND session holding the ownership gate, so the purge itself would be safe
-  there.
-  **The bare call is not, and a review round proved it** — recorded here so the
-  next attempt does not repeat it. `purgeSharedPending` can itself write the
-  record: when both register-stream rungs fail, `deleteInflightRegisters` falls
-  back to `persistVoidedRegs`, whose `saveClassified` can land ambiguously and
-  set `seqUncertain`. `saveWithDetail` then REFUSES every later write (`mqtt.go`,
-  "an earlier record write is unresolved"), so the branch's own save is refused
-  after `takeDeferredDisconnect` has already consumed the parked action and
-  nothing will retry it: `disconnectedAt` survives in memory only, while the
-  landed purge record still carries `DisconnectedAt=0`, and the expiry then sees
-  a session that looks connected by the record and superseded in memory. So the
-  fix must open the record transaction first, stop the purge from initiating an
-  independent save, persist the fallback nonces and the original disconnect time
-  together, and keep the retry/resolve continuations when that save is ambiguous.
-  Test it with a failed register delete AND tombstone plus a landed-but-lost
-  response, then assert the persisted deadline survives resolution and restart —
-  a test that only covers successful register cleanup proves nothing here.
+  DONE. `applyDeferredDisconnect`'s session-survives branch (`sess_uncertain.go`)
+  now opens the record transaction BEFORE its first mutation, stamps the ORIGINAL
+  disconnect time, runs a purge variant that only STAGES (the register-stream
+  rungs plus the nonce in memory — the two cleanup ladders were split into
+  stream-only cores, `voidRegistersOnStream` and
+  `tombstoneCancellationsOnStream`, so who writes the record is the caller's
+  business), and makes ONE `saveClassified` carrying the deadline and the
+  fallback verdicts together. An ambiguous save retains the void-verdict
+  continuation, which is now closed under repeated ambiguity — it re-saves and
+  re-registers itself — so the deadline rides every retry; a definite failure
+  keeps the in-memory purge and the armed timer. Since the action is CONSUMED
+  before the discharge runs, the discharge also re-checks that the record state is
+  still resolved (once on entry, once with its own fence held) and RE-PARKS the
+  untouched action if an off-readLoop writer went ambiguous in between — otherwise
+  every write is refused with nothing left holding the original deadlines.
+  Two mechanisms fell out of the review rounds and replaced the per-branch
+  retries the first design had. **Every landed record write credits the
+  void-register revision it MARSHALLED** (`saveWithDetail` samples it in the
+  marshal's own critical section; the sample travels in `mqttPendingWrite` and
+  `mqttSessSaveDetail`, so the landed readback and each landed classification of
+  `resolveContendedRecordSave` credit it too), never on an unlanded, unresolved,
+  definitely-failed or foreign outcome, with the accept ROLLBACK's raw write a
+  stated exemption. And **the release handoff** owns void-verdict persistence
+  liveness for UNBOUND sessions: the record-fence release (decided inside its own
+  `sess.mu` critical section) and both ownership-gate release forms
+  (`unlockSession` and CONNECT's inline delete) re-check what was staged while
+  they were held, and attempt persistence under the gate, taken fail-fast, with a
+  watermark that advances only when an attempt ACQUIRES the fence, plus a periodic
+  BACKSTOP that re-arms that watermark for a resident unbound session whose store
+  failed definitely — without it the watermark itself ended the sequence and a
+  never-expiring session could keep the verdict memory-only indefinitely. Bound
+  sessions keep converging through their packet tails. The resolver also re-checks at BOTH
+  levels and reports `mqttUncertainUnresolved` when a continuation or a discharge
+  re-armed uncertainty, which is what stops a CONNECT from binding on a stale
+  "ours" and evicting the object holding the continuation.
+  Twenty-five native tests (`sess_deferred_purge_test.go`) plus one end-to-end test
+  through a real reconnect (`inflight_register_e2e_test.go`, in the ported suite: a
+  surviving close that can persist nothing, then a CONNECT whose accept save is the
+  first landed write and must carry AND credit the inherited verdict): the purge
+  itself, the
+  bullet's own one-landed-write case with restart survival, the unlanded retry,
+  the second-ambiguity re-arm, the definite-failure convergence, a stale close
+  fenced by a register claim, a real late settle converging at the gate release,
+  the ambiguous-plus-late-staging arms, successive-staging convergence and its
+  termination, the fence-losing race, the bound-session and generation-reuse
+  scoping, the gate-yield, the helper's resident/nonresident contract, both
+  resolver re-check sites, the inherited-verdict credit, four contended-save
+  credit variants, the rollback exemption, both re-park windows (a discharge that
+  finds the state unresolved again at either of ITS two checks, and a discard
+  refused at either of `clearEx`'s), the contention hand-back, and the periodic
+  backstop with its evicted-snapshot arm. Mutations killed by their paired
+  test: MU1 (the bare purge), MU2 (no purge), MU3 (stamp the disconnect time after
+  the save), MU4 (no continuation), MU5 (a plain re-save), MU6/MU8/MU9 (each
+  resolver re-check, MU8 and MU9 independently), MU7 (no fence-release trigger),
+  MU10 (watermark burned at decision time) and its inverse (unconditional
+  re-trigger), MU11a (no `unlockSession` trigger), MU13c (the unbound scoping gone
+  from both guards), MU14 (no watermark reset in `clear()`), MU15/MU15b (each credit
+  site), MU16 (the contended-save credits), MU17 (an ungated attempt) and MU18 (the
+  rollback credits), MU19 (no unresolved re-check at the discharge), MU20/MU20b
+  (`clearEx` without its in-fence re-check, and a discharge that does not opt in),
+  MU21 (no re-park on the late-refusal sentinel), MU22 (the entry refusal drops
+  that sentinel), MU23 (the handoff recurses through its own releases instead of
+  looping), MU24/MU24b (a contended attempt hands its loop ownership back outside
+  the gate's critical section, or never) and MU25/MU25b (no periodic backstop, and
+  a backstop that does not re-arm the watermark), MU26 (the handoff gate does not
+  check residency), MU19b (no in-fence re-check in the surviving discharge) and
+  MU13d (the unbound rule removed from both its homes, caught in the rebind
+  window) and MU27 (the Will's fate decided from the entry sample of the clock
+  rather than a fresh one) — the last fourteen pin the twelve findings the holistic
+  review rounds produced. THREE survive, honestly, and each for a stated reason.
+  MU11b, dropping only
+  CONNECT's inline release call, because round 14 established no reachable path
+  leaves a resident unbound session with a gap there (defensive wiring, tested at
+  the helper); MU12, sampling the fence-release decision after the unlock, which
+  is observationally equivalent because the revision gap is monotonic and every
+  other writer's release re-checks (the in-section sample is kept as the
+  discipline, not because a test distinguishes it); and MU13/MU13b, each unbound
+  guard alone. The unbound rule has two homes — one shared predicate, consulted
+  both by the trigger and by the attempt's own re-validation under the gate, and
+  the gate CLAIM itself, made as NOBODY so it decides against fresh state rather
+  than a pre-gate sample. Either home enforces the rule, so removing one is
+  unobservable; removing BOTH is killed twice over, by T9 for a session already
+  bound when the trigger fires (MU13c) and by T18 for a rebind that lands in the
+  window between the sample and the claim (MU13d). The claim is the load-bearing
+  one — a pre-gate sample cannot see a CONNECT that binds after it — and T18 is
+  what pins that, positively: no write, no uncertainty, ownership handed back.
+  M1-M7 were re-run against the final tree (the extraction and the
+  collect/stage split touch exactly the code they pin) and each failed its paired
+  test.
+  Residuals stated in `docs/CONFORMANCE.md`: the parked action (deadline and Will)
+  is memory-only across a crash, a crash between the rungs and the save loses that
+  close's purge, a definite save failure loses restart-survival of the deadline, a
+  crash after a landed save but before Will publication loses the Will, and a
+  verdict staged during the accept rollback is lost with the aborted object (with
+  its three-way register residue).
   Spec5 [4.8.2], [4.9].
+
+- [ ] Give every `clear()` caller a late-uncertainty recovery, so a discard never
+  runs on a sequence nobody has classified. `clear` refuses at ENTRY while a
+  record write is unresolved, and that check is a check-then-act: the fence is
+  what serializes writers, so an off-readLoop one — a register store settling —
+  can arm `seqUncertain` while the call is already waiting for the fence. The
+  deferred discharge now opts into an in-fence re-check (`clearEx`'s
+  `refuseLateUncertainty`, returning `errMQTTClearLateUncertain`) because it can
+  put its consumed action back. The other four callers cannot, and the refusal is
+  deliberately NOT extended to them: `mqttHandleClosedClient` removes the session
+  before clearing and logs, `expireSession` does the same, CONNECT's clean start
+  removes it on error, and the record-restore discard returns the error — so a
+  refusal there would strand the object while its record and consumers survive.
+  Today they instead PROCEED, and their sequence-targeted record delete then
+  removes nothing, leaving a record whose durables are gone until a later
+  reconnect discards it (stated in `docs/CONFORMANCE.md`).
+  The fix is per-caller recovery, each with its own invariant: the ordinary close
+  parks a FULL deferred action (disconnect time and Will) instead of logging, the
+  expiry retains the session and retries the due discard after resolution, CONNECT
+  rejects without evicting the continuation-bearing object, and the restore path
+  keeps the object it was about to discard. Each needs a forced-race test using
+  the clear-window seam (`setMQTTTestClearWindowHook`, whose
+  `mqttClearWindowPreEntry` and `mqttClearWindowPreFence` name the two windows an
+  ambiguity can be armed in) and a mutation that removes
+  only that caller's recovery. Filed as a separate item deliberately: the
+  deferred-close work above proved that widening this refusal without per-caller
+  recovery trades one loss for another.
+
+- [ ] Investigate: a definite record-CAS rejection with a MISSED remote-persist
+  notification may leave a never-expiring stale local session resident
+  indefinitely. A definite rejection creates no uncertainty, so the periodic
+  retry pass never reads it back, and eviction of the stale object comes from
+  `processSessionPersist` or a later readback's foreign verdict. If the
+  notification is lost, a never-expiring unbound session has neither and stays in
+  `sessByHash` for good. The shape is PRE-EXISTING and not specific to the
+  deferred close — the ordinary close's rejected disconnect save has it too —
+  which is why the deferred-purge item above did not fix it. Needs a
+  notification-loss reproduction before any fix; the candidate is classifying a
+  definite rejection with an authoritative readback under the ownership gate.
 
 - [ ] Make `readd` restore `sharedSubs` alongside `cons`, or release from both.
   `rollbackSubscribePacket`'s `readd` (`mqtt.go`) restores the packet's added

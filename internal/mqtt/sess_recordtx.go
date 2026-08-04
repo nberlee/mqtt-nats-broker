@@ -128,11 +128,12 @@ func (sess *mqttSession) endRecordTxNewGeneration(tok recordTx) error {
 
 func (sess *mqttSession) endRecordTxLocked(tok recordTx, newGeneration bool) error {
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
 	if err := sess.validateRecordTxLocked(tok); err != nil {
+		sess.mu.Unlock()
 		return err
 	}
 	if !tok.owner {
+		sess.mu.Unlock()
 		return fmt.Errorf("session %q: a nested record transaction token may not close transaction %v", sess.id, tok.id)
 	}
 	// Test seam, fired with sess.mu held and the fence still OPEN: it observes
@@ -147,7 +148,23 @@ func (sess *mqttSession) endRecordTxLocked(tok recordTx, newGeneration bool) err
 	if newGeneration {
 		sess.recordEpoch++
 	}
+	// Whether a void-register verdict was staged while this transaction held the fence is
+	// decided INSIDE this critical section, not after the unlock. A stager takes sess.mu to
+	// record its nonce and then finds the fence held; the cleared fence becomes visible to
+	// it only when we unlock, so a decision sampled after the unlock can miss a nonce
+	// staged in exactly that window — and that stager's own persistence attempt was
+	// refused, so nothing else is left owing it. Never for a generation that has just
+	// ENDED: clear() discards the session's whole state, verdicts included.
+	handoff := !newGeneration && sess.voidVerdictHandoffDueLocked()
 	sess.recordTxCondLocked().Broadcast()
+	sess.mu.Unlock()
+	if handoff {
+		// After the unlock, and after the broadcast: the attempt takes the ownership gate
+		// and re-acquires this fence, and it runs on this goroutine, so holding either
+		// here would deadlock. No client on this path — the fence is released by paths
+		// with and without one — and every log site the attempt reaches is nil-safe.
+		sess.attemptVoidVerdictHandoff(nil)
+	}
 	return nil
 }
 

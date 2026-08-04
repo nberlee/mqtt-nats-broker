@@ -849,7 +849,7 @@ func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
 	sess.mu.Lock()
 	sess.sharedSubs = map[string]byte{sid: 1}
 	// An earlier write in this packet already left the session unresolved.
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"earlier":"attempt"}`))
+	sess.markWriteUncertainLocked(sess.seq, []byte(`{"earlier":"attempt"}`), 0)
 	sess.mu.Unlock()
 
 	tok := sess.beginRecordTx()
@@ -1257,7 +1257,7 @@ func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
 	sess.c = c
 	baseSeq := sess.seq
 	// An attempted write whose digest will NOT match whatever is stored.
-	sess.markWriteUncertainLocked(baseSeq, []byte(`{"attempted":"ours"}`))
+	sess.markWriteUncertainLocked(baseSeq, []byte(`{"attempted":"ours"}`), 0)
 	sess.mu.Unlock()
 
 	// Somebody else advances the record with different content.
@@ -1338,7 +1338,7 @@ func TestUncertainRetrySkipsAnOpenRecordTransaction(t *testing.T) {
 	// the session uncertain — the exact mid-flight state.
 	tok := sess.beginRecordTx()
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"mid-flight"}`))
+	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"mid-flight"}`), 0)
 	sess.mu.Unlock()
 
 	// The periodic pass must leave it alone.
@@ -1431,7 +1431,7 @@ func TestResolutionIsOneRecordTransaction(t *testing.T) {
 
 	sess.mu.Lock()
 	baseSeq := sess.seq
-	sess.markWriteUncertainLocked(baseSeq, []byte(`{"attempted":"never-landed"}`))
+	sess.markWriteUncertainLocked(baseSeq, []byte(`{"attempted":"never-landed"}`), 0)
 	sess.mu.Unlock()
 
 	var (
@@ -1506,7 +1506,7 @@ func TestResolutionRefusesWhileAnotherTransactionIsOpen(t *testing.T) {
 		t.Fatalf("initial save: %v", err)
 	}
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"busy"}`))
+	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"busy"}`), 0)
 	sess.mu.Unlock()
 
 	held := sess.beginRecordTx()
@@ -1622,7 +1622,7 @@ func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
 
 	sess.mu.Lock()
 	sess.c = c
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"ours"}`))
+	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"ours"}`), 0)
 	sess.mu.Unlock()
 
 	// Another owner advances the record with different content.

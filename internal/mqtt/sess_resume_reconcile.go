@@ -705,6 +705,15 @@ func mqttVerifyConsumersBatched(durables []string, bound int,
 // The retry re-sends detail's exact framed bytes rather than re-marshalling,
 // so the digest a later readback compares cannot diverge from what was stored.
 //
+// Every landed classification here CREDITS the void-register revision those bytes
+// marshalled, because this is a durability proof that never passes through
+// saveWithDetail's success arm or through the generic resolver: a 10164-rejected save
+// whose exact-byte retry succeeds, or whose digest is found at a newer sequence, is
+// durable and its verdicts are durable with it. Left uncredited, a quiet bound
+// connection could park the reservation indefinitely. The unresolved arms hand the same
+// revision to pendingWrite so the deferred readback credits it instead. See
+// creditVoidedRegsLocked.
+//
 // No lock held on entry. Performs JetStream requests.
 func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttRepairSaveVerdict {
 	want := mqttRecordDigest(d.body)
@@ -717,7 +726,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 				// establishes the pending-write state itself, carrying the base and
 				// digest, so the deferred readback classifies THIS attempt.
 				sess.mu.Lock()
-				sess.markWriteUncertainLocked(d.baseSeq, d.body)
+				sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
 				sess.mu.Unlock()
 				return mqttRepairSaveUnresolved
 			}
@@ -732,6 +741,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			if rerr == nil {
 				sess.mu.Lock()
 				sess.seq = resp.Sequence
+				sess.creditVoidedRegsLocked(d.voidedRegsRev)
 				sess.mu.Unlock()
 				return mqttRepairSaveLanded
 			}
@@ -743,7 +753,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// The retry's outcome is unknown (a timeout, a lost response). Same
 			// pending-write discipline as the unreadable re-read above.
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(d.baseSeq, d.body)
+			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		case smsg.Sequence > d.baseSeq && mqttRecordDigest(smsg.Data) == want:
@@ -751,6 +761,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// response was lost to the contention.
 			sess.mu.Lock()
 			sess.seq = smsg.Sequence
+			sess.creditVoidedRegsLocked(d.voidedRegsRev)
 			sess.mu.Unlock()
 			return mqttRepairSaveLanded
 		default:
@@ -770,7 +781,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	switch {
 	case lerr != nil && isErrorOtherThan(lerr, JSNoMessageFoundErr):
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(d.baseSeq, d.body)
+		sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
 		sess.mu.Unlock()
 		return mqttRepairSaveUnresolved
 	case lerr != nil:
@@ -780,6 +791,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	case smsg.Sequence > d.baseSeq && mqttRecordDigest(smsg.Data) == want:
 		sess.mu.Lock()
 		sess.seq = smsg.Sequence
+		sess.creditVoidedRegsLocked(d.voidedRegsRev)
 		sess.mu.Unlock()
 		return mqttRepairSaveLanded
 	default:

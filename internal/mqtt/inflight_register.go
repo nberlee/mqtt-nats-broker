@@ -134,6 +134,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/nats-io/nuid"
 )
@@ -561,6 +562,29 @@ func (sess *mqttSession) releaseSettledVoidReservationsLocked() {
 	}
 }
 
+// creditVoidedRegsLocked records that a landed record write provably carried every
+// void-register verdict up to rev, and releases the reservations that proof frees.
+//
+// It is the single credit point, and every proof of durability comes through it: a
+// CONFIRMED save (saveWithDetail), a readback that finds those exact bytes at a newer
+// sequence (resolveUncertainWriteInTx), and the contention classifier's landed verdicts
+// (resolveContendedRecordSave). Never an unlanded, unresolved, definitely-failed or
+// FOREIGN outcome — a record that is not ours carries nothing of ours.
+//
+// rev is the revision the write MARSHALLED, never the set's current revision: a nonce
+// staged after the marshal is durable nowhere, and crediting it would free an identifier
+// while a crash could still resurrect its register as an ordinary delivery.
+//
+// sess.mu must be held.
+func (sess *mqttSession) creditVoidedRegsLocked(rev uint64) {
+	// The gap is the common case's whole cost: one comparison on every save.
+	if rev <= sess.voidedRegsSavedRev {
+		return
+	}
+	sess.voidedRegsSavedRev = rev
+	sess.releaseSettledVoidReservationsLocked()
+}
+
 // forgetCancelledReg drops a cancellation intent whose register is provably dealt with:
 // deleted, tombstoned, or now carried as an owed delete against its exact sequence.
 //
@@ -701,12 +725,8 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 	outcome, err := sess.saveClassified(tok)
 	switch outcome {
 	case saveLanded:
-		sess.mu.Lock()
-		if sess.voidedRegsSavedRev < rev {
-			sess.voidedRegsSavedRev = rev
-		}
-		sess.releaseSettledVoidReservationsLocked()
-		sess.mu.Unlock()
+		// Nothing to do: the save credited the revision it marshalled, which is at
+		// least rev. See creditVoidedRegsLocked.
 	case saveDefinitelyFailed:
 		// Nothing landed. The in-memory set still drives this connection's behaviour, and
 		// the record is not credited with a verdict it never recorded.
@@ -714,11 +734,10 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 			sess.id, err)
 	case saveMaybeLanded:
 		// The verdict exists either way, so nothing is undone. The REVISION is a different
-		// matter: it may be claimed only on proof, so the readback's continuations carry
-		// that decision. Registering neither — and leaving the revision unclaimed
-		// unconditionally — would be safe but wasteful; registering only the landed one
-		// would be wrong on the other branch.
-		sess.retainOnUncertain(sess.voidedRegsUncertainActions(c, rev))
+		// matter: it may be claimed only on proof. The LANDED half of that proof is the
+		// readback's own (it credits what those bytes carried), so all this continuation
+		// owes is the re-save for the other half.
+		sess.retainOnUncertain(sess.voidedRegsUncertainAction(c), nil)
 	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		mqttErrorf(c, "MQTT: record transaction not released after recording void-register verdicts for client %q: %v", sess.id, terr)
@@ -733,8 +752,234 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 	return outcome == saveLanded
 }
 
-// voidedRegsUncertainActions is what the readback owes a verdict whose save was ambiguous,
-// as a pair the resolver runs exactly one of.
+// The release handoff: who converges a void verdict staged while somebody else held the
+// lock it needed.
+//
+// A verdict is staged in memory by whichever goroutine gives the register up, and it becomes
+// durable only on a session-record save. Those two are not the same thread of control, and
+// the gap is not a rare interleaving: an off-readLoop register store settling
+// (confirmInflightRegister / abandonInflightRegister) stages its nonce and then finds
+// persistVoidedRegs REFUSED, because the record transaction fence — or the ownership gate a
+// resolver needs — is held by somebody else at that instant. The refusal leaves the revision
+// gap open, which is correct, but nothing is left owing the retry.
+//
+// For a BOUND session the connection itself is the convergence point: ordinary traffic,
+// mqttResolveAfterPacket, and the UNSUBSCRIBE tail's flush all save again, and every landed
+// save credits what it marshalled. An UNBOUND session has none of that, and a never-expiring
+// one has no timer either — so the identifier and its Receive Maximum slot could stay
+// reserved for the life of the session, and a crash would restore the surviving register as
+// an ordinary pending delivery.
+//
+// So the rule is at the LOCK RELEASES, which is where "somebody else held it" ends: every
+// release of the record fence and of the ownership gate re-checks whether a verdict was
+// staged while it was held, and if so attempts the save the stager could not. Two sites, one
+// predicate, one attempt — deliberately not a third mechanism per staging path.
+//
+// voidVerdictHandoffDueLocked is that predicate. Each conjunct earns its place:
+//
+//   - !seqUncertain: an unresolved session refuses every write, and the uncertainty
+//     machinery already owns the retry (its resolver's own releases re-check afterwards).
+//   - sess.c == nil: a bound session converges through its packet tails, and firing there
+//     would inject a fresh ambiguity into a tail that has no resolver — CONNECT's
+//     endAcceptTx, right after a success CONNACK, with the ownership gate held.
+//   - a revision gap: the record does not carry everything staged.
+//   - rev above the handoff watermark: one attempt per newly staged revision, which is what
+//     makes the sequence of attempts finite.
+//   - the fence closed: an open transaction means a writer is mid-record, and ITS release
+//     re-checks.
+//
+// sess.mu must be held.
+func (sess *mqttSession) voidVerdictHandoffPendingLocked() bool {
+	return !sess.seqUncertain && sess.c == nil && !sess.recordTxOpen &&
+		sess.voidedRegsRev > sess.voidedRegsSavedRev &&
+		sess.voidedRegsRev > sess.voidedRegsHandoffRev
+}
+
+// voidVerdictHandoffDueLocked is what a lock RELEASE asks: the same pending condition, plus
+// "nobody is already running the loop". An attempt's own releases — the fence it holds and
+// the ownership gate it took — would otherwise re-enter this decision inside their own
+// frames, recursing once per late staging and building a stack proportional to the session's
+// outstanding register stores, each frame holding JetStream round trips. The loop in
+// attemptVoidVerdictHandoff is the trampoline instead, and this conjunct is what routes work
+// to it: it clears the flag only in the same critical section in which it finds nothing
+// pending, so a staging that races the exit is either seen by the loop or fires its own
+// trigger — never dropped between the two.
+//
+// sess.mu must be held.
+func (sess *mqttSession) voidVerdictHandoffDueLocked() bool {
+	return !sess.voidHandoffActive && sess.voidVerdictHandoffPendingLocked()
+}
+
+// attemptVoidVerdictHandoff persists the staged void verdicts of an unbound session, for a
+// lock release that observed the gap.
+//
+// It runs UNDER THE OWNERSHIP GATE, taken fail-fast, and skipped when that fails. Both
+// halves are load-bearing. Gated, any uncertainty this attempt creates exists only while the
+// gate is held, so a CONNECT that ever holds the gate SEES it at its own uncertainty check
+// and resolves it; ungated, an attempt whose store went ambiguous just after that check let
+// the CONNECT bind, have its accept save refused, and evict the very session object holding
+// the continuation. Skipping on contention loses nothing: the holder is an ownership-gated
+// operation whose own release re-checks, and a CONNECT that wins resolves what it finds and
+// then carries — and credits — the verdicts in its accept save.
+//
+// The gate is claimed as NOBODY (lockSession with a nil client), which is also what makes it
+// refuse for a session that has since rebound, so the unbound scoping cannot go stale
+// between the decision and the attempt.
+//
+// Successive revisions are ridden by a LOOP, not by recursion. Each iteration takes the gate,
+// attempts, releases it, and only then asks whether more was staged meanwhile — so one frame
+// serves however many late stagings arrive, and the releases inside it are suppressed by the
+// active flag rather than re-entering here. Every property of a per-attempt handoff is kept:
+// the gate is acquired and released per attempt, the watermark still advances only on fence
+// acquisition, and no revision is coalesced away, because the loop re-reads the pending
+// condition after each attempt.
+//
+// No lock held on entry, and asm.mu must NOT be held: this takes the ownership gate.
+func (sess *mqttSession) attemptVoidVerdictHandoff(c *client) {
+	asm := sess.asm
+	if asm == nil {
+		return
+	}
+	sess.mu.Lock()
+	if sess.voidHandoffActive {
+		// A loop is already running on another frame; it re-checks before it exits.
+		sess.mu.Unlock()
+		return
+	}
+	sess.voidHandoffActive = true
+	sess.mu.Unlock()
+
+	for {
+		// The pending condition above is a PRE-GATE sample, and a CONNECT can bind (and
+		// release the gate again) before the claim below — which is why the claim is made
+		// as NOBODY rather than as the session's current owner: that is what refuses for a
+		// session which has since rebound, and a bound session's tails own its convergence.
+		sess.voidHandoffWindowHook(mqttHandoffWindowPreGate)
+		// Contention ends the loop rather than spinning against the holder, whose own
+		// release re-checks — and the ownership is given up INSIDE the gate's critical
+		// section, which is what stops that release from suppressing itself against a loop
+		// that is already leaving. See lockSessionForVoidHandoff.
+		if err := asm.lockSessionForVoidHandoff(sess); err != nil {
+			// Fired where a two-step hand-back would still be holding the ownership flag:
+			// the fixed form has already given it back inside the gate's critical section,
+			// so a gate release driven from here observes it CLEAR and fires its own loop.
+			sess.voidHandoffWindowHook(mqttHandoffWindowGateRefused)
+			return
+		}
+		sess.persistVoidedRegsFromRelease(c)
+		asm.unlockSession(sess)
+		sess.mu.Lock()
+		if !sess.voidVerdictHandoffPendingLocked() {
+			// Cleared in the SAME critical section that finds nothing pending, which is
+			// what makes the handoff lossless: staging takes sess.mu, so it either landed
+			// before this decision (and the loop continues) or after the flag is clear
+			// (and its own release triggers a new loop).
+			sess.voidHandoffActive = false
+			sess.mu.Unlock()
+			return
+		}
+		sess.mu.Unlock()
+	}
+}
+
+// persistVoidedRegsFromRelease is persistVoidedRegs for the release handoff, differing in
+// exactly one thing: the ATTEMPT is what advances the handoff watermark, and it advances it
+// in the same critical section that acquires the fence.
+//
+// persistVoidedRegs cannot express this — it reports only "is the record known to carry the
+// verdicts", so a refused fence and a failed store are the same answer — and the difference
+// decides whether the handoff terminates or strands. A releaser that decided to attempt, and
+// burned the watermark on that decision, can lose the fence to a waiter it just signalled;
+// that waiter may make no relevant save, and the refused trigger stored nothing, so the
+// nonce is never ridden by anything. Advancing only on acquisition makes the refused trigger
+// a non-event, and the fence winner's own release the next re-check.
+//
+// No lock held on entry.
+func (sess *mqttSession) persistVoidedRegsFromRelease(c *client) {
+	// Test seam, fired in the window the acquired-only watermark exists for: the releaser has
+	// unlocked and signalled its waiters, and this attempt has not taken the fence yet. A
+	// waiter stealing it here is the interleaving that strands a nonce if the watermark was
+	// burned at the decision instead, and nothing outside can produce that window.
+	if h := mqttTestVoidHandoffPreAttemptHookV.Load(); h != nil {
+		(*h)(sess)
+	}
+	sess.mu.Lock()
+	if !sess.voidVerdictHandoffPendingLocked() {
+		// Re-validated under the gate: the state that justified the trigger is a
+		// pre-gate sample, and a rebind, a resolution or another attempt may have
+		// overtaken it. The PENDING form, because the loop that called us holds the
+		// active flag by construction.
+		sess.mu.Unlock()
+		return
+	}
+	tok := sess.openRecordTxLocked()
+	sess.voidedRegsHandoffRev = sess.voidedRegsRev
+	sess.mu.Unlock()
+
+	outcome, err := sess.saveClassified(tok)
+	switch outcome {
+	case saveLanded:
+		// Credited by the save itself, along with everything else it marshalled.
+	case saveMaybeLanded:
+		// Ambiguity is not this mechanism's to retry: seqUncertain excludes the session
+		// from the predicate, the periodic pass resolves it (it walks every resident
+		// uncertain session, expiry or none), and the continuation carries the re-save.
+		sess.retainOnUncertain(sess.voidedRegsUncertainAction(c), nil)
+	case saveDefinitelyFailed:
+		// The gap stays open with the watermark at it, so no self-retrigger: this class
+		// keeps its existing posture — the next activity on the session persists it.
+		mqttWarnf(c, "MQTT: could not persist the void-register verdicts for client %q at a lock release: %v",
+			sess.id, err)
+	}
+	if terr := sess.endRecordTx(tok); terr != nil {
+		mqttErrorf(c, "MQTT: record transaction not released after a void-verdict handoff for client %q: %v", sess.id, terr)
+	}
+}
+
+// mqttTestVoidHandoffWindowHookV fires at the two windows of a handoff attempt that another
+// goroutine can act in, named by the window: PRE-GATE, after the pending condition was
+// sampled and before the gate is claimed — where a rebind makes that sample stale, which is
+// why the claim is made as NOBODY — and GATE-REFUSED, where a two-step ownership hand-back
+// would not yet have run. See attemptVoidVerdictHandoff.
+var mqttTestVoidHandoffWindowHookV atomic.Pointer[func(sess *mqttSession, window string)]
+
+const (
+	mqttHandoffWindowPreGate     = "pre-gate"
+	mqttHandoffWindowGateRefused = "gate-refused"
+)
+
+func setMQTTTestVoidHandoffWindowHook(h func(sess *mqttSession, window string)) func() {
+	prev := mqttTestVoidHandoffWindowHookV.Load()
+	if h == nil {
+		mqttTestVoidHandoffWindowHookV.Store(nil)
+	} else {
+		mqttTestVoidHandoffWindowHookV.Store(&h)
+	}
+	return func() { mqttTestVoidHandoffWindowHookV.Store(prev) }
+}
+
+func (sess *mqttSession) voidHandoffWindowHook(window string) {
+	if h := mqttTestVoidHandoffWindowHookV.Load(); h != nil {
+		(*h)(sess, window)
+	}
+}
+
+// mqttTestVoidHandoffPreAttemptHookV fires after a lock release decided a void-verdict handoff
+// is owed and before the attempt takes the record fence. See persistVoidedRegsFromRelease.
+var mqttTestVoidHandoffPreAttemptHookV atomic.Pointer[func(sess *mqttSession)]
+
+func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestVoidHandoffPreAttemptHookV.Load()
+	if h == nil {
+		mqttTestVoidHandoffPreAttemptHookV.Store(nil)
+	} else {
+		mqttTestVoidHandoffPreAttemptHookV.Store(&h)
+	}
+	return func() { mqttTestVoidHandoffPreAttemptHookV.Store(prev) }
+}
+
+// voidedRegsUncertainAction is what the readback owes a verdict whose save was ambiguous:
+// a re-save for the NOT-LANDED verdict, and nothing at all for the landed one.
 //
 // The not-landed verdict is the dangerous one, and an empty continuation is not an answer to
 // it: the void verdict would then be durable nowhere, and nothing would notice, because a
@@ -743,25 +988,37 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 // and the reason these continuations are handed one at all. Uncertainty is cleared before
 // reverts run, so that save is not refused at entry.
 //
-// Neither continuation undoes anything: the verdict exists whatever the record says. All
-// they decide is whether rev may be called durable.
-func (sess *mqttSession) voidedRegsUncertainActions(c *client, rev uint64) (onNotLanded, onLanded func(recordTx)) {
-	markSaved := func() {
-		sess.mu.Lock()
-		if sess.voidedRegsSavedRev < rev {
-			sess.voidedRegsSavedRev = rev
-		}
-		sess.releaseSettledVoidReservationsLocked()
-		sess.mu.Unlock()
-	}
+// There is no landed counterpart because crediting is not this continuation's job: the
+// resolver credits the revision the proven bytes marshalled, exactly as a confirmed save
+// credits its own. Nothing here undoes anything either — the verdict is a fact about a
+// register, whatever the record currently says.
+//
+// It is CLOSED under repeated ambiguity: the re-save can itself come back ambiguous, and it
+// then registers ITSELF for the new pending write. Without that, a second ambiguity left the
+// record with no continuation at all, so restart-survival of the verdict (and, on the
+// deferred close, of the disconnect deadline the same save carries) depended on later live
+// traffic that an unbound session never has. It deliberately does NOT chase revision gaps
+// beyond the save it makes: a nonce staged after this save's marshal is the release
+// handoff's to converge (see attemptVoidVerdictHandoff), and a confirmed re-save credits
+// itself through the ordinary save path.
+func (sess *mqttSession) voidedRegsUncertainAction(c *client) func(recordTx) {
 	return func(tok recordTx) {
-		if serr := sess.save(tok); serr != nil {
+		// Unconditionally, not gated on a revision gap: the record may owe more than a
+		// verdict on this path — the deferred close's disconnect time rides exactly this
+		// re-save — and a gap-free set says nothing about that.
+		outcome, serr := sess.saveClassified(tok)
+		switch outcome {
+		case saveMaybeLanded:
+			// Ambiguous again. retainOnUncertain appends to the FRESH list (the resolver
+			// consumed the old one before running this), so the new attempt has its
+			// continuation; the resolver's own re-check then reports the session
+			// unresolved rather than ours. See resolutionAfterContinuations.
+			sess.retainOnUncertain(sess.voidedRegsUncertainAction(c), nil)
+		case saveDefinitelyFailed:
 			mqttWarnf(c, "MQTT: could not persist the void-register verdicts for client %q "+
 				"after an unlanded write: %v", sess.id, serr)
-			return
 		}
-		markSaved()
-	}, func(recordTx) { markSaved() }
+	}
 }
 
 // deleteInflightRegisterFor removes the register of a pending entry a terminal path
@@ -1048,8 +1305,26 @@ type mqttVoidedReg struct {
 //
 // Session lock NOT held on entry: each of these issues JetStream requests.
 func (sess *mqttSession) deleteInflightRegisters(c *client, tok recordTx, voided []mqttVoidedReg) {
+	if sess.voidRegistersOnStream(c, voided) && !sess.proveVoidedRegs(c, tok) {
+		mqttErrorf(c, "MQTT: the void-register verdict(s) of client %q are not durably recorded yet; "+
+			"the next convergence point retries", sess.id)
+	}
+}
+
+// voidRegistersOnStream is deleteInflightRegisters' ladder over the REGISTER STREAM
+// alone — the confirmed delete and the tombstone — reporting whether any register got
+// neither, so its nonce is staged in memory and the SESSION RECORD still owes the
+// verdict.
+//
+// Split out from the wrapper because who writes the record is the caller's business,
+// and one caller must write it itself: the deferred close folds the verdict into the
+// same classified save that persists its disconnect time, and a save of our own there
+// would leave that one refused. See applyDeferredDisconnect.
+//
+// Session lock NOT held on entry: each of these issues JetStream requests.
+func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg) bool {
 	if len(voided) == 0 || sess.asm == nil {
-		return
+		return false
 	}
 	unproven := false
 	for _, v := range voided {
@@ -1082,10 +1357,7 @@ func (sess *mqttSession) deleteInflightRegisters(c *client, tok recordTx, voided
 		sess.mu.Unlock()
 		unproven = true
 	}
-	if unproven && !sess.proveVoidedRegs(c, tok) {
-		mqttErrorf(c, "MQTT: the void-register verdict(s) of client %q are not durably recorded yet; "+
-			"the next convergence point retries", sess.id)
-	}
+	return unproven
 }
 
 // voidRegistrationsLocked marks every in-flight register of one consumer durable VOID, because
@@ -1427,9 +1699,21 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoide
 //
 // Session lock NOT held on entry: this issues JetStream requests.
 func (sess *mqttSession) secureRegCancellations(c *client, tok recordTx, cancels []mqttRegCancellation) bool {
-	if len(cancels) == 0 {
+	if !sess.tombstoneCancellationsOnStream(c, cancels) {
 		return true
 	}
+	return sess.proveVoidedRegs(c, tok)
+}
+
+// tombstoneCancellationsOnStream is secureRegCancellations' tombstone pass over the
+// REGISTER STREAM alone, reporting whether any cancellation failed to get one, so its
+// nonce stays staged in memory and the SESSION RECORD still owes the verdict.
+//
+// Split from the wrapper for the same reason voidRegistersOnStream is: the deferred
+// close owns its own record write and folds the verdict into it.
+//
+// Session lock NOT held on entry: this issues JetStream requests.
+func (sess *mqttSession) tombstoneCancellationsOnStream(c *client, cancels []mqttRegCancellation) bool {
 	owed := false
 	for _, rc := range cancels {
 		if err := sess.markInflightRegisterCancelledPending(c, rc); err != nil {
@@ -1441,10 +1725,7 @@ func (sess *mqttSession) secureRegCancellations(c *client, tok recordTx, cancels
 		// The tombstone says everything the nonce did, on the record itself.
 		sess.forgetCancelledReg(rc.nonce)
 	}
-	if !owed {
-		return true
-	}
-	return sess.proveVoidedRegs(c, tok)
+	return owed
 }
 
 // proveVoidedRegs reports whether the session record is KNOWN to carry the void-register
@@ -1468,12 +1749,8 @@ func (sess *mqttSession) proveVoidedRegs(c *client, tok recordTx) bool {
 		mqttWarnf(c, "MQTT: could not persist the void-register verdicts of client %q: %v", sess.id, err)
 		return false
 	}
-	sess.mu.Lock()
-	if sess.voidedRegsSavedRev < rev {
-		sess.voidedRegsSavedRev = rev
-	}
-	sess.releaseSettledVoidReservationsLocked()
-	sess.mu.Unlock()
+	// The save credited the revision it marshalled — at least rev, since the set can only
+	// have grown since the sample above. See creditVoidedRegsLocked.
 	return true
 }
 

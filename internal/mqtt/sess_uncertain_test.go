@@ -10,7 +10,7 @@ import (
 // would, against the given CAS base and record body.
 func testMarkUncertain(sess *mqttSession, baseSeq uint64, body []byte) {
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(baseSeq, body)
+	sess.markWriteUncertainLocked(baseSeq, body, 0)
 	sess.mu.Unlock()
 }
 
