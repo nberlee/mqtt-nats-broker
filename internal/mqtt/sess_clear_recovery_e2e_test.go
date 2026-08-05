@@ -85,7 +85,7 @@ func testSessionDurables(sess *mqttSession) []string {
 // The clean close is the caller whose failure leaks most: removeSession has already run, so
 // on a bare log the record, the consumers and this generation's registers survive with no
 // resident object — and for an expiry-0 session nothing reaps them, because
-// retryUncertainSessions and CONNECT both scan as.sessions and sweepSessionExpiries skips
+// reconcileResidentRecordState and CONNECT both scan as.sessions and sweepSessionExpiries skips
 // an ExpiryInterval == 0 record.
 //
 // The WILL is the other half. It must still be published by this close, immediately, as it
@@ -294,7 +294,7 @@ func TestMQTTExpiryOverrideCloseDiscardsAfterRefusal(t *testing.T) {
 
 	// The next resolution completes the discard, so the record no longer describes a
 	// resumable session and the reconnect starts fresh.
-	asm.retryUncertainSessions(s)
+	asm.reconcileResidentRecordState(s)
 
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID,
 		props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)

@@ -271,7 +271,7 @@ func TestRetryUncertainSessionsIsSerializedAgainstConnect(t *testing.T) {
 	a.asm.mu.Lock()
 	a.asm.sessLocked[sess.id] = struct{}{}
 	a.asm.mu.Unlock()
-	a.asm.retryUncertainSessions(a.s)
+	a.asm.reconcileResidentRecordState(a.s)
 	if !sess.isSeqUncertain() {
 		t.Fatal("the retry pass resolved a session a CONNECT was holding")
 	}
@@ -280,7 +280,7 @@ func TestRetryUncertainSessionsIsSerializedAgainstConnect(t *testing.T) {
 	a.asm.mu.Unlock()
 
 	// Released, it resolves — proving the pass does reach a never-expiring session.
-	a.asm.retryUncertainSessions(a.s)
+	a.asm.reconcileResidentRecordState(a.s)
 	if sess.isSeqUncertain() {
 		t.Fatal("the retry pass did not resolve an unbound, unresolved session")
 	}

@@ -409,7 +409,7 @@ func (sess *mqttSession) resolveUncertainNow(c *client) mqttUncertainResolution 
 	gated := false
 	if asm := sess.asm; asm != nil {
 		// Claimed as the session's CURRENT owner — the bound client, or nobody for
-		// an unbound one — which is the same claim retryUncertainSessions makes.
+		// an unbound one — which is the same claim reconcileResidentRecordState makes.
 		// Sampling it cannot go stale unnoticed: lockSession re-checks the owner
 		// under its own lock and fails if it moved.
 		//
@@ -1127,7 +1127,7 @@ func (s *Server) reparkDeferredDisconnect(sess *mqttSession, action *mqttDeferre
 // It parks the discard as a deferred disconnect with expiryInterval 0, so endsAtDisconnect()
 // is true and the discharge takes applyDeferredDisconnect's discard branch — the same
 // clear(), performed by a caller that has just proved the record state resolved. Then it
-// restores RESIDENCY, which is what every resolver needs: retryUncertainSessions and CONNECT
+// restores RESIDENCY, which is what every resolver needs: reconcileResidentRecordState and CONNECT
 // both scan as.sessions, and for an expiry-0 record sweepSessionExpiries looks at nothing at
 // all. Park first, publish second — the obligation must exist before the object is reachable.
 //
@@ -1188,7 +1188,10 @@ func (s *Server) reparkRefusedDiscard(asm *mqttAccountSessionManager, sess *mqtt
 	return true
 }
 
-// retryUncertainSessions is the periodic pass over RESIDENT unresolved sessions.
+// reconcileResidentRecordState is the periodic pass over RESIDENT sessions whose
+// record state is not settled. It resolves an ambiguous write, settles a definite
+// rejection, and back-stops the void-verdict release handoff — three ways for a
+// resident session's record state to need work that no traffic will bring.
 //
 // It cannot be folded into sweepSessionExpiries: that walks persisted RECORDS and
 // skips ExpiryInterval == 0 or mqttSessionNeverExpire — exactly the two cases that
@@ -1200,7 +1203,7 @@ func (s *Server) reparkRefusedDiscard(asm *mqttAccountSessionManager, sess *mqtt
 // mid-CONNECT), so a reconnect simply wins and resolves the session itself.
 //
 // Runs from the periodic sweep goroutine. No lock held on entry.
-func (as *mqttAccountSessionManager) retryUncertainSessions(s *Server) {
+func (as *mqttAccountSessionManager) reconcileResidentRecordState(s *Server) {
 	// Snapshot under the manager lock and release it before any JetStream call.
 	as.mu.RLock()
 	candidates := make([]*mqttSession, 0, len(as.sessions))
@@ -1210,30 +1213,13 @@ func (as *mqttAccountSessionManager) retryUncertainSessions(s *Server) {
 	as.mu.RUnlock()
 
 	for _, sess := range candidates {
-		if !sess.isSeqUncertain() {
-			// Not unresolved, but possibly still owing a void-register verdict: the
-			// BACKSTOP below is what makes the release handoff's liveness claim true
-			// unconditionally.
-			as.flushVoidVerdictGap(sess)
-			continue
-		}
-		// A BOUND session must be resolved too, and it is the harder case: nothing
-		// else will do it. Its own writers cannot — every save is refused while the
-		// session is unresolved — and the connection can stay open indefinitely, so
-		// "wait for the disconnect" is not a bound on anything. Left alone, such a
-		// session stops being able to persist at all: an UNSUBSCRIBE whose response
-		// was lost, a reserved-namespace purge, an affine unwind.
-		//
-		// The gate is taken as the BOUND CLIENT rather than as nobody, which is the
-		// same ownership claim its own readLoop would make: it still fails while a
-		// CONNECT is in progress (sessLocked) or if the client changed underneath us,
-		// so a reconnect continues to win. resolveUncertainSession itself re-checks
-		// for a rebind before discharging any deferred close, and its foreign branch
-		// detaches and evicts — which is exactly right for a bound client holding a
-		// session somebody else now owns.
 		sess.mu.Lock()
+		uncertain := sess.seqUncertain
 		owner := sess.c
 		txOpen := sess.recordTxOpen
+		// Sampled here and RE-READ inside the fence by the probe itself; this is only
+		// the candidate test.
+		rejected := sess.recordRejectionPendingLocked()
 		sess.mu.Unlock()
 		if txOpen {
 			// A writer is mid-transaction. save() publishes seqUncertain BEFORE it
@@ -1245,15 +1231,71 @@ func (as *mqttAccountSessionManager) retryUncertainSessions(s *Server) {
 			// atomic, so wait for the next pass. See classifySave.
 			continue
 		}
-		if err := as.lockSession(sess, owner); err != nil {
-			continue // a CONNECT is in progress, or the binding changed: it wins
+		if uncertain {
+			// A BOUND session must be resolved too, and it is the harder case: nothing
+			// else will do it. Its own writers cannot — every save is refused while the
+			// session is unresolved — and the connection can stay open indefinitely, so
+			// "wait for the disconnect" is not a bound on anything. Left alone, such a
+			// session stops being able to persist at all: an UNSUBSCRIBE whose response
+			// was lost, a reserved-namespace purge, an affine unwind.
+			//
+			// The gate is taken as the BOUND CLIENT rather than as nobody, which is the
+			// same ownership claim its own readLoop would make: it still fails while a
+			// CONNECT is in progress (sessLocked) or if the client changed underneath
+			// us, so a reconnect continues to win. resolveUncertainSession itself
+			// re-checks for a rebind before discharging any deferred close, and its
+			// foreign branch detaches and evicts — which is exactly right for a bound
+			// client holding a session somebody else now owns.
+			if err := as.lockSession(sess, owner); err != nil {
+				continue // a CONNECT is in progress, or the binding changed: it wins
+			}
+			// Re-validate AFTER taking the gate: a CONNECT may have resolved this
+			// session between the snapshot and here.
+			if sess.isSeqUncertain() {
+				s.resolveUncertainSession(as, sess)
+			}
+			as.unlockSession(sess)
+			continue
 		}
-		// Re-validate AFTER taking the gate: a CONNECT may have resolved this
-		// session between the snapshot and here.
-		if sess.isSeqUncertain() {
-			s.resolveUncertainSession(as, sess)
+		if rejected {
+			as.settleRejectionFromSweep(s, sess)
+			continue
 		}
-		as.unlockSession(sess)
+		// Nothing outstanding on the record, but possibly still owing a void-register
+		// verdict: the BACKSTOP is what makes the release handoff's liveness claim true
+		// unconditionally.
+		as.flushVoidVerdictGap(sess)
+	}
+}
+
+// settleRejectionFromSweep probes one UNBOUND session's outstanding record rejection
+// and follows the verdict.
+//
+// The gate is the sole unboundness check on this path: a bound session's marker simply has
+// its claim refused and waits for the connection to end, at which point this same pass
+// settles it. See lockSessionForRecordRejection.
+//
+// Runs from the periodic sweep goroutine. No lock held on entry.
+func (as *mqttAccountSessionManager) settleRejectionFromSweep(s *Server, sess *mqttSession) {
+	if err := as.lockSessionForRecordRejection(sess); err != nil {
+		return
+	}
+	defer as.unlockSession(sess)
+	switch sess.settleRecordRejection(as) {
+	case mqttRejectionUnresolved:
+		// The probe's own write is ambiguous. Resolve it in THIS iteration with the gate
+		// still held — that is resolveUncertainSession's contract, and the wrapper form
+		// would claim the same gate and fail against our own hold.
+		s.resolveUncertainSession(as, sess)
+	case mqttRejectionOurs:
+		// The probe IS the backstop: every landed save credits the void-register
+		// revision it marshalled, so a gap it covered is closed by it, and a nonce
+		// staged after its marshal is the release handoff's to converge.
+	case mqttRejectionForeign:
+		// Disposed. Nothing else may touch this session, backstop included.
+	default: // mqttRejectionKeep
+		// Ownership was not established, so the backstop's save would be the same doomed
+		// CAS. The marker stays armed and the next pass asks again.
 	}
 }
 

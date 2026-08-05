@@ -1342,7 +1342,7 @@ func TestUncertainRetrySkipsAnOpenRecordTransaction(t *testing.T) {
 	sess.mu.Unlock()
 
 	// The periodic pass must leave it alone.
-	asm.retryUncertainSessions(s)
+	asm.reconcileResidentRecordState(s)
 
 	if !sess.isSeqUncertain() {
 		t.Fatal("the resolver settled an ambiguity while its writer held the record transaction: " +
@@ -1353,7 +1353,7 @@ func TestUncertainRetrySkipsAnOpenRecordTransaction(t *testing.T) {
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
-	asm.retryUncertainSessions(s)
+	asm.reconcileResidentRecordState(s)
 	if sess.isSeqUncertain() {
 		t.Fatal("with no transaction open the resolver must settle the session")
 	}
@@ -1631,7 +1631,7 @@ func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
 		t.Fatalf("foreign write: %v", err)
 	}
 
-	asm.retryUncertainSessions(s)
+	asm.reconcileResidentRecordState(s)
 
 	sess.mu.Lock()
 	bound := sess.c

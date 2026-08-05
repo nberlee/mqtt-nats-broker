@@ -13,7 +13,7 @@ import (
 // what makes it recoverable; but a caller that has already evicted the session and only
 // logs turns "do not tear down on an unclassified sequence" into "strand the object while
 // its record, its consumers and its shared durables survive". Residency is what every
-// resolver needs: retryUncertainSessions and CONNECT both scan as.sessions, and for an
+// resolver needs: reconcileResidentRecordState and CONNECT both scan as.sessions, and for an
 // expiry-0 record sweepSessionExpiries looks at nothing.
 //
 // The tests below drive the race POSITIVELY through the clear-window seams — on the same
@@ -166,7 +166,7 @@ func TestMQTTExpiryReparksTheRefusedDiscardAtTheFence(t *testing.T) {
 
 	// And the obligation is real: the periodic pass over resident unresolved sessions
 	// classifies the write and completes the discard the timer could not.
-	e.asm.retryUncertainSessions(e.s)
+	e.asm.reconcileResidentRecordState(e.s)
 	if e.recordPresent(t) {
 		t.Fatal("the discharged discard must delete the record")
 	}
@@ -416,7 +416,7 @@ func TestMQTTExpiryReEntryLeavesTheParkedDiscardUntouched(t *testing.T) {
 	}
 
 	// And the discard still completes once the write is classified.
-	e.asm.retryUncertainSessions(e.s)
+	e.asm.reconcileResidentRecordState(e.s)
 	if e.recordPresent(t) {
 		t.Fatal("the discharged discard must delete the record")
 	}
@@ -514,7 +514,7 @@ func TestMQTTExpiryDoesNotEvictOnALandedAmbiguousWrite(t *testing.T) {
 
 	// Classification is what settles ownership: ours, so the landed sequence is adopted
 	// and the parked discard CASes against the right one.
-	e.asm.retryUncertainSessions(e.s)
+	e.asm.reconcileResidentRecordState(e.s)
 	if e.recordPresent(t) {
 		t.Fatal("the discharged discard must delete the record it now knows is ours")
 	}

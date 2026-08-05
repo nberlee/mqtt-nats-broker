@@ -139,6 +139,119 @@ const (
 	mqttRepairSaveUnresolved
 )
 
+// mqttRecordAttemptVerdict is what a readback says about the ATTEMPT it was about,
+// before any digest comparison: the base/gone/moved decision alone.
+type mqttRecordAttemptVerdict uint8
+
+const (
+	// mqttRecordAttemptUnreadable: the re-read itself is unavailable, so nothing can
+	// be classified. Never a verdict about ownership.
+	mqttRecordAttemptUnreadable mqttRecordAttemptVerdict = iota
+	// mqttRecordAttemptGone: the record is absent. A write of ours cannot have landed
+	// and then vanished on its own, so somebody released this session.
+	mqttRecordAttemptGone
+	// mqttRecordAttemptAtBase: the record is still exactly the one we CAS'd against.
+	// This is CONTENTION, never ownership — JetStream returns 10164 while a write for
+	// the subject is in process upstream, so the contender's proposal can commit a
+	// moment later and a read that finds the base sequence proves nothing.
+	mqttRecordAttemptAtBase
+	// mqttRecordAttemptMoved: the record is at some other sequence. Whether that is
+	// our own write landing with its response lost is a question about CONTENT, which
+	// only a caller holding the attempted bytes can answer.
+	mqttRecordAttemptMoved
+)
+
+// classifyRecordAgainstAttempt is the base/gone/moved decision for a readback taken
+// about an attempted write at baseSeq.
+//
+// It exists as one function so "the base sequence is contention, not ownership" has a
+// single home: every caller that reads a record back to classify its own failed write
+// asks the same question, and the one that answered it by inference is the defect this
+// mechanism was built for.
+func classifyRecordAgainstAttempt(smsg *StoredMsg, lerr error, baseSeq uint64) mqttRecordAttemptVerdict {
+	if lerr != nil {
+		if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
+			return mqttRecordAttemptUnreadable
+		}
+		return mqttRecordAttemptGone
+	}
+	if smsg == nil {
+		// No error and no message is not a state the load boundary produces; treat it
+		// as unclassifiable rather than as either owner's evidence.
+		return mqttRecordAttemptUnreadable
+	}
+	if smsg.Sequence == baseSeq {
+		return mqttRecordAttemptAtBase
+	}
+	return mqttRecordAttemptMoved
+}
+
+// mqttRejectionVerdict is how a REJECTION PROBE — a re-attempt of the session's
+// current memory, made so a CAS arbitrates ownership rather than a read guessing at
+// it — was classified.
+type mqttRejectionVerdict uint8
+
+const (
+	// mqttRejectionKeep: nothing was established. The probe was refused, contended, or its
+	// readback unreadable; the marker stays armed and a later pass settles it. No ownership
+	// claim in either direction, so no caller may act on it.
+	//
+	// An earlier iteration split this three ways — contended (the record demonstrably has
+	// not moved), indeterminate (nothing arbitrated at all) and nothing-owed — because a
+	// BOUND session's packet tail had to decide whether to serve traffic on each. With that
+	// half deferred to its own roadmap item, the one remaining caller treats all three
+	// identically, and the distinction would be a mechanism nothing reads.
+	mqttRejectionKeep mqttRejectionVerdict = iota
+	// mqttRejectionOurs: the probe LANDED. The CAS arbitrated ownership in our
+	// favour, and the advanced sequence invalidates the marker.
+	mqttRejectionOurs
+	// mqttRejectionForeign: the probe definitively did not land and the record is not
+	// this attempt's. Another owner holds the session.
+	mqttRejectionForeign
+	// mqttRejectionUnresolved: the probe's own outcome is unknown. The uncertainty
+	// machinery owns the session until a readback classifies it.
+	mqttRejectionUnresolved
+)
+
+// classifyRejectedProbe is the probe's whole post-save decision, the CAS guard
+// included.
+//
+// The guard is the load-bearing part. A save can fail DEFINITELY without ever
+// reaching the store — a refused fence, a refusal at entry — and such a failure comes
+// back with a ZERO-VALUED detail, so classifying its readback would compare a real
+// record against base sequence 0 and read every session in the account as foreign.
+// Only a CAS-typed store error means "this attempt was rejected by the stream", which
+// is the only failure a readback can say anything about. Everything else keeps the marker.
+//
+// There is no digest arm, and that is deliberate rather than an omission: a rejected
+// write did not land, so a later record matching our bytes cannot be this attempt.
+func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg *StoredMsg, lerr error) mqttRejectionVerdict {
+	switch outcome {
+	case saveLanded:
+		return mqttRejectionOurs
+	case saveMaybeLanded:
+		return mqttRejectionUnresolved
+	}
+	if !mqttIsRecordCASRejection(detail.rawErr) {
+		return mqttRejectionKeep
+	}
+	switch classifyRecordAgainstAttempt(smsg, lerr, detail.baseSeq) {
+	case mqttRecordAttemptGone:
+		return mqttRejectionForeign
+	case mqttRecordAttemptMoved:
+		// The probe definitively did not land, so an accepted transition at another
+		// sequence is not this attempt's — and it cannot be ours by another route: a
+		// second local writer needs the fence this probe holds, an earlier ambiguous
+		// write of ours would have armed seqUncertain (which the marker's predicate
+		// excludes), a replacement object on this broker is excluded by the
+		// identity-current ownership gate, and the expiry sweep's raw CAS skips a
+		// client whose session is resident.
+		return mqttRejectionForeign
+	default: // at base (contention) or unreadable: nothing established either way
+		return mqttRejectionKeep
+	}
+}
+
 // mqttReleasePhaseGateLocked releases a phase-installed subscription's delivery
 // gate, waking any QoS 1/2 delivery waiting on it. Idempotent — every release
 // path (adoption, the sweep, the phase's own undo) calls it, and the release
@@ -719,22 +832,20 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	want := mqttRecordDigest(d.body)
 	for attempt := 0; attempt < mqttRepairSaveAttempts; attempt++ {
 		smsg, lerr := sess.jsa.loadSessionMsg(d.domainTk, d.cidHash)
-		if lerr != nil {
-			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-				// The re-read itself is unavailable. A CAS rejection is definite, so
-				// save() deliberately did not mark this uncertain — the phase
-				// establishes the pending-write state itself, carrying the base and
-				// digest, so the deferred readback classifies THIS attempt.
-				sess.mu.Lock()
-				sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
-				sess.mu.Unlock()
-				return mqttRepairSaveUnresolved
-			}
+		switch classifyRecordAgainstAttempt(smsg, lerr, d.baseSeq) {
+		case mqttRecordAttemptUnreadable:
+			// The re-read itself is unavailable. A CAS rejection is definite, so
+			// save() deliberately did not mark this uncertain — the phase
+			// establishes the pending-write state itself, carrying the base and
+			// digest, so the deferred readback classifies THIS attempt.
+			sess.mu.Lock()
+			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
+			sess.mu.Unlock()
+			return mqttRepairSaveUnresolved
+		case mqttRecordAttemptGone:
 			// The record is gone: somebody released this session. Not ours.
 			return mqttRepairSaveForeign
-		}
-		switch {
-		case smsg.Sequence == d.baseSeq:
+		case mqttRecordAttemptAtBase:
 			// Still exactly the record we CAS'd against: the rejection was
 			// transient contention. Retry the identical write.
 			resp, rerr := sess.retryRepairStore(d)
@@ -756,17 +867,19 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
-		case smsg.Sequence > d.baseSeq && mqttRecordDigest(smsg.Data) == want:
-			// Byte-identical at a newer sequence: our write landed and only its
-			// response was lost to the contention.
-			sess.mu.Lock()
-			sess.seq = smsg.Sequence
-			sess.creditVoidedRegsLocked(d.voidedRegsRev)
-			sess.mu.Unlock()
-			return mqttRepairSaveLanded
-		default:
-			// A newer, different record. Another owner is authoritative; adopting
-			// its sequence would turn our stale snapshot into a valid CAS over it.
+		default: // mqttRecordAttemptMoved
+			if smsg.Sequence > d.baseSeq && mqttRecordDigest(smsg.Data) == want {
+				// Byte-identical at a newer sequence: our write landed and only its
+				// response was lost to the contention.
+				sess.mu.Lock()
+				sess.seq = smsg.Sequence
+				sess.creditVoidedRegsLocked(d.voidedRegsRev)
+				sess.mu.Unlock()
+				return mqttRepairSaveLanded
+			}
+			// A newer, different record (or one below our base). Another owner is
+			// authoritative; adopting its sequence would turn our stale snapshot into a
+			// valid CAS over it.
 			return mqttRepairSaveForeign
 		}
 	}
@@ -778,23 +891,24 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	// local-definite there would undo our work while leaving a session we no
 	// longer own mapped and bound.
 	smsg, lerr := sess.jsa.loadSessionMsg(d.domainTk, d.cidHash)
-	switch {
-	case lerr != nil && isErrorOtherThan(lerr, JSNoMessageFoundErr):
+	switch classifyRecordAgainstAttempt(smsg, lerr, d.baseSeq) {
+	case mqttRecordAttemptUnreadable:
 		sess.mu.Lock()
 		sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
 		sess.mu.Unlock()
 		return mqttRepairSaveUnresolved
-	case lerr != nil:
+	case mqttRecordAttemptGone:
 		return mqttRepairSaveForeign // the record is gone: somebody released it
-	case smsg.Sequence == d.baseSeq:
+	case mqttRecordAttemptAtBase:
 		return mqttRepairSaveLocalDefinite // still ours, still unwritten
-	case smsg.Sequence > d.baseSeq && mqttRecordDigest(smsg.Data) == want:
-		sess.mu.Lock()
-		sess.seq = smsg.Sequence
-		sess.creditVoidedRegsLocked(d.voidedRegsRev)
-		sess.mu.Unlock()
-		return mqttRepairSaveLanded
-	default:
+	default: // mqttRecordAttemptMoved
+		if smsg.Sequence > d.baseSeq && mqttRecordDigest(smsg.Data) == want {
+			sess.mu.Lock()
+			sess.seq = smsg.Sequence
+			sess.creditVoidedRegsLocked(d.voidedRegsRev)
+			sess.mu.Unlock()
+			return mqttRepairSaveLanded
+		}
 		return mqttRepairSaveForeign
 	}
 }

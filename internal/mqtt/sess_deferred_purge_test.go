@@ -1833,7 +1833,7 @@ func TestMQTTVoidVerdictBackstopConvergesAfterDefiniteFailure(t *testing.T) {
 
 	// The store recovers, and the periodic pass is what notices.
 	restoreSave()
-	e.asm.retryUncertainSessions(e.s)
+	e.asm.reconcileResidentRecordState(e.s)
 
 	rev, saved, handoff = e.voidRevs(t)
 	if saved < rev {

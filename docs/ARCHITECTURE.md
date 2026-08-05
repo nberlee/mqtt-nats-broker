@@ -198,18 +198,33 @@ Two refinements keep the guarantee tight:
   marker to its session save sequence — a *gating* write: no success CONNACK is sent
   until it lands (and a failed advance runs a rollback transaction that rejects the
   CONNECT). Sequences are comparable only within one `$MQTT_sess` incarnation,
-  identified by a generated epoch (`nuid:<NUID>`) stored in the session-stream
-  metadata and carried on both the marker (`SessEpoch`) and each Will
-  (`OriginSessionSeq`, `OriginSessEpoch`). The claimant fence suppresses a Will when a
-  current-epoch marker is *strictly beyond* its origin sequence
-  (`SessionSeq > OriginSessionSeq` — the connection's own delayed Will, at an equal or
-  higher origin, still fires), or when the marker is from a different incarnation.
-  Because the marker is permanent, this holds even after the newer connection
-  finite-disconnects or its session record is deleted — the residual a session-record
-  fence alone could not close. When no marker is present (administrative loss), the
-  fence falls back to the numeric session-record rule (suppress iff a newer record
-  with `DisconnectedAt == 0`), and a marker-stream outage defers pending Wills (never
-  lost) until it recovers.
+  identified by a generated epoch (`nuid:<NUID>`) stored in the session-stream metadata
+  and carried on both the marker (`SessEpoch`) and each Will (`OriginSessionSeq`,
+  `OriginSessEpoch`). The claimant fence suppresses a Will when a current-epoch marker
+  is *strictly beyond* its origin sequence (`SessionSeq > OriginSessionSeq` — the
+  connection's own delayed Will, at an equal or higher origin, still fires), or when the
+  marker is from a different incarnation. Because the marker is permanent, this holds
+  even after the newer connection finite-disconnects or its session record is deleted —
+  the residual a session-record fence alone could not close. When no marker is present
+  (administrative loss), the fence falls back to the numeric session-record rule
+  (suppress iff a newer record with `DisconnectedAt == 0`), and a marker-stream outage
+  defers pending Wills (never lost) until it recovers. Because that fallback reads
+  `DisconnectedAt == 0` as *a live newer connection*, a disconnected session's record
+  has to say it is disconnected whatever its expiry class. The finite close persists the
+  stamp with its disconnect save; a **never-expiring** session makes no such save, so
+  its close stamps the disconnect time inside a RECORD TRANSACTION of its own — acquired
+  NON-BLOCKING, and a close that finds the fence held stamps anyway, unordered, because
+  the rejection probe would otherwise persist current memory with `DisconnectedAt = 0`
+  at a newer sequence — before the detach and therefore before the shared purge's own
+  record write. The fence, not `sess.mu`, is what makes that effective: an off-readLoop
+  writer takes the fence without the ownership gate, so a body it had already marshalled
+  with `DisconnectedAt = 0` could otherwise land after the Will's origin sequence is
+  captured. Holding the fence means every earlier marshal has completed and advanced the
+  sequence that capture reads, and every later write on that session (the purge, a
+  void-verdict release handoff, a rejection probe) therefore publishes a record newer
+  than an owed Will's origin sequence that still reads as disconnected, instead of
+  cancelling a Will the client is owed. The field stays inert for every expiry reader,
+  each of which pre-filters on never-expire before looking at it.
 
 Residual that keeps literal exactly-once impossible:
 
@@ -241,6 +256,76 @@ Operational constraints for the marker:
   state shape. `DenyDelete`/`DenyPurge` remain deliberately unchecked — no
   operation ever deletes or purges a watermark, so they are audited
   non-prerequisites, not oversights.
+
+### A definite record-CAS rejection is outstanding work
+
+A session-record save is a per-subject CAS. When JetStream **rejects** it — **10071**
+from the single-writer check, **10164** from the clustered contention branch — the write
+certainly did not land, so `sess.seq` is still right and the session stays usable; that
+is why `saveWithDetail` deliberately does not mark such a session unresolved. It is
+correct about the write and silent about the other fact the rejection carries: **the
+subject moved**, so this broker's belief that it owns the session may be obsolete.
+
+Nothing else re-validates a resident session. The **persist observation**
+(`processSessionPersist`, over the `$MQTT.JSA.*.SP.*.*` wildcard) is an at-most-once
+core-NATS notification with no retry and nothing durable behind it, and it is the only
+thing that evicts a displaced object today; an uncertainty readback's foreign verdict is
+unreachable here, because a definite rejection creates no uncertainty. A never-expiring
+session — **every** MQTT 3.1.1 persistent session — has no expiry timer either, and the
+expiry sweep skips it outright. So with the notification lost the object stays resident
+indefinitely, holding the client ID's reaping duty it can no longer discharge (both the
+cross-replica expiry handoff and the sweep's stamp-a-deadline branch defer to a resident
+object), and a **bound** one keeps serving a client against a session another broker owns
+— which [MQTT-3.1.4-3] requires to be closed.
+
+**What settles it is a write, not a read.** JetStream returns 10164 while a write for the
+subject is *in process* upstream, so a load that finds the record still at our base
+sequence proves nothing — the contender's proposal can commit a moment later. The
+settlement is therefore a **probe**: re-attempt the save of CURRENT memory so a fresh CAS
+arbitrates ownership, and let the readback distinguish only contention from a foreign
+owner. The probe re-marshals memory rather than replaying the rejected bytes, because a
+definitely-failed caller has since rolled its mutation back. It CASes at our own
+last-known sequence, so it can neither overwrite a record that moved (a foreign record
+rejects it) nor recreate a released one (a rejection implies a non-zero base, so the CAS
+carries a real expected-last-subject-sequence header). There is **no digest arm**: a
+rejected write did not land, so a later record matching our bytes cannot be this attempt.
+
+The marker (`recordRejectedSeq`, memory-only) is armed centrally at the store boundary,
+so a rejection site nobody enumerated is covered; its validity is a predicate at the
+point of use — non-zero, equal to `sess.seq`, and not unresolved — so every path that
+moves the sequence invalidates it without being enumerated. The `!seqUncertain` conjunct
+is load-bearing: an unresolved session's save is refused *before* the store, and a probe
+classifying on a zero-valued attempt would read any real record as foreign.
+
+Verdicts: **landed** → ours, and the advanced sequence retires the marker; **rejected
+with the record at the probe's own base** → contention, which is never ownership, so the
+marker stays; **rejected with the record gone or at another sequence** → foreign, and
+`disposeForeignSessionLocked` detaches, evicts and closes; **anything else** (a refused
+fence, an unreadable readback, a non-CAS error) → nothing established, marker kept. A
+foreign verdict is sound because a second local writer would need the fence the probe
+holds, an earlier ambiguous write of ours would have armed uncertainty, and a same-broker
+replacement is excluded by the gate below.
+
+The settlement runs from the **periodic pass**, renamed `reconcileResidentRecordState` for
+the three things it now settles (an ambiguous write, a definite rejection, the void-verdict
+backstop). Its gate, `lockSessionForRecordRejection`, claims the session as nobody and checks
+**residency by identity in the same critical section**, which is what makes "a newer record
+is not ours" true: the pass snapshots pointers, and a plain claim would let a stale object
+classify a same-broker replacement's own record as foreign. That gate is also the sole
+unboundness check on the path, and it is what keeps the settlement off a session with a live
+connection: claiming the shared client-ID gate for a bound session would fail a concurrent
+SUBSCRIBE's own claim, and that packet error closes a live connection.
+
+**A BOUND session is therefore NOT settled by this mechanism**, and that is a deliberate,
+stated gap rather than an oversight. A mid-connection save rejected by a remote takeover
+leaves this broker serving a client against a session another broker owns, which
+[MQTT-3.1.4-3] requires closed; converging that needs a settlement on the session's own
+readLoop, and a settlement there has to answer questions this one does not — whether the
+triggering packet may be dispatched, what a refused ownership claim means, and how a
+connection is actually torn down when the answer is "we do not know". Nine review rounds
+produced four distinct defects in successive attempts at exactly that, so it is deferred to
+its own roadmap item with those findings recorded. Until then a bound session converges when
+it unbinds, through the pass above.
 
 ## Reserved `$MQTT.>` namespace
 

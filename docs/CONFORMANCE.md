@@ -445,11 +445,15 @@ Residuals:
   durably tombstoned and others live with no verdict, and a crash after the rungs loses a
   fallback verdict whose nonce existed only in memory.
 - **A deferred close whose record write DEFINITELY fails loses restart-survival of the
-  deadline.** The in-memory purge stands, the timer is armed, and the verdicts stay staged
-  for the next convergence point, but nothing durable records the disconnect time — so a
-  restart before any later write reads the record as connected and the session waits for a
-  reconnect instead of expiring. The same posture as the ordinary close's failed disconnect
-  save.
+  deadline — unless a later rejection probe lands.** The in-memory purge stands, the timer
+  is armed, and the verdicts stay staged for the next convergence point, but nothing
+  durable records the disconnect time — so a restart before any later write reads the
+  record as connected and the session waits for a reconnect instead of expiring. The same
+  posture as the ordinary close's failed disconnect save. **Narrowed** by the
+  record-rejection settlement below: when that failure was a definite CAS rejection, the
+  probe re-saves current memory, so a LANDED probe makes the deadline durable after all.
+  A contended or unreadable one does not, and neither does a failure that was not a CAS
+  rejection.
 - **A close parked by an uncertain record write is memory-only until it is applied.** The
   parked action carries the ORIGINAL disconnect time and the Will, both captured while the
   client still existed, and neither is reconstructible: a crash before the discharge loses
@@ -534,13 +538,14 @@ Residuals:
   fallback reaps by WRITING a new deadline onto a record nobody has classified, which can
   turn an ambiguous write that landed into a different record the resolver then calls
   foreign, dropping the local obligation during foreign disposal. A resident object means
-  a broker is actively retrying, which is the class `retryUncertainSessions` already holds
-  every other unresolvable session in. The cost, in full: growth is unbounded across client
-  IDs (the residency maps have no quota) and each retained object holds its subscriptions,
-  consumers, drains, pending deliveries, retained continuations and its parked action; both
+  a broker is actively retrying, which is the class `reconcileResidentRecordState` already
+  holds every other unresolvable session in. The cost, in full: growth is unbounded
+  across client IDs (the residency maps have no quota) and each retained object holds
+  its subscriptions, consumers, drains, pending deliveries, retained continuations and
+  its parked action; both
   the object and the record keep the referenced consumers out of the orphan sweep's reach;
-  and `retryUncertainSessions` performs a synchronous readback per unresolved candidate with
-  no budget, ahead of the expiry, orphan-consumer and orphan-QoS2 sweeps on the same
+  and `reconcileResidentRecordState` performs a synchronous readback per unresolved candidate
+  with no budget, ahead of the expiry, orphan-consumer and orphan-QoS2 sweeps on the same
   goroutine, so N unresolved sessions delay those three by roughly N × the JetStream API
   timeout and make shutdown latency linear in the same walk. For a record carrying
   `DisconnectedAt > 0` the recovery is additionally RE-ENTERED about once per sweep interval
@@ -583,6 +588,91 @@ Residuals:
   broker never reads `$MQTT_inflight`, so it re-offers a started delivery under a
   fresh identifier and its orphan sweep does not know the stream. Continuity holds
   once every broker serving the account understands it.
+
+### A definite record-CAS rejection is settled by a probe, with bounded convergence
+
+A rejected session-record CAS says the subject moved, and the only thing that evicts a
+displaced session object otherwise is an at-most-once core-NATS persist notification. The
+settlement re-attempts the write so a fresh CAS arbitrates ownership (see
+`docs/ARCHITECTURE.md`). What it does *not* promise:
+
+- **Convergence is bounded by the pass's SCHEDULING, not by the sweep interval alone, and
+  only for an UNBOUND session.** The settlement runs on the next periodic pass that reaches
+  the session. That pass is the same serial, unbudgeted walk over every resident session
+  that the residency residual above describes: it performs blocking JetStream work per
+  candidate that needs it, so a session late in the walk converges after roughly the
+  interval PLUS the backlog ahead of it (order N × the JetStream request timeout for N
+  candidates doing round trips). A pass budget is a candidate follow-up, the same one the
+  residency residual names; until it exists, the honest bound is "the next pass that reaches
+  this session", not "one interval".
+- **A BOUND session is not settled at all until it unbinds, and its split-brain window is
+  the connection's remaining lifetime.** The mechanism is deliberately unbound-only: the
+  ownership gate a settlement needs is the same one a concurrent SUBSCRIBE takes, so
+  claiming it for a live connection turns a packet into an error and closes that connection.
+  So a mid-connection save rejected by a remote takeover leaves this broker serving a client
+  against a session another broker owns — which [MQTT-3.1.4-3] requires closed — until the
+  connection ends and the pass above settles the object. Converging it while bound is its
+  own roadmap item, filed with the four defects that successive attempts at it produced.
+- **Sustained contention holds the object for as long as it lasts.** A readback that finds
+  the record at the probe's own base sequence, or that cannot be performed at all,
+  establishes nothing, so the marker stays and the object is kept until a later pass — at
+  one probe per pass, indefinitely if the contention never clears.
+  Reading the base
+  sequence as ownership is not available as a shortcut: JetStream returns 10164 while a
+  write for the subject is in process, so that read is compatible with the contender
+  committing a moment later.
+- **A rejected close still publishes its Will, and the settlement cannot retract it.**
+  When the ordinary close's disconnect save is CAS-rejected by a remote takeover, the Will
+  is published synchronously by that close, before anything has classified the rejection;
+  a probe that later proves the session foreign cannot take it back. Pre-existing and
+  untouched here — a CAS rejection is contention, not takeover evidence, so discarding the
+  Will on one would drop a Will a session that is still ours owes, and parking it is
+  memory-only and non-transferable. Its own roadmap item, together with the periodic pass's
+  bound-foreign disposal, which reaches the same owed-Will arm.
+- **A takeover with the notification lost and NO local rejection is still not reaped.**
+  The probe runs only where a rejection armed the marker. A resident session that never
+  writes again is never re-validated, so what this change bounds is convergence for
+  rejection-caused staleness, not for staleness in general. Filed as its own roadmap item
+  rather than papered over.
+- **The marker is memory-only.** A crash drops it, which is benign: nothing durable was
+  written and the crash removes the object the settlement would have removed.
+- **The record arbitrates the last accepted state transition; it is not a liveness
+  lease.** A broker that crashes between its accept save and its success CONNACK leaves a
+  record that reads as connected with no acknowledged connection behind it, and `Origin`
+  is only a configured node name (uniqueness is documented, not enforced). Ownership is
+  revalidated by CAS, and no part of this design infers liveness from the record.
+- **Protection is PER BROKER and behaviourally asymmetric during a rolling upgrade.** No
+  stream, subject, record field, header or cross-broker message is added, and the probe is
+  an ordinary session save an older broker already understands — so wire compatibility is
+  symmetric in both directions. But a new broker settles only its OWN rejections; an older
+  broker keeps its stale objects and its bound split-brain. During a mixed-version window
+  the contender in process may be the older broker, which is precisely why the probe
+  retries a CAS instead of trusting a read.
+- **The never-expire disconnect stamp is a Will-fence fix, not an expiry change.** A
+  never-expiring session's close records the disconnect time so a later write cannot read
+  as a live newer connection and cancel an owed delayed Will. The stamp is taken inside a
+  RECORD TRANSACTION when one can be had, which is what orders it: `sess.mu` alone leaves
+  a body an off-readLoop writer had already marshalled with `DisconnectedAt = 0` free to
+  land after the Will's origin sequence is captured, while holding the fence means every
+  earlier marshal has completed and advanced the sequence that capture reads. The
+  acquisition is NON-BLOCKING, and what a busy fence costs is stated exactly: the close
+  **still stamps**, unordered, so every marshal from that point on — the rejection probe
+  included — carries the disconnect time, and the residual is the ONE body already
+  marshalled inside that open transaction, which no non-blocking form can order against.
+  Stamping there is not optional: the probe is a writer this change ADDS, and skipping it
+  would leave the probe free to persist current memory with `DisconnectedAt = 0` at a newer
+  sequence, which the fence reads as a reconnect. The fence is not WAITED for, because
+  waiting bought two defects for one fix — a wait spans the very writer being waited on
+  going ambiguous, which makes the close's entry uncertainty check stale, and a park taken
+  after a wait timestamps the close up to a JetStream timeout late, re-opening an
+  already-elapsed Will Delay for a reconnect to cancel. The in-fence arm additionally
+  re-checks that the record state is still resolved and parks the teardown if it is not;
+  the busy-fence arm makes no such check, because without the fence there is no sound one
+  to make. The field is inert for expiry (every reader pre-filters on never-expire), and
+  the pre-existing finite-close window where the purge's own write publishes
+  `DisconnectedAt = 0` before the disconnect save corrects it is unchanged — not widened,
+  and not bounded in time either, since that corrective save can itself fail and the
+  window then lasts until some later settlement succeeds.
 
 ### Session teardown: arbitrated across brokers, with two upgrade-window residuals
 

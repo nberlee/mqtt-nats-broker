@@ -847,6 +847,15 @@ type mqttAccountSessionManager struct {
 	// reconcileRemoteSessionExpiry.
 	testReconcilePause func(idHash string)
 
+	// testSessPersistDrop, when non-nil, drops the remote persist observation for the
+	// client ID hashes it returns true for, on THIS account manager only. Set/read
+	// under mu. That is the state a lost core-NATS notification leaves — the remote
+	// store happened and this broker never learned of it — which is the condition the
+	// record-rejection settlement exists for and which nothing else can produce
+	// deterministically. Hash-keyed so a parallel test and every unrelated session on
+	// this manager are unaffected. Nil in production. See processSessionPersist.
+	testSessPersistDrop func(idHash string) bool
+
 	// testCancelWatermarkLoad / testCancelWatermarkStore, when non-nil, replace the
 	// per-client cancel-watermark load / CAS store for THIS account manager only
 	// (instance-scoped). Set/read under mu. Used to drive the takeover fence off a
@@ -1180,6 +1189,15 @@ type mqttSession struct {
 	seqUncertain       bool
 	pendingWrite       *mqttPendingWrite
 	deferredDisconnect *mqttDeferredDisconnect
+	// recordRejectedSeq is the sequence a DEFINITELY REJECTED record CAS was based
+	// on, held as OUTSTANDING WORK rather than as a settled fact. The write did not
+	// land, so sess.seq is still right and the session stays usable — but the subject
+	// MOVED, so this broker's belief that it owns the session may be obsolete, and on
+	// an unbound never-expiring session nothing else ever asks again. Zero means none.
+	//
+	// Guarded by mu; validity is the predicate recordRejectionPendingLocked, not the
+	// field alone. See sess_rejected_write.go.
+	recordRejectedSeq uint64
 	// gen is this session INCARNATION's durable generation. It namespaces every
 	// resource whose name would otherwise derive from idHash alone — the PUBREL
 	// durable, subject and delivery subject, and the inbound QoS 2 hold subjects —
@@ -1384,8 +1402,12 @@ type mqttSession struct {
 	// Clean Session flag (clean => 0, persistent => mqttSessionNeverExpire). Set on
 	// each CONNECT and possibly overridden by a v5 DISCONNECT. Spec5 [3.1.2.11.2].
 	expiryInterval uint32
-	// disconnectedAt is the Unix time the client disconnected with a finite expiry
-	// interval pending (0 while connected). Persisted so the deadline survives a restart.
+	// disconnectedAt is the Unix time the client disconnected (0 while connected).
+	// Persisted so a finite deadline survives a restart — but it is stamped for a
+	// NEVER-EXPIRING session too, because the delayed-Will record fence reads a newer
+	// record with DisconnectedAt == 0 as a live newer connection and would cancel a Will
+	// that session is owed. It is inert for every expiry reader: each pre-filters on
+	// mqttSessionNeverExpire before looking at it. See sessionRecordFence.
 	disconnectedAt int64
 	domainTk       string
 
@@ -2809,6 +2831,7 @@ func (c *client) mqttParse(buf []byte) error {
 		default:
 			err = fmt.Errorf("%w: received unknown packet type %d", errMQTTMalformedPacket, pt>>4)
 		}
+
 	}
 	if err == nil && rd > 0 {
 		r.reader.SetReadDeadline(time.Now().Add(rd))
@@ -2968,6 +2991,78 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		return
 	}
 
+	// A NEVER-EXPIRING session makes no disconnect save below, so nothing else ever
+	// records that this connection ended — and the delayed-Will record fence reads a
+	// newer record with DisconnectedAt == 0 as a live newer connection and CANCELS a Will
+	// this client is owed. Every later write on this session would publish exactly that
+	// shape: the purge below, a void-verdict release handoff, a rejection probe.
+	//
+	// The RECORD FENCE is what makes the stamp effective, and `sess.mu` alone is not: an
+	// off-readLoop writer (a register store's `persistVoidedRegs`, which takes the fence
+	// without the ownership gate) can already have MARSHALLED `DisconnectedAt = 0` and be
+	// mid-store, and that body landing after the origin sequence is captured below is a
+	// newer record reading as connected. Holding the fence means every earlier marshal has
+	// completed AND advanced `sess.seq` — so the capture below is at or past it — while
+	// every later marshal needs this fence and therefore carries the stamp.
+	//
+	// Only for never-expire: the finite branch keeps its own in-transaction stamp, whose
+	// save corrects the record immediately, and a clean close discards the record outright.
+	sess.mu.Lock()
+	neverExpire := sess.expiryInterval == mqttSessionNeverExpire
+	sess.mu.Unlock()
+	if neverExpire {
+		sess.rejectionWindowHook(mqttRejectionWindowStamp)
+		// NEVER the blocking form. Waiting here is what generated two defects rather than
+		// one fix: the wait is exactly long enough for the writer being waited on to go
+		// AMBIGUOUS — publishing seqUncertain before it releases, with its own immediate
+		// resolver failing against the ownership gate this close holds — and long enough
+		// (a JetStream timeout) that a park taken afterwards timestamps the close seconds
+		// late, which can re-open an already-elapsed Will Delay for a reconnect to cancel.
+		// A refusal does not skip the stamp — see the else branch, which stamps anyway,
+		// unordered — it only gives up the ORDERING against a body already marshalled inside
+		// that open transaction. Same non-blocking reasoning as every other off-path record
+		// write (see persistVoidedRegs).
+		if tok, ok := sess.tryBeginRecordTx(); ok {
+			// Re-checked WITH THE FENCE HELD even so: acquiring it proves every earlier
+			// marshal completed, but not that none of them armed uncertainty between the
+			// entry check above and this instant. Stamping and detaching on a sequence
+			// nobody has classified is what that check exists to withhold.
+			unresolved := sess.isSeqUncertain()
+			if !unresolved {
+				sess.mu.Lock()
+				sess.disconnectedAt = time.Now().Unix()
+				sess.mu.Unlock()
+			}
+			if err := sess.endRecordTx(tok); err != nil {
+				c.Errorf("MQTT: %v", err)
+			}
+			if unresolved {
+				// Park after the release: the deferred discharge takes the fence itself.
+				s.mqttDeferDisconnect(c, asm, sess)
+				return
+			}
+		} else {
+			// A busy fence still stamps, just without the ordering. Skipping it entirely
+			// would leave the REJECTION PROBE — a writer this change adds, and the reason
+			// the stamp exists at all — free to persist current memory with
+			// DisconnectedAt = 0 at a newer sequence, which the Will fence reads as a
+			// reconnect: the holder we could not order against can be rejected at the
+			// unchanged base, arming the marker, and the probe then lands after the origin
+			// capture. So every marshal from HERE on carries the disconnect time, and the
+			// residual is exactly the one body already marshalled inside that open
+			// transaction — which no non-blocking form can order against, and which waiting
+			// for would re-open the two defects the wait caused.
+			//
+			// No uncertainty re-check on this arm: without the fence there is no sound one
+			// to make, and an unsound sample acted on is check-then-act. The stamp is a
+			// memory field, and every other teardown decision below already runs with that
+			// same pre-existing exposure.
+			sess.mu.Lock()
+			sess.disconnectedAt = time.Now().Unix()
+			sess.mu.Unlock()
+		}
+	}
+
 	asm.mu.Lock()
 	// Clear the client from the session, but session may stay.
 	sess.mu.Lock()
@@ -3000,7 +3095,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 			// deleted nothing, so the discard is recoverable: park it and restore the
 			// residency removeSession took above. Without that the record, the consumers,
 			// the shared group durables and this generation's registers survive with NO
-			// resident object, and nothing reaps them — retryUncertainSessions and CONNECT
+			// resident object, and nothing reaps them — reconcileResidentRecordState and CONNECT
 			// both scan as.sessions, and sweepSessionExpiries skips an ExpiryInterval == 0
 			// record — so only a reconnect on this client ID ever would.
 			//
@@ -3673,7 +3768,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// records orphaned when their owner crashed while the client was connected),
 	// and the orphaned-consumer sweep reconciles durables leaked in crash windows
 	// (re-run so it also catches orphans skipped by the grace window at startup).
-	// retryUncertainSessions rides along here but is deliberately NOT part of
+	// reconcileResidentRecordState rides along here but is deliberately NOT part of
 	// sweepSessionExpiries: that walks persisted records and skips ExpiryInterval 0
 	// or never-expire, which are exactly the two cases that park a deferred clear()
 	// or a deferred Will. See sess_uncertain.go.
@@ -3687,7 +3782,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		for {
 			select {
 			case <-tt.C:
-				as.retryUncertainSessions(s)
+				as.reconcileResidentRecordState(s)
 				as.sweepSessionExpiries(s)
 				as.sweepOrphanedConsumers(s)
 				as.sweepOrphanedQoS2State(s)
@@ -4567,6 +4662,16 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 		return
 	}
 	cIDHash := tokenAt(subject, mqttJSAClientIDPos)
+	// Checked before anything else, so a dropped observation touches neither the
+	// reconciliation watermark nor the takeover branch: what it reproduces is a LOST
+	// core-NATS notification, where the remote store happened and this broker never
+	// learned of it.
+	as.mu.RLock()
+	drop := as.testSessPersistDrop
+	as.mu.RUnlock()
+	if drop != nil && drop(cIDHash) {
+		return
+	}
 	_, msg := pc.msgParts(rmsg)
 	if len(msg) < LEN_CR_LF {
 		return
@@ -5654,6 +5759,46 @@ func (as *mqttAccountSessionManager) lockSessionForVoidHandoff(sess *mqttSession
 		sess.voidHandoffActive = false
 		sess.mu.Unlock()
 		return fmt.Errorf("session %q is in use; its void-verdict handoff yields", sess.id)
+	}
+	as.sessLocked[sess.id] = struct{}{}
+	return nil
+}
+
+// lockSessionForRecordRejection takes the session gate as NOBODY for a periodic
+// rejection probe, and it is the SOLE unboundness check on that path.
+//
+// Residency BY IDENTITY, in the same as.mu critical section as the claim, is what makes
+// the probe's foreign classification true: the periodic pass snapshots session
+// pointers, and plain lockSession checks only sessLocked and sess.c — so a stale object
+// could take the gate after a same-broker replacement had been installed and saved, and
+// then read that locally authored record as another owner's and dispose of the live
+// session. Identity, not client ID: a CONNECT may already have installed a restored
+// replacement under the same ID.
+//
+// Unbound-only, and that is what makes the settlement unbound-only: claiming this gate for a
+// healthy bound session would fail a concurrent SUBSCRIBE's own lockSession, and that packet
+// error closes a live connection — a disruption the uncertainty pass only inflicts on
+// sessions that are already unusable. So a bound session's marker simply has its claim
+// refused and waits for the connection to end; converging it while bound is its own roadmap
+// item. The check lives here and nowhere else: a duplicate check in the caller would mask a
+// mutation of this one. See sess_rejected_write.go.
+//
+// Lock order is the established as.mu → sess.mu, same as lockSession.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) lockSessionForRecordRejection(sess *mqttSession) error {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	fail := as.sessions[sess.id] != sess
+	if !fail {
+		if _, fail = as.sessLocked[sess.id]; !fail {
+			sess.mu.Lock()
+			fail = sess.c != nil
+			sess.mu.Unlock()
+		}
+	}
+	if fail {
+		return fmt.Errorf("session %q is in use; its record-rejection probe yields", sess.id)
 	}
 	as.sessLocked[sess.id] = struct{}{}
 	return nil
@@ -8065,11 +8210,18 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 		// leaves an outcome nobody can name, and a stale sess.seq would otherwise
 		// reject the client's own next reconnect. Record the attempted write's
 		// identity so a readback can classify it.
-		if !mqttIsRecordCASRejection(err) {
-			sess.mu.Lock()
+		sess.mu.Lock()
+		if mqttIsRecordCASRejection(err) {
+			// Certain about the WRITE, and silent about the other fact the rejection
+			// carries: the subject moved. Armed HERE, at the one boundary every record
+			// write passes through, so a rejection site nobody enumerated is covered
+			// anyway — the enumeration in this feature's plan was itself incomplete
+			// twice over. See sess_rejected_write.go.
+			sess.markWriteRejectedLocked(seq)
+		} else {
 			sess.markWriteUncertainLocked(seq, body, voidedRev)
-			sess.mu.Unlock()
 		}
+		sess.mu.Unlock()
 		return detail, fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
 	}
 	sess.mu.Lock()
@@ -8292,6 +8444,12 @@ func (sess *mqttSession) clear(noWait bool) error {
 	sess.cancelledRegNonces = nil
 	sess.settledVoidReservations = nil
 	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
+	// A retired generation's rejected CAS is not a fresh incarnation's work to settle.
+	// Cross-generation false equality is structurally excluded anyway — $MQTT_sess
+	// sequences only grow, so a new incarnation's sess.seq can never equal a prior
+	// generation's base — but the reset states the intent instead of leaning on stream
+	// arithmetic. See sess_rejected_write.go.
+	sess.recordRejectedSeq = 0
 	// The identifier space of the RETIRING incarnation is gone with the maps above, so
 	// the restriction that protected it must go too. Two paths REUSE the session object
 	// as a fresh session, and a fresh one reports Session Present false, so it never
