@@ -596,8 +596,8 @@ displaced session object otherwise is an at-most-once core-NATS persist notifica
 settlement re-attempts the write so a fresh CAS arbitrates ownership (see
 `docs/ARCHITECTURE.md`). What it does *not* promise:
 
-- **Convergence is bounded by the pass's SCHEDULING, not by the sweep interval alone, and
-  only for an UNBOUND session.** The settlement runs on the next periodic pass that reaches
+- **For an UNBOUND session, convergence is bounded by the pass's SCHEDULING, not by the
+  sweep interval alone.** The settlement runs on the next periodic pass that reaches
   the session. That pass is the same serial, unbudgeted walk over every resident session
   that the residency residual above describes: it performs blocking JetStream work per
   candidate that needs it, so a session late in the walk converges after roughly the
@@ -605,14 +605,80 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   candidates doing round trips). A pass budget is a candidate follow-up, the same one the
   residency residual names; until it exists, the honest bound is "the next pass that reaches
   this session", not "one interval".
-- **A BOUND session is not settled at all until it unbinds, and its split-brain window is
-  the connection's remaining lifetime.** The mechanism is deliberately unbound-only: the
-  ownership gate a settlement needs is the same one a concurrent SUBSCRIBE takes, so
-  claiming it for a live connection turns a packet into an error and closes that connection.
-  So a mid-connection save rejected by a remote takeover leaves this broker serving a client
-  against a session another broker owns — which [MQTT-3.1.4-3] requires closed — until the
-  connection ends and the pass above settles the object. Converging it while bound is its
-  own roadmap item, filed with the four defects that successive attempts at it produced.
+- **A BOUND session is settled before its next packet is dispatched, and that is narrower
+  than "never serves a displaced client".** The gate runs per packet inside `mqttParse`,
+  claims the ownership gate as the bound client, and serves only on a landed CAS; every
+  other outcome closes the connection — 0x8E when the probe proved the session foreign,
+  0x89 "server busy" when nothing was established, and SILENCE when the session was found
+  REBOUND (a takeover owns the notification and sends its own 0x8E; a courtesy packet here
+  would contradict it on the same socket). A refused ownership claim is retried while this
+  connection is still the owner rather than read as a verdict. What that leaves:
+  1. **Outbound deliveries continue** to the displaced client until an inbound packet
+     triggers the settlement, or the connection ends. Closing that needs a delivery-side
+     gate, which is the "resident session never re-validates" item's territory.
+  2. **A silent client with keepalive 0 converges only at unbind.** The bound is a
+     conformant client's PINGREQ — about 1.5 keepalive intervals — and a client that
+     promises nothing is owed nothing.
+  3. **The packet that races the marker's arming is served.** A rejection that lands after
+     a packet's pre-dispatch check is invisible to it; the NEXT packet gates. This is
+     inherent to any check-then-dispatch: a barrier synchronised with the arming would
+     deadlock, because arming happens inside the save on the dispatch path itself.
+  4. **A no-verdict close may drop a connection whose session was still ours.** That is the
+     availability side of failing closed. The Will then follows the ordinary close rules,
+     which includes the rejected-close Will publication residual below.
+  5. **While suspended by an unresolved write of ours, the connection fails closed
+     immediately without probing** — no probe is possible — and the teardown follows the
+     courtesy write, per (9).
+  6. **The rolling-upgrade asymmetry is unchanged**: protection is per owning broker (see
+     the last bullet), so an older broker keeps its bound split-brain.
+  7. **A false foreign verdict can close a live connection and discard its Will.** The
+     uncertainty resolver clears an ambiguity on a single plain load at the base sequence,
+     but a timed-out proposal can commit later and its digest has been discarded — so the
+     probe reads that landing as another owner's. This is a defect of the shipped
+     uncertainty machinery (it already permits a false-foreign disposal of an unbound
+     session); the bound arm widens its blast radius to a live connection. Its own §0
+     roadmap item.
+  8. **An ambiguous probe's fail-closed close parks a memory-only teardown**, so a crash
+     before resolution loses the parked Will and the original expiry deadline. That is the
+     pre-existing parked-teardown exposure, newly reachable from this path.
+  9. **The fail-closed teardown begins only after the courtesy 0x89 write returns, and that
+     write is unbounded**, so a stalled v5 client defers it indefinitely. Pre-existing
+     property of the parse-error footer, shared by every parse error today, and NOT
+     gate-held — the settlement releases the ownership gate before returning.
+  10. **The park after an ambiguous probe is not guaranteed.** Between the sentinel return
+      and the close bookkeeping, the periodic pass's bound-uncertain resolver can classify
+      foreign and dispose first, reaching the owed-Will arm the Will bullet below names.
+  11. **The foreign arm's 0x8E is an unbounded courtesy write too**, as is the periodic
+      pass's disposal 0x8E — which is additionally performed gate-held. Same class as (9),
+      filed as its own §0 roadmap item.
+  12. **No single owner exists for "displace this connection", so a second DISCONNECT
+      remains possible.** Four paths displace a bound connection — a local CONNECT takeover,
+      `processSessionPersist`, a resolver's foreign disposal, and this settlement — and only
+      the first and third take the session gate. `processSessionPersist` evicts, enqueues
+      0x8E and closes ASYNCHRONOUSLY under `as.mu` alone, so it can overlap even a gate-held
+      probe; the suspended-by-uncertainty arm answers 0x89 without attempting a claim at
+      all; and the periodic pass can dispose foreign in the window between this settlement
+      releasing the gate and its close bookkeeping running. In each of those a 0x89 or a
+      0x8E can follow another path's 0x8E on one socket, which [MQTT-3.14.4-2] does not
+      allow the server to do. The classification above removes the common orderings (a
+      rebound session is never answered, and transient contention is waited out) but not the
+      class; closing it needs one owner for takeover notification and close across all four
+      paths, which is its own §0 roadmap item.
+  13. **The gate hold is not starvation-free.** "At most one probe per arming, roughly three
+      JetStream timeouts" assumes the record fence is handed to the waiting settlement when
+      its current holder releases. `beginRecordTx` waits on a condition variable with no
+      FIFO guarantee and `tryBeginRecordTx` can barge it, so sustained off-readLoop writer
+      activity on one session stretches both the wait and the ownership gate the settlement
+      holds — which a same-client-ID CONNECT can then fail against. Pre-existing property
+      of the fence, shared by SUBSCRIBE's and UNSUBSCRIBE's blocking acquisitions; its own
+      roadmap item.
+  14. **A takeover still mid-flight can have its Will published by this connection's
+      close.** The rebound arm applies the takeover's own discard rule as soon as the rebind
+      is observable. Before the rebind there is nothing to observe: if the bounded retry
+      gives up while the session is still ours (a CONNECT holding the gate for longer than
+      the spin, without having rebound yet), the 0x89 close marks the Will owed, and the
+      takeover's later discard preserves an owed Will by design. Narrow, and the same
+      Will-disposition race roadmap bullet 1297 tracks.
 - **Sustained contention holds the object for as long as it lasts.** A readback that finds
   the record at the probe's own base sequence, or that cannot be performed at all,
   establishes nothing, so the marker stays and the object is kept until a later pass — at
@@ -645,7 +711,8 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   stream, subject, record field, header or cross-broker message is added, and the probe is
   an ordinary session save an older broker already understands — so wire compatibility is
   symmetric in both directions. But a new broker settles only its OWN rejections; an older
-  broker keeps its stale objects and its bound split-brain. During a mixed-version window
+  broker keeps its stale objects and its bound split-brain — the pre-dispatch gate protects
+  the sessions THIS broker owns, not the account. During a mixed-version window
   the contender in process may be the older broker, which is precisely why the probe
   retries a CAS instead of trusting a read.
 - **The never-expire disconnect stamp is a Will-fence fix, not an expiry change.** A

@@ -2591,6 +2591,27 @@ func (c *client) mqttParse(buf []byte) error {
 			break
 		}
 
+		// A definitely rejected record CAS means the session subject MOVED, so this
+		// broker's ownership belief may be obsolete — and BEFORE DISPATCH is the only
+		// place that can act on it: a QoS 1 PUBLISH routed and acked from a displaced
+		// connection cannot be retracted afterwards. Per packet rather than per read,
+		// because a save the PREVIOUS packet in this same buffer triggered (an
+		// UNSUBSCRIBE's voided-register flush) can arm the marker between the two.
+		if connected {
+			if proceed, serr := c.mqttGateDispatchOnRejection(pt); !proceed {
+				if serr != nil {
+					// No verdict: fail closed through the ordinary parse-error path, so
+					// the connection is really torn down and the close bookkeeping runs.
+					err = serr
+					break
+				}
+				// Foreign: this connection has been disposed, told and closed. Return as
+				// the graceful DISCONNECT branch does — an error here would make the
+				// footer send a second DISCONNECT.
+				return nil
+			}
+		}
+
 		switch pt {
 		// Packets that we receive back when we act as the "sender": PUBACK,
 		// PUBREC, PUBCOMP.
@@ -5775,13 +5796,15 @@ func (as *mqttAccountSessionManager) lockSessionForVoidHandoff(sess *mqttSession
 // session. Identity, not client ID: a CONNECT may already have installed a restored
 // replacement under the same ID.
 //
-// Unbound-only, and that is what makes the settlement unbound-only: claiming this gate for a
-// healthy bound session would fail a concurrent SUBSCRIBE's own lockSession, and that packet
-// error closes a live connection — a disruption the uncertainty pass only inflicts on
-// sessions that are already unusable. So a bound session's marker simply has its claim
-// refused and waits for the connection to end; converging it while bound is its own roadmap
-// item. The check lives here and nowhere else: a duplicate check in the caller would mask a
-// mutation of this one. See sess_rejected_write.go.
+// Unbound-only, and that is what makes THIS settlement unbound-only: claiming the gate as
+// nobody for a healthy bound session would fail a concurrent SUBSCRIBE's own lockSession,
+// and that packet error closes a live connection — a disruption the uncertainty pass only
+// inflicts on sessions that are already unusable. So a bound session's marker simply has
+// its claim refused here. It is not left unconverged: the bound session settles the marker
+// on its OWN readLoop before the next packet is dispatched, claiming the gate as itself
+// (mqttGateDispatchOnRejection), and this pass settles whatever survives the unbind. The
+// check lives here and nowhere else: a duplicate check in the caller would mask a mutation
+// of this one. See sess_rejected_write.go.
 //
 // Lock order is the established as.mu → sess.mu, same as lockSession.
 //
@@ -5804,9 +5827,10 @@ func (as *mqttAccountSessionManager) lockSessionForRecordRejection(sess *mqttSes
 	return nil
 }
 
-// lockSessionForTeardown takes the session gate on behalf of a closing
-// connection, retrying for as long as that connection is still the session's
-// owner.
+// lockSessionForTeardown takes the session gate on behalf of a connection that is
+// about to end — a close, or a bound record-rejection settlement that has already
+// decided not to serve — retrying for as long as that connection is still the
+// session's owner.
 //
 // lockSession fails for two very different reasons: the session has been rebound
 // to another connection (a takeover — nothing below is this connection's to do
@@ -5819,7 +5843,9 @@ func (as *mqttAccountSessionManager) lockSessionForRecordRejection(sess *mqttSes
 // Bounded, and mirrors the CONNECT side's own spin (mqttProcessConnect). It
 // cannot deadlock: nothing that holds the gate waits on this teardown, and a
 // CONNECT registers the gate before it rebinds the session, so a teardown
-// waiting on a CONNECT observes the rebind on its next attempt.
+// waiting on a CONNECT observes the rebind on its next attempt. The settlement
+// caller keeps that true by spinning here BEFORE it takes the record fence — a
+// waiter holding the fence a gate holder needs would close the cycle.
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) lockSessionForTeardown(sess *mqttSession, c *client) error {
@@ -10865,6 +10891,11 @@ func mqttDisconnectReasonFromErr(err error) byte {
 		return mqttReasonReceiveMaxExceeded
 	case errors.Is(err, errMQTTPayloadFormatInvalid):
 		return mqttReasonPayloadFormatInvalid
+	case errors.Is(err, errMQTTSessionOwnershipUnsettled):
+		// Nothing arbitrated the ownership question, so this is "try again later", not
+		// 0x8E: a takeover nobody proved must not be announced as one. See
+		// sess_rejected_write.go.
+		return mqttReasonServerBusy
 	}
 	return mqttReasonUnspecifiedError
 }

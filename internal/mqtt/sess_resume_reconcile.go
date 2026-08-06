@@ -198,9 +198,11 @@ const (
 	//
 	// An earlier iteration split this three ways — contended (the record demonstrably has
 	// not moved), indeterminate (nothing arbitrated at all) and nothing-owed — because a
-	// BOUND session's packet tail had to decide whether to serve traffic on each. With that
-	// half deferred to its own roadmap item, the one remaining caller treats all three
-	// identically, and the distinction would be a mechanism nothing reads.
+	// BOUND session's packet tail was expected to decide whether to serve traffic on each.
+	// That half now exists and does NOT need the split: only a landed CAS licenses serving,
+	// so every non-landed shade is one answer, and the bound caller's own re-read of the
+	// serve gate distinguishes the case it actually has to act on (a marker retired while
+	// it waited for the fence) without any help from the verdict.
 	mqttRejectionKeep mqttRejectionVerdict = iota
 	// mqttRejectionOurs: the probe LANDED. The CAS arbitrated ownership in our
 	// favour, and the advanced sequence invalidates the marker.

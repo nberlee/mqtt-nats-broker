@@ -528,8 +528,31 @@ func (sess *mqttSession) dischargeDeferredIfUnbound(c *client) {
 // the caller: a resolver reaching a foreign verdict from the periodic pass has
 // no idea which connection it is about to close, and got this wrong.
 //
+// The state disposal and the notify/close tail are split apart because they belong on
+// different goroutines for different callers, NOT because either is optional: every caller
+// that disposes state runs the tail. An off-readLoop caller (this one) must not close
+// synchronously — it holds the ownership gate, and closeConnection unsubscribes and can
+// drain — while the bound settlement on a session's own readLoop must, so that the
+// connection is shut before its parser can look at another packet. See
+// mqttGateDispatchOnRejection.
+//
 // No lock held on entry (other than the ownership gate).
 func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionManager, c *client) {
+	stale, disposed := sess.disposeForeignStateLocked(asm, c)
+	if !disposed || stale == nil {
+		return
+	}
+	stale.mqttNotifyForeignDisposal(sess.id)
+	go stale.closeConnection(DuplicateClientID)
+}
+
+// disposeForeignStateLocked is the STATE half of the foreign disposition: it detaches the
+// stale client, drops the deferred close and evicts the session. It reports the client it
+// observed bound and whether the disposal APPLIED, so a caller cannot run the notify/close
+// tail against a session it turned out to have no business disposing of.
+//
+// No lock held on entry (other than the ownership gate).
+func (sess *mqttSession) disposeForeignStateLocked(asm *mqttAccountSessionManager, c *client) (*client, bool) {
 	// The identity check comes BEFORE any mutation. A stale caller that discarded the
 	// deferred close and only then noticed the binding had changed would have
 	// destroyed the CURRENT session's obligation — the Will it still owes, the expiry
@@ -541,7 +564,7 @@ func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionMana
 		// that cannot be a CONNECT in flight, but it can be one that completed before
 		// we took it — in which case the session is theirs and not ours to tear down.
 		sess.mu.Unlock()
-		return
+		return nil, false
 	}
 	sess.mu.Unlock()
 
@@ -557,12 +580,18 @@ func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionMana
 		// cancelling it unconditionally would disarm a REPLACEMENT session's deadline.
 		asm.removeSessionIfCurrent(sess)
 	}
-	if stale != nil {
-		stale.Warnf("MQTT: session %q is now owned elsewhere; closing this connection", sess.id)
-		if stale.connAckWritten.Load() {
-			stale.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
-		}
-		go stale.closeConnection(DuplicateClientID)
+	return stale, true
+}
+
+// mqttNotifyForeignDisposal tells a disposed connection why it is about to be closed. The
+// close itself is the caller's: it is what differs between the off-readLoop callers and the
+// settlement running on this connection's own readLoop.
+//
+// No lock held on entry.
+func (c *client) mqttNotifyForeignDisposal(id string) {
+	c.Warnf("MQTT: session %q is now owned elsewhere; closing this connection", id)
+	if c.connAckWritten.Load() {
+		c.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
 	}
 }
 

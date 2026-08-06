@@ -16,12 +16,27 @@
 // with the notification lost the object stays resident for good, holding the client
 // ID's reaping duty it can no longer discharge.
 //
-// This file settles an UNBOUND session, which is the shape the roadmap bullet described. A
-// BOUND one keeps serving a client against a session another broker owns ([MQTT-3.1.4-3]),
-// and converging THAT is deferred to its own roadmap item: the ownership gate a settlement
-// needs is the one a concurrent SUBSCRIBE claims, so taking it for a live connection turns
-// that packet into an error and closes the connection. A bound session is settled here when
-// it unbinds.
+// This file settles BOTH shapes an armed marker can be in.
+//
+// An UNBOUND session is settled by the periodic pass, claiming the ownership gate as
+// nobody (lockSessionForRecordRejection).
+//
+// A BOUND one would otherwise keep serving a client against a session another broker owns
+// — PUBLISHes routed and acked, SUBSCRIBEs changing durable state — for the whole
+// remaining life of the connection, which is the split-brain [MQTT-3.1.4-3] forbids. The
+// gate such a settlement needs is the one a concurrent SUBSCRIBE claims, so the settlement
+// is made BY that connection's own readLoop rather than against it
+// (mqttGateDispatchOnRejection), BEFORE the triggering packet is dispatched: a QoS 1
+// PUBLISH served from a displaced connection is acked and unretractable, so a check that
+// runs after the dispatch switch has already lost.
+//
+// The bound half is FAIL-CLOSED, and the two questions it asks are deliberately named
+// apart. recordRejectionGatesServingLocked asks whether the ownership question is still
+// outstanding (may this packet be served?); recordRejectionPendingLocked asks whether a
+// probe is valid right now (may we ask the stream again?). Gating service on the probe's
+// licence would serve every packet between a contended probe and the next opportunity to
+// re-probe, which is the same mistake as reading "no verdict" as permission: only a landed
+// CAS is arbitration, and every other outcome closes the connection.
 //
 // WHAT SETTLES IT IS A WRITE, NOT A READ. JetStream returns 10164 from
 // checkMsgHeadersPreClusteredProposal while a write for the subject is IN PROCESS
@@ -38,16 +53,22 @@
 
 package mqtt
 
-import "sync/atomic"
+import (
+	"errors"
+	"fmt"
+	"sync/atomic"
+)
 
 // markWriteRejectedLocked records that a record CAS was DEFINITELY REJECTED at baseSeq.
 //
-// There is no probe rate limit beyond the periodic pass itself: the settlement runs once
-// per pass over an unbound session, which IS the cadence. An earlier iteration carried a
-// per-arming licence, but that existed only to stop a bound session's per-packet
-// settlement from holding the ownership gate across JetStream round trips; with the bound
-// half deferred to its own roadmap item, a licence would be a mechanism restating what the
-// sweep interval already says.
+// There is no probe rate limit on either settlement, and neither needs one. The unbound
+// settlement runs once per periodic pass, which IS its cadence. The bound settlement
+// performs AT MOST ONE probe per arming, because the only verdict that lets the connection
+// keep running is the landed one — and a landed save moves sess.seq, retiring the marker.
+// An earlier iteration carried a per-arming licence to bound the bound half's gate holds;
+// with one probe per arming that licence would restate what the verdict handling already
+// guarantees, and (worse) a licence read as a serve gate would license serving packets it
+// never arbitrated.
 //
 // sess.mu must be held.
 func (sess *mqttSession) markWriteRejectedLocked(baseSeq uint64) {
@@ -76,6 +97,27 @@ func (sess *mqttSession) markWriteRejectedLocked(baseSeq uint64) {
 func (sess *mqttSession) recordRejectionPendingLocked() bool {
 	return sess.recordRejectedSeq != 0 && sess.recordRejectedSeq == sess.seq &&
 		!sess.seqUncertain
+}
+
+// recordRejectionGatesServingLocked reports whether the OWNERSHIP QUESTION this rejection
+// raised is still outstanding, which is what decides whether a bound client's packet may
+// be served. It is deliberately not the same predicate as recordRejectionPendingLocked:
+// that one is probe-VALIDITY ("may we ask the stream again right now?"), and reading a
+// probe licence as permission to serve is how an earlier attempt served every packet
+// between a contended probe and its next opportunity to re-probe.
+//
+// The two share the first two conjuncts — the marker is invalidated by any route that
+// moves the sequence, because a landed CAS arbitrated the question — and differ in the
+// third, which is ABSENT here on purpose. While a write of ours is unresolved, sess.seq
+// still holds the base, so this predicate keeps gating: no probe is possible (an
+// unresolved session's save is refused at entry) and no verdict exists, and no verdict is
+// not permission. Resolution then either adopts a landed sequence, which moves sess.seq
+// and retires the marker, or restores the base, which leaves this gate closed and the next
+// packet probing.
+//
+// sess.mu must be held.
+func (sess *mqttSession) recordRejectionGatesServingLocked() bool {
+	return sess.recordRejectedSeq != 0 && sess.recordRejectedSeq == sess.seq
 }
 
 // mqttTestRejectionWindowHookV fires at each point where this feature samples record
@@ -117,10 +159,10 @@ func (sess *mqttSession) rejectionWindowHook(window string) {
 // caller's, because resolving it needs the gate the caller already holds.
 //
 // It is UNBOUND-ONLY, and takes no client for that reason: the session it settles has none,
-// so the disposition below disposes with nil. Converging a BOUND session is deferred to its
-// own roadmap item — a settlement on the session's own readLoop has to decide whether the
-// triggering packet may be dispatched and how the connection is torn down, and neither
-// question arises here.
+// so the disposition below disposes with nil. A BOUND session is settled by
+// settleRecordRejectionBound on its own readLoop instead, because there the verdict also
+// decides whether the triggering packet may be dispatched and how the connection is torn
+// down — neither of which arises here.
 //
 // The caller holds the ownership gate, claimed as nobody through
 // asm.lockSessionForRecordRejection.
@@ -185,6 +227,256 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 	verdict := classifyRejectedProbe(outcome, detail, smsg, lerr)
 	if verdict == mqttRejectionKeep && err != nil {
 		sess.jsa.c.Debugf("MQTT: rejection probe for session %q established nothing: %v", sess.id, err)
+	}
+	return verdict
+}
+
+// errMQTTSessionOwnershipUnsettled is the sentinel the bound settlement fails closed with:
+// the ownership question is outstanding and NOTHING ARBITRATED IT. It is not a takeover —
+// no evidence of one exists — which is why it maps to 0x89 "Server busy, try again later"
+// (mqttDisconnectReasonFromErr) rather than 0x8E: claiming a takeover the broker cannot
+// demonstrate would tell a client to stop reconnecting on the strength of a guess.
+//
+// Returning it as a parse error is what makes the stop a real stop: the readLoop's
+// disconnect() runs the ordinary close bookkeeping — the Will by its own rules, the expiry
+// save, the purge — and the marker is settled after the unbind by the periodic pass. An
+// earlier attempt returned nil from mid-parse instead, which closed nothing, silently
+// dropped every following packet and skipped the footer that re-arms the keepalive
+// deadline.
+var errMQTTSessionOwnershipUnsettled = errors.New("session ownership is unsettled after a rejected record write")
+
+// mqttBoundSettlement is what the gate-held half established, which decides both whether
+// the packet may be dispatched and WHO tells the client the connection is ending.
+type mqttBoundSettlement uint8
+
+const (
+	// mqttBoundServe: a fresh CAS landed (or nothing was outstanding). Dispatch.
+	mqttBoundServe mqttBoundSettlement = iota
+	// mqttBoundUnsettled: no verdict, with the ownership gate HELD — contended,
+	// unreadable, ambiguous, or suspended before the claim. Nobody else is disposing this
+	// connection, so it is ours to close and ours to explain: 0x89.
+	mqttBoundUnsettled
+	// mqttBoundDisplaced: the ownership claim was refused, or the disposal's identity
+	// check found the session rebound. Some other operation owns this client ID right now
+	// — a CONNECT taking the session over, a remote persist observation evicting it, a
+	// resolver disposing it — and every one of those tells the client itself and closes
+	// the connection. This arm therefore says NOTHING and only closes.
+	mqttBoundDisplaced
+	// mqttBoundDisposed: the probe proved the session foreign and this settlement disposed
+	// it, so this connection is the one that owes the client its 0x8E.
+	mqttBoundDisposed
+)
+
+// mqttGateDispatchOnRejection settles an outstanding record-CAS rejection BEFORE the
+// packet that triggered the check is dispatched, and reports whether it may be dispatched
+// at all.
+//
+// Three outcomes:
+//
+//   - (true, nil): a fresh CAS landed, so this broker demonstrably still owns the session
+//     (or nothing was outstanding). Dispatch normally; the parse footer re-arms the
+//     keepalive deadline as it does for any served packet.
+//   - (false, err): NO VERDICT reached with the gate held — contended, unreadable or
+//     suspended by an unresolved write of ours. Fail closed on the sentinel; the caller's
+//     parse-error footer tells a v5 client 0x89 and the readLoop tears the connection down.
+//   - (false, nil): the connection is already closed here — because the probe proved the
+//     session FOREIGN (0x8E first, then the close) or because this connection was already
+//     DISPLACED by another operation (closed silently). The caller returns nil exactly as
+//     the graceful-DISCONNECT branch does.
+//
+// The silence on the displaced arm is load-bearing, not an omission. A refused claim means
+// a CONNECT takeover, a remote persist observation or a resolver disposal is running for
+// this client ID, and each of those enqueues its OWN 0x8E and closes the connection
+// asynchronously — `processSessionPersist` does it without even taking the gate. Answering
+// a refusal with 0x89 would append "server busy, try again" to another path's "session
+// taken over" on the same socket: two DISCONNECTs where the spec allows one, in an order
+// neither path controls, telling the client the opposite of what happened.
+//
+// CONNECT and DISCONNECT are exempt. Pre-CONNECT there is no bound session to arbitrate,
+// and a second CONNECT is already a protocol error before dispatch. DISCONNECT neither
+// routes nor acks anything: it carries the client's own instruction about its Will (which
+// a fail-closed error-close would turn into a Will publication the client explicitly
+// forbade, [MQTT-3.1.2-8] / Spec5 [3.14.4]), a session-expiry override already guarded by
+// sess.c == c and by the record CAS, and the teardown that IS the [MQTT-3.1.4-3]
+// convergence — refusing to process the packet that ends the split-brain would be
+// self-defeating. PINGREQ is NOT exempt, and that is what bounds convergence: a conformant
+// client sends one within its keepalive, so even an otherwise silent displaced connection
+// closes within about 1.5 keepalive intervals.
+//
+// Runs on the client's readLoop, from mqttParse's per-packet loop. No lock held on entry.
+// Performs JetStream requests only when a rejection is actually outstanding.
+func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
+	if pt == mqttPacketConnect || pt == mqttPacketDisconnect {
+		return true, nil
+	}
+	c.mu.Lock()
+	var sess *mqttSession
+	var asm *mqttAccountSessionManager
+	if c.mqtt != nil {
+		sess, asm = c.mqtt.sess, c.mqtt.asm
+	}
+	c.mu.Unlock()
+	if sess == nil {
+		return true, nil
+	}
+
+	// The fast path for every packet on every healthy connection: one sess.mu acquisition
+	// that finds nothing outstanding.
+	sess.mu.Lock()
+	gates := sess.recordRejectionGatesServingLocked()
+	suspended := sess.seqUncertain
+	sess.mu.Unlock()
+	if !gates {
+		return true, nil
+	}
+	if suspended {
+		// An unresolved write owns this session's record: its save is refused at entry, so
+		// no probe can run and no verdict can exist. Fail closed. The close bookkeeping
+		// PARKS the teardown (mqttHandleClosedClient's unresolved branch) and the existing
+		// resolution machinery discharges or disposes it.
+		return false, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+	}
+	if asm == nil {
+		// No manager to claim the ownership gate through, so nothing can arbitrate. Same
+		// answer as any other no-verdict outcome.
+		return false, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+	}
+
+	outcome, stale := c.settleBoundRejectionGated(asm, sess)
+	switch outcome {
+	case mqttBoundServe:
+		return true, nil
+	case mqttBoundDisposed:
+		// The gate is released; the tail runs HERE, on the readLoop, in the graceful
+		// DISCONNECT branch's shape: notify, then close synchronously, then return so the
+		// next Read fails instead of parsing a queued packet against a disposed session.
+		// Doing it inline is also what keeps the ownership gate off socket I/O.
+		if stale != nil {
+			stale.mqttNotifyForeignDisposal(sess.id)
+			stale.closeConnection(DuplicateClientID)
+		}
+		return false, nil
+	case mqttBoundDisplaced:
+		// Whoever displaced this connection owns the notification. Close synchronously
+		// anyway — that path's close is asynchronous, and until it lands this readLoop
+		// would keep parsing packets against a session that is no longer ours. The Will is
+		// left exactly as it is: the displacing path already decided its fate.
+		c.closeConnection(DuplicateClientID)
+		return false, nil
+	}
+	return false, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+}
+
+// settleBoundRejectionGated is mqttGateDispatchOnRejection's gate-held half: it claims the
+// ownership gate, probes, and applies the verdict's STATE changes — everything that must
+// not race a CONNECT. It reports what was established, and, for a foreign verdict whose
+// disposal APPLIED, the stale client its caller must notify and close.
+//
+// The gate is claimed through lockSessionForTeardown, NOT plain lockSession, and the
+// difference is a Will-correctness one. A refusal does not say which competing operation
+// holds the gate: a CONNECT registers the client-ID gate long before it rebinds the session
+// (mqttProcessConnect holds it for its whole duration), and a resolver can hold it for a
+// session that stays OURS. Closing this connection on the bare refusal therefore ends it
+// while a takeover is still mid-flight — and mqttHandleClosedClient marks the Will owed
+// BEFORE it contends for the gate, so that takeover's later mqttDiscardWillOnTakeover finds
+// an already-owed Will, preserves it by its own too-late-to-cancel rule, and the close
+// publishes a Will the takeover was supposed to suppress.
+//
+// So a refusal is CLASSIFIED rather than assumed, on the same bounded spin the teardown
+// path uses for exactly this problem: it retries while this connection is still the
+// session's owner and gives up the moment the binding moves. Every holder is bounded (a
+// CONNECT rebinds early, a resolver by its JetStream timeouts), so the wait is bounded too.
+//
+//   - Acquired: the competing operation finished; probe normally.
+//   - REBOUND: a takeover owns this connection's fate now. Apply the takeover's own Will
+//     rule here — the identical call it makes a few lines later, so whichever side notices
+//     the displacement first applies the same rule and the other's is a no-op — and report
+//     displacement, which closes the connection without a packet.
+//   - Still ours after the spin: nothing is displacing us that we can see, so this is an
+//     ordinary no-verdict outcome and says 0x89.
+//
+// Runs on the client's readLoop. No lock held on entry. Performs JetStream requests.
+func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess *mqttSession) (mqttBoundSettlement, *client) {
+	if err := asm.lockSessionForTeardown(sess, c); err != nil {
+		sess.mu.Lock()
+		rebound := sess.c != c
+		sess.mu.Unlock()
+		if !rebound {
+			return mqttBoundUnsettled, nil
+		}
+		c.mqttDiscardWillOnTakeover()
+		return mqttBoundDisplaced, nil
+	}
+	defer asm.unlockSession(sess)
+
+	switch sess.settleRecordRejectionBound() {
+	case mqttRejectionOurs:
+		// The probe's CAS arbitrated ownership our way, and the advanced sequence retired
+		// the marker. This connection is served again from the fast path.
+		return mqttBoundServe, nil
+	case mqttRejectionForeign:
+		// Exactly what a local takeover does: an armed Will goes away with the connection
+		// the displacement closes, and one already owed NOW is not the takeover's to
+		// cancel. Before the disposal, so the disposal's own close cannot observe a Will
+		// still armed.
+		c.mqttDiscardWillOnTakeover()
+		stale, applied := sess.disposeForeignStateLocked(asm, c)
+		if !applied {
+			// The identity check refused: the session was rebound while this verdict was
+			// being reached, so the disposal — and the notification — are not ours.
+			return mqttBoundDisplaced, nil
+		}
+		return mqttBoundDisposed, stale
+	case mqttRejectionKeep:
+		// Nothing was arbitrated by the probe — but the fence it took may have been
+		// waiting on a writer whose save LANDED, which settles the question without any
+		// probe at all. Re-read the serve gate rather than the probe's licence: false
+		// means the marker was retired while we waited.
+		sess.mu.Lock()
+		still := sess.recordRejectionGatesServingLocked()
+		sess.mu.Unlock()
+		if still {
+			return mqttBoundUnsettled, nil
+		}
+		return mqttBoundServe, nil
+	default: // mqttRejectionUnresolved
+		// The probe's own write is ambiguous, so it established nothing either. Fail
+		// closed and let the uncertainty machinery — which now owns this session — reach
+		// a verdict on its own schedule.
+		return mqttBoundUnsettled, nil
+	}
+}
+
+// settleRecordRejectionBound is settleRecordRejection for a BOUND session, probing on that
+// session's own readLoop and returning the verdict RAW.
+//
+// It differs from the unbound settlement in two ways, both consequences of running on the
+// readLoop:
+//
+//   - the fence is taken in the BLOCKING form, as mqttProcessSubs does. This is an
+//     outermost readLoop entry point, so no transaction can be held on this goroutine, and
+//     an off-readLoop writer holding the fence is doing bounded JetStream work whose result
+//     the in-fence re-read must see. The unbound settlement cannot block: its caller may
+//     hold a transaction, and "not now" is a complete answer to a periodic pass.
+//   - a foreign verdict is NOT disposed here. The bound caller's disposal has a tail — the
+//     0x8E and the close — that must run off the ownership gate and on this readLoop, so
+//     sequencing it belongs to the caller.
+//
+// The caller holds the ownership gate, claimed as the bound client.
+//
+// No lock held on entry. Performs JetStream requests.
+func (sess *mqttSession) settleRecordRejectionBound() mqttRejectionVerdict {
+	// The same pre-fence window the unbound settlement fires, for the same reason: the
+	// caller's sample of the marker was taken without the fence that makes it sound. Fired
+	// here rather than inside probeRecordRejectionInTx because settleRecordRejection fires
+	// it itself, and one hook per window is what the tests key on.
+	sess.rejectionWindowHook(mqttRejectionWindowSettle)
+	tok := sess.beginRecordTx()
+	verdict := sess.probeRecordRejectionInTx(tok)
+	// Plain, never endRecordTxNewGeneration: on every arm but the landed one nothing was
+	// mutated, and the landed one is an ordinary save.
+	if terr := sess.endRecordTx(tok); terr != nil {
+		sess.jsa.c.Errorf("MQTT: %v", terr)
 	}
 	return verdict
 }

@@ -2,10 +2,16 @@ package mqtt
 
 import (
 	"errors"
+	"io"
+	"net"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 // testRejectionWait bounds the ONE intentionally asynchronous observation in this file
@@ -1207,4 +1213,1149 @@ func TestMQTTRejectedRecordPersistDropIsScoped(t *testing.T) {
 	if dropped.Load() == 0 {
 		t.Fatal("the seam never dropped an observation, so the fixture proved nothing")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// A BOUND session's settlement, before the packet is dispatched.
+// ---------------------------------------------------------------------------
+//
+// Every assertion here runs through a REAL SOCKET and through the readLoop's own
+// contract, and neither is decoration. A bare mqttParse call cannot see the two things
+// this feature is about: whether the connection was actually torn down (mqttParse only
+// enqueues the error DISCONNECT and returns — the shape of the defect that returned nil
+// mid-loop and closed nothing), and what the client was told before it was. A fixture
+// asserting on in-memory state alone passes against a broker that stops nothing.
+
+// testWireCapture is the client end of a bound connection: it records everything the
+// broker writes and blocks reads until the connection is closed.
+//
+// It replaces a net.Pipe plus a draining goroutine deliberately. net.Pipe is unbuffered,
+// so every PINGRESP, PUBACK and DISCONNECT the parse goroutine writes needs a concurrent
+// reader — and a reader that appends to a capture buffer records the bytes SOME TIME AFTER
+// the broker's Write returns, which makes every "the client was told X" assertion a race
+// the test loses at random. Capturing inside Write makes the record complete the moment
+// mqttParse returns. TestMQTTBoundRejectionNoReentryAfterForeign uses a real net.Pipe,
+// because what it asserts is socket behaviour rather than packet content.
+type testWireCapture struct {
+	mu     sync.Mutex
+	data   []byte
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (w *testWireCapture) Read(p []byte) (int, error) {
+	<-w.closed
+	return 0, io.EOF
+}
+
+func (w *testWireCapture) Write(p []byte) (int, error) {
+	select {
+	case <-w.closed:
+		return 0, io.ErrClosedPipe
+	default:
+	}
+	w.mu.Lock()
+	w.data = append(w.data, p...)
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+func (w *testWireCapture) Close() error {
+	w.once.Do(func() { close(w.closed) })
+	return nil
+}
+
+func (w *testWireCapture) LocalAddr() net.Addr                { return testWireAddr{} }
+func (w *testWireCapture) RemoteAddr() net.Addr               { return testWireAddr{} }
+func (w *testWireCapture) SetDeadline(t time.Time) error      { return nil }
+func (w *testWireCapture) SetReadDeadline(t time.Time) error  { return nil }
+func (w *testWireCapture) SetWriteDeadline(t time.Time) error { return nil }
+
+type testWireAddr struct{}
+
+func (testWireAddr) Network() string { return "pipe" }
+func (testWireAddr) String() string  { return "test" }
+
+func (w *testWireCapture) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.data...)
+}
+
+type testBoundConn struct {
+	*testRejectionEnv
+	bc  *client
+	out *testWireCapture
+}
+
+// bindSocket binds the env's session to a NEW client over a connection, as a completed
+// CONNECT leaves it: connectReceived set (mqttParse derives "connected" from that flag
+// alone, and without it every packet is refused before the gate is reached) and the
+// success CONNACK recorded, which is what licenses a server DISCONNECT at all.
+func (e *testRejectionEnv) bindSocket(t *testing.T, proto byte) *testBoundConn {
+	t.Helper()
+	out := &testWireCapture{closed: make(chan struct{})}
+
+	// mpay is the account max payload the publish path sizes messages against; leaving it
+	// at zero makes every PUBLISH fail with Quota Exceeded, which would let a "the packet
+	// was served" assertion pass on an ERROR ack.
+	bc := &client{srv: e.s, acc: e.s.globalAccount(), nrc: e.s.nrc, nc: out, rawConn: out,
+		mpay: 1024 * 1024}
+	bc.mqtt = &mqtt{
+		sess:  e.sess,
+		asm:   e.asm,
+		proto: proto,
+		pp:    &mqttPublish{},
+		cp:    &mqttConnectProto{},
+	}
+	bc.initClient()
+	bc.mu.Lock()
+	bc.flags.set(connectReceived)
+	bc.mu.Unlock()
+	bc.connAckWritten.Store(true)
+
+	e.sess.mu.Lock()
+	e.sess.c = bc
+	e.sess.mu.Unlock()
+
+	t.Cleanup(func() { _ = out.Close() })
+	return &testBoundConn{testRejectionEnv: e, bc: bc, out: out}
+}
+
+// armWill puts a Will on the connection, so a disposition assertion has something to
+// observe.
+func (b *testBoundConn) armWill() {
+	b.bc.mu.Lock()
+	b.bc.mqtt.cp.will = &mqttWill{topic: []byte("will/topic"), subject: []byte("will.topic"), message: []byte("bye")}
+	b.bc.mqtt.willDisposition = mqttWillArmed
+	b.bc.mu.Unlock()
+}
+
+// deliver hands a buffer to the parser THROUGH THE READLOOP'S CONTRACT
+// (shim_engine.go's readLoop): a parse error runs the close bookkeeping and closes the
+// connection. Reproducing it here rather than calling mqttParse directly is what makes
+// "the connection is closed" and "the teardown ran" real assertions.
+func (b *testBoundConn) deliver(t *testing.T, buf []byte) error {
+	t.Helper()
+	err := b.bc.mqttParse(buf)
+	if err != nil {
+		b.s.mqttHandleClosedClient(b.bc)
+		b.bc.closeConnection(ClientClosed)
+		return err
+	}
+	if b.closed() {
+		// The parse itself closed the connection (the foreign and displaced arms do),
+		// so the readLoop's very next Read fails and runs the same two calls. Without
+		// this the fixture would stop one step short of the teardown production
+		// performs.
+		b.s.mqttHandleClosedClient(b.bc)
+		b.bc.closeConnection(ClientClosed)
+	}
+	return nil
+}
+
+func (b *testBoundConn) closed() bool { return b.bc.closed.Load() }
+
+// testWirePacket is one control packet read back off the wire.
+type testWirePacket struct {
+	typ  byte
+	body []byte
+}
+
+// testParseWire splits the captured bytes into control packets. Scanning for a byte
+// pattern instead would match a reason code inside another packet's payload.
+func testParseWire(t *testing.T, data []byte) []testWirePacket {
+	t.Helper()
+	var pkts []testWirePacket
+	for i := 0; i < len(data); {
+		typ := data[i] & mqttPacketMask
+		i++
+		var pl, mult int
+		for {
+			if i >= len(data) {
+				t.Fatalf("truncated remaining length in captured bytes %x", data)
+			}
+			b := data[i]
+			i++
+			pl += int(b&0x7f) * (1 << mult)
+			if b&0x80 == 0 {
+				break
+			}
+			mult += 7
+		}
+		if i+pl > len(data) {
+			t.Fatalf("truncated packet body in captured bytes %x", data)
+		}
+		pkts = append(pkts, testWirePacket{typ: typ, body: data[i : i+pl]})
+		i += pl
+	}
+	return pkts
+}
+
+// sawPacket reports whether a packet of this type was written to the client.
+func (b *testBoundConn) sawPacket(t *testing.T, typ byte) bool {
+	t.Helper()
+	for _, p := range testParseWire(t, b.out.bytes()) {
+		if p.typ == typ {
+			return true
+		}
+	}
+	return false
+}
+
+// sawPubAckSuccess reports whether a SUCCESS PUBACK was written for this identifier. The
+// reason code matters: a Quota Exceeded or Not Authorized PUBACK is also a PUBACK, and a
+// bare packet-type check would read one as "the packet was served".
+func (b *testBoundConn) sawPubAckSuccess(t *testing.T, pi uint16) bool {
+	t.Helper()
+	for _, p := range testParseWire(t, b.out.bytes()) {
+		if p.typ != mqttPacketPubAck || len(p.body) < 2 {
+			continue
+		}
+		if uint16(p.body[0])<<8|uint16(p.body[1]) != pi {
+			continue
+		}
+		// The short form (no reason byte) is success; the long form carries it.
+		if len(p.body) == 2 || p.body[2] == mqttReasonSuccess {
+			return true
+		}
+	}
+	return false
+}
+
+// sawDisconnect reports whether a server DISCONNECT carrying this reason code was written.
+func (b *testBoundConn) sawDisconnect(t *testing.T, reason byte) bool {
+	t.Helper()
+	for _, p := range testParseWire(t, b.out.bytes()) {
+		if p.typ == mqttPacketDisconnect && len(p.body) > 0 && p.body[0] == reason {
+			return true
+		}
+	}
+	return false
+}
+
+// testBoundPublish builds a PUBLISH packet.
+func testBoundPublish(v5 bool, qos byte, pi uint16, topic, payload string) []byte {
+	body := newMQTTWriter(0)
+	body.WriteString(topic)
+	if qos > 0 {
+		body.WriteUint16(pi)
+	}
+	if v5 {
+		body.WriteByte(0) // no properties
+	}
+	body.Write([]byte(payload)) // the payload is raw, not length-prefixed
+	pkt := newMQTTWriter(0)
+	pkt.WriteByte(mqttPacketPub | (qos << 1))
+	pkt.WriteVarInt(body.Len())
+	pkt.Write(body.Bytes())
+	return pkt.Bytes()
+}
+
+// testBoundUnsub builds an UNSUBSCRIBE packet for one filter.
+func testBoundUnsub(v5 bool, pi uint16, filter string) []byte {
+	body := newMQTTWriter(0)
+	body.WriteUint16(pi)
+	if v5 {
+		body.WriteByte(0) // no properties
+	}
+	body.WriteString(filter)
+	pkt := newMQTTWriter(0)
+	pkt.WriteByte(mqttPacketUnsub | 0x02)
+	pkt.WriteVarInt(body.Len())
+	pkt.Write(body.Bytes())
+	return pkt.Bytes()
+}
+
+// watchDelivery subscribes to the NATS subject an MQTT topic fans out on, so "the PUBLISH
+// was actually routed" is observed rather than inferred from its ack. Counting messages on
+// $MQTT_msgs would prove nothing here: that stream is interest-retained, so a store with
+// no consumer succeeds and keeps nothing.
+func (e *testRejectionEnv) watchDelivery(t *testing.T, topic string) *nats.Subscription {
+	t.Helper()
+	sub, err := e.s.nrc.SubscribeSync(strings.ReplaceAll(topic, "/", "."))
+	if err != nil {
+		t.Fatalf("subscribe to the delivery subject: %v", err)
+	}
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush the subscription: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	return sub
+}
+
+// deliveryBarrier publishes a sentinel on the same subject and connection the broker's own
+// fan-out uses, then returns the FIRST message the watcher sees. One connection preserves
+// order, so a sentinel arriving first is proof the gated PUBLISH was never routed — an
+// absence check with no barrier would pass against a delivery that is merely slower than
+// the test.
+func (e *testRejectionEnv) deliveryBarrier(t *testing.T, sub *nats.Subscription, topic string) *nats.Msg {
+	t.Helper()
+	if err := e.s.nrc.Publish(strings.ReplaceAll(topic, "/", "."), []byte("barrier")); err != nil {
+		t.Fatalf("publish the barrier: %v", err)
+	}
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush the barrier: %v", err)
+	}
+	msg, err := sub.NextMsg(testRejectionWait)
+	if err != nil {
+		t.Fatalf("the barrier itself never arrived, so the fixture proved nothing: %v", err)
+	}
+	return msg
+}
+
+// TestMQTTBoundRejectionForeignStopsPublish is the reproduction the roadmap bullet
+// demanded, and the one nine review rounds of earlier attempts never had: the packet is a
+// QoS 1 PUBLISH, not a PINGREQ. Being served first is harmless for a PINGREQ, which is
+// exactly why every earlier test read past a settlement that ran AFTER the dispatch
+// switch; a PUBLISH routed and acked from a connection whose session another broker owns
+// cannot be taken back.
+//
+// The marker is armed the production way — a real remote takeover through a second
+// account session manager moves the subject, a real save is CAS-rejected by the stream,
+// and the persist notification that would otherwise evict the object is dropped.
+func TestMQTTBoundRejectionForeignStopsPublish(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		proto byte
+	}{
+		{"v5", mqttProtoLevel5},
+		{"3.1.1", mqttProtoLevel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := testNewRejectionEnv(t, "boundforeign")
+			e.dropPersistObservations(t, e.idHash)
+			b := e.bindSocket(t, tc.proto)
+			b.armWill()
+
+			e.remoteTakeover(t, "node2", "boundforeign")
+			e.rejectSave(t, e.sess)
+
+			watch := e.watchDelivery(t, "bound/foreign")
+			willWatch := e.watchDelivery(t, "will/topic")
+			if err := b.deliver(t, testBoundPublish(tc.proto == mqttProtoLevel5, 1, 1, "bound/foreign", "nope")); err != nil {
+				t.Fatalf("the foreign arm must return nil, as the DISCONNECT branch does: %v", err)
+			}
+
+			if b.sawPacket(t, mqttPacketPubAck) {
+				t.Fatal("a PUBLISH from a displaced connection must not be acked")
+			}
+			if msg := e.deliveryBarrier(t, watch, "bound/foreign"); string(msg.Data) != "barrier" {
+				t.Fatalf("the PUBLISH must not be routed: the watcher saw %q first", msg.Data)
+			}
+			if !b.closed() {
+				t.Fatal("a foreign verdict must close the connection [MQTT-3.1.4-3]")
+			}
+			if e.resident(e.sess) {
+				t.Fatal("a foreign verdict must evict the session object")
+			}
+			// The Will goes the way a local takeover's does: this connection is being
+			// displaced, and the displacement is not a Will publication trigger. Asserted
+			// as the SEMANTIC outcome — no publication — because the disposition field is
+			// mqttWillDischarged either way once the close bookkeeping's mqttHandleWill
+			// has consumed an owed Will, which is another layer's guarantee and would let
+			// a skipped takeover discard pass.
+			if msg := e.deliveryBarrier(t, willWatch, "will/topic"); string(msg.Data) != "barrier" {
+				t.Fatalf("the Will must not be published: the watcher saw %q first", msg.Data)
+			}
+			if tc.proto == mqttProtoLevel5 {
+				if !b.sawDisconnect(t, mqttReasonSessionTakenOver) {
+					t.Fatalf("a v5 client must be told 0x8E before the close: wire %x", b.out.bytes())
+				}
+			} else if len(b.out.bytes()) != 0 {
+				t.Fatalf("a 3.1.1 client has no server DISCONNECT: wire %x", b.out.bytes())
+			}
+		})
+	}
+}
+
+// TestMQTTBoundRejectionProbeLandsServesPacket is the causal pair's other half. Without
+// it, a broker that refused every packet after any rejection would pass the test above:
+// the claim is that a LANDED CAS — and only that — resumes service.
+func TestMQTTBoundRejectionProbeLandsServesPacket(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundlands")
+	b := e.bindSocket(t, mqttProtoLevel5)
+
+	// A contended rejection with the record left genuinely untouched: the probe that
+	// follows can therefore land.
+	restore := testForceContendedRejection(t, e.sess)
+	if err := testSessSave(t, e.sess); err == nil {
+		t.Fatal("the forced save must be rejected")
+	}
+	restore()
+	if !e.markerPending(e.sess) {
+		t.Fatal("the forced rejection must arm the marker")
+	}
+	seqBefore := func() uint64 {
+		e.sess.mu.Lock()
+		defer e.sess.mu.Unlock()
+		return e.sess.seq
+	}()
+
+	watch := e.watchDelivery(t, "bound/lands")
+	if err := b.deliver(t, testBoundPublish(true, 1, 3, "bound/lands", "served")); err != nil {
+		t.Fatalf("a landed probe must let the packet through: %v", err)
+	}
+	if !b.sawPubAckSuccess(t, 3) {
+		t.Fatalf("the packet must be served after the probe lands: wire %x", b.out.bytes())
+	}
+	if msg := e.deliveryBarrier(t, watch, "bound/lands"); string(msg.Data) != "served" {
+		t.Fatalf("the PUBLISH must be routed: the watcher saw %q first", msg.Data)
+	}
+	if b.closed() {
+		t.Fatal("a landed probe must leave the connection open")
+	}
+	e.sess.mu.Lock()
+	seqAfter, marker := e.sess.seq, e.sess.recordRejectedSeq
+	gates := e.sess.recordRejectionGatesServingLocked()
+	e.sess.mu.Unlock()
+	if seqAfter <= seqBefore {
+		t.Fatalf("the probe must have landed a save: seq %d -> %d", seqBefore, seqAfter)
+	}
+	if gates {
+		t.Fatalf("a landed CAS retires the marker: rejectedSeq=%d seq=%d", marker, seqAfter)
+	}
+}
+
+// testCountRejectionProbes counts SETTLEMENT ATTEMPTS at the pre-fence window hook, which
+// the bound settlement fires exactly once per probe. It is the right counter for "did the
+// settlement run at all?": counting record saves cannot answer that on any path where the
+// close bookkeeping saves too, and counting evictions cannot distinguish a settlement that
+// never ran from one that ran and kept the session.
+func testCountRejectionProbes(t *testing.T) (*atomic.Int64, func()) {
+	t.Helper()
+	var n atomic.Int64
+	restore := setMQTTTestRejectionWindowHook(func(_ *mqttSession, window string) {
+		if window == mqttRejectionWindowSettle {
+			n.Add(1)
+		}
+	})
+	return &n, restore
+}
+
+// TestMQTTBoundRejectionContendedFailsClosed pins the no-verdict rule: a probe that is
+// CONTENDED (10164 with the record demonstrably still at our base) establishes nothing,
+// and nothing is not permission. The connection closes with 0x89 — "try again later" —
+// rather than 0x8E, which would announce a takeover no evidence supports.
+func TestMQTTBoundRejectionContendedFailsClosed(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundcontend")
+	b := e.bindSocket(t, mqttProtoLevel5)
+
+	stop := testForceContendedRejection(t, e.sess)
+	if err := testSessSave(t, e.sess); err == nil {
+		t.Fatal("the forced save must be rejected")
+	}
+	if !e.markerPending(e.sess) {
+		t.Fatal("the forced rejection must arm the marker")
+	}
+
+	watch := e.watchDelivery(t, "bound/contend")
+	err := b.deliver(t, testBoundPublish(true, 1, 5, "bound/contend", "nope"))
+	if !errors.Is(err, errMQTTSessionOwnershipUnsettled) {
+		t.Fatalf("a contended probe must fail closed on the sentinel: %v", err)
+	}
+	if b.sawPubAckSuccess(t, 5) {
+		t.Fatal("no verdict is not permission: the packet must not be served")
+	}
+	if msg := e.deliveryBarrier(t, watch, "bound/contend"); string(msg.Data) != "barrier" {
+		t.Fatalf("the PUBLISH must not be routed: the watcher saw %q first", msg.Data)
+	}
+	if !b.closed() {
+		t.Fatal("a no-verdict outcome must close the connection")
+	}
+	if !b.sawDisconnect(t, mqttReasonServerBusy) {
+		t.Fatalf("a v5 client must be told 0x89, not 0x8E: wire %x", b.out.bytes())
+	}
+	if b.sawDisconnect(t, mqttReasonSessionTakenOver) {
+		t.Fatal("0x8E claims a takeover nothing proved")
+	}
+	if !e.markerPending(e.sess) {
+		t.Fatal("an unarbitrated question stays outstanding: the marker must still be armed")
+	}
+
+	// The retry path is the existing machinery, not this connection: with contention over
+	// and the session unbound, the periodic pass settles what the connection could not.
+	// While the forced 10164 is still installed every probe is necessarily Keep, so it
+	// must come off before this half means anything.
+	stop()
+	e.asm.reconcileResidentRecordState(e.s)
+	if e.markerPending(e.sess) {
+		t.Fatal("the periodic pass must settle the marker once the session unbinds")
+	}
+	if !e.resident(e.sess) {
+		t.Fatal("the probe lands on an untouched record, so the session stays ours")
+	}
+}
+
+// TestMQTTBoundRejectionUncertaintySuspendsProbe covers the conjunct the serve gate
+// deliberately does NOT share with the probe's licence. While a write of ours is
+// unresolved no probe is even possible — an unresolved session's save is refused at entry
+// — so a predicate that read "cannot probe" as "may serve" would serve every packet for as
+// long as the ambiguity lasted.
+func TestMQTTBoundRejectionUncertaintySuspendsProbe(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundsuspend")
+	b := e.bindSocket(t, mqttProtoLevel5)
+
+	// The positive control: this fixture answers a PINGREQ when nothing is outstanding.
+	// Without it, a broker that refused every packet would pass the assertions below.
+	if err := b.deliver(t, []byte{mqttPacketPing, 0}); err != nil {
+		t.Fatalf("the control PINGREQ must be served: %v", err)
+	}
+	if !b.sawPacket(t, mqttPacketPingResp) {
+		t.Fatalf("the control PINGREQ must be answered: wire %x", b.out.bytes())
+	}
+	pingResps := func() int {
+		n := 0
+		for _, p := range testParseWire(t, b.out.bytes()) {
+			if p.typ == mqttPacketPingResp {
+				n++
+			}
+		}
+		return n
+	}
+	before := pingResps()
+
+	stop := testForceContendedRejection(t, e.sess)
+	if err := testSessSave(t, e.sess); err == nil {
+		t.Fatal("the forced save must be rejected")
+	}
+	stop()
+	if !e.markerPending(e.sess) {
+		t.Fatal("the forced rejection must arm the marker")
+	}
+	// Another writer's ambiguity on top of the rejection: the store never reaches the
+	// stream, so the session is unresolved with its sequence still at the marker's base.
+	mqttTestSessStoreSuppressV.Store(true)
+	if err := testSessSave(t, e.sess); err == nil {
+		t.Fatal("the suppressed save must fail")
+	}
+	mqttTestSessStoreSuppressV.Store(false)
+	if !e.sess.isSeqUncertain() {
+		t.Fatal("the suppressed save must leave the session unresolved")
+	}
+
+	saves, restoreSaves := testCountSessSaves(t)
+	defer restoreSaves()
+	probes, restoreProbes := testCountRejectionProbes(t)
+	defer restoreProbes()
+
+	err := b.deliver(t, []byte{mqttPacketPing, 0})
+	if !errors.Is(err, errMQTTSessionOwnershipUnsettled) {
+		t.Fatalf("a suspended settlement must fail closed on the sentinel: %v", err)
+	}
+	if n := probes.Load(); n != 0 {
+		t.Fatalf("no probe is possible while the record is unresolved: %d attempts", n)
+	}
+	if n := saves.Load(); n != 0 {
+		t.Fatalf("a suspended settlement must attempt no record write at all: %d saves", n)
+	}
+	if pingResps() != before {
+		t.Fatalf("the PINGREQ must not be served: wire %x", b.out.bytes())
+	}
+	if !b.closed() || !b.sawDisconnect(t, mqttReasonServerBusy) {
+		t.Fatalf("the connection must close with 0x89: closed=%v wire %x", b.closed(), b.out.bytes())
+	}
+	e.sess.mu.Lock()
+	parked := e.sess.deferredDisconnect != nil
+	e.sess.mu.Unlock()
+	if !parked {
+		t.Fatal("a close on an unresolved session must park its obligations for the resolver")
+	}
+}
+
+// TestMQTTBoundRejectionGatesPerPacket is why the check lives inside the packet loop and
+// not at mqttParse's entry. TCP does not preserve write boundaries, so two packets
+// routinely arrive in one read — and the FIRST one's own record save is one of the ways
+// the marker gets armed in production. An entry check samples the marker before that
+// happened and serves the second packet unarbitrated.
+func TestMQTTBoundRejectionGatesPerPacket(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundcoalesced")
+	e.dropPersistObservations(t, e.idHash)
+	b := e.bindSocket(t, mqttProtoLevel5)
+	// The UNSUBSCRIBE must actually change something, or the session never saves and the
+	// marker is never armed: sess.update persists only a real membership change.
+	e.sess.mu.Lock()
+	e.sess.subs = map[string]byte{"bound.gone": 0} // membership is keyed by NATS subject
+	e.sess.mu.Unlock()
+	e.remoteTakeover(t, "node2", "boundcoalesced")
+
+	probes, restoreProbes := testCountRejectionProbes(t)
+	defer restoreProbes()
+	watch := e.watchDelivery(t, "bound/coalesced")
+
+	// One buffer, two packets: an UNSUBSCRIBE whose record save the moved subject rejects
+	// (v5 reports that per filter and still answers, so the packet itself completes and
+	// the marker is armed centrally), then a QoS 1 PUBLISH that must be gated.
+	buf := append(testBoundUnsub(true, 9, "bound/gone"),
+		testBoundPublish(true, 1, 11, "bound/coalesced", "nope")...)
+	if err := b.deliver(t, buf); err != nil {
+		t.Fatalf("the foreign arm must return nil: %v", err)
+	}
+
+	if !b.sawPacket(t, mqttPacketUnsubAck) {
+		t.Fatalf("the first packet must have completed, or the fixture proves nothing: wire %x", b.out.bytes())
+	}
+	if n := probes.Load(); n != 1 {
+		t.Fatalf("the second packet must settle the marker the first one armed: %d probes", n)
+	}
+	if b.sawPubAckSuccess(t, 11) {
+		t.Fatal("the second packet in the same buffer must be gated")
+	}
+	if msg := e.deliveryBarrier(t, watch, "bound/coalesced"); string(msg.Data) != "barrier" {
+		t.Fatalf("the second packet must not be routed: the watcher saw %q first", msg.Data)
+	}
+	if !b.closed() || e.resident(e.sess) {
+		t.Fatalf("the foreign verdict must close and evict: closed=%v resident=%v", b.closed(), e.resident(e.sess))
+	}
+}
+
+// TestMQTTBoundRejectionGatesPingReq pins the packet type every earlier attempt used as its
+// only test — and exempting it would be tempting, since a PINGREQ routes nothing. It is
+// gated because it is what BOUNDS convergence: a conformant client sends one within its
+// keepalive, so an otherwise silent displaced connection still closes.
+func TestMQTTBoundRejectionGatesPingReq(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundping")
+	e.dropPersistObservations(t, e.idHash)
+	b := e.bindSocket(t, mqttProtoLevel5)
+	e.remoteTakeover(t, "node2", "boundping")
+	e.rejectSave(t, e.sess)
+
+	if err := b.deliver(t, []byte{mqttPacketPing, 0}); err != nil {
+		t.Fatalf("the foreign arm must return nil: %v", err)
+	}
+	if b.sawPacket(t, mqttPacketPingResp) {
+		t.Fatalf("a PINGREQ must be gated too: wire %x", b.out.bytes())
+	}
+	if !b.sawDisconnect(t, mqttReasonSessionTakenOver) || !b.closed() || e.resident(e.sess) {
+		t.Fatalf("the settlement must run on a PINGREQ: closed=%v resident=%v wire %x",
+			b.closed(), e.resident(e.sess), b.out.bytes())
+	}
+}
+
+// TestMQTTBoundRejectionDisconnectExempt pins the one packet type the gate must never
+// refuse. A DISCONNECT routes nothing and acks nothing; what it carries is the client's own
+// instruction about its Will and the teardown that ENDS the split-brain. Fail-closed on it
+// would manufacture a Will publication the client explicitly forbade — from a session that
+// may well still be ours — and would refuse the packet that converges the very condition
+// the gate exists for.
+func TestMQTTBoundRejectionDisconnectExempt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		packet    []byte
+		published bool
+	}{
+		{"normal DISCONNECT discards the Will", []byte{mqttPacketDisconnect, 0}, false},
+		{"reason 0x04 publishes it", []byte{mqttPacketDisconnect, 1, mqttReasonDisconnectWithWill}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := testNewRejectionEnv(t, "bounddisc")
+			e.dropPersistObservations(t, e.idHash)
+			b := e.bindSocket(t, mqttProtoLevel5)
+			b.armWill()
+			e.remoteTakeover(t, "node2", "bounddisc")
+			e.rejectSave(t, e.sess)
+
+			probes, restore := testCountRejectionProbes(t)
+			defer restore()
+			watch := e.watchDelivery(t, "will/topic")
+
+			if err := b.deliver(t, tc.packet); err != nil {
+				t.Fatalf("a DISCONNECT must be dispatched, not refused: %v", err)
+			}
+			if n := probes.Load(); n != 0 {
+				t.Fatalf("a DISCONNECT must not be gated: %d probes", n)
+			}
+			if !b.closed() {
+				t.Fatal("a DISCONNECT tears the connection down")
+			}
+			if b.sawDisconnect(t, mqttReasonServerBusy) || b.sawDisconnect(t, mqttReasonSessionTakenOver) {
+				t.Fatalf("a client that said goodbye is told nothing: wire %x", b.out.bytes())
+			}
+			// The SEMANTIC outcome, not the disposition field: this same dispatch runs
+			// mqttHandleClosedClient, whose mqttHandleWill consumes an owed Will on the
+			// spot, so both variants end at mqttWillDischarged.
+			msg := e.deliveryBarrier(t, watch, "will/topic")
+			if published := string(msg.Data) == "bye"; published != tc.published {
+				t.Fatalf("Will published=%v, want %v (watcher saw %q first)", published, tc.published, msg.Data)
+			}
+		})
+	}
+}
+
+// TestMQTTBoundRejectionGateRefused covers the claim being REFUSED, which is two different
+// facts wearing one error and must not be collapsed into one answer.
+//
+// A CONNECT registers the shared client-ID gate for its whole duration and rebinds the
+// session only part-way through, and a resolver can hold the gate for a session that stays
+// OURS. So the settlement retries while this connection is still the owner and classifies
+// the outcome:
+//
+//   - still ours when the bounded spin gives up: nothing observable is displacing us, so
+//     this is an ordinary no-verdict outcome and says 0x89;
+//   - REBOUND: a takeover owns this connection's fate. It is told nothing (the takeover
+//     sends its own 0x8E, and a courtesy 0x89 would contradict it on the same socket), and
+//     its Will is settled by the takeover's own rule rather than by the close bookkeeping —
+//     which marks a Will OWED before it contends for the gate, so an early close would
+//     otherwise publish a Will the takeover was about to discard.
+func TestMQTTBoundRejectionGateRefused(t *testing.T) {
+	t.Run("held but still ours: 0x89", func(t *testing.T) {
+		e := testNewRejectionEnv(t, "boundgateheld")
+		e.dropPersistObservations(t, e.idHash)
+		b := e.bindSocket(t, mqttProtoLevel5)
+		e.remoteTakeover(t, "node2", "boundgateheld")
+		e.rejectSave(t, e.sess)
+
+		// The gate is held by an operation that is NOT displacing this connection — a
+		// resolver, or a CONNECT that has not rebound yet.
+		e.asm.mu.Lock()
+		e.asm.sessLocked[e.sess.id] = struct{}{}
+		// The close bookkeeping retries the teardown claim for as long as this connection
+		// is still the session's owner, so a fixture that never released would hang by
+		// construction. Release from the seam that fires before that loop.
+		var released atomic.Bool
+		e.asm.testBeforeTeardownLock = func(string) {
+			if released.CompareAndSwap(false, true) {
+				e.asm.mu.Lock()
+				delete(e.asm.sessLocked, e.sess.id)
+				e.asm.mu.Unlock()
+			}
+		}
+		e.asm.mu.Unlock()
+		defer func() {
+			e.asm.mu.Lock()
+			delete(e.asm.sessLocked, e.sess.id)
+			e.asm.mu.Unlock()
+		}()
+
+		probes, restore := testCountRejectionProbes(t)
+		defer restore()
+
+		err := b.deliver(t, []byte{mqttPacketPing, 0})
+		if !errors.Is(err, errMQTTSessionOwnershipUnsettled) {
+			t.Fatalf("a gate held by something that is not displacing us is a no-verdict "+
+				"outcome, not a displacement: %v", err)
+		}
+		if n := probes.Load(); n != 0 {
+			t.Fatalf("a refused claim probes nothing: %d probes", n)
+		}
+		if !released.Load() {
+			t.Fatal("the close bookkeeping never ran, so the fixture proved nothing")
+		}
+		if b.sawPacket(t, mqttPacketPingResp) {
+			t.Fatalf("the packet must not be served: wire %x", b.out.bytes())
+		}
+		if !b.closed() || !b.sawDisconnect(t, mqttReasonServerBusy) {
+			t.Fatalf("the connection must close with 0x89: closed=%v wire %x", b.closed(), b.out.bytes())
+		}
+	})
+
+	t.Run("held then released: the settlement waits and probes", func(t *testing.T) {
+		e := testNewRejectionEnv(t, "boundgatewait")
+		b := e.bindSocket(t, mqttProtoLevel5)
+
+		stop := testForceContendedRejection(t, e.sess)
+		if err := testSessSave(t, e.sess); err == nil {
+			t.Fatal("the forced save must be rejected")
+		}
+		stop()
+		if !e.markerPending(e.sess) {
+			t.Fatal("the forced rejection must arm the marker")
+		}
+
+		// A competing operation holds the gate briefly and leaves the session ours. The
+		// settlement must WAIT it out rather than read "could not ask" as a verdict:
+		// giving up immediately would close a healthy connection over contention that was
+		// about to clear.
+		e.asm.mu.Lock()
+		e.asm.sessLocked[e.sess.id] = struct{}{}
+		e.asm.mu.Unlock()
+		go func() {
+			time.Sleep(2 * mqttTeardownLockItvl)
+			e.asm.mu.Lock()
+			delete(e.asm.sessLocked, e.sess.id)
+			e.asm.mu.Unlock()
+		}()
+
+		if err := b.deliver(t, testBoundPublish(true, 1, 51, "bound/gatewait", "served")); err != nil {
+			t.Fatalf("the settlement must wait for the gate and probe: %v", err)
+		}
+		if !b.sawPubAckSuccess(t, 51) {
+			t.Fatalf("the probe lands once the gate clears, so the packet is served: wire %x", b.out.bytes())
+		}
+		if b.closed() {
+			t.Fatal("transient contention must not close a connection whose probe then lands")
+		}
+	})
+
+	t.Run("rebound by a takeover: silent, and the Will is the takeover's", func(t *testing.T) {
+		e := testNewRejectionEnv(t, "boundrebound")
+		e.dropPersistObservations(t, e.idHash)
+		b := e.bindSocket(t, mqttProtoLevel5)
+		b.armWill()
+		e.remoteTakeover(t, "node2", "boundrebound")
+		e.rejectSave(t, e.sess)
+
+		// A local CONNECT mid-takeover: it holds the gate for its whole duration and has
+		// already rebound the session, but has NOT yet reached its own Will discard.
+		newConn := &client{srv: e.s, acc: e.s.globalAccount(), nrc: e.s.nrc}
+		newConn.mqtt = &mqtt{sess: e.sess, asm: e.asm, proto: mqttProtoLevel5, pp: &mqttPublish{}, cp: &mqttConnectProto{}}
+		e.asm.mu.Lock()
+		e.asm.sessLocked[e.sess.id] = struct{}{}
+		e.asm.mu.Unlock()
+		e.sess.mu.Lock()
+		e.sess.c = newConn
+		e.sess.mu.Unlock()
+		defer func() {
+			e.asm.mu.Lock()
+			delete(e.asm.sessLocked, e.sess.id)
+			e.asm.mu.Unlock()
+		}()
+
+		probes, restore := testCountRejectionProbes(t)
+		defer restore()
+		willWatch := e.watchDelivery(t, "will/topic")
+
+		start := time.Now()
+		if err := b.deliver(t, []byte{mqttPacketPing, 0}); err != nil {
+			t.Fatalf("a displaced connection is closed, not errored: %v", err)
+		}
+		// The rebind is observed on the first attempt, so this must not sit out the
+		// bounded spin.
+		if waited := time.Since(start); waited > mqttTeardownLockAttempts*mqttTeardownLockItvl/2 {
+			t.Fatalf("a rebind must be observed immediately, not waited out: took %v", waited)
+		}
+		if n := probes.Load(); n != 0 {
+			t.Fatalf("a refused claim probes nothing: %d probes", n)
+		}
+		if b.sawPacket(t, mqttPacketPingResp) {
+			t.Fatalf("the packet must not be served: wire %x", b.out.bytes())
+		}
+		if !b.closed() {
+			t.Fatal("the connection must be closed")
+		}
+		if len(b.out.bytes()) != 0 {
+			t.Fatalf("a displaced connection must be told nothing at all: wire %x", b.out.bytes())
+		}
+		// The Will is the takeover's to decide, and its rule is to discard an armed one.
+		// Without this the close bookkeeping would have marked it OWED before contending
+		// for the gate, and the takeover's later discard preserves an owed Will by design
+		// — so the Will of a connection a takeover displaced would be published.
+		if msg := e.deliveryBarrier(t, willWatch, "will/topic"); string(msg.Data) != "barrier" {
+			t.Fatalf("a displaced connection's armed Will must not be published: the "+
+				"watcher saw %q first", msg.Data)
+		}
+	})
+}
+
+// TestMQTTBoundRejectionDisplacedSaysNothing is the same rule against the path that
+// actually races this gate in production, and the one that does not even take the
+// ownership gate: processSessionPersist evicts the session, clears sess.c, enqueues its own
+// 0x8E and closes ASYNCHRONOUSLY.
+//
+// Two orderings, and the second is the one with teeth. Waiting for the eviction to become
+// visible usually waits past its close too — the close marks the client closed before it
+// touches the socket, and testWireCapture then rejects every later write — so in that
+// state a gate arm that closed nothing, or that wrote an extra DISCONNECT, would look
+// exactly like a correct one. The second subtest therefore stages the state the eviction
+// leaves BEFORE its close lands, using the production halves of that tail, and owns the
+// window.
+func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
+	t.Run("after the eviction completed", func(t *testing.T) {
+		e := testNewRejectionEnv(t, "bounddisplaced")
+		b := e.bindSocket(t, mqttProtoLevel5)
+
+		// The persist observation is NOT dropped here: this is the delivered-notification
+		// ordering, which is the common one — the same remote save both moves the record
+		// (arming the marker through the rejected save below) and notifies this broker.
+		e.remoteTakeover(t, "node2", "bounddisplaced")
+		e.rejectSave(t, e.sess)
+
+		// Asynchronous by design: the observation is a core-NATS delivery, so this is a
+		// bounded poll, the same shape TestMQTTRejectedRecordNotificationDelivered uses.
+		deadline := time.Now().Add(testRejectionWait)
+		for {
+			e.sess.mu.Lock()
+			bound := e.sess.c
+			e.sess.mu.Unlock()
+			if bound == nil && !e.resident(e.sess) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the persist observation must evict the displaced local session")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !b.sawDisconnect(t, mqttReasonSessionTakenOver) {
+			t.Fatalf("the eviction must have told the client 0x8E: wire %x", b.out.bytes())
+		}
+
+		// What this ordering can still show: the gate refuses to SERVE, and answers with
+		// no error — a sentinel here would have appended 0x89 to that 0x8E.
+		if err := b.deliver(t, testBoundPublish(true, 1, 41, "bound/displaced", "nope")); err != nil {
+			t.Fatalf("a displaced connection is closed, not errored: %v", err)
+		}
+		if b.sawPubAckSuccess(t, 41) {
+			t.Fatal("a displaced connection must not be served")
+		}
+		if b.sawDisconnect(t, mqttReasonServerBusy) {
+			t.Fatalf("0x89 must not follow the takeover's 0x8E: wire %x", b.out.bytes())
+		}
+	})
+
+	t.Run("inside the eviction's enqueue-to-close window", func(t *testing.T) {
+		e := testNewRejectionEnv(t, "boundwindowdisp")
+		e.dropPersistObservations(t, e.idHash)
+		b := e.bindSocket(t, mqttProtoLevel5)
+		e.remoteTakeover(t, "node2", "boundwindowdisp")
+		e.rejectSave(t, e.sess)
+
+		// The two production halves of the eviction's tail, without its `go
+		// closeConnection`: the session evicted and detached, the takeover DISCONNECT
+		// already on the wire, the socket still open. That is the instant the displaced
+		// readLoop can reach this gate in.
+		stale, applied := e.sess.disposeForeignStateLocked(e.asm, nil)
+		if !applied || stale != b.bc {
+			t.Fatalf("the fixture must stage the eviction's own state: applied=%v stale=%p", applied, stale)
+		}
+		stale.mqttNotifyForeignDisposal(e.sess.id)
+		if !b.sawDisconnect(t, mqttReasonSessionTakenOver) {
+			t.Fatalf("the staged eviction must have written 0x8E: wire %x", b.out.bytes())
+		}
+		if b.closed() {
+			t.Fatal("the window this test exists for is the one BEFORE the close: it is already shut")
+		}
+		before := len(testParseWire(t, b.out.bytes()))
+
+		if err := b.deliver(t, testBoundPublish(true, 1, 43, "bound/windowdisp", "nope")); err != nil {
+			t.Fatalf("a displaced connection is closed, not errored: %v", err)
+		}
+		if b.sawPubAckSuccess(t, 43) {
+			t.Fatal("a displaced connection must not be served")
+		}
+		if !b.closed() {
+			t.Fatal("the gate must close a displaced connection itself: the eviction's own " +
+				"close is asynchronous, and until it lands this readLoop keeps parsing")
+		}
+		if after := len(testParseWire(t, b.out.bytes())); after != before {
+			t.Fatalf("nothing may follow the takeover DISCONNECT: %d packets became %d (wire %x)",
+				before, after, b.out.bytes())
+		}
+	})
+}
+
+// TestMQTTBoundRejectionKeepRetiredInWindow and its sibling below pin the two ways a
+// post-fence Keep can end. Between the caller's pre-gate sample of the marker and the fence
+// that makes a sample sound, another writer can land a save — which settles the ownership
+// question without any probe at all. The re-read after the fence is what notices, and it
+// re-reads the SERVE GATE rather than the probe's licence.
+func TestMQTTBoundRejectionKeepRetiredInWindow(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundwindowlands")
+	b := e.bindSocket(t, mqttProtoLevel5)
+
+	stop := testForceContendedRejection(t, e.sess)
+	if err := testSessSave(t, e.sess); err == nil {
+		t.Fatal("the forced save must be rejected")
+	}
+	stop()
+	if !e.markerPending(e.sess) {
+		t.Fatal("the forced rejection must arm the marker")
+	}
+
+	saves, restoreSaves := testCountSessSaves(t)
+	defer restoreSaves()
+	var once atomic.Bool
+	restoreWindow := setMQTTTestRejectionWindowHook(func(sess *mqttSession, window string) {
+		if window != mqttRejectionWindowSettle || sess != e.sess || !once.CompareAndSwap(false, true) {
+			return
+		}
+		// A save LANDS in the window, moving the sequence past the marker's base.
+		if err := testSessSave(t, sess); err != nil {
+			t.Errorf("the in-window save must land: %v", err)
+		}
+	})
+	defer restoreWindow()
+
+	if err := b.deliver(t, testBoundPublish(true, 1, 21, "bound/window", "served")); err != nil {
+		t.Fatalf("a retired marker must let the packet through: %v", err)
+	}
+	if !once.Load() {
+		t.Fatal("the window never fired, so the fixture proved nothing")
+	}
+	if !b.sawPubAckSuccess(t, 21) {
+		t.Fatalf("the packet must be served: wire %x", b.out.bytes())
+	}
+	if b.closed() {
+		t.Fatal("nothing was outstanding by the time the fence was held: the connection stays")
+	}
+	// Exactly the in-window save: the in-fence re-read found nothing pending, so the probe
+	// itself never ran. Two saves would mean the settlement probed anyway.
+	if n := saves.Load(); n != 1 {
+		t.Fatalf("the probe must be skipped once the marker is retired: %d record saves", n)
+	}
+}
+
+// TestMQTTBoundRejectionKeepSuspendedInWindow is the other post-fence Keep: what landed in
+// the window was an AMBIGUITY, not a save. The probe is impossible and the question is
+// still outstanding, so the same Keep verdict must fail closed here — which is exactly why
+// the re-read cannot be the probe's licence, whose third conjunct this case clears.
+func TestMQTTBoundRejectionKeepSuspendedInWindow(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundwindowuncertain")
+	b := e.bindSocket(t, mqttProtoLevel5)
+
+	stop := testForceContendedRejection(t, e.sess)
+	if err := testSessSave(t, e.sess); err == nil {
+		t.Fatal("the forced save must be rejected")
+	}
+	stop()
+	if !e.markerPending(e.sess) {
+		t.Fatal("the forced rejection must arm the marker")
+	}
+
+	var once atomic.Bool
+	restoreWindow := setMQTTTestRejectionWindowHook(func(sess *mqttSession, window string) {
+		if window != mqttRejectionWindowSettle || sess != e.sess || !once.CompareAndSwap(false, true) {
+			return
+		}
+		mqttTestSessStoreSuppressV.Store(true)
+		if err := testSessSave(t, sess); err == nil {
+			t.Error("the suppressed in-window save must fail")
+		}
+		mqttTestSessStoreSuppressV.Store(false)
+	})
+	defer restoreWindow()
+
+	err := b.deliver(t, testBoundPublish(true, 1, 23, "bound/windowu", "nope"))
+	if !errors.Is(err, errMQTTSessionOwnershipUnsettled) {
+		t.Fatalf("an ambiguity in the window must fail closed on the sentinel: %v", err)
+	}
+	if !once.Load() {
+		t.Fatal("the window never fired, so the fixture proved nothing")
+	}
+	if b.sawPubAckSuccess(t, 23) {
+		t.Fatal("the packet must not be served")
+	}
+	if !b.closed() || !b.sawDisconnect(t, mqttReasonServerBusy) {
+		t.Fatalf("the connection must close with 0x89: closed=%v wire %x", b.closed(), b.out.bytes())
+	}
+	e.sess.mu.Lock()
+	parked := e.sess.deferredDisconnect != nil
+	e.sess.mu.Unlock()
+	if !parked {
+		t.Fatal("a close on an unresolved session must park its obligations")
+	}
+}
+
+// TestMQTTBoundRejectionNoReentryAfterForeign runs the REAL readLoop, because what it
+// asserts is the shape of the foreign arm's tail rather than the content of a packet: the
+// 0x8E is written and the connection CLOSED before mqttParse returns, so the loop's next
+// Read fails instead of parsing whatever the client sent next.
+//
+// Closing asynchronously — the shape every off-readLoop disposal caller uses, and which
+// this arm deliberately does not — would let the loop re-enter and turn a queued packet
+// into a second, contradictory DISCONNECT (0x89 "try again later" after 0x8E "taken
+// over"), or close the socket before the 0x8E reached the client at all.
+//
+// The second packet is staged ACROSS THE SOCKET rather than appended to the first buffer:
+// the foreign arm returns nil from mid-parse, so a same-buffer remainder is discarded
+// whichever way the tail closes, and would discriminate nothing.
+func TestMQTTBoundRejectionNoReentryAfterForeign(t *testing.T) {
+	e := testNewRejectionEnv(t, "boundnoreentry")
+	e.dropPersistObservations(t, e.idHash)
+
+	brokerSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	// rawConn is what closeConnection closes; a fixture that left it unwired would show a
+	// connection that never dies no matter which tail ran.
+	bc := &client{srv: e.s, acc: e.s.globalAccount(), nrc: e.s.nrc, nc: brokerSide, rawConn: brokerSide,
+		mpay: 1024 * 1024}
+	bc.mqtt = &mqtt{sess: e.sess, asm: e.asm, proto: mqttProtoLevel5, pp: &mqttPublish{}, cp: &mqttConnectProto{}}
+	bc.initClient()
+	bc.mu.Lock()
+	bc.flags.set(connectReceived)
+	bc.mu.Unlock()
+	bc.connAckWritten.Store(true)
+	e.sess.mu.Lock()
+	e.sess.c = bc
+	e.sess.mu.Unlock()
+
+	e.remoteTakeover(t, "node2", "boundnoreentry")
+	e.rejectSave(t, e.sess)
+
+	e.s.clientWG.Add(1) // readLoop's defer releases the lifecycle token
+	go bc.readLoop(nil)
+
+	_ = clientSide.SetWriteDeadline(time.Now().Add(testRejectionWait))
+	if _, err := clientSide.Write(testBoundPublish(true, 1, 31, "bound/noreentry", "nope")); err != nil {
+		t.Fatalf("write the triggering PUBLISH: %v", err)
+	}
+
+	// Read until the takeover DISCONNECT arrives.
+	var seen []byte
+	deadline := time.Now().Add(testRejectionWait)
+	buf := make([]byte, 256)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("no 0x8E arrived before the connection went away: read %x", seen)
+		}
+		_ = clientSide.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := clientSide.Read(buf)
+		seen = append(seen, buf[:n]...)
+		if mqttTestSawDisconnect(t, seen, mqttReasonSessionTakenOver) {
+			break
+		}
+		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("the connection was closed before the 0x8E: read %x (%v)", seen, err)
+		}
+	}
+
+	// The connection is closed by the time mqttParse returns, so a client that keeps
+	// talking is severed rather than served. With an asynchronous close the readLoop can
+	// be back in Read, and this write is accepted and parsed.
+	_ = clientSide.SetWriteDeadline(time.Now().Add(testRejectionWait))
+	if _, err := clientSide.Write(testBoundPublish(true, 1, 33, "bound/noreentry", "again")); err == nil {
+		t.Fatal("a packet sent after the 0x8E must not be accepted: the connection is closed")
+	}
+
+	_ = clientSide.SetReadDeadline(time.Now().Add(time.Second))
+	for {
+		n, err := clientSide.Read(buf)
+		seen = append(seen, buf[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	if mqttTestSawDisconnect(t, seen, mqttReasonServerBusy) {
+		t.Fatalf("a second DISCONNECT contradicting the first: read %x", seen)
+	}
+}
+
+// mqttTestSawDisconnect reports whether the bytes read so far contain a complete server
+// DISCONNECT with this reason code. Tolerates a trailing partial packet.
+func mqttTestSawDisconnect(t *testing.T, data []byte, reason byte) bool {
+	t.Helper()
+	for i := 0; i < len(data); {
+		typ := data[i] & mqttPacketMask
+		i++
+		var pl, mult int
+		for {
+			if i >= len(data) {
+				return false
+			}
+			b := data[i]
+			i++
+			pl += int(b&0x7f) * (1 << mult)
+			if b&0x80 == 0 {
+				break
+			}
+			mult += 7
+		}
+		if i+pl > len(data) {
+			return false
+		}
+		if typ == mqttPacketDisconnect && pl > 0 && data[i] == reason {
+			return true
+		}
+		i += pl
+	}
+	return false
 }

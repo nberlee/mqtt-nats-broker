@@ -1229,50 +1229,124 @@ is fixed before feature work continues.
   consecutive regressions in it (next bullet); the unbound design was untouched by all
   of them. Residuals in `docs/CONFORMANCE.md`: convergence is bounded by the next PASS
   that reaches the session — a serial unbudgeted walk, so the honest bound carries its
-  backlog term, not "one interval"; a BOUND session is not settled until it unbinds;
+  backlog term, not "one interval"; a BOUND session was not settled until it unbinds
+  (closed by the next bullet);
   sustained contention holds the object at one probe per pass; the marker is
   memory-only; the record is not a liveness lease; protection is per owning broker and
   behaviourally asymmetric during a rolling upgrade although wire-symmetric; and the
   deferred close's "loses restart-survival of the deadline" residual is NARROWED — a
   landed probe repairs it, a contended one does not.
 
-- [ ] Converge a BOUND session's record-CAS rejection: close the split-brain
+- [x] Converge a BOUND session's record-CAS rejection: close the split-brain
   [MQTT-3.1.4-3] requires, without the four defects nine review rounds found in
-  successive attempts. A mid-connection save rejected by a remote takeover leaves this
-  broker serving a client against a session another broker owns, and the shipped
-  settlement above is deliberately unbound-only: its ownership gate is the same one a
-  concurrent SUBSCRIBE claims, so taking it for a live connection turns that packet into
-  an error and closes the connection. A settlement on the session's own readLoop is the
-  shape that works, and it has to answer three questions the unbound one never faces.
-  **Every attempt in rounds 6-9 failed on one of them, and the record of those failures
-  is the value of this bullet:**
-  1. **WHERE it runs.** After the packet dispatch switch, a marker already armed lets the
-     triggering packet take effect first — a QoS 1 PUBLISH is routed and acknowledged
-     from a displaced connection, which nothing can retract. It must run BEFORE
-     dispatch. (Every earlier test used PINGREQ, where being served first is harmless,
-     which is why eight plan rounds and five holistic rounds read past it.)
-  2. **What "no verdict" means.** Serving on anything short of positive arbitration is the
-     hole; a refused ownership claim and an in-memory `sess.c == c` are NOT evidence,
-     since after a rejection the durable record may already be another broker's. But a
-     probe licence is a rate limit on PROBING and must not double as the gate for
-     SERVING: gating on it serves every packet between a contended probe and the next
-     re-licence. `pending` (is an ownership question outstanding?) and `owed` (may I
-     probe again?) are different facts and were conflated.
-  3. **How the connection actually ends.** A stop that merely returns from `mqttParse`
-     closes nothing: the readLoop keeps reading, the session stays bound, the client's
-     packets are silently dropped, and — because the early return skips the deadline
-     restoration at the bottom of `mqttParse` — keepalive enforcement is DISABLED, so a
-     silent client is never timed out. A graceful DISCONNECT stopped that way never runs
-     its Will-discard branch either, so the later EOF cleanup can publish a Will that
-     should have been suppressed. Any design needs a real teardown path (dispose or
-     close), deadline restoration on every exit, and preserved DISCONNECT semantics
-     including MQTT 5 reason 0x04.
-  Also settled by those rounds, and worth keeping: a foreign verdict must discard the Will
-  as a local takeover does (or the close bookkeeping publishes one for a client that
-  reconnected elsewhere) and must stop the loop in the DISCONNECT branch's shape
-  (`return nil`), because the parse-error footer runs INSIDE `mqttParse` and would send a
-  second DISCONNECT. Needs its own plan; the CONNECT-starvation bound and the teardown
-  path should be designed up front rather than added per round.
+  successive attempts. **Done.** The settlement is made by the displaced connection's
+  OWN readLoop (`mqttGateDispatchOnRejection`, `sess_rejected_write.go`), from
+  `mqttParse`'s per-packet loop, BEFORE the dispatch switch: it claims the ownership gate
+  as the bound client — the claim a SUBSCRIBE makes, so it never fails one — takes the
+  record fence in its blocking form, and probes. Only a LANDED CAS lets the packet
+  through; the three non-serving outcomes are distinct. **Foreign**: discard the Will as a
+  local takeover does, dispose the session state under the gate, then write 0x8E and close
+  SYNCHRONOUSLY on the readLoop before returning nil (the graceful-DISCONNECT branch's
+  shape). **Unsettled** (contended, unreadable, ambiguous, or suspended by an unresolved
+  write): fail closed with `errMQTTSessionOwnershipUnsettled` → **0x89**, never 0x8E,
+  through the ordinary parse-error path so the real close bookkeeping runs. **Rebound**:
+  close in SILENCE — the takeover sends its own 0x8E, and a courtesy packet appended to it
+  would be a second DISCONNECT giving opposite advice — with `mqttDiscardWillOnTakeover`
+  applied here, because `mqttHandleClosedClient` owes a Will BEFORE it contends for the
+  gate and an early close would otherwise publish a Will the takeover was about to
+  suppress. A refused ownership claim is CLASSIFIED rather than read as a verdict, through
+  `lockSessionForTeardown`: transient contention is waited out and probed, a rebind takes
+  the silent arm, and a gate still held when the bounded spin gives up is unsettled. The
+  four recorded defects
+  are answered structurally: placement is per-packet and pre-dispatch (a save the previous
+  packet in the same buffer triggered arms the marker between the two); the serve gate
+  (`recordRejectionGatesServingLocked`) is a SEPARATE predicate from the probe's licence,
+  and deliberately omits `!seqUncertain` so a suspended probe keeps gating; the stop is a
+  parse error, so the teardown, the keepalive deadline and DISCONNECT semantics are the
+  existing ones; and CONNECT/DISCONNECT are exempt with the reasoning stated, while
+  PINGREQ is not — which is what bounds convergence at ~1.5 keepalive intervals. At most
+  ONE probe per arming, so the gate hold is the fence wait plus a store and a readback
+  (~3 JetStream timeouts, assuming the fence is not barged — see the fence-fairness bullet
+  below) and contains no socket I/O. 6 plan rounds plus the holistic review;
+  the disposal-write mechanism was DELETED at plan round 4 after three rounds cut a new
+  seam in it each (see the courtesy-write bullet below). Residuals in
+  `docs/CONFORMANCE.md`, fourteen of them, the load-bearing ones being: outbound deliveries
+  continue until the next inbound packet; a keepalive-0 silent client converges only at
+  unbind; the packet racing the marker's arming is served; a no-verdict close may drop a
+  connection that was still ours; the courtesy 0x89/0x8E writes are unbounded; and the
+  resolver's clear-at-base seam can produce a FALSE foreign verdict, which now closes a
+  live connection (next bullet).
+
+- [ ] The session-record fence is not barge-proof, so a BLOCKING acquisition has no
+  starvation bound. `beginRecordTx` waits on the session's condition variable
+  (`sess_recordtx.go`) and `tryBeginRecordTx` takes the fence whenever it finds it free, so
+  a queued blocking waiter has no priority: sustained off-readLoop writer activity on one
+  session — delivery finalizers, register discharges — can hand the fence between try-callers
+  indefinitely while the waiter sleeps. Go's `sync.Cond` gives no FIFO guarantee either. The
+  three blocking callers are `mqttProcessSubs`, `mqttProcessUnsubs` and the bound rejection
+  settlement, and all three hold the session OWNERSHIP GATE while they wait, so a starved
+  waiter also fails a same-client-ID CONNECT for as long as it lasts (the CONNECT's own spin
+  is 10 × 100ms). Pre-existing; what is new is that the settlement's stated "~3 JetStream
+  timeouts" bound depends on it. A fix is to make the fence prefer queued waiters — count
+  them and have `tryBeginRecordTx` refuse while one is queued, which the try-callers' own
+  contract already tolerates ("failing to get the fence must leave their work pending and
+  retryable") — plus a stress test with continuous off-readLoop attempts proving the
+  blocking caller acquires within the current holder's bounded duration. Found by holistic
+  round 5 of the bound settlement.
+
+- [ ] No single owner exists for "displace this connection", and it costs a second
+  DISCONNECT. Four paths displace a bound connection — a local CONNECT takeover
+  (`mqttProcessConnect`), `processSessionPersist`, a resolver's foreign disposal, and the
+  bound rejection settlement — and only two of them take the session gate.
+  `processSessionPersist` evicts, enqueues 0x8E and closes ASYNCHRONOUSLY holding `as.mu`
+  alone (`mqtt.go`), so it can overlap even a gate-held settlement probe; the settlement's
+  suspended-by-uncertainty arm answers 0x89 without attempting a claim; and the periodic
+  pass can dispose foreign between the settlement releasing the gate and its close
+  bookkeeping running. Each of those puts a second DISCONNECT on one socket — 0x89 "try
+  again later" after 0x8E "session taken over", or two 0x8Es — which [MQTT-3.14.4-2]
+  forbids the server, and gives the client the opposite advice to the one that is true. The
+  same missing owner is why the Will's fate depends on which goroutine observes the close
+  first (bullet on Will suppression below, routes (a)-(c)). A fix is one atomic
+  displacement transition — notification, close and Will disposition consumed exactly once
+  — shared by all four paths, which is not a change any single one of them can make: the
+  persist path runs on the JSA delivery goroutine and must not block on a gate. Found by
+  holistic rounds 1 and 2 of the bound settlement, which narrowed the common orderings
+  (a rebound session is never answered, transient contention is waited out) without closing
+  the class.
+
+- [ ] The uncertainty resolver clears an ambiguity on a PLAIN LOAD at the base sequence,
+  so a late-committing proposal is later read as another owner's — a FALSE FOREIGN
+  verdict. `resolveUncertainWriteInTx`'s base-sequence arm (`sess_uncertain.go`) concludes
+  "not landed" from one readback that finds the record where we left it, and rolls the
+  mutation back. But the timed-out proposal can commit AFTER that read, and the rollback
+  discards the digest that would have identified it, so nothing can recognise the landing
+  as ours afterwards: `classifyRejectedProbe` sees a record at an unexpected sequence and
+  returns foreign. Already reachable against the shipped UNBOUND settlement (it disposes a
+  session whose record is in fact ours); the bound settlement widens the blast radius to a
+  LIVE connection, which is closed with 0x8E and has its Will discarded by the
+  takeover-style discard. The fix is a change to the uncertainty resolution contract — the
+  resolver must RE-ATTEMPT the exact framed CAS (or otherwise keep an identity for the
+  proposal) rather than clear on a base read, which changes what `onNotLanded` may assume
+  for every ambiguous save — so it is filed rather than folded in. Found by plan round 1
+  of the bound settlement.
+
+- [ ] Every server-initiated COURTESY DISCONNECT write is unbounded, and one of them is
+  performed with the ownership gate held. `mqttEnqueueDisconnect` → `queueOutbound` →
+  `writeSocket` with a ZERO deadline (`shim_engine.go`), so a client that has stopped
+  reading blocks the writer indefinitely: the parse-error footer's 0x89 defers the
+  teardown that follows it, the bound settlement's foreign 0x8E pins its own readLoop, and
+  the periodic pass's `disposeForeignSessionLocked` performs that write while holding the
+  session gate, which blocks a reconnecting CONNECT for as long as the stalled client
+  lasts. A deadline is not enough on its own: `writeSocket` installs it only AFTER
+  acquiring `wmu`, so an earlier unbounded writer holding that mutex leaves the "bounded"
+  write unbounded — a gap `shutdownDisconnect` shares. Three fix shapes were tried and
+  each was killed by a review round of the bound settlement, so do not repeat them: (1) a
+  SYNCHRONOUS write on the readLoop bounds nothing and pins the loop; (2) an ASYNCHRONOUS
+  goroutine that writes then closes never reaches the close while the write blocks, and
+  with the read deadline cleared the connection stays open forever; (3) `writeDirect` with
+  a deadline does not bound the `wmu` acquisition. What is needed is a real write
+  watchdog (arm the connection deadline before contending for `wmu`, or close from a timer
+  independent of the writer), designed once and applied to every courtesy write.
 
 - [ ] Investigate: a resident session NEVER re-validates its ownership absent a local
   rejection, so a remote takeover whose persist notification is lost still strands the
@@ -1303,8 +1377,14 @@ is fixed before feature work continues.
   Will is already out. (b) The PERIODIC PASS's bound-foreign disposal reaches the close
   bookkeeping's `stillOurs == false` arm without a takeover discard, so the displaced
   connection's close classifies its Will as owed where a local takeover would have
-  discarded it.
-  Both are UNCHANGED by the rejection settlement — the diff touches neither
+  discarded it — and the bound settlement's sentinel close adds a way to REACH (b): its
+  fail-closed return races the close bookkeeping against the pass's bound-uncertain
+  resolver, which can dispose foreign first. (c) A teardown PARKED by an ambiguous write
+  is dropped wholesale by a foreign uncertainty resolution, including a Will owed NOW by a
+  v5 DISCONNECT reason 0x04 — which contradicts the takeover rule's too-late-to-cancel arm
+  (`mqttDiscardWillOnTakeover`): that Will's connection closed first and its delay has
+  already run out, so nothing may cancel it. Pre-existing for every uncertain 0x04 close.
+  All three are UNCHANGED by the rejection settlement — the diff touches neither
   `mqttHandleWill`'s call nor the finite save's error branch — and neither is closable by
   the obvious fixes. Discarding on a rejection alone is destructive: 10164 is CONTENTION,
   not takeover evidence, so it would drop a Will a session that is still ours owes.
@@ -1316,7 +1396,7 @@ is fixed before feature work continues.
   A durable, cluster-visible Will intent is what would settle it, which is Will-outbox
   scope. Needs that analysis before any fix; stated as a residual in
   `docs/CONFORMANCE.md` meanwhile. (a) found by holistic round 2 of the rejection
-  settlement, (b) by its plan round 4.
+  settlement, (b) by its plan round 4, (c) by plan round 2 of the bound settlement.
 
 - [ ] Make `readd` restore `sharedSubs` alongside `cons`, or release from both.
   `rollbackSubscribePacket`'s `readd` (`mqtt.go`) restores the packet's added

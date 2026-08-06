@@ -316,16 +316,92 @@ unboundness check on the path, and it is what keeps the settlement off a session
 connection: claiming the shared client-ID gate for a bound session would fail a concurrent
 SUBSCRIBE's own claim, and that packet error closes a live connection.
 
-**A BOUND session is therefore NOT settled by this mechanism**, and that is a deliberate,
-stated gap rather than an oversight. A mid-connection save rejected by a remote takeover
-leaves this broker serving a client against a session another broker owns, which
-[MQTT-3.1.4-3] requires closed; converging that needs a settlement on the session's own
-readLoop, and a settlement there has to answer questions this one does not — whether the
-triggering packet may be dispatched, what a refused ownership claim means, and how a
-connection is actually torn down when the answer is "we do not know". Nine review rounds
-produced four distinct defects in successive attempts at exactly that, so it is deferred to
-its own roadmap item with those findings recorded. Until then a bound session converges when
-it unbinds, through the pass above.
+**A BOUND session is settled on its own readLoop, before the packet is dispatched.** The
+pass above cannot do it — its claim is nobody's, and taking the shared client-ID gate for
+a live connection breaks a concurrent SUBSCRIBE — so the settlement is made *by* that
+connection instead, from `mqttParse`'s per-packet loop
+(`mqttGateDispatchOnRejection`, `sess_rejected_write.go`).
+
+**Before dispatch, and per packet.** A QoS 1 PUBLISH routed and acked from a displaced
+connection cannot be retracted, so a settlement that ran after the dispatch switch would
+have already lost; and a check hoisted to the top of the read would miss a marker armed by
+the *previous* packet in the same buffer (an UNSUBSCRIBE's own record save is one of the
+ways it gets armed). The fast path is one predicate read per packet.
+
+**Two predicates, named apart.** `recordRejectionGatesServingLocked` asks whether the
+ownership question is still outstanding — may this packet be served? —
+`recordRejectionPendingLocked` whether a probe is valid right now. They share the first two
+conjuncts and differ in `!seqUncertain`, which the serve gate deliberately omits: while a
+write of ours is unresolved no probe is possible, and "cannot ask" is not permission.
+Gating service on the probe's licence instead would serve every packet between a contended
+probe and the next opportunity to re-probe.
+
+**Fail closed on everything but a landed CAS.** The settlement claims the ownership gate as
+the bound client (the claim a SUBSCRIBE makes), takes the record fence in its blocking form
+as an outermost readLoop entry point, and probes. *Landed* → dispatch, marker retired.
+*Foreign* → the Will is discarded as a local takeover discards it, the session state is
+disposed under the gate, and then — off the gate, on the readLoop — the 0x8E is written and
+the connection closed synchronously before `mqttParse` returns, which is the graceful
+DISCONNECT branch's own shape: no re-entry, no second DISCONNECT, and no socket I/O under
+the gate. *No verdict with the gate held* — contended, unreadable, probe ambiguous,
+suspended by an unresolved write — establishes nothing and closes the connection with
+`errMQTTSessionOwnershipUnsettled`, a parse error mapped to **0x89 "server busy"** rather
+than 0x8E, because announcing a takeover nobody proved would tell a client to stop
+reconnecting on a guess. Returning that as a parse error is what makes the stop a real
+stop: the readLoop's ordinary close bookkeeping runs, and the periodic pass settles the
+marker after the unbind.
+
+*A refused claim is CLASSIFIED, never assumed*, and the claim is taken through
+`lockSessionForTeardown` rather than plain `lockSession` for that reason. A refusal does
+not say who holds the gate: `mqttProcessConnect` registers the client-ID gate for its whole
+duration and rebinds the session only part-way through, and a resolver can hold it for a
+session that stays ours. So the settlement retries while this connection is still the
+session's owner — bounded, every holder being bounded — and reads the outcome:
+
+- **acquired**: the competing operation finished; probe normally. Transient contention
+  therefore does not close a healthy connection whose probe would have landed.
+- **rebound**: a takeover owns this connection now. It is told **nothing** — the takeover
+  sends its own 0x8E, and a courtesy 0x89 appended to that on the same socket would be a
+  second DISCONNECT giving the opposite advice — and its Will is settled here by
+  `mqttDiscardWillOnTakeover`, the takeover's own rule, applied by whichever side notices
+  the displacement first. That call is what stops an early close from publishing a Will the
+  takeover was about to suppress: `mqttHandleClosedClient` marks a Will OWED *before* it
+  contends for the gate, and the takeover's later discard preserves an already-owed Will by
+  design.
+- **still ours when the spin gives up**: nothing observable is displacing this connection,
+  so it is an ordinary no-verdict outcome and says 0x89.
+
+One path still ignores the gate entirely: `processSessionPersist` evicts, notifies and
+closes under `as.mu` alone, so it can overlap a gate-held probe. That is stated as a
+residual and filed, not claimed away.
+
+**At most one probe per arming**, so the gate hold is bounded by the fence wait plus a store
+and a readback (roughly three JetStream timeouts) rather than by packet rate: every verdict
+except the landed one ends the connection, and the landed one retires the marker. One
+qualification on that arithmetic: the fence wait is bounded by the CURRENT holder's work,
+and the fence is not barge-proof — `beginRecordTx` waits on a condition variable with no
+FIFO guarantee, so a `tryBeginRecordTx` caller (an off-readLoop delivery finalizer) can take
+it ahead of a queued waiter. Sustained barging on one session therefore stretches the wait,
+and with it the ownership gate this settlement holds. That is a property of the fence shared
+with `mqttProcessSubs`' and `mqttProcessUnsubs`' own blocking acquisitions, stated as a
+residual and filed rather than papered over here.
+
+**CONNECT and DISCONNECT are exempt.** Pre-CONNECT there is no bound session, and a second
+CONNECT is already a protocol error before dispatch. A DISCONNECT routes and acks nothing;
+what it carries is the client's own instruction about its Will — fail-closed would publish
+a Will the client explicitly discarded ([MQTT-3.1.2-8], Spec5 [3.14.4]) — an expiry override
+already guarded by `sess.c == c` and by the record CAS, and the teardown that *is* the
+[MQTT-3.1.4-3] convergence. PINGREQ is **not** exempt, and that is what bounds convergence:
+a conformant client sends one within its keepalive, so even an otherwise silent displaced
+connection closes within about 1.5 keepalive intervals.
+
+What the mechanism guarantees is: **once a packet's pre-dispatch check observes the
+outstanding ownership question, nothing further is served without a fresh landed CAS.** It
+is not "nothing is served after a rejection anywhere in the cluster" — the packet already
+past its check when the marker arms is served, outbound deliveries continue until the next
+inbound packet, and a landed probe proves ownership at its own linearization point, not
+through the dispatch that follows. The record is not a liveness lease. `docs/CONFORMANCE.md`
+states those residuals.
 
 ## Reserved `$MQTT.>` namespace
 
