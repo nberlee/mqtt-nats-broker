@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1876,6 +1878,187 @@ func TestMQTTVoidVerdictBackstopConvergesAfterDefiniteFailure(t *testing.T) {
 	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-evicted") {
 		t.Fatalf("an evicted object's verdict is not ours to persist: %v", ps.CancelledRegs)
 	}
+}
+
+// T17c: the release handoff DEFERS to a blocking writer queued for the fence, and the
+// deferral is a handoff rather than a strand.
+//
+// The record fence prefers an announced blocking writer over every non-blocking acquisition
+// (see sess_recordtx.go), and this attempt is one: it opens the fence inline at a lock
+// release. Taking it while a waiter is announced would be exactly the barge waiter priority
+// exists to refuse — and would hold the ownership gate through a JetStream store while the
+// waiter, which usually holds the client-ID gate, waits behind it.
+//
+// Every "an attempt fired" statement here is made through the PRE-GATE window counter, never
+// through the handoff watermark: an attempt that bails at its in-fence pending recheck leaves
+// the watermark untouched too, so the watermark cannot tell a suppressed trigger from a
+// deferred one.
+//
+// Mutation M2: drop the waiter conjunct from voidVerdictHandoffPendingLocked — the predicate
+// half fails outright, and the release half sees the holder's own release start an attempt
+// while the waiter is parked on the fence.
+// Mutation M5: add the waiter conjunct to flushVoidVerdictGap's `owed` — the backstop half's
+// re-arm never happens, so a definitely-failed verdict waits a whole further sweep interval
+// with the crash window open.
+func TestMQTTVoidVerdictHandoffDefersToQueuedWaiter(t *testing.T) {
+	e := testNewDeferredEnv(t, "client-handoff-waiter", "handoff.waiter")
+
+	var attempts atomic.Int64
+	restoreWindow := setMQTTTestVoidHandoffWindowHook(func(sess *mqttSession, window string) {
+		if sess == e.sess && window == mqttHandoffWindowPreGate {
+			attempts.Add(1)
+		}
+	})
+	defer restoreWindow()
+
+	// The predicate itself: an announced waiter suppresses the trigger, exactly as an open
+	// transaction does.
+	e.testStageVerdict(t, "nonce-waiter", 220)
+	if !e.handoffPending(t) {
+		t.Fatal("a staged verdict on a resident, unbound, resolved session with a free fence must be pending")
+	}
+	e.sess.recordTxWaiters.Store(1)
+	pendingWithWaiter := e.handoffPending(t)
+	e.sess.recordTxWaiters.Store(0)
+	if pendingWithWaiter {
+		t.Fatal("a blocking writer announced for the fence must suppress the handoff: the fence is reserved for it, " +
+			"and its own release re-checks")
+	}
+
+	// And at a real release, with the waiter's transaction PARKED so the not-fired assertion
+	// is not racing its immediate release.
+	holder := e.sess.beginRecordTx()
+	parked := make(chan struct{}, 1)
+	restoreWait := setMQTTTestRecordTxWaitHook(func(sess *mqttSession) {
+		if sess != e.sess {
+			return
+		}
+		select { // under sess.mu: never blocks
+		case parked <- struct{}{}:
+		default:
+		}
+	})
+	defer restoreWait()
+
+	waiterAcquired := make(chan struct{})
+	waiterDone := make(chan struct{})
+	unparkCh := make(chan struct{})
+	unpark := sync.OnceFunc(func() { close(unparkCh) })
+	go func() {
+		defer close(waiterDone)
+		tok := e.sess.beginRecordTx()
+		close(waiterAcquired)
+		<-unparkCh
+		if err := e.sess.endRecordTx(tok); err != nil {
+			t.Errorf("endRecordTx (waiter): %v", err)
+		}
+	}()
+	releaseHolder := sync.OnceFunc(func() {
+		if err := e.sess.endRecordTx(holder); err != nil {
+			t.Errorf("endRecordTx (holder): %v", err)
+		}
+	})
+	// Installed before the first assertion, and in this order: unwinding runs the HOLDER
+	// release first, then the unpark, then the join. Any other order lets a failed
+	// assertion made before the release leave the waiter blocked on a fence nobody
+	// releases — the test would then hang to the suite timeout instead of reporting, which
+	// is how an announcement regression (M3, M4) disappears into a harness timeout.
+	defer func() { <-waiterDone }()
+	defer unpark()
+	defer releaseHolder()
+
+	<-parked
+	// Causally established BEFORE the holder releases. Merely having spawned the waiter
+	// would let a fast release legitimately observe no waiter and start a handoff, which is
+	// a false failure on correct code.
+	if n := e.sess.recordTxWaiters.Load(); n != 1 {
+		t.Fatalf("the waiter must be announced before the holder releases: count = %d, want 1", n)
+	}
+	before := attempts.Load()
+	releaseHolder()
+	<-waiterAcquired
+	if n := attempts.Load(); n != before {
+		t.Fatalf("the release must not start a handoff while a blocking writer is announced, %d attempt(s) fired", n-before)
+	}
+	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-waiter") {
+		t.Fatalf("nothing may have persisted the verdict yet: %v", ps.CancelledRegs)
+	}
+
+	unpark()
+	<-waiterDone
+	if n := attempts.Load(); n != before+1 {
+		t.Fatalf("the deferral is a handoff: the waiter's own release must fire exactly one attempt, got %d", n-before)
+	}
+	if rev, saved, _ := e.voidRevs(t); saved < rev {
+		t.Fatalf("the waiter's release must converge the verdict: rev=%d saved=%d", rev, saved)
+	}
+	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-waiter") {
+		t.Fatalf("the verdict never reached the record: %v", ps.CancelledRegs)
+	}
+
+	// The BACKSTOP, from the state it exists for: a definite store failure has burned the
+	// watermark, so no release triggers again on its own.
+	restoreSave := setMQTTTestSessSaveHook(func(sess *mqttSession) error {
+		if sess != e.sess {
+			return nil
+		}
+		return errors.New("test: the session store is unavailable")
+	})
+	e.testStageVerdict(t, "nonce-waiter-backstop", 221)
+	e.releaseFence(t)
+	restoreSave()
+	rev, saved, handoff := e.voidRevs(t)
+	if saved >= rev || handoff != rev {
+		t.Fatalf("the attempt must have acquired the fence and failed definitely: rev=%d saved=%d handoff=%d", rev, saved, handoff)
+	}
+
+	// The announced state is constructed WHITE-BOX here: a real waiter on a FREE fence
+	// competes for sess.mu immediately, with no seam between its announce and its Lock(), so
+	// the backstop could not be made to run first.
+	e.sess.mu.Lock()
+	seqBefore := e.sess.recordTxSeqno
+	e.sess.mu.Unlock()
+	e.sess.recordTxWaiters.Store(1)
+	e.asm.flushVoidVerdictGap(e.sess)
+	rev, saved, handoff = e.voidRevs(t)
+	if handoff != saved || rev <= saved {
+		t.Fatalf("the backstop must re-arm the watermark even while a waiter is announced — re-arming is what lets "+
+			"the waiter's own release trigger the attempt: rev=%d saved=%d handoff=%d", rev, saved, handoff)
+	}
+	e.sess.mu.Lock()
+	seqAfter := e.sess.recordTxSeqno
+	e.sess.mu.Unlock()
+	if seqAfter != seqBefore {
+		t.Fatalf("the re-armed attempt must not take the fence ahead of an announced waiter: transaction seqno %d -> %d",
+			seqBefore, seqAfter)
+	}
+	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-waiter-backstop") {
+		t.Fatalf("the deferred attempt may not have written: %v", ps.CancelledRegs)
+	}
+
+	// A phase-local DELTA, never a cumulative count: the backstop's own deferred attempt
+	// already fired the window hook once above before bailing.
+	e.sess.recordTxWaiters.Store(0)
+	snapshot := attempts.Load()
+	e.releaseFence(t)
+	if n := attempts.Load(); n != snapshot+1 {
+		t.Fatalf("the next release must fire exactly one attempt for the re-armed revision, got %d", n-snapshot)
+	}
+	if rev, saved, _ = e.voidRevs(t); saved < rev {
+		t.Fatalf("the re-armed verdict must converge: rev=%d saved=%d", rev, saved)
+	}
+	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-waiter-backstop") {
+		t.Fatalf("the re-armed verdict never reached the record: %v", ps.CancelledRegs)
+	}
+}
+
+// handoffPending asks the release handoff's predicate under sess.mu, since every field it
+// reads but the waiter count is guarded by it.
+func (e *testDeferredEnv) handoffPending(t *testing.T) bool {
+	t.Helper()
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	return e.sess.voidVerdictHandoffPendingLocked()
 }
 
 // T15c: the SURVIVING branch's in-fence re-check, in the window its entry check cannot see.

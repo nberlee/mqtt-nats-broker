@@ -717,7 +717,9 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 	// tryBeginRecordTx, never the blocking form: this runs on a delivery goroutine, and a
 	// refused fence must leave the verdict pending rather than block. The revision gap
 	// stays open, so the next convergence point retries — including the one at the end of
-	// the UNSUBSCRIBE that is usually the holder here.
+	// the UNSUBSCRIBE that is usually the holder here. Refusal does not mean a transaction
+	// is open: a fence reserved for an announced blocking writer refuses too, and that
+	// waiter's own release is then the retry edge.
 	tok, ok := sess.tryBeginRecordTx()
 	if !ok {
 		return false
@@ -759,9 +761,13 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 // durable only on a session-record save. Those two are not the same thread of control, and
 // the gap is not a rare interleaving: an off-readLoop register store settling
 // (confirmInflightRegister / abandonInflightRegister) stages its nonce and then finds
-// persistVoidedRegs REFUSED, because the record transaction fence — or the ownership gate a
-// resolver needs — is held by somebody else at that instant. The refusal leaves the revision
-// gap open, which is correct, but nothing is left owing the retry.
+// persistVoidedRegs REFUSED, because at that instant the record transaction fence — or the
+// ownership gate a resolver needs — is either held by somebody else OR, free but RESERVED for
+// an announced blocking writer under waiter priority (see sess_recordtx.go). The second cause
+// is production-reachable with nobody holding either lock: the fence is free, a blocker
+// announces itself and stalls before sess.mu, a register settlement stages a verdict, and
+// persistVoidedRegs is refused at the fence's pre-lock fast check. The refusal leaves the
+// revision gap open, which is correct, but nothing is left owing the retry.
 //
 // For a BOUND session the connection itself is the convergence point: ordinary traffic,
 // mqttResolveAfterPacket, and the UNSUBSCRIBE tail's flush all save again, and every landed
@@ -770,10 +776,11 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 // reserved for the life of the session, and a crash would restore the surviving register as
 // an ordinary pending delivery.
 //
-// So the rule is at the LOCK RELEASES, which is where "somebody else held it" ends: every
-// release of the record fence and of the ownership gate re-checks whether a verdict was
-// staged while it was held, and if so attempts the save the stager could not. Two sites, one
-// predicate, one attempt — deliberately not a third mechanism per staging path.
+// So the rule is at the LOCK RELEASES, which is where the reason for the refusal ends —
+// whether that reason was an actual holder or a fence reserved for a waiter, since the waiter
+// releases too: every release of the record fence and of the ownership gate re-checks whether
+// a verdict was staged while it was held, and if so attempts the save the stager could not.
+// Two sites, one predicate, one attempt — deliberately not a third mechanism per staging path.
 //
 // voidVerdictHandoffDueLocked is that predicate. Each conjunct earns its place:
 //
@@ -785,12 +792,21 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 //   - a revision gap: the record does not carry everything staged.
 //   - rev above the handoff watermark: one attempt per newly staged revision, which is what
 //     makes the sequence of attempts finite.
-//   - the fence closed: an open transaction means a writer is mid-record, and ITS release
-//     re-checks.
+//   - the fence closed AND no blocking writer announced: an open transaction means a writer
+//     is mid-record, and ITS release re-checks. An ANNOUNCED waiter is the same situation one
+//     step earlier — the fence is reserved for it, so taking it here would be exactly the
+//     barge waiter priority exists to refuse — and the waiter's own release re-checks in turn.
+//     The deferral is a handoff, not a strand: provided blocking arrivals are finite and each
+//     holder releases, the chain reaches a release with no waiter announced and the attempt
+//     fires. If something intervenes, the fate follows the session's state — a definite store
+//     failure on a resident-unbound session leaves the gap open for the periodic pass, a
+//     rebind removes the session from this predicate (sess.c == nil) so the bound session's
+//     own convergence events carry the verdicts, and an eviction ends local retry by design.
 //
 // sess.mu must be held.
 func (sess *mqttSession) voidVerdictHandoffPendingLocked() bool {
 	return !sess.seqUncertain && sess.c == nil && !sess.recordTxOpen &&
+		sess.recordTxWaiters.Load() == 0 &&
 		sess.voidedRegsRev > sess.voidedRegsSavedRev &&
 		sess.voidedRegsRev > sess.voidedRegsHandoffRev
 }
@@ -893,6 +909,18 @@ func (sess *mqttSession) attemptVoidVerdictHandoff(c *client) {
 // that waiter may make no relevant save, and the refused trigger stored nothing, so the
 // nonce is never ridden by anything. Advancing only on acquisition makes the refused trigger
 // a non-event, and the fence winner's own release the next re-check.
+//
+// Waiter priority adds one more way to be refused without acquiring: an ANNOUNCED blocking
+// writer makes the pending predicate false, so this attempt returns without taking the fence
+// and without burning the watermark — the same non-event arm, deferred to that waiter's own
+// release. There is deliberately no pre-lock fast check here, unlike tryBeginRecordTx: this
+// site runs one attempt per lock release rather than in a storm, and it must take sess.mu
+// anyway for the predicate's non-atomic fields, so a pre-lock load would add a path without
+// removing any class of mutex pressure. The cost of the deferral is that the staged verdict
+// stays memory-only for longer, so a crash in the added interval loses it — the consequence
+// already documented above for an unpersisted verdict. It is usually converged by the
+// prioritized transaction itself, since any landed save marshals current memory, staged
+// verdicts included.
 //
 // No lock held on entry.
 func (sess *mqttSession) persistVoidedRegsFromRelease(c *client) {

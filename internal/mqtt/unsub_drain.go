@@ -638,7 +638,9 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 
 	tok, ok := sess.tryBeginRecordTx()
 	if !ok {
-		return true // fence busy: stays claimed and unacked, retried on redelivery
+		// Fence unavailable — held, or free but reserved for an announced blocking writer
+		// (see sess_recordtx.go): stays claimed and unacked, retried on redelivery.
+		return true
 	}
 	// The guard goes on WITH the mutation, not after the save. A delivery or a
 	// duplicate PUBREL callback can run at any point during the save, and would

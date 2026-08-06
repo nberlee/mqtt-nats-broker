@@ -213,7 +213,7 @@ Two refinements keep the guarantee tight:
   has to say it is disconnected whatever its expiry class. The finite close persists the
   stamp with its disconnect save; a **never-expiring** session makes no such save, so
   its close stamps the disconnect time inside a RECORD TRANSACTION of its own — acquired
-  NON-BLOCKING, and a close that finds the fence held stamps anyway, unordered, because
+  NON-BLOCKING, and a close whose acquisition is REFUSED stamps anyway, unordered, because
   the rejection probe would otherwise persist current memory with `DisconnectedAt = 0`
   at a newer sequence — before the detach and therefore before the shared purge's own
   record write. The fence, not `sess.mu`, is what makes that effective: an off-readLoop
@@ -224,7 +224,15 @@ Two refinements keep the guarantee tight:
   void-verdict release handoff, a rejection probe) therefore publishes a record newer
   than an owed Will's origin sequence that still reads as disconnected, instead of
   cancelling a Will the client is owed. The field stays inert for every expiry reader,
-  each of which pre-filters on never-expire before looking at it.
+  each of which pre-filters on never-expire before looking at it. Refusal has two causes
+  and the same cost. An OPEN (or pre-admitted) transaction leaves the residual above: the
+  one body already marshalled inside it, which no non-blocking form can order against.
+  Waiter priority refuses on a FREE fence reserved for an announced blocking writer, where
+  nothing is open yet — but that writer can then take `sess.mu`, open its transaction and
+  marshal `DisconnectedAt = 0` before this stamp is taken, which is the same one-body
+  exposure reached from the other side. This is the one non-blocking site that does not
+  retry, so waiter priority gives its degraded arm more occasions of that residual, not a
+  cost-free arm; `docs/CONFORMANCE.md` residual 13 carries it.
 
 Residual that keeps literal exactly-once impossible:
 
@@ -378,13 +386,40 @@ residual and filed, not claimed away.
 **At most one probe per arming**, so the gate hold is bounded by the fence wait plus a store
 and a readback (roughly three JetStream timeouts) rather than by packet rate: every verdict
 except the landed one ends the connection, and the landed one retires the marker. One
-qualification on that arithmetic: the fence wait is bounded by the CURRENT holder's work,
-and the fence is not barge-proof — `beginRecordTx` waits on a condition variable with no
-FIFO guarantee, so a `tryBeginRecordTx` caller (an off-readLoop delivery finalizer) can take
-it ahead of a queued waiter. Sustained barging on one session therefore stretches the wait,
-and with it the ownership gate this settlement holds. That is a property of the fence shared
-with `mqttProcessSubs`' and `mqttProcessUnsubs`' own blocking acquisitions, stated as a
-residual and filed rather than papered over here.
+qualification on that arithmetic: the fence wait is bounded by the CURRENT holder's work
+plus whatever other BLOCKING acquisitions precede this one, because the fence is barge-proof
+against the non-blocking form only.
+
+`beginRecordTx` ANNOUNCES itself — an atomic waiter count incremented before it contends on
+`sess.mu` — and every non-blocking acquisition (`tryBeginRecordTx`, and the void-verdict
+handoff's inline acquisition) refuses while that count is nonzero. Both linearization points
+are exact: the announce is ordered before the mutex contention, and an acquirer
+linearizes at its successful free-fence predicate load under `sess.mu`. The refusal is
+double-checked, and the pre-lock half of that check is a liveness guarantee rather than an
+optimization: a try-caller refused there never touches `sess.mu`, so a storm cannot starve
+the announced waiter of the mutex itself — the claim rests on the code, not on
+`sync.Mutex` fairness, which is undocumented. A waiter that dies abnormally
+(a panic, or `runtime.Goexit` from a test seam) withdraws its announce INSIDE the critical
+section that holds `sess.mu`, never after releasing it, so no reader of the count — the
+void-verdict handoff decision at a fence release, above all — can act on an announce for a
+waiter that no longer exists. So **try-callers cannot add a fence hold
+ahead of the waiter** unless already admitted at the announce: a try load following the
+announce refuses without locking `sess.mu`; a caller past only the fast check contends
+once and refuses if its authoritative reload occurs while the announce remains
+outstanding; at most one caller already past the authoritative predicate may still open
+and hold the fence; and a delayed caller may succeed after the waiter has completed, which
+lengthens nothing.
+
+What that does NOT give is an unconditional bound on every blocking acquisition. There
+is no FIFO among BLOCKING waiters — a newly arriving `beginRecordTx` can win the post-broadcast
+mutex race against an older `Cond` waiter — so the individual bound holds only absent an
+unbounded stream of later blocking arrivals. In ordinary operation there is at most one
+blocking caller per session (the readLoop entry points share the session's one readLoop, and
+the expiry-side `clear()` is serialized against a reconnect by `lockSession`), but that
+is an observation, not a proven invariant. Waiter priority also carries a reciprocal
+cost — refused try-callers retry on events rather than on a clock, and the never-expire
+close stamp takes its unordered fallback on more occasions — both stated in
+`docs/CONFORMANCE.md` residual 13 with the blocking-vs-blocking residual that stays open.
 
 **CONNECT and DISCONNECT are exempt.** Pre-CONNECT there is no bound session, and a second
 CONNECT is already a protocol error before dispatch. A DISCONNECT routes and acks nothing;
@@ -1318,8 +1353,12 @@ The invariants, in the order they matter:
   claim exactly that nonce durable (`docs/CONFORMANCE.md` states what happens to it).
 - **A lock release is what re-checks a verdict staged behind somebody else's lock.** The
   stager and the writer are not the same thread of control: a register store settling
-  off-readLoop stages its nonce and finds its own persistence refused, because the record
-  fence — or the ownership gate a resolver needs — is held at that instant. A BOUND session
+  off-readLoop stages its nonce and finds its own persistence refused, because at that
+  instant the record fence — or the ownership gate a resolver needs — is either held by
+  somebody else, or free but RESERVED for an announced blocking writer under waiter
+  priority. The second cause needs nobody to hold anything: a blocker announces itself,
+  stalls before `sess.mu`, and every non-blocking acquisition refuses meanwhile — with that
+  waiter's eventual release as the retry edge. A BOUND session
   converges through its own packet tails; an UNBOUND one has no traffic, and a
   never-expiring one no timer, so the identifier could stay reserved for the life of the
   session. So both canonical releases re-check: the RECORD FENCE release, sampling the
@@ -1329,38 +1368,50 @@ The invariants, in the order they matter:
   delete, since a CONNECT does not release through the former. The re-check fires only for
   a session that is resident, unbound, not uncertain (the uncertainty machinery owns that
   retry, and its resolver's releases re-check afterwards), not mid-transaction, and whose
-  revision is above the HANDOFF WATERMARK. That watermark advances when an attempt
-  ACQUIRES the fence, never when a release merely decides to try: a trigger that lost the
-  fence to a waiter it just signalled stored nothing, and burning the watermark on it would
-  strand the very nonce it fired for — the fence winner's own release is the next re-check.
-  One attempt per newly staged revision makes the sequence of attempts finite; keeping it
-  to one STACK FRAME is a separate property, and a LOOP is what provides it. The releases
-  inside an attempt would otherwise re-enter the decision in their own frames — once per
-  late staging, each frame holding a JetStream round trip, so a session with many outstanding
-  register stores could build a stack proportional to them. So an attempt marks the session
-  as having a handoff in progress, the releases route work to that loop instead of recursing,
-  and the flag is cleared only in the same critical section that finds nothing left pending,
-  which is what keeps a staging racing the exit from being dropped between the two. A loop
-  that gives up on GATE contention hands that ownership back inside the gate's own critical
-  section, for the mirror-image reason: a gate owner deletes its entry under the manager lock
-  and only then asks whether a loop is running, so a hand-back made after that lock was
-  released could be seen as still running — the owner suppresses itself, the loop exits, and
-  the staged revision has no successor at all.
-  **The releases alone are not the whole liveness argument**, and the gap is the watermark's
-  own doing: a DEFINITE store failure leaves the revision AT the watermark, so no release
-  triggers again, and an unbound never-expiring session may never stage another nonce to lift
-  it. So the periodic pass carries a BACKSTOP — for a resident, unbound, resolved session
-  with an unsaved revision it puts the watermark back below it and runs the ordinary
-  attempt. Re-arming rather than bypassing keeps one path to the store, and the sweep interval
-  is the retry cadence, which is the right one for a failure that did not look transient.
-  The attempt itself runs UNDER the ownership gate, taken fail-fast and
-  skipped on contention: gated, any ambiguity it creates exists only while the gate is
-  held, so a CONNECT that ever holds the gate sees it at its own uncertainty check and
-  resolves it — ungated, an ambiguity landing just after that check would have the CONNECT
-  bind, find its accept save refused, and evict the object holding the continuation. The
-  unbound scoping is equally deliberate: fired at CONNECT's accept-transaction release it
-  could inject uncertainty right behind a success CONNACK, with the gate held and no
-  packet tail yet to resolve it.
+  revision is above the HANDOFF WATERMARK. "Not mid-transaction" is also where waiter
+  priority applies: an ANNOUNCED blocking writer suppresses the trigger outright, because
+  the attempt's own acquisition is a non-blocking one and taking the fence there would be
+  exactly the barge waiter priority refuses — while an announce landing after the
+  release-time load produces a trigger whose inline re-check then defers instead. Either
+  way the deferral is a handoff, not a strand: that waiter's own release re-checks, and
+  provided blocking arrivals are finite the chain reaches a release with none announced.
+  That watermark advances when an attempt ACQUIRES the fence, never when a release merely
+  decides to try: a trigger that lost the fence to a waiter it just signalled stored
+  nothing, and burning the watermark on it would strand the very nonce it fired for — the
+  fence winner's own release is the next re-check. One attempt per newly staged revision
+  makes the sequence of attempts finite; keeping it to one STACK FRAME is a separate
+  property, and a LOOP is what provides it. The releases inside an attempt would otherwise
+  re-enter the decision in their own frames — once per late staging, each frame holding a
+  JetStream round trip, so a session with many outstanding register stores could build a
+  stack proportional to them. So an attempt marks the session as having a handoff in
+  progress, the releases route work to that loop instead of recursing, and the flag is
+  cleared only in the same critical section that finds nothing left pending, which is what
+  keeps a staging racing the exit from being dropped between the two. A loop that gives up
+  on GATE contention hands that ownership back inside the gate's own critical section, for
+  the mirror-image reason: a gate owner deletes its entry under the manager lock and only
+  then asks whether a loop is running, so a hand-back made after that lock was released
+  could be seen as still running — the owner suppresses itself, the loop exits, and the
+  staged revision has no successor at all. **The releases alone are not the whole liveness
+  argument**, and the gap is the watermark's own doing: a DEFINITE store failure leaves
+  the revision AT the watermark, so no release triggers again, and an unbound
+  never-expiring session may never stage another nonce to lift it. So the periodic pass
+  carries a BACKSTOP — for a resident, unbound, resolved session with an unsaved revision
+  it puts the watermark back below it and runs the ordinary attempt. Re-arming rather than
+  bypassing keeps one path to the store, and the sweep interval is the retry cadence,
+  which is the right one for a failure that did not look transient. The backstop re-arms
+  WITHOUT regard to the waiter count, deliberately: the attempt it drives still refuses
+  while a blocking writer is announced, and the re-armed watermark is precisely what lets
+  that waiter's own release trigger the store instead of waiting a whole further sweep
+  interval. So the backstop is a liveness carrier past a definite failure, not an
+  unconditional one: while blocking writers keep arriving, each attempt defers again. The
+  attempt itself runs UNDER the ownership gate, taken fail-fast and skipped on contention:
+  gated, any ambiguity it creates exists only while the gate is held, so a CONNECT that
+  ever holds the gate sees it at its own uncertainty check and resolves it — ungated, an
+  ambiguity landing just after that check would have the CONNECT bind, find its accept
+  save refused, and evict the object holding the continuation. The unbound scoping is
+  equally deliberate: fired at CONNECT's accept-transaction release it could inject
+  uncertainty right behind a success CONNACK, with the gate held and no packet tail yet to
+  resolve it.
 - **A resume claims the shared registers it recovers before installing them.** A
   cross-broker takeover constructs a new session object but preserves the session
   incarnation generation, so that generation correctly finds the durable state but cannot

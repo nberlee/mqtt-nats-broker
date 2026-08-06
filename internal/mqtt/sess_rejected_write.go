@@ -175,8 +175,9 @@ func (sess *mqttSession) settleRecordRejection(asm *mqttAccountSessionManager) m
 	// it.
 	tok, ok := sess.tryBeginRecordTx()
 	if !ok {
-		// A local writer holds the fence, so nothing is arbitrated. The marker stays armed
-		// and the next pass tries again.
+		// The fence was unavailable — a local writer holds it, or it is free but reserved
+		// for an announced blocking writer (see sess_recordtx.go) — so nothing is
+		// arbitrated. The marker stays armed and the next pass tries again.
 		return mqttRejectionKeep
 	}
 	verdict := sess.probeRecordRejectionInTx(tok)

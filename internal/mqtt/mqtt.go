@@ -1178,6 +1178,18 @@ type mqttSession struct {
 	recordTxSeqno uint64
 	recordEpoch   uint64
 	recordTxCond  *sync.Cond
+	// recordTxWaiters counts the blocking writers that have ANNOUNCED themselves for
+	// the fence. Atomic, and deliberately not under mu: a blocking writer announces
+	// itself BEFORE contending on mu, which is what makes the announce the
+	// linearization point of waiter priority. A non-blocking acquisition linearizes
+	// at its successful predicate load under mu (fence free AND count zero), so while
+	// an announce remains outstanding no non-blocking caller whose load follows it can
+	// acquire — later loads, after the waiter completes and withdraws, succeed
+	// normally. At most ONE transaction already past its successful free-fence
+	// predicate at the announce — blocking, try, or the inline handoff, since mu
+	// serializes them all — may still open in wall time after it; it counts as
+	// already admitted at the announce.
+	recordTxWaiters atomic.Int64
 
 	// seqUncertain marks a record write whose outcome is UNKNOWN (it may have
 	// landed with its response lost), with pendingWrite holding that write's
@@ -3041,8 +3053,15 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		// late, which can re-open an already-elapsed Will Delay for a reconnect to cancel.
 		// A refusal does not skip the stamp — see the else branch, which stamps anyway,
 		// unordered — it only gives up the ORDERING against a body already marshalled inside
-		// that open transaction. Same non-blocking reasoning as every other off-path record
-		// write (see persistVoidedRegs).
+		// an open transaction, when there is one. Same non-blocking reasoning as every other
+		// off-path record write (see persistVoidedRegs). This is the ONE non-blocking site
+		// that does not retry: it takes its degraded arm immediately, so waiter priority (see
+		// sess_recordtx.go) gives that arm more occasions — including with the fence FREE but
+		// reserved for an announced blocking writer. That arm is not cheaper: no transaction
+		// is open at the refusal, but the prioritized writer can then take sess.mu, open its
+		// transaction and marshal DisconnectedAt = 0 before this fallback stamps, which is
+		// the same one-body residual reached from the other side. More occasions of a stated
+		// residual, not a new behaviour; docs/CONFORMANCE.md carries it.
 		if tok, ok := sess.tryBeginRecordTx(); ok {
 			// Re-checked WITH THE FENCE HELD even so: acquiring it proves every earlier
 			// marshal completed, but not that none of them armed uncertainty between the
@@ -3063,16 +3082,19 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 				return
 			}
 		} else {
-			// A busy fence still stamps, just without the ordering. Skipping it entirely
+			// An unavailable fence still stamps, just without the ordering. Skipping it entirely
 			// would leave the REJECTION PROBE — a writer this change adds, and the reason
 			// the stamp exists at all — free to persist current memory with
 			// DisconnectedAt = 0 at a newer sequence, which the Will fence reads as a
 			// reconnect: the holder we could not order against can be rejected at the
 			// unchanged base, arming the marker, and the probe then lands after the origin
 			// capture. So every marshal from HERE on carries the disconnect time, and the
-			// residual is exactly the one body already marshalled inside that open
-			// transaction — which no non-blocking form can order against, and which waiting
-			// for would re-open the two defects the wait caused.
+			// residual is one body this stamp could not order against, and which waiting
+			// for would re-open the two defects the wait caused. On the OPEN-transaction
+			// refusal that body was marshalled before the refusal; on the waiter-priority
+			// refusal nothing is open yet, but the prioritized writer can open and marshal
+			// in the interval before this stamp takes sess.mu, so the exposure is the same
+			// one body rather than none.
 			//
 			// No uncertainty re-check on this arm: without the fence there is no sound one
 			// to make, and an unsound sample acted on is check-then-act. The stamp is a

@@ -587,9 +587,11 @@ func TestMQTTExpiryHoldsTheRecordFenceAcrossTheLoad(t *testing.T) {
 // transaction IDENTITY, not merely by "some transaction is open".
 //
 // T10b proves only that the fence is held when the load BEGINS, and a fence-refusal probe
-// at the decision does not close that gap: tryBeginRecordTx reports that SOME transaction
-// is open, never which one, so an implementation that released the load's transaction and
-// opened a fresh one before deciding would pass both. So this reads sess.recordTxID at each
+// at the decision does not close that gap: tryBeginRecordTx reports only that the
+// acquisition failed — never which transaction is open, and (since waiter priority) not
+// even that one is, since an announced blocking writer refuses it on a free fence. So an
+// implementation that released the load's transaction and opened a fresh one before
+// deciding would pass both. So this reads sess.recordTxID at each
 // seam and requires them EQUAL and non-zero. That identity changes on every open
 // (recordTxSeqno increments in openRecordTxLocked), which is what makes a release-and-reopen
 // between the two seams detectable.

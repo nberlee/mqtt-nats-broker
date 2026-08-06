@@ -1163,8 +1163,9 @@ is fixed before feature work continues.
   gate-held or as a singleton check-and-write inside one `sess.mu` section, so no
   execution overlaps one with the helper's read and `-race` has nothing to observe;
   and MU-I2b (leaving the `sess.seq` sample outside the fence) — the pre-fence sample
-  normally equals the later value, and `tryBeginRecordTx` reports only that SOME
-  transaction is open, never transaction identity. Both remain as discipline carried
+  normally equals the later value, and `tryBeginRecordTx` reports only acquisition
+  failure: never transaction identity, and (since waiter priority landed) not even that
+  a transaction is open at all. Both remain as discipline carried
   on the argument, and the `sess.seq` read still moved inside the fence because the
   window it closes is real. MU-A3 needed a test the plan did not have, and it is killed
   as a DEFENSIVE-branch mutation rather than a production-shaped one: with the session
@@ -1215,22 +1216,24 @@ is fixed before feature work continues.
   write. The stamp needs the record FENCE rather than `sess.mu`, because an off-readLoop
   writer takes the fence without the ownership gate and a body it has already marshalled
   would otherwise land after the Will's origin capture. The acquisition is NON-BLOCKING:
-  a busy fence stamps anyway, unordered, since the probe is a writer this change ADDS
-  and would otherwise persist `DisconnectedAt = 0` at a newer sequence, and the residual
-  is the one already-marshalled body. Waiting for the fence instead bought two defects
-  for one fix (a stale entry uncertainty check, and a park timestamped a JetStream
-  timeout late that re-opens an elapsed Will Delay), which is why it does not. The
-  hazard itself is pre-existing — the void-verdict release handoff already makes such a
-  write — but was not shippable alongside a recurring second writer. The reproduction
-  the bullet demanded is a CAUSAL PAIR on an instance-scoped, client-hash-keyed
-  persist-drop seam: notification delivered → evicted by `processSessionPersist` alone;
-  identical takeover with it dropped → resident until the settlement classifies it. 8
-  plan rounds + 9 holistic rounds. **The BOUND half was cut** at round 9 after four
-  consecutive regressions in it (next bullet); the unbound design was untouched by all
-  of them. Residuals in `docs/CONFORMANCE.md`: convergence is bounded by the next PASS
-  that reaches the session — a serial unbudgeted walk, so the honest bound carries its
-  backlog term, not "one interval"; a BOUND session was not settled until it unbinds
-  (closed by the next bullet);
+  a refused acquisition stamps anyway, unordered, since the probe is a writer this change
+  ADDS and would otherwise persist `DisconnectedAt = 0` at a newer sequence, and the
+  residual is the one body the stamp could not order against — on the waiter-priority arm
+  added later, one the prioritized writer marshals just after the refusal rather than one
+  already marshalled, at the same cost.
+  Waiting for the fence instead bought two defects for one fix (a stale entry uncertainty
+  check, and a park timestamped a JetStream timeout late that re-opens an elapsed Will
+  Delay), which is why it does not. The hazard itself is pre-existing — the void-verdict
+  release handoff already makes such a write — but was not shippable alongside a recurring
+  second writer. The reproduction the bullet demanded is a CAUSAL PAIR on an
+  instance-scoped, client-hash-keyed persist-drop seam: notification delivered → evicted
+  by `processSessionPersist` alone; identical takeover with it dropped → resident until
+  the settlement classifies it. 8 plan rounds + 9 holistic rounds. **The BOUND half was
+  cut** at round 9 after four consecutive regressions in it (next bullet); the unbound
+  design was untouched by all of them. Residuals in `docs/CONFORMANCE.md`: convergence is
+  bounded by the next PASS that reaches the session — a serial unbudgeted walk, so the
+  honest bound carries its backlog term, not "one interval"; a BOUND session was not
+  settled until it unbinds (closed by the next bullet);
   sustained contention holds the object at one probe per pass; the marker is
   memory-only; the record is not a liveness lease; protection is per owning broker and
   behaviourally asymmetric during a rolling upgrade although wire-symmetric; and the
@@ -1277,22 +1280,65 @@ is fixed before feature work continues.
   resolver's clear-at-base seam can produce a FALSE foreign verdict, which now closes a
   live connection (next bullet).
 
-- [ ] The session-record fence is not barge-proof, so a BLOCKING acquisition has no
-  starvation bound. `beginRecordTx` waits on the session's condition variable
-  (`sess_recordtx.go`) and `tryBeginRecordTx` takes the fence whenever it finds it free, so
-  a queued blocking waiter has no priority: sustained off-readLoop writer activity on one
-  session — delivery finalizers, register discharges — can hand the fence between try-callers
-  indefinitely while the waiter sleeps. Go's `sync.Cond` gives no FIFO guarantee either. The
-  three blocking callers are `mqttProcessSubs`, `mqttProcessUnsubs` and the bound rejection
-  settlement, and all three hold the session OWNERSHIP GATE while they wait, so a starved
-  waiter also fails a same-client-ID CONNECT for as long as it lasts (the CONNECT's own spin
-  is 10 × 100ms). Pre-existing; what is new is that the settlement's stated "~3 JetStream
-  timeouts" bound depends on it. A fix is to make the fence prefer queued waiters — count
-  them and have `tryBeginRecordTx` refuse while one is queued, which the try-callers' own
-  contract already tolerates ("failing to get the fence must leave their work pending and
-  retryable") — plus a stress test with continuous off-readLoop attempts proving the
-  blocking caller acquires within the current holder's bounded duration. Found by holistic
-  round 5 of the bound settlement.
+- [x] The session-record fence is now BARGE-PROOF against non-blocking acquisitions, which
+  is what this bullet named ("count them and have `tryBeginRecordTx` refuse while one is
+  queued"). `beginRecordTx` ANNOUNCES itself in an atomic waiter count incremented BEFORE
+  it contends on `sess.mu` — the announce is the linearization point, and a count taken under
+  the mutex would have left a pre-advertisement window resting on `sync.Mutex` fairness the
+  Go API does not document — and both non-blocking acquisition sites refuse while it is
+  nonzero: `tryBeginRecordTx` and the void-verdict release handoff's inline acquisition
+  (`voidVerdictHandoffPendingLocked`, one conjunct serving its three uses). The refusal in
+  `tryBeginRecordTx` is DOUBLE-CHECKED, and the pre-lock half is a liveness guarantee rather
+  than an optimization: without it a try-storm keeps contending for the very mutex the
+  announced waiter needs, so the claim would have rested on mutex fairness again. A caller
+  refused pre-lock never touches `sess.mu`; one already past it contends once and refuses
+  at the authoritative under-mutex reload, which is where acquisition linearizes.
+  Two corrections to this bullet's own text. Its "three blocking callers" undercounts: the
+  affected set is the CLASS of blocking fence acquisitions made while holding the session
+  OWNERSHIP GATE — `mqttProcessSubs`, `mqttProcessUnsubs`, the bound rejection settlement,
+  the CONNECT accept transaction, session expiry, the ordinary disconnect close on both
+  branches, and the deferred disconnect discharge — explicitly non-exhaustive. And the
+  CONNECT spin is 10 failed checks with nine 100 ms sleeps (~900 ms), not 10 × 100 ms.
+  RETAINED RESIDUAL, not closed: there is no FIFO among BLOCKING waiters, so a newly
+  arriving `beginRecordTx` can win the post-broadcast mutex race against an older one and
+  identity churn can starve a waiter at a small constant count; `docs/CONFORMANCE.md`
+  residual 13 states that with the reciprocal cost (refused non-blocking writers retry on
+  events, not on a clock; the never-expire close stamp, which does not retry, takes its
+  unordered arm on more occasions) and the per-broker rollout scope. Tests:
+  `TestRecordTxTryBeginDefersToQueuedWaiter` (six parts — the direct refusal at counts 1 and
+  2, the barge-free storm window, exactly-once withdrawal, and the three orderings the double
+  check consists of, driven through three new production seams: a wait-loop seam under
+  `sess.mu`, a pre-lock seam outside it, and a withdrawal-guard seam on the abnormal exit
+  path),
+  `TestRecordTxBlockingAcquisitionBoundedUnderTryStorm` (this bullet's stress test),
+  `TestRecordTxWaitHookGoexitWithdrawsAnnounce` (the withdrawal guard),
+  `TestRecordTxAbnormalWithdrawalPrecedesTheUnlock` (that guard withdraws INSIDE the
+  critical section, so no reader of the count ever sees an announce for a waiter that no
+  longer exists), `TestRecordTxWithdrawGuardHookGoexitStillCleansUp` (that guard's own
+  cleanup is exception-safe, so a seam dying mid-cleanup strands neither the announce nor
+  the session lock) and
+  `TestMQTTVoidVerdictHandoffDefersToQueuedWaiter` (predicate, release deferral to the
+  waiter's own release, and the periodic backstop's re-arm). Mutations run and KILLED:
+  M1-M11, M12a/M12b, M13 and M14a/M14b (both waiter checks, the handoff conjunct, the
+  announce and its placement, the early withdraw, the withdrawal guard and its flag, the
+  withdrawal moved after the unlock, each half of the guard cleanup's exception safety,
+  the backstop's `owed` predicate, each half of the double check, the
+  reload hoisted out from under the mutex, and each check weakened from `> 0` to `== 1`).
+  One earlier shape of the withdrawal-ordering test — an observer parked on `sess.mu`
+  reading the count as the dying waiter released it — let M13 SURVIVE 200 iterations and
+  was replaced by the guard seam's lock-held assertion; that is what the third seam is
+  for. Both regression tests' failure paths were
+  checked to REPORT rather than hang: the handoff test's cleanup releases the fence holder
+  before it unparks and joins the waiter, and with that release removed an intentionally
+  failed pre-release assertion hangs to the suite timeout instead of failing (verified in
+  both directions), which is how an announcement regression would have disappeared into a
+  timeout. One MUTATION-HARNESS fault was found and fixed mid-run, by review: M6 was defined
+  as deleting both calls to the guard closure, which leaves it declared and unused, so the
+  package did not build and the harness read the nonzero exit as a kill — a build failure
+  is not a kill. M6 is now a compiling behavioural mutation (the guard fires but withdraws
+  nothing), the harness refuses any run whose paired test did not actually execute, and
+  every mutation above was re-run on the final tree under that rule. 21 plan-review
+  rounds. Found by holistic round 5 of the bound settlement.
 
 - [ ] No single owner exists for "displace this connection", and it costs a second
   DISCONNECT. Four paths displace a bound connection — a local CONNECT takeover

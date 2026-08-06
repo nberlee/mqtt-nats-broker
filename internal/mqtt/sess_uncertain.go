@@ -226,7 +226,12 @@ func (sess *mqttSession) resolveUncertainWrite() (mqttUncertainResolution, error
 	return res, err
 }
 
-var errMQTTResolveFenceBusy = errors.New("another record transaction is open; resolution deferred")
+// errMQTTResolveFenceBusy covers both refusal causes of the non-blocking acquisition:
+// another record transaction is open, or the fence is free but reserved for an
+// announced blocking writer under waiter priority (see sess_recordtx.go). The caller's
+// arm is the same either way — not now, retry on the periodic pass — which is why one
+// error serves both.
+var errMQTTResolveFenceBusy = errors.New("the record fence is unavailable (a transaction is open, or a blocking writer is queued for it); resolution deferred")
 
 // resolveUncertainWriteInTx is resolveUncertainWrite's body, with the fence held.
 func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainResolution, error) {
@@ -1291,8 +1296,11 @@ func (as *mqttAccountSessionManager) reconcileResidentRecordState(s *Server) {
 			continue
 		}
 		// Nothing outstanding on the record, but possibly still owing a void-register
-		// verdict: the BACKSTOP is what makes the release handoff's liveness claim true
-		// unconditionally.
+		// verdict: the BACKSTOP is what carries the release handoff's liveness past a
+		// definite store failure. Not unconditional — the attempt it re-arms enters the
+		// same pending predicate, so it defers again while a blocking writer is announced
+		// for the fence (see sess_recordtx.go), and that waiter's own release is then the
+		// next trigger.
 		as.flushVoidVerdictGap(sess)
 	}
 }
@@ -1350,6 +1358,14 @@ func (as *mqttAccountSessionManager) settleRejectionFromSweep(s *Server, sess *m
 func (as *mqttAccountSessionManager) flushVoidVerdictGap(sess *mqttSession) {
 	sess.mu.Lock()
 	// The pending condition minus the watermark: that is the conjunct being re-armed.
+	//
+	// Minus the WAITER conjunct too, deliberately, and that is load-bearing: re-arming
+	// while a blocking writer is announced for the fence is exactly what lets that
+	// waiter's eventual release trigger the handoff. Completing the predicate here —
+	// adding recordTxWaiters.Load() == 0 to owed — would leave the watermark burned, so
+	// the release finds nothing above it and the retry waits a whole further sweep
+	// interval, lengthening the memory-only crash window for no gain. The attempt this
+	// re-arm drives still tests the waiter conjunct, so nothing barges.
 	owed := !sess.seqUncertain && sess.c == nil && !sess.recordTxOpen && !sess.voidHandoffActive &&
 		sess.voidedRegsRev > sess.voidedRegsSavedRev
 	if owed {

@@ -28,6 +28,26 @@
 // There is deliberately no "a zero token opens one for you" convenience. A
 // transaction that starts after the mutation cannot make that mutation invisible
 // to another writer, which is the entire point.
+//
+// # Waiter priority
+//
+// The fence is barge-proof against the non-blocking form. A blocking acquisition
+// ANNOUNCES itself (recordTxWaiters) before contending on sess.mu, and every
+// non-blocking acquisition refuses while the count is nonzero. Both linearization
+// points are exact: the announce is an atomic increment ordered before the mutex
+// contention, and an acquirer linearizes at its successful free-fence predicate load
+// under sess.mu.
+//
+// What that delivers: try-callers cannot add a fence hold ahead of an announced
+// waiter unless already admitted at the announce — at most one such pre-admitted
+// transaction exists, blocking, try, or the inline handoff, because sess.mu
+// serializes the predicate loads. What it does NOT deliver: any FIFO among BLOCKING
+// waiters (a newly arriving beginRecordTx can win the post-broadcast mutex race
+// against an older Cond waiter, so identity churn can starve one waiter at a
+// constant count), and no priority at all over ordinary sess.mu traffic, which is
+// invisible to the count. A try-caller delayed past the waiter's completion succeeds
+// normally, which lengthens nothing. See docs/CONFORMANCE.md residual 13 for the
+// blocking-vs-blocking residual this leaves stated rather than fixed.
 
 package mqtt
 
@@ -62,32 +82,151 @@ func (sess *mqttSession) recordTxCondLocked() *sync.Cond {
 }
 
 // beginRecordTx opens a record transaction, WAITING while another writer holds the
-// fence. Only outermost readLoop entry points may use it: a session has one bound
-// readLoop, and the non-readLoop clear() callers (session expiry) are already
-// serialized against a reconnect by lockSession, so at most one blocking caller
-// can exist at a time.
+// fence. It is the form for a caller that cannot proceed without the fence and is not
+// running on a goroutine that might already hold one: outermost readLoop entry points,
+// the CONNECT accept transaction, session expiry, teardown, the bound rejection
+// settlement, the will-cancel write, the drain's recovery paths.
+//
+// Blocking callers are ordinarily SPARSE on one session — the readLoop entry points
+// share the session's single readLoop, and the expiry-side clear() is serialized against
+// a reconnect by lockSession — but MULTIPLE ones are permitted, and nothing here orders
+// them. There is no FIFO among blocking waiters: a newly arriving beginRecordTx can win
+// the post-broadcast mutex race against an older Cond waiter, so under a sustained stream
+// of blocking arrivals one waiter can be preceded indefinitely. That residual is stated,
+// not fixed (docs/CONFORMANCE.md residual 13); what this function does guarantee is
+// priority over the NON-BLOCKING form, below.
+//
+// The wait is BARGE-PROOF against non-blocking acquisitions. sync.Cond gives no
+// handoff — Broadcast only wakes a waiter, which must then re-acquire sess.mu and
+// re-check — so without the announce below, a sustained stream of try-callers could
+// pass the fence between themselves indefinitely while this caller starved. That
+// matters because a blocking acquisition is usually made while holding the session
+// OWNERSHIP GATE, so a starved waiter also fails every same-client-ID CONNECT for
+// as long as the starvation lasts.
 //
 // Lock not held on entry.
 func (sess *mqttSession) beginRecordTx() recordTx {
+	// Announced BEFORE contending on sess.mu: while this announce remains
+	// outstanding, no non-blocking acquisition whose predicate load follows it can
+	// take the fence. At most one transaction already past its successful free-fence
+	// predicate — blocking, try, or the inline handoff; sess.mu serializes them all —
+	// can still be admitted after the announce, and OTHER BLOCKING callers (already
+	// queued or arriving later) may acquire first, in no particular order. What the
+	// announce guarantees is narrower and exact: try-callers cannot add a fence hold
+	// ahead of this waiter unless already admitted at the announce. A try load
+	// following the announce refuses without locking sess.mu; a caller past only the
+	// fast check contends once and refuses if its authoritative reload occurs while
+	// the announce remains outstanding; at most one caller already past the
+	// authoritative predicate may still open and hold the fence; and a delayed caller
+	// may succeed after this waiter has completed.
+	sess.recordTxWaiters.Add(1)
+	// The withdrawal guard: an announce must be withdrawn on EVERY exit from this
+	// function, and once sess.mu is held it must be withdrawn INSIDE the critical section
+	// that holds it. A panic or runtime.Goexit escaping the wait-loop test seam (t.Fatal in
+	// a hook is a Goexit, which runs defers but skips straight-line code) would otherwise
+	// leave the count positive forever, refusing every later non-blocking acquisition.
+	//
+	// The ordering against the unlock is load-bearing, not tidiness: an abnormal exit that
+	// unlocked first would publish a FREE fence with a dead waiter still announced, and a
+	// release acquiring sess.mu in that window would suppress the void-verdict handoff for
+	// a waiter that no longer exists — with the withdrawal behind it having no release of
+	// its own to re-trigger the attempt, so the staged verdict would stay memory-only until
+	// some later event or the periodic backstop. Every observer of the count that matters
+	// reads it under sess.mu, so withdrawing before the unlock makes the announce and the
+	// waiter's existence agree at every point such an observer can look.
+	announced := true
+	withdraw := func() {
+		if announced {
+			announced = false
+			sess.recordTxWaiters.Add(-1)
+		}
+	}
+	// withdrawAtExit is withdraw for an exit that never reached the explicit withdrawal
+	// below — the abnormal path, and the only one that still finds the announce
+	// outstanding. Its test seam fires there and nowhere else, and it exists to make the
+	// ordering above assertable rather than argued: a handler that finds sess.mu FREE has
+	// caught the withdrawal happening outside the critical section, which is the state a
+	// release would misread. Nothing on the normal path reaches it.
+	withdrawAtExit := func() {
+		if !announced {
+			return
+		}
+		// Deferred, not called after the seam: a cleanup path must be exception-safe, or
+		// the seam becomes another way to reach exactly the abnormal exit this guard
+		// exists to cover — with the announce left outstanding for the life of the
+		// session.
+		defer withdraw()
+		if h := mqttTestRecordTxWithdrawGuardHookV.Load(); h != nil {
+			(*h)(sess)
+		}
+	}
+	// Covers an exit before sess.mu is held at all. It runs last, after the locked cleanup
+	// below has already withdrawn on every path that got the lock.
+	defer withdrawAtExit()
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
+	defer func() {
+		// The unlock is deferred for the same reason, and it is what keeps the withdrawal
+		// inside the critical section: the withdrawal runs while this frame does, the
+		// unlock only as it leaves — including when the guard's seam dies mid-cleanup.
+		defer sess.mu.Unlock()
+		withdrawAtExit()
+	}()
 	for sess.recordTxOpen {
+		// Test seam, fired under sess.mu each iteration before Wait — the causal point
+		// at which a waiter is provably announced and parked, which is what lets a test
+		// read the count without racing the scheduler. Same pattern as
+		// mqttTestRecordTxReleaseHookV. A handler runs with sess.mu HELD, so one that
+		// blocks pins every other user of the session lock — deliberately usable as such,
+		// and it must therefore never wait on anything that itself needs sess.mu. The
+		// withdrawal guard above keeps the count balanced if one panics or Goexits.
+		if h := mqttTestRecordTxWaitHookV.Load(); h != nil {
+			(*h)(sess)
+		}
 		sess.recordTxCondLocked().Wait()
 	}
+	// Withdrawn under sess.mu immediately before opening, so the count never reads
+	// zero while this waiter is still due the fence.
+	withdraw()
 	return sess.openRecordTxLocked()
 }
 
 // tryBeginRecordTx opens a record transaction without ever waiting, reporting
-// false when another writer holds the fence. This is the form for off-readLoop
-// writers (drain finalizers): failing to get the fence must leave their work
-// pending and retryable, never blocked, and it is what makes such a writer unable
-// to observe or persist a half-applied readLoop transaction.
+// false when another writer holds the fence OR a blocking writer has announced
+// itself for it. This is the form for off-readLoop writers (drain finalizers):
+// failing to get the fence must leave their work pending and retryable, never
+// blocked, and it is what makes such a writer unable to observe or persist a
+// half-applied readLoop transaction.
 //
 // Lock not held on entry.
 func (sess *mqttSession) tryBeginRecordTx() (recordTx, bool) {
+	// Double-checked refusal. The pre-lock fast path is a LIVENESS guarantee, not an
+	// optimization: a try-caller refused HERE never touches sess.mu, so while an
+	// announce is outstanding NEW try arrivals stop contending for the mutex. One
+	// already past this check contends once and refuses at the reload below if the
+	// announce is still outstanding there — it may instead be the one pre-admitted
+	// transaction, or succeed later once the waiter has completed. Without the fast
+	// path, sync.Mutex's undocumented fairness would be the only thing keeping a storm
+	// from starving the announced waiter of the mutex itself.
+	//
+	// Refusing on a stale positive is safe because it selects the same arm ANY refusal
+	// selects — retry later for most consumers, the unordered fallback for the
+	// never-expire close stamp in mqttHandleClosedClient, whose residual
+	// this transient merely gives one more occasion.
+	if sess.recordTxWaiters.Load() > 0 {
+		return recordTx{}, false
+	}
+	// Test seam, PRE-LOCK, after the zero observation. Unlike the wait-loop seam this
+	// one runs outside sess.mu, so a handler MAY block — which is what lets a test park
+	// a try-caller here causally.
+	if h := mqttTestTryBeginPreLockHookV.Load(); h != nil {
+		(*h)(sess)
+	}
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	if sess.recordTxOpen {
+	// The authoritative re-check, under the mutex: acquisition linearizes HERE, and
+	// this reload is what closes the race with an announce that landed after the fast
+	// path's load.
+	if sess.recordTxOpen || sess.recordTxWaiters.Load() > 0 {
 		return recordTx{}, false
 	}
 	return sess.openRecordTxLocked(), true
@@ -215,6 +354,63 @@ func setMQTTTestRecordTxReleaseHook(h func(sess *mqttSession)) func() {
 		mqttTestRecordTxReleaseHookV.Store(&h)
 	}
 	return func() { mqttTestRecordTxReleaseHookV.Store(prev) }
+}
+
+// mqttTestRecordTxWaitHookV fires inside beginRecordTx's wait loop, under sess.mu,
+// after the announce and before each Wait. It is the causal point at which a
+// blocking waiter is provably announced and parked, so a test can read
+// recordTxWaiters there rather than polling against the scheduler. Handlers run with
+// sess.mu HELD: one that blocks pins every other user of the session lock, which is
+// how a test holds a waiter in place, and it must therefore never wait on anything
+// that itself needs sess.mu. See beginRecordTx.
+var mqttTestRecordTxWaitHookV atomic.Pointer[func(sess *mqttSession)]
+
+func setMQTTTestRecordTxWaitHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestRecordTxWaitHookV.Load()
+	if h == nil {
+		mqttTestRecordTxWaitHookV.Store(nil)
+	} else {
+		mqttTestRecordTxWaitHookV.Store(&h)
+	}
+	return func() { mqttTestRecordTxWaitHookV.Store(prev) }
+}
+
+// mqttTestTryBeginPreLockHookV fires in tryBeginRecordTx between the pre-lock fast
+// refusal and sess.mu.Lock(). It runs OUTSIDE sess.mu, so unlike the wait-loop seam
+// a handler MAY block — which is what lets a test park a try-caller between the two
+// halves of the double check and drive the interleaving causally rather than by
+// timing. See tryBeginRecordTx.
+var mqttTestTryBeginPreLockHookV atomic.Pointer[func(sess *mqttSession)]
+
+// mqttTestRecordTxWithdrawGuardHookV fires in beginRecordTx's withdrawal guard, on an
+// ABNORMAL exit only (a panic or runtime.Goexit that skipped the explicit withdrawal),
+// immediately before the announce is withdrawn. It is what makes the withdrawal's
+// ordering against the unlock assertable: sess.mu is HELD at this point on every exit
+// that got the lock, so a handler observing a free lock has caught the withdrawal
+// escaping the critical section.
+//
+// A handler here may itself panic or Goexit — the withdrawal and the unlock are both
+// deferred around it, so the count and the lock come back either way. See beginRecordTx.
+var mqttTestRecordTxWithdrawGuardHookV atomic.Pointer[func(sess *mqttSession)]
+
+func setMQTTTestRecordTxWithdrawGuardHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestRecordTxWithdrawGuardHookV.Load()
+	if h == nil {
+		mqttTestRecordTxWithdrawGuardHookV.Store(nil)
+	} else {
+		mqttTestRecordTxWithdrawGuardHookV.Store(&h)
+	}
+	return func() { mqttTestRecordTxWithdrawGuardHookV.Store(prev) }
+}
+
+func setMQTTTestTryBeginPreLockHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestTryBeginPreLockHookV.Load()
+	if h == nil {
+		mqttTestTryBeginPreLockHookV.Store(nil)
+	} else {
+		mqttTestTryBeginPreLockHookV.Store(&h)
+	}
+	return func() { mqttTestTryBeginPreLockHookV.Store(prev) }
 }
 
 // validateSessStream verifies a $MQTT_sess stream can carry session records.

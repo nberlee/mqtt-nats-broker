@@ -664,14 +664,36 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       rebound session is never answered, and transient contention is waited out) but not the
       class; closing it needs one owner for takeover notification and close across all four
       paths, which is its own §0 roadmap item.
-  13. **The gate hold is not starvation-free.** "At most one probe per arming, roughly three
-      JetStream timeouts" assumes the record fence is handed to the waiting settlement when
-      its current holder releases. `beginRecordTx` waits on a condition variable with no
-      FIFO guarantee and `tryBeginRecordTx` can barge it, so sustained off-readLoop writer
-      activity on one session stretches both the wait and the ownership gate the settlement
-      holds — which a same-client-ID CONNECT can then fail against. Pre-existing property
-      of the fence, shared by SUBSCRIBE's and UNSUBSCRIBE's blocking acquisitions; its own
-      roadmap item.
+  13. **The gate hold is bounded against non-blocking writers only.** "At most one probe per
+      arming, roughly three JetStream timeouts" needs the record fence to reach the waiting
+      settlement once its current holder releases. The TRY-BARGE half of that is closed:
+      `beginRecordTx` announces itself before it contends on `sess.mu`, and every
+      non-blocking acquisition refuses while an announce is outstanding, so sustained
+      off-readLoop writer activity can no longer pass the fence between try-callers while
+      the settlement starves — at most one already-admitted transaction precedes it.
+      What remains open is BLOCKING-vs-BLOCKING: `Cond` gives no FIFO, so a newly arriving
+      `beginRecordTx` can win the post-broadcast mutex race against an older waiter, and
+      identity churn can starve one waiter indefinitely even at a small constant count. In
+      ordinary operation there is at most one blocking caller per session, which is an
+      observation about the call sites rather than an enforced invariant; a same-client-ID
+      CONNECT can still fail against a starved waiter's gate hold. The remedy also has a
+      RECIPROCAL cost, accepted deliberately: while blocking writers keep arriving,
+      non-blocking writers can be refused indefinitely, and their retries are event-driven
+      (packet tails, redeliveries, later register stores, the periodic pass) rather than
+      time-bounded — so a refusal on a session that then goes idle converts an immediate
+      persistence into one that waits for the next event. The void-verdict release handoff
+      is deferred the same way, which lengthens the memory-only window for a staged
+      verdict (the periodic backstop's own attempt defers too; the usual convergence is
+      the prioritized transaction's own landed save, since every landed save marshals
+      current memory). And the never-expire close stamp, the one non-blocking writer that
+      does NOT retry, takes its unordered fallback on more occasions — including with the
+      fence FREE but reserved for an announced waiter. Nothing is marshalled at the instant
+      of that refusal, but the prioritized writer can open its transaction and marshal
+      `DisconnectedAt = 0` before the fallback stamps, so that arm reaches the SAME one-body
+      exposure rather than a cost-free state. Waiter priority is a per-broker property of
+      an in-process fence: during a rolling upgrade a session resident on an older broker
+      keeps the original barge exposure until that broker upgrades, and no wire, stream or
+      record state is involved either way.
   14. **A takeover still mid-flight can have its Will published by this connection's
       close.** The rebound arm applies the takeover's own discard rule as soon as the rebind
       is observable. Before the rebind there is nothing to observe: if the bounded retry
@@ -722,10 +744,17 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   a body an off-readLoop writer had already marshalled with `DisconnectedAt = 0` free to
   land after the Will's origin sequence is captured, while holding the fence means every
   earlier marshal has completed and advanced the sequence that capture reads. The
-  acquisition is NON-BLOCKING, and what a busy fence costs is stated exactly: the close
-  **still stamps**, unordered, so every marshal from that point on — the rejection probe
-  included — carries the disconnect time, and the residual is the ONE body already
-  marshalled inside that open transaction, which no non-blocking form can order against.
+  acquisition is NON-BLOCKING, and what a refused acquisition costs is stated exactly: the
+  close **still stamps**, unordered, so every marshal from that point on — the rejection probe
+  included — carries the disconnect time, and the residual is at most the ONE body already
+  marshalled inside an open transaction, which no non-blocking form can order against.
+  Refusal has two causes and the same cost. An open (or already-admitted) transaction is
+  the case above. WAITER PRIORITY refuses on a FREE fence reserved for an announced
+  blocking writer: nothing is open at the refusal, but that writer can take `sess.mu`,
+  open its transaction and marshal `DisconnectedAt = 0` before the stamp is taken, so the
+  exposure is the same one body rather than none. Because this site does not retry, waiter
+  priority gives more occasions of this same residual — not a cost-free arm (residual 13
+  above).
   Stamping there is not optional: the probe is a writer this change ADDS, and skipping it
   would leave the probe free to persist current memory with `DisconnectedAt = 0` at a newer
   sequence, which the fence reads as a reconnect. The fence is not WAITED for, because
@@ -734,7 +763,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   after a wait timestamps the close up to a JetStream timeout late, re-opening an
   already-elapsed Will Delay for a reconnect to cancel. The in-fence arm additionally
   re-checks that the record state is still resolved and parks the teardown if it is not;
-  the busy-fence arm makes no such check, because without the fence there is no sound one
+  the refused arm makes no such check, because without the fence there is no sound one
   to make. The field is inert for expiry (every reader pre-filters on never-expire), and
   the pre-existing finite-close window where the purge's own write publishes
   `DisconnectedAt = 0` before the disconnect save corrects it is unchanged — not widened,
