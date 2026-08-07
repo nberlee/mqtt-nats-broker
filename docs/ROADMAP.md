@@ -1248,13 +1248,15 @@ is fixed before feature work continues.
   as the bound client — the claim a SUBSCRIBE makes, so it never fails one — takes the
   record fence in its blocking form, and probes. Only a LANDED CAS lets the packet
   through; the three non-serving outcomes are distinct. **Foreign**: discard the Will as a
-  local takeover does, dispose the session state under the gate, then write 0x8E and close
-  SYNCHRONOUSLY on the readLoop before returning nil (the graceful-DISCONNECT branch's
-  shape). **Unsettled** (contended, unreadable, ambiguous, or suspended by an unresolved
+  local takeover does, dispose the session state under the gate, then attempt the 0x8E
+  through the shared tail and close SYNCHRONOUSLY on the readLoop before returning nil (the
+  graceful-DISCONNECT branch's shape; the attempt is suppressed for a pre-CONNACK
+  connection, or one whose DISCONNECT another path already claimed). **Unsettled**
+  (contended, unreadable, ambiguous, or suspended by an unresolved
   write): fail closed with `errMQTTSessionOwnershipUnsettled` → **0x89**, never 0x8E,
   through the ordinary parse-error path so the real close bookkeeping runs. **Rebound**:
-  close in SILENCE — the takeover sends its own 0x8E, and a courtesy packet appended to it
-  would be a second DISCONNECT giving opposite advice — with `mqttDiscardWillOnTakeover`
+  close in SILENCE — the takeover makes its own 0x8E attempt, and speaking here would race
+  it for the reason the client is left with — with `mqttDiscardWillOnTakeover`
   applied here, because `mqttHandleClosedClient` owes a Will BEFORE it contends for the
   gate and an early close would otherwise publish a Will the takeover was about to
   suppress. A refused ownership claim is CLASSIFIED rather than read as a verdict, through
@@ -1340,25 +1342,50 @@ is fixed before feature work continues.
   every mutation above was re-run on the final tree under that rule. 21 plan-review
   rounds. Found by holistic round 5 of the bound settlement.
 
-- [ ] No single owner exists for "displace this connection", and it costs a second
-  DISCONNECT. Four paths displace a bound connection — a local CONNECT takeover
-  (`mqttProcessConnect`), `processSessionPersist`, a resolver's foreign disposal, and the
-  bound rejection settlement — and only two of them take the session gate.
-  `processSessionPersist` evicts, enqueues 0x8E and closes ASYNCHRONOUSLY holding `as.mu`
-  alone (`mqtt.go`), so it can overlap even a gate-held settlement probe; the settlement's
-  suspended-by-uncertainty arm answers 0x89 without attempting a claim; and the periodic
-  pass can dispose foreign between the settlement releasing the gate and its close
-  bookkeeping running. Each of those puts a second DISCONNECT on one socket — 0x89 "try
-  again later" after 0x8E "session taken over", or two 0x8Es — which [MQTT-3.14.4-2]
-  forbids the server, and gives the client the opposite advice to the one that is true. The
-  same missing owner is why the Will's fate depends on which goroutine observes the close
-  first (bullet on Will suppression below, routes (a)-(c)). A fix is one atomic
-  displacement transition — notification, close and Will disposition consumed exactly once
-  — shared by all four paths, which is not a change any single one of them can make: the
-  persist path runs on the JSA delivery goroutine and must not block on a gate. Found by
-  holistic rounds 1 and 2 of the bound settlement, which narrowed the common orderings
-  (a rebound session is never answered, transient contention is waited out) without closing
-  the class.
+- [x] "Displace this connection" now has one owner per leg, and a connection gets AT MOST
+  ONE server-initiated DISCONNECT ATTEMPT. Four paths displace a bound connection — a local
+  CONNECT takeover (`mqttProcessConnect`), `processSessionPersist`, a resolver's foreign
+  disposal, and the bound rejection settlement — and each used to notify the client itself,
+  putting a second DISCONNECT on one socket (0x89 "try again later" after 0x8E "session
+  taken over", or two 0x8Es), which [MQTT-3.14.4-1] forbids the server and which gives the
+  client the opposite advice to the one that is true. Of the three legs the original bullet
+  asked to make atomic, two already had exactly-once owners — `closeConnection` is
+  idempotent (`c.closed.Swap`), and `willDisposition` is consumed once by `mqttTakeWill` —
+  so the fix added the missing third rather than a fourth mechanism summarising them:
+  `mqtt.disconnectSent`, consumed under `c.mu` through the single-homed
+  `mqttClaimDisconnectLocked`. Every server-DISCONNECT writer claims: the four displacement
+  paths (through one shared tail, `mqttNotifyTakenOver`), the parse-error footer, the
+  packet-too-large 0x95 and the shutdown drain's 0x8B. The enqueue-path writers claim in the
+  same critical section as the write it authorizes; the shutdown drain, which bypasses the
+  enqueue path, RESERVES the claim under the lock and writes through `writeDirect` after
+  releasing it, so it can spend the claim and write nothing — which is one reason the
+  guarantee is an attempt and not a packet. It builds first, so a nil build spends nothing.
+  A latent second defect in the same class was fixed with it:
+  the CONNECT-takeover and persist notifications were not CONNACK-gated, so a connection
+  displaced before its own CONNACK — the state `mqttAbortAcceptedConnect` leaves — got a
+  0x8E ahead of it, against [MQTT-3.2.0-1]; that gate now has one home in the shared tail
+  and reads `connAckWritten` under `c.mu`, which is why `mqttEnqueueConnAck` stores the flag
+  inside its own write's critical section (storing it after the unlock let a notifier read
+  false for an already-acknowledged client and drop a DISCONNECT it was owed). Residuals,
+  all stated in `docs/CONFORMANCE.md` item 12: the guarantee is at-most-one ATTEMPT, not one
+  delivered packet (a best-effort write can lose to a concurrent close, the shutdown drain's
+  reservation can be spent without a write, and the displaced arm's synchronous close can
+  beat the displacer's notify, leaving zero); a notifier that takes `c.mu` before the CONNACK
+  writer still reads the gate false, so an already-connecting client can get its success
+  CONNACK and then a silent close, with the displaced CONNECT's own remaining work
+  arbitrated by the record CAS as before; which reason wins
+  is race-determined, so a delivered 0x89 can be stale; non-DISCONNECT traffic can still
+  trail the winner until the close lands, which needs a delivery-side gate; the notification
+  write is still unbounded (bullet below); and the `processSessionPersist` overlap with a
+  gate-held probe itself remains, since that path runs on the JSA delivery goroutine and
+  cannot wait on the gate. The claim is an in-process bool, so protection is PER OWNING
+  BROKER and the rollout is asymmetric: nothing wire-, stream- or record-visible changes,
+  and during a mixed-version window a session resident on an OLDER broker keeps the full
+  duplicate-DISCONNECT behaviour on its own sockets until that broker upgrades — a partial
+  deployment is not cluster-wide protection. The Will-fate routes stay with the
+  Will-suppression bullet below,
+  which defers itself to the Will-outbox analysis. Found by holistic rounds 1 and 2 of the
+  bound settlement.
 
 - [ ] The uncertainty resolver clears an ambiguity on a PLAIN LOAD at the base sequence,
   so a late-committing proposal is later read as another owner's — a FALSE FOREIGN
@@ -1383,10 +1410,13 @@ is fixed before feature work continues.
   teardown that follows it, the bound settlement's foreign 0x8E pins its own readLoop, and
   the periodic pass's `disposeForeignSessionLocked` performs that write while holding the
   session gate, which blocks a reconnecting CONNECT for as long as the stalled client
-  lasts. A deadline is not enough on its own: `writeSocket` installs it only AFTER
-  acquiring `wmu`, so an earlier unbounded writer holding that mutex leaves the "bounded"
-  write unbounded — a gap `shutdownDisconnect` shares. Three fix shapes were tried and
-  each was killed by a review round of the bound settlement, so do not repeat them: (1) a
+  lasts. The DISCONNECT claim above removes a write only when it suppresses one (a second
+  notification, or a pre-CONNACK takeover); the first claimant still writes unbounded, so
+  every site here stands. A deadline is not enough on its own: `writeSocket` installs it
+  only AFTER acquiring `wmu`, so an earlier unbounded writer holding that mutex leaves the
+  "bounded" write unbounded — a gap `shutdownDisconnect` shares. Three fix shapes were
+  tried and each was killed by a review round of the bound settlement, so do not repeat
+  them: (1) a
   SYNCHRONOUS write on the readLoop bounds nothing and pins the loop; (2) an ASYNCHRONOUS
   goroutine that writes then closes never reaches the close while the write blocks, and
   with the read deadline cleared the connection stays open forever; (3) `writeDirect` with

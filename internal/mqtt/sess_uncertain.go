@@ -592,12 +592,14 @@ func (sess *mqttSession) disposeForeignStateLocked(asm *mqttAccountSessionManage
 // close itself is the caller's: it is what differs between the off-readLoop callers and the
 // settlement running on this connection's own readLoop.
 //
+// The notification itself is mqttNotifyTakenOver's, the one tail every displacement path
+// shares: the CONNACK gate that used to be checked here lives there now, alongside the
+// claim that keeps this from being the second DISCONNECT on the socket.
+//
 // No lock held on entry.
 func (c *client) mqttNotifyForeignDisposal(id string) {
 	c.Warnf("MQTT: session %q is now owned elsewhere; closing this connection", id)
-	if c.connAckWritten.Load() {
-		c.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
-	}
+	c.mqttNotifyTakenOver()
 }
 
 // disposeForeignSession is disposeForeignSessionLocked for a caller that does not

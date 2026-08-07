@@ -260,8 +260,10 @@ const (
 	// mqttBoundDisplaced: the ownership claim was refused, or the disposal's identity
 	// check found the session rebound. Some other operation owns this client ID right now
 	// — a CONNECT taking the session over, a remote persist observation evicting it, a
-	// resolver disposing it — and every one of those tells the client itself and closes
-	// the connection. This arm therefore says NOTHING and only closes.
+	// resolver disposing it — and every one of those owns the notification as well as the
+	// close. This arm therefore says NOTHING and only closes. Staying silent is what keeps
+	// the REASON theirs; the claim would refuse a second attempt in any case, and their
+	// attempt can itself be suppressed (CONNACK gate) or fail.
 	mqttBoundDisplaced
 	// mqttBoundDisposed: the probe proved the session foreign and this settlement disposed
 	// it, so this connection is the one that owes the client its 0x8E.
@@ -287,11 +289,13 @@ const (
 //
 // The silence on the displaced arm is load-bearing, not an omission. A refused claim means
 // a CONNECT takeover, a remote persist observation or a resolver disposal is running for
-// this client ID, and each of those enqueues its OWN 0x8E and closes the connection
+// this client ID, and each of those attempts its OWN 0x8E and closes the connection
 // asynchronously — `processSessionPersist` does it without even taking the gate. Answering
-// a refusal with 0x89 would append "server busy, try again" to another path's "session
-// taken over" on the same socket: two DISCONNECTs where the spec allows one, in an order
-// neither path controls, telling the client the opposite of what happened.
+// a refusal with 0x89 would try to append "server busy, try again" to another path's
+// "session taken over": the connection's one DISCONNECT claim now refuses whichever of the
+// two is second (mqttClaimDisconnectLocked), so the cost of speaking here is no longer a
+// second packet but a WRONG one — this arm racing the displacer for the reason the client
+// is left with, in an order neither path controls.
 //
 // CONNECT and DISCONNECT are exempt. Pre-CONNECT there is no bound session to arbitrate,
 // and a second CONNECT is already a protocol error before dispatch. DISCONNECT neither

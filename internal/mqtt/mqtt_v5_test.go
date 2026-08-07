@@ -2498,6 +2498,36 @@ func TestMQTTv5SessionTakenOverDisconnect(t *testing.T) {
 	}
 }
 
+// A connection displaced BEFORE its own CONNACK is closed silently: CONNACK must be the
+// first packet a client sees [MQTT-3.2.0-1], and mqttAbortAcceptedConnect leaves a refused
+// connection bound until its readLoop detaches it, so the takeover branch can find one.
+//
+// This is the CONNECT-takeover route's half of the gate every displacement path now shares
+// (mqttNotifyTakenOver); the persist, resolver and settlement routes are covered in
+// disconnect_claim_test.go. Forcing connAckWritten false is targeted state injection — the
+// second CONNECT still runs the real mqttProcessConnect displacement branch — and the test
+// makes no claim about how such a connection arises. Its positive twin is the test above,
+// which pins the 0x8E this case must suppress.
+func TestMQTTv5TakeoverBeforeConnAckIsSilent(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c1, r1 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "takeoversilent", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c1.Close()
+	testMQTTReadConnAckV5(t, r1)
+
+	testMQTTGetClient(t, s, "takeoversilent").connAckWritten.Store(false)
+
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "takeoversilent", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+
+	if pt, _, ok := testMQTTReadPacketReady(r1, testMQTTTimeout); ok {
+		t.Fatalf("Expected the displaced connection to be closed without a packet, got type %x", pt&mqttPacketMask)
+	}
+}
+
 // mqttV5RequestProblemInfoProps builds a CONNECT properties body carrying only a
 // Request Problem Information property with the given value (0 or 1).
 func mqttV5RequestProblemInfoProps(v byte) []byte {

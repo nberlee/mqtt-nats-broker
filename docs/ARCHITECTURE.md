@@ -348,10 +348,12 @@ probe and the next opportunity to re-probe.
 the bound client (the claim a SUBSCRIBE makes), takes the record fence in its blocking form
 as an outermost readLoop entry point, and probes. *Landed* → dispatch, marker retired.
 *Foreign* → the Will is discarded as a local takeover discards it, the session state is
-disposed under the gate, and then — off the gate, on the readLoop — the 0x8E is written and
-the connection closed synchronously before `mqttParse` returns, which is the graceful
-DISCONNECT branch's own shape: no re-entry, no second DISCONNECT, and no socket I/O under
-the gate. *No verdict with the gate held* — contended, unreadable, probe ambiguous,
+disposed under the gate, and then — off the gate, on the readLoop — the takeover
+notification is ATTEMPTED through the shared tail (`mqttNotifyTakenOver`; suppressed if this
+connection never saw its CONNACK, or if another displacement path already claimed its one
+DISCONNECT) and the connection closed synchronously before `mqttParse` returns, which is the
+graceful DISCONNECT branch's own shape: no re-entry, no second DISCONNECT, and no socket I/O
+under the gate. *No verdict with the gate held* — contended, unreadable, probe ambiguous,
 suspended by an unresolved write — establishes nothing and closes the connection with
 `errMQTTSessionOwnershipUnsettled`, a parse error mapped to **0x89 "server busy"** rather
 than 0x8E, because announcing a takeover nobody proved would tell a client to stop
@@ -369,8 +371,10 @@ session's owner — bounded, every holder being bounded — and reads the outcom
 - **acquired**: the competing operation finished; probe normally. Transient contention
   therefore does not close a healthy connection whose probe would have landed.
 - **rebound**: a takeover owns this connection now. It is told **nothing** — the takeover
-  sends its own 0x8E, and a courtesy 0x89 appended to that on the same socket would be a
-  second DISCONNECT giving the opposite advice — and its Will is settled here by
+  makes its own 0x8E attempt, and a courtesy 0x89 appended to that on the same socket would
+  be a second DISCONNECT giving the opposite advice (the claim below would refuse it in any
+  case; staying silent here is what keeps the *reason* the takeover's) — and its Will is
+  settled here by
   `mqttDiscardWillOnTakeover`, the takeover's own rule, applied by whichever side notices
   the displacement first. That call is what stops an early close from publishing a Will the
   takeover was about to suppress: `mqttHandleClosedClient` marks a Will OWED *before* it
@@ -380,8 +384,57 @@ session's owner — bounded, every holder being bounded — and reads the outcom
   so it is an ordinary no-verdict outcome and says 0x89.
 
 One path still ignores the gate entirely: `processSessionPersist` evicts, notifies and
-closes under `as.mu` alone, so it can overlap a gate-held probe. That is stated as a
-residual and filed, not claimed away.
+closes under `as.mu` alone, so it can overlap a gate-held probe. Blocking it on the gate is
+not available — it runs on the JSA delivery goroutine, where a gate wait head-of-line-
+stalls every later persist observation — so the overlap itself stays, stated as a residual.
+What no longer follows from it is a second DISCONNECT: see the claim below.
+
+**"Displace this connection" has one owner per leg.** Four paths displace a bound
+connection — a local CONNECT takeover (`mqttProcessConnect`), a remote persist observation
+(`processSessionPersist`), a resolver's foreign disposal (`disposeForeignSessionLocked` →
+`mqttNotifyForeignDisposal`) and the bound settlement's foreign arm above — and they race
+by construction. Rather than one atomic transition shared by all four, each leg of the
+displacement has its own single owner:
+
+- **Notification**: `mqtt.disconnectSent`, consumed under `c.mu` through
+  `mqttClaimDisconnectLocked` — for every enqueue-path writer in the same critical section
+  as the write it authorizes, so there is no check-then-act window; `shutdownDisconnect` is
+  the one exception, reserving the claim under the lock and attempting its `writeDirect`
+  after releasing it, so it can suppress a competing 0x8E and then write nothing. The
+  first ELIGIBLE claimant — of the four paths, the parse-error footer, the packet-too-large
+  0x95, or the shutdown drain's 0x8B — consumes the connection's one notification and every
+  later sender is silent, which is what [MQTT-3.14.4-1] requires ("after sending a DISCONNECT
+  the sender MUST NOT send any more MQTT Control Packets on that Network Connection"). The
+  guarantee is **at most one server-DISCONNECT ATTEMPT per connection**, not one delivered
+  packet: a nil build never reaches the claim, the CONNACK gate can refuse before it, the
+  shutdown drain's reservation can be spent without a write, and the winner's write stays
+  best-effort against a socket a concurrent close may already have taken down. Nothing
+  gates non-DISCONNECT traffic, so a PINGRESP or an in-flight PUBLISH can still trail the
+  winner until the close lands.
+- **Close**: `closeConnection` is idempotent (`c.closed.Swap(true)`). Any number of paths
+  may call it; one runs.
+- **Will disposition**: `willDisposition`, transitioned only under `c.mu` and consumed
+  exactly once by `mqttTakeWill`, with the takeover discard rule applied by whichever side
+  observes the displacement first.
+
+The four takeover notifications share one tail, `mqttNotifyTakenOver`, which is also the only
+home of the [MQTT-3.2.0-1] CONNACK gate for them: a connection displaced before its own
+CONNACK is closed silently, because CONNACK must be the first packet a client sees and
+`mqttAbortAcceptedConnect` leaves a refused connection bound until its readLoop detaches it.
+That gate reads `connAckWritten` under `c.mu`, which is why `mqttEnqueueConnAck` stores the
+flag inside the same critical section as the CONNACK write — storing it after the unlock
+left a window in which a notifier saw `false` for a client that had already been
+acknowledged, and dropped a DISCONNECT it was owed. `shutdownDisconnect` remains a
+separate, legitimate reader of the same flag; it claims like everyone else, but writes
+through `writeDirect` rather than the enqueue path.
+
+What the mutex ordering does NOT decide is which of the two enters first. A notifier that
+takes `c.mu` BEFORE the CONNACK write reads `false`, stays silent, and the client then gets
+its success CONNACK followed by a silent close — the notifier-first ordering, and the price
+of a gate that cannot predict a future CONNACK. The displaced CONNECT's own goroutine keeps
+running until the asynchronous close lands, which is unchanged by this design and is
+arbitrated where it matters: every record write it still makes goes through the session
+record's CAS, so a record another broker has moved rejects it (`docs/CONFORMANCE.md`).
 
 **At most one probe per arming**, so the gate hold is bounded by the fence wait plus a store
 and a readback (roughly three JetStream timeouts) rather than by packet rate: every verdict

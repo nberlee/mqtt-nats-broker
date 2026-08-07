@@ -608,10 +608,13 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
 - **A BOUND session is settled before its next packet is dispatched, and that is narrower
   than "never serves a displaced client".** The gate runs per packet inside `mqttParse`,
   claims the ownership gate as the bound client, and serves only on a landed CAS; every
-  other outcome closes the connection — 0x8E when the probe proved the session foreign,
-  0x89 "server busy" when nothing was established, and SILENCE when the session was found
-  REBOUND (a takeover owns the notification and sends its own 0x8E; a courtesy packet here
-  would contradict it on the same socket). A refused ownership claim is retried while this
+  other outcome closes the connection — a 0x8E ATTEMPT when the probe proved the session
+  foreign, a 0x89 "server busy" attempt when nothing was established, and SILENCE when the
+  session was found REBOUND (a takeover owns the notification and makes its own 0x8E
+  attempt; a courtesy packet here would contradict it on the same socket). Each of those is
+  an attempt rather than a delivered packet: a connection's one server DISCONNECT is claimed
+  once (see (12)), the takeover notification is additionally gated on the CONNACK, and a
+  write can lose to a concurrent close. A refused ownership claim is retried while this
   connection is still the owner rather than read as a verdict. What that leaves:
   1. **Outbound deliveries continue** to the displaced client until an inbound packet
      triggers the settlement, or the connection ends. Closing that needs a delivery-side
@@ -628,7 +631,9 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
      which includes the rejected-close Will publication residual below.
   5. **While suspended by an unresolved write of ours, the connection fails closed
      immediately without probing** — no probe is possible — and the teardown follows the
-     courtesy write, per (9).
+     courtesy write, per (9). That 0x89 now goes through the shared claim like every other
+     server DISCONNECT, so a displacement that already notified this connection suppresses
+     it and the close is silent.
   6. **The rolling-upgrade asymmetry is unchanged**: protection is per owning broker (see
      the last bullet), so an older broker keeps its bound split-brain.
   7. **A false foreign verdict can close a live connection and discard its Will.** The
@@ -644,26 +649,56 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   9. **The fail-closed teardown begins only after the courtesy 0x89 write returns, and that
      write is unbounded**, so a stalled v5 client defers it indefinitely. Pre-existing
      property of the parse-error footer, shared by every parse error today, and NOT
-     gate-held — the settlement releases the ownership gate before returning.
+     gate-held — the settlement releases the ownership gate before returning. A claim
+     already consumed by a displacement removes the write, and with it this delay, but only
+     in that case.
   10. **The park after an ambiguous probe is not guaranteed.** Between the sentinel return
       and the close bookkeeping, the periodic pass's bound-uncertain resolver can classify
       foreign and dispose first, reaching the owed-Will arm the Will bullet below names.
   11. **The foreign arm's 0x8E is an unbounded courtesy write too**, as is the periodic
       pass's disposal 0x8E — which is additionally performed gate-held. Same class as (9),
-      filed as its own §0 roadmap item.
-  12. **No single owner exists for "displace this connection", so a second DISCONNECT
-      remains possible.** Four paths displace a bound connection — a local CONNECT takeover,
-      `processSessionPersist`, a resolver's foreign disposal, and this settlement — and only
-      the first and third take the session gate. `processSessionPersist` evicts, enqueues
-      0x8E and closes ASYNCHRONOUSLY under `as.mu` alone, so it can overlap even a gate-held
-      probe; the suspended-by-uncertainty arm answers 0x89 without attempting a claim at
-      all; and the periodic pass can dispose foreign in the window between this settlement
-      releasing the gate and its close bookkeeping running. In each of those a 0x89 or a
-      0x8E can follow another path's 0x8E on one socket, which [MQTT-3.14.4-2] does not
-      allow the server to do. The classification above removes the common orderings (a
-      rebound session is never answered, and transient contention is waited out) but not the
-      class; closing it needs one owner for takeover notification and close across all four
-      paths, which is its own §0 roadmap item.
+      filed as its own §0 roadmap item. (When the claim or the CONNACK gate suppresses the
+      notification there is no write and no delay; that is not a bound, only a case.)
+  12. **At most one server-DISCONNECT ATTEMPT per connection, which is narrower than one
+      delivered packet with the right reason.** The second-DISCONNECT class is closed: the
+      notification is a per-connection claim (`mqttClaimDisconnectLocked`) shared by all four
+      displacement paths, the parse-error footer, the packet-too-large 0x95 and the shutdown
+      drain, so a 0x89 can no longer follow a 0x8E — or a 0x8E another 0x8E — on one socket,
+      which is what [MQTT-3.14.4-1] forbids. Every enqueue-path writer consumes it in the
+      same `c.mu` critical section as its write; `shutdownDisconnect` is the exception and
+      RESERVES it, claiming under the lock and attempting `writeDirect` after releasing it.
+      What remains:
+      - **Zero notifications is a legal outcome.** The displaced arm closes synchronously
+        while the displacer notifies asynchronously, so the socket can be gone first; a
+        3.1.1 or size-suppressed build never reaches the claim; a connection displaced
+        before its own CONNACK is closed silently by design ([MQTT-3.2.0-1]); and the
+        shutdown drain can spend its reservation and then write nothing — suppressing a
+        competing 0x8E — if the process dies or the deadline-bounded `writeDirect` fails
+        after the unlock.
+      - **A notification can be dropped for an already-acknowledged client.** The CONNACK
+        gate is read under `c.mu` and the flag is stored inside the CONNACK write's own
+        critical section, so a notifier entering AFTER that write always sees it. Entering
+        BEFORE it, the notifier reads `false` and stays silent, and the client gets a
+        success CONNACK followed by a silent close. Nothing can retract bytes or predict a
+        future CONNACK, so this ordering is accepted; it is strictly better than the
+        pre-CONNACK 0x8E it replaces. Its server-side half — the displaced CONNECT's own
+        goroutine continuing until the asynchronous close lands — is unchanged by the claim
+        and is arbitrated by the session record's CAS, which rejects every write it still
+        attempts once another broker has moved the record.
+      - **Which reason wins is race-determined**, so the winning attempt's reason — if it
+        is delivered at all — can be stale: a 0x89 "try again later" claimed a moment
+        before a real takeover is never corrected to 0x8E: written bytes cannot be retracted.
+        A client told 0x89 by mistake reconnects and is handled normally.
+      - **Non-DISCONNECT packets can still trail the final DISCONNECT** until the close
+        lands — a PINGRESP, or an in-flight PUBLISH from a delivery goroutine — which
+        [MQTT-3.14.4-1] also forbids. Nothing gates those; closing it needs a delivery-side
+        gate, the "resident session never re-validates" item's territory.
+      - **The notification write is still unbounded**, per (9) and (11), and the
+        `processSessionPersist` overlap with a gate-held probe itself remains: that path
+        runs on the JSA delivery goroutine and cannot wait on the gate.
+      - **Per owning broker**, like every in-process fix here: during a rolling upgrade a
+        session resident on an older broker keeps the old double-DISCONNECT exposure on its
+        own sockets. No wire, stream or record state is involved (see (6)).
   13. **The gate hold is bounded against non-blocking writers only.** "At most one probe per
       arming, roughly three JetStream timeouts" needs the record fence to reach the waiting
       settlement once its current holder releases. The TRY-BARGE half of that is closed:
@@ -698,7 +733,8 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       close.** The rebound arm applies the takeover's own discard rule as soon as the rebind
       is observable. Before the rebind there is nothing to observe: if the bounded retry
       gives up while the session is still ours (a CONNECT holding the gate for longer than
-      the spin, without having rebound yet), the 0x89 close marks the Will owed, and the
+      the spin, without having rebound yet), the fail-closed close marks the Will owed —
+      independently of whether its 0x89 attempt is written at all — and the
       takeover's later discard preserves an owed Will by design. Narrow, and the same
       Will-disposition race roadmap bullet 1297 tracks.
 - **Sustained contention holds the object for as long as it lasts.** A readback that finds

@@ -522,9 +522,14 @@ type client struct {
 	closed     atomic.Bool
 	finishOnce sync.Once // releases the clientWG lifecycle token exactly once
 	// connAckWritten is set true only after a success CONNACK has been written to
-	// the socket without error. The shutdown drain uses it to decide whether to
-	// send a server DISCONNECT: a pre-CONNACK connection (whose negotiated v5
-	// fields are not yet stable) gets only a socket close.
+	// the socket without error, by mqttEnqueueConnAck under c.mu. Two readers:
+	// the shutdown drain decides whether to send a server DISCONNECT at all (a
+	// pre-CONNACK connection, whose negotiated v5 fields are not yet stable, gets
+	// only a socket close), and mqttNotifyTakenOver gates the takeover
+	// notification on it — a client must see its CONNACK before any other packet
+	// [MQTT-3.2.0-1], and a displaced connection can still be bound before its
+	// CONNACK (mqttAbortAcceptedConnect). That second reader loads it under c.mu,
+	// which is why the store lives inside the CONNACK write's critical section.
 	connAckWritten atomic.Bool
 }
 
@@ -845,19 +850,34 @@ func (c *client) abortSetup(reason ClosedState) {
 }
 
 // shutdownDisconnect is the per-client drain step. For a connection that
-// completed a v5 CONNACK it sends a server DISCONNECT (0x8B "server shutting
-// down") under a bounded write deadline, then closes the socket; a pre-CONNACK
-// or 3.1.1 connection gets only a socket close. It deliberately does NOT run
+// completed a v5 CONNACK and still holds its one DISCONNECT claim, it ATTEMPTS a
+// server DISCONNECT (0x8B "server shutting down") under a bounded write deadline,
+// then closes the socket; a pre-CONNACK or 3.1.1 connection, and one already told
+// 0x8E by a displacement, get only a socket close. It deliberately does NOT run
 // MQTT/session/Will cleanup: closing the socket unblocks readLoop, whose
 // disconnect() performs that cleanup exactly once in the correct order
 // (mqttHandleClosedClient before closeConnection). The DISCONNECT bytes are
 // built under c.mu so this cannot race CONNECT parsing mutating the negotiated
-// v5 fields.
+// v5 fields. It is the one server-DISCONNECT writer that bypasses the enqueue
+// path — writeDirect, under a deadline — so it claims the connection's one
+// notification itself (mqttClaimDisconnectLocked): a displacement that already
+// told this client 0x8E must not be followed by a 0x8B [MQTT-3.14.4-1].
 func (c *client) shutdownDisconnect(deadline time.Time) {
 	var pkt []byte
 	if c.connAckWritten.Load() {
 		c.mu.Lock()
-		pkt = c.mqttBuildDisconnect(mqttReasonServerShuttingDown, mqttReasonStrServerShuttingDown)
+		// Build before claiming: a nil build (3.1.1, or a client Maximum Packet
+		// Size too small for even the short form) sends nothing, so it must not
+		// spend the claim. Contenders may build; only a claimant writes. Unlike
+		// the enqueue path, the claim here is a RESERVATION taken before the
+		// write: it is consumed inside this critical section and writeDirect runs
+		// after the unlock, so a competing 0x8E can be suppressed by a 0x8B that
+		// is then never written. Stated as a residual rather than fixed — closing
+		// it would mean holding c.mu across a deadline-bounded socket write.
+		if built := c.mqttBuildDisconnect(mqttReasonServerShuttingDown, mqttReasonStrServerShuttingDown); built != nil &&
+			c.mqttClaimDisconnectLocked() {
+			pkt = built
+		}
 		c.mu.Unlock()
 	}
 	if len(pkt) > 0 {

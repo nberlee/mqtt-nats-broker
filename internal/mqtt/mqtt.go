@@ -1803,6 +1803,25 @@ type mqtt struct {
 	// exactly once by mqttTakeWill. See mqttHandleClosedClient, mqttHandleWill.
 	willDisposition mqttWillDisposition
 
+	// disconnectSent records that a server-initiated DISCONNECT has been
+	// ATTEMPTED on this connection. After sending a DISCONNECT the sender must
+	// not send any more MQTT Control Packets on that Network Connection
+	// [MQTT-3.14.4-1], so the first attempt consumes the connection's one
+	// notification and every later would-be sender stays silent — whichever of
+	// the four displacement paths, the parse-error footer or the shutdown drain
+	// it is. It exists because nothing else owns "displace this connection":
+	// close is idempotent (c.closed) and the Will's fate is consumed exactly
+	// once (willDisposition), but every notification site used to write
+	// unconditionally, so two racing paths put two DISCONNECTs on one socket.
+	// Consumed only through mqttClaimDisconnectLocked, under c.mu — for every
+	// enqueue-path writer in the same critical section as the write it
+	// authorizes; shutdownDisconnect is the exception, reserving the claim under
+	// the lock and attempting its writeDirect after releasing it. The guarantee
+	// is at-most-one ATTEMPT: the winner's write stays best-effort (a concurrent
+	// close can fail it, and the shutdown drain can spend the claim and then
+	// write nothing at all), never exactly-once delivery.
+	disconnectSent bool
+
 	// pubOrigin is the authenticated No Local origin marker (or empty) resolved
 	// for the message currently being delivered. Set by
 	// mqttInitiateMsgDeliveryJSA before onward processing so mqttHandlePubRetain
@@ -2617,9 +2636,14 @@ func (c *client) mqttParse(buf []byte) error {
 					err = serr
 					break
 				}
-				// Foreign: this connection has been disposed, told and closed. Return as
-				// the graceful DISCONNECT branch does — an error here would make the
-				// footer send a second DISCONNECT.
+				// Foreign or displaced: this connection has been disposed, its one
+				// DISCONNECT attempted (or deliberately suppressed — pre-CONNACK, or
+				// already claimed) and closed. Return as the graceful DISCONNECT branch
+				// does: an error here would put the footer in the race for the REASON
+				// the client is left with — the claim would refuse whichever attempt is
+				// second, so the cost is a wrong reason rather than a second packet.
+				// The footer's own pre-CONNACK exposure is closed elsewhere, by
+				// mqttAbortAcceptedConnect clearing connectReceived.
 				return nil
 			}
 		}
@@ -4825,8 +4849,11 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 	sess.mu.Unlock()
 	if ec != nil {
 		// Tell the evicted v5 client why before the close (no-op for 3.1.1);
-		// enqueued outside sess.mu since it takes the client lock. Spec5 [3.1.4].
-		ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
+		// notified outside sess.mu since it takes the client lock. The shared
+		// tail claims the connection's one DISCONNECT and honors the CONNACK
+		// gate, so this observation cannot append a second DISCONNECT to one a
+		// racing displacement already sent. Spec5 [3.1.4].
+		ec.mqttNotifyTakenOver()
 		// Remove in separate go routine.
 		go ec.closeConnection(DuplicateClientID)
 	}
@@ -9863,14 +9890,11 @@ func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
 // No lock held on entry.
 func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) error {
 	sendConnAck := func(rc byte, sessp bool, reasonStr string) bool {
+		// A delivered success CONNACK is recorded by mqttEnqueueConnAck itself,
+		// under the same c.mu hold as the write, so a concurrent takeover
+		// notification cannot read the gate in between (see
+		// mqttRecordConnAckWrittenLocked).
 		sent, werr := c.mqttEnqueueConnAck(rc, sessp, reasonStr)
-		// Record a delivered success CONNACK so the shutdown drain knows this
-		// connection completed CONNECT and its negotiated v5 fields are stable.
-		// Only on a clean write: a failed write closes the socket and readLoop
-		// tears the client down.
-		if sent && werr == nil && rc == mqttConnAckRCConnectionAccepted {
-			c.connAckWritten.Store(true)
-		}
 		if sent && trace {
 			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
 		}
@@ -10205,8 +10229,10 @@ CHECK:
 			asm.mu.Unlock()
 			c.Warnf("Replacing old client %q since both have the same client ID %q", ec, cid)
 			// Tell the evicted v5 client why before the close (no-op for
-			// 3.1.1). Spec5 [3.1.4].
-			ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
+			// 3.1.1), through the tail every displacement path shares: it
+			// claims the connection's one DISCONNECT and stays silent for a
+			// connection displaced before its own CONNACK. Spec5 [3.1.4].
+			ec.mqttNotifyTakenOver()
 			// Close old client in separate go routine
 			go ec.closeConnection(DuplicateClientID)
 		}
@@ -10652,8 +10678,17 @@ func mqttConnAckReasonFromRC(rc byte) byte {
 // Packet Size even after dropping its Reason String; the 3.1.1 path always sends.
 // It returns whether the CONNACK was sent (false only when a v5 frame exceeds
 // the client's Maximum Packet Size even after dropping its Reason String) and
-// the socket write error, so the caller can record a delivered success CONNACK
-// (connAckWritten) or abort CONNECT on a write failure.
+// the socket write error, so the caller can decide its abort discipline on a
+// write failure.
+//
+// A clean success CONNACK records connAckWritten HERE, inside the same c.mu
+// critical section as the write, not in the caller after the lock is released.
+// The flag is the [MQTT-3.2.0-1] gate every takeover notification consults
+// (mqttNotifyTakenOver reads it under c.mu): storing it after the unlock left a
+// window in which a notifier could observe false for a client that had already
+// received its CONNACK, and silently drop the DISCONNECT it is owed. Under the
+// mutex, a notifier entering the critical section after the write completed is
+// guaranteed to see the flag.
 func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr string) (bool, error) {
 	// Spec [MQTT-3.2.2-4], spec5 [3.2.2.1.1]: when the (reason) code indicates
 	// failure, the session present flag must be 0.
@@ -10670,6 +10705,7 @@ func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr stri
 		}
 		c.mu.Lock()
 		err := c.enqueueProtoErr(frame)
+		c.mqttRecordConnAckWrittenLocked(rc, err)
 		c.mu.Unlock()
 		return true, err
 	}
@@ -10677,8 +10713,21 @@ func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr stri
 	proto := [4]byte{mqttPacketConnectAck, 2, sp, rc}
 	c.mu.Lock()
 	err := c.enqueueProtoErr(proto[:])
+	c.mqttRecordConnAckWrittenLocked(rc, err)
 	c.mu.Unlock()
 	return true, err
+}
+
+// mqttRecordConnAckWrittenLocked records that this connection has been told its
+// CONNECT succeeded. Only a clean write of an accepted CONNACK counts: a failed
+// write closed the socket and nothing was acknowledged, and a failure CONNACK
+// never opens the connection for further packets. c.mu must be held — the flag
+// gates every later takeover notification [MQTT-3.2.0-1], and holding the lock
+// across write-then-store is what orders it against those readers.
+func (c *client) mqttRecordConnAckWrittenLocked(rc byte, err error) {
+	if err == nil && rc == mqttConnAckRCConnectionAccepted {
+		c.connAckWritten.Store(true)
+	}
 }
 
 // mqttMakeConnAckV5Frame builds an MQTT 5.0 CONNACK frame: a reason code, the
@@ -10846,17 +10895,79 @@ func (c *client) mqttReasonProps(pktType byte, reasonStr string) *mqttProperties
 	return nil
 }
 
+// mqttClaimDisconnectLocked consumes this connection's one server-initiated
+// DISCONNECT notification and reports whether the caller may write it. The
+// second and every later would-be sender is refused: after sending a DISCONNECT
+// the sender must not send any more MQTT Control Packets on that Network
+// Connection [MQTT-3.14.4-1], and the displacement paths race, so which reason
+// the client is told is decided here rather than by whoever reaches the socket
+// first. Every server-DISCONNECT writer claims through this one predicate; the
+// enqueue-path writers do it in the same c.mu critical section as their write,
+// so for them there is no check-then-act window at all. shutdownDisconnect is
+// the one exception, and there the claim is a RESERVATION: it claims under the
+// lock and writes through writeDirect after releasing it, so it can spend the
+// claim — suppressing a competing notification — and then write nothing, or
+// fail. That is why the guarantee is at most one ATTEMPT and not one delivered
+// packet. c.mu must be held.
+func (c *client) mqttClaimDisconnectLocked() bool {
+	if c.mqtt == nil || c.mqtt.disconnectSent {
+		return false
+	}
+	c.mqtt.disconnectSent = true
+	return true
+}
+
 // mqttEnqueueDisconnect sends an MQTT 5.0 DISCONNECT with the given reason code
 // (and, when allowed and it fits, a Reason String) to the client, before the
 // connection is closed on a protocol/processing error. It is a no-op for 3.1.1
-// connections, which have no server-initiated DISCONNECT. Spec5 [3.14].
+// connections, which have no server-initiated DISCONNECT, and for a connection
+// whose one DISCONNECT another path already claimed. Spec5 [3.14].
 func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 	pkt := c.mqttBuildDisconnect(reason, reasonStr)
+	if pkt == nil {
+		// Nothing was sent, so [MQTT-3.14.4-1] never triggered: the claim stays
+		// available to a later sender rather than being spent on no packet.
+		return
+	}
+	c.mu.Lock()
+	if c.mqttClaimDisconnectLocked() {
+		c.enqueueProto(pkt)
+	}
+	c.mu.Unlock()
+}
+
+// mqttNotifyTakenOver tells a displaced connection that its session was taken
+// over (0x8E). It is the single tail shared by all four paths that displace a
+// bound connection — a local CONNECT takeover, a remote persist observation
+// (processSessionPersist), a resolver's foreign disposal and the bound rejection
+// settlement — so that "displace this connection" has one notification owner
+// instead of four writers racing to the socket.
+//
+// Two conditions, both required. The connection must already have been told its
+// CONNECT succeeded: CONNACK must be the first packet a client sees
+// [MQTT-3.2.0-1], and mqttAbortAcceptedConnect leaves a refused connection bound
+// until its readLoop detaches it, so a displacement can find a bound but
+// pre-CONNACK connection — which is then closed silently. And no server
+// DISCONNECT may have been attempted yet ([MQTT-3.14.4-1],
+// mqttClaimDisconnectLocked).
+//
+// The gate is read under c.mu, which orders it against the CONNACK writer's
+// store in mqttEnqueueConnAck's own critical section: a notifier entering after
+// the CONNACK write completed is guaranteed to see it. The packet is built
+// before the lock (mqttBuildDisconnect reads only fields immutable after CONNECT
+// parsing) because enqueueProto is called with c.mu held and the mutex is not
+// reentrant.
+//
+// No lock held on entry.
+func (c *client) mqttNotifyTakenOver() {
+	pkt := c.mqttBuildDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
 	if pkt == nil {
 		return
 	}
 	c.mu.Lock()
-	c.enqueueProto(pkt)
+	if c.connAckWritten.Load() && c.mqttClaimDisconnectLocked() {
+		c.enqueueProto(pkt)
+	}
 	c.mu.Unlock()
 }
 

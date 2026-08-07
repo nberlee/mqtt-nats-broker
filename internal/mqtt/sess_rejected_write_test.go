@@ -1236,11 +1236,20 @@ func TestMQTTRejectedRecordPersistDropIsScoped(t *testing.T) {
 // the test loses at random. Capturing inside Write makes the record complete the moment
 // mqttParse returns. TestMQTTBoundRejectionNoReentryAfterForeign uses a real net.Pipe,
 // because what it asserts is socket behaviour rather than packet content.
+//
+// recordAfterClose makes it an ATTEMPT LOG rather than a delivery record, which is what
+// the DISCONNECT-claim tests need. A displacement closes the socket from another
+// goroutine, so a capture that silently drops post-close writes would make "only one
+// DISCONNECT was written" true even with the claim deleted — the close, not the claim,
+// would be doing the work. Recording the attempt and still returning io.ErrClosedPipe
+// keeps production's close-on-write-error path intact while the assertions inspect what
+// the broker TRIED to send; nothing here claims those bytes reached a wire.
 type testWireCapture struct {
-	mu     sync.Mutex
-	data   []byte
-	closed chan struct{}
-	once   sync.Once
+	mu               sync.Mutex
+	data             []byte
+	closed           chan struct{}
+	once             sync.Once
+	recordAfterClose bool
 }
 
 func (w *testWireCapture) Read(p []byte) (int, error) {
@@ -1251,6 +1260,12 @@ func (w *testWireCapture) Read(p []byte) (int, error) {
 func (w *testWireCapture) Write(p []byte) (int, error) {
 	select {
 	case <-w.closed:
+		if !w.recordAfterClose {
+			return 0, io.ErrClosedPipe
+		}
+		w.mu.Lock()
+		w.data = append(w.data, p...)
+		w.mu.Unlock()
 		return 0, io.ErrClosedPipe
 	default:
 	}
@@ -1294,7 +1309,19 @@ type testBoundConn struct {
 // success CONNACK recorded, which is what licenses a server DISCONNECT at all.
 func (e *testRejectionEnv) bindSocket(t *testing.T, proto byte) *testBoundConn {
 	t.Helper()
-	out := &testWireCapture{closed: make(chan struct{})}
+	return e.bindSocketOver(t, proto, &testWireCapture{closed: make(chan struct{})})
+}
+
+// bindSocketAttemptLog binds over a capture that keeps recording write ATTEMPTS after the
+// socket closes. Use it wherever the assertion is about what the broker tried to send —
+// the server-DISCONNECT claim — rather than about what a client received.
+func (e *testRejectionEnv) bindSocketAttemptLog(t *testing.T, proto byte) *testBoundConn {
+	t.Helper()
+	return e.bindSocketOver(t, proto, &testWireCapture{closed: make(chan struct{}), recordAfterClose: true})
+}
+
+func (e *testRejectionEnv) bindSocketOver(t *testing.T, proto byte, out *testWireCapture) *testBoundConn {
+	t.Helper()
 
 	// mpay is the account max payload the publish path sizes messages against; leaving it
 	// at zero makes every PUBLISH fail with Quota Exceeded, which would let a "the packet
@@ -1433,6 +1460,35 @@ func (b *testBoundConn) sawDisconnect(t *testing.T, reason byte) bool {
 	}
 	return false
 }
+
+// disconnectAttempts returns the reason code of every server DISCONNECT the broker tried
+// to write, in order. On an attempt-log capture (bindSocketAttemptLog) that includes
+// writes made after the socket closed, which is the point: a second notification must be
+// suppressed by the claim BEFORE the write, not by a socket that happened to be gone.
+func (b *testBoundConn) disconnectAttempts(t *testing.T) []byte {
+	t.Helper()
+	var reasons []byte
+	for _, p := range testParseWire(t, b.out.bytes()) {
+		if p.typ != mqttPacketDisconnect {
+			continue
+		}
+		if len(p.body) == 0 {
+			// The zero-length form means Normal Disconnection; count it, so a
+			// stray one can never hide from an "exactly one" assertion.
+			reasons = append(reasons, mqttReasonSuccess)
+			continue
+		}
+		reasons = append(reasons, p.body[0])
+	}
+	return reasons
+}
+
+// forgetConnAck puts a bound connection back in the state a refused CONNECT leaves it in:
+// still bound to the session, but never told its CONNECT succeeded. mqttAbortAcceptedConnect
+// produces exactly this — the connection stays bound until its readLoop detaches it — and
+// it is the state in which a displacement must NOT write a DISCONNECT, since CONNACK has to
+// be the first packet the client sees [MQTT-3.2.0-1].
+func (b *testBoundConn) forgetConnAck() { b.bc.connAckWritten.Store(false) }
 
 // testBoundPublish builds a PUBLISH packet.
 func testBoundPublish(v5 bool, qos byte, pi uint16, topic, payload string) []byte {
