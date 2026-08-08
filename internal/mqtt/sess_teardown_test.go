@@ -61,6 +61,17 @@ func testLoadSessRecord(t *testing.T, env *testTeardownEnv, idHash string) (*mqt
 	return ps, smsg.Sequence
 }
 
+// testRecordBodyAt returns the RAW stored bytes of a client's session record — the
+// digest identity, as opposed to the decoded view testLoadSessRecord returns.
+func testRecordBodyAt(t *testing.T, env *testTeardownEnv, idHash string) []byte {
+	t.Helper()
+	smsg, err := env.asm.jsa.loadSessionMsg(env.asm.domainTk, idHash)
+	if err != nil {
+		t.Fatalf("loadSessionMsg: %v", err)
+	}
+	return smsg.Data
+}
+
 // testConsumerExists reports whether a durable is present on a stream.
 func testConsumerExists(t *testing.T, env *testTeardownEnv, stream, durable string) bool {
 	t.Helper()

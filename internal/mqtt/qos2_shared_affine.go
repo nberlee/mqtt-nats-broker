@@ -1153,17 +1153,24 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 			// Undo only when the write DEFINITELY did not land. An ambiguous one may
 			// have stored a record that names this consumer, and detaching it in
 			// memory would leave that record pointing at something the session no
-			// longer knows about. Which way memory reconciles is the readback's to
-			// decide, not the failing writer's. See sess_uncertain.go.
+			// longer knows about. See sess_uncertain.go.
 			switch outcome {
 			case saveDefinitelyFailed:
 				rollback()
 			case saveMaybeLanded:
-				// The record may name the consumer, so keep the view — the reconciliation
-				// depends on an outcome nobody knows yet — and let the readback detach it
-				// if it proves the write never landed: a record that does not name this
-				// consumer must not be paired with a session that does.
-				sess.retainOnUncertain(func(recordTx) { rollback() }, nil)
+				// The record may name the consumer, so keep the view: the resolver
+				// settles the write forward by re-attempting exactly these bytes, and the
+				// record then names what the session knows about. Nothing was withheld
+				// for want of proof — the gate below is opened by this call's own return
+				// path — so there is no landed continuation to register.
+				//
+				// The SUBSCRIBE caller marks this filter failed and carries on, which is
+				// truthful: its shared membership is persisted in a LATER loop, and that
+				// save is refused while the session is unresolved — so the client is told
+				// the filter failed and no membership for it becomes durable. What the
+				// settlement does make durable is the affine path itself, which the
+				// packet's own unused-path unwind and rollback then reconcile. See
+				// mqttProcessSubs.
 			}
 			return err
 		}

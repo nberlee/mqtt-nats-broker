@@ -3,6 +3,7 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1312,6 +1313,10 @@ type atomicOnce struct{ done atomic.Bool }
 
 func (o *atomicOnce) fire() bool { return o.done.CompareAndSwap(false, true) }
 
+// fired reports whether the one-shot has already been consumed, for a test that must
+// prove its injection actually ran rather than assume it.
+func (o *atomicOnce) fired() bool { return o.done.Load() }
+
 // TestMQTTSharedSubscribeAmbiguousSaveAbandonsThePacket pins that an ambiguous
 // EARLY shared-membership write stops the packet instead of marking the filter
 // failed and carrying on.
@@ -1579,16 +1584,23 @@ func TestMQTTUnsubAmbiguousLandedSaveStillCommits(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c, got)
 }
 
-// TestMQTTSubscribeAmbiguousThatDidNotLandUnwindsThePacket drives the REAL
-// SUBSCRIBE path for the did-not-land outcome, which the unit test can only mirror.
+// TestMQTTSubscribeAmbiguousIsSettledForwardE2E drives the REAL SUBSCRIBE path for a
+// write that never reaches the stream.
 //
-// The packet's final record write genuinely never lands, so the readback must undo
-// the whole packet — and that undo has to persist the restored state before it may
-// release anything. Its continuation therefore opens its OWN record transaction:
-// the packet's closed long ago, and reusing it makes the compensating save refused
-// at entry, silently skipping every resource release it gates. The consumer this
-// packet created is the observable: it is deleted only after that save is confirmed.
-func TestMQTTSubscribeAmbiguousThatDidNotLandUnwindsThePacket(t *testing.T) {
+// The packet's state is KEPT — the record may already hold it — and what settles the
+// question is the resolver re-attempting the attempt's exact bytes, not a readback
+// concluding from the base sequence that the write died. So the membership and the
+// consumer this packet created both stand, and the record ends up naming them: no
+// SUBACK was sent, but a durable subscription the client was never acknowledged for
+// is exactly what a landed original with a lost response leaves behind.
+//
+// The fixture waits for the ambiguity BEFORE lifting suppression. An earlier version
+// polled for the absence of the packet's state and was satisfied by the first sample,
+// which the broker had not processed yet — it passed without the packet ever failing.
+//
+// Mutation M1: revert the at-base arm to clearing the uncertainty and the packet is
+// undone instead: the membership disappears and its durable is deleted.
+func TestMQTTSubscribeAmbiguousIsSettledForwardE2E(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1599,65 +1611,67 @@ func TestMQTTSubscribeAmbiguousThatDidNotLandUnwindsThePacket(t *testing.T) {
 	if _, reason, _ := testMQTTReadConnAckV5(t, r); reason != mqttReasonSuccess {
 		t.Fatalf("CONNACK reason = %v", reason)
 	}
-	// One confirmed subscription, so there is a pre-packet state to restore to.
+	// One confirmed subscription, so there is a pre-packet state to compare against.
 	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "subunwind/first", opts: 1}}); len(codes) != 1 || codes[0] != 1 {
 		t.Fatalf("SUBACK = %v", codes)
 	}
 	testMQTTFlush(t, c, nil, r)
 	sess := testMQTTResidentSession(t, s, "subunwind")
 
-	sess.mu.Lock()
-	consBefore := len(sess.cons)
-	sess.mu.Unlock()
-	// The DURABLES on the stream, not the in-memory map: rollbackSubscribePacket
-	// restores sess.cons from its snapshot BEFORE its compensating save, so the map
-	// returns to its pre-packet shape whether or not that save was confirmed. Only
-	// the consumer's actual deletion — which happens after it — distinguishes them.
+	// The DURABLES on the stream, not the in-memory map: only an actual deletion
+	// distinguishes a settled packet from an undone one.
 	dursBefore := testDrainStreamDurables(t, sess)
 
-	// The next packet's record write never lands. Suppression is lifted as soon as
-	// the readback has classified it, so the undo's own save can succeed.
+	// The next packet's record write never reaches the stream. Suppression stays on
+	// until the ambiguity is REAL, or the packet under test never fails at all.
 	mqttTestSessStoreSuppressV.Store(true)
 	testDrainSendSubscribeV5(t, c, 2, "subunwind/second", 1)
-
-	// Production resolves this itself; the undo then runs.
-	checkFor(t, 20*time.Second, 50*time.Millisecond, func() error {
-		if sess.isSeqUncertain() {
-			// The readback is a load, so it works while stores are suppressed; the
-			// undo's save is what needs stores back, and it runs after resolution.
-			mqttTestSessStoreSuppressV.Store(false)
-			return errors.New("still unresolved")
+	checkFor(t, 20*time.Second, 25*time.Millisecond, func() error {
+		if !sess.isSeqUncertain() {
+			return errors.New("the packet's write has not gone ambiguous yet")
 		}
 		return nil
 	})
 	mqttTestSessStoreSuppressV.Store(false)
 
-	// The whole packet is unwound: membership restored, and the consumer it created
-	// actually DELETED. No SUBACK was sent, so the client believes none of it
-	// happened.
-	checkFor(t, 15*time.Second, 100*time.Millisecond, func() error {
-		sess.mu.Lock()
-		n := len(sess.cons)
-		_, second := sess.subs["subunwind.second"]
-		sess.mu.Unlock()
-		if second {
-			return errors.New("the packet's membership is still present")
-		}
-		if n != consBefore {
-			return fmt.Errorf("in-memory consumer count %d, want the pre-packet %d", n, consBefore)
-		}
-		if extra := testDrainNewDurables(t, sess, dursBefore); len(extra) > 0 {
-			return fmt.Errorf("the packet's durable(s) %v were never deleted: its compensating save was refused, "+
-				"so every resource release that save gates was skipped", extra)
+	// The connection is closed by the failed packet, so the resolution comes from the
+	// pass over resident sessions — driven here rather than waited on.
+	asm := testMQTTGetGlobalASM(t, s)
+	checkFor(t, 20*time.Second, 50*time.Millisecond, func() error {
+		asm.reconcileResidentRecordState(s)
+		if sess.isSeqUncertain() {
+			return errors.New("still unresolved")
 		}
 		return nil
 	})
 
+	// Settled forward: the packet's membership stands, and the consumer it created is
+	// still there — referenced by the record the re-attempt made durable.
 	sess.mu.Lock()
+	_, second := sess.subs["subunwind.second"]
 	_, first := sess.subs["subunwind.first"]
 	sess.mu.Unlock()
+	if !second {
+		t.Fatal("the packet's membership was undone: an ambiguous write is settled by making its bytes durable, not by rolling them back")
+	}
 	if !first {
-		t.Fatal("the pre-packet subscription must survive the unwind")
+		t.Fatal("the pre-packet subscription must survive")
+	}
+	if extra := testDrainNewDurables(t, sess, dursBefore); len(extra) == 0 {
+		t.Fatal("the packet's durable was deleted although the record names its subscription")
+	}
+	// The record itself, which is what a restart would read.
+	subject := mqttSessStreamSubjectPrefix + sess.domainTk + sess.idHash
+	smsg, err := sess.jsa.loadLastMsgFor(mqttSessStreamName, subject)
+	if err != nil {
+		t.Fatalf("loading the settled record: %v", err)
+	}
+	ps := &mqttPersistedSession{}
+	if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
+		t.Fatalf("unmarshal the settled record: %v", uerr)
+	}
+	if _, durable := ps.Subs["subunwind.second"]; !durable {
+		t.Fatalf("the settled record must carry the packet's subscription, got %v", ps.Subs)
 	}
 }
 

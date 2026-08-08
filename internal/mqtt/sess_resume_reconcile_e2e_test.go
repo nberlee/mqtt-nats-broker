@@ -1590,12 +1590,15 @@ func TestMQTTReconcileAmbiguousRepairSaveLanded(t *testing.T) {
 	testReconcileExpectQoS1(t, c2, r2, topic, []byte("landed"))
 }
 
-// Genuinely NOT landed: the store is suppressed before it is issued. The
-// CONNECT is refused with the state kept and the undo REGISTERED; the next
-// reconnect's readback proves the write never landed, runs the undo (the
-// created durable is deleted, the old entry restored), and the same CONNECT
-// then repairs again and delivers.
-func TestMQTTReconcileAmbiguousRepairSaveNotLanded(t *testing.T) {
+// The store never reaches the stream: it is suppressed before it is issued. The
+// CONNECT is refused with the repaired identity KEPT, and the next reconnect's
+// resolution settles the ambiguity by re-attempting that repair record's exact
+// bytes — so the SAME replacement becomes durable and is then verified present,
+// rather than being rolled back and repaired all over again under a third name.
+//
+// Mutation M1: revert the at-base arm to clearing the uncertainty and the
+// replacement is undone, so the reconnect repairs afresh under a new durable.
+func TestMQTTReconcileAmbiguousRepairSaveIsSettledForward(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1648,18 +1651,18 @@ func TestMQTTReconcileAmbiguousRepairSaveNotLanded(t *testing.T) {
 		t.Fatal("the suppression never fired; the test proved nothing")
 	}
 
-	// Kept until the readback — the first replacement is still named in memory.
+	// Kept while unresolved — the replacement is still named in memory.
 	sess := testMQTTResidentSession(t, s, cid)
 	sess.mu.Lock()
 	firstReplacement := sess.cons[sid].Durable
 	sess.mu.Unlock()
 	if firstReplacement == oldDur {
-		t.Fatal("the replacement was rolled back before any readback classified the write")
+		t.Fatal("the replacement was rolled back before the write was settled either way")
 	}
 
-	// The next reconnect: readback proves NOT LANDED, the undo deletes the
-	// first replacement and restores the (absent) old entry — and the same
-	// CONNECT then repairs afresh.
+	// The next reconnect: the resolution re-attempts the repair record's own bytes,
+	// so the record ends up naming THIS replacement and the resume verifies it
+	// present — no second repair.
 	restoreSave()
 	restoreResult()
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
@@ -1667,21 +1670,20 @@ func TestMQTTReconcileAmbiguousRepairSaveNotLanded(t *testing.T) {
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
 	testMQTTFlush(t, c2, nil, r2)
 
-	secondReplacement := testReconcileConsDur(t, s, cid, sid)
-	if secondReplacement == oldDur || secondReplacement == firstReplacement {
-		t.Fatalf("expected a fresh second repair, got %q (old %q, first %q)", secondReplacement, oldDur, firstReplacement)
+	settled := testReconcileConsDur(t, s, cid, sid)
+	if settled != firstReplacement {
+		t.Fatalf("the settled resume must keep the repaired identity %q, got %q (old %q)",
+			firstReplacement, settled, oldDur)
 	}
 	ps, _ := testReconcileRecord(t, asm, cid)
-	if cc := ps.Cons[sid]; cc == nil || cc.Durable != secondReplacement {
-		t.Fatalf("the record names %+v, want %q", cc, secondReplacement)
+	if cc := ps.Cons[sid]; cc == nil || cc.Durable != firstReplacement {
+		t.Fatalf("the record names %+v, want the settled repair %q", cc, firstReplacement)
 	}
-	// The undone first replacement is deleted (its charge refunded with it).
-	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		if testReconcileConsumerPresent(t, asm, firstReplacement) {
-			return fmt.Errorf("the undone replacement %q still exists", firstReplacement)
-		}
-		return nil
-	})
+	// And it is the durable that actually exists: the ambiguity was settled by making
+	// the record match the resources, never by deleting them.
+	if !testReconcileConsumerPresent(t, asm, firstReplacement) {
+		t.Fatalf("the settled replacement %q must still exist", firstReplacement)
+	}
 	testReconcileQoS1Publish(t, o, topic, []byte("re-repaired"))
 	testReconcileExpectQoS1(t, c2, r2, topic, []byte("re-repaired"))
 }
@@ -2476,9 +2478,8 @@ func TestMQTTReconcileFailedRepairStrandsNoDeferredMarker(t *testing.T) {
 // replacements, never the lifetime. A restart in between would read the wrong
 // one and discard the session.
 //
-// Mutation check: drop the retainOnUncertain(persist, persist) registration and
-// the record still carries the refused CONNECT's zero interval after
-// resolution.
+// Mutation check: drop the lifetime restore's save and the record still carries the
+// refused CONNECT's zero interval after resolution.
 func TestMQTTReconcileUncertainRefusalStillRestoresLifetime(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -2545,8 +2546,8 @@ func TestMQTTReconcileUncertainRefusalStillRestoresLifetime(t *testing.T) {
 		t.Fatal("the session should be unresolved after an ambiguous repair save")
 	}
 
-	// Resolve it the way the periodic pass does. The continuation must carry the
-	// restored lifetime into the record.
+	// Resolve it the way the periodic pass does: the settlement carries the restored
+	// lifetime into the record along with everything else those bytes marshalled.
 	if err := asm.lockSession(sess, nil); err != nil {
 		t.Fatalf("lockSession: %v", err)
 	}
@@ -2561,11 +2562,10 @@ func TestMQTTReconcileUncertainRefusalStillRestoresLifetime(t *testing.T) {
 		t.Fatalf("record after resolution: ExpiryInterval=%d Clean=%v, want the session's own persistent lifetime restored",
 			ps.ExpiryInterval, ps.Clean)
 	}
-	// The write did NOT land, so the repair was undone and its replacement
-	// consumer deleted. The record must therefore still name the ORIGINAL
-	// durable: a lifetime restore that serialized BEFORE that undo would leave
-	// the record naming a consumer the undo then deleted, and memory and record
-	// would disagree about which durable this filter has.
+	// The resolution settled the repair forward — it re-attempted the repair
+	// record's own bytes — so the record names the REPLACEMENT, and memory names
+	// the same one. Record and memory agreeing is the load-bearing half: whichever
+	// way the ambiguity settles, this filter must have exactly one durable identity.
 	sess.mu.Lock()
 	memDur := ""
 	if cc := sess.cons[sid]; cc != nil {
@@ -2573,11 +2573,11 @@ func TestMQTTReconcileUncertainRefusalStillRestoresLifetime(t *testing.T) {
 	}
 	sess.mu.Unlock()
 	cc := ps.Cons[sid]
-	if cc == nil || cc.Durable != oldDur {
-		t.Fatalf("record names %+v after a not-landed repair, want the pre-repair durable %q", cc, oldDur)
+	if cc == nil || cc.Durable == oldDur {
+		t.Fatalf("record names %+v after a settled repair, want the replacement (old %q)", cc, oldDur)
 	}
 	if memDur != cc.Durable {
-		t.Fatalf("record names %q but memory names %q; the restore serialized before the undo", cc.Durable, memDur)
+		t.Fatalf("record names %q but memory names %q: the settlement left them disagreeing", cc.Durable, memDur)
 	}
 }
 
@@ -3004,18 +3004,26 @@ func TestMQTTReconcileClearedSessionTakesRequestedLifetime(t *testing.T) {
 	}
 }
 
-// An ambiguous lifetime grant must not let a refused resume destroy the
-// session.
+// An ambiguous lifetime grant reaches the teardown decision ONLY on proof, and
+// then it reaches it completely.
 //
 // Review finding: keeping the requested terms in memory while the write was
 // unresolved meant the close path snapshotted THEM into the deferred disconnect
 // (mqttDeferDisconnect), and applyDeferredDisconnect acts on that snapshot — so
-// a requested interval of 0 whose write never landed still discarded a
-// persistent session, no matter what the readback restored afterwards.
+// a requested interval of 0 whose outcome was unknown discarded a persistent
+// session on nothing but a hopeful write. The parked action therefore carries the
+// CONFIRMED lifetime, and only a settlement that proves the grant durable
+// retargets it (retargetDeferredLifetime).
 //
-// Mutation check: keep the speculative terms on ambiguity (register the undo
-// instead of the re-apply) and the session below is gone after resolution.
-func TestMQTTReconcileAmbiguousGrantKeepsSessionAlive(t *testing.T) {
+// Once that proof exists the granted terms DO apply, refused CONNACK or not: the
+// lifetime is granted at the grant point, and the resolver settles an ambiguity by
+// making exactly those bytes durable rather than by guessing them dead. The record
+// then says "ends at disconnect", and the discharge honours it — which is the same
+// outcome a landed original with a lost response always had.
+//
+// Mutation check: drop retargetDeferredLifetime from the grant's landed
+// continuation and the parked action keeps a lifetime the record no longer states.
+func TestMQTTReconcileAmbiguousGrantAppliesOnlyOnProof(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3092,8 +3100,25 @@ func TestMQTTReconcileAmbiguousGrantKeepsSessionAlive(t *testing.T) {
 	if !sess.isSeqUncertain() {
 		t.Fatal("the session should be unresolved after an ambiguous grant save")
 	}
-	// The teardown the close path parked must have been captured against the
-	// CONFIRMED lifetime, not the interval this refused CONNECT asked for.
+	// BEFORE any proof: the teardown the close path parked was captured against the
+	// CONFIRMED lifetime, not the interval this refused CONNECT asked for. This is
+	// the half that must never depend on a hopeful write.
+	sess.mu.Lock()
+	parked := sess.deferredDisconnect
+	memExpiry := sess.expiryInterval
+	sess.mu.Unlock()
+	if parked == nil {
+		t.Fatal("the close of an unresolved session must park its teardown")
+	}
+	if parked.expiryInterval != mqttSessionNeverExpire {
+		t.Fatalf("the parked teardown carries ExpiryInterval=%d, want the CONFIRMED %d: an unproven grant reached the teardown decision",
+			parked.expiryInterval, mqttSessionNeverExpire)
+	}
+	if memExpiry != mqttSessionNeverExpire {
+		t.Fatalf("memory carries ExpiryInterval=%d while the grant is unresolved, want the confirmed %d",
+			memExpiry, mqttSessionNeverExpire)
+	}
+
 	asm := testMQTTGetGlobalASM(t, s)
 	if err := asm.lockSession(sess, nil); err != nil {
 		t.Fatalf("lockSession: %v", err)
@@ -3104,29 +3129,28 @@ func TestMQTTReconcileAmbiguousGrantKeepsSessionAlive(t *testing.T) {
 		t.Fatalf("resolution = %v, want ours", res)
 	}
 
+	// AFTER the proof: the grant's own bytes are durable, so the record states
+	// "ends at disconnect" and the discharge honours it. The session is gone, and a
+	// retry gets a clean one — the grant-at-durability outcome, reached because the
+	// write is now settled rather than guessed.
 	asm.mu.RLock()
 	_, resident := asm.sessions[cid]
 	asm.mu.RUnlock()
-	if !resident {
-		t.Fatal("the refused resume discarded the session: its unconfirmed interval reached the teardown decision")
+	if resident {
+		t.Fatal("a grant PROVEN durable ends the session at its close: the discharge must have discarded it")
 	}
-	if _, err := asm.jsa.loadSessionMsg(asm.domainTk, getHash(cid)); err != nil {
-		t.Fatalf("the session record is gone after a refused resume: %v", err)
+	if _, err := asm.jsa.loadSessionMsg(asm.domainTk, getHash(cid)); err == nil {
+		t.Fatal("the discarded session must leave no record")
+	} else if isErrorOtherThan(err, JSNoMessageFoundErr) {
+		t.Fatalf("reading the discarded session's record: %v", err)
 	}
 
-	// And it still resumes, with its subscription intact.
 	c3, r3 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(mqttSessionNeverExpire)}, o.MQTT.Host, o.MQTT.Port)
 	defer c3.Close()
-	if sp, reason, _ := testMQTTReadConnAckV5(t, r3); reason != mqttReasonSuccess || !sp {
-		t.Fatalf("retry after the ambiguous grant: sp=%v reason=%x, want Session Present 1", sp, reason)
+	if sp, reason, _ := testMQTTReadConnAckV5(t, r3); reason != mqttReasonSuccess || sp {
+		t.Fatalf("retry after a granted zero interval: sp=%v reason=%x, want Session Present 0", sp, reason)
 	}
-	testReconcileQoS1Publish(t, o, topic, []byte("alive"))
-	qos, pi := testMQTTReadPublishV5(t, r3, topic, []byte("alive"))
-	if qos != 1 || pi == 0 {
-		t.Fatalf("delivery qos=%d pi=%d, want QoS 1 with a packet identifier", qos, pi)
-	}
-	testMQTTSendPIPacket(mqttPacketPubAck, t, c3, pi)
 }
 
 // The LANDED half of an ambiguous lifetime grant: a grant that really did
@@ -3474,7 +3498,7 @@ func TestMQTTReconcileResolveAlwaysTakesTheGate(t *testing.T) {
 	// state in which the sampled version skips the gate entirely.
 	sess.mu.Lock()
 	bound := sess.c
-	sess.markWriteUncertainLocked(sess.seq, []byte("an attempt that did not land"), 0)
+	testMarkUncertainLocked(sess, sess.seq, []byte("an attempt that did not land"))
 	parked := sess.deferredDisconnect
 	sess.mu.Unlock()
 	if bound == nil || parked != nil {
@@ -3541,7 +3565,7 @@ func TestMQTTReconcileCloseParksTeardownWhenResolverHoldsGate(t *testing.T) {
 	// An unresolved write whose readback will classify OURS (the base matches
 	// the record), so resolution ends in a discharge rather than a disposition.
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(sess.seq, []byte("attempt that did not land"), 0)
+	testMarkUncertainLocked(sess, sess.seq, []byte("attempt that did not land"))
 	sess.mu.Unlock()
 
 	// Stall the resolver's readback well past the close path's bounded gate

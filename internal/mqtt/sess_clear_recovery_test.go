@@ -79,7 +79,7 @@ func testArmAtClearWindow(t *testing.T, e *testDeferredEnv, window string) func(
 		}
 		armed = true
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(sess.seq, []byte(`{"competing":"ambiguous"}`), 0)
+		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
 		sess.mu.Unlock()
 	})
 	t.Cleanup(restore)
@@ -274,7 +274,7 @@ func TestMQTTExpiryKeepsHistoricalOutcomeWhenAPostClaimFailureLeavesItUnresolved
 			// Synthesized, not production-reachable: clear() holds the fence across the
 			// claim and this delete, so a real writer could not arm uncertainty here.
 			e.sess.mu.Lock()
-			e.sess.markWriteUncertainLocked(e.sess.seq, []byte(`{"competing":"ambiguous"}`), 0)
+			testMarkUncertainLocked(e.sess, e.sess.seq, []byte(`{"competing":"ambiguous"}`))
 			e.sess.mu.Unlock()
 		}
 		return errors.New("test: the session record delete is unavailable")

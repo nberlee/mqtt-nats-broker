@@ -736,10 +736,9 @@ func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 			sess.id, err)
 	case saveMaybeLanded:
 		// The verdict exists either way, so nothing is undone. The REVISION is a different
-		// matter: it may be claimed only on proof. The LANDED half of that proof is the
-		// readback's own (it credits what those bytes carried), so all this continuation
-		// owes is the re-save for the other half.
-		sess.retainOnUncertain(sess.voidedRegsUncertainAction(c), nil)
+		// matter: it may be claimed only on proof — and the resolver is what produces it,
+		// re-attempting these exact bytes and crediting the revision they marshalled.
+		// Nothing further is owed here.
 	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		mqttErrorf(c, "MQTT: record transaction not released after recording void-register verdicts for client %q: %v", sess.id, terr)
@@ -950,9 +949,9 @@ func (sess *mqttSession) persistVoidedRegsFromRelease(c *client) {
 		// Credited by the save itself, along with everything else it marshalled.
 	case saveMaybeLanded:
 		// Ambiguity is not this mechanism's to retry: seqUncertain excludes the session
-		// from the predicate, the periodic pass resolves it (it walks every resident
-		// uncertain session, expiry or none), and the continuation carries the re-save.
-		sess.retainOnUncertain(sess.voidedRegsUncertainAction(c), nil)
+		// from the predicate, and the periodic pass resolves it (it walks every resident
+		// uncertain session, expiry or none) by re-attempting these exact bytes, which
+		// credits the revision they marshalled.
 	case saveDefinitelyFailed:
 		// The gap stays open with the watermark at it, so no self-retrigger: this class
 		// keeps its existing posture — the next activity on the session persists it.
@@ -1004,49 +1003,6 @@ func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
 		mqttTestVoidHandoffPreAttemptHookV.Store(&h)
 	}
 	return func() { mqttTestVoidHandoffPreAttemptHookV.Store(prev) }
-}
-
-// voidedRegsUncertainAction is what the readback owes a verdict whose save was ambiguous:
-// a re-save for the NOT-LANDED verdict, and nothing at all for the landed one.
-//
-// The not-landed verdict is the dangerous one, and an empty continuation is not an answer to
-// it: the void verdict would then be durable nowhere, and nothing would notice, because a
-// convergence point that finds the set unchanged since its last attempt makes none. So the
-// retry happens THERE, under the resolver's token — the only writer allowed at that moment,
-// and the reason these continuations are handed one at all. Uncertainty is cleared before
-// reverts run, so that save is not refused at entry.
-//
-// There is no landed counterpart because crediting is not this continuation's job: the
-// resolver credits the revision the proven bytes marshalled, exactly as a confirmed save
-// credits its own. Nothing here undoes anything either — the verdict is a fact about a
-// register, whatever the record currently says.
-//
-// It is CLOSED under repeated ambiguity: the re-save can itself come back ambiguous, and it
-// then registers ITSELF for the new pending write. Without that, a second ambiguity left the
-// record with no continuation at all, so restart-survival of the verdict (and, on the
-// deferred close, of the disconnect deadline the same save carries) depended on later live
-// traffic that an unbound session never has. It deliberately does NOT chase revision gaps
-// beyond the save it makes: a nonce staged after this save's marshal is the release
-// handoff's to converge (see attemptVoidVerdictHandoff), and a confirmed re-save credits
-// itself through the ordinary save path.
-func (sess *mqttSession) voidedRegsUncertainAction(c *client) func(recordTx) {
-	return func(tok recordTx) {
-		// Unconditionally, not gated on a revision gap: the record may owe more than a
-		// verdict on this path — the deferred close's disconnect time rides exactly this
-		// re-save — and a gap-free set says nothing about that.
-		outcome, serr := sess.saveClassified(tok)
-		switch outcome {
-		case saveMaybeLanded:
-			// Ambiguous again. retainOnUncertain appends to the FRESH list (the resolver
-			// consumed the old one before running this), so the new attempt has its
-			// continuation; the resolver's own re-check then reports the session
-			// unresolved rather than ours. See resolutionAfterContinuations.
-			sess.retainOnUncertain(sess.voidedRegsUncertainAction(c), nil)
-		case saveDefinitelyFailed:
-			mqttWarnf(c, "MQTT: could not persist the void-register verdicts for client %q "+
-				"after an unlanded write: %v", sess.id, serr)
-		}
-	}
 }
 
 // deleteInflightRegisterFor removes the register of a pending entry a terminal path

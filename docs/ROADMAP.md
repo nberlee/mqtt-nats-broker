@@ -216,20 +216,20 @@ is fixed before feature work continues.
   agreeing with whichever outcome the readback proves: rolling back immediately
   commits to "it did not land" at the one moment nobody can know that, and if it did
   land the next write overwrites it. (The write's identity is safe either way — the
-  digest is copied into `pendingWrite` when the failure is recorded, so later memory
-  changes cannot alter what the readback compares against. The problem is purely
-  that memory has to be reconciled differently in the two cases.) That is why
-  keeping the mutation is only half the answer: `retainOnUncertain` registers how to
-  undo it, and the readback runs those undos when it proves the record is still at
-  the base sequence, or discards them when the stored bytes match. Without that,
-  "keep it" silently means "assume it landed" — and for a drain claim, an
-  unconfirmed removal that is treated as durable gets the message **acked away**
-  (I1), or lets a forwarded PUBREL complete an exchange the record still owes (I10).
-  A retained removal is therefore also marked `unclaimUnconfirmed`, which the two
-  delivery callbacks check before doing anything irreversible — the QoS 1/2 callback
-  before acking a redelivery, the PUBREL callback before forwarding — because each
-  makes its own decision after the helper returns and would otherwise act on
-  in-memory "not claimed".
+  digest and the exact framed bytes are copied into `pendingWrite` when the failure is
+  recorded, so later memory changes cannot alter what the settlement compares against,
+  or re-sends.) Keeping the mutation is therefore the whole answer for the state
+  itself: the settlement re-attempts those bytes, so the record ends up agreeing with
+  memory unless a foreign owner intervened, and `retainOnLanded` registers only what a
+  caller withheld for want of PROOF. For a drain claim that distinction is the point:
+  an unconfirmed removal treated as durable gets the message **acked away** (I1), or
+  lets a forwarded PUBREL complete an exchange the record still owes (I10). A retained
+  removal is therefore also marked `unclaimUnconfirmed`, which the two delivery
+  callbacks check before doing anything irreversible — the QoS 1/2 callback before
+  acking a redelivery, the PUBREL callback before forwarding — because each makes its
+  own decision after the helper returns and would otherwise act on in-memory "not
+  claimed"; the marker comes off when the settlement PROVES the removal durable, and a
+  definite failure restores the claim inside the writer's own transaction.
 
   Resolution is itself a record-state transition, not a read that observes one: it
   takes the record fence (never waiting — a caller may hold one on the same
@@ -254,10 +254,10 @@ is fixed before feature work continues.
   the stale connection — leaving it merely detached would let a live client keep
   publishing and acking against an evicted session.
 
-  A caller that keeps a mutation also owes the readback its **landed** continuation
+  A caller that keeps a mutation also owes the SETTLEMENT its **landed** continuation
   wherever its success path does work after the save: UNSUBSCRIBE commits the staged
   drains, clears their inactivity timers, releases shared durables and drops the
-  client-facing subscriptions, and skipping that for a write that did land would
+  client-facing subscriptions, and skipping that for a write proven durable would
   leave the record saying "unsubscribed" over a half-applied runtime.
   `saveOutcome` distinguishes the
   two, and each of these callers classifies its own write and rolls back only a
@@ -1006,10 +1006,11 @@ is fixed before feature work continues.
   stream-only cores, `voidRegistersOnStream` and
   `tombstoneCancellationsOnStream`, so who writes the record is the caller's
   business), and makes ONE `saveClassified` carrying the deadline and the
-  fallback verdicts together. An ambiguous save retains the void-verdict
-  continuation, which is now closed under repeated ambiguity — it re-saves and
-  re-registers itself — so the deadline rides every retry; a definite failure
-  keeps the in-memory purge and the armed timer. Since the action is CONSUMED
+  fallback verdicts together. An ambiguous save needs no continuation: the deadline
+  and the verdicts are in the bytes it attempted, and the settlement re-attempts
+  exactly those and credits the revision they marshalled (the void-verdict re-save
+  continuation this item introduced is deleted with the not-landed verdict itself);
+  a definite failure keeps the in-memory purge and the armed timer. Since the action is CONSUMED
   before the discharge runs, the discharge also re-checks that the record state is
   still resolved (once on entry, once with its own fence held) and RE-PARKS the
   untouched action if an off-readLoop writer went ambiguous in between — otherwise
@@ -1018,10 +1019,11 @@ is fixed before feature work continues.
   retries the first design had. **Every landed record write credits the
   void-register revision it MARSHALLED** (`saveWithDetail` samples it in the
   marshal's own critical section; the sample travels in `mqttPendingWrite` and
-  `mqttSessSaveDetail`, so the landed readback and each landed classification of
-  `resolveContendedRecordSave` credit it too), never on an unlanded, unresolved,
-  definitely-failed or foreign outcome, with the accept ROLLBACK's raw write a
-  stated exemption. And **the release handoff** owns void-verdict persistence
+  `mqttSessSaveDetail`, so every settlement that proves those bytes durable — a read
+  finding them at a newer sequence, the resolver's own re-attempt landing them — and
+  each landed classification of `resolveContendedRecordSave` credit it too), never on
+  an unresolved, definitely-failed or foreign outcome, with the accept ROLLBACK's raw
+  write a stated exemption. And **the release handoff** owns void-verdict persistence
   liveness for UNBOUND sessions: the record-fence release (decided inside its own
   `sess.mu` critical section) and both ownership-gate release forms
   (`unlockSession` and CONNECT's inline delete) re-check what was staged while
@@ -1039,8 +1041,9 @@ is fixed before feature work continues.
   surviving close that can persist nothing, then a CONNECT whose accept save is the
   first landed write and must carry AND credit the inherited verdict): the purge
   itself, the
-  bullet's own one-landed-write case with restart survival, the unlanded retry,
-  the second-ambiguity re-arm, the definite-failure convergence, a stale close
+  bullet's own one-landed-write case with restart survival, the never-reached-the-stream
+  case settled by the re-attempt, the ambiguous re-attempt that keeps its identity,
+  the definite-failure convergence, a stale close
   fenced by a register claim, a real late settle converging at the gate release,
   the ambiguous-plus-late-staging arms, successive-staging convergence and its
   termination, the fence-losing race, the bound-session and generation-reuse
@@ -1387,21 +1390,88 @@ is fixed before feature work continues.
   which defers itself to the Will-outbox analysis. Found by holistic rounds 1 and 2 of the
   bound settlement.
 
-- [ ] The uncertainty resolver clears an ambiguity on a PLAIN LOAD at the base sequence,
-  so a late-committing proposal is later read as another owner's — a FALSE FOREIGN
-  verdict. `resolveUncertainWriteInTx`'s base-sequence arm (`sess_uncertain.go`) concludes
-  "not landed" from one readback that finds the record where we left it, and rolls the
-  mutation back. But the timed-out proposal can commit AFTER that read, and the rollback
-  discards the digest that would have identified it, so nothing can recognise the landing
-  as ours afterwards: `classifyRejectedProbe` sees a record at an unexpected sequence and
-  returns foreign. Already reachable against the shipped UNBOUND settlement (it disposes a
-  session whose record is in fact ours); the bound settlement widens the blast radius to a
-  LIVE connection, which is closed with 0x8E and has its Will discarded by the
-  takeover-style discard. The fix is a change to the uncertainty resolution contract — the
-  resolver must RE-ATTEMPT the exact framed CAS (or otherwise keep an identity for the
-  proposal) rather than clear on a base read, which changes what `onNotLanded` may assume
-  for every ambiguous save — so it is filed rather than folded in. Found by plan round 1
-  of the bound settlement.
+- [x] The uncertainty resolver cleared an ambiguity on a PLAIN LOAD at the base sequence,
+  so a late-committing proposal was later read as another owner's — a FALSE FOREIGN
+  verdict. Fixed by changing the settlement contract: `resolveUncertainWriteInTx`'s
+  at-base arm now RE-ATTEMPTS the attempt's exact framed bytes at its own CAS base
+  (`storeFramedSessionMsg`, shared with the contention retry), so a CAS arbitrates
+  instead of a read guessing. A success proves the content durable at the sequence it
+  reports and kills the original if it is still in process; a rejection is classified by
+  one further read through `classifyAttemptReadback` — the single helper both reads use,
+  which is where the `Sequence > baseSeq` conjunct and the below-base fail-safe live;
+  an ambiguous re-attempt keeps the identity untouched for the next pass. "It did not
+  land" is no longer a reachable verdict, so `onNotLanded`, `runUncertainReverts` and the
+  void-verdict re-save continuation are DELETED and the 22 production registrations became
+  `retainOnLanded` or nothing; the three landed wrappers that captured a packet token now
+  take the resolver's — including the cleanup `commitUnsub` reaches, which was a nested
+  closure capturing the enclosing token and kept using it through a signature change on
+  its caller (holistic round 6). It is now the method `removeUnsubConsumer`, so the
+  packet's transaction is not in scope to be captured at all; the packet's own token is
+  additionally named `packetTok` to keep the two visually distinct. KNOWN TEST GAP:
+  passing the wrong token explicitly is still possible and no test covers it — the
+  end-to-end unsubscribe test releases a consumer with no pending registers, so the
+  token-gated record fallback is never reached. A discriminating fixture must force the
+  cancellation tombstone to fall back to a record save and observe the consumer delete
+  ordered against that verdict's durability, which needs a seam the harness lacks.
+  The one ACKNOWLEDGED caller, the v5 UNSUBSCRIBE, gets a truthful
+  UNSUBACK: its true per-filter reasons and reason strings are snapshotted before the 0x83
+  overwrite and restored iff the flag set by THAT attempt's landed continuation is
+  observed, with the acknowledgment skipped for a connection the settlement displaced.
+  An ABSENT record is arbitrated the same way rather than disposed on the read: a
+  clustered apply never re-checks the per-subject CAS (`canConsistencyCheck :=
+  !isClustered`, nats-server v2.14.4 `server/stream.go:6247`), so a proposal already
+  accepted into the log lands even after an exact-sequence delete — 10164 on the
+  re-attempt therefore defers, and only 10071 classifies foreign.
+  Explicit non-changes and residuals: the unconditional create (CAS base 0) is never
+  re-attempted — it carries no header, so it is never classified at-base — and keeps its
+  existing classification and residual; the below-base arm stays fail-safe rather than
+  proven; and gone-plus-10071 stays fail-safe too, because a leader transition clears the
+  in-process map while a replicated proposal can survive it. So `docs/CONFORMANCE.md`
+  residual 7 is closed for the AT-BASE arm at a non-zero base, with the base-0 and
+  gone-plus-10071 residuals retained and the forward-resolution posture stated. Found by
+  plan round 1 of the bound settlement.
+
+- [ ] UNRESOLVED: does an ambiguous shared-QoS 2 AFFINE provisioning save leave a durable
+  affine path with no membership? The provisioning write happens in mqttProcessSubs' FIRST
+  filter loop; when it goes ambiguous the filter is marked failed, the session is
+  unresolved, and the packet's final `sess.update` is therefore REFUSED at entry — so the
+  unused-path unwind is NOT reached (it sits in the `else` branch, which requires that
+  update to succeed), and `rollbackSubscribePacket` runs instead with every save of its
+  own refused. The settlement then makes the provisioning bytes durable, so the record can
+  name `Q2Aff`/`Q2AffGen` for a subscription that never existed, with its consumer and its
+  MaxAckPending charge, reachable by no membership and reclaimed by no orphan sweep (the
+  record references it). The same end state is reachable in the SHIPPED code whenever that
+  ambiguous write happens to land; the settlement makes it deterministic. NOT MEASURED:
+  a probe driving a shared QoS 2 SUBSCRIBE with the provisioning save suppressed did not
+  reach the arming condition, so neither the leak nor its absence is established here.
+  Establish it first (the fixture must confirm the affine save is the one made ambiguous),
+  then decide between a landed continuation that unwinds under the resolver's token and
+  leaving it to session teardown. Raised by holistic round 11 of the ambiguous-write
+  settlement, whose stated mechanism (via the unwind at the `else` branch) is refuted by
+  the branch structure; the outcome question is not.
+
+- [ ] A per-subject CAS is a linearization point only WITHIN a leader term, so a
+  surviving unapplied proposal can be overwritten across an election — every arbitration
+  in this broker rests on the contract that breaks. JetStream checks
+  `Nats-Expected-Last-Subject-Sequence` BEFORE proposing and never again at apply
+  (`canConsistencyCheck := !isClustered`, nats-server v2.14.4 `server/stream.go:6247`),
+  and a leader transition clears `expectedPerSubjectInProcess`
+  (`jetstream_cluster.go:4720`) while a replicated proposal can survive it. A new leader
+  can therefore admit a second same-base write and apply BOTH, in log order. When the two
+  carry the same bytes this is benign (`MaxMsgsPer: 1` discards the earlier, and the later
+  sequence is the one adopted — see the ambiguous-write settlement). When they do not, the
+  write that applies LAST wins regardless of who owned the session: a remote broker's
+  accepted takeover can be erased by this broker's re-attempt, probe or ordinary save,
+  after which the persist observation evicts the rightful owner's client. This is NOT
+  specific to the uncertainty resolver — the definite-rejection probe's re-attempt of
+  current memory and the repair retry's exact-byte re-send have the identical exposure —
+  which is why it is filed rather than folded into any one of them. The fix has to be an
+  arbitration identity that survives an election (a generation or owner token carried IN
+  the record and checked by the writer, so a late apply is recognisable as stale) applied
+  across every writer, plus a way to test it: staging an accepted-but-unapplied entry
+  through a leader transition is beyond the current cluster harness. Stated in
+  `docs/CONFORMANCE.md` under the ambiguous-write settlement. Found by holistic round 5 of
+  the ambiguous-write settlement.
 
 - [ ] Every server-initiated COURTESY DISCONNECT write is unbounded, and one of them is
   performed with the ownership gate held. `mqttEnqueueDisconnect` → `queueOutbound` →
@@ -1622,10 +1692,10 @@ is fixed before feature work continues.
     until a scan happens to see a register that will never exist; the store loop
     could prove "no attempt was ambiguous" and retire its own verdict at abandonment,
     the same proof `releaseCancelledReservation` already uses for the no-CAS case.
-  - Drive the UNSUBSCRIBE ambiguous-save continuations (`undoUnsub`/`commitUnsub`
-    reopening the delivery barrier and withdrawing transmitted verdicts) through a
-    packet-level readback test; the behavior is pinned at the unit level today, and
-    the wiring only by the definite-failure path.
+  - ~~Drive the UNSUBSCRIBE ambiguous-save continuations through a packet-level
+    readback test~~ — superseded: `undoUnsub` is now the definite-failure path only,
+    and `commitUnsub` is driven at packet level by the UNSUBACK-truthfulness tests
+    (`unsub_ack_truthful_test.go`) plus `TestMQTTUnsubAmbiguousLandedSaveStillCommits`.
 
 ## 1. Settle release decisions
 

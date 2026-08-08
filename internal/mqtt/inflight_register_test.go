@@ -2410,58 +2410,71 @@ func TestMQTTInflightVoidVerdictPersistsAfterBusyFence(t *testing.T) {
 	}
 }
 
-// A verdict whose save turns out NOT to have landed is re-saved by the readback, not left in
-// memory.
+// A verdict carried by an AMBIGUOUS save is durable once the resolver settles that write,
+// and the revision it marshalled is credited with it.
 //
-// An ambiguous write is kept and resolved later, and for this verdict "resolved: it never
-// landed" is the dangerous outcome: the entry is then durable nowhere, and nothing else will
-// notice — the convergence points skip a session whose set has not changed since its last
-// attempt. So the retry happens inside the resolver's own transaction, which is the only
-// writer allowed at that moment and the reason continuations are handed a token at all.
+// The dangerous outcome used to be "resolved: it never landed" — the entry was then durable
+// nowhere, and nothing would notice, because the convergence points skip a session whose set
+// has not changed since its last attempt. That verdict no longer exists: the resolver
+// RE-ATTEMPTS the attempt's exact bytes, which carry this nonce, so settling the ambiguity is
+// what makes the verdict durable. Crediting is the resolver's too — the proof is the
+// durability boundary, not the intent of whoever wrote.
 //
-// Mutation check: leave the not-landed continuation empty and the record never gets it.
-func TestMQTTInflightVoidVerdictUnlandedSaveRetries(t *testing.T) {
+// The credit is asserted with the record fence still HELD. Releasing it first would let the
+// void-verdict release handoff persist the gap through a second save, which would mask a
+// resolver that credited nothing.
+//
+// Mutation check (M4): skip creditVoidedRegsLocked on the re-attempt's success and the
+// revision stays uncredited.
+func TestMQTTInflightVoidVerdictAmbiguousSaveIsSettled(t *testing.T) {
 	e := testNewInflightEnv(t, "client-void-unlanded")
-	// So sess.seq names the record the readback will find.
+	// So sess.seq names the record the resolver will find at its base sequence.
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("initial save: %v", err)
 	}
 
 	e.sess.mu.Lock()
 	idHash, base := e.sess.idHash, e.sess.seq
-	// An attempted write that will not match the record: the readback compares the
-	// record's sequence with this base and its digest with this body, so it can only
-	// conclude that nothing landed.
-	e.sess.markWriteUncertainLocked(base, []byte(`{"attempted":"never-landed"}`), 0)
-	// The verdict the ambiguous save was carrying.
+	// The verdict the ambiguous save was carrying, marshalled INTO the attempted
+	// bytes exactly as saveWithDetail would have marshalled it.
 	e.sess.voidRegNonceLocked("nonce-unlanded")
 	rev := e.sess.voidedRegsRev
+	ps := e.sess.buildPersistedSessionLocked()
+	body, merr := json.Marshal(&ps)
+	if merr != nil {
+		e.sess.mu.Unlock()
+		t.Fatalf("marshal the attempted record: %v", merr)
+	}
+	testMarkUncertainCarrying(e.sess, base, body, rev)
 	e.sess.mu.Unlock()
 
-	// Exactly what persistVoidedRegs hands the readback on saveMaybeLanded.
-	e.sess.retainOnUncertain(e.sess.voidedRegsUncertainAction(e.c), nil)
-
-	res, err := e.sess.resolveUncertainWrite()
+	// The fence is held by this test, so the resolution's own credit is observed
+	// before any release can converge the gap behind it.
+	tok := e.sess.beginRecordTx()
+	res, err := e.sess.resolveUncertainWriteInTx(tok)
 	if err != nil {
-		t.Fatalf("resolveUncertainWrite: %v", err)
+		t.Fatalf("resolveUncertainWriteInTx: %v", err)
 	}
 	if res != mqttUncertainOurs {
 		t.Fatalf("resolution = %v, want ours", res)
-	}
-
-	// The record carries it, because the not-landed continuation re-saved it.
-	ps, _, err := e.asm.loadFenceSession(idHash)
-	if err != nil {
-		t.Fatalf("load the session record: %v", err)
-	}
-	if ps == nil || len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != "nonce-unlanded" {
-		t.Fatalf("an unlanded verdict save must be retried by the readback, got %v", ps)
 	}
 	e.sess.mu.Lock()
 	saved := e.sess.voidedRegsSavedRev
 	e.sess.mu.Unlock()
 	if saved != rev {
-		t.Fatalf("the verdict is durable, so it must be marked saved: rev %d, saved %d", rev, saved)
+		t.Fatalf("the re-attempted bytes are durable, so their revision must be credited: rev %d, saved %d", rev, saved)
+	}
+	if err := e.sess.endRecordTx(tok); err != nil {
+		t.Fatalf("endRecordTx: %v", err)
+	}
+
+	// The record carries it, because the resolver re-attempted the very bytes that did.
+	psRec, _, err := e.asm.loadFenceSession(idHash)
+	if err != nil {
+		t.Fatalf("load the session record: %v", err)
+	}
+	if psRec == nil || len(psRec.CancelledRegs) != 1 || psRec.CancelledRegs[0] != "nonce-unlanded" {
+		t.Fatalf("settling the ambiguity must make the verdict durable, got %v", psRec)
 	}
 }
 

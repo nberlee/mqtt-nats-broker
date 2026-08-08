@@ -224,7 +224,7 @@ func TestMQTTPeriodicForeignDisposalHonorsTheConnAckGate(t *testing.T) {
 			// An unresolved write of ours, and a record another owner has since moved:
 			// the periodic pass resolves that to a foreign verdict.
 			e.sess.mu.Lock()
-			e.sess.markWriteUncertainLocked(e.sess.seq, []byte(`{"attempted":"ours"}`), 0)
+			testMarkUncertainLocked(e.sess, e.sess.seq, []byte(`{"attempted":"ours"}`))
 			e.sess.mu.Unlock()
 			subject := mqttSessStreamSubjectPrefix + e.sess.domainTk + e.sess.idHash
 			if _, err := e.sess.jsa.storeMsg(subject, 0, []byte(`{"owner":"someone-else"}`)); err != nil {

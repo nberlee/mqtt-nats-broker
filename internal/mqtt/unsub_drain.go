@@ -143,7 +143,8 @@ type drainSeq struct {
 	// no JetStream ack, no PUBREL forwarded. Those are exactly the actions that
 	// cannot be taken back if the write turns out never to have landed, which is why
 	// in-memory "not claimed" is not by itself evidence of durable removal (I1).
-	// Cleared by the readback, which either restores the claim or confirms it gone.
+	// Cleared by the resolution: proving the write durable discharges the ack, and a
+	// definite failure restores the claim inside the writer's own transaction.
 	unclaimUnconfirmed bool
 	phase              drainPhase
 	// intent is the persisted fact that this exchange is past PUBREC and owes a
@@ -667,29 +668,20 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		st.unclaimUnconfirmed = false
 		sess.mu.Unlock()
 	case saveMaybeLanded:
-		// The removal MAY be durable, and the guard is already set. Hand the readback
-		// BOTH continuations: undo the removal if the write never landed, or — if it
-		// did — clear the guard and perform the ack and teardown that were withheld
-		// only for want of proof. Registering just the undo would leave a landed
-		// removal permanently unacked and its drain never torn down.
-		sess.retainOnUncertain(
-			func(recordTx) {
-				sess.mu.Lock()
-				st.claimed = true
-				st.unclaimUnconfirmed = false
-				sess.mu.Unlock()
-			},
-			func(recordTx) {
-				sess.mu.Lock()
-				st.unclaimUnconfirmed = false
-				ackNow := st.ack
-				sess.mu.Unlock()
-				if ackNow != _EMPTY_ {
-					sess.jsa.sendAck(ackNow)
-				}
-				sess.finishDrainIfEmpty(c, d)
-			},
-		)
+		// The removal MAY be durable, and the guard is already set. What the resolver
+		// owes is the half that was withheld for want of PROOF: clear the guard and
+		// perform the ack and the teardown. Without it a removal the resolver makes
+		// durable would stay permanently unacked and its drain never torn down.
+		sess.retainOnLanded(func(recordTx) {
+			sess.mu.Lock()
+			st.unclaimUnconfirmed = false
+			ackNow := st.ack
+			sess.mu.Unlock()
+			if ackNow != _EMPTY_ {
+				sess.jsa.sendAck(ackNow)
+			}
+			sess.finishDrainIfEmpty(c, d)
+		})
 	}
 	if terr := sess.endRecordTx(tok); terr != nil && c != nil {
 		c.Errorf("MQTT: %v", terr)
@@ -1110,9 +1102,9 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		undoPlans()
 	case saveMaybeLanded:
 		// The record may already carry the reconciliation, so keep it — the guards are
-		// already set — and let the readback undo it all if the write never landed.
-		sess.retainOnUncertain(func(recordTx) { undoPlans() }, func(recordTx) {
-			// Landed: the reconciliation is durable, so clear the markers and tear
+		// already set — and the resolver settles it by re-attempting those exact bytes.
+		sess.retainOnLanded(func(recordTx) {
+			// Proven durable: the reconciliation stands, so clear the markers and tear
 			// down whatever it emptied.
 			sess.mu.Lock()
 			for i := range plans {
@@ -1236,14 +1228,12 @@ func (sess *mqttSession) recordPubRelIntent(c *client, jsDur string, sseq uint64
 	case saveLanded:
 		return attempt, false, nil
 	case saveMaybeLanded:
-		// The intent MAY have landed. The phase and the intent STAY — resending the
-		// payload would be wrong if it did land — but if the readback proves it did
-		// NOT, they must go back: an intent no record authorizes would make recovery
-		// recreate a PUBREL for an exchange the client never durably PUBREC'd, and
-		// suppress the payload the record still says is owed (I11).
-		sess.retainOnUncertain(func(recordTx) {
-			sess.rollbackPubRelIntent(d, sseq, prevPhase, prevPI, prevIntent)
-		}, nil)
+		// The intent MAY have landed, and the phase and the intent STAY: resending the
+		// payload would be wrong if it did, and the resolver settles the write forward
+		// by re-attempting those exact bytes rather than leaving the question open.
+		// Nothing was withheld for want of proof here — the caller's next step is the
+		// PUBREL store, gated on the intent it just set — so there is no landed
+		// continuation to register (I11).
 		return attempt, false, err
 	default:
 		return 0, true, err
@@ -1363,10 +1353,8 @@ func (sess *mqttSession) bumpDrainPubRelAttempt(c *client, d *mqttDrain, sseq ui
 	case saveMaybeLanded:
 		// The record may already name this attempt, so keep the bump — reusing the
 		// previous identity would be exactly the poisoned deduplication the counter
-		// exists to escape. If the readback proves the write never landed, the
-		// counter must return to what the record holds, or the next recreate stores
-		// under an identity no record authorizes.
-		sess.retainOnUncertain(func(recordTx) { undoBump() }, nil)
+		// exists to escape — and the resolver makes those exact bytes durable, so the
+		// record ends up naming the identity memory holds. Nothing is owed on proof.
 	}
 	if terr := sess.endRecordTx(tok); terr != nil && c != nil {
 		c.Errorf("MQTT: %v", terr)
@@ -1571,23 +1559,13 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 		}
 		sess.mu.Unlock()
 	case saveMaybeLanded:
-		// May be durable: keep the removals — the guards are already set — and
-		// register the undo for the readback.
+		// May be durable: keep the removals — the guards are already set — and let the
+		// resolver settle them by re-attempting these exact bytes.
 		batch := confirmed
-		sess.retainOnUncertain(
+		sess.retainOnLanded(
 			func(recordTx) {
-				sess.mu.Lock()
-				for _, cl := range batch {
-					if st := cl.d.seqs[cl.seq]; st != nil {
-						st.claimed = true
-						st.unclaimUnconfirmed = false
-					}
-				}
-				sess.mu.Unlock()
-			},
-			func(recordTx) {
-				// Landed: clear the markers and discharge the acks and teardowns the
-				// batch withheld for want of proof.
+				// Proven durable: clear the markers and discharge the acks and
+				// teardowns the batch withheld for want of proof.
 				for _, cl := range batch {
 					sess.mu.Lock()
 					var ack string

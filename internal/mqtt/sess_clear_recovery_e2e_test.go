@@ -49,7 +49,7 @@ func testArmAmbiguityAtClearPreFence(t *testing.T, sess *mqttSession) func() boo
 		}
 		armed = true
 		cur.mu.Lock()
-		cur.markWriteUncertainLocked(cur.seq, []byte(`{"competing":"ambiguous"}`), 0)
+		testMarkUncertainLocked(cur, cur.seq, []byte(`{"competing":"ambiguous"}`))
 		cur.mu.Unlock()
 	})
 	t.Cleanup(restore)

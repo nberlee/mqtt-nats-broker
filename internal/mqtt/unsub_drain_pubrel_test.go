@@ -1035,7 +1035,8 @@ func TestMQTTDrainAmbiguousCompletionThroughTheRealCallbacks(t *testing.T) {
 // The callback's own "fresh or already finalized" branch acks the message. For a
 // sequence whose removal is UNCONFIRMED that ack would destroy a message the stored
 // record may still claim (I1) — and unlike a forward, there is nothing left
-// afterwards to recover it from.
+// afterwards to recover it from. The gate comes off only when the removal is PROVEN
+// durable, which is what the resolver's re-attempt establishes.
 func TestMQTTDrainUnconfirmedRemovalIsNotAckedByTheDeliveryCallback(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	// Short, so the redelivery that exercises the branch arrives inside the test.
@@ -1079,18 +1080,19 @@ func TestMQTTDrainUnconfirmedRemovalIsNotAckedByTheDeliveryCallback(t *testing.T
 			"and there is nothing left to recover the message from (I1)")
 	}
 
-	// Resolving proves the write never landed, so the claim comes back and the
-	// message is still there to be completed.
+	// Settling the write is what discharges the ack: the resolver re-attempts the
+	// completion's own bytes, so the removal becomes durable and the claim is
+	// released for real — rather than the source being acked on an unproven one.
 	suppressing.Store(false)
 	restoreRead()
 	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
 		if sess.isSeqUncertain() {
-			return errors.New("still unresolved: nothing in production is retrying the readback")
+			return errors.New("still unresolved: nothing in production is retrying the resolution")
 		}
 		return nil
 	})
-	if n := testDrainClaims(sess); n != 1 {
-		t.Fatalf("the record's claim must be restored once the write is proven not to have landed, got %d", n)
+	if n := testDrainClaims(sess); n != 0 {
+		t.Fatalf("a settled removal releases the claim, got %d still claimed", n)
 	}
 }
 

@@ -7,18 +7,44 @@
 // the reconnect is rejected — recovery is never reached.
 //
 // So an ambiguous failure is recorded rather than merely returned: the session is
-// marked UNRESOLVED, together with the identity of the write it attempted (the CAS
-// base sequence and a digest of the exact bytes). Resolving it is a READBACK, and
-// the readback is a three-way classification — never "adopt whatever sequence is
-// current", which would turn a stale local snapshot into a *valid* CAS and
-// overwrite another broker's newer subscriptions, drains, claims or expiry state:
+// marked UNRESOLVED, together with the identity of the write it attempted — the CAS
+// base sequence, a digest of the exact bytes, and those exact bytes themselves.
 //
-//	readSeq == baseSeq                     -> our write did not land; seq is right
+// Settling it is a classification, never "adopt whatever sequence is current", which
+// would turn a stale local snapshot into a *valid* CAS and overwrite another broker's
+// newer subscriptions, drains, claims or expiry state. And where the record is found
+// still at the base sequence, the classification is not a READ at all: a read never
+// arbitrates ownership. JetStream returns its contention rejection precisely while a
+// write for the subject is IN PROCESS upstream, so a record at the base sequence is
+// silent about a proposal that can commit a moment later. What settles that case is a
+// CAS — the attempted bytes RE-SENT at the same base sequence, which arbitrates:
+//
 //	readSeq > baseSeq && digest matches     -> it landed; adopt readSeq
-//	anything else (incl. an absent record)  -> that record is AUTHORITATIVE and not
+//	moved to anything else                  -> that record is AUTHORITATIVE and not
 //	                                           ours: detach and evict, never write
-//	the readback itself failing             -> still unresolved; write nothing,
+//	readSeq == baseSeq                      -> nothing is known yet: RE-ATTEMPT the
+//	                                           exact bytes. Landing them makes the
+//	                                           attempt's content durable; a rejected
+//	                                           re-attempt is classified by one more
+//	                                           read; an ambiguous one keeps the
+//	                                           identity for the next pass
+//	the record is GONE (base > 0)           -> also not a verdict, and also
+//	                                           RE-ATTEMPTED: a clustered apply never
+//	                                           re-checks the CAS, so a proposal
+//	                                           already accepted can land after a
+//	                                           delete. The REJECTION KIND decides —
+//	                                           10164 (a write is in process, possibly
+//	                                           that proposal) stays unresolved, 10071
+//	                                           is foreign FAIL-SAFE. Base 0 keeps the
+//	                                           historical foreign classification: a
+//	                                           headerless create is never re-attempted
+//	the read itself failing                 -> still unresolved; write nothing,
 //	                                           delete nothing, retry later
+//
+// "Our write did not land" is therefore never a verdict. An ambiguity ends as OURS or
+// as FOREIGN, or it stays unresolved — so a mutation kept on the strength of "it may
+// have landed" is never rolled back, and what a caller registers with it is the
+// LANDED continuation alone. See retainOnLanded.
 //
 // While unresolved, save, clear and the record delete REFUSE AT ENTRY. That is the
 // hard guarantee, and it is about teardown as much as about writes: the close path
@@ -48,12 +74,23 @@ import (
 )
 
 // mqttPendingWrite is the identity of an attempted record write whose outcome is
-// unknown: the sequence it CAS'd against, and a digest of the exact record bytes
-// it tried to store. Both are needed — the sequence alone cannot tell our write
-// apart from another broker's, which is the whole point of the classification.
+// unknown: the sequence it CAS'd against, a digest of the exact record bytes it
+// tried to store, and those bytes as framed for the wire. The sequence alone cannot
+// tell our write apart from another broker's, which is the whole point of the
+// classification; the framed bytes are what lets the resolver SETTLE the ambiguity
+// by re-attempting the very same write rather than by reading and guessing.
+//
+// The bytes are the attempt's, not memory's, and that is load-bearing: an uncertain
+// caller KEPT its mutation and memory may have moved on since, so a re-marshal could
+// send content whose digest no longer matches the identity a readback compares
+// against — the original landing would then be unrecognizable as ours.
 type mqttPendingWrite struct {
 	baseSeq uint64
 	digest  [sha256.Size]byte
+	// framed is the CAS header plus body exactly as sent, with hdr its header
+	// length — the two arguments storeSessionMsg takes.
+	framed []byte
+	hdr    int
 	// voidedRegsRev is the void-register revision the attempt MARSHALLED, so a
 	// readback that proves those exact bytes durable can credit exactly the
 	// verdicts they carried — no more, whatever has been staged since. Every
@@ -63,21 +100,24 @@ type mqttPendingWrite struct {
 	voidedRegsRev uint64
 }
 
-// mqttUncertainResolution is how a readback classified an ambiguous write.
+// mqttUncertainResolution is how the resolver classified an ambiguous write.
 type mqttUncertainResolution int
 
 const (
 	// mqttUncertainUnresolved: this session's durable state is not known, so
 	// nothing may be written or deleted and the retry pass tries again. Two ways
-	// to get here, and callers treat them identically: the readback FAILED, so
-	// nothing was written and any deferred action is still parked; or the readback
-	// succeeded and the work it authorized — a continuation's re-save, a discharged
-	// deferred disconnect — left the session uncertain AGAIN, so the deferred action
-	// was consumed but a NEW attempt is now outstanding. See
+	// to get here, and callers treat them identically: NOTHING WAS SETTLED — a read
+	// that failed, a re-attempt whose own outcome is unknown, or a re-attempt
+	// rejected while the subject is still in contention — so nothing was written and
+	// any deferred action is still parked; or the ambiguity WAS settled and the work
+	// it authorized — a landed continuation's write, a discharged deferred
+	// disconnect — left the session uncertain AGAIN, so the deferred action was
+	// consumed but a NEW attempt is now outstanding. See
 	// resolutionAfterContinuations.
 	mqttUncertainUnresolved mqttUncertainResolution = iota
-	// mqttUncertainOurs: the record is ours, whether or not the write landed.
-	// sess.seq is now correct and the session may write again.
+	// mqttUncertainOurs: the record is ours, and the attempted write's content is
+	// durable — landed as issued, or landed as the resolver's byte-identical
+	// re-attempt. sess.seq is now correct and the session may write again.
 	mqttUncertainOurs
 	// mqttUncertainForeign: an authoritative record exists that is not ours. Detach
 	// and evict; every obligation belongs to its owner.
@@ -147,14 +187,19 @@ func mqttRecordDigest(body []byte) [sha256.Size]byte {
 // usable. Only an ambiguous failure — a timeout, a lost response, no responders —
 // leaves an outcome nobody can name.
 //
+// body is what a load returns (the digest identity); framed and hdr are the same
+// content as it went on the wire, kept so the resolver can re-attempt this exact
+// write instead of reading the record and guessing at its fate.
+//
 // voidedRev is the void-register revision the attempt marshalled, carried so a
-// landed readback can credit it.
+// resolution that proves those bytes durable can credit it.
 //
 // sess.mu must be held.
-func (sess *mqttSession) markWriteUncertainLocked(baseSeq uint64, body []byte, voidedRev uint64) {
+func (sess *mqttSession) markWriteUncertainLocked(baseSeq uint64, body, framed []byte, hdr int, voidedRev uint64) {
 	sess.seqUncertain = true
 	sess.pendingWrite = &mqttPendingWrite{
-		baseSeq: baseSeq, digest: mqttRecordDigest(body), voidedRegsRev: voidedRev,
+		baseSeq: baseSeq, digest: mqttRecordDigest(body), framed: framed, hdr: hdr,
+		voidedRegsRev: voidedRev,
 	}
 }
 
@@ -181,23 +226,25 @@ func mqttIsRecordCASRejection(err error) bool {
 		IsNatsErr(err, JSStreamWrongLastSequenceConstantErr)
 }
 
-// resolveUncertainWrite reads the session record back, classifies the ambiguous
-// write against the attempted write's identity, and reconciles memory to match —
-// ALL INSIDE A RECORD TRANSACTION.
+// resolveUncertainWrite SETTLES an ambiguous write: it reads the session record
+// back, classifies it against the attempted write's identity, RE-ATTEMPTS that
+// write's exact bytes when the record is still at its CAS base, and reconciles
+// memory to match — ALL INSIDE A RECORD TRANSACTION.
 //
 // Holding the fence across the whole thing is the point, not an implementation
-// detail. Resolution is a record-state transition like any other, and the three
-// things it does — decide, clear the uncertainty, run the retained continuations —
-// have to be indivisible with respect to other writers:
+// detail. Resolution is a record-state transition like any other — it can WRITE —
+// and the things it does (decide, arbitrate by re-attempting, clear the uncertainty,
+// run the retained continuations) have to be indivisible with respect to other
+// writers:
 //
 //   - observing "no transaction is open" and then resolving is a check-then-act: an
 //     off-read-loop finalizer takes the fence in between and its save() publishes
 //     seqUncertain before it returns, so the resolver settles an ambiguity whose
 //     writer has not yet classified it;
-//   - clearing the uncertainty and only then running the undos leaves a window in
-//     which another writer can persist the still-unreverted attempted state — the
-//     exact mutate/save interleaving the fence exists to prevent;
-//   - two resolvers can otherwise both act on one attempt: the first reconciles and
+//   - the re-attempt is a record write at the attempt's own base sequence, so
+//     another writer interleaving with it would be CAS'ing against a sequence this
+//     resolver is about to move;
+//   - two resolvers can otherwise both act on one attempt: the first settles it and
 //     its continuation advances the record, and the second then reads a record that no
 //     longer describes the attempt it asked about.
 //
@@ -210,7 +257,13 @@ func mqttIsRecordCASRejection(err error) bool {
 // The retained continuations receive the resolver's token: they must write under it,
 // never open a transaction of their own.
 //
-// No lock held on entry. Performs a JetStream request.
+// One single-shot pass, never a retry loop: the periodic pass is the retry cadence,
+// and a loop would hold the fence across an unbounded number of round trips. The
+// pass costs at most three JetStream requests (read, re-attempt, classifying
+// re-read), plus whatever the landed continuations do — which is the pre-existing
+// landed-arm cost, not a new one.
+//
+// No lock held on entry. Performs JetStream requests.
 func (sess *mqttSession) resolveUncertainWrite() (mqttUncertainResolution, error) {
 	if !sess.isSeqUncertain() {
 		return mqttUncertainOurs, nil
@@ -269,53 +322,224 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		return mqttUncertainOurs, nil
 	}
 
-	if err != nil {
-		if isErrorOtherThan(err, JSNoMessageFoundErr) {
-			return mqttUncertainUnresolved, fmt.Errorf("unable to read back the record of session %q: %w", sess.id, err)
-		}
-		// The record is GONE. Our write cannot have landed and then vanished on its
-		// own, so somebody released this session (a teardown, an expiry). Its state
-		// is not ours to rebuild.
-		return mqttUncertainForeign, nil
-	}
-
-	switch {
-	case smsg.Sequence == pw.baseSeq:
-		// Still exactly the record we CAS'd against: our write did not land, and
-		// sess.seq already says so. Every mutation KEPT on the strength of "it may
-		// have landed" is now undone — the record holds the state that preceded it.
-		//
-		// Uncertainty is cleared first so a continuation that must PERSIST its undo is
-		// not refused at entry, and both happen under the fence this resolver holds,
-		// so no other writer can observe or store the intermediate state.
-		sess.clearUncertaintyLocked(pw.baseSeq)
-		sess.runUncertainReverts(tok)
-		// Nothing landed, so nothing is credited: the void-register verdicts this
-		// attempt marshalled are still durable nowhere, and the continuation that
-		// re-saves them is what carries them (voidedRegsUncertainAction).
-		return sess.resolutionAfterContinuations(mqttUncertainOurs), nil
-	case smsg.Sequence > pw.baseSeq && mqttRecordDigest(smsg.Data) == pw.digest:
+	switch verdict, seq := classifyAttemptReadback(smsg, err, pw); verdict {
+	case mqttAttemptUnreadable:
+		// Nothing is known: write nothing, delete nothing, and let a later pass ask
+		// again.
+		return mqttUncertainUnresolved, fmt.Errorf("unable to read back the record of session %q: %w", sess.id, err)
+	case mqttAttemptOurs:
 		// Byte-identical to what we tried to store, at a newer sequence: it landed,
-		// and only the response was lost. Adopt the sequence it landed at and run the
-		// LANDED continuations — memory already matches the record, but every action a
-		// caller withheld for want of proof is now authorized.
-		sess.clearUncertaintyLocked(smsg.Sequence)
-		// These exact bytes are durable, so the void-register verdicts they
-		// marshalled are too — credited here for the same reason a confirmed save
-		// credits its own: the proof is the durability boundary, not the intent of
-		// whoever wrote. See creditVoidedRegsLocked.
-		sess.mu.Lock()
-		sess.creditVoidedRegsLocked(pw.voidedRegsRev)
-		sess.mu.Unlock()
-		sess.commitUncertainWrites(tok)
-		return sess.resolutionAfterContinuations(mqttUncertainOurs), nil
-	default:
+		// and only the response was lost.
+		return sess.settleLandedAttempt(tok, pw, seq), nil
+	case mqttAttemptForeign:
 		// A newer record with different content, or a sequence below our base. Either
 		// way it is not the write we attempted, so it belongs to another owner. Do
 		// NOT adopt its sequence: doing so would turn our stale snapshot into a valid
 		// CAS and overwrite whatever that owner has since persisted.
 		return mqttUncertainForeign, nil
+	default: // mqttAttemptAtBase, mqttAttemptGone
+		// Neither answer settles anything on its own. At base says nothing about our
+		// proposal, because JetStream reports contention while a write for the subject
+		// is still in process; and an empty subject does not stop a proposal already
+		// accepted into the log. Both are arbitrated by a CAS instead of a guess.
+		return sess.reattemptUncertainWrite(tok, pw, domainTk, idHash)
 	}
+}
+
+// mqttAttemptReadback is what a record read says about the AMBIGUOUS ATTEMPT it was
+// taken about, content included.
+type mqttAttemptReadback uint8
+
+const (
+	// mqttAttemptUnreadable: the read itself is unavailable, so nothing can be
+	// classified. Never a verdict about ownership.
+	mqttAttemptUnreadable mqttAttemptReadback = iota
+	// mqttAttemptForeign: the record is not this attempt's and never can be — the
+	// subject has moved past the base sequence with other content, so the attempt's
+	// CAS can no longer commit.
+	mqttAttemptForeign
+	// mqttAttemptGone: the subject is EMPTY. Somebody released this session, and the
+	// attempt's CAS can no longer be accepted — but that is not the same as saying an
+	// already-accepted proposal of ours cannot still land, so it is not foreign on its
+	// own. Only reported for a non-zero base; see classifyAttemptReadback.
+	mqttAttemptGone
+	// mqttAttemptOurs: these are the attempt's exact bytes, at a sequence past its
+	// base. The write landed and only its response was lost.
+	mqttAttemptOurs
+	// mqttAttemptAtBase: the record is still the one the attempt CAS'd against. That
+	// is CONTENTION, not an outcome: the proposal may still be in process upstream.
+	mqttAttemptAtBase
+)
+
+// classifyAttemptReadback is the whole classification of a record read taken about
+// an ambiguous write — the base/gone/moved decision of classifyRecordAgainstAttempt
+// plus the CONTENT question only a caller holding the attempted bytes can answer.
+//
+// One function for BOTH reads the resolver takes (the initial readback and the one
+// that follows a rejected re-attempt), so the two cannot drift apart. In particular
+// the `Sequence > baseSeq` conjunct is stated once: classifyRecordAgainstAttempt
+// calls every non-equal sequence "moved", and stream sequences are monotonic within
+// a stream incarnation, so a record BELOW the base cannot be this attempt's landing
+// however its bytes compare — a subject deleted and re-created lands higher, and a
+// lower sequence means a reset or re-provisioned store. Such a record is classified
+// foreign FAIL-SAFE (never adopted), not as a proof of another owner.
+//
+// The sequence returned is meaningful only for mqttAttemptOurs.
+func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite) (mqttAttemptReadback, uint64) {
+	switch classifyRecordAgainstAttempt(smsg, lerr, pw.baseSeq) {
+	case mqttRecordAttemptUnreadable:
+		return mqttAttemptUnreadable, 0
+	case mqttRecordAttemptGone:
+		// Somebody released this session (a teardown, an expiry) — but an absent
+		// subject does NOT prove the attempt is dead. In a clustered stream the
+		// expected-sequence check runs only BEFORE the proposal
+		// (`canConsistencyCheck := !isClustered`, nats-server v2.14.4
+		// server/stream.go:6247), so a proposal already accepted into the log applies
+		// whatever happened to the subject meanwhile — including an exact-sequence
+		// delete (rollbackDeleteSession, clear()). Reported as its own verdict so the
+		// resolver ARBITRATES rather than disposing on a read.
+		//
+		// Base 0 keeps the historical classification: a headerless create is never
+		// re-attempted (it would be unconditional), so there is nothing to arbitrate
+		// with. That is the stated base-0 residual.
+		if pw.baseSeq == 0 {
+			return mqttAttemptForeign, 0
+		}
+		return mqttAttemptGone, 0
+	case mqttRecordAttemptAtBase:
+		return mqttAttemptAtBase, 0
+	default: // mqttRecordAttemptMoved
+		if smsg.Sequence > pw.baseSeq && mqttRecordDigest(smsg.Data) == pw.digest {
+			return mqttAttemptOurs, smsg.Sequence
+		}
+		return mqttAttemptForeign, 0
+	}
+}
+
+// reattemptUncertainWrite settles an ambiguity by RE-SENDING the attempt's exact
+// bytes at its own CAS base — the only thing that can settle it, because a read of a
+// record still at the base sequence is silent about a proposal that may still be in
+// process upstream.
+//
+// It is an arbitration, not a repair. A success proves the attempt's CONTENT durable at
+// the sequence it reports; a rejection proves the subject moved, and one further read
+// says by whom.
+//
+// It does NOT guarantee that only one of the two proposals commits, and the invariant
+// deliberately does not rest on that. Ordinarily the shared CAS base makes the second
+// proposal impossible — but a leader transition clears the in-process map
+// (jetstream_cluster.go:4720) while a replicated proposal can survive it, and a clustered
+// apply never re-checks the expected sequence (stream.go:6247), so both can land. What
+// makes that harmless is the content and the stream: the bytes are IDENTICAL, log order
+// puts the re-attempt last so its PubAck names the surviving sequence, and $MQTT_sess is
+// MaxMsgsPer:1 — a validated prerequisite — so the earlier duplicate is discarded on
+// arrival. The observable end state is one record with these bytes at the adopted
+// sequence, which is exactly the landed-original-with-a-lost-response state. The cost is
+// one consumed stream sequence and one extra persist notification, and that notification
+// is idempotent: a remote broker evicts a stale resident either way.
+//
+// A FOREIGN proposal in that same window is a different matter, and it is NOT solved
+// here: if another broker's same-base takeover survives the election unapplied and
+// applies before this re-attempt, this write lands last and erases it. That is the
+// pinned per-subject-CAS linearization contract failing (docs/ARCHITECTURE.md, "JetStream
+// behaviors this design depends on"), and it fails identically for every arbitrating CAS
+// in this broker — the rejection probe's re-attempt of current memory, the repair retry,
+// any ordinary save. What this change adds is FREQUENCY: the resolver now writes where it
+// used to only read. Stated as a residual in docs/CONFORMANCE.md, with its own roadmap
+// item; closing it needs an arbitration identity that survives a leader transition, which
+// is a protocol change across every writer rather than a property of this arm.
+//
+// Single-shot: the periodic pass is the retry cadence, and holding the record fence
+// across a retry loop would starve every other writer on the session.
+//
+// The resolver's fence is held. sess.mu must not be held.
+func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWrite,
+	domainTk, cidHash string) (mqttUncertainResolution, error) {
+
+	// Test seam, fired between the at-base classification and the re-attempt: it is
+	// what lets a test land the ORIGINAL proposal inside the very window this arm
+	// exists for, rather than approximating it with a sleep.
+	if h := mqttTestResolveReattemptHookV.Load(); h != nil {
+		(*h)(sess)
+	}
+	resp, err := sess.storeFramedSessionMsg(domainTk, cidHash, pw.hdr, pw.framed)
+	if err == nil {
+		return sess.settleLandedAttempt(tok, pw, resp.Sequence), nil
+	}
+	if !mqttIsRecordCASRejection(err) {
+		// The re-attempt's own outcome is unknown. The identity stays EXACTLY as it
+		// was — same base, same digest, same bytes — because it names whichever of the
+		// two proposals lands (and if both land, the later one, which is the record
+		// that survives MaxMsgsPer:1).
+		return mqttUncertainUnresolved,
+			fmt.Errorf("the re-attempted record write of session %q is itself unresolved: %w", sess.id, err)
+	}
+
+	// Definitely rejected: this re-attempt is not the write that will decide, so the
+	// record that IS there does.
+	smsg, lerr := sess.jsa.loadSessionMsg(domainTk, cidHash)
+	switch verdict, seq := classifyAttemptReadback(smsg, lerr, pw); verdict {
+	case mqttAttemptOurs:
+		// The original landed between the readback and the re-attempt.
+		return sess.settleLandedAttempt(tok, pw, seq), nil
+	case mqttAttemptForeign:
+		return mqttUncertainForeign, nil
+	case mqttAttemptGone:
+		// The subject is still empty, and the REJECTION KIND is the only thing that
+		// says anything about our original. 10164 means a write for this subject is
+		// IN PROCESS upstream — possibly that original, accepted before the delete and
+		// still to apply — so nothing may be concluded and certainly nothing disposed.
+		// 10071 means no write is in process, which is the best evidence available
+		// that the original went with the record; it is a FAIL-SAFE classification,
+		// not a proof, because a leader transition clears the in-process map
+		// (jetstream_cluster.go:4720) while a replicated proposal can survive it. See
+		// docs/CONFORMANCE.md.
+		if IsNatsErr(err, JSStreamWrongLastSequenceConstantErr) {
+			return mqttUncertainUnresolved,
+				fmt.Errorf("the record of session %q is gone while a write for it is in process: %w", sess.id, err)
+		}
+		return mqttUncertainForeign, nil
+	default:
+		// At base or unreadable. At base after a rejection means a write for the
+		// subject is in process — possibly our own original — which is contention,
+		// never a verdict.
+		return mqttUncertainUnresolved,
+			fmt.Errorf("the re-attempted record write of session %q was rejected and its outcome is not yet classifiable: %w", sess.id, err)
+	}
+}
+
+// settleLandedAttempt adopts an ambiguous write PROVEN durable at seq, whichever of
+// the two proposals carrying its bytes committed.
+//
+// Adopting the sequence, crediting the revision those bytes marshalled and running
+// the landed continuations are one step under the resolver's fence: memory already
+// matches the record, but every action a caller withheld for want of proof is now
+// authorized. The credit happens here for the same reason a confirmed save credits
+// its own — the proof is the durability boundary, not the intent of whoever wrote.
+// See creditVoidedRegsLocked.
+//
+// No lock held on entry.
+func (sess *mqttSession) settleLandedAttempt(tok recordTx, pw *mqttPendingWrite, seq uint64) mqttUncertainResolution {
+	sess.clearUncertaintyLocked(seq)
+	sess.mu.Lock()
+	sess.creditVoidedRegsLocked(pw.voidedRegsRev)
+	sess.mu.Unlock()
+	sess.commitUncertainWrites(tok)
+	return sess.resolutionAfterContinuations(mqttUncertainOurs)
+}
+
+// mqttTestResolveReattemptHookV fires after an ambiguous write has been classified
+// at-base and before its exact bytes are re-attempted. See reattemptUncertainWrite.
+var mqttTestResolveReattemptHookV atomic.Pointer[func(sess *mqttSession)]
+
+func setMQTTTestResolveReattemptHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestResolveReattemptHookV.Load()
+	if h == nil {
+		mqttTestResolveReattemptHookV.Store(nil)
+	} else {
+		mqttTestResolveReattemptHookV.Store(&h)
+	}
+	return func() { mqttTestResolveReattemptHookV.Store(prev) }
 }
 
 // resolutionAfterContinuations downgrades a resolved verdict to UNRESOLVED when the
@@ -354,34 +578,6 @@ func (sess *mqttSession) clearUncertaintyLocked(seq uint64) {
 // ---------------------------------------------------------------------------
 // Reconciling the state an ambiguous write left behind
 // ---------------------------------------------------------------------------
-
-// uncertainOutcomeActions is what a caller owes the readback after keeping a
-// mutation whose write MAY have landed.
-//
-// Keeping it is only half an answer. The write either landed — in which case memory
-// already matches the record, but any action the caller deferred because it could
-// not prove durability is now owed — or it did not, in which case the record still
-// holds the previous state and memory has to be put back. Nobody can tell which at
-// failure time, which is the whole reason the state was kept; the readback decides,
-// so BOTH continuations have to be handed to it rather than guessed at.
-//
-// Registering only the undo is how "keep it on saveMaybeLanded" turns into "assume
-// it landed" in one direction and "stall forever" in the other: a drain claim whose
-// removal never reached the stream gets acked as though it had (I1), while one that
-// did land is never acked at all and its drain is never torn down.
-//
-// Both run with sess.mu NOT held.
-// Each receives the RESOLVER'S record-transaction token. A continuation that needs
-// to persist must write under it: opening a transaction of its own would deadlock
-// against the resolver holding the fence, and would also let another writer
-// interleave between the resolution and the reconciliation.
-type uncertainOutcomeActions struct {
-	// onNotLanded undoes the mutation: the record is still at the base sequence.
-	onNotLanded func(recordTx)
-	// onLanded performs whatever was deferred for want of proof: the record holds
-	// the mutation, so the irreversible follow-up is now authorized. May be nil.
-	onLanded func(recordTx)
-}
 
 // resolveUncertainNow attempts the readback immediately, for an off-readLoop writer
 // whose ambiguous save would otherwise sit unresolved.
@@ -622,54 +818,55 @@ func (sess *mqttSession) disposeForeignSession(c *client) {
 	sess.disposeForeignSessionLocked(asm, c)
 }
 
-// retainOnUncertain registers the two continuations for a mutation that was KEPT
-// because its write may have landed. See uncertainOutcomeActions.
+// retainOnLanded registers what a caller owes once an ambiguous write is PROVEN
+// durable, for a mutation that was KEPT because that write may have landed.
+//
+// There is one continuation because there is one outcome to prepare for. An
+// ambiguity is settled by re-attempting the exact bytes, so it ends as ours or as
+// foreign and never as "it did not land": the kept mutation is never rolled back,
+// and what a caller cannot do at failure time is only the part that needed PROOF —
+// acking a drain, releasing a group durable, applying granted terms. That is what
+// this registers. A caller with nothing to defer registers nothing; its mutation
+// simply stands, exactly as it would have with the response not lost.
+//
+// It runs with sess.mu NOT held, and receives the RESOLVER'S record-transaction
+// token. A continuation that needs to persist must write under it: opening a
+// transaction of its own would deadlock against the resolver holding the fence, and
+// would also let another writer interleave between the resolution and the
+// reconciliation.
 //
 // sess.mu must not be held.
-func (sess *mqttSession) retainOnUncertain(onNotLanded, onLanded func(recordTx)) {
-	if onNotLanded == nil && onLanded == nil {
+func (sess *mqttSession) retainOnLanded(onLanded func(recordTx)) {
+	if onLanded == nil {
 		return
 	}
 	sess.mu.Lock()
-	sess.uncertainReverts = append(sess.uncertainReverts, uncertainOutcomeActions{onNotLanded: onNotLanded, onLanded: onLanded})
+	sess.uncertainLanded = append(sess.uncertainLanded, onLanded)
 	sess.mu.Unlock()
 }
 
 // takeUncertainActions removes and returns the registered continuations.
-func (sess *mqttSession) takeUncertainActions() []uncertainOutcomeActions {
+func (sess *mqttSession) takeUncertainActions() []func(recordTx) {
 	sess.mu.Lock()
-	r := sess.uncertainReverts
-	sess.uncertainReverts = nil
+	r := sess.uncertainLanded
+	sess.uncertainLanded = nil
 	sess.mu.Unlock()
 	return r
 }
 
-// commitUncertainWrites runs the LANDED continuations, oldest first: the record
-// holds every retained mutation, so the follow-ups they deferred are now owed.
+// commitUncertainWrites runs the retained continuations, oldest first: the record
+// holds every mutation they were registered for, so the follow-ups they deferred are
+// now owed.
 //
-// Both walkers take the whole list and run it to the end, which is correct only while
-// at most ONE continuation per pending write can re-arm uncertainty (today the
-// void-verdict re-save, which registers itself for the new attempt and is the last
-// thing to run). Register a second re-arming continuation and these walkers must stop
-// at the first re-arm and put the unprocessed tail back: continuations that follow it
-// would write under a token whose session is uncertain again, and every such write is
-// refused at entry — silently, since neither walker looks at an outcome.
+// The walker takes the whole list and runs it to the end, which is correct only while
+// at most ONE continuation per pending write can re-arm uncertainty. Register a
+// second re-arming continuation and it must stop at the first re-arm and put the
+// unprocessed tail back: continuations that follow it would write under a token whose
+// session is uncertain again, and every such write is refused at entry — silently,
+// since the walker looks at no outcome.
 func (sess *mqttSession) commitUncertainWrites(tok recordTx) {
-	for _, a := range sess.takeUncertainActions() {
-		if a.onLanded != nil {
-			a.onLanded(tok)
-		}
-	}
-}
-
-// runUncertainReverts undoes every retained mutation, most recent first: the write
-// did NOT land, so the record still holds the state that preceded it.
-func (sess *mqttSession) runUncertainReverts(tok recordTx) {
-	r := sess.takeUncertainActions()
-	for i := len(r) - 1; i >= 0; i-- {
-		if r[i].onNotLanded != nil {
-			r[i].onNotLanded(tok)
-		}
+	for _, onLanded := range sess.takeUncertainActions() {
+		onLanded(tok)
 	}
 }
 
@@ -1042,12 +1239,11 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		outcome, err := sess.saveClassified(tok)
 		switch outcome {
 		case saveMaybeLanded:
-			// Ambiguous: the deadline and the verdicts are both in memory and both ride
-			// the continuation's re-save, so restart-survival is restored the moment the
-			// readback says the write did not land. A landed one needs nothing — the
-			// resolver credits what those bytes carried.
-			sess.retainOnUncertain(sess.voidedRegsUncertainAction(nil), nil)
-			s.Debugf("MQTT: the deferred disconnect of session %q was written ambiguously; the readback will settle it: %v", sess.id, err)
+			// Ambiguous: the deadline and the verdicts both ride the exact bytes this
+			// write attempted, and those are what the resolver re-attempts — so the
+			// settlement itself restores restart-survival and credits the revision they
+			// marshalled. Nothing is owed on proof.
+			s.Debugf("MQTT: the deferred disconnect of session %q was written ambiguously; the resolver will settle it: %v", sess.id, err)
 		case saveDefinitelyFailed:
 			// The in-memory purge stands, the verdicts stay staged for the next
 			// convergence point, and the timer below is still armed. Only
@@ -1387,20 +1583,18 @@ func (as *mqttAccountSessionManager) flushVoidVerdictGap(sess *mqttSession) {
 // saveOutcome says what a failed save means for the state the caller mutated
 // before it.
 //
-// The distinction is not cosmetic. An ambiguous write may have landed, and which way
-// memory has to be reconciled depends entirely on which — so committing to "it did
-// not land" at failure time is a guess made at the one moment nobody can know. Guess
-// wrong and the next save overwrites what did land: a drain, a claim, a membership,
-// an attempt counter.
+// The distinction is not cosmetic. An ambiguous write may have landed, so committing
+// to "it did not land" at failure time is a guess made at the one moment nobody can
+// know. Guess wrong and the next save overwrites what did land: a drain, a claim, a
+// membership, an attempt counter.
 //
-// (The attempted write's identity is safe either way — its digest is snapshotted into
-// pendingWrite when the failure is recorded, so later memory changes cannot alter what
-// the readback compares against. What is at stake is only the reconciliation.)
+// (The attempted write's identity is safe either way — its digest and its exact bytes
+// are snapshotted into pendingWrite when the failure is recorded, so later memory
+// changes cannot alter what the resolver compares against, or re-sends.)
 //
 // So: roll back only a DEFINITE failure. Keep the attempted state when the write may
-// have landed, and hand the readback both continuations — see
-// uncertainOutcomeActions, because keeping it without saying how to undo or commit it
-// is just "assume it landed" with extra steps.
+// have landed — the resolver settles it forward, by re-attempting those very bytes —
+// and register whatever the caller withheld for want of proof. See retainOnLanded.
 type saveOutcome uint8
 
 const (
@@ -1412,7 +1606,7 @@ const (
 	// the state it is undoing.
 	saveDefinitelyFailed
 	// saveMaybeLanded: the request went out and its outcome is unknown. The caller
-	// must KEEP its mutation; the session is unresolved until a readback classifies
+	// must KEEP its mutation; the session is unresolved until the resolver settles
 	// it, and no further write is permitted meanwhile.
 	saveMaybeLanded
 )

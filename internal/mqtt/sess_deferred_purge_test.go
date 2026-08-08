@@ -242,15 +242,18 @@ func TestMQTTDeferredCloseWritesVerdictAndDeadlineTogether(t *testing.T) {
 	if !e.sess.isSeqUncertain() {
 		t.Fatal("an ambiguous record write must leave the session unresolved")
 	}
-	e.sess.mu.Lock()
-	conts := len(e.sess.uncertainReverts)
-	e.sess.mu.Unlock()
-	if conts != 1 {
-		t.Fatalf("the ambiguous write must retain exactly one continuation, got %d", conts)
-	}
 	rev, saved, _ := e.voidRevs(t)
 	if rev == 0 || saved >= rev {
 		t.Fatalf("the purge must have staged an unproven verdict: rev=%d saved=%d", rev, saved)
+	}
+	// The verdict travels with the ATTEMPT's identity, which is what makes the credit
+	// below exact: the resolver credits the revision those bytes marshalled, not
+	// whatever has been staged since.
+	e.sess.mu.Lock()
+	pw := e.sess.pendingWrite
+	e.sess.mu.Unlock()
+	if pw == nil || pw.voidedRegsRev != rev {
+		t.Fatalf("the pending write must carry the marshalled void revision %d, got %+v", rev, pw)
 	}
 
 	res, err := e.sess.resolveUncertainWrite()
@@ -287,14 +290,16 @@ func TestMQTTDeferredCloseWritesVerdictAndDeadlineTogether(t *testing.T) {
 	}
 }
 
-// T3: an ambiguous write that did NOT land is re-saved by the readback, deadline included.
+// T3: an ambiguous write that never reached the stream is settled by the RE-ATTEMPT, deadline
+// included.
 //
-// Driven through the real resolution path, because the continuation's REGISTRATION is what a
-// mutation removes: obtaining a fresh closure from the helper would test the closure and
-// prove nothing about the branch.
+// Driven through the real resolution path: the suppressed store is the one shape that is
+// genuinely "issued and never landed", and what makes the deadline durable anyway is the
+// resolver re-sending the attempt's exact bytes rather than reading the base sequence and
+// calling the write dead.
 //
-// Mutation MU4: drop the retainOnUncertain registration and no action is registered, so
-// nothing re-saves.
+// Mutation M1: revert the at-base arm to clearing the uncertainty and the record keeps
+// DisconnectedAt=0 — nothing ever writes it.
 func TestMQTTDeferredCloseUnlandedWriteIsRetried(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-deferred-unlanded", "deferred.unlanded")
 	e.failRegisterStream(t)
@@ -312,12 +317,6 @@ func TestMQTTDeferredCloseUnlandedWriteIsRetried(t *testing.T) {
 	if *stores != 0 {
 		t.Fatalf("the suppressed write must not have reached the stream, %d store(s)", *stores)
 	}
-	e.sess.mu.Lock()
-	conts := len(e.sess.uncertainReverts)
-	e.sess.mu.Unlock()
-	if conts != 1 {
-		t.Fatalf("exactly one continuation must be registered, got %d", conts)
-	}
 	rev, savedBefore, _ := e.voidRevs(t)
 	if savedBefore >= rev {
 		t.Fatalf("nothing landed, so nothing may be credited: rev=%d saved=%d", rev, savedBefore)
@@ -330,30 +329,33 @@ func TestMQTTDeferredCloseUnlandedWriteIsRetried(t *testing.T) {
 	e.release()
 
 	if *stores != 1 {
-		t.Fatalf("the readback's continuation must make the record write, %d store(s)", *stores)
+		t.Fatalf("the resolver's re-attempt must make the record write, %d store(s)", *stores)
 	}
 	ps := e.loadRecord(t)
 	if ps.DisconnectedAt != action.disconnectedAt {
-		t.Fatalf("the retry must carry the original deadline: DisconnectedAt=%d, want %d",
+		t.Fatalf("the re-attempt must carry the original deadline: DisconnectedAt=%d, want %d",
 			ps.DisconnectedAt, action.disconnectedAt)
 	}
 	if !testRecordHasNonce(ps, e.nonce) {
-		t.Fatalf("the retry must carry the verdict %q, got %v", e.nonce, ps.CancelledRegs)
+		t.Fatalf("the re-attempt must carry the verdict %q, got %v", e.nonce, ps.CancelledRegs)
 	}
 	if _, saved, _ := e.voidRevs(t); saved < rev {
-		t.Fatalf("the credit must follow the landed retry: rev=%d saved=%d", rev, saved)
+		t.Fatalf("the credit must follow the landed re-attempt: rev=%d saved=%d", rev, saved)
 	}
 }
 
-// T3b: a SECOND ambiguity re-arms the continuation, and the resolver reports UNRESOLVED.
+// T3b: an ambiguous RE-ATTEMPT keeps the attempt's identity and reports UNRESOLVED, and the
+// next pass settles it.
 //
-// The verdict here is the destructive one. A resolver that returned "ours" while its own
-// continuation had just re-armed uncertainty would have CONNECT bind, find its accept save
-// refused, and evict the only object holding the new continuation — losing the deadline and
-// the verdicts with no crash anywhere.
+// The re-attempt is the same content at the same CAS base, so at most one of it and the
+// original can commit and the retained identity names whichever did. Dropping that identity
+// on an ambiguous re-attempt would be the destructive move: the session would be reported
+// resolved (or left with nothing to classify), a CONNECT would bind, its accept save would be
+// refused, and the object holding the deferred deadline and the verdicts would be evicted with
+// no crash anywhere.
 //
-// Mutation MU5: revert the continuation to a plain save and no new continuation is registered.
-// Mutation MU6: drop the inner resolver re-check and the resolution reports ours.
+// Mutation M6: clear pendingWrite on the re-attempt's ambiguous outcome and the second
+// resolution has no identity to match the record against.
 func TestMQTTDeferredCloseSecondAmbiguityReArms(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-deferred-rearm", "deferred.rearm")
 	e.failRegisterStream(t)
@@ -364,7 +366,14 @@ func TestMQTTDeferredCloseSecondAmbiguityReArms(t *testing.T) {
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 	mqttTestSessStoreSuppressV.Store(false)
 
-	// The continuation's re-save lands, and its response is lost.
+	e.sess.mu.Lock()
+	pw := e.sess.pendingWrite
+	e.sess.mu.Unlock()
+	if pw == nil {
+		t.Fatal("the suppressed write must have left an attempt identity")
+	}
+
+	// The resolver's re-attempt lands, and its response is lost.
 	stores := 0
 	restore := setMQTTTestSessStoreResultHook(func(s *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
 		if s != e.sess {
@@ -380,22 +389,22 @@ func TestMQTTDeferredCloseSecondAmbiguityReArms(t *testing.T) {
 
 	res, err := e.sess.resolveUncertainWrite()
 	if res != mqttUncertainUnresolved {
-		t.Fatalf("resolution = %v (err=%v), want unresolved: the continuation re-armed uncertainty", res, err)
+		t.Fatalf("resolution = %v (err=%v), want unresolved: the re-attempt's own outcome is unknown", res, err)
 	}
 	if !e.sess.isSeqUncertain() {
-		t.Fatal("the re-armed uncertainty must stand")
+		t.Fatal("the unsettled uncertainty must stand")
 	}
 	e.sess.mu.Lock()
-	conts := len(e.sess.uncertainReverts)
+	same := e.sess.pendingWrite == pw
 	e.sess.mu.Unlock()
-	if conts != 1 {
-		t.Fatalf("the new pending write must have its own continuation, got %d", conts)
+	if !same {
+		t.Fatal("the identity must survive an ambiguous re-attempt: it names whichever proposal lands")
 	}
 	e.asm.mu.RLock()
 	resident := e.asm.sessByHash[e.sess.idHash] == e.sess
 	e.asm.mu.RUnlock()
 	if !resident {
-		t.Fatal("the session holding the continuation must stay resident")
+		t.Fatal("the session holding the unresolved attempt must stay resident")
 	}
 
 	// The following resolution finally settles it: those bytes are on the stream.
@@ -661,14 +670,15 @@ func TestMQTTDeferredCloseLateSettleConvergesAtGateRelease(t *testing.T) {
 	}
 }
 
-// T6b: a primary write that is AMBIGUOUS plus a late staging — two arms with different
-// owners.
+// T6b: a primary write that is AMBIGUOUS plus a late staging — ONE owner, whichever way the
+// ambiguity settles.
 //
-// The not-landed arm needs no handoff at all: the continuation's re-save marshals the set as
-// it stands, so it carries the late nonce itself. The landed arm leaves a residual gap that
-// only the release handoff closes.
+// A nonce staged after the attempt's marshal is not in the attempted bytes, and the resolver
+// settles an ambiguity by re-attempting exactly those bytes — so neither arm can carry it, and
+// the residual gap belongs to the release handoff in both. That is the point: the late nonce
+// has one owner rather than two mechanisms racing to claim it.
 func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
-	t.Run("not landed: the continuation carries it", func(t *testing.T) {
+	t.Run("never reached the stream: the re-attempt carries the deadline, the handoff the late nonce", func(t *testing.T) {
 		e := testNewDeferredEnv(t, "client-deferred-amb-unlanded", "deferred.amb.unlanded")
 		settle, lateNonce := e.armLateSettle(t)
 
@@ -681,7 +691,7 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 			t.Fatal("the suppressed write must leave the session unresolved")
 		}
 		// Staged after the attempt, while the session is uncertain: no save is possible
-		// until the readback runs.
+		// until the resolution runs.
 		settle()
 		late := lateNonce()
 
@@ -689,16 +699,21 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 		if res != mqttUncertainOurs {
 			t.Fatalf("resolution = %v (err=%v), want ours", res, err)
 		}
-		_, _, handoff := e.voidRevs(t)
-		if handoff != 0 {
-			t.Fatalf("the continuation must converge this arm on its own: handoff=%d", handoff)
-		}
+		// The re-attempt is the ATTEMPT's bytes, so the deadline is durable and the late
+		// nonce — staged after their marshal — is not.
 		ps := e.loadRecord(t)
-		if !testRecordHasNonce(ps, late) || ps.DisconnectedAt != action.disconnectedAt {
-			t.Fatalf("the re-save must carry the late verdict and the deadline: %v DisconnectedAt=%d",
-				ps.CancelledRegs, ps.DisconnectedAt)
+		if ps.DisconnectedAt != action.disconnectedAt {
+			t.Fatalf("the re-attempt must carry the deadline: DisconnectedAt=%d, want %d",
+				ps.DisconnectedAt, action.disconnectedAt)
+		}
+		if testRecordHasNonce(ps, late) {
+			t.Fatalf("the re-attempted bytes never carried the late nonce: %v", ps.CancelledRegs)
 		}
 		e.release()
+		ps = e.loadRecord(t)
+		if !testRecordHasNonce(ps, late) {
+			t.Fatalf("the release handoff must close the residual gap, got %v", ps.CancelledRegs)
+		}
 	})
 
 	t.Run("landed: the release handoff closes the gap", func(t *testing.T) {
@@ -728,8 +743,8 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 		if res != mqttUncertainOurs {
 			t.Fatalf("resolution = %v (err=%v), want ours", res, err)
 		}
-		// The readback credited the marshalled revision only, so the late nonce is still
-		// owed and the record does not carry it.
+		// The resolution credited the marshalled revision only, so the late nonce is
+		// still owed and the record does not carry it.
 		ps := e.loadRecord(t)
 		if testRecordHasNonce(ps, late) {
 			t.Fatalf("the proven bytes never carried the late nonce: %v", ps.CancelledRegs)
@@ -1124,12 +1139,19 @@ func (e *testDeferredEnv) testParkDeferredAfterUnlandedWrite(t *testing.T) *mqtt
 // testAmbiguousLandedOnce makes the NEXT record write of this session land with its response
 // lost, once.
 func testAmbiguousLandedOnce(sess *mqttSession) func() {
+	return testAmbiguousLandedOnNth(sess, 1)
+}
+
+// testAmbiguousLandedOnNth is testAmbiguousLandedOnce aimed at a LATER write, for a fixture
+// whose earlier writes belong to another step — a resolver's re-attempt, say, which must be
+// allowed to settle before the write under test goes ambiguous.
+func testAmbiguousLandedOnNth(sess *mqttSession, nth int) func() {
 	n := 0
 	return setMQTTTestSessStoreResultHook(func(s *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
 		if s != sess || err != nil {
 			return resp, err
 		}
-		if n++; n == 1 {
+		if n++; n == nth {
 			return nil, errors.New("test: the response to a landed record write was lost")
 		}
 		return resp, err
@@ -1149,7 +1171,10 @@ func TestMQTTDeferredDischargeReArmReportsUnresolved(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-discharge-rearm", "discharge.rearm")
 	e.failRegisterStream(t)
 	action := e.testParkDeferredAfterUnlandedWrite(t)
-	restore := testAmbiguousLandedOnce(e.sess)
+	// The SECOND write, because the first is the resolver's own re-attempt: it settles
+	// the parked ambiguity, which is what authorizes the discharge whose write is the
+	// one under test here.
+	restore := testAmbiguousLandedOnNth(e.sess, 2)
 	defer restore()
 
 	e.gate(t)
@@ -1164,16 +1189,16 @@ func TestMQTTDeferredDischargeReArmReportsUnresolved(t *testing.T) {
 	resident := e.asm.sessByHash[e.sess.idHash] == e.sess
 	e.asm.mu.RUnlock()
 	if !resident {
-		t.Fatal("the session must stay resident: it holds the continuation")
+		t.Fatal("the session must stay resident: it holds the outstanding attempt")
 	}
 	e.sess.mu.Lock()
-	conts, parked := len(e.sess.uncertainReverts), e.sess.deferredDisconnect
+	pw, parked := e.sess.pendingWrite, e.sess.deferredDisconnect
 	e.sess.mu.Unlock()
-	if conts != 1 {
-		t.Fatalf("the discharge's write must have its continuation, got %d", conts)
+	if pw == nil {
+		t.Fatal("the discharge's own write must have left an attempt identity")
 	}
 	if parked != nil {
-		t.Fatal("the action was consumed by the discharge; the continuation owns its deadline now")
+		t.Fatal("the action was consumed by the discharge; its deadline rides the attempted bytes now")
 	}
 
 	// A later resolution finds those exact bytes on the stream and settles it.
@@ -1197,7 +1222,9 @@ func TestMQTTResolveUncertainNowReportsDischargeReArm(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-resolvenow-rearm", "resolvenow.rearm")
 	e.failRegisterStream(t)
 	action := e.testParkDeferredAfterUnlandedWrite(t)
-	restore := testAmbiguousLandedOnce(e.sess)
+	// The second write: the first is the resolver's re-attempt, which settles the parked
+	// ambiguity and authorizes the discharge under test.
+	restore := testAmbiguousLandedOnNth(e.sess, 2)
 	defer restore()
 
 	// Ungated: resolveUncertainNow takes the ownership gate itself, which is what makes the
@@ -1209,10 +1236,10 @@ func TestMQTTResolveUncertainNowReportsDischargeReArm(t *testing.T) {
 		t.Fatal("the discharge's ambiguity must stand")
 	}
 	e.sess.mu.Lock()
-	conts := len(e.sess.uncertainReverts)
+	pw := e.sess.pendingWrite
 	e.sess.mu.Unlock()
-	if conts != 1 {
-		t.Fatalf("the continuation must be intact, got %d", conts)
+	if pw == nil {
+		t.Fatal("the discharge's outstanding attempt must be intact")
 	}
 	if res := e.sess.resolveUncertainNow(e.c); res != mqttUncertainOurs {
 		t.Fatalf("second resolveUncertainNow = %v, want ours", res)
@@ -1472,8 +1499,8 @@ func TestMQTTAcceptRollbackDoesNotCreditLateVerdict(t *testing.T) {
 // exclude an off-readLoop writer: a register store settling between the resolution and the
 // fence acquisition takes the fence with tryBeginRecordTx and can leave its own write
 // ambiguous. Applied anyway, the branch's save is refused at entry, classified definitely
-// failed, and registers no continuation — so if the competing write later resolves as LANDED
-// (its own continuation is onNotLanded-only) and the purge's register-stream rungs succeeded
+// failed, and registers no continuation — so if the competing write is later settled as OURS
+// (its own bytes carry no disconnect time) and the purge's register-stream rungs succeeded
 // (no revision gap for the release handoff), nothing ever re-saves the disconnect time. A
 // restart then reads a connected-looking record and drops the expiry: the exact failure this
 // item exists to close.
@@ -1486,8 +1513,8 @@ func TestMQTTDeferredDischargeReparksWhenUnresolvedAgain(t *testing.T) {
 	e.gate(t)
 
 	// The competing writer: it took the fence after the resolution released it, and its own
-	// write is ambiguous. Its bytes LAND, so its readback will classify it ours and its
-	// onNotLanded-only continuation will do nothing.
+	// write is ambiguous. Its bytes LAND, so a later resolution classifies it ours and
+	// nothing it carries mentions the disconnect time.
 	restore := testAmbiguousLandedOnce(e.sess)
 	tok := e.sess.beginRecordTx()
 	if err := e.sess.save(tok); err == nil {
@@ -1590,7 +1617,7 @@ func TestMQTTDeferredDiscardReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 		// the discharge and clear() both passed their entry checks, and before the fence
 		// is taken. Only a check made under that fence can still see it.
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(sess.seq, []byte(`{"competing":"ambiguous"}`), 0)
+		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
 		sess.mu.Unlock()
 	})
 	defer restoreHook()
@@ -1679,7 +1706,7 @@ func TestMQTTDeferredDiscardReparksWhenUnresolvedAtClearEntry(t *testing.T) {
 		// The competing writer lands here: after the discharge's own check, before
 		// clear()'s. This is the window the entry refusal — and its sentinel — owns.
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(sess.seq, []byte(`{"competing":"ambiguous"}`), 0)
+		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
 		sess.mu.Unlock()
 	})
 	defer restoreHook()
@@ -2089,7 +2116,7 @@ func TestMQTTDeferredDischargeReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 		// A register store settled here and its save went ambiguous: after the discharge's
 		// entry check, before it takes the fence.
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(sess.seq, []byte(`{"competing":"ambiguous"}`), 0)
+		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
 		sess.mu.Unlock()
 	})
 	defer restoreHook()

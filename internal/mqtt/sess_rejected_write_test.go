@@ -368,7 +368,7 @@ func TestMQTTRejectedRecordUncertainInFence(t *testing.T) {
 		// The state an off-readLoop writer's ambiguity leaves, armed in the window the
 		// pre-fence sample cannot cover.
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(base, []byte("body"), 0)
+		testMarkUncertainLocked(sess, base, []byte("body"))
 		sess.mu.Unlock()
 	})
 	defer restoreWindow()
@@ -608,8 +608,9 @@ func TestMQTTRejectedRecordPassLeavesBoundSessionsAlone(t *testing.T) {
 
 // TestMQTTRejectedRecordDeferredDischargeSite covers the DEFERRED CLOSE's classified save
 // (sess_uncertain.go), the first of the four rejection sites the plan enumerated, through the
-// production path rather than a stand-in: a close parked by an ambiguous write, resolution
-// classifying that write not-landed, and the discharge's own save then CAS-rejected.
+// production path rather than a stand-in: a close parked by an ambiguous write, the resolver
+// settling that write by re-attempting its bytes, and the discharge's own save then
+// CAS-rejected.
 //
 // The rejection is genuinely reachable there because a REMOTE broker needs none of our
 // locks: resolution adopts a sequence under the record fence, and a peer can move the record
@@ -636,7 +637,6 @@ func TestMQTTRejectedRecordDeferredDischargeSite(t *testing.T) {
 	e.s.mqttHandleClosedClient(e.c)
 	e.sess.mu.Lock()
 	parked := e.sess.deferredDisconnect != nil
-	base := e.sess.seq
 	e.sess.mu.Unlock()
 	if !parked {
 		t.Fatal("a close on an unresolved session must park its obligations")
@@ -662,11 +662,15 @@ func TestMQTTRejectedRecordDeferredDischargeSite(t *testing.T) {
 	e.sess.mu.Lock()
 	rejected := e.sess.recordRejectedSeq
 	uncertain := e.sess.seqUncertain
+	// The base the discharge's save actually CAS'd against: the sequence the resolution
+	// adopted for the re-attempt it landed, which a rejection leaves untouched. Read
+	// AFTER the pass for that reason — the pre-resolution sequence is a different write's.
+	base := e.sess.seq
 	e.sess.mu.Unlock()
 	if uncertain {
-		t.Fatal("resolution must have classified the ambiguous write")
+		t.Fatal("the resolver must have settled the ambiguous write")
 	}
-	if rejected != base {
+	if rejected == 0 || rejected != base {
 		t.Fatalf("the discharge's rejected save must arm the marker centrally at its own "+
 			"base: rejected=%d want=%d", rejected, base)
 	}
@@ -997,7 +1001,7 @@ func TestMQTTRejectedRecordStampDefersOnLateAmbiguity(t *testing.T) {
 		// The state an off-readLoop writer's ambiguous save leaves, armed in the window
 		// the entry check cannot cover.
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(sess.seq, []byte("body"), 0)
+		testMarkUncertainLocked(sess, sess.seq, []byte("body"))
 		sess.mu.Unlock()
 	})
 	e.s.mqttHandleClosedClient(e.c)

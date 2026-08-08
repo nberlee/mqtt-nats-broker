@@ -589,6 +589,102 @@ Residuals:
   fresh identifier and its orphan sweep does not know the stream. Continuity holds
   once every broker serving the account understands it.
 
+### An ambiguous record write COMPLETES rather than aborts, once it is settled
+
+A save whose outcome is unknown is settled by re-attempting its exact bytes at its own CAS
+base, never by reading the base sequence and calling the write dead (see
+`docs/ARCHITECTURE.md`). That closes the false-foreign disposal for a non-zero base. What
+it does *not* promise:
+
+- **A wedged proposal keeps the session unresolved across passes.** The old arm restored
+  writability immediately, by guessing. Now a proposal genuinely stuck in process upstream
+  leaves the session unresolved until the pipeline settles it (apply, or a leader
+  transition clearing the in-process entry), bounded by the periodic pass cadence. That is
+  an availability cost, not a correctness one: unresolved is the posture every caller
+  already handles, and a wrong verdict is not.
+- **For operations the client was never positively acknowledged for, the ambiguity now
+  COMPLETES.** A SUBSCRIBE with no SUBACK, the 3.1.1 UNSUBSCRIBE (whose error closes the
+  connection with no UNSUBACK), and a refused CONNECT's lifetime grant all keep their
+  mutation, and once a resolution verdict is obtained that mutation is durable unless a
+  foreign owner intervened. Both outcomes were always legal — the client was told nothing
+  and must reconcile on reconnect — and the landed one was always possible; what changed
+  is that it became deterministic. A granted Session Expiry Interval of 0 therefore ends
+  the session at that close even though the CONNECT was refused, which is the
+  grant-at-durability rule this broker already followed whenever the write happened to
+  land.
+  The shared QoS 2 affine provisioning is NOT a second acknowledged caller either: its
+  save runs BEFORE the loop that persists shared memberships, and that later save is
+  refused while the session is unresolved — so the per-filter SUBACK failure it reports
+  is truthful, with no membership for that filter becoming durable.
+- **SEPARATELY, the v5 UNSUBSCRIBE is acknowledged**, and its UNSUBACK is made truthful:
+  the packet's true per-filter reasons are restored in place of the 0x83 whenever the
+  attempt's own landed continuation has fired by the time the packet tail loads its flag.
+  The residual is exactly that scope. Whenever PROOF is unavailable at the flag load — the
+  resolution deferred by a busy fence or gate, an unreadable read, an ambiguous
+  re-attempt, or a re-attempt rejected while the record reads at-base or is unreadable —
+  the unsubscribe may be durably applied (already landed, or landing before or after the
+  acknowledgment, including a verdict arriving between the flag load and the enqueue)
+  while the 0x83 stands. The guarantee is defined at the flag-load linearization point,
+  not at socket write time. It is NOT claimed strictly narrower than before: an
+  ambiguously-successful re-attempt can durably apply an unsubscribe whose original
+  proposal alone would never have landed, a new execution the forward-resolution posture
+  accepts. 3.1.1 is unaffected — no per-filter codes, and the error closes the connection
+  with no UNSUBACK.
+- **A DISPLACED connection is not acknowledged, with one interleaving left open.** The
+  acknowledgment is refused when this connection's one server-initiated DISCONNECT has
+  already been ATTEMPTED, read under `c.mu` in the same critical section as the write —
+  which is what every displacement reaching that point has done. (The tail also samples
+  `sess.c == c` beforehand; that half is defensive and changes no reachable outcome
+  today.) What is NOT covered is a displacement that detaches without ever notifying —
+  one whose 0x8E the CONNACK gate refuses, or whose claim an earlier writer already
+  spent — landing after the ownership sample: such a connection can still receive its
+  UNSUBACK. That is the pre-existing "nothing gates non-DISCONNECT traffic" residual of
+  the claim mechanism, narrowed here rather than closed.
+- **An unconditional create (CAS base 0) keeps its existing classification.** A first-ever
+  record write carries no expected-last-subject-sequence header, so it is never classified
+  at-base and is never re-attempted; a late landing of such a create can still be read as
+  another owner's record. Pre-existing headerless-create territory, stated as residual 7
+  above.
+- **A record found BELOW the attempt's base is classified foreign fail-safe**, not proven:
+  sequences are monotonic within a stream incarnation, so that shape implies a reset or
+  re-provisioned store. Nothing is adopted and nothing is written there.
+- **A leader transition can also let this broker's re-attempt overwrite a FOREIGN
+  same-base proposal, and that is not fixed here.** If another broker's takeover is
+  accepted at the same base, survives the election unapplied, and applies before this
+  re-attempt, the re-attempt lands last and erases it — the local session then settles as
+  ours while the takeover is discarded by `MaxMsgsPer: 1`, and the displaced broker's
+  client is evicted by the persist observation. This is the pinned per-subject-CAS
+  linearization contract failing (`docs/ARCHITECTURE.md`, "JetStream behaviors this design
+  depends on"), and it fails identically for EVERY arbitrating CAS this broker makes: the
+  definite-rejection probe's re-attempt of current memory, the repair retry's exact-byte
+  re-send, and any ordinary save. What this change contributes is FREQUENCY, not the
+  window — the resolver now writes where it previously only read. Closing it requires an
+  arbitration identity that survives a leader transition, across every writer; filed as
+  its own §0 roadmap item rather than folded in here.
+- **A leader transition can let BOTH of this broker's proposals commit, and that is
+  accepted rather than prevented.** The shared CAS base ordinarily excludes the second,
+  but a transition clears the in-process map while a replicated proposal survives, and a
+  clustered apply does not
+  re-check the expected sequence. Both landings carry IDENTICAL bytes, log order makes the
+  re-attempt's sequence the surviving one, and `$MQTT_sess` is `MaxMsgsPer: 1`, so the
+  duplicate is discarded on arrival and the end state is one record with those bytes at the
+  adopted sequence. The cost is one consumed stream sequence and one extra (idempotent)
+  persist notification. No cluster leader-transition test exercises the double commit
+  itself — making an accepted-but-unapplied entry survive an election deterministically is
+  not something this harness can do — so what is pinned by test is the CONSEQUENCE: two
+  identical framed writes both landing leave exactly one record, with the attempt's bytes,
+  at the sequence the broker adopted.
+- **An ABSENT record is fail-safe too, and one window stays open.** A clustered stream
+  checks the expected sequence only before proposing, so a proposal already accepted into
+  the log applies even if an exact-sequence delete removed the record in between — an
+  absent subject is therefore not proof that the attempt is dead. The resolver arbitrates:
+  a re-attempt refused with **10164** (a write for the subject is in process, possibly that
+  proposal) leaves the session UNRESOLVED rather than disposing it. A refusal with
+  **10071** is classified foreign, and that is the residual: a leader transition clears the
+  in-process map while a replicated proposal can survive it, so a proposal that lands after
+  such a transition can still be read as another owner's. Narrowed from "absence is a
+  verdict", not closed.
+
 ### A definite record-CAS rejection is settled by a probe, with bounded convergence
 
 A rejected session-record CAS says the subject moved, and the only thing that evicts a
@@ -636,13 +732,22 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
      it and the close is silent.
   6. **The rolling-upgrade asymmetry is unchanged**: protection is per owning broker (see
      the last bullet), so an older broker keeps its bound split-brain.
-  7. **A false foreign verdict can close a live connection and discard its Will.** The
-     uncertainty resolver clears an ambiguity on a single plain load at the base sequence,
-     but a timed-out proposal can commit later and its digest has been discarded — so the
-     probe reads that landing as another owner's. This is a defect of the shipped
-     uncertainty machinery (it already permits a false-foreign disposal of an unbound
-     session); the bound arm widens its blast radius to a live connection. Its own §0
-     roadmap item.
+  7. **The AT-BASE false foreign verdict is CLOSED for a non-zero CAS base; two
+     fail-safe residuals remain.** The uncertainty resolver no longer clears an ambiguity
+     on a plain load at the base sequence: it RE-ATTEMPTS the attempt's exact bytes, so a
+     late-committing proposal loses that arbitration instead of being read later as
+     another owner's record. Still open, and NOT covered by that closure:
+     - the **unconditional create** (base 0, the first-ever record write, which carries no
+       CAS header and is therefore never classified at-base): an ambiguous create whose
+       landing arrives late can still be classified foreign. Pre-existing
+       headerless-create territory, not a property of the resolver.
+     - **an absent record whose re-attempt is refused 10071** (nothing in process for the
+       subject). That refusal does not prove the ORIGINAL proposal is dead: a leader
+       transition clears the in-process map while a replicated proposal can survive it, so
+       a proposal landing after such a transition is still classified foreign — evicting
+       the session, closing a live connection with 0x8E and discarding its Will before its
+       own write lands. Narrowed (10164 now defers instead of disposing) rather than
+       closed; see the settlement section below.
   8. **An ambiguous probe's fail-closed close parks a memory-only teardown**, so a crash
      before resolution loses the parked Will and the original expiry deadline. That is the
      pre-existing parked-teardown exposure, newly reachable from this path.

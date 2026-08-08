@@ -86,12 +86,12 @@ const (
 	// no record and no live session, so the orphan sweep reclaims them.
 	mqttReconcileRefuseForeign
 	// mqttReconcileRefuseUnresolved: the repair save's outcome is unknown. The
-	// pending-write state carries the attempt's identity and BOTH continuations
-	// (not-landed -> the phase's undo; landed -> keep the replacements), and
-	// resolution is deferred: the accept transaction is still open, so the
-	// readback runs from the deferred-close path, the periodic uncertain pass,
-	// or the next CONNECT. No traffic is served meanwhile — no CONNACK was sent
-	// and every phase subscription is closed.
+	// pending-write state carries the attempt's identity and its exact bytes, the
+	// replaced entries are KEPT (the record may name them, and a resolution that
+	// re-attempts those bytes makes it so), and resolution is deferred: the accept
+	// transaction is still open, so it runs from the deferred-close path, the
+	// periodic uncertain pass, or the next CONNECT. No traffic is served meanwhile
+	// — no CONNACK was sent and every phase subscription is closed.
 	mqttReconcileRefuseUnresolved
 )
 
@@ -135,7 +135,9 @@ const (
 	mqttRepairSaveLocalDefinite
 	// mqttRepairSaveUnresolved: a retry's outcome (or the re-read itself) is
 	// unknowable right now. The pending-write state has been established with the
-	// attempt's base and digest; the caller registers the continuations.
+	// attempt's base, digest and exact bytes, so the resolver can settle it; the
+	// caller keeps its mutation and registers whatever it deferred for want of
+	// proof.
 	mqttRepairSaveUnresolved
 )
 
@@ -722,15 +724,13 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	}
 
 	if outcome == saveMaybeLanded {
-		// The record may already name the replacements. Which way memory
-		// reconciles is the readback's to decide: not-landed runs the phase's
-		// undo; landed keeps the replaced entries (the record names them, and the
-		// next resume verifies them present — nothing further is owed).
-		// Resolution is necessarily deferred: the accept transaction is still
-		// open, so the readback runs from the deferred-close path, the periodic
-		// uncertain pass, or the next CONNECT — and no traffic is served
-		// meanwhile (no CONNACK, every phase subscription closed).
-		sess.retainOnUncertain(func(recordTx) { undo() }, nil)
+		// The record may already name the replacements, so the replaced entries are
+		// KEPT — and nothing further is owed when the resolver proves them durable:
+		// the record names them and the next resume verifies them present, so there
+		// is no landed continuation to register. Resolution is necessarily deferred:
+		// the accept transaction is still open, so it runs from the deferred-close
+		// path, the periodic uncertain pass, or the next CONNECT — and no traffic is
+		// served meanwhile (no CONNACK, every phase subscription closed).
 		releaseGates()
 		return nil, mqttReconcileRefuseUnresolved, serr
 	}
@@ -753,12 +753,11 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 			sess.disposeForeignSessionLocked(as, c)
 			return nil, mqttReconcileRefuseForeign, serr
 		case mqttRepairSaveUnresolved:
-			// The pending-write state (base + digest) is already established;
-			// register the real continuations and refuse. NOT the generic ambiguous
-			// handling: a CAS rejection is definite and save() deliberately did not
-			// mark it uncertain, so without this the readback would classify
-			// nothing.
-			sess.retainOnUncertain(func(recordTx) { undo() }, nil)
+			// The pending-write state (base, digest and the exact bytes) is already
+			// established by resolveContendedRecordSave — deliberately, because a CAS
+			// rejection is definite and save() did not mark it uncertain, so without
+			// that the resolver would have nothing to classify or re-attempt. The
+			// replacements are kept and nothing further is owed, exactly as above.
 			releaseGates()
 			return nil, mqttReconcileRefuseUnresolved,
 				fmt.Errorf("repair save contended and its resolution is unavailable: %v", serr)
@@ -841,7 +840,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// establishes the pending-write state itself, carrying the base and
 			// digest, so the deferred readback classifies THIS attempt.
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
+			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		case mqttRecordAttemptGone:
@@ -850,7 +849,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 		case mqttRecordAttemptAtBase:
 			// Still exactly the record we CAS'd against: the rejection was
 			// transient contention. Retry the identical write.
-			resp, rerr := sess.retryRepairStore(d)
+			resp, rerr := sess.storeFramedSessionMsg(d.domainTk, d.cidHash, d.hdr, d.framed)
 			if rerr == nil {
 				sess.mu.Lock()
 				sess.seq = resp.Sequence
@@ -866,7 +865,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// The retry's outcome is unknown (a timeout, a lost response). Same
 			// pending-write discipline as the unreadable re-read above.
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
+			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		default: // mqttRecordAttemptMoved
@@ -896,7 +895,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	switch classifyRecordAgainstAttempt(smsg, lerr, d.baseSeq) {
 	case mqttRecordAttemptUnreadable:
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(d.baseSeq, d.body, d.voidedRegsRev)
+		sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev)
 		sess.mu.Unlock()
 		return mqttRepairSaveUnresolved
 	case mqttRecordAttemptGone:
@@ -915,14 +914,26 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	}
 }
 
-// retryRepairStore re-issues a repair save's EXACT bytes — same CAS base, same
-// body — through the same store boundary (the suppress and result seams
-// included, so a test observes the retry exactly as it observed the original).
-// The caller's accept transaction is still open on this goroutine, which is
-// what makes the raw re-send safe without re-validating the fence: nothing can
-// have closed a transaction this goroutine holds.
-func (sess *mqttSession) retryRepairStore(d *mqttSessSaveDetail) (*JSPubAckResponse, error) {
-	resp, err := sess.jsa.storeSessionMsg(d.domainTk, d.cidHash, d.hdr, d.framed)
+// storeFramedSessionMsg re-issues an attempted record write's EXACT bytes — same
+// CAS base, same body, framed as it went out the first time — through the same
+// store boundary (the result seam included, so a test observes the re-send exactly
+// as it observed the original).
+//
+// Re-sending rather than re-marshalling is what keeps the write's IDENTITY intact:
+// the digest a later read compares against is the one these bytes carry, and a
+// caller that kept its mutation may have moved memory on since. It is also what
+// makes the re-send an ARBITRATION: same CAS base, so within one leader term at most
+// one of the original and this can commit. Across a transition that exclusion does not
+// hold — the check is pre-proposal and the in-process map is cleared — and both can
+// land; see docs/CONFORMANCE.md, and the settlement contract in sess_uncertain.go for
+// why identical bytes plus MaxMsgsPer:1 make that outcome benign.
+//
+// Both callers hold a record transaction on this goroutine — the repair's accept
+// transaction, the resolver's own — which is what makes the raw re-send safe
+// without re-validating the fence: nothing can have closed a transaction this
+// goroutine holds.
+func (sess *mqttSession) storeFramedSessionMsg(domainTk, cidHash string, hdr int, framed []byte) (*JSPubAckResponse, error) {
+	resp, err := sess.jsa.storeSessionMsg(domainTk, cidHash, hdr, framed)
 	if h := mqttTestSessStoreResultHookV.Load(); h != nil {
 		resp, err = (*h)(sess, resp, err)
 	}
@@ -1055,7 +1066,7 @@ func (sess *mqttSession) grantRequestedLifetime(asm *mqttAccountSessionManager, 
 		return nil
 	case outcome == saveMaybeLanded:
 		restore()
-		sess.retainOnUncertain(nil, apply)
+		sess.retainOnLanded(apply)
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceErrF):
 		sess.disposeForeignSessionLocked(asm, c)
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
@@ -1064,7 +1075,7 @@ func (sess *mqttSession) grantRequestedLifetime(asm *mqttAccountSessionManager, 
 			return nil
 		case mqttRepairSaveUnresolved:
 			restore()
-			sess.retainOnUncertain(nil, apply)
+			sess.retainOnLanded(apply)
 		case mqttRepairSaveForeign:
 			sess.disposeForeignSessionLocked(asm, c)
 		default:

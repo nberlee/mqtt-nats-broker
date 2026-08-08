@@ -52,7 +52,13 @@ the "no fallbacks" stance reviewable rather than implicit.
 
 - **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
   is accepted only if the subject's last sequence matches, giving every state
-  machine its linearization point. A rejection is reported structurally
+  machine its linearization point — **within a leader term**. The check is made
+  before the proposal and never re-made at apply (`canConsistencyCheck :=
+  !isClustered`, `server/stream.go`), so a transition that clears the in-process
+  map while a replicated proposal survives can admit a second same-base write and
+  apply both. Every arbitration in this broker rests on that contract, so the
+  window belongs to all of them, not to any one writer; `docs/CONFORMANCE.md`
+  states it as a residual and a roadmap item carries the fix. A rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
   every rejection is resolved by re-reading rather than classified directly.
@@ -265,6 +271,123 @@ Operational constraints for the marker:
   operation ever deletes or purges a watermark, so they are audited
   non-prerequisites, not oversights.
 
+### An ambiguous record write is settled by a CAS, never by a readback
+
+A save whose outcome is UNKNOWN — a timeout, a lost response — leaves the session
+UNRESOLVED with the identity of the write it attempted: the CAS base sequence, a digest
+of the exact bytes, and **those bytes as framed for the wire**. Settling it is a
+classification of the record against that identity, and three of its four answers are
+reads:
+
+- **past the base with a matching digest** → it landed and only the response was lost;
+  adopt the sequence it landed at;
+- **moved otherwise** → that record is authoritative and not ours; detach and evict,
+  never write;
+- **unreadable** → nothing is known; write nothing, delete nothing, retry later.
+
+The remaining two answers are not verdicts at all, and reading them as such was the
+defect. The first is **the record still at the attempt's own base sequence**. JetStream
+returns its contention rejection *while a write for the subject is in process upstream*,
+so a proposal that has
+not committed yet can commit a moment later; concluding "our write did not land" there
+discarded the digest that would have identified that late landing as OURS. The session's
+next save was then CAS-rejected, its rejection probe found a record whose bytes matched
+nothing it knew, and `disposeForeignSessionLocked` evicted a session over its own write —
+on the bound settlement, closing a live connection with 0x8E and discarding its Will, with
+no takeover anywhere.
+
+The second is **an absent subject**. It is tempting to read "gone" as proof that the
+attempt is dead — its CAS can certainly not be ACCEPTED against an empty subject — but
+acceptance is not the question. In a clustered stream the expected-sequence check runs
+only BEFORE the proposal (`canConsistencyCheck := !isClustered`, nats-server v2.14.4
+`server/stream.go:6247`), so a proposal already accepted into the log applies whatever
+happened to the subject meanwhile, INCLUDING an exact-sequence delete — and this broker
+issues those (`rollbackDeleteSession`, `clear()`). Disposing on absence therefore
+reproduces the same late-landing false-foreign shape, one arm over.
+
+**So both cases are settled by a CAS: the attempt's exact bytes are RE-SENT at the
+same base sequence.** That is an arbitration, not a repair. A success proves the attempt's
+CONTENT durable at the sequence it reports; a rejection
+proves the subject moved, and one further read (through the same classification helper,
+so the two cannot drift) says by whom — ours if the original landed in the window, foreign
+if the record moved to other content, **unresolved** if it is at base again (contention)
+or unreadable, and for an absent record whatever the REJECTION KIND says (below: 10164
+defers, 10071 is fail-safe foreign). An ambiguous re-attempt keeps the identity EXACTLY
+as it was: it names whichever of the two proposals lands. The re-send is byte-identical
+rather than a re-marshal because the caller KEPT its mutation and memory may have moved
+on — a
+re-marshalled body's digest could no longer match what a later read compares against.
+
+For the gone case the re-attempt can never be accepted, and that is not its purpose: what
+it extracts is the REJECTION KIND. **10164** means a write for this subject is in process
+upstream — possibly the original, accepted before the delete and still to apply — so
+nothing is settled and nothing is disposed. **10071** means no write is in process, which
+is the best evidence available that the original went with the record; it is classified
+foreign FAIL-SAFE, not proven, because a leader transition clears the in-process map
+(`jetstream_cluster.go:4720`) while a replicated proposal can survive it.
+
+The pass is single-shot: the periodic pass is the retry cadence, and a retry loop would
+hold the record fence across an unbounded number of round trips. It costs at most three
+JetStream requests (read, re-attempt, classifying re-read) of record-fence occupation,
+plus whatever the landed continuations do — which is the pre-existing landed-arm cost made
+more frequent, not a new hold class.
+
+**The invariant does not rest on "only one of them commits", and that matters.**
+Ordinarily the shared CAS base makes the second proposal impossible. But a leader
+transition clears the in-process map (`jetstream_cluster.go:4720`) while a replicated
+proposal can survive it, and a clustered apply never re-checks the expected sequence — so
+a surviving original and a re-attempt admitted by the new leader can BOTH land. Three
+properties make that outcome indistinguishable from a single landing: the bytes are
+identical; log order puts the re-attempt last, so the PubAck this broker adopts names the
+surviving sequence; and `$MQTT_sess` is `MaxMsgsPer: 1` — a validated prerequisite — so
+the earlier duplicate is discarded the moment the later one arrives. What is spent is one
+stream sequence and one extra persist notification, and that notification is idempotent:
+a remote broker evicts a stale resident either way.
+
+**The invariant is that an ours-landed settlement always leaves a state reachable by the
+original landing with its response lost.** Content identity is the digest, ordering
+identity is the committed sequence, and no consumer of either asks *which* proposal
+landed: a register's `ClaimSeq` sampled at the stale base is still older than every later
+owner's claim, the delayed-Will fences compare captured baselines against actual
+sequences, and a remote broker's persist observation evicts its stale resident exactly as
+it would for a landed original.
+
+Two consequences are stated rather than hidden. **"It did not land" ceases to be a
+reachable verdict**, so a kept mutation is never rolled back and a caller registers only
+what it withheld for want of PROOF (`retainOnLanded`); for operations the client was never
+positively acknowledged for — a SUBSCRIBE with no SUBACK, the 3.1.1 UNSUBSCRIBE whose
+error closes the connection, a refused CONNECT's lifetime grant — the ambiguity now
+completes rather than aborts, which was always a legal outcome and is now the deterministic
+one. The v5 UNSUBSCRIBE is the one ACKNOWLEDGED case, and its UNSUBACK is made truthful:
+the packet snapshots the true per-filter reasons before overwriting them with 0x83, and
+the packet tail puts them back if a flag set by **that attempt's own landed continuation**
+is observed — never a session-state predicate, since `seqUncertain` is cleared by a foreign
+disposition too and can be re-armed by a different attempt. A connection the settlement
+DISPLACED is not acknowledged, and what makes that hold is the **DISCONNECT claim read
+inside the enqueue's own `c.mu` critical section**: a displacement notifies through that
+claim and `processSessionPersist` holds no lock of ours, so any check made and released
+before the enqueue is a check-then-act and an acknowledgment appended behind the 0x8E
+would violate [MQTT-3.14.4-1]. The tail also samples ownership (`sess.c == c` under
+`sess.mu`, rather than the asynchronous close flag), but that half is defensive: every
+displacement that can reach the tail has a written CONNACK and therefore consumes the
+claim, so removing the sample changes no reachable outcome today. It states a different
+fact — "this session is no longer mine" — for a future detach-without-notifying path.
+And **a genuinely wedged proposal keeps the session unresolved across passes** instead of
+being cleared by a guess — the availability side of the trade, where unresolved is a
+posture every caller already handles and a wrong verdict is not.
+
+Foreign soundness is per-arm and scoped to a **non-zero base**, and only ONE arm is a
+proof: a subject moved past the base with other content can never accept the attempt's CAS
+and can never be its landing. The gone arm is fail-safe (above), and a record BELOW the
+base is
+impossible within a stream incarnation (sequences are monotonic, so a subject deleted and
+re-created lands higher) and implies a reset or re-provisioned store, so it is classified
+foreign **fail-safe** — never adopted — rather than proven. **Base 0 is excluded by
+construction**: a first-ever record write carries no CAS header, a found record's sequence
+is at least 1, so an unconditional create is never classified at-base and is never
+re-attempted. Its existing classification stands, with the residual `docs/CONFORMANCE.md`
+states.
+
 ### A definite record-CAS rejection is outstanding work
 
 A session-record save is a per-subject CAS. When JetStream **rejects** it — **10071**
@@ -311,8 +434,10 @@ marker stays; **rejected with the record gone or at another sequence** → forei
 `disposeForeignSessionLocked` detaches, evicts and closes; **anything else** (a refused
 fence, an unreadable readback, a non-CAS error) → nothing established, marker kept. A
 foreign verdict is sound because a second local writer would need the fence the probe
-holds, an earlier ambiguous write of ours would have armed uncertainty, and a same-broker
-replacement is excluded by the gate below.
+holds, an earlier ambiguous write of ours would have armed uncertainty — and that arming
+now HOLDS, because the resolver above no longer clears it on a base-sequence read, which
+is what used to leave a late landing of our own unrecognizable to this probe — and a
+same-broker replacement is excluded by the gate below.
 
 The settlement runs from the **periodic pass**, renamed `reconcileResidentRecordState` for
 the three things it now settles (an ambiguous write, a definite rejection, the void-verdict
@@ -905,10 +1030,11 @@ The pass:
    a moved record into the foreign disposition, and turns an unreadable re-read
    into an explicitly established pending-write state — a CAS rejection is
    definite, so `save()` deliberately does not mark it uncertain, and the phase
-   must do so itself for the deferred readback to classify anything. An
-   **ambiguous** save refuses the CONNECT with real continuations registered:
-   *not-landed* runs the phase's undo, *landed* keeps the replacements (the
-   record names them; the next resume verifies them present). Resolution is
+   must do so itself for the deferred settlement to classify or re-attempt anything. An
+   **ambiguous** save refuses the CONNECT with the replacements KEPT: the
+   settlement re-attempts the phase's own bytes, so the record ends up naming
+   them and the next resume verifies them present — nothing further is owed, so
+   no continuation is registered. Resolution is
    necessarily deferred — the accept transaction is still open — and no traffic
    is served meanwhile: no CONNACK was sent and every phase subscription is
    closed.
@@ -1173,8 +1299,9 @@ The invariants, in the order they matter:
   fence, and that transaction may already have marshalled its record — so the addition
   is refused its own save *and* missed by the save that does happen. A revision counter
   pairs what the set is with what the record provably carries, and every convergence
-  point (the packet tail, each register store, each resume, the ambiguous-save
-  readback's own continuations) retries until the two agree. Each verdict additionally
+  point (the packet tail, each register store, each resume, and the settlement of an
+  ambiguous save — which re-attempts the very bytes that marshalled the verdict and
+  credits the revision they carried) retries until the two agree. Each verdict additionally
   carries the revision of its own insertion, because "the record carries the set" is a
   claim about a MARSHAL: a landed save proves durable exactly the verdicts recorded at
   or before the revision it captured, and a release keyed on membership alone would
@@ -1263,9 +1390,9 @@ The invariants, in the order they matter:
   then finds belongs to a newer allocation whose own CAS is still on the wire — not the
   stale settler's to release.
 - **Rollback withdraws verdicts on transmitted deliveries, and only those.** A packet
-  whose save definitely failed (or whose ambiguous save is read back as not-landed)
-  keeps its subscriptions, so its transmitted deliveries are live and still owe their
-  identifiers — a standing verdict would have the next restart free identifiers the
+  whose save DEFINITELY failed keeps its subscriptions, so its transmitted deliveries are
+  live and still owe their identifiers — a standing verdict would have the next restart
+  free identifiers the
   client holds, the reverse of the bug and a worse one. A CANCELLED allocation is never
   reinstated: nothing was transmitted, the source simply re-offers under a fresh
   allocation, so its verdict stands on every branch.
@@ -1324,8 +1451,9 @@ The invariants, in the order they matter:
   reconnect that may never come. So the deferred close opens the record transaction BEFORE
   its first mutation, stamps the ORIGINAL disconnect time, runs the purge in a form that
   only STAGES (the register-stream rungs, then the nonce in memory), and makes ONE
-  classified save carrying both. An ambiguous save keeps the retry/resolve continuations,
-  so the deadline and the verdicts ride every retry; a definite failure keeps the
+  classified save carrying both. An ambiguous save needs no continuation at all: the
+  deadline and the verdicts are in the bytes it attempted, and the settlement re-attempts
+  exactly those, crediting the revision they marshalled; a definite failure keeps the
   in-memory purge and the armed timer and loses only restart-survival of the deadline,
   which is the ordinary close's posture too. The Will's fate is decided on a FRESH clock
   sample rather than the one taken at entry: the branch's rungs and its save are round
@@ -1393,10 +1521,11 @@ The invariants, in the order they matter:
   persisting, so the credit lives at the write: `save` samples the void-register revision
   in the same critical section that marshals the record, and a CONFIRMED store advances
   the saved-revision watermark to that sample and releases the reservations it frees. The
-  same sample travels with the attempt's identity, so a readback that finds those exact
-  bytes at a newer sequence credits it, and so does each landed classification of the
-  contention retry — which proves bytes durable without passing through either. Never on
-  an unlanded, unresolved, definitely-failed or FOREIGN outcome: a record that is not ours
+  same sample travels with the attempt's identity, so every settlement that PROVES those
+  exact bytes durable credits it — a read finding them at a newer sequence, the resolver's
+  own re-attempt landing them, and each landed classification of the contention retry —
+  none of which passes through the confirmed-store path. Never on an unresolved,
+  definitely-failed or FOREIGN outcome: a record that is not ours
   carries nothing of ours. Crediting only at the paths that set out to record a verdict
   left the other half open — a reconnect's accept save inherits the staged verdicts and is
   not a verdict path at all, so it made the fact durable while its identifier stayed

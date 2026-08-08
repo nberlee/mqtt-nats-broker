@@ -8,10 +8,29 @@ import (
 
 // testMarkUncertain puts a session into the unresolved state as an ambiguous write
 // would, against the given CAS base and record body.
+//
+// The bytes are framed exactly as the save path frames them — the production helper,
+// not a copy — because the resolver SETTLES an ambiguity by re-sending them: a
+// hand-built body with no CAS header would re-attempt an unconditional create and
+// prove nothing about the arbitration under test.
 func testMarkUncertain(sess *mqttSession, baseSeq uint64, body []byte) {
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(baseSeq, body, 0)
+	testMarkUncertainLocked(sess, baseSeq, body)
 	sess.mu.Unlock()
+}
+
+// testMarkUncertainLocked is testMarkUncertain for a caller that already holds
+// sess.mu — a hook firing inside another operation's critical section.
+func testMarkUncertainLocked(sess *mqttSession, baseSeq uint64, body []byte) {
+	testMarkUncertainCarrying(sess, baseSeq, body, 0)
+}
+
+// testMarkUncertainCarrying is testMarkUncertainLocked for an attempt that
+// MARSHALLED void-register verdicts: voidedRev is the revision those exact bytes
+// carry, and a resolution proving them durable credits exactly it.
+func testMarkUncertainCarrying(sess *mqttSession, baseSeq uint64, body []byte, voidedRev uint64) {
+	framed, hdr := mqttFrameRecordWrite(baseSeq, body)
+	sess.markWriteUncertainLocked(baseSeq, body, framed, hdr, voidedRev)
 }
 
 // testRecordBody returns the exact bytes a save of this session's current state
@@ -28,10 +47,10 @@ func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 	return b
 }
 
-// TestUncertainWriteThreeWayReadback is test 5: the classification itself, in all
-// three outcomes plus the unreadable case.
+// TestUncertainWriteThreeWayReadback is test 5: the classification itself, in every
+// outcome — the at-base arbitration, the two content verdicts, and the unreadable case.
 //
-// The middle case is the one that matters most in both directions. "Adopt the
+// The digest arm is the one that matters most in both directions. "Adopt the
 // latest sequence" would resolve it — and would also turn a stale local snapshot
 // into a VALID CAS over another broker's newer record, silently overwriting its
 // subscriptions, drains, claims and expiry state. Only a byte-identical record may
@@ -39,12 +58,15 @@ func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 func TestUncertainWriteThreeWayReadback(t *testing.T) {
 	a, b := testNewTeardownEnv(t)
 
-	t.Run("did not land", func(t *testing.T) {
+	t.Run("at base: re-attempted and landed", func(t *testing.T) {
 		sess := testProvisionSession(t, a, "notland")
 		_, seq := testLoadSessRecord(t, a, sess.idHash)
-		// An attempted write whose body never reached the stream.
+		// An attempted write whose body never reached the stream. The record is
+		// therefore still at its CAS base — which proves nothing about a proposal
+		// that may yet commit, so the resolver arbitrates by re-sending it.
 		sess.subs["extra"] = 1
-		testMarkUncertain(sess, seq, testRecordBody(t, sess))
+		body := testRecordBody(t, sess)
+		testMarkUncertain(sess, seq, body)
 
 		if res, err := sess.resolveUncertainWrite(); res != mqttUncertainOurs {
 			t.Fatalf("resolution = %v (err=%v), want ours", res, err)
@@ -55,8 +77,27 @@ func TestUncertainWriteThreeWayReadback(t *testing.T) {
 		sess.mu.Lock()
 		got := sess.seq
 		sess.mu.Unlock()
-		if got != seq {
-			t.Errorf("sess.seq = %v, want the unchanged base %v", got, seq)
+		if got <= seq {
+			t.Errorf("sess.seq = %v, want a sequence past the base %v: the re-attempt is a record write", got, seq)
+		}
+		// The attempt's own bytes are what became durable, at the sequence adopted.
+		ps, recSeq := testLoadSessRecord(t, a, sess.idHash)
+		if recSeq != got {
+			t.Errorf("the adopted sequence %v is not the record's %v", got, recSeq)
+		}
+		if ps == nil {
+			t.Fatal("the re-attempt must have stored a record")
+		}
+		if _, ok := ps.Subs["extra"]; !ok {
+			t.Errorf("the record must hold the attempted state, got %+v", ps.Subs)
+		}
+		stored := testRecordBodyAt(t, a, sess.idHash)
+		if mqttRecordDigest(stored) != mqttRecordDigest(body) {
+			t.Error("the re-attempt must store the ATTEMPT's exact bytes, not a re-marshal of current memory")
+		}
+		// And the session can write again.
+		if err := testSessSave(t, sess); err != nil {
+			t.Fatalf("a settled session must be writable: %v", err)
 		}
 	})
 

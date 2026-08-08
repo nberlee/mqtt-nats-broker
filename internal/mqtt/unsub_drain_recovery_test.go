@@ -749,17 +749,18 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 	})
 }
 
-// TestDrainAmbiguousCompletionThatDidNotLandRestoresTheClaim is plan test 5(b) for
-// the completion path: the ambiguous write turns out NOT to have landed.
+// TestDrainAmbiguousCompletionIsSettledForward is plan test 5(b) for the completion
+// path: an ambiguous removal is settled by RE-ATTEMPTING it, and only then acked.
 //
 // This is the case that makes "keep the mutation when it may have landed"
-// insufficient on its own. The claim is released in memory, the record still holds
-// it, and nothing else ever writes while the session is unresolved — so unless the
-// readback puts the claim back, the release is silently treated as durable. The
-// consequences are irreversible: a redelivery of a sequence memory calls unclaimed
-// is acked away, and a correlated PUBREL is forwarded, letting the client PUBCOMP
-// an exchange the record still says is owed (I1, I10).
-func TestDrainAmbiguousCompletionThatDidNotLandRestoresTheClaim(t *testing.T) {
+// insufficient on its own. The claim is released in memory while the record may
+// still hold it, and nothing else writes while the session is unresolved — so
+// everything IRREVERSIBLE waits for proof: a redelivery must not be acked away and a
+// correlated PUBREL must not be forwarded, or the client can PUBCOMP an exchange the
+// record still says is owed (I1, I10). What supplies that proof is the re-attempt,
+// not a read: a record found at the base sequence is silent about a proposal that may
+// still commit, and undoing there is what let a late landing be read as foreign.
+func TestDrainAmbiguousCompletionIsSettledForward(t *testing.T) {
 	_, c, sess, _ := drainTestSession(t, "amb-notland")
 
 	d := addTestDrain(sess, "sid", "dur-notland", "foo", 2, map[uint64]*drainSeq{
@@ -808,8 +809,8 @@ func TestDrainAmbiguousCompletionThatDidNotLandRestoresTheClaim(t *testing.T) {
 			"or the client can PUBCOMP an exchange the record still claims")
 	}
 
-	// Readback available again: the record is still at the base sequence, so the
-	// write did NOT land.
+	// Readback available again: the record is still at the base sequence, which
+	// settles nothing — so the resolver re-attempts the completion's own bytes.
 	restoreRead()
 	res, err := sess.resolveUncertainWrite()
 	if err != nil {
@@ -823,13 +824,44 @@ func TestDrainAmbiguousCompletionThatDidNotLandRestoresTheClaim(t *testing.T) {
 	}
 
 	st = drainSeqState(sess, d, 5)
-	if !st.claimed {
-		t.Fatal("the readback proved the write did not land, so the claim must be RESTORED: " +
-			"the record still owes this delivery, and leaving it released loses the message")
+	if st.claimed {
+		t.Fatal("the re-attempt made the removal durable, so the claim must stay released")
 	}
 	if st.unclaimUnconfirmed {
-		t.Fatal("the unconfirmed marker must be cleared once the sequence is resolved")
+		t.Fatal("the guard must come off once the removal is PROVEN durable: that is what authorizes the ack")
 	}
+	// The decisive observable: the record the re-attempt stored no longer claims the
+	// sequence. It was the drain's last claim, so the landed continuation tore the
+	// drain down as well — exactly what a landed original would have done. Under the
+	// old at-base arm nothing was stored at all and the record still owed the
+	// delivery.
+	ps := testLoadDrainRecord(t, sess)
+	if pd := ps.Drains["sid"]; pd != nil {
+		for _, ds := range pd.Started {
+			if ds.Seq == 5 {
+				t.Fatalf("the settled record still claims sequence 5: the removal was never made durable, got %+v", pd.Started)
+			}
+		}
+	}
+	if drainRegistered(sess, "dur-notland") {
+		t.Fatal("the drain claimed nothing once the removal was PROVEN durable, so it must have been torn down")
+	}
+}
+
+// testLoadDrainRecord returns the session's STORED record, for a drain assertion that
+// must read what is durable rather than what memory says.
+func testLoadDrainRecord(t *testing.T, sess *mqttSession) *mqttPersistedSession {
+	t.Helper()
+	subject := mqttSessStreamSubjectPrefix + sess.domainTk + sess.idHash
+	smsg, err := sess.jsa.loadLastMsgFor(mqttSessStreamName, subject)
+	if err != nil || smsg == nil {
+		t.Fatalf("loading the persisted session record: %v", err)
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		t.Fatalf("unmarshal the persisted session record: %v", err)
+	}
+	return ps
 }
 
 // TestSharedSubRollbackRefusedAtEntry covers rollbackSharedSub's already-uncertain
@@ -849,7 +881,7 @@ func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
 	sess.mu.Lock()
 	sess.sharedSubs = map[string]byte{sid: 1}
 	// An earlier write in this packet already left the session unresolved.
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"earlier":"attempt"}`), 0)
+	testMarkUncertainLocked(sess, sess.seq, []byte(`{"earlier":"attempt"}`))
 	sess.mu.Unlock()
 
 	tok := sess.beginRecordTx()
@@ -989,15 +1021,18 @@ func TestDrainAmbiguousLandedCompletionDischargesTheAck(t *testing.T) {
 	}
 }
 
-// TestDrainAmbiguousIntentThatDidNotLandIsUndone covers the PUBREL intent, which is
-// the linearization point of the whole QoS 2 second phase.
+// TestDrainAmbiguousIntentIsSettledForward covers the PUBREL intent, which is the
+// linearization point of the whole QoS 2 second phase.
 //
 // An intent kept in memory that no record authorizes is worse than a lost one: it
 // suppresses the payload the record still says is owed, and makes recovery recreate
-// a PUBREL for an exchange the client never durably PUBREC'd (I11). So when the
-// readback proves the intent write never landed, the phase, identifier and intent
-// must all go back to what the record holds.
-func TestDrainAmbiguousIntentThatDidNotLandIsUndone(t *testing.T) {
+// a PUBREL for an exchange the client never durably PUBREC'd (I11). The intent is
+// kept anyway — resending the payload would be wrong if the write landed — and what
+// makes memory and record agree is the resolver RE-ATTEMPTING those bytes, so the
+// record ends up authorizing exactly the intent memory holds. Reading the base
+// sequence as "it died" and rolling the intent back is what could leave a late
+// landing describing an exchange this broker had already forgotten.
+func TestDrainAmbiguousIntentIsSettledForward(t *testing.T) {
 	_, c, sess, _ := drainTestSession(t, "amb-intent-notland")
 
 	d := addTestDrain(sess, "sid", "dur-intent", "foo", 2, map[uint64]*drainSeq{
@@ -1037,12 +1072,30 @@ func TestDrainAmbiguousIntentThatDidNotLandIsUndone(t *testing.T) {
 	}
 
 	st := drainSeqState(sess, d, 4)
-	if st.intent || st.pi != 0 || st.phase != drainPublish {
-		t.Fatalf("the readback proved the intent write did not land, so it must be undone, got %+v: "+
-			"an intent no record authorizes suppresses a payload that is still owed and recreates a PUBREL nothing ordered", st)
+	if !st.intent || st.pi != 77 || st.phase != drainPubRelUncertain {
+		t.Fatalf("the intent must stand once the resolver settles the write, got %+v", st)
 	}
 	if !st.claimed {
-		t.Fatal("the source claim must still be held: the record never stopped claiming it")
+		t.Fatal("the source claim must still be held: the exchange is past PUBREC, not complete")
+	}
+	// And the record now AUTHORIZES it, which is the whole point of the intent: it is
+	// a positive durable fact, never an inference from memory.
+	ps := testLoadDrainRecord(t, sess)
+	pd := ps.Drains["sid"]
+	if pd == nil {
+		t.Fatalf("the settled record must still carry the drain, got %+v", ps.Drains)
+	}
+	var found bool
+	for _, ds := range pd.Started {
+		if ds.Seq == 4 {
+			found = true
+			if !ds.PubRel || ds.PI != 77 {
+				t.Fatalf("the settled record must carry the intent under its identifier, got %+v", ds)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("the settled record must still claim sequence 4, got %+v", pd.Started)
 	}
 }
 
@@ -1052,15 +1105,21 @@ type atomicOnceBool struct{ v atomic.Bool }
 func (a *atomicOnceBool) set(b bool) { a.v.Store(b) }
 func (a *atomicOnceBool) get() bool  { return a.v.Load() }
 
-// TestSubscribeAmbiguousThatDidNotLandIsUndone is finding 1: the final SUBSCRIBE
-// save kept the packet's state on ambiguity but registered no undo.
+// TestSubscribeAmbiguousIsSettledForward is the whole-packet arm of the settlement
+// contract: a SUBSCRIBE whose final save is AMBIGUOUS keeps its state, and the
+// resolver makes exactly those bytes durable.
 //
-// No SUBACK is sent when that save fails, so the client believes none of the packet
-// happened. If the readback then proves the write never landed, memory must agree:
-// leaving the subscriptions in place lets a later save persist filters the client
-// was never told about, and the record would name consumers no membership justifies.
-func TestSubscribeAmbiguousThatDidNotLandIsUndone(t *testing.T) {
-	_, c, sess, _ := drainTestSession(t, "sub-notland")
+// The packet used to be rolled back whenever a readback found the record still at the
+// base sequence — which is not evidence that the write died, only that it has not
+// committed YET. Undoing there is what let a late-committing proposal be read later
+// as another owner's record. So the state stands, with or without a SUBACK: the
+// client was told nothing and must reconcile on reconnect, and this is exactly the
+// outcome a landed original with a lost response would have produced.
+//
+// Mutation M1: revert the at-base arm to clearing the uncertainty and the packet's
+// filter is neither in memory nor in the record.
+func TestSubscribeAmbiguousIsSettledForward(t *testing.T) {
+	_, _, sess, _ := drainTestSession(t, "sub-notland")
 
 	// A membership the packet adds, persisted so there is a base sequence.
 	if err := testSessSave(t, sess); err != nil {
@@ -1077,12 +1136,9 @@ func TestSubscribeAmbiguousThatDidNotLandIsUndone(t *testing.T) {
 	baseSeq := sess.seq
 	sess.mu.Unlock()
 
-	snap := sess.snapshotSubs()
-	consSnap := map[string]*ConsumerConfig{}
-	// A consumer the packet created. rollbackSubscribePacket deletes it only AFTER
-	// its restore-save is CONFIRMED — so if that save is refused (which it is when
-	// the undo runs before uncertainty is cleared), the durable is left behind while
-	// the membership is rolled back: a leak with nothing referencing it.
+	// A consumer the packet created. It is referenced by the membership the packet is
+	// about to persist, so settling the write forward is precisely what keeps it
+	// legitimate rather than orphaned.
 	packetDur := "pkt_" + nuid.Next()
 	if _, err := sess.jsa.createDurableConsumer(&CreateConsumerRequest{
 		Stream: mqttStreamName,
@@ -1105,8 +1161,8 @@ func TestSubscribeAmbiguousThatDidNotLandIsUndone(t *testing.T) {
 	sess.cons["packet.filter"] = &ConsumerConfig{Durable: packetDur, DeliverSubject: mqttSubPrefix + packetDur}
 	sess.mu.Unlock()
 
-	// The packet's write neither lands nor resolves, so the retained state and its
-	// undo are both observable.
+	// The packet's write neither lands nor resolves, so the retained state is
+	// observable while the session is unresolved.
 	var suppressing atomicOnceBool
 	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
 		if stream == mqttSessStreamName && suppressing.get() {
@@ -1119,14 +1175,6 @@ func TestSubscribeAmbiguousThatDidNotLandIsUndone(t *testing.T) {
 	tok := sess.beginRecordTx()
 	err := sess.save(tok)
 	outcome := sess.classifySave(false, err)
-	if outcome == saveMaybeLanded {
-		// Mirrors production: the continuation writes under the RESOLVER'S token. It
-		// must not open one of its own — the resolver holds the fence for exactly this
-		// reason, so a nested begin would deadlock.
-		sess.retainOnUncertain(func(rtok recordTx) {
-			sess.rollbackSubscribePacket(c, rtok, nil, consSnap, snap, true)
-		}, nil)
-	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -1142,66 +1190,47 @@ func TestSubscribeAmbiguousThatDidNotLandIsUndone(t *testing.T) {
 		t.Fatal("the packet's membership must be kept while the write is unresolved")
 	}
 
-	// The record is still at the base sequence: the write did not land.
+	// The record is still at the base sequence — which settles nothing, so the
+	// resolver re-attempts the packet's own bytes.
 	suppressing.set(false)
 	restoreRead()
-	if _, rerr := sess.resolveUncertainWrite(); rerr != nil {
+	res, rerr := sess.resolveUncertainWrite()
+	if rerr != nil {
 		t.Fatalf("resolveUncertainWrite: %v", rerr)
+	}
+	if res != mqttUncertainOurs {
+		t.Fatalf("resolution = %v, want ours: the re-attempt arbitrates the ambiguity", res)
 	}
 
 	sess.mu.Lock()
 	_, stillThere := sess.subs["packet.filter"]
 	_, prior := sess.subs["already.there"]
-	sess.mu.Unlock()
-	if stillThere {
-		t.Fatal("the readback proved the SUBSCRIBE never landed, so the packet must be undone: " +
-			"no SUBACK was sent, and a later save would otherwise persist a filter the client never had acknowledged")
-	}
-	if !prior {
-		t.Fatal("the pre-packet membership must survive the rollback")
-	}
-	// And the rollback's own re-persist was NOT refused. This is the load-bearing
-	// part: rollbackSubscribePacket restores the maps, re-persists them, and only
-	// then tears down what the packet created — so a save refused at entry (which is
-	// what happens when the undo runs while the session is still marked uncertain)
-	// silently skips every resource release that follows it, leaving the packet's
-	// consumers, subscriptions and accounting behind.
-	if sess.isSeqUncertain() {
-		t.Fatal("the session must be resolved before its undo runs, or the undo's own save is refused at entry")
-	}
-	// The decisive observable: the rollback's re-persist actually WROTE. Its content
-	// happens to match the pre-packet record, so only the sequence shows it landed —
-	// and if it was refused at entry, nothing after it in rollbackSubscribePacket ran
-	// either.
-	sess.mu.Lock()
 	seqAfter := sess.seq
 	sess.mu.Unlock()
+	if !stillThere || !prior {
+		t.Fatal("the packet's state is kept: the resolver settles the write forward rather than undoing it")
+	}
+	if sess.isSeqUncertain() {
+		t.Fatal("a landed re-attempt must leave the session resolved and writable")
+	}
 	if seqAfter <= baseSeq {
-		t.Fatalf("the rollback's re-persist never landed (sequence %v, base %v): it was refused at entry, "+
-			"so everything it gates — the consumer teardown, the affine unwind, the accounting refunds — was skipped",
-			seqAfter, baseSeq)
-	}
-	stored := testPersistedSubs(t, sess)
-	if _, leaked := stored["packet.filter"]; leaked {
-		t.Fatal("the rolled-back record still carries the packet's filter: the undo's re-persist was refused, " +
-			"so everything it gates — the consumer teardown, the affine unwind, the accounting refunds — was skipped")
-	}
-	if _, kept := stored["already.there"]; !kept {
-		t.Fatal("the rolled-back record must still carry the pre-packet membership")
+		t.Fatalf("the re-attempt must advance the record (sequence %v, base %v)", seqAfter, baseSeq)
 	}
 
-	// And the release the save GATES actually happened: the consumer this packet
-	// created is deleted. This is independent of the subscription list — the `added`
-	// loop is driven by cons-versus-snapshot — so it is assertable here, and it is
-	// what the sequence check alone cannot see: a rollback that returned straight
-	// after its compensating save would still advance the sequence while leaking the
-	// durable. Deletion is asynchronous, hence the poll.
-	drainCheckFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		if ci, lerr := sess.jsa.lookupConsumer(mqttStreamName, packetDur); lerr == nil && ci != nil {
-			return errors.New("the packet's consumer still exists")
-		}
-		return nil
-	})
+	// The decisive observable: the RECORD carries the packet's filter. Under the old
+	// arm it carried neither the filter nor any write at all.
+	stored := testPersistedSubs(t, sess)
+	if _, durable := stored["packet.filter"]; !durable {
+		t.Fatal("the settled record must carry the packet's filter: the ambiguity is resolved by making those exact bytes durable")
+	}
+	if _, keptPrior := stored["already.there"]; !keptPrior {
+		t.Fatal("the settled record must still carry the pre-packet membership")
+	}
+
+	// And the consumer the packet created is still there, referenced by that record.
+	if ci, lerr := sess.jsa.lookupConsumer(mqttStreamName, packetDur); lerr != nil || ci == nil {
+		t.Fatalf("the packet's consumer must survive with the membership that names it: %v", lerr)
+	}
 }
 
 // testPersistedSubs returns the subscription map from the STORED session record.
@@ -1257,7 +1286,7 @@ func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
 	sess.c = c
 	baseSeq := sess.seq
 	// An attempted write whose digest will NOT match whatever is stored.
-	sess.markWriteUncertainLocked(baseSeq, []byte(`{"attempted":"ours"}`), 0)
+	testMarkUncertainLocked(sess, baseSeq, []byte(`{"attempted":"ours"}`))
 	sess.mu.Unlock()
 
 	// Somebody else advances the record with different content.
@@ -1338,7 +1367,7 @@ func TestUncertainRetrySkipsAnOpenRecordTransaction(t *testing.T) {
 	// the session uncertain — the exact mid-flight state.
 	tok := sess.beginRecordTx()
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"mid-flight"}`), 0)
+	testMarkUncertainLocked(sess, sess.seq, []byte(`{"attempted":"mid-flight"}`))
 	sess.mu.Unlock()
 
 	// The periodic pass must leave it alone.
@@ -1420,9 +1449,11 @@ func TestDrainRemovalIsGuardedBeforeTheSave(t *testing.T) {
 // transaction is open" and then resolving is a check-then-act, because an
 // off-read-loop finalizer takes the fence in between and its save publishes
 // seqUncertain before returning. Clearing the uncertainty and only then running the
-// undos lets another writer persist the still-unreverted attempted state. And a
+// continuations lets another writer interleave with the state they reconcile. And a
 // continuation that opens a transaction of its own would deadlock against the
 // resolver holding it — which is why continuations receive the resolver's token.
+// The at-base arm settles by RE-ATTEMPTING the attempt's bytes, which is itself a
+// write under that same fence.
 func TestResolutionIsOneRecordTransaction(t *testing.T) {
 	_, _, sess, _ := drainTestSession(t, "resolve-atomic")
 	if err := testSessSave(t, sess); err != nil {
@@ -1431,7 +1462,7 @@ func TestResolutionIsOneRecordTransaction(t *testing.T) {
 
 	sess.mu.Lock()
 	baseSeq := sess.seq
-	sess.markWriteUncertainLocked(baseSeq, []byte(`{"attempted":"never-landed"}`), 0)
+	testMarkUncertainLocked(sess, baseSeq, []byte(`{"attempted":"never-landed"}`))
 	sess.mu.Unlock()
 
 	var (
@@ -1439,10 +1470,11 @@ func TestResolutionIsOneRecordTransaction(t *testing.T) {
 		fenceHeld  atomicOnceBool
 		tokenWorks atomicOnceBool
 	)
-	sess.retainOnUncertain(func(tok recordTx) {
+	sess.retainOnLanded(func(tok recordTx) {
 		ran.set(true)
-		// The fence must be HELD while this runs: no other writer may open one, so a
-		// mutation being undone here cannot be observed or persisted by anyone else.
+		// The fence must be HELD while this runs: no other writer may open one, so the
+		// state this continuation reconciles cannot be observed or persisted by anyone
+		// else between the decision and the reconciliation.
 		if _, ok := sess.tryBeginRecordTx(); !ok {
 			fenceHeld.set(true)
 		} else {
@@ -1450,13 +1482,13 @@ func TestResolutionIsOneRecordTransaction(t *testing.T) {
 				"the reconciliation is not atomic with the decision that authorized it")
 		}
 		// And the token it was handed must actually authorize a write, which is what
-		// lets an undo re-persist without opening (and deadlocking on) its own fence.
+		// lets a continuation persist without opening (and deadlocking on) its own fence.
 		if err := sess.save(tok); err == nil {
 			tokenWorks.set(true)
 		} else {
 			t.Errorf("the continuation's token did not authorize a write: %v", err)
 		}
-	}, nil)
+	})
 
 	res, err := sess.resolveUncertainWrite()
 	if err != nil {
@@ -1466,7 +1498,7 @@ func TestResolutionIsOneRecordTransaction(t *testing.T) {
 		t.Fatalf("resolution = %v, want ours", res)
 	}
 	if !ran.get() {
-		t.Fatal("the no-land continuation never ran")
+		t.Fatal("the landed continuation never ran")
 	}
 	if !fenceHeld.get() {
 		t.Fatal("the fence was not held across the reconciliation")
@@ -1506,7 +1538,7 @@ func TestResolutionRefusesWhileAnotherTransactionIsOpen(t *testing.T) {
 		t.Fatalf("initial save: %v", err)
 	}
 	sess.mu.Lock()
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"busy"}`), 0)
+	testMarkUncertainLocked(sess, sess.seq, []byte(`{"attempted":"busy"}`))
 	sess.mu.Unlock()
 
 	held := sess.beginRecordTx()
@@ -1622,7 +1654,7 @@ func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
 
 	sess.mu.Lock()
 	sess.c = c
-	sess.markWriteUncertainLocked(sess.seq, []byte(`{"attempted":"ours"}`), 0)
+	testMarkUncertainLocked(sess, sess.seq, []byte(`{"attempted":"ours"}`))
 	sess.mu.Unlock()
 
 	// Another owner advances the record with different content.

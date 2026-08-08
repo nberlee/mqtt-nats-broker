@@ -1248,10 +1248,10 @@ type mqttSession struct {
 	// record. Every restore starts it false. See
 	// ensurePubRelConsumerSubscription.
 	pubRelVerified bool
-	// uncertainReverts undoes mutations retained because their record write MAY
-	// have landed. Run by the readback when it proves the write did not.
-	// See retainOnUncertain.
-	uncertainReverts []uncertainOutcomeActions
+	// uncertainLanded holds what callers deferred for want of proof that a record
+	// write landed, for mutations retained because it MAY have. Run by the resolver
+	// once it proves those exact bytes durable. See retainOnLanded.
+	uncertainLanded []func(recordTx)
 
 	pubRelSubscribed       bool
 	pubRelDeliverySubject  string
@@ -2735,8 +2735,9 @@ func (c *client) mqttParse(buf []byte) error {
 			if trace {
 				c.traceInOp("UNSUBSCRIBE", errOrTrace(err, mqttUnsubscribeTrace(pi, filters)))
 			}
+			var unsubAckRestore *mqttUnsubAckRestore
 			if err == nil {
-				err = c.mqttProcessUnsubs(filters)
+				unsubAckRestore, err = c.mqttProcessUnsubs(filters)
 				c.mqttResolveAfterPacket()
 				// Unconditional: an UNSUBSCRIBE that cancelled a register-pending
 				// delivery leaves the cleanup obligation with the delivery goroutine,
@@ -2745,9 +2746,12 @@ func (c *client) mqttParse(buf []byte) error {
 				c.mqttFlushVoidedRegs()
 			}
 			if err == nil {
-				// Trace only if the UNSUBACK was actually sent (a tiny client
-				// Maximum Packet Size can suppress it).
-				if c.mqttEnqueueUnsubAck(pi, filters) && trace {
+				// After the resolution above, because an ambiguous write proven
+				// durable by it turns this packet's 0x83 reasons back into the true
+				// ones. Trace only if the UNSUBACK was actually sent (a tiny client
+				// Maximum Packet Size can suppress it, and a displaced connection is
+				// not acknowledged at all).
+				if c.mqttAckUnsubscribe(pi, filters, unsubAckRestore) && trace {
 					c.traceOutOp("UNSUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
 				}
 			}
@@ -6481,16 +6485,16 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			wasUncertain := sess.isSeqUncertain()
 			if err := sess.update(tok, []*mqttFilter{f}, true); err != nil {
 				if sess.classifySave(wasUncertain, err) != saveDefinitelyFailed {
-					sess.retainOnUncertain(func(recordTx) {
-						sess.restoreSharedKeyInMemory(sid, priorExisted, priorQoS, priorRap, priorSubID)
-					}, nil)
 					// POSSIBLY LANDED. Continuing would be worse than failing: the final
 					// update() skips filters marked failed, so the client would get a
 					// failure code for a membership that is durably stored, and the rest
 					// of the packet would run on a session whose record state is unknown
 					// (every later save is refused while it is unresolved). Abandon the
-					// packet with the attempted state intact — that is what the readback
-					// must recognise — and let the connection close.
+					// packet with the attempted state intact — that is what the resolver
+					// re-attempts and proves durable — and let the connection close. The
+					// membership then simply stands, SUBACK or not, which is the outcome a
+					// landed original would have produced anyway; nothing was deferred for
+					// want of proof, so there is no landed continuation to register.
 					// Spec5 [4.8.2]. See sess_uncertain.go.
 					c.Errorf("MQTT: shared membership write for %q is unresolved; abandoning the SUBSCRIBE with its state intact: %v", sess.id, err)
 					return nil, err
@@ -6703,40 +6707,19 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// error so the connection closes. Spec5 [4.8.2].
 			//
 			// ONLY when the write definitely did not land. An ambiguous one may have
-			// stored exactly the state this packet built, and which way memory has to be
-			// reconciled is not knowable yet — so the packet's state is kept and the
-			// readback decides, undoing it only if it proves the write never landed.
-			// Nothing is torn down meanwhile either: the consumers and subscriptions this
-			// packet created may be precisely what the stored record references. The
-			// connection closes regardless, and the session stays unresolved until a
-			// readback classifies it. See sess_uncertain.go.
+			// stored exactly the state this packet built, so the packet's state is KEPT
+			// and the resolver settles it by re-attempting those very bytes — the
+			// subscriptions stand, with or without a SUBACK, exactly as they would have
+			// had the original landed with its response lost. Nothing is torn down
+			// meanwhile either: the consumers and subscriptions this packet created may
+			// be precisely what the stored record references. The connection closes
+			// regardless, and the session stays unresolved until the resolver classifies
+			// it. See sess_uncertain.go.
 			if sess.classifySave(wasUncertain, err) == saveMaybeLanded {
-				// Keep the packet's state — the record may hold it — but if the readback
-				// proves the write never landed, the whole packet must be undone: no
-				// SUBACK was sent, so the client believes none of it happened, and
-				// leaving the subscriptions in memory lets a later save persist filters
-				// that were never acknowledged.
-				// The undo runs under the RESOLVER'S transaction, never one of its own:
-				// rollbackSubscribePacket must re-persist the restored state before it may
-				// release anything, and opening a fence it already holds would deadlock
-				// (this packet's own transaction is still open on this goroutine when the
-				// resolution below runs). See resolveUncertainWrite.
-				sess.retainOnUncertain(func(rtok recordTx) {
-					// The downgraded subscriptions are the client's again, so their
-					// delivery barrier is lifted with the rest of the packet.
-					sess.reopenTeardownDelivery(closedDeliveries)
-					sess.unvoidRegNonces(voidedSent)
-					sess.rollbackSubscribePacket(c, rtok, subs, consSnap, snap, q2AffPrePacket)
-					// The withdrawn allocations stay withdrawn — a cancellation is never
-					// rolled back, the source is simply re-offered under a fresh one — so
-					// their registers are still owed. The rolled-back record carries the
-					// nonces; this just lets them go now.
-					sess.secureRegCancellations(c, rtok, stagedCancels)
-				}, nil)
 				// Not resolved here: the packet's transaction is still open and the
 				// resolver must hold the fence. The readLoop resolves after it closes.
 				// See mqttResolveAfterPacket.
-				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state for the readback: %v", sess.id, err)
+				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state: %v", sess.id, err)
 				return nil, err
 			}
 			sess.reopenTeardownDelivery(closedDeliveries)
@@ -6774,10 +6757,10 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					default:
 						// Ambiguous: the record may already omit the path. Keep the
 						// detached view (it matches what may have landed) but delete
-						// nothing, and let the readback restore the view if the write
-						// never landed — the resources are still live either way.
-						sess.retainOnUncertain(func(recordTx) { sess.restoreQ2AffineUnwind(u) },
-							func(recordTx) { sess.finishQ2AffineUnwind(c, u) })
+						// nothing — the resources stay live until the resolver proves the
+						// record no longer names them, which is what authorizes the
+						// delete.
+						sess.retainOnLanded(func(recordTx) { sess.finishQ2AffineUnwind(c, u) })
 						c.Errorf("MQTT: the removal of an unused affine QoS 2 path for %q is unresolved: %v", sess.id, serr)
 						sess.resolveUncertainNow(c)
 					}
@@ -6860,12 +6843,12 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 		case saveDefinitelyFailed:
 			restoreCur()
 		case saveMaybeLanded:
-			// If the compensating write LANDED, the record no longer names this filter
-			// but the caller has already returned without releasing its resources — so
-			// the release is owed here, from the readback. Nothing else would do it, and
-			// the durable plus its MaxAckPending charge would outlive the membership.
-			sess.retainOnUncertain(func(recordTx) { restoreCur() },
-				func(rtok recordTx) { sess.releaseFailedSharedFilter(c, rtok, f) })
+			// Once the compensating write is PROVEN durable the record no longer names
+			// this filter, but the caller has already returned without releasing its
+			// resources — so the release is owed here, from the resolver. Nothing else
+			// would do it, and the durable plus its MaxAckPending charge would outlive
+			// the membership.
+			sess.retainOnLanded(func(rtok recordTx) { sess.releaseFailedSharedFilter(c, rtok, f) })
 		}
 	}
 
@@ -6998,7 +6981,10 @@ func (sess *mqttSession) purgeReservedSubs(c *client, tok recordTx, denied []*mq
 	// readback that later proves an ambiguous write landed can run it too. Skipping it
 	// then would leave the record without the reserved memberships while their
 	// consumers and group durables stayed behind, referenced by nothing.
-	commitPurge := func() {
+	// The token is a PARAMETER, never the captured one: this closure also runs as a
+	// landed continuation, long after the accept transaction that created `tok` has
+	// closed, and a write under a dead token is refused at entry. See retainOnLanded.
+	commitPurge := func(tok recordTx) {
 		// Durable in this purge's own record already; the tombstone is cleanup.
 		sess.secureRegCancellations(c, tok, stagedCancels)
 		// Persist confirmed. The memberships are already out of the record, so one
@@ -7096,16 +7082,18 @@ func (sess *mqttSession) purgeReservedSubs(c *client, tok recordTx, denied []*mq
 		case saveMaybeLanded:
 			// The purge continues either way (the filters are denied regardless), but
 			// the session must not be left unresolved: it runs during CONNECT, with the
-			// client bound, and every later save on it would be refused. If the write
-			// landed, the release above is owed and nothing else would perform it.
-			sess.retainOnUncertain(func(recordTx) { undoPurge() }, func(recordTx) { commitPurge() })
+			// client bound, and every later save on it would be refused. Once the write
+			// is proven durable the release above is owed, and nothing else would
+			// perform it — under the RESOLVER'S token, since this packet's is gone by
+			// the time a deferred resolution runs it.
+			sess.retainOnLanded(func(rtok recordTx) { commitPurge(rtok) })
 			sess.resolveUncertainNow(c)
 		}
 		c.Errorf("MQTT: unable to purge %d legacy reserved-namespace subscription(s) from the session record: %v", len(denied), err)
 		return
 	}
 
-	commitPurge()
+	commitPurge(tok)
 }
 
 // mqttSubSnapshot captures the pre-SUBSCRIBE state of the session's subscription
@@ -7275,7 +7263,8 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 		// An AMBIGUOUS write is different: the rolled-back record may be exactly
 		// what is stored. Re-adding the packet's consumers would then diverge from what
 		// landed, so the rolled-back view stays and only the still-live resources are
-		// spared; the readback decides which way it reconciles.
+		// spared; the resolver settles it by re-attempting those bytes, and the release
+		// runs when it does.
 		readd := func() {
 			sess.mu.Lock()
 			if sess.cons == nil {
@@ -7299,13 +7288,13 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 		case saveDefinitelyFailed:
 			readd()
 		case saveMaybeLanded:
-			// If this rollback's own write landed, the record already describes the
-			// rolled-back session and the releases below are owed — nothing else resumes
-			// them, so the packet's consumers and their charges would be leaked.
-			sess.retainOnUncertain(func(recordTx) { readd() },
-				func(rtok recordTx) {
-					sess.finishSubscribeRollback(c, rtok, subs, added, rollbackCancels, snap, q2AffUnwind)
-				})
+			// Once this rollback's own write is proven durable the record already
+			// describes the rolled-back session and the releases below are owed —
+			// nothing else resumes them, so the packet's consumers and their charges
+			// would be leaked.
+			sess.retainOnLanded(func(rtok recordTx) {
+				sess.finishSubscribeRollback(c, rtok, subs, added, rollbackCancels, snap, q2AffUnwind)
+			})
 		}
 		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
 		return
@@ -8212,6 +8201,31 @@ type mqttSessSaveDetail struct {
 	voidedRegsRev uint64
 }
 
+// mqttFrameRecordWrite frames a record body for the store: the CAS header requiring
+// the subject's last sequence to be seq, followed by the body. It returns the framed
+// bytes and the header length — the two arguments storeSessionMsg takes, and the two
+// an ambiguous write keeps so it can be re-attempted verbatim.
+//
+// A first-ever write (seq 0) carries no header and is therefore UNCONDITIONAL: there
+// is no sequence to expect. That is what keeps such a write out of the resolver's
+// re-attempt arm — an unconditional create can never be classified at-base, since a
+// found record always has a sequence of at least 1. See sess_uncertain.go.
+func mqttFrameRecordWrite(seq uint64, body []byte) ([]byte, int) {
+	if seq == 0 {
+		return body, 0
+	}
+	bb := bytes.Buffer{}
+	bb.WriteString(hdrLine)
+	bb.WriteString(JSExpectedLastSubjSeq)
+	bb.WriteString(":")
+	bb.WriteString(strconv.FormatInt(int64(seq), 10))
+	bb.WriteString(CR_LF)
+	bb.WriteString(CR_LF)
+	hdr := bb.Len()
+	bb.Write(body)
+	return bb.Bytes(), hdr
+}
+
 // saveWithDetail is save()'s body; it additionally returns the attempted
 // write's raw identity so a caller can classify a definite CAS rejection by
 // kind and retry (or read back) the exact bytes it sent. The returned error is
@@ -8256,19 +8270,7 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	voidedRev := sess.voidedRegsRev
 	sess.mu.Unlock()
 
-	var hdr int
-	if seq != 0 {
-		bb := bytes.Buffer{}
-		bb.WriteString(hdrLine)
-		bb.WriteString(JSExpectedLastSubjSeq)
-		bb.WriteString(":")
-		bb.WriteString(strconv.FormatInt(int64(seq), 10))
-		bb.WriteString(CR_LF)
-		bb.WriteString(CR_LF)
-		hdr = bb.Len()
-		bb.Write(b)
-		b = bb.Bytes()
-	}
+	b, hdr := mqttFrameRecordWrite(seq, b)
 	detail = mqttSessSaveDetail{
 		baseSeq: seq, body: body, framed: b, hdr: hdr,
 		domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
@@ -8294,7 +8296,11 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 			// twice over. See sess_rejected_write.go.
 			sess.markWriteRejectedLocked(seq)
 		} else {
-			sess.markWriteUncertainLocked(seq, body, voidedRev)
+			// The framed bytes travel with the identity, because settling this
+			// ambiguity means RE-SENDING them: a re-marshal of whatever memory holds
+			// later could not carry the digest a readback compares against. See
+			// mqttPendingWrite.
+			sess.markWriteUncertainLocked(seq, body, b, hdr, voidedRev)
 		}
 		sess.mu.Unlock()
 		return detail, fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
@@ -10149,8 +10155,8 @@ CHECK:
 					// discard waited for the fence — deleted nothing, so this case gets
 					// the SAME answer as the early one above: reject without evicting,
 					// and let the client retry. Evicting here would drop the retained
-					// continuations, so a mutation the ambiguous write persisted would
-					// never be committed and one that did not land never undone, and the
+					// continuations, so what the resolution of that ambiguous write
+					// authorizes would never be committed at all, and the
 					// gate release reads asm.sessions to decide the void-verdict handoff,
 					// which an evicted object never gets. Nothing is parked: this path has
 					// a client waiting for a CONNACK, not an obligation, and the retry's
@@ -10480,12 +10486,16 @@ CHECK:
 		}
 		es.mu.Unlock()
 		// Everything the forced leave does once its record write is CONFIRMED. A
-		// closure, because that confirmation can also arrive later from a readback:
+		// closure, because that confirmation can also arrive later from the resolver:
 		// skipping it then would leave the record without the shared memberships while
 		// the runtime kept their cons entries, their MaxAckPending charge and their
 		// group durables — stale state a v5 re-subscribe would trip over, and leaked
 		// consumers nothing releases.
-		commitLeave := func() {
+		//
+		// The record token is a PARAMETER, never the captured acceptTok: as a landed
+		// continuation this runs under the RESOLVER'S transaction, and the CONNECT's
+		// own is long closed by then — every write under it would be refused at entry.
+		commitLeave := func(tok recordTx) {
 			// Also drop the resident session's in-memory shared consumer state
 			// (cons entries, tmaxack charge, pending deliveries): a later v5
 			// resubscribe of the same filter must not find a stale cons entry and
@@ -10510,14 +10520,14 @@ CHECK:
 				}
 			}
 			es.mu.Unlock()
-			es.deleteInflightRegisters(c, acceptTok, regs)
+			es.deleteInflightRegisters(c, tok, regs)
 			// The staged cancellations are already in this CONNECT's record; anything the
 			// purge just found arrived after that write, and the group durables below stay
 			// while such a cancellation is unaccounted for — an unexplained register costs
 			// an identifier for the life of the session, a surviving durable only costs
 			// resources.
-			es.secureRegCancellations(c, acceptTok, leaveCancels)
-			if !es.secureRegCancellations(c, acceptTok, cancels) {
+			es.secureRegCancellations(c, tok, leaveCancels)
+			if !es.secureRegCancellations(c, tok, cancels) {
 				c.Errorf("MQTT: the cancelled in-flight registration(s) of client %q are not "+
 					"durably recorded yet on a 3.1.1 forced leave", es.id)
 			}
@@ -10539,10 +10549,11 @@ CHECK:
 		outcome, err := es.saveClassified(acceptTok)
 		if err != nil {
 			// Put the memberships back only if the removal DEFINITELY did not land.
-			// An ambiguous write may already have stored the record without them; the
-			// readback then adopts that record while memory still holds the removed
-			// entries, and the next save resurrects a shared membership the client
-			// cannot see, observe or UNSUBSCRIBE. See sess_uncertain.go.
+			// An ambiguous write may already have stored the record without them, and
+			// the resolver settles it forward by re-attempting exactly those bytes;
+			// restoring here would leave memory holding entries the record has dropped,
+			// and the next save would resurrect a shared membership the client cannot
+			// see, observe or UNSUBSCRIBE. See sess_uncertain.go.
 			undoLeave := func() {
 				es.mu.Lock()
 				es.sharedSubs = prior
@@ -10557,12 +10568,12 @@ CHECK:
 				// finish the leave — which is exactly why the LANDED continuation matters:
 				// nothing else would ever run it. Resolve now so the resident session is
 				// usable again rather than permanently unable to persist.
-				es.retainOnUncertain(func(recordTx) { undoLeave() }, func(recordTx) { commitLeave() })
+				es.retainOnLanded(func(rtok recordTx) { commitLeave(rtok) })
 				es.resolveUncertainNow(c)
 			}
 			return formatError(err)
 		}
-		commitLeave()
+		commitLeave(acceptTok)
 	}
 
 	// Process possible saved subscriptions.
@@ -10866,9 +10877,38 @@ func (c *client) mqttEnqueueFittingProto(buf []byte) bool {
 		c.Debugf("Suppressing MQTT packet of %d bytes exceeding client Maximum Packet Size %d", len(buf), c.mqtt.maxPacketSize)
 		return false
 	}
+	return c.mqttEnqueueProtoLocked(buf, false)
+}
+
+// mqttEnqueueFittingProtoUnlessDisconnected is mqttEnqueueFittingProto for a packet
+// that must not follow a server-initiated DISCONNECT on this connection.
+func (c *client) mqttEnqueueFittingProtoUnlessDisconnected(buf []byte) bool {
+	if !c.mqttFitsClientMax(len(buf)) {
+		c.Debugf("Suppressing MQTT packet of %d bytes exceeding client Maximum Packet Size %d", len(buf), c.mqtt.maxPacketSize)
+		return false
+	}
+	return c.mqttEnqueueProtoLocked(buf, true)
+}
+
+// mqttEnqueueProtoLocked enqueues buf under c.mu, optionally refusing when this
+// connection's one server-initiated DISCONNECT has already been ATTEMPTED.
+//
+// The refusal has to happen in the SAME critical section as the write, for the same
+// reason every enqueue-path DISCONNECT writer claims in its own: a check made and
+// released first is a check-then-act, and the interval between them is exactly when a
+// displacement — `processSessionPersist` needs no lock of ours — notifies and detaches.
+// A packet appended after that notification violates [MQTT-3.14.4-1].
+//
+// It gates only the packets whose callers ask for it. Nothing else about the
+// connection's outbound traffic changes: an in-flight PUBLISH or a PINGRESP can still
+// trail a DISCONNECT, which is the stated residual of the claim mechanism.
+func (c *client) mqttEnqueueProtoLocked(buf []byte, unlessDisconnected bool) bool {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if unlessDisconnected && (c.mqtt == nil || c.mqtt.disconnectSent) {
+		return false
+	}
 	c.enqueueProto(buf)
-	c.mu.Unlock()
 	return true
 }
 
@@ -13566,8 +13606,9 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			//
 			// The same applies to a sequence whose removal is UNCONFIRMED: its record
 			// state is unknown, so acking would destroy a message the stored record
-			// may still claim (I1). Leave it pending; the readback either restores the
-			// claim or discharges the ack. See unsub_drain.go.
+			// may still claim (I1). Leave it pending; the resolution discharges the
+			// ack once it proves the removal durable, and a foreign verdict makes it
+			// somebody else's message entirely. See unsub_drain.go.
 			unconfirmed := st != nil && st.unclaimUnconfirmed
 			staged := d.staged || unconfirmed
 			sess.mu.Unlock()
@@ -15183,9 +15224,13 @@ func (c *client) mqttParseUnsubs(r *mqttReader, b byte, pl int) (uint16, []*mqtt
 // Given the list of topics, this is going to unsubscribe the low level NATS subscriptions
 // and delete the JS durable consumers when applicable.
 //
+// It returns the truthful-UNSUBACK restore for an AMBIGUOUS record write (nil
+// otherwise), which the packet tail applies if that write is proven durable before
+// it acknowledges. See mqttUnsubAckRestore.
+//
 // Runs from the client's readLoop.
 // No lock held on entry.
-func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
+func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore, error) {
 	// Those things are immutable, but since processing unsubs is not
 	// really in the fast path, let's get them under the client lock.
 	c.mu.Lock()
@@ -15194,16 +15239,16 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 	c.mu.Unlock()
 
 	if err := asm.lockSession(sess, c); err != nil {
-		return err
+		return nil, err
 	}
 	defer asm.unlockSession(sess)
 
 	// The whole UNSUBSCRIBE is one record transaction, opened before the first
 	// membership mutation so no other writer can persist a half-applied packet.
 	// Outermost readLoop entry point, so it takes the blocking form.
-	tok := sess.beginRecordTx()
+	packetTok := sess.beginRecordTx()
 	defer func() {
-		if err := sess.endRecordTx(tok); err != nil {
+		if err := sess.endRecordTx(packetTok); err != nil {
 			c.Errorf("MQTT: %v", err)
 		}
 	}()
@@ -15211,64 +15256,12 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 	// One record scan (heldShared, computed after the record save below) decides
 	// every shared durable this packet may release.
 	var heldShared map[string]bool
-	removeJSCons := func(sid string) {
-		cc, ok := sess.cons[sid]
-		if !ok {
-			// A shared filter's group durable must be released even without a
-			// local consumer entry (e.g. a per-filter restore failure left the
-			// membership persisted with no live join): derive the durable(s) from
-			// the session key — the persisted authority — like clear() does, and
-			// delete each that has no remaining holder. The membership was already
-			// removed and persisted above, so the scan is correct. Spec5 [4.8.2].
-			if strings.HasPrefix(sid, string(mqttSharedSubPrefix)) && !strings.HasSuffix(sid, mqttMultiLevelSidSuffix) {
-				for _, dur := range mqttSharedDurablesForKey(sid) {
-					if heldShared[dur] {
-						continue
-					}
-					if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-						c.Errorf("Unable to delete shared consumer %q: %v", dur, err)
-					}
-				}
-			}
-			return
-		}
-		delete(sess.cons, sid)
-		// A shared group consumer is released (deleted only if no other member
-		// remains); the leaving filter has already been removed from sharedSubs
-		// and persisted below, so the last-holder scan is correct. Spec5 [4.8.2].
-		if cc.DeliverGroup != _EMPTY_ {
-			sess.releaseSharedConsumer(c, tok, cc, heldShared)
-			return
-		}
-
-		c.mu.Lock()
-		sub := c.subs[cc.DeliverSubject]
-		c.mu.Unlock()
-
-		// Need lock here since these are accessed by callbacks
-		sess.mu.Lock()
-		// Mark the delivery sub closed so an in-flight QoS 1/2 callback stops
-		// tracking new messages after the purge (deleteConsumer is async);
-		// same barrier as the QoS 0 downgrade path in processJSConsumer.
-		if sub != nil && sub.mqtt != nil {
-			sess.subsMu.Lock()
-			sub.mqtt.closed = true
-			sess.subsMu.Unlock()
-		}
-		regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
-		sess.mu.Unlock()
-		// The consumer delete moved BELOW the purge, which is also what the barrier
-		// above always wanted: the closed flag is now set before the durable goes, and
-		// a cancelled registration is durably named before the consumer that would
-		// classify its source disappears.
-		if !sess.secureRegCancellations(c, tok, cancels) {
-			c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for client %q "+
-				"are not durably recorded yet", cc.Durable, sess.id)
-		}
-		// Before the consumer, for the reason given in deleteInflightRegisters.
-		sess.deleteInflightRegisters(c, tok, regs)
-		sess.deleteConsumer(cc)
-	}
+	// The record token is a PARAMETER, never the packet's: this closure is reached from
+	// commitUnsub, which also runs as a LANDED CONTINUATION under the resolver's
+	// transaction — and every write below (the shared release, the cancellation
+	// tombstones, the register deletes) is refused at entry under a closed one. A
+	// nested closure capturing the enclosing `tok` is exactly how that leak survives a
+	// signature change on its caller.
 	// v5 UNSUBACK reports whether each subscription existed; the session maps are
 	// guarded by the session-manager lock held here. Spec5 [3.11.3].
 	for _, f := range filters {
@@ -15327,11 +15320,15 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 
 	// Everything the UNSUBSCRIBE does AFTER its record write is confirmed. It is a
 	// closure because the confirmation can arrive in two ways: inline, or later from
-	// a readback that proves an ambiguous write landed. Skipping it in the second
+	// the resolver proving an ambiguous write durable. Skipping it in the second
 	// case would leave the record saying "unsubscribed" while the runtime kept the
 	// subscriptions, the consumers and the staged (uncommitted) drains — a
 	// half-applied packet with nothing left to finish it.
-	commitUnsub := func() {
+	//
+	// The record token is a PARAMETER, never the captured one: as a landed
+	// continuation this runs under the RESOLVER'S transaction, and the packet's own
+	// is closed by then — every write under it would be refused at entry.
+	commitUnsub := func(tok recordTx) {
 		// The staged cancellations are durable in the packet's own record now, so this
 		// is cleanup: a tombstone lets the register go without waiting for a resume.
 		sess.secureRegCancellations(c, tok, stagedCancels)
@@ -15365,7 +15362,7 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 				// Only the client-facing subscription goes, because the client really did
 				// unsubscribe.
 				if !drainedSids[s] {
-					removeJSCons(s)
+					sess.removeUnsubConsumer(c, tok, s, heldShared)
 				}
 				if err := c.processUnsub([]byte(s)); err != nil {
 					c.Errorf("error unsubscribing from %q: %v", s, err)
@@ -15375,13 +15372,13 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 	}
 
 	wasUncertain := sess.isSeqUncertain()
-	if err := sess.update(tok, filters, false); err != nil {
+	if err := sess.update(packetTok, filters, false); err != nil {
 		// Roll back the in-memory removals ONLY if nothing was stored. An ambiguous
-		// write may already carry them, and only the readback can decide how memory
-		// reconciles — restoring here would make the next save overwrite a landed
-		// unsubscribe. The packet still reports failure; the
-		// session is unresolved until the readback settles it, so nothing else can
-		// be persisted meanwhile. See sess_uncertain.go.
+		// write may already carry them, and the resolver settles it forward by
+		// re-attempting exactly those bytes — restoring here would make the next save
+		// overwrite an unsubscribe that is, or is about to be, durable. The packet
+		// still reports failure; the session is unresolved until the resolver settles
+		// it, so nothing else can be persisted meanwhile. See sess_uncertain.go.
 		undoUnsub := func() {
 			// The delivery barrier goes back too: nothing was persisted, so these
 			// subscriptions are still the client's and must keep delivering, and their
@@ -15397,17 +15394,31 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 			sess.rollbackStagedDrains()
 			sess.mu.Unlock()
 		}
+		var restore *mqttUnsubAckRestore
 		switch sess.classifySave(wasUncertain, err) {
 		case saveDefinitelyFailed:
 			undoUnsub()
 		case saveMaybeLanded:
-			// Kept, because the record may hold the removal and the staged drains —
-			// but if the readback proves the write never landed, the session must go
-			// back to describing what the record actually has, or a later save
-			// persists an unsubscribe that never happened (and drops the drains that
-			// were meant to replace it). If it DID land, the confirmed-path work above
-			// is owed and runs then instead.
-			sess.retainOnUncertain(func(recordTx) { undoUnsub() }, func(recordTx) { commitUnsub() })
+			// Kept, because the record may hold the removal and the staged drains, and
+			// the resolver makes exactly those bytes durable. The confirmed-path work
+			// above is then owed and runs from the resolution instead — under ITS
+			// token, since this packet's is closed by then.
+			//
+			// The restore flag is this ATTEMPT's own: the continuation that sets it is
+			// the one registered here, so it can fire for nothing else — not for a
+			// foreign verdict, and not for some later ambiguity B armed by another
+			// writer. Set LAST, so a reader that observes it observes a durable and
+			// fully applied unsubscribe. See mqttUnsubAckRestore.
+			landed := &atomic.Bool{}
+			sess.retainOnLanded(func(rtok recordTx) {
+				commitUnsub(rtok)
+				landed.Store(true)
+			})
+			// Snapshotted BEFORE the 0x83 overwrite below, reason strings included: the
+			// encoder carries the first failed filter's string as the packet-level
+			// Reason String, so restoring the byte alone would tell a client "unable to
+			// persist unsubscribe" for a filter that in fact had no subscription.
+			restore = newMQTTUnsubAckRestore(landed, filters)
 			// Deliberately NOT resolved here: this packet's own record transaction is
 			// still open, and the resolver must hold the fence — so an attempt from
 			// inside would simply be refused. The readLoop resolves once the
@@ -15420,12 +15431,207 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 				f.reason = mqttReasonImplementationSpecificError
 				f.reasonStr = "unable to persist unsubscribe"
 			}
-			return nil
+			return restore, nil
 		}
-		return err
+		return nil, err
 	}
-	commitUnsub()
-	return nil
+	commitUnsub(packetTok)
+	return nil, nil
+}
+
+// mqttUnsubAckRestore is the truthful UNSUBACK a v5 UNSUBSCRIBE owes its client when
+// the record write it reported as failed turns out to be DURABLE.
+//
+// The v5 UNSUBSCRIBE is the one operation this broker ACKNOWLEDGES over an ambiguous
+// write: it overwrites every per-filter reason with 0x83 and still sends the
+// UNSUBACK, so a write that landed leaves the client told the unsubscribe failed
+// while the record says it happened. The resolver now settles such a write forward,
+// which would make that contradiction deterministic — so the acknowledgment waits for
+// the resolution the readLoop performs anyway (mqttResolveAfterPacket) and tells the
+// truth whenever proof has arrived by then.
+//
+// The signal is the attempt's OWN landed continuation, never a session-state
+// predicate: seqUncertain is cleared by a foreign disposition as well as by a
+// resolution, and it can be re-armed by a different attempt entirely, so a coarse
+// check would restore this packet's reasons on somebody else's outcome. A flag set
+// by the continuation registered for THIS write cannot be either.
+//
+// reasons/strs are positional over the packet's filters, captured before the 0x83
+// overwrite.
+type mqttUnsubAckRestore struct {
+	landed  *atomic.Bool
+	reasons []byte
+	strs    []string
+}
+
+// newMQTTUnsubAckRestore snapshots the per-filter reasons as they stood before the
+// failure overwrite. landed is the flag the attempt's landed continuation sets — the
+// SAME pointer, never a copy, since that is the whole handoff.
+func newMQTTUnsubAckRestore(landed *atomic.Bool, filters []*mqttFilter) *mqttUnsubAckRestore {
+	r := &mqttUnsubAckRestore{
+		landed:  landed,
+		reasons: make([]byte, len(filters)),
+		strs:    make([]string, len(filters)),
+	}
+	for i, f := range filters {
+		r.reasons[i], r.strs[i] = f.reason, f.reasonStr
+	}
+	return r
+}
+
+// applyIfLanded puts the true reasons back if this attempt has been proven durable.
+//
+// The flag LOAD is the linearization point of the guarantee: a verdict that arrives
+// after it — including between here and the enqueue — leaves the honest 0x83 standing,
+// which is the residual docs/CONFORMANCE.md states.
+func (r *mqttUnsubAckRestore) applyIfLanded(filters []*mqttFilter) {
+	if r == nil || !r.landed.Load() {
+		return
+	}
+	for i, f := range filters {
+		if i >= len(r.reasons) {
+			break
+		}
+		f.reason, f.reasonStr = r.reasons[i], r.strs[i]
+	}
+}
+
+// mqttAckUnsubscribe is the UNSUBSCRIBE packet's tail: make the UNSUBACK truthful if
+// the packet's ambiguous write has since been proven durable, then acknowledge —
+// unless this connection has been DISPLACED meanwhile, which is what a foreign
+// verdict does. Reports whether the UNSUBACK was sent, so the caller traces exactly
+// what went out.
+//
+// What ACTUALLY makes the guarantee hold is the DISCONNECT claim, read inside the
+// enqueue's own c.mu critical section (mqttEnqueueProtoLocked). A displacement notifies
+// through that claim, and `processSessionPersist` holds no lock of ours — so any check
+// made and released BEFORE the enqueue is a check-then-act, and an acknowledgment
+// appended after the 0x8E would violate [MQTT-3.14.4-1]. Only a check made WITH the
+// write closes that window.
+//
+// The ownership sample below (`sess.c == c` under sess.mu, read that way rather than as
+// c.isClosed(): a foreign disposition detaches synchronously and closes asynchronously,
+// so the close flag lags the fact) is DEFENSIVE, deliberately. Every displacement that
+// can reach this tail has a written CONNACK, so it consumes the claim, and the gate
+// above refuses on its own; a mutation of the sample therefore SURVIVES, which is the
+// honest signal that it guards nothing reachable today rather than something untested.
+// It is kept because the cost is one comparison and it states a different fact — "this
+// session is no longer mine" — that a future detach-without-notifying path would need,
+// where the alternative is failing open.
+//
+// Runs from the client's readLoop. No lock held on entry.
+func (c *client) mqttAckUnsubscribe(pi uint16, filters []*mqttFilter, restore *mqttUnsubAckRestore) bool {
+	restore.applyIfLanded(filters)
+	c.mu.Lock()
+	sess := c.mqtt.sess
+	c.mu.Unlock()
+	if sess != nil {
+		sess.mu.Lock()
+		bound := sess.c == c
+		sess.mu.Unlock()
+		if !bound {
+			return false
+		}
+	}
+	// Test seam, fired in exactly the window the second gate exists for: after the
+	// ownership sample, before the enqueue's critical section.
+	if h := mqttTestUnsubAckWindowHookV.Load(); h != nil {
+		(*h)(c)
+	}
+	return c.mqttEnqueueUnsubAck(pi, filters)
+}
+
+// mqttTestUnsubAckWindowHookV fires between the acknowledgment's ownership sample and
+// its enqueue. See mqttAckUnsubscribe.
+var mqttTestUnsubAckWindowHookV atomic.Pointer[func(c *client)]
+
+func setMQTTTestUnsubAckWindowHook(h func(c *client)) func() {
+	prev := mqttTestUnsubAckWindowHookV.Load()
+	if h == nil {
+		mqttTestUnsubAckWindowHookV.Store(nil)
+	} else {
+		mqttTestUnsubAckWindowHookV.Store(&h)
+	}
+	return func() { mqttTestUnsubAckWindowHookV.Store(prev) }
+}
+
+// removeUnsubConsumer releases one sid's consumer state for an UNSUBSCRIBE that is
+// known durable: the shared group release, the cancellation tombstones, the register
+// deletes and the consumer delete.
+//
+// A METHOD rather than a closure inside mqttProcessUnsubs, deliberately. It is reached
+// from commitUnsub, which also runs as a LANDED CONTINUATION under the resolver's
+// transaction long after the packet's has closed — and every write here is refused at
+// entry under a closed token, silently, since none of these calls is checked for an
+// outcome. As a closure it captured the packet's transaction and kept using it after
+// its caller's signature changed to take one; with no enclosing scope there is nothing
+// to capture, so the token can only arrive as an argument. Passing the WRONG one
+// explicitly is still possible and is NOT covered by any test: the end-to-end
+// unsubscribe test releases a consumer with no pending registers, so the token-gated
+// record fallback below is never reached and the mutation survives. Stated as a known
+// gap in docs/ROADMAP.md rather than implied to be guarded.
+//
+// The caller holds the session-manager lock AND an open record transaction — the
+// packet's on the confirmed path, the resolver's on the landed continuation — and tok
+// is that transaction's token, which the cancellation fallback writes under. sess.mu
+// must NOT be held: this takes it.
+func (sess *mqttSession) removeUnsubConsumer(c *client, tok recordTx, sid string, heldShared map[string]bool) {
+	cc, ok := sess.cons[sid]
+	if !ok {
+		// A shared filter's group durable must be released even without a
+		// local consumer entry (e.g. a per-filter restore failure left the
+		// membership persisted with no live join): derive the durable(s) from
+		// the session key — the persisted authority — like clear() does, and
+		// delete each that has no remaining holder. The membership was already
+		// removed and persisted above, so the scan is correct. Spec5 [4.8.2].
+		if strings.HasPrefix(sid, string(mqttSharedSubPrefix)) && !strings.HasSuffix(sid, mqttMultiLevelSidSuffix) {
+			for _, dur := range mqttSharedDurablesForKey(sid) {
+				if heldShared[dur] {
+					continue
+				}
+				if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+					c.Errorf("Unable to delete shared consumer %q: %v", dur, err)
+				}
+			}
+		}
+		return
+	}
+	delete(sess.cons, sid)
+	// A shared group consumer is released (deleted only if no other member
+	// remains); the leaving filter has already been removed from sharedSubs
+	// and persisted below, so the last-holder scan is correct. Spec5 [4.8.2].
+	if cc.DeliverGroup != _EMPTY_ {
+		sess.releaseSharedConsumer(c, tok, cc, heldShared)
+		return
+	}
+
+	c.mu.Lock()
+	sub := c.subs[cc.DeliverSubject]
+	c.mu.Unlock()
+
+	// Need lock here since these are accessed by callbacks
+	sess.mu.Lock()
+	// Mark the delivery sub closed so an in-flight QoS 1/2 callback stops
+	// tracking new messages after the purge (deleteConsumer is async);
+	// same barrier as the QoS 0 downgrade path in processJSConsumer.
+	if sub != nil && sub.mqtt != nil {
+		sess.subsMu.Lock()
+		sub.mqtt.closed = true
+		sess.subsMu.Unlock()
+	}
+	regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
+	sess.mu.Unlock()
+	// The consumer delete moved BELOW the purge, which is also what the barrier
+	// above always wanted: the closed flag is now set before the durable goes, and
+	// a cancelled registration is durably named before the consumer that would
+	// classify its source disappears.
+	if !sess.secureRegCancellations(c, tok, cancels) {
+		c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for client %q "+
+			"are not durably recorded yet", cc.Durable, sess.id)
+	}
+	// Before the consumer, for the reason given in deleteInflightRegisters.
+	sess.deleteInflightRegisters(c, tok, regs)
+	sess.deleteConsumer(cc)
 }
 
 // mqttUnsubSids returns the sid(s) one UNSUBSCRIBE filter covers: its own, plus
@@ -15440,7 +15646,9 @@ func mqttUnsubSids(sid string) []string {
 
 // mqttEnqueueUnsubAck enqueues an UNSUBACK and reports whether it was sent. A v5
 // UNSUBACK whose reason-code payload alone exceeds the client's Maximum Packet
-// Size is suppressed (returns false); the 3.1.1 path always sends.
+// Size is suppressed (returns false), and BOTH protocol paths refuse to append the
+// packet behind a server-initiated DISCONNECT — checked in the same c.mu critical
+// section as the write. See mqttEnqueueProtoLocked and mqttAckUnsubscribe.
 func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) bool {
 	if c.mqtt.proto == mqttProtoLevel5 {
 		// v5 UNSUBACK adds a properties block and one reason code per filter.
@@ -15477,16 +15685,13 @@ func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) bool {
 		}
 		// If the reason-code payload alone still overflows, the UNSUBACK cannot be
 		// sent [MQTT-3.1.2-24]; the unsubscribe side effects stand.
-		return c.mqttEnqueueFittingProto(buf)
+		return c.mqttEnqueueFittingProtoUnlessDisconnected(buf)
 	}
 	w := newMQTTWriter(4)
 	w.WriteByte(mqttPacketUnsubAck)
 	w.WriteVarInt(2)
 	w.WriteUint16(pi)
-	c.mu.Lock()
-	c.enqueueProto(w.Bytes())
-	c.mu.Unlock()
-	return true
+	return c.mqttEnqueueProtoLocked(w.Bytes(), true)
 }
 
 func mqttUnsubscribeTrace(pi uint16, filters []*mqttFilter) string {
