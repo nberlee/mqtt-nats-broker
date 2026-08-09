@@ -1160,17 +1160,25 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 			case saveMaybeLanded:
 				// The record may name the consumer, so keep the view: the resolver
 				// settles the write forward by re-attempting exactly these bytes, and the
-				// record then names what the session knows about. Nothing was withheld
-				// for want of proof — the gate below is opened by this call's own return
-				// path — so there is no landed continuation to register.
+				// record then names what the session knows about.
 				//
 				// The SUBSCRIBE caller marks this filter failed and carries on, which is
 				// truthful: its shared membership is persisted in a LATER loop, and that
 				// save is refused while the session is unresolved — so the client is told
 				// the filter failed and no membership for it becomes durable. What the
-				// settlement does make durable is the affine path itself, which the
-				// packet's own unused-path unwind and rollback then reconcile. See
-				// mqttProcessSubs.
+				// settlement DOES make durable is the affine path itself, and the packet's
+				// own unused-path unwind and rollback cannot reconcile that: their
+				// confirming saves are refused for the same reason. So the reclaim is owed
+				// to the settlement, and registered here.
+				//
+				// ONLY when this call MINTED the generation. A resume that re-establishes
+				// a path the record already named reaches this same save with
+				// existing == nil but minted == false — the record can carry a generation
+				// without a consumer config — and that generation may owe assignments to a
+				// delivery already started to it, which an unwind would discard.
+				if minted {
+					sess.retainOnLanded(func(rtok recordTx) { sess.unwindProvisionedQ2AffineOnLanded(c, rtok) })
+				}
 			}
 			return err
 		}
@@ -2107,18 +2115,36 @@ type mqttQ2AffUnwind struct {
 	prepared bool
 }
 
-// prepareQ2AffineUnwind fences the affine path, terminates the assignments it
-// owns, and clears it from the session — but deletes nothing yet.
+// prepareQ2AffineUnwind fences the affine path and clears it from the session —
+// but deletes nothing yet.
 //
-// Claim cleanup comes FIRST, and a failure aborts the whole unwind with the path
-// left intact and usable. Clearing the session's view of a consumer that is still
-// alive would orphan it: the record would stop naming it, nothing would delete
-// it, and the assignments still pointing at it would have no owner able to act.
-// Leaving a working path provisioned after a failed packet is the strictly better
-// outcome — it is session-level, idempotent, and the next SUBSCRIBE reuses it.
+// disposeNow selects WHEN this generation's assignments are terminated, and the
+// two answers are not interchangeable:
 //
-// Runs from the client's readLoop. sess.mu not held on entry.
-func (sess *mqttSession) prepareQ2AffineUnwind(c *client) mqttQ2AffUnwind {
+//   - true: terminate them here, before the caller's confirming save. A failure
+//     aborts the whole unwind with the path left intact and usable, because
+//     clearing the session's view of a consumer that is still alive would orphan
+//     it — the record would stop naming it, nothing would delete it, and the
+//     assignments still pointing at it would have no owner able to act. Leaving a
+//     working path provisioned after a failed packet is the strictly better
+//     outcome: it is session-level, idempotent, and the next SUBSCRIBE reuses it.
+//   - false: terminate nothing, and leave the disposal to the caller once its
+//     record write is CONFIRMED (see discardQ2AffineUnwindClaims). The discard is
+//     MONOTONIC, so a caller whose save is then rejected by a remote winner that
+//     PRESERVED this generation would have terminated that winner's started
+//     delivery with nothing able to put it back. Session teardown already makes
+//     this choice — claimTeardown wins a durable ownership marker before
+//     deleteTeardownTargets disposes of anything — and disposing LATE is
+//     recoverable rather than stalling: materializeQ2AffOnBehalf discards, acks
+//     and reaps a claim whose record no longer names its generation.
+//
+// Either way the assignments are marked DISCARDED, never released: a delivery
+// already started to this session dies with the subscription that was never
+// established, which [MQTT-4.8.2-6] permits, rather than being handed to another
+// member.
+//
+// Runs from the client's readLoop, or from the resolver. sess.mu not held on entry.
+func (sess *mqttSession) prepareQ2AffineUnwind(c *client, disposeNow bool) mqttQ2AffUnwind {
 	gen, durable := sess.closeQ2AffAndDrain()
 	if gen == _EMPTY_ {
 		sess.mu.Lock()
@@ -2127,11 +2153,7 @@ func (sess *mqttSession) prepareQ2AffineUnwind(c *client) mqttQ2AffUnwind {
 		return mqttQ2AffUnwind{}
 	}
 
-	// Terminate this generation's assignments before anything is torn down. They
-	// are marked DISCARDED, never released: a delivery already started to this
-	// session dies with the subscription that was never established, which
-	// [MQTT-4.8.2-6] permits, rather than being handed to another member.
-	if sess.asm != nil {
+	if disposeNow && sess.asm != nil {
 		if err := sess.asm.discardQ2AffClaimsFor(sess.idHash, gen); err != nil {
 			c.Errorf("MQTT: unable to terminate the shared QoS 2 assignments of a rolled-back SUBSCRIBE for %q, leaving its affine delivery path in place: %v", sess.id, err)
 			sess.mu.Lock()
@@ -2165,9 +2187,70 @@ func (sess *mqttSession) prepareQ2AffineUnwind(c *client) mqttQ2AffUnwind {
 	return u
 }
 
-// finishQ2AffineUnwind deletes what prepareQ2AffineUnwind detached, once the
-// record that no longer names it is confirmed.
-func (sess *mqttSession) finishQ2AffineUnwind(c *client, u mqttQ2AffUnwind) {
+// q2AffineGenerationOwnsClaims reports whether this (client, generation) still
+// owes a delivery — an assignment that is NOT terminal.
+//
+// The predicate is `terminal()`, not "not discarded". All three terminal states
+// mean no further MQTT delivery can come of the claim, and two of them PERSIST:
+// an `AffineDone` claim outlives a failed ack or reap, and a `Lost` claim is
+// deliberately never reaped, because it is the only durable evidence that a
+// message the broker accepted was never delivered. Treating either as an
+// outstanding obligation would retain this path forever — for a never-expiring
+// session, the broker's lifetime — which is the exact leak the reclaim exists to
+// close.
+//
+// FAILS CLOSED: the scan is account-wide and aborts on a claim it cannot read or
+// attribute, and an aborted scan is reported as "yes, it owes something" — the
+// only safe answer for a caller about to remove the path a delivery would use.
+//
+// sess.mu not held on entry.
+func (sess *mqttSession) q2AffineGenerationOwnsClaims(gen string) (bool, error) {
+	if sess.asm == nil || gen == _EMPTY_ {
+		return false, nil
+	}
+	var owes bool
+	if err := sess.asm.scanQ2AffClaims(func(_ string, claim *mqttQ2AffClaim, _ uint64) error {
+		if claim.ownedBy(sess.idHash, gen) && !claim.terminal() {
+			owes = true
+		}
+		return nil
+	}); err != nil {
+		return true, err
+	}
+	return owes, nil
+}
+
+// discardQ2AffineUnwindClaims terminates the assignments of a generation the
+// record has been CONFIRMED to no longer authorize, for an unwind prepared with
+// disposeNow false.
+//
+// Safe to run late, and safe to fail: a claim whose winning record no longer
+// names its generation is discarded, source-acked and reaped by
+// materializeQ2AffOnBehalf on the next source redelivery. What is NOT safe is
+// running it early — see prepareQ2AffineUnwind.
+//
+// sess.mu not held on entry.
+func (sess *mqttSession) discardQ2AffineUnwindClaims(u mqttQ2AffUnwind) error {
+	if !u.prepared || sess.asm == nil {
+		return nil
+	}
+	return sess.asm.discardQ2AffClaimsFor(sess.idHash, u.gen)
+}
+
+// releaseQ2AffineUnwindLocally drops the LOCAL half of a detached path: its
+// delivery subscription and its share of the session's MaxAckPending budget.
+//
+// Split out from finishQ2AffineUnwind because the two halves are gated on
+// different facts. Deleting the consumer needs the generation's assignments to
+// have been terminated first — $MQTT_out is interest-retained, so the delete
+// takes any copies with it — while the subscription and the charge belong to a
+// path this session has already stopped owning, and nothing else can ever reach
+// them: they are not on the record, and the orphan sweep operates on consumers,
+// not on another broker's in-memory accounting. Stranding them leaks a slice of
+// mqttMaxAckTotalLimit for the life of the session.
+//
+// sess.mu not held on entry.
+func (sess *mqttSession) releaseQ2AffineUnwindLocally(c *client, u mqttQ2AffUnwind) {
 	if !u.prepared {
 		return
 	}
@@ -2176,11 +2259,10 @@ func (sess *mqttSession) finishQ2AffineUnwind(c *client, u mqttQ2AffUnwind) {
 			c.Warnf("Unable to remove the affine QoS 2 delivery subscription on %q: %v", u.deliver, err)
 		}
 	}
+	// A path restored from a record was never charged against THIS process's
+	// budget, so refunding it would credit a charge that was never made.
 	if !u.charged {
 		return
-	}
-	if _, err := sess.jsa.deleteConsumer(mqttOutStreamName, u.durable, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-		c.Errorf("Unable to delete the affine QoS 2 consumer %q of a rolled-back SUBSCRIBE: %v", u.durable, err)
 	}
 	opts := c.srv.getOpts()
 	maxAckPending := int(opts.MQTT.MaxAckPending)
@@ -2193,6 +2275,21 @@ func (sess *mqttSession) finishQ2AffineUnwind(c *client, u mqttQ2AffUnwind) {
 		sess.tmaxack = 0
 	}
 	sess.mu.Unlock()
+}
+
+// finishQ2AffineUnwind deletes what prepareQ2AffineUnwind detached, once the
+// record that no longer names it is confirmed.
+func (sess *mqttSession) finishQ2AffineUnwind(c *client, u mqttQ2AffUnwind) {
+	if !u.prepared {
+		return
+	}
+	sess.releaseQ2AffineUnwindLocally(c, u)
+	if !u.charged {
+		return
+	}
+	if _, err := sess.jsa.deleteConsumer(mqttOutStreamName, u.durable, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+		c.Errorf("Unable to delete the affine QoS 2 consumer %q of a rolled-back SUBSCRIBE: %v", u.durable, err)
+	}
 }
 
 // restoreQ2AffineUnwind puts a prepared-but-not-executed unwind back, for a
@@ -2231,4 +2328,127 @@ func (sess *mqttSession) hasSharedQoS2Sub() bool {
 		}
 	}
 	return false
+}
+
+// unwindProvisionedQ2AffineOnLanded reclaims an affine path whose PROVISIONING
+// save was ambiguous and has since been PROVEN durable.
+//
+// An ambiguity is settled by re-attempting the attempt's exact bytes, so what
+// becomes durable is the record as the FIRST filter loop serialized it: a session
+// naming this consumer and its generation. No membership this PACKET tried to add
+// can accompany it — shared memberships are persisted in a later loop, and every
+// save is refused while the session is unresolved — and the orphan sweep passes
+// over the consumer precisely because the record references it. Neither the
+// packet's unused-path unwind nor its rollback can reconcile it either: their own
+// confirming saves are refused for the same reason. Without this continuation the
+// path, its MaxAckPending charge and its consumer survive until the session is
+// torn down — for a session that never expires, the broker's lifetime.
+//
+// What licenses the removal is that the PACKET FAILED, NOT that the generation is
+// provably unreachable or claim-free. It is neither in general: a packet carrying
+// a SECOND shared QoS 2 filter re-enters this function with the consumer already
+// present, skips the save and opens the readiness gate below on a session that is
+// still unresolved, so a move can transiently claim and copy under this generation
+// before the membership rollback. A membership the record already CARRIED is a
+// different matter again, and is what the guard in the continuation is for.
+//
+// Registered only when the provisioning call MINTED the generation, which is what
+// makes the path this call's to unwind rather than one it merely re-established.
+//
+// The claims this discards are the ones the packet's own unwind would have
+// discarded had the write been confirmed — a delivery started to a session whose
+// subscription never became durable dies with it, which [MQTT-4.8.2-6] permits.
+// Deferred to the settlement rather than done at failure time so it is one
+// arbitrated CAS on a record we have proof of, not a guess against one we do not.
+//
+// OWNERSHIP IS ARBITRATED BEFORE ANYTHING IRREVERSIBLE. The unwind is prepared
+// with disposeNow FALSE, so the assignments survive until the cleanup record is
+// confirmed: a remote winner that took the session over and PRESERVED this
+// generation wins the CAS instead, and the definite arm then restores a path
+// whose claims were never touched. The other two unwind sites still dispose
+// first; converting them has its own failure semantics and is filed in
+// docs/ROADMAP.md.
+//
+// Runs from the resolver, holding its record transaction and its ownership gate.
+// Safe against the move fence: closeQ2AffAndDrain waits only for in-flight move
+// operations, and a move touches $MQTT_qos2assign and $MQTT_out — never the
+// session record — so it cannot be waiting on the very transaction we hold.
+//
+// sess.mu not held on entry.
+func (sess *mqttSession) unwindProvisionedQ2AffineOnLanded(c *client, tok recordTx) {
+	// A real membership outranks this. The pre-upgrade resume shape reaches the
+	// same provisioning save with its shared QoS 2 subscriptions ALREADY restored
+	// — they were loaded from the record before the attempt — so they survive the
+	// settlement and the path is owed to them.
+	if sess.hasSharedQoS2Sub() {
+		return
+	}
+	u := sess.prepareQ2AffineUnwind(c, false)
+	if !u.prepared {
+		// There was nothing to unwind. Not ours to delete.
+		return
+	}
+	// A STARTED DELIVERY outranks the reclaim. The packet failed; it did not end
+	// the session — and `Discarded` means the owning session ENDED. An assignment
+	// this generation still owns therefore belongs to a session that is still
+	// live, which [MQTT-4.8.2-5] requires to complete the delivery it started. So
+	// the path is put back and session teardown becomes what ends it, which is the
+	// one event that makes the discard truthful.
+	//
+	// This is NOT check-then-act. prepareQ2AffineUnwind fenced and DRAINED the path
+	// first, and it returns with the generation detached — and beginQ2AffOp admits
+	// nothing without a generation and readiness — so no move can add an assignment
+	// between the scan and the decision. A remote winner can still create one after
+	// it, which is what the CAS-first ordering below is for.
+	if owns, err := sess.q2AffineGenerationOwnsClaims(u.gen); owns {
+		sess.restoreQ2AffineUnwind(u)
+		if err != nil {
+			c.Errorf("MQTT: cannot prove the unused affine QoS 2 path of %q owns no assignment, so it is retained: %v", sess.id, err)
+		} else {
+			c.Warnf("MQTT: keeping the unused affine QoS 2 path of %q: its generation still owns a started delivery, which only the end of the session may discard", sess.id)
+		}
+		return
+	}
+	// dispose runs only once the record that no longer authorizes this generation
+	// is CONFIRMED. A failure to terminate the assignments stops short of the
+	// CONSUMER DELETE and of nothing else: $MQTT_out is interest-retained, so
+	// deleting it would take any copies with it, and the record no longer
+	// references it — which makes it the orphan sweep's, and the sweep
+	// grace-observes, claim-checks and revalidates before deleting. The LOCAL half
+	// is released either way: the delivery subscription and the MaxAckPending
+	// charge belong to a path this session no longer owns, they are reachable from
+	// nothing else once the record stops naming it, and the sweep cannot refund
+	// another broker's budget.
+	dispose := func() {
+		if err := sess.discardQ2AffineUnwindClaims(u); err != nil {
+			sess.releaseQ2AffineUnwindLocally(c, u)
+			c.Errorf("MQTT: the unused affine QoS 2 path of %q is removed from its record but its assignments could not be terminated; releasing its subscription and budget and leaving the consumer %q to the orphan sweep: %v", sess.id, u.durable, err)
+			return
+		}
+		sess.finishQ2AffineUnwind(c, u)
+	}
+	// Detach, persist a record that no longer names the path, and only then
+	// dispose of anything.
+	outcome, err := sess.saveClassified(tok)
+	switch {
+	case err == nil:
+		dispose()
+	case outcome == saveDefinitelyFailed:
+		// Nothing stored, so the session must go back to describing the resources
+		// that are still live, and the path reverts to being the teardown residual.
+		// Nothing was disposed of, so the restore is complete rather than partial —
+		// which is the whole reason the claims were not touched above. A remote
+		// winner that preserved this generation keeps its assignments.
+		sess.restoreQ2AffineUnwind(u)
+		c.Errorf("MQTT: unable to persist the removal of a settled but unused affine QoS 2 path for %q: %v", sess.id, err)
+	default:
+		// Ambiguous again: the record may already omit the path. Keep the detached
+		// view (it matches what may have landed) but dispose of nothing until the
+		// NEXT settlement proves the record no longer names it. Deliberately NOT
+		// resolved from here — the resolver holds the fence, so an attempt from
+		// inside it would be refused; resolutionAfterContinuations reports the
+		// session unresolved and the periodic pass retries.
+		sess.retainOnLanded(func(recordTx) { dispose() })
+		c.Errorf("MQTT: the removal of a settled but unused affine QoS 2 path for %q is unresolved: %v", sess.id, err)
+	}
 }

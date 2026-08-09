@@ -846,6 +846,60 @@ live, a live copy always keeps its claim (`reapable` requires the copy to be
 authoritatively absent), and the redelivered copy is disposed of by the delivery
 gate's terminal branch.
 
+**A provisioned path with no membership, and what removes it.** The affine path
+is provisioned in `mqttProcessSubs`' FIRST filter loop, before any filter is known
+to succeed, so it can outlive the subscription it was built for. The variants are
+told apart by their REMOVAL POINT, not by their shape:
+
+- A generation this call **minted**, whose provisioning save went AMBIGUOUS, is
+  ELIGIBLE for removal at SETTLEMENT. The settlement makes the attempt's own bytes
+  durable, so the record names the path, and nothing in the packet can undo that
+  because every save is refused while the session is unresolved. What licenses the
+  removal is that the PACKET FAILED and no NEW membership became durable — not that
+  the generation is provably empty, which it is not in general. A packet carrying a
+  SECOND shared QoS 2 filter re-enters provisioning with the consumer already
+  present, skips the save and OPENS the readiness gate on a still-unresolved
+  session, so a move can transiently claim and copy under the generation before the
+  packet's membership rollback. The reclaim therefore RETAINS the path whenever the
+  generation still owns an assignment: a failed packet is not an ended session, and
+  `Discarded` means the owning session ended, so a delivery already started to a
+  session that is still live is one [MQTT-4.8.2-5] requires it to complete — session
+  teardown is the event that may end it. The check is not check-then-act, because
+  the unwind fences and drains the path first and a detached generation admits no
+  new move. (The packet's own two unwinds still discard on a failed packet; see
+  `docs/ROADMAP.md`.) The
+  pre-affine RESUME shape is different in kind: the restored record already carried
+  shared QoS 2 memberships, restore loaded them before the provisioning attempt,
+  and they survive the settlement — so the path is owed to a LIVE subscription and
+  must not be removed at all. The provisioning save therefore registers a landed
+  continuation (`unwindProvisionedQ2AffineOnLanded`) that runs the ordinary
+  three-arm unwind under the resolver's token, and `hasSharedQoS2Sub()` is what
+  tells those two apart: eligible, never automatic. The guard is mandatory rather
+  than defensive, and
+  `TestQ2AffineAmbiguousProvisioningKeepsAPathAMembershipOwns` is the resume shape
+  it exists for. Only a MINTED generation qualifies at all: a resume that
+  re-establishes a path the record already named reaches the same save, and its
+  generation may owe assignments to a delivery already started to it. After a crash
+  inside that window nothing removes the path at settlement, because there is no
+  longer a continuation to run: a later shared QoS 2 SUBSCRIBE REUSES it — making
+  it useful again without deleting it or releasing its cost — and session teardown
+  is what removes it.
+  Its unwind is prepared with `disposeNow` FALSE, so ownership is arbitrated before
+  anything irreversible: the cleanup record is CASed first, and only once that write
+  is confirmed are the generation's assignments discarded, its delivery subscription
+  and MaxAckPending charge released, and its consumer deleted. A remote winner that
+  took the session over and preserved the
+  generation therefore wins the CAS and keeps its started deliveries, and the
+  definite arm restores a path whose claims were never touched. This is the order
+  `claimTeardown` already uses, and it is safe to dispose late because
+  `materializeQ2AffOnBehalf` terminates a claim whose record no longer names its
+  generation. The packet's own two unwinds still dispose first; see
+  `docs/CONFORMANCE.md` and `docs/ROADMAP.md`.
+- The **claim-cleanup-failure abort** and the path retained after UNSUBSCRIBE of
+  the last shared QoS 2 filter are deliberately KEPT: the path may still owe
+  outstanding assignments or started deliveries. A later SUBSCRIBE reuses them;
+  session teardown is the only thing that removes them.
+
 **Stream prerequisites.** `$MQTT_qos2assign` must be `LimitsPolicy` +
 `DiscardOld` + `MaxMsgsPer: 1` — permanent retention is as load-bearing as the
 per-subject singleton, because claims are read by direct subject lookup and are

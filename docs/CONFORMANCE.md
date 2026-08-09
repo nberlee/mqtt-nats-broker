@@ -616,6 +616,57 @@ it does *not* promise:
   save runs BEFORE the loop that persists shared memberships, and that later save is
   refused while the session is unresolved — so the per-filter SUBACK failure it reports
   is truthful, with no membership for that filter becoming durable.
+- **What the shared QoS 2 affine provisioning DOES leave durable is the path itself, and
+  the settlement removes it when no membership owns it.** The bytes made durable name
+  `Q2Aff`/`Q2AffGen` — in the
+  fresh-SUBSCRIBE shape for a subscription that never became durable, and in the
+  pre-affine RESUME shape for shared memberships the restored record already carried and
+  the settlement preserves — and no orphan sweep will touch a consumer the record
+  references. A generation MINTED by that save therefore registers a landed continuation
+  that unwinds the path under the resolver's token — unless a real membership owns it by
+  then, or the generation still owes a STARTED DELIVERY, which a failed packet may not
+  discard because `Discarded` means the owning session ended and this one is still live —
+  in this order: confirm the record that no longer names the path, discard the
+  generation's assignments, release the delivery subscription and the MaxAckPending
+  charge, and only then delete the consumer — a delete whose own failure is logged and
+  leaves an unreferenced durable for the orphan sweep. A generation the save merely
+  re-established is deliberately excluded: it may owe assignments to a delivery already
+  started to it. If the assignment scan FAILS — it is account-wide and fails closed on any
+  claim it cannot read or attribute — the subscription and the charge are still released,
+  because once the record stops naming the path nothing else can reach them. The discard
+  is a STREAMING one, so its progress is PARTIAL rather than none: the generation's claims
+  the scan had already reached are discarded, and a claim that was already proven on both
+  sides may also have been reaped, while the malformed record aborts the remainder. Those
+  remaining assignments and the consumer stay pending, and they are not merely deferred to
+  the orphan sweep: the same unreadable claim aborts that sweep's affine inventory too,
+  deliberately, since an incomplete inventory cannot authorize any consumer delete. Until
+  that record is repaired or removed, one malformed claim therefore wedges affine CONSUMER
+  reclamation account-wide, leaving an unreferenced consumer on `$MQTT_out` for as long as
+  it persists. The RESIDUAL is the crash window between the ambiguous
+  save and its settlement. After a restart the record names the path and the resume
+  re-establishes it — without recharging, and without reclaiming it. From there session
+  TEARDOWN is the only thing that removes it: a later shared QoS 2 SUBSCRIBE reuses the
+  same generation and consumer, which ends the path's UNUSED status but deletes nothing
+  and refunds nothing. So the durable consumer on `$MQTT_out` persists until teardown. Its
+  MaxAckPending charge is process-local and lasts the life of the provisioning process —
+  the broker's, for a never-expiring session — and a restart drops that charge with the
+  process while leaving the durable behind. The reclaim also adds ONE
+  more arbitrating CAS site — plus whatever re-attempts and rejection probes its own
+  failures invoke — to the exposure of the same-base leader-transition overwrite below;
+  the exception's class and window are unchanged, its frequency is not.
+- **The packet's two unwinds discard this generation's assignments BEFORE the CAS that
+  arbitrates whether they still own them**, so a cleanup save lost to a remote winner that
+  PRESERVED the generation leaves that winner's started QoS 2 delivery discarded —
+  terminated for a session that is still live, which is the [MQTT-4.8.2-6] outcome applied
+  to the wrong owner. `restoreQ2AffineUnwind` cannot undo it: the discard is monotonic by
+  design. The settlement reclaim does NOT have this exposure — it prepares its unwind with
+  `disposeNow` false and discards only once the cleanup record is confirmed — but the
+  defect CLASS predates it and remains in `rollbackSubscribePacket` and the packet's
+  unused-path unwind, both filed in `docs/ROADMAP.md`. Session teardown never had it:
+  `claimTeardown` wins a durable ownership marker first, and only a WON claim discards.
+  Disposing late is recoverable rather than stalling, which is what makes the reclaim's
+  order safe: `materializeQ2AffOnBehalf` discards, source-acks and reaps a claim whose
+  record no longer names its generation.
 - **SEPARATELY, the v5 UNSUBSCRIBE is acknowledged**, and its UNSUBACK is made truthful:
   the packet's true per-filter reasons are restored in place of the 0x83 whenever the
   attempt's own landed continuation has fired by the time the packet tail loads its flag.

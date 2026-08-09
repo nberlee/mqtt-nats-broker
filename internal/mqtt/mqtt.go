@@ -6741,10 +6741,22 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// create, a failed subscription) would otherwise keep a consumer, a
 			// generation and a MaxAckPending charge for a subscription that does not
 			// exist. Only ever unwinds a path THIS packet built. Spec5 [4.8.2].
-			if !q2AffPrePacket && !sess.hasSharedQoS2Sub() {
+			//
+			// Not while the session is UNRESOLVED. The confirming save below is
+			// refused at entry then, so the unwind would terminate the generation's
+			// assignments — which nothing undoes — and then restore a path it never
+			// managed to remove. The write that left the session unresolved is the
+			// provisioning save itself, and it registered a continuation that owns
+			// this reclaim and runs it under the resolver's token once the record is
+			// proven. See unwindProvisionedQ2AffineOnLanded.
+			if !q2AffPrePacket && !sess.isSeqUncertain() && !sess.hasSharedQoS2Sub() {
 				// Same commit order as the rollback path: detach, persist a record
 				// that no longer names it, and only then delete.
-				if u := sess.prepareQ2AffineUnwind(c); u.prepared {
+				// disposeNow: this site's failure semantics are unchanged — a failed
+				// claim cleanup aborts the unwind and leaves the path usable. Moving it
+				// to dispose-after-confirm is filed as its own §0 item, because the
+				// rollback around it has distinct failure semantics of its own.
+				if u := sess.prepareQ2AffineUnwind(c, true); u.prepared {
 					outcome, serr := sess.saveClassified(tok)
 					switch {
 					case serr == nil:
@@ -7251,7 +7263,8 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// alone. Spec5 [4.8.2].
 	var q2AffUnwind mqttQ2AffUnwind
 	if !q2AffPrePacket {
-		q2AffUnwind = sess.prepareQ2AffineUnwind(c)
+		// disposeNow: unchanged here too; see the note at the unused-path unwind.
+		q2AffUnwind = sess.prepareQ2AffineUnwind(c, true)
 	}
 	outcome, err := sess.saveClassified(tok)
 	if err != nil {
