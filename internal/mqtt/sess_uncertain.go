@@ -98,6 +98,11 @@ type mqttPendingWrite struct {
 	// from; this is that revision travelling with the proof. See
 	// voidRegNonceLocked and releaseSettledVoidReservationsLocked.
 	voidedRegsRev uint64
+	// wid / pwid are the lineage the ATTEMPT stamped, kept for the same reason the
+	// bytes are: memory may have moved on, so a resolution that proves these bytes
+	// durable must adopt the identity THEY carry and not whatever the session holds
+	// by then. See sess_fork_lineage.go.
+	wid, pwid string
 }
 
 // mqttUncertainResolution is how the resolver classified an ambiguous write.
@@ -122,6 +127,12 @@ const (
 	// mqttUncertainForeign: an authoritative record exists that is not ours. Detach
 	// and evict; every obligation belongs to its owner.
 	mqttUncertainForeign
+	// mqttUncertainForked: a record exists that is provably a SIBLING of the one this
+	// broker was acknowledged for, so our write's base was erased by something that is
+	// no successor of ours. Disposed exactly as foreign — the session is not ours to
+	// write and the surviving record is authoritative whoever wrote it — and reported
+	// differently, because no takeover was demonstrated. See sess_fork_lineage.go.
+	mqttUncertainForked
 )
 
 func (r mqttUncertainResolution) String() string {
@@ -130,6 +141,8 @@ func (r mqttUncertainResolution) String() string {
 		return "ours"
 	case mqttUncertainForeign:
 		return "foreign"
+	case mqttUncertainForked:
+		return "forked"
 	default:
 		return "unresolved"
 	}
@@ -192,14 +205,18 @@ func mqttRecordDigest(body []byte) [sha256.Size]byte {
 // write instead of reading the record and guessing at its fate.
 //
 // voidedRev is the void-register revision the attempt marshalled, carried so a
-// resolution that proves those bytes durable can credit it.
+// resolution that proves those bytes durable can credit it; wid and pwid are the
+// lineage it stamped, carried so a resolution that proves them durable adopts the
+// identity those bytes carry rather than memory's.
 //
 // sess.mu must be held.
-func (sess *mqttSession) markWriteUncertainLocked(baseSeq uint64, body, framed []byte, hdr int, voidedRev uint64) {
+func (sess *mqttSession) markWriteUncertainLocked(baseSeq uint64, body, framed []byte, hdr int,
+	voidedRev uint64, wid, pwid string) {
+
 	sess.seqUncertain = true
 	sess.pendingWrite = &mqttPendingWrite{
 		baseSeq: baseSeq, digest: mqttRecordDigest(body), framed: framed, hdr: hdr,
-		voidedRegsRev: voidedRev,
+		voidedRegsRev: voidedRev, wid: wid, pwid: pwid,
 	}
 }
 
@@ -295,6 +312,11 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 	}
 	pw := sess.pendingWrite
 	domainTk, idHash := sess.domainTk, sess.idHash
+	// The pair this broker was ACKNOWLEDGED for — not the attempt's, which is what a
+	// sibling of our base would be compared against in vain. Sampled in the same
+	// critical section as pw, and stable while the session is uncertain because every
+	// save is refused at entry until it resolves. See sess_fork_lineage.go.
+	ourGen, ackWID, ackPWID := sess.gen, sess.wid, sess.pwid
 	sess.mu.Unlock()
 	if pw == nil {
 		// Uncertain with no attempted-write identity: nothing can be classified, and
@@ -322,7 +344,7 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		return mqttUncertainOurs, nil
 	}
 
-	switch verdict, seq := classifyAttemptReadback(smsg, err, pw); verdict {
+	switch verdict, seq := classifyAttemptReadback(smsg, err, pw, ourGen, ackWID, ackPWID); verdict {
 	case mqttAttemptUnreadable:
 		// Nothing is known: write nothing, delete nothing, and let a later pass ask
 		// again.
@@ -337,12 +359,17 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// NOT adopt its sequence: doing so would turn our stale snapshot into a valid
 		// CAS and overwrite whatever that owner has since persisted.
 		return mqttUncertainForeign, nil
+	case mqttAttemptForked:
+		// A PROVEN sibling of the record we were acknowledged for. Everything the
+		// foreign arm does still applies — the attempt did not land, and its sequence
+		// must not be adopted — but no takeover was demonstrated, so none is claimed.
+		return mqttUncertainForked, nil
 	default: // mqttAttemptAtBase, mqttAttemptGone
 		// Neither answer settles anything on its own. At base says nothing about our
 		// proposal, because JetStream reports contention while a write for the subject
 		// is still in process; and an empty subject does not stop a proposal already
 		// accepted into the log. Both are arbitrated by a CAS instead of a guess.
-		return sess.reattemptUncertainWrite(tok, pw, domainTk, idHash)
+		return sess.reattemptUncertainWrite(tok, pw, domainTk, idHash, ourGen, ackWID, ackPWID)
 	}
 }
 
@@ -369,6 +396,12 @@ const (
 	// mqttAttemptAtBase: the record is still the one the attempt CAS'd against. That
 	// is CONTENTION, not an outcome: the proposal may still be in process upstream.
 	mqttAttemptAtBase
+	// mqttAttemptForked: the surviving record is PROVABLY a sibling of the one this
+	// broker was acknowledged for — same parent, different identity — so the attempt's
+	// base was erased by a write that is no successor of ours. Everything foreign does
+	// happens here too (the attempt did not land and its sequence must not be adopted);
+	// what differs is that no takeover is asserted. See sess_fork_lineage.go.
+	mqttAttemptForked
 )
 
 // classifyAttemptReadback is the whole classification of a record read taken about
@@ -385,7 +418,9 @@ const (
 // foreign FAIL-SAFE (never adopted), not as a proof of another owner.
 //
 // The sequence returned is meaningful only for mqttAttemptOurs.
-func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite) (mqttAttemptReadback, uint64) {
+func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
+	ourGen, ackWID, ackPWID string) (mqttAttemptReadback, uint64) {
+
 	switch classifyRecordAgainstAttempt(smsg, lerr, pw.baseSeq) {
 	case mqttRecordAttemptUnreadable:
 		return mqttAttemptUnreadable, 0
@@ -411,6 +446,15 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite) 
 	default: // mqttRecordAttemptMoved
 		if smsg.Sequence > pw.baseSeq && mqttRecordDigest(smsg.Data) == pw.digest {
 			return mqttAttemptOurs, smsg.Sequence
+		}
+		// Foreign — and the lineage question is asked HERE, on the branch that has
+		// already reached that conclusion, and only above the base. A record BELOW it
+		// stays foreign whatever its identity says: a lower sequence means a reset or
+		// re-provisioned store, and that fail-safe is not the lineage rule's to relax.
+		// Decoded lazily, because the two branches above compare raw bytes.
+		if smsg.Sequence > pw.baseSeq &&
+			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ourGen, ackWID, ackPWID) == mqttLineageForked {
+			return mqttAttemptForked, 0
 		}
 		return mqttAttemptForeign, 0
 	}
@@ -454,7 +498,7 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite) 
 //
 // The resolver's fence is held. sess.mu must not be held.
 func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWrite,
-	domainTk, cidHash string) (mqttUncertainResolution, error) {
+	domainTk, cidHash, ourGen, ackWID, ackPWID string) (mqttUncertainResolution, error) {
 
 	// Test seam, fired between the at-base classification and the re-attempt: it is
 	// what lets a test land the ORIGINAL proposal inside the very window this arm
@@ -478,12 +522,17 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 	// Definitely rejected: this re-attempt is not the write that will decide, so the
 	// record that IS there does.
 	smsg, lerr := sess.jsa.loadSessionMsg(domainTk, cidHash)
-	switch verdict, seq := classifyAttemptReadback(smsg, lerr, pw); verdict {
+	switch verdict, seq := classifyAttemptReadback(smsg, lerr, pw, ourGen, ackWID, ackPWID); verdict {
 	case mqttAttemptOurs:
 		// The original landed between the readback and the re-attempt.
 		return sess.settleLandedAttempt(tok, pw, seq), nil
 	case mqttAttemptForeign:
 		return mqttUncertainForeign, nil
+	case mqttAttemptForked:
+		// A proven sibling of our acknowledged base, reached through the re-attempt's
+		// own rejection rather than the first readback. Same disposition, same silence
+		// about a takeover nothing established.
+		return mqttUncertainForked, nil
 	case mqttAttemptGone:
 		// The subject is still empty, and the REJECTION KIND is the only thing that
 		// says anything about our original. 10164 means a write for this subject is
@@ -520,7 +569,7 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 //
 // No lock held on entry.
 func (sess *mqttSession) settleLandedAttempt(tok recordTx, pw *mqttPendingWrite, seq uint64) mqttUncertainResolution {
-	sess.clearUncertaintyLocked(seq)
+	sess.clearUncertaintyLocked(seq, pw.wid, pw.pwid)
 	sess.mu.Lock()
 	sess.creditVoidedRegsLocked(pw.voidedRegsRev)
 	sess.mu.Unlock()
@@ -566,12 +615,16 @@ func (sess *mqttSession) resolutionAfterContinuations(res mqttUncertainResolutio
 	return res
 }
 
-// clearUncertainty marks the session resolved at seq.
-func (sess *mqttSession) clearUncertaintyLocked(seq uint64) {
+// clearUncertainty marks the session resolved at seq, adopting the lineage the proven
+// bytes carry alongside it — the same pairing every other adoption site makes, because
+// a sequence without its identity leaves the next save parenting itself to a record
+// that is no longer the base. See sess_fork_lineage.go.
+func (sess *mqttSession) clearUncertaintyLocked(seq uint64, wid, pwid string) {
 	sess.mu.Lock()
 	sess.seqUncertain = false
 	sess.pendingWrite = nil
 	sess.seq = seq
+	sess.wid, sess.pwid = wid, pwid
 	sess.mu.Unlock()
 }
 
@@ -637,18 +690,25 @@ func (sess *mqttSession) resolveUncertainNow(c *client) mqttUncertainResolution 
 	if err != nil && c != nil {
 		c.Debugf("MQTT: could not resolve the uncertain record write of session %q: %v", sess.id, err)
 	}
-	if res == mqttUncertainForeign {
-		// Somebody else owns this session now. Disposition happens under the
-		// ownership gate — doing it ungated would race a CONNECT that has already
-		// evicted this object and installed a replacement — but this call already
-		// holds that gate, so it must NOT go through the wrapper: lockSession fails
-		// fast on a gate it finds held, including its own, which would silently
-		// skip the disposition and leave a stale client bound to a session another
-		// broker owns. See disposeForeignSessionLocked.
+	if res == mqttUncertainForeign || res == mqttUncertainForked {
+		// Somebody else owns this session now — or, on the forked arm, nobody who can
+		// be shown to. The DISPOSITION is identical either way and deliberately so:
+		// the surviving record is authoritative, this object may not write, and every
+		// protocol the eviction satisfies (the retained continuations, the parked
+		// action, residency identity, CONNECT's verdict switch) stays satisfied by the
+		// code that already satisfies it. Only the vocabulary differs.
+		//
+		// Disposition happens under the ownership gate — doing it ungated would race a
+		// CONNECT that has already evicted this object and installed a replacement —
+		// but this call already holds that gate, so it must NOT go through the
+		// wrapper: lockSession fails fast on a gate it finds held, including its own,
+		// which would silently skip the disposition and leave a stale client bound to
+		// a session another broker owns. See disposeForeignSessionLocked.
+		voc := mqttDisposalForForeignResolution(res)
 		if gated {
-			sess.disposeForeignSessionLocked(sess.asm, c)
+			sess.disposeForeignSessionLocked(sess.asm, c, voc)
 		} else {
-			sess.disposeForeignSession(c)
+			sess.disposeForeignSession(c, voc)
 		}
 		return res
 	}
@@ -738,13 +798,15 @@ func (sess *mqttSession) dischargeDeferredIfUnbound(c *client) {
 // mqttGateDispatchOnRejection.
 //
 // No lock held on entry (other than the ownership gate).
-func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionManager, c *client) {
+func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionManager, c *client,
+	voc mqttDisposalVocabulary) {
+
 	stale, disposed := sess.disposeForeignStateLocked(asm, c)
 	if !disposed || stale == nil {
 		return
 	}
-	stale.mqttNotifyForeignDisposal(sess.id)
-	go stale.closeConnection(DuplicateClientID)
+	stale.mqttNotifyForeignDisposal(sess.id, voc)
+	go stale.closeConnection(voc.closeReason)
 }
 
 // disposeForeignStateLocked is the STATE half of the foreign disposition: it detaches the
@@ -793,9 +855,13 @@ func (sess *mqttSession) disposeForeignStateLocked(asm *mqttAccountSessionManage
 // claim that keeps this from being the second DISCONNECT on the socket.
 //
 // No lock held on entry.
-func (c *client) mqttNotifyForeignDisposal(id string) {
-	c.Warnf("MQTT: session %q is now owned elsewhere; closing this connection", id)
-	c.mqttNotifyTakenOver()
+// The vocabulary decides what is CLAIMED. A demonstrated takeover says so; a record
+// merely proven to have FORKED says only that ownership could not be established, and
+// carries 0x89 rather than 0x8E so the client is invited to reconnect instead of being
+// told to stop. See sess_fork_lineage.go.
+func (c *client) mqttNotifyForeignDisposal(id string, voc mqttDisposalVocabulary) {
+	c.Warnf("MQTT: session %q %s", id, voc.logReason)
+	c.mqttNotifyDisplaced(voc)
 }
 
 // disposeForeignSession is disposeForeignSessionLocked for a caller that does not
@@ -803,7 +869,7 @@ func (c *client) mqttNotifyForeignDisposal(id string) {
 // progress: it wins, and it will rebuild from the authoritative record itself.
 //
 // No lock held on entry.
-func (sess *mqttSession) disposeForeignSession(c *client) {
+func (sess *mqttSession) disposeForeignSession(c *client, voc mqttDisposalVocabulary) {
 	asm := sess.asm
 	if asm == nil {
 		return
@@ -815,7 +881,7 @@ func (sess *mqttSession) disposeForeignSession(c *client) {
 		return
 	}
 	defer asm.unlockSession(sess)
-	sess.disposeForeignSessionLocked(asm, c)
+	sess.disposeForeignSessionLocked(asm, c, voc)
 }
 
 // retainOnLanded registers what a caller owes once an ambiguous write is PROVEN
@@ -1102,13 +1168,14 @@ func (s *Server) resolveUncertainSession(asm *mqttAccountSessionManager, sess *m
 	case mqttUncertainUnresolved:
 		s.Debugf("MQTT: session %q is still unresolved: %v", sess.id, err)
 		return res
-	case mqttUncertainForeign:
-		// Another owner holds this session. One disposition path for both resolvers,
+	case mqttUncertainForeign, mqttUncertainForked:
+		// Another owner holds this session, or — on the forked arm — the record moved
+		// without anything establishing one. One disposition path for both resolvers,
 		// so a session found foreign by the periodic pass has its stale connection
 		// CLOSED too — this pass now examines bound sessions, and detaching one
 		// without closing it leaves a live client acting on an evicted session. The
 		// caller already holds the ownership gate.
-		sess.disposeForeignSessionLocked(asm, nil)
+		sess.disposeForeignSessionLocked(asm, nil, mqttDisposalForForeignResolution(res))
 		return res
 	}
 
@@ -1526,8 +1593,11 @@ func (as *mqttAccountSessionManager) settleRejectionFromSweep(s *Server, sess *m
 		// The probe IS the backstop: every landed save credits the void-register
 		// revision it marshalled, so a gap it covered is closed by it, and a nonce
 		// staged after its marshal is the release handoff's to converge.
-	case mqttRejectionForeign:
-		// Disposed. Nothing else may touch this session, backstop included.
+	case mqttRejectionForeign, mqttRejectionForked:
+		// Disposed either way — settleRecordRejection disposes on both — so nothing
+		// else may touch this session, backstop included. Named rather than left to
+		// the default, which means "nothing was established" and would describe a
+		// disposed session as one whose marker is still armed.
 	default: // mqttRejectionKeep
 		// Ownership was not established, so the backstop's save would be the same doomed
 		// CAS. The marker stays armed and the next pass asks again.

@@ -186,11 +186,15 @@ func (sess *mqttSession) settleRecordRejection(asm *mqttAccountSessionManager) m
 	if terr := sess.endRecordTx(tok); terr != nil {
 		sess.jsa.c.Errorf("MQTT: %v", terr)
 	}
-	if verdict == mqttRejectionForeign {
+	if verdict == mqttRejectionForeign || verdict == mqttRejectionForked {
 		// Outside the fence, as expireSession disposes: the disposal takes sess.mu, evicts
 		// and closes, and holds no record state. nil, not a client: this path is
-		// unbound-only, so there is no connection of ours to close.
-		sess.disposeForeignSessionLocked(asm, nil)
+		// unbound-only, so there is no connection of ours to close — which is also why
+		// the forked verdict changes nothing OBSERVABLE here. The helper returns before
+		// the notification when there is no bound client, so no packet and no log line
+		// differ; the arm exists so the classifier has one meaning at every call site
+		// rather than a special case where the distinction happens not to be visible.
+		sess.disposeForeignSessionLocked(asm, nil, mqttDisposalForRejection(verdict))
 	}
 	return verdict
 }
@@ -205,6 +209,11 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 	sess.mu.Lock()
 	pending := sess.recordRejectionPendingLocked()
 	domainTk, idHash := sess.domainTk, sess.idHash
+	// The pair this broker was ACKNOWLEDGED for, sampled under the fence alongside the
+	// predicate that makes it meaningful. The probe below mints its own identity; this
+	// is the base that identity descends from, and it is what a surviving sibling would
+	// share a parent with. A rejected probe never moves it. See sess_fork_lineage.go.
+	ourGen, ackWID, ackPWID := sess.gen, sess.wid, sess.pwid
 	sess.mu.Unlock()
 	if !pending {
 		return mqttRejectionKeep
@@ -225,7 +234,7 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 		// between the probe and the readback that classifies it.
 		smsg, lerr = sess.jsa.loadSessionMsg(domainTk, idHash)
 	}
-	verdict := classifyRejectedProbe(outcome, detail, smsg, lerr)
+	verdict := classifyRejectedProbe(outcome, detail, smsg, lerr, ourGen, ackWID, ackPWID)
 	if verdict == mqttRejectionKeep && err != nil {
 		sess.jsa.c.Debugf("MQTT: rejection probe for session %q established nothing: %v", sess.id, err)
 	}
@@ -357,8 +366,11 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 		// next Read fails instead of parsing a queued packet against a disposed session.
 		// Doing it inline is also what keeps the ownership gate off socket I/O.
 		if stale != nil {
-			stale.mqttNotifyForeignDisposal(sess.id)
-			stale.closeConnection(DuplicateClientID)
+			// Only mqttRejectionForeign reaches mqttBoundDisposed — the forked verdict
+			// routes to mqttBoundUnsettled above and never disposes — so the takeover
+			// vocabulary is the only one this tail can owe.
+			stale.mqttNotifyForeignDisposal(sess.id, mqttDisposalTakenOver)
+			stale.closeConnection(mqttDisposalTakenOver.closeReason)
 		}
 		return false, nil
 	case mqttBoundDisplaced:
@@ -432,6 +444,23 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 			return mqttBoundDisplaced, nil
 		}
 		return mqttBoundDisposed, stale
+	case mqttRejectionForked:
+		// A PROVEN sibling of the record we were acknowledged for: our own write was
+		// erased by something that is no successor of ours, and nothing established
+		// another owner. That is precisely what mqttBoundUnsettled already means — the
+		// ownership question is outstanding with the gate held and nobody else
+		// disposing this connection — so it routes there rather than to a fifth
+		// settlement, and the client is told 0x89 by the caller's sentinel.
+		//
+		// Deliberately NOT the foreign arm's shape. That arm disposes the session and
+		// calls mqttDiscardWillOnTakeover first, because a demonstrated takeover owns
+		// the Will's fate. Here nothing is demonstrated, so the connection takes the
+		// ordinary close bookkeeping — the Will handled by its own rules, the expiry
+		// save attempted, shared pending purged — and the session object stays
+		// resident with its marker armed, settled by the next reconnect's accept save
+		// or by the periodic unbound pass. Copying the foreign arm would silently
+		// suppress a Will nothing arbitrated. See docs/CONFORMANCE.md.
+		return mqttBoundUnsettled, nil
 	case mqttRejectionKeep:
 		// Nothing was arbitrated by the probe — but the fence it took may have been
 		// waiting on a writer whose save LANDED, which settles the question without any

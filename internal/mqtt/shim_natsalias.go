@@ -97,6 +97,7 @@ const (
 	ReplayInstant                        = server.ReplayInstant
 	S2Compression                        = server.S2Compression
 	ServerShutdown                       = server.ServerShutdown
+	StaleConnection                      = server.StaleConnection
 	TLSHandshakeError                    = server.TLSHandshakeError
 	WriteError                           = server.WriteError
 )

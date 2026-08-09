@@ -130,6 +130,12 @@ const (
 	// mqttRepairSaveForeign: the record moved to content that is not our write
 	// (or is gone). Another owner is authoritative.
 	mqttRepairSaveForeign
+	// mqttRepairSaveForked: the record moved to content that is PROVABLY a sibling of
+	// the one this broker was acknowledged for. Every consequence of foreign holds —
+	// the write did not land, the sequence must not be adopted, the caller refuses —
+	// and nothing is credited, because nothing landed. What differs is only what the
+	// caller's disposition CLAIMS. See sess_fork_lineage.go.
+	mqttRepairSaveForked
 	// mqttRepairSaveLocalDefinite: retries exhausted with the base sequence still
 	// unchanged. Nothing was stored; undo and refuse.
 	mqttRepairSaveLocalDefinite
@@ -215,6 +221,12 @@ const (
 	// mqttRejectionUnresolved: the probe's own outcome is unknown. The uncertainty
 	// machinery owns the session until a readback classifies it.
 	mqttRejectionUnresolved
+	// mqttRejectionForked: the probe definitively did not land, and the record that IS
+	// there is PROVABLY a sibling of the one this broker was acknowledged for. The
+	// session is equally not ours to write, so the session is disposed exactly as a
+	// foreign verdict disposes it — but no takeover was demonstrated, so none is
+	// claimed and the client is told 0x89 rather than 0x8E. See sess_fork_lineage.go.
+	mqttRejectionForked
 )
 
 // classifyRejectedProbe is the probe's whole post-save decision, the CAS guard
@@ -229,7 +241,9 @@ const (
 //
 // There is no digest arm, and that is deliberate rather than an omission: a rejected
 // write did not land, so a later record matching our bytes cannot be this attempt.
-func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg *StoredMsg, lerr error) mqttRejectionVerdict {
+func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg *StoredMsg, lerr error,
+	ourGen, ackWID, ackPWID string) mqttRejectionVerdict {
+
 	switch outcome {
 	case saveLanded:
 		return mqttRejectionOurs
@@ -241,6 +255,8 @@ func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg 
 	}
 	switch classifyRecordAgainstAttempt(smsg, lerr, detail.baseSeq) {
 	case mqttRecordAttemptGone:
+		// An ABSENT record carries no identity, so there is nothing to compare and the
+		// conclusion stands as it is.
 		return mqttRejectionForeign
 	case mqttRecordAttemptMoved:
 		// The probe definitively did not land, so an accepted transition at another
@@ -250,6 +266,17 @@ func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg 
 		// excludes), a replacement object on this broker is excluded by the
 		// identity-current ownership gate, and the expiry sweep's raw CAS skips a
 		// client whose session is resident.
+		//
+		// That reasoning establishes the record is not OURS. It does not establish
+		// that it SUCCEEDS ours, which is the separate claim the foreign verdict goes
+		// on to make: across a leader transition a write derived from our own base can
+		// survive and erase us. Asked here, on the branch that already concluded
+		// foreign, and only above the base — a record below it stays foreign fail-safe,
+		// because a lower sequence means a reset or re-provisioned store.
+		if smsg.Sequence > detail.baseSeq &&
+			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ourGen, ackWID, ackPWID) == mqttLineageForked {
+			return mqttRejectionForked
+		}
 		return mqttRejectionForeign
 	default: // at base (contention) or unreadable: nothing established either way
 		return mqttRejectionKeep
@@ -741,16 +768,22 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// contention, not a lost race, and gets the bounded re-read/retry treatment.
 	switch {
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceErrF):
+		// 10071 disposes without ever reading the record, so until now this arm claimed
+		// a takeover on nothing but the failed CAS. It reads once and classifies; the
+		// control flow is unchanged, only what the disposition says.
 		releaseGates()
-		sess.disposeForeignSessionLocked(as, c)
+		sess.disposeForeignSessionLocked(as, c, sess.disposalForDirectRejection(&detail))
 		return nil, mqttReconcileRefuseForeign, serr
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
-		switch sess.resolveContendedRecordSave(&detail) {
+		switch v := sess.resolveContendedRecordSave(&detail); v {
 		case mqttRepairSaveLanded:
 			return installedList(), mqttReconcileProceed, nil
-		case mqttRepairSaveForeign:
+		case mqttRepairSaveForeign, mqttRepairSaveForked:
+			// One arm: a fork is refused exactly as a foreign record is — the write did
+			// not land and this CONNECT cannot proceed — and differs only in what the
+			// disposition claims.
 			releaseGates()
-			sess.disposeForeignSessionLocked(as, c)
+			sess.disposeForeignSessionLocked(as, c, mqttDisposalForRepairSave(v))
 			return nil, mqttReconcileRefuseForeign, serr
 		case mqttRepairSaveUnresolved:
 			// The pending-write state (base, digest and the exact bytes) is already
@@ -831,6 +864,21 @@ func mqttVerifyConsumersBatched(durables []string, bound int,
 // No lock held on entry. Performs JetStream requests.
 func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttRepairSaveVerdict {
 	want := mqttRecordDigest(d.body)
+	// The pair this broker was acknowledged for, sampled once: the loop's landed arms
+	// return immediately, so no iteration can observe a pair this call itself moved.
+	sess.mu.Lock()
+	ourGen, ackWID, ackPWID := sess.gen, sess.wid, sess.pwid
+	sess.mu.Unlock()
+	movedVerdict := func(smsg *StoredMsg) mqttRepairSaveVerdict {
+		// Reached only after the digest comparison above has ruled the record out as
+		// ours, and gated on the same `> base` the landed arm uses — a record below
+		// the base stays foreign fail-safe whatever its identity says.
+		if smsg != nil && smsg.Sequence > d.baseSeq &&
+			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ourGen, ackWID, ackPWID) == mqttLineageForked {
+			return mqttRepairSaveForked
+		}
+		return mqttRepairSaveForeign
+	}
 	for attempt := 0; attempt < mqttRepairSaveAttempts; attempt++ {
 		smsg, lerr := sess.jsa.loadSessionMsg(d.domainTk, d.cidHash)
 		switch classifyRecordAgainstAttempt(smsg, lerr, d.baseSeq) {
@@ -840,7 +888,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// establishes the pending-write state itself, carrying the base and
 			// digest, so the deferred readback classifies THIS attempt.
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev)
+			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev, d.wid, d.pwid)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		case mqttRecordAttemptGone:
@@ -853,6 +901,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			if rerr == nil {
 				sess.mu.Lock()
 				sess.seq = resp.Sequence
+				sess.adoptRecordLineageLocked(d)
 				sess.creditVoidedRegsLocked(d.voidedRegsRev)
 				sess.mu.Unlock()
 				return mqttRepairSaveLanded
@@ -865,7 +914,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// The retry's outcome is unknown (a timeout, a lost response). Same
 			// pending-write discipline as the unreadable re-read above.
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev)
+			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev, d.wid, d.pwid)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		default: // mqttRecordAttemptMoved
@@ -874,14 +923,15 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 				// response was lost to the contention.
 				sess.mu.Lock()
 				sess.seq = smsg.Sequence
+				sess.adoptRecordLineageLocked(d)
 				sess.creditVoidedRegsLocked(d.voidedRegsRev)
 				sess.mu.Unlock()
 				return mqttRepairSaveLanded
 			}
-			// A newer, different record (or one below our base). Another owner is
-			// authoritative; adopting its sequence would turn our stale snapshot into a
-			// valid CAS over it.
-			return mqttRepairSaveForeign
+			// A newer, different record (or one below our base). Not ours either way;
+			// adopting its sequence would turn our stale snapshot into a valid CAS over
+			// it. Whether it SUCCEEDS ours is the separate question movedVerdict asks.
+			return movedVerdict(smsg)
 		}
 	}
 
@@ -895,7 +945,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	switch classifyRecordAgainstAttempt(smsg, lerr, d.baseSeq) {
 	case mqttRecordAttemptUnreadable:
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev)
+		sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev, d.wid, d.pwid)
 		sess.mu.Unlock()
 		return mqttRepairSaveUnresolved
 	case mqttRecordAttemptGone:
@@ -906,11 +956,12 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 		if smsg.Sequence > d.baseSeq && mqttRecordDigest(smsg.Data) == want {
 			sess.mu.Lock()
 			sess.seq = smsg.Sequence
+			sess.adoptRecordLineageLocked(d)
 			sess.creditVoidedRegsLocked(d.voidedRegsRev)
 			sess.mu.Unlock()
 			return mqttRepairSaveLanded
 		}
-		return mqttRepairSaveForeign
+		return movedVerdict(smsg)
 	}
 }
 
@@ -1068,16 +1119,20 @@ func (sess *mqttSession) grantRequestedLifetime(asm *mqttAccountSessionManager, 
 		restore()
 		sess.retainOnLanded(apply)
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceErrF):
-		sess.disposeForeignSessionLocked(asm, c)
+		// As in reconcileResumedConsumers: the 10071 arm classifies the record it is
+		// about to concede to, instead of asserting a takeover from the CAS failure
+		// alone. No restore() on either disposing arm — the session is being evicted,
+		// so putting the pre-grant terms back would only mutate an object nobody reads.
+		sess.disposeForeignSessionLocked(asm, c, sess.disposalForDirectRejection(&detail))
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
-		switch sess.resolveContendedRecordSave(&detail) {
+		switch v := sess.resolveContendedRecordSave(&detail); v {
 		case mqttRepairSaveLanded:
 			return nil
 		case mqttRepairSaveUnresolved:
 			restore()
 			sess.retainOnLanded(apply)
-		case mqttRepairSaveForeign:
-			sess.disposeForeignSessionLocked(asm, c)
+		case mqttRepairSaveForeign, mqttRepairSaveForked:
+			sess.disposeForeignSessionLocked(asm, c, mqttDisposalForRepairSave(v))
 		default:
 			restore()
 		}

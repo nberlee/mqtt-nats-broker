@@ -1219,6 +1219,14 @@ type mqttSession struct {
 	// legacy record written before generations existed: keep the old names. See
 	// sess_incarnation.go.
 	gen string
+	// wid / pwid are the identity of the record write this broker was last
+	// ACKNOWLEDGED for, and that record's own parent. Every save stamps a fresh wid
+	// with pwid set to this one, so the durable chain is a parent pointer and two
+	// writes off one base are recognisable as siblings. Adopted wherever seq is —
+	// a confirmed save, an ambiguity resolved landed, a repair save proven durable —
+	// because a lineage that lags the sequence would parent the next write to a
+	// record that is no longer the base. See sess_fork_lineage.go.
+	wid, pwid string
 	// regClaim is this session OBJECT's ownership identity for shared-delivery
 	// in-flight registers. Unlike gen it is deliberately not persisted: a resume on
 	// another broker constructs a new object and therefore takes a new claim, while a
@@ -1466,6 +1474,22 @@ type mqttPersistedSession struct {
 	// using those names, so the two do not see each other's PUBRELs — the same
 	// mixed-version rule as Q2AffGen. See sess_incarnation.go.
 	Gen string `json:"gen,omitempty"`
+	// WID is this record write's own identity, minted once per write; PWID is the
+	// WID of the record the write was derived from (empty only for a first create).
+	// The pair is a PARENT POINTER, and it exists because a per-subject CAS is a
+	// linearization point only WITHIN a leader term: across a transition the
+	// pre-proposal check runs against stale applied state with the in-process map
+	// cleared, so two writes derived from ONE base can both apply and the later
+	// discards the earlier under MaxMsgsPer:1. Two records carrying the same PWID
+	// are therefore SIBLINGS of one base, and a survivor that is provably our
+	// sibling is not evidence that anybody took the session over.
+	//
+	// RECOGNITION ONLY: nothing repairs the erased write, and an absent WID simply
+	// concedes exactly as every record written before this field did. An older
+	// broker ignores both fields and drops them on its next write, which limits
+	// detection rather than disabling it. See sess_fork_lineage.go.
+	WID  string `json:"wid,omitempty"`
+	PWID string `json:"pwid,omitempty"`
 	// Drains are the consumers that survived an UNSUBSCRIBE because deliveries they
 	// had already STARTED must still be completed ([MQTT-3.10.4-3]). Keyed by the
 	// same sid as Cons, so a "foo/#" filter's level-up companion drains
@@ -5338,7 +5362,7 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 
 	// Build a transient session from the record — enough state for clear() to
 	// delete the consumers and the record itself — and clean up.
-	sess := mqttSessionCreate(&as.jsa, ps.ID, idHash, ps.Gen, seq, s.getOpts())
+	sess := mqttSessionCreate(&as.jsa, ps.ID, idHash, ps.Gen, seq, ps.WID, ps.PWID, s.getOpts())
 	sess.asm = as
 	sess.domainTk = as.domainTk
 	sess.clean = ps.Clean
@@ -5422,6 +5446,11 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 				continue
 			}
 			ps.DisconnectedAt = time.Now().Unix()
+			// A raw record write, so it carries a lineage like any other. ps was
+			// decoded from the loaded record, so its CURRENT WID is this write's
+			// parent — set PWID from it BEFORE minting the new one, or the write
+			// parents itself. See sess_fork_lineage.go.
+			ps.PWID, ps.WID = ps.WID, mqttNewRecordWID()
 			if err := as.storeSessionRecordCAS(ps, idHash, smsg.Sequence); err != nil {
 				continue
 			}
@@ -7846,7 +7875,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		}
 		// Message not found, so reate the session...
 		// Create a session and indicate that this session did not exist.
-		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, opts)
+		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
 		return sess, false, nil
@@ -7880,7 +7909,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		if err := as.finishAdoptedTeardown(ps, hash, smsg.Sequence, opts); err != nil {
 			return nil, false, fmt.Errorf("finishing the claimed teardown of session %q: %w", clientID, err)
 		}
-		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, opts)
+		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
 		return sess, false, nil
@@ -7890,7 +7919,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	// startup sweep to it: discard its state and start fresh. Spec5 [3.1.2.11.2].
 	if ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
 		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval) {
-		sess := mqttSessionCreate(jsa, clientID, hash, ps.Gen, smsg.Sequence, opts)
+		sess := mqttSessionCreate(jsa, clientID, hash, ps.Gen, smsg.Sequence, ps.WID, ps.PWID, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
 		sess.cons = ps.Cons
@@ -7922,7 +7951,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	// thing. The incarnation generation comes from the record and is PRESERVED: a
 	// resumed session must still find its own PUBRELs and QoS 2 holds, which are
 	// named after it. Only a discard re-mints (clear()).
-	sess := mqttSessionCreate(jsa, clientID, hash, ps.Gen, smsg.Sequence, opts)
+	sess := mqttSessionCreate(jsa, clientID, hash, ps.Gen, smsg.Sequence, ps.WID, ps.PWID, opts)
 	sess.asm = as
 	sess.domainTk = as.domainTk
 	sess.clean = ps.Clean
@@ -8063,7 +8092,14 @@ func mqttReceiveMax(opts *Options) uint16 {
 // restore. It is never empty — a record carrying no generation is rejected by
 // mqttSessGenFromRecord rather than resumed on hash-only names. See
 // sess_incarnation.go.
-func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, opts *Options) *mqttSession {
+//
+// wid / pwid are the restored record's lineage, adopted ALONGSIDE seq for the same
+// reason seq is: the first save after this restore parents itself to the record it
+// was derived from, and a restore that dropped the pair would stamp an empty parent
+// — making every sibling of the restored base unprovable, so detection would be inert
+// after any restart. Both empty for a session that did not exist, and for a record
+// written before this field. See sess_fork_lineage.go.
+func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, wid, pwid string, opts *Options) *mqttSession {
 	maxp := opts.MQTT.MaxAckPending
 	if maxp == 0 {
 		maxp = mqttDefaultMaxAckPending
@@ -8074,6 +8110,8 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, opts *O
 		id:       id,
 		idHash:   idHash,
 		seq:      seq,
+		wid:      wid,
+		pwid:     pwid,
 		maxp:     maxp,
 		regClaim: mqttNewInflightNonce(),
 	}
@@ -8206,6 +8244,14 @@ type mqttSessSaveDetail struct {
 	domainTk string
 	cidHash  string
 	rawErr   error // the store-boundary error, type preserved; nil on success
+	// wid / pwid are the LINEAGE these bytes carry: this write's own minted identity
+	// and the record it was derived from. Carried on the detail because everything
+	// that later proves or classifies this attempt holds only the detail — the three
+	// markWriteUncertainLocked calls and resolveContendedRecordSave's landed arms —
+	// so without it there is nothing for them to adopt, and the next save would parent
+	// itself to whatever memory holds instead of to the record that actually landed.
+	// See sess_fork_lineage.go.
+	wid, pwid string
 	// voidedRegsRev is the void-register revision these bytes MARSHALLED, so a
 	// caller that proves them durable outside saveWithDetail's own success arm —
 	// resolveContendedRecordSave classifies a 10164-rejected write landed by an
@@ -8266,6 +8312,12 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 		return detail, fmt.Errorf("refusing to persist session %q: an earlier record write is unresolved", sess.id)
 	}
 	ps := sess.buildPersistedSessionLocked()
+	// Stamp the lineage HERE, at the store boundary, never in the builder: the builder
+	// is also clear()'s pre-teardown snapshot, so minting there would write a parent
+	// pointer naming a record that was never stored. This write's parent is the record
+	// we were last acknowledged for, which sess.mu makes stable across the two
+	// statements. See sess_fork_lineage.go.
+	ps.WID, ps.PWID = mqttNewRecordWID(), sess.wid
 	// body is what a readback returns (the CAS header below is a message header,
 	// not part of the stored data), so it is what an ambiguous write is identified
 	// by.
@@ -8274,6 +8326,7 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 
 	domainTk, cidHash := sess.domainTk, sess.idHash
 	seq := sess.seq
+	wid, pwid := ps.WID, ps.PWID
 	// The void-register revision this write MARSHALLS, sampled in the same critical
 	// section as the marshal, which is what makes it exact: the record above carries
 	// every nonce recorded at or before it and none recorded after, so whoever later
@@ -8287,6 +8340,7 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	detail = mqttSessSaveDetail{
 		baseSeq: seq, body: body, framed: b, hdr: hdr,
 		domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
+		wid: wid, pwid: pwid,
 	}
 
 	resp, err := sess.jsa.storeSessionMsg(domainTk, cidHash, hdr, b)
@@ -8313,13 +8367,17 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 			// ambiguity means RE-SENDING them: a re-marshal of whatever memory holds
 			// later could not carry the digest a readback compares against. See
 			// mqttPendingWrite.
-			sess.markWriteUncertainLocked(seq, body, b, hdr, voidedRev)
+			sess.markWriteUncertainLocked(seq, body, b, hdr, voidedRev, wid, pwid)
 		}
 		sess.mu.Unlock()
 		return detail, fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
 	}
 	sess.mu.Lock()
 	sess.seq = resp.Sequence
+	// The lineage is adopted with the sequence, in the same critical section, because a
+	// pair that lagged the sequence would parent the NEXT write to a record that is no
+	// longer the base — and every sibling of the real base would then be unprovable.
+	sess.wid, sess.pwid = wid, pwid
 	// A CONFIRMED write is the durability boundary for everything it marshalled, so the
 	// void-register verdicts it carried are credited HERE rather than by whichever caller
 	// happened to want them recorded. Crediting only at the paths that set out to persist
@@ -8481,6 +8539,13 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// under a generation nothing here can name. See sess_incarnation.go.
 	retiringGen := sess.gen
 	seq := sess.seq
+	// The identity of the record the teardown marker will be derived from, captured
+	// BEFORE the reset below for the same reason retiringGen and seq are. It is
+	// threaded to claimTeardown explicitly rather than read off the snapshot: the
+	// snapshot comes from buildPersistedSessionLocked, which deliberately mints no
+	// lineage, so deriving the parent there would stamp an empty one. See
+	// sess_fork_lineage.go.
+	retiringWID := sess.wid
 	// The record as it stands, captured BEFORE the reset below: the teardown marker
 	// preserves it so any broker can finish this teardown, and so the orphan sweep
 	// keeps reading the durables it names as referenced.
@@ -8590,6 +8655,10 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// leaves the exposed hash-only naming. See sess_incarnation.go.
 	sess.setIncarnationLocked(mqttNewSessGen())
 	sess.seq = 0
+	// The lineage goes with the sequence: the retiring record is being deleted, so a
+	// parent pointer at it would make a reused object's first write claim descent from
+	// a record that no longer exists. Zeroed AFTER retiringWID was captured above.
+	sess.wid, sess.pwid = _EMPTY_, _EMPTY_
 	sess.tmaxack = 0
 	// Discarded session: reset the PI counter too so a reused session object
 	// does not inherit the previous session's identifiers. Spec [MQTT-3.1.2-6].
@@ -8618,7 +8687,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// broker is entitled to do. An indeterminate claim is different and does fail,
 	// so the caller (a clean-start CONNECT, say) fails closed rather than proceeding
 	// as though a teardown had run. See sess_teardown.go.
-	markerSeq, nonce, claim, err := sess.claimTeardown(tok, &ps, seq)
+	markerSeq, nonce, claim, err := sess.claimTeardown(tok, &ps, seq, retiringWID)
 	switch claim {
 	case mqttTeardownClaimWon:
 	case mqttTeardownClaimSuperseded:
@@ -10109,9 +10178,14 @@ CHECK:
 	// in sessLocked, which is what excludes the retry pass. See sess_uncertain.go.
 	if exists && es.isSeqUncertain() {
 		switch s.resolveUncertainSession(asm, es) {
-		case mqttUncertainForeign:
-			// Another owner is authoritative and the local copy has been evicted;
-			// rebuild from the record and take over normally.
+		case mqttUncertainForeign, mqttUncertainForked:
+			// Another owner is authoritative — or, on the forked arm, a record exists
+			// that nothing established an owner for — and the local copy has been
+			// evicted either way. Rebuild from the record and take over normally: the
+			// surviving record is what the session's durable state IS, whoever wrote
+			// it, and this CONNECT is a legitimate new claim on it. Named explicitly
+			// rather than left to the default, which means "ours" and would bind a
+			// stale object whose CAS base is no longer the record's.
 			es, exists, err = asm.createOrRestoreSession(cid, s.getOpts())
 			if err != nil {
 				if err == errMQTTSessionCollision {
@@ -10850,6 +10924,13 @@ func (c *client) mqttMakeConnAckV5Frame(rc, sp byte, reasonStr string) []byte {
 // over by a new connection with the same client ID. Spec5 [3.1.4].
 const mqttReasonStrSessionTakenOver = "session taken over by a new connection"
 
+// Reason String sent with the 0x89 DISCONNECT to a client whose session record was
+// found to have FORKED — a record write derived from the same base as ours survived,
+// so our own was erased without anything establishing another owner. Deliberately not
+// mqttReasonStrSessionTakenOver: pairing that text with 0x89 would make exactly the
+// claim the fork verdict exists to withhold. See sess_fork_lineage.go.
+const mqttReasonStrOwnershipUnsettled = "session ownership could not be established; try again"
+
 // Reason String sent with the DISCONNECT to every connected client when the
 // broker is draining connections for shutdown. Spec5 [3.14.2.1].
 const mqttReasonStrServerShuttingDown = "server shutting down"
@@ -11012,8 +11093,18 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 // reentrant.
 //
 // No lock held on entry.
-func (c *client) mqttNotifyTakenOver() {
-	pkt := c.mqttBuildDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
+func (c *client) mqttNotifyTakenOver() { c.mqttNotifyDisplaced(mqttDisposalTakenOver) }
+
+// mqttNotifyDisplaced is mqttNotifyTakenOver's body, with WHAT is reported passed in.
+//
+// The vocabulary travels as one value because it is one claim made four ways: a caller
+// that could pass a reason code alone would emit 0x89 "server busy" alongside "session
+// taken over by a new connection", which is exactly the assertion a fork verdict exists
+// to withhold. Both gates, the DISCONNECT claim and the 3.1.1 no-op are inherited
+// unchanged — they belong to the displacement, not to its reason. See
+// sess_fork_lineage.go.
+func (c *client) mqttNotifyDisplaced(voc mqttDisposalVocabulary) {
+	pkt := c.mqttBuildDisconnect(voc.reason, voc.reasonStr)
 	if pkt == nil {
 		return
 	}

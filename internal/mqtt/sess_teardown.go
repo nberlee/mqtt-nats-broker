@@ -148,7 +148,7 @@ func (c mqttTeardownClaim) String() string {
 // ps must be the record content as it stands, so the marker preserves it: any
 // broker must be able to finish this teardown, and the orphan sweep must keep
 // reading the durables it names as referenced.
-func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, seq uint64) (markerSeq uint64, nonce string, outcome mqttTeardownClaim, err error) {
+func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, seq uint64, retiringWID string) (markerSeq uint64, nonce string, outcome mqttTeardownClaim, err error) {
 	// The marker IS a record write, so it needs the same authorization as any other
 	// (I8): a writer from a terminated generation must not be able to mark — and so
 	// license the deletion of — a record it no longer owns.
@@ -164,6 +164,14 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 	// is recognizable as ours on the re-read instead of looking like a peer's.
 	nonce = nuid.Next()
 	marked := *ps
+	// The marker IS a record write, so it carries a lineage like any other: a fresh
+	// identity of its own, parented to the record it was derived from. retiringWID is
+	// passed in because the snapshot arrives with no lineage — the builder mints none —
+	// so a parent derived from ps would come out empty and the marker would look like a
+	// first create. Every attempt below re-sends THESE bytes, so the identity is minted
+	// once and a write that landed with its response lost stays recognisable.
+	// See sess_fork_lineage.go.
+	marked.WID, marked.PWID = mqttNewRecordWID(), retiringWID
 	marked.Teardown = &mqttSessTeardown{
 		Origin:    sess.jsa.id,
 		Nonce:     nonce,
@@ -420,7 +428,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// A transient session, just enough to reach the JSA and the affine claim scan.
 	// Created on the RETIRING generation so every name it deletes is that
 	// incarnation's; nothing here provisions, so no re-mint is wanted.
-	sess := mqttSessionCreate(&as.jsa, ps.ID, idHash, ps.Gen, seq, opts)
+	sess := mqttSessionCreate(&as.jsa, ps.ID, idHash, ps.Gen, seq, ps.WID, ps.PWID, opts)
 	sess.asm = as
 	sess.domainTk = as.domainTk
 

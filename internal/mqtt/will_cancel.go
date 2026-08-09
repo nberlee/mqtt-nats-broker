@@ -269,6 +269,15 @@ const (
 	rollbackApplied       rollbackResult = iota // candidate is absent or an authoritative disconnected record
 	rollbackSuperseded                          // a newer connected generation is authoritative (a legitimate success)
 	rollbackIndeterminate                       // candidate still connected, or the record is unreadable
+	// rollbackForked: a newer CONNECTED record exists that is PROVABLY a sibling of the
+	// candidate — same parent, different identity — so it is no successor of it and
+	// "a legitimate newer generation" is not established. Distinguished from
+	// rollbackSuperseded because that verdict CANCELS the expiry timer, which is
+	// durable state changed on an unsupported conclusion; and from
+	// rollbackIndeterminate because nothing about the store was unavailable, so the
+	// "session store unavailable" warning would be a report of a failure that did not
+	// happen. See sess_fork_lineage.go.
+	rollbackForked
 )
 
 // rollbackAcceptedSession is the CONNECT-accept watermark-failure transaction. The
@@ -339,7 +348,19 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 	case ps.DisconnectedAt != 0:
 		result = rollbackApplied
 	case seq > candidate:
-		result = rollbackSuperseded
+		// A newer CONNECTED record. Sequence alone cannot say whether it SUCCEEDS the
+		// candidate or merely shares its parent, and the two demand opposite treatment
+		// of the expiry timer, so the lineage decides. es.wid/es.pwid are still the
+		// candidate's: the re-save above either landed (in which case DisconnectedAt is
+		// set and this arm is unreachable) or did not, and a rollback never adopts.
+		es.mu.Lock()
+		ourGen, ackWID, ackPWID := es.gen, es.wid, es.pwid
+		es.mu.Unlock()
+		if classifyRecordLineage(ps, ourGen, ackWID, ackPWID) == mqttLineageForked {
+			result = rollbackForked
+		} else {
+			result = rollbackSuperseded
+		}
 	default:
 		result = rollbackIndeterminate
 	}
@@ -373,6 +394,17 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 		as.scheduleSessionExpiryLocked(s, cidHash, remaining)
 	case result == rollbackIndeterminate:
 		// Cannot prove the record's state: preserve any existing timer conservatively.
+	case result == rollbackForked:
+		// The surviving record is no successor of the candidate, so nothing has been
+		// shown to own the deadline the existing timer is counting. Cancelling it here
+		// would disarm a session nobody demonstrated had been replaced, which is what
+		// rollbackSuperseded does and why a fork must not reach it.
+		//
+		// Preserving is not a guarantee of eventual expiry either: a sibling still
+		// reading DisconnectedAt == 0 makes loadExpiringSessionRecord report not-due
+		// when this one-shot fires, and nothing re-arms at that moment. What catches it
+		// is sweepSessionExpiries, which stamps such a record and arms from it. The
+		// residual is the DELAY and the sweep's origin gate; see docs/CONFORMANCE.md.
 	default:
 		// applied-absent / zero / never-expire, or superseded (the newer generation
 		// owns its own scheduling): cancel any stale timer.
@@ -406,6 +438,14 @@ func (as *mqttAccountSessionManager) rollbackStoreSession(es *mqttSession, tok r
 	if terr != nil {
 		return fmt.Errorf("refusing to roll back the record of session %q: %w", ps.ID, terr)
 	}
+	// The re-save is a record write, so it carries a lineage like any other: a fresh
+	// identity parented to the candidate record it rolls back. Stamped BEFORE the test
+	// seam, so a test observing the store sees the bytes production would store. The
+	// session is removed by the caller and never adopts this pair. See
+	// sess_fork_lineage.go.
+	es.mu.Lock()
+	ps.WID, ps.PWID = mqttNewRecordWID(), es.wid
+	es.mu.Unlock()
 	as.mu.RLock()
 	hook := as.testRollbackSessionStore
 	as.mu.RUnlock()

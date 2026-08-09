@@ -589,7 +589,7 @@ func TestClassifyAttemptReadbackShapes(t *testing.T) {
 		{"no error and no message", nil, nil, mqttAttemptUnreadable, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, seq := classifyAttemptReadback(tc.smsg, tc.lerr, pw)
+			got, seq := classifyAttemptReadback(tc.smsg, tc.lerr, pw, _EMPTY_, _EMPTY_, _EMPTY_)
 			if got != tc.want || seq != tc.seq {
 				t.Fatalf("classifyAttemptReadback = (%v, %d), want (%v, %d)", got, seq, tc.want, tc.seq)
 			}
@@ -600,7 +600,7 @@ func TestClassifyAttemptReadbackShapes(t *testing.T) {
 	// unconditional create carries no CAS header, so there is nothing to arbitrate
 	// with and the re-attempt arm must never be reached.
 	zero := &mqttPendingWrite{baseSeq: 0, digest: mqttRecordDigest(body)}
-	if got, _ := classifyAttemptReadback(nil, ApiErrors[JSNoMessageFoundErr], zero); got != mqttAttemptForeign {
+	if got, _ := classifyAttemptReadback(nil, ApiErrors[JSNoMessageFoundErr], zero, _EMPTY_, _EMPTY_, _EMPTY_); got != mqttAttemptForeign {
 		t.Fatalf("classifyAttemptReadback(gone, base 0) = %v, want foreign", got)
 	}
 

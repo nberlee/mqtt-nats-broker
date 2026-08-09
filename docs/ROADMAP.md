@@ -1460,28 +1460,102 @@ is fixed before feature work continues.
   that is the broker's lifetime. Plus one more arbitrating CAS site on the same-base
   leader-transition exception's exposure surface.
 
-- [ ] A per-subject CAS is a linearization point only WITHIN a leader term, so a
-  surviving unapplied proposal can be overwritten across an election — every arbitration
-  in this broker rests on the contract that breaks. JetStream checks
-  `Nats-Expected-Last-Subject-Sequence` BEFORE proposing and never again at apply
-  (`canConsistencyCheck := !isClustered`, nats-server v2.14.4 `server/stream.go:6247`),
-  and a leader transition clears `expectedPerSubjectInProcess`
-  (`jetstream_cluster.go:4720`) while a replicated proposal can survive it. A new leader
-  can therefore admit a second same-base write and apply BOTH, in log order. When the two
-  carry the same bytes this is benign (`MaxMsgsPer: 1` discards the earlier, and the later
-  sequence is the one adopted — see the ambiguous-write settlement). When they do not, the
-  write that applies LAST wins regardless of who owned the session: a remote broker's
-  accepted takeover can be erased by this broker's re-attempt, probe or ordinary save,
-  after which the persist observation evicts the rightful owner's client. This is NOT
-  specific to the uncertainty resolver — the definite-rejection probe's re-attempt of
-  current memory and the repair retry's exact-byte re-send have the identical exposure —
-  which is why it is filed rather than folded into any one of them. The fix has to be an
-  arbitration identity that survives an election (a generation or owner token carried IN
-  the record and checked by the writer, so a late apply is recognisable as stale) applied
-  across every writer, plus a way to test it: staging an accepted-but-unapplied entry
-  through a leader transition is beyond the current cluster harness. Stated in
-  `docs/CONFORMANCE.md` under the ambiguous-write settlement. Found by holistic round 5 of
-  the ambiguous-write settlement.
+- [x] A per-subject CAS is a linearization point only WITHIN a leader term, so a
+  surviving unapplied proposal can be overwritten across an election. DONE for `$MQTT_sess`
+  as RECOGNITION, not arbitration, and not across every writer — read the residuals before
+  treating this as closed. JetStream checks `Nats-Expected-Last-Subject-Sequence` BEFORE
+  proposing and never again at apply (`canConsistencyCheck := !isClustered`, nats-server
+  v2.14.4 `server/stream.go:6247`), and a leader transition clears
+  `expectedPerSubjectInProcess` (`jetstream_cluster.go:4720`) while a replicated proposal
+  can survive it, so a new leader can admit a second same-base write and apply BOTH in log
+  order. PREVENTING that is out of reach here: production NATS is external
+  (`internal/backend/backend.go`), and the only apply-time-rechecked precondition
+  (`Nats-Expected-Last-Msg-Id`) compares a stream-wide value and cannot serialize one
+  client ID's subject.
+
+  What landed instead is the identity the bullet asked for — "a generation or owner token
+  carried IN the record and checked by the writer, so a late apply is recognisable as
+  stale" — as a PARENT POINTER (`WID`/`PWID`) on every `$MQTT_sess` record. Two writes
+  carrying the same `PWID` are siblings of one base, so a survivor that is provably our
+  sibling is no successor of ours, and the broker stops answering it with 0x8E "session
+  taken over" — which tells a client to stop reconnecting — and answers 0x89 "server busy,
+  try again later" instead. Consulted on the four paths that had already concluded foreign
+  (definite rejection bound and unbound, the ambiguity resolver, the two CONNECT-time
+  classified saves), plus the CONNECT rollback readback, whose sequence-only supersession
+  cancelled the expiry timer on the same unsupported conclusion. `sess_fork_lineage.go`;
+  `docs/ARCHITECTURE.md`, "Recognising a forked session record".
+
+  NOT closed by it, and each filed below: the persist-observation route (the one that
+  causes this most often) still evicts with 0x8E and cannot classify at all; no durable
+  state is repaired; the other five arbitrated streams have no lineage; and the Raft window
+  itself is still not reproduced by any test — what the tests stage is the durable outcome.
+  Full list in `docs/CONFORMANCE.md`, "A forked session record is RECOGNISED, and nothing
+  more". Found by holistic round 5 of the ambiguous-write settlement.
+
+- [ ] `processSessionPersist` evicts the rightful client on a remote PubAck it cannot
+  classify, and it is the PRIMARY route by which a forked record becomes client-visible
+  damage. A remote sibling's persist at a higher sequence evicts synchronously with 0x8E,
+  **cancels the displaced incarnation's Will outbox** (so a spurious eviction suppresses a
+  Will) and **cancels the session-expiry timer** — directly for a resident session, and
+  through `reconcileRemoteSessionExpiry` when none is resident. The parent-pointer
+  recognition above cannot reach it: a `JSPubAckResponse` carries stream, sequence and
+  domain, no record. Closing it needs the observation to fetch and classify the record
+  before acting, which turns an at-most-once notification handler into a JetStream reader
+  on the eviction path — with its own ordering problem, since a remote observation can be
+  handled BEFORE the local write's PubAck has updated `sess.wid`. That last point is a
+  finding from round 2 of the recognition work and belongs in this item's brief.
+
+- [ ] A proven fork is recognised but never REPAIRED: the surviving sibling stays and the
+  rightful owner's granted state is lost. A naive repair was designed and rejected — it
+  would resurrect an incarnation a teardown had already deleted (`mqtt.go`, "A CLAIMED
+  teardown must be FINISHED, never resumed and never overwritten"), it needs a
+  last-durable byte snapshot that does not exist (`save()` discards
+  `mqttSessSaveDetail`), its worker races a same-broker reconnect with no ownership guard,
+  and the repair CAS is itself exposed to the window it repairs. Any future attempt has to
+  answer all four.
+
+- [ ] The ambiguity path's foreign disposition consumes the parked deferred disconnect
+  (`disposeForeignStateLocked` calls `takeDeferredDisconnect`), which can drop the only
+  copy of a Will and an original expiry deadline; and it clears `pendingWrite` and the
+  uncertainty flag without clearing the retained `uncertainLanded` continuations, which
+  stay reachable through a live `c.mqtt.sess` pointer after an off-readLoop disposal. Both
+  are PRE-EXISTING on the foreign path — the forked verdict merely reaches them more often
+  — and both were deliberately left alone by the recognition work rather than folded in.
+
+- [ ] Takeover versus takeover at one base is unordered, and the recognition above only
+  makes both sides WITHHOLD the claim where the persist observation is absent or lost. In
+  the general case that untouched route still picks a side. Converging the two brokers on
+  one owner needs the arbitration this item's parent bullet could not provide.
+
+- [ ] `$MQTT_willq` carries no write lineage, so a create-only enqueue erased by a
+  same-base sibling across a leader transition is unrecognisable. The Will it named is
+  then either lost outright — nothing re-enqueues it, and the enqueuing incarnation has
+  moved on — or, if the surviving sibling holds an earlier state, re-fired after `done`
+  was supposed to have retired it. The record shape and the classifier from
+  `sess_fork_lineage.go` are reusable; this stream's CONSEQUENCE analysis is not.
+
+- [ ] `$MQTT_willcancel` carries no write lineage. Its per-client watermark is monotonic
+  by design, so a surviving sibling that holds a LOWER `SessionSeq` silently un-suppresses
+  a Will an accepted CONNECT had already cancelled — the one failure this stream exists to
+  prevent. Worse than the others because the marker is permanent: nothing deletes it, so
+  the lowered value stands until the next accepted CONNECT advances it again.
+
+- [ ] `$MQTT_qos2in` carries no write lineage, on both its hold subjects and their `.rel`
+  siblings. A hold claim erased mid-exchange lets a second broker claim the same inbound
+  QoS 2 message, which is the duplicate delivery [MQTT-4.3.3] forbids; a `.rel` claim
+  erased between PUBREL and fan-out loses the release, stalling the exchange until the
+  orphan sweep reaps it. The two subject families have different consequences and need
+  naming separately even though one bullet covers the stream.
+
+- [ ] `$MQTT_qos2assign` carries no write lineage. An affine claim erased by a sibling
+  leaves contenders waiting on a `claimed` record whose owner never materialises, which
+  stalls the shared-group delivery of that message indefinitely — the same stall the
+  generation-scoped naming was introduced to make impossible.
+
+- [ ] `$MQTT_inflight` carries no write lineage. A register erased by a sibling frees a
+  packet identifier that is still in flight (so a later delivery can collide with it) or,
+  in the other direction, leaves a register whose deletion was proven, reserving an
+  identifier and a Receive Maximum slot for the life of the session.
 
 - [ ] Every server-initiated COURTESY DISCONNECT write is unbounded, and one of them is
   performed with the ownership gate held. `mqttEnqueueDisconnect` → `queueOutbound` →

@@ -709,9 +709,11 @@ it does *not* promise:
   depends on"), and it fails identically for EVERY arbitrating CAS this broker makes: the
   definite-rejection probe's re-attempt of current memory, the repair retry's exact-byte
   re-send, and any ordinary save. What this change contributes is FREQUENCY, not the
-  window — the resolver now writes where it previously only read. Closing it requires an
-  arbitration identity that survives a leader transition, across every writer; filed as
-  its own §0 roadmap item rather than folded in here.
+  window — the resolver now writes where it previously only read. Closing the window is out
+  of reach (production NATS is external, and the only apply-time-rechecked precondition
+  compares a stream-wide value), so what `$MQTT_sess` carries instead is a **parent
+  pointer** that makes the outcome recognisable. See the next section for exactly how much
+  that buys.
 - **A leader transition can let BOTH of this broker's proposals commit, and that is
   accepted rather than prevented.** The shared CAS base ordinarily excludes the second,
   but a transition clears the in-process map while a replicated proposal survives, and a
@@ -735,6 +737,88 @@ it does *not* promise:
   in-process map while a replicated proposal can survive it, so a proposal that lands after
   such a transition can still be read as another owner's. Narrowed from "absence is a
   verdict", not closed.
+
+### A forked session record is RECOGNISED, and nothing more
+
+`$MQTT_sess` records carry `WID`/`PWID`, a parent pointer, so a survivor that is provably
+a **sibling** of the record this broker was acknowledged for stops being reported as a
+takeover: the client is told **0x89 "server busy, try again later"** instead of 0x8E, which
+invites the reconnect 0x8E forbids. Four classified paths consult it — the definite
+rejection probe (bound and unbound), the ambiguity resolver, the two CONNECT-time saves —
+plus the CONNECT rollback readback. See `docs/ARCHITECTURE.md`, "Recognising a forked
+session record".
+
+What it does NOT do:
+
+- **The persist-observation route is untouched, and it is the route that causes this most
+  often.** A remote sibling's PubAck at a higher sequence still evicts the rightful client
+  synchronously, still sends 0x8E, still **cancels the displaced incarnation's Will
+  outbox** — so a spurious eviction can suppress a Will — and still **cancels the
+  session-expiry timer**, directly for a resident session and through
+  `reconcileRemoteSessionExpiry` when none is resident. That last one bounds what the
+  rollback path's preserved timer is worth: observing the sibling's PubAck cancels it
+  anyway. The route cannot classify inline at all, because a `JSPubAckResponse` carries
+  stream, sequence and domain — no record. Filed as its own §0 item.
+- **No durable state is repaired.** The forked record stays and the rightful owner's
+  granted state is still lost. A repair was designed and rejected: it would resurrect an
+  incarnation a teardown had already deleted, it needs a last-durable byte snapshot that
+  does not exist, and the repair CAS is itself exposed to the window it repairs.
+- **The verdict does not prove the survivor erased us.** A teardown claim is a full-body
+  CAS off the same base, so a sibling can merely have become current after `clear()`
+  deleted our record. What is proven is only that the survivor is no successor of ours.
+- **The withheld verdict can publish a Will a genuine takeover would have suppressed**, on
+  the definite-rejection bound path: the foreign settlement calls
+  `mqttDiscardWillOnTakeover` before disposing, while the 0x89 route runs ordinary close
+  bookkeeping, which marks the Will owed and publishes it. This is what
+  `errMQTTSessionOwnershipUnsettled` has always done — it is the "nothing arbitrated this"
+  path — but the forked verdict reaches it more often.
+- **The ambiguity path's treatment is unchanged in every other respect**, including that
+  `disposeForeignStateLocked` consumes the parked deferred disconnect, which can drop the
+  only copy of a Will and an original expiry deadline, and that retained `uncertainLanded`
+  continuations are not cleared. Both are PRE-EXISTING behavior on the foreign path, not
+  regressions from this item — the forked verdict reaches the disposition it would have
+  reached anyway — and both are filed separately.
+- **A preserved rollback timer can miss its record once, and the sweep is what catches
+  it.** When the timer a forked rollback leaves armed fires, a surviving sibling that is
+  still `DisconnectedAt == 0` makes `loadExpiringSessionRecord` report not-due, the one-shot
+  entry is consumed, and nothing re-arms *at that moment*. It is not stranded: the periodic
+  `sweepSessionExpiries` (15 minutes) stamps any finite-expiry record that claims a
+  connected client with no resident session and arms a timer from it. The residual is the
+  DELAY — up to one sweep interval plus the expiry — and the sweep's own origin gate, which
+  in a cluster leaves such a record to the broker named in `Origin`, so a record written by
+  a broker that is now down waits for it to return. Preserving the timer is nonetheless
+  strictly better than the `rollbackSuperseded` behavior it replaces, which CANCELS it.
+- **The bound 0x89 close leaves the session resident with its marker armed.** For a
+  never-expiring session the object survives the close and the state terminates after one
+  failed pre-CONNACK reconnect (whose accept save CASes against the forked record and is
+  rejected, evicting the object), or sooner if the periodic unbound settlement runs first.
+  That reconnect is silent: `c.mqtt.sess` is not assigned until after the accept save.
+- **The one-hop limit is reached by ordinary operation**, not only by exotic histories.
+  Once a landed save advances the acknowledged pair from `{a,p}` to `{c,a}`, a delayed
+  sibling `{b,p}` of the PREVIOUS acknowledged record classifies as unrelated and concedes
+  — which is precisely the fork this mechanism is about, missed because the base moved
+  first.
+- **Detection is LIMITED by lineage-dropping writers, not disabled by them.** An upgraded
+  writer that reads an unstamped record still writes a fresh `WID`, so siblings formed from
+  that stamped base are detectable. What concedes is a fork *involving* an old writer, or
+  one based on a record whose lineage an old writer dropped, until an upgraded write
+  establishes a new base.
+- **Takeover versus takeover at one base stays unordered**, and "both sides withhold the
+  claim" holds only where the persist observation is absent or lost; in the general case
+  that untouched route still picks a side and evicts it with 0x8E before either classifier
+  runs.
+- **The other five arbitrated streams have no lineage at all** — `$MQTT_willq`,
+  `$MQTT_willcancel`, `$MQTT_qos2in` (both its hold subjects and their `.rel` siblings),
+  `$MQTT_qos2assign` and `$MQTT_inflight` — so the same leader-transition overwrite is
+  unrecognisable on each, with a different consequence per stream. One independently
+  checkable roadmap bullet each, naming that consequence.
+- **The Raft window itself is not reproduced by any test.** What the tests stage is the
+  DURABLE OUTCOME — two records off one parent, the later surviving under
+  `MaxMsgsPer: 1` — with an unconditional store. Not reproduced: pre-proposal
+  admission against stale applied state, the cleared in-process map, two success
+  PubAcks to distinct brokers, and a second election. The replicated-JetStream tests
+  pin that the pair survives Raft, a broker handoff and a node restart, which is a
+  different claim and is stated as one.
 
 ### A definite record-CAS rejection is settled by a probe, with bounded convergence
 

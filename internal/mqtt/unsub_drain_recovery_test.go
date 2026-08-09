@@ -1607,7 +1607,7 @@ func TestForeignDispositionIsOwnershipGated(t *testing.T) {
 	sess.mu.Lock()
 	sess.c = c
 	sess.mu.Unlock()
-	sess.disposeForeignSession(c)
+	sess.disposeForeignSession(c, mqttDisposalTakenOver)
 
 	// The replacement must be untouched: the stale disposition may only remove
 	// itself.
@@ -1719,7 +1719,7 @@ func TestForeignDispositionRefusesWhileTheGateIsHeld(t *testing.T) {
 	asm.sessLocked[sess.id] = struct{}{}
 	asm.mu.Unlock()
 
-	sess.disposeForeignSession(c)
+	sess.disposeForeignSession(c, mqttDisposalTakenOver)
 
 	sess.mu.Lock()
 	bound := sess.c
@@ -1780,7 +1780,7 @@ func TestForeignDispositionSparesARenboundClient(t *testing.T) {
 	sess.c = newClient
 	sess.mu.Unlock()
 
-	sess.disposeForeignSession(oldClient)
+	sess.disposeForeignSession(oldClient, mqttDisposalTakenOver)
 
 	sess.mu.Lock()
 	bound := sess.c
@@ -1841,7 +1841,7 @@ func TestStaleDispositionSparesAReplacementExpiryTimer(t *testing.T) {
 	sess.mu.Lock()
 	sess.c = c
 	sess.mu.Unlock()
-	sess.disposeForeignSession(c)
+	sess.disposeForeignSession(c, mqttDisposalTakenOver)
 
 	asm.mu.RLock()
 	_, timerLives := asm.pendingExpiries[replacement.idHash]

@@ -1090,30 +1090,34 @@ func TestMQTTRejectedRecordNoBackstopUnlessOurs(t *testing.T) {
 // that never reached the store comes back with a ZERO-VALUED detail, and classifying its
 // readback would compare a real record against base sequence 0 and call every session
 // foreign.
+//
+// The acknowledged lineage pair is empty throughout: these fixtures are about the CAS
+// guard, and an empty pair concedes at every arm, so the verdicts here are the
+// pre-lineage ones by construction. The lineage rule has its own tests.
 func TestMQTTRejectedProbeClassifierRefusal(t *testing.T) {
 	record := &StoredMsg{Sequence: 42}
 	refused := mqttSessSaveDetail{} // the shape an entry refusal returns
-	if v := classifyRejectedProbe(saveDefinitelyFailed, refused, record, nil); v != mqttRejectionKeep {
+	if v := classifyRejectedProbe(saveDefinitelyFailed, refused, record, nil, _EMPTY_, _EMPTY_, _EMPTY_); v != mqttRejectionKeep {
 		t.Fatalf("a REFUSED save is not a rejected CAS: got verdict %v, want keep", v)
 	}
 	// A non-CAS store error is the same fact by another route.
 	other := mqttSessSaveDetail{baseSeq: 41, rawErr: errors.New("test: store unavailable")}
-	if v := classifyRejectedProbe(saveDefinitelyFailed, other, record, nil); v != mqttRejectionKeep {
+	if v := classifyRejectedProbe(saveDefinitelyFailed, other, record, nil, _EMPTY_, _EMPTY_, _EMPTY_); v != mqttRejectionKeep {
 		t.Fatalf("a non-CAS failure carries no readback verdict: got %v, want keep", v)
 	}
 	// And a real CAS rejection does consult the readback, which is what makes the guard
 	// a guard rather than a blanket refusal.
 	rejected := mqttSessSaveDetail{baseSeq: 41, rawErr: ApiErrors[JSStreamWrongLastSequenceConstantErr]}
-	if v := classifyRejectedProbe(saveDefinitelyFailed, rejected, record, nil); v != mqttRejectionForeign {
+	if v := classifyRejectedProbe(saveDefinitelyFailed, rejected, record, nil, _EMPTY_, _EMPTY_, _EMPTY_); v != mqttRejectionForeign {
 		t.Fatalf("a CAS-rejected probe with a moved record is foreign: got %v", v)
 	}
 	atBase := mqttSessSaveDetail{baseSeq: 42, rawErr: ApiErrors[JSStreamWrongLastSequenceConstantErr]}
-	if v := classifyRejectedProbe(saveDefinitelyFailed, atBase, record, nil); v != mqttRejectionKeep {
+	if v := classifyRejectedProbe(saveDefinitelyFailed, atBase, record, nil, _EMPTY_, _EMPTY_, _EMPTY_); v != mqttRejectionKeep {
 		t.Fatalf("contention is never ownership: got %v, want keep", v)
 	}
 	unreadable := mqttSessSaveDetail{baseSeq: 41, rawErr: ApiErrors[JSStreamWrongLastSequenceConstantErr]}
 	if v := classifyRejectedProbe(saveDefinitelyFailed, unreadable, nil,
-		errors.New("test: unreadable")); v != mqttRejectionKeep {
+		errors.New("test: unreadable"), _EMPTY_, _EMPTY_, _EMPTY_); v != mqttRejectionKeep {
 		t.Fatalf("an unreadable readback arbitrates nothing: got %v, want keep", v)
 	}
 }
@@ -2177,7 +2181,7 @@ func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
 		if !applied || stale != b.bc {
 			t.Fatalf("the fixture must stage the eviction's own state: applied=%v stale=%p", applied, stale)
 		}
-		stale.mqttNotifyForeignDisposal(e.sess.id)
+		stale.mqttNotifyForeignDisposal(e.sess.id, mqttDisposalTakenOver)
 		if !b.sawDisconnect(t, mqttReasonSessionTakenOver) {
 			t.Fatalf("the staged eviction must have written 0x8E: wire %x", b.out.bytes())
 		}

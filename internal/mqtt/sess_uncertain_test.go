@@ -30,7 +30,12 @@ func testMarkUncertainLocked(sess *mqttSession, baseSeq uint64, body []byte) {
 // carry, and a resolution proving them durable credits exactly it.
 func testMarkUncertainCarrying(sess *mqttSession, baseSeq uint64, body []byte, voidedRev uint64) {
 	framed, hdr := mqttFrameRecordWrite(baseSeq, body)
-	sess.markWriteUncertainLocked(baseSeq, body, framed, hdr, voidedRev)
+	// The lineage comes out of the BODY, exactly as the store boundary's does: these
+	// bytes are the attempt, so the pending write must carry the identity they carry
+	// and not one invented beside them.
+	var ps mqttPersistedSession
+	_ = json.Unmarshal(body, &ps)
+	sess.markWriteUncertainLocked(baseSeq, body, framed, hdr, voidedRev, ps.WID, ps.PWID)
 }
 
 // testRecordBody returns the exact bytes a save of this session's current state

@@ -1317,7 +1317,12 @@ func (e *testDeferredEnv) testContendedAttempt(t *testing.T) mqttSessSaveDetail 
 		t.Fatalf("release the fence: %v", terr)
 	}
 	mqttTestSessStoreSuppressV.Store(false)
-	e.sess.clearUncertaintyLocked(d.baseSeq)
+	// Back to the pre-attempt state: the base sequence AND the lineage the session was
+	// acknowledged for, which a failed save never moved.
+	e.sess.mu.Lock()
+	ackWID, ackPWID := e.sess.wid, e.sess.pwid
+	e.sess.mu.Unlock()
+	e.sess.clearUncertaintyLocked(d.baseSeq, ackWID, ackPWID)
 	if d.voidedRegsRev == 0 {
 		t.Fatal("the attempt must carry the revision it marshalled")
 	}

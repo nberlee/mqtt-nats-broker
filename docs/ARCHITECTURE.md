@@ -58,7 +58,13 @@ the "no fallbacks" stance reviewable rather than implicit.
   map while a replicated proposal survives can admit a second same-base write and
   apply both. Every arbitration in this broker rests on that contract, so the
   window belongs to all of them, not to any one writer; `docs/CONFORMANCE.md`
-  states it as a residual and a roadmap item carries the fix. A rejection is reported structurally
+  states it as a residual. The window itself cannot be closed here — production
+  NATS is external, and the only apply-time-rechecked precondition
+  (`Nats-Expected-Last-Msg-Id`) compares a stream-wide value — so `$MQTT_sess`
+  carries a **parent pointer** instead, which makes the outcome *recognisable*
+  rather than preventable (see "Recognising a forked session record" below). The
+  other arbitrated streams have no such identity yet; each has its own roadmap
+  bullet. A rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
   every rejection is resolved by re-reading rather than classified directly.
@@ -122,7 +128,7 @@ per-owner:
 
 | Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
 |---|---|---|---|
-| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, rollback); no purge, no consumers | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) | `DenyPurge` (nothing purges); `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, rollback); no purge, no consumers. Every record carries `WID`/`PWID`, the write's own identity and its parent's | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) | `DenyPurge` (nothing purges); `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL` (no `Nats-TTL` header sent) |
 | `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | as `$MQTT_sess` minus the epoch; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
 | `$MQTT_willcancel` | per-client watermark CAS and reads — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources` | **`DenyDelete`/`DenyPurge`** (no operation deletes or purges — markers are permanent by design); `SubjectDeleteMarkerTTL` (no delete means no marker can ever be created); `MaxConsumers`/`ConsumerLimits` |
 | `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
@@ -387,6 +393,82 @@ construction**: a first-ever record write carries no CAS header, a found record'
 is at least 1, so an unconditional create is never classified at-base and is never
 re-attempted. Its existing classification stands, with the residual `docs/CONFORMANCE.md`
 states.
+
+### Recognising a forked session record
+
+The foreign arm above is sound about one thing and silent about another. "The subject
+moved past my base with other content" proves the record is **not ours**. It does not
+prove the record **succeeds** ours — and that second claim is the one the broker went on
+to make, evicting its own client with **0x8E "session taken over by a new connection"**,
+which instructs that client to stop reconnecting under this session.
+
+Across a leader transition the two shapes are genuinely different events. A write derived
+from the same base as ours can survive the election unapplied, apply after a second write
+the new leader admitted against that same base, and discard the earlier record under
+`MaxMsgsPer: 1`. The survivor is then a **sibling** of our record, not its successor, and
+nobody took anything over. Two brokers can reach the takeover conclusion about each other
+from that one event.
+
+A sequence cannot distinguish them, and neither can a counter: a per-write epoch is a
+branch-local Lamport counter, and a competing branch that never read our record can advance
+above us and then look like our successor. What distinguishes them is **ancestry**, so
+every `$MQTT_sess` record carries a parent pointer — `WID`, the write's own identity, and
+`PWID`, the identity of the record it was derived from. Two records carrying the same
+`PWID` are siblings of one base.
+
+**The rule** (`classifyRecordLineage`, `sess_fork_lineage.go`) is consulted at exactly one
+place in each caller — the branch that has already concluded foreign — behind that
+caller's existing `Sequence > baseSeq` gate, and it emits only **forked** or
+**not-forked**:
+
+1. a different incarnation generation → not-forked (its lineage restarts);
+2. `ackWID != "" && ackPWID != "" && found.WID != "" && found.PWID == ackPWID &&
+   found.WID != ackWID` → **forked**;
+3. anything else → not-forked, which is today's behavior exactly.
+
+Sibling-hood is defined against the **acknowledged** pair, never the in-flight attempt:
+with acknowledged `{a,p}` and attempt `{c,a}`, survivor `{b,p}` is the fork, `{d,a}` is a
+legitimate child, and `{c,a}` is our own late landing (recognised by digest before lineage
+is reached). All four conjuncts of arm 2 are load-bearing, and the last one is the least
+obvious: `storeFramedSessionMsg` replays our acknowledged bytes verbatim and a clustered
+duplicate proposal can land them at a higher sequence, so without `found.WID != ackWID`
+that replay is reported as a fork of itself.
+
+**The lineage never decides that a write landed.** `mqttAttemptOurs` and
+`mqttRepairSaveLanded` credit void-register verdicts and run landed continuations, and an
+identity match is not proof that an attempt's *bytes* are durable — the digest comparison
+remains the only thing that licenses them.
+
+**Four classified paths** consult it, and every one of them keeps the disposition it
+already had, changing only what is reported:
+
+| Path | On a proven sibling |
+|---|---|
+| definite rejection, **bound** (`sess_rejected_write.go`) | `mqttBoundUnsettled` → **0x89** and the ORDINARY close bookkeeping. Deliberately not the foreign arm's shape: that arm calls `mqttDiscardWillOnTakeover` first, and suppressing a Will on a takeover nothing demonstrated is a silent loss |
+| definite rejection, **unbound** | the same foreign disposition, with the forked vocabulary. It passes `nil` for the client, so the helper returns before the notification and *nothing observable differs*; the arm exists so the classifier has one meaning everywhere |
+| ambiguity resolution (`sess_uncertain.go`) | the same foreign disposition, verbatim — the same eviction, residency, continuation and parked-action treatment — with the forked vocabulary |
+| CONNECT-time classified saves (`reconcileResumedConsumers`, `grantRequestedLifetime`) | the same disposition, forked vocabulary. Their **10071** arms disposed with no readback at all, so they now read once and classify — the only new I/O in the mechanism, on a pre-CONNACK rejection path |
+
+A fifth site, the CONNECT rollback readback (`rollbackAcceptedSession`), classified any
+connected record above the candidate sequence as a legitimate newer generation and
+**cancelled the expiry timer** on it. A proven sibling now yields `rollbackForked`, which
+preserves the timer and emits no "session store unavailable" warning, since nothing about
+the store was unavailable.
+
+**What is reported travels as one value** (`mqttDisposalVocabulary`): reason code, Reason
+String, log line and close reason. Passing a reason code alone emits 0x89 alongside
+"session taken over by a new connection", which is precisely the claim the verdict exists
+to withhold. **0x89 "server busy, try again later"** is the point of the whole mechanism —
+it invites the reconnect that resolves the ambiguity, where 0x8E forbids it.
+
+**This detects; it never repairs.** The forked record stays, the rightful owner's granted
+state is still lost, and the verdict licenses no write of its own. It does not even prove
+the survivor erased us — a teardown claim is itself a full-body CAS off the same base — only
+that the survivor is no successor of ours. An absent `WID` concedes through arm 2's guard
+rather than through a legacy branch, so there is no alternate code path and no
+mixed-version machinery. `docs/CONFORMANCE.md` states what is left open, of which the
+largest by far is that `processSessionPersist` — the route that causes this most often —
+cannot classify at all, because a `JSPubAckResponse` carries no record.
 
 ### A definite record-CAS rejection is outstanding work
 
