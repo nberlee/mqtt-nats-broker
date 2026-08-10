@@ -1310,3 +1310,83 @@ the compatibility boundary (no released contract exists for either):
   boundary. The retained-messages setup no longer rewrites `Subjects` or
   `MaxMsgsPer` in place either — `$MQTT_rmsgs` is create-then-validate like
   every other broker-owned stream.
+
+### The retained index is not arbitrated by sequence, and a lost application is not repaired
+
+Retained state is durably arbitrated: `$MQTT_rmsgs` holds exactly one record per
+topic (`MaxMsgsPer: 1`), a write evicts the record it replaces at store time, and
+an empty body is the deletion authority. What every broker actually SERVES from is
+a volatile index — `as.retmsgs` plus the `rmsCache` copy — and that index is not
+arbitrated. Its three writers (the retained stream's per-broker ephemeral `AckNone`
+consumer callback, the publishing broker's synchronous local seed, and the
+decode-failure eviction) each apply what they observed without comparing it to what
+the index already holds.
+
+Delay and loss are different. A delayed application eventually arrives and the
+index settles on whatever it applies last. A **lost** one never arrives: the
+consumer is `AckNone`, so nothing is redelivered and no writer runs.
+
+What repairs a loss depends on whether the subject is still IN the index, and the
+two cases are not alike:
+
+- **An indexed subject is repaired at subscribe time.** Any later matching
+  SUBSCRIBE — wildcard or exact — puts the subject through
+  `loadRetainedMessages`, which reads the stream once the cached copy has
+  expired. A tombstone read there calls `removeRetainedMsg(subject, 0)` and the
+  entry goes; a replacement read there refreshes what is served. So these arms
+  are bounded by the retained cache TTL plus the next matching subscription, not
+  unbounded. The load does not call `addRetainedMsg`, so the index's stored
+  SEQUENCE is not refreshed and stays stale until a later application.
+- **An absent subject is repaired by nothing.** Serialization enumerates
+  `as.retmsgs`, so a subject missing from the index is never a candidate for a
+  wildcard, and an exact filter's forced authoritative load populates the cache
+  without making it deliverable. There is no periodic repair, so the subject
+  stays undeliverable on that broker until some later application for it happens
+  to arrive, the broker restarts and replays the stream, or the F-059
+  reconciliation exists.
+
+Filed as [F-059](findings/runtime-correctness.md#f-059); the observable residual
+is:
+
+- **An absent entry suppresses replay for wildcard AND exact filters.** A missed
+  or reordered add, or an over-eager eviction, leaves the subject out of the
+  index. `serializeRetainedMsgsForSub` matches candidate subjects against that
+  index and returns immediately when it is empty, so the exact filter's forced
+  authoritative stream load fetches the record into the cache without making it
+  deliverable. That forced load narrows only the window in which a just-published
+  record's callback lands during the SUBSCRIBE's own round trip. **This is the
+  arm with no bound**: when the add was LOST rather than delayed, a retained
+  message that exists in the stream and is served correctly by every other broker
+  is simply never replayed by this one, and no subscription repairs it.
+- **A missed or reordered replacement serves the OLD value**, to wildcard and to
+  exact subscribers alike — a lookup returns the cached record without reading the
+  stream. A *delayed old* add can actively restore a stale value over a newer one,
+  since the add overwrites the sequence and the cache entry with no comparison.
+  Bounded: once the cached copy expires, the next matching subscription reloads
+  the stream and serves the current record. The index's stored sequence is not
+  refreshed by that load and stays stale until a later application.
+- **A missed or reordered tombstone serves a deleted message**, to wildcard and
+  exact subscribers, under the same bound — the reload reads the tombstone and
+  removes the index entry, so this arm self-heals at the next matching
+  subscription after cache expiry.
+- **Two mitigations are deliberately absent.** The `RD` delete-notification
+  protocol was an additional best-effort removal path for a remote broker whose
+  tombstone delivery was lost; it was removed with the rest of the development-era
+  retained compatibility ([F-056](findings/resolved.md#f-056)). That widens the
+  tombstone arm's window — a lost tombstone now waits for cache expiry plus a
+  matching subscription rather than possibly being retired sooner by the
+  notification — without adding a failure class or making the arm unbounded. The
+  decode-failure eviction that same change added is itself unconditional, so a
+  delayed corrupt-record callback can evict a newer valid entry, landing in the
+  absent-index arm above. The F-059 fix has to arbitrate all three writers and add
+  a repair for absent entries, which is the case no subscription reaches.
+
+Supported current-format retained behavior is otherwise unchanged. Records the
+broker cannot decode now fail closed everywhere — warned with the subject and the
+error, and evicted rather than silently ignored — where the development-era JSON
+fallback used to accept some of them; a record carrying a valid `Nmqtt-RFlags`
+header from a sourced foreign account is still accepted, and malformed *optional*
+headers (properties, expiry) are still ignored rather than rejected. Legacy
+development records (a JSON body, or a `-1` marker tombstone) and mixed old/new
+development fleets deliberately change behavior per the compatibility boundary and
+are not supported topologies.

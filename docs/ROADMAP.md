@@ -18,7 +18,7 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
-The 27 resolved findings are retained in the
+The 28 resolved findings are retained in the
 [resolved-findings archive](findings/resolved.md). The entries below are the active
 release view; their linked dossiers are canonical for mechanism, evidence,
 rejected designs, tests, and residuals.
@@ -30,10 +30,13 @@ persisted-state contract, so carrying these paths through subsequent session,
 retained-message, and Will changes would make every change maintain and test
 formats that no user release depends on. Each checkbox is one commit.
 
-- [ ] [F-056: Remove inherited retained-message compatibility](findings/pre-release-migrations.md#f-056).
-  **First; medium.** Delete the legacy JSON reader, old-server tombstone marker,
-  and `RD` delete-notification protocol while preserving current-format retained
-  deletion, restart recovery, expiry, and multi-broker convergence.
+- [x] [F-056: Remove inherited retained-message compatibility](findings/resolved.md#f-056).
+  The legacy JSON reader, the old-server tombstone marker and the `RD`
+  delete-notification protocol are gone, and so is the compaction delete beside
+  the notification: the empty-body tombstone alone carries deletion, and the
+  store evicts the record it replaces. An undecodable record is now rejected with
+  a log and evicted rather than silently ignored. Filed while doing it: F-059 and
+  F-060 below.
 - [ ] [F-058: Reject generationless delayed-Will records](findings/pre-release-migrations.md#f-058).
   **Second; small.** Validate decoded outbox records before scan, cancellation, or
   publication and fail closed on the unsupported pre-generation format.
@@ -108,6 +111,18 @@ takeover.
 - [ ] [F-048: Arbitrate affine cleanup before discarding assignments](findings/shared-qos2.md#f-048).
   **Medium to large.** Design and test F-047 and F-048 as one transactional-cleanup
   cluster.
+- [ ] [F-059: Arbitrate retained-index application by stream sequence](findings/runtime-correctness.md#f-059).
+  **Medium.** The volatile retained index applies stream events and local seeds
+  without comparing sequences, so a delayed or lost application can leave a stale
+  or absent entry. Two mechanisms, not one: a watermark orders the writers, and a
+  replayable consumer or a reconciliation is what covers a lost `AckNone`
+  delivery — the watermark alone cannot. Scope it by arm: a stale entry on an
+  indexed subject is already reconciled by the next matching subscription after
+  cache expiry, so the work that has no existing repair is the ABSENT entry.
+- [ ] [F-060: Report a failed retained store to the publisher](findings/runtime-correctness.md#f-060).
+  **Small to medium.** A PUBLISH whose RETAIN side failed to store is reported as
+  successful, contrary to [MQTT-3.3.1-5]. Decide the contract for QoS 0 —
+  which has no acknowledgement to withhold — alongside QoS 1 and 2.
 
 ### 0.4 Release-verification investigations
 
@@ -122,6 +137,12 @@ finding with acceptance criteria.
   **Investigation.** Do not truncate suite output.
 - [ ] [F-044: Determine whether the phase-2 shutdown observation is real](findings/release-investigations.md#f-044).
   **Investigation.**
+- [ ] Cover retained convergence for a sourced `$MQTT_rmsgs` topology.
+  **Investigation.** `docs/ARCHITECTURE.md` declares a cross-account sourced
+  retained stream a supported topology, but the only test of it lives in the
+  unbuilt `mqttport_clustertests` reference file, so nothing running exercises a
+  record arriving through a source with a subject transform. Establish whether a
+  native test can stand it up; if it can, the test is release verification.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 

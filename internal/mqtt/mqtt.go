@@ -349,7 +349,6 @@ const (
 	mqttJSAMsgLoad        = "ML"
 	mqttJSAMsgDelete      = "MD"
 	mqttJSASessPersist    = "SP"
-	mqttJSARetainedMsgDel = "RD"
 	mqttJSAConsumerList   = "CLS"
 	// mqttJSAAckConfirm is the JetStream "double ack": the acknowledgement of a
 	// delivery, sent WITH a reply subject so JetStream answers once it has been
@@ -379,7 +378,6 @@ const (
 	mqttProcessSubTooLong       = 100 * time.Millisecond
 	mqttDefaultRetainedCacheTTL = 2 * time.Minute
 	mqttDefaultJSAPITimeout     = 5 * time.Second
-	mqttRetainedFlagDelMarker   = '-'
 )
 
 const (
@@ -691,22 +689,26 @@ var (
 	errMQTTUnsupportedCharacters      = errors.New("character not supported for MQTT topics")
 	errMQTTInvalidSession             = errors.New("invalid MQTT session")
 	errMQTTInvalidRetainFlags         = errors.New("invalid retained message flags")
-	errMQTTSessionCollision           = errors.New("stored session does not match client ID")
-	errMQTTInvalidPublishLength       = errors.New("invalid publish message, variable header exceeds remaining length")
-	errMQTTMalformedProperties        = errors.New("malformed properties")
-	errMQTTProtocolError              = errors.New("protocol error")
-	errMQTTDuplicateProperty          = errors.New("duplicate property")
-	errMQTTUnknownProperty            = errors.New("unknown property identifier")
-	errMQTTPropertyNotAllowed         = errors.New("property not allowed for this packet type")
-	errMQTTAuthMethodNotSupported     = errors.New("enhanced authentication (auth method) is not supported")
-	errMQTTUnsupportedSubOption       = errors.New("unsupported MQTT 5.0 subscription option")
-	errMQTTMalformedSubOption         = errors.New("malformed MQTT 5.0 subscription option")
-	errMQTTMalformedSharedSub         = errors.New("malformed shared subscription")
-	errMQTTTopicAliasInvalid          = errors.New("topic alias invalid")
-	errMQTTReceiveMaxExceeded         = errors.New("receive maximum exceeded")
-	errMQTTPayloadFormatInvalid       = errors.New("payload format invalid")
-	errMQTTNotAuthorizedToSubscribe   = errors.New("not authorized to subscribe")
-	errMQTTMalformedPacket            = errors.New("malformed packet")
+	// A stored retained record without the Nmqtt-RFlags header is not in the
+	// format this broker writes. It is rejected as an unsupported format rather
+	// than guessed at — a distinct fact from "the flags value is out of range".
+	errMQTTRetainedMsgUnsupportedFormat = errors.New("retained message without Nmqtt-RFlags header: unsupported pre-release format")
+	errMQTTSessionCollision             = errors.New("stored session does not match client ID")
+	errMQTTInvalidPublishLength         = errors.New("invalid publish message, variable header exceeds remaining length")
+	errMQTTMalformedProperties          = errors.New("malformed properties")
+	errMQTTProtocolError                = errors.New("protocol error")
+	errMQTTDuplicateProperty            = errors.New("duplicate property")
+	errMQTTUnknownProperty              = errors.New("unknown property identifier")
+	errMQTTPropertyNotAllowed           = errors.New("property not allowed for this packet type")
+	errMQTTAuthMethodNotSupported       = errors.New("enhanced authentication (auth method) is not supported")
+	errMQTTUnsupportedSubOption         = errors.New("unsupported MQTT 5.0 subscription option")
+	errMQTTMalformedSubOption           = errors.New("malformed MQTT 5.0 subscription option")
+	errMQTTMalformedSharedSub           = errors.New("malformed shared subscription")
+	errMQTTTopicAliasInvalid            = errors.New("topic alias invalid")
+	errMQTTReceiveMaxExceeded           = errors.New("receive maximum exceeded")
+	errMQTTPayloadFormatInvalid         = errors.New("payload format invalid")
+	errMQTTNotAuthorizedToSubscribe     = errors.New("not authorized to subscribe")
+	errMQTTMalformedPacket              = errors.New("malformed packet")
 )
 
 type srvMQTT struct {
@@ -746,6 +748,15 @@ type mqttSessionManager struct {
 	// mqttCreateAccountSessionManager.
 	testSessCreateGate    func()
 	testSessCreateObserve func(created bool, err error)
+
+	// testRetainedApplyGate is an instance-scoped test seam, nil in production,
+	// invoked by processRetainedMsg with the decoded record's logical subject and
+	// whether it is a tombstone, immediately BEFORE the record is applied to the
+	// index. Holding one application there lets a test run the other index writer
+	// — mqttHandlePubRetain's synchronous local seed — ahead of it, which is the
+	// reordering F-059 describes and the window that made the removed compaction
+	// delete destructive. See processRetainedMsg.
+	testRetainedApplyGate func(subject string, tombstone bool)
 }
 
 type mqttAccountSessionManager struct {
@@ -1208,11 +1219,6 @@ type mqttJSPubMsg struct {
 	msg   []byte
 }
 
-type mqttRetMsgDel struct {
-	Subject string `json:"subject"`
-	Seq     uint64 `json:"seq"`
-}
-
 type mqttSession struct {
 	// subsMu is a "quick" version of the session lock, sufficient for the QoS0
 	// callback. It only guarantees that a new subscription is initialized, and
@@ -1623,17 +1629,20 @@ type mqttPersistedWill struct {
 	FireAt int64  `json:"fire,omitempty"` // Unix nanoseconds to publish at (truncation could fire early)
 }
 
+// mqttRetainedMsg is stored and read back through the NATS header format that
+// mqttEncodeRetainedMessage writes, never as a marshalled struct — so the fields
+// carry no serialization tags.
 type mqttRetainedMsg struct {
-	Origin  string `json:"origin,omitempty"`
-	Subject string `json:"subject,omitempty"`
-	Topic   string `json:"topic,omitempty"`
-	Msg     []byte `json:"msg,omitempty"`
-	Flags   byte   `json:"flags,omitempty"`
-	Source  string `json:"source,omitempty"`
+	Origin  string
+	Subject string
+	Topic   string
+	Msg     []byte
+	Flags   byte
+	Source  string
 	// Props is the raw MQTT 5.0 properties block captured from the retained
 	// PUBLISH, forwarded to v5 subscribers when the message is replayed. Empty
 	// for messages published by 3.1.1 clients or without properties.
-	Props []byte `json:"props,omitempty"`
+	Props []byte
 
 	// SessionHash is the authenticated No Local origin marker (HMAC of the
 	// publishing session hash, subject, and payload under a per-server secret)
@@ -1641,7 +1650,7 @@ type mqttRetainedMsg struct {
 	// suppress replaying it to that same session without trusting a forgeable
 	// header. Empty when v5 is disabled or there is no publishing session. Spec5
 	// [3.8.3.1].
-	SessionHash string `json:"session_hash,omitempty"`
+	SessionHash string
 
 	// expires is the absolute deadline after which this retained message must no
 	// longer be delivered, when it was published with an MQTT 5.0 Message Expiry
@@ -3886,12 +3895,6 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		return nil, err
 	}
 
-	// Create a subscription to be notified of retained messages delete requests.
-	rmdelsubj := mqttJSARepliesPrefix + "*." + mqttJSARetainedMsgDel
-	if err := as.createSubscription(rmdelsubj, as.processRetainedMsgDel, &sid, &subs); err != nil {
-		return nil, err
-	}
-
 	// No more creation of subscriptions past this point otherwise RACEs may happen.
 
 	// Start the go routine that will send JS API requests.
@@ -4761,61 +4764,42 @@ func (as *mqttAccountSessionManager) processRetainedMsg(_ *subscription, c *clie
 	h, m := c.msgParts(rmsg)
 	rm, err := mqttDecodeRetainedMessage(subject, h, m)
 	if err != nil {
+		// A record this broker cannot decode is an anomaly, not a message meant
+		// for someone else: the only format written is the header format, and no
+		// mechanism relies any more on servers silently ignoring what they cannot
+		// parse. Fail CLOSED — dropping the callback alone would leave a valid
+		// predecessor indexed and cached for a subject whose authoritative stream
+		// record is unreadable, so the index entry goes too. The index is keyed by
+		// the logical retained subject, not by the stream subject the callback
+		// carries. This matches loadRetainedMessages, so the live and the
+		// post-restart views of a corrupt record agree.
+		c.Warnf("Rejecting retained message on %q: %v", subject, err)
+		as.removeRetainedMsg(strings.TrimPrefix(subject, mqttRetainedMsgsStreamSubject), 0)
 		return
 	}
 	if strings.IndexByte(rm.Subject, 0x7f) >= 0 {
 		c.Warnf("Skipping retained message for subject %q: unsupported character 0x7f", rm.Subject)
 		return
 	}
-	// The as.jsa.id is immutable, so no need to have a rlock here.
-	local := rm.Origin == as.jsa.id
 	// Get the stream sequence for this message.
 	seq, _, _, _, _ := ackReplyInfo(reply)
-	if len(m) == 0 {
-		// An empty payload means that we need to remove the retained message.
-		rmSeq := as.removeRetainedMsg(rm.Subject, 0)
-		if local {
-			if rmSeq > 0 {
-				// This is for backward compatibility reasons.
-				// Should be removed in a future release.
-				as.notifyRetainedMsgDeleted(rm.Subject, rmSeq)
-				// Best-effort cleanup of the message this tombstone replaces. The
-				// retained stream is MaxMsgsPer=1 + AllowMsgTTL, and — unlike a
-				// non-empty replacement — storing an empty-body tombstone does NOT
-				// evict the prior message, so it must be deleted explicitly or it
-				// would resurface on a cold restart. We do NOT delete the tombstone
-				// itself: it carries no TTL (delete markers never do) and stays the
-				// subject's last message, so loadRetainedMessages reads it back as
-				// "deleted" and the removal survives a restart even if this async
-				// delete is lost. (Upstream instead deletes the tombstone, relying
-				// on MaxMsgsPer having already evicted the prior — which does not
-				// hold for empty bodies here.) Spec [MQTT-3.3.1-11].
-				as.deleteRetainedMsg(rmSeq)
-			}
+	if c.srv != nil {
+		if gate := c.srv.mqtt.sessmgr.testRetainedApplyGate; gate != nil {
+			gate(rm.Subject, len(m) == 0)
 		}
+	}
+	if len(m) == 0 {
+		// An empty payload is the tombstone: it IS the deletion, and the store
+		// has already evicted the record it replaces (MaxMsgsPer=1 enforcement
+		// runs on every store, empty body or not), so there is nothing further to
+		// delete. Spec [MQTT-3.3.1-11].
+		as.removeRetainedMsg(rm.Subject, 0)
 	} else {
 		// Add this retained message. The `rm.Msg` references some buffer that we
 		// don't own. But addRetainedMsg() will take care of making a copy of
 		// `rm.Msg` it `rm` ends-up being stored in the cache.
 		as.addRetainedMsg(rm.Subject, seq, rm)
 	}
-}
-
-// NOTE: This is maintained for backward compatibility reasons. Should be removed in 2.14/2.15?
-func (as *mqttAccountSessionManager) processRetainedMsgDel(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
-	idHash := tokenAt(subject, 3)
-	if idHash == _EMPTY_ || idHash == as.jsa.id {
-		return
-	}
-	_, msg := c.msgParts(rmsg)
-	if len(msg) < LEN_CR_LF {
-		return
-	}
-	var drm mqttRetMsgDel
-	if err := json.Unmarshal(msg, &drm); err != nil {
-		return
-	}
-	as.removeRetainedMsg(drm.Subject, drm.Seq)
 }
 
 // This will receive all JS API replies for a request to store a session record,
@@ -6254,12 +6238,14 @@ func (as *mqttAccountSessionManager) addRetainedMsg(key string, sseq uint64, rm 
 }
 
 // Remove the retained message stored with the `subject` key from the map/cache.
-// When invoked from the retained message stream's consumer, this function will
-// be called with `seq == 0`, this is because add/remove are serialized in this
-// stream and so the request is to remove the current retained message.
-// But in some conditions, we will invoke this function from some other places
-// with `seq > 0` which means that the retained message will be removed only if
-// its sequence is the same than the provided one.
+// Callers that mean "remove whatever the index currently holds" pass `seq == 0`:
+// the retained stream's consumer callback, the publishing broker's synchronous
+// local seed (mqttHandlePubRetain), and the decode-failure eviction above. Those
+// writers are NOT arbitrated against each other — none of them compares the
+// sequence it observed with the one the index holds, so a delayed application
+// can remove or restore a generation the index has already moved past (finding
+// F-059). A caller that has a specific record in mind passes `seq > 0`, and the
+// removal happens only if that exact sequence is still the indexed one.
 // This function returns the sequence associated with the existing retained
 // message that is being removed (used with `seq == 0`) and returns 0 if the
 // retained message was not removed from the map (not found or sequence did not
@@ -6269,6 +6255,18 @@ func (as *mqttAccountSessionManager) removeRetainedMsg(subject string, seq uint6
 	defer as.mu.Unlock()
 	rm, ok := as.retmsgs.Find(stringToBytes(subject))
 	if !ok || (seq > 0 && rm.sseq != seq) {
+		if seq == 0 {
+			// "Remove whatever is there" has to include the cached copy, which
+			// can outlive the index entry: an exact-filter subscription caches
+			// unconditionally (loadRetainedMessages) while only the consumer
+			// callback and the local seed ever index, so cache-present with
+			// index-absent is a reachable state — the first F-059 arm. Returning
+			// here without the delete would leave a decode-failure eviction
+			// fail-OPEN in exactly that state, since a later add inserts the
+			// index without refreshing the cache and the stale predecessor
+			// becomes servable again.
+			as.rmsCache.Delete(subject)
+		}
 		return 0
 	}
 	rm, _ = as.retmsgs.Delete(stringToBytes(subject))
@@ -7938,16 +7936,15 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]ui
 }
 
 // Composes a NATS message for a storeable mqttRetainedMsg.
-// If the body is empty, the flags are encoded in a way that will cause older
-// servers to fail to decode the message in processRetainedMsg callback and
-// will simply ignore it, which is what we want.
+// An empty body is itself the deletion tombstone [MQTT-3.3.1-11]; the flags are
+// encoded plainly either way, and every reader is expected to decode both.
 func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen int) {
 	delRM := len(rm.Msg) == 0
 
 	// MQTT 5.0 Message Expiry Interval: for a live retained message with an
 	// expiry, carry the absolute deadline (so the remaining interval can be
 	// recomputed on replay) plus a JetStream per-message TTL for the remaining
-	// lifetime (so the stored copy is dropped once it expires). Delete markers
+	// lifetime (so the stored copy is dropped once it expires). Tombstones
 	// (empty payload) never carry expiry. Spec5 [3.3.2.3.3].
 	var expStr, ttlStr string
 	if !delRM && !rm.expires.IsZero() {
@@ -7985,9 +7982,7 @@ func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen i
 	}
 	l += len(mqttNatsRetainedMessageFlags) + 1 + 2 + 2 // 1 byte for ':', 2 bytes for the flags, 2 bytes for CRLF
 	l += 2                                             // 2 bytes for the extra CRLF after the header
-	if delRM {
-		l++ // Will add the delete marker before the flag
-	} else {
+	if !delRM {
 		l += len(rm.Msg)
 	}
 
@@ -8002,9 +7997,6 @@ func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen i
 
 	buf.WriteString(mqttNatsRetainedMessageFlags)
 	buf.WriteByte(':')
-	if delRM {
-		buf.WriteByte(mqttRetainedFlagDelMarker)
-	}
 	buf.WriteString(strconv.FormatUint(uint64(rm.Flags), 16))
 	buf.WriteString(_CRLF_)
 
@@ -8061,10 +8053,18 @@ func mqttSliceHeaders(headers map[string][]byte, hdr []byte) {
 	}
 	crLFAsBytes := stringToBytes(CR_LF)
 	for i := len(hdrLine); i < len(hdr); {
-		// Search for key/val delimiter.
+		// Search for key/val delimiter. `del` is an offset INTO hdr[i:], not an
+		// absolute index — comparing it against `i` (as this once did) aborts the
+		// scan whenever a key's length happens to equal the current position, and
+		// silently discards every header from there on. The first header sits at
+		// i == len(hdrLine) == 10, so a ten-character key such as "Nmqtt-RExp"
+		// triggered it; NATS header order is map order, so it bit roughly one
+		// retained message in seven that carried an MQTT 5.0 expiry. A zero-length
+		// key is `del == 0`, and it is caught by the empty-key check below in any
+		// case.
 		del := bytes.IndexByte(hdr[i:], ':')
 		// Not found or key is length 0, we stop.
-		if del < 0 || del == i {
+		if del < 0 || del == 0 {
 			break
 		}
 		keyStart := i
@@ -8116,52 +8116,42 @@ func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, e
 		mqttNatsRetainedMessageExpiry:      nil,
 		mqttNatsRetainedMessageSessionHash: nil,
 	}
-	var rm *mqttRetainedMsg
 	// Retrieve the values for the above headers.
 	mqttSliceHeaders(headers, h)
-	// Get the flag header.
+	// Get the flag header. It is the one header that identifies the record as
+	// one this broker wrote: without it the stored bytes are in no format this
+	// broker produces, and are rejected rather than interpreted as another one.
 	fHeader := headers[mqttNatsRetainedMessageFlags]
-	// If we don't, it could be that this is an old retained message that
-	// was JSON encoded.
-	if len(fHeader) > 0 {
-		if len(fHeader) > 1 && fHeader[0] == mqttRetainedFlagDelMarker {
-			fHeader = fHeader[1:]
+	if len(fHeader) == 0 {
+		return nil, errMQTTRetainedMsgUnsupportedFormat
+	}
+	flagsUint, err := strconv.ParseUint(bytesToString(fHeader), 16, 8)
+	if err != nil {
+		// Since the error is currently not reported in the server, we
+		// will simply replace with this one.
+		return nil, errMQTTInvalidRetainFlags
+	}
+	rm := &mqttRetainedMsg{
+		Flags:       byte(flagsUint),
+		Origin:      string(headers[mqttNatsRetainedMessageOrigin]),
+		Source:      string(headers[mqttNatsRetainedMessageSource]),
+		SessionHash: string(headers[mqttNatsRetainedMessageSessionHash]),
+		Msg:         m,
+	}
+	// MQTT 5.0 properties block (base64). Absent for messages published without
+	// properties. Validate before keeping it: the retained stream could contain a
+	// crafted Nmqtt-RProps from a non-MQTT publisher, and rm.Props is later
+	// written verbatim into outbound PUBLISH packets.
+	if enc := headers[mqttNatsRetainedMessageProps]; len(enc) > 0 {
+		if raw, err := base64.StdEncoding.DecodeString(bytesToString(enc)); err == nil {
+			rm.Props = mqttValidateForwardProps(raw)
 		}
-		flagsUint, err := strconv.ParseUint(bytesToString(fHeader), 16, 8)
-		if err != nil {
-			// Since the error is currently not reported in the server, we
-			// will simply replace with this one.
-			return nil, errMQTTInvalidRetainFlags
+	}
+	// MQTT 5.0 Message Expiry Interval: absolute deadline (Unix nanoseconds).
+	if exp := headers[mqttNatsRetainedMessageExpiry]; len(exp) > 0 {
+		if ns, err := strconv.ParseInt(bytesToString(exp), 10, 64); err == nil && ns > 0 {
+			rm.expires = time.Unix(0, ns)
 		}
-		rm = &mqttRetainedMsg{
-			Flags:       byte(flagsUint),
-			Origin:      string(headers[mqttNatsRetainedMessageOrigin]),
-			Source:      string(headers[mqttNatsRetainedMessageSource]),
-			SessionHash: string(headers[mqttNatsRetainedMessageSessionHash]),
-			Msg:         m,
-		}
-		// MQTT 5.0 properties block (base64). Absent for older stored messages.
-		// Validate before keeping it: the retained stream could contain a
-		// crafted Nmqtt-RProps from a non-MQTT publisher, and rm.Props is later
-		// written verbatim into outbound PUBLISH packets.
-		if enc := headers[mqttNatsRetainedMessageProps]; len(enc) > 0 {
-			if raw, err := base64.StdEncoding.DecodeString(bytesToString(enc)); err == nil {
-				rm.Props = mqttValidateForwardProps(raw)
-			}
-		}
-		// MQTT 5.0 Message Expiry Interval: absolute deadline (Unix nanoseconds).
-		if exp := headers[mqttNatsRetainedMessageExpiry]; len(exp) > 0 {
-			if ns, err := strconv.ParseInt(bytesToString(exp), 10, 64); err == nil && ns > 0 {
-				rm.expires = time.Unix(0, ns)
-			}
-		}
-	} else {
-		if err := json.Unmarshal(m, &rm); err != nil {
-			return nil, err
-		}
-		// Same validation as the header path above: a JSON record from a
-		// non-MQTT publisher could carry crafted Props.
-		rm.Props = mqttValidateForwardProps(rm.Props)
 	}
 	// Now check that the values are correct.
 	//
@@ -8392,29 +8382,6 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.disconnectedAt = ps.DisconnectedAt
 	as.addSession(sess, true)
 	return sess, true, nil
-}
-
-// Sends a request to delete a message, but does not wait for the response.
-//
-// No lock held on entry.
-func (as *mqttAccountSessionManager) deleteRetainedMsg(seq uint64) {
-	as.jsa.deleteMsg(mqttRetainedMsgsStreamName, seq, false)
-}
-
-// Sends a message indicating that a retained message on a given subject and stream sequence
-// is being removed.
-// NOTE: This is maintained for backward compatibility reasons. Should be removed in 2.14/2.15?
-func (as *mqttAccountSessionManager) notifyRetainedMsgDeleted(subject string, seq uint64) {
-	req := mqttRetMsgDel{
-		Subject: subject,
-		Seq:     seq,
-	}
-	b, _ := json.Marshal(&req)
-	jsa := &as.jsa
-	jsa.sendq.push(&mqttJSPubMsg{
-		subj: jsa.rplyr + mqttJSARetainedMsgDel,
-		msg:  b,
-	})
 }
 
 func (as *mqttAccountSessionManager) getCachedRetainedMsg(subject string) *mqttRetainedMsg {
@@ -12981,13 +12948,16 @@ func (c *client) mqttHandlePubRetain() {
 	// Spec [MQTT-3.3.1-11]. Payload of size 0 removes the retained message, but
 	// should still be delivered as a normal message.
 	//
-	// We used to delete the message here from our map, the stream, and notify
-	// the network about the delete. We no longer do that. Instead, we store
-	// the message with an empty body. When servers will get the empty body
-	// in processRetainedMsg, then will remove the message from their map. This
-	// effectively serializes all add/remove of retained messages without the
-	// need for "network" notifications about deletes (we still support that
-	// for backward compatibility but will be pulled in future releases).
+	// A deletion is stored, not signalled: we write the message with an empty
+	// body and every broker's retained-stream consumer removes the subject when
+	// it processes that record. The STREAM is what orders adds and removes
+	// durably — the empty-body tombstone is the only deletion authority, and
+	// MaxMsgsPer=1 evicts the record it replaces at store time, so no explicit
+	// delete request is involved. The volatile INDEX is a different matter: its
+	// writers (the consumer callback, the local seed below, and the
+	// decode-failure eviction in processRetainedMsg) apply what they observe
+	// without comparing sequences, so index state can go stale under reordering.
+	// That is finding F-059, not something this path arbitrates.
 
 	rm := &mqttRetainedMsg{
 		Origin: asm.jsa.id,
@@ -13070,8 +13040,10 @@ func (c *client) mqttHandlePubRetain() {
 	// round trip in this standalone broker (unlike upstream's in-process hop),
 	// so a SUBSCRIBE arriving right after this PUBLISH could miss the retained
 	// message. Seeding here makes retained-then-subscribe deterministic on the
-	// publishing node; the later processRetainedMsg callback re-applies the same
-	// add/remove idempotently. An empty body is a delete tombstone [MQTT-3.3.1-11].
+	// publishing node. The later processRetainedMsg callback applies the same
+	// add/remove again — identically when nothing raced it, but neither writer
+	// compares sequences, so a callback delayed past a newer publish re-applies
+	// an older generation (F-059). An empty body is a tombstone [MQTT-3.3.1-11].
 	if len(rm.Msg) == 0 {
 		asm.removeRetainedMsg(key, 0)
 	} else {

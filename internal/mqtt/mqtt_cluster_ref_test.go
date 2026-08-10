@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1342,6 +1343,26 @@ func TestMQTTCrossAccountRetain(t *testing.T) {
 	}
 }
 
+// mqttRefRetainedNATSMsg builds the NATS message for a retained record in the
+// only format this broker reads: the Nmqtt-R* header block that
+// mqttEncodeRetainedMessage writes. Reference-only helper.
+func mqttRefRetainedNATSMsg(rm *mqttRetainedMsg) *nats.Msg {
+	hdr := nats.Header{}
+	hdr.Set(mqttNatsRetainedMessageTopic, rm.Topic)
+	hdr.Set(mqttNatsRetainedMessageFlags, strconv.FormatUint(uint64(rm.Flags), 16))
+	if rm.Origin != _EMPTY_ {
+		hdr.Set(mqttNatsRetainedMessageOrigin, rm.Origin)
+	}
+	if rm.Source != _EMPTY_ {
+		hdr.Set(mqttNatsRetainedMessageSource, rm.Source)
+	}
+	return &nats.Msg{
+		Subject: mqttRetainedMsgsStreamSubject + rm.Subject,
+		Header:  hdr,
+		Data:    rm.Msg,
+	}
+}
+
 func TestMQTTDecodeRetainedMessage(t *testing.T) {
 	tdir := t.TempDir()
 	tmpl := `
@@ -1371,7 +1392,11 @@ func TestMQTTDecodeRetainedMessage(t *testing.T) {
 	testMQTTPublish(t, mc, r, 0, false, true, "foo/1", 0, []byte("msg1"))
 	mc.Close()
 
-	// Store a "legacy", JSON-encoded payload directly into the stream.
+	// Store a second retained message directly into the stream. Upstream wrote a
+	// JSON-encoded body here to exercise the legacy reader; this broker accepts
+	// only the header format (F-056 removed the JSON fallback), so the reference
+	// injects the current format instead. Reference-only: this file is build
+	// tagged mqttport_clustertests and never runs — see docs/PORTING.md.
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
 
@@ -1382,11 +1407,7 @@ func TestMQTTDecodeRetainedMessage(t *testing.T) {
 		Flags:   mqttPubFlagRetain,
 		Msg:     []byte("msg2"),
 	}
-	jsonData, _ := json.Marshal(rm)
-	_, err := js.PublishMsg(&nats.Msg{
-		Subject: mqttRetainedMsgsStreamSubject + rm.Subject,
-		Data:    jsonData,
-	})
+	_, err := js.PublishMsg(mqttRefRetainedNATSMsg(&rm))
 	if err != nil {
 		t.Fatalf("Error publishing retained message to JS directly: %v", err)
 	}
@@ -2230,8 +2251,12 @@ func TestMQTTRetainedMessageWithDelSubjectIsNotRestored(t *testing.T) {
 	testMQTTPublish(t, mc, r, 0, false, true, "foo/ok", 0, []byte("ok"))
 	mc.Close()
 
-	// Store a legacy retained message directly into JetStream using a subject
-	// that contains DEL. That subject can no longer be indexed after restore.
+	// Store a retained message directly into JetStream using a subject that
+	// contains DEL. That subject can no longer be indexed after restore. It is
+	// written in the current header format so that the DEL check is what rejects
+	// it — upstream injected a JSON body, and this broker no longer reads that
+	// format at all (F-056), which would make the record fail earlier for an
+	// unrelated reason.
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
 	rm := mqttRetainedMsg{
@@ -2241,11 +2266,7 @@ func TestMQTTRetainedMessageWithDelSubjectIsNotRestored(t *testing.T) {
 		Flags:   mqttPubFlagRetain,
 		Msg:     []byte("bad"),
 	}
-	jsonData, _ := json.Marshal(rm)
-	_, err := js.PublishMsg(&nats.Msg{
-		Subject: mqttRetainedMsgsStreamSubject + rm.Subject,
-		Data:    jsonData,
-	})
+	_, err := js.PublishMsg(mqttRefRetainedNATSMsg(&rm))
 	require_NoError(t, err)
 
 	// Restart the server so retained-message recovery runs through

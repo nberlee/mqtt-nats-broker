@@ -11,54 +11,9 @@ This audit does **not** apply to the roadmap's operator migration guide from NAT
 Server's embedded MQTT listener. That guide describes cutover from a different
 product and remains first-release documentation.
 
-F-057 (the reserved-subscription migration) is resolved and its record now lives in
-[the resolved-findings archive](resolved.md#f-057).
-
-## F-056
-
-**Title:** Remove inherited retained-message format and delete-protocol compatibility
-
-- Status: Open
-- Classification: Pre-release persistence compatibility cleanup
-- Release treatment: Immediate cleanup before further MQTT-core implementation
-
-### Evidence
-
-The retained-message path still carries three coordinated compatibility mechanisms:
-
-- `mqttDecodeRetainedMessage` falls back to JSON when the current
-  `Nmqtt-RFlags` header is absent. The production encoder always emits the
-  header-based format; direct JSON fixtures exist only to exercise the inherited
-  legacy reader.
-- Empty retained-message tombstones prepend `mqttRetainedFlagDelMarker` so older
-  servers fail to decode and ignore them. No older bridge release or supported
-  mixed-version fleet exists.
-- Every account manager subscribes to the internal `RD` retained-delete
-  notification protocol. `processRetainedMsg` publishes that notification and
-  `processRetainedMsgDel` consumes it, even though current brokers already observe
-  the authoritative retained-stream tombstone. The source comments explicitly
-  identify this as backward compatibility intended for later removal.
-
-This is inherited compatibility with older NATS Server MQTT persistence, not MQTT
-wire-protocol compatibility. Keeping it expands the accepted storage format and
-adds an account-wide subscription, sender, receiver, message type, and tests to
-every current broker.
-
-### Commit-sized resolution
-
-Land one retained-message compatibility cleanup commit:
-
-1. Remove the `RD` constant, subscription, message type, sender, receiver, and
-   notification call while preserving current tombstone processing and cleanup.
-2. Require the current header-based retained record, remove the JSON fallback and
-   old-server delete-marker encoding, and keep validation of all current headers.
-3. Replace legacy-format fixtures with current-format corruption and restart
-   coverage where the underlying validation remains relevant.
-
-Acceptance requires retained publish, replacement, deletion, restart recovery,
-expiry, malformed-header, and multi-broker cache-convergence tests. A retained
-record without the current required headers must be rejected with a clear log; it
-must never be interpreted as another format.
+[F-056](resolved.md#f-056) (the retained-message format and delete protocol) and
+[F-057](resolved.md#f-057) (the reserved-subscription migration) are resolved and
+their records now live in the resolved-findings archive.
 
 ## F-058
 

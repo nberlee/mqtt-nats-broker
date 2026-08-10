@@ -4787,6 +4787,14 @@ func TestMQTTSliceHeadersAndDecodeRetainedMessage(t *testing.T) {
 		{"three keys", hdrLine + "key2:val2\r\nkey3:val3\r\nkey1:val1\r\n", []string{"val1", "val2", "val3"}},
 		{"space before value", hdrLine + "somekey:someval\r\nkey2:  val2withspacebefore\r\n", []string{_EMPTY_, "val2withspacebefore", _EMPTY_}},
 		{"space between key and colon sign", hdrLine + "key1:val1\r\nkey2 :val2\r\nkey3  :  val3\r\n", []string{"val1", "val2", "val3"}},
+		// A key whose LENGTH equals the scan's current absolute position must not
+		// end the scan: the delimiter search returns an offset into the remaining
+		// slice, and confusing the two silently dropped this header and every one
+		// after it. The first header begins at len(hdrLine) == 10, so a
+		// ten-character key is the case that fires there — "Nmqtt-RExp" is exactly
+		// ten, which is how this reached retained messages carrying an MQTT 5.0
+		// expiry. The second line repeats the trap at the next position.
+		{"key length equals the scan position", hdrLine + "0123456789:valA\r\nkey1:val1\r\nkey2:val2\r\nkey3:val3\r\n", []string{"val1", "val2", "val3"}},
 		// Error cases
 		{"no hdr line", "key1:val1\r\n", []string{_EMPTY_, _EMPTY_, _EMPTY_}},
 		{"key length 0", hdrLine + "key1:val1\r\n:val2\r\nkey3:val3\r\n", []string{"val1", _EMPTY_, _EMPTY_}},
@@ -4811,30 +4819,28 @@ func TestMQTTSliceHeadersAndDecodeRetainedMessage(t *testing.T) {
 	}
 
 	// Now test mqttDecodeRetainedMessage() itself.
-	t.Run("flag with delete marker", func(t *testing.T) {
-		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:%c1\r\n\r\n", hdrLine, mqttRetainedFlagDelMarker)
-		rm, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, nil)
-		require_NoError(t, err)
-		require_Equal(t, rm.Flags, 1)
-	})
 	t.Run("flag not a number", func(t *testing.T) {
 		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:bad\r\n\r\n", hdrLine)
 		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, []byte("msg"))
 		require_Error(t, err, errMQTTInvalidRetainFlags)
 	})
-	t.Run("flag not a number with delete marker", func(t *testing.T) {
-		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:%cad\r\n\r\n", hdrLine, mqttRetainedFlagDelMarker)
-		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, []byte("msg"))
-		require_Error(t, err, errMQTTInvalidRetainFlags)
-	})
 	t.Run("flag too big", func(t *testing.T) {
-		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:%c15\r\n\r\n", hdrLine, mqttRetainedFlagDelMarker)
+		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:15\r\n\r\n", hdrLine)
 		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, []byte("msg"))
 		require_Error(t, err, errMQTTInvalidRetainFlags)
 	})
 	t.Run("flag invalid qos", func(t *testing.T) {
-		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:%c7\r\n\r\n", hdrLine, mqttRetainedFlagDelMarker)
+		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:7\r\n\r\n", hdrLine)
 		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, []byte("msg"))
+		require_Error(t, err, errMQTTInvalidRetainFlags)
+	})
+	// The development-era delete marker ('-' prefixed to the hex flags, so that
+	// older servers would fail to decode a tombstone and ignore it) is gone from
+	// both the encoder and the decoder. A record still carrying it must be
+	// rejected, never silently accepted as flags=1.
+	t.Run("flag with legacy delete marker rejected", func(t *testing.T) {
+		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:-1\r\n\r\n", hdrLine)
+		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, nil)
 		require_Error(t, err, errMQTTInvalidRetainFlags)
 	})
 	t.Run("decode retained msg with space before header value", func(t *testing.T) {
@@ -4897,31 +4903,30 @@ func TestMQTTSliceHeadersAndDecodeRetainedMessage(t *testing.T) {
 		require_Equal(t, rm.Flags, 1)
 		require_Len(t, len(rm.Msg), 0)
 	})
-	t.Run("decode retained message as JSON with bad flags", func(t *testing.T) {
-		rmo := &mqttRetainedMsg{Flags: 15}
-		msg, err := json.Marshal(rmo)
-		require_NoError(t, err)
-		_, err = mqttDecodeRetainedMessage("$MQTT.rmsgs.foo.x", nil, msg)
-		require_Error(t, err, errMQTTInvalidRetainFlags)
+	// The Nmqtt-RFlags header is what identifies a record as one this broker
+	// wrote. Without it the stored bytes are rejected as an unsupported format —
+	// never interpreted as some other format, which is what the development-era
+	// JSON fallback used to do.
+	t.Run("no header at all is unsupported", func(t *testing.T) {
+		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.foo.x", nil, []byte("msg"))
+		require_Error(t, err, errMQTTRetainedMsgUnsupportedFormat)
 	})
-	t.Run("decode retained message as JSON subject transform", func(t *testing.T) {
-		rmo := &mqttRetainedMsg{
-			Topic:  "foo/x",
-			Origin: "Origin",
-			Source: "Source",
-			Flags:  1,
-			Msg:    []byte("hello"),
-		}
-		msg, err := json.Marshal(rmo)
+	t.Run("JSON body without header is not decoded as JSON", func(t *testing.T) {
+		msg, err := json.Marshal(map[string]any{
+			"topic":  "foo/x",
+			"origin": "Origin",
+			"source": "Source",
+			"flags":  1,
+			"msg":    []byte("hello"),
+		})
 		require_NoError(t, err)
-		rm, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", nil, msg)
-		require_NoError(t, err)
-		require_Equal(t, rm.Topic, "bar/x")
-		require_Equal(t, rm.Subject, "bar.x")
-		require_Equal(t, rm.Origin, "Origin")
-		require_Equal(t, rm.Source, "Source")
-		require_Equal(t, rm.Flags, 1)
-		require_Equal(t, string(rm.Msg), "hello")
+		_, err = mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", nil, msg)
+		require_Error(t, err, errMQTTRetainedMsgUnsupportedFormat)
+	})
+	t.Run("other retained headers without flags is unsupported", func(t *testing.T) {
+		hdr := fmt.Appendf(nil, "%sNmqtt-RTopic:foo/x\r\nNmqtt-ROrigin:Origin\r\n\r\n", hdrLine)
+		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, []byte("msg"))
+		require_Error(t, err, errMQTTRetainedMsgUnsupportedFormat)
 	})
 }
 

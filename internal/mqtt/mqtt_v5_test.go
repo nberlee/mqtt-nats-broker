@@ -4398,26 +4398,6 @@ func TestMQTTv5WillForwardsOwnProps(t *testing.T) {
 	testMQTTCheckFwdProps(t, props)
 }
 
-// A legacy JSON-encoded retained message must have its Props validated like the
-// header-encoded path: a forbidden block (e.g. Topic Alias) is dropped rather
-// than forwarded verbatim to subscribers.
-func TestMQTTv5RetainedJSONFallbackPropsValidated(t *testing.T) {
-	badProps := newMQTTWriter(0)
-	badProps.WriteByte(mqttPropTopicAlias)
-	badProps.WriteUint16(5)
-	jm, err := json.Marshal(&mqttRetainedMsg{Topic: "foo", Msg: []byte("m"), Props: badProps.Bytes()})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	rm, err := mqttDecodeRetainedMessage(mqttRetainedMsgsStreamSubject+"foo", nil, jm)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if rm.Props != nil {
-		t.Fatalf("Expected forbidden props to be dropped, got %v", rm.Props)
-	}
-}
-
 // ---- Receive Maximum ----
 
 // mqttV5ConnPropsReceiveMax returns a CONNECT properties body carrying a

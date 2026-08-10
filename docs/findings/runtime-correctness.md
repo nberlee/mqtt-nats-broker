@@ -110,3 +110,161 @@ it existed on 2026-08-10.
   that is already gone — under a Receive Maximum of 1, a session that can no
   longer deliver at all. The removals should purge what they strand, by the same
   pending-state derivation. Spec5 [4.8.2], [4.9].
+
+## F-059
+
+**Title:** Arbitrate retained-index application by stream sequence
+
+- Status: Open
+- Classification: Confirmed correctness defect
+- Release treatment: Alpha blocker
+- Filed: 2026-08-10, while resolving [F-056](resolved.md#f-056)
+
+### Evidence
+
+The durable retained state is arbitrated: `$MQTT_rmsgs` holds one record per
+subject (`MaxMsgsPer: 1`), the store evicts the record a write replaces, and an
+empty body is the deletion. The VOLATILE index every broker serves from —
+`as.retmsgs` plus `rmsCache` — is not. Three writers apply what they observe
+without comparing it to what the index already holds:
+
+- `processRetainedMsg`, the retained stream's consumer callback: `addRetainedMsg`
+  accepts any sequence and overwrites the stored one, and the tombstone arm calls
+  `removeRetainedMsg(subject, 0)`, which removes whatever is there.
+- `mqttHandlePubRetain`'s synchronous local seed, applied on the publishing broker
+  right after `storeMsg` returns, concurrently with that broker's own callback for
+  the same record.
+- The decode-failure eviction added by F-056, also unconditional.
+
+The consumer is a per-broker ephemeral `AckNone` `DeliverAll` consumer, so a
+dropped delivery is never redelivered. Loss is NOT delay, and conflating the two
+would frame this finding as an ordering problem it is not: a delayed callback
+eventually runs and the index settles on what it applies, whereas a lost one runs
+no writer at all.
+
+What ends a loss depends on whether the subject is still indexed, and only one of
+the two cases is unbounded:
+
+- **Indexed subject.** Any later matching SUBSCRIBE, wildcard or exact, puts the
+  subject through `loadRetainedMessages`, which reads the stream once the cached
+  copy has expired; its tombstone arm calls `removeRetainedMsg(subject, 0)` and a
+  replacement refreshes what is served. These arms are therefore bounded by the
+  retained cache TTL plus the next matching subscription. That load does not call
+  `addRetainedMsg`, so the index's stored SEQUENCE is left stale even after the
+  served content is right.
+- **Absent subject.** Nothing repairs it. Serialization enumerates `as.retmsgs`,
+  so the subject is not a wildcard candidate at all, and an exact filter's forced
+  authoritative load caches it without making it deliverable. It stays
+  undeliverable on that broker until a later application for the subject arrives,
+  the broker restarts and replays the stream, or the reconciliation described
+  under "Fix direction" exists.
+
+### Observable surface
+
+- **Missed or reordered add, or an over-eager eviction (absent index entry)** —
+  retained replay is suppressed for WILDCARD and EXACT filters alike.
+  `serializeRetainedMsgsForSub` matches candidate subjects against `as.retmsgs`
+  and returns immediately when that index is empty, so the exact filter's forced
+  authoritative stream load fetches the record into the cache without making it
+  deliverable. That forced load narrows only the window in which a just-published
+  record's callback lands during the SUBSCRIBE's own round trip. A delayed
+  decode-failure eviction lands in this arm. **This is the arm no subscription
+  repairs**, and so the only one that is unbounded on loss.
+- **Missed or reordered replacement** — the OLD value stays in `retmsgs` and
+  `rmsCache` and is served stale to wildcard AND exact subscribers, since a lookup
+  returns the cached record without reading the stream. A DELAYED OLD add can
+  actively restore a stale value over a newer one, because `addRetainedMsg`
+  overwrites the sequence and the cache entry with no comparison. Bounded: after
+  the cached copy expires the next matching subscription reloads the stream and
+  serves the current record, though the index entry's sequence stays wrong until
+  the next application.
+- **Missed or reordered tombstone** — stale retained delivery to wildcard and
+  exact subscribers, under the same bound. Here the reload does more than refresh:
+  reading the tombstone removes the index entry outright, so the arm self-heals at
+  the next matching subscription after cache expiry.
+
+### Disclosure
+
+[F-056](resolved.md#f-056) removed the `RD` notification protocol, which was an
+additional best-effort removal path for the specific case of a remote broker
+whose `AckNone` tombstone delivery was lost. Its removal widens this finding's
+tombstone window — that arm now waits for cache expiry plus a matching
+subscription instead of possibly being retired sooner by the notification. It
+does not make the arm unbounded and adds no failure class. F-056 also added the
+decode-failure eviction, which is itself unarbitrated and lands in the
+absent-index arm — the one no subscription reaches. The fix must therefore cover
+LOST deliveries, not only reordering, and must arbitrate the eviction alongside
+the add and the tombstone.
+
+### Fix direction
+
+This needs two mechanisms, and it is worth being explicit that the first does not
+subsume the second.
+
+**Ordering.** A per-topic last-applied stream sequence watermark that also covers
+deleted state (a tombstone must raise the watermark, not clear it, or a delayed
+older add walks back over the deletion), rebuilt from the stream on restart. Every
+index writer — the callback's add, the callback's tombstone removal, the local
+seed, and F-056's decode-failure eviction — compares against it and drops what it
+has already passed. Recording the watermark alongside the index reference keeps it
+under one lock. `MaxMsgsPer: 1` means the stream never holds a superseded record,
+so the watermark is only ever compared against, never used to fetch.
+
+**Loss.** The watermark cannot repair a LOST application, and must not be
+described as if it could: when a remote broker's `AckNone` delivery is dropped no
+writer runs at all, so there is nothing for a watermark to reject and nothing to
+notice the gap. Scope this precisely, because a repair already exists for half of
+it: an INDEXED subject is reconciled by the next matching subscription's
+`loadRetainedMessages` read once its cached copy expires. What that repair cannot
+reach is an ABSENT subject, since serialization only ever enumerates the index —
+so the fix has to make a broker able to discover a per-subject state it does not
+know it is missing. That needs either a consumer whose deliveries are replayable
+(an acknowledged or durable consumer in place of the ephemeral `AckNone` one,
+with the retention cost that implies) or a reconciliation comparing observed
+stream progress against the index. The two mechanisms are complementary:
+reconciliation bounds how long a lost application can persist, and the watermark
+is what keeps its repair from being undone by a straggler.
+
+## F-060
+
+**Title:** Report a failed retained store to the publisher
+
+- Status: Open
+- Classification: Confirmed correctness defect
+- Release treatment: Alpha blocker
+- Filed: 2026-08-10, while resolving [F-056](resolved.md#f-056)
+
+### Evidence
+
+A failed retained store is invisible to the publishing client.
+`mqttHandlePubRetain` logs a `storeMsg` error and returns, and the delivery path
+reports success regardless. [MQTT-3.3.1-5] requires the server to store the
+message; a client that publishes retained state has no way to learn that the
+retained copy does not exist, and no retry is attempted. This spans all three
+quality-of-service levels, and they do not share a remedy:
+
+- **QoS 1 and 2** are acknowledged anyway — the PUBACK is sent, and the QoS 2
+  handshake completes — so the client is told the publication succeeded.
+- **QoS 0 has no acknowledgement to withhold.** The same swallowed error occurs
+  there, and a fix framed only around acknowledgement leaves that publisher
+  completely unaware. It is the arm most likely to be missed, which is why it is
+  named here.
+
+This is independent of the compatibility mechanisms F-056 removed; it was
+surfaced by that item's crash-window analysis. The neighbouring window — live
+fan-out precedes the retained store, so subscribers can see a PUBLISH while the
+retained authority is still the previous record — is a separate ordering question
+and is not part of this finding.
+
+### Fix direction
+
+Decide the reporting contract first, and decide it for all three QoS levels
+together. For QoS 1 and 2 the options are failing the acknowledgement (v5 has a
+reason code for it; 3.1.1 has none for QoS 1, so a PUBACK is either sent or the
+connection is closed) or retrying the store before acknowledging. For QoS 0 the
+only signals available are a logged failure the client cannot see and terminating
+the connection, which under MQTT 5.0 can carry a DISCONNECT reason code — so its
+contract has to be chosen deliberately rather than inherited from whatever the
+acknowledged path does. Whatever is chosen must not acknowledge a store whose
+outcome is still unresolved, which is the same ambiguity class the session-record
+work already settled by re-attempting rather than reading back.

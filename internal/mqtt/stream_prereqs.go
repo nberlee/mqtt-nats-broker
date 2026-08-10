@@ -14,8 +14,9 @@
 // scans in its feature file — never copied from another stream's list. That is
 // why no two lists here are the same: DenyDelete is fatal on $MQTT_sess (the
 // teardown release is the only exit a record has) and waived on $MQTT_rmsgs
-// (deletes there are best-effort compaction; the empty-body tombstone plus
-// MaxMsgsPer:1 replacement carry correctness). A setting absent from a list is
+// (that owner issues no delete API request at all; the empty-body tombstone
+// plus MaxMsgsPer:1 replacement carry correctness, and both that store-time
+// eviction and TTL reaping are store-internal, which DenyDelete does not gate). A setting absent from a list is
 // an audited NON-prerequisite with a written reason, not an oversight:
 // rejecting a setting no owner operation depends on would refuse legitimate
 // deployments — policy hardening, not derivation. The audit is enforced by
@@ -237,14 +238,16 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 // validateRetainedStream verifies $MQTT_rmsgs can carry retained messages.
 // Derived from what this owner does: one plain store per topic subject with a
 // per-message Nats-TTL, including empty-body tombstones; loadLastMsgForMulti /
-// loadNextMsgFor reads; best-effort NO-WAIT deletes only (compaction); and one
-// ephemeral AckNone consumer per broker with a 5-minute InactiveThreshold.
+// loadNextMsgFor reads; NO explicit message-delete or purge API calls at all;
+// and one ephemeral AckNone consumer per broker with a 5-minute
+// InactiveThreshold.
 //
-// DenyDelete is deliberately NOT a prerequisite: every delete here is
-// fire-and-forget compaction. The durable deletion authority is the empty-body
-// tombstone plus MaxMsgsPer:1 replacement (docs/PORTING.md), so denying
-// deletes costs only the lingering delete-API targets (TTL expiry is reaped by
-// the store engine itself, which DenyDelete does not gate), never correctness.
+// DenyDelete is deliberately NOT a prerequisite: this owner issues no delete
+// API request. The durable deletion authority is the empty-body tombstone plus
+// MaxMsgsPer:1 replacement (docs/PORTING.md), and BOTH the store-time eviction
+// that replacement performs and TTL expiry are reaped by the store engine
+// itself, which DenyDelete does not gate. Denying deletes therefore costs
+// nothing here.
 // Sources is NOT a prerequisite either: cross-account retained sourcing with
 // subject transforms is a supported topology (the decoder handles sourced
 // records explicitly). ConsumerLimits is not checked: a stream

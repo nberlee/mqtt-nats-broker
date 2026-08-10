@@ -1838,6 +1838,231 @@ not classify —…
   `internal/mqtt/mqtt.go`, `sess_recordtx.go`, `sess_fork_lineage.go`;
   `sess_persist_evict_test.go`.
 
+## F-056
+
+**Title:** Remove inherited retained-message format and delete-protocol compatibility
+
+- Status: Resolved
+- Classification: Pre-release persistence compatibility cleanup
+- Release treatment: Completed; MQTT wire-protocol retained behavior is unchanged
+- Original dossier: `pre-release-migrations.md`
+
+### Resolution
+
+Three coordinated development-era mechanisms are deleted, and with them the only
+reason the retained path had to stay silent about records it could not read.
+
+**The `RD` delete-notification protocol** is gone entirely: the constant, the
+account-wide `$MQTT.JSA.*.RD` subscription, `processRetainedMsgDel`,
+`notifyRetainedMsgDeleted`, and the `mqttRetMsgDel` type. Stated precisely, `RD`
+was not pure redundancy — it was an independent best-effort repair for one case,
+a remote broker whose `AckNone` tombstone delivery was lost, where the origin's
+sequence-carrying notification might still land. Removing it therefore WIDENS the
+window of F-059's stale-tombstone arm — that arm now waits for the retained cache
+copy to expire and a matching subscription to arrive, where the notification might
+have retired the entry sooner. It does not make the arm unbounded: the next
+matching subscription's `loadRetainedMessages` reads the tombstone and removes the
+index entry. The widening is disclosed in F-059 and in `docs/CONFORMANCE.md`. Note
+that F-059's sequence watermark does NOT by itself replace what `RD` was doing: a
+watermark orders the writers that run, and a lost `AckNone` delivery runs no
+writer at all. Covering the loss case needs a replayable consumer or a
+reconciliation against stream progress — and specifically for the ABSENT-index
+case, which no subscription reaches — which is why F-059 states the two
+requirements separately. `RD` is
+removed anyway because a lossy fire-and-forget second channel is dedup-grade
+redundancy standing in for the sequence arbitration that is actually missing —
+not because it was doing nothing.
+
+**The legacy JSON reader** is gone: an absent `Nmqtt-RFlags` header now returns
+`errMQTTRetainedMsgUnsupportedFormat`, a distinct sentinel from
+`errMQTTInvalidRetainFlags`, because "this is not a format we write" and "these
+flags are out of range" are different facts. `mqttRetainedMsg` lost its `json:`
+tags with the fallback, which were its only remaining users.
+
+**The old-server tombstone delete marker** is gone from both the encoder and the
+decoder. An empty body is the tombstone on its own.
+
+**The compaction delete beside the notification is also removed**, a deliberate
+delta from the original dossier's "preserving current tombstone processing and
+cleanup". `deleteRetainedMsg(rmSeq)` was provably inert when it did what it
+intended and destructive when it did not. The mechanism claim it rested on — that
+storing an empty body does not evict the prior record — is false for the pinned
+backend: nats-server v2.14.4 `filestore.go storeRawMsg` enforces the per-subject
+limit on every store (`for psmax && psmc > mmp { removeMsgViaLimits(fseq) }`)
+with no empty-body or TTL exception, so the prior record is already gone and the
+delete is a "no message found" no-op. Under the F-059 reordering, however,
+`rmSeq` is the sequence of a NEWER live record and the call deletes the
+authoritative current one — durable data loss. Removing it eliminates the single
+durably destructive consequence of that pre-existing race; what remains of F-059
+is volatile-index staleness only. The eviction premise is pinned empirically by an
+assertion that a deleted subject holds exactly one stream record.
+
+`docs/PORTING.md` item 8 is rewritten as a correction rather than a re-explanation.
+Its original mechanism claim is not merely imprecise, it is self-defeating: if
+storing the tombstone had not evicted the predecessor, deleting the tombstone would
+leave the predecessor as the subject's last record — but under the pinned backend
+the predecessor is already gone, so deleting the tombstone leaves NO record, which
+reads as deleted just the same. Whatever the original resurrection really was
+cannot be reconstructed from what that item wrote down, and no substitute story is
+invented in its place. Keeping the tombstone remains worthwhile for a reason about
+DELIVERY rather than storage — it is the record whose delivery makes other brokers
+drop their index entry, and a deleted message is never delivered — which is stated
+there in those terms.
+
+That destructive window is no longer only an argument. A review round pointed out
+that nothing exercised it — the happy path makes the delete inert, so restoring it
+fails no test — and it is now reproduced deterministically by
+`TestRetainedDelayedTombstoneKeepsNewerRecord`, using a new instance-scoped test
+seam (`testRetainedApplyGate`, nil in production) that parks one tombstone's
+consumer callback while the local seed of a newer publish runs ahead of it.
+Restoring the delete destroys the newer record outright: the subject's stream
+record is gone (`message not found`), which is the mutation the removal needed.
+
+**Rejection is now fail-closed on every reading path.** `processRetainedMsg`'s
+silent return WAS the old-server-ignore mechanism; with the marker gone, a decode
+failure there is a real anomaly. It now warns with the subject and the error and
+evicts the subject's index and cache entry. Log-and-return alone would have been
+fail-open: a corrupt record REPLACING a valid one leaves nothing servable in the
+stream, so a surviving index entry or cached copy would keep serving a value the
+durable authority has lost. The eviction uses the logical retained key — the
+stream subject with the `$MQTT.rmsgs.` prefix trimmed — because the index is keyed
+without it; the untrimmed subject would match nothing and silently preserve the
+fail-open behavior. This matches `loadRetainedMessages`, which already warned and
+evicted, so the live and post-restart views of a corrupt record now agree. The
+eviction is itself unconditional, so under F-059 a delayed corrupt-record callback
+can evict a newer valid entry: the same volatile-staleness class F-059 owns, and
+the F-059 fix must arbitrate this writer too.
+
+The eviction also exposed a genuine pre-existing defect, which had to be fixed
+before it could ship. `mqttSliceHeaders` compared the delimiter search's offset —
+which is relative to the remaining slice — against the absolute scan position
+(`del == i`), so a key whose length equalled that position ended the scan and
+discarded that header and every one after it. The first header sits at
+`len(hdrLine) == 10`; `Nmqtt-RExp` is exactly ten characters, and NATS emits
+headers in map order, so roughly one retained message in seven carrying an MQTT
+5.0 Message Expiry lost `Nmqtt-RFlags` along with the rest and became
+undecodable. Before this change that was invisible and nearly harmless — the
+publishing broker's local seed had already indexed the record, and the failed
+callback returned silently — but every REMOTE broker, which has no seed, simply
+never indexed those retained messages. With the eviction in place it became
+active loss: the callback removed the correctly seeded entry. The guard is now
+`del == 0`, which is what a zero-length key actually is and which the empty-key
+check below it already covered independently. `docs/PORTING.md` item 10 records
+it, and the "key length equals the scan position" row pins it (mutation M9).
+This is why `make full-suite` failed once at the end of verification, on
+`TestV5RetainedMessageExpiry`: the run-to-run header ordering decides whether the
+alignment is hit. The same test passes 12/12 on the parent commit, which is what
+identified the change rather than the environment as the trigger.
+
+Making that eviction actually closed took a second change, which a review round
+caught: `removeRetainedMsg` returned early — without touching `rmsCache` —
+whenever the index held no entry for the subject. Cache-present with index-absent
+is reachable, and is F-059's own first arm: an exact-filter subscription caches
+unconditionally while only the callback and the local seed ever index. In that
+state a corrupt replacement evicted nothing, and a later valid add re-indexed the
+subject WITHOUT refreshing the cache, so the stale predecessor became servable
+again. A `seq == 0` removal now deletes the cached copy whether or not the index
+holds an entry, which is what "remove whatever is there" meant all along; a
+`seq > 0` removal is unchanged, since it names one specific record.
+
+Scope, stated precisely: a foreign record carrying a valid `Nmqtt-RFlags` header
+is still accepted — cross-account sourcing is a supported topology — and malformed
+OPTIONAL headers (properties, expiry) are still ignored rather than rejected.
+Only headerless or otherwise undecodable records fail closed.
+
+Compatibility: pre-release, no released persisted-state contract. A legacy JSON
+record or a `-1` marker tombstone left in a development stream is warned about and
+never served; the remedy is republishing the retained message or recreating the
+`$MQTT_*` streams. Mixed old/new development fleets are not a supported topology,
+and this is an intentional refusal rather than an oversight — new-broker writes
+still decode on an old broker, and a delivered old-broker marker tombstone now
+converges immediately, since warn-and-evict is exactly the state that tombstone
+intended.
+
+Tests: five native tests in `retained_convergence_test.go` run in the default
+tree under `-race`, because no running suite covered multi-broker retained
+convergence at all (`mqtt_cluster_ref_test.go` is build-tagged
+`mqttport_clustertests` and never builds).
+`TestRetainedCrossBrokerConvergence` proves a non-publishing broker learns both a
+retained message and its deletion from the stream alone, and asserts the durable
+residue: the last record for the subject is the empty-body tombstone and it is the
+only record for that subject. `TestRetainedCorruptRecordFailsClosed` plants an
+undecodable record BEFORE a valid one so the valid record's arrival in a restarted
+broker's index is an ordering barrier proving the corrupt one was already
+processed, then requires the rejection warning naming the subject and the
+sentinel. `TestRetainedCorruptReplacementEvictsCachedPredecessor` warms both the
+index and `rmsCache` through an exact-filter subscription before injecting the
+corrupt replacement, and is the test a log-and-return implementation fails.
+`TestRetainedEvictionClearsCacheWithoutIndexEntry` reproduces cache-present with
+index-absent and proves the eviction reaches the cache there.
+`TestRetainedDelayedTombstoneKeepsNewerRecord` is the compaction-delete
+reproduction described above.
+
+Nine mutations were run, each failing its paired test: restoring the JSON
+fallback, treating a missing header as `flags=0`, skipping the tombstone removal,
+re-adding the encoder's delete marker, reverting the decode-failure eviction to
+log-and-return, restoring the decoder's marker strip, reverting the cache delete
+to index-gated, restoring the compaction delete, and restoring the
+`del == i` header-scan guard. The marker-strip mutation is
+paired with a permanent decode row requiring `Nmqtt-RFlags:-1` to be rejected,
+without which nothing pinned the decoder half — the encoder mutation alone leaves
+it uncaught. One predicted signature was wrong and is recorded as such:
+re-adding the encoder's delete marker does NOT fail
+`TestRetainedCrossBrokerConvergence`, because the decode-failure eviction
+converges a delivered marker tombstone to exactly the state that tombstone
+intended; the empty-body round-trip decode row is its real pairing.
+
+`internal/mqtt/mqtt.go`; `retained_convergence_test.go`, `mqtt_test.go`,
+`mqtt_v5_test.go`.
+
+### Original finding record
+
+Preserved from `pre-release-migrations.md` as it existed on 2026-08-10.
+
+**Title:** Remove inherited retained-message format and delete-protocol compatibility
+
+- Status: Open
+- Classification: Pre-release persistence compatibility cleanup
+- Release treatment: Immediate cleanup before further MQTT-core implementation
+
+#### Evidence
+
+The retained-message path still carries three coordinated compatibility mechanisms:
+
+- `mqttDecodeRetainedMessage` falls back to JSON when the current
+  `Nmqtt-RFlags` header is absent. The production encoder always emits the
+  header-based format; direct JSON fixtures exist only to exercise the inherited
+  legacy reader.
+- Empty retained-message tombstones prepend `mqttRetainedFlagDelMarker` so older
+  servers fail to decode and ignore them. No older bridge release or supported
+  mixed-version fleet exists.
+- Every account manager subscribes to the internal `RD` retained-delete
+  notification protocol. `processRetainedMsg` publishes that notification and
+  `processRetainedMsgDel` consumes it, even though current brokers already observe
+  the authoritative retained-stream tombstone. The source comments explicitly
+  identify this as backward compatibility intended for later removal.
+
+This is inherited compatibility with older NATS Server MQTT persistence, not MQTT
+wire-protocol compatibility. Keeping it expands the accepted storage format and
+adds an account-wide subscription, sender, receiver, message type, and tests to
+every current broker.
+
+#### Commit-sized resolution
+
+Land one retained-message compatibility cleanup commit:
+
+1. Remove the `RD` constant, subscription, message type, sender, receiver, and
+   notification call while preserving current tombstone processing and cleanup.
+2. Require the current header-based retained record, remove the JSON fallback and
+   old-server delete-marker encoding, and keep validation of all current headers.
+3. Replace legacy-format fixtures with current-format corruption and restart
+   coverage where the underlying validation remains relevant.
+
+Acceptance requires retained publish, replacement, deletion, restart recovery,
+expiry, malformed-header, and multi-broker cache-convergence tests. A retained
+record without the current required headers must be rejected with a clear log; it
+must never be interpreted as another format.
+
 ## F-057
 
 **Title:** Replace legacy reserved-subscription migration with current-schema refusal

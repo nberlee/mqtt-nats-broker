@@ -287,8 +287,10 @@ func TestValidateMsgsStream(t *testing.T) {
 }
 
 // validateRetainedStream: the acceptance rows pin the two findings that make
-// this list unlike any other — DenyDelete is compaction-only (the empty-body
-// tombstone plus MaxMsgsPer:1 replacement carry correctness; mutation 10) and
+// this list unlike any other — DenyDelete is waived because this owner issues no
+// delete API request at all (the empty-body tombstone plus MaxMsgsPer:1
+// replacement carry correctness, and both the store-time eviction and TTL
+// reaping are store-internal, ungated by DenyDelete; mutation 10) and
 // Sources is a supported cross-account topology (mutation 11). The Sources row
 // cannot be left to TestMQTTCrossAccountRetain: that test adds the source
 // AFTER the manager initialized, so an over-strict validator would pass it and
@@ -351,7 +353,7 @@ func TestValidateRetainedStream(t *testing.T) {
 		name string
 		mut  func(cfg *StreamConfig)
 	}{
-		{"deny delete is not a prerequisite (compaction only)", func(c *StreamConfig) { c.DenyDelete = true }},
+		{"deny delete is not a prerequisite (no delete API request is issued)", func(c *StreamConfig) { c.DenyDelete = true }},
 		{"deny purge is not a prerequisite", func(c *StreamConfig) { c.DenyPurge = true }},
 		{"sources are a supported topology", func(c *StreamConfig) { c.Sources = []*StreamSource{{Name: "X"}} }},
 		{"consumer inactivity limit is enforced at the consumer create", func(c *StreamConfig) { c.ConsumerLimits.InactiveThreshold = time.Minute }},
@@ -780,7 +782,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		register()
 		d["AllowMsgTTL"] = fieldDisposition{kind: dispRejected, errWant: "allow_msg_ttl"}
 		d["MaxConsumers"] = fieldDisposition{kind: dispRejected, errWant: "max_consumers"}
-		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "deletes here are best-effort compaction; the empty-body tombstone plus MaxMsgsPer:1 replacement carry correctness, and TTL expiry is store-internal reaping DenyDelete does not gate"}
+		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "this owner issues no delete API request; the empty-body tombstone plus MaxMsgsPer:1 replacement carry correctness, and both that store-time eviction and TTL expiry are store-internal reaping DenyDelete does not gate"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing ever purges retained messages"}
 		d["Sources"] = fieldDisposition{kind: dispWaived, reason: "supported cross-account retained sourcing topology; the decoder handles sourced records explicitly"}
 		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispWaived, reason: "a stream limit below the requested 5 minutes already fails initialization at the consumer create itself, naming the consumer; a validator entry would duplicate that enforcement"}

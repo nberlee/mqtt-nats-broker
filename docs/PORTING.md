@@ -176,10 +176,11 @@ were adapted as follows:
 Notably NOT skipped (they surfaced real bugs, now fixed — see below):
 `SetLogger`-based log capture now works (the shim routes slog to the test
 logger); the retained-then-subscribe timing races are fixed by seeding the
-retained index synchronously at publish; the cross-restart retained-delete
-durability bug is fixed by keeping the (TTL-less) delete tombstone as the
-subject's last message; and the `$MQTT.*` publish spoof is rejected
-broker-side.
+retained index synchronously at publish; retained deletion keeps the (TTL-less)
+tombstone as the subject's last message, so peer consumers observe the deletion
+(item 8 below explains why the cross-restart resurrection this was once credited
+with cannot have happened by the mechanism it claimed); and the `$MQTT.*` publish
+spoof is rejected broker-side.
 
 ## Resolved: the disconnect / stored-delivery gap
 
@@ -260,16 +261,35 @@ then driving the skip count down, found nine genuine bugs, all in
    **synchronously** at store time (`mqttHandlePubRetain` uses the `storeMsg`
    sequence), so retained-then-subscribe is deterministic on that node for
    wildcard filters too. (`processSubs` + `mqttHandlePubRetain`, mqtt.go.)
-8. **A deleted retained message could resurface after a cold restart.** On an
-   empty-body (delete) publish the code stored a tombstone and then deleted
-   the tombstone, relying on `MaxMsgsPer=1` having evicted the prior message.
-   But the retained stream is `MaxMsgsPer=1` **+ `AllowMsgTTL`**, and storing
-   an empty body does NOT evict the prior message the way a non-empty
-   replacement does — so deleting the tombstone left the original, which
-   reloaded on restart. Fixed by keeping the tombstone (it carries no TTL, so
-   it stays the subject's last message and `loadRetainedMessages` reads it back
-   as "deleted") and instead deleting the prior message by its known sequence
-   (`processRetainedMsg`, mqtt.go).
+8. **The retained-deletion item is preserved as a correction, not as an
+   explanation.** This entry used to describe a deleted retained message
+   resurfacing after a cold restart, and attributed it to a mechanism that is
+   false against the pinned backend: it claimed that storing an empty body does
+   NOT evict the prior message the way a non-empty replacement does.
+   `MaxMsgsPer=1` enforcement runs on every store with no empty-body exception
+   (nats-server v2.14.4 `filestore.go storeRawMsg`), so the predecessor is
+   already gone once the tombstone is stored. The stated resurrection path —
+   "deleting the tombstone left the prior message as the subject's last record"
+   — therefore cannot have happened as described: with the predecessor already
+   evicted, deleting the tombstone leaves the subject with NO record, which is
+   read as deleted just the same. What the original diagnosis really was cannot
+   be reconstructed from what it wrote down, so no replacement story is invented
+   here.
+   What is true of the code now: an empty-body publish stores a tombstone that
+   evicts its predecessor at store time; the tombstone carries no TTL and stays
+   the subject's last record; last-per-subject reads interpret that empty body
+   as "deleted"; and no explicit delete is issued at all — the compaction delete
+   written on the strength of the false premise was removed by
+   [F-056](findings/resolved.md#f-056), which also demonstrated that keeping it
+   destroys a newer record when a tombstone callback is delayed past a newer
+   publish (`TestRetainedDelayedTombstoneKeepsNewerRecord`).
+   Retaining the tombstone rather than deleting it is still worth doing, for a
+   reason about DELIVERY rather than about storage: the tombstone is the record
+   whose delivery makes every other broker's consumer drop its index entry, and
+   a deleted message is never delivered. Removing it can therefore strand a
+   peer's index entry until that peer restarts.
+   `TestRetainedCrossBrokerConvergence` asserts a deleted subject holds exactly
+   one stream record, which is what pins the eviction premise.
 9. **An MQTT client could publish into the broker's internal `$MQTT.*`
    namespace.** A client mapping a `$MQTT/JSA/...` topic onto `$MQTT.JSA.*`
    could forge session-persist / JSA traffic and evict or corrupt other
@@ -279,6 +299,23 @@ then driving the skip count down, found nine genuine bugs, all in
    a real gap that the shipped example `test/conformance/nats.conf` (which
    gave the `mqtt` user `publish: ">"`) did not. Defense in depth: that config
    now also denies `$MQTT.>` publish for the client user.
+10. **`mqttSliceHeaders` silently dropped every header from a given point.**
+    The delimiter search returns an offset into the REMAINING slice, but the
+    zero-length-key guard compared it against the absolute scan position
+    (`del == i`). Whenever a key's length happened to equal that position the
+    scan stopped, discarding that header and all after it. The first header
+    starts at `len(hdrLine) == 10`, so any ten-character key triggered it —
+    `Nmqtt-RExp` is exactly ten, and NATS emits headers in map order, so this
+    hit roughly one retained message in seven that carried an MQTT 5.0 Message
+    Expiry, dropping `Nmqtt-RFlags` with the rest and making the record
+    undecodable. Inherited from the upstream parser. The guard is now
+    `del == 0`, which is what a zero-length key actually is (and which the
+    empty-key check below it already covered). Found because
+    [F-056](findings/resolved.md#f-056) made an undecodable record evict its
+    index entry: before that, the publishing broker's local seed masked it, so
+    only brokers that had no seed — every REMOTE broker — silently failed to
+    index the affected retained messages. Pinned by the "key length equals the
+    scan position" row in `TestMQTTSliceHeadersAndDecodeRetainedMessage`.
 
 The log-capture tests (`TestMQTTStart`, `TestMQTTConnectNotFirstPacket`,
 `TestMQTTClientIDInLogStatements`) now pass rather than skip: the harness
