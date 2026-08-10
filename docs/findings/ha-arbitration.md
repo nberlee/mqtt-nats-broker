@@ -4,6 +4,9 @@ These findings share one architectural dependency: JetStream per-subject CAS is 
 linearization point only within a leader term. Treat them as one design epic before
 scheduling stream-specific work.
 
+Multi-frontend HA is supported alpha scope (decided 2026-08-10, `docs/ROADMAP.md`
+section 0.2), so every finding here is an unconditional alpha blocker.
+
 The text under each “Original finding record” heading is preserved from the roadmap as
 it existed on 2026-08-10.
 
@@ -13,7 +16,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 27
 
 ### Original finding record
@@ -33,7 +36,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 29
 
 ### Original finding record
@@ -51,7 +54,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 30
 
 ### Original finding record
@@ -69,7 +72,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 31
 
 ### Original finding record
@@ -86,7 +89,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 32
 
 ### Original finding record
@@ -104,7 +107,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 33
 
 ### Original finding record
@@ -120,7 +123,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 34
 
 ### Original finding record
@@ -136,7 +139,7 @@ it existed on 2026-08-10.
 
 - Status: Open
 - Classification: HA arbitration architecture
-- Release treatment: Alpha blocker while multi-frontend HA is supported
+- Release treatment: Alpha blocker
 - Original roadmap order: 36
 
 ### Original finding record

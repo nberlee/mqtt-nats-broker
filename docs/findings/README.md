@@ -10,34 +10,34 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 ## Active findings
 
 - Repair a recognised session-record fork.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-027](ha-arbitration.md#f-027).
 - Preserve deferred disconnect state during foreign disposition.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
 - Arbitrate simultaneous takeovers from one session-record base.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-029](ha-arbitration.md#f-029).
 - Add write lineage to the Will outbox.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-030](ha-arbitration.md#f-030).
 - Add write lineage to Will-cancellation watermarks.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-031](ha-arbitration.md#f-031).
 - Add write lineage to inbound QoS 2 holds and release claims.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-032](ha-arbitration.md#f-032).
 - Add write lineage to shared QoS 2 assignment claims.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-033](ha-arbitration.md#f-033).
 - Add write lineage to outbound in-flight registers.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-034](ha-arbitration.md#f-034).
 - Bound every server-initiated courtesy DISCONNECT write.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-035](runtime-correctness.md#f-035).
 - Revalidate ownership for otherwise quiet resident sessions.
-  Status: Open. Release treatment: Alpha blocker while multi-frontend HA is supported.
+  Status: Open. Release treatment: Alpha blocker.
   Details: [F-036](ha-arbitration.md#f-036).
 - Make a rejected finite disconnect stamp crash-safe.
   Status: Open. Release treatment: Alpha blocker.

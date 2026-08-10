@@ -62,33 +62,40 @@ formats that no user release depends on. Each checkbox is one commit.
 These cleanups do not remove MQTT wire compatibility or the operator migration
 guide from NATS Server's embedded MQTT listener.
 
-### 0.2 Decide the supported HA scope
+### 0.2 The supported HA scope: multi-frontend
 
-The first decision is whether the alpha supports multiple MQTT frontends against a
-replicated JetStream cluster. The README currently promises horizontally scalable,
-cross-instance HA. If that promise remains, every conditional item in this
-subsection is an alpha blocker. If the first alpha is explicitly single-frontend,
-record that limitation in the README and conformance documentation and schedule
-this epic after alpha.
+Decided 2026-08-10: the first alpha supports multiple MQTT frontends against a
+replicated JetStream cluster, keeping the README's horizontally scalable,
+cross-instance HA promise. Every item in this subsection is therefore an
+unconditional alpha blocker. Their shared dependency is that JetStream
+per-subject CAS linearizes only within a leader term ("JetStream behaviors this
+design depends on", `docs/ARCHITECTURE.md`), so F-027, F-029 and F-036 are one
+arbitration design, made before the per-stream write-lineage items rather than
+per stream.
 
-- [ ] Decide and document the first-alpha HA support level.
+- [x] Decide and document the first-alpha HA support level. Decided: multi-frontend
+  HA stays in alpha scope. The README already promises it, the architecture is
+  built for it (stateless frontends, all durable state in JetStream,
+  cross-instance takeover), and a single-frontend alpha would defer the epic
+  this project exists to deliver. The items below stop being conditional, and
+  the dossier release-treatment lines record the same resolution.
 - [ ] [F-027: Repair a recognised session-record fork](findings/ha-arbitration.md#f-027).
-  **Conditional; very large.** Define the recoverable state and an arbitration
+  **Very large.** Define the recoverable state and an arbitration
   mechanism before implementation.
 - [ ] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
-  **Conditional; very large.** This shares the F-027 arbitration design.
+  **Very large.** This shares the F-027 arbitration design.
 - [ ] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
-  **Conditional; large.**
+  **Large.**
 - [ ] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).
-  **Conditional; large.**
+  **Large.**
 - [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
-  **Conditional; large.**
+  **Large.**
 - [ ] [F-033: Add write lineage to shared QoS 2 assignments](findings/ha-arbitration.md#f-033).
-  **Conditional; large.**
+  **Large.**
 - [ ] [F-034: Add write lineage to outbound in-flight registers](findings/ha-arbitration.md#f-034).
-  **Conditional; large.**
+  **Large.**
 - [ ] [F-036: Revalidate quiet resident-session ownership](findings/ha-arbitration.md#f-036).
-  **Conditional; very large.** Design this with F-027/F-029 rather than as a
+  **Very large.** Design this with F-027/F-029 rather than as a
   periodic-read patch.
 
 ### 0.3 Confirmed alpha blockers
@@ -403,8 +410,9 @@ them in order where a later lint change depends on an earlier cleanup.
 The first alpha may be tagged only when:
 
 - [ ] Every unconditional alpha blocker is complete.
-- [ ] The supported HA scope is documented, and every conditional blocker for
-  that scope is complete.
+- [x] The supported HA scope is documented: multi-frontend (section 0.2,
+  decided 2026-08-10). Its blockers are unconditional, so the gate above
+  covers them.
 - [ ] Every release-verification investigation is closed or has produced a
   confirmed finding with an explicit release disposition.
 - [ ] Every post-alpha candidate has an explicit disposition; an unchecked
