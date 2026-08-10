@@ -5,7 +5,8 @@ roadmap section 0. They remain here as design evidence, including invariants, re
 approaches, verification, and residual risks.
 
 The text under each “Original finding record” heading is preserved from the roadmap as
-it existed on 2026-08-10.
+it existed on 2026-08-10 — or, for a finding resolved after the dossiers were split out,
+from its own dossier. Each record names its source.
 
 ## F-001
 
@@ -75,6 +76,9 @@ certificate-rollover behavior
 - Classification: Resolved finding
 - Release treatment: Completed
 - Original roadmap order: 5
+- Superseded in part: the "legacy entries are purged from resumed session records"
+  half of the original record was replaced by a fail-closed REFUSAL at the restore
+  boundary under [F-057](#f-057). The namespace denial itself is unchanged.
 
 ### Original finding record
 
@@ -1833,3 +1837,130 @@ not classify —…
   `docs/CONFORMANCE.md`, "A forked session record is RECOGNISED, and nothing more".
   `internal/mqtt/mqtt.go`, `sess_recordtx.go`, `sess_fork_lineage.go`;
   `sess_persist_evict_test.go`.
+
+## F-057
+
+**Title:** Replace legacy reserved-subscription migration with current-schema refusal
+
+- Status: Resolved
+- Classification: Pre-release session-schema migration cleanup
+- Release treatment: Completed; the live `$MQTT.>` SUBSCRIBE denial is unchanged
+- Original dossier: `pre-release-migrations.md`
+
+### Resolution
+
+`purgeReservedSubs` and its `denied`-list plumbing are deleted. A session record
+carrying a subscription key in the reserved `$MQTT.>` namespace is now REFUSED at the
+CONNECT restore boundary by `mqttReservedMembershipInRecord`, which is read-only and
+runs ahead of every other branch — the generation validation, the teardown adoption, the
+overdue discard, and the resume construction — so no name is ever derived from such a
+record and nothing is written to it. The diagnostic names the offending key and tells
+the operator to stop the account's brokers and recreate the bridge-owned `$MQTT_*`
+streams. No CONNACK is sent, matching the malformed-generation refusal below it.
+
+Ordering ahead of the generation check is load-bearing, and it is a correction the
+holistic review forced: the namespace deny (3610eb3, 2026-07-27) PREDATES
+generation-scoped naming (`mqttSessGenFromRecord`, ab683d9, 2026-07-30), so a broker old
+enough to have written a reserved membership wrote no `gen` either. With the checks in
+the other order every record that can really exist got the generation refusal and the
+key-naming diagnostic was unreachable. Both refusals are read-only and both prescribe
+recreating the streams, so the order decides only which message the operator sees.
+A reserved key alongside a *valid* generation is a shape no writer could produce; it is
+refused all the same, because a fail-closed schema boundary is not owed a provenance
+story.
+
+The validator looks in `Subs`, `SharedSubs`, `Cons` and `Drains`, through two key
+shapes: the `$MQTT.` prefix (plain filters and the synthetic level-up sid) and, for a
+`$share/{group}/{subject}` key, the prefix test applied to the underlying subject.
+`Cons` and `Drains` are checked because a record can carry a reserved consumer with no
+membership left to name it — a shape the old membership-driven migration left behind
+entirely.
+
+Scope, stated precisely: the refusal guarantees such a record is never HONORED. It is
+deliberately not a quarantine. The expiry sweep's `clear()`, teardown adoption by the
+expiry and orphan sweeps, and the orphan-consumer sweep keep treating the record's
+keys as ordinary subjects while DESTROYING state — but only while the record's
+generation is valid. A record with no valid generation is reclaimed by none of them
+(the expiry path refuses to act, teardown adoption validates first, and the
+orphaned-consumer sweep counts the record's consumers as referenced), so it waits for
+the operator. That is the pre-existing consequence of the generation refusal rather
+than something this change introduced, and it is why the diagnostic offers no
+work-around: an earlier draft suggested connecting under a different client ID, which
+would have left the record and its consumers in place forever. A clean-start CONNECT is
+refused too:
+`createOrRestoreSession` runs before `processConnect`'s clean-session check, and the
+discard it would take deletes the record's consumers — the same migration under
+another name.
+
+Residual: a refused restore returns while the client ID is still registered in
+`sessLocked`, and `expireSessionFromRecord` yields to that registration without
+re-arming the one-shot timer it consumed, so a due expiry can be deferred to a later
+sweep pass. Pre-existing, shared with the malformed-generation refusal, and stated in
+`docs/CONFORMANCE.md`.
+
+Tests: `TestMQTTReservedRecordRefusesRestore` replaces the three migration tests with
+eight record shapes (plain, shared membership, shared `Cons`-only, level-up
+`Cons`-only, `Drains`-only, overdue deadline, generationless, claimed teardown), each
+asserting a refused CONNECT with no CONNACK, a byte-identical record at the same stream
+sequence, surviving JetStream durables, an identically refused clean-start retry, and
+the complete formatted diagnostic. Six mutations were run against it: removing the
+validator call (all eight rows fail), narrowing it to `Subs` (four fail), dropping the
+shared-key arm (two fail), skipping `Cons` and `Drains` (three fail), moving the
+validator below the overdue-discard branch (the overdue, generationless and
+claimed-teardown rows fail — that move also puts it below the teardown branch and the
+generation check), and moving it back below only the generation check (the
+generationless row alone fails, which is why that row exists).
+
+`internal/mqtt/mqtt.go`, `sess_resume_reconcile.go`; `reserved_namespace_test.go`.
+
+### Original finding record
+
+Preserved from `pre-release-migrations.md` as it existed on 2026-08-10.
+
+**Title:** Replace legacy reserved-subscription migration with current-schema refusal
+
+- Status: Open
+- Classification: Pre-release session-schema migration cleanup
+- Release treatment: First cleanup before further MQTT-core implementation;
+  preserve the live `$MQTT.>` security boundary
+
+#### Evidence
+
+`purgeReservedSubs` is a full migration for a session record created before the
+broker denied subscriptions to its internal `$MQTT.>` namespace. On CONNECT it:
+
+- removes old plain and shared memberships through a session-record transaction;
+- stages in-flight registration cancellations;
+- determines whether other sessions retain shared durables;
+- deletes plain, shared, and synthetic level-up consumers only after a confirmed
+  save; and
+- carries definite-failure rollback and ambiguous-write continuation behavior.
+
+The accompanying integration tests construct old records and consumers solely to
+prove that this migration succeeds and rolls back atomically. No released bridge
+ever wrote those records. The machinery therefore contradicts the current policy
+that development streams may be recreated instead of upgraded, and it adds a
+large mutation path to the already sensitive CONNECT restore transaction.
+
+The security behavior itself is not obsolete. A new SUBSCRIBE must continue to
+reject every explicit `$MQTT.>` filter, and per-client NATS permissions remain
+defense in depth.
+
+#### Commit-sized resolution
+
+Land one session-schema cleanup commit:
+
+1. Validate restored `Subs`, `SharedSubs`, and their consumer references before
+   publishing or resuming the session.
+2. If a record contains a reserved membership, refuse restoration with an
+   actionable instruction to stop the account's brokers and recreate the
+   bridge-owned development state.
+3. Delete `purgeReservedSubs`, its denied-list plumbing, migration fixtures, and
+   transactional migration tests. Replace them with fail-closed restore tests for
+   plain, shared, and level-up shapes.
+4. Update changelog and resolved-finding language so it promises refusal, not an
+   in-place upgrade, while retaining the documented namespace denial.
+
+Validation must happen before a malformed record can derive a consumer name or
+mutate broker-owned state. Ordinary current-format session resume and new
+SUBSCRIBE rejection must remain unchanged.

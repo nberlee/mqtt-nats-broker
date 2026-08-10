@@ -18,7 +18,7 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
-The 26 resolved findings are retained in the
+The 27 resolved findings are retained in the
 [resolved-findings archive](findings/resolved.md). The entries below are the active
 release view; their linked dossiers are canonical for mechanism, evidence,
 rejected designs, tests, and residuals.
@@ -30,16 +30,12 @@ persisted-state contract, so carrying these paths through subsequent session,
 retained-message, and Will changes would make every change maintain and test
 formats that no user release depends on. Each checkbox is one commit.
 
-- [ ] [F-057: Replace reserved-subscription migration with refusal](findings/pre-release-migrations.md#f-057).
-  **First; large deletion.** Reject incompatible restored session records with
-  recreate guidance, then remove the transactional purge and its old-record
-  fixtures. Keep live `$MQTT.>` SUBSCRIBE denial unchanged.
 - [ ] [F-056: Remove inherited retained-message compatibility](findings/pre-release-migrations.md#f-056).
-  **Second; medium.** Delete the legacy JSON reader, old-server tombstone marker,
+  **First; medium.** Delete the legacy JSON reader, old-server tombstone marker,
   and `RD` delete-notification protocol while preserving current-format retained
   deletion, restart recovery, expiry, and multi-broker convergence.
 - [ ] [F-058: Reject generationless delayed-Will records](findings/pre-release-migrations.md#f-058).
-  **Third; small.** Validate decoded outbox records before scan, cancellation, or
+  **Second; small.** Validate decoded outbox records before scan, cancellation, or
   publication and fail closed on the unsupported pre-generation format.
 
 These cleanups do not remove MQTT wire compatibility or the operator migration

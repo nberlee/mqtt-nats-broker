@@ -11,6 +11,9 @@ This audit does **not** apply to the roadmap's operator migration guide from NAT
 Server's embedded MQTT listener. That guide describes cutover from a different
 product and remains first-release documentation.
 
+F-057 (the reserved-subscription migration) is resolved and its record now lives in
+[the resolved-findings archive](resolved.md#f-057).
+
 ## F-056
 
 **Title:** Remove inherited retained-message format and delete-protocol compatibility
@@ -56,56 +59,6 @@ Acceptance requires retained publish, replacement, deletion, restart recovery,
 expiry, malformed-header, and multi-broker cache-convergence tests. A retained
 record without the current required headers must be rejected with a clear log; it
 must never be interpreted as another format.
-
-## F-057
-
-**Title:** Replace legacy reserved-subscription migration with current-schema refusal
-
-- Status: Open
-- Classification: Pre-release session-schema migration cleanup
-- Release treatment: First cleanup before further MQTT-core implementation;
-  preserve the live `$MQTT.>` security boundary
-
-### Evidence
-
-`purgeReservedSubs` is a full migration for a session record created before the
-broker denied subscriptions to its internal `$MQTT.>` namespace. On CONNECT it:
-
-- removes old plain and shared memberships through a session-record transaction;
-- stages in-flight registration cancellations;
-- determines whether other sessions retain shared durables;
-- deletes plain, shared, and synthetic level-up consumers only after a confirmed
-  save; and
-- carries definite-failure rollback and ambiguous-write continuation behavior.
-
-The accompanying integration tests construct old records and consumers solely to
-prove that this migration succeeds and rolls back atomically. No released bridge
-ever wrote those records. The machinery therefore contradicts the current policy
-that development streams may be recreated instead of upgraded, and it adds a
-large mutation path to the already sensitive CONNECT restore transaction.
-
-The security behavior itself is not obsolete. A new SUBSCRIBE must continue to
-reject every explicit `$MQTT.>` filter, and per-client NATS permissions remain
-defense in depth.
-
-### Commit-sized resolution
-
-Land one session-schema cleanup commit:
-
-1. Validate restored `Subs`, `SharedSubs`, and their consumer references before
-   publishing or resuming the session.
-2. If a record contains a reserved membership, refuse restoration with an
-   actionable instruction to stop the account's brokers and recreate the
-   bridge-owned development state.
-3. Delete `purgeReservedSubs`, its denied-list plumbing, migration fixtures, and
-   transactional migration tests. Replace them with fail-closed restore tests for
-   plain, shared, and level-up shapes.
-4. Update changelog and resolved-finding language so it promises refusal, not an
-   in-place upgrade, while retaining the documented namespace denial.
-
-Validation must happen before a malformed record can derive a consumer name or
-mutate broker-owned state. Ordinary current-format session resume and new
-SUBSCRIBE rejection must remain unchanged.
 
 ## F-058
 

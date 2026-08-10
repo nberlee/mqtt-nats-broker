@@ -107,10 +107,6 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
   Status: Open. Release treatment: Immediate cleanup before further MQTT-core
   implementation.
   Details: [F-056](pre-release-migrations.md#f-056).
-- Replace legacy reserved-subscription migration with current-schema refusal.
-  Status: Open. Release treatment: First cleanup before further MQTT-core
-  implementation while preserving the live `$MQTT.>` security boundary.
-  Details: [F-057](pre-release-migrations.md#f-057).
 - Reject generationless delayed-Will outbox records.
   Status: Open. Release treatment: Immediate cleanup before further MQTT-core
   implementation.
@@ -187,3 +183,5 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 - processSessionPersist evicted the rightful client on a remote PubAck it could not
   classify —….
   Details: [F-026](resolved.md#f-026).
+- Replace legacy reserved-subscription migration with current-schema refusal.
+  Details: [F-057](resolved.md#f-057).

@@ -4202,8 +4202,8 @@ func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 // The 3.1.1 forced leave runs before processSubs (so there is no shared cons entry), nils
 // the membership, and stages only register verdicts: voidRegistrationsLocked leaves a
 // TRANSMITTED delivery's cpending/pendingPublish entries "for the teardown's purge to
-// remove". UNSUBSCRIBE's no-cons branch and purgeReservedSubs leave the same shape. After
-// any of them BOTH views of the group are empty while the pending state is still live —
+// remove". UNSUBSCRIBE's no-cons branch leaves the same shape. After
+// either of them BOTH views of the group are empty while the pending state is still live —
 // which is why the purge derives its targets from that state instead.
 //
 // Mutation check: derive the targets from sharedSubs (or from any union of the two views)

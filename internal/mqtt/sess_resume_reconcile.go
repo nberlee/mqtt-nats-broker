@@ -60,7 +60,6 @@ package mqtt
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/nats-io/nuid"
 )
@@ -387,17 +386,15 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// group durables have their own machinery; drained sids are not in cons
 	// (stageDrain removed them) and their filters are not in subs unless a
 	// re-SUBSCRIBE adopted the drain — in which case the entry is back in cons
-	// and is verified here like any other. Filters in the reserved "$MQTT.>"
-	// namespace are excluded outright: subscription restoration denies and
-	// purges them, so the phase must never install interest for them. A stale
-	// Cons entry with no matching subscription is not an active delivery entry
-	// and is deliberately not verified (stated residual, docs/CONFORMANCE.md).
+	// and is verified here like any other. A stale Cons entry with no matching
+	// subscription is not an active delivery entry and is deliberately not
+	// verified (stated residual, docs/CONFORMANCE.md).
 	var entries []*mqttReconcileEntry
 	sess.mu.Lock()
 	idHash := sess.idHash
 	rmax := sess.rmax
 	for subject, qos := range sess.subs {
-		if qos == 0 || strings.HasPrefix(subject, mqttPrefix) {
+		if qos == 0 {
 			continue
 		}
 		reserved := isMQTTReservedSubscription(subject)

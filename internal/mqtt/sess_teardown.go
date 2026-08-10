@@ -26,11 +26,16 @@
 //     a newer owner exists, so delete nothing. A release is a sequence-targeted
 //     delete whose no-op is classified by re-reading, never assumed to be ours.
 //
-// Every CONNECT that reads a marker FINISHES it rather than overwriting it: it
-// adopts the teardown, repeats the (idempotent) deletions for the RETIRING
-// generation, releases the record, and only then starts a fresh session with a
-// fresh generation and Session Present false. That also makes a crashed teardown
-// self-healing, which today leaks until the orphan sweep.
+// Every CONNECT that can INTERPRET the record FINISHES a marker it reads rather than
+// overwriting it: it adopts the teardown, repeats the (idempotent) deletions for the
+// RETIRING generation, releases the record, and only then starts a fresh session with
+// a fresh generation and Session Present false. That also makes a crashed teardown
+// self-healing, which today leaks until the orphan sweep. A record the restore
+// boundary refuses is never adopted by the CONNECT: a reserved-namespace record whose
+// generation is valid is still finished by the expiry path and the orphan sweep, while
+// one with no valid generation is adopted by NOTHING — every deletion here is
+// generation-scoped, so there is no safe name to issue — and waits for an operator to
+// recreate the streams. See docs/ARCHITECTURE.md, teardown section.
 
 package mqtt
 
@@ -100,7 +105,8 @@ func (r mqttTeardownRelease) String() string {
 
 // mqttTeardownReleaseAttempts bounds the retry of a release whose delete did not
 // take while our marker was still current. Exhausting it leaves a marked record,
-// which the next CONNECT (or the orphan sweep) finishes — never a silent leak.
+// which the next CONNECT that can interpret it (or the orphan sweep, which needs no
+// CONNECT at all) finishes — never a silent leak.
 const mqttTeardownReleaseAttempts = 3
 
 // mqttTeardownClaimAttempts bounds the retry of a claim rejected by transient
@@ -206,8 +212,9 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 			// Our write landed after all; only the response was lost.
 			return smsg.Sequence, nonce, mqttTeardownClaimWon, nil
 		case cur.Teardown != nil:
-			// Another broker's teardown owns this record. It (or the next CONNECT to
-			// read the marker) finishes it; we delete nothing.
+			// Another broker's teardown owns this record. It (or the next reader that
+			// can interpret the record — a CONNECT, or a sweep) finishes it; we delete
+			// nothing.
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
 		case smsg.Sequence != seq:
 			// The record moved: a newer owner exists.

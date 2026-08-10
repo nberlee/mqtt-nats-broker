@@ -14,7 +14,10 @@
 // all three accumulate. This file converges them, and it converges the fourth
 // thing that would otherwise pin the other three in place: a teardown marker whose
 // broker died after claiming the record. sess_teardown.go promises such a marker is
-// finished by the next CONNECT or by the orphan sweep, and a marked record
+// finished by the next CONNECT that can interpret the record or by the orphan sweep —
+// and for a reserved-namespace record, which every CONNECT refuses, this pass is the
+// ONLY finisher (a record with no valid generation is finished by neither: the
+// adoption below validates before it deletes) — and a marked record
 // deliberately reads as a REFERENCE to everything it names, so without the adoption
 // pass below a never-returning client's QoS 2 state could never become eligible.
 //

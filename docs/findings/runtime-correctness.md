@@ -92,6 +92,10 @@ it existed on 2026-08-10.
 - Classification: Confirmed correctness or liveness defect
 - Release treatment: Alpha blocker
 - Original roadmap order: 45
+- Narrowed since: the preserved record below names three stranding paths;
+  `purgeReservedSubs` was deleted by [F-057](resolved.md#f-057), so two remain (the
+  3.1.1 forced leave and UNSUBSCRIBE's no-`cons` branch). The finding stands
+  unchanged on those.
 
 ### Original finding record
 

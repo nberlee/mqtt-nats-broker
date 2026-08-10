@@ -456,6 +456,29 @@ func setMQTTSessionExpirySweepInterval(d time.Duration) func() {
 	return func() { mqttSessionExpirySweepIntervalNS.Store(old) }
 }
 
+// Test hook: called once sweepSessionExpiries has finished a full pass over the
+// records. A test seeding an already-overdue record needs to know that the
+// STARTUP pass is behind it — that pass is launched asynchronously from the
+// account manager's own goroutine with no completion signal, so a test that
+// merely waited would race it arming an immediate expiry timer and deleting the
+// fixture out from under the assertion.
+//
+// Atomic for the same reason as the save hook: the sweep goroutine outlives the
+// test that created its account manager.
+var mqttTestSessExpirySweepPassHookV atomic.Pointer[func(as *mqttAccountSessionManager)]
+
+// setMQTTTestSessExpirySweepPassHook installs (or, with nil, clears) the sweep-pass
+// hook and returns a function that restores the previous value.
+func setMQTTTestSessExpirySweepPassHook(h func(as *mqttAccountSessionManager)) func() {
+	prev := mqttTestSessExpirySweepPassHookV.Load()
+	if h == nil {
+		mqttTestSessExpirySweepPassHookV.Store(nil)
+	} else {
+		mqttTestSessExpirySweepPassHookV.Store(&h)
+	}
+	return func() { mqttTestSessExpirySweepPassHookV.Store(prev) }
+}
+
 // Test hook: when set, sess.save() consults it and fails with the returned error
 // instead of persisting. Used to exercise persistence-failure rollback.
 //
@@ -1567,11 +1590,16 @@ type mqttPersistedSession struct {
 	CancelledRegs []string `json:"cancelled_regs,omitempty"`
 	// Teardown, when present, means a broker has CLAIMED this record's teardown and
 	// may be part way through deleting the incarnation's resources. Nobody may
-	// resume that state: every reader finishes the teardown (the deletions are
-	// idempotent and generation-scoped) and releases the record before starting
-	// fresh. The record keeps its full content under the marker precisely so any
-	// broker can finish the job, and so the orphan sweep still reads Cons /
-	// SharedSubs / Drains as referenced. See sess_teardown.go.
+	// resume that state: every reader that can INTERPRET the record finishes the
+	// teardown (the deletions are idempotent and generation-scoped) and releases the
+	// record before starting fresh. A reader that refuses the record's schema does not
+	// resume it either, but it does not finish it: the expiry path and the orphan
+	// sweep pick a reserved-namespace record up only while its GENERATION is valid,
+	// and one without a valid generation is adopted by nothing until the streams are
+	// recreated (docs/ARCHITECTURE.md, teardown section). The record keeps its full
+	// content under the marker precisely so any broker can finish the job, and so the
+	// orphan sweep still reads Cons / SharedSubs / Drains as referenced.
+	// See sess_teardown.go.
 	Teardown *mqttSessTeardown  `json:"teardown,omitempty"`
 	Will     *mqttPersistedWill `json:"will,omitempty"`
 	// Session Expiry Interval (seconds) and disconnect Unix time (0 while
@@ -5849,6 +5877,9 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
+	if h := mqttTestSessExpirySweepPassHookV.Load(); h != nil {
+		defer (*h)(as)
+	}
 	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
 	var swept int
 	for seq := uint64(1); ; {
@@ -6745,9 +6776,6 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		q2AffPrePacket = sess.q2AffGen != _EMPTY_
 		sess.mu.Unlock()
 	}
-	// Filters denied for being in the reserved namespace. On the CONNECT restore
-	// path these come from the persisted record and are purged from it below.
-	var denied []*mqttFilter
 	// Preload retained messages for all requested subscriptions.  Also, since
 	// it's the first iteration over the filter list, do some cleanup.
 	for _, f := range filters {
@@ -6787,10 +6815,13 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// "$MQTT.>" (the broker's internal subscriptions live on the service
 		// connection, so that deny is safe -- see processSub). The broker must not
 		// depend on that config being correct.
+		//
+		// The restore path cannot reach this: a record carrying such a filter is
+		// refused before it becomes a session (mqttReservedMembershipInRecord), so
+		// this denial only ever answers a live SUBSCRIBE.
 		if strings.HasPrefix(f.filter, mqttPrefix) {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = "cannot subscribe to internal server subject"
-			denied = append(denied, f)
 			continue
 		}
 
@@ -7166,10 +7197,6 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		addJSConsToSess(sid, jscons)
 	}
 
-	if !fromSubProto && len(denied) > 0 {
-		sess.purgeReservedSubs(c, tok, denied)
-	}
-
 	if fromSubProto {
 		wasUncertain := sess.isSeqUncertain()
 		if err = sess.update(tok, filters, true); err != nil {
@@ -7437,149 +7464,6 @@ func (sess *mqttSession) restoreSharedLiveMetadata(c *client, f *mqttFilter, qos
 		_, ldeliver, _ := mqttSharedNames(f.group, f.filter[:len(f.filter)-2])
 		setFields(ldeliver)
 	}
-}
-
-// purgeReservedSubs removes filters in the reserved "$MQTT.>" namespace from a
-// resumed session record and releases their consumer state.
-//
-// Such a filter can only be a legacy entry, persisted before the broker denied
-// the whole namespace at SUBSCRIBE. Denying it at restore is not enough on its
-// own: processSubs skips a denied filter without touching the record (only the
-// fromSubProto path calls sess.update), so the entry would sit in the session
-// forever and be re-denied on every single reconnect.
-//
-// Transactional, following the UNSUBSCRIBE path: persist the removals FIRST and
-// tear down consumers only once the save is confirmed, so a failed save cannot
-// leave the record claiming a subscription whose durable is already gone. The
-// maps must NOT be pre-cleared -- sess.update detects entries as it deletes
-// them, so a pre-emptied map leaves needUpdate false and silently skips the
-// save. A failure here is logged, not fatal: the filter is denied either way and
-// the next resume retries the cleanup. Spec5 [4.8.2].
-func (sess *mqttSession) purgeReservedSubs(c *client, tok recordTx, denied []*mqttFilter) {
-	snap := sess.snapshotSubs()
-	// Cancelled in the same write that removes the memberships, for the reason given in
-	// cancelPendingRegistrationsLocked: after that write there is no subscription left to
-	// redeliver a stranded identifier through.
-	sess.mu.Lock()
-	stagedCancels, _, voidedSent := sess.stageUnsubCancellationsLocked(nil, denied, nil)
-	sess.mu.Unlock()
-	// Everything the purge does once its record write is CONFIRMED, as a closure so a
-	// readback that later proves an ambiguous write landed can run it too. Skipping it
-	// then would leave the record without the reserved memberships while their
-	// consumers and group durables stayed behind, referenced by nothing.
-	// The token is a PARAMETER, never the captured one: this closure also runs as a
-	// landed continuation, long after the accept transaction that created `tok` has
-	// closed, and a write under a dead token is refused at entry. See retainOnLanded.
-	commitPurge := func(tok recordTx) {
-		// Durable in this purge's own record already; the tombstone is cleanup.
-		sess.secureRegCancellations(c, tok, stagedCancels)
-		// Persist confirmed. The memberships are already out of the record, so one
-		// scan now decides every shared durable this purge may release.
-		var sharedDurs []string
-		for _, f := range denied {
-			if f.shared {
-				sharedDurs = append(sharedDurs, mqttSharedDurablesForKey(f.sessionKey())...)
-			}
-		}
-		var heldShared map[string]bool
-		if len(sharedDurs) > 0 {
-			heldShared = sess.sharedDurablesHeldByOthers(sharedDurs)
-		}
-
-		// dropCons releases one sid's consumer state, mirroring removeJSCons in
-		// processUnsubs. A shared filter's group durable must be released even with
-		// no local cons entry: buildPersistedSessionLocked never persists shared
-		// consumers, so the realistic legacy record carries the membership and no
-		// entry at all.
-		dropCons := func(sid string) {
-			sess.mu.Lock()
-			cc, ok := sess.cons[sid]
-			if ok {
-				delete(sess.cons, sid)
-			}
-			sess.mu.Unlock()
-			if !ok {
-				if strings.HasPrefix(sid, string(mqttSharedSubPrefix)) && !strings.HasSuffix(sid, mqttMultiLevelSidSuffix) {
-					for _, dur := range mqttSharedDurablesForKey(sid) {
-						if heldShared[dur] {
-							continue
-						}
-						if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-							c.Errorf("MQTT: unable to delete shared consumer %q while purging a reserved subscription: %v", dur, err)
-						}
-					}
-				}
-				return
-			}
-			// Both helpers also drop the durable's pending deliveries; the shared one
-			// additionally returns its tmaxack charge and only deletes the group
-			// durable when no other member still holds it.
-			if cc.DeliverGroup != _EMPTY_ {
-				sess.releaseSharedConsumer(c, tok, cc, heldShared)
-				return
-			}
-			sess.mu.Lock()
-			regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
-			sess.mu.Unlock()
-			// Ordered before the consumer delete, not after it: a register whose store
-			// is still in flight must have something durable calling it cancelled
-			// before the consumer that would classify its source disappears — and when
-			// that cannot be achieved the durable stays rather than the identifier.
-			if !sess.secureRegCancellations(c, tok, cancels) {
-				c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for "+
-					"client %q are not durably recorded yet", cc.Durable, sess.id)
-			}
-			// Both before the consumer goes: after that, an unremoved register can no
-			// longer be classified and its identifier is reserved for good.
-			sess.deleteInflightRegisters(c, tok, regs)
-			sess.deleteConsumer(cc)
-		}
-
-		for _, f := range denied {
-			sid := f.sessionKey()
-			dropCons(sid)
-			// A multi-level filter also owns a synthetic level-up consumer; leaving it
-			// behind leaks a durable after the membership is gone.
-			if mqttNeedSubForLevelUp(sid) {
-				dropCons(sid[:len(sid)-2] + mqttMultiLevelSidSuffix)
-			}
-		}
-		c.Warnf("MQTT: purged %d subscription(s) to the reserved %s namespace from the session record", len(denied), mqttPrefix)
-	}
-	wasUncertain := sess.isSeqUncertain()
-	if err := sess.update(tok, denied, false); err != nil {
-		// Restore only when nothing was stored. An ambiguous write may already have
-		// removed these memberships, and putting them back would make the next save
-		// reinstate entries the record no longer has. See sess_uncertain.go.
-		undoPurge := func() {
-			sess.mu.Lock()
-			sess.subs = snap.subs
-			sess.sharedSubs = snap.shared
-			sess.rapSubs = snap.rap
-			sess.noLocalSubs = snap.noLocal
-			sess.subIDs = snap.subIDs
-			sess.mu.Unlock()
-			// The memberships are back, so their transmitted deliveries are live again.
-			sess.unvoidRegNonces(voidedSent)
-		}
-		switch sess.classifySave(wasUncertain, err) {
-		case saveDefinitelyFailed:
-			undoPurge()
-		case saveMaybeLanded:
-			// The purge continues either way (the filters are denied regardless), but
-			// the session must not be left unresolved: it runs during CONNECT, with the
-			// client bound, and every later save on it would be refused. Once the write
-			// is proven durable the release above is owed, and nothing else would
-			// perform it — under the RESOLVER'S token, since this packet's is gone by
-			// the time a deferred resolution runs it.
-			sess.retainOnLanded(func(rtok recordTx) { commitPurge(rtok) })
-			sess.resolveUncertainNow(c)
-		}
-		c.Errorf("MQTT: unable to purge %d legacy reserved-namespace subscription(s) from the session record: %v", len(denied), err)
-		return
-	}
-
-	commitPurge(tok)
 }
 
 // mqttSubSnapshot captures the pre-SUBSCRIBE state of the session's subscription
@@ -8299,6 +8183,65 @@ func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, e
 	return rm, nil
 }
 
+// mqttReservedMembershipInRecord returns the first subscription key in the
+// record that lies in the reserved "$MQTT.>" namespace, looking in Subs,
+// SharedSubs, Cons and Drains. Such a key can only have been written by a
+// development broker predating the namespace deny (processSubs has rejected
+// those filters ever since, and buildPersistedSessionLocked persists only what
+// the session holds), so the record's schema is UNSUPPORTED and restoration
+// fails closed before any name is derived from it — no migration, no
+// half-honored record. CONTRIBUTING.md forbids migration code before the first
+// release; the operator recreates the bridge-owned state instead.
+//
+// Such a record is almost certainly also generationless, since the deny predates
+// generation-scoped naming — which is why the caller runs this check BEFORE the
+// generation one. A reserved key alongside a VALID generation is a shape no writer
+// could produce (a broker new enough to mint generations already denied the filter);
+// it is refused all the same, because a fail-closed schema boundary is not owed a
+// provenance story.
+//
+// Read-only, and deliberately narrow: it checks the key SHAPES a pre-deny
+// writer could emit, not the record's schema in general. A shared key that does
+// not parse is skipped at restore anyway, and mqttPersistedDrain.Subject is not
+// independently checked — no writer, pre- or post-deny, can produce a drain
+// whose key is harmless while its subject is reserved (drains postdate the deny
+// entirely), and defending against a hand-tampered record is general schema
+// validation rather than this boundary.
+func mqttReservedMembershipInRecord(ps *mqttPersistedSession) (string, bool) {
+	// A plain filter and a level-up sid both start with the prefix; a shared key
+	// ("$share/g/$MQTT.msgs.>") never does, so its underlying subject is tested.
+	isReserved := func(key string) bool {
+		if strings.HasPrefix(key, mqttPrefix) {
+			return true
+		}
+		if _, subject, ok := mqttParseSharedKey(key); ok {
+			return strings.HasPrefix(subject, mqttPrefix)
+		}
+		return false
+	}
+	// Cons and Drains are keyed by sid, so a record can carry a reserved consumer
+	// with no membership left to name it: the old in-place migration was driven by
+	// the memberships alone and would leave those behind.
+	for _, m := range []map[string]byte{ps.Subs, ps.SharedSubs} {
+		for key := range m {
+			if isReserved(key) {
+				return key, true
+			}
+		}
+	}
+	for key := range ps.Cons {
+		if isReserved(key) {
+			return key, true
+		}
+	}
+	for key := range ps.Drains {
+		if isReserved(key) {
+			return key, true
+		}
+	}
+	return _EMPTY_, false
+}
+
 // Creates the session stream (limit msgs of 1) for this client ID if it does
 // not already exist. If it exists, recover the single record to rebuild the
 // state of the session. If there is a session record but this session is not
@@ -8332,6 +8275,32 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	}
 	if ps.ID != clientID {
 		return nil, false, errMQTTSessionCollision
+	}
+
+	// A record carrying a subscription in the reserved "$MQTT.>" namespace has an
+	// unsupported schema and is REFUSED here, ahead of every other branch: the
+	// teardown adoption below copies durable names straight out of Cons / Drains and
+	// derives shared durables from every SharedSubs key (mqttTeardownTargetFromRecord,
+	// which this path does not validate), and the overdue discard runs clear(), which
+	// does the same while deleting. Refusing first is what keeps the CONNECT path from
+	// ever deriving a name from such a record or migrating it in place.
+	//
+	// It also precedes the GENERATION check below, which is what makes the diagnostic
+	// reach the record shape that actually exists: the namespace deny (3610eb3)
+	// predates generation-scoped naming, so a broker old enough to have written a
+	// reserved membership wrote no `gen` either, and the generation refusal would
+	// otherwise answer every real case with the less specific message. Both refusals
+	// are read-only and both prescribe recreating the streams, so the order decides
+	// only which one an operator is told about — and naming the offending key is the
+	// more actionable of the two. Nothing here reads ps.Gen, and the generation is
+	// still validated before anything derives a name from it.
+	// See mqttReservedMembershipInRecord.
+	if key, found := mqttReservedMembershipInRecord(ps); found {
+		return nil, false, fmt.Errorf("restoring session %q: the record contains a "+
+			"subscription in the reserved %q namespace (%q), written by a pre-release "+
+			"development broker; this format is not supported: stop this account's "+
+			"brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
+			"streams)", clientID, mqttPrefix, key)
 	}
 
 	// A CLAIMED teardown must be FINISHED, never resumed and never overwritten: some
@@ -15487,8 +15456,8 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *Cons
 // deterministic group durable names, so a cons walk purges nothing. A SUBSCRIBE whose
 // rolled-back save failed leaves a config outside the membership (rollbackSubscribePacket's
 // readd restores cons, not sharedSubs), so a sharedSubs walk misses it. A 3.1.1 forced
-// leave, UNSUBSCRIBE's no-cons branch and purgeReservedSubs each strand transmitted
-// entries with NEITHER view left, which is why even the union is not enough.
+// leave and UNSUBSCRIBE's no-cons branch each strand transmitted entries with NEITHER
+// view left, which is why even the union is not enough.
 //
 // For broker-minted state the durable name IS the protocol fact "deliveries under this
 // consumer are group deliveries": mqttSharedNames is the single source of the prefix, and

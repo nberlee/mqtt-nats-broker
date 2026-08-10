@@ -1536,7 +1536,7 @@ func (as *mqttAccountSessionManager) reconcileResidentRecordState(s *Server) {
 			// session is unresolved — and the connection can stay open indefinitely, so
 			// "wait for the disconnect" is not a bound on anything. Left alone, such a
 			// session stops being able to persist at all: an UNSUBSCRIBE whose response
-			// was lost, a reserved-namespace purge, an affine unwind.
+			// was lost, an affine unwind.
 			//
 			// The gate is taken as the BOUND CLIENT rather than as nobody, which is the
 			// same ownership claim its own readLoop would make: it still fails while a

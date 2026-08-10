@@ -3,11 +3,13 @@
 package mqtt
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -362,13 +364,61 @@ func testReservedSessionRecordEx(t *testing.T, s *Server, o *Options, seed func(
 	}
 	testMQTTDisconnect(t, c, nil)
 	c.Close()
+	// The fixture is not settled until the disconnect is persisted: that save
+	// stamps DisconnectedAt and moves the record's stream sequence, so a raw
+	// snapshot taken ahead of it would shift under a "record unchanged" assertion.
+	testWaitSessionRecordSettled(t, s, asm, cid)
 	return cid
 }
 
+// testWaitSessionRecordSettled waits until the seed client is gone from the server
+// AND its disconnect is visible in the persisted record. Both, because the two are
+// not ordered: the client leaves s.clients on close while the disconnect-path save
+// runs on a server goroutine that outlives the socket.
+func testWaitSessionRecordSettled(t *testing.T, s *Server, asm *mqttAccountSessionManager, cid string) {
+	t.Helper()
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		s.mu.Lock()
+		for _, cl := range s.clients {
+			cl.mu.Lock()
+			mqttState := cl.mqtt
+			var id string
+			if mqttState != nil {
+				id = mqttState.cid
+			}
+			cl.mu.Unlock()
+			if id == cid {
+				s.mu.Unlock()
+				return fmt.Errorf("client %q is still registered", cid)
+			}
+		}
+		s.mu.Unlock()
+		if ps := testLoadPersistedSession(t, asm, cid); ps.DisconnectedAt == 0 {
+			return fmt.Errorf("the disconnect of %q is not persisted yet", cid)
+		}
+		return nil
+	})
+}
+
+// testEvictResidentSession removes a session from BOTH residency indexes, which is
+// what makes the next CONNECT go through createOrRestoreSession at all:
+// processConnect takes the resident path when it finds the client ID, so a fixture
+// left resident never reaches the restore boundary under test. addSession and
+// removeSession keep sessions and sessByHash in step, so clearing one index alone
+// leaves the other holding a stale object.
+func testEvictResidentSession(t *testing.T, asm *mqttAccountSessionManager, cid string) {
+	t.Helper()
+	asm.mu.Lock()
+	delete(asm.sessions, cid)
+	delete(asm.sessByHash, string(getHash(cid)))
+	asm.mu.Unlock()
+}
+
 // testCreateLegacyDurable creates a REAL JetStream durable on the messages
-// stream, so a purge test can prove the durable is actually deleted rather than
-// just that a map entry disappeared. Returns the ConsumerConfig to seed into the
-// session record.
+// stream, so a refusal test can prove the durable actually SURVIVES rather than
+// that a map entry stayed put — a record write and a consumer delete are
+// independent, and the old in-place migration deleted these. Returns the
+// ConsumerConfig to seed into the session record.
 func testCreateLegacyDurable(t *testing.T, asm *mqttAccountSessionManager, durable, deliver, filter, group string) *ConsumerConfig {
 	t.Helper()
 	ccr := &CreateConsumerRequest{
@@ -421,14 +471,25 @@ func testDurableExists(t *testing.T, s *Server, durable string) bool {
 // ID is not connected, so the record is only reachable by a restore.
 func testWriteLegacyPersistedSession(t *testing.T, asm *mqttAccountSessionManager, cid string, ps *mqttPersistedSession) {
 	t.Helper()
-	ps.ID = cid
-	ps.Origin = asm.jsa.id
-	// "Legacy" here means the pre-reserved-namespace SUBSCRIPTION format, not a
-	// record predating incarnation generations: those are rejected outright, so the
-	// fixture carries a well-formed generation like any real record.
+	// "Legacy" here means the pre-reserved-namespace SUBSCRIPTION format on an
+	// otherwise current record, which is what isolates one key shape per fixture: a
+	// generationless record is refused for its generation too, so it could not tell
+	// the two refusals apart. The one fixture that DOES need that shape — the
+	// realistic pre-deny record, since the deny predates generations — writes it
+	// through testWriteLegacyPersistedSessionRaw instead.
 	if ps.Gen == _EMPTY_ {
 		ps.Gen = mqttNewSessGen()
 	}
+	testWriteLegacyPersistedSessionRaw(t, asm, cid, ps)
+}
+
+// testWriteLegacyPersistedSessionRaw stores the record exactly as given, filling in
+// only the identity fields the subject implies. No generation is minted, so this is
+// the way to reproduce a record written before generation-scoped naming existed.
+func testWriteLegacyPersistedSessionRaw(t *testing.T, asm *mqttAccountSessionManager, cid string, ps *mqttPersistedSession) {
+	t.Helper()
+	ps.ID = cid
+	ps.Origin = asm.jsa.id
 	b, err := json.Marshal(ps)
 	if err != nil {
 		t.Fatalf("marshal legacy session: %v", err)
@@ -451,9 +512,10 @@ func testLoadPersistedSessionByID(t *testing.T, s *Server, o *Options, cid strin
 
 // testLoadPersistedSession reads the session record back out of the $MQTT_sess
 // stream and decodes it. Asserting against this rather than against the resident
-// mqttSession is what proves the purge was actually persisted: a resumed client
-// gets the in-memory session from asm.sessions, so inspecting that map would
-// still pass if save() silently stopped writing.
+// mqttSession is what proves the record was NOT rewritten: the refusal never
+// publishes a session, so the only durable evidence either way is in the stream.
+// For "unchanged", prefer testLoadRawSessionMsg — decoding drops the sequence and
+// normalises the JSON, so it cannot tell "not written" from "rewritten identically".
 func testLoadPersistedSession(t *testing.T, asm *mqttAccountSessionManager, cid string) *mqttPersistedSession {
 	t.Helper()
 	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, string(getHash(cid)))
@@ -467,303 +529,354 @@ func testLoadPersistedSession(t *testing.T, asm *mqttAccountSessionManager, cid 
 	return ps
 }
 
-// TestMQTTPurgeLegacyReservedSubs covers the cleanup half of the deny. A denied
-// filter is merely skipped during restore, and the restore path never persists,
-// so without an explicit purge a legacy "$MQTT." entry would sit in the record
-// and be re-denied on every reconnect forever.
+// testLoadRawSessionMsg returns the session record's stream sequence and its exact
+// stored bytes. Decoding drops the sequence and normalises the JSON, so only the raw
+// pair can distinguish "never written" from "rewritten to the same value" — and a
+// rewrite is precisely what the refusal must not do.
+func testLoadRawSessionMsg(t *testing.T, asm *mqttAccountSessionManager, cid string) (uint64, []byte) {
+	t.Helper()
+	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, string(getHash(cid)))
+	if err != nil {
+		t.Fatalf("load raw session record for %q: %v", cid, err)
+	}
+	return smsg.Sequence, smsg.Data
+}
+
+// testReservedProbeASM connects a throwaway client purely to reach the account
+// session manager, and keeps it connected for the subtest: the fixtures write
+// records and create consumers through it, and the refused client IDs never get a
+// session of their own to reach it from.
+func testReservedProbeASM(t *testing.T, s *Server, o *Options) *mqttAccountSessionManager {
+	t.Helper()
+	probeID := "probe-reserved-" + nuid.Next()
+	probe, probeR := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: probeID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	t.Cleanup(func() { probe.Close() })
+	if _, reason, _ := testMQTTReadConnAckV5(t, probeR); reason != mqttReasonSuccess {
+		t.Fatalf("probe CONNACK reason = 0x%02x", reason)
+	}
+	return testMQTTGetAccountSessionManager(t, s, probeID)
+}
+
+// testReservedRefusedConnect sends one v5 CONNECT and requires the broker to close
+// the connection without answering it.
 //
-// Every fixture uses a real JetStream durable and asserts against the persisted
-// record, so neither a broken save() nor a broken consumer delete can pass.
-func TestMQTTPurgeLegacyReservedSubs(t *testing.T) {
+// testMQTTExpectDisconnect is the deliberate oracle: testMQTTReadConnAckV5 fatals on
+// EOF, so it cannot express "closed", and testExpectNoConnAck accepts a read timeout,
+// which a CONNECT wedged before the validator would satisfy. This one tells a real
+// EOF/reset apart from a timeout.
+func testReservedRefusedConnect(t *testing.T, o *Options, cid string, cleanStart bool) {
+	t.Helper()
+	c, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   cid,
+		cleanStart: cleanStart,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTExpectDisconnect(t, c)
+}
+
+// TestMQTTReservedRecordRefusesRestore pins the fail-closed restore boundary that
+// replaced the old in-place migration. A session record carrying a subscription in
+// the reserved "$MQTT.>" namespace can only have been written by a development
+// broker predating the namespace deny, and there is no released persisted-state
+// contract to migrate from (CONTRIBUTING.md), so the CONNECT is REFUSED and the
+// operator recreates the bridge-owned state.
+//
+// Every row asserts the three facts a migration, a discard, or a skip-only
+// regression would each break: the CONNECT gets no CONNACK, the record is
+// byte-identical at the same stream sequence afterwards, and every durable the
+// fixture created still exists. The rows differ in WHERE the reserved key sits,
+// because the validator has to look in four maps and through two key shapes, and in
+// which competing restore branch would otherwise have run first.
+func TestMQTTReservedRecordRefusesRestore(t *testing.T) {
 	reserved := mqttStreamSubjectPrefix + ">"
 	sharedKey := "$share/g/" + reserved
 	_, sharedDeliver, sharedDurable := mqttSharedNames("g", reserved)
+	levelUp := reserved[:len(reserved)-2] + mqttMultiLevelSidSuffix
 
 	for _, tc := range []struct {
 		name string
-		key  string
-		// wantCons is true when the fixture's record is expected to carry a Cons
-		// entry for key, so the "no longer present" assertion is not vacuous.
-		wantCons bool
-		// setup builds the session record and returns the client ID plus the
-		// durables that must be gone once the purge has run.
-		setup func(t *testing.T, s *Server, o *Options) (string, []string)
+		// key is the offending key the diagnostic must name. Each fixture carries
+		// exactly ONE reserved key, so which one is reported does not depend on map
+		// iteration order.
+		key string
+		// setup seeds the fixture and returns the client ID plus every durable that
+		// must still exist afterwards.
+		setup func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, waitSweepPass func(*mqttAccountSessionManager)) (string, []string)
 	}{
 		{
-			// Plain filter with a consumer entry. A plain consumer IS persisted by
+			// Plain filter with its consumer. A plain consumer IS persisted by
 			// buildPersistedSessionLocked, so seeding through the session works.
-			name:     "plain",
-			key:      reserved,
-			wantCons: true,
-			setup: func(t *testing.T, s *Server, o *Options) (string, []string) {
-				cid := testReservedSessionRecordEx(t, s, o, func(asm *mqttAccountSessionManager, sess *mqttSession) {
-					cc := testCreateLegacyDurable(t, asm, "legacy-plain", mqttSubPrefix+"legacy", reserved, _EMPTY_)
+			name: "plain filter with its consumer",
+			key:  reserved,
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
+				cid := testReservedSessionRecordEx(t, s, o, func(seedASM *mqttAccountSessionManager, sess *mqttSession) {
+					cc := testCreateLegacyDurable(t, seedASM, "legacy-plain", mqttSubPrefix+"legacy", reserved, _EMPTY_)
 					sess.subs = map[string]byte{reserved: 1}
 					sess.cons = map[string]*ConsumerConfig{reserved: cc}
 				})
+				testEvictResidentSession(t, asm, cid)
 				return cid, []string{"legacy-plain"}
 			},
 		},
 		{
-			// Shared filter with NO consumer entry: the realistic current-format
-			// record, because buildPersistedSessionLocked never persists a consumer
-			// that has a DeliverGroup. The purge must derive the durable from the
-			// session key rather than walking sess.cons.
-			name: "shared without consumer entry",
+			// Shared membership with NO consumer entry: the realistic record, since
+			// buildPersistedSessionLocked never persists a consumer that has a
+			// DeliverGroup. Exercises the parse-shared-key arm on SharedSubs, where
+			// the key itself does not start with "$MQTT." at all.
+			name: "shared membership only",
 			key:  sharedKey,
-			setup: func(t *testing.T, s *Server, o *Options) (string, []string) {
-				cid := testReservedSessionRecordEx(t, s, o, func(asm *mqttAccountSessionManager, sess *mqttSession) {
-					testCreateLegacyDurable(t, asm, sharedDurable, sharedDeliver, reserved, "g")
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
+				cid := testReservedSessionRecordEx(t, s, o, func(seedASM *mqttAccountSessionManager, sess *mqttSession) {
+					testCreateLegacyDurable(t, seedASM, sharedDurable, sharedDeliver, reserved, "g")
 					sess.sharedSubs = map[string]byte{sharedKey: 1}
+				})
+				testEvictResidentSession(t, asm, cid)
+				return cid, []string{sharedDurable}
+			},
+		},
+		{
+			// Old-format record carrying the shared consumer entry and NO membership,
+			// so the shared arm has to be applied to Cons independently: a
+			// membership-only validator passes every other shared shape. The old
+			// migration was driven by the memberships alone and never reached this
+			// record at all, so here the durable-survival assertion discriminates
+			// against the validator mutations rather than against the purge.
+			name: "shared consumer entry only (old format)",
+			key:  sharedKey,
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
+				cid := "legacy-shared-cons-" + nuid.Next()
+				// A real consumer, not just the JSON: a direct record write stores
+				// bytes, which would make the survival assertion vacuous.
+				cc := testCreateLegacyDurable(t, asm, sharedDurable, sharedDeliver, reserved, "g")
+				testWriteLegacyPersistedSession(t, asm, cid, &mqttPersistedSession{
+					Cons: map[string]*ConsumerConfig{sharedKey: cc},
+					// Never-expire keeps the expiry sweep away entirely: it skips
+					// these records, so nothing can stamp DisconnectedAt and move the
+					// sequence under the "unchanged" assertion.
+					ExpiryInterval: mqttSessionNeverExpire,
 				})
 				return cid, []string{sharedDurable}
 			},
 		},
 		{
-			// Old-format record that DOES carry the shared consumer entry, so the
-			// purge takes the releaseSharedConsumer branch rather than deriving the
-			// durable from the key. Seeding this through sess.save() is impossible
-			// (the shared consumer would be stripped on the way out), so the record
-			// is written directly and the client ID is never connected beforehand --
-			// the resume must restore it from the stream.
-			name:     "shared with consumer entry (old format)",
-			key:      sharedKey,
-			wantCons: true,
-			setup: func(t *testing.T, s *Server, o *Options) (string, []string) {
-				cid := "legacy-oldfmt-" + nuid.Next()
-				// A throwaway client just to reach the account session manager.
-				probe, probeR := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "probe-" + cid, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-				defer probe.Close()
-				testMQTTReadConnAckV5(t, probeR)
-				asm := testMQTTGetAccountSessionManager(t, s, "probe-"+cid)
-
-				cc := testCreateLegacyDurable(t, asm, sharedDurable, sharedDeliver, reserved, "g")
+			// The synthetic level-up sid as the ONLY reserved key. With a Subs
+			// membership present the validator could refuse without ever inspecting
+			// Cons, so this row isolates both the plain-prefix arm on Cons and the
+			// level-up shape ("$MQTT.msgs fwc", which is not a subject).
+			name: "level-up consumer entry only",
+			key:  levelUp,
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
+				cid := "legacy-levelup-" + nuid.Next()
+				idHash := string(getHash(cid))
+				// Both halves of a multi-level filter's consumer pair are real; the
+				// record names only the level-up one, which is what keeps the reported
+				// key deterministic. Both must survive.
+				testCreateLegacyDurable(t, asm, idHash+"_main", mqttSubPrefix+"main", reserved, _EMPTY_)
+				fwc := testCreateLegacyDurable(t, asm, idHash+"_fwc", mqttSubPrefix+"fwc", reserved[:len(reserved)-2], _EMPTY_)
 				testWriteLegacyPersistedSession(t, asm, cid, &mqttPersistedSession{
-					SharedSubs:     map[string]byte{sharedKey: 1},
-					Cons:           map[string]*ConsumerConfig{sharedKey: cc},
-					ExpiryInterval: 300,
+					Cons:           map[string]*ConsumerConfig{levelUp: fwc},
+					ExpiryInterval: mqttSessionNeverExpire,
 				})
-				return cid, []string{sharedDurable}
+				return cid, []string{idHash + "_main", idHash + "_fwc"}
+			},
+		},
+		{
+			// A reserved key in Drains only. No writer can produce this — drains
+			// postdate the namespace deny — which is exactly why it is checked: the
+			// refusal exists for records no current writer emits, and
+			// restoreDrainsFromRecord derives consumer state from these keys.
+			name: "drain entry only",
+			key:  reserved,
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
+				cid := "legacy-drain-" + nuid.Next()
+				idHash := string(getHash(cid))
+				cc := testCreateLegacyDurable(t, asm, idHash+"_drain", mqttSubPrefix+"drain", reserved, _EMPTY_)
+				testWriteLegacyPersistedSession(t, asm, cid, &mqttPersistedSession{
+					Drains: map[string]*mqttPersistedDrain{
+						reserved: {Cons: cc, Subject: reserved, QoS: 1},
+					},
+					ExpiryInterval: mqttSessionNeverExpire,
+				})
+				return cid, []string{idHash + "_drain"}
+			},
+		},
+		{
+			// An already-overdue deadline, which pins the validator sitting BEFORE the
+			// overdue-discard branch: that branch builds a transient session from the
+			// record and calls clear(), deleting record-owned state before anything
+			// refuses. Every other row is never-expiring, so a validator moved below
+			// that branch would pass them all.
+			name: "overdue deadline",
+			key:  reserved,
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, waitSweepPass func(*mqttAccountSessionManager)) (string, []string) {
+				// The startup sweep must be BEHIND us before an overdue record exists:
+				// it arms an immediate expiry timer for one, which would delete the
+				// fixture before the CONNECT reached the validator. That pass is
+				// launched asynchronously with no completion signal of its own, so the
+				// guard is the sweep-pass hook, not a sleep; the raised interval keeps
+				// any later pass from running at all.
+				waitSweepPass(asm)
+				cid := "legacy-overdue-" + nuid.Next()
+				idHash := string(getHash(cid))
+				cc := testCreateLegacyDurable(t, asm, idHash+"_overdue", mqttSubPrefix+"overdue", reserved, _EMPTY_)
+				testWriteLegacyPersistedSession(t, asm, cid, &mqttPersistedSession{
+					Subs:           map[string]byte{reserved: 1},
+					Cons:           map[string]*ConsumerConfig{reserved: cc},
+					ExpiryInterval: 1,
+					DisconnectedAt: time.Now().Add(-time.Hour).Unix(),
+				})
+				return cid, []string{idHash + "_overdue"}
+			},
+		},
+		{
+			// NO GENERATION — the record shape that actually existed. The namespace deny
+			// (3610eb3) predates generation-scoped naming, so a broker old enough to have
+			// written a reserved membership wrote no `gen` either. This row pins the
+			// reserved check sitting BEFORE the generation check: with the order reversed
+			// the only realistic record gets the generation refusal instead, and the
+			// key-naming diagnostic this finding requires never reaches it. The
+			// full-diagnostic assertion is what discriminates — the refusal itself would
+			// happen either way, which is exactly why a "connection closed" oracle alone
+			// would not have caught this.
+			name: "no generation (the realistic pre-deny shape)",
+			key:  reserved,
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
+				cid := "legacy-nogen-" + nuid.Next()
+				idHash := string(getHash(cid))
+				cc := testCreateLegacyDurable(t, asm, idHash+"_nogen", mqttSubPrefix+"nogen", reserved, _EMPTY_)
+				testWriteLegacyPersistedSessionRaw(t, asm, cid, &mqttPersistedSession{
+					Subs:           map[string]byte{reserved: 1},
+					Cons:           map[string]*ConsumerConfig{reserved: cc},
+					ExpiryInterval: mqttSessionNeverExpire,
+				})
+				return cid, []string{idHash + "_nogen"}
+			},
+		},
+		{
+			// A CLAIMED teardown, which pins the validator sitting before the teardown
+			// adoption: finishAdoptedTeardown copies Cons and Drains durable names
+			// verbatim and derives shared durables from every SharedSubs key, and the
+			// CONNECT path does not validate those targets. The marker is genuine (a
+			// nonempty nonce is what a release matches on) and the durable is named
+			// "<idHash>_..." so mqttValidateTeardownTargets would accept the record —
+			// the refusal has to win against a marker the adopters would really act on.
+			name: "claimed teardown",
+			key:  reserved,
+			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
+				cid := "legacy-teardown-" + nuid.Next()
+				idHash := string(getHash(cid))
+				cc := testCreateLegacyDurable(t, asm, idHash+"_teardown", mqttSubPrefix+"teardown", reserved, _EMPTY_)
+				testWriteLegacyPersistedSession(t, asm, cid, &mqttPersistedSession{
+					Subs: map[string]byte{reserved: 1},
+					Cons: map[string]*ConsumerConfig{reserved: cc},
+					Teardown: &mqttSessTeardown{
+						Origin:    asm.jsa.id,
+						Nonce:     nuid.Next(),
+						StartedAt: time.Now().Unix(),
+					},
+					ExpiryInterval: mqttSessionNeverExpire,
+				})
+				return cid, []string{idHash + "_teardown"}
 			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o := testMQTTDefaultOptions()
+			// Only the STARTUP expiry sweep may run: a periodic pass could arm an
+			// immediate timer on the overdue fixture between its write and the CONNECT.
+			defer setMQTTSessionExpirySweepInterval(time.Hour)()
+			var passMu sync.Mutex
+			passes := map[*mqttAccountSessionManager]int{}
+			defer setMQTTTestSessExpirySweepPassHook(func(as *mqttAccountSessionManager) {
+				passMu.Lock()
+				passes[as]++
+				passMu.Unlock()
+			})()
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
+			// Counted per account manager, because sweep goroutines outlive the
+			// servers that started them: a bare "a pass completed" signal could be a
+			// previous test's sweeper rather than this one's startup pass.
+			waitSweepPass := func(asm *mqttAccountSessionManager) {
+				t.Helper()
+				checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+					passMu.Lock()
+					defer passMu.Unlock()
+					if passes[asm] == 0 {
+						return fmt.Errorf("the startup session-expiry sweep has not finished a pass yet")
+					}
+					return nil
+				})
+			}
 
-			cid, durables := tc.setup(t, s, o)
+			asm := testReservedProbeASM(t, s, o)
+			cid, durables := tc.setup(t, s, o, asm, waitSweepPass)
+
+			// Prove the fixture is what it claims BEFORE the refusal, so nothing
+			// below can pass vacuously. The membership check reads the maps directly
+			// rather than asking the validator, which is the thing under test.
 			for _, d := range durables {
 				if !testDurableExists(t, s, d) {
-					t.Fatalf("seed durable %q was not created; the deletion assertion below would prove nothing", d)
+					t.Fatalf("seed durable %q was not created; the survival assertion would prove nothing", d)
 				}
+			}
+			seq, data := testLoadRawSessionMsg(t, asm, cid)
+			seeded := &mqttPersistedSession{}
+			if err := json.Unmarshal(data, seeded); err != nil {
+				t.Fatalf("decode seeded record: %v", err)
+			}
+			_, inSubs := seeded.Subs[tc.key]
+			_, inShared := seeded.SharedSubs[tc.key]
+			_, inCons := seeded.Cons[tc.key]
+			_, inDrains := seeded.Drains[tc.key]
+			if !inSubs && !inShared && !inCons && !inDrains {
+				t.Fatalf("seeded record carries %q in none of Subs, SharedSubs, Cons, Drains; there is nothing to refuse", tc.key)
 			}
 
-			// Prove the fixture is what it claims BEFORE the resume, so the
-			// post-purge assertions cannot pass vacuously.
-			seeded := testLoadPersistedSessionByID(t, s, o, cid)
-			_, seededPlain := seeded.Subs[tc.key]
-			_, seededShared := seeded.SharedSubs[tc.key]
-			if !seededPlain && !seededShared {
-				t.Fatalf("seeded record does not contain %q; nothing to purge", tc.key)
-			}
-			if _, ok := seeded.Cons[tc.key]; ok != tc.wantCons {
-				t.Fatalf("seeded record Cons[%q] present = %v, want %v", tc.key, ok, tc.wantCons)
-			}
-
-			// Resume with v5: a 3.1.1 resume force-leaves shared subscriptions
-			// before the reserved-namespace check ever sees them, which would make
-			// the shared fixtures pass for the wrong reason.
-			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
-			defer c.Close()
-			sp, reason, _ := testMQTTReadConnAckV5(t, r)
-			if reason != mqttReasonSuccess {
-				t.Fatalf("resume CONNACK reason = 0x%02x, want success", reason)
-			}
-			if !sp {
-				t.Fatal("expected the seeded session to be present on resume")
-			}
-
-			// The CONNACK is sent before the saved subscriptions are restored, so
-			// poll. Assert against the PERSISTED record, not the resident session.
-			asm := testMQTTGetAccountSessionManager(t, s, cid)
-			checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
-				ps := testLoadPersistedSession(t, asm, cid)
-				if _, ok := ps.Subs[tc.key]; ok {
-					return fmt.Errorf("reserved filter %q is still in the persisted Subs", tc.key)
-				}
-				if _, ok := ps.SharedSubs[tc.key]; ok {
-					return fmt.Errorf("reserved filter %q is still in the persisted SharedSubs", tc.key)
-				}
-				if _, ok := ps.Cons[tc.key]; ok {
-					return fmt.Errorf("consumer entry for %q is still in the persisted record", tc.key)
-				}
+			requireIntact := func(what string) {
+				t.Helper()
 				for _, d := range durables {
-					if testDurableExists(t, s, d) {
-						return fmt.Errorf("JetStream durable %q survived the purge", d)
+					if !testDurableExists(t, s, d) {
+						t.Errorf("%s: JetStream durable %q was deleted; a refusal destroys nothing", what, d)
 					}
 				}
-				return nil
-			})
-
-			// And it stays gone across a full reload: evict the resident session so
-			// the second resume must read the record back from $MQTT_sess.
-			c.Close()
-			asm.mu.Lock()
-			delete(asm.sessions, cid)
-			asm.mu.Unlock()
-
-			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
-			defer c2.Close()
-			if _, reason, _ := testMQTTReadConnAckV5(t, r2); reason != mqttReasonSuccess {
-				t.Fatalf("second resume CONNACK reason = 0x%02x", reason)
-			}
-			asm.mu.Lock()
-			sess2 := asm.sessions[cid]
-			asm.mu.Unlock()
-			if sess2 == nil {
-				t.Fatal("no session after the reloading resume")
-			}
-			sess2.mu.Lock()
-			_, stillSubs := sess2.subs[tc.key]
-			_, stillShared := sess2.sharedSubs[tc.key]
-			sess2.mu.Unlock()
-			if stillSubs || stillShared {
-				t.Errorf("reserved filter %q came back after a reload from the stream; the purge did not persist", tc.key)
-			}
-		})
-	}
-}
-
-// TestMQTTPurgeLevelUpConsumer pins that a multi-level reserved filter releases
-// BOTH of its consumers. "$MQTT.msgs.>" owns a main sid and a synthetic level-up
-// sid; dropping only the main one leaks a real durable after the membership is
-// gone, which is invisible in the session record.
-func TestMQTTPurgeLevelUpConsumer(t *testing.T) {
-	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	reserved := mqttStreamSubjectPrefix + ">"
-	levelUp := reserved[:len(reserved)-2] + mqttMultiLevelSidSuffix
-
-	cid := testReservedSessionRecordEx(t, s, o, func(asm *mqttAccountSessionManager, sess *mqttSession) {
-		main := testCreateLegacyDurable(t, asm, "legacy-main", mqttSubPrefix+"main", reserved, _EMPTY_)
-		fwc := testCreateLegacyDurable(t, asm, "legacy-fwc", mqttSubPrefix+"fwc", reserved[:len(reserved)-2], _EMPTY_)
-		sess.subs = map[string]byte{reserved: 1}
-		sess.cons = map[string]*ConsumerConfig{reserved: main, levelUp: fwc}
-	})
-	for _, d := range []string{"legacy-main", "legacy-fwc"} {
-		if !testDurableExists(t, s, d) {
-			t.Fatalf("seed durable %q was not created", d)
-		}
-	}
-
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
-	defer c.Close()
-	if sp, reason, _ := testMQTTReadConnAckV5(t, r); reason != mqttReasonSuccess || !sp {
-		t.Fatalf("resume CONNACK reason=0x%02x sessionPresent=%v", reason, sp)
-	}
-
-	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
-		ps := testLoadPersistedSession(t, asm, cid)
-		for _, sid := range []string{reserved, levelUp} {
-			if _, ok := ps.Cons[sid]; ok {
-				return fmt.Errorf("consumer entry for %q is still in the persisted record", sid)
-			}
-		}
-		// The level-up durable is the one a main-sid-only cleanup would leak.
-		for _, d := range []string{"legacy-main", "legacy-fwc"} {
-			if testDurableExists(t, s, d) {
-				return fmt.Errorf("JetStream durable %q survived the purge", d)
-			}
-		}
-		return nil
-	})
-}
-
-// TestMQTTPurgeReservedSubsSaveFailureRollsBack covers the failure branch. If the
-// record cannot be persisted, the in-memory maps must be restored exactly rather
-// than left disagreeing with the stream, and the CONNECT must still succeed --
-// the filter is denied either way, so a failed purge is a deferred cleanup, not
-// a connection error.
-func TestMQTTPurgeReservedSubsSaveFailureRollsBack(t *testing.T) {
-	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	reserved := mqttStreamSubjectPrefix + ">"
-	cid := testReservedSessionRecordEx(t, s, o, func(asm *mqttAccountSessionManager, sess *mqttSession) {
-		cc := testCreateLegacyDurable(t, asm, "legacy-rollback", mqttSubPrefix+"rb", reserved, _EMPTY_)
-		sess.subs = map[string]byte{reserved: 1}
-		sess.cons = map[string]*ConsumerConfig{reserved: cc}
-	})
-
-	// Fail only the purge's save. It is identifiable precisely: sess.update has
-	// already removed the reserved key from subs, but dropCons has not yet run,
-	// so the consumer entry is still there. Failing every save instead would tear
-	// down the CONNECT itself and test nothing about the rollback.
-	saveErr := errors.New("injected save failure")
-	restoreHook := setMQTTTestSessSaveHook(func(sess *mqttSession) error {
-		sess.mu.Lock()
-		_, inSubs := sess.subs[reserved]
-		_, inCons := sess.cons[reserved]
-		sess.mu.Unlock()
-		if !inSubs && inCons {
-			return saveErr
-		}
-		return nil
-	})
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
-	// Saves run on server goroutines that outlive the client socket, so the hook
-	// must stay installed until the server has finished with this client. Closing
-	// the connection is not enough: a disconnect-path save still in flight would
-	// race the hook reset. Wait for the client to leave s.clients first.
-	defer func() {
-		c.Close()
-		checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			for _, cl := range s.clients {
-				cl.mu.Lock()
-				id := cl.mqtt.cid
-				cl.mu.Unlock()
-				if id == cid {
-					return fmt.Errorf("client %q still registered", cid)
+				gotSeq, gotData := testLoadRawSessionMsg(t, asm, cid)
+				if gotSeq != seq {
+					t.Errorf("%s: session record moved from sequence %v to %v; the refusal wrote to it", what, seq, gotSeq)
+				}
+				if !bytes.Equal(gotData, data) {
+					t.Errorf("%s: session record content changed\nbefore: %s\n after: %s", what, data, gotData)
 				}
 			}
-			return nil
-		})
-		restoreHook()
-	}()
-	sp, reason, _ := testMQTTReadConnAckV5(t, r)
-	if reason != mqttReasonSuccess {
-		t.Fatalf("resume CONNACK reason = 0x%02x; a failed purge must not fail the CONNECT", reason)
-	}
-	if !sp {
-		t.Fatal("expected the seeded session to be present on resume")
-	}
 
-	// The membership must be intact in memory: a half-applied purge would leave
-	// the record and memory disagreeing.
-	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	asm.mu.Lock()
-	sess := asm.sessions[cid]
-	asm.mu.Unlock()
-	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		sess.mu.Lock()
-		defer sess.mu.Unlock()
-		if _, ok := sess.subs[reserved]; !ok {
-			return fmt.Errorf("subs[%q] was not rolled back after the save failure", reserved)
-		}
-		if _, ok := sess.cons[reserved]; !ok {
-			return fmt.Errorf("cons[%q] was dropped despite the save failure", reserved)
-		}
-		return nil
-	})
-	// Give the purge a moment to have (wrongly) deleted the durable, then check.
-	if !testDurableExists(t, s, "legacy-rollback") {
-		t.Error("durable was deleted even though the purge failed to persist; teardown must follow a confirmed save")
+			// The resume is refused, and nothing was migrated or discarded on the way.
+			testReservedRefusedConnect(t, o, cid, false)
+			requireIntact("after the refused resume")
+
+			// A CLEAN START attempt is refused identically. Stated consequence, not an
+			// oversight: createOrRestoreSession runs before processConnect's
+			// clean-session check, and the discard it would take derives shared
+			// durable names from the record's own keys and deletes consumers — the
+			// same migration under another name. Recreating the streams is the only
+			// exit, which is the finding's guidance.
+			testReservedRefusedConnect(t, o, cid, true)
+			requireIntact("after the refused clean-start attempt")
+
+			// The diagnostic has to be the ACTIONABLE one: the finding and
+			// CONTRIBUTING.md both require stop-and-recreate guidance naming the
+			// offending key. Compared in full rather than fragment by fragment,
+			// because a negated message ("do not stop ..., do not recreate ...")
+			// contains every fragment while instructing the opposite.
+			_, _, err := asm.createOrRestoreSession(cid, s.getOpts())
+			want := fmt.Sprintf("restoring session %q: the record contains a "+
+				"subscription in the reserved %q namespace (%q), written by a pre-release "+
+				"development broker; this format is not supported: stop this account's "+
+				"brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
+				"streams)", cid, mqttPrefix, tc.key)
+			if err == nil || err.Error() != want {
+				t.Fatalf("createOrRestoreSession error:\n got: %v\nwant: %s", err, want)
+			}
+		})
 	}
 }

@@ -184,10 +184,17 @@ All notable changes to this project are documented here. The format is based on
   ordinary NATS traffic on those subjects, so `$MQTT/msgs/#` yielded every
   QoS 1/2 message in the account and `$MQTT/rmsgs/#` every retained message,
   regardless of the client's own per-topic NATS permissions. SUBSCRIBE now
-  rejects the whole reserved prefix with SUBACK 0x80. A legacy subscription
-  found in a resumed session record is purged from the record (transactionally,
-  releasing its consumers including the level-up durable) rather than merely
-  skipped, which would have re-denied it on every reconnect forever.
+  rejects the whole reserved prefix with SUBACK 0x80. A session **record**
+  carrying such a subscription — only a development broker predating this deny
+  could have written one — is **refused** at the CONNECT restore boundary,
+  fail-closed and read-only, naming the offending key and telling the operator to
+  stop the account's brokers and recreate the bridge-owned `$MQTT_*` streams. That
+  check runs ahead of the generation check on purpose: this deny predates
+  generation-scoped naming, so the record that really exists carries no `gen`, and
+  the operator would otherwise be told only that. A clean-start CONNECT is refused
+  too, since its discard would delete the record's consumers. Merely skipping the
+  filter would have re-denied it on every reconnect forever, and migrating the
+  record in place is what the pre-release policy in `CONTRIBUTING.md` excludes.
   **Security fix.**
 - **A Will topic could still publish into `$MQTT.>`.** `mqttProcessPub` rejects
   a client PUBLISH into the reserved prefix, but a Will never goes through that

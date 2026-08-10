@@ -1570,10 +1570,10 @@ type mqttRegCancellation struct {
 // delete once it has released the session lock (R5), plus the cancellations it must
 // SECURE before destroying the consumer (secureRegCancellations).
 //
-// The six callers all destroy or abandon a consumer without acking its deliveries —
-// a denied reserved-namespace subscription, a 3.1.1 forced shared leave, a deferred
-// consumer delete, a shared-consumer release, a surviving disconnect's shared purge,
-// and a non-drain UNSUBSCRIBE teardown. Each one frees identifiers, so each one owes
+// The five callers all destroy or abandon a consumer without acking its deliveries —
+// a 3.1.1 forced shared leave, a deferred consumer delete, a shared-consumer release,
+// a surviving disconnect's shared purge, and a non-drain UNSUBSCRIBE teardown. Each
+// one frees identifiers, so each one owes
 // the registers naming them: a register left behind would have the next resume
 // reserve an identifier for a delivery whose consumer no longer exists.
 //

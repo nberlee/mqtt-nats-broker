@@ -1096,10 +1096,16 @@ takeover-discard) now runs under a durable **teardown claim** on the session rec
 and deletes only resources named after the **retiring session incarnation**
 (`internal/mqtt/sess_teardown.go`, `sess_incarnation.go`). A broker that loses the
 claim deletes nothing; the release is a sequence-targeted delete whose outcome is
-classified by re-reading, never assumed; and a CONNECT that finds a claim finishes
-it before starting fresh, so a crashed teardown self-heals rather than leaking.
+classified by re-reading, never assumed; and a CONNECT that can interpret the record
+finishes a claim it finds before starting fresh, so a crashed teardown self-heals
+rather than leaking. A record the restore boundary refuses is not adopted by the
+CONNECT at all: a reserved-namespace record with a valid generation is still finished
+by the expiry path and the orphan sweep, but one with no valid generation is adopted by
+nothing and persists with its consumers until an operator recreates the streams — the
+pre-existing consequence of the generation refusal, since a generation-scoped deletion
+has no name to use.
 
-One residual, confined to an upgrade window, and one hard requirement:
+Two residuals — one of them confined to an upgrade window — and one hard requirement:
 
 - **A session record without a generation is rejected, not resumed.** Records
   written before generation-scoped naming existed carry no `gen`, and a CONNECT that
@@ -1110,7 +1116,21 @@ One residual, confined to an upgrade window, and one hard requirement:
   payload whose releaser had already claimed it — silent loss, and strictly worse
   than the ordering deviation the claim exists to fix. The bridge is pre-release and
   its `$MQTT_*` schemas carry no compatibility contract, so the remedy is to
-  recreate the development store.
+  recreate the development store. A record carrying a subscription in the reserved
+  `$MQTT.>` namespace is refused on the same terms and for the same reason (see the
+  namespace section of `docs/ARCHITECTURE.md`).
+- **A refused restore can defer a due session expiry to a later sweep pass.** Every
+  refusal on that path returns while the client ID is still registered in the
+  in-process `sessLocked` map, and `expireSessionFromRecord` yields to that
+  registration without re-arming the one-shot timer it has already consumed. A
+  session whose deadline falls inside that window is therefore not expired at its
+  deadline. It is not stranded — the periodic `sweepSessionExpiries` re-arms an
+  absent timer for a due record — but the DELAY is not bounded by one sweep
+  interval either: `reconcileResidentRecordState` runs ahead of it on the same
+  goroutine and can hold the pass up (the unbounded-walk residual above). The window
+  is pre-existing and shared by every refusal on this path rather than specific to
+  one; deferring indefinitely would take a client holding a CONNECT in flight across
+  every pass, which gains it nothing, since every attempt is refused.
 - **Mixed-version operation.** An older broker ignores the `Teardown` marker (it
   would overwrite it) and uses the old names, so both halves hold only once every
   broker in the cluster understands them — the same rule as the shared-subscription

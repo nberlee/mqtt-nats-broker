@@ -806,8 +806,24 @@ so the namespace is closed on every path a client can reach:
   carries a reason string). This covers the whole prefix, not just the delivery
   subjects: a wildcard filter such as `#` already cannot match a `$`-topic
   ([MQTT-4.7.2-1]), but an explicit `$MQTT/msgs/#` filter is not "reserved" by
-  that rule and would otherwise be honoured. A legacy subscription found in a
-  resumed session record is dropped from the record, not merely ignored.
+  that rule and would otherwise be honoured. A session **record** carrying such a
+  filter is **refused** at the restore boundary instead: only a development broker
+  predating this deny could have written one, there is no released persisted-state
+  contract to migrate from, and the CONNECT fails closed before anything derives a
+  consumer name from the record or rewrites it. The refusal names the offending
+  key and tells the operator to stop the account's brokers and recreate the
+  bridge-owned `$MQTT_*` streams. It deliberately offers no work-around: moving the
+  client to another ID would leave this record and its consumers behind, and for the
+  generationless shape below nothing would ever reclaim them. A clean-start
+  CONNECT is refused too, because its discard would delete the record's consumers,
+  which is the same migration under another name. The record itself is not
+  quarantined: with a valid generation it is still expired and reaped as ordinary
+  state. The realistic record has **no** generation — this deny predates
+  generation-scoped naming, so a broker old enough to have written a reserved
+  membership wrote no `gen` either — and such a record is reclaimed by nothing until
+  the streams are recreated (see the teardown section). The reserved check therefore
+  runs *before* the generation check, so the operator is told which key is at fault
+  rather than only that the generation is missing.
 - **Will topics** in the namespace are rejected at CONNECT: `0x05` in 3.1.1,
   `0x87` in 5.0. A Will never passes through the PUBLISH path, and a *delayed*
   Will is replayed from the outbox over the service connection where the client's
@@ -1165,9 +1181,9 @@ The pass:
    sid with **no** `Cons` entry at all is classified *absent identity* and
    minted here (left alone, restoration would create its consumer after the
    CONNACK and never persist it: the restore path runs no final subscription
-   save). Filters in the reserved `$MQTT.>` namespace are excluded — restoration
-   denies and purges them, so the phase never installs interest for them. A
-   stale `Cons` entry with **no** matching subscription is not an active
+   save). No filter here can be in the reserved `$MQTT.>` namespace: such a
+   record is refused at restore, and a resident session could never have
+   subscribed to one. A stale `Cons` entry with **no** matching subscription is not an active
    delivery entry and is deliberately not verified (a stated residual in
    `docs/CONFORMANCE.md`).
 2. **Subscribe everything closed, then batch-verify.** Before any lookup, a
@@ -1538,8 +1554,8 @@ The invariants, in the order they matter:
   through, so a register that lands afterwards holds its identifier and its Receive
   Maximum slot for the life of the session whatever becomes of the durable — under a
   Receive Maximum of 1, a session that can no longer deliver at all. So every
-  transaction that removes a consumer's membership (an UNSUBSCRIBE, a reserved-namespace
-  purge, a QoS downgrade, a 3.1.1 forced shared leave, a SUBSCRIBE rollback) withdraws
+  transaction that removes a consumer's membership (an UNSUBSCRIBE, a QoS downgrade,
+  a 3.1.1 forced shared leave, a SUBSCRIBE rollback) withdraws
   that consumer's in-flight registrations first, and its own save carries both facts.
   The drained sids are exempt because stageDrain already did it and their consumer
   survives. What the teardown itself then finds can only be a registration that arrived
@@ -1635,8 +1651,8 @@ The invariants, in the order they matter:
   its pending entries under the deterministic group durable names, so a config walk finds
   nothing. A SUBSCRIBE whose rolled-back save definitely failed leaves the opposite: the
   re-added configs are live and their group key is not back in the membership, so a
-  membership walk misses them. And a 3.1.1 forced leave, an UNSUBSCRIBE with no config to
-  tear down, and a reserved-namespace purge each strand a TRANSMITTED delivery's entries
+  membership walk misses them. And a 3.1.1 forced leave and an UNSUBSCRIBE with no config
+  to tear down each strand a TRANSMITTED delivery's entries
   on purpose — the staging records the verdict and leaves the entry "for the teardown's
   purge" — with NEITHER view left naming the durable, which is why even the union of the
   two is not enough. So the purge takes every durable named by the maps it is about to
@@ -1953,11 +1969,28 @@ means done, our own nonce means retry, and a foreign nonce or no marker means a
 newer owner exists. The release is always confirmed even on the no-wait discard
 path, since an unclassifiable release is not a release.
 
-Nobody resumes a marked record. Every CONNECT (and the record-driven expiry path)
-that finds a marker **finishes** the teardown — repeating the idempotent,
-generation-scoped deletions and releasing the record — and only then starts a fresh
-session with a fresh generation and Session Present false. That also makes a
-crashed teardown self-healing instead of leaking until the orphan sweep.
+Nobody resumes a marked record. Every CONNECT that can interpret the record (and the
+record-driven expiry path) **finishes** the teardown when it finds a marker —
+repeating the idempotent, generation-scoped deletions and releasing the record — and
+only then starts a fresh session with a fresh generation and Session Present false.
+That also makes a crashed teardown self-healing instead of leaking until the orphan
+sweep. The exception is a record the restore boundary refuses outright — a subscription
+in the reserved `$MQTT.>` namespace, or a missing or malformed generation: the CONNECT
+is refused without adopting the marker. What finishes it then depends on which refusal
+it was, and only one of the two is recoverable:
+
+- **Reserved namespace, generation valid**: the expiry path and the orphan sweep's
+  adoption both still act on the record — the deletions they issue are
+  generation-scoped and the record's generation is sound — so the marker is finished
+  and the state is reclaimed without a CONNECT.
+- **No valid generation**: nothing adopts it. `expireSessionFromRecord` refuses to act
+  on a record it cannot validate, `mqttValidateTeardownTargets` rejects it through
+  `mqttValidateSessionRecord`, and the orphaned-consumer sweep counts the consumers the
+  record names as *referenced*, so they are not reaped either. The record, its
+  consumers and its marker persist until an operator recreates the `$MQTT_*` streams.
+  That is the pre-existing consequence of the generation refusal — there is no
+  generation to scope a safe deletion by — and it is why both refusals prescribe
+  recreating the streams rather than offering a way to work around the record.
 
 Shared group durables stay outside all of this: they are not owned by one session
 and are released last, by the existing last-holder record scan, only once this
