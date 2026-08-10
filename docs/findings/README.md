@@ -103,6 +103,18 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 - Restore reachability diagnostics for `mqtt.go`.
   Status: Open. Release treatment: Maintainability gate after F-052 through F-054.
   Details: [F-055](dead-code.md#f-055).
+- Remove inherited retained-message format and delete-protocol compatibility.
+  Status: Open. Release treatment: Immediate cleanup before further MQTT-core
+  implementation.
+  Details: [F-056](pre-release-migrations.md#f-056).
+- Replace legacy reserved-subscription migration with current-schema refusal.
+  Status: Open. Release treatment: First cleanup before further MQTT-core
+  implementation while preserving the live `$MQTT.>` security boundary.
+  Details: [F-057](pre-release-migrations.md#f-057).
+- Reject generationless delayed-Will outbox records.
+  Status: Open. Release treatment: Immediate cleanup before further MQTT-core
+  implementation.
+  Details: [F-058](pre-release-migrations.md#f-058).
 
 ## Resolved findings
 

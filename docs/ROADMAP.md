@@ -23,7 +23,29 @@ The 26 resolved findings are retained in the
 release view; their linked dossiers are canonical for mechanism, evidence,
 rejected designs, tests, and residuals.
 
-### 0.1 Decide the supported HA scope
+### 0.1 Remove pre-release persistence compatibility
+
+Do these before further MQTT-core implementation. The bridge has no released
+persisted-state contract, so carrying these paths through subsequent session,
+retained-message, and Will changes would make every change maintain and test
+formats that no user release depends on. Each checkbox is one commit.
+
+- [ ] [F-057: Replace reserved-subscription migration with refusal](findings/pre-release-migrations.md#f-057).
+  **First; large deletion.** Reject incompatible restored session records with
+  recreate guidance, then remove the transactional purge and its old-record
+  fixtures. Keep live `$MQTT.>` SUBSCRIBE denial unchanged.
+- [ ] [F-056: Remove inherited retained-message compatibility](findings/pre-release-migrations.md#f-056).
+  **Second; medium.** Delete the legacy JSON reader, old-server tombstone marker,
+  and `RD` delete-notification protocol while preserving current-format retained
+  deletion, restart recovery, expiry, and multi-broker convergence.
+- [ ] [F-058: Reject generationless delayed-Will records](findings/pre-release-migrations.md#f-058).
+  **Third; small.** Validate decoded outbox records before scan, cancellation, or
+  publication and fail closed on the unsupported pre-generation format.
+
+These cleanups do not remove MQTT wire compatibility or the operator migration
+guide from NATS Server's embedded MQTT listener.
+
+### 0.2 Decide the supported HA scope
 
 The first decision is whether the alpha supports multiple MQTT frontends against a
 replicated JetStream cluster. The README currently promises horizontally scalable,
@@ -52,7 +74,7 @@ this epic after alpha.
   **Conditional; very large.** Design this with F-027/F-029 rather than as a
   periodic-read patch.
 
-### 0.2 Confirmed alpha blockers
+### 0.3 Confirmed alpha blockers
 
 These are concrete correctness, data-loss, race, or liveness defects in features
 the README currently reports as supported. They remain blockers independently of
@@ -91,7 +113,7 @@ takeover.
   **Medium to large.** Design and test F-047 and F-048 as one transactional-cleanup
   cluster.
 
-### 0.3 Release-verification investigations
+### 0.4 Release-verification investigations
 
 These entries preserve observations without pretending the implementation scope is
 known. Capture complete logs, obtain a deterministic reproduction or identify the
@@ -105,7 +127,7 @@ finding with acceptance criteria.
 - [ ] [F-044: Determine whether the phase-2 shutdown observation is real](findings/release-investigations.md#f-044).
   **Investigation.**
 
-### 0.4 Post-alpha candidates and scope cleanup
+### 0.5 Post-alpha candidates and scope cleanup
 
 These do not block the alpha unless investigation shows that ordinary broker
 operation can trigger correctness loss or unbounded resource growth.
