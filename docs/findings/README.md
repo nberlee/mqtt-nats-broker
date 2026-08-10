@@ -86,6 +86,23 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 - Refuse or retry a CONNECT with incomplete shared-subscription restoration.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-050](shared-qos2.md#f-050).
+- Bound pre-CONNECT clients when authentication passthrough is configured.
+  Status: Open. Release treatment: Alpha blocker.
+  Details: [F-051](dead-code.md#f-051).
+- Connect MQTT option validation to the production startup boundary.
+  Status: Open. Release treatment: Maintainability item; promote if startup tests
+  expose an accepted invalid configuration.
+  Details: [F-052](dead-code.md#f-052).
+- Remove declarations unused by production and the full suite.
+  Status: Open. Release treatment: Maintainability cleanup.
+  Details: [F-053](dead-code.md#f-053).
+- Separate test and future-feature scaffolding from production code.
+  Status: Open. Release treatment: Maintainability cleanup; WebSocket remains in
+  its transport milestone.
+  Details: [F-054](dead-code.md#f-054).
+- Restore reachability diagnostics for `mqtt.go`.
+  Status: Open. Release treatment: Maintainability gate after F-052 through F-054.
+  Details: [F-055](dead-code.md#f-055).
 
 ## Resolved findings
 

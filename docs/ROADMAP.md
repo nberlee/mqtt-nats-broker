@@ -59,6 +59,9 @@ the README currently reports as supported. They remain blockers independently of
 the HA-scope decision except where the dossier explicitly requires a remote
 takeover.
 
+- [ ] [F-051: Bound pre-CONNECT clients under auth passthrough](findings/dead-code.md#f-051).
+  **Medium.** Derive admission timing from the configured client dialer and pin
+  idle-socket closure without changing CONNECT authentication.
 - [ ] [F-043: Fix the `removeSessFromFlappers` data race](findings/runtime-correctness.md#f-043).
   **Small to medium.** Reproduce both call sites and verify lock ordering first.
 - [ ] [F-035: Bound every courtesy DISCONNECT write](findings/runtime-correctness.md#f-035).
@@ -171,6 +174,35 @@ behavior when no container limit is configured.
   concise file or package documentation.
 - [ ] Do not preserve file layout merely to keep a line-by-line upstream diff;
   maintainability of this broker is the controlling requirement.
+
+### Dead-code and reachability cleanup
+
+Each checkbox below is intentionally scoped as one reviewable commit. Complete
+them in order where a later lint change depends on an earlier cleanup.
+
+- [ ] [F-052: Connect MQTT option validation to production startup](findings/dead-code.md#f-052).
+  Adapt or retire the upstream validator, and make its tests exercise the real
+  standalone startup boundary.
+- [ ] [F-053: Remove independent dead declarations](findings/dead-code.md#f-053).
+  Delete the unreferenced constants, errors, leaf wrappers, singular shared-holder
+  helper, and superseded no-sequence message lookup.
+- [ ] [F-053: Remove obsolete upstream integration clusters](findings/dead-code.md#f-053).
+  Delete the unused configuration-reload, embedded-routing, and retained-permission
+  rescan paths with the imports and shim state they strand.
+- [ ] [F-054: Move test-only helper APIs out of production files](findings/dead-code.md#f-054).
+  Keep live hook points, but place tagged-test setters and convenience methods in
+  the test build where possible.
+- [ ] [F-054: Reconcile the constant-state v5 capability](findings/dead-code.md#f-054).
+  Derive it from supported configuration or collapse its impossible false branch.
+- [ ] [F-054: Isolate the parked WebSocket path](findings/dead-code.md#f-054).
+  Keep the future transport milestone explicit without carrying an apparently
+  selectable non-nil WebSocket path in current production flow.
+- [ ] [F-054: Isolate upstream-only QoS compatibility switches](findings/dead-code.md#f-054).
+  Keep reference-test behavior without presenting the switches as reachable
+  production configuration.
+- [ ] [F-055: Re-enable reachability lint for `mqtt.go`](findings/dead-code.md#f-055).
+  Replace the file-wide exclusions with default- and full-suite analysis plus
+  narrowly documented exceptions.
 
 ### Performance and resource audits
 
