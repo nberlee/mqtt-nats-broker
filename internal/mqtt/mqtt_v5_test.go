@@ -5879,14 +5879,40 @@ func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
 		asm.processSessionPersist(nil, &client{}, nil, subject, _EMPTY_, append(b, CR_LF...))
 	}
 
-	// Stale ack: timer and session must survive.
+	// Stale ack: timer and session must survive. Refused synchronously by the
+	// callback's cheap filter, before any eviction worker spawns.
 	deliverAck(seq - 1)
 	if !testMQTTHasPendingExpiry(t, s, "seprobe3", "sestale") {
 		t.Fatal("expected the pending expiry to survive a stale persist ack")
 	}
 
-	// Newer ack: remote takeover, timer cancelled and session dropped.
-	deliverAck(seq + 1)
+	// Newer ack: a remote takeover. The eviction now runs on a classifying
+	// worker, so a GENUINE successor record is planted above the session's
+	// acknowledged sequence before its observation is delivered — the old
+	// synthetic seq+1 with no record behind it would make the worker load the
+	// session's own record and correctly refuse on equality. The completion
+	// observer is what makes the assertions follow the worker's decision.
+	done := make(chan bool, 4)
+	asm.mu.Lock()
+	asm.testEvictComplete = func(h string, applied bool) {
+		if h == hash {
+			done <- applied
+		}
+	}
+	asm.mu.Unlock()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	newSeq := testMQTTPlantSessionRecord(t, js, asm.domainTk, "sestale",
+		&mqttPersistedSession{DisconnectedAt: time.Now().Unix(), ExpiryInterval: 30})
+	deliverAck(newSeq)
+	select {
+	case applied := <-done:
+		if !applied {
+			t.Fatal("expected the worker to evict on a demonstrated takeover")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the eviction worker never completed")
+	}
 	if testMQTTHasPendingExpiry(t, s, "seprobe3", "sestale") {
 		t.Fatal("expected the pending expiry cancelled by a newer persist ack")
 	}

@@ -348,15 +348,19 @@ identical; log order puts the re-attempt last, so the PubAck this broker adopts 
 surviving sequence; and `$MQTT_sess` is `MaxMsgsPer: 1` — a validated prerequisite — so
 the earlier duplicate is discarded the moment the later one arrives. What is spent is one
 stream sequence and one extra persist notification, and that notification is idempotent:
-a remote broker evicts a stale resident either way.
+both deliveries trigger the same classifying eviction attempt on the remote broker (the
+attempt itself may be refused by a held gate or fence — see "Recognising a forked
+session record" — in which case convergence falls to the displaced session's own local
+triggers, the rejection probe first among them).
 
 **The invariant is that an ours-landed settlement always leaves a state reachable by the
 original landing with its response lost.** Content identity is the digest, ordering
 identity is the committed sequence, and no consumer of either asks *which* proposal
 landed: a register's `ClaimSeq` sampled at the stale base is still older than every later
 owner's claim, the delayed-Will fences compare captured baselines against actual
-sequences, and a remote broker's persist observation evicts its stale resident exactly as
-it would for a landed original.
+sequences, and a remote broker's persist observation triggers the same classifying
+eviction attempt against its stale resident as a landed original would (refusable, per
+the recognition section; a refused attempt leaves convergence to the local triggers).
 
 Two consequences are stated rather than hidden. **"It did not land" ceases to be a
 reachable verdict**, so a kept mutation is never rolled back and a caller registers only
@@ -439,7 +443,7 @@ that replay is reported as a fork of itself.
 identity match is not proof that an attempt's *bytes* are durable — the digest comparison
 remains the only thing that licenses them.
 
-**Four classified paths** consult it, and every one of them keeps the disposition it
+**Five classified paths** consult it, and every one of them keeps the disposition it
 already had, changing only what is reported:
 
 | Path | On a proven sibling |
@@ -448,6 +452,7 @@ already had, changing only what is reported:
 | definite rejection, **unbound** | the same foreign disposition, with the forked vocabulary. It passes `nil` for the client, so the helper returns before the notification and *nothing observable differs*; the arm exists so the classifier has one meaning everywhere |
 | ambiguity resolution (`sess_uncertain.go`) | the same foreign disposition, verbatim — the same eviction, residency, continuation and parked-action treatment — with the forked vocabulary |
 | CONNECT-time classified saves (`reconcileResumedConsumers`, `grantRequestedLifetime`) | the same disposition, forked vocabulary. Their **10071** arms disposed with no readback at all, so they now read once and classify — the only new I/O in the mechanism, on a pre-CONNACK rejection path |
+| the persist observation (`evictDisplacedOnRemotePersist`) | the same eviction — the record provably moved with content that is not ours — with the forked vocabulary, and the displaced incarnation's **delayed-Will outbox record is left alone**, because nothing arbitrated a session continuation. See below for the worker this route required |
 
 A fifth site, the CONNECT rollback readback (`rollbackAcceptedSession`), classified any
 connected record above the candidate sequence as a legitimate newer generation and
@@ -466,9 +471,78 @@ state is still lost, and the verdict licenses no write of its own. It does not e
 the survivor erased us — a teardown claim is itself a full-body CAS off the same base — only
 that the survivor is no successor of ours. An absent `WID` concedes through arm 2's guard
 rather than through a legacy branch, so there is no alternate code path and no
-mixed-version machinery. `docs/CONFORMANCE.md` states what is left open, of which the
-largest by far is that `processSessionPersist` — the route that causes this most often —
-cannot classify at all, because a `JSPubAckResponse` carries no record.
+mixed-version machinery. `docs/CONFORMANCE.md` states what is left open.
+
+**The persist-observation consult** (`processSessionPersist` →
+`evictDisplacedOnRemotePersist`, `mqtt.go`) is the route that turns a fork into
+client-visible damage most often, and it is the one consult that cannot run inline: a
+`JSPubAckResponse` carries no record, and reading one (`loadSessionMsg`) is a blocking JSA
+request on the one delivery goroutine every later persist observation shares. The eviction
+therefore runs on a spawned, admitted worker, and the mechanism is **recognition plus
+in-process coalescing — arbitration stays with the record CAS and the rejection probe**:
+
+- **One worker per client, not per observation.** The callback registers with the same
+  `reconcileWM` state the no-local expiry reconcile uses (both branches create entries
+  now); `st.evictRunning` coalesces every further resident-delivered observation onto
+  the running worker, whose trigger is a watermark, not the PubAck that spawned it. The
+  eviction trigger (`st.evictLatest`) advances ONLY on the resident branch: an
+  observation that arrives with no session resident belongs to the no-local reconcile
+  exclusively, and must never be replayed by a lingering worker against a re-added
+  object (whose obligations that branch deliberately preserves). The worker carries
+  only the client hash and resolves the resident object FRESH, under `as.mu`, inside
+  each decision — a replacement installed mid-run is simply the object the next
+  iteration decides against.
+- **A latest-knowledge-wins loop, bounded structurally.** Each iteration reads the
+  trigger, loads the record once, and re-loads only when the trigger has advanced
+  strictly past `max(target, loadedSeq)` — a strict advance past the iteration's own
+  knowledge, so the loop is bounded by observation count.
+- **The observation licenses; the read only narrows.** An absent, undecodable,
+  unreadable, or below-trigger record cannot revoke the license the observation granted:
+  those arms concede the takeover vocabulary and decide at the observation level
+  (evict only if `target > sess.seq`). A record older than the write that licensed the
+  eviction is never classified — classifying it could answer 0x89 for a write it cannot
+  speak for.
+- **The gate is observed, never claimed.** The decision is one `as.mu` critical section;
+  `lockSession` itself needs `as.mu`, so no gate can be newly taken while it runs, and a
+  gate already held defers the worker (bounded retries, then a refused exit). That is a
+  deliberate narrowing versus the old synchronous handler, which barged into a gate-held
+  probe; the cost is a possibly lost eviction, which the at-most-once observation
+  contract already allows.
+- **The fence proves adoption quiescent — not attempt-free.** `tryBeginRecordTx`
+  (non-blocking, refused → the same bounded retry) is what retires the ordering hazard
+  where a remote observation is handled before the local write's own PubAck adopted its
+  sequence: every `sess.seq`/lineage adoption on a resident object happens inside the
+  writer's open record transaction, so fence-acquired means no adoption is in flight and
+  the classification runs HERE, at decision time, never from a pair sampled at load
+  time. An AMBIGUOUS attempt (store landed, response lost) closes its transaction with
+  the pair still stale behind `seqUncertain`; that staleness only narrows — a sibling of
+  the unadopted attempt concedes to the takeover claim (the one-hop recognition miss,
+  today's behavior exactly), a sibling of the acknowledged record still classifies
+  forked, and no shape manufactures a false forked verdict from a stale pair.
+- **Strict staleness.** Eviction requires `loadedSeq > sess.seq`. Equality is the
+  session's own record — no remote write can land AT our acknowledged sequence within a
+  stream epoch — and refusing it is a deliberate narrowing versus the old handler, which
+  evicted on an observation at exactly `sess.seq` (e.g. the late-delivered notification
+  of the very write a restore adopted).
+- **A fixed release order.** State disposal happens under `as.mu`; then `as.mu` is
+  released, then the fence (`endRecordTx` can synchronously run the void-verdict
+  handoff, which takes `as.mu` — the other order self-deadlocks), and only then the
+  notification and close, so no lock is held across the unbounded socket write. Abnormal
+  exits release the fence with `abandonRecordTx` (`sess_recordtx.go`), the handoff-free
+  form that is legal under `as.mu`; the handoff it skips belongs to the periodic
+  backstop (`reconcileResidentRecordState` → `flushVoidVerdictGap`).
+- **Terminal cleanup is one atomic decision.** Clearing the coalescing flag re-checks
+  the eviction trigger in the same `as.mu` section: a trigger that arrived after the
+  worker's last attempt loops the SAME worker (fresh retry budget, possibly against a
+  replacement object) instead of stranding behind a clearing flag. A refused attempt —
+  busy-exhausted or no-resident — consumes only the trigger it answered, never the
+  record it happened to load, so an observation at exactly that record's level still
+  forces a decision once the gate frees.
+
+On the takeover verdict the worker cancels the displaced incarnation's delayed-Will
+outbox records, scoped by generation and origin sequence, inline (it is already off the
+delivery goroutine and tracked). On the forked verdict that scan does not run: the
+records stay pending, and their fate at `FireAt` still belongs to the fire-time fences.
 
 ### A definite record-CAS rejection is outstanding work
 
@@ -590,11 +664,12 @@ session's owner — bounded, every holder being bounded — and reads the outcom
 - **still ours when the spin gives up**: nothing observable is displacing this connection,
   so it is an ordinary no-verdict outcome and says 0x89.
 
-One path still ignores the gate entirely: `processSessionPersist` evicts, notifies and
-closes under `as.mu` alone, so it can overlap a gate-held probe. Blocking it on the gate is
-not available — it runs on the JSA delivery goroutine, where a gate wait head-of-line-
-stalls every later persist observation — so the overlap itself stays, stated as a residual.
-What no longer follows from it is a second DISCONNECT: see the claim below.
+One path still takes no gate of its own: the persist observation's eviction worker
+(`evictDisplacedOnRemotePersist`) claims nothing, but it now OBSERVES `sessLocked` inside
+its `as.mu` decision and defers to a holder it finds (bounded retries, then a refused
+exit) instead of overlapping a gate-held probe as the old synchronous handler did. The
+deferral can lose the eviction — the at-most-once observation contract already allows
+that — and a second DISCONNECT is refused by the claim below in any case.
 
 **"Displace this connection" has one owner per leg.** Four paths displace a bound
 connection — a local CONNECT takeover (`mqttProcessConnect`), a remote persist observation

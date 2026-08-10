@@ -2111,10 +2111,11 @@ func TestMQTTBoundRejectionGateRefused(t *testing.T) {
 	})
 }
 
-// TestMQTTBoundRejectionDisplacedSaysNothing is the same rule against the path that
-// actually races this gate in production, and the one that does not even take the
-// ownership gate: processSessionPersist evicts the session, clears sess.c, enqueues its own
-// 0x8E and closes ASYNCHRONOUSLY.
+// TestMQTTBoundRejectionDisplacedSaysNothing is the same rule against the persist
+// observation route, which never CLAIMS the ownership gate (its eviction worker observes a
+// held gate and defers to it instead of overlapping its holder): the worker evicts the
+// session, clears sess.c, enqueues its own classified notification and closes
+// ASYNCHRONOUSLY.
 //
 // Two orderings, and the second is the one with teeth. Waiting for the eviction to become
 // visible usually waits past its close too — the close marks the client closed before it

@@ -72,8 +72,9 @@ func TestMQTTDisplacementClaimsTheOneDisconnect(t *testing.T) {
 	}
 
 	// The first contender: a real remote persist, observed by the real subscription, which
-	// runs the takeover branch of processSessionPersist. Its notification is synchronous
-	// and precedes its `go closeConnection`, so a closed connection proves it has run.
+	// hands the eviction to processSessionPersist's classifying worker. The whole route is
+	// asynchronous now, but the worker's notification still precedes its
+	// `go closeConnection`, so a closed connection proves the notification was attempted.
 	e.remoteTakeover(t, "node2", "dispclaim")
 	deadline := time.Now().Add(testRejectionWait)
 	for !b.closed() {

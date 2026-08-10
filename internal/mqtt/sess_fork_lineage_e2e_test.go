@@ -86,8 +86,8 @@ func TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill(t *testing.T) {
 		t.Fatal("the connection must be bound to a session")
 	}
 	idHash := sess.idHash
-	// Without this the persist observation evicts the connection with 0x8E through the
-	// route this change does NOT touch, and the classified path is never reached.
+	// Without this the persist observation's own classifying worker evicts the
+	// connection first, and the rejection-settlement path under test is never reached.
 	asm.mu.Lock()
 	asm.testSessPersistDrop = func(h string) bool { return h == idHash }
 	asm.mu.Unlock()
@@ -206,8 +206,8 @@ func TestMQTTForkedRecordE2EConnectRebuildsFromRecord(t *testing.T) {
 // and therefore the shape that produces this change's sharpest residual.
 //
 // The peer's own persist observation is dropped for the same reason the local one is:
-// otherwise the local save below evicts the peer through the untouched route, and there is
-// no competing owner left to be competing.
+// otherwise the local save below evicts the peer through its own persist-observation
+// worker, and there is no competing owner left to be competing.
 func testE2ELiveCompetingOwner(t *testing.T, s *Server, node, clientID string, idHash string) *mqttSession {
 	t.Helper()
 	peer := &Server{nrc: s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}

@@ -56,7 +56,7 @@ func testGrantLifetime(t *testing.T, e *testRejectionEnv, c *client) error {
 // TestSessForkedAtConnectTimeDirectRejection is the 10071 half of tests 8c-8f (M19a).
 //
 // This arm disposed with no readback at all, so it asserted a takeover on nothing but the
-// fact that the CAS failed — the weakest evidence any of the four classified paths acts on.
+// fact that the CAS failed — the weakest evidence any of the five classified paths acts on.
 // It now reads the record it is about to concede to. The successor row is what keeps that
 // from being a blanket downgrade.
 func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {

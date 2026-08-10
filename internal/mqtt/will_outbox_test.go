@@ -899,15 +899,19 @@ func TestMQTTWillOutboxEnqueueAckDelayedNoCancelWhilePublishing(t *testing.T) {
 //
 // Two brokers share one JetStream. Broker A's enqueue is blocked with the
 // enqueue-store seam. The same client takes over on broker B, whose synchronous
-// cancel (completed before B's CONNACK) and A's asynchronous cancel (via
-// processSessionPersist, awaited through the cancel observer) both run on the still
-// EMPTY outbox. Only then is A's real create released, so the sole thing that can
-// suppress the record is the new fence. A far-future FireAt (60s) keeps the claim
-// loop out of the picture entirely, so any cancellation is attributable to the
-// ENQUEUE-side fence, not the claimant. Broken origin-sequence plumbing
-// (OriginSessionSeq left 0) bypasses the fence, so the record simply stays pending
-// (its 60s FireAt is never reached during the test) and the 3s cancellation
-// assertion below times out — which is how this test fails on a broken fence.
+// cancel (completed before B's CONNACK) runs on the still EMPTY outbox. A's own
+// takeover-triggered cancel cannot run here at all: its classifying eviction
+// worker defers to the ownership gate A's blocked close holds across the parked
+// enqueue, and a deferred-out eviction is refused, not retried — so A's persist
+// observation is DROPPED outright (the lost-notification state, which the drop
+// seam exists to produce deterministically) rather than awaited. Only then is A's
+// real create released, so the sole thing that can suppress the record is the new
+// fence. A far-future FireAt (60s) keeps the claim loop out of the picture
+// entirely, so any cancellation is attributable to the ENQUEUE-side fence, not
+// the claimant. Broken origin-sequence plumbing (OriginSessionSeq left 0)
+// bypasses the fence, so the record simply stays pending (its 60s FireAt is never
+// reached during the test) and the 3s cancellation assertion below times out —
+// which is how this test fails on a broken fence.
 func TestMQTTWillOutboxTakeoverLateEnqueue(t *testing.T) {
 	oA := testMQTTDefaultOptionsV5()
 	sA := testMQTTRunServer(t, oA)
@@ -961,17 +965,17 @@ func TestMQTTWillOutboxTakeoverLateEnqueue(t *testing.T) {
 		willProps: mqttV5WillDelayProps(60), props: mqttV5ConnPropsSessionExpiry(60)}, oA.MQTT.Host, oA.MQTT.Port)
 	testMQTTReadConnAckV5(t, rwA)
 
-	// Observe A's asynchronous cancel AFTER A's own CONNECT — that CONNECT's own
-	// cancelWillOutbox would otherwise pre-fill the channel with a stale token. A's
-	// own session saves are ignored by its processSessionPersist (self jsa.id), so
-	// from here the only observer fire is A's takeover-triggered async cancel below.
-	aCancelled := make(chan struct{}, 4)
-	setWillCancelDoneHook(asmA, func() {
-		select {
-		case aCancelled <- struct{}{}:
-		default:
-		}
-	})
+	// Drop A's persist observations for this client. A's close is about to park
+	// inside the enqueue seam while HOLDING the ownership gate, and the classifying
+	// eviction worker defers to a held gate and then refuses — so A's
+	// takeover-triggered cancel can no longer run in this staging, only lose a
+	// bounded race about WHEN it gives up. The drop pins the refused/lost outcome
+	// deterministically; either way nothing of A's touches the outbox before the
+	// release, which is what the attribution below needs.
+	asmA.mu.Lock()
+	willHash := getHash("tlepub")
+	asmA.testSessPersistDrop = func(h string) bool { return h == willHash }
+	asmA.mu.Unlock()
 
 	// Disconnect: A's readLoop enters enqueueDelayedWill and blocks in the seam.
 	cwA.Close()
@@ -990,15 +994,9 @@ func TestMQTTWillOutboxTakeoverLateEnqueue(t *testing.T) {
 	defer cwB.Close() // keep B connected (DisconnectedAt == 0) through the assertions
 	testMQTTReadConnAckV5(t, rwB)
 
-	// A's takeover-triggered async cancel MUST complete on the still-empty outbox
-	// before release, so no stray old cancel can later mask a broken fence.
-	select {
-	case <-aCancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("A's takeover-triggered async cancel never completed on the empty outbox")
-	}
-	// Stop observing/cancelling further so nothing races the released enqueue.
-	setWillCancelDoneHook(asmA, nil)
+	// A's observation is dropped (above), so no cancel of A's can race the released
+	// enqueue: B's synchronous cancel has already completed before its CONNACK, and
+	// the outbox is still empty.
 
 	// Release A's real create: it lands pending carrying A's (older) OriginSessionSeq,
 	// and enqueueDelayedWill's earlyCancelIfSuperseded re-reads B's live session

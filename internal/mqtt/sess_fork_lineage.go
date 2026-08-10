@@ -246,6 +246,19 @@ func mqttDisposalForRepairSave(v mqttRepairSaveVerdict) mqttDisposalVocabulary {
 	return mqttDisposalTakenOver
 }
 
+// disposalForRemotePersist maps the persist-observation route's lineage verdict onto
+// what it licenses the broker to SAY, the same shape as the other mqttDisposalFor*
+// helpers. The caller (evictDisplacedOnRemotePersist) keeps its strict
+// `Sequence > sess.seq` gate AHEAD of this call — that is this consult's sequence
+// fail-safe — and calls it only on the usable-record path: an absent, undecodable or
+// below-target record concedes through the license rule without reaching lineage.
+func disposalForRemotePersist(ps *mqttPersistedSession, ourGen, ackWID, ackPWID string) mqttDisposalVocabulary {
+	if classifyRecordLineage(ps, ourGen, ackWID, ackPWID) == mqttLineageForked {
+		return mqttDisposalForked
+	}
+	return mqttDisposalTakenOver
+}
+
 // disposalForDirectRejection classifies the record behind a 10071 rejection — the
 // CONNECT-time saves' OTHER rejection arm, which disposes immediately without consulting
 // resolveContendedRecordSave and therefore has no readback of its own.
@@ -253,7 +266,7 @@ func mqttDisposalForRepairSave(v mqttRepairSaveVerdict) mqttDisposalVocabulary {
 // It adds the only new I/O in this change: one load, on the rejection path of a
 // pre-CONNACK save, never on a healthy connection. Without it the two helpers would keep
 // asserting a takeover on the bare fact that the CAS failed, which is the weakest
-// evidence any of the four classified paths acts on.
+// evidence any of the five classified paths acts on.
 //
 // Unreadable, undecodable, absent or at/below the base all CONCEDE — the takeover
 // vocabulary, exactly today's behavior. The verdict only ever narrows.

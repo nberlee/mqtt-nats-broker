@@ -298,13 +298,14 @@ const (
 //
 // The silence on the displaced arm is load-bearing, not an omission. A refused claim means
 // a CONNECT takeover, a remote persist observation or a resolver disposal is running for
-// this client ID, and each of those attempts its OWN 0x8E and closes the connection
-// asynchronously — `processSessionPersist` does it without even taking the gate. Answering
-// a refusal with 0x89 would try to append "server busy, try again" to another path's
-// "session taken over": the connection's one DISCONNECT claim now refuses whichever of the
-// two is second (mqttClaimDisconnectLocked), so the cost of speaking here is no longer a
-// second packet but a WRONG one — this arm racing the displacer for the reason the client
-// is left with, in an order neither path controls.
+// this client ID, and each of those attempts its OWN notification (0x8E, or 0x89 for a
+// record its classifier proved forked) and closes the connection asynchronously — the
+// persist observation's eviction worker claims no gate of its own, though it defers to one
+// it observes held. Answering a refusal with 0x89 would try to append "server busy, try
+// again" to another path's verdict: the connection's one DISCONNECT claim now refuses
+// whichever of the two is second (mqttClaimDisconnectLocked), so the cost of speaking here
+// is no longer a second packet but a WRONG one — this arm racing the displacer for the
+// reason the client is left with, in an order neither path controls.
 //
 // CONNECT and DISCONNECT are exempt. Pre-CONNECT there is no bound session to arbitrate,
 // and a second CONNECT is already a protocol error before dispatch. DISCONNECT neither

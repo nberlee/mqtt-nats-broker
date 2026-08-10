@@ -1380,8 +1380,9 @@ is fixed before feature work continues.
   is race-determined, so a delivered 0x89 can be stale; non-DISCONNECT traffic can still
   trail the winner until the close lands, which needs a delivery-side gate; the notification
   write is still unbounded (bullet below); and the `processSessionPersist` overlap with a
-  gate-held probe itself remains, since that path runs on the JSA delivery goroutine and
-  cannot wait on the gate. The claim is an in-process bool, so protection is PER OWNING
+  gate-held probe was closed later by the classified-eviction item — its worker now defers
+  to a held gate instead of barging. The claim is an in-process bool, so protection is PER
+  OWNING
   BROKER and the rollout is asymmetric: nothing wire-, stream- or record-visible changes,
   and during a mixed-version window a session resident on an OLDER broker keeps the full
   duplicate-DISCONNECT behaviour on its own sockets until that broker upgrades — a partial
@@ -1486,24 +1487,39 @@ is fixed before feature work continues.
   `docs/ARCHITECTURE.md`, "Recognising a forked session record".
 
   NOT closed by it, and each filed below: the persist-observation route (the one that
-  causes this most often) still evicts with 0x8E and cannot classify at all; no durable
-  state is repaired; the other five arbitrated streams have no lineage; and the Raft window
-  itself is still not reproduced by any test — what the tests stage is the durable outcome.
-  Full list in `docs/CONFORMANCE.md`, "A forked session record is RECOGNISED, and nothing
-  more". Found by holistic round 5 of the ambiguous-write settlement.
+  causes this most often) was closed by the item directly below, which taught the eviction
+  to classify; no durable state is repaired; the other five arbitrated streams have no
+  lineage; and the Raft window itself is still not reproduced by any test — what the tests
+  stage is the durable outcome. Full list in `docs/CONFORMANCE.md`, "A forked session
+  record is RECOGNISED, and nothing more". Found by holistic round 5 of the
+  ambiguous-write settlement.
 
-- [ ] `processSessionPersist` evicts the rightful client on a remote PubAck it cannot
-  classify, and it is the PRIMARY route by which a forked record becomes client-visible
-  damage. A remote sibling's persist at a higher sequence evicts synchronously with 0x8E,
-  **cancels the displaced incarnation's Will outbox** (so a spurious eviction suppresses a
-  Will) and **cancels the session-expiry timer** — directly for a resident session, and
-  through `reconcileRemoteSessionExpiry` when none is resident. The parent-pointer
-  recognition above cannot reach it: a `JSPubAckResponse` carries stream, sequence and
-  domain, no record. Closing it needs the observation to fetch and classify the record
-  before acting, which turns an at-most-once notification handler into a JetStream reader
-  on the eviction path — with its own ordering problem, since a remote observation can be
-  handled BEFORE the local write's PubAck has updated `sess.wid`. That last point is a
-  finding from round 2 of the recognition work and belongs in this item's brief.
+- [x] `processSessionPersist` evicted the rightful client on a remote PubAck it could not
+  classify — synchronously, with 0x8E, cancelling the displaced incarnation's Will outbox
+  and the session-expiry timer on unclassifiable evidence. Closed by moving the resident
+  branch's eviction onto a per-client classifying worker
+  (`evictDisplacedOnRemotePersist`): one admitted worker per client (coalesced through the
+  shared `reconcileWM` watermark plus an `evictRunning` flag), a latest-knowledge-wins
+  loop bounded by strict trigger advance, ONE `as.mu` decision section that resolves the
+  resident object fresh, OBSERVES (never claims) the ownership gate, takes the record
+  fence non-blocking (which retires the round-2 ordering hazard: adoption happens inside
+  the writer's open transaction, so fence-acquired proves adoption QUIESCENT — an
+  ambiguous landed attempt still leaves a stale pair, which only ever narrows the
+  verdict; see the unresolved-attempt residual in `docs/CONFORMANCE.md`),
+  requires a strictly advanced record (`Sequence > sess.seq`; equality — the session's own
+  record — no longer evicts), and classifies at decision time. A proven sibling answers
+  0x89 with the ownership-unsettled Reason String and LEAVES the delayed-Will outbox
+  records pending; everything unreadable/absent/below-trigger concedes 0x8E through the
+  license rule (the observation licenses, the read only narrows). Release order is
+  `as.mu` → `endRecordTx` → notify/close, with a new handoff-free `abandonRecordTx` for
+  abnormal exits (the skipped void-verdict handoff belongs to the periodic backstop).
+  Residuals — asynchronous and REFUSABLE eviction (held gate/fence defers; a quiet bound
+  session then converges only on a local trigger, the §"resident session never
+  re-validates" class below), the serving window, lost observations still unreplayed,
+  clean-start/re-minted-gen forks still concede, and the rest — are stated in
+  `docs/CONFORMANCE.md`, "A forked session record is RECOGNISED, and nothing more".
+  `internal/mqtt/mqtt.go`, `sess_recordtx.go`, `sess_fork_lineage.go`;
+  `sess_persist_evict_test.go`.
 
 - [ ] A proven fork is recognised but never REPAIRED: the surviving sibling stays and the
   rightful owner's granted state is lost. A naive repair was designed and rejected — it
@@ -1522,10 +1538,12 @@ is fixed before feature work continues.
   are PRE-EXISTING on the foreign path — the forked verdict merely reaches them more often
   — and both were deliberately left alone by the recognition work rather than folded in.
 
-- [ ] Takeover versus takeover at one base is unordered, and the recognition above only
-  makes both sides WITHHOLD the claim where the persist observation is absent or lost. In
-  the general case that untouched route still picks a side. Converging the two brokers on
-  one owner needs the arbitration this item's parent bullet could not provide.
+- [ ] Takeover versus takeover at one base is unordered. With the persist observation now
+  classifying, both sides WITHHOLD the claim on a recognisable (resume-shaped) fork — but
+  nothing orders or arbitrates the two evictions themselves, a clean-start side's
+  re-minted generation still concedes 0x8E, and a lost observation decides nothing.
+  Converging the two brokers on one owner needs the arbitration this item's parent bullet
+  could not provide.
 
 - [ ] `$MQTT_willq` carries no write lineage, so a create-only enqueue erased by a
   same-base sibling across a leader transition is unrecognisable. The Will it named is

@@ -481,17 +481,19 @@ Residuals:
   wrong; and the parking helper itself DECLINES for an already-parked action that is not
   the discard-only shape (below). What remains is that the parked discard exists only in
   session memory, so there are exactly THREE ways to lose it, and every statement below is
-  conditional on all three: a crash before the discharge; a remote persist, which evicts
-  the re-added object under the manager lock alone — correctly, since a record another
-  broker owns is not this one's to delete, but the obligation goes with it; and the helper
-  DECLINING, which needs neither of the other two and whose reachability is unknown. Absent
-  all three, the next successful local classification retries the discard and completes it.
-  A remote persist has two orderings and neither is a guarantee: arriving after the re-add
-  it evicts, and arriving in the window between the caller's `removeSession` and the
-  re-add it takes the no-local-session branch and starts a reconciliation worker that then
-  finds the object resident and deliberately does nothing — so convergence there is
-  eventual, through the uncertainty classification calling the object foreign, not
-  immediate.
+  conditional on all three: a crash before the discharge; a remote persist, whose
+  classifying eviction worker evicts the re-added object — correctly, since a record
+  another broker owns is not this one's to delete, but the obligation goes with it (the
+  eviction is asynchronous now, defers to a held ownership gate or record fence, and can
+  be refused outright, which changes when the obligation is lost, not whether); and the
+  helper DECLINING, which needs neither of the other two and whose reachability is
+  unknown. Absent all three, the next successful local classification retries the discard
+  and completes it. A remote persist has two orderings and neither is a guarantee:
+  arriving after the re-add it evicts, and arriving in the window between the caller's
+  `removeSession` and the re-add it takes the no-local-session branch and starts a
+  reconciliation worker that then finds the object resident and deliberately does nothing
+  — so convergence there is eventual, through the uncertainty classification calling the
+  object foreign, not immediate.
   - For a v5 DISCONNECT that overrode a non-zero Session Expiry Interval to 0, losing the
     obligation is a spec deviation and not merely a leak. The override is applied to
     `sess.expiryInterval` and `c.mqtt.sessionExpiry` in memory and never persisted, so the
@@ -743,22 +745,60 @@ it does *not* promise:
 `$MQTT_sess` records carry `WID`/`PWID`, a parent pointer, so a survivor that is provably
 a **sibling** of the record this broker was acknowledged for stops being reported as a
 takeover: the client is told **0x89 "server busy, try again later"** instead of 0x8E, which
-invites the reconnect 0x8E forbids. Four classified paths consult it — the definite
-rejection probe (bound and unbound), the ambiguity resolver, the two CONNECT-time saves —
-plus the CONNECT rollback readback. See `docs/ARCHITECTURE.md`, "Recognising a forked
-session record".
+invites the reconnect 0x8E forbids. Five classified paths consult it — the definite
+rejection probe (bound and unbound), the ambiguity resolver, the two CONNECT-time saves,
+and the persist observation's eviction worker — plus the CONNECT rollback readback. See
+`docs/ARCHITECTURE.md`, "Recognising a forked session record".
 
 What it does NOT do:
 
-- **The persist-observation route is untouched, and it is the route that causes this most
-  often.** A remote sibling's PubAck at a higher sequence still evicts the rightful client
-  synchronously, still sends 0x8E, still **cancels the displaced incarnation's Will
-  outbox** — so a spurious eviction can suppress a Will — and still **cancels the
-  session-expiry timer**, directly for a resident session and through
-  `reconcileRemoteSessionExpiry` when none is resident. That last one bounds what the
-  rollback path's preserved timer is worth: observing the sibling's PubAck cancels it
-  anyway. The route cannot classify inline at all, because a `JSPubAckResponse` carries
-  stream, sequence and domain — no record. Filed as its own §0 item.
+- **The persist-observation route now classifies, asynchronously, and that leaves its own
+  residuals.** The eviction runs on a per-client worker that loads and classifies the
+  surviving record before acting; on a proven sibling it answers 0x89 and leaves the
+  displaced incarnation's delayed-Will outbox records pending. What that does not close:
+  - a **lost observation is still lost** — it is an at-most-once core-NATS notification,
+    and neither the rejection probe nor the expiry sweep re-delivers the notification;
+    they settle ownership and reap records, nothing more;
+  - the eviction is now **refusable**: a held ownership gate or record fence defers the
+    worker through bounded retries and can lose the eviction entirely, with ZERO
+    notifications written. Convergence for a quiet bound session then needs a local
+    trigger — a save (CAS-rejected → the probe), a reconnect, a later observation, or
+    the sweep — which is the pre-existing "a resident session never re-validates its
+    ownership absent a local trigger" class, now with more instances;
+  - a **serving window**: between the observation and the worker's decision the
+    displaced client keeps being served for the worker's latency (a record read plus
+    bounded retries). Any record write it triggers is CAS-rejected; deliveries in the
+    window are the same exposure a lost notification always had;
+  - a **lost newer observation can leave an older verdict's vocabulary to apply** — the
+    worker decides from knowledge at least as new as every observation actually
+    delivered before its decision, never newer;
+  - only **resume-shaped** fork siblings are recognisable here: a clean-start remote
+    CONNECT (or any discard) re-mints the incarnation generation, and a generation
+    mismatch concedes to 0x8E. The one-hop limit applies as everywhere — including
+    through an UNRESOLVED local attempt: a save whose store landed ambiguously leaves
+    the acknowledged pair stale behind a free fence, so a remote sibling of that
+    unadopted attempt concedes to 0x8E (and the takeover-path Will cancel), exactly as
+    before this change, while a sibling of the acknowledged record itself still
+    classifies forked; a stale pair can only narrow the verdict, never manufacture a
+    false forked one;
+  - the **timer-cancel** consequences are unchanged in shape: both verdicts cancel the
+    session-expiry timer (the record is owned remotely either way), which still bounds
+    what the rollback path's preserved timer is worth;
+  - a **bound connection's never-enqueued delayed Will is still lost on eviction**, on
+    both verdicts: eviction detaches `sess.c`, the close's teardown gate then fails, and
+    a delayed Will is never enqueued — the same shape as the foreign disposition's filed
+    behavior. What this item narrows is only the destruction of already-durable outbox
+    state;
+  - an **interrupted takeover-verdict cancel scan** leaves a durable partial state —
+    earlier records cancelled, later ones pending, no resume marker (pre-existing);
+  - on the forked verdict the preserved outbox record can **still be cancelled at
+    `FireAt`** by the lineage-blind watermark/session-record fences (filed separately);
+  - **shutdown-time observations are dropped** once the dispatch gate closes or the
+    watermark map is nilled, and a **mid-rollout** broker that owns the resident session
+    keeps the old synchronous 0x8E-and-cancel behavior on its own sessions;
+  - **warm-up**: a record predating the recognition work carries no lineage; its first
+    upgraded save stamps `{WID, PWID: ""}`, which the classifier refuses, so only the
+    second upgraded save yields a classifiable acknowledged pair.
 - **No durable state is repaired.** The forked record stays and the rightful owner's
   granted state is still lost. A repair was designed and rejected: it would resurrect an
   incarnation a teardown had already deleted, it needs a last-durable byte snapshot that
@@ -803,10 +843,11 @@ What it does NOT do:
   that stamped base are detectable. What concedes is a fork *involving* an old writer, or
   one based on a record whose lineage an old writer dropped, until an upgraded write
   establishes a new base.
-- **Takeover versus takeover at one base stays unordered**, and "both sides withhold the
-  claim" holds only where the persist observation is absent or lost; in the general case
-  that untouched route still picks a side and evicts it with 0x8E before either classifier
-  runs.
+- **Takeover versus takeover at one base stays unordered.** Both sides' persist
+  observations now classify, so for a resume-shaped fork each side withholds the claim
+  (0x89) rather than evicting the other with 0x8E — but nothing orders or arbitrates the
+  two evictions themselves, a clean-start side's re-minted generation still concedes to
+  0x8E, and a side whose observation was lost decides nothing at all.
 - **The other five arbitrated streams have no lineage at all** — `$MQTT_willq`,
   `$MQTT_willcancel`, `$MQTT_qos2in` (both its hold subjects and their `.rel` siblings),
   `$MQTT_qos2assign` and `$MQTT_inflight` — so the same leader-transition overwrite is
@@ -933,9 +974,11 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
         lands — a PINGRESP, or an in-flight PUBLISH from a delivery goroutine — which
         [MQTT-3.14.4-1] also forbids. Nothing gates those; closing it needs a delivery-side
         gate, the "resident session never re-validates" item's territory.
-      - **The notification write is still unbounded**, per (9) and (11), and the
-        `processSessionPersist` overlap with a gate-held probe itself remains: that path
-        runs on the JSA delivery goroutine and cannot wait on the gate.
+      - **The notification write is still unbounded**, per (9) and (11), though the
+        persist observation's eviction worker no longer holds any lock across it. The
+        old overlap with a gate-held probe is gone — the worker OBSERVES the gate and
+        defers to a holder — at the price that the deferral can lose the eviction
+        (bounded retries, then a refused exit).
       - **Per owning broker**, like every in-process fix here: during a rolling upgrade a
         session resident on an older broker keeps the old double-DISCONNECT exposure on its
         own sockets. No wire, stream or record state is involved (see (6)).

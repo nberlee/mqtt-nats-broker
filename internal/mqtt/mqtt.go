@@ -847,6 +847,42 @@ type mqttAccountSessionManager struct {
 	// reconcileRemoteSessionExpiry.
 	testReconcilePause func(idHash string)
 
+	// testEvictPauseBeforeLoad / testEvictPauseAfterLoad, when non-nil, are invoked
+	// by an eviction worker for THIS account manager only (instance-scoped) around
+	// its per-iteration record load: BEFORE the load (after the trigger read) and
+	// AFTER the load/decode, both outside every lock, so a handler may block. They
+	// are the levers for the replacement-object, stale-save, pair-freshness and
+	// coalescing races, and pauseBeforeLoad is where test 14(a)'s Goexit exercises
+	// the pre-fence abnormal cleanup. Set/read under mu. Nil in production. See
+	// evictDisplacedOnRemotePersist.
+	testEvictPauseBeforeLoad func(idHash string)
+	testEvictPauseAfterLoad  func(idHash string)
+
+	// testEvictPostFence, when non-nil, is invoked by an eviction worker's decision
+	// section for THIS account manager only, with as.mu HELD and the record fence
+	// OPEN — the window an abnormal exit must clean up from. A handler may panic or
+	// Goexit (the deferred guard releases the fence handoff-free and the deferred
+	// unlock releases as.mu, in that LIFO order) but must NOT block: it pins as.mu.
+	// Read under the held mu. Nil in production. See evictDecideOnce.
+	testEvictPostFence func(idHash string)
+
+	// testEvictCleanupEntry, when non-nil, is invoked by an eviction worker at the
+	// ENTRY of its terminal cleanup, outside every lock — before the as.mu section
+	// that re-checks the trigger watermark and clears the coalescing flag. It is
+	// what makes the cleanup's atomic re-check causally testable: a handler can
+	// release a gate entry and deliver a newer observation here, and the same
+	// worker must loop instead of stranding the trigger. Set/read under mu. Nil in
+	// production. See evictDisplacedOnRemotePersist.
+	testEvictCleanupEntry func(idHash string)
+
+	// testEvictComplete, when non-nil, is invoked by an eviction worker AFTER its
+	// cleanup on both the normal and abnormal exit paths, outside every lock,
+	// carrying whether an eviction was applied. Tests awaiting "no eviction"
+	// outcomes assert after this seam, so the negative is the worker's DECISION
+	// rather than its absence. Set/read under mu. Nil in production. See
+	// evictDisplacedOnRemotePersist.
+	testEvictComplete func(idHash string, applied bool)
+
 	// testSessPersistDrop, when non-nil, drops the remote persist observation for the
 	// client ID hashes it returns true for, on THIS account manager only. Set/read
 	// under mu. That is the state a lost core-NATS notification leaves — the remote
@@ -1032,11 +1068,28 @@ type mqttAccountSessionManager struct {
 	sweepQuarantine *mqttSweepQuarantine
 }
 
-// sessionReconcileState orders remote-expiry reconciliation workers for a single
-// client ID hash. Guarded by mqttAccountSessionManager.mu.
+// sessionReconcileState orders remote-persist workers for a single client ID
+// hash: the no-local expiry reconciliation worker and the resident-session
+// eviction worker share the watermark, so a newer observation supersedes an
+// older in-flight worker of either kind. Guarded by mqttAccountSessionManager.mu.
 type sessionReconcileState struct {
 	latest   uint64 // highest observed PubAck sequence for this client
-	inFlight uint64 // admitted-but-not-yet-completed reconciliation workers
+	inFlight uint64 // admitted-but-not-yet-completed workers (both kinds)
+	// evictLatest is the eviction worker's TRIGGER: the highest observation
+	// delivered while a session was RESIDENT. It is deliberately not `latest` —
+	// an observation that arrives with no resident session belongs to the
+	// no-local reconcile branch exclusively (which in the remove→re-add window
+	// deliberately does nothing), and a lingering eviction worker replaying it
+	// against a subsequently re-added object would evict on evidence that was
+	// never an eviction trigger (holistic round 3). Guarded by as.mu.
+	evictLatest uint64
+	// evictRunning coalesces resident-branch observations onto ONE eviction worker
+	// per client: while set, an observation only advances evictLatest, and the
+	// running worker's terminal cleanup re-checks it under as.mu before clearing
+	// the flag, looping instead of exiting when a newer trigger arrived. Checked
+	// on the resident branch only, so an observation with no resident session
+	// always reaches the no-local reconcile regardless of the flag.
+	evictRunning bool
 }
 
 type mqttJSAResponse struct {
@@ -4741,12 +4794,15 @@ func (as *mqttAccountSessionManager) processRetainedMsgDel(_ *subscription, c *c
 // including the reply for our own server, which we will ignore.
 //
 // It has two responsibilities for a remote persist. When we own a local session
-// for the client ID, a store elsewhere means an application somewhere else in the
-// cluster is connecting with the same client ID, so we evict our displaced local
-// connection (takeover). When we do NOT own a local session, we reconcile our
-// local session-expiry timer from the authoritative persisted record on a spawned
-// worker, so a surviving replica cleans up a remotely disconnected session near
-// its original deadline instead of waiting for the periodic sweep.
+// for the client ID, a store elsewhere means the record moved with content that is
+// not ours, so we evict our displaced local connection on a spawned worker that
+// CLASSIFIES the surviving record first: a demonstrated successor is a takeover
+// (0x8E), a proven same-base sibling — the leader-transition fork — is reported as
+// 0x89 "server busy" and keeps its enqueued delayed Will. When we do NOT own a
+// local session, we reconcile our local session-expiry timer from the
+// authoritative persisted record on a spawned worker, so a surviving replica
+// cleans up a remotely disconnected session near its original deadline instead of
+// waiting for the periodic sweep.
 // Spec5 [MQTT-3.1.2-8], [3.1.2.11.2].
 //
 // Can run from various go routines (system send loop, etc..).
@@ -4795,19 +4851,22 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 	// The delivery client (pc) has no server ref, so use the account JSA client's.
 	s := as.jsa.c.srv
 	// Advance the per-client reconciliation watermark for this observation, before
-	// choosing the takeover vs no-local path, so a newer observation handled by the
-	// takeover branch still supersedes an older in-flight reconciliation worker.
-	// Only the no-local branch creates an entry, so advancing an existing one here
-	// never leaks state for a client that has no worker in flight. Delivery is
-	// serialized on one subscription goroutine but need not match stream-sequence
-	// order, so advance with a max rather than last-write-wins.
+	// choosing the takeover vs no-local path, so a newer observation still
+	// supersedes an older in-flight expiry-reconciliation worker. The EVICTION
+	// trigger (st.evictLatest) is deliberately not advanced here: it moves only on
+	// the resident branch below, so an observation that arrives with no session
+	// resident can never become a lingering eviction worker's license against a
+	// re-added object. Both branches create entries now, so advancing an existing
+	// one here never leaks state for a client that has no worker in flight.
+	// Delivery is serialized on one subscription goroutine but need not match
+	// stream-sequence order, so advance with a max rather than last-write-wins.
 	if st := as.reconcileWM[cIDHash]; st != nil && par.Sequence > st.latest {
 		st.latest = par.Sequence
 	}
 	// A connection for this client ID started on another server, i.e. a new
-	// connection to this session. Below we evict our displaced local connection;
-	// the reconnecting broker also cancels the outbox from mqttProcessConnect.
-	// Spec5 [MQTT-3.1.2-8].
+	// connection to this session. Below we hand our displaced local connection to
+	// the classifying eviction worker; the reconnecting broker also cancels the
+	// outbox from mqttProcessConnect. Spec5 [MQTT-3.1.2-8].
 	sess, ok := as.sessByHash[cIDHash]
 	if !ok {
 		// No local session: reconcile this session's expiry deadline from the
@@ -4844,64 +4903,450 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 	}
 	// If our current session's stream sequence is higher, it means that this
 	// update is stale, so we don't do anything here (and keep our expiry timer).
+	// Cheap synchronous filter only — strictly below, NOT at, sess.seq: the worker
+	// refuses equality under the fence (its own strict `Sequence > sess.seq`), and
+	// an observation AT sess.seq must still spawn it so tests can assert that
+	// refusal was DECIDED (through the completion seam) rather than skipped here.
 	sess.mu.Lock()
 	ignore = par.Sequence < sess.seq
 	sess.mu.Unlock()
 	if ignore {
 		return
 	}
-	// The remote connection owns the session now; our expiry timer must not fire
-	// and delete its state. Spec5 [3.1.2.11.2].
+	// The record moved at-or-past our acknowledged sequence with content that may
+	// not be ours. What that licenses depends on the surviving record — a
+	// demonstrated successor is a takeover, a proven same-base sibling is not —
+	// and reading it (loadSessionMsg) is a blocking JSA request that must not run
+	// on this delivery goroutine: it would head-of-line-stall every later persist
+	// observation up to the JSA timeout. So the eviction runs on a spawned,
+	// ADMITTED worker (tracked via willWorkerWG, drained before shutdown tears
+	// down the JSA), coalesced to at most ONE per client: an observation arriving
+	// while one runs only advanced st.latest above, and the worker's terminal
+	// cleanup re-checks that watermark under as.mu before clearing the flag, so
+	// the trigger is consumed by a further iteration rather than stranded. The
+	// flag is checked ONLY on this resident branch: an observation with no
+	// resident session always reaches the no-local reconcile above regardless.
+	// See evictDisplacedOnRemotePersist. Spec5 [MQTT-3.1.2-8].
+	if as.reconcileWM == nil {
+		// Shutdown nilled the map: dropping the observation is the shutdown
+		// contract (the process is stopping; nothing may install new state).
+		return
+	}
+	if st := as.reconcileWM[cIDHash]; st != nil {
+		// The EVICTION trigger advances only here, on the resident branch: an
+		// observation delivered with no session resident is the no-local
+		// reconcile's alone and must never become a lingering worker's license
+		// against a re-added object.
+		if par.Sequence > st.evictLatest {
+			st.evictLatest = par.Sequence
+		}
+		if st.evictRunning {
+			return
+		}
+	}
+	// Admission refused means shutdown Phase 2 closed the Will dispatch gate; skip
+	// (the process is stopping). Checked before any state is created so refusal
+	// needs no undo.
+	if !s.admitWillWorker() {
+		return
+	}
+	st := as.reconcileWM[cIDHash]
+	if st == nil {
+		st = &sessionReconcileState{}
+		as.reconcileWM[cIDHash] = st
+	}
+	if par.Sequence > st.latest {
+		st.latest = par.Sequence
+	}
+	if par.Sequence > st.evictLatest {
+		st.evictLatest = par.Sequence
+	}
+	// Flag and increment set synchronously, in delivery order, before the go: the
+	// flag is what coalesces the next observation onto this worker, and the
+	// increment keeps a concurrent no-local worker's prune from deleting the entry
+	// before the worker runs. The worker clears both on every exit path.
+	st.evictRunning = true
+	st.inFlight++
+	go func() {
+		defer s.willWorkerWG.Done()
+		as.evictDisplacedOnRemotePersist(s, cIDHash, st)
+	}()
+}
+
+// evictOutcome is what one decision attempt of the eviction worker concluded.
+type evictOutcome uint8
+
+const (
+	// evictNoSession: no resident object for the client — terminal. An observation
+	// that declined to spawn while ANY object was resident is consumed against the
+	// object now resident; one that arrived with none resident took the no-local
+	// branch.
+	evictNoSession evictOutcome = iota
+	// evictStale: nothing moved strictly past the resident session's acknowledged
+	// record — terminal. Covers the equality/own-record case: no remote write can
+	// land AT our acknowledged sequence within a stream epoch, so equality is
+	// never a takeover.
+	evictStale
+	// evictBusy: the ownership gate or the record fence is held; the caller
+	// retries on a bounded budget, then exits accepting a lost eviction.
+	evictBusy
+	// evictFresher: a strictly newer trigger arrived past this iteration's
+	// knowledge; the caller re-loads.
+	evictFresher
+	// evictApplied: the session was evicted; the caller runs the notify/close and
+	// (takeover only) Will-cancel tail.
+	evictApplied
+)
+
+// evictDecision carries one decision attempt's outcome and, on evictApplied, the
+// verdict's vocabulary and the state captured for the tail that runs after the
+// locks are released.
+type evictDecision struct {
+	out  evictOutcome
+	sess *mqttSession
+	// tok/tokHeld: the record transaction still OPEN when the decision section
+	// returned. The caller must release it with the full endRecordTx AFTER this
+	// decision's as.mu section has returned — the full release can synchronously
+	// run the void-verdict handoff, which reacquires as.mu.
+	tok     recordTx
+	tokHeld bool
+	voc     mqttDisposalVocabulary
+	forked  bool
+	// displacedGen/displacedSeq scope the takeover path's Will-outbox cancel to
+	// exactly the Wills the displaced incarnation enqueued. See willCancelScope.
+	displacedGen string
+	displacedSeq uint64
+	ec           *client
+}
+
+// evictDecideOnce is the eviction worker's decision: ONE as.mu critical section
+// with nothing blocking inside. It resolves the resident object FRESH (the worker
+// is per-client, not per-object, so a replacement installed mid-run is simply the
+// object decided against), OBSERVES the ownership gate without ever claiming it,
+// proves adoption quiescent through the record fence, and only then classifies the
+// decoded record against the freshest acknowledged pair.
+//
+// Holding as.mu across the section is what makes the gate observation sound:
+// lockSession itself requires as.mu, so no gate can be NEWLY taken while this runs;
+// a gate ALREADY held defers the worker (evictBusy) — a deliberate narrowing versus
+// the old synchronous handler, which barged into a gate-held probe.
+//
+// usable=false is the license path: the observation licensed the eviction and the
+// record could not narrow it (absent, undecodable, load error, or below the
+// trigger), so decisionSeq is the OBSERVATION level and the verdict concedes to
+// takeover. The freshness arm still applies on this path — a trigger that
+// advanced past the observation this iteration answers is delivered knowledge,
+// not a lost observation, and the re-load may find the record readable at the
+// new level.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *sessionReconcileState,
+	usable bool, ps *mqttPersistedSession, decisionSeq uint64) (d evictDecision) {
+
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	sess, ok := as.sessByHash[cIDHash]
+	if !ok {
+		d.out = evictNoSession
+		return d
+	}
+	if _, held := as.sessLocked[sess.id]; held {
+		// A CONNECT, close, probe, SUBSCRIBE or UNSUBSCRIBE owns the session's
+		// record state; its writes are CAS-arbitrated, so deferring costs at most
+		// a lost eviction, which the observation contract already allows.
+		d.out = evictBusy
+		return d
+	}
+	tok, acquired := sess.tryBeginRecordTx()
+	if !acquired {
+		d.out = evictBusy
+		return d
+	}
+	d.sess, d.tok, d.tokHeld = sess, tok, true
+	// The abnormal-exit fence guard (LIFO: runs before the as.mu unlock above). A
+	// panic or Goexit escaping the seam below must release the fence, and the full
+	// endRecordTx is illegal here — it can synchronously run the void-verdict
+	// handoff, which reacquires as.mu. abandonRecordTx takes only sess.mu (the
+	// established as.mu → sess.mu order) and skips the handoff, whose skipped
+	// liveness edge the periodic backstop (reconcileResidentRecordState →
+	// flushVoidVerdictGap) owns. Every NORMAL return hands the open token to the
+	// caller instead, which releases it fully after as.mu.
+	normalReturn := false
+	defer func() {
+		if !normalReturn {
+			_ = sess.abandonRecordTx(tok)
+			d.tokHeld = false
+		}
+	}()
+	// Test seam: fired with as.mu held and the record fence open — the window an
+	// abnormal exit must clean up from. Handlers may panic or Goexit; they must
+	// not block (they pin as.mu).
+	if h := as.testEvictPostFence; h != nil {
+		h(cIDHash)
+	}
+	// Fence acquired proves adoption QUIESCENT: every sess.seq/lineage adoption on
+	// a resident, concurrently reachable object happens inside the writer's open
+	// recordTx, so no adoption is in flight and a DELAYED acknowledgment (store
+	// returned, tx still open until it adopts) cannot be raced past — which is
+	// what retires the ordering hazard where a remote observation is handled
+	// before the local write's own PubAck adopted its sequence. What it does NOT
+	// prove is that no AMBIGUOUS attempt is outstanding: a save whose store landed
+	// but whose response was lost arms seqUncertain, closes its transaction, and
+	// leaves this pair stale behind a free fence. That staleness only ever NARROWS
+	// the verdict — a sibling of the unadopted attempt reads unrelated against the
+	// stale pair and CONCEDES to the takeover claim (the stated one-hop
+	// recognition miss, exactly today's behavior), while a sibling of the
+	// acknowledged record itself still classifies forked (a true positive). No
+	// record shape can manufacture a false forked verdict from a stale pair, so
+	// the eviction proceeds; the unresolved attempt's own convergence stays with
+	// the resolver and the rejection probe. See sess_persist_evict_test.go's
+	// unresolved-attempt pair test and docs/CONFORMANCE.md.
+	sess.mu.Lock()
+	seqNow, gen, wid, pwid := sess.seq, sess.gen, sess.wid, sess.pwid
+	sess.mu.Unlock()
+	// Strict: eviction requires the record to have moved PAST us.
+	if decisionSeq <= seqNow {
+		d.out = evictStale
+		normalReturn = true
+		return d
+	}
+	// A strictly newer trigger than this iteration's own knowledge deserves a
+	// fresh read — on the unusable-load path included: an observation that
+	// advanced past the trigger this iteration answers is DELIVERED knowledge,
+	// and a record unreadable at the old level can be readable (and classifiable)
+	// at the new one, so conceding here would cancel a Will on knowledge already
+	// superseded (holistic round 2). Requiring the advance to pass decisionSeq
+	// (= max(target, smsg.Sequence) when the record was usable, the observation
+	// level otherwise) bounds the loop by observation count.
+	if st.evictLatest > decisionSeq {
+		d.out = evictFresher
+		normalReturn = true
+		return d
+	}
+	// Classify HERE, at decision time, from the freshest pair — never from a pair
+	// sampled at load time, which a local save adopting between the load and this
+	// section would falsify. The license path concedes.
+	voc := mqttDisposalTakenOver
+	if usable {
+		voc = disposalForRemotePersist(ps, gen, wid, pwid)
+	}
+	// The remote record owns the session now; our expiry timer must not fire and
+	// delete its state. Spec5 [3.1.2.11.2].
 	as.cancelSessionExpiryLocked(cIDHash)
 	as.removeSession(sess, false)
 	sess.mu.Lock()
-	// The displaced incarnation. The async cancel below is entitled to exactly the
-	// Wills this connection enqueued, and scoping it to this generation is what
-	// stops a late scan from destroying a Will enqueued by a LATER incarnation
-	// (reconnect elsewhere, disconnect again) — which the reconnect watermark does
-	// not suppress. See cancelWillOutboxForGen.
-	displacedGen := sess.gen
-	// The record sequence this broker knew when it was displaced. A Will its own
-	// connection enqueues cannot be past it, and the resuming broker's newer Will
-	// necessarily is — its takeover save advanced the record. See willCancelScope.
-	displacedSeq := sess.seq
+	d.displacedGen, d.displacedSeq = sess.gen, sess.seq
 	ec := sess.c
 	if ec != nil {
 		as.addSessToFlappers(sess.id)
-		ec.Warnf("Closing because a remote connection has started with the same client ID: %q", sess.id)
+		ec.Warnf("MQTT: session %q %s", sess.id, voc.logReason)
 		// Disassociate the client from the session so that on client close,
-		// nothing will be done with regards to cleaning up the session,
-		// such as deleting stream, etc..
+		// nothing will be done with regards to cleaning up the session, such as
+		// deleting stream, etc..
 		sess.c = nil
 	}
 	sess.mu.Unlock()
-	if ec != nil {
-		// Tell the evicted v5 client why before the close (no-op for 3.1.1);
-		// notified outside sess.mu since it takes the client lock. The shared
-		// tail claims the connection's one DISCONNECT and honors the CONNACK
-		// gate, so this observation cannot append a second DISCONNECT to one a
-		// racing displacement already sent. Spec5 [3.1.4].
-		ec.mqttNotifyTakenOver()
-		// Remove in separate go routine.
-		go ec.closeConnection(DuplicateClientID)
+	d.voc, d.forked, d.ec = voc, voc.reason == mqttDisposalForked.reason, ec
+	d.out = evictApplied
+	normalReturn = true
+	return d
+}
+
+// evictDisplacedOnRemotePersist evicts the resident local session after
+// processSessionPersist observed a remote persist at-or-past its acknowledged
+// record — classifying the surviving record FIRST, so a demonstrated successor is
+// reported as a takeover (0x8E, delayed-Will outbox cancelled) while a proven
+// same-base sibling — the leader-transition fork — is reported as 0x89 "server
+// busy" (inviting the reconnect that resolves the ambiguity) and destroys NO
+// durable Will state, because nothing arbitrated a session continuation.
+//
+// It is per-CLIENT, not per-object: at most one runs per client (st.evictRunning),
+// and each iteration resolves the resident object fresh under as.mu, so a
+// replacement installed mid-run is simply the object the next iteration decides
+// against. This is RECOGNITION plus in-process coalescing; the durable
+// arbitrations remain the record CAS and the rejection probe, and a lost
+// observation is never replayed.
+//
+// st is the *sessionReconcileState the callback registered for cIDHash; it is
+// passed in (not re-fetched) so the cleanup targets exactly that entry.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cIDHash string, st *sessionReconcileState) {
+	applied := false
+	completed := false
+	// cleanup clears the coalescing flag and runs the same lifecycle-tied prune as
+	// the no-local worker: decrement the exact state the callback incremented,
+	// delete the entry once no worker is in flight, with the map-identity check
+	// guarding a future refactor from deleting a replacement entry (delete on a
+	// nil map at shutdown is a no-op).
+	cleanup := func() {
+		as.mu.Lock()
+		st.evictRunning = false
+		if st.inFlight > 0 {
+			st.inFlight--
+		}
+		if st.inFlight == 0 && as.reconcileWM[cIDHash] == st {
+			delete(as.reconcileWM, cIDHash)
+		}
+		as.mu.Unlock()
 	}
-	// Cancel any delayed Will the displaced local connection enqueued. Together
-	// with the eviction above this closes the reconnect race for both orderings:
-	// a not-yet-run local close now fails its lockSession (sess.c was cleared) and
-	// never enqueues, while a close that already enqueued its Will has it
-	// cancelled here — covering the window where the enqueue landed after the
-	// reconnecting broker's own cancel scan. Async so the JSA delivery goroutine
-	// is not blocked on the bounded cancel scan, but ADMITTED through the Will
-	// dispatch gate first so it is tracked (willWorkerWG) and drained before
-	// shutdown tears down the JSA: admission fails once shutdown Phase 2 has closed
-	// the gate, in which case we skip it (the process is stopping).
-	// Spec5 [MQTT-3.1.2-8].
-	if s.admitWillWorker() {
-		go func() {
-			defer s.willWorkerWG.Done()
-			_ = as.cancelWillOutboxForIncarnation(s, cIDHash, displacedGen, displacedSeq)
-		}()
+	// observe fires the completion seam AFTER cleanup, on the normal and abnormal
+	// paths both, carrying whether an eviction was applied — so a test awaiting a
+	// "no eviction" outcome asserts on the worker's DECISION, not its absence.
+	observe := func() {
+		as.mu.RLock()
+		h := as.testEvictComplete
+		as.mu.RUnlock()
+		if h != nil {
+			h(cIDHash, applied)
+		}
 	}
+	// Abnormal exits only (a panic or Goexit escaping a test seam): the normal
+	// path funnels through the in-loop terminal cleanup, whose atomic re-check
+	// keeps a late trigger from stranding; this guard accepts trigger loss to keep
+	// the flag and counter from leaking.
+	defer func() {
+		if completed {
+			return
+		}
+		cleanup()
+		observe()
+	}()
+
+	// consumed is the trigger level this worker's last iteration decided against;
+	// the terminal cleanup re-checks st.latest against it under as.mu.
+	var consumed uint64
+	for {
+		as.mu.RLock()
+		// The trigger this iteration answers. Read fresh each iteration: a newer
+		// resident-delivered observation only advances it (no-resident
+		// observations advance only the reconcile watermark, never this).
+		target := st.evictLatest
+		pauseBefore := as.testEvictPauseBeforeLoad
+		as.mu.RUnlock()
+		if pauseBefore != nil {
+			pauseBefore(cIDHash)
+		}
+
+		// ONE read per iteration; the observation is at-most-once and the read is
+		// bounded, so JetStream unavailability delays only this eviction.
+		smsg, err := as.jsa.loadSessionMsg(as.domainTk, cIDHash)
+		if err != nil && isErrorOtherThan(err, JSNoMessageFoundErr) {
+			s.Warnf("MQTT remote-persist eviction: unable to load session record: %v", err)
+		}
+		// The license rule: the eviction's LICENSE is the observation — a remote
+		// write happened — and the read can only NARROW the claim, never revoke
+		// the license. Absent, undecodable, a load error, or a record BELOW the
+		// trigger (older than the write that licensed the eviction — classifying
+		// it could reproduce the exact wrong 0x8E-plus-cancel this path exists to
+		// prevent) all concede: the decision runs at the OBSERVATION level with
+		// the takeover vocabulary. Decode outside any lock.
+		var ps *mqttPersistedSession
+		usable := false
+		decisionSeq := target
+		if err == nil && smsg != nil && smsg.Sequence >= target {
+			if ps = mqttDecodeSessionRecord(smsg); ps != nil {
+				usable = true
+				decisionSeq = smsg.Sequence
+			}
+		}
+
+		as.mu.RLock()
+		pauseAfter := as.testEvictPauseAfterLoad
+		as.mu.RUnlock()
+		if pauseAfter != nil {
+			pauseAfter(cIDHash)
+		}
+
+		// The decision, on a bounded busy-retry budget. Each attempt re-resolves
+		// residency fresh; the sleeps run outside every lock.
+		var d evictDecision
+		for attempt := 0; ; attempt++ {
+			d = as.evictDecideOnce(cIDHash, st, usable, ps, decisionSeq)
+			if d.tokHeld {
+				// Full release, strictly AFTER the decision's as.mu section
+				// returned: endRecordTx can synchronously run the void-verdict
+				// handoff, which takes as.mu; the other order self-deadlocks.
+				if rerr := d.sess.endRecordTx(d.tok); rerr != nil {
+					s.Warnf("MQTT remote-persist eviction: unable to release record transaction: %v", rerr)
+				}
+			}
+			if d.out != evictBusy || attempt+1 >= mqttTeardownLockAttempts {
+				break
+			}
+			time.Sleep(mqttTeardownLockItvl)
+		}
+		// consumed is what this iteration actually DECIDED against. A busy
+		// refusal and a no-resident exit decided nothing: crediting them with the
+		// opportunistically loaded record's sequence would let an observation at
+		// exactly that level — delivered after the last failed attempt — read as
+		// already consumed at cleanup, stranding a genuine trigger behind the
+		// clearing flag. They consume only the trigger they answered.
+		consumed = decisionSeq
+		if d.out == evictBusy || d.out == evictNoSession {
+			consumed = target
+		}
+
+		switch d.out {
+		case evictApplied:
+			applied = true
+			if d.ec != nil {
+				// Notify and close AFTER every lock release: the notify writes to
+				// the socket under c.mu with no deadline. The shared tail claims
+				// the connection's one DISCONNECT and honors the CONNACK gate, so
+				// this cannot append a second DISCONNECT to one a racing
+				// displacement already sent; 3.1.1 closes silently. The object is
+				// already deresidented, so a replacement CONNECT proceeds
+				// regardless of this write's duration. Spec5 [3.1.4].
+				d.ec.mqttNotifyDisplaced(d.voc)
+				go d.ec.closeConnection(d.voc.closeReason)
+			}
+			if !d.forked {
+				// Cancel any delayed Will the displaced incarnation enqueued —
+				// on the TAKEOVER verdict only. A forked verdict proved nothing
+				// arbitrated a session continuation, so this path must not
+				// destroy the durable outbox record; the fire-time fences still
+				// decide its fate. Inline: this goroutine is already off the
+				// delivery path and admitted/tracked, and running it before the
+				// completion seam is what lets tests assert the record's final
+				// state. Spec5 [MQTT-3.1.2-8].
+				_ = as.cancelWillOutboxForIncarnation(s, cIDHash, d.displacedGen, d.displacedSeq)
+			}
+		case evictFresher:
+			continue
+		}
+
+		// Terminal cleanup, in-loop: clearing the coalescing flag and consuming a
+		// late trigger must be ONE as.mu decision, or an observation that declined
+		// to spawn (flag still true) while this worker was past its last check
+		// would strand. If a resident object exists and a strictly newer trigger
+		// arrived, this same worker loops — with a fresh busy budget, possibly
+		// against a replacement object — instead of exiting.
+		if h := func() func(string) {
+			as.mu.RLock()
+			defer as.mu.RUnlock()
+			return as.testEvictCleanupEntry
+		}(); h != nil {
+			h(cIDHash)
+		}
+		as.mu.Lock()
+		_, resident := as.sessByHash[cIDHash]
+		if resident && st.evictLatest > consumed {
+			as.mu.Unlock()
+			continue
+		}
+		st.evictRunning = false
+		if st.inFlight > 0 {
+			st.inFlight--
+		}
+		if st.inFlight == 0 && as.reconcileWM[cIDHash] == st {
+			delete(as.reconcileWM, cIDHash)
+		}
+		as.mu.Unlock()
+		break
+	}
+	completed = true
+	observe()
 }
 
 // reconcileRemoteSessionExpiry reconciles this replica's local session-expiry

@@ -637,8 +637,8 @@ func TestSessForkedWithALiveCompetingOwnerIsStillUnsettled(t *testing.T) {
 		t.Fatal("the peer must have its own account session manager")
 	}
 	// The peer's OWN persist observation has to be dropped as well, or our save below
-	// evicts its session through the route this change deliberately does not touch — and
-	// the fixture would then have no live competing owner at all. That eviction is
+	// evicts its session through the peer's persist-observation worker — and the
+	// fixture would then have no live competing owner at all. That eviction is
 	// correct broker behavior; it is simply not the path under test.
 	peerASM.mu.Lock()
 	peerASM.testSessPersistDrop = func(h string) bool { return h == e.idHash }

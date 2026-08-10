@@ -265,6 +265,39 @@ func (sess *mqttSession) endRecordTxNewGeneration(tok recordTx) error {
 	return sess.endRecordTxLocked(tok, true)
 }
 
+// abandonRecordTx releases the fence held by tok WITHOUT running the void-verdict
+// handoff and WITHOUT ending the record generation. It exists for exactly one
+// caller shape: an abnormal-exit guard (deferred around a fence acquisition) that
+// may run while the goroutine still holds the account manager's lock. The full
+// release is illegal there — endRecordTx can synchronously run the void-verdict
+// handoff, which takes the ownership gate and therefore as.mu
+// (lockSessionForVoidHandoff) — and endRecordTxNewGeneration suppresses the
+// handoff only by advancing recordEpoch, which is wrong when no discard occurred.
+// This helper takes only sess.mu (as.mu → sess.mu is the established order, so it
+// is legal under as.mu).
+//
+// The handoff it skips is not lost: it is due only for a resident, unbound,
+// settled session with an unsaved void-register revision, and the periodic
+// backstop (reconcileResidentRecordState → flushVoidVerdictGap) persists that gap
+// once the fence reads closed. Normal paths must keep using endRecordTx, whose
+// synchronous handoff is a liveness edge the backstop only backstops.
+//
+// Lock not held on entry.
+func (sess *mqttSession) abandonRecordTx(tok recordTx) error {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if err := sess.validateRecordTxLocked(tok); err != nil {
+		return err
+	}
+	if !tok.owner {
+		return fmt.Errorf("session %q: a nested record transaction token may not close transaction %v", sess.id, tok.id)
+	}
+	sess.recordTxOpen = false
+	sess.recordTxID = 0
+	sess.recordTxCondLocked().Broadcast()
+	return nil
+}
+
 func (sess *mqttSession) endRecordTxLocked(tok recordTx, newGeneration bool) error {
 	sess.mu.Lock()
 	if err := sess.validateRecordTxLocked(tok); err != nil {
