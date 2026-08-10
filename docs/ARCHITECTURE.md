@@ -261,6 +261,68 @@ supported migration). This is a first-release storage format: pre-Layer-2 in-rec
 Wills, migrated outbox records, and a `$MQTT_sess` stream without a valid generated
 epoch are unsupported and rejected with recreate guidance rather than carried forward.
 
+**Refusal of an unsupported outbox record.** That rejection is a mechanism, not a
+policy statement. Every decoded `$MQTT_willq` record is validated
+(`validateWillOutboxRecord`): a well-formed incarnation generation, a nonzero
+`OriginSessionSeq`, a well-formed `OriginSessEpoch`, a known state, `WillID` and
+`ClientIDHash` that are each a nonempty **single subject token**, and the binding
+that those two identities name the subject the record is stored on. All three
+decode boundaries validate — the point loader, the claim scan, and the cancellation
+scan — so nothing can act on a record that does not satisfy them. The enqueue
+validates before persisting and falls to the immediate-publish fail-safe rather
+than write one; consequently the claimant fence is handed only validated records
+and does not re-check their origin.
+
+Two of those checks answer failure modes the obvious ones do not. Body validation
+alone would admit a well-formed record carrying another client's identities stored
+on this client's subject: it would be fenced with the *other* client's watermark and
+session state, then claimed and published here, and `finalizeWillPublish`'s `WillID`
+equality would not catch it (that detects a post-claim replacement, not a body that
+never matched its subject). And subject equality alone would admit a dotted
+identity: NATS parses these into subject tokens, so a `WillID` of `a.b` on its
+exactly-matching subject is visible to the account scan (`<domainTk>>`) but
+**invisible** to the reconnect-cancel filter (`<domainTk><cidHash>.*`, exactly one
+trailing token), and could fire after a reconnect entitled to suppress it.
+
+A record that fails is **refused**: never claimed, never published, never
+cancelled, and never deleted. Deletion is withheld deliberately — it is a mutation
+of state the bridge has just declared it cannot interpret, and unlike a
+retained-message cache entry the outbox record is the only durable copy of the
+Will. Refusal is read-only, so a refused record is **reclaimed by nothing**: no
+sweep, fence or reaper will ever remove it. It is logged once per subject (Warn,
+then Debug — the claim scan meets it every 5s) with the only remedy there is,
+deleting that message from `$MQTT_willq` or recreating the stream. A refused record
+does not make a cancellation pass unresolved — no fire path will act on it either —
+so a reconnect still completes cleanly, and it never contends for a live Will's
+subject slot, because every enqueue mints a fresh WillID.
+
+**Operational residual: refused records are permanent, and permanence has a
+running cost on two paths.** Both scans walk their filter serially with one
+JetStream message-get per matching record, and neither can skip a record it refuses
+— refusing it is what the walk is for.
+
+- *The claim scan.* `scanWillOutbox` restarts from sequence 1 each interval, so `N`
+  refused records add `O(N)` requests to every scan on every broker, on every
+  interval, indefinitely. A large enough backlog can push a scan past
+  `mqttWillClaimInterval` and **delay valid due Wills**.
+- *The reconnect path, which is worse because a client waits on it.*
+  `cancelWillOutboxOnce` walks one client's filter, and `mqttProcessConnect` calls
+  `cancelWillOutbox` synchronously **before the CONNACK**. So `N` refused records
+  for one client cost `O(N)` serial round trips on **every reconnect of that
+  client, forever**. Returning `nil` on a refused record avoids the retry loop and
+  the spurious error log; it does not avoid the latency. A large enough per-client
+  backlog degrades that client's connect time and can make it effectively unable to
+  connect — an availability cost, not merely a delayed Will.
+
+This is the same accumulation hazard the `DenyDelete` rationale states for the
+stream as a whole, arriving by the other route: there, deletion is denied; here, the
+bridge declines to delete what it cannot read. The refusal is therefore not a stable
+resting state to be left alone — the diagnostic asks for prompt cleanup, and an
+operator who leaves refused records in place is accepting a growing scan cost and a
+growing connect cost for the affected client. Deliberately no quarantine stream, no
+bounded scan and no reaper: each would be a second mechanism deciding the fate of
+records the bridge has already said it cannot interpret.
+
 Operational constraints for the marker:
 
 - **Back up, restore, delete, or recreate `$MQTT_sess` and `$MQTT_willcancel` as one

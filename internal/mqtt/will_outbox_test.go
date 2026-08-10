@@ -644,7 +644,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	wid := "scr-w"
 	subject := mqttWillQSubject(asm.domainTk, cidHash, wid)
 	seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: wid, ClientIDHash: cidHash, Topic: "will/scr", Msg: []byte("x"), QoS: 0,
+		WillID: wid, ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/scr", Msg: []byte("x"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
@@ -652,7 +652,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	// The claim loop claims pending->publishing (seq1); its worker parks in the gate.
 	var seq1 uint64
 	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
-		rec, seq, err := asm.jsa.loadWillOutbox(subject)
+		rec, seq, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 		if err != nil || rec == nil || rec.State != mqttWillPublishing {
 			return fmt.Errorf("record not publishing yet")
 		}
@@ -662,7 +662,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 
 	// Simulate a peer reclaiming: advance the still-valid publishing record to a
 	// higher sequence (seq2) while the first worker remains parked holding seq1.
-	rec1, s1, err := asm.jsa.loadWillOutbox(subject)
+	rec1, s1, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 	if err != nil || rec1 == nil {
 		t.Fatalf("load publishing record: %v", err)
 	}
@@ -681,7 +681,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	gate.release(wid)
 
 	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
-		if rec, _, err := asm.jsa.loadWillOutbox(subject); err != nil || rec != nil {
+		if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err != nil || rec != nil {
 			return fmt.Errorf("record not drained yet (err=%v)", err)
 		}
 		return nil
@@ -691,7 +691,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	// published exactly once across a full lease window (a broken reconcile would
 	// re-fire and publish twice).
 	time.Sleep(mqttWillClaimLease + mqttWillClaimInterval + 200*time.Millisecond)
-	if rec, _, err := asm.jsa.loadWillOutbox(subject); err != nil || rec != nil {
+	if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err != nil || rec != nil {
 		t.Fatalf("record reappeared after lease window (err=%v rec=%v)", err, rec)
 	}
 	if n := gate.publishedCount(wid); n != 1 {
@@ -724,7 +724,7 @@ func TestMQTTWillOutboxNewerDisconnectedRecordFires(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/ndrf", opts: 0}})
 
 	seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "ndrf-w", ClientIDHash: getHash("ndrf-pub"), Topic: "will/ndrf", Msg: []byte("fire"), QoS: 0,
+		WillID: "ndrf-w", ClientIDHash: getHash("ndrf-pub"), Gen: mqttNewSessGen(), Topic: "will/ndrf", Msg: []byte("fire"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch, // older than the newer-but-disconnected session (100)
 	})
@@ -756,14 +756,14 @@ func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/lesol", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "lesol-w", ClientIDHash: getHash("lesol-pub"), Topic: "will/lesol", Msg: []byte("suppressed"), QoS: 0,
+		WillID: "lesol-w", ClientIDHash: getHash("lesol-pub"), Gen: mqttNewSessGen(), Topic: "will/lesol", Msg: []byte("suppressed"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
 	// The claimant fence cancels the superseded Will; it is never delivered.
 	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
-		rec, _, err := asm.jsa.loadWillOutbox(subject)
+		rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 		if err != nil {
 			return err
 		}
@@ -802,14 +802,14 @@ func TestMQTTWillOutboxFenceIndeterminateLoadDefers(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/fild", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "fild-w", ClientIDHash: getHash("fild-pub"), Topic: "will/fild", Msg: []byte("later"), QoS: 0,
+		WillID: "fild-w", ClientIDHash: getHash("fild-pub"), Gen: mqttNewSessGen(), Topic: "will/fild", Msg: []byte("later"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
 	// While loads fail, the record stays pending (deferred) and nothing is delivered.
 	time.Sleep(500 * time.Millisecond)
-	if rec, _, err := asm.jsa.loadWillOutbox(subject); err != nil || rec == nil || rec.State != mqttWillPending {
+	if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err != nil || rec == nil || rec.State != mqttWillPending {
 		got := "nil"
 		if rec != nil {
 			got = string(rec.State)
@@ -1731,7 +1731,7 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 
 	// Seed a pending record far in the future and keep its sequence.
 	pending := &mqttWillOutbox{
-		WillID: "aec-wid", ClientIDHash: cidHash, Topic: "will/aec", Msg: []byte("x"), QoS: 0,
+		WillID: "aec-wid", ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/aec", Msg: []byte("x"), QoS: 0,
 		FireAt: time.Now().Add(time.Hour).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: originEpoch,
 	}
@@ -1773,7 +1773,7 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 	}
 
 	// The losing CAS must not have rewritten the record.
-	cur, _, err := asm.jsa.loadWillOutbox(subject)
+	cur, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 	if err != nil || cur == nil {
 		t.Fatalf("reload record: %v", err)
 	}
@@ -1836,7 +1836,7 @@ func TestMQTTWillOutboxDisplacedCancelIsGenerationScoped(t *testing.T) {
 
 	stateOf := func(subject string) mqttWillState {
 		t.Helper()
-		rec, _, err := asm.jsa.loadWillOutbox(subject)
+		rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 		if err != nil || rec == nil {
 			t.Fatalf("reload %q: rec=%v err=%v", subject, rec, err)
 		}

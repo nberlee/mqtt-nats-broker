@@ -240,7 +240,7 @@ func TestMQTTWillOutboxWatermarkOutageAbortsScanAfterOneLoad(t *testing.T) {
 	for i := 0; i < n; i++ {
 		subj, _ := seedWillRecord(t, asm, &mqttWillOutbox{
 			WillID: fmt.Sprintf("outage-w%d", i), ClientIDHash: getHash(fmt.Sprintf("outage-pub%d", i)),
-			Topic: "will/outage", Msg: []byte("later"), QoS: 0,
+			Gen: mqttNewSessGen(), Topic: "will/outage", Msg: []byte("later"), QoS: 0,
 			FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 			OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 		})
@@ -256,7 +256,7 @@ func TestMQTTWillOutboxWatermarkOutageAbortsScanAfterOneLoad(t *testing.T) {
 
 	// Every record remains pending (deferred, never fired or cancelled).
 	for _, subj := range subjects {
-		rec, _, err := asm.jsa.loadWillOutbox(subj)
+		rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subj)
 		if err != nil || rec == nil || rec.State != mqttWillPending {
 			got := "nil"
 			if rec != nil {
@@ -672,7 +672,7 @@ func TestMQTTWillOutboxWatermarkPhase2ShutdownStopsScan(t *testing.T) {
 	for i := 0; i < n; i++ {
 		subj, _ := seedWillRecord(t, asm, &mqttWillOutbox{
 			WillID: fmt.Sprintf("p2-w%d", i), ClientIDHash: getHash(fmt.Sprintf("p2-pub%d", i)),
-			Topic: "will/p2", Msg: []byte("x"), QoS: 0,
+			Gen: mqttNewSessGen(), Topic: "will/p2", Msg: []byte("x"), QoS: 0,
 			FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 			OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 		})
@@ -689,7 +689,7 @@ func TestMQTTWillOutboxWatermarkPhase2ShutdownStopsScan(t *testing.T) {
 	// The remaining records were never claimed (still pending).
 	pendingRest := 0
 	for _, subj := range subjects {
-		if rec, _, err := asm.jsa.loadWillOutbox(subj); err == nil && rec != nil && rec.State == mqttWillPending {
+		if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subj); err == nil && rec != nil && rec.State == mqttWillPending {
 			pendingRest++
 		}
 	}
@@ -738,7 +738,7 @@ func TestMQTTWillOutboxWatermarkRealConnectAdvancesAndSuppresses(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmreal", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmreal-w", ClientIDHash: cidHash, Topic: "will/wmreal", Msg: []byte("suppressed"), QoS: 0,
+		WillID: "wmreal-w", ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/wmreal", Msg: []byte("suppressed"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
@@ -805,7 +805,7 @@ func TestMQTTWillOutboxWatermarkSuppressesAfterRealFiniteDisconnect(t *testing.T
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmfindisc", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmfindisc-w", ClientIDHash: cidHash, Topic: "will/wmfindisc", Msg: []byte("suppressed"), QoS: 0,
+		WillID: "wmfindisc-w", ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/wmfindisc", Msg: []byte("suppressed"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: s1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
@@ -872,7 +872,7 @@ func TestMQTTWillOutboxWatermarkSurvivesSessionDeletion(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmdel", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmdel-w", ClientIDHash: cidHash, Topic: "will/wmdel", Msg: []byte("suppressed"), QoS: 0,
+		WillID: "wmdel-w", ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/wmdel", Msg: []byte("suppressed"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
@@ -902,7 +902,7 @@ func TestMQTTWillOutboxWatermarkConnectFailurePriorWillFires(t *testing.T) {
 	// Prior Will, due ~1.2s out so the failing CONNECT's rollback (a confirmed delete
 	// of its own candidate record) completes before the record becomes due.
 	seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wm8a-w", ClientIDHash: cidHash, Topic: "will/wm8a", Msg: []byte("fires"), QoS: 0,
+		WillID: "wm8a-w", ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/wm8a", Msg: []byte("fires"), QoS: 0,
 		FireAt: time.Now().Add(1200 * time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
@@ -1000,7 +1000,7 @@ func wmEpoch(wm *mqttWillCancelWatermark) string {
 func expectWillSuppressed(t *testing.T, asm *mqttAccountSessionManager, subject string, rs *mqttReader) {
 	t.Helper()
 	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
-		rec, _, err := asm.jsa.loadWillOutbox(subject)
+		rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 		if err != nil {
 			return err
 		}
@@ -1036,7 +1036,7 @@ func TestMQTTWillOutboxWatermarkSuppressesDisconnectedGeneration(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmsup", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmsup-w", ClientIDHash: pubHash, Topic: "will/wmsup", Msg: []byte("suppressed"), QoS: 0,
+		WillID: "wmsup-w", ClientIDHash: pubHash, Gen: mqttNewSessGen(), Topic: "will/wmsup", Msg: []byte("suppressed"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch, // older than the watermark (100)
 	})
@@ -1063,7 +1063,7 @@ func TestMQTTWillOutboxWatermarkLegitNewerWillFires(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmfire", opts: 0}})
 
 	seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmfire-w", ClientIDHash: pubHash, Topic: "will/wmfire", Msg: []byte("fire"), QoS: 0,
+		WillID: "wmfire-w", ClientIDHash: pubHash, Gen: mqttNewSessGen(), Topic: "will/wmfire", Msg: []byte("fire"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 101, OriginSessEpoch: asm.sessStreamEpoch, // newer than the watermark (100): its own Will
 	})
@@ -1093,7 +1093,7 @@ func TestMQTTWillOutboxWatermarkCancelsForeignEpochWill(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmxepoch", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmxepoch-w", ClientIDHash: pubHash, Topic: "will/wmxepoch", Msg: []byte("suppressed"), QoS: 0,
+		WillID: "wmxepoch-w", ClientIDHash: pubHash, Gen: mqttNewSessGen(), Topic: "will/wmxepoch", Msg: []byte("suppressed"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 999, OriginSessEpoch: mqttGenSessEpoch(), // a different incarnation
 	})
@@ -1103,9 +1103,13 @@ func TestMQTTWillOutboxWatermarkCancelsForeignEpochWill(t *testing.T) {
 
 // TestMQTTWillOutboxWatermarkMalformedEpochCharsetRejected proves the epoch
 // validator rejects a body of the correct length whose characters are outside the
-// NUID base-62 alphabet, and that such a Will DEFERS (never cross-incarnation
-// cancels) even against a valid current-epoch watermark. Guards the length-only
-// validation gap.
+// NUID base-62 alphabet, and that a Will carrying such an origin epoch is REFUSED:
+// never cross-incarnation cancelled and never fired, even against a valid
+// current-epoch watermark. Guards the length-only validation gap.
+//
+// Observed through the stored BYTES. F-058 made the origin epoch part of the
+// record's format contract, so the loader now errors on this record and a decoded
+// "still pending" assertion would hold vacuously.
 func TestMQTTWillOutboxWatermarkMalformedEpochCharsetRejected(t *testing.T) {
 	bad := mqttSessEpochNUIDPrefix + strings.Repeat("!", 22) // 22 chars, out of alphabet
 	if mqttValidSessEpoch(bad) {
@@ -1133,35 +1137,33 @@ func TestMQTTWillOutboxWatermarkMalformedEpochCharsetRejected(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmbadcs", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmbadcs-w", ClientIDHash: pubHash, Topic: "will/wmbadcs", Msg: []byte("deferred"), QoS: 0,
+		WillID: "wmbadcs-w", ClientIDHash: pubHash, Gen: mqttNewSessGen(), Topic: "will/wmbadcs", Msg: []byte("deferred"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
-		OriginSessionSeq: 5, OriginSessEpoch: bad, // length-valid but out-of-alphabet: must defer, not cancel
+		OriginSessionSeq: 5, OriginSessEpoch: bad, // length-valid but out-of-alphabet: refused, never cancelled
 	})
+	seeded := rawWillBytes(t, asm, subject)
 
 	time.Sleep(600 * time.Millisecond)
-	rec, _, err := asm.jsa.loadWillOutbox(subject)
-	if err != nil || rec == nil || rec.State != mqttWillPending {
-		got := "nil"
-		if rec != nil {
-			got = string(rec.State)
-		}
-		t.Fatalf("want malformed-epoch record still pending (deferred), got state=%s err=%v", got, err)
+	requireWillBytesUnchanged(t, asm, subject, seeded)
+	if _, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err == nil {
+		t.Fatal("the loader must refuse a record whose origin epoch is out of alphabet")
 	}
 	testMQTTExpectNothing(t, rs)
 }
 
-// TestMQTTWillOutboxWatermarkInvalidOriginDefers proves a Will with a zero origin
-// sequence or an empty/malformed origin epoch is never compared through the
-// watermark and stays pending (deferred), never fired or cancelled. (Plan test 12.)
-func TestMQTTWillOutboxWatermarkInvalidOriginDefers(t *testing.T) {
+// TestMQTTWillOutboxWatermarkInvalidOriginRefused proves a Will with an invalid
+// origin identity is never compared through the watermark: it is refused at
+// decode, so it is neither fired nor cancelled and its stored bytes do not change.
+// (Plan test 12, re-based on F-058's refusal.)
+func TestMQTTWillOutboxWatermarkInvalidOriginRefused(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 	asm := testMQTTGetGlobalASM(t, s)
 
 	pubHash := getHash("wminv-pub")
-	// A valid current-epoch watermark exists, but the record's own origin identity is
-	// invalid (empty epoch), so fence step 1 defers before any comparison.
+	// A valid current-epoch watermark exists, so a record that REACHED the fence
+	// would be cross-incarnation cancelled. This one never reaches it.
 	seedWatermark(t, asm, &mqttWillCancelWatermark{ClientIDHash: pubHash, SessionSeq: 100, SessEpoch: asm.sessStreamEpoch})
 
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wminvsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
@@ -1170,20 +1172,17 @@ func TestMQTTWillOutboxWatermarkInvalidOriginDefers(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wminv", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wminv-w", ClientIDHash: pubHash, Topic: "will/wminv", Msg: []byte("deferred"), QoS: 0,
+		WillID: "wminv-w", ClientIDHash: pubHash, Gen: mqttNewSessGen(), Topic: "will/wminv", Msg: []byte("deferred"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 5, OriginSessEpoch: "", // invalid origin identity
 	})
+	seeded := rawWillBytes(t, asm, subject)
 
-	// Stays pending (deferred): neither fired nor cancelled.
+	// Untouched: not fired, not cancelled, and not deleted either.
 	time.Sleep(600 * time.Millisecond)
-	rec, _, err := asm.jsa.loadWillOutbox(subject)
-	if err != nil || rec == nil || rec.State != mqttWillPending {
-		got := "nil"
-		if rec != nil {
-			got = string(rec.State)
-		}
-		t.Fatalf("want invalid-origin record still pending, got state=%s err=%v", got, err)
+	requireWillBytesUnchanged(t, asm, subject, seeded)
+	if _, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err == nil {
+		t.Fatal("the loader must refuse a record with an empty origin epoch")
 	}
 	testMQTTExpectNothing(t, rs)
 }
@@ -1206,14 +1205,14 @@ func TestMQTTWillOutboxWatermarkCorruptMarkerDefers(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmcf", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmcf-w", ClientIDHash: pubHash, Topic: "will/wmcf", Msg: []byte("later"), QoS: 0,
+		WillID: "wmcf-w", ClientIDHash: pubHash, Gen: mqttNewSessGen(), Topic: "will/wmcf", Msg: []byte("later"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
 	// While the marker is corrupt the record stays pending; nothing is delivered.
 	time.Sleep(600 * time.Millisecond)
-	if rec, _, err := asm.jsa.loadWillOutbox(subject); err != nil || rec == nil || rec.State != mqttWillPending {
+	if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err != nil || rec == nil || rec.State != mqttWillPending {
 		got := "nil"
 		if rec != nil {
 			got = string(rec.State)
@@ -1250,13 +1249,13 @@ func TestMQTTWillOutboxWatermarkIndeterminateAborts(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/wmindet", opts: 0}})
 
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "wmindet-w", ClientIDHash: pubHash, Topic: "will/wmindet", Msg: []byte("deferred"), QoS: 0,
+		WillID: "wmindet-w", ClientIDHash: pubHash, Gen: mqttNewSessGen(), Topic: "will/wmindet", Msg: []byte("deferred"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
 	time.Sleep(600 * time.Millisecond)
-	if rec, _, err := asm.jsa.loadWillOutbox(subject); err != nil || rec == nil || rec.State != mqttWillPending {
+	if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err != nil || rec == nil || rec.State != mqttWillPending {
 		got := "nil"
 		if rec != nil {
 			got = string(rec.State)

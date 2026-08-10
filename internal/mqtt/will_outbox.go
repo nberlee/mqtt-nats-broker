@@ -54,7 +54,11 @@
 // under administrative loss of $MQTT_willcancel (documented as a degradation, not a
 // supported migration). This is a first-release format: pre-Layer-2 in-record
 // Wills, migrated outbox records, and a session stream without a valid generated
-// epoch are unsupported and rejected rather than carried forward.
+// epoch are unsupported and rejected rather than carried forward. Every decoded
+// record is validated (validateWillOutboxRecord) and one that is not a supported
+// record is REFUSED: never claimed, published, cancelled or deleted, and reported
+// once with the operator remedy. Refusal is read-only, so nothing reclaims a
+// refused record — an operator does.
 
 package mqtt
 
@@ -127,16 +131,17 @@ type mqttWillOutbox struct {
 	// the $MQTT_sess incarnation epoch captured at the disconnect (mqtt.go:1942).
 	// A sequence is comparable only within one incarnation, so the fence compares
 	// OriginSessionSeq against a watermark/session sequence only when the epochs are
-	// equal. Every native record carries a nonzero sequence and a valid epoch; a
-	// zero sequence or empty/malformed epoch is corrupt and defers (there is no
-	// legacy/migrated compatibility path in the first release). See
-	// willTakeoverFence.
-	OriginSessionSeq uint64 `json:"oseq,omitempty"`
-	OriginSessEpoch  string `json:"oep,omitempty"`
+	// equal. Every record carries a nonzero sequence and a valid epoch; a zero
+	// sequence or empty/malformed epoch is unsupported and refused at decode (there
+	// is no legacy/migrated compatibility path in the first release). See
+	// validateWillOutboxBody.
+	OriginSessionSeq uint64 `json:"oseq"`
+	OriginSessEpoch  string `json:"oep"`
 	// Gen is the enqueuing session INCARNATION's generation (mqttSession.gen; see
-	// sess_incarnation.go). Empty means either a legacy session that predates
-	// generations or a record written by an older broker — both are one bucket, and
-	// both are matched only by an empty scope.
+	// sess_incarnation.go). Every record carries a valid one; a generationless
+	// record is unsupported and refused at decode, not treated as a distinct
+	// unscoped bucket — "no identity" must not collapse into the identity space
+	// (sess_incarnation.go:51-56), and an unscoped bucket cannot be arbitrated.
 	//
 	// It exists so the DISPLACED-broker cancel can say what it means. That scan's
 	// job is to cancel the Will its own evicted connection enqueued, but it is
@@ -146,12 +151,97 @@ type mqttWillOutbox struct {
 	// Will's origin sequence is beyond the marker) and no other layer recovers.
 	// The reconnect cancel on the CONNECT path is deliberately NOT scoped: a
 	// reconnect supersedes every earlier incarnation. See cancelWillOutbox.
-	Gen string `json:"gen,omitempty"`
+	Gen string `json:"gen"`
 }
 
 // leaseValid reports whether the publishing claim lease is still valid at now.
 func (r *mqttWillOutbox) leaseValid(now time.Time) bool {
 	return r.ClaimOwner != _EMPTY_ && r.ClaimUntil > now.UnixNano()
+}
+
+// mqttWillIdentTk reports whether s is a nonempty SINGLE subject token, the shape
+// both identity fields must have because both are subject tokens: the subject is
+// <prefix><domainTk><cid>.<wid>. A dotted (or wildcard) identity would still match
+// its own subject by equality yet change the subject's token count, making the
+// record visible to the account filter (<domainTk>>) but INVISIBLE to the
+// reconnect-cancel filter (<domainTk><cid>.*, exactly one trailing token) — so it
+// could fire after a reconnect that was entitled to suppress it. Both real mints
+// are single tokens by construction (nuid.Next() and getHash are base-62), so this
+// refuses only foreign shapes.
+func mqttWillIdentTk(s string) bool {
+	if s == _EMPTY_ {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case btsep, pwc, fwc, ' ':
+			return false
+		}
+	}
+	return true
+}
+
+// validateWillOutboxBody checks the format invariants a delayed-Will outbox
+// record carries on its own, independent of where it is stored. This is the
+// pre-release format contract: every field a decision is taken on must be
+// present and well-formed, because there is no legacy bucket to fall back to and
+// an unscoped record cannot be arbitrated (see the Compatibility boundary in
+// docs/ARCHITECTURE.md and sess_incarnation.go:22-32).
+//
+// It applies at the persist and decode boundaries only. An outbox record used
+// purely as a publication vehicle — mqttPublishOwedWill's, and the deferred-close
+// immediate publication's — is built in memory, handed straight to
+// deliverWillRecord (which reads message fields alone) and never persisted, so it
+// carries no identity and is deliberately not validated.
+//
+// Not checked, deliberately: FireAt, which is dueness rather than format (a zero
+// FireAt is simply a due Will), and any length/alphabet shape for the identity
+// fields beyond token topology, since they are matched by equality and never
+// parsed.
+func validateWillOutboxBody(rec *mqttWillOutbox) error {
+	if !mqttWillIdentTk(rec.WillID) {
+		return fmt.Errorf("will id %q is not a single subject token", rec.WillID)
+	}
+	if !mqttWillIdentTk(rec.ClientIDHash) {
+		return fmt.Errorf("client id hash %q is not a single subject token", rec.ClientIDHash)
+	}
+	if !mqttValidSessGen(rec.Gen) {
+		return fmt.Errorf("session incarnation generation %q is not well-formed", rec.Gen)
+	}
+	if rec.OriginSessionSeq == 0 {
+		return fmt.Errorf("origin session sequence is zero")
+	}
+	if !mqttValidSessEpoch(rec.OriginSessEpoch) {
+		return fmt.Errorf("origin session epoch %q is not well-formed", rec.OriginSessEpoch)
+	}
+	switch rec.State {
+	case mqttWillPending, mqttWillPublishing, mqttWillCancelled, mqttWillDone:
+	default:
+		return fmt.Errorf("state %q is not a known outbox state", rec.State)
+	}
+	return nil
+}
+
+// validateWillOutboxRecord is validateWillOutboxBody plus the binding between the
+// record and the subject it was stored on: the identities in the body must be the
+// identities the subject is built from.
+//
+// Body-only validation is not enough at a decode boundary. A well-formed record
+// carrying client B's identities, stored on client A's subject, would be fenced
+// with B's watermark and session state and then claimed and published on A's
+// subject; finalize's WillID equality only detects a post-claim REPLACEMENT, it
+// never establishes that the claimed body matched its own subject.
+//
+// The writer validates the body alone: it builds the subject from those same
+// fields, so the binding holds by construction.
+func validateWillOutboxRecord(domainTk, subject string, rec *mqttWillOutbox) error {
+	if err := validateWillOutboxBody(rec); err != nil {
+		return err
+	}
+	if want := mqttWillQSubject(domainTk, rec.ClientIDHash, rec.WillID); subject != want {
+		return fmt.Errorf("record identities name subject %q, but it is stored on %q", want, subject)
+	}
+	return nil
 }
 
 // mqttWillQSubject returns the per-Will subject for a client hash + Will id.
@@ -204,7 +294,13 @@ func (jsa *mqttJSA) storeWillOutboxCAS(subject string, expectSeq uint64, rec *mq
 // loadWillOutbox returns the current record on subject and its stream sequence,
 // or (nil, 0, nil) when the subject has no record. A transient load error is
 // returned so callers can distinguish "absent" from "indeterminate".
-func (jsa *mqttJSA) loadWillOutbox(subject string) (*mqttWillOutbox, uint64, error) {
+//
+// A record that decodes but is not a supported one is returned as an ERROR, never
+// as a record and never as "absent": every point-load caller acts on what it gets
+// back, and an unsupported record must be acted on by nobody. Validating here is
+// what leaves no unvalidated semantic loader in the package; a test that needs to
+// observe a refused record reads the stream's raw bytes instead.
+func (jsa *mqttJSA) loadWillOutbox(domainTk, subject string) (*mqttWillOutbox, uint64, error) {
 	smsg, err := jsa.loadLastMsgFor(mqttWillQStreamName, subject)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
@@ -216,7 +312,60 @@ func (jsa *mqttJSA) loadWillOutbox(subject string) (*mqttWillOutbox, uint64, err
 	if err := json.Unmarshal(smsg.Data, rec); err != nil {
 		return nil, 0, err
 	}
+	if err := validateWillOutboxRecord(domainTk, smsg.Subject, rec); err != nil {
+		return nil, 0, err
+	}
 	return rec, smsg.Sequence, nil
+}
+
+// decodeScannedWillOutbox decodes one scanned outbox message and refuses it if it
+// is not a supported record: unsupported records are logged (once per subject) and
+// skipped, never claimed, published, cancelled or deleted. Deletion is withheld
+// deliberately — it is a mutation of state we have just declared we cannot
+// interpret, and unlike a retained-message cache entry the outbox record is the
+// only durable copy of a Will-shaped fact. Shared by both scans so the claim pass
+// and the cancel pass refuse exactly the same set.
+func (as *mqttAccountSessionManager) decodeScannedWillOutbox(s *Server, smsg *StoredMsg) (*mqttWillOutbox, bool) {
+	rec := &mqttWillOutbox{}
+	if err := json.Unmarshal(smsg.Data, rec); err != nil {
+		as.refuseWillOutboxRecord(s, smsg.Subject, err)
+		return nil, false
+	}
+	if err := validateWillOutboxRecord(as.domainTk, smsg.Subject, rec); err != nil {
+		as.refuseWillOutboxRecord(s, smsg.Subject, err)
+		return nil, false
+	}
+	return rec, true
+}
+
+// refuseWillOutboxRecord reports an unsupported outbox record and the operator
+// remedy. Warn once per subject per account-manager lifetime, Debug thereafter:
+// the claim scan meets every record every mqttWillClaimInterval, so warning each
+// pass would bury the one actionable line under twelve identical ones a minute.
+//
+// The remedy is stated, and stated as URGENT, because nothing else resolves it: a
+// refused record is reclaimed by NOTHING — no sweep, no fence and no reaper touches
+// it — and both serial walks re-read it every time. A backlog costs one JetStream
+// get per record per scan per broker, and — because mqttProcessConnect waits for
+// cancelWillOutbox before the CONNACK — one more per record on every reconnect of
+// that client. The first delays valid due Wills; the second delays the client's own
+// CONNECT. The log must not imply that leaving it alone either clears it or is free.
+func (as *mqttAccountSessionManager) refuseWillOutboxRecord(s *Server, subject string, err error) {
+	as.mu.Lock()
+	_, warned := as.refusedWillRecords[subject]
+	if !warned {
+		if as.refusedWillRecords == nil {
+			as.refusedWillRecords = map[string]struct{}{}
+		}
+		as.refusedWillRecords[subject] = struct{}{}
+	}
+	as.mu.Unlock()
+	const format = "MQTT: refusing unsupported delayed-Will outbox record on %q: %v. It will never fire, be cancelled or be reaped, and both the claim scan and this client's reconnect re-read it every time; delete that message from the %s stream (or recreate the stream) PROMPTLY, or an accumulating backlog will slow every scan, delay valid Wills, and add a round trip to every CONNECT for this client"
+	if warned {
+		s.Debugf(format, subject, err, mqttWillQStreamName)
+		return
+	}
+	s.Warnf(format, subject, err, mqttWillQStreamName)
 }
 
 // armDelayedWillTimer schedules a local fire timer for a confirmed-pending
@@ -235,7 +384,7 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 		// may have cancelled the record and a peer may have claimed it, so the
 		// snapshot's state and sequence can both be stale. This mirrors what
 		// scanWillOutbox does for a single record.
-		rec, seq, err := as.jsa.loadWillOutbox(subject)
+		rec, seq, err := as.jsa.loadWillOutbox(as.domainTk, subject)
 		if err != nil || rec == nil {
 			// Transient load failure or already reaped; the scan retries.
 			return
@@ -264,6 +413,14 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 // success). If the durable enqueue still cannot be confirmed after the bounded
 // retries, the Will is published IMMEDIATELY as a fail-safe (trading the Will
 // Delay for not losing the Will) rather than left with no authority to fire it.
+//
+// The record is validated before it is persisted, and a record that would be
+// refused by every reader takes the same fail-safe rather than being written:
+// persisting one converts a sacrificed delay into permanent loss PLUS a permanent
+// operator diagnostic. No current caller can reach it — all of them pass a live
+// session's generation, the startup-validated stream epoch, and the nonzero
+// sequence of the CONNECT save a surviving session implies — so it is an
+// invariant assert that happens to have a safe arm.
 func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash, sessGen string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
 	willID := nuid.Next()
 	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
@@ -278,6 +435,12 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash, sess
 		OriginSessEpoch:  originSessEpoch,
 	}
 	willOutboxMessage(rec, will, props, user)
+	// Body only: the subject above is built from these same identities, so the
+	// subject binding validateWillOutboxRecord adds holds by construction.
+	if verr := validateWillOutboxBody(rec); verr != nil {
+		s.Errorf("MQTT: refusing to enqueue an unsupported delayed-Will outbox record for client hash %q: %v; publishing immediately as a fail-safe", cidHash, verr)
+		return as.publishWillFailSafe(s, cidHash, rec)
+	}
 	var err error
 	for attempt := 0; attempt < mqttWillEnqueueAttempts; attempt++ {
 		newSeq, serr := as.storeWillEnqueueCAS(subject, 0, rec)
@@ -298,7 +461,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash, sess
 		err = serr
 		// The create-only CAS may have failed because our own earlier attempt's
 		// write landed but its ack was lost: re-read to resolve the ambiguity.
-		existing, exSeq, lerr := as.jsa.loadWillOutbox(subject)
+		existing, exSeq, lerr := as.jsa.loadWillOutbox(as.domainTk, subject)
 		if lerr != nil || existing == nil || existing.WillID != willID {
 			continue // enqueue UNCONFIRMED: retry, else fall to the fail-safe
 		}
@@ -319,11 +482,35 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash, sess
 		}
 		return nil
 	}
-	// Fail-safe: durable enqueue not confirmed. Publish now so the Will is not
-	// lost; the delay is sacrificed. (For QoS 0 this succeeds even if the willq
-	// store failed; for QoS 1/2 it hits the same JetStream store, so a sustained
-	// outage still fails — logged at Error.)
 	s.Warnf("MQTT: could not durably enqueue delayed Will for client hash %q after %d attempts (%v); publishing immediately as a fail-safe", cidHash, mqttWillEnqueueAttempts, err)
+	return as.publishWillFailSafe(s, cidHash, rec)
+}
+
+// publishWillFailSafe publishes a delayed Will immediately because this broker has
+// no CONFIRMED durable record to fire it later: the Will Delay is sacrificed rather
+// than the Will. Its two callers do NOT carry the same guarantee, and the
+// difference is the difference between a lost delay and a duplicate.
+//
+//   - The writer-side refusal: nothing was ever sent, so provably no record exists.
+//     A crash between the refusal and the publish loses the Will, which is inside
+//     the stated guarantee — durability begins at acknowledged outbox persistence
+//     and nothing was persisted.
+//   - Retry exhaustion: UNCONFIRMED, not proven absent. A create can land while its
+//     ack is lost, and if every bounded re-read is also indeterminate the loop
+//     exits here with a durable pending record in place. That record fires later,
+//     so the Will is published twice. This is pre-existing behavior, not something
+//     the F-058 validation introduced, and it is the outbox's sanctioned
+//     at-least-once duplicate reached by a second route: the alternative is
+//     staying silent on an enqueue that may never have landed, which is loss.
+//     TestMQTTWillOutboxEnqueueExhaustionAfterLandedWriteDuplicates pins it.
+//
+// A confirmed enqueue must never reach here — that would publish AND leave a record
+// this broker knows will fire.
+//
+// (For QoS 0 the publish succeeds even if the willq store failed; for QoS 1/2 it
+// hits the same JetStream store, so a sustained outage still fails — logged at
+// Error.)
+func (as *mqttAccountSessionManager) publishWillFailSafe(s *Server, cidHash string, rec *mqttWillOutbox) error {
 	if perr := as.publishWillRecord(s, rec); perr != nil {
 		s.Errorf("MQTT: fail-safe immediate publish of delayed Will for client hash %q also failed: %v", cidHash, perr)
 		return perr
@@ -366,7 +553,7 @@ func (as *mqttAccountSessionManager) earlyCancelIfSuperseded(s *Server, subject 
 		// weight until FireAt. Re-read to tell them apart, and keep the timer only
 		// when the record is confirmed still pending (or the re-read itself is
 		// indeterminate, where the claimant fence remains the safety net).
-		cur, _, lerr := as.jsa.loadWillOutbox(subject)
+		cur, _, lerr := as.jsa.loadWillOutbox(as.domainTk, subject)
 		if lerr == nil && (cur == nil || cur.State != mqttWillPending) {
 			s.cancelWillTimer(subject)
 		}
@@ -410,8 +597,8 @@ type willCancelScope struct {
 // recovers, since the reconnect watermark sits BELOW that Will's origin sequence.
 //
 // Scoped by generation AND by an upper origin-sequence bound; see willCancelScope
-// for why the generation alone is not enough. sessGen may be _EMPTY_ (a legacy
-// incarnation), which matches only records that carry no generation.
+// for why the generation alone is not enough. sessGen is always the displaced
+// connection's own valid generation.
 func (as *mqttAccountSessionManager) cancelWillOutboxForIncarnation(s *Server, cidHash, sessGen string, maxOriginSeq uint64) error {
 	return as.cancelWillOutboxScoped(s, cidHash, &willCancelScope{gen: sessGen, maxOriginSeq: maxOriginSeq})
 }
@@ -480,7 +667,9 @@ func (as *mqttAccountSessionManager) cancelWillOutboxScoped(s *Server, cidHash s
 // scope, when non-nil, restricts the pass to records enqueued by that session
 // incarnation up to its origin-sequence bound. A skipped record is not an
 // unresolved one — it was never in scope — so it does not make the pass
-// indeterminate.
+// indeterminate. A REFUSED record is likewise not an unresolved pending record:
+// no fire path will act on it either, so "every pending record was resolved" is
+// scoped to the records this broker is able to interpret.
 func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter string, scope *willCancelScope) error {
 	for seq := uint64(1); ; {
 		smsg, err := as.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, seq)
@@ -491,9 +680,9 @@ func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter stri
 			return nil // no (more) records: scan complete
 		}
 		seq = smsg.Sequence + 1
-		rec := &mqttWillOutbox{}
-		if err := json.Unmarshal(smsg.Data, rec); err != nil {
-			continue
+		rec, ok := as.decodeScannedWillOutbox(s, smsg)
+		if !ok {
+			continue // refused: never cancelled, and not an unresolved pending record
 		}
 		if scope != nil && rec.Gen != scope.gen {
 			// Another incarnation's Will. Out of scope, and its local fire timer must
@@ -518,7 +707,7 @@ func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter stri
 			// CAS failed. Re-read: if the record is no longer pending (a fire won,
 			// or a peer cancelled it) it is resolved; if it is still pending, the
 			// write failed transiently and this pass is indeterminate.
-			cur, _, lerr := as.jsa.loadWillOutbox(smsg.Subject)
+			cur, _, lerr := as.jsa.loadWillOutbox(as.domainTk, smsg.Subject)
 			if lerr != nil {
 				return lerr
 			}
@@ -587,9 +776,9 @@ func (as *mqttAccountSessionManager) scanWillOutbox(s *Server) {
 			return
 		}
 		seq = smsg.Sequence + 1
-		rec := &mqttWillOutbox{}
-		if err := json.Unmarshal(smsg.Data, rec); err != nil {
-			continue
+		rec, ok := as.decodeScannedWillOutbox(s, smsg)
+		if !ok {
+			continue // refused: never claimed, never dispatched, and never deleted
 		}
 		switch rec.State {
 		case mqttWillPending:
@@ -661,10 +850,12 @@ func (as *mqttAccountSessionManager) loadFenceSession(cidHash string) (*mqttPers
 // watermark exists. Epoch is an identity: a sequence is comparable only within the
 // incarnation named by its epoch.
 //
-//   - defer: the record's origin is invalid (zero sequence, or empty/malformed
-//     epoch). Every native record is epoch-known; acting on an invalid origin could
-//     lose a legitimate Will or publish a suppressed one. There is no legacy/migrated
-//     compatibility path in the first release.
+// Precondition: rec is a validated record, so its origin sequence is nonzero and
+// its origin epoch is well-formed. Every production caller gets its record from a
+// decode boundary that refuses anything else (tryFireWill from either scan or the
+// fire timer's load, earlyCancelIfSuperseded from the writer-validated enqueue),
+// so the fence does not re-check what the boundary already established.
+//
 //   - abort: the watermark load was transiently/globally indeterminate. The caller
 //     stops the scan so a marker outage costs one JSA timeout, not one per record.
 //   - defer: the watermark record itself is corrupt (this record only).
@@ -674,9 +865,6 @@ func (as *mqttAccountSessionManager) loadFenceSession(cidHash string) (*mqttPers
 //   - otherwise (absent/stale watermark, or same-epoch watermark not newer): fall
 //     back to the session record via sessionRecordFence.
 func (as *mqttAccountSessionManager) willTakeoverFence(rec *mqttWillOutbox) willFenceDecision {
-	if rec.OriginSessionSeq == 0 || !mqttValidSessEpoch(rec.OriginSessEpoch) {
-		return willFenceDefer
-	}
 	wm, _, status := as.loadWillCancelWatermark(rec.ClientIDHash)
 	switch status {
 	case mqttWillCancelIndeterminate:
@@ -822,7 +1010,7 @@ func (as *mqttAccountSessionManager) finalizeWillPublish(s *Server, subject stri
 		}
 		// CAS failed (transiently, on a stale sequence, or via an ambiguous seam
 		// that may have written anyway). Re-read to learn the durable truth.
-		cur, curSeq, lerr := as.jsa.loadWillOutbox(subject)
+		cur, curSeq, lerr := as.jsa.loadWillOutbox(as.domainTk, subject)
 		if lerr != nil {
 			continue // indeterminate load: retry
 		}

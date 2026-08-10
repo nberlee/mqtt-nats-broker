@@ -2189,3 +2189,178 @@ Land one session-schema cleanup commit:
 Validation must happen before a malformed record can derive a consumer name or
 mutate broker-owned state. Ordinary current-format session resume and new
 SUBSCRIBE rejection must remain unchanged.
+
+## F-058
+
+**Title:** Reject generationless delayed-Will outbox records
+
+- Status: Resolved
+- Classification: Pre-release outbox-format compatibility cleanup
+- Release treatment: Completed; no MQTT-visible behavior changes
+- Original dossier: `pre-release-migrations.md`
+
+### Resolution
+
+The empty-generation "legacy bucket" is gone. `validateWillOutboxBody` is the
+format contract for a persisted `$MQTT_willq` record — a valid incarnation
+generation (`mqttValidSessGen`), a nonzero `OriginSessionSeq`, a well-formed
+`OriginSessEpoch`, a known `State`, and `WillID`/`ClientIDHash` that are each a
+nonempty SINGLE subject token. `validateWillOutboxRecord` adds the binding
+between the body and the subject it was stored on.
+
+Every decode boundary validates: the point loader `loadWillOutbox` (which now takes
+`domainTk`, so no unvalidated semantic loader remains in the package), the claim
+scan, and the cancellation scan. A record that fails is REFUSED — never claimed,
+published, cancelled or deleted — and reported once per subject with the operator
+remedy. Refusal is read-only, so a refused record is reclaimed by NOTHING; the
+diagnostic says so and prescribes deleting the message or recreating the stream.
+
+Two checks are not the obvious ones and are load-bearing.
+
+The subject binding is not implied by body validation. A well-formed record
+carrying client B's identities, stored on client A's subject, would be fenced with
+B's watermark and session state and then claimed and published on A's subject.
+`finalizeWillPublish`'s `WillID` equality only detects a post-claim REPLACEMENT; it
+never establishes that the claimed body matched its own subject.
+
+The single-token identity check is not redundant with the binding, because NATS
+parses the identities into subject tokens. A body with `WillID: "a.b"` on its
+exactly-matching subject passes the binding and is visible to the account filter
+(`<domainTk>>`), but is INVISIBLE to the reconnect-cancel filter
+(`<domainTk><cidHash>.*`, exactly one trailing token) — so it could fire after a
+reconnect that was entitled to suppress it. Both real mints are single tokens by
+construction (`nuid.Next()` and `getHash` are base-62), so the check refuses only
+foreign shapes.
+
+Two deliberate deltas from the finding's decode-only wording:
+
+- `enqueueDelayedWill` validates the record before persisting it (body only — it
+  builds the subject from those same fields). On failure the Will takes the
+  existing immediate-publish fail-safe. Persisting a record every reader refuses
+  would convert a sacrificed Will Delay into permanent loss PLUS a permanent
+  operator diagnostic. No production caller can reach the arm; a crash between the
+  refusal and the publish loses the Will, which is inside the stated guarantee
+  because durability begins at acknowledged outbox persistence and nothing was
+  persisted.
+- `willTakeoverFence`'s inline origin check is deleted rather than duplicated. Its
+  `OriginSessionSeq != 0` / `mqttValidSessEpoch` test is now the validator's, and
+  the fence documents the precondition that every production caller hands it a
+  validated record. Without the writer-side check above this deletion would be
+  unsound, which is why the two land together.
+
+Erroring the cancel pass on a refused record was considered and rejected. The
+reconnect caller deliberately ignores that error and proceeds — the watermark is
+the authoritative suppression — so it buys no safety while logging an unresolved
+cancellation on every reconnect of that client forever. It also misstates the
+semantics: a refused record cannot fire either, so it is not an unresolved
+*pending* record. `cancelWillOutboxScoped`'s contract comment now scopes "every
+pending record was resolved" to the records the broker can interpret.
+
+Deleting a refused record (the F-056 eviction pattern) was rejected too. Retained-
+message eviction removes a cache entry the store re-derives; the outbox record is
+the only durable copy of a Will-shaped fact, and deletion is a mutation of state
+the broker has just declared it cannot interpret.
+
+Rolling upgrade over a tree of valid records is behavior-identical: every record a
+released writer could produce validates, and new enqueues use fresh per-WillID
+subjects, so a refused record never contends for a live Will's subject slot. A
+mixed-version fleet in which an old broker still claims records a new broker refuses
+is unsupported outright, per the pre-release compatibility boundary.
+
+Operational residual, stated in `docs/ARCHITECTURE.md` and in the diagnostic rather
+than mitigated. Both scans walk their filter serially with one JetStream get per
+matching record, and refused records are never deleted, so:
+
+- `scanWillOutbox` restarts from sequence 1 each interval, so `N` refused records add
+  `O(N)` requests to every scan on every broker, forever, and a large enough backlog
+  can push a scan past `mqttWillClaimInterval` and delay valid due Wills.
+- `cancelWillOutboxOnce` walks one client's filter and `mqttProcessConnect` waits for
+  it **before the CONNACK**, so `N` refused records for one client add `O(N)` serial
+  round trips to every reconnect of that client, forever. Returning nil on a refused
+  record avoids the retry loop and the spurious error log, not the latency; a large
+  enough per-client backlog is an availability problem for that client.
+
+This is the `DenyDelete` accumulation hazard reached by the other route — there
+deletion is denied, here the bridge declines to delete what it cannot read — so the
+refusal is not a stable resting state and the log asks for prompt cleanup. A
+quarantine stream, a bounded scan and a reaper were each rejected as a second
+mechanism deciding the fate of records already declared uninterpretable.
+
+Second residual, pre-existing and now written down rather than introduced: retry
+exhaustion in `enqueueDelayedWill` means UNCONFIRMED, not proven absent. A create can
+land while its ack is lost, and if every bounded re-read is also indeterminate the
+loop reaches the immediate-publish fail-safe with a durable pending record in place —
+so the Will publishes now and fires again later. An earlier draft of
+`publishWillFailSafe`'s contract claimed no record can exist at that point, which was
+false; the comment now separates the writer-refusal arm (provably no record) from the
+exhaustion arm (the sanctioned at-least-once duplicate reached by a second route), and
+`TestMQTTWillOutboxEnqueueExhaustionAfterLandedWriteDuplicates` pins it.
+
+Tests: `will_outbox_refusal_test.go` — the claim scan, the expired-lease reclaim and
+the terminal reaper each refuse eight unsupported shapes (missing generation,
+out-of-alphabet generation, zero origin sequence, malformed origin epoch,
+foreign-identity binding, dotted `WillID`, unknown state, undecodable body) while a
+valid sibling in the same pass fires or is reaped; the cancel pass refuses three
+shapes, cancels its valid sibling and still returns nil; the loader errors on a
+decodable-but-unsupported record and still loads a valid control; and the writer
+refuses an empty generation, persists nothing and publishes once, with a valid
+control that persists and does NOT also publish. Every "untouched" assertion reads
+the STORED BYTES, never `loadWillOutbox` — which now errors on exactly those
+records, so a decoded assertion would hold vacuously. The two watermark tests that
+deliberately persist an invalid origin epoch
+(`TestMQTTWillOutboxWatermarkMalformedEpochCharsetRejected`,
+`TestMQTTWillOutboxWatermarkInvalidOriginRefused`) were rewritten as raw-storage
+refusal tests rather than given valid fixtures, which would have deleted the
+coverage they exist for.
+
+Seven mutations were run, each failing exactly its paired variant: dropping the
+generation check (both generation rows), the claim scan's validation call (all three
+scan tests), the cancel scan's (all three cancel rows), the loader's (both loader
+rows), the writer's (the enqueue test), the subject binding (the foreign-identity
+row) and the single-token check (the dotted-`WillID` row).
+
+`internal/mqtt/will_outbox.go`, `mqtt.go`; `will_outbox_refusal_test.go`,
+`will_cancel_test.go`, `will_outbox_test.go`, `will_outbox_cluster_test.go`,
+`sess_persist_evict_test.go`, `sess_rejected_write_test.go`.
+
+### Original finding record
+
+Preserved from `pre-release-migrations.md` as it existed on 2026-08-10.
+
+**Title:** Reject generationless delayed-Will outbox records
+
+- Status: Open
+- Classification: Pre-release outbox-format compatibility cleanup
+- Release treatment: Immediate cleanup before further MQTT-core implementation
+
+#### Evidence
+
+Every current session has a validated NUID incarnation generation, and session
+records without one already fail restoration with recreate guidance. Every current
+delayed-Will enqueue therefore writes `mqttWillOutbox.Gen`.
+
+The outbox still documents and accepts an empty generation as a legacy bucket.
+Scoped displaced-connection cancellation may match that empty bucket, while scan
+and load paths do not validate the field before a record can be cancelled,
+claimed, or published. This is inconsistent with the same record's
+`OriginSessionSeq` and `OriginSessEpoch`, which explicitly reject legacy or
+migrated forms.
+
+The empty-generation allowance is small, but it silently preserves a
+development-era outbox format and weakens the invariant used to scope delayed-Will
+cancellation to one session incarnation.
+
+#### Commit-sized resolution
+
+Land one delayed-Will format-hardening commit:
+
+1. Centralize validation of every decoded outbox record, including a valid
+   session generation, origin sequence, epoch, identity fields, and state.
+2. Make scan, point-load, and cancellation paths treat a generationless or
+   malformed record as unsupported/corrupt and never publish or mutate it as if it
+   were current state.
+3. Remove empty-generation legacy wording and tests; add fail-closed coverage for
+   pending and publishing records plus actionable diagnostics.
+
+The resolution must not change unscoped reconnect cancellation of valid records or
+the generation-and-origin-sequence scope used by displaced-connection cleanup.

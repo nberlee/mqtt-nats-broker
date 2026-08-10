@@ -783,10 +783,16 @@ type mqttAccountSessionManager struct {
 	// entry is pruned only once inFlight drops to zero so a worker parked before mu
 	// cannot resume into a pruned-away watermark. See reconcileRemoteSessionExpiry.
 	reconcileWM map[string]*sessionReconcileState
-	retmsgs     *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
-	rmsCache    *sync.Map                              // map[subject]mqttRetainedMsg
-	jsa         mqttJSA
-	domainTk    string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+	// refusedWillRecords is the set of $MQTT_willq subjects whose record has
+	// already been reported unsupported, so the 5s claim scan warns once per
+	// record rather than every pass. Guarded by mu; bounded by the number of
+	// distinct refused subjects, and never cleared because a refused record is
+	// permanent until an operator removes it. See refuseWillOutboxRecord.
+	refusedWillRecords map[string]struct{}
+	retmsgs            *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
+	rmsCache           *sync.Map                              // map[subject]mqttRetainedMsg
+	jsa                mqttJSA
+	domainTk           string // Domain (with trailing "."), or possibly empty. This is added to session subject.
 
 	// sessStreamEpoch is the $MQTT_sess incarnation identity resolved once at
 	// account-manager init from the stream's mqtt_sess_epoch metadata (form

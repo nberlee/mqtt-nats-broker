@@ -37,9 +37,27 @@ formats that no user release depends on. Each checkbox is one commit.
   store evicts the record it replaces. An undecodable record is now rejected with
   a log and evicted rather than silently ignored. Filed while doing it: F-059 and
   F-060 below.
-- [ ] [F-058: Reject generationless delayed-Will records](findings/pre-release-migrations.md#f-058).
-  **Second; small.** Validate decoded outbox records before scan, cancellation, or
-  publication and fail closed on the unsupported pre-generation format.
+- [x] [F-058: Reject generationless delayed-Will records](findings/resolved.md#f-058).
+  The empty-generation legacy bucket is gone. Every decoded `$MQTT_willq` record is
+  validated — generation, origin sequence and epoch, state, and identity fields that
+  must each be a single subject token — and bound to the subject it was stored on,
+  at all three decode boundaries. A record that fails is refused: never claimed,
+  published, cancelled or deleted, and reported once per subject. Two deltas from
+  the finding's wording: the enqueue validates before persisting and falls to the
+  existing immediate-publish fail-safe, and `willTakeoverFence`'s now-duplicate
+  inline origin check is deleted rather than kept beside the validator. Residual,
+  stated: a refused record is reclaimed by NOTHING — no sweep, fence or reaper
+  touches it — so it persists until an operator deletes the message or recreates the
+  stream, which is what the diagnostic prescribes. Permanence has a running cost, and
+  the diagnostic says so, on two paths. The claim scan re-reads every extant record
+  each interval, so a refused backlog adds `O(N)` JetStream gets per scan per broker
+  and a large enough one can push a scan past its interval and delay valid due Wills.
+  Worse, `mqttProcessConnect` waits for `cancelWillOutbox` before the CONNACK, so `N`
+  refused records for one client add `O(N)` serial round trips to **every reconnect
+  of that client, forever** — an availability cost for that client, not just a
+  delayed Will. A quarantine stream, a bounded scan and a reaper were all rejected —
+  each is a second mechanism deciding the fate of records the bridge has said it
+  cannot interpret.
 
 These cleanups do not remove MQTT wire compatibility or the operator migration
 guide from NATS Server's embedded MQTT listener.

@@ -822,7 +822,9 @@ func TestMQTTRejectedRecordCloseStampsDisconnect(t *testing.T) {
 	seq := e.sess.seq
 	e.sess.mu.Unlock()
 	rec := &mqttWillOutbox{
+		WillID:           mqttNewRecordWID(),
 		ClientIDHash:     e.idHash,
+		Gen:              mqttNewSessGen(),
 		OriginSessionSeq: seq - 1, // the record is NEWER than the Will's origin
 		OriginSessEpoch:  e.asm.sessStreamEpoch,
 		State:            mqttWillPending,
@@ -964,7 +966,9 @@ func TestMQTTRejectedRecordBusyFenceStampBindsTheProbe(t *testing.T) {
 	// The probe's own record is newer than the Will's origin, and must NOT read as a
 	// reconnect.
 	rec := &mqttWillOutbox{
+		WillID:           mqttNewRecordWID(),
 		ClientIDHash:     e.idHash,
+		Gen:              mqttNewSessGen(),
 		OriginSessionSeq: originSeq,
 		OriginSessEpoch:  e.asm.sessStreamEpoch,
 		State:            mqttWillPending,

@@ -67,13 +67,16 @@ func TestMQTTWillOutboxReplicatedStream(t *testing.T) {
 	cidHash := "smoke-" + nuid.Next()
 	subject := mqttWillQSubject(asm.domainTk, cidHash, willID)
 	rec := &mqttWillOutbox{
-		WillID:       willID,
-		ClientIDHash: cidHash,
-		Topic:        "will/smoke",
-		Msg:          []byte("inert"),
-		FireAt:       time.Now().Add(time.Hour).UnixNano(),
-		State:        mqttWillPending,
-		Account:      asm.jsa.c.acc.GetName(),
+		WillID:           willID,
+		ClientIDHash:     cidHash,
+		Gen:              mqttNewSessGen(),
+		Topic:            "will/smoke",
+		Msg:              []byte("inert"),
+		FireAt:           time.Now().Add(time.Hour).UnixNano(),
+		State:            mqttWillPending,
+		Account:          asm.jsa.c.acc.GetName(),
+		OriginSessionSeq: 1,
+		OriginSessEpoch:  asm.sessStreamEpoch,
 	}
 	seq, err := asm.jsa.storeWillOutboxCAS(subject, 0, rec)
 	if err != nil {
@@ -81,7 +84,7 @@ func TestMQTTWillOutboxReplicatedStream(t *testing.T) {
 	}
 
 	// Readable back, and replicated to every node.
-	got, _, err := asm.jsa.loadWillOutbox(subject)
+	got, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 	if err != nil || got == nil {
 		t.Fatalf("load inert record: err=%v got=%v", err, got)
 	}

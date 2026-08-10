@@ -97,6 +97,7 @@ func (e *testRejectionEnv) plantPendingWill(t *testing.T) string {
 		FireAt:           time.Now().Add(time.Hour).UnixNano(),
 		State:            mqttWillPending,
 		OriginSessionSeq: seq,
+		OriginSessEpoch:  e.asm.sessStreamEpoch,
 	}
 	if _, err := e.asm.jsa.storeWillOutboxCAS(subject, 0, rec); err != nil {
 		t.Fatalf("plant the pending Will outbox record: %v", err)
@@ -108,7 +109,7 @@ func (e *testRejectionEnv) plantPendingWill(t *testing.T) string {
 // interest-retention hazard: absence never proves anything about what ran.
 func (e *testRejectionEnv) willOutboxState(t *testing.T, subject string) mqttWillState {
 	t.Helper()
-	rec, _, err := e.asm.jsa.loadWillOutbox(subject)
+	rec, _, err := e.asm.jsa.loadWillOutbox(e.asm.domainTk, subject)
 	if err != nil || rec == nil {
 		t.Fatalf("load the Will outbox record: %v", err)
 	}
