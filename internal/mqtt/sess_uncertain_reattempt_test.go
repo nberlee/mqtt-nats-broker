@@ -69,6 +69,7 @@ func (e *testUncertainEnv) resident() bool {
 // Mutation M1: revert the at-base arm to clearing the uncertainty. The late store
 // then commits and the pass disposes of the session over its own write.
 func TestUncertainLateProposalIsNotForeign(t *testing.T) {
+	t.Parallel()
 	e := testNewUncertainEnv(t, "late-proposal")
 
 	res, err := e.sess.resolveUncertainWrite()
@@ -420,6 +421,7 @@ func TestUncertainReattemptContendedStaysUnresolved(t *testing.T) {
 // Mutation M13: re-marshal current memory in the re-attempt and the stored digest
 // diverges from the attempt's.
 func TestUncertainReattemptSendsTheAttemptsOwnBytes(t *testing.T) {
+	t.Parallel()
 	e := testNewUncertainEnv(t, "reattempt-bytes")
 
 	// Staged AFTER the attempt was marked uncertain: it is not in the attempted
@@ -460,6 +462,7 @@ func TestUncertainReattemptSendsTheAttemptsOwnBytes(t *testing.T) {
 // The property rests on $MQTT_sess being MaxMsgsPer:1, which is a validated startup
 // prerequisite (validateSessStream) rather than an assumption made here.
 func TestUncertainDuplicateCommitCollapses(t *testing.T) {
+	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	sess := testProvisionSession(t, a, "duplicate-commit")
 	_, base := testLoadSessRecord(t, a, sess.idHash)
@@ -584,6 +587,7 @@ func TestUncertainBaseZeroIsReAttempted(t *testing.T) {
 // Mutation M11: drop the `Sequence > baseSeq` conjunct and the byte-identical
 // below-base record is adopted as ours.
 func TestClassifyAttemptReadbackShapes(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{"id":"c","subs":{"foo":1}}`)
 	pw := &mqttPendingWrite{baseSeq: 10, digest: mqttRecordDigest(body)}
 	other := []byte(`{"id":"c","subs":{"theirs":2}}`)
@@ -633,6 +637,7 @@ func TestClassifyAttemptReadbackShapes(t *testing.T) {
 // exactly but whose sequence is BELOW its base must not be adopted, because adopting
 // it would turn a stale snapshot into a valid CAS over whatever that record is.
 func TestUncertainBelowBaseRecordIsNeverAdopted(t *testing.T) {
+	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	sess := testProvisionSession(t, a, "below-base")
 	body := testRecordBody(t, sess)

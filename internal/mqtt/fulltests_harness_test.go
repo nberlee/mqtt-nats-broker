@@ -304,23 +304,251 @@ func testMQTTWaitRetained(t testing.TB, s *Server, subject string) {
 // backs it via its NATS connection.
 // ---------------------------------------------------------------------------
 
-var (
-	testEmbeddedMu   sync.Mutex
-	testEmbeddedNATS = map[*Server]*natsserver.Server{}
-	// testEmbeddedNATSByDir tracks the live embedded nats-server (if any) for a
-	// given StoreDir. The ported suite's restart idiom is
-	// s.Shutdown(); o.StoreDir = <same dir>; s = testMQTTRunServer(t, o) —
-	// s.Shutdown() only stops the shim's MQTT listener (Server.Shutdown,
-	// shim_public.go), not the paired embedded nats-server (by design: in
-	// production the bridge restarts against an external, never-restarted
-	// NATS/JetStream deployment). Without this registry, testMQTTRunServer
-	// would start a SECOND embedded nats-server pointed at the same on-disk
-	// store while the first is still running — a file-store conflict that
-	// corrupts JetStream state (observed as stale/reverted retained messages).
-	// Reusing the still-live instance instead matches production restart
-	// semantics: only the MQTT layer cycles, JetStream stays up.
-	testEmbeddedNATSByDir = map[string]*natsserver.Server{}
-)
+// testEmbeddedRegistry owns the pairing between a shim *Server and the embedded
+// nats-server backing it, and the StoreDir reuse map beside it.
+//
+// It owns its lock as well as its maps, and neither is reachable from outside:
+// that is what makes testMQTTRunServer callable from parallel tests. A bare
+// package-level map would be shared mutable state that any future line could
+// touch unlocked, and the parallel-safety guard would have to be told to ignore
+// it — an exemption that stays true only until someone edits nearby. With the
+// state behind a type there is nothing to exempt, because there is no unlocked
+// path to write.
+//
+// Entries are keyed by a *Server, or by the StoreDir, that exactly one test owns,
+// so concurrent tests touch disjoint keys.
+//
+// byDir tracks the live embedded nats-server (if any) for a given StoreDir. The
+// ported suite's restart idiom is
+// s.Shutdown(); o.StoreDir = <same dir>; s = testMQTTRunServer(t, o) —
+// s.Shutdown() only stops the shim's MQTT listener (Server.Shutdown,
+// shim_public.go), not the paired embedded nats-server (by design: in production
+// the bridge restarts against an external, never-restarted NATS/JetStream
+// deployment). Without it, testMQTTRunServer would start a SECOND embedded
+// nats-server pointed at the same on-disk store while the first is still
+// running — a file-store conflict that corrupts JetStream state (observed as
+// stale/reverted retained messages). Reusing the still-live instance instead
+// matches production restart semantics: only the MQTT layer cycles, JetStream
+// stays up.
+// embeddedServer is one embedded nats-server and the lifecycle state of the
+// StoreDir it owns. A directory is in exactly one of three states, and the
+// channels are what let a caller wait for the state it needs without holding the
+// registry lock across a multi-second server start or shutdown:
+//
+//	creating  ready is open   — one caller is starting it, everybody else waits
+//	live      ready is closed — refs shims are paired with it
+//	closing   closing non-nil — the last ref went away and shutdown is running
+//
+// The states matter because two nats-servers on one on-disk store corrupt
+// JetStream state, which the comment above records as observed, not theoretical.
+// Splitting "is there one?" from "make one" is what allows that, and splitting
+// "forget it" from "shut it down" allows the same collision in the other
+// direction: a new acquisition adopting a directory whose server is mid-shutdown.
+type embeddedServer struct {
+	dir     string
+	ready   chan struct{} // closed once ns and err are final
+	ns      *natsserver.Server
+	err     error
+	refs    int           // shims currently paired with it
+	closing chan struct{} // non-nil once the last ref went away
+}
+
+func (e *embeddedServer) server() *natsserver.Server {
+	<-e.ready
+	return e.ns
+}
+
+type testEmbeddedRegistry struct {
+	mu       sync.Mutex
+	byDir    map[string]*embeddedServer
+	byServer map[*Server]*embeddedServer
+}
+
+var testEmbedded = &testEmbeddedRegistry{
+	byDir:    map[string]*embeddedServer{},
+	byServer: map[*Server]*embeddedServer{},
+}
+
+// acquire returns the embedded server for dir, starting it exactly once however
+// many callers arrive together, and taking a reference for the pairing that must
+// follow. A caller that finds the directory mid-shutdown waits for that to finish
+// rather than racing a second server onto the same store.
+func (r *testEmbeddedRegistry) acquire(dir string, start func() (*natsserver.Server, error)) (*embeddedServer, error) {
+	for {
+		r.mu.Lock()
+		e, ok := r.byDir[dir]
+		if ok && e.closing != nil {
+			r.mu.Unlock()
+			<-e.closing
+			continue // the directory is free now; look again
+		}
+		if ok {
+			r.reapLocked(e)
+			e.refs++
+			r.mu.Unlock()
+			<-e.ready
+			if e.err != nil {
+				r.releaseEntry(e)
+				return nil, e.err
+			}
+			return e, nil
+		}
+		e = &embeddedServer{dir: dir, ready: make(chan struct{}), refs: 1}
+		r.byDir[dir] = e
+		r.mu.Unlock()
+
+		e.ns, e.err = start()
+		close(e.ready)
+		if e.err != nil {
+			// Drop the failed entry so a later attempt is not stuck with it.
+			r.mu.Lock()
+			if r.byDir[dir] == e {
+				delete(r.byDir, dir)
+			}
+			r.mu.Unlock()
+			return nil, e.err
+		}
+		return e, nil
+	}
+}
+
+// pair records which embedded server a shim is using. The reference it consumes
+// was taken by acquire, or by transfer from the shim being replaced.
+func (r *testEmbeddedRegistry) pair(s *Server, e *embeddedServer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byServer[s] = e
+}
+
+func (r *testEmbeddedRegistry) paired(s *Server) *natsserver.Server {
+	r.mu.Lock()
+	e := r.byServer[s]
+	r.mu.Unlock()
+	if e == nil {
+		return nil
+	}
+	return e.server()
+}
+
+// transfer hands a shim's reference to its caller, which must pair a replacement
+// shim with it. This is the restart idiom — the MQTT layer cycles while the
+// embedded server stays up — so the reference moves rather than being dropped.
+func (r *testEmbeddedRegistry) transfer(s *Server) *embeddedServer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.byServer[s]
+	delete(r.byServer, s)
+	return e
+}
+
+// release drops a shim's reference and, when it was the last one, shuts the
+// embedded server down. The directory stays reserved until that shutdown
+// returns: a caller arriving in between waits in acquire rather than starting a
+// second server on the same store.
+func (r *testEmbeddedRegistry) release(s *Server) {
+	r.mu.Lock()
+	e := r.byServer[s]
+	delete(r.byServer, s)
+	r.mu.Unlock()
+	if e != nil {
+		r.releaseEntry(e)
+	}
+}
+
+// TestEmbeddedRegistryReclaimsARestartedShim pins the accounting for the restart
+// idiom, which is the one shape reference counting cannot express on its own: a
+// raw s.Shutdown() followed by another testMQTTRunServer against the same
+// StoreDir, where the first shim never releases what it took.
+//
+// Without reaping, that reference is never returned, the count never reaches
+// zero, and the embedded nats-server, its goroutines and its store survive to
+// process exit. The assertion is on the registry rather than on any symptom
+// because the symptom is a slow leak that no test would fail on.
+func TestEmbeddedRegistryReclaimsARestartedShim(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+
+	// The restart idiom: the shim stops, the embedded server deliberately does
+	// not, and the replacement re-acquires the same store.
+	s.Shutdown()
+	s2 := testMQTTRunServer(t, o)
+	testMQTTShutdownServer(s2)
+
+	testEmbedded.mu.Lock()
+	defer testEmbedded.mu.Unlock()
+	if e, ok := testEmbedded.byDir[o.StoreDir]; ok {
+		t.Fatalf("the store is still registered after every shim using it went away "+
+			"(refs=%d): its embedded nats-server will never be shut down", e.refs)
+	}
+	for shim, e := range testEmbedded.byServer {
+		if e.dir == o.StoreDir {
+			t.Fatalf("shim %p is still paired with %q after shutdown", shim, o.StoreDir)
+		}
+	}
+}
+
+// reapLocked drops references held by shims that are no longer running.
+//
+// The restart idiom the ported suite uses is a raw s.Shutdown() followed by
+// another testMQTTRunServer against the same StoreDir — deliberately NOT
+// testMQTTShutdownServer, because the embedded server has to stay up across the
+// restart. That shim never releases its reference, so counting alone would keep
+// every restarted store's server alive until process exit. Reaping is what makes
+// reference counting fit an idiom that cannot hand its reference over: a shim
+// that has been shut down is not using the server any more, whatever it forgot
+// to say.
+// The signal is shutdownDone, NOT isRunning. BeginShutdown clears running
+// synchronously and then drains in the background, and Shutdown returns after
+// shutdownDrainTimeout whether or not that finished — so a shim can be
+// not-running while it is still persisting sessions and Wills. Reaping on
+// running would let the replacement's final release shut the embedded server
+// down underneath that drain. A drain that never completes holds its reference,
+// which is the safe direction: the next acquire or release for the same store
+// reaps it once it does.
+func (r *testEmbeddedRegistry) reapLocked(e *embeddedServer) {
+	for s, paired := range r.byServer {
+		if paired != e {
+			continue
+		}
+		select {
+		case <-s.shutdownDone:
+			delete(r.byServer, s)
+			e.refs--
+		default:
+		}
+	}
+}
+
+func (r *testEmbeddedRegistry) releaseEntry(e *embeddedServer) {
+	r.mu.Lock()
+	r.reapLocked(e)
+	e.refs--
+	if e.refs < 0 {
+		r.mu.Unlock()
+		// Every reference is created by acquire and destroyed exactly once, by
+		// reapLocked when its shim died without saying so or by this decrement.
+		// Going negative means one was destroyed twice, which would let a live
+		// store's server be shut down under a test still using it.
+		panic(fmt.Sprintf("testEmbeddedRegistry: reference count for %q went negative", e.dir))
+	}
+	if e.refs > 0 {
+		r.mu.Unlock()
+		return
+	}
+	e.closing = make(chan struct{})
+	r.mu.Unlock()
+
+	if ns := e.server(); ns != nil {
+		ns.Shutdown()
+	}
+
+	r.mu.Lock()
+	if r.byDir[e.dir] == e {
+		delete(r.byDir, e.dir)
+	}
+	r.mu.Unlock()
+	close(e.closing)
+}
 
 // mqttTestLogger is the upstream server.Logger method set that the ported
 // suite's capture loggers (DummyLogger and the captureX loggers) implement.
@@ -406,25 +634,39 @@ func testMQTTNewServerFromOptions(t testing.TB, o *Options) (*Server, error) {
 	if o.StoreDir == _EMPTY_ {
 		o.StoreDir = t.TempDir()
 	}
-	ns, err := natsserver.NewServer(&natsserver.Options{
-		Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: o.StoreDir,
+	entry, err := testEmbedded.acquire(o.StoreDir, func() (*natsserver.Server, error) {
+		ns, err := natsserver.NewServer(&natsserver.Options{
+			Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: o.StoreDir,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("creating embedded nats-server: %w", err)
+		}
+		go ns.Start()
+		if !ns.ReadyForConnections(10 * time.Second) {
+			ns.Shutdown()
+			return nil, errors.New("embedded nats-server not ready")
+		}
+		return ns, nil
 	})
 	if err != nil {
-		t.Fatalf("Error creating embedded nats-server: %v", err)
+		t.Fatalf("Error starting embedded nats-server: %v", err)
 	}
-	go ns.Start()
-	if !ns.ReadyForConnections(10 * time.Second) {
-		t.Fatal("embedded nats-server not ready")
-	}
-	nc, err := nats.Connect(ns.ClientURL())
+	// The reference acquire took is released unless pairing commits it: t.Fatalf
+	// unwinds this goroutine only, and the rest of the parallel run continues with
+	// the entry stranded otherwise.
+	paired := false
+	defer func() {
+		if !paired {
+			testEmbedded.releaseEntry(entry)
+		}
+	}()
+	nc, err := nats.Connect(entry.server().ClientURL())
 	if err != nil {
-		ns.Shutdown()
 		t.Fatalf("Error connecting to embedded nats-server: %v", err)
 	}
 	s := NewServer(nc, o, o.ServerName)
-	testEmbeddedMu.Lock()
-	testEmbeddedNATS[s] = ns
-	testEmbeddedMu.Unlock()
+	testEmbedded.pair(s, entry)
+	paired = true
 	return s, nil
 }
 
@@ -435,29 +677,31 @@ func testMQTTNewServerFromOptions(t testing.TB, o *Options) (*Server, error) {
 // same JetStream state.
 func testMQTTRestartServerSameStore(t testing.TB, oldS *Server, o *Options) *Server {
 	t.Helper()
-	testEmbeddedMu.Lock()
-	ns := testEmbeddedNATS[oldS]
-	delete(testEmbeddedNATS, oldS)
-	testEmbeddedMu.Unlock()
-	if ns == nil {
+	entry := testEmbedded.transfer(oldS)
+	if entry == nil {
 		t.Fatal("testMQTTRestartServerSameStore: oldS has no paired embedded nats-server")
 	}
-	nc, err := nats.Connect(ns.ClientURL())
+	// transfer already took the old shim's ownership away, so a failure before
+	// pairing would strand the reference with no shim left to release it.
+	paired := false
+	defer func() {
+		if !paired {
+			testEmbedded.releaseEntry(entry)
+		}
+	}()
+	nc, err := nats.Connect(entry.server().ClientURL())
 	if err != nil {
 		t.Fatalf("Error connecting to embedded nats-server: %v", err)
 	}
 	s := NewServer(nc, o, o.ServerName)
-	testEmbeddedMu.Lock()
-	testEmbeddedNATS[s] = ns
-	testEmbeddedMu.Unlock()
+	testEmbedded.pair(s, entry)
+	paired = true
 	return s
 }
 
 // ClientURL returns the paired embedded nats-server's client URL.
 func (s *Server) ClientURL() string {
-	testEmbeddedMu.Lock()
-	ns := testEmbeddedNATS[s]
-	testEmbeddedMu.Unlock()
+	ns := testEmbedded.paired(s)
 	if ns == nil {
 		return _EMPTY_
 	}
@@ -472,9 +716,7 @@ type JetStreamConfigShim struct {
 
 // JetStreamConfig returns the store dir of the paired embedded nats-server.
 func (s *Server) JetStreamConfig() *JetStreamConfigShim {
-	testEmbeddedMu.Lock()
-	ns := testEmbeddedNATS[s]
-	testEmbeddedMu.Unlock()
+	ns := testEmbedded.paired(s)
 	if ns == nil {
 		return &JetStreamConfigShim{}
 	}

@@ -20,6 +20,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestMQTTInflightSubjectNaming(t *testing.T) {
+	t.Parallel()
 	idHash, gen := getHash("client-a"), mqttNewSessGen()
 
 	subject := mqttInflightSubject(idHash, gen, 1234)
@@ -48,6 +49,7 @@ func TestMQTTInflightSubjectNaming(t *testing.T) {
 }
 
 func TestMQTTInflightSubjectParseRejects(t *testing.T) {
+	t.Parallel()
 	idHash, gen := getHash("client-a"), mqttNewSessGen()
 	base := mqttInflightStreamSubjectPrefix
 
@@ -76,6 +78,7 @@ func TestMQTTInflightSubjectParseRejects(t *testing.T) {
 }
 
 func TestMQTTInflightRecordIdentity(t *testing.T) {
+	t.Parallel()
 	ok := func() *mqttInflightRecord {
 		return &mqttInflightRecord{PI: 7, Dur: "hash_nuid", Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce()}
 	}
@@ -111,6 +114,7 @@ func TestMQTTInflightRecordIdentity(t *testing.T) {
 }
 
 func TestMQTTInflightRecordCodec(t *testing.T) {
+	t.Parallel()
 	rec := &mqttInflightRecord{
 		PI: 9, Dur: "hash_nuid", Seq: 1234, QoS: 1,
 		Nonce: mqttNewInflightNonce(), Claim: mqttNewInflightNonce(),
@@ -139,6 +143,7 @@ func TestMQTTInflightRecordCodec(t *testing.T) {
 // The source stream is DERIVED from the durable's prefix rather than stored, so an
 // affine copy's $MQTT_out sequence is never checked against $MQTT_msgs.
 func TestMQTTInflightSourceStream(t *testing.T) {
+	t.Parallel()
 	idHash, gen := getHash("client-a"), mqttNewQ2AffGen()
 	_, _, affDur := mqttQ2AffineNames(idHash, gen)
 	if got := mqttInflightSourceStream(affDur); got != mqttOutStreamName {
@@ -154,6 +159,7 @@ func TestMQTTInflightSourceStream(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMQTTValidateInflightStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:       mqttInflightStreamName,
@@ -374,6 +380,7 @@ func (e *testInflightEnv) waitRegisterCount(t *testing.T, want int) {
 // The happy path: a first transmission records a register naming its source, and the
 // pending entry is released for sending.
 func TestMQTTInflightStoreConfirms(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-store")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -398,6 +405,7 @@ func TestMQTTInflightStoreConfirms(t *testing.T) {
 // the subject and matching the NONCE. The sequence cannot answer this, because the
 // subject is reused by later exchanges on the same identifier.
 func TestMQTTInflightStoreAmbiguousResolvedByNonce(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-ambiguous")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -432,6 +440,7 @@ func TestMQTTInflightStoreAmbiguousResolvedByNonce(t *testing.T) {
 // A definite store failure sends NOTHING and releases the identifier, which is safe
 // precisely because nothing else could have sent under it (R1).
 func TestMQTTInflightStoreDefiniteFailureUntracks(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-failure")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -469,6 +478,7 @@ func TestMQTTInflightStoreDefiniteFailureUntracks(t *testing.T) {
 // refused rather than reaped: on another broker that record is that delivery's only
 // durable identity.
 func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-foreign")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -501,6 +511,7 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 // A register whose delivery is provably complete is a leftover of a lost delete, and
 // its identifier may be reused once it has been reaped at its EXACT sequence.
 func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-stale")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -550,6 +561,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 // Withheld deliveries are never registered (R6): they were never transmitted, so
 // there is no identifier to make durable.
 func TestMQTTInflightDeferredNeverRegistered(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-deferred")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	e.sess.mu.Lock()
@@ -578,6 +590,7 @@ func TestMQTTInflightDeferredNeverRegistered(t *testing.T) {
 
 // A terminal path deletes the register at its exact sequence.
 func TestMQTTInflightTerminalDeletesRegister(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-terminal")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -596,6 +609,7 @@ func TestMQTTInflightTerminalDeletesRegister(t *testing.T) {
 // their registers with it: otherwise the next resume would reserve identifiers for
 // deliveries whose consumer no longer exists.
 func TestMQTTInflightConsumerPurgeDeletesRegisters(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-purge")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -633,6 +647,7 @@ func (e *testInflightEnv) forgetInMemory() {
 // The core guarantee: after a restart the barrier restores the ORIGINAL identifier
 // for a delivery still in the PUBLISH phase, and the redelivery reports it started.
 func TestMQTTInflightRecoveryRestoresIdentifier(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-recover")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -718,6 +733,7 @@ func (e *testInflightEnv) publishSourceGroup(t *testing.T, dur, group, filter, p
 // A register whose source is provably complete is dropped rather than reserved: the
 // exchange finished and only the delete was lost.
 func TestMQTTInflightRecoveryDropsCompletedSource(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-complete")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -746,6 +762,7 @@ func TestMQTTInflightRecoveryDropsCompletedSource(t *testing.T) {
 // delivery was lost rather than completed, so the client may still be holding the
 // identifier and it must not be handed to another message.
 func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-lost")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -785,6 +802,7 @@ func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
 // client has already answered. This is also the latent collision the barrier closes:
 // without the reservation a fresh allocation could mint the PUBREL's identifier.
 func TestMQTTInflightRecoveryReservesPubRelIdentifiers(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-pubrel")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	const pi = uint16(5)
@@ -849,6 +867,7 @@ func (e *testInflightEnv) subscribePubRel(t *testing.T) {
 // Mutation check: delete the register on this branch (the original rule) and the retained
 // -and-retired assertions fail.
 func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-precedence")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -890,6 +909,7 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 // lost. Nothing can redeliver it, so the register is dropped rather than retired — which
 // is what keeps a lost delete from leaving state behind forever.
 func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-precedence-done")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -934,6 +954,7 @@ func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T)
 // Mutation check: restore the "keep the newest, drop the other" rule and the
 // both-reserved, register-count and withheld-allocation assertions all fail.
 func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-duplicate")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -988,6 +1009,7 @@ func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
 // Mutation check: remove the completeness test from the retired branch of
 // recoverInflightRegisters and both assertions fail.
 func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-retired-converge")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1039,6 +1061,7 @@ func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T
 // survival assertion fails; (c) do not set piSpaceIncomplete for an opaque register —
 // the fresh-source-delivery assertion fails.
 func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-unusable")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1147,6 +1170,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 // In-memory state wins every conflict: a same-process reconnect already holds the
 // live authority, and the barrier must not overwrite it.
 func TestMQTTInflightRecoveryKeepsInMemoryState(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-inmemory")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1262,6 +1286,7 @@ func TestMQTTInflightRecoveryWithholdsAllocationOnUnreadableWalk(t *testing.T) {
 // Mutation check: drop the piSpaceIncomplete reset from clear() and the allocation
 // assertion below fails.
 func TestMQTTInflightClearResetsIncompleteSpace(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-clear-flag")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1300,6 +1325,7 @@ func TestMQTTInflightClearResetsIncompleteSpace(t *testing.T) {
 // Mutation check: drop the deferred marker from abandonInflightRegister and the
 // redelivery reports dup=true.
 func TestMQTTInflightAbandonedRegisterKeepsFirstSendDupClear(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-dup")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1353,6 +1379,7 @@ func TestMQTTInflightAbandonedRegisterKeepsFirstSendDupClear(t *testing.T) {
 // cpending[dur][sseq] = pi and drop the srcAckOwed entry — and the post-PUBCOMP
 // assertion fails.
 func TestMQTTInflightRetiredSourceSurvivesPubComp(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{maxp: 100}
 	const pi = uint16(7)
 	const dur, sseq = "hash_nuid", uint64(42)
@@ -1411,6 +1438,7 @@ func TestMQTTInflightRetiredSourceSurvivesPubComp(t *testing.T) {
 // Mutation check: `continue` without untracking (the original) and the entry survives, so
 // the store confirms and the send proceeds.
 func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-stage-cancel")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	const sid = "foo"
@@ -1468,6 +1496,7 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 // Mutation check: cancel without recording the marker and the DUP assertion fails; drop
 // the commitDrains cleanup and the committed case leaves the marker behind.
 func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-cancel-dup")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	const sid, sseq = "foo", uint64(1800)
@@ -1532,6 +1561,7 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 // Mutation check: use the bare deleteMsg here instead of the confirmed helper and the
 // completion is withheld.
 func TestMQTTInflightDrainCompletesWhenRegisterAlreadyGone(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-drain-gone")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	const sid = "foo"
@@ -1572,6 +1602,7 @@ func TestMQTTInflightDrainCompletesWhenRegisterAlreadyGone(t *testing.T) {
 // Mutation check: assign each register to the drain in turn (the original) and only one
 // sequence survives, so the others are neither reserved nor released.
 func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-drain-ambiguous")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	const sid = "foo"
@@ -1629,6 +1660,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 // Mutation check: drop the markInflightRegisterCancelled fallback and the resume reserves
 // the identifier and consumes the slot instead.
 func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-tombstone")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1696,6 +1728,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 // Mutation checks: skip the verdict on the double-failure branch of deleteInflightRegisters,
 // or drop CancelledRegs from the persisted record, and the identifier stays reserved.
 func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-ladder-verdict"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -1768,6 +1801,7 @@ func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 // Mutation checks: skip the tombstone rung, or skip the forget on its success, and the
 // record still carries a verdict it no longer needs.
 func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-ladder-tombstone")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1824,6 +1858,7 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 // Mutation checks: drop the secureRegCancellations call from the teardown, or free the
 // identifier at purge time instead of reserving it, and the assertions below fail.
 func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-purge-secure")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -1913,6 +1948,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 // UNSUBSCRIBE staging loop, or from this test) and the record does not carry the
 // cancellation.
 func TestMQTTInflightUnsubStagesCancellationWithMembershipRemoval(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-staged-cancel")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	const sid = "foo"
@@ -2008,6 +2044,7 @@ func TestMQTTInflightUnsubStagesCancellationWithMembershipRemoval(t *testing.T) 
 // Mutation check: void only the regPending allocations (skip the transmitted branch) and the
 // identifier stays reserved.
 func TestMQTTInflightRecoveryDropsVoidedTransmittedRegister(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-voided-sent"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -2083,6 +2120,7 @@ func TestMQTTInflightRecoveryDropsVoidedTransmittedRegister(t *testing.T) {
 //
 // Mutation check: make unvoidRegNonces a no-op and the live delivery's identifier is freed.
 func TestMQTTInflightRolledBackTeardownRestoresTransmittedRegister(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-unvoid"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -2184,6 +2222,7 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 // Mutation checks: skip the barrier in stageDeferredDeleteLocked, or make
 // reopenTeardownDelivery a no-op, and the assertions below fail.
 func TestMQTTInflightDeferredDeleteStagingIsReversible(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-deferred-staging")
 
 	stage := func(t *testing.T, dur string) (*subscription, []mqttRegCancellation) {
@@ -2243,6 +2282,7 @@ func TestMQTTInflightDeferredDeleteStagingIsReversible(t *testing.T) {
 // Mutation check: treat a cancelled occupant like any other (drop the case) and the store is
 // refused.
 func TestMQTTInflightStoreReapsCancelledOccupant(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-reap-cancelled")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	sseq := e.publishSource(t, dur)
@@ -2289,6 +2329,7 @@ func TestMQTTInflightStoreReapsCancelledOccupant(t *testing.T) {
 // Mutation checks: ignore the nonce set in the recovery classification, or drop CancelledRegs
 // from the persisted record, and the identifier stays reserved with its slot consumed.
 func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-cancel-crash"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -2381,6 +2422,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 // Mutation check: mark the revision saved on a refused fence in persistVoidedRegs, and the
 // record never learns about it.
 func TestMQTTInflightVoidVerdictPersistsAfterBusyFence(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-void-busy-fence")
 
 	// Another writer holds the fence, exactly as an UNSUBSCRIBE does, while the verdict is
@@ -2427,6 +2469,7 @@ func TestMQTTInflightVoidVerdictPersistsAfterBusyFence(t *testing.T) {
 // Mutation check (M4): skip creditVoidedRegsLocked on the re-attempt's success and the
 // revision stays uncredited.
 func TestMQTTInflightVoidVerdictAmbiguousSaveIsSettled(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-void-unlanded")
 	// So sess.seq names the record the resolver will find at its base sequence.
 	if err := testSessSave(t, e.sess); err != nil {
@@ -2489,6 +2532,7 @@ func TestMQTTInflightVoidVerdictAmbiguousSaveIsSettled(t *testing.T) {
 // Mutation check: drop the verdict on the double-failure branch of confirmInflightRegister
 // (the original logged and forgot) and the record never learns the register is void.
 func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-late-cancel")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -2579,6 +2623,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 // Mutation check: drop the regPending guard from releaseSettledVoidReservationsLocked and
 // the identifier is freed while the store is still out.
 func TestMQTTInflightStalledStoreHoldsReservation(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-stalled-store")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -2686,6 +2731,7 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 // Mutation check: run the tombstone rung for a retired register (or void its nonce at
 // staging) and the restart loses the retirement.
 func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-retired-ladder"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -2781,6 +2827,7 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 // purge; drop the shared-prefix filter and the plain delivery is purged with them; delete the
 // group consumers and the presence window fails.
 func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-purge-restored"
 	e := testNewInflightEnv(t, clientID)
 
@@ -2914,6 +2961,7 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 // Mutation M9: drop the recovery claim pass and the stale exact-sequence delete
 // removes the register, so the final recovery cannot reserve pi.
 func TestMQTTInflightClaimFencesStaleClosePurge(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-stale-close"
 	e := testNewInflightEnv(t, clientID)
 	const group, filter = "g", "claim.stale"
@@ -2997,6 +3045,7 @@ func TestMQTTInflightClaimFencesStaleClosePurge(t *testing.T) {
 //
 // Mutation M15: classify claim-pass absence as opaque and pi remains reserved.
 func TestMQTTInflightClaimConsumesEarlierClose(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-close-first"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.close.first")
@@ -3045,6 +3094,7 @@ func TestMQTTInflightClaimConsumesEarlierClose(t *testing.T) {
 // Mutation M10: allow the rung-2 re-target on nonce alone and B's record is
 // rewritten Cancelled.
 func TestMQTTInflightClaimFencesCancellationReconcile(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-cancel-gate"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.cancel")
@@ -3097,6 +3147,7 @@ func TestMQTTInflightClaimFencesCancellationReconcile(t *testing.T) {
 //
 // Mutation M12: adopt on nonce alone and A confirms B's sequence for sending.
 func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-store-gate"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.store")
@@ -3155,6 +3206,7 @@ func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
 // Mutation M13: ignore the claim in retirement reconcile and the record is
 // rewritten Retired (or its sequence adopted).
 func TestMQTTInflightClaimFencesRetirementReconcile(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-retire-gate"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.retire")
@@ -3189,6 +3241,7 @@ func TestMQTTInflightClaimFencesRetirementReconcile(t *testing.T) {
 // Mutation M14: ignore the claim in pending-tombstone reconcile and B's live
 // register becomes Cancelled.
 func TestMQTTInflightClaimFencesPendingCancellation(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-pending-gate"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.pending")
@@ -3233,6 +3286,7 @@ func TestMQTTInflightClaimFencesPendingCancellation(t *testing.T) {
 // Mutation check: drop the claim condition from the same-delivery replacement branch and
 // this test fails on B's register being rewritten.
 func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-replace-gate"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.replace")
@@ -3328,6 +3382,7 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 // and the stale purge below removes R1 — the register count and C's fail-closed state
 // both fail.
 func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-duplicate"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.duplicate")
@@ -3422,6 +3477,7 @@ func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
 // Mutation check: convert claim-failed members to bodyless reservations before the
 // grouping (the pre-fix shape) and the sibling installs — the cpending assertion fails.
 func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-split"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.split")
@@ -3507,6 +3563,7 @@ func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
 // Mutation check: classify the displaced result as opaque instead and the error
 // assertion fails (the resume completes with a foreign reservation).
 func TestMQTTInflightClaimDisplacedResumeRefused(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-displaced")
 	_, _, dur := mqttSharedNames("g", "claim.displaced")
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.displaced", "claim.displaced")
@@ -3571,6 +3628,7 @@ func TestMQTTInflightClaimDisplacedResumeRefused(t *testing.T) {
 // Mutation check: treat every foreign live claim as displacement regardless of order
 // (the pre-fix shape) and the resume is refused — the success assertion fails.
 func TestMQTTInflightClaimSupersedesOlderOwner(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-supersede"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.supersede")
@@ -3656,6 +3714,7 @@ func TestMQTTInflightClaimSupersedesOlderOwner(t *testing.T) {
 // Mutation check: cap the contest at three attempts with exhaustion falling to opaque
 // (the pre-fix shape) and the ownership assertions fail.
 func TestMQTTInflightClaimOutlastsOlderClaimChain(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-shared-claim-chain"
 	e := testNewInflightEnv(t, clientID)
 	_, _, dur := mqttSharedNames("g", "claim.chain")
@@ -3740,6 +3799,7 @@ func TestMQTTInflightClaimOutlastsOlderClaimChain(t *testing.T) {
 // delete lands — the final assertions fail; skip the complete-source memory
 // reconciliation and the entry survives run 2 — the same assertions fail.
 func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-terminal-race")
 	_, _, dur := mqttSharedNames("g", "claim.terminal.race")
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.terminal.race", "claim.terminal.race")
@@ -3830,6 +3890,7 @@ func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
 // Mutation check: let exhaustion fall to an opaque reservation (the pre-fix shape) and
 // the refusal assertion fails.
 func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-unfenced")
 	_, _, dur := mqttSharedNames("g", "claim.unfenced")
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.unfenced", "claim.unfenced")
@@ -3915,6 +3976,7 @@ func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
 // Mutation check: drop the poisoned-demotion loop from the apply phase and the mapping
 // survives — the trackPublish assertion fails.
 func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-poison-memory")
 	_, _, dur := mqttSharedNames("g", "claim.poison.mem")
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.poison.mem", "claim.poison.mem")
@@ -3992,6 +4054,7 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 // Mutation check: drop the consumed-close reconciliation loop from the apply phase and
 // both assertions below fail.
 func TestMQTTInflightClaimConsumedCloseRetiresLiveMemory(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-close-memory")
 	_, _, dur := mqttSharedNames("g", "claim.close.mem")
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.close.mem", "claim.close.mem")
@@ -4055,6 +4118,7 @@ func TestMQTTInflightClaimConsumedCloseRetiresLiveMemory(t *testing.T) {
 // Mutation check: drop the regForeign gate from deleteInflightRegisterFor and the
 // register-count assertion fails.
 func TestMQTTInflightClaimLostMemberSurvivesTerminalAck(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-lost-ack")
 	_, _, dur := mqttSharedNames("g", "claim.lost.ack")
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.lost.ack", "claim.lost.ack")
@@ -4130,6 +4194,7 @@ func TestMQTTInflightClaimLostMemberSurvivesTerminalAck(t *testing.T) {
 // Mutation check: drop the regForeign decline from mqttProcessPublishReceived and every
 // assertion below fails.
 func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-foreign-pubrec")
 	_, _, dur := mqttSharedNames("g", "claim.foreign.pubrec")
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.foreign.pubrec", "claim.foreign.pubrec")
@@ -4209,6 +4274,7 @@ func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 // Mutation check: derive the targets from sharedSubs (or from any union of the two views)
 // and this test fails; the strays are unreachable through either.
 func TestMQTTInflightSharedPurgeReachesForcedLeaveStrays(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-purge-strays")
 	const group, filter = "g", "foo.bar"
 	_, _, dur := mqttSharedNames(group, filter)
@@ -4287,6 +4353,7 @@ func TestMQTTInflightSharedPurgeReachesForcedLeaveStrays(t *testing.T) {
 // record; skip the srcAckOwed keys and the retirement survives; skip the deferred keys and
 // the withheld marker survives.
 func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-purge")
 	const group = "g"
 	// The deterministic group name IS the fact the collection reads; nothing here is
@@ -4407,6 +4474,7 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 // Mutation check: skip forgetCancelledReg on the confirmed-delete rung and the record still
 // carries a verdict its register no longer needs.
 func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-rung1-bounds")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -4459,6 +4527,7 @@ func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
 // any voided nonce) and the rejoined delivery's identifier is freed while the client holds
 // it.
 func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-rejoin-nonce"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -4527,6 +4596,7 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 // Mutation check: release on membership alone (drop the insertion-revision comparison) and
 // the unserialized verdict's identifier is freed.
 func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-serialized-release")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -4585,6 +4655,7 @@ func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
 // Mutation check: always park at the abandon settle point (drop the retired-verdict escape)
 // and the reservation survives its own proof.
 func TestMQTTInflightAbandonReleasesProvenReservation(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-abandon-proven")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -4638,6 +4709,7 @@ func TestMQTTInflightAbandonReleasesProvenReservation(t *testing.T) {
 // register survives as an ordinary delivery; drop the no-CAS forget and a nonce no register
 // can carry stays on the record.
 func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-late-cas"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -4720,6 +4792,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 // Mutation check: drop the nonce comparison from releaseCancelledReservation and the newer
 // allocation's reservation (and verdict) are destroyed by the stale settle.
 func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-stale-settle")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -4863,6 +4936,7 @@ func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
 // Mutation check: route a tombstoned in-set register to the fire-and-forget drop list (the
 // original ordering) and the verdict survives its own proof.
 func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-tombstone-retire"
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -4916,6 +4990,7 @@ func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
 // Mutation check: drop the srcAckOwed loop from purgeConsumerPendingLocked and both
 // assertions fail.
 func TestMQTTInflightConsumerPurgeReleasesRetiredSources(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-purge-retired")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -5036,6 +5111,7 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 // Mutation check: treat any resp.ToError() as absence (as the first batched implementation
 // of both paths did) and the read-failure cases below fail.
 func TestMQTTClassifyMsgGetResponse(t *testing.T) {
+	t.Parallel()
 	notFound := &JSApiMsgGetResponse{ApiResponse: ApiResponse{
 		Error: &ApiError{ErrCode: uint16(JSNoMessageFoundErr), Code: 404},
 	}}
@@ -5069,6 +5145,7 @@ func TestMQTTClassifyMsgGetResponse(t *testing.T) {
 
 // The source cache never reads a consumer's absence as a completed delivery.
 func TestMQTTInflightSourceCacheConsumerGoneIsUnknown(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-batch-consumer")
 	cache := e.asm.newInflightSourceCache()
 	cache.known["missing_durable"] = true // looked up, found nothing
@@ -5089,6 +5166,7 @@ func TestMQTTInflightSourceCacheConsumerGoneIsUnknown(t *testing.T) {
 // Mutation check: drop the drainOwned check and the register is rewritten (its sequence
 // moves) while the drain's RegSeq is left naming the old one.
 func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-drain-owned")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	const sid = "foo"
@@ -5152,6 +5230,7 @@ func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
 //
 // Mutation check: tolerate JSStreamNotFoundErr here and the assertion fails.
 func TestMQTTInflightRecoveryMissingStreamIsIncomplete(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-no-stream")
 
 	e.asm.mu.Lock()
@@ -5182,6 +5261,7 @@ func TestMQTTInflightRecoveryMissingStreamIsIncomplete(t *testing.T) {
 // Mutation check: use the asynchronous deleteInflightRegister here and the delete is no
 // longer observed as confirmed.
 func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-cancel-confirm")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -5229,6 +5309,7 @@ func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
 
 // One consumer lookup per durable, however many registers name it.
 func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-cache")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	sseq := e.publishSource(t, dur)
@@ -5279,6 +5360,7 @@ func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
 // A session discard destroys the registers of the incarnation it retires: every
 // identifier it held is void.
 func TestMQTTInflightTeardownPurgesRegisters(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-teardown")
 	dur := e.sess.idHash + "_" + nuid.Next()
 
@@ -5336,6 +5418,7 @@ func (e *testInflightEnv) registerPresent(t *testing.T, subject string) bool {
 // manager's own sweep goroutine runs concurrently and would supply observations of
 // its own; the wiring is covered separately below.
 func TestMQTTInflightOrphanReconcile(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-orphan")
 	subject, _ := e.seedOrphanRegister(t, 12)
 	zero := time.Duration(0)
@@ -5376,6 +5459,7 @@ func TestMQTTInflightOrphanReconcile(t *testing.T) {
 
 // The wiring: a full sweep pass reaches the in-flight class and converges.
 func TestMQTTInflightOrphanSweepWired(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-orphan-wired")
 	subject, _ := e.seedOrphanRegister(t, 13)
 	zero := time.Duration(0)
@@ -5396,6 +5480,7 @@ func TestMQTTInflightOrphanSweepWired(t *testing.T) {
 // A register belonging to a LIVE incarnation is never touched: absence from the
 // authoritative reference set is the only thing that makes one an orphan.
 func TestMQTTInflightOrphanSweepSparesLiveIncarnation(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "client-live")
 	dur := e.sess.idHash + "_" + nuid.Next()
 

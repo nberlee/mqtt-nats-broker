@@ -22,6 +22,7 @@ import (
 // rows for the exact configuration the create path produces and for the audited
 // non-prerequisites.
 func TestValidateSessStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:       mqttSessStreamName,
@@ -136,6 +137,7 @@ func TestValidateSessStream(t *testing.T) {
 // scan churn; the durable publishing->done transition precedes the delete, so
 // a Will is never re-fired by a denied delete).
 func TestValidateWillQStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:       mqttWillQStreamName,
@@ -213,6 +215,7 @@ func TestValidateWillQStream(t *testing.T) {
 // tests impose the limit post-startup and cannot catch an over-strict
 // validator; this row is the only thing that can).
 func TestValidateMsgsStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:        mqttStreamName,
@@ -319,6 +322,7 @@ func TestValidateMsgsStream(t *testing.T) {
 // AFTER the manager initialized, so an over-strict validator would pass it and
 // only refuse the deployment's next restart.
 func TestValidateRetainedStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:        mqttRetainedMsgsStreamName,
@@ -446,6 +450,7 @@ func (s *stubStreamAPI) createStream(_ *StreamConfig) (*StreamInfo, bool, error)
 // (mqttJSA.createStream), so validating it is the realistic wrong
 // implementation.
 func TestEnsureBrokerStream(t *testing.T) {
+	t.Parallel()
 	notFound := func() (*StreamInfo, error) { return nil, ApiErrors[JSStreamNotFoundErr] }
 	infoA := &StreamInfo{Config: StreamConfig{Name: "A"}}
 	infoB := &StreamInfo{Config: StreamConfig{Name: "B"}}
@@ -573,6 +578,7 @@ func testBrokerStreamSpecs() []brokerStreamSpec {
 // exactly the nine $MQTT_* streams, each with a non-nil validator and a config
 // the validator itself accepts.
 func TestBrokerStreamSpecTable(t *testing.T) {
+	t.Parallel()
 	specs := testBrokerStreamSpecs()
 	if len(specs) != len(mqttTestBrokerStreamNames) {
 		t.Fatalf("the spec table has %d entries, want %d — every broker-owned stream must be provisioned through ensureBrokerStream", len(specs), len(mqttTestBrokerStreamNames))
@@ -842,6 +848,7 @@ func changedTopLevelFields(a, b *StreamConfig) []string {
 // (a waiver that masks a live rejection fails), and every waiver/domination
 // reason non-empty prose.
 func TestStreamValidatorFieldCoverage(t *testing.T) {
+	t.Parallel()
 	fields := reflectedStreamConfigFields(t)
 
 	// Bijection: reflected set <-> mutator table, iterating the REFLECTED set.

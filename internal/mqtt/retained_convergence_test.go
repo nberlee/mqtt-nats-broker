@@ -245,6 +245,7 @@ func legacyJSONRetainedRecord(t *testing.T, topic, payload string) []byte {
 // — one record for the subject, and that record is the empty-body tombstone —
 // which is why no explicit delete of the record it replaces is needed.
 func TestRetainedCrossBrokerConvergence(t *testing.T) {
+	t.Parallel()
 	srv := runJetStreamServerHA(t)
 	_, addrA, _ := retainedBroker(t, srv.ClientURL(), "node-a")
 	sB, addrB, _ := retainedBroker(t, srv.ClientURL(), "node-b")
@@ -314,6 +315,7 @@ func TestRetainedCrossBrokerConvergence(t *testing.T) {
 // the rejection through a broker's cold replay of the whole stream, which is
 // also the restart-recovery path.
 func TestRetainedCorruptRecordFailsClosed(t *testing.T) {
+	t.Parallel()
 	srv := runJetStreamServerHA(t)
 	sA, addrA, _ := retainedBroker(t, srv.ClientURL(), "node-a")
 
@@ -356,6 +358,7 @@ func TestRetainedCorruptRecordFailsClosed(t *testing.T) {
 // index entry or cached copy left behind would keep serving a value the durable
 // authority has lost — fail-open. The decode failure must evict.
 func TestRetainedCorruptReplacementEvictsCachedPredecessor(t *testing.T) {
+	t.Parallel()
 	srv := runJetStreamServerHA(t)
 	s, addr, lc := retainedBroker(t, srv.ClientURL(), "node-a")
 	asm := retainedASM(t, s)
@@ -394,6 +397,7 @@ func TestRetainedCorruptReplacementEvictsCachedPredecessor(t *testing.T) {
 // would leave the predecessor cached, and a later valid add re-indexes the
 // subject without refreshing the cache, making that predecessor servable again.
 func TestRetainedEvictionClearsCacheWithoutIndexEntry(t *testing.T) {
+	t.Parallel()
 	srv := runJetStreamServerHA(t)
 	s, addr, lc := retainedBroker(t, srv.ClientURL(), "node-a")
 	asm := retainedASM(t, s)
@@ -442,6 +446,7 @@ func TestRetainedEvictionClearsCacheWithoutIndexEntry(t *testing.T) {
 // loss, not the volatile staleness F-059 otherwise leaves. With the delete gone,
 // the same reordering costs only an index entry the next callback restores.
 func TestRetainedDelayedTombstoneKeepsNewerRecord(t *testing.T) {
+	t.Parallel()
 	srv := runJetStreamServerHA(t)
 	release := make(chan struct{})
 	// Every application of race.topic announces itself BEFORE it is applied, and

@@ -57,6 +57,7 @@ func expectNoMsg(t *testing.T, ch <-chan string, within time.Duration) {
 }
 
 func TestProtocolQoS1(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	sub := connectClient(t, broker, "qos1-sub")
 	pub := connectClient(t, broker, "qos1-pub")
@@ -67,6 +68,7 @@ func TestProtocolQoS1(t *testing.T) {
 }
 
 func TestProtocolQoS2(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	sub := connectClient(t, broker, "qos2-sub")
 	pub := connectClient(t, broker, "qos2-pub")
@@ -77,6 +79,7 @@ func TestProtocolQoS2(t *testing.T) {
 }
 
 func TestProtocolRetained(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	pub := connectClient(t, broker, "ret-pub")
 
@@ -96,6 +99,7 @@ func TestProtocolRetained(t *testing.T) {
 }
 
 func TestProtocolWildcards(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	sub := connectClient(t, broker, "wc-sub")
 	pub := connectClient(t, broker, "wc-pub")
@@ -110,6 +114,7 @@ func TestProtocolWildcards(t *testing.T) {
 }
 
 func TestProtocolUnsubscribe(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	sub := connectClient(t, broker, "unsub")
 	pub := connectClient(t, broker, "unsub-pub")
@@ -126,6 +131,7 @@ func TestProtocolUnsubscribe(t *testing.T) {
 }
 
 func TestProtocolMultipleSubscribers(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	pub := connectClient(t, broker, "multi-pub")
 	subA := connectClient(t, broker, "multi-a")
@@ -139,6 +145,7 @@ func TestProtocolMultipleSubscribers(t *testing.T) {
 }
 
 func TestProtocolPersistentSession(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	// Subscriber connects with a persistent session (clean=false) at QoS1, then

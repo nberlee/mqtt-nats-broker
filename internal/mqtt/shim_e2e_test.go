@@ -53,6 +53,7 @@ func connectClient(t *testing.T, broker, id string) pmqtt.Client {
 // NATS/JetStream. This exercises the connection I/O loop, the parser, the
 // session manager, and the routing transport together.
 func TestE2EPubSubQoS0(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	sub := connectClient(t, broker, "subscriber")

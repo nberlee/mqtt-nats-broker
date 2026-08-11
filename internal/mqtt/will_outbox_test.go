@@ -35,6 +35,7 @@ func runSharedReplica(t *testing.T, first *Options) (*Server, *Options) {
 // TestMQTTWillOutboxCrossReplicaHandoff: a delayed Will enqueued on broker A
 // fires from broker B after A is (gracefully) shut down.
 func TestMQTTWillOutboxCrossReplicaHandoff(t *testing.T) {
+	t.Parallel()
 	oA := testMQTTDefaultOptionsV5()
 	sA := testMQTTRunServer(t, oA)
 	sB, oB := runSharedReplica(t, oA)
@@ -66,6 +67,7 @@ func TestMQTTWillOutboxCrossReplicaHandoff(t *testing.T) {
 // TestMQTTWillOutboxReconnectCancelsCrossReplica: reconnecting the client on the
 // OTHER broker before the delay elapses cancels the pending Will everywhere.
 func TestMQTTWillOutboxReconnectCancelsCrossReplica(t *testing.T) {
+	t.Parallel()
 	oA := testMQTTDefaultOptionsV5()
 	sA := testMQTTRunServer(t, oA)
 	defer testMQTTShutdownServer(sA) // shared-NATS owner: LIFO runs this last
@@ -112,6 +114,7 @@ func TestMQTTWillOutboxReconnectCancelsCrossReplica(t *testing.T) {
 // TestMQTTWillOutboxNoDoubleFire: with two replicas both scanning, a delayed
 // Will is delivered exactly once (the pending->publishing CAS dedupes claimants).
 func TestMQTTWillOutboxNoDoubleFire(t *testing.T) {
+	t.Parallel()
 	oA := testMQTTDefaultOptionsV5()
 	sA := testMQTTRunServer(t, oA)
 	defer testMQTTShutdownServer(sA) // shared-NATS owner: LIFO runs this last
@@ -140,6 +143,7 @@ func TestMQTTWillOutboxNoDoubleFire(t *testing.T) {
 // Phase-2 dispatch-stop signal (willClaimStopCh), so the shutdown lifecycle
 // actually completes (shutdownDone closes) instead of hanging on willWorkerWG.
 func TestMQTTWillOutboxShutdownUnblocksBarrier(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s) // NATS cleanup; s.Shutdown is idempotent
@@ -190,6 +194,7 @@ func TestMQTTWillOutboxShutdownUnblocksBarrier(t *testing.T) {
 // failure). Uses an instance-scoped publish seam so the injected failure is
 // isolated to a specific broker, not a package global.
 func TestMQTTWillOutboxPublishFailureRecovery(t *testing.T) {
+	t.Parallel()
 	oA := testMQTTDefaultOptionsV5()
 	sA := testMQTTRunServer(t, oA)
 	sB, oB := runSharedReplica(t, oA)
@@ -266,6 +271,7 @@ func TestMQTTWillOutboxPublishFailureRecovery(t *testing.T) {
 // at-least-once behavior — while N+1, once cancelled, must publish exactly zero
 // times.
 func TestMQTTWillOutboxOverlappingGenerations(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -404,6 +410,7 @@ func TestMQTTWillOutboxOverlappingGenerations(t *testing.T) {
 // with a long delay is nonetheless delivered promptly and leaves no outbox record
 // behind (nothing was ever durably written to fire again).
 func TestMQTTWillOutboxEnqueueExhaustionImmediatePublish(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -457,6 +464,7 @@ func TestMQTTWillOutboxEnqueueExhaustionImmediatePublish(t *testing.T) {
 // so the duplicates come from successive lease-expiry cycles, never from two live
 // claimants racing the same record.
 func TestMQTTWillOutboxAmbiguousPublishDuplicateRecovery(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -522,6 +530,7 @@ func TestMQTTWillOutboxAmbiguousPublishDuplicateRecovery(t *testing.T) {
 // sequence, so publication becomes durably terminal, the native record is then
 // deleted, and the Will is delivered exactly once across a full lease window.
 func TestMQTTWillOutboxTerminalCASRetry(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -570,6 +579,7 @@ func TestMQTTWillOutboxTerminalCASRetry(t *testing.T) {
 // returns an error (ambiguous ack) must be reconciled by re-reading the now-done
 // record and treated as success, never republished.
 func TestMQTTWillOutboxAmbiguousTerminalCAS(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -706,6 +716,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 // would wrongly suppress a legitimate Will (no-loss regression); the DisconnectedAt
 // gate prevents that.
 func TestMQTTWillOutboxNewerDisconnectedRecordFires(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -738,6 +749,7 @@ func TestMQTTWillOutboxNewerDisconnectedRecordFires(t *testing.T) {
 // superseded it. No live origin broker is needed: the durable session record alone
 // drives the suppression.
 func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -783,6 +795,7 @@ func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 // later scan resolves it once the read succeeds. This proves an indeterminate read
 // never risks publishing a suppressed Will nor loses a legitimate one.
 func TestMQTTWillOutboxFenceIndeterminateLoadDefers(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -913,6 +926,7 @@ func TestMQTTWillOutboxEnqueueAckDelayedNoCancelWhilePublishing(t *testing.T) {
 // reached during the test) and the 3s cancellation assertion below times out —
 // which is how this test fails on a broken fence.
 func TestMQTTWillOutboxTakeoverLateEnqueue(t *testing.T) {
+	t.Parallel()
 	oA := testMQTTDefaultOptionsV5()
 	sA := testMQTTRunServer(t, oA)
 	sB, oB := runSharedReplica(t, oA)
@@ -1657,6 +1671,7 @@ func TestMQTTWillOutboxTimerReleasedWhenRecordReaped(t *testing.T) {
 // interleaving is exactly "between scan completion and the sweep" and cannot be
 // staged reliably from the protocol surface.
 func TestMQTTWillTimerSweepExcludesLaterArmings(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1796,6 +1811,7 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 // The reconnect cancel on the CONNECT path stays deliberately unscoped, which the
 // second half asserts: a reconnect supersedes every earlier incarnation.
 func TestMQTTWillOutboxDisplacedCancelIsGenerationScoped(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

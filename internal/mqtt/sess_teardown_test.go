@@ -138,6 +138,7 @@ func testProvisionSession(t *testing.T, env *testTeardownEnv, clientID string) *
 // read as success. B was left with a valid record naming deleted consumers, and on
 // the interest-retained streams their messages went with them.
 func TestSessTeardownLostClaimDeletesNothing(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const clientID = "lostclaim"
 
@@ -316,6 +317,7 @@ func TestSessTeardownLateDeleteIsHarmless(t *testing.T) {
 // entirely (0d, a crashed teardown, which previously leaked until the orphan
 // sweep).
 func TestSessTeardownAdoptedByConnect(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const clientID = "adopted"
 
@@ -394,6 +396,7 @@ func TestSessTeardownAdoptedByConnect(t *testing.T) {
 // re-read sees another owner and the teardown stops — in particular it must not go
 // on to release shared group durables the new owner may hold.
 func TestSessTeardownReleaseIsCAS(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const clientID = "releasecas"
 
@@ -461,6 +464,7 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 // "retry", and fails an ordinary disconnect. A property that holds only by
 // send-queue timing is not a property.
 func TestSessTeardownNoWaitReleaseIsStillClassified(t *testing.T) {
+	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	const clientID = "nowait"
 

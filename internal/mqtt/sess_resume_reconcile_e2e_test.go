@@ -161,6 +161,7 @@ func testReconcileRestart(t *testing.T, s *Server, o *Options) *Server {
 // restored subscription points at a dead deliver subject) and M2 (recreate
 // under the recorded name — the fresh-name assertions fail).
 func TestMQTTReconcileResumeAfterReap(t *testing.T) {
+	t.Parallel()
 	for _, qos := range []byte{1, 2} {
 		t.Run(fmt.Sprintf("qos%d", qos), func(t *testing.T) {
 			o := testMQTTDefaultOptions()
@@ -238,6 +239,7 @@ func TestMQTTReconcileResumeAfterReap(t *testing.T) {
 // the record READBACK names the new durable — which is what pins the repair
 // save (M3: skip the repair save and the readback still names the reaped one).
 func TestMQTTReconcileRecordRestoreAfterReap(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -280,6 +282,7 @@ func TestMQTTReconcileRecordRestoreAfterReap(t *testing.T) {
 // sids (M8: collect only the main sid and the exact-subject delivery stays
 // dead).
 func TestMQTTReconcileMultiLevelCompanion(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -329,6 +332,7 @@ func TestMQTTReconcileMultiLevelCompanion(t *testing.T) {
 // the replacement charged exactly once (M4). Non-default MaxAckPending, so an
 // assertion cannot be satisfied by a default.
 func TestMQTTReconcileChargeAccounting(t *testing.T) {
+	t.Parallel()
 	const cap = 111
 
 	assertCharges := func(t *testing.T, s *Server, cid string, wantDur string, wantAmt int) {
@@ -485,6 +489,7 @@ func TestMQTTReconcileChargeAccounting(t *testing.T) {
 // CONNACK is never persisted — the restore path runs no final subscription
 // save — and the next resume starts from nothing again.
 func TestMQTTReconcileAbsentIdentityMinted(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -545,6 +550,7 @@ func TestMQTTReconcileAbsentIdentityMinted(t *testing.T) {
 // absent forever, so the register classifies Lost and the identifier stays
 // reserved.
 func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -647,6 +653,7 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 // The broker's own consumer_inactive_threshold reaps the durable while the
 // client is away; the next CONNECT repairs it and QoS 1 delivery works.
 func TestMQTTReconcileRealReapBrokerThreshold(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.ConsumerInactiveThreshold = 300 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -675,6 +682,7 @@ func TestMQTTReconcileRealReapBrokerThreshold(t *testing.T) {
 // The stream-forced ConsumerLimits.InactiveThreshold variant: the limit reaches
 // consumers requesting 0, so the broker's own opt-out does not protect them.
 func TestMQTTReconcileRealReapStreamForcedThreshold(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -722,6 +730,7 @@ func TestMQTTReconcileRealReapStreamForcedThreshold(t *testing.T) {
 // same object with its gate opened in place (a processSub re-issue installs a
 // new object and fails the pointer assertion).
 func TestMQTTReconcileSubscribeBeforeCreateAndInPlaceAdoption(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -825,6 +834,7 @@ func TestMQTTReconcileSubscribeBeforeCreateAndInPlaceAdoption(t *testing.T) {
 // dead deliver subject, and the delivery assertion fails — deterministically,
 // because the sleep is inside the hook, not a race.
 func TestMQTTReconcileInterestHeldBeforeLookup(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -899,6 +909,7 @@ func TestMQTTReconcileInterestHeldBeforeLookup(t *testing.T) {
 // reporting for a drain the phase never touched (its sid is not in subs, so it
 // is not collected).
 func TestMQTTReconcileAdoptedDrainRepairedAtNextConnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 500 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -987,6 +998,7 @@ func TestMQTTReconcileAdoptedDrainRepairedAtNextConnect(t *testing.T) {
 // cursor proves what the reaped consumer was owed. This documents the
 // delivery-start policy (a stated residual), it does not fix it.
 func TestMQTTReconcileReapGapNotReplayed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1429,6 +1441,7 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 // next uninjected reconnect resumes and repairs normally. M10 (treat
 // unresolved durables as present and continue) sends a CONNACK here instead.
 func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1891,6 +1904,7 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 // CONNECT: a live re-SUBSCRIBE reaches the exists-branch and never recreates
 // missing interest (a stated residual).
 func TestMQTTReconcileUnadoptedPhaseSubReclaimed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// Comfortably longer than the whole test: nothing here waits on an AckWait
 	// redelivery, and a short one would only add DUP copies of the two backlog
@@ -2064,6 +2078,7 @@ func TestMQTTReconcileForcedLeaveFailureFallback(t *testing.T) {
 // deliberately does not verify those) installs no delivery interest and stays
 // unavailable until a subsequent CONNECT reconciles it.
 func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2145,6 +2160,7 @@ func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
 // Mutation check: drop the restore in abortAcceptedResume and this test fails —
 // the retry reports Session Present 0 and delivers nothing.
 func TestMQTTReconcileRefusedResumeKeepsSessionLifetime(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2307,6 +2323,7 @@ func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
 // Mutation check: skip the save in restoreRefusedResumeLifetime and the
 // restarted broker reports Session Present 0 here.
 func TestMQTTReconcileRefusedResumePersistsRestoredLifetime(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2693,6 +2710,7 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 // Mutation check: disown unconditionally (M27) and the redelivery below arrives
 // with DUP set.
 func TestMQTTReconcileSweptSurvivorStillRecordsDelivery(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// Comfortably longer than the wait inside the verification below, so the
 	// delivery parked on the gate is released by the SWEEP rather than by its own
@@ -2824,6 +2842,7 @@ func TestMQTTReconcileSweptSurvivorStillRecordsDelivery(t *testing.T) {
 // Mutation check: drop the purge beside the charge refund and the marker
 // survives.
 func TestMQTTReconcileRepairPurgesRetiredDurableMarkers(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second // also the phase-gate bound
 	s := testMQTTRunServer(t, o)
@@ -2895,6 +2914,7 @@ func TestMQTTReconcileRepairPurgesRetiredDurableMarkers(t *testing.T) {
 // Mutation check: skip the grant-point save and the record below still carries
 // the old interval.
 func TestMQTTReconcileGrantedResumePersistsRequestedLifetime(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2953,6 +2973,7 @@ func TestMQTTReconcileGrantedResumePersistsRequestedLifetime(t *testing.T) {
 // Mutation check: drop the !sessp assignment at rebind and the session below
 // keeps the old never-expire terms.
 func TestMQTTReconcileClearedSessionTakesRequestedLifetime(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3482,6 +3503,7 @@ func TestMQTTReconcileResolveDefersToAnInFlightConnect(t *testing.T) {
 // Mutation check: gate only when something is already parked (the sampled
 // version) and this test resolves through a held gate.
 func TestMQTTReconcileResolveAlwaysTakesTheGate(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3645,6 +3667,7 @@ func TestMQTTReconcileCloseParksTeardownWhenResolverHoldsGate(t *testing.T) {
 // unconditionally (the action strands on a resolved session, taking the Will
 // with it) — both leave the watcher below empty.
 func TestMQTTReconcileRefusedParkRestoresTheWill(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

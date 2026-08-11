@@ -164,6 +164,7 @@ func testRecordHasNonce(ps *mqttPersistedSession, nonce string) bool {
 // the pending maps and the register all survive the close.
 // Mutation MU3: set disconnectedAt after the save and the record carries 0.
 func TestMQTTDeferredCloseRunsSharedPurge(t *testing.T) {
+	t.Parallel()
 	e := testNewDeferredEnv(t, "client-deferred-purge", "deferred.purge")
 	action := testSurvivingAction()
 
@@ -495,6 +496,7 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 // GENERIC failure on purpose — an old-sequence delete reads "already gone" as success and
 // never reaches the tombstone rung, which is the rung that must abandon on a foreign claim.
 func TestMQTTDeferredCloseFencedByRegisterClaim(t *testing.T) {
+	t.Parallel()
 	const clientID = "client-deferred-stale-claim"
 	e := testNewDeferredEnv(t, clientID, "deferred.claim")
 	_, before := e.loadRegister(t, e.pi)
@@ -1006,6 +1008,7 @@ func TestMQTTVoidVerdictHandoffSkipsBoundSession(t *testing.T) {
 // Mutation MU14: skip the watermark reset in clear() and the reused object's handoff never
 // fires.
 func TestMQTTVoidVerdictHandoffAfterGenerationReuse(t *testing.T) {
+	t.Parallel()
 	e := testNewDeferredEnv(t, "client-handoff-reuse", "handoff.reuse")
 
 	// Burn the watermark in the OLD generation.
@@ -1092,6 +1095,7 @@ func TestMQTTVoidVerdictHandoffYieldsToTheOwnershipGate(t *testing.T) {
 // defensive wiring, and what is testable is the helper's own contract: it triggers for a
 // resident unbound session with a gap, and skips an object no map points at.
 func TestMQTTVoidVerdictHandoffHelperSkipsNonresident(t *testing.T) {
+	t.Parallel()
 	e := testNewDeferredEnv(t, "client-handoff-resident", "handoff.resident")
 
 	e.testStageVerdict(t, "nonce-resident", 107)
@@ -1268,6 +1272,7 @@ func TestMQTTResolveUncertainNowReportsDischargeReArm(t *testing.T) {
 //
 // Mutation MU15: drop the marshal-rev credit in saveWithDetail's success arm.
 func TestMQTTLandedSaveCreditsInheritedVerdicts(t *testing.T) {
+	t.Parallel()
 	e := testNewDeferredEnv(t, "client-credit-inherited", "credit.inherited")
 	e.sess.mu.Lock()
 	e.sess.c = e.c
@@ -1456,6 +1461,7 @@ func TestMQTTContendedSaveCreditsMarshalledVerdicts(t *testing.T) {
 //
 // Mutation MU18: credit the current revision on a raw rollback success.
 func TestMQTTAcceptRollbackDoesNotCreditLateVerdict(t *testing.T) {
+	t.Parallel()
 	e := testNewDeferredEnv(t, "client-rollback-exempt", "rollback.exempt")
 	// Gated for the whole rollback, as CONNECT is: it also keeps the release handoff from
 	// being what persists the late nonce.

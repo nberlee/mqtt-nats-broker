@@ -48,6 +48,7 @@ func newJS(t *testing.T, nc *nats.Conn) (jetstream.JetStream, context.Context) {
 // conformant $MQTT_willcancel, and a second getOrCreate reuses the manager and epoch
 // without a config update.
 func TestSessionManagerEpochResolution(t *testing.T) {
+	t.Parallel()
 	s, c, nc := newBringUpServer(t)
 
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
@@ -85,6 +86,7 @@ func TestSessionManagerEpochResolution(t *testing.T) {
 // verbatim (the create-race-loser path), reuses it without a config update, and
 // leaves unrelated stream metadata untouched.
 func TestSessionManagerEpochCreateRaceAdoptsWinner(t *testing.T) {
+	t.Parallel()
 	s, c, nc := newBringUpServer(t)
 	js, ctx := newJS(t, nc)
 
@@ -131,6 +133,7 @@ func TestSessionManagerEpochCreateRaceAdoptsWinner(t *testing.T) {
 // it from ensureBrokerStream's authoritative re-read rather than its own
 // discarded generated value).
 func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 
 	// Barrier: block until both managers reach the lookup->create boundary, so
@@ -202,6 +205,7 @@ func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
 // and recreating $MQTT_sess through a fresh manager produces a different incarnation
 // epoch, so sequences from the old incarnation are never numerically comparable.
 func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
+	t.Parallel()
 	s1, c1, nc1 := newBringUpServer(t)
 	asm1, err := s1.getOrCreateMQTTAccountSessionManager(c1)
 	if err != nil {
@@ -241,6 +245,7 @@ func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
 // stream without a valid generated epoch fails manager initialization with an
 // actionable recreate error. Covers missing, empty, and malformed metadata.
 func TestSessionManagerEpochMissingFailsInit(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		meta map[string]string
@@ -279,6 +284,7 @@ func TestSessionManagerEpochMissingFailsInit(t *testing.T) {
 // $MQTT_willcancel with an incompatible configuration fails manager initialization
 // with recreate guidance rather than being mutated in place.
 func TestSessionManagerWillCancelStreamValidation(t *testing.T) {
+	t.Parallel()
 	base := func() jetstream.StreamConfig {
 		return jetstream.StreamConfig{
 			Name:              mqttWillCancelStreamName,

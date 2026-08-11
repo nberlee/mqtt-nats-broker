@@ -336,6 +336,7 @@ func testAwaitConnClosed(t *testing.T, b *testBoundConn) {
 // and the displaced incarnation's enqueued delayed Will record stays PENDING,
 // because nothing arbitrated a session continuation (M1, M3, M7).
 func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevfork")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	will := e.plantPendingWill(t)
@@ -371,6 +372,7 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 // before the completion observer (which is what makes this assertion causal
 // rather than a poll against the scan).
 func TestMQTTPersistEvictTakeoverCancelsWill(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevtake")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	will := e.plantPendingWill(t)
@@ -397,6 +399,7 @@ func TestMQTTPersistEvictTakeoverCancelsWill(t *testing.T) {
 // notify). Both verdicts evict silently and cancel the timer; only the Will
 // record's fate differs.
 func TestMQTTPersistEvictResidentUnbound(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		shape func(*testRejectionEnv, *mqttPersistedSession)
@@ -448,6 +451,7 @@ func TestMQTTPersistEvictResidentUnbound(t *testing.T) {
 // AT our acknowledged sequence within a stream epoch, so the session's own
 // record is never a takeover.
 func TestMQTTPersistEvictLicenseTable(t *testing.T) {
+	t.Parallel()
 	type row struct {
 		name string
 		// stage returns the sequence to deliver as the observation.
@@ -543,6 +547,7 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 // spawn-time object (M4) would pass staleness on the removed object's lower
 // sequence and delete the replacement by hash.
 func TestMQTTPersistEvictReplacementObject(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevrepl")
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, true)
@@ -595,6 +600,7 @@ func TestMQTTPersistEvictReplacementObject(t *testing.T) {
 // knowledge is stale and the eviction is refused (M5 — dropping the staleness
 // check evicts a session over its own newer record).
 func TestMQTTPersistEvictStaleAfterLocalSave(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevstale")
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, true)
@@ -633,6 +639,7 @@ func TestMQTTPersistEvictStaleAfterLocalSave(t *testing.T) {
 // fresh observation applies the eviction, which is what pins the refusal on the
 // gate (M10).
 func TestMQTTPersistEvictDefersToHeldGate(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevgate")
 	done := e.armEvictObserver()
 
@@ -684,6 +691,7 @@ func testBoundSubscribe(pi uint16, topic string, opts byte) []byte {
 // design that claimed the gate would refuse it as a packet error and close a
 // live connection.
 func TestMQTTPersistEvictClaimsNothing(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevnoclaim")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	done := e.armEvictObserver()
@@ -788,6 +796,7 @@ func TestMQTTPersistEvictDefersToOpenRecordTx(t *testing.T) {
 // and apply the newer record's verdict — here flipping takeover to forked, which
 // both the vocabulary and the Will record's final state assert (M9).
 func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevfresh")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	will := e.plantPendingWill(t)
@@ -829,6 +838,7 @@ func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
 // concedes 0x8E at the old level and irreversibly cancels a Will that delivered
 // knowledge would have preserved.
 func TestMQTTPersistEvictUnusableLoadFreshTrigger(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevunusable")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	will := e.plantPendingWill(t)
@@ -1020,6 +1030,7 @@ var errMQTTInjectedLostStoreResponse = errors.New("mqtt test: injected lost stor
 // completion fires (M12), and the eviction it applies is computed from
 // knowledge at least as new as every delivered observation.
 func TestMQTTPersistEvictCoalesces(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevcoal")
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, false)
@@ -1057,6 +1068,7 @@ func TestMQTTPersistEvictCoalesces(t *testing.T) {
 // which loops and applies the eviction; clearing the flag without the re-check
 // strands the trigger forever (M13).
 func TestMQTTPersistEvictCleanupHandoff(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevhand")
 	done := e.armEvictObserver()
 
@@ -1107,6 +1119,7 @@ func TestMQTTPersistEvictCleanupHandoff(t *testing.T) {
 // consumed and strands a genuine successor's trigger, leaving the stale client
 // serving indefinitely. The same worker must loop and apply the eviction.
 func TestMQTTPersistEvictBusyExitConsumesOnlyItsTrigger(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevbusycons")
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, false)
@@ -1168,6 +1181,7 @@ func TestMQTTPersistEvictBusyExitConsumesOnlyItsTrigger(t *testing.T) {
 // resident (it takes the no-local branch), and the object is re-added; the
 // cleanup re-check must NOT hand that observation to the worker as a trigger.
 func TestMQTTPersistEvictNoResidentTriggerNotReplayed(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevnoresid")
 	done := e.armEvictObserver()
 
@@ -1223,6 +1237,7 @@ func TestMQTTPersistEvictNoResidentTriggerNotReplayed(t *testing.T) {
 // must not leak is the flag and the counter, so those are asserted instead, and the
 // prune is asserted where it now belongs: after the session leaves the maps.
 func TestMQTTPersistEvictAbnormalExitPreFence(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevgoexit")
 	done := e.armEvictObserver()
 
@@ -1297,6 +1312,7 @@ func TestMQTTPersistEvictAbnormalExitPreFence(t *testing.T) {
 //     reads closed, and both the credited revision and the durable nonce prove
 //     it PERSISTED the gap rather than merely returning.
 func TestMQTTPersistEvictAbnormalExitPostFence(t *testing.T) {
+	t.Parallel()
 	e := testNewEvictEnv(t, "pevpostfence")
 	done := e.armEvictObserver()
 

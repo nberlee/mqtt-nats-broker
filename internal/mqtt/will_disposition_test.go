@@ -124,6 +124,7 @@ func testMQTTWillWitness(t testing.TB, o *Options, id, topic string) (*mqttReade
 // connection closing with a Will and a same-client-ID CONNECT taking its session
 // over. Spec5 [3.1.2.5], [3.14.4], [MQTT-3.1.2-8].
 func TestMQTTWillDispositionRacingTakeover(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -258,6 +259,7 @@ func TestMQTTWillDispositionRacingTakeover(t *testing.T) {
 // still cancel a Will, so an owed-but-delayed Will stays cancellable — and,
 // when nobody reconnects, still gets published exactly once. Spec5 [3.1.2.5].
 func TestMQTTWillDispositionDelayed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -332,6 +334,7 @@ func TestMQTTWillDispositionDelayed(t *testing.T) {
 // turn at the teardown barrier, which is how the test knows classification has
 // happened), and only then is the CONNECT released to make its decision.
 func TestMQTTWillDispositionUsesOwnSessionExpiry(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -436,6 +439,7 @@ func TestMQTTWillDispositionUsesOwnSessionExpiry(t *testing.T) {
 // message is being transmitted for the first time, and NAK'ing it hands the
 // client a duplicate it was never owed.
 func TestMQTTResumeDoesNotNakFreshDelivery(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

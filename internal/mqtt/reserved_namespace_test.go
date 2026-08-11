@@ -47,6 +47,7 @@ var reservedPrefixes = map[string]string{
 // and $MQTT.rmsgs.> every retained message -- so an explicit filter into any of
 // them is a read-side bypass of the client's own subscribe permissions.
 func TestMQTTDenySubscribeToReservedNamespace(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -82,6 +83,7 @@ func TestMQTTDenySubscribeToReservedNamespace(t *testing.T) {
 // $MQTT.msgs.<subject>, so a client allowed to subscribe there would read all of
 // them regardless of its own per-topic permissions.
 func TestMQTTReservedNamespaceNoMessageBypass(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -109,6 +111,7 @@ func TestMQTTReservedNamespaceNoMessageBypass(t *testing.T) {
 // namespace, which is what [MQTT-4.7.2-1] requires and what made the narrow
 // upstream check look unnecessary.
 func TestMQTTWildcardDoesNotReachReserved(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -135,6 +138,7 @@ func TestMQTTWildcardDoesNotReachReserved(t *testing.T) {
 // only v5 can say so. 3.1.1 has no reason codes, so the client sees an ordinary
 // success PUBACK for a message that was thrown away.
 func TestMQTTPublishReservedAckAsymmetry(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -223,6 +227,7 @@ func TestMQTTPublishReservedAckAsymmetry(t *testing.T) {
 // replayed from the outbox over the service connection, where the client's own
 // NATS permissions no longer apply. So the topic is rejected at CONNECT.
 func TestMQTTWillTopicReservedRejected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -300,6 +305,7 @@ func TestMQTTWillTopicReservedRejected(t *testing.T) {
 // unsubscribe each one explicitly or every connect/disconnect cycle leaks
 // interest on the shared connection.
 func TestMQTTInternalSubsReleasedOnClientClose(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

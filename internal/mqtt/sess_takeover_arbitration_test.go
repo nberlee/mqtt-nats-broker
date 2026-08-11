@@ -72,6 +72,7 @@ func testQuietExpirySweeps(t *testing.T) {
 // The positive control comes FIRST and is not decoration: without it, "the second
 // create was rejected" would also be satisfied by a create that can never succeed.
 func TestSessBaseZeroCreateIsConditional(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const cid = "b1cond"
 
@@ -124,6 +125,7 @@ func TestSessBaseZeroCreateIsConditional(t *testing.T) {
 // inside a single leader term. It must now be rejected, and the winner's record must
 // be byte-identical afterwards.
 func TestSessSupersededClaimCannotStompTheWinner(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const cid = "b2stomp"
 
@@ -178,6 +180,7 @@ func TestSessSupersededClaimCannotStompTheWinner(t *testing.T) {
 // over", a claim that somebody legitimately owns the session, when in fact a sibling
 // had erased it and nobody took anything over. It is now {c, a}.
 func TestSessCleanStartForkIsRecognised(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const cid = "b3fork"
 
@@ -255,6 +258,7 @@ func TestSessCleanStartForkIsRecognised(t *testing.T) {
 // descends from when we hold no record at all — so the accessor must prefer wid and
 // fall back, never conflate them.
 func TestSessParentForNextWriteFallsBackToTheReMint(t *testing.T) {
+	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	sess := testFreshSession(a, "b3accessor")
 
@@ -571,6 +575,7 @@ func TestSessSupersededAdoptionIsTerminalForRecordExpiry(t *testing.T) {
 // cycle budget first and then proves the create-retry budget is still FULL — the one
 // shape that discriminates.
 func TestReDriveBudgetsAreIndependent(t *testing.T) {
+	t.Parallel()
 	rd := mqttNewRecordReDrive()
 
 	// Spend all but one cycle. The initial attempt is not a retry, so what is bounded
@@ -745,6 +750,7 @@ func TestSupersededDiscardIsTerminalForTheExpiryCallers(t *testing.T) {
 // The positive assertion comes first, so the negative one after clear() cannot pass
 // against a marker that was never armed.
 func TestRejectionMarkerRepresentsBaseZero(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const cid = "b4marker"
 
@@ -856,6 +862,7 @@ func TestWonClaimDeletesEvenWhenItsReleaseIsSuperseded(t *testing.T) {
 // ackPWID != "" conjunct outright — is already killed by TestSessEmptyParentsAreNotSiblings,
 // so a guard aimed at it would be redundant.
 func TestParentlessForeignRecordStillConcedes(t *testing.T) {
+	t.Parallel()
 	// Acknowledged for a real record with a real parent; the survivor carries neither.
 	parentless := testLineageRecord("gen-other", mqttNewRecordWID(), _EMPTY_)
 	if got := classifyRecordLineage(parentless, "ack-wid", "ack-pwid"); got != mqttLineageNotForked {
@@ -917,6 +924,7 @@ func TestSessAdoptedTeardownCreateParentsFromTheMarker(t *testing.T) {
 // so reading sess.wid there stamps an empty parent and breaks the chain on exactly the
 // path a rolled-back CONNECT takes.
 func TestSessWillCancelRollbackParentsFromTheReMint(t *testing.T) {
+	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	const cid = "b3rollback"
 

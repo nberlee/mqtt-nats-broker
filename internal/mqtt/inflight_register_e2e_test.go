@@ -88,6 +88,7 @@ func testInflightReconnect(t *testing.T, o *Options, clientID string) (net.Conn,
 // Mutation check: skip the recoverInflightRegisters call in mqttProcessConnect, or
 // have it reserve nothing, and the redelivery arrives under identifier 1.
 func TestMQTTInflightQoS1IdentifierSurvivesRestart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// A short AckWait: after a restart the redelivery is driven by AckWait rather
 	// than by a NAK, because a recovered entry has no per-attempt ack subject to NAK
@@ -140,6 +141,7 @@ func TestMQTTInflightQoS1IdentifierSurvivesRestart(t *testing.T) {
 // Mutation check: as above; also, removing the register write from
 // mqttDeliverMsgCbQoS12 leaves nothing to recover and the identifier changes.
 func TestMQTTInflightQoS2IdentifierSurvivesRestartBeforePubRec(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -197,6 +199,7 @@ func TestMQTTInflightQoS2IdentifierSurvivesRestartBeforePubRec(t *testing.T) {
 // recoverInflightRegisters and the fresh QoS 1 delivery below collides with the
 // PUBREL's identifier.
 func TestMQTTInflightPubRelIdentifierReservedAcrossRestart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -277,6 +280,7 @@ func TestMQTTInflightPubRelIdentifierReservedAcrossRestart(t *testing.T) {
 // recoverInflightRegisters (trust the register alone) and the follow-up message never
 // arrives, because the phantom holds the session's only in-flight slot.
 func TestMQTTInflightStaleRegisterLeavesNoPhantomSlot(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -364,6 +368,7 @@ func TestMQTTInflightStaleRegisterLeavesNoPhantomSlot(t *testing.T) {
 // Mutation check: remove the recorrelateSourceLocked call from the unproven-ack branch
 // of mqttProcessPublishReceived and a second PUBLISH arrives below.
 func TestMQTTInflightUnprovenSourceAckSendsNoSecondPublish(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// The DEFAULT AckWait, deliberately long: the retirement is transient by design —
 	// the settling redelivery removes it — so a short AckWait would race every assertion
@@ -478,6 +483,7 @@ func TestMQTTInflightUnprovenSourceAckSendsNoSecondPublish(t *testing.T) {
 // stop routing retired registers in recoverInflightRegisters) and the PUBLISH assertion
 // below fires.
 func TestMQTTInflightRetiredSourceSurvivesRestart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -551,6 +557,7 @@ func TestMQTTInflightRetiredSourceSurvivesRestart(t *testing.T) {
 // Mutation check: ack the PUBREL unconditionally in mqttProcessPubComp (drop the
 // insecure-retirement guard) and the PUBLISH assertion below fires.
 func TestMQTTInflightUnmarkableRetirementKeepsPubRelEvidence(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -662,6 +669,7 @@ func TestMQTTInflightUnmarkableRetirementKeepsPubRelEvidence(t *testing.T) {
 // Mutation check: remove the resolveRetiredSource call from the unproven-acknowledgement
 // branch and both assertions below fail.
 func TestMQTTInflightLandedButUnconfirmedAckLeavesNothing(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -726,6 +734,7 @@ func TestMQTTInflightLandedButUnconfirmedAckLeavesNothing(t *testing.T) {
 // Mutation check: remove the register release from finalizeDrainDelivery and the follow-up
 // message never arrives.
 func TestMQTTInflightDrainedQoS2ReleasesRegister(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -797,6 +806,7 @@ func TestMQTTInflightDrainedQoS2ReleasesRegister(t *testing.T) {
 // A retained-message delivery has no JetStream backing and therefore no register,
 // which is R6's second half. It must not leave one behind, and must not be recovered.
 func TestMQTTInflightRetainedSendNotRegistered(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

@@ -211,6 +211,7 @@ func TestMQTTRejectedRecordContendedKeepsMarker(t *testing.T) {
 // have landed and then vanished on its own, so an absent record means somebody released
 // this session and its state is not ours to rebuild.
 func TestMQTTRejectedRecordGoneIsForeign(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "rejgone")
 	e.dropPersistObservations(t, e.idHash)
 
@@ -695,6 +696,7 @@ func TestMQTTRejectedRecordDeferredDischargeSite(t *testing.T) {
 // already moved, so that save is CAS-rejected and nothing else on this session would ever
 // look again.
 func TestMQTTRejectedRecordPurgeSaveSite(t *testing.T) {
+	t.Parallel()
 	d := testNewDeferredEnv(t, "rejpurgesite", "rej/purgesite")
 	e := &testRejectionEnv{testInflightEnv: d.testInflightEnv, clientID: "rejpurgesite", idHash: d.sess.idHash}
 	e.sess.mu.Lock()
@@ -733,6 +735,7 @@ func TestMQTTRejectedRecordPurgeSaveSite(t *testing.T) {
 // long before that, and the expiry entry must not be left armed against an object that
 // has since been evicted.
 func TestMQTTRejectedRecordFiniteCloseSite(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "rejfinite")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
@@ -854,6 +857,7 @@ func TestMQTTRejectedRecordCloseStampsDisconnect(t *testing.T) {
 // inside or a few instructions outside the transaction is NOT observable here — the
 // busy-fence arm stamps either way — and is not claimed; see the mutation report.
 func TestMQTTRejectedRecordStampNeedsTheFence(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "rejstampfence")
 	e.bind(t)
 	e.sess.mu.Lock()
@@ -916,16 +920,21 @@ func TestMQTTRejectedRecordBusyFenceStampBindsTheProbe(t *testing.T) {
 	rejected := make(chan struct{})
 	release := make(chan struct{})
 	released := make(chan struct{})
+	// The suppression seam is installed and restored on THIS goroutine, not inside
+	// the holder below. It is a process-global, and a write that happens on a
+	// goroutine can outlive the test that launched it — landing while the parallel
+	// tests that read these globals are running. Installing before the holder
+	// starts and restoring after <-rejected keeps the same ordering the holder
+	// needs, with the write bounded by the test body.
+	stop := testForceContendedRejection(t, e.sess)
 	go func() {
 		defer close(released)
 		// A holder whose own save is REJECTED at the unchanged base: the record does not
 		// move, and the marker is armed centrally.
-		stop := testForceContendedRejection(t, e.sess)
 		tok := e.sess.beginRecordTx()
 		if err := e.sess.save(tok); err == nil {
 			t.Error("the holder's save must be rejected")
 		}
-		stop()
 		close(rejected)
 		<-release
 		if err := e.sess.endRecordTx(tok); err != nil {
@@ -933,6 +942,9 @@ func TestMQTTRejectedRecordBusyFenceStampBindsTheProbe(t *testing.T) {
 		}
 	}()
 	<-rejected
+	// Restored before the close path runs, exactly as when this lived inside the
+	// holder: the close's own save must not be suppressed.
+	stop()
 
 	// The close runs with the fence still held by that holder.
 	e.s.mqttHandleClosedClient(e.c)
@@ -1099,6 +1111,7 @@ func TestMQTTRejectedRecordNoBackstopUnlessOurs(t *testing.T) {
 // guard, and an empty pair concedes at every arm, so the verdicts here are the
 // pre-lineage ones by construction. The lineage rule has its own tests.
 func TestMQTTRejectedProbeClassifierRefusal(t *testing.T) {
+	t.Parallel()
 	record := &StoredMsg{Sequence: 42}
 	refused := mqttSessSaveDetail{} // the shape an entry refusal returns
 	if v := classifyRejectedProbe(saveDefinitelyFailed, refused, record, nil, _EMPTY_, _EMPTY_); v != mqttRejectionKeep {
@@ -1136,6 +1149,7 @@ func TestMQTTRejectedProbeClassifierRefusal(t *testing.T) {
 // from opposite sides: without arming nothing is ever disposed; without the probe a
 // rejection alone would dispose.
 func TestMQTTRejectedRecordNotificationDropped(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "rejdrop")
 	dropped := e.dropPersistObservations(t, e.idHash)
 
@@ -1176,6 +1190,7 @@ func TestMQTTRejectedRecordNotificationDropped(t *testing.T) {
 // pass run at all. Without it the test above could not tell "settled by the new
 // mechanism" from "the notification would have done it anyway".
 func TestMQTTRejectedRecordNotificationDelivered(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "rejdeliver")
 	e.remoteTakeover(t, "node2", "rejdeliver")
 
@@ -1196,6 +1211,7 @@ func TestMQTTRejectedRecordNotificationDelivered(t *testing.T) {
 // the dropped-notification tests make about "nothing else evicts this session" would
 // silently become a claim about the whole manager.
 func TestMQTTRejectedRecordPersistDropIsScoped(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "rejscoped")
 	dropped := e.dropPersistObservations(t, e.idHash)
 
@@ -1583,6 +1599,7 @@ func (e *testRejectionEnv) deliveryBarrier(t *testing.T, sub *nats.Subscription,
 // account session manager moves the subject, a real save is CAS-rejected by the stream,
 // and the persist notification that would otherwise evict the object is dropped.
 func TestMQTTBoundRejectionForeignStopsPublish(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		proto byte
@@ -1882,6 +1899,7 @@ func TestMQTTBoundRejectionGatesPerPacket(t *testing.T) {
 // gated because it is what BOUNDS convergence: a conformant client sends one within its
 // keepalive, so an otherwise silent displaced connection still closes.
 func TestMQTTBoundRejectionGatesPingReq(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "boundping")
 	e.dropPersistObservations(t, e.idHash)
 	b := e.bindSocket(t, mqttProtoLevel5)
@@ -2129,6 +2147,7 @@ func TestMQTTBoundRejectionGateRefused(t *testing.T) {
 // leaves BEFORE its close lands, using the production halves of that tail, and owns the
 // window.
 func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
+	t.Parallel()
 	t.Run("after the eviction completed", func(t *testing.T) {
 		e := testNewRejectionEnv(t, "bounddisplaced")
 		b := e.bindSocket(t, mqttProtoLevel5)
@@ -2328,6 +2347,7 @@ func TestMQTTBoundRejectionKeepSuspendedInWindow(t *testing.T) {
 // the foreign arm returns nil from mid-parse, so a same-buffer remainder is discarded
 // whichever way the tail closes, and would discriminate nothing.
 func TestMQTTBoundRejectionNoReentryAfterForeign(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "boundnoreentry")
 	e.dropPersistObservations(t, e.idHash)
 

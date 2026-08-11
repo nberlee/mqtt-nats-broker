@@ -272,6 +272,7 @@ func (b *testQ2AffBroker) unsubscribe(t *testing.T, c net.Conn, r *mqttReader, p
 // the other member. It must now wait for the client it was started to, and
 // complete with that client when it returns.
 func TestQ2AffineStartedDeliveryStaysWithChosenMember(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "stay")
 	ca, ra := b.member(t, "stayA", 300)
 	cb, rb := b.member(t, "stayB", 300)
@@ -338,6 +339,7 @@ func TestQ2AffineStartedDeliveryStaysWithChosenMember(t *testing.T) {
 // client a completed exchange. This is the case releaseSharedConsumer used to
 // break by dropping pending state without acking.
 func TestQ2AffineUnsubscribeMidWindowKeepsDelivery(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "unsub")
 	ca, ra := b.member(t, "unsubA", 300)
 	defer ca.Close()
@@ -375,6 +377,7 @@ func TestQ2AffineUnsubscribeMidWindowKeepsDelivery(t *testing.T) {
 // member is not. A discarded session's claim must go terminal, and the message
 // must not reappear anywhere.
 func TestQ2AffineSessionEndDiscardsRatherThanRedistributes(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "discard")
 	// Expiry 0 on BOTH members: whichever one the group chooses, closing it ENDS
 	// its session rather than suspending it, so the test never depends on which
@@ -428,6 +431,7 @@ func TestQ2AffineSessionEndDiscardsRatherThanRedistributes(t *testing.T) {
 // recovery to see a `claimed` claim with no copy — which it resolves by creating
 // a SECOND copy. So: no PUBLISH until the claim durably says materialized.
 func TestQ2AffineDeliveryGatedOnMaterializedClaim(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "gate")
 	ca, ra := b.member(t, "gateA", 300)
 	defer ca.Close()
@@ -476,6 +480,7 @@ func TestQ2AffineDeliveryGatedOnMaterializedClaim(t *testing.T) {
 // BEHALF — onto the winner's own durable — and releases the group delivery. The
 // message then waits at the winner, not in the group's queue.
 func TestQ2AffineAbsentWinnerMaterializedOnBehalf(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "onbehalf")
 	ca, ra := b.member(t, "obA", 300)
 	cb, rb := b.member(t, "obB", 300)
@@ -580,6 +585,7 @@ func testQ2AffLiveSourceSeq(t *testing.T, b *testQ2AffBroker, topic string) uint
 // redelivery elect a fresh winner, which is the central violation reached through
 // the discard side-door.
 func TestQ2AffineReapRequiresBothSidesProven(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "reap")
 	ca, _ := b.member(t, "reapA", 300)
 	defer ca.Close()
@@ -667,6 +673,7 @@ func TestQ2AffineReapRequiresBothSidesProven(t *testing.T) {
 // source ack it just confirmed. Asserted at the CAS layer, because the reap that
 // follows a discard in clear() would otherwise remove the evidence.
 func TestQ2AffineDiscardPreservesProvenSourceAck(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "preserve")
 	ca, _ := b.member(t, "presA", 300)
 	defer ca.Close()
@@ -766,6 +773,7 @@ func TestQ2AffineProvisioningRollsBackOnSaveFailure(t *testing.T) {
 // tmaxack without bound until shared QoS 2 subscribes started failing against
 // mqttMaxAckTotalLimit — with nothing having changed but the reconnect count.
 func TestQ2AffineResumeDoesNotRechargeAckBudget(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "charge")
 	ca, _ := b.member(t, "chargeA", 300)
 	b.bind(t, "chargeA")
@@ -797,6 +805,7 @@ func TestQ2AffineResumeDoesNotRechargeAckBudget(t *testing.T) {
 // would make every later shared QoS 2 subscribe on the reused object fail with
 // "session is terminating".
 func TestQ2AffineClearLeavesSessionReusable(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "reuse")
 	ca, _ := b.member(t, "reuseA", 300)
 	defer ca.Close()
@@ -836,6 +845,7 @@ func TestQ2AffineClearLeavesSessionReusable(t *testing.T) {
 // cannot account for may still hold an in-flight PUBLISH, and re-provisioning
 // over it would strand or delete that message.
 func TestQ2AffineUnaccountableConsumerFailsClosed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -965,6 +975,7 @@ func testQ2AffAssertUnwound(t *testing.T, b *testQ2AffBroker, sess *mqttSession,
 // indefinitely, so its source delivery would stall forever with nothing left able
 // to complete it.
 func TestQ2AffineUnreadableClaimFailsScanClosed(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "corrupt")
 	ca, _ := b.member(t, "corruptA", 300)
 	defer ca.Close()
@@ -1007,6 +1018,7 @@ func TestQ2AffineUnreadableClaimFailsScanClosed(t *testing.T) {
 // it, but never reaped, so the durable evidence of an undelivered QoS 2 message
 // survives.
 func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "lostcons")
 	ca, ra := b.member(t, "lostA", 300)
 	b.bind(t, "lostA")
@@ -1093,6 +1105,7 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 // unconfirmed source ack cannot be produced from the wire, since the broker acks
 // the group delivery as soon as the claim materializes.
 func TestQ2AffineContenderCannotReapALostDelivery(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "contreap")
 	ca, ra := b.member(t, "contA", 300)
 	b.bind(t, "contA")
@@ -1201,6 +1214,7 @@ func TestQ2AffineContenderCannotReapALostDelivery(t *testing.T) {
 // it cannot redeliver, and the source is already acked so no contender looks at
 // it. Skipping AffineDone claims in recovery leaked those forever.
 func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "unreaped")
 	ca, _ := b.member(t, "unreapA", 300)
 	b.bind(t, "unreapA")
@@ -1330,6 +1344,7 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 // path that has seen nothing at all, so it fails against any per-broker
 // continuity signal.
 func TestQ2AffineLossSurvivesConsumerRecreateAndHandoff(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "handoff")
 	ca, ra := b.member(t, "hoA", 300)
 	defer ca.Close()
@@ -1388,6 +1403,7 @@ func TestQ2AffineLossSurvivesConsumerRecreateAndHandoff(t *testing.T) {
 // ordinary inference would fire and leave a record claiming both that the message
 // was delivered and that it was lost.
 func TestQ2AffineLostClaimIsNotRevisited(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "lostonce")
 	ca, _ := b.member(t, "lostoA", 300)
 	defer ca.Close()
@@ -1482,6 +1498,7 @@ func TestQ2AffinePerFilterFailureLeavesNoProvisioning(t *testing.T) {
 // already seen is correct protocol behavior (the short AckWait here makes it
 // likely) and says nothing about ordering.
 func TestQ2AffineOrderingPreserved(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "order")
 	ca, ra := b.member(t, "orderA", 300)
 	defer ca.Close()
@@ -1526,6 +1543,7 @@ func TestQ2AffineOrderingPreserved(t *testing.T) {
 // group's copy would be silently dropped and its member would never receive the
 // message at all.
 func TestQ2AffineTwoGroupsGetIndependentAssignments(t *testing.T) {
+	t.Parallel()
 	b := testQ2AffSetup(t, "two")
 	c1, r1 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "grp1", cleanStart: true}, b.o.MQTT.Host, b.o.MQTT.Port)
 	defer c1.Close()
@@ -1561,6 +1579,7 @@ func TestQ2AffineTwoGroupsGetIndependentAssignments(t *testing.T) {
 // stalls, rather than reopens, an assignment. Still worth pinning: a dropped
 // Winner or Gen WOULD reopen it.
 func TestQ2AffClaimRecordRoundTrip(t *testing.T) {
+	t.Parallel()
 	in := &mqttQ2AffClaim{
 		Winner: "abc", Gen: mqttNewQ2AffGen(), GroupDurable: "$MQTT_SHARED_x", SourceSeq: 99,
 		ClaimHash: "0123456789abcdef", CopySubject: "$MQTT.out.q2.abc.g.h", AffDurable: "$MQTT_Q2AFF_abc_g",

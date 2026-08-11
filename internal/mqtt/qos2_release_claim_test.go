@@ -112,6 +112,7 @@ func (e *testRelClaimEnv) holdPresent(t *testing.T, holdSubject string) bool {
 // against an occupied subject succeed, the discard and the releaser could both
 // believe they won and the serialization would be silently gone.
 func TestQoS2RelClaimCreateOnlyCASIsExclusive(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "cas-exclusive")
 	holdSubject, _ := e.hold(t, 1, nuid.Next(), "payload")
 	claimSubject := mqttQoS2ClaimSubjectFor(holdSubject)
@@ -157,6 +158,7 @@ func TestQoS2RelClaimCreateOnlyCASIsExclusive(t *testing.T) {
 // it purges the proof a late releaser must lose against. The suffix is a property of
 // the name itself and survives all of that.
 func TestQoS2ClaimSubjectNaming(t *testing.T) {
+	t.Parallel()
 	const idHash = "HASH"
 	gen := nuid.Next()
 
@@ -210,6 +212,7 @@ func TestQoS2ClaimSubjectNaming(t *testing.T) {
 // is one a real fault could produce, and admitting any of them would let a claim
 // be attributed to an exchange that does not own it.
 func TestQoS2RelClaimIdentityValidation(t *testing.T) {
+	t.Parallel()
 	gen := nuid.Next()
 	for _, tc := range []struct {
 		name  string
@@ -262,6 +265,7 @@ func TestQoS2RelClaimIdentityValidation(t *testing.T) {
 // check anywhere, because the only predicate a range check could live in is the
 // readability one it has to stay out of.
 func TestQoS2RelClaimAtAndOrigin(t *testing.T) {
+	t.Parallel()
 	before := time.Now().Unix()
 	for _, c := range []*mqttQoS2RelClaim{
 		mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "node1"),
@@ -321,6 +325,7 @@ func TestQoS2RelClaimAtAndOrigin(t *testing.T) {
 // hold before delivering, so the client retries forever with the hold never
 // released.
 func TestQoS2ClaimRecordMaxBoundsEveryRealClaim(t *testing.T) {
+	t.Parallel()
 	bound := mqttQoS2ClaimRecordMax()
 	for _, tc := range []struct {
 		name  string
@@ -356,6 +361,7 @@ func TestQoS2ClaimRecordMaxBoundsEveryRealClaim(t *testing.T) {
 // Every row is a state a real race produces, and the two that answer the client
 // (Discarded, Unreadable) must never be confused with the two that proceed.
 func TestQoS2ClaimVerdicts(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		// setup writes whatever already occupies the claim subject.
@@ -441,6 +447,7 @@ func TestQoS2ClaimVerdicts(t *testing.T) {
 // answers the client nor deletes anything: an omitted case must cost a retry, not a
 // message.
 func TestQoS2ClaimIndeterminateIsNonMutating(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "claim-indeterminate")
 	gen := nuid.Next()
 	holdSubject, holdSeq := e.hold(t, 1, gen, "payload")
@@ -479,6 +486,7 @@ func TestQoS2ClaimIndeterminateIsNonMutating(t *testing.T) {
 // packet identifier as proof of its own completion and answer 0x00 for a message
 // it never delivered.
 func TestQoS2VerifyHoldForRelease(t *testing.T) {
+	t.Parallel()
 	ourGen := nuid.Next()
 	for _, tc := range []struct {
 		name string
@@ -601,6 +609,7 @@ func TestQoS2VerifyHoldForRelease(t *testing.T) {
 // cannot name the wrong state — the failure mode qos2_move.go's own String()
 // default would have had if a state were added to it.
 func TestQoS2ReleaseStatusStringsAreDistinct(t *testing.T) {
+	t.Parallel()
 	claims := []mqttQoS2ClaimStatus{
 		mqttQoS2ClaimClaimed, mqttQoS2ClaimAlreadyClaimed, mqttQoS2ClaimDiscarded,
 		mqttQoS2ClaimUnreadable, mqttQoS2ClaimIndeterminate,
@@ -630,6 +639,7 @@ func TestQoS2ReleaseStatusStringsAreDistinct(t *testing.T) {
 // TestQoS2DiscardArbitration pins the discard half: it competes for each release
 // claim and destroys only what it won.
 func TestQoS2DiscardArbitration(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		setup     func(t *testing.T, e *testRelClaimEnv, holdSubject string)
@@ -709,6 +719,7 @@ func TestQoS2DiscardArbitration(t *testing.T) {
 // claim could read the hold record's absence as proof the exchange completed and
 // answer 0x00 for a message the discard destroyed.
 func TestQoS2DiscardClaimsBeforePurging(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "order")
 	holdSubject, _ := e.hold(t, 1, nuid.Next(), "payload")
 
@@ -748,6 +759,7 @@ func TestQoS2DiscardClaimsBeforePurging(t *testing.T) {
 // disconnect — which is the whole reason the claim lives on a sibling subject
 // rather than inside the hold record.
 func TestQoS2DiscardReadsNoPayloads(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "no-payloads")
 	const n = 5
 	for pi := uint16(1); pi <= n; pi++ {
@@ -781,6 +793,7 @@ func TestQoS2DiscardReadsNoPayloads(t *testing.T) {
 // identifier: that would re-expose the later exchange to the stalled-loader
 // fan-out this whole register exists to stop.
 func TestQoS2ClaimReapsTargetExactSequence(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "reap-sequence")
 	holdSubject, _ := e.hold(t, 1, nuid.Next(), "payload")
 
@@ -814,6 +827,7 @@ func TestQoS2ClaimReapsTargetExactSequence(t *testing.T) {
 // reap it — including through the unarbitrated filter purges, which must not name
 // this incarnation's own generation.
 func TestQoS2DiscardLeavesClaimsForTheSweep(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "sweep")
 	holdSubject, _ := e.hold(t, 1, nuid.Next(), "payload")
 
@@ -833,6 +847,7 @@ func TestQoS2DiscardLeavesClaimsForTheSweep(t *testing.T) {
 // leaves the payload alone. Destroying it would turn this spec deviation into
 // silent loss: it is what a crashed releaser's retry delivers.
 func TestQoS2ClearPreservesAClaimedHold(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "claimed-hold")
 	holdSubject, _ := e.hold(t, 1, nuid.Next(), "payload")
 	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "peer"))
@@ -855,6 +870,7 @@ func TestQoS2ClearPreservesAClaimedHold(t *testing.T) {
 // broker finishes inside the budget, the discard sees the claim vanish and leaves
 // nothing behind.
 func TestQoS2ClearWaitsOutACompletingRelease(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "wait-out")
 	holdSubject, _ := e.hold(t, 1, nuid.Next(), "payload")
 	claimSeq := e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "peer"))
@@ -885,6 +901,7 @@ func TestQoS2ClearWaitsOutACompletingRelease(t *testing.T) {
 // the fence afterwards, because two callers reuse the session object as a fresh
 // session.
 func TestQoS2ReleaseFenceRefusesDuringDiscard(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "fence")
 
 	if !e.sess.beginQoS2ReleaseOp() {
@@ -943,6 +960,7 @@ func TestQoS2ReleaseFenceRefusesDuringDiscard(t *testing.T) {
 // fails — as does every name and filter downstream, which would then be built from
 // nothing.
 func TestQoS2GenerationlessSessionIsRejected(t *testing.T) {
+	t.Parallel()
 	if _, err := mqttSessGenFromRecord(_EMPTY_); err == nil {
 		t.Fatal("a record with no incarnation generation must be rejected, not resumed on hash-only names")
 	}
@@ -975,6 +993,7 @@ func TestQoS2GenerationlessSessionIsRejected(t *testing.T) {
 // Two holds under one incarnation, one claimed and one not, is what makes this
 // detectable: any wildcard purge over this generation would take both.
 func TestQoS2DiscardRunsNoBlindPurge(t *testing.T) {
+	t.Parallel()
 	e := testNewRelClaimEnv(t, "no-blind-purge")
 	claimed, _ := e.hold(t, 1, nuid.Next(), "claimed-payload")
 	unclaimed, _ := e.hold(t, 2, nuid.Next(), "unclaimed-payload")

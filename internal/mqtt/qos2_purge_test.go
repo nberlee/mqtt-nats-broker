@@ -23,6 +23,7 @@ import (
 // test_flow_control2 force-disconnects "myclientid" with reason 147 (see
 // docs/CONFORMANCE.md).
 func TestSessionClearPurgesQoS2Hold(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 
 	s := &Server{

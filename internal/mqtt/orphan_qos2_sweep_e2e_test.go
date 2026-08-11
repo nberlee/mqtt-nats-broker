@@ -93,6 +93,7 @@ func testOrphanHoldPresent(t *testing.T, asm *mqttAccountSessionManager, subject
 // sweep is that it reaches state somebody still owns. Matching on the client-ID hash
 // instead of the (hash, generation) pair fails this test.
 func TestOrphanSweepRetiresRetiredGenerationAndSparesLive(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "orphan-e2e")
 	asm := b.asm
 	testOrphanSetGraces(t, asm, 0, 0)
@@ -242,6 +243,7 @@ func TestOrphanSweepSharedSourceHonorsDiscardedAssignment(t *testing.T) {
 // it held. Every affine name is generation-scoped precisely so that only the
 // retired generation's copies go with it.
 func TestOrphanSweepConsumerDeleteDropsOnlyRetiredGeneration(t *testing.T) {
+	t.Parallel()
 	c := testNewJetStreamCluster(t, 3)
 	b := c.startBroker(t, 0)
 	asm := testMQTTGetGlobalASM(t, b.s)
@@ -614,6 +616,7 @@ func TestOrphanSweepLateClaimFromAnotherBrokerRetainsTheConsumer(t *testing.T) {
 // orphan is gone, nothing live was touched, and neither sweeper reported a state it
 // could not reconcile.
 func TestOrphanSweepTwoSweepersConverge(t *testing.T) {
+	t.Parallel()
 	c := testNewJetStreamCluster(t, 3)
 	bA := c.startBroker(t, 0)
 	bB := c.startBroker(t, 1)

@@ -19,6 +19,7 @@ import (
 // rewrite must also be idempotent, because newRequestExMulti and the purge/
 // delete helpers each call it on subjects that may already be prefixed.
 func TestPrefixDomain(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, domain, subject, want string
 	}{
@@ -75,6 +76,7 @@ func serveJSDomain(t *testing.T, nc *nats.Conn, domain string) func() int {
 // since a mismatch between the two would store sessions under a namespace the
 // broker cannot query back.
 func TestJSDomainResolution(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, jsDomain, wantDomainTk string
 	}{
@@ -132,6 +134,7 @@ func TestJSDomainResolution(t *testing.T) {
 // because the strip removes the whole header either way. This one can, and is
 // the regression guard for the broker advertising its node id as a NATS cluster.
 func TestJSARequestHeaderClaimsNoCluster(t *testing.T) {
+	t.Parallel()
 	hdr := mqttJSARequestHeader("$G")
 
 	// The header block is "NATS/1.0\r\n" + MIME headers + CRLF CRLF.
@@ -166,6 +169,7 @@ func TestJSARequestHeaderClaimsNoCluster(t *testing.T) {
 // with no standing to assert anything through it. This guards the strip in
 // processInboundClientMsg, not the ClientInfo contents.
 func TestJSAPIRequestsCarryNoClientInfo(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 
 	var (

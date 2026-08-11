@@ -12,6 +12,7 @@ import (
 // cosmetic mismatch: it makes headerLen wrong (a corrupt stored copy) and the
 // admission budget wrong (an unwritable copy admitted at PUBREC).
 func TestQ2AffineEncoderMatchesSizeCalculator(t *testing.T) {
+	t.Parallel()
 	base := func() *mqttQ2AffineEnvelope {
 		return &mqttQ2AffineEnvelope{
 			natsSubject:  "foo.bar",
@@ -68,6 +69,7 @@ func TestQ2AffineEncoderMatchesSizeCalculator(t *testing.T) {
 // inbound move protocol's Nats-Msg-Id, which would make the copies of one
 // $MQTT_msgs message moved into two different groups dedup each other away.
 func TestQ2AffineRecordCarriesOnlyItsOwnIdentity(t *testing.T) {
+	t.Parallel()
 	env := &mqttQ2AffineEnvelope{
 		natsSubject:  "foo.bar",
 		msg:          []byte("payload"),
@@ -127,6 +129,7 @@ func TestQ2AffineRecordCarriesOnlyItsOwnIdentity(t *testing.T) {
 // optimization (see the file header), but a key that collided across groups
 // would turn that optimization into silent loss for the second group.
 func TestQ2AffMsgIdNamespacing(t *testing.T) {
+	t.Parallel()
 	a := mqttQ2AffMsgId("$MQTT_SHARED_aaa", 10)
 	b := mqttQ2AffMsgId("$MQTT_SHARED_bbb", 10)
 	c := mqttQ2AffMsgId("$MQTT_SHARED_aaa", 11)
@@ -149,6 +152,7 @@ func TestQ2AffMsgIdNamespacing(t *testing.T) {
 // session of the same client ID would inherit the previous generation's subject,
 // durable and deliver subject.
 func TestQ2AffineNamesAreGenerationScopedAndClaimSpecific(t *testing.T) {
+	t.Parallel()
 	const idHash = "abcdef0123456789"
 	g1, g2 := mqttNewQ2AffGen(), mqttNewQ2AffGen()
 	if g1 == g2 {
@@ -185,6 +189,7 @@ func TestQ2AffineNamesAreGenerationScopedAndClaimSpecific(t *testing.T) {
 // consumer still holding an in-flight PUBLISH; re-provisioning over it would
 // strand or delete that message.
 func TestValidateQ2AffineNames(t *testing.T) {
+	t.Parallel()
 	const idHash = "abcdef0123456789"
 	gen := mqttNewQ2AffGen()
 	filter, deliver, durable := mqttQ2AffineNames(idHash, gen)
@@ -225,6 +230,7 @@ func TestValidateQ2AffineNames(t *testing.T) {
 // its group ack was in fact unconfirmed, and the source redelivery would elect a
 // fresh winner — the central violation, through the discard side-door.
 func TestQ2AffClaimTransitionsPreserveProvenFacts(t *testing.T) {
+	t.Parallel()
 	prev := &mqttQ2AffClaim{Phase: mqttQ2AffMaterialized, SourceAcked: true}
 
 	discard := &mqttQ2AffClaim{Phase: mqttQ2AffClaimed, Discarded: true}
@@ -284,6 +290,7 @@ func TestQ2AffClaimTransitionsPreserveProvenFacts(t *testing.T) {
 // deleting the claim in that window would strand the copy with nothing left able
 // to authorize or dispose of it.
 func TestQ2AffClaimReapRule(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		claim      mqttQ2AffClaim
@@ -323,6 +330,7 @@ func TestQ2AffClaimReapRule(t *testing.T) {
 // positive row for the exact configuration the create path produces, so the
 // validator cannot reject its own output.
 func TestValidateQoS2AssignStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:       mqttQoS2AssignStreamName,
@@ -388,6 +396,7 @@ func TestValidateQoS2AssignStream(t *testing.T) {
 // DenyDelete/DenyPurge are deliberately NOT prerequisites — a positive row
 // asserts that, so a future copy-paste from the claim validator is caught.
 func TestValidateOutStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:      mqttOutStreamName,
@@ -474,6 +483,7 @@ func TestValidateOutStream(t *testing.T) {
 // its Subscription Identifier and Retain As Published option) exists, which is
 // why those are budgeted at their maximum rather than at their actual value.
 func TestQ2AffineFormMaxBoundsEveryRealRecord(t *testing.T) {
+	t.Parallel()
 	payload := bytes.Repeat([]byte("x"), 512)
 	subj, err := mqttTopicToNATSPubSubject([]byte("shared/topic/deep"))
 	if err != nil {

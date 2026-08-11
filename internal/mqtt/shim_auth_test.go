@@ -75,6 +75,7 @@ func tryConnect(broker, id, user, pass string) error {
 // TestAuthPassthroughAccept verifies a client with valid NATS credentials
 // connects successfully.
 func TestAuthPassthroughAccept(t *testing.T) {
+	t.Parallel()
 	broker := startAuthBroker(t)
 	if err := tryConnect(broker, "good", "alice", "pw"); err != nil {
 		t.Fatalf("expected accept for valid creds, got: %v", err)
@@ -84,6 +85,7 @@ func TestAuthPassthroughAccept(t *testing.T) {
 // TestAuthPassthroughReject verifies a client with invalid NATS credentials is
 // rejected (the per-client NATS dial fails, so CONNECT is not authorized).
 func TestAuthPassthroughReject(t *testing.T) {
+	t.Parallel()
 	broker := startAuthBroker(t)
 	if err := tryConnect(broker, "bad", "alice", "wrong-password"); err == nil {
 		t.Fatal("expected connect rejection for invalid creds, got success")
@@ -110,6 +112,7 @@ func authClient(t *testing.T, broker, id string) pmqtt.Client {
 // connection — i.e. the closeConnection subscription cleanup is correct in both
 // connection modes.
 func TestAuthPassthroughStoredDelivery(t *testing.T) {
+	t.Parallel()
 	broker := startAuthBroker(t)
 
 	pub := authClient(t, broker, "auth-ret-pub")

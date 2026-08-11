@@ -204,6 +204,7 @@ func testMQTTResidentSession(t testing.TB, s *Server, clientID string) *mqttSess
 // session then stored PUBRELs that were silently dropped and never delivered a
 // PUBREL again, for the life of that session.
 func TestMQTTPubRelConsumerIsVerifiedOnResume(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -359,6 +360,7 @@ func TestMQTTStoredPubRelIsCorrelated(t *testing.T) {
 // Regression: the resume path asked "does this session hold a drain?" before
 // making the PUBREL path ready. A session carrying only PUBRELs answered no.
 func TestMQTTStoredPubRelIsDeliveredWithoutSubscriptionOrDrain(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// The stored PUBREL is redelivered by AckWait after the resume, so keep the
 	// window short enough to test in.

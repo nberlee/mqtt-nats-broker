@@ -56,6 +56,7 @@ func testMutateSibling(ps *mqttPersistedSession) {
 // stops the fix from being a blanket downgrade — a legitimate takeover must still be
 // reported as one (M5, M2b).
 func TestSessRejectionProbeClassifiesLineage(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
@@ -97,6 +98,7 @@ func TestSessRejectionProbeClassifiesLineage(t *testing.T) {
 // mechanism this item refuses to add. The arm exists so the classifier has ONE meaning at
 // every call site, not because the distinction is visible here.
 func TestSessForkedUnboundDisposesOrdinarily(t *testing.T) {
+	t.Parallel()
 	e := testNewForkEnv(t, "rejfork-unbound")
 	testLandSibling(t, e.testInflightEnv, testMutateSibling)
 	e.rejectSave(t, e.sess)
@@ -129,6 +131,7 @@ func TestSessForkedUnboundDisposesOrdinarily(t *testing.T) {
 // Copying the foreign arm's shape — which calls mqttDiscardWillOnTakeover and disposes —
 // would silently suppress a Will nothing arbitrated (M6).
 func TestSessForkedBoundIsUnsettledNotDisposed(t *testing.T) {
+	t.Parallel()
 	e := testNewForkEnv(t, "rejfork-bound")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	testLandSibling(t, e.testInflightEnv, testMutateSibling)
@@ -157,6 +160,7 @@ func TestSessForkedBoundIsUnsettledNotDisposed(t *testing.T) {
 // TestSessForkedBoundPacketAnswers0x89 drives the same settlement through the real
 // per-packet gate and reads the wire, which is where the reason byte is decided (M7).
 func TestSessForkedBoundPacketAnswers0x89(t *testing.T) {
+	t.Parallel()
 	e := testNewForkEnv(t, "rejfork-wire")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	testLandSibling(t, e.testInflightEnv, testMutateSibling)
@@ -399,6 +403,7 @@ func TestSessUncertaintyResolutionAdoptsLineage(t *testing.T) {
 // forked/not-forked, dropping the gate misreports the record as forked while still
 // adopting nothing. The VERDICT is the only thing that catches it.
 func TestSessLowerSequenceSiblingIsReportedForeign(t *testing.T) {
+	t.Parallel()
 	const (
 		ourGen  = "gen-ours"
 		ackWID  = "a"
@@ -553,6 +558,7 @@ func testCurrentRecordSeq(t *testing.T, e *testInflightEnv) uint64 {
 // failure that did not happen. The EXACT result and the absence of that warning are what
 // discriminate.
 func TestSessForkedRollbackReportsForkedAndKeepsTheTimer(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
@@ -625,6 +631,7 @@ func TestSessForkedRollbackReportsForkedAndKeepsTheTimer(t *testing.T) {
 // publication can actually be observed on the wire. This test deliberately claims only
 // what it checks.
 func TestSessForkedWithALiveCompetingOwnerIsStillUnsettled(t *testing.T) {
+	t.Parallel()
 	const cid = "forklive"
 	e := testNewRejectionEnv(t, cid)
 	e.dropPersistObservations(t, e.idHash)

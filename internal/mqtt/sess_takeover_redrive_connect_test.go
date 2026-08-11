@@ -1100,6 +1100,7 @@ func TestReDriveT1ExhaustionLeavesNothingResident(t *testing.T) {
 // its indeterminate arm. The CONNECT must fail (nothing may be resumed on an
 // unclassifiable record) AND the old connection must be closed rather than left serving.
 func TestFailedTeardownDetachesTheOldClient(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

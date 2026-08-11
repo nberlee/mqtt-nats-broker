@@ -14,6 +14,7 @@ import (
 // forever (nothing will ever fill its ack subject) and the delivery's PUBLISH
 // tracking was gone, so it could neither be redelivered nor acknowledged.
 func TestPubRelStoreFailureRollsBack(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{
 		id:             "rollback",
 		pendingPublish: map[uint16]*mqttPending{},
@@ -71,6 +72,7 @@ func TestPubRelStoreFailureRollsBack(t *testing.T) {
 // tracking (leaking the identifier and leaving nothing for PUBCOMP to ack) and
 // reinstate stale PUBLISH tracking for an exchange that has already moved on.
 func TestPubRelRollbackIsConditional(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{
 		id:             "ambiguous",
 		pendingPublish: map[uint16]*mqttPending{},
@@ -119,6 +121,7 @@ func TestPubRelRollbackIsConditional(t *testing.T) {
 // charged (only the create path charges). Tearing one down therefore refunded a
 // charge that was never made, inflating the account's remaining budget.
 func TestConsumerChargeAccounting(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "charge"}
 
 	// A consumer this process created.

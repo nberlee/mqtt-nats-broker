@@ -68,6 +68,7 @@ func startDenyReservedBroker(t *testing.T) (broker, natsURL string) {
 // connection, NATS would deny them -- deny is evaluated before allow, so they
 // could not be carved out -- and QoS 2 delivery would silently stop.
 func TestReservedDenyACLIsDeployable(t *testing.T) {
+	t.Parallel()
 	broker, _ := startDenyReservedBroker(t)
 
 	got := make(chan pmqtt.Message, 4)
@@ -153,6 +154,7 @@ func v5AuthClient(t *testing.T, brokerTCP, id string, onPub func(paho.PublishRec
 // the Paho suite's shared-subscription test publishes at QoS 0, which never
 // touches the $MQTT.qsub.* delivery path at all.
 func TestReservedDenyACLSharedSubscription(t *testing.T) {
+	t.Parallel()
 	broker, _ := startDenyReservedBroker(t)
 
 	got := make(chan string, 8)
@@ -191,6 +193,7 @@ func TestReservedDenyACLSharedSubscription(t *testing.T) {
 // Only the account ACL stops it -- and that ACL is only deployable because of
 // the separation the test above proves.
 func TestReservedDenyACLBindsDirectNATSClients(t *testing.T) {
+	t.Parallel()
 	_, natsURL := startDenyReservedBroker(t)
 
 	nc, err := nats.Connect(natsURL, nats.UserInfo("alice", "pw"))

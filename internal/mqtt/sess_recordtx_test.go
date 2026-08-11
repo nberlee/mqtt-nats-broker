@@ -44,6 +44,7 @@ func testSessRecordTx(t testing.TB, sess *mqttSession, fn func(tok recordTx) err
 // persist state another transaction had staged and was about to roll back — the
 // mutations happen before save(), so serializing the stores alone never fixed it.
 func TestRecordTxRequiresAnOpenTransaction(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 	s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "node1"}
 	s.running.Store(true)
@@ -85,6 +86,7 @@ func TestRecordTxRequiresAnOpenTransaction(t *testing.T) {
 // Go has no goroutine identity, so ownership cannot be inferred from "a fence is
 // open" — a callee that observed one would otherwise assume it was its own.
 func TestRecordTxTokenIdentity(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "identity"}
 
 	first := sess.beginRecordTx()
@@ -133,6 +135,7 @@ func TestRecordTxTokenIdentity(t *testing.T) {
 // writer stored with no CAS header at all and RECREATED a terminated session's
 // record.
 func TestRecordTxGenerationBinding(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "generation"}
 
 	stale := sess.beginRecordTx()
@@ -178,6 +181,7 @@ func TestRecordTxGenerationBinding(t *testing.T) {
 // retryable — and, crucially, it cannot observe or persist a half-applied
 // readLoop transaction.
 func TestRecordTxTryBeginNeverWaits(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "trybegin"}
 
 	held := sess.beginRecordTx()
@@ -627,6 +631,7 @@ func TestRecordTxAbnormalWithdrawalPrecedesTheUnlock(t *testing.T) {
 // enormous against the holders it competes with, which do nothing but validate a
 // token.
 func TestRecordTxBlockingAcquisitionBoundedUnderTryStorm(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "bounded-under-storm"}
 	const (
 		stormers     = 8
@@ -787,6 +792,7 @@ func TestRecordTxWithdrawGuardHookGoexitStillCleansUp(t *testing.T) {
 // -race and asserts that transactions never interleave: at most one is open at a
 // time, and every one of them is the transaction its own token names.
 func TestRecordTxSerializesWriters(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "concurrent"}
 
 	var (

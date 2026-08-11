@@ -42,6 +42,7 @@ func v5Client(t *testing.T, brokerTCP, id string, onPub func(paho.PublishReceive
 
 // TestV5Connect verifies a genuine MQTT 5.0 CONNECT is accepted (v5 always-on).
 func TestV5Connect(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	v5Client(t, broker, "v5-connect", nil)
 }
@@ -49,6 +50,7 @@ func TestV5Connect(t *testing.T) {
 // TestV5PubSub drives a real MQTT 5.0 SUBSCRIBE/PUBLISH round trip, including a
 // v5 User Property carried on the publish.
 func TestV5PubSub(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	got := make(chan *paho.Publish, 1)
@@ -98,6 +100,7 @@ func TestV5PubSub(t *testing.T) {
 // delivered promptly rather than waiting out AckWait. Each iteration uses a
 // fresh topic so a new consumer (and deliver-subject subscription) is created.
 func TestV5SubscribeThenImmediatePublish(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	got := make(chan *paho.Publish, 16)
@@ -144,6 +147,7 @@ func TestV5SubscribeThenImmediatePublish(t *testing.T) {
 // merely delayed. The barrier makes the store wait out in-flight SUBSCRIBEs,
 // so a publish processed after SUBSCRIBE processing has begun must arrive.
 func TestV5PublishRacingSubscribe(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	got := make(chan *paho.Publish, 16)

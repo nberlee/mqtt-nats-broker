@@ -189,6 +189,7 @@ func TestMQTTExpiryReparksTheRefusedDiscardAtTheFence(t *testing.T) {
 //
 // Mutation MU-E: return a plain error from the entry refusal and the recovery is skipped.
 func TestMQTTExpiryReparksTheRefusedDiscardAtClearEntry(t *testing.T) {
+	t.Parallel()
 	e, disconnectedAt := testExpiringEnv(t, "client-expiry-entry", "expiry.entry")
 	testMarkUncertain(e.sess, e.sess.seq, []byte(`{"competing":"ambiguous"}`))
 
@@ -438,6 +439,7 @@ func TestMQTTExpiryReEntryLeavesTheParkedDiscardUntouched(t *testing.T) {
 // residency while the discard the caller actually owed is silently dropped. The residency
 // assertion is what discriminates it.
 func TestMQTTExpiryDeclinesRecoveryForAnyOtherParkedShape(t *testing.T) {
+	t.Parallel()
 	shapes := map[string]*mqttDeferredDisconnect{
 		"a surviving lifetime": {
 			disconnectedAt: time.Now().Unix() - 600,
@@ -488,6 +490,7 @@ func TestMQTTExpiryDeclinesRecoveryForAnyOtherParkedShape(t *testing.T) {
 //
 // Mutation MU-I: remove the isSeqUncertain() guard from the superseded decision.
 func TestMQTTExpiryDoesNotEvictOnALandedAmbiguousWrite(t *testing.T) {
+	t.Parallel()
 	e, disconnectedAt := testExpiringEnv(t, "client-expiry-landed", "expiry.landed")
 
 	e.sess.mu.Lock()

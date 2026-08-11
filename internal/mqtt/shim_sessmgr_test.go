@@ -15,6 +15,7 @@ import (
 // processJSAPIReplies. Success means the MQTT streams actually exist in
 // JetStream, created by the ported code over nats.go.
 func TestSessionManagerBringUp(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 
 	s := &Server{

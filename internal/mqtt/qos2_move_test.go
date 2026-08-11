@@ -37,6 +37,7 @@ import (
 // junk would be admitted into the identity space and compared against real
 // generations. Mirrors the mqttValidSessEpoch rules.
 func TestQoS2GenValidation(t *testing.T) {
+	t.Parallel()
 	real := nuid.Next()
 	for _, tc := range []struct {
 		name string
@@ -99,6 +100,7 @@ func TestQoS2GenValidation(t *testing.T) {
 // corrupt, NOT delivered: the terminal branch would otherwise answer PUBCOMP 0x00
 // for a record it cannot identify, claiming a delivery it cannot prove happened.
 func TestQoS2CorruptDoneMarkerIsCorruptNotDone(t *testing.T) {
+	t.Parallel()
 	gen := nuid.Next()
 	for _, tc := range []struct {
 		name string
@@ -174,6 +176,7 @@ func TestQoS2CorruptDoneMarkerIsCorruptNotDone(t *testing.T) {
 // succeeds, the commit is rejected for size, and every PUBREL retry repeats the
 // delivery forever.
 func TestQoS2TerminalRecordBoundMatchesEncoder(t *testing.T) {
+	t.Parallel()
 	bound := mqttQoS2TerminalRecordMax()
 	seqs := []uint64{0, 1, 9, 10, math.MaxUint64}
 	for p := uint64(10); p < math.MaxUint64/10; p *= 10 {
@@ -198,6 +201,7 @@ func TestQoS2TerminalRecordBoundMatchesEncoder(t *testing.T) {
 // The header bounds used by the preflight must not be smaller than what the
 // encoders emit, for the same reason.
 func TestQoS2HeaderBoundsMatchEncoders(t *testing.T) {
+	t.Parallel()
 	gen := nuid.Next()
 	pp := &mqttPublish{topic: []byte("b"), subject: []byte("b"), msg: []byte("x"), sz: 1}
 
@@ -231,6 +235,7 @@ func TestQoS2HeaderBoundsMatchEncoders(t *testing.T) {
 // The encoder and the sizer must agree byte-for-byte with the new headers in
 // play, or headerLen is wrong and the stored message is corrupt.
 func TestQoS2EncoderSizeMatchesComputed(t *testing.T) {
+	t.Parallel()
 	gen := nuid.Next()
 	pp := &mqttPublish{topic: []byte("a/b"), subject: []byte("a.b"), msg: []byte("payload"), sz: 7}
 	for _, tc := range []struct {
@@ -260,6 +265,7 @@ func TestQoS2EncoderSizeMatchesComputed(t *testing.T) {
 // the sequence I expected". Classifying anything else as a CAS rejection would
 // turn a real store failure into a silent retry.
 func TestQoS2CASRejectionClassification(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -291,6 +297,7 @@ func TestQoS2CASRejectionClassification(t *testing.T) {
 // would be circular: it is the call sites that could regress to logging
 // rec.stored.Data, and a helper-only test stays green while they do.
 func TestQoS2CorruptLoggingOmitsPayload(t *testing.T) {
+	t.Parallel()
 	const secret = "SUPERSECRETPAYLOAD"
 	// Long enough that a raw dump would also be a very large log line, which is the
 	// second half of why the raw record must never be logged.
@@ -416,6 +423,7 @@ func TestQoS2CorruptLoggingOmitsPayload(t *testing.T) {
 // positive row for the exact configuration the create path produces, so the
 // validator cannot reject its own output.
 func TestValidateQoS2InStream(t *testing.T) {
+	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name:       mqttQoS2IncomingMsgsStreamName,
@@ -492,6 +500,7 @@ func TestValidateQoS2InStream(t *testing.T) {
 // still running the plain hold store would overwrite held records instead of
 // getting its duplicate rejection.
 func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 
 	s := &Server{
@@ -704,6 +713,7 @@ func (b *testQoS2Broker) consumeOne(t *testing.T, payload string) {
 // that as superseded, mutate nothing, and answer 0x92 — and the replacement must
 // still be deliverable afterwards.
 func TestQoS2FinalizeDoesNotMutateNewGeneration(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "supersede")
 	pi := uint16(21)
 	subject := b.holdSubject(t, pi)
@@ -780,6 +790,7 @@ func TestQoS2FinalizeDoesNotMutateNewGeneration(t *testing.T) {
 // the onward store already succeeded, so the exchange is complete and the client
 // is answered 0x00.
 func TestQoS2FinalizeGoneAfterPurge(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "gone")
 	pi := uint16(22)
 	subject := b.holdSubject(t, pi)
@@ -873,6 +884,7 @@ func TestQoS2PubRelDoneRecordAnsweredWithoutRedelivery(t *testing.T) {
 // a payload that was never stored means the following PUBREL finds a tombstone,
 // answers 0x00, and the payload is gone.
 func TestQoS2NewPublishReapsLeftoverDoneRecord(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "leftover")
 	pi := uint16(24)
 	subject := b.holdSubject(t, pi)
@@ -1009,6 +1021,7 @@ func TestQoS2CorruptRecordDoesNotSwallowFreshPublish(t *testing.T) {
 // headers branch, which presupposes a valid generation and is covered separately
 // below.
 func TestQoS2PubRelCorruptRecordReports92(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "corruptrel")
 	pi := uint16(26)
 	subject := b.holdSubject(t, pi)
@@ -1033,6 +1046,7 @@ func TestQoS2PubRelCorruptRecordReports92(t *testing.T) {
 // is released and answered 0x92 — but it is not corrupt, and conflating the two
 // would leave this branch untested (which is what happened in an earlier draft).
 func TestQoS2PubRelMalformedPublishHeaderReports92(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "malformed")
 	pi := uint16(27)
 	subject := b.holdSubject(t, pi)
@@ -1222,6 +1236,7 @@ func TestQoS2PubRelStoreFailureSuppressesPubComp(t *testing.T) {
 // Nats-Msg-Id, so the QoS 2 subscriber still receives exactly one message while a
 // QoS 0 subscriber receives two. This test IS residuals 1 and 2.
 func TestQoS2PubRelFinalizeFailureRedeliversOnce(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "finfail")
 	pi := uint16(30)
 
@@ -1352,6 +1367,7 @@ func TestQoS2MsgIdStableAcrossRetries(t *testing.T) {
 // A DUP PUBLISH reaches PUBREC through the CAS-rejection + re-read path, and the
 // message is delivered exactly once.
 func TestQoS2DupPublishReadsHeldRecord(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "duppath")
 	pi := uint16(32)
 	subject := b.holdSubject(t, pi)
@@ -1486,6 +1502,7 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 // validateMsgsStream deliberately waives Duplicates, and this is the only
 // test that would notice the default disappearing.
 func TestQoS2MsgsStreamHasDuplicateWindow(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "dupwin")
 	si, err := b.jsa.lookupStream(mqttStreamName)
 	if err != nil || si == nil {

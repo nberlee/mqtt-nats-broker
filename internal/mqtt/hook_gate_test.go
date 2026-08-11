@@ -76,9 +76,11 @@ func (g *testHookGate) leave() { g.mu.Unlock() }
 // Without the gate the closure runs against a completed *testing.T and the binary
 // panics, so this test does not merely assert a boolean — removing the enter/leave
 // pair takes the whole run down with it.
+// Deliberately NOT parallel: it installs the process-global clear-window hook,
+// so it would fire on any session a test running beside it happened to clear.
+// TestParallelTestsTouchNoProcessGlobalState is what keeps that from being
+// forgotten — it caught this test.
 func TestHookGateSilencesAHookAfterItsTestCompleted(t *testing.T) {
-	t.Parallel()
-
 	var fired int
 	var restore func()
 

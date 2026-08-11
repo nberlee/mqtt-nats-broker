@@ -63,6 +63,7 @@ func jsRawStreamConfig(t *testing.T, nc *nats.Conn, name string) *StreamConfig {
 // creation-time normalization (MaxConsumers/MaxMsgSize 0 -> -1, the default
 // duplicate window).
 func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
+	t.Parallel()
 	s, c, _ := newBringUpServer(t)
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
 	if err != nil {
@@ -94,6 +95,7 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 // field; the sess subtest also proves the documented recovery (recreate, then
 // initialization succeeds).
 func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		cfg     func() *StreamConfig
@@ -240,6 +242,7 @@ func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {
 // winner path) and the spec-table test, this pins mutation 12's NameExist
 // branch end to end.
 func TestSessCreateRaceLoserValidatesWinnersStream(t *testing.T) {
+	t.Parallel()
 	s, c, nc := newBringUpServer(t)
 
 	atGate := make(chan struct{})
@@ -295,6 +298,7 @@ func TestSessCreateRaceLoserValidatesWinnersStream(t *testing.T) {
 // must SUCCEED (on a default, MQTT 5-accepting broker the same streams are a
 // startup failure; the field-coverage audit pins that side).
 func TestV4OnlyBrokerAcceptsTTLlessStreams(t *testing.T) {
+	t.Parallel()
 	s, c, nc := newBringUpServer(t)
 	s.opts.MQTT.MaxProtocolVersion = mqttProtoLevel
 

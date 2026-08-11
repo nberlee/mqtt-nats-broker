@@ -55,6 +55,7 @@ func testQoS2ExpectNoDelivery(t *testing.T, b *testQoS2Broker) {
 // Mutation: remove the claim (or let a lost claim proceed) and the witness receives
 // the message.
 func TestQoS2ReleaseDiscardedMidClaimDeliversNothing(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-discard")
 	pi := uint16(31)
 	holdSubject := b.holdSubject(t, pi)
@@ -115,6 +116,7 @@ func TestQoS2ReleaseDiscardedMidClaimDeliversNothing(t *testing.T) {
 // Mutation: drop the re-read (or accept its Gone/Delivered rows without checking
 // the generation) and the witness receives the message twice.
 func TestQoS2ReleaseStalledLoaderDeliversNothing(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-stalled")
 	pi := uint16(32)
 	holdSubject := b.holdSubject(t, pi)
@@ -160,6 +162,7 @@ func TestQoS2ReleaseStalledLoaderDeliversNothing(t *testing.T) {
 // generation must proceed rather than treat the claim as a conflict — otherwise a
 // PUBREL retry after any failure could never complete.
 func TestQoS2ReleaseAdoptsItsOwnClaimAcrossRetries(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-adopt")
 	pi := uint16(33)
 	holdSubject := b.holdSubject(t, pi)
@@ -202,6 +205,7 @@ func TestQoS2ReleaseAdoptsItsOwnClaimAcrossRetries(t *testing.T) {
 // must not block the current one forever. It is reaped with a confirmed delete and
 // the claim is retried.
 func TestQoS2ReleaseForeignClaimIsReapedAndRetried(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-foreign")
 	pi := uint16(34)
 	holdSubject := b.holdSubject(t, pi)
@@ -229,6 +233,7 @@ func TestQoS2ReleaseForeignClaimIsReapedAndRetried(t *testing.T) {
 // The hold record itself is released with a confirmed delete before the client is
 // answered, because a PUBCOMP frees the packet identifier (invariant 3).
 func TestQoS2ReleaseUnreadableClaimAnswersGoneAndKeepsTheRecord(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-unreadable")
 	pi := uint16(35)
 	holdSubject := b.holdSubject(t, pi)
@@ -261,6 +266,7 @@ func TestQoS2ReleaseUnreadableClaimAnswersGoneAndKeepsTheRecord(t *testing.T) {
 // hold record is intact, and the client retries against session state that is
 // still whole. MQTT 5 has no PUBCOMP reason for "the broker failed".
 func TestQoS2ReleaseIndeterminateClaimSuppressesPubComp(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-indeterminate")
 	pi := uint16(36)
 	holdSubject := b.holdSubject(t, pi)
@@ -301,6 +307,7 @@ func TestQoS2ReleaseIndeterminateClaimSuppressesPubComp(t *testing.T) {
 // last of which ages the Message Expiry Interval — stay exactly as the original
 // PUBLISH left them.
 func TestQoS2DupPublishWhileClaimedStillAnswersPubRec(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-dup")
 	pi := uint16(37)
 	holdSubject := b.holdSubject(t, pi)
@@ -347,6 +354,7 @@ func TestQoS2DupPublishWhileClaimedStillAnswersPubRec(t *testing.T) {
 // Mutation: remove the gate from mqttProcessPubRel and the message is delivered
 // after the session was discarded.
 func TestQoS2ClearRefusesReleaseOnTheSameBroker(t *testing.T) {
+	t.Parallel()
 	b := testQoS2Setup(t, "relclaim-fence")
 	pi := uint16(38)
 

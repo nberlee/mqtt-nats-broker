@@ -18,6 +18,7 @@ import (
 // TestMQTTShutdownV5SendsDisconnect verifies a connected MQTT 5.0 client receives
 // a server DISCONNECT with reason 0x8B before the socket is closed.
 func TestMQTTShutdownV5SendsDisconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -51,6 +52,7 @@ func TestMQTTShutdownV5SendsDisconnect(t *testing.T) {
 // TestMQTTShutdownV311CleanClose verifies a 3.1.1 client gets a clean socket
 // close and NO server DISCONNECT (3.1.1 has no server-initiated DISCONNECT).
 func TestMQTTShutdownV311CleanClose(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -67,6 +69,7 @@ func TestMQTTShutdownV311CleanClose(t *testing.T) {
 // TestMQTTShutdownPostDialRefused verifies that once Shutdown has completed the
 // listener is closed and a fresh dial is refused (not accepted without CONNACK).
 func TestMQTTShutdownPostDialRefused(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	addr := net.JoinHostPort(o.MQTT.Host, strconv.Itoa(o.MQTT.Port))
@@ -85,6 +88,7 @@ func TestMQTTShutdownPostDialRefused(t *testing.T) {
 // client stops reading: the bounded write deadline lets Shutdown complete well
 // within shutdownDrainTimeout rather than blocking on the wedged socket.
 func TestMQTTShutdownBoundedWithStuckReader(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

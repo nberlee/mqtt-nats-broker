@@ -53,6 +53,7 @@ func testBoundE2EMoveRecord(t *testing.T, s *Server, node, clientID string) {
 // the persist notification lost, must be told and closed BEFORE its next packet takes
 // effect — [MQTT-3.1.4-3] — and its Will must go the way a takeover's does.
 func TestMQTTBoundRejectionE2EForeignClosesConnection(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

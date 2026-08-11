@@ -35,6 +35,7 @@ func runNATS(t *testing.T) (*natsserver.Server, *nats.Conn) {
 // delivery callback with the header/payload split msgParts expects. This is the
 // plumbing the mqttJSA request/reply cycle rides on.
 func TestTransportPubSub(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 	s := &Server{nrc: nc, opts: &Options{}}
 	c := &client{srv: s, nrc: nc, acc: s.globalAccount()}
@@ -112,6 +113,7 @@ func TestTransportPubSub(t *testing.T) {
 
 // TestTransportUnsub verifies processUnsub stops delivery.
 func TestTransportUnsub(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 	s := &Server{nrc: nc, opts: &Options{}}
 	c := &client{srv: s, nrc: nc, acc: s.globalAccount()}

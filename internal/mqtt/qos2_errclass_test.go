@@ -36,6 +36,7 @@ import (
 // The rows are kept as classifier coverage, deliberately, not as a claim about
 // which path constructs them.
 func TestQoS2JSErrClassifier(t *testing.T) {
+	t.Parallel()
 	storeFailed := func(cause error) error {
 		return natsserver.NewJSStreamStoreFailedError(cause)
 	}
@@ -124,6 +125,7 @@ func TestQoS2JSErrClassifier(t *testing.T) {
 // still `held`, which is the duplicate signal. It must still produce a PUBREC,
 // and the message must be delivered onward exactly once on PUBREL.
 func TestQoS2DupPublishStoresOnce(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -358,6 +360,7 @@ func testQoS2PubRelFailureSuppressesPubComp(t *testing.T, name string,
 // "not found" and keeps reporting 0x92 — the classification must not turn an
 // absent hold entry into a connection drop.
 func TestQoS2PubRelUnknownPIStillAnswered(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

@@ -32,6 +32,7 @@ func testLineageRecord(gen, wid, pwid string) *mqttPersistedSession {
 // that is not a proven sibling must come back not-forked — that is the concession the
 // change promises, and it is what keeps this a pure narrowing of an existing verdict.
 func TestSessLineageRuleArms(t *testing.T) {
+	t.Parallel()
 	const (
 		ourGen  = "gen-ours"
 		ackWID  = "a"
@@ -96,6 +97,7 @@ func TestSessLineageRuleArms(t *testing.T) {
 // the JSON carries, so a hand-edited or future-broker record can. Without the guard, every
 // survivor with parent p becomes a sibling of a record that has no identity of its own.
 func TestSessAbsentAcknowledgedWIDIsNotASiblingBase(t *testing.T) {
+	t.Parallel()
 	got := classifyRecordLineage(testLineageRecord("g", "b", "p"), _EMPTY_, "p")
 	if got != mqttLineageNotForked {
 		t.Fatalf("an acknowledged pair with no identity of its own is no sibling base: got %v", got)
@@ -106,6 +108,7 @@ func TestSessAbsentAcknowledgedWIDIsNotASiblingBase(t *testing.T) {
 // FIRST CREATES both carry an empty parent, and without the guard they read as siblings of
 // each other.
 func TestSessEmptyParentsAreNotSiblings(t *testing.T) {
+	t.Parallel()
 	got := classifyRecordLineage(testLineageRecord("g", "b", _EMPTY_), "a", _EMPTY_)
 	if got != mqttLineageNotForked {
 		t.Fatalf("two empty parents are not a shared ancestry: got %v", got)
@@ -117,6 +120,7 @@ func TestSessEmptyParentsAreNotSiblings(t *testing.T) {
 // this change existed. A regression guard, with no paired mutation — several guards
 // already cover the individual conjuncts, and this pins that they compose.
 func TestSessTwoAbsentWIDsAreNotForked(t *testing.T) {
+	t.Parallel()
 	got := classifyRecordLineage(testLineageRecord("g", _EMPTY_, _EMPTY_), _EMPTY_, _EMPTY_)
 	if got != mqttLineageNotForked {
 		t.Fatalf("a record written before lineage existed must concede: got %v", got)
@@ -136,6 +140,7 @@ func TestSessTwoAbsentWIDsAreNotForked(t *testing.T) {
 // why asserting on a marker cannot discriminate — two earlier revisions of this test
 // paired M17 with the teardown test and it passed against the broken code both times.
 func TestSessBuilderDoesNotMintLineage(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "builder-lineage")
 	e.sess.mu.Lock()
 	ps := e.sess.buildPersistedSessionLocked()
@@ -149,6 +154,7 @@ func TestSessBuilderDoesNotMintLineage(t *testing.T) {
 // identity, parents it to the record the session was acknowledged for, and adopts the pair
 // only once the write is CONFIRMED.
 func TestSessSaveStampsAndAdoptsLineage(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "save-lineage")
 
 	if err := testSessSave(t, e.sess); err != nil {
@@ -190,6 +196,7 @@ func TestSessSaveStampsAndAdoptsLineage(t *testing.T) {
 // record's identity, and that the save's own identity is freshly minted, because the
 // parent assertion alone does not pin the mint.
 func TestSessRestoreAdoptsLoadedLineage(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "restore-lineage")
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("seed the record: %v", err)
@@ -225,6 +232,7 @@ func TestSessRestoreAdoptsLoadedLineage(t *testing.T) {
 // have a mutation: reusing the snapshot's identity makes the marker indistinguishable from
 // its own parent, and resetting sess.wid before the capture leaves the parent empty.
 func TestSessTeardownClaimParentsTheLoadedRecord(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "teardown-lineage")
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("seed the record: %v", err)
@@ -264,6 +272,7 @@ func TestSessTeardownClaimParentsTheLoadedRecord(t *testing.T) {
 // is gone the session must hold no parent pointer at it, or a REUSED object's first write
 // would claim descent from a record that no longer exists.
 func TestSessClearZeroesLineageAfterCapture(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "clear-lineage")
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("seed the record: %v", err)
@@ -286,6 +295,7 @@ func TestSessClearZeroesLineageAfterCapture(t *testing.T) {
 // compares against intact. Re-stamping the identity on the way out would change the bytes
 // and make the original landing unrecognisable as ours.
 func TestSessExactByteResendKeepsIdentity(t *testing.T) {
+	t.Parallel()
 	e := testNewInflightEnv(t, "resend-lineage")
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("seed the record: %v", err)
@@ -402,6 +412,7 @@ func testLandSuccessor(t *testing.T, e *testInflightEnv, mutate func(*mqttPersis
 // parent ITSELF, which is indistinguishable from a first create and silently ends the
 // chain.
 func TestSessRawWritersStampLineage(t *testing.T) {
+	t.Parallel()
 	t.Run("the expiry sweep's disconnect stamp", func(t *testing.T) {
 		e := testNewInflightEnv(t, "sweep-lineage")
 		e.sess.mu.Lock()

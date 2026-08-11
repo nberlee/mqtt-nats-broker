@@ -55,6 +55,7 @@ func testE2ELandSibling(t *testing.T, sess *mqttSession) {
 // That Will assertion is the sharpest difference from the takeover path, where the same
 // fixture suppresses it, and it is deliberately the opposite of what the foreign arm does.
 func TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -305,6 +306,7 @@ func testE2ELandCompetingWrite(t *testing.T, sess *mqttSession, idHash string) {
 // what stops it from being an untested claim. A change that suppresses the Will here must
 // update this test and that document together.
 func TestMQTTForkedRecordE2EWithALiveCompetingOwnerPublishesTheWill(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

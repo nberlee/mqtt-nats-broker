@@ -108,6 +108,7 @@ func drainRegistered(sess *mqttSession, durable string) bool {
 // identifier pending and the exchange could never complete — a silently abandoned
 // QoS 2 message rather than a reported loss.
 func TestDrainRecoveryKeepsIntentBearingClaim(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "drain-intent")
 
 	// Neither durable exists as a consumer, so both lookups say "gone".
@@ -138,6 +139,7 @@ func TestDrainRecoveryKeepsIntentBearingClaim(t *testing.T) {
 // from a drain the past-PUBREC barrier could not resolve. Its PUBREL state is
 // unknown, so nothing about it may be pruned — the next resume retries.
 func TestDrainRecoverySkipsUnresolvedDurables(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "drain-skip")
 
 	d := addTestDrain(sess, "sid", "dur-unresolved", "foo", 2, map[uint64]*drainSeq{
@@ -191,6 +193,7 @@ func TestDrainRecoveryUndoesAFailedSave(t *testing.T) {
 //
 // Regression: recoverDrains mutated under sess.mu and only then opened the fence.
 func TestDrainRecoveryOpensTheFenceBeforeMutating(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "drain-fence")
 
 	d := addTestDrain(sess, "sid", "dur-gone", "foo", 1, map[uint64]*drainSeq{
@@ -240,6 +243,7 @@ func TestDrainRecoveryOpensTheFenceBeforeMutating(t *testing.T) {
 // It also pins the BLOCKING fence form: the intent is written from the read loop,
 // where refusing on contention would turn a busy fence into a dropped connection.
 func TestDrainPubRelIntentOpensTheFenceBeforeMutating(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "drain-intent-fence")
 
 	d := addTestDrain(sess, "sid", "dur-intent", "foo", 2, map[uint64]*drainSeq{
@@ -301,6 +305,7 @@ func TestDrainPubRelIntentOpensTheFenceBeforeMutating(t *testing.T) {
 // message can be gone. A claim for a message that no longer exists can neither be
 // delivered nor acked, and would otherwise hold its drain open forever.
 func TestDrainRecoveryPrunesAMessageAbsentAboveFirstSeq(t *testing.T) {
+	t.Parallel()
 	_, c, sess, nc := drainTestSession(t, "drain-hole")
 
 	const filter = "holefilter"
@@ -384,6 +389,7 @@ func TestDrainRecoveryPrunesAMessageAbsentAboveFirstSeq(t *testing.T) {
 // which makes the broker refuse to drain at all — this one is escapable, so it is
 // cleared.
 func TestDrainClearsTheConsumerInactivityTimer(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "drain-timer")
 
 	const filter = "timerfilter"
@@ -439,6 +445,7 @@ func TestDrainClearsTheConsumerInactivityTimer(t *testing.T) {
 // unable to deliver a PUBREL it had already stored — the client waits on a PUBCOMP
 // exchange that nothing will ever advance.
 func TestSessionNeedsPubRelDeliveryForAStoredPubRel(t *testing.T) {
+	t.Parallel()
 	_, _, sess, _ := drainTestSession(t, "pubrel-only")
 
 	if sess.needsPubRelDelivery() {
@@ -874,6 +881,7 @@ func testLoadDrainRecord(t *testing.T, sess *mqttSession) *mqttPersistedSession 
 // against. Reading the refusal as "may have landed" would keep a rollback that
 // never reached the stream.
 func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "rbshared-refused")
 	f := &mqttFilter{shared: true, group: "g1", filter: "rb/topic", qos: 1}
 	sid := f.sessionKey()
@@ -911,6 +919,7 @@ func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
 // which is then deleted — and a crash in between strands a reference to a durable
 // that no longer exists, so a resume restores a drain nothing can deliver for.
 func TestPersistedRecordOmitsAnEmptyDrain(t *testing.T) {
+	t.Parallel()
 	_, _, sess, _ := drainTestSession(t, "empty-drain")
 
 	d := addTestDrain(sess, "sid", "dur-empty", "foo", 1, map[uint64]*drainSeq{
@@ -1257,6 +1266,7 @@ func testPersistedSubs(t *testing.T, sess *mqttSession) map[string]byte {
 // session another owner is authoritative for, and its own close path would act on
 // that state too.
 func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "foreign-now")
 
 	if err := testSessSave(t, sess); err != nil {
@@ -1347,6 +1357,7 @@ func testMQTTResidentSessionOrNil(asm *mqttAccountSessionManager, id string) *mq
 // The record transaction is exactly the interval over which mark-classify-register
 // is atomic, so the resolver waits for it.
 func TestUncertainRetrySkipsAnOpenRecordTransaction(t *testing.T) {
+	t.Parallel()
 	s, c, sess, _ := drainTestSession(t, "retry-fence")
 	asm := sess.asm
 	if asm == nil {
@@ -1455,6 +1466,7 @@ func TestDrainRemovalIsGuardedBeforeTheSave(t *testing.T) {
 // The at-base arm settles by RE-ATTEMPTING the attempt's bytes, which is itself a
 // write under that same fence.
 func TestResolutionIsOneRecordTransaction(t *testing.T) {
+	t.Parallel()
 	_, _, sess, _ := drainTestSession(t, "resolve-atomic")
 	if err := testSessSave(t, sess); err != nil {
 		t.Fatalf("initial save: %v", err)
@@ -1533,6 +1545,7 @@ func TestResolutionIsOneRecordTransaction(t *testing.T) {
 // readLoop against itself. Refusing is safe because an unresolved session can make
 // no progress anyway: the periodic pass and the redelivery clocks retry.
 func TestResolutionRefusesWhileAnotherTransactionIsOpen(t *testing.T) {
+	t.Parallel()
 	_, _, sess, _ := drainTestSession(t, "resolve-busy")
 	if err := testSessSave(t, sess); err != nil {
 		t.Fatalf("initial save: %v", err)
@@ -1577,6 +1590,7 @@ func TestResolutionRefusesWhileAnotherTransactionIsOpen(t *testing.T) {
 // no map knows about. Identity is the only safe predicate, and the ownership gate is
 // what keeps the decision and the removal from straddling such a CONNECT.
 func TestForeignDispositionIsOwnershipGated(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "foreign-gate")
 	asm := sess.asm
 	if asm == nil {
@@ -1640,6 +1654,7 @@ func TestForeignDispositionIsOwnershipGated(t *testing.T) {
 // against a session another broker owns — unless it is closed. Both resolvers must
 // go through one disposition path; that they used to differ is exactly the bug.
 func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
+	t.Parallel()
 	s, c, sess, _ := drainTestSession(t, "foreign-periodic")
 	asm := sess.asm
 	if err := testSessSave(t, sess); err != nil {
@@ -1686,6 +1701,7 @@ func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
 // the disposition must do NOTHING — not detach, not evict, not discard the deferred
 // close, not cancel the expiry timer, not close the client.
 func TestForeignDispositionRefusesWhileTheGateIsHeld(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "gate-held")
 	asm := sess.asm
 	if asm == nil {
@@ -1756,6 +1772,7 @@ func TestForeignDispositionRefusesWhileTheGateIsHeld(t *testing.T) {
 // or it destroys the current session's deferred obligation on its way to deciding
 // it had no business there.
 func TestForeignDispositionSparesARenboundClient(t *testing.T) {
+	t.Parallel()
 	_, oldClient, sess, _ := drainTestSession(t, "rebound")
 	asm := sess.asm
 	newClient := (&Server{opts: &Options{}, quitCh: make(chan struct{})}).createInternalAccountClient()
@@ -1816,6 +1833,7 @@ func TestForeignDispositionSparesARenboundClient(t *testing.T) {
 // sweep re-arms it on its next pass, so the state is not immortal; what is lost is
 // the deadline guarantee, and the session lingers past the interval it was promised.
 func TestStaleDispositionSparesAReplacementExpiryTimer(t *testing.T) {
+	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "expiry-replacement")
 	asm := sess.asm
 

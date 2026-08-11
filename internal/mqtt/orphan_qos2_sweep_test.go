@@ -264,6 +264,7 @@ func (e *testOrphanEnv) settleAffineConsumers(t *testing.T, budget int) {
 // ---------------------------------------------------------------------------
 
 func TestOrphanSweepParsesInboundSubjectsStrictly(t *testing.T) {
+	t.Parallel()
 	const hash = "abcd1234"
 	gen := nuid.Next()
 	prefix := mqttQoS2IncomingMsgsStreamSubjectPrefix
@@ -311,6 +312,7 @@ func TestOrphanSweepParsesInboundSubjectsStrictly(t *testing.T) {
 }
 
 func TestOrphanSweepParsesSessionSubjectsAndAffineDurables(t *testing.T) {
+	t.Parallel()
 	const hash = "abcd1234"
 	gen := nuid.Next()
 
@@ -360,6 +362,7 @@ func TestOrphanSweepParsesSessionSubjectsAndAffineDurables(t *testing.T) {
 // STABLE-OBSERVATION requirement measured on this process's monotonic clock, and a
 // stored timestamp is never arithmetic — only identity is.
 func TestOrphanSweepQuarantineRule(t *testing.T) {
+	t.Parallel()
 	t.Run("one observation never authorizes, even at zero grace", func(t *testing.T) {
 		q := newMQTTSweepQuarantine()
 		if q.observedOrphanFor("k", "fp", 0) {
@@ -1498,6 +1501,7 @@ func testValidQ2AffClaim(idHash, gen, groupDur string, sseq uint64) *mqttQ2AffCl
 }
 
 func TestOrphanSweepAffineValidatorChecksEveryDerivedName(t *testing.T) {
+	t.Parallel()
 	idHash, gen, groupDur := getHash("winner"), nuid.Next(), "$MQTT_SHARED_abc"
 	const sseq = uint64(42)
 	subject := mqttQ2AffClaimSubject(groupDur, sseq)

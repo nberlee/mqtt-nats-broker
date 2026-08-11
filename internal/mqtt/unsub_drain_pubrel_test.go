@@ -37,6 +37,7 @@ func testDrainQoS2Restart(t *testing.T, s *Server, o *Options) *Server {
 // PUBREL delivery only when it finds a drain, or source interest only when it finds
 // a subscription.
 func TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -745,6 +746,7 @@ func TestMQTTDrainNoResendAfterPubCompThenCrash(t *testing.T) {
 // recreate must therefore verify presence and escape the poisoned identity, or the
 // source is acked for a PUBREL that never existed.
 func TestMQTTDrainRecreateEscapesASkippedStore(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)

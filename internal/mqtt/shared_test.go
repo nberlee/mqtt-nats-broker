@@ -13,6 +13,7 @@ import (
 // two subscribers in the same group split the published messages — each message
 // is delivered to exactly one member, with no duplicates and none lost.
 func TestV5SharedSubscription(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	const total = 20

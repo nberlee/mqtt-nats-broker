@@ -15,6 +15,7 @@ import (
 // rejected at the record boundary (mqttSessGenFromRecord), so no live session can
 // carry one, and no name here is ever built without one.
 func TestSessGenNamingIsScoped(t *testing.T) {
+	t.Parallel()
 	const idHash = "abcdefghijklmnop"
 	g1, g2 := mqttNewSessGen(), mqttNewSessGen()
 	if g1 == g2 {
@@ -105,6 +106,7 @@ func testSubjectMatchesFilter(subject, filter string) bool {
 // and gets a new one only when it is discarded. A record carrying no generation is
 // refused outright.
 func TestSessGenContinuity(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 
 	s := &Server{
@@ -215,6 +217,7 @@ func TestSessGenContinuity(t *testing.T) {
 // hash-wide purge that destroys a held payload whose releaser claimed it and then
 // died. Rejecting the record is the alternative to that silent loss.
 func TestSessGenFromRecordFailsClosed(t *testing.T) {
+	t.Parallel()
 	good := mqttNewSessGen()
 	if got, err := mqttSessGenFromRecord(good); err != nil || got != good {
 		t.Fatalf("a well-formed generation must be accepted, got %q err=%v", got, err)
@@ -267,6 +270,7 @@ func TestSessGenFromRecordFailsClosed(t *testing.T) {
 // here because clear() is what breaks it, is called from five places, and hands its
 // session object back to be REUSED as a fresh session on two of them.
 func TestClearResetsPerConnectionDeliveryFlags(t *testing.T) {
+	t.Parallel()
 	_, nc := runNATS(t)
 	s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "node1"}
 	s.running.Store(true)

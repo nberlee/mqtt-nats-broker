@@ -321,6 +321,7 @@ func TestMQTTExpiryOverrideCloseDiscardsAfterRefusal(t *testing.T) {
 // This is a characterization test with no mutation of its own. Its value is that it fails
 // if a later change breaks the chain the fallthrough depends on.
 func TestMQTTDisconnectWithWillAndZeroExpiryPublishesImmediately(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

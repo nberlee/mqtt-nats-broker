@@ -74,6 +74,7 @@ func testDrainCount(sess *mqttSession) int {
 // what it already sent, which is exactly why fresh messages need an explicit
 // discard rather than simply not arriving.
 func TestMQTTDrainDiscardsFreshMessages(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -118,6 +119,7 @@ func TestMQTTDrainDiscardsFreshMessages(t *testing.T) {
 // and the filter stays unsubscribed, because the drain is deliberately not a
 // membership.
 func TestMQTTDrainSurvivesReconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -167,6 +169,7 @@ func TestMQTTDrainSurvivesReconnect(t *testing.T) {
 // adopt would create a SECOND durable on the same filter and deliver every new
 // message twice.
 func TestMQTTDrainAdoptedByResubscribe(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -237,6 +240,7 @@ func TestMQTTDrainAdoptedByResubscribe(t *testing.T) {
 // reaches trackPublish and sess.deferred stays empty, and the test would pass
 // whatever stageDrain did with it.
 func TestMQTTDrainDiscardsWithheldDeliveries(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -328,6 +332,7 @@ func TestMQTTDrainDiscardsWithheldDeliveries(t *testing.T) {
 // behavior loudly; creating a drain anyway would look compliant and silently lose
 // the very messages the drain exists to protect.
 func TestMQTTDrainRefusedUnderStreamConsumerLimit(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -405,6 +410,7 @@ func TestMQTTDrainRefusedUnderStreamConsumerLimit(t *testing.T) {
 // what it started, at its own QoS, while the new subscription delivers fresh
 // messages at QoS 0.
 func TestMQTTDrainNotAdoptedByQoS0Resubscribe(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -457,6 +463,7 @@ func TestMQTTDrainNotAdoptedByQoS0Resubscribe(t *testing.T) {
 // owns. Both would silently corrupt the account-wide MaxAckPending budget, which
 // is only ever observed as unrelated subscriptions being refused much later.
 func TestMQTTDrainAdoptionPreservesConsumerAccounting(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -531,6 +538,7 @@ func TestMQTTDrainAdoptionPreservesConsumerAccounting(t *testing.T) {
 // its filter forever — with the orphan sweep taught to treat drains as referenced,
 // nothing would ever reap it either.
 func TestMQTTDrainDurablesDeletedOnCleanStart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -631,6 +639,7 @@ func TestMQTTDrainSurvivesOrphanSweep(t *testing.T) {
 // accumulate in the stream. None of them is owed to the client — it unsubscribed —
 // so the reconnect must discard the backlog and deliver only what was started.
 func TestMQTTDrainDiscardsOfflineBacklog(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -672,6 +681,7 @@ func TestMQTTDrainDiscardsOfflineBacklog(t *testing.T) {
 // MQTT filter but must drain BOTH, or the started delivery on whichever consumer
 // was overlooked is deleted with its durable.
 func TestMQTTDrainLevelUpCoversBothConsumers(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -751,6 +761,7 @@ func TestMQTTDrainLevelUpCoversBothConsumers(t *testing.T) {
 // survive a disconnect, and reaping it takes the started deliveries with it,
 // because the messages stream is interest-retained.
 func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	o.MQTT.ConsumerInactiveThreshold = 500 * time.Millisecond
@@ -816,6 +827,7 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 // is silent. The threshold is re-imposed out of band here, which is exactly the
 // state a failed clear leaves behind.
 func TestMQTTDrainInactivityClearRetriedOnResume(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	o.MQTT.ConsumerInactiveThreshold = time.Hour
@@ -1009,6 +1021,7 @@ func TestMQTTDrainCompletionSaveFailureLosesNothing(t *testing.T) {
 // cannot tell a started delivery from a new one — only the record can, which is
 // why the claim, not the memory, is the authority.
 func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -1067,6 +1080,7 @@ func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
 // forever, with the orphan sweep taught to treat drains as referenced and the
 // record gone.
 func TestMQTTDrainDurablesDeletedOnSessionExpiry(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)

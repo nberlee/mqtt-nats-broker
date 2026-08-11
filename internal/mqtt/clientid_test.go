@@ -29,6 +29,7 @@ func connectClientID(t *testing.T, broker, id string) pmqtt.Client {
 // client works end to end, including QoS2 (whose dedup subject embeds a hash of
 // the client ID).
 func TestClientIDArbitraryChars(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	for _, id := range []string{"clean retained", "id.with.dots", "weird/+#*id", "clientеÜ"} {

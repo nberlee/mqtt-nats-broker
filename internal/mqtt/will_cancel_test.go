@@ -80,6 +80,7 @@ func seedWatermarkRaw(t testing.TB, asm *mqttAccountSessionManager, cidHash stri
 // TestMQTTWillOutboxWatermarkMonotonicCAS proves the advance never lowers a
 // watermark: after advancing to 100, an out-of-order advance to 90 is a no-op.
 func TestMQTTWillOutboxWatermarkMonotonicCAS(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -107,6 +108,7 @@ func TestMQTTWillOutboxWatermarkMonotonicCAS(t *testing.T) {
 // TestMQTTWillOutboxWatermarkAmbiguousAck proves an advance whose CAS store lands
 // but returns an error is confirmed by a re-read rather than failing the CONNECT.
 func TestMQTTWillOutboxWatermarkAmbiguousAck(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -133,6 +135,7 @@ func TestMQTTWillOutboxWatermarkAmbiguousAck(t *testing.T) {
 // TestMQTTWillOutboxWatermarkFailsWhenUnconfirmable proves a store failure that
 // does NOT land (nothing durable) surfaces an error so the CONNECT is rejected.
 func TestMQTTWillOutboxWatermarkFailsWhenUnconfirmable(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -157,6 +160,7 @@ func TestMQTTWillOutboxWatermarkFailsWhenUnconfirmable(t *testing.T) {
 // TestMQTTWillOutboxWatermarkSelfHealsCorrupt proves a corrupt/cross-client marker
 // is authoritatively CAS-overwritten by the next advance (self-heal).
 func TestMQTTWillOutboxWatermarkSelfHealsCorrupt(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -196,6 +200,7 @@ func TestMQTTWillOutboxWatermarkSelfHealsCorrupt(t *testing.T) {
 // different incarnation classifies stale-epoch (fall back to the session-record
 // fence) and is overwritten with the current epoch by the next advance.
 func TestMQTTWillOutboxWatermarkStaleEpochFallbackThenOverwrite(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -219,6 +224,7 @@ func TestMQTTWillOutboxWatermarkStaleEpochFallbackThenOverwrite(t *testing.T) {
 // indeterminate watermark load (it aborts after the first, leaving every record
 // pending) rather than one timeout per due record.
 func TestMQTTWillOutboxWatermarkOutageAbortsScanAfterOneLoad(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -272,6 +278,7 @@ func TestMQTTWillOutboxWatermarkOutageAbortsScanAfterOneLoad(t *testing.T) {
 // retention, mirror, sources, and explicit-replica-mismatch checks that a
 // single-node manager bring-up cannot reach.
 func TestValidateWillCancelStream(t *testing.T) {
+	t.Parallel()
 	const domainTk = ""
 	wantSubj := mqttWillCancelSubjectPrefix + domainTk + ">"
 	base := func() *StreamInfo {
@@ -452,6 +459,7 @@ func awaitRollback(t *testing.T, ch chan rollbackObs) rollbackObs {
 // recovers. The resolved expiry is finite, so the rollback re-saves a disconnected
 // record (never a falsely-connected one).
 func TestMQTTWillOutboxWatermarkConnectFailureRollback(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -495,6 +503,7 @@ func TestMQTTWillOutboxWatermarkConnectFailureRollback(t *testing.T) {
 // performs a CONFIRMED delete of the candidate record (it ends at connection close),
 // leaving the durable record absent.
 func TestMQTTWillOutboxWatermarkConnectFailureZeroExpiryDeletes(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -527,6 +536,7 @@ func TestMQTTWillOutboxWatermarkConnectFailureZeroExpiryDeletes(t *testing.T) {
 // (no CONNACK), yet the marker is durably present (suppressing the prior Will), and a
 // later CONNECT succeeds.
 func TestMQTTWillOutboxWatermarkConnectFailureAmbiguousLanded(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -575,6 +585,7 @@ func TestMQTTWillOutboxWatermarkConnectFailureAmbiguousLanded(t *testing.T) {
 // CONNACK, es.c == nil, in-memory session removed) but the persisted record is NOT
 // required to be non-connected.
 func TestMQTTWillOutboxWatermarkConnectFailureIndeterminate(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -614,6 +625,7 @@ func TestMQTTWillOutboxWatermarkConnectFailureIndeterminate(t *testing.T) {
 // never-expire disconnected record must reconcile the expiry timer by CANCELLING a
 // stale finite timer (a never-expire session does not expire), not by re-arming it.
 func TestMQTTWillOutboxWatermarkRollbackNeverExpireCancelsTimer(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -649,6 +661,7 @@ func TestMQTTWillOutboxWatermarkRollbackNeverExpireCancelsTimer(t *testing.T) {
 // from inside the fence while the first record is being processed; the loop-top stop
 // check must then return before the remaining records are walked (marker-loaded).
 func TestMQTTWillOutboxWatermarkPhase2ShutdownStopsScan(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -703,6 +716,7 @@ func TestMQTTWillOutboxWatermarkPhase2ShutdownStopsScan(t *testing.T) {
 // production CONNECT path — no seam — and that real marker then suppresses an
 // older-generation Will via the claimant fence.
 func TestMQTTWillOutboxWatermarkRealConnectAdvancesAndSuppresses(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -753,6 +767,7 @@ func TestMQTTWillOutboxWatermarkRealConnectAdvancesAndSuppresses(t *testing.T) {
 // session-record fence alone would fire here (a newer-but-disconnected record fires
 // like an absent one), so suppression proves the durable marker is doing the work.
 func TestMQTTWillOutboxWatermarkSuppressesAfterRealFiniteDisconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -819,6 +834,7 @@ func TestMQTTWillOutboxWatermarkSuppressesAfterRealFiniteDisconnect(t *testing.T
 // session record present — the case a lifecycle bug that deleted the watermark would
 // silently break.
 func TestMQTTWillOutboxWatermarkSurvivesSessionDeletion(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -884,6 +900,7 @@ func TestMQTTWillOutboxWatermarkSurvivesSessionDeletion(t *testing.T) {
 // client; a definite watermark no-write failure ⇒ the prior Will still fires. (Not a
 // general multi-replica guarantee.)
 func TestMQTTWillOutboxWatermarkConnectFailurePriorWillFires(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -921,6 +938,7 @@ func TestMQTTWillOutboxWatermarkConnectFailurePriorWillFires(t *testing.T) {
 // the local reconcile watermark; a stale remote-expiry worker parked on an older
 // observation must then reject its snapshot and leave the rollback's timer intact.
 func TestMQTTWillOutboxWatermarkConnectFailureStaleReconcileWorker(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1020,6 +1038,7 @@ func expectWillSuppressed(t *testing.T, asm *mqttAccountSessionManager, subject 
 // exists (administrative loss / origin replica loss) — the residual the old
 // session-record fence could not close. (Plan tests 3, 4, 6.)
 func TestMQTTWillOutboxWatermarkSuppressesDisconnectedGeneration(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1049,6 +1068,7 @@ func TestMQTTWillOutboxWatermarkSuppressesDisconnectedGeneration(t *testing.T) {
 // still fires: watermark.SessionSeq is not greater than the Will's origin, so the
 // fence falls back and (absent session record) proceeds. (Plan test 5.)
 func TestMQTTWillOutboxWatermarkLegitNewerWillFires(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1076,6 +1096,7 @@ func TestMQTTWillOutboxWatermarkLegitNewerWillFires(t *testing.T) {
 // watermark regardless of the numeric sequences (epoch is an identity, not an
 // ordering). (Plan test 13b.)
 func TestMQTTWillOutboxWatermarkCancelsForeignEpochWill(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1111,6 +1132,7 @@ func TestMQTTWillOutboxWatermarkCancelsForeignEpochWill(t *testing.T) {
 // record's format contract, so the loader now errors on this record and a decoded
 // "still pending" assertion would hold vacuously.
 func TestMQTTWillOutboxWatermarkMalformedEpochCharsetRejected(t *testing.T) {
+	t.Parallel()
 	bad := mqttSessEpochNUIDPrefix + strings.Repeat("!", 22) // 22 chars, out of alphabet
 	if mqttValidSessEpoch(bad) {
 		t.Fatalf("epoch %q must be invalid (out-of-alphabet body)", bad)
@@ -1156,6 +1178,7 @@ func TestMQTTWillOutboxWatermarkMalformedEpochCharsetRejected(t *testing.T) {
 // decode, so it is neither fired nor cancelled and its stored bytes do not change.
 // (Plan test 12, re-based on F-058's refusal.)
 func TestMQTTWillOutboxWatermarkInvalidOriginRefused(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1191,6 +1214,7 @@ func TestMQTTWillOutboxWatermarkInvalidOriginRefused(t *testing.T) {
 // Will's own client defers only that record (never fires or cancels it) until a
 // CONNECT repairs the marker. (Plan test 7, corrupt branch.)
 func TestMQTTWillOutboxWatermarkCorruptMarkerDefers(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1226,6 +1250,7 @@ func TestMQTTWillOutboxWatermarkCorruptMarkerDefers(t *testing.T) {
 // failure returns willScanAbort: the record stays pending and nothing is delivered
 // until the load recovers. (Plan test 7, indeterminate branch.)
 func TestMQTTWillOutboxWatermarkIndeterminateAborts(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

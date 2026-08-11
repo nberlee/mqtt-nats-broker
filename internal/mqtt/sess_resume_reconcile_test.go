@@ -14,6 +14,7 @@ import (
 // The helper walks the deduplicated list in batches of at most `bound`, and
 // classifies each durable present/absent from a completed lookup.
 func TestMQTTVerifyConsumersBatchedBounds(t *testing.T) {
+	t.Parallel()
 	durables := []string{"a", "b", "c", "d", "e"}
 	var batches [][]string
 	lookup := func(durs []string) ([]*ConsumerInfo, []bool, error) {
@@ -48,6 +49,7 @@ func TestMQTTVerifyConsumersBatchedBounds(t *testing.T) {
 // fails the WHOLE verification: absence must be authoritative before anything
 // is recreated over it, and presence before a session resumes trusting it.
 func TestMQTTVerifyConsumersBatchedIndeterminate(t *testing.T) {
+	t.Parallel()
 	durables := []string{"a", "b", "c", "d", "e"}
 
 	for _, tc := range []struct {
@@ -91,6 +93,7 @@ func TestMQTTVerifyConsumersBatchedIndeterminate(t *testing.T) {
 
 // A degenerate bound never panics and never skips a durable.
 func TestMQTTVerifyConsumersBatchedDegenerateBound(t *testing.T) {
+	t.Parallel()
 	durables := []string{"a", "b", "c"}
 	calls := 0
 	lookup := func(durs []string) ([]*ConsumerInfo, []bool, error) {
@@ -121,6 +124,7 @@ func TestMQTTVerifyConsumersBatchedDegenerateBound(t *testing.T) {
 // Mutation check: drop the `cur != prior` guard and the pre-existing action
 // below is rewritten.
 func TestMQTTRetargetDeferredLifetimeIsScopedToItsOwnAction(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "retarget"}
 
 	stale := &mqttDeferredDisconnect{disconnectedAt: 1000, expiryInterval: mqttSessionNeverExpire}
@@ -160,6 +164,7 @@ func TestMQTTRetargetDeferredLifetimeIsScopedToItsOwnAction(t *testing.T) {
 // Mutation check: park without requiring uncertainty inside the critical
 // section and the resolved-session case below parks a stranded action.
 func TestMQTTDeferDisconnectIfUncertainIsAtomic(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{id: "atomic-park"}
 	action := &mqttDeferredDisconnect{disconnectedAt: 1, expiryInterval: 300}
 

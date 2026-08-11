@@ -77,6 +77,7 @@ func (e *testRejectionEnv) reconcileEntry() (present bool, latest, decided uint6
 // backstop OFF, a peer's record write still evicts the displaced resident — so the
 // convergence is attributable to the watch alone.
 func TestMQTTWatchConvergesWithoutTheBackstop(t *testing.T) {
+	t.Parallel()
 	e := testNewWatchEnv(t, "wchlive")
 	e.setWatchDelivery(true)
 	done := e.armEvictObserver()
@@ -95,6 +96,7 @@ func TestMQTTWatchConvergesWithoutTheBackstop(t *testing.T) {
 // one that closes F-036: the delivery is LOST — the state the old at-most-once
 // notification left behind for good — and one periodic pass still converges it.
 func TestMQTTBackstopConvergesWithoutTheWatch(t *testing.T) {
+	t.Parallel()
 	e := testNewWatchEnv(t, "wchdrop")
 	done := e.armEvictObserver()
 
@@ -294,6 +296,7 @@ func TestMQTTBackstopUnusableLoadCannotEvictOwnLanding(t *testing.T) {
 // so an uncertainty-shaped refusal would be settled by the same pass and could not
 // show the re-fire at all.
 func TestMQTTWatchRefusedEvictionIsRefired(t *testing.T) {
+	t.Parallel()
 	e := testNewWatchEnv(t, "wchrefire")
 	done := e.armEvictObserver()
 
@@ -346,6 +349,7 @@ func TestMQTTWatchRefusedEvictionIsRefired(t *testing.T) {
 // The control is a session whose record is PRESENT and unmoved: it must arm nothing,
 // which is what distinguishes "keys on absence" from "arms on every backstop read".
 func TestMQTTBackstopArmsOnDeletedRecord(t *testing.T) {
+	t.Parallel()
 	t.Run("deleted record arms the ownership marker", func(t *testing.T) {
 		e := testNewWatchEnv(t, "wchgone")
 		e.setBackstop(true)
@@ -401,6 +405,7 @@ func TestMQTTBackstopArmsOnDeletedRecord(t *testing.T) {
 // resident, and no worker is in flight — so the residency and inFlight conjuncts
 // both permit the delete and cannot mask a missing identity check.
 func TestMQTTReconcileEntryPruningIsIdentitySafe(t *testing.T) {
+	t.Parallel()
 	e := testNewWatchEnv(t, "wchprune")
 	hash := e.idHash
 
@@ -433,6 +438,7 @@ func TestMQTTReconcileEntryPruningIsIdentitySafe(t *testing.T) {
 // worker share ONE entry, and that worker's cleanup deleted it on "no worker in
 // flight" alone.
 func TestMQTTReconcileEntrySurvivesNoLocalWorker(t *testing.T) {
+	t.Parallel()
 	e := testNewWatchEnv(t, "wchshared")
 
 	// A trigger the eviction side owns, left undecided.
@@ -459,6 +465,7 @@ func TestMQTTReconcileEntrySurvivesNoLocalWorker(t *testing.T) {
 // therefore the watch, exists — while DeliverAll would replay every record ever
 // written into the no-local expiry reconcile at every manager start.
 func TestMQTTSessRecordWatchConsumerConfig(t *testing.T) {
+	t.Parallel()
 	ccr := mqttSessRecordWatchConsumerConfig("", "$MQTT.sub.test")
 	if ccr.Stream != mqttSessStreamName {
 		t.Fatalf("the watch must consume the session stream, got %q", ccr.Stream)
@@ -485,6 +492,7 @@ func TestMQTTSessRecordWatchConsumerConfig(t *testing.T) {
 // TestMQTTSessRecordSubjectParsing covers the callback's own attribution: a record
 // subject names exactly one client, and a deeper subject names none.
 func TestMQTTSessRecordSubjectParsing(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, domainTk, subject, want string
 	}{
@@ -513,6 +521,7 @@ func TestMQTTSessRecordSubjectParsing(t *testing.T) {
 // is only the own-write spawn filter, and the worker already has an
 // unusable-record arm that decides at the observation level.
 func TestMQTTWatchFeedsTriggerOnUndecodableRecord(t *testing.T) {
+	t.Parallel()
 	e := testNewWatchEnv(t, "wchgarbage")
 	e.setWatchDelivery(true)
 	done := e.armEvictObserver()
@@ -532,6 +541,7 @@ func TestMQTTWatchFeedsTriggerOnUndecodableRecord(t *testing.T) {
 // reason the backstop must NOT apply the same filter: Origin proves no authorship,
 // so the skip may only ever cost latency.
 func TestMQTTWatchSkipsOwnOriginForSpawn(t *testing.T) {
+	t.Parallel()
 	e := testNewWatchEnv(t, "wchorigin")
 	e.setWatchDelivery(true)
 

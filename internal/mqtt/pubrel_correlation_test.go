@@ -14,6 +14,7 @@ import (
 // A redelivery of that source then allocated a FRESH identifier and resent the
 // payload of an exchange already past PUBREC.
 func TestPubRelCorrelationRoundTrip(t *testing.T) {
+	t.Parallel()
 	const (
 		pi     = uint16(4242)
 		srcDur = "abcdef0123456789_XYZ"
@@ -45,6 +46,7 @@ func TestPubRelCorrelationRoundTrip(t *testing.T) {
 // form, and a record written by a broker that predates correlation parses as
 // uncorrelated rather than as a correlation to some sequence 0.
 func TestPubRelUncorrelatedIsUnchanged(t *testing.T) {
+	t.Parallel()
 	const pi = uint16(7)
 	legacy, legacyLen := mqttNewDeliverablePubRel(pi)
 	got, gotLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_)
@@ -62,6 +64,7 @@ func TestPubRelUncorrelatedIsUnchanged(t *testing.T) {
 // TestPubRelCorrelationRejectsPartialRecords: a half-correlated record must be
 // treated as uncorrelated, never as a correlation to a sequence no delivery has.
 func TestPubRelCorrelationRejectsPartialRecords(t *testing.T) {
+	t.Parallel()
 	for name, hdr := range map[string]string{
 		"no headers at all": hdrLine + _CRLF_,
 		"durable only":      hdrLine + mqttPubRelSrcDurHeader + ":DUR" + _CRLF_ + _CRLF_,
@@ -89,6 +92,7 @@ func TestPubRelCorrelationRejectsPartialRecords(t *testing.T) {
 // that has verified its record absent therefore bumps the attempt rather than
 // retrying under an id the server will swallow.
 func TestPubRelMsgIdIdentity(t *testing.T) {
+	t.Parallel()
 	base := mqttPubRelMsgId("hash", "DUR", 5, 0)
 	for name, other := range map[string]string{
 		"different client":   mqttPubRelMsgId("other", "DUR", 5, 0),
@@ -116,6 +120,7 @@ func TestPubRelMsgIdIdentity(t *testing.T) {
 // redelivery, and a surviving dedupe entry would silently drop it, leaving the
 // client waiting for a PUBREL that will never exist.
 func TestCorrelatedPubRelCarriesMsgIdOnlyWhenAsked(t *testing.T) {
+	t.Parallel()
 	without, wl := mqttNewCorrelatedPubRel(9, "DUR", 3, _EMPTY_)
 	if got := getHeader(JSMsgId, without[:wl]); len(got) != 0 {
 		t.Errorf("an unasked-for deduplication identity was written: %q", got)

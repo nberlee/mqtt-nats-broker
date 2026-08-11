@@ -103,6 +103,7 @@ func TestMQTTDisplacementClaimsTheOneDisconnect(t *testing.T) {
 // refused before it writes. Which production paths reach the helper is the route tests'
 // question, deliberately not this one's.
 func TestMQTTDisconnectClaimConsumedOnce(t *testing.T) {
+	t.Parallel()
 	e := testNewRejectionEnv(t, "claimonce")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 
@@ -130,6 +131,7 @@ func TestMQTTDisconnectClaimConsumedOnce(t *testing.T) {
 // for. The CONNACKed case is the positive control: it asserts the default, and it exists
 // so a gate that failed closed into total silence could not pass the case below it.
 func TestMQTTPersistTakeoverHonorsTheConnAckGate(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		connAckd bool
@@ -177,6 +179,7 @@ func TestMQTTPersistTakeoverHonorsTheConnAckGate(t *testing.T) {
 // that bypasses the enqueue path: shutdownDisconnect writes directly, under a deadline, so
 // it claims the notification itself. A client already told 0x8E must not then be told 0x8B.
 func TestMQTTShutdownDisconnectYieldsToADisplacement(t *testing.T) {
+	t.Parallel()
 	t.Run("the drain alone sends 0x8B", func(t *testing.T) {
 		// A default-value check, not a claim test: it only keeps the case below from
 		// passing against a drain that sends nothing at all.
@@ -208,6 +211,7 @@ func TestMQTTShutdownDisconnectYieldsToADisplacement(t *testing.T) {
 // inline in that function now lives in the shared tail; this pins that moving it did not
 // lose it, through production rather than through the helper.
 func TestMQTTPeriodicForeignDisposalHonorsTheConnAckGate(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		connAckd bool
@@ -260,6 +264,7 @@ func TestMQTTPeriodicForeignDisposalHonorsTheConnAckGate(t *testing.T) {
 // after releasing the ownership gate. TestMQTTBoundRejectionGatesPingReq is the CONNACKed
 // twin in the settlement's own file; this pins that the pre-CONNACK case says nothing.
 func TestMQTTBoundSettlementForeignArmHonorsTheConnAckGate(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		connAckd bool

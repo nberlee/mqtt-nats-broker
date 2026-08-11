@@ -61,6 +61,7 @@ func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 // subscriptions, drains, claims and expiry state. Only a byte-identical record may
 // be adopted.
 func TestUncertainWriteThreeWayReadback(t *testing.T) {
+	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 
 	t.Run("at base: re-attempted and landed", func(t *testing.T) {
@@ -190,6 +191,7 @@ func TestUncertainWriteThreeWayReadback(t *testing.T) {
 // — nothing may be DELETED. clear() would otherwise remove the shared durables and
 // the record before its stale CAS could ever fail.
 func TestUncertainSessionRefusesWritesAndTeardown(t *testing.T) {
+	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	sess := testProvisionSession(t, a, "refuse")
 	_, seq := testLoadSessRecord(t, a, sess.idHash)
@@ -233,6 +235,7 @@ func TestUncertainSessionRefusesWritesAndTeardown(t *testing.T) {
 // the Will Delay Interval. Both deadlines are absolute and measured from the
 // ORIGINAL disconnect.
 func TestDeferredDisconnectPreservesOriginalDeadlines(t *testing.T) {
+	t.Parallel()
 	disconnected := time.Now().Add(-2 * time.Hour)
 
 	finite := &mqttDeferredDisconnect{
@@ -302,6 +305,7 @@ func TestDeferredDisconnectPreservesOriginalDeadlines(t *testing.T) {
 // and never-expire — exactly the two cases that park a deferred discard or a
 // deferred Will.
 func TestRetryUncertainSessionsIsSerializedAgainstConnect(t *testing.T) {
+	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	sess := testProvisionSession(t, a, "retrygate")
 	a.asm.addSession(sess, true)

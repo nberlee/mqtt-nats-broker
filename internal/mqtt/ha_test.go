@@ -48,6 +48,7 @@ func persistentClient(t *testing.T, broker, id string, onMsg pmqtt.MessageHandle
 // session (receiving messages queued while offline) after reconnecting to a
 // DIFFERENT broker instance backed by the same NATS/JetStream cluster.
 func TestHASessionTakeover(t *testing.T) {
+	t.Parallel()
 	srv := runJetStreamServerHA(t)
 	brokerA := brokerOn(t, srv.ClientURL(), "node-a")
 	brokerB := brokerOn(t, srv.ClientURL(), "node-b")

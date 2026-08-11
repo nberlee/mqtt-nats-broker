@@ -15,6 +15,7 @@ func u32(v uint32) *uint32 { return &v }
 // (JetStream per-message TTL), so a late subscriber does not receive it; a
 // subscriber joining within the interval does.
 func TestV5RetainedMessageExpiry(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

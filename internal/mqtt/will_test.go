@@ -58,6 +58,7 @@ func encodeRemLen(n int) []byte {
 // TCP connection ungracefully (no DISCONNECT), the broker publishes the Will.
 // This exercises the readLoop -> mqttHandleClosedClient path.
 func TestProtocolWillUngraceful(t *testing.T) {
+	t.Parallel()
 	broker, _ := startBroker(t)
 
 	// Subscriber watching the will topic.

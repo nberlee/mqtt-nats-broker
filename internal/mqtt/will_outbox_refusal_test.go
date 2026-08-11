@@ -349,6 +349,7 @@ func TestMQTTWillOutboxScanNeverReapsUnsupportedTerminalRecord(t *testing.T) {
 // not make the pass unresolved. The pass must still return nil, or every reconnect
 // of that client would log an unresolved cancellation forever.
 func TestMQTTWillOutboxCancelRefusesUnsupportedRecords(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -420,6 +421,7 @@ func TestMQTTWillOutboxCancelRefusesUnsupportedRecords(t *testing.T) {
 // fixtures are well-formed JSON broken only semantically: an undecodable one would
 // make this vacuous, since json.Unmarshal supplies the error either way.
 func TestMQTTWillOutboxLoadRefusesUnsupportedRecord(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -476,6 +478,7 @@ func TestMQTTWillOutboxLoadRefusesUnsupportedRecord(t *testing.T) {
 // Unreachable from production callers (all pass a live session's generation), so
 // this drives the invariant arm directly.
 func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

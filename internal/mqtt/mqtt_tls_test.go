@@ -75,6 +75,7 @@ func (m *testTLSMaterial) requireClientCerts() {
 // Before the handshake was implemented this listener served plaintext (and
 // panicked on the *tls.Conn assertion made after client setup).
 func TestMQTTTLSHandshake(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TLSConfig = m.serverCfg
@@ -99,6 +100,7 @@ func TestMQTTTLSHandshake(t *testing.T) {
 // listener: a client that skips the handshake and sends CONNECT in the clear
 // gets no CONNACK.
 func TestMQTTTLSRejectsPlaintext(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TLSConfig = m.serverCfg
@@ -147,6 +149,7 @@ func testMQTTExpectClosed(t testing.TB, c net.Conn, what string) {
 // TestMQTTMutualTLS checks that a client certificate signed by the configured
 // client CA is accepted.
 func TestMQTTMutualTLS(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	m.requireClientCerts()
 
@@ -167,6 +170,7 @@ func TestMQTTMutualTLS(t *testing.T) {
 // TestMQTTTLSBadCertRejected checks that a client certificate from an untrusted
 // CA cannot connect to an mTLS listener.
 func TestMQTTTLSBadCertRejected(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	m.requireClientCerts()
 
@@ -216,6 +220,7 @@ func TestMQTTTLSBadCertRejected(t *testing.T) {
 // would make any "eventually closed" assertion pass vacuously), the upper bound
 // is generous enough for -race.
 func TestMQTTTLSHandshakeTimeout(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TLSConfig = m.serverCfg
@@ -250,6 +255,7 @@ func TestMQTTTLSHandshakeTimeout(t *testing.T) {
 // timeout integration test deliberately does not exercise (timing assertions
 // around a 2s default are flaky).
 func TestMQTTTLSTimeoutResolver(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		in, want float64
 	}{
@@ -275,6 +281,7 @@ func TestMQTTTLSTimeoutResolver(t *testing.T) {
 // MaxConn is no defense: it bounds how many clients are registered, not how long
 // one of them can hold up the accept loop (and it is unlimited by default).
 func TestMQTTTLSStalledHandshakeDoesNotBlockAccept(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TLSConfig = m.serverCfg
@@ -336,6 +343,7 @@ func TestMQTTTLSStalledHandshakeDoesNotBlockAccept(t *testing.T) {
 // the handshake deadline instead — the drain cannot reach the socket it needs to
 // close.
 func TestMQTTTLSShutdownInterruptsParkedHandshake(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TLSConfig = m.serverCfg
@@ -392,6 +400,7 @@ func TestMQTTTLSShutdownInterruptsParkedHandshake(t *testing.T) {
 // goroutine; both must be safe. Run under -race, where an unsynchronized
 // read/write of the connection field is reported.
 func TestMQTTTLSHandshakeCompletionRacesShutdown(t *testing.T) {
+	t.Parallel()
 	m := testMQTTTLSMaterial(t)
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TLSConfig = m.serverCfg

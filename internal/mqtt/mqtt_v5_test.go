@@ -451,6 +451,7 @@ func testMQTTDefaultOptionsV5() *Options {
 // docs/PORTING.md.
 
 func TestMQTTv5ConnectAndCapabilities(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -494,6 +495,7 @@ func TestMQTTv5ConnectAndCapabilities(t *testing.T) {
 }
 
 func TestMQTTv5AssignedClientID(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -512,6 +514,7 @@ func TestMQTTv5AssignedClientID(t *testing.T) {
 }
 
 func TestMQTTv5MalformedConnectProperties(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -569,6 +572,7 @@ func TestMQTTv5MalformedConnectProperties(t *testing.T) {
 }
 
 func TestMQTTv5MalformedConnectConnAck(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -608,6 +612,7 @@ func TestMQTTv5MalformedConnectConnAck(t *testing.T) {
 }
 
 func TestMQTTv5AuthMethodRejected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -627,6 +632,7 @@ func TestMQTTv5AuthMethodRejected(t *testing.T) {
 }
 
 func TestMQTTv5ConnectedProtocolErrorDisconnectReason(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -672,6 +678,7 @@ func TestMQTTv5ConnectedProtocolErrorDisconnectReason(t *testing.T) {
 // encoding/content violations, 0x82 Protocol Error for well-formed-but-illegal
 // packets), not the generic 0x80. Spec5 [4.13.1].
 func TestMQTTv5DisconnectReasonCodes(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -747,6 +754,7 @@ func TestMQTTv5DisconnectReasonCodes(t *testing.T) {
 }
 
 func TestMQTTv5PubRecFailureSkipsPubRel(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -778,6 +786,7 @@ func TestMQTTv5PubRecFailureSkipsPubRel(t *testing.T) {
 }
 
 func TestMQTTv5MaxProtocolVersionCap(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.MaxProtocolVersion = 4 // restrict to 3.1.1
 	s := testMQTTRunServer(t, o)
@@ -798,6 +807,7 @@ func TestMQTTv5MaxProtocolVersionCap(t *testing.T) {
 }
 
 func TestMQTTv5PubSubQoS1(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -831,6 +841,7 @@ func TestMQTTv5PubSubQoS1(t *testing.T) {
 }
 
 func TestMQTTv5Unsubscribe(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -847,6 +858,7 @@ func TestMQTTv5Unsubscribe(t *testing.T) {
 }
 
 func TestMQTTv5DisconnectWithWill(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -955,6 +967,7 @@ func testMQTTNumPendingWills(t testing.TB, s *Server, liveClientID string) int {
 // the delay cancels it; a clean session or a zero delay publishes immediately.
 // Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
 func TestMQTTv5WillDelay(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1159,6 +1172,7 @@ RETRY:
 // A v5 subscriber must correctly receive a message published by a 3.1.1 client
 // (exercises the outbound v5 PUBLISH framing with the empty properties field).
 func TestMQTTv5InteropWith311Publisher(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1183,6 +1197,7 @@ func TestMQTTv5InteropWith311Publisher(t *testing.T) {
 // are covered by TestMQTTv5RetainHandling, TestMQTTv5NoLocal and
 // TestMQTTv5RetainAsPublished.
 func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1272,6 +1287,7 @@ func testMQTTTryReadPublishV5(r *mqttReader, timeout time.Duration) (topic strin
 // the requested QoS, and a message published on the underlying topic is
 // delivered to exactly one member of the group. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscription(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1344,6 +1360,7 @@ func TestMQTTv5SharedSubscription(t *testing.T) {
 // message exactly once to the group (no double delivery via the raw queue sub and
 // the shared consumer). Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionMixedQoS(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1397,6 +1414,7 @@ func TestMQTTv5SharedSubscriptionMixedQoS(t *testing.T) {
 // A QoS2 shared subscriber receives a QoS2-published message through the group
 // consumer and completes the full PUBREC/PUBREL/PUBCOMP handshake. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionQoS2(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1431,6 +1449,7 @@ func TestMQTTv5SharedSubscriptionQoS2(t *testing.T) {
 // messages on both the level-up subject (foo) and deeper subjects (foo/bar).
 // Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionWildcard(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1466,6 +1485,7 @@ func TestMQTTv5SharedSubscriptionWildcard(t *testing.T) {
 // (non-shared) subscription on the same client coexists and gets a copy too.
 // Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionTwoGroupsAndPlain(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1499,6 +1519,7 @@ func TestMQTTv5SharedSubscriptionTwoGroupsAndPlain(t *testing.T) {
 // Shared subscriptions never receive retained messages, while a plain
 // subscription on the same topic still replays them. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionRetainedSuppressed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1528,6 +1549,7 @@ func TestMQTTv5SharedSubscriptionRetainedSuppressed(t *testing.T) {
 // connection with DISCONNECT 0x81; No Local on a shared subscription is a
 // Protocol Error 0x82. Spec5 [MQTT-4.8.2-1], [MQTT-4.8.2-2], [MQTT-3.8.3-4].
 func TestMQTTv5SharedSubscriptionMalformed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1561,6 +1583,7 @@ func TestMQTTv5SharedSubscriptionMalformed(t *testing.T) {
 // literal topic filter. A publish to that literal topic is delivered; a publish
 // to the underlying topic is not.
 func TestMQTTSharedSubscription311Literal(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1585,6 +1608,7 @@ func TestMQTTSharedSubscription311Literal(t *testing.T) {
 // UNSUBSCRIBE of a shared subscription removes it (and reports 0x11 if it never
 // existed), without affecting a plain subscription on the same subject. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionUnsub(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1632,6 +1656,7 @@ func TestMQTTv5SharedSubscriptionUnsub(t *testing.T) {
 // resumes as MQTT 3.1.1 (which cannot manage them), and are gone on a later v5
 // resume. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscription311ForcedLeave(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1682,6 +1707,7 @@ func TestMQTTv5SharedSubscription311ForcedLeave(t *testing.T) {
 // A QoS1 message delivered to a member that disconnects without acking is
 // redelivered to another member of the group after AckWait. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionRedeliveryToOtherMember(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -1747,6 +1773,7 @@ func TestMQTTv5SharedSubscriptionRedeliveryToOtherMember(t *testing.T) {
 // A shared wildcard subscription must not match topics beginning with '$'.
 // Spec [MQTT-4.7.2-1], Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionReservedTopics(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1779,6 +1806,7 @@ func TestMQTTv5SharedSubscriptionReservedTopics(t *testing.T) {
 // A client must not be able to subscribe to the internal shared-subscription
 // deliver subject and divert group deliveries. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionDeliverSubjectRejected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1798,6 +1826,7 @@ func TestMQTTv5SharedSubscriptionDeliverSubjectRejected(t *testing.T) {
 // membership resumes and a QoS1 message published while offline is delivered.
 // Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionSessionResume(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1838,6 +1867,7 @@ func TestMQTTv5SharedSubscriptionSessionResume(t *testing.T) {
 // A QoS0-published message on the underlying topic is distributed to exactly one
 // group member via the raw NATS queue subscription. Spec5 [4.8.2].
 func TestMQTTv5SharedSubscriptionQoS0Distribution(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1880,6 +1910,7 @@ func TestMQTTv5SharedSubscriptionQoS0Distribution(t *testing.T) {
 // are replayed at subscribe time: 0 always, 1 only when the subscription is new,
 // 2 never. Spec5 [3.8.3.1].
 func TestMQTTv5RetainHandling(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1958,6 +1989,7 @@ func TestMQTTv5RetainHandling(t *testing.T) {
 // not. A retained replay to a new subscription always has RETAIN=1 regardless.
 // Spec5 [3.8.3.1].
 func TestMQTTv5RetainAsPublished(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2074,6 +2106,7 @@ func TestMQTTv5RetainAsPublished(t *testing.T) {
 // delivered back to the connection that published it, while a message from a
 // different connection still arrives. Spec5 [3.8.3.1].
 func TestMQTTv5NoLocal(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2264,6 +2297,7 @@ func TestMQTTv5NoLocal(t *testing.T) {
 // one for a victim's session and silently drop that subscriber's messages. This
 // covers both delivery paths that carry the marker.
 func TestMQTTv5NoLocalOriginNotSpoofable(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2320,6 +2354,7 @@ func TestMQTTv5NoLocalOriginNotSpoofable(t *testing.T) {
 // suppresses anyway), and cannot suppress an independently-authored message,
 // which carries a different origin's marker. Spec5 [3.8.3.1].
 func TestMQTTv5NoLocalMarkerReplayIsBenign(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2380,6 +2415,7 @@ func TestMQTTv5NoLocalMarkerReplayIsBenign(t *testing.T) {
 // delivery cap used by the QoS 1/2 callback, which reads it off the (unchanged)
 // JetStream delivery subscription. Spec5 [MQTT-3.8.4-3].
 func TestMQTTv5ResubscribeRefreshesDeliveryQoS(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2409,6 +2445,7 @@ func TestMQTTv5ResubscribeRefreshesDeliveryQoS(t *testing.T) {
 // only when parsed from a config file. Otherwise an out-of-range value (e.g. 3)
 // would cause the runtime cap to reject even MQTT 3.1.1 connections.
 func TestMQTTv5MaxProtocolVersionValidation(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.MaxProtocolVersion = 3
 	if err := validateMQTTOptions(o); err == nil {
@@ -2425,6 +2462,7 @@ func TestMQTTv5MaxProtocolVersionValidation(t *testing.T) {
 // A v5 UNSUBACK must report 0x11 (No subscription existed) per filter that was
 // not subscribed, not a blanket success. Spec5 [3.11.3].
 func TestMQTTv5UnsubscribeNoSubscriptionExisted(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2443,6 +2481,7 @@ func TestMQTTv5UnsubscribeNoSubscriptionExisted(t *testing.T) {
 // A v5 PUBCOMP for a PUBREL whose packet identifier has no session state must
 // carry reason 0x92 (Packet Identifier not found). Spec5 [MQTT-4.3.3-1].
 func TestMQTTv5PubCompPacketIDNotFound(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2477,6 +2516,7 @@ func TestMQTTv5PubCompPacketIDNotFound(t *testing.T) {
 // An evicted v5 client must be told the session was taken over with a
 // DISCONNECT 0x8E before the connection closes. Spec5 [3.1.4].
 func TestMQTTv5SessionTakenOverDisconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2509,6 +2549,7 @@ func TestMQTTv5SessionTakenOverDisconnect(t *testing.T) {
 // makes no claim about how such a connection arises. Its positive twin is the test above,
 // which pins the 0x8E this case must suppress.
 func TestMQTTv5TakeoverBeforeConnAckIsSilent(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2630,6 +2671,7 @@ func testMQTTReadPubRecV5(t testing.TB, r *mqttReader, expPI uint16) (byte, *mqt
 // A rejected v5 CONNACK carries a Reason String explaining the failure; a
 // successful CONNACK carries none.
 func TestMQTTv5ConnAckReasonString(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2663,6 +2705,7 @@ func TestMQTTv5ConnAckReasonString(t *testing.T) {
 
 // A server-initiated DISCONNECT on a protocol error carries a Reason String.
 func TestMQTTv5DisconnectReasonString(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2702,6 +2745,7 @@ func TestMQTTv5DisconnectReasonString(t *testing.T) {
 // failure text as the packet-level Reason String, alongside the per-filter 0x80
 // code, while a valid filter in the same packet is still granted.
 func TestMQTTv5SubAckReasonString(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2724,6 +2768,7 @@ func TestMQTTv5SubAckReasonString(t *testing.T) {
 
 // An UNSUBACK for a never-subscribed filter carries the failure text.
 func TestMQTTv5UnsubAckReasonString(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2744,6 +2789,7 @@ func TestMQTTv5UnsubAckReasonString(t *testing.T) {
 // A PUBCOMP with a failure reason (unknown packet identifier) carries the failure
 // text as a Reason String.
 func TestMQTTv5PubCompReasonString(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2768,6 +2814,7 @@ func TestMQTTv5PubCompReasonString(t *testing.T) {
 // PUBCOMP) but not on CONNACK/DISCONNECT, which the server MAY always send.
 // Spec5 [3.1.2.11.7].
 func TestMQTTv5ReasonStringRequestProblemInfo(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2843,6 +2890,7 @@ func TestMQTTv5ReasonStringRequestProblemInfo(t *testing.T) {
 // each packet. Exercises all four writer families (CONNACK, DISCONNECT, SUBACK,
 // PUBCOMP) since each frames separately.
 func TestMQTTv5ReasonStringMaxPacketSize(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2930,6 +2978,7 @@ func TestMQTTv5ReasonStringMaxPacketSize(t *testing.T) {
 // The server advertises its Maximum Packet Size (derived from max_payload) in the
 // success CONNACK. Spec5 [3.2.2.3.6].
 func TestMQTTv5MaxPacketSizeAdvertised(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		maxpay int32
@@ -2965,6 +3014,7 @@ func TestMQTTv5MaxPacketSizeAdvertised(t *testing.T) {
 // with a DISCONNECT 0x95 and the connection is closed; a packet at the limit is
 // accepted. Spec5 [MQTT-3.2.2-15].
 func TestMQTTv5MaxPacketSizeInboundEnforced(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MaxPayload = 512
 	s := testMQTTRunServer(t, o)
@@ -3032,6 +3082,7 @@ func TestMQTTv5MaxPacketSizeInboundEnforced(t *testing.T) {
 // limit: it never advertised one, so a large post-connect packet is processed as
 // before.
 func TestMQTTv5MaxPacketSizeInboundV4Unaffected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MaxPayload = 512
 	s := testMQTTRunServer(t, o)
@@ -3054,6 +3105,7 @@ func TestMQTTv5MaxPacketSizeInboundV4Unaffected(t *testing.T) {
 // server responds with a Quota Exceeded (0x97) ack for QoS 1/2 (silently for
 // QoS 0), keeping the connection alive. Spec5 [3.4.2.1], [3.5.2.1].
 func TestMQTTv5MaxPacketSizeQuotaExceeded(t *testing.T) {
+	t.Parallel()
 	payload := bytes.Repeat([]byte("x"), 2000)
 	subj, err := mqttTopicToNATSPubSubject([]byte("foo"))
 	if err != nil {
@@ -3175,6 +3227,7 @@ func testMQTTPublishV5Props(t testing.TB, c net.Conn, qos byte, pi uint16, topic
 // with DISCONNECT 0x99. A valid payload, or PFI=0, is delivered normally.
 // Spec5 [3.3.2.3.2], reason 0x99.
 func TestMQTTv5PayloadFormatInvalid(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3253,6 +3306,7 @@ func TestMQTTv5PayloadFormatInvalid(t *testing.T) {
 // A CONNECT whose Will declares PFI=1 but carries a non-UTF-8 Will payload is
 // rejected with CONNACK 0x99. Spec5 [3.1.3.2.2].
 func TestMQTTv5WillPayloadFormatInvalid(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3272,6 +3326,7 @@ func TestMQTTv5WillPayloadFormatInvalid(t *testing.T) {
 // configured with a base response topic AND the client set Request Response
 // Information = 1. Spec5 [3.2.2.3.15].
 func TestMQTTv5ResponseInformation(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ResponseInformation = "resp/base"
 	s := testMQTTRunServer(t, o)
@@ -3304,6 +3359,7 @@ func TestMQTTv5ResponseInformation(t *testing.T) {
 // With no configured base response topic, requesting Response Information yields
 // none (it is a server MAY). Spec5 [3.2.2.3.15].
 func TestMQTTv5ResponseInformationUnconfigured(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3320,6 +3376,7 @@ func TestMQTTv5ResponseInformationUnconfigured(t *testing.T) {
 // and the connection is closed, with no acceptance side effects: no Will is
 // published and no resumable session is left behind. Spec5 [MQTT-3.1.2-24].
 func TestMQTTv5MaxPacketSizeConnAckSuppressed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3420,6 +3477,7 @@ func testMQTTPublishV5Dup(t testing.TB, c net.Conn, qos byte, pi uint16, topic s
 // option: default when unset, the explicit value otherwise, and omitted (absent
 // => 65535) when disabled. Spec5 [3.2.2.3.3].
 func TestMQTTv5ServerReceiveMaximumAdvertised(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		opt    int
@@ -3458,6 +3516,7 @@ func TestMQTTv5ServerReceiveMaximumAdvertised(t *testing.T) {
 // the frame unsendable and the server closes the connection without committing
 // session state, while disabling it lets the same connection succeed.
 func TestMQTTv5ServerReceiveMaximumConnAckFit(t *testing.T) {
+	t.Parallel()
 	// Measure the exact success CONNACK size with Receive Maximum advertised.
 	// MaxPayload is fixed so the Maximum Packet Size property is present and its
 	// size constant across runs.
@@ -3541,6 +3600,7 @@ func TestMQTTv5ServerReceiveMaximumConnAckFit(t *testing.T) {
 // A client that keeps more inbound QoS 2 PUBLISH awaiting PUBREL than the
 // advertised Receive Maximum is disconnected with reason 0x93. Spec5 [4.9].
 func TestMQTTv5ServerReceiveMaximumQoS2Enforced(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 2
 	s := testMQTTRunServer(t, o)
@@ -3572,6 +3632,7 @@ func TestMQTTv5ServerReceiveMaximumQoS2Enforced(t *testing.T) {
 // A PUBREL returns the client's send-quota slot, so a subsequent QoS 2 PUBLISH is
 // accepted. Spec5 [4.9].
 func TestMQTTv5ServerReceiveMaximumPubRelFreesSlot(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -3602,6 +3663,7 @@ func TestMQTTv5ServerReceiveMaximumPubRelFreesSlot(t *testing.T) {
 // A DUP re-send of a QoS 2 PUBLISH already awaiting PUBREL is not a new send and
 // must not consume a second quota slot. Spec5 [4.9].
 func TestMQTTv5ServerReceiveMaximumDupNotDoubleCounted(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -3635,6 +3697,7 @@ func TestMQTTv5ServerReceiveMaximumDupNotDoubleCounted(t *testing.T) {
 // while a QoS 2 message holds the only slot is a flow-control violation. Spec5
 // [4.9].
 func TestMQTTv5ServerReceiveMaximumQoS1Blocked(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -3663,6 +3726,7 @@ func TestMQTTv5ServerReceiveMaximumQoS1Blocked(t *testing.T) {
 // beyond the advertised window is therefore acknowledged, not disconnected —
 // whether the packets arrive coalesced or not. Spec5 [4.9].
 func TestMQTTv5ServerReceiveMaximumQoS1NotPoliced(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -3689,6 +3753,7 @@ func TestMQTTv5ServerReceiveMaximumQoS1NotPoliced(t *testing.T) {
 // A PUBREL for a packet identifier the server is not holding returns PUBCOMP 0x92
 // and must not free a slot that is genuinely in use. Spec5 [MQTT-4.3.3-1], [4.9].
 func TestMQTTv5ServerReceiveMaximumUnknownPubRelKeepsSlots(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -3720,6 +3785,7 @@ func TestMQTTv5ServerReceiveMaximumUnknownPubRelKeepsSlots(t *testing.T) {
 // A PUBLISH rejected before it is stored (here Quota Exceeded 0x97 from the
 // account max payload) does not consume a Receive Maximum slot. Spec5 [4.9].
 func TestMQTTv5ServerReceiveMaximumRejectedPubNoSlot(t *testing.T) {
+	t.Parallel()
 	big := bytes.Repeat([]byte("x"), 2000)
 	subj, err := mqttTopicToNATSPubSubject([]byte("foo"))
 	if err != nil {
@@ -3754,6 +3820,7 @@ func TestMQTTv5ServerReceiveMaximumRejectedPubNoSlot(t *testing.T) {
 // quota even though QoS 2 messages from the previous connection are still awaiting
 // PUBREL, which the old packet identifiers still complete. Spec5 [4.9].
 func TestMQTTv5ServerReceiveMaximumFreshQuotaOnResume(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -3795,6 +3862,7 @@ func TestMQTTv5ServerReceiveMaximumFreshQuotaOnResume(t *testing.T) {
 // A 3.1.1 client never advertised a Receive Maximum, so its inbound QoS 2 flow is
 // not subject to the v5 quota even when the option is set.
 func TestMQTTv5ServerReceiveMaximum311Unaffected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -3823,6 +3891,7 @@ func TestMQTTv5ServerReceiveMaximum311Unaffected(t *testing.T) {
 // Maximum Packet Size is not sent; the subscription side effects still apply and
 // the connection stays alive. Spec5 [MQTT-3.1.2-24].
 func TestMQTTv5MaxPacketSizeSubAckSuppressed(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3881,6 +3950,7 @@ func TestMQTTv5MaxPacketSizeSubAckSuppressed(t *testing.T) {
 // uint16 length prefix would wrap and corrupt the properties block. The
 // resulting DISCONNECT must still be well-formed (short form).
 func TestMQTTv5ReasonStringMaxLength(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3921,6 +3991,7 @@ func TestMQTTv5ReasonStringMaxLength(t *testing.T) {
 // the legacy form (packet identifier + one reason byte per filter, no properties
 // block), even against a v5-enabled server.
 func TestMQTTv5ReasonStringV4Unaffected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3959,6 +4030,7 @@ func TestMQTTv5ReasonStringV4Unaffected(t *testing.T) {
 // consume (e.g. a lying properties length) must be rejected as malformed, not
 // silently desync the packet stream.
 func TestMQTTv5ConnectLengthMismatch(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4129,6 +4201,7 @@ func testMQTTReadPubV5Props(t testing.TB, c net.Conn, r *mqttReader, expTopic st
 // v5 PUBLISH properties are forwarded unaltered to a v5 subscriber, across the
 // QoS0/1/2 publish paths (including QoS2 store + PUBREL replay).
 func TestMQTTv5PublishPropertyForwarding(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4156,6 +4229,7 @@ func TestMQTTv5PublishPropertyForwarding(t *testing.T) {
 // share c.mqtt.pp). The Will's own properties are not forwarded yet, so the
 // delivered Will must carry an empty properties block.
 func TestMQTTv5WillDoesNotLeakPublishProps(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4180,6 +4254,7 @@ func TestMQTTv5WillDoesNotLeakPublishProps(t *testing.T) {
 
 // Retained v5 properties are persisted and replayed to a late v5 subscriber.
 func TestMQTTv5RetainedPropertyForwarding(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4202,6 +4277,7 @@ func TestMQTTv5RetainedPropertyForwarding(t *testing.T) {
 // subscriber, and a 3.1.1 publisher must yield an empty properties block to a
 // v5 subscriber.
 func TestMQTTv5PropertyForwardingInterop(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4242,6 +4318,7 @@ func TestMQTTv5PropertyForwardingInterop(t *testing.T) {
 // Retained-message encode/decode round-trips the properties block and stays
 // backward compatible with stored messages that have none.
 func TestMQTTv5RetainedMessagePropsEncodeDecode(t *testing.T) {
+	t.Parallel()
 	subj := mqttRetainedMsgsStreamSubject + "a.b"
 	props := testMQTTv5PubPropsBlock()
 
@@ -4280,6 +4357,7 @@ func mqttMakePropsBlock(body []byte) []byte {
 // blocks and blocks carrying Topic Alias or a Subscription Identifier are
 // dropped so the server never emits a malformed/forbidden outbound PUBLISH.
 func TestMQTTv5ValidateForwardProps(t *testing.T) {
+	t.Parallel()
 	valid := testMQTTv5PubPropsBlock()
 	topicAlias := mqttMakePropsBlock([]byte{mqttPropTopicAlias, 0x00, 0x01})
 	subID := mqttMakePropsBlock([]byte{mqttPropSubscriptionID, 0x01})
@@ -4313,6 +4391,7 @@ func TestMQTTv5ValidateForwardProps(t *testing.T) {
 // A client-to-server PUBLISH carrying a Subscription Identifier is a protocol
 // error (spec5 [MQTT-3.3.4-6]); the server must reject it, not relay it.
 func TestMQTTv5PublishSubscriptionIdRejected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4348,6 +4427,7 @@ func TestMQTTv5PublishSubscriptionIdRejected(t *testing.T) {
 // client is subscribed to. A crafted (malformed) Nmqtt-Props must be dropped so
 // the v5 subscriber still receives a well-formed PUBLISH with no properties.
 func TestMQTTv5ForwardPropsFromNATSPublisherValidated(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4376,6 +4456,7 @@ func TestMQTTv5ForwardPropsFromNATSPublisherValidated(t *testing.T) {
 // Type, Response Topic, Correlation Data, User Properties), not none and not
 // the client's last PUBLISH's. Spec5 [3.1.3.2].
 func TestMQTTv5WillForwardsOwnProps(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4422,6 +4503,7 @@ func testMQTTSessionReceiveMax(t testing.TB, s *Server, clientID string) uint16 
 // bounds the number of unacknowledged QoS1 PUBLISH the server has in flight:
 // a second message is held until the first is acked and then redelivered.
 func TestMQTTv5ReceiveMaximum(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second // keep redelivery of the held message fast
 	s := testMQTTRunServer(t, o)
@@ -4480,6 +4562,7 @@ func mqttV5PropsSessionExpiryReceiveMax(secs uint32, rmax uint16) []byte {
 // On resume the server re-sends unacknowledged QoS 1/2 messages, but must not
 // exceed the resumed connection's Receive Maximum. Spec5 [MQTT-3.3.4-9].
 func TestMQTTv5ReceiveMaximumResumeCap(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 3 * testMQTTTimeout // keep un-NAK'd messages from redelivering during the test
 	s := testMQTTRunServer(t, o)
@@ -4517,6 +4600,7 @@ func TestMQTTv5ReceiveMaximumResumeCap(t *testing.T) {
 // can neither be redelivered nor acked; on resume its pending entry must be
 // released so it does not leak a Receive Maximum slot. Spec5 [3.3.2.3.3].
 func TestMQTTv5MessageExpiryPendingReconciledOnResume(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 3 * testMQTTTimeout
 	s := testMQTTRunServer(t, o)
@@ -4596,6 +4680,7 @@ func findPendingBySeq(sess *mqttSession, sseq uint64) (uint16, bool) {
 }
 
 func TestMQTTv5ReceiveMaximumQoS2(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -4632,6 +4717,7 @@ func TestMQTTv5ReceiveMaximumQoS2(t *testing.T) {
 // redelivered immediately when the client frees a slot, not only after
 // AckWait expires. Mirrors paho test_flow_control1. Spec5 [4.9].
 func TestMQTTv5ReceiveMaximumPromptRelease(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 3 * testMQTTTimeout // long enough that only the NAK path can deliver in time
 	s := testMQTTRunServer(t, o)
@@ -4671,6 +4757,7 @@ func TestMQTTv5ReceiveMaximumPromptRelease(t *testing.T) {
 // from pendingPublish to pendingPubRel, which still counts against the cap),
 // not only after AckWait expires. Spec5 [4.9].
 func TestMQTTv5ReceiveMaximumPromptReleaseQoS2(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 3 * testMQTTTimeout
 	s := testMQTTRunServer(t, o)
@@ -4702,6 +4789,7 @@ func TestMQTTv5ReceiveMaximumPromptReleaseQoS2(t *testing.T) {
 }
 
 func TestMQTTSessionDropUnredeliverableRetained(t *testing.T) {
+	t.Parallel()
 	// A retained (QoS1/2) delivery is tracked with no JetStream backing (empty
 	// jsAckSubject); it cannot be redelivered, so it must be released on resume
 	// rather than leaking a Receive Maximum slot. JS-backed entries stay.
@@ -4736,6 +4824,7 @@ func TestMQTTSessionDropUnredeliverableRetained(t *testing.T) {
 // JetStream per-message TTL equals the Message Expiry Interval, so the message
 // is reaped from the stream at the same time it logically expires.
 func TestMQTTSessionTrackPublishStarted(t *testing.T) {
+	t.Parallel()
 	sess := &mqttSession{maxp: 10}
 	const dur = "S_C"
 	// $JS.ACK.<stream>.<consumer>.<deliveries>.<streamseq>.<consumerseq>.<ts>.<pending>
@@ -4765,6 +4854,7 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 // A Receive Maximum of 0 is a protocol error (spec5 [3.1.2.11.3]); the CONNECT
 // is rejected with a CONNACK carrying reason 0x82 (Protocol Error).
 func TestMQTTv5ReceiveMaximumZeroRejected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4810,6 +4900,7 @@ func testMQTTReadAnyPublishV5(t testing.TB, r *mqttReader) (byte, string, []byte
 // is delivered as QoS1; the rest are downgraded to QoS0 (delivered, not counted
 // against the in-flight limit).
 func TestMQTTv5RetainedReceiveMaximum(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4852,6 +4943,7 @@ func TestMQTTv5RetainedReceiveMaximum(t *testing.T) {
 // and without waiting out AckWait (which is left at its 30s default here, so a
 // drop-at-cap would make this test time out).
 func TestMQTTv5ReceiveMaximumOrdering(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4915,6 +5007,7 @@ func testMQTTSessionNumPending(t testing.TB, s *Server, clientID string) int {
 // occupy an in-flight slot forever (the pending set drains back to empty), while
 // the connection keeps working for messages within the limit. Spec5 [3.1.2.11.4].
 func TestMQTTv5MaximumPacketSize(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4963,6 +5056,7 @@ func TestMQTTv5MaximumPacketSize(t *testing.T) {
 // A QoS0 PUBLISH exceeding the client's Maximum Packet Size is silently dropped
 // (there is nothing to ack); one within the limit is delivered.
 func TestMQTTv5MaximumPacketSizeQoS0(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4987,6 +5081,7 @@ func TestMQTTv5MaximumPacketSizeQoS0(t *testing.T) {
 // A 3.1.1 subscriber advertises no Maximum Packet Size (maxPacketSize == 0), so
 // the limit never applies: a large message is delivered unchanged.
 func TestMQTTv5MaximumPacketSize311Unaffected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5008,6 +5103,7 @@ func TestMQTTv5MaximumPacketSize311Unaffected(t *testing.T) {
 // A Maximum Packet Size of 0 is a protocol error (spec5 [3.1.2.11.4]); the
 // CONNECT is rejected with a CONNACK carrying reason 0x82 (Protocol Error).
 func TestMQTTv5MaximumPacketSizeZeroRejected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5025,6 +5121,7 @@ func TestMQTTv5MaximumPacketSizeZeroRejected(t *testing.T) {
 // message exceeding the subscriber's Maximum Packet Size is skipped, while a
 // within-limit retained message on the same subscription is delivered.
 func TestMQTTv5RetainedMaximumPacketSize(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5070,6 +5167,7 @@ func mqttV5PropsWithExpiry(me uint32) []byte {
 // properties block without disturbing the other properties, and blocks without
 // one are left untouched.
 func TestMQTTv5MessageExpiryPropsHelpers(t *testing.T) {
+	t.Parallel()
 	block := mqttV5PropsWithExpiry(100)
 
 	off := mqttPropValueOffset(block, mqttPropMessageExpiry)
@@ -5145,6 +5243,7 @@ func TestMQTTv5MessageExpiryPropsHelpers(t *testing.T) {
 // absolute deadline through encode/decode and carries a JetStream per-message
 // TTL; a retained message without one carries neither.
 func TestMQTTv5RetainedMessageExpiryEncodeDecode(t *testing.T) {
+	t.Parallel()
 	subj := mqttRetainedMsgsStreamSubject + "a.b"
 	props := mqttV5PropsWithExpiry(3600)
 	exp := time.Now().Add(time.Hour)
@@ -5185,6 +5284,7 @@ func TestMQTTv5RetainedMessageExpiryEncodeDecode(t *testing.T) {
 // A retained message replayed to a late v5 subscriber carries the Message Expiry
 // Interval reduced by the time it has been waiting in the server. Spec5 [3.3.2.3.3].
 func TestMQTTv5RetainedMessageExpiryDecrement(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5218,6 +5318,7 @@ func TestMQTTv5RetainedMessageExpiryDecrement(t *testing.T) {
 // A retained message whose Message Expiry Interval has elapsed is no longer
 // delivered to a new subscriber. Spec5 [3.3.2.3.3].
 func TestMQTTv5RetainedMessageExpires(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5241,6 +5342,7 @@ func TestMQTTv5RetainedMessageExpires(t *testing.T) {
 // not be written there) and is forwarded to a v5 subscriber with its properties
 // intact. Spec5 [3.3.2.3.3].
 func TestMQTTv5QoS2MessageExpiryForwarded(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5273,6 +5375,7 @@ func TestMQTTv5QoS2MessageExpiryForwarded(t *testing.T) {
 // A stored QoS1 message whose Message Expiry Interval elapses while its
 // subscriber is offline must not be delivered on reconnect. Spec5 [3.3.2.3.3].
 func TestMQTTv5QoS1MessageExpires(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5308,6 +5411,7 @@ func TestMQTTv5QoS1MessageExpires(t *testing.T) {
 // distinguishes an explicit 0 (expire now) from an absent interval (never
 // expires). Spec5 [3.3.2.3.3].
 func TestMQTTv5RetainedMessageExpiryZeroImmediate(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5331,6 +5435,7 @@ func TestMQTTv5RetainedMessageExpiryZeroImmediate(t *testing.T) {
 // server must not forward it (the clock does not restart at PUBREL). Spec5
 // [3.3.2.3.3].
 func TestMQTTv5QoS2ExpiryAgesDuringPubRel(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5378,6 +5483,7 @@ func TestMQTTv5QoS2ExpiryAgesDuringPubRel(t *testing.T) {
 // onward delivery would otherwise happen within the same second. Covers the
 // QoS1 delivery and QoS2 PUBREL-release paths. Spec5 [3.3.2.3.3].
 func TestMQTTv5StoredMessageExpiryZeroNotDelivered(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5407,6 +5513,7 @@ func TestMQTTv5StoredMessageExpiryZeroNotDelivered(t *testing.T) {
 // on the same stored message). Sizes are derived from the production sizing so
 // the boundary is exact. Spec5 [3.3.2.3.3].
 func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
+	t.Parallel()
 	props := mqttV5PropsWithExpiry(60)
 	payload := bytes.Repeat([]byte("x"), 2000)
 
@@ -5504,6 +5611,7 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 // must not be delivered to ANY subscriber, whatever its protocol level or QoS.
 // Spec5 [3.3.2.3.3].
 func TestMQTTv5MessageExpiryZeroAllProtos(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5544,6 +5652,7 @@ func TestMQTTv5MessageExpiryZeroAllProtos(t *testing.T) {
 // the absolute expiry deadline header (so delivery-side expiry can recompute
 // the remaining interval on replay). Spec5 [3.3.2.3.3].
 func TestMQTTv5RetainedMessageEncodeTTL(t *testing.T) {
+	t.Parallel()
 	rm := &mqttRetainedMsg{Topic: "t", Msg: []byte("m"), expires: time.Now().Add(time.Minute)}
 	full, hdr := mqttEncodeRetainedMessage(rm)
 	if !bytes.Contains(full, []byte(JSMessageTTL)) {
@@ -5564,6 +5673,7 @@ func TestMQTTv5RetainedMessageEncodeTTL(t *testing.T) {
 // A delayed Will must carry the Will's own forwardable properties when it
 // eventually fires, matching the immediate-publish path. Spec5 [3.1.3.2].
 func TestMQTTv5WillDelayForwardsOwnProps(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5594,6 +5704,7 @@ func TestMQTTv5WillDelayForwardsOwnProps(t *testing.T) {
 // which changes across restarts (so the pre-Layer-2 Origin gate would have
 // dropped it).
 func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name       string
 		cleanStart bool
@@ -5731,6 +5842,7 @@ func testMQTTSessionRecordExists(t testing.TB, s *Server, liveClientID, targetCl
 // executed, if overdue) by a sweep when the account session manager is recreated.
 // Sessions that never expire are left untouched. Spec5 [3.1.2.11.2].
 func TestMQTTv5SessionExpiryPersistedAcrossRestart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownRestartedServer(&s)
@@ -5820,6 +5932,7 @@ func TestMQTTv5SessionExpiryPersistedAcrossRestart(t *testing.T) {
 // session's) must not cancel the local expiry timer; a newer one is a takeover
 // and must.
 func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -5915,6 +6028,7 @@ func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
 // not-yet-due record is re-armed rather than cleaned early; a due one is cleaned
 // up (using the record's own sequence). Spec5 [3.1.2.11.2].
 func TestMQTTv5SessionExpiryStaleTimerRecordState(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name        string
 		disconnAt   func() int64 // newer record's DisconnectedAt (0 == connected)
@@ -5990,6 +6104,7 @@ func TestMQTTv5SessionExpiryStaleTimerRecordState(t *testing.T) {
 // MQTT connect after a restart, i.e. when the reconnect races (and beats) the
 // async startup sweep: the restore path checks the deadline synchronously.
 func TestMQTTv5SessionExpiryExpiredFirstReconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownRestartedServer(&s)
@@ -6065,6 +6180,7 @@ func TestMQTTv5SessionExpiryExpiredFirstReconnect(t *testing.T) {
 // that many seconds (then it is cleaned up), and it is orthogonal to Clean Start.
 // A DISCONNECT may update the interval. Spec5 [3.1.2.11.2], [3.14.2.2.2].
 func TestMQTTv5SessionExpiry(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -6236,6 +6352,7 @@ func TestMQTTv5SessionExpiry(t *testing.T) {
 // must not resume it: the session is discarded, like on the record-restore
 // path. Spec5 [3.1.2.11.2].
 func TestMQTTv5SessionExpiryOverdueInMemoryResume(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -6386,6 +6503,7 @@ func testMQTTConsumerExists(t testing.TB, s *Server, liveClientID, durable strin
 // replica that owns no local session, which reconciles a local expiry timer from
 // the authoritative persisted deadline. Spec5 [3.1.2.11.2].
 func TestMQTTv5SessionExpiryCrossReplicaHandoff(t *testing.T) {
+	t.Parallel()
 	oA := testMQTTDefaultOptionsV5()
 	sA := testMQTTRunServer(t, oA)
 	sB, oB := runSharedReplica(t, oA)
@@ -6614,6 +6732,7 @@ func testMQTTReconcileEntryPresent(asm *mqttAccountSessionManager, idHash string
 // A replica observing a remote session persist for a client it does not own
 // locally reconciles its local expiry timer from the authoritative record.
 func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -6714,6 +6833,7 @@ func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
 // even when they complete out of order, and their ordering state must be pruned
 // only when no worker is in flight.
 func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -6825,6 +6945,7 @@ func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
 // deadline, so correctness here comes from the ownership guard, not the fire-time
 // re-read. The newer local timer must survive unchanged. Spec5 [3.1.2.11.2].
 func TestMQTTv5RemoteExpiryReconcileLocalReconnectRace(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -6981,6 +7102,7 @@ func testMQTTReadPubV5Raw(t testing.TB, r *mqttReader, expTopic string, expPaylo
 // the subscription that carries it, across QoS0 and QoS1 delivery. Spec5
 // [3.8.2.1.2].
 func TestMQTTv5SubscriptionIdentifier(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7101,6 +7223,7 @@ func TestMQTTv5SubscriptionIdentifier(t *testing.T) {
 // identifier, and the Message Expiry rewrite composes with the injection. Spec5
 // [3.8.2.1.2], [3.3.2.3.3].
 func TestMQTTv5SubscriptionIdentifierRetained(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7152,6 +7275,7 @@ func TestMQTTv5SubscriptionIdentifierRetained(t *testing.T) {
 // with its own identifier, yields one PUBLISH per subscription carrying that
 // subscription's identifier. Spec5 [3.8.2.1.2].
 func TestMQTTv5SubscriptionIdentifierOverlapping(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7184,6 +7308,7 @@ func TestMQTTv5SubscriptionIdentifierOverlapping(t *testing.T) {
 // A re-SUBSCRIBE to the same filter replaces its identifier; re-subscribing with
 // no identifier clears it. Spec5 [3.8.2.1.2], [MQTT-3.8.4-3].
 func TestMQTTv5ResubscribeReplacesSubscriptionID(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7210,6 +7335,7 @@ func TestMQTTv5ResubscribeReplacesSubscriptionID(t *testing.T) {
 // A Subscription Identifier survives a persistent session's reconnect, for both a
 // fresh publish and the redelivery of an unacked QoS1 message. Spec5 [3.8.2.1.2].
 func TestMQTTv5SubscriptionIdentifierRestoredOnReconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7279,6 +7405,7 @@ func TestMQTTv5SubscriptionIdentifierRestoredOnReconnect(t *testing.T) {
 // same topic: only the v5 delivery carries the identifier; the 3.1.1 delivery has
 // no properties section at all.
 func TestMQTTv5SubscriptionIdentifier311Unaffected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7306,6 +7433,7 @@ func TestMQTTv5SubscriptionIdentifier311Unaffected(t *testing.T) {
 // A SUBSCRIBE carrying more than one Subscription Identifier, or one with value 0,
 // is a Protocol Error. Spec5 [MQTT-3.8.2.1.2], [3.3.2.3.8].
 func TestMQTTv5SubscribeSubscriptionIDProtocolErrors(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7363,6 +7491,7 @@ func TestMQTTv5SubscribeSubscriptionIDProtocolErrors(t *testing.T) {
 // Subscription Identifier but exceeds it once injected must be discarded; the
 // injection therefore has to happen before the size check. Spec5 [3.1.2.11.4].
 func TestMQTTv5SubscriptionIdentifierMaxPacketSize(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7414,6 +7543,7 @@ func TestMQTTv5SubscriptionIdentifierMaxPacketSize(t *testing.T) {
 // well-formed block, and out-of-range ids or unsafe/malformed blocks are left
 // unchanged. Spec5 [3.8.2.1.2].
 func TestMQTTv5InjectSubID(t *testing.T) {
+	t.Parallel()
 	parse := func(block []byte) *mqttProperties {
 		t.Helper()
 		r := &mqttReader{}
@@ -7537,6 +7667,7 @@ func testMQTTReadDisconnectV5(t testing.TB, r *mqttReader) (byte, *mqttPropertie
 // option: default when unset, the explicit value otherwise, and omitted (absent
 // => 0) when disabled.
 func TestMQTTv5TopicAliasMaxAdvertised(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		opt    int
@@ -7573,6 +7704,7 @@ func TestMQTTv5TopicAliasMaxAdvertised(t *testing.T) {
 // requested keep alive: never when the option is unset, and only when the
 // client asked for 0 (none) or a value above the configured maximum.
 func TestMQTTv5ServerKeepAliveAdvertised(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name     string
 		opt      int
@@ -7615,6 +7747,7 @@ func TestMQTTv5ServerKeepAliveAdvertised(t *testing.T) {
 // 3.1.1 client on the same server keeps its (absent) keep alive: the override is
 // silently inapplicable to v4, which has no way to be told of it.
 func TestMQTTv5ServerKeepAliveEnforced(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.KeepAliveMaximum = 1
 	s := testMQTTRunServer(t, o)
@@ -7642,6 +7775,7 @@ func TestMQTTv5ServerKeepAliveEnforced(t *testing.T) {
 // empty topic + the alias; the server resolves it and delivers on the bound
 // topic. Exercised at QoS 0 and QoS 1.
 func TestMQTTv5TopicAliasPublish(t *testing.T) {
+	t.Parallel()
 	for _, qos := range []byte{0, 1} {
 		t.Run(fmt.Sprintf("qos%d", qos), func(t *testing.T) {
 			o := testMQTTDefaultOptionsV5()
@@ -7679,6 +7813,7 @@ func TestMQTTv5TopicAliasPublish(t *testing.T) {
 // above the advertised maximum => 0x94 (Topic Alias invalid); an empty topic
 // with an unbound alias => 0x82 (Protocol Error).
 func TestMQTTv5TopicAliasErrors(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TopicAliasMaximum = 5
 	s := testMQTTRunServer(t, o)
@@ -7711,6 +7846,7 @@ func TestMQTTv5TopicAliasErrors(t *testing.T) {
 // Re-binding an existing alias to a new topic overwrites the previous binding;
 // a subsequent alias-only PUBLISH follows the new topic. Spec5 [3.3.2.3.4].
 func TestMQTTv5TopicAliasRemap(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7740,6 +7876,7 @@ func TestMQTTv5TopicAliasRemap(t *testing.T) {
 // subscriber: other properties survive, and when the alias was the only property
 // the subscriber receives an empty block.
 func TestMQTTv5TopicAliasStrippedOnForward(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7791,6 +7928,7 @@ func TestMQTTv5TopicAliasStrippedOnForward(t *testing.T) {
 // late subscriber gets the retained message with the alias stripped, and an
 // alias-only retained PUBLISH retains under the resolved topic.
 func TestMQTTv5TopicAliasStrippedInRetained(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7848,6 +7986,7 @@ func TestMQTTv5TopicAliasStrippedInRetained(t *testing.T) {
 // When topic aliases are disabled (TopicAliasMaximum -1), the CONNACK omits the
 // property and any alias-bearing PUBLISH is rejected with 0x94.
 func TestMQTTv5TopicAliasDisabled(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.TopicAliasMaximum = -1
 	s := testMQTTRunServer(t, o)
@@ -7869,6 +8008,7 @@ func TestMQTTv5TopicAliasDisabled(t *testing.T) {
 // present), a previously bound alias is unknown, so an alias-only PUBLISH is a
 // Protocol Error.
 func TestMQTTv5TopicAliasConnectionScoped(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -7895,6 +8035,7 @@ func TestMQTTv5TopicAliasConnectionScoped(t *testing.T) {
 // prefix, including where stripping the 3 alias bytes shrinks the prefix across
 // the 127/128-byte varint boundary. Every other property must survive intact.
 func TestMQTTv5StripTopicAlias(t *testing.T) {
+	t.Parallel()
 	// A block with no alias is returned unchanged.
 	noAlias := testMQTTv5PubPropsBlock()
 	if got := mqttStripTopicAlias(noAlias); &got[0] != &noAlias[0] {
@@ -8028,6 +8169,7 @@ func testMQTTSendPubAck(t testing.TB, c net.Conn, pi uint16) {
 // alias) and sends alias-only (empty topic + alias) on subsequent deliveries,
 // across QoS 0 and QoS 1. Spec5 [3.3.2.3.4].
 func TestMQTTv5OutboundTopicAliasBindReuse(t *testing.T) {
+	t.Parallel()
 	for _, qos := range []byte{0, 1} {
 		t.Run(fmt.Sprintf("qos%d", qos), func(t *testing.T) {
 			o := testMQTTDefaultOptionsV5()
@@ -8072,6 +8214,7 @@ func TestMQTTv5OutboundTopicAliasBindReuse(t *testing.T) {
 // one connection. Whichever delivery arrives first binds the alias and the
 // other reuses it; MQTT does not order delivery across QoS levels.
 func TestMQTTv5OutboundTopicAliasMixedQoS(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -8126,6 +8269,7 @@ func TestMQTTv5OutboundTopicAliasMixedQoS(t *testing.T) {
 
 // Distinct topics receive distinct aliases, first-come-first-served.
 func TestMQTTv5OutboundTopicAliasDistinct(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -8167,6 +8311,7 @@ func TestMQTTv5OutboundTopicAliasDistinct(t *testing.T) {
 // A client that advertises no Topic Alias Maximum (absent, or an explicit 0)
 // never receives an alias: every delivery carries the full topic.
 func TestMQTTv5OutboundTopicAliasClientMaxZero(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name  string
 		props []byte
@@ -8205,6 +8350,7 @@ func TestMQTTv5OutboundTopicAliasClientMaxZero(t *testing.T) {
 // Once the alias table is full, further distinct topics are sent unaliased while
 // already-bound topics keep using their alias.
 func TestMQTTv5OutboundTopicAliasTableFull(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -8247,6 +8393,7 @@ func TestMQTTv5OutboundTopicAliasTableFull(t *testing.T) {
 // The effective outbound maximum is min(client's advertised max, server option):
 // a small server cap wins over a large client max, and -1 disables aliasing.
 func TestMQTTv5OutboundTopicAliasServerCap(t *testing.T) {
+	t.Parallel()
 	t.Run("server-cap-wins", func(t *testing.T) {
 		o := testMQTTDefaultOptionsV5()
 		o.MQTT.TopicAliasMaximum = 1
@@ -8308,6 +8455,7 @@ func TestMQTTv5OutboundTopicAliasServerCap(t *testing.T) {
 // Aliases are connection-scoped: after a reconnect the unacked QoS1 message is
 // redelivered with the full topic (a fresh binding), never alias-only.
 func TestMQTTv5OutboundTopicAliasReconnectResets(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -8351,6 +8499,7 @@ func TestMQTTv5OutboundTopicAliasReconnectResets(t *testing.T) {
 // Retained-message deliveries are never aliased; a later live publish on the same
 // topic then binds the alias.
 func TestMQTTv5OutboundTopicAliasRetainedUnaliased(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -8383,6 +8532,7 @@ func TestMQTTv5OutboundTopicAliasRetainedUnaliased(t *testing.T) {
 // A Subscription Identifier and a Topic Alias coexist on a delivered PUBLISH: the
 // binding frame carries both, and the alias-only reuse keeps the identifier.
 func TestMQTTv5OutboundTopicAliasWithSubID(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -8437,6 +8587,7 @@ func TestMQTTv5OutboundTopicAliasWithSubID(t *testing.T) {
 // a topic: the 3.1.1 client always gets the full topic and no properties, while
 // the v5 client is aliased on reuse.
 func TestMQTTv5OutboundTopicAlias311Unaffected(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -8482,6 +8633,7 @@ func TestMQTTv5OutboundTopicAlias311Unaffected(t *testing.T) {
 // when they would exceed the client's limit, and a fresh binding is never
 // committed when its frame is dropped.
 func TestMQTTv5OutboundTopicAliasMaxPacketSize(t *testing.T) {
+	t.Parallel()
 	// mps builds a CONNECT props body carrying both a Maximum Packet Size and a
 	// Topic Alias Maximum.
 	mps := func(max uint32) []byte {
@@ -8626,6 +8778,7 @@ func TestMQTTv5OutboundTopicAliasMaxPacketSize(t *testing.T) {
 // mqttInjectTopicAlias appends a Topic Alias to a raw properties block, or
 // synthesizes one, and reports ok=false on a structurally invalid block.
 func TestMQTTInjectTopicAlias(t *testing.T) {
+	t.Parallel()
 	reparse := func(t *testing.T, block []byte) *mqttProperties {
 		t.Helper()
 		r := &mqttReader{}

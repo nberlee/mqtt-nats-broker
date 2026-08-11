@@ -60,6 +60,7 @@ func testGrantLifetime(t *testing.T, e *testRejectionEnv, c *client) error {
 // It now reads the record it is about to concede to. The successor row is what keeps that
 // from being a blanket downgrade.
 func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
@@ -98,6 +99,7 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 // proving any lineage at all and still pass the sibling cases above. The survivor here
 // shares neither our identity nor our parent.
 func TestSessUnrelatedLineageAtConnectTimeStaysForeign(t *testing.T) {
+	t.Parallel()
 	e := testNewConnectForkEnv(t, "cxfork-unrelated",
 		func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandUnrelated(t, e, testMutateSibling)
@@ -394,6 +396,7 @@ func testReconcileResumedConsumers(t *testing.T, e *testRejectionEnv, c *client)
 // resolveContendedRecordSave on that branch at all — so a mutation reverting one of them is
 // invisible to a test that only drives the other.
 func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession

@@ -142,6 +142,7 @@ func testMQTTReadPIPacket(expectedType byte, t testing.TB, r *mqttReader, expect
 }
 
 func TestMQTTReader(t *testing.T) {
+	t.Parallel()
 	r := &mqttReader{}
 	r.reset([]byte{0, 2, 'a', 'b'})
 	bs, err := r.readBytes("", false)
@@ -251,6 +252,7 @@ func TestMQTTReader(t *testing.T) {
 }
 
 func TestMQTTWriter(t *testing.T) {
+	t.Parallel()
 	w := newMQTTWriter(0)
 	w.WriteUint16(1234)
 
@@ -301,6 +303,7 @@ func TestMQTTWriter(t *testing.T) {
 }
 
 func TestMQTTIncompleteConnectMaxPayloadViolationDisconnects(t *testing.T) {
+	t.Parallel()
 	const maxPayload = 1024
 	const remainingLength = maxPayload + 1
 
@@ -325,6 +328,7 @@ func TestMQTTIncompleteConnectMaxPayloadViolationDisconnects(t *testing.T) {
 }
 
 func TestMQTTPacketLenMaxPayloadViolation(t *testing.T) {
+	t.Parallel()
 	const maxPayload = 1024
 
 	w := newMQTTWriter(0)
@@ -360,25 +364,37 @@ func testMQTTRunServer(t testing.TB, o *Options) *Server {
 	if o.StoreDir == _EMPTY_ {
 		o.StoreDir = t.TempDir()
 	}
-	testEmbeddedMu.Lock()
-	ns := testEmbeddedNATSByDir[o.StoreDir]
-	testEmbeddedMu.Unlock()
-	if ns == nil {
-		var err error
-		ns, err = natsserver.NewServer(&natsserver.Options{
+	// One embedded server per StoreDir, started once however many tests arrive
+	// together: two nats-servers on one store corrupt JetStream state.
+	entry, err := testEmbedded.acquire(o.StoreDir, func() (*natsserver.Server, error) {
+		ns, err := natsserver.NewServer(&natsserver.Options{
 			Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: o.StoreDir,
 		})
 		if err != nil {
-			t.Fatalf("Error creating embedded nats-server: %v", err)
+			return nil, fmt.Errorf("creating embedded nats-server: %w", err)
 		}
 		go ns.Start()
 		if !ns.ReadyForConnections(10 * time.Second) {
-			t.Fatal("embedded nats-server not ready")
+			ns.Shutdown()
+			return nil, errors.New("embedded nats-server not ready")
 		}
-		testEmbeddedMu.Lock()
-		testEmbeddedNATSByDir[o.StoreDir] = ns
-		testEmbeddedMu.Unlock()
+		return ns, nil
+	})
+	if err != nil {
+		t.Fatalf("Error starting embedded nats-server: %v", err)
 	}
+	// acquire took a reference for the pairing below. Every failure between here
+	// and pair leaves via t.Fatalf, which unwinds only THIS goroutine — the other
+	// parallel tests keep running — so without this the entry and its embedded
+	// server stay registered for the rest of the run. Deferred functions do run on
+	// Goexit, which is what makes this the right shape.
+	paired := false
+	defer func() {
+		if !paired {
+			testEmbedded.releaseEntry(entry)
+		}
+	}()
+	ns := entry.server()
 	nc, err := nats.Connect(ns.ClientURL())
 	if err != nil {
 		t.Fatalf("Error connecting to embedded nats-server: %v", err)
@@ -388,9 +404,8 @@ func testMQTTRunServer(t testing.TB, o *Options) *Server {
 		nc.Close()
 		t.Fatalf("Error starting MQTT server: %v", err)
 	}
-	testEmbeddedMu.Lock()
-	testEmbeddedNATS[s] = ns
-	testEmbeddedMu.Unlock()
+	testEmbedded.pair(s, entry)
+	paired = true
 	if err := s.readyForConnections(3 * time.Second); err != nil {
 		testMQTTShutdownServer(s)
 		t.Fatal(err)
@@ -406,23 +421,15 @@ func testMQTTShutdownRestartedServer(s **Server) {
 
 func testMQTTShutdownServer(s *Server) {
 	s.Shutdown()
-	testEmbeddedMu.Lock()
-	ns := testEmbeddedNATS[s]
-	delete(testEmbeddedNATS, s)
-	if ns != nil {
-		for dir, dns := range testEmbeddedNATSByDir {
-			if dns == ns {
-				delete(testEmbeddedNATSByDir, dir)
-			}
-		}
-	}
-	testEmbeddedMu.Unlock()
-	if ns != nil {
-		ns.Shutdown()
-	}
+	// One critical section: forgetting the pairing and forgetting the StoreDir
+	// entries that named the same embedded server have to be atomic together, or
+	// a restart could find a dir entry pointing at a server this call is about to
+	// shut down.
+	testEmbedded.release(s)
 }
 
 func TestMQTTValidateOptions(t *testing.T) {
+	t.Parallel()
 	nmqtto := DefaultOptions()
 	mqtto := testMQTTDefaultOptions()
 	for _, test := range []struct {
@@ -501,6 +508,7 @@ func TestMQTTValidateOptions(t *testing.T) {
 }
 
 func TestMQTTStart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -766,6 +774,7 @@ func testMQTTCheckPubAck(t testing.TB, r *mqttReader, packetType byte) {
 }
 
 func TestMQTTAuthTimeout(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name string
 		at   float64
@@ -824,6 +833,7 @@ func TestMQTTAuthTimeout(t *testing.T) {
 }
 
 func TestMQTTConnectNotFirstPacket(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -851,6 +861,7 @@ func TestMQTTConnectNotFirstPacket(t *testing.T) {
 }
 
 func TestMQTTSecondConnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -867,6 +878,7 @@ func TestMQTTSecondConnect(t *testing.T) {
 }
 
 func TestMQTTParseConnect(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		proto   []byte
@@ -921,6 +933,7 @@ func TestMQTTParseConnect(t *testing.T) {
 }
 
 func TestMQTTConnectFailsOnParse(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -957,6 +970,7 @@ func TestMQTTConnectFailsOnParse(t *testing.T) {
 }
 
 func TestMQTTConnKeepAlive(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -972,6 +986,7 @@ func TestMQTTConnKeepAlive(t *testing.T) {
 }
 
 func TestMQTTMalformedFixedHeaderFlagsCauseDisconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1047,6 +1062,7 @@ func TestMQTTMalformedFixedHeaderFlagsCauseDisconnect(t *testing.T) {
 }
 
 func TestMQTTMalformedRemainingLengthCausesDisconnect(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1124,6 +1140,7 @@ func TestMQTTMalformedRemainingLengthCausesDisconnect(t *testing.T) {
 }
 
 func TestMQTTTopicAndSubjectConversion(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name        string
 		mqttTopic   string
@@ -1198,6 +1215,7 @@ func TestMQTTTopicAndSubjectConversion(t *testing.T) {
 }
 
 func TestMQTTFilterConversion(t *testing.T) {
+	t.Parallel()
 	// Similar to TopicConversion test except that wildcards are OK here.
 	// So testing only those.
 	for _, test := range []struct {
@@ -1254,6 +1272,7 @@ func TestMQTTFilterConversion(t *testing.T) {
 }
 
 func TestMQTTParseSub(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		proto   []byte
@@ -1334,6 +1353,7 @@ func testMQTTSub(t testing.TB, pi uint16, c net.Conn, r *mqttReader, filters []*
 }
 
 func TestMQTTSubAck(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.Users = []*User{
 		{
@@ -1367,6 +1387,7 @@ func TestMQTTSubAck(t *testing.T) {
 }
 
 func TestMQTTQoS2SubDowngrade(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.downgradeQoS2Sub = true
 	s := testMQTTRunServer(t, o)
@@ -1595,6 +1616,7 @@ func testMQTTPublish(t testing.TB, c net.Conn, r *mqttReader, qos byte, dup, ret
 }
 
 func TestMQTTParsePub(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		flags   byte
@@ -1634,6 +1656,7 @@ func TestMQTTParsePub(t *testing.T) {
 }
 
 func TestMQTTParsePIMsg(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name  string
 		proto []byte
@@ -1654,6 +1677,7 @@ func TestMQTTParsePIMsg(t *testing.T) {
 }
 
 func TestMQTTPublish(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1671,6 +1695,7 @@ func TestMQTTPublish(t *testing.T) {
 }
 
 func TestMQTTQoS2PubReject(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.rejectQoS2Pub = true
 	s := testMQTTRunServer(t, o)
@@ -1690,6 +1715,7 @@ func TestMQTTQoS2PubReject(t *testing.T) {
 }
 
 func TestMQTTSub(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1756,6 +1782,7 @@ func TestMQTTSub(t *testing.T) {
 }
 
 func TestMQTTSubQoS2(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1821,6 +1848,7 @@ func TestMQTTSubQoS2(t *testing.T) {
 }
 
 func TestMQTTSubQoS1(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1880,6 +1908,7 @@ func getSubQoS(sub *subscription) int {
 }
 
 func TestMQTTSubDups(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2000,6 +2029,7 @@ func TestMQTTSubDups(t *testing.T) {
 }
 
 func TestMQTTSubWithSpaces(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2020,6 +2050,7 @@ func TestMQTTSubWithSpaces(t *testing.T) {
 // connection drop. mqttFilterToNATSSubject rejects them; the SUBSCRIBE
 // parser logs and continues so the failure surfaces as mqttSubAckFailure.
 func TestMQTTSubWithControlChars(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2048,6 +2079,7 @@ func TestMQTTSubWithControlChars(t *testing.T) {
 }
 
 func TestMQTTSubCaseSensitive(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2080,6 +2112,7 @@ func TestMQTTSubCaseSensitive(t *testing.T) {
 }
 
 func TestMQTTPubSubMatrix(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name        string
 		natsPub     bool
@@ -2176,6 +2209,7 @@ func TestMQTTPubSubMatrix(t *testing.T) {
 }
 
 func TestMQTTPreventSubWithMQTTSubPrefix(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2189,6 +2223,7 @@ func TestMQTTPreventSubWithMQTTSubPrefix(t *testing.T) {
 }
 
 func TestMQTTTrackPendingOverrun(t *testing.T) {
+	t.Parallel()
 	sess := mqttSession{}
 	// Real sessions always have a positive max pending (mqttSessionCreate uses
 	// the configured MaxAckPending or the default); use the maximum here so this
@@ -2220,6 +2255,7 @@ func TestMQTTTrackPendingOverrun(t *testing.T) {
 }
 
 func TestMQTTSubRestart(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2279,6 +2315,7 @@ func testMQTTConnectDisconnect(t *testing.T, o *Options, clientID string, clean 
 }
 
 func TestMQTTRetainedNoMsgBodyCorruption(t *testing.T) {
+	t.Parallel()
 	f := func() {
 		o := testMQTTDefaultOptions()
 		s := testMQTTRunServer(t, o)
@@ -2384,6 +2421,7 @@ func (l *remoteConnSameClientIDLogger) Warnf(format string, args ...any) {
 }
 
 func TestMQTTParseUnsub(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		proto   []byte
@@ -2450,6 +2488,7 @@ func testMQTTUnsub(t *testing.T, pi uint16, c net.Conn, r *mqttReader, filters [
 }
 
 func TestMQTTUnsub(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2516,6 +2555,7 @@ func testMQTTExpectDisconnect(t testing.TB, c net.Conn) {
 }
 
 func TestMQTTPublishTopicErrors(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2565,6 +2605,7 @@ func testMQTTDisconnectEx(t testing.TB, c net.Conn, bw *bufio.Writer, wait bool)
 }
 
 func TestMQTTWill(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2627,6 +2668,7 @@ func TestMQTTWill(t *testing.T) {
 }
 
 func TestMQTTQoS2WillReject(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.rejectQoS2Pub = true
 	s := testMQTTRunServer(t, o)
@@ -2653,6 +2695,7 @@ func TestMQTTQoS2WillReject(t *testing.T) {
 }
 
 func TestMQTTWillRetain(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		pubQoS byte
@@ -2730,6 +2773,7 @@ func TestMQTTWillRetain(t *testing.T) {
 }
 
 func TestMQTTPublishRetain(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2783,6 +2827,7 @@ func TestMQTTPublishRetain(t *testing.T) {
 }
 
 func TestMQTTQoS2RetainedReject(t *testing.T) {
+	t.Parallel()
 	// Start the server with QOS2 enabled, and submit retained messages with QoS
 	// 1 and 2.
 	o := testMQTTDefaultOptions()
@@ -2818,6 +2863,7 @@ func TestMQTTQoS2RetainedReject(t *testing.T) {
 }
 
 func TestMQTTRetainFlag(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2864,6 +2910,7 @@ func TestMQTTRetainFlag(t *testing.T) {
 }
 
 func TestMQTTCleanSession(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2892,6 +2939,7 @@ func TestMQTTCleanSession(t *testing.T) {
 }
 
 func TestMQTTDuplicateClientID(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2913,6 +2961,7 @@ func TestMQTTDuplicateClientID(t *testing.T) {
 }
 
 func TestMQTTPersistedSession(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownRestartedServer(&s)
@@ -3095,6 +3144,7 @@ func TestMQTTPersistedSession(t *testing.T) {
 }
 
 func TestMQTTRejectsHashCollidingClientID(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3130,6 +3180,7 @@ func TestMQTTRejectsHashCollidingClientID(t *testing.T) {
 }
 
 func TestMQTTRecoverSessionAndAddNewSub(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownRestartedServer(&s)
@@ -3176,6 +3227,7 @@ func TestMQTTRecoverSessionAndAddNewSub(t *testing.T) {
 }
 
 func TestMQTTRecoverSessionWithSubAndClientResendSub(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownRestartedServer(&s)
@@ -3340,6 +3392,7 @@ func TestMQTTFlappingSession(t *testing.T) {
 }
 
 func TestMQTTLockedSession(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3405,6 +3458,7 @@ func TestMQTTLockedSession(t *testing.T) {
 }
 
 func TestMQTTPersistRetainedMsg(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownRestartedServer(&s)
@@ -3534,6 +3588,7 @@ func TestMQTTRetainedMsgCleanup(t *testing.T) {
 }
 
 func TestMQTTRestoreRetainedMsgs(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3581,6 +3636,7 @@ func TestMQTTRestoreRetainedMsgs(t *testing.T) {
 }
 
 func TestMQTTConnAckFirstPacket(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.NoLog, o.Debug, o.Trace = true, false, false
 	s := testMQTTRunServer(t, o)
@@ -3639,6 +3695,7 @@ func TestMQTTConnAckFirstPacket(t *testing.T) {
 }
 
 func TestMQTTRedeliveryAckWait(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -3720,6 +3777,7 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 // above the client read deadline (testMQTTTimeout) so a redelivery arriving
 // proves it was triggered by the reconnect, not by the AckWait timer.
 func TestMQTTReconnectForcesRedeliveryWithDUP(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 3 * testMQTTTimeout
 	s := testMQTTRunServer(t, o)
@@ -3766,6 +3824,7 @@ func TestMQTTReconnectForcesRedeliveryWithDUP(t *testing.T) {
 // their packet identifiers leak and permanently count against the in-flight cap
 // for the life of the session (as mqttProcessUnsubs already does).
 func TestMQTTQoS0DowngradePurgesPending(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3824,6 +3883,7 @@ func TestMQTTQoS0DowngradePurgesPending(t *testing.T) {
 //   - After one is PUBCOMP-ed, and one is PUBREC-ed, Unsubscribe.
 //   - See that the remaining 2 are fully delivered.
 func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// Leave enough time to read the initial three-message batch before the
 	// first unacknowledged PUBLISH becomes eligible for redelivery. The old
@@ -3915,6 +3975,7 @@ func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
 }
 
 func TestMQTTQoS2RejectPublishDuplicates(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -3985,6 +4046,7 @@ func TestMQTTQoS2RejectPublishDuplicates(t *testing.T) {
 }
 
 func TestMQTTQoS2RetriesPublish(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 100 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -4029,6 +4091,7 @@ func TestMQTTQoS2RetriesPublish(t *testing.T) {
 }
 
 func TestMQTTQoS2RetriesPubRel(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 50 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -4069,6 +4132,7 @@ func TestMQTTQoS2RetriesPubRel(t *testing.T) {
 }
 
 func TestMQTTAckWaitConfigChange(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -4139,6 +4203,7 @@ func TestMQTTAckWaitConfigChange(t *testing.T) {
 }
 
 func TestMQTTUnsubscribeWithPendingAcks(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -4212,6 +4277,7 @@ func TestMQTTUnsubscribeWithPendingAcks(t *testing.T) {
 }
 
 func TestMQTTMaxAckPending(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.MaxAckPending = 1
 	s := testMQTTRunServer(t, o)
@@ -4323,6 +4389,7 @@ func TestMQTTMaxAckPending(t *testing.T) {
 }
 
 func TestMQTTMaxAckPendingForMultipleSubs(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	o.MQTT.MaxAckPending = 1
@@ -4360,6 +4427,7 @@ func TestMQTTMaxAckPendingForMultipleSubs(t *testing.T) {
 }
 
 func TestMQTTMaxAckPendingOverLimit(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.MaxAckPending = 20000
 	s := testMQTTRunServer(t, o)
@@ -4420,6 +4488,7 @@ func TestMQTTMaxAckPendingOverLimit(t *testing.T) {
 }
 
 func TestMQTTStreamInfoReturnsNonEmptySubject(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4476,6 +4545,7 @@ func (cwc *chunkWriteConn) Write(p []byte) (int, error) {
 }
 
 func TestMQTTClientIDInLogStatements(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4514,6 +4584,7 @@ func TestMQTTClientIDInLogStatements(t *testing.T) {
 }
 
 func TestMQTTConsumerReplicasValidate(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	for _, test := range []struct {
 		name string
@@ -4558,6 +4629,7 @@ func TestMQTTConsumerReplicasValidate(t *testing.T) {
 // with Topic Names beginning with a $ character [MQTT-4.7.2-1]
 
 func TestMQTTTopicWithDot(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4601,6 +4673,7 @@ func TestMQTTTopicWithDot(t *testing.T) {
 // Issue https://github.com/nats-io/nats-server/issues/4291
 
 func TestMQTTSparkbDeathHandling(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4692,6 +4765,7 @@ func TestMQTTSparkbDeathHandling(t *testing.T) {
 }
 
 func TestMQTTSparkbBirthHandling(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -4775,6 +4849,7 @@ func TestMQTTSparkbBirthHandling(t *testing.T) {
 }
 
 func TestMQTTSliceHeadersAndDecodeRetainedMessage(t *testing.T) {
+	t.Parallel()
 	// First check low level mqttSliceHeaders
 	for _, test := range []struct {
 		name     string
@@ -5019,6 +5094,7 @@ func TestMQTTRetainedMsgRemovedFromMapIfNotInStream(t *testing.T) {
 // stream now, so the subject that matters is $MQTT.sess.<hash> — where an unguarded
 // publish would land a durable record rather than a transient notification.
 func TestMQTTSessionPersistSpoofPrevented(t *testing.T) {
+	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.Users = []*User{
 		{
