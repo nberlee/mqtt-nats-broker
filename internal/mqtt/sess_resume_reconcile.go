@@ -241,7 +241,7 @@ const (
 // There is no digest arm, and that is deliberate rather than an omission: a rejected
 // write did not land, so a later record matching our bytes cannot be this attempt.
 func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg *StoredMsg, lerr error,
-	ourGen, ackWID, ackPWID string) mqttRejectionVerdict {
+	ackWID, ackPWID string) mqttRejectionVerdict {
 
 	switch outcome {
 	case saveLanded:
@@ -273,7 +273,7 @@ func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg 
 		// foreign, and only above the base — a record below it stays foreign fail-safe,
 		// because a lower sequence means a reset or re-provisioned store.
 		if smsg.Sequence > detail.baseSeq &&
-			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ourGen, ackWID, ackPWID) == mqttLineageForked {
+			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ackWID, ackPWID) == mqttLineageForked {
 			return mqttRejectionForked
 		}
 		return mqttRejectionForeign
@@ -864,14 +864,14 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	// The pair this broker was acknowledged for, sampled once: the loop's landed arms
 	// return immediately, so no iteration can observe a pair this call itself moved.
 	sess.mu.Lock()
-	ourGen, ackWID, ackPWID := sess.gen, sess.wid, sess.pwid
+	ackWID, ackPWID := sess.wid, sess.pwid
 	sess.mu.Unlock()
 	movedVerdict := func(smsg *StoredMsg) mqttRepairSaveVerdict {
 		// Reached only after the digest comparison above has ruled the record out as
 		// ours, and gated on the same `> base` the landed arm uses — a record below
 		// the base stays foreign fail-safe whatever its identity says.
 		if smsg != nil && smsg.Sequence > d.baseSeq &&
-			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ourGen, ackWID, ackPWID) == mqttLineageForked {
+			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ackWID, ackPWID) == mqttLineageForked {
 			return mqttRepairSaveForked
 		}
 		return mqttRepairSaveForeign

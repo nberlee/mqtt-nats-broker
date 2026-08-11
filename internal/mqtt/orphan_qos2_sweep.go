@@ -96,6 +96,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -470,8 +471,19 @@ func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 			continue
 		}
 		if err := as.finishAdoptedTeardown(cur, idHash, curSeq, opts); err != nil {
-			// Everything this record names stays referenced until a later pass.
-			s.Warnf("MQTT teardown adoption: unable to finish the abandoned teardown of session %q: %v", idHash, err)
+			if !errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
+				// Everything this record names stays referenced until a later pass.
+				s.Warnf("MQTT teardown adoption: unable to finish the abandoned teardown of session %q: %v", idHash, err)
+				continue
+			}
+			// TERMINAL, and a success for this sweep: a newer record holds the subject,
+			// so the teardown this pass quarantined was not abandoned after all —
+			// somebody finished it. Given its own branch because the quarantine entry
+			// must still be FORGOTTEN: left standing it would keep re-observing a marker
+			// that no longer exists, and every later pass would re-derive the same
+			// verdict. The warning arm would skip exactly that.
+			s.Debugf("MQTT teardown adoption: the teardown of session %q was superseded; nothing was left to finish", idHash)
+			q.forget(mqttQuarantineTeardownKey(idHash))
 			continue
 		}
 		s.Debugf("MQTT teardown adoption: finished the abandoned teardown of session %q", idHash)

@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -165,10 +166,12 @@ func TestSessTeardownLostClaimDeletesNothing(t *testing.T) {
 	}
 
 	// A now tears down against its stale view. Losing the claim is a COMPLETE
-	// outcome — there is nothing left for A to do — so it is not an error; what
-	// matters is that A touched nothing.
-	if err := sessA.clear(false); err != nil {
-		t.Fatalf("A's superseded teardown should be a no-op, not an error: %v", err)
+	// outcome — there is nothing left for A to do — and since F-029 it is REPORTED as
+	// such rather than as success: a caller that read it as success went on to write
+	// at the sequence clear() had just reset to 0, erasing B's record. What still
+	// matters just as much is that A touched nothing.
+	if err := sessA.clear(false); !errors.Is(err, errMQTTClearSuperseded) {
+		t.Fatalf("A's superseded teardown must report the superseded outcome, got %v", err)
 	}
 
 	ps, seq := testLoadSessRecord(t, a, sessA.idHash)
@@ -265,9 +268,11 @@ func TestSessTeardownLateDeleteIsHarmless(t *testing.T) {
 	})
 	defer restore()
 
-	// A resumes: its deletions and its release now land after everything above.
-	if err := sessA.clear(false); err != nil {
-		t.Fatalf("A's late teardown reported an error: %v", err)
+	// A resumes: its deletions and its release now land after everything above. Its
+	// release re-read finds B's record, so the outcome is superseded — a complete one,
+	// reported as errMQTTClearSuperseded since F-029.
+	if err := sessA.clear(false); !errors.Is(err, errMQTTClearSuperseded) {
+		t.Fatalf("A's late teardown must report the superseded outcome, got %v", err)
 	}
 	restore()
 
@@ -377,8 +382,9 @@ func TestSessTeardownAdoptedByConnect(t *testing.T) {
 
 	// 0c: the original owner wakes up. Its deletions name the retired generation
 	// only, and its release must classify as superseded/released, never as license
-	// to keep deleting.
-	if err := sessA.clear(false); err != nil {
+	// to keep deleting. Superseded is now reported as errMQTTClearSuperseded rather
+	// than as success (F-029); anything else is a real failure.
+	if err := sessA.clear(false); err != nil && !errors.Is(err, errMQTTClearSuperseded) {
 		t.Fatalf("the paused owner's teardown reported an error after the handover: %v", err)
 	}
 }

@@ -451,12 +451,26 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if err := sess.deleteTeardownTargets(target, false); err != nil {
 		return err
 	}
+	// The window between an adoption's deletions and its release, in which a peer's
+	// record is still invisible to every check that ran before it. Both callers'
+	// superseded dispositions are reached through here, so a test arms one broker in
+	// exactly this window rather than racing the two for real.
+	if h := mqttTestTeardownAdoptionWindowHookV.Load(); h != nil {
+		(*h)(ps.ID, idHash, seq)
+	}
 	switch res, rerr := sess.releaseTeardown(tok, target, ps.Teardown.Nonce, seq); res {
 	case mqttTeardownReleased:
 	case mqttTeardownSuperseded:
 		// Somebody else's record is there now. Nothing further is ours to delete —
 		// and in particular the group durables its membership may hold are not.
-		return nil
+		//
+		// SURFACED, not swallowed. Returning nil here told createOrRestoreSession the
+		// adoption had completed, and it handed back a fresh base-0 object without
+		// re-reading the record it had authoritatively been told exists — a write on a
+		// base already known to be stale, which is R1's one production violation. The
+		// two terminal callers are given this branch explicitly rather than inheriting
+		// an error arm. See sess_takeover_redrive.go.
+		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, errMQTTTeardownAdoptionSuperseded)
 	default:
 		return rerr
 	}

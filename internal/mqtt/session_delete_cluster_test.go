@@ -17,6 +17,7 @@
 package mqtt
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -134,7 +135,23 @@ func TestMQTTSessionDeleteAlreadyDeletedReplicated(t *testing.T) {
 	}
 	err = sess.clear(false)
 	asm.unlockSession(sess)
-	if err != nil {
+	// ACCEPTANCE is the assertion, and since F-029 it has two shapes rather than one.
+	// claimTeardown has always reported an absent record as SUPERSEDED — "the record is
+	// gone, so somebody else already released this session" — and clear() used to
+	// flatten that to nil. It now returns errMQTTClearSuperseded, which says the same
+	// thing with a type: the base is not current, nothing was deleted on its behalf, and
+	// there is no further record work. All six callers treat it as complete (four are
+	// terminal, the two CONNECT paths re-read and start fresh).
+	//
+	// So the check is narrowed rather than relaxed: anything OTHER than those two
+	// outcomes is still a rejection of the already-deleted record.
+	if err != nil && !errors.Is(err, errMQTTClearSuperseded) {
 		t.Fatalf("Session teardown rejected the already-deleted record: %v", err)
+	}
+	// And it stayed deleted: a teardown that "accepted" the absence by recreating the
+	// record would satisfy the check above and be exactly wrong.
+	if _, lerr := jsa.loadSessionMsg(sess.domainTk, sess.idHash); lerr == nil ||
+		isErrorOtherThan(lerr, JSNoMessageFoundErr) {
+		t.Fatalf("the record must still be absent after the teardown, got %v", lerr)
 	}
 }

@@ -415,7 +415,7 @@ func TestSessLowerSequenceSiblingIsReportedForeign(t *testing.T) {
 
 	t.Run("classifyRejectedProbe", func(t *testing.T) {
 		d := mqttSessSaveDetail{baseSeq: base, rawErr: ApiErrors[JSStreamWrongLastSequenceConstantErr]}
-		got := classifyRejectedProbe(saveDefinitelyFailed, d, below, nil, ourGen, ackWID, ackPWID)
+		got := classifyRejectedProbe(saveDefinitelyFailed, d, below, nil, ackWID, ackPWID)
 		if got != mqttRejectionForeign {
 			t.Fatalf("a sibling BELOW the base stays foreign fail-safe: got %v", got)
 		}
@@ -423,7 +423,7 @@ func TestSessLowerSequenceSiblingIsReportedForeign(t *testing.T) {
 
 	t.Run("classifyAttemptReadback", func(t *testing.T) {
 		pw := &mqttPendingWrite{baseSeq: base, digest: mqttRecordDigest([]byte("other"))}
-		got, seq := classifyAttemptReadback(below, nil, pw, ourGen, ackWID, ackPWID)
+		got, seq := classifyAttemptReadback(below, nil, pw, ackWID, ackPWID)
 		if got != mqttAttemptForeign || seq != 0 {
 			t.Fatalf("a sibling BELOW the base stays foreign fail-safe: got (%v,%d)", got, seq)
 		}
@@ -434,11 +434,11 @@ func TestSessLowerSequenceSiblingIsReportedForeign(t *testing.T) {
 	above := &StoredMsg{Sequence: 11, Data: body}
 	t.Run("above the base, both classifiers report forked", func(t *testing.T) {
 		d := mqttSessSaveDetail{baseSeq: base, rawErr: ApiErrors[JSStreamWrongLastSequenceConstantErr]}
-		if got := classifyRejectedProbe(saveDefinitelyFailed, d, above, nil, ourGen, ackWID, ackPWID); got != mqttRejectionForked {
+		if got := classifyRejectedProbe(saveDefinitelyFailed, d, above, nil, ackWID, ackPWID); got != mqttRejectionForked {
 			t.Fatalf("classifyRejectedProbe above the base = %v, want forked", got)
 		}
 		pw := &mqttPendingWrite{baseSeq: base, digest: mqttRecordDigest([]byte("other"))}
-		if got, _ := classifyAttemptReadback(above, nil, pw, ourGen, ackWID, ackPWID); got != mqttAttemptForked {
+		if got, _ := classifyAttemptReadback(above, nil, pw, ackWID, ackPWID); got != mqttAttemptForked {
 			t.Fatalf("classifyAttemptReadback above the base = %v, want forked", got)
 		}
 	})

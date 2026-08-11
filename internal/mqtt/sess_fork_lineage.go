@@ -109,16 +109,20 @@ func (l mqttRecordLineage) String() string {
 // There is deliberately no "is this our own record" arm and no "direct successor" arm:
 // with only two verdicts, either would turn not-forked into not-forked, so no mutation
 // could kill it and it would state nothing a test can distinguish.
-func classifyRecordLineage(found *mqttPersistedSession, ourGen, ackWID, ackPWID string) mqttRecordLineage {
+func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) mqttRecordLineage {
 	if found == nil {
 		return mqttLineageNotForked
 	}
-	// A different incarnation restarts the lineage — its parent pointers name records
-	// of a generation we may not reason about at all. Reuses the identity
-	// sess_incarnation.go already established rather than inventing a second one.
-	if found.Gen != ourGen {
-		return mqttLineageNotForked
-	}
+	// The incarnation GENERATION is deliberately not consulted, and that is a reversal.
+	// It used to short-circuit here — a different incarnation was held to restart the
+	// lineage — which made the one fork this feature exists to catch invisible: a
+	// CLEAN-START sibling is written by a session clear() re-minted, so it ALWAYS
+	// carries a different generation, and the short-circuit conceded before the pointer
+	// test ran. Record identities are globally unique NUIDs, so a parent match means
+	// descent from one actual record whatever generation wrote it; a generation
+	// mismatch adds nothing to that and only suppressed it. See
+	// parentForNextWriteLocked.
+	//
 	// All four conjuncts are load-bearing, and each is stated here rather than assumed
 	// by the callers, because each has a shape that would otherwise be misclassified:
 	//
@@ -140,6 +144,27 @@ func classifyRecordLineage(found *mqttPersistedSession, ourGen, ackWID, ackPWID 
 		return mqttLineageForked
 	}
 	return mqttLineageNotForked
+}
+
+// parentForNextWriteLocked is the record a new write descends from: the one we hold, or —
+// for a session object a teardown RE-MINTED and a caller then reused — the record that
+// teardown claimed.
+//
+// Both parenting sites call it, and the fallback is what carries the chain across the
+// re-mint. Without it clear() leaves the next create parentless, and the two siblings of
+// one base — a resume child {b, a} and a clean-start survivor written after tearing a down
+// — have nothing in common for classifyRecordLineage to match on, so a broker whose record
+// was ERASED by a sibling reports a takeover that never happened.
+//
+// The claimed record's WID, never the teardown marker's: the marker is deleted by the
+// release and is nobody's base.
+//
+// sess.mu must be held.
+func (sess *mqttSession) parentForNextWriteLocked() string {
+	if sess.wid != _EMPTY_ {
+		return sess.wid
+	}
+	return sess.reMintedFrom
 }
 
 // adoptRecordLineageLocked adopts the lineage an attempt STAMPED, for a caller that has
@@ -215,6 +240,23 @@ var (
 		logReason:   "could not be shown to be owned elsewhere; closing this connection",
 		closeReason: StaleConnection,
 	}
+	// mqttDisposalTeardownIncomplete is what a teardown that began DESTROYING state and
+	// could not finish licenses. Its reason code matches the forked one, and the
+	// rationale does not: nothing here proves a sibling, and nothing proves another
+	// owner either. What is known is narrower and worse — this broker erased the
+	// session's own state and cannot say whether the record survived — so the client
+	// must be let go, and 0x89 "try again later" is the only honest instruction. 0x8E
+	// would tell it to stop reconnecting under a session nobody demonstrably took.
+	//
+	// It is a separate value rather than a reuse of mqttDisposalForked because the NAME
+	// is read at the call site as the claim being made. See processConnect's post-reset
+	// clear() arm.
+	mqttDisposalTeardownIncomplete = mqttDisposalVocabulary{
+		reason:      mqttReasonServerBusy,
+		reasonStr:   mqttReasonStrOwnershipUnsettled,
+		logReason:   "was left inconsistent by a teardown that could not complete; closing this connection",
+		closeReason: StaleConnection,
+	}
 )
 
 // mqttDisposalForForeignResolution maps an ambiguity resolution onto what it licenses
@@ -252,8 +294,8 @@ func mqttDisposalForRepairSave(v mqttRepairSaveVerdict) mqttDisposalVocabulary {
 // `Sequence > sess.seq` gate AHEAD of this call — that is this consult's sequence
 // fail-safe — and calls it only on the usable-record path: an absent, undecodable or
 // below-target record concedes through the license rule without reaching lineage.
-func disposalForRemotePersist(ps *mqttPersistedSession, ourGen, ackWID, ackPWID string) mqttDisposalVocabulary {
-	if classifyRecordLineage(ps, ourGen, ackWID, ackPWID) == mqttLineageForked {
+func disposalForRemotePersist(ps *mqttPersistedSession, ackWID, ackPWID string) mqttDisposalVocabulary {
+	if classifyRecordLineage(ps, ackWID, ackPWID) == mqttLineageForked {
 		return mqttDisposalForked
 	}
 	return mqttDisposalTakenOver
@@ -278,10 +320,10 @@ func (sess *mqttSession) disposalForDirectRejection(d *mqttSessSaveDetail) mqttD
 		return mqttDisposalTakenOver
 	}
 	sess.mu.Lock()
-	ourGen, ackWID, ackPWID := sess.gen, sess.wid, sess.pwid
+	ackWID, ackPWID := sess.wid, sess.pwid
 	sess.mu.Unlock()
 	if smsg.Sequence > d.baseSeq &&
-		classifyRecordLineage(mqttDecodeSessionRecord(smsg), ourGen, ackWID, ackPWID) == mqttLineageForked {
+		classifyRecordLineage(mqttDecodeSessionRecord(smsg), ackWID, ackPWID) == mqttLineageForked {
 		return mqttDisposalForked
 	}
 	return mqttDisposalTakenOver

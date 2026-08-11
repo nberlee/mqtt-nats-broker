@@ -474,9 +474,17 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 			}
 			return resp.Sequence
 		}, true, mqttReasonSessionTakenOver, mqttWillCancelled},
-		{"generation mismatch concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
+		// INVERTED by F-029, deliberately. This row used to assert that a different
+		// incarnation concedes, which was the generation short-circuit in
+		// classifyRecordLineage. That short-circuit hid the one fork the rule exists to
+		// catch: a clean-start sibling is written by a session clear() re-minted, so it
+		// carries a different generation BY CONSTRUCTION and this shape is precisely
+		// what a fork looks like. It now classifies forked, which means 0x89 (reconnect
+		// invited) rather than 0x8E, and the Will outbox record is preserved — a forked
+		// verdict proved no session continuation, so it may not destroy the outbox.
+		{"sibling of another incarnation is forked", func(t *testing.T, e *testRejectionEnv) uint64 {
 			return e.landRecord(t, func(ps *mqttPersistedSession) { ps.Gen = mqttNewSessGen() })
-		}, true, mqttReasonSessionTakenOver, mqttWillCancelled},
+		}, true, mqttReasonServerBusy, mqttWillPending},
 		{"absent lineage concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
 			return e.landRecord(t, func(ps *mqttPersistedSession) { ps.WID, ps.PWID = _EMPTY_, _EMPTY_ })
 		}, true, mqttReasonSessionTakenOver, mqttWillCancelled},

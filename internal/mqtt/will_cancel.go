@@ -354,9 +354,9 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 		// candidate's: the re-save above either landed (in which case DisconnectedAt is
 		// set and this arm is unreachable) or did not, and a rollback never adopts.
 		es.mu.Lock()
-		ourGen, ackWID, ackPWID := es.gen, es.wid, es.pwid
+		ackWID, ackPWID := es.wid, es.pwid
 		es.mu.Unlock()
-		if classifyRecordLineage(ps, ourGen, ackWID, ackPWID) == mqttLineageForked {
+		if classifyRecordLineage(ps, ackWID, ackPWID) == mqttLineageForked {
 			result = rollbackForked
 		} else {
 			result = rollbackSuperseded
@@ -444,7 +444,7 @@ func (as *mqttAccountSessionManager) rollbackStoreSession(es *mqttSession, tok r
 	// session is removed by the caller and never adopts this pair. See
 	// sess_fork_lineage.go.
 	es.mu.Lock()
-	ps.WID, ps.PWID = mqttNewRecordWID(), es.wid
+	ps.WID, ps.PWID = mqttNewRecordWID(), es.parentForNextWriteLocked()
 	es.mu.Unlock()
 	as.mu.RLock()
 	hook := as.testRollbackSessionStore

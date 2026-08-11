@@ -1347,8 +1347,11 @@ type mqttSession struct {
 	// an unbound never-expiring session nothing else ever asks again. Zero means none.
 	//
 	// Guarded by mu; validity is the predicate recordRejectionPendingLocked, not the
-	// field alone. See sess_rejected_write.go.
-	recordRejectedSeq uint64
+	// field alone. recordRejectedArmed is whether there IS a marker, which the sequence
+	// can no longer stand in for: a base-0 CAS is real since F-029, so zero is a
+	// legitimate rejection base rather than "none". See sess_rejected_write.go.
+	recordRejectedSeq   uint64
+	recordRejectedArmed bool
 	// gen is this session INCARNATION's durable generation. It namespaces every
 	// resource whose name would otherwise derive from idHash alone — the PUBREL
 	// durable, subject and delivery subject, and the inbound QoS 2 hold subjects —
@@ -1366,6 +1369,19 @@ type mqttSession struct {
 	// because a lineage that lags the sequence would parent the next write to a
 	// record that is no longer the base. See sess_fork_lineage.go.
 	wid, pwid string
+	// reMintedFrom is the record a teardown CLAIMED on a session object that was then
+	// REUSED as a fresh one — the third lineage fact, and deliberately not one of the
+	// two above. wid means "the record we are acknowledged for" at six reading sites,
+	// and a re-minted object is acknowledged for nothing; pwid is that record's parent.
+	// What the next write needs to descend from, when we hold no record at all, is
+	// neither, so it gets its own field and one accessor
+	// (parentForNextWriteLocked).
+	//
+	// It is what makes a CLEAN-START fork recognisable: the sibling of base a written
+	// after tearing a down is {c, a}, not {c, ""}, so it and a resume child {b, a}
+	// share a parent. Memory-only, and self-retiring — once a save lands, wid is
+	// non-empty and this is never consulted again. See sess_fork_lineage.go.
+	reMintedFrom string
 	// regClaim is this session OBJECT's ownership identity for shared-delivery
 	// in-flight registers. Unlike gen it is deliberately not persisted: a resume on
 	// another broker constructs a new object and therefore takes a new claim, while a
@@ -3347,7 +3363,18 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 			//
 			// FALL THROUGH rather than return. The !doClean block is skipped anyway, and
 			// this connection's Will is still owed.
-			if !errors.Is(err, errMQTTClearRefusedUnresolved) || !s.reparkRefusedDiscard(asm, sess, time.Now().Unix()) {
+			switch {
+			case errors.Is(err, errMQTTClearSuperseded):
+				// TERMINAL, and a normal outcome: the base this discard claimed is not
+				// current, so another owner holds the session (or it is already gone) and
+				// nothing here was ours to delete. Its own branch rather than the fall-
+				// through below, because logging a normal outcome at error level is what
+				// sends an operator hunting a teardown that never went wrong. Explicitly
+				// NOT re-parked either — nothing was refused, and re-parking would
+				// resurrect a discard obligation the current owner now holds.
+				c.Debugf("MQTT: discard of session %q stopped: %v", sess.id, err)
+			case errors.Is(err, errMQTTClearRefusedUnresolved) && s.reparkRefusedDiscard(asm, sess, time.Now().Unix()):
+			default:
 				c.Errorf("%s", err.Error())
 			}
 		}
@@ -5033,7 +5060,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 	// sess.mu section as the pair, so no resolver can adopt between the two reads
 	// and leave the arm deciding on a mismatched snapshot.
 	sess.mu.Lock()
-	seqNow, gen, wid, pwid := sess.seq, sess.gen, sess.wid, sess.pwid
+	seqNow, wid, pwid := sess.seq, sess.wid, sess.pwid
 	uncertain, pw := sess.seqUncertain, sess.pendingWrite
 	var pwBase uint64
 	var pwDigest [sha256.Size]byte
@@ -5097,7 +5124,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 	// section would falsify. The license path concedes.
 	voc := mqttDisposalTakenOver
 	if usable {
-		voc = disposalForRemotePersist(ps, gen, wid, pwid)
+		voc = disposalForRemotePersist(ps, wid, pwid)
 	}
 	// The remote record owns the session now; our expiry timer must not fire and
 	// delete its state. Spec5 [3.1.2.11.2].
@@ -5688,6 +5715,15 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 		// residency; the deferred as.unlockSession above then releases the gate and runs the
 		// void-verdict handoff for a session that is resident again. Keyed on the SENTINEL
 		// alone. See reparkRefusedDiscard.
+		// TERMINAL on a superseded teardown, in its own branch ahead of the recovery:
+		// the base this expiry claimed is not current, so the record it was going to
+		// expire is another owner's and there is nothing left to expire. A normal
+		// outcome, so it is not warned about — and not re-parked, which would re-arm an
+		// expiry deadline against a session this broker no longer owns.
+		if errors.Is(err, errMQTTClearSuperseded) {
+			s.Debugf("MQTT session expiry for %q stopped: %v", sess.id, err)
+			return
+		}
 		sess.mu.Lock()
 		disconnectedAt := sess.disconnectedAt
 		sess.mu.Unlock()
@@ -5786,6 +5822,14 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 
 	if ps.Teardown != nil {
 		if err := as.finishAdoptedTeardown(ps, idHash, seq, s.getOpts()); err != nil {
+			// TERMINAL on a superseded adoption, and explicitly so: a newer record holds
+			// the subject, which means this expiry has nothing to expire. The historical
+			// nil return already behaved this way; what changes is only that the outcome
+			// is now named, so it must not fall into the warning arm below.
+			if errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
+				s.Debugf("MQTT session expiry: the claimed teardown of %q was superseded; nothing was left to finish", ps.ID)
+				return
+			}
 			s.Warnf("MQTT session expiry: finishing the claimed teardown of %q failed: %v", ps.ID, err)
 		}
 		return
@@ -5816,6 +5860,14 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	// the session is not destroyed on a sequence nobody classified, only left for the
 	// next sweep.
 	if err := sess.clear(true); err != nil {
+		// TERMINAL on a superseded teardown: a newer record holds the subject, so this
+		// record-driven expiry has nothing left to expire. Its own branch — a warning
+		// here would report a failure on an outcome that is ordinary cross-replica
+		// arbitration.
+		if errors.Is(err, errMQTTClearSuperseded) {
+			s.Debugf("MQTT session expiry for %q stopped: %v", ps.ID, err)
+			return
+		}
 		s.Warnf("MQTT session expiry cleanup for %q failed: %v", ps.ID, err)
 	}
 }
@@ -8226,9 +8278,30 @@ func mqttReservedMembershipInRecord(ps *mqttPersistedSession) (string, bool) {
 // Runs from the client's readLoop.
 // Lock not held on entry, but session is in the locked map.
 func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opts *Options) (*mqttSession, bool, error) {
-	jsa := &as.jsa
+	return as.createOrRestoreSessionWithin(clientID, opts, mqttNewRecordReDrive())
+}
 
+// createOrRestoreSessionWithin is createOrRestoreSession under a CALLER'S re-drive
+// budget, so a CONNECT that re-enters the restore cannot silently start a fresh one.
+//
+// The loop is R1's entry point (sess_takeover_redrive.go): the two outcomes reachable
+// from here that mean "the base I was going to act on is not current" — a superseded
+// discard of an overdue record, and a superseded release inside an adopted teardown —
+// re-read the subject and restart the whole restore decision rather than returning an
+// object derived from what they already know is stale.
+//
+// This is transition T0: pre-bind and NOT resident. The object was built from the
+// record moments ago, is in no map and has no client, so there is nothing to dispose —
+// on exhaustion it is simply garbage nobody references.
+//
+// Runs from the client's readLoop.
+// Lock not held on entry, but session is in the locked map.
+func (as *mqttAccountSessionManager) createOrRestoreSessionWithin(clientID string, opts *Options,
+	rd *mqttRecordReDrive) (*mqttSession, bool, error) {
+
+	jsa := &as.jsa
 	hash := getHash(clientID)
+RESTORE:
 	smsg, err := jsa.loadSessionMsg(as.domainTk, hash)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
@@ -8294,11 +8367,29 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 
 	if ps.Teardown != nil {
 		if err := as.finishAdoptedTeardown(ps, hash, smsg.Sequence, opts); err != nil {
-			return nil, false, fmt.Errorf("finishing the claimed teardown of session %q: %w", clientID, err)
+			if !errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
+				return nil, false, fmt.Errorf("finishing the claimed teardown of session %q: %w", clientID, err)
+			}
+			// R1. A newer record holds the subject, and the marker this pass was going
+			// to succeed is gone. Re-read rather than returning a base-0 object built
+			// from it: that object would create against a record we have just been told
+			// exists, carrying lineage derived from a marker that is nobody's base.
+			if aerr := rd.admitCycle(); aerr != nil {
+				return nil, false, fmt.Errorf("restoring session %q: %w", clientID, aerr)
+			}
+			goto RESTORE
 		}
 		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
+		// R2's named exception: this session's first write descends from the record the
+		// ADOPTED teardown claimed, which the marker preserved as its own PWID — not
+		// from the marker, which the release just deleted and which is nobody's base.
+		// It is what makes a remote adopted-teardown create and a local clean-start
+		// create off one base stamp the same parent, so the cross-broker fork this
+		// feature exists for is recognisable from either side. See
+		// parentForNextWriteLocked.
+		sess.reMintedFrom = ps.PWID
 		return sess, false, nil
 	}
 
@@ -8328,7 +8419,17 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		// armed uncertainty. The refusal is retained as a fail-closed invariant — the
 		// CONNECT is refused rather than the session destroyed unclassified.
 		if err := sess.clear(false); err != nil {
-			return nil, false, fmt.Errorf("clearing expired session: %w", err)
+			if !errors.Is(err, errMQTTClearSuperseded) {
+				return nil, false, fmt.Errorf("clearing expired session: %w", err)
+			}
+			// R1, at transition T0. The base this discard claimed is not current, so the
+			// object in hand describes a record that is gone; returning it would create
+			// at base 0 against whatever superseded it. Nothing to dispose — it is in no
+			// map and has no client — so the whole disposition is to read again.
+			if aerr := rd.admitCycle(); aerr != nil {
+				return nil, false, fmt.Errorf("restoring session %q: %w", clientID, aerr)
+			}
+			goto RESTORE
 		}
 		// clear() reset the state (seq included), so sess is now a fresh session.
 		return sess, false, nil
@@ -8629,14 +8730,26 @@ type mqttSessSaveDetail struct {
 // bytes and the header length — the two arguments storeSessionMsg takes, and the two
 // an ambiguous write keeps so it can be re-attempted verbatim.
 //
-// A first-ever write (seq 0) carries no header and is therefore UNCONDITIONAL: there
-// is no sequence to expect. That is what keeps such a write out of the resolver's
-// re-attempt arm — an unconditional create can never be classified at-base, since a
-// found record always has a sequence of at least 1. See sess_uncertain.go.
+// NO record write is unconditional, a first-ever create (seq 0) included: the header
+// is emitted at every sequence, and at 0 it means "the subject must currently be
+// EMPTY". That is the whole arbitration this broker has for two brokers creating one
+// session from nothing — a headerless create lands whatever else is there, which
+// erases a record another broker was acknowledged for, within a single leader term
+// and with no rejection anywhere.
+//
+// The dependency honors it at both boundaries (nats-server v2.14.4): the store folds
+// a not-found subject to fseq 0 (server/stream.go), and the clustered pre-proposal
+// check does the same AND enrolls the write in the in-process contention checks
+// (server/jetstream_batching.go), which is what makes a concurrent create fail 10164
+// rather than silently interleave.
+//
+// So a create can now be REJECTED, which is a new outcome for its callers: 10071 for
+// a subject that is no longer empty — and, deliberately, for a load error the server
+// folds into the same code, so 10071 never proves a record exists — and 10164 for
+// contention. Both are mqttIsRecordCASRejection, so the write is CERTAIN not to have
+// stored anything; what turns that certainty into progress is the CONNECT's re-drive.
+// See sess_uncertain.go and the re-drive in mqttProcessConnect.
 func mqttFrameRecordWrite(seq uint64, body []byte) ([]byte, int) {
-	if seq == 0 {
-		return body, 0
-	}
 	bb := bytes.Buffer{}
 	bb.WriteString(hdrLine)
 	bb.WriteString(JSExpectedLastSubjSeq)
@@ -8679,9 +8792,10 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	// Stamp the lineage HERE, at the store boundary, never in the builder: the builder
 	// is also clear()'s pre-teardown snapshot, so minting there would write a parent
 	// pointer naming a record that was never stored. This write's parent is the record
-	// we were last acknowledged for, which sess.mu makes stable across the two
-	// statements. See sess_fork_lineage.go.
-	ps.WID, ps.PWID = mqttNewRecordWID(), sess.wid
+	// we were last acknowledged for — or, on a session a teardown re-minted, the record
+	// that teardown claimed — which sess.mu makes stable across the two statements.
+	// See sess_fork_lineage.go.
+	ps.WID, ps.PWID = mqttNewRecordWID(), sess.parentForNextWriteLocked()
 	// body is what a readback returns (the CAS header below is a message header,
 	// not part of the stored data), so it is what an ambiguous write is identified
 	// by.
@@ -8972,7 +9086,11 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// sequences only grow, so a new incarnation's sess.seq can never equal a prior
 	// generation's base — but the reset states the intent instead of leaning on stream
 	// arithmetic. See sess_rejected_write.go.
-	sess.recordRejectedSeq = 0
+	//
+	// DISARMING is the load-bearing half now, not the sequence reset: this re-mints at
+	// seq = 0, and a base-0 rejection is a real one since F-029, so a marker left armed
+	// here would match the fresh session's own sequence and gate its serving forever.
+	sess.recordRejectedSeq, sess.recordRejectedArmed = 0, false
 	// The identifier space of the RETIRING incarnation is gone with the maps above, so
 	// the restriction that protected it must go too. Two paths REUSE the session object
 	// as a fresh session, and a fresh one reports Session Present false, so it never
@@ -9019,10 +9137,19 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// leaves the exposed hash-only naming. See sess_incarnation.go.
 	sess.setIncarnationLocked(mqttNewSessGen())
 	sess.seq = 0
-	// The lineage goes with the sequence: the retiring record is being deleted, so a
-	// parent pointer at it would make a reused object's first write claim descent from
-	// a record that no longer exists. Zeroed AFTER retiringWID was captured above.
+	// The lineage goes with the sequence: we are acknowledged for nothing once the
+	// retiring record is deleted, and six sites read wid as exactly that. Zeroed AFTER
+	// retiringWID was captured above.
 	sess.wid, sess.pwid = _EMPTY_, _EMPTY_
+	// But the chain does NOT break here, and that reverses what this comment used to
+	// say. It reasoned that a parent pointer at the retiring record would make a reused
+	// object's first write claim descent from a record that no longer exists — true, and
+	// now the point: BOTH siblings of a fork descend from a base that is gone, and a
+	// pointer at it is what makes them recognisable as siblings rather than as
+	// strangers. Without it a broker whose record a sibling erased answers 0x8E "session
+	// taken over", a claim that somebody legitimately owns the session, when nothing
+	// arbitrated anything. See parentForNextWriteLocked.
+	sess.reMintedFrom = retiringWID
 	sess.tmaxack = 0
 	// Discarded session: reset the PI counter too so a reused session object
 	// does not inherit the previous session's identifiers. Spec [MQTT-3.1.2-6].
@@ -9045,17 +9172,19 @@ func (sess *mqttSession) clear(noWait bool) error {
 		return sess.releaseSharedTeardownDurables(target, noWait)
 	}
 
-	// CLAIM. Losing it means a newer owner exists, so nothing is deleted — not the
-	// record, not one consumer. That is a COMPLETE outcome, not a failure: the
-	// session is already detached and reset in memory, which is all a superseded
-	// broker is entitled to do. An indeterminate claim is different and does fail,
-	// so the caller (a clean-start CONNECT, say) fails closed rather than proceeding
-	// as though a teardown had run. See sess_teardown.go.
+	// CLAIM. Losing it means the base we claimed is no longer current, so nothing is
+	// deleted — not the record, not one consumer. That is a COMPLETE outcome for this
+	// teardown, and it is reported as errMQTTClearSuperseded rather than as success:
+	// a caller that read it as success went on to write at the sequence this call had
+	// just reset to 0, which is how a superseded broker erased the winner's record.
+	// Four callers are terminal on it and two re-drive. An indeterminate claim is
+	// different again and does fail, so the caller fails closed rather than proceeding
+	// as though a teardown had run. See sess_teardown.go and sess_takeover_redrive.go.
 	markerSeq, nonce, claim, err := sess.claimTeardown(tok, &ps, seq, retiringWID)
 	switch claim {
 	case mqttTeardownClaimWon:
 	case mqttTeardownClaimSuperseded:
-		return nil
+		return fmt.Errorf("discarding session %q: %w", id, errMQTTClearSuperseded)
 	default:
 		return err
 	}
@@ -9081,8 +9210,11 @@ func (sess *mqttSession) clear(noWait bool) error {
 		// Ours, and gone. The shared durables are now safe to consider.
 	case mqttTeardownSuperseded:
 		// A newer owner holds the record. Its membership counts as a holder, so the
-		// shared durables are not ours to release either.
-		return nil
+		// shared durables are not ours to release either. Same sentinel as the claim
+		// arm, and it says the same thing: the base is not current. It does NOT say
+		// nothing was deleted — the deletions above already ran, legitimately, because
+		// the claim was won. See the claim-won deletion window in docs/ROADMAP.md §0.2.
+		return fmt.Errorf("discarding session %q: %w", id, errMQTTClearSuperseded)
 	default:
 		return rerr
 	}
@@ -10523,10 +10655,41 @@ CHECK:
 		return fmt.Errorf("%v for account %q, session %q", err, c.acc.GetName(), cid)
 	}
 
+	// This CONNECT's re-drive budget, and the ACCEPT TRANSACTION's identity — both
+	// declared ahead of the restore label because both must SURVIVE a re-drive. A
+	// budget re-created per pass would bound nothing, and a deferred close that
+	// captured `es` would, after a T2 object switch, end the old token against the new
+	// object and leak the discarded one's fence. So the transaction is pinned to its
+	// own session variable, which the handover updates explicitly.
+	// See sess_takeover_redrive.go.
+	rd := mqttNewRecordReDrive()
+	var (
+		acceptSess    *mqttSession
+		acceptTok     recordTx
+		acceptTokOpen bool
+	)
+	endAcceptTx := func() {
+		if !acceptTokOpen {
+			return
+		}
+		acceptTokOpen = false
+		if err := acceptSess.endRecordTx(acceptTok); err != nil {
+			c.Errorf("MQTT: %v", err)
+		}
+	}
+	defer endAcceptTx()
+
+	// R1's re-entry point for this frame: the AUTHORITATIVE restore, from the top. Every
+	// transition that learns its base is not current arrives back here having already
+	// disposed of whatever it held, with `exists` false so the record — not the map —
+	// decides again. Session Present and the resumed in-flight sets are recomputed from
+	// that read too: carried over, they would report a session present that the second
+	// pass discarded, and re-send deliveries belonging to a dead incarnation.
+restoreSession:
 	// The session is not in the map, but may be on disk, so try to recover
 	// or create the stream if not.
 	if !exists {
-		es, exists, err = asm.createOrRestoreSession(cid, s.getOpts())
+		es, exists, err = asm.createOrRestoreSessionWithin(cid, s.getOpts(), rd)
 		if err != nil {
 			if err == errMQTTSessionCollision {
 				sendConnAck(mqttConnAckRCIdentifierRejected, false, err.Error())
@@ -10550,7 +10713,7 @@ CHECK:
 			// it, and this CONNECT is a legitimate new claim on it. Named explicitly
 			// rather than left to the default, which means "ours" and would bind a
 			// stale object whose CAS base is no longer the record's.
-			es, exists, err = asm.createOrRestoreSession(cid, s.getOpts())
+			es, exists, err = asm.createOrRestoreSessionWithin(cid, s.getOpts(), rd)
 			if err != nil {
 				if err == errMQTTSessionCollision {
 					sendConnAck(mqttConnAckRCIdentifierRejected, false, err.Error())
@@ -10571,14 +10734,42 @@ CHECK:
 			// Resolved as ours, and the deferred close (if any) has been applied. If
 			// that discharged a deferred discard — a clean disconnect, or a deadline
 			// that passed while the record was unresolved — the session is gone from
-			// the maps and this CONNECT must start fresh rather than resume the object
-			// it left behind. clear() already reset and re-minted it, so it is reusable
-			// exactly as the clean-start path reuses one.
+			// the maps and this CONNECT must start fresh.
+			//
+			// It RE-READS rather than reusing the object it left behind, and that is R1.
+			// The discharge runs clear(), whose outcome this frame never sees: the
+			// deferred-discard site consumes it and removes the session either way. So a
+			// SUPERSEDED discard is indistinguishable here from a completed one — and
+			// reusing the object after a superseded one would write at the sequence
+			// clear() reset to 0 having already learned the base was stale, with
+			// reMintedFrom naming a record that is no longer the base. That is the exact
+			// shape this item exists to close, reached through the one door that does not
+			// report it.
+			//
+			// The cost is one record read on a CONNECT that discharged a deferred
+			// discard. It cannot loop: the restore below yields an object that is not
+			// uncertain, so this arm is not re-entered.
 			asm.mu.RLock()
 			_, resident := asm.sessions[cid]
 			asm.mu.RUnlock()
 			if !resident {
-				exists = false
+				// Admitted as a CYCLE, because by the definition this item bounds it is
+				// one: the pass it starts performs a fresh authoritative restore and may
+				// run a whole teardown and accept save off it. R3 admits nothing past the
+				// deadline, and an arm that jumped straight to the restore would begin
+				// exactly that work after it.
+				//
+				// The cycle CAP can never refuse here — this arm is reachable at most once
+				// per CONNECT, since the restore below yields an object that is not
+				// uncertain — so what this call really enforces is the deadline. Refusing
+				// is clean: the discharge only runs on an UNBOUND session and has already
+				// removed it, so nothing is resident and nothing is bound to leak.
+				if aerr := rd.admitCycle(); aerr != nil {
+					return formatError(aerr)
+				}
+				es, exists, sessp = nil, false, false
+				resumePubs, resumeRels = nil, nil
+				goto restoreSession
 			}
 		}
 	}
@@ -10601,6 +10792,26 @@ CHECK:
 			// associated with this Session MUST NOT be reused in any subsequent
 			// Session.
 			if err := es.clear(false); err != nil {
+				if errors.Is(err, errMQTTClearSuperseded) {
+					// R1 at transition T1. The base this discard claimed is not current,
+					// and clear() has already reset this object to sequence 0 without
+					// detaching its client — so proceeding would bind and then CREATE
+					// against the record that actually won, and returning would leave a
+					// seq == 0 object resident that no reaper reaches.
+					//
+					// Dispose FIRST, before the budget check and before the fallible
+					// restore below: that ordering is what makes the reset-resident state
+					// unreachable rather than merely unlikely. On exhaustion the CONNECT
+					// is refused with nothing resident and nothing bound, which is the
+					// state a fresh CONNECT starts from.
+					asm.abandonReDrivenSession(c, es)
+					if aerr := rd.admitCycle(); aerr != nil {
+						return formatError(aerr)
+					}
+					es, exists, sessp = nil, false, false
+					resumePubs, resumeRels = nil, nil
+					goto restoreSession
+				}
 				if errors.Is(err, errMQTTClearRefusedUnresolved) {
 					// A LATE ambiguity — armed by an off-readLoop writer while this
 					// discard waited for the fence — deleted nothing, so this case gets
@@ -10614,7 +10825,22 @@ CHECK:
 					// own uncertainty check resolves the session.
 					return formatError(fmt.Errorf("session record state is unresolved"))
 				}
-				asm.removeSession(es, true)
+				// EVERY REMAINING ERROR IS POST-RESET, and that is provable rather than
+				// likely: both of clear()'s refusals happen before it deletes or claims
+				// anything and both carry errMQTTClearRefusedUnresolved, handled above.
+				// So by here the object's subscriptions, consumers and registers are
+				// erased, its sequence is 0 and its generation re-minted — an indeterminate
+				// claim, a failed target deletion, an unclassifiable release or a shared
+				// durable error all arrive in this state.
+				//
+				// removeSession alone was NOT enough, and the gap was silent: it deletes
+				// map entries and never touches sess.c, so an old client stayed BOUND to a
+				// wiped, evicted object. Its readLoop's gate checks the binding, not
+				// residency, so it went on serving packets against a session that no
+				// longer existed anywhere — and no watch, backstop or sweep reaches an
+				// object that is not in the maps. Detach and close it instead, with the
+				// one instruction this state licenses: try again later.
+				es.disposeForeignSessionLocked(asm, nil, mqttDisposalTeardownIncomplete)
 				return err
 			}
 		} else {
@@ -10675,23 +10901,11 @@ CHECK:
 		resumePubs, resumeRels = mqttPendingRefs(es.pendingPublish), mqttPendingRefs(es.pendingPubRel)
 		es.mu.Unlock()
 		if ec != nil {
-			asm.beforeTakeoverDiscard(cid)
-			// Remove the "will" of the existing client before closing it — unless
-			// that connection already closed and owes an immediate Will, which this
-			// takeover is too late to cancel. See mqttDiscardWillOnTakeover.
-			ec.mqttDiscardWillOnTakeover()
-			// Add to the map of the flappers
-			asm.mu.Lock()
-			asm.addSessToFlappers(cid)
-			asm.mu.Unlock()
-			c.Warnf("Replacing old client %q since both have the same client ID %q", ec, cid)
-			// Tell the evicted v5 client why before the close (no-op for
-			// 3.1.1), through the tail every displacement path shares: it
-			// claims the connection's one DISCONNECT and stays silent for a
-			// connection displaced before its own CONNACK. Spec5 [3.1.4].
-			ec.mqttNotifyTakenOver()
-			// Close old client in separate go routine
-			go ec.closeConnection(DuplicateClientID)
+			// The one takeover tail, shared with the re-drive's T1b so the two cannot
+			// drift apart: a client displaced by a re-drive is entitled to exactly the
+			// same explanation as one displaced by an ordinary reconnect.
+			// See sess_takeover_redrive.go.
+			asm.discardTakenOverClient(c, ec, cid)
 		}
 	} else {
 		// Spec [MQTT-3.2.2-3]: if the Server does not have stored Session state,
@@ -10716,18 +10930,12 @@ CHECK:
 	// persists (the Receive Maximum and the Will drop just below), because a
 	// transaction that begins after its own mutation cannot make that mutation
 	// invisible to another writer. See sess_recordtx.go.
-	acceptTok := es.beginRecordTx()
-	acceptTokOpen := true
-	endAcceptTx := func() {
-		if !acceptTokOpen {
-			return
-		}
-		acceptTokOpen = false
-		if err := es.endRecordTx(acceptTok); err != nil {
-			c.Errorf("MQTT: %v", err)
-		}
-	}
-	defer endAcceptTx()
+	//
+	// It is opened on THIS pass's object and recorded as such: a re-drive ends this
+	// transaction explicitly before switching objects and then arrives back here to open
+	// a fresh one on the replacement, which is what keeps the deferred close matched to
+	// the token it is closing.
+	acceptSess, acceptTok, acceptTokOpen = es, es.beginRecordTx(), true
 
 	es.mu.Lock()
 	es.rmax = rmax
@@ -10743,9 +10951,57 @@ CHECK:
 	// We would need to save only if it did not exist previously, but we save
 	// always in case we are running in cluster mode. This will notify other
 	// running servers that this session is being used.
-	if err := es.save(acceptTok); err != nil {
-		asm.removeSession(es, true)
-		return err
+	//
+	// saveWithDetail rather than save, because the two CAS rejection codes demand
+	// OPPOSITE dispositions here and save() %v-formats the error, destroying the
+	// distinction. Both are certain — nothing was stored, so sess.seq is still right —
+	// and neither is a failure of this CONNECT on its own. See sess_takeover_redrive.go.
+	for {
+		detail, serr := es.saveWithDetail(acceptTok)
+		if serr == nil {
+			break
+		}
+		switch {
+		case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
+			// 10164: same-subject contention, in a cluster, with nothing stored and the
+			// subject's ownership not decided either way. Retry the WRITE. Deliberately
+			// no restore and no disposal — this repeats one write, not one takeover,
+			// which is why it draws on its own budget rather than the cycle budget.
+			if aerr := rd.admitCreateRetry(); aerr != nil {
+				// M13: this object may be resident at sequence 0 (addSession above runs
+				// before the first save), and nothing reaps that. Detach and evict, do
+				// not merely remove.
+				asm.detachConnectingClientForReDrive(es, c)
+				return formatError(aerr)
+			}
+			time.Sleep(mqttRecordCreateRetryWait)
+			continue
+		case mqttIsRecordCASRejection(detail.rawErr):
+			// 10071: DEFINITELY rejected. It does not prove a record exists — the server
+			// folds a failed subject load into the same code — so what it licenses is a
+			// re-read, not a conclusion. R1: back to the authoritative restore.
+			//
+			// T2, and it must be SILENT: the client bound here is the one we are in the
+			// middle of accepting, so the takeover tail would close the very connection
+			// this CONNECT is trying to serve. Detach without notifying, without closing
+			// and without a flapper entry; the client's CONNECT is still in progress and
+			// is about to be re-bound to the object restored from the record that won.
+			//
+			// The accept transaction ends BEFORE the object switch, against the object it
+			// was opened on, so the deferred close cannot end this token against the
+			// replacement and leak the discarded object's fence.
+			endAcceptTx()
+			asm.detachConnectingClientForReDrive(es, c)
+			if aerr := rd.admitCycle(); aerr != nil {
+				return formatError(aerr)
+			}
+			es, exists, sessp = nil, false, false
+			resumePubs, resumeRels = nil, nil
+			goto restoreSession
+		default:
+			asm.removeSession(es, true)
+			return serr
+		}
 	}
 	cidHash := getHash(cid)
 	// Durably advance this client's delayed-Will cancellation watermark to the

@@ -9,7 +9,8 @@ section 0.2), so every finding here is an unconditional alpha blocker.
 
 The one arbitration design these findings share was made on 2026-08-11 and is sliced
 in dependency order: Slice A (the observation and convergence backbone) landed first
-and NARROWED F-036 without closing it, F-029 is Slice B, F-027 is Slice C. Each remaining
+and NARROWED F-036 without closing it, F-029 is Slice B and closed on 2026-08-11
+leaving F-029a and F-029b behind, F-027 is Slice C. Each remaining
 slice gets its own
 implementation-depth plan against that design; the roadmap bullets carry the
 constraints each must answer.
@@ -41,10 +42,64 @@ it existed on 2026-08-10.
 
 **Title:** Arbitrate simultaneous takeovers from one session-record base
 
-- Status: Open
+- Status: **Closed 2026-08-11** (Slice B), with two shapes explicitly left open and
+  filed as their own `docs/ROADMAP.md` §0.2 blockers — see F-029a and F-029b below.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 29
+
+### What closed it
+
+Every session-record write is conditional, base 0 included, so a first-ever create is
+CASed on "the subject must currently be empty" instead of landing on top of whatever is
+there. A superseded teardown claim is a typed outcome rather than success, so the path
+that produced the unconditional create no longer runs; four callers are terminal on it
+and two re-drive. `finishAdoptedTeardown`'s superseded release is surfaced rather than
+swallowed — the one production path that wrote on a base it had authoritatively been
+told was stale. The lineage chain crosses the teardown re-mint (`reMintedFrom`), and the
+incarnation generation no longer short-circuits the fork test, because a clean-start
+sibling always carries a different generation and that short-circuit hid exactly the
+fork the rule exists to catch. See "Two frontends taking over one session from the same
+base" in `docs/ARCHITECTURE.md`.
+
+The convergence claim is: every interleaving converges on one owner, and each client is
+told something true. It is NOT that neither side destroys what the arbitration awarded
+the other — that is F-029a.
+
+## F-029a
+
+**Title:** The claim-won deletion window
+
+- Status: Open
+- Classification: HA arbitration architecture
+- Release treatment: Alpha blocker
+- Filed: 2026-08-11, out of F-029's implementation
+
+A teardown that WINS its claim deletes the retiring generation's consumers and durables
+before its release tells it whether it still owns the claim, so a cross-term resume off
+the same base can survive with a record naming state that is already gone. Pre-existing:
+a property of the teardown protocol, not something F-029 introduced. Reordering release
+before delete was designed and refuted — `releaseTeardown` proves absence rather than
+authorship, the unsafe interval merely moves, shared group durables are not
+generation-scoped, and after the release the durable target list is gone while PUBREL
+durables have no orphan reaper. The roadmap bullet carries the full refutation.
+
+## F-029b
+
+**Title:** Cross-term create × create recognition
+
+- Status: Open
+- Classification: HA arbitration architecture
+- Release treatment: Alpha blocker
+- Filed: 2026-08-11, out of F-029's implementation
+
+Two brokers creating from an empty subject across a leader term both apply; the later
+survives and the erased side concedes 0x8E, correct about ownership and wrong about
+cause. Both records are parentless, and the rule requires a non-empty acknowledged
+parent precisely so two unrelated first-creates do not read as siblings. A `bound`-gated
+parentless arm was designed and refuted: its premise is false, and a FALSE fork verdict
+suppresses delayed-Will cancellation, so this is not a vocabulary-only gap. The roadmap
+bullet carries the full refutation.
 
 ### Original finding record
 

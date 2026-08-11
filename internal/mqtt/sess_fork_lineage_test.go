@@ -65,8 +65,14 @@ func TestSessLineageRuleArms(t *testing.T) {
 		// found.WID != ackWID conjunct it is reported as a fork of itself.
 		{"verbatim replay of the acknowledged record", testLineageRecord(ourGen, "a", "p"), mqttLineageNotForked},
 
-		// 6 / M4: otherwise a proven sibling, so ONLY the generation arm can concede it.
-		{"proven sibling of another incarnation", testLineageRecord("gen-other", "b", "p"), mqttLineageNotForked},
+		// M6: a proven sibling written by ANOTHER incarnation is forked, and this row was
+		// deliberately INVERTED by F-029. It used to assert not-forked, on the reasoning
+		// that a different incarnation restarts the lineage. That conceded the one fork
+		// the feature exists to catch: a clean-start sibling is written by a session
+		// clear() re-minted, so it always carries a different generation, and the
+		// short-circuit ran before the pointer test could see the shared parent. Record
+		// identities are globally unique, so the parent match means what it says here too.
+		{"proven sibling of another incarnation", testLineageRecord("gen-other", "b", "p"), mqttLineageForked},
 
 		// 5a / M2a: an absent identity with a matching parent. Without the
 		// found.WID != "" guard, "" != ackWID satisfies the last conjunct and this
@@ -76,7 +82,7 @@ func TestSessLineageRuleArms(t *testing.T) {
 		{"nil record", nil, mqttLineageNotForked},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyRecordLineage(tc.found, ourGen, ackWID, ackPWID); got != tc.want {
+			if got := classifyRecordLineage(tc.found, ackWID, ackPWID); got != tc.want {
 				t.Fatalf("classifyRecordLineage(%+v) = %v, want %v", tc.found, got, tc.want)
 			}
 		})
@@ -90,7 +96,7 @@ func TestSessLineageRuleArms(t *testing.T) {
 // the JSON carries, so a hand-edited or future-broker record can. Without the guard, every
 // survivor with parent p becomes a sibling of a record that has no identity of its own.
 func TestSessAbsentAcknowledgedWIDIsNotASiblingBase(t *testing.T) {
-	got := classifyRecordLineage(testLineageRecord("g", "b", "p"), "g", _EMPTY_, "p")
+	got := classifyRecordLineage(testLineageRecord("g", "b", "p"), _EMPTY_, "p")
 	if got != mqttLineageNotForked {
 		t.Fatalf("an acknowledged pair with no identity of its own is no sibling base: got %v", got)
 	}
@@ -100,7 +106,7 @@ func TestSessAbsentAcknowledgedWIDIsNotASiblingBase(t *testing.T) {
 // FIRST CREATES both carry an empty parent, and without the guard they read as siblings of
 // each other.
 func TestSessEmptyParentsAreNotSiblings(t *testing.T) {
-	got := classifyRecordLineage(testLineageRecord("g", "b", _EMPTY_), "g", "a", _EMPTY_)
+	got := classifyRecordLineage(testLineageRecord("g", "b", _EMPTY_), "a", _EMPTY_)
 	if got != mqttLineageNotForked {
 		t.Fatalf("two empty parents are not a shared ancestry: got %v", got)
 	}
@@ -111,7 +117,7 @@ func TestSessEmptyParentsAreNotSiblings(t *testing.T) {
 // this change existed. A regression guard, with no paired mutation — several guards
 // already cover the individual conjuncts, and this pins that they compose.
 func TestSessTwoAbsentWIDsAreNotForked(t *testing.T) {
-	got := classifyRecordLineage(testLineageRecord("g", _EMPTY_, _EMPTY_), "g", _EMPTY_, _EMPTY_)
+	got := classifyRecordLineage(testLineageRecord("g", _EMPTY_, _EMPTY_), _EMPTY_, _EMPTY_)
 	if got != mqttLineageNotForked {
 		t.Fatalf("a record written before lineage existed must concede: got %v", got)
 	}

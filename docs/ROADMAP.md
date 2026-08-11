@@ -80,7 +80,10 @@ per stream.
   this project exists to deliver. The items below stop being conditional, and
   the dossier release-treatment lines record the same resolution.
 - [ ] [F-027: Repair a recognised session-record fork](findings/ha-arbitration.md#f-027).
-  **Very large.** The recoverable state is now DEFINED (Slice C of the arbitration
+  **Very large.** Its create-only-CAS prerequisite is now in place (F-029 below), and
+  both blockers F-029 filed likely change the repair: a capsule re-asserted through the
+  accept-save CAS has to survive a re-drive, and a fork it cannot RECOGNISE it cannot
+  repair. The recoverable state is now DEFINED (Slice C of the arbitration
   design): a fork's durable loss is exactly the record delta, and everything needed to
   restore it is in the losing broker's memory at verdict time — so the repair is an
   in-memory capsule minted at the forked verdict and re-asserted by that client's own
@@ -90,19 +93,69 @@ per stream.
   reclaim's ordering behind the CONNECT's existing uncertainty resolution, all four
   rejection-settlement verdicts, and `settleRecordRejection` being unbound-only while
   a displaced connection may still be attached.
-- [ ] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
-  **Very large.** Shares the F-027 arbitration design (Slice B). Scope now also
-  includes a defect found while designing it and verified in code: a clean-start
-  CONNECT whose teardown claim was SUPERSEDED — told a newer owner exists — still
-  proceeds to an accept save at base 0, which is framed with NO CAS header, so it
-  lands unconditionally and erases the winner's record within a single leader term.
-  The design: every session-record write becomes conditional (create-only CAS at base
-  0), a superseded claim re-drives the restore instead of proceeding, and the lineage
-  chain crosses the teardown re-mint (`PWID` = the claimed record's `WID`) so a
-  clean-start survivor and a resume child of one base are recognisable siblings. Its
-  own plan must settle: what the base-0 CAS does to the ambiguity readback's absent
-  arm and to a zero-valued rejection marker, a typed superseded outcome per `clear()`
-  caller, and disposing the old binding when a re-drive replaces the session object.
+- [x] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
+  **Slice B of the arbitration design.** Every session-record write is now conditional,
+  base 0 included, which closes the defect found while designing it: a clean-start
+  CONNECT whose teardown claim was SUPERSEDED still proceeded to an accept save at base
+  0, framed with no CAS header, so it landed unconditionally and erased the winner's
+  record within a single leader term. The claim's outcome is typed
+  (`errMQTTClearSuperseded`) — four callers terminal, two re-driving — and
+  `finishAdoptedTeardown`'s superseded release is surfaced rather than swallowed, which
+  was the one production path that wrote on a base it had been told was stale. The
+  re-drive is governed by three rules (any stale-base outcome re-enters the
+  authoritative restore; base and parent come from one read; bounded, and no exit
+  leaves a `seq == 0` resident) rather than by an enumeration of `processConnect`'s
+  branches, and by four binding transitions, because the discard runs pre-bind and the
+  accept save post-bind. The lineage chain crosses the teardown re-mint via
+  `reMintedFrom`, and the generation short-circuit is gone from `classifyRecordLineage`
+  — a clean-start sibling always carries a different incarnation, so that short-circuit
+  hid the one fork the rule exists to catch.
+  **What it does NOT close** is the two bullets below, filed as blockers rather than
+  recorded as residuals.
+- [ ] **The claim-won deletion window.** A teardown that WINS its claim deletes the
+  retiring generation's consumers and durables BEFORE its release tells it whether it
+  still owns the claim. A cross-term resume derived from the same base can apply
+  afterwards; a resume preserves the generation, so the surviving record names exactly
+  the consumers that were just deleted, and no repair path exists — marker and record
+  share the subject under `MaxMsgsPer: 1`, so nothing is left for
+  `finishAdoptedTeardown` or the orphan sweep to adopt. F-029 makes the eventual
+  displacement a conditional takeover rather than an unconditional erasure, which does
+  not shorten the interval. **Reordering release before delete was designed and
+  REFUTED**: `releaseTeardown` proves absence, not authorship (its own comment says
+  so), a cross-term proposal admitted earlier can apply after the release and recreate
+  the same shape one step later, shared group durables are not generation-scoped so an
+  early release lets a fresh same-client session have its durable deleted by the old
+  teardown's late scan, and after the release the durable target list is gone —
+  PUBREL durables have no orphan reaper at all. Closing it needs a durable teardown
+  intent that does NOT live on the replaceable record subject, or durable generation
+  fencing that makes a late resume of a retired generation rejectable. Extending the
+  orphan sweep to PUBREL durables is independently needed and belongs with it.
+- [ ] **Sweep the rollout-qualified residuals out of the docs.** The Compatibility
+  boundary is normative (`CLAUDE.md`, `docs/ARCHITECTURE.md`), but residuals written
+  before it became so still qualify themselves with "an older broker", "mid-rollout" and
+  "once every broker upgrades" — in `docs/CONFORMANCE.md` and in two `docs/ARCHITECTURE.md`
+  sections. F-029 rewrote the ones in its own blast radius — including two inside the
+  session-watch and lineage residuals it edits — and left the rest standing, with the
+  preamble narrowed to say so rather than claiming a consistency the document does not
+  have. Each one has to be re-read against what its feature actually
+  does for a broker running this tree — the wording often hides a real scope limit that
+  survives the rollout framing, so this is a rewrite per residual, not a delete.
+
+- [ ] **Cross-term create × create recognition.** Two brokers creating from an empty
+  subject across a leader term are both admitted pre-proposal, both apply, and the
+  later survives. Both records are parentless, and `classifyRecordLineage` requires a
+  non-empty acknowledged parent precisely so two unrelated first-creates do not read as
+  siblings — so the erased side concedes 0x8E, correct about ownership and wrong about
+  cause. **A `bound`-gated parentless arm was designed and REFUTED**: its premise, that
+  nothing legitimately deletes a bound session's record, is false — a legitimate
+  clean-start release, a crash before the parented successor save, and the next CONNECT
+  creates a parentless record while an F-036 silent owner is still bound; rollback
+  deletes, operator deletion, stream re-provisioning and a different branch's expiry
+  reach the same shape. And the failure is not vocabulary-only: `mqtt.go` guards
+  delayed-Will cancellation on `!d.forked`, so a FALSE fork leaves an obsolete Will
+  eligible to fire. Closing it needs a durable identity for each empty-subject interval
+  — a per-client epoch or tombstone both racing first-creates inherit — which is new
+  durable state and its own design. Note it likely changes Slice C's repair.
 - [ ] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
   **Large.**
 - [ ] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).
@@ -232,6 +285,17 @@ operation can trigger correctness loss or unbounded resource growth.
 - [ ] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
   Keep basic diagnostics in alpha scope; automatic quarantine or repair may follow
   alpha if broker-owned state cannot create the malformed record.
+- [ ] Force two session-record proposals into the clustered pre-proposal window.
+  **Test infrastructure, not a broker gap, and deliberately not a §0.2 blocker.**
+  `TestMQTTTakeoverCreateRaceReplicated` asserts the property on a real Replicas=3
+  stream — one winner, a definite loser, the winner's bytes surviving — but a barrier
+  only makes both goroutines runnable, so it cannot hold one proposal between clustered
+  admission and apply and release a second into that window. The mechanism itself is
+  owned and tested upstream (`jetstream_batching.go:777-782`, with
+  `jetstream_batching_test.go:1576-1586` and `jetstream_cluster_4_test.go:5158-5164`),
+  which is why this is a limit on what a test HERE can observe rather than a
+  conformance residual. Closing it needs a seam in nats-server, so an upstream issue is
+  the likelier route than anything in this repository.
 
 ## 1. Settle release decisions
 

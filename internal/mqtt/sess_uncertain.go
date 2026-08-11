@@ -316,7 +316,7 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 	// sibling of our base would be compared against in vain. Sampled in the same
 	// critical section as pw, and stable while the session is uncertain because every
 	// save is refused at entry until it resolves. See sess_fork_lineage.go.
-	ourGen, ackWID, ackPWID := sess.gen, sess.wid, sess.pwid
+	ackWID, ackPWID := sess.wid, sess.pwid
 	sess.mu.Unlock()
 	if pw == nil {
 		// Uncertain with no attempted-write identity: nothing can be classified, and
@@ -344,7 +344,7 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		return mqttUncertainOurs, nil
 	}
 
-	switch verdict, seq := classifyAttemptReadback(smsg, err, pw, ourGen, ackWID, ackPWID); verdict {
+	switch verdict, seq := classifyAttemptReadback(smsg, err, pw, ackWID, ackPWID); verdict {
 	case mqttAttemptUnreadable:
 		// Nothing is known: write nothing, delete nothing, and let a later pass ask
 		// again.
@@ -369,7 +369,7 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// proposal, because JetStream reports contention while a write for the subject
 		// is still in process; and an empty subject does not stop a proposal already
 		// accepted into the log. Both are arbitrated by a CAS instead of a guess.
-		return sess.reattemptUncertainWrite(tok, pw, domainTk, idHash, ourGen, ackWID, ackPWID)
+		return sess.reattemptUncertainWrite(tok, pw, domainTk, idHash, ackWID, ackPWID)
 	}
 }
 
@@ -419,7 +419,7 @@ const (
 //
 // The sequence returned is meaningful only for mqttAttemptOurs.
 func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
-	ourGen, ackWID, ackPWID string) (mqttAttemptReadback, uint64) {
+	ackWID, ackPWID string) (mqttAttemptReadback, uint64) {
 
 	switch classifyRecordAgainstAttempt(smsg, lerr, pw.baseSeq) {
 	case mqttRecordAttemptUnreadable:
@@ -434,12 +434,15 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 		// delete (rollbackDeleteSession, clear()). Reported as its own verdict so the
 		// resolver ARBITRATES rather than disposing on a read.
 		//
-		// Base 0 keeps the historical classification: a headerless create is never
-		// re-attempted (it would be unconditional), so there is nothing to arbitrate
-		// with. That is the stated base-0 residual.
-		if pw.baseSeq == 0 {
-			return mqttAttemptForeign, 0
-		}
+		// Base 0 reaches this arm like any other base, and that is F-029's doing. The
+		// exclusion here existed because a first-ever create carried no header and could
+		// therefore never be re-attempted — an unconditional write arbitrates nothing,
+		// so the only safe reading of an absent subject was "somebody else's". Now the
+		// create CASes at 0 too, so its re-attempt is exactly the arbitration this
+		// verdict asks for: acceptance proves our create landed, and rejection falls to
+		// the post-rejection classification below. The at-base arm stays unreachable at
+		// 0 — stream sequences start at 1 — which is a property of the store, not an
+		// assumption of ours. See sess_takeover_redrive.go.
 		return mqttAttemptGone, 0
 	case mqttRecordAttemptAtBase:
 		return mqttAttemptAtBase, 0
@@ -453,7 +456,7 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 		// re-provisioned store, and that fail-safe is not the lineage rule's to relax.
 		// Decoded lazily, because the two branches above compare raw bytes.
 		if smsg.Sequence > pw.baseSeq &&
-			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ourGen, ackWID, ackPWID) == mqttLineageForked {
+			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ackWID, ackPWID) == mqttLineageForked {
 			return mqttAttemptForked, 0
 		}
 		return mqttAttemptForeign, 0
@@ -498,7 +501,7 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 //
 // The resolver's fence is held. sess.mu must not be held.
 func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWrite,
-	domainTk, cidHash, ourGen, ackWID, ackPWID string) (mqttUncertainResolution, error) {
+	domainTk, cidHash, ackWID, ackPWID string) (mqttUncertainResolution, error) {
 
 	// Test seam, fired between the at-base classification and the re-attempt: it is
 	// what lets a test land the ORIGINAL proposal inside the very window this arm
@@ -522,7 +525,7 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 	// Definitely rejected: this re-attempt is not the write that will decide, so the
 	// record that IS there does.
 	smsg, lerr := sess.jsa.loadSessionMsg(domainTk, cidHash)
-	switch verdict, seq := classifyAttemptReadback(smsg, lerr, pw, ourGen, ackWID, ackPWID); verdict {
+	switch verdict, seq := classifyAttemptReadback(smsg, lerr, pw, ackWID, ackPWID); verdict {
 	case mqttAttemptOurs:
 		// The original landed between the readback and the re-attempt.
 		return sess.settleLandedAttempt(tok, pw, seq), nil
@@ -1254,11 +1257,22 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		// there would resurrect an obligation that is either another owner's or already
 		// half-discharged. Those keep the historical outcome — the object goes.
 		if err := sess.clear(true); err != nil {
-			if errors.Is(err, errMQTTClearRefusedUnresolved) {
+			switch {
+			case errors.Is(err, errMQTTClearRefusedUnresolved):
 				s.reparkDeferredDisconnect(sess, action)
 				return
+			case errors.Is(err, errMQTTClearSuperseded):
+				// TERMINAL, in its own branch: the base this deferred discard claimed is
+				// not current, so the discard is another owner's business and nothing was
+				// ours to delete. NOT re-parked — the action is consumed and putting it
+				// back would resurrect an obligation the current owner holds — and not
+				// warned about, since it is the ordinary outcome of losing an
+				// arbitration. The removeSession tail below still runs: this object is
+				// finished either way.
+				s.Debugf("MQTT: deferred discard of session %q stopped: %v", sess.id, err)
+			default:
+				s.Warnf("MQTT: deferred discard of session %q failed: %v", sess.id, err)
 			}
-			s.Warnf("MQTT: deferred discard of session %q failed: %v", sess.id, err)
 		}
 		asm.removeSession(sess, true)
 	default:

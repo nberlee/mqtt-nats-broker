@@ -4,6 +4,18 @@ The broker is tested against the conformance suites named in the project plan.
 Results below are from running each suite against the running broker
 (`cmd/mqtt-nats-bridge`) backed by a JetStream-enabled NATS server.
 
+**No NEW residual may be conditioned on a rollout.** Every broker in existence is built
+from this tree — see "Compatibility boundary" in `docs/ARCHITECTURE.md`, which is
+normative — so "protection is per broker until the fleet upgrades" is not a real
+qualification, and writing one invites a future change to preserve behavior for a broker
+that will never run. State what a broker running this code does.
+
+Residuals written before that boundary became normative still carry mixed-version and
+upgrade-window wording, and this document is **not yet internally consistent with the
+rule above**. Removing it wholesale is its own change — it rewrites other features'
+stated limits — and is tracked as a `docs/ROADMAP.md` cleanup rather than claimed here.
+F-029 rewrote only the ones in its own blast radius.
+
 ## vibesrc/mqttconformance (primary) ✅
 
 Rust CLI mapping tests to OASIS normative statements (e.g. `MQTT-3.1.0-1`).
@@ -221,14 +233,12 @@ deviation, here or on any other outbound path: a started delivery's identifier i
 durable and is restored before the redelivery. See "Outbound in-flight identifiers"
 below.
 
-**Mixed-version operation.** The storage schema is rolling-compatible: an older
-broker simply ignores the new stream and the new session-record fields. The
-delivery *protocol* is not. An older broker serving the same shared group never
-consults `$MQTT_qos2assign`, so during a rolling upgrade it can still redistribute
-a started delivery that a newer broker has claimed. Shared-subscription QoS 2
-affinity holds only once **every** broker that can serve the group runs a
-q2aff-aware version. There is no runtime enforcement of this today; a
-cluster-wide capability gate is noted as a possible follow-up.
+**Scope.** Affinity is enforced by the brokers that consult `$MQTT_qos2assign`, which
+is every broker serving the account — they all run this tree (see the Compatibility
+boundary). It is stated as scope rather than as a rollout condition: a broker that did
+not consult the claims could redistribute a started delivery another broker had
+claimed, and there is no runtime capability gate that would stop it. That gate is
+noted as a possible follow-up, not as a mixed-fleet accommodation.
 
 Plain (non-shared) subscriptions no longer drop an unacknowledged QoS 1/2 PUBLISH
 on UNSUBSCRIBE — see the next section.
@@ -554,15 +564,12 @@ Residuals:
   — the sweep's residency guard covers only its `DisconnectedAt == 0` branch — costing one
   record load, a timer, a gate acquisition and one warning line per stuck session per
   interval. A pass budget for that walk is a candidate follow-up, not part of this change.
-- **The refusal-and-recovery protection is PER BROKER, not fleet-wide during a rolling
-  upgrade.** It adds no stream, subject, record field or cross-broker message, so there
-  is no decoder incompatibility in either direction and both versions read and CAS the
-  same record. But an older broker keeps its own destructive-and-leaky behavior for the
-  sessions it owns, and because the parked obligation is memory-only there is nothing
-  another broker — older or newer — can adopt: a takeover simply evicts it. So the
-  invariant holds for a session whose owning broker runs this code, and holds fleet-wide
-  only once every broker serving the account does. Stated as scope, not as
-  rolling-upgrade safety.
+- **The protection is PER SESSION, not per account.** It adds no stream, subject, record
+  field or cross-broker message: the parked obligation is memory-only, so there is
+  nothing another broker can adopt and a takeover simply evicts it. The invariant
+  therefore holds for a session while the broker that owns it holds it — which is the
+  whole account, because every broker runs this tree (see the Compatibility boundary).
+  Stated as scope, not as a rollout condition.
 - **A parked action that is not the discard-only shape has unknown reachability, and keeps
   the historical evict-and-log outcome.** The shared recovery helper accepts an existing
   obligation only when it already ends at disconnect AND carries no Will. Anything else —
@@ -693,11 +700,13 @@ it does *not* promise:
   spent — landing after the ownership sample: such a connection can still receive its
   UNSUBACK. That is the pre-existing "nothing gates non-DISCONNECT traffic" residual of
   the claim mechanism, narrowed here rather than closed.
-- **An unconditional create (CAS base 0) keeps its existing classification.** A first-ever
-  record write carries no expected-last-subject-sequence header, so it is never classified
-  at-base and is never re-attempted; a late landing of such a create can still be read as
-  another owner's record. Pre-existing headerless-create territory, stated as residual 7
-  above.
+- **CLOSED by F-029: the create is conditional, so base 0 is no longer excluded.** A
+  first-ever record write now carries the expected-last-subject-sequence header at 0,
+  where it means "the subject must currently be empty". An ambiguous create therefore
+  flows through the ordinary arms and is settled by RE-ATTEMPTING it, exactly as any
+  other base is. What remains at base 0 is not specific to it: an absent record whose
+  re-attempt is refused 10071 is still classified foreign fail-safe, for the reason
+  residual 7 states.
 - **A record found BELOW the attempt's base is classified foreign fail-safe**, not proven:
   sequences are monotonic within a stream incarnation, so that shape implies a reset or
   re-provisioned store. Nothing is adopted and nothing is written there.
@@ -769,11 +778,10 @@ What it does NOT do:
     business. Nothing recreates a deleted or inactivity-reaped watch consumer under a
     live manager: the watch stays absent and the backstop alone converges until the
     next manager start;
-  - during a **rolling upgrade** what Slice A does close is per-broker: a quiet resident
-    owned by a not-yet-upgraded broker still has only the old at-most-once path until
-    that broker upgrades. Full rollout therefore closes the MOVED-record and
-    lost-observation subcase everywhere — it does **not** close F-036, which stays
-    open for the bound deleted-record case below;
+  - the MOVED-record and lost-observation subcase is closed outright, not "once a
+    rollout completes". Every broker is built from this tree (see the Compatibility
+    boundary), so there is no older path to be asymmetric with. It does **not** close
+    F-036, which stays open for the bound deleted-record case below;
   - a record that was **deleted** rather than moved is handed to the ownership marker,
     which converges an UNBOUND session; its bound outcome is **0x8E** when it converges
     at all (see the next bullet, which is why F-036 stays open). Absence is a real
@@ -803,9 +811,14 @@ What it does NOT do:
   - a **lost newer observation can leave an older verdict's vocabulary to apply** — the
     worker decides from knowledge at least as new as every observation actually
     delivered before its decision, never newer;
-  - only **resume-shaped** fork siblings are recognisable here: a clean-start remote
-    CONNECT (or any discard) re-mints the incarnation generation, and a generation
-    mismatch concedes to 0x8E. The one-hop limit applies as everywhere — including
+  - a **clean-start** fork sibling is recognisable here since F-029, and this bullet used
+    to say the opposite. A clean-start CONNECT (or any discard) re-mints the incarnation
+    generation, and the classifier used to concede on that mismatch before it ever
+    compared parents; it no longer consults the generation at all, and `clear()` carries
+    the claimed record's identity across the re-mint, so the sibling arrives PARENTED and
+    classifies forked. What still concedes is a PARENTLESS survivor — a cross-term
+    create x create, where neither record has a parent to match — which is filed as the
+    F-029b blocker in `docs/ROADMAP.md` §0.2. The one-hop limit applies as everywhere — including
     through an UNRESOLVED local attempt: a save whose store landed ambiguously leaves
     the acknowledged pair stale behind a free fence, so a remote sibling of that
     unadopted attempt concedes to 0x8E (and the takeover-path Will cancel), exactly as
@@ -825,11 +838,12 @@ What it does NOT do:
   - on the forked verdict the preserved outbox record can **still be cancelled at
     `FireAt`** by the lineage-blind watermark/session-record fences (filed separately);
   - **shutdown-time observations are dropped** once the dispatch gate closes or the
-    watermark map is nilled, and a **mid-rollout** broker that owns the resident session
-    keeps the old synchronous 0x8E-and-cancel behavior on its own sessions;
-  - **warm-up**: a record predating the recognition work carries no lineage; its first
-    upgraded save stamps `{WID, PWID: ""}`, which the classifier refuses, so only the
-    second upgraded save yields a classifiable acknowledged pair.
+    watermark map is nilled;
+  - **warm-up**: a record left in a developer's JetStream store before the recognition
+    work carries no lineage; the first save over it stamps `{WID, PWID: ""}`, which the
+    classifier refuses, so only the SECOND save yields a classifiable acknowledged pair.
+    This is a property of the stored record, not of the writer — every broker runs this
+    tree — and the same two-save warm-up applies after any state reset.
 - **No durable state is repaired.** The forked record stays and the rightful owner's
   granted state is still lost. A repair was designed and rejected: it would resurrect an
   incarnation a teardown had already deleted, it needs a last-durable byte snapshot that
@@ -869,16 +883,20 @@ What it does NOT do:
   sibling `{b,p}` of the PREVIOUS acknowledged record classifies as unrelated and concedes
   — which is precisely the fork this mechanism is about, missed because the base moved
   first.
-- **Detection is LIMITED by lineage-dropping writers, not disabled by them.** An upgraded
-  writer that reads an unstamped record still writes a fresh `WID`, so siblings formed from
-  that stamped base are detectable. What concedes is a fork *involving* an old writer, or
-  one based on a record whose lineage an old writer dropped, until an upgraded write
-  establishes a new base.
-- **Takeover versus takeover at one base stays unordered.** Both sides' persist
-  observations now classify, so for a resume-shaped fork each side withholds the claim
-  (0x89) rather than evicting the other with 0x8E — but nothing orders or arbitrates the
-  two evictions themselves, a clean-start side's re-minted generation still concedes to
-  0x8E, and a side whose observation was lost decides nothing at all.
+- **Detection is LIMITED by an unstamped stored record, not disabled by it.** A save over
+  a record that carries no lineage still writes a fresh `WID`, so siblings formed from
+  that stamped base are detectable. What concedes is a fork based on the unstamped record
+  itself, until one save establishes a new base.
+- **Takeover versus takeover at one base is arbitrated WITHIN a leader term, and only
+  there.** F-029 made every record write conditional, base 0 included, so two frontends
+  writing off one base inside a term produce exactly one winner and a definitely-rejected
+  loser that re-drives onto the winner's record. A clean-start side no longer concedes on
+  its re-minted generation either: the classifier ignores the generation and the sibling
+  is parented across the re-mint, so it classifies forked and answers 0x89. What remains
+  is the CROSS-TERM pair, where both records can apply and the loser's record is
+  parentless: it converges on one owner but cannot tell that from an ordinary takeover.
+  Filed as the F-029b blocker rather than accepted here. A side whose observation was lost
+  still decides nothing until the backstop reaches it.
 - **The other five arbitrated streams have no lineage at all** — `$MQTT_willq`,
   `$MQTT_willcancel`, `$MQTT_qos2in` (both its hold subjects and their `.rel` siblings),
   `$MQTT_qos2assign` and `$MQTT_inflight` — so the same leader-transition overwrite is
@@ -937,17 +955,23 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
      courtesy write, per (9). That 0x89 now goes through the shared claim like every other
      server DISCONNECT, so a displacement that already notified this connection suppresses
      it and the close is silent.
-  6. **The rolling-upgrade asymmetry is unchanged**: protection is per owning broker (see
-     the last bullet), so an older broker keeps its bound split-brain.
-  7. **The AT-BASE false foreign verdict is CLOSED for a non-zero CAS base; two
-     fail-safe residuals remain.** The uncertainty resolver no longer clears an ambiguity
-     on a plain load at the base sequence: it RE-ATTEMPTS the attempt's exact bytes, so a
-     late-committing proposal loses that arbitration instead of being read later as
-     another owner's record. Still open, and NOT covered by that closure:
-     - the **unconditional create** (base 0, the first-ever record write, which carries no
-       CAS header and is therefore never classified at-base): an ambiguous create whose
-       landing arrives late can still be classified foreign. Pre-existing
-       headerless-create territory, not a property of the resolver.
+  6. **The protection is per OWNING broker** (see the last bullet): a session's bound
+     split-brain is closed by whichever broker owns that session, and no broker acts on
+     another's residents.
+  7. **The AT-BASE false foreign verdict is CLOSED at every CAS base, base 0 included;
+     one fail-safe residual remains.** The uncertainty resolver no longer clears an
+     ambiguity on a plain load at the base sequence: it RE-ATTEMPTS the attempt's exact
+     bytes, so a late-committing proposal loses that arbitration instead of being read
+     later as another owner's record. The **unconditional create** used to be excluded
+     from that — a first-ever write carried no CAS header, so re-sending it would have
+     overwritten whatever was there rather than arbitrating. **F-029 made every create
+     conditional**, so base 0 is settled the same way as any other, and two brokers
+     creating one session from nothing are arbitrated within a leader term rather than
+     one erasing the other. Across a leader transition both creates can still apply and
+     the later one survive, and the loser cannot tell that from an ordinary takeover —
+     that is a `docs/ROADMAP.md` §0.2 blocker, tracked work rather than an accepted
+     limit, because closing it needs a durable identity for the empty-subject interval.
+     Still open, and NOT covered by the closure:
      - **an absent record whose re-attempt is refused 10071** (nothing in process for the
        subject). That refusal does not prove the ORIGINAL proposal is dead: a leader
        transition clears the in-process map while a replicated proposal can survive it, so
@@ -1010,9 +1034,9 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
         old overlap with a gate-held probe is gone — the worker OBSERVES the gate and
         defers to a holder — at the price that the deferral can lose the eviction
         (bounded retries, then a refused exit).
-      - **Per owning broker**, like every in-process fix here: during a rolling upgrade a
-        session resident on an older broker keeps the old double-DISCONNECT exposure on its
-        own sockets. No wire, stream or record state is involved (see (6)).
+      - **In-process, so no wire, stream or record state is involved** (see (6)). Every
+        broker is built from this tree (Compatibility boundary), so the claim is not
+        qualified by a rollout.
   13. **The gate hold is bounded against non-blocking writers only.** "At most one probe per
       arming, roughly three JetStream timeouts" needs the record fence to reach the waiting
       settlement once its current holder releases. The TRY-BARGE half of that is closed:
@@ -1040,9 +1064,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       of that refusal, but the prioritized writer can open its transaction and marshal
       `DisconnectedAt = 0` before the fallback stamps, so that arm reaches the SAME one-body
       exposure rather than a cost-free state. Waiter priority is a per-broker property of
-      an in-process fence: during a rolling upgrade a session resident on an older broker
-      keeps the original barge exposure until that broker upgrades, and no wire, stream or
-      record state is involved either way.
+      an in-process fence, and no wire, stream or record state is involved either way.
   14. **A takeover still mid-flight can have its Will published by this connection's
       close.** The rebound arm applies the takeover's own discard rule as soon as the rebind
       is observable. Before the rebind there is nothing to observe: if the bounded retry
@@ -1079,14 +1101,13 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   record that reads as connected with no acknowledged connection behind it, and `Origin`
   is only a configured node name (uniqueness is documented, not enforced). Ownership is
   revalidated by CAS, and no part of this design infers liveness from the record.
-- **Protection is PER BROKER and behaviourally asymmetric during a rolling upgrade.** No
-  stream, subject, record field, header or cross-broker message is added, and the probe is
-  an ordinary session save an older broker already understands — so wire compatibility is
-  symmetric in both directions. But a new broker settles only its OWN rejections; an older
-  broker keeps its stale objects and its bound split-brain — the pre-dispatch gate protects
-  the sessions THIS broker owns, not the account. During a mixed-version window
-  the contender in process may be the older broker, which is precisely why the probe
-  retries a CAS instead of trusting a read.
+- **Protection is PER SESSION, not per account.** No stream, subject, record field,
+  header or cross-broker message is added; the probe is an ordinary session save. A
+  broker settles the rejections of the sessions IT owns, and the pre-dispatch gate
+  protects those sessions — which is the whole account only because every broker runs
+  this code (Compatibility boundary). The contender in process is another broker's
+  ordinary write either way, which is why the probe retries a CAS instead of trusting a
+  read.
 - **The never-expire disconnect stamp is a Will-fence fix, not an expiry change.** A
   never-expiring session's close records the disconnect time so a later write cannot read
   as a live newer connection and cancel an owed delayed Will. The stamp is taken inside a

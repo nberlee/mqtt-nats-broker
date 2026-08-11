@@ -32,8 +32,8 @@ lint-md: ## Run markdownlint over the project's own Markdown
 full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 	go test -tags mqttport_fulltests ./internal/mqtt/
 
-cluster-failover-tests: ## Run the gated 3-node JetStream Will-outbox failover tests.
-	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
+cluster-failover-tests: ## Run the 3-node JetStream tests: Will-outbox failover and takeover arbitration.
+	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)' ./internal/mqtt/
 
 soak: ## Paired flakiness soak: same gated tests on this tree vs a clean baseline
 	SOAK_RUNS=$(SOAK_RUNS) SOAK_RUN='$(SOAK_RUN)' SOAK_BASE=$(SOAK_BASE) SOAK_DIR=$(SOAK_DIR) \

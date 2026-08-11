@@ -74,7 +74,7 @@ import (
 //
 // sess.mu must be held.
 func (sess *mqttSession) markWriteRejectedLocked(baseSeq uint64) {
-	sess.recordRejectedSeq = baseSeq
+	sess.recordRejectedSeq, sess.recordRejectedArmed = baseSeq, true
 }
 
 // recordRejectionPendingLocked reports whether a definite rejection is still
@@ -85,8 +85,11 @@ func (sess *mqttSession) markWriteRejectedLocked(baseSeq uint64) {
 // resolver's adoption, a repair save's adopting arms — invalidates the marker without
 // having to be enumerated. Each conjunct earns its place:
 //
-//   - != 0 because clear() resets sess.seq to 0, and two zeroes must not read as a
-//     match;
+//   - armed because a base-0 rejection is now REAL (F-029 made the create conditional),
+//     so the sequence alone can no longer stand in for "is there a marker": zero used
+//     to mean none. It is the ONE fact this predicate cannot derive, which is why
+//     clear() — the route that re-mints at seq = 0 — carries an explicit obligation to
+//     disarm it;
 //   - == sess.seq because a write that has since landed settled the question and moved
 //     the sequence past this rejection's base;
 //   - !seqUncertain because the uncertainty machinery owns such a session — and this one
@@ -97,7 +100,7 @@ func (sess *mqttSession) markWriteRejectedLocked(baseSeq uint64) {
 //
 // sess.mu must be held.
 func (sess *mqttSession) recordRejectionPendingLocked() bool {
-	return sess.recordRejectedSeq != 0 && sess.recordRejectedSeq == sess.seq &&
+	return sess.recordRejectedArmed && sess.recordRejectedSeq == sess.seq &&
 		!sess.seqUncertain
 }
 
@@ -119,7 +122,7 @@ func (sess *mqttSession) recordRejectionPendingLocked() bool {
 //
 // sess.mu must be held.
 func (sess *mqttSession) recordRejectionGatesServingLocked() bool {
-	return sess.recordRejectedSeq != 0 && sess.recordRejectedSeq == sess.seq
+	return sess.recordRejectedArmed && sess.recordRejectedSeq == sess.seq
 }
 
 // mqttTestRejectionWindowHookV fires at each point where this feature samples record
@@ -215,7 +218,7 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 	// predicate that makes it meaningful. The probe below mints its own identity; this
 	// is the base that identity descends from, and it is what a surviving sibling would
 	// share a parent with. A rejected probe never moves it. See sess_fork_lineage.go.
-	ourGen, ackWID, ackPWID := sess.gen, sess.wid, sess.pwid
+	ackWID, ackPWID := sess.wid, sess.pwid
 	sess.mu.Unlock()
 	if !pending {
 		return mqttRejectionKeep
@@ -236,7 +239,7 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 		// between the probe and the readback that classifies it.
 		smsg, lerr = sess.jsa.loadSessionMsg(domainTk, idHash)
 	}
-	verdict := classifyRejectedProbe(outcome, detail, smsg, lerr, ourGen, ackWID, ackPWID)
+	verdict := classifyRejectedProbe(outcome, detail, smsg, lerr, ackWID, ackPWID)
 	if verdict == mqttRejectionKeep && err != nil {
 		sess.jsa.c.Debugf("MQTT: rejection probe for session %q established nothing: %v", sess.id, err)
 	}

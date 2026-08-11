@@ -512,26 +512,41 @@ func TestUncertainDuplicateCommitCollapses(t *testing.T) {
 	}
 }
 
-// TestUncertainBaseZeroNeverReAttempts pins the exclusion of the unconditional
-// create.
+// TestUncertainBaseZeroIsReAttempted replaces TestUncertainBaseZeroNeverReAttempts,
+// which asserted the exclusion F-029 removed (test 11, mutation M10).
 //
-// A first-ever record write carries no CAS header — there is no sequence to expect —
-// so re-sending it would be an unconditional store that could overwrite whatever is
-// there. It can never reach the re-attempt arm: a found record's sequence is at least
-// 1, so it is never "at base" for base 0. That is a property of the framing, and this
-// test is what keeps it one.
-func TestUncertainBaseZeroNeverReAttempts(t *testing.T) {
+// The old test pinned a real property of the old framing: a first-ever write carried no
+// CAS header, so re-sending it would have been an unconditional store that could
+// overwrite whatever was there, and the resolver was right to refuse. What changed is
+// the framing, not the reasoning — a base-0 create now CASes on "the subject must be
+// empty", so re-sending it arbitrates instead of stomping, and the absent-subject
+// readback is exactly the case that needs arbitrating.
+//
+// The two halves are asserted separately so a mutation cannot satisfy one by accident:
+// the attempt must be framed WITH a header, and an absent subject must drive a store.
+func TestUncertainBaseZeroIsReAttempted(t *testing.T) {
 	a, _ := testNewTeardownEnv(t)
 	sess := testProvisionSession(t, a, "base-zero")
 
-	// An ambiguous UNCONDITIONAL create: base 0, so mqttFrameRecordWrite emits no
-	// header at all.
-	testMarkUncertain(sess, 0, []byte(`{"attempted":"unconditional"}`))
+	// An ambiguous first-ever create: base 0, and conditional like every other write.
+	testMarkUncertain(sess, 0, []byte(`{"attempted":"conditional-create"}`))
 	sess.mu.Lock()
-	if sess.pendingWrite.hdr != 0 {
-		t.Fatalf("a base-0 attempt must be framed headerless, got hdr=%d", sess.pendingWrite.hdr)
-	}
+	hdr := sess.pendingWrite.hdr
 	sess.mu.Unlock()
+	if hdr == 0 {
+		t.Fatal("a base-0 attempt must carry a CAS header: an unconditional create is what F-029 closed")
+	}
+
+	// The subject must be EMPTY for the "gone" readback to be what the resolver sees.
+	// testProvisionSession leaves a record behind, so remove it — and load first, so
+	// "absent" below means removed rather than never there.
+	smsg, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
+	if lerr != nil || smsg == nil {
+		t.Fatalf("the provisioned record must be loadable before it is removed: %v", lerr)
+	}
+	if derr := a.asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); derr != nil {
+		t.Fatalf("removing the session record: %v", derr)
+	}
 
 	var stores int
 	restore := setMQTTTestSessStoreResultHook(func(s *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
@@ -542,16 +557,17 @@ func TestUncertainBaseZeroNeverReAttempts(t *testing.T) {
 	})
 	defer restore()
 
-	res, _ := sess.resolveUncertainWrite()
+	res, rerr := sess.resolveUncertainWrite()
 	restore()
-	if stores != 0 {
-		t.Fatalf("a base-0 ambiguity must never be re-attempted, got %d store(s): "+
-			"a headerless re-send is unconditional and could overwrite another owner's record", stores)
+	if stores != 1 {
+		t.Fatalf("a base-0 ambiguity over an absent subject must be settled by RE-ATTEMPTING it, "+
+			"got %d store(s) (err=%v): a readback never settles a rejection", stores, rerr)
 	}
-	// The record exists at a sequence of its own, which is not this attempt's bytes:
-	// today's classification stands, unchanged.
-	if res != mqttUncertainForeign {
-		t.Fatalf("resolution = %v, want the existing base-0 classification (foreign)", res)
+	// The re-attempt was accepted against an empty subject, which proves the create is
+	// ours: that is the verdict the arbitration produces, and the one the old exclusion
+	// could never reach.
+	if res != mqttUncertainOurs {
+		t.Fatalf("resolution = %v, want ours: the re-attempt landed against an empty subject", res)
 	}
 }
 
@@ -589,19 +605,20 @@ func TestClassifyAttemptReadbackShapes(t *testing.T) {
 		{"no error and no message", nil, nil, mqttAttemptUnreadable, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, seq := classifyAttemptReadback(tc.smsg, tc.lerr, pw, _EMPTY_, _EMPTY_, _EMPTY_)
+			got, seq := classifyAttemptReadback(tc.smsg, tc.lerr, pw, _EMPTY_, _EMPTY_)
 			if got != tc.want || seq != tc.seq {
 				t.Fatalf("classifyAttemptReadback = (%v, %d), want (%v, %d)", got, seq, tc.want, tc.seq)
 			}
 		})
 	}
 
-	// Gone at a base of ZERO keeps the historical foreign classification: an
-	// unconditional create carries no CAS header, so there is nothing to arbitrate
-	// with and the re-attempt arm must never be reached.
+	// Gone at a base of ZERO reaches the ordinary gone arm since F-029 (M10). The
+	// special case that returned foreign here existed because an unconditional create
+	// could not be re-attempted; the create is conditional now, so the absent subject is
+	// arbitrated by re-sending it rather than guessed at from a read.
 	zero := &mqttPendingWrite{baseSeq: 0, digest: mqttRecordDigest(body)}
-	if got, _ := classifyAttemptReadback(nil, ApiErrors[JSNoMessageFoundErr], zero, _EMPTY_, _EMPTY_, _EMPTY_); got != mqttAttemptForeign {
-		t.Fatalf("classifyAttemptReadback(gone, base 0) = %v, want foreign", got)
+	if got, _ := classifyAttemptReadback(nil, ApiErrors[JSNoMessageFoundErr], zero, _EMPTY_, _EMPTY_); got != mqttAttemptGone {
+		t.Fatalf("classifyAttemptReadback(gone, base 0) = %v, want gone", got)
 	}
 
 	// The digest is over the record BODY, which is what a load returns — the CAS

@@ -343,6 +343,110 @@ Operational constraints for the marker:
   operation ever deletes or purges a watermark, so they are audited
   non-prerequisites, not oversights.
 
+### Two frontends taking over one session from the same base
+
+The session record is the sole arbitration, and per-subject CAS linearizes it only
+WITHIN a stream-leader term. Nothing can prevent two writes off one base. What the
+design delivers is that every interleaving converges on one owner and each client is
+told something true.
+
+**Every record write is conditional, base 0 included.** The create was the one write
+that opted out: with no header it landed on top of whatever was there, so a clean-start
+CONNECT on one frontend erased the record another was acknowledged for, with no
+rejection anywhere. At sequence 0 the header means *the subject must currently be
+empty*. Two consequences follow. A create can now fail — 10071 for an occupied subject
+and, deliberately, for a subject load the server folds into the same code, so **10071
+never proves a record exists**; 10164 for contention, including with an in-process write
+of any kind. And the pre-proposal check enrolls the write in the clustered in-process
+contention checks, which is what makes a concurrent create fail rather than silently
+interleave.
+
+That last clause is a **dependency contract, and the evidence for it lives upstream**:
+nats-server rejects a write whose subject is already in process
+(`jetstream_batching.go:777-782`) and tests that guard directly
+(`jetstream_batching_test.go:1576-1586`) and on a replicated stream
+(`jetstream_cluster_4_test.go:5158-5164`). This broker's own replicated tests assert the
+property that follows — from an empty subject exactly one create is admitted, the loser
+is definitely rejected, and the winner's bytes survive — but cannot force two proposals
+into the pre-proposal window, because no seam holds a proposal between admission and
+apply. That is a limit on what a test here can observe, not on what the broker does.
+
+**A superseded teardown claim re-drives; it never proceeds at base 0.** `clear()`
+reported both of its superseded outcomes as success, and a CONNECT read that as a
+completed discard and went on to its accept save — at base 0, because `clear()` had just
+reset the sequence. The two halves close the same stomp from opposite ends: the write is
+refused, and the path that produced it no longer runs. The outcome is now typed
+(`errMQTTClearSuperseded`); four callers are terminal on it and two re-drive, and each
+terminal one has its OWN branch, because a normal outcome logged as a teardown failure
+sends an operator hunting something that never went wrong.
+
+**The loop is the contract, not an enumeration of branches.** Three review rounds each
+found one more reachable path through the CONNECT's control flow, so the design does not
+depend on having enumerated them:
+
+- **R1** — any outcome meaning *the base I was going to write at is not current* (a
+  superseded claim, a superseded release including one inside `finishAdoptedTeardown`,
+  or a definite 10071-class rejection) re-enters at the authoritative restore, from the
+  top. No path continues to a write on a base it learned was stale.
+- **R2** — every write's base and parent come from the same authoritative read. The base
+  is what the re-evaluated clean-start decision produces; the parent is that record's
+  identity, with one named exception — an adopted teardown marker's successor parents
+  from the marker's `PWID`.
+- **R3** — the loop is bounded, and every exit leaves nothing resident at `seq == 0`.
+
+One re-entry is driven by *not being able to know*, and it is the one door that reports
+nothing. A CONNECT whose session has an unresolved record write resolves it first, and a
+resolution that comes back ours discharges whatever the close parked. When that is a
+deferred discard, the discharge runs `clear()` and consumes the outcome — the session
+leaves the maps whether the teardown completed or was superseded — so the CONNECT cannot
+tell the two apart by asking. It re-reads instead of reusing the object left behind,
+which would write at the sequence `clear()` reset to 0 after the base was already stale.
+That re-entry is admitted as a **cycle**: the pass it starts performs a fresh
+authoritative restore and may run a whole teardown and accept save off it, which is
+exactly the work the admission deadline exists to stop. The cycle cap can never be what
+refuses there — the arm is reachable at most once per CONNECT, since the restore yields
+an object that is not uncertain — so what the admission enforces is the deadline.
+
+R3's second half is not housekeeping. `clear()` resets the object to sequence 0 and
+deliberately does not detach its client, and `reconcileResidentOwnership` returns early
+on `ourSeq == 0`, because an absent subject is the ordinary state of a session whose
+first record has not landed. A reset, still-bound, still-resident object is therefore
+unreachable by every reaper the broker has — permanent split-brain, not a leak.
+
+**Which is why the re-drive is a binding state machine, not one disposal primitive.**
+The discard runs *pre-bind*, when the bound client is the genuinely old one; the accept
+save runs *post-bind*, when it is the connecting client itself. Four transitions:
+
+| | State | Disposal |
+|---|---|---|
+| **T0** | pre-bind, not resident (the restore's own overdue discard) | nothing to dispose; re-read and restart the decision |
+| **T1a** | resident, unbound | evict, tell nobody — there is no connection to notify |
+| **T1b** | resident, old client attached | evict, then the ordinary takeover tail: Will drop, flappers entry, 0x8E, close |
+| **T2** | post-bind, the connecting client is the bound one | **silent** detach and evict, then re-bind the SAME client to the replacement |
+
+Each disposes BEFORE anything fallible, which is what makes the reset-resident state
+unreachable rather than merely unlikely. T2 also hands over the **accept record
+transaction**: it ends the transaction on the object it is leaving before switching, so
+the deferred close cannot end an old token against a new object and leak the discarded
+one's fence. A plain end, never a new generation — epoch advancement is `clear()`'s
+mechanism for an object that will be REUSED, and T2 abandons its object instead.
+
+**Two independent bounds, because there are two loops.** Full re-drive cycles are capped
+at 3; 10164 create retries repeat one write rather than one takeover, so they draw on
+their own cap of 5 with a 100 ms backoff. The two are deliberately unequal: with the
+same number, a shared counter is indistinguishable from two separate ones. Over both
+sits a 5 s **admission** bound — no new top-level cycle and no new accept-save retry is
+admitted after it. It is not a ceiling: an attempt already in progress runs to the
+JetStream request timeout, and the nested retry loops inside `claimTeardown` and
+`releaseTeardown` are not deadline-checked. On exhaustion the CONNECT is refused, with
+nothing resident and nothing bound — the state a fresh CONNECT starts from.
+
+**What this does not close.** Two shapes remain, both tracked as `docs/ROADMAP.md` §0.2
+blockers rather than accepted limits, because both need durable state this design does
+not introduce: the window in which a teardown that WON its claim has already deleted the
+consumers a cross-term survivor's record still names; and telling two parentless
+first-creates racing across a leader term apart from two unrelated ones.
+
 ### The session-record watch
 
 Ownership of a session changes only by a write to its record subject on `$MQTT_sess`,
@@ -456,10 +560,9 @@ Shutdown stays the one exception: it nils the whole map.
 
 **What is closed and what is not.** A quiet session converges within delivery latency
 of any remote ownership write, bounded by the next backstop pass that reaches it, and
-absent any write ownership provably never moved. What remains: the serving window
-between an observation and the worker's decision; and, during a rolling upgrade, a
-quiet resident on a not-yet-upgraded broker still has only the lossy path until that
-broker upgrades. Nothing recreates a deleted or inactivity-reaped watch consumer under
+absent any write ownership provably never moved. What remains is the serving window
+between an observation and the worker's decision. Nothing recreates a deleted or
+inactivity-reaped watch consumer under
 a live manager — the watch then stays absent and the backstop alone converges, until
 the next manager start.
 
@@ -578,11 +681,18 @@ and can never be its landing. The gone arm is fail-safe (above), and a record BE
 base is
 impossible within a stream incarnation (sequences are monotonic, so a subject deleted and
 re-created lands higher) and implies a reset or re-provisioned store, so it is classified
-foreign **fail-safe** — never adopted — rather than proven. **Base 0 is excluded by
-construction**: a first-ever record write carries no CAS header, a found record's sequence
-is at least 1, so an unconditional create is never classified at-base and is never
-re-attempted. Its existing classification stands, with the residual `docs/CONFORMANCE.md`
-states.
+foreign **fail-safe** — never adopted — rather than proven.
+
+**Base 0 is no longer excluded, because the create is no longer unconditional.** The
+exclusion was sound while a first-ever write carried no CAS header: an unconditional
+re-send arbitrates nothing and could only overwrite whatever was there, so an absent
+subject at base 0 had to be read as somebody else's. Every record write now carries the
+header at every sequence, 0 included, where it means **the subject must currently be
+empty** — so base 0 flows through the ordinary arms. *Gone* re-attempts, and acceptance
+against an empty subject proves the create ours; *at base* stays unreachable at 0
+because stream sequences start at 1, which is a property of the store rather than an
+assumption; *moved* is ours on a digest match and otherwise foreign, or forked when the
+lineage test below says so.
 
 ### Recognising a forked session record
 
@@ -611,10 +721,28 @@ place in each caller — the branch that has already concluded foreign — behin
 caller's existing `Sequence > baseSeq` gate, and it emits only **forked** or
 **not-forked**:
 
-1. a different incarnation generation → not-forked (its lineage restarts);
-2. `ackWID != "" && ackPWID != "" && found.WID != "" && found.PWID == ackPWID &&
+1. `ackWID != "" && ackPWID != "" && found.WID != "" && found.PWID == ackPWID &&
    found.WID != ackWID` → **forked**;
-3. anything else → not-forked, which is today's behavior exactly.
+2. anything else → not-forked, which is the pre-lineage behavior exactly.
+
+**The incarnation generation is deliberately not consulted, and that is a reversal.** It
+used to short-circuit ahead of the pointer test, on the reasoning that a different
+incarnation restarts the lineage. That hid the fork this rule exists to catch. Record
+identities are globally unique, so a parent match states descent from one actual record
+whatever generation wrote it; a generation mismatch adds nothing to that and only
+suppressed it.
+
+**The chain also crosses the teardown re-mint**, which is what makes a clean-start fork
+visible at all. `clear()` zeroes `wid`/`pwid` — the session is acknowledged for nothing
+once its record is deleted, and six sites read `wid` as exactly that — but it records the
+WID of the record the teardown CLAIMED in a third field, `reMintedFrom`, and both
+parenting sites take their parent from `parentForNextWriteLocked()`: the record we hold,
+or that one when we hold none. So the sibling of base `a` written after tearing `a` down
+is `{c, a}` rather than `{c, ""}`, and a resume child `{b, a}` recognises it. The
+adopted-teardown create takes the same parent from the marker's own `PWID` — the record
+that teardown claimed, not the marker, which the release deletes and which is nobody's
+base — so the cross-broker fork is recognisable from either side. The field is
+memory-only and self-retiring: once a save lands, `wid` is authoritative again.
 
 Sibling-hood is defined against the **acknowledged** pair, never the in-flight attempt:
 with acknowledged `{a,p}` and attempt `{c,a}`, survivor `{b,p}` is the fork, `{d,a}` is a
@@ -763,12 +891,21 @@ rejects it) nor recreate a released one (a rejection implies a non-zero base, so
 carries a real expected-last-subject-sequence header). There is **no digest arm**: a
 rejected write did not land, so a later record matching our bytes cannot be this attempt.
 
-The marker (`recordRejectedSeq`, memory-only) is armed centrally at the store boundary,
-so a rejection site nobody enumerated is covered; its validity is a predicate at the
-point of use — non-zero, equal to `sess.seq`, and not unresolved — so every path that
-moves the sequence invalidates it without being enumerated. The `!seqUncertain` conjunct
-is load-bearing: an unresolved session's save is refused *before* the store, and a probe
-classifying on a zero-valued attempt would read any real record as foreign.
+The marker (`recordRejectedSeq` plus `recordRejectedArmed`, memory-only) is armed
+centrally at the store boundary, so a rejection site nobody enumerated is covered; its
+validity is a predicate at the point of use — armed, equal to `sess.seq`, and not
+unresolved — so every path that moves the sequence invalidates it without being
+enumerated. The `!seqUncertain` conjunct is load-bearing: an unresolved session's save is
+refused *before* the store, and a probe classifying on a zero-valued attempt would read
+any real record as foreign.
+
+**The armed flag replaced a non-zero sequence test**, and it is not bookkeeping. Zero
+used to be a safe stand-in for "no marker" because a base-0 create could not be rejected
+at all; now that every create is conditional it can, and a real rejection at base 0 must
+arm the marker like any other. That leaves exactly one fact the predicate cannot derive
+from the sequence, so `clear()` — the one route that re-mints at `seq = 0` — carries an
+explicit obligation to DISARM. Left armed there, the marker would match the fresh
+session's own sequence and gate its serving for the life of the session.
 
 Verdicts: **landed** → ours, and the advanced sequence retires the marker; **rejected
 with the record at the probe's own base** → contention, which is never ownership, so the
