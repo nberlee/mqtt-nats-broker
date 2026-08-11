@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // errMQTTTestLostResponse is the store-result hook's "landed, response lost" half:
@@ -540,17 +539,58 @@ func TestMQTTWatchSkipsOwnOriginForSpawn(t *testing.T) {
 	seq := e.sess.seq
 	e.sess.mu.Unlock()
 
+	// A forbidden worker has to be caught by its ADMISSION, not by waiting to see
+	// whether one shows up.
+	//
+	// Three weaker versions of this assertion were tried and each lost the evidence
+	// it was reading. Presence of a reconcileWM entry is not this filter's business:
+	// the no-local-session expiry branch creates one during setup, before the session
+	// is registered in sessByHash, and pruneReconcileEntryLocked keeps it while the
+	// session is resident — asserting absence failed about one run in eight with the
+	// filter working perfectly. The entry's counters are worse: a worker admitted by
+	// a broken filter EVICTS the session, and its cleanup then prunes the entry
+	// precisely BECAUSE the session is no longer resident, so every field reads back
+	// zero. And a timed wait on the completion seam is not a negative at all — a
+	// worker still inside its JetStream load after the deadline lets residency look
+	// intact here and then satisfies the backstop's own assertion below.
+	//
+	// Admission is synchronous: evictRunning and inFlight are set under as.mu before
+	// the goroutine is launched, and the delivery is an ordinary call, so by the time
+	// it returns the decision is already recorded. Parking any worker before its
+	// first load is what stops it completing and erasing that record before it is
+	// read.
+	_, release := e.parkEvictWorker(t, false)
+
 	body, err := json.Marshal(&mqttPersistedSession{ID: e.clientID, Origin: e.asm.jsa.id})
 	if err != nil {
 		t.Fatalf("marshal the record: %v", err)
 	}
 	e.deliverThroughWatchCallback(t, seq+1, body)
 
-	// No worker spawns, so no trigger is recorded either.
-	time.Sleep(20 * time.Millisecond)
-	if present, _, _, _, _ := e.reconcileEntry(); present {
-		t.Fatal("a record this broker wrote must not wake an eviction worker")
+	e.asm.mu.RLock()
+	var evictRunning bool
+	var evictLatest uint64
+	if st := e.asm.reconcileWM[e.idHash]; st != nil {
+		evictRunning, evictLatest = st.evictRunning, st.evictLatest
 	}
+	_, resident := e.asm.sessByHash[e.idHash]
+	e.asm.mu.RUnlock()
+
+	if evictRunning || evictLatest != 0 {
+		t.Fatalf("a record this broker wrote must not wake an eviction worker: "+
+			"evictRunning=%v evictLatest=%d", evictRunning, evictLatest)
+	}
+	if !resident {
+		t.Fatal("the own-origin record evicted the session that wrote it")
+	}
+
+	// Release the barrier and disarm it before the backstop half, whose worker must
+	// run to completion. Closing release first makes the seam a no-op for any worker
+	// that reaches it in between.
+	close(release)
+	e.asm.mu.Lock()
+	e.asm.testEvictPauseBeforeLoad = nil
+	e.asm.mu.Unlock()
 
 	// The backstop refuses that shortcut, which is what keeps an Origin collision a
 	// latency cost rather than a correctness one.

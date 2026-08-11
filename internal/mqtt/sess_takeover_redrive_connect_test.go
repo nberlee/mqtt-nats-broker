@@ -113,6 +113,10 @@ func testTraceReDrive(t *testing.T, asm *mqttAccountSessionManager, shape ...fun
 func testTraceReDriveStaged(t *testing.T, stage func(*mqttSession)) *testReDriveTrace {
 	t.Helper()
 	tr := &testReDriveTrace{}
+	// Registered before the restore below, so the cleanups unwind in the order the
+	// window needs: the restore stops new calls, then the gate waits out the one
+	// that may already be inside stage. See testHookGate.
+	gate := newTestHookGate(t)
 	restoreSave := setMQTTTestSessSaveHook(func(sess *mqttSession) error {
 		sess.mu.Lock()
 		base := sess.seq
@@ -139,6 +143,14 @@ func testTraceReDriveStaged(t *testing.T, stage func(*mqttSession)) *testReDrive
 		if done || stage == nil {
 			return
 		}
+		// stage reports its failures through t, and a clear window can open on a
+		// server goroutine after this test has returned — an expiry reconcile is
+		// enough. Without the gate that report panics the whole binary and aborts
+		// every test still to run.
+		if !gate.enter() {
+			return
+		}
+		defer gate.leave()
 		stage(sess)
 		tr.mu.Lock()
 		tr.staged = true
