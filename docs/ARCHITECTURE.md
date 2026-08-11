@@ -128,7 +128,7 @@ per-owner:
 
 | Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
 |---|---|---|---|
-| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, rollback); no purge, no consumers. Every record carries `WID`/`PWID`, the write's own identity and its parent's | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) | `DenyPurge` (nothing purges); `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, rollback); no purge; **one ephemeral `AckNone` session-record watch consumer per broker** (see "The session-record watch"). Every record carries `WID`/`PWID`, the write's own identity and its parent's | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted); **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
 | `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | as `$MQTT_sess` minus the epoch; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
 | `$MQTT_willcancel` | per-client watermark CAS and reads — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources` | **`DenyDelete`/`DenyPurge`** (no operation deletes or purges — markers are permanent by design); `SubjectDeleteMarkerTTL` (no delete means no marker can ever be created); `MaxConsumers`/`ConsumerLimits` |
 | `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
@@ -342,6 +342,126 @@ Operational constraints for the marker:
   state shape. `DenyDelete`/`DenyPurge` remain deliberately unchecked — no
   operation ever deletes or purges a watermark, so they are audited
   non-prerequisites, not oversights.
+
+### The session-record watch
+
+Ownership of a session changes only by a write to its record subject on `$MQTT_sess`,
+so **observing that stream is observing every ownership change** — and a session
+nobody writes about needs no revalidation at all. That is what lets convergence cost
+nothing per quiet session, which the rejected alternatives could not: a periodic READ
+per resident session proves nothing when it finds the record unmoved (10164 is
+returned while a write is in process upstream), and a periodic CAS would be a write
+per session per interval.
+
+What this replaced was an at-most-once core-NATS notification on the JetStream reply
+subject of every other broker's session store (`$MQTT.JSA.*.SP.*.*`). Lost meant lost:
+a never-expiring session — **every** MQTT 3.1.1 persistent session — has no expiry
+timer, the expiry sweep skips it, and nothing else re-validated a resident object, so
+a displaced client kept being served against a session another broker owned, which is
+the split-brain [MQTT-3.1.4-3] forbids.
+
+**The watch is not a durable channel either, and the design does not claim it is.** It
+is one uniquely-named ephemeral push consumer per broker per account
+(`AckNone`, `ReplayInstant`, `InactiveThreshold` 5 minutes, delivered to a
+`$MQTT.sub.<nuid>` subject on the **service** connection so the recommended client ACL
+still holds), created only once EVERY stream in the provisioning table has been
+created and validated.
+
+That ordering is a leak fix, not a preference. Both per-broker ephemeral consumers —
+this one and the retained-messages consumer — are uniquely named, so nothing later
+adopts or replaces one; manager initialization tears down only local subscriptions;
+and every MQTT connection retries the whole initialization. A consumer created before
+a step that then fails is therefore deleted by nothing, and a persistent
+misconfiguration accumulates one per attempt until each reaches its inactivity
+threshold. So the pair is provisioned as a unit
+(`mqttProvisionEphemeralConsumers`): the watch is created last, and a failure there
+rolls the retained-messages consumer back, leaving a failed attempt with nothing of
+its own behind. Its delivery state is not
+quorum-replicated and it runs without flow control, so a leader change, a slow service
+connection or an in-flight socket loss can **duplicate or drop** a delivery. The
+guarantee lives in the pair:
+
+- **the watch owns latency** — duplicates are inert, because every watermark advances
+  by `max` and `evictRunning` coalesces observations onto one worker per client;
+- **the committed-read backstop owns convergence** — `reconcileResidentOwnership`, one
+  read per resident session on the periodic pass.
+
+`DeliverPolicy` is **`DeliverNew`**, unlike the retained-messages consumer: a resident
+session can only exist on this broker after the manager (and therefore the watch)
+exists, so no historical record concerns a resident, while `DeliverAll` would replay
+every record ever written into the no-local expiry reconcile at every manager start.
+The filter names the record space exactly — `domainTk` carries its trailing dot, a
+domain is one token and a client-ID hash is one token, so a single trailing wildcard
+matches every record subject and nothing else.
+
+**A read can only ever be a trigger, never a verdict**, and the asymmetry is the
+point: "the subject moved" is provable from committed state; "the subject did not
+move" is not. Every classification still happens in the eviction worker, under the
+record fence. The backstop is reached only after the periodic pass's own
+`recordTxOpen`, `seqUncertain` and armed-rejection arms have each taken their
+`continue`, which is what stops it from rediscovering a local ambiguity as if it were
+a peer's write.
+
+Two shapes trigger, and the second is the one no sequence comparison can see:
+
+- **the record MOVED** past our acknowledged sequence — feed the eviction trigger,
+  exactly as a delivery does;
+- **the record is GONE** while we hold a non-zero sequence — there is no newer
+  sequence to compare against, so the backstop **arms the ownership marker**
+  (`markWriteRejectedLocked`) and the existing rejection settlement converges it: the
+  probe re-attempts the save, a CAS against an empty subject is rejected, and
+  *rejected with the record gone* is already classified foreign. This adds an arming
+  SITE, not a mechanism or a verdict, and the marker's point-of-use predicate is
+  unchanged. It also inherits that settlement's PACKET-DRIVEN property for a bound
+  session — the unbound half refuses while a client is attached, the bound half runs
+  pre-dispatch on that connection's readLoop — so unlike the moved-record shape, this
+  one does not converge a bound client that never sends again (`docs/CONFORMANCE.md`,
+  and a roadmap bullet of its own). Absence IS an ownership fact: production contains
+  exactly two deleters of
+  a session record — `releaseTeardown`, at a marker sequence a claim CAS won, and
+  `rollbackDeleteSession`, at the failed CONNECT candidate's own sequence — so a
+  record can only vanish under a party that first claimed it. The bound outcome is
+  therefore **0x8E**, not 0x89; `docs/CONFORMANCE.md` records the one imprecision that
+  leaves.
+
+**Observing our own writes is new, and one shape of it is dangerous.** The old channel
+never delivered this broker's own stores; a stream watch delivers everything. A save
+that LANDED with its response lost arms `seqUncertain` and leaves the acknowledged
+lineage pair stale, so the delivered record is strictly past `sess.seq` and lineage
+would read our own bytes as unrelated — evicting the rightful client with 0x8E over
+its own write. Two layers answer it: before the write settles, the writer's open
+record transaction refuses the worker's fence; after it arms, the worker's **digest
+arm** (`evictOwnLanding`) recognises the record as the attempt's own bytes, using the
+resolver's identity test verbatim, and defers to the resolver without deciding
+anything. The same refusal covers the case with NO bytes to compare: while an attempt
+is unresolved, an unusable load (absent, unreadable, undecodable) may not concede to
+the takeover vocabulary, because the trigger can be that very write — the backstop
+reaches this path carrying no record at all, so nothing else can screen it. The record's
+`Origin` is used only as a **spawn filter** on the delivery
+path — `Origin` proves no authorship, so the backstop deliberately passes no record at
+all and re-triggers whatever the fast path skipped. A record the callback cannot
+decode still feeds the trigger; returning early there would discard the observation
+for exactly the records most likely to matter.
+
+**A refused eviction is no longer lost.** `evictDecided` records the highest trigger a
+decision actually consumed; a refusal (held gate, busy fence, digest deferral,
+exhausted retries) leaves `evictLatest` ahead of it, and the backstop re-fires. The
+entry that carries that accounting therefore outlives its workers, so pruning it is
+one rule in one helper — **the map must still hold this exact entry, no session may be
+resident for the hash, and no worker may be in flight** — applied from both eviction
+cleanups, the no-local expiry worker's cleanup (which previously deleted on "no worker
+in flight" alone and could erase a resident's trigger, since the two kinds share one
+entry), `removeSession`, `removeSessionIfCurrent`, and the backstop's own scan.
+Shutdown stays the one exception: it nils the whole map.
+
+**What is closed and what is not.** A quiet session converges within delivery latency
+of any remote ownership write, bounded by the next backstop pass that reaches it, and
+absent any write ownership provably never moved. What remains: the serving window
+between an observation and the worker's decision; and, during a rolling upgrade, a
+quiet resident on a not-yet-upgraded broker still has only the lossy path until that
+broker upgrades. Nothing recreates a deleted or inactivity-reaped watch consumer under
+a live manager — the watch then stays absent and the backstop alone converges, until
+the next manager start.
 
 ### An ambiguous record write is settled by a CAS, never by a readback
 

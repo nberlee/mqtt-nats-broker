@@ -774,7 +774,7 @@ type mqttAccountSessionManager struct {
 	// Spec5 [3.1.2.11.2]. Guarded by mu.
 	pendingExpiries map[string]*time.Timer
 	// Per-client reconciliation ordering state, keyed by MQTT client ID hash and
-	// guarded by mu. A remote session persist observed by processSessionPersist
+	// guarded by mu. A remote session-record write observed by the session-record watch
 	// hands the expiry reconciliation to a spawned worker; because each worker
 	// loads the record before taking mu, worker completion order can reverse the
 	// (ordered) delivery order. latest is the highest observed PubAck sequence for
@@ -831,7 +831,7 @@ type mqttAccountSessionManager struct {
 	// testCancelWillDone, when non-nil, is invoked after each cancelWillOutbox pass
 	// for THIS account manager only (instance-scoped). Set/read under mu. Lets the
 	// takeover late-enqueue test wait until the displaced broker's asynchronous
-	// cancel scan (processSessionPersist) has completed on the still-empty outbox
+	// cancel scan (the session-record watch's observation) has completed on the still-empty outbox
 	// before releasing the blocked enqueue, so a stray old cancel cannot be mistaken
 	// for the new enqueue-side fence. Nil in production.
 	testCancelWillDone func()
@@ -929,8 +929,15 @@ type mqttAccountSessionManager struct {
 	// store happened and this broker never learned of it — which is the condition the
 	// record-rejection settlement exists for and which nothing else can produce
 	// deterministically. Hash-keyed so a parallel test and every unrelated session on
-	// this manager are unaffected. Nil in production. See processSessionPersist.
+	// this manager are unaffected. Nil in production. See processSessionRecordDelivery.
 	testSessPersistDrop func(idHash string) bool
+	// testSessRecordBackstopOff disables the periodic ownership backstop
+	// (reconcileResidentOwnership) for this manager. It is the counterpart of
+	// testSessPersistDrop, and the two exist so a test can isolate ONE convergence
+	// channel: with both live, a test that means to prove the watch converged a
+	// session would also pass if only the backstop did, and vice versa. Read under
+	// mu; false in production.
+	testSessRecordBackstopOff bool
 
 	// testCancelWatermarkLoad / testCancelWatermarkStore, when non-nil, replace the
 	// per-client cancel-watermark load / CAS store for THIS account manager only
@@ -1130,6 +1137,50 @@ type sessionReconcileState struct {
 	// on the resident branch only, so an observation with no resident session
 	// always reaches the no-local reconcile regardless of the flag.
 	evictRunning bool
+	// evictDecided is the highest trigger a decision actually CONSUMED, and it is
+	// what makes a refused eviction recoverable instead of lost. A refusal — a held
+	// ownership gate, a busy record fence, a digest deferral, an exhausted retry
+	// budget — ends the worker without deciding anything, and clearing the trigger
+	// there is what used to discard the observation entirely (docs/CONFORMANCE.md
+	// stated the eviction as losable with zero notifications). Only a real decision
+	// advances this, so the record-state backstop can re-fire any entry left with
+	// evictLatest > evictDecided. Guarded by as.mu.
+	evictDecided uint64
+}
+
+// pruneReconcileEntryLocked removes a client's reconciliation entry, and it is the
+// ONLY thing that may: the entry now outlives its workers whenever a refusal left a
+// trigger undecided, so "no worker is running" stopped being a licence to delete it.
+//
+// Three conjuncts, each answering a way the delete goes wrong:
+//
+//   - the map must still hold THIS st. A cleanup arriving late holds a pointer that a
+//     replacement may already have superseded, and deleting by hash alone would take
+//     the replacement's trigger with it — the same identity argument
+//     removeSessionIfCurrent exists for.
+//   - no session may be resident for the hash. A resident session is exactly who an
+//     undecided trigger is about, so pruning under one discards the eviction the
+//     backstop was going to re-fire.
+//   - inFlight must be zero. A live worker of either kind holds this pointer and
+//     will write through it.
+//
+// as.mu must be held. Shutdown is the one exception and does not come through here:
+// it nils the whole map, because nothing may install new state once the process is
+// stopping.
+func (as *mqttAccountSessionManager) pruneReconcileEntryLocked(cIDHash string, st *sessionReconcileState) {
+	if as.reconcileWM == nil || st == nil {
+		return
+	}
+	if cur := as.reconcileWM[cIDHash]; cur != st {
+		return
+	}
+	if _, resident := as.sessByHash[cIDHash]; resident {
+		return
+	}
+	if st.inFlight != 0 {
+		return
+	}
+	delete(as.reconcileWM, cIDHash)
 }
 
 type mqttJSAResponse struct {
@@ -3886,18 +3937,22 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		return nil, err
 	}
 
-	// We will listen for replies to session persist requests so that we can
-	// detect the use of a session with the same client ID anywhere in the cluster.
-	//   `$MQTT.JSA.{js-id}.SP.{client-id-hash}.{uuid}`
-	if err := as.createSubscription(mqttJSARepliesPrefix+"*."+mqttJSASessPersist+".*.*",
-		as.processSessionPersist, &sid, &subs); err != nil {
-		return nil, err
-	}
-
 	// We create the subscription on "$MQTT.sub.<nuid>" to limit the subjects
 	// that a user would allow permissions on.
 	rmsubj := mqttSubPrefix + nuid.Next()
 	if err := as.createSubscription(rmsubj, as.processRetainedMsg, &sid, &subs); err != nil {
+		return nil, err
+	}
+
+	// The session-record watch's delivery subject. Every session-record write in the
+	// account arrives here, which is how this broker learns that a peer took one of
+	// its sessions over — the at-most-once `$MQTT.JSA.*.SP.*.*` notification this
+	// replaces could simply be lost, stranding a displaced client indefinitely.
+	// Under "$MQTT.sub." and on the SERVICE connection, like the retained consumer,
+	// so the recommended client ACL denying "$MQTT.>" stays correct.
+	// See sess_record_watch.go.
+	srwsubj := mqttSubPrefix + nuid.Next()
+	if err := as.createSubscription(srwsubj, as.processSessionRecordDelivery, &sid, &subs); err != nil {
 		return nil, err
 	}
 
@@ -3936,16 +3991,34 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// emits a per-message Nats-TTL (Message Expiry) and must not require the
 	// capability of a pre-existing stream. Everything else accepts MQTT 5.0.
 	requireMsgTTL := opts.MQTT.MaxProtocolVersion != mqttProtoLevel
-	for _, spec := range as.brokerStreamSpecs(s, accName, replicas, wantReplicas, maxAckPending, requireMsgTTL, rmsubj) {
+	// Recorded by the $MQTT_rmsgs post step so a later failure can roll it back: the
+	// two per-broker ephemeral consumers are provisioned as one unit.
+	var retainedConsumerName string
+	for _, spec := range as.brokerStreamSpecs(s, accName, replicas, wantReplicas, maxAckPending, requireMsgTTL, rmsubj, &retainedConsumerName) {
 		si, err := ensureBrokerStream(jsa, spec.cfg, spec.validate, spec.preCreate, spec.observe)
 		if err != nil {
+			as.rollbackEphemeralConsumers(retainedConsumerName, _EMPTY_)
 			return nil, fmt.Errorf("MQTT %s stream for account %q: %w", spec.txt, accName, err)
 		}
 		if spec.post != nil {
 			if err := spec.post(si); err != nil {
+				// A post step that failed may still have created its consumer — the
+				// retained one records its name before issuing the request precisely
+				// so this path can remove it. Without this the loop's own failures
+				// leak exactly what the post-loop rollback was added to prevent.
+				as.rollbackEphemeralConsumers(retainedConsumerName, _EMPTY_)
 				return nil, err
 			}
 		}
+	}
+
+	// The session-record watch, created only once EVERY stream has provisioned and
+	// validated, and rolling the retained-messages consumer back if it fails: an
+	// ephemeral consumer left behind by a failed attempt is deleted by nothing, and
+	// every connection retries this whole function. See
+	// mqttProvisionEphemeralConsumers.
+	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, retainedConsumerName); err != nil {
+		return nil, err
 	}
 
 	// Re-arm session-expiry timers, without delaying the connecting client. Then
@@ -4572,7 +4645,7 @@ func (jsa *mqttJSA) storeSessionMsg(domainTk, cidHash string, hdr int, msg []byt
 	subject := mqttSessStreamSubjectPrefix + domainTk + cidHash
 
 	// Passing cidHash will add it to the JS reply subject, so that we can use
-	// it in processSessionPersist.
+	// it in the JS API reply handler.
 	smri, err := jsa.newRequestEx(mqttJSASessPersist, subject, cidHash, hdr, msg)
 	if err != nil {
 		return nil, err
@@ -4808,189 +4881,6 @@ func (as *mqttAccountSessionManager) processRetainedMsg(_ *subscription, c *clie
 	}
 }
 
-// This will receive all JS API replies for a request to store a session record,
-// including the reply for our own server, which we will ignore.
-//
-// It has two responsibilities for a remote persist. When we own a local session
-// for the client ID, a store elsewhere means the record moved with content that is
-// not ours, so we evict our displaced local connection on a spawned worker that
-// CLASSIFIES the surviving record first: a demonstrated successor is a takeover
-// (0x8E), a proven same-base sibling — the leader-transition fork — is reported as
-// 0x89 "server busy" and keeps its enqueued delayed Will. When we do NOT own a
-// local session, we reconcile our local session-expiry timer from the
-// authoritative persisted record on a spawned worker, so a surviving replica
-// cleans up a remotely disconnected session near its original deadline instead of
-// waiting for the periodic sweep.
-// Spec5 [MQTT-3.1.2-8], [3.1.2.11.2].
-//
-// Can run from various go routines (system send loop, etc..).
-// No lock held on entry.
-func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *client, _ *Account, subject, _ string, rmsg []byte) {
-	// Ignore our own responses here (they are handled elsewhere)
-	if tokenAt(subject, mqttJSAIdTokenPos) == as.jsa.id {
-		return
-	}
-	cIDHash := tokenAt(subject, mqttJSAClientIDPos)
-	// Checked before anything else, so a dropped observation touches neither the
-	// reconciliation watermark nor the takeover branch: what it reproduces is a LOST
-	// core-NATS notification, where the remote store happened and this broker never
-	// learned of it.
-	as.mu.RLock()
-	drop := as.testSessPersistDrop
-	as.mu.RUnlock()
-	if drop != nil && drop(cIDHash) {
-		return
-	}
-	_, msg := pc.msgParts(rmsg)
-	if len(msg) < LEN_CR_LF {
-		return
-	}
-	var par = &JSPubAckResponse{}
-	if err := json.Unmarshal(msg, par); err != nil {
-		return
-	}
-	if err := par.Error; err != nil {
-		return
-	}
-	as.mu.RLock()
-	// Note that as.domainTk includes a terminal '.', so strip to compare to PubAck.Domain.
-	dl := len(as.domainTk)
-	if dl > 0 {
-		dl--
-	}
-	ignore := par.Domain != as.domainTk[:dl]
-	as.mu.RUnlock()
-	if ignore {
-		return
-	}
-
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	// The delivery client (pc) has no server ref, so use the account JSA client's.
-	s := as.jsa.c.srv
-	// Advance the per-client reconciliation watermark for this observation, before
-	// choosing the takeover vs no-local path, so a newer observation still
-	// supersedes an older in-flight expiry-reconciliation worker. The EVICTION
-	// trigger (st.evictLatest) is deliberately not advanced here: it moves only on
-	// the resident branch below, so an observation that arrives with no session
-	// resident can never become a lingering eviction worker's license against a
-	// re-added object. Both branches create entries now, so advancing an existing
-	// one here never leaks state for a client that has no worker in flight.
-	// Delivery is serialized on one subscription goroutine but need not match
-	// stream-sequence order, so advance with a max rather than last-write-wins.
-	if st := as.reconcileWM[cIDHash]; st != nil && par.Sequence > st.latest {
-		st.latest = par.Sequence
-	}
-	// A connection for this client ID started on another server, i.e. a new
-	// connection to this session. Below we hand our displaced local connection to
-	// the classifying eviction worker; the reconnecting broker also cancels the
-	// outbox from mqttProcessConnect. Spec5 [MQTT-3.1.2-8].
-	sess, ok := as.sessByHash[cIDHash]
-	if !ok {
-		// No local session: reconcile this session's expiry deadline from the
-		// authoritative persisted record on a spawned, ADMITTED worker. Re-reading
-		// the record is a synchronous JSA request that must not run on this
-		// subscription delivery goroutine — it would head-of-line-stall further
-		// persist observations up to the JSA timeout. Admission through the Will
-		// dispatch gate also keeps the worker tracked (willWorkerWG) and drained
-		// before shutdown tears down the JSA; admission fails once shutdown Phase 2
-		// closed the gate, in which case we skip (the process is stopping). The
-		// worker arms or cancels the local timer from the record, so a surviving
-		// replica cleans up near the original deadline instead of waiting for the
-		// periodic sweep. Spec5 [3.1.2.11.2].
-		if as.reconcileWM != nil && s.admitWillWorker() {
-			st := as.reconcileWM[cIDHash]
-			if st == nil {
-				st = &sessionReconcileState{}
-				as.reconcileWM[cIDHash] = st
-			}
-			if par.Sequence > st.latest {
-				st.latest = par.Sequence
-			}
-			// Increment synchronously, in delivery order, before the go so a newer
-			// observation cannot complete and prune this entry before the worker
-			// runs. The worker decrements it on every exit path.
-			st.inFlight++
-			observedSeq := par.Sequence
-			go func() {
-				defer s.willWorkerWG.Done()
-				as.reconcileRemoteSessionExpiry(s, cIDHash, observedSeq, st)
-			}()
-		}
-		return
-	}
-	// If our current session's stream sequence is higher, it means that this
-	// update is stale, so we don't do anything here (and keep our expiry timer).
-	// Cheap synchronous filter only — strictly below, NOT at, sess.seq: the worker
-	// refuses equality under the fence (its own strict `Sequence > sess.seq`), and
-	// an observation AT sess.seq must still spawn it so tests can assert that
-	// refusal was DECIDED (through the completion seam) rather than skipped here.
-	sess.mu.Lock()
-	ignore = par.Sequence < sess.seq
-	sess.mu.Unlock()
-	if ignore {
-		return
-	}
-	// The record moved at-or-past our acknowledged sequence with content that may
-	// not be ours. What that licenses depends on the surviving record — a
-	// demonstrated successor is a takeover, a proven same-base sibling is not —
-	// and reading it (loadSessionMsg) is a blocking JSA request that must not run
-	// on this delivery goroutine: it would head-of-line-stall every later persist
-	// observation up to the JSA timeout. So the eviction runs on a spawned,
-	// ADMITTED worker (tracked via willWorkerWG, drained before shutdown tears
-	// down the JSA), coalesced to at most ONE per client: an observation arriving
-	// while one runs only advanced st.latest above, and the worker's terminal
-	// cleanup re-checks that watermark under as.mu before clearing the flag, so
-	// the trigger is consumed by a further iteration rather than stranded. The
-	// flag is checked ONLY on this resident branch: an observation with no
-	// resident session always reaches the no-local reconcile above regardless.
-	// See evictDisplacedOnRemotePersist. Spec5 [MQTT-3.1.2-8].
-	if as.reconcileWM == nil {
-		// Shutdown nilled the map: dropping the observation is the shutdown
-		// contract (the process is stopping; nothing may install new state).
-		return
-	}
-	if st := as.reconcileWM[cIDHash]; st != nil {
-		// The EVICTION trigger advances only here, on the resident branch: an
-		// observation delivered with no session resident is the no-local
-		// reconcile's alone and must never become a lingering worker's license
-		// against a re-added object.
-		if par.Sequence > st.evictLatest {
-			st.evictLatest = par.Sequence
-		}
-		if st.evictRunning {
-			return
-		}
-	}
-	// Admission refused means shutdown Phase 2 closed the Will dispatch gate; skip
-	// (the process is stopping). Checked before any state is created so refusal
-	// needs no undo.
-	if !s.admitWillWorker() {
-		return
-	}
-	st := as.reconcileWM[cIDHash]
-	if st == nil {
-		st = &sessionReconcileState{}
-		as.reconcileWM[cIDHash] = st
-	}
-	if par.Sequence > st.latest {
-		st.latest = par.Sequence
-	}
-	if par.Sequence > st.evictLatest {
-		st.evictLatest = par.Sequence
-	}
-	// Flag and increment set synchronously, in delivery order, before the go: the
-	// flag is what coalesces the next observation onto this worker, and the
-	// increment keeps a concurrent no-local worker's prune from deleting the entry
-	// before the worker runs. The worker clears both on every exit path.
-	st.evictRunning = true
-	st.inFlight++
-	go func() {
-		defer s.willWorkerWG.Done()
-		as.evictDisplacedOnRemotePersist(s, cIDHash, st)
-	}()
-}
-
 // evictOutcome is what one decision attempt of the eviction worker concluded.
 type evictOutcome uint8
 
@@ -5014,6 +4904,20 @@ const (
 	// evictApplied: the session was evicted; the caller runs the notify/close and
 	// (takeover only) Will-cancel tail.
 	evictApplied
+	// evictOwnLanding: the record carries the bytes of THIS session's own
+	// unresolved attempt — a store that landed with its response lost. Nothing is
+	// evicted and nothing is decided: the ambiguity resolver owns that write, and
+	// once it adopts the sequence the same trigger reads stale. Terminal for this
+	// attempt, and deliberately NOT a consumed decision, so the record-state
+	// backstop re-fires if the resolver never gets there.
+	//
+	// Without this arm the record would be classified by LINEAGE against the
+	// acknowledged pair, which is stale precisely because the attempt is
+	// unresolved: our own write {c,a} reads unrelated to acknowledged {a,p} and
+	// evicts the rightful client with 0x8E over its own write. The digest is the
+	// only thing that identifies an attempt as ours (sess_fork_lineage.go), which
+	// is why the comparison is the resolver's own, not a lineage question.
+	evictOwnLanding
 )
 
 // evictDecision carries one decision attempt's outcome and, on evictApplied, the
@@ -5058,8 +4962,11 @@ type evictDecision struct {
 // new level.
 //
 // No lock held on entry.
+// loaded is the raw record this iteration read, or nil when the load failed or
+// found nothing. It is carried alongside the decoded ps because the digest arm
+// compares BYTES — the decoded form cannot answer "are these the bytes we sent".
 func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *sessionReconcileState,
-	usable bool, ps *mqttPersistedSession, decisionSeq uint64) (d evictDecision) {
+	usable bool, ps *mqttPersistedSession, decisionSeq uint64, loaded *StoredMsg) (d evictDecision) {
 
 	as.mu.Lock()
 	defer as.mu.Unlock()
@@ -5119,12 +5026,56 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 	// the eviction proceeds; the unresolved attempt's own convergence stays with
 	// the resolver and the rejection probe. See sess_persist_evict_test.go's
 	// unresolved-attempt pair test and docs/CONFORMANCE.md.
+	//
+	// The one shape that staleness does NOT merely narrow is our own unresolved
+	// attempt arriving back as a delivered record: that is not a sibling of
+	// anything, it IS our write, and only its digest says so. Sampled in the same
+	// sess.mu section as the pair, so no resolver can adopt between the two reads
+	// and leave the arm deciding on a mismatched snapshot.
 	sess.mu.Lock()
 	seqNow, gen, wid, pwid := sess.seq, sess.gen, sess.wid, sess.pwid
+	uncertain, pw := sess.seqUncertain, sess.pendingWrite
+	var pwBase uint64
+	var pwDigest [sha256.Size]byte
+	if pw != nil {
+		pwBase, pwDigest = pw.baseSeq, pw.digest
+	}
 	sess.mu.Unlock()
 	// Strict: eviction requires the record to have moved PAST us.
 	if decisionSeq <= seqNow {
 		d.out = evictStale
+		normalReturn = true
+		return d
+	}
+	// The digest arm, ahead of every classification: while a write of ours is
+	// unresolved, a record carrying its exact bytes is that write landing with its
+	// response lost — the resolver's own identity test (sess_uncertain.go), reused
+	// verbatim so the two cannot drift. Deciding it here would be the false
+	// eviction the old SP path avoided by never delivering our own writes at all.
+	// A NON-matching record under seqUncertain keeps today's behavior exactly: it
+	// falls through to lineage against the stale pair, which can only narrow.
+	if uncertain && pw != nil && loaded != nil &&
+		loaded.Sequence > pwBase && mqttRecordDigest(loaded.Data) == pwDigest {
+		d.out = evictOwnLanding
+		normalReturn = true
+		return d
+	}
+	// The SAME refusal when there are no bytes to compare. An unusable load — absent,
+	// unreadable, undecodable, or below the trigger — normally concedes to the
+	// takeover vocabulary and decides at the observation level, which is right when
+	// the observation can only have come from a peer. It is NOT right while a write
+	// of ours is unresolved and could itself be what was observed: the trigger can be
+	// our own landed-but-unacknowledged write (the backstop reaches this path with no
+	// record at all, deliberately, so the Origin filter cannot screen it), and
+	// conceding would evict the rightful client over its own write on the one
+	// occasion the digest cannot speak.
+	//
+	// Refusing costs only latency: the periodic pass settles the ambiguity before it
+	// ever reaches the ownership backstop again, and the undecided trigger is
+	// re-fired afterwards against an adopted sequence, where staleness or lineage
+	// decides it properly.
+	if uncertain && pw != nil && !usable && decisionSeq > pwBase {
+		d.out = evictOwnLanding
 		normalReturn = true
 		return d
 	}
@@ -5171,7 +5122,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 }
 
 // evictDisplacedOnRemotePersist evicts the resident local session after
-// processSessionPersist observed a remote persist at-or-past its acknowledged
+// the session-record watch observed a record write at-or-past its acknowledged
 // record — classifying the surviving record FIRST, so a demonstrated successor is
 // reported as a takeover (0x8E, delayed-Will outbox cancelled) while a proven
 // same-base sibling — the leader-transition fork — is reported as 0x89 "server
@@ -5192,20 +5143,18 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cIDHash string, st *sessionReconcileState) {
 	applied := false
 	completed := false
-	// cleanup clears the coalescing flag and runs the same lifecycle-tied prune as
-	// the no-local worker: decrement the exact state the callback incremented,
-	// delete the entry once no worker is in flight, with the map-identity check
-	// guarding a future refactor from deleting a replacement entry (delete on a
-	// nil map at shutdown is a no-op).
+	// cleanup clears the coalescing flag, decrements the exact state the callback
+	// incremented, and prunes through the one helper — which keeps the entry alive
+	// while a session is still resident, because an undecided trigger left by a
+	// refusal is precisely what the record-state backstop re-fires. See
+	// pruneReconcileEntryLocked.
 	cleanup := func() {
 		as.mu.Lock()
 		st.evictRunning = false
 		if st.inFlight > 0 {
 			st.inFlight--
 		}
-		if st.inFlight == 0 && as.reconcileWM[cIDHash] == st {
-			delete(as.reconcileWM, cIDHash)
-		}
+		as.pruneReconcileEntryLocked(cIDHash, st)
 		as.mu.Unlock()
 	}
 	// observe fires the completion seam AFTER cleanup, on the normal and abnormal
@@ -5262,10 +5211,18 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 		var ps *mqttPersistedSession
 		usable := false
 		decisionSeq := target
-		if err == nil && smsg != nil && smsg.Sequence >= target {
-			if ps = mqttDecodeSessionRecord(smsg); ps != nil {
-				usable = true
-				decisionSeq = smsg.Sequence
+		// The raw record travels separately from the decoded one and is kept even
+		// when the record is BELOW the trigger or undecodable: the digest arm asks
+		// whether these are the bytes this session sent, which is a question about
+		// the load, not about the license.
+		var loaded *StoredMsg
+		if err == nil && smsg != nil {
+			loaded = smsg
+			if smsg.Sequence >= target {
+				if ps = mqttDecodeSessionRecord(smsg); ps != nil {
+					usable = true
+					decisionSeq = smsg.Sequence
+				}
 			}
 		}
 
@@ -5280,7 +5237,7 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 		// residency fresh; the sleeps run outside every lock.
 		var d evictDecision
 		for attempt := 0; ; attempt++ {
-			d = as.evictDecideOnce(cIDHash, st, usable, ps, decisionSeq)
+			d = as.evictDecideOnce(cIDHash, st, usable, ps, decisionSeq, loaded)
 			if d.tokHeld {
 				// Full release, strictly AFTER the decision's as.mu section
 				// returned: endRecordTx can synchronously run the void-verdict
@@ -5303,6 +5260,20 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 		consumed = decisionSeq
 		if d.out == evictBusy || d.out == evictNoSession {
 			consumed = target
+		}
+		// evictDecided is the OTHER half of that accounting, and it is what the
+		// record-state backstop reads. `consumed` governs this worker's own loop;
+		// evictDecided says whether anything ever reached a verdict for this client.
+		// A refusal — busy, or our own landing deferred to the resolver — leaves it
+		// behind evictLatest deliberately, which is the re-fire signal. Advanced
+		// only where a decision really happened.
+		decided := d.out == evictApplied || d.out == evictStale || d.out == evictNoSession
+		if decided {
+			as.mu.Lock()
+			if decisionSeq > st.evictDecided {
+				st.evictDecided = decisionSeq
+			}
+			as.mu.Unlock()
 		}
 
 		switch d.out {
@@ -5357,9 +5328,7 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 		if st.inFlight > 0 {
 			st.inFlight--
 		}
-		if st.inFlight == 0 && as.reconcileWM[cIDHash] == st {
-			delete(as.reconcileWM, cIDHash)
-		}
+		as.pruneReconcileEntryLocked(cIDHash, st)
 		as.mu.Unlock()
 		break
 	}
@@ -5368,7 +5337,7 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 }
 
 // reconcileRemoteSessionExpiry reconciles this replica's local session-expiry
-// timer from the authoritative persisted record after processSessionPersist
+// timer from the authoritative persisted record after the session-record watch
 // observed a remote session persist for a client this replica does not own
 // locally. It runs on a spawned, admitted worker (never inline in the delivery
 // callback) because loadSessionMsg is a blocking JSA request.
@@ -5383,19 +5352,18 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) reconcileRemoteSessionExpiry(s *Server, idHash string, observedSeq uint64, st *sessionReconcileState) {
-	// Lifecycle-tied prune: decrement the exact state the callback incremented, and
-	// delete the map entry once no worker is in flight. Runs on every exit path, so a
-	// worker parked before mu keeps its own entry alive and can never resume into a
-	// pruned-away watermark. The map-identity check guards a future refactor from
-	// deleting a replacement entry; delete on a nil map (shutdown) is a no-op.
+	// Lifecycle-tied prune: decrement the exact state the callback incremented, then
+	// prune through the ONE helper. Deleting on `inFlight == 0` alone — which this
+	// path used to do — is what let a no-local worker erase a RESIDENT session's
+	// undecided eviction trigger, since the two kinds share one entry. Runs on every
+	// exit path, so a worker parked before mu keeps its own entry alive and can never
+	// resume into a pruned-away watermark. See pruneReconcileEntryLocked.
 	defer func() {
 		as.mu.Lock()
 		if st.inFlight > 0 {
 			st.inFlight--
 		}
-		if st.inFlight == 0 && as.reconcileWM[idHash] == st {
-			delete(as.reconcileWM, idHash)
-		}
+		as.pruneReconcileEntryLocked(idHash, st)
 		as.mu.Unlock()
 	}()
 
@@ -5545,7 +5513,7 @@ func mqttStoreSessionRecordCASBody(jsa *mqttJSA, domainTk string, b []byte, idHa
 //
 // Deadlines survive a restart via the persisted disconnect time and
 // sweepSessionExpiries. A surviving replica also re-arms the timer when it
-// observes the persisted disconnect: processSessionPersist reconciles the
+// observes the persisted disconnect: the session-record watch reconciles the
 // deadline for a session it does not own locally, so the session no longer
 // lingers until a reconnect or the periodic sweep if the owning broker dies.
 //
@@ -5860,7 +5828,7 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 // restart) and then periodically. Spec5 [3.1.2.11.2].
 //
 // This is fallback and startup recovery, not the normal cross-replica handoff:
-// when a broker dies with the cluster still running, processSessionPersist's
+// when a broker dies with the cluster still running, the session-record watch's
 // remote-expiry reconciliation re-arms surviving replicas near the original
 // deadline. The sweep still catches sessions no replica observed (e.g. a persist
 // that landed before an account manager existed on any survivor).
@@ -6533,6 +6501,12 @@ func (as *mqttAccountSessionManager) removeSession(sess *mqttSession, lock bool)
 	}
 	delete(as.sessions, sess.id)
 	delete(as.sessByHash, sess.idHash)
+	// The session is gone, so an entry kept alive only because it was resident has
+	// nothing left to be about. Pruning HERE is what bounds the map: an undecided
+	// trigger now outlives its worker, so the worker's own cleanup can no longer be
+	// the last word. See pruneReconcileEntryLocked, which refuses when a worker is
+	// still in flight or when a replacement installed its own entry.
+	as.pruneReconcileEntryLocked(sess.idHash, as.reconcileWM[sess.idHash])
 	if lock {
 		as.mu.Unlock()
 	}
@@ -6565,6 +6539,9 @@ func (as *mqttAccountSessionManager) removeSessionIfCurrent(sess *mqttSession) b
 		delete(as.sessByHash, sess.idHash)
 	}
 	as.cancelSessionExpiryLocked(sess.idHash)
+	// Same reason as removeSession's prune, and the helper's own residency check is
+	// what keeps this correct when the hash map still points at a replacement.
+	as.pruneReconcileEntryLocked(sess.idHash, as.reconcileWM[sess.idHash])
 	return true
 }
 
@@ -11377,7 +11354,7 @@ func (c *client) mqttEnqueueFittingProtoUnlessDisconnected(buf []byte) bool {
 // The refusal has to happen in the SAME critical section as the write, for the same
 // reason every enqueue-path DISCONNECT writer claims in its own: a check made and
 // released first is a check-then-act, and the interval between them is exactly when a
-// displacement — `processSessionPersist` needs no lock of ours — notifies and detaches.
+// displacement — the watch's eviction worker needs no lock of ours — notifies and detaches.
 // A packet appended after that notification violates [MQTT-3.14.4-1].
 //
 // It gates only the packets whose callers ask for it. Nothing else about the
@@ -11460,7 +11437,7 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 // mqttNotifyTakenOver tells a displaced connection that its session was taken
 // over (0x8E). It is the single tail shared by all four paths that displace a
 // bound connection — a local CONNECT takeover, a remote persist observation
-// (processSessionPersist), a resolver's foreign disposal and the bound rejection
+// (the session-record watch's eviction worker), a resolver's foreign disposal and the bound rejection
 // settlement — so that "displace this connection" has one notification owner
 // instead of four writers racing to the socket.
 //
@@ -16000,7 +15977,7 @@ func (r *mqttUnsubAckRestore) applyIfLanded(filters []*mqttFilter) {
 //
 // What ACTUALLY makes the guarantee hold is the DISCONNECT claim, read inside the
 // enqueue's own c.mu critical section (mqttEnqueueProtoLocked). A displacement notifies
-// through that claim, and `processSessionPersist` holds no lock of ours — so any check
+// through that claim, and the watch's eviction worker holds no lock of ours — so any check
 // made and released BEFORE the enqueue is a check-then-act, and an acknowledgment
 // appended after the 0x8E would violate [MQTT-3.14.4-1]. Only a check made WITH the
 // write closes that window.

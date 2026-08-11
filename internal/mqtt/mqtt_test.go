@@ -5011,9 +5011,13 @@ func TestMQTTRetainedMsgRemovedFromMapIfNotInStream(t *testing.T) {
 	require_True(t, ok)
 }
 
-// TestMQTTSessionPersistSpoofPrevented verifies that an MQTT client cannot
-// publish to internal $MQTT.JSA.* subjects to spoof session-persist messages
-// and evict other sessions.
+// TestMQTTSessionPersistSpoofPrevented verifies that an MQTT client cannot publish
+// into the broker's reserved internal namespace to forge session state and evict
+// other sessions.
+//
+// The target moved with the mechanism: ownership is observed by WATCHING the session
+// stream now, so the subject that matters is $MQTT.sess.<hash> — where an unguarded
+// publish would land a durable record rather than a transient notification.
 func TestMQTTSessionPersistSpoofPrevented(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.Users = []*User{
@@ -5059,17 +5063,23 @@ func TestMQTTSessionPersistSpoofPrevented(t *testing.T) {
 	defer ac.Close()
 	testMQTTCheckConnAck(t, ar, mqttConnAckRCConnectionAccepted, false)
 
-	// Craft a forged session-persist message targeting the victim's session.
-	// MQTT topic "/" maps to NATS ".", so this becomes:
-	//   $MQTT.JSA.fakenode.SP.<victimHash>.fakeuuid
+	// Craft a forged SESSION RECORD targeting the victim's session. MQTT topic "/"
+	// maps to NATS ".", so this becomes $MQTT.sess.<victimHash> — a subject the
+	// session stream itself owns.
+	//
+	// This is the subject the guard has to cover now that ownership is observed by
+	// watching $MQTT_sess rather than by listening for JetStream replies. It is also
+	// a strictly worse target than the old one: an unguarded publish here does not
+	// merely forge a notification, it lands a RECORD, corrupting the victim's durable
+	// session state and waking every broker's watch.
 	victimHash := getHash("victim")
-	spoofTopic := fmt.Sprintf("$MQTT/JSA/fakenode/%s/%s/fakeuuid", mqttJSASessPersist, victimHash)
-	forgedPayload := []byte(`{"stream":"` + mqttSessStreamName + `","seq":999}`)
+	spoofTopic := fmt.Sprintf("$MQTT/sess/%s", victimHash)
+	forgedPayload := []byte(`{"id":"victim","origin":"fakenode","clean":false}`)
 
 	// Attempt the spoofed publish. The broker rejects any client PUBLISH whose
 	// mapped subject falls in the reserved internal namespace ("$MQTT.*") in
-	// mqttProcessPub, so the forged session-persist message never reaches the
-	// internal handler — independent of NATS account permissions.
+	// mqttProcessPub, so the forged record never reaches the stream — independent of
+	// NATS account permissions.
 	testMQTTPublish(t, ac, ar, 0, false, false, spoofTopic, 0, forgedPayload)
 	testMQTTFlush(t, ac, nil, ar)
 
@@ -5079,6 +5089,25 @@ func TestMQTTSessionPersistSpoofPrevented(t *testing.T) {
 	// Verify the victim session was NOT evicted by round-tripping a message.
 	testMQTTPublish(t, ac, ar, 0, false, false, "foo/bar", 0, []byte("still-alive"))
 	testMQTTCheckPubMsg(t, vc, vr, "foo/bar", 0, []byte("still-alive"))
+
+	// And that nothing was written where the guard is supposed to have stopped it.
+	// Surviving the round trip alone would also hold if the record HAD landed and the
+	// watch simply had not evicted yet; the stream is where the damage would be.
+	asm := testMQTTGetAccountSessionManager(t, s, "victim")
+	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, victimHash)
+	if err != nil {
+		t.Fatalf("load the victim's session record: %v", err)
+	}
+	if smsg == nil {
+		t.Fatal("fixture: the victim must have a session record for this to prove anything")
+	}
+	var ps mqttPersistedSession
+	if uerr := json.Unmarshal(smsg.Data, &ps); uerr != nil {
+		t.Fatalf("the victim's record must still be the broker's own: %v", uerr)
+	}
+	if ps.Origin == "fakenode" {
+		t.Fatal("the forged record reached the session stream: the reserved-namespace publish guard did not hold")
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////

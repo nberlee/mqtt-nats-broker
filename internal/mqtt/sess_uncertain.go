@@ -1567,7 +1567,109 @@ func (as *mqttAccountSessionManager) reconcileResidentRecordState(s *Server) {
 		// for the fence (see sess_recordtx.go), and that waiter's own release is then the
 		// next trigger.
 		as.flushVoidVerdictGap(sess)
+		// And the OWNERSHIP backstop: the session-record watch is a lossy push channel,
+		// so a resident session whose record moved (or vanished) remotely may never have
+		// been told. Reached only here, which is exactly the ordering this needs — an
+		// open transaction, an unresolved write and an armed rejection each `continue`
+		// above, so this never rediscovers a local ambiguity as if it were a peer's
+		// write. See reconcileResidentOwnership.
+		as.reconcileResidentOwnership(s, sess)
 	}
+}
+
+// reconcileResidentOwnership is the committed-read backstop behind the session-record
+// watch: one read per resident session per pass, feeding the SAME triggers a delivery
+// feeds. It is what makes convergence a guarantee rather than a hope, because the
+// watch's own deliveries can be dropped (AckNone, no flow control) and its eviction
+// worker can refuse a held gate.
+//
+// A read can only ever be a TRIGGER here, never a verdict, and the asymmetry is the
+// point: "the subject moved" is provable from committed state, while "the subject did
+// NOT move" is not — JetStream returns its contention rejection while a write is in
+// process upstream, so an unmoved read proves nothing (see sess_rejected_write.go).
+// Every classification therefore still happens in the worker, under the record fence,
+// with the digest arm ahead of it.
+//
+// Two shapes trigger, and the second is the one no sequence comparison can see:
+//
+//   - the record MOVED past our acknowledged sequence: feed the eviction trigger, as a
+//     delivery would.
+//   - the record is GONE while we hold a non-zero sequence: there is no newer sequence
+//     to compare against, so this arms the ownership marker instead and lets the
+//     rejection settlement — which already answers "the record moved out from under
+//     me" — converge it. A record can only be removed by a party that first CLAIMED it
+//     (a teardown claim is a full-body CAS at the sequence it believes current) or by
+//     the expiry owner of a record we no longer own, so absence IS an ownership fact.
+//     Locally the shape cannot be manufactured: clear() zeroes sess.seq before it
+//     claims or deletes anything, and rollbackDeleteSession removes only the failed
+//     CONNECT candidate's own sequence on an already-unbound object.
+//
+// It also re-fires a trigger a refusal left undecided (evictLatest > evictDecided),
+// which is the other half of the "an eviction can be lost entirely" fix.
+//
+// Runs from the periodic sweep goroutine, with no lock held and no session gate: it
+// installs no state of its own beyond a trigger, and every decision it provokes takes
+// the locks it needs for itself.
+func (as *mqttAccountSessionManager) reconcileResidentOwnership(s *Server, sess *mqttSession) {
+	as.mu.RLock()
+	off := as.testSessRecordBackstopOff
+	as.mu.RUnlock()
+	if off {
+		return
+	}
+	sess.mu.Lock()
+	idHash, ourSeq := sess.idHash, sess.seq
+	sess.mu.Unlock()
+	if ourSeq == 0 {
+		// Nothing was ever acknowledged for this session, so neither shape applies:
+		// there is no sequence to have moved past, and an absent subject is the
+		// ordinary state of a session whose first record has not landed.
+		return
+	}
+	// Re-fire a trigger some refusal left undecided, before spending a read: this
+	// needs no authoritative state, only the accounting.
+	as.mu.Lock()
+	if st := as.reconcileWM[idHash]; st != nil && st.evictLatest > st.evictDecided &&
+		!st.evictRunning && s.admitWillWorker() {
+		st.evictRunning = true
+		st.inFlight++
+		go func() {
+			defer s.willWorkerWG.Done()
+			as.evictDisplacedOnRemotePersist(s, idHash, st)
+		}()
+		as.mu.Unlock()
+		return
+	}
+	as.mu.Unlock()
+
+	smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash)
+	if err != nil && isErrorOtherThan(err, JSNoMessageFoundErr) {
+		// Unreadable establishes nothing in either direction; the next pass asks again.
+		return
+	}
+	if smsg == nil {
+		// GONE. Hand it to the settlement that already owns "the record moved out from
+		// under me", rather than inventing a second verdict for the same question. The
+		// marker's meaning is exactly this — the ownership question is outstanding —
+		// and its point-of-use predicate still governs when a probe may run.
+		sess.mu.Lock()
+		if sess.seq == ourSeq && !sess.seqUncertain {
+			sess.markWriteRejectedLocked(ourSeq)
+		}
+		sess.mu.Unlock()
+		return
+	}
+	if smsg.Sequence <= ourSeq {
+		return
+	}
+	// MOVED: identical to a delivery, except that NO record is passed — which
+	// deliberately bypasses the callback's own-write spawn filter. That filter keys
+	// on Origin alone and Origin proves no authorship, so a collision could make the
+	// fast path skip a real peer's write forever; the backstop is what makes that
+	// cost latency rather than correctness, and it can only do so by declining to
+	// apply the same filter. It has already established the record moved past our own
+	// acknowledged sequence, which is the fact the filter exists to approximate.
+	as.deliverSessionRecordObservation(idHash, smsg.Sequence, nil)
 }
 
 // settleRejectionFromSweep probes one UNBOUND session's outstanding record rejection

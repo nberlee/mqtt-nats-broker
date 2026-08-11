@@ -80,10 +80,29 @@ per stream.
   this project exists to deliver. The items below stop being conditional, and
   the dossier release-treatment lines record the same resolution.
 - [ ] [F-027: Repair a recognised session-record fork](findings/ha-arbitration.md#f-027).
-  **Very large.** Define the recoverable state and an arbitration
-  mechanism before implementation.
+  **Very large.** The recoverable state is now DEFINED (Slice C of the arbitration
+  design): a fork's durable loss is exactly the record delta, and everything needed to
+  restore it is in the losing broker's memory at verdict time — so the repair is an
+  in-memory capsule minted at the forked verdict and re-asserted by that client's own
+  reconnect through the ordinary accept-save CAS, with no repair write and no durable
+  snapshot. That answers the four recorded rejections for the recoverable subset; it
+  is bounded repair, not general repair. Its own plan must additionally settle: the
+  reclaim's ordering behind the CONNECT's existing uncertainty resolution, all four
+  rejection-settlement verdicts, and `settleRecordRejection` being unbound-only while
+  a displaced connection may still be attached.
 - [ ] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
-  **Very large.** This shares the F-027 arbitration design.
+  **Very large.** Shares the F-027 arbitration design (Slice B). Scope now also
+  includes a defect found while designing it and verified in code: a clean-start
+  CONNECT whose teardown claim was SUPERSEDED — told a newer owner exists — still
+  proceeds to an accept save at base 0, which is framed with NO CAS header, so it
+  lands unconditionally and erases the winner's record within a single leader term.
+  The design: every session-record write becomes conditional (create-only CAS at base
+  0), a superseded claim re-drives the restore instead of proceeding, and the lineage
+  chain crosses the teardown re-mint (`PWID` = the claimed record's `WID`) so a
+  clean-start survivor and a resume child of one base are recognisable siblings. Its
+  own plan must settle: what the base-0 CAS does to the ambiguity readback's absent
+  arm and to a zero-valued rejection marker, a typed superseded outcome per `clear()`
+  caller, and disposing the old binding when a re-drive replaces the session object.
 - [ ] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
   **Large.**
 - [ ] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).
@@ -94,9 +113,42 @@ per stream.
   **Large.**
 - [ ] [F-034: Add write lineage to outbound in-flight registers](findings/ha-arbitration.md#f-034).
   **Large.**
+- [x] **Slice A of the arbitration design: the session-record watch.** Ownership changes
+  only by a write to the client's record subject, so the observation channel is now a
+  per-broker ephemeral consumer on `$MQTT_sess` instead of the at-most-once
+  `$MQTT.JSA.*.SP.*.*` notification, and a quiet session still costs no write per
+  interval. The watch is lossy by construction, so convergence rests on the PAIR: a
+  committed-read backstop on the periodic pass re-reads each resident session's record,
+  feeds the same trigger when it MOVED, arms the ownership marker when it is GONE (the
+  shape no sequence comparison can see), and re-fires any trigger a refusal left
+  undecided — which also closes "a refused eviction can be lost entirely". The eviction
+  worker gained a digest arm so a watch delivering this broker's OWN ambiguous landing
+  can never evict the rightful client over its own write, and refuses equally when an
+  unusable load leaves nothing to compare. Residuals in `docs/CONFORMANCE.md`.
 - [ ] [F-036: Revalidate quiet resident-session ownership](findings/ha-arbitration.md#f-036).
-  **Very large.** Design this with F-027/F-029 rather than as a
-  periodic-read patch.
+  **Was: very large; now the remainder of one shape.** Slice A above converges every
+  MOVED record, bound sessions included. What is left is the DELETED record on a BOUND
+  session: arming the ownership marker hands it to the record-rejection settlement,
+  whose unbound half refuses while a client is attached and whose bound half runs
+  pre-dispatch on that connection's own readLoop — so a client that negotiated Keep
+  Alive 0 and then goes silent still holds a session another broker tore down, which is
+  precisely the failure this finding names. Closing it needs a bound-session disposal
+  that does not depend on future client traffic, and that fix has to answer why taking
+  the shared client-ID gate for a bound session is safe here when it is not for a
+  concurrent SUBSCRIBE (`docs/ARCHITECTURE.md`, "A definite record-CAS rejection is
+  outstanding work"). Found by the Slice A holistic review.
+- [ ] Make ephemeral-consumer cleanup guaranteed rather than best-effort. A failed
+  manager initialization now rolls back both per-broker ephemeral consumers, including
+  a create whose response was lost, so retries no longer ACCUMULATE them. What is left
+  is the rollback delete itself failing or being lost: the stray consumer is then
+  reaped by its five-minute inactivity threshold, which bounds lifetime rather than
+  cardinality. **Small.** Closing it needs durable cleanup tracking or stable
+  per-broker consumer identities (a stable name makes a retry reuse the same consumer
+  instead of minting another). Found by the Slice A holistic review.
+- [ ] Give a vanished record its own disposal vocabulary. The deleted-record arm reports
+  0x8E "session taken over by a new connection", which is right about the ownership fact
+  and wrong about the cause when the deletion was expiry-driven: no new connection need
+  exist. **Small.** A third `mqttDisposalVocabulary` value, not a new verdict.
 
 ### 0.3 Confirmed alpha blockers
 

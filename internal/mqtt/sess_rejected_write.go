@@ -8,13 +8,15 @@
 // MOVED, so this broker's belief that it owns the session may be obsolete.
 //
 // Two things evict a stale local session object otherwise, and neither covers this:
-// the persist observation in processSessionPersist, which is an at-most-once core-NATS
-// notification with no retry and nothing durable behind it; and an uncertainty
-// readback's foreign verdict, which a definite rejection never reaches because it
-// creates no uncertainty. A never-expiring session — every MQTT 3.1.1 persistent
-// session — has no expiry timer either, and sweepSessionExpiries skips it outright. So
-// with the notification lost the object stays resident for good, holding the client
-// ID's reaping duty it can no longer discharge.
+// the session-record watch (sess_record_watch.go), whose push deliveries can be
+// duplicated or dropped and whose eviction worker can refuse a held gate; and an
+// uncertainty readback's foreign verdict, which a definite rejection never reaches
+// because it creates no uncertainty. A never-expiring session — every MQTT 3.1.1
+// persistent session — has no expiry timer either, and sweepSessionExpiries skips it
+// outright. The watch is backstopped by a committed read on the periodic pass, which
+// also ARMS this marker when a resident session's record has been deleted outright —
+// a shape no sequence comparison can see, because there is no newer sequence to
+// compare against.
 //
 // This file settles BOTH shapes an armed marker can be in.
 //

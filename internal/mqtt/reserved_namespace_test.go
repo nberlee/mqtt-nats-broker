@@ -811,6 +811,16 @@ func TestMQTTReservedRecordRefusesRestore(t *testing.T) {
 			}
 
 			asm := testReservedProbeASM(t, s, o)
+			// This test is about what the CONNECT restore path does with a record it
+			// refuses to interpret: nothing. The session-record watch would otherwise
+			// observe the record this fixture PLANTS and — for the overdue row, with no
+			// session resident — reconcile its expiry immediately, deleting the record
+			// and its durables through a mechanism this test is not about. That is the
+			// documented expiry behavior for such a record (the expiry path and the
+			// orphan sweep DO finish it); the watch only makes it prompt instead of
+			// waiting for the periodic sweep. Suppressed so the assertions below speak
+			// about the refusal alone.
+			testMQTTSuppressRecordWatch(t, asm)
 			cid, durables := tc.setup(t, s, o, asm, waitSweepPass)
 
 			// Prove the fixture is what it claims BEFORE the refusal, so nothing

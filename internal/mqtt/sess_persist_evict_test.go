@@ -3,6 +3,7 @@ package mqtt
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -11,8 +12,8 @@ import (
 
 // The persist-observation eviction path, CLASSIFIED.
 //
-// processSessionPersist used to conclude "the session was taken over" from the
-// PubAck alone — synchronously evicting with 0x8E and destroying the displaced
+// The old persist observation used to conclude "the session was taken over" from
+// the PubAck alone — synchronously evicting with 0x8E and destroying the displaced
 // incarnation's enqueued delayed Will on evidence that a leader-transition fork
 // also produces. The eviction now runs on a per-client worker
 // (evictDisplacedOnRemotePersist) that reads and classifies the surviving record
@@ -24,31 +25,79 @@ import (
 // deliveries into processSessionPersist, which decouple the observed sequence
 // from the planted record — the state a lost/late core-NATS notification leaves.
 
-// testNewEvictEnv is testNewForkEnv with the persist-observation drop DISARMED:
-// these tests are about the observation route, so observations must reach
-// processSessionPersist (testNewForkEnv arms the drop for the rejection tests'
-// benefit; this env's own saves are self-id-filtered regardless).
+// testNewEvictEnv is testNewForkEnv with the record-watch drop DISARMED: these
+// tests are about the observation route, so observations must reach the watch
+// callback (testNewForkEnv arms the drop for the rejection tests' benefit). The
+// ownership BACKSTOP stays off throughout, so every convergence these tests assert
+// is the watch's own — with both channels live, a test meaning to prove the watch
+// converged a session would also pass if only the backstop did.
 func testNewEvictEnv(t *testing.T, clientID string) *testRejectionEnv {
 	t.Helper()
 	e := testNewForkEnv(t, clientID)
 	e.asm.mu.Lock()
 	e.asm.testSessPersistDrop = nil
+	e.asm.testSessRecordBackstopOff = true
 	e.asm.mu.Unlock()
 	return e
 }
 
-// deliverPersistObservation hands processSessionPersist a crafted remote persist
-// ack, exactly as the JSA reply subscription would deliver one from another
-// broker. Synthetic delivery decouples the observed sequence from any record
-// actually present, which no real save can do.
+// deliverPersistObservation hands the session-record watch a crafted delivery of a
+// record write, exactly as the watch consumer would deliver another broker's. The
+// observed sequence is decoupled from any record actually present, which no real
+// save can do.
+//
+// The sequence rides the $JS.ACK reply subject because that is where the watch
+// reads it from — the stream's own statement about the message, never the body.
 func (e *testRejectionEnv) deliverPersistObservation(t *testing.T, seq uint64) {
 	t.Helper()
-	b, err := json.Marshal(&JSPubAckResponse{PubAck: &PubAck{Stream: mqttSessStreamName, Sequence: seq}})
-	if err != nil {
-		t.Fatalf("marshal the persist ack: %v", err)
+	e.deliverRecordObservation(t, seq, &mqttPersistedSession{ID: e.clientID, Origin: "remoteid"})
+}
+
+// deliverRecordObservation is deliverPersistObservation with the record body under
+// the test's control, for the arms that turn on what the delivered record SAYS (the
+// own-write spawn filter, an undecodable body).
+func (e *testRejectionEnv) deliverRecordObservation(t *testing.T, seq uint64, ps *mqttPersistedSession) {
+	t.Helper()
+	var body []byte
+	if ps != nil {
+		b, err := json.Marshal(ps)
+		if err != nil {
+			t.Fatalf("marshal the session record: %v", err)
+		}
+		body = b
 	}
-	subject := mqttJSARepliesPrefix + "remoteid." + mqttJSASessPersist + "." + e.idHash + ".reply"
-	e.asm.processSessionPersist(nil, &client{}, nil, subject, _EMPTY_, append(b, CR_LF...))
+	e.deliverRawRecordObservation(t, seq, body)
+}
+
+// deliverRawRecordObservation delivers arbitrary bytes as the record, so a test can
+// stage a body that does not decode at all.
+//
+// It injects at deliverSessionRecordObservation — BELOW the callback's drop seam —
+// on purpose. landRecord arms that seam permanently to keep a staged record's own
+// push from spawning a worker, and a synthetic delivery must still be able to model
+// an observation that DID arrive. The callback's own parsing (subject to hash, reply
+// to sequence, body decode) is covered by the watch-channel tests that drive it
+// through processSessionRecordDelivery directly.
+func (e *testRejectionEnv) deliverRawRecordObservation(t *testing.T, seq uint64, body []byte) {
+	t.Helper()
+	var ps *mqttPersistedSession
+	if len(body) > 0 {
+		decoded := &mqttPersistedSession{}
+		if err := json.Unmarshal(body, decoded); err == nil {
+			ps = decoded
+		}
+	}
+	e.asm.deliverSessionRecordObservation(e.idHash, seq, ps)
+}
+
+// deliverThroughWatchCallback drives the real callback end to end — subject parsing,
+// $JS.ACK sequence extraction and body decode included — for the tests that are
+// about the CHANNEL rather than about what a worker does with an observation.
+func (e *testRejectionEnv) deliverThroughWatchCallback(t *testing.T, seq uint64, body []byte) {
+	t.Helper()
+	subject := mqttSessStreamSubjectPrefix + e.asm.domainTk + e.idHash
+	reply := fmt.Sprintf("$JS.ACK.%s.watch.1.%d.1.0.0", mqttSessStreamName, seq)
+	e.asm.processSessionRecordDelivery(nil, &client{}, nil, subject, reply, append(body, CR_LF...))
 }
 
 // armEvictObserver arms the completion seam: the returned channel carries one
@@ -134,6 +183,21 @@ func (e *testRejectionEnv) landRecord(t *testing.T, shape func(*mqttPersistedSes
 	}
 	testMutateSibling(&ps)
 	body, _ := json.Marshal(&ps)
+	// STAGING IS NOT AN OBSERVATION. The session-record watch observes the stream
+	// itself, so unlike the JSA-reply channel it replaced it delivers records this
+	// fixture plants — which would spawn an eviction worker before the test delivered
+	// anything and race every assertion about the worker the test does drive.
+	//
+	// The suppression is PERMANENT for this hash rather than scoped to the store,
+	// because lifting it afterwards would be check-then-act against an asynchronous
+	// delivery: the record is written on the server, and nothing here can prove the
+	// resulting push has already been dropped. A test that stages its own record is by
+	// construction a synthetic-delivery test — it decouples the observed sequence from
+	// the planted record, which is the whole reason to stage one — and the tests that
+	// exercise the REAL channel (siblingTakeover, remoteTakeover) never stage.
+	e.asm.mu.Lock()
+	e.asm.testSessPersistDrop = func(h string) bool { return h == idHash }
+	e.asm.mu.Unlock()
 	resp, err := e.sess.jsa.storeSessionMsg(domainTk, idHash, 0, body)
 	if err != nil {
 		t.Fatalf("land the staged record: %v", err)
@@ -1140,8 +1204,16 @@ func TestMQTTPersistEvictNoResidentTriggerNotReplayed(t *testing.T) {
 
 // TestMQTTPersistEvictAbnormalExitPreFence is plan test 14a: a Goexit from the
 // pre-fence park seam runs the deferred cleanup — flag cleared, counter
-// decremented, entry pruned, completion observer still fired — and a subsequent
-// observation spawns a FRESH worker whose eviction applies.
+// decremented, completion observer still fired — and a subsequent observation
+// spawns a FRESH worker whose eviction applies.
+//
+// The entry is deliberately RETAINED while the session is still resident, which is
+// the opposite of what this test asserted before the session-record watch landed.
+// An abnormal exit decided nothing, so it leaves evictLatest ahead of evictDecided
+// — exactly the undecided trigger the ownership backstop re-fires — and pruning it
+// here is what used to make a refused or killed eviction unrecoverable. What still
+// must not leak is the flag and the counter, so those are asserted instead, and the
+// prune is asserted where it now belongs: after the session leaves the maps.
 func TestMQTTPersistEvictAbnormalExitPreFence(t *testing.T) {
 	e := testNewEvictEnv(t, "pevgoexit")
 	done := e.armEvictObserver()
@@ -1166,10 +1238,21 @@ func TestMQTTPersistEvictAbnormalExitPreFence(t *testing.T) {
 		t.Fatal("the killed worker cannot have applied an eviction")
 	}
 	e.asm.mu.RLock()
-	_, entryPresent := e.asm.reconcileWM[e.idHash]
+	st, entryPresent := e.asm.reconcileWM[e.idHash]
+	var running bool
+	var inFlight, latest, decided uint64
+	if st != nil {
+		running, inFlight, latest, decided = st.evictRunning, st.inFlight, st.evictLatest, st.evictDecided
+	}
 	e.asm.mu.RUnlock()
-	if entryPresent {
-		t.Fatal("the abnormal exit must prune the watermark entry")
+	if !entryPresent {
+		t.Fatal("the entry must survive an abnormal exit while the session is resident: it carries the undecided trigger the backstop re-fires")
+	}
+	if running || inFlight != 0 {
+		t.Fatalf("the abnormal exit must clear the coalescing flag and the counter (running=%v inFlight=%d)", running, inFlight)
+	}
+	if latest <= decided {
+		t.Fatalf("a killed worker decided nothing, so the trigger must stay undecided (evictLatest=%d evictDecided=%d)", latest, decided)
 	}
 
 	e.deliverPersistObservation(t, succ)
@@ -1178,6 +1261,13 @@ func TestMQTTPersistEvictAbnormalExitPreFence(t *testing.T) {
 	}
 	if e.resident(e.sess) {
 		t.Fatal("the fresh worker's eviction must apply")
+	}
+	// The eviction removed the session, which is where the prune now belongs.
+	e.asm.mu.RLock()
+	_, stillPresent := e.asm.reconcileWM[e.idHash]
+	e.asm.mu.RUnlock()
+	if stillPresent {
+		t.Fatal("once the session leaves the maps the entry must be pruned")
 	}
 }
 

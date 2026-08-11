@@ -85,15 +85,38 @@ func TestValidateSessStream(t *testing.T) {
 		})
 	}
 
+	// A finite consumer cap IS a prerequisite now, and this row moved out of the
+	// accepted list to say so: every broker creates its own ephemeral session-record
+	// watch consumer on this stream (sess_record_watch.go), so a cap eventually
+	// rejects a legitimate broker start. A configured 0 is NOT hostile — nats-server
+	// normalizes it to unlimited — so only a positive value is rejected.
+	t.Run("a finite max consumers is rejected", func(t *testing.T) {
+		si := good()
+		si.Config.MaxConsumers = 5
+		err := validateSessStream(si, "", 3)
+		if err == nil {
+			t.Fatal("a finite consumer cap must be rejected: the watch consumer is per broker")
+		}
+		if !strings.Contains(err.Error(), "max_consumers") {
+			t.Fatalf("the diagnostic must name the setting, got: %v", err)
+		}
+	})
+	t.Run("max consumers 0 means unlimited and is accepted", func(t *testing.T) {
+		si := good()
+		si.Config.MaxConsumers = 0
+		if err := validateSessStream(si, "", 3); err != nil {
+			t.Fatalf("0 normalizes to unlimited and must be accepted: %v", err)
+		}
+	})
+
 	// Audited non-prerequisites must be ACCEPTED: nothing purges the session
-	// stream, no consumer is ever created on it, and unrelated metadata keys
-	// beside a valid epoch belong to whoever wrote them.
+	// stream, the consumer limits are enforced at the watch consumer's own create,
+	// and unrelated metadata keys beside a valid epoch belong to whoever wrote them.
 	for _, tc := range []struct {
 		name string
 		mut  func(cfg *StreamConfig)
 	}{
 		{"deny purge is not a prerequisite", func(c *StreamConfig) { c.DenyPurge = true }},
-		{"max consumers is not a prerequisite", func(c *StreamConfig) { c.MaxConsumers = 5 }},
 		{"consumer inactivity limit is not a prerequisite", func(c *StreamConfig) { c.ConsumerLimits.InactiveThreshold = time.Minute }},
 		{"unrelated metadata keys are accepted", func(c *StreamConfig) { c.Metadata["unrelated_key"] = "keepme" }},
 		{"a duplicate window is not a prerequisite", func(c *StreamConfig) { c.Duplicates = 100 * time.Millisecond }},
@@ -542,7 +565,7 @@ var mqttTestBrokerStreamNames = []string{
 
 func testBrokerStreamSpecs() []brokerStreamSpec {
 	as := &mqttAccountSessionManager{}
-	return as.brokerStreamSpecs(&Server{}, "T", 3, 3, mqttDefaultMaxAckPending, true, "rmsub")
+	return as.brokerStreamSpecs(&Server{}, "T", 3, 3, mqttDefaultMaxAckPending, true, "rmsub", nil)
 }
 
 // With provisioning table-driven, bypassing ensureBrokerStream requires
@@ -744,6 +767,12 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing ever purges the session stream; records leave one at a time through exact-sequence deletes"}
+		// This owner DOES create a consumer now: every broker runs its own ephemeral
+		// session-record watch over this stream (sess_record_watch.go), so the
+		// register-commons waiver no longer describes it.
+		d["MaxConsumers"] = fieldDisposition{kind: dispRejected, errWant: "max_consumers"}
+		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispWaived, reason: "a stream threshold below the watch's requested five minutes already fails the consumer create at initialization, naming the consumer; a validator entry would duplicate that enforcement"}
+		d["ConsumerLimits.MaxAckPending"] = fieldDisposition{kind: dispWaived, reason: "a positive stream limit is copied into the zero-request watch consumer and then rejected against AckNone at the same create, which already fails initialization"}
 		// Round-3 Q2.1: the incarnation epoch is a REAL prerequisite carried in
 		// Metadata, validated by the composed callback on the same snapshot.
 		d["Metadata"] = fieldDisposition{kind: dispRejected, errWant: mqttSessEpochMetaKey}

@@ -450,10 +450,25 @@ func setMQTTTestTryBeginPreLockHook(h func(sess *mqttSession)) func() {
 // Derived from what this owner does: a per-subject CAS store (sess.save),
 // loadLastMsgFor reads, filtered forward scans, and exact-sequence CONFIRMED
 // deletes (the teardown release, session expiry, the CONNECT rollback). It
-// never purges and never creates a consumer, so DenyPurge, MaxConsumers and
-// ConsumerLimits are audited NON-prerequisites here — a validator that listed
-// them would refuse legitimate deployments for settings no operation depends
-// on.
+// never purges, so DenyPurge is an audited NON-prerequisite here — a validator
+// that listed it would refuse legitimate deployments for a setting no operation
+// depends on.
+//
+// MaxConsumers IS a prerequisite now, and it was not before: this owner creates
+// a consumer. Every broker runs its own ephemeral session-record watch over this
+// stream (sess_record_watch.go), which is how a resident session learns that a
+// peer took it over, so a finite cap eventually rejects a legitimate broker
+// start — the same reasoning, and the same check, as $MQTT_rmsgs. Note that a
+// configured 0 means UNLIMITED once nats-server normalizes the config, so only a
+// positive value is hostile.
+//
+// ConsumerLimits stays UNCHECKED, and the reason is enforcement rather than
+// irrelevance: a stream InactiveThreshold below the watch's requested five
+// minutes already fails initialization at the consumer create itself, naming the
+// consumer (a consumer cannot opt out of a stream limit), and any positive
+// MaxAckPending limit is copied into the zero-request consumer and then rejected
+// against AckNone at that same create. A validator entry would duplicate an
+// enforcement that already exists and already names the offending object.
 //
 // DenyDelete IS fatal: the teardown release's delete is the only exit a
 // record has, and since nobody resumes a marked record, a client whose
@@ -499,6 +514,9 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): a marker after the teardown delete would be read back as an unreadable record", cfg.SubjectDeleteMarkerTTL)
+	}
+	if cfg.MaxConsumers > 0 {
+		return fmt.Errorf("max_consumers is %d (want unlimited): every broker creates its own ephemeral session-record watch consumer, so a cap eventually rejects a legitimate broker start", cfg.MaxConsumers)
 	}
 	if epoch := cfg.Metadata[mqttSessEpochMetaKey]; !mqttValidSessEpoch(epoch) {
 		return fmt.Errorf("no valid %q metadata (found %q); recreate the session stream/store so a fresh incarnation epoch is generated",

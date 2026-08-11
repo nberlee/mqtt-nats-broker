@@ -756,15 +756,46 @@ What it does NOT do:
   residuals.** The eviction runs on a per-client worker that loads and classifies the
   surviving record before acting; on a proven sibling it answers 0x89 and leaves the
   displaced incarnation's delayed-Will outbox records pending. What that does not close:
-  - a **lost observation is still lost** — it is an at-most-once core-NATS notification,
-    and neither the rejection probe nor the expiry sweep re-delivers the notification;
-    they settle ownership and reap records, nothing more;
-  - the eviction is now **refusable**: a held ownership gate or record fence defers the
-    worker through bounded retries and can lose the eviction entirely, with ZERO
-    notifications written. Convergence for a quiet bound session then needs a local
-    trigger — a save (CAS-rejected → the probe), a reconnect, a later observation, or
-    the sweep — which is the pre-existing "a resident session never re-validates its
-    ownership absent a local trigger" class, now with more instances;
+  - a **lost observation is no longer lost**, and neither is a refused eviction: the
+    observation channel is the session-record watch, and the committed-read backstop
+    on the periodic pass re-reads every resident session's record and re-fires any
+    trigger no decision consumed (`evictDecided`). What that costs is LATENCY —
+    convergence is bounded by the next backstop pass that reaches the session, not by
+    a fixed interval, because the pass is serial and does blocking JetStream work. See
+    `docs/ARCHITECTURE.md`, "The session-record watch";
+  - the watch itself can still **duplicate or drop** deliveries (an ephemeral
+    `AckNone` push consumer, no flow control, delivery state not quorum-replicated);
+    duplicates are inert (max-watermarks plus coalescing) and drops are the backstop's
+    business. Nothing recreates a deleted or inactivity-reaped watch consumer under a
+    live manager: the watch stays absent and the backstop alone converges until the
+    next manager start;
+  - during a **rolling upgrade** what Slice A does close is per-broker: a quiet resident
+    owned by a not-yet-upgraded broker still has only the old at-most-once path until
+    that broker upgrades. Full rollout therefore closes the MOVED-record and
+    lost-observation subcase everywhere — it does **not** close F-036, which stays
+    open for the bound deleted-record case below;
+  - a record that was **deleted** rather than moved is handed to the ownership marker,
+    which converges an UNBOUND session; its bound outcome is **0x8E** when it converges
+    at all (see the next bullet, which is why F-036 stays open). Absence is a real
+    ownership fact (only a
+    party that claimed the record at our sequence can remove it), but for an
+    expiry-driven deletion the accompanying Reason String — "session taken over by a
+    new connection" — is imprecise: no new connection need exist. The disposal is
+    right either way and the client's reconnect correctly gets a fresh session; a
+    gone-specific vocabulary value is filed as its own roadmap bullet;
+  - **the deleted-record shape does NOT converge a bound session that never sends
+    another packet.** Unlike the moved-record shape — where the eviction worker
+    disposes a bound session itself — arming the marker hands the case to the record
+    rejection settlement, whose unbound half refuses while a client is attached and
+    whose bound half runs pre-dispatch on that connection's own readLoop. A
+    conformant client sends a PINGREQ within its Keep Alive and therefore converges
+    within about 1.5 intervals, but a client that negotiated **Keep Alive 0** and then
+    goes silent has no such bound, so it can stay resident indefinitely after a lost
+    teardown observation. This is the packet-driven property the bound settlement has
+    always had (`docs/ARCHITECTURE.md`, "A definite record-CAS rejection is
+    outstanding work"), now reached by one more shape; closing it needs a periodic
+    bound-session disposal that does not depend on client traffic, which is filed as
+    its own roadmap bullet rather than claimed here;
   - a **serving window**: between the observation and the worker's decision the
     displaced client keeps being served for the worker's latency (a record read plus
     bounded retries). Any record write it triggers is CAS-rejected; deliveries in the

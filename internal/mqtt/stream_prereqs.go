@@ -323,9 +323,12 @@ type brokerStreamSpec struct {
 // count is configured; maxAckPending is the broker's effective per-consumer
 // cap; requireMsgTTL is whether this broker accepts MQTT 5.0 (see
 // validateMsgsStream); rmsubj is the delivery subject of this broker's
-// retained-messages consumer, created as the $MQTT_rmsgs post step.
+// retained-messages consumer, created as the $MQTT_rmsgs post step; retainedName, when
+// non-nil, receives that consumer's generated name so the caller can roll it back if a
+// later provisioning step fails.
 func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string,
-	replicas, wantReplicas, maxAckPending int, requireMsgTTL bool, rmsubj string) []brokerStreamSpec {
+	replicas, wantReplicas, maxAckPending int, requireMsgTTL bool, rmsubj string,
+	retainedName *string) []brokerStreamSpec {
 
 	jsa := &as.jsa
 	// The provisioning loop prefixes every error with the stream and account, so
@@ -591,11 +594,87 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 						InactiveThreshold: 5 * time.Minute,
 					},
 				}
+				// The name is recorded BEFORE the request, not after it succeeds: a
+				// create whose response is lost may still have created the consumer,
+				// and a rollback that only knows about confirmed creates would leave
+				// exactly those behind. See mqttProvisionEphemeralConsumers.
+				if retainedName != nil {
+					*retainedName = ccfg.Config.Name
+				}
 				if _, err := jsa.createEphemeralConsumer(ccfg); err != nil {
 					return fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 				}
 				return nil
 			},
 		},
+	}
+}
+
+// mqttProvisionEphemeralConsumers creates this broker's session-record watch AFTER
+// every stream in the provisioning table has been created and validated, and makes
+// the pair of per-broker ephemeral consumers FAILURE-ATOMIC.
+//
+// Both properties answer the same hazard, which is a leak measured per RETRY rather
+// than per broker. Each consumer is uniquely named, so nothing later adopts or
+// replaces one; manager initialization tears down only local subscriptions; and every
+// MQTT connection retries the whole initialization. So a consumer created before a
+// step that fails is never deleted by anything, and a persistent misconfiguration
+// accumulates one per attempt until each reaches its inactivity threshold.
+//
+// retainedName is the retained-messages consumer already created by its stream's post
+// step, or empty when it was not reached. On a watch-create failure it is deleted, so
+// a failed attempt leaves the account exactly as it found it.
+//
+// See sess_record_watch.go for what the watch is and why the broker needs one.
+func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, srwsubj, retainedName string) error {
+	ccfg := mqttSessRecordWatchConsumerConfig(as.domainTk, srwsubj)
+	err := error(nil)
+	// The seam models a FAILED CREATE, so it has to reach the same rollback the real
+	// failure does. Returning early here instead is how the first version of this
+	// function passed its own leak test while leaking.
+	if h := mqttTestWatchConsumerCreateFailV.Load(); h != nil && *h {
+		err = fmt.Errorf("mqtt test: session-record watch consumer creation forced to fail")
+	} else {
+		_, err = as.jsa.createEphemeralConsumer(ccfg)
+		if h := mqttTestConsumerCreateResultHookV.Load(); h != nil {
+			err = (*h)(mqttSessStreamName, ccfg.Config.Name, err)
+		}
+	}
+	if err != nil {
+		// BOTH names, including the one whose create just failed: an error here does
+		// not prove the consumer was not created — a request whose response is lost
+		// leaves one behind under exactly the name we asked for — so a rollback that
+		// only removed the previous consumer would leak the failing one.
+		as.rollbackEphemeralConsumers(retainedName, ccfg.Config.Name)
+		return fmt.Errorf("create session-record watch consumer for account %q: %v", accName, err)
+	}
+	return nil
+}
+
+// rollbackEphemeralConsumers removes the per-broker ephemeral consumers a FAILED
+// initialization attempt may have created — "may have" being the operative part: each
+// name is recorded before its request is issued, so a create whose response was lost
+// is covered by the same delete as a create that plainly succeeded, and a name that
+// was never created deletes nothing.
+//
+// What this bounds is the per-RETRY accumulation, which is the real hazard: every MQTT
+// connection retries initialization, and each attempt otherwise mints another uniquely
+// named consumer that nothing deletes. It does NOT make cleanup guaranteed — a delete
+// can itself fail or be lost, and the stray consumer is then reaped by its inactivity
+// threshold as before. Removing that last window needs durable cleanup tracking or
+// stable per-broker consumer identities; docs/ROADMAP.md carries it.
+func (as *mqttAccountSessionManager) rollbackEphemeralConsumers(retainedName, watchName string) {
+	for _, c := range []struct{ stream, name string }{
+		{mqttRetainedMsgsStreamName, retainedName},
+		{mqttSessStreamName, watchName},
+	} {
+		if c.name == _EMPTY_ {
+			continue
+		}
+		// Not-found IS successful cleanup: the create never landed.
+		if _, derr := as.jsa.deleteConsumer(c.stream, c.name, false); isErrorOtherThan(derr, JSConsumerNotFoundErr) {
+			as.jsa.c.Warnf("MQTT: unable to roll back %s consumer %q after a failed initialization: %v",
+				c.stream, c.name, derr)
+		}
 	}
 }

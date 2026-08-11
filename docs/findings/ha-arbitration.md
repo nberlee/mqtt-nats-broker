@@ -7,6 +7,13 @@ scheduling stream-specific work.
 Multi-frontend HA is supported alpha scope (decided 2026-08-10, `docs/ROADMAP.md`
 section 0.2), so every finding here is an unconditional alpha blocker.
 
+The one arbitration design these findings share was made on 2026-08-11 and is sliced
+in dependency order: Slice A (the observation and convergence backbone) landed first
+and NARROWED F-036 without closing it, F-029 is Slice B, F-027 is Slice C. Each remaining
+slice gets its own
+implementation-depth plan against that design; the roadmap bullets carry the
+constraints each must answer.
+
 The text under each “Original finding record” heading is preserved from the roadmap as
 it existed on 2026-08-10.
 
@@ -137,7 +144,18 @@ it existed on 2026-08-10.
 
 **Title:** Revalidate ownership for otherwise quiet resident sessions
 
-- Status: Open
+- Status: Open — NARROWED, not resolved. Slice A landed on 2026-08-11 (the
+  session-record watch plus its committed-read backstop,
+  `internal/mqtt/sess_record_watch.go`; `docs/ARCHITECTURE.md`, "The session-record
+  watch"): ownership changes only by a record write, so the watch observes every one
+  of them, a quiet session still costs no write per interval, and every MOVED record
+  now converges — bound sessions included, through the eviction worker itself. What
+  remains is the DELETED record on a BOUND session: the backstop arms the ownership
+  marker, and the record-rejection settlement that answers it is packet-driven for a
+  bound connection, so a Keep Alive 0 client that goes silent still holds a session
+  another broker tore down. That is this finding's own failure shape, so the finding
+  stays open until a bound-session disposal exists that does not wait for client
+  traffic. Residuals in `docs/CONFORMANCE.md`.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 36

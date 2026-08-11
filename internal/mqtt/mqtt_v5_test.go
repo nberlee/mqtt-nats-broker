@@ -5849,14 +5849,18 @@ func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
 	seq := sess.seq
 	sess.mu.Unlock()
 
-	// Deliver a crafted remote persist ack to the callback.
+	// Deliver a crafted record observation to the session-record watch, which is
+	// where a peer's write is observed now. The sequence rides the $JS.ACK reply
+	// subject because that is where the callback reads it from — the stream's own
+	// statement about the message, never the record body.
 	deliverAck := func(ackSeq uint64) {
 		t.Helper()
-		b, err := json.Marshal(&JSPubAckResponse{PubAck: &PubAck{Stream: mqttSessStreamName, Sequence: ackSeq}})
+		body, err := json.Marshal(&mqttPersistedSession{ID: "sestale", Origin: "remoteid"})
 		require_NoError(t, err)
-		subject := mqttJSARepliesPrefix + "remoteid." + mqttJSASessPersist + "." + hash + ".reply"
+		subject := mqttSessStreamSubjectPrefix + asm.domainTk + hash
+		reply := fmt.Sprintf("$JS.ACK.%s.watch.1.%d.1.0.0", mqttSessStreamName, ackSeq)
 		// pc is only used for msgParts; a fresh client has no header parse state.
-		asm.processSessionPersist(nil, &client{}, nil, subject, _EMPTY_, append(b, CR_LF...))
+		asm.processSessionRecordDelivery(nil, &client{}, nil, subject, reply, append(body, CR_LF...))
 	}
 
 	// Stale ack: timer and session must survive. Refused synchronously by the
@@ -6532,6 +6536,22 @@ func testMQTTPlantSessionRecord(t testing.TB, js nats.JetStreamContext, domainTk
 // the shared *sessionReconcileState plus a runner that executes the worker to
 // completion. Registering several workers before running any lets a test drive a
 // deterministic worker-completion order.
+// testMQTTSuppressRecordWatch stops the session-record watch from observing records
+// this test PLANTS.
+//
+// The watch reads the session stream itself, so unlike the JSA-reply channel it
+// replaced it delivers every record a fixture writes — which for a client hash with
+// no resident session spawns an expiry-reconcile worker of its own, racing the
+// workers these tests start deliberately and sharing their watermark entry. The
+// tests below are about what ONE worker decides, so the channel is suppressed and
+// every worker they observe is one they started.
+func testMQTTSuppressRecordWatch(t testing.TB, asm *mqttAccountSessionManager) {
+	t.Helper()
+	asm.mu.Lock()
+	asm.testSessPersistDrop = func(string) bool { return true }
+	asm.mu.Unlock()
+}
+
 func testMQTTRunReconcile(t testing.TB, asm *mqttAccountSessionManager, s *Server, idHash string, observedSeq uint64) (*sessionReconcileState, func()) {
 	t.Helper()
 	asm.mu.Lock()
@@ -6602,6 +6622,7 @@ func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
 	defer cp.Close()
 	testMQTTReadConnAckV5(t, rp)
 	asm := testMQTTGetClient(t, s, "recprobe").mqtt.asm
+	testMQTTSuppressRecordWatch(t, asm)
 
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
@@ -6701,6 +6722,7 @@ func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
 	defer cp.Close()
 	testMQTTReadConnAckV5(t, rp)
 	asm := testMQTTGetClient(t, s, "ordprobe").mqtt.asm
+	testMQTTSuppressRecordWatch(t, asm)
 
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
@@ -6811,6 +6833,7 @@ func TestMQTTv5RemoteExpiryReconcileLocalReconnectRace(t *testing.T) {
 	defer cp.Close()
 	testMQTTReadConnAckV5(t, rp)
 	asm := testMQTTGetClient(t, s, "lrprobe").mqtt.asm
+	testMQTTSuppressRecordWatch(t, asm)
 
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
@@ -6856,8 +6879,24 @@ func TestMQTTv5RemoteExpiryReconcileLocalReconnectRace(t *testing.T) {
 	if got := testMQTTPendingExpiryTimer(asm, h); got != localTimer {
 		t.Fatal("stale worker wrongly cancelled or replaced the newer local session's timer")
 	}
+	// The entry is RETAINED here, and that is the session-record watch's lifecycle
+	// rather than a leak: the local reconnect made this client resident again, and a
+	// resident session is exactly who an undecided eviction trigger would be about.
+	// Pruning on "no worker in flight" alone is what used to discard a refused
+	// eviction's trigger permanently. This test asserted the prune before that
+	// change; it now asserts the rule that replaced it — retained while resident,
+	// pruned once the session leaves the maps.
+	if !testMQTTReconcileEntryPresent(asm, h) {
+		t.Fatal("expected the watermark entry to survive while the reconnected session is resident")
+	}
+	asm.mu.RLock()
+	resident := asm.sessByHash[h]
+	asm.mu.RUnlock()
+	if resident != nil {
+		asm.removeSession(resident, true)
+	}
 	if testMQTTReconcileEntryPresent(asm, h) {
-		t.Fatal("expected the watermark entry pruned once the stale worker completed")
+		t.Fatal("expected the watermark entry pruned once the session left the maps")
 	}
 }
 
