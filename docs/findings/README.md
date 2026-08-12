@@ -86,9 +86,10 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 - Refuse or retry a CONNECT with incomplete shared-subscription restoration.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-050](shared-qos2.md#f-050).
-- Bound pre-CONNECT clients when authentication passthrough is configured.
-  Status: Open. Release treatment: Alpha blocker.
-  Details: [F-051](dead-code.md#f-051).
+- Send a CONNACK before closing an unauthorized CONNECT.
+  Status: Open. Release treatment: Post-alpha candidate; promote if a conformance
+  suite or an operator report shows the missing CONNACK in practice.
+  Details: [F-061](runtime-correctness.md#f-061).
 - Connect MQTT option validation to the production startup boundary.
   Status: Open. Release treatment: Maintainability item; promote if startup tests
   expose an accepted invalid configuration.
@@ -181,3 +182,5 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
   Details: [F-056](resolved.md#f-056).
 - Reject generationless delayed-Will outbox records.
   Details: [F-058](resolved.md#f-058).
+- Bound a connection that never sends CONNECT.
+  Details: [F-051](resolved.md#f-051).

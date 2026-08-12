@@ -811,16 +811,22 @@ func TestMQTTAuthTimeout(t *testing.T) {
 				if test.ok {
 					t.Fatalf("Error sending connect: %v", err)
 				}
-				// else it is ok since we got disconnected due to auth timeout
+				// else it is ok since we got disconnected due to the connect deadline
 				return
 			}
 			buf, err := testMQTTRead(mc)
-			if err != nil {
-				if test.ok {
-					t.Fatalf("Error reading: %v", err)
+			if !test.ok {
+				// The window elapsed before this CONNECT, so the broker must NOT have
+				// acknowledged it. Requiring the absence of a CONNACK is what makes
+				// this case test the bound: accepting either outcome passed against a
+				// deadline that was never armed at all.
+				if err == nil {
+					t.Fatalf("Expected no CONNACK after the connect deadline expired, got %v", buf)
 				}
-				// else it is ok since we got disconnected due to auth timeout
 				return
+			}
+			if err != nil {
+				t.Fatalf("Error reading: %v", err)
 			}
 			r := &mqttReader{reader: mc}
 			r.reset(buf)

@@ -2592,14 +2592,17 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 		}
 	}
 
-	if authRequired {
-		timeout := opts.AuthTimeout
-		// Possibly override with MQTT specific value.
-		if opts.MQTT.AuthTimeout != 0 {
-			timeout = opts.MQTT.AuthTimeout
-		}
-		c.setAuthTimer(secondsToDuration(timeout))
-	}
+	// A connection that has not sent CONNECT has no identity and no session, and
+	// the keep-alive read deadline that bounds a connected client is armed only
+	// from cp.rd, after CONNECT. Without this bound such a connection holds its
+	// socket, its s.clients registration, its clientWG token and its readLoop for
+	// as long as the peer keeps the TCP connection open. MQTT 3.1.1 / 5.0 [3.1.4]:
+	// the Server SHOULD close a Network Connection that does not deliver a CONNECT
+	// in reasonable time. Unconditional, because the cost is the same whether or
+	// not an authentication mechanism is configured. Armed after the TLS handshake
+	// so the two bounds compose rather than overlap, and before the readLoop below
+	// so an expired deadline always has a reader that observes the close.
+	c.armConnectDeadline(secondsToDuration(mqttConnectTimeout(opts)))
 
 	// No Ping timer for MQTT clients...
 
@@ -10491,8 +10494,15 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 
 	c.mu.Lock()
 	cid := c.mqtt.cid
-	c.clearAuthTimer()
+	admitted := c.mqttAdmitConnectLocked()
 	c.mu.Unlock()
+	if !admitted {
+		// The CONNECT deadline already won: this connection is condemned and its
+		// socket is closed. Refuse BEFORE isClientAuthorized, so a connection that
+		// lost the race dials no per-client NATS connection and binds no session
+		// state -- there is nothing to unwind.
+		return errMQTTConnectDeadlineExpired
+	}
 	if !s.isClientAuthorized(c) {
 		// The CONNACK is enqueued inside authViolation; trace it only if sent.
 		sent := c.authViolation()

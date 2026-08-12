@@ -77,6 +77,7 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-host` | `MQTTNB_HOST` | `0.0.0.0` | MQTT listen host |
 | `-port` | `MQTTNB_PORT` | `1883` | MQTT listen port |
 | `-max-conns` | `MQTTNB_MAX_CONNS` | `0` (∞) | Max concurrent clients |
+| `-connect-timeout` | `MQTTNB_CONNECT_TIMEOUT` | `5s` | How long an accepted connection may send no CONNECT before it is closed. Must be `> 0`: the bound is fail-closed and cannot be disabled ([details](docs/ARCHITECTURE.md#connection-liveness-bounds)) |
 | `-auth-passthrough` | `MQTTNB_AUTH_PASSTHROUGH` | `true` | Dial per-client NATS conn from MQTT creds |
 | `-default-user` / `-default-pass` | `MQTTNB_DEFAULT_USER` / `_PASS` | | NATS creds for anonymous MQTT clients |
 | `-keepalive-max` | `MQTTNB_KEEPALIVE_MAX` | `0` (no override) | MQTT 5.0 Server Keep Alive cap (seconds) |

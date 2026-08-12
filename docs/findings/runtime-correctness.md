@@ -268,3 +268,51 @@ contract has to be chosen deliberately rather than inherited from whatever the
 acknowledged path does. Whatever is chosen must not acknowledge a store whose
 outcome is still unresolved, which is the same ambiguity class the session-record
 work already settled by re-attempting rather than reading back.
+
+## F-061
+
+**Title:** An unauthorized CONNECT is closed with no CONNACK
+
+- Status: Open
+- Classification: Confirmed conformance gap (a SHOULD)
+- Release treatment: Post-alpha candidate; promote if a conformance suite or an
+  operator report contradicts the evidence below
+
+### Evidence
+
+The shim's `authViolation` (`internal/mqtt/shim_engine.go`) is `closeConnection`
+and nothing else. It is the CONNECT-authorization failure path: when auth
+passthrough is configured and the per-client NATS dial is refused,
+`mqttProcessConnect` calls it and returns `ErrAuthentication`. So a client whose
+credentials NATS rejected sees its socket close with no CONNACK at all — it cannot
+distinguish bad credentials from a network failure, a full broker, or a listener
+that is not an MQTT broker.
+
+The call site believes otherwise. `mqtt.go` comments that "the CONNACK is enqueued
+inside `authViolation`", and traces an outbound CONNACK with return code
+`mqttConnAckRCNotAuthorized` when the call returns true — which it always does.
+The trace therefore records a packet that was never written.
+
+MQTT 3.1.1 [3.1.4]: the Server "SHOULD send an appropriate CONNACK response with a
+non-zero return code ... and it MUST close the Network Connection". The MUST is
+met; the SHOULD is not. The MQTT 5.0 wording and its reason code (0x87 Not
+Authorized against 3.1.1's 0x05) are to be verified against the specification text
+when this item is planned rather than assumed to match.
+
+Found while reading this path for F-051 (the CONNECT deadline), not caused by it.
+F-051 deliberately left the false comment and the trace untouched, because this
+finding owns that path and that change does not enter it.
+
+Both conformance suites pass today — vibesrc/mqttconformance 124/124, Paho 106/106
+— which is the evidence for the post-alpha treatment: no suite currently exercises
+a rejected CONNECT against a broker that authenticates.
+
+### Fix direction
+
+Write the CONNACK before the close, at the version the connection negotiated, and
+make the returned value report whether it was actually written — the same
+"a delivered CONNACK is a checked fact" discipline `mqttEnqueueConnAck` already
+applies on the success path, whose write error is part of its verdict. Then the
+call site's trace stops claiming a packet that was not sent. A connection whose
+CONNECT lost the race to the connect deadline is a different case and must stay
+silent: its socket is already closed, and it was never authenticated.

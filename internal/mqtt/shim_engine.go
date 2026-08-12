@@ -517,10 +517,24 @@ type client struct {
 	// must close on disconnect (as opposed to the shared service connection).
 	ownNRC bool
 
-	wmu        sync.Mutex // serializes writes to nc from parse + delivery goroutines
-	authTimer  *time.Timer
-	closed     atomic.Bool
-	finishOnce sync.Once // releases the clientWG lifecycle token exactly once
+	wmu sync.Mutex // serializes writes to nc from parse + delivery goroutines
+	// connectTimer is the CONNECT deadline (connect_deadline.go), and
+	// connectAdmission is the arbitration between its callback and the CONNECT it
+	// races. Both are written and read under c.mu -- including the Stop in
+	// closeConnection, which is what makes the accesses provably race-free rather
+	// than race-free by the field never being written.
+	connectTimer     *time.Timer
+	connectAdmission mqttConnectAdmission
+	// testConnectDeadlinePause, when non-nil, is invoked by THIS connection's
+	// deadline callback with c.mu HELD and before the arbitration, so a test can
+	// park the callback exactly where it contends with closeConnection's timer
+	// stop. Without it the overlap can only be hoped for: time.AfterFunc gives no
+	// upper bound on when its goroutine starts, and sync.Mutex grants no ordering
+	// to waiters. Instance-scoped, set and read under c.mu. Nil in production.
+	// See connectDeadlineExpired.
+	testConnectDeadlinePause func()
+	closed                   atomic.Bool
+	finishOnce               sync.Once // releases the clientWG lifecycle token exactly once
 	// connAckWritten is set true only after a success CONNACK has been written to
 	// the socket without error, by mqttEnqueueConnAck under c.mu. Two readers:
 	// the shutdown drain decides whether to send a server DISCONNECT at all (a
@@ -573,16 +587,6 @@ func (c *client) traceOutOp(op string, arg []byte) {}
 
 func (c *client) isClosed() bool    { return c.closed.Load() }
 func (c *client) isWebsocket() bool { return false }
-
-func (c *client) setAuthTimer(d time.Duration) {
-	c.authTimer = time.AfterFunc(d, func() { c.authViolation() })
-}
-func (c *client) clearAuthTimer() bool {
-	if c.authTimer == nil {
-		return true
-	}
-	return c.authTimer.Stop()
-}
 
 // Permission checks: permissive in-broker (NATS enforces via auth passthrough).
 func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bool { return true }
@@ -795,9 +799,6 @@ func (c *client) closeConnection(reason ClosedState) {
 	if c.mqtt != nil {
 		c.Debugf("Client connection closed")
 	}
-	if c.authTimer != nil {
-		c.authTimer.Stop()
-	}
 	if c.rawConn != nil {
 		_ = c.rawConn.Close()
 	}
@@ -812,6 +813,14 @@ func (c *client) closeConnection(reason ClosedState) {
 	// be explicitly unsubscribed or a stale handler keeps consuming/acking the
 	// durable consumer's messages.
 	c.mu.Lock()
+	// Stop the CONNECT deadline here rather than on the CONNECT path: this is the
+	// teardown every connection that can have an armed timer reaches, including a
+	// malformed or non-CONNECT first packet and a peer hang-up. Timer.Stop does
+	// not wait for a running AfterFunc, so stopping under c.mu cannot deadlock
+	// against the callback, which takes c.mu itself.
+	if c.connectTimer != nil {
+		c.connectTimer.Stop()
+	}
 	subs := c.subs
 	c.subs = nil
 	c.mu.Unlock()

@@ -2510,3 +2510,68 @@ every MQTT topic (mapped to a NATS subject). JetStream asset operations use a
 separate service connection with its own credentials. In v1 all MQTT users must
 belong to the same NATS account as the service connection, because the
 session/retained/QoS streams are account-scoped.
+
+## Connection liveness bounds
+
+Three bounds cover a connection's life, in this order. Each covers a distinct
+window, and none of them substitutes for another:
+
+1. **TLS handshake deadline** — a socket read deadline set before the
+   server-side handshake and cleared on success (`mqttTLSTimeout`,
+   `shim_engine.go`). TLS listeners only.
+2. **CONNECT deadline** — from the accepted (and, on a TLS listener,
+   handshaked) connection until its CONNECT is admitted
+   (`internal/mqtt/connect_deadline.go`).
+3. **Keep-alive read deadline** — armed from the negotiated Keep Alive after
+   CONNECT, and re-armed per read only while that value is nonzero
+   (`mqttParse`). A client that negotiates Keep Alive 0 is bounded by nothing
+   after CONNECT; see `docs/CONFORMANCE.md`.
+
+The CONNECT deadline exists because a connection that has not sent CONNECT has
+no client id, no session and no subscriptions, so nothing else in the broker can
+name it, evict it or bound it. Until it existed such a connection held its
+socket, its `s.clients` registration, its `clientWG` token, a readLoop goroutine
+and a writeLoop goroutine for as long as the peer kept the TCP connection open.
+MQTT 3.1.1 / 5.0 [3.1.4] says the Server SHOULD close a Network Connection that
+does not deliver a CONNECT in reasonable time.
+
+**Unconditional and fail-closed.** It is armed for every accepted connection,
+not only when an authentication mechanism is configured: the resources a silent
+connection holds are the same either way, and `-auth-passthrough=false` is a
+supported configuration. `mqttConnectTimeout` resolves the window per server from
+`*Options` at the point of use (MQTT-specific value, else top-level, else
+`mqttDefaultConnectTimeout` = 5s), and a zero or negative value falls back to the
+default rather than reaching `time.AfterFunc`, where it would close every
+connection immediately. `-connect-timeout` is the operator surface; `Validate`
+refuses `<= 0`, so "disabled" is not expressible.
+
+**The arbitration is a state under `c.mu`, not `Timer.Stop()`.** Exactly one of
+two racing facts wins for a connection: the CONNECT arrived
+(`mqttAdmitConnectLocked`), or the deadline expired (`mqttExpireConnectLocked`).
+`Stop` reports that the timer had already fired; it cannot order itself against a
+callback that is about to decide, so it is not an arbitration. The loser does
+nothing: a late callback that finds the CONNECT admitted leaves the socket alone,
+and a CONNECT that finds the deadline expired is refused with
+`errMQTTConnectDeadlineExpired` **before** `isClientAuthorized` — so a connection
+that lost dials no per-client NATS connection and binds no session state.
+
+**The callback closes `c.rawConn` only**, never `closeConnection`. The ordered
+teardown belongs to `readLoop`'s `disconnect()`, which runs
+`mqttHandleClosedClient` (nil-safe pre-CONNECT) before `closeConnection`; closing
+the accepted socket also tears down any TLS layer above it. `shutdownDisconnect`
+has the same shape for the same reason. The timer is stopped in
+`closeConnection`, which is the teardown every connection that can have an armed
+timer reaches — a malformed first packet, a non-CONNECT first packet, a peer
+hang-up. On those paths the admission state stays `pending`, which is correct:
+neither racer won.
+
+**Not tracked by a WaitGroup**, unlike the delayed-Will timers on `willTimerWG`.
+A Will timer publishes through JetStream and must finish before shutdown stops
+the service connection; this callback closes a socket and returns. It depends on
+nothing shutdown tears down, and every armed deadline belongs to a client that
+shutdown Phase 1 already waits for — registered (drained, readLoop exits,
+`closeConnection` stops the timer) or still in setup (`connSetupWG`).
+
+**What it is not.** It makes an idle connection's lifetime finite; it is not a
+DoS defense. A peer can still hold roughly `accept rate x window` connections
+open. `MaxConn` remains the absolute cap and `admitConnSetup` the shutdown gate.

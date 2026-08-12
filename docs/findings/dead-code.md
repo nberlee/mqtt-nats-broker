@@ -36,35 +36,6 @@ settlement, in-flight-register, or classified-eviction branch. Every non-test
 function added since the stream-prerequisite audit has a production caller; the
 confirmed dead Will wrapper predates that run.
 
-## F-051
-
-**Title:** The pre-CONNECT authentication timeout is never armed
-
-- Status: Open
-- Classification: Confirmed connection-liveness defect
-- Release treatment: Alpha blocker
-
-### Evidence
-
-`createMQTTClient` derives `authRequired` from `s.info.AuthRequired` and
-`s.mqtt.authOverride`. The first field has no writer in this repository. The only
-writer of the second is `mqttConfigAuth`, which itself has no caller. Therefore
-both `authRequired` branches are unreachable: the client never receives
-`expectConnect`, and `setAuthTimer` is never called.
-
-This is not an authentication bypass. `mqttProcessConnect` still calls
-`isClientAuthorized`, and the configured client dialer still accepts or rejects
-the supplied credentials. The gap is before CONNECT: a peer may open a socket and
-send nothing without this authentication timer bounding the connection.
-
-### Commit-sized resolution
-
-Make pre-CONNECT admission derive from the authentication mechanism the standalone
-broker actually configures, rather than reviving the embedded-server auth override.
-Pin the behavior with a test that installs a client dialer, opens a socket without
-sending CONNECT, and observes bounded closure. Verify that normal CONNECT
-authentication and shutdown accounting are unchanged.
-
 ## F-052
 
 **Title:** MQTT option validation is disconnected from the production startup path

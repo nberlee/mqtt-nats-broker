@@ -2364,3 +2364,77 @@ Land one delayed-Will format-hardening commit:
 
 The resolution must not change unscoped reconnect cancellation of valid records or
 the generation-and-origin-sequence scope used by displaced-connection cleanup.
+
+## F-051
+
+**Title:** Bound a connection that never sends CONNECT
+
+- Status: Resolved
+- Classification: Confirmed connection-liveness defect
+- Release treatment: Completed; one new observable behavior, one new option
+- Original dossier: `dead-code.md`
+
+### Resolution
+
+`internal/mqtt/connect_deadline.go` bounds every accepted connection between
+accept and CONNECT. MQTT 3.1.1 / 5.0 [3.1.4] says the Server SHOULD close a
+Network Connection that does not deliver a CONNECT in reasonable time; the broker
+did not, because the timer the ported code armed was unreachable. `createMQTTClient`
+gated it on `s.info.AuthRequired || s.mqtt.authOverride`, and neither input has a
+writer in this repository — the first has no writer at all, and the second's only
+writer, `mqttConfigAuth`, has no caller. So `setAuthTimer` was never called and a
+peer that opened a socket and sent nothing held that socket, its `s.clients`
+registration, its `clientWG` token, a readLoop goroutine and a writeLoop goroutine
+until it hung up. A peer that sent a partial CONNECT and stalled did the same:
+`mqttParse` buffers the incomplete packet and returns, and the keep-alive read
+deadline is armed from `cp.rd` only after CONNECT.
+
+The bound is **unconditional**, which is deliberately wider than the finding's
+"when authentication passthrough is configured" wording. The dossier's own
+evidence states the defect unconditionally, `-auth-passthrough=false` is a
+supported configuration under which the connection holds exactly the same
+resources, and gating would have invented a `docs/CONFORMANCE.md` residual for
+nothing. It also keeps the ported `TestMQTTAuthTimeout` honest: that test installs
+no dialer, so under the gated reading it would have stayed vacuous forever.
+
+Three parts are load-bearing.
+
+**The arbitration is a state under `c.mu`, not `Timer.Stop()`.** Exactly one of
+two racing facts wins: the CONNECT arrived (`mqttAdmitConnectLocked`) or the
+deadline expired (`mqttExpireConnectLocked`). `Stop` reports that the timer had
+already fired; it says nothing about whether the callback has already decided to
+close, and it cannot order itself against a callback that is about to. The loser
+does nothing — a late callback that finds the CONNECT admitted leaves the socket
+alone.
+
+**The refusal precedes `isClientAuthorized`.** A CONNECT that lost the race
+returns `errMQTTConnectDeadlineExpired` before the per-client NATS dial, the
+account session manager lookup and every session mutation, so there is nothing to
+unwind. CONNECT authentication is otherwise untouched: `authViolation` remains the
+authorization failure path, a different fact from the deadline.
+
+**The callback closes `c.rawConn` only**, never `closeConnection`, so the ordered
+teardown stays with `readLoop`'s `disconnect()` (which runs
+`mqttHandleClosedClient`, nil-safe pre-CONNECT, first) and any TLS layer above the
+accepted socket comes down with it. The timer is stopped in `closeConnection`, the
+teardown every connection that can have an armed timer reaches; on a malformed or
+non-CONNECT first packet the admission state stays `pending`, because neither
+racer won.
+
+A read deadline was rejected in favor of a timer: `mqttParse` re-arms one only
+while `rd > 0`, so a client negotiating Keep Alive 0 would never clear a
+previously-set absolute deadline and would be killed mid-session at the
+pre-CONNECT window.
+
+Renames and surfaces: `client.authTimer` became `connectTimer` (plus
+`connectAdmission`), `setAuthTimer`/`clearAuthTimer` were deleted, and
+`closeConnection`'s previously unlocked timer read moved under `c.mu`.
+`internal/config`'s dead `AuthTimeout` became `ConnectTimeout` with a real
+`-connect-timeout` / `MQTTNB_CONNECT_TIMEOUT` (default 5s), refused at `<= 0`
+because the bound is fail-closed. No alias and no deprecated name were added:
+neither name was reachable by an operator before this change, so there is no
+deployed configuration to accommodate.
+
+`TestMQTTAuthTimeout` was tightened rather than left alone. With the timer never
+armed, its negative case read a success CONNACK, published, and passed; it now
+requires that no CONNACK arrives.

@@ -210,9 +210,25 @@ the README currently reports as supported. They remain blockers independently of
 the HA-scope decision except where the dossier explicitly requires a remote
 takeover.
 
-- [ ] [F-051: Bound pre-CONNECT clients under auth passthrough](findings/dead-code.md#f-051).
-  **Medium.** Derive admission timing from the configured client dialer and pin
-  idle-socket closure without changing CONNECT authentication.
+- [x] [F-051: Bound a connection that never sends CONNECT](findings/resolved.md#f-051).
+  A CONNECT deadline (`internal/mqtt/connect_deadline.go`) bounds every accepted
+  connection between accept and CONNECT, closing the MQTT 3.1.1 / 5.0 [3.1.4]
+  SHOULD the broker did not implement: the timer the ported code armed was
+  unreachable, because neither `Info.AuthRequired` nor `srvMQTT.authOverride` has
+  a writer in this repository. **Deliberately wider than the finding's wording:**
+  the bound is unconditional, not gated on a configured client dialer, because
+  the resources a silent connection holds are identical with
+  `-auth-passthrough=false` and gating would have invented a conformance residual
+  for nothing. The arbitration between the deadline callback and the CONNECT it
+  races is a state under `c.mu` (`Timer.Stop()` reports that the timer fired, not
+  whether its callback has decided); the loser does nothing, and a CONNECT that
+  lost is refused **before** `isClientAuthorized`, so it dials no per-client NATS
+  connection. `authTimer` became `connectTimer` and `setAuthTimer`/`clearAuthTimer`
+  were deleted; `authViolation` is untouched, being the CONNECT-authorization
+  failure path and a different fact. `-connect-timeout` /
+  `MQTTNB_CONNECT_TIMEOUT` (default 5s) is the operator surface, refused at `<= 0`
+  because the bound is fail-closed. `TestMQTTAuthTimeout` was tightened: with the
+  timer never armed its negative case read a success CONNACK and passed.
 - [ ] [F-043: Fix the `removeSessFromFlappers` data race](findings/runtime-correctness.md#f-043).
   **Small to medium.** Reproduce both call sites and verify lock ordering first.
 - [ ] [F-035: Bound every courtesy DISCONNECT write](findings/runtime-correctness.md#f-035).
@@ -282,6 +298,15 @@ operation can trigger correctness loss or unbounded resource growth.
 - [ ] [F-046: Split the in-flight stabilization follow-ups](findings/inflight-followups.md#f-046).
   Decide the compatibility-sensitive schema naming before alpha; schedule the
   stale-metadata cleanup and settlement-fence work independently.
+- [ ] [F-061: Send a CONNACK before closing an unauthorized CONNECT](findings/runtime-correctness.md#f-061).
+  **Small.** The shim's `authViolation` only closes the socket, so a client whose
+  per-client NATS dial is refused never receives CONNACK 0x05 / 0x87 — while
+  `mqtt.go` comments that the CONNACK is enqueued there and traces one as sent.
+  MQTT 3.1.1 [3.1.4] makes the close a MUST (met) and the CONNACK a SHOULD (not
+  met); verify the v5 wording when planning it. Found while reading this path for
+  F-051, not caused by it. Both conformance suites pass today (124/124, 106/106),
+  which is why it is a post-alpha candidate rather than a blocker; promote it if a
+  suite or an operator report contradicts that.
 - [ ] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
   Keep basic diagnostics in alpha scope; automatic quarantine or repair may follow
   alpha if broker-owned state cannot create the malformed record.

@@ -38,9 +38,12 @@ func mqttOptions(cfg *config.Config, tlsCfg *tls.Config) *mqtt.Options {
 	opts := &mqtt.Options{
 		Host: cfg.MQTTHost,
 		MQTT: mqtt.MQTTOpts{
-			Host:                cfg.MQTTHost,
-			Port:                cfg.MQTTPort,
-			MaxConn:             cfg.MaxConns,
+			Host:    cfg.MQTTHost,
+			Port:    cfg.MQTTPort,
+			MaxConn: cfg.MaxConns,
+			// The option field carries upstream's name; the mechanism it feeds is
+			// the CONNECT deadline (internal/mqtt/connect_deadline.go).
+			AuthTimeout:         cfg.ConnectTimeout.Seconds(),
 			StreamReplicas:      cfg.StreamReps,
 			JsDomain:            cfg.JSDomain,
 			KeepAliveMaximum:    int32(cfg.KeepAliveMax),

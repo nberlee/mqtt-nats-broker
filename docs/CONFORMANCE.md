@@ -1442,3 +1442,33 @@ headers (properties, expiry) are still ignored rather than rejected. Legacy
 development records (a JSON body, or a `-1` marker tombstone) and mixed old/new
 development fleets deliberately change behavior per the compatibility boundary and
 are not supported topologies.
+
+### A connection that never sends CONNECT is closed; a connected one may still be silent forever
+
+MQTT 3.1.1 / 5.0 [3.1.4]: if the Server does not receive a CONNECT Packet within a
+reasonable amount of time after the Network Connection is established, the Server
+SHOULD close the connection. The broker implements this SHOULD. A connection that
+sends nothing, or an incomplete CONNECT, is closed after `-connect-timeout`
+(default 5s, `MQTTNB_CONNECT_TIMEOUT`); the window is absolute rather than
+restarted per byte received, and the bound is fail-closed — a value of `0` or
+below is refused at startup rather than read as "unlimited". See
+`docs/ARCHITECTURE.md`, "Connection liveness bounds".
+
+The CONNECT that races the expiry is refused before any authentication is
+attempted, so a connection the deadline closed never dials a per-client NATS
+connection and never binds session state. CONNECT authentication itself is
+unchanged: credentials are still adjudicated by the configured client dialer.
+
+**The residual is on the other side of CONNECT**, and it is pre-existing rather
+than introduced here: a client that completes CONNECT with **Keep Alive 0** is
+bounded by nothing afterwards, because the keep-alive read deadline is armed only
+while the negotiated value is nonzero. The consequence for ownership convergence
+is stated above ("A silent client with keepalive 0 converges only at unbind"); the
+consequence here is simply that this bound covers the pre-CONNECT window and no
+other. `-keepalive-max` is the operator surface that caps a v5 client's requested
+Keep Alive.
+
+This bound is not a denial-of-service defense and is not documented as one. It
+makes an idle connection's lifetime finite; a peer can still hold roughly
+`accept rate x window` connections open, and `-max-conns` remains the absolute
+cap.

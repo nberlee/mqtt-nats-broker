@@ -29,10 +29,14 @@ type Config struct {
 	ConsumerRep int           // JetStream consumer replicas (0 = follow stream)
 
 	// MQTT listener.
-	MQTTHost    string
-	MQTTPort    int
-	MaxConns    int
-	AuthTimeout time.Duration
+	MQTTHost string
+	MQTTPort int
+	MaxConns int
+	// ConnectTimeout bounds how long an accepted connection may hold a socket, a
+	// registration and a readLoop without having sent a CONNECT. Fail-closed:
+	// there is no value that disables the bound, so 0 and negative are refused
+	// rather than read as "unlimited".
+	ConnectTimeout time.Duration
 
 	// Shutdown.
 	// DrainDelay is the grace period after SIGTERM before the broker disconnects
@@ -79,7 +83,7 @@ func Default() *Config {
 		MQTTHost:        "0.0.0.0",
 		MQTTPort:        1883,
 		MaxConns:        0,
-		AuthTimeout:     5 * time.Second,
+		ConnectTimeout:  5 * time.Second,
 		AuthPassthrough: true,
 		LogLevel:        "info",
 		HTTPAddr:        ":8080",
@@ -159,6 +163,9 @@ func Load(args []string) (*Config, error) {
 	if c.DrainDelay, err = envDuration("MQTTNB_DRAIN_DELAY", c.DrainDelay); err != nil {
 		return nil, err
 	}
+	if c.ConnectTimeout, err = envDuration("MQTTNB_CONNECT_TIMEOUT", c.ConnectTimeout); err != nil {
+		return nil, err
+	}
 
 	fs := flag.NewFlagSet("mqtt-nats-bridge", flag.ContinueOnError)
 	fs.StringVar(&c.NATSURLs, "nats", c.NATSURLs, "comma-separated NATS server URLs")
@@ -183,6 +190,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug|info|warn|error")
 	fs.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "health/metrics bind address (empty=disabled)")
 	fs.DurationVar(&c.DrainDelay, "drain-delay", c.DrainDelay, "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)")
+	fs.DurationVar(&c.ConnectTimeout, "connect-timeout", c.ConnectTimeout, "how long an accepted connection may send no CONNECT before it is closed (must be > 0)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -206,6 +214,12 @@ func (c *Config) Validate() error {
 	}
 	if c.DrainDelay < 0 {
 		return fmt.Errorf("invalid drain-delay %s (must be >= 0)", c.DrainDelay)
+	}
+	// The CONNECT bound is fail-closed, so "disabled" is not expressible: a 0 or
+	// negative value would otherwise read as unlimited and restore exactly the
+	// unbounded pre-CONNECT connection this bound exists to close.
+	if c.ConnectTimeout <= 0 {
+		return fmt.Errorf("invalid connect-timeout %s (must be > 0)", c.ConnectTimeout)
 	}
 	if err := validateJSDomain(c.JSDomain); err != nil {
 		return err
