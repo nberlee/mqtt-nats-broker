@@ -101,7 +101,9 @@ the other — that is F-029a.
 
 **Title:** The claim-won deletion window
 
-- Status: Open
+- Status: **Closed** on 2026-08-12 by the generation-retirement watermark
+  (`internal/mqtt/sess_teardown.go`, `$MQTT_teardown`; `docs/ARCHITECTURE.md`, "The
+  generation-retirement watermark").
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Filed: 2026-08-11, out of F-029's implementation
@@ -114,6 +116,25 @@ before delete was designed and refuted — `releaseTeardown` proves absence rath
 authorship, the unsafe interval merely moves, shared group durables are not
 generation-scoped, and after the release the durable target list is gone while PUBREL
 durables have no orphan reaper. The roadmap bullet carries the full refutation.
+
+**How it was closed.** The refutation above says what the fix had to be: a durable
+teardown intent that does not live on the replaceable record subject. Every teardown that
+wins its claim now records a permanent per-client retirement watermark on a dedicated
+`$MQTT_teardown` stream — naming the generation and the `$MQTT_sess` sequence its claim
+marker landed at — before its first deletion, always confirmed, and fails the teardown
+closed with nothing deleted if it cannot. Three readers make the window recognisable and
+repair it: the winner's own release-superseded arm condemns a same-generation survivor
+with a fresh teardown marker (mark only, so the survivor's broker can still observe the
+move); the CONNECT restore refuses to resume a retired generation and routes the record
+through the existing overdue-discard shape instead; and the orphan sweep condemns one
+with no CONNECT at all, deferring the finish to a later pass. Replacement is ordered by
+the marker sequence alone, nothing ever reaps a watermark, and the stream is epoch-coupled
+to `$MQTT_sess` so a partial recreation of the unit is refused at startup. The repair is
+truthful TERMINATION, never restoration: the deleted state stays deleted, and what is
+guaranteed is that no client is served as though it existed. The stacked apply-time
+escapes that remain — the fence names only the latest retirement, and the slot itself can
+be regressed by a cross-term apply — are residuals in `docs/CONFORMANCE.md`, strictly
+narrower than the parent CAS hole they come from.
 
 ## F-029b
 
@@ -242,6 +263,18 @@ bullet carries the full refutation.
   another broker tore down. That is this finding's own failure shape, so the finding
   stays open until a bound-session disposal exists that does not wait for client
   traffic. Residuals in `docs/CONFORMANCE.md`.
+
+  **A second route into the same shape arrived with F-029a's fix (2026-08-12), and any
+  fix here must revalidate against it.** A condemnation marker written onto a bound
+  hollow record converges as MOVED, but whoever FINISHES that marker deletes the record —
+  and if the survivor's broker dropped the marker observation, it is then facing an
+  absent record under a bound, silent Keep Alive 0 client: this finding's own shape. Two
+  variants, deliberately different: a CONNECT that adopts the marker finishes it
+  IMMEDIATELY and cannot be deferred, and the orphan sweep defers its finish by a pass
+  (which narrows the case it owns to a survivor whose serial committed-read backstop does
+  not reach the record within the widened window — the unbounded-walk residual). Neither
+  is claimed to be closed by the deferral; both are listed here so this finding's
+  eventual fix tests them alongside the pre-existing route.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 36

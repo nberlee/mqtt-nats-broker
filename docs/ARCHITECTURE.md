@@ -99,7 +99,7 @@ Every broker-owned `$MQTT_*` stream is provisioned through one convergence shape
 **unconditional authoritative re-read**, then a per-stream validator over that
 re-read — so a create-race loser (and equally the winner, whose create response is
 not authoritative for what now exists) validates the stream that is actually
-there, never the config it asked for. The nine streams are entries in one ordered
+there, never the config it asked for. The ten streams are entries in one ordered
 provisioning table iterated by a single loop, so none can be provisioned outside
 the shape. A stream that fails its validator **fails account-manager
 initialization** with recreate guidance; nothing is repaired or updated in place,
@@ -131,6 +131,7 @@ per-owner:
 | `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, rollback); no purge; **one ephemeral `AckNone` session-record watch consumer per broker** (see "The session-record watch"). Every record carries `WID`/`PWID`, the write's own identity and its parent's | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted); **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
 | `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | as `$MQTT_sess` minus the epoch; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
 | `$MQTT_willcancel` | per-client watermark CAS and reads — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources` | **`DenyDelete`/`DenyPurge`** (no operation deletes or purges — markers are permanent by design); `SubjectDeleteMarkerTTL` (no delete means no marker can ever be created); `MaxConsumers`/`ConsumerLimits` |
+| `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | as `$MQTT_willcancel`, plus the **adopted `$MQTT_sess` incarnation epoch** in `Metadata`, required to match this account's (unrelated keys accepted): an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | as `$MQTT_willcancel` — and `DenyDelete`/`DenyPurge` are load-bearing waivers here, since reaping a fence would unfence a generation whose resources are already deleted |
 | `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
 | `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); `loadLastMsgForMulti`/`loadNextMsgFor`; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker) | **`DenyDelete`** (the owner issues no delete API request at all; the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
 | `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL` | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
@@ -159,6 +160,15 @@ acceptance test so an over-strict "fix" fails:
 - **`Sources` is waived on `$MQTT_rmsgs` only** — sourcing is additive, so it is
   fatal exactly where a foreign record could occupy a protocol CAS slot, and
   cross-account retained sourcing is a supported topology.
+
+`$MQTT_sess`, `$MQTT_willcancel` and `$MQTT_teardown` are **one logical unit**, and
+all three validators say so in their recreate guidance. Both watermark streams order
+themselves by `$MQTT_sess` sequences, so the two partial-recreation directions differ
+and both are stated: recreating `$MQTT_sess` alone mints a fresh epoch while the
+permanent watermarks keep the old one, which `validateTeardownStream` **refuses** at
+the next startup; recreating a watermark stream alone stamps the current epoch,
+validates clean, and admits with **no historical fences** — the loss recorded in
+`docs/CONFORMANCE.md`.
 
 Startup validation is a **snapshot**: a stream config mutated after
 initialization is not re-checked until the next process start or manager
@@ -325,9 +335,13 @@ records the bridge has already said it cannot interpret.
 
 Operational constraints for the marker:
 
-- **Back up, restore, delete, or recreate `$MQTT_sess` and `$MQTT_willcancel` as one
-  logical unit.** Recreating only `$MQTT_willcancel` loses suppression evidence and
-  reopens the residual until each affected client reconnects.
+- **Back up, restore, delete, or recreate `$MQTT_sess`, `$MQTT_willcancel` and
+  `$MQTT_teardown` as one logical unit.** Recreating only `$MQTT_willcancel` loses
+  suppression evidence and reopens the residual until each affected client reconnects;
+  recreating only `$MQTT_teardown` loses every open generation-retirement fence.
+  Recreating `$MQTT_sess` alone is not merely discouraged for the retirement fences —
+  `validateTeardownStream` refuses to start against watermarks stamped with a different
+  incarnation epoch (see "Stream prerequisites").
 - **Recreating `$MQTT_sess` requires restarting every bridge serving the account
   before MQTT traffic resumes.** The incarnation epoch is captured once per account
   manager (`as.sessStreamEpoch`); a live manager that outlives stream recreation
@@ -441,11 +455,13 @@ JetStream request timeout, and the nested retry loops inside `claimTeardown` and
 `releaseTeardown` are not deadline-checked. On exhaustion the CONNECT is refused, with
 nothing resident and nothing bound — the state a fresh CONNECT starts from.
 
-**What this does not close.** Two shapes remain, both tracked as `docs/ROADMAP.md` §0.2
-blockers rather than accepted limits, because both need durable state this design does
-not introduce: the window in which a teardown that WON its claim has already deleted the
-consumers a cross-term survivor's record still names; and telling two parentless
-first-creates racing across a leader term apart from two unrelated ones.
+**What this does not close.** One shape remains, tracked as a `docs/ROADMAP.md` §0.2
+blocker rather than an accepted limit, because it needs durable state this design does
+not introduce: telling two parentless first-creates racing across a leader term apart
+from two unrelated ones. The other — the window in which a teardown that WON its claim
+has already deleted the consumers a cross-term survivor's record still names — is closed
+by the generation-retirement watermark, which is durable state off the record subject
+and therefore outside this design's reach (see "The generation-retirement watermark").
 
 ### The session-record watch
 
@@ -2551,6 +2567,84 @@ Shared group durables stay outside all of this: they are not owned by one sessio
 and are released last, by the existing last-holder record scan, only once this
 session's record is gone.
 
+### The generation-retirement watermark
+
+The claim licenses the deletions, and the release that says whether the claim is
+still ours runs *after* them — it has to, because it proves absence rather than
+authorship, and moving it earlier only lets an already-admitted proposal recreate the
+same shape one step later. So while the deletions run, the marker is the only durable
+record of the retirement, and the marker lives on the record's own subject. A
+cross-term resume derived from the same base can apply after it landed (per-subject
+CAS is checked pre-proposal, never at apply — see "JetStream behaviors this design
+depends on") and `MaxMsgsPer: 1` then **evicts** it. What survives is a record naming
+exactly the resources the winner deleted, with no marker for an adopter or the sweep
+to find: a **hollow survivor** that a reconnect resumes with Session Present 1 for
+consumers, holds and in-flight registers that no longer exist.
+
+The fix keeps the retirement fact **off the replaceable subject**. Every teardown that
+wins its claim first records a permanent per-client watermark on `$MQTT_teardown`
+(`{id, gen, mseq, nonce, origin, started}`, one subject per client, `MaxMsgsPer: 1`),
+and only then deletes. It is written on both writers — `clear()` and
+`finishAdoptedTeardown`, which deletes the same resources under a marker just as
+evictable — always confirmed, even on a no-wait discard: a fence that only reached a
+send queue is not a fence. A write that cannot be confirmed **aborts the teardown with
+nothing deleted**, leaving the record marked, which is the already-handled
+self-healing state.
+
+**A generation whose retirement was ever recorded is retired, and stays fenced.**
+`mseq` — the `$MQTT_sess` sequence the claim marker landed at — is the ordering field,
+and replacement is decided by it *alone*: a standing watermark at or above ours is
+already at least as new, a lower one is CAS-replaced at the sequence we read, and a
+rejection is resolved by re-reading rather than classified. The generation plays no
+part in that decision, because a generation-equality early return would let a newer
+same-generation retirement be skipped and leave a paused older writer's write final.
+The monotonicity is **decision-time** monotonicity; an admitted CAS that applies after
+a leader transition can still regress the single slot, which is a stated residual.
+
+Three readers consume the fence, and each applies the same validation
+(`mqttValidateGenRetirement`: decodable, the client ID hashes back to the subject
+token, a valid generation, a nonzero `mseq`) with the same fail-closed disposition —
+a watermark that is unreadable or malformed in any field is never repaired in place,
+because it may name a retirement newer than the reader's own:
+
+- **The winner's release-superseded arm.** The release now hands back the record it
+  classified against; when that record carries the generation just retired and no
+  marker, it is the hollow survivor and is condemned with a fresh teardown claim.
+  **Mark only** — no deletions, no release — because a marked record is already the
+  fully-handled state: the survivor's broker observes the move on its session-record
+  watch (or the committed-read backstop) and evicts, its client's reconnect adopts the
+  marker and starts fresh with Session Present false, and with no client the expiry
+  path or the sweep finishes it. A *different* generation is a legitimate successor and
+  is left alone; a record already marked by a foreign teardown belongs to that
+  teardown's finisher. `finishAdoptedTeardown` carries the identical arm, because its
+  deletions ran on the same licence.
+- **The CONNECT restore.** One exact-subject read per record-restoring CONNECT: a
+  record whose generation the watermark names is routed into the *existing*
+  overdue-discard shape rather than resumed, so there is one discard path and not two,
+  and the client gets Session Present false — the truthful answer. This is the only
+  prompt reader for a winner that crashed after recording the retirement; without it
+  every reconnect resumes the same hollow record until the sweep runs.
+- **The orphan sweep**, for a client that never comes back. See "Orphan
+  reconciliation".
+
+Two things a marker means constrain all three: it licenses its adopters to delete
+every durable the record names, and the CONNECT discard deletes them itself. So each
+reader validates the record with `mqttValidateTeardownTargets` before it acts — the
+CONNECT *refuses* rather than discarding — and a record whose names are not this
+session's is condemned by nobody.
+
+Nothing ever reaps a watermark. Storage is bounded by the client-ID population, as it
+is for the `$MQTT_willcancel` markers, and permanence is what keeps the residual from
+being widened by a GC choice. Because `mseq` is a `$MQTT_sess` sequence, the two
+streams are one logical unit: `$MQTT_teardown` carries the adopted session-stream
+incarnation epoch in its metadata and a mismatch is **refused at startup** — see
+"Stream prerequisites".
+
+The deliberate exception to the fence is a crash *between* the won claim and the
+watermark write. It is non-destructive by construction, since the write precedes every
+deletion, so that generation has lost nothing and is legitimately resumable until an
+adopter fences it.
+
 **Every session carries a generation.** A record without one is **rejected** at the
 boundary rather than resumed on hash-only names: it predates this design, and under
 the compatibility boundary above the development store is recreated. Accommodating
@@ -2560,9 +2654,8 @@ be arbitrated for it and the discard would fall back to a blind hash-wide purge,
 which destroys a held payload whose releaser claimed it and then died. A
 partially-arbitrated path is worse than a rejected one.
 
-**Mixed version.** An older broker ignores the `Teardown` marker and would
-overwrite it, and uses the old names — so, as with the affine protocol, both halves
-hold only once every broker understands them. See `docs/CONFORMANCE.md`.
+What this leaves open is stated in `docs/CONFORMANCE.md`: the fence names only the
+latest retirement, and the single slot can itself be regressed by a cross-term apply.
 
 ## Orphan reconciliation
 
@@ -2583,6 +2676,27 @@ teardown restarts the wait — the sweep re-reads it, requires that same sequenc
 nonce, and runs `finishAdoptedTeardown`. No stored timestamp participates: neither
 the record's store time nor `Teardown.StartedAt`. A young marker, an unreadable
 record or a failed adoption leaves everything referenced.
+
+**Then retired survivors are condemned.** The pass walks `$MQTT_teardown` — the
+watermarks, one per client, bounded by the client-ID population — and for each valid
+fence loads the client's record. An unmarked record carrying the retired generation is
+the hollow survivor of the claim-won deletion window, and with no live winner and no
+CONNECT this is the only reader left for it. Eligibility is a stable observation of
+**both** identities, the record's sequence and the watermark's, so a resave, a peer's
+teardown or a newer retirement restarts the wait; the record is then validated with
+`mqttValidateTeardownTargets` and re-read at those exact sequences, and the sweep
+writes a teardown claim.
+
+It **marks only**, and the *finish* is left to the marker-adoption class on a later
+pass. That ordering is deliberate: releasing the record in the same pass would remove
+it moments after the marker landed, and a survivor broker whose lossy record watch
+dropped that brief observation would face an absent record rather than a moved one —
+which is the F-036 shape, where a bound Keep Alive 0 client strands. Deferring narrows
+that route to the case where the survivor's committed-read backstop does not reach the
+record in time; it does not close it, and a CONNECT that adopts the marker finishes
+immediately by design (see `docs/findings/ha-arbitration.md#f-036`). Nothing here
+reaps a watermark, so there is no reap step and no GC choice that could widen the
+escape the fence covers.
 
 **Absence is proven, never inferred.** Candidates are listed *before* a complete
 walk of `$MQTT_sess`, so a resource created between the two is never judged
@@ -2671,6 +2785,31 @@ additionally re-looked-up immediately before deletion and must still be the same
 instance quarantine observed: one deleted and recreated under the same name is a
 different consumer, and deleting it by name would destroy a peer's fresh consumer
 inside the very create-before-save window the wait exists to protect.
+
+**PUBREL durables are reaped too, and nothing else ever revisited one.**
+`sweepOrphanedConsumers` lists `$MQTT_msgs` only, this pass's affine class drops every
+name without the affine prefix, and the reference snapshot had no PUBREL class at all —
+so a `$MQTT_PUBREL_<idHash>_<gen>` consumer created just before the record save that
+names it (`ensurePubRelConsumerSubscription` provisions it first) was unreferenced
+forever if its broker died in between, holding its interest-retained PUBRELs with it.
+The class mirrors the affine one: the durable is parsed back to `(idHash, generation)`,
+its config must match all three names that identity derives — durable, filter subject
+and delivery subject — at discovery *and* again at the pre-delete lookup, since a
+consumer that disagrees with its own name cannot be attributed at all. A record is a
+reference through the `PubRel` durable it names verbatim, and a *local* session through
+the name derived from its `(idHash, generation)` unconditionally, which is what covers
+the create-before-save window on this broker. The class shares nothing with the affine
+inventory and is deliberately not gated on it: an unreadable assignment claim aborts
+the affine phases, and only those, because one persistent corrupt claim must not
+disable PUBREL reclamation account-wide on evidence about a different resource class.
+Deletion is authorized by a final
+authoritative record re-read — a save landing after the reference walk aborts it, and
+does not change `Created`, so the instance check alone could not catch it — and then by
+re-looking-up the same instance. Deleting the consumer drops the PUBRELs it held, which
+is correct in every state those checks can observe: no observable session could deliver
+them and the identifiers died with the session. Both windows are narrowed rather than
+closed, because a consumer delete is by name and unconditioned; that residual, and the
+resume-side verify-and-recreate that bounds it, are in `docs/CONFORMANCE.md`.
 
 **The affine side is the mirror image.** An assignment is committed `Discarded`
 *before* its consumer is deleted, because `$MQTT_out` is interest-retained and

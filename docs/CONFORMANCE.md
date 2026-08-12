@@ -593,10 +593,12 @@ Residuals:
   reach them, and a surviving disconnect leaves them reserved. Fail-closed by design:
   the identifier stays out of use rather than being handed to a second message, at the
   cost of one reserved identifier and one Receive Maximum slot each.
-- **Mixed-version operation.** As with the affine and teardown protocols: an older
-  broker never reads `$MQTT_inflight`, so it re-offers a started delivery under a
-  fresh identifier and its orphan sweep does not know the stream. Continuity holds
-  once every broker serving the account understands it.
+- **Mixed-version operation.** As with the affine protocol: an older broker never
+  reads `$MQTT_inflight`, so it re-offers a started delivery under a fresh identifier
+  and its orphan sweep does not know the stream. Continuity holds once every broker
+  serving the account understands it. (The teardown protocol no longer carries such a
+  residual: its section was rewritten for this tree when the retirement watermark
+  landed. The remaining rollout-framed residuals are a roadmap bullet of their own.)
 
 ### An ambiguous record write COMPLETES rather than aborts, once it is settled
 
@@ -651,7 +653,9 @@ it does *not* promise:
   deliberately, since an incomplete inventory cannot authorize any consumer delete. Until
   that record is repaired or removed, one malformed claim therefore wedges affine CONSUMER
   reclamation account-wide, leaving an unreferenced consumer on `$MQTT_out` for as long as
-  it persists. The RESIDUAL is the crash window between the ambiguous
+  it persists. The wedge is confined to that class: the sweep's other phases —
+  including PUBREL durable reclamation, which needs no assignment inventory — keep
+  running. The RESIDUAL is the crash window between the ambiguous
   save and its settlement. After a restart the record names the path and the resume
   re-establishes it — without recharging, and without reclaiming it. From there session
   TEARDOWN is the only thing that removes it: a later shared QoS 2 SUBSCRIBE reuses the
@@ -1199,7 +1203,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   and not bounded in time either, since that corrective save can itself fail and the
   window then lasts until some later settlement succeeds.
 
-### Session teardown: arbitrated across brokers, with two upgrade-window residuals
+### Session teardown: arbitrated across brokers, and fenced by a permanent watermark
 
 Discarding a session (clean start, a v5 DISCONNECT with expiry 0, session expiry,
 takeover-discard) now runs under a durable **teardown claim** on the session record
@@ -1215,8 +1219,71 @@ nothing and persists with its consumers until an operator recreates the streams 
 pre-existing consequence of the generation refusal, since a generation-scoped deletion
 has no name to use.
 
-Two residuals — one of them confined to an upgrade window — and one hard requirement:
+A teardown that WINS its claim records a permanent per-client **generation-retirement
+watermark** on `$MQTT_teardown` before it deletes anything, so the fact survives the one
+thing the record cannot: a cross-term resume derived from the same base evicting the
+marker off the record's own subject. Three readers act on it — the winner's own
+release-superseded arm, which condemns a same-generation survivor with a fresh marker;
+the CONNECT restore, which discards a retired record instead of resuming it hollow; and
+the orphan sweep, which condemns one with no CONNECT at all. Nothing ever reaps a
+watermark. See `docs/ARCHITECTURE.md`, "The generation-retirement watermark".
 
+What the repair is, exactly: **truthful termination, never restoration.** The deleted
+consumers, holds and in-flight registers are gone; what the readers guarantee is that
+the session is not served as though they existed. A client whose record was condemned
+gets Session Present false on its next connection, and its QoS 1/2 messages held by the
+deleted durables are lost — which is what a session discard means, and why the window
+mattered.
+
+Residuals and hard requirements:
+
+- **The hollow interval is bounded by observation, not by an instant.** Between the
+  cross-term resume applying and a reader condemning it, the survivor's broker still
+  answers for the session: the winner's arm runs immediately, but a winner that crashed
+  after recording the retirement leaves the repair to the next CONNECT or to the sweep,
+  which needs a stable observation across its grace plus a later pass. Nothing is lost
+  by the delay that was not already destroyed by the deletions.
+- **The fence names only the LATEST retirement.** An older retired generation escapes it
+  only through a same-base proposal that outlived a whole intervening session lifecycle
+  (teardown, a new session, its teardown), and the single slot can itself be regressed
+  by a `$MQTT_teardown` CAS admitted before a leader transition and applied after a
+  newer one. Both are stacked instances of the documented apply-time CAS hole — strictly
+  narrower than it, and not widened by any reaping, since nothing reaps a watermark. A
+  condemnation claim admitted before a leader transition can likewise apply over a
+  fresh-generation successor's record; that resolves as the accepted takeover
+  convergence (the successor's broker observes the move and concedes, its client
+  reconnects with Session Present false, and generation-scoped deletions cannot touch
+  the successor's own resources).
+- **A finish can outrun the survivor's own observation.** Whoever finishes the
+  condemnation marker deletes the record, and a bound, silent Keep Alive 0 client on the
+  survivor's broker that dropped the marker observation then faces an ABSENT record — the
+  F-036 shape, tracked as its own §0.2 blocker
+  (`docs/findings/ha-arbitration.md#f-036`), which this route is now listed under. The
+  sweep defers its finish by a pass to narrow the case it owns; a CONNECT adoption
+  finishes immediately by design.
+- **`$MQTT_teardown` recreated alone loses every open fence.** It stamps the current
+  session-stream incarnation epoch, validates clean and admits empty, so a generation
+  retired before the recreation is no longer fenced — the same loss, for the same
+  reason, as `$MQTT_willcancel` recreated alone. The other direction is refused rather
+  than admitted: `$MQTT_sess` recreated alone leaves watermarks from a different
+  incarnation, and startup fails with the coupled recreate-as-a-unit guidance. Watermark
+  storage is permanent and bounded by the client-ID population.
+- **An orphaned PUBREL durable is now reaped, and the PUBRELs it held go with it.**
+  A `$MQTT_PUBREL_<idHash>_<gen>` consumer on the interest-retained `$MQTT_out` whose
+  session generation is authoritatively absent was previously referenced by nothing and
+  accumulated forever; the orphan sweep now deletes it after a complete reference walk,
+  a full stable-observation grace, a final authoritative record re-read and an
+  instance re-lookup. The undelivered PUBRELs it was holding are dropped with it, which
+  is correct in every state those checks can observe — no observable session could
+  deliver them and their packet identifiers died with the session. Two windows are
+  narrowed rather than closed, because a JetStream consumer delete is by name and
+  unconditioned: a record save can land after the final re-read (no leader transition
+  needed — a broker pausing between the consumer create and the record save suffices),
+  and the durable can be deleted and recreated after the instance re-lookup. Both are
+  the same bound the affine reaper already has. The consequence of losing that race is
+  bounded rather than silent: the owning session's next resume verifies its PUBREL
+  durable and recreates an absent one, so what is lost is the PUBRELs it held — the
+  outbound QoS 2 completions those exchanges owed are not re-sent.
 - **A session record without a generation is rejected, not resumed.** Records
   written before generation-scoped naming existed carry no `gen`, and a CONNECT that
   finds one fails with recreate guidance rather than falling back to hash-only
@@ -1241,10 +1308,6 @@ Two residuals — one of them confined to an upgrade window — and one hard req
   is pre-existing and shared by every refusal on this path rather than specific to
   one; deferring indefinitely would take a client holding a CONNECT in flight across
   every pass, which gains it nothing, since every attempt is refused.
-- **Mixed-version operation.** An older broker ignores the `Teardown` marker (it
-  would overwrite it) and uses the old names, so both halves hold only once every
-  broker in the cluster understands them — the same rule as the shared-subscription
-  affinity protocol above.
 
 ### Inbound QoS 2 PUBREL is at-least-once across the unresolved move interval
 

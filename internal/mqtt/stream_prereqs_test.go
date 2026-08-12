@@ -560,6 +560,7 @@ var mqttTestBrokerStreamNames = []string{
 	mqttSessStreamName,
 	mqttWillQStreamName,
 	mqttWillCancelStreamName,
+	mqttTeardownStreamName,
 	mqttStreamName,
 	mqttQoS2IncomingMsgsStreamName,
 	mqttQoS2AssignStreamName,
@@ -568,14 +569,29 @@ var mqttTestBrokerStreamNames = []string{
 	mqttRetainedMsgsStreamName,
 }
 
+// testBrokerStreamSpecs builds the table as provisioning sees it, with every
+// entry's preCreate already applied.
+//
+// Both are needed for the configurations to be the ones the broker actually
+// creates. The manager carries an adopted session-stream epoch because
+// $MQTT_teardown is coupled to it, and $MQTT_teardown's own preCreate is where
+// that epoch is stamped into its config — it cannot be a literal, since the real
+// table is built before the loop that adopts the epoch.
 func testBrokerStreamSpecs() []brokerStreamSpec {
 	as := &mqttAccountSessionManager{}
-	return as.brokerStreamSpecs(&Server{}, "T", 3, 3, mqttDefaultMaxAckPending, true, "rmsub", nil)
+	as.sessStreamEpoch = mqttGenSessEpoch()
+	specs := as.brokerStreamSpecs(&Server{}, "T", 3, 3, mqttDefaultMaxAckPending, true, "rmsub", nil)
+	for _, spec := range specs {
+		if spec.preCreate != nil {
+			spec.preCreate()
+		}
+	}
+	return specs
 }
 
 // With provisioning table-driven, bypassing ensureBrokerStream requires
 // deleting a stream's entry — which this test refuses: the table must name
-// exactly the nine $MQTT_* streams, each with a non-nil validator and a config
+// exactly the ten $MQTT_* streams, each with a non-nil validator and a config
 // the validator itself accepts.
 func TestBrokerStreamSpecTable(t *testing.T) {
 	t.Parallel()
@@ -791,6 +807,16 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "no operation ever deletes a watermark — markers are permanent by design"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "no operation ever purges a watermark — markers are permanent by design"}
 		d["SubjectDeleteMarkerTTL"] = fieldDisposition{kind: dispWaived, reason: "no delete ever occurs here, so no delete marker can ever be created"}
+	case mqttTeardownStreamName:
+		register()
+		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "no operation ever deletes a retirement watermark — a fence is permanent by design, and reaping one would unfence a generation whose resources are already deleted"}
+		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "no operation ever purges a retirement watermark — fences are permanent by design"}
+		d["SubjectDeleteMarkerTTL"] = fieldDisposition{kind: dispWaived, reason: "no delete ever occurs here, so no delete marker can ever be created"}
+		// The incarnation epoch is a REAL prerequisite here, not owner-inert
+		// metadata: a watermark orders itself by a $MQTT_sess sequence, so this
+		// stream is only interpretable within the session-stream incarnation it was
+		// created against. See validateTeardownStream.
+		d["Metadata"] = fieldDisposition{kind: dispRejected, errWant: mqttSessEpochMetaKey}
 	case mqttQoS2IncomingMsgsStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}

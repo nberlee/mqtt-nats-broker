@@ -122,32 +122,46 @@ per stream.
   `reMintedFrom`, and the generation short-circuit is gone from `classifyRecordLineage`
   — a clean-start sibling always carries a different incarnation, so that short-circuit
   hid the one fork the rule exists to catch.
-  **What it does NOT close** is the two bullets below, filed as blockers rather than
-  recorded as residuals.
-- [ ] **The claim-won deletion window.** A teardown that WINS its claim deletes the
-  retiring generation's consumers and durables BEFORE its release tells it whether it
-  still owns the claim. A cross-term resume derived from the same base can apply
-  afterwards; a resume preserves the generation, so the surviving record names exactly
-  the consumers that were just deleted, and no repair path exists — marker and record
-  share the subject under `MaxMsgsPer: 1`, so nothing is left for
-  `finishAdoptedTeardown` or the orphan sweep to adopt. F-029 makes the eventual
-  displacement a conditional takeover rather than an unconditional erasure, which does
-  not shorten the interval. **Reordering release before delete was designed and
-  REFUTED**: `releaseTeardown` proves absence, not authorship (its own comment says
-  so), a cross-term proposal admitted earlier can apply after the release and recreate
-  the same shape one step later, shared group durables are not generation-scoped so an
-  early release lets a fresh same-client session have its durable deleted by the old
-  teardown's late scan, and after the release the durable target list is gone —
-  PUBREL durables have no orphan reaper at all. Closing it needs a durable teardown
-  intent that does NOT live on the replaceable record subject, or durable generation
-  fencing that makes a late resume of a retired generation rejectable. Extending the
-  orphan sweep to PUBREL durables is independently needed and belongs with it.
+  **What it does NOT close** was filed as two blockers below rather than recorded as
+  residuals; the claim-won deletion window is now closed by the retirement watermark,
+  and cross-term create × create recognition is still open.
+- [x] **The claim-won deletion window** (F-029a) **and the PUBREL orphan class.** The
+  window was real: a teardown that wins its claim deletes the retiring generation's
+  resources before its release can say whether it still owns the claim, and a cross-term
+  resume derived from the same base evicts the marker off the record subject
+  (`MaxMsgsPer: 1`), leaving a record that names exactly what was deleted with nothing
+  for `finishAdoptedTeardown` or the sweep to adopt. Closed by the durable teardown
+  intent this bullet asked for, kept OFF the replaceable subject: a permanent per-client
+  **generation-retirement watermark** on the new `$MQTT_teardown` stream, written after
+  the claim is won and before the first deletion, always confirmed, and read by three
+  readers — the winner's own release-superseded arm (condemn a same-generation survivor
+  with a fresh marker, MARK ONLY), the CONNECT restore (discard a retired record through
+  the existing overdue shape rather than resume it hollow), and the orphan sweep (condemn
+  one with no CONNECT at all, its finish deferred to a later pass). Replacement is
+  ordered by the claim marker's `$MQTT_sess` sequence alone; the generation plays no part
+  in that decision. Nothing ever reaps a watermark, so no GC choice widens the residual,
+  and the stream is epoch-COUPLED to `$MQTT_sess` — a partial recreation of the unit is
+  refused at startup rather than classified per read. Every reader validates the record
+  with `mqttValidateTeardownTargets` first, because a marker licenses its adopters to
+  delete every name the record carries. The companion half landed with it: the sweep now
+  has a PUBREL orphan class (parse, config validation at both the discovery and
+  pre-delete sites, verbatim-plus-derived reference classes, final record re-read then
+  instance re-lookup).
+  **Residuals** (`docs/CONFORMANCE.md`): the fence names only the LATEST retirement and
+  the single slot can itself be regressed by a cross-term apply on `$MQTT_teardown`, both
+  stacked instances of the documented apply-time CAS hole; the PUBREL reaper's two
+  post-check windows, the same bound the affine reaper has; `$MQTT_teardown` recreated
+  alone loses every open fence. A finish that outruns the survivor broker's own
+  observation is a new route into F-036 and is listed under that blocker, not here.
 - [ ] **Sweep the rollout-qualified residuals out of the docs.** The Compatibility
   boundary is normative (`CLAUDE.md`, `docs/ARCHITECTURE.md`), but residuals written
   before it became so still qualify themselves with "an older broker", "mid-rollout" and
   "once every broker upgrades" — in `docs/CONFORMANCE.md` and in two `docs/ARCHITECTURE.md`
   sections. F-029 rewrote the ones in its own blast radius — including two inside the
-  session-watch and lineage residuals it edits — and left the rest standing, with the
+  session-watch and lineage residuals it edits — and F-029a did the same for the teardown
+  pair (`docs/ARCHITECTURE.md`'s "Mixed version" paragraph and the mixed-version bullet
+  in the `docs/CONFORMANCE.md` teardown section are gone). Both left the rest standing,
+  with the
   preamble narrowed to say so rather than claiming a consistency the document does not
   have. Each one has to be re-read against what its feature actually
   does for a broker running this tree — the wording often hides a real scope limit that
@@ -371,6 +385,14 @@ project. Retain `mqtt-nats-bridge` only if continuity outweighs that ambiguity.
 
 - [ ] Decide whether the `$MQTT_sess` + `$MQTT_willcancel` "one logical unit"
   constraint should be durably enforced at startup rather than documented.
+  **Now precedented, and narrowed to a retrofit.** `$MQTT_teardown` (F-029a) carries
+  exactly the proposed echo — the adopted epoch in stream metadata, stamped in the
+  entry's `preCreate` and required to match by its validator, which refuses a
+  `$MQTT_sess`-recreated-alone unit at startup. That settles the mechanics (who writes
+  it, the create race, and the bootstrap order) for a stream introduced WITH the echo.
+  What is left to decide here is the retrofit onto a stream that may already exist
+  without one, where an absent stamp cannot be told from a foreign incarnation and
+  refusing would invert `TestSessionManagerEpochRecreationYieldsDifferentEpoch`.
   Raised by the stream-prerequisite audit's review (round 7): deleting only
   `$MQTT_sess` mints a new incarnation epoch while permanent watermarks keep
   the old one; the fence then classifies them stale and falls back to the

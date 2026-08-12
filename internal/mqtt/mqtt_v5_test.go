@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -6694,14 +6695,22 @@ func testMQTTRunReconcile(t testing.TB, asm *mqttAccountSessionManager, s *Serve
 // local reconnect) that runs while it is parked. The returned release closes the
 // seam; done closes when the worker returns. The pause hook is cleared once this
 // worker is parked, so any worker started afterward does not park.
+//
+// Callers must arm testMQTTSuppressRecordWatch first when they PLANT the record: a
+// planted record is a real $MQTT_sess write and the watch spawns a reconcile worker
+// of its own for the same client, which would reach this seam too. The park below is
+// idempotent so that a caller who forgets fails its own assertions instead of
+// panicking the whole binary on a double close — a foreign park is held and released
+// with ours, carrying the same observation and therefore the same decision.
 func testMQTTStartParkedReconcile(t testing.TB, asm *mqttAccountSessionManager, s *Server, idHash string, observedSeq uint64) (release, done chan struct{}) {
 	t.Helper()
 	loaded := make(chan struct{})
 	release = make(chan struct{})
 	done = make(chan struct{})
+	var once sync.Once
 	asm.mu.Lock()
 	asm.testReconcilePause = func(string) {
-		close(loaded)
+		once.Do(func() { close(loaded) })
 		<-release
 	}
 	asm.mu.Unlock()

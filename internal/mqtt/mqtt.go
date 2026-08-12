@@ -231,6 +231,15 @@ const (
 	mqttWillCancelStreamName    = "$MQTT_willcancel"
 	mqttWillCancelSubjectPrefix = mqttPrefix + "willcancel."
 
+	// Stream name and subject prefix for the durable per-client GENERATION
+	// RETIREMENT watermark (one subject per client, MaxMsgsPer:1, permanent
+	// retention). A teardown that has WON its claim records the retirement here
+	// before it deletes anything, so the fact survives the one thing the session
+	// record cannot: a cross-term resume evicting the marker off the record's own
+	// subject. Nothing ever reaps a watermark. See sess_teardown.go.
+	mqttTeardownStreamName    = "$MQTT_teardown"
+	mqttTeardownSubjectPrefix = mqttPrefix + "teardown."
+
 	// Reserved $MQTT_sess metadata key holding the generated stream-incarnation
 	// epoch, and the only valid epoch form: "nuid:<22-character NUID>". The epoch
 	// is an identity token (equality only), so a session sequence is comparable to
@@ -4045,7 +4054,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.cleanupRetainedMessageCache(s, closeCh)
 	})
 
-	// Provision the nine broker-owned $MQTT_* streams through the one
+	// Provision the ten broker-owned $MQTT_* streams through the one
 	// convergence shape (ensureBrokerStream): create-or-lose, an UNCONDITIONAL
 	// authoritative re-read, then per-owner validation over that re-read — a
 	// nonconforming stream is a startup failure with recreate guidance, never
@@ -8458,10 +8467,52 @@ RESTORE:
 		return sess, false, nil
 	}
 
+	// THE RETIREMENT FENCE. An unmarked record whose generation is durably RETIRED is
+	// the hollow survivor of the claim-won deletion window: some teardown won its
+	// claim, recorded the retirement and deleted this generation's consumers, durables,
+	// QoS 2 holds and in-flight registers, and a cross-term resume then evicted the
+	// marker off this subject. Resuming it would answer Session Present 1 for state
+	// that no longer exists, so it is discarded instead. This is the only prompt reader
+	// for a winner that crashed after the watermark: without it every reconnect
+	// re-resumes the same hollow record until the sweep runs.
+	//
+	// One exact-subject read per record-restoring CONNECT (a fresh create and a
+	// marked-record adoption never reach here). A watermark that cannot be read — or
+	// that is malformed in any field — REFUSES the CONNECT rather than being ignored:
+	// the same fail-closed rule the record load itself follows, and the same rule the
+	// writer and the sweep apply. See sess_teardown.go.
+	rt, _, rstatus := jsa.loadGenRetirement(as.domainTk, hash)
+	switch rstatus {
+	case mqttRetirementCorrupt:
+		return nil, false, fmt.Errorf("restoring session %q: its durable retirement watermark is malformed, "+
+			"so whether this generation was torn down cannot be decided: stop this account's brokers and "+
+			"recreate the bridge-owned JetStream state (the $MQTT_* streams)", clientID)
+	case mqttRetirementIndeterminate:
+		return nil, false, fmt.Errorf("restoring session %q: unable to read its durable retirement watermark", clientID)
+	}
+	genRetired := rstatus == mqttRetirementValid && rt.Gen == ps.Gen
+	if genRetired {
+		// The discard below is destructive — clear() deletes every durable this record
+		// names — and `genRetired` is a NEW route into it, so it does not inherit the
+		// overdue arm's pre-existing validation level. A record naming another session's
+		// consumer is refused here rather than discarded, exactly as readers 1 and 3
+		// refuse to condemn one. See mqttValidateTeardownTargets.
+		if verr := mqttValidateTeardownTargets(ps, hash); verr != nil {
+			return nil, false, fmt.Errorf("restoring session %q: its generation is durably retired, but the "+
+				"record names resources that are not this session's: %w", clientID, verr)
+		}
+	}
+
 	// An overdue session must not be resumed, even if this reconnect beats the
 	// startup sweep to it: discard its state and start fresh. Spec5 [3.1.2.11.2].
-	if ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
-		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval) {
+	// A retired generation takes the SAME route rather than a second discard shape of
+	// its own: build the transient session, clear() it (which re-marks the record,
+	// finds the retirement already recorded, repeats the idempotent deletions and
+	// releases the record) and hand back the reset object as a fresh session, with
+	// Session Present false — which is the truthful answer in both cases.
+	overdue := ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
+		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval)
+	if overdue || genRetired {
 		sess := mqttSessionCreate(jsa, clientID, hash, ps.Gen, smsg.Sequence, ps.WID, ps.PWID, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
@@ -8485,7 +8536,7 @@ RESTORE:
 		// CONNECT is refused rather than the session destroyed unclassified.
 		if err := sess.clear(false); err != nil {
 			if !errors.Is(err, errMQTTClearSuperseded) {
-				return nil, false, fmt.Errorf("clearing expired session: %w", err)
+				return nil, false, fmt.Errorf("discarding the unresumable session record of %q: %w", clientID, err)
 			}
 			// R1, at transition T0. The base this discard claimed is not current, so the
 			// object in hand describes a record that is gone; returning it would create
@@ -9273,6 +9324,17 @@ func (sess *mqttSession) clear(noWait bool) error {
 		return err
 	}
 
+	// RECORD THE RETIREMENT, before the first deletion and on a subject a resume
+	// cannot evict. The marker alone cannot carry this fact: it shares the record's
+	// subject, so a cross-term resume derived from the same base replaces it and the
+	// deletions below become invisible. A failure here aborts the teardown with
+	// NOTHING deleted, leaving the record marked — the already-handled self-healing
+	// state, which the next CONNECT, the expiry path or the sweep finishes, each
+	// recording the retirement first. See sess_teardown.go.
+	if err := sess.recordGenRetirement(target, nonce, markerSeq); err != nil {
+		return err
+	}
+
 	// DELETE this incarnation's resources. A nonce re-read before the batch would
 	// only be an early-out, never what makes this safe — the read and the JetStream
 	// delete cannot be atomic. Generation-scoped naming is what makes it safe, and
@@ -9289,7 +9351,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// were involved: the last-holder scan below must not observe this session's own
 	// stale record and wrongly keep (or, via another member, delete) a group
 	// durable. Spec5 [4.8.2].
-	switch res, rerr := sess.releaseTeardown(tok, target, nonce, markerSeq); res {
+	switch res, cur, curSeq, rerr := sess.releaseTeardown(tok, target, nonce, markerSeq); res {
 	case mqttTeardownReleased:
 		// Ours, and gone. The shared durables are now safe to consider.
 	case mqttTeardownSuperseded:
@@ -9297,7 +9359,14 @@ func (sess *mqttSession) clear(noWait bool) error {
 		// shared durables are not ours to release either. Same sentinel as the claim
 		// arm, and it says the same thing: the base is not current. It does NOT say
 		// nothing was deleted — the deletions above already ran, legitimately, because
-		// the claim was won. See the claim-won deletion window in docs/ROADMAP.md §0.2.
+		// the claim was won.
+		//
+		// That is the claim-won deletion window, and this is where it is REPAIRED rather
+		// than only reported: when the survivor carries the generation we just retired,
+		// it names resources that no longer exist, so it is condemned with a fresh
+		// teardown marker before this returns. The sentinel and every caller's
+		// disposition are unchanged. See sess_teardown.go.
+		sess.condemnRetiredSurvivor(tok, target, cur, curSeq)
 		return fmt.Errorf("discarding session %q: %w", id, errMQTTClearSuperseded)
 	default:
 		return rerr

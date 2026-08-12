@@ -349,10 +349,23 @@ func testSupersedeInAdoptionWindow(t *testing.T, peer *testTeardownEnv, forClien
 	// from a goroutine running after its server is gone.
 	t.Cleanup(func() { mu.Lock(); done = true; mu.Unlock() })
 	restore = setMQTTTestTeardownAdoptionWindowHook(func(clientID, idHash string, markerSeq uint64) {
+		// The WHOLE plant runs under the lock, not just the gate, and that is what makes
+		// this fixture single-shot. Two adoptions of the same marker run concurrently by
+		// design — the test's own (a CONNECT, an expiry or a sweep) and a background sweep
+		// still holding a previous environment's marker — and `rivalWID` is only set once a
+		// CAS has landed, so gating on it while planting OUTSIDE the lock let both plant:
+		// the second record superseded the first, `rivalWID` named whichever finished last,
+		// and the restore was then compared against a rival that had not superseded the
+		// adoption it was compared for.
+		//
+		// Holding it across the plant is also what keeps a slow firing from starving the
+		// test's own: the second firing waits for the first to finish and then either sees
+		// a rival already planted or plants one itself. A gate that reserved the slot
+		// before the CAS instead let a firing whose JetStream round trip was still in
+		// flight consume it, and the test asserted "no rival" while that plant was pending.
 		mu.Lock()
-		skip := done || rivalWID != _EMPTY_ || clientID != forClientID
-		mu.Unlock()
-		if skip {
+		defer mu.Unlock()
+		if done || rivalWID != _EMPTY_ || clientID != forClientID {
 			return
 		}
 		// Written through the raw record CAS rather than through a session save: this is
@@ -381,9 +394,7 @@ func testSupersedeInAdoptionWindow(t *testing.T, peer *testTeardownEnv, forClien
 				WID: mqttNewRecordWID(), PWID: mqttNewRecordWID(),
 			}
 			if _, err := mqttStoreSessionRecordCAS(&peer.asm.jsa, peer.asm.domainTk, ps, idHash, cur); err == nil {
-				mu.Lock()
 				rivalWID = ps.WID
-				mu.Unlock()
 				return
 			} else {
 				lastErr = err
@@ -391,7 +402,7 @@ func testSupersedeInAdoptionWindow(t *testing.T, peer *testTeardownEnv, forClien
 		}
 		// Deliberately NOT a test failure. The hook is global and a background sweep can
 		// reach it for this client ID from an environment whose server is already gone —
-		// a dead broker cannot stage anything, and the test's own call will. `reached` is
+		// a dead broker cannot stage anything, and the test's own call will. `rivalWID` is
 		// set only where the rival actually landed, so a fixture that never staged still
 		// fails, just not from the wrong goroutine.
 		_ = lastErr

@@ -98,6 +98,32 @@ func mqttPubRelNames(idHash, gen string) (subject, deliverSubject, durable strin
 	return subject, deliverSubject, durable
 }
 
+// mqttValidatePubRelNames checks a PUBREL consumer's config against the three names
+// the given session generation must own. Mirror of mqttValidateQ2AffineNames, and used
+// for the same reason: the durable NAME is what attributes a consumer to a session, so
+// a config that disagrees with its own name cannot be attributed at all and must not
+// be acted on. The orphan sweep applies it at discovery and again immediately before
+// the delete.
+func mqttValidatePubRelNames(cc *ConsumerConfig, idHash, gen string) error {
+	if cc == nil {
+		return fmt.Errorf("no consumer config")
+	}
+	if !mqttValidSessGen(gen) {
+		return fmt.Errorf("session generation %q is not a valid identity", gen)
+	}
+	subject, deliver, durable := mqttPubRelNames(idHash, gen)
+	if cc.Durable != durable {
+		return fmt.Errorf("durable is %q (want %q)", cc.Durable, durable)
+	}
+	if cc.FilterSubject != subject {
+		return fmt.Errorf("filter subject is %q (want %q)", cc.FilterSubject, subject)
+	}
+	if cc.DeliverSubject != deliver {
+		return fmt.Errorf("deliver subject is %q (want %q)", cc.DeliverSubject, deliver)
+	}
+	return nil
+}
+
 // mqttQoS2HoldSubject returns the $MQTT_qos2in subject holding an inbound QoS 2
 // PUBLISH for one packet identifier of one session incarnation
 // ("$MQTT.qos2.in.<idHash>.<gen>.<PI>").

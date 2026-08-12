@@ -949,6 +949,15 @@ func TestMQTTWillOutboxWatermarkConnectFailureStaleReconcileWorker(t *testing.T)
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
 
+	// The watch fixture rule, armed BEFORE the plant: a planted record is a real
+	// $MQTT_sess write, so the broker's own session-record watch would spawn a
+	// reconcile worker for this same client hash — sharing the watermark entry and the
+	// pause seam with the worker this test starts deliberately. This test is about
+	// what ONE parked worker decides, so the observation is dropped. Without it the
+	// foreign worker can reach the pause hook inside its arming window, which panicked
+	// the whole test binary on a double close.
+	testMQTTSuppressRecordWatch(t, asm)
+
 	// A real session record so the parked worker's authoritative load succeeds and it
 	// parks at the decision seam (rather than returning early on not-found).
 	planted := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{

@@ -318,7 +318,7 @@ type brokerStreamSpec struct {
 	post      func(*StreamInfo) error // runs after validation, on the authoritative info
 }
 
-// brokerStreamSpecs returns the ordered provisioning table for the nine
+// brokerStreamSpecs returns the ordered provisioning table for the ten
 // broker-owned $MQTT_* streams. wantReplicas is 0 when no explicit replica
 // count is configured; maxAckPending is the broker's effective per-consumer
 // cap; requireMsgTTL is whether this broker accepts MQTT 5.0 (see
@@ -336,6 +336,18 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 	stopAll := func(verr error, stream, req string) error {
 		return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s with the required %s configuration (this is not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
 			verr, stream, req)
+	}
+
+	// Hoisted so its own preCreate can stamp it: the $MQTT_sess incarnation epoch
+	// this stream is coupled to does not exist yet when the table is built.
+	teardownCfg := &StreamConfig{
+		Name:       mqttTeardownStreamName,
+		Subjects:   []string{mqttTeardownSubjectPrefix + as.domainTk + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Discard:    DiscardOld,
+		Replicas:   replicas,
+		MaxMsgsPer: 1,
 	}
 
 	return []brokerStreamSpec{
@@ -358,14 +370,15 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			},
 			validate: func(si *StreamInfo) error {
 				if verr := validateSessStream(si, as.domainTk, wantReplicas); verr != nil {
-					// The session stream is epoch-coupled to the will-cancel marker
-					// stream: recreating $MQTT_sess alone mints a new incarnation
-					// epoch while the permanent watermarks keep the old one, the
-					// partial-recreation hazard docs/ARCHITECTURE.md ("Operational
-					// constraints for the marker") warns against. The recovery is
-					// the coupled one, mirroring the marker stream's own guidance.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s as one logical unit — recreating the session stream alone mints a new incarnation epoch against stale takeover-suppression watermarks (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
-						verr, mqttSessStreamName, mqttWillCancelStreamName)
+					// The session stream is epoch-coupled to BOTH permanent watermark
+					// streams: recreating $MQTT_sess alone mints a new incarnation
+					// epoch while the takeover-suppression and generation-retirement
+					// watermarks keep the old one, the partial-recreation hazard
+					// docs/ARCHITECTURE.md ("Operational constraints for the marker")
+					// warns against. The recovery is the coupled one, mirroring both
+					// watermark streams' own guidance.
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the session stream alone mints a new incarnation epoch against stale takeover-suppression and generation-retirement watermarks (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
+						verr, mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName)
 				}
 				return nil
 			},
@@ -433,8 +446,48 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 					// are only comparable within one $MQTT_sess incarnation — so the
 					// recovery is the coupled one docs/ARCHITECTURE.md ("Operational
 					// constraints for the marker") requires.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s as one logical unit — recreating the marker stream alone discards permanent takeover-suppression watermarks and can let superseded delayed Wills fire (see docs/ARCHITECTURE.md)",
-						verr, mqttWillCancelStreamName, mqttSessStreamName)
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the marker stream alone discards permanent takeover-suppression watermarks and can let superseded delayed Wills fire (see docs/ARCHITECTURE.md)",
+						verr, mqttWillCancelStreamName, mqttSessStreamName, mqttTeardownStreamName)
+				}
+				return nil
+			},
+		},
+		{
+			name: mqttTeardownStreamName,
+			txt:  "teardown retirement watermark",
+			// Durable per-client generation-retirement watermark stream. Permanent
+			// per-client retention (MaxMsgsPer:1, no global limits so a fence is never
+			// evicted; DiscardOld so a CAS replacement of a client's prior watermark is
+			// never rejected). Epoch-COUPLED to $MQTT_sess: the entry sits after it so
+			// the adopted incarnation epoch exists by the time preCreate stamps it. See
+			// sess_teardown.go.
+			cfg: teardownCfg,
+			// The stamp cannot be a config literal: this table is built before the
+			// provisioning loop runs, and as.sessStreamEpoch is adopted inside
+			// $MQTT_sess's own iteration. preCreate runs immediately before the create,
+			// which is after that iteration, so the value is there. A create-race loser
+			// never reaches here and validates the authoritative re-read instead — whose
+			// stamp is the identical value, because every broker adopted the same epoch
+			// from the same session-stream re-read.
+			preCreate: func() {
+				if as.sessStreamEpoch == _EMPTY_ {
+					// Unreachable in the provisioning order: $MQTT_sess validated and
+					// adopted its epoch first. Left unstamped rather than guessed, so the
+					// validator below refuses the stream instead of admitting an
+					// uncomparable one.
+					return
+				}
+				teardownCfg.Metadata = map[string]string{mqttSessEpochMetaKey: as.sessStreamEpoch}
+			},
+			validate: func(si *StreamInfo) error {
+				if verr := validateTeardownStream(si, as.domainTk, wantReplicas, as.sessStreamEpoch); verr != nil {
+					// Same coupling as the will-cancel markers, for the same reason: a
+					// MarkerSeq is a $MQTT_sess sequence, so these permanent watermarks
+					// are only comparable within the incarnation they were written under.
+					// Recreating either stream alone is the hazard, and an unfenced
+					// generation whose resources are already deleted is the cost.
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the session stream alone leaves generation-retirement watermarks from a different incarnation, and recreating this stream alone discards the fences that keep a torn-down session from being resumed hollow (see docs/ARCHITECTURE.md)",
+						verr, mqttTeardownStreamName, mqttSessStreamName, mqttWillCancelStreamName)
 				}
 				return nil
 			},

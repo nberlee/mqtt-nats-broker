@@ -159,6 +159,14 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	// would protect resources the adoption has just deleted.
 	as.adoptAbandonedTeardowns(s)
 
+	// (1b) Then condemn the survivors of the claim-won deletion window: records whose
+	// generation is durably RETIRED but which carry no marker, because a cross-term
+	// resume evicted it. Ordered AFTER adoption deliberately — a marker this pass
+	// writes must be finished by a LATER pass, so the record stays visibly MOVED for at
+	// least one backstop cadence rather than vanishing moments after it was marked.
+	// See condemnRetiredSurvivors.
+	as.condemnRetiredSurvivors(s)
+
 	// (2) Candidates BEFORE references (invariant 3). A candidate the later walk does
 	// not reference was already unreferenced when it was listed; the reverse order
 	// would classify a resource created after the walk.
@@ -192,20 +200,39 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 		as.reconcileOrphanInflight(s, inflight, refs, &inflightBudget)
 	}
 
-	if cerr != nil {
-		// A malformed claim aborts the whole inventory, which is what protects every
-		// affine consumer from deletion during this pass.
+	// A malformed claim aborts the whole affine INVENTORY, which is what protects every
+	// affine consumer from deletion during this pass — and nothing more than that. It is
+	// deliberately not an early return: the phases below that share nothing with the
+	// inventory keep running, or one persistent corrupt claim would disable them
+	// account-wide, forever, on evidence about a different resource class.
+	affineUsable := cerr == nil
+	if !affineUsable {
 		s.Warnf("MQTT orphaned QoS 2 sweep: assignment inventory incomplete, skipping affine reconciliation: %v", cerr)
-		return
 	}
 	budget := mqttQ2AffSweepMutationBudget
-	as.reconcileOrphanQ2AffClaims(s, inventory, refs, &budget)
+	if affineUsable {
+		as.reconcileOrphanQ2AffClaims(s, inventory, refs, &budget)
+	}
 
 	if conserr != nil {
+		// This one IS fatal to both remaining phases: each judges a consumer against a
+		// listing, and there is none.
 		s.Debugf("MQTT orphaned QoS 2 sweep: unable to list $MQTT_out consumers: %v", conserr)
 		return
 	}
-	as.deleteOrphanQ2AffConsumers(s, inventory, consumers, refs, &budget)
+	if affineUsable {
+		as.deleteOrphanQ2AffConsumers(s, inventory, consumers, refs, &budget)
+	}
+
+	// PUBREL durables, from the same $MQTT_out listing. Nothing else revisits one: a
+	// consumer created just before the record save that names it is referenced by
+	// nothing at all if its broker dies in between, and it holds its interest-retained
+	// PUBRELs forever.
+	//
+	// It needs no assignment inventory: eligibility rests on its own complete reference
+	// snapshot, this listing, the grace, the final record re-read and the instance
+	// re-lookup — so an unreadable affine claim is not evidence about it.
+	as.deleteOrphanPubRelConsumers(s, consumers, refs)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,12 +405,14 @@ func (as *mqttAccountSessionManager) quarantine() *mqttSweepQuarantine {
 
 // Quarantine keys. Each names one resource; the fingerprint that accompanies it
 // names the exact record or consumer currently occupying it.
-func mqttQuarantineHoldKey(subject string) string     { return "hold|" + subject }
-func mqttQuarantineClaimKey(subject string) string    { return "claim|" + subject }
-func mqttQuarantineTeardownKey(idHash string) string  { return "teardown|" + idHash }
-func mqttQuarantineAssignKey(subject string) string   { return "assign|" + subject }
-func mqttQuarantineConsumerKey(durable string) string { return "q2aff|" + durable }
-func mqttQuarantineInflightKey(subject string) string { return "inflight|" + subject }
+func mqttQuarantineHoldKey(subject string) string      { return "hold|" + subject }
+func mqttQuarantineClaimKey(subject string) string     { return "claim|" + subject }
+func mqttQuarantineTeardownKey(idHash string) string   { return "teardown|" + idHash }
+func mqttQuarantineRetirementKey(idHash string) string { return "retire|" + idHash }
+func mqttQuarantinePubRelKey(durable string) string    { return "pubrel|" + durable }
+func mqttQuarantineAssignKey(subject string) string    { return "assign|" + subject }
+func mqttQuarantineConsumerKey(durable string) string  { return "q2aff|" + durable }
+func mqttQuarantineInflightKey(subject string) string  { return "inflight|" + subject }
 
 func mqttQuarantineSeqFP(seq uint64) string { return strconv.FormatUint(seq, 10) }
 
@@ -492,6 +521,133 @@ func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 }
 
 // ---------------------------------------------------------------------------
+// Retirement condemnation
+// ---------------------------------------------------------------------------
+
+// condemnRetiredSurvivors marks the records that survived a teardown's deletions:
+// unmarked records whose generation the durable $MQTT_teardown watermark says was
+// RETIRED. It is the reader of last resort for that window — the winner's own
+// release-superseded arm covers the case where the winner is alive, and the CONNECT
+// restore covers a client that comes back, but a winner that crashed after recording
+// the retirement leaves a hollow record that nothing else revisits.
+//
+// It walks the watermarks rather than the records: the watermark IS the fact, one per
+// client, and the walk is bounded by the client-ID population exactly as the
+// will-cancel markers are.
+//
+// MARK ONLY, and NOTHING is ever reaped here. Two things follow from that, both
+// load-bearing:
+//
+//   - The finish belongs to the marker-adoption class on a LATER pass. Releasing the
+//     record in the same pass would remove it moments after the marker landed, and a
+//     survivor broker whose lossy record watch dropped that brief observation would
+//     face an ABSENT record — the documented F-036 shape, where a bound Keep Alive 0
+//     client strands. Deferring narrows that route to the case where the survivor's
+//     committed-read backstop does not reach the record in time; it does not close it,
+//     and a CONNECT that adopts the marker immediately does not wait at all
+//     (docs/findings/ha-arbitration.md#f-036).
+//   - A watermark is permanent, so there is no reap step, no reap fingerprint, and no
+//     GC choice that could widen the escape it fences. An older-than-latest retirement
+//     is the stated residual instead.
+//
+// Eligibility is a stable observation of BOTH identities — the record's sequence and
+// the watermark's — so a resave, a peer's teardown or a newer retirement restarts the
+// wait. A malformed watermark, an unreadable record or a record whose names are not
+// this session's mutates nothing for that client: a marker licenses its adopters to
+// delete every durable the record names, which is exactly why it is not written onto a
+// record whose names cannot be accounted for.
+func (as *mqttAccountSessionManager) condemnRetiredSurvivors(s *Server) {
+	grace, q := as.orphanGrace(), as.quarantine()
+	opts := s.getOpts()
+	filter := mqttTeardownSubjectPrefix + as.domainTk + ">"
+	for seq := uint64(1); ; {
+		smsg, err := as.jsa.loadNextMsgFromSeq(mqttTeardownStreamName, filter, seq)
+		if err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				s.Debugf("MQTT retirement condemnation sweep ended: %v", err)
+			}
+			return
+		}
+		seq = smsg.Sequence + 1
+		wmSeq := smsg.Sequence
+
+		idHash, perr := mqttTeardownIDHashFromSubject(smsg.Subject, as.domainTk)
+		if perr != nil {
+			continue // not ours to interpret, and not ours to act on
+		}
+		r := &mqttGenRetirement{}
+		if uerr := json.Unmarshal(smsg.Data, r); uerr != nil {
+			s.Warnf("MQTT retirement condemnation: retirement watermark on %q is undecodable: %v", smsg.Subject, uerr)
+			continue
+		}
+		if verr := mqttValidateGenRetirement(r, idHash); verr != nil {
+			s.Warnf("MQTT retirement condemnation: refusing to act on the watermark on %q: %v", smsg.Subject, verr)
+			continue
+		}
+
+		ps, curSeq, lerr := as.loadFenceSession(idHash)
+		if lerr != nil || ps == nil {
+			// Unreadable is not absence, and absence needs no repair: the retired
+			// generation's record is already gone.
+			continue
+		}
+		if ps.Gen != r.Gen {
+			continue // a fresh generation owns the subject; the watermark simply stays
+		}
+		if ps.Teardown != nil {
+			continue // marked already: the adoption class above owns it
+		}
+		if verr := mqttValidateTeardownTargets(ps, idHash); verr != nil {
+			s.Warnf("MQTT retirement condemnation: refusing to condemn the record of %q: %v", idHash, verr)
+			continue
+		}
+
+		fp := mqttQuarantineSeqFP(curSeq) + "|" + mqttQuarantineSeqFP(wmSeq)
+		if !q.observedOrphanFor(mqttQuarantineRetirementKey(idHash), fp, grace) {
+			continue
+		}
+
+		// Act-time re-validation at the SAME identities, as every mutation here gets:
+		// the snapshot above is older than both records, and the claim CAS below must
+		// land on the record this pass verified.
+		cur, reSeq, rerr := as.loadFenceSession(idHash)
+		if rerr != nil || cur == nil || reSeq != curSeq || cur.Gen != r.Gen || cur.Teardown != nil {
+			continue
+		}
+		if verr := mqttValidateTeardownTargets(cur, idHash); verr != nil {
+			continue
+		}
+		rr, reWmSeq, rstatus := as.jsa.loadGenRetirement(as.domainTk, idHash)
+		if rstatus != mqttRetirementValid || reWmSeq != wmSeq || rr.Gen != r.Gen || rr.MarkerSeq != r.MarkerSeq {
+			continue
+		}
+
+		// A transient session on the RETIRING generation, exactly as
+		// finishAdoptedTeardown builds one: the marker is a record write, so it needs a
+		// record transaction and a lineage parented to the record it is derived from.
+		sess := mqttSessionCreate(&as.jsa, cur.ID, idHash, cur.Gen, reSeq, cur.WID, cur.PWID, opts)
+		sess.asm = as
+		sess.domainTk = as.domainTk
+		tok := sess.beginRecordTx()
+		_, _, outcome, cerr := sess.claimTeardown(tok, cur, reSeq, cur.WID)
+		if terr := sess.endRecordTx(tok); terr != nil {
+			s.Errorf("MQTT: %v", terr)
+		}
+		if outcome != mqttTeardownClaimWon {
+			// The subject moved again, or the outcome is unknown. The watermark is
+			// permanent, so the next pass tries again from a fresh observation.
+			s.Debugf("MQTT retirement condemnation: could not condemn the record of %q (%v): %v", idHash, outcome, cerr)
+			continue
+		}
+		s.Warnf("MQTT retirement condemnation: condemned the record of session %q, whose generation %q was torn down",
+			cur.ID, r.Gen)
+		// The record now carries a marker, so this class will skip it from here on; the
+		// slot is released so the adoption class's own wait is the only one left.
+		q.forget(mqttQuarantineRetirementKey(idHash))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The authoritative session-reference snapshot
 // ---------------------------------------------------------------------------
 
@@ -502,6 +658,12 @@ type mqttSessRefs struct {
 	inbound     map[string]struct{} // (idHash, incarnation generation)
 	affine      map[string]struct{} // (idHash, Q2Aff generation)
 	affDurables map[string]struct{}
+	// pubRelDurables is the PUBREL consumer names a record or a local session
+	// claims: the persisted name verbatim, and — for a LOCAL session — the name
+	// derived from its (idHash, generation) unconditionally, because the consumer is
+	// created before the record save that names it and the derived name is the only
+	// thing that covers that window on this broker.
+	pubRelDurables map[string]struct{}
 }
 
 func mqttSessRefKey(idHash, gen string) string { return idHash + "\x00" + gen }
@@ -533,9 +695,10 @@ func (r *mqttSessRefs) hasAffine(idHash, gen string) bool {
 // reconciliation do not race ahead of the teardown.
 func (as *mqttAccountSessionManager) buildSessionRefs() (*mqttSessRefs, error) {
 	refs := &mqttSessRefs{
-		inbound:     make(map[string]struct{}),
-		affine:      make(map[string]struct{}),
-		affDurables: make(map[string]struct{}),
+		inbound:        make(map[string]struct{}),
+		affine:         make(map[string]struct{}),
+		affDurables:    make(map[string]struct{}),
+		pubRelDurables: make(map[string]struct{}),
 	}
 
 	as.mu.RLock()
@@ -551,12 +714,24 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (*mqttSessRefs, error) {
 		if sess.q2AffConsumer != nil {
 			affDur = sess.q2AffConsumer.Durable
 		}
+		var pubRelDur string
+		if sess.pubRelConsumer != nil {
+			pubRelDur = sess.pubRelConsumer.Durable
+		}
 		sess.mu.Unlock()
 		if idHash == _EMPTY_ {
 			continue
 		}
 		if gen != _EMPTY_ {
 			refs.inbound[mqttSessRefKey(idHash, gen)] = struct{}{}
+			// UNCONDITIONALLY, whether or not this session has created its PUBREL
+			// consumer yet: the create precedes the record save that names it, so the
+			// derived name is what covers that window on this broker.
+			_, _, dur := mqttPubRelNames(idHash, gen)
+			refs.pubRelDurables[dur] = struct{}{}
+		}
+		if pubRelDur != _EMPTY_ {
+			refs.pubRelDurables[pubRelDur] = struct{}{}
 		}
 		if affGen != _EMPTY_ {
 			refs.affine[mqttSessRefKey(idHash, affGen)] = struct{}{}
@@ -591,6 +766,12 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (*mqttSessRefs, error) {
 			return nil, fmt.Errorf("session record on %q: %w", smsg.Subject, verr)
 		}
 		refs.inbound[mqttSessRefKey(idHash, ps.Gen)] = struct{}{}
+		// The persisted PUBREL durable VERBATIM, as for the affine one: the record is
+		// the authority on what it claims, and mqttValidateSessionRecord above has
+		// already refused a record whose names are not this session's.
+		if ps.PubRel != nil {
+			refs.pubRelDurables[ps.PubRel.Durable] = struct{}{}
+		}
 		if ps.Q2AffGen != _EMPTY_ {
 			refs.affine[mqttSessRefKey(idHash, ps.Q2AffGen)] = struct{}{}
 			_, _, dur := mqttQ2AffineNames(idHash, ps.Q2AffGen)
@@ -1693,6 +1874,142 @@ func mqttQ2AffGenerationSettled(inv []*mqttQ2AffInvEntry, idHash, gen string) bo
 		}
 	}
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// PUBREL durables
+// ---------------------------------------------------------------------------
+
+// deleteOrphanPubRelConsumers removes $MQTT_PUBREL_* consumers on $MQTT_out that no
+// session record and no local session references.
+//
+// Nothing else has ever revisited one. sweepOrphanedConsumers lists $MQTT_msgs only,
+// this file's affine pass drops every name without the affine prefix, and the
+// reference snapshot had no PUBREL class at all — so a consumer created just before
+// the record save that names it (mqtt.go, ensurePubRelConsumerSubscription) is
+// unreferenced forever if its broker dies in between, and it holds the
+// interest-retained PUBRELs of a session that no longer exists.
+//
+// Deleting one DROPS those PUBRELs, which is correct in every state these checks can
+// observe: after a complete authoritative reference walk, a full grace of stable
+// observation and the final record re-read below, no observable session exists that
+// could deliver them, and the packet identifiers they carry died with their session.
+//
+// Two windows are NARROWED and not closed, because a JetStream consumer delete is by
+// name and unconditioned: a record save can land after the final re-read, and the
+// durable can be deleted and recreated after the instance re-lookup. That is the same
+// bound the affine reaper has (docs/CONFORMANCE.md); the resume-side verify-and-recreate
+// (ensurePubRelConsumerSubscription) bounds the damage to the PUBRELs the consumer
+// held.
+func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, consumers []*ConsumerInfo, refs *mqttSessRefs) {
+	type pubRelCand struct {
+		durable string
+		idHash  string
+		gen     string
+		created time.Time // the exact consumer instance quarantine observed
+	}
+	grace, q := as.orphanGrace(), as.quarantine()
+	var candidates []pubRelCand
+	for _, ci := range consumers {
+		if ci == nil || ci.Config == nil {
+			continue
+		}
+		if !strings.HasPrefix(ci.Name, mqttPubRelConsumerDurablePrefix) {
+			continue // not ours to judge
+		}
+		idHash, gen, perr := mqttParsePubRelDurable(ci.Name)
+		if perr != nil {
+			s.Warnf("MQTT orphaned QoS 2 sweep: retaining PUBREL consumer %q: %v", ci.Name, perr)
+			continue
+		}
+		// A consumer whose config does not match its own name is not ours to judge, at
+		// this site or the pre-delete one below. Same rule, and same reason, as the
+		// affine class: the name is what attributes it, so a mismatch means we cannot
+		// say whose delivery path this is.
+		if verr := mqttValidatePubRelNames(ci.Config, idHash, gen); verr != nil {
+			s.Warnf("MQTT orphaned QoS 2 sweep: retaining PUBREL consumer %q: %v", ci.Name, verr)
+			continue
+		}
+		if _, ok := refs.pubRelDurables[ci.Name]; ok {
+			q.forget(mqttQuarantinePubRelKey(ci.Name))
+			continue
+		}
+		// Created is a FINGERPRINT here, never an age: a recreated consumer of the same
+		// name carries a different one and restarts the wait.
+		fp := strconv.FormatInt(ci.Created.UnixNano(), 10)
+		if !q.observedOrphanFor(mqttQuarantinePubRelKey(ci.Name), fp, grace) {
+			continue
+		}
+		candidates = append(candidates, pubRelCand{durable: ci.Name, idHash: idHash, gen: gen, created: ci.Created})
+	}
+
+	for _, cand := range candidates {
+		// (1) A final AUTHORITATIVE record re-read. A record saved after the reference
+		// walk names this durable and has not been validated by that walk, and a
+		// delayed save does not change ConsumerInfo.Created — so the instance re-lookup
+		// below cannot catch it and this read is the only thing that can.
+		ps, _, serr := as.loadFenceSession(cand.idHash)
+		if serr != nil {
+			continue // unreadable is not absence
+		}
+		if ps != nil {
+			if verr := mqttValidateSessionRecord(ps, cand.idHash); verr != nil {
+				// A malformed but LIVE record may well reference this consumer, so it
+				// must never be read as evidence that nothing does.
+				continue
+			}
+			if ps.Gen == cand.gen {
+				continue // the generation came back and owns its delivery path again
+			}
+			if ps.PubRel != nil && ps.PubRel.Durable == cand.durable {
+				continue
+			}
+		}
+
+		// (2) Still the INSTANCE quarantine observed? A durable deleted and recreated
+		// under the same name since the listing is a different consumer holding
+		// different copies — and recreation is precisely what the grace protects, since
+		// the consumer is provisioned BEFORE the record that references it.
+		ci, lerr := as.jsa.lookupConsumer(mqttOutStreamName, cand.durable)
+		if lerr != nil || ci == nil || ci.Config == nil {
+			continue // gone, or unreadable: nothing to delete, and absence is not proven
+		}
+		if !ci.Created.Equal(cand.created) {
+			continue // a different instance; its own wait starts from the next listing
+		}
+		if verr := mqttValidatePubRelNames(ci.Config, cand.idHash, cand.gen); verr != nil {
+			s.Warnf("MQTT orphaned QoS 2 sweep: retaining PUBREL consumer %q: %v", cand.durable, verr)
+			continue
+		}
+
+		// (3) Only now.
+		if _, derr := as.jsa.deleteConsumer(mqttOutStreamName, cand.durable, false); isErrorOtherThan(derr, JSConsumerNotFoundErr) {
+			s.Warnf("MQTT orphaned QoS 2 sweep: unable to delete orphaned PUBREL consumer %q: %v", cand.durable, derr)
+			continue
+		}
+		s.Debugf("MQTT orphaned QoS 2 sweep: deleted orphaned PUBREL consumer %q", cand.durable)
+		q.forget(mqttQuarantinePubRelKey(cand.durable))
+	}
+}
+
+// mqttParsePubRelDurable splits a PUBREL consumer durable back into the identity it
+// was built from ("$MQTT_PUBREL_<idHash>_<generation>"), requiring the exact shape
+// mqttPubRelNames produces. The separator is "_", which neither a hash nor a
+// generation can contain, so the split is unambiguous. Counterpart of
+// mqttParseQ2AffDurable; anything else is not ours to judge.
+func mqttParsePubRelDurable(durable string) (idHash, gen string, err error) {
+	rest := strings.TrimPrefix(durable, mqttPubRelConsumerDurablePrefix)
+	if len(rest) != sysHashLen+1+mqttSessGenLen || rest[sysHashLen] != '_' {
+		return _EMPTY_, _EMPTY_, fmt.Errorf("durable does not have the PUBREL consumer shape")
+	}
+	idHash, gen = rest[:sysHashLen], rest[sysHashLen+1:]
+	if !mqttValidIDHashToken(idHash) {
+		return _EMPTY_, _EMPTY_, fmt.Errorf("durable carries a malformed client-ID hash token %q", idHash)
+	}
+	if !mqttValidSessGen(gen) {
+		return _EMPTY_, _EMPTY_, fmt.Errorf("durable carries a malformed incarnation generation token %q", gen)
+	}
+	return idHash, gen, nil
 }
 
 // mqttParseQ2AffDurable splits an affine consumer durable back into the identity it

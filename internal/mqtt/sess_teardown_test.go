@@ -115,7 +115,12 @@ func testProvisionSession(t *testing.T, env *testTeardownEnv, clientID string) *
 	if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 		t.Fatalf("create PUBREL consumer: %v", err)
 	}
+	// Under sess.mu, as every production writer of this field is: the session is
+	// registered with the account manager by now, and its orphan sweep reads
+	// pubRelConsumer from its own goroutine (buildSessionRefs' PUBREL reference class).
+	sess.mu.Lock()
 	sess.pubRelConsumer = &ccr.Config
+	sess.mu.Unlock()
 
 	if _, err := sess.jsa.storeMsg(mqttQoS2HoldSubject(sess.idHash, sess.gen, 1), 0, []byte("held")); err != nil {
 		t.Fatalf("store QoS2 hold: %v", err)
@@ -257,7 +262,10 @@ func TestSessTeardownLateDeleteIsHarmless(t *testing.T) {
 			t.Errorf("B create fresh PUBREL consumer: %v", err)
 			return
 		}
+		// Under the lock, for the reason testProvisionSession's own write is.
+		freshSess.mu.Lock()
 		freshSess.pubRelConsumer = &ccr.Config
+		freshSess.mu.Unlock()
 		if _, err := freshSess.jsa.storeMsg(mqttQoS2HoldSubject(freshSess.idHash, freshGen, 1), 0, []byte("fresh")); err != nil {
 			t.Errorf("B store fresh QoS2 hold: %v", err)
 			return
@@ -420,9 +428,15 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 		t.Fatalf("foreign takeover write: %v", err)
 	}
 
-	res, rerr := sessA.releaseTeardown(tok, target, nonce, markerSeq)
+	res, cur, curSeq, rerr := sessA.releaseTeardown(tok, target, nonce, markerSeq)
 	if res != mqttTeardownSuperseded {
 		t.Fatalf("release classification = %v (err=%v), want superseded: a no-op delete was read as our own success", res, rerr)
+	}
+	// The superseded outcome hands back the record it classified against, at the
+	// exact sequence: that is the hollow survivor of the claim-won deletion window,
+	// and condemnRetiredSurvivor has to CAS at that sequence.
+	if cur == nil || curSeq != foreignSeq {
+		t.Fatalf("superseded must return the classifying read, got %+v at %v (want the foreign record at %v)", cur, curSeq, foreignSeq)
 	}
 	if got, gotSeq := testLoadSessRecord(t, a, sessA.idHash); got == nil || gotSeq != foreignSeq {
 		t.Fatalf("the foreign record must survive at sequence %v, got %+v at %v", foreignSeq, got, gotSeq)
@@ -440,8 +454,10 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 	if claim2 != mqttTeardownClaimWon {
 		t.Fatalf("second claimTeardown = %v, err=%v", claim2, err)
 	}
-	if res, rerr := sessA.releaseTeardown(tok2, target, nonce2, markerSeq2); res != mqttTeardownReleased {
+	if res, cur, curSeq, rerr := sessA.releaseTeardown(tok2, target, nonce2, markerSeq2); res != mqttTeardownReleased {
 		t.Fatalf("release classification = %v (err=%v), want released", res, rerr)
+	} else if cur != nil || curSeq != 0 {
+		t.Fatalf("a released teardown has no classifying record to hand back, got %+v at %v", cur, curSeq)
 	}
 	if err := sessA.endRecordTx(tok2); err != nil {
 		t.Fatalf("endRecordTx: %v", err)

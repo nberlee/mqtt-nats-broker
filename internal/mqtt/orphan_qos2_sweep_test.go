@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -2260,4 +2261,436 @@ func TestOrphanSweepRunsFromTheAccountSweepLoop(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("the periodic account sweep never reconciled an orphaned inbound QoS 2 hold")
+}
+
+// ---------------------------------------------------------------------------
+// Retirement condemnation and the PUBREL orphan class
+// ---------------------------------------------------------------------------
+
+// quarantined reports whether a key currently holds an observation slot. Asserted
+// directly where SURVIVAL cannot discriminate: a candidate wrongly admitted here can
+// still be rescued by an act-time re-read, which would mask a dropped reference class.
+func (e *testOrphanEnv) quarantined(key string) bool {
+	q := e.asm.quarantine()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.entries[key] != nil
+}
+
+func (e *testOrphanEnv) retirement(t *testing.T, idHash string) (*mqttGenRetirement, mqttRetirementStatus) {
+	t.Helper()
+	r, _, status := e.asm.jsa.loadGenRetirementRecord(e.asm.domainTk, idHash)
+	return r, status
+}
+
+func (e *testOrphanEnv) sessRecord(t *testing.T, idHash string) *mqttPersistedSession {
+	t.Helper()
+	ps, _, err := e.asm.loadFenceSession(idHash)
+	if err != nil {
+		t.Fatalf("loading the session record of %q: %v", idHash, err)
+	}
+	return ps
+}
+
+// testCreatePubRelConsumer provisions a session incarnation's PUBREL consumer with
+// exactly the three names mqttPubRelNames derives, as the broker does.
+func testCreatePubRelConsumer(t *testing.T, e *testOrphanEnv, idHash, gen string) string {
+	t.Helper()
+	subject, deliver, durable := mqttPubRelNames(idHash, gen)
+	if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+		Stream: mqttOutStreamName,
+		Config: ConsumerConfig{
+			Durable:        durable,
+			FilterSubject:  subject,
+			DeliverSubject: deliver,
+			AckPolicy:      AckExplicit,
+			DeliverPolicy:  DeliverNew,
+			MaxAckPending:  1024,
+		},
+	}); err != nil {
+		t.Fatalf("create PUBREL consumer %q: %v", durable, err)
+	}
+	return durable
+}
+
+// sweepPubRelConsumers runs one PUBREL pass in production's order: candidates are
+// listed, then the authoritative reference snapshot is built.
+func (e *testOrphanEnv) sweepPubRelConsumers(t *testing.T) {
+	t.Helper()
+	cons, err := e.asm.jsa.consumerList(mqttOutStreamName)
+	if err != nil {
+		t.Fatalf("consumerList: %v", err)
+	}
+	refs, err := e.asm.buildSessionRefs()
+	if err != nil {
+		t.Fatalf("buildSessionRefs: %v", err)
+	}
+	e.asm.deleteOrphanPubRelConsumers(e.s, cons, refs)
+}
+
+// TestOrphanSweepCondemnsARetiredSurvivor is test 4, reader 3: with no CONNECT and no
+// live winner, the sweep is what recognises the survivor of the claim-won deletion
+// window — and it MARKS ONLY, leaving the finish to the marker-adoption class on a
+// LATER pass.
+//
+// The ordering is the point. Finishing in the same pass would release the record
+// moments after the marker landed, and a survivor broker whose lossy record watch
+// dropped that brief observation would face an ABSENT record instead of a moved one —
+// the F-036 shape. Deferring keeps it visibly MOVED for at least one backstop cadence.
+//
+// The watermark is produced by the REAL writer, never planted: a planted fence would
+// let this test pass even if no teardown ever recorded one.
+func TestOrphanSweepCondemnsARetiredSurvivor(t *testing.T) {
+	e := testNewOrphanEnv(t, "sweep-condemn")
+	e.setGraces(t, 0, 0)
+	idHash := e.sess.idHash
+	retiredGen := e.sess.gen
+
+	base, baseSeq, err := e.asm.loadFenceSession(idHash)
+	if err != nil || base == nil {
+		t.Fatalf("loading the base record: %+v %v", base, err)
+	}
+
+	// Stage the window: the winner is parked between its claim and its deletions while
+	// a same-base resume applies over the marker.
+	gate := newTestHookGate(t)
+	restore := setMQTTTestTeardownClaimedHook(func(sess *mqttSession, _ string, markerSeq uint64) {
+		if !gate.enter() {
+			return
+		}
+		defer gate.leave()
+		if sess != e.sess {
+			return
+		}
+		survivor := *base
+		survivor.Teardown = nil
+		survivor.WID, survivor.PWID = mqttNewRecordWID(), base.WID
+		if _, serr := mqttStoreSessionRecordCAS(&e.asm.jsa, e.asm.domainTk, &survivor, idHash, markerSeq); serr != nil {
+			t.Errorf("planting the surviving record: %v", serr)
+		}
+	})
+	if cerr := e.sess.clear(false); !errors.Is(cerr, errMQTTClearSuperseded) {
+		restore()
+		t.Fatalf("clear() = %v, want the superseded sentinel", cerr)
+	}
+	restore()
+
+	if r, status := e.retirement(t, idHash); status != mqttRetirementValid || r.Gen != retiredGen {
+		t.Fatalf("the teardown recorded no usable fence: status=%v r=%+v", status, r)
+	}
+	// The winner's own arm condemned the survivor; a SECOND late resume erases that
+	// marker too (matrix row 12), which is the state only the sweep can still repair.
+	marked, markedSeq, err := e.asm.loadFenceSession(idHash)
+	if err != nil || marked == nil || marked.Teardown == nil {
+		t.Fatalf("expected the winner to have condemned the survivor, got %+v (err=%v)", marked, err)
+	}
+	again := *base
+	again.Teardown = nil
+	again.WID, again.PWID = mqttNewRecordWID(), base.WID
+	if _, serr := mqttStoreSessionRecordCAS(&e.asm.jsa, e.asm.domainTk, &again, idHash, markedSeq); serr != nil {
+		t.Fatalf("planting the second surviving record: %v", serr)
+	}
+	if baseSeq == 0 {
+		t.Fatal("staging error: the base record was never persisted")
+	}
+
+	// Pass 1 first-sights the hollow pair and authorizes nothing.
+	e.asm.sweepOrphanedQoS2State(e.s)
+	if ps := e.sessRecord(t, idHash); ps == nil || ps.Teardown != nil {
+		t.Fatalf("the first pass must authorize nothing, got %+v", ps)
+	}
+
+	// Pass 2 MARKS, and only marks.
+	e.asm.sweepOrphanedQoS2State(e.s)
+	ps := e.sessRecord(t, idHash)
+	if ps == nil {
+		t.Fatal("the sweep released the record in the pass that marked it: a survivor broker that " +
+			"dropped the marker observation would see an absent record, not a moved one")
+	}
+	if ps.Teardown == nil {
+		t.Fatal("the sweep did not condemn a record whose generation is durably retired")
+	}
+	if ps.Gen != retiredGen {
+		t.Fatalf("the condemnation must preserve the record's content, got generation %q", ps.Gen)
+	}
+
+	// Pass 3 is the adoption class's own first sighting of that marker: still nothing.
+	e.asm.sweepOrphanedQoS2State(e.s)
+	if got := e.sessRecord(t, idHash); got == nil || got.Teardown == nil {
+		t.Fatalf("a first marker observation must authorize no finish, got %+v", got)
+	}
+
+	// Pass 4 finishes it.
+	e.asm.sweepOrphanedQoS2State(e.s)
+	if got := e.sessRecord(t, idHash); got != nil {
+		t.Fatalf("the marker-adoption class never finished the condemnation, got %+v", got)
+	}
+	// Nothing reaps a fence, so it is still there after every pass.
+	if r, status := e.retirement(t, idHash); status != mqttRetirementValid || r.Gen != retiredGen {
+		t.Fatalf("the retirement fence must be permanent: status=%v r=%+v", status, r)
+	}
+}
+
+// TestOrphanSweepReapsAnOrphanedPubRelDurable is test 9: the companion half. A PUBREL
+// durable on $MQTT_out whose session generation is authoritatively absent was
+// referenced by NOTHING before this class existed — sweepOrphanedConsumers lists
+// $MQTT_msgs only, and the affine pass deliberately drops every other prefix — so it
+// held its interest-retained PUBRELs forever.
+func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
+	t.Run("an unreferenced durable is reaped, never on the first pass", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "pubrel-orphan")
+		e.setGraces(t, 0, 0)
+		durable := testCreatePubRelConsumer(t, e, getHash("pubrel-gone"), mqttNewSessGen())
+
+		e.sweepPubRelConsumers(t)
+		if !e.consumerExists(t, durable) {
+			t.Fatal("the pass that first sighted the durable deleted it; one observation authorizes nothing")
+		}
+		e.sweepPubRelConsumers(t)
+		if e.consumerExists(t, durable) {
+			t.Fatal("an unreferenced PUBREL durable was never reaped")
+		}
+	})
+
+	t.Run("one a record names never enters quarantine", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "pubrel-referenced")
+		e.setGraces(t, 0, 0)
+		idHash, gen := e.sess.idHash, e.sess.gen
+		durable := testCreatePubRelConsumer(t, e, idHash, gen)
+		_, _, cfgDurable := mqttPubRelNames(idHash, gen)
+		e.sess.mu.Lock()
+		e.sess.pubRelConsumer = &ConsumerConfig{Durable: cfgDurable}
+		e.sess.mu.Unlock()
+		e.persist(t)
+		// Only the RECORD may reference it now.
+		e.dropLocalSession()
+
+		e.sweepPubRelConsumers(t)
+		e.sweepPubRelConsumers(t)
+		// Asserted against the candidate state, not against survival: the act-time
+		// record re-read would keep a wrongly-admitted candidate alive and hide a
+		// missing reference class.
+		if e.quarantined(mqttQuarantinePubRelKey(durable)) {
+			t.Fatal("a PUBREL durable a session record names was admitted as an orphan candidate")
+		}
+		if !e.consumerExists(t, durable) {
+			t.Fatal("a referenced PUBREL durable was deleted")
+		}
+	})
+
+	t.Run("one only a local session references is untouched", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "pubrel-local")
+		e.setGraces(t, 0, 0)
+		idHash, gen := e.sess.idHash, e.sess.gen
+		durable := testCreatePubRelConsumer(t, e, idHash, gen)
+		// The create-before-save window: the consumer exists, the record naming it does
+		// not, and the only thing that can speak for it is the live session in memory.
+		e.dropSessionRecord(t)
+
+		e.sweepPubRelConsumers(t)
+		e.sweepPubRelConsumers(t)
+		if !e.consumerExists(t, durable) {
+			t.Fatal("a PUBREL durable created by a live local session was reaped inside the " +
+				"create-before-save window")
+		}
+	})
+
+	t.Run("a record saved after the reference walk aborts the deletion", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "pubrel-late-save")
+		e.setGraces(t, 0, 0)
+		const owner = "pubrel-late-saver"
+		idHash, gen := getHash(owner), mqttNewSessGen()
+		durable := testCreatePubRelConsumer(t, e, idHash, gen)
+
+		e.sweepPubRelConsumers(t) // quarantine the instance
+		// The owner's save lands after the walk: it never passed through the reference
+		// snapshot, and it does not change the consumer's Created either, so only the
+		// final authoritative re-read can see it.
+		e.asm.mu.Lock()
+		e.asm.testSessionLoad = func(hash string) (*mqttPersistedSession, uint64, error) {
+			if hash != idHash {
+				return nil, 0, nil
+			}
+			return &mqttPersistedSession{ID: owner, Gen: gen}, 7, nil
+		}
+		e.asm.mu.Unlock()
+		t.Cleanup(func() {
+			e.asm.mu.Lock()
+			e.asm.testSessionLoad = nil
+			e.asm.mu.Unlock()
+		})
+
+		e.sweepPubRelConsumers(t)
+		if !e.consumerExists(t, durable) {
+			t.Fatal("a PUBREL durable was deleted although its record had come back by act time")
+		}
+	})
+
+	t.Run("a durable recreated since the listing is not deleted", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "pubrel-recreated")
+		e.setGraces(t, 0, 0)
+		idHash, gen := getHash("pubrel-recreated-owner"), mqttNewSessGen()
+		durable := testCreatePubRelConsumer(t, e, idHash, gen)
+
+		cons, err := e.asm.jsa.consumerList(mqttOutStreamName)
+		if err != nil {
+			t.Fatalf("consumerList: %v", err)
+		}
+		refs, err := e.asm.buildSessionRefs()
+		if err != nil {
+			t.Fatalf("buildSessionRefs: %v", err)
+		}
+		e.asm.deleteOrphanPubRelConsumers(e.s, cons, refs) // quarantine this instance
+
+		// A peer tears it down and provisions it again under the same name, and has not
+		// saved its record yet.
+		if _, derr := e.asm.jsa.deleteConsumer(mqttOutStreamName, durable, false); derr != nil {
+			t.Fatalf("deleting the consumer: %v", derr)
+		}
+		time.Sleep(10 * time.Millisecond) // a distinguishable Created
+		testCreatePubRelConsumer(t, e, idHash, gen)
+
+		// The sweep proceeds from its now-stale listing.
+		e.asm.deleteOrphanPubRelConsumers(e.s, cons, refs)
+		if !e.consumerExists(t, durable) {
+			t.Fatal("a PUBREL durable recreated since the listing was deleted on the previous " +
+				"instance's fingerprint, destroying a peer's fresh consumer")
+		}
+	})
+}
+
+// TestOrphanSweepPubRelValidatesTheConsumerConfig is test 15. The durable NAME is what
+// attributes a consumer to a session, so a config that disagrees with its own name
+// cannot be attributed at all — and the check is applied at BOTH sites, because they
+// answer different questions: discovery decides what may become a candidate, and the
+// pre-delete lookup is what actually authorizes the delete.
+func TestOrphanSweepPubRelValidatesTheConsumerConfig(t *testing.T) {
+	t.Run("a mismatched consumer is never admitted at discovery", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "pubrel-badcfg-discovery")
+		e.setGraces(t, 0, 0)
+		idHash, gen := getHash("pubrel-badcfg"), mqttNewSessGen()
+		_, deliver, durable := mqttPubRelNames(idHash, gen)
+		if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+			Stream: mqttOutStreamName,
+			Config: ConsumerConfig{
+				Durable: durable,
+				// Another incarnation's PUBREL subject: the name says one generation and
+				// the filter says another, so which delivery path this is cannot be said.
+				FilterSubject:  mqttPubRelSubjectPrefix + idHash + mqttSessGenTk(mqttNewSessGen(), "."),
+				DeliverSubject: deliver,
+				AckPolicy:      AckExplicit,
+				DeliverPolicy:  DeliverNew,
+				MaxAckPending:  1024,
+			},
+		}); err != nil {
+			t.Fatalf("create mismatched PUBREL consumer: %v", err)
+		}
+
+		e.sweepPubRelConsumers(t)
+		e.sweepPubRelConsumers(t)
+		if e.quarantined(mqttQuarantinePubRelKey(durable)) {
+			t.Fatal("a consumer whose config does not match its name was admitted as a candidate")
+		}
+		if !e.consumerExists(t, durable) {
+			t.Fatal("a consumer we cannot attribute was deleted")
+		}
+	})
+
+	t.Run("a same-instance mismatch is refused at the pre-delete lookup", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "pubrel-badcfg-predelete")
+		e.setGraces(t, 0, 0)
+		idHash, gen := getHash("pubrel-badcfg-late"), mqttNewSessGen()
+		subject, deliver, durable := mqttPubRelNames(idHash, gen)
+		if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+			Stream: mqttOutStreamName,
+			Config: ConsumerConfig{
+				Durable:        durable,
+				FilterSubject:  subject,
+				DeliverSubject: mqttPubRelDeliverySubjectPrefix + idHash + mqttSessGenTk(mqttNewSessGen(), "."),
+				AckPolicy:      AckExplicit,
+				DeliverPolicy:  DeliverNew,
+				MaxAckPending:  1024,
+			},
+		}); err != nil {
+			t.Fatalf("create mismatched PUBREL consumer: %v", err)
+		}
+		real, err := e.asm.jsa.lookupConsumer(mqttOutStreamName, durable)
+		if err != nil || real == nil {
+			t.Fatalf("looking up the consumer just created: %+v %v", real, err)
+		}
+
+		// A listing that passes discovery, carrying the REAL instance's Created: the
+		// instance re-lookup therefore agrees, and only the pre-delete config check can
+		// still refuse the delete.
+		listing := []*ConsumerInfo{{
+			Name:    durable,
+			Created: real.Created,
+			Config: &ConsumerConfig{
+				Durable:        durable,
+				FilterSubject:  subject,
+				DeliverSubject: deliver,
+				AckPolicy:      AckExplicit,
+				DeliverPolicy:  DeliverNew,
+				MaxAckPending:  1024,
+			},
+		}}
+		refs, err := e.asm.buildSessionRefs()
+		if err != nil {
+			t.Fatalf("buildSessionRefs: %v", err)
+		}
+		e.asm.deleteOrphanPubRelConsumers(e.s, listing, refs)
+		e.asm.deleteOrphanPubRelConsumers(e.s, listing, refs)
+		if !e.consumerExists(t, durable) {
+			t.Fatal("a consumer whose live config does not match its name was deleted: the instance " +
+				"fingerprint agreed, so only the pre-delete validation could refuse it")
+		}
+	})
+}
+
+// TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory pins the class boundary in
+// the production pass, which the direct-call tests above cannot see.
+//
+// A malformed assignment claim aborts the affine INVENTORY, and that must protect the
+// affine consumers and nothing else. It used to return from the whole sweep, so one
+// persistent corrupt claim disabled PUBREL reconciliation account-wide and for good —
+// on evidence about a different resource class. PUBREL eligibility rests on its own
+// complete reference snapshot, the consumer listing, the grace, the final record
+// re-read and the instance re-lookup; none of them is an assignment claim.
+//
+// The affine half is asserted as a POSITIVE CONTROL, not as a discriminator: an
+// orphaned affine consumer is retained in the same pass, but that outcome is
+// over-determined — the phase's own second complete inventory refuses it as well, so
+// removing the guard beside this pass would not change it. What the control buys is
+// that the fix is not a licence to delete affine consumers from a partial view.
+func TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory(t *testing.T) {
+	e := testNewOrphanEnv(t, "pubrel-vs-affine-inventory")
+	e.setGraces(t, 0, 0)
+
+	// A claim that fails validation: the winner hash no longer derives the copy subject
+	// and affine durable the claim carries, so the inventory cannot be completed.
+	groupDur := mqttSharedConsumerDurablePrefix + "CORRUPT"
+	bad := testValidQ2AffClaim(getHash("affine-corrupt"), mqttNewQ2AffGen(), groupDur, 77)
+	bad.Winner = "not-a-hash"
+	if _, err := e.asm.jsa.storeQ2AffClaimCAS(mqttQ2AffClaimSubject(groupDur, 77), 0, bad); err != nil {
+		t.Fatalf("planting a malformed assignment claim: %v", err)
+	}
+	if _, ierr := e.asm.collectQ2AffInventory(); ierr == nil {
+		t.Fatal("staging error: the planted claim must make the affine inventory incomplete")
+	}
+
+	pubRelDur := testCreatePubRelConsumer(t, e, getHash("pubrel-past-a-corrupt-claim"), mqttNewSessGen())
+	affDur := testCreateAffineConsumer(t, e, getHash("affine-past-a-corrupt-claim"), mqttNewQ2AffGen())
+
+	// The REAL pass, twice: one observation authorizes nothing.
+	e.asm.sweepOrphanedQoS2State(e.s)
+	e.asm.sweepOrphanedQoS2State(e.s)
+
+	if e.consumerExists(t, pubRelDur) {
+		t.Fatal("an unreadable affine claim disabled the PUBREL class: the orphaned durable and its " +
+			"interest-retained PUBRELs would accumulate indefinitely, on evidence about another class")
+	}
+	if !e.consumerExists(t, affDur) {
+		t.Fatal("the affine consumer was deleted from an INCOMPLETE inventory: absence taken from a " +
+			"partial view is not absence")
+	}
 }
