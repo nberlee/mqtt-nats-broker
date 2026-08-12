@@ -358,6 +358,16 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 		es.mu.Unlock()
 		if classifyRecordLineage(ps, ackWID, ackPWID) == mqttLineageForked {
 			result = rollbackForked
+			// This site mints like the other six, and that is a CORRECTION rather than an
+			// omission repaired: once a repair-bearing accept save has landed as candidate C
+			// and this rollback finds a sibling D of C, the grant the capsule contributed is
+			// durably erased again while the old capsule anchors the superseded survivor and
+			// will be dropped. Refusing to mint here would lose an acknowledged grant this
+			// feature had just repaired. What makes it safe on a CONNECT that repaired
+			// nothing is the empty-delta property, not a special case: grant terms are not
+			// carried fields, so such a rollback produces no capsule at all.
+			// See sess_fork_repair.go.
+			es.mintForkedGrant(ackWID, ackPWID)
 		} else {
 			result = rollbackSuperseded
 		}

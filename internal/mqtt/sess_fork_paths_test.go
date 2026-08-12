@@ -25,6 +25,16 @@ import (
 func testNewForkEnv(t *testing.T, clientID string) *testRejectionEnv {
 	t.Helper()
 	e := testNewRejectionEnv(t, clientID)
+	// The second save also carries a GRANT CHANGE, so the record it replaces is a real
+	// parent rather than a duplicate. Without it every fork test would have an empty delta,
+	// and the repair assertions at each mint site would be vacuous: an empty delta mints
+	// nothing by design. See sess_fork_repair.go.
+	e.sess.mu.Lock()
+	if e.sess.subs == nil {
+		e.sess.subs = map[string]byte{}
+	}
+	e.sess.subs[testForkEnvDeltaFilter] = 1
+	e.sess.mu.Unlock()
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("second save (the one that gives the record a parent): %v", err)
 	}
@@ -78,6 +88,14 @@ func TestSessRejectionProbeClassifiesLineage(t *testing.T) {
 
 			if got := e.sess.settleRecordRejection(e.asm); got != tc.want {
 				t.Fatalf("settleRecordRejection = %v, want %v", got, tc.want)
+			}
+			// The verdict is reached inside the probe's own record transaction, and that is
+			// where the repair is minted — covering both the unbound settlement here and the
+			// bound one, which never disposes at all. See sess_fork_repair.go.
+			if tc.want == mqttRejectionForked {
+				testAssertMinted(t, e)
+			} else {
+				testAssertNotMinted(t, e)
 			}
 			// Both verdicts dispose: the surviving record is authoritative whoever wrote
 			// it, and this object may not write. Only the CLAIM differs.
@@ -244,6 +262,13 @@ func TestSessForkOnAmbiguousResolution(t *testing.T) {
 			got, _ := e.sess.resolveUncertainWrite()
 			if got != tc.want {
 				t.Fatalf("resolveUncertainWrite = %v, want %v", got, tc.want)
+			}
+			// The resolver's first readback is a mint site: only a PROVEN sibling licenses a
+			// repair, so the successor row must record nothing. See sess_fork_repair.go.
+			if tc.want == mqttUncertainForked {
+				testAssertMinted(t, e)
+			} else {
+				testAssertNotMinted(t, e)
 			}
 		})
 	}
@@ -609,6 +634,18 @@ func TestSessForkedRollbackReportsForkedAndKeepsTheTimer(t *testing.T) {
 				t.Fatalf("expiry timer armed = %v, want %v: a forked record establishes no "+
 					"owner for the deadline, so the timer must survive; a real successor owns "+
 					"its own scheduling", armed, wantArmed)
+			}
+			// Test 16: this site mints like the other six, which is a CORRECTION rather than an
+			// omission repaired. Once a repair-bearing accept save has landed and this rollback
+			// finds a sibling of it, the grant the capsule contributed is durably erased again
+			// while the old capsule anchors a superseded survivor and will be dropped —
+			// refusing here would lose a grant this feature had just repaired. What makes it
+			// safe on a CONNECT that repaired nothing is the empty-delta property, asserted by
+			// TestForkRepairEmptyDeltaMintsNothing. See sess_fork_repair.go.
+			if tc.want == rollbackForked {
+				testAssertMinted(t, e)
+			} else {
+				testAssertNotMinted(t, e)
 			}
 		})
 	}

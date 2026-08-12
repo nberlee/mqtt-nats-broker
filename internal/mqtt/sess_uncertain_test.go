@@ -35,7 +35,10 @@ func testMarkUncertainCarrying(sess *mqttSession, baseSeq uint64, body []byte, v
 	// and not one invented beside them.
 	var ps mqttPersistedSession
 	_ = json.Unmarshal(body, &ps)
-	sess.markWriteUncertainLocked(baseSeq, body, framed, hdr, voidedRev, ps.WID, ps.PWID)
+	sess.markWriteUncertainLocked(&mqttSessSaveDetail{
+		baseSeq: baseSeq, body: body, framed: framed, hdr: hdr, voidedRegsRev: voidedRev,
+		wid: ps.WID, pwid: ps.PWID,
+	})
 }
 
 // testRecordBody returns the exact bytes a save of this session's current state

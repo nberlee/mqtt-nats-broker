@@ -133,3 +133,12 @@ survives
   review of the ambiguous affine provisioning reclaim, whose retention test now proves
   delivery after a REAL re-subscribe (`TestQ2AffineAmbiguousProvisioningKeepsAPathAMembershipOwns`)
   and deliberately does not claim delivery without one.
+
+### Downstream
+
+F-027's forked-record repair (closed 2026-08-12) excludes shared-subscription membership
+for exactly this ordering: the success CONNACK precedes shared restoration, so a
+re-asserted group membership would be durable while a per-filter failure leaves no join
+and no consumer — the accepted-but-dead state above. **F-027's repair set widens to shared
+membership when this closes**, and its snapshot constructor is where that exclusion lives
+(`sess_fork_repair.go`).

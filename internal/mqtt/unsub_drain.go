@@ -536,10 +536,16 @@ func (sess *mqttSession) dropDrainLocked(d *mqttDrain) string {
 	return sid
 }
 
-// restoreDrainLocked puts a dropped drain back under its original sid, undoing
-// dropDrainLocked when the save that would have made the drop durable failed.
+// restoreDrainLocked files a drain under a sid, in BOTH maps.
 //
-// sess.mu must be held.
+// It is the only two-map insertion in the package, and that is deliberate: drains alone is
+// not enough — the delivery callback finds a drain through drainByDur, drain recovery
+// queries that key, and a drain missing from it looks absent to everything except a
+// teardown. Three callers: undoing dropDrainLocked when the save that would have made the
+// drop durable failed, restoring the record's drains on a resume, and re-asserting a drain a
+// proven fork erased (sess_fork_repair.go).
+//
+// sess.mu must be held, or the session must not yet be reachable.
 func (sess *mqttSession) restoreDrainLocked(sid string, d *mqttDrain) {
 	if sid == _EMPTY_ || d == nil || d.cc == nil {
 		return
@@ -837,18 +843,8 @@ func (sess *mqttSession) restoreDrainsFromRecord(ps *mqttPersistedSession) {
 	if len(ps.Drains) == 0 {
 		return
 	}
-	sess.drains = make(map[string]*mqttDrain, len(ps.Drains))
-	sess.drainByDur = make(map[string]*mqttDrain, len(ps.Drains))
 	for sid, pd := range ps.Drains {
-		d := mqttDrainFromPersisted(pd)
-		if d == nil {
-			continue
-		}
-		sess.drains[sid] = d
-		sess.drainByDur[d.cc.Durable] = d
-	}
-	if len(sess.drains) == 0 {
-		sess.drains, sess.drainByDur = nil, nil
+		sess.restoreDrainLocked(sid, mqttDrainFromPersisted(pd))
 	}
 }
 

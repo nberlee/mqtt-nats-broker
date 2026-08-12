@@ -240,6 +240,17 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 		smsg, lerr = sess.jsa.loadSessionMsg(domainTk, idHash)
 	}
 	verdict := classifyRejectedProbe(outcome, detail, smsg, lerr, ackWID, ackPWID)
+	if verdict == mqttRejectionForked {
+		// Inside the fence that classified, and covering BOTH rejection halves at once —
+		// which is why the mint lives here rather than in either settlement's disposal arm.
+		// lockSessionForRecordRejection refuses while sess.c != nil, so the bound half is
+		// settled by settleRecordRejectionBound instead and never disposes; between its
+		// verdict and the asynchronous unbind the periodic settlement is refused, and the
+		// reconnect the 0x89 invited can arrive first. A mint in only one of the two arms
+		// would therefore miss whichever window happened to lose that race.
+		// See sess_fork_repair.go.
+		sess.mintForkedGrant(ackWID, ackPWID)
+	}
 	if verdict == mqttRejectionKeep && err != nil {
 		sess.jsa.c.Debugf("MQTT: rejection probe for session %q established nothing: %v", sess.id, err)
 	}

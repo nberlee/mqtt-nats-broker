@@ -79,20 +79,32 @@ per stream.
   cross-instance takeover), and a single-frontend alpha would defer the epic
   this project exists to deliver. The items below stop being conditional, and
   the dossier release-treatment lines record the same resolution.
-- [ ] [F-027: Repair a recognised session-record fork](findings/ha-arbitration.md#f-027).
-  **Very large.** Its create-only-CAS prerequisite is now in place (F-029 below), and
-  both blockers F-029 filed likely change the repair: a capsule re-asserted through the
-  accept-save CAS has to survive a re-drive, and a fork it cannot RECOGNISE it cannot
-  repair. The recoverable state is now DEFINED (Slice C of the arbitration
-  design): a fork's durable loss is exactly the record delta, and everything needed to
-  restore it is in the losing broker's memory at verdict time — so the repair is an
-  in-memory capsule minted at the forked verdict and re-asserted by that client's own
-  reconnect through the ordinary accept-save CAS, with no repair write and no durable
-  snapshot. That answers the four recorded rejections for the recoverable subset; it
-  is bounded repair, not general repair. Its own plan must additionally settle: the
-  reclaim's ordering behind the CONNECT's existing uncertainty resolution, all four
-  rejection-settlement verdicts, and `settleRecordRejection` being unbound-only while
-  a displaced connection may still be attached.
+- [x] [F-027: Repair a recognised session-record fork](findings/ha-arbitration.md#f-027).
+  **Slice C of the arbitration design.** A fork's durable loss is exactly the record
+  DELTA, and because `classifyRecordLineage` matches on a shared parent that parent is a
+  single-hop common ancestor — so the repair is a three-way merge against it, not a union.
+  A union was the trap: it resurrects a subscription the client was UNSUBACKed for,
+  because "absent from the survivor" is ambiguous between a lost addition and a
+  survivor-side removal, and only the parent's content disambiguates it. Two
+  record-sourced grant snapshots rotate at every landed adoption; a forked verdict at any
+  of seven classification points mints an in-memory capsule of the delta, inside the
+  transaction that classified; and the client's own reconnect re-asserts it through the
+  ORDINARY accept-save CAS, behind the record fence. No repair write, no worker, no
+  durable state, so the four recorded rejections are answered rather than waived, and the
+  repair inherits F-029's conditional write, rejection classification and T0/T1a/T1b/T2
+  re-drive. The whole coupled per-sid state is modelled — membership, the v5 options, both
+  identities of a multi-level filter, drains, cancelled-register verdicts and the PUBREL
+  consumer — as ten action rows over nine state pairs, with the conflict predicate drawn
+  at drain PRESENCE so a reconciliation-recreated durable is not read as a subscription
+  conflict. The three settle-items are settled: the reclaim sits behind the accept
+  transaction and therefore strictly after the CONNECT's uncertainty resolution on every
+  path; all four rejection verdicts are covered by one in-fence mint at
+  `probeRecordRejectionInTx`, which is also what covers `settleRecordRejection` being
+  unbound-only while a displaced connection is still attached. It is bounded repair, not
+  general repair: not a record this broker did not author, not across a restart, not a
+  filter the survivor decided about, and **not shared-subscription membership, which stays
+  excluded until F-050 closes** because the success CONNACK precedes shared restoration.
+  `docs/CONFORMANCE.md` states every bound and the cap-forfeiture residual.
 - [x] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
   **Slice B of the arbitration design.** Every session-record write is now conditional,
   base 0 included, which closes the defect found while designing it: a clean-start
@@ -310,6 +322,23 @@ operation can trigger correctness loss or unbounded resource growth.
 - [ ] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
   Keep basic diagnostics in alpha scope; automatic quarantine or repair may follow
   alpha if broker-owned state cannot create the malformed record.
+- [ ] Consolidate embedded NATS servers across the fork-repair test fixtures. **Test
+  infrastructure, not a broker gap.** `sess_fork_repair_test.go` starts one embedded
+  server per subtest through `testNewInflightEnv`/`runNATS` — roughly 37 for the file —
+  and that suite weight is the leading (not conclusively attributed) explanation for a
+  pre-existing timing-proxy test becoming flaky, which was resolved by replacing that test
+  with a deterministic barrier seam (F-027's implementation record has the full evidence
+  trail). Sharing one server per top-level test would cut ~25 of them, but it is NOT a
+  harmless count optimization; the constraints a plan must answer are recorded there: a
+  fresh `Server`+account-manager+connection+node name per subtest (a shared asm lets
+  `dropPersistObservations` installs clobber each other, and the hard-coded `node1` would
+  make managers read each other's `Origin` writes as local), per-subtest quit channels so
+  one sibling's cleanup cannot stop the shared server, a durable-name audit within each
+  sharing group, and lingering watch/retained consumers accumulating in the shared streams
+  up to the 5-minute inactivity threshold. Any fixture change re-runs F-027's full
+  mutation table, since shared state can mask a discriminator whose assertions are
+  unchanged.
+
 - [ ] Force two session-record proposals into the clustered pre-proposal window.
   **Test infrastructure, not a broker gap, and deliberately not a §0.2 blocker.**
   `TestMQTTTakeoverCreateRaceReplicated` asserts the property on a real Replicas=3

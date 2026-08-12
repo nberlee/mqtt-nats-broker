@@ -167,18 +167,22 @@ func (sess *mqttSession) parentForNextWriteLocked() string {
 	return sess.reMintedFrom
 }
 
-// adoptRecordLineageLocked adopts the lineage an attempt STAMPED, for a caller that has
-// just proven those exact bytes durable outside saveWithDetail's own success arm.
+// adoptRecordLineageLocked adopts the lineage AND the grant an attempt STAMPED, for a caller
+// that has just proven those exact bytes durable outside saveWithDetail's own success arm.
 //
-// It exists as a named step beside every `sess.seq = ...` adoption because the two are
-// one fact: the record now at that sequence is the one carrying this identity, and a
-// site that moved the sequence while leaving the lineage stale would parent the session's
-// NEXT write to a record that is no longer the base — after which every genuine sibling
-// of the real base classifies as unrelated and concedes.
+// It exists as a named step beside every `sess.seq = ...` adoption because the three are
+// one fact: the record now at that sequence is the one carrying this identity and these
+// bytes. A site that moved the sequence while leaving the lineage stale would parent the
+// session's NEXT write to a record that is no longer the base — after which every genuine
+// sibling of the real base classifies as unrelated and concedes. A site that moved the
+// lineage while leaving the BYTES stale would then compute a fork's repair against a record
+// two writes back, and re-assert state the client never held. Both belong here rather than
+// at each landed arm, so a future proof site cannot adopt one without the other.
 //
 // sess.mu must be held.
 func (sess *mqttSession) adoptRecordLineageLocked(d *mqttSessSaveDetail) {
 	sess.wid, sess.pwid = d.wid, d.pwid
+	sess.adoptGrantBodyLocked(d.body)
 }
 
 // mqttDecodeSessionRecord decodes a loaded record for the lineage question only.
@@ -324,6 +328,10 @@ func (sess *mqttSession) disposalForDirectRejection(d *mqttSessSaveDetail) mqttD
 	sess.mu.Unlock()
 	if smsg.Sequence > d.baseSeq &&
 		classifyRecordLineage(mqttDecodeSessionRecord(smsg), ackWID, ackPWID) == mqttLineageForked {
+		// The 10071 arms of both CONNECT-time saves reach their verdict here, and both
+		// callers hold a record transaction on this goroutine, so this is the in-fence mint
+		// for the reconcile and lifetime paths. See sess_fork_repair.go.
+		sess.mintForkedGrant(ackWID, ackPWID)
 		return mqttDisposalForked
 	}
 	return mqttDisposalTakenOver

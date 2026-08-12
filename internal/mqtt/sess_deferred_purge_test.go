@@ -1323,11 +1323,18 @@ func (e *testDeferredEnv) testContendedAttempt(t *testing.T) mqttSessSaveDetail 
 	}
 	mqttTestSessStoreSuppressV.Store(false)
 	// Back to the pre-attempt state: the base sequence AND the lineage the session was
-	// acknowledged for, which a failed save never moved.
+	// acknowledged for, which a failed save never moved. The grant pair is captured and put
+	// back verbatim rather than handed to the rotation, for the same reason: a failed save
+	// moves neither body, and rotating the current one into itself would make the session its
+	// own parent and leave the next fork with an empty delta.
 	e.sess.mu.Lock()
 	ackWID, ackPWID := e.sess.wid, e.sess.pwid
+	body, bodyParent := e.sess.grantBody, e.sess.grantBodyParent
 	e.sess.mu.Unlock()
-	e.sess.clearUncertaintyLocked(d.baseSeq, ackWID, ackPWID)
+	e.sess.clearUncertaintyLocked(d.baseSeq, ackWID, ackPWID, body)
+	e.sess.mu.Lock()
+	e.sess.grantBody, e.sess.grantBodyParent = body, bodyParent
+	e.sess.mu.Unlock()
 	if d.voidedRegsRev == 0 {
 		t.Fatal("the attempt must carry the revision it marshalled")
 	}

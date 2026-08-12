@@ -89,6 +89,13 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 				t.Fatalf("reason codes %x, want exactly one %x (wire %x)",
 					reasons, tc.want, b.out.bytes())
 			}
+			// disposalForDirectRejection reaches its verdict inside the caller's record
+			// transaction, which is where the repair is minted. See sess_fork_repair.go.
+			if tc.want == mqttReasonServerBusy {
+				testAssertMinted(t, e.testRejectionEnv)
+			} else {
+				testAssertNotMinted(t, e.testRejectionEnv)
+			}
 		})
 	}
 }
@@ -137,14 +144,24 @@ func TestSessForkedAtConnectTimeContendedInLoop(t *testing.T) {
 			// re-read inside resolveContendedRecordSave takes the moved arm, before the
 			// retry budget is touched.
 			stop := testForceContendedRejection(t, e.sess)
-			_, detail, serr := testSaveClassified(t, e.sess)
+			_, detail, release, serr := testSaveClassifiedHeld(t, e.sess)
 			stop()
 			if serr == nil {
+				release()
 				t.Fatal("the forced save must be rejected")
 			}
 
-			if got := e.sess.resolveContendedRecordSave(&detail); got != tc.want {
+			// The fence is still HELD, as the CONNECT holds it: this is where the fork is
+			// classified and therefore where its repair is minted.
+			got := e.sess.resolveContendedRecordSave(&detail)
+			release()
+			if got != tc.want {
 				t.Fatalf("resolveContendedRecordSave (in-loop arm) = %v, want %v", got, tc.want)
+			}
+			if tc.want == mqttRepairSaveForked {
+				testAssertMinted(t, e.testRejectionEnv)
+			} else {
+				testAssertNotMinted(t, e.testRejectionEnv)
 			}
 		})
 	}
@@ -351,6 +368,25 @@ func testSaveClassified(t *testing.T, sess *mqttSession) (saveOutcome, mqttSessS
 	return outcome, detail, err
 }
 
+// testSaveClassifiedHeld is testSaveClassified with the transaction LEFT OPEN, and it returns
+// the release.
+//
+// resolveContendedRecordSave runs inside the CONNECT's own transaction in production, and it
+// classifies a fork there — so a test that closed the fence first could not show the mint
+// happening under it, and would pass against an implementation that minted from a released
+// fence. See sess_fork_repair.go.
+func testSaveClassifiedHeld(t *testing.T, sess *mqttSession) (saveOutcome, mqttSessSaveDetail, func(), error) {
+	t.Helper()
+	tok := sess.beginRecordTx()
+	outcome, detail, err := sess.saveClassifiedDetail(tok)
+	release := func() {
+		if terr := sess.endRecordTx(tok); terr != nil {
+			t.Fatalf("endRecordTx: %v", terr)
+		}
+	}
+	return outcome, detail, release, err
+}
+
 // testLandUnrelated stages a record from a lineage that shares nothing with ours — neither
 // our identity nor our parent — which is Codex round 1's competing-branch counterexample.
 func testLandUnrelated(t *testing.T, e *testInflightEnv, mutate func(*mqttPersistedSession)) *mqttPersistedSession {
@@ -421,6 +457,13 @@ func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
 			if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != tc.want {
 				t.Fatalf("reason codes %x, want exactly one %x (wire %x)",
 					reasons, tc.want, b.out.bytes())
+			}
+			// disposalForDirectRejection reaches its verdict inside the caller's record
+			// transaction, which is where the repair is minted. See sess_fork_repair.go.
+			if tc.want == mqttReasonServerBusy {
+				testAssertMinted(t, e)
+			} else {
+				testAssertNotMinted(t, e)
 			}
 		})
 	}

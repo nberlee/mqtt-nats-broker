@@ -10,8 +10,8 @@ section 0.2), so every finding here is an unconditional alpha blocker.
 The one arbitration design these findings share was made on 2026-08-11 and is sliced
 in dependency order: Slice A (the observation and convergence backbone) landed first
 and NARROWED F-036 without closing it, F-029 is Slice B and closed on 2026-08-11
-leaving F-029a and F-029b behind, F-027 is Slice C. Each remaining
-slice gets its own
+leaving F-029a and F-029b behind, and F-027 is Slice C, closed on 2026-08-12. Each
+remaining slice gets its own
 implementation-depth plan against that design; the roadmap bullets carry the
 constraints each must answer.
 
@@ -22,7 +22,9 @@ it existed on 2026-08-10.
 
 **Title:** Repair a recognised session-record fork
 
-- Status: Open
+- Status: **Closed 2026-08-12** (Slice C), for the recoverable subset; every bound is
+  recorded in `docs/CONFORMANCE.md`, and shared-subscription membership stays excluded
+  until F-050 closes
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 27
@@ -37,6 +39,35 @@ it existed on 2026-08-10.
   `mqttSessSaveDetail`), its worker races a same-broker reconnect with no ownership guard,
   and the repair CAS is itself exposed to the window it repairs. Any future attempt has to
   answer all four.
+
+### What closed it
+
+A fork's durable loss is exactly the record DELTA. The anchor condition
+`classifyRecordLineage` tests means the survivor and the erased record are siblings of ONE
+NAMED parent, so that parent is a single-hop common ancestor and a three-way merge against
+it is well defined — which is what a union cannot be: with base `{a}`, ours `{a,b}` and a
+survivor `{}` carrying an acknowledged UNSUBSCRIBE of `a`, a union resurrects `a`, because
+"absent from the survivor" is ambiguous between a lost addition and a survivor-side
+removal.
+
+Two grant snapshots, both built from the persisted RECORD rather than from memory, rotate
+at every adoption that can later mint. A forked verdict at any of seven classification
+points mints an in-memory capsule of the delta, inside the transaction that classified.
+The client's own reconnect re-asserts it through the ordinary accept-save CAS, behind the
+record fence and strictly after the CONNECT's uncertainty resolution.
+
+That answers the four rejections rather than waiving them: generation-anchored, so a
+retired incarnation can never be resurrected; a semantic delta rather than a byte replay,
+so no snapshot `save()` discards is needed; no worker and no repair write, so nothing
+races a same-broker reconnect; and the write IS the accept save, so it inherits F-029's
+conditional arbitration, rejection classification and re-drive instead of opening a window
+of its own.
+
+The repair claim is: an acknowledged SUBSCRIBE or UNSUBSCRIBE a proven fork erased is
+re-asserted **where the survivor made no grant decision about the same filter**. It is NOT
+that every recognised loss is recovered — a conflict is left to the survivor and counted,
+a restart forfeits the capsule, and the cardinality bound forfeits the oldest client's.
+See "Repairing a recognised fork" in `docs/ARCHITECTURE.md`.
 
 ## F-029
 

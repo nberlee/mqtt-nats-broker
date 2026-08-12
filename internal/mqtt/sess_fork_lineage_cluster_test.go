@@ -168,3 +168,79 @@ func TestMQTTSessLineageSurvivesNodeRestart(t *testing.T) {
 			ps.WID, ps.PWID, wantWID, wantPWID)
 	}
 }
+
+// TestMQTTForkedRecordRepairOnAReplicatedStream is test 23: the repair property over REAL
+// replicated JetStream.
+//
+// Everything else about the repair runs against one embedded stream, where "the grant
+// serializes" and "the grant survives replication" are the same statement. They are not: the
+// parent snapshot a capsule is measured against comes from a record that has been through
+// Raft, and the accept save that applies the merge is a per-subject CAS on a Replicas=3
+// stream — the very write whose non-linearizability across a leader term is what produces
+// forks in the first place.
+//
+// The assertion that matters is the last one: a re-asserted membership DELIVERS. A record
+// that merely mentions the filter would satisfy everything above it.
+func TestMQTTForkedRecordRepairOnAReplicatedStream(t *testing.T) {
+	oldTimeout := testMQTTTimeout
+	testMQTTTimeout = 40 * time.Second
+	defer func() { testMQTTTimeout = oldTimeout }()
+
+	c := testNewJetStreamCluster(t, 3)
+	b := c.startBroker(t, 0)
+	defer b.cleanup()
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
+
+	const cid = "repair-replicated"
+	ci := &mqttConnInfo{clientID: cid, cleanSess: false}
+	c1, r1 := testMQTTConnect(t, ci, b.opts.MQTT.Host, b.opts.MQTT.Port)
+	testMQTTCheckConnAck(t, r1, mqttConnAckRCConnectionAccepted, false)
+	// The SUBSCRIBE's save is the record a sibling will erase, and the accept save before it
+	// is that record's parent — so the delta is exactly this acknowledged SUBSCRIBE.
+	testMQTTSub(t, 1, c1, r1, []*mqttFilter{{filter: "repair/replicated", qos: 1}}, []byte{1})
+	testMQTTFlush(t, c1, nil, r1)
+
+	sess := testMQTTGetClient(t, b.s, cid).mqtt.sess
+	if sess == nil {
+		t.Fatal("the broker must be bound to a session")
+	}
+	asm := testMQTTGetGlobalASM(t, b.s)
+	idHash := sess.idHash
+	asm.mu.Lock()
+	asm.testSessPersistDrop = func(h string) bool { return h == idHash }
+	asm.mu.Unlock()
+
+	// An unresolved write whose bytes never reached the stream, then a sibling of the
+	// acknowledged record: the resolver's readback finds a record that is provably no
+	// successor of ours, which is the verdict that mints.
+	mqttTestSessStoreSuppressV.Store(true)
+	_ = testSessSave(t, sess)
+	mqttTestSessStoreSuppressV.Store(false)
+	if !sess.isSeqUncertain() {
+		t.Fatal("the suppressed save must leave the session unresolved")
+	}
+	testE2ELandSibling(t, sess)
+
+	testMQTTDisconnect(t, c1, nil)
+	c1.Close()
+
+	c2, r2 := testMQTTConnect(t, ci, b.opts.MQTT.Host, b.opts.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+
+	sess2 := testMQTTGetClient(t, b.s, cid).mqtt.sess
+	if sess2 == nil || sess2 == sess {
+		t.Fatal("the forked resolution must evict the stale object and rebuild from the record")
+	}
+	sess2.mu.Lock()
+	ps := sess2.buildPersistedSessionLocked()
+	sess2.mu.Unlock()
+	if _, ok := ps.Subs["repair.replicated"]; !ok {
+		t.Fatalf("the replicated record must carry the re-asserted SUBSCRIBE: %v", ps.Subs)
+	}
+	if _, ok := ps.Subs["forked/e2e/marker"]; !ok {
+		t.Fatalf("the surviving record's own membership must be preserved: %v", ps.Subs)
+	}
+	testMQTTPublish(t, c2, r2, 1, false, false, "repair/replicated", 1, []byte("replicated"))
+	testMQTTCheckPubMsg(t, c2, r2, "repair/replicated", mqttPubQos1, []byte("replicated"))
+}

@@ -780,12 +780,12 @@ String, log line and close reason. Passing a reason code alone emits 0x89 alongs
 to withhold. **0x89 "server busy, try again later"** is the point of the whole mechanism —
 it invites the reconnect that resolves the ambiguity, where 0x8E forbids it.
 
-**This detects; it never repairs.** The forked record stays, the rightful owner's granted
-state is still lost, and the verdict licenses no write of its own. It does not even prove
-the survivor erased us — a teardown claim is itself a full-body CAS off the same base — only
-that the survivor is no successor of ours. An absent `WID` concedes through arm 2's guard
-rather than through a legacy branch, so there is no alternate code path and no
-mixed-version machinery. `docs/CONFORMANCE.md` states what is left open.
+**This detects. What it recognises is then REPAIRED, for the recoverable subset, by
+"Repairing a recognised fork" below.** The verdict itself still licenses no write of its
+own, and it does not prove the survivor erased us — a teardown claim is itself a full-body
+CAS off the same base — only that the survivor is no successor of ours. An absent `WID`
+concedes through arm 2's guard rather than through a legacy branch, so there is no alternate
+code path and no mixed-version machinery. `docs/CONFORMANCE.md` states what is left open.
 
 **The persist-observation consult** (`processSessionPersist` →
 `evictDisplacedOnRemotePersist`, `mqtt.go`) is the route that turns a fork into
@@ -857,6 +857,238 @@ On the takeover verdict the worker cancels the displaced incarnation's delayed-W
 outbox records, scoped by generation and origin sequence, inline (it is already off the
 delivery goroutine and tracked). On the forked verdict that scan does not run: the
 records stay pending, and their fate at `FireAt` still belongs to the fire-time fences.
+
+### Repairing a recognised fork
+
+Recognition stops a false takeover claim; it does not give the client back the
+subscriptions it was SUBACKed for, nor the UNSUBSCRIBEs it was UNSUBACKed for. MQTT
+requires the Session State to carry the client's subscriptions ([MQTT-4.1.0-1], Spec5
+[4.1.1]), so that loss is a conformance break. `sess_fork_repair.go` closes the
+recoverable subset of it, and everything below is memory-only: no persisted field, no
+encoding change, no new stream or subject.
+
+**What is recoverable is the record DELTA.** The anchor condition (`found.PWID ==
+ackPWID`) means the survivor and our erased record are siblings of one NAMED parent, so
+that parent is a single-hop common ancestor and a three-way merge against it is well
+defined.
+
+**A union is wrong, and this is the trap the design exists to avoid.** The verdict proves
+siblinghood only — explicitly *not* that the survivor erased us. With base `P = {a}`, our
+child `X = {a,b}` and a survivor `Y = {}` carrying an **acknowledged UNSUBSCRIBE of `a`**,
+a union yields `{a,b}` and resurrects a subscription the client was UNSUBACKed for.
+"Absent from the survivor" is ambiguous between "our addition was erased" and "the
+survivor removed a base field"; only the parent's content disambiguates it.
+
+**Two retained record BODIES** (`grantBody`, `grantBodyParent` on `mqttSession`): the
+exact bytes of the record `wid` names and of the record `pwid` names. The grant itself —
+the per-filter map plus the two session-scoped members, the cancelled-register nonces and
+the PUBREL consumer — is materialised from those bytes by one constructor, and only on the
+rare fork path.
+
+Bytes rather than a built grant, because building it eagerly put O(grant size) work on the
+save path: an earlier revision constructed the full grant inside `saveWithDetail` while
+holding `sess.mu`, on every save ATTEMPT including rejected ones and retries. With
+`MaxSubs` unset the grant is unbounded, and `BenchmarkGrantMaterialise` measures 2.7 us at
+one filter, 189 us at 100 and **2.5 ms at 1000** — milliseconds under the session lock per
+attempt. Retaining the body instead costs two slice assignments and no allocation
+(`BenchmarkGrantBodyRotation`, 13 ns), because the save that is landing has already
+marshalled it.
+
+The bytes are immutable by construction: `json.Marshal` hands out a fresh buffer per call
+and the CAS framing copies into its own, so nothing ever writes through the retained
+slices. That is also a STRONGER provenance than a snapshot of live memory could be —
+`buildPersistedSessionLocked` returns `sess.subs`, `sess.subIDs` and `sess.sharedSubs` by
+reference and shares `*ConsumerConfig` pointers, so a memory-sourced snapshot would alias
+state that keeps changing. And it inherits one rule for free: the writer omits a drain
+that claims nothing, so the retained record can never re-assert a reference to a durable
+whose deletion is already licensed.
+
+The retention is **bounded**, not trusted: a record over `mqttGrantBodyMax` (64 KiB) is
+not retained at all, and the session forgoes the repair rather than doubling its
+footprint. Both bodies are cleared together in that case, because a parent whose child is
+unknown computes no delta either. Stated as a residual in `docs/CONFORMANCE.md`.
+
+**And the bound fails CLOSED on the survivor side.** The anchor consults only lineage, so
+it still licenses a merge when the restore retained no body — an oversize survivor, or
+bytes that stopped decoding. A survivor grant defaulted to empty there would make every
+conflict invisible and invert survivor-wins: filters the survivor decided about would read
+as absent-therefore-unconflicted, and the losing branch would overwrite them. The reclaim
+therefore refuses the WHOLE merge for that pass when the survivor's grant cannot be
+materialised — no per-filter fallback, no partial repair — and `mergeForkedGrantLocked`
+takes the grant as a parameter so the fail-open default is unrepresentable. The capsule is
+RETAINED across the refusal, not discarded: this pass's accept save can itself be rejected
+and T2-re-driven onto a SECOND sibling of the same parent — the same leader-transition
+mechanism that forked the record — and a smaller, readable sibling still satisfies the
+anchor, so the repair applies on that pass. Once an accept save lands, the record is ours
+and the anchor drops the capsule on the next reconnect; until then the cap bounds it like
+every retained capsule. (The refusal is the holistic review's second round; the retention
+is its third, correcting the second's own discard recommendation.)
+
+**Rotation** happens at every adoption that can later mint, and the source is always the
+exact record adopted: the resume restore (the loaded bytes, parent nil),
+`saveWithDetail`'s success arm (the body it marshalled), and `adoptRecordLineageLocked`,
+which every landed-proof site already calls beside its `sess.seq` adoption. Because the
+body already rides `mqttSessSaveDetail` as `d.body`, and `mqttPendingWrite` already
+carries it inside `framed`, no field was added to either. The restore sets the parent
+**nil**, which is the honest answer: this broker holds no copy of that record's own
+parent, so nothing about it is repairable. `clear()` drops both — and that asymmetry
+against `reMintedFrom` is the point: a sibling of the retired base must stay RECOGNISABLE,
+but nothing of the retired incarnation may be RE-ASSERTED into the fresh one. **The
+invariant is not "`grantBodyParent` always names `pwid`"; it is "a nil body means nothing
+is repairable".**
+
+**The grant representation.** One filter is one compound value, because QoS, No Local,
+Retain As Published and the Subscription Identifier are ONE grant and merging them
+independently resurrects stale options. `mqttGrantTerms` holds that acknowledged half as
+comparable scalars; `sids` holds the per-sid durable state, which is EXCLUSIVE — a live
+consumer or a drain, never both, the invariant `stageDrain` and `adoptDrainLocked`
+maintain. A multi-level filter has TWO identities, the main sid and the level-up
+companion, and a persisted sid is mapped back to its filter by
+`buildPersistedSessionLocked`'s own reversal (`mqttUnsubSids` is forward-only, and a
+record can persist a companion's drain after the filter is gone).
+
+**The conflict predicate is membership, the options, and each sid's DRAIN PRESENCE** — not
+the `*ConsumerConfig` contents, not whether a consumer identity is present at all, and not
+a drain's started set. That line is exactly the one between a grant decision and its
+implementation. A shape change is a grant consequence: only an acknowledged UNSUBSCRIBE
+turns a live sid into a draining one. Consumer identity is not — the resume reconciliation
+recreates a reaped durable with no MQTT decision behind it, so comparing identity would
+turn a server-side repair into a subscription conflict and suppress a correct repair. A
+drain's started set is in-flight accounting both sides advance independently, so it is
+carried, compared only when both sides drain, and never merged entry by entry. **Delta**
+equality (base vs ours) adds drain CONTENT and excludes consumer identity entirely; drain
+equality, wherever used, is order-independent, keyed by `Seq`, over every
+`mqttPersistedDrainSeq` field, because `startedSeqs` ranges a map and slice order carries
+no meaning.
+
+**The capsule** (`mqttForkedGrant`) is the delta, held on the account manager keyed by
+client ID: the generation and the `(ackWID, ackPWID)` pair the verdict was reached
+against, the per-filter changes, the cancelled-register nonces our record held and the
+survivor's does not, and the PUBREL consumer. `CancelledRegs` is carried by **union**,
+because the set is a monotonically accumulating record of fact, and it is merged through
+`voidRegNonceLocked` rather than by assigning the map: the restore asserts the restored
+set is already durable, so a merged nonce must be marked NOT durable, and that helper's
+own insertion revision is what makes credit-every-landed-save persist it. The PUBREL
+consumer is installed only where the survivor has NONE, and **never compared**: the
+durable name is deterministic per generation but the config around it is not, so two
+branches of one generation can hold different configs for one durable. Nothing else is
+carried — `Will`, `ExpiryInterval`, `DisconnectedAt` and `Clean` are per-connection terms
+the reconnecting CONNECT establishes, `Origin`/`ID` are identity, `Gen`/`WID`/`PWID` are
+the anchor, `Q2Aff*` belongs to the affine path's own reclaim, `Teardown` is a marker, and
+`SharedSubs` is excluded pending F-050 (the success CONNACK precedes shared restoration,
+so a re-asserted group membership would be durable while a per-filter failure leaves no
+join and no consumer — the accepted-but-dead state F-050 records).
+
+**Seven mint sites, at the point the verdict is MADE.** Every disposition arm returns
+after its record transaction is released, so minting at the classification point is what
+samples the record and the pair under one fence: `probeRecordRejectionInTx` (covering the
+bound and unbound rejection halves at once — the bound half never disposes, and between
+its verdict and the asynchronous unbind the reconnect can arrive first), both
+`classifyAttemptReadback` callers (the initial readback and the post-re-attempt one are
+separate classifications), `resolveContendedRecordSave`'s moved closure,
+`disposalForDirectRejection`, `evictDecideOnce`, and `rollbackAcceptedSession`'s classify.
+**There is no site-specific refusal**, including at the rollback: once a repair-bearing
+accept save has landed and the rollback finds a sibling of it, the grant the capsule
+contributed is durably erased again, so refusing there would lose a grant this feature had
+just repaired. What makes that safe on a CONNECT that repaired nothing is a property, not
+a special case — **an empty delta mints nothing**, and "empty" means no changes, no nonces
+and no PUBREL consumer, since those are independent persisted members. No other verdict
+mints: the write landed (`mqttRejectionOurs`), contention is never ownership (`Keep`),
+nothing was established (`Unresolved`), and a demonstrated successor descends from our
+record so our change is in its ancestry. `evictDecideOnce` holds `as.mu` for its whole
+decision and calls a `...Locked` form; the other six take `as.mu` themselves. Two named
+functions, not one that guesses.
+
+**The applier is the client's own CONNECT.** `reassertForkedGrantInto` runs in
+`mqttProcessConnect` immediately after the accept record transaction opens and before that
+block's own mutations, because a transaction that begins after the mutation it protects
+cannot make that mutation invisible to another writer — and the `sessLocked` ownership
+gate is not a `recordTx`. That placement makes one call serve both entry states (restored
+and resident), puts the merge immediately before the save that persists it, and is
+strictly after the CONNECT's own uncertainty resolution on every path including the
+re-driven ones. A clean start needs no special case: `clear()` re-mints the generation
+earlier in the same function, after which the anchor cannot match ([MQTT-3.1.2-6]). **No
+repair write, no worker, no durable state** — the accept save's existing CAS is what
+persists the merge, so the repair inherits its conditional arbitration, its rejection
+classification and its T0/T1a/T1b/T2 re-drive.
+
+**The anchor has THREE outcomes**, and it re-evaluates the licence rather than remembering
+it:
+
+- `wid == ackWID` → **keep**. A resident object that has not re-read the record still
+  carries the capsule's own base, so the forked test would say not-forked and a
+  two-outcome anchor would drop a capsule that is still valid. Keeping costs nothing: that
+  accept save CASes at a sequence the record has moved past, is definitely rejected, and
+  T2 re-drives to the authoritative restore, whose pass merges — which is also what
+  preserves the no-extra-reconnect property.
+- lineage forked against `(ackWID, ackPWID)` **and** `gen == g.gen` → **merge**. The
+  generation conjunct is separately load-bearing because `classifyRecordLineage`
+  deliberately ignores the generation: a clean-start sibling is parented across the
+  teardown re-mint, so it classifies forked while belonging to an incarnation a teardown
+  destroyed.
+- otherwise → **drop**. Any write since the verdict makes the current record a CHILD of
+  the survivor.
+
+The anchor does **not** arbitrate ownership of the re-asserted state. Only the accept
+save's expected-sequence CAS does that, and it linearizes only within a leader term.
+
+**Capsule lifecycle.** A merge does not consume it: within the reclaim only the anchor
+refusing it removes it, and the accept save landing is what makes the anchor refuse. So a
+CONNECT that merges and then fails forfeits nothing and a re-drive simply re-merges,
+idempotently, because the merge is a function of the survivor's content. Lookup does not
+remove; the delete happens only on `drop` and only under pointer identity, so a capsule
+minted by a newer verdict in between is not deleted by a stale decision. Two mechanisms
+remove one from outside the reclaim, and they are separate rather than exceptions: a later
+mint for the same client supersedes it, and `mqttForkedGrantMax` (256) evicts the oldest
+by mint time. The anchor bounds HARM; the cap bounds MEMORY — a successful repair leaves
+an entry behind by design. There is deliberately **no TTL**: an old but still-anchored
+capsule is a correct repair, so a TTL would only add a second reason to refuse one.
+
+**The apply rule has two halves from different sides.** The GRANT becomes ours —
+membership, the options, and each sid's drain presence — because that is the acknowledged
+decision the fork erased. The CONSUMER IDENTITY stays the survivor's wherever the
+resulting state is LIVE, because identity is never a grant decision and the reconciliation
+resolves the durable and deliver subject from whichever config the session holds. And **a
+resulting DRAIN always keeps its own persisted `Cons`**: `drainByDur` is keyed by it,
+in-flight registers correlate through the durable they were created under, drain recovery
+queries that durable's consumer state, and completion deletes it — so re-pointing our
+drain at a survivor's live durable would evaluate our started sequences against another
+consumer's ack state, orphan our registers and eventually delete the wrong durable.
+
+A change applies only where `mqttSurvivorDecidedGrant` is false — only where the
+survivor's grant for that filter equals the parent's. The one refused row below is refused
+PER SID, not per filter, and that is not a half-measure: a drained sid has no membership
+on either side, so no membership change can accompany it, and a multi-level filter's two
+sids drain and complete independently, so refusing one must not withdraw the other. Ten
+action rows over nine state pairs, no row unreachable:
+
+| survivor sid | ours sid | action |
+|---|---|---|
+| absent | live | install `cons[sid]` from ours |
+| absent | draining | rebuild with `mqttDrainFromPersisted` and file it in BOTH maps (`restoreDrainLocked`) |
+| live | absent | delete `cons[sid]` |
+| live | draining | delete `cons[sid]`, install our drain **with its own `Cons`**; the survivor's displaced live consumer goes to the orphan sweep |
+| draining | live | `adoptDrainLocked(sid)` — keeps the durable; the started obligations are re-established by the later durable scans |
+| draining | draining, equal | nothing |
+| draining | draining, differing | **refused**, a conflict. Losing nothing: the base was already draining, a committed drain adds no fresh claims and completion only removes them, so the survivor still names everything it says is owed |
+| draining | absent | drop both map entries, delete NO durable. Reachable through last-claim completion: our record's omission IS the acknowledged completion, and `finishDrainIfEmpty` already deleted the durable after proving its own save |
+| absent | absent | nothing |
+| live | live | **nothing — the survivor's config is preserved**, stated explicitly rather than by omission; installing ours would repoint delivery at a durable the survivor may have replaced |
+
+Every sid, not just the main one: a removal that dropped only the main sid would leave a
+stale `cons` entry that is invisible durably (the writer omits a consumer whose filter is
+absent) but makes `processJSConsumer`'s existing-consumer arm return on a later
+re-SUBSCRIBE without rebuilding delivery interest, so that filter silently stops
+delivering. A re-asserted removal keeps its drain's durable referenced, which is how the
+started deliveries [MQTT-3.10.4-3] requires survive. **The reclaim deletes no durable on
+any row**, creates none, and installs no delivery interest of its own — an addition whose
+durable was reaped is recreated by the resume reconciliation's absent arm, which runs
+after the merge and before the CONNACK. Charge accounting needs no transfer, and that is
+provable rather than assumed: a merge is only reachable on a session that restored the
+survivor's record this pass (no local save can produce the survivor's lineage pair), and
+record-restored consumers and drains are deliberately uncharged. One `Warnf` per merge
+names what was re-asserted and what was left to the survivor, so a non-repair is counted
+rather than guessed at.
 
 ### A definite record-CAS rejection is outstanding work
 

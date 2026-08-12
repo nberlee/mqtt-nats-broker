@@ -872,6 +872,11 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 		// the base stays foreign fail-safe whatever its identity says.
 		if smsg != nil && smsg.Sequence > d.baseSeq &&
 			classifyRecordLineage(mqttDecodeSessionRecord(smsg), ackWID, ackPWID) == mqttLineageForked {
+			// One mint for both of this function's moved arms, in the closure that reaches
+			// the verdict — the reconcile-contended and lifetime-contended callers share it,
+			// so the record and the pair are sampled together whichever one asked.
+			// See sess_fork_repair.go.
+			sess.mintForkedGrant(ackWID, ackPWID)
 			return mqttRepairSaveForked
 		}
 		return mqttRepairSaveForeign
@@ -885,7 +890,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// establishes the pending-write state itself, carrying the base and
 			// digest, so the deferred readback classifies THIS attempt.
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev, d.wid, d.pwid)
+			sess.markWriteUncertainLocked(d)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		case mqttRecordAttemptGone:
@@ -911,7 +916,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			// The retry's outcome is unknown (a timeout, a lost response). Same
 			// pending-write discipline as the unreadable re-read above.
 			sess.mu.Lock()
-			sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev, d.wid, d.pwid)
+			sess.markWriteUncertainLocked(d)
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		default: // mqttRecordAttemptMoved
@@ -942,7 +947,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	switch classifyRecordAgainstAttempt(smsg, lerr, d.baseSeq) {
 	case mqttRecordAttemptUnreadable:
 		sess.mu.Lock()
-		sess.markWriteUncertainLocked(d.baseSeq, d.body, d.framed, d.hdr, d.voidedRegsRev, d.wid, d.pwid)
+		sess.markWriteUncertainLocked(d)
 		sess.mu.Unlock()
 		return mqttRepairSaveUnresolved
 	case mqttRecordAttemptGone:

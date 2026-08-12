@@ -569,6 +569,23 @@ var mqttTestSuppressMsgTTLV atomic.Bool
 // sess.seq stale and drives the three-way readback.
 var mqttTestSessStoreResultHookV atomic.Pointer[func(sess *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error)]
 
+// mqttTestSubsBarrierHeldHookV fires inside processSubs with the subs barrier HELD and
+// before any JetStream consumer has been created, which is the window interest-based
+// retention makes dangerous: a QoS 1/2 message stored there finds no interest and is
+// discarded outright rather than delayed. A test blocks in it to prove the barrier holds a
+// concurrent store, instead of staggering the two with a sleep and hoping. nil in production.
+var mqttTestSubsBarrierHeldHookV atomic.Pointer[func(filters []*mqttFilter)]
+
+func setMQTTTestSubsBarrierHeldHook(h func(filters []*mqttFilter)) func() {
+	prev := mqttTestSubsBarrierHeldHookV.Load()
+	if h == nil {
+		mqttTestSubsBarrierHeldHookV.Store(nil)
+	} else {
+		mqttTestSubsBarrierHeldHookV.Store(&h)
+	}
+	return func() { mqttTestSubsBarrierHeldHookV.Store(prev) }
+}
+
 // mqttTestSessStoreSuppressV drops a session-record store before it is issued and
 // reports an unclassifiable error, producing an ambiguous failure whose write
 // genuinely did NOT land. See storeSessionMsg.
@@ -789,10 +806,17 @@ type mqttAccountSessionManager struct {
 	// distinct refused subjects, and never cleared because a refused record is
 	// permanent until an operator removes it. See refuseWillOutboxRecord.
 	refusedWillRecords map[string]struct{}
-	retmsgs            *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
-	rmsCache           *sync.Map                              // map[subject]mqttRetainedMsg
-	jsa                mqttJSA
-	domainTk           string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+	// forkedGrants holds, per MQTT client ID, the grant a PROVEN session-record fork
+	// erased, waiting for that client's own reconnect to re-assert it through the ordinary
+	// accept save. Guarded by mu, bounded by mqttForkedGrantMax, and memory-only: a restart
+	// forfeits a repair and breaks nothing. Entries are removed when a reconnect's anchor
+	// refuses them, superseded by a later verdict for the same client, or evicted by the
+	// bound. See sess_fork_repair.go.
+	forkedGrants map[string]*mqttForkedGrant
+	retmsgs      *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
+	rmsCache     *sync.Map                              // map[subject]mqttRetainedMsg
+	jsa          mqttJSA
+	domainTk     string // Domain (with trailing "."), or possibly empty. This is added to session subject.
 
 	// sessStreamEpoch is the $MQTT_sess incarnation identity resolved once at
 	// account-manager init from the stream's mqtt_sess_epoch metadata (form
@@ -1382,6 +1406,27 @@ type mqttSession struct {
 	// share a parent. Memory-only, and self-retiring — once a save lands, wid is
 	// non-empty and this is never consulted again. See sess_fork_lineage.go.
 	reMintedFrom string
+	// grantBody / grantBodyParent are the RECORD BYTES of the record wid names and of the
+	// record pwid names — the fourth and fifth lineage facts, and the two a fork's repair is
+	// computed from. Their delta is exactly what a sibling of that parent erased, and a
+	// three-way merge against the parent is the only thing that can tell "our addition was
+	// erased" from "the survivor removed a base field".
+	//
+	// BYTES, not a built grant: the body is already marshalled by the save that lands, so a
+	// rotation costs two slice assignments and the grant is materialised only on the rare fork
+	// path. They are immutable by construction — json.Marshal returns a fresh buffer and the
+	// CAS framing copies into its own — which is also what makes them a stronger provenance
+	// than any snapshot of live memory could be (buildPersistedSessionLocked returns
+	// sess.subs / sess.subIDs / sess.sharedSubs by reference).
+	//
+	// Rotated at every adoption that can later mint (a confirmed save, an ambiguity resolved
+	// landed, a repair save proven durable, and the resume restore — which has no known
+	// parent here and so sets the parent nil), and cleared by clear(). A nil body means
+	// nothing is repairable, which is the whole invariant: it is NOT "grantBodyParent always
+	// names pwid", because a re-minted object's first write carries a PWID whose content this
+	// broker never held, and a record over mqttGrantBodyMax is deliberately not retained at
+	// all. Memory-only. See sess_fork_repair.go.
+	grantBody, grantBodyParent []byte
 	// regClaim is this session OBJECT's ownership identity for shared-delivery
 	// in-flight registers. Unlike gen it is deliberately not persisted: a resume on
 	// another broker constructs a new object and therefore takes a new claim, while a
@@ -5146,6 +5191,13 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 	}
 	sess.mu.Unlock()
 	d.voc, d.forked, d.ec = voc, voc.reason == mqttDisposalForked.reason, ec
+	if d.forked {
+		// The persist-observation route's mint, and the ONE site that must not take as.mu:
+		// this whole decision runs under it. Derived from the same d.forked the report is,
+		// rather than re-classifying, so the capsule and the 0x89 can never disagree.
+		// See sess_fork_repair.go.
+		as.mintForkedGrantLocked(sess, wid, pwid)
+	}
 	d.out = evictApplied
 	normalReturn = true
 	return d
@@ -6783,6 +6835,16 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	// wait() holds no locks.
 	as.jsa.subsBarrier.enter()
 	defer as.jsa.subsBarrier.leave()
+
+	// Test seam, fired with the barrier HELD and before any consumer exists — the exact
+	// window the barrier is for. Blocking here lets a test prove the guarantee positively:
+	// a QoS 1/2 store issued while this is held must not complete, and must complete and
+	// deliver once it is released. That is what distinguishes a real barrier violation from
+	// a test whose publish merely raced ahead of SUBSCRIBE processing, which a sleep-based
+	// stagger cannot tell apart. See mqttTestSubsBarrierHeldHookV.
+	if h := mqttTestSubsBarrierHeldHookV.Load(); h != nil {
+		(*h)(filters)
+	}
 
 	// Helper to determine if we need to create a separate top-level
 	// subscription for a wildcard. sid is derived from the passed-in sid (which
@@ -8467,6 +8529,13 @@ RESTORE:
 	sess.q2AffGen = ps.Q2AffGen
 	sess.expiryInterval = ps.ExpiryInterval
 	sess.disconnectedAt = ps.DisconnectedAt
+	// The BYTES of the record just restored. The parent is nil because this broker did not
+	// author this record and holds no copy of its parent's content, which is exactly the case
+	// where nothing is repairable. Retaining the bytes rather than a built grant also removes
+	// the ordering trap the earlier design had: there is nothing here that could be captured
+	// before the hydration above filled Subs, the option sets, Cons and the drains.
+	// See sess_fork_repair.go.
+	sess.setRestoredGrantBodyLocked(smsg.Data)
 	as.addSession(sess, true)
 	return sess, true, nil
 }
@@ -8848,7 +8917,7 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 			// ambiguity means RE-SENDING them: a re-marshal of whatever memory holds
 			// later could not carry the digest a readback compares against. See
 			// mqttPendingWrite.
-			sess.markWriteUncertainLocked(seq, body, b, hdr, voidedRev, wid, pwid)
+			sess.markWriteUncertainLocked(&detail)
 		}
 		sess.mu.Unlock()
 		return detail, fmt.Errorf("unable to persist session %q (seq=%v): %v", ps.ID, seq, err)
@@ -8859,6 +8928,11 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	// pair that lagged the sequence would parent the NEXT write to a record that is no
 	// longer the base — and every sibling of the real base would then be unprovable.
 	sess.wid, sess.pwid = wid, pwid
+	// And the record BYTES with them: the record just confirmed becomes the base a later
+	// fork's delta is measured from, and the one it replaced becomes that base's parent. Two
+	// slice assignments — the grant itself is materialised only if a fork ever happens, which
+	// is what keeps this off the save path. See sess_fork_repair.go.
+	sess.adoptGrantBodyLocked(body)
 	// A CONFIRMED write is the durability boundary for everything it marshalled, so the
 	// void-register verdicts it carried are credited HERE rather than by whichever caller
 	// happened to want them recorded. Crediting only at the paths that set out to persist
@@ -9153,6 +9227,13 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// taken over", a claim that somebody legitimately owns the session, when nothing
 	// arbitrated anything. See parentForNextWriteLocked.
 	sess.reMintedFrom = retiringWID
+	// The GRANT chain does break here, unlike the parent pointer above, and the asymmetry is
+	// the point: a sibling of the retired base must still be RECOGNISABLE (hence
+	// reMintedFrom), but nothing of the retired incarnation may be RE-ASSERTED into the fresh
+	// one — that is the resurrection this repair is forbidden to perform. With both bodies
+	// nil the first post-re-mint save has a parent pointer and no parent content, so it mints
+	// nothing. See sess_fork_repair.go.
+	sess.grantBody, sess.grantBodyParent = nil, nil
 	sess.tmaxack = 0
 	// Discarded session: reset the PI counter too so a reused session object
 	// does not inherit the previous session's identifiers. Spec [MQTT-3.1.2-6].
@@ -10946,6 +11027,16 @@ restoreSession:
 	// a fresh one on the replacement, which is what keeps the deferred close matched to
 	// the token it is closing.
 	acceptSess, acceptTok, acceptTokOpen = es, es.beginRecordTx(), true
+
+	// Re-assert whatever a proven session-record fork erased, before the mutations below and
+	// before the save that persists them — the merge edits subs, the options, cons, the drains
+	// and the nonce set, so it belongs inside this transaction rather than at the restore that
+	// produced the object. This placement is also what makes one call serve both entry states,
+	// a session restored this pass and a resident one, and it is strictly AFTER the CONNECT's
+	// own uncertainty resolution on every path including the re-driven ones. A clean start
+	// needs no special case: clear() has already re-minted the generation above, so the
+	// capsule's anchor cannot match. See sess_fork_repair.go.
+	asm.reassertForkedGrantInto(es, acceptTok)
 
 	es.mu.Lock()
 	es.rmax = rmax

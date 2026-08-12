@@ -749,7 +749,7 @@ it does *not* promise:
   such a transition can still be read as another owner's. Narrowed from "absence is a
   verdict", not closed.
 
-### A forked session record is RECOGNISED, and nothing more
+### A forked session record is RECOGNISED, and its recoverable grant REPAIRED
 
 `$MQTT_sess` records carry `WID`/`PWID`, a parent pointer, so a survivor that is provably
 a **sibling** of the record this broker was acknowledged for stops being reported as a
@@ -844,10 +844,68 @@ What it does NOT do:
     classifier refuses, so only the SECOND save yields a classifiable acknowledged pair.
     This is a property of the stored record, not of the writer — every broker runs this
     tree — and the same two-save warm-up applies after any state reset.
-- **No durable state is repaired.** The forked record stays and the rightful owner's
-  granted state is still lost. A repair was designed and rejected: it would resurrect an
-  incarnation a teardown had already deleted, it needs a last-durable byte snapshot that
-  does not exist, and the repair CAS is itself exposed to the window it repairs.
+- **The recoverable subset of the erased grant IS repaired**, and the rest is not. What
+  the reconnect re-asserts is the DELTA between the record this broker was acknowledged
+  for and its parent: plain membership with its v5 options, both consumer identities of a
+  multi-level filter, the drains an acknowledged UNSUBSCRIBE staged, the
+  cancelled-register verdicts, and the PUBREL consumer where the survivor has none. The
+  four recorded rejections of a repair are answered rather than waived: it is
+  generation-anchored, so a capsule from an incarnation a teardown retired can never
+  match; nothing replays bytes, because the payload is a semantic delta between two
+  record-sourced snapshots; there is no worker and no repair write, because the only
+  applier is the client's own CONNECT on its readLoop holding `sessLocked` and the accept
+  transaction; and the write is the accept-save CAS itself, inheriting its conditional
+  arbitration, rejection classification and re-drive. See `docs/ARCHITECTURE.md`,
+  "Repairing a recognised fork". What it does NOT repair:
+  - only a fork of a record **this broker authored**, and never the first record after a
+    teardown re-mint: a restored record has no known parent content here, so no delta is
+    computable and nothing is minted. A generationless or parentless record is repaired by
+    NOTHING;
+  - only on **this broker** and only while the survivor it conceded to is still the
+    current record in the same incarnation — the capsule is memory, so a restart forfeits
+    the repair, and any write since the verdict makes the anchor refuse permanently;
+  - only where the survivor **made no grant decision of its own** about the same filter. A
+    filter the survivor also decided about, and two drains for one sid whose persisted
+    content differs, are left to the survivor and never repaired: two acknowledgements
+    with no ordering between them, so the record that is actually durable wins. The
+    non-repair is counted in the merge's log line, never guessed at;
+  - **one losing branch, not the union of all recognised losses**: the first reconnect
+    whose accept CAS lands advances the record identity and invalidates every other
+    broker's capsule;
+  - reaching the **cardinality bound** (256 capsules per account manager) forfeits the
+    oldest client's otherwise repairable state. Two ordinary outcomes leave a capsule
+    behind — a client that never reconnects here, and one whose reconnect merged, because
+    a merge deliberately does not consume it — so the bound is reached by correct entries,
+    not only by stale ones;
+  - **two drains for one sid whose persisted content differs are refused, so a
+    per-sequence progression is not repaired.** The CLAIMS are safe either way: the base
+    was already draining, a committed drain adds no fresh claims and completion only
+    removes them, so the survivor still names everything it says is owed. What is not
+    repaired is a fact ABOUT one of those claims — a PUBREL intent, a packet identifier, a
+    store attempt or an in-flight register sequence — that our branch acknowledged and the
+    survivor's did not. The visible consequence is the survivor's own: recovery treats a
+    delivery whose intent it does not hold as still in the PUBLISH phase and may resend
+    the payload, which is the state the survivor's branch would have reached with no fork
+    at all. Refused rather than merged because nothing orders the two acknowledgements;
+  - a session whose record exceeds **64 KiB** (`mqttGrantBodyMax`) retains no bytes and is
+    therefore not repairable at all — and the same bound applied to the SURVIVOR refuses the
+    whole merge for that pass, because a survivor whose grant cannot be materialised cannot
+    show its conflicts and nothing may be re-asserted over it. The capsule outlives the
+    refusal (a re-driven pass against a readable sibling can still merge) and dies through
+    the ordinary anchor refusal once a landed save makes the record this broker's own. The
+    repair holds two record bodies per resident session, and that is bounded rather than
+    trusted: a very large subscription set
+    forgoes the repair instead of doubling its footprint. The grant is materialised from
+    those bytes only on the fork path, never on a save — an earlier revision built it on
+    every save attempt under the session lock, which measured 2.5 ms and ~1 MB per attempt
+    at 1000 filters;
+  - a repaired **QoS 2** membership whose PUBREL provisioning then fails is
+    accepted-but-dead: `processSubs` runs after the success CONNACK. The same shape as
+    F-050's, not a new one;
+  - **shared-subscription membership is excluded until F-050 closes.** The success CONNACK
+    precedes shared restoration, so a re-asserted group membership would be durable while
+    a per-filter restore failure leaves no join and no consumer. Repairing into that
+    ordering would extend an open finding rather than respect it.
 - **The verdict does not prove the survivor erased us.** A teardown claim is a full-body
   CAS off the same base, so a sibling can merely have become current after `clear()`
   deleted our record. What is proven is only that the survivor is no successor of ours.

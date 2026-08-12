@@ -200,23 +200,20 @@ func mqttRecordDigest(body []byte) [sha256.Size]byte {
 // usable. Only an ambiguous failure — a timeout, a lost response, no responders —
 // leaves an outcome nobody can name.
 //
-// body is what a load returns (the digest identity); framed and hdr are the same
-// content as it went on the wire, kept so the resolver can re-attempt this exact
-// write instead of reading the record and guessing at its fate.
-//
-// voidedRev is the void-register revision the attempt marshalled, carried so a
-// resolution that proves those bytes durable can credit it; wid and pwid are the
-// lineage it stamped, carried so a resolution that proves them durable adopts the
-// identity those bytes carry rather than memory's.
+// It takes the ATTEMPT'S OWN DETAIL rather than a list of its parts, because everything
+// pendingWrite holds is something a resolution must adopt from the bytes instead of from
+// memory: d.body is the digest identity, d.framed/d.hdr are the same content as it went on
+// the wire so the resolver can re-attempt this exact write rather than guessing at its fate,
+// d.voidedRegsRev is the void-register revision it marshalled, and d.wid/d.pwid are the lineage it
+// stamped; the record bytes the repair retains are d.body itself. Passing the detail is what makes it impossible for
+// one of the four call sites to carry a field the other three carry.
 //
 // sess.mu must be held.
-func (sess *mqttSession) markWriteUncertainLocked(baseSeq uint64, body, framed []byte, hdr int,
-	voidedRev uint64, wid, pwid string) {
-
+func (sess *mqttSession) markWriteUncertainLocked(d *mqttSessSaveDetail) {
 	sess.seqUncertain = true
 	sess.pendingWrite = &mqttPendingWrite{
-		baseSeq: baseSeq, digest: mqttRecordDigest(body), framed: framed, hdr: hdr,
-		voidedRegsRev: voidedRev, wid: wid, pwid: pwid,
+		baseSeq: d.baseSeq, digest: mqttRecordDigest(d.body), framed: d.framed, hdr: d.hdr,
+		voidedRegsRev: d.voidedRegsRev, wid: d.wid, pwid: d.pwid,
 	}
 }
 
@@ -363,6 +360,10 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// A PROVEN sibling of the record we were acknowledged for. Everything the
 		// foreign arm does still applies — the attempt did not land, and its sequence
 		// must not be adopted — but no takeover was demonstrated, so none is claimed.
+		//
+		// What the sibling erased is recorded HERE, under the resolver's fence, for the
+		// reconnect the 0x89 invites to re-assert. See sess_fork_repair.go.
+		sess.mintForkedGrant(ackWID, ackPWID)
 		return mqttUncertainForked, nil
 	default: // mqttAttemptAtBase, mqttAttemptGone
 		// Neither answer settles anything on its own. At base says nothing about our
@@ -534,7 +535,10 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 	case mqttAttemptForked:
 		// A proven sibling of our acknowledged base, reached through the re-attempt's
 		// own rejection rather than the first readback. Same disposition, same silence
-		// about a takeover nothing established.
+		// about a takeover nothing established, and its own mint: this is a SECOND
+		// classification of the same session, and a resolver that reached the verdict only
+		// here would otherwise leave the repair unrecorded. See sess_fork_repair.go.
+		sess.mintForkedGrant(ackWID, ackPWID)
 		return mqttUncertainForked, nil
 	case mqttAttemptGone:
 		// The subject is still empty, and the REJECTION KIND is the only thing that
@@ -572,7 +576,7 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 //
 // No lock held on entry.
 func (sess *mqttSession) settleLandedAttempt(tok recordTx, pw *mqttPendingWrite, seq uint64) mqttUncertainResolution {
-	sess.clearUncertaintyLocked(seq, pw.wid, pw.pwid)
+	sess.clearUncertaintyLocked(seq, pw.wid, pw.pwid, pw.framed[pw.hdr:])
 	sess.mu.Lock()
 	sess.creditVoidedRegsLocked(pw.voidedRegsRev)
 	sess.mu.Unlock()
@@ -618,16 +622,18 @@ func (sess *mqttSession) resolutionAfterContinuations(res mqttUncertainResolutio
 	return res
 }
 
-// clearUncertainty marks the session resolved at seq, adopting the lineage the proven
-// bytes carry alongside it — the same pairing every other adoption site makes, because
-// a sequence without its identity leaves the next save parenting itself to a record
-// that is no longer the base. See sess_fork_lineage.go.
-func (sess *mqttSession) clearUncertaintyLocked(seq uint64, wid, pwid string) {
+// clearUncertainty marks the session resolved at seq, adopting the lineage AND the record bytes the
+// proven bytes carry alongside it — the same pairing every other adoption site makes, because
+// a sequence without its identity leaves the next save parenting itself to a record that is no
+// longer the base, and an identity without its bytes leaves the next fork's delta measured
+// against a record two writes back. See sess_fork_lineage.go and sess_fork_repair.go.
+func (sess *mqttSession) clearUncertaintyLocked(seq uint64, wid, pwid string, body []byte) {
 	sess.mu.Lock()
 	sess.seqUncertain = false
 	sess.pendingWrite = nil
 	sess.seq = seq
 	sess.wid, sess.pwid = wid, pwid
+	sess.adoptGrantBodyLocked(body)
 	sess.mu.Unlock()
 }
 

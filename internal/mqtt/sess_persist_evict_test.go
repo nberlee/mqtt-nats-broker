@@ -364,6 +364,9 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 	if st := e.willOutboxState(t, will); st != mqttWillPending {
 		t.Fatalf("a forked verdict must NOT cancel the Will outbox record, got %v", st)
 	}
+	// The persist-observation route is a mint site too, and it is the ONE that must not take
+	// as.mu: this whole decision runs under it. See sess_fork_repair.go.
+	testAssertMinted(t, e)
 }
 
 // TestMQTTPersistEvictTakeoverCancelsWill is the paired successor case: a real
@@ -392,6 +395,7 @@ func TestMQTTPersistEvictTakeoverCancelsWill(t *testing.T) {
 	if st := e.willOutboxState(t, will); st != mqttWillCancelled {
 		t.Fatalf("the takeover verdict must cancel the displaced incarnation's Will, got %v", st)
 	}
+	testAssertNotMinted(t, e)
 }
 
 // TestMQTTPersistEvictResidentUnbound is plan test 11: the resident-DISCONNECTED

@@ -198,6 +198,27 @@ func TestMQTTForkedRecordE2EConnectRebuildsFromRecord(t *testing.T) {
 	if sess2.isSeqUncertain() {
 		t.Fatal("the rebuilt session must not inherit the stale object's uncertainty")
 	}
+
+	// Test 21: the acknowledged SUBSCRIBE the sibling erased is REPAIRED, and the survivor's
+	// own membership is kept beside it. The sibling carried "forked/e2e/marker" and no
+	// "forkconnect/x", while the parent record had neither — so the survivor made no grant
+	// decision about the client's filter and the change applies, while the peer's filter is
+	// not in the delta at all and is left exactly as it is. See sess_fork_repair.go.
+	sess2.mu.Lock()
+	ps := sess2.buildPersistedSessionLocked()
+	sess2.mu.Unlock()
+	// Membership is keyed by the NATS subject the filter maps to, not by the MQTT filter.
+	if _, ok := ps.Subs["forkconnect.x"]; !ok {
+		t.Fatalf("the record the reconnect wrote must carry the SUBACKed filter again: %v", ps.Subs)
+	}
+	if _, ok := ps.Subs["forked/e2e/marker"]; !ok {
+		t.Fatalf("the surviving record's own membership must be preserved: %v", ps.Subs)
+	}
+	// And it DELIVERS, which is the only assertion that proves the repair reached the
+	// consumer rather than only the record: the pre-CONNACK reconciliation is what recreates
+	// a durable for a re-asserted membership.
+	testMQTTPublish(t, c2, r2, 1, false, false, "forkconnect/x", 1, []byte("repaired"))
+	testMQTTCheckPubMsg(t, c2, r2, "forkconnect/x", mqttPubQos1, []byte("repaired"))
 }
 
 // testE2ELiveCompetingOwner stands up a SECOND account session manager that restores the
@@ -288,6 +309,10 @@ func testE2ELandCompetingWrite(t *testing.T, sess *mqttSession, idHash string) {
 	sess.mu.Lock()
 	sess.seq = resp.Sequence
 	sess.wid, sess.pwid = rec.WID, rec.PWID
+	// The record BYTES go with the pair, for the same reason: this stands in for a confirmed
+	// save, and a fixture that moved the sequence and the lineage while leaving the retained
+	// bytes unset would silently mint nothing on a later fork.
+	sess.adoptGrantBodyLocked(body)
 	sess.mu.Unlock()
 }
 
