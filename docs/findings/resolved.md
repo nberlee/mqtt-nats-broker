@@ -1622,8 +1622,8 @@ AT MOST ONE…
   taken over", or two 0x8Es), which [MQTT-3.14.4-1] forbids the server and which gives the
   client the opposite advice to the one that is true. Of the three legs the original bullet
   asked to make atomic, two already had exactly-once owners — `closeConnection` is
-  idempotent (`c.closed.Swap`), and `willDisposition` is consumed once by `mqttTakeWill` —
-  so the fix added the missing third rather than a fourth mechanism summarising them:
+  idempotent (`c.closed.Swap`), and `willDisposition` is consumed once by
+  `mqttTakeWillLocked` — so the fix added the missing third rather than a fourth mechanism:
   `mqtt.disconnectSent`, consumed under `c.mu` through the single-homed
   `mqttClaimDisconnectLocked`. Every server-DISCONNECT writer claims: the four displacement
   paths (through one shared tail, `mqttNotifyTakenOver`), the parse-error footer, the
@@ -2438,3 +2438,48 @@ deployed configuration to accommodate.
 `TestMQTTAuthTimeout` was tightened rather than left alone. With the timer never
 armed, its negative case read a success CONNACK, published, and passed; it now
 requires that no CONNACK arrives.
+
+## F-053
+
+**Title:** Remove declarations unused by production and the full suite
+
+- Status: Resolved
+- Classification: Confirmed dead code
+- Release treatment: Completed maintainability cleanup
+- Original dossier: `dead-code.md`
+
+### Resolution
+
+The production and `mqttport_fulltests` reachability audit identified 15
+declarations in `mqtt.go` with no caller. A final repository scan added the
+orphaned `isValidName` and `containsAny` helpers from `compat_helpers.go`.
+
+The independent slice removed `mqttWSPath`,
+`errMQTTUnsupportedSubOption`, the unlocked `mqttTakeWill` wrapper,
+`mqttConfigAuth`, `getMQTTClientID`, `loadNextMsgFor`,
+`sharedConsumerHasOtherHolders`, and the two compatibility helpers. Live Will
+consumers already hold `c.mu` and continue to use `mqttTakeWillLocked`; live
+shared-holder scans already use the batched helper; and forward scans use
+`loadNextMsgFromSeq`. Removing `mqttConfigAuth` also stranded `authOverride`.
+That bit had no runtime writer because the function itself had no caller, and
+standalone authentication remains at the per-client NATS dial boundary.
+
+The integration slice removed three inherited mechanisms that cannot be selected
+by the standalone broker:
+
+- configuration-reload propagation through `mqttUpdateMaxAckPending`;
+- embedded multi-account routing through `mqttGetJSAForAccount` and
+  `mqttStoreQoSMsgForAccountOnNewSubject`;
+- the embedded global-user retained-permission rescan through
+  `mqttCheckPubRetainedPerms`, `mqttPerm`, `generatePubPerms`, `pubAllowed`, and
+  its private asynchronous `storeMsgNoWait` wrapper.
+
+The `Server.accounts` and `Server.users` shim fields and the `gsl` import went
+with those mechanisms. The NATS `User`, `Permissions`, and `SubjectPermission`
+aliases remain because supported upstream-reference tests still use them; the
+JSA send queue remains because live publish and management paths use it.
+
+No live call site changed. Default, full tagged, and unrestricted reachability
+passes were run after each slice. The default race suite exposed unrelated
+parallel timing failures on one loaded run; every named failure passed in an
+immediate isolated race rerun, and an independent package race run passed.

@@ -357,17 +357,22 @@ docs/CONFORMANCE.md.
 
 mqtt.go references a small set of **behavioral** NATS-server types by their
 *unexported* methods/fields, so they can't be aliased — they must be
-re-implemented against `nats.go`. The full surface (from a compile of the tagged
-core) is below.
+re-implemented against `nats.go`. The current porting-significant surface is
+below; the compiler remains authoritative for the exhaustive dependency set.
 
-### `client` (~30 members) — `shim_client.go`
+### `client` — `shim_engine.go`
 
-Fields: `mqtt`, `mu`, `pa`, `srv`, `opts`, `acc`, `nc`, `flags`, `subs`, `mpay`,
-`perms`, `msgParts`, `out`, `ncs`, `trace`.
-Methods: `processSub`, `processUnsub`, `processInboundClientMsg`, `queueOutbound`,
-`enqueueProto`, `flushClients`, `closeConnection`, `setAuthTimer`,
-`registerWithAccount`, `readLoop`, `writeLoop`, `addToPCD`,
-`selectMappedSubject`, `pubAllowedFullCheck`, `maxPayloadViolation`,
+Fields: `mu`, `srv`, `acc`, `nc`, `rawConn`, `cid`, `kind`, `ncs`, `opts`,
+`flags`, `in`, `out`, `pa`, `perms`, `mperms`, `subs`, `mpay`, `msubs`,
+`trace`, `headers`, `start`, `last`, `ws`, `mqtt`, `nrc`, `ownNRC`, `wmu`,
+`connectTimer`, `connectAdmission`, `testConnectDeadlinePause`, `closed`,
+`finishOnce`, `connAckWritten`.
+Porting-facing methods: `msgParts`, `processSub`, `processUnsub`,
+`processInboundClientMsg`, `queueOutbound`, `enqueueProto`, `enqueueProtoErr`,
+`flushClients`, `closeConnection`, `registerWithAccount`, `readLoop`,
+`writeLoop`, `addToPCD`, `selectMappedSubject`, `pubAllowedFullCheck`,
+`checkDenySub`, `maxPayloadViolation`, `doTLSServerHandshake`, `writeSocket`,
+`writeDirect`, `shutdownDisconnect`, and
 `Errorf`/`Warnf`/`Debugf`/`Tracef`/`traceInOp`/`traceOutOp`.
 
 This is the broker engine: replace the NATS-server socket read/write loop with a
@@ -375,15 +380,18 @@ per-connection handler (`internal/conn`), route `processSub`/`processInboundClie
 through a per-client `*nats.Conn` (see `backend.DialClient`), and back
 `queueOutbound`/`flushClients` with a buffered writer to the MQTT socket.
 
-### `Server` (~25 members) — `shim_server.go`
+### `Server` — `shim_engine.go` and `shim_public.go`
 
-Fields/accessors: `mqtt`, `mu`, `info`, `opts`/`getOpts`, `accounts`, `clients`,
-`users`, `quitCh`, `grWG`, `subIDs`, `subs`, `rap`, `shared`, `ldm`.
-Methods: `globalAccount`, `getOrCreateMQTTAccountSessionManager`,
-`mqttGetJSAForAccount`, `mqttDetermineReplicas`, `createMQTTClient`,
-`createInternalAccountClient`, `startGoRoutine`, `isRunning`/`isShuttingDown`,
-`isClientAuthorized`, `JetStreamEnabled`/`JetStreamIsClustered`,
-`Noticef`/`Warnf`/`Debugf`/`Fatalf`.
+Fields: `mu`, `opts`, `info`, `log`, `nrc`, `dialClient`, `mqtt`, `clients`,
+`ipQueues`, `totalClients`, `quitCh`, `grWG`, `clientWG`, `connSetupWG`,
+`connGateClosed`, `shutdownOnce`, `shutdownDone`, `willDispatchMu`,
+`willDispatchClosed`, `willTimers`, `willClaimStopCh`, `willTimerWG`,
+`willClaimWG`, `willWorkerWG`, `ldm`, `nodeName`, `running`, `gacc`, `gcid`.
+Porting-facing methods/accessors: `getOpts`, `globalAccount`,
+`getOrCreateMQTTAccountSessionManager`, `mqttDetermineReplicas`,
+`createMQTTClient`, `createInternalAccountClient`, `startGoRoutine`,
+`isRunning`/`isShuttingDown`, `isClientAuthorized`, `JetStreamIsClustered`,
+`NodeName`, and `Noticef`/`Warnf`/`Debugf`/`Errorf`/`Fatalf`.
 
 Back these with the `backend.Backend` (service `*nats.Conn` + JetStream) and the
 config; `JetStreamIsClustered` etc. come from `js.AccountInfo`/server info.

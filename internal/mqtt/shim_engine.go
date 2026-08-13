@@ -208,9 +208,7 @@ type Server struct {
 
 	mqtt srvMQTT
 
-	accounts     sync.Map
 	clients      map[uint64]*client
-	users        map[string]*User
 	ipQueues     sync.Map
 	totalClients int
 

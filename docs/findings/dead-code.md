@@ -64,58 +64,6 @@ checks and invoke them from `Start`, or delete the obsolete validator and retarg
 its valuable cases to the command configuration and actual startup boundary. Tests
 must call the production entry point they claim to validate.
 
-## F-053
-
-**Title:** `mqtt.go` retains declarations unused by production and the full suite
-
-- Status: Open
-- Classification: Confirmed dead code
-- Release treatment: Maintainability cleanup
-
-### Evidence
-
-With `mqttport_fulltests` enabled, the `unused` analyzer reports 15 declarations in
-`mqtt.go` that no production or supported full-suite path references:
-
-- `mqttWSPath` and `errMQTTUnsupportedSubOption`;
-- `mqttTakeWill` (live callers use `mqttTakeWillLocked`);
-- `mqttConfigAuth` and `getMQTTClientID`;
-- `mqttUpdateMaxAckPending`;
-- `mqttGetJSAForAccount` and `mqttStoreQoSMsgForAccountOnNewSubject`;
-- `loadNextMsgFor` (live scans use `loadNextMsgFromSeq`);
-- `storeMsgNoWait`, `mqttCheckPubRetainedPerms`, `mqttPerm`, `generatePubPerms`,
-  and `pubAllowed`;
-- `sharedConsumerHasOtherHolders` (live callers use the batched plural helper).
-
-The larger clusters are inherited integration surfaces. MaxAckPending reload has
-no standalone reload caller. The cross-account QoS store belongs to embedded NATS
-routing. The retained-permission rescan belongs to upstream global-user reload,
-whereas this broker delegates authorization to NATS connections.
-
-The final repository reference scan also found `isValidName` and its private
-`containsAny` helper in `compat_helpers.go`. Both were inherited JetStream-name
-validation helpers with no caller in production or any test build.
-
-### Implemented slice: independent declarations
-
-Removed the two constants, the independent Will/auth/client-ID wrappers, the
-superseded no-sequence lookup, the singular shared-holder wrapper, and the two
-orphaned compatibility helpers. Removing `mqttConfigAuth` also removed the
-`authOverride` bit it alone could set; the standalone authentication boundary is
-the per-client NATS dialer, not the inherited embedded-server override.
-
-### Commit-sized resolution
-
-Land this as two mechanical commits:
-
-1. Remove the independent constants and leaf wrappers after one final repository
-   reference scan.
-2. Remove the reload, embedded-routing, and retained-permission clusters together
-   with imports and shim fields made unused by them.
-
-Neither commit should alter a live call site. Run default tests, full tests, and
-the unrestricted `unused` analyzer after each.
-
 ## F-054
 
 **Title:** Test and future-feature scaffolding remains in production source

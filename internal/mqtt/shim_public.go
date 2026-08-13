@@ -34,7 +34,6 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 		opts:            opts,
 		nodeName:        nodeName,
 		clients:         make(map[uint64]*client),
-		users:           make(map[string]*User),
 		quitCh:          make(chan struct{}),
 		shutdownDone:    make(chan struct{}),
 		willClaimStopCh: make(chan struct{}),

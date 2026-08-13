@@ -18,10 +18,12 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
-The 28 resolved findings are retained in the
-[resolved-findings archive](findings/resolved.md). The entries below are the active
-release view; their linked dossiers are canonical for mechanism, evidence,
-rejected designs, tests, and residuals.
+The 33 closed findings are indexed in the [finding dossiers](findings/README.md).
+Of those, 31 are retained in the
+[resolved-findings archive](findings/resolved.md); F-027 and F-029 remain in the
+mixed-status [HA arbitration dossier](findings/ha-arbitration.md) beside their open
+follow-ups. The entries below are the active release view; their linked dossiers
+are canonical for mechanism, evidence, rejected designs, tests, and residuals.
 
 ### 0.1 Remove pre-release persistence compatibility
 
@@ -514,13 +516,14 @@ them in order where a later lint change depends on an earlier cleanup.
 - [ ] [F-052: Connect MQTT option validation to production startup](findings/dead-code.md#f-052).
   Adapt or retire the upstream validator, and make its tests exercise the real
   standalone startup boundary.
-- [x] [F-053: Remove independent dead declarations](findings/dead-code.md#f-053).
+- [x] [F-053: Remove independent dead declarations](findings/resolved.md#f-053).
   Delete the unreferenced constants, errors, leaf wrappers, singular shared-holder
   helper, superseded no-sequence message lookup, and the two orphaned JetStream-name
   compatibility helpers found by the final reference scan. No live call site changed.
-- [ ] [F-053: Remove obsolete upstream integration clusters](findings/dead-code.md#f-053).
+- [x] [F-053: Remove obsolete upstream integration clusters](findings/resolved.md#f-053).
   Delete the unused configuration-reload, embedded-routing, and retained-permission
-  rescan paths with the imports and shim state they strand.
+  rescan paths with the imports and shim state they strand. The standalone broker
+  now carries no dormant embedded-server account/reload mechanism.
 - [ ] [F-054: Move test-only helper APIs out of production files](findings/dead-code.md#f-054).
   Keep live hook points, but place tagged-test setters and convenience methods in
   the test build where possible.

@@ -9,15 +9,9 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 
 ## Active findings
 
-- Repair a recognised session-record fork.
-  Status: Open. Release treatment: Alpha blocker.
-  Details: [F-027](ha-arbitration.md#f-027).
 - Preserve deferred disconnect state during foreign disposition.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
-- Arbitrate simultaneous takeovers from one session-record base.
-  Status: Open. Release treatment: Alpha blocker.
-  Details: [F-029](ha-arbitration.md#f-029).
 - Add write lineage to the Will outbox.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-030](ha-arbitration.md#f-030).
@@ -94,9 +88,6 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
   Status: Open. Release treatment: Maintainability item; promote if startup tests
   expose an accepted invalid configuration.
   Details: [F-052](dead-code.md#f-052).
-- Remove declarations unused by production and the full suite.
-  Status: Open. Release treatment: Maintainability cleanup.
-  Details: [F-053](dead-code.md#f-053).
 - Separate test and future-feature scaffolding from production code.
   Status: Open. Release treatment: Maintainability cleanup; WebSocket remains in
   its transport milestone.
@@ -176,6 +167,10 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 - processSessionPersist evicted the rightful client on a remote PubAck it could not
   classify —….
   Details: [F-026](resolved.md#f-026).
+- Repair a recognised session-record fork.
+  Details: [F-027](ha-arbitration.md#f-027).
+- Arbitrate simultaneous takeovers from one session-record base.
+  Details: [F-029](ha-arbitration.md#f-029).
 - Replace legacy reserved-subscription migration with current-schema refusal.
   Details: [F-057](resolved.md#f-057).
 - Remove inherited retained-message format and delete-protocol compatibility.
@@ -184,3 +179,5 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
   Details: [F-058](resolved.md#f-058).
 - Bound a connection that never sends CONNECT.
   Details: [F-051](resolved.md#f-051).
+- Remove declarations unused by production and the full suite.
+  Details: [F-053](resolved.md#f-053).

@@ -36,7 +36,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/nats-io/jwt/v2"
-	"github.com/nats-io/nats-server/v2/server/gsl"
 	"github.com/nats-io/nats-server/v2/server/stree"
 	"github.com/nats-io/nuid"
 )
@@ -3449,66 +3448,6 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 	s.mqttHandleWill(c, expiry, sessGen, originSessionSeq, originSessEpoch)
 }
 
-// Updates the MaxAckPending for all MQTT sessions, updating the
-// JetStream consumers and updating their max ack pending and forcing
-// a expiration of pending messages.
-//
-// Runs from a server configuration reload routine.
-// No lock held on entry.
-func (s *Server) mqttUpdateMaxAckPending(newmaxp uint16) {
-	msm := &s.mqtt.sessmgr
-	s.accounts.Range(func(k, _ any) bool {
-		accName := k.(string)
-		msm.mu.RLock()
-		asm := msm.sessions[accName]
-		msm.mu.RUnlock()
-		if asm == nil {
-			// Move to next account
-			return true
-		}
-		asm.mu.RLock()
-		for _, sess := range asm.sessions {
-			sess.mu.Lock()
-			sess.maxp = newmaxp
-			sess.mu.Unlock()
-		}
-		asm.mu.RUnlock()
-		return true
-	})
-}
-
-func (s *Server) mqttGetJSAForAccount(acc string) *mqttJSA {
-	sm := &s.mqtt.sessmgr
-
-	sm.mu.RLock()
-	asm := sm.sessions[acc]
-	sm.mu.RUnlock()
-
-	if asm == nil {
-		return nil
-	}
-
-	asm.mu.RLock()
-	jsa := &asm.jsa
-	asm.mu.RUnlock()
-	return jsa
-}
-
-func (s *Server) mqttStoreQoSMsgForAccountOnNewSubject(hdr int, msg []byte, acc, subject string) {
-	if s == nil || hdr <= 0 {
-		return
-	}
-	h := mqttParsePublishNATSHeader(msg[:hdr])
-	if h == nil || h.qos == 0 {
-		return
-	}
-	jsa := s.mqttGetJSAForAccount(acc)
-	if jsa == nil {
-		return
-	}
-	jsa.storeMsg(mqttStreamSubjectPrefix+subject, hdr, msg)
-}
-
 func mqttParsePublishNATSHeader(headerBytes []byte) *mqttParsedPublishNATSHeader {
 	if len(headerBytes) == 0 {
 		return nil
@@ -4634,14 +4573,6 @@ func (jsa *mqttJSA) loadMsg(streamName string, seq uint64) (*StoredMsg, error) {
 	}
 	lmr := lmri.(*JSApiMsgGetResponse)
 	return lmr.Message, lmr.ToError()
-}
-
-func (jsa *mqttJSA) storeMsgNoWait(subject string, hdrLen int, msg []byte) {
-	jsa.sendq.push(&mqttJSPubMsg{
-		subj: subject,
-		msg:  msg,
-		hdr:  hdrLen,
-	})
 }
 
 func (jsa *mqttJSA) storeMsg(subject string, headers int, msg []byte) (*JSPubAckResponse, error) {
@@ -13447,150 +13378,6 @@ func (c *client) mqttHandlePubRetain() {
 	} else {
 		asm.addRetainedMsg(key, resp.Sequence, rm)
 	}
-}
-
-// After a config reload, it is possible that the source of a publish retained
-// message is no longer allowed to publish on the given topic. If that is the
-// case, the retained message is removed from the map and will no longer be
-// sent to (re)starting subscriptions.
-//
-// Server lock MUST NOT be held on entry.
-func (s *Server) mqttCheckPubRetainedPerms() {
-	sm := &s.mqtt.sessmgr
-	sm.mu.RLock()
-	done := len(sm.sessions) == 0
-	sm.mu.RUnlock()
-
-	if done {
-		return
-	}
-
-	s.mu.Lock()
-	users := make(map[string]*User, len(s.users))
-	for un, u := range s.users {
-		users[un] = u
-	}
-	s.mu.Unlock()
-
-	// First get a list of all of the sessions.
-	sm.mu.RLock()
-	asms := make([]*mqttAccountSessionManager, 0, len(sm.sessions))
-	for _, asm := range sm.sessions {
-		asms = append(asms, asm)
-	}
-	sm.mu.RUnlock()
-
-	// For each session we will obtain a list of retained messages.
-	var _rms [128]uint64
-	rms := _rms[:0]
-	for _, asm := range asms {
-		// Get all of the retained messages. Then we will sort them so
-		// that they are in sequence order, which should help the file
-		// store to not have to load out-of-order blocks so often.
-		asm.mu.RLock()
-		rms = rms[:0] // reuse slice
-		// Copy the sequence out of the tree. The tree entry itself can be
-		// updated concurrently by addRetainedMsg() after we release the lock,
-		// so keeping a pointer here would race with the later sort.
-		asm.retmsgs.IterOrdered(func(_ []byte, rm *mqttRetainedMsgRef) bool {
-			rms = append(rms, rm.sseq)
-			return true
-		})
-		jsaID := asm.jsa.id
-		asm.mu.RUnlock()
-		slices.Sort(rms)
-
-		perms := map[string]*mqttPerm{}
-		for _, rf := range rms {
-			jsm, err := asm.jsa.loadMsg(mqttRetainedMsgsStreamName, rf)
-			if err != nil || jsm == nil {
-				continue
-			}
-			rm, err := mqttDecodeRetainedMessage(jsm.Subject, jsm.Header, jsm.Data)
-			if err != nil {
-				continue
-			}
-			// We deal only with messages that have a source (the username that produced
-			// this message) and were produced on this server.
-			if rm.Source == _EMPTY_ || rm.Origin != jsaID {
-				continue
-			}
-			// Lookup source from global users.
-			u := users[rm.Source]
-			if u != nil {
-				p, ok := perms[rm.Source]
-				if !ok {
-					p = generatePubPerms(u.Permissions)
-					perms[rm.Source] = p // possibly nil
-				}
-				// If there is permission and no longer allowed to publish in
-				// the subject, remove the publish retained message from the map.
-				if p != nil && !pubAllowed(p, rm.Subject) {
-					u = nil
-				}
-			}
-
-			// Not present or permissions have changed such that the source can't
-			// publish on that subject anymore: delete this retained message.
-			if u == nil {
-				// Set the payload to empty to notify that we are deleting this
-				// retained message. We will send this message async.
-				rm.Msg = nil
-				rmBytes, hdrLen := mqttEncodeRetainedMessage(rm)
-				asm.jsa.storeMsgNoWait(mqttRetainedMsgsStreamSubject+rm.Subject, hdrLen, rmBytes)
-			}
-		}
-	}
-}
-
-// Helper to generate only pub permissions from a Permissions object
-type mqttPerm struct {
-	allow *gsl.SimpleSublist
-	deny  *gsl.SimpleSublist
-}
-
-func generatePubPerms(perms *Permissions) *mqttPerm {
-	// If given permissions is `nil`, then it means that permissions block
-	// has been removed (so the user is now allowed to publish on everything)
-	// or was never there in the first place. Returning `nil` will let the
-	// caller know that there are no permissions to enforce.
-	if perms == nil {
-		return nil
-	}
-	var p *mqttPerm
-	if perms.Publish.Allow != nil {
-		p = &mqttPerm{}
-		p.allow = gsl.NewSimpleSublist()
-		for _, pubSubject := range perms.Publish.Allow {
-			_ = p.allow.Insert(pubSubject, struct{}{})
-		}
-	}
-	if len(perms.Publish.Deny) > 0 {
-		if p == nil {
-			p = &mqttPerm{}
-		}
-		p.deny = gsl.NewSimpleSublist()
-		for _, pubSubject := range perms.Publish.Deny {
-			_ = p.deny.Insert(pubSubject, struct{}{})
-		}
-	}
-	return p
-}
-
-// Helper that checks if given `perms` allow to publish on the given `subject`
-func pubAllowed(perms *mqttPerm, subject string) bool {
-	if perms == nil {
-		return true
-	}
-	allowed := true
-	if perms.allow != nil {
-		allowed = perms.allow.HasInterest(subject)
-	}
-	// If we have a deny list and are currently allowed, check that as well.
-	if allowed && perms.deny != nil {
-		allowed = !perms.deny.HasInterest(subject)
-	}
-	return allowed
 }
 
 func (c *client) mqttEnqueuePubResponse(packetType byte, pi uint16, trace bool) {
