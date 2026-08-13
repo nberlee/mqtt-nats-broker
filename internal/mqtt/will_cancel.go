@@ -19,6 +19,7 @@ package mqtt
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -266,9 +267,15 @@ func (as *mqttAccountSessionManager) watermarkAtLeast(cidHash string, candidate 
 type rollbackResult int
 
 const (
-	rollbackApplied       rollbackResult = iota // candidate is absent or an authoritative disconnected record
-	rollbackSuperseded                          // a newer connected generation is authoritative (a legitimate success)
-	rollbackIndeterminate                       // candidate still connected, or the record is unreadable
+	// rollbackUnset holds position ZERO so an unassigned outcome is REPRESENTABLE and
+	// wrong. Every arm of the classification below assigns, so this value is
+	// unreachable — but while rollbackApplied sat at iota, deleting an arm's assignment
+	// left the variable reading "applied" and no test could tell the difference. An
+	// expected value that is also the zero value cannot discriminate.
+	rollbackUnset         rollbackResult = iota
+	rollbackApplied                      // candidate is absent, MARKED for teardown, or an authoritative disconnected record
+	rollbackSuperseded                   // a newer connected generation is authoritative (a legitimate success)
+	rollbackIndeterminate                // candidate still connected, or the record is unreadable
 	// rollbackForked: a newer CONNECTED record exists that is PROVABLY a sibling of the
 	// candidate — same parent, different identity — so it is no successor of it and
 	// "a legitimate newer generation" is not established. Distinguished from
@@ -278,6 +285,13 @@ const (
 	// "session store unavailable" warning would be a report of a failure that did not
 	// happen. See sess_fork_lineage.go.
 	rollbackForked
+	// rollbackParked: the zero-lifetime teardown was REFUSED over an unresolved record
+	// write and the discard is now parked on a session left resident. Nothing was
+	// deleted and nothing about the candidate has been decided, so it is neither
+	// rollbackIndeterminate (whose warning would report a store failure that did not
+	// happen) nor rollbackApplied (which would claim the candidate is no longer
+	// authoritative). See reparkRefusedDiscard.
+	rollbackParked
 )
 
 // rollbackAcceptedSession is the CONNECT-accept watermark-failure transaction. The
@@ -286,52 +300,111 @@ const (
 // undo the durable record, so this makes the candidate generation non-falsely-
 // connected and reconciles local state.
 //
-// Unconditional guarantees (the caller sends no success CONNACK): es.c == nil, the
-// in-memory session is removed, and the rollback is classified applied / superseded
-// / indeterminate. The persisted record being non-connected is NOT unconditional —
-// under rollbackIndeterminate ($MQTT_sess unavailable) it may remain durably
-// connected; recovery is then the periodic expiry sweep (finite sessions only) or a
-// later reconnect. The prior connection's Will is not guaranteed to remain eligible:
-// pre-watermark takeover effects (a remote observer's cancelWillOutbox, a displaced
-// client's cleared Will) may already have suppressed it. The watermark itself is
-// never touched (a monotonic value that may have landed cannot be safely lowered).
-func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqttSession, cidHash string, candidate uint64, expiry uint32) {
+// Guarantees (the caller sends no success CONNACK): es.c == nil; the in-memory session
+// is REMOVED, or retained as a parked discard when a refused teardown leaves the record
+// write unresolved (rollbackParked); and the rollback is classified. The persisted
+// record being non-connected is NOT unconditional — under rollbackIndeterminate
+// ($MQTT_sess unavailable) it may remain durably connected; recovery is then the
+// periodic expiry sweep (finite sessions only) or a later reconnect. The prior
+// connection's Will is not guaranteed to remain eligible: pre-watermark takeover
+// effects (a remote observer's cancelWillOutbox, a displaced client's cleared Will) may
+// already have suppressed it. The watermark itself is never touched (a monotonic value
+// that may have landed cannot be safely lowered).
+func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqttSession, cidHash string, candidate uint64) {
+	report := func(r rollbackResult) {
+		as.mu.RLock()
+		done := as.testRollbackDone
+		as.mu.RUnlock()
+		if done != nil {
+			done(es, r)
+		}
+	}
+
 	// Detach the rejected client so the (soon-removed) session object no longer
 	// points at it. Neither clear() nor removeSession clears sess.c.
+	//
+	// The candidate's LINEAGE is captured in the same critical section, because the
+	// zero-lifetime branch below runs clear(), which zeroes wid/pwid — and the
+	// classification's sibling test needs the pair the candidate record carries. Read
+	// off the session afterwards it would be empty, and a genuine sibling of the
+	// candidate would be reported "a legitimate newer generation", which is exactly the
+	// claim this feature withholds. See sess_fork_lineage.go.
 	es.mu.Lock()
 	es.c = nil
+	effective, ackWID, ackPWID := es.expiryInterval, es.wid, es.pwid
 	es.mu.Unlock()
 
-	// Sequence-targeted write making the candidate record non-connected. Branch ONLY
-	// on the resolved Session Expiry Interval (Clean Start / resume state is
-	// orthogonal in MQTT 5, mirroring mqttHandleClosedClient's doClean = expiry==0):
-	// zero expiry deletes the record (it ends at connection close); any positive
-	// expiry re-saves it disconnected so a later reconnect can still resume it.
-	//
-	// Both are record writes, so they run in a record transaction like every other
-	// (I8) — opened before the mutation the re-save persists. It is uncontended: the
-	// CONNECT that owns this session released its accept transaction before calling
-	// here, and the client is already detached.
-	//
-	// This path deliberately does NOT take a teardown claim. It removes only the
-	// record, at an exact sequence, and its outcome is decided by the authoritative
-	// re-read below — which is the substance of the release protocol — while it
-	// deletes no consumers, so it has nothing it could wrongly delete. Widening it
-	// into a full teardown would change guarantees this function documents.
-	tok := es.beginRecordTx()
-	defer func() {
-		if terr := es.endRecordTx(tok); terr != nil {
-			s.Errorf("MQTT: %v", terr)
+	// Branch ONLY on the session's EFFECTIVE persisted lifetime, never on the interval
+	// this CONNECT requested. The requested value is not applied at the call site — the
+	// grant happens after the watermark advance whose failure brought us here — so a
+	// rejected RESUME that merely asked for 0 must not have a persistent session's
+	// consumers, QoS 2 holds, affine state and in-flight registers destroyed. This is
+	// also what the candidate record itself says, since the accept save persisted this
+	// same value. Clean Start / resume state is orthogonal in MQTT 5, mirroring
+	// mqttHandleClosedClient's doClean = expiry == 0.
+	if effective == 0 {
+		// A zero lifetime ends the session at connection close, and this CONNECT was
+		// rejected — so the candidate is not DELETED, it is TORN DOWN. That reverses the
+		// rationale this function used to carry ("deliberately does NOT take a teardown
+		// claim ... it deletes no consumers, so it has nothing it could wrongly delete"),
+		// which was written for a world where a bare delete had no consequence beyond the
+		// record. It has one now: the next create into the emptied subject inherits the
+		// deleted record's identity as its parent, so a delete that recorded no retirement
+		// would leave two records in DIFFERENT intervals carrying the same parent — a
+		// FALSE fork, which is the direction that suppresses a delayed Will's cancellation.
+		//
+		// The CLAIM is what licenses the fence: it is a CAS at the candidate's own
+		// sequence, so a same-generation successor rejects it, nothing is deleted and
+		// nothing is fenced, while a won claim means the record it retires really is
+		// current. Recording a retirement without holding the base would instead fence a
+		// legitimate successor permanently. See sess_teardown.go.
+		//
+		// It also deletes this incarnation's consumers and durables, which the bare delete
+		// left to the orphan sweep, and is the correct semantics for a zero lifetime — the
+		// ordinary close path's doClean does the same. clear() opens its own record
+		// transaction, so this branch must hold none.
+		if cerr := es.clear(false); cerr != nil {
+			switch {
+			case errors.Is(cerr, errMQTTClearRefusedUnresolved) &&
+				s.reparkRefusedDiscard(as, es, time.Now().Unix()):
+				// A refusal deleted NOTHING, and this object is the only thing that can
+				// resolve the write it refused over — so the discard is parked and the
+				// session stays RESIDENT. No classification, no timer decision and no
+				// removeSession: the record is neither gone nor re-saved, and the parked
+				// discard is what ends it once the write resolves.
+				report(rollbackParked)
+				return
+			case errors.Is(cerr, errMQTTClearSuperseded):
+				// A normal outcome: the base this teardown claimed is not current, so
+				// nothing here was ours to delete. Logged at debug for the same reason the
+				// close path does — an error line sends an operator hunting a teardown that
+				// never went wrong — and the classification below reports what the survivor
+				// actually is.
+				s.Debugf("MQTT: CONNECT rollback for client hash %q stopped: %v", cidHash, cerr)
+			default:
+				s.Warnf("MQTT: CONNECT rollback for client hash %q could not discard the "+
+					"rejected session: %v", cidHash, cerr)
+			}
 		}
-	}()
-	if expiry == 0 {
-		_ = as.rollbackDeleteSession(es, tok, candidate)
 	} else {
-		es.mu.Lock()
-		es.disconnectedAt = time.Now().Unix()
-		ps := es.buildPersistedSessionLocked()
-		es.mu.Unlock()
-		_ = as.rollbackStoreSession(es, tok, &ps, cidHash, candidate)
+		// Sequence-targeted re-save making the candidate record non-connected, so a later
+		// reconnect can still resume it. A record write, so it runs in a record
+		// transaction like every other (I8) — opened before the mutation it persists. It
+		// is uncontended: the CONNECT that owns this session released its accept
+		// transaction before calling here, and the client is already detached.
+		func() {
+			tok := es.beginRecordTx()
+			defer func() {
+				if terr := es.endRecordTx(tok); terr != nil {
+					s.Errorf("MQTT: %v", terr)
+				}
+			}()
+			es.mu.Lock()
+			es.disconnectedAt = time.Now().Unix()
+			ps := es.buildPersistedSessionLocked()
+			es.mu.Unlock()
+			_ = as.rollbackStoreSession(es, tok, &ps, cidHash, candidate)
+		}()
 	}
 
 	// Classify by an authoritative re-read. A successful re-save lands at a NEW
@@ -347,15 +420,24 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 		result = rollbackApplied
 	case ps.DisconnectedAt != 0:
 		result = rollbackApplied
+	case ps.Teardown != nil && seq > candidate:
+		// A newer record CLAIMED for teardown is neither a legitimate successor nor an
+		// unavailable store, so it must reach neither of those verdicts — and it must
+		// never be fed to the sibling test below, which is why this arm is gated
+		// explicitly and placed FIRST. A marked record is never resumed: createOrRestoreSession
+		// adopts and finishes it. So the candidate is not falsely connected, which is
+		// exactly what rollbackApplied means.
+		//
+		// This is the ordinary outcome of a zero-lifetime rollback whose claim was won and
+		// whose release was then lost. Cancelling the timer is right: the marker preserves
+		// the candidate's DisconnectedAt == 0, so a surviving one-shot would consume itself
+		// as not-due while marker adoption proceeds independently.
+		result = rollbackApplied
 	case seq > candidate:
 		// A newer CONNECTED record. Sequence alone cannot say whether it SUCCEEDS the
 		// candidate or merely shares its parent, and the two demand opposite treatment
-		// of the expiry timer, so the lineage decides. es.wid/es.pwid are still the
-		// candidate's: the re-save above either landed (in which case DisconnectedAt is
-		// set and this arm is unreachable) or did not, and a rollback never adopts.
-		es.mu.Lock()
-		ackWID, ackPWID := es.wid, es.pwid
-		es.mu.Unlock()
+		// of the expiry timer, so the lineage decides — against the pair CAPTURED at
+		// entry, since the zero-lifetime branch above may have zeroed the session's own.
 		if classifyRecordLineage(ps, ackWID, ackPWID) == mqttLineageForked {
 			result = rollbackForked
 			// This site mints like the other six, and that is a CORRECTION rather than an
@@ -390,9 +472,34 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 			st.latest = hi
 		}
 	}
-	// Reconcile the expiry timer from the authoritative re-read (the normal
-	// cancelSessionExpiry on the accept path is skipped here).
+	as.reconcileRollbackTimerLocked(s, cidHash, result, ps)
+	as.removeSession(es, false)
+	as.mu.Unlock()
+
+	if result == rollbackIndeterminate {
+		s.Warnf("MQTT: CONNECT rollback for client hash %q is indeterminate (session store unavailable); the rejected record may linger until the expiry sweep or a later reconnect", cidHash)
+	}
+
+	report(result)
+}
+
+// reconcileRollbackTimerLocked reconciles the session-expiry timer from the rollback's
+// authoritative re-read (the normal cancelSessionExpiry on the accept path is skipped).
+// ps is that re-read's record, or nil when the subject was empty.
+//
+// A named step rather than an inline switch because the impossible arm is behavior: the
+// value that means "nothing was classified" must be observable taking no timer action,
+// where the generic arm would silently cancel a deadline.
+//
+// as.mu must be held.
+func (as *mqttAccountSessionManager) reconcileRollbackTimerLocked(s *Server, cidHash string,
+	result rollbackResult, ps *mqttPersistedSession) {
+
 	switch {
+	case result == rollbackUnset:
+		// UNREACHABLE: every arm of the classification assigns. Reported LOUDLY and taking
+		// no timer action, because the default arm below cancels.
+		s.Errorf("MQTT: CONNECT rollback for client hash %q reached the timer decision with no classification", cidHash)
 	case result == rollbackApplied && ps != nil && ps.DisconnectedAt != 0 &&
 		ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire:
 		// Finite disconnected record: arm from its persisted absolute deadline so
@@ -419,19 +526,6 @@ func (as *mqttAccountSessionManager) rollbackAcceptedSession(s *Server, es *mqtt
 		// applied-absent / zero / never-expire, or superseded (the newer generation
 		// owns its own scheduling): cancel any stale timer.
 		as.cancelSessionExpiryLocked(cidHash)
-	}
-	as.removeSession(es, false)
-	as.mu.Unlock()
-
-	if result == rollbackIndeterminate {
-		s.Warnf("MQTT: CONNECT rollback for client hash %q is indeterminate (session store unavailable); the rejected record may linger until the expiry sweep or a later reconnect", cidHash)
-	}
-
-	as.mu.RLock()
-	done := as.testRollbackDone
-	as.mu.RUnlock()
-	if done != nil {
-		done(es, result)
 	}
 }
 
@@ -463,18 +557,6 @@ func (as *mqttAccountSessionManager) rollbackStoreSession(es *mqttSession, tok r
 		return hook(ps, idHash, seq)
 	}
 	return as.storeSessionRecordCAS(ps, idHash, seq)
-}
-
-// rollbackDeleteSession removes the candidate record at its exact sequence, under
-// the same authorization rule.
-func (as *mqttAccountSessionManager) rollbackDeleteSession(es *mqttSession, tok recordTx, seq uint64) error {
-	es.mu.Lock()
-	terr := es.validateRecordTxLocked(tok)
-	es.mu.Unlock()
-	if terr != nil {
-		return fmt.Errorf("refusing to roll back the record of session %q: %w", es.id, terr)
-	}
-	return as.jsa.deleteMsg(mqttSessStreamName, seq, true)
 }
 
 // rollbackLoadSession loads the current session record for the rollback

@@ -43,15 +43,44 @@ func testMarkUncertainCarrying(sess *mqttSession, baseSeq uint64, body []byte, v
 
 // testRecordBody returns the exact bytes a save of this session's current state
 // would store — the identity an ambiguous write is later classified against.
+//
+// Including the LINEAGE, which the builder does not stamp: production stamps it at the
+// store boundary (see the save path in mqtt.go), so a body with no identity is a shape
+// no save can produce. It matters beyond tidiness — a resolution that proves such an
+// attempt landed adopts an EMPTY wid, after which a teardown of that record cannot name
+// the record its deletion retires and fails closed.
 func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 	t.Helper()
 	sess.mu.Lock()
 	ps := sess.buildPersistedSessionLocked()
+	ps.WID, ps.PWID = mqttNewRecordWID(), sess.parentForNextWriteLocked()
 	sess.mu.Unlock()
 	b, err := json.Marshal(&ps)
 	if err != nil {
 		t.Fatalf("marshal record: %v", err)
 	}
+	return b
+}
+
+// testAmbiguousBodyLocked is an opaque competing attempt's bytes carrying the lineage
+// every real save stamps: a fresh identity parented to the record this session holds.
+// content names the fixture so a failure says which attempt it was.
+//
+// sess.mu must be held, as it is at every site that arms an ambiguity from inside
+// another operation's critical section. testAmbiguousBody is the form for a caller that
+// holds nothing.
+func testAmbiguousBody(sess *mqttSession, content string) []byte {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return testAmbiguousBodyLocked(sess, content)
+}
+
+func testAmbiguousBodyLocked(sess *mqttSession, content string) []byte {
+	b, _ := json.Marshal(&struct {
+		Content string `json:"competing"`
+		WID     string `json:"wid"`
+		PWID    string `json:"pwid"`
+	}{content, mqttNewRecordWID(), sess.parentForNextWriteLocked()})
 	return b
 }
 

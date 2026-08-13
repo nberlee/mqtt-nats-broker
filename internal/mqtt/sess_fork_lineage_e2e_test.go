@@ -442,3 +442,128 @@ func testAssertCurrentOwner(t *testing.T, sess *mqttSession, idHash string) {
 			wid, ps)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T9: the finding itself, over real connections
+// ---------------------------------------------------------------------------
+
+// TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient is T9 (M1).
+//
+// No Will assertion here, unlike the rejection-settlement e2e above: this verdict is
+// reached by the eviction route, which detaches the client first, and a Will lost that way
+// is a residual already recorded for BOTH verdicts (docs/CONFORMANCE.md).
+//
+// The bound session's record here is a PRODUCTION create whose ONLY save is the accept
+// save: the client's previous clean-start close deleted its record, and the reconnect's
+// create inherited the retirement watermark. That is the only reason a sibling of it can be
+// proven — with no second save to supply a parent, an implementation that does not inherit
+// leaves the record parentless and the loser is told 0x8E instead.
+//
+// The verdict is reached through the persist observation rather than the rejection
+// settlement, because the latter needs a record write to reject and any such write would
+// itself give the record a parent, which is exactly what must not be available here.
+func TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// A clean-start session whose close DISCARDS its record: that teardown writes the
+	// watermark naming the record it deletes.
+	c0, r0 := testMQTTConnect(t, &mqttConnInfo{clientID: "createe2e", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r0, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c0, r0, []*mqttFilter{{filter: "createe2e/gone", qos: 1}}, []byte{1})
+	testMQTTFlush(t, c0, nil, r0)
+	testMQTTDisconnect(t, c0, nil)
+	c0.Close()
+
+	asm := testMQTTGetGlobalASM(t, s)
+	idHash := getHash("createe2e")
+	testMQTTWaitForRecordAbsent(t, asm, idHash)
+	if r, _, st := asm.jsa.loadGenRetirement(asm.domainTk, idHash); st != mqttRetirementValid || r.RWID == _EMPTY_ {
+		t.Fatalf("the clean-start close must record a retirement naming the deleted record: status %v", st)
+	}
+
+	// The reconnect's record is a CREATE that inherited it — and stays the only save.
+	ci := &mqttV5ConnInfo{
+		clientID: "createe2e",
+		will:     &mqttWill{topic: []byte("createe2e/will"), message: []byte("bye")},
+	}
+	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	if _, reason, _ := testMQTTReadConnAckV5(t, r); reason != mqttConnAckRCConnectionAccepted {
+		t.Fatalf("CONNACK reason %x", reason)
+	}
+	sess := testMQTTGetClient(t, s, "createe2e").mqtt.sess
+	if sess == nil {
+		t.Fatal("the connection must be bound to a session")
+	}
+	sess.mu.Lock()
+	ackWID, ackPWID := sess.wid, sess.pwid
+	sess.mu.Unlock()
+	if ackWID == _EMPTY_ {
+		t.Fatal("the accept save must be acknowledged")
+	}
+	if ackPWID == _EMPTY_ {
+		t.Fatal("the create must have INHERITED a parent: with no second save, nothing else " +
+			"can give this record one, and a parentless record concedes 0x8E")
+	}
+
+	// A sibling of the create lands, written as ANOTHER broker's record: the session-record
+	// watch filters this broker's own writes out of the eviction route on Origin, so a
+	// locally-authored sibling would never spawn the worker under test.
+	sess.mu.Lock()
+	sibling := sess.buildPersistedSessionLocked()
+	sibling.Gen, sibling.Origin = sess.gen, "othernode"
+	sibling.WID, sibling.PWID = mqttNewRecordWID(), ackPWID
+	sibling.Subs = map[string]byte{"createe2e/sibling": 1}
+	domainTk := sess.domainTk
+	sess.mu.Unlock()
+	body, merr := json.Marshal(&sibling)
+	if merr != nil {
+		t.Fatalf("marshal the sibling: %v", merr)
+	}
+	if _, serr := sess.jsa.storeSessionMsg(domainTk, idHash, 0, body); serr != nil {
+		t.Fatalf("land the sibling record: %v", serr)
+	}
+
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketDisconnect {
+		t.Fatalf("the displaced connection must get a server DISCONNECT, got %x (pl=%d)", pt, pl)
+	}
+	reason, err := r.readByte("disconnect reason")
+	if err != nil {
+		t.Fatalf("read the DISCONNECT reason: %v", err)
+	}
+	if reason != mqttReasonServerBusy {
+		t.Fatalf("a create whose sibling erased it answers 0x89 'try again', never 0x8E "+
+			"'session taken over' — the two creates arbitrated nothing. Got %x", reason)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var buf [256]byte
+	n, rerr := c.Read(buf[:])
+	if n > 0 {
+		t.Fatalf("nothing may follow the DISCONNECT: got %x", buf[:n])
+	}
+	var nerr net.Error
+	if rerr == nil || (errors.As(rerr, &nerr) && nerr.Timeout()) {
+		t.Fatalf("the connection must be CLOSED after the 0x89, not merely idle: %v", rerr)
+	}
+}
+
+// testMQTTWaitForRecordAbsent waits for a client's session record to be gone, which is what
+// a clean-start close leaves behind once its teardown completes.
+func testMQTTWaitForRecordAbsent(t *testing.T, asm *mqttAccountSessionManager, idHash string) {
+	t.Helper()
+	deadline := time.Now().Add(testMQTTTimeout)
+	for time.Now().Before(deadline) {
+		if _, err := asm.jsa.loadSessionMsg(asm.domainTk, idHash); err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				t.Fatalf("loadSessionMsg: %v", err)
+			}
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatal("the clean-start close never deleted the session record")
+}

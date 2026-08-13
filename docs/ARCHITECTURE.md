@@ -455,13 +455,54 @@ JetStream request timeout, and the nested retry loops inside `claimTeardown` and
 `releaseTeardown` are not deadline-checked. On exhaustion the CONNECT is refused, with
 nothing resident and nothing bound — the state a fresh CONNECT starts from.
 
-**What this does not close.** One shape remains, tracked as a `docs/ROADMAP.md` §0.2
-blocker rather than an accepted limit, because it needs durable state this design does
-not introduce: telling two parentless first-creates racing across a leader term apart
-from two unrelated ones. The other — the window in which a teardown that WON its claim
-has already deleted the consumers a cross-term survivor's record still names — is closed
-by the generation-retirement watermark, which is durable state off the record subject
-and therefore outside this design's reach (see "The generation-retirement watermark").
+**The CONNECT rollback ARBITRATES before it fences, and its own documented rationale is
+REVERSED** (F-029b). The rollback that undoes an accepted CONNECT whose Will-cancel
+watermark could not be advanced used to say, in as many words, that it deliberately takes
+no teardown claim: it removed only the record, at an exact sequence, and deleted no
+consumers, so it had nothing it could wrongly delete. That was true while a bare delete
+had no consequence beyond the record. It has one now — the next create into the emptied
+subject inherits the deleted record's identity as its parent — so a delete that recorded
+no retirement would leave two records in DIFFERENT intervals carrying the same parent,
+which is a FALSE fork, the one direction that suppresses a delayed Will's cancellation.
+Four consequences, each load-bearing:
+
+- **The predicate is the session's EFFECTIVE persisted lifetime**, never the interval this
+  CONNECT requested. The requested value is not applied at the call site — the grant
+  happens after the watermark advance whose failure calls the rollback — so branching on
+  it would let a rejected RESUME that merely asked for 0 destroy a persistent session's
+  consumers, QoS 2 holds, affine state and in-flight registers. That was a live defect in
+  the bare-delete form, and fixing it is part of the same change.
+- **A zero lifetime tears the candidate DOWN rather than deleting it**: `clear()`'s
+  seventh call site. The CLAIM is what licenses the fence, because it is a CAS at the
+  candidate's own sequence — a same-generation successor rejects it, nothing is deleted
+  and nothing is fenced, while a won claim means the record it retires really is
+  current. Recording a retirement without holding the base would instead fence a
+  legitimate successor permanently and route it through a destructive discard. What the
+  claim does NOT bound is the cross-term apply that regresses the single slot: this
+  caller inherits that residual from every other `clear()` caller, and
+  `docs/CONFORMANCE.md` states it as new exposure on this path, because the bare delete
+  it replaces could not reach it. The teardown also deletes this incarnation's consumers
+  and durables, which the bare delete left to the orphan sweep, and which is what a zero
+  lifetime means on the ordinary close path too.
+- **The classification reads the pair captured at ENTRY**, because `clear()` zeroes
+  `wid`/`pwid`; read afterwards, a genuine sibling of the candidate would be reported as
+  a legitimate newer generation. A newer record MARKED for teardown classifies applied —
+  it is never resumed, so the candidate is not falsely connected — and is gated
+  explicitly so a marker never reaches the sibling test.
+- **A refused teardown parks rather than abandons.** `clear()` refuses while a record
+  write is unresolved, having deleted nothing, and the rejected session object is the only
+  thing that can resolve that write — so the discard is parked and the session stays
+  resident, reported as its own outcome. The function's unconditional "the in-memory
+  session is removed" therefore becomes "removed, or retained as a parked discard".
+
+**What this does not close.** The shape this design left open — telling two parentless
+first-creates racing across a leader term apart from two unrelated ones — is closed by
+inheriting the retired record's identity (see "Recognising a forked session record"), for
+every interval a valid retirement watermark describes; what still concedes is stated in
+`docs/CONFORMANCE.md`. The other — the window in which a teardown that WON its claim has
+already deleted the consumers a cross-term survivor's record still names — is closed by
+the generation-retirement watermark, which is durable state off the record subject and
+therefore outside this design's reach (see "The generation-retirement watermark").
 
 ### The session-record watch
 
@@ -537,12 +578,12 @@ Two shapes trigger, and the second is the one no sequence comparison can see:
   pre-dispatch on that connection's readLoop — so unlike the moved-record shape, this
   one does not converge a bound client that never sends again (`docs/CONFORMANCE.md`,
   and a roadmap bullet of its own). Absence IS an ownership fact: production contains
-  exactly two deleters of
-  a session record — `releaseTeardown`, at a marker sequence a claim CAS won, and
-  `rollbackDeleteSession`, at the failed CONNECT candidate's own sequence — so a
-  record can only vanish under a party that first claimed it. The bound outcome is
-  therefore **0x8E**, not 0x89; `docs/CONFORMANCE.md` records the one imprecision that
-  leaves.
+  exactly ONE deleter of a session record — `releaseTeardown`, at a marker sequence a
+  claim CAS won — so a record can only vanish under a party that first claimed it.
+  The CONNECT rollback used to be a second, unclaimed one; it now tears down through
+  `clear()` instead, which is the stronger statement this arm always wanted. The bound
+  outcome is therefore **0x8E**, not 0x89; `docs/CONFORMANCE.md` records the one
+  imprecision that leaves.
 
 **Observing our own writes is new, and one shape of it is dangerous.** The old channel
 never delivered this broker's own stores; a stream watch delivers everything. A save
@@ -613,7 +654,7 @@ acceptance is not the question. In a clustered stream the expected-sequence chec
 only BEFORE the proposal (`canConsistencyCheck := !isClustered`, nats-server v2.14.4
 `server/stream.go:6247`), so a proposal already accepted into the log applies whatever
 happened to the subject meanwhile, INCLUDING an exact-sequence delete — and this broker
-issues those (`rollbackDeleteSession`, `clear()`). Disposing on absence therefore
+issues those (only `clear()` now, the CONNECT rollback included). Disposing on absence therefore
 reproduces the same late-landing false-foreign shape, one arm over.
 
 **So both cases are settled by a CAS: the attempt's exact bytes are RE-SENT at the
@@ -751,14 +792,42 @@ suppressed it.
 **The chain also crosses the teardown re-mint**, which is what makes a clean-start fork
 visible at all. `clear()` zeroes `wid`/`pwid` — the session is acknowledged for nothing
 once its record is deleted, and six sites read `wid` as exactly that — but it records the
-WID of the record the teardown CLAIMED in a third field, `reMintedFrom`, and both
+WID of the record the teardown CLAIMED in a third field, `retiredBaseWID`, and both
 parenting sites take their parent from `parentForNextWriteLocked()`: the record we hold,
 or that one when we hold none. So the sibling of base `a` written after tearing `a` down
-is `{c, a}` rather than `{c, ""}`, and a resume child `{b, a}` recognises it. The
-adopted-teardown create takes the same parent from the marker's own `PWID` — the record
-that teardown claimed, not the marker, which the release deletes and which is nobody's
-base — so the cross-broker fork is recognisable from either side. The field is
+is `{c, a}` rather than `{c, ""}`, and a resume child `{b, a}` recognises it. The field is
 memory-only and self-retiring: once a save lands, `wid` is authoritative again.
+
+**A create descends from the record whose deletion emptied the subject**, and that is one
+rule with three sources rather than three rules (F-029b). The durable identity of an
+empty-subject interval is the identity of the record that was deleted to produce it, so a
+create becomes a *child* of the record it replaces: two creates in one interval are
+siblings of each other, and a create in a later interval is a descendant rather than a
+sibling. Ordering survives deletions with no new comparison anywhere, which is why the
+token is the retired record's identity and not a fresh interval nonce. The three sources
+all name that same record:
+
+| The teardown that emptied the subject | Where the create's parent comes from |
+|---|---|
+| performed by this object itself | `clear()`'s `retiredBaseWID`, the record its claim held |
+| ADOPTED by this broker, marker still readable | the marker's own `PWID` — the record that teardown claimed, not the marker, which the release deletes and which is nobody's base |
+| already complete, no marker survives | the generation-retirement watermark's `RWID` (see "The generation-retirement watermark") |
+
+Without the third source the one shape the recognition could not see was the **cross-term
+create pair**: both brokers find the subject empty, both are admitted at base 0
+pre-proposal, both apply, `MaxMsgsPer: 1` discards the earlier, and both records are
+parentless — so arm 2's `ackPWID != ""` conjunct concedes, and the erased side answers
+0x8E about a takeover nothing arbitrated. Inheriting the retired record's identity makes
+the pair siblings from either side, including the MIXED pair where one broker tore the
+record down locally and the other only ever saw an empty subject. Inheriting the
+watermark's `Nonce` instead would miss exactly that pair: the two sides would carry
+different tokens and both would concede.
+
+A create-parented fork is **recognised and repaired by nothing**: a create has a parent
+POINTER and no parent CONTENT, so `buildForkedGrantLocked` returns nil and no capsule is
+minted. Merging against an empty base is the union "Repairing a recognised fork" refutes.
+`docs/CONFORMANCE.md` states the residuals, which are one missed recognition (a
+record-absent create with no usable watermark still concedes) and four false-fork routes.
 
 Sibling-hood is defined against the **acknowledged** pair, never the in-flight attempt:
 with acknowledged `{a,p}` and attempt `{c,a}`, survivor `{b,p}` is the fork, `{d,a}` is a
@@ -948,7 +1017,7 @@ body already rides `mqttSessSaveDetail` as `d.body`, and `mqttPendingWrite` alre
 carries it inside `framed`, no field was added to either. The restore sets the parent
 **nil**, which is the honest answer: this broker holds no copy of that record's own
 parent, so nothing about it is repairable. `clear()` drops both — and that asymmetry
-against `reMintedFrom` is the point: a sibling of the retired base must stay RECOGNISABLE,
+against `retiredBaseWID` is the point: a sibling of the retired base must stay RECOGNISABLE,
 but nothing of the retired incarnation may be RE-ASSERTED into the fresh one. **The
 invariant is not "`grantBodyParent` always names `pwid`"; it is "a nil body means nothing
 is repairable".**
@@ -2348,7 +2417,7 @@ The invariants, in the order they matter:
   is enumerated below rather than summarized: the shared recovery can decline, so this
   section deliberately asserts no universal recovery.
   The refusal was once opt-in for the deferred discharge alone, because no other caller
-  could act on it; three more now can — four of the six call sites in all — so the flag
+  could act on it; four more now can — five of the seven call sites in all — so the flag
   was a mechanism reading
   "true" at every site it could reach. The refusal alone is not enough either:
   "never tear down on an unclassified sequence" would otherwise become "strand the object
@@ -2652,13 +2721,16 @@ consumers, holds and in-flight registers that no longer exist.
 
 The fix keeps the retirement fact **off the replaceable subject**. Every teardown that
 wins its claim first records a permanent per-client watermark on `$MQTT_teardown`
-(`{id, gen, mseq, nonce, origin, started}`, one subject per client, `MaxMsgsPer: 1`),
-and only then deletes. It is written on both writers — `clear()` and
+(`{id, gen, mseq, rwid, nonce, origin, started}`, one subject per client,
+`MaxMsgsPer: 1`), and only then deletes. It is written on both writers — `clear()` and
 `finishAdoptedTeardown`, which deletes the same resources under a marker just as
 evictable — always confirmed, even on a no-wait discard: a fence that only reached a
-send queue is not a fence. A write that cannot be confirmed **aborts the teardown with
-nothing deleted**, leaving the record marked, which is the already-handled
-self-healing state.
+send queue is not a fence. There are two direct writers and a **third initiating
+path**: the CONNECT rollback's zero-lifetime branch, which routes through `clear()`
+rather than fencing on its own (see "Two frontends taking over one session from the
+same base"), so nothing else can record a retirement without holding the base. A write
+that cannot be confirmed **aborts the teardown with nothing deleted**, leaving the record
+marked, which is the already-handled self-healing state.
 
 **A generation whose retirement was ever recorded is retired, and stays fenced.**
 `mseq` — the `$MQTT_sess` sequence the claim marker landed at — is the ordering field,
@@ -2670,11 +2742,21 @@ same-generation retirement be skipped and leave a paused older writer's write fi
 The monotonicity is **decision-time** monotonicity; an admitted CAS that applies after
 a leader transition can still regress the single slot, which is a stated residual.
 
-Three readers consume the fence, and each applies the same validation
+**`rwid` names the RECORD the deletion removed** — the record the teardown claimed,
+never the marker that claimed it — and it is REQUIRED: a watermark without it is
+corrupt to every reader, because it is the field a create inherits as its parent (see
+"Recognising a forked session record"). It cannot be optional and cannot be filled in
+later: the validator cannot tell "field absent" from "field present and empty", so
+accepting an empty one would accept the pre-`rwid` shape the compatibility boundary
+refuses. By the same rule, a teardown of a record carrying no `WID` **fails closed**
+with the record left marked, rather than retiring a record on a name nothing can
+attribute.
+
+Four readers consume the fence, and each applies the same validation
 (`mqttValidateGenRetirement`: decodable, the client ID hashes back to the subject
-token, a valid generation, a nonzero `mseq`) with the same fail-closed disposition —
-a watermark that is unreadable or malformed in any field is never repaired in place,
-because it may name a retirement newer than the reader's own:
+token, a valid generation, a nonzero `mseq`, a non-empty `rwid`) with the same
+fail-closed disposition — a watermark that is unreadable or malformed in any field is
+never repaired in place, because it may name a retirement newer than the reader's own:
 
 - **The winner's release-superseded arm.** The release now hands back the record it
   classified against; when that record carries the generation just retired and no
@@ -2695,12 +2777,30 @@ because it may name a retirement newer than the reader's own:
   every reconnect resumes the same hollow record until the sweep runs.
 - **The orphan sweep**, for a client that never comes back. See "Orphan
   reconciliation".
+- **The record-absent CREATE**, which is the only non-destructive reader: it draws no
+  conclusion about a record, because there is none. It reads `rwid` as the parent its
+  first write descends from, immediately AFTER the proof that the subject is empty —
+  and that order is load-bearing, since the watermark is confirmed before the deletion
+  it precedes, so a watermark read after observing the subject empty is at least as new
+  as the deletion that emptied it. Its dispositions differ from the destructive readers'
+  in exactly one row, and deliberately: **corrupt REFUSES the CONNECT**, because
+  admitting a session over a watermark this broker cannot read leaves its own later
+  teardown unable to record a retirement — the record would then stay marked for every
+  future finisher — while **indeterminate concedes**, creating parentless rather than
+  failing a fresh CONNECT over a transient `$MQTT_teardown` read. Nothing unsupported is
+  established by conceding: no record exists yet, and a later teardown re-reads and
+  fences normally. **Absent also concedes**, and makes no positive claim from the
+  absence: `$MQTT_teardown` can be recreated alone and validate clean with no historical
+  fences, so "no retirement is recorded here now" is not "none ever happened". That is
+  the stated residual in `docs/CONFORMANCE.md`.
 
-Two things a marker means constrain all three: it licenses its adopters to delete
-every durable the record names, and the CONNECT discard deletes them itself. So each
-reader validates the record with `mqttValidateTeardownTargets` before it acts — the
+Two things a marker means constrain the three DESTRUCTIVE readers: it licenses its
+adopters to delete every durable the record names, and the CONNECT discard deletes them
+itself. So each
+of them validates the record with `mqttValidateTeardownTargets` before it acts — the
 CONNECT *refuses* rather than discarding — and a record whose names are not this
-session's is condemned by nobody.
+session's is condemned by nobody. The create-side reader names no target and deletes
+nothing, so it has none to validate.
 
 Nothing ever reaps a watermark. Storage is bounded by the client-ID population, as it
 is for the `$MQTT_willcancel` markers, and permanence is what keeps the residual from

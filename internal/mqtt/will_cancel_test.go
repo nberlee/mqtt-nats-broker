@@ -647,8 +647,11 @@ func TestMQTTWillOutboxWatermarkRollbackNeverExpireCancelsTimer(t *testing.T) {
 	setRollbackSessionStoreHook(asm, func(*mqttPersistedSession, string, uint64) error { return nil })
 	defer setRollbackSessionStoreHook(asm, nil)
 
-	es := &mqttSession{id: "wm8dnever", idHash: cidHash, jsa: &asm.jsa, c: &client{}}
-	asm.rollbackAcceptedSession(s, es, cidHash, 998, mqttSessionNeverExpire)
+	// The EFFECTIVE lifetime is what the rollback branches on, so it is the session's
+	// own field and not a parameter: never-expire re-saves the record disconnected.
+	es := &mqttSession{id: "wm8dnever", idHash: cidHash, jsa: &asm.jsa, c: &client{},
+		expiryInterval: mqttSessionNeverExpire}
+	asm.rollbackAcceptedSession(s, es, cidHash, 998)
 
 	if testMQTTPendingExpiryTimer(asm, cidHash) != nil {
 		t.Fatal("never-expire rollback must cancel the stale finite timer")
@@ -976,13 +979,14 @@ func TestMQTTWillOutboxWatermarkConnectFailureStaleReconcileWorker(t *testing.T)
 	setRollbackSessionStoreHook(asm, func(*mqttPersistedSession, string, uint64) error { return nil })
 	defer setRollbackSessionStoreHook(asm, nil)
 
-	es := &mqttSession{id: id, idHash: cidHash, jsa: &asm.jsa, c: &client{}}
+	// The finite branch is selected by the session's EFFECTIVE lifetime.
+	es := &mqttSession{id: id, idHash: cidHash, jsa: &asm.jsa, c: &client{}, expiryInterval: 3600}
 	asm.mu.Lock()
 	asm.sessions[es.id] = es
 	asm.sessByHash[es.idHash] = es
 	asm.mu.Unlock()
 
-	asm.rollbackAcceptedSession(s, es, cidHash, candidate, 3600)
+	asm.rollbackAcceptedSession(s, es, cidHash, candidate)
 
 	es.mu.Lock()
 	cNil := es.c == nil
@@ -1305,4 +1309,109 @@ func TestMQTTWillOutboxWatermarkIndeterminateAborts(t *testing.T) {
 	// the deferred Will now fires — proving it was deferred, never lost.
 	setWillCancelWatermarkLoadHook(asm, nil)
 	testMQTTReadPublishV5(t, rs, "will/wmindet", []byte("deferred"))
+}
+
+// TestMQTTWatermarkRollbackKeepsAPersistentSessionOnARequestedZero is T14 (M13).
+//
+// The rollback branches on the session's EFFECTIVE persisted lifetime, never on the
+// interval this CONNECT requested. mqttProcessConnect deliberately does not apply the
+// requested value on a resume — the grant happens after the watermark advance whose failure
+// calls the rollback — so a rejected resume that merely ASKED for 0 must not have a
+// persistent session's record, consumers and durables destroyed.
+//
+// Driven over real connections because the mutation lives at the boundary between the two
+// values: a unit call into the rollback cannot see a caller that applies the request early.
+// clear() is asserted through its own window hook rather than inferred from the aftermath.
+func TestMQTTWatermarkRollbackKeepsAPersistentSessionOnARequestedZero(t *testing.T) {
+	// NOT parallel: the clear-window hook it asserts through is process-global state.
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	asm := testMQTTGetGlobalASM(t, s)
+
+	clientID := "wmzero"
+	cidHash := getHash(clientID)
+
+	// A PERSISTENT session: expiry 120, a QoS 1 subscription's durable, then a clean
+	// disconnect that leaves the record behind.
+	c1, r1 := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID: clientID, cleanStart: true, props: mqttV5ConnPropsSessionExpiry(120),
+	}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r1)
+	if codes := testMQTTSubV5(t, c1, r1, 1, []mqttV5SubFilter{{topic: "wmzero/x", opts: 1}}); codes[0] != 1 {
+		t.Fatalf("SUBACK reason %x", codes[0])
+	}
+	testMQTTDisconnect(t, c1, nil)
+	c1.Close()
+
+	before := testLoadSessionRecordFor(t, asm, cidHash)
+	if before == nil {
+		t.Fatal("the persistent session's record must survive its disconnect")
+	}
+	if before.ExpiryInterval != 120 {
+		t.Fatalf("fixture: the persisted lifetime must be finite and non-zero, got %v", before.ExpiryInterval)
+	}
+	if len(before.Cons) == 0 {
+		t.Fatal("fixture: the record must name a durable, or 'not destroyed' proves little")
+	}
+
+	// A resume that REQUESTS expiry 0 and whose watermark advance fails.
+	cleared := false
+	restoreClear := setMQTTTestClearWindowHook(func(sess *mqttSession, _ string) {
+		if sess.idHash == cidHash {
+			cleared = true
+		}
+	})
+	defer restoreClear()
+	obs := captureRollback(asm)
+	failWatermarkStoreFor(asm, cidHash, false)
+	defer setWillCancelWatermarkStoreHook(asm, nil)
+
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID: clientID, props: mqttV5ConnPropsSessionExpiry(0),
+	}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testExpectNoConnAck(t, c2, r2)
+	awaitRollback(t, obs)
+
+	if cleared {
+		t.Fatal("a rejected resume must not TEAR DOWN a session whose persisted lifetime is " +
+			"non-zero: the requested interval was never granted")
+	}
+	after := testLoadSessionRecordFor(t, asm, cidHash)
+	if after == nil {
+		t.Fatal("the persistent session's record must survive the rollback")
+	}
+	if after.DisconnectedAt == 0 {
+		t.Fatal("the rollback must re-save the record as disconnected")
+	}
+	if len(after.Cons) != len(before.Cons) {
+		t.Fatalf("the rollback must keep the session's durables: %v want %v", after.Cons, before.Cons)
+	}
+	for _, cc := range after.Cons {
+		if _, lerr := asm.jsa.lookupConsumer(mqttStreamName, cc.Durable); lerr != nil {
+			t.Fatalf("durable %q was deleted by a rollback that only re-saves: %v", cc.Durable, lerr)
+		}
+	}
+	if _, _, st := asm.jsa.loadGenRetirement(asm.domainTk, cidHash); st != mqttRetirementAbsent {
+		t.Fatalf("a re-saving rollback retires nothing, so it fences nothing: watermark status %v", st)
+	}
+}
+
+// testLoadSessionRecordFor decodes a client's session record, or nil when the subject is
+// empty.
+func testLoadSessionRecordFor(t *testing.T, asm *mqttAccountSessionManager, cidHash string) *mqttPersistedSession {
+	t.Helper()
+	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, cidHash)
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			t.Fatalf("loadSessionMsg: %v", err)
+		}
+		return nil
+	}
+	ps := &mqttPersistedSession{}
+	if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
+		t.Fatalf("unmarshal the session record: %v", uerr)
+	}
+	return ps
 }

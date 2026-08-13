@@ -140,8 +140,9 @@ func TestMQTTSessionDeleteAlreadyDeletedReplicated(t *testing.T) {
 	// gone, so somebody else already released this session" — and clear() used to
 	// flatten that to nil. It now returns errMQTTClearSuperseded, which says the same
 	// thing with a type: the base is not current, nothing was deleted on its behalf, and
-	// there is no further record work. All six callers treat it as complete (four are
-	// terminal, the two CONNECT paths re-read and start fresh).
+	// there is no further record work. All seven callers treat it as complete: four are
+	// terminal, the two CONNECT restore paths re-read and start fresh, and the CONNECT
+	// rollback logs it and lets its own authoritative re-read classify the survivor.
 	//
 	// So the check is narrowed rather than relaxed: anything OTHER than those two
 	// outcomes is still a rejection of the already-deleted record.

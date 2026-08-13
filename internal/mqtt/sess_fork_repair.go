@@ -470,7 +470,7 @@ func (g *mqttForkedGrant) isEmpty() bool {
 // restored from the stream (no known parent content here), or it is the first record after
 // a teardown re-mint, whose protection is the teardown claim protocol rather than this
 // repair. Note the invariant is not "grantSnapParent always names sess.pwid" — clear()
-// keeps the retiring WID in reMintedFrom, so the first post-re-mint save has a non-empty
+// keeps the retiring WID in retiredBaseWID, so the first post-re-mint save has a non-empty
 // PWID with no parent content — it is "a nil parent means unrepairable".
 //
 // sess.mu must NOT be held.

@@ -420,6 +420,9 @@ func TestOrphanSweepAdoptsATeardownWhileItsOwnerResumes(t *testing.T) {
 		t.Fatalf("loading the session record: ps=%v err=%v", ps, err)
 	}
 	ps.Teardown = &mqttSessTeardown{Origin: "deadnode", Nonce: nuid.Next(), StartedAt: time.Now().Unix()}
+	// The marker's LINEAGE, as claimTeardown stamps it: its own identity, parented to the
+	// record it claimed. The finisher retires that parent by name.
+	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
 	raw, err := json.Marshal(ps)
 	if err != nil {
 		t.Fatalf("marshalling the marked record: %v", err)

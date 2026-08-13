@@ -549,8 +549,12 @@ func TestSessLowerSequenceSiblingAtEveryOtherGate(t *testing.T) {
 
 		// The candidate sits ABOVE the surviving record, so `seq > candidate` is false
 		// and the lineage must never be consulted: the caller-specific answer is
-		// INDETERMINATE, not forked and not superseded.
-		e.asm.rollbackAcceptedSession(e.s, e.sess, e.idHash, recSeq+5, 3600)
+		// INDETERMINATE, not forked and not superseded. A positive EFFECTIVE lifetime
+		// keeps this on the re-save branch rather than the teardown.
+		e.sess.mu.Lock()
+		e.sess.expiryInterval = 3600
+		e.sess.mu.Unlock()
+		e.asm.rollbackAcceptedSession(e.s, e.sess, e.idHash, recSeq+5)
 		if got != rollbackIndeterminate {
 			t.Fatalf("a record below the candidate is indeterminate, never forked: got %v", got)
 		}
@@ -602,6 +606,9 @@ func TestSessForkedRollbackReportsForkedAndKeepsTheTimer(t *testing.T) {
 			e.sess.mu.Lock()
 			candidate := e.sess.seq
 			e.sess.disconnectedAt = 0 // the accept save's shape: durably CONNECTED
+			// A positive EFFECTIVE lifetime so the rollback re-saves rather than tearing
+			// down; the rollback reads it off the session.
+			e.sess.expiryInterval = 3600
 			e.sess.mu.Unlock()
 
 			// The staged record is CONNECTED too, which is what makes the sequence-only
@@ -618,10 +625,9 @@ func TestSessForkedRollbackReportsForkedAndKeepsTheTimer(t *testing.T) {
 			e.asm.testRollbackDone = func(_ *mqttSession, r rollbackResult) { got = r }
 			e.asm.mu.Unlock()
 
-			// A positive expiry so the rollback re-saves rather than deleting; the
-			// re-save is CAS-rejected by the moved record, which is what leaves the
+			// The re-save is CAS-rejected by the moved record, which is what leaves the
 			// classification to the re-read.
-			e.asm.rollbackAcceptedSession(e.s, e.sess, e.idHash, candidate, 3600)
+			e.asm.rollbackAcceptedSession(e.s, e.sess, e.idHash, candidate)
 
 			if got != tc.want {
 				t.Fatalf("rollback result = %v, want %v", got, tc.want)

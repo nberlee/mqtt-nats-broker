@@ -10,10 +10,10 @@ section 0.2), so every finding here is an unconditional alpha blocker.
 The one arbitration design these findings share was made on 2026-08-11 and is sliced
 in dependency order: Slice A (the observation and convergence backbone) landed first
 and NARROWED F-036 without closing it, F-029 is Slice B and closed on 2026-08-11
-leaving F-029a and F-029b behind, and F-027 is Slice C, closed on 2026-08-12. Each
-remaining slice gets its own
-implementation-depth plan against that design; the roadmap bullets carry the
-constraints each must answer.
+leaving F-029a and F-029b behind, F-027 is Slice C, closed on 2026-08-12, and both
+remainders are now closed too — F-029a on 2026-08-12 and F-029b on 2026-08-13. Each
+remaining slice gets its own implementation-depth plan against that design; the roadmap
+bullets carry the constraints each must answer.
 
 The text under each “Original finding record” heading is preserved from the roadmap as
 it existed on 2026-08-10.
@@ -140,7 +140,9 @@ narrower than the parent CAS hole they come from.
 
 **Title:** Cross-term create × create recognition
 
-- Status: Open
+- Status: **Closed** on 2026-08-13 by inheriting the retired record's identity
+  (`internal/mqtt/sess_teardown.go`'s `rwid`, `createOrRestoreSessionWithin`'s
+  record-absent arm; `docs/ARCHITECTURE.md`, "Recognising a forked session record").
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Filed: 2026-08-11, out of F-029's implementation
@@ -152,6 +154,54 @@ parent precisely so two unrelated first-creates do not read as siblings. A `boun
 parentless arm was designed and refuted: its premise is false, and a FALSE fork verdict
 suppresses delayed-Will cancellation, so this is not a vocabulary-only gap. The roadmap
 bullet carries the full refutation.
+
+**How it was closed.** The finding asked for a durable identity for each empty-subject
+interval that both racing creates inherit, and that fact was already recorded,
+permanently and per client, before every deletion: the generation-retirement watermark.
+It gains one required field, `rwid`, naming the RECORD its deletion removes — the record
+the teardown claimed, never the marker that claimed it — and a fourth reader, the
+record-absent create, which inherits it as the parent of its first write immediately
+after the proof that the subject is empty. So a create becomes a child of the record it
+replaces: two creates in one interval are siblings of each other, a create in a later
+interval is a descendant, and ordering survives deletions with no new comparison
+anywhere. `classifyRecordLineage` is untouched; the whole change to the seven consults
+is where a parent token comes from.
+
+Three designs were refuted on the way and are recorded so they are not re-proposed: a
+separate per-client deletion-fact stream, whose objection was answered at the root by
+the rollback rework below and which otherwise adds a second pre-deletion marker stating
+an overlapping fact; inheriting the watermark's `nonce`, which misses the MIXED pair
+where one broker tears the record down locally while the other only sees an empty
+subject; and minting a retirement watermark at a first create, which would fence the
+session being created and unfence a generation a real teardown retired.
+
+The invariant the design rests on is that every record deletion this broker performs
+advances the interval identity — so the CONNECT rollback's bare sequence-targeted delete
+had to go. It now runs the real teardown, whose CLAIM is a CAS at the candidate's own
+sequence: a same-generation successor rejects it, nothing is deleted and nothing is
+fenced, while a won claim means the record it retires really is current. Recording a
+fence without holding the base would have permanently condemned a legitimate successor.
+That rework also fixed a live defect of its own — the bare delete branched on the
+interval the CONNECT REQUESTED rather than the session's effective persisted lifetime,
+so a rejected resume that asked for 0 destroyed a persistent session's record. It also
+carries the one piece of new exposure this closure has: the claim it takes can be
+regressed by a cross-term apply, which the bare delete could not reach, and that is
+stated as a residual rather than claimed away.
+
+What is left is stated by DIRECTION rather than by count. A record-absent create with no
+usable watermark — a genuine first interval, a client whose retirement history was lost,
+or an indeterminate read — still concedes exactly as before, and is filed as its own
+`docs/ROADMAP.md` §0.2 bullet carrying the refutation of the cheap fix (a reserved token
+stamped on the Absent arm mints a positive claim out of an absence, and `$MQTT_teardown`
+can be recreated alone and validate clean with no historical fences). The four other
+routes are residuals in `docs/CONFORMANCE.md`. They are named for the false-fork
+direction because that is the dangerous one, but three of them also concede: a stale
+read across a remote lifecycle and a regressed watermark slot give the two creates of
+one interval different parents, and an out-of-band deletion leaves the watermark naming
+the last RETIRED record rather than the deleted one. Each is bounded by the same two
+facts: no false verdict can resurrect state, because the anchor's generation conjunct
+drops any capsule minted for a create, and a survivor carrying a retired generation is
+condemned by the retirement fence.
 
 ### Original finding record
 

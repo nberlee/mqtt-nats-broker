@@ -79,7 +79,7 @@ func testArmAtClearWindow(t *testing.T, e *testDeferredEnv, window string) func(
 		}
 		armed = true
 		sess.mu.Lock()
-		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
+		testMarkUncertainLocked(sess, sess.seq, testAmbiguousBodyLocked(sess, "ambiguous"))
 		sess.mu.Unlock()
 	})
 	t.Cleanup(restore)
@@ -191,7 +191,7 @@ func TestMQTTExpiryReparksTheRefusedDiscardAtTheFence(t *testing.T) {
 func TestMQTTExpiryReparksTheRefusedDiscardAtClearEntry(t *testing.T) {
 	t.Parallel()
 	e, disconnectedAt := testExpiringEnv(t, "client-expiry-entry", "expiry.entry")
-	testMarkUncertain(e.sess, e.sess.seq, []byte(`{"competing":"ambiguous"}`))
+	testMarkUncertain(e.sess, e.sess.seq, testAmbiguousBody(e.sess, "ambiguous"))
 
 	testFireExpiry(t, e)
 	e.assertRefusedDiscardParked(t, disconnectedAt)
@@ -275,7 +275,7 @@ func TestMQTTExpiryKeepsHistoricalOutcomeWhenAPostClaimFailureLeavesItUnresolved
 			// Synthesized, not production-reachable: clear() holds the fence across the
 			// claim and this delete, so a real writer could not arm uncertainty here.
 			e.sess.mu.Lock()
-			testMarkUncertainLocked(e.sess, e.sess.seq, []byte(`{"competing":"ambiguous"}`))
+			testMarkUncertainLocked(e.sess, e.sess.seq, testAmbiguousBodyLocked(e.sess, "ambiguous"))
 			e.sess.mu.Unlock()
 		}
 		return errors.New("test: the session record delete is unavailable")
@@ -454,7 +454,7 @@ func TestMQTTExpiryDeclinesRecoveryForAnyOtherParkedShape(t *testing.T) {
 	for name, action := range shapes {
 		t.Run(name, func(t *testing.T) {
 			e, _ := testExpiringEnv(t, "client-expiry-decline-"+name, "expiry.decline")
-			testMarkUncertain(e.sess, e.sess.seq, []byte(`{"competing":"ambiguous"}`))
+			testMarkUncertain(e.sess, e.sess.seq, testAmbiguousBody(e.sess, "ambiguous"))
 			if !e.sess.deferDisconnect(action) {
 				t.Fatal("park the pre-existing action")
 			}

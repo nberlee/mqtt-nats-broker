@@ -6070,7 +6070,10 @@ func TestMQTTv5SessionExpiryStaleTimerRecordState(t *testing.T) {
 
 			// Rewrite the record (bumping the stream sequence past ours) as another
 			// server would, while this server still holds the session and its timer.
-			ps := mqttPersistedSession{Origin: "remote", ID: "seh4", Gen: mqttNewSessGen(), ExpiryInterval: 100, DisconnectedAt: test.disconnAt()}
+			// WID included, as every real save stamps one: a record with no identity
+			// cannot be retired by name, so a teardown of it fails closed.
+			ps := mqttPersistedSession{Origin: "remote", ID: "seh4", Gen: mqttNewSessGen(),
+				WID: mqttNewRecordWID(), ExpiryInterval: 100, DisconnectedAt: test.disconnAt()}
 			b, err := json.Marshal(&ps)
 			require_NoError(t, err)
 			_, err = asm.jsa.storeSessionMsg(asm.domainTk, hash, 0, b)
@@ -6638,6 +6641,13 @@ func testMQTTPlantSessionRecord(t testing.TB, js nats.JetStreamContext, domainTk
 	// DOES care sets its own and keeps it.
 	if ps.Gen == _EMPTY_ {
 		ps.Gen = mqttNewSessGen()
+	}
+	// Same rule for the record's own IDENTITY: every save stamps one at the store
+	// boundary, and a teardown of a record that carries none fails closed, because
+	// nothing can name the record its deletion would retire. A fixture that cares about
+	// lineage sets its own and keeps it.
+	if ps.WID == _EMPTY_ {
+		ps.WID = mqttNewRecordWID()
 	}
 	b, err := json.Marshal(ps)
 	if err != nil {

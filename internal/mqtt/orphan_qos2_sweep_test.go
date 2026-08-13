@@ -2139,6 +2139,11 @@ func TestOrphanSweepAdoptsAnAbandonedTeardown(t *testing.T) {
 		t.Fatalf("loading the session record: %v", err)
 	}
 	ps.Teardown = &mqttSessTeardown{Origin: "node9", Nonce: nuid.Next(), StartedAt: time.Now().Unix()}
+	// The marker's LINEAGE, exactly as claimTeardown stamps it: an identity of its own,
+	// parented to the record it claimed. The finisher retires that parent BY NAME, so a
+	// marker whose PWID names nothing is a record no teardown could have written — and
+	// one whose retirement can never be recorded.
+	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
 	subject := mqttSessStreamSubjectPrefix + e.asm.domainTk + e.sess.idHash
 	if _, err := e.asm.jsa.storeMsg(subject, 0, testMustJSON(t, ps)); err != nil {
 		t.Fatalf("writing the teardown marker: %v", err)
@@ -2187,6 +2192,11 @@ func TestOrphanSweepFailedAdoptionKeepsReferencesLive(t *testing.T) {
 		t.Fatalf("loading the session record: %v", err)
 	}
 	ps.Teardown = &mqttSessTeardown{Origin: "node9", Nonce: nuid.Next(), StartedAt: time.Now().Unix()}
+	// The marker's LINEAGE, exactly as claimTeardown stamps it: an identity of its own,
+	// parented to the record it claimed. The finisher retires that parent BY NAME, so a
+	// marker whose PWID names nothing is a record no teardown could have written — and
+	// one whose retirement can never be recorded.
+	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
 	subject := mqttSessStreamSubjectPrefix + e.asm.domainTk + e.sess.idHash
 	if _, err := e.asm.jsa.storeMsg(subject, 0, testMustJSON(t, ps)); err != nil {
 		t.Fatalf("writing the teardown marker: %v", err)

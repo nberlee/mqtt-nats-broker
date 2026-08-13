@@ -148,16 +148,17 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 }
 
 // parentForNextWriteLocked is the record a new write descends from: the one we hold, or —
-// for a session object a teardown RE-MINTED and a caller then reused — the record that
-// teardown claimed.
+// for a session that holds none — the record whose REMOVAL emptied the subject it is about
+// to write into.
 //
-// Both parenting sites call it, and the fallback is what carries the chain across the
-// re-mint. Without it clear() leaves the next create parentless, and the two siblings of
+// Both parenting sites call it, and the fallback is what carries the chain across a
+// deletion. Without it clear() leaves the next create parentless, and the two siblings of
 // one base — a resume child {b, a} and a clean-start survivor written after tearing a down
 // — have nothing in common for classifyRecordLineage to match on, so a broker whose record
-// was ERASED by a sibling reports a takeover that never happened.
+// was ERASED by a sibling reports a takeover that never happened. The same holds when no
+// marker survives to read and the retirement watermark is what names the removed record.
 //
-// The claimed record's WID, never the teardown marker's: the marker is deleted by the
+// The removed record's WID, never the teardown marker's: the marker is deleted by the
 // release and is nobody's base.
 //
 // sess.mu must be held.
@@ -165,7 +166,7 @@ func (sess *mqttSession) parentForNextWriteLocked() string {
 	if sess.wid != _EMPTY_ {
 		return sess.wid
 	}
-	return sess.reMintedFrom
+	return sess.retiredBaseWID
 }
 
 // adoptRecordLineageLocked adopts the lineage AND the grant an attempt STAMPED, for a caller

@@ -244,3 +244,88 @@ func TestMQTTForkedRecordRepairOnAReplicatedStream(t *testing.T) {
 	testMQTTPublish(t, c2, r2, 1, false, false, "repair/replicated", 1, []byte("replicated"))
 	testMQTTCheckPubMsg(t, c2, r2, "repair/replicated", mqttPubQos1, []byte("replicated"))
 }
+
+// TestMQTTCreateLineageAcrossBrokersOverAWatermark is T11: the create-side chain over real
+// replicated JetStream.
+//
+// The single-stream tests prove the fields serialize. This one proves the fact TRAVELS: the
+// watermark one broker's teardown wrote is read by ANOTHER broker's create, which is the
+// only shape the cross-term create pair has — the two brokers never share memory, so
+// nothing but $MQTT_teardown can carry the retired record's identity between them.
+func TestMQTTCreateLineageAcrossBrokersOverAWatermark(t *testing.T) {
+	oldTimeout := testMQTTTimeout
+	testMQTTTimeout = 40 * time.Second
+	defer func() { testMQTTTimeout = oldTimeout }()
+
+	c := testNewJetStreamCluster(t, 3)
+	a := c.startBroker(t, 0)
+	defer a.cleanup()
+	b := c.startBroker(t, 1)
+	defer b.cleanup()
+
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttTeardownStreamName)
+
+	const cid = "create-lineage-across"
+	idHash := getHash(cid)
+
+	// Broker A: a clean-start session whose close DISCARDS the record. That teardown
+	// records the watermark naming the record it deletes, through Raft.
+	ca, ra := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true},
+		a.opts.MQTT.Host, a.opts.MQTT.Port)
+	testMQTTCheckConnAck(t, ra, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, ca, ra, []*mqttFilter{{filter: "create/across", qos: 1}}, []byte{1})
+	testMQTTFlush(t, ca, nil, ra)
+	sessA := testMQTTGetClient(t, a.s, cid).mqtt.sess
+	if sessA == nil {
+		t.Fatal("broker A must be bound to a session")
+	}
+	sessA.mu.Lock()
+	widA := sessA.wid
+	sessA.mu.Unlock()
+	if widA == _EMPTY_ {
+		t.Fatal("broker A's record must carry a minted identity")
+	}
+	testMQTTDisconnect(t, ca, nil)
+	ca.Close()
+
+	asmA := a.s.mqtt.sessmgr.sessions[globalAccountName]
+	deadline := time.Now().Add(testMQTTTimeout)
+	var r *mqttGenRetirement
+	for time.Now().Before(deadline) {
+		if got, _, st := asmA.jsa.loadGenRetirement(asmA.domainTk, idHash); st == mqttRetirementValid {
+			r = got
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if r == nil {
+		t.Fatal("the clean-start close must record a retirement watermark")
+	}
+	if r.RWID != widA {
+		t.Fatalf("the replicated watermark must name the record the teardown removed: RWID=%q want %q",
+			r.RWID, widA)
+	}
+
+	// Broker B finds the subject empty and creates. Its parent can only have come from the
+	// replicated watermark.
+	cb, rb := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false},
+		b.opts.MQTT.Host, b.opts.MQTT.Port)
+	defer cb.Close()
+	testMQTTCheckConnAck(t, rb, mqttConnAckRCConnectionAccepted, false)
+
+	sessB := testMQTTGetClient(t, b.s, cid).mqtt.sess
+	if sessB == nil {
+		t.Fatal("broker B must be bound to a session")
+	}
+	sessB.mu.Lock()
+	widB, pwidB := sessB.wid, sessB.pwid
+	sessB.mu.Unlock()
+	if pwidB != widA {
+		t.Fatalf("broker B's CREATE must descend from the record broker A's teardown retired: "+
+			"PWID=%q want %q (B's own WID %q)", pwidB, widA, widB)
+	}
+	if widB == _EMPTY_ || widB == widA {
+		t.Fatalf("broker B must mint its own identity: WID=%q (A's %q)", widB, widA)
+	}
+}

@@ -196,7 +196,7 @@ func TestSessCleanStartForkIsRecognised(t *testing.T) {
 		t.Fatalf("the clean-start discard must succeed: %v", err)
 	}
 	sessA.mu.Lock()
-	reMinted := sessA.reMintedFrom
+	reMinted := sessA.retiredBaseWID
 	sessA.mu.Unlock()
 	if reMinted != base.WID {
 		t.Fatalf("clear() must record the CLAIMED record as the next write's parent: got %q, want %q",
@@ -254,7 +254,7 @@ func TestSessCleanStartForkIsRecognised(t *testing.T) {
 // fallback, isolated from the save path.
 //
 // Two facts are distinct and the design keeps them distinct — wid is the record we are
-// ACKNOWLEDGED for (six sites read it that way), reMintedFrom is what the next write
+// ACKNOWLEDGED for (six sites read it that way), retiredBaseWID is what the next write
 // descends from when we hold no record at all — so the accessor must prefer wid and
 // fall back, never conflate them.
 func TestSessParentForNextWriteFallsBackToTheReMint(t *testing.T) {
@@ -265,7 +265,7 @@ func TestSessParentForNextWriteFallsBackToTheReMint(t *testing.T) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
-	sess.wid, sess.reMintedFrom = _EMPTY_, "claimed-base"
+	sess.wid, sess.retiredBaseWID = _EMPTY_, "claimed-base"
 	if got := sess.parentForNextWriteLocked(); got != "claimed-base" {
 		t.Fatalf("holding no record, the next write descends from the re-mint: got %q", got)
 	}
@@ -274,7 +274,7 @@ func TestSessParentForNextWriteFallsBackToTheReMint(t *testing.T) {
 	if got := sess.parentForNextWriteLocked(); got != "held" {
 		t.Fatalf("holding a record, the next write descends from it: got %q", got)
 	}
-	sess.wid, sess.reMintedFrom = _EMPTY_, _EMPTY_
+	sess.wid, sess.retiredBaseWID = _EMPTY_, _EMPTY_
 	if got := sess.parentForNextWriteLocked(); got != _EMPTY_ {
 		t.Fatalf("a genuine first create has no parent: got %q", got)
 	}
@@ -911,7 +911,7 @@ func TestSessAdoptedTeardownCreateParentsFromTheMarker(t *testing.T) {
 		t.Fatal("an adopted teardown starts the client FRESH: Session Present must be false")
 	}
 	fresh.mu.Lock()
-	reMinted := fresh.reMintedFrom
+	reMinted := fresh.retiredBaseWID
 	fresh.mu.Unlock()
 	if reMinted != marker.PWID {
 		t.Fatalf("the fresh session must descend from the record the adopted teardown CLAIMED: "+
@@ -1005,12 +1005,12 @@ func TestSessSupersededAdoptionReEntersTheRestore(t *testing.T) {
 	}
 
 	sess.mu.Lock()
-	seq, reMinted, wid := sess.seq, sess.reMintedFrom, sess.wid
+	seq, reMinted, wid := sess.seq, sess.retiredBaseWID, sess.wid
 	sess.mu.Unlock()
 
 	if seq == 0 {
 		t.Fatalf("a superseded adoption must RE-READ before anything is built from it: "+
-			"got a base-0 object (reMintedFrom=%q, marker parent=%q)", reMinted, marker.PWID)
+			"got a base-0 object (retiredBaseWID=%q, marker parent=%q)", reMinted, marker.PWID)
 	}
 	// Compared against the rival's own IDENTITY rather than a re-read of the subject:
 	// the subject can move again after the restore, and what R1 promises is that the

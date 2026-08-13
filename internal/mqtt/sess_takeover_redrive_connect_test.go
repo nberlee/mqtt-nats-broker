@@ -1319,7 +1319,7 @@ func TestReDriveDeferredDischargeIsAdmitted(t *testing.T) {
 // the session leaves the maps whether the teardown COMPLETED or was SUPERSEDED. So this
 // frame cannot tell the two apart by asking, which is why it must not reuse the object it
 // left behind — that object carries the sequence clear() reset to 0 after the base was
-// already known stale, and reMintedFrom naming a record that is no longer the base.
+// already known stale, and retiredBaseWID naming a record that is no longer the base.
 //
 // Staged on the ABSENT arm of a superseded claim, because that is the arm where the two
 // dispositions differ DURABLY rather than only in path: with the record gone the base-0
@@ -1676,7 +1676,7 @@ func TestOverdueMovedWinnerReDrivesInsideTheRestore(t *testing.T) {
 		}
 		if ps.PWID == _EMPTY_ {
 			t.Fatal("the create after an overdue discard must descend from the record that " +
-				"discard retired: reMintedFrom is what carries it out of the restore")
+				"discard retired: retiredBaseWID is what carries it out of the restore")
 		}
 	})
 

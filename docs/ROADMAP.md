@@ -126,7 +126,7 @@ per stream.
   hid the one fork the rule exists to catch.
   **What it does NOT close** was filed as two blockers below rather than recorded as
   residuals; the claim-won deletion window is now closed by the retirement watermark,
-  and cross-term create × create recognition is still open.
+  and cross-term create × create recognition is closed by F-029b below.
 - [x] **The claim-won deletion window** (F-029a) **and the PUBREL orphan class.** The
   window was real: a teardown that wins its claim deletes the retiring generation's
   resources before its release can say whether it still owns the claim, and a cross-term
@@ -244,21 +244,78 @@ per stream.
   and the reversed "a broker old enough to have written X" phrasings, which describe
   fail-closed refusal rather than rollout support.
 
-- [ ] **Cross-term create × create recognition.** Two brokers creating from an empty
-  subject across a leader term are both admitted pre-proposal, both apply, and the
-  later survives. Both records are parentless, and `classifyRecordLineage` requires a
-  non-empty acknowledged parent precisely so two unrelated first-creates do not read as
-  siblings — so the erased side concedes 0x8E, correct about ownership and wrong about
-  cause. **A `bound`-gated parentless arm was designed and REFUTED**: its premise, that
-  nothing legitimately deletes a bound session's record, is false — a legitimate
-  clean-start release, a crash before the parented successor save, and the next CONNECT
-  creates a parentless record while an F-036 silent owner is still bound; rollback
-  deletes, operator deletion, stream re-provisioning and a different branch's expiry
-  reach the same shape. And the failure is not vocabulary-only: `mqtt.go` guards
-  delayed-Will cancellation on `!d.forked`, so a FALSE fork leaves an obsolete Will
-  eligible to fire. Closing it needs a durable identity for each empty-subject interval
-  — a per-client epoch or tombstone both racing first-creates inherit — which is new
-  durable state and its own design. Note it likely changes Slice C's repair.
+- [x] **Cross-term create × create recognition** (F-029b). A create now descends from
+  the record whose deletion emptied the subject, which is one rule with three sources
+  rather than a new mechanism: the record `clear()`'s own claim held, the record an
+  ADOPTED marker names in its `PWID`, and — the new one — the record the
+  generation-retirement watermark names in a required `rwid` field, for the interval
+  whose marker is already gone. That makes two creates in one interval siblings of each
+  other and a create in a later interval a descendant, so ordering survives deletions
+  with no new comparison; inheriting a fresh interval nonce instead would have missed
+  the MIXED pair, where one broker tore the record down locally and the other only ever
+  saw an empty subject. The watermark gains a fourth reader, whose one deliberate
+  asymmetry is that a CORRUPT watermark refuses the CONNECT — admitting a session over
+  one this broker cannot read leaves its own later teardown unable to record a
+  retirement — while an indeterminate read concedes rather than failing a fresh CONNECT.
+  The invariant that makes the token exact is that every record deletion advances the
+  interval identity, so the **CONNECT rollback now ARBITRATES before it fences**: its
+  bare sequence-targeted delete is replaced by the real teardown (`clear()`'s seventh
+  call site), whose claim is a CAS at the candidate's own sequence, and it branches on
+  the session's EFFECTIVE persisted lifetime — which also fixes a live defect, since the
+  bare form destroyed a persistent session's record on a rejected resume that merely
+  REQUESTED expiry 0. A refused teardown parks the discard on a still-resident session
+  rather than abandoning it, and the classification reads the lineage pair captured at
+  entry, because `clear()` zeroes it. `reMintedFrom` became `retiredBaseWID`: one field,
+  one fact, three sources.
+  **What it does NOT close**: a record-absent create with no usable watermark still
+  concedes, filed as the bullet below with its refuted cheap fix, and four routes on
+  which a stale, regressed, delayed or out-of-band identity manufactures a FALSE FORK —
+  the dangerous direction, and the one they are named for. Three of them also concede: a
+  stale read across a remote lifecycle and a regressed watermark slot give the two
+  creates of one interval different parents, and an out-of-band deletion leaves a
+  watermark naming the last RETIRED record rather than the deleted one, so a create
+  following it matches neither the record that was deleted nor its parent. All four are
+  stated as residuals R1-R4 in `docs/CONFORMANCE.md`. Recognition succeeds exactly where
+  a valid retirement history supplies the identity; nothing here claims more. One piece
+  of NEW exposure comes with the rollback rework and is stated as such: the teardown
+  claim it now takes can itself be regressed by a cross-term apply, which the bare
+  delete could not reach — the same claim-apply window every other `clear()` caller
+  already carries, narrowable only by durable evidence of the interval a claim
+  overwrote. Slice C's repair is untouched and deliberately so: a create has a parent
+  POINTER and no parent CONTENT, so a create-parented fork is recognised and repaired by
+  nothing, merging against an empty base being the union Slice C refuted.
+- [ ] **A durable identity for an interval with no retirement history** (F-029b's R0).
+  **Large**, and a protocol of its own rather than a variant of F-029b. A record-absent
+  create with no usable watermark inherits nothing and its erased sibling concedes 0x8E,
+  in three shapes that all reach that outcome: a genuine first-ever interval for the
+  client ID; a client whose retirement history was LOST, through `$MQTT_teardown` being
+  recreated alone, an administrative watermark deletion, or a partial restore; and an
+  INDETERMINATE read, which must not fail a fresh CONNECT.
+  **A reserved parent token stamped on the watermark-Absent arm was designed and
+  REFUTED**, and re-proposing it costs a review round: an absence is not a fact —
+  `$MQTT_teardown` can be recreated alone, stamped with the current session epoch, and
+  validate clean with no historical fences (`docs/ARCHITECTURE.md`, "Stream
+  prerequisites"), and administrative deletion and partial restore do the same. So the
+  token mints a positive claim out of missing evidence, and its failure direction is a
+  FALSE fork, which suppresses delayed-Will cancellation — the one direction F-029b
+  exists to prevent, where every other row of that design concedes instead. Minting a
+  RETIREMENT watermark at a first create is refused separately: it would fence the
+  session being created, and would replace the standing watermark under `mseq` ordering,
+  unfencing a generation a real teardown retired.
+  **What would close it** is a positive durable fact whose absence still concedes: a
+  retain-all per-client stream whose earliest entry every reader elects by MINIMUM
+  SEQUENCE — sound across a leader transition, since NATS embeds the proposed sequence
+  in the replicated entry and applies in log order. That needs the election bound to the
+  client hash, the domain and both stream incarnations; `DenyDelete`/`DenyPurge`
+  required on `$MQTT_teardown` so watermark history cannot be erased undetected; a
+  disposition for a corrupt earliest entry, which otherwise blocks every later
+  candidate; and a durable record of the first interval's END, because minimum-sequence
+  election proves candidate convergence but not that the elected token still belongs to
+  the current interval.
+  **Its bounds**: it closes the Absent and history-lost subcases only — the
+  Indeterminate one survives any protocol that keeps conceding on a transient read, and
+  closing that means refusing the CONNECT instead, a different and heavier decision —
+  and it does not close the cross-stream apply-time window R1 and R3 already carry.
 - [ ] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
   **Large.**
 - [ ] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).

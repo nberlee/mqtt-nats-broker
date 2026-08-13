@@ -509,11 +509,14 @@ Residuals:
 - **A refused discard's obligation is memory-only, so a crash or a remote takeover in that
   window drops it.** On a broker running this code, no discard runs on an unclassified
   sequence: `clear` refuses unconditionally, at entry and again with the record fence
-  held. FOUR of the six call sites are REFUSAL-AWARE, each acting on the sentinel rather
-  than destroying, and what each then does differs: the deferred discharge re-parks its
-  consumed action (pre-existing); CONNECT's clean start rejects without evicting; and the
+  held. FIVE of the seven call sites are REFUSAL-AWARE, each acting on the sentinel
+  rather than destroying, and what each then does differs: the deferred discharge re-parks
+  its consumed action (pre-existing); CONNECT's clean start rejects without evicting; the
   clean close and session expiry park the discard and restore residency only when the
-  shared helper ACCEPTS, failing closed to the historical evict-and-log when it declines.
+  shared helper ACCEPTS, failing closed to the historical evict-and-log when it declines;
+  and the CONNECT rollback's zero-lifetime branch parks it on a session that never left
+  the maps, reporting `rollbackParked` and removing nothing, or takes its historical
+  outcome — classify and remove — when the helper declines.
   The two remaining callers
   that clear a transient object built from a record they just read have an unreachability
   proof rather than a recovery, plus the same fail-closed refusal if that proof were ever
@@ -849,9 +852,11 @@ What it does NOT do:
     generation, and the classifier used to concede on that mismatch before it ever
     compared parents; it no longer consults the generation at all, and `clear()` carries
     the claimed record's identity across the re-mint, so the sibling arrives PARENTED and
-    classifies forked. What still concedes is a PARENTLESS survivor — a cross-term
-    create x create, where neither record has a parent to match — which is filed as the
-    F-029b blocker in `docs/ROADMAP.md` §0.2. The one-hop limit applies as everywhere — including
+    classifies forked. A cross-term create x create is recognised too since F-029b: a
+    create inherits the identity of the record whose deletion emptied the subject, so both
+    sides of the pair carry a parent — for every interval a valid retirement watermark
+    describes. What still concedes is a create with NO usable watermark (R0 below).
+    The one-hop limit applies as everywhere — including
     through an UNRESOLVED local attempt: a save whose store landed ambiguously leaves
     the acknowledged pair stale behind a free fence, so a remote sibling of that
     unadopted attempt concedes to 0x8E (and the takeover-path Will cancel), exactly as
@@ -983,11 +988,133 @@ What it does NOT do:
   writing off one base inside a term produce exactly one winner and a definitely-rejected
   loser that re-drives onto the winner's record. A clean-start side no longer concedes on
   its re-minted generation either: the classifier ignores the generation and the sibling
-  is parented across the re-mint, so it classifies forked and answers 0x89. What remains
-  is the CROSS-TERM pair, where both records can apply and the loser's record is
-  parentless: it converges on one owner but cannot tell that from an ordinary takeover.
-  Filed as the F-029b blocker rather than accepted here. A side whose observation was lost
-  still decides nothing until the backstop reaches it.
+  is parented across the re-mint, so it classifies forked and answers 0x89. The CROSS-TERM
+  pair — both records applying, the loser's erased — is recognised since F-029b: a
+  record-absent create descends from the record whose deletion emptied the subject, whose
+  identity the generation-retirement watermark records permanently and per client before
+  every deletion, so two creates in one interval are siblings of each other and a create in
+  a later interval is a descendant. A side whose observation was lost still decides nothing
+  until the backstop reaches it.
+
+  **Recognition succeeds only where a valid retirement history supplies that
+  identity.** There are two failure DIRECTIONS, and the five recognition routes below
+  are named by the one that matters for each rather than by the only one it has. A
+  **missed recognition** concedes to the takeover vocabulary and is exactly the
+  behavior that preceded F-029b. A **false fork** reports the fork vocabulary — reason
+  code 0x89, its Reason String, the log line and the close reason travel as one value
+  — where the takeover vocabulary would have been reported, and PRESERVES a delayed
+  Will the takeover path would have cancelled; that is the dangerous direction, and it
+  is why R1-R4 are named for it. But a token that is stale or regressed ALSO concedes
+  whenever the pair it should have matched carries the other interval's identity: on
+  R1 and R2 the two creates of one interval can end up with different parents — one
+  reading the pre-lifecycle or regressed slot, the other the current one — and both
+  concede, exactly as R0 does. R4 has both as well, and by a route that needs no
+  watermark transition at all: the watermark names the last RETIRED record, so after
+  any acknowledged save in the current interval it names neither the record an
+  operator deletes nor that record's parent. R0 is the only route with a single
+  direction — it can only concede, because it inherits nothing.
+
+  - **R0 — a record-absent create with no usable watermark concedes.** Its scope is the
+    UNION of three shapes, because all three reach the same parentless outcome: a genuine
+    first-ever interval for that client ID; a client whose retirement history was LOST,
+    through `$MQTT_teardown` being recreated alone, an administrative watermark deletion,
+    or a partial restore; and an INDETERMINATE read, where a transient failure must not
+    fail a fresh CONNECT. In each there is no positive evidence to inherit, so the create
+    stays parentless and its erased sibling answers 0x8E, exactly as before F-029b.
+    Nothing cheaper closes it, and the refutation is recorded so it is not re-proposed: a
+    reserved parent token stamped on the Absent arm was designed and REFUTED, because an
+    absence is not a fact — `$MQTT_teardown` can be recreated alone, stamped with the
+    current session epoch, and validate clean with no historical fences (see "Stream
+    prerequisites"), and administrative deletion and partial restore do the same. Every
+    other row of this design degrades to conceding when it cannot prove something; that
+    token degraded to a false affirmative, whose cost is the suppressed Will cancellation
+    the item exists to prevent. Minting a retirement watermark at a first create is
+    refused for its own reason: a watermark carrying a fresh generation would fence the
+    session being created, and would replace the standing watermark under `mseq` ordering,
+    unfencing a generation a real teardown retired. What would close the Absent and
+    history-lost subcases is a positive durable fact whose absence still concedes — filed
+    as its own `docs/ROADMAP.md` §0.2 bullet with the design it needs. The Indeterminate
+    subcase survives any such protocol, since a transient read still concedes.
+  - **R1 — a create's watermark read separated from its own admission by a complete
+    remote lifecycle.** The read-then-CAS pair spans two streams and cannot be made
+    atomic: if a remote create, teardown and delete interleave in between, the create
+    stamps the previous interval's identity. Both directions follow from that one token:
+    it can be reported as a sibling of a record that legitimately preceded it (the false
+    fork), and it fails to match the create it genuinely races in the new interval,
+    conceding exactly as R0 does. Closing it means coupling admission to the interval
+    identity — revalidating it at apply time — which the single CAS cannot express, so
+    it is not narrowed by the R0 bullet in `docs/ROADMAP.md` either.
+  - **R2 — a regressed `$MQTT_teardown` slot** presenting an older interval's identity,
+    downstream of the stated decision-time-monotonicity residual rather than a new one.
+  - **R3 — a delayed same-base proposal that outlives an interval.** A child write
+    admitted against record `P` can apply after `P` was properly retired and deleted and
+    a create `X` inherited `P`'s identity; the two are in different intervals with the
+    same parent, so `X`'s broker reports forked. On this route the verdict is defensible
+    on its own terms — the survivor descends from a record `X` never held, and nothing
+    took the session over, so 0x89 "try again" is the honest instruction where 0x8E is a
+    false one — and what the change alters is only what `X`'s broker SAYS, plus the
+    skipped Will cancellation. The rest of the route's cost is PRE-EXISTING and is not
+    introduced or fixed here: the survivor wins the single slot either way, so `X`'s
+    granted state is lost and unrecoverable (a create has no parent content, so nothing
+    is repairable); condemning the survivor by the retirement fence is destructive where
+    it added state; the F-036 stranded-session route applies; and a delayed
+    STATE-CHANGING save can have its client acknowledged for membership the fence
+    subsequently deletes — a conditional false acknowledgement that is a property of the
+    delayed-proposal window and the fence, unverified and not tested by F-029b.
+  - **R4 — out-of-band record deletion.** `$MQTT_sess` must have `DenyDelete == false`
+    because the broker's own deleter needs it, so an operator deleting a live record
+    leaves the standing watermark untouched — and that watermark names the last record
+    this broker RETIRED, which is a different record from the one just deleted as soon
+    as the interval has taken one save. Both directions follow, and neither needs a
+    watermark transition. Say the retirement named `P`, the interval's create is
+    `C{PWID: P}` and an acknowledged save made it `S{PWID: C}`. An operator deletes
+    `S`; the next create is `N{PWID: P}`. Against a broker still acknowledged for `C`
+    that is a FALSE FORK — same parent, different identity, different intervals.
+    Against one acknowledged for `S` it is a CONCESSION: `N.PWID` is `P` where the
+    acknowledged parent is `C`, so nothing matches and the erased side answers 0x8E
+    with the takeover-path Will cancellation, exactly as it did before F-029b.
+    Eliminating the concession would need durable evidence of the record actually
+    deleted rather than the last one retired, which no in-broker fence can supply for
+    a deletion the broker did not perform. Both directions are pinned by
+    `TestCreateOutOfBandDeletionKeepsBothResidualDirections`.
+  - **Not a recognition route, and the one piece of NEW EXPOSURE this change carries:
+    the rollback's own teardown claim can be regressed by a cross-term apply.** The
+    teardown claim is a full-body CAS at the candidate's sequence, and the
+    expected-sequence check runs only BEFORE the proposal, so a remote successor
+    admitted against the same base and the claim can both apply. Whichever applies last
+    holds the subject: claim-last makes `clear()` believe it won and delete the retiring
+    generation's state, which a SAME-generation successor (a resumed CONNECT preserves
+    the generation) still needs; claim-first leaves the retirement recorded and the
+    survivor is condemned by the retirement fence. Either way a client whose save
+    succeeded can lose its resumable state. This is the SAME claim-apply window every
+    other `clear()` caller carries — see "decision-time monotonicity" in
+    `docs/ARCHITECTURE.md`, "The generation-retirement watermark" — and it is accepted
+    here for that reason, but it is stated as new because the bare delete it replaces
+    could not reach it: a delete aimed at the candidate's exact sequence removes nothing
+    once `MaxMsgsPer: 1` has evicted that message. Narrowing it means durable evidence
+    of the interval a claim overwrote, which is new durable state for all seven callers
+    and not something this item introduces for one of them.
+
+  Every false-fork route carries the same two bounds. **No false verdict can resurrect
+  state**, in two steps rather than categorically: the create side of a pair mints no
+  capsule, having no parent content, but the pair's OTHER side need not be the create — an
+  authored non-create child retains both bodies, and the persist-observation route mints on
+  any forked verdict without asking which side was a create. What holds is that such a
+  capsule can never be APPLIED to the create, because the anchor requires generation
+  equality and the create carries a freshly minted generation, so it is dropped. And the
+  **surviving record is condemned by the retirement fence wherever it carries a generation
+  the fence names** — R3 by construction, R1/R2/R4 only when the survivor happens to carry
+  a retired generation, since both the CONNECT fence and immediate survivor condemnation
+  test generation equality.
+
+  What remains structurally excluded is narrower than "no missed detection": two creates in
+  the SAME interval carrying different parents concede, which R0 reaches by having no token
+  and R1/R2 reach by carrying the wrong one, and in every case the outcome is a concession
+  rather than a false claim. What no interleaving can produce is two records in
+  DIFFERENT intervals sharing a parent through a deletion this broker performed, because
+  every one of those records a retirement first; the routes that reach that shape do so
+  through a delayed apply (R3), a regressed watermark slot (R2) or a deletion the broker
+  never performed (R4).
 - **The other five arbitrated streams have no lineage at all** — `$MQTT_willq`,
   `$MQTT_willcancel`, `$MQTT_qos2in` (both its hold subjects and their `.rel` siblings),
   `$MQTT_qos2assign` and `$MQTT_inflight` — so the same leader-transition overwrite is
@@ -1251,11 +1378,13 @@ has no name to use.
 A teardown that WINS its claim records a permanent per-client **generation-retirement
 watermark** on `$MQTT_teardown` before it deletes anything, so the fact survives the one
 thing the record cannot: a cross-term resume derived from the same base evicting the
-marker off the record's own subject. Three readers act on it — the winner's own
+marker off the record's own subject. Four readers act on it — the winner's own
 release-superseded arm, which condemns a same-generation survivor with a fresh marker;
-the CONNECT restore, which discards a retired record instead of resuming it hollow; and
-the orphan sweep, which condemns one with no CONNECT at all. Nothing ever reaps a
-watermark. See `docs/ARCHITECTURE.md`, "The generation-retirement watermark".
+the CONNECT restore, which discards a retired record instead of resuming it hollow;
+the orphan sweep, which condemns one with no CONNECT at all; and the record-absent
+CREATE, which inherits the retired record's identity as its own parent so a cross-term
+sibling of that create stays recognisable (F-029b). Nothing ever reaps a watermark. See
+`docs/ARCHITECTURE.md`, "The generation-retirement watermark".
 
 What the repair is, exactly: **truthful termination, never restoration.** The deleted
 consumers, holds and in-flight registers are gone; what the readers guarantee is that

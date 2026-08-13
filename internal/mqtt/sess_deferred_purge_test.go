@@ -1635,7 +1635,7 @@ func TestMQTTDeferredDiscardReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 		// the discharge and clear() both passed their entry checks, and before the fence
 		// is taken. Only a check made under that fence can still see it.
 		sess.mu.Lock()
-		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
+		testMarkUncertainLocked(sess, sess.seq, testAmbiguousBodyLocked(sess, "ambiguous"))
 		sess.mu.Unlock()
 	})
 	defer restoreHook()
@@ -1724,7 +1724,7 @@ func TestMQTTDeferredDiscardReparksWhenUnresolvedAtClearEntry(t *testing.T) {
 		// The competing writer lands here: after the discharge's own check, before
 		// clear()'s. This is the window the entry refusal — and its sentinel — owns.
 		sess.mu.Lock()
-		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
+		testMarkUncertainLocked(sess, sess.seq, testAmbiguousBodyLocked(sess, "ambiguous"))
 		sess.mu.Unlock()
 	})
 	defer restoreHook()
@@ -2134,7 +2134,7 @@ func TestMQTTDeferredDischargeReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 		// A register store settled here and its save went ambiguous: after the discharge's
 		// entry check, before it takes the fence.
 		sess.mu.Lock()
-		testMarkUncertainLocked(sess, sess.seq, []byte(`{"competing":"ambiguous"}`))
+		testMarkUncertainLocked(sess, sess.seq, testAmbiguousBodyLocked(sess, "ambiguous"))
 		sess.mu.Unlock()
 	})
 	defer restoreHook()

@@ -432,7 +432,7 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 		// (`canConsistencyCheck := !isClustered`, nats-server v2.14.4
 		// server/stream.go:6247), so a proposal already accepted into the log applies
 		// whatever happened to the subject meanwhile — including an exact-sequence
-		// delete (rollbackDeleteSession, clear()). Reported as its own verdict so the
+		// delete, which only clear() now issues. Reported as its own verdict so the
 		// resolver ARBITRATES rather than disposing on a read.
 		//
 		// Base 0 reaches this arm like any other base, and that is F-029's doing. The
@@ -1438,10 +1438,11 @@ func (s *Server) reparkDeferredDisconnect(sess *mqttSession, action *mqttDeferre
 }
 
 // reparkRefusedDiscard is the recovery for a discard that clear() REFUSED with
-// errMQTTClearRefusedUnresolved — the ordinary clean close and session expiry both take it.
-// Neither may simply abandon the session: the refusal deleted nothing, so the record, the
-// consumers, the shared group durables the discard owed a release, and the generation's
-// in-flight registers are all still there.
+// errMQTTClearRefusedUnresolved — the ordinary clean close, session expiry and the
+// CONNECT-accept rollback's zero-lifetime branch all take it. None may simply abandon the
+// session: the refusal deleted nothing, so the record, the consumers, the shared group
+// durables the discard owed a release, and the generation's in-flight registers are all
+// still there.
 //
 // It parks the discard as a deferred disconnect with expiryInterval 0, so endsAtDisconnect()
 // is true and the discharge takes applyDeferredDisconnect's discard branch — the same
@@ -1449,6 +1450,12 @@ func (s *Server) reparkDeferredDisconnect(sess *mqttSession, action *mqttDeferre
 // restores RESIDENCY, which is what every resolver needs: reconcileResidentRecordState and CONNECT
 // both scan as.sessions, and for an expiry-0 record sweepSessionExpiries looks at nothing at
 // all. Park first, publish second — the obligation must exist before the object is reachable.
+//
+// "Restores" holds for the two callers that REMOVED the session before attempting the
+// discard. The CONNECT rollback's session is still resident when it calls here — it removes
+// only in its own tail, which the parked outcome skips — so for that caller addSession
+// merely republishes the same two map entries. Idempotent, and the park is what the call is
+// for either way.
 //
 // No WILL goes into the action, deliberately. A parked Will is memory-only and
 // non-transferable: a remote takeover evicts the action under as.mu alone and nothing
@@ -1462,7 +1469,9 @@ func (s *Server) reparkDeferredDisconnect(sess *mqttSession, action *mqttDeferre
 // discharged.
 //
 // Returns whether the discard is now someone's responsibility. False leaves the caller its
-// historical outcome: the session stays evicted and the caller logs.
+// historical outcome: the session stays evicted and the caller logs — or, for a caller whose
+// session is still resident, it is removed by that caller's own tail. Ignoring a false return
+// there would leave a resident object nobody owns.
 //
 // No lock held on entry.
 func (s *Server) reparkRefusedDiscard(asm *mqttAccountSessionManager, sess *mqttSession, disconnectedAt int64) bool {
@@ -1500,9 +1509,11 @@ func (s *Server) reparkRefusedDiscard(asm *mqttAccountSessionManager, sess *mqtt
 		}
 		s.Debugf("MQTT: the refused discard of session %q is already parked as a discard-only obligation", sess.id)
 	}
-	// RESIDENT again, so a resolver can find it. The caller removed it before attempting
-	// the discard, and for the close that removal is what makes the failure a leak: an
-	// expiry-0 record with no resident object has no reaper at all.
+	// RESIDENT again, so a resolver can find it. Two of the three callers removed it
+	// before attempting the discard, and for the close that removal is what makes the
+	// failure a leak: an expiry-0 record with no resident object has no reaper at all.
+	// For the CONNECT rollback the session never left the maps, so this is a re-publish
+	// of the same entries.
 	asm.addSession(sess, true)
 	return true
 }
@@ -1620,9 +1631,9 @@ func (as *mqttAccountSessionManager) reconcileResidentRecordState(s *Server) {
 //     me" — converge it. A record can only be removed by a party that first CLAIMED it
 //     (a teardown claim is a full-body CAS at the sequence it believes current) or by
 //     the expiry owner of a record we no longer own, so absence IS an ownership fact.
-//     Locally the shape cannot be manufactured: clear() zeroes sess.seq before it
-//     claims or deletes anything, and rollbackDeleteSession removes only the failed
-//     CONNECT candidate's own sequence on an already-unbound object.
+//     Locally the shape cannot be manufactured: clear() is the only deleter, and it
+//     zeroes sess.seq before it claims or deletes anything — the CONNECT rollback's
+//     zero-lifetime branch included, since it deletes through that same teardown.
 //
 // It also re-fires a trigger a refusal left undecided (evictLatest > evictDecided),
 // which is the other half of the "an eviction can be lost entirely" fix.

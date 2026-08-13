@@ -458,12 +458,15 @@ func TestSessRawWritersStampLineage(t *testing.T) {
 		}
 		e.asm.addSession(e.sess, true)
 		e.sess.mu.Lock()
+		// A positive EFFECTIVE lifetime selects the re-save over the teardown, and the
+		// rollback reads it off the session rather than taking it as a parameter.
+		e.sess.expiryInterval = 3600
 		candidate, candidateWID := e.sess.seq, e.sess.wid
 		e.sess.mu.Unlock()
 
 		// The record is untouched, so the rollback's re-save LANDS and its bytes are what
-		// the assertion reads. A positive expiry selects the re-save over the delete.
-		e.asm.rollbackAcceptedSession(e.s, e.sess, e.sess.idHash, candidate, 3600)
+		// the assertion reads.
+		e.asm.rollbackAcceptedSession(e.s, e.sess, e.sess.idHash, candidate)
 
 		after := testLoadRecordLineage(t, e)
 		if after.DisconnectedAt == 0 {
