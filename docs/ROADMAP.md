@@ -514,9 +514,10 @@ them in order where a later lint change depends on an earlier cleanup.
 - [ ] [F-052: Connect MQTT option validation to production startup](findings/dead-code.md#f-052).
   Adapt or retire the upstream validator, and make its tests exercise the real
   standalone startup boundary.
-- [ ] [F-053: Remove independent dead declarations](findings/dead-code.md#f-053).
+- [x] [F-053: Remove independent dead declarations](findings/dead-code.md#f-053).
   Delete the unreferenced constants, errors, leaf wrappers, singular shared-holder
-  helper, and superseded no-sequence message lookup.
+  helper, superseded no-sequence message lookup, and the two orphaned JetStream-name
+  compatibility helpers found by the final reference scan. No live call site changed.
 - [ ] [F-053: Remove obsolete upstream integration clusters](findings/dead-code.md#f-053).
   Delete the unused configuration-reload, embedded-routing, and retained-permission
   rescan paths with the imports and shim state they strand.

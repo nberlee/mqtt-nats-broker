@@ -374,9 +374,6 @@ const (
 	// This is how frequently the timer to cleanup the sessions flappers map is firing.
 	mqttSessFlappingCleanupInterval = 5 * time.Second
 
-	// For Websocket URLs
-	mqttWSPath = "/mqtt"
-
 	// Default bound (in seconds) on the server-side TLS handshake for an MQTT
 	// connection when MQTTOpts.TLSTimeout is unset. Matches nats-server's default
 	// so a client that opens a socket and then stalls cannot pin a connection
@@ -727,7 +724,6 @@ var (
 	errMQTTUnknownProperty              = errors.New("unknown property identifier")
 	errMQTTPropertyNotAllowed           = errors.New("property not allowed for this packet type")
 	errMQTTAuthMethodNotSupported       = errors.New("enhanced authentication (auth method) is not supported")
-	errMQTTUnsupportedSubOption         = errors.New("unsupported MQTT 5.0 subscription option")
 	errMQTTMalformedSubOption           = errors.New("malformed MQTT 5.0 subscription option")
 	errMQTTMalformedSharedSub           = errors.New("malformed shared subscription")
 	errMQTTTopicAliasInvalid            = errors.New("topic alias invalid")
@@ -738,10 +734,9 @@ var (
 )
 
 type srvMQTT struct {
-	listener     net.Listener
-	listenerErr  error
-	authOverride bool
-	sessmgr      mqttSessionManager
+	listener    net.Listener
+	listenerErr error
+	sessmgr     mqttSessionManager
 	// v5Enabled caches whether this server accepts MQTT 5.0 (max_protocol_version
 	// == 5), set once at startup and read lock-free thereafter. It lets v5-only
 	// machinery be skipped entirely on a 3.1.1-only server.
@@ -1989,23 +1984,12 @@ func (c *client) mqttDiscardWillOnTakeover() {
 	c.mu.Unlock()
 }
 
-// mqttTakeWill consumes this connection's Will, returning it together with the
-// disposition it was consumed in; a nil Will means there is nothing left to do.
+// mqttTakeWillLocked consumes this connection's Will, returning it together
+// with the disposition it was consumed in; a nil Will means there is nothing
+// left to do. Every path that discharges a Will performs this transition while
+// holding the client lock, so competing close, deferred-disconnect and takeover
+// paths cannot claim the same Will twice.
 //
-// Every path that discharges a Will goes through here, because more than one
-// runs: mqttHandleClosedClient is invoked twice for a graceful DISCONNECT (once
-// from the packet, once when the socket closes), the deferred-disconnect capture
-// takes over responsibility for an unresolved session, and a takeover races all
-// of them. "Has this already been discharged?" can only be answered by the same
-// transition that hands the Will over.
-//
-// No lock held on entry.
-func (c *client) mqttTakeWill() (*mqttWill, mqttWillDisposition) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.mqttTakeWillLocked()
-}
-
 // Lock held on entry.
 func (c *client) mqttTakeWillLocked() (*mqttWill, mqttWillDisposition) {
 	if c.mqtt == nil || c.mqtt.cp == nil || c.mqtt.cp.will == nil {
@@ -2047,7 +2031,8 @@ type mqtt struct {
 	// connection's teardown and a same-client-ID CONNECT taking the session over —
 	// and the answer depends on which of them observed the close first, which the
 	// Will pointer alone cannot express. Transitioned only under c.mu; consumed
-	// exactly once by mqttTakeWill. See mqttHandleClosedClient, mqttHandleWill.
+	// exactly once by mqttTakeWillLocked. See mqttHandleClosedClient,
+	// mqttHandleWill.
 	willDisposition mqttWillDisposition
 
 	// disconnectSent records that a server-initiated DISCONNECT has been
@@ -2577,8 +2562,7 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 	c.registerWithAccount(s.globalAccount())
 
 	s.mu.Lock()
-	// Check auth, override if applicable.
-	authRequired := s.info.AuthRequired || s.mqtt.authOverride
+	authRequired := s.info.AuthRequired
 	s.totalClients++
 	s.mu.Unlock()
 
@@ -2683,18 +2667,6 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 	return c
 }
 
-// Given the mqtt options, we check if any auth configuration
-// has been provided. If so, possibly create users/nkey users and
-// store them in s.mqtt.users/nkeys.
-// Also update a boolean that indicates if auth is required for
-// mqtt clients.
-// Server lock is held on entry.
-func (s *Server) mqttConfigAuth(opts *MQTTOpts) {
-	mqtt := &s.mqtt
-	// If any of those is specified, we consider that there is an override.
-	mqtt.authOverride = opts.Username != _EMPTY_ || opts.Token != _EMPTY_ || opts.NoAuthUser != _EMPTY_
-}
-
 // Validate the mqtt related options.
 func validateMQTTOptions(o *Options) error {
 	mo := &o.MQTT
@@ -2779,16 +2751,6 @@ func validateMQTTOptions(o *Options) error {
 // Lock held on entry.
 func (c *client) isMqtt() bool {
 	return c.mqtt != nil
-}
-
-// If this is an MQTT client, returns the session client ID,
-// otherwise returns the empty string.
-// Lock held on entry
-func (c *client) getMQTTClientID() string {
-	if !c.isMqtt() {
-		return _EMPTY_
-	}
-	return c.mqtt.cid
 }
 
 // Parse protocols inside the given buffer.
@@ -4636,20 +4598,6 @@ func (jsa *mqttJSA) loadLastMsgForMulti(streamName string, subjects []string) ([
 		}
 	}
 	return responses, err
-}
-
-func (jsa *mqttJSA) loadNextMsgFor(streamName string, subject string) (*StoredMsg, error) {
-	mreq := &JSApiMsgGetRequest{NextFor: subject}
-	req, err := json.Marshal(mreq)
-	if err != nil {
-		return nil, err
-	}
-	lmri, err := jsa.newRequest(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), 0, req)
-	if err != nil {
-		return nil, err
-	}
-	lmr := lmri.(*JSApiMsgGetResponse)
-	return lmr.Message, lmr.ToError()
 }
 
 // loadNextMsgFromSeq returns the first message on the given subject (which may
@@ -15955,12 +15903,6 @@ func (sess *mqttSession) collectSharedPendingPurge() ([]mqttVoidedReg, []mqttReg
 	}
 	sess.mu.Unlock()
 	return regs, cancels
-}
-
-// sharedConsumerHasOtherHolders reports whether any session still holds a shared
-// subscription that maps to the given group durable. See sharedDurablesHeldByOthers.
-func (sess *mqttSession) sharedConsumerHasOtherHolders(durable string) bool {
-	return sess.sharedDurablesHeldByOthers([]string{durable})[durable]
 }
 
 // sharedDurablesHeldByOthers returns which of the given group durables some

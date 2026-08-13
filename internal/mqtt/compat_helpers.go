@@ -92,25 +92,6 @@ func tokenAt(subject string, index uint8) string {
 	return _EMPTY_
 }
 
-// JetStream name validation (nats-server: jetstream.go).
-func isValidName(name string) bool {
-	if name == _EMPTY_ {
-		return false
-	}
-	return !containsAny(name, " \t\r\n\f.*>")
-}
-
-func containsAny(s, chars string) bool {
-	for i := 0; i < len(s); i++ {
-		for j := 0; j < len(chars); j++ {
-			if s[i] == chars[j] {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // JetStream ack-reply subject parsing (nats-server: consumer.go).
 const (
 	expectedNumReplyTokensV1 = 9

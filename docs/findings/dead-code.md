@@ -92,6 +92,18 @@ no standalone reload caller. The cross-account QoS store belongs to embedded NAT
 routing. The retained-permission rescan belongs to upstream global-user reload,
 whereas this broker delegates authorization to NATS connections.
 
+The final repository reference scan also found `isValidName` and its private
+`containsAny` helper in `compat_helpers.go`. Both were inherited JetStream-name
+validation helpers with no caller in production or any test build.
+
+### Implemented slice: independent declarations
+
+Removed the two constants, the independent Will/auth/client-ID wrappers, the
+superseded no-sequence lookup, the singular shared-holder wrapper, and the two
+orphaned compatibility helpers. Removing `mqttConfigAuth` also removed the
+`authOverride` bit it alone could set; the standalone authentication boundary is
+the per-client NATS dialer, not the inherited embedded-server override.
+
 ### Commit-sized resolution
 
 Land this as two mechanical commits:

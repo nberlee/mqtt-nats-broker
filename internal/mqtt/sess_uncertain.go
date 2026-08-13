@@ -1096,7 +1096,7 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 
 	c.mu.Lock()
 	// Consume it: from here this deferred action owns the Will, and no other
-	// teardown path may publish it as well. See mqttTakeWill. taken/takenDisp
+	// teardown path may publish it as well. See mqttTakeWillLocked. taken/takenDisp
 	// remember the pre-take state so a REFUSED park can undo the consumption.
 	var taken *mqttWill
 	var takenDisp mqttWillDisposition

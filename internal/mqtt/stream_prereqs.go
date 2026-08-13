@@ -237,8 +237,8 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 
 // validateRetainedStream verifies $MQTT_rmsgs can carry retained messages.
 // Derived from what this owner does: one plain store per topic subject with a
-// per-message Nats-TTL, including empty-body tombstones; loadLastMsgForMulti /
-// loadNextMsgFor reads; NO explicit message-delete or purge API calls at all;
+// per-message Nats-TTL, including empty-body tombstones; loadLastMsgForMulti
+// reads; NO explicit message-delete or purge API calls at all;
 // and one ephemeral AckNone consumer per broker with a 5-minute
 // InactiveThreshold.
 //
