@@ -50,8 +50,8 @@ func TestMQTTSessLineageReplicatedStream(t *testing.T) {
 // Broker A's record carries a minted identity; broker B restores it, adopts that identity
 // as its acknowledged one, and its own next write names it as PARENT. Without the restore
 // adoption the second broker's write would carry an empty parent, and from then on every
-// sibling of that base is unprovable — so detection would be inert after any handoff even
-// on a fully upgraded cluster, with nothing failing anywhere.
+// sibling of that base is unprovable — so detection would be inert after any handoff,
+// with nothing failing anywhere.
 func TestMQTTSessLineageAcrossBrokers(t *testing.T) {
 	oldTimeout := testMQTTTimeout
 	testMQTTTimeout = 40 * time.Second

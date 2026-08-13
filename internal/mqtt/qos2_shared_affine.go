@@ -84,11 +84,10 @@
 //     The message is never lost and never redistributed; HA exactly-once
 //     (identifier continuity) remains a documented deviation. See
 //     docs/CONFORMANCE.md.
-//   - Mixed-version operation. The storage schema is rolling-compatible, but the
-//     delivery PROTOCOL is not: an older broker serving the same shared group
-//     never consults $MQTT_qos2assign and will redistribute. Shared QoS 2
-//     affinity holds only once every broker that can serve the group is
-//     q2aff-aware.
+//   - Scope. Affinity is a property of the brokers that consult $MQTT_qos2assign,
+//     which is every broker serving the account. Nothing gates it at runtime: a
+//     broker serving the same shared group without consulting the claims would
+//     redistribute a started delivery another broker had claimed.
 
 package mqtt
 
@@ -614,12 +613,14 @@ var mqttQ2AffineFormMax = func(pp *mqttPublish, retained bool) int {
 }
 
 // mqttQ2AffineRecordFits reports whether an already-assembled envelope fits the
-// account's max payload. Defensive backstop for a message stored by a broker
-// that predates the affine bound above: those were admitted without it, so the
-// runtime check is the only thing standing between them and an eternal
-// materialize-retry wedge. The caller's policy on failure is to NOT claim, ack
-// the group delivery, and log an oversize discard — the same disposal the client
-// Maximum Packet Size path already uses.
+// account's max payload. It is a live backstop, not a formality: the PUBLISH
+// admission preflight applies the affine bound above (mqttMaxQoS2FormSize), but
+// QoS 1/2 Will stores bypass that preflight entirely — mqttHandleWill and
+// deliverWillRecord call mqttInitiateMsgDelivery directly — so a QoS 2 Will
+// reaching a QoS 2 shared member arrives here unbounded, and a copy that can
+// never be stored would wedge the group durable in eternal retry. The caller's
+// policy on failure is to NOT claim, ack the group delivery, and log an oversize
+// discard — the same disposal the client Maximum Packet Size path already uses.
 func mqttQ2AffineRecordFits(env *mqttQ2AffineEnvelope, maxPayload int32) bool {
 	if maxPayload <= 0 {
 		return true
@@ -1433,13 +1434,14 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 		gen:          gen,
 		msgID:        mqttQ2AffMsgId(in.groupDurable, sseq),
 	}
-	// Backstop for a message stored by a broker that predates the affine
-	// admission bound: it was admitted without it, and a copy that can never be
-	// stored would wedge the group durable in eternal retry. Drop it with a
-	// logged error instead — the same disposal an undeliverable oversize PUBLISH
-	// already gets. New PUBLISHes are bounded at admission (mqttMaxQoS2FormSize).
+	// Backstop for a message that never met the affine admission bound: a
+	// PUBLISH is bounded at admission (mqttMaxQoS2FormSize), but a QoS 1/2 Will
+	// store bypasses that preflight, so a QoS 2 Will can reach a QoS 2 shared
+	// member unbounded. A copy that can never be stored would wedge the group
+	// durable in eternal retry; drop it with a logged error instead — the same
+	// disposal an undeliverable oversize PUBLISH already gets.
 	if !mqttQ2AffineRecordFits(env, in.maxPayload) {
-		s.Errorf("MQTT: discarding a shared QoS 2 message on %q: its session-affine form (%d bytes) exceeds the account max payload (%d); it was accepted by a broker without the affine admission bound",
+		s.Errorf("MQTT: discarding a shared QoS 2 message on %q: its session-affine form (%d bytes) exceeds the account max payload (%d); it was stored without the affine admission bound, which a QoS 1/2 Will bypasses",
 			in.natsSubject, mqttComputeQ2AffineSize(env), in.maxPayload)
 		sess.jsa.sendAck(in.reply)
 		res = mqttQ2AffMoveDropped
@@ -1627,10 +1629,28 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 	if err != nil {
 		return false // indeterminate: fail closed, a later contender resolves it
 	}
+	// A record that exists is USED here in both directions — a mismatch discards the
+	// assignment, a match materializes a copy and acknowledges the group source — so
+	// it is validated before either, not inside one arm. Both readings are wrong on
+	// an uninterpretable record: the mismatch arm would turn a malformed shape into
+	// proof of absence (an empty affine generation mismatches EVERY claim), and the
+	// match arm would ACK the source irreversibly for a copy owed to a session that
+	// can never resume, since the same record is refused at CONNECT and its affine
+	// reconciliation is suspended in the sweep. Indeterminate leaves the claim
+	// untouched and acknowledges nothing, which is this function's contract.
+	// discardAbsentWinnerClaim validates before the same decision, for the same
+	// reason.
+	if ps != nil {
+		if verr := mqttValidateSessionRecord(ps, claim.Winner); verr != nil {
+			s.Warnf("MQTT: refusing to act on shared QoS 2 assignment %q: the winner's record is uninterpretable: %v", claimSubject, verr)
+			return false
+		}
+	}
 	if ps == nil || ps.Q2AffGen != claim.Gen {
 		// Authoritatively gone, or replaced by a later generation of the same client
 		// ID. The delivery dies with the session it was assigned to, which
 		// [MQTT-4.8.2-6] permits; it is never released back to the group.
+		//
 		if _, _, derr := as.advanceQ2AffClaim(claimSubject, claim.Winner, claim.Gen,
 			func(c *mqttQ2AffClaim) { c.Discarded = true }); derr != nil {
 			return false
@@ -2330,6 +2350,18 @@ func (sess *mqttSession) hasSharedQoS2Sub() bool {
 	return false
 }
 
+// mqttRecordHasSharedQoS2 is hasSharedQoS2Sub over a PERSISTED record: does it
+// claim any shared subscription at QoS 2, the only kind the affine path is
+// provisioned for. See mqttValidateRecordAffinePair for the invariant it feeds.
+func mqttRecordHasSharedQoS2(ps *mqttPersistedSession) bool {
+	for _, qos := range ps.SharedSubs {
+		if qos == 2 {
+			return true
+		}
+	}
+	return false
+}
+
 // unwindProvisionedQ2AffineOnLanded reclaims an affine path whose PROVISIONING
 // save was ambiguous and has since been PROVEN durable.
 //
@@ -2376,10 +2408,18 @@ func (sess *mqttSession) hasSharedQoS2Sub() bool {
 //
 // sess.mu not held on entry.
 func (sess *mqttSession) unwindProvisionedQ2AffineOnLanded(c *client, tok recordTx) {
-	// A real membership outranks this. The pre-upgrade resume shape reaches the
-	// same provisioning save with its shared QoS 2 subscriptions ALREADY restored
-	// — they were loaded from the record before the attempt — so they survive the
-	// settlement and the path is owed to them.
+	// A real membership outranks this: an affine path a live shared QoS 2
+	// subscription is owed is not ours to reclaim.
+	//
+	// Kept as a FAIL-CLOSED BACKSTOP, not for a shape a valid record can produce.
+	// The continuation registers only when minting was needed, meaning q2AffGen was
+	// empty on entry — and a record whose SharedSubs carries a qos-2 entry without a
+	// generation is now refused at CONNECT, in the sweep and at expiry
+	// (mqttValidateRecordAffinePair), so no interpretable record reaches here with a
+	// membership to find. It stays because the two do not state the same fact: the
+	// refusal rejects a record shape at load, this refuses an IRREVERSIBLE disposal
+	// given the in-memory state, and any hole in the refusal would otherwise become
+	// assignments discarded out from under a started delivery ([MQTT-4.8.2-6]).
 	if sess.hasSharedQoS2Sub() {
 		return
 	}

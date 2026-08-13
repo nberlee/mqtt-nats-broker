@@ -232,7 +232,7 @@ func (e *testOrphanEnv) sweepInbound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collectInboundQoS2Candidates: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -559,6 +559,16 @@ func TestOrphanSweepPostSnapshotRereadsFailClosed(t *testing.T) {
 				Q2Aff: &ConsumerConfig{Durable: "$MQTT_Q2AFF_somewhere_else"},
 			}
 		}},
+		{"shared QoS 2 membership with no affine generation", func(string) *mqttPersistedSession {
+			// The pre-affine shape. Its EMPTY generation is what makes it dangerous
+			// here rather than merely malformed: emptiness differs from every claim's
+			// generation, so the "valid record for a different generation" arm would
+			// read it as proof the winner is gone.
+			return &mqttPersistedSession{
+				ID: "x", Gen: mqttNewSessGen(),
+				SharedSubs: map[string]byte{"$share/g/reread.topic": 2},
+			}
+		}},
 	}
 
 	t.Run("a raced record never authorizes discarding an assignment", func(t *testing.T) {
@@ -686,7 +696,7 @@ func TestOrphanSweepRetainedAssignmentsHoldNoQuarantineSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collectQ2AffInventory: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -783,7 +793,7 @@ func TestOrphanSweepRevalidatesConsumerIdentityBeforeDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("consumerList: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -854,7 +864,7 @@ func TestOrphanSweepBudgetIsChargedOnlyForWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collectQ2AffInventory: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -1295,9 +1305,15 @@ func TestOrphanSweepRetainsUnattributableInboundState(t *testing.T) {
 // The session-reference snapshot fails closed
 // ---------------------------------------------------------------------------
 
-// TestOrphanSweepReferenceSnapshotFailsClosed pins that anything which could hide a
-// live reference aborts the whole destructive pass. A hidden reference is a deleted
-// live resource, so there is no per-record "skip it" here.
+// TestOrphanSweepReferenceSnapshotFailsClosed pins the FATAL class: a record whose
+// IDENTITY cannot be established hides references in EVERY class — the inbound and
+// PUBREL references are derived from the id hash and the generation — so it aborts
+// the whole destructive pass. A hidden reference is a deleted live resource.
+//
+// A record whose identity is sound but whose AFFINE PAIR does not validate is a
+// different case and is not here: it hides affine references only, so it disables
+// the affine phases alone. See
+// TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases.
 func TestOrphanSweepReferenceSnapshotFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1318,15 +1334,6 @@ func TestOrphanSweepReferenceSnapshotFailsClosed(t *testing.T) {
 		{"record whose client ID does not hash back", func(t *testing.T, e *testOrphanEnv) {
 			testStoreRawSession(t, e, "impostor", &mqttPersistedSession{ID: "somebody-else", Gen: nuid.Next()})
 		}},
-		{"record with a malformed affine generation", func(t *testing.T, e *testOrphanEnv) {
-			testStoreRawSession(t, e, "badaff", &mqttPersistedSession{ID: "badaff", Gen: nuid.Next(), Q2AffGen: "short"})
-		}},
-		{"affine consumer config with no affine generation", func(t *testing.T, e *testOrphanEnv) {
-			testStoreRawSession(t, e, "orphanconf", &mqttPersistedSession{
-				ID: "orphanconf", Gen: nuid.Next(),
-				Q2Aff: &ConsumerConfig{Durable: "$MQTT_Q2AFF_whatever"},
-			})
-		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewOrphanEnv(t, "refs-"+strings.ReplaceAll(tc.name, " ", "-"))
@@ -1334,8 +1341,8 @@ func TestOrphanSweepReferenceSnapshotFailsClosed(t *testing.T) {
 			e.forget(t)
 			tc.write(t, e)
 
-			if _, err := e.asm.buildSessionRefs(); err == nil {
-				t.Fatal("the reference snapshot reported success on a record it could not interpret")
+			if _, _, err := e.asm.buildSessionRefs(); err == nil {
+				t.Fatal("the reference snapshot reported success on a record whose identity it could not establish")
 			}
 			// And the pass that depends on it destroys nothing.
 			e.asm.sweepOrphanedQoS2State(e.s)
@@ -1621,7 +1628,7 @@ func TestOrphanSweepKeepsADiscardedAssignmentWhoseSourceCouldRedeliver(t *testin
 	if err != nil {
 		t.Fatalf("collectQ2AffInventory: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -1670,7 +1677,7 @@ func TestOrphanSweepDiscardsAbsentWinnerWithoutErasingProvenFacts(t *testing.T) 
 	if err != nil {
 		t.Fatalf("collectQ2AffInventory: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -1733,7 +1740,7 @@ func TestOrphanSweepReapsWhenTheSourceCanNoLongerBeOffered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collectQ2AffInventory: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -1900,7 +1907,7 @@ func (e *testOrphanEnv) sweepAffineConsumers(t *testing.T, budget int) {
 	if err != nil {
 		t.Fatalf("consumerList: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -2076,7 +2083,7 @@ func TestOrphanSweepRetainsAConsumerOnALateClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("consumerList: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -2208,7 +2215,7 @@ func TestOrphanSweepFailedAdoptionKeepsReferencesLive(t *testing.T) {
 		t.Fatal("a failed adoption removed or altered the marker")
 	}
 	// And the still-marked record is what counted as the reference.
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -2321,7 +2328,7 @@ func (e *testOrphanEnv) sweepPubRelConsumers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("consumerList: %v", err)
 	}
-	refs, err := e.asm.buildSessionRefs()
+	refs, _, err := e.asm.buildSessionRefs()
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
@@ -2536,7 +2543,7 @@ func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("consumerList: %v", err)
 		}
-		refs, err := e.asm.buildSessionRefs()
+		refs, _, err := e.asm.buildSessionRefs()
 		if err != nil {
 			t.Fatalf("buildSessionRefs: %v", err)
 		}
@@ -2634,7 +2641,7 @@ func TestOrphanSweepPubRelValidatesTheConsumerConfig(t *testing.T) {
 				MaxAckPending:  1024,
 			},
 		}}
-		refs, err := e.asm.buildSessionRefs()
+		refs, _, err := e.asm.buildSessionRefs()
 		if err != nil {
 			t.Fatalf("buildSessionRefs: %v", err)
 		}

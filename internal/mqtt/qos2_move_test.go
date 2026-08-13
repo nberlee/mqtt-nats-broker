@@ -495,10 +495,10 @@ func TestValidateQoS2InStream(t *testing.T) {
 // This is the end-to-end complement to TestValidateQoS2InStream: that test proves
 // the validator's own logic, this one proves the validator is actually wired into
 // startup and that its message reaches an operator. The distinction matters
-// because the failure it prevents is silent data loss during a rolling upgrade —
-// the moment one upgraded broker flipped the stream to DiscardOld, an old broker
-// still running the plain hold store would overwrite held records instead of
-// getting its duplicate rejection.
+// because the failure it prevents is silent data loss: an account manager that has
+// already initialized keeps serving on its original validation decision, so
+// flipping the discard policy underneath it would turn its hold stores into
+// overwrites of held records with nothing revalidating.
 func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 	t.Parallel()
 	_, nc := runNATS(t)
@@ -552,7 +552,7 @@ func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 		}
 	}
 
-	// It must NOT have mutated the stream in place: an old broker still running
+	// It must NOT have mutated the stream in place: a manager already serving
 	// against it would silently overwrite held records once the discard policy
 	// flipped, which is worse than refusing to start.
 	si, ierr := js.StreamInfo(mqttQoS2IncomingMsgsStreamName)

@@ -203,8 +203,8 @@ func TestSessGenContinuity(t *testing.T) {
 // TestSessGenFromRecordFailsClosed pins that a stored incarnation generation is
 // validated before any name or purge filter is built from it.
 //
-// The record is not a trusted input — an older broker, a future one, or a hand
-// edit can put anything there — and everything downstream is built by
+// The record is not a trusted input — a future broker or a hand edit can put
+// anything there — and everything downstream is built by
 // concatenation. A value carrying a wildcard or a subject separator would either
 // produce an unusable durable name or, far worse, WIDEN the QoS 2 hold
 // enumeration filter beyond this incarnation, reaching records the session has no

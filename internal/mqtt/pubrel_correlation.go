@@ -10,9 +10,11 @@
 // Both a duplicate exactly-once delivery and a permanent wedge.
 //
 // So a PUBREL names its source: the durable that delivered it and that delivery's
-// stream sequence. Absent headers mean "no correlation", which is exactly the
-// behavior of a record written before this existed — safe, because a broker that
-// wrote one never created the drains that depend on correlation.
+// stream sequence. Absent headers mean "no correlation", and that is a real,
+// current shape rather than a legacy one — a retained QoS 2 send is tracked with a
+// wholly empty pending entry (trackPublishRetained), so its PUBREC names no source
+// and the PUBREL is stored uncorrelated. Safe, because a delivery with no source
+// durable is not one a drain can be waiting on.
 //
 // The deterministic Nats-Msg-Id exists for a different hazard. A superseded broker
 // can still perform its own (non-CAS) PUBREL store after a peer took over and
@@ -41,9 +43,9 @@ const (
 )
 
 // mqttPubRelCorrelation is the source delivery a PUBREL completes. Ok is false for
-// an uncorrelated record — one written before correlation existed, or by an older
-// broker — which callers must treat exactly as they did before: no correlation, no
-// drain interaction.
+// an uncorrelated record — a retained or otherwise unbacked QoS 2 send names no
+// source durable, and a missing or malformed header parses the same way — which
+// callers must treat as it says: no correlation, no source or drain interaction.
 type mqttPubRelCorrelation struct {
 	SrcDur string
 	SrcSeq uint64

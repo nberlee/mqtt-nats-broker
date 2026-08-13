@@ -10,11 +10,9 @@ normative — so "protection is per broker until the fleet upgrades" is not a re
 qualification, and writing one invites a future change to preserve behavior for a broker
 that will never run. State what a broker running this code does.
 
-Residuals written before that boundary became normative still carry mixed-version and
-upgrade-window wording, and this document is **not yet internally consistent with the
-rule above**. Removing it wholesale is its own change — it rewrites other features'
-stated limits — and is tracked as a `docs/ROADMAP.md` cleanup rather than claimed here.
-F-029 rewrote only the ones in its own blast radius.
+The rule applies throughout this document: every residual below states what a broker
+running this code does, and a limit that is real is stated as the scope of the
+mechanism that enforces it, not as a property of a fleet's version mix.
 
 ## vibesrc/mqttconformance (primary) ✅
 
@@ -240,6 +238,35 @@ not consult the claims could redistribute a started delivery another broker had
 claimed, and there is no runtime capability gate that would stop it. That gate is
 noted as a possible follow-up, not as a mixed-fleet accommodation.
 
+**A record whose shared QoS 2 membership carries no affine generation is refused,
+and nothing reclaims it.** No writer on this tree can produce that pairing, so it
+can only have been written by a pre-release development broker. The same applies to
+a persisted shared QoS byte outside 0..2, which the resume would otherwise clamp
+into a live QoS 2 membership. Both are refused at
+CONNECT, in the startup expiry sweep, at a fired expiry timer, and by the sweep's
+shared validator (see "Session-affine shared-subscription QoS 2" in
+`docs/ARCHITECTURE.md`). The residual is what the refusal costs, and it is wider
+than that one session:
+
+- The record is never resumed, never rewritten, never claimed and never deleted, so
+  it and any consumers it names persist. Expiring it would destroy the state an
+  assignment owed to a started delivery is arbitrated from, so that is the stated
+  recovery rather than an oversight.
+- **The affine half of the orphan QoS 2 sweep is suspended account-wide while it is
+  present, and only that half.** The record carries qos-2 memberships while naming no
+  affine generation, so it contributes no affine reference although the session it
+  describes may own an affine consumer and outstanding claims; nothing can then prove
+  which affine resources are still referenced, and affine claim reconciliation and
+  affine consumer deletion are skipped for every session in the account. Since
+  nothing removes the record, that is permanent, and it is logged as a warning naming
+  the recovery on every pass. **Inbound QoS 2 holds, outbound in-flight registers and
+  PUBREL consumers keep being reclaimed**: the record's identity and generation are
+  sound, so the references it contributes to those classes are complete. A record
+  whose *identity* cannot be established — undecodable, unattributable, or carrying a
+  malformed `Gen` — is the stronger case and still aborts the whole pass. Either way
+  the recovery is the same: stop the account's brokers and recreate the bridge-owned
+  `$MQTT_*` streams.
+
 Plain (non-shared) subscriptions no longer drop an unacknowledged QoS 1/2 PUBLISH
 on UNSUBSCRIBE — see the next section.
 
@@ -308,8 +335,6 @@ Residuals:
     not yet performed: interest registered after that decision cannot revoke
     it, and the lookup still reports the consumer present, so it is trusted
     for that connection and repaired at the next one.
-  - Mixed-version: an unfixed broker still blind-trusts the record, so the
-    gap persists wherever such a broker accepts the resume.
   - A re-SUBSCRIBE that adopts a drain whose durable was reaped inherits a
     dead entry until the next CONNECT repairs it.
   - A backlog delivery that runs out its phase-gate wait (reconciliation
@@ -360,9 +385,13 @@ Residuals:
   PUBREL has been delivered, or found present at its sequence by the resume
   barrier. The cost is one redelivery of the source in the rare case where the
   store landed but its delivery did not; the alternative is losing the message.
-- **Mixed-version operation.** An older broker ignores the `Drains` record field,
-  so its orphan sweep can delete a drained durable and lose its started messages.
-  Same class as the affine residual above.
+- **Scope.** A drain survives because the brokers that read the `Drains` record field
+  exclude its durable from the orphan sweep's candidates and hand it to teardown as
+  this session's own — and that is every broker serving the account, since they all run
+  this tree (see the Compatibility boundary). It is scope rather than a rollout
+  condition: a broker that did not read `Drains` would let its orphan sweep delete a
+  drained durable and lose its started messages, and there is no runtime capability
+  gate that would stop it. Same class as the affine scope above.
 - An unbounded drain is deliberate: a client that never acknowledges holds one
   durable per drained filter until its session ends.
 
@@ -593,12 +622,12 @@ Residuals:
   reach them, and a surviving disconnect leaves them reserved. Fail-closed by design:
   the identifier stays out of use rather than being handed to a second message, at the
   cost of one reserved identifier and one Receive Maximum slot each.
-- **Mixed-version operation.** As with the affine protocol: an older broker never
-  reads `$MQTT_inflight`, so it re-offers a started delivery under a fresh identifier
-  and its orphan sweep does not know the stream. Continuity holds once every broker
-  serving the account understands it. (The teardown protocol no longer carries such a
-  residual: its section was rewritten for this tree when the retirement watermark
-  landed. The remaining rollout-framed residuals are a roadmap bullet of their own.)
+- **Scope.** As with the affine protocol: identifier continuity is enforced by the
+  brokers that read and sweep `$MQTT_inflight`, which is every broker serving the
+  account — they all run this tree (see the Compatibility boundary). A broker that did
+  not read the stream would re-offer a started delivery under a fresh identifier and
+  its orphan sweep would leave the registers behind, and there is no runtime capability
+  gate that would stop it.
 
 ### An ambiguous record write COMPLETES rather than aborts, once it is settled
 
@@ -1433,14 +1462,20 @@ consequences the `$MQTT_qos2in` precedent established:
 - **A nonconforming stream fails broker startup**, with an error naming the
   stream, the offending setting, and the recovery. Nothing is repaired or
   updated in place.
-- **A nonconforming stream splits a mixed fleet.** An older broker keeps serving
-  the account while an upgraded broker refuses initialization, surfacing as
-  CONNECT failures on the new broker only. The recovery is **stop-all**: stop
-  every broker for the account, recreate or fix the named stream per the
-  error's guidance, then restart. This is not a rolling upgrade. A *conforming*
-  deployment restarts and rolls exactly as before — default broker-created
-  streams are conforming, and so are supported administrative variations such
-  as a source on `$MQTT_rmsgs`.
+- **A stream mutated after initialization splits the account's brokers.**
+  Nonconformance that is already present when a broker starts is refused by every
+  initialization alike, so no broker serves the account. A config mutated *after* a
+  manager initialized is the case that splits: that manager is returned to later
+  connections on its original validation decision and keeps serving, while any
+  initialization afterwards — another broker, or the same one restarted — refuses,
+  surfacing as CONNECT failures on the refusing broker only. The recovery for both is
+  **stop-all**: stop every broker for the account, recreate the named stream per the
+  error's guidance, then restart. The errors offer no in-place fix, and some name a
+  coupled unit — `$MQTT_sess` is recreated together with `$MQTT_willcancel` and
+  `$MQTT_teardown` or the incarnation epoch is minted against stale watermarks. This
+  is not a rolling upgrade. A *conforming* deployment restarts exactly as before —
+  default broker-created streams are conforming, and so are supported administrative
+  variations such as a source on `$MQTT_rmsgs`.
 - **Startup validation is a snapshot.** A stream config mutated *after*
   initialization is not re-checked until the next process start or manager
   recreation. Runtime guards exist exactly where the code already has them: the

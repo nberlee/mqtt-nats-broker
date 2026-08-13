@@ -90,8 +90,8 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 
 // A pre-existing nonconforming stream must make account-manager initialization
 // FAIL with an error naming the stream, the offending setting and the
-// recovery — and must NOT be mutated in place (an old broker may still be
-// serving it). One subtest per new validator, each poisoning exactly one
+// recovery — and must NOT be mutated in place (another account manager may
+// already have initialized against it). One subtest per new validator, each poisoning exactly one
 // field; the sess subtest also proves the documented recovery (recreate, then
 // initialization succeeds).
 func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {

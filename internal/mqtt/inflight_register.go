@@ -25,8 +25,7 @@
 // is read by direct subject lookup and by a bounded walk, never delivered). The
 // session record cannot carry it either — a record write per delivery would put
 // every outbound QoS 1/2 message behind the record CAS and the record fence, which
-// is the one lock the delivery path must not contend on. A new stream is also the
-// schema-compatible shape: an older broker simply never looks at it.
+// is the one lock the delivery path must not contend on.
 //
 // # Invariants
 //

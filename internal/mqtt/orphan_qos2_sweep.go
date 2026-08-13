@@ -6,7 +6,7 @@
 //   - an inbound QoS 2 hold record on $MQTT_qos2in whose session record is gone,
 //     together with the sibling release claim that arbitrates it;
 //   - a session-affine $MQTT_Q2AFF_* consumer on $MQTT_out whose session record is
-//     gone (an older broker in a mixed-version window ignores Q2Aff entirely); and
+//     gone; and
 //   - an assignment claim on $MQTT_qos2assign whose winner generation no longer
 //     exists and which no contender happens to revisit.
 //
@@ -111,6 +111,14 @@ import (
 // manager begins sweeping before a test can reach into it.
 var mqttOrphanSweepRuns atomic.Int64
 
+// errMQTTSessRecordUninterpretable marks a reference-walk failure caused by a
+// RECORD rather than by the transport. The distinction is operator-facing: a record
+// this broker cannot interpret is permanent and its recovery is recreating the
+// bridge-owned streams, whereas a scan that failed on a timeout, a leader change or
+// a shutdown resolves itself on a later pass. Prescribing the destructive recovery
+// for the second class would be actively harmful.
+var errMQTTSessRecordUninterpretable = errors.New("session record cannot be interpreted")
+
 var (
 	// mqttQoS2ReleaseOrphanGrace is how old an inbound QoS 2 RELEASE CLAIM must be
 	// before the sweep may retire it. Deliberately far longer than
@@ -177,9 +185,20 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 
 	// (3) One authoritative, COMPLETE reference set. Anything indeterminate here
 	// aborts every destructive phase below, because all of them act on absence.
-	refs, rerr := as.buildSessionRefs()
+	refs, affRefsBad, rerr := as.buildSessionRefs()
 	if rerr != nil {
-		s.Debugf("MQTT orphaned QoS 2 sweep ended: %v", rerr)
+		// A record-shaped failure is PERMANENT — nothing rewrites such a record and
+		// expiry refuses it too, so every later pass aborts here — and it has an
+		// operator action, so it warns and names it. A transport failure resolves on
+		// the next pass and must NOT carry that guidance: telling an operator to
+		// recreate the streams because a scan timed out would be worse than silence.
+		if errors.Is(rerr, errMQTTSessRecordUninterpretable) {
+			s.Warnf("MQTT orphaned QoS 2 sweep ABORTED and nothing was reclaimed: %v; "+
+				"this will not clear on its own — stop this account's brokers and recreate the "+
+				"bridge-owned JetStream state (the $MQTT_* streams)", rerr)
+		} else {
+			s.Debugf("MQTT orphaned QoS 2 sweep ended: %v", rerr)
+		}
 		return
 	}
 
@@ -205,9 +224,22 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	// deliberately not an early return: the phases below that share nothing with the
 	// inventory keep running, or one persistent corrupt claim would disable them
 	// account-wide, forever, on evidence about a different resource class.
-	affineUsable := cerr == nil
-	if !affineUsable {
+	// The reference walk's affine half is the second, independent way this pass can
+	// lose the right to judge an affine resource: a record whose affine pair does not
+	// validate contributes no affine reference while the session it describes may own
+	// one. Same consequence as an incomplete inventory, same scope — affine only.
+	// Unlike an incomplete inventory it is PERMANENT (expiry refuses such a record
+	// too), so the warning names the operator action.
+	affineUsable := cerr == nil && affRefsBad == nil
+	if cerr != nil {
 		s.Warnf("MQTT orphaned QoS 2 sweep: assignment inventory incomplete, skipping affine reconciliation: %v", cerr)
+	}
+	if affRefsBad != nil {
+		s.Warnf("MQTT orphaned QoS 2 sweep: skipping affine reconciliation because a session record's "+
+			"affine pair cannot be interpreted, so nothing proves which affine consumers are still "+
+			"referenced: %v; this will not clear on its own — stop this account's brokers and recreate "+
+			"the bridge-owned JetStream state (the $MQTT_* streams). Every other class is unaffected "+
+			"and keeps being reclaimed", affRefsBad)
 	}
 	budget := mqttQ2AffSweepMutationBudget
 	if affineUsable {
@@ -687,14 +719,34 @@ func (r *mqttSessRefs) hasAffine(idHash, gen string) bool {
 // would otherwise look unreferenced. That covers the create-before-save window on
 // this broker; the age grace covers it on every other one.
 //
-// Every failure is fatal to the caller's destructive pass. An unattributable
-// subject, an undecodable record, a client ID that does not hash back to its subject
-// token, or a generation that cannot be validated could each hide a live reference,
-// and a hidden reference is a deleted live resource. A record carrying a teardown
-// marker still counts: its preserved content exists so recovery and orphan
-// reconciliation do not race ahead of the teardown.
-func (as *mqttAccountSessionManager) buildSessionRefs() (*mqttSessRefs, error) {
-	refs := &mqttSessRefs{
+// Failures come in TWO classes, and the difference is which references the record
+// can still be trusted for.
+//
+// FATAL, returned as an error: an unattributable subject, an undecodable record, a
+// client ID that does not hash back to its subject token, or a generation that
+// cannot be validated. Each of those makes EVERY class underivable — the inbound
+// and PUBREL references are built from `Gen` and the id hash — so any of them could
+// hide a live reference in any class, and a hidden reference is a deleted live
+// resource.
+//
+// AFFINE-INDETERMINATE, returned as the non-fatal second value (nil when every
+// record validated): a record whose
+// affine PAIR does not validate. Its `Gen` and id hash are sound, so the inbound,
+// in-flight and PUBREL references it contributes are complete; only the affine ones
+// are not, because such a record either names an affine generation that cannot be
+// interpreted or (the G7 shape) carries qos-2 memberships while naming none at all,
+// so a session that owns an affine consumer and outstanding claims would contribute
+// no reference to them. The caller therefore skips the affine phases and runs the
+// rest — the same rule the affine claim INVENTORY already follows below, and for
+// the reason stated there: otherwise one persistent bad record disables every other
+// class account-wide, forever, on evidence about a different resource class. That
+// matters here more than for the inventory, because a record refused this way is
+// also refused by expiry, so nothing ever removes it.
+//
+// A record carrying a teardown marker still counts: its preserved content exists so
+// recovery and orphan reconciliation do not race ahead of the teardown.
+func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, affineIndeterminate, err error) {
+	refs = &mqttSessRefs{
 		inbound:        make(map[string]struct{}),
 		affine:         make(map[string]struct{}),
 		affDurables:    make(map[string]struct{}),
@@ -745,25 +797,45 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (*mqttSessRefs, error) {
 
 	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
 	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				return nil, fmt.Errorf("session record walk failed before reaching the end: %w", err)
+		smsg, lerr := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if lerr != nil {
+			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
+				return nil, nil, fmt.Errorf("session record walk failed before reaching the end: %w", lerr)
 			}
-			return refs, nil
+			return refs, affineIndeterminate, nil
 		}
 		seq = smsg.Sequence + 1
 
 		idHash, perr := mqttSessIDHashFromSubject(smsg.Subject, as.domainTk)
 		if perr != nil {
-			return nil, fmt.Errorf("session record on %q cannot be attributed: %w", smsg.Subject, perr)
+			return nil, nil, fmt.Errorf("%w: session record on %q cannot be attributed: %w",
+				errMQTTSessRecordUninterpretable, smsg.Subject, perr)
 		}
 		ps := &mqttPersistedSession{}
 		if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
-			return nil, fmt.Errorf("session record on %q at sequence %d is undecodable: %w", smsg.Subject, smsg.Sequence, uerr)
+			return nil, nil, fmt.Errorf("%w: session record on %q at sequence %d is undecodable: %w",
+				errMQTTSessRecordUninterpretable, smsg.Subject, smsg.Sequence, uerr)
 		}
-		if verr := mqttValidateSessionRecord(ps, idHash); verr != nil {
-			return nil, fmt.Errorf("session record on %q: %w", smsg.Subject, verr)
+		// The identity half is fatal; the affine half only disables the affine phases.
+		if getHash(ps.ID) != idHash {
+			return nil, nil, fmt.Errorf("%w: session record on %q names a client ID that does not hash back to it",
+				errMQTTSessRecordUninterpretable, smsg.Subject)
+		}
+		if _, gerr := mqttSessGenFromRecord(ps.Gen); gerr != nil {
+			return nil, nil, fmt.Errorf("%w: session record on %q: %w",
+				errMQTTSessRecordUninterpretable, smsg.Subject, gerr)
+		}
+		if averr := mqttValidateRecordAffinePair(ps, idHash); averr != nil {
+			// Its inbound and PUBREL references below are still sound, so they are
+			// collected; only the affine ones cannot be trusted.
+			if affineIndeterminate == nil {
+				affineIndeterminate = fmt.Errorf("session record on %q: %w", smsg.Subject, averr)
+			}
+			refs.inbound[mqttSessRefKey(idHash, ps.Gen)] = struct{}{}
+			if ps.PubRel != nil {
+				refs.pubRelDurables[ps.PubRel.Durable] = struct{}{}
+			}
+			continue
 		}
 		refs.inbound[mqttSessRefKey(idHash, ps.Gen)] = struct{}{}
 		// The persisted PUBREL durable VERBATIM, as for the affine one: the record is
@@ -790,11 +862,40 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (*mqttSessRefs, error) {
 // deletes the durable the record names. Splitting them once let adoption delete a
 // consumer the reference walk would have refused to interpret.
 func mqttValidateRecordAffinePair(ps *mqttPersistedSession, idHash string) error {
+	// A persisted shared QoS byte outside 0..2 is malformed — every writer here
+	// stores the value AFTER processSubs has bounded it — and it is not harmlessly
+	// malformed. processSubs CLAMPS a filter above QoS 2 down to 2 while restoring,
+	// and the resume feeds these values in verbatim, so a record carrying 3 becomes a
+	// live shared QoS 2 membership and provisions an affine path. A rule that matched
+	// only the literal 2 would let exactly that record through the check below and
+	// straight into the destructive readers it exists to stop. Refused, not clamped:
+	// this broker did not write it.
+	for key, qos := range ps.SharedSubs {
+		if qos > 2 {
+			return fmt.Errorf("record carries a shared subscription %q with an invalid QoS %d", key, qos)
+		}
+	}
 	if ps.Q2AffGen == _EMPTY_ {
 		if ps.Q2Aff != nil {
 			// A consumer config with no generation to scope it: the pair is malformed,
 			// and neither half can be trusted to say which durable is referenced.
 			return fmt.Errorf("record carries an affine consumer config with no affine generation")
+		}
+		// A qos-2 shared membership IMPLIES an affine generation. No writer in this
+		// tree can separate them: the affine path is provisioned in the SUBSCRIBE's
+		// first filter loop, before the membership is persisted, and
+		// buildPersistedSessionLocked writes SharedSubs, Q2Aff and Q2AffGen in one
+		// record. A record that does separate them predates the affine path, and
+		// under the compatibility boundary an unsupported persisted shape is REFUSED
+		// rather than accommodated.
+		//
+		// Refusing it is not bookkeeping. Q2AffGen is what materializeQ2AffOnBehalf
+		// compares a claim against to conclude the winner is gone, so an empty one
+		// mismatches EVERY claim: a record read instead of refused turns a malformed
+		// shape into proof of absence and discards an assignment owed to a delivery
+		// already started — the redistribution [MQTT-4.8.2-6] forbids.
+		if mqttRecordHasSharedQoS2(ps) {
+			return fmt.Errorf("record carries a shared QoS 2 subscription with no affine generation")
 		}
 		return nil
 	}

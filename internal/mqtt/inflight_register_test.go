@@ -5432,7 +5432,7 @@ func TestMQTTInflightOrphanReconcile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("collectInflightCandidates: %v", err)
 		}
-		refs, err := e.asm.buildSessionRefs()
+		refs, _, err := e.asm.buildSessionRefs()
 		if err != nil {
 			t.Fatalf("buildSessionRefs: %v", err)
 		}

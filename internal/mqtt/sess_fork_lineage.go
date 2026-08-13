@@ -129,8 +129,9 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 	//   - ackWID != "": an acknowledged pair of {"", p} would otherwise make every
 	//     survivor with parent p a sibling of a record that has no identity of its own.
 	//     Correct writers cannot produce that shape, but createOrRestoreSession
-	//     validates only Gen and accepts whatever lineage the JSON carries, so the guard
-	//     is what makes the fail-safe uniform against a hand-edited or future record.
+	//     validates only the generation and the affine pair, and accepts whatever lineage
+	//     the JSON carries, so the guard is what makes the fail-safe uniform against a
+	//     hand-edited or future record.
 	//   - ackPWID != "": without it two unrelated FIRST CREATES read as siblings.
 	//   - found.WID != "": a survivor carrying no identity but a parent matching ours
 	//     would otherwise satisfy the last conjunct through "" != ackWID. This is what

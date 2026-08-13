@@ -1512,12 +1512,12 @@ hold record already does — under the `<idHash>.<gen>.<PI>` layout and its `.re
 sibling the field list is unchanged, since the subject check is a wildcard
 spanning both layouts and each of the hold and the claim is its own single-slot
 register (see "Stream prerequisites"). A stream that does not match **fails
-broker startup** with recreate guidance rather than being updated in place —
-updating it would be actively unsafe, since a broker still running the
-pre-move code would silently overwrite held records once the discard policy
-flipped. Upgrading a development
-store therefore means stopping **all** brokers for the account and recreating the
-stream, under the compatibility boundary above. This is not a rolling upgrade.
+broker startup** with recreate guidance rather than being updated in place.
+Nonconformance already present when a broker starts is refused by every
+initialization alike; a config mutated *after* a manager initialized leaves that
+manager serving on its original decision while any later initialization refuses.
+Both recover the same way: stopping **all** brokers for the account and recreating
+the stream, under the compatibility boundary above. This is not a rolling upgrade.
 
 ## Session-affine shared-subscription QoS 2
 
@@ -1644,6 +1644,73 @@ told apart by their REMOVAL POINT, not by their shape:
   outstanding assignments or started deliveries. A later SUBSCRIBE reuses them;
   session teardown is the only thing that removes them.
 
+**A persisted qos-2 shared membership implies an affine generation.** No writer
+here can separate them: the path is provisioned in the SUBSCRIBE's first filter
+loop, before the membership is persisted, and the record builder writes
+`SharedSubs`, `Q2Aff` and `Q2AffGen` as one record. A record that does separate
+them predates the affine path, so it is **refused** rather than interpreted —
+at CONNECT, in the startup expiry sweep, at a fired expiry timer, and in
+`mqttValidateRecordAffinePair`, which the reference walk and teardown adoption
+share.
+
+Refusing it is not bookkeeping. `Q2AffGen` is what a contender compares a claim
+against to conclude its winner is gone, and an **empty** one mismatches every
+claim: read rather than refused, such a record turns a malformed shape into proof
+of absence and discards an assignment owed to a delivery already started — the
+redistribution [MQTT-4.8.2-6] forbids. `materializeQ2AffOnBehalf` therefore
+validates the winner's record **before the comparison**, not inside one of its arms,
+because the record is used in both directions: a mismatch discards the assignment,
+and a match materializes the copy and **acknowledges the group source**, which is
+irreversible and would strand the delivery on a session that can never resume. A
+record can match a claim's generation and still be uninterpretable. Its sibling
+`discardAbsentWinnerClaim` already validated before the same decision.
+
+The rule is deliberately narrow:
+shared QoS 0 and QoS 1 memberships provision no affine path, and a generation with
+no consumer config — the shape the `minted` gate is built around — is one the
+validator deliberately continues to permit.
+
+It is narrow but not literal, and the difference matters. A persisted shared QoS
+byte outside 0..2 is **also refused**, because `processSubs` CLAMPS a filter above
+QoS 2 down to 2 while restoring and the resume feeds these values in verbatim: a
+record carrying 3 becomes a live shared QoS 2 membership, so a rule matching only
+the literal 2 would pass it straight through to the destructive readers the refusal
+exists to stop. Every writer stores the value after that clamp has already bounded
+it, so no record here can carry one. Whether any writer originates that
+second shape is a pre-existing question about the affine design; it is not settled
+here, and refusing it would be a new refusal of a shape whose non-existence is
+unproven.
+
+The four enforcement points call `mqttValidateRecordAffinePair` **whole** rather
+than the new rule alone, which deliberately widens them: the three malformed
+pairings it already refused for the sweep — a consumer config with no generation, a
+malformed generation, and a config whose names do not match its generation — now
+refuse a CONNECT and an expiry too, where before they resumed and were rewritten.
+Splitting the predicate is the failure the validator's own comment records
+("splitting them once let adoption delete a consumer the reference walk would have
+refused to interpret"), and a record uninterpretable to the sweep is not one a
+resume may rewrite.
+
+Sharing the validator also means the refusal reaches `buildSessionRefs`, and there
+the consequence is scoped **by resource class**. Such a record contributes no affine
+reference while the qos-2 memberships it carries mean the session may own an affine
+consumer and outstanding claims, so no affine resource may be judged: the reference
+walk reports the affine half indeterminate and the caller skips affine claim
+reconciliation and affine consumer deletion for the whole account, permanently,
+since nothing rewrites the record and expiry will not remove it either. Its identity
+and generation are sound, so the inbound, in-flight and PUBREL references it
+contributes are complete and **those classes keep being reclaimed**.
+
+That partition is the rule the affine claim inventory already follows, for the
+reason stated at its own call site: otherwise one bad record disables every other
+class account-wide, forever, on evidence about a different resource class. A record
+whose *identity* cannot be established is the stronger case — the inbound and PUBREL
+references are derived from the id hash and the generation, so nothing about it is
+trustworthy — and that still aborts the pass outright. Both are logged as warnings;
+only a record-shaped failure carries the recreate-the-streams guidance, because a
+scan that failed on a timeout or a leader change resolves itself. The cost is stated
+in `docs/CONFORMANCE.md`.
+
 **Stream prerequisites.** `$MQTT_qos2assign` must be `LimitsPolicy` +
 `DiscardOld` + `MaxMsgsPer: 1` — permanent retention is as load-bearing as the
 per-subject singleton, because claims are read by direct subject lookup and are
@@ -1656,13 +1723,13 @@ broker startup** rather than update a non-conforming stream in place, and the tw
 lists differ deliberately: each is derived from what that stream's owner actually
 does.
 
-**Mixed version.** The storage schema is rolling-compatible — an older broker
-ignores the new stream and the new session-record fields. The delivery *protocol*
-is not: an older broker serving the same shared group never consults
-`$MQTT_qos2assign` and will redistribute a started delivery a newer broker has
-claimed. Shared QoS 2 affinity holds only once every broker that can serve the
-group is q2aff-aware. See `docs/CONFORMANCE.md` for this and for the
-packet-identifier residual.
+**Scope.** Affinity is a property of the brokers that consult `$MQTT_qos2assign`,
+which is every broker serving the account — they all run this tree (see the
+Compatibility boundary). It is stated as scope rather than as a rollout condition: a
+broker serving the same shared group without consulting the claims would redistribute
+a started delivery another broker had claimed, and there is no runtime capability gate
+that would stop it. See `docs/CONFORMANCE.md` for this and for the packet-identifier
+residual.
 
 ## UNSUBSCRIBE drain
 
@@ -1678,9 +1745,11 @@ survive; already-started deliveries keep being redelivered and completed; fresh
 messages on the filter are discarded. The drain is a field on the session record
 (`Drains`), so it survives disconnect, restart and failover, and it lives until
 every started delivery completes or the session ends. It is deliberately kept
-**out** of the record's `Cons` map: an older broker restoring it there would find
-`cons[sid]` on a re-SUBSCRIBE, take the early return, and never create a delivery
-subscription.
+**out** of the record's `Cons` map, because in this tree `Cons` restores straight
+into `sess.cons` and a live re-SUBSCRIBE that finds `cons[sid]` takes the
+exists-branch: a drain carried there would satisfy that lookup and the filter would
+never get a delivery subscription. Drains restore through their own path instead, and
+a re-SUBSCRIBE reclaims one by adopting it explicitly.
 
 The invariants, in the order they matter:
 

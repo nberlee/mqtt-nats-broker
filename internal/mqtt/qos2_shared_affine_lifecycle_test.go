@@ -1040,8 +1040,8 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 	}
 	subject, _ := b.waitForClaim(t, "materialized", func(c *mqttQ2AffClaim) bool { return c.Phase == mqttQ2AffMaterialized })
 
-	// The consumer is destroyed out of band, exactly as an operator (or an older
-	// broker's sweep) could. Its pending copy goes with it.
+	// The consumer is destroyed out of band, exactly as an operator (or a sweep
+	// that no longer sees a session record) could. Its pending copy goes with it.
 	ca.Close()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1937,95 +1937,97 @@ func TestQ2AffineAmbiguousProvisioningIsUnwoundAfterPacketRollback(t *testing.T)
 	}
 }
 
-// A membership that reached the record BEFORE the provisioning save outranks the
-// reclaim, and the pre-affine resume is the shape that produces one: a record
-// carrying shared QoS 2 subscriptions with no affine path is restored, the
-// CONNECT provisions the path in its first filter loop, and THAT save goes
-// ambiguous. Restore loads the memberships before the attempt, so they survive
-// the settlement — which makes durable a record naming both — and the path is
-// owed to a live subscription.
+// A live shared QoS 2 membership outranks the reclaim, and the guard that says
+// so is a FAIL-CLOSED BACKSTOP over the session's IN-MEMORY state rather than a
+// reader of its record — which is why this drives it there directly.
 //
-// Mutation M5: drop the hasSharedQoS2Sub() guard in
-// unwindProvisionedQ2AffineOnLanded and the settlement deletes a path its own
-// settled record still names a subscription for.
-func TestQ2AffineAmbiguousProvisioningKeepsAPathAMembershipOwns(t *testing.T) {
-	b := testQ2AffSetup(t, "ambkeep")
-	// A throwaway client, only so an account session manager exists to seed through.
-	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ambkeep-seeder", cleanStart: true}, b.o.MQTT.Host, b.o.MQTT.Port)
-	defer cs.Close()
-	testMQTTReadConnAckV5(t, rs)
-	b.bind(t, "ambkeep-seeder")
+// No record shape can produce its precondition any more. A persisted qos-2
+// membership with no affine generation is refused at CONNECT, in the expiry sweep
+// and at expiry itself (mqttValidateRecordAffinePair), and the live SUBSCRIBE that
+// MINTS a generation cannot produce one either: when its provisioning save goes
+// ambiguous the filter is marked failed, and sess.update skips a failed filter, so
+// no membership is ever installed. The fixture asserts exactly that (no shared
+// membership survived the packet), which is what leaves the map empty for this
+// test to seed. The guard is kept because what it prevents is irreversible —
+// assignments discarded out from under a delivery already started, the
+// redistribution [MQTT-4.8.2-6] forbids.
+//
+// The fixture deliberately leaves NO outstanding affine claim. With one, the later
+// q2AffineGenerationOwnsClaims arm retains the path anyway and the assertions below
+// would hold against a broken guard.
+//
+// Mutation M-F: drop the hasSharedQoS2Sub() guard in
+// unwindProvisionedQ2AffineOnLanded and the settlement reclaims a path a live
+// membership owns.
+func TestQ2AffineReclaimYieldsToALiveSharedMembership(t *testing.T) {
+	a := testQ2AffArmAmbiguousProvisioning(t, "ambmem", 300)
 
-	// The persisted key is the sole authority the CONNECT rebuilds shared filters
-	// from, so it is built the way the broker builds it and checked to parse back.
-	subj, err := mqttTopicToNATSPubSubject([]byte(b.topic))
+	// The membership is keyed the way the broker keys it, so hasSharedQoS2Sub sees
+	// what a real shared QoS 2 subscription would have left behind.
+	subj, err := mqttTopicToNATSPubSubject([]byte(a.b.topic))
 	if err != nil {
 		t.Fatalf("subject conversion: %v", err)
 	}
-	key := (&mqttFilter{shared: true, group: "ambkeepg", filter: string(subj)}).sessionKey()
+	key := (&mqttFilter{shared: true, group: "ambmemg", filter: string(subj)}).sessionKey()
 	if _, _, ok := mqttParseSharedKey(key); !ok {
-		t.Fatalf("the seeded shared key %q does not parse back; the CONNECT would silently restore no filter", key)
+		t.Fatalf("the seeded shared key %q does not parse back as a shared membership", key)
 	}
-	testQ2AffSeedRecord(t, b, "ambkeep", func(ps *mqttPersistedSession) {
-		ps.SharedSubs = map[string]byte{key: 2}
-	})
+	a.sess.mu.Lock()
+	if a.sess.sharedSubs == nil {
+		a.sess.sharedSubs = make(map[string]byte)
+	}
+	a.sess.sharedSubs[key] = 2
+	a.sess.mu.Unlock()
 
-	armed := testQ2AffSuppressProvisioningSave(t, "ambkeep")
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
-		clientID:   "ambkeep",
-		cleanStart: false,
-		props:      mqttV5ConnPropsSessionExpiry(300),
-	}, b.o.MQTT.Host, b.o.MQTT.Port)
-	defer c.Close()
-	testMQTTReadConnAckV5(t, r)
-	sess := testMQTTGetClient(t, b.s, "ambkeep").mqtt.sess
-	testQ2AffSettleAmbiguousProvisioning(t, b, sess, armed)
+	a.settle(t)
 
-	// The path is retained BECAUSE a membership owns it.
-	if !sess.hasSharedQoS2Sub() {
-		t.Fatal("the restored shared QoS 2 membership did not survive the settlement, so this fixture proves nothing about retention")
+	// The guard returns before prepareQ2AffineUnwind, so nothing was detached:
+	// memory still describes the path...
+	a.sess.mu.Lock()
+	gen, consumer := a.sess.q2AffGen, a.sess.q2AffConsumer
+	a.sess.mu.Unlock()
+	if gen == _EMPTY_ || consumer == nil {
+		t.Fatalf("the settlement reclaimed an affine path a live shared QoS 2 membership owns: gen=%q consumer=%v", gen, consumer)
 	}
-	ps := testQ2AffLoadRecord(t, sess)
-	if ps.Q2AffGen == _EMPTY_ || ps.Q2Aff == nil {
-		t.Fatalf("the settlement removed an affine path a live membership owns: Q2AffGen=%q Q2Aff=%+v", ps.Q2AffGen, ps.Q2Aff)
+	// ...the durable is still on the stream...
+	durs := a.b.affineConsumers(t, a.idHash)
+	if len(durs) != 1 || durs[0] != consumer.Durable {
+		t.Fatalf("the affine durable did not survive: memory names %q, the stream carries %v", consumer.Durable, durs)
 	}
-	if _, ok := ps.SharedSubs[key]; !ok {
-		t.Fatalf("the settled record lost the membership it was supposed to keep: %v", ps.SharedSubs)
-	}
-	durs := b.affineConsumers(t, getHash("ambkeep"))
-	if len(durs) != 1 {
-		t.Fatalf("expected the affine durable to survive on %s, got %v", mqttOutStreamName, durs)
+	// ...and the settled record still names it, so a restart finds the same path.
+	ps := testQ2AffLoadRecord(t, a.sess)
+	if ps.Q2AffGen != gen || ps.Q2Aff == nil {
+		t.Fatalf("the settled record stopped naming the retained path: Q2AffGen=%q Q2Aff=%+v", ps.Q2AffGen, ps.Q2Aff)
 	}
 
 	// RETAINED means USABLE, which only a delivery proves. The re-subscribe is a
-	// real one: this fixture's CONNECT restored the membership map but its shared
-	// filter failed per-filter, so the live queue subscription was never rebuilt —
-	// a separate CONNECT-restore gap, filed in docs/ROADMAP.md and deliberately not
-	// fixed here. What this pins is that the retained path is the SAME one, reused
-	// rather than re-provisioned, and that a started QoS 2 delivery completes over it.
-	if codes := testMQTTSubV5(t, c, r, 3, []mqttV5SubFilter{{topic: "$share/ambkeepg/" + b.topic, opts: 2}}); len(codes) != 1 || codes[0] != 2 {
+	// real one: the packet under test failed per-filter, so no live queue
+	// subscription was ever built. What this pins is that the retained path is the
+	// SAME one — reused rather than re-provisioned — and that a started QoS 2
+	// delivery completes over it.
+	if codes := testMQTTSubV5(t, a.c, a.r, 3, []mqttV5SubFilter{{topic: "$share/ambmemg/" + a.b.topic, opts: 2}}); len(codes) != 1 || codes[0] != 2 {
 		t.Fatalf("re-subscribing to the retained shared filter failed: %v", codes)
 	}
-	testMQTTFlush(t, c, nil, r)
-	if after := b.affineConsumers(t, getHash("ambkeep")); len(after) != 1 || after[0] != durs[0] {
+	testMQTTFlush(t, a.c, nil, a.r)
+	if after := a.b.affineConsumers(t, a.idHash); len(after) != 1 || after[0] != durs[0] {
 		t.Fatalf("the re-subscribe did not REUSE the retained path: had %v, now %v", durs, after)
 	}
-	sess.mu.Lock()
-	reusedGen := sess.q2AffGen
-	sess.mu.Unlock()
-	if reusedGen != ps.Q2AffGen {
-		t.Fatalf("the re-subscribe re-provisioned under a new generation: %q, want the retained %q", reusedGen, ps.Q2AffGen)
+	a.sess.mu.Lock()
+	reusedGen := a.sess.q2AffGen
+	a.sess.mu.Unlock()
+	if reusedGen != gen {
+		t.Fatalf("the re-subscribe re-provisioned under a new generation: %q, want the retained %q", reusedGen, gen)
 	}
 
-	b.publish(t, 1, "retained")
-	_, payload, qos, pi, ok := testMQTTTryReadPublishV5(r, 10*time.Second)
+	a.b.publish(t, 1, "retained")
+	_, payload, qos, pi, ok := testMQTTTryReadPublishV5(a.r, 10*time.Second)
 	if !ok {
 		t.Fatal("no delivery arrived over the retained affine path")
 	}
 	if qos != 2 || string(payload) != "retained" {
 		t.Fatalf("unexpected delivery over the retained path: payload=%q qos=%d", payload, qos)
 	}
-	b.completeExchange(t, c, r, pi)
+	a.b.completeExchange(t, a.c, a.r, pi)
 }
 
 // The un-minted resume shape: a record naming a GENERATION but no consumer

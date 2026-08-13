@@ -4915,9 +4915,8 @@ func TestMQTTSliceHeadersAndDecodeRetainedMessage(t *testing.T) {
 		_, err := mqttDecodeRetainedMessage("$MQTT.rmsgs.bar.x", hdr, []byte("msg"))
 		require_Error(t, err, errMQTTInvalidRetainFlags)
 	})
-	// The development-era delete marker ('-' prefixed to the hex flags, so that
-	// older servers would fail to decode a tombstone and ignore it) is gone from
-	// both the encoder and the decoder. A record still carrying it must be
+	// The development-era delete marker ('-' prefixed to the hex flags) is gone
+	// from both the encoder and the decoder. A record still carrying it must be
 	// rejected, never silently accepted as flags=1.
 	t.Run("flag with legacy delete marker rejected", func(t *testing.T) {
 		hdr := fmt.Appendf(nil, "%sNmqtt-RFlags:-1\r\n\r\n", hdrLine)

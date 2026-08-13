@@ -153,19 +153,94 @@ per stream.
   post-check windows, the same bound the affine reaper has; `$MQTT_teardown` recreated
   alone loses every open fence. A finish that outruns the survivor broker's own
   observation is a new route into F-036 and is listed under that blocker, not here.
-- [ ] **Sweep the rollout-qualified residuals out of the docs.** The Compatibility
-  boundary is normative (`CLAUDE.md`, `docs/ARCHITECTURE.md`), but residuals written
-  before it became so still qualify themselves with "an older broker", "mid-rollout" and
-  "once every broker upgrades" — in `docs/CONFORMANCE.md` and in two `docs/ARCHITECTURE.md`
-  sections. F-029 rewrote the ones in its own blast radius — including two inside the
-  session-watch and lineage residuals it edits — and F-029a did the same for the teardown
-  pair (`docs/ARCHITECTURE.md`'s "Mixed version" paragraph and the mixed-version bullet
-  in the `docs/CONFORMANCE.md` teardown section are gone). Both left the rest standing,
-  with the
-  preamble narrowed to say so rather than claiming a consistency the document does not
-  have. Each one has to be re-read against what its feature actually
-  does for a broker running this tree — the wording often hides a real scope limit that
-  survives the rollout framing, so this is a rewrite per residual, not a delete.
+- [x] **Sweep the rollout-qualified residuals out of the docs.** DONE. Every residual
+  qualified by "an older broker", "mid-rollout" or "once every broker upgrades" was
+  re-read against what its feature does for a broker running this tree and rewritten:
+  **9 documentation sites** (five in `docs/CONFORMANCE.md`, **three**
+  `docs/ARCHITECTURE.md` sections against the bullet's "two", plus this entry), **30
+  inventoried Go comment blocks** and **one runtime diagnostic string**, plus **three
+  more the implementation's own broad audit surfaced**: `sess_fork_lineage.go`'s
+  "validates only Gen", a third instance of the wrong generationless-record claim in
+  `clear()`, and `pubrel_correlation_test.go`'s body, which still called the plain form
+  "legacy" after its doc comment stopped doing so. The comments were in scope because
+  they restate the same claims beside the mechanism; leaving them would have put code
+  and docs in direct contradiction. Most sites became **Scope** on the F-029
+  template — the limit is real, but it is the reach of the brokers that read a stream or
+  record field, with no runtime capability gate — and one became a restart /
+  post-initialization-mutation split, whose recovery was also corrected to stop-all-and-
+  recreate (the errors offer no in-place fix, and `$MQTT_sess` is coupled to
+  `$MQTT_willcancel` and `$MQTT_teardown`).
+
+  Three sites were not merely stale. Two had framing that **hid a live producer**, so the
+  rewrites gain accuracy: the affine oversize backstop is reached because a QoS 1/2
+  **Will bypasses the PUBLISH admission preflight**, and an uncorrelated PUBREL comes
+  from a **retained or otherwise unbacked QoS 2 send**, not from a broker that predates
+  correlation. Two comments were **factually wrong** — both claimed a generationless
+  record falls back to legacy hash-only names, which `mqttSessGenFromRecord` refuses.
+
+  The third was not wording at all. `unwindProvisionedQ2AffineOnLanded`'s
+  `hasSharedQoS2Sub()` guard named a **legacy persisted shape** — a record with a qos-2
+  `SharedSubs` entry and an empty `Q2AffGen` — that no writer on this tree can produce,
+  which under the boundary is refused rather than accommodated. So the item also
+  **closed a legacy-state accommodation its title does not promise**: the pairing is now
+  refused at CONNECT, in the startup expiry sweep, at a fired expiry timer, and in
+  `mqttValidateRecordAffinePair`; and `materializeQ2AffOnBehalf` — which read
+  `Q2AffGen != claim.Gen` as proof its winner was gone — now validates the record first,
+  since an empty generation mismatches every claim and would discard an assignment owed
+  to a started delivery. The guard itself is KEPT as a fail-closed backstop over the
+  in-memory state, and its comment now says so instead of claiming a live population.
+  Residual in `docs/CONFORMANCE.md`: a refused record is reclaimed by nothing until the
+  streams are recreated. The enforcement points call the sweep's validator **whole**,
+  which also makes its three pre-existing malformed pairings refuse a CONNECT and an
+  expiry rather than only the sweep — deliberate, and stated in
+  `docs/ARCHITECTURE.md`: splitting that predicate is the failure its own comment
+  records. The holistic review's substantive finding is folded in: because the
+  validator is shared with `buildSessionRefs`, a refused record initially suspended
+  the orphan QoS 2 sweep account-wide **and permanently**, since nothing rewrites
+  such a record and expiry now refuses it too. That was over-broad, and the same
+  function already said so about its affine claim inventory — "deliberately not an
+  early return ... or one persistent corrupt claim would disable them account-wide,
+  forever, on evidence about a different resource class". The reference walk now
+  reports the affine half indeterminate **separately from a fatal failure**: an
+  affine-pair failure skips affine claim reconciliation and affine consumer deletion
+  while inbound holds, in-flight registers and PUBREL consumers keep being reclaimed
+  (that record's identity and generation are sound, so their references are
+  complete); only a record whose identity cannot be established still aborts the
+  pass. This also fixes the same over-broad abort for the three pre-existing
+  affine-pair failures. Both are warnings now rather than debug, and the
+  recreate-the-streams guidance is attached only to record-shaped failures so a scan
+  timeout cannot prescribe a destructive recovery. Two tests pin the split, each
+  asserting both halves, with mutations M-H (fatal again) and M-I (skip dropped)
+  breaking opposite halves.
+
+  A third round then found a **bypass of the new rule itself**, and it was real: the
+  predicate matched the literal QoS 2, but `processSubs` clamps a filter above QoS 2
+  down to 2 while restoring and the resume feeds `SharedSubs` values in verbatim, so
+  a record carrying 3 became a live shared QoS 2 membership that the rule never saw.
+  A persisted shared QoS byte outside 0..2 is now refused in its own right
+  (mutation M-J), with QoS 3 and QoS 255 rows in the shared acceptance matrix.
+
+  A fourth round found the last one: the winner-record validation in
+  `materializeQ2AffOnBehalf` sat *inside* the generation-mismatch arm, so a record
+  that MATCHED a claim's generation and was still malformed went on to materialize a
+  copy and **acknowledge the group source** — irreversible, for a delivery owed to a
+  session the same refusal makes unresumable. Validation moved ahead of the
+  comparison, since the record is used in both directions. Its first fixture passed
+  for the wrong reason (the arm was unreachable without the winner's affine consumer)
+  and mutation M-K exposed that before it could be believed.
+
+  One correction to the plan's own bookkeeping: `inflight_register_test.go:4717` was
+  listed as a survivor of the closing regression grep and is not one — its phrase
+  splits across two comment lines, so the single-line pattern never matched it. It
+  remains a correct exclusion ("the old broker" there is the *displaced* participant,
+  two concurrent brokers of this tree); it was simply never a gate hit.
+
+  Deliberately not swept: operator-facing "not a rolling upgrade" error strings and the
+  assertion pinning one, `docs/findings/` and `CHANGELOG.md` (historical record),
+  `CONTRIBUTING.md` / `docs/PORTING.md` / `CLAUDE.md` (correct statements of the
+  boundary), upstream nats-server's embedded MQTT listener (a real external population),
+  and the reversed "a broker old enough to have written X" phrasings, which describe
+  fail-closed refusal rather than rollout support.
 
 - [ ] **Cross-term create × create recognition.** Two brokers creating from an empty
   subject across a leader term are both admitted pre-proposal, both apply, and the

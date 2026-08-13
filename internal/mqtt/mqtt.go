@@ -1333,8 +1333,9 @@ type mqttSession struct {
 	// sharedSubs holds MQTT 5.0 Shared Subscriptions, keyed by session key
 	// ("$share/{ShareName}/{NATS subject}") so distinct groups (and a plain
 	// subscription) on the same subject do not collide. Kept separate from subs
-	// so an older server reading the persisted record never subscribes to a
-	// "$share/..." key as a literal topic. rapSubs/subIDs are shared with plain
+	// so that every reader of the persisted record finds in Subs only literal topic
+	// filters: a "$share/..." key is not one, and nothing may subscribe to it as
+	// though it were. rapSubs/subIDs are shared with plain
 	// subscriptions but keyed by session key (collision-free). Spec5 [4.8.2].
 	sharedSubs map[string]byte
 
@@ -1390,9 +1391,9 @@ type mqttSession struct {
 	// durable, subject and delivery subject, and the inbound QoS 2 hold subjects —
 	// because idHash is reused by a later session of the same client ID and a
 	// deterministic name is therefore not an identity. Minted at creation,
-	// re-minted by clear(), preserved by a reconnect or resume. Empty means a
-	// legacy record written before generations existed: keep the old names. See
-	// sess_incarnation.go.
+	// re-minted by clear(), preserved by a reconnect or resume. Never empty for a
+	// session restored from a record: a record without a generation predates them
+	// and is REFUSED, not interpreted under the old names. See sess_incarnation.go.
 	gen string
 	// wid / pwid are the identity of the record write this broker was last
 	// ACKNOWLEDGED for, and that record's own parent. Every save stamps a fresh wid
@@ -1654,34 +1655,37 @@ type mqttPersistedSession struct {
 	// NoLocal and RetainAsPublished are the sets of Subs filters that carry the
 	// v5 No Local / Retain As Published options; SubIDs maps a Subs filter to its
 	// v5 Subscription Identifier. All kept separate from Subs (rather than packed
-	// into its QoS byte) so an older server reading this record still sees a valid
-	// 0..2 QoS and simply ignores these fields. Spec5 [3.8.3.1], [3.8.2.1.2].
+	// into its QoS byte) so that Subs' value stays a valid 0..2 QoS for every reader
+	// of this record. Spec5 [3.8.3.1], [3.8.2.1.2].
 	NoLocal           []string       `json:"no_local,omitempty"`
 	RetainAsPublished []string       `json:"retain_as_published,omitempty"`
 	SubIDs            map[string]int `json:"sub_ids,omitempty"`
 	// SharedSubs is the sole persisted authority for MQTT 5.0 Shared
 	// Subscriptions (session key -> QoS). The group consumer's durable, deliver
 	// subject, and queue name are all derived deterministically from each key
-	// (see mqttSharedNames), so no consumer config is persisted for them — and
-	// they are deliberately excluded from Cons, since an older server would
-	// otherwise delete the group durable in clear(). Spec5 [4.8.2].
+	// (see mqttSharedNames), so no consumer config is persisted for them: the
+	// record builder filters group-owned configs out of Cons as redundant, and the
+	// paths that release a group durable key off SharedSubs rather than Cons.
+	// Spec5 [4.8.2].
 	SharedSubs map[string]byte            `json:"shared_subs,omitempty"`
 	Cons       map[string]*ConsumerConfig `json:"cons,omitempty"`
 	PubRel     *ConsumerConfig            `json:"pubrel,omitempty"`
 	// Q2Aff / Q2AffGen are the session-affine QoS 2 delivery path for shared
 	// subscriptions: the consumer that delivers copies of started deliveries this
-	// session owns, and the generation that namespaces all three of its names. An
-	// older server ignores both, which leaks the consumer but can never expose one
-	// session's in-flight message to another (the generation is in every name).
+	// session owns, and the generation that namespaces all three of its names.
+	// Because the generation is in EVERY name, a leaked affine consumer can never
+	// expose one session's in-flight message to another. A record carrying any
+	// qos-2 entry in SharedSubs must carry a Q2AffGen; one that does not is refused
+	// rather than interpreted (see mqttValidateRecordAffinePair).
 	// Spec5 [4.8.2]; see qos2_shared_affine.go.
 	Q2Aff    *ConsumerConfig `json:"q2aff,omitempty"`
 	Q2AffGen string          `json:"q2affgen,omitempty"`
 	// Gen is this session incarnation's generation, which namespaces every
 	// resource named after idHash alone (the PUBREL path, the inbound QoS 2 hold
-	// subjects). Absent means a record written before generations existed: the
-	// legacy hash-only names apply. An older broker ignores the field and keeps
-	// using those names, so the two do not see each other's PUBRELs — the same
-	// mixed-version rule as Q2AffGen. See sess_incarnation.go.
+	// subjects). It is mandatory. A record without one predates generations and is
+	// REFUSED rather than interpreted under the hash-only names it was written with
+	// (F-057): nothing reclaims such a record, so the recovery is recreating the
+	// bridge-owned streams. See sess_incarnation.go.
 	Gen string `json:"gen,omitempty"`
 	// WID is this record write's own identity, minted once per write; PWID is the
 	// WID of the record the write was derived from (empty only for a first create).
@@ -1693,18 +1697,20 @@ type mqttPersistedSession struct {
 	// are therefore SIBLINGS of one base, and a survivor that is provably our
 	// sibling is not evidence that anybody took the session over.
 	//
-	// RECOGNITION ONLY: nothing repairs the erased write, and an absent WID simply
-	// concedes exactly as every record written before this field did. An older
-	// broker ignores both fields and drops them on its next write, which limits
-	// detection rather than disabling it. See sess_fork_lineage.go.
+	// RECOGNITION ONLY: nothing repairs the erased write, and a record whose WID is
+	// absent CONCEDES rather than accuses — classifyRecordLineage requires the
+	// survivor to carry an identity of its own before the parent match can mean
+	// anything. See sess_fork_lineage.go.
 	WID  string `json:"wid,omitempty"`
 	PWID string `json:"pwid,omitempty"`
 	// Drains are the consumers that survived an UNSUBSCRIBE because deliveries they
 	// had already STARTED must still be completed ([MQTT-3.10.4-3]). Keyed by the
 	// same sid as Cons, so a "foo/#" filter's level-up companion drains
-	// independently. Deliberately kept OUT of Cons: an older broker restoring one
-	// there would find cons[sid] on a re-SUBSCRIBE, take the fromSubProto early
-	// return and never create a delivery subscription. See unsub_drain.go.
+	// independently. Deliberately kept OUT of Cons, because Cons restores straight
+	// into sess.cons: a drain carried there would satisfy the cons[sid] lookup on a
+	// re-SUBSCRIBE, take the fromSubProto early return, and leave the filter with no
+	// delivery subscription. Drains restore through their own path and a
+	// re-SUBSCRIBE adopts one explicitly. See unsub_drain.go.
 	Drains map[string]*mqttPersistedDrain `json:"drains,omitempty"`
 
 	// CancelledRegs are the NONCES of registers this session has given up — the
@@ -5883,6 +5889,15 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 		return
 	}
 	ps.Gen = recGen
+	// Same rule again, and for the sharper reason: this path CLAIMS the record and
+	// deletes it. A shared QoS 2 membership with no affine generation is a record
+	// the broker cannot interpret, and expiring it would destroy the state an
+	// assignment owed to a started delivery is arbitrated from.
+	// See mqttValidateRecordAffinePair.
+	if aerr := mqttValidateRecordAffinePair(ps, idHash); aerr != nil {
+		s.Warnf("MQTT session expiry: refusing to act on %q: %v", ps.ID, aerr)
+		return
+	}
 
 	if ps.Teardown != nil {
 		if err := as.finishAdoptedTeardown(ps, idHash, seq, s.getOpts()); err != nil {
@@ -5976,6 +5991,16 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 			continue
 		}
 		idHash := getHash(ps.ID)
+		// A record this broker has said it cannot interpret is not one it may
+		// REWRITE. The stamp below is a full record write, and arming a timer on it
+		// schedules a claim and a delete of the same record — F-058's rule is that a
+		// refused record is never claimed, published, cancelled or deleted. Skip it
+		// whole: nothing reclaims it until the streams are recreated.
+		// See mqttValidateRecordAffinePair.
+		if aerr := mqttValidateRecordAffinePair(ps, idHash); aerr != nil {
+			s.Warnf("MQTT session expiry sweep: refusing to act on the record of %q: %v", ps.ID, aerr)
+			continue
+		}
 		if ps.DisconnectedAt == 0 {
 			// The record claims a connected client. If we own the record and
 			// have no session for it in memory, the owner (us) went down while
@@ -8439,6 +8464,22 @@ RESTORE:
 	}
 	ps.Gen = recGen
 
+	// A shared QoS 2 membership with no affine generation predates the affine path,
+	// and is REFUSED here rather than resumed. It has to be caught before the
+	// branches below: the teardown adoption derives shared durable names from every
+	// SharedSubs key, the overdue discard runs clear() over the same set, and an
+	// ordinary resume would REWRITE the record — after which materializeQ2AffOnBehalf
+	// reads the empty generation as proof the winner is gone and discards an
+	// assignment owed to a delivery already started. The sweep and both expiry paths
+	// enforce the same rule, so the record is uninterpretable everywhere rather than
+	// only where it is convenient. See mqttValidateRecordAffinePair.
+	if aerr := mqttValidateRecordAffinePair(ps, hash); aerr != nil {
+		return nil, false, fmt.Errorf("restoring session %q: %w; this record was written by "+
+			"a pre-release development broker and its format is not supported: stop this "+
+			"account's brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
+			"streams)", clientID, aerr)
+	}
+
 	if ps.Teardown != nil {
 		if err := as.finishAdoptedTeardown(ps, hash, smsg.Sequence, opts); err != nil {
 			if !errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
@@ -8571,9 +8612,9 @@ RESTORE:
 	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 	sess.restoreDrainsFromRecord(ps)
 	sess.pubRelConsumer = ps.PubRel
-	// A persisted affine consumer proves only that one once existed: it may have
-	// been deleted, may have drifted, or may never have been honored by an older
-	// broker. q2AffReady therefore stays FALSE here and is set only by
+	// A persisted affine consumer proves only that one once existed: it may since
+	// have been deleted or have drifted from the persisted config. q2AffReady
+	// therefore stays FALSE here and is set only by
 	// ensureQ2AffineConsumerSubscription, after the delivery subscription is
 	// installed and the real consumer is create-or-update verified.
 	sess.q2AffConsumer = ps.Q2Aff
@@ -8728,8 +8769,8 @@ func (sess *mqttSession) setIncarnationLocked(gen string) {
 //
 // Persist only consumer configs that still correspond to a live subscription:
 //   - Shared (DeliverGroup) consumers are group-owned and reconstructed from
-//     SharedSubs on restore; never persist them in Cons (an older server would
-//     delete the group durable in clear()).
+//     SharedSubs on restore; never persist them in Cons, where they would be
+//     redundant with the sole authority that already names them.
 //   - A plain consumer is persisted only while its subscription exists in Subs,
 //     so a consumer removed from Subs but not yet torn down (e.g. UNSUBSCRIBE
 //     persisting before teardown, or a rolled-back failed SUBSCRIBE) is not
@@ -9423,7 +9464,7 @@ func (sess *mqttSession) update(tok recordTx, filters []*mqttFilter, add bool) e
 				needUpdate = true
 			}
 			// Track No Local and Retain As Published in separate sets so the
-			// persisted QoS byte stays in the 0..2 range older servers understand.
+			// persisted QoS byte stays a valid 0..2 for every reader of the record.
 			// No Local never applies to shared subscriptions. Spec5 [3.8.3.1].
 			var changed bool
 			if !f.shared {

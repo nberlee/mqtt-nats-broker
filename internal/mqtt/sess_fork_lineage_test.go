@@ -191,8 +191,8 @@ func TestSessSaveStampsAndAdoptsLineage(t *testing.T) {
 //
 // Without adoption at the restore, the first save after ANY restart is stamped with an
 // empty parent — after which arm 2's ackPWID guard makes every sibling of that base
-// unprovable, so detection would be inert after every restart even on a fully upgraded
-// cluster. The assertion is deliberately BOTH halves: that the parent is the restored
+// unprovable, so detection would be inert after every restart, with nothing failing
+// anywhere. The assertion is deliberately BOTH halves: that the parent is the restored
 // record's identity, and that the save's own identity is freshly minted, because the
 // parent assertion alone does not pin the mint.
 func TestSessRestoreAdoptsLoadedLineage(t *testing.T) {

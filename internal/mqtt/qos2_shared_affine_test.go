@@ -524,7 +524,8 @@ func TestQ2AffineFormMaxBoundsEveryRealRecord(t *testing.T) {
 		t.Fatal("the create-only form must fit the bound")
 	}
 
-	// The runtime backstop for legacy messages admitted before this bound existed.
+	// The runtime backstop for a message stored without the admission bound, which
+	// a QoS 1/2 Will bypasses.
 	if !mqttQ2AffineRecordFits(env, int32(bound)) {
 		t.Fatal("a record at the bound must be accepted by the runtime check")
 	}

@@ -41,22 +41,23 @@ func TestPubRelCorrelationRoundTrip(t *testing.T) {
 	}
 }
 
-// TestPubRelUncorrelatedIsUnchanged pins backward compatibility in both
-// directions: producing a PUBREL with no source is byte-identical to the old
-// form, and a record written by a broker that predates correlation parses as
-// uncorrelated rather than as a correlation to some sequence 0.
+// TestPubRelUncorrelatedIsUnchanged pins the uncorrelated form in both
+// directions: producing a PUBREL with no source — which a retained QoS 2 send
+// does — is byte-identical to the plain form, and a record carrying no
+// correlation headers parses as uncorrelated rather than as a correlation to
+// some sequence 0.
 func TestPubRelUncorrelatedIsUnchanged(t *testing.T) {
 	t.Parallel()
 	const pi = uint16(7)
-	legacy, legacyLen := mqttNewDeliverablePubRel(pi)
+	plain, plainLen := mqttNewDeliverablePubRel(pi)
 	got, gotLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_)
-	if string(got) != string(legacy) || gotLen != legacyLen {
-		t.Fatalf("an uncorrelated PUBREL must be byte-identical to the legacy form:\n got %q\nwant %q", got, legacy)
+	if string(got) != string(plain) || gotLen != plainLen {
+		t.Fatalf("an uncorrelated PUBREL must be byte-identical to the plain form:\n got %q\nwant %q", got, plain)
 	}
-	if corr := mqttParsePubRelCorrelation(legacy[:legacyLen]); corr.Ok {
-		t.Errorf("a legacy PUBREL must parse as uncorrelated, got %+v", corr)
+	if corr := mqttParsePubRelCorrelation(plain[:plainLen]); corr.Ok {
+		t.Errorf("a PUBREL carrying no correlation headers must parse as uncorrelated, got %+v", corr)
 	}
-	if got := mqttParsePubRelNATSHeader(legacy[:legacyLen]); got != pi {
+	if got := mqttParsePubRelNATSHeader(plain[:plainLen]); got != pi {
 		t.Errorf("packet identifier = %v, want %v", got, pi)
 	}
 }

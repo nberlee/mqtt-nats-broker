@@ -80,10 +80,10 @@ func (p drainPhase) String() string {
 
 // mqttPersistedDrain is one draining consumer as it appears in the session record.
 //
-// It is deliberately NOT written to the record's Cons map. An older broker
-// restoring it would find cons[sid] on a re-SUBSCRIBE, take the fromSubProto early
-// return, and never create a delivery subscription — so the filter would look
-// subscribed while nothing delivered it.
+// It is deliberately NOT written to the record's Cons map, because Cons restores
+// straight into sess.cons: a drain carried there would satisfy the cons[sid] lookup
+// on a re-SUBSCRIBE, take the fromSubProto early return, and never create a delivery
+// subscription — so the filter would look subscribed while nothing delivered it.
 type mqttPersistedDrain struct {
 	// Cons is the surviving durable: its name, deliver subject and filter subject.
 	Cons *ConsumerConfig `json:"cons"`
