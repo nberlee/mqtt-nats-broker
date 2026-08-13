@@ -49,7 +49,14 @@ All notable changes to this project are documented here. The format is based on
   format:** the pre-release in-record Will migration path (`Migrated` field, migration
   worker, terminal tombstones) is removed, and a `$MQTT_sess` stream without a valid
   generated epoch is rejected with recreate guidance. Back up/restore/recreate
-  `$MQTT_sess` and `$MQTT_willcancel` as one unit.
+  `$MQTT_sess`, `$MQTT_willcancel`, `$MQTT_teardown` and `$MQTT_origin` as ONE unit,
+  with every broker for the account stopped. The coupling is enforced differently on
+  each, which is why the instruction covers all four: `$MQTT_teardown` and
+  `$MQTT_origin` carry the session stream's incarnation epoch in their STREAM metadata
+  and their validators refuse a session-only recreation at the next startup, while
+  `$MQTT_willcancel` carries it per watermark RECORD and is not startup-enforced — a
+  session-only recreation there is admitted, silently losing the suppression evidence
+  that keeps superseded delayed Wills from firing.
 - Project scaffold: Go module, config (`internal/config`), NATS/JetStream backend
   with auth-passthrough dial (`internal/backend`), runnable entrypoint with
   health/readiness endpoints.

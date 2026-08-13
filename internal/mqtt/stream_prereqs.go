@@ -318,7 +318,7 @@ type brokerStreamSpec struct {
 	post      func(*StreamInfo) error // runs after validation, on the authoritative info
 }
 
-// brokerStreamSpecs returns the ordered provisioning table for the ten
+// brokerStreamSpecs returns the ordered provisioning table for the eleven
 // broker-owned $MQTT_* streams. wantReplicas is 0 when no explicit replica
 // count is configured; maxAckPending is the broker's effective per-consumer
 // cap; requireMsgTTL is whether this broker accepts MQTT 5.0 (see
@@ -338,8 +338,8 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			verr, stream, req)
 	}
 
-	// Hoisted so its own preCreate can stamp it: the $MQTT_sess incarnation epoch
-	// this stream is coupled to does not exist yet when the table is built.
+	// Hoisted so their own preCreate can stamp them: the $MQTT_sess incarnation epoch
+	// these streams are coupled to does not exist yet when the table is built.
 	teardownCfg := &StreamConfig{
 		Name:       mqttTeardownStreamName,
 		Subjects:   []string{mqttTeardownSubjectPrefix + as.domainTk + ">"},
@@ -348,6 +348,20 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 		Discard:    DiscardOld,
 		Replicas:   replicas,
 		MaxMsgsPer: 1,
+	}
+	// The interval register carries TWO epochs: its own generated incarnation
+	// identity, which is half of every interval token, and the adopted session epoch
+	// it is coupled to. The first can be a literal here; the second is stamped into
+	// the same map by preCreate, so the map is created now rather than replaced there.
+	originCfg := &StreamConfig{
+		Name:       mqttOriginStreamName,
+		Subjects:   []string{mqttOriginSubjectPrefix + as.domainTk + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Discard:    DiscardOld,
+		Replicas:   replicas,
+		MaxMsgsPer: 1,
+		Metadata:   map[string]string{mqttOriginEpochMetaKey: mqttGenOriginEpoch()},
 	}
 
 	return []brokerStreamSpec{
@@ -371,14 +385,15 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			validate: func(si *StreamInfo) error {
 				if verr := validateSessStream(si, as.domainTk, wantReplicas); verr != nil {
 					// The session stream is epoch-coupled to BOTH permanent watermark
-					// streams: recreating $MQTT_sess alone mints a new incarnation
-					// epoch while the takeover-suppression and generation-retirement
-					// watermarks keep the old one, the partial-recreation hazard
+					// streams AND to the interval register: recreating $MQTT_sess alone
+					// mints a new incarnation epoch while the takeover-suppression
+					// watermarks, the generation-retirement watermarks and the interval
+					// registers keep the old one, the partial-recreation hazard
 					// docs/ARCHITECTURE.md ("Operational constraints for the marker")
-					// warns against. The recovery is the coupled one, mirroring both
-					// watermark streams' own guidance.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the session stream alone mints a new incarnation epoch against stale takeover-suppression and generation-retirement watermarks (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
-						verr, mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName)
+					// warns against. The recovery is the coupled one, mirroring all
+					// three of those streams' own guidance.
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the session stream alone mints a new incarnation epoch against stale takeover-suppression watermarks, generation-retirement watermarks and session-interval registers (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
+						verr, mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName, mqttOriginStreamName)
 				}
 				return nil
 			},
@@ -446,8 +461,8 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 					// are only comparable within one $MQTT_sess incarnation — so the
 					// recovery is the coupled one docs/ARCHITECTURE.md ("Operational
 					// constraints for the marker") requires.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the marker stream alone discards permanent takeover-suppression watermarks and can let superseded delayed Wills fire (see docs/ARCHITECTURE.md)",
-						verr, mqttWillCancelStreamName, mqttSessStreamName, mqttTeardownStreamName)
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the marker stream alone discards permanent takeover-suppression watermarks and can let superseded delayed Wills fire (see docs/ARCHITECTURE.md)",
+						verr, mqttWillCancelStreamName, mqttSessStreamName, mqttTeardownStreamName, mqttOriginStreamName)
 				}
 				return nil
 			},
@@ -486,9 +501,59 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 					// are only comparable within the incarnation they were written under.
 					// Recreating either stream alone is the hazard, and an unfenced
 					// generation whose resources are already deleted is the cost.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the session stream alone leaves generation-retirement watermarks from a different incarnation, and recreating this stream alone discards the fences that keep a torn-down session from being resumed hollow (see docs/ARCHITECTURE.md)",
-						verr, mqttTeardownStreamName, mqttSessStreamName, mqttWillCancelStreamName)
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the session stream alone leaves generation-retirement watermarks from a different incarnation, and recreating this stream alone discards the fences that keep a torn-down session from being resumed hollow (see docs/ARCHITECTURE.md)",
+						verr, mqttTeardownStreamName, mqttSessStreamName, mqttWillCancelStreamName, mqttOriginStreamName)
 				}
+				return nil
+			},
+		},
+		{
+			name: mqttOriginStreamName,
+			txt:  "session interval register",
+			// Durable per-client session-interval register. Permanent per-client
+			// retention (MaxMsgsPer:1, no global limits so a register is never evicted;
+			// DiscardOld so the advance replaces a client's standing register rather
+			// than being rejected). Nothing here ever deletes or purges, so both denials
+			// are audited non-prerequisites: a delete cannot rewind the sequence counter,
+			// so an erasure loses recognition rather than replaying an identity.
+			// Epoch-COUPLED
+			// to $MQTT_sess, so the entry sits after it. See sess_origin_interval.go.
+			cfg: originCfg,
+			// Merges the adopted session epoch into the map the literal above already
+			// created — replacing the map would drop this stream's own incarnation
+			// epoch, which is half of every interval identity it hands out. Same reason
+			// the stamp cannot be a literal as on $MQTT_teardown: the table is built
+			// before the loop that adopts it.
+			preCreate: func() {
+				if as.sessStreamEpoch == _EMPTY_ {
+					// Unreachable in the provisioning order: $MQTT_sess validated and
+					// adopted its epoch first. Left unstamped rather than guessed, so the
+					// validator below refuses the stream instead of admitting one coupled
+					// to nothing.
+					return
+				}
+				originCfg.Metadata[mqttSessEpochMetaKey] = as.sessStreamEpoch
+			},
+			validate: func(si *StreamInfo) error {
+				if verr := validateOriginStream(si, as.domainTk, wantReplicas, as.sessStreamEpoch); verr != nil {
+					// The same coupling as both watermark streams, and one more reason of
+					// its own: these registers name intervals of $MQTT_sess record
+					// subjects, so a session stream recreated under them describes
+					// intervals that no longer exist, while this stream recreated alone
+					// restarts the sequences every interval identity is derived from.
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the session stream alone leaves interval registers naming intervals of a different incarnation, and recreating this stream alone restarts the sequences every interval identity is derived from, so a later interval can be handed one an earlier interval already used (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
+						verr, mqttOriginStreamName, mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName)
+				}
+				return nil
+			},
+			post: func(si *StreamInfo) error {
+				// Adopt the authoritative register-stream incarnation epoch, already
+				// validated by validateOriginStream on this exact snapshot. It is the
+				// first half of every interval identity this broker derives, so a
+				// create-race loser adopts the WINNER's value here rather than the one it
+				// proposed. Without this the create arm has nothing to build a token
+				// from. See originIntervalToken.
+				as.originStreamEpoch = si.Config.Metadata[mqttOriginEpochMetaKey]
 				return nil
 			},
 		},

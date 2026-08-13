@@ -126,20 +126,28 @@ func TestCreateInheritsTheRetiredRecordIdentity(t *testing.T) {
 	}
 }
 
-// TestCreateWatermarkDispositions is T4 (M7, M20): every status has a disposition, and the
-// two that carry no evidence make no positive claim from its absence.
+// TestCreateWatermarkDispositions is T4 (M7, M20): every status has a disposition, and
+// neither of the two that carry no retirement evidence makes a positive claim OUT OF THAT
+// ABSENCE.
 //
-// The hook returns a NON-EMPTY RWID alongside every status, so the parentless assertions
-// cannot pass merely because the expected value is also the zero value.
+// The hook returns a NON-EMPTY RWID alongside every status, so no row can pass merely
+// because the expected value is also the zero value — and on the absent row that offered
+// value is precisely what must NOT be inherited. Absent now derives an identity, but from
+// the session-interval register, which is a positive durable fact of its own rather than
+// something read off a watermark that is not there (sess_origin_interval.go). Indeterminate
+// still concedes, and must not touch the register at all.
 func TestCreateWatermarkDispositions(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		status  mqttRetirementStatus
 		refused bool
+		// wantRegisterParent: the create must descend from the interval register.
+		// Otherwise it must be parentless.
+		wantRegisterParent bool
 	}{
-		{"absent creates parentless", mqttRetirementAbsent, false},
-		{"indeterminate creates parentless", mqttRetirementIndeterminate, false},
-		{"corrupt refuses the CONNECT", mqttRetirementCorrupt, true},
+		{"absent inherits the interval identity", mqttRetirementAbsent, false, true},
+		{"indeterminate creates parentless", mqttRetirementIndeterminate, false, false},
+		{"corrupt refuses the CONNECT", mqttRetirementCorrupt, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e, _ := testNewCreateLineageEnv(t, "create-disp-"+strings.ReplaceAll(tc.name, " ", "-"))
@@ -188,9 +196,32 @@ func TestCreateWatermarkDispositions(t *testing.T) {
 			if ps == nil {
 				t.Fatal("the create's first save left no record")
 			}
-			if ps.PWID != _EMPTY_ {
-				t.Fatalf("no retirement is RECORDED, so nothing may be inherited: PWID=%q "+
-					"(the hook offered %q)", ps.PWID, offered)
+			if ps.PWID == offered {
+				t.Fatalf("no retirement is RECORDED, so the watermark's RWID may never be "+
+					"inherited: PWID=%q is the value the hook offered", ps.PWID)
+			}
+			_, oseq, ostatus := e.asm.jsa.loadOriginIntervalRecord(e.asm.domainTk, e.idHash)
+			if !tc.wantRegisterParent {
+				if ps.PWID != _EMPTY_ {
+					t.Fatalf("a transient watermark read establishes no retirement fact, so the "+
+						"create must stay parentless: PWID=%q", ps.PWID)
+				}
+				if ostatus != mqttOriginAbsent {
+					t.Fatalf("the indeterminate arm must not touch $MQTT_origin, got register "+
+						"status %v", ostatus)
+				}
+				return
+			}
+			if ostatus != mqttOriginValid {
+				t.Fatalf("the absent arm must establish an interval register, got status %v", ostatus)
+			}
+			want := mqttOriginToken(e.asm.originStreamEpoch, oseq)
+			if want == _EMPTY_ {
+				t.Fatalf("the register at sequence %v yielded no identity", oseq)
+			}
+			if ps.PWID != want {
+				t.Fatalf("the absent arm descends from the INTERVAL identity: PWID=%q want %q",
+					ps.PWID, want)
 			}
 		})
 	}

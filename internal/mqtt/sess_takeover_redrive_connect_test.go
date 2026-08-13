@@ -1406,14 +1406,34 @@ func TestReDriveReReadsAfterASupersededDeferredDiscard(t *testing.T) {
 	if ps.WID == retired {
 		t.Fatal("the CONNECT re-used the retired record's identity instead of creating one")
 	}
-	// The discriminator. The authoritative re-read found an EMPTY subject, so this create
-	// descends from nothing. A parent here is the retired record's WID, carried on the
-	// object the discharge reset — a write whose base and parent came from two different
-	// reads, which is exactly what R2 forbids.
-	if ps.PWID != _EMPTY_ {
-		t.Fatalf("a create after an authoritative read of an ABSENT subject must be parentless: "+
-			"parent %q, retired record %q", ps.PWID, retired)
+	// The discriminator, and it is the RETIRED WID specifically: a create after an
+	// authoritative read of an empty subject must not carry the identity the discharge
+	// reset off the object, because that is a write whose base and parent came from two
+	// different reads — exactly what R2 forbids. It descends from the session-interval
+	// register instead, which is read on this same pass (sess_origin_interval.go).
+	if ps.PWID == retired {
+		t.Fatalf("a create after an authoritative read of an ABSENT subject must not inherit the "+
+			"RETIRED record's identity: parent %q", ps.PWID)
 	}
+	if ps.PWID != testRedriveOriginToken(t, asm, getHash(cid)) {
+		t.Fatalf("the create must descend from the interval identity: parent %q, register %q",
+			ps.PWID, testRedriveOriginToken(t, asm, getHash(cid)))
+	}
+}
+
+// testRedriveOriginToken returns the identity the client's standing interval register
+// yields, for the create-side assertions above.
+func testRedriveOriginToken(t *testing.T, asm *mqttAccountSessionManager, idHash string) string {
+	t.Helper()
+	_, seq, status := asm.jsa.loadOriginIntervalRecord(asm.domainTk, idHash)
+	if status != mqttOriginValid {
+		t.Fatalf("expected a valid interval register, got status %v", status)
+	}
+	tok := mqttOriginToken(asm.originStreamEpoch, seq)
+	if tok == _EMPTY_ {
+		t.Fatalf("the register at sequence %v yielded no identity", seq)
+	}
+	return tok
 }
 
 // ---------------------------------------------------------------------------
@@ -1634,10 +1654,16 @@ func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 	if ps == nil {
 		t.Fatal("the accepted CONNECT left no record")
 	}
-	if ps.PWID != _EMPTY_ {
-		t.Fatalf("a create after an authoritative read of an ABSENT subject is a genuine "+
-			"first-create and descends from nothing: parent %q, retired record %q",
-			ps.PWID, retiredWID)
+	// As above: what must not be inherited is the RETIRED record's identity. A genuine
+	// first-create now descends from the session-interval register instead of from
+	// nothing, which is what makes its cross-term sibling recognisable.
+	if ps.PWID == retiredWID {
+		t.Fatalf("a create after an authoritative read of an ABSENT subject must not inherit the "+
+			"RETIRED record's identity: parent %q", ps.PWID)
+	}
+	if want := testRedriveOriginToken(t, asm, getHash(cid)); ps.PWID != want {
+		t.Fatalf("the create must descend from the interval identity: parent %q, register %q",
+			ps.PWID, want)
 	}
 }
 

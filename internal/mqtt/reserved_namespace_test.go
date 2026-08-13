@@ -26,9 +26,18 @@ func mqttTopicFor(prefix string) string {
 // reservedPrefixes is every subject prefix inside the broker's reserved
 // namespace that carries real traffic. Kept as one list so a new internal
 // prefix is a visible omission here rather than a silent hole.
+//
+// Five entries below were added after that intent had already been missed once
+// each: teardown, qos2 assign, inflight, affine delivery and the interval
+// register were introduced with their features and never registered here. The
+// guards deny "$MQTT.>" wholesale rather than enumerating prefixes, so none of
+// them was ever a live hole — but a list whose whole purpose is to make an
+// omission visible only does that if it is complete. The two affine prefixes
+// under "$MQTT.out." are covered by the outbound entry's own wildcard.
 var reservedPrefixes = map[string]string{
 	"deliver subject":   mqttSubPrefix,
 	"pubrel delivery":   mqttPubRelDeliverySubjectPrefix,
+	"affine delivery":   mqttQ2AffineDeliverPrefix,
 	"shared deliver":    mqttSharedSubDeliverPrefix,
 	"sessions":          mqttSessStreamSubjectPrefix,
 	"messages":          mqttStreamSubjectPrefix,
@@ -36,7 +45,11 @@ var reservedPrefixes = map[string]string{
 	"jsa replies":       mqttJSARepliesPrefix,
 	"will queue":        mqttWillQSubjectPrefix,
 	"will cancel":       mqttWillCancelSubjectPrefix,
+	"teardown":          mqttTeardownSubjectPrefix,
+	"interval register": mqttOriginSubjectPrefix,
 	"qos2 inbound":      mqttQoS2IncomingMsgsStreamSubjectPrefix,
+	"qos2 assign":       mqttQoS2AssignStreamSubjectPrefix,
+	"inflight":          mqttInflightStreamSubjectPrefix,
 	"outbound":          mqttOutSubjectPrefix,
 	"pubrel outbound":   mqttPubRelSubjectPrefix,
 }

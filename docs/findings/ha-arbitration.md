@@ -188,17 +188,39 @@ carries the one piece of new exposure this closure has: the claim it takes can b
 regressed by a cross-term apply, which the bare delete could not reach, and that is
 stated as a residual rather than claimed away.
 
-What is left is stated by DIRECTION rather than by count. A record-absent create with no
-usable watermark — a genuine first interval, a client whose retirement history was lost,
-or an indeterminate read — still concedes exactly as before, and is filed as its own
-`docs/ROADMAP.md` §0.2 bullet carrying the refutation of the cheap fix (a reserved token
-stamped on the Absent arm mints a positive claim out of an absence, and `$MQTT_teardown`
-can be recreated alone and validate clean with no historical fences). The four other
-routes are residuals in `docs/CONFORMANCE.md`. They are named for the false-fork
+What is left is stated by DIRECTION rather than by count. The record-absent create with no
+usable watermark was filed as its own `docs/ROADMAP.md` §0.2 bullet and is now **closed by
+the session-interval register** (`internal/mqtt/sess_origin_interval.go`;
+`docs/ARCHITECTURE.md`, "The session-interval register"): a per-client single-slot register
+on `$MQTT_origin` whose sequences only move forward, rotated by every teardown from
+inside `recordGenRetirement`, whose identity is the standing message's SEQUENCE paired with
+the stream's incarnation epoch — a sequence because a body can be replayed and a sequence
+cannot. That closes the genuine-first-ever and history-lost shapes; the INDETERMINATE read
+still concedes by construction, and its remaining divergence routes are R0a-R0f in
+`docs/CONFORMANCE.md`. The cheap fix stays refuted for the reason it always was: a reserved
+token stamped on the Absent arm mints a positive claim out of an absence, and
+`$MQTT_teardown` can be recreated alone and validate clean with no historical fences.
+
+That closure also settles what `rwid` is for. It is now the only durable statement of
+*"this specific record was retired"*, and it is retained rather than unified into the
+register for three reasons: it is free at its consult point, the duplication is of
+DERIVATION rather than of fact (the watermark names a record, the register names an
+interval), and F-036's remaining shape plausibly needs exactly that predicate — a bound,
+silent Keep Alive 0 client whose record another broker deleted needs a disposal that does
+not wait for client traffic, and record-absence is ambiguous where `ackWID == rwid` is
+positive proof. **If neither F-036 nor "give a vanished record its own disposal
+vocabulary" needs it, whoever closes the later of the two should CONSIDER removing
+`rwid`** — the field, its validator row, and the valid arm re-pointed at the register. Both
+roadmap bullets carry the note; the consideration is what is prescribed, not the removal.
+
+The four other routes are residuals in `docs/CONFORMANCE.md`. They are named for the false-fork
 direction because that is the dangerous one, but three of them also concede: a stale
 read across a remote lifecycle and a regressed watermark slot give the two creates of
 one interval different parents, and an out-of-band deletion leaves the watermark naming
-the last RETIRED record rather than the deleted one. Each is bounded by the same two
+the last RETIRED record rather than the deleted one. Two of them — R1's read-then-CAS gap
+and R4's out-of-band deletion — are **widened** by the register to the no-watermark
+population, since a create that used to be parentless and simply concede now derives an
+identity and can therefore reach both routes. Each is bounded by the same two
 facts: no false verdict can resurrect state, because the anchor's generation conjunct
 drops any capsule minted for a create, and a survivor carrying a retired generation is
 condemned by the retirement fence.

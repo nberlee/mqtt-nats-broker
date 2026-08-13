@@ -239,6 +239,18 @@ const (
 	mqttTeardownStreamName    = "$MQTT_teardown"
 	mqttTeardownSubjectPrefix = mqttPrefix + "teardown."
 
+	// Stream name and subject prefix for the durable per-client SESSION INTERVAL
+	// register (one subject per client, MaxMsgsPer:1, permanent retention). Every
+	// teardown that records a retirement also rotates the register, so the sequence
+	// its standing message occupies names the interval the client's record subject is
+	// currently in — the identity a create inherits when no retirement watermark
+	// survives to name a parent. No broker operation ever deletes or purges one, but
+	// neither is REFUSED in the configuration: a delete cannot rewind the sequence
+	// counter, so an erasure loses an identity rather than replaying one.
+	// See sess_origin_interval.go.
+	mqttOriginStreamName    = "$MQTT_origin"
+	mqttOriginSubjectPrefix = mqttPrefix + "origin."
+
 	// Reserved $MQTT_sess metadata key holding the generated stream-incarnation
 	// epoch, and the only valid epoch form: "nuid:<22-character NUID>". The epoch
 	// is an identity token (equality only), so a session sequence is comparable to
@@ -246,6 +258,15 @@ const (
 	// validateSessStream.
 	mqttSessEpochMetaKey    = "mqtt_sess_epoch"
 	mqttSessEpochNUIDPrefix = "nuid:"
+
+	// Reserved $MQTT_origin metadata key holding THAT stream's own generated
+	// incarnation epoch, in the same "nuid:<22-character NUID>" form. An interval
+	// identity is a $MQTT_origin sequence, and sequences restart at 1 in a new
+	// incarnation, so the epoch is what keeps two incarnations from handing out the
+	// same identity. Distinct from mqttSessEpochMetaKey, which $MQTT_origin ALSO
+	// carries as the coupling to the session stream whose records it parents. See
+	// validateOriginStream.
+	mqttOriginEpochMetaKey = "mqtt_origin_epoch"
 
 	// Stream name and subject for incoming MQTT QoS2 messages
 	mqttQoS2IncomingMsgsStreamName          = "$MQTT_qos2in"
@@ -829,6 +850,17 @@ type mqttAccountSessionManager struct {
 	// cannot be resolved, the account manager is not published. See
 	// validateSessStream, willTakeoverFence.
 	sessStreamEpoch string
+
+	// originStreamEpoch is the $MQTT_origin incarnation identity resolved once at
+	// account-manager init from that stream's mqtt_origin_epoch metadata (form
+	// "nuid:<NUID>"). It is the first half of every interval identity this broker
+	// derives, the second being a $MQTT_origin sequence — which is only unique
+	// within the incarnation that assigned it. Immutable after init (read without
+	// lock), which is why recreating $MQTT_origin under a running broker is
+	// bounded by the mandatory-restart rule rather than by a check. If a valid
+	// epoch cannot be resolved, the account manager is not published. See
+	// validateOriginStream, originIntervalToken.
+	originStreamEpoch string
 
 	// testPublishWill, when non-nil, replaces the delayed-Will publication for
 	// THIS account manager only (instance-scoped, so parallel tests stay
@@ -3967,7 +3999,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.cleanupRetainedMessageCache(s, closeCh)
 	})
 
-	// Provision the ten broker-owned $MQTT_* streams through the one
+	// Provision the eleven broker-owned $MQTT_* streams through the one
 	// convergence shape (ensureBrokerStream): create-or-lose, an UNCONDITIONAL
 	// authoritative re-read, then per-owner validation over that re-read — a
 	// nonconforming stream is a startup failure with recreate guidance, never
@@ -8321,15 +8353,28 @@ RESTORE:
 				"watermark for this client is unreadable, so a teardown of this session "+
 				"could never record its retirement; stop this account's brokers and "+
 				"recreate the bridge-owned JetStream state (the $MQTT_* streams)", clientID)
-		case mqttRetirementAbsent, mqttRetirementIndeterminate:
-			// No parent, and deliberately no positive claim drawn from an absence.
-			// Absent means no retirement is RECORDED HERE NOW, which is not the same as
-			// none ever happened: $MQTT_teardown can be recreated alone and validate
-			// clean with no historical fences (docs/ARCHITECTURE.md, "Stream
-			// prerequisites"), and a watermark can be deleted administratively.
-			// Indeterminate is a transient read failure that must not fail a CONNECT.
-			// Both concede — exactly today's behavior — and both are the stated
-			// residual in docs/CONFORMANCE.md.
+		case mqttRetirementAbsent:
+			// No retirement is RECORDED HERE NOW, which is not the same as none ever
+			// happened: $MQTT_teardown can be recreated alone and validate clean with no
+			// historical fences (docs/ARCHITECTURE.md, "Stream prerequisites"), and a
+			// watermark can be deleted administratively. So no parent is drawn from the
+			// absence itself — an absence is not a fact, and a token minted from one
+			// fails toward a FALSE fork.
+			//
+			// What IS available is a positive durable fact of the interval: the
+			// per-client register, which every teardown rotates before it deletes
+			// anything and which nothing can erase. It covers both shapes this arm
+			// otherwise conceded — a genuine first-ever interval, where the two racing
+			// creates establish or read one register, and a client whose retirement
+			// history was lost, where the register survives on a different stream.
+			// Empty concedes exactly as before. See sess_origin_interval.go.
+			inherited = as.originIntervalToken(clientID, hash)
+		case mqttRetirementIndeterminate:
+			// A transient read, which must not fail a CONNECT and must not derive an
+			// identity either: it establishes no retirement fact, so a token taken here
+			// could stamp one interval's identity onto another whose retirement state
+			// merely could not be read. Concede without touching $MQTT_origin at all —
+			// exactly today's behavior, and the stated residual in docs/CONFORMANCE.md.
 		}
 		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as

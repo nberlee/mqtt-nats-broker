@@ -219,15 +219,16 @@ func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
 	// Recreate on the SAME store (an administrative recreate) and bring up a fresh
 	// manager against that same NATS; it must generate a new epoch.
 	//
-	// The unit, not $MQTT_sess alone: $MQTT_teardown is stamped with the incarnation
-	// epoch it was created against and its validator REFUSES a mismatch, so deleting
-	// only the session stream is now the explicitly unsupported partial recreation
-	// (`validateTeardownStream`; asserted from the other side in
-	// TestTeardownStreamIsEpochCoupledToTheSessionStream). What this test asserts is
+	// The unit, not $MQTT_sess alone: $MQTT_teardown and $MQTT_origin are each stamped
+	// with the incarnation epoch they were created against and both validators REFUSE a
+	// mismatch, so deleting only the session stream is the explicitly unsupported partial
+	// recreation (`validateTeardownStream`, `validateOriginStream`; asserted from the
+	// other side in TestTeardownStreamIsEpochCoupledToTheSessionStream and
+	// TestOriginStreamIsEpochCoupledToTheSessionStream). What this test asserts is
 	// unchanged — a fresh incarnation mints a different epoch — and recreating the unit
 	// is the documented recovery that reaches it.
 	js, ctx := newJS(t, nc1)
-	for _, name := range []string{mqttSessStreamName, mqttTeardownStreamName} {
+	for _, name := range []string{mqttSessStreamName, mqttTeardownStreamName, mqttOriginStreamName} {
 		if err := js.DeleteStream(ctx, name); err != nil {
 			t.Fatalf("delete %s: %v", name, err)
 		}

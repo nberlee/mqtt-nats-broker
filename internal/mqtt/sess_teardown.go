@@ -592,6 +592,24 @@ func (sess *mqttSession) recordGenRetirement(t *mqttTeardownTarget, nonce, retir
 		// target itself is malformed, which every caller's record already excludes.
 		return fmt.Errorf("refusing to record the retirement of session %q: %w", t.id, verr)
 	}
+	// ROTATE THE INTERVAL IDENTITY, before the watermark decision below and therefore
+	// before every deletion. Both edges of that placement are load-bearing.
+	//
+	// After the validation above: a malformed target would otherwise move the interval
+	// identity forward and then fail retirement validation without deleting anything,
+	// putting the register ahead of a teardown that never happened.
+	//
+	// Before the decision loop: that loop RETURNS EARLY when a standing watermark is
+	// already at or above our marker sequence, and the record is still deleted on that
+	// path. A rotation placed past the early return is skipped exactly there, leaving
+	// an interval whose record is gone with its identity unmoved — which is identity
+	// REUSE, the direction this register exists to make impossible.
+	//
+	// A failure aborts the teardown with NOTHING deleted, exactly as the watermark
+	// write's own failure does. See sess_origin_interval.go.
+	if err := sess.advanceOriginInterval(t, nonce, markerSeq); err != nil {
+		return err
+	}
 	var lastErr error
 	for attempt := 0; attempt < mqttGenRetirementAttempts; attempt++ {
 		cur, seq, status := sess.jsa.loadGenRetirement(sess.domainTk, t.idHash)
