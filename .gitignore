@@ -12,9 +12,12 @@ coverage.*
 *.local
 
 # Editor
-.idea/
+.idea
 .vscode/
 *.swp
 
 # OS
 .DS_Store
+
+# Per-developer MCP server configuration
+.mcp.json
