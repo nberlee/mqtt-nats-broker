@@ -48,6 +48,49 @@ const mqttSessGenLen = 22
 // mqttNewSessGen mints a session incarnation generation.
 func mqttNewSessGen() string { return nuid.Next() }
 
+// Session STREAM incarnation epochs.
+//
+// Distinct from the per-session generation above, and at a different granularity: a
+// generation identifies one session's incarnation, while an epoch identifies the
+// $MQTT_sess STORE's. It is stamped into the stream metadata at creation and adopted
+// by every broker from the authoritative re-read, and it is what makes a stream
+// SEQUENCE meaningful — a sequence is comparable only within the incarnation that
+// assigned it, so every durable record that carries one carries the epoch beside it.
+// Recreating the stream mints a new epoch, which is exactly how records naming
+// sequences of the old store are recognised as uncomparable rather than misread.
+//
+// It is an identity token: equality means "same incarnation, sequences comparable",
+// inequality means "another incarnation". Nothing is ever ordered by it.
+
+// mqttGenSessEpoch generates a fresh session-stream incarnation epoch.
+func mqttGenSessEpoch() string {
+	return mqttSessEpochNUIDPrefix + nuid.Next()
+}
+
+// mqttValidSessEpoch reports whether s is a well-formed epoch: exactly
+// "nuid:<22 base-62 chars>". Empty or any other form is invalid (it collapses no
+// value into the identity space and must never be trusted or compared). The body
+// must be 22 characters drawn from the NUID base-62 alphabet [0-9A-Za-z] — length
+// alone is insufficient, since a same-length body of out-of-alphabet bytes would
+// otherwise be treated as a valid identity and (having a different value than the
+// current epoch) drive a spurious cross-incarnation cancel instead of a defer.
+func mqttValidSessEpoch(s string) bool {
+	if !strings.HasPrefix(s, mqttSessEpochNUIDPrefix) {
+		return false
+	}
+	body := s[len(mqttSessEpochNUIDPrefix):]
+	if len(body) != 22 { // nuid.Next() is 22 chars
+		return false
+	}
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if !(c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
+			return false
+		}
+	}
+	return true
+}
+
 // mqttValidSessGen reports whether s is a well-formed incarnation generation:
 // exactly mqttSessGenLen characters of the NUID base-62 alphabet. Same rule, and
 // same reasoning, as mqttValidQ2AffGen — an out-of-alphabet body of the right

@@ -1268,10 +1268,9 @@ func TestOriginStreamCoupledRecreationGuidance(t *testing.T) {
 	specs := as.brokerStreamSpecs(&Server{}, "acc", 3, 3, mqttDefaultMaxAckPending, true, "rmsub", nil)
 
 	unit := map[string]bool{
-		mqttSessStreamName:       true,
-		mqttWillCancelStreamName: true,
-		mqttTeardownStreamName:   true,
-		mqttOriginStreamName:     true,
+		mqttSessStreamName:     true,
+		mqttTeardownStreamName: true,
+		mqttOriginStreamName:   true,
 	}
 	seen := 0
 	for _, spec := range specs {
@@ -1320,12 +1319,12 @@ func TestOriginStreamIsEpochCoupledToTheSessionStream(t *testing.T) {
 			t.Fatalf("first bring-up: %v", err)
 		}
 
-		// Both watermark streams go too, so THEY are recreated clean against the fresh
-		// session epoch and $MQTT_origin is the stream left carrying the stale one.
+		// The retirement watermark stream goes too, so IT is recreated clean against the
+		// fresh session epoch and $MQTT_origin is the stream left carrying the stale one.
 		// Without this the refusal comes from an earlier entry and says nothing about
 		// this stream's own guidance.
 		js, ctx := testRetirementJS(t, nc)
-		for _, name := range []string{mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName} {
+		for _, name := range []string{mqttSessStreamName, mqttTeardownStreamName} {
 			if derr := js.DeleteStream(ctx, name); derr != nil {
 				t.Fatalf("delete %s: %v", name, derr)
 			}
@@ -1338,7 +1337,7 @@ func TestOriginStreamIsEpochCoupledToTheSessionStream(t *testing.T) {
 				"initialization: its registers name intervals of a stream that no longer exists")
 		}
 		for _, want := range []string{
-			mqttOriginStreamName, mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName,
+			mqttOriginStreamName, mqttSessStreamName, mqttTeardownStreamName,
 			"one logical unit", mqttSessEpochMetaKey,
 		} {
 			if !strings.Contains(err.Error(), want) {

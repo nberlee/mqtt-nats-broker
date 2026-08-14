@@ -203,11 +203,14 @@ func TestReservedDenyACLBindsDirectNATSClients(t *testing.T) {
 	defer nc.Close()
 
 	// $MQTT.sub.> is the JetStream push-consumer deliver subject: reading it
-	// would yield every QoS 1/2 delivery in the account.
+	// would yield every QoS 1/2 delivery in the account. $MQTT.accept.> is the
+	// acceptance-fact space, which is permanent and never reaped, so reading it
+	// yields every client's whole connection history rather than a live window.
 	for _, subject := range []string{
 		mqttSubPrefix + ">",
 		mqttStreamSubjectPrefix + ">",
 		mqttSessStreamSubjectPrefix + ">",
+		mqttAcceptSubjectPrefix + ">",
 	} {
 		t.Run(subject, func(t *testing.T) {
 			// nats.go's async Subscribe does not report the denial inline, and

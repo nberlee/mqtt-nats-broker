@@ -993,6 +993,24 @@ func (sess *mqttSession) storeFramedSessionMsg(domainTk, cidHash string, hdr int
 	return resp, err
 }
 
+// reattemptPendingStore re-issues an ambiguous attempt through the store boundary it
+// originally used. An accepted CONNECT's attempt is a two-message atomic batch, and
+// re-issuing it means recomposing that batch under a fresh id — never re-sending the
+// framed bytes, which carry a batch id the server may still hold staged. Everything
+// that gives the re-attempt its arbitrating power is preserved regardless: the same
+// record CAS base, and bodies whose digests a readback still recognizes.
+func (sess *mqttSession) reattemptPendingStore(domainTk, cidHash string, pw *mqttPendingWrite) (*JSPubAckResponse, error) {
+	if pw.factSubj == _EMPTY_ {
+		return sess.storeFramedSessionMsg(domainTk, cidHash, pw.hdr, pw.framed)
+	}
+	fact, record, batchID := mqttComposeAcceptBatch(pw.factSubj, pw.factBody, domainTk, cidHash, pw.baseSeq, pw.framed[pw.hdr:])
+	resp, err := sess.jsa.storeAcceptBatch(domainTk, cidHash, batchID, fact, record)
+	if h := mqttTestSessStoreResultHookV.Load(); h != nil {
+		resp, err = (*h)(sess, resp, err)
+	}
+	return resp, err
+}
+
 // sweepUnadoptedPhaseSubs removes every reconciliation-phase subscription that
 // subscription restoration did not adopt. Restoration can legitimately skip a
 // collected filter after the CONNACK — a PUBREL setup failure fails a QoS 2

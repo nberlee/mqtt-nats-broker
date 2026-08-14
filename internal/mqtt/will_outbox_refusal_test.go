@@ -93,9 +93,9 @@ func testMQTTCountWillRecordsForClient(t testing.TB, asm *mqttAccountSessionMana
 // dueWillRecord is a well-formed, due, pending record: the shape every variant
 // below starts from and then breaks in exactly one way, so each variant isolates
 // the invariant named in its case name.
-func dueWillRecord(asm *mqttAccountSessionManager, cidHash, willID string) *mqttWillOutbox {
+func dueWillRecord(asm *mqttAccountSessionManager, clientID, willID string) *mqttWillOutbox {
 	return &mqttWillOutbox{
-		WillID: willID, ClientIDHash: cidHash, Gen: mqttNewSessGen(),
+		WillID: willID, ClientIDHash: getHash(clientID), ClientID: clientID, Gen: mqttNewSessGen(),
 		Topic: "will/refusal", Msg: []byte(willID), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
@@ -183,9 +183,10 @@ func seedRefusedWillFixtures(t *testing.T, asm *mqttAccountSessionManager, state
 	}
 	out := make([]refusedWillFixture, 0, len(breaks)+1)
 	for i, b := range breaks {
-		cidHash := getHash(fmt.Sprintf("refusal-%s-%d", b.name, i))
+		clientID := fmt.Sprintf("refusal-%s-%d", b.name, i)
+		cidHash := getHash(clientID)
 		willID := fmt.Sprintf("refusal-w%d", i)
-		rec := dueWillRecord(asm, cidHash, willID)
+		rec := dueWillRecord(asm, clientID, willID)
 		rec.State = state
 		if prep != nil {
 			prep(rec)
@@ -228,8 +229,7 @@ func TestMQTTWillOutboxScanRefusesUnsupportedRecords(t *testing.T) {
 
 	// The control: a well-formed due record with no watermark and no session
 	// record, so the fence proceeds and it fires.
-	okHash := getHash("refusal-control-pub")
-	okRec := dueWillRecord(asm, okHash, "refusal-control-w")
+	okRec := dueWillRecord(asm, "refusal-control-pub", "refusal-control-w")
 	okSubject, _ := seedWillRecord(t, asm, okRec)
 
 	// The control fires and its record drains, leaving EXACTLY the refused ones.
@@ -281,8 +281,7 @@ func TestMQTTWillOutboxScanRefusesUnsupportedExpiredClaim(t *testing.T) {
 	}
 	refused := seedRefusedWillFixtures(t, asm, mqttWillPublishing, expired)
 
-	okHash := getHash("reclaim-control-pub")
-	okRec := dueWillRecord(asm, okHash, "reclaim-control-w")
+	okRec := dueWillRecord(asm, "reclaim-control-pub", "reclaim-control-w")
 	okRec.State = mqttWillPublishing
 	expired(okRec)
 	okSubject, _ := seedWillRecord(t, asm, okRec)
@@ -323,9 +322,11 @@ func TestMQTTWillOutboxScanNeverReapsUnsupportedTerminalRecord(t *testing.T) {
 
 	refused := seedRefusedWillFixtures(t, asm, mqttWillDone, nil)
 
-	okHash := getHash("reap-control-pub")
-	okRec := dueWillRecord(asm, okHash, "reap-control-w")
-	okRec.State = mqttWillDone
+	okRec := dueWillRecord(asm, "reap-control-pub", "reap-control-w")
+	// A terminal record carries the licence that produced it: the legal shape matrix
+	// refuses a done record with no decision, exactly as it refuses a pending one
+	// that carries one.
+	testLicenseWill(okRec, mqttWillDone, mqttWillDecisionPublish, 1)
 	okSubject, _ := seedWillRecord(t, asm, okRec)
 
 	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
@@ -336,79 +337,6 @@ func TestMQTTWillOutboxScanNeverReapsUnsupportedTerminalRecord(t *testing.T) {
 	})
 	time.Sleep(3 * mqttWillClaimInterval)
 
-	for _, f := range refused {
-		t.Run(f.name, func(t *testing.T) {
-			requireWillBytesUnchanged(t, asm, f.subject, f.data)
-		})
-	}
-}
-
-// TestMQTTWillOutboxCancelRefusesUnsupportedRecords proves the reconnect cancel
-// pass refuses them as well: an unsupported record is never CAS-transitioned to
-// cancelled, and — because no fire path will act on it either — its presence does
-// not make the pass unresolved. The pass must still return nil, or every reconnect
-// of that client would log an unresolved cancellation forever.
-func TestMQTTWillOutboxCancelRefusesUnsupportedRecords(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-	asm := testMQTTGetGlobalASM(t, s)
-
-	// One client hash for the whole pass: the cancel filter is per client, so the
-	// refused records and the control must share it. FireAt is far in the future so
-	// the claim loop leaves every record pending and the cancel is the only writer.
-	cidHash := getHash("cancel-refusal-pub")
-	far := time.Now().Add(time.Hour).UnixNano()
-
-	type seeded struct {
-		name    string
-		subject string
-		data    []byte
-	}
-	var refused []seeded
-	seed := func(name string, mutate func(rec *mqttWillOutbox) string) {
-		rec := dueWillRecord(asm, cidHash, "cancel-"+name)
-		rec.FireAt = far
-		subject := mutate(rec)
-		if subject == _EMPTY_ {
-			subject = mqttWillQSubject(asm.domainTk, rec.ClientIDHash, rec.WillID)
-		}
-		data, err := json.Marshal(rec)
-		if err != nil {
-			t.Fatalf("marshal %s fixture: %v", name, err)
-		}
-		seedWillRecordRaw(t, asm, subject, data)
-		refused = append(refused, seeded{name, subject, data})
-	}
-	seed("missing-generation", func(rec *mqttWillOutbox) string {
-		rec.Gen = _EMPTY_
-		return _EMPTY_
-	})
-	seed("zero-origin-sequence", func(rec *mqttWillOutbox) string {
-		rec.OriginSessionSeq = 0
-		return _EMPTY_
-	})
-	seed("foreign-identity-on-another-clients-subject", func(rec *mqttWillOutbox) string {
-		subject := mqttWillQSubject(asm.domainTk, cidHash, rec.WillID)
-		rec.ClientIDHash = getHash("cancel-refusal-foreign")
-		return subject
-	})
-
-	okRec := dueWillRecord(asm, cidHash, "cancel-control-w")
-	okRec.FireAt = far
-	okSubject, _ := seedWillRecord(t, asm, okRec)
-
-	// The unscoped reconnect cancel: entitled to every incarnation's records.
-	if err := asm.cancelWillOutbox(s, cidHash); err != nil {
-		t.Fatalf("cancel pass must resolve: a refused record is not an unresolved pending one: %v", err)
-	}
-
-	// The control proves the pass ran over this client's filter at all.
-	cur, _, err := asm.jsa.loadWillOutbox(asm.domainTk, okSubject)
-	if err != nil || cur == nil || cur.State != mqttWillCancelled {
-		t.Fatalf("valid sibling must be cancelled, got rec=%v err=%v", cur, err)
-	}
 	for _, f := range refused {
 		t.Run(f.name, func(t *testing.T) {
 			requireWillBytesUnchanged(t, asm, f.subject, f.data)
@@ -429,8 +357,7 @@ func TestMQTTWillOutboxLoadRefusesUnsupportedRecord(t *testing.T) {
 
 	far := time.Now().Add(time.Hour).UnixNano()
 	load := func(name string, mutate func(rec *mqttWillOutbox)) (*mqttWillOutbox, error) {
-		cidHash := getHash("load-refusal-" + name)
-		rec := dueWillRecord(asm, cidHash, "load-"+name)
+		rec := dueWillRecord(asm, "load-refusal-"+name, "load-"+name)
 		rec.FireAt = far
 		mutate(rec)
 		subject := mqttWillQSubject(asm.domainTk, rec.ClientIDHash, rec.WillID)
@@ -494,10 +421,11 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 	})
 	defer setWillPublishHook(asm, nil)
 
-	cidHash := getHash("enqueue-refusal-pub")
+	const refusedID = "enqueue-refusal-pub"
+	cidHash := getHash(refusedID)
 	will := &mqttWill{topic: []byte("will/enqueue-refusal"), message: []byte("failsafe")}
 	// _EMPTY_ generation: the F-058 invariant, breaking nothing else.
-	err := asm.enqueueDelayedWill(s, cidHash, _EMPTY_, will, nil, _EMPTY_,
+	err := asm.enqueueDelayedWill(s, refusedID, _EMPTY_, will, nil, _EMPTY_,
 		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch)
 	if err != nil {
 		t.Fatalf("the fail-safe publish must succeed: %v", err)
@@ -515,8 +443,9 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 
 	// The control: the same call with a valid generation DOES persist, so the
 	// assertion above is a refusal and not an enqueue that never works here.
-	okHash := getHash("enqueue-control-pub")
-	if err := asm.enqueueDelayedWill(s, okHash, mqttNewSessGen(), will, nil, _EMPTY_,
+	const okID = "enqueue-control-pub"
+	okHash := getHash(okID)
+	if err := asm.enqueueDelayedWill(s, okID, mqttNewSessGen(), will, nil, _EMPTY_,
 		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch); err != nil {
 		t.Fatalf("valid enqueue: %v", err)
 	}
@@ -588,9 +517,10 @@ func TestMQTTWillOutboxEnqueueExhaustionAfterLandedWriteDuplicates(t *testing.T)
 	})
 	defer restoreLoad()
 
-	cidHash := getHash("exhaust-landed-pub")
+	const exhaustID = "exhaust-landed-pub"
+	cidHash := getHash(exhaustID)
 	will := &mqttWill{topic: []byte("will/exhaust-landed"), message: []byte("dup")}
-	if err := asm.enqueueDelayedWill(s, cidHash, mqttNewSessGen(), will, nil, _EMPTY_,
+	if err := asm.enqueueDelayedWill(s, exhaustID, mqttNewSessGen(), will, nil, _EMPTY_,
 		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch); err != nil {
 		t.Fatalf("the fail-safe publish must succeed: %v", err)
 	}

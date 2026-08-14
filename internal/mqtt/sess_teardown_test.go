@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 // testTeardownEnv is one embedded NATS/JetStream with two account session
@@ -26,10 +27,23 @@ func testNewTeardownEnv(t *testing.T) (a, b *testTeardownEnv) {
 			opts:     &Options{},
 			quitCh:   make(chan struct{}),
 			nodeName: node,
+			// Initialised HERE, before any goroutine exists, because the claim loop
+			// this manager starts reads it: a test that assigned it later would be
+			// racing that loop rather than configuring itself.
+			willClaimStopCh: make(chan struct{}),
+			willTimers:      make(map[string]*time.Timer),
 		}
 		s.running.Store(true)
 		s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-		t.Cleanup(func() { close(s.quitCh) })
+		// Idempotent: a test that has to model SHUTDOWN closes this itself, and
+		// a second close would panic in cleanup rather than in the test.
+		t.Cleanup(func() {
+			select {
+			case <-s.quitCh:
+			default:
+				close(s.quitCh)
+			}
+		})
 		c := s.createInternalAccountClient()
 		asm, err := s.getOrCreateMQTTAccountSessionManager(c)
 		if err != nil {

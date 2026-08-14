@@ -928,48 +928,6 @@ func TestSessAdoptedTeardownCreateParentsFromTheMarker(t *testing.T) {
 	}
 }
 
-// TestSessWillCancelRollbackParentsFromTheReMint is test 10's Will-cancel variant (M16).
-//
-// rollbackStoreSession is the SECOND site that parents a record write, and it was missed
-// by the first draft of this change. A session re-minted by a teardown holds no record,
-// so reading sess.wid there stamps an empty parent and breaks the chain on exactly the
-// path a rolled-back CONNECT takes.
-func TestSessWillCancelRollbackParentsFromTheReMint(t *testing.T) {
-	t.Parallel()
-	a, _ := testNewTeardownEnv(t)
-	const cid = "b3rollback"
-
-	sess := testProvisionSession(t, a, cid)
-	base, _ := testLoadSessRecord(t, a, sess.idHash)
-	if err := sess.clear(false); err != nil {
-		t.Fatalf("the clean-start discard: %v", err)
-	}
-	if err := testSessSave(t, sess); err != nil {
-		t.Fatalf("the re-minted session's first save: %v", err)
-	}
-	// Now the session is acknowledged again; drop that so the rollback is exercised on
-	// the shape that matters — a session holding no record but carrying a re-mint.
-	sess.mu.Lock()
-	sess.wid, sess.pwid = _EMPTY_, _EMPTY_
-	sess.mu.Unlock()
-
-	ps, seq := testLoadSessRecord(t, a, sess.idHash)
-	if ps == nil {
-		t.Fatal("the record must exist for the rollback to re-save it")
-	}
-	err := testSessRecordTx(t, sess, func(tok recordTx) error {
-		return a.asm.rollbackStoreSession(sess, tok, ps, sess.idHash, seq)
-	})
-	if err != nil {
-		t.Fatalf("the rollback re-save: %v", err)
-	}
-	rolled, _ := testLoadSessRecord(t, a, sess.idHash)
-	if rolled == nil || rolled.PWID != base.WID {
-		t.Fatalf("the rollback's re-save must descend from the record the teardown claimed: "+
-			"got %+v, want parent %q", rolled, base.WID)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test 3(h) / M27: an adopted marker whose own release is superseded re-enters R1
 // ---------------------------------------------------------------------------

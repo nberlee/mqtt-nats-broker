@@ -1108,7 +1108,7 @@ What it does NOT do:
     client hash ever seen — so an operator reclaiming space deletes registers. The client
     whose register is removed derives a fresh identity at its next record-absent create,
     which no peer holds, so a pair straddling the erasure CONCEDES. Safe direction, and
-    the same class as pruning `$MQTT_willcancel` or `$MQTT_teardown`, whose losses are
+    the same class as pruning `$MQTT_teardown`, whose losses are
     already stated. Pinned by `TestOriginErasedRegisterYieldsAFreshIdentity`, which
     drives a real delete AND a real purge and asserts the re-established identity sits
     strictly ABOVE the removed one each time. **Automatic** eviction is a different
@@ -1117,8 +1117,8 @@ What it does NOT do:
     and without a diagnostic, disabling this recognition for every client whose register
     ages out at a scale and a moment nobody chose. The refusal is not about identity
     reuse — eviction cannot replay an identity any more than a delete can — it is about a
-    configuration that turns the mechanism off invisibly, which is the same ground the
-    two watermark streams refuse global limits on.
+    configuration that turns the mechanism off invisibly, which is the same ground
+    `$MQTT_teardown`, the retirement-watermark stream, refuses global limits on.
   - **R0d — two client IDs sharing an eight-character hash deny each other recognition.**
     `getHash` is collision-resistant but not injective, so the register validates the
     client ID **exactly** rather than by hash-back — without which two unrelated clients
@@ -1221,8 +1221,8 @@ What it does NOT do:
   interval identity first; the routes that reach that shape do so through a delayed apply
   (R3), a regressed watermark slot (R2), a regressed or replayed register (R0c) or a
   deletion the broker never performed (R4).
-- **The other five arbitrated streams have no lineage at all** — `$MQTT_willq`,
-  `$MQTT_willcancel`, `$MQTT_qos2in` (both its hold subjects and their `.rel` siblings),
+- **The other four arbitrated streams have no lineage at all** — `$MQTT_willq`,
+  `$MQTT_qos2in` (both its hold subjects and their `.rel` siblings),
   `$MQTT_qos2assign` and `$MQTT_inflight` — so the same leader-transition overwrite is
   unrecognisable on each, with a different consequence per stream. One independently
   checkable roadmap bullet each, naming that consequence.
@@ -1432,11 +1432,19 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   this code (Compatibility boundary). The contender in process is another broker's
   ordinary write either way, which is why the probe retries a CAS instead of trusting a
   read.
-- **The never-expire disconnect stamp is a Will-fence fix, not an expiry change.** A
-  never-expiring session's close records the disconnect time so a later write cannot read
-  as a live newer connection and cancel an owed delayed Will. The stamp is taken inside a
-  RECORD TRANSACTION when one can be had, which is what orders it: `sess.mu` alone leaves
-  a body an off-readLoop writer had already marshalled with `DisconnectedAt = 0` free to
+- **The never-expire disconnect stamp has outlived its consumer.** It was a Will-fence
+  fix: a never-expiring session's close recorded the disconnect time so a later write
+  could not read as a live newer connection and cancel an owed delayed Will. That fence
+  is GONE — delayed-Will suppression is now decided from the permanent acceptance facts
+  and reads no session record at all — so for a never-expiring session the stamp is
+  currently inert, every remaining `DisconnectedAt` reader being an expiry path that
+  pre-filters on never-expire. The mechanism is retained rather than removed, and this
+  entry says so plainly rather than restating a rationale that no longer holds; removing
+  it touches the close paths, the rejection probe and waiter priority, and is its own
+  change. The description below is of what the code still does. The stamp is taken
+  inside a RECORD TRANSACTION when one can be had, which is what orders it: `sess.mu`
+  alone leaves a body an off-readLoop writer had already marshalled with
+  `DisconnectedAt = 0` free to
   land after the Will's origin sequence is captured, while holding the fence means every
   earlier marshal has completed and advanced the sequence that capture reads. The
   acquisition is NON-BLOCKING, and what a refused acquisition costs is stated exactly: the
@@ -1464,6 +1472,157 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   `DisconnectedAt = 0` before the disconnect save corrects it is unchanged — not widened,
   and not bounded in time either, since that corrective save can itself fail and the
   window then lasts until some later settlement succeeds.
+
+### Delayed-Will suppression: permanent acceptance facts, and what still escapes them
+
+An accepted CONNECT records one permanent, dated acceptance fact on `$MQTT.accept.>`,
+committed in ONE JetStream atomic batch with its session record on `$MQTT_sess`. A
+claimant suppresses a delayed Will only for an acceptance of that EXACT client, in this
+incarnation, strictly newer than the connection that created the Will, and dated BEFORE
+the Will fell due. See `docs/ARCHITECTURE.md`. What that does **not** cover:
+
+- **Cross-term claimant divergence — a distinct destructive class, NOT the sanctioned
+  at-least-once duplicate.** Across a `$MQTT_willq` leader transition two same-base
+  claimant writes can both be accepted and applied, because the expected-sequence check
+  is pre-proposal and the in-process map is cleared. Worked interleaving: A's licensing
+  CAS at `S` is accepted but not yet applied; the transition clears the per-subject
+  state; B's reclaim at `S` is accepted using the older body, which carries no decision;
+  A's licence applies and records `(publish, U_A)`; B's reclaim applies AFTER it and
+  overwrites that decision; B scans under a later `U_B`, sees an acceptance that landed
+  in between and chooses cancel — while A may already have published. The publish is
+  external and irreversible, so the broker cannot repair it. This is one suppressed-Will
+  publication, not two publications of an owed Will, which is why it is filed
+  separately from the sanctioned duplicate below.
+- **Terminal regression — the part of F-030 that stays OPEN.** A committed `done` can be
+  overwritten by a stale cross-term reclaim: the record at `S` is
+  `(publishing, publish, U)`; A publishes; A's `publishing -> done` CAS at `S` is
+  accepted but not applied; a transition clears the in-process state; B's reclaim at `S`
+  is accepted from the older `publishing` body, preserving `(publish, U)`; A's `done`
+  applies; B's reclaim applies after it and overwrites `done`; B enters on the persisted
+  decision and republishes without scanning. The persisted decision makes that
+  republication DETERMINISTIC rather than accidental. It is not the sanctioned duplicate,
+  and the line between them is EVIDENCE rather than whether a broker crashed: that one
+  republishes because `done` was never committed and the system genuinely lacks proof of
+  completion, whereas here `done` COMMITTED and was then overwritten — evidence the
+  system already held, discarded. Widening the sanctioned duplicate's boundary to lease
+  expiry does not move that line, and reclassifying this would close F-030 by weakening
+  the contract that created it. `docs/ROADMAP.md` §0.2 carries
+  it; `TestWillTerminalRegressionConsequence` pins the shape a fix must kill.
+- **The sanctioned at-least-once duplicate, stated by its real boundary.** That
+  boundary is **external publication with no durable evidence of completion**. A crash
+  is one way to reach it and not the definition, and there are TWO sanctioned triggers,
+  each with its own test:
+
+  1. **Lease expiry** with the publish externally done and `done` uncommitted. Recovery
+     cannot tell a crash from a pause, a partition, or a live broker stalled inside its
+     own process; all four look identical to it.
+  2. **Enqueue ambiguity**, with no lease expiry involved at all: retry exhaustion
+     leaves an UNCONFIRMED create, `publishWillFailSafe` publishes immediately, and a
+     record that did land fires again later
+     (`TestMQTTWillOutboxEnqueueExhaustionAfterLandedWriteDuplicates`).
+
+  Republishing is the correct bias in both, because the alternatives are silence about a
+  Will that may be owed, or durably cancelling one that may already have gone out.
+
+  **A live broker reaches this without failing.** `mqttInitiateMsgDeliveryJSA` fans the
+  Will out to subscribers first — irreversible, external — and then waits on
+  `mqttSubsBarrier` before storing the QoS 1/2 copy; that wait is bounded by SHUTDOWN,
+  not by the lease. The barrier is held for a whole `processSubs`, which creates a
+  JetStream consumer per filter, so a CONNECT session restore with a few dozen
+  subscriptions on a cluster timing requests out holds it past the 30s lease. A peer
+  reclaims the still-`publishing` record, reuses the persisted decision and publishes
+  again. **One stall yields two publications, not unboundedly many.** `mqttSubsBarrier`
+  is per account manager, so the stalled broker's `processSubs` does not stall the peer:
+  the peer's worker runs through, commits `done` and deletes the record. A third
+  publication needs each successive claimant to ALSO outlive its own freshly minted
+  lease or fail terminal reconciliation — possible, but a separate condition rather than
+  something the first stall causes.
+  Bounding the barrier is not the fix — the fan-out precedes it, so abandoning there
+  would skip the store that protects the racing subscriber and trade a duplicate for a
+  LOSS. `docs/ROADMAP.md` carries end-to-end phase-aware ownership as the real fix.
+
+  The permanent acceptance facts did not introduce this: a slow barrier always let a
+  peer reclaim and republish. What they changed is that the peer now reuses a persisted
+  decision instead of rescanning, which makes an already-permitted trace DETERMINISTIC
+  rather than adding a new one. **This is still not the terminal regression above**, and
+  the difference is evidence, not liveness: here `done` was never committed and the
+  system genuinely lacks proof of completion, whereas there `done` COMMITTED and was
+  overwritten — evidence it already held, discarded.
+- **Acceptance-fact storage is unbounded and client-driven.** One permanent record per
+  ACCEPTED CONNECT, on a stream that cannot carry global limits (they would evict live
+  session records) and whose `MaxMsgsPer: 1` does not apply because each fact has its
+  own subject. Any credential permitted to CONNECT therefore grows the account's disk
+  permanently through a reconnect loop, and nothing refuses or throttles it. Filed as a
+  `docs/ROADMAP.md` §0.3 blocker with a candidate reclamation rule; stated here because
+  the change ships with the exposure, and a disclosure is not a bound. The claimant's
+  own walk is narrower than the history, but only within one incarnation: for a Will
+  whose origin epoch is current it starts at `OriginSessionSeq + 1` and stops at the
+  cutoff, so it reads only facts written after the connection that enqueued that Will.
+  For a Will from ANOTHER incarnation the walk starts at the beginning of the stream,
+  because that origin sequence names a store that no longer exists, so its scan depth
+  is the whole current history.
+- **A fact survives a CONNECT that never receives its CONNACK.** The batch commits
+  before the CONNACK is written, and several exits between them refuse the connection.
+  The acceptance is then durable and will suppress the prior Will even though the client
+  never learned it was accepted — the same family the pre-existing pre-CONNACK
+  disclosure covers, now reached through the fact rather than a watermark.
+- **`At < FireAt` compares two brokers' clocks, in both directions.** A skewed
+  accepting broker can date an acceptance before a Will that in truth fell due first
+  (suppressing a Will that was owed), or after one that in truth preceded it (firing a
+  Will a reconnect was entitled to suppress). No mechanism here bounds skew; the
+  comparison is between the accepting broker's `At` and the enqueuing broker's `FireAt`.
+- **An acceptance still UNCOMMITTED when the decision is taken cannot suppress, even
+  though it qualifies.** Eligibility is dated by wall clock (`At < FireAt`) while
+  evidence arrives in durable commit order, and no reader can see an uncommitted write.
+  Worked interleaving, needing neither a leader transition nor clock skew: a Will falls
+  due at `FireAt`; a CONNECT samples `At < FireAt` and begins its accept batch; the
+  claimant claims the record, samples cutoff `U`, walks the client's facts through `U`,
+  re-samples and finds no new fact for that filter, licenses `(publish, U)` and
+  publishes; the accept batch commits afterwards at a sequence above `U`. The fact now
+  satisfies every qualification term — exact client, current incarnation, dated before
+  the Will fell due, above the origin sequence — and nothing will ever read it for this
+  Will, because the persisted decision is deliberately never re-derived. The claimant
+  CHASES the cutoff to shrink this to whatever commits after its final sample (see
+  `docs/ARCHITECTURE.md`), which is a narrowing and not a fence.
+
+  The remainder is irreducible under three premises this design holds: eligibility stays
+  `At < FireAt`; a decision must be reached once the Will falls due; and an uncommitted
+  write can be neither observed nor prevented from committing later. Two executions —
+  one with no qualifying acceptance, one with a qualifying batch still uncommitted — are
+  identical in every durable observation through the licensing CAS, so the claimant must
+  decide the same way in both, and publishing is right in the first and wrong in the
+  second. Closing it means changing a premise: dating eligibility by the fact's own
+  durable confirmation instead (which is a specification change, not a synchronization
+  fix, since a reconnect that genuinely occurred during the Will Delay would then be
+  ineligible for having stored too slowly), blocking a due Will until all writers
+  settle, or a cross-subject arbitration JetStream does not offer here.
+  **No temporal bound is claimed.** An ambiguous acceptance write re-sends its ORIGINAL
+  `At`, so settlement can outlive the first request by a wide margin; the statement is
+  logical, not a latency budget. `TestWillAcceptanceAfterTheFinalCutoffIsMissed` pins the
+  direction, and its recovery half is
+  `TestWillRecoveryReusesThePersistedDecision` — if the first test ever starts
+  suppressing, the residual is closed and both it and this entry are stale.
+
+- **Administrative loss reverses direction.** Pruning facts, or recreating `$MQTT_sess`,
+  removes suppression evidence, so an obsolete Will FIRES rather than a due Will being
+  lost. That is the safer direction of the two, and it is the only direction available:
+  nothing here can lose a Will by losing a fact.
+- **A pathologically slow store can still defer a Will indefinitely, but not wedge
+  one.** Scan progress is persisted by the claim renewal, so each pass resumes where
+  the last left off and a finite history is always finished. What is NOT bounded is a
+  store so slow that a single fact read outlasts the whole scan budget: no renewal
+  lands, no progress is recorded, and the Will defers again next pass. That is a
+  store-availability condition rather than a protocol one — nothing else works either —
+  and under THIS condition the Will is deferred, never lost or spuriously published.
+  A slow acceptance WRITE is a different condition with a different direction, covered
+  by the uncommitted-acceptance residual above; this bullet is about slow fact reads and
+  claims nothing about writes.
+- **Early cancellation is eager, never authoritative.** The claim pass may suppress a
+  not-yet-due Will as soon as a qualifying fact exists, because that half of the
+  predicate is monotone. The opposite verdict is not: "nothing qualifies" is never
+  persisted and never licenses a publication before `FireAt`. The phase is budgeted and
+  cursor-fair, so under heavy churn it can fall behind, which delays a suppression that
+  the claimant would make anyway at `FireAt` — it cannot change the outcome.
 
 ### Session teardown: arbitrated across brokers, and fenced by a permanent watermark
 
@@ -1527,8 +1686,7 @@ Residuals and hard requirements:
   finishes immediately by design.
 - **`$MQTT_teardown` recreated alone loses every open fence.** It stamps the current
   session-stream incarnation epoch, validates clean and admits empty, so a generation
-  retired before the recreation is no longer fenced — the same loss, for the same
-  reason, as `$MQTT_willcancel` recreated alone. The other direction is refused rather
+  retired before the recreation is no longer fenced. The other direction is refused rather
   than admitted: `$MQTT_sess` recreated alone leaves watermarks from a different
   incarnation, and startup fails with the coupled recreate-as-a-unit guidance. Watermark
   storage is permanent and bounded by the client-ID population.
@@ -1706,28 +1864,27 @@ consequences the `$MQTT_qos2in` precedent established:
   surfacing as CONNECT failures on the refusing broker only. The recovery for both is
   **stop-all**: stop every broker for the account, recreate the named stream per the
   error's guidance, then restart. The errors offer no in-place fix, and some name a
-  coupled unit — `$MQTT_sess` is recreated together with `$MQTT_willcancel`,
-  `$MQTT_teardown` **and `$MQTT_origin`**, all four at once, or the incarnation epoch is
-  minted against stale watermarks and stale interval registers.
+  coupled unit — `$MQTT_sess` is recreated together with `$MQTT_teardown` **and
+  `$MQTT_origin`**, all three at once, or the incarnation epoch is minted against stale
+  watermarks and stale interval registers.
 
-  **The four-stream rule is a PROCEDURE, not a guarantee that every partial recreation
+  **The three-stream rule is a PROCEDURE, not a guarantee that every partial recreation
   fails closed**, and the difference matters to an operator deciding whether an unsafe
-  recovery would be caught. Only `$MQTT_teardown` and `$MQTT_origin` carry the session
-  epoch in STREAM METADATA and so are the only two that can detect a recreated
-  `$MQTT_sess`; `$MQTT_willcancel` carries it per watermark RECORD, its validator reads
-  no metadata at all, and a recreated one is simply empty. The complete rule is two
-  clauses:
+  recovery would be caught. Both `$MQTT_teardown` and `$MQTT_origin` carry the session
+  epoch in STREAM METADATA and so are what can detect a recreated `$MQTT_sess`. The
+  complete rule is two clauses:
 
   - **`$MQTT_sess` recreated** — refused if and only if an OLD `$MQTT_teardown` or
     `$MQTT_origin` survives beside it, either of which aborts account-manager
-    initialization. Recreate both of those together with it and startup ADMITS, whatever
-    is done with `$MQTT_willcancel`, whose retained records then carry an epoch nothing
-    compares them to and stop being suppression evidence.
-  - **`$MQTT_sess` kept** — any subset of the other three may be recreated, and every
-    one of them is ADMITTED: brokers start normally while whatever the recreated streams
-    held is silently gone.
+    initialization. Recreate both of those together with it and startup ADMITS — and
+    every client's **permanent CONNECT acceptance history goes with the old stream**,
+    since the facts live on it. A delayed Will enqueued before the recreation can then
+    no longer be suppressed by the acceptance entitled to suppress it, and it fires.
+  - **`$MQTT_sess` kept** — either of the other two may be recreated, and both are
+    ADMITTED: brokers start normally while whatever the recreated stream held is
+    silently gone.
 
-    So the recovery is specified as all four at once rather than left to what a validator
+    So the recovery is specified as all three at once rather than left to what a validator
   happens to catch. This is not a rolling
   upgrade. A *conforming* deployment restarts exactly as before —
   default broker-created streams are conforming, and so are supported administrative

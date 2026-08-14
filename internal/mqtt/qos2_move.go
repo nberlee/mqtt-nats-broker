@@ -635,7 +635,7 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttQoS2IncomingMsgsStreamSubjectPrefix+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"}, wantReplicas); err != nil {
 		return err
 	}
 

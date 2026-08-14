@@ -107,13 +107,14 @@ func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {
 			name: mqttSessStreamName,
 			cfg: func() *StreamConfig {
 				return &StreamConfig{
-					Name:       mqttSessStreamName,
-					Subjects:   []string{mqttSessStreamSubjectPrefix + ">"},
-					Storage:    FileStorage,
-					Retention:  LimitsPolicy,
-					MaxMsgsPer: 1,
-					Replicas:   1,
-					Metadata:   map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+					Name:               mqttSessStreamName,
+					Subjects:           testSessStreamSubjects(),
+					Storage:            FileStorage,
+					Retention:          LimitsPolicy,
+					MaxMsgsPer:         1,
+					Replicas:           1,
+					AllowAtomicPublish: true,
+					Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 				}
 			},
 			// A valid epoch is present, so the failure is attributable to the
@@ -121,8 +122,9 @@ func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {
 			poison:  func(cfg *StreamConfig) { cfg.DenyDelete = true },
 			poisonQ: func(cfg *StreamConfig) bool { return cfg.DenyDelete },
 			// The recovery must be the COUPLED one: recreating $MQTT_sess alone
-			// mints a new epoch against stale takeover-suppression watermarks.
-			want: []string{mqttSessStreamName, mqttWillCancelStreamName, "one logical unit", "deny_delete", "recreate"},
+			// mints a new epoch against stale retirement watermarks, and destroys
+			// every permanent CONNECT acceptance fact with it.
+			want: []string{mqttSessStreamName, mqttTeardownStreamName, "one logical unit", "deny_delete", "recreate"},
 		},
 		{
 			name: mqttWillQStreamName,
@@ -208,14 +210,15 @@ func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {
 	t.Run("recovery", func(t *testing.T) {
 		s, c, nc := newBringUpServer(t)
 		jsRawCreateStream(t, nc, &StreamConfig{
-			Name:       mqttSessStreamName,
-			Subjects:   []string{mqttSessStreamSubjectPrefix + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			MaxMsgsPer: 1,
-			Replicas:   1,
-			DenyDelete: true,
-			Metadata:   map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+			Name:               mqttSessStreamName,
+			Subjects:           testSessStreamSubjects(),
+			Storage:            FileStorage,
+			Retention:          LimitsPolicy,
+			MaxMsgsPer:         1,
+			Replicas:           1,
+			AllowAtomicPublish: true,
+			DenyDelete:         true,
+			Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 		})
 		if _, err := s.getOrCreateMQTTAccountSessionManager(c); err == nil {
 			t.Fatal("expected the nonconforming stream to refuse startup")
@@ -266,14 +269,15 @@ func TestSessCreateRaceLoserValidatesWinnersStream(t *testing.T) {
 	// The manager saw the stream absent and is parked before its create.
 	<-atGate
 	jsRawCreateStream(t, nc, &StreamConfig{
-		Name:       mqttSessStreamName,
-		Subjects:   []string{mqttSessStreamSubjectPrefix + ">"},
-		Storage:    FileStorage,
-		Retention:  LimitsPolicy,
-		MaxMsgsPer: 1,
-		Replicas:   1,
-		DenyDelete: true, // the single deviation the loser must detect
-		Metadata:   map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+		Name:               mqttSessStreamName,
+		Subjects:           testSessStreamSubjects(),
+		Storage:            FileStorage,
+		Retention:          LimitsPolicy,
+		MaxMsgsPer:         1,
+		Replicas:           1,
+		AllowAtomicPublish: true,
+		DenyDelete:         true, // the single deviation the loser must detect
+		Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 	})
 	close(release)
 

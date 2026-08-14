@@ -3384,7 +3384,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 // create-only CAS per identifier, a per-subject singleton, deletes at an exact
 // sequence, a filter purge per retiring incarnation, and a bounded forward walk. It
 // therefore requires the CAS and acknowledgement semantics, and — unlike
-// $MQTT_willcancel, which never removes anything — it requires deletion AND purging
+// $MQTT_teardown, which never removes anything — it requires deletion AND purging
 // to be permitted.
 //
 // It deliberately does NOT check ConsumerLimits.InactiveThreshold: nothing ever
@@ -3396,7 +3396,7 @@ func validateInflightStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttInflightStreamSubjectPrefix+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttInflightStreamSubjectPrefix + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != LimitsPolicy {

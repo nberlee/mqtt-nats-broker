@@ -46,7 +46,7 @@ formats that no user release depends on. Each checkbox is one commit.
   at all three decode boundaries. A record that fails is refused: never claimed,
   published, cancelled or deleted, and reported once per subject. Two deltas from
   the finding's wording: the enqueue validates before persisting and falls to the
-  existing immediate-publish fail-safe, and `willTakeoverFence`'s now-duplicate
+  existing immediate-publish fail-safe, and the takeover fence's now-duplicate
   inline origin check is deleted rather than kept beside the validator. Residual,
   stated: a refused record is reclaimed by NOTHING — no sweep, fence or reaper
   touches it — so it persists until an operator deletes the message or recreates the
@@ -54,10 +54,9 @@ formats that no user release depends on. Each checkbox is one commit.
   the diagnostic says so, on two paths. The claim scan re-reads every extant record
   each interval, so a refused backlog adds `O(N)` JetStream gets per scan per broker
   and a large enough one can push a scan past its interval and delay valid due Wills.
-  Worse, `mqttProcessConnect` waits for `cancelWillOutbox` before the CONNACK, so `N`
-  refused records for one client add `O(N)` serial round trips to **every reconnect
-  of that client, forever** — an availability cost for that client, not just a
-  delayed Will. A quarantine stream, a bounded scan and a reaper were all rejected —
+  The reconnect half of that cost is since GONE with the reconnect-time cancel walk
+  itself (F-031), so a refused backlog no longer adds round trips to a client's
+  CONNECT. A quarantine stream, a bounded scan and a reaper were all rejected —
   each is a second mechanism deciding the fate of records the bridge has said it
   cannot interpret.
 
@@ -171,7 +170,7 @@ per stream.
   record field, with no runtime capability gate — and one became a restart /
   post-initialization-mutation split, whose recovery was also corrected to stop-all-and-
   recreate (the errors offer no in-place fix, and `$MQTT_sess` is coupled to
-  `$MQTT_willcancel` and `$MQTT_teardown`).
+  `$MQTT_teardown` and `$MQTT_origin`).
 
   Three sites were not merely stale. Two had framing that **hid a live producer**, so the
   rewrites gain accuracy: the affine oversize backstop is reached because a QoS 1/2
@@ -328,9 +327,39 @@ per stream.
   divergence. R1 and R4 are WIDENED to the no-watermark population, stated rather than
   claimed away.
 - [ ] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
-  **Large.**
-- [ ] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).
-  **Large.**
+  **Large.** NARROWED, not closed. Its cancellation half is closed **within a
+  `$MQTT_willq` leader term** by the acceptance-fact change below: a claimant claims
+  before it decides, persists the decision and its cutoff with the licensing CAS, renews
+  while scanning, and a recovering claimant EXECUTES that decision instead of re-deciding.
+  What remains open is the TERMINAL REGRESSION: a committed `done` overwritten by a stale
+  cross-term reclaim leaves the record re-fireable, and the persisted decision makes the
+  republication deterministic. That is this finding's own recorded consequence and NOT the
+  sanctioned at-least-once duplicate. The line between them is EVIDENCE, not whether a
+  broker crashed: the sanctioned duplicate republishes because the system genuinely lacks
+  proof of completion — whether a lease lapsed with `done` uncommitted or an ambiguous
+  enqueue published through the fail-safe — whereas here `done` COMMITTED and a stale
+  cross-term reclaim overwrote it, discarding evidence already held. Stating the
+  sanctioned boundary as "external publication without durable completion evidence"
+  rather than "a crash" does not touch that distinction.
+  Closing it needs non-regressible or recognisable terminal completion on `$MQTT_willq`;
+  `TestWillTerminalRegressionConsequence` pins the shape such a mechanism must kill.
+- [x] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).
+  **Large.** CLOSED by DELETING the watermark rather than by adding lineage to it.
+  `$MQTT_willcancel` is gone. An accepted CONNECT writes one permanent, dated acceptance
+  FACT on a subject nothing else ever names, committed in ONE JetStream atomic batch with
+  the session record on `$MQTT_sess` — so there is no interval in which a session is
+  accepted and its evidence is not yet durable, and no slot for a sibling to regress. The
+  claimant suppresses a delayed Will only for an acceptance of that EXACT client, in this
+  incarnation, strictly newer than the connection that created the Will, and dated BEFORE
+  the Will fell due ([MQTT-3.1.3-9] vs [MQTT-3.1.2-8]) — which is why the direct
+  reconnect-time outbox cancels went too: neither could say WHEN the acceptance happened.
+  **Residual:** the facts live on `$MQTT_sess`, so recreating that stream discards every
+  client's acceptance history and a delayed Will enqueued beforehand then fires; one
+  permanent record per accepted CONNECT is unbounded storage; and an acceptance still
+  UNCOMMITTED when the claimant takes its decision cannot suppress even though it
+  qualifies — the claimant chases the cutoff to narrow that to whatever commits after its
+  final sample, which is irreducible while eligibility is dated by `At` and a due Will
+  must still be decided. All three in `docs/CONFORMANCE.md`.
 - [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
   **Large.**
 - [ ] [F-033: Add write lineage to shared QoS 2 assignments](findings/ha-arbitration.md#f-033).
@@ -459,6 +488,64 @@ takeover.
   **Small to medium.** A PUBLISH whose RETAIN side failed to store is reported as
   successful, contrary to [MQTT-3.3.1-5]. Decide the contract for QoS 0 —
   which has no acknowledgement to withhold — alongside QoS 1 and 2.
+- [ ] **Reclaim CONNECT acceptance facts, or bound them.** **Medium.** Every accepted
+  CONNECT writes one permanent record on a unique `$MQTT.accept.>` subject, and
+  `$MQTT_sess` carries no `MaxMsgs`, `MaxBytes` or `MaxAge` (it cannot: those limits
+  would evict live session records). `MaxMsgsPer: 1` does not bound it either, because
+  each fact has its own subject. So any credential permitted to CONNECT grows the
+  account's disk permanently through a reconnect loop, and nothing in the broker
+  refuses or throttles it. Raised as a **no-ship** by the holistic review of the
+  acceptance-fact change (F-031); the change landed with it stated as a residual in
+  `docs/CONFORMANCE.md`, which is a disclosure, not a bound.
+
+  The latency half of the same complaint is weaker than the storage half, but only
+  WITHIN one incarnation, and the difference matters to scoping. For a Will whose
+  origin epoch is the current one, the walk starts at `OriginSessionSeq + 1` and stops
+  at the cutoff, so it reads only facts written after the connection that enqueued that
+  Will — and every reconnect that inflates the history also advances the origin of any
+  Will enqueued afterwards, and licenses a cancel for one already pending. For a Will
+  from ANOTHER incarnation the walk starts at the beginning of the stream, because that
+  origin sequence names a store that no longer exists, so there the scan depth is the
+  whole current history.
+
+  **A candidate reclamation rule, and the epoch condition that a first draft of it got
+  wrong.** Within ONE incarnation a fact at stream sequence `S` can only ever qualify
+  for a Will whose `OriginSessionSeq < S`, and a Will's origin is the session record of
+  the connection that enqueued it. So for client `C`, with every non-terminal Will of
+  `C` in the CURRENT incarnation, let
+
+      L = min( C's current session-record sequence (absent = +inf),
+               min OriginSessionSeq over C's non-terminal $MQTT_willq records )
+
+  and every fact of `C` at or below `L` is permanently unusable — including for Wills
+  not yet enqueued, because a future connection's record necessarily sits above every
+  fact that exists now, and a fact always commits below the record of its own batch.
+  Since `$MQTT_sess` is `MaxMsgsPer: 1`, `C` has exactly one record, so this reclaims a
+  client's whole history on each reconnect and leaves storage at O(clients + pending
+  delayed Wills) rather than O(accepted CONNECTs).
+
+  **That rule is UNSOUND the moment any non-terminal Will of `C` carries a different
+  origin epoch**, and a review round caught the first draft of this bullet asserting it
+  unconditionally. `mqttAcceptFactQualifies` deliberately SKIPS the sequence comparison
+  for a cross-incarnation Will — a current-incarnation acceptance supersedes it outright
+  — so such a Will qualifies against a current-epoch fact at ANY sequence. Worked
+  counterexample: an old-epoch Will has origin 100; after the supported coupled
+  recreation a fresh acceptance fact lands at sequence 1 and its record at 2; the rule
+  computes `L = min(2, 100) = 2` and deletes the fact that would have suppressed that
+  Will, which then fires. The rule must therefore retain EVERY current-epoch fact of
+  `C` while any non-terminal Will of `C` has a foreign origin epoch, and may apply `L`
+  only when they all match.
+
+  Also settle before implementing: where the reaper runs (the claim pass already walks
+  `$MQTT_willq` per account, which is where `L`'s second term is cheapest to compute);
+  what a *refused* outbox record does to `L`, since its origin cannot be read and it
+  must therefore force `L = 0` for that client rather than be skipped; whether a partial
+  or failed `$MQTT_willq` walk may reclaim anything at all (it must not — the same
+  conclusively-completed rule the timer sweep already obeys); and how the rule interacts
+  with `an absence is not a fact`, since this deletes suppression evidence and a wrong
+  `L` silently un-suppresses a Will. The alternative, if the proof is rejected, is an
+  admission bound — a per-account acceptance-fact ceiling that refuses CONNECT — which
+  trades a storage vector for an availability one and needs its own decision.
 
 ### 0.4 Release-verification investigations
 
@@ -473,6 +560,49 @@ finding with acceptance criteria.
   **Investigation.** Do not truncate suite output.
 - [ ] [F-044: Determine whether the phase-2 shutdown observation is real](findings/release-investigations.md#f-044).
   **Investigation.**
+- [ ] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
+  **Confirmed defect, bounded scope, NOT an investigation.** The worker does not renew,
+  and the construction check bounds one JetStream REQUEST below the lease — not the
+  worker's licensed lifetime. `mqttInitiateMsgDeliveryJSA` fans the Will out externally
+  and then waits on `mqttSubsBarrier`, a wait bounded by SHUTDOWN. That barrier is held
+  for a whole `processSubs`, which creates a consumer per filter, so a CONNECT session
+  restore with a few dozen subscriptions on a cluster timing requests out holds it past
+  30s; a peer reclaims and republishes with both brokers alive. That is TWO publications
+  per stall, not unboundedly many — the barrier is per account manager, so the reclaiming
+  peer is not stalled and commits `done`; a third needs that peer to outlive its own fresh
+  lease too. Disclosed in `docs/CONFORMANCE.md` as the sanctioned duplicate's true
+  boundary — a disclosure, not a bound.
+
+  What a fix must do, and what it must not claim:
+  - Renew the claim through dispatch, the barrier wait, publication and the terminal
+    commit, with renewal and finalization SERIALIZED — a free-running renewal CAS
+    would keep staling the worker's own `done` CAS.
+  - Treat renewal failure by PHASE: before the irreversible fan-out an unconfirmed
+    renewal stops the worker safely; after it, nothing can be stopped, so the worker
+    must continue through barrier, store and terminal reconciliation as best it can.
+    A design that pretends these are the same case is wrong.
+  - Not claim exactly-once. A fencing token cannot make external subscriber delivery
+    exactly-once unless the recipients participate in the fence; renewal narrows the
+    ambiguity window and never closes it.
+  - Not bound the barrier as the fix: the fan-out precedes it, so abandoning there
+    trades a duplicate for a LOSS of the store that protects the racing subscriber.
+
+  Verification: a two-broker regression holding one broker's barrier past a shortened
+  lease (`mqttTestSubsBarrierHeldHookV` already provides the seam) and asserting the
+  subscriber receives the Will exactly once.
+- [ ] Fix `TestMQTTOriginFirstEverCreateRaceReplicated`'s rejection-count assertion.
+  **Investigation, but the reproduction and cause are already in hand.** The test
+  requires `gotEstablishes >= 2` and then asserts `gotRejections != 1`
+  (`sess_origin_interval_cluster_test.go:207`). When a retry produces a THIRD establish
+  attempt, two rejections out of three is the CORRECT outcome — one winner, two losers —
+  and the assertion fails a passing broker. Measured in isolation with `-count=8` on
+  2026-08-14: **2/8 at `81a8b9f`, 3/8 with the acceptance-fact change**, so it is
+  pre-existing and the rates are within noise of each other; it is not the concurrent-suite
+  starvation the other flakes are. The fix is to assert the INVARIANT — exactly one
+  establish succeeds, every other attempt is rejected — rather than a fixed rejection
+  count, which is only correct for exactly two attempts. Not folded into the
+  acceptance-fact change: different mechanism (F-029b origin intervals), and that diff
+  already spans 46 files.
 - [ ] Cover retained convergence for a sourced `$MQTT_rmsgs` topology.
   **Investigation.** `docs/ARCHITECTURE.md` declares a cross-account sourced
   retained stream a supported topology, but the only test of it lives in the
@@ -547,31 +677,18 @@ project. Retain `mqtt-nats-bridge` only if continuity outweighs that ambiguity.
 
 ### Durable enforcement of the session/marker coupling
 
-- [ ] Decide whether the `$MQTT_sess` + `$MQTT_willcancel` "one logical unit"
-  constraint should be durably enforced at startup rather than documented.
-  **Now precedented, and narrowed to a retrofit.** `$MQTT_teardown` (F-029a) carries
-  exactly the proposed echo — the adopted epoch in stream metadata, stamped in the
-  entry's `preCreate` and required to match by its validator, which refuses a
-  `$MQTT_sess`-recreated-alone unit at startup. That settles the mechanics (who writes
-  it, the create race, and the bootstrap order) for a stream introduced WITH the echo.
-  What is left to decide here is the retrofit onto a stream that may already exist
-  without one, where an absent stamp cannot be told from a foreign incarnation and
-  refusing would invert `TestSessionManagerEpochRecreationYieldsDifferentEpoch`.
-  Raised by the stream-prerequisite audit's review (round 7): deleting only
-  `$MQTT_sess` mints a new incarnation epoch while permanent watermarks keep
-  the old one; the fence then classifies them stale and falls back to the
-  session-record rule, whose comment already names "unsupported partial
-  recreation" as the carrier of this documented residual
-  (`will_outbox.go`, `sessionRecordFence`). The reviewer proposed echoing the
-  authoritative epoch into `$MQTT_willcancel` metadata and refusing a
-  mismatch before publishing the manager. Deciding needs its own design pass:
-  the echo is new arbitration-bearing durable state (who writes it, create
-  races between initializing brokers, bootstrap when the marker stream is
-  created first, self-heal on the SUPPORTED coupled recreation), and refusal
-  on mismatch inverts `TestSessionManagerEpochRecreationYieldsDifferentEpoch`,
-  which has pinned recreate-then-start since the watermark item landed. Not a
-  release blocker: the exposure requires an administrative action the
-  operational constraints in `docs/ARCHITECTURE.md` already forbid.
+- [x] Decide whether the `$MQTT_sess` + marker "one logical unit" constraint should be
+  durably enforced at startup rather than documented. **Answered by deletion.** The
+  stream this item was about, `$MQTT_willcancel`, no longer exists: the permanent
+  CONNECT acceptance facts that replaced its watermark live on `$MQTT_sess` ITSELF, so
+  there is no second stream to echo an epoch into and no way to recreate the evidence
+  without recreating the records. The remaining coupled streams, `$MQTT_teardown` and
+  `$MQTT_origin`, already carry the adopted epoch in STREAM metadata and their
+  validators already refuse a session-only recreation at startup — which is exactly the
+  enforcement this item proposed, for the two streams where it is still meaningful.
+  What is left is not enforceable and is documented instead: recreating `$MQTT_sess`
+  discards every client's acceptance history along with the records, and a delayed Will
+  enqueued beforehand then fires (`docs/CONFORMANCE.md`).
 
 ### Memory-limit strategy
 

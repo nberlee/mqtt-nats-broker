@@ -487,8 +487,21 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttSessStreamSubjectPrefix+domainTk+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{
+		mqttSessStreamSubjectPrefix + domainTk + ">",
+		mqttAcceptSubjectPrefix + domainTk + ">",
+	}, wantReplicas); err != nil {
 		return err
+	}
+	// The permanent CONNECT acceptance facts live on this stream so that an
+	// accepted CONNECT commits its record and its fact in one atomic batch. Without
+	// the capability the server rejects the batch headers outright, which would
+	// fail every CONNECT — and, worse, a stream that merely LOOKED right would
+	// leave the split-acceptance interval the fact exists to remove. It is a
+	// prerequisite of an operation this owner performs, so it belongs here rather
+	// than in the shared shape: no other broker-owned stream is written in a batch.
+	if !cfg.AllowAtomicPublish {
+		return fmt.Errorf("allow_atomic is not set: an accepted CONNECT commits the session record and its permanent acceptance fact in one atomic batch, which the stream would reject")
 	}
 	if cfg.Retention != LimitsPolicy {
 		return fmt.Errorf("retention is %v (want limits): nothing consumes a session record, so any other retention drops it immediately", cfg.Retention)

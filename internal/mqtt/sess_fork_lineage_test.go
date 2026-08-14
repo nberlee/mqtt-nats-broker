@@ -462,39 +462,6 @@ func TestSessRawWritersStampLineage(t *testing.T) {
 		}
 	})
 
-	t.Run("the CONNECT rollback re-save", func(t *testing.T) {
-		e := testNewInflightEnv(t, "rollback-lineage")
-		if err := testSessSave(t, e.sess); err != nil {
-			t.Fatalf("seed: %v", err)
-		}
-		if err := testSessSave(t, e.sess); err != nil {
-			t.Fatalf("give the record a parent: %v", err)
-		}
-		e.asm.addSession(e.sess, true)
-		e.sess.mu.Lock()
-		// A positive EFFECTIVE lifetime selects the re-save over the teardown, and the
-		// rollback reads it off the session rather than taking it as a parameter.
-		e.sess.expiryInterval = 3600
-		candidate, candidateWID := e.sess.seq, e.sess.wid
-		e.sess.mu.Unlock()
-
-		// The record is untouched, so the rollback's re-save LANDS and its bytes are what
-		// the assertion reads.
-		e.asm.rollbackAcceptedSession(e.s, e.sess, e.sess.idHash, candidate)
-
-		after := testLoadRecordLineage(t, e)
-		if after.DisconnectedAt == 0 {
-			t.Fatal("the rollback must have re-saved the record as disconnected")
-		}
-		if after.PWID != candidateWID {
-			t.Fatalf("the rollback re-save must parent the candidate record: PWID=%q want %q",
-				after.PWID, candidateWID)
-		}
-		if after.WID == _EMPTY_ || after.WID == after.PWID {
-			t.Fatalf("the rollback re-save must mint its own identity: WID=%q PWID=%q",
-				after.WID, after.PWID)
-		}
-	})
 }
 
 // TestSessClearParentsTheTeardownMarker is M12's paired test, and the observation has to

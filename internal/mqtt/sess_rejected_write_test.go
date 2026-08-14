@@ -819,21 +819,17 @@ func TestMQTTRejectedRecordCloseStampsDisconnect(t *testing.T) {
 		t.Fatal("the never-expire close must stamp the disconnect time BEFORE the purge's save")
 	}
 
-	// And the record the fence reads says disconnected, so a Will owed by the
-	// incarnation that just closed still fires.
-	e.sess.mu.Lock()
-	seq := e.sess.seq
-	e.sess.mu.Unlock()
-	rec := &mqttWillOutbox{
-		WillID:           mqttNewRecordWID(),
-		ClientIDHash:     e.idHash,
-		Gen:              mqttNewSessGen(),
-		OriginSessionSeq: seq - 1, // the record is NEWER than the Will's origin
-		OriginSessEpoch:  e.asm.sessStreamEpoch,
-		State:            mqttWillPending,
+	// And the record says disconnected, which is what the stamp is FOR: a newer record
+	// that carries a disconnect time is not a reconnect, and the Will owed by the
+	// incarnation that just closed is still owed. (Nothing reads that record to decide
+	// a Will any more — suppression is decided from the permanent acceptance facts,
+	// which a closing connection does not write — so the assertion is on the bytes.)
+	ps, _, lerr := e.asm.loadFenceSession(e.idHash)
+	if lerr != nil || ps == nil {
+		t.Fatalf("load the record: ps=%v err=%v", ps, lerr)
 	}
-	if d := e.asm.sessionRecordFence(rec); d != willFenceProceed {
-		t.Fatalf("a disconnected session's newer record must not cancel its owed Will: %v", d)
+	if ps.DisconnectedAt == 0 {
+		t.Fatal("the stamped record must carry the disconnect time")
 	}
 }
 
@@ -975,19 +971,8 @@ func TestMQTTRejectedRecordBusyFenceStampBindsTheProbe(t *testing.T) {
 		t.Fatalf("the probe must have landed: seq %d <= origin %d", newSeq, originSeq)
 	}
 
-	// The probe's own record is newer than the Will's origin, and must NOT read as a
-	// reconnect.
-	rec := &mqttWillOutbox{
-		WillID:           mqttNewRecordWID(),
-		ClientIDHash:     e.idHash,
-		Gen:              mqttNewSessGen(),
-		OriginSessionSeq: originSeq,
-		OriginSessEpoch:  e.asm.sessStreamEpoch,
-		State:            mqttWillPending,
-	}
-	if d := e.asm.sessionRecordFence(rec); d != willFenceProceed {
-		t.Fatalf("the probe's record must not cancel the owed Will: %v", d)
-	}
+	// The probe's own record is newer than the Will's origin, and must carry the
+	// disconnect time rather than reading as a reconnect.
 	ps, _, err := e.asm.loadFenceSession(e.idHash)
 	if err != nil || ps == nil {
 		t.Fatalf("load the record: ps=%v err=%v", ps, err)

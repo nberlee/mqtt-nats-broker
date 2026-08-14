@@ -334,7 +334,7 @@ const (
 // No operation ever deletes or purges here, by design — a retirement fence is
 // permanent, and an age- or delete-based reap of it would be an unfenced reap of the
 // fence itself — so DenyDelete, DenyPurge and SubjectDeleteMarkerTTL are audited
-// NON-prerequisites, exactly as on $MQTT_willcancel. No consumer is ever created, so
+// NON-prerequisites, exactly as on $MQTT_origin. No consumer is ever created, so
 // MaxConsumers and ConsumerLimits are waived, and no Nats-TTL is ever sent, so
 // AllowMsgTTL is inert.
 //
@@ -346,7 +346,7 @@ const (
 // mints a fresh epoch while the permanent watermarks keep the old one — instead of
 // classifying it per read. The other direction ($MQTT_teardown recreated alone) stamps
 // the current epoch, validates clean, and admits with no historical fences; that loss
-// is stated in docs/CONFORMANCE.md, as it is for $MQTT_willcancel.
+// is stated in docs/CONFORMANCE.md, as it is for $MQTT_origin.
 //
 // wantReplicas is 0 when no explicit replica count is configured (skip that check).
 func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, sessEpoch string) error {
@@ -354,7 +354,7 @@ func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, s
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttTeardownSubjectPrefix+domainTk+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttTeardownSubjectPrefix + domainTk + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != LimitsPolicy {

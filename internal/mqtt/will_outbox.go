@@ -16,13 +16,13 @@
 // while a fresh reconnect+disconnect enqueues a new generation.
 //
 // Firing model: every account manager runs a claim loop (dedicated ticker). A
-// pending record whose FireAt has passed is CAS-transitioned pending->publishing
-// by whichever replica's scan wins, which then dispatches a publisher worker.
-// Leases matter only in the publishing state: a claimant that dies leaves a
-// publishing record whose lease expires, letting a survivor recover and
-// republish (the at-least-once duplicate). A reconnect CAS-transitions the
-// client's pending records to cancelled; fire and reconnect compete for the same
-// pending sequence and the CAS winner is authoritative.
+// pending record whose FireAt has passed is CAS-claimed pending->publishing by
+// whichever replica's scan wins; the claimant then DECIDES the Will's fate and
+// persists that decision with the CAS that licenses it. Leases matter only in the
+// publishing state: a claimant that dies leaves a publishing record whose lease
+// expires, letting a survivor recover — and a survivor that finds a persisted
+// publish decision EXECUTES it rather than re-deciding, which is what stops one
+// Will being published by one broker and suppressed by another.
 //
 // Durable termination: a successful publish is made durably terminal
 // (publishing->done, retried against the record's latest sequence) BEFORE any
@@ -30,35 +30,43 @@
 // committed first, a failed delete cannot leave a re-fireable publishing record —
 // the scanner reaps the done record instead. See finalizeWillPublish.
 //
-// Takeover suppression has two layers. The primary is a durable per-client
-// cancellation watermark on the dedicated $MQTT_willcancel stream: every accepted
-// CONNECT advances the client's marker to its session save sequence (a gating
-// write — no success CONNACK until it lands), stamped with the $MQTT_sess
-// incarnation epoch. Each delayed Will records the origin connection's session
-// sequence and epoch (OriginSessionSeq / OriginSessEpoch); the claimant fence
-// suppresses the Will when a current-epoch marker is strictly beyond it
-// (SessionSeq > OriginSessionSeq — the connection's own Will still fires), or when
-// the marker is from a different incarnation. This survives finite-disconnect and
-// session-record deletion, closing the reconnect-suppression residual that a
-// session-record fence alone could not. The secondary, unchanged layer is the
-// numeric session-record fence, used only as a fallback when no marker is present
-// (administrative marker loss): it suppresses iff a newer record (sequence >
-// OriginSessionSeq) shows a still-connected generation (DisconnectedAt == 0). See
-// willTakeoverFence and will_cancel.go.
+// Takeover suppression is decided from the PERMANENT CONNECT ACCEPTANCE FACTS on
+// $MQTT_sess (sess_accept_fact.go), not from a cancellation watermark and not from
+// a reconnect-time cancel. Both of those are gone, and both for the same reason:
+// neither could say WHEN the acceptance happened. MQTT 5.0 suppresses a delayed
+// Will only for a reconnect that happens during the Will Delay ([MQTT-3.1.3-9]);
+// once the delay has elapsed the Will is owed and must be published
+// ([MQTT-3.1.2-8]). A claimant therefore scans this client's acceptance facts,
+// bounded by the cutoff it sampled and persisted, and suppresses only for an
+// acceptance that is this incarnation's, this exact client's, strictly newer than
+// the connection that created the Will, and dated BEFORE the Will became due.
 //
 // Residual (why literal exactly-once remains impossible):
-//   - at-least-once duplicate: a crash between the external publish and the done
-//     commit republishes after the lease expires. This is the sanctioned duplicate.
+//   - at-least-once duplicate. The boundary is EXTERNAL PUBLICATION WITH NO DURABLE
+//     EVIDENCE OF COMPLETION — not a crash, which is only one way to reach it. Two
+//     triggers, both sanctioned and both with their own test:
+//       1. Lease expiry with the publish externally done and done uncommitted.
+//          Recovery cannot tell WHY the lease lapsed: a crash, a pause, a partition
+//          and a live broker stalled in its own process are indistinguishable to it.
+//          The last is reachable — the publish path waits on mqttSubsBarrier, bounded
+//          by shutdown and not by the lease (see willPublishWorker). One such stall
+//          yields TWO publications, not unboundedly many: the barrier is per account
+//          manager, so the peer that reclaims is not stalled and commits done.
+//       2. Enqueue ambiguity, with no lease expiry involved at all: retry exhaustion
+//          leaves an UNCONFIRMED create, the fail-safe publishes immediately, and a
+//          record that did land fires again later (publishWillFailSafe).
+//     Republishing is the correct bias in both: the alternative is silence about a
+//     Will that may be owed, or durably cancelling one that may already have gone
+//     out. Neither is the terminal regression, where done COMMITTED and was then
+//     overwritten — evidence the system HELD and discarded, rather than never had.
 //
-// The reconnect-suppression residual is closed by the watermark and reopens only
-// under administrative loss of $MQTT_willcancel (documented as a degradation, not a
-// supported migration). This is a first-release format: pre-Layer-2 in-record
-// Wills, migrated outbox records, and a session stream without a valid generated
-// epoch are unsupported and rejected rather than carried forward. Every decoded
-// record is validated (validateWillOutboxRecord) and one that is not a supported
-// record is REFUSED: never claimed, published, cancelled or deleted, and reported
-// once with the operator remedy. Refusal is read-only, so nothing reclaims a
-// refused record — an operator does.
+// This is a first-release format: pre-Layer-2 in-record Wills, records without an
+// exact client identity or a well-formed decision shape, and a session stream
+// without a valid generated epoch are unsupported and rejected rather than carried
+// forward. Every decoded record is validated (validateWillOutboxRecord) and one
+// that is not a supported record is REFUSED: never claimed, published, cancelled or
+// deleted, and reported once with the operator remedy. Refusal is read-only, so
+// nothing reclaims a refused record — an operator does.
 
 package mqtt
 
@@ -90,18 +98,38 @@ const (
 // publish finishes inside it, and above the scan interval so a crashed
 // publisher's record is reclaimed by a later scan rather than while it is still
 // live. The interval is the fire granularity for a due Will.
-var (
-	mqttWillClaimLease    = 30 * time.Second
-	mqttWillClaimInterval = 5 * time.Second
+const (
+	mqttWillDefaultClaimLease    = 30 * time.Second
+	mqttWillDefaultClaimInterval = 5 * time.Second
 )
 
-// Bounded retry counts for the enqueue and cancel JSA operations, which sit on
-// the disconnect and reconnect paths respectively: a transient JetStream error
-// must not silently lose a delayed Will (enqueue) or let a suppressed Will fire
-// after a successful reconnect (cancel).
+var (
+	mqttWillClaimLease    = mqttWillDefaultClaimLease
+	mqttWillClaimInterval = mqttWillDefaultClaimInterval
+)
+
+// How many times a claimant re-samples the acceptance cutoff before deciding. A
+// fact that commits while the walk runs is above the cutoff the walk used, so it
+// is invisible to it — and the persisted decision means no later claimant ever
+// re-reads it. Chasing the cutoff examines those late arrivals, and is sound in
+// only one direction: `At < FireAt` is what DATES eligibility, so a later cutoff
+// can never suppress a Will an earlier one would have published — it can only
+// find evidence this pass would otherwise have missed.
+//
+// The limit is what keeps the chase from becoming a wedge. An empty delta is NOT
+// required to decide: a client reconnecting steadily after its Will fell due (or
+// a hash-colliding one) produces facts forever, none of which can qualify, so a
+// chase that insisted on an empty delta would defer an OWED Will on every pass
+// and never fire it. Exhausting the limit therefore LICENSES under the cutoff
+// actually verified rather than deferring; deferral stays reserved for the four
+// conditions that make a decision unsafe rather than merely less informed —
+// shutdown, an exhausted budget, an unreadable fact, and a lost renewal.
+const mqttWillCutoffChases = 4
+
+// Bounded retry count for the enqueue JSA operation, which sits on the disconnect
+// path: a transient JetStream error must not silently lose a delayed Will.
 const (
 	mqttWillEnqueueAttempts = 3
-	mqttWillCancelAttempts  = 3
 	// Bounded retry for the terminal publishing->done CAS. A transient/ambiguous
 	// terminal failure must not leave a published record able to re-fire, so the
 	// commit is retried against the record's latest sequence before giving up and
@@ -113,19 +141,26 @@ const (
 // record per subject (MaxMsgsPer:1); the subject carries WillID so overlapping
 // generations for the same client hash never evict each other.
 type mqttWillOutbox struct {
-	WillID       string        `json:"wid"`
-	ClientIDHash string        `json:"cid"`
-	Topic        string        `json:"topic"`
-	Msg          []byte        `json:"msg,omitempty"`
-	QoS          byte          `json:"qos,omitempty"`
-	Retain       bool          `json:"retain,omitempty"`
-	Props        []byte        `json:"props,omitempty"` // encoded forwardable Will properties
-	User         string        `json:"user,omitempty"`
-	FireAt       int64         `json:"fire"` // unix nanoseconds to publish at
-	State        mqttWillState `json:"state"`
-	ClaimOwner   string        `json:"owner,omitempty"` // node name of the current publisher
-	ClaimUntil   int64         `json:"until,omitempty"` // unix nanoseconds publish lease expiry
-	Account      string        `json:"acct,omitempty"`  // diagnostic only
+	WillID       string `json:"wid"`
+	ClientIDHash string `json:"cid"`
+	// ClientID is the EXACT client identifier, of which ClientIDHash is only the
+	// routing token. Suppression is decided by comparing this against an acceptance
+	// fact's client id, because two distinct clients can share a hash and one
+	// client's reconnect must never destroy another's delayed Will. Both durable
+	// enqueue routes have the exact identity in hand; a record without one is an
+	// unsupported shape and is refused.
+	ClientID   string        `json:"cidx"`
+	Topic      string        `json:"topic"`
+	Msg        []byte        `json:"msg,omitempty"`
+	QoS        byte          `json:"qos,omitempty"`
+	Retain     bool          `json:"retain,omitempty"`
+	Props      []byte        `json:"props,omitempty"` // encoded forwardable Will properties
+	User       string        `json:"user,omitempty"`
+	FireAt     int64         `json:"fire"` // unix nanoseconds to publish at
+	State      mqttWillState `json:"state"`
+	ClaimOwner string        `json:"owner,omitempty"` // node name of the current publisher
+	ClaimUntil int64         `json:"until,omitempty"` // unix nanoseconds publish lease expiry
+	Account    string        `json:"acct,omitempty"`  // diagnostic only
 	// OriginSessionSeq and OriginSessEpoch identify the accepted generation that
 	// created this delayed Will: the persisted session-record stream sequence and
 	// the $MQTT_sess incarnation epoch captured at the disconnect (mqtt.go:1942).
@@ -143,15 +178,157 @@ type mqttWillOutbox struct {
 	// unscoped bucket — "no identity" must not collapse into the identity space
 	// (sess_incarnation.go:51-56), and an unscoped bucket cannot be arbitrated.
 	//
-	// It exists so the DISPLACED-broker cancel can say what it means. That scan's
-	// job is to cancel the Will its own evicted connection enqueued, but it is
-	// dispatched asynchronously and could otherwise land after the client has
-	// reconnected elsewhere and disconnected again — cancelling a LATER
-	// incarnation's Will, which the reconnect watermark does not suppress (that
-	// Will's origin sequence is beyond the marker) and no other layer recovers.
-	// The reconnect cancel on the CONNECT path is deliberately NOT scoped: a
-	// reconnect supersedes every earlier incarnation. See cancelWillOutbox.
+	// It existed so the DISPLACED-broker cancel could scope itself to the Wills its
+	// own evicted connection enqueued. That cancel is DELETED — a reconnect-time
+	// cancel cannot say when the acceptance happened, which is the whole point of the
+	// dated facts — so nothing reads this field today. It is still written and still
+	// validated, and it is called out in docs/CONFORMANCE.md as a field whose reader
+	// is gone rather than quietly left to look load-bearing.
 	Gen string `json:"gen"`
+	// Decision is the act this record has been LICENSED to perform, and it is
+	// immutable once set. It exists because a fresh decision per claimant is
+	// destructive without needing any leader transition at all: a claimant that
+	// scanned under one cutoff, licensed a publish, published, and crashed before
+	// the terminal commit would otherwise be recovered by a peer that samples a
+	// LATER cutoff, sees an acceptance that landed in between, and cancels — the
+	// same Will generation reinterpreted from published to suppressed after the
+	// irreversible act. A recovering claimant reuses this decision and does not
+	// scan at all.
+	//
+	// It also distinguishes an UNLICENSED publishing claim (a claimant is
+	// scanning) from a LICENSED one (a claimant may publish), which the state
+	// alone cannot say.
+	Decision mqttWillDecision `json:"dec,omitempty"`
+	// ScanFrom is the highest $MQTT_sess sequence a claimant has EXAMINED and rejected
+	// for this Will: "no acceptance fact at or below this sequence qualifies". It is
+	// monotone progress, not a decision, and it is permanent — the record's own
+	// predicate inputs (client, epochs, origin sequence, FireAt) are immutable, and a
+	// fact is never rewritten or removed, so a rejection stays a rejection.
+	//
+	// Without it a bounded scan cannot finish an unbounded history: every claimant
+	// restarted at the same sequence, so a non-qualifying prefix long enough to exhaust
+	// the scan budget wedged the Will permanently — neither published nor cancelled,
+	// with every lease-expiry recovery re-reading the same prefix. That is a liveness
+	// defect, not the accepted disk-growth residual.
+	//
+	// Advanced by the RENEWAL CAS, which already writes during a scan, so progress
+	// costs nothing extra; carried forward untouched by every reclaim.
+	//
+	// It is a $MQTT_sess SEQUENCE, so it is meaningless outside the incarnation that
+	// assigned it — which is why ScanEpoch travels with it and a floor from another
+	// incarnation is IGNORED. Without that scoping the documented coupled recreation
+	// is a live defect: $MQTT_willq is not part of that unit, so a pending Will
+	// survives carrying a floor from the old stream while the new one restarts at
+	// sequence 1, and the walk then skips the very facts a cross-incarnation Will
+	// qualifies on. Worse than skipping: with the floor above the new cutoff the loop
+	// runs zero times and reports "nothing qualifies", which LICENSES a publication
+	// having read nothing at all.
+	ScanFrom uint64 `json:"sfrom,omitempty"`
+	// ScanEpoch is the $MQTT_sess incarnation ScanFrom was recorded under. Set with
+	// it and cleared with it; a floor whose epoch is not this broker's is discarded
+	// and the walk restarts, which costs one re-read and is the conservative
+	// direction.
+	ScanEpoch string `json:"sepoch,omitempty"`
+	// DecisionCutoff is the exact $MQTT_sess last sequence the decision was taken
+	// under. It is a POINTER because presence is the thing being recorded and zero
+	// is a legal value: a fresh or recreated session stream has LastSeq 0, so a
+	// numeric-zero sentinel would collapse "no cutoff" into a valid cutoff.
+	//
+	// It carries NO incarnation companion, unlike ScanFrom, and deliberately so: it is
+	// only ever compared for EQUALITY against the cutoff on the record this claimant
+	// licensed (sameDecision), never against a newly derived sequence and never as an
+	// ordering bound. Both sides of every such comparison were written by one licensing
+	// CAS on one record, so no incarnation boundary can fall between them, and equality
+	// does not depend on what the number counts. That is what separates it from
+	// ScanFrom, where a stored sequence WAS compared against sequences derived later —
+	// the defect this design has now been bitten by three times.
+	DecisionCutoff *uint64 `json:"cut,omitempty"`
+}
+
+// mqttWillDecision is the act a licensing CAS grants a claimed record. Unset means
+// no act is licensed; the two set values are terminal intentions, so a record
+// carrying one may only ever perform that one.
+type mqttWillDecision string
+
+const (
+	mqttWillDecisionUnset   mqttWillDecision = ""
+	mqttWillDecisionPublish mqttWillDecision = "publish"
+	mqttWillDecisionCancel  mqttWillDecision = "cancel"
+)
+
+// validateWillDecisionShape enforces the legal (state, decision, cutoff) matrix.
+// Everything outside it is refused rather than interpreted, because each illegal
+// combination is a claim about the protocol that the protocol does not make:
+//
+//	pending     decision unset, cutoff absent   (nothing licensed yet)
+//	publishing  unset+absent, or publish+cutoff (scanning, or licensed to publish)
+//	cancelled   cancel + cutoff                 (a suppression was licensed)
+//	done        publish + cutoff                (a publication was licensed)
+//
+// publishing/cancel in particular must never be legal: a cancel is licensed
+// straight to cancelled by the same CAS that records it, so a publishing record
+// carrying cancel could only be a decision the entry branch would then try to
+// EXECUTE — and a cancel executed from publishing is a state with two meanings.
+func validateWillDecisionShape(state mqttWillState, dec mqttWillDecision, cut *uint64) error {
+	switch dec {
+	case mqttWillDecisionUnset, mqttWillDecisionPublish, mqttWillDecisionCancel:
+	default:
+		return fmt.Errorf("decision %q is not a known outbox decision", dec)
+	}
+	if (dec == mqttWillDecisionUnset) != (cut == nil) {
+		return fmt.Errorf("decision %q and decision-cutoff presence (%v) disagree", dec, cut != nil)
+	}
+	switch state {
+	case mqttWillPending:
+		if dec != mqttWillDecisionUnset {
+			return fmt.Errorf("a pending record carries decision %q", dec)
+		}
+	case mqttWillPublishing:
+		if dec == mqttWillDecisionCancel {
+			return fmt.Errorf("a publishing record carries a cancel decision, which is never executable")
+		}
+	case mqttWillCancelled:
+		if dec != mqttWillDecisionCancel {
+			return fmt.Errorf("a cancelled record carries decision %q (want cancel)", dec)
+		}
+	case mqttWillDone:
+		if dec != mqttWillDecisionPublish {
+			return fmt.Errorf("a done record carries decision %q (want publish)", dec)
+		}
+	}
+	return nil
+}
+
+// usableScanFloor returns the persisted scan floor only when it was recorded under
+// the incarnation the reader is running in. A floor from another incarnation names a
+// sequence in a store that no longer exists, so it is discarded rather than compared.
+func (r *mqttWillOutbox) usableScanFloor(currentEpoch string) uint64 {
+	if r.ScanEpoch == _EMPTY_ || r.ScanEpoch != currentEpoch {
+		return 0
+	}
+	return r.ScanFrom
+}
+
+// licensedToPublish reports whether this record carries the exact shape the
+// claimant entry branch may EXECUTE without scanning. Phrased on publish
+// specifically: a cancel decision is terminal, so no record a claimant could
+// execute ever carries one.
+func (r *mqttWillOutbox) licensedToPublish() bool {
+	return r.State == mqttWillPublishing && r.Decision == mqttWillDecisionPublish && r.DecisionCutoff != nil
+}
+
+// sameDecision reports whether other carries the identical licensed decision — both
+// the act and the cutoff it was taken under. The cutoff is part of the identity
+// because two claimants can license the same act under different evidence, and only
+// the persisted one may be finalized.
+func (r *mqttWillOutbox) sameDecision(other *mqttWillOutbox) bool {
+	if r.Decision != other.Decision {
+		return false
+	}
+	if r.DecisionCutoff == nil || other.DecisionCutoff == nil {
+		return r.DecisionCutoff == nil && other.DecisionCutoff == nil
+	}
+	return *r.DecisionCutoff == *other.DecisionCutoff
 }
 
 // leaseValid reports whether the publishing claim lease is still valid at now.
@@ -205,11 +382,35 @@ func validateWillOutboxBody(rec *mqttWillOutbox) error {
 	if !mqttWillIdentTk(rec.ClientIDHash) {
 		return fmt.Errorf("client id hash %q is not a single subject token", rec.ClientIDHash)
 	}
+	// The exact client identity, and its binding to the routing token. Suppression
+	// compares this against an acceptance fact's client id, so a record whose two
+	// identities disagree could be suppressed by — or survive — the wrong client's
+	// reconnect.
+	if rec.ClientID == _EMPTY_ {
+		return fmt.Errorf("record carries no exact client id")
+	}
+	if h := getHash(rec.ClientID); h != rec.ClientIDHash {
+		return fmt.Errorf("exact client id hashes to %q, but the record's hash token is %q", h, rec.ClientIDHash)
+	}
 	if !mqttValidSessGen(rec.Gen) {
 		return fmt.Errorf("session incarnation generation %q is not well-formed", rec.Gen)
 	}
 	if rec.OriginSessionSeq == 0 {
 		return fmt.Errorf("origin session sequence is zero")
+	}
+	// Only a claimant renewal advances the scan floor, and a claimant is publishing by
+	// then. A pending record carrying one would mean progress was recorded by
+	// something that never held the record, which no writer does.
+	if rec.State == mqttWillPending && (rec.ScanFrom != 0 || rec.ScanEpoch != _EMPTY_) {
+		return fmt.Errorf("a pending record carries a scan floor %d under epoch %q", rec.ScanFrom, rec.ScanEpoch)
+	}
+	// The floor and the incarnation it was recorded under are one fact. A bare
+	// sequence would be uncomparable, and a bare epoch says nothing.
+	if (rec.ScanFrom == 0) != (rec.ScanEpoch == _EMPTY_) {
+		return fmt.Errorf("scan floor %d and scan epoch %q disagree about presence", rec.ScanFrom, rec.ScanEpoch)
+	}
+	if rec.ScanEpoch != _EMPTY_ && !mqttValidSessEpoch(rec.ScanEpoch) {
+		return fmt.Errorf("scan epoch %q is not well-formed", rec.ScanEpoch)
 	}
 	if !mqttValidSessEpoch(rec.OriginSessEpoch) {
 		return fmt.Errorf("origin session epoch %q is not well-formed", rec.OriginSessEpoch)
@@ -219,7 +420,7 @@ func validateWillOutboxBody(rec *mqttWillOutbox) error {
 	default:
 		return fmt.Errorf("state %q is not a known outbox state", rec.State)
 	}
-	return nil
+	return validateWillDecisionShape(rec.State, rec.Decision, rec.DecisionCutoff)
 }
 
 // validateWillOutboxRecord is validateWillOutboxBody plus the binding between the
@@ -247,20 +448,6 @@ func validateWillOutboxRecord(domainTk, subject string, rec *mqttWillOutbox) err
 // mqttWillQSubject returns the per-Will subject for a client hash + Will id.
 func mqttWillQSubject(domainTk, cidHash, willID string) string {
 	return mqttWillQSubjectPrefix + domainTk + cidHash + "." + willID
-}
-
-// mqttWillQClientFilter matches every Will event for one client hash (reconnect
-// cancellation).
-func mqttWillQClientFilter(domainTk, cidHash string) string {
-	return mqttWillQSubjectPrefix + domainTk + cidHash + ".*"
-}
-
-// mqttWillQClientSubjectPrefix is the literal (non-wildcard) prefix every Will
-// subject for one client hash shares. Used to sweep local fire timers by client,
-// which mqttWillQClientFilter cannot do: that is a NATS subject filter, not a
-// string prefix.
-func mqttWillQClientSubjectPrefix(domainTk, cidHash string) string {
-	return mqttWillQSubjectPrefix + domainTk + cidHash + "."
 }
 
 // mqttWillQAccountFilter matches every Will event for the account (claim scan).
@@ -345,11 +532,9 @@ func (as *mqttAccountSessionManager) decodeScannedWillOutbox(s *Server, smsg *St
 //
 // The remedy is stated, and stated as URGENT, because nothing else resolves it: a
 // refused record is reclaimed by NOTHING — no sweep, no fence and no reaper touches
-// it — and both serial walks re-read it every time. A backlog costs one JetStream
-// get per record per scan per broker, and — because mqttProcessConnect waits for
-// cancelWillOutbox before the CONNACK — one more per record on every reconnect of
-// that client. The first delays valid due Wills; the second delays the client's own
-// CONNECT. The log must not imply that leaving it alone either clears it or is free.
+// it — and the claim walk re-reads it every pass. A backlog costs one JetStream get
+// per record per scan per broker, which delays valid due Wills. The log must not
+// imply that leaving it alone either clears it or is free.
 func (as *mqttAccountSessionManager) refuseWillOutboxRecord(s *Server, subject string, err error) {
 	as.mu.Lock()
 	_, warned := as.refusedWillRecords[subject]
@@ -389,14 +574,13 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 			// Transient load failure or already reaped; the scan retries.
 			return
 		}
-		now := time.Now()
-		if rec.State != mqttWillPending || rec.FireAt > now.UnixNano() {
+		if rec.State != mqttWillPending || rec.FireAt > time.Now().UnixNano() {
 			return
 		}
-		// tryFireWill owns the takeover fence, the pending->publishing CAS, worker
-		// admission and dispatch. Its willScanAbort result only tells a multi-record
-		// scan to stop, so it is not meaningful for this single record.
-		_ = as.tryFireWill(s, subject, rec, seq, now)
+		// tryFireWill owns the claim, the decision and the dispatch. Its willScanAbort
+		// result only tells a multi-record scan to stop, so it is not meaningful for
+		// this single record.
+		_ = as.tryFireWill(s, subject, rec, seq)
 	})
 }
 
@@ -421,12 +605,14 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 // session's generation, the startup-validated stream epoch, and the nonzero
 // sequence of the CONNECT save a surviving session implies — so it is an
 // invariant assert that happens to have a safe arm.
-func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, cidHash, sessGen string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
+func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, sessGen string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
 	willID := nuid.Next()
+	cidHash := getHash(clientID)
 	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
 	rec := &mqttWillOutbox{
 		WillID:           willID,
 		ClientIDHash:     cidHash,
+		ClientID:         clientID,
 		Gen:              sessGen,
 		FireAt:           fireAt,
 		State:            mqttWillPending,
@@ -541,12 +727,72 @@ func (as *mqttAccountSessionManager) storeWillEnqueueCAS(subject string, expectS
 // is the durable safety net. rec must be pending on entry and is at CAS sequence
 // seq.
 func (as *mqttAccountSessionManager) earlyCancelIfSuperseded(s *Server, subject string, rec *mqttWillOutbox, seq uint64) {
-	if as.willTakeoverFence(rec) != willFenceCancel {
+	as.cancelIfSuperseded(s, subject, rec, seq, time.Time{})
+}
+
+// cancelIfSuperseded is the POSITIVE-ONLY suppression: it scans this Will's
+// acceptance facts and, if one qualifies, licenses a cancel straight from pending
+// with a single CAS. It never publishes and never persists a negative verdict.
+//
+// It takes no claim, and that is not an omission. A claim exists so that a claimant
+// which may PUBLISH cannot have its decision re-taken after the irreversible act;
+// this path never publishes, and its single CAS at the pending sequence is its own
+// exclusion — a concurrent claimant either moves the record first (and this CAS
+// fails) or does not (and this cancel is what it finds). Claiming here would also
+// leave a publishing record behind whenever no fact qualified, and the recovery arm
+// fires a publishing record regardless of FireAt: a best-effort optimization would
+// have become a way to publish a Will before it was due.
+//
+// Best-effort throughout. Every failure leaves the record exactly as it was, and the
+// claimant at FireAt remains the authority.
+//
+// bound caps the whole call. A caller that has its own budget passes it, and the
+// effective deadline is the EARLIER of the two: a nested scan that could run to its
+// own budget would make the caller's meaningless. The zero value means "no caller
+// bound", used by the enqueue-time route, which runs on the disconnecting
+// connection's own goroutine rather than on the claim loop.
+//
+// rec must be PENDING at sequence seq.
+func (as *mqttAccountSessionManager) cancelIfSuperseded(s *Server, subject string, rec *mqttWillOutbox, seq uint64, bound time.Time) {
+	deadline := time.Now().Add(as.scanBudget())
+	if !bound.IsZero() && bound.Before(deadline) {
+		deadline = bound
+	}
+	if !time.Now().Before(deadline) {
 		return
 	}
-	rec.State = mqttWillCancelled
-	if _, err := as.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
-		s.Debugf("MQTT: early-cancel of superseded delayed Will %q lost/failed (claimant fence will resolve): %v", rec.WillID, err)
+	// Sampled INSIDE the bound, for the reason tryFireWill states: the cutoff read is
+	// itself a request, and a bound that excluded it would not bound the call.
+	upTo, uerr := as.sessLastSeq()
+	if uerr != nil {
+		return
+	}
+	stop := as.claimStopChans(s)
+	if probe := (&mqttFactScan{stop: stop}); probe.stopped() || !time.Now().Before(deadline) {
+		return
+	}
+	sc := &mqttFactScan{
+		upTo:       upTo,
+		deadline:   deadline,
+		renewEvery: as.renewCadence(),
+		stop:       stop,
+	}
+	if as.scanAcceptFacts(rec, sc) != mqttFactQualified {
+		return
+	}
+	// And once more immediately before the write. Everything between the last check
+	// and here is a decision, not an act; this is the act, and it must not be the one
+	// thing that outlives shutdown or the caller's bound.
+	if sc.stopped() || !time.Now().Before(deadline) {
+		return
+	}
+	cancelled := *rec
+	cancelled.State = mqttWillCancelled
+	cancelled.Decision = mqttWillDecisionCancel
+	cutoff := upTo
+	cancelled.DecisionCutoff = &cutoff
+	if _, err := as.jsa.storeWillOutboxCAS(subject, seq, &cancelled); err != nil {
+		s.Debugf("MQTT: cancel of superseded delayed Will %q lost/failed (the claimant fence will resolve): %v", rec.WillID, err)
 		// The CAS outcome is ambiguous: the cancelled write may have landed with a
 		// lost ack, or another writer may have advanced or deleted the record. In
 		// either of those the record is no longer pending and the timer is dead
@@ -560,170 +806,9 @@ func (as *mqttAccountSessionManager) earlyCancelIfSuperseded(s *Server, subject 
 		return
 	}
 	// Cancelled: release the local fire timer rather than leaving it armed until
-	// FireAt for a record that will never fire.
+	// FireAt for a record that will never fire. A no-op on any broker but the one
+	// that enqueued it — which is why the scan's completed pass reconciles the rest.
 	s.cancelWillTimer(subject)
-}
-
-// cancelWillOutbox suppresses a reconnecting client's pending delayed Wills, in
-// EVERY incarnation: a reconnect supersedes all of them. See
-// cancelWillOutboxScoped for the semantics.
-func (as *mqttAccountSessionManager) cancelWillOutbox(s *Server, cidHash string) error {
-	return as.cancelWillOutboxScoped(s, cidHash, nil)
-}
-
-// willCancelScope names the exact set of delayed Wills a displaced broker may
-// cancel: those its own evicted connection enqueued.
-//
-// The generation alone is NOT that set. A persistent session keeps its incarnation
-// across reconnects (only a discard re-mints it), so broker B resuming the same
-// session, disconnecting, and enqueuing a NEW Will produces a record with the very
-// same generation — which a generation-only scan would then destroy, long after A
-// was displaced. maxOriginSeq closes that: it is the session-record sequence A
-// knew when it was displaced, and B's newer Will necessarily carries a higher one,
-// because B's own takeover save advanced the record past it. Sequences are
-// comparable only within one incarnation epoch, which is exactly the condition the
-// generation match already establishes.
-type willCancelScope struct {
-	gen string
-	// maxOriginSeq is inclusive. Zero means "no upper bound", used only by the
-	// unscoped reconnect cancel, which is entitled to everything.
-	maxOriginSeq uint64
-}
-
-// cancelWillOutboxForIncarnation cancels only the pending delayed Wills this
-// broker's displaced connection enqueued. That scan is dispatched asynchronously
-// and can land after the client has reconnected elsewhere and disconnected again,
-// so an unscoped cancel would destroy the newer Will — a loss no other layer
-// recovers, since the reconnect watermark sits BELOW that Will's origin sequence.
-//
-// Scoped by generation AND by an upper origin-sequence bound; see willCancelScope
-// for why the generation alone is not enough. sessGen is always the displaced
-// connection's own valid generation.
-func (as *mqttAccountSessionManager) cancelWillOutboxForIncarnation(s *Server, cidHash, sessGen string, maxOriginSeq uint64) error {
-	return as.cancelWillOutboxScoped(s, cidHash, &willCancelScope{gen: sessGen, maxOriginSeq: maxOriginSeq})
-}
-
-// cancelWillOutboxScoped suppresses a client's pending delayed Wills by
-// CAS-transitioning each pending record to cancelled. A record already
-// publishing is irrevocable (that generation is due) and is left alone; the
-// claim loop later reaps cancelled native records. It is the authoritative
-// reconnect suppression, so a transient failure must not be mistaken for a
-// completed cancellation: the scan is retried a bounded number of times and an
-// error is returned if it could not confirm every pending record was resolved
-// (cancelled, or already firing). Runs without locks (JSA I/O).
-//
-// onlyGen nil cancels every incarnation's records; non-nil restricts to records
-// whose Gen equals *onlyGen.
-func (as *mqttAccountSessionManager) cancelWillOutboxScoped(s *Server, cidHash string, scope *willCancelScope) error {
-	// Instance-scoped test observer: fires after this cancel pass so the takeover
-	// late-enqueue test can confirm the displaced broker's async cancel completed on
-	// the empty outbox before a late enqueue is released. Nil in production.
-	as.mu.RLock()
-	done := as.testCancelWillDone
-	as.mu.RUnlock()
-	if done != nil {
-		defer done()
-	}
-	filter := mqttWillQClientFilter(as.domainTk, cidHash)
-	prefix := mqttWillQClientSubjectPrefix(as.domainTk, cidHash)
-	var err error
-	for attempt := 0; attempt < mqttWillCancelAttempts; attempt++ {
-		// Capture this client's armed fire timers BEFORE the scan. A record the
-		// scan never returns (cancelled by a peer, then reaped by a claim loop)
-		// leaves a timer whose exact subject this broker can no longer name, so it
-		// needs a sweep — but the sweep must not reach a timer armed after the
-		// capture. The remote-takeover path really does interleave that way: an
-		// enqueue blocked behind this scan can land right after it and arm a timer
-		// for a record that is still pending, and stopping it would drop that Will
-		// back to the 5s scan latency.
-		//
-		// The sweep is by CLIENT HASH, which a scoped cancel is not entitled to, so
-		// it is skipped there: an unreturned record is either another incarnation's
-		// (whose timer must survive) or already reaped (whose timer fires, finds
-		// nothing and stops — the same harmless posture as a failed pass here). The
-		// records this pass DID resolve had their timers cancelled by subject inside
-		// the scan.
-		var captured []willTimerRef
-		if scope == nil {
-			captured = s.snapshotWillTimersWithPrefix(prefix)
-		}
-		if err = as.cancelWillOutboxOnce(s, filter, scope); err == nil {
-			// Conclusively completed: nothing captured before the scan can still be
-			// wanted. Deliberately not done after a failed pass — an indeterminate
-			// scan may have left records pending, and their timers must survive.
-			s.stopWillTimers(captured)
-			return nil
-		}
-	}
-	s.Errorf("MQTT: could not confirm delayed-Will cancellation for client hash %q after %d attempts: %v", cidHash, mqttWillCancelAttempts, err)
-	return err
-}
-
-// cancelWillOutboxOnce performs one full scan+cancel pass. It returns an error
-// only on an indeterminate outcome (a transient scan/load failure, or a CAS
-// write failure where the record is still pending); a CAS lost to a concurrent
-// fire (the record is no longer pending) is a resolved, non-error outcome.
-//
-// scope, when non-nil, restricts the pass to records enqueued by that session
-// incarnation up to its origin-sequence bound. A skipped record is not an
-// unresolved one — it was never in scope — so it does not make the pass
-// indeterminate. A REFUSED record is likewise not an unresolved pending record:
-// no fire path will act on it either, so "every pending record was resolved" is
-// scoped to the records this broker is able to interpret.
-func (as *mqttAccountSessionManager) cancelWillOutboxOnce(s *Server, filter string, scope *willCancelScope) error {
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				return err // transient scan failure: indeterminate
-			}
-			return nil // no (more) records: scan complete
-		}
-		seq = smsg.Sequence + 1
-		rec, ok := as.decodeScannedWillOutbox(s, smsg)
-		if !ok {
-			continue // refused: never cancelled, and not an unresolved pending record
-		}
-		if scope != nil && rec.Gen != scope.gen {
-			// Another incarnation's Will. Out of scope, and its local fire timer must
-			// be left armed — this pass has no authority over either.
-			continue
-		}
-		if scope != nil && scope.maxOriginSeq != 0 && rec.OriginSessionSeq > scope.maxOriginSeq {
-			// Same generation, but enqueued by a LATER connection of that session —
-			// its origin sequence is past the record this broker was displaced at, so
-			// it cannot be ours. A persistent session keeps its generation across
-			// reconnects, which is precisely why the generation alone cannot decide.
-			continue
-		}
-		if rec.State != mqttWillPending {
-			// Already resolved by a fire or a peer: nothing to cancel, but if this
-			// broker enqueued it we still hold a useless fire timer.
-			s.cancelWillTimer(smsg.Subject)
-			continue
-		}
-		rec.State = mqttWillCancelled
-		if _, werr := as.jsa.storeWillOutboxCAS(smsg.Subject, smsg.Sequence, rec); werr != nil {
-			// CAS failed. Re-read: if the record is no longer pending (a fire won,
-			// or a peer cancelled it) it is resolved; if it is still pending, the
-			// write failed transiently and this pass is indeterminate.
-			cur, _, lerr := as.jsa.loadWillOutbox(as.domainTk, smsg.Subject)
-			if lerr != nil {
-				return lerr
-			}
-			if cur != nil && cur.State == mqttWillPending {
-				return werr
-			}
-			s.cancelWillTimer(smsg.Subject)
-			continue
-		}
-		// Cancelled durably. Release the local fire timer so a long Will Delay does
-		// not retain it (and the account manager it captures) until FireAt. A no-op
-		// on a broker that did not enqueue this Will. This covers both a local
-		// reconnect and a remote takeover, since the origin broker runs this scan
-		// on the remote-disconnect path too.
-		s.cancelWillTimer(smsg.Subject)
-	}
 }
 
 // willClaimLoop periodically scans the account's outbox and drives due Wills to
@@ -753,63 +838,195 @@ func (as *mqttAccountSessionManager) willClaimLoop(s *Server, closeCh chan struc
 // a due pending record (or a publishing record whose lease expired) is claimed
 // via CAS pending/publishing->publishing and dispatched to a worker; a terminal
 // record (cancelled/done) is deleted. A tryFireWill that returns willScanAbort
-// (a transient/global cancel-watermark load failure) stops the scan after leaving
-// the record pending, so a marker-stream outage costs at most one JSA timeout per
-// scan rather than one per due record; the next interval retries. willClaimStopCh
-// is checked between records so Phase-2 shutdown does not continue a long scan.
+// (a transient or global failure to read the evidence: the acceptance cutoff or an
+// acceptance fact) stops the scan, leaving the record as it found it, so a $MQTT_sess
+// outage costs at most one JSA timeout per SCAN rather than one per due record; the
+// next interval retries. willClaimStopCh is checked between records so Phase-2
+// shutdown does not continue a long scan.
 func (as *mqttAccountSessionManager) scanWillOutbox(s *Server) {
+	// Captured BEFORE the walk, for the same reason the per-client capture was: a
+	// completed walk only proves no record was pending while it ran, and an enqueue
+	// blocked behind it can land immediately after and arm a genuinely wanted timer.
+	// Anything armed during or after the walk is excluded by construction.
+	captured := s.snapshotWillTimersWithPrefix(mqttWillQSubjectPrefix + as.domainTk)
+	// Subjects this walk saw still PENDING. Everything else the capture holds — a
+	// record a peer cancelled and reaped, one that has gone terminal, one this broker
+	// can no longer name at all — is a timer for a Will that will never fire from
+	// here.
+	stillPending := map[string]struct{}{}
+	var future []futureWill
+	complete := false
+
 	filter := mqttWillQAccountFilter(as.domainTk)
-	now := time.Now()
+walk:
 	for seq := uint64(1); ; {
 		select {
 		case <-s.willClaimStopCh:
-			return
+			break walk
 		case <-s.quitCh:
-			return
+			break walk
 		default:
 		}
 		smsg, err := as.jsa.loadNextMsgFromSeq(mqttWillQStreamName, filter, seq)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
 				s.Debugf("MQTT will-outbox scan ended: %v", err)
+				break walk
 			}
-			return
+			complete = true // no more records: the walk is conclusive
+			break walk
 		}
 		seq = smsg.Sequence + 1
+		// Sampled PER RECORD, never once for the walk. A single acceptance-fact scan
+		// can consume the whole scan budget, so a timestamp taken at the top would by
+		// then be minutes old — and it decides two things that must not be stale:
+		// whether a record is due, and whether a claim's lease has expired.
+		now := time.Now()
 		rec, ok := as.decodeScannedWillOutbox(s, smsg)
 		if !ok {
-			continue // refused: never claimed, never dispatched, and never deleted
+			// Refused: never claimed, dispatched or deleted — and never swept either.
+			// A record this broker cannot interpret is not evidence that its timer is
+			// unwanted, so the subject counts as pending for the sweep below.
+			stillPending[smsg.Subject] = struct{}{}
+			continue
 		}
 		switch rec.State {
 		case mqttWillPending:
 			if rec.FireAt <= now.UnixNano() {
-				if as.tryFireWill(s, smsg.Subject, rec, smsg.Sequence, now) == willScanAbort {
-					return
+				if as.tryFireWill(s, smsg.Subject, rec, smsg.Sequence) == willScanAbort {
+					break walk
 				}
+				continue
 			}
+			// Not due. Its fate cannot be settled here — "no acceptance qualifies" is
+			// an UNSTABLE verdict, since a later reconnect can still add one — so it is
+			// deferred to the budgeted phase below, which only ever acts on the stable
+			// half of the predicate.
+			stillPending[smsg.Subject] = struct{}{}
+			future = append(future, futureWill{subject: smsg.Subject, rec: rec, seq: smsg.Sequence})
 		case mqttWillPublishing:
+			stillPending[smsg.Subject] = struct{}{}
 			if !rec.leaseValid(now) {
-				as.tryFireWill(s, smsg.Subject, rec, smsg.Sequence, now) // crashed-publisher recovery
+				// Crashed-publisher recovery. Its abort result is tested for the same
+				// reason the pending arm's is, and NOT testing it was the defect: a
+				// transient outage reading the acceptance evidence costs one JetStream
+				// timeout per expired record instead of one per pass, and a backlog of
+				// expired records turns a brief outage into a scan that never finishes.
+				if as.tryFireWill(s, smsg.Subject, rec, smsg.Sequence) == willScanAbort {
+					break walk
+				}
 			}
 		case mqttWillCancelled, mqttWillDone:
 			_ = as.jsa.deleteMsg(mqttWillQStreamName, smsg.Sequence, false)
 		}
 	}
+
+	if !complete {
+		// Inconclusive. Nothing below may run: a walk that stopped early proves
+		// nothing about the records it never reached, and both the early cancellation
+		// and the timer sweep are entitled to act only on what the walk established.
+		return
+	}
+	as.cancelSupersededAhead(s, future)
+	// Only now, and only over the pre-walk capture: a timer whose record this walk
+	// saw still pending is wanted, and every other captured timer is for a record
+	// that is gone, terminal, or claimed. This is the ONLY thing that releases the
+	// enqueuing broker's timer when a PEER cancelled and reaped the record first —
+	// that broker's own cancelWillTimer is a no-op on a subject it never sees again.
+	// It decides no MQTT outcome; it releases a local promptness optimization after
+	// durable state has proved the timer represents nothing.
+	var stale []willTimerRef
+	for _, ref := range captured {
+		if _, keep := stillPending[ref.key]; !keep {
+			stale = append(stale, ref)
+		}
+	}
+	s.stopWillTimers(stale)
 }
 
-// willFenceDecision is the outcome of the takeover fence.
-type willFenceDecision int
+// futureWill is a pending record whose FireAt has not arrived, carried out of the
+// walk so the early-cancellation phase runs AFTER every due Will has been handled.
+type futureWill struct {
+	subject string
+	rec     *mqttWillOutbox
+	seq     uint64
+}
 
-const (
-	willFenceProceed willFenceDecision = iota // fire: no superseding generation observed
-	willFenceCancel                           // suppress: a newer generation superseded this connection
-	willFenceDefer                            // indeterminate/corrupt for THIS record: resolve later
-	willFenceAbort                            // transient/global watermark-load failure: stop the scan
-)
+// cancelSupersededAhead suppresses not-yet-due Wills for which a qualifying
+// acceptance ALREADY exists, rather than waiting for FireAt.
+//
+// It is sound because the suppression predicate is MONOTONE: every operand is fixed
+// for a pending record (the fact's date and client, the epochs, the two sequences)
+// and a fact is never rewritten or removed, so a QUALIFYING verdict reached now is
+// the verdict FireAt would reach. The converse is not true, which is why this phase
+// is positive-only: "nothing qualifies" is unstable — a later reconnect can add a
+// fact — so it is never persisted and never licenses a publication.
+//
+// It is not a second decision mechanism. There is one suppression fact, one
+// predicate and one licensing shape; the enqueue-time early cancel, this phase and
+// the FireAt claimant are three CADENCES of the same positive test, and all three
+// go through cancelIfSuperseded.
+//
+// Why it runs AFTER the walk rather than inline: a fact scan may consume up to the
+// scan budget, and one taken inline for a Will due in a year would delay publishing
+// a Will that is owed now. The phase has its own pass-wide budget, and a per-account
+// cursor so successive passes make progress round-robin instead of restarting at the
+// same records forever.
+func (as *mqttAccountSessionManager) cancelSupersededAhead(s *Server, future []futureWill) {
+	if len(future) == 0 {
+		return
+	}
+	deadline := time.Now().Add(mqttWillAheadBudget())
+	as.mu.Lock()
+	start := as.willAheadCursor
+	as.mu.Unlock()
+	if start >= len(future) {
+		start = 0
+	}
+	done := 0
+ahead:
+	for i := range future {
+		// LABELLED: an unlabelled break inside a select leaves the SELECT, not the
+		// loop, so the phase would carry on right through shutdown.
+		select {
+		case <-s.willClaimStopCh:
+			break ahead
+		case <-s.quitCh:
+			break ahead
+		default:
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		f := future[(start+i)%len(future)]
+		// Re-checked HERE, not at collection time: the walk may have taken a while,
+		// and a record that has since fallen due belongs to the claimant, which is the
+		// only path allowed to reach the unstable half of the predicate.
+		if f.rec.FireAt <= time.Now().UnixNano() {
+			done++
+			continue
+		}
+		// The OUTER deadline is threaded in, not merely checked between records. A
+		// budget that bounds only the loop and not the work each iteration starts is
+		// not a budget: one client with a long acceptance history would hold the claim
+		// loop for a full scan budget, and every Will that fell due meanwhile would
+		// fire late on every replica without a local timer.
+		as.cancelIfSuperseded(s, f.subject, f.rec, f.seq, deadline)
+		done++
+	}
+	as.mu.Lock()
+	as.willAheadCursor = (start + done) % len(future)
+	as.mu.Unlock()
+}
+
+// mqttWillAheadBudget bounds the early-cancellation phase for one pass. Half the
+// claim interval, so the phase cannot make the loop miss its own tick: this is
+// cleanup, and a due Will always outranks it.
+func mqttWillAheadBudget() time.Duration { return mqttWillClaimInterval / 2 }
 
 // willScanResult tells scanWillOutbox whether to keep walking records after a
-// pending-record claim attempt, or to stop because a transient/global
-// cancel-watermark load failure would otherwise cost one JSA timeout per record.
+// claim attempt, or to stop because a transient/global failure reading the
+// acceptance evidence would otherwise cost one JSA timeout per record.
 type willScanResult int
 
 const (
@@ -843,113 +1060,319 @@ func (as *mqttAccountSessionManager) loadFenceSession(cidHash string) (*mqttPers
 	return ps, smsg.Sequence, nil
 }
 
-// willTakeoverFence decides whether a delayed Will must be suppressed because a
-// newer generation superseded the connection that created it. The durable
-// per-client cancel watermark (advanced at every accepted CONNECT) is the
-// authoritative signal; the session record is only a fallback when no usable
-// watermark exists. Epoch is an identity: a sequence is comparable only within the
-// incarnation named by its epoch.
-//
-// Precondition: rec is a validated record, so its origin sequence is nonzero and
-// its origin epoch is well-formed. Every production caller gets its record from a
-// decode boundary that refuses anything else (tryFireWill from either scan or the
-// fire timer's load, earlyCancelIfSuperseded from the writer-validated enqueue),
-// so the fence does not re-check what the boundary already established.
-//
-//   - abort: the watermark load was transiently/globally indeterminate. The caller
-//     stops the scan so a marker outage costs one JSA timeout, not one per record.
-//   - defer: the watermark record itself is corrupt (this record only).
-//   - cancel: a valid current-epoch watermark proves a newer accepted generation —
-//     same epoch with SessionSeq > OriginSessionSeq, or a different (other-
-//     incarnation) origin epoch, which a current-epoch CONNECT necessarily supersedes.
-//   - otherwise (absent/stale watermark, or same-epoch watermark not newer): fall
-//     back to the session record via sessionRecordFence.
-func (as *mqttAccountSessionManager) willTakeoverFence(rec *mqttWillOutbox) willFenceDecision {
-	wm, _, status := as.loadWillCancelWatermark(rec.ClientIDHash)
-	switch status {
-	case mqttWillCancelIndeterminate:
-		return willFenceAbort
-	case mqttWillCancelCorrupt:
-		return willFenceDefer
-	case mqttWillCancelValid:
-		// wmValid implies wm.SessEpoch == as.sessStreamEpoch. If the Will's origin
-		// epoch differs, it is from another incarnation and is superseded; if it
-		// matches, compare sequences within that incarnation.
-		if wm.SessEpoch != rec.OriginSessEpoch {
-			return willFenceCancel
-		}
-		if wm.SessionSeq > rec.OriginSessionSeq {
-			return willFenceCancel
-		}
-		return as.sessionRecordFence(rec)
-	default: // mqttWillCancelAbsent, mqttWillCancelStaleEpoch
-		return as.sessionRecordFence(rec)
+// claimStopChans are the signals a claimant's fact scan must abandon on. Resolved
+// per manager rather than read straight off the Server, so a test that QUIETS this
+// account's background claim loop — by closing the server's willClaimStopCh — can
+// still drive a claimant directly instead of having every scan defer at once. Without
+// it a claimant test shares its account with a live loop that can reclaim any record
+// whose lease has expired, which is precisely what every budget-exhaustion test
+// leaves behind (the budget is two leases, so the lease always expires first).
+func (as *mqttAccountSessionManager) claimStopChans(s *Server) []<-chan struct{} {
+	as.mu.RLock()
+	override := as.testClaimStop
+	as.mu.RUnlock()
+	if override != nil {
+		return *override
 	}
+	return []<-chan struct{}{s.willClaimStopCh, s.quitCh}
 }
 
-// sessionRecordFence is the pre-watermark session-record fence, retained as the
-// fallback when no usable watermark exists (absent or stale epoch). It reads the
-// current session record: a newer record (sequence > OriginSessionSeq) with
-// DisconnectedAt == 0 (a newer accepted connection without a later finite-disconnect
-// stamp) is a takeover -> cancel; absent/unchanged/newer-but-disconnected -> proceed;
-// an unreadable record -> defer. Its numeric comparison is only meaningful within
-// one $MQTT_sess incarnation; when the marker stream and session stream are recreated
-// together (the supported operation) the origin epoch keeps the watermark path exact,
-// and this fallback carries the documented residual only for unsupported partial
-// recreation.
-func (as *mqttAccountSessionManager) sessionRecordFence(rec *mqttWillOutbox) willFenceDecision {
-	ps, seq, err := as.loadFenceSession(rec.ClientIDHash)
+// claimLease is this account manager's publish lease. It is resolved PER MANAGER
+// rather than read from the package variable directly, because a test that needs a
+// short lease must not reach across into every other manager's claim loop: the
+// variable is read by a live loop on another goroutine, so assigning it is a data
+// race, not merely a shared setting.
+func (as *mqttAccountSessionManager) claimLease() time.Duration {
+	as.mu.RLock()
+	d := as.testClaimLease
+	as.mu.RUnlock()
+	if d <= 0 {
+		return mqttWillClaimLease
+	}
+	return d
+}
+
+// renewCadence is how often a scanning claimant renews its lease. Derived from the
+// lease rather than configured beside it, so shortening the lease cannot silently
+// produce a cadence that never renews in time. A third of the lease leaves two
+// cadences of margin, so a single lost renewal is survivable.
+func (as *mqttAccountSessionManager) renewCadence() time.Duration { return as.claimLease() / 3 }
+
+// scanBudget bounds the whole of one claimant's fact scan. A claimant that reaches it
+// licenses NOTHING and defers: it leaves the record publishing and lets lease expiry
+// re-drive. Two leases is deliberately generous — the budget is a backstop against a
+// pathological scan, not the mechanism that keeps a scan short.
+func (as *mqttAccountSessionManager) scanBudget() time.Duration { return 2 * as.claimLease() }
+
+// mqttWillTimingInvariant asserts the relationships the claim protocol depends on,
+// rather than leaving them as properties of whatever the constants happen to be:
+//
+//   - the renewal cadence must be strictly below the lease, or a renewal never
+//     precedes expiry and a scanning claimant is reclaimed underneath itself;
+//   - the JetStream request timeout must be below the lease, so no SINGLE request can
+//     by itself consume an entire ownership window. That is the whole of what this
+//     inequality delivers, and it is deliberately weaker than "a request completes
+//     inside the lease it was licensed under", which it does NOT give: the publish
+//     licensing CAS stamps a fresh lease and then spends up to a whole timeout being
+//     acknowledged, so a timeout just under the lease leaves the worker a residue
+//     approaching zero — `T < L` is not `2T < L`. The worker then also waits on
+//     mqttSubsBarrier, which no timeout bounds at all. So the worker's deliberate lack
+//     of renewal does not rest on this relationship; the overrun it leaves is the
+//     residual docs/CONFORMANCE.md discloses, for which docs/ROADMAP.md carries a
+//     phase-aware lease-ownership fix (see willPublishWorker);
+//   - the claim interval must be below the lease, so a record is reclaimed by a LATER
+//     scan rather than one whose lease is still valid. Note this is about lease
+//     VALIDITY, not about whether the owning broker is alive — a live broker whose
+//     lease expired is reclaimable, which is the point of a lease.
+//
+// It takes its inputs rather than reading the package variables, which is what lets
+// one function serve two callers: a TEST asserting the relationship over the
+// production defaults, and account-manager construction checking the EFFECTIVE
+// JetStream request timeout against the DEFAULT lease. The second caller is the load
+// -bearing one, because the timeout is an option an operator can set while the lease
+// is a constant — and a timeout at or above the lease means EVERY request can outlive
+// the ownership window, so a licensing ack can arrive after a peer has already
+// reclaimed the record and published it. That is a misconfiguration this refuses
+// outright, distinct from the disclosed barrier overrun, which no configuration
+// prevents. The default lease is deliberately the reference:
+// tests shorten the lease per-manager, and a two-second lease against a five-second
+// request timeout is their intent rather than a misconfiguration.
+func mqttWillTimingInvariant(lease, interval, jsaTimeout time.Duration) error {
+	if c := lease / 3; c >= lease {
+		return fmt.Errorf("renewal cadence %v is not below the claim lease %v", c, lease)
+	}
+	if jsaTimeout >= lease {
+		return fmt.Errorf("the JetStream request timeout %v is not below the claim lease %v", jsaTimeout, lease)
+	}
+	if interval >= lease {
+		return fmt.Errorf("the claim interval %v is not below the claim lease %v", interval, lease)
+	}
+	return nil
+}
+
+// tryFireWill drives one due or recoverable outbox record to a licensed act.
+//
+// The order is CLAIM FIRST, then decide, and that is the correction this protocol
+// exists for. Deciding first and claiming afterwards leaves the decision unowned:
+// two claimants can reach opposite verdicts from cutoffs that straddle one
+// acceptance, and the loser's verdict is not even recorded anywhere to be
+// contradicted. Deciding under a claim, and PERSISTING the decision with the very
+// CAS that licenses it, makes the decision a property of the Will generation rather
+// than of whichever broker happened to be looking.
+//
+//  1. Claim or reclaim (pending -> publishing, or publishing -> publishing at the
+//     scanned sequence), carrying Decision and DecisionCutoff forward unchanged.
+//  2. If the claimed record is already LICENSED TO PUBLISH, execute that decision.
+//     No cutoff is sampled, no fact is read, and whatever acceptances have landed
+//     since are irrelevant: the decision was taken and it is not re-taken.
+//  3. Otherwise sample a cutoff, scan this Will's acceptance facts within it while
+//     renewing the claim, and license the outcome with one CAS — publish (staying
+//     publishing, with a refreshed lease) or cancel (straight to cancelled).
+//
+// Returns willScanAbort only for a transient, GLOBAL failure, so a stream outage
+// costs one JetStream timeout per pass rather than one per record.
+//
+// It samples its OWN clock rather than taking one from the caller. A scan can spend
+// its whole budget on one record's acceptance-fact walk, so a timestamp handed down
+// from the top of a pass would mint a lease that had ALREADY expired — and a claim
+// whose lease is in the past is reclaimable by a peer the instant it lands, which
+// would put two brokers on one licensed publish. That is a defect rather than the
+// sanctioned duplicate, and the distinction is not that a crash did or did not happen:
+// it is that such a lease was never an ownership window at all. The sanctioned
+// duplicate needs a lease minted correctly and then EXPIRED, with the publish
+// externally done and `done` uncommitted.
+func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec *mqttWillOutbox, seq uint64) willScanResult {
+	// Step 1. The claim carries the decision forward untouched — a reclaim that
+	// cleared it would let a recovering claimant re-decide a Will another claimant
+	// may already have published.
+	claimed := *rec
+	claimed.State = mqttWillPublishing
+	claimed.ClaimOwner = s.NodeName()
+	claimed.ClaimUntil = time.Now().Add(as.claimLease()).UnixNano()
+	claimSeq, err := as.storeWillClaimCAS(subject, seq, &claimed)
 	if err != nil {
-		return willFenceDefer
+		// Lost the claim (a peer took it, a cancel won) or a transient write failure.
+		// A later scan re-resolves; nothing here is owed.
+		return willScanContinue
 	}
-	if ps == nil || seq <= rec.OriginSessionSeq {
-		return willFenceProceed
-	}
-	if ps.DisconnectedAt == 0 {
-		return willFenceCancel
-	}
-	return willFenceProceed
-}
 
-// tryFireWill claims a due/recoverable record by CAS-transitioning it to
-// publishing with a fresh lease, then dispatches a publisher worker through the
-// shutdown-aware admission gate. A lost CAS (a reconnect cancelled it, or a peer
-// claimed it) is a no-op. If the gate is closed (shutdown Phase 2), the record
-// is left publishing for post-restart recovery. Returns willScanAbort only when the
-// pending-record fence hit a transient/global watermark-load failure, so the caller
-// stops the scan; every other outcome returns willScanContinue.
-func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec *mqttWillOutbox, seq uint64, now time.Time) willScanResult {
-	// Fence only the initial pending->publishing claim. A record that is already
-	// publishing (crashed-publisher recovery) is an irrevocable, due generation:
-	// the fence must never cancel a record a peer was mid-publishing.
-	if rec.State == mqttWillPending {
-		switch as.willTakeoverFence(rec) {
-		case willFenceCancel:
-			rec.State = mqttWillCancelled
-			if _, err := as.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
-				// Lost to a concurrent fire/cancel, or a transient write failure: a
-				// later scan re-resolves. Harmless either way.
-				s.Debugf("MQTT: unable to cancel superseded delayed Will %q: %v", rec.WillID, err)
-			}
+	// Step 2. A persisted publish decision is EXECUTED, never revisited.
+	if claimed.licensedToPublish() {
+		as.dispatchWillPublish(s, subject, &claimed, claimSeq)
+		return willScanContinue
+	}
+
+	// Step 3. Undecided: sample the cutoff, then scan under it.
+	//
+	// The budget starts HERE, before the cutoff read, not after it. That read is a
+	// JetStream request with its own timeout, so a budget that began afterwards left it
+	// outside the bound entirely — and a claimant that spent its whole budget getting a
+	// cutoff would then go on to license an act under it.
+	deadline := time.Now().Add(as.scanBudget())
+	// Resolved BEFORE the cutoff read, because that read is blocking: shutdown can
+	// close while it is in flight, and a stop-aware scan built only afterwards would
+	// never see it.
+	//
+	// There is deliberately NO check between the cutoff read and the scan. One was
+	// written and then deleted: the scan's own pre-read check catches exactly the same
+	// condition before it issues a request, so nothing could distinguish the two and a
+	// mutation of either survived — three checks where two decide everything. What
+	// remains is the scan's own bracket, and the final guard below for the one path the
+	// scan cannot cover: a verdict reached without entering the loop at all.
+	stop := as.claimStopChans(s)
+	upTo, uerr := as.sessLastSeq()
+	if uerr != nil {
+		// The cutoff itself is unavailable. Global and transient, so it stops the pass
+		// for the same reason a fact-load failure does. The record stays publishing and
+		// its lease expiry re-drives it.
+		s.Debugf("MQTT: delayed Will %q could not sample an acceptance cutoff: %v", rec.WillID, uerr)
+		return willScanAbort
+	}
+	curSeq := claimSeq
+	// Declared before the closure so the renewal can read the scan's own progress.
+	sc := &mqttFactScan{
+		upTo: upTo,
+		// A floor from another incarnation is discarded: the sequence it names belongs
+		// to a store that no longer exists.
+		from:       claimed.usableScanFloor(as.sessStreamEpoch),
+		deadline:   deadline,
+		renewEvery: as.renewCadence(),
+		// Armed once, HERE, and deliberately not re-armed per cutoff-chase pass: the
+		// lease it protects runs from the claim, not from whichever pass is current.
+		nextRenew: time.Now().Add(as.renewCadence()),
+		stop:      stop,
+	}
+	sc.renew = func() error {
+		renewed := claimed
+		renewed.ClaimUntil = time.Now().Add(as.claimLease()).UnixNano()
+		// The renewal carries the scan's PROGRESS, which is what makes a bounded
+		// scan able to finish an unbounded history: a later claimant resumes here
+		// instead of re-reading the same rejected prefix forever.
+		//
+		// Compared against the USABLE floor, not the stored number. A floor from
+		// another incarnation is already ignored for reading, so the scan restarts
+		// at the beginning — but comparing progress against a numerically larger
+		// stale value would then persist nothing, and every pass would re-read the
+		// same prefix and re-exhaust the same budget. That is the wedge this field
+		// exists to prevent, reached by scoping only one of the two sides.
+		if v := sc.verified; v > renewed.usableScanFloor(as.sessStreamEpoch) {
+			renewed.ScanFrom, renewed.ScanEpoch = v, as.sessStreamEpoch
+		}
+		ns, rerr := as.storeWillClaimCAS(subject, curSeq, &renewed)
+		if rerr != nil {
+			// An UNCONFIRMED renewal is abandoned, not retried and not ignored. It
+			// may be transient, or a successful renewal whose ack was lost, or proof
+			// that a recovery claimant advanced the record — and only the last is a
+			// verdict. Since the safe response to the verdict is to stop, and the
+			// other two cost only a deferred Will, they are all treated alike.
+			return rerr
+		}
+		curSeq = ns
+		claimed.ScanFrom, claimed.ScanEpoch = renewed.ScanFrom, renewed.ScanEpoch
+		return nil
+	}
+	verdict := as.scanAcceptFacts(rec, sc)
+	// Chase the cutoff. The walk above examined everything at or below the cutoff it
+	// was given, so an acceptance that committed WHILE it ran sits above that cutoff
+	// and no reader ever returns to it: this claimant is bounded by `upTo` and every
+	// later one executes the persisted decision without rescanning. Re-sampling and
+	// examining only the delta narrows that to whatever commits after the final
+	// sample. See mqttWillCutoffChases for why exhausting the limit decides instead
+	// of deferring.
+	for chase := 0; verdict == mqttFactNone && chase < mqttWillCutoffChases; chase++ {
+		if sc.stopped() || !time.Now().Before(deadline) {
 			return willScanContinue
-		case willFenceDefer:
-			return willScanContinue // indeterminate/corrupt for this record: leave pending
-		case willFenceAbort:
-			return willScanAbort // transient/global marker outage: stop the scan
 		}
+		fresh, ferr := as.sessLastSeq()
+		if ferr != nil {
+			// A narrowing, not a prerequisite: the cutoff already verified is a sound
+			// basis for a decision, so an unavailable re-sample stops chasing rather
+			// than abandoning a pass that has already read its evidence.
+			break
+		}
+		if fresh <= sc.upTo {
+			break // nothing committed while the walk ran
+		}
+		// Resume above the cutoff just finished. Sound for the same reason the
+		// persisted floor is: every fact for this filter at or below it was examined
+		// and rejected, and a fact is never rewritten.
+		sc.from, sc.upTo = sc.upTo, fresh
+		verdict = as.scanAcceptFacts(rec, sc)
 	}
-	rec.State = mqttWillPublishing
-	rec.ClaimOwner = s.NodeName()
-	rec.ClaimUntil = now.Add(mqttWillClaimLease).UnixNano()
-	newSeq, err := as.jsa.storeWillOutboxCAS(subject, seq, rec)
-	if err != nil {
+	switch verdict {
+	case mqttFactDefer:
+		// Shutdown, an exhausted budget, an unreadable fact, or a lost renewal. Act not
+		// at all: the record stays publishing and lease expiry re-drives it.
+		return willScanContinue
+	case mqttFactAbort:
+		return willScanAbort
+	}
+
+	// The budget AND the stop signals are checked again, immediately before the
+	// licensing CAS. A renewed lease is not permission to act once the budget is gone:
+	// the renewal proves this claimant still holds the record, while the budget is what
+	// bounds how stale the cutoff it decided under may be. The stop check belongs here
+	// too, and its omission was a real gap — a scan that returned a verdict without
+	// entering its loop (a cutoff below the start) never checks a stop at all, and a
+	// stop arriving after a verdict was never checked either.
+	if !time.Now().Before(deadline) || sc.stopped() {
 		return willScanContinue
 	}
-	if !s.admitWillWorker() {
+
+	// Step 4. License the act and persist the decision it was taken under, in one
+	// CAS at the record's CURRENT sequence. A cancel goes straight to cancelled:
+	// there is no licensed-cancel publishing state, which would be a state with two
+	// meanings and an executable decision that must never be executed.
+	licensed := claimed
+	// The cutoff persisted is the one the scan actually VERIFIED through, which the
+	// chase above may have advanced past the first sample. Recording the first sample
+	// instead would understate the evidence a recovery claimant is told this decision
+	// was taken under.
+	cutoff := sc.upTo
+	licensed.DecisionCutoff = &cutoff
+	if verdict == mqttFactQualified {
+		licensed.State = mqttWillCancelled
+		licensed.Decision = mqttWillDecisionCancel
+		if _, cerr := as.storeWillClaimCAS(subject, curSeq, &licensed); cerr != nil {
+			s.Debugf("MQTT: unable to cancel superseded delayed Will %q: %v", rec.WillID, cerr)
+			return willScanContinue
+		}
+		s.cancelWillTimer(subject)
 		return willScanContinue
 	}
-	go as.willPublishWorker(s, subject, rec, newSeq)
+	licensed.Decision = mqttWillDecisionPublish
+	licensed.ClaimUntil = time.Now().Add(as.claimLease()).UnixNano()
+	licSeq, lerr := as.storeWillClaimCAS(subject, curSeq, &licensed)
+	if lerr != nil {
+		return willScanContinue
+	}
+	as.dispatchWillPublish(s, subject, &licensed, licSeq)
 	return willScanContinue
+}
+
+// dispatchWillPublish hands a record LICENSED to publish to a worker, through the
+// shutdown-aware admission gate. A closed gate leaves the record publishing and
+// licensed, which is exactly what post-restart recovery is meant to find: the
+// decision survives, so the recovering claimant executes it without rescanning.
+func (as *mqttAccountSessionManager) dispatchWillPublish(s *Server, subject string, rec *mqttWillOutbox, seq uint64) {
+	if !s.admitWillWorker() {
+		return
+	}
+	go as.willPublishWorker(s, subject, rec, seq)
+}
+
+// storeWillClaimCAS performs a claim, renewal or licensing CAS, honoring an
+// instance-scoped test seam. Nil seam in production delegates straight to the JSA.
+// Routed separately from the enqueue and finalize stores so an injected failure on
+// one leg of the protocol never perturbs the others.
+func (as *mqttAccountSessionManager) storeWillClaimCAS(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error) {
+	as.mu.RLock()
+	hook := as.testClaimStore
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(subject, expectSeq, rec)
+	}
+	return as.jsa.storeWillOutboxCAS(subject, expectSeq, rec)
 }
 
 // willPublishWorker publishes a claimed Will and then finalizes its record.
@@ -960,11 +1383,29 @@ func (as *mqttAccountSessionManager) tryFireWill(s *Server, subject string, rec 
 // first means a failed delete can no longer leave a re-fireable publishing record —
 // the scanner reaps the done record instead.
 //
-// The worker does not renew its lease: the lease (mqttWillClaimLease, 30s) is
-// sized well above the publish timeout (the JSA request timeout, seconds), so a
-// normal publish finishes within it and no peer reclaims. A pathologically slow
-// publish that exceeds the lease can be reclaimed and republished concurrently —
-// a duplicate that the at-least-once guarantee already permits.
+// The worker does not renew its lease. The construction check
+// (mqttWillTimingInvariant) bounds ONE JetStream request below the lease, which is
+// worth having — an operator-set timeout above the lease would make every publish
+// outlive its ownership window — but it bounds a request, NOT this worker's whole
+// licensed lifecycle, and must not be read as doing so.
+//
+// The gap is real and reachable, not pathological. mqttInitiateMsgDeliveryJSA fans
+// the Will out to subscribers FIRST (irreversible, external), then waits on
+// mqttSubsBarrier before storing the QoS 1/2 copy — and that wait is bounded by
+// shutdown, not by the lease. The barrier is held for a whole processSubs, which
+// creates a JetStream consumer per filter, so a CONNECT session restore with a few
+// dozen subscriptions on a cluster timing requests out holds it past 30s. A peer
+// then reclaims the still-`publishing` record, reuses the persisted publish
+// decision, and publishes again with both brokers alive.
+//
+// That is the sanctioned at-least-once duplicate, because LEASE EXPIRY is the
+// failure boundary: a crash, a pause, a partition and a live broker stalled in its
+// own process are indistinguishable to recovery, which sees only "licensed publish,
+// completion unknown". Bounding the barrier here would be worse, not better — the
+// fan-out already happened, so abandoning would skip the store that protects the
+// racing subscriber, trading a duplicate for a LOSS. End-to-end phase-aware
+// ownership is a ROADMAP item; the honest statement today is that this worker can
+// outlive its lease without anything crashing.
 func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string, rec *mqttWillOutbox, seq uint64) {
 	defer s.willWorkerWG.Done()
 	if err := as.publishWillRecord(s, rec); err != nil {
@@ -1002,6 +1443,14 @@ func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string
 // If done cannot be confirmed within the bounded budget, returns ok==false and the
 // caller leaves the record publishing for lease-expiry recovery.
 func (as *mqttAccountSessionManager) finalizeWillPublish(s *Server, subject string, rec *mqttWillOutbox, seq uint64) (uint64, bool) {
+	// Only a LICENSED publish is finalizable. The previous form retried against any
+	// current publishing record with the same WillID, which was already too broad and
+	// becomes unsafe once a claim can be unlicensed: it would have committed done over
+	// a record another claimant was still scanning under.
+	if !rec.licensedToPublish() {
+		s.Warnf("MQTT: refusing to finalize delayed Will %q on %q: it carries no publish licence", rec.WillID, subject)
+		return 0, false
+	}
 	rec.State = mqttWillDone
 	for attempt := 0; attempt < mqttWillFinalizeAttempts; attempt++ {
 		newSeq, err := as.storeWillFinalizeCAS(subject, seq, rec)
@@ -1019,6 +1468,16 @@ func (as *mqttAccountSessionManager) finalizeWillPublish(s *Server, subject stri
 		}
 		if cur.WillID != rec.WillID {
 			s.Warnf("MQTT: delayed Will %q finalize found a foreign record on %q (state %q, wid %q); abandoning finalize", rec.WillID, subject, cur.State, cur.WillID)
+			return 0, false
+		}
+		// The DECISION is part of what may be finalized, not just the Will. A record
+		// carrying a different decision — or the same act under a different cutoff — is
+		// a different licensing, and committing our terminal state over it would retire
+		// a decision that was never ours. ClaimOwner is deliberately NOT required to
+		// match: after a lease expires a peer may reclaim and republish the SAME
+		// licensed decision, and finalizing it then is correct whoever published.
+		if !cur.sameDecision(rec) {
+			s.Warnf("MQTT: delayed Will %q finalize found a differently licensed record on %q (state %q); abandoning finalize", rec.WillID, subject, cur.State)
 			return 0, false
 		}
 		switch cur.State {
@@ -1128,7 +1587,7 @@ func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int) erro
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttWillQSubjectPrefix+domainTk+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttWillQSubjectPrefix + domainTk + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != LimitsPolicy {

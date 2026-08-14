@@ -1487,8 +1487,12 @@ func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
 	// Exactly one write: the accept save. The CONNECT's requested lifetime is
 	// applied only at the grant point, which a refused resume never reaches, so
 	// there is nothing else to write and nothing to put back.
-	if recSeqAfter != recSeqBefore+1 {
-		t.Fatalf("record advanced %d -> %d; want the accept save only", recSeqBefore, recSeqAfter)
+	//
+	// Counted in $MQTT_sess sequences, and an accept save consumes mqttAcceptBatchSize
+	// of them: the permanent acceptance fact commits atomically with the record.
+	if recSeqAfter != recSeqBefore+mqttAcceptBatchSize {
+		t.Fatalf("record advanced %d -> %d; want the accept save only (%d sequences)",
+			recSeqBefore, recSeqAfter, mqttAcceptBatchSize)
 	}
 	if ps.ExpiryInterval != mqttSessionNeverExpire || ps.Clean {
 		t.Fatalf("the restored record carries ExpiryInterval=%d Clean=%v, want the session's own persistent lifetime",

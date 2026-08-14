@@ -75,6 +75,9 @@ const (
 	JSApiStreamPurgeT        = server.JSApiStreamPurgeT
 	JSApiStreams             = server.JSApiStreams
 	JSApiStreamUpdateT       = server.JSApiStreamUpdateT
+	JSBatchCommit            = server.JSBatchCommit
+	JSBatchId                = server.JSBatchId
+	JSBatchSeq               = server.JSBatchSeq
 	JSConsumerNotFoundErr    = server.JSConsumerNotFoundErr
 	JSExpectedLastSubjSeq    = server.JSExpectedLastSubjSeq
 	JSMessageTTL             = server.JSMessageTTL

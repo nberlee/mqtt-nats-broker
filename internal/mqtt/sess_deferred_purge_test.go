@@ -1459,57 +1459,6 @@ func TestMQTTContendedSaveCreditsMarshalledVerdicts(t *testing.T) {
 	})
 }
 
-// T13: the accept ROLLBACK is the one landed record write that must NOT credit.
-//
-// Its snapshot is built inside the rollback, so a nonce staged after it is not in the bytes
-// that land — and crediting the then-current revision would claim exactly that nonce durable
-// while nothing anywhere recorded it. The nonce is lost with the aborted object, which is
-// pre-existing behavior stated in docs/CONFORMANCE.md, not something a false credit improves.
-//
-// Mutation MU18: credit the current revision on a raw rollback success.
-func TestMQTTAcceptRollbackDoesNotCreditLateVerdict(t *testing.T) {
-	t.Parallel()
-	e := testNewDeferredEnv(t, "client-rollback-exempt", "rollback.exempt")
-	// Gated for the whole rollback, as CONNECT is: it also keeps the release handoff from
-	// being what persists the late nonce.
-	e.gate(t)
-
-	tok := e.sess.beginRecordTx()
-	e.sess.mu.Lock()
-	e.sess.disconnectedAt = time.Now().Unix()
-	ps := e.sess.buildPersistedSessionLocked()
-	candidate := e.sess.seq
-	e.sess.mu.Unlock()
-
-	// Staged AFTER the snapshot and before the raw store completes.
-	pi := e.testStageVerdict(t, "nonce-after-snapshot", 112)
-	rev, saved, _ := e.voidRevs(t)
-
-	if err := e.asm.rollbackStoreSession(e.sess, tok, &ps, e.sess.idHash, candidate); err != nil {
-		t.Fatalf("the rollback re-save: %v", err)
-	}
-
-	stored := e.loadRecord(t)
-	if testRecordHasNonce(stored, "nonce-after-snapshot") {
-		t.Fatalf("the snapshot cannot carry a nonce staged after it: %v", stored.CancelledRegs)
-	}
-	if _, nowSaved, _ := e.voidRevs(t); nowSaved != saved {
-		t.Fatalf("the rollback must credit nothing: saved was %d, now %d (rev=%d)", saved, nowSaved, rev)
-	}
-	e.sess.mu.Lock()
-	_, parked := e.sess.settledVoidReservations["nonce-after-snapshot"]
-	_, held := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if !parked || !held {
-		t.Fatalf("an uncredited verdict keeps its reservation: parked=%v held=%v", parked, held)
-	}
-
-	if err := e.sess.endRecordTx(tok); err != nil {
-		t.Fatalf("release the fence: %v", err)
-	}
-	e.release()
-}
-
 // T15: a discharge that finds the record state UNRESOLVED again re-parks the action instead
 // of applying a close whose every write is refused.
 //

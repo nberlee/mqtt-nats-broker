@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
-	"time"
 )
 
 // The four paths that reported a takeover on evidence that could not support one.
@@ -476,14 +475,13 @@ func TestSessLowerSequenceSiblingIsReportedForeign(t *testing.T) {
 
 // TestSessLowerSequenceSiblingAtEveryOtherGate is the rest of test 5e's matrix.
 //
-// The two classifiers above are not the only independent `> base` gates: three more
+// The two classifiers above are not the only independent `> base` gates: two more
 // production sites reach the lineage rule by their own route —
-// disposalForDirectRejection (the CONNECT-time 10071 arms),
-// resolveContendedRecordSave's movedVerdict (the 10164 arms), and
-// rollbackAcceptedSession's `seq > candidate` dispatch. Removing any ONE of them is
-// invisible to a test that drives only the other two, and each removal downgrades the
+// disposalForDirectRejection (the CONNECT-time 10071 arms) and
+// resolveContendedRecordSave's movedVerdict (the 10164 arms). Removing either one is
+// invisible to a test that drives only the other, and each removal downgrades the
 // documented reset/re-provisioned fail-safe: a lower-sequence record would take forked
-// vocabulary, or a preserved timer, on a store that was rebuilt underneath us.
+// vocabulary on a store that was rebuilt underneath us.
 //
 // Driven against a real record, with the ATTEMPT's base placed ABOVE it — which is the
 // only way to produce "record below the base" on a live stream, and is exactly the shape
@@ -531,34 +529,6 @@ func TestSessLowerSequenceSiblingAtEveryOtherGate(t *testing.T) {
 		}
 	})
 
-	t.Run("rollbackAcceptedSession", func(t *testing.T) {
-		e := testNewForkEnv(t, "gate-rollback")
-		e.sess.mu.Lock()
-		e.sess.disconnectedAt = 0
-		e.sess.mu.Unlock()
-		testLandSibling(t, e.testInflightEnv, testMutateSibling)
-		recSeq := testCurrentRecordSeq(t, e.testInflightEnv)
-
-		e.asm.mu.Lock()
-		e.asm.scheduleSessionExpiryLocked(e.s, e.idHash, time.Hour)
-		e.asm.mu.Unlock()
-		var got rollbackResult
-		e.asm.mu.Lock()
-		e.asm.testRollbackDone = func(_ *mqttSession, r rollbackResult) { got = r }
-		e.asm.mu.Unlock()
-
-		// The candidate sits ABOVE the surviving record, so `seq > candidate` is false
-		// and the lineage must never be consulted: the caller-specific answer is
-		// INDETERMINATE, not forked and not superseded. A positive EFFECTIVE lifetime
-		// keeps this on the re-save branch rather than the teardown.
-		e.sess.mu.Lock()
-		e.sess.expiryInterval = 3600
-		e.sess.mu.Unlock()
-		e.asm.rollbackAcceptedSession(e.s, e.sess, e.idHash, recSeq+5)
-		if got != rollbackIndeterminate {
-			t.Fatalf("a record below the candidate is indeterminate, never forked: got %v", got)
-		}
-	})
 }
 
 // testCurrentRecordSeq returns the sequence the session record currently sits at.
@@ -572,90 +542,8 @@ func testCurrentRecordSeq(t *testing.T, e *testInflightEnv) uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// Path 4: the CONNECT rollback readback
+// Path 4: a live competing owner
 // ---------------------------------------------------------------------------
-
-// TestSessForkedRollbackReportsForkedAndKeepsTheTimer is test 8g (M22, M22a).
-//
-// rollbackAcceptedSession classified any CONNECTED record above the candidate sequence as
-// rollbackSuperseded — "a legitimate newer generation" — and then CANCELLED the expiry
-// timer on it. A surviving sibling satisfies that sequence test while being no successor at
-// all, so durable timer state was changed on an unsupported conclusion.
-//
-// Asserting only "not superseded" would pass an implementation that maps every sibling to
-// rollbackIndeterminate: that result also preserves the timer, but it reports a store
-// failure that did not happen. The EXACT result and the absence of that warning are what
-// discriminate.
-func TestSessForkedRollbackReportsForkedAndKeepsTheTimer(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name  string
-		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
-		want  rollbackResult
-	}{
-		{"proven sibling", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSibling(t, e, testMutateSibling)
-		}, rollbackForked},
-		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
-		}, rollbackSuperseded},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := testNewForkEnv(t, "rbfork-"+tc.name)
-
-			e.sess.mu.Lock()
-			candidate := e.sess.seq
-			e.sess.disconnectedAt = 0 // the accept save's shape: durably CONNECTED
-			// A positive EFFECTIVE lifetime so the rollback re-saves rather than tearing
-			// down; the rollback reads it off the session.
-			e.sess.expiryInterval = 3600
-			e.sess.mu.Unlock()
-
-			// The staged record is CONNECTED too, which is what makes the sequence-only
-			// test fire.
-			tc.stage(t, e.testInflightEnv)
-
-			// An expiry timer the rollback must not disarm on unproven evidence.
-			e.asm.mu.Lock()
-			e.asm.scheduleSessionExpiryLocked(e.s, e.idHash, time.Hour)
-			e.asm.mu.Unlock()
-
-			var got rollbackResult
-			e.asm.mu.Lock()
-			e.asm.testRollbackDone = func(_ *mqttSession, r rollbackResult) { got = r }
-			e.asm.mu.Unlock()
-
-			// The re-save is CAS-rejected by the moved record, which is what leaves the
-			// classification to the re-read.
-			e.asm.rollbackAcceptedSession(e.s, e.sess, e.idHash, candidate)
-
-			if got != tc.want {
-				t.Fatalf("rollback result = %v, want %v", got, tc.want)
-			}
-			e.asm.mu.RLock()
-			_, armed := e.asm.pendingExpiries[e.idHash]
-			e.asm.mu.RUnlock()
-			wantArmed := tc.want == rollbackForked
-			if armed != wantArmed {
-				t.Fatalf("expiry timer armed = %v, want %v: a forked record establishes no "+
-					"owner for the deadline, so the timer must survive; a real successor owns "+
-					"its own scheduling", armed, wantArmed)
-			}
-			// Test 16: this site mints like the other six, which is a CORRECTION rather than an
-			// omission repaired. Once a repair-bearing accept save has landed and this rollback
-			// finds a sibling of it, the grant the capsule contributed is durably erased again
-			// while the old capsule anchors a superseded survivor and will be dropped —
-			// refusing here would lose a grant this feature had just repaired. What makes it
-			// safe on a CONNECT that repaired nothing is the empty-delta property, asserted by
-			// TestForkRepairEmptyDeltaMintsNothing. See sess_fork_repair.go.
-			if tc.want == rollbackForked {
-				testAssertMinted(t, e)
-			} else {
-				testAssertNotMinted(t, e)
-			}
-		})
-	}
-}
 
 // TestSessForkedWithALiveCompetingOwnerIsStillUnsettled pins the VERDICT on the shape that
 // produces this change's sharpest residual.

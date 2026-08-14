@@ -64,11 +64,13 @@ func TestMQTTWillOutboxReplicatedStream(t *testing.T) {
 	// claim loop cannot publish or delete it while we inspect replication.
 	asm := testMQTTGetGlobalASM(t, b.s)
 	willID := nuid.Next()
-	cidHash := "smoke-" + nuid.Next()
+	clientID := "smoke-" + nuid.Next()
+	cidHash := getHash(clientID)
 	subject := mqttWillQSubject(asm.domainTk, cidHash, willID)
 	rec := &mqttWillOutbox{
 		WillID:           willID,
 		ClientIDHash:     cidHash,
+		ClientID:         clientID,
 		Gen:              mqttNewSessGen(),
 		Topic:            "will/smoke",
 		Msg:              []byte("inert"),
@@ -304,11 +306,39 @@ func testMQTTExpectNothingFor(t testing.TB, r *mqttReader, d time.Duration) {
 	}
 }
 
-// TestMQTTWillOutboxReplicatedWatermark (plan test 16, always-run): the durable
-// per-client cancellation marker stream $MQTT_willcancel is created R3 and current
-// on every node, and a watermark advanced through the bridge is replicated and
-// readable back as a valid current-epoch marker.
-func TestMQTTWillOutboxReplicatedWatermark(t *testing.T) {
+// testAcceptFactsFor returns every permanent acceptance fact currently stored for a
+// client hash in this broker's incarnation, oldest first.
+func testAcceptFactsFor(t *testing.T, asm *mqttAccountSessionManager, cidHash string) []*mqttAcceptFact {
+	t.Helper()
+	filter := mqttAcceptClientEpochFilter(asm.domainTk, cidHash, asm.sessStreamEpoch)
+	var out []*mqttAcceptFact
+	for seq := uint64(1); ; {
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				t.Fatalf("walk acceptance facts: %v", err)
+			}
+			return out
+		}
+		seq = smsg.Sequence + 1
+		f, derr := mqttDecodeAcceptFact(asm.domainTk, asm.sessStreamEpoch, smsg)
+		if derr != nil {
+			t.Fatalf("decode acceptance fact on %q: %v", smsg.Subject, derr)
+		}
+		out = append(out, f)
+	}
+}
+
+// TestMQTTWillOutboxReplicatedAcceptFacts is T17's always-run half: $MQTT_sess is
+// created R3 and current on every node, it carries BOTH subject spaces, and a real
+// CONNECT through the bridge leaves a permanent acceptance fact that is replicated
+// and reads back valid.
+//
+// SMOKE COVERAGE ONLY. It runs against a real cluster, but no mutation is paired
+// with it, so it is not evidence for any cluster-shaped claim — see CLAUDE.md. What
+// it does establish is that the atomic batch actually works against a replicated
+// stream, which no single-node test can.
+func TestMQTTWillOutboxReplicatedAcceptFacts(t *testing.T) {
 	c := testNewJetStreamCluster(t, 3)
 	b := c.startBroker(t, 0)
 
@@ -317,101 +347,110 @@ func TestMQTTWillOutboxReplicatedWatermark(t *testing.T) {
 		t.Fatalf("jetstream context: %v", err)
 	}
 	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
-		si, err := js.StreamInfo(mqttWillCancelStreamName)
+		si, err := js.StreamInfo(mqttSessStreamName)
 		if err != nil {
-			return fmt.Errorf("marker stream info: %w", err)
+			return fmt.Errorf("session stream info: %w", err)
 		}
 		if si.Config.Replicas != 3 {
 			return fmt.Errorf("Config.Replicas=%d, want 3", si.Config.Replicas)
 		}
-		if si.Config.MaxMsgsPerSubject != 1 {
-			return fmt.Errorf("MaxMsgsPerSubject=%d, want 1", si.Config.MaxMsgsPerSubject)
+		if len(si.Config.Subjects) != 2 {
+			return fmt.Errorf("Config.Subjects=%v, want the record and accept-fact spaces", si.Config.Subjects)
 		}
 		if si.Cluster == nil || si.Cluster.Leader == "" || len(si.Cluster.Replicas) != 2 {
-			return fmt.Errorf("marker stream not R3-clustered: %+v", si.Cluster)
+			return fmt.Errorf("session stream not R3-clustered: %+v", si.Cluster)
 		}
+		// AllowAtomicPublish is asserted through the broker's OWN validator rather
+		// than this client's StreamConfig, which does not carry the field: the
+		// account manager refuses to initialize without it, so a broker that got
+		// this far already proved it. Left as a note rather than a silent omission.
 		return nil
 	})
-	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
 
-	// Advance a watermark through the bridge and prove it replicated + reads back.
 	asm := testMQTTGetGlobalASM(t, b.s)
-	cidHash := "wmrepl-" + nuid.Next()
-	if err := asm.advanceWillCancelWatermark(cidHash, 42); err != nil {
-		t.Fatalf("advance watermark: %v", err)
+	const cid = "factrepl"
+	cc, cr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
+	defer cc.Close()
+	testMQTTReadConnAckV5(t, cr)
+
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
+	facts := testAcceptFactsFor(t, asm, getHash(cid))
+	if len(facts) != 1 {
+		t.Fatalf("one accepted CONNECT must leave exactly one acceptance fact, got %d", len(facts))
 	}
-	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
-	wm, _, status := asm.loadWillCancelWatermark(cidHash)
-	if status != mqttWillCancelValid || wm.SessionSeq != 42 || wm.SessEpoch != asm.sessStreamEpoch {
-		t.Fatalf("watermark not durable/valid after replication: status=%v wm=%+v", status, wm)
+	if facts[0].ClientID != cid {
+		t.Fatalf("the fact must carry the EXACT client id: got %q want %q", facts[0].ClientID, cid)
+	}
+	if facts[0].At == 0 {
+		t.Fatal("the fact must be dated: an undated acceptance suppresses unconditionally")
 	}
 }
 
-// TestMQTTWillOutboxReplicatedWatermarkLeaderFailover (plan test 16, gated): a
-// watermark committed to the R3 marker stream remains authoritative across the loss
-// of its stream-leader node, and CONNECT-side advances recover after the election.
-func TestMQTTWillOutboxReplicatedWatermarkLeaderFailover(t *testing.T) {
+// TestMQTTWillOutboxReplicatedAcceptFactsLeaderFailover is T17's gated half: a
+// committed acceptance fact stays authoritative across the loss of its stream-leader
+// node, and a CONNECT after the election commits a new one.
+//
+// Same limitation: smoke coverage, no paired mutation, not evidence for a
+// cluster-shaped claim.
+func TestMQTTWillOutboxReplicatedAcceptFactsLeaderFailover(t *testing.T) {
 	if os.Getenv("MQTTNB_CLUSTER_FAILOVER_TESTS") != "1" {
 		t.Skip("set MQTTNB_CLUSTER_FAILOVER_TESTS=1 to run cluster failover tests")
 	}
 
 	c := testNewJetStreamCluster(t, 3)
 	b := c.startBroker(t, 0)
-
-	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
 	asm := testMQTTGetGlobalASM(t, b.s)
-	cidHash := "wmfailover-" + nuid.Next()
-	if err := asm.advanceWillCancelWatermark(cidHash, 7); err != nil {
-		t.Fatalf("advance watermark: %v", err)
-	}
-	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
 
-	// Stop ONLY the marker stream leader (2/3 quorum preserved).
-	leader := c.waitStreamLeader(t, testGlobalAccount, mqttWillCancelStreamName)
-	t.Logf("stopping $MQTT_willcancel stream-leader node %q", leader.name)
-	c.stopNode(leader)
-
-	// A new leader is elected among survivors and the marker stream is current.
-	newLeader := c.waitStreamLeader(t, testGlobalAccount, mqttWillCancelStreamName)
-	t.Logf("new $MQTT_willcancel stream-leader node %q", newLeader.name)
-	c.waitStreamCurrent(t, testGlobalAccount, mqttWillCancelStreamName)
-
-	// The pre-failover watermark is still authoritative.
-	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
-		wm, _, status := asm.loadWillCancelWatermark(cidHash)
-		if status != mqttWillCancelValid || wm.SessionSeq != 7 {
-			return fmt.Errorf("watermark lost across failover: status=%v wm=%+v\n%s", status, wm, c.describe())
-		}
-		return nil
-	})
-
-	// A CONNECT-side advance recovers post-election (monotonic raise to 9).
-	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
-		if err := asm.advanceWillCancelWatermark(cidHash, 9); err != nil {
-			return fmt.Errorf("advance after failover: %w\n%s", err, c.describe())
-		}
-		return nil
-	})
-	if wm, _, status := asm.loadWillCancelWatermark(cidHash); status != mqttWillCancelValid || wm.SessionSeq != 9 {
-		t.Fatalf("post-failover advance not durable: status=%v wm=%+v", status, wm)
-	}
-
-	// A REAL CONNECT through the surviving broker must succeed post-election — the
-	// gating watermark advance on the production path works after the leader loss.
 	oldTimeout := testMQTTTimeout
 	testMQTTTimeout = 30 * time.Second
 	defer func() { testMQTTTimeout = oldTimeout }()
+
+	const before = "factfailover-before"
+	cc, cr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: before, cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
+	defer cc.Close()
+	testMQTTReadConnAckV5(t, cr)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
+	if n := len(testAcceptFactsFor(t, asm, getHash(before))); n != 1 {
+		t.Fatalf("pre-failover CONNECT must leave one acceptance fact, got %d", n)
+	}
+
+	// Stop ONLY the session stream leader (2/3 quorum preserved).
+	leader := c.waitStreamLeader(t, testGlobalAccount, mqttSessStreamName)
+	t.Logf("stopping $MQTT_sess stream-leader node %q", leader.name)
+	c.stopNode(leader)
+
+	newLeader := c.waitStreamLeader(t, testGlobalAccount, mqttSessStreamName)
+	t.Logf("new $MQTT_sess stream-leader node %q", newLeader.name)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
+
+	// The pre-failover fact is permanent: nothing rewrites its subject and nothing
+	// reaps it, so an election cannot cost it.
+	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+		facts := testAcceptFactsFor(t, asm, getHash(before))
+		if len(facts) != 1 || facts[0].ClientID != before {
+			return fmt.Errorf("acceptance fact lost across failover: %+v\n%s", facts, c.describe())
+		}
+		return nil
+	})
+
+	// And a real CONNECT through the surviving broker still commits its batch
+	// post-election — the atomic accept works after a leader loss.
 	checkFor(t, 25*time.Second, 250*time.Millisecond, func() error {
 		if !b.nc.IsConnected() {
 			return fmt.Errorf("broker not connected yet\n%s", c.describe())
 		}
 		return nil
 	})
-	cc, cr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wmfailover-real", cleanStart: true,
+	const after = "factfailover-after"
+	cc2, cr2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: after, cleanStart: true,
 		props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
-	defer cc.Close()
-	testMQTTReadConnAckV5(t, cr)
-	if _, _, status := asm.loadWillCancelWatermark(getHash("wmfailover-real")); status != mqttWillCancelValid {
-		t.Fatalf("real post-election CONNECT must have advanced a valid marker, got %v", status)
+	defer cc2.Close()
+	testMQTTReadConnAckV5(t, cr2)
+	if n := len(testAcceptFactsFor(t, asm, getHash(after))); n != 1 {
+		t.Fatalf("a post-election CONNECT must commit its acceptance fact, got %d facts", n)
 	}
 }

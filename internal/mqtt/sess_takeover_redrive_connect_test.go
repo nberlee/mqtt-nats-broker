@@ -509,6 +509,21 @@ func TestReDriveLeavesNoResidentAtBaseZero(t *testing.T) {
 		atBarrier, release := make(chan struct{}), make(chan struct{})
 		subject := mqttSessStreamSubjectPrefix + asm.domainTk + getHash(cid)
 
+		// The plant below writes this client's record subject, which this broker's own
+		// session-record watch observes; its eviction worker then loads that subject
+		// from another goroutine and would trip the barrier before the authoritative
+		// restore ever ran. Drop the observation for this client only: the subtest is
+		// about the re-drive, and the watch is a separate convergence channel with its
+		// own tests.
+		asm.mu.Lock()
+		asm.testSessPersistDrop = func(h string) bool { return h == getHash(cid) }
+		asm.mu.Unlock()
+		defer func() {
+			asm.mu.Lock()
+			asm.testSessPersistDrop = nil
+			asm.mu.Unlock()
+		}()
+
 		restore := setMQTTTestSessStoreResultHook(func(sess *mqttSession, resp *JSPubAckResponse, serr error) (*JSPubAckResponse, error) {
 			if sess.id != cid {
 				return resp, serr

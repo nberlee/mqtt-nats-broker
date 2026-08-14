@@ -25,14 +25,20 @@ func TestValidateSessStream(t *testing.T) {
 	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
-			Name:       mqttSessStreamName,
-			Subjects:   []string{mqttSessStreamSubjectPrefix + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Discard:    DiscardOld,
-			MaxMsgsPer: 1,
-			Replicas:   3,
-			Metadata:   map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+			Name: mqttSessStreamName,
+			// TWO subject spaces: the session records, and the permanent CONNECT
+			// acceptance facts an accepted CONNECT commits atomically with its record.
+			Subjects: []string{
+				mqttSessStreamSubjectPrefix + ">",
+				mqttAcceptSubjectPrefix + ">",
+			},
+			Storage:            FileStorage,
+			Retention:          LimitsPolicy,
+			Discard:            DiscardOld,
+			MaxMsgsPer:         1,
+			Replicas:           3,
+			AllowAtomicPublish: true,
+			Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 		}}
 	}
 	if err := validateSessStream(good(), "", 3); err != nil {
@@ -51,6 +57,10 @@ func TestValidateSessStream(t *testing.T) {
 	}{
 		{"wrong subject", func(c *StreamConfig) { c.Subjects = []string{"other.>"} }},
 		{"extra subject", func(c *StreamConfig) { c.Subjects = append(c.Subjects, "other.>") }},
+		{"the accept space missing", func(c *StreamConfig) {
+			c.Subjects = []string{mqttSessStreamSubjectPrefix + ">"}
+		}},
+		{"no atomic publish", func(c *StreamConfig) { c.AllowAtomicPublish = false }},
 		{"memory storage", func(c *StreamConfig) { c.Storage = MemoryStorage }},
 		{"interest retention", func(c *StreamConfig) { c.Retention = InterestPolicy }},
 		{"discard new", func(c *StreamConfig) { c.Discard = DiscardNew }},
@@ -559,7 +569,6 @@ func TestEnsureBrokerStream(t *testing.T) {
 var mqttTestBrokerStreamNames = []string{
 	mqttSessStreamName,
 	mqttWillQStreamName,
-	mqttWillCancelStreamName,
 	mqttTeardownStreamName,
 	mqttOriginStreamName,
 	mqttStreamName,
@@ -682,11 +691,12 @@ var streamFieldMutators = map[string]func(*StreamConfig){
 	"ConsumerLimits.InactiveThreshold": func(c *StreamConfig) { c.ConsumerLimits.InactiveThreshold = time.Minute },
 	"ConsumerLimits.MaxAckPending":     func(c *StreamConfig) { c.ConsumerLimits.MaxAckPending = 1 },
 	// Flip relative to the baseline: required-true streams get the mandatory
-	// false mutation (round-3 Q4.1), waived-false streams get true.
+	// false mutation (round-3 Q4.1), waived-false streams get true. AllowAtomicPublish
+	// joins that class for $MQTT_sess, whose accept batch makes it a prerequisite.
 	"AllowMsgTTL":            func(c *StreamConfig) { c.AllowMsgTTL = !c.AllowMsgTTL },
 	"SubjectDeleteMarkerTTL": func(c *StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute },
 	"AllowMsgCounter":        func(c *StreamConfig) { c.AllowMsgCounter = true },
-	"AllowAtomicPublish":     func(c *StreamConfig) { c.AllowAtomicPublish = true },
+	"AllowAtomicPublish":     func(c *StreamConfig) { c.AllowAtomicPublish = !c.AllowAtomicPublish },
 	"AllowMsgSchedules":      func(c *StreamConfig) { c.AllowMsgSchedules = true },
 	"PersistMode":            func(c *StreamConfig) { c.PersistMode = AsyncPersistMode },
 	"AllowBatchPublish":      func(c *StreamConfig) { c.AllowBatchPublish = true },
@@ -799,15 +809,15 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		// Round-3 Q2.1: the incarnation epoch is a REAL prerequisite carried in
 		// Metadata, validated by the composed callback on the same snapshot.
 		d["Metadata"] = fieldDisposition{kind: dispRejected, errWant: mqttSessEpochMetaKey}
+		// The commons waiver said "the owner never emits batch headers". This owner
+		// now does: an accepted CONNECT commits its record and its permanent
+		// acceptance fact in ONE atomic batch, so the capability is a prerequisite of
+		// an operation rather than an inert setting.
+		d["AllowAtomicPublish"] = fieldDisposition{kind: dispRejected, errWant: "allow_atomic"}
 	case mqttWillQStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing ever purges the outbox; records leave through exact-sequence deletes"}
-	case mqttWillCancelStreamName:
-		register()
-		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "no operation ever deletes a watermark — markers are permanent by design"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "no operation ever purges a watermark — markers are permanent by design"}
-		d["SubjectDeleteMarkerTTL"] = fieldDisposition{kind: dispWaived, reason: "no delete ever occurs here, so no delete marker can ever be created"}
 	case mqttTeardownStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "no operation ever deletes a retirement watermark — a fence is permanent by design, and reaping one would unfence a generation whose resources are already deleted"}

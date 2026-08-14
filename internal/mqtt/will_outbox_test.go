@@ -650,21 +650,25 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	// A due pending record with a valid origin (nonzero seq + current epoch) so the
 	// fence proceeds; no watermark exists for this hash, so it falls back to the
 	// (absent) session record and fires.
-	cidHash := getHash("scr-cid")
+	const clientID = "scr-cid"
+	cidHash := getHash(clientID)
 	wid := "scr-w"
 	subject := mqttWillQSubject(asm.domainTk, cidHash, wid)
 	seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: wid, ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/scr", Msg: []byte("x"), QoS: 0,
+		WillID: wid, ClientIDHash: cidHash, ClientID: clientID, Gen: mqttNewSessGen(), Topic: "will/scr", Msg: []byte("x"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
-	// The claim loop claims pending->publishing (seq1); its worker parks in the gate.
+	// The claim loop claims pending->publishing and then LICENSES the publish; the
+	// worker parks in the gate holding the licensed sequence (seq1). Waiting for the
+	// licence, not merely for "publishing", is what makes seq1 stable: an unlicensed
+	// claim is advanced again moments later by the licensing CAS.
 	var seq1 uint64
 	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
 		rec, seq, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
-		if err != nil || rec == nil || rec.State != mqttWillPublishing {
-			return fmt.Errorf("record not publishing yet")
+		if err != nil || rec == nil || !rec.licensedToPublish() {
+			return fmt.Errorf("record not licensed to publish yet")
 		}
 		seq1 = seq
 		return nil
@@ -672,16 +676,23 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 
 	// Simulate a peer reclaiming: advance the still-valid publishing record to a
 	// higher sequence (seq2) while the first worker remains parked holding seq1.
-	rec1, s1, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
-	if err != nil || rec1 == nil {
-		t.Fatalf("load publishing record: %v", err)
-	}
-	rec1.ClaimOwner = "peer-node"
-	rec1.ClaimUntil = time.Now().Add(mqttWillClaimLease).UnixNano()
-	seq2, err := asm.jsa.storeWillOutboxCAS(subject, s1, rec1)
-	if err != nil {
-		t.Fatalf("advance record to a higher sequence: %v", err)
-	}
+	// Retried, because the claim loop is live and may move the record between the
+	// load and the CAS.
+	var seq2 uint64
+	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
+		rec1, s1, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
+		if err != nil || rec1 == nil {
+			return fmt.Errorf("load publishing record: %v", err)
+		}
+		rec1.ClaimOwner = "peer-node"
+		rec1.ClaimUntil = time.Now().Add(mqttWillClaimLease).UnixNano()
+		s2, serr := asm.jsa.storeWillOutboxCAS(subject, s1, rec1)
+		if serr != nil {
+			return fmt.Errorf("advance record to a higher sequence: %w", serr)
+		}
+		seq2 = s2
+		return nil
+	})
 	if seq2 <= seq1 {
 		t.Fatalf("expected advanced sequence > %d, got %d", seq1, seq2)
 	}
@@ -710,12 +721,15 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 }
 
 // TestMQTTWillOutboxNewerDisconnectedRecordFires: the takeover fence must FIRE a
-// Will when the current session record is newer (sequence > OriginSessionSeq) but
-// DISCONNECTED (DisconnectedAt > 0) — e.g. the expiry sweep stamped it, or a
-// reconnect that has since taken a finite-expiry disconnect. A sequence-only fence
-// would wrongly suppress a legitimate Will (no-loss regression); the DisconnectedAt
-// gate prevents that.
-func TestMQTTWillOutboxNewerDisconnectedRecordFires(t *testing.T) {
+// Will when the client's session record has moved on but NO acceptance of that
+// client predates the Will falling due — the no-loss direction.
+//
+// The record's own sequence is deliberately irrelevant now, and that is the change:
+// a newer record proves only that something wrote one (an expiry sweep's
+// disconnect stamp, a teardown, a reconnect that happened AFTER the delay elapsed),
+// none of which is an acceptance entitled to suppress. Only a dated acceptance fact
+// is.
+func TestMQTTWillOutboxNoAcceptanceMeansTheWillFires(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -723,31 +737,25 @@ func TestMQTTWillOutboxNewerDisconnectedRecordFires(t *testing.T) {
 
 	asm := testMQTTGetGlobalASM(t, s)
 
-	// Newer session (seq 100) but disconnected: fence must proceed (fire).
-	setWillSessionLoadHook(asm, func(cidHash string) (*mqttPersistedSession, uint64, error) {
-		return &mqttPersistedSession{DisconnectedAt: time.Now().Unix()}, 100, nil
-	})
-	defer setWillSessionLoadHook(asm, nil)
-
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ndrfsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/ndrf", opts: 0}})
 
 	seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "ndrf-w", ClientIDHash: getHash("ndrf-pub"), Gen: mqttNewSessGen(), Topic: "will/ndrf", Msg: []byte("fire"), QoS: 0,
+		WillID: "ndrf-w", ClientIDHash: getHash("ndrf-pub"), ClientID: "ndrf-pub", Gen: mqttNewSessGen(), Topic: "will/ndrf", Msg: []byte("fire"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
-		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch, // older than the newer-but-disconnected session (100)
+		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
 	testMQTTReadPublishV5(t, rs, "will/ndrf", []byte("fire"))
 }
 
-// TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss: the fence must cancel a Will
-// purely from persisted state when the current session record is newer AND shows a
-// currently-connected generation (DisconnectedAt == 0) — a reconnect/takeover
-// superseded it. No live origin broker is needed: the durable session record alone
-// drives the suppression.
+// TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss: the claimant must cancel a Will
+// purely from persisted state when a permanent acceptance fact of that exact client
+// is dated before the Will fell due. No live origin broker is needed, and no
+// reconnect-time action either: the durable fact alone drives the suppression, which
+// is what makes it survive the loss of the broker that enqueued the Will.
 func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -756,24 +764,23 @@ func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 
 	asm := testMQTTGetGlobalASM(t, s)
 
-	// Newer session (seq 100) AND connected: fence must cancel.
-	setWillSessionLoadHook(asm, func(cidHash string) (*mqttPersistedSession, uint64, error) {
-		return &mqttPersistedSession{DisconnectedAt: 0}, 100, nil
-	})
-	defer setWillSessionLoadHook(asm, nil)
-
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "lesolsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/lesol", opts: 0}})
 
+	// The Will's origin sits at the stream floor, and the acceptance lands above it
+	// and BEFORE the Will falls due — the production ordering.
+	origin := testSessStreamFloor(t, asm)
+	fireAt := time.Now().Add(-time.Millisecond).UnixNano()
+	testPlantAcceptFact(t, asm, "lesol-pub", fireAt-int64(time.Minute))
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "lesol-w", ClientIDHash: getHash("lesol-pub"), Gen: mqttNewSessGen(), Topic: "will/lesol", Msg: []byte("suppressed"), QoS: 0,
-		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
-		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
+		WillID: "lesol-w", ClientIDHash: getHash("lesol-pub"), ClientID: "lesol-pub", Gen: mqttNewSessGen(), Topic: "will/lesol", Msg: []byte("suppressed"), QoS: 0,
+		FireAt: fireAt, State: mqttWillPending,
+		OriginSessionSeq: origin, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
-	// The claimant fence cancels the superseded Will; it is never delivered.
+	// The claimant cancels the superseded Will; it is never delivered.
 	checkFor(t, 4*time.Second, 20*time.Millisecond, func() error {
 		rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
 		if err != nil {
@@ -790,11 +797,11 @@ func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 	testMQTTExpectNothing(t, rs)
 }
 
-// TestMQTTWillOutboxFenceIndeterminateLoadDefers: when the session record cannot be
-// read (load/decode error), the fence must DEFER — neither fire nor cancel — so a
-// later scan resolves it once the read succeeds. This proves an indeterminate read
-// never risks publishing a suppressed Will nor loses a legitimate one.
-func TestMQTTWillOutboxFenceIndeterminateLoadDefers(t *testing.T) {
+// TestMQTTWillOutboxFactReadIndeterminateDefers: when the acceptance evidence cannot
+// be read, the claimant must DEFER — neither fire nor cancel — so a later pass
+// resolves it once the read succeeds. This proves an indeterminate read never risks
+// publishing a suppressed Will nor loses a legitimate one.
+func TestMQTTWillOutboxFactReadIndeterminateDefers(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -802,41 +809,47 @@ func TestMQTTWillOutboxFenceIndeterminateLoadDefers(t *testing.T) {
 
 	asm := testMQTTGetGlobalASM(t, s)
 
-	// Fail every session load: the fence defers on each scan.
+	// Fail every acceptance-fact read: the claimant defers on each pass.
 	var loads int32
-	setWillSessionLoadHook(asm, func(cidHash string) (*mqttPersistedSession, uint64, error) {
+	asm.mu.Lock()
+	asm.testFactLoad = func(string, uint64) (*StoredMsg, error) {
 		atomic.AddInt32(&loads, 1)
-		return nil, 0, fmt.Errorf("injected session load error")
-	})
+		return nil, fmt.Errorf("injected acceptance-fact read error")
+	}
+	asm.mu.Unlock()
 
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fildsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/fild", opts: 0}})
 
+	origin := testSessStreamFloor(t, asm)
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "fild-w", ClientIDHash: getHash("fild-pub"), Gen: mqttNewSessGen(), Topic: "will/fild", Msg: []byte("later"), QoS: 0,
+		WillID: "fild-w", ClientIDHash: getHash("fild-pub"), ClientID: "fild-pub", Gen: mqttNewSessGen(), Topic: "will/fild", Msg: []byte("later"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
-		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
+		OriginSessionSeq: origin, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
-	// While loads fail, the record stays pending (deferred) and nothing is delivered.
+	// While reads fail, the record is left for a later pass and nothing is delivered.
+	// It may be an unlicensed publishing CLAIM rather than pending — a claimant takes
+	// its claim before it reads any evidence — but it must carry no decision, which is
+	// what "nothing was licensed" means here.
 	time.Sleep(500 * time.Millisecond)
-	if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err != nil || rec == nil || rec.State != mqttWillPending {
-		got := "nil"
-		if rec != nil {
-			got = string(rec.State)
-		}
-		t.Fatalf("want record still pending while load errors, got state=%s err=%v", got, err)
+	rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
+	if err != nil || rec == nil || rec.Decision != mqttWillDecisionUnset ||
+		(rec.State != mqttWillPending && rec.State != mqttWillPublishing) {
+		t.Fatalf("want the record left unlicensed while reads fail, got %+v err=%v", rec, err)
 	}
 	testMQTTExpectNothing(t, rs)
 	if atomic.LoadInt32(&loads) == 0 {
-		t.Fatal("expected the fence to attempt the session load")
+		t.Fatal("expected the claimant to attempt an acceptance-fact read")
 	}
 
-	// Clear the seam: the real load finds no session record (absent) => proceed, so
-	// the deferred Will now fires (never lost).
-	setWillSessionLoadHook(asm, nil)
+	// Clear the seam: the real walk finds no qualifying acceptance => publish, so the
+	// deferred Will now fires (never lost).
+	asm.mu.Lock()
+	asm.testFactLoad = nil
+	asm.mu.Unlock()
 	testMQTTReadPublishV5(t, rs, "will/fild", []byte("later"))
 }
 
@@ -853,12 +866,11 @@ func TestMQTTWillOutboxEnqueueAckDelayedNoCancelWhilePublishing(t *testing.T) {
 
 	asm := testMQTTGetGlobalASM(t, s)
 
-	// Make the fence WANT to cancel, so the test proves the state guard (not the
-	// fence) is what protects the publishing record.
-	setWillSessionLoadHook(asm, func(cidHash string) (*mqttPersistedSession, uint64, error) {
-		return &mqttPersistedSession{DisconnectedAt: 0}, 1 << 30, nil
-	})
-	defer setWillSessionLoadHook(asm, nil)
+	// Make the early cancel WANT to cancel — a qualifying acceptance of this exact
+	// client, dated before the Will falls due — so the test proves the STATE GUARD,
+	// not the absence of evidence, is what protects the publishing record.
+	testSessStreamFloor(t, asm)
+	testPlantAcceptFact(t, asm, "eadpub", time.Now().Add(-time.Hour).UnixNano())
 
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "eadsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cs.Close()
@@ -1069,22 +1081,6 @@ func setWillEnqueueStoreHook(asm *mqttAccountSessionManager, fn func(subject str
 func setWillFinalizeStoreHook(asm *mqttAccountSessionManager, fn func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)) {
 	asm.mu.Lock()
 	asm.testFinalizeStore = fn
-	asm.mu.Unlock()
-}
-
-// setWillSessionLoadHook installs (or clears) the instance-scoped session-load
-// seam used by the takeover fence on asm.
-func setWillSessionLoadHook(asm *mqttAccountSessionManager, fn func(cidHash string) (*mqttPersistedSession, uint64, error)) {
-	asm.mu.Lock()
-	asm.testSessionLoad = fn
-	asm.mu.Unlock()
-}
-
-// setWillCancelDoneHook installs (or clears) the instance-scoped observer invoked
-// after each cancelWillOutbox pass on asm.
-func setWillCancelDoneHook(asm *mqttAccountSessionManager, fn func()) {
-	asm.mu.Lock()
-	asm.testCancelWillDone = fn
 	asm.mu.Unlock()
 }
 
@@ -1471,10 +1467,12 @@ func TestMQTTWillOutboxTimerReconnectCancels(t *testing.T) {
 // The delay here must be long enough that the timer cannot possibly self-release
 // by firing; otherwise the assertion cannot tell "released on cancel" from
 // "released when it fired", which is exactly the trap the short-delay
-// cancellation test above falls into.
+// cancellation test above falls into. A 300-second delay does that on its own, so
+// the claim interval is left at its normal value — deliberately, because the claim
+// pass is now WHAT RELEASES the timer: the reconnect writes an acceptance fact and
+// the next pass's early-cancellation phase suppresses the not-yet-due Will and
+// releases its timer. A long interval would only be testing the clock.
 func TestMQTTWillOutboxTimerReleasedOnCancel(t *testing.T) {
-	withLongWillScan(t)
-
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1492,8 +1490,8 @@ func TestMQTTWillOutboxTimerReleasedOnCancel(t *testing.T) {
 		return nil
 	})
 
-	// Reconnect cancels the record. With a 300s delay the timer cannot fire, so
-	// the only way the count reaches zero is the cancel path releasing it.
+	// The reconnect records its acceptance. With a 300s delay the timer cannot fire,
+	// so the only way the count reaches zero is a suppression path releasing it.
 	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "relpub", cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
 	defer cw2.Close()
@@ -1566,7 +1564,7 @@ func TestMQTTWillOutboxTimerOnCancelledRecord(t *testing.T) {
 
 	// Cancel the record durably WITHOUT going through cancelWillOutbox, so
 	// cancelWillTimer is never called and the timer stays armed.
-	rec.State = mqttWillCancelled
+	testLicenseWill(rec, mqttWillCancelled, mqttWillDecisionCancel, 1)
 	if _, err := asm.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {
 		t.Fatalf("direct cancel CAS: %v", err)
 	}
@@ -1600,9 +1598,12 @@ func TestMQTTWillOutboxTimerOnCancelledRecord(t *testing.T) {
 //
 // The reap is simulated by deleting the record outright, which is what the claim
 // loop does to a terminal record.
+//
+// The claim interval is left at its normal value: the captured sweep runs at the end
+// of a conclusively completed pass, so suppressing the pass would suppress the very
+// mechanism under test. The 300-second delay is what keeps the timer from
+// self-releasing.
 func TestMQTTWillOutboxTimerReleasedWhenRecordReaped(t *testing.T) {
-	withLongWillScan(t)
-
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1634,21 +1635,18 @@ func TestMQTTWillOutboxTimerReleasedWhenRecordReaped(t *testing.T) {
 		return nil
 	})
 
-	// Reap the record before any cancellation scan can observe it.
+	// Reap the record, modelling a PEER that cancelled and reaped it before this
+	// broker's own pass could observe the subject. This broker's per-record release
+	// can never fire for it again: timers are keyed by exact subject and the walk
+	// will never return one.
 	if err := asm.jsa.deleteMsg(mqttWillQStreamName, recSeq, true); err != nil {
 		t.Fatalf("reap record: %v", err)
 	}
 	if n := testWillTimerCount(s); n != 1 {
-		t.Fatalf("timer count = %d before the cancel scan, want 1", n)
+		t.Fatalf("timer count = %d before the sweep, want 1", n)
 	}
 
-	// The reconnect's cancellation scan now finds nothing at all.
-	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "reappub", cleanStart: false,
-		props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
-	defer cw2.Close()
-	testMQTTReadConnAckV5(t, rw2)
-
-	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+	checkFor(t, 15*time.Second, 25*time.Millisecond, func() error {
 		if n := testWillTimerCount(s); n != 0 {
 			return fmt.Errorf("%d fire timer(s) retained after the record was reaped; the completed scan never saw the subject, so only the captured sweep can release it", n)
 		}
@@ -1738,7 +1736,8 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 	testMQTTReadConnAckV5(t, r)
 	asm := testMQTTGetAccountSessionManager(t, s, "aecsub")
 
-	cidHash := getHash("aec-pub")
+	const clientID = "aec-pub"
+	cidHash := getHash(clientID)
 	subject := mqttWillQSubject(asm.domainTk, cidHash, "aec-wid")
 	// A valid epoch from a DIFFERENT incarnation than the account's, so the
 	// watermark path below decides cancel.
@@ -1746,7 +1745,7 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 
 	// Seed a pending record far in the future and keep its sequence.
 	pending := &mqttWillOutbox{
-		WillID: "aec-wid", ClientIDHash: cidHash, Gen: mqttNewSessGen(), Topic: "will/aec", Msg: []byte("x"), QoS: 0,
+		WillID: "aec-wid", ClientIDHash: cidHash, ClientID: clientID, Gen: mqttNewSessGen(), Topic: "will/aec", Msg: []byte("x"), QoS: 0,
 		FireAt: time.Now().Add(time.Hour).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: originEpoch,
 	}
@@ -1770,12 +1769,11 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 		t.Fatalf("advance record to publishing: %v", err)
 	}
 
-	// Force the takeover fence to decide cancel: a valid watermark whose epoch
-	// differs from the record's origin epoch is a different incarnation.
-	setWillCancelWatermarkLoadHook(asm, func(string) (*mqttWillCancelWatermark, uint64, mqttWillCancelStatus) {
-		return &mqttWillCancelWatermark{ClientIDHash: cidHash, SessionSeq: 1, SessEpoch: asm.sessStreamEpoch}, 1, mqttWillCancelValid
-	})
-	defer setWillCancelWatermarkLoadHook(asm, nil)
+	// Give the early cancel something to decide on: an acceptance of this exact
+	// client, dated before the Will falls due. The Will's origin is from a DIFFERENT
+	// incarnation, so the sequence comparison does not apply and a current-incarnation
+	// acceptance supersedes it outright.
+	testPlantAcceptFact(t, asm, clientID, pending.FireAt-int64(time.Minute))
 
 	// Early-cancel with the stale sequence: the CAS loses, and the re-read sees
 	// publishing. The record is no longer this broker's to fire, so the timer
@@ -1794,91 +1792,5 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 	}
 	if cur.State != mqttWillPublishing {
 		t.Errorf("record state = %q, want publishing: the stale CAS must not have overwritten a claimed record", cur.State)
-	}
-}
-
-// TestMQTTWillOutboxDisplacedCancelIsGenerationScoped: the displaced-broker
-// cancel must only cancel the Wills its own evicted incarnation enqueued.
-//
-// Regression (a cross-incarnation data loss in the same class as the late-delete
-// race that generations exist to close): the displaced broker's cancel is
-// dispatched asynchronously from mqttHandleRemoteSessionPersist, so it can land
-// after the client has reconnected on another broker and disconnected again with a
-// NEW delayed Will. An unscoped cancel then destroys that Will, and nothing
-// recovers it — the reconnect watermark sits BELOW its origin sequence, so the
-// claimant fence lets it fire, but there is no longer a pending record to fire.
-//
-// The reconnect cancel on the CONNECT path stays deliberately unscoped, which the
-// second half asserts: a reconnect supersedes every earlier incarnation.
-func TestMQTTWillOutboxDisplacedCancelIsGenerationScoped(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	nc, _ := testMQTTConnect(t, &mqttConnInfo{clientID: "genscope", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
-	defer nc.Close()
-	asm := testMQTTGetGlobalASM(t, s)
-
-	cidHash := getHash("genscope")
-	retiredGen, freshGen := mqttNewSessGen(), mqttNewSessGen()
-
-	// Two pending records for the same client, from two incarnations. FireAt is far
-	// out so no claim loop resolves them underneath the test.
-	fireAt := time.Now().Add(time.Hour).UnixNano()
-	enqueue := func(gen string, originSeq uint64) string {
-		t.Helper()
-		willID := nuid.Next()
-		subject := mqttWillQSubject(asm.domainTk, cidHash, willID)
-		rec := &mqttWillOutbox{
-			WillID: willID, ClientIDHash: cidHash, Gen: gen,
-			Topic: "will/genscope", Msg: []byte(gen), FireAt: fireAt,
-			State: mqttWillPending, OriginSessionSeq: originSeq, OriginSessEpoch: asm.sessStreamEpoch,
-		}
-		if _, err := asm.jsa.storeWillOutboxCAS(subject, 0, rec); err != nil {
-			t.Fatalf("enqueue pending record for generation %q: %v", gen, err)
-		}
-		return subject
-	}
-	const displacedSeq = uint64(10)
-	retiredSubject, freshSubject := enqueue(retiredGen, displacedSeq), enqueue(freshGen, displacedSeq)
-	// The case a generation-only scope cannot see: the SAME session resumed on
-	// another broker, disconnected again, and enqueued a new Will. A persistent
-	// session keeps its incarnation across reconnects, so this record carries the
-	// retired generation too — only its origin sequence, advanced past the
-	// displaced broker's view by the resuming broker's own takeover save,
-	// distinguishes it.
-	resumedSubject := enqueue(retiredGen, displacedSeq+1)
-
-	stateOf := func(subject string) mqttWillState {
-		t.Helper()
-		rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject)
-		if err != nil || rec == nil {
-			t.Fatalf("reload %q: rec=%v err=%v", subject, rec, err)
-		}
-		return rec.State
-	}
-
-	// The displaced broker's late cancel, scoped to the connection it evicted.
-	if err := asm.cancelWillOutboxForIncarnation(s, cidHash, retiredGen, displacedSeq); err != nil {
-		t.Fatalf("cancelWillOutboxForIncarnation: %v", err)
-	}
-	if got := stateOf(retiredSubject); got != mqttWillCancelled {
-		t.Errorf("retired incarnation's Will state = %q, want cancelled", got)
-	}
-	if got := stateOf(freshSubject); got != mqttWillPending {
-		t.Errorf("later incarnation's Will state = %q, want pending: a displaced broker's cancel destroyed a Will it does not own", got)
-	}
-	if got := stateOf(resumedSubject); got != mqttWillPending {
-		t.Errorf("resumed connection's Will state = %q, want pending: the same session keeps its generation across a reconnect, "+
-			"so a generation-only scope destroys a Will enqueued after the displacement", got)
-	}
-
-	// A reconnect, by contrast, supersedes every incarnation.
-	if err := asm.cancelWillOutbox(s, cidHash); err != nil {
-		t.Fatalf("cancelWillOutbox: %v", err)
-	}
-	if got := stateOf(freshSubject); got != mqttWillCancelled {
-		t.Errorf("later incarnation's Will state = %q after an unscoped reconnect cancel, want cancelled", got)
 	}
 }

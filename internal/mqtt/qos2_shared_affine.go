@@ -773,7 +773,7 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttQoS2AssignStreamSubjectPrefix+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttQoS2AssignStreamSubjectPrefix + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != LimitsPolicy {
@@ -837,7 +837,7 @@ func validateOutStream(si *StreamInfo, wantReplicas, maxAckPending int) error {
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttOutSubjectPrefix+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttOutSubjectPrefix + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != InterestPolicy {

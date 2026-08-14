@@ -1,4 +1,10 @@
-//go:build mqttport_fulltests
+// $MQTT_sess incarnation-epoch resolution at account-manager initialization.
+//
+// The epoch is stamped into the stream metadata by whichever broker wins the
+// create, and every broker — the winner included — adopts it from the
+// authoritative re-read rather than from the config it proposed. It is the
+// identity that makes a session SEQUENCE comparable, so a broker that resolved the
+// wrong one, or none, must not serve CONNECTs at all.
 
 package mqtt
 
@@ -67,7 +73,7 @@ func TestSessionManagerEpochResolution(t *testing.T) {
 	if got := si.CachedInfo().Config.Metadata[mqttSessEpochMetaKey]; got != asm.sessStreamEpoch {
 		t.Fatalf("stream metadata epoch %q != resolved %q", got, asm.sessStreamEpoch)
 	}
-	if _, err := js.Stream(ctx, mqttWillCancelStreamName); err != nil {
+	if _, err := js.Stream(ctx, mqttTeardownStreamName); err != nil {
 		t.Fatalf("will-cancel stream must exist: %v", err)
 	}
 
@@ -94,12 +100,16 @@ func TestSessionManagerEpochCreateRaceAdoptsWinner(t *testing.T) {
 	// metadata key the manager must preserve.
 	winnerEpoch := mqttGenSessEpoch()
 	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
-		Name:              mqttSessStreamName,
-		Subjects:          []string{mqttSessStreamSubjectPrefix + ">"},
-		Storage:           jetstream.FileStorage,
-		Retention:         jetstream.LimitsPolicy,
-		MaxMsgsPerSubject: 1,
-		Metadata:          map[string]string{mqttSessEpochMetaKey: winnerEpoch, "unrelated_key": "keepme"},
+		Name: mqttSessStreamName,
+		Subjects: []string{
+			mqttSessStreamSubjectPrefix + ">",
+			mqttAcceptSubjectPrefix + ">",
+		},
+		Storage:            jetstream.FileStorage,
+		Retention:          jetstream.LimitsPolicy,
+		MaxMsgsPerSubject:  1,
+		AllowAtomicPublish: true,
+		Metadata:           map[string]string{mqttSessEpochMetaKey: winnerEpoch, "unrelated_key": "keepme"},
 	}); err != nil {
 		t.Fatalf("pre-create winner session stream: %v", err)
 	}
@@ -294,56 +304,3 @@ func TestSessionManagerEpochMissingFailsInit(t *testing.T) {
 // TestSessionManagerWillCancelStreamValidation (plan test 15): a pre-existing
 // $MQTT_willcancel with an incompatible configuration fails manager initialization
 // with recreate guidance rather than being mutated in place.
-func TestSessionManagerWillCancelStreamValidation(t *testing.T) {
-	t.Parallel()
-	base := func() jetstream.StreamConfig {
-		return jetstream.StreamConfig{
-			Name:              mqttWillCancelStreamName,
-			Subjects:          []string{mqttWillCancelSubjectPrefix + ">"},
-			Storage:           jetstream.FileStorage,
-			Retention:         jetstream.LimitsPolicy,
-			Discard:           jetstream.DiscardOld,
-			MaxMsgsPerSubject: 1,
-		}
-	}
-	for _, tc := range []struct {
-		name   string
-		mutate func(cfg *jetstream.StreamConfig)
-	}{
-		{"maxage", func(cfg *jetstream.StreamConfig) { cfg.MaxAge = time.Hour }},
-		{"maxmsgs", func(cfg *jetstream.StreamConfig) { cfg.MaxMsgs = 1000 }},
-		{"maxbytes", func(cfg *jetstream.StreamConfig) { cfg.MaxBytes = 1 << 20 }},
-		{"discardnew", func(cfg *jetstream.StreamConfig) { cfg.Discard = jetstream.DiscardNew }},
-		{"maxmsgsper", func(cfg *jetstream.StreamConfig) { cfg.MaxMsgsPerSubject = 5 }},
-		{"wrongsubject", func(cfg *jetstream.StreamConfig) { cfg.Subjects = []string{"bogus.>"} }},
-		{"memstorage", func(cfg *jetstream.StreamConfig) { cfg.Storage = jetstream.MemoryStorage }},
-		{"interestretention", func(cfg *jetstream.StreamConfig) {
-			cfg.Retention = jetstream.InterestPolicy
-			cfg.MaxMsgsPerSubject = -1 // interest streams reject a positive per-subject cap
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, c, nc := newBringUpServer(t)
-			js, ctx := newJS(t, nc)
-			cfg := base()
-			tc.mutate(&cfg)
-			if _, err := js.CreateStream(ctx, cfg); err != nil {
-				t.Fatalf("pre-create incompatible will-cancel stream: %v", err)
-			}
-			_, err := s.getOrCreateMQTTAccountSessionManager(c)
-			if err == nil {
-				t.Fatalf("expected manager init to fail on incompatible $MQTT_willcancel (%s)", tc.name)
-			}
-			if !strings.Contains(err.Error(), "recreate") {
-				t.Fatalf("error must guide recreation, got: %v", err)
-			}
-			// The recovery must be the COUPLED one: recreating the marker stream
-			// alone discards permanent takeover-suppression watermarks
-			// (docs/ARCHITECTURE.md, "Operational constraints for the marker").
-			if !strings.Contains(err.Error(), mqttSessStreamName) || !strings.Contains(err.Error(), "one logical unit") {
-				t.Fatalf("error must direct recreating %s together with %s as one logical unit, got: %v",
-					mqttWillCancelStreamName, mqttSessStreamName, err)
-			}
-		})
-	}
-}

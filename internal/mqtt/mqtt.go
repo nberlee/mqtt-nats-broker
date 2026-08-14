@@ -212,6 +212,15 @@ const (
 	mqttSessStreamName          = "$MQTT_sess"
 	mqttSessStreamSubjectPrefix = mqttPrefix + "sess."
 
+	// Subject prefix for the permanent per-CONNECT acceptance facts, carried on
+	// the SAME stream as the session records so an accepted CONNECT can commit
+	// both in one atomic batch. It is a separate TOP-LEVEL prefix, never a nesting
+	// under "sess.", because every session walk in this package filters
+	// "sess.<domainTk>>" and decodes what it gets as a session record.
+	// One subject per acceptance: <prefix><domainTk><cidHash>.<epoch>.<acceptID>.
+	// See sess_accept_fact.go.
+	mqttAcceptSubjectPrefix = mqttPrefix + "accept."
+
 	// Stream name and subject prefix for the delayed-Will durable outbox
 	// (Layer 2). One subject per Will event: <prefix><domainTk><cidHash>.<willID>,
 	// MaxMsgsPer:1, so each generation is an independent CAS target and an
@@ -219,16 +228,6 @@ const (
 	// will_outbox.go.
 	mqttWillQStreamName    = "$MQTT_willq"
 	mqttWillQSubjectPrefix = mqttPrefix + "willq."
-
-	// Stream name and subject prefix for the durable per-client delayed-Will
-	// cancellation watermark (one subject per client, MaxMsgsPer:1, permanent
-	// retention). A CONNECT-accept advances the client's watermark to its session
-	// save sequence; the takeover fence suppresses any older-generation Will whose
-	// origin sequence is below it, even after the session record is gone. Kept on a
-	// dedicated stream so the willq claim/cancel scans are not slowed by permanent
-	// per-client markers. See will_outbox.go.
-	mqttWillCancelStreamName    = "$MQTT_willcancel"
-	mqttWillCancelSubjectPrefix = mqttPrefix + "willcancel."
 
 	// Stream name and subject prefix for the durable per-client GENERATION
 	// RETIREMENT watermark (one subject per client, MaxMsgsPer:1, permanent
@@ -830,6 +829,31 @@ type mqttAccountSessionManager struct {
 	// distinct refused subjects, and never cleared because a refused record is
 	// permanent until an operator removes it. See refuseWillOutboxRecord.
 	refusedWillRecords map[string]struct{}
+	// refusedAcceptFacts is the same set for CONNECT acceptance facts this broker
+	// cannot interpret. Same reasons and the same bound, and one more of its own:
+	// an acceptance fact is never rewritten (its subject is unique) and never
+	// deleted (facts are permanent), so nothing but an operator ever clears one.
+	// Guarded by mu. See refuseAcceptFact.
+	refusedAcceptFacts map[string]struct{}
+	// willAheadCursor is where the next early-cancellation phase resumes in this
+	// account's not-yet-due pending Wills. The phase is budgeted, so without a cursor
+	// a large enough backlog would re-examine the same first records every pass and
+	// never reach the rest. Guarded by mu. See cancelSupersededAhead.
+	willAheadCursor int
+	// testClaimLease overrides the delayed-Will publish lease for THIS account
+	// manager only (instance-scoped, 0 = the package default). Set/read under mu.
+	// It exists because the package variable is read by every live claim loop on its
+	// own goroutine: a test that assigned it would be racing them, not configuring
+	// itself. The renewal cadence and the scan budget are derived from whatever this
+	// resolves to. Zero in production. See claimLease.
+	testClaimLease time.Duration
+
+	// testClaimStop, when non-nil, replaces the stop channels a claimant's fact scan
+	// watches, for THIS account manager only (instance-scoped). Set/read under mu. A
+	// test that quiets this account's background claim loop by closing the server's
+	// willClaimStopCh supplies an EMPTY set here, so the claimant it drives directly
+	// still runs. Nil in production. See claimStopChans.
+	testClaimStop *[]<-chan struct{}
 	// forkedGrants holds, per MQTT client ID, the grant a PROVEN session-record fork
 	// erased, waiting for that client's own reconnect to re-assert it through the ordinary
 	// accept save. Guarded by mu, bounded by mqttForkedGrantMax, and memory-only: a restart
@@ -844,11 +868,11 @@ type mqttAccountSessionManager struct {
 
 	// sessStreamEpoch is the $MQTT_sess incarnation identity resolved once at
 	// account-manager init from the stream's mqtt_sess_epoch metadata (form
-	// "nuid:<NUID>"). It stamps every watermark (SessEpoch) and native Will record
-	// (OriginSessEpoch); a sequence is only comparable across the two when the
-	// epochs are equal. Immutable after init (read without lock). If a valid epoch
-	// cannot be resolved, the account manager is not published. See
-	// validateSessStream, willTakeoverFence.
+	// "nuid:<NUID>"). It stamps every acceptance fact (SessEpoch), every retirement
+	// watermark and every native Will record (OriginSessEpoch); a sequence is only
+	// comparable across them when the epochs are equal. Immutable after init (read
+	// without lock). If a valid epoch cannot be resolved, the account manager is not
+	// published. See validateSessStream, sess_accept_fact.go.
 	sessStreamEpoch string
 
 	// originStreamEpoch is the $MQTT_origin incarnation identity resolved once at
@@ -874,26 +898,40 @@ type mqttAccountSessionManager struct {
 	// production. See storeWillEnqueueCAS / enqueueDelayedWill.
 	testEnqueueStore func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)
 
+	// testClaimStore, when non-nil, replaces the claim / renewal / licensing CAS for
+	// THIS account manager only (instance-scoped). Set/read under mu. It is the seam
+	// the renewal and licensing tests need in both directions: to fail a renewal
+	// mid-scan, and to COUNT licensing attempts — "the claimant did not publish" is
+	// also what a stale final CAS produces, so only the attempt count discriminates.
+	// Nil in production. See storeWillClaimCAS.
+	testClaimStore func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)
+
 	// testFinalizeStore, when non-nil, replaces the terminal publishing->done CAS
 	// store for THIS account manager only (instance-scoped). Set/read under mu.
 	// Used to fail or ambiguate the terminal commit and verify the finalizer's
 	// re-read/reconcile path. Nil in production. See finalizeWillPublish.
 	testFinalizeStore func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error)
 
-	// testSessionLoad, when non-nil, replaces the session-record load used by the
-	// delayed-Will takeover fence for THIS account manager only (instance-scoped).
-	// Set/read under mu. Used to drive the fence decision (a connected/disconnected
-	// newer generation) and to inject a load error so the fence defers on an
+	// testSessionLoad, when non-nil, replaces the point session-record load used by
+	// the orphan QoS 2 sweep and the shared-affine record refusal for THIS account
+	// manager only (instance-scoped). Set/read under mu. Used to drive a decision on
+	// a synthesized record and to inject a load error so the caller defers on an
 	// indeterminate read. Nil in production. See loadFenceSession.
 	testSessionLoad func(cidHash string) (*mqttPersistedSession, uint64, error)
 
-	// testCancelWillDone, when non-nil, is invoked after each cancelWillOutbox pass
-	// for THIS account manager only (instance-scoped). Set/read under mu. Lets the
-	// takeover late-enqueue test wait until the displaced broker's asynchronous
-	// cancel scan (the session-record watch's observation) has completed on the still-empty outbox
-	// before releasing the blocked enqueue, so a stray old cancel cannot be mistaken
-	// for the new enqueue-side fence. Nil in production.
-	testCancelWillDone func()
+	// testFactLoad, when non-nil, replaces the acceptance-fact walk's point read for
+	// THIS account manager only (instance-scoped). Set/read under mu. It is both a
+	// gate and a COUNTER, and the counting is the load-bearing half: a claimant that
+	// reused a persisted decision and one that rescanned and found nothing produce
+	// the same publication, so the only discriminating assertion is that no fact was
+	// loaded at all. Nil in production. See loadNextAcceptFact.
+	testFactLoad func(filter string, seq uint64) (*StoredMsg, error)
+
+	// testSessLastSeq, when non-nil, replaces the $MQTT_sess last-sequence sample
+	// that becomes a decision's cutoff, for THIS account manager only
+	// (instance-scoped). Set/read under mu. Used to stage a claimant scanning under
+	// an older cutoff than a peer's. Nil in production. See sessLastSeq.
+	testSessLastSeq func() (uint64, error)
 
 	// testBeforeTeardownLock, when non-nil, is invoked by mqttHandleClosedClient for
 	// THIS account manager only (instance-scoped) after the closing connection has
@@ -998,15 +1036,6 @@ type mqttAccountSessionManager struct {
 	// mu; false in production.
 	testSessRecordBackstopOff bool
 
-	// testCancelWatermarkLoad / testCancelWatermarkStore, when non-nil, replace the
-	// per-client cancel-watermark load / CAS store for THIS account manager only
-	// (instance-scoped). Set/read under mu. Used to drive the takeover fence off a
-	// planted/stale/corrupt watermark and to fail the CONNECT-side advance so the
-	// gating and failure transaction are exercised. Nil in production. See
-	// loadWillCancelWatermark / storeWillCancelWatermarkCAS.
-	testCancelWatermarkLoad  func(cidHash string) (*mqttWillCancelWatermark, uint64, mqttWillCancelStatus)
-	testCancelWatermarkStore func(subject string, expectSeq uint64, wm *mqttWillCancelWatermark) (uint64, error)
-
 	// testQoS2HoldStore / testQoS2FinalizeStore / testQoS2Load, when non-nil,
 	// replace the inbound QoS 2 move protocol's create-only hold CAS, its terminal
 	// held->delivered CAS, and its classified record load, for THIS account manager
@@ -1086,23 +1115,6 @@ type mqttAccountSessionManager struct {
 	// but the claim does not yet authorize delivery — the window the delivery gate
 	// exists for. A returned error abandons the transition. Nil in production.
 	testQ2AffPreMaterialize func(claimSubject string, seq uint64) error
-
-	// testRollbackSessionStore / testRollbackSessionLoad, when non-nil, replace the
-	// session-record CAS store / load used ONLY by the CONNECT-accept watermark
-	// failure transaction (instance-scoped). Set/read under mu. Routed only through
-	// the rollback path so a test can fail the rollback (and its confirming re-read)
-	// without perturbing the initial es.save() or unrelated fence loads, exercising
-	// the rollbackIndeterminate classification. Nil in production. See
-	// rollbackAcceptedSession.
-	testRollbackSessionStore func(ps *mqttPersistedSession, idHash string, seq uint64) error
-	testRollbackSessionLoad  func(cidHash string) (*mqttPersistedSession, uint64, error)
-
-	// testRollbackDone, when non-nil, is invoked at the end of the CONNECT-accept
-	// watermark-failure transaction with the detached session and its classified
-	// result, so a test can assert the unconditional guarantees (es.c == nil, the
-	// result classification) precisely. Instance-scoped, set/read under mu, nil in
-	// production. See rollbackAcceptedSession.
-	testRollbackDone func(es *mqttSession, result rollbackResult)
 
 	// Seams for the outbound in-flight register (inflight_register.go),
 	// instance-scoped and set/read under mu. Routed only through the register's own
@@ -1665,11 +1677,14 @@ type mqttSession struct {
 	// each CONNECT and possibly overridden by a v5 DISCONNECT. Spec5 [3.1.2.11.2].
 	expiryInterval uint32
 	// disconnectedAt is the Unix time the client disconnected (0 while connected).
-	// Persisted so a finite deadline survives a restart — but it is stamped for a
-	// NEVER-EXPIRING session too, because the delayed-Will record fence reads a newer
-	// record with DisconnectedAt == 0 as a live newer connection and would cancel a Will
-	// that session is owed. It is inert for every expiry reader: each pre-filters on
-	// mqttSessionNeverExpire before looking at it. See sessionRecordFence.
+	// Persisted so a finite deadline survives a restart. It is stamped for a
+	// NEVER-EXPIRING session too, which was a delayed-Will fix: a record fence read a
+	// newer record with DisconnectedAt == 0 as a live newer connection and cancelled a
+	// Will that session was owed. THAT FENCE IS GONE — suppression is decided from the
+	// permanent acceptance facts and reads no session record — so on a never-expiring
+	// session the stamp is currently inert, every remaining reader being an expiry path
+	// that pre-filters on mqttSessionNeverExpire. Retained rather than removed; see
+	// docs/CONFORMANCE.md, which says so rather than restating the old rationale.
 	disconnectedAt int64
 	domainTk       string
 
@@ -3893,6 +3908,26 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	if mqttJSAPITimeout == 0 {
 		mqttJSAPITimeout = mqttDefaultJSAPITimeout
 	}
+	// The delayed-Will claim protocol depends on no single request being able to consume
+	// a whole ownership window: the publish worker deliberately does not renew, so a
+	// request timeout at or above the lease lets a licensing ack arrive after a peer
+	// has already reclaimed the expired record and published it — a duplicate Will
+	// with no crash anywhere. It does NOT follow that a request fits the lease REMAINING
+	// once licensing has been acknowledged; that overrun is a disclosed residual, and
+	// mqttWillTimingInvariant says so. Checked against the DEFAULT lease, not the effective
+	// one: tests shorten the lease per-manager, and a two-second lease against the
+	// five-second default timeout is their intent rather than a misconfiguration.
+	// Enforced here rather than asserted in a test, because the timeout is an option
+	// and an operator can set it.
+	// Every input but the timeout is a DEFAULT: the timeout is the only one an
+	// operator can set, and the defaults are known consistent among themselves (a
+	// unit test asserts that). Mixing a default lease with the LIVE interval would
+	// compare two worlds — tests retune the interval and lease together, and a
+	// 30s interval under a 60s lease is safe on its own terms while failing against
+	// the 30s default.
+	if verr := mqttWillTimingInvariant(mqttWillDefaultClaimLease, mqttWillDefaultClaimInterval, mqttJSAPITimeout); verr != nil {
+		return nil, fmt.Errorf("MQTT delayed-Will timing is unsafe for account %q: %w", accName, verr)
+	}
 
 	replicas := opts.MQTT.StreamReplicas
 	if replicas <= 0 {
@@ -4258,6 +4293,81 @@ func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects 
 				return responses, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs))
 			}
 		}
+	}
+}
+
+// mqttBatchMsg is one message of an atomic batch: a subject and the already-framed
+// bytes (batch headers, per-subject CAS header, body) with the header length the
+// send loop needs.
+type mqttBatchMsg struct {
+	subj string
+	hdr  int
+	msg  []byte
+}
+
+// newAtomicBatchRequest sends msgs as ONE JetStream atomic batch and waits for the
+// COMMIT's PubAck. Every message must already carry its batch headers; the last one
+// must carry the commit header, and the caller owns that framing.
+//
+// Exactly one reply subject is registered, and it goes on the commit message alone.
+// That is not tidiness: JetStream answers a NON-commit message that carries a reply
+// with an empty ack the moment it is staged (server/stream.go, the !commit arm), so
+// a reply on the staged message would consume the correlation entry and the real
+// commit PubAck would arrive with nowhere to go. The staged message therefore goes
+// out with an empty reply, and the price is that a failure DURING staging is
+// reported to nobody and surfaces here as a timeout — an ambiguity the caller's
+// paired readback already has to resolve, since a lost response is ambiguous
+// whether one message or two produced it.
+//
+// The batch id must be fresh per attempt. Reusing one while a batch is still staged
+// creates a sequence gap on the server's staging store, which abandons the batch.
+func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatchMsg) (any, error) {
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("unreachable: an atomic batch with no messages")
+	}
+	var sb strings.Builder
+	jsa.mu.Lock()
+	uid := jsa.nuid.Next()
+	sb.WriteString(jsa.rplyr)
+	jsa.mu.Unlock()
+	sb.WriteString(kind)
+	sb.WriteByte(btsep)
+	if cidHash != _EMPTY_ {
+		sb.WriteString(cidHash)
+		sb.WriteByte(btsep)
+	}
+	sb.WriteString(uid)
+	reply := sb.String()
+
+	responseCh := make(chan *mqttJSAResponse, 1)
+	jsa.replies.Store(reply, responseCh)
+
+	for i, m := range msgs {
+		r := _EMPTY_
+		if i == len(msgs)-1 {
+			r = reply
+		}
+		jsa.sendq.push(&mqttJSPubMsg{
+			subj:  jsa.prefixDomain(m.subj),
+			reply: r,
+			hdr:   m.hdr,
+			msg:   m.msg,
+		})
+	}
+
+	start := time.Now()
+	t := time.NewTimer(jsa.timeout)
+	defer t.Stop()
+	select {
+	case resp := <-responseCh:
+		return resp.value, nil
+	case <-jsa.quitCh:
+		jsa.replies.Delete(reply)
+		return nil, ErrServerNotRunning
+	case <-t.C:
+		jsa.replies.Delete(reply)
+		return nil, fmt.Errorf("timeout after %v: atomic batch request type %q on %q (reply=%q)",
+			time.Since(start), kind, msgs[len(msgs)-1].subj, reply)
 	}
 }
 
@@ -4659,6 +4769,52 @@ func (jsa *mqttJSA) storeSessionMsg(domainTk, cidHash string, hdr int, msg []byt
 	}
 	smr := smri.(*JSPubAckResponse)
 	return smr, smr.ToError()
+}
+
+// storeAcceptBatch commits an accepted CONNECT's permanent acceptance fact and its
+// session record in one atomic batch on $MQTT_sess, and returns the COMMIT's PubAck
+// — whose sequence is the SESSION RECORD's, because the reply rides the commit
+// entry and the session record is the message that carries it.
+//
+// The fact is staged first and the record commits. Both halves of that ordering are
+// load-bearing: the ack then names the record (the sequence the session adopts), and
+// the fact sorts strictly below the record of the connection that wrote it, so a
+// connection can never suppress its own delayed Will.
+//
+// Both session-store test seams are honored here rather than in storeSessionMsg,
+// because an accepted CONNECT no longer passes through it: mqttTestSessStoreSuppressV
+// is the "issued but did not land" half of ambiguity (nothing reaches the stream) and
+// mqttTestSessStoreResultHookV is the other half, and it must mean the WHOLE batch's
+// commit result — including a re-attempt's — or a test could suppress one message of
+// an indivisible pair.
+func (jsa *mqttJSA) storeAcceptBatch(domainTk, cidHash, batchID string, fact, record mqttBatchMsg) (*JSPubAckResponse, error) {
+	if mqttTestSessStoreSuppressV.Load() {
+		return nil, errors.New("mqtt test: session record store suppressed")
+	}
+	bi, err := jsa.newAtomicBatchRequest(mqttJSASessPersist, cidHash, []mqttBatchMsg{fact, record})
+	if err != nil {
+		return nil, err
+	}
+	smr := bi.(*JSPubAckResponse)
+	if aerr := smr.ToError(); aerr != nil {
+		return smr, aerr
+	}
+	// Validated HERE, once, so the initial send and every ambiguity re-attempt are
+	// held to the same proof. A success that is not bound to the batch this call sent
+	// is not evidence about it: the caller adopts resp.Sequence as the SESSION
+	// RECORD's, which is only true of an acknowledgement naming this batch and both
+	// of its messages.
+	if smr.PubAck == nil {
+		return smr, fmt.Errorf("the acceptance batch was acknowledged with no publish acknowledgement")
+	}
+	if smr.BatchId != batchID || smr.BatchSize != mqttAcceptBatchSize {
+		return smr, fmt.Errorf("the acceptance batch was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
+			smr.BatchSize, smr.BatchId, mqttAcceptBatchSize, batchID)
+	}
+	if smr.Stream != mqttSessStreamName {
+		return smr, fmt.Errorf("the acceptance batch was acknowledged on stream %q (want %q)", smr.Stream, mqttSessStreamName)
+	}
+	return smr, nil
 }
 
 func (jsa *mqttJSA) loadSessionMsg(domainTk, cidHash string) (*StoredMsg, error) {
@@ -5304,17 +5460,17 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 				d.ec.mqttNotifyDisplaced(d.voc)
 				go d.ec.closeConnection(d.voc.closeReason)
 			}
-			if !d.forked {
-				// Cancel any delayed Will the displaced incarnation enqueued —
-				// on the TAKEOVER verdict only. A forked verdict proved nothing
-				// arbitrated a session continuation, so this path must not
-				// destroy the durable outbox record; the fire-time fences still
-				// decide its fate. Inline: this goroutine is already off the
-				// delivery path and admitted/tracked, and running it before the
-				// completion seam is what lets tests assert the record's final
-				// state. Spec5 [MQTT-3.1.2-8].
-				_ = as.cancelWillOutboxForIncarnation(s, cIDHash, d.displacedGen, d.displacedSeq)
-			}
+			// No delayed-Will cancel here any more, on either verdict. The
+			// displaced incarnation's Will is decided where every other one is:
+			// by the claimant, when it becomes due, against the permanent
+			// acceptance facts. A cancel issued here could only say "somebody
+			// reconnected", which is not the question — a reconnect after the
+			// Will Delay has elapsed leaves the Will owed ([MQTT-3.1.2-8]) — and
+			// it had to be scoped by generation AND origin sequence precisely
+			// because it could otherwise land after a LATER incarnation's
+			// enqueue and destroy that Will instead. Both problems are the same
+			// problem: an undated cancel cannot name the Will it is entitled to.
+			// See sess_accept_fact.go.
 		case evictFresher:
 			continue
 		}
@@ -6853,7 +7009,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// That matters here because the broker's own state moves as ordinary NATS
 		// publishes on these subjects: every QoS 1/2 PUBLISH is stored to
 		// $MQTT.msgs.<subject> and every retained message to $MQTT.rmsgs.<key>,
-		// alongside $MQTT.sess.*, $MQTT.JSA.*, $MQTT.willq.*, $MQTT.willcancel.*,
+		// alongside $MQTT.sess.*, $MQTT.accept.*, $MQTT.JSA.*, $MQTT.willq.*,
 		// $MQTT.qos2.in.* and $MQTT.out.*. So a client subscribing to
 		// "$MQTT/msgs/#" would read every QoS 1/2 message in the account
 		// regardless of its own per-topic NATS permissions -- a read-side bypass
@@ -8856,6 +9012,15 @@ type mqttSessSaveDetail struct {
 	// exact-byte retry or a digest match — credits exactly what they carried. See
 	// mqttPendingWrite.
 	voidedRegsRev uint64
+	// factSubj / factBody are the permanent acceptance fact this write committed
+	// ATOMICALLY with the record, empty on every write that is not an accepted
+	// CONNECT's. They travel on the detail for the same reason the record bytes do:
+	// the pair is indivisible, so every question asked about the attempt afterwards —
+	// did it land, may it be re-attempted, whose record is this — is a question about
+	// BOTH messages, and a resolver holding only one of them would answer it about
+	// half a write. See sess_accept_fact.go.
+	factSubj string
+	factBody []byte
 }
 
 // mqttFrameRecordWrite frames a record body for the store: the CAS header requiring
@@ -8883,16 +9048,89 @@ type mqttSessSaveDetail struct {
 // stored anything; what turns that certainty into progress is the CONNECT's re-drive.
 // See sess_uncertain.go and the re-drive in mqttProcessConnect.
 func mqttFrameRecordWrite(seq uint64, body []byte) ([]byte, int) {
+	return mqttFrameBatchWrite(seq, body, _EMPTY_, 0, false)
+}
+
+// mqttFrameBatchWrite is mqttFrameRecordWrite's sibling for one message of an
+// atomic batch: the same per-subject CAS header, plus the headers that bind this
+// message to the rest of the batch. batchID empty emits no batch headers at all,
+// which is what makes the single-write form above literally the same framing it
+// always was rather than a special case of a new one.
+//
+// The binding between the two messages of an accept batch is ATOMICITY, never a
+// cross-subject CAS: each message keeps its own Nats-Expected-Last-Subject-Sequence
+// and the server evaluates both before committing either. The cross-subject variant
+// is refused inside a batch with 10164, which this codebase reads as transient
+// contention — so a design that reached for it would retry a permanent
+// misconfiguration forever.
+//
+// commit marks the LAST message. Until the server sees it, an incomplete batch
+// stores nothing.
+func mqttFrameBatchWrite(seq uint64, body []byte, batchID string, batchSeq int, commit bool) ([]byte, int) {
 	bb := bytes.Buffer{}
 	bb.WriteString(hdrLine)
 	bb.WriteString(JSExpectedLastSubjSeq)
 	bb.WriteString(":")
 	bb.WriteString(strconv.FormatInt(int64(seq), 10))
 	bb.WriteString(CR_LF)
+	if batchID != _EMPTY_ {
+		bb.WriteString(JSBatchId)
+		bb.WriteString(":")
+		bb.WriteString(batchID)
+		bb.WriteString(CR_LF)
+		bb.WriteString(JSBatchSeq)
+		bb.WriteString(":")
+		bb.WriteString(strconv.Itoa(batchSeq))
+		bb.WriteString(CR_LF)
+		if commit {
+			bb.WriteString(JSBatchCommit)
+			bb.WriteString(":1")
+			bb.WriteString(CR_LF)
+		}
+	}
 	bb.WriteString(CR_LF)
 	hdr := bb.Len()
 	bb.Write(body)
 	return bb.Bytes(), hdr
+}
+
+// batchIdOf / batchSizeOf read an atomic-batch PubAck defensively, so the error
+// that reports a malformed acknowledgement can be built without dereferencing the
+// thing it is complaining about.
+// The embedded *PubAck is a POINTER, so an acknowledgement that carried no ack
+// payload dereferences to a panic rather than to a zero value.
+func batchIdOf(resp *JSPubAckResponse) string {
+	if resp == nil || resp.PubAck == nil {
+		return _EMPTY_
+	}
+	return resp.BatchId
+}
+
+func batchSizeOf(resp *JSPubAckResponse) uint64 {
+	if resp == nil || resp.PubAck == nil {
+		return 0
+	}
+	return resp.BatchSize
+}
+
+// mqttAcceptBatchSize is how many messages an accepted CONNECT commits: the
+// permanent acceptance fact, and the session record that carries the commit. It is
+// named because it is observable — an accept consumes two $MQTT_sess sequences, not
+// one — and a caller counting record sequences has to know that.
+const mqttAcceptBatchSize = 2
+
+// mqttAcceptAttempt marks a save as an ACCEPTED CONNECT's, and carries the two
+// identities the permanent acceptance fact is built from. It is a struct rather
+// than a boolean deliberately: a boolean at this boundary would be one flag away
+// from any of the seven other saves minting a fact, and only one save in a
+// connection's life may — the CONNECT-internal save after the grant point must not.
+type mqttAcceptAttempt struct {
+	// clientID is the EXACT client identifier, of which the record subject carries
+	// only the hash. Suppression is decided on it.
+	clientID string
+	// sessEpoch is the incarnation this acceptance belongs to, so a fact is never
+	// comparable against sequences of another one.
+	sessEpoch string
 }
 
 // saveWithDetail is save()'s body; it additionally returns the attempted
@@ -8902,6 +9140,35 @@ func mqttFrameRecordWrite(seq uint64, body []byte) ([]byte, int) {
 //
 // Lock not held on entry.
 func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error) {
+	return sess.persistRecord(tok, nil)
+}
+
+// saveAcceptWithDetail is the accepting CONNECT's save: it commits the session
+// record AND the permanent fact of this acceptance in one JetStream atomic batch,
+// so there is no interval in which the session has been accepted and the evidence
+// of that acceptance does not yet exist.
+//
+// That interval is the whole reason the previous design could not work. A watermark
+// written after the record left a window in which a crash lost the suppression while
+// keeping the acceptance; a watermark written before it left one in which the
+// suppression outlived a takeover that never happened at all. Neither ordering is
+// available to a two-write protocol, and no gate closes a window that the protocol
+// itself creates.
+//
+// The batch closes that interval and no other. In particular the fact is NOT
+// conditional on this CONNECT going on to succeed: the commit precedes consumer
+// reconciliation, the lifetime grant and the CONNACK, and the exits between them leave
+// the fact durable. A fact therefore proves a session record committed, never that the
+// client was told so — the residual docs/CONFORMANCE.md discloses.
+//
+// Lock not held on entry.
+func (sess *mqttSession) saveAcceptWithDetail(tok recordTx, clientID, sessEpoch string) (mqttSessSaveDetail, error) {
+	return sess.persistRecord(tok, &mqttAcceptAttempt{clientID: clientID, sessEpoch: sessEpoch})
+}
+
+// persistRecord is the single store boundary for a session record. accept is nil
+// for every write but the accepting CONNECT's.
+func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) (mqttSessSaveDetail, error) {
 	var detail mqttSessSaveDetail
 	if h := mqttTestSessSaveHookV.Load(); h != nil {
 		if err := (*h)(sess); err != nil {
@@ -8947,14 +9214,48 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	voidedRev := sess.voidedRegsRev
 	sess.mu.Unlock()
 
-	b, hdr := mqttFrameRecordWrite(seq, b)
-	detail = mqttSessSaveDetail{
-		baseSeq: seq, body: body, framed: b, hdr: hdr,
-		domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
-		wid: wid, pwid: pwid,
+	var resp *JSPubAckResponse
+	var err error
+	if accept == nil {
+		b, hdr := mqttFrameRecordWrite(seq, b)
+		detail = mqttSessSaveDetail{
+			baseSeq: seq, body: body, framed: b, hdr: hdr,
+			domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
+			wid: wid, pwid: pwid,
+		}
+		resp, err = sess.jsa.storeSessionMsg(domainTk, cidHash, hdr, b)
+	} else {
+		// A NEWLY COMPOSED acceptance attempt: a fresh acceptID, and the acceptance
+		// time sampled here rather than at function entry. Each call composes one
+		// attempt, so a re-drive that repeats the write composes a new one — which is
+		// right, because the previous one is CERTAIN not to have stored anything. Only
+		// an AMBIGUOUS re-send preserves the attempt, and it does so by re-sending
+		// these exact bodies. See mqttComposeAcceptBatch.
+		fact := &mqttAcceptFact{
+			ClientID:  accept.clientID,
+			SessEpoch: accept.sessEpoch,
+			AcceptID:  mqttNewAcceptID(),
+			At:        time.Now().UnixNano(),
+		}
+		factSubj := mqttAcceptSubject(domainTk, cidHash, fact.SessEpoch, fact.AcceptID)
+		// The writer validates what every reader will validate. It builds the subject
+		// from these same fields, so the binding holds by construction and this is an
+		// invariant assert — but a fact that would be refused by every reader must
+		// never be written: it is permanent, nothing reclaims it, and it would defer
+		// this client's every delayed Will forever.
+		if verr := validateAcceptFactRecord(domainTk, accept.sessEpoch, factSubj, fact); verr != nil {
+			return detail, fmt.Errorf("refusing to persist session %q: its acceptance fact is not a supported record: %w", sess.id, verr)
+		}
+		factBody, _ := json.Marshal(fact)
+		fm, rm, batchID := mqttComposeAcceptBatch(factSubj, factBody, domainTk, cidHash, seq, b)
+		detail = mqttSessSaveDetail{
+			baseSeq: seq, body: body, framed: rm.msg, hdr: rm.hdr,
+			domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
+			wid: wid, pwid: pwid,
+			factSubj: factSubj, factBody: factBody,
+		}
+		resp, err = sess.jsa.storeAcceptBatch(domainTk, cidHash, batchID, fm, rm)
 	}
-
-	resp, err := sess.jsa.storeSessionMsg(domainTk, cidHash, hdr, b)
 	if h := mqttTestSessStoreResultHookV.Load(); h != nil {
 		resp, err = (*h)(sess, resp, err)
 	}
@@ -8965,14 +9266,27 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 		// leaves an outcome nobody can name, and a stale sess.seq would otherwise
 		// reject the client's own next reconnect. Record the attempted write's
 		// identity so a readback can classify it.
+		//
+		// For an acceptance batch the rejection is classified BEFORE the marker is
+		// armed. The marker gates serving on the claim "the subject moved", and a
+		// batch rejection does not carry that claim on its own: it names the first
+		// failed precondition and nothing else, so the proof has to come from the
+		// acceptance fact — absent means the batch never committed and the record CAS
+		// is what was refused. See sess_rejected_write.go.
+		armMarker := mqttIsRecordCASRejection(err)
+		if armMarker && accept != nil {
+			armMarker = sess.jsa.readAcceptFact(detail.factSubj, mqttRecordDigest(detail.factBody)) == mqttAcceptFactAbsent
+		}
 		sess.mu.Lock()
 		if mqttIsRecordCASRejection(err) {
-			// Certain about the WRITE, and silent about the other fact the rejection
-			// carries: the subject moved. Armed HERE, at the one boundary every record
-			// write passes through, so a rejection site nobody enumerated is covered
-			// anyway — the enumeration in this feature's plan was itself incomplete
-			// twice over. See sess_rejected_write.go.
-			sess.markWriteRejectedLocked(seq)
+			if armMarker {
+				// Certain about the WRITE, and silent about the other fact the rejection
+				// carries: the subject moved. Armed HERE, at the one boundary every record
+				// write passes through, so a rejection site nobody enumerated is covered
+				// anyway — the enumeration in this feature's plan was itself incomplete
+				// twice over. See sess_rejected_write.go.
+				sess.markWriteRejectedLocked(seq)
+			}
 		} else {
 			// The framed bytes travel with the identity, because settling this
 			// ambiguity means RE-SENDING them: a re-marshal of whatever memory holds
@@ -11138,12 +11452,21 @@ restoreSession:
 	// always in case we are running in cluster mode. This will notify other
 	// running servers that this session is being used.
 	//
-	// saveWithDetail rather than save, because the two CAS rejection codes demand
-	// OPPOSITE dispositions here and save() %v-formats the error, destroying the
-	// distinction. Both are certain — nothing was stored, so sess.seq is still right —
-	// and neither is a failure of this CONNECT on its own. See sess_takeover_redrive.go.
+	// saveAcceptWithDetail rather than save, for two reasons. The two CAS rejection
+	// codes demand OPPOSITE dispositions here and save() %v-formats the error,
+	// destroying the distinction; both are certain — nothing was stored, so sess.seq
+	// is still right — and neither is a failure of this CONNECT on its own. See
+	// sess_takeover_redrive.go.
+	//
+	// And this is the ONE save in a connection's life that records the permanent fact
+	// of the acceptance, committed in the same atomic batch as the record. It is
+	// therefore also the last place a delayed-Will suppression has to be arranged:
+	// there is no watermark to advance, no CONNACK gate on a second write, and no
+	// rollback for that write to fail — the fact either commits with the record or
+	// neither exists. Every later save on this CONNECT, the grant point's included,
+	// is an ordinary one. See sess_accept_fact.go.
 	for {
-		detail, serr := es.saveWithDetail(acceptTok)
+		detail, serr := es.saveAcceptWithDetail(acceptTok, cid, asm.sessStreamEpoch)
 		if serr == nil {
 			break
 		}
@@ -11189,45 +11512,22 @@ restoreSession:
 			return serr
 		}
 	}
-	cidHash := getHash(cid)
-	// Durably advance this client's delayed-Will cancellation watermark to the
-	// session sequence just saved, BEFORE the success CONNACK. This is the
-	// authoritative, permanent suppression of any older-generation Will: unlike the
-	// best-effort cancelWillOutbox below, and unlike the session record (which a
-	// finite disconnect or clean start later removes), the watermark survives and
-	// keeps an obsolete Will suppressed. The CONNACK is therefore gated on this
-	// write (strict: no acknowledgement unless the suppression is durable). On
-	// failure the accepted session is rolled back to a well-defined, non-falsely-
-	// connected state and the CONNECT is rejected; the client retries. Note that
-	// c.mqtt.cp is still unset here, so the failing connection's own Will does not
-	// fire (mqttHandleWill no-ops on a nil cp). See advanceWillCancelWatermark.
-	es.mu.Lock()
-	candidate := es.seq
-	es.mu.Unlock()
-	if werr := asm.advanceWillCancelWatermark(cidHash, candidate); werr != nil {
-		s.Warnf("MQTT: rejecting CONNECT for client %q: could not durably advance delayed-Will cancel watermark: %v", cid, werr)
-		// The rollback opens its OWN record transaction — directly on the re-save
-		// branch, or inside clear() on the zero-lifetime one — so this frame's must
-		// be released first: the fence's blocking form would otherwise deadlock
-		// against a transaction only this frame can close. Idempotent, so the
-		// deferred release below stays a no-op.
-		endAcceptTx()
-		asm.rollbackAcceptedSession(s, es, cidHash, candidate)
-		return werr
-	}
-	// The connection is now accepted (session saved). A new connection for this
-	// client ID cancels any delayed Will pending from a previous connection,
-	// whether or not its session still existed (a clean-start client removes its
-	// session on disconnect). Done only on success so a failed CONNECT does not
-	// suppress the prior Will. This is the authoritative cross-replica
-	// cancellation (CAS pending->cancelled on the outbox), regardless of which
-	// broker enqueued the Will. Keyed by client ID hash. Spec5 [MQTT-3.1.2-8].
-	// cancelWillOutbox retries internally and logs on exhausted retries; proceed
-	// with the reconnect regardless — blocking CONNECT on a JetStream outage would
-	// be worse than the rare chance the prior Will still fires under sustained
-	// unavailability. Spec5 [MQTT-3.1.2-8].
-	_ = asm.cancelWillOutbox(s, cidHash)
-	// Likewise cancel any pending session-expiry timer: this connection has resumed
+	// The connection is now accepted, and the permanent fact of that acceptance is
+	// durable with it. NOTHING further is done here to suppress a prior delayed Will,
+	// and the two writes that used to be are both gone:
+	//
+	//   - the cancellation watermark, because a single-slot marker is regressible and
+	//     an erased acceptance is unrecoverable — F-031;
+	//   - the direct outbox cancel, because it suppressed on reconnect ALONE, with no
+	//     term for whether the Will had already become due. A reconnect after the Will
+	//     Delay has elapsed does not suppress: the Will is owed ([MQTT-3.1.2-8]).
+	//
+	// The claimant reads the acceptance facts when the Will becomes due and applies
+	// the dated predicate. That is later than a direct cancel, and it is the only
+	// point at which the question "was this acceptance before the Will was owed?" can
+	// be answered at all. See sess_accept_fact.go and will_outbox.go.
+	//
+	// Cancel any pending session-expiry timer: this connection has resumed
 	// (or replaced) the session before it expired. Spec5 [3.1.2.11.2].
 	asm.cancelSessionExpiry(getHash(cid))
 	c.mu.Lock()
@@ -12046,7 +12346,10 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, sessGen string,
 		fireAt := time.Now().Add(time.Duration(effDelay) * time.Second).UnixNano()
 		props := mqttWillForwardProps(will.props)
 		user := c.opts.Username
-		idHash := getHash(c.mqtt.cid)
+		// The EXACT client id, read under c.mu with everything else this frame needs:
+		// suppression is decided by comparing it against an acceptance fact's client
+		// id, and two clients can share a hash.
+		clientID := c.mqtt.cid
 		// A delayed Will cannot re-check publish permissions at fire time (they are
 		// not serializable), so evaluate them now and never enqueue a denied Will.
 		willAllowed := c.pubAllowedFullCheck(string(will.subject), false, true)
@@ -12058,7 +12361,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, sessGen string,
 		if asm != nil && willAllowed {
 			// enqueueDelayedWill retries internally and logs on exhausted retries;
 			// there is nothing further to do on the disconnect path.
-			_ = asm.enqueueDelayedWill(s, idHash, sessGen, will, props, user, fireAt, originSessionSeq, originSessEpoch)
+			_ = asm.enqueueDelayedWill(s, clientID, sessGen, will, props, user, fireAt, originSessionSeq, originSessEpoch)
 		}
 		return
 	}
@@ -12089,10 +12392,10 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, sessGen string,
 // the one that just gave up, and the takeover deliberately does not publish the
 // Will of the connection it displaces.
 //
-// Only an immediate Will is published here. A delayed one is precisely what a
-// reconnect is entitled to cancel, and the reconnect that took this session over
-// is that cancellation — it advanced the durable cancel watermark before its
-// CONNACK. Spec5 [3.1.2.5].
+// Only an immediate Will is published here. A delayed one is what a reconnect may
+// be entitled to suppress, and the reconnect that took this session over recorded
+// the permanent acceptance fact that decides it — at FireAt, and only if that
+// acceptance predates the Will falling due. Spec5 [3.1.2.5].
 //
 // Publication goes through the account's internal client rather than this dying
 // one, whose NATS connection the concurrent takeover close may be tearing down

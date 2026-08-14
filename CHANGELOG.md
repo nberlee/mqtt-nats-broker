@@ -34,29 +34,44 @@ All notable changes to this project are documented here. The format is based on
   finish. Teardown paths close the raw accepted socket rather than the
   protocol-facing connection, so the drain cannot race a handshake swapping in the
   TLS wrapper.
-- **Durable delayed-Will cancellation watermark.** Closes the reconnect-suppression
-  residual in the Layer-2 delayed-Will outbox: an obsolete Will could still fire
-  after a newer CONNECT that later finite-disconnected or deleted its session record.
-  A permanent per-client marker on a dedicated `$MQTT_willcancel` stream
-  (`MaxMsgsPer:1`, no age/size limits) is advanced at every accepted CONNECT as a
-  gating write — no success CONNACK until it lands, with a rollback transaction that
-  rejects the CONNECT and reconciles local state if it cannot. Sequences are compared
-  only within one `$MQTT_sess` incarnation, identified by a generated epoch
-  (`nuid:<NUID>`) stored in the session-stream metadata (`mqtt_sess_epoch`) and
-  carried on both the marker and each Will (`OriginSessEpoch`). When no marker is
-  present the fence falls back to the prior session-record rule; a marker-stream
-  outage defers pending Wills (never lost) until it recovers. **First-release storage
-  format:** the pre-release in-record Will migration path (`Migrated` field, migration
-  worker, terminal tombstones) is removed, and a `$MQTT_sess` stream without a valid
-  generated epoch is rejected with recreate guidance. Back up/restore/recreate
-  `$MQTT_sess`, `$MQTT_willcancel`, `$MQTT_teardown` and `$MQTT_origin` as ONE unit,
-  with every broker for the account stopped. The coupling is enforced differently on
-  each, which is why the instruction covers all four: `$MQTT_teardown` and
-  `$MQTT_origin` carry the session stream's incarnation epoch in their STREAM metadata
-  and their validators refuse a session-only recreation at the next startup, while
-  `$MQTT_willcancel` carries it per watermark RECORD and is not startup-enforced — a
-  session-only recreation there is admitted, silently losing the suppression evidence
-  that keeps superseded delayed Wills from firing.
+- **Permanent per-CONNECT acceptance facts, committed atomically with the session
+  record.** Replaces the delayed-Will cancellation watermark outright. An accepted
+  CONNECT writes one durable, dated fact of its own acceptance on a subject nothing
+  else ever names (`$MQTT.accept.<domainTk><cidHash>.<epoch>.<acceptID>`), committed in
+  ONE JetStream atomic batch with the session record on `$MQTT_sess` — so there is no
+  interval in which a session has been accepted and the evidence of that acceptance is
+  not yet durable, which is the split no ordering of two separate writes could close.
+  The fact's unique subject makes the set of acceptances monotone: nothing overwrites
+  one, which is what a single-slot watermark could not promise. `$MQTT_willcancel` and
+  its stream, the CONNACK-gating watermark advance and its rollback transaction, and
+  BOTH direct reconnect-time outbox cancels are removed.
+
+  A delayed Will is now suppressed only by an acceptance of that EXACT client, in this
+  `$MQTT_sess` incarnation, strictly newer than the connection that created the Will,
+  and dated BEFORE the Will fell due — the distinction MQTT 5.0 draws between a
+  reconnect during the Will Delay ([MQTT-3.1.3-9]) and one after it, when the Will is
+  owed ([MQTT-3.1.2-8]). Neither the watermark nor the direct cancel could say WHEN the
+  acceptance happened, which is why both are gone rather than kept as a fast path.
+
+  The claimant claims BEFORE it decides, and persists the decision and the cutoff it
+  was taken under with the CAS that licenses it; a recovering claimant EXECUTES that
+  decision instead of re-deciding, so WITHIN a `$MQTT_willq` leader term a Will cannot
+  be reinterpreted from published to suppressed after the irreversible act. Across a
+  leader transition it still can — a stale reclaim may overwrite the persisted decision
+  and re-decide under a later cutoff — which is the cross-term claimant-divergence
+  residual in `docs/CONFORMANCE.md`, not a duplicate publication. Because that makes
+  the deciding claimant the only reader, it CHASES its cutoff — re-sampling and
+  examining the delta — so an
+  acceptance committing while it walks is still seen; an acceptance still uncommitted at
+  its final sample cannot be, which is a stated residual rather than a closed gap.
+  `$MQTT_sess` now requires exactly two subject spaces and `AllowAtomicPublish`.
+
+  **First-release storage format:** an outbox record without an exact client identity
+  or a legal decision shape, and a `$MQTT_sess` stream without a valid generated epoch,
+  are rejected with recreate guidance. Back up, restore or recreate `$MQTT_sess`,
+  `$MQTT_teardown` and `$MQTT_origin` as ONE unit with every broker for the account
+  stopped — and note that recreating `$MQTT_sess` discards every client's acceptance
+  history with it, after which a delayed Will enqueued beforehand fires.
 - Project scaffold: Go module, config (`internal/config`), NATS/JetStream backend
   with auth-passthrough dial (`internal/backend`), runnable entrypoint with
   health/readiness endpoints.

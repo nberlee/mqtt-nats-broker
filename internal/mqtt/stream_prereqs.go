@@ -59,9 +59,18 @@ import (
 //
 // wantReplicas is 0 when no explicit replica count is configured (skip that
 // check).
-func validateBrokerOwnedStreamShape(cfg *StreamConfig, wantSubject string, wantReplicas int) error {
-	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != wantSubject {
-		return fmt.Errorf("subjects %v (want [%q])", cfg.Subjects, wantSubject)
+//
+// wantSubjects is the EXACT subject set, compared order-independently and
+// rejecting duplicates. Most owners name one subject; $MQTT_sess names two,
+// because the permanent CONNECT acceptance facts share its stream so that an
+// accepted CONNECT can commit the record and the fact in one atomic batch. Order
+// independence is not laxity — JetStream does not promise to return a stream's
+// subjects in the order they were configured — while a duplicate really is a
+// misconfiguration: it would let a two-subject expectation be satisfied by one
+// subject repeated, leaving the other subject space unowned.
+func validateBrokerOwnedStreamShape(cfg *StreamConfig, wantSubjects []string, wantReplicas int) error {
+	if err := validateStreamSubjectSet(cfg.Subjects, wantSubjects); err != nil {
+		return err
 	}
 	if cfg.Storage != FileStorage {
 		return fmt.Errorf("storage is %v (want file)", cfg.Storage)
@@ -92,6 +101,30 @@ func validateBrokerOwnedStreamShape(cfg *StreamConfig, wantSubject string, wantR
 	}
 	if cfg.PersistMode != DefaultPersistMode {
 		return fmt.Errorf("persist_mode is %v (want the default): its durability semantics are unproven for these protocols", cfg.PersistMode)
+	}
+	return nil
+}
+
+// validateStreamSubjectSet compares a stream's configured subjects against the
+// exact set its owner requires: same members, no extras, no duplicates, any order.
+func validateStreamSubjectSet(got, want []string) error {
+	fail := func() error {
+		return fmt.Errorf("subjects %v (want exactly %v, in any order)", got, want)
+	}
+	if len(got) != len(want) {
+		return fail()
+	}
+	seen := make(map[string]struct{}, len(got))
+	for _, s := range got {
+		if _, dup := seen[s]; dup {
+			return fmt.Errorf("subjects %v repeat %q (want exactly %v, each once)", got, s, want)
+		}
+		seen[s] = struct{}{}
+	}
+	for _, s := range want {
+		if _, ok := seen[s]; !ok {
+			return fail()
+		}
 	}
 	return nil
 }
@@ -201,7 +234,7 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttStreamSubjectPrefix+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttStreamSubjectPrefix + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != InterestPolicy {
@@ -266,7 +299,7 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttRetainedMsgsStreamSubject+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttRetainedMsgsStreamSubject + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != LimitsPolicy {
@@ -318,7 +351,7 @@ type brokerStreamSpec struct {
 	post      func(*StreamInfo) error // runs after validation, on the authoritative info
 }
 
-// brokerStreamSpecs returns the ordered provisioning table for the eleven
+// brokerStreamSpecs returns the ordered provisioning table for the ten
 // broker-owned $MQTT_* streams. wantReplicas is 0 when no explicit replica
 // count is configured; maxAckPending is the broker's effective per-consumer
 // cap; requireMsgTTL is whether this broker accepts MQTT 5.0 (see
@@ -374,26 +407,41 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			// it from ensureBrokerStream's authoritative re-read in the post step,
 			// after validateSessStream has accepted it on that same snapshot.
 			cfg: &StreamConfig{
-				Name:       mqttSessStreamName,
-				Subjects:   []string{mqttSessStreamSubjectPrefix + as.domainTk + ">"},
+				Name: mqttSessStreamName,
+				// Two subject spaces, one stream: the session records, and the
+				// permanent per-CONNECT acceptance facts an accepted CONNECT commits
+				// atomically WITH its record. A batch is per stream, so the fact
+				// cannot live anywhere else without reintroducing the interval in
+				// which a session is accepted and its evidence is not yet durable.
+				// The accept prefix is top-level rather than nested under "sess.",
+				// because every session walk in this package filters "sess.<domainTk>>"
+				// and decodes what it gets as a session record.
+				Subjects: []string{
+					mqttSessStreamSubjectPrefix + as.domainTk + ">",
+					mqttAcceptSubjectPrefix + as.domainTk + ">",
+				},
 				Storage:    FileStorage,
 				Retention:  LimitsPolicy,
 				Replicas:   replicas,
 				MaxMsgsPer: 1,
-				Metadata:   map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+				// Required, not optional: the accept batch carries Nats-Batch-*
+				// headers, which a stream without this rejects.
+				AllowAtomicPublish: true,
+				Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 			},
 			validate: func(si *StreamInfo) error {
 				if verr := validateSessStream(si, as.domainTk, wantReplicas); verr != nil {
-					// The session stream is epoch-coupled to BOTH permanent watermark
-					// streams AND to the interval register: recreating $MQTT_sess alone
-					// mints a new incarnation epoch while the takeover-suppression
-					// watermarks, the generation-retirement watermarks and the interval
-					// registers keep the old one, the partial-recreation hazard
-					// docs/ARCHITECTURE.md ("Operational constraints for the marker")
-					// warns against. The recovery is the coupled one, mirroring all
-					// three of those streams' own guidance.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the session stream alone mints a new incarnation epoch against stale takeover-suppression watermarks, generation-retirement watermarks and session-interval registers (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
-						verr, mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName, mqttOriginStreamName)
+					// The session stream is epoch-coupled to the retirement watermarks
+					// AND to the interval register: recreating $MQTT_sess alone mints a
+					// new incarnation epoch while both keep the old one, the
+					// partial-recreation hazard docs/ARCHITECTURE.md ("Operational
+					// constraints for the marker") warns against. It also destroys every
+					// permanent CONNECT acceptance fact, which lives on this stream — so
+					// no delayed Will enqueued before the recreation can be suppressed by
+					// the acceptance that was entitled to suppress it. The recovery is
+					// the coupled one, mirroring both of those streams' own guidance.
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the session stream alone mints a new incarnation epoch against stale generation-retirement watermarks and session-interval registers, and discards every permanent CONNECT acceptance fact with it (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
+						verr, mqttSessStreamName, mqttTeardownStreamName, mqttOriginStreamName)
 				}
 				return nil
 			},
@@ -439,35 +487,6 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			},
 		},
 		{
-			name: mqttWillCancelStreamName,
-			txt:  "will-cancel",
-			// Durable per-client delayed-Will cancellation watermark stream.
-			// Permanent per-client retention (MaxMsgsPer:1, no global limits so a
-			// marker is never evicted; DiscardOld so a CAS replacement of a client's
-			// prior watermark is never rejected). See will_cancel.go.
-			cfg: &StreamConfig{
-				Name:       mqttWillCancelStreamName,
-				Subjects:   []string{mqttWillCancelSubjectPrefix + as.domainTk + ">"},
-				Storage:    FileStorage,
-				Retention:  LimitsPolicy,
-				Discard:    DiscardOld,
-				Replicas:   replicas,
-				MaxMsgsPer: 1,
-			},
-			validate: func(si *StreamInfo) error {
-				if verr := validateWillCancelStream(si, as.domainTk, wantReplicas); verr != nil {
-					// The marker stream must never be recreated alone: its permanent
-					// watermarks are the takeover-suppression evidence, and sequences
-					// are only comparable within one $MQTT_sess incarnation — so the
-					// recovery is the coupled one docs/ARCHITECTURE.md ("Operational
-					// constraints for the marker") requires.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the marker stream alone discards permanent takeover-suppression watermarks and can let superseded delayed Wills fire (see docs/ARCHITECTURE.md)",
-						verr, mqttWillCancelStreamName, mqttSessStreamName, mqttTeardownStreamName, mqttOriginStreamName)
-				}
-				return nil
-			},
-		},
-		{
 			name: mqttTeardownStreamName,
 			txt:  "teardown retirement watermark",
 			// Durable per-client generation-retirement watermark stream. Permanent
@@ -501,8 +520,8 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 					// are only comparable within the incarnation they were written under.
 					// Recreating either stream alone is the hazard, and an unfenced
 					// generation whose resources are already deleted is the cost.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the session stream alone leaves generation-retirement watermarks from a different incarnation, and recreating this stream alone discards the fences that keep a torn-down session from being resumed hollow (see docs/ARCHITECTURE.md)",
-						verr, mqttTeardownStreamName, mqttSessStreamName, mqttWillCancelStreamName, mqttOriginStreamName)
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the session stream alone leaves generation-retirement watermarks from a different incarnation, and recreating this stream alone discards the fences that keep a torn-down session from being resumed hollow (see docs/ARCHITECTURE.md)",
+						verr, mqttTeardownStreamName, mqttSessStreamName, mqttOriginStreamName)
 				}
 				return nil
 			},
@@ -541,8 +560,8 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 					// subjects, so a session stream recreated under them describes
 					// intervals that no longer exist, while this stream recreated alone
 					// restarts the sequences every interval identity is derived from.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s, %s and %s as one logical unit — recreating the session stream alone leaves interval registers naming intervals of a different incarnation, and recreating this stream alone restarts the sequences every interval identity is derived from, so a later interval can be handed one an earlier interval already used (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
-						verr, mqttOriginStreamName, mqttSessStreamName, mqttWillCancelStreamName, mqttTeardownStreamName)
+					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s and %s as one logical unit — recreating the session stream alone leaves interval registers naming intervals of a different incarnation, and recreating this stream alone restarts the sequences every interval identity is derived from, so a later interval can be handed one an earlier interval already used (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
+						verr, mqttOriginStreamName, mqttSessStreamName, mqttTeardownStreamName)
 				}
 				return nil
 			},

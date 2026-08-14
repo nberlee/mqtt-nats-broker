@@ -142,6 +142,7 @@ func (e *testRejectionEnv) plantPendingWill(t *testing.T) string {
 	rec := &mqttWillOutbox{
 		WillID:           willID,
 		ClientIDHash:     e.idHash,
+		ClientID:         e.sess.id,
 		Gen:              gen,
 		FireAt:           time.Now().Add(time.Hour).UnixNano(),
 		State:            mqttWillPending,
@@ -369,12 +370,18 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 	testAssertMinted(t, e)
 }
 
-// TestMQTTPersistEvictTakeoverCancelsWill is the paired successor case: a real
+// TestMQTTPersistEvictTakeoverPreservesWill is the paired successor case: a real
 // peer RESUME save is a child of our acknowledged record — a demonstrated
-// takeover — so the claim is 0x8E and the scoped Will cancel runs, sequenced
-// before the completion observer (which is what makes this assertion causal
-// rather than a poll against the scan).
-func TestMQTTPersistEvictTakeoverCancelsWill(t *testing.T) {
+// takeover — so the claim is 0x8E.
+//
+// And the delayed Will is PRESERVED even so, which is the change this pins. The
+// eviction used to run a scoped outbox cancel here; it no longer does, on either
+// verdict, because "somebody took the session over" is not the question a Will
+// turns on. A reconnect after the Will Delay has elapsed leaves the Will owed
+// ([MQTT-3.1.2-8]), and this path has no idea whether it did. The claimant decides,
+// at FireAt, against the permanent acceptance facts — which the takeover's own
+// accepted CONNECT wrote.
+func TestMQTTPersistEvictTakeoverPreservesWill(t *testing.T) {
 	t.Parallel()
 	e := testNewEvictEnv(t, "pevtake")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
@@ -392,8 +399,8 @@ func TestMQTTPersistEvictTakeoverCancelsWill(t *testing.T) {
 	if e.resident(e.sess) {
 		t.Fatal("the displaced session must be evicted")
 	}
-	if st := e.willOutboxState(t, will); st != mqttWillCancelled {
-		t.Fatalf("the takeover verdict must cancel the displaced incarnation's Will, got %v", st)
+	if st := e.willOutboxState(t, will); st != mqttWillPending {
+		t.Fatalf("no eviction verdict may destroy a delayed Will, got %v", st)
 	}
 	testAssertNotMinted(t, e)
 }
@@ -407,16 +414,15 @@ func TestMQTTPersistEvictResidentUnbound(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		shape func(*testRejectionEnv, *mqttPersistedSession)
-		want  mqttWillState
 	}{
-		{"forked preserves the outbox record", func(e *testRejectionEnv, ps *mqttPersistedSession) {
+		{"forked", func(e *testRejectionEnv, ps *mqttPersistedSession) {
 			// The default landRecord shape IS the sibling.
-		}, mqttWillPending},
-		{"takeover cancels it", func(e *testRejectionEnv, ps *mqttPersistedSession) {
+		}},
+		{"takeover", func(e *testRejectionEnv, ps *mqttPersistedSession) {
 			e.sess.mu.Lock()
 			ps.PWID = e.sess.wid // a CHILD of the acknowledged record
 			e.sess.mu.Unlock()
-		}, mqttWillCancelled},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewEvictEnv(t, "pevunb-"+tc.name[:4])
@@ -436,8 +442,11 @@ func TestMQTTPersistEvictResidentUnbound(t *testing.T) {
 			if e.hasPendingExpiry() {
 				t.Fatal("the expiry timer must be cancelled on both verdicts")
 			}
-			if st := e.willOutboxState(t, will); st != tc.want {
-				t.Fatalf("Will outbox record state = %v, want %v", st, tc.want)
+			// The same on BOTH verdicts, which is the point: an eviction no longer
+			// decides a Will's fate at all. Asserted per row rather than once, so a
+			// verdict-dependent cancel reappearing on either row fails here.
+			if st := e.willOutboxState(t, will); st != mqttWillPending {
+				t.Fatalf("no eviction verdict may destroy a delayed Will, got %v", st)
 			}
 		})
 	}
@@ -459,10 +468,9 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 	type row struct {
 		name string
 		// stage returns the sequence to deliver as the observation.
-		stage    func(t *testing.T, e *testRejectionEnv) uint64
-		evicted  bool
-		reason   byte
-		wantWill mqttWillState
+		stage   func(t *testing.T, e *testRejectionEnv) uint64
+		evicted bool
+		reason  byte
 	}
 	for _, tc := range []row{
 		{"absent record concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
@@ -474,14 +482,14 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 				t.Fatalf("delete the session record: %v", err)
 			}
 			return smsg.Sequence + 1
-		}, true, mqttReasonSessionTakenOver, mqttWillCancelled},
+		}, true, mqttReasonSessionTakenOver},
 		{"undecodable record concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
 			resp, err := e.sess.jsa.storeSessionMsg(e.asm.domainTk, e.idHash, 0, []byte("{not-a-record"))
 			if err != nil {
 				t.Fatalf("land the undecodable record: %v", err)
 			}
 			return resp.Sequence
-		}, true, mqttReasonSessionTakenOver, mqttWillCancelled},
+		}, true, mqttReasonSessionTakenOver},
 		// INVERTED by F-029, deliberately. This row used to assert that a different
 		// incarnation concedes, which was the generation short-circuit in
 		// classifyRecordLineage. That short-circuit hid the one fork the rule exists to
@@ -492,21 +500,21 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 		// verdict proved no session continuation, so it may not destroy the outbox.
 		{"sibling of another incarnation is forked", func(t *testing.T, e *testRejectionEnv) uint64 {
 			return e.landRecord(t, func(ps *mqttPersistedSession) { ps.Gen = mqttNewSessGen() })
-		}, true, mqttReasonServerBusy, mqttWillPending},
+		}, true, mqttReasonServerBusy},
 		{"absent lineage concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
 			return e.landRecord(t, func(ps *mqttPersistedSession) { ps.WID, ps.PWID = _EMPTY_, _EMPTY_ })
-		}, true, mqttReasonSessionTakenOver, mqttWillCancelled},
+		}, true, mqttReasonSessionTakenOver},
 		{"below-target sibling concedes through the license", func(t *testing.T, e *testRejectionEnv) uint64 {
 			// A FORKED record below the trigger: classifying it would answer
 			// 0x89 for a write it cannot speak for (M14). The license path
 			// concedes at the observation level instead.
 			return e.landRecord(t, nil) + 1
-		}, true, mqttReasonSessionTakenOver, mqttWillCancelled},
+		}, true, mqttReasonSessionTakenOver},
 		{"equality is never a takeover", func(t *testing.T, e *testRejectionEnv) uint64 {
 			e.sess.mu.Lock()
 			defer e.sess.mu.Unlock()
 			return e.sess.seq
-		}, false, 0, mqttWillPending},
+		}, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewEvictEnv(t, "pevlic-"+tc.name[:6])
@@ -532,8 +540,8 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 			} else if len(reasons) != 1 || reasons[0] != tc.reason {
 				t.Fatalf("DISCONNECT reasons = %x, want [%x]", reasons, tc.reason)
 			}
-			if st := e.willOutboxState(t, will); st != tc.wantWill {
-				t.Fatalf("Will outbox record state = %v, want %v", st, tc.wantWill)
+			if st := e.willOutboxState(t, will); st != mqttWillPending {
+				t.Fatalf("no eviction verdict may destroy a delayed Will, got %v", st)
 			}
 		})
 	}
@@ -960,10 +968,9 @@ func TestMQTTPersistEvictUnresolvedAttemptPair(t *testing.T) {
 		name      string
 		siblingOf string // "attempt" or "acknowledged"
 		reason    byte
-		wantWill  mqttWillState
 	}{
-		{"sibling of the unadopted attempt concedes", "attempt", mqttReasonSessionTakenOver, mqttWillCancelled},
-		{"sibling of the acknowledged record still proves the fork", "acknowledged", mqttReasonServerBusy, mqttWillPending},
+		{"sibling of the unadopted attempt concedes", "attempt", mqttReasonSessionTakenOver},
+		{"sibling of the acknowledged record still proves the fork", "acknowledged", mqttReasonServerBusy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewEvictEnv(t, "pevunres-"+tc.siblingOf)
@@ -1010,8 +1017,8 @@ func TestMQTTPersistEvictUnresolvedAttemptPair(t *testing.T) {
 			if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != tc.reason {
 				t.Fatalf("DISCONNECT reasons = %x, want [%x]", reasons, tc.reason)
 			}
-			if st := e.willOutboxState(t, will); st != tc.wantWill {
-				t.Fatalf("Will outbox record state = %v, want %v", st, tc.wantWill)
+			if st := e.willOutboxState(t, will); st != mqttWillPending {
+				t.Fatalf("no eviction verdict may destroy a delayed Will, got %v", st)
 			}
 			if e.resident(e.sess) {
 				t.Fatal("the displaced session must be evicted on both rows")

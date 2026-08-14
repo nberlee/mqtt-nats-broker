@@ -181,7 +181,7 @@ func mqttValidateOriginInterval(r *mqttOriginInterval, idHash string) error {
 // interval held. What it costs is the opposite direction — the erased client's next
 // record-absent create derives an identity no peer holds, so a pair straddling the
 // erasure concedes. That is a recognition loss of exactly the kind administrative
-// pruning of $MQTT_willcancel or $MQTT_teardown already causes, stated in
+// pruning of $MQTT_teardown already causes, stated in
 // docs/CONFORMANCE.md rather than refused here; only stream RECREATION or a restore
 // replays sequences, which the incarnation epoch is what guards.
 //
@@ -211,7 +211,7 @@ func validateOriginStream(si *StreamInfo, domainTk string, wantReplicas int, ses
 		return fmt.Errorf("stream info unavailable")
 	}
 	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, mqttOriginSubjectPrefix+domainTk+">", wantReplicas); err != nil {
+	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttOriginSubjectPrefix + domainTk + ">"}, wantReplicas); err != nil {
 		return err
 	}
 	if cfg.Retention != LimitsPolicy {

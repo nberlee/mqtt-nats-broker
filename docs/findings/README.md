@@ -13,11 +13,9 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
 - Add write lineage to the Will outbox.
-  Status: Open. Release treatment: Alpha blocker.
-  Details: [F-030](ha-arbitration.md#f-030).
-- Add write lineage to Will-cancellation watermarks.
-  Status: Open. Release treatment: Alpha blocker.
-  Details: [F-031](ha-arbitration.md#f-031).
+  Status: Open — narrowed. Release treatment: Alpha blocker.
+  Details: [F-030](ha-arbitration.md#f-030). Its cancellation half is closed within a
+  `$MQTT_willq` leader term; the terminal regression stays open.
 - Add write lineage to inbound QoS 2 holds and release claims.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-032](ha-arbitration.md#f-032).

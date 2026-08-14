@@ -238,7 +238,7 @@ condemned by the retirement fence.
 
 **Title:** Add write lineage to the Will outbox
 
-- Status: Open
+- Status: **Open — narrowed**
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 30
@@ -252,22 +252,92 @@ condemned by the retirement fence.
   was supposed to have retired it. The record shape and the classifier from
   `sess_fork_lineage.go` are reusable; this stream's CONSEQUENCE analysis is not.
 
+### What the acceptance-fact change did, and did not, close
+
+The **cancellation half is closed WITHIN a `$MQTT_willq` leader term.** Every claimant
+now takes its claim before it decides, persists the decision and the cutoff it was taken
+under with the CAS that licenses it, renews that claim while scanning, and re-checks its
+budget immediately before licensing. A recovering claimant EXECUTES the persisted
+decision instead of re-deciding, so the destructive in-term interleaving — publish under
+one cutoff, crash, recover under a later one and cancel — is gone. That qualification
+matters: nothing here claims to eliminate spurious fires across a leader transition.
+
+The **terminal-regression half stays OPEN, and this is why the finding is not ticked.**
+A committed `done` can still be overwritten by a stale cross-term reclaim:
+
+> The record at `S` is `(publishing, publish, U)`; A publishes; A's `publishing -> done`
+> CAS at `S` is accepted but not yet applied; a leader transition clears the in-process
+> per-subject state; B's reclaim at `S` is accepted from the older `publishing` body,
+> preserving `(publish, U)`; A's `done` applies; **B's reclaim applies after it and
+> overwrites `done`**; B enters on the persisted decision and republishes without
+> scanning.
+
+That is exactly this finding's recorded "re-fired after `done` was supposed to have
+retired it", and the persisted decision makes the republication DETERMINISTIC rather
+than accidental. It is **not** the sanctioned at-least-once duplicate, which this
+repository defines by EVIDENCE rather than by a crash: external publication with no
+durable proof of completion, reached either by lease expiry with `done` uncommitted or by
+an ambiguous enqueue whose fail-safe publishes while an unconfirmed record may exist. In
+both, completion is genuinely unknown. Here `done` COMMITTED and was then regressed —
+evidence the system already held, discarded. Reclassifying it would
+close this finding by weakening the contract that created it.
+
+Closing it needs a mechanism that makes terminal completion **non-regressible or
+recognisable** on `$MQTT_willq` — which is what the original finding proposed, and which
+the cancellation analysis refuted only for the other half. The shape such a mechanism
+must kill is pinned by `TestWillTerminalRegressionConsequence`.
+
 ## F-031
 
 **Title:** Add write lineage to Will-cancellation watermarks
 
-- Status: Open
+- Status: **CLOSED** — the watermark it was about no longer exists
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 31
 
 ### Original finding record
 
-- [ ] `$MQTT_willcancel` carries no write lineage. Its per-client watermark is monotonic
+- [x] `$MQTT_willcancel` carries no write lineage. Its per-client watermark is monotonic
   by design, so a surviving sibling that holds a LOWER `SessionSeq` silently un-suppresses
   a Will an accepted CONNECT had already cancelled — the one failure this stream exists to
   prevent. Worse than the others because the marker is permanent: nothing deletes it, so
   the lowered value stands until the next accepted CONNECT advances it again.
+
+### How it was closed
+
+Not by adding lineage to the watermark — by **deleting the watermark**. `$MQTT_willcancel`
+is gone, and with it the single-slot record this finding is about.
+
+An accepted CONNECT now writes one permanent, dated acceptance FACT on a subject nothing
+else ever names (`$MQTT.accept.<domainTk><cidHash>.<epoch>.<acceptID>`), committed in ONE
+JetStream atomic batch with the session record on `$MQTT_sess`. Two properties retire the
+finding outright rather than mitigating it:
+
+- **A fact is never overwritten.** Its subject carries its own `acceptID`, so the set of
+  acceptances is monotone and there is no slot for a sibling to regress. The failure this
+  finding describes — a surviving sibling holding a LOWER value, silently un-suppressing a
+  Will — has no representation left: to lose an acceptance you would have to delete a
+  record nothing deletes.
+- **The evidence and the acceptance commit together.** The batch removes the interval in
+  which a session has been accepted and the evidence of that acceptance does not yet
+  exist. That interval, not the missing lineage, was what made every ordering of a
+  separate watermark write unsound.
+
+The lineage question does not survive the deletion: a same-base sibling on a create-only
+unique subject would carry the identical body, and a fact says only "this acceptance
+happened", which two identical facts also say.
+
+`TestWillClaimantSeesAnEarlierAcceptanceAfterALaterOne` pins the property directly — an
+EARLIER entitled acceptance still suppresses after a later non-entitled one, which a slot
+could not do.
+
+**What this closure does NOT claim.** That no acceptance is ever missed. A fact is
+unloseable once COMMITTED; one still uncommitted when a claimant takes its decision is
+unreadable, and the persisted decision means it is never read later. That is a separate
+residual in `docs/CONFORMANCE.md` with its own interleaving, irreducible while eligibility
+is dated by `At` and a due Will must still be decided — not a survival of this finding,
+whose subject is a durable value being REGRESSED.
 
 ## F-032
 

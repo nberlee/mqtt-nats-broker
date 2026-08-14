@@ -113,7 +113,7 @@ Every broker-owned `$MQTT_*` stream is provisioned through one convergence shape
 **unconditional authoritative re-read**, then a per-stream validator over that
 re-read — so a create-race loser (and equally the winner, whose create response is
 not authoritative for what now exists) validates the stream that is actually
-there, never the config it asked for. The eleven streams are entries in one ordered
+there, never the config it asked for. The ten streams are entries in one ordered
 provisioning table iterated by a single loop, so none can be provisioned outside
 the shape. A stream that fails its validator **fails account-manager
 initialization** with recreate guidance; nothing is repaired or updated in place,
@@ -142,10 +142,9 @@ per-owner:
 
 | Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
 |---|---|---|---|
-| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, rollback); no purge; **one ephemeral `AckNone` session-record watch consumer per broker** (see "The session-record watch"). Every record carries `WID`/`PWID`, the write's own identity and its parent's | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted); **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
-| `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | as `$MQTT_sess` minus the epoch; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_willcancel` | per-client watermark CAS and reads — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources` | **`DenyDelete`/`DenyPurge`** (no operation deletes or purges — markers are permanent by design); `SubjectDeleteMarkerTTL` (no delete means no marker can ever be created); `MaxConsumers`/`ConsumerLimits` |
-| `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | as `$MQTT_willcancel`, plus the **adopted `$MQTT_sess` incarnation epoch** in `Metadata`, required to match this account's (unrelated keys accepted): an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | as `$MQTT_willcancel` — and `DenyDelete`/`DenyPurge` are load-bearing waivers here, since reaping a fence would unfence a generation whose resources are already deleted |
+| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker** (see "The session-record watch"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's | **exactly two subjects** — `$MQTT.sess.<domainTk>>` and `$MQTT.accept.<domainTk>>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch carries `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted); **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's two-subject set and its atomic-publish requirement, neither of which applies |
+| `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources`; plus the **adopted `$MQTT_sess` incarnation epoch** in `Metadata`, required to match this account's (unrelated keys accepted): an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | **`DenyDelete`/`DenyPurge`** and `SubjectDeleteMarkerTTL` (no operation deletes or purges — a fence is permanent by design, so no delete marker can ever be created); `MaxConsumers`/`ConsumerLimits` (no consumers). Both denial waivers are load-bearing here, since reaping a fence would unfence a generation whose resources are already deleted |
 | `$MQTT_origin` | per-client interval register: a create-only CAS (the establish), a plain confirmed publish that replaces the standing register (the advance), and exact-subject reads — **nothing else, ever**. No scan, no consumer, no delete, no purge | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; **no global limits** (they would reap registers continuously and silently, disabling recognition for every client whose register ages out — not because eviction could replay an identity, which it cannot); no `MaxMsgSize` cap; no `Sources`; **its own incarnation epoch** and the **adopted `$MQTT_sess` epoch** in `Metadata` (unrelated keys accepted) | **`DenyDelete`/`DenyPurge`** (no operation ever deletes or purges a register, and an erasure cannot replay an identity — a delete does not rewind the sequence counter, so the next establish mints a strictly higher one; what it costs is recognition, the same loss pruning the watermark streams carries); `SubjectDeleteMarkerTTL` (no delete occurs here); `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL` (no `Nats-TTL` sent); `Duplicates` (no `Nats-Msg-Id` set) |
 | `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
 | `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker) | **`DenyDelete`** (the owner issues no delete API request at all; the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
@@ -158,7 +157,7 @@ Three asymmetries in that table are deliberate, and each is pinned by an
 acceptance test so an over-strict "fix" fails:
 
 - **`DenyDelete` is fatal on `$MQTT_sess`/`$MQTT_willq` and waived on
-  `$MQTT_willcancel`/`$MQTT_rmsgs`** — the former have deletion as a record's
+  `$MQTT_teardown`/`$MQTT_rmsgs`** — the former have deletion as a record's
   only exit; on the latter the owner issues no explicit delete API request for
   correctness. That is not the same as "nothing is deleted": on `$MQTT_rmsgs`
   the `MaxMsgsPer: 1` store-time eviction IS the replacement semantics, and TTL
@@ -176,22 +175,30 @@ acceptance test so an over-strict "fix" fails:
   fatal exactly where a foreign record could occupy a protocol CAS slot, and
   cross-account retained sourcing is a supported topology.
 
-`$MQTT_sess`, `$MQTT_willcancel`, `$MQTT_teardown` and `$MQTT_origin` are **one
-logical unit**, and all four validators say so in their recreate guidance. Both
-watermark streams order themselves by `$MQTT_sess` sequences and the register names
-intervals of `$MQTT_sess` record subjects, so a partial recreation leaves state that
-describes an incarnation that no longer exists.
+`$MQTT_sess`, `$MQTT_teardown` and `$MQTT_origin` are **one logical unit**, and all
+three validators say so in their recreate guidance. The retirement watermarks order
+themselves by `$MQTT_sess` sequences and the register names intervals of `$MQTT_sess`
+record subjects, so a partial recreation leaves state that describes an incarnation
+that no longer exists.
+
+Recreating `$MQTT_sess` now costs one thing more, and it is not recoverable: the
+permanent CONNECT **acceptance facts live on that stream**, so recreating it discards
+every client's acceptance history. A delayed Will enqueued before the recreation can
+then no longer be suppressed by the acceptance that was entitled to suppress it, and
+it fires. That is a deliberate consequence of putting the facts where the record is —
+the atomicity that removes the split-acceptance interval is only available within one
+stream — and it is stated here rather than mitigated, because there is no honest
+mitigation short of a second write nobody could make atomic with the first.
 
 Startup catches only part of that, and the exact rule matters to an operator judging
-whether a mistake would be caught. Only `$MQTT_teardown` and `$MQTT_origin` carry the
-session epoch in STREAM METADATA; `$MQTT_willcancel` carries it per watermark RECORD and
-its validator reads no metadata at all. So **a recreated `$MQTT_sess` is refused if and
-only if an OLD `$MQTT_teardown` or `$MQTT_origin` survives beside it** — recreate both of
-those together with it and startup admits, whatever happens to `$MQTT_willcancel` — and
-**with `$MQTT_sess` kept, any subset of the other three may be recreated and is
-admitted**, starting cleanly with no historical fences, no registers and no suppression
-evidence. `docs/CONFORMANCE.md` records those losses; the four-stream recovery is
-specified as a procedure for that reason rather than because every mistake fails closed.
+whether a mistake would be caught. Both `$MQTT_teardown` and `$MQTT_origin` carry the
+session epoch in STREAM METADATA. So **a recreated `$MQTT_sess` is refused if and only
+if an OLD `$MQTT_teardown` or `$MQTT_origin` survives beside it** — recreate both of
+those together with it and startup admits — and **with `$MQTT_sess` kept, either of the
+other two may be recreated and is admitted**, starting cleanly with no historical
+fences and no registers. `docs/CONFORMANCE.md` records those losses; the three-stream
+recovery is specified as a procedure for that reason rather than because every mistake
+fails closed.
 
 That second direction is safe for different reasons on the two kinds of stream, and
 the register's reason is **conditional on the mandatory restart** below. A recreated
@@ -249,81 +256,250 @@ Two refinements keep the guarantee tight:
   the record deleted (at the `done` sequence). Committing `done` first means a failed
   delete cannot leave a re-fireable `publishing` record — the scanner reaps the
   `done` record instead.
-- **Takeover fence (durable cancellation watermark).** The primary suppression is a
-  permanent per-client marker on the dedicated `$MQTT_willcancel` stream
-  (`MaxMsgsPer:1`, no age/size limits). Every accepted CONNECT advances the client's
-  marker to its session save sequence — a *gating* write: no success CONNACK is sent
-  until it lands (and a failed advance runs a rollback transaction that rejects the
-  CONNECT). Sequences are comparable only within one `$MQTT_sess` incarnation,
-  identified by a generated epoch (`nuid:<NUID>`) stored in the session-stream metadata
-  and carried on both the marker (`SessEpoch`) and each Will (`OriginSessionSeq`,
-  `OriginSessEpoch`). The claimant fence suppresses a Will when a current-epoch marker
-  is *strictly beyond* its origin sequence (`SessionSeq > OriginSessionSeq` — the
-  connection's own delayed Will, at an equal or higher origin, still fires), or when the
-  marker is from a different incarnation. Because the marker is permanent, this holds
-  even after the newer connection finite-disconnects or its session record is deleted —
-  the residual a session-record fence alone could not close. When no marker is present
-  (administrative loss), the fence falls back to the numeric session-record rule
-  (suppress iff a newer record with `DisconnectedAt == 0`), and a marker-stream outage
-  defers pending Wills (never lost) until it recovers. Because that fallback reads
-  `DisconnectedAt == 0` as *a live newer connection*, a disconnected session's record
-  has to say it is disconnected whatever its expiry class. The finite close persists the
-  stamp with its disconnect save; a **never-expiring** session makes no such save, so
-  its close stamps the disconnect time inside a RECORD TRANSACTION of its own — acquired
-  NON-BLOCKING, and a close whose acquisition is REFUSED stamps anyway, unordered, because
-  the rejection probe would otherwise persist current memory with `DisconnectedAt = 0`
-  at a newer sequence — before the detach and therefore before the shared purge's own
-  record write. The fence, not `sess.mu`, is what makes that effective: an off-readLoop
-  writer takes the fence without the ownership gate, so a body it had already marshalled
-  with `DisconnectedAt = 0` could otherwise land after the Will's origin sequence is
-  captured. Holding the fence means every earlier marshal has completed and advanced the
-  sequence that capture reads, and every later write on that session (the purge, a
-  void-verdict release handoff, a rejection probe) therefore publishes a record newer
-  than an owed Will's origin sequence that still reads as disconnected, instead of
-  cancelling a Will the client is owed. The field stays inert for every expiry reader,
-  each of which pre-filters on never-expire before looking at it. Refusal has two causes
-  and the same cost. An OPEN (or pre-admitted) transaction leaves the residual above: the
-  one body already marshalled inside it, which no non-blocking form can order against.
-  Waiter priority refuses on a FREE fence reserved for an announced blocking writer, where
-  nothing is open yet — but that writer can then take `sess.mu`, open its transaction and
-  marshal `DisconnectedAt = 0` before this stamp is taken, which is the same one-body
-  exposure reached from the other side. This is the one non-blocking site that does not
-  retry, so waiter priority gives its degraded arm more occasions of that residual, not a
-  cost-free arm; `docs/CONFORMANCE.md` residual 13 carries it.
+- **Takeover suppression (permanent per-CONNECT acceptance facts).** An accepted
+  CONNECT records one durable, dated fact of its own acceptance on a subject nothing
+  else ever writes — `$MQTT.accept.<domainTk><cidHash>.<epoch>.<acceptID>` — and that
+  fact is committed in ONE JetStream **atomic batch** together with the session
+  record, on the shared `$MQTT_sess` stream. That is the whole design, and each half
+  answers a defect the previous one could not.
 
-Residual that keeps literal exactly-once impossible:
+  *Why atomic.* A suppression written after the record leaves a window in which a
+  crash keeps the acceptance and loses the evidence; written before it, a window in
+  which the evidence outlives a takeover that never happened at all. Neither ordering
+  is available to a two-write protocol, and no gate closes a window the protocol itself
+  creates. The batch removes the interval **between the two writes**: the fact and the
+  record commit together or neither exists, so a fact exists only where a session
+  record committed — only where a takeover really did occur.
 
-- *At-least-once duplicate* — a crash between the external publish and the `done`
-  commit republishes after the lease expires (the sanctioned duplicate).
+  What atomicity does **not** do is make the fact conditional on the CONNECT
+  *succeeding*. The batch commits before consumer reconciliation, the lifetime grant and
+  the CONNACK, and several exits between them still refuse the connection; the fact is
+  durable by then and will suppress the prior Will even though the client never learned
+  it was accepted. That is a disclosed residual in `docs/CONFORMANCE.md` — the family the
+  pre-CONNACK disclosure already covered — and not a window this ordering closes.
 
-The reconnect-suppression miss is now closed by the durable watermark; it reopens
-only under administrative loss of `$MQTT_willcancel` (a documented degradation, not a
-supported migration). This is a first-release storage format: pre-Layer-2 in-record
-Wills, migrated outbox records, and a `$MQTT_sess` stream without a valid generated
-epoch are unsupported and rejected with recreate guidance rather than carried forward.
+  A batch is per stream, which is why the
+  facts live on `$MQTT_sess` under a **separate top-level prefix** rather than nested
+  under `sess.` — every session walk in the broker filters `sess.<domainTk>>` and
+  decodes what it gets as a session record.
+
+  *Why unique subjects.* The fact carries its own `acceptID`, so nothing ever
+  overwrites it and the set of acceptances is monotone. A single-slot watermark is
+  regressible: a sibling write erases the acceptance an earlier CONNECT recorded, and
+  an erased acceptance can never be recovered because nothing else knew about it.
+
+  *Why dated.* MQTT 5.0 suppresses a delayed Will only for a reconnect that happens
+  DURING the Will Delay ([MQTT-3.1.3-9]); once the delay has elapsed the Will is owed
+  and must be published ([MQTT-3.1.2-8]). A watermark carrying no date could answer
+  only the first, which is why both the watermark and the direct reconnect-time
+  outbox cancel are gone: neither could say WHEN the acceptance happened.
+
+  *Ordering inside the batch.* The fact is staged FIRST and the session record
+  carries the commit. The batch's PubAck therefore reports the record's sequence (the
+  reply rides the commit entry, which is the sequence the session adopts), and the
+  fact sorts strictly BELOW the record of the connection that wrote it — so a
+  connection can never suppress its own Will. A fact's sequence is read back from the
+  stream, never derived arithmetically from the ack.
+
+  *The predicate.* A claimant suppresses a Will iff some acceptance fact of that
+  client satisfies all of: the fact belongs to the incarnation this broker is running
+  in; its client id matches the Will's EXACTLY (equal hashes are not equal clients,
+  and the hash only routes); `At < FireAt`; and, within the Will's own incarnation,
+  the fact's stream sequence is strictly above `OriginSessionSeq`. Across incarnations
+  that last comparison is meaningless and a current-incarnation acceptance supersedes
+  outright. Every binding is re-checked at decode — the body's client id must hash to
+  the subject's token, its epoch must equal both the subject's and this broker's, its
+  `acceptID` must equal the subject's, and `At` must be present — because an
+  unchecked binding is a way to make one client's acceptance destroy another's Will. A
+  fact that fails any of them is REFUSED and DEFERS the Will; a well-formed fact
+  naming a different client that merely hashes the same is simply non-qualifying.
+
+- **The claimant decides once, and its decision is durable.** The order is CLAIM
+  FIRST, then decide. Deciding first and claiming afterwards leaves the decision
+  unowned: two claimants can reach opposite verdicts from cutoffs that straddle one
+  acceptance, and the loser's verdict is not recorded anywhere to be contradicted.
+
+  1. Claim or reclaim (`pending -> publishing`, or `publishing -> publishing` at the
+     scanned sequence), carrying `Decision` and `DecisionCutoff` forward unchanged.
+  2. If the claimed record is already LICENSED TO PUBLISH, execute that decision — no
+     cutoff is sampled, no fact is read, and whatever acceptances have landed since
+     are irrelevant.
+  3. Otherwise sample a cutoff `U` (the `$MQTT_sess` last sequence), walk this Will's
+     acceptance facts within it while renewing the claim, CHASE the cutoff as below,
+     and license the outcome with one CAS: publish (staying `publishing`, lease
+     refreshed) or cancel (straight to `cancelled` — there is no licensed-cancel
+     `publishing` state, which would be a state with two meanings).
+
+  **The cutoff is CHASED, not sampled once.** A walk examines everything at or below
+  the cutoff it was given, so an acceptance that commits WHILE it runs sits above that
+  cutoff — and because the decision is persisted, no later claimant ever returns to
+  read it. So after a walk finds nothing, the cutoff is re-sampled and only the delta
+  is examined, up to `mqttWillCutoffChases` times, and the cutoff PERSISTED is the one
+  actually verified through rather than the first sample. This is sound in exactly one
+  direction: `At < FireAt` is the term that DATES eligibility, so a later cutoff can
+  never suppress a Will an earlier one would have published — it can only find evidence
+  the pass would otherwise have missed.
+
+  What bounds the chase is that **an empty delta is not required to decide.** A client
+  reconnecting steadily after its Will fell due — or one that merely hashes the same —
+  produces facts forever, none of which can qualify, so a chase that insisted on an
+  empty delta would defer an OWED Will on every pass and never fire it: the wedge shape
+  again, arrived at from the other side. Exhausting the limit therefore LICENSES under
+  the cutoff verified so far. Deferral stays reserved for the four conditions that make
+  a decision unsafe rather than merely less informed — shutdown, an exhausted budget, an
+  unreadable fact, and a lost renewal — and an unavailable re-sample stops the chase
+  without abandoning a pass that has already read its evidence.
+
+  The chase NARROWS and does not close: an acceptance still uncommitted at the final
+  sample is unreadable, and `docs/CONFORMANCE.md` carries that residual with its
+  interleaving. Do not read the chase as a fence.
+
+  `Decision`/`DecisionCutoff` are persisted BY the licensing CAS and are immutable
+  once set, because a fresh decision per claimant is destructive without needing any
+  leader transition at all: a claimant that scanned under one cutoff, licensed a
+  publish, published, and crashed before the terminal commit would otherwise be
+  recovered by a peer that samples a LATER cutoff, sees an acceptance that landed in
+  between, and cancels — the same Will reinterpreted from published to suppressed
+  after the irreversible act. `DecisionCutoff` is a POINTER: `LastSeq == 0` is a valid
+  cutoff on a fresh or recreated stream, so a numeric-zero sentinel would collapse "no
+  cutoff" into it. The legal `(state, decision, cutoff)` matrix is enforced at every
+  decode boundary and everything outside it is refused.
+
+  **A bounded scan has to be able to FINISH an unbounded history**, and that needs
+  persisted progress: the record carries `ScanFrom`, the highest `$MQTT_sess` sequence
+  a claimant has examined and REJECTED for this Will, and a later claimant resumes
+  above it. It is sound because a rejection is permanent — the record's predicate
+  inputs (client, epochs, origin sequence, `FireAt`) are immutable and a fact is never
+  rewritten or removed. Without it every claimant restarted at the same sequence, so a
+  non-qualifying prefix long enough to exhaust the budget wedged the Will permanently:
+  neither published nor cancelled, with every lease-expiry recovery re-reading the same
+  prefix. `ScanFrom` is advanced by the RENEWAL CAS, which already writes during a
+  scan, so progress costs no extra round trip; every reclaim carries it forward, and a
+  `pending` record may never hold one (only a claimant renewal sets it, and a claimant
+  is `publishing` by then).
+
+  **It is a `$MQTT_sess` SEQUENCE, so it is meaningless outside the incarnation that
+  issued it**, and it therefore travels with `ScanEpoch`. The pair is validated together:
+  a bare sequence is uncomparable and a bare epoch says nothing. `$MQTT_willq` is not
+  part of the coupled recreation unit, so a pending Will SURVIVES that operation carrying
+  a floor recorded against a stream that no longer exists, while the new one restarts at
+  sequence 1 — which makes this reachable through an operation the documentation
+  supports, not a theoretical concern.
+
+  Both sides are scoped, and each was a live defect when it was not:
+
+  - **Reading.** Honouring a foreign floor skips exactly the facts a cross-incarnation
+    Will qualifies on, and with the floor above the new cutoff the walk runs ZERO times
+    and reports "nothing qualifies" — licensing a publication having read no evidence at
+    all.
+  - **Writing.** Progress is compared against the USABLE floor, never the stored number.
+    Comparing against a numerically larger stale value persists nothing, so every pass
+    re-reads the same prefix and re-exhausts the same budget: the wedge this field exists
+    to prevent, reached by scoping only one of the two sides. The stored number therefore
+    moves DOWNWARDS when a real current-epoch sequence replaces a large foreign one,
+    which is correct and is why monotonicity is a property of the usable floor rather than
+    of the field.
+
+  An ignored floor costs one re-walk, which is the conservative direction.
+
+  Timing is derived from the claim lease (30s) rather than configured beside it:
+  the renewal cadence is `lease/3` and the scan budget `2 x lease`. The one input
+  that is NOT derived is the JetStream request timeout, which is an operator option
+  while the lease is a constant — so an account whose effective timeout is not below
+  the default lease is **REFUSED at account-manager construction**, the same
+  treatment a bad stream shape gets: at or above the lease, a licensing acknowledgement
+  can arrive after a peer has already reclaimed the expired record. The check compares
+  against the DEFAULT lease deliberately, because tests shorten the lease per-manager
+  and a two-second lease against a five-second request timeout is their intent, not a
+  misconfiguration.
+
+  **That check bounds ONE REQUEST, not the worker's licensed lifetime**, and must not be
+  read as the latter. `mqttInitiateMsgDeliveryJSA` fans a Will out to subscribers first
+  — irreversible and external — and only then waits on `mqttSubsBarrier` before storing
+  the QoS 1/2 copy, a wait bounded by SHUTDOWN rather than by the lease. The barrier is
+  held for a whole `processSubs`, which creates a JetStream consumer per filter, so a
+  CONNECT session restore carrying a few dozen subscriptions on a cluster timing
+  requests out holds it past 30s. A peer then reclaims the still-`publishing` record,
+  reuses the persisted decision and publishes again, with both brokers alive and nothing
+  crashed. Bounding the barrier would be worse: the fan-out has already happened, so
+  abandoning there would skip the store that protects the racing subscriber and trade a
+  duplicate for a LOSS. `docs/CONFORMANCE.md` states the resulting failure boundary, and
+  end-to-end phase-aware ownership is a `docs/ROADMAP.md` item. The budget starts
+  BEFORE the cutoff sample, not after it — that sample is itself a JetStream request,
+  and a budget beginning afterwards would leave it unbounded. Both the budget and the
+  shutdown signals are checked BEFORE and AFTER every blocking read, because a request
+  runs to its own timeout and cannot be cancelled: a qualifying answer arriving after
+  shutdown began would otherwise license a durable cancel on a broker that is leaving.
+
+  Three places check them, and each covers a window no other does — the scan's own
+  pre/post-read bracket, the chase before each re-sample, and the final guard before the
+  licensing CAS. The final guard is not redundant: a verdict reached WITHOUT entering the
+  scan's loop (a cutoff at or below its start) is a path the bracket cannot cover, and a
+  qualifying verdict skips the chase entirely. A FOURTH check, between the cutoff read and
+  the scan, was written and then deleted — it caught the same condition one step later
+  than the scan's own pre-read check, so no test could distinguish the two and a mutation
+  of either survived. The rule that separates the three kept from the one deleted is that
+  a check earns its place by having a window a test can distinguish, which is why the
+  chase's is pinned on a SAMPLE COUNT rather than on an outcome.
+
+  An UNCONFIRMED renewal abandons — it may be transient, an
+  ack-lost success, or proof that a
+  recovery claimant advanced the record, and only the last is a verdict, so all three
+  are treated alike. The budget is checked before every fact load AND again
+  immediately before the licensing CAS: a renewed lease is not permission to act once
+  the budget is gone. `finalizeWillPublish` runs only for a licensed publish and
+  requires the current record to carry the SAME decision and cutoff; `ClaimOwner`
+  equality is deliberately not required, because after a lease expires a peer may
+  reclaim and republish that same licensed decision.
+
+Residuals that keep literal exactly-once impossible:
+
+- *At-least-once duplicate* — the sanctioned one, whose boundary is **external
+  publication with no durable evidence of completion**. A crash is one route, not the
+  definition. Two triggers: lease expiry with `done` uncommitted (where a crash, a pause,
+  a partition and a live broker stalled in the shutdown-bounded `mqttSubsBarrier` wait are
+  indistinguishable to recovery — one stall yields two publications, not unboundedly many,
+  since the barrier is per account manager and the reclaiming peer is not stalled); and
+  enqueue ambiguity, where retry exhaustion publishes immediately through the fail-safe
+  while an unconfirmed record may exist and fire later. `docs/CONFORMANCE.md` carries
+  both.
+- *Cross-term claimant divergence* — a distinct destructive class, NOT the sanctioned
+  duplicate, and *Terminal regression*, which is the part of F-030 that stays open.
+  Both are stated with their exact interleavings in `docs/CONFORMANCE.md`.
+
+The reconnect-suppression miss is closed WITHIN a `$MQTT_willq` leader term by the
+permanent facts and the persisted decision. This is a first-release storage format:
+pre-Layer-2 in-record Wills, outbox records without an exact client identity or a
+legal decision shape, and a `$MQTT_sess` stream without a valid generated epoch are
+unsupported and rejected with recreate guidance rather than carried forward.
 
 **Refusal of an unsupported outbox record.** That rejection is a mechanism, not a
 policy statement. Every decoded `$MQTT_willq` record is validated
 (`validateWillOutboxRecord`): a well-formed incarnation generation, a nonzero
 `OriginSessionSeq`, a well-formed `OriginSessEpoch`, a known state, `WillID` and
 `ClientIDHash` that are each a nonempty **single subject token**, and the binding
-that those two identities name the subject the record is stored on. All three
-decode boundaries validate — the point loader, the claim scan, and the cancellation
-scan — so nothing can act on a record that does not satisfy them. The enqueue
-validates before persisting and falls to the immediate-publish fail-safe rather
-than write one; consequently the claimant fence is handed only validated records
-and does not re-check their origin.
+that those two identities name the subject the record is stored on, plus the exact
+`ClientID` the acceptance predicate matches on. **Both** decode boundaries validate —
+the point loader and the claim scan — so nothing can act on a record that does not
+satisfy them. There is no third boundary: the reconnect-time cancellation walk that
+was the third is gone, replaced by the acceptance-fact scan the claimant runs. The
+enqueue validates before persisting and falls to the immediate-publish fail-safe
+rather than write one; consequently the claimant is handed only validated records and
+does not re-check their origin.
 
 Two of those checks answer failure modes the obvious ones do not. Body validation
-alone would admit a well-formed record carrying another client's identities stored
-on this client's subject: it would be fenced with the *other* client's watermark and
-session state, then claimed and published here, and `finalizeWillPublish`'s `WillID`
-equality would not catch it (that detects a post-claim replacement, not a body that
-never matched its subject). And subject equality alone would admit a dotted
-identity: NATS parses these into subject tokens, so a `WillID` of `a.b` on its
-exactly-matching subject is visible to the account scan (`<domainTk>>`) but
-**invisible** to the reconnect-cancel filter (`<domainTk><cidHash>.*`, exactly one
-trailing token), and could fire after a reconnect entitled to suppress it.
+alone would admit a well-formed record carrying another client's identities stored on
+this client's subject, and the suppression predicate would then judge it against the
+WRONG client: `mqttAcceptFactQualifies` matches a fact's exact `ClientID` against the
+record's, so a mismatched body would be tested against acceptances that were never
+this Will's to be suppressed by — while `finalizeWillPublish`'s `WillID` equality
+would not catch it (that detects a post-claim replacement, not a body that never
+matched its subject). And subject equality alone would admit a dotted identity: NATS
+parses these into subject tokens, so a `WillID` of `a.b` would make the subject
+`<domainTk><cidHash>.a.b`, breaking the one-to-one mapping between a subject and the
+`(cidHash, WillID)` pair it is supposed to name — which is what makes the binding
+check meaningful at all, and what keeps `MaxMsgsPer: 1` a per-Will CAS slot rather
+than a per-prefix one.
 
 A record that fails is **refused**: never claimed, never published, never
 cancelled, and never deleted. Deletion is withheld deliberately — it is a mutation
@@ -346,14 +522,12 @@ JetStream message-get per matching record, and neither can skip a record it refu
   refused records add `O(N)` requests to every scan on every broker, on every
   interval, indefinitely. A large enough backlog can push a scan past
   `mqttWillClaimInterval` and **delay valid due Wills**.
-- *The reconnect path, which is worse because a client waits on it.*
-  `cancelWillOutboxOnce` walks one client's filter, and `mqttProcessConnect` calls
-  `cancelWillOutbox` synchronously **before the CONNACK**. So `N` refused records
-  for one client cost `O(N)` serial round trips on **every reconnect of that
-  client, forever**. Returning `nil` on a refused record avoids the retry loop and
-  the spurious error log; it does not avoid the latency. A large enough per-client
-  backlog degrades that client's connect time and can make it effectively unable to
-  connect — an availability cost, not merely a delayed Will.
+- *The reconnect path no longer pays this cost.* It used to be the worse of the two,
+  because a client waited on it: `mqttProcessConnect` called a synchronous per-client
+  cancel walk before the CONNACK, so `N` refused records for one client cost `O(N)`
+  serial round trips on every reconnect of that client, forever. That walk is gone
+  with the reconnect-time cancel itself, so a refused backlog now costs only the claim
+  scan above and no longer degrades a client's connect time.
 
 This is the same accumulation hazard the `DenyDelete` rationale states for the
 stream as a whole, arriving by the other route: there, deletion is denied; here, the
@@ -364,12 +538,13 @@ growing connect cost for the affected client. Deliberately no quarantine stream,
 bounded scan and no reaper: each would be a second mechanism deciding the fate of
 records the bridge has already said it cannot interpret.
 
-Operational constraints for the marker:
+Operational constraints for the coupled streams:
 
-- **Back up, restore, delete, or recreate `$MQTT_sess`, `$MQTT_willcancel`,
-  `$MQTT_teardown` and `$MQTT_origin` as one logical unit.** Recreating only
-  `$MQTT_willcancel` loses suppression evidence and reopens the residual until each
-  affected client reconnects; recreating only `$MQTT_teardown` loses every open
+- **Back up, restore, delete, or recreate `$MQTT_sess`, `$MQTT_teardown` and
+  `$MQTT_origin` as one logical unit.** Recreating `$MQTT_sess` discards every
+  client's permanent acceptance history along with the records, so a delayed Will
+  enqueued beforehand can no longer be suppressed and fires; recreating only
+  `$MQTT_teardown` loses every open
   generation-retirement fence; recreating only `$MQTT_origin` loses every session
   interval identity, so the next record-absent create for each affected client concedes
   a takeover it cannot demonstrate. Recreating `$MQTT_sess` alone is not merely
@@ -390,15 +565,18 @@ Operational constraints for the marker:
   stream's sequence counter, so the next create establishes a strictly higher
   identity — but it weakens recognition for the pruned client until its next
   teardown, which is recorded in `docs/CONFORMANCE.md`.
-- **Retention is intentionally unbounded**: one permanent marker per distinct client
-  ID ever seen (no `MaxAge`). Monitor `$MQTT_willcancel` message count and storage;
-  administrative pruning weakens the guarantee for the pruned client IDs.
-- **The full marker-stream configuration is validated at startup** (see "Stream
-  prerequisites"): `validateWillCancelStream` covers the write/CAS-affecting
-  settings (`NoAck`, `Sealed`, `SubjectTransform`, `MaxMsgSize`, …) beyond the
-  state shape. `DenyDelete`/`DenyPurge` remain deliberately unchecked — no
-  operation ever deletes or purges a watermark, so they are audited
-  non-prerequisites, not oversights.
+- **Acceptance-fact retention is intentionally unbounded and shares `$MQTT_sess`**:
+  one permanent record per ACCEPTED CONNECT — not per client — so the stream grows
+  with connection churn rather than with the client population, which is a different
+  and faster growth curve from the per-client watermarks it replaces. Nothing reaps a
+  fact: retiring one needs proof that no delayed Will it could still suppress remains,
+  which nothing here has. Monitor `$MQTT_sess` message count and storage.
+  Administrative pruning of facts silently removes suppression evidence and can let a
+  superseded Will fire; `docs/CONFORMANCE.md` records it.
+- **The full `$MQTT_sess` configuration is validated at startup** (see "Stream
+  prerequisites"), including the exact two-subject set and `AllowAtomicPublish`. A
+  stream that merely looked right — one subject space, or batches disabled — would
+  fail every CONNECT at the accept batch rather than degrade quietly.
 
 ### Two frontends taking over one session from the same base
 
@@ -900,12 +1078,6 @@ already had, changing only what is reported:
 | CONNECT-time classified saves (`reconcileResumedConsumers`, `grantRequestedLifetime`) | the same disposition, forked vocabulary. Their **10071** arms disposed with no readback at all, so they now read once and classify — the only new I/O in the mechanism, on a pre-CONNACK rejection path |
 | the persist observation (`evictDisplacedOnRemotePersist`) | the same eviction — the record provably moved with content that is not ours — with the forked vocabulary, and the displaced incarnation's **delayed-Will outbox record is left alone**, because nothing arbitrated a session continuation. See below for the worker this route required |
 
-A fifth site, the CONNECT rollback readback (`rollbackAcceptedSession`), classified any
-connected record above the candidate sequence as a legitimate newer generation and
-**cancelled the expiry timer** on it. A proven sibling now yields `rollbackForked`, which
-preserves the timer and emits no "session store unavailable" warning, since nothing about
-the store was unavailable.
-
 **What is reported travels as one value** (`mqttDisposalVocabulary`): reason code, Reason
 String, log line and close reason. Passing a reason code alone emits 0x89 alongside
 "session taken over by a new connection", which is precisely the claim the verdict exists
@@ -1118,13 +1290,13 @@ bound and unbound rejection halves at once — the bound half never disposes, an
 its verdict and the asynchronous unbind the reconnect can arrive first), both
 `classifyAttemptReadback` callers (the initial readback and the post-re-attempt one are
 separate classifications), `resolveContendedRecordSave`'s moved closure,
-`disposalForDirectRejection`, `evictDecideOnce`, and `rollbackAcceptedSession`'s classify.
-**There is no site-specific refusal**, including at the rollback: once a repair-bearing
-accept save has landed and the rollback finds a sibling of it, the grant the capsule
-contributed is durably erased again, so refusing there would lose a grant this feature had
-just repaired. What makes that safe on a CONNECT that repaired nothing is a property, not
-a special case — **an empty delta mints nothing**, and "empty" means no changes, no nonces
-and no PUBREL consumer, since those are independent persisted members. No other verdict
+`disposalForDirectRejection`, `evictDecideOnce`, and `resolveAcceptPair` — the accepted
+CONNECT's paired classification, whose forked arm is reached from the FACT's verdict
+rather than the record's and would otherwise leave that repair unrecorded.
+**There is no site-specific refusal.** What makes that safe on a CONNECT that repaired
+nothing is a property, not a special case — **an empty delta mints nothing**, and "empty"
+means no changes, no nonces and no PUBREL consumer, since those are independent persisted
+members. No other verdict
 mints: the write landed (`mqttRejectionOurs`), contention is never ownership (`Keep`),
 nothing was established (`Unresolved`), and a demonstrated successor descends from our
 record so our change is in its ancestry. `evictDecideOnce` holds `as.mu` for its whole
@@ -1475,7 +1647,8 @@ NATS traffic on those subjects:
 | `$MQTT.rmsgs.<subject>` | every retained message |
 | `$MQTT.sess.<domain>.<hash>` | session records |
 | `$MQTT.JSA.<...>` | JetStream API replies and session-persist broadcasts |
-| `$MQTT.willq.*`, `$MQTT.willcancel.*` | delayed-Will outbox and cancel watermarks |
+| `$MQTT.willq.*` | delayed-Will outbox |
+| `$MQTT.accept.*` | permanent per-CONNECT acceptance facts |
 | `$MQTT.teardown.<domain>.<hash>` | generation-retirement watermarks |
 | `$MQTT.origin.<domain>.<hash>` | session-interval registers: the identity a record-absent create inherits when no retirement watermark survives |
 | `$MQTT.qos2.in.<hash>.<gen>.<pi>[.rel]`, `$MQTT.out.*` | inbound QoS 2 move state and its release claim, outbound PUBREL state, and session-affine shared QoS 2 copies |
@@ -2851,11 +3024,11 @@ CONNECT *refuses* rather than discarding — and a record whose names are not th
 session's is condemned by nobody. The create-side reader names no target and deletes
 nothing, so it has none to validate.
 
-Nothing ever reaps a watermark. Storage is bounded by the client-ID population, as it
-is for the `$MQTT_willcancel` markers, and permanence is what keeps the residual from
-being widened by a GC choice. Because `mseq` is a `$MQTT_sess` sequence, the two
-streams are one logical unit: `$MQTT_teardown` carries the adopted session-stream
-incarnation epoch in its metadata and a mismatch is **refused at startup** — see
+Nothing ever reaps a watermark. Storage is bounded by the client-ID population, and
+permanence is what keeps the residual from being widened by a GC choice. Because
+`mseq` is a `$MQTT_sess` sequence, the two streams are one logical unit:
+`$MQTT_teardown` carries the adopted session-stream incarnation epoch in its
+metadata and a mismatch is **refused at startup** — see
 "Stream prerequisites".
 
 The deliberate exception to the fence is a crash *between* the won claim and the
