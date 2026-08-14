@@ -1917,7 +1917,7 @@ the compatibility boundary (no released contract exists for either):
   a post-start config/stream mutation can — a persisted expiring v5 Will then
   stalls with logged store rejections and lease retries (never silently lost)
   until the stream is fixed. Recreate per the compatibility boundary. The
-  support floor is nats-server 2.14, which always understands `AllowMsgTTL`.
+  support floor is nats-server 2.14.5, which always understands `AllowMsgTTL`.
 - **The two inherited upstream migrations are gone.** Pre-2.10 nats-server
   per-client `$MQTT_sess_<hash>` session streams and pre-2.10.10 single-subject
   retained messages are no longer transferred at startup — and they are no

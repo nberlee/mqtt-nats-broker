@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the embedded and CI nats-server dependency from 2.14.4 to 2.14.5,
+  including its matching compression and `x/crypto`/`x/net` dependency updates.
+  The external-server support floor is now 2.14.5: it includes the term-fenced
+  Raft proposal behavior shipped in 2.14.4 and fixes the idempotent stream-create
+  data-loss path directly relevant to bridge provisioning. Every JetStream peer
+  must meet the floor; mixed-version clusters are unsupported.
+
 ### Added
 
 - **Working MQTT TLS and mutual TLS listener, failing closed.** The server-side TLS

@@ -18,9 +18,9 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
-The 33 closed findings are indexed in the [finding dossiers](findings/README.md).
+The 34 closed findings are indexed in the [finding dossiers](findings/README.md).
 Of those, 31 are retained in the
-[resolved-findings archive](findings/resolved.md); F-027 and F-029 remain in the
+[resolved-findings archive](findings/resolved.md); F-027, F-029, and F-031 remain in the
 mixed-status [HA arbitration dossier](findings/ha-arbitration.md) beside their open
 follow-ups. The entries below are the active release view; their linked dossiers
 are canonical for mechanism, evidence, rejected designs, tests, and residuals.
@@ -68,11 +68,13 @@ guide from NATS Server's embedded MQTT listener.
 Decided 2026-08-10: the first alpha supports multiple MQTT frontends against a
 replicated JetStream cluster, keeping the README's horizontally scalable,
 cross-instance HA promise. Every item in this subsection is therefore an
-unconditional alpha blocker. Their shared dependency is that JetStream
-per-subject CAS linearizes only within a leader term ("JetStream behaviors this
-design depends on", `docs/ARCHITECTURE.md`), so F-027, F-029 and F-036 are one
-arbitration design, made before the per-stream write-lineage items rather than
-per stream.
+unconditional alpha blocker. The lineage work was designed against the observed
+pre-2.14.4 window in which stale stream-leader work could propose after a fast
+election. nats-server 2.14.4 then shipped term-fenced Raft proposals
+([platform audit](findings/nats-platform.md#term-fenced-raft-proposals)). Before
+adding any more lineage, prove at the broker boundary whether that upstream change
+eliminates the shared same-base window; only the evidence may close or shrink the
+per-stream findings.
 
 - [x] Decide and document the first-alpha HA support level. Decided: multi-frontend
   HA stays in alpha scope. The README already promises it, the architecture is
@@ -327,22 +329,23 @@ per stream.
   divergence. R1 and R4 are WIDENED to the no-watermark population, stated rather than
   claimed away.
 - [ ] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
-  **Large.** NARROWED, not closed. Its cancellation half is closed **within a
-  `$MQTT_willq` leader term** by the acceptance-fact change below: a claimant claims
-  before it decides, persists the decision and its cutoff with the licensing CAS, renews
-  while scanning, and a recovering claimant EXECUTES that decision instead of re-deciding.
-  What remains open is the TERMINAL REGRESSION: a committed `done` overwritten by a stale
-  cross-term reclaim leaves the record re-fireable, and the persisted decision makes the
-  republication deterministic. That is this finding's own recorded consequence and NOT the
-  sanctioned at-least-once duplicate. The line between them is EVIDENCE, not whether a
-  broker crashed: the sanctioned duplicate republishes because the system genuinely lacks
-  proof of completion — whether a lease lapsed with `done` uncommitted or an ambiguous
-  enqueue published through the fail-safe — whereas here `done` COMMITTED and a stale
-  cross-term reclaim overwrote it, discarding evidence already held. Stating the
-  sanctioned boundary as "external publication without durable completion evidence"
-  rather than "a crash" does not touch that distinction.
-  Closing it needs non-regressible or recognisable terminal completion on `$MQTT_willq`;
-  `TestWillTerminalRegressionConsequence` pins the shape such a mechanism must kill.
+  **Dependency investigation before implementation.** NARROWED by F-031 and now
+  potentially closed at the common source by nats-server 2.14.4's term-fenced
+  proposals. The remaining TERMINAL REGRESSION requires a stale cross-term reclaim
+  to overwrite committed `done`; `TestWillTerminalRegressionConsequence` currently
+  injects that consequence with an unconditional write and is explicitly not evidence
+  that the supported server permits it. Closing this item requires a deterministic R3
+  regression that holds the CAS-checked reclaim across the leadership transition,
+  proves the old window is reached on pre-2.14.4, and proves neither the reclaim nor a
+  second publication can land on the supported floor. Keep that exact JetStream-level
+  composition regression as a repository-owned, CI-executed version-bump gate; the
+  generic Raft term test plus an ordinary stale-CAS bridge test are not equivalent.
+  Then replace the synthetic consequence test, remove the stale residual from
+  architecture/conformance, and audit outbox/session lineage for deletion. If the
+  broker-level test disproves the upstream closure, stop and design recognisable
+  terminal completion; do not infer it from the release note. Full protocol and
+  stopping rule in the
+  [F-030 dossier](findings/ha-arbitration.md#upstream-term-fence-and-closure-plan).
 - [x] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).
   **Large.** CLOSED by DELETING the watermark rather than by adding lineage to it.
   `$MQTT_willcancel` is gone. An accepted CONNECT writes one permanent, dated acceptance
@@ -361,11 +364,12 @@ per stream.
   final sample, which is irreducible while eligibility is dated by `At` and a due Will
   must still be decided. All three in `docs/CONFORMANCE.md`.
 - [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
-  **Large.**
+  **Dependency investigation.** Run the F-030 term-fence proof first; add lineage
+  only if a supported server can still land the same-base cross-term survivor.
 - [ ] [F-033: Add write lineage to shared QoS 2 assignments](findings/ha-arbitration.md#f-033).
-  **Large.**
+  **Dependency investigation.** Same common gate as F-032.
 - [ ] [F-034: Add write lineage to outbound in-flight registers](findings/ha-arbitration.md#f-034).
-  **Large.**
+  **Dependency investigation.** Same common gate as F-032.
 - [x] **Slice A of the arbitration design: the session-record watch.** Ownership changes
   only by a write to the client's record subject, so the observation channel is now a
   per-broker ephemeral consumer on `$MQTT_sess` instead of the at-most-once
@@ -408,9 +412,12 @@ per stream.
   a create whose response was lost, so retries no longer ACCUMULATE them. What is left
   is the rollback delete itself failing or being lost: the stray consumer is then
   reaped by its five-minute inactivity threshold, which bounds lifetime rather than
-  cardinality. **Small.** Closing it needs durable cleanup tracking or stable
-  per-broker consumer identities (a stable name makes a retry reuse the same consumer
-  instead of minting another). Found by the Slice A holistic review.
+  cardinality. **Small.** Close it with one unguessable process identity that derives
+  a stable consumer name AND delivery subject per account/purpose, so a retry repeats
+  the same consumer configuration. Add consumer metadata for owner, purpose, process
+  instance and schema; `InactiveThreshold` remains crash cleanup. Do not use a
+  user-configurable node name that two live brokers could share. See the
+  [platform audit](findings/nats-platform.md#stable-ephemeral-consumer-identities-and-metadata).
 - [ ] Give a vanished record its own disposal vocabulary. The deleted-record arm reports
   0x8E "session taken over by a new connection", which is right about the ownership fact
   and wrong about the cause when the deletion was expiry-driven: no new connection need
@@ -457,7 +464,8 @@ takeover.
   **Medium.** The durable record and resume decision must agree even after an
   ambiguous write.
 - [ ] [F-039: Restore shared membership during SUBSCRIBE rollback](findings/runtime-correctness.md#f-039).
-  **Small.**
+  **Small.** Independent of the F-030 term-fence work: this is a missing in-memory
+  `sharedSubs` restoration, not a JetStream CAS failure.
 - [ ] [F-045: Release stranded shared pending state at membership removal](findings/runtime-correctness.md#f-045).
   **Medium.**
 - [ ] [F-050: Refuse or retry an incomplete shared-subscription restore](findings/shared-qos2.md#f-050).
@@ -484,6 +492,11 @@ takeover.
   delivery — the watermark alone cannot. Scope it by arm: a stale entry on an
   indexed subject is already reconciled by the next matching subscription after
   cache expiry, so the work that has no existing repair is the ABSENT entry.
+  Evaluate `SubjectDeleteMarkerTTL` as the expiry signal in this SAME change:
+  recognize `Nats-Marker-Reason: MaxAge` before MQTT decoding and order the marker
+  by stream sequence, while keeping explicit empty-body MQTT tombstones. Markers do
+  not replace replay/reconciliation and require an `AllowRollup`/purge ACL review.
+  See the [platform audit](findings/nats-platform.md#subject-delete-markers-for-retained-convergence).
 - [ ] [F-060: Report a failed retained store to the publisher](findings/runtime-correctness.md#f-060).
   **Small to medium.** A PUBLISH whose RETAIN side failed to store is reported as
   successful, contrary to [MQTT-3.3.1-5]. Decide the contract for QoS 0 —
@@ -608,7 +621,9 @@ finding with acceptance criteria.
   retained stream a supported topology, but the only test of it lives in the
   unbuilt `mqttport_clustertests` reference file, so nothing running exercises a
   record arriving through a source with a subject transform. Establish whether a
-  native test can stand it up; if it can, the test is release verification.
+  native test can stand it up; if it can, the test is release verification. Include
+  TTL expiry and any F-059 delete marker through the source: source/mirror marker and
+  TTL behavior differs, so the unsourced test is not a substitute.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 
@@ -711,6 +726,13 @@ behavior when no container limit is configured.
   concise file or package documentation.
 - [ ] Do not preserve file layout merely to keep a line-by-line upstream diff;
   maintainability of this broker is the controlling requirement.
+- [ ] Introduce a narrow JetStream transport boundary and migrate ordinary
+  stream/consumer CRUD, info, publish-ack and double-ack operations incrementally to
+  `nats.go/jetstream`. Preserve per-client authorization connections and a thin raw
+  adapter for atomic-batch framing and unsupported endpoints. Spike ordered consumers
+  for the two observation consumers only after the F-030 lineage-deletion audit, and
+  adopt them only if failure semantics and measurements improve. See the
+  [platform audit](findings/nats-platform.md#staged-use-of-the-high-level-jetstream-client).
 
 ### Dead-code and reachability cleanup
 
@@ -750,7 +772,11 @@ them in order where a later lint change depends on an earlier cleanup.
   Look for avoidable request/reply round trips, repeated stream or consumer
   lookups, serial operations that can be batched or run concurrently, full
   scans where direct lookups are available, and polling that can be replaced by
-  push or event-driven behavior.
+  push or event-driven behavior. Keep the leader-routed management GET for
+  correctness-sensitive loads: Direct multi/batch Get lacks read-after-write
+  coherence. The [platform audit](findings/nats-platform.md#deliberate-non-adoptions)
+  records this and the pinned-consumer, KV/counter, pause/reset, and fast-batch
+  non-adoptions so the audit starts from decisions rather than rediscovering them.
 - [ ] Benchmark the current and proposed JetStream paths under connect,
   subscribe, publish, reconnect, retained-message, and session-recovery loads.
   Record request counts, transferred bytes, latency, and NATS/JetStream load;
@@ -764,6 +790,18 @@ them in order where a later lint change depends on an earlier cleanup.
   disconnect, expire sessions, fail over, and reload TLS. Use heap and goroutine
   profiles plus leak detection to prove memory and resource counts return to a
   stable baseline after work drains; fix every confirmed leak before alpha.
+
+### NATS platform follow-ups
+
+- [ ] Enable `js_ack_fc_v2` in clustered CI and prove the bridge's dual-layout ACK
+  parser and ACLs accept the domain/account-aware subjects announced as the v2.15
+  default. This is a compatibility test, not a production feature toggle.
+- [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
+  A schedule may publish only into its own stream, so the ADR must preserve F-031's
+  atomic `$MQTT_sess` record/acceptance fact and must not claim cross-stream
+  cancellation. The broker, not the scheduler, remains responsible for MQTT publish
+  semantics. See the
+  [platform audit](findings/nats-platform.md#message-schedules-post-alpha-will-outbox-spike).
 
 ## 3. Add MQTT transports
 
@@ -892,6 +930,9 @@ The first alpha may be tagged only when:
   confirmed finding with an explicit release disposition.
 - [ ] Every post-alpha candidate has an explicit disposition; an unchecked
   post-alpha item does not by itself block the alpha.
+- [ ] A repository documentation check proves every canonical `F-###` dossier
+  appears exactly once in the active or resolved finding index and that the
+  roadmap's closed total matches the index.
 - [ ] The full test, race, lint, conformance, Paho, container, and deployment
   gates pass with no unexplained failures or skips.
 - [ ] CI is green from a clean checkout on every supported architecture.

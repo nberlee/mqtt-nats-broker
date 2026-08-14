@@ -7,15 +7,20 @@ retain failure mechanisms, invariants, rejected approaches, tests, and residual 
 Stable IDs do not change when a title, priority, or status changes. Plans, tests,
 commits, and architecture notes may refer to a finding by its `F-###` identifier.
 
+Cross-cutting JetStream feature decisions that are not independent correctness
+findings live in the [NATS platform-adoption audit](nats-platform.md). Its actionable
+work is merged into the existing finding or roadmap item whose invariant it serves.
+
 ## Active findings
 
 - Preserve deferred disconnect state during foreign disposition.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
 - Add write lineage to the Will outbox.
-  Status: Open — narrowed. Release treatment: Alpha blocker.
-  Details: [F-030](ha-arbitration.md#f-030). Its cancellation half is closed within a
-  `$MQTT_willq` leader term; the terminal regression stays open.
+  Status: Open — upstream dependency under proof. Release treatment: Alpha blocker.
+  Details: [F-030](ha-arbitration.md#f-030). nats-server 2.14.4 term-fenced proposals
+  target the stale-leader route; deterministic differential evidence is required before
+  the terminal regression can close.
 - Add write lineage to inbound QoS 2 holds and release claims.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-032](ha-arbitration.md#f-032).
@@ -78,6 +83,12 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
 - Refuse or retry a CONNECT with incomplete shared-subscription restoration.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-050](shared-qos2.md#f-050).
+- Arbitrate retained-index application by stream sequence.
+  Status: Open. Release treatment: Alpha blocker.
+  Details: [F-059](runtime-correctness.md#f-059).
+- Report a failed retained store to the publisher.
+  Status: Open. Release treatment: Alpha blocker.
+  Details: [F-060](runtime-correctness.md#f-060).
 - Send a CONNACK before closing an unauthorized CONNECT.
   Status: Open. Release treatment: Post-alpha candidate; promote if a conformance
   suite or an operator report shows the missing CONNACK in practice.
@@ -169,6 +180,8 @@ commits, and architecture notes may refer to a finding by its `F-###` identifier
   Details: [F-027](ha-arbitration.md#f-027).
 - Arbitrate simultaneous takeovers from one session-record base.
   Details: [F-029](ha-arbitration.md#f-029).
+- Replace the Will-cancellation watermark with an immutable acceptance fact.
+  Details: [F-031](ha-arbitration.md#f-031).
 - Replace legacy reserved-subscription migration with current-schema refusal.
   Details: [F-057](resolved.md#f-057).
 - Remove inherited retained-message format and delete-protocol compatibility.

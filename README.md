@@ -31,12 +31,14 @@ sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Quickstart
 
-**Requires nats-server 2.14 or newer.** Releases before 2.14 are explicitly
+**Requires nats-server 2.14.5 or newer.** Earlier releases are explicitly
 unsupported — not degraded, not fallback-handled. The bridge's durability
 guarantees rest on specific JetStream behaviors (per-subject CAS, interest
 retention, deduplication, per-message TTL, double ack); those are asserted against
-2.14 and validated at startup rather than worked around. `go.mod` pins the exact
-version tested. See "JetStream behaviors this design depends on" in
+the supported line and their stream prerequisites are validated at startup rather
+than worked around. The external cluster's version is an operator prerequisite:
+every JetStream peer must meet the floor, and a mixed-version cluster is unsupported.
+`go.mod` pins the exact version tested. See "JetStream behaviors this design depends on" in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the list a version bump has to
 re-verify.
 

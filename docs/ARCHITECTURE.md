@@ -36,9 +36,11 @@ current `nats-server/v2` dependency in `go.mod` and exercised in CI. The bridge
 does not maintain alternate code paths for older JetStream APIs or semantics.
 When the dependency advances, plans may adopt the new current behavior directly.
 
-The floor is **nats-server 2.14**. Older releases are unsupported outright: there
-are no fallbacks, and where a behavior below is load-bearing it is validated at
-startup and failed closed rather than degraded.
+The floor is **nats-server 2.14.5**. Older releases are unsupported outright: there
+are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
+is unsupported. Stream-shape prerequisites are validated at startup and fail closed,
+but the bridge cannot infer every peer's binary version from one client connection,
+so the cluster-wide version floor is an explicit deployment prerequisite.
 
 This boundary applies only to bridge persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
@@ -51,20 +53,17 @@ code assumes. This is the list a version bump has to re-verify — it is what ma
 the "no fallbacks" stance reviewable rather than implicit.
 
 - **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
-  is accepted only if the subject's last sequence matches, giving every state
-  machine its linearization point — **within a leader term**. The check is made
-  before the proposal and never re-made at apply (`canConsistencyCheck :=
-  !isClustered`, `server/stream.go`), so a transition that clears the in-process
-  map while a replicated proposal survives can admit a second same-base write and
-  apply both. Every arbitration in this broker rests on that contract, so the
-  window belongs to all of them, not to any one writer; `docs/CONFORMANCE.md`
-  states it as a residual. The window itself cannot be closed here — production
-  NATS is external, and the only apply-time-rechecked precondition
-  (`Nats-Expected-Last-Msg-Id`) compares a stream-wide value — so `$MQTT_sess`
-  carries a **parent pointer** instead, which makes the outcome *recognisable*
-  rather than preventable (see "Recognising a forked session record" below). The
-  other arbitrated streams have no such identity yet; each has its own roadmap
-  bullet. A rejection is reported structurally
+  is accepted only if the subject's last sequence matches. The check is made before
+  the proposal and is not repeated at clustered apply (`canConsistencyCheck :=
+  !isClustered`, `server/stream.go`). Since 2.14.4, however, JetStream passes the
+  stream leadership term into Raft and Raft rejects a proposal whose captured term
+  is no longer current (`nats-io/nats-server#8370`); leadership changes also tear
+  down the prior stream-leader state. F-030 owns the deterministic differential
+  proof of whether that upstream fence eliminates the previously documented
+  same-base cross-term window at the broker boundary. Until that proof and its
+  consequence-specific audits land, the existing lineage and conformance residuals
+  remain conservative rather than being deleted from source inspection alone. A
+  rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
   every rejection is resolved by re-reading rather than classified directly.
