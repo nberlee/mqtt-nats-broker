@@ -2,15 +2,24 @@
 // broker was acknowledged for.
 //
 // Every durable arbitration here is a per-subject JetStream CAS
-// (Nats-Expected-Last-Subject-Sequence), and that header is a linearization point only
-// WITHIN a leader term. At the pinned nats-server v2.14.4 the check runs once, before
-// the proposal (checkMsgHeadersPreClusteredProposal, server/jetstream_batching.go),
-// against applied state plus an in-process map that processStreamLeaderChange nils on
-// every transition (server/jetstream_cluster.go); the clustered apply never re-checks it
-// (`canConsistencyCheck := !isClustered || traceOnly`, server/stream.go). So a proposal
-// accepted under one leader can survive the election unapplied while the NEW leader
-// admits a second write against the SAME base, and both apply in log order — last apply
-// wins, and MaxMsgsPer:1 discards the other.
+// (Nats-Expected-Last-Subject-Sequence). At the pinned nats-server v2.14.5 the check
+// runs once, before the proposal (checkMsgHeadersPreClusteredProposal,
+// server/jetstream_batching.go), against applied state plus an in-process map that
+// processStreamLeaderChange nils on every transition (server/jetstream_cluster.go); the
+// clustered apply never re-checks it (`canConsistencyCheck := !isClustered ||
+// traceOnly`, server/stream.go).
+//
+// This machinery was designed against the reading that a proposal accepted under one
+// leader could therefore survive the election unapplied while the NEW leader admitted a
+// second write against the SAME base. **That reading was MEASURED and does not hold on
+// the supported floor** — see test/depproof, which enumerates every route to such a
+// proposal, fixtures the two live ones and refutes the rest, with a mutation per
+// mechanism (F-030). It was measured on $MQTT_willq's CAS shape, which is this one.
+//
+// What that does NOT retire is the rest of this file's job. Recognition here also
+// covers an ambiguous acknowledgement, an out-of-band deletion and a stream
+// recreation — none of them proposal-ordering questions — so the machinery stands
+// until the roadmap's obligation-by-obligation deletion audit says which parts do not.
 //
 // The observable damage is not the lost write. It is what the broker CONCLUDES from it:
 // its next CAS is rejected, it re-reads, finds a record it did not write, and reports

@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-bridge
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite cluster-failover-tests soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite cluster-failover-tests depproof soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -34,6 +34,9 @@ full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 
 cluster-failover-tests: ## Run the 3-node JetStream tests: Will-outbox failover and takeover arbitration.
 	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)' ./internal/mqtt/
+
+depproof: ## Dependency proof for F-030: the JetStream route regressions plus every mutation
+	./test/depproof/run.sh --matrix
 
 soak: ## Paired flakiness soak: same gated tests on this tree vs a clean baseline
 	SOAK_RUNS=$(SOAK_RUNS) SOAK_RUN='$(SOAK_RUN)' SOAK_BASE=$(SOAK_BASE) SOAK_DIR=$(SOAK_DIR) \

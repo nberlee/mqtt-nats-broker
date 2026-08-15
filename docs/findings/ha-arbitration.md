@@ -4,6 +4,17 @@ These findings share one architectural dependency: JetStream per-subject CAS is 
 linearization point only within a leader term. Treat them as one design epic before
 scheduling stream-specific work.
 
+**That shared premise was MEASURED on 2026-08-15 rather than assumed, and it did not
+hold up.** F-030 enumerated every route a write conditioned on a superseded base could
+take to a proposal across a leader transition and exercised each against the supported
+floor (`test/depproof/`). The old-term route is closed on evidence that stands alone.
+The new-leader route was refused in every run measured, but its oracle has yielded a
+distinct false-positive path in each of four review rounds, so it is recorded as
+observed rather than accepted as closed, and F-030 stays open and narrowed. The
+mechanisms are stream-independent, so F-032 through F-034 inherit the route inventory
+and the harness — but each owns a consequence of its own, and none closes on this
+evidence alone.
+
 Multi-frontend HA is supported alpha scope (decided 2026-08-10, `docs/ROADMAP.md`
 section 0.2), so every finding here is an unconditional alpha blocker.
 
@@ -238,7 +249,13 @@ condemned by the retirement fence.
 
 **Title:** Add write lineage to the Will outbox
 
-- Status: **Open — narrowed**
+- Status: **Open — NARROWED, 2026-08-15.** Not closed, and not because a defect was
+  found: the property was measured and holds in every run. One of its two live routes
+  (R-old) is closed on evidence that stands alone; the other (R-new) is OBSERVED to hold
+  but is not accepted as harness-enforced closure, because four review rounds each found
+  a distinct false-positive path in that route's oracle. What is missing is confidence in
+  the instrument, not a suspected hole in the server. Evidence and inventory in
+  `test/depproof/`.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 30
@@ -252,40 +269,151 @@ condemned by the retirement fence.
   was supposed to have retired it. The record shape and the classifier from
   `sess_fork_lineage.go` are reusable; this stream's CONSEQUENCE analysis is not.
 
-### What the acceptance-fact change did, and did not, close
+### What the acceptance-fact change had already closed
 
-The **cancellation half is closed WITHIN a `$MQTT_willq` leader term.** Every claimant
-now takes its claim before it decides, persists the decision and the cutoff it was taken
-under with the CAS that licenses it, renews that claim while scanning, and re-checks its
-budget immediately before licensing. A recovering claimant EXECUTES the persisted
-decision instead of re-deciding, so the destructive in-term interleaving — publish under
-one cutoff, crash, recover under a later one and cancel — is gone. That qualification
-matters: nothing here claims to eliminate spurious fires across a leader transition.
+The **cancellation half** was closed WITHIN a `$MQTT_willq` leader term by F-031: every
+claimant takes its claim before it decides, persists the decision and the cutoff it was
+taken under with the CAS that licenses it, renews that claim while scanning, and
+re-checks its budget immediately before licensing. A recovering claimant EXECUTES the
+persisted decision instead of re-deciding.
 
-The **terminal-regression half stays OPEN, and this is why the finding is not ticked.**
-A committed `done` can still be overwritten by a stale cross-term reclaim:
+What stayed open was the **terminal half**: a committed `done` taken back to
+`publishing` by a write conditioned on the base `done` replaced, after which a claimant
+enters on the persisted decision and republishes. That is not the sanctioned
+at-least-once duplicate — this repository draws that line by EVIDENCE rather than by a
+crash, and here completion evidence the system already held would have been discarded.
 
-> The record at `S` is `(publishing, publish, U)`; A publishes; A's `publishing -> done`
-> CAS at `S` is accepted but not yet applied; a leader transition clears the in-process
-> per-subject state; B's reclaim at `S` is accepted from the older `publishing` body,
-> preserving `(publish, U)`; A's `done` applies; **B's reclaim applies after it and
-> overwrites `done`**; B enters on the persisted decision and republishes without
-> scanning.
+### What has been established, and what has not
 
-That is exactly this finding's recorded "re-fired after `done` was supposed to have
-retired it", and the persisted decision makes the republication DETERMINISTIC rather
-than accidental. It is **not** the sanctioned at-least-once duplicate, which this
-repository defines by EVIDENCE rather than by a crash: external publication with no
-durable proof of completion, reached either by lease expiry with `done` uncommitted or by
-an ambiguous enqueue whose fail-safe publishes while an unconfirmed record may exist. In
-both, completion is genuinely unknown. Here `done` COMMITTED and was then regressed —
-evidence the system already held, discarded. Reclassifying it would
-close this finding by weakening the contract that created it.
+By testing the premise instead of building on it. The premise was that a write's
+per-subject expectation is checked pre-proposal and the in-process map is cleared by a
+leader transition, so two writes taken from one base could both apply. Every
+`$MQTT_willq` write this broker makes is already conditional, so the finding reduces
+entirely to a property of the server, and the server was measured — on the supported
+floor and on a generation predating its proposal fence.
 
-Closing it needs a mechanism that makes terminal completion **non-regressible or
-recognisable** on `$MQTT_willq` — which is what the original finding proposed, and which
-the cancellation analysis refuted only for the other half. The shape such a mechanism
-must kill is pinned by `TestWillTerminalRegressionConsequence`.
+`test/depproof/` holds the route inventory, the fixtures and one mutation per
+mechanism, driven by `test/depproof/run.sh --matrix` (also `make depproof`) inside
+isolated nats-server checkouts. Two routes can carry such a write to a proposal across
+a transition, and each is refused by a named mechanism:
+
+- **R-old — CLOSED.** An operation whose captured proposing term outlives that term,
+  refused by Raft's comparison of the captured term against the current one
+  ([`nats-io/nats-server#8370`](https://github.com/nats-io/nats-server/pull/8370), in
+  the 2.14.5 floor). Two mutations discriminate it: removing the comparison, and
+  substituting the node's current term for the one the operation captured.
+- **R-new — OBSERVED, NOT ACCEPTED AS CLOSED.** A newly elected leader admitting a
+  CURRENT-term write, which the term comparison cannot refuse. Refused by two
+  mechanisms, each with its own mutation. A READINESS envelope with two redundant
+  halves: a node behind on applies does not take
+  leadership, and a new leader is not announced as serving until the log it was elected
+  with has been processed. Each half is isolated by its own mutation, and the redundancy
+  is measured — with the campaign refusal alone removed a node leads from a stale applied
+  view and the stream still refuses to serve; with the announcement alone removed nothing
+  changes at all; only with both removed does a leader serve from the superseded base and
+  propose a write carrying it, while the unmutated server produces neither. Then, once a
+  leader IS serving, the per-subject expectation it compares against is reconstructed
+  from its own APPLIED state, which contains `done`; bypassing exactly that comparison
+  is the second mutation.
+
+Eight further shapes — a stale-log election, in-term contention, an unclustered stream,
+the batch path, `ForwardProposal`, mirror or source ingestion, this broker's own
+sequence-targeted deletes, and an entry that reaches the log anyway — are refuted in
+writing in `test/depproof/README.md` rather than left unnamed, because the closure claim
+is the INVENTORY, not the fixtures.
+
+### The control run falsified the plan's own prediction
+
+The plan required a v2.14.3 control showing "both operations apply and the stale
+reclaim is the surviving record". **That prediction is false, and is recorded here
+rather than quietly restated.** What v2.14.3 shows is that the older-term write IS
+ADMITTED at the proposal boundary — which is the mechanism #8370 changed, and is what
+makes the fixture evidence rather than an artefact — but the entry is then discarded by
+two version-common backstops: the apply-time log-order comparison, and beneath it the
+store, which refuses any sequence that is not the next one. So the proven version
+difference is proposal ADMISSION, and the terminal record stands on both generations.
+Neither backstop is mutation-proved and neither is part of the claim: making an
+admitted entry survive would take a second mutation to the store itself, which is a
+server that does not exist.
+
+That is why every fixture asserts at the boundary its mutation targets, with the
+record-state assertions kept as documented defence in depth: a fixture asserting only
+the final record could not discriminate any of these mechanisms, since the record
+survives with all but one of them removed.
+
+### What is required before this finding can be ticked
+
+Nothing about the server, on present evidence: R-new's mechanisms refused the write in
+every run measured, and no run has ever produced the hazard on the supported floor. What
+is missing is confidence in the INSTRUMENT.
+
+Four adversarial review rounds each found a distinct false-positive path in R-new's
+oracle — a mutation that staged the wrong state and reported success; a scorer that
+counted a kill without its boundary assertion firing; a scorer that required a marker but
+did not forbid the others; and a fixture whose final observation was unmarked, so a late
+proposal scored as the expected kill. Each was real and each was fixed, and the last of
+them is fixed here. But four rounds of one class — *an assertion whose failure the oracle
+cannot see* — is itself evidence about the harness rather than about the server, and a
+closure claim that rests on that harness should not be made until the class stops
+recurring.
+
+Concretely, closing this needs: every failure path in the R-new fixtures observable by
+the scorer; a negative check per row proving the scorer rejects the neighbouring outcome;
+and review rounds that stop finding new false-positive paths. R-old does not wait on any
+of that — its fixture, its two mutations and the v2.14.3 control stand alone, and it is
+recorded as closed above.
+
+### What this evidence does NOT claim
+
+- **Not that the two backstops beneath the proved mechanisms are proved.** An entry
+  admitted anyway is discarded by apply-time log order, and beneath that by the store's
+  refusal of any sequence that is not the next one. Both are version-common and neither
+  is mutation-proved — making an admitted entry survive would take a second mutation to
+  the store itself — so they are stated as observed and are not part of the claim.
+- **Not that the other streams are closed.** The server mechanisms are
+  stream-independent, but F-032 through F-034 each own a consequence of their own and
+  stay open until each is audited on its own terms.
+- **Not that a Will is never published twice.** The sanctioned at-least-once duplicate
+  is untouched, and its boundary is unchanged: external publication with no durable
+  evidence of completion. What is retired is the class where evidence EXISTED and was
+  taken back.
+- **Not that an unconditional write is harmless.** It is not, and
+  `TestWillUnconditionalWriteRefiresAPublishedWill` states exactly what it would cost —
+  which is why it is retained, renamed as a negative dependency test rather than cited
+  as evidence about the server.
+- **Not that the terminal-regression residual is retired.** It is NARROWED, in
+  `docs/CONFORMANCE.md`, to the part R-new's evidence does not yet carry. Retiring it
+  outright would rest the contract on the harness this section has just declined to
+  rest a checkbox on.
+
+### The bridge-level sentinel
+
+`TestMQTTWillOutboxReplicatedTerminalDoneStands` (ungated, in the cluster job) drives
+the whole shape through the production helpers over a real R3 cluster: a licensed
+record, a real stream-leader stepdown through the public endpoint, the finalize to
+`done`, and then the reclaim from the superseded base — refused, with the terminal
+record standing and nothing published. Its paired mutation is EXECUTABLE, not a comment:
+`test/depproof/run.sh --bridge` copies the working tree, replaces that reclaim with the
+unconditional store the negative tests use, and requires the failure to be the one about
+the external act — *"a Will whose record committed `done` was published again"* — so a
+build failure or an unrelated assertion is not accepted as the kill.
+
+It is an integration sentinel, not the proof that the internal window was
+reached; `test/depproof/` supplies that.
+
+### Keeping the evidence alive across a dependency bump
+
+`make depproof` is wired into a CI job that runs on dependency bumps and on demand
+(`.github/workflows/ci.yml`). The broker's own suites cannot replace it: they pass
+whether or not the server still refuses the write. Neither can the generic upstream
+term-fence unit test, which exercises Raft directly and says nothing about whether
+JetStream propagates the term an operation captured.
+
+F-039 is explicitly outside this finding. It is a local rollback invariant: the inner
+`readd` closure on `rollbackSubscribePacket`'s save-failure path restores the packet's
+`cons` entries without restoring their `sharedSubs` membership. The main rollback
+snapshot restores both maps correctly. No JetStream proposal fence can reconstruct the
+missing entry in the `readd` arm.
 
 ## F-031
 
@@ -343,7 +471,11 @@ whose subject is a durable value being REGRESSED.
 
 **Title:** Add write lineage to inbound QoS 2 holds and release claims
 
-- Status: Open
+- Status: Open. The shared cross-term premise is being measured rather than assumed
+  (see the note at the top of this file and F-030), and one of its two routes is
+  closed; what remains for this finding is its OWN consequence audit against that
+  route inventory, plus a fixture and a discriminating mutation for anything the
+  audit finds still reachable.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 32
@@ -361,7 +493,11 @@ whose subject is a durable value being REGRESSED.
 
 **Title:** Add write lineage to shared QoS 2 assignment claims
 
-- Status: Open
+- Status: Open. The shared cross-term premise is being measured rather than assumed
+  (see the note at the top of this file and F-030), and one of its two routes is
+  closed; what remains for this finding is its OWN consequence audit against that
+  route inventory, plus a fixture and a discriminating mutation for anything the
+  audit finds still reachable.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 33
@@ -377,7 +513,11 @@ whose subject is a durable value being REGRESSED.
 
 **Title:** Add write lineage to outbound in-flight registers
 
-- Status: Open
+- Status: Open. The shared cross-term premise is being measured rather than assumed
+  (see the note at the top of this file and F-030), and one of its two routes is
+  closed; what remains for this finding is its OWN consequence audit against that
+  route inventory, plus a fixture and a discriminating mutation for anything the
+  audit finds still reachable.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 34

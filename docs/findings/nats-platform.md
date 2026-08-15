@@ -22,26 +22,34 @@ the old stream-leader state. The
 [2.14.4 release note](https://github.com/nats-io/nats-server/releases/tag/v2.14.4)
 describes the consequence as preventing stale proposals from a previous term
 from changing state after a fast election. The pinned upstream evidence is
-[`raft.proposeLocked`](https://github.com/nats-io/nats-server/blob/v2.14.4/server/raft.go#L908-L920)
+[`raft.proposeLocked`](https://github.com/nats-io/nats-server/blob/v2.14.5/server/raft.go#L914-L919)
 and
-[`TestNRGTermFencedProposals`](https://github.com/nats-io/nats-server/blob/v2.14.4/server/raft_test.go#L6400-L6455).
+[`TestNRGTermFencedProposals`](https://github.com/nats-io/nats-server/blob/v2.14.5/server/raft_test.go#L6393-L6455).
 
 This is **not an apply-time recheck of**
-`Nats-Expected-Last-Subject-Sequence`. The exact bridge consequence therefore
-must be proved rather than inferred. It targets the stale stream-leader goroutine
+`Nats-Expected-Last-Subject-Sequence`. It targets the stale stream-leader goroutine
 that could perform the pre-proposal CAS check under one leadership epoch and
 propose after a fast election; it does not make arbitrary unconditional stores
 safe, add cross-stream transactions, explain administrative deletion, or provide
 lineage across stream recreation.
 
-The first consumers of this guarantee are F-030 and F-032 through F-034. Their
-closure gate is one deterministic clustered dependency test that holds a
-CAS-checked operation across the relevant leadership transition and proves the
-old same-base survivor cannot land on the supported server. The corresponding
-pre-2.14.4 run is evidence that the test reaches the old window, not a supported
-compatibility mode. Only after that test exists may the findings close and the
-session/outbox lineage machinery be audited for deletion. Fields used for other
-facts, notably `RWID` as possible positive retirement evidence for F-036, do not
+**What the bridge actually gets from it was measured, not inferred** (F-030, narrowed
+2026-08-15). `test/depproof/` enumerates every route by which a write conditioned on a
+superseded base could reach a proposal across a leader transition, fixtures the two
+live ones inside isolated checkouts, refutes the other eight in writing, and pairs
+mutations with each mechanism. The term fence covers ONE of those two routes, and that
+route is closed; the other is refused because a new leader reconstructs the subject's
+expectation from its own applied state, which held in every run measured but is not yet
+accepted as harness-enforced closure. The v2.14.3 control run also corrected this
+audit's expectation: an old-term write is ADMITTED there, which is the difference the
+floor buys, but it never becomes the surviving record, because an apply-time
+log-order check that both generations have discards it.
+
+That evidence belongs to `$MQTT_willq`. F-032 through F-034 inherit the inventory and
+the harness, and each still needs its own consequence audit before it closes; the
+lineage-deletion audit is its own roadmap bullet and is blocked on F-030 closing.
+Fields used for other facts, notably `RWID` as possible positive retirement evidence
+for F-036, do not
 fall merely because the term window does.
 
 ## Subject delete markers for retained convergence

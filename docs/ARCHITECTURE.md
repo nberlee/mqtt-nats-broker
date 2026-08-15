@@ -55,15 +55,27 @@ the "no fallbacks" stance reviewable rather than implicit.
 - **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
   is accepted only if the subject's last sequence matches. The check is made before
   the proposal and is not repeated at clustered apply (`canConsistencyCheck :=
-  !isClustered`, `server/stream.go`). Since 2.14.4, however, JetStream passes the
-  stream leadership term into Raft and Raft rejects a proposal whose captured term
-  is no longer current (`nats-io/nats-server#8370`); leadership changes also tear
-  down the prior stream-leader state. F-030 owns the deterministic differential
-  proof of whether that upstream fence eliminates the previously documented
-  same-base cross-term window at the broker boundary. Until that proof and its
-  consequence-specific audits land, the existing lineage and conformance residuals
-  remain conservative rather than being deleted from source inspection alone. A
-  rejection is reported structurally
+  !isClustered`, `server/stream.go`), which for years made "two writes from one base
+  across a leader transition" the premise every write-lineage mechanism here was
+  designed against. **That premise is now measured rather than assumed** (F-030), and it
+  did not hold up: of the two routes by which such a write could reach a proposal, one is
+  closed on evidence and the other was refused in every run measured. An operation whose
+  captured proposing term outlives that term is refused by Raft's comparison of the
+  captured term against the current one (`nats-io/nats-server#8370`, 2.14.4); a
+  current-term write, which that comparison cannot refuse, is refused by a readiness
+  envelope under which a node behind on applies neither leads nor serves, and then by
+  the per-subject expectation a serving leader reconstructs from its own APPLIED
+  state. `test/depproof/` carries the route inventory, the fixtures, the written
+  refutations for the eight other shapes, and one discriminating mutation per
+  mechanism; `make depproof` runs them against isolated nats-server checkouts, and a
+  version bump must. F-030 is NOT ticked on that evidence: the new-leader route's oracle
+  yielded a distinct false-positive path in each of four review rounds, so it is recorded
+  as observed rather than accepted as closed, and `docs/CONFORMANCE.md` keeps the
+  corresponding residual narrowed to it. What this also does NOT license is deleting the
+  lineage machinery wholesale: those mechanisms also cover ambiguous acknowledgements, out-of-band
+  deletion and stream recreation, which are not proposal-ordering questions, and each
+  remaining per-stream finding owns its own consequence audit.
+  A rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
   every rejection is resolved by re-reading rather than classified directly.
@@ -462,14 +474,23 @@ Residuals that keep literal exactly-once impossible:
   enqueue ambiguity, where retry exhaustion publishes immediately through the fail-safe
   while an unconfirmed record may exist and fire later. `docs/CONFORMANCE.md` carries
   both.
-- *Cross-term claimant divergence* — a distinct destructive class, NOT the sanctioned
-  duplicate, and *Terminal regression*, which is the part of F-030 that stays open.
-  Both are stated with their exact interleavings in `docs/CONFORMANCE.md`.
+Two further classes are listed here — *cross-term claimant divergence* and *terminal
+regression*, both turning on two writes taken from one base across a leader transition.
+**Both are NARROWED rather than retired** (F-030, 2026-08-15): one of the two routes
+that ordering needs is closed on evidence, and the other was refused in every run
+measured but is not yet accepted as harness-enforced closure. `docs/CONFORMANCE.md`
+states precisely what is proved, what is observed, and what remains.
 
 The reconnect-suppression miss is closed WITHIN a `$MQTT_willq` leader term by the
-permanent facts and the persisted decision. This is a first-release storage format:
-pre-Layer-2 in-record Wills, outbox records without an exact client identity or a
-legal decision shape, and a `$MQTT_sess` stream without a valid generated epoch are
+permanent facts and the persisted decision. Whether the terminal state that ends the
+protocol — `done` — is durable against the write that would take it back is what F-030
+is measuring; on present evidence the supported server refuses that write by every route
+exercised, which is what makes executing a persisted decision on recovery safe in
+practice, though the finding is not yet ticked.
+
+This is a first-release storage format: pre-Layer-2 in-record Wills, outbox records
+without an exact client identity or a legal decision shape, and a `$MQTT_sess` stream
+without a valid generated epoch are
 unsupported and rejected with recreate guidance rather than carried forward.
 
 **Refusal of an unsupported outbox record.** That rejection is a mechanism, not a

@@ -1481,33 +1481,51 @@ claimant suppresses a delayed Will only for an acceptance of that EXACT client, 
 incarnation, strictly newer than the connection that created the Will, and dated BEFORE
 the Will fell due. See `docs/ARCHITECTURE.md`. What that does **not** cover:
 
-- **Cross-term claimant divergence — a distinct destructive class, NOT the sanctioned
-  at-least-once duplicate.** Across a `$MQTT_willq` leader transition two same-base
-  claimant writes can both be accepted and applied, because the expected-sequence check
-  is pre-proposal and the in-process map is cleared. Worked interleaving: A's licensing
-  CAS at `S` is accepted but not yet applied; the transition clears the per-subject
-  state; B's reclaim at `S` is accepted using the older body, which carries no decision;
-  A's licence applies and records `(publish, U_A)`; B's reclaim applies AFTER it and
-  overwrites that decision; B scans under a later `U_B`, sees an acceptance that landed
-  in between and chooses cancel — while A may already have published. The publish is
-  external and irreversible, so the broker cannot repair it. This is one suppressed-Will
-  publication, not two publications of an owed Will, which is why it is filed
-  separately from the sanctioned duplicate below.
-- **Terminal regression — the part of F-030 that stays OPEN.** A committed `done` can be
-  overwritten by a stale cross-term reclaim: the record at `S` is
-  `(publishing, publish, U)`; A publishes; A's `publishing -> done` CAS at `S` is
-  accepted but not applied; a transition clears the in-process state; B's reclaim at `S`
-  is accepted from the older `publishing` body, preserving `(publish, U)`; A's `done`
-  applies; B's reclaim applies after it and overwrites `done`; B enters on the persisted
-  decision and republishes without scanning. The persisted decision makes that
-  republication DETERMINISTIC rather than accidental. It is not the sanctioned duplicate,
-  and the line between them is EVIDENCE rather than whether a broker crashed: that one
-  republishes because `done` was never committed and the system genuinely lacks proof of
-  completion, whereas here `done` COMMITTED and was then overwritten — evidence the
-  system already held, discarded. Widening the sanctioned duplicate's boundary to lease
-  expiry does not move that line, and reclassifying this would close F-030 by weakening
-  the contract that created it. `docs/ROADMAP.md` §0.2 carries
-  it; `TestWillTerminalRegressionConsequence` pins the shape a fix must kill.
+- **Two same-base claimant writes across a leader transition: NARROWED, not retired.**
+  Two residuals were stated here — claimant DIVERGENCE, where a reclaim overwrites a
+  licensing decision, and terminal REGRESSION, where it overwrites a committed `done` —
+  on the premise that the expected-sequence check is pre-proposal and the in-process map
+  is cleared by a transition, so two writes taken from one base could both apply. That
+  premise was tested rather than reasoned about again (F-030, `test/depproof/`), against
+  the supported server and a generation predating its proposal fence. What follows is
+  what the evidence carries and what it does not.
+- **What is PROVED refused.** A write conditioned on base `S` can only reach the stream
+  after a committed `done` has replaced `S` by one of two routes. **R-old** — an
+  operation whose captured proposing term outlives that term — is refused by Raft's
+  comparison of the captured term against the current one (`nats-io/nats-server#8370`,
+  in the 2.14.5 floor), with two discriminating mutations and a control run on the
+  pre-fence generation. That route is closed. Eight further shapes are refuted in
+  writing in `test/depproof/README.md` rather than left unnamed.
+- **What is OBSERVED but not yet accepted as closed.** **R-new** — a newly elected leader
+  admitting a CURRENT-term write, which the term comparison cannot refuse — was refused
+  in every run measured, by a readiness envelope of two redundant halves and then by the
+  per-subject expectation a serving leader reconstructs from its own APPLIED state. No
+  run has produced the hazard on the supported floor. It is nonetheless NOT recorded as
+  closed: four adversarial review rounds each found a distinct false-positive path in
+  that route's oracle, so the confidence that is missing is in the instrument rather than
+  in the server. **Until that is settled, the terminal-regression and claimant-divergence
+  classes remain stated here, narrowed to this route.** What would settle it is in
+  `docs/findings/ha-arbitration.md` under F-030: every failure path observable by the
+  scorer, a negative check per row, and rounds that stop finding new ones.
+- **Why the DIVERGENCE class stands or falls with R-new.** Its ordering differs — the
+  first write is a licensing decision rather than `done` — but the admission question is
+  identical, and it reduces to the same inventory. For a second write taken from the same
+  base to be admitted after the first: in the same term it is refused as in-process
+  contention; if its expectation was read in a term that has ended it is R-old, which is
+  closed; if it is read and proposed in the new term, the leader admitting it must still
+  expose the earlier applied state, which is R-new. What the record CARRIES does not
+  change the stream-level admission and sequence mechanisms that refuse it.
+- **What the evidence says nothing about.** `$MQTT_sess`, `$MQTT_qos2in`,
+  `$MQTT_qos2assign` and `$MQTT_inflight`: the server mechanisms are stream-independent,
+  but each of those findings owns its own consequence, and F-032 through F-034 stay open
+  until each is audited on its own terms. It also does not claim the two backstops below
+  the proved mechanisms — an entry admitted anyway is discarded by apply-time log order,
+  and beneath that by the store's refusal of any sequence that is not the next one — but
+  neither is mutation-proved and neither is part of any claim.
+- **A duplicate is still possible where no terminal evidence exists.** Everything above
+  is about a COMMITTED `done` being taken back. It leaves the sanctioned duplicate below
+  exactly where it was, and that is the honest boundary: the broker never discards
+  completion evidence it holds, and it still republishes when it holds none.
 - **The sanctioned at-least-once duplicate, stated by its real boundary.** That
   boundary is **external publication with no durable evidence of completion**. A crash
   is one way to reach it and not the definition, and there are TWO sanctioned triggers,
@@ -1544,10 +1562,11 @@ the Will fell due. See `docs/ARCHITECTURE.md`. What that does **not** cover:
   The permanent acceptance facts did not introduce this: a slow barrier always let a
   peer reclaim and republish. What they changed is that the peer now reuses a persisted
   decision instead of rescanning, which makes an already-permitted trace DETERMINISTIC
-  rather than adding a new one. **This is still not the terminal regression above**, and
-  the difference is evidence, not liveness: here `done` was never committed and the
-  system genuinely lacks proof of completion, whereas there `done` COMMITTED and was
-  overwritten — evidence it already held, discarded.
+  rather than adding a new one. **This is the only duplicate class left, now that the
+  terminal regression above is retired**, and the line was always evidence rather than
+  liveness: here `done` was never committed and the system genuinely lacks proof of
+  completion, whereas the retired class had `done` COMMITTED and then taken back —
+  evidence it already held, discarded.
 - **Acceptance-fact storage is unbounded and client-driven.** One permanent record per
   ACCEPTED CONNECT, on a stream that cannot carry global limits (they would evict live
   session records) and whose `MaxMsgsPer: 1` does not apply because each fact has its

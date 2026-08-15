@@ -548,10 +548,12 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 		// Somebody released this session (a teardown, an expiry) — but an absent
 		// subject does NOT prove the attempt is dead. In a clustered stream the
 		// expected-sequence check runs only BEFORE the proposal
-		// (`canConsistencyCheck := !isClustered`, nats-server v2.14.4
+		// (`canConsistencyCheck := !isClustered`, nats-server v2.14.5
 		// server/stream.go:6247), so a proposal already accepted into the log applies
 		// whatever happened to the subject meanwhile — including an exact-sequence
-		// delete, which only clear() now issues. Reported as its own verdict so the
+		// delete, which only clear() now issues. F-030's proof does not reach this:
+		// it is about a write conditioned on a superseded base, and a delete carries
+		// no expectation at all. Reported as its own verdict so the
 		// resolver ARBITRATES rather than disposing on a read.
 		//
 		// Base 0 reaches this arm like any other base, and that is F-029's doing. The

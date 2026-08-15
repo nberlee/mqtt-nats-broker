@@ -20,7 +20,7 @@ a release classification, and a canonical dossier before feature work continues.
 
 The 34 closed findings are indexed in the [finding dossiers](findings/README.md).
 Of those, 31 are retained in the
-[resolved-findings archive](findings/resolved.md); F-027, F-029, and F-031 remain in the
+[resolved-findings archive](findings/resolved.md); F-027, F-029 and F-031 remain in the
 mixed-status [HA arbitration dossier](findings/ha-arbitration.md) beside their open
 follow-ups. The entries below are the active release view; their linked dossiers
 are canonical for mechanism, evidence, rejected designs, tests, and residuals.
@@ -68,13 +68,18 @@ guide from NATS Server's embedded MQTT listener.
 Decided 2026-08-10: the first alpha supports multiple MQTT frontends against a
 replicated JetStream cluster, keeping the README's horizontally scalable,
 cross-instance HA promise. Every item in this subsection is therefore an
-unconditional alpha blocker. The lineage work was designed against the observed
+unconditional alpha blocker. The lineage work was designed against an observed
 pre-2.14.4 window in which stale stream-leader work could propose after a fast
-election. nats-server 2.14.4 then shipped term-fenced Raft proposals
-([platform audit](findings/nats-platform.md#term-fenced-raft-proposals)). Before
-adding any more lineage, prove at the broker boundary whether that upstream change
-eliminates the shared same-base window; only the evidence may close or shrink the
-per-stream findings.
+election. **That premise is now MEASURED rather than assumed** (F-030, 2026-08-15):
+`test/depproof/` enumerates every route by which a write conditioned on a superseded
+base could reach a proposal across a leader transition, fixtures the two live ones
+against isolated nats-server checkouts, refutes the rest in writing, and pairs mutations
+with each mechanism. The old-term route is closed on that evidence; the new-leader route
+is observed to hold in every run but is not yet accepted as harness-enforced closure, so
+F-030 stays open and narrowed. No further lineage is to be added on the strength of the
+old premise without checking it against that inventory. The per-stream findings F-032
+through F-034 inherit the inventory and the harness, and each still needs its own
+consequence audit.
 
 - [x] Decide and document the first-alpha HA support level. Decided: multi-frontend
   HA stays in alpha scope. The README already promises it, the architecture is
@@ -329,47 +334,61 @@ per-stream findings.
   divergence. R1 and R4 are WIDENED to the no-watermark population, stated rather than
   claimed away.
 - [ ] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
-  **Dependency investigation before implementation.** NARROWED by F-031 and now
-  potentially closed at the common source by nats-server 2.14.4's term-fenced
-  proposals. The remaining TERMINAL REGRESSION requires a stale cross-term reclaim
-  to overwrite committed `done`; `TestWillTerminalRegressionConsequence` currently
-  injects that consequence with an unconditional write and is explicitly not evidence
-  that the supported server permits it. Closing this item requires a deterministic R3
-  regression that holds the CAS-checked reclaim across the leadership transition,
-  proves the old window is reached on pre-2.14.4, and proves neither the reclaim nor a
-  second publication can land on the supported floor. Keep that exact JetStream-level
-  composition regression as a repository-owned, CI-executed version-bump gate; the
-  generic Raft term test plus an ordinary stale-CAS bridge test are not equivalent.
-  Then replace the synthetic consequence test, remove the stale residual from
-  architecture/conformance, and audit outbox/session lineage for deletion. If the
-  broker-level test disproves the upstream closure, stop and design recognisable
-  terminal completion; do not infer it from the release note. Full protocol and
-  stopping rule in the
-  [F-030 dossier](findings/ha-arbitration.md#upstream-term-fence-and-closure-plan).
-- [x] [F-031: Add write lineage to Will-cancellation watermarks](findings/ha-arbitration.md#f-031).
-  **Large.** CLOSED by DELETING the watermark rather than by adding lineage to it.
-  `$MQTT_willcancel` is gone. An accepted CONNECT writes one permanent, dated acceptance
-  FACT on a subject nothing else ever names, committed in ONE JetStream atomic batch with
-  the session record on `$MQTT_sess` — so there is no interval in which a session is
-  accepted and its evidence is not yet durable, and no slot for a sibling to regress. The
-  claimant suppresses a delayed Will only for an acceptance of that EXACT client, in this
-  incarnation, strictly newer than the connection that created the Will, and dated BEFORE
-  the Will fell due ([MQTT-3.1.3-9] vs [MQTT-3.1.2-8]) — which is why the direct
-  reconnect-time outbox cancels went too: neither could say WHEN the acceptance happened.
-  **Residual:** the facts live on `$MQTT_sess`, so recreating that stream discards every
-  client's acceptance history and a delayed Will enqueued beforehand then fires; one
-  permanent record per accepted CONNECT is unbounded storage; and an acceptance still
-  UNCOMMITTED when the claimant takes its decision cannot suppress even though it
-  qualifies — the claimant chases the cutoff to narrow that to whatever commits after its
-  final sample, which is irreducible while eligibility is dated by `At` and a due Will
-  must still be decided. All three in `docs/CONFORMANCE.md`.
+  **NARROWED, not closed.** No lineage was added and none is now expected to be: every
+  `$MQTT_willq` write is already conditional on the sequence its writer read, so the
+  finding reduces to a property of the server, and that property was MEASURED rather than
+  reasoned about again. `test/depproof/` (`make depproof`, plus a CI job on any change to
+  `go.mod`, `go.sum` or the harness) carries an exhaustive route inventory for a write
+  conditioned on a superseded base reaching a proposal across a leader transition: two
+  live routes with fixtures, eight refuted in writing, and mutations per mechanism run
+  inside isolated nats-server checkouts.
+  **R-old is closed**: an operation whose captured proposing term outlives that term is
+  refused by Raft's comparison of the captured term against the current one (2.14.4,
+  `nats-io/nats-server#8370`), proved by two discriminating mutations that do not depend
+  on the other route's machinery. **R-new is OBSERVED to hold but is not accepted as
+  harness-enforced closure**: a readiness envelope of two redundant halves, and then the
+  per-subject expectation a serving leader reconstructs from its own applied state,
+  refuse it in every run measured — but four review rounds each found a distinct
+  false-positive path in that route's oracle, which is evidence the harness is not yet
+  mature enough to carry the closure claim, whatever the runs show. What remains is
+  oracle confidence, not a suspected defect: a fixture whose every failure path is
+  observable by the scorer, and enough rounds without a new false-positive path to trust
+  it. The plan's control prediction was FALSIFIED and is recorded as such: on v2.14.3 the
+  older-term write IS admitted at the proposal boundary — the difference the floor buys —
+  but never becomes the surviving record, because apply-time log order and the store's
+  refusal of any sequence that is not the next one both discard it; neither backstop is
+  mutation-proved, so neither is part of any claim.
+  `TestMQTTWillOutboxReplicatedTerminalDoneStands` is the bridge sentinel over a real R3
+  cluster, with an executable unconditional-write mutation that must republish an
+  already-published Will. The two synthetic pins are retained, renamed as negative
+  dependency tests, and are never cited as evidence about the server. The
+  `docs/CONFORMANCE.md` residuals are narrowed to exactly what is still open rather than
+  retired. F-032 through F-034 inherit the inventory and the harness, not a checkbox.
+- [ ] **Audit the session write-lineage machinery for deletion, obligation by
+  obligation.** Prescribed by F-030's evidence and deliberately NOT folded into it: it
+  touches `sess_fork_lineage.go`, `sess_fork_repair.go` and `sess_origin_interval.go`
+  (about 1,840 production lines) and would make one reviewable change into two
+  unrelated ones. **Blocked on F-030 actually closing**, since it rests on the premise
+  F-030 is measuring. Even then it does NOT retire everything those mechanisms do: keep
+  whatever covers an ambiguous acknowledgement, an
+  out-of-band deletion, stream recreation, or retirement evidence, since none of those
+  is a proposal-ordering question. `RWID` in particular stays until F-036 and the
+  vanished-record vocabulary decide whether they need it. Each obligation is deleted
+  only with the test that proves the survivor still holds, and never on the strength of
+  the term proof alone.
 - [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
-  **Dependency investigation.** Run the F-030 term-fence proof first; add lineage
-  only if a supported server can still land the same-base cross-term survivor.
+  **Consequence audit, not a lineage design.** F-030's evidence bears on the shared
+  premise for this stream too, so the question left is this stream's OWN: whether any
+  hold or `.rel` claim it makes is unconditional, taken from a base it did not read, or written
+  by a path outside `test/depproof/`'s inventory — and what a duplicate inbound QoS 2
+  delivery would cost if one were. Add lineage only for what that audit finds, with a
+  fixture and a discriminating mutation for it.
 - [ ] [F-033: Add write lineage to shared QoS 2 assignments](findings/ha-arbitration.md#f-033).
-  **Dependency investigation.** Same common gate as F-032.
+  **Consequence audit.** Same shape as F-032; the consequence to bound is a contender
+  waiting on a `claimed` record whose owner never materialises.
 - [ ] [F-034: Add write lineage to outbound in-flight registers](findings/ha-arbitration.md#f-034).
-  **Dependency investigation.** Same common gate as F-032.
+  **Consequence audit.** Same shape as F-032; the consequences to bound are a freed
+  identifier still in flight and a register whose deletion was proven.
 - [x] **Slice A of the arbitration design: the session-record watch.** Ownership changes
   only by a write to the client's record subject, so the observation channel is now a
   per-broker ephemeral consumer on `$MQTT_sess` instead of the at-most-once
@@ -611,7 +630,11 @@ finding with acceptance criteria.
   and the assertion fails a passing broker. Measured in isolation with `-count=8` on
   2026-08-14: **2/8 at `81a8b9f`, 3/8 with the acceptance-fact change**, so it is
   pre-existing and the rates are within noise of each other; it is not the concurrent-suite
-  starvation the other flakes are. The fix is to assert the INVARIANT — exactly one
+  starvation the other flakes are. Re-measured 2026-08-15 during the F-030 work at
+  **2/12 on a clean checkout of `4db3764` and 2/12 on the working tree** — identical, and
+  confirming both the diagnosis and that it is unrelated to whatever change is in flight.
+  At roughly one failure in six on an ungated CI job, this is worth doing. The fix is to
+  assert the INVARIANT — exactly one
   establish succeeds, every other attempt is rejected — rather than a fixed rejection
   count, which is only correct for exactly two attempts. Not folded into the
   acceptance-fact change: different mechanism (F-029b origin intervals), and that diff
@@ -730,7 +753,8 @@ behavior when no container limit is configured.
   stream/consumer CRUD, info, publish-ack and double-ack operations incrementally to
   `nats.go/jetstream`. Preserve per-client authorization connections and a thin raw
   adapter for atomic-batch framing and unsupported endpoints. Spike ordered consumers
-  for the two observation consumers only after the F-030 lineage-deletion audit, and
+  for the two observation consumers only after the session-lineage deletion audit
+  (below), and
   adopt them only if failure semantics and measurements improve. See the
   [platform audit](findings/nats-platform.md#staged-use-of-the-high-level-jetstream-client).
 

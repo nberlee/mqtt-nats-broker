@@ -858,20 +858,27 @@ func TestAcceptResolutionStopsBetweenThePairedReads(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T18a / T18b: the two residual pins
+// The two NEGATIVE DEPENDENCY tests
 // ---------------------------------------------------------------------------
+//
+// Both stage their state with an UNCONDITIONAL store, which bypasses the per-subject
+// expectation every production write on `$MQTT_willq` carries. That is the whole
+// point of them: they say what the claim protocol would do if the server's CAS
+// contract did not hold, and they are the reason the protocol depends on it rather
+// than on a re-check of its own.
+//
+// They are NOT evidence that the supported server admits either state. It does not: the
+// routes by which a write conditioned on a superseded base could reach the stream across
+// a leader transition are enumerated, fixtured and mutation-checked in `test/depproof/`,
+// and every run measured refused the write. F-030 is nonetheless still open and narrowed
+// — one of the two routes is closed, the other is observed rather than accepted — so
+// neither of these tests may be read as the residual having been retired either. Neither
+// reproduces an election window, and neither is cited as though it did.
 
-// TestWillCrossTermDivergenceConsequence is T18a.
-//
-// SYNTHETIC. A normal per-subject CAS cannot stage two accepted same-base writes
-// within one leader term, so this stages the DURABLE CONSEQUENCE with an
-// unconditional write and asserts exactly two things: A publishes externally, and B
-// durably cancels that same Will generation.
-//
-// It is explicitly NOT evidence of reproducing the election window — no test in this
-// repository reproduces one. It exists so the residual cannot be quietly believed
-// closed, and so a future mechanism that closes it has a shape to kill.
-func TestWillCrossTermDivergenceConsequence(t *testing.T) {
+// TestWillUnconditionalWriteDivergesClaimants: with the CAS contract bypassed, two
+// claimants taken from one base diverge — A publishes externally while B durably
+// cancels the same Will generation.
+func TestWillUnconditionalWriteDivergesClaimants(t *testing.T) {
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "cross-term"
@@ -914,19 +921,20 @@ func TestWillCrossTermDivergenceConsequence(t *testing.T) {
 	}
 }
 
-// TestWillTerminalRegressionConsequence is T18b: F-030's STILL-OPEN consequence.
-//
-// A committed `done` overwritten by a stale cross-term reclaim makes the record
-// re-fireable, and the persisted decision makes the republication DETERMINISTIC.
+// TestWillUnconditionalWriteRefiresAPublishedWill: with the CAS contract bypassed, a
+// committed `done` taken back to `publishing` makes the record re-fireable, and the
+// persisted decision makes the republication DETERMINISTIC rather than accidental.
 //
 // The zero-fact-load assertion is what makes "deterministic" mechanically explicit.
 // A qualifying acceptance is staged ABOVE the persisted cutoff, so any illicit fresh
 // scan would CANCEL rather than republish; without that guard a republication could
 // false-pass through a rescan that happened to find nothing.
 //
-// Same labelling as T18a: a synthetic consequence pin, not evidence of the window.
-// This is the shape a future terminal-completion mechanism must kill.
-func TestWillTerminalRegressionConsequence(t *testing.T) {
+// This is why the terminal state's durability is a release-blocking property and not
+// a nicety: the whole distance between "published once" and "published twice" is the
+// server refusing this write. `TestMQTTWillOutboxReplicatedTerminalDoneStands` is the
+// same shape against the real server, where the write IS refused.
+func TestWillUnconditionalWriteRefiresAPublishedWill(t *testing.T) {
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "terminal-regression"
@@ -953,8 +961,8 @@ func TestWillTerminalRegressionConsequence(t *testing.T) {
 	// cancel rather than republish.
 	testPlantAcceptFact(t, a.asm, cid, fireAt-int64(time.Minute))
 
-	// The stale reclaim applies AFTER it, from the older publishing body, preserving
-	// the licence. Unconditional, for the same reason as T18a.
+	// The write applies AFTER it, from the older publishing body, preserving the
+	// licence. Unconditional, which is what the supported server refuses.
 	body, err := json.Marshal(&licensed)
 	if err != nil {
 		t.Fatalf("marshal the stale reclaim: %v", err)
@@ -976,8 +984,8 @@ func TestWillTerminalRegressionConsequence(t *testing.T) {
 	}
 	testWaitFor(t, 4*time.Second, 10*time.Millisecond, func() error {
 		if n := pubs.Load(); n != 1 {
-			return fmt.Errorf("F-030's open consequence is a DETERMINISTIC republication after a "+
-				"committed done: got %d publications, want 1", n)
+			return fmt.Errorf("bypassing the CAS contract must give a DETERMINISTIC "+
+				"republication after a committed done: got %d publications, want 1", n)
 		}
 		return nil
 	})

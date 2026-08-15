@@ -17,10 +17,10 @@ work is merged into the existing finding or roadmap item whose invariant it serv
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
 - Add write lineage to the Will outbox.
-  Status: Open — upstream dependency under proof. Release treatment: Alpha blocker.
-  Details: [F-030](ha-arbitration.md#f-030). nats-server 2.14.4 term-fenced proposals
-  target the stale-leader route; deterministic differential evidence is required before
-  the terminal regression can close.
+  Status: Open — NARROWED. Release treatment: Alpha blocker.
+  Details: [F-030](ha-arbitration.md#f-030). No lineage added and none expected: the
+  premise was measured instead. The old-term route is closed; the new-leader route is
+  observed to hold but is not yet accepted as harness-enforced closure.
 - Add write lineage to inbound QoS 2 holds and release claims.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-032](ha-arbitration.md#f-032).

@@ -9035,7 +9035,7 @@ type mqttSessSaveDetail struct {
 // erases a record another broker was acknowledged for, within a single leader term
 // and with no rejection anywhere.
 //
-// The dependency honors it at both boundaries (nats-server v2.14.4): the store folds
+// The dependency honors it at both boundaries (nats-server v2.14.5): the store folds
 // a not-found subject to fseq 0 (server/stream.go), and the clustered pre-proposal
 // check does the same AND enrolls the write in the in-process contention checks
 // (server/jetstream_batching.go), which is what makes a concurrent create fail 10164
