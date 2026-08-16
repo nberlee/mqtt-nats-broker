@@ -16,11 +16,6 @@ work is merged into the existing finding or roadmap item whose invariant it serv
 - Preserve deferred disconnect state during foreign disposition.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
-- Add write lineage to the Will outbox.
-  Status: Open — NARROWED. Release treatment: Alpha blocker.
-  Details: [F-030](ha-arbitration.md#f-030). No lineage added and none expected: the
-  premise was measured instead. The old-term route is closed; the new-leader route is
-  observed to hold but is not yet accepted as harness-enforced closure.
 - Add write lineage to inbound QoS 2 holds and release claims.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-032](ha-arbitration.md#f-032).
@@ -180,6 +175,9 @@ work is merged into the existing finding or roadmap item whose invariant it serv
   Details: [F-027](ha-arbitration.md#f-027).
 - Arbitrate simultaneous takeovers from one session-record base.
   Details: [F-029](ha-arbitration.md#f-029).
+- Add write lineage to the Will outbox.
+  Details: [F-030](ha-arbitration.md#f-030). Closed by disproving the cross-election
+  failure premise; no lineage was added.
 - Replace the Will-cancellation watermark with an immutable acceptance fact.
   Details: [F-031](ha-arbitration.md#f-031).
 - Replace legacy reserved-subscription migration with current-schema refusal.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Dependency proof for F-030: run the repository-owned JetStream route regressions
+# Dependency canary for F-030: run the repository-owned JetStream route regressions
 # inside an isolated nats-server checkout.
 #
 # The fixtures live in testdata/ because they are package `server` files: they cannot
@@ -255,13 +255,13 @@ one_run() {
     fi
   fi
 
-  # A skipped test is not a passing one. `go test` exits 0 for a run in which every
-  # selected test skipped, so a row whose fixture self-skipped would otherwise be
-  # scored PASS and would prove nothing at all.
-  if [ "$outcome" = PASS ] && ! grep -qE '^\s*--- PASS: ' "$log"; then
+  # A skipped test is not a passing one, including when a broad row also contains a
+  # passing neighbour. `go test` exits 0 in both cases, so accepting any SKIP would let
+  # the clean all-routes row pass without exercising every selected fixture.
+  if [ "$outcome" = PASS ]; then
     if grep -qE '^\s*--- SKIP: ' "$log"; then
       outcome=SKIPPED
-    else
+    elif ! grep -qE '^\s*--- PASS: ' "$log"; then
       outcome=BROKEN
     fi
   fi
@@ -275,9 +275,9 @@ one_run() {
 # evidence and needs the same scoring: a mutation is only evidence if it fails, and a
 # failure is only a kill if a test actually ran and the failure is the one claimed.
 #
-# The sentinel file is UNTRACKED until this change is committed, so the copy is of the
-# working tree (tracked plus untracked, ignored files excluded) rather than a git
-# worktree of HEAD -- a worktree would not contain the test at all.
+# The copy is of the working tree (tracked plus untracked, ignored files excluded)
+# rather than a worktree of HEAD, so a dependency-canary change exercises the exact
+# bridge code and documentation tree being reviewed rather than the previous commit.
 # ---------------------------------------------------------------------------
 
 bridge_test='^TestMQTTWillOutboxReplicatedTerminalDoneStands$'
@@ -330,6 +330,27 @@ bridge_run() {
   echo "$outcome bridge-sentinel ${mutate} -> $log"
 }
 
+# bridge_matrix asserts both directions when the bridge sentinel is run on its own.
+# Printing two outcomes and exiting zero would let callers mistake a broken mutation
+# for evidence, so this is shared by --bridge and the full matrix.
+bridge_matrix() {
+  local failures=0 line want mode row
+  for row in "PASS clean" "FAIL mutate"; do
+    # shellcheck disable=SC2086
+    set -- $row
+    want=$1
+    mode=$2
+    line=$(bridge_run "$mode") || exit 2
+    echo "$line"
+    case $line in
+      "$want "*) ;;
+      *) echo "  ^ expected $want"; failures=$((failures + 1)) ;;
+    esac
+  done
+  [ "$failures" -eq 0 ] || return 1
+  echo "depproof: both bridge-sentinel rows matched the evidence table"
+}
+
 matrix() {
   local pinned failures=0 line
   pinned=$(pinned_version)
@@ -358,17 +379,7 @@ matrix() {
   done
 
   # The bridge sentinel and its own mutation, scored the same way.
-  for row in "PASS clean" "FAIL mutate"; do
-    # shellcheck disable=SC2086
-    set -- $row
-    local want=$1
-    line=$(bridge_run "$2") || exit 2
-    echo "$line"
-    case $line in
-      "$want "*) ;;
-      *) echo "  ^ expected $want" ; failures=$((failures + 1)) ;;
-    esac
-  done
+  bridge_matrix || failures=$((failures + 1))
   if [ "$failures" -gt 0 ]; then
     echo "depproof: $failures row(s) did not match the evidence table" >&2
     return 1
@@ -384,7 +395,7 @@ mutations=()
 while [ $# -gt 0 ]; do
   case $1 in
     --matrix) matrix; exit $? ;;
-    --bridge) bridge_run clean; bridge_run mutate; exit 0 ;;
+    --bridge) bridge_matrix; exit $? ;;
     --version) version=${2:?}; shift 2 ;;
     --mutation) mutations+=("${2:?}"); shift 2 ;;
     --require) mutations+=("@${2:?}"); shift 2 ;;

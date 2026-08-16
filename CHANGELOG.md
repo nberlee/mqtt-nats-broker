@@ -12,10 +12,13 @@ All notable changes to this project are documented here. The format is based on
   machinery against them: a claimant reclaim overwriting another's licensing decision,
   and one overwriting a committed `done` and republishing an already-published Will.
   Both rested on the same premise — that two writes taken from one base can both apply
-  across a leader transition — which the dependency proof above shows the supported
-  server refuses. No record format changed and no lineage was added. The sanctioned
-  at-least-once duplicate is unchanged: its boundary is a publication with no committed
-  evidence of completion, which is a different thing from evidence being discarded.
+  across a leader transition — which the route/mutation evidence, pinned server source,
+  and upstream maintainer confirmation jointly show the supported server refuses for
+  the bridge's conditional writes on a conforming Will-outbox stream. No record format
+  changed and no lineage was added. The sanctioned at-least-once duplicate is unchanged:
+  its boundary is a publication with no committed evidence of completion, which is a
+  different thing from evidence being discarded. Unconditional writes and post-start
+  stream-configuration drift remain outside this closure.
 
 - Updated the embedded and CI nats-server dependency from 2.14.4 to 2.14.5,
   including its matching compression and `x/crypto`/`x/net` dependency updates.
@@ -26,16 +29,17 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
-- **Dependency proof that a delayed Will's terminal state cannot be taken back**
+- **Dependency canary for the conditional-write contract that protects delayed-Will
+  terminal state**
   (`test/depproof/`, `make depproof`). The Will outbox's `done` record is only
-  non-regressible if the server refuses a write whose per-subject expectation read a
-  base that a committed `done` has replaced, including across a stream-leader
-  transition. That is now enumerated and measured rather than assumed: every route by
-  which such a write could reach a proposal is listed, the two live ones have
-  deterministic fixtures that run inside isolated nats-server checkouts, the other
-  eight are refuted in writing, and each mechanism has a mutation that must break its
-  fixture. A CI job runs the whole matrix whenever a change touches `go.mod`, `go.sum`
-  or the harness.
+  protected from a bridge-authored same-base sibling if the server refuses a write whose
+  per-subject expectation read a base that a committed `done` has replaced, including
+  across a stream-leader transition. Every route for that conditional write is listed,
+  the two live ones have deterministic fixtures, the other eight are scoped or refuted
+  in writing, and each mechanism has a mutation that must break its fixture. The canary
+  is one of three closure layers beside the pinned source and upstream maintainer
+  confirmation; it is not sole proof and says nothing about unconditional foreign
+  writes. CI runs the matrix whenever a dependency or either side of the harness changes.
   `TestMQTTWillOutboxReplicatedTerminalDoneStands` is the matching bridge-level
   sentinel over a real 3-node cluster.
 

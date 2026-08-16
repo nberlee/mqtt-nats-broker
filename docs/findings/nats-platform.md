@@ -33,24 +33,41 @@ propose after a fast election; it does not make arbitrary unconditional stores
 safe, add cross-stream transactions, explain administrative deletion, or provide
 lineage across stream recreation.
 
-**What the bridge actually gets from it was measured, not inferred** (F-030, narrowed
-2026-08-15). `test/depproof/` enumerates every route by which a write conditioned on a
-superseded base could reach a proposal across a leader transition, fixtures the two
-live ones inside isolated checkouts, refutes the other eight in writing, and pairs
-mutations with each mechanism. The term fence covers ONE of those two routes, and that
-route is closed; the other is refused because a new leader reconstructs the subject's
-expectation from its own applied state, which held in every run measured but is not yet
-accepted as harness-enforced closure. The v2.14.3 control run also corrected this
-audit's expectation: an old-term write is ADMITTED there, which is the difference the
-floor buys, but it never becomes the surviving record, because an apply-time
+**What the bridge actually gets from it was measured and upstream-confirmed** (F-030,
+closed 2026-08-16). `test/depproof/` enumerates every route by which a write conditioned
+on a superseded base could reach a proposal across a leader transition, fixtures the two
+live ones inside isolated checkouts, refutes seven other shapes, scopes post-start
+mirror/source drift outside F-030, and pairs mutations with each live mechanism. The term
+fence covers ONE of those two routes; the other
+is refused because a new leader does not accept messages before pending entries are
+applied and then reconstructs the subject's expectation from its own applied state. A
+NATS maintainer explicitly confirmed that these leader-only mechanisms guarantee header
+enforcement across elections
+([`nats-server#8469`](https://github.com/nats-io/nats-server/issues/8469#issuecomment-5304075553)).
+The four repaired oracle defects keep the harness from being the sole proof, but do not
+defeat the independent source and upstream contract. The v2.14.3 control run corrected
+this audit's expectation: an old-term write is ADMITTED there, which is the difference
+the floor buys, but it never becomes the surviving record, because an apply-time
 log-order check that both generations have discards it.
 
-That evidence belongs to `$MQTT_willq`. F-032 through F-034 inherit the inventory and
-the harness, and each still needs its own consequence audit before it closes; the
-lineage-deletion audit is its own roadmap bullet and is blocked on F-030 closing.
+That closure belongs to `$MQTT_willq`. F-032 through F-034 inherit the server contract
+and the canary, and each still needs its own consequence audit before it closes; the
+lineage-deletion audit is its own roadmap bullet and is now unblocked.
 Fields used for other facts, notably `RWID` as possible positive retirement evidence
 for F-036, do not
 fall merely because the term window does.
+
+### Rejected follower-local apply-time CAS
+
+Issue #8469 proposed marking conditional entries so every replica would recheck its
+physical store during apply. That design was withdrawn. Interest retention can make
+storage depend on replica-local consumer state, and MaxAge or per-message TTL expiry is
+timer-driven on each replica. Physical per-subject store state is therefore not a
+deterministic consensus input. If one peer rejected while another stored, their failed
+sequence accounting could diverge. Restricting emission by the stream's current
+configuration does not repair historical state or order a concurrent configuration
+change with the stream log. The maintainer confirmed the architectural rule: the leader
+alone decides admission; followers persist the sequence it selected.
 
 ## Subject delete markers for retained convergence
 

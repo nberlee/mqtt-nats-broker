@@ -133,14 +133,16 @@ JetStream, mining the same upstream scenarios:
 - `shim_*_test.go`: transport, session-manager bring-up, auth passthrough
   (including retained delivery over per-client connections), e2e.
 
-One layer sits outside all of these, because its subject is the DEPENDENCY rather
-than the broker: `test/depproof/` (`make depproof`) runs `package server` fixtures
-inside isolated nats-server checkouts, to prove that a write conditioned on a
-superseded base cannot reach a stream across a leader transition. It cannot live in
-this package — it needs upstream's unexported cluster helpers and Raft internals,
-which is the same boundary that parks `mqttport_clustertests` — and the broker's own
-suites cannot substitute for it, since they pass whether or not the server still
-refuses the write. Its counterpart inside this package is the bridge sentinel
+One canary layer sits outside all of these, because its subject is the DEPENDENCY
+rather than the broker: `test/depproof/` (`make depproof`) runs `package server`
+fixtures inside isolated nats-server checkouts. It exercises the dependency
+boundary for a bridge-authored conditional write whose base is superseded across a
+leader transition. It cannot live in this package — it needs upstream's unexported
+cluster helpers and Raft internals, which is the same boundary that parks
+`mqttport_clustertests` — and the broker's own suites cannot substitute for this
+package-internal canary. F-030 closure does not rest on the canary alone: the pinned
+v2.14.5 source and upstream maintainer confirmation complete the contract evidence.
+Its counterpart inside this package is the bridge sentinel
 `TestMQTTWillOutboxReplicatedTerminalDoneStands`.
 
 The `mqttport_fulltests` suite runs with no skips. Its inherited upstream cases

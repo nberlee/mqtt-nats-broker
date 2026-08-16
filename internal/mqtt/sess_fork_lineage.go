@@ -11,10 +11,11 @@
 //
 // This machinery was designed against the reading that a proposal accepted under one
 // leader could therefore survive the election unapplied while the NEW leader admitted a
-// second write against the SAME base. **That reading was MEASURED and does not hold on
-// the supported floor** — see test/depproof, which enumerates every route to such a
-// proposal, fixtures the two live ones and refutes the rest, with a mutation per
-// mechanism (F-030). It was measured on $MQTT_willq's CAS shape, which is this one.
+// second write against the SAME base. **That reading is retired on the supported floor**
+// by F-030's combined dependency-canary, pinned-source and maintainer-confirmed evidence.
+// test/depproof enumerates every route for a conditional write on a conforming stream:
+// it fixtures the two live ones, refutes seven, and scopes post-start mirror/source drift
+// outside the claim. It exercises $MQTT_willq's CAS shape, which is this one.
 //
 // What that does NOT retire is the rest of this file's job. Recognition here also
 // covers an ambiguous acknowledgement, an out-of-band deletion and a stream

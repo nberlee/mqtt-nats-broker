@@ -1,11 +1,12 @@
-# Dependency proof: can the Will outbox's terminal state be regressed?
+# Dependency canary: can the Will outbox's terminal state be regressed?
 
-This directory holds the evidence for `docs/findings/ha-arbitration.md` F-030, which is
-**open and narrowed**, not closed. Of the two routes by which the hazard could occur,
-R-old is closed on evidence that stands alone; R-new was refused in every run measured
-but is not yet accepted as harness-enforced closure, because four review rounds each
-found a distinct false-positive path in its oracle. The dossier states what would settle
-that. Nothing here should be cited as though F-030 were ticked.
+This directory holds the executable dependency canary for
+`docs/findings/ha-arbitration.md` F-030, **closed 2026-08-16**. Both routes by which the
+hazard could occur are refused on the supported floor. Closure does not rest on this
+harness alone: it combines the route inventory and mutations here, pinned source
+mechanisms, and the NATS maintainer's explicit confirmation that leader-local in-flight
+ownership plus applied-before-serving enforce the header across elections
+([`nats-server#8469`](https://github.com/nats-io/nats-server/issues/8469#issuecomment-5304075553)).
 
 The question it answers is one about the SERVER, not about this broker's code, so the
 tests live in `testdata/` as `package server` files and run inside an isolated
@@ -37,11 +38,15 @@ the claim reduces to a property of the server: **a write whose per-subject
 expectation read base `S` must not reach the stream after a committed `done` has
 replaced `S`** - including across a stream-leader transition, which is where the
 expectation is checked pre-proposal and the in-process per-subject state is cleared.
+The claim assumes the validated `$MQTT_willq` shape remains conforming while the manager
+serves it. An operator adding a source after initialization can introduce unconditional
+foreign writes; startup validation is a snapshot, so that configuration-drift residual
+is outside F-030 and remains documented in `docs/CONFORMANCE.md`.
 
 ## Route inventory
 
-The inventory is what any closure would have to rest on, more than the fixtures: a
-route left unclassified keeps F-030 open on its own. Each row states how a write
+The inventory is what the closure rests on, more than any single fixture: a route left
+unclassified would invalidate it. Each row states how a write
 conditioned on `S` could reach a proposal after `done` is committed, and what stops it.
 
 | Route | The shape | What refuses it | Evidence |
@@ -54,7 +59,7 @@ conditioned on `S` could reach a proposal after `done` is committed, and what st
 | **R-unclustered** | `node == nil` (an R1 stream, or a scale-up with queued inbound), where the write goes straight to `processJetStreamMsg`. | The per-subject expectation is then enforced at apply (`canConsistencyCheck := !isClustered`), against the same store the write would land in. There is no leader transition and no window: this broker also refuses to run with a `$MQTT_willq` that is not R3 when replicas are configured (`internal/mqtt/stream_prereqs.go`). | written refutation |
 | **R-batch** | `ProposeMulti`, the atomic-batch path. | It carries and compares the captured term identically (`raft.go` `ProposeMulti`). `$MQTT_willq` is not an atomic-batch stream in any case - only `$MQTT_sess` sets `AllowAtomicPublish`, for the record-plus-acceptance-fact commit. | written refutation |
 | **R-forward** | `ForwardProposal`, the one proposal entry point that does not take a term. | Its only stream-data call site is a message DELETE, proposed directly when this node is the stream leader and forwarded to it otherwise (`stream.go`), and a forwarded proposal always uses the receiving node's CURRENT term (asserted by upstream's own `TestNRGTermFencedProposals`). It carries no per-subject expectation, so it cannot be the write this claim is about; a delete is separately harmless here, since reaping a terminal record is what the protocol does with it. | written refutation |
-| **R-mirror** | The stream ingests writes from somewhere other than a client publish - a mirror, or a source. | Provisioning refuses both before the broker will run: a `$MQTT_willq` that is a mirror is rejected ("a mirror rejects the owner's direct writes") and one carrying `Sources` is rejected ("a foreign record could occupy a Will's CAS slot"), in `validateBrokerOwnedStreamShape` and `validateWillQStream`. Neither shape can exist on a stream this broker serves. | written refutation |
+| **R-mirror/source** | The stream ingests writes from somewhere other than a conditional client publish. | Initial provisioning refuses a `$MQTT_willq` mirror or sources. Because validation is a snapshot, a source added after manager initialization is not a conditional-write route at all: it is retained outside F-030 as live configuration drift, not falsely refuted by this inventory. The closure is for a conforming stream. | scoped exclusion; `validateBrokerOwnedStreamShape`, `validateWillQStream`, and the configuration-drift residual |
 | **R-delete** | This broker's own terminal cleanup, which deletes by sequence. | It targets the sequence the finalize returned, and a delete cannot revive `publishing`: the record is gone, and an absent record is the scan's "nothing owed" (`finalizeWillPublish`, `willPublishWorker`). | written refutation |
 
 Two properties bound every route above, and both belong to this broker rather than
@@ -149,13 +154,13 @@ this harness rests only on the mechanisms that have a discriminating mutation; t
 backstops are stated because they explain why the control run's outcome differs from the
 one the plan predicted, not as part of the argument.
 
-That same standard is why F-030 is not ticked. R-new's mechanisms refused the write in
-every run, but this harness's ability to SEE a future regression on that route is what
-four review rounds kept faulting — a mutation that staged the wrong state and reported
-success, a scorer that counted a kill without its boundary firing, a scorer that required
-a marker but did not forbid the others, and a fixture whose final observation was
-unmarked. Each is fixed. The judgement that the class has stopped recurring is not one
-this file can make about itself.
+That standard is why this harness remains a CANARY rather than the sole proof. R-new's
+mechanisms refused the write in every run, but four review rounds faulted its ability to
+see a future regression — a mutation that staged the wrong state and reported success, a
+scorer that counted a kill without its boundary firing, a scorer that required a marker
+but did not forbid the others, and a fixture whose final observation was unmarked. Each
+is fixed. Closure is justified by independent, converging source, upstream-contract, and
+mutation evidence; this matrix keeps that contract executable across dependency bumps.
 
 ## What the control run actually showed
 

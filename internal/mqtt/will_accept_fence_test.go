@@ -870,10 +870,10 @@ func TestAcceptResolutionStopsBetweenThePairedReads(t *testing.T) {
 // They are NOT evidence that the supported server admits either state. It does not: the
 // routes by which a write conditioned on a superseded base could reach the stream across
 // a leader transition are enumerated, fixtured and mutation-checked in `test/depproof/`,
-// and every run measured refused the write. F-030 is nonetheless still open and narrowed
-// — one of the two routes is closed, the other is observed rather than accepted — so
-// neither of these tests may be read as the residual having been retired either. Neither
-// reproduces an election window, and neither is cited as though it did.
+// and every run measured refused the write. F-030 is closed by that evidence together
+// with the pinned source mechanisms and the maintainer-confirmed leader-only contract;
+// neither synthetic test reproduces an election window, and neither is cited as though
+// it independently proves the server property.
 
 // TestWillUnconditionalWriteDivergesClaimants: with the CAS contract bypassed, two
 // claimants taken from one base diverge — A publishes externally while B durably

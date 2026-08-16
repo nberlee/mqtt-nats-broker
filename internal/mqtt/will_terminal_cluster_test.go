@@ -3,9 +3,9 @@
 // The bridge-level sentinel for F-030's terminal Will state, over a genuine 3-node
 // embedded JetStream cluster and the production CAS helpers.
 //
-// It is an INTEGRATION SENTINEL, not the proof that the internal window was reached:
-// the deterministic proof that the supported server cannot admit a write whose
-// per-subject expectation read a base a committed `done` has replaced lives in
+// It is an INTEGRATION SENTINEL, not sole proof that the internal window was reached:
+// the deterministic dependency canary for the supported server's refusal of a write
+// whose per-subject expectation read a base a committed `done` has replaced lives in
 // test/depproof, inside an isolated nats-server checkout. What this test adds is that
 // the bridge's own writes go through that contract - both of them conditional - and
 // that a refused reclaim leaves the terminal record standing and the Will unpublished.

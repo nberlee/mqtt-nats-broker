@@ -35,7 +35,7 @@ full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 cluster-failover-tests: ## Run the 3-node JetStream tests: Will-outbox failover and takeover arbitration.
 	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)' ./internal/mqtt/
 
-depproof: ## Dependency proof for F-030: the JetStream route regressions plus every mutation
+depproof: ## Dependency canary for F-030: JetStream route regressions plus every mutation
 	./test/depproof/run.sh --matrix
 
 soak: ## Paired flakiness soak: same gated tests on this tree vs a clean baseline

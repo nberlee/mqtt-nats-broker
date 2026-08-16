@@ -70,23 +70,23 @@ jobs:
         run: go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
 
   depproof:
-    name: dependency proof (JetStream terminal-write routes)
+    name: dependency canary (JetStream terminal-write routes)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # F-030's closure evidence: the two routes by which a Will-outbox write
+    # F-030's dependency canary: the two routes by which a Will-outbox write
     # conditioned on a superseded base could still reach the stream across a
     # stream-leader transition, run against isolated nats-server checkouts, plus the
     # mutation for each mechanism that closes one. See test/depproof/README.md.
     #
     # The job always starts and decides for itself, from the FILES the change touches,
-    # whether the proof can have been invalidated. Gating on the actor or on a label
+    # whether the canary can have been invalidated. Gating on the actor or on a label
     # would have missed a hand-written dependency bump, and then the push to main after
-    # it -- which is exactly the change that must not land unproved.
+    # it -- which is exactly the change that must not land without the canary.
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: decide whether this change can invalidate the proof
+      - name: decide whether this change can invalidate the canary
         id: gate
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -102,6 +102,7 @@ jobs:
             exit 0
           fi
           if git diff --name-only "$BASE" HEAD -- go.mod go.sum test/depproof \
+              internal/mqtt/will_terminal_cluster_test.go \
               | grep -q .; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
           else

@@ -1479,35 +1479,33 @@ An accepted CONNECT records one permanent, dated acceptance fact on `$MQTT.accep
 committed in ONE JetStream atomic batch with its session record on `$MQTT_sess`. A
 claimant suppresses a delayed Will only for an acceptance of that EXACT client, in this
 incarnation, strictly newer than the connection that created the Will, and dated BEFORE
-the Will fell due. See `docs/ARCHITECTURE.md`. What that does **not** cover:
+the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 
-- **Two same-base claimant writes across a leader transition: NARROWED, not retired.**
-  Two residuals were stated here — claimant DIVERGENCE, where a reclaim overwrites a
-  licensing decision, and terminal REGRESSION, where it overwrites a committed `done` —
-  on the premise that the expected-sequence check is pre-proposal and the in-process map
-  is cleared by a transition, so two writes taken from one base could both apply. That
-  premise was tested rather than reasoned about again (F-030, `test/depproof/`), against
-  the supported server and a generation predating its proposal fence. What follows is
-  what the evidence carries and what it does not.
-- **What is PROVED refused.** A write conditioned on base `S` can only reach the stream
+- **Two same-base claimant writes across a leader transition: RETIRED for a conforming
+  `$MQTT_willq`.** Two residuals were stated here — claimant DIVERGENCE, where a reclaim
+  overwrites a licensing decision, and terminal REGRESSION, where it overwrites a
+  committed `done` — on the premise that the expected-sequence check is pre-proposal and
+  the in-process map is cleared by a transition, so two bridge-authored conditional
+  writes taken from one base could both apply. F-030 disproved that premise against the
+  supported server.
+- **What is refused.** A write conditioned on base `S` can only reach the stream
   after a committed `done` has replaced `S` by one of two routes. **R-old** — an
   operation whose captured proposing term outlives that term — is refused by Raft's
   comparison of the captured term against the current one (`nats-io/nats-server#8370`,
   in the 2.14.5 floor), with two discriminating mutations and a control run on the
-  pre-fence generation. That route is closed. Eight further shapes are refuted in
-  writing in `test/depproof/README.md` rather than left unnamed.
-- **What is OBSERVED but not yet accepted as closed.** **R-new** — a newly elected leader
-  admitting a CURRENT-term write, which the term comparison cannot refuse — was refused
-  in every run measured, by a readiness envelope of two redundant halves and then by the
-  per-subject expectation a serving leader reconstructs from its own APPLIED state. No
-  run has produced the hazard on the supported floor. It is nonetheless NOT recorded as
-  closed: four adversarial review rounds each found a distinct false-positive path in
-  that route's oracle, so the confidence that is missing is in the instrument rather than
-  in the server. **Until that is settled, the terminal-regression and claimant-divergence
-  classes remain stated here, narrowed to this route.** What would settle it is in
-  `docs/findings/ha-arbitration.md` under F-030: every failure path observable by the
-  scorer, a negative check per row, and rounds that stop finding new ones.
-- **Why the DIVERGENCE class stands or falls with R-new.** Its ordering differs — the
+  pre-fence generation. That route is closed. Seven further shapes are refuted in
+  writing in `test/depproof/README.md`; post-start mirror/source drift is classified
+  outside F-030 rather than left unnamed or falsely refuted.
+  **R-new** — a newly elected leader admitting a CURRENT-term write — is refused by a
+  readiness envelope and then by the per-subject expectation a serving leader
+  reconstructs from its own applied state. The local fixtures and discriminating
+  mutations exercise those boundaries; the pinned source identifies them; and a NATS
+  maintainer independently confirmed that in-flight ownership and
+  applied-before-serving guarantee correct header enforcement across elections
+  ([`nats-server#8469`](https://github.com/nats-io/nats-server/issues/8469#issuecomment-5304075553)).
+  Four repaired false-positive paths mean the harness remains a canary rather than the
+  sole proof; the independent layers are why the route is closed.
+- **Why the DIVERGENCE class closes with R-new.** Its ordering differs — the
   first write is a licensing decision rather than `done` — but the admission question is
   identical, and it reduces to the same inventory. For a second write taken from the same
   base to be admitted after the first: in the same term it is refused as in-process
@@ -1515,13 +1513,19 @@ the Will fell due. See `docs/ARCHITECTURE.md`. What that does **not** cover:
   closed; if it is read and proposed in the new term, the leader admitting it must still
   expose the earlier applied state, which is R-new. What the record CARRIES does not
   change the stream-level admission and sequence mechanisms that refuse it.
-- **What the evidence says nothing about.** `$MQTT_sess`, `$MQTT_qos2in`,
+- **What the closure says nothing about.** `$MQTT_sess`, `$MQTT_qos2in`,
   `$MQTT_qos2assign` and `$MQTT_inflight`: the server mechanisms are stream-independent,
   but each of those findings owns its own consequence, and F-032 through F-034 stay open
   until each is audited on its own terms. It also does not claim the two backstops below
   the proved mechanisms — an entry admitted anyway is discarded by apply-time log order,
   and beneath that by the store's refusal of any sequence that is not the next one — but
   neither is mutation-proved and neither is part of any claim.
+- **Post-start source configuration remains outside the closure.** `$MQTT_willq`
+  validation rejects sources at manager initialization, but validation is a snapshot. An
+  operator can add a source while an initialized manager keeps serving; its foreign
+  writes carry no bridge CAS expectation and can replace the one-slot subject. The next
+  manager initialization refuses that shape, but the live configuration-drift interval
+  is not bounded by F-030's conditional-write contract.
 - **A duplicate is still possible where no terminal evidence exists.** Everything above
   is about a COMMITTED `done` being taken back. It leaves the sanctioned duplicate below
   exactly where it was, and that is the honest boundary: the broker never discards

@@ -551,7 +551,8 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 		// (`canConsistencyCheck := !isClustered`, nats-server v2.14.5
 		// server/stream.go:6247), so a proposal already accepted into the log applies
 		// whatever happened to the subject meanwhile — including an exact-sequence
-		// delete, which only clear() now issues. F-030's proof does not reach this:
+		// delete, which only clear() now issues. F-030's conditional-write closure does
+		// not reach this:
 		// it is about a write conditioned on a superseded base, and a delete carries
 		// no expectation at all. Reported as its own verdict so the
 		// resolver ARBITRATES rather than disposing on a read.

@@ -4,16 +4,15 @@ These findings share one architectural dependency: JetStream per-subject CAS is 
 linearization point only within a leader term. Treat them as one design epic before
 scheduling stream-specific work.
 
-**That shared premise was MEASURED on 2026-08-15 rather than assumed, and it did not
+**That shared premise was RETIRED on 2026-08-16 rather than assumed, and it did not
 hold up.** F-030 enumerated every route a write conditioned on a superseded base could
 take to a proposal across a leader transition and exercised each against the supported
-floor (`test/depproof/`). The old-term route is closed on evidence that stands alone.
-The new-leader route was refused in every run measured, but its oracle has yielded a
-distinct false-positive path in each of four review rounds, so it is recorded as
-observed rather than accepted as closed, and F-030 stays open and narrowed. The
-mechanisms are stream-independent, so F-032 through F-034 inherit the route inventory
-and the harness — but each owns a consequence of its own, and none closes on this
-evidence alone.
+floor (`test/depproof/`). Both live routes are closed by the combined route/mutation
+evidence, the pinned source mechanisms, and the NATS maintainer's explicit confirmation
+that leader-local in-flight ownership and applied-before-serving enforce the header
+across elections. The mechanisms are stream-independent, so F-032 through F-034 inherit
+the server contract and the canary — but each owns a consequence of its own, and none
+closes on this evidence alone.
 
 Multi-frontend HA is supported alpha scope (decided 2026-08-10, `docs/ROADMAP.md`
 section 0.2), so every finding here is an unconditional alpha blocker.
@@ -249,13 +248,11 @@ condemned by the retirement fence.
 
 **Title:** Add write lineage to the Will outbox
 
-- Status: **Open — NARROWED, 2026-08-15.** Not closed, and not because a defect was
-  found: the property was measured and holds in every run. One of its two live routes
-  (R-old) is closed on evidence that stands alone; the other (R-new) is OBSERVED to hold
-  but is not accepted as harness-enforced closure, because four review rounds each found
-  a distinct false-positive path in that route's oracle. What is missing is confidence in
-  the instrument, not a suspected hole in the server. Evidence and inventory in
-  `test/depproof/`.
+- Status: **CLOSED 2026-08-16.** No server defect was reproduced and no lineage was
+  added. The cross-election failure premise is disproved by three independent layers:
+  the exhaustive route inventory and mutation evidence in `test/depproof/`, the pinned
+  server mechanisms, and the NATS maintainer's explicit confirmation of the leader-only
+  contract across elections.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 30
@@ -302,7 +299,7 @@ a transition, and each is refused by a named mechanism:
   ([`nats-io/nats-server#8370`](https://github.com/nats-io/nats-server/pull/8370), in
   the 2.14.5 floor). Two mutations discriminate it: removing the comparison, and
   substituting the node's current term for the one the operation captured.
-- **R-new — OBSERVED, NOT ACCEPTED AS CLOSED.** A newly elected leader admitting a
+- **R-new — CLOSED.** A newly elected leader admitting a
   CURRENT-term write, which the term comparison cannot refuse. Refused by two
   mechanisms, each with its own mutation. A READINESS envelope with two redundant
   halves: a node behind on applies does not take
@@ -316,11 +313,12 @@ a transition, and each is refused by a named mechanism:
   from its own APPLIED state, which contains `done`; bypassing exactly that comparison
   is the second mutation.
 
-Eight further shapes — a stale-log election, in-term contention, an unclustered stream,
-the batch path, `ForwardProposal`, mirror or source ingestion, this broker's own
-sequence-targeted deletes, and an entry that reaches the log anyway — are refuted in
-writing in `test/depproof/README.md` rather than left unnamed, because the closure claim
-is the INVENTORY, not the fixtures.
+Seven further shapes — a stale-log election, in-term contention, an unclustered stream,
+the batch path, `ForwardProposal`, this broker's own sequence-targeted deletes, and an
+entry that reaches the log anyway — are refuted in writing in
+`test/depproof/README.md`. Mirror/source ingestion is classified rather than refuted:
+initial validation excludes it from a conforming stream, while post-start source drift
+remains outside F-030. The closure claim is the INVENTORY, not the fixtures.
 
 ### The control run falsified the plan's own prediction
 
@@ -341,27 +339,39 @@ record-state assertions kept as documented defence in depth: a fixture asserting
 the final record could not discriminate any of these mechanisms, since the record
 survives with all but one of them removed.
 
-### What is required before this finding can be ticked
+### Why closure does not rest on the harness alone
 
-Nothing about the server, on present evidence: R-new's mechanisms refused the write in
-every run measured, and no run has ever produced the hazard on the supported floor. What
-is missing is confidence in the INSTRUMENT.
+R-new's mechanisms refused the write in every run measured, and no run has ever
+produced the hazard on the supported floor.
 
 Four adversarial review rounds each found a distinct false-positive path in R-new's
 oracle — a mutation that staged the wrong state and reported success; a scorer that
 counted a kill without its boundary assertion firing; a scorer that required a marker but
 did not forbid the others; and a fixture whose final observation was unmarked, so a late
-proposal scored as the expected kill. Each was real and each was fixed, and the last of
-them is fixed here. But four rounds of one class — *an assertion whose failure the oracle
-cannot see* — is itself evidence about the harness rather than about the server, and a
-closure claim that rests on that harness should not be made until the class stops
-recurring.
+proposal scored as the expected kill. Each was real and each was fixed. That history
+still prevents treating the harness as the sole authority. It no longer prevents closure
+because upstream has now stated the contract independently: a NATS maintainer confirmed
+that the leader owns conditional admission, keeps conflicting clustered proposals in
+flight, and accepts no new messages after election until pending entries are applied,
+thereby guaranteeing enforcement of the expected-subject header across elections
+([`nats-server#8469`](https://github.com/nats-io/nats-server/issues/8469#issuecomment-5304075553)).
+The pinned source shows those same readiness and admission boundaries, and the harness
+exercises and mutates them. The three layers converge; no one scorer carries the claim.
 
-Concretely, closing this needs: every failure path in the R-new fixtures observable by
-the scorer; a negative check per row proving the scorer rejects the neighbouring outcome;
-and review rounds that stop finding new false-positive paths. R-old does not wait on any
-of that — its fixture, its two mutations and the v2.14.3 control stand alone, and it is
-recorded as closed above.
+The harness remains in CI as a dependency canary. Its negative checks and exact markers
+matter because a future dependency can regress the contract even though the historical
+closure does not depend on the harness proving itself in isolation.
+
+### Rejected upstream apply-time recheck
+
+The abandoned alternative was to let every follower re-evaluate the expected-subject
+condition against its physical store during replicated apply. That is unsound: physical
+store contents can legitimately differ across replicas under interest retention and
+replica-local expiry timing, so peers could disagree about whether to store the same
+committed entry and diverge their sequence accounting. A current-configuration gate does
+not repair the historical-state or configuration-ordering problem. This is the same
+desynchronisation avenue the maintainer identified in rejecting follower decisions.
+Leader-only admission is therefore part of the resolution, not a weakness left behind.
 
 ### What this evidence does NOT claim
 
@@ -381,10 +391,14 @@ recorded as closed above.
   `TestWillUnconditionalWriteRefiresAPublishedWill` states exactly what it would cost —
   which is why it is retained, renamed as a negative dependency test rather than cited
   as evidence about the server.
-- **Not that the terminal-regression residual is retired.** It is NARROWED, in
-  `docs/CONFORMANCE.md`, to the part R-new's evidence does not yet carry. Retiring it
-  outright would rest the contract on the harness this section has just declined to
-  rest a checkbox on.
+- **Not that post-start stream configuration is continuously validated.** The closure
+  assumes the validated `$MQTT_willq` shape remains conforming. A source added after
+  manager initialization can introduce an unconditional foreign write; it remains under
+  the configuration-drift residual and is not a route this conditional-write inventory
+  claims to refuse.
+- **Not that follower-local apply decisions would strengthen the result.** They would
+  introduce a second, non-deterministic admission decision and can desynchronise peers;
+  the guarantee is deliberately leader-authoritative.
 
 ### The bridge-level sentinel
 
@@ -398,8 +412,9 @@ unconditional store the negative tests use, and requires the failure to be the o
 the external act — *"a Will whose record committed `done` was published again"* — so a
 build failure or an unrelated assertion is not accepted as the kill.
 
-It is an integration sentinel, not the proof that the internal window was
-reached; `test/depproof/` supplies that.
+It is an integration sentinel, not sole proof that the internal window was reached;
+`test/depproof/` supplies the package-internal dependency canary, with the pinned source
+and maintainer statement completing the closure.
 
 ### Keeping the evidence alive across a dependency bump
 
@@ -471,9 +486,9 @@ whose subject is a durable value being REGRESSED.
 
 **Title:** Add write lineage to inbound QoS 2 holds and release claims
 
-- Status: Open. The shared cross-term premise is being measured rather than assumed
-  (see the note at the top of this file and F-030), and one of its two routes is
-  closed; what remains for this finding is its OWN consequence audit against that
+- Status: Open. The shared cross-term premise is closed
+  (see the note at the top of this file and F-030); what remains for this finding is its
+  OWN consequence audit against that
   route inventory, plus a fixture and a discriminating mutation for anything the
   audit finds still reachable.
 - Classification: HA arbitration architecture
@@ -493,9 +508,9 @@ whose subject is a durable value being REGRESSED.
 
 **Title:** Add write lineage to shared QoS 2 assignment claims
 
-- Status: Open. The shared cross-term premise is being measured rather than assumed
-  (see the note at the top of this file and F-030), and one of its two routes is
-  closed; what remains for this finding is its OWN consequence audit against that
+- Status: Open. The shared cross-term premise is closed
+  (see the note at the top of this file and F-030); what remains for this finding is its
+  OWN consequence audit against that
   route inventory, plus a fixture and a discriminating mutation for anything the
   audit finds still reachable.
 - Classification: HA arbitration architecture
@@ -513,9 +528,9 @@ whose subject is a durable value being REGRESSED.
 
 **Title:** Add write lineage to outbound in-flight registers
 
-- Status: Open. The shared cross-term premise is being measured rather than assumed
-  (see the note at the top of this file and F-030), and one of its two routes is
-  closed; what remains for this finding is its OWN consequence audit against that
+- Status: Open. The shared cross-term premise is closed
+  (see the note at the top of this file and F-030); what remains for this finding is its
+  OWN consequence audit against that
   route inventory, plus a fixture and a discriminating mutation for anything the
   audit finds still reachable.
 - Classification: HA arbitration architecture

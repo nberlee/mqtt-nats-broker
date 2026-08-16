@@ -5,7 +5,8 @@
 // terminal Will-outbox state (`done` on $MQTT_willq) is only non-regressible if the
 // JetStream server refuses a write whose per-subject expectation read a base that a
 // committed `done` has already replaced. Two routes can carry such a write to a Raft
-// proposal across a stream-leader transition, and each is proved separately here:
+// proposal across a stream-leader transition, and each is exercised separately here.
+// F-030's closure also rests on the pinned source and upstream maintainer confirmation:
 //
 //	R-old  an operation whose captured proposing term outlives that term. Refused by
 //	       the term comparison in raft.proposeLocked, shipped in v2.14.4
