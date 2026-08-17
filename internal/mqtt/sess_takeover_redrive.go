@@ -1,9 +1,11 @@
 // Arbitrating two frontends taking over one session from the same record base.
 //
-// JetStream per-subject CAS is the only durable arbitration this broker has, and it
-// linearizes only WITHIN a stream-leader term (docs/ARCHITECTURE.md, "JetStream
-// behaviors this design depends on"). Nothing here can prevent two writes off one
-// base. What it delivers is the part that can be delivered without new durable state:
+// JetStream per-subject CAS is the only durable arbitration this broker has, and
+// nothing HERE can prevent a second write landing on one base — which remains true for
+// the reason that survives: a CAS excludes a competing CONDITIONAL write off our base
+// (the same-base boundary, docs/CONFORMANCE.md), and cannot exclude an UNCONDITIONAL
+// one at all. This file is the arbitration either way, and it is still required for the
+// ordinary case it was built for: a definite CAS rejection, and a superseded teardown. What it delivers is the part that can be delivered without new durable state:
 // every interleaving converges on one owner, and each client is told something true.
 //
 // Two mechanisms, and they are one design.
@@ -48,9 +50,9 @@
 // transition below disposes BEFORE anything fallible.
 //
 // WHAT THIS DOES NOT CLOSE, both filed as docs/ROADMAP.md §0.2 blockers: the window in
-// which a teardown that WON its claim has already deleted the consumers a
-// cross-term survivor's record still names, and the recognition of two parentless
-// first-creates racing across a leader term. Both need durable state this slice does
+// which a teardown that WON its claim has already deleted the consumers a surviving
+// foreign record still names, and the recognition of two parentless first-creates
+// racing for one empty subject. Both need durable state this slice does
 // not introduce.
 //
 // See docs/ARCHITECTURE.md and docs/findings/ha-arbitration.md#f-029.

@@ -7,17 +7,19 @@ import (
 
 // Recognising a session record that FORKED from ours.
 //
-// The Raft window itself is unreachable from a test: it needs a proposal accepted under
-// one leader, an election, and a second proposal admitted against the stale applied state
-// the transition leaves behind. What IS reproducible, and what the broker actually has to
-// act on, is the DURABLE OUTCOME that window produces — two records derived from one
-// parent, the later surviving under MaxMsgsPer:1. That is staged here with an
-// unconditional store, which needs no CAS and no cluster, and it is the same
-// "pin the consequence, not the window" shape docs/CONFORMANCE.md already uses.
+// The unconditional store below is NOT a simulation of a Raft window any more. It IS the
+// route: a write carrying no per-subject expectation is excluded by nothing, and the
+// same-base boundary in docs/CONFORMANCE.md closes the cross-term alternative for two
+// bridge-authored CONDITIONAL writes. Nothing validates provenance at restore, and the
+// reserved-namespace guards deny $MQTT.> to MQTT clients rather than to permitted NATS
+// publication, so a valid-shaped body claiming our parent can simply be published onto
+// the subject. What the broker has to act on is that durable outcome — two records
+// claiming one parent, the later surviving under MaxMsgsPer:1.
 //
-// What these tests therefore do NOT reproduce, stated so the coverage is not read as more
-// than it is: pre-proposal admission against stale applied state, the cleared in-process
-// map, two success PubAcks to distinct brokers, and a second election.
+// This comment used to describe the shape as the durable consequence of an unreachable
+// Raft window, and to disclaim the parts of that window it could not reproduce. Those
+// disclaimers are moot: the mechanism being pinned is a write that needs no CAS, no
+// cluster and no election, which is why these tests need none either.
 
 // testLineageRecord builds a record fixture with an explicit identity. Everything the
 // classifier reads is stated at the call site — no fixture here relies on a zero value it
@@ -29,7 +31,7 @@ func testLineageRecord(gen, wid, pwid string) *mqttPersistedSession {
 // TestSessLineageRuleArms is the classifier's whole truth table, driven directly.
 //
 // The rule is consulted only where a caller has ALREADY concluded foreign, so every row
-// that is not a proven sibling must come back not-forked — that is the concession the
+// that does not claim our parent must come back not-forked — that is the concession the
 // change promises, and it is what keeps this a pure narrowing of an existing verdict.
 func TestSessLineageRuleArms(t *testing.T) {
 	t.Parallel()
@@ -44,7 +46,7 @@ func TestSessLineageRuleArms(t *testing.T) {
 		want  mqttRecordLineage
 	}{
 		// The one shape the rule exists for: same parent, different identity.
-		{"proven sibling", testLineageRecord(ourGen, "b", "p"), mqttLineageForked},
+		{"claims our parent", testLineageRecord(ourGen, "b", "p"), mqttLineageForked},
 
 		// 5c: a CHILD of our acknowledged record is a legitimate successor and a lost
 		// race, not a fork. It must not become forked now that the sibling arm is
@@ -66,14 +68,14 @@ func TestSessLineageRuleArms(t *testing.T) {
 		// found.WID != ackWID conjunct it is reported as a fork of itself.
 		{"verbatim replay of the acknowledged record", testLineageRecord(ourGen, "a", "p"), mqttLineageNotForked},
 
-		// M6: a proven sibling written by ANOTHER incarnation is forked, and this row was
+		// M6: a body claiming our parent written by ANOTHER incarnation is forked, and this row was
 		// deliberately INVERTED by F-029. It used to assert not-forked, on the reasoning
 		// that a different incarnation restarts the lineage. That conceded the one fork
 		// the feature exists to catch: a clean-start sibling is written by a session
 		// clear() re-minted, so it always carries a different generation, and the
 		// short-circuit ran before the pointer test could see the shared parent. Record
 		// identities are globally unique, so the parent match means what it says here too.
-		{"proven sibling of another incarnation", testLineageRecord("gen-other", "b", "p"), mqttLineageForked},
+		{"claims our parent, another incarnation", testLineageRecord("gen-other", "b", "p"), mqttLineageForked},
 
 		// 5a / M2a: an absent identity with a matching parent. Without the
 		// found.WID != "" guard, "" != ackWID satisfies the last conjunct and this
@@ -358,10 +360,11 @@ func testLoadRecordBody(t *testing.T, e *testInflightEnv) []byte {
 // acknowledged one, UNCONDITIONALLY — no CAS header, so it lands whatever the subject's
 // current sequence is.
 //
-// That is the durable end state a leader transition produces, staged without one: two
-// records off a single base, the later surviving under MaxMsgsPer:1. It is deliberately
-// not a CAS, because a CAS is exactly what cannot produce this outcome inside a single
-// leader term — which is the whole finding.
+// It is deliberately NOT a CAS, and that is the finding rather than a staging shortcut:
+// a conditional write off our base cannot produce this outcome at all (the same-base
+// boundary, docs/CONFORMANCE.md), while an unconditional one is excluded by nothing and
+// is the live route. Two records claiming one parent, the later surviving under
+// MaxMsgsPer:1.
 //
 // mutate is applied to the sibling's content so its digest differs from anything of ours;
 // without that the record would classify as a byte-identical landing.

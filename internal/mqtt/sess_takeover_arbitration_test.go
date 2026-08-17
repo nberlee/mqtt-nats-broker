@@ -241,7 +241,7 @@ func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 
 	// The authored-record fork is NOT given up, and this is the discrimination: a
 	// legitimate successor written through the production path by the other broker is
-	// not a fork, while two writes off that same base are (TestSessAuthoredForkStillClassifies).
+	// not a fork, while a body CLAIMING that same parent is (TestSessAuthoredForkStillClassifies).
 	sessB := testFreshSession(b, cid)
 	sessB.mu.Lock()
 	sessB.seq, sessB.wid, sessB.pwid = survivorSeq, survivor.WID, survivor.PWID

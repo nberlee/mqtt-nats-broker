@@ -168,8 +168,8 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	as.adoptAbandonedTeardowns(s)
 
 	// (1b) Then condemn the survivors of the claim-won deletion window: records whose
-	// generation is durably RETIRED but which carry no marker, because a cross-term
-	// resume evicted it. Ordered AFTER adoption deliberately — a marker this pass
+	// generation is durably RETIRED but which carry no marker, because an unconditional
+	// foreign write evicted it (the same-base boundary, docs/CONFORMANCE.md). Ordered AFTER adoption deliberately — a marker this pass
 	// writes must be finished by a LATER pass, so the record stays visibly MOVED for at
 	// least one backstop cadence rather than vanishing moments after it was marked.
 	// See condemnRetiredSurvivors.

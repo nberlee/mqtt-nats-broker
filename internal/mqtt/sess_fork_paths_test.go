@@ -71,7 +71,7 @@ func TestSessRejectionProbeClassifiesLineage(t *testing.T) {
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
 		want  mqttRejectionVerdict
 	}{
-		{"proven sibling", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttRejectionForked},
 		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
@@ -224,7 +224,7 @@ func TestSessForkOnAmbiguousResolution(t *testing.T) {
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
 		want  mqttUncertainResolution
 	}{
-		{"proven sibling", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttUncertainForked},
 		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
@@ -262,7 +262,7 @@ func TestSessForkOnAmbiguousResolution(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("resolveUncertainWrite = %v, want %v", got, tc.want)
 			}
-			// The resolver's first readback is a mint site: only a PROVEN sibling licenses a
+			// The resolver's first readback is a mint site: only a body claiming our parent licenses a
 			// repair, so the successor row must record nothing. See sess_fork_repair.go.
 			if tc.want == mqttUncertainForked {
 				testAssertMinted(t, e)
@@ -362,7 +362,7 @@ func TestSessForkedNotificationKeepsBothGates(t *testing.T) {
 }
 
 // TestSessUncertaintyResolutionAdoptsLineage is M13's paired test (10): resolving an
-// ambiguity as LANDED must adopt the lineage the proven bytes carry alongside the
+// ambiguity as LANDED must adopt the lineage the bytes proven DURABLE carry alongside the
 // sequence, or the next save parents itself to a record that is no longer the base.
 func TestSessUncertaintyResolutionAdoptsLineage(t *testing.T) {
 	e := testNewForkEnv(t, "amb-adopt")
@@ -433,7 +433,7 @@ func TestSessLowerSequenceSiblingIsReportedForeign(t *testing.T) {
 		ackWID  = "a"
 		ackPWID = "p"
 	)
-	// A record that IS a proven sibling by identity, sitting below the base.
+	// A record that DOES claim our parent by identity, sitting below the base.
 	sibling := testLineageRecord(ourGen, "b", ackPWID)
 	body, err := json.Marshal(sibling)
 	if err != nil {
@@ -548,10 +548,10 @@ func testCurrentRecordSeq(t *testing.T, e *testInflightEnv) uint64 {
 // TestSessForkedWithALiveCompetingOwnerIsStillUnsettled pins the VERDICT on the shape that
 // produces this change's sharpest residual.
 //
-// A proven sibling does not prove the survivor is an ORPHAN. Two CONNECTs admitted from
-// one base across a leader transition produce exactly this shape with a live owner on the
-// other side — a genuine takeover — and the fork verdict cannot tell that apart from a
-// write whose author is gone. The bound arm therefore treats both as unsettled rather than
+// A body claiming our parent does not prove the survivor is an ORPHAN. A live competitor
+// whose write reached the subject by a route no CAS excludes produces exactly this shape
+// with a real owner on the other side — a genuine takeover — and the fork verdict cannot
+// tell that apart from a write whose author is gone. The bound arm therefore treats both as unsettled rather than
 // as a takeover, which is what this test asserts: the competing owner is real and resident,
 // its record is the one that survives, and the verdict is still mqttBoundUnsettled with
 // nothing disposed.
@@ -619,7 +619,7 @@ func TestSessForkedWithALiveCompetingOwnerIsStillUnsettled(t *testing.T) {
 
 	outcome, stale := b.bc.settleBoundRejectionGated(e.asm, e.sess)
 	if outcome != mqttBoundUnsettled || stale != nil {
-		t.Fatalf("a proven sibling is UNSETTLED even with a live competing owner: got %v (stale=%v)",
+		t.Fatalf("a body claiming our parent is UNSETTLED even with a live competing owner: got %v (stale=%v)",
 			outcome, stale)
 	}
 	// Not disposed, so the connection ends through mqttHandleClosedClient's ordinary
@@ -627,7 +627,7 @@ func TestSessForkedWithALiveCompetingOwnerIsStillUnsettled(t *testing.T) {
 	if !e.resident(e.sess) {
 		t.Fatal("the forked arm must not dispose, or the Will consequence does not follow")
 	}
-	// The competing owner is still there: this is a sibling with a LIVE author, not an
+	// The competing owner is still there: this body claiming our parent has a LIVE author, not an
 	// orphan, which is the whole point of the fixture.
 	peerASM.mu.RLock()
 	_, peerResident := peerASM.sessions[cid]

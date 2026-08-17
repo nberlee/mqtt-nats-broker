@@ -746,12 +746,17 @@ it does *not* promise:
 - **A record found BELOW the attempt's base is classified foreign fail-safe**, not proven:
   sequences are monotonic within a stream incarnation, so that shape implies a reset or
   re-provisioned store. Nothing is adopted and nothing is written there.
-- **A leader transition can also let this broker's re-attempt overwrite a FOREIGN
-  same-base proposal, and that is not fixed here.** If another broker's takeover is
-  accepted at the same base, survives the election unapplied, and applies before this
-  re-attempt, the re-attempt lands last and erases it — the local session then settles as
-  ours while the takeover is discarded by `MaxMsgsPer: 1`, and the displaced broker's
-  client is evicted by the persist observation. This is the pinned per-subject-CAS
+- **A FOREIGN unconditional write can supersede this broker's conditional write, and
+  that is not fixed here.** The route is an UNCONDITIONAL foreign write, which carries
+  no expectation for any check to compare (a competing CONDITIONAL write off our base is
+  excluded — see the same-base boundary below). **The direction matters, because the
+  reverse is not reachable.** If the unconditional write is admitted first it is recorded
+  in the stream's in-flight state, so our later expected-sequence re-attempt is REFUSED;
+  and if it has already applied, the moved subject sequence refuses the re-attempt too.
+  What is reachable is the other order: our re-attempt is admitted, and the unconditional
+  write lands afterwards and overwrites it — the record then holds a body this broker
+  never wrote, while the local session believes its own write settled. This is the
+  pinned per-subject-CAS
   linearization contract failing (`docs/ARCHITECTURE.md`, "JetStream behaviors this design
   depends on"), and it fails identically for EVERY arbitrating CAS this broker makes: the
   definite-rejection probe's re-attempt of current memory, the repair retry's exact-byte
@@ -761,11 +766,13 @@ it does *not* promise:
   compares a stream-wide value), so what `$MQTT_sess` carries instead is a **parent
   pointer** that makes the outcome recognisable. See the next section for exactly how much
   that buys.
-- **A leader transition can let BOTH of this broker's proposals commit, and that is
-  accepted rather than prevented.** The shared CAS base ordinarily excludes the second,
-  but a transition clears the in-process map while a replicated proposal survives, and a
-  clustered apply does not
-  re-check the expected sequence. Both landings carry IDENTICAL bytes, log order makes the
+- **This broker's original and its re-attempt cannot both commit, and the design no
+  longer rests on tolerating it if they did.** Both are bridge-authored conditional
+  writes off one base, so the same-base boundary below excludes the second. The
+  tolerance described here is RETAINED as ordinary defensive depth, and it is NOT
+  coverage of the unconditional route: an external replay supplies no second
+  acknowledgement for this broker to adopt, so the reasoning below does not
+  transfer to it. Both landings would carry IDENTICAL bytes, log order makes the
   re-attempt's sequence the surviving one, and `$MQTT_sess` is `MaxMsgsPer: 1`, so the
   duplicate is discarded on arrival and the end state is one record with those bytes at the
   adopted sequence. The cost is one consumed stream sequence and one extra (idempotent)
@@ -780,26 +787,28 @@ it does *not* promise:
   absent subject is therefore not proof that the attempt is dead. The resolver arbitrates:
   a re-attempt refused with **10164** (a write for the subject is in process, possibly that
   proposal) leaves the session UNRESOLVED rather than disposing it. A refusal with
-  **10071** is classified foreign, and that is the residual: a leader transition clears the
-  in-process map while a replicated proposal can survive it, so a proposal that lands after
-  such a transition can still be read as another owner's. Narrowed from "absence is a
+  **10071** is classified foreign, and that is the residual: an unconditional foreign
+  write carries no expectation for any check to compare, so a body that lands on the
+  subject can still be read as another owner's. (For a competing CONDITIONAL write the
+  route is closed — see the same-base boundary below.) Narrowed from "absence is a
   verdict", not closed.
 
 ### A forked session record is RECOGNISED, and its recoverable grant REPAIRED
 
-`$MQTT_sess` records carry `WID`/`PWID`, a parent pointer, so a survivor that is provably
-a **sibling** of the record this broker was acknowledged for stops being reported as a
-takeover: the client is told **0x89 "server busy, try again later"** instead of 0x8E, which
-invites the reconnect 0x8E forbids. Five classified paths consult it — the definite
-rejection probe (bound and unbound), the ambiguity resolver, the two CONNECT-time saves,
-and the persist observation's eviction worker — plus the CONNECT rollback readback. See
-`docs/ARCHITECTURE.md`, "Recognising a forked session record".
+`$MQTT_sess` records carry `WID`/`PWID`, a parent pointer, so a survivor that provably
+**CLAIMS the parent** of the record this broker was acknowledged for stops being
+reported as a takeover: the client is told **0x89 "server busy, try again later"**
+instead of 0x8E, which invites the reconnect 0x8E forbids. Five classified paths consult
+it — the definite rejection probe (bound and unbound), the ambiguity resolver, the two
+CONNECT-time saves, and the persist observation's eviction worker — plus the CONNECT
+rollback readback. See `docs/ARCHITECTURE.md`, "Recognising a forked session record".
 
 What it does NOT do:
 
 - **The persist-observation route now classifies, asynchronously, and that leaves its own
   residuals.** The eviction runs on a per-client worker that loads and classifies the
-  surviving record before acting; on a proven sibling it answers 0x89 and leaves the
+  surviving record before acting; on a body claiming our own parent it answers 0x89
+  and leaves the
   displaced incarnation's delayed-Will outbox records pending. What that does not close:
   - a **lost observation is no longer lost**, and neither is a refused eviction: the
     observation channel is the session-record watch, and the committed-read backstop
@@ -852,9 +861,9 @@ What it does NOT do:
     generation before it ever compared parents; it no longer consults the generation at
     all, and briefly `clear()` carried the claimed record's identity across the re-mint so
     the sibling arrived PARENTED. That inheritance, and the three others like it, were
-    deleted: a create is parentless, so a clean-start sibling and a cross-term create pair
-    both concede at arm 2's `ackPWID` conjunct. See R-create below for the direction and
-    the evidence. The one-hop limit applies as everywhere — including
+    deleted: a create is parentless, so a clean-start sibling and a parentless
+    create pair both concede at arm 2's `ackPWID` conjunct. See R-create below for
+    the direction and the evidence. The one-hop limit applies as everywhere — including
     through an UNRESOLVED local attempt: a save whose store landed ambiguously leaves
     the acknowledged pair stale behind a free fence, so a remote sibling of that
     unadopted attempt concedes to 0x8E (and the takeover-path Will cancel), exactly as
@@ -900,11 +909,13 @@ What it does NOT do:
   - only on **this broker** and only while the survivor it conceded to is still the
     current record in the same incarnation — the capsule is memory, so a restart forfeits
     the repair, and any write since the verdict makes the anchor refuse permanently;
-  - only where the survivor **made no grant decision of its own** about the same filter. A
-    filter the survivor also decided about, and two drains for one sid whose persisted
-    content differs, are left to the survivor and never repaired: two acknowledgements
-    with no ordering between them, so the record that is actually durable wins. The
-    non-repair is counted in the merge's log line, never guessed at;
+  - only where the survivor's **recorded grant EQUALS the retained baseline** for that
+    filter. A filter whose recorded content differs, and two drains for one sid whose
+    persisted content differs, are left to the survivor and never repaired: the record that
+    is actually durable wins. Equality is not evidence that the survivor's author decided
+    nothing about the filter — only that it recorded nothing this broker can see, which is
+    the repair-authorization residual stated below. The non-repair is counted in the merge's
+    log line, never guessed at;
   - **one losing branch, not the union of all recognised losses**: the first reconnect
     whose accept CAS lands advances the record identity and invalidates every other
     broker's capsule;
@@ -944,7 +955,8 @@ What it does NOT do:
     ordering would extend an open finding rather than respect it.
 - **The verdict does not prove the survivor erased us.** A teardown claim is a full-body
   CAS off the same base, so a sibling can merely have become current after `clear()`
-  deleted our record. What is proven is only that the survivor is no successor of ours.
+  deleted our record. What is established is only that the survivor is not demonstrably
+  a successor of ours.
 - **The withheld verdict can publish a Will a genuine takeover would have suppressed**, on
   the definite-rejection bound path: the foreign settlement calls
   `mqttDiscardWillOnTakeover` before disposing, while the 0x89 route runs ordinary close
@@ -981,11 +993,14 @@ What it does NOT do:
   a record that carries no lineage still writes a fresh `WID`, so siblings formed from
   that stamped base are detectable. What concedes is a fork based on the unstamped record
   itself, until one save establishes a new base.
-- **Takeover versus takeover at one base is arbitrated WITHIN a leader term, and only
-  there.** F-029 made every record write conditional, base 0 included, so two frontends
-  writing off one base inside a term produce exactly one winner and a definitely-rejected
-  loser that re-drives onto the winner's record. The CROSS-TERM pair — both records
-  applying, the loser's erased — is NOT recognised: F-029b closed it by having a create
+- **Takeover versus takeover at one base is arbitrated by the record CAS.** F-029 made
+  every record write conditional, base 0 included, so two frontends writing off one base
+  produce exactly one winner and a definitely-rejected loser that re-drives onto the
+  winner's record — and the same-base boundary below makes that unqualified for two
+  bridge-authored conditional writes rather than true only within a term. What is NOT
+  recognised is the pair produced by a write no CAS can exclude — an unconditional
+  foreign one — where both records exist and the loser's is
+  erased: F-029b closed it by having a create
   inherit the identity of the record whose deletion emptied the subject, and the
   write-lineage audit deleted every such inheritance because each was reachable equally by
   a false fork. A clean-start side concedes for the same reason. A side whose observation
@@ -1006,9 +1021,8 @@ What it does NOT do:
   and PRESERVES a delayed Will the takeover path would have cancelled; that is the
   dangerous direction. The audit's result is that the create side now has only the first.
 
-  - **R-create — the cross-term create pair is not recognised.** Both brokers find the
-    subject empty, both are admitted at base 0 pre-proposal, both apply, `MaxMsgsPer: 1`
-    discards the earlier, and both records carry no parent — so arm 2's `ackPWID != ""`
+  - **R-create — the parentless create pair is not recognised.** Two records both carry
+    no parent — so arm 2's `ackPWID != ""`
     conjunct concedes from either orientation and the erased side answers 0x8E about a
     takeover nothing arbitrated, cancelling its delayed Will on that path. This is the
     general form of what F-029b closed and this audit reopened, and it subsumes the
@@ -1056,35 +1070,40 @@ What it does NOT do:
     are, because their routes survive parentlessness with a changed VERDICT rather than
     disappearing.
 
-  - **R3 — a delayed same-base proposal that outlives an interval.** A child write
-    admitted against record `P` can apply after `P` was properly retired and deleted and
-    a create `X` took its place. `X` no longer inherits `P`'s identity, so the lineage
+  - **R3 — a delayed same-base proposal that outlives an interval. CONDITIONAL: every
+    consequence below holds IF this interleaving is reachable, and this item does not
+    settle that — see the closing note of this bullet.** Suppose a child write admitted
+    against record `P` applies after `P` was properly retired and deleted and a create
+    `X` took its place. `X` no longer inherits `P`'s identity, so the lineage
     verdict is a CONCESSION rather than a fork — `X`'s broker reports 0x8E "session taken
     over" where it reported 0x89, and **performs the takeover-path Will cancellation the
     forked verdict used to skip**, destroying durable Will state on a takeover nothing
     demonstrated. That is the same direction as R-create and R4 and it is stated here
     explicitly, because the pre-audit text recorded the opposite consequence for this
     route. What does not go is the route or its other
-    costs, and they are PRE-EXISTING rather than introduced here: the survivor wins the
+    costs — all equally conditional on the supposition above, and all PRE-EXISTING
+    rather than introduced here: the survivor wins the
     single slot either way, so `X`'s granted state is lost and unrecoverable; condemning
     the survivor by the retirement fence is destructive where it added state; the F-036
     stranded-session route applies; and a delayed STATE-CHANGING save can have its client
     acknowledged for membership the fence subsequently deletes — a conditional false
     acknowledgement that is a property of the delayed-proposal window and the fence.
 
-    It cannot be dismissed as a single-message impossibility, and that is now true of
-    the accepted-CONNECT writer for a stated reason rather than for want of evidence.
-    F-030's inventory proves the single-message writer. The accepted-CONNECT write is an
-    `AllowAtomicPublish` batch, and its apply-layer behaviour is **measured** rather than
-    refuted in writing (`test/depproof/README.md`, R-batch): a committed prefix without
-    its commit entry stores nothing, so a batch never applies half of itself. What the
-    batch does NOT change is this route, because the refusals that guard it are the same
-    code the single-message writer uses — `ProposeMulti` carries `proposeLocked`'s
-    captured-term comparison verbatim, and a batch commit derives its per-subject
-    expectation through the same `checkMsgHeadersPreClusteredProposal`, read from the
-    leader's own applied store. R3's window is therefore identical for both writers
-    rather than absent from one: the expectation is checked before the proposal, and the
-    apply happens later.
+    **What this item settles about R3, and what it deliberately does not.** The same-base
+    boundary below is about two bridge-authored CONDITIONAL writes taken from ONE base.
+    R3's interleaving is a different shape — it involves a DELETE and a create at base 0 —
+    so the boundary neither states it nor closes it. The framing this route used to carry,
+    that it is an instance of two same-base conditional writes both applying, is RETIRED,
+    because that shape is excluded. **Whether R3's interleaving is reachable at all is NOT
+    settled here**: an adversarial review argued it is excluded by proposal ordering and
+    the in-process per-subject guard, and this item did not verify that against the pinned
+    server. R3 therefore stands as previously documented, pending an analysis that owns
+    it, and nothing in this change is evidence for or against it. Both writers reach
+    whatever remains identically: the batch's apply-layer behaviour is measured
+    (`test/depproof/README.md`, R-batch) and its refusals are the same code —
+    `ProposeMulti` carries `proposeLocked`'s captured-term comparison verbatim, and a
+    batch commit derives its expectation through the same
+    `checkMsgHeadersPreClusteredProposal`.
 
   - **R4 — out-of-band record deletion.** `$MQTT_sess` must have `DenyDelete == false`
     because the broker's own deleter needs it, so an operator deleting a live record
@@ -1100,15 +1119,23 @@ What it does NOT do:
     deletion the broker did not perform.
 
   - **Not a recognition route, and it survives this deletion independently: the
-    rollback's own teardown claim can be regressed by a cross-term apply.** The teardown
-    claim is a full-body CAS at the candidate's sequence, and the expected-sequence check
-    runs only BEFORE the proposal, so a remote successor admitted against the same base
-    and the claim can both apply. Whichever applies last holds the subject: claim-last
-    makes `clear()` believe it won and delete the retiring generation's state, which a
-    SAME-generation successor (a resumed CONNECT preserves the generation) still needs;
-    claim-first leaves the retirement recorded and the survivor is condemned by the
-    retirement fence. Either way a client whose save succeeded can lose its resumable
-    state. Parentless creates are not its justification and do not narrow it — the claim
+    rollback's own teardown claim can be regressed by a write it cannot exclude.** The
+    teardown claim is a full-body CAS at the candidate's sequence. Its RE-FOUNDED route is
+    an UNCONDITIONAL foreign write, which carries no expectation for the check to compare;
+    a competing CONDITIONAL successor off the same base is excluded by the same-base
+    boundary below, so the cross-term framing this residual used to carry is retired.
+    **Only ONE ordering is reachable, and the symmetry the cross-term framing carried does
+    not survive with it.** The claim is CONDITIONAL, so it cannot be the one that lands
+    last: if the unconditional write was admitted first it is in the stream's in-flight
+    state and the claim is refused, and if it has already applied its new sequence refuses
+    the claim too (the same admission rule stated for the re-attempt above). The reachable
+    order is claim-FIRST, then the unconditional write, which evicts the marker and leaves
+    the hollow survivor — the retirement is recorded, so the survivor is condemned by the
+    retirement fence, and a client whose save succeeded can lose its resumable state. That
+    arm alone is what the retirement watermark exists to protect against, and it is
+    untouched by this correction; what goes is only the claim-LAST consequence, which
+    would require an admission path bypassing both refusals, and none is documented.
+    Parentless creates are not its justification and do not narrow it — the claim
     is a record write of its own, not a create — which is why it is stated here rather
     than carried out with the create-side routes. This is the SAME claim-apply window
     every other `clear()` caller carries — see "decision-time monotonicity" in
@@ -1131,15 +1158,75 @@ What it does NOT do:
   is measured (`test/depproof/README.md`), and the bridge's own use of the batch is
   asserted at the store boundary by `TestMQTTAcceptBatchReplicatedIndivisible`.
 
-  So the machinery is retained on a NARROWER and still-open question: whether any
-  supported writer, ambiguity path, deletion, recreation, restore, replay or
-  administrative input can place two record bodies claiming one parent where a broker
-  can observe them. The classifier's predicate proves exactly that — two byte strings
-  naming one parent — and never that two CAS applications off one base both landed, so
-  closing the batch route does not by itself answer it. That audit is the open half of
-  the same `docs/ROADMAP.md` item, and this machinery stands until it reports. Pinned by
-  `TestMQTTAuthoredForkStillClassifies`, which is also what stops every concession above
-  from being satisfiable by a classifier that had simply been removed.
+  **The same-base boundary (authoritative; other sections reference this one).** State it
+  in three parts, because collapsing them is what produced two wrong conclusions in a row:
+
+  1. **Closed.** Two BRIDGE-AUTHORED CONDITIONAL writes on `$MQTT_sess` taken from one
+     base cannot both apply. Every bridge-authored production writer of the record
+     subject sets `Nats-Expected-Last-Subject-Sequence` — the accept batch, the
+     non-accept save, the teardown claim and the expiry sweep's stamping — and the
+     admission trichotomy then closes it: in the same term the second is refused as
+     in-process contention; if its expectation was read in a term that has ended it is
+     R-old, closed by the captured-term comparison; if it is read and proposed in the new
+     term, the leader admitting it must still expose the earlier applied state, which is
+     R-new. F-030 established that trichotomy and Part A supplied the writer it was
+     missing. This is why no statement here may still explain live behaviour by "two
+     writes off one base can both apply".
+  2. **Still open.** The same durable END STATE — a foreign body in the one slot, off a
+     base this broker held — remains reachable, because an **unconditional** write is not
+     a write the trichotomy speaks about at all. `test/depproof/README.md` scopes the
+     proof to writes CARRYING a per-subject expectation; a headerless direct publish to
+     `$MQTT.sess.<domainTk><cidHash>` carries none. Nothing validates record provenance
+     at restore: `createOrRestoreSession` checks JSON, client ID, reserved membership,
+     generation, the affine pair, teardown/retirement and overdue state, then adopts
+     `WID`/`PWID` exactly as given. The reserved-namespace guards deny `$MQTT.>` to MQTT
+     clients; they are not a guard against permitted NATS publication.
+  3. **Untouched**, and the reasons differ per stream — do not collapse them.
+     **Deletes** carry no per-subject expectation, so no admission closure speaks about
+     them. **`$MQTT_qos2in`, `$MQTT_qos2assign` and `$MQTT_inflight`** await their own
+     consequence audits — F-032, F-033 and F-034 respectively — which are open.
+     **`$MQTT_teardown`** is not one of those: it carries its own separately documented
+     residuals (the retirement watermark and the single slot), stated where they arise.
+     **`$MQTT_origin` is not in scope at all**: the register was deleted by the
+     write-lineage audit and the stream is REFUSED at startup, so there is nothing about
+     it left to retire. Nothing above retires a statement about any of these.
+
+  **So the machinery is retained, and on part 2 rather than on the batch gap.** The
+  classifier's predicate `found.PWID == ackPWID && found.WID != ackWID` establishes that
+  the surviving body CLAIMS the same parent — never that it is provably descended from
+  it, which unvalidated restore forbids anyone from concluding. That is still exactly the
+  claim needed: a body claiming our parent does not establish a takeover, and reporting
+  one as a takeover would cancel a delayed Will that is still owed
+  (`sess_rejected_write.go`, foreign arm) and skip the repair capsule.
+
+  **What the re-founded route costs the REPAIR, stated as a residual.** The repair's
+  conflict predicate (`mqttSurvivorDecidedGrant`) re-asserts our delta for a filter only
+  where the survivor's grant EQUALS the retained parent's — read as "the survivor made no
+  decision about this filter". Under the route this audit retired (two legitimate brokers
+  racing off one base) that inference was sound, because the survivor was another broker's
+  record. Under the route that remains, the body is whatever an unconditional publisher
+  wrote, and equality with the baseline is no longer evidence about intent. Three things
+  bound it, and none of them makes it an invariant. The predicate is conservative in the
+  only direction that matters: anything the survivor states DIFFERENTLY is left alone and
+  the non-repair is counted and logged, so a deliberate divergent grant is never
+  overwritten. The re-assertion is applied by the client's own CONNECT under the accept
+  save's CAS, not by a background writer. And an actor able to publish an arbitrary body
+  to `$MQTT.sess.<domainTk><cidHash>` can already set that session's state directly, so
+  the repair grants it no capability it did not have. What is NOT claimed is that the
+  survivor made no decision — only that it recorded none this broker can see. Repair
+  authorization is therefore weaker than classifier retention, and deliberately so: the
+  classifier's conclusion is negative (no takeover is established) and needs no provenance,
+  while the repair acts, and acts on an inference from body equality.
+
+  Two tests carry that, and they are not interchangeable.
+  `TestMQTTAuthoredForkStillClassifies` pins the classifier's SEMANTICS; it constructs
+  lineage values and calls the predicate, so it says nothing about live reachability.
+  `TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill` is the retention oracle: it
+  lands a valid-shaped record with an unconditional store and proves the live connection
+  reaches the classifier, is answered 0x89, and publishes its Will.
+  `TestMQTTForkedRecordE2EConnectRebuildsFromRecord` proves the capsule restores real
+  delivery. Together they are what stops every concession above from being satisfiable by
+  a classifier that had simply been removed.
 
   Both remaining bounds are unchanged. **No false verdict can resurrect state**: a
   capsule minted by the persist-observation route can never be APPLIED to a create,
@@ -1223,16 +1310,18 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
      from that — a first-ever write carried no CAS header, so re-sending it would have
      overwritten whatever was there rather than arbitrating. **F-029 made every create
      conditional**, so base 0 is settled the same way as any other, and two brokers
-     creating one session from nothing are arbitrated within a leader term rather than
-     one erasing the other. Across a leader transition both creates can still apply and
-     the later one survive, and the loser cannot tell that from an ordinary takeover —
-     that is a `docs/ROADMAP.md` §0.2 blocker, tracked work rather than an accepted
-     limit, because closing it needs a durable identity for the empty-subject interval.
+     creating one session from nothing are arbitrated rather than one erasing the other.
+     That is now unqualified for two bridge-authored conditional writes — a create is
+     conditional too, base 0 meaning *the subject must currently be empty* — see the
+     same-base boundary below. What remains is a parentless record arriving by a route no
+     CAS excludes (an unconditional write, or an out-of-band deletion then a create),
+     which the loser cannot tell from an ordinary takeover; closing that needs a durable
+     identity for the empty-subject interval.
      Still open, and NOT covered by the closure:
      - **an absent record whose re-attempt is refused 10071** (nothing in process for the
-       subject). That refusal does not prove the ORIGINAL proposal is dead: a leader
-       transition clears the in-process map while a replicated proposal can survive it, so
-       a proposal landing after such a transition is still classified foreign — evicting
+       subject). That refusal does not prove the ORIGINAL proposal is dead, and an
+       unconditional foreign write is excluded by nothing, so a body landing on the
+       subject afterwards is still classified foreign — evicting
        the session, closing a live connection with 0x8E and discarding its Will before its
        own write lands. Narrowed (10164 now defers instead of disposing) rather than
        closed; see the settlement section below.
@@ -1598,8 +1687,8 @@ has no name to use.
 
 A teardown that WINS its claim records a permanent per-client **generation-retirement
 watermark** on `$MQTT_teardown` before it deletes anything, so the fact survives the one
-thing the record cannot: a cross-term resume derived from the same base evicting the
-marker off the record's own subject. Three readers act on it — the winner's own
+thing the record cannot: an unconditional foreign write evicting the marker off the
+record's own subject. Three readers act on it — the winner's own
 release-superseded arm, which condemns a same-generation survivor with a fresh marker;
 the CONNECT restore, which discards a retired record instead of resuming it hollow; and
 the orphan sweep, which condemns one with no CONNECT at all. A FOURTH was deleted by the
@@ -1619,7 +1708,7 @@ mattered.
 Residuals and hard requirements:
 
 - **The hollow interval is bounded by observation, not by an instant.** Between the
-  cross-term resume applying and a reader condemning it, the survivor's broker still
+  foreign write applying and a reader condemning it, the survivor's broker still
   answers for the session: the winner's arm runs immediately, but a winner that crashed
   after recording the retirement leaves the repair to the next CONNECT or to the sweep,
   which needs a stable observation across its grace plus a later pass. Nothing is lost

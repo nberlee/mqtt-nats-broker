@@ -176,8 +176,8 @@ func TestMQTTSessLineageSurvivesNodeRestart(t *testing.T) {
 // serializes" and "the grant survives replication" are the same statement. They are not: the
 // parent snapshot a capsule is measured against comes from a record that has been through
 // Raft, and the accept save that applies the merge is a per-subject CAS on a Replicas=3
-// stream — the very write whose non-linearizability across a leader term is what produces
-// forks in the first place.
+// stream — the very write a foreign unconditional publish can erase, which is what
+// produces forks in the first place.
 //
 // The assertion that matters is the last one: a re-asserted membership DELIVERS. A record
 // that merely mentions the filter would satisfy everything above it.
@@ -211,7 +211,7 @@ func TestMQTTForkedRecordRepairOnAReplicatedStream(t *testing.T) {
 	asm.mu.Unlock()
 
 	// An unresolved write whose bytes never reached the stream, then a sibling of the
-	// acknowledged record: the resolver's readback finds a record that is provably no
+	// acknowledged record: the resolver's readback finds a record that is not demonstrably a
 	// successor of ours, which is the verdict that mints.
 	mqttTestSessStoreSuppressV.Store(true)
 	_ = testSessSave(t, sess)
@@ -254,7 +254,7 @@ func TestMQTTForkedRecordRepairOnAReplicatedStream(t *testing.T) {
 // basis, and it is now the ONLY cross-broker consumer of the fact.
 //
 // The second half is the reader that was REMOVED: broker B's create no longer draws a
-// parent from the watermark it can plainly read, which is what makes a cross-term create
+// parent from the watermark it can plainly read, which is what makes a parentless create
 // pair concede. Asserting both against one replicated watermark is the point — the fact
 // is available and deliberately unused.
 func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {

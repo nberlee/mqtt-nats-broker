@@ -8,7 +8,8 @@ import (
 	"time"
 )
 
-// Repairing the grant a proven session-record fork erased.
+// Repairing the grant a recognised forked record may be missing: a CANDIDATE delta at
+// mint time, filtered against the survivor at merge time.
 //
 // Every fixture here stages THREE records — the parent P, our child X, and a survivor Y
 // that is X's sibling — because that is the only shape the repair is defined for, and
@@ -27,8 +28,8 @@ import (
 // Fixtures
 // ---------------------------------------------------------------------------
 
-// testForkRepairEnv is a broker that has reached a PROVEN fork with a capsule minted: the
-// record chain is R1 -> R2 (the parent P) -> R3 (ours, X), a sibling of P has erased X, and
+// testForkRepairEnv is a broker that has reached a RECOGNISED fork with a capsule minted: the
+// record chain is R1 -> R2 (the parent P) -> R3 (ours, X), a body claiming P has replaced X, and
 // the local session has been disposed exactly as production disposes it.
 type testForkRepairEnv struct {
 	*testRejectionEnv
@@ -78,9 +79,10 @@ func testStageForkedGrant(t *testing.T, clientID string, base, ours func(sess *m
 		t.Fatalf("fixture: the acknowledged pair must be complete, got (%q,%q)", ackWID, ackPWID)
 	}
 
-	// The survivor: a sibling of P, so classifyRecordLineage proves it is no successor of
-	// X. Its content defaults to P's, which is the survivor that made no grant decision of
-	// its own.
+	// The survivor: a body CLAIMING P as its parent, so classifyRecordLineage reports it
+	// as not demonstrably a successor of X. Its content defaults to P's, which is the
+	// survivor whose RECORDED grant equals the retained baseline — the repairable side of
+	// the conflict predicate, not a survivor proven to have decided nothing.
 	testLandSibling(t, e.testInflightEnv, func(ps *mqttPersistedSession) {
 		testCopyGrantInto(ps, &parentRec)
 		if survivor != nil {
@@ -514,7 +516,7 @@ func TestForkRepairThreeWayMerge(t *testing.T) {
 		sess := e.reconnect(t)
 		got := testSubsOf(t, sess)
 		if _, ok := got["m/b"]; !ok {
-			t.Fatalf("the acknowledged SUBSCRIBE the fork erased must be re-asserted, got %v", got)
+			t.Fatalf("the acknowledged SUBSCRIBE missing from the survivor must be re-asserted, got %v", got)
 		}
 		if _, ok := got["m/a"]; !ok {
 			t.Fatalf("the survivor's own membership must survive, got %v", got)
@@ -1108,7 +1110,8 @@ func TestForkRepairDeletesNoDurable(t *testing.T) {
 // the repair assertions attached to those tests all look for exactly this filter.
 const testForkEnvDeltaFilter = "fork/env/delta"
 
-// testAssertMinted checks that a forked verdict recorded the grant its sibling erased.
+// testAssertMinted checks that a forked verdict recorded the CANDIDATE delta. Whether the
+// survivor lacks any of it is a merge-time question this mint-time assertion cannot ask.
 func testAssertMinted(t *testing.T, e *testRejectionEnv) *mqttForkedGrant {
 	t.Helper()
 	g := e.capsule(t)
@@ -1125,7 +1128,7 @@ func testAssertMinted(t *testing.T, e *testRejectionEnv) *mqttForkedGrant {
 func testAssertNotMinted(t *testing.T, e *testRejectionEnv) {
 	t.Helper()
 	if g := e.capsuleOrNil(); g != nil {
-		t.Fatalf("only a PROVEN sibling licenses a repair; this verdict minted %+v", g.changes)
+		t.Fatalf("only a body claiming our parent licenses a repair; this verdict minted %+v", g.changes)
 	}
 }
 
@@ -1924,7 +1927,7 @@ func TestForkRepairRefusesAnOversizeRecord(t *testing.T) {
 			"keeping only one would leave a delta computed against a record two writes back")
 	}
 
-	// And therefore a proven fork mints nothing rather than repairing from stale bytes.
+	// And therefore a recognised fork mints nothing rather than repairing from stale bytes.
 	testLandSibling(t, e.testInflightEnv, testMutateSibling)
 	e.rejectSave(t, e.sess)
 	if got := e.sess.settleRecordRejection(e.asm); got != mqttRejectionForked {

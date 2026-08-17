@@ -21,14 +21,14 @@ import (
 // identities explicitly.
 
 // testConnectForkEnv stages the reachable CONNECT-time shape: the acknowledged pair is the
-// ACCEPT SAVE's, and the survivor is a sibling of THAT record rather than of anything
+// ACCEPT SAVE's, and the survivor claims THAT record's parent rather than anything
 // older.
 type testConnectForkEnv struct {
 	*testRejectionEnv
 	survivor *mqttPersistedSession
 }
 
-// testNewConnectForkEnv builds it. stage decides whether the survivor is a proven sibling
+// testNewConnectForkEnv builds it. stage decides whether the survivor claims our parent
 // of the accept save or a legitimate successor of it.
 func testNewConnectForkEnv(t *testing.T, clientID string,
 	stage func(*testing.T, *testInflightEnv) *mqttPersistedSession) *testConnectForkEnv {
@@ -66,7 +66,7 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
 		want  byte
 	}{
-		{"proven sibling", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttReasonServerBusy},
 		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
@@ -130,7 +130,7 @@ func TestSessForkedAtConnectTimeContendedInLoop(t *testing.T) {
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
 		want  mqttRepairSaveVerdict
 	}{
-		{"proven sibling", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttRepairSaveForked},
 		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
@@ -181,7 +181,7 @@ func TestSessForkedAtConnectTimeContendedAfterExhaustion(t *testing.T) {
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
 		want  mqttRepairSaveVerdict
 	}{
-		{"proven sibling", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttRepairSaveForked},
 		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
@@ -438,7 +438,7 @@ func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
 		want  byte
 	}{
-		{"proven sibling", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttReasonServerBusy},
 		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {

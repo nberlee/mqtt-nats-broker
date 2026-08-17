@@ -145,9 +145,9 @@ const (
 	// mqttUncertainForeign: an authoritative record exists that is not ours. Detach
 	// and evict; every obligation belongs to its owner.
 	mqttUncertainForeign
-	// mqttUncertainForked: a record exists that is provably a SIBLING of the one this
-	// broker was acknowledged for, so our write's base was erased by something that is
-	// no successor of ours. Disposed exactly as foreign — the session is not ours to
+	// mqttUncertainForked: a record exists that provably CLAIMS the parent of the one this
+	// broker was acknowledged for, so our write's base was erased by something not
+	// demonstrably a successor of ours. Disposed exactly as foreign — the session is not ours to
 	// write and the surviving record is authoritative whoever wrote it — and reported
 	// differently, because no takeover was demonstrated. See sess_fork_lineage.go.
 	mqttUncertainForked
@@ -417,12 +417,15 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// CAS and overwrite whatever that owner has since persisted.
 		return mqttUncertainForeign, nil
 	case mqttAttemptForked:
-		// A PROVEN sibling of the record we were acknowledged for. Everything the
+		// A body CLAIMING the parent of the record we were acknowledged for. Everything the
 		// foreign arm does still applies — the attempt did not land, and its sequence
 		// must not be adopted — but no takeover was demonstrated, so none is claimed.
 		//
-		// What the sibling erased is recorded HERE, under the resolver's fence, for the
-		// reconnect the 0x89 invites to re-assert. See sess_fork_repair.go.
+		// The capsule minted HERE, under the resolver's fence, is OUR side: the body this
+		// broker was acknowledged for, against the parent body it was written from. It is a
+		// CANDIDATE delta for the reconnect the 0x89 invites, not an account of what the
+		// survivor did — nothing here establishes which write displaced our base, or how
+		// many landed in between. See sess_fork_repair.go.
 		sess.mintForkedGrant(ackWID, ackPWID)
 		return mqttUncertainForked, nil
 	default: // mqttAttemptAtBase, mqttAttemptGone
@@ -516,11 +519,13 @@ const (
 	// mqttAttemptAtBase: the record is still the one the attempt CAS'd against. That
 	// is CONTENTION, not an outcome: the proposal may still be in process upstream.
 	mqttAttemptAtBase
-	// mqttAttemptForked: the surviving record is PROVABLY a sibling of the one this
-	// broker was acknowledged for — same parent, different identity — so the attempt's
-	// base was erased by a write that is no successor of ours. Everything foreign does
-	// happens here too (the attempt did not land and its sequence must not be adopted);
-	// what differs is that no takeover is asserted. See sess_fork_lineage.go.
+	// mqttAttemptForked: the surviving record provably CLAIMS the parent of the one this
+	// broker was acknowledged for — same parent, different identity — so the attempt's base
+	// is no longer current, and the body that replaced it does not demonstrably descend from
+	// it. WHICH write displaced our base is NOT established: a legitimate child could have
+	// landed first and been replaced in turn. Everything foreign does happens here too (the
+	// attempt did not land and its sequence must not be adopted); what differs is that no
+	// takeover is asserted. See sess_fork_lineage.go.
 	mqttAttemptForked
 )
 
@@ -595,29 +600,38 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 // the sequence it reports; a rejection proves the subject moved, and one further read
 // says by whom.
 //
-// It does NOT guarantee that only one of the two proposals commits, and the invariant
-// deliberately does not rest on that. Ordinarily the shared CAS base makes the second
-// proposal impossible — but a leader transition clears the in-process map
-// (jetstream_cluster.go:4720) while a replicated proposal can survive it, and a clustered
-// apply never re-checks the expected sequence (stream.go:6247), so both can land. What
-// makes that harmless is the content and the stream: the bytes are IDENTICAL, log order
-// puts the re-attempt last so its PubAck names the surviving sequence, and $MQTT_sess is
-// MaxMsgsPer:1 — a validated prerequisite — so the earlier duplicate is discarded on
-// arrival. The observable end state is one record with these bytes at the adopted
-// sequence, which is exactly the landed-original-with-a-lost-response state. The cost is
-// one consumed stream sequence and one extra persist notification, and that notification
-// is idempotent: a remote broker evicts a stale resident either way.
+// This comment used to argue that the original attempt and this re-attempt — two
+// BRIDGE-AUTHORED CONDITIONAL writes off one base — could both commit across a leader
+// transition, and that identical bytes plus MaxMsgsPer:1 made that harmless. **That
+// argument is RETIRED**, not re-pointed at another producer: the same-base boundary in
+// docs/CONFORMANCE.md closes it for exactly this pair. An external unconditional replay
+// can put an indistinguishable body on the subject, but it is a different producer and
+// is no evidence for the retired claim.
 //
-// A FOREIGN proposal in that same window is a different matter, and it is NOT solved
-// here: if another broker's same-base takeover survives the election unapplied and
-// applies before this re-attempt, this write lands last and erases it. That is the
-// pinned per-subject-CAS linearization contract failing (docs/ARCHITECTURE.md, "JetStream
-// behaviors this design depends on"), and it fails identically for every arbitrating CAS
-// in this broker — the rejection probe's re-attempt of current memory, the repair retry,
-// any ordinary save. What this change adds is FREQUENCY: the resolver now writes where it
-// used to only read. Stated as a residual in docs/CONFORMANCE.md, with its own roadmap
-// item; closing it needs an arbitration identity that survives a leader transition, which
-// is a protocol change across every writer rather than a property of this arm.
+// Two properties the retired argument used as its safety net remain load-bearing for
+// their OWN reasons, which is why nothing here changes:
+//
+//   - Exact-byte reissue, because a success or a digest match must credit the ORIGINAL
+//     attempted body. Re-marshalling current memory would settle the ambiguity against
+//     bytes the attempt never sent.
+//   - $MQTT_sess being MaxMsgsPer:1, a validated stream prerequisite the single-slot
+//     register depends on generally.
+//
+// Their coincidence — identical bytes landing twice being observationally benign — is
+// kept only as generic defensive depth. It is NOT an argument about the unconditional
+// route: that route supplies no second acknowledgement for this broker to adopt, so the
+// surviving-sequence reasoning does not describe it.
+//
+// A FOREIGN write in this window is a different matter and is NOT solved here, and its
+// direction is the OPPOSITE of what this comment used to say. An UNCONDITIONAL foreign
+// write carries no expectation, so no CAS excludes it. Arriving BEFORE this re-attempt it
+// is recorded in the stream's in-flight state and our expected-sequence re-attempt is
+// REFUSED (and once it has applied, the moved subject sequence refuses us too). What is
+// reachable is the other order: our re-attempt is admitted, and the foreign body lands
+// afterwards and replaces it. For two bridge-authored CONDITIONAL writes neither ordering
+// arises — the same-base boundary excludes the second. That is the external-write route
+// in docs/CONFORMANCE.md, not a reattempt-specific residual, and it is not narrowed by
+// anything this arm could do.
 //
 // Single-shot: the periodic pass is the retry cadence, and holding the record fence
 // across a retry loop would starve every other writer on the session.
@@ -639,8 +653,9 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 	if !mqttIsRecordCASRejection(err) {
 		// The re-attempt's own outcome is unknown. The identity stays EXACTLY as it
 		// was — same base, same digest, same bytes — because it names whichever of the
-		// two proposals lands (and if both land, the later one, which is the record
-		// that survives MaxMsgsPer:1).
+		// two proposals lands. (The both-land case is retired for these two writes: they
+		// are bridge-authored conditional writes off one base — see the same-base
+		// boundary in docs/CONFORMANCE.md.)
 		return mqttUncertainUnresolved,
 			fmt.Errorf("the re-attempted record write of session %q is itself unresolved: %w", sess.id, err)
 	}
@@ -668,7 +683,7 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 	case mqttAttemptForeign:
 		return mqttUncertainForeign, nil
 	case mqttAttemptForked:
-		// A proven sibling of our acknowledged base, reached through the re-attempt's
+		// A body claiming our acknowledged record's parent, reached through the re-attempt's
 		// own rejection rather than the first readback. Same disposition, same silence
 		// about a takeover nothing established, and its own mint: this is a SECOND
 		// classification of the same session, and a resolver that reached the verdict only
@@ -682,9 +697,10 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 		// still to apply — so nothing may be concluded and certainly nothing disposed.
 		// 10071 means no write is in process, which is the best evidence available
 		// that the original went with the record; it is a FAIL-SAFE classification,
-		// not a proof, because a leader transition clears the in-process map
-		// (jetstream_cluster.go:4720) while a replicated proposal can survive it. See
-		// docs/CONFORMANCE.md.
+		// not a proof, because an UNCONDITIONAL foreign write carries no expectation
+		// for any check to compare and so is excluded by nothing — see the same-base
+		// boundary in docs/CONFORMANCE.md, which closes the competing-CONDITIONAL-write
+		// route this used to cite.
 		if IsNatsErr(err, JSStreamWrongLastSequenceConstantErr) {
 			return mqttUncertainUnresolved,
 				fmt.Errorf("the record of session %q is gone while a write for it is in process: %w", sess.id, err)

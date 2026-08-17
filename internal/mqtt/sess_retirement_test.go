@@ -16,12 +16,12 @@ import (
 // the record-absent create that inherited the retired record's identity, was deleted by
 // the write-lineage audit; that create still READS the watermark, but only to refuse a
 // corrupt one. The window they close is the claim-won deletion window: a teardown deletes on the
-// strength of a won claim, and a cross-term resume derived from the same base can
-// evict the marker off the record's own subject afterwards, leaving a record that
+// strength of a won claim, and an unconditional foreign write — excluded by no CAS, see
+// the same-base boundary in docs/CONFORMANCE.md — can evict the marker off the record's
+// own subject afterwards, leaving a record that
 // names resources the winner destroyed and no marker for anyone to adopt.
 //
-// The cross-term apply cannot be forced for real — no seam holds a JetStream
-// proposal between admission and apply — so the shape is STAGED: the winner is
+// The shape is STAGED rather than produced by a real foreign publisher: the winner is
 // parked between its claim and its deletions (mqttTestTeardownClaimedHookV) and a
 // same-base record is written over the marker from the other broker, which is what
 // such a resume leaves behind.
@@ -46,9 +46,10 @@ func testPlantRetirement(t *testing.T, env *testTeardownEnv, idHash string, r *m
 }
 
 // testPlantResumeOver writes ps over whatever occupies the client's record subject,
-// CASing at atSeq — the shape a cross-term resume leaves: a record derived from the
-// same base, applied after the marker landed, which MaxMsgsPer:1 evicts the marker
-// for.
+// CASing at atSeq — the shape a foreign write leaves: a record landing on the subject
+// after the marker did, which MaxMsgsPer:1 evicts the marker for. Staged with a CAS at
+// the marker's own sequence because that is deterministic here; the reachable producer is
+// an UNCONDITIONAL write (the same-base boundary, docs/CONFORMANCE.md).
 func testPlantResumeOver(t *testing.T, env *testTeardownEnv, idHash string, ps *mqttPersistedSession, atSeq uint64) uint64 {
 	t.Helper()
 	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
@@ -98,8 +99,7 @@ func TestRetirementCondemnsTheHollowSurvivor(t *testing.T) {
 			return
 		}
 		stagedMarkerSeq, ownNonce = markerSeq, nonce
-		// The cross-term resume: B's save was derived from the same base and applies
-		// now, evicting A's marker. It preserves the generation, so it names exactly
+		// The foreign write: B's save lands on the subject now, evicting A's marker. It preserves the generation, so it names exactly
 		// what A is about to delete.
 		survivor := *base
 		survivor.Teardown = nil
@@ -614,7 +614,7 @@ func TestRetirementAdopterCondemnsTheHollowSurvivor(t *testing.T) {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
 
-	// B adopts. Between its deletions and its release, the cross-term resume lands.
+	// B adopts. Between its deletions and its release, the foreign write lands.
 	fired := false
 	gate := newTestHookGate(t)
 	restoreWindow := setMQTTTestTeardownAdoptionWindowHook(func(_, hash string, markerSeq uint64) {
@@ -1051,7 +1051,7 @@ func TestRetirementNamesTheRetiredRecord(t *testing.T) {
 //
 // An adopted teardown retires the record the MARKER claimed, which the marker preserved as
 // its own PWID — not the marker, which the release deletes and which is nobody's base.
-// Naming the marker would give the two sides of a cross-term pair different tokens.
+// Naming the marker would give the two sides of a racing pair different tokens.
 func TestRetirementAdoptionNamesTheClaimedRecord(t *testing.T) {
 	testQuietExpirySweeps(t)
 	a, _ := testNewTeardownEnv(t)

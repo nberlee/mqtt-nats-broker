@@ -18,9 +18,11 @@ import (
 // together: this file's assertion is only meaningful because that one exists — a change
 // that downgraded every rejection to 0x89 would pass here and fail there.
 
-// testE2ELandSibling stores a record derived from the SAME parent as the bound session's
-// acknowledged one, unconditionally. That is the durable end state a leader transition
-// produces, staged without one — see sess_fork_lineage_test.go.
+// testE2ELandSibling stores a record CLAIMING the SAME parent as the bound session's
+// acknowledged one, unconditionally — no per-subject expectation, so nothing excludes it.
+// This is the retention route itself, not a stand-in for a leader transition: that
+// alternative is closed for two bridge-authored conditional writes (the same-base
+// boundary, docs/CONFORMANCE.md). See sess_fork_lineage_test.go.
 func testE2ELandSibling(t *testing.T, sess *mqttSession) {
 	t.Helper()
 	sess.mu.Lock()
@@ -169,7 +171,7 @@ func TestMQTTForkedRecordE2EConnectRebuildsFromRecord(t *testing.T) {
 
 	// Leave the session with an unresolved write whose bytes never reached the stream,
 	// then land a sibling of its acknowledged record. The resolver's readback now finds a
-	// record that is provably no successor of ours.
+	// record that is not demonstrably a successor of ours.
 	mqttTestSessStoreSuppressV.Store(true)
 	_ = testSessSave(t, sess)
 	mqttTestSessStoreSuppressV.Store(false)
@@ -199,7 +201,7 @@ func TestMQTTForkedRecordE2EConnectRebuildsFromRecord(t *testing.T) {
 		t.Fatal("the rebuilt session must not inherit the stale object's uncertainty")
 	}
 
-	// Test 21: the acknowledged SUBSCRIBE the sibling erased is REPAIRED, and the survivor's
+	// Test 21: the acknowledged SUBSCRIBE absent from the survivor is REPAIRED, and the survivor's
 	// own membership is kept beside it. The sibling carried "forked/e2e/marker" and no
 	// "forkconnect/x", while the parent record had neither — so the survivor made no grant
 	// decision about the client's filter and the change applies, while the peer's filter is
@@ -320,7 +322,7 @@ func testE2ELandCompetingWrite(t *testing.T, sess *mqttSession, idHash string) {
 // on the shape that actually produces it and at the only layer where a Will publication is
 // observable.
 //
-// A proven sibling does not prove the survivor is an orphan. Here the competing broker is
+// A body claiming our parent does not prove the survivor is an orphan. Here the competing broker is
 // real, resident, and holds the surviving record — a genuine takeover, as far as anything
 // durable can show — and the displaced client's Will is nonetheless PUBLISHED, because the
 // fork verdict withholds the takeover claim and the connection ends through ordinary close
@@ -370,8 +372,8 @@ func TestMQTTForkedRecordE2EWithALiveCompetingOwnerPublishesTheWill(t *testing.T
 	peerSess := testE2ELiveCompetingOwner(t, s, "node2", "forklive", idHash)
 
 	// 2. The local session writes again. Its new record is derived from the one the
-	//    competitor holds — so the competitor's next write will be its SIBLING, which is
-	//    the shape a leader transition produces and a working CAS cannot.
+	//    competitor holds — so the competitor's next write will CLAIM the same parent,
+	//    which is the shape an unconditional write produces and a CAS cannot.
 	if codes := testMQTTSubV5(t, c, r, 2, []mqttV5SubFilter{{topic: "forklive/second"}}); codes[0] != 0 {
 		t.Fatalf("the second SUBACK must succeed: reason %x", codes[0])
 	}

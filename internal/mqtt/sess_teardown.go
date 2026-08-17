@@ -242,9 +242,10 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 // than authorship, and reordering it would let an admitted proposal recreate the same
 // shape one step later. So the claim marker is the only durable record of the
 // retirement while the deletions run, and the marker lives on the record's own
-// subject: a cross-term resume derived from the same base can apply after the marker
-// landed (per-subject CAS is checked pre-proposal and never at apply, see
-// docs/ARCHITECTURE.md) and MaxMsgsPer:1 then EVICTS it. What survives is a record
+// subject: an UNCONDITIONAL foreign write can land after the marker did — a CAS
+// excludes a competing conditional write off that base (the same-base boundary,
+// docs/CONFORMANCE.md) but not one carrying no expectation — and MaxMsgsPer:1 then
+// EVICTS the marker. What survives is a record
 // naming exactly the resources the winner just deleted, with no marker for any
 // adopter or the orphan sweep to find — a hollow survivor nothing repairs.
 //
@@ -921,7 +922,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 
 	// The retirement is recorded BEFORE the adoption's first deletion, exactly as on
 	// the owner's own path: an adopter deletes the same resources, so it needs the same
-	// fence, and the marker it adopted is just as evictable by a cross-term resume. The
+	// fence, and the marker it adopted is just as evictable by an unconditional write. The
 	// adopted marker's sequence is the ordering fact — it IS where the claim landed.
 	// A failure aborts the adoption with nothing deleted; the record stays marked and a
 	// later adopter tries again. That now includes a record whose client ID does not

@@ -233,8 +233,11 @@ const (
 	// RETIREMENT watermark (one subject per client, MaxMsgsPer:1, permanent
 	// retention). A teardown that has WON its claim records the retirement here
 	// before it deletes anything, so the fact survives the one thing the session
-	// record cannot: a cross-term resume evicting the marker off the record's own
-	// subject. Nothing ever reaps a watermark. See sess_teardown.go.
+	// record cannot: an unconditional foreign write evicting the marker off the
+	// record's own subject. (Two bridge-authored CONDITIONAL writes off one base
+	// cannot both apply — see the same-base boundary in docs/CONFORMANCE.md — but a
+	// write carrying no expectation is not excluded by any CAS.) Nothing ever reaps a
+	// watermark. See sess_teardown.go.
 	mqttTeardownStreamName    = "$MQTT_teardown"
 	mqttTeardownSubjectPrefix = mqttPrefix + "teardown."
 
@@ -842,9 +845,11 @@ type mqttAccountSessionManager struct {
 	// willClaimStopCh supplies an EMPTY set here, so the claimant it drives directly
 	// still runs. Nil in production. See claimStopChans.
 	testClaimStop *[]<-chan struct{}
-	// forkedGrants holds, per MQTT client ID, the grant a PROVEN session-record fork
-	// erased, waiting for that client's own reconnect to re-assert it through the ordinary
-	// accept save. Guarded by mu, bounded by mqttForkedGrantMax, and memory-only: a restart
+	// forkedGrants holds, per MQTT client ID, the CANDIDATE grant delta a RECOGNISED fork
+	// minted — this broker's acknowledged body against its retained baseline, computed
+	// WITHOUT reading the survivor — waiting for that client's own reconnect to filter it
+	// against the surviving record at merge and re-assert what survives that comparison
+	// through the ordinary accept save. Guarded by mu, bounded by mqttForkedGrantMax, and memory-only: a restart
 	// forfeits a repair and breaks nothing. Entries are removed when a reconnect's anchor
 	// refuses them, superseded by a later verdict for the same client, or evicted by the
 	// bound. See sess_fork_repair.go.
@@ -1423,17 +1428,18 @@ type mqttSession struct {
 	gen string
 	// wid / pwid are the identity of the record write this broker was last
 	// ACKNOWLEDGED for, and that record's own parent. Every save stamps a fresh wid
-	// with pwid set to this one, so the durable chain is a parent pointer and two
-	// writes off one base are recognisable as siblings. Adopted wherever seq is —
+	// with pwid set to this one, so the durable chain is a parent pointer and a body
+	// CLAIMING our own parent is recognisable as such. Adopted wherever seq is —
 	// a confirmed save, an ambiguity resolved landed, a repair save proven durable —
 	// because a lineage that lags the sequence would parent the next write to a
 	// record that is no longer the base. See sess_fork_lineage.go.
 	wid, pwid string
 	// grantBody / grantBodyParent are the RECORD BYTES of the record wid names and of the
 	// record pwid names — the fourth and fifth lineage facts, and the two a fork's repair is
-	// computed from. Their delta is exactly what a sibling of that parent erased, and a
-	// three-way merge against the parent is the only thing that can tell "our addition was
-	// erased" from "the survivor removed a base field".
+	// computed from. Their delta is exactly what our acknowledged record carried, and reconciling
+	// against the RETAINED body is the only thing that can tell "our addition was erased"
+	// from "the survivor removed a base field". The baseline's standing is that this broker
+	// HELD it, not that the survivor is proven to descend from it. See sess_fork_repair.go.
 	//
 	// BYTES, not a built grant: the body is already marshalled by the save that lands, so a
 	// rotation costs two slice assignments and the grant is materialised only on the rare fork
@@ -1705,13 +1711,20 @@ type mqttPersistedSession struct {
 	Gen string `json:"gen,omitempty"`
 	// WID is this record write's own identity, minted once per write; PWID is the
 	// WID of the record the write was derived from (empty only for a first create).
-	// The pair is a PARENT POINTER, and it exists because a per-subject CAS is a
-	// linearization point only WITHIN a leader term: across a transition the
-	// pre-proposal check runs against stale applied state with the in-process map
-	// cleared, so two writes derived from ONE base can both apply and the later
-	// discards the earlier under MaxMsgsPer:1. Two records carrying the same PWID
-	// are therefore SIBLINGS of one base, and a survivor that is provably our
-	// sibling is not evidence that anybody took the session over.
+	// The pair is a PARENT POINTER.
+	//
+	// It used to exist because two writes derived from one base could both apply
+	// across a leader transition. That is retired for two BRIDGE-AUTHORED CONDITIONAL
+	// writes — see the same-base boundary in docs/CONFORMANCE.md. What the pointer
+	// answers now is the route that boundary leaves open: an UNCONDITIONAL foreign
+	// write puts a body in the single slot that a CAS cannot exclude, and sequence and
+	// WID alone cannot tell such a body from a legitimate successor of ours.
+	//
+	// It establishes exactly one thing, and the wording matters: a record carrying our
+	// PWID CLAIMS the same parent. It is not proof of descent — restore adopts WID and
+	// PWID without validating provenance — and none is needed, because the claim being
+	// made is negative: a body claiming our parent does not establish that anybody took
+	// the session over.
 	//
 	// RECOGNITION ONLY: nothing repairs the erased write, and a record whose WID is
 	// absent CONCEDES rather than accuses — classifyRecordLineage requires the
@@ -5281,10 +5294,17 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 // evictDisplacedOnRemotePersist evicts the resident local session after
 // the session-record watch observed a record write at-or-past its acknowledged
 // record — classifying the surviving record FIRST, so a demonstrated successor is
-// reported as a takeover (0x8E, delayed-Will outbox cancelled) while a proven
-// same-base sibling — the leader-transition fork — is reported as 0x89 "server
-// busy" (inviting the reconnect that resolves the ambiguity) and destroys NO
-// durable Will state, because nothing arbitrated a session continuation.
+// reported as a takeover (0x8E) while a survivor whose body CLAIMS our own parent is
+// reported as 0x89 "server busy", inviting the reconnect that resolves the ambiguity.
+//
+// Two corrections to what this comment used to say. It is NOT the leader-transition
+// fork: that route is closed for two bridge-authored conditional writes (the same-base
+// boundary, docs/CONFORMANCE.md), and what remains reachable is an unconditional foreign
+// write. And THIS path cancels no delayed Will on either verdict — see the block below,
+// where that was deliberately removed in favour of the claimant deciding against the
+// permanent acceptance facts. The verdict's Will consequence lives on the BOUND
+// REJECTION path (sess_rejected_write.go), whose foreign arm calls
+// mqttDiscardWillOnTakeover and whose forked arm deliberately does not.
 //
 // It is per-CLIENT, not per-object: at most one runs per client (st.evictRunning),
 // and each iteration resolves the resident object fresh under as.mu, so a
@@ -8590,8 +8610,9 @@ RESTORE:
 	// THE RETIREMENT FENCE. An unmarked record whose generation is durably RETIRED is
 	// the hollow survivor of the claim-won deletion window: some teardown won its
 	// claim, recorded the retirement and deleted this generation's consumers, durables,
-	// QoS 2 holds and in-flight registers, and a cross-term resume then evicted the
-	// marker off this subject. Resuming it would answer Session Present 1 for state
+	// QoS 2 holds and in-flight registers, and an unconditional foreign write then
+	// evicted the marker off this subject (the same-base boundary, docs/CONFORMANCE.md:
+	// a CAS cannot exclude a write that carries no expectation). Resuming it would answer Session Present 1 for state
 	// that no longer exists, so it is discarded instead. This is the only prompt reader
 	// for a winner that crashed after the watermark: without it every reconnect
 	// re-resumes the same hollow record until the sweep runs.
@@ -9601,8 +9622,9 @@ func (sess *mqttSession) clear(noWait bool) error {
 
 	// RECORD THE RETIREMENT, before the first deletion and on a subject a resume
 	// cannot evict. The marker alone cannot carry this fact: it shares the record's
-	// subject, so a cross-term resume derived from the same base replaces it and the
-	// deletions below become invisible. A failure here aborts the teardown with
+	// subject, so an unconditional foreign write replaces it and the deletions below
+	// become invisible — a CAS excludes a competing CONDITIONAL write off our base (the
+	// same-base boundary, docs/CONFORMANCE.md) but not one carrying no expectation. A failure here aborts the teardown with
 	// NOTHING deleted, leaving the record marked — the already-handled self-healing
 	// state, which the next CONNECT, the expiry path or the sweep finishes, each
 	// recording the retirement first. See sess_teardown.go.
@@ -11377,7 +11399,8 @@ restoreSession:
 	// the token it is closing.
 	acceptSess, acceptTok, acceptTokOpen = es, es.beginRecordTx(), true
 
-	// Re-assert whatever a proven session-record fork erased, before the mutations below and
+	// Merge a recognised fork's candidate delta against the surviving record and re-assert
+	// what that comparison accepts, before the mutations below and
 	// before the save that persists them — the merge edits subs, the options, cons, the drains
 	// and the nonce set, so it belongs inside this transaction rather than at the restore that
 	// produced the object. This placement is also what makes one call serve both entry states,
@@ -11982,8 +12005,8 @@ func (c *client) mqttMakeConnAckV5Frame(rc, sp byte, reasonStr string) []byte {
 const mqttReasonStrSessionTakenOver = "session taken over by a new connection"
 
 // Reason String sent with the 0x89 DISCONNECT to a client whose session record was
-// found to have FORKED — a record write derived from the same base as ours survived,
-// so our own was erased without anything establishing another owner. Deliberately not
+// found to have FORKED — a record write CLAIMING the same parent as ours survived, so
+// our own was erased without anything establishing another owner. Deliberately not
 // mqttReasonStrSessionTakenOver: pairing that text with 0x89 would make exactly the
 // claim the fork verdict exists to withhold. See sess_fork_lineage.go.
 const mqttReasonStrOwnershipUnsettled = "session ownership could not be established; try again"

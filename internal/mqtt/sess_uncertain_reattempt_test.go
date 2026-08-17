@@ -81,10 +81,12 @@ func TestUncertainLateProposalIsNotForeign(t *testing.T) {
 	}
 
 	// The proposal that was in process upstream commits NOW. It CAS's against the
-	// same base the resolver just re-attempted at, and within ONE leader term that
-	// exclusion holds — the re-attempt already landed, so this one loses. (Across a
-	// transition both can land; this fixture has no election, and
-	// TestUncertainDuplicateCommitCollapses covers that outcome.)
+	// same base the resolver just re-attempted at, so the exclusion holds and this one
+	// loses — the re-attempt already landed. That exclusion is now unqualified for two
+	// bridge-authored conditional writes (the same-base boundary, docs/CONFORMANCE.md);
+	// TestUncertainDuplicateCommitCollapses covers the both-landed outcome as a generic
+	// MaxMsgsPer:1 property — NOT as coverage of the unconditional route, which supplies
+	// no acknowledgement for this broker to adopt.
 	lateSeq, lateErr := mqttStoreSessionRecordCASBody(&e.a.asm.jsa, e.a.asm.domainTk,
 		e.body, e.sess.idHash, e.base)
 	if lateErr == nil {
@@ -450,14 +452,20 @@ func TestUncertainReattemptSendsTheAttemptsOwnBytes(t *testing.T) {
 // TestUncertainDuplicateCommitCollapses pins what makes the ours-landed invariant hold
 // WITHOUT relying on "only one of the two proposals can commit".
 //
-// That exclusion is the ordinary case, not a guarantee: a leader transition clears
-// JetStream's in-process map while a replicated proposal survives, and a clustered apply
-// never re-checks the expected sequence — so a surviving original and a re-attempt
-// admitted by the new leader can both land, in log order. This test does not stage that
-// election (an accepted-but-unapplied entry surviving one is not something this harness
-// can produce deterministically); it stages its CONSEQUENCE, two identical framed writes
-// both landing, and pins that the outcome is indistinguishable from a single landing:
-// one record, the attempt's bytes, at the sequence the broker adopts.
+// For two BRIDGE-AUTHORED CONDITIONAL writes that exclusion is now a guarantee — see the
+// same-base boundary in docs/CONFORMANCE.md — so this test no longer pins a reachable
+// interleaving of the original and its re-attempt.
+//
+// What it is NOT: coverage of the unconditional foreign-write route. This test performs
+// two sequential CONDITIONAL writes and then assigns the second sequence to the session
+// itself. On the unconditional route the broker is acknowledged for its own re-attempt
+// and the later foreign write supplies NO acknowledgement to adopt, so nothing here
+// exercises that disposition. Claiming otherwise would contradict sess_uncertain.go's own
+// statement of the reachable order.
+//
+// What it still pins is the generic MaxMsgsPer:1 property the invariant leans on: two
+// identical framed writes both landing leave one record, with the attempt's bytes, at the
+// adopted sequence — indistinguishable from a single landing.
 //
 // The property rests on $MQTT_sess being MaxMsgsPer:1, which is a validated startup
 // prerequisite (validateSessStream) rather than an assumption made here.

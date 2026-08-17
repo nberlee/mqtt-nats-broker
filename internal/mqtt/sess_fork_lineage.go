@@ -1,4 +1,4 @@
-// Recognising a session record that is provably NOT a successor of the one this
+// Recognising a session record that is not demonstrably a successor of the one this
 // broker was acknowledged for.
 //
 // Every durable arbitration here is a per-subject JetStream CAS
@@ -15,7 +15,8 @@
 // by F-030's combined dependency-canary, pinned-source and maintainer-confirmed evidence.
 // test/depproof enumerates every route for a conditional write on a conforming stream:
 // it fixtures the two live ones, refutes seven, and scopes post-start mirror/source drift
-// outside the claim. It exercises $MQTT_willq's CAS shape, which is this one.
+// outside the claim. It exercises $MQTT_willq's single-message CAS shape and, since the
+// accepted-CONNECT proof, $MQTT_sess's atomic-batch shape as well.
 //
 // **That audit has run**, obligation by obligation, and it split this machinery in two.
 //
@@ -40,15 +41,27 @@
 // test/depproof (R-batch, mutation m-batch-apply-eager) and, for this broker's own use
 // of the batch, by TestMQTTAcceptBatchReplicatedIndivisible.
 //
-// What keeps this machinery is the NARROWER question that survives: the predicate below
-// proves two record BODIES claiming one parent, never that two CAS applications off one
-// base both landed. A restore, a stream recreation, an administrative write or a
-// replay can produce the first without the second. Whether any supported route can put
-// such a pair where a broker observes it is the open half of the same docs/ROADMAP.md
-// item, and this stands until that audit reports.
+// **The AUTHORED-RECORD side was then audited in its own right, and it STAYS** — on a
+// route the closed gap never covered. The predicate below establishes two record BODIES
+// CLAIMING one parent, never that two CAS applications off one base both landed, and an
+// UNCONDITIONAL write produces the first without the second. That route is live: nothing
+// validates record provenance at restore (createOrRestoreSession checks JSON, client ID,
+// reserved membership, generation, the affine pair, teardown/retirement and overdue
+// state, then adopts WID and PWID as given), and the reserved-namespace guards deny
+// $MQTT.> to MQTT clients rather than to permitted NATS publication. See the same-base
+// boundary in docs/CONFORMANCE.md for the three-part statement.
+//
+// TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill is the retention oracle for that
+// route — it lands a valid-shaped record with an unconditional store and proves the live
+// connection reaches this classifier, is answered 0x89, and publishes its Will.
+// TestMQTTAuthoredForkStillClassifies pins the predicate's SEMANTICS and nothing more:
+// it constructs lineage values and calls the classifier, so it would keep passing even if
+// no live route could produce the pair.
 //
 // Recognition here also covers an ambiguous acknowledgement, an out-of-band deletion and
 // a stream recreation — none of them proposal-ordering questions — for the same records.
+// Those three CONCEDE rather than classify, so they are not independent reasons to keep
+// this machinery; the unconditional-write route is.
 //
 // The observable damage is not the lost write. It is what the broker CONCLUDES from it:
 // its next CAS is rejected, it re-reads, finds a record it did not write, and reports
@@ -60,11 +73,16 @@
 // with other content" is true of a legitimate successor AND of a sibling that erased us.
 // What distinguishes them is ANCESTRY, so each record carries a parent pointer: WID is
 // the write's own identity, PWID is the WID of the record it was derived from. Two
-// writes carrying the same PWID are siblings of one base.
+// writes carrying the same PWID CLAIM one base.
+//
+// VOCABULARY, used throughout this package and its tests: "sibling" is shorthand for
+// "a body claiming the parent we claim". It is NOT a proof of descent — restore adopts
+// WID and PWID without validating provenance — and it never needs to be, because every
+// conclusion drawn from it is negative: such a body does not establish a takeover.
 //
 // WHAT THIS DOES AND DOES NOT DO.
 //
-// It DETECTS; it never repairs. A proven sibling stops the broker asserting a takeover
+// It DETECTS; it never repairs. A body claiming our parent stops the broker asserting a takeover
 // it cannot demonstrate — the client is told 0x89 "server busy" instead, which invites
 // the reconnect 0x8E forbids — and licenses no write of its own. The forked record
 // stays, and the rightful owner's granted state is still lost.
@@ -72,12 +90,15 @@
 // The verdict does NOT prove the survivor erased us: a teardown claim is itself a
 // full-body CAS off the same base (sess_teardown.go), so a sibling can merely have
 // become current after clear() deleted our record. What it proves is narrower and
-// sufficient — the survivor is not a successor of the record we were acknowledged for,
+// sufficient — the survivor is not demonstrably a successor of the record we were acknowledged for,
 // so "another owner holds this session" is not established.
 //
 // A counter would not do this job: a per-write epoch is a branch-local Lamport counter,
 // and a competing branch that never read our record can advance above us and then look
-// like our successor. Only a pointer AT the parent states ancestry.
+// like our successor. Only a pointer AT the parent carries a CLAIM of ancestry — and a
+// claim is all it is, since restore adopts the pair unvalidated. That is sufficient here
+// precisely because the conclusion drawn is negative: a body claiming our parent does not
+// establish that another owner holds the session.
 //
 // See docs/ARCHITECTURE.md and the residual in docs/CONFORMANCE.md.
 
@@ -111,8 +132,10 @@ const (
 	// unrelated lineage, a different incarnation, a record carrying no identity, or
 	// our own record — every one of them concedes exactly as the broker does today.
 	mqttLineageNotForked mqttRecordLineage = iota
-	// mqttLineageForked: the survivor is PROVABLY a sibling of the record we were
-	// acknowledged for, so it is no successor of ours and no evidence of a takeover.
+	// mqttLineageForked: the survivor CLAIMS the parent our acknowledged record claims,
+	// so it is not demonstrably a successor of ours and is no evidence of a takeover.
+	// Not a proof of descent — restore adopts the pair unvalidated — and it does not need
+	// to be, because the conclusion drawn is negative.
 	mqttLineageForked
 )
 
@@ -123,7 +146,7 @@ func (l mqttRecordLineage) String() string {
 	return "not-forked"
 }
 
-// classifyRecordLineage decides whether found is a proven sibling of the record this
+// classifyRecordLineage decides whether found CLAIMS the same parent as the record this
 // broker was last acknowledged for, identified by (ackWID, ackPWID).
 //
 // It takes NO sequence and does not replace the sequence fail-safe. Every caller keeps
@@ -136,7 +159,7 @@ func (l mqttRecordLineage) String() string {
 // attempt, and the difference is the whole point. With acknowledged {a,p} and an attempt
 // {c,a}:
 //
-//   - survivor {b,p} is a sibling of a — our acknowledged record was erased. FORKED.
+//   - survivor {b,p} claims a's parent — our acknowledged record was erased. FORKED.
 //     Compared against the attempt {c,a} it would look unrelated and be missed entirely.
 //   - survivor {d,a} is a CHILD of a: somebody read our acknowledged record and wrote on
 //     top of it. A legitimate successor and a lost race, not a fork. Not-forked.
@@ -158,8 +181,9 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 	// short-circuit conceded before the pointer test ran. That particular pair now
 	// concedes anyway, because the write-lineage audit made the post-re-mint write
 	// parentless. The reversal stands regardless and on its own terms: record identities
-	// are globally unique NUIDs, so a parent match means descent from one actual record
-	// whatever generation wrote it, and a generation mismatch adds nothing to that.
+	// are globally unique NUIDs, so a parent match names one actual record whatever
+	// generation wrote it — a CLAIM of descent from it, which is what the verdict rests
+	// on — and a generation mismatch adds nothing to that.
 	// Re-introducing it would suppress an authored fork whose two writers restarted under
 	// different incarnations. See parentForNextWriteLocked.
 	//
@@ -279,7 +303,7 @@ var (
 		logReason:   "is now owned elsewhere; closing this connection",
 		closeReason: DuplicateClientID,
 	}
-	// mqttDisposalForked is what a proven sibling licenses instead, and the difference
+	// mqttDisposalForked is what a body claiming our parent licenses instead, and the difference
 	// is the client's instruction. 0x89 "Server busy, try again later" invites the
 	// reconnect that resolves the ambiguity; 0x8E tells the client the session is
 	// somebody else's, which on this evidence is a guess. Spec5 [3.14.2.1] 0x89.

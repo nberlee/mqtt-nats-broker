@@ -208,9 +208,9 @@ func (e *testRejectionEnv) landRecord(t *testing.T, shape func(*mqttPersistedSes
 
 // siblingTakeover restores the same client through a peer manager, points the
 // peer object's acknowledged WID at OUR acknowledged PARENT, and saves: the
-// peer's write then derives from the same base as our acknowledged record — a
-// proven sibling — and its REAL persist observation is what our subscription
-// delivers. Returns the sequence the record now sits at.
+// peer's write then CLAIMS the same parent as our acknowledged record — which is
+// what the classifier recognises — and its REAL persist observation is what our
+// subscription delivers. Returns the sequence the record now sits at.
 func (e *testRejectionEnv) siblingTakeover(t *testing.T, node, clientID string) uint64 {
 	t.Helper()
 	_, psess, _ := e.peer(t, node, clientID)
@@ -330,7 +330,7 @@ func testAwaitConnClosed(t *testing.T, b *testBoundConn) {
 // ---------------------------------------------------------------------------
 
 // TestMQTTPersistEvictForkedSiblingBound is the finding, end to end: a REAL peer
-// save whose record is a proven same-base sibling displaces a bound client. The
+// save whose record CLAIMS our own parent displaces a bound client. The
 // broker must still evict (the record provably moved with content that is not
 // ours) but may claim only what the evidence supports: 0x89 "server busy" with
 // the ownership-unsettled Reason String — inviting the reconnect 0x8E forbids —
@@ -350,7 +350,7 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 		t.Fatal("a forked verdict still evicts — only the CLAIM differs")
 	}
 	if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != mqttReasonServerBusy {
-		t.Fatalf("a proven sibling licenses 0x89 server busy, got %x", reasons)
+		t.Fatalf("a body claiming our parent licenses 0x89 server busy, got %x", reasons)
 	}
 	if rs := b.disconnectReasonString(t); rs != mqttReasonStrOwnershipUnsettled {
 		t.Fatalf("the 0x89 must carry the ownership-unsettled Reason String, got %q", rs)
@@ -876,7 +876,7 @@ func TestMQTTPersistEvictUnusableLoadFreshTrigger(t *testing.T) {
 		t.Fatal("the eviction must apply from the freshest knowledge")
 	}
 	if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != mqttReasonServerBusy {
-		t.Fatalf("the delivered newer sibling proves the fork; got %x", reasons)
+		t.Fatalf("the delivered newer sibling yields the fork verdict; got %x", reasons)
 	}
 	if st := e.willOutboxState(t, will); st != mqttWillPending {
 		t.Fatalf("the forked verdict must preserve the Will record, got %v", st)
@@ -924,7 +924,7 @@ func TestMQTTPersistEvictClassifiesAtDecisionTime(t *testing.T) {
 
 	// The sibling of the ATTEMPT: {b, a} at S+2. Against the stale pair {a,p}
 	// it reads unrelated (concede); against the adopted pair {c,a} it is a
-	// proven sibling.
+	// body claiming our parent.
 	sib := e.landRecord(t, func(ps *mqttPersistedSession) { ps.PWID = ackWID })
 	e.deliverPersistObservation(t, sib)
 	<-parked

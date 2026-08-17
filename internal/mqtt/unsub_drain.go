@@ -543,7 +543,7 @@ func (sess *mqttSession) dropDrainLocked(d *mqttDrain) string {
 // queries that key, and a drain missing from it looks absent to everything except a
 // teardown. Three callers: undoing dropDrainLocked when the save that would have made the
 // drop durable failed, restoring the record's drains on a resume, and re-asserting a drain a
-// proven fork erased (sess_fork_repair.go).
+// merge accepted from a recognised fork's candidate delta (sess_fork_repair.go).
 //
 // sess.mu must be held, or the session must not yet be reachable.
 func (sess *mqttSession) restoreDrainLocked(sid string, d *mqttDrain) {

@@ -168,7 +168,7 @@ func testAssertParentlessCreate(t *testing.T, env *testTeardownEnv, sess *mqttSe
 // The two orientations are not the same assertion twice: they concede by DIFFERENT
 // conjuncts of arm 2, and each is killed by a different mutation.
 //
-//   - Both records PARENTLESS — the cross-term create pair itself, `{c, ""}` against
+//   - Both records PARENTLESS — the parentless create pair, `{c, ""}` against
 //     `{x, ""}`. The parents MATCH, so `found.PWID == ackPWID` does not save it; the
 //     only guard is `ackPWID != ""`, and dropping that conjunct makes two unrelated
 //     first creates accuse each other.
@@ -181,7 +181,7 @@ func testAssertParentlessCreate(t *testing.T, env *testTeardownEnv, sess *mqttSe
 //
 // NOT parallel: the envs install process-global store hooks.
 func TestMQTTParentlessCreateSettlesToTakeoverBothOrientations(t *testing.T) {
-	t.Run("both records parentless: the cross-term create pair", func(t *testing.T) {
+	t.Run("both records parentless: the parentless create pair", func(t *testing.T) {
 		// One save only, so the acknowledged pair is a create's: {c, ""}.
 		e := testNewRejectionEnv(t, "parentless-settle-a")
 		e.dropPersistObservations(t, e.idHash)
@@ -192,8 +192,8 @@ func TestMQTTParentlessCreateSettlesToTakeoverBothOrientations(t *testing.T) {
 			t.Fatalf("fixture: the acknowledged pair must be a create's, got (%q,%q)", ackWID, ackPWID)
 		}
 		// The survivor is ALSO a parentless create: testLandSibling copies our own
-		// parent, which is empty. This is the cross-term create pair itself — both
-		// admitted at base 0, both applied, the earlier discarded — and the ONLY thing
+		// parent, which is empty. This is the parentless create pair — two records both
+		// carrying no parent, however they came to be there — and the ONLY thing
 		// that stops the two empty parents from reading as shared ancestry is arm 2's
 		// `ackPWID != ""` conjunct.
 		sib := testLandSibling(t, e.testInflightEnv, testMutateSibling)
@@ -240,7 +240,7 @@ func testAssertSettlesToTakeover(t *testing.T, e *testRejectionEnv) {
 	if v := mqttDisposalForRejection(got); v.reason != mqttReasonSessionTakenOver {
 		t.Fatalf("the conceding verdict must map to 0x8E 'session taken over': got %#v", v)
 	}
-	// Nothing is repairable from a verdict that never proved a sibling.
+	// Nothing is repairable from a verdict that never recognised a claim on our parent.
 	if g := e.capsuleOrNil(); g != nil {
 		t.Fatalf("a conceding verdict mints nothing: %+v", g)
 	}
@@ -253,14 +253,22 @@ func testAssertSettlesToTakeover(t *testing.T, e *testRejectionEnv) {
 // Test 2: the retained obligation, and the discriminator for every test above
 // ---------------------------------------------------------------------------
 
-// TestMQTTAuthoredForkStillClassifies is the positive half of this change, and the
-// reason none of the concessions above can be satisfied by a deleted classifier.
+// TestMQTTAuthoredForkStillClassifies pins the classifier's SEMANTICS, and nothing more.
 //
-// The authored-record fork — two CAS writes off a base this broker actually HELD — is
-// the shape classifyRecordLineage exists for, and its retirement is unproved on the
-// writer every accepted CONNECT uses: that write is an AllowAtomicPublish batch, and
-// F-030's dependency inventory covers the single-message path only. So the classifier
-// and sess_fork_repair.go stay, and this pins that they still work.
+// Be precise about what it can and cannot show. It constructs lineage values and calls
+// classifyRecordLineage directly, so it would keep passing even if no live route could
+// produce the pair — it is NOT evidence that the machinery is still needed, and its
+// commentary used to claim exactly that, on the since-closed grounds that the accepted
+// CONNECT's batch writer lay outside F-030's inventory.
+//
+// The retention evidence is TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill, which
+// lands a valid-shaped record with an UNCONDITIONAL store and drives the live connection
+// through this classifier to 0x89 with the Will published. See the same-base boundary in
+// docs/CONFORMANCE.md: two bridge-authored CONDITIONAL writes off one base cannot both
+// apply, and a write carrying no expectation is excluded by nothing.
+//
+// What this test is for: the concessions above cannot be satisfied by a classifier that
+// had simply been removed.
 func TestMQTTAuthoredForkStillClassifies(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "authored-fork")
@@ -281,13 +289,14 @@ func TestMQTTAuthoredForkStillClassifies(t *testing.T) {
 		t.Fatalf("the acknowledged pair must be complete: (%q,%q)", ackWID, ackPWID)
 	}
 
-	// The sibling: another writer's record off the SAME base, which is what a fork is.
+	// The sibling: another writer's record CLAIMING the same parent, which is what the
+	// fork verdict recognises.
 	sibling := testLineageRecord("gen-other", mqttNewRecordWID(), ackPWID)
 	if got := classifyRecordLineage(sibling, ackWID, ackPWID); got != mqttLineageForked {
-		t.Fatalf("two writes off one HELD base are siblings: got %v", got)
+		t.Fatalf("a body claiming one HELD base is recognised: got %v", got)
 	}
 	if got := mqttDisposalForForeignResolution(mqttUncertainForked); got.reason != mqttReasonServerBusy {
-		t.Fatalf("a proven sibling licenses 0x89, not a takeover claim: %#v", got)
+		t.Fatalf("a body claiming our parent licenses 0x89, not a takeover claim: %#v", got)
 	}
 
 	// And a legitimate successor of the acknowledged record still concedes, so the arm

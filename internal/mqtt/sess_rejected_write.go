@@ -462,8 +462,8 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		}
 		return mqttBoundDisposed, stale
 	case mqttRejectionForked:
-		// A PROVEN sibling of the record we were acknowledged for: our own write was
-		// erased by something that is no successor of ours, and nothing established
+		// A body CLAIMING the parent of the record we were acknowledged for: our own write was
+		// erased by something not demonstrably a successor of ours, and nothing established
 		// another owner. That is precisely what mqttBoundUnsettled already means — the
 		// ownership question is outstanding with the gate held and nobody else
 		// disposing this connection — so it routes there rather than to a fifth

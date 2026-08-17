@@ -409,7 +409,7 @@ but each still needs its own consequence audit.
   `ensureBrokerStream` creates an absent stream before validating it. Nine provisioned
   streams, down from ten. Six tests and five mutations (M1, M2, M5, M7, M9); no
   obligation was deleted on the strength of the term proof alone.
-- [ ] **Prove or retire the accepted-CONNECT atomic-batch write path.** F-030's
+- [x] **Prove or retire the accepted-CONNECT atomic-batch write path.** F-030's
   dependency inventory (`test/depproof`) fixtures `$MQTT_willq`'s SINGLE-MESSAGE
   conditional write. Every accepted CONNECT writes something else: `storeAcceptBatch`
   commits the record and its permanent acceptance fact in ONE `AllowAtomicPublish` batch
@@ -455,24 +455,47 @@ but each still needs its own consequence audit.
   durable residue that recovery converges — never "no residue exists". No Raft edit and
   no consensus-safety check disabled; the term guard is inherited by citation, since
   `ProposeMulti`'s is verbatim `proposeLocked`'s.
-  **STILL OPEN — the consequence this item owns.** The authored-record fork machinery
-  was retained on exactly the gap just closed, so this bullet does not tick until that
-  is settled. The predicate `found.PWID == ackPWID && found.WID != ackWID` proves two
-  record BODIES claim one parent, never that two CAS applications off one base both
-  landed — a restore, a stream recreation, an administrative write or a replay produces
-  the first without the second. The remaining work is the obligation audit, per
-  BEHAVIORAL CONTEXT (not per call site: `classifyAttemptReadback` serves two readbacks,
-  and `resolveContendedRecordSave` and `disposalForDirectRejection` each serve two
-  paths), asking whether any supported writer, ambiguity path, deletion, recreation,
-  restore, replay or administrative input can make that site observe the COMPLETE
-  predicate. Three exits and only these: unreachable everywhere → delete the classifier
-  and repair machinery, with the concessions restated in `docs/CONFORMANCE.md`;
-  reachable anywhere → this item owns the fix and the machinery stays; unsettled → the
-  item stays open with the truthful rationale. The deletion manifest is an OUTPUT of the
-  audit, and it is not a file removal: `adoptRecordLineageLocked` is retained but calls
-  `adoptGrantBodyLocked` in `sess_fork_repair.go`, the grant-body rotation is entangled
-  with five external call sites, and most of the disposal vocabulary serves ordinary
-  takeover.
+  **CONSEQUENCE AUDITED 2026-08-17 — the machinery is RETAINED, on a route the closed gap
+  never covered.** The audit asked whether any supported writer, ambiguity path, deletion,
+  recreation, restore, replay or administrative input can make a consult site observe the
+  COMPLETE predicate. It can. The predicate `found.PWID == ackPWID && found.WID != ackWID`
+  establishes two record BODIES CLAIMING one parent, never that two CAS applications off
+  one base both landed — and an **unconditional** write produces the first without the
+  second. A headerless direct publish to `$MQTT.sess.<domainTk><cidHash>` is not a write
+  the F-030 closure speaks about at all: that proof is scoped to writes CARRYING a
+  per-subject expectation. Nothing validates provenance at restore
+  (`createOrRestoreSession` checks JSON, client ID, reserved membership, generation, the
+  affine pair, teardown/retirement and overdue state, then adopts `WID`/`PWID` as given),
+  and the reserved-namespace guards deny `$MQTT.>` to MQTT clients rather than to
+  permitted NATS publication. `TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill`
+  already proves the whole route end to end — an unconditional store, the live connection
+  reaching the classifier, 0x89, and the Will PUBLISHED — and it runs in `make full-suite`,
+  which applies no `-run` filter.
+  **Deleting it would not have been a cleanup.** The forked verdict is not a reason code:
+  the bound-rejection foreign arm calls `mqttDiscardWillOnTakeover` and the forked arm
+  deliberately does not, so reporting this route as a takeover would cancel a delayed Will
+  that is still owed and skip the repair capsule
+  (`TestMQTTForkedRecordE2EConnectRebuildsFromRecord` pins the capsule restoring real
+  delivery). One surviving route invalidates deletion however much other evidence
+  converges, so the exit was fail-closed.
+  **It also corrects the falsified PREMISE where that premise was doing live work.**
+  Part A closed the cross-term same-base route ONLY for bridge-authored conditional writes
+  on `$MQTT_sess`, and a substantial number of code comments, test commentary and doc
+  blocks still explained live machinery by it. The authoritative statement now lives ONCE,
+  in `docs/CONFORMANCE.md`'s three-part same-base boundary (closed / still open /
+  untouched), with `docs/ARCHITECTURE.md` summarising and referencing it; code comments
+  stay locally useful rather than becoming "see docs" pointers, and historical text
+  (`CHANGELOG.md`, completed `[x]` items) is preserved verbatim.
+  **What is NOT claimed.** This is not a proof that every semantically equivalent
+  restatement in the repository has been found. No such claim is mechanically checkable
+  over natural language, and asserting one was the error that cost this item three review
+  rounds. A lexical signature sweep (130 candidates) and a concept-rooted structural pass
+  were SEARCH AIDS that made the work finite; they are not a completeness certificate. The
+  defensible claim is narrower and is the one made here: the audit reached a justified
+  result — RETAIN, on a live route with an enforced end-to-end oracle — and every concrete
+  false statement the reviews and sweeps surfaced was corrected. A stale comment found
+  later is an ordinary defect, not a reopening of this item.
+
 - [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
   **Consequence audit, not a lineage design.** F-030's evidence bears on the shared
   premise for this stream too, so the question left is this stream's OWN: whether any
@@ -791,6 +814,12 @@ operation can trigger correctness loss or unbounded resource growth.
 
 - [ ] Force two session-record proposals into the clustered pre-proposal window.
   **Test infrastructure, not a broker gap, and deliberately not a §0.2 blocker.**
+  **Motivation changed 2026-08-17, item NOT retired.** Its subject is the SAME-TERM
+  clustered admission/apply window, and that window still exists — the in-process
+  per-subject map refusing the second same-base write with 10164 is exactly what it
+  targets. What §0.2 retired is the CROSS-ELECTION consequence that used to be attributed
+  to it (the same-base boundary in `docs/CONFORMANCE.md`). Retiring this bullet would need
+  its own audit of what a test here could still observe.
   `TestMQTTTakeoverCreateRaceReplicated` asserts the property on a real Replicas=3
   stream — one winner, a definite loser, the winner's bytes surviving — but a barrier
   only makes both goroutines runnable, so it cannot hold one proposal between clustered

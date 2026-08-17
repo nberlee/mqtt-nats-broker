@@ -129,7 +129,7 @@ const (
 	// mqttRepairSaveForeign: the record moved to content that is not our write
 	// (or is gone). Another owner is authoritative.
 	mqttRepairSaveForeign
-	// mqttRepairSaveForked: the record moved to content that is PROVABLY a sibling of
+	// mqttRepairSaveForked: the record moved to content provably CLAIMING the same parent, a sibling of
 	// the one this broker was acknowledged for. Every consequence of foreign holds —
 	// the write did not land, the sequence must not be adopted, the caller refuses —
 	// and nothing is credited, because nothing landed. What differs is only what the
@@ -221,7 +221,7 @@ const (
 	// machinery owns the session until a readback classifies it.
 	mqttRejectionUnresolved
 	// mqttRejectionForked: the probe definitively did not land, and the record that IS
-	// there is PROVABLY a sibling of the one this broker was acknowledged for. The
+	// there is provably a body CLAIMING the parent of the one this broker was acknowledged for. The
 	// session is equally not ours to write, so the session is disposed exactly as a
 	// foreign verdict disposes it — but no takeover was demonstrated, so none is
 	// claimed and the client is told 0x89 rather than 0x8E. See sess_fork_lineage.go.
@@ -268,8 +268,9 @@ func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg 
 		//
 		// That reasoning establishes the record is not OURS. It does not establish
 		// that it SUCCEEDS ours, which is the separate claim the foreign verdict goes
-		// on to make: across a leader transition a write derived from our own base can
-		// survive and erase us. Asked here, on the branch that already concluded
+		// on to make: an UNCONDITIONAL foreign write can erase us off our own base
+		// without succeeding us, and no CAS excludes one (the same-base boundary,
+		// docs/CONFORMANCE.md). Asked here, on the branch that already concluded
 		// foreign, and only above the base — a record below it stays foreign fail-safe,
 		// because a lower sequence means a reset or re-provisioned store.
 		if smsg.Sequence > detail.baseSeq &&
@@ -975,11 +976,12 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 // Re-sending rather than re-marshalling is what keeps the write's IDENTITY intact:
 // the digest a later read compares against is the one these bytes carry, and a
 // caller that kept its mutation may have moved memory on since. It is also what
-// makes the re-send an ARBITRATION: same CAS base, so within one leader term at most
-// one of the original and this can commit. Across a transition that exclusion does not
-// hold — the check is pre-proposal and the in-process map is cleared — and both can
-// land; see docs/CONFORMANCE.md, and the settlement contract in sess_uncertain.go for
-// why identical bytes plus MaxMsgsPer:1 make that outcome benign.
+// makes the re-send an ARBITRATION: same CAS base, so at most one of the original and
+// this can commit. That exclusion used to be qualified as holding only within a leader
+// term; it is now unqualified for two BRIDGE-AUTHORED CONDITIONAL writes — see the
+// same-base boundary in docs/CONFORMANCE.md, and the retired argument in
+// sess_uncertain.go for why identical bytes and MaxMsgsPer:1 are kept for their own
+// reasons rather than as that exclusion's safety net.
 //
 // Both callers hold a record transaction on this goroutine — the repair's accept
 // transaction, the resolver's own — which is what makes the raw re-send safe

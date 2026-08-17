@@ -1,4 +1,9 @@
-// Repairing the grant a proven session-record fork erased.
+// Repairing the grant a recognised forked record may be missing.
+//
+// PRECISION about what is computed WHERE, because the mint site knows less than the
+// merge site: the capsule is a CANDIDATE delta, built without ever reading the survivor.
+// Only mergeForkedGrantLocked compares it against the surviving body and decides, filter
+// by filter, whether a candidate is applied or skipped.
 //
 // sess_fork_lineage.go recognises that a surviving record is a SIBLING of the one this
 // broker was acknowledged for, and stops there. The client is told 0x89 "server busy"
@@ -7,13 +12,41 @@
 // State to carry the client's subscriptions ([MQTT-4.1.0-1], Spec5 [4.1.1]), so an
 // acknowledged SUBSCRIBE or UNSUBSCRIBE silently ceasing to exist is a conformance break.
 //
-// WHAT IS RECOVERABLE IS THE RECORD DELTA. The anchor condition classifyRecordLineage
-// tests (found.PWID == ackPWID) means the survivor and our erased record are siblings of
-// ONE NAMED PARENT, so that parent is a single-hop common ancestor and a three-way merge
-// against it is well defined.
+// WHAT IS RECOVERABLE IS THE RECORD DELTA, and it is a WELL-DEFINED RECONCILIATION
+// AGAINST THE RETAINED BODY — deliberately not described as a three-way merge over a
+// proven common ancestor, which is more than anything here establishes.
+//
+// The anchor condition classifyRecordLineage tests (found.PWID == ackPWID) means the
+// survivor CLAIMS the parent our erased record claimed. That is a claim, not a proof:
+// restore adopts WID and PWID without validating provenance. Three things are true, and
+// keeping them apart is what keeps this honest:
+//
+//   - The comparison baseline is concrete, and it is the retained PARENT body
+//     (sess.grantBodyParent) — the record our acknowledged record was DERIVED FROM. The
+//     delta re-asserted is our acknowledged body (sess.grantBody) relative to it; see
+//     mqttGrantFromBody's two arguments. Its standing comes from this broker having held
+//     BOTH bodies, never from the survivor's pointer.
+//   - The computation is therefore deterministic WITHOUT trusting the survivor's PWID —
+//     the delta is ours-versus-baseline, and the survivor's body is the thing it is
+//     re-asserted onto.
+//   - It does NOT establish that the survivor descended from that body, nor that the
+//     baseline is a genuine common ancestor of both. It never needs to: what is
+//     re-asserted is state this broker's own client was acknowledged for.
+//
+// AUTHORIZATION IS WEAKER THAN RECOGNITION, and the two must not be conflated. The
+// classifier's conclusion is NEGATIVE — no takeover is established — and needs no
+// provenance. This file ACTS, and it acts on an inference: mqttSurvivorDecidedGrant reads
+// "the survivor's grant equals the retained parent's" as "the survivor decided nothing
+// about this filter". Since the reachable route is an UNCONDITIONAL foreign write (see the
+// same-base boundary in docs/CONFORMANCE.md), that body is whatever its author wrote, so
+// the inference is about what the survivor RECORDED, never about what it intended. The
+// conflict predicate is conservative in the direction that matters — anything stated
+// differently is left alone and the non-repair is counted — and an author able to publish
+// that body could set the state directly anyway. Stated as a residual in
+// docs/CONFORMANCE.md rather than claimed as an invariant.
 //
 // A UNION IS WRONG, and that is the trap this file exists to avoid. The verdict proves
-// siblinghood only — explicitly NOT that the survivor erased us (sess_fork_lineage.go).
+// that the survivor CLAIMS our parent — explicitly NOT that it erased us (sess_fork_lineage.go).
 // With base P = {a}, our child X = {a,b} and a survivor Y = {} carrying an ACKNOWLEDGED
 // UNSUBSCRIBE of a, a union yields {a,b} and resurrects a subscription the client was
 // UNSUBACKed for. "Absent from the survivor" is ambiguous between "our addition was
@@ -429,15 +462,16 @@ type mqttGrantChange struct {
 	ours   *mqttGrantEntry
 }
 
-// mqttForkedGrant is the change a proven fork erased, held in memory for this client's own
+// mqttForkedGrant is the CANDIDATE change — our acknowledged body against our retained
+// baseline, computed without reading the survivor — held in memory for this client's own
 // reconnect to re-assert through the ordinary accept save.
 type mqttForkedGrant struct {
 	// gen is the incarnation the change belongs to. clear() re-mints it, so a capsule
 	// from a retired incarnation can never match — which is what stops this resurrecting
 	// an incarnation a teardown already deleted.
 	gen string
-	// ackWID / ackPWID is the pair the forked verdict was reached against: our erased
-	// record's identity and the parent it shares with the survivor.
+	// ackWID / ackPWID is the pair the forked verdict was reached against: our own
+	// record's identity and the parent the survivor also claims.
 	ackWID, ackPWID string
 	changes         []mqttGrantChange
 	// regNonces are the cancelled-register verdicts our record held and the survivor's
@@ -464,7 +498,10 @@ func (g *mqttForkedGrant) isEmpty() bool {
 }
 
 // buildForkedGrantLocked computes the delta between the record this broker was acknowledged
-// for and its parent, which is exactly what a sibling of that parent erased.
+// for and its retained parent baseline. That is a CANDIDATE set, not the state the
+// survivor lacks: this function never reads the survivor, which may carry the same change
+// or a conflicting one. mergeForkedGrantLocked is where the survivor is compared and a
+// candidate becomes an applied change or a counted skip.
 //
 // A nil parent snapshot means NOTHING IS REPAIRABLE and nothing is minted: the record was
 // restored from the stream, which has no known parent content here. The first record after
@@ -521,7 +558,8 @@ func (sess *mqttSession) buildForkedGrantLocked(ackWID, ackPWID string) *mqttFor
 	return g
 }
 
-// mintForkedGrant records the delta a forked verdict just proved erased.
+// mintForkedGrant records the CANDIDATE delta our acknowledged record carried relative to
+// its retained baseline. Whether the survivor lacks any of it is decided later, at merge.
 //
 // Called at the point the verdict is MADE rather than where it is reported, which puts it
 // inside the record transaction that classified: every disposition arm returns after its
@@ -655,7 +693,7 @@ const (
 	// sequence the record has moved past, is definitely rejected, and T2 re-drives to the
 	// authoritative restore, whose pass carries the survivor's pair and merges.
 	mqttForkAnchorKeep
-	// mqttForkAnchorMerge: the record now current is still the sibling that erased us, in
+	// mqttForkAnchorMerge: the record now current is still the body claiming our parent, in
 	// the same incarnation.
 	mqttForkAnchorMerge
 )
@@ -675,8 +713,15 @@ const (
 // is a resurrection.
 //
 // What the anchor does NOT do is arbitrate ownership of the re-asserted state. Only the
-// accept save's expected-sequence CAS does that, and it linearizes only within a leader
-// term. This is a staleness and eligibility guard over an ordinary write.
+// accept save's expected-sequence CAS does that, and a CAS cannot exclude an
+// UNCONDITIONAL foreign write by construction — see the same-base boundary in
+// docs/CONFORMANCE.md, which is also the route this repair exists for. This is a
+// staleness and eligibility guard over an ordinary write.
+//
+// Note this consult has NO sequence gate, unlike the other classifier call sites: it
+// compares the in-memory pair after its own WID and generation gates. A capsule retained
+// across a live stream recreation or an external restore can therefore be anchored
+// against a restored survivor whose sequences restarted.
 //
 // sess.mu must be held.
 func (sess *mqttSession) anchorForkedGrantLocked(g *mqttForkedGrant) mqttForkAnchor {
@@ -709,7 +754,8 @@ func setMQTTTestForkRepairMergeHook(h func(sess *mqttSession)) func() {
 	return func() { mqttTestForkRepairMergeHookV.Store(prev) }
 }
 
-// reassertForkedGrantInto re-asserts what a proven fork erased, into a session that has
+// reassertForkedGrantInto re-asserts the candidates the merge ACCEPTED — those the
+// survivor was found not to have decided differently — into a session that has
 // just restored the surviving record.
 //
 // It runs from mqttProcessConnect IMMEDIATELY AFTER the accept record transaction opens and
@@ -871,9 +917,11 @@ func (sess *mqttSession) mergeForkedGrantLocked(g *mqttForkedGrant, survivor *mq
 // membership change can accompany it. A multi-level filter's two sids drain and complete
 // independently, so refusing one must not withdraw the other.
 //
-// The rule has two halves that come from different sides. The GRANT becomes ours —
-// membership, the options, and each sid's drain presence — because that is the acknowledged
-// decision the fork erased. The CONSUMER IDENTITY stays the survivor's wherever the
+// The rule has two halves that come from different sides. This runs at MERGE, so the
+// survivor has already been compared and this candidate survived that comparison. The
+// GRANT becomes ours — membership, the options, and each sid's drain presence — because
+// that is the acknowledged decision the survivor was found not to have decided
+// differently. The CONSUMER IDENTITY stays the survivor's wherever the
 // resulting state is LIVE, because identity is never a grant decision (that is the conflict
 // predicate's whole premise) and the reconciliation resolves the durable and deliver subject
 // from whichever config the session holds.

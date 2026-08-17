@@ -620,9 +620,12 @@ Operational constraints for the coupled streams:
 
 ### Two frontends taking over one session from the same base
 
-The session record is the sole arbitration, and per-subject CAS linearizes it only
-WITHIN a stream-leader term. Nothing can prevent two writes off one base. What the
-design delivers is that every interleaving converges on one owner and each client is
+The session record is the sole arbitration. Two BRIDGE-AUTHORED CONDITIONAL writes taken
+from one base cannot both apply — see the same-base boundary in `docs/CONFORMANCE.md`,
+which is authoritative and which every statement in this section is scoped by. What no
+CAS can exclude is an **unconditional** write, which carries no expectation to compare;
+that route stays open and is why the lineage machinery below exists. What the design
+delivers either way is that every interleaving converges on one owner and each client is
 told something true.
 
 **Every record write is conditional, base 0 included.** The create was the one write
@@ -743,7 +746,7 @@ merely REQUESTED expiry 0. Four consequences, each load-bearing:
   and nothing is fenced, while a won claim means the record it retires really is
   current. Recording a retirement without holding the base would instead fence a
   legitimate successor permanently and route it through a destructive discard. What the
-  claim does NOT bound is the cross-term apply that regresses the single slot: this
+  claim does NOT bound is an unconditional foreign write regressing the single slot: this
   caller inherits that residual from every other `clear()` caller, and
   `docs/CONFORMANCE.md` states it as new exposure on this path, because the bare delete
   it replaces could not reach it. The teardown also deletes this incarnation's consumers
@@ -768,7 +771,7 @@ by which such a verdict was reached was equally a FALSE fork. Every create is pa
 again, the pair concedes 0x8E, and that is residual R-create in `docs/CONFORMANCE.md` —
 the principal safety cost of this design, not a gap awaiting a fix. See "Recognising a
 forked session record". The other — the window in which a teardown that WON its claim has
-already deleted the consumers a cross-term survivor's record still names — is closed by
+already deleted the consumers a surviving foreign record still names — is closed by
 the generation-retirement watermark, which is durable state off the record subject and
 therefore outside this design's reach (see "The generation-retirement watermark").
 
@@ -943,8 +946,9 @@ it extracts is the REJECTION KIND. **10164** means a write for this subject is i
 upstream — possibly the original, accepted before the delete and still to apply — so
 nothing is settled and nothing is disposed. **10071** means no write is in process, which
 is the best evidence available that the original went with the record; it is classified
-foreign FAIL-SAFE, not proven, because a leader transition clears the in-process map
-(`jetstream_cluster.go:4720`) while a replicated proposal can survive it.
+foreign FAIL-SAFE rather than proven, because an unconditional foreign write carries no
+expectation for any check to compare and so is excluded by nothing (the same-base
+boundary in `docs/CONFORMANCE.md`).
 
 The pass is single-shot: the periodic pass is the retry cadence, and a retry loop would
 hold the record fence across an unbounded number of round trips. It costs at most three
@@ -952,10 +956,16 @@ JetStream requests (read, re-attempt, classifying re-read) of record-fence occup
 plus whatever the landed continuations do — which is the pre-existing landed-arm cost made
 more frequent, not a new hold class.
 
-**The invariant does not rest on "only one of them commits", and that matters.**
-Ordinarily the shared CAS base makes the second proposal impossible. But a leader
-transition clears the in-process map (`jetstream_cluster.go:4720`) while a replicated
-proposal can survive it, and a clustered apply never re-checks the expected sequence — so
+**The invariant does not rest on "only one of them commits", and that reasoning is now
+RETIRED rather than load-bearing.** For two bridge-authored conditional writes the shared
+CAS base makes the second impossible — the same-base boundary in `docs/CONFORMANCE.md`.
+It is NOT transferable to the unconditional foreign write that remains reachable: that
+route's reachable order is the re-attempt admitted first and the foreign body landing
+afterwards, which supplies no acknowledgement for this broker to adopt, so the
+surviving-sequence argument below does not describe it. Kept only as a record of the
+retired reasoning and as generic defensive depth. Historically it ran: a leader
+transition clears the in-process
+map while a replicated proposal survives it, and a clustered apply never re-checks — so
 a surviving original and a re-attempt admitted by the new leader can BOTH land. Three
 properties make that outcome indistinguishable from a single landing: the bytes are
 identical; log order puts the re-attempt last, so the PubAck this broker adopts names the
@@ -1027,19 +1037,28 @@ prove the record **succeeds** ours — and that second claim is the one the brok
 to make, evicting its own client with **0x8E "session taken over by a new connection"**,
 which instructs that client to stop reconnecting under this session.
 
-Across a leader transition the two shapes are genuinely different events. A write derived
-from the same base as ours can survive the election unapplied, apply after a second write
-the new leader admitted against that same base, and discard the earlier record under
-`MaxMsgsPer: 1`. The survivor is then a **sibling** of our record, not its successor, and
-nobody took anything over. Two brokers can reach the takeover conclusion about each other
-from that one event.
+The two shapes are genuinely different events. A write that is **not** conditioned on the
+subject at all — carrying no `Nats-Expected-Last-Subject-Sequence`, so no check compares
+it — can land on our base and discard our record under `MaxMsgsPer: 1`. The survivor then
+CLAIMS our own parent rather than DEMONSTRATING succession. That is all the record
+establishes: it does not settle whether a takeover occurred, and a live competing owner
+adopting such a write produces this same shape
+(`TestMQTTForkedRecordE2EWithALiveCompetingOwnerPublishesTheWill`). What the verdict
+withholds is the ASSERTION of a takeover, not the possibility of one. Two brokers can
+reach the takeover conclusion about each other from that one event.
+
+This used to be described as a cross-term race between two conditional writes. That route
+is closed — see the same-base boundary in `docs/CONFORMANCE.md` — and the recognition is
+retained for the unconditional one, which a CAS cannot exclude by construction.
 
 A sequence cannot distinguish them, and neither can a counter: a per-write epoch is a
 branch-local Lamport counter, and a competing branch that never read our record can advance
 above us and then look like our successor. What distinguishes them is **ancestry**, so
 every `$MQTT_sess` record carries a parent pointer — `WID`, the write's own identity, and
 `PWID`, the identity of the record it was derived from. Two records carrying the same
-`PWID` are siblings of one base.
+`PWID` CLAIM one base. "Sibling" is shorthand for that claim throughout, never a proof
+of descent: restore adopts `WID`/`PWID` without validating provenance, and every
+conclusion drawn is negative — such a body does not establish a takeover.
 
 **The rule** (`classifyRecordLineage`, `sess_fork_lineage.go`) is consulted at exactly one
 place in each caller — the branch that has already concluded foreign — behind that
@@ -1053,9 +1072,9 @@ caller's existing `Sequence > baseSeq` gate, and it emits only **forked** or
 **The incarnation generation is deliberately not consulted, and that is a reversal.** It
 used to short-circuit ahead of the pointer test, on the reasoning that a different
 incarnation restarts the lineage. That hid the fork this rule exists to catch. Record
-identities are globally unique, so a parent match states descent from one actual record
-whatever generation wrote it; a generation mismatch adds nothing to that and only
-suppressed it.
+identities are globally unique, so a parent match names one actual record whatever
+generation wrote it — a CLAIM of descent from it, never a proof, since restore adopts
+the pair unvalidated; a generation mismatch adds nothing to that and only suppressed it.
 
 **A CREATE IS PARENTLESS**, and that is the write-lineage audit's result rather than an
 omission. `parentForNextWriteLocked()` returns the record we are acknowledged for and
@@ -1081,11 +1100,19 @@ INHERITED an identity which outlived the interval it named, and each fires the s
 verdict a true fork would. Removing the inheritance removes all five; nothing else in the
 recognition changes.
 
-What that concedes is the cross-term create pair itself: both brokers find the subject
-empty, both are admitted at base 0 pre-proposal, both apply, `MaxMsgsPer: 1` discards the
-earlier, and both records are parentless — so arm 2's `ackPWID != ""` conjunct concedes
-from either orientation, and the erased side answers 0x8E about a takeover nothing
-arbitrated. That is the pre-F-029b behavior, restated as a residual in
+What that concedes is the PARENTLESS CREATE PAIR: two records both carrying no parent, so
+arm 2's `ackPWID != ""` conjunct concedes from either orientation and the erased side
+answers 0x8E about a takeover nothing arbitrated.
+
+Its stated route used to be a cross-term one — both brokers find the subject empty,
+both are admitted at base 0, both apply. **That route is closed**: a create is
+conditional too (base 0 means *the subject must currently be empty*), so it is covered
+by the same-base boundary in `docs/CONFORMANCE.md` like every other bridge-authored
+conditional write. The
+CONCESSION is unchanged, because the shape is still reachable without it — an
+unconditional foreign write, or an out-of-band deletion followed by a create, produces a
+parentless record beside ours just as well. That is the pre-F-029b behavior, restated
+as a residual in
 `docs/CONFORMANCE.md` and pinned end to end by
 `TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient`. It is a residual conditioned on
 EVIDENCE, not on a rollout: it stands unless a route is found that produces the verdict
@@ -1124,7 +1151,7 @@ remains the only thing that licenses them.
 **Five classified paths** consult it, and every one of them keeps the disposition it
 already had, changing only what is reported:
 
-| Path | On a proven sibling |
+| Path | On a body claiming our parent |
 |---|---|
 | definite rejection, **bound** (`sess_rejected_write.go`) | `mqttBoundUnsettled` → **0x89** and the ORDINARY close bookkeeping. Deliberately not the foreign arm's shape: that arm calls `mqttDiscardWillOnTakeover` first, and suppressing a Will on a takeover nothing demonstrated is a silent loss |
 | definite rejection, **unbound** | the same foreign disposition, with the forked vocabulary. It passes `nil` for the client, so the helper returns before the notification and *nothing observable differs*; the arm exists so the classifier has one meaning everywhere |
@@ -1141,7 +1168,8 @@ it invites the reconnect that resolves the ambiguity, where 0x8E forbids it.
 **This detects. What it recognises is then REPAIRED, for the recoverable subset, by
 "Repairing a recognised fork" below.** The verdict itself still licenses no write of its
 own, and it does not prove the survivor erased us — a teardown claim is itself a full-body
-CAS off the same base — only that the survivor is no successor of ours. An absent `WID`
+CAS off the same base — only that the survivor is not demonstrably a successor of
+ours. An absent `WID`
 concedes through arm 2's guard rather than through a legacy branch, so there is no alternate
 code path and no mixed-version machinery. `docs/CONFORMANCE.md` states what is left open.
 
@@ -1225,17 +1253,23 @@ requires the Session State to carry the client's subscriptions ([MQTT-4.1.0-1], 
 recoverable subset of it, and everything below is memory-only: no persisted field, no
 encoding change, no new stream or subject.
 
-**What is recoverable is the record DELTA.** The anchor condition (`found.PWID ==
-ackPWID`) means the survivor and our erased record are siblings of one NAMED parent, so
-that parent is a single-hop common ancestor and a three-way merge against it is well
-defined.
+**What is recoverable is the record DELTA**, as a well-defined reconciliation against
+the RETAINED BODY — deliberately not as a three-way merge over a proven common ancestor.
+The anchor condition (`found.PWID == ackPWID`) means the survivor CLAIMS the parent our
+erased record claimed, and a claim is all it is: restore adopts `WID`/`PWID` without
+validating provenance. The baseline is concrete because this broker actually HELD that
+body, so the computation is deterministic without trusting the survivor's pointer; it
+establishes neither that the survivor descended from the baseline nor that the baseline
+is a genuine common ancestor, and it needs neither — what is re-asserted is state this
+broker's own client was acknowledged for.
 
-**A union is wrong, and this is the trap the design exists to avoid.** The verdict proves
-siblinghood only — explicitly *not* that the survivor erased us. With base `P = {a}`, our
-child `X = {a,b}` and a survivor `Y = {}` carrying an **acknowledged UNSUBSCRIBE of `a`**,
-a union yields `{a,b}` and resurrects a subscription the client was UNSUBACKed for.
-"Absent from the survivor" is ambiguous between "our addition was erased" and "the
-survivor removed a base field"; only the parent's content disambiguates it.
+**A union is wrong, and this is the trap the design exists to avoid.** The verdict
+proves that the survivor CLAIMS our parent — explicitly *not* that it erased us. With
+base `P = {a}`, our child `X = {a,b}` and a survivor `Y = {}` carrying an **acknowledged
+UNSUBSCRIBE of `a`**, a union yields `{a,b}` and resurrects a subscription the client
+was UNSUBACKed for. "Absent from the survivor" is ambiguous between "our addition was
+erased" and "the survivor removed a base field"; only the parent's content disambiguates
+it.
 
 **Two retained record BODIES** (`grantBody`, `grantBodyParent` on `mqttSession`): the
 exact bytes of the record `wid` names and of the record `pwid` names. The grant itself —
@@ -1269,7 +1303,7 @@ unknown computes no delta either. Stated as a residual in `docs/CONFORMANCE.md`.
 **And the bound fails CLOSED on the survivor side.** The anchor consults only lineage, so
 it still licenses a merge when the restore retained no body — an oversize survivor, or
 bytes that stopped decoding. A survivor grant defaulted to empty there would make every
-conflict invisible and invert survivor-wins: filters the survivor decided about would read
+conflict invisible and invert survivor-wins: filters the survivor RECORDED would read
 as absent-therefore-unconflicted, and the losing branch would overwrite them. The reclaim
 therefore refuses the WHOLE merge for that pass when the survivor's grant cannot be
 materialised — no per-filter fallback, no partial repair — and `mergeForkedGrantLocked`
@@ -1389,7 +1423,10 @@ it:
   the survivor.
 
 The anchor does **not** arbitrate ownership of the re-asserted state. Only the accept
-save's expected-sequence CAS does that, and it linearizes only within a leader term.
+save's expected-sequence CAS does that, and a CAS cannot exclude an UNCONDITIONAL
+foreign write at all (the same-base boundary in `docs/CONFORMANCE.md`) — which is the
+route this repair exists for. Note also that this consult has NO sequence gate, unlike
+the other call sites: it compares the in-memory pair after its WID and generation gates.
 
 **Capsule lifecycle.** A merge does not consume it: within the reclaim only the anchor
 refusing it removes it, and the accept save landing is what makes the anchor refuse. So a
@@ -1403,9 +1440,11 @@ by mint time. The anchor bounds HARM; the cap bounds MEMORY — a successful rep
 an entry behind by design. There is deliberately **no TTL**: an old but still-anchored
 capsule is a correct repair, so a TTL would only add a second reason to refuse one.
 
-**The apply rule has two halves from different sides.** The GRANT becomes ours —
-membership, the options, and each sid's drain presence — because that is the acknowledged
-decision the fork erased. The CONSUMER IDENTITY stays the survivor's wherever the
+**The apply rule has two halves from different sides.** This is the MERGE, so the
+survivor has already been compared and the candidate has already survived that comparison
+— the mint site never read it. The GRANT becomes ours — membership, the options, and each
+sid's drain presence — because that is the acknowledged decision the survivor was found
+not to have decided differently. The CONSUMER IDENTITY stays the survivor's wherever the
 resulting state is LIVE, because identity is never a grant decision and the reconciliation
 resolves the durable and deliver subject from whichever config the session holds. And **a
 resulting DRAIN always keeps its own persisted `Cons`**: `drainByDur` is keyed by it,
@@ -2987,10 +3026,11 @@ The claim licenses the deletions, and the release that says whether the claim is
 still ours runs *after* them — it has to, because it proves absence rather than
 authorship, and moving it earlier only lets an already-admitted proposal recreate the
 same shape one step later. So while the deletions run, the marker is the only durable
-record of the retirement, and the marker lives on the record's own subject. A
-cross-term resume derived from the same base can apply after it landed (per-subject
-CAS is checked pre-proposal, never at apply — see "JetStream behaviors this design
-depends on") and `MaxMsgsPer: 1` then **evicts** it. What survives is a record naming
+record of the retirement, and the marker lives on the record's own subject. An
+UNCONDITIONAL foreign write can land after it did — a CAS excludes a competing
+conditional write off that base but not one carrying no expectation (see the
+same-base boundary in `docs/CONFORMANCE.md`) — and `MaxMsgsPer: 1` then **evicts**
+it. What survives is a record naming
 exactly the resources the winner deleted, with no marker for an adopter or the sweep
 to find: a **hollow survivor** that a reconnect resumes with Session Present 1 for
 consumers, holds and in-flight registers that no longer exist.
