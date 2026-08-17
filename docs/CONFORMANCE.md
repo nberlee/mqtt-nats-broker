@@ -1072,10 +1072,19 @@ What it does NOT do:
     acknowledged for membership the fence subsequently deletes — a conditional false
     acknowledgement that is a property of the delayed-proposal window and the fence.
 
-    It cannot be dismissed as a single-message impossibility. F-030's inventory proves
-    the single-message writer, and the accepted-CONNECT write is an `AllowAtomicPublish`
-    batch whose retirement is refuted in writing only (`test/depproof/README.md`,
-    R-batch); that gap is its own `docs/ROADMAP.md` item.
+    It cannot be dismissed as a single-message impossibility, and that is now true of
+    the accepted-CONNECT writer for a stated reason rather than for want of evidence.
+    F-030's inventory proves the single-message writer. The accepted-CONNECT write is an
+    `AllowAtomicPublish` batch, and its apply-layer behaviour is **measured** rather than
+    refuted in writing (`test/depproof/README.md`, R-batch): a committed prefix without
+    its commit entry stores nothing, so a batch never applies half of itself. What the
+    batch does NOT change is this route, because the refusals that guard it are the same
+    code the single-message writer uses — `ProposeMulti` carries `proposeLocked`'s
+    captured-term comparison verbatim, and a batch commit derives its per-subject
+    expectation through the same `checkMsgHeadersPreClusteredProposal`, read from the
+    leader's own applied store. R3's window is therefore identical for both writers
+    rather than absent from one: the expectation is checked before the proposal, and the
+    apply happens later.
 
   - **R4 — out-of-band record deletion.** `$MQTT_sess` must have `DenyDelete == false`
     because the broker's own deleter needs it, so an operator deleting a live record
@@ -1109,13 +1118,26 @@ What it does NOT do:
 
   **What the AUTHORED-RECORD fork retains, and why.** Two CAS writes off a base this
   broker actually held still classify as siblings, and `sess_fork_repair.go` still
-  repairs the grant one erased. That machinery is kept on evidence rather than
-  preference: F-030's dependency inventory proves the single-message writer, and every
-  accepted CONNECT writes through an `AllowAtomicPublish` batch instead. At the pinned
-  v2.14.5 no Raft-level field preserves "these entries came from one `ProposeMulti`" —
-  entries are pushed individually, popped as whatever prefix exists, regrouped by size
-  thresholds, and each group rechecks leadership on its own — so the inventory does not
-  reach that writer and its R-batch row is a written refutation only. Pinned by
+  repairs the grant one erased.
+
+  The reason previously stated for that retention was an evidence gap in the accepted
+  CONNECT's writer, and **that gap is now closed**. Every one of its Raft-level facts
+  holds — at the pinned v2.14.5 no Raft-level field preserves "these entries came from
+  one `ProposeMulti`"; entries are pushed individually, popped as whatever prefix
+  exists, regrouped by size thresholds, and each group rechecks leadership on its own —
+  but the consequence drawn from them was false. Batch identity is carried in the stream
+  entry encoding and enforced at apply, so a committed prefix applies **nothing**, and
+  the accepted CONNECT's fact and record commit together or not at all. The R-batch row
+  is measured (`test/depproof/README.md`), and the bridge's own use of the batch is
+  asserted at the store boundary by `TestMQTTAcceptBatchReplicatedIndivisible`.
+
+  So the machinery is retained on a NARROWER and still-open question: whether any
+  supported writer, ambiguity path, deletion, recreation, restore, replay or
+  administrative input can place two record bodies claiming one parent where a broker
+  can observe them. The classifier's predicate proves exactly that — two byte strings
+  naming one parent — and never that two CAS applications off one base both landed, so
+  closing the batch route does not by itself answer it. That audit is the open half of
+  the same `docs/ROADMAP.md` item, and this machinery stands until it reports. Pinned by
   `TestMQTTAuthoredForkStillClassifies`, which is also what stops every concession above
   from being satisfiable by a classifier that had simply been removed.
 

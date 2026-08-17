@@ -1,6 +1,10 @@
-# Dependency canary: can the Will outbox's terminal state be regressed?
+# Dependency canary: the JetStream write contracts this broker rests on
 
-This directory holds the executable dependency canary for
+Two questions, one harness, because both are about the SERVER rather than about this
+broker's code and both are answered the same way - a route inventory, fixtures inside an
+isolated nats-server checkout, and one discriminating mutation per live mechanism.
+
+**Can the Will outbox's terminal state be regressed?** The executable canary for
 `docs/findings/ha-arbitration.md` F-030, **closed 2026-08-16**. Both routes by which the
 hazard could occur are refused on the supported floor. Closure does not rest on this
 harness alone: it combines the route inventory and mutations here, pinned source
@@ -8,16 +12,24 @@ mechanisms, and the NATS maintainer's explicit confirmation that leader-local in
 ownership plus applied-before-serving enforce the header across elections
 ([`nats-server#8469`](https://github.com/nats-io/nats-server/issues/8469#issuecomment-5304075553)).
 
-The question it answers is one about the SERVER, not about this broker's code, so the
-tests live in `testdata/` as `package server` files and run inside an isolated
-nats-server checkout:
+**Can an accepted CONNECT's atomic batch commit half of itself?** The R-batch row below,
+which used to be a written refutation and is now measured. Every accepted CONNECT
+commits its acceptance fact and its session record as one `AllowAtomicPublish` batch on
+`$MQTT_sess`, and `mqttAcceptFactLanded` reads an acknowledgement of that batch as "the
+record committed with the fact". A FIFO prefix of the batch really can be committed
+without its commit entry - the Raft layer preserves nothing about a batch - but such a
+prefix applies NOTHING, and that is what the fixture and its mutation measure.
+
+The fixtures live in `testdata/` as `package server` files, because that is the only
+place they can reach the mechanisms they measure:
 
 ```bash
 ./run.sh                       # the version pinned in go.mod, unmutated
 ./run.sh --version v2.14.3     # the control generation
 ./run.sh --mutation m-term-guard
+./run.sh --fixture acceptbatch_partial_test.go --run '^TestJetStreamAcceptBatch'
 ./run.sh --matrix              # every row of the table below, direction asserted
-./run.sh --bridge              # the bridge sentinel and its own mutation
+./run.sh --bridge              # the two bridge sentinels and their own mutations
 ```
 
 `run.sh` clones the pinned tags into `$DEPPROOF_DIR` (default
@@ -57,7 +69,7 @@ conditioned on `S` could reach a proposal after `done` is committed, and what st
 | **R-inflight** | Two writes on one subject inside one term, the second reading `S` before the first applies. | `checkMsgHeadersPreClusteredProposal` tracks in-process per-subject expectations and refuses the second with 10164 while the first is in flight; this broker resolves 10164 by re-reading rather than classifying (`docs/ARCHITECTURE.md`). Pre-existing, not a cross-term route. | covered by the bridge's own CAS tests |
 | **R-apply** | A write that reaches the log anyway - a proposal admitted by a generation without the term comparison. | TWO version-common backstops, stacked: apply-time log order (`processJetStreamMsg` returns `errLastSeqMismatch` when the entry's position is not `mset.lseq + clfs`), and beneath it the store, which refuses an explicit sequence that is not exactly `LastSeq+1` (`ErrSequenceMismatch`). Together they are why the control run does NOT produce the surviving stale record the plan predicted. | measured on v2.14.3; reported as an OBSERVED backstop, see below |
 | **R-unclustered** | `node == nil` (an R1 stream, or a scale-up with queued inbound), where the write goes straight to `processJetStreamMsg`. | The per-subject expectation is then enforced at apply (`canConsistencyCheck := !isClustered`), against the same store the write would land in. There is no leader transition and no window: this broker also refuses to run with a `$MQTT_willq` that is not R3 when replicas are configured (`internal/mqtt/stream_prereqs.go`). | written refutation |
-| **R-batch** | `ProposeMulti`, the atomic-batch path. | It carries and compares the captured term identically (`raft.go` `ProposeMulti`). `$MQTT_willq` is not an atomic-batch stream in any case - only `$MQTT_sess` sets `AllowAtomicPublish`, for the record-plus-acceptance-fact commit. | written refutation |
+| **R-batch** | `ProposeMulti`, the atomic-batch path. Its own shape: a FIFO prefix of the batch is committed and the commit entry is not, so the acceptance fact could be durable without the session record it was supposed to arrive with. | For `$MQTT_willq`, nothing to refuse: it is not an atomic-batch stream - only `$MQTT_sess` sets `AllowAtomicPublish`, for the record-plus-acceptance-fact commit. For `$MQTT_sess`, the prefix split is REAL at the Raft layer and applies NOTHING: batch identity lives in the stream entry encoding, a committed non-commit member is counted and buffered in memory, and only a gap-free commit op replays the members into the store under one `mset.mu` hold. The term comparison is inherited by citation - `ProposeMulti`'s guard is verbatim `proposeLocked`'s (`raft.go`) - and the batch commit derives its per-subject expectation through the same `checkMsgHeadersPreClusteredProposal` a single clustered write uses. | `TestJetStreamAcceptBatchPrefixStoresNothing`, mutation `m-batch-apply-eager`, the unmutated `^TestJetStreamAtomicBatchPublish` pin, and the accept sentinel `TestMQTTAcceptBatchReplicatedIndivisible` with `m-accept-split-write` |
 | **R-forward** | `ForwardProposal`, the one proposal entry point that does not take a term. | Its only stream-data call site is a message DELETE, proposed directly when this node is the stream leader and forwarded to it otherwise (`stream.go`), and a forwarded proposal always uses the receiving node's CURRENT term (asserted by upstream's own `TestNRGTermFencedProposals`). It carries no per-subject expectation, so it cannot be the write this claim is about; a delete is separately harmless here, since reaping a terminal record is what the protocol does with it. | written refutation |
 | **R-mirror/source** | The stream ingests writes from somewhere other than a conditional client publish. | Initial provisioning refuses a `$MQTT_willq` mirror or sources. Because validation is a snapshot, a source added after manager initialization is not a conditional-write route at all: it is retained outside F-030 as live configuration drift, not falsely refuted by this inventory. The closure is for a conforming stream. | scoped exclusion; `validateBrokerOwnedStreamShape`, `validateWillQStream`, and the configuration-drift residual |
 | **R-delete** | This broker's own terminal cleanup, which deletes by sequence. | It targets the sequence the finalize returned, and a delete cannot revive `publishing`: the record is gone, and an absent record is the scan's "nothing owed" (`finalizeWillPublish`, `willPublishWorker`). | written refutation |
@@ -86,11 +98,23 @@ requires, or one carrying a marker the row forbids, is `OFFTARGET`.
 | PASS | pinned | R-new readiness, half 2 alone | `m-premature-ready` + `m-freeze-store` | removing the announcement alone changes nothing: the campaign refusal keeps the node from leading at all |
 | FAIL | pinned | R-new readiness, both halves | `m-behind-campaign` + `m-premature-ready` + `m-freeze-store`, requiring all three markers | with both halves removed, a leader serves from the superseded base and PROPOSES a write carrying it |
 | PASS | v2.14.3 | all | none | the control generation: the older-term write is ADMITTED, and still does not survive |
+| PASS | pinned | R-batch | none, requiring `ACCEPT-BATCH-PREFIX-BUFFERED` and FORBIDDING `ACCEPT-BATCH-PREFIX-STORED` | a committed batch prefix with no commit entry is buffered on every replica and stores nothing, before and after the leader change that abandons it |
+| FAIL | pinned | R-batch | `m-batch-apply-eager`, requiring `ACCEPT-BATCH-PREFIX-STORED` | the buffering is what keeps the prefix out of the store: applying each member as it is committed puts an uncommitted batch's messages on the subject |
+| PASS | pinned | upstream batch contract | none | the dependency's own `AllowAtomicPublish` suite, unmutated, so a bump that breaks batch atomicity outright fails the canary rather than silently invalidating the rows above |
 | PASS | working tree | bridge sentinel | none | the broker's own writes go through the contract, over a real 3-node cluster |
 | FAIL | working tree | bridge sentinel | unconditional store | the sentinel reaches the EXTERNAL consequence: a Will published once, `done` committed, and then published a SECOND time (the harness requires the count, not just the phrase) |
+| PASS | working tree | accept sentinel | none | the accepted CONNECT's fact and record are both on a real R3 `$MQTT_sess` at the moment its batch is acknowledged, and the acknowledged sequence names the record |
+| FAIL | working tree | accept sentinel | `m-accept-split-write`, requiring `ACCEPT-BATCH-TORN` | splitting the one batch into two independent conditional writes and suppressing the second leaves the fact durable without its record, while the caller is handed an acknowledgement it cannot tell from a commit |
 
-Rows run in that order, and the two bridge rows run last because they copy the working
-tree rather than a dependency checkout.
+Rows run in that order, and the four working-tree rows run last because they copy the
+working tree rather than a dependency checkout.
+
+The R-batch fixture is selected by its ROW (`--fixture`), not by the version being
+run: it is a pinned-only fixture, and choosing it from a version comparison would be
+the rollout-shaped branching this repository's compatibility boundary forbids. Markers
+are scored on PASS rows as well as FAIL rows, because the clean R-batch row's contract
+is as much "nothing was stored" as "the prefix was buffered", and a PASS accepted
+without reading the markers enforces neither.
 
 One mutation exists but is NOT a matrix row, because it does not discriminate what its
 name suggests, and the measurement is worth keeping:

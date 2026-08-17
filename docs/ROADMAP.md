@@ -437,6 +437,42 @@ but each still needs its own consequence audit.
   designing edits that disable consensus safety checks. So the honest options are a
   narrower question that source inspection shows is specific to `ProposeMulti`, or a
   written refutation carrying the four routes above. Do not open it by re-proving Raft.
+  **PROVED, 2026-08-17 — the four Raft-layer facts hold and the consequence drawn from
+  them is FALSE.** Batch identity is not preserved at Raft and does not need to be: it
+  is carried in the stream ENTRY ENCODING and enforced at APPLY. A committed non-commit
+  member is counted and its entry buffered in memory, never stored; only a gap-free
+  `batchCommitMsgOp` replays the members into the store, under one `mset.mu` hold. **A
+  FIFO prefix split therefore applies NOTHING** — fact-without-record is not producible
+  after all. Measured, not argued: `TestJetStreamAcceptBatchPrefixStoresNothing` (a thin
+  delta over upstream's own R3 `ProposeMulti` prefix + `StepDown` shape, asserting on
+  every replica what upstream never looks at — the target subject), mutation
+  `m-batch-apply-eager`, the unmutated `^TestJetStreamAtomicBatchPublish` pin, and the
+  bridge sentinel `TestMQTTAcceptBatchReplicatedIndivisible` with `m-accept-split-write`
+  over a real R3 `$MQTT_sess`. Two limits are stated rather than glossed: the guarantee
+  is a HISTORICAL COMMITMENT at the moment of the write (the record subject is a
+  `MaxMsgsPer: 1` register, so a later legitimate save replaces what the batch
+  committed), and a hard kill between two members' store writes CAN leave partial
+  durable residue that recovery converges — never "no residue exists". No Raft edit and
+  no consensus-safety check disabled; the term guard is inherited by citation, since
+  `ProposeMulti`'s is verbatim `proposeLocked`'s.
+  **STILL OPEN — the consequence this item owns.** The authored-record fork machinery
+  was retained on exactly the gap just closed, so this bullet does not tick until that
+  is settled. The predicate `found.PWID == ackPWID && found.WID != ackWID` proves two
+  record BODIES claim one parent, never that two CAS applications off one base both
+  landed — a restore, a stream recreation, an administrative write or a replay produces
+  the first without the second. The remaining work is the obligation audit, per
+  BEHAVIORAL CONTEXT (not per call site: `classifyAttemptReadback` serves two readbacks,
+  and `resolveContendedRecordSave` and `disposalForDirectRejection` each serve two
+  paths), asking whether any supported writer, ambiguity path, deletion, recreation,
+  restore, replay or administrative input can make that site observe the COMPLETE
+  predicate. Three exits and only these: unreachable everywhere → delete the classifier
+  and repair machinery, with the concessions restated in `docs/CONFORMANCE.md`;
+  reachable anywhere → this item owns the fix and the machinery stays; unsettled → the
+  item stays open with the truthful rationale. The deletion manifest is an OUTPUT of the
+  audit, and it is not a file removal: `adoptRecordLineageLocked` is retained but calls
+  `adoptGrantBodyLocked` in `sess_fork_repair.go`, the grant-body rotation is entangled
+  with five external call sites, and most of the disposal vocabulary serves ordinary
+  takeover.
 - [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
   **Consequence audit, not a lineage design.** F-030's evidence bears on the shared
   premise for this stream too, so the question left is this stream's OWN: whether any

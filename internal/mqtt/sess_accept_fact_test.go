@@ -713,3 +713,104 @@ func TestAcceptBatchAckMustNameThisBatch(t *testing.T) {
 		t.Fatal("a nil acknowledgement must read as empty, never panic")
 	}
 }
+
+// TestAcceptStoreObserverSeesBothMoments pins the accepted-CONNECT store observation
+// seam's own contract, on a real store: it fires once before the batch is issued and
+// once after the acknowledgement has been bound to that batch, both moments describe
+// the SAME attempt, only the second carries a sequence, and an observer that refuses a
+// moment fails the store rather than merely being told about it.
+//
+// The seam exists for TestMQTTAcceptBatchReplicatedIndivisible, which has to read both
+// subjects back at the store boundary and compare them against what went out. The
+// (sess, resp, err) result hook cannot carry that: it has neither subject nor digest,
+// and it fires only after storeAcceptBatch has returned.
+func TestAcceptStoreObserverSeesBothMoments(t *testing.T) {
+	a, _ := testNewTeardownEnv(t)
+	const cid = "accept-obs"
+	sess := testProvisionSession(t, a, cid)
+
+	// The record's CURRENT sequence is re-read for every attempt: a refused attempt
+	// does not prove the subject stayed where it was.
+	compose := func() (mqttBatchMsg, mqttBatchMsg, string) {
+		t.Helper()
+		fact := &mqttAcceptFact{ClientID: cid, SessEpoch: a.asm.sessStreamEpoch,
+			AcceptID: mqttNewAcceptID(), At: time.Now().UnixNano()}
+		body, err := json.Marshal(fact)
+		if err != nil {
+			t.Fatalf("marshal the fact: %v", err)
+		}
+		subj := mqttAcceptSubject(a.asm.domainTk, sess.idHash, fact.SessEpoch, fact.AcceptID)
+		smsg, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
+		if lerr != nil {
+			t.Fatalf("read the record's current sequence: %v", lerr)
+		}
+		return mqttComposeAcceptBatch(subj, body, a.asm.domainTk, sess.idHash,
+			smsg.Sequence, []byte(`{"r":1}`))
+	}
+
+	var seen []mqttAcceptStoreObs
+	restore := a.asm.jsa.setAcceptStoreObserver(func(o mqttAcceptStoreObs) error {
+		seen = append(seen, o)
+		return nil
+	})
+	fm, rm, id := compose()
+	resp, err := a.asm.jsa.storeAcceptBatch(a.asm.domainTk, sess.idHash, id, fm, rm)
+	restore()
+	if err != nil {
+		t.Fatalf("the acceptance batch must commit: %v", err)
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("the seam must fire exactly twice for one batch, got %d", len(seen))
+	}
+	if seen[0].Phase != mqttAcceptStoreIssuing || seen[1].Phase != mqttAcceptStoreAcked {
+		t.Fatalf("the moments must be issuing then acked, got %d then %d",
+			seen[0].Phase, seen[1].Phase)
+	}
+	for i, o := range seen {
+		if o.BatchID != id || o.FactSubj != fm.subj || o.RecSubj != rm.subj {
+			t.Fatalf("moment %d does not describe this attempt: batch %q, fact %q, record %q",
+				i, o.BatchID, o.FactSubj, o.RecSubj)
+		}
+		if o.FactDigest != mqttRecordDigest(fm.msg[fm.hdr:]) ||
+			o.RecDigest != mqttRecordDigest(rm.msg[rm.hdr:]) {
+			t.Fatalf("moment %d does not carry the digests of the bodies that went out", i)
+		}
+	}
+	// Only the acknowledged moment has a sequence, and it is the SESSION RECORD's —
+	// which is the whole reason the phase is part of the contract.
+	if seen[0].Seq != 0 {
+		t.Fatalf("the pre-issue moment cannot name a sequence, got %d", seen[0].Seq)
+	}
+	if seen[1].Seq != resp.Sequence {
+		t.Fatalf("the acknowledged moment must carry the record's sequence %d, got %d",
+			resp.Sequence, seen[1].Seq)
+	}
+
+	// A refusal at the pre-issue moment fails the store AND leaves the subject where it
+	// was: an interception point, not a notification.
+	before, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
+	if lerr != nil {
+		t.Fatalf("read the record before the refused attempt: %v", lerr)
+	}
+	restore = a.asm.jsa.setAcceptStoreObserver(func(o mqttAcceptStoreObs) error {
+		if o.Phase == mqttAcceptStoreIssuing {
+			return fmt.Errorf("refused before the batch was issued")
+		}
+		return nil
+	})
+	defer restore()
+	fm, rm, id = compose()
+	if _, err := a.asm.jsa.storeAcceptBatch(a.asm.domainTk, sess.idHash, id, fm, rm); err == nil ||
+		!strings.Contains(err.Error(), "refused before the batch was issued") {
+		t.Fatalf("a refusal at the pre-issue moment must fail the store, got: %v", err)
+	}
+	after, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
+	if lerr != nil {
+		t.Fatalf("read the record after the refused attempt: %v", lerr)
+	}
+	if after.Sequence != before.Sequence {
+		t.Fatalf("the refused attempt must not have written anything: the record moved "+
+			"from %d to %d", before.Sequence, after.Sequence)
+	}
+}

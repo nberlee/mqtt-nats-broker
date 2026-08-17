@@ -1254,6 +1254,17 @@ type mqttJSA struct {
 	// subsBarrier lets QoS 1/2 message stores wait out any SUBSCRIBE that is
 	// still being processed in this account. See mqttSubsBarrier.
 	subsBarrier mqttSubsBarrier
+
+	// acceptObs is the accepted-CONNECT store observation seam. nil in production;
+	// a test arms it to observe the acceptance batch AT the store boundary, which is
+	// the only place the pair's indivisibility is a fact about this write rather than
+	// an invariant over time — the session record's subject is a MaxMsgsPer:1
+	// register, so a later legitimate save replaces what the batch committed.
+	//
+	// Scoped to the account's JetStream assistant rather than to the package, because
+	// the sentinel that arms it runs several brokers in one process and must observe
+	// exactly one of them. See mqttAcceptStoreObs.
+	acceptObs atomic.Pointer[func(mqttAcceptStoreObs) error]
 }
 
 // mqttSubsBarrier prevents a PUBLISH from racing a concurrent SUBSCRIBE into
@@ -4756,6 +4767,11 @@ func (jsa *mqttJSA) storeAcceptBatch(domainTk, cidHash, batchID string, fact, re
 	if mqttTestSessStoreSuppressV.Load() {
 		return nil, errors.New("mqtt test: session record store suppressed")
 	}
+	// The observation seam, armed only by the sentinel that proves this pair is
+	// indivisible over a real replicated stream. Inert and free when unarmed.
+	if oerr := jsa.observeAcceptStore(mqttAcceptStoreIssuing, batchID, fact, record, 0); oerr != nil {
+		return nil, oerr
+	}
 	bi, err := jsa.newAtomicBatchRequest(mqttJSASessPersist, cidHash, []mqttBatchMsg{fact, record})
 	if err != nil {
 		return nil, err
@@ -4778,6 +4794,12 @@ func (jsa *mqttJSA) storeAcceptBatch(domainTk, cidHash, batchID string, fact, re
 	}
 	if smr.Stream != mqttSessStreamName {
 		return smr, fmt.Errorf("the acceptance batch was acknowledged on stream %q (want %q)", smr.Stream, mqttSessStreamName)
+	}
+	// Fired only once the acknowledgement has been validated as THIS batch's, so the
+	// sequence handed to an observer is the one the session is about to adopt and not
+	// merely the one that came back.
+	if oerr := jsa.observeAcceptStore(mqttAcceptStoreAcked, batchID, fact, record, smr.Sequence); oerr != nil {
+		return smr, oerr
 	}
 	return smr, nil
 }

@@ -82,6 +82,28 @@ the "no fallbacks" stance reviewable rather than implicit.
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
   every rejection is resolved by re-reading rather than classified directly.
+- **An atomic batch is indivisible at APPLY, not at Raft** (`AllowAtomicPublish`).
+  Raft preserves nothing about a batch: `ProposeMulti` pushes the entries
+  individually, `runAsLeader` pops whatever prefix exists, and each regrouped batch
+  rechecks leadership on its own — so a committed FIFO prefix without its commit
+  entry is a real outcome. It applies **nothing**. Batch identity is carried in the
+  stream entry encoding instead (`encodeStreamMsgAllowCompressAndBatch` stamps every
+  entry with its batch id and sequence and marks the last one a commit op), and
+  `applyStreamEntries` enforces it: a committed non-commit member is counted and its
+  entry buffered in memory, never stored, and only a gap-free commit op replays every
+  buffered member into the store under a single `mset.mu` hold. An abandoned prefix is
+  accounted for through `clfs` and stores nothing on any replica. That is what makes
+  the accepted-CONNECT pair below indivisible, and it is **measured** rather than
+  argued: `test/depproof/`'s R-batch row, its `m-batch-apply-eager` mutation, and a
+  bridge sentinel over a real R3 `$MQTT_sess`.
+
+  Two limits belong with it. The guarantee is a **historical commitment at the moment
+  of the write**, not an invariant over time — the session-record subject is a
+  `MaxMsgsPer: 1` register, so a later legitimate save replaces what the batch
+  committed. And a hard kill *between* two members' store writes **can** leave partial
+  durable residue on a replica: each member goes separately to `StoreRawMsg`. Recovery
+  skips the stored members and applies the remainder, so the post-recovery state is the
+  whole batch — convergence, not the absence of residue.
 - **`MaxMsgsPer: 1`** turns a subject into a single-slot register: a new record
   evicts the old one, so a stream sequence names a record, never a subject.
 - **Every store receives a fresh sequence, assigned before the proposal and applied
@@ -155,7 +177,7 @@ per-owner:
 
 | Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
 |---|---|---|---|
-| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker** (see "The session-record watch"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's | **exactly two subjects** — `$MQTT.sess.<domainTk>>` and `$MQTT.accept.<domainTk>>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch carries `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted); **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker** (see "The session-record watch"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's | **exactly two subjects** — `$MQTT.sess.<domainTk>>` and `$MQTT.accept.<domainTk>>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch carries `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the fact and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted); **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
 | `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's two-subject set and its atomic-publish requirement, neither of which applies |
 | `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources`; plus the **adopted `$MQTT_sess` incarnation epoch** in `Metadata`, required to match this account's (unrelated keys accepted): an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | **`DenyDelete`/`DenyPurge`** and `SubjectDeleteMarkerTTL` (no operation deletes or purges — a fence is permanent by design, so no delete marker can ever be created); `MaxConsumers`/`ConsumerLimits` (no consumers). Both denial waivers are load-bearing here, since reaping a fence would unfence a generation whose resources are already deleted |
 | `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
@@ -277,6 +299,18 @@ Two refinements keep the guarantee tight:
   creates. The batch removes the interval **between the two writes**: the fact and the
   record commit together or neither exists, so a fact exists only where a session
   record committed — only where a takeover really did occur.
+
+  That indivisibility is measured, not assumed. The apply-layer contract it rests on is
+  stated under "JetStream behaviors this design depends on"; the accepted CONNECT's own
+  use of it is asserted at the store boundary by
+  `TestMQTTAcceptBatchReplicatedIndivisible`, over a real R3 `$MQTT_sess`, and killed by
+  a mutation that splits the batch into two independent conditional writes and
+  suppresses the second. The assertion is made at that boundary rather than later
+  because it is a claim about **this write**: the record subject is a `MaxMsgsPer: 1`
+  register, and a repair save, a lifetime grant or a SUBSCRIBE legitimately replaces the
+  record the batch committed while the fact — which is permanent — stays. So
+  `mqttAcceptFactLanded` means "the batch committed and the record committed with it",
+  never "the record the fact was committed beside is still the one on the subject".
 
   What atomicity does **not** do is make the fact conditional on the CONNECT
   *succeeding*. The batch commits before consumer reconciliation, the lifetime grant and

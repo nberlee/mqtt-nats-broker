@@ -35,6 +35,7 @@
 package mqtt
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -419,6 +420,84 @@ func mqttComposeAcceptBatch(factSubj string, factBody []byte, domainTk, cidHash 
 	return mqttBatchMsg{subj: factSubj, hdr: fh, msg: fb},
 		mqttBatchMsg{subj: mqttSessSubject(domainTk, cidHash), hdr: rh, msg: rb},
 		batchID
+}
+
+// mqttAcceptStorePhase names the moment at which the accepted-CONNECT store
+// observation seam fires.
+//
+// There are two, and the distinction is not decoration: only the second one has an
+// acknowledgement, so only it can name the sequence the session is about to adopt,
+// and only the first one precedes the write it describes. A single-moment seam could
+// express neither half of "these exact bodies went out, and this exact sequence came
+// back naming the record among them".
+//
+// The type is open on purpose. A test may declare a further phase and fire it from a
+// deliberately broken store path, which is how the counterfactual this seam exists to
+// exclude — an independently acknowledged fact write followed by a suppressed record
+// write — is reachable at all. Production fires only the two below.
+type mqttAcceptStorePhase uint8
+
+const (
+	// mqttAcceptStoreIssuing: the batch is composed and nothing has been sent.
+	mqttAcceptStoreIssuing mqttAcceptStorePhase = iota
+	// mqttAcceptStoreAcked: the commit's acknowledgement has been validated as this
+	// batch's, so Seq names the SESSION RECORD.
+	mqttAcceptStoreAcked
+)
+
+// mqttAcceptStoreObs is what the seam carries. Digests rather than bodies, because
+// what an observer has to settle is identity — that the thing on the subject is what
+// THIS attempt wrote — and a body would invite comparing something else.
+type mqttAcceptStoreObs struct {
+	Phase      mqttAcceptStorePhase
+	FactSubj   string
+	FactDigest [sha256.Size]byte
+	RecSubj    string
+	RecDigest  [sha256.Size]byte
+	BatchID    string
+	// Seq is the acknowledged SESSION RECORD sequence, and is zero before the ack.
+	Seq uint64
+}
+
+// setAcceptStoreObserver installs (or, with nil, clears) this account's
+// accepted-CONNECT store observer and returns a function restoring the previous one.
+//
+// An observer returning a non-nil error fails the store from the caller's point of
+// view, which is what makes a phase an interception point and not only a notification.
+func (jsa *mqttJSA) setAcceptStoreObserver(h func(mqttAcceptStoreObs) error) func() {
+	prev := jsa.acceptObs.Load()
+	if h == nil {
+		jsa.acceptObs.Store(nil)
+	} else {
+		jsa.acceptObs.Store(&h)
+	}
+	return func() { jsa.acceptObs.Store(prev) }
+}
+
+// observeAcceptStore fires the seam for one phase, and builds the observation only
+// once there is somebody to receive it. The digests are the reason: an accepted
+// CONNECT would otherwise pay for two SHA-256 hashes it never uses, on the connection
+// path, so that a test could exist.
+//
+// Building it here rather than at the call site is also what makes both moments
+// describe the same bytes by construction — they are derived from the messages
+// actually being sent, not from a struct assembled earlier and carried along.
+func (jsa *mqttJSA) observeAcceptStore(phase mqttAcceptStorePhase, batchID string,
+	fact, record mqttBatchMsg, seq uint64) error {
+
+	h := jsa.acceptObs.Load()
+	if h == nil {
+		return nil
+	}
+	return (*h)(mqttAcceptStoreObs{
+		Phase:      phase,
+		FactSubj:   fact.subj,
+		FactDigest: mqttRecordDigest(fact.msg[fact.hdr:]),
+		RecSubj:    record.subj,
+		RecDigest:  mqttRecordDigest(record.msg[record.hdr:]),
+		BatchID:    batchID,
+		Seq:        seq,
+	})
 }
 
 // mqttAcceptFactReadback is what a read of an attempt's OWN acceptance-fact subject

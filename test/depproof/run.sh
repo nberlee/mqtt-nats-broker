@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Dependency canary for F-030: run the repository-owned JetStream route regressions
-# inside an isolated nats-server checkout.
+# Dependency canary: run the repository-owned JetStream write-contract regressions
+# inside an isolated nats-server checkout. Two questions -- the Will outbox's terminal
+# state (F-030) and the accepted-CONNECT atomic batch -- answered the same way.
 #
 # The fixtures live in testdata/ because they are package `server` files: they cannot
 # compile inside this module, and the Go tool never builds a directory called
@@ -11,8 +12,9 @@
 #   ./run.sh --version v2.14.3  # one other version, unmutated
 #   ./run.sh --mutation m-term-guard
 #   ./run.sh --run <regexp> --require <marker> --forbid <marker> --mutation <name> ...
+#   ./run.sh --run <regexp> --fixture acceptbatch_partial_test.go
 #   ./run.sh --matrix           # every row of the evidence table in README.md
-#   ./run.sh --bridge           # the bridge sentinel and its own mutation
+#   ./run.sh --bridge           # the bridge sentinels and their own mutations
 #
 # A mutation run is EXPECTED TO FAIL: that is what makes the paired assertion
 # evidence rather than decoration. --matrix asserts the direction of every row and
@@ -70,6 +72,12 @@ checkout() {
 # install_fixtures copies the shared scenario plus the adapter this checkout's
 # proposal signature calls for. The choice is made from the source, not from a
 # version comparison, so a backport or a rename is picked up by what the code says.
+#
+# It prints the adapter name and NOTHING else: one_run captures that as the label it
+# reports. A fixture that only some rows want is installed by one_run instead (see
+# --fixture), because selecting it here would mean asking which version is running --
+# exactly the rollout-shaped branching this repository's compatibility boundary
+# forbids, and it would also have to be kept out of this function's stdout.
 install_fixtures() {
   local tree=$1
   cp "$fixtures/willq_terminal_routes_test.go" "$tree/server/" || die "copy failed"
@@ -171,6 +179,39 @@ apply_mutation() {
         '	} else if willqWaitStore(mset.srv.Name()); false {
 	} else if err := mset.store.StoreRawMsg(subj, hdr, msg, seq, ts, ttl, false); err != nil {'
       ;;
+    m-batch-apply-eager)
+      # The apply-layer mechanism the accepted-CONNECT batch's indivisibility rests on:
+      # a committed member of a batch is BUFFERED until its commit entry arrives, and
+      # only a gap-free commit replays the members into the store. This applies each
+      # member the moment it is committed instead.
+      #
+      # Written as an ADDED eager side effect rather than as a removal of the retention
+      # at the end of applyStreamEntries: dropping the retention would leave the members
+      # unstored, and the fixture's negative assertion would hold for the wrong reason
+      # and score the mutant a survivor.
+      #
+      # batch.mu is released across the apply and retaken afterwards, because
+      # applyStreamMsgOp is called with needLock and takes mset.mu -- the stream lock is
+      # acquired BEFORE the batch lock everywhere else in this function, and holding
+      # batch.mu across it would invert that order.
+      edit "$tree/server/jetstream_cluster.go" 1 \
+        '				// If the sequence is not monotonically increasing/we identify gaps, the batch can'"'"'t be accepted.' \
+        '				// depproof m-batch-apply-eager: apply the member as it is committed.
+				if batchSeq == batch.count {
+					_, _, eop, ebuf, eerr := decodeBatchMsg(buf[1:])
+					if eerr != nil {
+						panic(eerr.Error())
+					}
+					batch.mu.Unlock()
+					eerr = js.applyStreamMsgOp(mset, eop, ebuf, isRecovering, true)
+					batch.mu.Lock()
+					if eerr != nil {
+						batch.mu.Unlock()
+						return 0, eerr
+					}
+				}
+				// If the sequence is not monotonically increasing/we identify gaps, the batch can'"'"'t be accepted.'
+      ;;
     m-behind-campaign)
       # The two refusals that keep a node behind on applies from taking leadership.
       edit "$tree/server/raft.go" 1 \
@@ -188,9 +229,14 @@ apply_mutation() {
 revert() {
   local tree=$1 dirty
   git -C "$tree" checkout -- server/ 2>/dev/null
+  # Every fixture this harness can install, unconditionally -- including the ones only
+  # some rows ask for. A row-selected fixture left behind would compile into the NEXT
+  # row's run, which is the same class of cross-row contamination the mutation check
+  # below exists to catch.
   rm -f "$tree/server/willq_terminal_routes_test.go" \
     "$tree/server/willq_adapter_term_test.go" \
-    "$tree/server/willq_adapter_noterm_test.go"
+    "$tree/server/willq_adapter_noterm_test.go" \
+    "$tree/server/acceptbatch_partial_test.go"
   dirty=$(git -C "$tree" status --porcelain 2>&1) \
     || die "cannot read the checkout at $tree: $dirty"
   [ -z "$dirty" ] || die "the checkout at $tree is not clean after revert, so the next
@@ -203,7 +249,7 @@ $dirty"
 one_run() {
   local version=$1 tests=$2; shift 2
   local tree adapter log outcome args=()
-  local -a want_markers=() deny_markers=()
+  local -a want_markers=() deny_markers=() extra_fixtures=()
   # A row states the EXACT outcome it claims, as markers the fixture prints:
   #   @NAME  the log must carry it for a FAIL to count
   #   !NAME  the log must NOT carry it
@@ -211,10 +257,12 @@ one_run() {
   # still holds has to show that the other guard's failure did NOT also occur --
   # otherwise the row scores its expected FAIL either way, and the table would assert a
   # redundancy the run never demonstrated.
+  #   +FILE  a fixture this row needs on top of the shared ones
   for a in "$@"; do
     case $a in
       @*) want_markers+=("${a#@}") ;;
       !*) deny_markers+=("${a#!}") ;;
+      +*) extra_fixtures+=("${a#+}") ;;
       *) args+=("$a") ;;
     esac
   done
@@ -222,6 +270,10 @@ one_run() {
   tree=$(checkout "$version") || exit 2
   revert "$tree"
   adapter=$(install_fixtures "$tree") || exit 2
+  for f in ${extra_fixtures[@]+"${extra_fixtures[@]}"}; do
+    [ -f "$fixtures/$f" ] || die "no such fixture: $f"
+    cp "$fixtures/$f" "$tree/server/" || die "copy failed"
+  done
   for m in "$@"; do apply_mutation "$tree" "$m"; done
   # The log name carries the test filter as well as the mutations: two rows can
   # apply the SAME mutation to different tests, and a shared name would make the two
@@ -243,15 +295,6 @@ one_run() {
       outcome=BROKEN
     elif ! grep -E '^\s*--- FAIL: ' "$log" | grep -qE "FAIL: ${tests#^}"; then
       outcome=OFFTARGET
-    else
-      for m in ${want_markers[@]+"${want_markers[@]}"}; do
-        grep -qF "$m" "$log" || { outcome=OFFTARGET; break; }
-      done
-      if [ "$outcome" = FAIL ]; then
-        for m in ${deny_markers[@]+"${deny_markers[@]}"}; do
-          if grep -qF "$m" "$log"; then outcome=OFFTARGET; break; fi
-        done
-      fi
     fi
   fi
 
@@ -264,6 +307,23 @@ one_run() {
     elif ! grep -qE '^\s*--- PASS: ' "$log"; then
       outcome=BROKEN
     fi
+  fi
+
+  # Markers are scored on BOTH directions, because they state what the run OBSERVED and
+  # that is a claim about a passing row as much as a failing one. A clean row whose
+  # whole contract is "the prefix was buffered AND nothing was stored" is unenforced if
+  # a PASS is accepted without reading them: the required marker would go unchecked if
+  # the observation never happened, and the forbidden one would go unchecked if it did.
+  # BROKEN and OFFTARGET are left alone -- there is no run to make a claim about.
+  if [ "$outcome" = PASS ] || [ "$outcome" = FAIL ]; then
+    for m in ${want_markers[@]+"${want_markers[@]}"}; do
+      grep -qF "$m" "$log" || { outcome=OFFTARGET; break; }
+    done
+  fi
+  if [ "$outcome" = PASS ] || [ "$outcome" = FAIL ]; then
+    for m in ${deny_markers[@]+"${deny_markers[@]}"}; do
+      if grep -qF "$m" "$log"; then outcome=OFFTARGET; break; fi
+    done
   fi
   echo "$outcome $version [$adapter] ${*:-no-mutation} -> $log"
 }
@@ -283,15 +343,25 @@ one_run() {
 bridge_test='^TestMQTTWillOutboxReplicatedTerminalDoneStands$'
 bridge_file=internal/mqtt/will_terminal_cluster_test.go
 
-# bridge_run copies the working tree, optionally applies the unconditional-store
-# mutation, runs the sentinel and prints one scored line.
-bridge_run() {
-  local mutate=$1 dest="$work/bridge" log outcome
+accept_test='^TestMQTTAcceptBatchReplicatedIndivisible$'
+accept_file=internal/mqtt/accept_batch_cluster_test.go
+
+# copy_working_tree materializes the working tree (tracked plus untracked, ignored
+# files excluded) at $1, replacing whatever is there.
+copy_working_tree() {
+  local dest=$1
   rm -rf "$dest"
   mkdir -p "$dest" || die "cannot create $dest"
   ( cd "$repo_root" && git ls-files --cached --others --exclude-standard -z \
       | tar --null -T - -cf - ) | tar -C "$dest" -xf - \
     || die "could not copy the working tree"
+}
+
+# bridge_run copies the working tree, optionally applies the unconditional-store
+# mutation, runs the sentinel and prints one scored line.
+bridge_run() {
+  local mutate=$1 dest="$work/bridge" log outcome
+  copy_working_tree "$dest"
 
   if [ "$mutate" = mutate ]; then
     # Exactly the substitution the sentinel's own comment names: the conditional
@@ -351,6 +421,120 @@ bridge_matrix() {
   echo "depproof: both bridge-sentinel rows matched the evidence table"
 }
 
+# ---------------------------------------------------------------------------
+# The accepted-CONNECT batch sentinel and its own mutation.
+#
+# m-accept-split-write replaces the one atomic batch with the two independent
+# conditional writes the bridge claims it does NOT make: the acceptance fact is
+# acknowledged on its own, the session record write is then suppressed through the
+# sentinel's counterfactual phase, and the caller is handed an acknowledgement it
+# cannot tell from a real commit. Both messages already carry their own per-subject
+# CAS, so removing the batch headers is the whole difference.
+#
+# The mutation must produce a TORN PAIR specifically. A CONNECT that merely failed, or
+# a cluster that never formed, is not evidence about indivisibility, so the row is
+# scored on the sentinel marker rather than on any failure.
+# ---------------------------------------------------------------------------
+
+accept_run() {
+  local mutate=$1 dest="$work/accept" log outcome
+  copy_working_tree "$dest"
+
+  if [ "$mutate" = mutate ]; then
+    # The two messages stop being members of a batch...
+    edit "$dest/internal/mqtt/sess_accept_fact.go" 1 \
+      '	fb, fh := mqttFrameBatchWrite(0, factBody, batchID, 1, false)' \
+      '	fb, fh := mqttFrameBatchWrite(0, factBody, _EMPTY_, 1, false)'
+    edit "$dest/internal/mqtt/sess_accept_fact.go" 1 \
+      '	rb, rh := mqttFrameBatchWrite(baseSeq, recBody, batchID, 2, true)' \
+      '	rb, rh := mqttFrameBatchWrite(baseSeq, recBody, _EMPTY_, 2, true)'
+    # ... and the store issues them one after the other instead of committing them
+    # together. The helper is inserted into the sentinel file, where the
+    # counterfactual sits next to the assertion it must break.
+    edit "$dest/internal/mqtt/mqtt.go" 1 \
+      '	bi, err := jsa.newAtomicBatchRequest(mqttJSASessPersist, cidHash, []mqttBatchMsg{fact, record})' \
+      '	bi, err := jsa.storeAcceptSplit(cidHash, batchID, fact, record)'
+    edit "$dest/$accept_file" 1 \
+      '// MUTATION ANCHOR: test/depproof/run.sh inserts the m-accept-split-write helper here' \
+      'func (jsa *mqttJSA) storeAcceptSplit(cidHash, batchID string, fact, record mqttBatchMsg) (any, error) {
+	fi, err := jsa.newRequestEx(mqttJSASessPersist, fact.subj, cidHash, fact.hdr, fact.msg)
+	if err != nil {
+		return nil, err
+	}
+	resp, _ := fi.(*JSPubAckResponse)
+	if resp == nil || resp.PubAck == nil {
+		return resp, fmt.Errorf("m-accept-split-write: the fact write was not acknowledged")
+	}
+	if aerr := resp.ToError(); aerr != nil {
+		return resp, aerr
+	}
+	if oerr := jsa.observeAcceptStore(mqttAcceptStoreSplitRecordPending, batchID, fact, record, resp.Sequence); oerr == nil {
+		ri, rerr := jsa.newRequestEx(mqttJSASessPersist, record.subj, cidHash, record.hdr, record.msg)
+		if rerr != nil {
+			return nil, rerr
+		}
+		rr, _ := ri.(*JSPubAckResponse)
+		if rr == nil || rr.PubAck == nil {
+			return rr, fmt.Errorf("m-accept-split-write: the record write was not acknowledged")
+		}
+		if aerr := rr.ToError(); aerr != nil {
+			return rr, aerr
+		}
+		resp = rr
+	}
+	// Presented as an acknowledgement of the batch, so the acceptance-batch validation
+	// cannot tell two writes from one commit.
+	resp.BatchId, resp.BatchSize, resp.Stream = batchID, mqttAcceptBatchSize, mqttSessStreamName
+	return resp, nil
+}
+
+// MUTATION ANCHOR: test/depproof/run.sh inserts the m-accept-split-write helper here'
+  fi
+
+  log="$work/log-accept-${mutate}.txt"
+  ( cd "$dest" && go test -tags mqttport_fulltests -count=1 -run "$accept_test" \
+      ./internal/mqtt/ -v ) > "$log" 2>&1 && outcome=PASS || outcome=FAIL
+
+  if [ "$outcome" = FAIL ]; then
+    if grep -qE '\[build failed\]|^# ' "$log"; then
+      outcome=BROKEN
+    elif ! grep -qE '^\s*--- FAIL: TestMQTTAcceptBatchReplicatedIndivisible' "$log"; then
+      outcome=OFFTARGET
+    elif [ "$mutate" = mutate ] && ! grep -qF 'ACCEPT-BATCH-TORN' "$log"; then
+      # The kill has to be the TORN PAIR, not a refused CONNECT and not a broken
+      # cluster. Both of those fail the sentinel while saying nothing about whether
+      # the acceptance fact can outlive its session record.
+      outcome=OFFTARGET
+    fi
+  elif ! grep -qE '^\s*--- PASS: TestMQTTAcceptBatchReplicatedIndivisible' "$log"; then
+    outcome=BROKEN
+  elif grep -qF 'ACCEPT-BATCH-TORN' "$log"; then
+    # A clean row that printed the marker at all is not clean, whatever go test made
+    # of it: the marker is only ever written by an assertion that observed the tear.
+    outcome=OFFTARGET
+  fi
+  rm -rf "$dest"
+  echo "$outcome accept-sentinel ${mutate} -> $log"
+}
+
+accept_matrix() {
+  local failures=0 line want mode row
+  for row in "PASS clean" "FAIL mutate"; do
+    # shellcheck disable=SC2086
+    set -- $row
+    want=$1
+    mode=$2
+    line=$(accept_run "$mode") || exit 2
+    echo "$line"
+    case $line in
+      "$want "*) ;;
+      *) echo "  ^ expected $want"; failures=$((failures + 1)) ;;
+    esac
+  done
+  [ "$failures" -eq 0 ] || return 1
+  echo "depproof: both accept-sentinel rows matched the evidence table"
+}
+
 matrix() {
   local pinned failures=0 line
   pinned=$(pinned_version)
@@ -365,6 +549,19 @@ matrix() {
     "PASS $pinned ^TestJetStreamWillqNewLeaderCannotServeBeforeApplying m-premature-ready m-freeze-store"
     "FAIL $pinned ^TestJetStreamWillqNewLeaderCannotServeBeforeApplying @R-NEW-LED-BEHIND @R-NEW-SERVED-STALE @R-NEW-STALE-PROPOSAL m-behind-campaign m-premature-ready m-freeze-store"
     "PASS $control_version ^TestJetStreamWillq"
+
+    # The accepted-CONNECT batch: a committed prefix with no commit entry applies
+    # nothing. The clean row forbids the stored marker as well as requiring the
+    # buffered one, so it cannot be satisfied by a run in which the prefix never
+    # arrived. The fixture is named by the ROW rather than chosen from the version,
+    # which keeps it off the control run without any version branching.
+    "PASS $pinned ^TestJetStreamAcceptBatchPrefixStoresNothing +acceptbatch_partial_test.go @ACCEPT-BATCH-PREFIX-BUFFERED !ACCEPT-BATCH-PREFIX-STORED"
+    "FAIL $pinned ^TestJetStreamAcceptBatchPrefixStoresNothing +acceptbatch_partial_test.go @ACCEPT-BATCH-PREFIX-STORED m-batch-apply-eager"
+
+    # The dependency's OWN batch contract, unmutated. Nothing here asserts it, and a
+    # bump that broke batch atomicity outright would otherwise leave the rows above
+    # measuring a mechanism that no longer exists -- which is the canary's stated job.
+    "PASS $pinned ^TestJetStreamAtomicBatchPublish"
   )
   for row in "${rows[@]}"; do
     # shellcheck disable=SC2086
@@ -378,8 +575,9 @@ matrix() {
     esac
   done
 
-  # The bridge sentinel and its own mutation, scored the same way.
+  # The bridge sentinels and their own mutations, scored the same way.
   bridge_matrix || failures=$((failures + 1))
+  accept_matrix || failures=$((failures + 1))
   if [ "$failures" -gt 0 ]; then
     echo "depproof: $failures row(s) did not match the evidence table" >&2
     return 1
@@ -395,11 +593,12 @@ mutations=()
 while [ $# -gt 0 ]; do
   case $1 in
     --matrix) matrix; exit $? ;;
-    --bridge) bridge_matrix; exit $? ;;
+    --bridge) rc=0; bridge_matrix || rc=1; accept_matrix || rc=1; exit $rc ;;
     --version) version=${2:?}; shift 2 ;;
     --mutation) mutations+=("${2:?}"); shift 2 ;;
     --require) mutations+=("@${2:?}"); shift 2 ;;
     --forbid) mutations+=("!${2:?}"); shift 2 ;;
+    --fixture) mutations+=("+${2:?}"); shift 2 ;;
     --run) tests=${2:?}; shift 2 ;;
     -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;

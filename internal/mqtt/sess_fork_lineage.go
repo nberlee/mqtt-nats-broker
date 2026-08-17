@@ -27,15 +27,25 @@
 // outlived the interval it named. A create is now parentless and concedes.
 //
 // What remains is the AUTHORED-RECORD fork — two CAS writes off a base this broker
-// actually held — and it stays for a stated reason rather than by default. F-030's
-// dependency inventory (test/depproof) proves the SINGLE-MESSAGE writer. Every accepted
-// CONNECT writes through an AllowAtomicPublish batch instead (storeAcceptBatch,
-// sess_accept_fact.go), and at the pinned v2.14.5 no Raft-level field preserves "these
-// entries came from one ProposeMulti": entries are pushed individually, popped as
-// whatever prefix exists, regrouped by size thresholds, and each group rechecks
-// leadership on its own. So the inventory genuinely does not reach the writer that
-// matters, and its refutation is written-only (test/depproof/README.md, R-batch). That
-// gap is its own docs/ROADMAP.md item.
+// actually held — and it stays for a stated reason rather than by default.
+//
+// The reason it used to state was an evidence gap in the accepted CONNECT's writer, and
+// that gap is CLOSED. Every Raft-level fact behind it holds — at the pinned v2.14.5 no
+// Raft-level field preserves "these entries came from one ProposeMulti": entries are
+// pushed individually, popped as whatever prefix exists, regrouped by size thresholds,
+// and each group rechecks leadership on its own — but the consequence drawn from them
+// was false. Batch identity lives in the stream entry encoding and is enforced at
+// apply, so a committed prefix with no commit entry applies NOTHING, and
+// storeAcceptBatch's fact and record commit together or not at all. Measured by
+// test/depproof (R-batch, mutation m-batch-apply-eager) and, for this broker's own use
+// of the batch, by TestMQTTAcceptBatchReplicatedIndivisible.
+//
+// What keeps this machinery is the NARROWER question that survives: the predicate below
+// proves two record BODIES claiming one parent, never that two CAS applications off one
+// base both landed. A restore, a stream recreation, an administrative write or a
+// replay can produce the first without the second. Whether any supported route can put
+// such a pair where a broker observes it is the open half of the same docs/ROADMAP.md
+// item, and this stands until that audit reports.
 //
 // Recognition here also covers an ambiguous acknowledgement, an out-of-band deletion and
 // a stream recreation — none of them proposal-ordering questions — for the same records.
