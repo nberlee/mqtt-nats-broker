@@ -8,6 +8,26 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Deleted the create side of the session write-lineage machinery, obligation by
+  obligation.** A session record write no longer inherits a parent identity when the
+  session holds no record: the record-absent watermark inheritance, the adopted teardown
+  marker's parent, `clear()`'s stamp of the record its claim held, and the accessor
+  fallback are all gone, along with the `$MQTT_origin` session-interval register and its
+  stream. The audit's finding is why: every route by which that inheritance produced a
+  forked verdict was already documented as a FALSE fork — an identity that outlived the
+  interval it named, reached by a replayed register, a stale watermark read, a regressed
+  teardown slot, a delayed proposal or an out-of-band deletion — and no route reached a
+  true verdict without them. What it concedes is the cross-term create pair, which now
+  answers 0x8E "session taken over" where it briefly answered 0x89; that is a stated
+  residual conditioned on evidence. The AUTHORED-RECORD fork — two writes off a base the
+  broker held — still classifies and is still repaired, because its retirement is
+  unproved on the atomic-batch writer every accepted CONNECT uses.
+
+  **First-release storage format:** an account still holding `$MQTT_origin` is REFUSED at
+  startup with delete guidance, rather than having the stream validated or ignored. Stop
+  every broker for the account and delete it. The broker now provisions nine `$MQTT_*`
+  streams.
+
 - **Retired two documented failure classes for delayed Wills** rather than building
   machinery against them: a claimant reclaim overwriting another's licensing decision,
   and one overwriting a committed `done` and republishing an already-published Will.
@@ -103,8 +123,8 @@ All notable changes to this project are documented here. The format is based on
 
   **First-release storage format:** an outbox record without an exact client identity
   or a legal decision shape, and a `$MQTT_sess` stream without a valid generated epoch,
-  are rejected with recreate guidance. Back up, restore or recreate `$MQTT_sess`,
-  `$MQTT_teardown` and `$MQTT_origin` as ONE unit with every broker for the account
+  are rejected with recreate guidance. Back up, restore or recreate `$MQTT_sess` and
+  `$MQTT_teardown` as ONE unit with every broker for the account
   stopped — and note that recreating `$MQTT_sess` discards every client's acceptance
   history with it, after which a delayed Will enqueued beforehand fires.
 - Project scaffold: Go module, config (`internal/config`), NATS/JetStream backend

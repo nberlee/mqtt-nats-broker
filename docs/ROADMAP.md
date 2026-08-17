@@ -181,7 +181,8 @@ but each still needs its own consequence audit.
   record field, with no runtime capability gate — and one became a restart /
   post-initialization-mutation split, whose recovery was also corrected to stop-all-and-
   recreate (the errors offer no in-place fix, and `$MQTT_sess` is coupled to
-  `$MQTT_teardown` and `$MQTT_origin`).
+  `$MQTT_teardown` — and, at the time, to `$MQTT_origin`, which the write-lineage audit
+  has since deleted).
 
   Three sites were not merely stale. Two had framing that **hid a live producer**, so the
   rewrites gain accuracy: the affine oversize backstop is reached because a QoS 1/2
@@ -254,7 +255,11 @@ but each still needs its own consequence audit.
   and the reversed "a broker old enough to have written X" phrasings, which describe
   fail-closed refusal rather than rollout support.
 
-- [x] **Cross-term create × create recognition** (F-029b). A create now descends from
+- [x] **Cross-term create × create recognition** (F-029b). **SUPERSEDED 2026-08-16 by
+  the write-lineage audit in §0.2, which deleted every source below**: a create is
+  parentless again and this pair concedes, stated as residual R-create in
+  `docs/CONFORMANCE.md`. The entry is kept for the mechanism it describes and the
+  refutations it records. A create USED TO descend from
   the record whose deletion emptied the subject, which is one rule with three sources
   rather than a new mechanism: the record `clear()`'s own claim held, the record an
   ADOPTED marker names in its `PWID`, and — the new one — the record the
@@ -276,7 +281,9 @@ but each still needs its own consequence audit.
   REQUESTED expiry 0. A refused teardown parks the discard on a still-resident session
   rather than abandoning it, and the classification reads the lineage pair captured at
   entry, because `clear()` zeroes it. `reMintedFrom` became `retiredBaseWID`: one field,
-  one fact, three sources.
+  one fact, three sources. **SUPERSEDED**: the write-lineage audit deleted
+  `retiredBaseWID` and all four create-parent sources; the rollback's real teardown, its
+  effective-lifetime branch and the parked discard are unaffected and remain in force.
   **What it does NOT close**: a record-absent create with no usable watermark still
   concedes, filed as the bullet below with its refuted cheap fix, and four routes on
   which a stale, regressed, delayed or out-of-band identity manufactures a FALSE FORK —
@@ -295,6 +302,12 @@ but each still needs its own consequence audit.
   POINTER and no parent CONTENT, so a create-parented fork is recognised and repaired by
   nothing, merging against an empty base being the union Slice C refuted.
 - [x] **A durable identity for an interval with no retirement history** (F-029b's R0).
+  **SUPERSEDED AND DELETED by the write-lineage audit** — the register, its stream, its
+  validator and every residual below it are gone, and `$MQTT_origin` is now refused at
+  startup. The entry is kept for the refutations it records, which still bind anything
+  proposing a durable interval identity again. Its closure was real and so was its cost:
+  R0c, the replayed-or-regressed identity, was a FALSE fork, which is the direction the
+  audit deleted the whole inheritance to remove.
   The **session-interval register** (`internal/mqtt/sess_origin_interval.go`): a new
   broker-owned stream `$MQTT_origin`, one single-slot register per client at
   `$MQTT.origin.<domainTk><hash>`. The
@@ -373,18 +386,57 @@ but each still needs its own consequence audit.
   retired for a conforming `$MQTT_willq`. Unconditional foreign writes introduced by
   post-start stream-configuration drift remain outside F-030. F-032 through F-034
   inherit the server contract and the canary, not a checkbox.
-- [ ] **Audit the session write-lineage machinery for deletion, obligation by
-  obligation.** Prescribed by F-030's evidence and deliberately NOT folded into it: it
-  touches `sess_fork_lineage.go`, `sess_fork_repair.go` and `sess_origin_interval.go`
-  (about 1,840 production lines) and would make one reviewable change into two
-  unrelated ones. **Now unblocked by F-030's closure**, but that does NOT retire
-  everything those mechanisms do: keep
-  whatever covers an ambiguous acknowledgement, an
-  out-of-band deletion, stream recreation, or retirement evidence, since none of those
-  is a proposal-ordering question. `RWID` in particular stays until F-036 and the
-  vanished-record vocabulary decide whether they need it. Each obligation is deleted
-  only with the test that proves the survivor still holds, and never on the strength of
-  the term proof alone.
+- [x] **Audit the session write-lineage machinery for deletion, obligation by
+  obligation.** Prescribed by F-030's evidence and deliberately NOT folded into it.
+  **DELETED: the whole CREATE side.** All four sources a create drew a parent from — the
+  record-absent watermark inheritance, the adopted marker's `PWID`, `clear()`'s stamp,
+  and `parentForNextWriteLocked`'s fallback — plus `sess.retiredBaseWID` and the
+  session-interval register with its stream, validator and epoch (`sess_origin_interval.go`,
+  495 lines). The finding that licensed it: **every route by which the inheritance
+  produced a verdict was documented in `docs/CONFORMANCE.md` as a FALSE fork** (R0c, R1,
+  R2, R3, R4), each needing an inherited identity that outlived the interval it named,
+  and there was no route on which it was reachable only by a true one. A create is now
+  parentless, which kills all five and concedes the cross-term create pair — the stated
+  residual R-create, pinned in both orientations and end to end on the wire.
+  **KEPT, each with its live obligation:** `classifyRecordLineage`, its five consult
+  sites, the disposal vocabulary and `sess_fork_repair.go`, because the AUTHORED-RECORD
+  fork's retirement is unproved on the writer every accepted CONNECT uses (the next
+  bullet); `WID`/`PWID` stamping at all three writers; `RWID`, now with **no reader**,
+  pinned until F-036 and the vanished-record vocabulary decide; the create arm's
+  corrupt-watermark REFUSAL, which is a separate obligation from the inheritance beside
+  it; and the independent sequence fail-safes. **`$MQTT_origin` is REFUSED at startup**,
+  not tolerated — a lookup-only preflight before the provisioning loop, since
+  `ensureBrokerStream` creates an absent stream before validating it. Nine provisioned
+  streams, down from ten. Six tests and five mutations (M1, M2, M5, M7, M9); no
+  obligation was deleted on the strength of the term proof alone.
+- [ ] **Prove or retire the accepted-CONNECT atomic-batch write path.** F-030's
+  dependency inventory (`test/depproof`) fixtures `$MQTT_willq`'s SINGLE-MESSAGE
+  conditional write. Every accepted CONNECT writes something else: `storeAcceptBatch`
+  commits the record and its permanent acceptance fact in ONE `AllowAtomicPublish` batch
+  (`sess_accept_fact.go`), and the inventory's R-batch row is a **written refutation
+  only** — `$MQTT_willq` never uses batches, so nothing exercises that shape.
+  **The finding, established from the pinned v2.14.5 source, is that the two writers are
+  genuinely not equivalent**: `ProposeMulti` pushes each entry separately
+  (`raft.go:964`), each push releasing the queue mutex and signalling independently;
+  `runAsLeader` pops whatever prefix currently exists and regroups by byte and entry
+  thresholds; each resulting group independently takes the lock and independently
+  rechecks leadership; and `storeToWAL` advances one Raft index per encoded append
+  entry. **No Raft-level field preserves "these entries came from one `ProposeMulti`"**,
+  so a two-entry batch can be divided across groups, WAL indexes and a leadership
+  transition in ways a single `Propose` cannot — a FIFO prefix split, so
+  fact-without-record is producible and record-without-fact is not. F-030's inventory
+  therefore does not reach this writer, and the authored-record fork machinery is
+  retained on exactly that gap.
+  **What this item must NOT become.** Answering it needs fixtures on the queued, popped
+  and WAL routes, which is where the multi-entry difference lives — and that is an
+  independent verification campaign for consensus fundamentals the maintainer has
+  already confirmed. A scoping attempt was trimmed to a single substitute row
+  (R-atomic-apply) and the substitute was refuted: the natural split is FIFO, so it
+  yields a fact-prefix and never the lone commit that would exercise the count guard.
+  Two rounds of that review also **failed on the provider side**, which refuses content
+  designing edits that disable consensus safety checks. So the honest options are a
+  narrower question that source inspection shows is specific to `ProposeMulti`, or a
+  written refutation carrying the four routes above. Do not open it by re-proving Raft.
 - [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
   **Consequence audit, not a lineage design.** F-030's evidence bears on the shared
   premise for this stream too, so the question left is this stream's OWN: whether any
@@ -431,10 +483,12 @@ but each still needs its own consequence audit.
   the LATER of the two should CONSIDER removing `RWID`** — the field, its validator row,
   and the valid arm of the record-absent create re-pointed at the session-interval
   register identity, which can serve it. The consideration is what is prescribed, not the
-  removal: `RWID` is free at its consult point today (the valid arm reads it out of a
-  load that arm already performs) while unifying adds a read to every reconnect after a
-  teardown, so the default is to keep it until the evidence is in. Deleting one field
-  with one reader is small then; re-adding a required field to a permanent record is not.
+  removal. **Updated by the write-lineage audit**: the create's valid arm no longer reads
+  `RWID` at all, and the session-interval register that sentence offered as the
+  alternative no longer exists, so the field now has **no reader** — this item and the
+  vanished-record one are the only candidates left. The default is still to keep it until
+  the evidence is in: deleting one unread field is small, and re-adding a required field
+  to a permanent record is not.
 - [ ] Make ephemeral-consumer cleanup guaranteed rather than best-effort. A failed
   manager initialization now rolls back both per-broker ephemeral consumers, including
   a create whose response was lost, so retries no longer ACCUMULATE them. What is left
@@ -631,7 +685,12 @@ finding with acceptance criteria.
   Verification: a two-broker regression holding one broker's barrier past a shortened
   lease (`mqttTestSubsBarrierHeldHookV` already provides the seam) and asserting the
   subscriber receives the Will exactly once.
-- [ ] Fix `TestMQTTOriginFirstEverCreateRaceReplicated`'s rejection-count assertion.
+- [x] Fix `TestMQTTOriginFirstEverCreateRaceReplicated`'s rejection-count assertion.
+  **RETIRED by deletion, not fixed.** The write-lineage audit deleted the
+  session-interval register and every test of it, this one included, so there is no
+  assertion left to correct. The diagnosis below is kept because it is a worked example
+  of a count assertion that is only correct for one concurrency, which is a shape that
+  recurs.
   **Investigation, but the reproduction and cause are already in hand.** The test
   requires `gotEstablishes >= 2` and then asserts `gotRejections != 1`
   (`sess_origin_interval_cluster_test.go:207`). When a retry produces a THIRD establish
@@ -729,10 +788,12 @@ project. Retain `mqtt-nats-bridge` only if continuity outweighs that ambiguity.
   stream this item was about, `$MQTT_willcancel`, no longer exists: the permanent
   CONNECT acceptance facts that replaced its watermark live on `$MQTT_sess` ITSELF, so
   there is no second stream to echo an epoch into and no way to recreate the evidence
-  without recreating the records. The remaining coupled streams, `$MQTT_teardown` and
-  `$MQTT_origin`, already carry the adopted epoch in STREAM metadata and their
-  validators already refuse a session-only recreation at startup — which is exactly the
-  enforcement this item proposed, for the two streams where it is still meaningful.
+  without recreating the records. The remaining coupled stream, `$MQTT_teardown`,
+  already carries the adopted epoch in STREAM metadata and its validator already refuses
+  a session-only recreation at startup — which is exactly the enforcement this item
+  proposed, for the one stream where it is still meaningful. (`$MQTT_origin` was the
+  second such stream until the write-lineage audit deleted the register; startup now
+  refuses an account that still holds it.)
   What is left is not enforceable and is documented instead: recreating `$MQTT_sess`
   discards every client's acceptance history along with the records, and a delayed Will
   enqueued beforehand then fires (`docs/CONFORMANCE.md`).

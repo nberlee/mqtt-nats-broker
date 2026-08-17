@@ -245,14 +245,19 @@ func TestMQTTForkedRecordRepairOnAReplicatedStream(t *testing.T) {
 	testMQTTCheckPubMsg(t, c2, r2, "repair/replicated", mqttPubQos1, []byte("replicated"))
 }
 
-// TestMQTTCreateLineageAcrossBrokersOverAWatermark is T11: the create-side chain over real
-// replicated JetStream.
+// TestMQTTRetirementWatermarkTravelsAcrossBrokers is T11 after the write-lineage audit.
 //
-// The single-stream tests prove the fields serialize. This one proves the fact TRAVELS: the
-// watermark one broker's teardown wrote is read by ANOTHER broker's create, which is the
-// only shape the cross-term create pair has — the two brokers never share memory, so
-// nothing but $MQTT_teardown can carry the retired record's identity between them.
-func TestMQTTCreateLineageAcrossBrokersOverAWatermark(t *testing.T) {
+// The single-stream tests prove the fields serialize. This one proves the fact TRAVELS
+// through Raft: the watermark one broker's teardown wrote, naming the record it removed,
+// is readable by ANOTHER broker — the two never share memory, so nothing but
+// $MQTT_teardown can carry that identity between them. RWID is retained on exactly this
+// basis, and it is now the ONLY cross-broker consumer of the fact.
+//
+// The second half is the reader that was REMOVED: broker B's create no longer draws a
+// parent from the watermark it can plainly read, which is what makes a cross-term create
+// pair concede. Asserting both against one replicated watermark is the point — the fact
+// is available and deliberately unused.
+func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {
 	oldTimeout := testMQTTTimeout
 	testMQTTTimeout = 40 * time.Second
 	defer func() { testMQTTTimeout = oldTimeout }()
@@ -307,8 +312,10 @@ func TestMQTTCreateLineageAcrossBrokersOverAWatermark(t *testing.T) {
 			r.RWID, widA)
 	}
 
-	// Broker B finds the subject empty and creates. Its parent can only have come from the
-	// replicated watermark.
+	// Broker B finds the subject empty and creates. The replicated watermark is the only
+	// place a parent could have come from, and it is asserted valid and naming widA
+	// directly above — so a parentless create here is a real measurement of the removed
+	// reader rather than an absence that proves nothing.
 	cb, rb := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false},
 		b.opts.MQTT.Host, b.opts.MQTT.Port)
 	defer cb.Close()
@@ -321,9 +328,10 @@ func TestMQTTCreateLineageAcrossBrokersOverAWatermark(t *testing.T) {
 	sessB.mu.Lock()
 	widB, pwidB := sessB.wid, sessB.pwid
 	sessB.mu.Unlock()
-	if pwidB != widA {
-		t.Fatalf("broker B's CREATE must descend from the record broker A's teardown retired: "+
-			"PWID=%q want %q (B's own WID %q)", pwidB, widA, widB)
+	if pwidB != _EMPTY_ {
+		t.Fatalf("broker B's CREATE must descend from NOTHING, not from the record broker A's "+
+			"teardown retired: PWID=%q (the watermark names %q, B's own WID is %q)",
+			pwidB, widA, widB)
 	}
 	if widB == _EMPTY_ || widB == widA {
 		t.Fatalf("broker B must mint its own identity: WID=%q (A's %q)", widB, widA)

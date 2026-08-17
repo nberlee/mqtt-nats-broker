@@ -17,10 +17,28 @@
 // it fixtures the two live ones, refutes seven, and scopes post-start mirror/source drift
 // outside the claim. It exercises $MQTT_willq's CAS shape, which is this one.
 //
-// What that does NOT retire is the rest of this file's job. Recognition here also
-// covers an ambiguous acknowledgement, an out-of-band deletion and a stream
-// recreation — none of them proposal-ordering questions — so the machinery stands
-// until the roadmap's obligation-by-obligation deletion audit says which parts do not.
+// **That audit has run**, obligation by obligation, and it split this machinery in two.
+//
+// The CREATE side is DELETED. Every route by which a create could be handed a parent —
+// the retirement watermark's RWID, an adopted marker's PWID, a re-minted object's stamp,
+// the session-interval register on $MQTT_origin — existed so that two creates into one
+// emptied subject were recognisable as siblings, and every route docs/CONFORMANCE.md
+// documented for such a verdict turned out to be a FALSE fork: the inherited identity
+// outlived the interval it named. A create is now parentless and concedes.
+//
+// What remains is the AUTHORED-RECORD fork — two CAS writes off a base this broker
+// actually held — and it stays for a stated reason rather than by default. F-030's
+// dependency inventory (test/depproof) proves the SINGLE-MESSAGE writer. Every accepted
+// CONNECT writes through an AllowAtomicPublish batch instead (storeAcceptBatch,
+// sess_accept_fact.go), and at the pinned v2.14.5 no Raft-level field preserves "these
+// entries came from one ProposeMulti": entries are pushed individually, popped as
+// whatever prefix exists, regrouped by size thresholds, and each group rechecks
+// leadership on its own. So the inventory genuinely does not reach the writer that
+// matters, and its refutation is written-only (test/depproof/README.md, R-batch). That
+// gap is its own docs/ROADMAP.md item.
+//
+// Recognition here also covers an ambiguous acknowledgement, an out-of-band deletion and
+// a stream recreation — none of them proposal-ordering questions — for the same records.
 //
 // The observable damage is not the lost write. It is what the broker CONCLUDES from it:
 // its next CAS is rejected, it re-reads, finds a record it did not write, and reports
@@ -125,13 +143,15 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 	}
 	// The incarnation GENERATION is deliberately not consulted, and that is a reversal.
 	// It used to short-circuit here — a different incarnation was held to restart the
-	// lineage — which made the one fork this feature exists to catch invisible: a
-	// CLEAN-START sibling is written by a session clear() re-minted, so it ALWAYS
-	// carries a different generation, and the short-circuit conceded before the pointer
-	// test ran. Record identities are globally unique NUIDs, so a parent match means
-	// descent from one actual record whatever generation wrote it; a generation
-	// mismatch adds nothing to that and only suppressed it. See
-	// parentForNextWriteLocked.
+	// lineage — which made a CLEAN-START sibling invisible: one is written by a session
+	// clear() re-minted, so it ALWAYS carries a different generation, and the
+	// short-circuit conceded before the pointer test ran. That particular pair now
+	// concedes anyway, because the write-lineage audit made the post-re-mint write
+	// parentless. The reversal stands regardless and on its own terms: record identities
+	// are globally unique NUIDs, so a parent match means descent from one actual record
+	// whatever generation wrote it, and a generation mismatch adds nothing to that.
+	// Re-introducing it would suppress an authored fork whose two writers restarted under
+	// different incarnations. See parentForNextWriteLocked.
 	//
 	// All four conjuncts are load-bearing, and each is stated here rather than assumed
 	// by the callers, because each has a shape that would otherwise be misclassified:
@@ -157,26 +177,29 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 	return mqttLineageNotForked
 }
 
-// parentForNextWriteLocked is the record a new write descends from: the one we hold, or —
-// for a session that holds none — the record whose REMOVAL emptied the subject it is about
-// to write into.
+// parentForNextWriteLocked is the record a new write descends from: the one we are
+// acknowledged for, and nothing else. A session holding no record writes a PARENTLESS
+// create.
 //
-// Both parenting sites call it, and the fallback is what carries the chain across a
-// deletion. Without it clear() leaves the next create parentless, and the two siblings of
-// one base — a resume child {b, a} and a clean-start survivor written after tearing a down
-// — have nothing in common for classifyRecordLineage to match on, so a broker whose record
-// was ERASED by a sibling reports a takeover that never happened. The same holds when no
-// marker survives to read and the retirement watermark is what names the removed record.
+// It used to fall back to the identity of the record whose REMOVAL emptied the subject,
+// carrying the chain across a deletion so that a resume child {b, a} and a clean-start
+// survivor written after tearing a down were recognisable as siblings. The write-lineage
+// audit deleted that fallback and its three sources. Its verdicts were reachable only
+// through an inherited identity that had outlived the interval it named, and every route
+// docs/CONFORMANCE.md documented for one was a FALSE fork: the identity was replayed by a
+// regressed register, separated from its admission by a complete remote lifecycle,
+// resurrected by a regressed teardown slot, or left standing by an out-of-band deletion.
+// A parentless create concedes at classifyRecordLineage's ackPWID conjunct from either
+// orientation, which is the takeover vocabulary — the pre-F-029b behavior, restated as a
+// residual.
 //
-// The removed record's WID, never the teardown marker's: the marker is deleted by the
-// release and is nobody's base.
+// What that gives up is the CLEAN-START fork, and what it does not give up is the
+// authored-record one: two CAS writes off a base both broker held. That shape still
+// classifies, which is the obligation this file retains. See classifyRecordLineage.
 //
 // sess.mu must be held.
 func (sess *mqttSession) parentForNextWriteLocked() string {
-	if sess.wid != _EMPTY_ {
-		return sess.wid
-	}
-	return sess.retiredBaseWID
+	return sess.wid
 }
 
 // adoptRecordLineageLocked adopts the lineage AND the grant an attempt STAMPED, for a caller

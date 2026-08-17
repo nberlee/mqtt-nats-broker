@@ -447,22 +447,28 @@ func testAssertCurrentOwner(t *testing.T, sess *mqttSession, idHash string) {
 // T9: the finding itself, over real connections
 // ---------------------------------------------------------------------------
 
-// TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient is T9 (M1).
+// TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient is T9 after the write-lineage
+// audit, and it pins the RESIDUAL on the wire rather than a capability.
+//
+// The bound session's record here is a PRODUCTION create whose ONLY save is the accept
+// save: the client's previous clean-start close deleted its record, and the reconnect's
+// create used to inherit the retirement watermark's RWID. That inheritance is gone, so
+// the create is parentless, a sibling of it can no longer be proven, and the displaced
+// client is told 0x8E "session taken over" — a claim that somebody legitimately owns the
+// session, when the two creates arbitrated nothing.
+//
+// Asserting it end to end is deliberate. The residual is stated in docs/CONFORMANCE.md,
+// and a residual nothing exercises is a sentence rather than a fact; this is also the
+// test that would fail first if a future change restored an inheritance without saying so.
 //
 // No Will assertion here, unlike the rejection-settlement e2e above: this verdict is
 // reached by the eviction route, which detaches the client first, and a Will lost that way
 // is a residual already recorded for BOTH verdicts (docs/CONFORMANCE.md).
 //
-// The bound session's record here is a PRODUCTION create whose ONLY save is the accept
-// save: the client's previous clean-start close deleted its record, and the reconnect's
-// create inherited the retirement watermark. That is the only reason a sibling of it can be
-// proven — with no second save to supply a parent, an implementation that does not inherit
-// leaves the record parentless and the loser is told 0x8E instead.
-//
 // The verdict is reached through the persist observation rather than the rejection
 // settlement, because the latter needs a record write to reject and any such write would
-// itself give the record a parent, which is exactly what must not be available here.
-func TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient(t *testing.T) {
+// itself give the record a parent.
+func TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -484,7 +490,9 @@ func TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient(t *testing.T) {
 		t.Fatalf("the clean-start close must record a retirement naming the deleted record: status %v", st)
 	}
 
-	// The reconnect's record is a CREATE that inherited it — and stays the only save.
+	// The reconnect's record is a CREATE that no longer inherits it — and stays the only
+	// save. The watermark is still asserted valid above: it remains a retirement fact,
+	// and only its READER on the create path was removed.
 	ci := &mqttV5ConnInfo{
 		clientID: "createe2e",
 		will:     &mqttWill{topic: []byte("createe2e/will"), message: []byte("bye")},
@@ -504,9 +512,9 @@ func TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient(t *testing.T) {
 	if ackWID == _EMPTY_ {
 		t.Fatal("the accept save must be acknowledged")
 	}
-	if ackPWID == _EMPTY_ {
-		t.Fatal("the create must have INHERITED a parent: with no second save, nothing else " +
-			"can give this record one, and a parentless record concedes 0x8E")
+	if ackPWID != _EMPTY_ {
+		t.Fatalf("the create must inherit NOTHING: with no second save, only an inheritance "+
+			"could give this record a parent, and there is none left to draw on. Got %q", ackPWID)
 	}
 
 	// A sibling of the create lands, written as ANOTHER broker's record: the session-record
@@ -515,6 +523,10 @@ func TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient(t *testing.T) {
 	sess.mu.Lock()
 	sibling := sess.buildPersistedSessionLocked()
 	sibling.Gen, sibling.Origin = sess.gen, "othernode"
+	// The sibling carries the same (empty) parent, which is the real shape: two creates
+	// into one emptied subject, each descended from nothing. That is exactly what arm 2's
+	// ackPWID conjunct refuses to call sibling-hood, since two unrelated first creates
+	// look identical to it.
 	sibling.WID, sibling.PWID = mqttNewRecordWID(), ackPWID
 	sibling.Subs = map[string]byte{"createe2e/sibling": 1}
 	domainTk := sess.domainTk
@@ -535,9 +547,11 @@ func TestMQTTCreateForkE2EAnswers0x89ToTheDisplacedClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the DISCONNECT reason: %v", err)
 	}
-	if reason != mqttReasonServerBusy {
-		t.Fatalf("a create whose sibling erased it answers 0x89 'try again', never 0x8E "+
-			"'session taken over' — the two creates arbitrated nothing. Got %x", reason)
+	if reason != mqttReasonSessionTakenOver {
+		t.Fatalf("a create whose sibling erased it answers 0x8E 'session taken over', because "+
+			"nothing establishes the two as siblings any more. This is the residual, not the "+
+			"goal: 0x89 would require an inherited parent identity, which every documented "+
+			"route also made available to a FALSE fork. Got %x", reason)
 	}
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var buf [256]byte

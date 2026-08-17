@@ -27,9 +27,9 @@ func mqttTopicFor(prefix string) string {
 // namespace that carries real traffic. Kept as one list so a new internal
 // prefix is a visible omission here rather than a silent hole.
 //
-// Five entries below were added after that intent had already been missed once
-// each: teardown, qos2 assign, inflight, affine delivery and the interval
-// register were introduced with their features and never registered here. The
+// Four entries below were added after that intent had already been missed once
+// each: teardown, qos2 assign, inflight and affine delivery were introduced
+// with their features and never registered here. The
 // guards deny "$MQTT.>" wholesale rather than enumerating prefixes, so none of
 // them was ever a live hole — but a list whose whole purpose is to make an
 // omission visible only does that if it is complete. The two affine prefixes
@@ -46,7 +46,6 @@ var reservedPrefixes = map[string]string{
 	"will queue":        mqttWillQSubjectPrefix,
 	"accept facts":      mqttAcceptSubjectPrefix,
 	"teardown":          mqttTeardownSubjectPrefix,
-	"interval register": mqttOriginSubjectPrefix,
 	"qos2 inbound":      mqttQoS2IncomingMsgsStreamSubjectPrefix,
 	"qos2 assign":       mqttQoS2AssignStreamSubjectPrefix,
 	"inflight":          mqttInflightStreamSubjectPrefix,

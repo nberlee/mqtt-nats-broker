@@ -253,9 +253,10 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 // $MQTT_teardown naming the generation it is retiring, and only then deletes. Four
 // readers consume it: the winner's own release-superseded arm, which condemns a
 // same-generation survivor; the CONNECT restore, which refuses to resume a retired
-// generation; the orphan sweep, which condemns one with no CONNECT at all; and the
-// record-absent CREATE, which inherits the RETIRED RECORD's identity as its own
-// parent so a cross-term sibling of that create stays recognisable.
+// generation; and the orphan sweep, which condemns one with no CONNECT at all. A
+// FOURTH reader was removed by the write-lineage audit — the record-absent create,
+// which inherited the retired record's identity as its own parent — because every
+// verdict that inheritance produced was a false fork.
 //
 // A generation whose retirement was ever RECORDED is retired, and stays fenced:
 // nothing ever reaps a watermark, so no GC choice can widen the residual. The
@@ -292,18 +293,19 @@ type mqttGenRetirement struct {
 	Gen       string `json:"gen"`
 	MarkerSeq uint64 `json:"mseq"`
 	// RWID is the identity of the RECORD this retirement's deletion removes — the
-	// record the teardown CLAIMED, never the marker that claimed it. It is what a
-	// broker creating into the emptied subject inherits as the parent of its first
-	// write, which is what makes a sibling of that create recognisable from either
-	// side instead of conceding a takeover nothing demonstrated.
+	// record the teardown CLAIMED, never the marker that claimed it.
 	//
-	// A create is otherwise parentless, and two parentless records have nothing for
-	// classifyRecordLineage to match on — the one shape the fork recognition could
-	// not see. See sess_fork_lineage.go and parentForNextWriteLocked.
+	// It has NO reader today. The create that inherited it as a parent pointer was
+	// deleted by the write-lineage audit, and the field is retained deliberately
+	// rather than removed with it: what it states is a durable fact about which
+	// record a retirement attributes to, and docs/ROADMAP.md's F-036 and
+	// vanished-record bullets are the items that decide whether that fact gains a
+	// reader again. Retiring it now would have to be undone by whichever of them
+	// needs it.
 	//
 	// REQUIRED, and validated as such: a watermark that cannot name what it retired
-	// cannot seed a lineage, and accepting an empty value would be accepting the
-	// shape this field was added to replace.
+	// attributes a deletion to nothing, and accepting an empty value would be
+	// accepting the pre-RWID shape this field was added to replace.
 	RWID      string `json:"rwid"`
 	Nonce     string `json:"nonce"`
 	Origin    string `json:"origin"`
@@ -334,7 +336,7 @@ const (
 // No operation ever deletes or purges here, by design — a retirement fence is
 // permanent, and an age- or delete-based reap of it would be an unfenced reap of the
 // fence itself — so DenyDelete, DenyPurge and SubjectDeleteMarkerTTL are audited
-// NON-prerequisites, exactly as on $MQTT_origin. No consumer is ever created, so
+// NON-prerequisites. No consumer is ever created, so
 // MaxConsumers and ConsumerLimits are waived, and no Nats-TTL is ever sent, so
 // AllowMsgTTL is inert.
 //
@@ -346,7 +348,7 @@ const (
 // mints a fresh epoch while the permanent watermarks keep the old one — instead of
 // classifying it per read. The other direction ($MQTT_teardown recreated alone) stamps
 // the current epoch, validates clean, and admits with no historical fences; that loss
-// is stated in docs/CONFORMANCE.md, as it is for $MQTT_origin.
+// is stated in docs/CONFORMANCE.md.
 //
 // wantReplicas is 0 when no explicit replica count is configured (skip that check).
 func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, sessEpoch string) error {
@@ -447,20 +449,21 @@ func mqttTeardownIDHashFromSubject(subject, domainTk string) (string, error) {
 }
 
 // mqttValidateGenRetirement is the ONE definition of a watermark this broker may act
-// on, shared by the writer and all four readers. Sharing it is the point: three of
-// those readers draw a destructive conclusion from the watermark — condemn a live
-// record, discard a record at CONNECT — so a reader with its own weaker subset would
-// act on a fact the writer would have refused to record. Anything malformed is CORRUPT
+// on, shared by the writer and every reader. Sharing it is the point: the three
+// destructive readers draw a conclusion from the watermark — condemn a live record,
+// discard a record at CONNECT — so a reader with its own weaker subset would act on a
+// fact the writer would have refused to record. Anything malformed is CORRUPT
 // and fails closed everywhere: the writer aborts before deleting, the CONNECT is
 // refused, and the sweep mutates nothing for that client. It is never repaired in
 // place.
 //
-// The fourth reader is the record-absent CREATE (createOrRestoreSessionWithin), which
-// draws no destructive conclusion — it only inherits a parent — and still refuses the
-// CONNECT on a corrupt watermark rather than proceeding parentless. Conceding there
-// would admit a session into a store whose own later teardown can never record its
-// retirement, because recordGenRetirement refuses to replace a watermark it cannot
-// read, and the record would then stay MARKED for every future finisher.
+// A fourth reader, the record-absent CREATE (createOrRestoreSessionWithin), draws no
+// destructive conclusion and no longer draws a PARENT either — the write-lineage audit
+// deleted that inheritance — but it still reads the watermark for one outcome and still
+// REFUSES the CONNECT on a corrupt one. Conceding there would admit a session into a
+// store whose own later teardown can never record its retirement, because
+// recordGenRetirement refuses to replace a watermark it cannot read, and the record would
+// then stay MARKED for every future finisher.
 func mqttValidateGenRetirement(r *mqttGenRetirement, idHash string) error {
 	if r == nil {
 		return fmt.Errorf("no retirement watermark")
@@ -474,8 +477,8 @@ func mqttValidateGenRetirement(r *mqttGenRetirement, idHash string) error {
 	if r.MarkerSeq == 0 {
 		return fmt.Errorf("watermark carries no teardown marker sequence")
 	}
-	// A watermark that cannot say WHICH record its deletion removed cannot seed the
-	// lineage of the create that follows it. Refused rather than accepted-as-empty:
+	// A watermark that cannot say WHICH record its deletion removed attributes that
+	// deletion to nothing. Refused rather than accepted-as-empty:
 	// the validator cannot tell a missing field from a present empty one, so
 	// accepting empty would accept a pre-RWID watermark, which is the legacy
 	// acceptance the compatibility boundary forbids. The development store is
@@ -575,7 +578,7 @@ func (jsa *mqttJSA) loadGenRetirementRecord(domainTk, idHash string) (*mqttGenRe
 // finishAdoptedTeardown takes the marker's own PWID, the record that teardown claimed
 // rather than the marker the release deletes. Empty is refused by the validator below,
 // so a record with no identity fails its teardown closed instead of being retired
-// under a name nothing can attribute. See sess_fork_lineage.go.
+// under a name nothing can attribute.
 func (sess *mqttSession) recordGenRetirement(t *mqttTeardownTarget, nonce, retiredWID string, markerSeq uint64) error {
 	subject := mqttTeardownSubject(sess.domainTk, t.idHash)
 	want := &mqttGenRetirement{
@@ -591,24 +594,6 @@ func (sess *mqttSession) recordGenRetirement(t *mqttTeardownTarget, nonce, retir
 		// Refusing to write what we would refuse to read. Reached only if the teardown
 		// target itself is malformed, which every caller's record already excludes.
 		return fmt.Errorf("refusing to record the retirement of session %q: %w", t.id, verr)
-	}
-	// ROTATE THE INTERVAL IDENTITY, before the watermark decision below and therefore
-	// before every deletion. Both edges of that placement are load-bearing.
-	//
-	// After the validation above: a malformed target would otherwise move the interval
-	// identity forward and then fail retirement validation without deleting anything,
-	// putting the register ahead of a teardown that never happened.
-	//
-	// Before the decision loop: that loop RETURNS EARLY when a standing watermark is
-	// already at or above our marker sequence, and the record is still deleted on that
-	// path. A rotation placed past the early return is skipped exactly there, leaving
-	// an interval whose record is gone with its identity unmoved — which is identity
-	// REUSE, the direction this register exists to make impossible.
-	//
-	// A failure aborts the teardown with NOTHING deleted, exactly as the watermark
-	// write's own failure does. See sess_origin_interval.go.
-	if err := sess.advanceOriginInterval(t, nonce, markerSeq); err != nil {
-		return err
 	}
 	var lastErr error
 	for attempt := 0; attempt < mqttGenRetirementAttempts; attempt++ {
@@ -949,12 +934,11 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	//
 	// The retired record's identity is the MARKER'S PARENT, not the marker's own WID:
 	// claimTeardown parents the marker to the record it claimed, and that record — not
-	// the marker, which this release deletes and which is nobody's base — is what the
-	// next create descends from. Stamping ps.WID here would name the marker and make a
-	// remote create's parent disagree with a local clean-start create's, so the
-	// cross-broker fork would be recognisable from neither side. An empty value is
-	// refused by the validator, which is how a record carrying no lineage fails its
-	// adoption closed. See sess_fork_lineage.go.
+	// the marker, which this release deletes — is the one this teardown's deletions
+	// remove. Stamping ps.WID here would attribute the retirement to the marker, a
+	// record no deletion of this teardown's ever removed. An empty value is refused by
+	// the validator, which is how a record carrying no lineage fails its adoption
+	// closed. See sess_teardown.go's mqttGenRetirement.
 	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
 		return err
 	}

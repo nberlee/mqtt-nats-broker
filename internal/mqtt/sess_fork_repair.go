@@ -467,11 +467,11 @@ func (g *mqttForkedGrant) isEmpty() bool {
 // for and its parent, which is exactly what a sibling of that parent erased.
 //
 // A nil parent snapshot means NOTHING IS REPAIRABLE and nothing is minted: the record was
-// restored from the stream (no known parent content here), or it is the first record after
-// a teardown re-mint, whose protection is the teardown claim protocol rather than this
-// repair. Note the invariant is not "grantSnapParent always names sess.pwid" — clear()
-// keeps the retiring WID in retiredBaseWID, so the first post-re-mint save has a non-empty
-// PWID with no parent content — it is "a nil parent means unrepairable".
+// restored from the stream, which has no known parent content here. The first record after
+// a teardown re-mint no longer reaches this question at all — the write-lineage audit made
+// it PARENTLESS, so lineage concedes before a repair is considered — and its protection
+// remains the teardown claim protocol rather than this repair. The invariant is "a nil
+// parent means unrepairable", never "grantSnapParent always names sess.pwid".
 //
 // sess.mu must NOT be held.
 func (sess *mqttSession) buildForkedGrantLocked(ackWID, ackPWID string) *mqttForkedGrant {
@@ -667,9 +667,12 @@ const (
 // none of the classifiers returns the survivor record anyway, they all return an enum.
 //
 // The generation conjunct is separately load-bearing because classifyRecordLineage
-// deliberately IGNORES the generation (a recorded reversal): a clean-start sibling is
-// parented across the teardown re-mint, so it classifies forked while belonging to an
-// incarnation a teardown destroyed. Without this test that is the resurrection rejection.
+// deliberately IGNORES the generation (a recorded reversal). It no longer has the
+// clean-start sibling to catch — the write-lineage audit made the post-re-mint write
+// parentless, so that pair concedes before it reaches here — but the conjunct is what
+// keeps the repair from re-asserting state into an incarnation a teardown destroyed,
+// and nothing else states that. Without it, any future lineage match across a re-mint
+// is a resurrection.
 //
 // What the anchor does NOT do is arbitrate ownership of the re-asserted state. Only the
 // accept save's expected-sequence CAS does that, and it linearizes only within a leader

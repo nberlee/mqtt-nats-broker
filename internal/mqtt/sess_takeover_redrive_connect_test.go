@@ -207,16 +207,20 @@ func TestSessSupersededDiscardReDrivesTheCleanStart(t *testing.T) {
 		t.Fatalf("a superseded discard must re-run the clean-start decision, got %d discard(s)", got)
 	}
 
-	// (c) The session this CONNECT ends up owning descends from the WINNER's record —
-	// the B3 lineage crossing the re-mint. Without the re-drive it would descend from
-	// the record the first (superseded) discard claimed, which is not the one that won.
+	// (c) The session this CONNECT ends up owning descends from NOTHING. This used to be
+	// the lineage half of the re-drive claim — the create had to descend from the record
+	// that WON rather than from the one the superseded discard claimed — and the
+	// write-lineage audit removed the inheritance that carried it. The re-drive itself is
+	// still proved, by the discard count above and the base-0 trace below; what is
+	// asserted here is that the winner's identity, which IS available and is asserted
+	// non-empty above, is not silently re-inherited.
 	ps, _ := testLoadSessRecordByHash(t, asm, getHash(cid))
 	if ps == nil {
 		t.Fatal("the accepted CONNECT left no record")
 	}
-	if ps.PWID != winner {
-		t.Fatalf("the accepted create must descend from the record that WON the arbitration: "+
-			"parent %q, winner %q", ps.PWID, winner)
+	if ps.PWID != _EMPTY_ {
+		t.Fatalf("the accepted create descends from nothing: parent %q (the arbitration "+
+			"winner was %q)", ps.PWID, winner)
 	}
 
 	// (a) No base-0 store happened before the authoritative restore. Every save this
@@ -1334,7 +1338,7 @@ func TestReDriveDeferredDischargeIsAdmitted(t *testing.T) {
 // the session leaves the maps whether the teardown COMPLETED or was SUPERSEDED. So this
 // frame cannot tell the two apart by asking, which is why it must not reuse the object it
 // left behind — that object carries the sequence clear() reset to 0 after the base was
-// already known stale, and retiredBaseWID naming a record that is no longer the base.
+// already known stale.
 //
 // Staged on the ABSENT arm of a superseded claim, because that is the arm where the two
 // dispositions differ DURABLY rather than only in path: with the record gone the base-0
@@ -1424,31 +1428,17 @@ func TestReDriveReReadsAfterASupersededDeferredDiscard(t *testing.T) {
 	// The discriminator, and it is the RETIRED WID specifically: a create after an
 	// authoritative read of an empty subject must not carry the identity the discharge
 	// reset off the object, because that is a write whose base and parent came from two
-	// different reads — exactly what R2 forbids. It descends from the session-interval
-	// register instead, which is read on this same pass (sess_origin_interval.go).
+	// different reads — exactly what R2 forbids. `retired` is asserted non-empty above,
+	// so this arm can genuinely fail.
 	if ps.PWID == retired {
 		t.Fatalf("a create after an authoritative read of an ABSENT subject must not inherit the "+
 			"RETIRED record's identity: parent %q", ps.PWID)
 	}
-	if ps.PWID != testRedriveOriginToken(t, asm, getHash(cid)) {
-		t.Fatalf("the create must descend from the interval identity: parent %q, register %q",
-			ps.PWID, testRedriveOriginToken(t, asm, getHash(cid)))
+	// And it inherits nothing else either: a create is parentless since the
+	// write-lineage audit deleted every inheritance source.
+	if ps.PWID != _EMPTY_ {
+		t.Fatalf("a create descends from nothing: parent %q", ps.PWID)
 	}
-}
-
-// testRedriveOriginToken returns the identity the client's standing interval register
-// yields, for the create-side assertions above.
-func testRedriveOriginToken(t *testing.T, asm *mqttAccountSessionManager, idHash string) string {
-	t.Helper()
-	_, seq, status := asm.jsa.loadOriginIntervalRecord(asm.domainTk, idHash)
-	if status != mqttOriginValid {
-		t.Fatalf("expected a valid interval register, got status %v", status)
-	}
-	tok := mqttOriginToken(asm.originStreamEpoch, seq)
-	if tok == _EMPTY_ {
-		t.Fatalf("the register at sequence %v yielded no identity", seq)
-	}
-	return tok
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,16 +1577,17 @@ func TestSessSupersededByAnotherMarkerAdoptsIt(t *testing.T) {
 	if ps == nil {
 		t.Fatal("the accepted CONNECT left no record")
 	}
-	// R2's named exception: the successor of an adopted marker descends from the record
-	// that teardown CLAIMED, not from the marker itself. The marker is deleted by the
-	// release and is nobody's base.
-	if ps.PWID != stagedPWID {
-		t.Fatalf("the create after an adopted teardown must descend from the record the "+
-			"teardown claimed: parent %q, claimed %q, marker %q", ps.PWID, stagedPWID, stagedWID)
+	// R2's named exception is GONE with the rest of the create-parent sources: the
+	// successor of an adopted marker descends from nothing, neither from the record that
+	// teardown claimed nor from the marker itself. Both identities are asserted non-empty
+	// above, so this arm can genuinely fail — the inputs a wrong implementation would
+	// reach for are present.
+	if ps.PWID != _EMPTY_ {
+		t.Fatalf("the create after an adopted teardown descends from nothing: parent %q "+
+			"(the claimed record was %q, the marker %q)", ps.PWID, stagedPWID, stagedWID)
 	}
-	if ps.PWID == stagedWID {
-		t.Fatal("the create descends from the MARKER, which the release deleted: a parent " +
-			"pointer at it names a record that is nobody's base")
+	if ps.WID == _EMPTY_ {
+		t.Fatal("a parentless create still mints an identity of its OWN")
 	}
 }
 
@@ -1608,9 +1599,12 @@ func TestSessSupersededByAnotherMarkerAdoptsIt(t *testing.T) {
 // makes a genuine FIRST create with an empty parent.
 //
 // This is the arm where a superseded-as-success defect differs DURABLY rather than only
-// in path: with the subject empty the base-0 create lands either way, and only its
-// lineage says whether it came from the object clear() reset (parented to the retired
-// record) or from an authoritative read of an empty subject (parented to nothing).
+// in path: with the subject empty the base-0 create lands either way. The LINEAGE no
+// longer discriminates the two — every create is parentless since the write-lineage
+// audit, so an object clear() reset and an authoritative read of an empty subject stamp
+// the same thing — which is why the discard COUNT below is the discriminator, and why the
+// retired-WID assertion is kept as a guard against an inheritance being reintroduced
+// rather than as the proof.
 func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 	testQuietExpirySweeps(t)
 
@@ -1669,16 +1663,15 @@ func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 	if ps == nil {
 		t.Fatal("the accepted CONNECT left no record")
 	}
-	// As above: what must not be inherited is the RETIRED record's identity. A genuine
-	// first-create now descends from the session-interval register instead of from
-	// nothing, which is what makes its cross-term sibling recognisable.
+	// As above: what must not be inherited is the RETIRED record's identity, asserted
+	// non-empty above so this arm can genuinely fail. A genuine first-create descends
+	// from nothing at all.
 	if ps.PWID == retiredWID {
 		t.Fatalf("a create after an authoritative read of an ABSENT subject must not inherit the "+
 			"RETIRED record's identity: parent %q", ps.PWID)
 	}
-	if want := testRedriveOriginToken(t, asm, getHash(cid)); ps.PWID != want {
-		t.Fatalf("the create must descend from the interval identity: parent %q, register %q",
-			ps.PWID, want)
+	if ps.PWID != _EMPTY_ {
+		t.Fatalf("a create descends from nothing: parent %q", ps.PWID)
 	}
 }
 
@@ -1686,9 +1679,9 @@ func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 //
 // An overdue record never reaches processConnect's clean-start decision: the restore
 // intercepts it and discards it there, which is transition T0. Two things must hold that
-// the outer transitions do not cover — the base-0 create still descends from the record
-// that discard retired, and the re-drive budget is the CONNECT's, not one the restore
-// mints per call.
+// the outer transitions do not cover — the base-0 create is PARENTLESS, inheriting
+// nothing from the record that discard retired, and the re-drive budget is the CONNECT's,
+// not one the restore mints per call.
 func TestOverdueMovedWinnerReDrivesInsideTheRestore(t *testing.T) {
 	testQuietExpirySweeps(t)
 
@@ -1696,9 +1689,17 @@ func TestOverdueMovedWinnerReDrivesInsideTheRestore(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	t.Run("the base-0 create descends from the record the restore retired", func(t *testing.T) {
+	t.Run("the base-0 create after an overdue discard is parentless", func(t *testing.T) {
 		const cid = "overdue-lineage"
 		asm := testStageOverdueRecord(t, s, o, cid)
+
+		// The staged record's identity, read BEFORE the CONNECT discards it: it is the
+		// positive control for the parentless assertion below, which could not fail if
+		// there had been no identity to inherit in the first place.
+		overdue, _ := testLoadSessRecordByHash(t, asm, getHash(cid))
+		if overdue == nil || overdue.WID == _EMPTY_ {
+			t.Fatal("the staged overdue record carried no identity, so nothing could be mis-inherited")
+		}
 
 		tr := testTraceReDriveStaged(t, nil)
 		c, r := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
@@ -1706,8 +1707,6 @@ func TestOverdueMovedWinnerReDrivesInsideTheRestore(t *testing.T) {
 		// Overdue means NOT resumed, whatever the client asked for. Spec5 [3.1.2.11.2].
 		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
-		before, _ := testLoadSessRecordByHash(t, asm, getHash(cid))
-		_ = before
 		if got := tr.discards(); got != 1 {
 			t.Fatalf("an overdue record is discarded exactly once, inside the restore, got %d", got)
 		}
@@ -1715,9 +1714,12 @@ func TestOverdueMovedWinnerReDrivesInsideTheRestore(t *testing.T) {
 		if ps == nil {
 			t.Fatal("the accepted CONNECT left no record")
 		}
-		if ps.PWID == _EMPTY_ {
-			t.Fatal("the create after an overdue discard must descend from the record that " +
-				"discard retired: retiredBaseWID is what carries it out of the restore")
+		if ps.PWID != _EMPTY_ {
+			t.Fatalf("the create after an overdue discard descends from nothing: parent %q "+
+				"(the discarded record was %q)", ps.PWID, overdue.WID)
+		}
+		if ps.WID == _EMPTY_ || ps.WID == overdue.WID {
+			t.Fatalf("a parentless create still mints an identity of its OWN: %q", ps.WID)
 		}
 	})
 

@@ -238,17 +238,14 @@ const (
 	mqttTeardownStreamName    = "$MQTT_teardown"
 	mqttTeardownSubjectPrefix = mqttPrefix + "teardown."
 
-	// Stream name and subject prefix for the durable per-client SESSION INTERVAL
-	// register (one subject per client, MaxMsgsPer:1, permanent retention). Every
-	// teardown that records a retirement also rotates the register, so the sequence
-	// its standing message occupies names the interval the client's record subject is
-	// currently in — the identity a create inherits when no retirement watermark
-	// survives to name a parent. No broker operation ever deletes or purges one, but
-	// neither is REFUSED in the configuration: a delete cannot rewind the sequence
-	// counter, so an erasure loses an identity rather than replaying one.
-	// See sess_origin_interval.go.
-	mqttOriginStreamName    = "$MQTT_origin"
-	mqttOriginSubjectPrefix = mqttPrefix + "origin."
+	// $MQTT_origin was the durable per-client session-interval register, whose sequence
+	// named the interval a client's record subject was in and supplied the identity a
+	// parentless create inherited. The write-lineage audit deleted it: every verdict it
+	// enabled was a false fork. The broker no longer defines it, so an account still
+	// holding one is an unsupported persisted shape and startup REFUSES rather than
+	// carrying it — the name survives here for exactly that preflight.
+	// See mqttRefuseRetiredOriginStream and docs/ARCHITECTURE.md "Compatibility boundary".
+	mqttOriginStreamName = "$MQTT_origin"
 
 	// Reserved $MQTT_sess metadata key holding the generated stream-incarnation
 	// epoch, and the only valid epoch form: "nuid:<22-character NUID>". The epoch
@@ -257,15 +254,6 @@ const (
 	// validateSessStream.
 	mqttSessEpochMetaKey    = "mqtt_sess_epoch"
 	mqttSessEpochNUIDPrefix = "nuid:"
-
-	// Reserved $MQTT_origin metadata key holding THAT stream's own generated
-	// incarnation epoch, in the same "nuid:<22-character NUID>" form. An interval
-	// identity is a $MQTT_origin sequence, and sequences restart at 1 in a new
-	// incarnation, so the epoch is what keeps two incarnations from handing out the
-	// same identity. Distinct from mqttSessEpochMetaKey, which $MQTT_origin ALSO
-	// carries as the coupling to the session stream whose records it parents. See
-	// validateOriginStream.
-	mqttOriginEpochMetaKey = "mqtt_origin_epoch"
 
 	// Stream name and subject for incoming MQTT QoS2 messages
 	mqttQoS2IncomingMsgsStreamName          = "$MQTT_qos2in"
@@ -875,17 +863,6 @@ type mqttAccountSessionManager struct {
 	// published. See validateSessStream, sess_accept_fact.go.
 	sessStreamEpoch string
 
-	// originStreamEpoch is the $MQTT_origin incarnation identity resolved once at
-	// account-manager init from that stream's mqtt_origin_epoch metadata (form
-	// "nuid:<NUID>"). It is the first half of every interval identity this broker
-	// derives, the second being a $MQTT_origin sequence — which is only unique
-	// within the incarnation that assigned it. Immutable after init (read without
-	// lock), which is why recreating $MQTT_origin under a running broker is
-	// bounded by the mandatory-restart rule rather than by a check. If a valid
-	// epoch cannot be resolved, the account manager is not published. See
-	// validateOriginStream, originIntervalToken.
-	originStreamEpoch string
-
 	// testPublishWill, when non-nil, replaces the delayed-Will publication for
 	// THIS account manager only (instance-scoped, so parallel tests stay
 	// isolated). Set/read under mu. Used to inject publish failures and verify
@@ -1441,25 +1418,6 @@ type mqttSession struct {
 	// because a lineage that lags the sequence would parent the next write to a
 	// record that is no longer the base. See sess_fork_lineage.go.
 	wid, pwid string
-	// retiredBaseWID is the record this session's FIRST write descends from although
-	// this session holds none — the third lineage fact, and deliberately not one of
-	// the two above. wid means "the record we are acknowledged for" at six reading
-	// sites, and a session that holds no record is acknowledged for nothing; pwid is
-	// that record's parent. What the next write needs to descend from, when we hold no
-	// record at all, is neither, so it gets its own field and one accessor
-	// (parentForNextWriteLocked).
-	//
-	// One fact, three sources, all of them naming the record whose removal emptied the
-	// subject this session will create into: a teardown this object performed itself
-	// (clear() stamps the record it claimed), a teardown this broker ADOPTED (the
-	// marker's own PWID), and a teardown whose marker is already gone (the retirement
-	// watermark's RWID). All three make a CLEAN-START fork recognisable: the sibling of
-	// base a written after tearing a down is {c, a}, not {c, ""}, so it and a resume
-	// child {b, a} share a parent.
-	//
-	// Memory-only, and self-retiring — once a save lands, wid is non-empty and this is
-	// never consulted again. See sess_fork_lineage.go.
-	retiredBaseWID string
 	// grantBody / grantBodyParent are the RECORD BYTES of the record wid names and of the
 	// record pwid names — the fourth and fifth lineage facts, and the two a fork's repair is
 	// computed from. Their delta is exactly what a sibling of that parent erased, and a
@@ -4034,7 +3992,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.cleanupRetainedMessageCache(s, closeCh)
 	})
 
-	// Provision the eleven broker-owned $MQTT_* streams through the one
+	// Provision the nine broker-owned $MQTT_* streams through the one
 	// convergence shape (ensureBrokerStream): create-or-lose, an UNCONDITIONAL
 	// authoritative re-read, then per-owner validation over that re-read — a
 	// nonconforming stream is a startup failure with recreate guidance, never
@@ -4055,6 +4013,13 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// emits a per-message Nats-TTL (Message Expiry) and must not require the
 	// capability of a pre-existing stream. Everything else accepts MQTT 5.0.
 	requireMsgTTL := opts.MQTT.MaxProtocolVersion != mqttProtoLevel
+	// Before anything is created: an account still holding the retired
+	// $MQTT_origin register is refused outright. Read-only, and ahead of the loop
+	// because the loop's own shape creates an absent stream before it validates
+	// one. See mqttRefuseRetiredOriginStream.
+	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
+		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
+	}
 	// Recorded by the $MQTT_rmsgs post step so a later failure can roll it back: the
 	// two per-broker ephemeral consumers are provisioned as one unit.
 	var retainedConsumerName string
@@ -8481,61 +8446,31 @@ RESTORE:
 		}
 		// Message not found, so create the session and indicate it did not exist.
 		//
-		// The subject is empty because a record was DELETED from it, and every deletion
-		// this broker performs records a retirement watermark first. That watermark names
-		// the deleted record, so this create descends from it — which is what makes a
-		// sibling create recognisable instead of conceding a takeover nothing
-		// demonstrated. It is the same rule the adopted-teardown create below applies,
-		// extended to the case where no marker survives to read.
+		// A create is PARENTLESS. It used to inherit the identity of the record whose
+		// removal emptied this subject, so that a sibling create stayed recognisable;
+		// the write-lineage audit deleted every such source, because each documented
+		// route through which that inheritance produced a verdict was a FALSE fork —
+		// the inherited identity outlived the interval it named. A create carrying no
+		// PWID concedes at classifyRecordLineage's second conjunct from either
+		// orientation, which is the takeover vocabulary and the stated residual. See
+		// sess_fork_lineage.go and docs/CONFORMANCE.md.
 		//
-		// The read is placed AFTER the proof of absence, and that order is load-bearing:
-		// the watermark is written and confirmed before its deletion, so a watermark read
-		// after observing the subject empty is at least as new as the deletion that
-		// emptied it. See sess_fork_lineage.go and sess_teardown.go.
-		var inherited string
-		switch r, _, st := jsa.loadGenRetirement(as.domainTk, hash); st {
-		case mqttRetirementValid:
-			// The validator guarantees RWID non-empty, so a valid watermark always
-			// supplies a parent.
-			inherited = r.RWID
-		case mqttRetirementCorrupt:
-			// REFUSED, exactly as the resume-side reader refuses. Admitting a session
-			// over a watermark this broker cannot read leaves its OWN later teardown
-			// unable to record a retirement (recordGenRetirement refuses to replace a
-			// corrupt standing watermark), so the record would stay MARKED for every
-			// future finisher — new state admitted into a store whose teardown path is
-			// already known to be unusable.
+		// The watermark is still READ here, and its unreadable arm is a refusal in its
+		// own right rather than the discarded half of an inheritance: admitting a
+		// session over a watermark this broker cannot read leaves its OWN later teardown
+		// unable to record a retirement (recordGenRetirement refuses to replace a corrupt
+		// standing watermark), so the record would stay MARKED for every future finisher
+		// — new state admitted into a store whose teardown path is already known to be
+		// unusable.
+		if _, _, st := jsa.loadGenRetirement(as.domainTk, hash); st == mqttRetirementCorrupt {
 			return nil, false, fmt.Errorf("creating session %q: the delayed-teardown "+
 				"watermark for this client is unreadable, so a teardown of this session "+
 				"could never record its retirement; stop this account's brokers and "+
 				"recreate the bridge-owned JetStream state (the $MQTT_* streams)", clientID)
-		case mqttRetirementAbsent:
-			// No retirement is RECORDED HERE NOW, which is not the same as none ever
-			// happened: $MQTT_teardown can be recreated alone and validate clean with no
-			// historical fences (docs/ARCHITECTURE.md, "Stream prerequisites"), and a
-			// watermark can be deleted administratively. So no parent is drawn from the
-			// absence itself — an absence is not a fact, and a token minted from one
-			// fails toward a FALSE fork.
-			//
-			// What IS available is a positive durable fact of the interval: the
-			// per-client register, which every teardown rotates before it deletes
-			// anything and which nothing can erase. It covers both shapes this arm
-			// otherwise conceded — a genuine first-ever interval, where the two racing
-			// creates establish or read one register, and a client whose retirement
-			// history was lost, where the register survives on a different stream.
-			// Empty concedes exactly as before. See sess_origin_interval.go.
-			inherited = as.originIntervalToken(clientID, hash)
-		case mqttRetirementIndeterminate:
-			// A transient read, which must not fail a CONNECT and must not derive an
-			// identity either: it establishes no retirement fact, so a token taken here
-			// could stamp one interval's identity onto another whose retirement state
-			// merely could not be read. Concede without touching $MQTT_origin at all —
-			// exactly today's behavior, and the stated residual in docs/CONFORMANCE.md.
 		}
 		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
-		sess.retiredBaseWID = inherited
 		return sess, false, nil
 	}
 	// We need to recover the existing record now.
@@ -8622,14 +8557,11 @@ RESTORE:
 		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
-		// R2's named exception: this session's first write descends from the record the
-		// ADOPTED teardown claimed, which the marker preserved as its own PWID — not
-		// from the marker, which the release just deleted and which is nobody's base.
-		// It is what makes a remote adopted-teardown create and a local clean-start
-		// create off one base stamp the same parent, so the cross-broker fork this
-		// feature exists for is recognisable from either side. See
-		// parentForNextWriteLocked.
-		sess.retiredBaseWID = ps.PWID
+		// Parentless, as every create now is: this session's first write no longer
+		// descends from the record the ADOPTED teardown claimed. The marker's own PWID
+		// still names that record for the retirement watermark the release records
+		// (finishAdoptedTeardown passes it to recordGenRetirement), which is a
+		// retirement fact rather than a lineage one. See the create arm above.
 		return sess, false, nil
 	}
 
@@ -9191,10 +9123,10 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 	ps := sess.buildPersistedSessionLocked()
 	// Stamp the lineage HERE, at the store boundary, never in the builder: the builder
 	// is also clear()'s pre-teardown snapshot, so minting there would write a parent
-	// pointer naming a record that was never stored. This write's parent is the record
-	// we were last acknowledged for — or, on a session a teardown re-minted, the record
-	// that teardown claimed — which sess.mu makes stable across the two statements.
-	// See sess_fork_lineage.go.
+	// pointer naming a record that was never stored. This write's parent is the record we
+	// were last acknowledged for and nothing else — a session holding none, including one
+	// a teardown re-minted, writes a PARENTLESS create — which sess.mu makes stable across
+	// the two statements. See parentForNextWriteLocked.
 	ps.WID, ps.PWID = mqttNewRecordWID(), sess.parentForNextWriteLocked()
 	// body is what a readback returns (the CAS header below is a message header,
 	// not part of the stored data), so it is what an ambiguous write is identified
@@ -9593,20 +9525,17 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// retiring record is deleted, and six sites read wid as exactly that. Zeroed AFTER
 	// retiringWID was captured above.
 	sess.wid, sess.pwid = _EMPTY_, _EMPTY_
-	// But the chain does NOT break here, and that reverses what this comment used to
-	// say. It reasoned that a parent pointer at the retiring record would make a reused
-	// object's first write claim descent from a record that no longer exists — true, and
-	// now the point: BOTH siblings of a fork descend from a base that is gone, and a
-	// pointer at it is what makes them recognisable as siblings rather than as
-	// strangers. Without it a broker whose record a sibling erased answers 0x8E "session
-	// taken over", a claim that somebody legitimately owns the session, when nothing
-	// arbitrated anything. See parentForNextWriteLocked.
-	sess.retiredBaseWID = retiringWID
-	// The GRANT chain does break here, unlike the parent pointer above, and the asymmetry is
-	// the point: a sibling of the retired base must still be RECOGNISABLE (hence
-	// retiredBaseWID), but nothing of the retired incarnation may be RE-ASSERTED into the fresh
-	// one — that is the resurrection this repair is forbidden to perform. With both bodies
-	// nil the first post-re-mint save has a parent pointer and no parent content, so it mints
+	// The chain breaks here with the sequence, and the reused object's first write is a
+	// parentless create like every other. It used to keep a pointer at the retiring
+	// record so a clean-start sibling stayed recognisable; the write-lineage audit
+	// removed that, because a pointer at a record whose interval has ended is what every
+	// documented FALSE fork was built from. retiringWID is still captured above, for the
+	// retirement watermark below — which names the record this deletion removes, a fact
+	// about the teardown rather than about the next write's ancestry.
+	//
+	// The GRANT chain breaks here too, and always did: nothing of the retired incarnation
+	// may be RE-ASSERTED into the fresh one — that is the resurrection this repair is
+	// forbidden to perform. With both bodies nil the first post-re-mint save mints
 	// nothing. See sess_fork_repair.go.
 	sess.grantBody, sess.grantBodyParent = nil, nil
 	sess.tmaxack = 0
@@ -9658,8 +9587,8 @@ func (sess *mqttSession) clear(noWait bool) error {
 	//
 	// retiringWID rides along, captured above BEFORE the reset for the same reason the
 	// generation and the sequence were: the watermark names the record this deletion
-	// removes, so a broker that later creates into the emptied subject inherits it as
-	// its parent and a sibling of that create stays recognisable. Reading sess.wid here
+	// removes, which is what ATTRIBUTES the retirement rather than what parents any later
+	// write — no create reads it since the write-lineage audit. Reading sess.wid here
 	// would read the zero the reset just wrote.
 	if err := sess.recordGenRetirement(target, nonce, retiringWID, markerSeq); err != nil {
 		return err
@@ -11231,10 +11160,9 @@ restoreSession:
 			// deferred-discard site consumes it and removes the session either way. So a
 			// SUPERSEDED discard is indistinguishable here from a completed one — and
 			// reusing the object after a superseded one would write at the sequence
-			// clear() reset to 0 having already learned the base was stale, with
-			// retiredBaseWID naming a record that is no longer the base. That is the exact
-			// shape this item exists to close, reached through the one door that does not
-			// report it.
+			// clear() reset to 0 having already learned the base was stale. That is the
+			// exact shape this item exists to close, reached through the one door that
+			// does not report it.
 			//
 			// The cost is one record read on a CONNECT that discharged a deferred
 			// discard. It cannot loop: the restore below yields an object that is not

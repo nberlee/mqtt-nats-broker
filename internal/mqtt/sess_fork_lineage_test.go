@@ -164,22 +164,11 @@ func TestSessSaveStampsAndAdoptsLineage(t *testing.T) {
 	if first.WID == _EMPTY_ {
 		t.Fatal("a stored record must carry a minted identity")
 	}
-	// A first create is no longer PARENTLESS: it inherits the session-interval
-	// identity, which is what makes its cross-term sibling recognisable
-	// (sess_origin_interval.go). Derived from the register rather than from the
-	// session, so this pins where the parent comes from and not merely that the two
-	// agree with each other.
-	_, oseq, ostatus := e.asm.jsa.loadOriginIntervalRecord(e.asm.domainTk, e.sess.idHash)
-	if ostatus != mqttOriginValid {
-		t.Fatalf("the create must have established an interval register, got status %v", ostatus)
-	}
-	wantParent := mqttOriginToken(e.asm.originStreamEpoch, oseq)
-	if wantParent == _EMPTY_ {
-		t.Fatalf("the register at sequence %v yielded no identity", oseq)
-	}
-	if first.PWID != wantParent {
-		t.Fatalf("a first create descends from the INTERVAL identity: PWID=%q want %q",
-			first.PWID, wantParent)
+	// A first create is PARENTLESS. Every source that used to hand one an inherited
+	// identity was deleted by the write-lineage audit, so a create descends from
+	// nothing and concedes at arm 2's ackPWID conjunct. See parentForNextWriteLocked.
+	if first.PWID != _EMPTY_ {
+		t.Fatalf("a first create descends from nothing: PWID=%q want empty", first.PWID)
 	}
 	e.sess.mu.Lock()
 	adoptedWID, adoptedPWID := e.sess.wid, e.sess.pwid

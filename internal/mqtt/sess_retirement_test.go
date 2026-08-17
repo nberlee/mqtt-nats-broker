@@ -11,10 +11,11 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Tests for the durable generation-retirement watermark and its four readers: the
-// winner's release-superseded arm, the CONNECT restore, the orphan sweep, and the
-// record-absent create that inherits the retired record's identity. The
-// window they close is the claim-won deletion window: a teardown deletes on the
+// Tests for the durable generation-retirement watermark and its three readers: the
+// winner's release-superseded arm, the CONNECT restore, and the orphan sweep. A fourth,
+// the record-absent create that inherited the retired record's identity, was deleted by
+// the write-lineage audit; that create still READS the watermark, but only to refuse a
+// corrupt one. The window they close is the claim-won deletion window: a teardown deletes on the
 // strength of a won claim, and a cross-term resume derived from the same base can
 // evict the marker off the record's own subject afterwards, leaving a record that
 // names resources the winner destroyed and no marker for anyone to adopt.
@@ -321,15 +322,18 @@ func TestRetirementWatermarkIsPermanentAndMonotonic(t *testing.T) {
 		t.Fatalf("the newer retirement must carry the higher marker sequence: %v vs %v", r2.MarkerSeq, r1.MarkerSeq)
 	}
 	// The retired record's IDENTITY advances with the fence, and that is the difference
-	// between arbitration and a deduplicated first value: an implementation that advanced
-	// mseq while keeping the earlier RWID would leave the next create inheriting an older
-	// interval's record and manufacturing a false fork against the latest retired one.
+	// between arbitration and a deduplicated first value. RWID is no longer read by any
+	// create — the write-lineage audit removed that reader — but it remains what the
+	// watermark ATTRIBUTES the retirement to, and a fence that advanced its marker
+	// sequence while keeping an earlier RWID would name a record a different teardown
+	// removed. See docs/ROADMAP.md's F-036 and vanished-record bullets, which decide
+	// whether the field keeps a reader.
 	if r2.RWID != secondRec.WID {
 		t.Fatalf("the advanced fence must name the SECOND retired record: RWID=%q want %q "+
 			"(the first was %q)", r2.RWID, secondRec.WID, firstRec.WID)
 	}
-	// And a create into the now-empty subject descends from that second record, which is
-	// the property the whole recognition rests on.
+	// And a create into the now-empty subject descends from NOTHING: it reads the
+	// watermark — the corrupt arm is still a refusal — but draws no identity from it.
 	third, _, cerr := a.asm.createOrRestoreSession(clientID, a.s.getOpts())
 	if cerr != nil {
 		t.Fatalf("creating after the second teardown: %v", cerr)
@@ -337,9 +341,9 @@ func TestRetirementWatermarkIsPermanentAndMonotonic(t *testing.T) {
 	if err := testSessSave(t, third); err != nil {
 		t.Fatalf("the create's first save: %v", err)
 	}
-	if created, _ := testLoadSessRecord(t, a, idHash); created == nil || created.PWID != secondRec.WID {
-		t.Fatalf("the create must descend from the record the LAST retirement named: %+v want parent %q",
-			created, secondRec.WID)
+	if created, _ := testLoadSessRecord(t, a, idHash); created == nil || created.PWID != _EMPTY_ {
+		t.Fatalf("the create descends from nothing, not from the record the LAST retirement "+
+			"named (%q): %+v", secondRec.WID, created)
 	}
 	if err := third.clear(false); err != nil {
 		t.Fatalf("tearing the create down again: %v", err)

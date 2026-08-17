@@ -32,10 +32,11 @@
 //	    write on a base it learned was stale.
 //	R2  Every write's base and parent come from the SAME authoritative read. The base
 //	    is what the re-evaluated clean-start decision produces from the record just
-//	    read; the parent is that record's identity (parentForNextWriteLocked) — except
-//	    for an adopted teardown marker, whose successor parents from the marker's
-//	    PWID, the record that teardown CLAIMED. That exception is named rather than
-//	    left to contradict the rule.
+//	    read; the parent is that record's identity (parentForNextWriteLocked), and where
+//	    the read found NO record — an empty subject, or an adopted teardown marker whose
+//	    release deletes it — the write is parentless. The adopted-marker exception that
+//	    used to parent a successor from the marker's PWID was deleted by the
+//	    write-lineage audit, so the rule now has no exception to name.
 //	R3  The loop is bounded by the cycle cap, the create-retry cap and the admission
 //	    deadline, and EVERY exit leaves nothing resident at seq == 0.
 //

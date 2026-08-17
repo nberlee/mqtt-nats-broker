@@ -170,16 +170,20 @@ func TestSessSupersededClaimCannotStompTheWinner(t *testing.T) {
 // Test 10 / M5, M5b, M6, M16, M17: the lineage chain crosses the teardown re-mint
 // ---------------------------------------------------------------------------
 
-// TestSessCleanStartForkIsRecognised is B3 end to end, through the PRODUCTION path
-// rather than a synthetic record: a real clear() followed by the session's own first
-// save, classified against a resume child of the same base.
+// TestSessCleanStartCreateIsParentlessAndConcedes is B3's shape after the write-lineage
+// audit, through the PRODUCTION path rather than a synthetic record: a real clear()
+// followed by the session's own first save, classified against a resume child of the
+// same base.
 //
-// The shape is the finding. A resume child of base a is {b, a}. A clean-start survivor
-// written after tearing a down used to be {c, ""} — the chain BROKE at every re-mint —
-// so the two had nothing in common and the erased broker reported 0x8E "session taken
-// over", a claim that somebody legitimately owns the session, when in fact a sibling
-// had erased it and nobody took anything over. It is now {c, a}.
-func TestSessCleanStartForkIsRecognised(t *testing.T) {
+// The verdict is the one this change GIVES UP, and it is asserted in both directions
+// deliberately. A resume child of base a is {b, a}. A clean-start survivor written after
+// tearing a down was briefly {c, a} and is now {c, ""} again, so the two have nothing in
+// common, and a broker whose record that survivor erased answers 0x8E "session taken
+// over" — a claim nothing arbitrated. That is the residual stated in docs/CONFORMANCE.md,
+// and it is the cost of removing an inherited identity that outlived the interval it
+// named: every route by which the chain reached this verdict was reachable equally by a
+// FALSE fork. See parentForNextWriteLocked.
+func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 	t.Parallel()
 	a, b := testNewTeardownEnv(t)
 	const cid = "b3fork"
@@ -195,48 +199,49 @@ func TestSessCleanStartForkIsRecognised(t *testing.T) {
 	if err := sessA.clear(false); err != nil {
 		t.Fatalf("the clean-start discard must succeed: %v", err)
 	}
-	sessA.mu.Lock()
-	reMinted := sessA.retiredBaseWID
-	sessA.mu.Unlock()
-	if reMinted != base.WID {
-		t.Fatalf("clear() must record the CLAIMED record as the next write's parent: got %q, want %q",
-			reMinted, base.WID)
-	}
 	if err := testSessSave(t, sessA); err != nil {
 		t.Fatalf("the re-minted session's first save: %v", err)
 	}
 	survivor, survivorSeq := testLoadSessRecord(t, a, sessA.idHash)
-	if survivor == nil || survivor.PWID != base.WID {
-		t.Fatalf("the clean-start create must descend from the record its teardown claimed: %+v", survivor)
+	if survivor == nil || survivor.PWID != _EMPTY_ {
+		t.Fatalf("the clean-start create descends from nothing: %+v", survivor)
 	}
-	if survivor.WID == base.WID {
-		t.Fatal("the clean-start create must mint an identity of its own")
+	if survivor.WID == _EMPTY_ || survivor.WID == base.WID {
+		t.Fatalf("the clean-start create must mint an identity of its own: %+v", survivor)
 	}
 
-	// The OTHER sibling is a broker that RESUMED the same base: its acknowledged pair is
-	// {b, a} — a child of a — and it is asked about the survivor {c, a}. Sibling-hood is
-	// defined against the acknowledged pair, so this is the comparison that matters, and
-	// it is the one that used to be impossible: with the chain broken the survivor was
-	// {c, ""} and matched nothing.
+	// Direction 1, the concession. The OTHER sibling is a broker that RESUMED the same
+	// base: its acknowledged pair is {b, a}, a child of a, and it is asked about the
+	// survivor {c, ""}. Sibling-hood is defined against the acknowledged pair, and with
+	// the survivor carrying no parent there is nothing to match — the answer is 0x8E.
 	//
 	// The resume child's identity is synthetic because the two records cannot both be
-	// current — one erased the other, which is the whole finding. What has to come from
-	// the production path is the SURVIVOR, and it does.
+	// current — one erased the other. What has to come from the production path is the
+	// SURVIVOR, and it does.
 	resumeChildWID := mqttNewRecordWID()
-	if got := classifyRecordLineage(survivor, resumeChildWID, base.WID); got != mqttLineageForked {
-		t.Fatalf("a clean-start survivor of base %q and a resume child of it are siblings: got %v for %+v",
-			base.WID, got, survivor)
+	if got := classifyRecordLineage(survivor, resumeChildWID, base.WID); got != mqttLineageNotForked {
+		t.Fatalf("a parentless clean-start survivor establishes no sibling-hood: got %v for %+v",
+			got, survivor)
 	}
 
-	// Negative control 1: a genuine SEQUENTIAL handoff still concedes. A broker
-	// acknowledged for the BASE itself, pair {a, p}, sees the survivor {c, a} — whose
-	// parent is a, not p — so nothing is established and the answer stays 0x8E.
+	// Direction 2, the same question from the survivor's own side: a broker acknowledged
+	// for the survivor, asked about the resume child, equally concedes. Both orientations
+	// are pinned so a future change cannot restore one and leave the other, which would
+	// make two brokers disagree about the same event.
+	resumeChild := testLineageRecord(survivor.Gen, resumeChildWID, base.WID)
+	if got := classifyRecordLineage(resumeChild, survivor.WID, survivor.PWID); got != mqttLineageNotForked {
+		t.Fatalf("the reverse orientation must concede identically: got %v", got)
+	}
+
+	// Negative control: a genuine SEQUENTIAL handoff still concedes, and for its own
+	// reason rather than through the parentlessness above.
 	if got := classifyRecordLineage(survivor, base.WID, base.PWID); got != mqttLineageNotForked {
-		t.Fatalf("a survivor descended FROM the acknowledged record is a successor, not a sibling: got %v", got)
+		t.Fatalf("a survivor of the acknowledged record is no sibling: got %v", got)
 	}
 
-	// Negative control 2: a legitimate successor of the survivor, written through the
-	// production path by the other broker, is not a fork of it either.
+	// The authored-record fork is NOT given up, and this is the discrimination: a
+	// legitimate successor written through the production path by the other broker is
+	// not a fork, while two writes off that same base are (TestSessAuthoredForkStillClassifies).
 	sessB := testFreshSession(b, cid)
 	sessB.mu.Lock()
 	sessB.seq, sessB.wid, sessB.pwid = survivorSeq, survivor.WID, survivor.PWID
@@ -250,14 +255,14 @@ func TestSessCleanStartForkIsRecognised(t *testing.T) {
 	}
 }
 
-// TestSessParentForNextWriteFallsBackToTheReMint is M5b on its own: the accessor's
-// fallback, isolated from the save path.
+// TestSessParentForNextWriteIsTheHeldRecordOnly is M9's paired accessor half: the
+// parent-selection seam in isolation from the save path.
 //
-// Two facts are distinct and the design keeps them distinct — wid is the record we are
-// ACKNOWLEDGED for (six sites read it that way), retiredBaseWID is what the next write
-// descends from when we hold no record at all — so the accessor must prefer wid and
-// fall back, never conflate them.
-func TestSessParentForNextWriteFallsBackToTheReMint(t *testing.T) {
+// wid is the record we are ACKNOWLEDGED for, at six reading sites, and it is now the
+// ONLY thing a write descends from. The accessor used to fall back to the identity of
+// the record whose removal emptied the subject; that fallback and its three sources are
+// gone, so a session holding no record writes a parentless create.
+func TestSessParentForNextWriteIsTheHeldRecordOnly(t *testing.T) {
 	t.Parallel()
 	a, _ := testNewTeardownEnv(t)
 	sess := testFreshSession(a, "b3accessor")
@@ -265,18 +270,13 @@ func TestSessParentForNextWriteFallsBackToTheReMint(t *testing.T) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
-	sess.wid, sess.retiredBaseWID = _EMPTY_, "claimed-base"
-	if got := sess.parentForNextWriteLocked(); got != "claimed-base" {
-		t.Fatalf("holding no record, the next write descends from the re-mint: got %q", got)
+	sess.wid = _EMPTY_
+	if got := sess.parentForNextWriteLocked(); got != _EMPTY_ {
+		t.Fatalf("holding no record, the next write is parentless: got %q", got)
 	}
-	// The fallback RETIRES itself: once a save lands, wid is authoritative again.
 	sess.wid = "held"
 	if got := sess.parentForNextWriteLocked(); got != "held" {
 		t.Fatalf("holding a record, the next write descends from it: got %q", got)
-	}
-	sess.wid, sess.retiredBaseWID = _EMPTY_, _EMPTY_
-	if got := sess.parentForNextWriteLocked(); got != _EMPTY_ {
-		t.Fatalf("a genuine first create has no parent: got %q", got)
 	}
 }
 
@@ -884,16 +884,18 @@ func TestParentlessForeignRecordStillConcedes(t *testing.T) {
 	}
 }
 
-// TestSessAdoptedTeardownCreateParentsFromTheMarker is test 10's adopted-teardown
-// variant (M17).
+// TestSessAdoptedTeardownCreateIsParentless is test 10's adopted-teardown variant after
+// the write-lineage audit, and it is a DISCRIMINATING assertion rather than a default
+// one: a non-empty identity is available at this exact site — the marker's own PWID,
+// which names the record the adopted teardown claimed — and the create must not carry
+// it. This was the fourth create-parent source, and the last one whose input a test can
+// hold in its hand.
 //
-// A broker that finishes ANOTHER broker's teardown starts the client fresh, and that
-// fresh session's first write must descend from the record the teardown CLAIMED — which
-// the marker preserved as its own PWID — not from the marker, which the release deletes
-// and which is nobody's base. It is what makes a remote adopted-teardown create and a
-// local clean-start create off one base stamp the SAME parent, so the cross-broker fork
-// is recognisable from either side.
-func TestSessAdoptedTeardownCreateParentsFromTheMarker(t *testing.T) {
+// The claimed record's identity is not discarded, only re-scoped: the release still
+// hands it to recordGenRetirement as the RWID, which is a fact about what the teardown
+// removed rather than about the next write's ancestry. See test 3
+// (TestMQTTAdoptedTeardownRecordsTheClaimedRecordIdentity) for that half.
+func TestSessAdoptedTeardownCreateIsParentless(t *testing.T) {
 	testQuietExpirySweeps(t)
 	a, _ := testNewTeardownEnv(t)
 	const cid = "b3adopt"
@@ -911,20 +913,23 @@ func TestSessAdoptedTeardownCreateParentsFromTheMarker(t *testing.T) {
 		t.Fatal("an adopted teardown starts the client FRESH: Session Present must be false")
 	}
 	fresh.mu.Lock()
-	reMinted := fresh.retiredBaseWID
+	held := fresh.parentForNextWriteLocked()
 	fresh.mu.Unlock()
-	if reMinted != marker.PWID {
-		t.Fatalf("the fresh session must descend from the record the adopted teardown CLAIMED: "+
-			"got %q, want the marker's parent %q", reMinted, marker.PWID)
+	if held != _EMPTY_ {
+		t.Fatalf("an adopted-teardown create descends from nothing: got %q (the marker's "+
+			"parent is %q, which must NOT be inherited)", held, marker.PWID)
 	}
 
-	// And it reaches the wire: the first save stamps it.
+	// And that reaches the wire: the first save stamps no parent.
 	if err := testSessSave(t, fresh); err != nil {
 		t.Fatalf("the fresh session's first save: %v", err)
 	}
 	ps, _ := testLoadSessRecord(t, a, fresh.idHash)
-	if ps == nil || ps.PWID != marker.PWID {
-		t.Fatalf("the adopted create's stamped parent = %+v, want %q", ps, marker.PWID)
+	if ps == nil || ps.PWID != _EMPTY_ {
+		t.Fatalf("the adopted create's stamped parent = %+v, want empty", ps)
+	}
+	if ps.WID == _EMPTY_ {
+		t.Fatal("a parentless create still mints an identity of its OWN")
 	}
 }
 
@@ -963,12 +968,12 @@ func TestSessSupersededAdoptionReEntersTheRestore(t *testing.T) {
 	}
 
 	sess.mu.Lock()
-	seq, reMinted, wid := sess.seq, sess.retiredBaseWID, sess.wid
+	seq, wid := sess.seq, sess.wid
 	sess.mu.Unlock()
 
 	if seq == 0 {
 		t.Fatalf("a superseded adoption must RE-READ before anything is built from it: "+
-			"got a base-0 object (retiredBaseWID=%q, marker parent=%q)", reMinted, marker.PWID)
+			"got a base-0 object (marker parent=%q)", marker.PWID)
 	}
 	// Compared against the rival's own IDENTITY rather than a re-read of the subject:
 	// the subject can move again after the restore, and what R1 promises is that the

@@ -570,7 +570,6 @@ var mqttTestBrokerStreamNames = []string{
 	mqttSessStreamName,
 	mqttWillQStreamName,
 	mqttTeardownStreamName,
-	mqttOriginStreamName,
 	mqttStreamName,
 	mqttQoS2IncomingMsgsStreamName,
 	mqttQoS2AssignStreamName,
@@ -601,7 +600,7 @@ func testBrokerStreamSpecs() []brokerStreamSpec {
 
 // With provisioning table-driven, bypassing ensureBrokerStream requires
 // deleting a stream's entry — which this test refuses: the table must name
-// exactly the eleven $MQTT_* streams, each with a non-nil validator and a config
+// exactly the nine $MQTT_* streams, each with a non-nil validator and a config
 // the validator itself accepts.
 func TestBrokerStreamSpecTable(t *testing.T) {
 	t.Parallel()
@@ -828,18 +827,6 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		// stream is only interpretable within the session-stream incarnation it was
 		// created against. See validateTeardownStream.
 		d["Metadata"] = fieldDisposition{kind: dispRejected, errWant: mqttSessEpochMetaKey}
-	case mqttOriginStreamName:
-		register()
-		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "no operation ever deletes an interval register; a delete does not rewind the stream's sequence counter, so an erased register cannot replay an identity — the next establish mints a fresh, higher sequence — and the recognition it costs is the same loss administrative pruning of the watermark streams already carries"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "no operation ever purges an interval register, for the same reason deletion is waived"}
-		d["SubjectDeleteMarkerTTL"] = fieldDisposition{kind: dispWaived, reason: "no delete ever occurs here, so no delete marker can ever be created"}
-		// Metadata carries TWO real prerequisites, not owner-inert keys: this stream's
-		// own incarnation epoch, which is half of every interval identity it hands out,
-		// and the adopted session epoch it is coupled to. The mutator replaces the whole
-		// map, so it drops both; the origin epoch is checked first and names the
-		// rejection. The session-epoch half has its own dedicated test, since one
-		// mutation cannot discriminate two keys.
-		d["Metadata"] = fieldDisposition{kind: dispRejected, errWant: mqttOriginEpochMetaKey}
 	case mqttQoS2IncomingMsgsStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}

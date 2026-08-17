@@ -150,9 +150,11 @@ narrower than the parent CAS hole they come from.
 
 **Title:** Cross-term create × create recognition
 
-- Status: **Closed** on 2026-08-13 by inheriting the retired record's identity
-  (`internal/mqtt/sess_teardown.go`'s `rwid`, `createOrRestoreSessionWithin`'s
-  record-absent arm; `docs/ARCHITECTURE.md`, "Recognising a forked session record").
+- Status: **Closed** on 2026-08-13 by inheriting the retired record's identity, then
+  **REOPENED as a stated residual on 2026-08-16** by the write-lineage audit, which
+  deleted that inheritance and every other one (`docs/ROADMAP.md` §0.2;
+  `docs/CONFORMANCE.md`, residual R-create). The closure section below is kept because
+  the mechanism it describes is what was deleted and why.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Filed: 2026-08-11, out of F-029's implementation
@@ -177,6 +179,11 @@ interval is a descendant, and ordering survives deletions with no new comparison
 anywhere. `classifyRecordLineage` is untouched; the whole change to the seven consults
 is where a parent token comes from.
 
+**That fourth reader no longer exists.** The write-lineage audit deleted it, along with
+the other three sources; `rwid` stays on the watermark with no reader, and a create is
+parentless again. The reason is in the section below and in `docs/ROADMAP.md` §0.2: every
+route by which the inheritance produced a forked verdict was a documented FALSE fork.
+
 Three designs were refuted on the way and are recorded so they are not re-proposed: a
 separate per-client deletion-fact stream, whose objection was answered at the root by
 the rollback rework below and which otherwise adds a second pre-deletion marker stating
@@ -198,42 +205,42 @@ carries the one piece of new exposure this closure has: the claim it takes can b
 regressed by a cross-term apply, which the bare delete could not reach, and that is
 stated as a residual rather than claimed away.
 
-What is left is stated by DIRECTION rather than by count. The record-absent create with no
-usable watermark was filed as its own `docs/ROADMAP.md` §0.2 bullet and is now **closed by
-the session-interval register** (`internal/mqtt/sess_origin_interval.go`;
-`docs/ARCHITECTURE.md`, "The session-interval register"): a per-client single-slot register
-on `$MQTT_origin` whose sequences only move forward, rotated by every teardown from
-inside `recordGenRetirement`, whose identity is the standing message's SEQUENCE paired with
-the stream's incarnation epoch — a sequence because a body can be replayed and a sequence
-cannot. That closes the genuine-first-ever and history-lost shapes; the INDETERMINATE read
-still concedes by construction, and its remaining divergence routes are R0a-R0f in
-`docs/CONFORMANCE.md`. The cheap fix stays refuted for the reason it always was: a reserved
-token stamped on the Absent arm mints a positive claim out of an absence, and
-`$MQTT_teardown` can be recreated alone and validate clean with no historical fences.
+**THIS CLOSURE HAS SINCE BEEN REVERSED, cause and all.** The record-absent create with no
+usable watermark was filed as its own `docs/ROADMAP.md` §0.2 bullet and closed by the
+session-interval register — a per-client single-slot register on `$MQTT_origin` whose
+sequences only move forward, rotated by every teardown from inside `recordGenRetirement`.
+The write-lineage audit deleted that register, its stream and every other source a create
+drew a parent from, and `$MQTT_origin` is now refused at startup.
 
-That closure also settles what `rwid` is for. It is now the only durable statement of
-*"this specific record was retired"*, and it is retained rather than unified into the
-register for three reasons: it is free at its consult point, the duplication is of
-DERIVATION rather than of fact (the watermark names a record, the register names an
-interval), and F-036's remaining shape plausibly needs exactly that predicate — a bound,
-silent Keep Alive 0 client whose record another broker deleted needs a disposal that does
-not wait for client traffic, and record-absence is ambiguous where `ackWID == rwid` is
-positive proof. **If neither F-036 nor "give a vanished record its own disposal
-vocabulary" needs it, whoever closes the later of the two should CONSIDER removing
-`rwid`** — the field, its validator row, and the valid arm re-pointed at the register. Both
-roadmap bullets carry the note; the consideration is what is prescribed, not the removal.
+The reason is what the residual tree had been recording all along. Four routes were
+already stated as FALSE forks (R1, R2, R3, R4) and the register added a fifth (R0c, a
+restore or live recreation replaying an identity); each needed a create carrying an
+inherited identity that had outlived the interval it named, and each fired the same
+verdict a true cross-term create pair would. The register also WIDENED R1 and R4 to the
+no-watermark population, which is the same effect stated from the other side: a create
+that used to concede now derived an identity and could reach both routes. Audited
+obligation by obligation, there was no route on which the inheritance produced a true
+verdict and not a false one, so the mechanism was deleted rather than narrowed. The
+cross-term create pair concedes again — pre-F-029b behaviour, restated as residual
+R-create in `docs/CONFORMANCE.md`.
 
-The four other routes are residuals in `docs/CONFORMANCE.md`. They are named for the false-fork
-direction because that is the dangerous one, but three of them also concede: a stale
-read across a remote lifecycle and a regressed watermark slot give the two creates of
-one interval different parents, and an out-of-band deletion leaves the watermark naming
-the last RETIRED record rather than the deleted one. Two of them — R1's read-then-CAS gap
-and R4's out-of-band deletion — are **widened** by the register to the no-watermark
-population, since a create that used to be parentless and simply concede now derives an
-identity and can therefore reach both routes. Each is bounded by the same two
-facts: no false verdict can resurrect state, because the anchor's generation conjunct
-drops any capsule minted for a create, and a survivor carrying a retired generation is
-condemned by the retirement fence.
+What survives F-029b is the machinery around it: the CONNECT rollback's real teardown,
+its effective-lifetime branch, the parked discard, and the generation-blind classifier.
+What survives on the record is `rwid`, the only durable statement of *"this specific
+record was retired"* — now with **no reader at all**, since the create's valid arm no
+longer consults it and the register that was once offered as its replacement does not
+exist. It is retained because F-036's remaining shape plausibly needs exactly that
+predicate: a bound, silent Keep Alive 0 client whose record another broker deleted needs
+a disposal that does not wait for client traffic, and record-absence is ambiguous where
+`ackWID == rwid` is positive proof. **If neither F-036 nor "give a vanished record its own
+disposal vocabulary" needs it, whoever closes the later of the two should CONSIDER
+removing `rwid`.** Both roadmap bullets carry the note; the consideration is what is
+prescribed, not the removal.
+
+The bounds that held for the false-fork routes still hold for what remains: no false
+verdict can resurrect state, because the anchor's generation conjunct drops any capsule
+minted for a create, and a survivor carrying a retired generation is condemned by the
+retirement fence.
 
 ### Original finding record
 
@@ -423,6 +430,17 @@ and maintainer statement completing the closure.
 whether or not the server still refuses the write. Neither can the generic upstream
 term-fence unit test, which exercises Raft directly and says nothing about whether
 JetStream propagates the term an operation captured.
+
+**F-030's inventory covers the SINGLE-MESSAGE writer only.** It exercises `$MQTT_willq`'s
+conditional write, which is one `Propose`. Every accepted CONNECT writes through
+`storeAcceptBatch`, an `AllowAtomicPublish` two-message batch, and the inventory's R-batch
+row is a written refutation rather than a fixture because `$MQTT_willq` never uses
+batches. At the pinned v2.14.5 no Raft-level field preserves "these entries came from one
+`ProposeMulti`" — entries are pushed individually, popped as whatever prefix exists,
+regrouped by size thresholds, and each group rechecks leadership on its own — so the two
+writers are not equivalent and this finding's evidence does not reach the batch one. That
+gap is its own `docs/ROADMAP.md` §0.2 item, and it is why the session record's
+authored-fork machinery was retained by the write-lineage audit.
 
 F-039 is explicitly outside this finding. It is a local rollback invariant: the inner
 `readd` closure on `rollbackSubscribePacket`'s save-failure path restores the packet's

@@ -310,9 +310,10 @@ func TestForkRepairRestoreRotationFollowsHydration(t *testing.T) {
 // TestForkRepairNilParentMintsNothing is test 3 (M17).
 //
 // Without the nil-parent refusal every entry looks like an addition, so a fork on a session
-// this broker merely RESTORED would re-assert the survivor's own grant back over it — and a
-// fork on the first record after a teardown re-mint would resurrect the incarnation the
-// teardown destroyed.
+// this broker merely RESTORED would re-assert the survivor's own grant back over it. The
+// re-mint subtest below now reaches the same "nothing minted" conclusion one step earlier,
+// because a parentless write is not classified as a sibling at all; it is kept because the
+// refusal must still hold if lineage ever reaches that record again.
 func TestForkRepairNilParentMintsNothing(t *testing.T) {
 	t.Parallel()
 
@@ -353,20 +354,24 @@ func TestForkRepairNilParentMintsNothing(t *testing.T) {
 		if err := testSessSave(t, e.sess); err != nil {
 			t.Fatalf("the first post-re-mint save: %v", err)
 		}
+		// The post-re-mint write is PARENTLESS since the write-lineage audit, so the
+		// clean-start sibling is not even recognised as one: the verdict concedes rather
+		// than forking, which is the stated residual. Both halves are asserted, because
+		// this subtest's job is that NOTHING is minted, and a conceding verdict reaches
+		// that conclusion by a different route than the nil-parent refusal does.
 		e.sess.mu.Lock()
 		pwid := e.sess.pwid
 		e.sess.mu.Unlock()
-		if pwid == _EMPTY_ {
-			t.Fatal("fixture: the first post-re-mint write must still carry a parent POINTER, " +
-				"which is what makes a clean-start sibling recognisable")
+		if pwid != _EMPTY_ {
+			t.Fatalf("the first post-re-mint write descends from nothing: parent %q", pwid)
 		}
 		testLandSibling(t, e.testInflightEnv, testMutateSibling)
 		e.rejectSave(t, e.sess)
-		if got := e.sess.settleRecordRejection(e.asm); got != mqttRejectionForked {
-			t.Fatalf("verdict = %v, want forked", got)
+		if got := e.sess.settleRecordRejection(e.asm); got != mqttRejectionForeign {
+			t.Fatalf("verdict = %v, want foreign: a parentless write establishes no sibling-hood", got)
 		}
 		if g := e.capsuleOrNil(); g != nil {
-			t.Fatalf("a parent POINTER with no parent CONTENT is unrepairable: minted %+v", g)
+			t.Fatalf("nothing is repairable without a parent: minted %+v", g)
 		}
 	})
 }
@@ -1170,9 +1175,11 @@ func TestForkRepairMintsOnThePostReattemptReadback(t *testing.T) {
 // The anchor RE-EVALUATES the licence rather than remembering it. Both conjuncts are
 // load-bearing and for different reasons: the lineage test says the record now current is
 // still the sibling that erased us, and the generation test is needed because
-// classifyRecordLineage deliberately ignores the generation — a clean-start sibling is
-// parented across a teardown re-mint, so it classifies forked while belonging to an
-// incarnation a teardown destroyed.
+// classifyRecordLineage deliberately ignores the generation. It no longer has the
+// clean-start sibling to catch — that write is parentless since the write-lineage audit,
+// so the pair concedes before it reaches here — but the conjunct is what keeps any future
+// lineage match across a re-mint from re-asserting state into an incarnation a teardown
+// destroyed.
 func TestForkRepairAnchorConjuncts(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
