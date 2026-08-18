@@ -132,8 +132,10 @@ robust error classification
   long as the tombstone exists — indefinitely, and independently of any
   deduplication window. Every record carries an immutable `Nmqtt-Q2Gen` generation
   ID; the finalizer reconciles by generation and abandons without mutating when it
-  finds a foreign one, so it can never overwrite a newer session generation's
-  record on a reused `(client, packet identifier)` subject. A stable
+  finds a foreign one, so it can never overwrite a LATER EXCHANGE's record on a
+  reused `(client, packet identifier)` subject. (Not a newer session generation's:
+  the incarnation generation is part of the subject, so a fresh incarnation uses
+  distinct generation-scoped subjects entirely.) A stable
   `Nats-Msg-Id` on `$MQTT_msgs` (whose deduplication window is a nats-server
   default) narrows the remaining window in which a retry duplicates the *stored*
   copy, but correctness does not rest on it. `$MQTT_qos2in` moved from
@@ -207,8 +209,10 @@ resource names from…
   **session-incarnation generation** now scopes every name that used to derive from
   the client hash alone — the PUBREL durable, subject and delivery subject, the
   inbound QoS 2 hold subjects and their purge filter, and each delayed-Will
-  outbox record — so a delete issued by a retired incarnation can only name a
-  resource that no longer exists. A claim alone could not have achieved that: a
+  outbox record — so a delete issued by a retired incarnation cannot name a FRESH
+  incarnation's resource. (F-062 later established the limit: a resume preserves the
+  generation, so this says nothing about a peer still serving the retiring one.) A claim
+  alone could not have achieved that: a
   nonce re-check before each delete is a check-then-act, and a paused broker can
   verify its claim, let a peer finish the entire teardown and create a fresh
   session, and only then complete its delete. (2) A **teardown claim** on the
@@ -436,7 +440,10 @@ after UNSUBSCRIBE
   Fixed by a **release claim** (`internal/mqtt/qos2_release_claim.go`): a create-only
   CAS on a sibling of the hold subject (`…<pi>.rel`), which the releaser writes as
   `releasing` before the onward store and a discard writes as `discarded` before it
-  destroys the hold. Exactly one create can succeed, so the loser does nothing
+  destroys the hold. Exactly one create can succeed while a record occupies that
+  subject (F-062 records what that does NOT mean: the subject is reused by later
+  exchanges, and a `discarded` marker outliving its own exchange poisons one), so the
+  loser does nothing
   irreversible. The discard now arbitrates **per subject** — one `STREAM.INFO` with a
   subjects filter, then a claim and an exact-subject purge per hold — instead of
   purging by filter, and reads no payloads at all.
@@ -520,8 +527,10 @@ shared QoS 2 adds…
 - [x] Reap orphaned inbound QoS 2 hold records, the two structures session-affine
   shared QoS 2 adds (an `$MQTT_Q2AFF_*` consumer whose session record is gone, and
   an assignment claim whose winner generation no longer exists), and the inbound
-  release claims the discard serialization adds. None of them loses a message — a
-  stalled claim is honored, not released — but all of them accumulate.
+  release claims the discard serialization adds. None of them loses a message by
+  accumulating — a stalled claim is honored, not released — but all of them accumulate.
+  (F-062 later established that a stale `discarded` claim among them is not harmless: it
+  can fence a later exchange's hold, and retiring it can leave that exchange lost.)
 
   Implemented as a per-account periodic sweep (`internal/mqtt/orphan_qos2_sweep.go`)
   running beside `sweepSessionExpiries` and `sweepOrphanedConsumers`. See
@@ -607,8 +616,10 @@ shared QoS 2 adds…
 
   Two new conformance residuals, both recorded in `docs/CONFORMANCE.md`: a releaser
   that preloaded a hold answers `0x00` rather than the marker-backed `0x92` once the
-  marker has been retired (nothing delivered, nothing lost, only a more optimistic
-  reason code); and once a session record is gone, a genuinely `Lost` affine copy is
+  marker has been retired (for that marker's own exchange: nothing delivered, nothing
+  lost, only a more optimistic reason code — F-062 covers the later exchange a stale
+  marker had fenced, which IS lost); and once a session record is gone, a genuinely
+  `Lost` affine copy is
   indistinguishable from a permitted session teardown, so reconciliation records
   `Discarded`. `docs/ARCHITECTURE.md`'s `Lost` discriminator is qualified accordingly
   — it is authoritative only while the owning record still exists.

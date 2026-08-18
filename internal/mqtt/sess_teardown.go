@@ -18,7 +18,10 @@
 //     can verify its nonce, pause, let B finish the whole teardown, release the
 //     marker and create a fresh session that recreates the same deterministic name,
 //     and only then complete its delete. With generations, a late delete from a
-//     retired incarnation can only name a resource that no longer exists.
+//     retired incarnation cannot name a resource the FRESH incarnation owns. It can
+//     still reach one a peer created under the retiring generation, which a resume
+//     preserves — that is F-062, and it is why naming is not a substitute for
+//     arbitration on a subject a live peer can still write.
 //
 //  2. This claim. Its remaining job is narrower but still necessary: keep two
 //     brokers from tearing down and resuming the same record at once, and stop
@@ -27,9 +30,10 @@
 //     delete whose no-op is classified by re-reading, never assumed to be ours.
 //
 // Every CONNECT that can INTERPRET the record FINISHES a marker it reads rather than
-// overwriting it: it adopts the teardown, repeats the (idempotent) deletions for the
-// RETIRING generation, releases the record, and only then starts a fresh session with
-// a fresh generation and Session Present false. That also makes a crashed teardown
+// overwriting it: it adopts the teardown, repeats the deletions for the RETIRING
+// generation, releases the record, and only then starts a fresh session with a fresh
+// generation and Session Present false. (Repeating them is safe for names nothing can
+// re-occupy; the inbound QoS 2 hold walk is the exception — F-062 A2.) That also makes a crashed teardown
 // self-healing, which today leaks until the orphan sweep. A record the restore
 // boundary refuses is never adopted by the CONNECT: a reserved-namespace record whose
 // generation is valid is still finished by the expiry path and the orphan sweep, while
@@ -62,8 +66,12 @@ type mqttSessTeardown struct {
 
 // mqttTeardownTarget enumerates everything ONE retiring session incarnation owns,
 // captured before the in-memory state is reset. Every name in it is either
-// generation-scoped or already unique per incarnation, which is what makes the
-// deletions safe to repeat and safe to issue late.
+// generation-scoped or already unique per incarnation, so no deletion here can reach a
+// FRESH incarnation's resources however late it lands.
+//
+// That is not the same as "safe to repeat". The inbound QoS 2 hold walk purges by
+// SUBJECT, and a peer that resumed this generation can re-occupy one of those subjects,
+// so a repeat can destroy an acknowledged exchange written since — F-062 arm A2.
 //
 // sharedDurs is deliberately separate: a shared group durable is not owned by one
 // session, and is released only after the record is gone, by the last-holder scan.
@@ -693,9 +701,13 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 }
 
 // deleteTeardownTargets performs the destructive half of a teardown: everything the
-// retiring incarnation owns alone. Safe to repeat (every delete tolerates "already
-// gone") and safe to issue late (every name is generation-scoped or per-incarnation
-// unique), which is what lets an adopting broker just run it again.
+// retiring incarnation owns alone. Safe to issue late (every name is generation-scoped
+// or per-incarnation unique, so none reaches a fresh incarnation), which is what lets an
+// adopting broker run it again.
+//
+// Tolerating "already gone" is NOT the same as being idempotent: the inbound QoS 2 hold
+// walk purges by subject, so a subject re-occupied since the first run is destroyed by
+// the second (F-062 arm A2). Repetition is safe for the names nothing can re-occupy.
 //
 // Shared group durables are NOT here; they are released by the caller after the
 // record is gone, so the last-holder scan does not count this session.
@@ -734,8 +746,10 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// "$MQTT.qos2.in.<idHash>.<gen>.<PI>"; see mqttQoS2HoldSubject). Both record
 	// states are covered — held PUBLISHes and terminal tombstones — which is what the
 	// move protocol needs: a discarded session must leave neither behind. They
-	// otherwise collide by PI with a later session for the same client ID and can
-	// resurface stale payloads on PUBREL. Only on discard, never on resume: an
+	// otherwise collide by PI with a later EXCHANGE on this same incarnation and can
+	// resurface stale payloads on PUBREL. (Not with "a later session": the subject
+	// carries the incarnation generation, so a fresh incarnation names different
+	// subjects.) Only on discard, never on resume: an
 	// inbound QoS2 message pending PUBREL is session state (Spec5 [4.1]) that a
 	// resumed session must keep.
 	//
@@ -747,12 +761,17 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// releaser claimed first it waits briefly and then leaves both records rather than
 	// destroying a payload a crashed releaser's retry still needs. It reads no
 	// payloads at all. See qos2_release_claim.go.
-	// There is deliberately NO blind filter purge left beside this. Every hold
-	// subject of this incarnation is reached by the arbitration, and a filter purge
-	// alongside it could only destroy what the arbitration decided to preserve: a
-	// held payload whose releaser claimed it (and which its retry still needs after a
-	// crash), or the claim records themselves — including the `discarded` markers
+	// There is deliberately NO blind filter purge left beside this. Every hold subject
+	// this incarnation had WHEN THE WALK ENUMERATED is reached by the arbitration, and a
+	// filter purge alongside it could only destroy what the arbitration decided to
+	// preserve: a held payload whose releaser claimed it (and which its retry still needs
+	// after a crash), or the claim records themselves — including the `discarded` markers
 	// that are the only durable proof a late releaser must lose.
+	// The enumeration is a one-shot snapshot, and a peer still serving this incarnation can
+	// write after it: a subject the walk never enumerated is never arbitrated, while one it
+	// did enumerate can be re-occupied before the purge lands. Which finding owns which
+	// direction is stated once, in F-036 and F-062 (docs/findings/ha-arbitration.md); this
+	// paragraph covers neither.
 	if sess.asm != nil {
 		if err := sess.asm.arbitrateQoS2ReleaseClaims(sess.asm.server(), t.idHash, t.gen); err != nil {
 			return fmt.Errorf("unable to arbitrate the inbound QoS2 releases of session %q: %w", t.id, err)
@@ -765,13 +784,21 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// outbound QoS 1/2 delivery session state, and a discard destroys it rather than
 	// carrying it into whatever session next uses this client ID.
 	//
-	// A blind filter purge is CORRECT here, and the contrast with the arbitrated hold
-	// walk above is the point. A register has no second party: nothing else claims it,
-	// waits on it, or reads it as proof — it is one session's private note about its
-	// own identifier space, whereas a hold record is a payload another broker's
-	// releaser may still be committed to delivering. And the filter names the RETIRING
-	// generation, which clear() re-mints before this runs, so even a badly delayed
-	// purge can only name subjects no live session can ever occupy.
+	// A filter purge is used here rather than the arbitrated walk above, and the contrast
+	// is deliberate: on THIS broker nothing else is competing for a register — no claim
+	// record, no marker — whereas a hold record is a payload another broker's releaser may
+	// still be committed to delivering. (A register is not inert even so: a resuming
+	// session reads one as durable authority and rewrites it to take ownership, see
+	// claimRecoveredSharedInflight.) The filter names the RETIRING
+	// generation, which clear() re-mints before this runs, so a delayed purge cannot name a
+	// subject the NEXT incarnation occupies.
+	//
+	// That is the whole of what is established, and it is deliberately NOT a correctness
+	// verdict. A resume preserves the generation, so a peer may still be serving this
+	// incarnation and holding registers under these very subjects; "no second party" is a
+	// statement about this broker, not about the cluster. Whether that costs anything is
+	// $MQTT_inflight's own consequence question — F-034, unaudited — and the same premise's
+	// cost on $MQTT_qos2in is F-062. Do not read this paragraph as clearing either.
 	if t.idHash != _EMPTY_ && t.gen != _EMPTY_ {
 		filter := mqttInflightWalkFilter(t.idHash, t.gen)
 		if err := sess.jsa.purgeStream(mqttInflightStreamName, filter, noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
@@ -893,10 +920,16 @@ func (sess *mqttSession) releaseSharedTeardownDurables(t *mqttTeardownTarget, no
 // finish, so its record can be released and the client can start fresh.
 //
 // It never resumes the marked state and never overwrites the marker: it adopts the
-// existing nonce, repeats the (idempotent, generation-scoped) deletions and
-// releases the record. A concurrent finisher — including the original owner waking
-// up — is harmless: both delete the same retired names, one wins the record delete,
-// and the loser's classifying re-read reports released or superseded.
+// existing nonce, repeats the generation-scoped deletions and releases the record. A
+// concurrent finisher — including the original owner waking up — converges on the RECORD:
+// both delete the same retired names, one wins the record delete, and the loser's
+// classifying re-read reports released or superseded.
+//
+// "Idempotent" is NOT claimed for the inbound QoS 2 hold walk, and F-062 A2 is why: a
+// repeat observes the `discarded` marker an earlier finisher left and purges by subject,
+// so if a peer still serving this generation accepted a new exchange on that identifier
+// meanwhile, the repeat destroys it. Repetition is safe for names nothing can re-occupy;
+// it is not safe for a subject a live peer can still write.
 //
 // This is also what makes a CRASHED teardown self-healing, which previously leaked
 // until the orphan sweep.

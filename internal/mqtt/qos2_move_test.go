@@ -705,11 +705,16 @@ func (b *testQoS2Broker) consumeOne(t *testing.T, payload string) {
 
 // THE regression test for the flaw that rejected the first design: a finalizer
 // that re-read after a failed CAS and retried against the newly observed sequence
-// could CAS a NEWER session generation's held record into a tombstone, discarding
+// could CAS a LATER EXCHANGE's held record into a tombstone, discarding
 // a message that was never delivered.
 //
-// The seam replaces the held record with a different generation in exactly the
-// window a session discard plus a new PUBLISH would. The finalizer must classify
+// A later EXCHANGE, not a newer session generation: the hold subject carries the
+// incarnation generation, so a fresh incarnation names a different subject entirely.
+// What collides is a client reusing the packet identifier once its previous exchange
+// completed, which it may do immediately.
+//
+// The seam replaces the held record with a different exchange generation in exactly the
+// window a completed exchange plus a new PUBLISH would. The finalizer must classify
 // that as superseded, mutate nothing, and answer 0x92 — and the replacement must
 // still be deliverable afterwards.
 func TestQoS2FinalizeDoesNotMutateNewGeneration(t *testing.T) {
@@ -1523,4 +1528,179 @@ func mqttTestTopicSubject(t *testing.T, topic string) []byte {
 		t.Fatalf("subject conversion for %q: %v", topic, err)
 	}
 	return subj
+}
+
+// TestQoS2InEveryWriteCarriesItsExpectation pins the claim F-032's audit rests on:
+// EVERY write this protocol makes to $MQTT_qos2in carries a per-subject expectation,
+// three of the four are create-only, and the fourth commits at the sequence its caller
+// loaded. $MQTT_willq's equivalent claim is four line numbers in a README, which nothing
+// would notice going stale; this makes it executable for this stream.
+//
+// TWO oracles, because neither alone is sufficient and that is measured rather than
+// assumed:
+//
+//   - The RAW EMITTED BYTES, through the process-global pre-store hook, which receives the
+//     fully encoded message. This is the only oracle that can see a header the encoder
+//     failed to write: the instance seams below observe the expectSeq ARGUMENT, which is
+//     unchanged when a builder stops emitting it.
+//   - The CALL-SITE ARGUMENTS, through the three instance seams, each delegating to the
+//     real implementation so the flow stays real. This is the only oracle that can see a
+//     call site passing the wrong base, which the raw bytes cannot distinguish from a
+//     legitimate CAS at a nonzero sequence.
+//
+// Deliberately NOT parallel: mqttTestStoreMsgHookV is process-global, and testHookGate
+// bounds a closure's lifetime rather than arbitrating two installers.
+func TestQoS2InEveryWriteCarriesItsExpectation(t *testing.T) {
+	b := testQoS2Setup(t, "everywrite")
+
+	type rawStore struct {
+		subject string
+		expects int
+	}
+	type argStore struct {
+		writer    string
+		subject   string
+		expectSeq uint64
+	}
+
+	var mu sync.Mutex
+	var raws []rawStore
+	var args []argStore
+
+	// The raw oracle. Registered gate-first so the restore stops new calls and the gate
+	// then waits out any already inside (see testHookGate).
+	gate := newTestHookGate(t)
+	restore := setMQTTTestStoreMsgHook(func(subject string, hdrLen int, msg []byte) error {
+		// Filter BEFORE the gate, never after. gate.enter() returns holding a mutex, so
+		// entering first would serialize every storeMsg in the process — including other
+		// tests' servers, which run concurrently with this one — on a single lock for the
+		// whole of this test. Prefix-matching first keeps the hook a string compare for
+		// every store that is not ours.
+		if !strings.HasPrefix(subject, mqttQoS2IncomingMsgsStreamSubjectPrefix) {
+			return nil
+		}
+		if !gate.enter() {
+			return nil
+		}
+		defer gate.leave()
+		mu.Lock()
+		raws = append(raws, rawStore{
+			subject: subject,
+			expects: mqttCountHeader(JSExpectedLastSubjSeq, msg[:hdrLen]),
+		})
+		mu.Unlock()
+		return nil
+	})
+	t.Cleanup(restore)
+
+	// The call-site oracle. Each seam records its argument and delegates.
+	b.asm.mu.Lock()
+	b.asm.testQoS2HoldStore = func(subject string, expectSeq uint64, hdrLen int, msg []byte) (uint64, error) {
+		mu.Lock()
+		args = append(args, argStore{"W1-hold", subject, expectSeq})
+		mu.Unlock()
+		return b.jsa.storeQoS2HoldCAS(subject, expectSeq, hdrLen, msg)
+	}
+	b.asm.testQoS2FinalizeStore = func(subject, gen string, expectSeq uint64) (uint64, error) {
+		mu.Lock()
+		args = append(args, argStore{"W2-finalize", subject, expectSeq})
+		mu.Unlock()
+		return b.jsa.storeQoS2DoneCAS(subject, gen, expectSeq)
+	}
+	b.asm.testQoS2ClaimStore = func(subject string, expectSeq uint64, c *mqttQoS2RelClaim) (uint64, error) {
+		writer := "W3-releaser-claim"
+		if c.State == mqttQoS2RelStateDiscarded {
+			writer = "W4-discard-claim"
+		}
+		mu.Lock()
+		args = append(args, argStore{writer, subject, expectSeq})
+		mu.Unlock()
+		return b.jsa.storeQoS2RelClaimCAS(subject, expectSeq, c)
+	}
+	b.asm.mu.Unlock()
+
+	// The oracles are evaluated in a DEFERRED block, and that is load-bearing rather
+	// than stylistic. A call site passing the wrong expectation breaks the exchange, so
+	// a flow assertion below fatals first and an inline check would never be reached —
+	// the test would still "fail", but for the flow rather than for the expectation, and
+	// a mutation killed that way discriminates nothing. Deferring means a wrong base is
+	// reported as the wrong base, by name.
+	var heldSeq uint64
+	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		// --- Oracle 1: every emitted store carried exactly one expectation header. ---
+		if len(raws) == 0 {
+			t.Error("the raw store oracle observed nothing; the hook or the prefix filter is wrong")
+		}
+		for _, r := range raws {
+			if r.expects != 1 {
+				t.Errorf("store to %q emitted %d %s headers, want exactly 1",
+					r.subject, r.expects, JSExpectedLastSubjSeq)
+			}
+		}
+
+		// --- Oracle 2: each writer was reached, with the base the audit claims. ---
+		seen := map[string]bool{}
+		for _, a := range args {
+			seen[a.writer] = true
+			switch a.writer {
+			case "W1-hold", "W3-releaser-claim", "W4-discard-claim":
+				// Create-only. A nonzero expectation here means the write is conditioned on a
+				// base it read, which is a different protocol from the documented one.
+				if a.expectSeq != 0 {
+					t.Errorf("%s to %q used expectation %d, want 0 (create-only)",
+						a.writer, a.subject, a.expectSeq)
+				}
+			case "W2-finalize":
+				// The terminal commit must name the held record's own sequence. Zero would make
+				// it a create, and any other value is a base this releaser never loaded.
+				if heldSeq != 0 && a.expectSeq != heldSeq {
+					t.Errorf("%s to %q used expectation %d, want the held sequence %d",
+						a.writer, a.subject, a.expectSeq, heldSeq)
+				}
+			}
+		}
+		for _, w := range []string{"W1-hold", "W2-finalize", "W3-releaser-claim", "W4-discard-claim"} {
+			if !seen[w] {
+				t.Errorf("%s was never reached; the inventory claims four writers and this run exercised %v",
+					w, seen)
+			}
+		}
+	}()
+
+	// A real exchange: PUBLISH (W1) -> PUBREL, which claims (W3), stores onward, and
+	// commits the tombstone (W2).
+	const pi = uint16(7)
+	holdSubject := b.holdSubject(t, pi)
+	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("everywrite"))
+	testMQTTReadPubRecV5(t, b.rp, pi)
+
+	// The held record's sequence, which W2 must CAS at. Read before the PUBREL, so this
+	// is the value the releaser will have loaded.
+	var err error
+	_, heldSeq, err = b.jsa.loadQoS2Record(holdSubject)
+	if err != nil || heldSeq == 0 {
+		t.Fatalf("expected a held record with a sequence: seq=%d err=%v", heldSeq, err)
+	}
+
+	testQoS2SendPubRel(t, b.cp, pi)
+	if reason, _ := testMQTTReadPubCompV5(t, b.rp, pi); reason != mqttReasonSuccess {
+		t.Fatalf("PUBCOMP reason = 0x%x, want 0x%x", reason, mqttReasonSuccess)
+	}
+	b.consumeOne(t, "everywrite")
+
+	// A real discard arbitration, for W4: hold a second exchange, then let the discard
+	// half compete for it exactly as clear() does.
+	const pi2 = uint16(8)
+	testMQTTPublishV5(t, b.cp, 2, pi2, b.topic, []byte("discardme"))
+	testMQTTReadPubRecV5(t, b.rp, pi2)
+	cl := testMQTTGetClient(t, b.s, b.pubID)
+	cl.mqtt.sess.mu.Lock()
+	idHash, gen := cl.mqtt.sess.idHash, cl.mqtt.sess.gen
+	cl.mqtt.sess.mu.Unlock()
+	if err := b.asm.arbitrateQoS2ReleaseClaims(b.s, idHash, gen); err != nil {
+		t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
+	}
 }

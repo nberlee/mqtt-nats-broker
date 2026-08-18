@@ -11,8 +11,10 @@ import (
 // expiry, or a server-forced disconnect such as MQTT 5.0 Receive Maximum
 // exceeded, reason 147) purges that incarnation's inbound QoS2 records in
 // $MQTT_qos2in — BOTH record states, held and the terminal tombstone a committed
-// move leaves behind. The wildcard purge covers both; this test pins that, since
-// a tombstone left behind would make a later session's PUBLISH on the same packet
+// move leaves behind. The per-subject arbitrated purge covers both (there is no
+// wildcard purge: the discard enumerates this incarnation's generation-scoped hold
+// subjects and purges each where it wins the release claim); this test pins that,
+// since a tombstone left behind would make a later PUBLISH on the same packet
 // identifier take the reap-and-retry path instead of a clean create.
 //
 // Regression: without the purge, a discarded session's QoS2 records linger
@@ -90,9 +92,9 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 		t.Fatalf("expected the terminal QoS2 record to be purged by sess.clear, got rec=%v err=%v", rec, err)
 	}
 	// clear() re-minted the incarnation, so a later session for the same client ID
-	// hashes to the same idHash but holds on a DIFFERENT subject. That is what makes
-	// a late purge from the discarded incarnation harmless: it can no longer name
-	// this record.
+	// hashes to the same idHash but holds on a DIFFERENT subject. That is what makes a
+	// late purge from the discarded incarnation harmless TO THE NEXT INCARNATION: it can
+	// no longer name this record. (F-062 for what it does not protect.)
 	sess2, _, err := asm.createOrRestoreSession(clientID, s.getOpts())
 	if err != nil {
 		t.Fatalf("createOrRestoreSession (second session): %v", err)
@@ -120,8 +122,9 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 
 	// Re-running the RETIRED incarnation's destruction — the late-delete window a
 	// nonce re-check cannot close — must not touch the new incarnation's record.
-	// This is the arbitration walk now, and it is scoped by the retired generation,
-	// so it can only name subjects that no longer exist.
+	// This is the arbitration walk now, and it is scoped by the retired generation, so it
+	// cannot name the NEW incarnation's subjects. (A peer still serving the retiring
+	// generation is a different matter: F-062.)
 	if err := asm.arbitrateQoS2ReleaseClaims(s, sess.idHash, retiringGen); err != nil {
 		t.Fatalf("replaying the retired incarnation's arbitration: %v", err)
 	}

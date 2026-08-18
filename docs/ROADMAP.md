@@ -82,8 +82,9 @@ enforce the header across elections
 ([`nats-server#8469`](https://github.com/nats-io/nats-server/issues/8469#issuecomment-5304075553)).
 No further lineage is to be added on the strength of the old premise without checking it
 against that inventory.
-The per-stream findings F-032 through F-034 inherit the server contract and the canary,
-but each still needs its own consequence audit.
+The per-stream findings inherit the server contract and the canary, but each needs its own
+consequence audit. **F-033 and F-034 still owe theirs.** F-032's ran on 2026-08-17: no
+lineage was needed, and it produced F-062, which is open.
 
 - [x] Decide and document the first-alpha HA support level. Decided: multi-frontend
   HA stays in alpha scope. The README already promises it, the architecture is
@@ -384,8 +385,9 @@ but each still needs its own consequence audit.
   dependency tests, and are never cited as evidence about the server. The corresponding
   same-base conditional terminal-regression and claimant-divergence residuals are
   retired for a conforming `$MQTT_willq`. Unconditional foreign writes introduced by
-  post-start stream-configuration drift remain outside F-030. F-032 through F-034
-  inherit the server contract and the canary, not a checkbox.
+  post-start stream-configuration drift remain outside F-030. The per-stream findings
+  inherit the server contract and the canary, not a checkbox: **F-033 and F-034 have still
+  not been audited.** F-032's audit has run and closed, producing F-062.
 - [x] **Audit the session write-lineage machinery for deletion, obligation by
   obligation.** Prescribed by F-030's evidence and deliberately NOT folded into it.
   **DELETED: the whole CREATE side.** All four sources a create drew a parent from — the
@@ -496,13 +498,59 @@ but each still needs its own consequence audit.
   false statement the reviews and sweeps surfaced was corrected. A stale comment found
   later is an ordinary defect, not a reopening of this item.
 
-- [ ] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
-  **Consequence audit, not a lineage design.** F-030's evidence bears on the shared
-  premise for this stream too, so the question left is this stream's OWN: whether any
-  hold or `.rel` claim it makes is unconditional, taken from a base it did not read, or written
-  by a path outside `test/depproof/`'s inventory — and what a duplicate inbound QoS 2
-  delivery would cost if one were. Add lineage only for what that audit finds, with a
-  fixture and a discriminating mutation for it.
+- [x] [F-032: Add write lineage to inbound QoS 2 state](findings/ha-arbitration.md#f-032).
+  **Audited 2026-08-17. No lineage was needed, and the audit produced a new alpha blocker,
+  F-062 below.** Those are two separate results; the first does not imply "nothing
+  actionable remains", which is the conflation the first five drafts of this item made.
+  All four bridge-authored writes to `$MQTT_qos2in` carry `JSExpectedLastSubjSeq` — three
+  create-only, one at the writer's own loaded sequence under a generation comparison — so
+  clauses (a) and (b) answer NO over an inventory derived from two mechanical sweeps
+  (complete for bridge-authored data mutations with the test seams nil, not "by
+  construction"). The upstream contract is **inherited by citation** from F-030 rather than
+  re-proved, and no `test/depproof/` row was added; `docs/ARCHITECTURE.md`, "Trusting the
+  backend" now states why re-proving or reimplementing an unprovable upstream guarantee is
+  the wrong instinct, and where the line between a dependency gap and our own gap falls.
+  Lineage was refused on the merits: three writes are create-only so there is no base to
+  descend from, and the fourth is guarded by an immutable exchange generation.
+  **What the audit found instead** is the one route `$MQTT_willq`'s inventory never needed:
+  `purgeQoS2Hold` names a SUBJECT, not a sequence, so JetStream has no condition to enforce
+  because the bridge never supplied one. Its teardown caller is F-062; its orphan-sweep
+  caller and the post-enumeration gap went to F-036. Also corrected: the statements that had
+  made the defect unrecognisable, including the headline "no silent loss on any PUBREL path",
+  "exactly one create can ever succeed", a `discarded` marker concerning "only ever" its own
+  exchange, and "a late purge is harmless by naming". Those sentences are why it survived
+  review, so correcting them is part of filing it.
+- [ ] [F-062: Bound the inbound QoS 2 hold purge and the discard marker it leaves](findings/ha-arbitration.md#f-062).
+  **Alpha blocker, found by F-032's audit.** *The dossier is authoritative for the
+  mechanisms, their arms and the remedy constraints; this bullet is a derived summary so the
+  item can be scheduled from the roadmap, per the section's convention. Correct the dossier
+  first, then this.* Two mechanisms sharing one precondition: a
+  teardown that WINS its claim against a peer still serving the same incarnation (a resume
+  preserves the generation), while that peer's client reuses a packet identifier.
+  **Mechanism 1** — the teardown's hold removal is a SUBJECT purge, so a hold accepted and
+  PUBREC-acknowledged on an ALREADY-ENUMERATED subject, while that subject's purge is still
+  pending, is destroyed. (A hold on a subject the enumeration never saw is missed instead,
+  which is F-036's post-enumeration manifestation and the opposite direction.)
+  **Mechanism 2** — the `discarded` marker the teardown leaves is reaped by no teardown or
+  releaser path (it is the only durable proof a late releaser of the retired incarnation
+  must lose), so a LATER exchange on that identifier reads it and is answered 0x92 with its
+  hold released; only the age-qualified orphan sweep can retire it, hold first, and that
+  recovery is conditional on the sweep running. Both lose an **acknowledged**
+  PUBLISH. Bounding the purge does not fix mechanism 2, which is why they are separate.
+  Direction for both is loss, established by exhausting the arms that read a claim state;
+  cleanup does send PUBCOMP and free the identifier, so neither wedges the protocol.
+  Recovery from the poisoning is conditional on an orphan sweep whose liveness has three
+  documented limits. **Leading remedy for mechanism 1** is a purge cutoff:
+  `JSApiStreamPurgeRequest.Sequence` combines with `Subject`, and `StreamState.LastSeq` is
+  already in the `STREAM.INFO` response `streamSubjects` discards, so `Sequence: E+1` needs
+  no payload read and no per-hold sequence — but `LastSeq` and `Subjects` are not one
+  snapshot, so the honest claim is "bounded to sequences at or below E", and a hold
+  above the cutoff survives to the sweep rather than being destroyed. **Mechanism 2's
+  remedy is open and constrained**: it must not UNCONDITIONALLY reap the marker; a conditional
+  exact-sequence reap is safe only given durable evidence the marker does not fence the
+  loaded hold. Note for whoever takes it: the obvious repair (reap when
+  `holdSeq > claimSeq`) is wrong — the dossier's ordering 2 has the later hold PRECEDING the
+  marker, and the paired fixture must fail on both orderings so a partial fix cannot pass.
 - [ ] [F-033: Add write lineage to shared QoS 2 assignments](findings/ha-arbitration.md#f-033).
   **Consequence audit.** Same shape as F-032; the consequence to bound is a contender
   waiting on a `claimed` record whose owner never materialises.
@@ -533,6 +581,20 @@ but each still needs its own consequence audit.
   the shared client-ID gate for a bound session is safe here when it is not for a
   concurrent SUBSCRIBE (`docs/ARCHITECTURE.md`, "A definite record-CAS rejection is
   outstanding work"). Found by the Slice A holistic review.
+  **Scope WIDENED 2026-08-17 by F-032's audit, from the absent-record tail to "the previous
+  owner keeps serving, or is misread as gone, after ownership moved".** Two manifestations
+  were added, both consequences of this finding's own condition rather than new findings:
+  (1) `arbitrateQoS2ReleaseClaims` enumerates hold subjects ONCE, so a hold on a subject
+  ABSENT from that snapshot is never arbitrated, and a peer that has not yet observed the
+  ownership marker delivers it **after the session was discarded** — a delivery that should
+  not have happened, not a loss, and deliberately not something F-062's purge cutoff
+  addresses. (A replacement on an already-enumerated subject is F-062 mechanism 1 instead:
+  it is reached by name and destroyed.);
+  (2) the orphan sweep runs under no teardown claim and infers liveness from this broker's
+  residents plus persisted records only, so a live remote generation whose record is absent
+  is invisible and its hold is condemned — including when a bridge-authored teardown was
+  what deleted that record. A fix must answer both, not only the silent-Keep-Alive-0 case,
+  and should stage the post-enumeration ordering explicitly.
   **`RWID` may be the predicate this needs.** The retirement watermark's `RWID` is now
   the only durable statement of *"this specific record was retired"* — record-absence is
   ambiguous, and the generation test needs a surviving record to compare, whereas

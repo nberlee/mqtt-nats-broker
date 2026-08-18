@@ -50,9 +50,10 @@ this audit's expectation: an old-term write is ADMITTED there, which is the diff
 the floor buys, but it never becomes the surviving record, because an apply-time
 log-order check that both generations have discards it.
 
-That closure belongs to `$MQTT_willq`. F-032 through F-034 inherit the server contract
-and the canary, and each still needs its own consequence audit before it closes; the
-lineage-deletion audit is its own roadmap bullet and is now unblocked.
+That closure belongs to `$MQTT_willq`. The per-stream findings inherit the server contract
+and the canary, and each needs its own consequence audit before it closes. **F-033 and
+F-034 still need theirs.** F-032's ran on 2026-08-17 and closed without lineage, producing
+F-062. The lineage-deletion audit is its own roadmap bullet and is now unblocked.
 Fields used for other facts, notably `RWID` as possible positive retirement evidence
 for F-036, do not
 fall merely because the term window does.

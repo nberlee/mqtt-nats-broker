@@ -121,9 +121,12 @@ CI gates on *new* failures only:
   payload resurface on PUBREL — the "stray `message N`" that broke these two
   tests when run after `test_flow_control2` in the full sequential suite (both
   passed standalone). `sess.clear()` (`internal/mqtt/mqtt.go`), the single
-  funnel for every session-discard path, now also purges the discarded
-  session's QoS2 hold entries via a JetStream `STREAM.PURGE` filtered on the
-  client's hashed subject prefix. Regression test:
+  funnel for every session-discard path, now also destroys the discarded
+  session's QoS2 hold entries. (It no longer does so with a hash-prefix
+  `STREAM.PURGE`, as this bullet originally described: it enumerates the retiring
+  incarnation's generation-scoped hold subjects and arbitrates each one, purging
+  only where it wins the release claim. See "Inbound QoS 2 PUBREL is at-least-once
+  across the unresolved move interval".) Regression test:
   `TestSessionClearPurgesQoS2Hold` (`internal/mqtt/qos2_purge_test.go`).
 - **Server Keep Alive** (`test_server_keep_alive`): configurable cap via
   `MQTTNB_KEEPALIVE_MAX` / `-keepalive-max` (0 = no override), advertised in
@@ -1183,8 +1186,11 @@ What it does NOT do:
      clients; they are not a guard against permitted NATS publication.
   3. **Untouched**, and the reasons differ per stream — do not collapse them.
      **Deletes** carry no per-subject expectation, so no admission closure speaks about
-     them. **`$MQTT_qos2in`, `$MQTT_qos2assign` and `$MQTT_inflight`** await their own
-     consequence audits — F-032, F-033 and F-034 respectively — which are open.
+     them. **`$MQTT_qos2assign` and `$MQTT_inflight`** await their own
+     consequence audits — F-033 and F-034 respectively — which are open. **`$MQTT_qos2in`'s
+     ran (F-032, closed 2026-08-17)**: every write there carries its expectation, so it
+     needed no lineage, and what it found instead was a hold purge carrying no condition at
+     all — F-062 and F-036, neither of which this admission closure speaks to.
      **`$MQTT_teardown`** is not one of those: it carries its own separately documented
      residuals (the retirement watermark and the single slot), stated where they arise.
      **`$MQTT_origin` is not in scope at all**: the register was deleted by the
@@ -1537,8 +1543,9 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   change the stream-level admission and sequence mechanisms that refuse it.
 - **What the closure says nothing about.** `$MQTT_sess`, `$MQTT_qos2in`,
   `$MQTT_qos2assign` and `$MQTT_inflight`: the server mechanisms are stream-independent,
-  but each of those findings owns its own consequence, and F-032 through F-034 stay open
-  until each is audited on its own terms. It also does not claim the two backstops below
+  but each of those findings owns its own consequence. **F-033 and F-034 stay open until
+  each is audited on its own terms.** F-032 has since been audited and closed, producing
+  F-062, which is open. It also does not claim the two backstops below
   the proved mechanisms — an entry admitted anyway is discarded by apply-time log order,
   and beneath that by the store's refusal of any sequence that is not the next one — but
   neither is mutation-proved and neither is part of any claim.
@@ -1739,7 +1746,10 @@ Residuals and hard requirements:
   storage is permanent and bounded by the client-ID population.
 - **An orphaned PUBREL durable is now reaped, and the PUBRELs it held go with it.**
   A `$MQTT_PUBREL_<idHash>_<gen>` consumer on the interest-retained `$MQTT_out` whose
-  session generation is authoritatively absent was previously referenced by nothing and
+  session generation is absent from the sweep's evidence — the persisted records plus the
+  sweeping broker's own residents, which is what "authoritatively absent" means here and
+  which does **not** observe a session live on another broker whose record was removed
+  (F-036's open false-absence inference) — was previously referenced by nothing and
   accumulated forever; the orphan sweep now deletes it after a complete reference walk,
   a full stable-observation grace, a final authoritative record re-read and an
   instance re-lookup. The undelivered PUBRELs it was holding are dropped with it, which
@@ -1789,13 +1799,32 @@ finds the tombstone answers `0x00` without re-delivering.
 
 The guarantee, stated exactly:
 
-> No silent loss on any PUBREL path. Once the terminal state commits, suppression
+> No silent loss on any PUBREL path **of a session whose ownership does not move under
+> it** (see the F-062 exception below). Once the terminal state commits, suppression
 > of re-delivery is indefinite and independent of the deduplication window, the
 > broker's lifetime, and the nats-server's. Across the *unresolved* interval
 > between the onward store and that commit, the durable (QoS 1/2 subscriber) path
 > is exactly-once only while deduplication survives; otherwise it is
 > at-least-once. The live core-NATS fan-out is at-least-once in that same interval
 > and cannot be made otherwise.
+
+**The F-062 exception, stated so the guarantee above is not read wider than it holds.**
+*Derived from `docs/findings/ha-arbitration.md` F-062, which is authoritative for the
+mechanisms and their arms; what follows states only what a reader of the guarantee needs.*
+The guarantee covers the exchange's own paths. It does **not** cover loss inflicted from
+outside the exchange by a teardown running for an incarnation a peer is still serving. A
+teardown that WON its claim removes holds by subject filter, so an exchange accepted and
+PUBREC-acknowledged on an **already-enumerated hold subject**, while that subject's purge
+is still pending, is destroyed. (A hold on a subject the enumeration never saw is missed
+rather than destroyed — that is F-036, below, and a different direction.) Separately, the
+`discarded` marker the teardown leaves is **not reaped by any teardown or releaser path**,
+so it is read by a LATER exchange on the same packet identifier, which is then answered
+`0x92` with its hold released; only the age-qualified orphan sweep can retire it, hold
+first, and that recovery is conditional on the sweep running. Both lose an
+acknowledged PUBLISH. This is an **open alpha blocker, not a stated deviation**: see
+`docs/findings/ha-arbitration.md` F-062. Two neighbouring consequences of the same
+condition (a delivery after discard, and the orphan sweep condemning a live remote
+generation whose record is absent) belong to F-036, whose scope was widened for them.
 
 This is **not** "exactly-once across a nats-server restart", and should not be
 described that way.
@@ -1822,9 +1851,13 @@ The deviations that remain:
   completed.** A PUBREL now takes a durable **release claim** before delivering
   anything (`internal/mqtt/qos2_release_claim.go`): a create-only CAS on a sibling
   of the hold subject, which a session discard competes for and which exactly one
-  of them can win. So a discard that observes no claim can never be followed by a
-  delivery of that message, and the finalizer can no longer read a purge's absence
-  as proof the exchange completed. What the claim does not order is the wire: a
+  of them can win **while a record occupies that subject**. So a discard that observes no
+  claim is not followed by a delivery **of the exchange it enumerated**, and the finalizer
+  can no longer read a purge's absence as proof the exchange completed. Two limits on that
+  sentence: the enumeration is a one-shot snapshot, so a hold on a subject it never saw is
+  never competed for and CAN still be delivered after the discard (F-036); and the claim
+  subject is reused by successive exchanges, so exclusivity is per-occupancy rather than per
+  identifier for all time (F-062). What the claim does not order is the wire: a
   releaser that claimed before the discard observed the register is committed, and
   its live core-NATS fan-out may reach subscribers after the discard released the
   session record and its CONNACK reported Session Present false. The delivery
@@ -1835,8 +1868,12 @@ The deviations that remain:
 - **A discarded session leaves one small claim record per inbound QoS 2 exchange
   that was in flight.** The `discarded` marker is the only durable proof that a
   late releaser must lose, so nothing may reap it at teardown time — "no releaser
-  is still in flight" is not provable. It is inert (roughly 150 bytes, on a subject
-  scoped to the retired incarnation). It is retired by the periodic orphan sweep
+  is still in flight" is not provable. It is small (roughly 150 bytes, on a subject
+  scoped to the retiring incarnation), but **it is not inert**: a peer still serving that
+  incarnation can accept a LATER exchange on the same packet identifier, and the marker
+  then answers that exchange `0x92` and releases its hold. That is F-062 mechanism 2, an
+  open blocker — the marker's reach is not confined to the exchange it was written
+  for. It is retired by the periodic orphan sweep
   once it has been **continuously observed as an orphan**, unchanged, for a
   deliberately long grace (one hour, against five minutes for construction-window
   state) and only **after** the hold record it fences has been destroyed and
@@ -1850,19 +1887,24 @@ The deviations that remain:
   answers `0x00` where it would previously have answered `0x92`.** With the marker
   intact such a releaser observes it and reports the identifier as gone; once the
   sweep has destroyed the hold and removed the marker, it wins a fresh claim,
-  re-reads the hold as absent, and reports success. Nothing is delivered and
-  nothing is lost either way — only the reason code is more optimistic than the
-  marker-backed one.
+  re-reads the hold as absent, and reports success. For the exchange the marker was
+  written for, nothing is delivered and nothing is lost either way — only the reason
+  code is more optimistic than the marker-backed one. **That does not extend to a
+  LATER exchange the stale marker had fenced**: there the sweep destroys a hold whose
+  client was told it was held, and the preloaded PUBREL then answers success without
+  delivering. See F-062 mechanism 2.
 - **A `releasing` claim whose broker died is retired the same way**, hold first.
   This does not prove a paused process can never resume; it preserves the ordering
   that already governs one. A releaser that has not passed its authoritative
   re-read delivers nothing, and one already beyond it is inside the post-claim
   delivery-ordering residual above. Age cleanup is not exactly-once coordination.
 - **A superseded PUBREL is answered `0x92` after its message was in fact
-  delivered.** When a newer session generation has taken the same
-  `(client, packet identifier)` subject, the finalizer abandons without mutating
-  anything and reports the identifier as gone. No loss, and the newer
-  generation's payload is untouched.
+  delivered.** When a later exchange has taken the same
+  `(client, packet identifier)` subject — a client may reuse an identifier as soon as
+  its exchange completes, and the subject is generation-scoped so this is never a
+  different incarnation — the finalizer abandons without mutating
+  anything and reports the identifier as gone. No loss, and the later
+  exchange's payload is untouched.
 
 What is handled rather than deviating: a hold lookup that fails for any reason
 other than "not found", an unresolved release claim or an unresolved proof of the

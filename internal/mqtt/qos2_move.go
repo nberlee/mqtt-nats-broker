@@ -18,13 +18,19 @@
 //
 // # The guarantee
 //
-// No silent loss on any PUBREL path. Once the terminal state commits, suppression
+// No silent loss on any PUBREL path **of a session whose ownership has not moved
+// under it** — see F-062 for the exception, which this guarantee does not cover.
+// Once the terminal state commits, suppression
 // of re-delivery is indefinite and independent of the deduplication window, the
 // broker's lifetime, and the nats-server's. Across the *unresolved* interval
 // between the onward store and that commit, the durable (QoS 1/2 subscriber) path
 // is exactly-once only while deduplication survives; otherwise it is
 // at-least-once. The live core-NATS fan-out is at-least-once in that same
 // interval and cannot be made otherwise.
+//
+// The exception is a teardown running for an incarnation a peer is still serving, which
+// can lose an acknowledged PUBLISH from outside this exchange. Its mechanisms and their
+// bounds are stated once, in F-062 (docs/findings/ha-arbitration.md).
 //
 // Do not restate this as "exactly-once across nats-server restart". It is not.
 //
@@ -55,21 +61,27 @@
 //     peer's completion from delivering twice. Neither substitutes for the other,
 //     and both live in qos2_release_claim.go.
 //
-// Why identity is a generation ID and not a stream sequence: mqttSession.clear()
-// purges hold records by client hash, while the hold subject is keyed by client ID
-// and packet identifier — so one subject is reused across session generations. A
-// finalizer that re-read after a failed CAS and retried against the newly observed
-// sequence could therefore CAS a NEWER generation's hold record into a tombstone
-// and discard that message. finalizeQoS2Move reconciles by generation first and
-// returns mqttQoS2FinalizeSuperseded without mutating anything, exactly as
+// Why identity is a generation ID and not a stream sequence: a client may reuse a
+// packet identifier as soon as its exchange completes, so one hold subject is reused
+// by successive EXCHANGES within one incarnation. (Not across incarnations: the
+// subject carries the incarnation generation, and mqttSessGenTk has no empty-string
+// branch. Nor by a hash-wide purge: there is none — the discard arbitrates per
+// subject, see qos2_release_claim.go.) A finalizer that re-read after a failed CAS
+// and retried against the newly observed sequence could therefore CAS a LATER
+// EXCHANGE's hold record into a tombstone and discard that message.
+// finalizeQoS2Move reconciles by generation first and returns
+// mqttQoS2FinalizeSuperseded without mutating anything, exactly as
 // finalizeWillPublish abandons on a foreign WillID.
 //
 // # Residual
 //
-// Loss is eliminated: the record leaves `held` only after the onward delivery
-// returned success, and no nonterminal cleanup is reported to the client until it
-// is confirmed (invariant 3; terminal tombstone cleanup stays asynchronous by
-// invariant 4). What remains:
+// Loss on the paths this protocol controls is eliminated: the record leaves `held`
+// only after the onward delivery returned success, and no nonterminal cleanup is
+// reported to the client until it is confirmed (invariant 3; terminal tombstone
+// cleanup stays asynchronous by invariant 4). What it does NOT eliminate is loss
+// inflicted from OUTSIDE the exchange, by a teardown for an incarnation a peer is
+// still serving — that is F-062, and it is an open blocker rather than a residual.
+// What remains here:
 //
 //  1. At-least-once live fan-out. A failure between processInboundClientMsg and
 //     the terminal commit re-runs the fan-out on the PUBREL retry, so QoS 0 MQTT
@@ -88,7 +100,9 @@
 //  4. A release that has already won its claim may still fan out after the discard
 //     completed. The delivery DECISION is now arbitrated against a session discard
 //     by a create-only claim taken before the onward store (qos2_release_claim.go),
-//     so a discard that observes no claim can never be followed by a delivery. The
+//     so a discard that observes no claim on a hold it ENUMERATED is not followed by a
+//     delivery of that hold. What the enumeration does not cover is F-036's; see the
+//     dossier rather than a restatement here. The
 //     wire is not ordered by it: a releaser that claimed first is committed, and
 //     its live fan-out may land after the discard released the session record. A
 //     discard that observes a claim waits briefly, and on the same broker an
@@ -499,7 +513,7 @@ func (as *mqttAccountSessionManager) loadQoS2Record(subject string) (*mqttQoS2Re
 //   - absent                        -> Gone (our record was reaped; the onward
 //     store already succeeded, so the exchange is complete)
 //   - a different (or no) generation -> Superseded: warn and mutate NOTHING. A
-//     newer session generation may own this subject, and CASing its record would
+//     later exchange on this identifier may own this subject, and CASing its record would
 //     replace an undelivered payload with our tombstone.
 //   - our generation, already done   -> Committed at the re-read sequence
 //   - our generation, still held     -> retry the CAS at the re-read sequence

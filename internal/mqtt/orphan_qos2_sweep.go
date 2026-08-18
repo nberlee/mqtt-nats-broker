@@ -10,8 +10,13 @@
 //   - an assignment claim on $MQTT_qos2assign whose winner generation no longer
 //     exists and which no contender happens to revisit.
 //
-// None of them loses a message — a stalled claim is honored, never released — but
-// all three accumulate. This file converges them, and it converges the fourth
+// None of them loses a message BY ACCUMULATING — a stalled claim is honored, never
+// released. That is not a claim that the state they represent is never lost: a stale
+// `discarded` marker among them can fence a LATER exchange's hold, and this file's own
+// retirement of it (hold first, then the marker) can then leave a preloaded PUBREL
+// answering success without delivering. See F-062. What follows converges the
+// accumulation; it does not make that loss impossible.
+// All three accumulate. This file converges them, and it converges the fourth
 // thing that would otherwise pin the other three in place: a teardown marker whose
 // broker died after claiming the record. sess_teardown.go promises such a marker is
 // finished by the next CONNECT that can interpret the record or by the orphan sweep —
@@ -21,14 +26,34 @@
 // deliberately reads as a REFERENCE to everything it names, so without the adoption
 // pass below a never-returning client's QoS 2 state could never become eligible.
 //
+// # What "AUTHORITATIVE" means in this file, and what it does not
+//
+// Read this before any other use of the word below. Every "authoritative" claim here —
+// the reference set, the record walk, the quarantine's grace, each revalidation — means
+// authoritative over TWO things: the persisted session records, and this broker's own
+// resident sessions. That is the whole of the evidence available to a sweeper.
+//
+// It does NOT observe a session that is live on ANOTHER broker whose persisted record is
+// absent. A resume preserves the incarnation generation, so such a session keeps using
+// the very (hash, generation) names this file condemns, and a teardown elsewhere can be
+// what removed its record. Absence from the reference set is therefore not proof that a
+// generation is dead; it is proof that this broker cannot see an owner.
+//
+// That gap is **F-036**'s open false-absence inference, whose scope was widened for it by
+// F-032's audit (docs/findings/ha-arbitration.md). It is not restated at each site below:
+// the word "authoritative" throughout this file carries exactly the bound stated here, and
+// the consequences per resource class belong to the findings that own those classes —
+// F-033, F-034 and F-036 — not to this comment.
+//
 // # What makes a deletion legal here
 //
 // Ownership is the (client-ID hash, generation) pair carried in the subject or the
 // durable name, never the hash alone — the hash is reused by every later session of
 // the same client ID. A resource is an orphan only when its generation is
-// AUTHORITATIVELY absent from a COMPLETE session-record walk: a failed lookup, a
-// partial scan, an undecodable record or an unvalidatable generation all abort the
-// destructive pass rather than being read as absence (invariant 1). Candidates are
+// AUTHORITATIVELY absent (in the bounded sense above) from a COMPLETE session-record
+// walk: a failed lookup, a partial scan, an undecodable record or an unvalidatable
+// generation all abort the destructive pass rather than being read as absence
+// (invariant 1). Candidates are
 // listed BEFORE that walk, so a resource created between the two is never
 // classified from a snapshot that predates it, and local in-memory sessions count
 // as references so the create-before-save window is covered on this broker.
@@ -474,7 +499,9 @@ func (as *mqttAccountSessionManager) forgetIfQ2AffClaimGone(subject string) {
 // A young marker, a malformed record, a failed re-read or a failed adoption all
 // leave the record exactly as it was, and it continues to protect everything it
 // names. Concurrent adoption — by the original broker waking up, by another
-// sweeper, or by a CONNECT — is safe under the existing teardown release
+// sweeper, or by a CONNECT — converges on the RECORD under the existing teardown release
+// (it is not safe for the inbound hold walk, whose second run can meet the first
+// adopter's `discarded` marker and purge a later exchange: F-062 arm A2)
 // reconciliation: both delete the same retired, generation-scoped names, one wins
 // the record delete, and the loser's classifying re-read reports released or
 // superseded.
@@ -1313,8 +1340,13 @@ const (
 //     teardown runs). For an already-claimed one the existing claim IS the fence.
 //  2. A claim is never deleted while its hold survives. Deleting it first would let
 //     a paused releaser win a fresh claim and then read its hold as still Held.
-//  3. Every delete targets the EXACT sequence just observed, so a delayed pass
-//     cannot remove a later exchange's record on a reused packet identifier.
+//  3. Every CLAIM delete targets the EXACT sequence just observed, so a delayed pass
+//     cannot remove a later exchange's claim on a reused packet identifier. The HOLD
+//     removal is deliberately different and this rule does not cover it:
+//     purgeQoS2Hold purges by SUBJECT, so a delayed pass can remove a later
+//     exchange's hold. What bounds it is the reference walk plus the marker ordering
+//     above, not sequence targeting — and that bound has a hole where a live remote
+//     generation's record is absent (F-036).
 func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQoS2InName,
 	q *mqttSweepQuarantine, holdGrace, claimGrace time.Duration) mqttQoS2SweepOutcome {
 	rec, holdSeq, herr := as.loadQoS2Record(n.hold)
@@ -1530,14 +1562,28 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 // reconcileOrphanInflight deletes in-flight registers whose owning session
 // incarnation is authoritatively absent.
 //
-// This is the simplest class in the sweep, and deliberately so. A register has no
-// second party — nothing claims it, waits on it, or reads it as proof of anything —
-// so there is no ordering to preserve and no fence to keep in place: once the
-// incarnation that owned it provably does not exist, the record is inert bookkeeping
-// about an identifier space nobody will ever consult again. What it shares with every
-// other class is the part that matters: absence is proven by the complete session
-// walk, never inferred, and eligibility is a STABLE OBSERVATION on this process's
-// monotonic clock rather than any stored timestamp.
+// This class has no ordering for the SWEEP to preserve: it competes with no claim record
+// and no marker, so there is no local fence to keep in place.
+//
+// That is not the same as "a register has no second party", which this comment used to
+// say and which the code contradicts: recovery reads registers as durable authority, and
+// claimRecoveredSharedInflight REWRITES one to make the recovery-versus-close decision
+// durable, invalidating every sequence an older session object held. A register is a
+// takeover fence for whoever is resuming. The actor doing that is exactly what the header
+// says this sweep cannot observe when its record is absent.
+//
+// What does NOT follow, and what this comment previously asserted: that the owning
+// incarnation provably does not exist, that the register is inert, or that nobody will
+// consult that identifier space again. Absence here means absent from the complete
+// session walk and this broker's residents, in the bounded sense the file header defines
+// — which does not observe a session live on another broker whose record was removed, a
+// resume having preserved its generation. Whether deleting a register in THAT state costs
+// anything is $MQTT_inflight's own consequence question (F-034, unaudited) and is
+// deliberately not answered here.
+//
+// What it does share with every other class: absence is established by the complete
+// session walk rather than inferred from a partial one, and eligibility is a STABLE
+// OBSERVATION on this process's monotonic clock rather than any stored timestamp.
 //
 // The construction grace applies (not the longer release-claim one): a register is
 // written moments before the delivery it names, so the window it has to survive is the
@@ -1749,14 +1795,24 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 	}
 }
 
-// discardAbsentWinnerClaim proves the winner absent and commits Discarded.
+// discardAbsentWinnerClaim establishes the winner absent FROM THIS SWEEP'S EVIDENCE and
+// commits Discarded.
 //
 // "Absent" is a high bar and the verification order matters. Any backend error
 // defers. A record whose affine generation MATCHES this claim defers, whether or not
 // the rest of it validates: a matching generation means either a live winner or a
 // pair we cannot interpret, and neither authorizes discarding its assignment. Only
 // an authoritatively absent record, or a valid record for a DIFFERENT generation,
-// proves this winner is gone.
+// gets past this bar.
+//
+// That bar is the strongest one available here; it is NOT a proof that the winner is
+// gone, and neither of the two ways past it is. "Authoritatively absent" carries the
+// bound the file header states — persisted records and this broker's residents — so a
+// winner still serving on another broker with no record passes it. A valid record for a
+// DIFFERENT generation establishes that ownership MOVED, which is not the same fact: F-036
+// is precisely a previous owner continuing to serve after that. What committing Discarded
+// costs in either state is $MQTT_qos2assign's own consequence question (F-033, unaudited)
+// and is deliberately not answered here.
 func (as *mqttAccountSessionManager) discardAbsentWinnerClaim(s *Server, e *mqttQ2AffInvEntry) mqttQoS2SweepOutcome {
 	ps, _, err := as.loadFenceSession(e.claim.Winner)
 	if err != nil {
@@ -1768,8 +1824,9 @@ func (as *mqttAccountSessionManager) discardAbsentWinnerClaim(s *Server, e *mqtt
 		}
 		// A record written since the reference snapshot has not been through that
 		// walk's validation, and this re-read is what authorizes the discard. Only a
-		// fully interpretable record for a DIFFERENT generation proves this winner's
-		// incarnation is over; anything else is indeterminate.
+		// fully interpretable record for a DIFFERENT generation clears this bar for the
+		// winner's incarnation; anything else is indeterminate. (Clearing the bar is not
+		// proof it is over — see this function's doc and the file header.)
 		if verr := mqttValidateSessionRecord(ps, e.claim.Winner); verr != nil {
 			return mqttQoS2SweepDeferred
 		}
@@ -1905,6 +1962,15 @@ func (as *mqttAccountSessionManager) deleteOrphanQ2AffConsumers(s *Server, inv [
 		}
 
 		// (4) Final revalidation: a session that reappeared owns its consumer again.
+		//
+		// Note what the two negative outcomes below do and do not establish, because this
+		// step authorizes an irreversible delete of an interest-retained consumer. A record
+		// for a DIFFERENT generation establishes that ownership MOVED; it does not
+		// establish that the previous generation stopped serving, which F-036 explicitly
+		// permits it to keep doing. An ABSENT record is the bounded absence the file header
+		// defines. What deleting this consumer costs in either state — its queued copies go
+		// with it — is $MQTT_qos2assign's and $MQTT_out's consequence question (F-033,
+		// unaudited) and is deliberately not answered here.
 		ps, _, serr := as.loadFenceSession(cand.idHash)
 		if serr != nil {
 			continue
@@ -2065,6 +2131,12 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 			if ps.PubRel != nil && ps.PubRel.Durable == cand.durable {
 				continue
 			}
+			// Falling through means the record names a DIFFERENT generation, which
+			// establishes that ownership moved — not that this generation stopped serving,
+			// which F-036 permits it to keep doing. Deleting an interest-retained PUBREL
+			// durable drops the PUBRELs it holds, so what that costs in the
+			// live-previous-owner state is that class's own consequence question and is
+			// deliberately not answered here (see the file header's bound).
 		}
 
 		// (2) Still the INSTANCE quarantine observed? A durable deleted and recreated

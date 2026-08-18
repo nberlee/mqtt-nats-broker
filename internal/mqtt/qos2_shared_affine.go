@@ -1616,9 +1616,25 @@ func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 // The verification order is load-bearing. The winner's SESSION RECORD is checked
 // FIRST, and for the exact generation: an orphaned consumer can outlive the
 // record that named it, so "the consumer exists" would happily materialize onto a
-// durable belonging to a session that is gone. Only once the record proves the
-// generation is live is the consumer itself verified — without it the copy would
+// durable belonging to a session that is gone. Only once the record shows the
+// generation live is the consumer itself verified — without it the copy would
 // be stored with no interest and silently discarded.
+//
+// Note the asymmetry, because the two directions are not equally supported. A record
+// PRESENT for this generation is positive evidence and licenses materializing. NEITHER
+// negative reading is its converse:
+//
+//   - ABSENT does not establish the winner stopped serving. A resume preserves the
+//     generation, so it may still be serving on another broker after its record was
+//     removed — F-036's false-absence inference.
+//   - A valid record for a DIFFERENT generation establishes that ownership MOVED, which is
+//     not the same fact. F-036's shape is precisely a previous owner continuing to serve
+//     after ownership moved, and it begins BEFORE the record goes absent.
+//
+// The destructive branch below fires on both, so it acts on a stronger conclusion than
+// either supports. What discarding an assignment costs in those states is
+// $MQTT_qos2assign's own consequence question — F-033, unaudited — and is deliberately
+// not answered here.
 //
 // Anything indeterminate leaves the claim untouched and acks nothing.
 func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *mqttQ2AffClaim,
@@ -1647,9 +1663,13 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 		}
 	}
 	if ps == nil || ps.Q2AffGen != claim.Gen {
-		// Authoritatively gone, or replaced by a later generation of the same client
-		// ID. The delivery dies with the session it was assigned to, which
-		// [MQTT-4.8.2-6] permits; it is never released back to the group.
+		// No record for this generation in the evidence available here, or a later
+		// generation of the same client ID holds it. The delivery dies with the session it
+		// was assigned to, which [MQTT-4.8.2-6] permits; it is never released back to the
+		// group. Neither condition proves the winner stopped serving — absence is bounded
+		// evidence and a different generation means ownership moved, which F-036 says the
+		// previous owner can outlive. See this function's doc; the cost is F-033's
+		// unanswered question.
 		//
 		if _, _, derr := as.advanceQ2AffClaim(claimSubject, claim.Winner, claim.Gen,
 			func(c *mqttQ2AffClaim) { c.Discarded = true }); derr != nil {

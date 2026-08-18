@@ -46,6 +46,57 @@ This boundary applies only to bridge persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
 covered by the conformance suites.
 
+### Trusting the backend
+
+This bridge is built **on** NATS and JetStream. They are a dependency we trust, not
+a system we audit into submission. The list below states the behaviours we rely on
+so that a version bump has something concrete to re-check, and so a reader can see
+which properties are load-bearing. It is not a claim that we have independently
+proved any of them, and it is not a licence to rebuild them.
+
+Some upstream guarantees cannot be proved from outside the server, and a few cannot
+be proved at all without reimplementing the mechanism that provides them. That is a
+normal property of depending on software, not a defect in our design. The correct
+response is to name the contract we depend on and move on. Reaching instead for
+"we cannot prove this, therefore we must implement it ourselves" is the wrong
+conclusion: it duplicates a dependency, transfers a distributed-systems
+problem from a mature project onto our own permanent maintenance surface, and buys
+no assurance that the thing we wrote is more correct than the thing we replaced.
+An unprovable upstream claim is a reason to write down what we assume. It is not a
+reason to write a second consensus layer, a second dedup layer, or a second
+arbitration layer beside the one we already get.
+
+Two bounded exceptions, and neither reopens the general question. Where a contract
+is cheaply checkable and a regression in it would otherwise be **silent**, a canary
+keeps it executable across dependency bumps (`test/depproof/`, `make depproof`);
+that is a small fixed cost proportional to the risk of not noticing, not a re-proof
+of the dependency's fundamentals. And where a **startup-checkable, initialization-time
+stream prerequisite** would withdraw a behaviour we depend on, we refuse it at
+initialization rather than working around it (see "Stream prerequisites"). That
+refusal is a snapshot, not a standing guarantee: a configuration mutated after a
+manager initialized leaves that manager serving on its original decision, which is
+the configuration-drift residual in `docs/CONFORMANCE.md`.
+
+The distinction that actually matters when a race turns up is not whether NATS can
+be trusted. It is **whose gap it is**:
+
+- A gap in **our independent evidence** for a guarantee JetStream asserts is a
+  dependency question. Name what we assume, and if a silent regression is plausible,
+  add a canary row. This is not licence to record an assumption in place of a
+  guarantee that does not exist: where JetStream genuinely does **not** guarantee a
+  property we require, the design must constrain what it depends on, replace the
+  mechanism, or stop depending on it.
+- A gap in what *we asked* JetStream to enforce is ours, and it is ordinary local
+  work. If an operation carries no condition, the server has nothing to enforce and
+  cannot be faulted for not enforcing it. A subject purge that supplies only a
+  filter is the worked example: it removes whatever occupies the subject when it
+  applies, because that is precisely what we asked for.
+
+Conflating the second case with the first is how a local protocol defect gets
+mistaken for an unprovable upstream property and then documented as a residual
+instead of being fixed. Trust the backend for what it guarantees; own what we
+requested of it.
+
 ### JetStream behaviors this design depends on
 
 Correctness rests on these specific semantics, each stated as the contract the
@@ -77,7 +128,11 @@ the "no fallbacks" stance reviewable rather than implicit.
   What this does NOT license is deleting the lineage machinery wholesale: those
   mechanisms also cover ambiguous acknowledgements, out-of-band deletion and stream
   recreation, which are not proposal-ordering questions, and each remaining per-stream
-  finding owns its own consequence audit.
+  finding owns its own consequence audit. `$MQTT_qos2in`'s audit ran (F-032, closed):
+  every write there carries its expectation, so it needed no lineage — and what it did
+  find was a hold purge carrying no condition at all, which is F-062 and F-036 rather
+  than anything this contract speaks to. `$MQTT_qos2assign` (F-033) and `$MQTT_inflight`
+  (F-034) still owe theirs.
   A rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
@@ -1862,11 +1917,22 @@ create-only CAS record on a sibling subject, the hold subject plus a `rel` token
 | the releasing PUBREL | `releasing` + the exchange generation | before the onward store |
 | a session discard | `discarded` | before it destroys the hold |
 
-Exactly one create can succeed, so exactly one of "release it" and "discard it"
-wins and the loser does nothing irreversible. The claim is **discard-exclusive, not
+Exactly one create can succeed while a record occupies the claim subject, so for the
+exchange a discard **enumerated**, exactly one of "release it" and "discard it" wins and
+the loser does nothing irreversible. The claim is **discard-exclusive, not
 releaser-exclusive**: the generation identifies the exchange rather than the broker,
 so a second releaser of the same exchange reads its own generation back and
-proceeds. Because the claim is a sibling record, the hold record is never
+proceeds.
+
+Two limits belong with that sentence, and both are open blockers rather than residuals.
+The enumeration is a **one-shot snapshot**, so a hold on a subject it never saw is never
+competed for at all (F-036). And the claim subject is **reused by successive exchanges**,
+so exclusivity is per-occupancy rather than per identifier for all time: a `discarded`
+marker that outlives its own exchange is read by the next one on that identifier, which
+is then answered `0x92` (F-062). Neither is a JetStream limitation — the hold purge
+supplies only a subject filter, so there is no condition for the server to enforce.
+
+Because the claim is a sibling record, the hold record is never
 rewritten — its payload, properties and store time (which ages the Message Expiry
 Interval) stay as the PUBLISH left them — and a discard can enumerate a session's
 inbound QoS 2 state through `STREAM.INFO` without reading a single payload.
@@ -1902,6 +1968,42 @@ initialization alike; a config mutated *after* a manager initialized leaves that
 manager serving on its original decision while any later initialization refuses.
 Both recover the same way: stopping **all** brokers for the account and recreating
 the stream, under the compatibility boundary above. This is not a rolling upgrade.
+
+### What the write audit established, and the one gap it found
+
+*`docs/findings/ha-arbitration.md` F-062 and F-036 are authoritative for the gap's
+mechanisms, arms, directions and remedies. This section summarises and references them, as
+the compatibility boundary's precedent prescribes; it is not a second authority.*
+
+F-032 audited every mutation this protocol makes against
+`test/depproof/`'s route inventory. **All four writes carry their per-subject
+expectation** — the hold store, the releaser's claim and the discard's claim are
+create-only (expectation `0`), and the terminal commit CASes at the exact sequence its
+caller loaded, under a generation comparison. The server-side contract for those writes
+is **inherited from F-030 rather than re-proved here**, per "Trusting the backend"; no
+lineage is carried on this stream and none is needed, because a create has no base to
+descend from and the terminal commit is already generation-guarded.
+
+**The gap is the hold purge, and it is ours rather than JetStream's.** `purgeQoS2Hold`
+supplies only a subject filter, so it removes whatever occupies the subject when it
+applies; the server has no condition to enforce because the bridge never sent one. Its
+two callers are arbitrated differently and **neither arbitration makes it
+exchange-bound**:
+
+- The **teardown** caller runs only after `claimTeardown` is won, which fences a broker
+  that lost the claim but not a peer already serving the same incarnation — a resume
+  preserves the generation. That is **F-062**, together with the `discarded` marker the
+  teardown leaves behind, which outlives its own exchange and poisons the next one on
+  that identifier.
+- The **orphan sweep** caller runs under no teardown claim at all, and infers liveness
+  from this broker's residents plus persisted records, so a live remote generation whose
+  record is absent is invisible to it. With the one-shot enumeration that misses a hold on
+  a subject it never saw, that is **F-036**, whose scope was widened for both.
+
+For the record, the dependency does offer a `Sequence` cutoff combinable with `Subject`,
+and `StreamState.LastSeq` already arrives with the enumeration — that is F-062's leading
+remedy, not a limitation of the backend. What JetStream does **not** offer is an
+expected-sequence (CAS) purge, so no design here may assume one.
 
 ## Session-affine shared-subscription QoS 2
 
@@ -2922,10 +3024,15 @@ The invariants, in the order they matter:
   was never sent, so it is never registered. A retained-message send has no JetStream
   backing at all, so it has no register and no post-restart redelivery.
 
-A session discard purges the retiring incarnation's registers by filter. That blind
-purge is correct here and the contrast with the arbitrated inbound hold walk is the
-point: a register has no second party that could still be committed to acting on it,
-and the filter names a generation `clear()` has already re-minted.
+A session discard purges the retiring incarnation's registers by filter, rather than
+arbitrating each one as the inbound hold walk does: on the discarding broker nothing is
+competing for a register — no claim record, no marker — though a resuming session does
+read one as durable authority and rewrite it to take ownership. The filter
+names a generation `clear()` has already re-minted, so it cannot reach the next
+incarnation. That is the extent of the claim. A resume preserves the generation, so a
+peer may still be serving this incarnation; whether the filter purge costs anything there
+is `$MQTT_inflight`'s own consequence question (**F-034**, unaudited), and the same
+premise's cost on `$MQTT_qos2in` is **F-062**.
 
 **Cost, stated plainly.** One create-only CAS round trip per *first* transmission of
 every outbound QoS 1/2 message, one delete per completion, and on QoS 2 a confirmed
@@ -2972,8 +3079,11 @@ discard purges; and each `$MQTT_willq` outbox record. It is minted when a sessio
 is first created and re-minted by `clear()` — which every discard path runs,
 including the two that *reuse* the session object as a fresh session — while a
 plain reconnect or resume **preserves** it, because a resumed session must still
-find its own PUBRELs, QoS 2 holds and Will. A late delete from a retired
-incarnation can then only name something that is already gone.
+find its own PUBRELs, QoS 2 holds and Will. The invariant this buys is exactly one
+thing: a late delete from a retired incarnation cannot name a FRESH incarnation's
+resources. It does not establish that no live resource exists under the retiring
+generation — a resume preserves the generation, so a peer may still be serving it. For
+what that costs per stream, see F-062 (and F-034, unaudited).
 
 This is the same conclusion the QoS 2 move protocol and the affine delivery path
 reached independently, and it is why the fix is naming rather than a lock: a nonce
@@ -2995,8 +3105,11 @@ path, since an unclassifiable release is not a release.
 
 Nobody resumes a marked record. Every CONNECT that can interpret the record (and the
 record-driven expiry path) **finishes** the teardown when it finds a marker —
-repeating the idempotent, generation-scoped deletions and releasing the record — and
+repeating the generation-scoped deletions and releasing the record — and
 only then starts a fresh session with a fresh generation and Session Present false.
+Repetition is safe for names nothing can re-occupy. It is **not** universally safe: the
+inbound QoS 2 hold walk purges by subject, so a repeat that meets an earlier finisher's
+`discarded` marker destroys whatever occupies that subject now (**F-062**, arm A2).
 That also makes a crashed teardown self-healing instead of leaking until the orphan
 sweep. The exception is a record the restore boundary refuses outright — a subscription
 in the reserved `$MQTT.>` namespace, or a missing or malformed generation: the CONNECT
@@ -3153,7 +3266,9 @@ A broker that dies in the wrong window leaves durable state nothing else ever
 revisits: an inbound QoS 2 hold and its release claim on `$MQTT_qos2in`, a
 session-affine `$MQTT_Q2AFF_*` consumer on `$MQTT_out`, an assignment claim on
 `$MQTT_qos2assign`, and the teardown marker that pins all three in place. None of
-them loses a message — a stalled claim is honored, never released — but all of
+them loses a message BY ACCUMULATING — a stalled claim is honored, never released (a
+stale `discarded` marker among them is a different matter: it can fence a later
+exchange, and retiring it can leave that exchange lost — F-062 mechanism 2) — but all of
 them accumulate. A periodic per-account sweep converges them
 (`internal/mqtt/orphan_qos2_sweep.go`), beside the existing session-expiry and
 orphaned-consumer sweeps.
@@ -3188,10 +3303,16 @@ immediately by design (see `docs/findings/ha-arbitration.md#f-036`). Nothing her
 reaps a watermark, so there is no reap step and no GC choice that could widen the
 escape the fence covers.
 
-**Absence is proven, never inferred.** Candidates are listed *before* a complete
+**Absence is established by a complete walk, never inferred from a partial one — and
+that is a narrower claim than "proven".** Candidates are listed *before* a complete
 walk of `$MQTT_sess`, so a resource created between the two is never judged
 against a snapshot that predates it; local in-memory sessions count as references,
-covering the create-before-save window on this broker. Ownership is the
+covering the create-before-save window on this broker. What the walk plus this broker's
+residents cannot observe is a session live on **another** broker whose record is absent —
+a resume preserves the generation, so such a session still uses these names. That is
+**F-036**'s open false-absence inference; the per-resource-class consequences belong to
+F-033, F-034 and F-036 rather than to this section. The same bound is stated once for
+the code, in `internal/mqtt/orphan_qos2_sweep.go`'s header. Ownership is the
 `(client-ID hash, generation)` pair carried in the subject or durable name, never
 the hash alone. An incomplete walk, an undecodable record, a client ID that does
 not hash back to its subject token, or an unvalidatable generation aborts the
@@ -3295,7 +3416,11 @@ disable PUBREL reclamation account-wide on evidence about a different resource c
 Deletion is authorized by a final
 authoritative record re-read — a save landing after the reference walk aborts it, and
 does not change `Created`, so the instance check alone could not catch it — and then by
-re-looking-up the same instance. Deleting the consumer drops the PUBRELs it held, which
+re-looking-up the same instance. **What those checks cannot observe is a session live on
+another broker whose record is absent** (see "What AUTHORITATIVE means" in
+`orphan_qos2_sweep.go`): whether deletion in that state costs anything for this resource
+class is not answered here, because it belongs to the finding that owns the class rather
+than to this section. Deleting the consumer drops the PUBRELs it held, which
 is correct in every state those checks can observe: no observable session could deliver
 them and the identifiers died with the session. Both windows are narrowed rather than
 closed, because a consumer delete is by name and unconditioned; that residual, and the

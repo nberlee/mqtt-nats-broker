@@ -16,7 +16,9 @@
 // A RELEASE CLAIM is a create-only CAS on a sibling of the hold subject
 // ("$MQTT.qos2.in.<idHash>.<gen>.<PI>.rel", see mqttQoS2ClaimSubject). The
 // releaser writes `releasing`, a discard writes `discarded`, and exactly one
-// create can ever succeed. The loser does nothing irreversible.
+// create can succeed WHILE A RECORD OCCUPIES THE SUBJECT. The loser does nothing
+// irreversible. Exclusivity is per-occupancy, not per-identifier for all time; what
+// that costs is stated once, in F-062 (docs/findings/ha-arbitration.md).
 //
 //  1. The claim fences a DISCARD. A re-read of the hold record could not: read
 //     then fan out is check-then-act, and the discard is on another broker.
@@ -49,13 +51,12 @@
 //     identifier, re-exposing that exchange to the stale-loader fan-out fence 2
 //     exists to stop. Same rule as releaseQoS2Record and invariant 2 of
 //     qos2_move.go.
-//     The discard's HOLD purge (discardQoS2Hold) is different, and it only looks
-//     inconsistent: it names an exact subject of a RETIRED incarnation, and
-//     clear() re-mints the generation before the walk runs, so no later exchange
-//     can ever occupy that subject and a late purge is harmless by naming. A claim
-//     is reaped by releasers on a LIVE incarnation, where the same subject genuinely
-//     is reused by a later exchange. Naming suffices for one; only sequencing
-//     suffices for the other.
+//     The discard's HOLD purge (discardQoS2Hold) is not sequenced: it names a subject
+//     of the RETIRING incarnation, and clear() re-mints before the walk, which covers
+//     this broker's own reconnect. Generation scoping protects the next incarnation; a
+//     resume preserves the generation, so it does not protect a peer still serving the
+//     retiring one — see F-062, which owns that purge. Naming was never sufficient for
+//     a CLAIM, which is why every claim delete is sequenced.
 //  3. A DISCARD NEVER REAPS ITS OWN `discarded` CLAIM. It is the only durable
 //     proof that a late releaser must lose, so reaping it at teardown time re-opens
 //     exactly the window this file closes — the same rule as discardQ2AffClaimsFor,
@@ -236,9 +237,13 @@ type mqttQoS2RelClaim struct {
 // leftover (reap and retry), and a claim without one could be read as either.
 // A `discarded` claim requires the generation to be ABSENT, because the discard
 // never reads the hold record — that is what keeps payloads off the discard path —
-// and a discard needs no generation: it can only ever concern the one exchange
-// live on that generation-scoped subject, and it retires the incarnation, so no
-// later exchange can appear there to be confused by it.
+// and a discard needs no generation to identify the exchange it competed for.
+//
+// The reason this comment used to give — that a discard "can only ever concern the one
+// exchange live on that generation-scoped subject" — is FALSE; see F-062, mechanism 2.
+// What matters locally: with no generation on the marker, a stale one is
+// indistinguishable from an applicable one, so a remedy has to supply that fence some
+// other way.
 func mqttQoS2RelClaimIdentityOK(c *mqttQoS2RelClaim) bool {
 	if c == nil {
 		return false
@@ -563,8 +568,10 @@ func (st mqttQoS2VerifyStatus) String() string {
 // state is whatever the record says. The check belongs to the re-verification
 // alone, where a specific generation was loaded and is being carried forward.
 //
-// Once this returns Held nothing can remove the record under us: a discard must
-// win the claim before it purges (discardQoS2Hold), and we hold the claim.
+// Holding the claim fences a discard that has not yet committed to this subject's
+// purge. It does not fence one that has, nor the orphan sweep. The exceptions are
+// enumerated once, in F-062 (docs/findings/ha-arbitration.md); do not re-derive them
+// here.
 func (as *mqttAccountSessionManager) verifyQoS2HoldForRelease(holdSubject, gen string, holdSeq uint64) (mqttQoS2VerifyStatus, uint64, error) {
 	rec, curSeq, err := as.loadQoS2Record(holdSubject)
 	if err != nil {
@@ -703,8 +710,11 @@ func (as *mqttAccountSessionManager) discardQoS2Hold(s *Server, holdSubject stri
 				return fmt.Errorf("unable to reap the unusable QoS 2 release claim on %q: %w", claimSubject, rerr)
 			}
 		case cur.State == mqttQoS2RelStateDiscarded:
-			// Ours from an earlier attempt, or a peer discard's. Either way no releaser
-			// can ever win, so the hold is ours to destroy.
+			// Ours from an earlier attempt, or a peer discard's. Either way no releaser of
+			// the exchange this marker was written for can win, so that hold is ours to
+			// destroy. NOT necessarily whatever occupies the subject NOW: on a repeated
+			// teardown attempt the marker may predate a later exchange accepted meanwhile,
+			// and this purge would destroy it (F-062, mechanism 2).
 			return as.purgeQoS2Hold(holdSubject)
 		case cur.State == mqttQoS2RelStateReleasing:
 			return as.awaitQoS2Release(s, holdSubject, claimSubject, deadline)
@@ -760,8 +770,11 @@ func (as *mqttAccountSessionManager) awaitQoS2Release(s *Server, holdSubject, cl
 // Confirmed even where the caller asked for a no-wait teardown, for the reason
 // releaseTeardown documents: an unclassifiable outcome is not an outcome, and this
 // one licenses reporting the session's inbound QoS 2 state as destroyed. It needs
-// no sequence and reads no payload, and a late purge cannot reach a newer
-// incarnation because the subject carries the retiring generation (scope rule 2).
+// no sequence and reads no payload.
+//
+// Generation scoping protects the next incarnation; a resume preserves the generation,
+// so this purge can still reach live state under the retiring one — see F-062, which
+// this function is.
 func (as *mqttAccountSessionManager) purgeQoS2Hold(holdSubject string) error {
 	err := as.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, holdSubject, false)
 	if isErrorOtherThan(err, JSStreamNotFoundErr) {

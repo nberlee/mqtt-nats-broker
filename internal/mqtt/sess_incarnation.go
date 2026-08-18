@@ -12,9 +12,16 @@
 //
 // So the names carry an incarnation generation instead, exactly as the
 // session-affine QoS 2 path already does with q2AffGen (see
-// qos2_shared_affine.go): a late delete from a retired generation can only ever
-// name a resource that no longer exists. That is harmless by construction, with
-// no atomicity requirement anywhere. The generation is minted when a session is
+// qos2_shared_affine.go): a late delete from a retired generation cannot name a
+// resource a FRESH INCARNATION owns, because a fresh incarnation mints a new
+// generation and therefore new names. That much is harmless by construction, with no
+// atomicity requirement anywhere.
+//
+// It does NOT follow that a late delete names nothing live, and F-062 is what that
+// over-reading cost. A plain resume PRESERVES the generation (see below), so a peer may
+// still be serving the very incarnation a teardown is retiring, and a name-scoped
+// deletion reaches whatever that peer has created under it since. Generation scoping
+// protects the NEXT incarnation; it does not arbitrate against the current one. The generation is minted when a session is
 // first created and re-minted by clear() (which every discard path runs,
 // including the two that REUSE the session object as a fresh session); a plain
 // reconnect or resume preserves it, because a resumed session must still find its
@@ -234,10 +241,16 @@ func mqttQoS2HoldWalkFilter(idHash, gen string) string {
 // subjects, so the recovery walk's filter always returns the whole set in one
 // request — the same bound, for the same reason, as mqttQoS2HoldWalkFilter.
 //
-// The generation scopes it for the reason every other name here is scoped: a
-// register left behind by a retired incarnation can only ever name a subject a
-// live session does not use, so a late write or delete from one is harmless by
-// construction. See inflight_register.go.
+// The generation scopes it for the reason every other name here is scoped: a register
+// left behind by a retired incarnation names a subject no FRESH incarnation uses, so a
+// late write or delete from one cannot reach the next session's state.
+//
+// That is the whole of the invariant. It is NOT that the subject is unused: a resume
+// preserves the generation, so a peer may still be serving the retiring incarnation and
+// using these very subjects. Whether a late write or delete costs anything HERE is
+// $MQTT_inflight's own consequence question — F-034, unaudited — and must not be assumed
+// harmless on the strength of the naming. See inflight_register.go, and F-062 for the
+// same premise's cost on $MQTT_qos2in.
 func mqttInflightSubject(idHash, gen string, pi uint16) string {
 	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") +
 		"." + strconv.FormatUint(uint64(pi), 10)

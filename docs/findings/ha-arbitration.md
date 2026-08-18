@@ -10,9 +10,12 @@ take to a proposal across a leader transition and exercised each against the sup
 floor (`test/depproof/`). Both live routes are closed by the combined route/mutation
 evidence, the pinned source mechanisms, and the NATS maintainer's explicit confirmation
 that leader-local in-flight ownership and applied-before-serving enforce the header
-across elections. The mechanisms are stream-independent, so F-032 through F-034 inherit
-the server contract and the canary — but each owns a consequence of its own, and none
-closes on this evidence alone.
+across elections. The mechanisms are stream-independent, so the per-stream findings
+inherit the server contract and the canary — but each owns a consequence of its own, and
+none closes on this evidence alone. **F-033 and F-034 still owe their audits.** F-032's ran
+on 2026-08-17: it inherited the contract without re-proving it, needed no lineage, and
+found a local defect that JetStream's guarantees never spoke to — **F-062**, filed below
+and open.
 
 Multi-frontend HA is supported alpha scope (decided 2026-08-10, `docs/ROADMAP.md`
 section 0.2), so every finding here is an unconditional alpha blocker.
@@ -388,8 +391,9 @@ Leader-only admission is therefore part of the resolution, not a weakness left b
   is mutation-proved — making an admitted entry survive would take a second mutation to
   the store itself — so they are stated as observed and are not part of the claim.
 - **Not that the other streams are closed.** The server mechanisms are
-  stream-independent, but F-032 through F-034 each own a consequence of their own and
-  stay open until each is audited on its own terms.
+  stream-independent, but each per-stream finding owns a consequence of its own and stays
+  open until it is audited on its own terms. **F-033 and F-034 are still open on those
+  terms.** F-032's audit has since run and closed, producing F-062, which is open.
 - **Not that a Will is never published twice.** The sanctioned at-least-once duplicate
   is untouched, and its boundary is unchanged: external publication with no durable
   evidence of completion. What is retired is the class where evidence EXISTED and was
@@ -504,14 +508,59 @@ whose subject is a durable value being REGRESSED.
 
 **Title:** Add write lineage to inbound QoS 2 holds and release claims
 
-- Status: Open. The shared cross-term premise is closed
-  (see the note at the top of this file and F-030); what remains for this finding is its
-  OWN consequence audit against that
-  route inventory, plus a fixture and a discriminating mutation for anything the
-  audit finds still reachable.
+- Status: **Closed 2026-08-17 — no lineage was needed, and the audit produced F-062.**
+  The two results are separate and neither implies the other.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 32
+
+### What the audit established
+
+**Clauses (a) and (b) answer NO: no write here is unconditional, and none takes a base it
+did not read.** All four bridge-authored writes set `JSExpectedLastSubjSeq`. Three pass the
+literal `0` (create-only, so there is no base to be stale about): the hold store
+(`mqttStoreQoS2MsgOnce`, `mqtt.go`), the releaser's claim and the discard's claim (both
+`storeQoS2RelClaimCAS`, `qos2_release_claim.go`). The fourth, the terminal commit
+(`finalizeQoS2MoveInner`), CASes at the exact sequence its own caller loaded, under a
+generation comparison. Deletes target an exact sequence; the one exception is the hold
+purge, which is F-062.
+
+The inventory is **complete over bridge-authored data mutations with the test seams nil**,
+derived from two mechanical sweeps — one over `mqttQoS2IncomingMsgsStreamName` and the
+subject prefix, one over the subject builders `mqttQoS2HoldSubject` /
+`mqttQoS2ClaimSubjectFor`. It is not "complete by construction": those sweeps enumerate
+in-tree references and cannot enumerate a direct NATS publication, which stays scoped out
+by `docs/CONFORMANCE.md`'s three-part same-base boundary plus the reserved-namespace deny
+and the required ACL.
+
+**Clause (c): `test/depproof/`'s route inventory re-derived for this stream.** R-old,
+R-new, R-elect, R-inflight and R-apply are **inherited by citation** — the server
+mechanisms F-030 proved are stream-independent, and re-proving them here would be the
+error `docs/ARCHITECTURE.md`, "Trusting the backend" now warns against. R-unclustered is
+refused by the shared replica check in `validateBrokerOwnedStreamShape`, the same one
+`$MQTT_willq` relies on. R-batch: no writer here emits `Nats-Batch-*`, and
+`AllowAtomicPublish` is an audited, ACL-conditional waiver. R-forward and R-mirror/source
+are refuted in writing, with the post-start configuration-drift residual unchanged.
+
+**R-purge is the row `$MQTT_willq` never needed.** `purgeQoS2Hold` is the only mutation on
+any audited `$MQTT_*` stream that names a *subject* rather than a sequence, so no CAS
+argument covers it and the server has no condition to enforce — the bridge never supplied
+one. Its two caller classes are arbitrated differently, and neither arbitration makes it
+exchange-bound. That is **F-062** (the teardown caller) and **F-036** (the orphan sweep
+caller, plus the post-enumeration gap).
+
+**What the audit did NOT find:** any need for write lineage. Three of the four writes are
+create-only, so there is no base to descend from, and the fourth is guarded by an immutable
+exchange generation that answers "is this record mine?" more strongly than a parent pointer
+would. §0.2's own write-lineage audit deleted the create side of `$MQTT_sess`'s lineage for
+the same reason.
+
+**Also corrected:** the statements that had made F-062 unrecognisable — comments and
+conformance text asserting that exactly one claim create can ever succeed, that a
+`discarded` marker can only ever concern its own exchange, that a late purge is "harmless
+by naming", that every hold subject is reached by the arbitration, and the headline "no
+silent loss on any PUBREL path". Those sentences are why the defect survived review, so
+correcting them is part of filing it.
 
 ### Original finding record
 
@@ -606,3 +655,239 @@ whose subject is a durable value being REGRESSED.
   in-process argument applies — and a periodic unconditional probe of every resident
   session is a write per session per interval, which is why this is filed rather than
   folded in. Found while planning the rejection settlement.
+
+### Two manifestations added by F-032's audit (2026-08-17), which WIDEN this finding's shape
+
+This finding was stated as the **absent-record** tail: a bound, silent client holding a
+session another broker tore down. F-032's audit found two further consequences of the same
+underlying condition — the previous owner keeps serving, or is misread as gone, after
+ownership has moved — and they begin *before* the record is absent. **The shape is therefore
+widened from "an absent record under a bound session" to "the previous owner continues to
+serve, or is treated as absent, after durable ownership moved".** These are recorded here
+rather than as new IDs because both are consequences of this finding's own condition; they
+are not F-062, whose two mechanisms are teardown-side reuse hazards.
+
+- **Post-enumeration serving.** `arbitrateQoS2ReleaseClaims` enumerates hold subjects
+  once, through `STREAM.INFO`. A hold on a subject **absent from that snapshot** is never
+  passed to `discardQoS2Hold`, so it is missed rather than destroyed. (A replacement on a
+  subject the snapshot DID contain is reached by name and destroyed by the pending purge —
+  F-062 mechanism 1, not this. The boundary is which side of the snapshot the SUBJECT
+  falls on, not when the hold was written.) If the peer has not yet observed the ownership
+  marker, it wins an ordinary `releasing` claim, passes its authoritative re-read and
+  **delivers onward after the session was discarded**. Note the direction: this is a
+  delivery that should not have happened, not a loss. A purge cutoff (F-062's mechanism-1
+  candidate) does not address it, and must not be described as though it did: a cutoff at
+  `Sequence: E+1` excludes never-enumerated holds and bounds purging to sequences at or
+  below `E`, but it does **not** make teardown own exactly the enumerated set — `LastSeq`
+  and `Subjects` are not one snapshot, so it may also spare a subject that WAS enumerated
+  whose record landed above `E` (see F-062's stated limit). So this manifestation needs
+  its own remedy, and a fix here must account for an enumerated-but-unfenced hold that is
+  still serviceable after the teardown, not only for a never-enumerated one.
+- **The orphan sweep's false-absence inference.** The sweep's `purgeQoS2Hold` runs under no
+  teardown claim at all, and `buildSessionRefs` infers liveness from **this broker's
+  residents plus persisted session records only**. A live remote generation whose persisted
+  record is absent is therefore invisible to it, and its hold is condemned. That is this
+  finding's precondition exactly — including when the record was made absent by a
+  bridge-authored teardown, since `releaseTeardown` deletes it. Generation uniqueness does
+  not help: the peer is *continuing* to use the generation, not re-minting it.
+
+A fix for this finding must therefore answer both, not only the silent-Keep-Alive-0
+case, and its tests should stage the post-enumeration ordering explicitly.
+
+**The prose across the orphan sweep rests on this finding's premise, and is bounded rather
+than individually corrected.** F-032's audit had a reviewer enumerate, from the concept
+rather than from phrasings, every statement in the repository asserting that a late or
+repeated deletion can only reach dead state, or that absence from local evidence proves a
+generation gone. Twenty-six sites came back. They were sorted by **whose falsified premise
+each rests on**: those resting on F-062's (teardown-by-name is safe against a peer that
+resumed the retiring generation) were corrected under F-032; about sixteen rest on
+**this** finding's premise — that persisted records plus one broker's residents prove a
+remote generation absent — and span `internal/mqtt/orphan_qos2_sweep.go`,
+`docs/ARCHITECTURE.md`'s orphan-reconciliation section, `docs/findings/resolved.md` and two
+test helpers.
+
+Those sixteen are **not** rewritten one by one. `orphan_qos2_sweep.go`'s header now defines
+what "AUTHORITATIVE" means throughout that file — authoritative over persisted records and
+this broker's residents, explicitly not over a session live elsewhere whose record is
+absent — and every later use inherits that bound. Restating the boundary at each site is
+what made F-032's own review loop self-feeding, and the same discipline is applied here:
+one statement, many sites bounded.
+
+**Whoever closes this finding should re-run that conceptual enumeration** and correct the
+sites individually, because at that point the premise is no longer merely bounded but
+fixed. A further five sites assert consequences for `$MQTT_inflight`, the affine path and
+the PUBREL durables; those were deliberately converted to refusals-to-answer rather than
+corrected, because their consequences belong to **F-033, F-034** and this finding, none of
+which had been audited when they were written.
+
+## F-062
+
+**Title:** Teardown reuse hazards on an inbound QoS 2 hold subject after ownership moved
+
+- Status: **Open.** Found by F-032's consequence audit, 2026-08-17.
+- Classification: HA arbitration architecture / data loss
+- Release treatment: **Alpha blocker.** Multi-frontend HA is supported alpha scope, and the
+  PUBLISH that is lost was **acknowledged**: PUBREC follows the hold landing, so the client
+  has been told the message is held.
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+
+### The finding
+
+Not a JetStream shortcoming. `purgeQoS2Hold` sends only a subject filter, so the server has
+no condition to enforce and removes whatever occupies the subject when the purge
+applies. We never asked for anything narrower. See `docs/ARCHITECTURE.md`, "Trusting
+the backend", for why that distinction matters.
+
+**Shared precondition.** Broker A **wins** `claimTeardown` against B's live session on
+generation `G` — the won-claim ordering, not the lost-claim one that
+`TestSessTeardownLostClaimDeletesNothing` already fences — and B's client reuses a packet
+identifier while A's teardown walk is in progress. A resume preserves the generation, which
+is what makes "a peer still serving `G`" reachable at all.
+
+**Mechanism 1 — an unbounded subject purge destroys a newly accepted exchange.** A reaches
+`awaitQoS2Release`, observes B's `releasing` claim vanish when B completes exchange E1
+normally, and commits to the purge. B's client PUBLISHes E2 on the same identifier and **is
+answered PUBREC**; its create-only hold succeeded. A's purge then destroys E2's acknowledged
+payload. **Direction: loss.**
+
+**Every arm, because a per-arm remedy would leave the others unbounded.** `purgeQoS2Hold`
+is reached from four places, and mechanism 1 is a property of the SHARED purge rather
+than of any one caller:
+
+| Arm | Route | What A holds when it purges |
+|---|---|---|
+| A1 | `discardQoS2Hold` wins a fresh `discarded` claim (`qos2_release_claim.go:689`) | the teardown claim, and a release claim for an occupancy that had already ended — the subject was empty when it created the marker |
+| A2 | `discardQoS2Hold` observes an existing `discarded` marker, its own from an earlier attempt or a peer's (`:718`) | the teardown claim, and a marker that may predate the current occupant entirely |
+| A3 | `awaitQoS2Release` observes the claim subject EMPTY (`:750`) | the teardown claim, and **no release claim at all** — it LOST that one to E1, which is why it was awaiting |
+| A4 | the orphan sweep (`orphan_qos2_sweep.go:1393`) | no teardown claim either; fenced by the reference walk instead — that arm is **F-036**, not this |
+
+**Distinguish the two claims, because A3 is where conflating them misleads.** The
+**session teardown claim** is what licenses the walk; the per-subject **release claim** is
+what arbitrates one exchange. In A3, A holds the first and never acquires the second, so
+E2 can win its own `releasing` claim and pass `verifyQoS2HoldForRelease` — returning
+`Held` — and that newly won claim cannot cancel A's already-committed purge. In A1 and A2,
+A does hold a marker, but one written for an occupancy that is over. **In none of the three
+is the purge fenced against the subject's CURRENT occupant.**
+
+**The cutoff closes A1 and A3, and NOT A2.** For A1 and A3 the marker or the awaited claim
+belongs to *this* walk, so any hold accepted after this walk's enumeration sits above `E`
+and is spared — which is why the cutoff belongs **inside `purgeQoS2Hold`**, at the shared
+boundary, rather than in one caller.
+
+A2 defeats it, and this is the arm most likely to be missed by a remedy that looks
+complete. The marker there is from an **earlier, partial teardown**, so the fence it
+represents is older than the current walk's watermark. Interleaving: an earlier walk leaves
+a `discarded` marker without completing the purge; B then accepts E2 and answers PUBREC;
+a repeated walk enumerates, and **its `LastSeq` now includes E2**, so `E` is above E2's
+sequence; `discardQoS2Hold` observes the pre-existing marker and purges with `Sequence:
+E+1`, which deletes E2. The current watermark is simply the wrong fence for a marker that
+predates it.
+
+So A2 needs the marker's **own** fence — the value the marker itself records — which is the
+same evidence mechanism 2's remedy has to supply. **A1/A3 and A2/mechanism 2 therefore share
+two remedies, not one**, and a fix that implements only the cutoff still loses acknowledged
+payloads through A2. The fixture must fail if only the cutoff is implemented.
+
+**Mechanism 2 — a persistent `discarded` claim poisons a later exchange.** A creates the
+`discarded` marker and the teardown proceeds. B's PUBREL for E1 observes it, releases E1's
+hold and answers 0x92. B's client then reuses the identifier: E2's create-only hold succeeds
+on the emptied subject and PUBREC is returned. E2's PUBREL reads the **same, still present**
+marker and is answered 0x92 with E2's hold released. **Direction: loss**, established by
+exhausting every arm that reads a claim state — the two delivering arms require
+`State == releasing`, which a `discarded` marker never satisfies; the repeated-teardown arm
+purges the hold; and nothing reaps a `discarded` marker except the aged orphan sweep,
+hold-first. Successful cleanup does send PUBCOMP (0x92 on MQTT 5) and frees the identifier,
+so this is loss and repeated poisoning, **not** a protocol wedge.
+
+**Mechanism 2 is not closed by bounding the purge.** The marker survives independently
+of any purge, which is why these are two mechanisms rather than one defect with two
+symptoms.
+
+**Recovery is conditional, not automatic.** Each affected payload is permanently lost. The
+poisoning is only temporarily so: an eligible orphan sweep can retire the marker hold-first,
+but that depends on the sweep running, and its liveness has three documented limits — a
+session-record identity failure aborts every destructive phase account-wide and
+permanently, a transport failure aborts a pass, and a broker restarting more often than
+the grace never reaps at all.
+
+**Why no existing residual owns this.** `docs/CONFORMANCE.md`'s marker-arming concession says
+only that *a packet racing the marker's arming is served*; neither purging acknowledged state
+nor poisoning a later exchange is that. And the "a discarded session leaves one small claim
+record per inbound QoS 2 exchange **that was in flight**" statement understates the reach:
+mechanism 2 is one marker affecting an exchange that was not in flight when it was written.
+
+**What is not claimed.** No universal over interleavings. Each mechanism carries its own
+direction, established by walking the arms above; nothing here asserts no other ordering
+exists.
+
+### Fixtures and discriminating mutations
+
+- **`TestQoS2TeardownPurgeSparesAPostEnumerationHold`** — mechanism 1, and it must
+  discriminate **every arm in the table above, not one branch**, because the arms do not
+  share one remedy. Structure it at the shared boundary — assert `purgeQoS2Hold` never
+  removes a record the teardown was not entitled to — with one subtest per arm:
+  1. *A1, fresh `discarded` win.* E2 accepted between this walk's enumeration and the
+     purge. Closed by the cutoff: E2 sits above this walk's `E`.
+  2. *A3, `releasing` claim disappears.* Same staging through `awaitQoS2Release`.
+     Closed by the cutoff for the same reason.
+  3. *A2, marker from an EARLIER partial teardown.* Stage it in that order: earlier walk
+     leaves the marker without purging, **then** E2 is accepted and answered PUBREC,
+     **then** a repeated walk enumerates — so E2 is BELOW this walk's watermark. **This
+     subtest must fail against a cutoff-only implementation**, since the cutoff cannot
+     fence a marker older than the watermark; it passes only once the marker carries its
+     own fence (mechanism 2's remedy).
+
+  Assert in every subtest that E2's hold survives and its PUBREL completes.
+  **Mutations, one per remedy so neither can be dropped:** remove the purge's `Sequence`
+  bound — A1 and A3 must fail; and revert the marker-borne fence — A2 must fail. A
+  remedy implementing only the cutoff leaves A2 red, which is the point of splitting
+  them.
+- **`TestQoS2TeardownStaleDiscardedClaimDoesNotPoisonReuse`** — mechanism 2, and it must
+  cover **both orderings**, because the harder one is what discriminates a real remedy:
+  1. *Marker first* — A writes `discarded`, E1 answered 0x92, E2 accepted afterwards, so
+     E2's hold sequence is **above** the marker's.
+  2. *Hold first* — A captures its cutoff while enumerating E1; E1 completes and vacates the
+     subject; E2 lands and is answered PUBREC; **only then** does A write the marker; a
+     bounded purge correctly spares E2; E2's PUBREL is poisoned anyway. Here E2's hold
+     **precedes** the marker.
+
+  Ordering 2 exists in this dossier for a specific reason: the obvious repair — *reap the
+  marker when `holdSeq > claimSeq`* — **passes ordering 1 and fails ordering 2**. A fixture
+  staging only ordering 1 would bless a broken remedy. **Mutation:** revert the stale-claim
+  handling; must fail on **both** subtests, so a partial remedy cannot score the kill.
+
+### Remedy candidates
+
+**Mechanism 1 — a purge cutoff (leading).** `JSApiStreamPurgeRequest.Sequence` is a
+subject-combinable cutoff excluding the cutoff sequence, and `StreamState.LastSeq` is already
+in the `STREAM.INFO` response `streamSubjects` currently discards. Capture `LastSeq = E` at
+enumeration and purge with `Sequence: E+1`. No payload read, no extra round trip, and no
+per-hold sequence — which is what makes it viable, since the arbitration has no cheap
+per-hold sequence source (`STREAM.INFO`'s subject map carries per-subject *counts*).
+`MaxMsgsPer: 1` replacements receive a later stream sequence, so a replacement is above the
+cutoff.
+
+**Its stated limit:** `LastSeq` and `Subjects` are **not one snapshot** — they are taken under
+independent store locks — so a hold may appear in the enumerated map yet sit above the cutoff.
+The claim is "the purge is bounded to sequences at or below `E`", **not** "the teardown owns
+exactly what it enumerated". Direction of that gap: such a hold **survives** and is left to
+the orphan sweep; it is never destroyed.
+
+**Mechanism 2 — open, with a constraint that rules out the naive fix.** The remedy must not
+**unconditionally** reap the marker: its persistence is load-bearing, because it is the only
+durable proof that a late releaser of the *retired* incarnation must lose. A **conditional
+exact-sequence** reap is safe once there is durable evidence the marker does not fence the
+loaded hold. Two directions, qualified:
+
+- **Scoping the claim subject by exchange generation** is not directly viable under the
+  current layout: the releaser knows the exchange generation but the **payload-free discard
+  enumeration does not**. Making it viable needs a changed hold-subject layout, an
+  index, or a metadata lookup — none of which may reintroduce a payload read on the
+  discard path.
+- **Recording the fence in the marker** is viable provided the recorded value is the
+  enumeration cutoff `E` or an equivalent durable fence identity, **not** an exact per-hold
+  sequence, which is unavailable. A later exchange can then prove its hold is above the fence,
+  exact-delete the stale marker, and retry.
+
+Existing claim-versus-hold stream ordering identifies only marker-before-hold cases, so it
+cannot resolve ordering 2 on its own.

@@ -16,9 +16,9 @@ work is merged into the existing finding or roadmap item whose invariant it serv
 - Preserve deferred disconnect state during foreign disposition.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
-- Add write lineage to inbound QoS 2 holds and release claims.
+- Bound the inbound QoS 2 hold purge and the discard marker it leaves.
   Status: Open. Release treatment: Alpha blocker.
-  Details: [F-032](ha-arbitration.md#f-032).
+  Details: [F-062](ha-arbitration.md#f-062).
 - Add write lineage to shared QoS 2 assignment claims.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-033](ha-arbitration.md#f-033).
@@ -102,6 +102,10 @@ work is merged into the existing finding or roadmap item whose invariant it serv
 
 ## Resolved findings
 
+- Add write lineage to inbound QoS 2 holds and release claims.
+  Closed 2026-08-17: the audit found every write already carries its per-subject
+  expectation, so no lineage was needed; it produced F-062 (still open) instead.
+  Details: [F-032](ha-arbitration.md#f-032).
 - Remove the accidental review sentence from the README attribution section.
   Details: [F-001](resolved.md#f-001).
 - Make MQTT TLS startup fail closed.

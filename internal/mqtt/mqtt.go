@@ -1759,8 +1759,9 @@ type mqttPersistedSession struct {
 	// Teardown, when present, means a broker has CLAIMED this record's teardown and
 	// may be part way through deleting the incarnation's resources. Nobody may
 	// resume that state: every reader that can INTERPRET the record finishes the
-	// teardown (the deletions are idempotent and generation-scoped) and releases the
-	// record before starting fresh. A reader that refuses the record's schema does not
+	// teardown (the deletions are generation-scoped, and safe to repeat for names nothing
+	// can re-occupy — the inbound QoS 2 hold walk is the exception, F-062 A2) and releases
+	// the record before starting fresh. A reader that refuses the record's schema does not
 	// resume it either, but it does not finish it: the expiry path and the orphan
 	// sweep pick a reserved-namespace record up only while its GENERATION is valid,
 	// and one without a valid generation is adopted by nothing until the streams are
@@ -8648,8 +8649,9 @@ RESTORE:
 	// startup sweep to it: discard its state and start fresh. Spec5 [3.1.2.11.2].
 	// A retired generation takes the SAME route rather than a second discard shape of
 	// its own: build the transient session, clear() it (which re-marks the record,
-	// finds the retirement already recorded, repeats the idempotent deletions and
-	// releases the record) and hand back the reset object as a fresh session, with
+	// finds the retirement already recorded, repeats the deletions — see F-062 A2 for the
+	// one that is not safe to repeat — and releases the record) and hand back the reset
+	// object as a fresh session, with
 	// Session Present false — which is the truthful answer in both cases.
 	overdue := ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
 		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval)
@@ -9348,9 +9350,9 @@ func (sess *mqttSession) clearWindowHook(window string) {
 // arbitrate nothing against a broker that has taken the session over. A lost claim
 // means a newer owner exists and NOTHING is deleted. A release that removes no
 // record is classified by re-reading rather than assumed to be ours. And every
-// resource named here is generation-scoped, so even a delete that lands after a
-// peer finished the whole teardown can only name something that is already gone.
-// See sess_teardown.go.
+// resource named here is generation-scoped. Generation scoping protects the next
+// incarnation; a resume preserves the generation, so it does not protect a peer still
+// serving the retiring one (F-062). See sess_teardown.go.
 //
 // It runs in a record transaction of the OLD generation — its record removal must
 // validate against the epoch it opened with — and ends that generation as it
@@ -9559,7 +9561,9 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// overdue-record path), and both must provision under a generation that the
 	// deletions below cannot name — including when one of them lands late, after a
 	// peer has finished the teardown and a new session exists. That is what makes a
-	// late delete harmless by construction rather than merely unlikely. A legacy
+	// late delete harmless TO THE NEXT INCARNATION by construction rather than merely
+	// unlikely. It does not make one harmless to a peer still serving the RETIRING
+	// generation, which a resume preserves: see F-062. A legacy
 	// session with no generation is re-minted here too, which is the only way it
 	// leaves the exposed hash-only naming. See sess_incarnation.go.
 	sess.setIncarnationLocked(mqttNewSessGen())
@@ -9640,8 +9644,10 @@ func (sess *mqttSession) clear(noWait bool) error {
 
 	// DELETE this incarnation's resources. A nonce re-read before the batch would
 	// only be an early-out, never what makes this safe — the read and the JetStream
-	// delete cannot be atomic. Generation-scoped naming is what makes it safe, and
-	// the hook here is how a test parks a broker in exactly that window.
+	// delete cannot be atomic. Generation-scoped naming is what keeps these deletes off
+	// the NEXT incarnation's resources; it does not establish that no peer is still
+	// serving this one (F-062, and F-034 unaudited). The hook here is how a test parks a
+	// broker in exactly that window.
 	if h := mqttTestTeardownClaimedHookV.Load(); h != nil {
 		(*h)(sess, nonce, markerSeq)
 	}
@@ -13292,7 +13298,10 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 // client IDs are accepted. mqtt-nats-bridge divergence from upstream.
 //
 // The session's incarnation generation is part of the subject, so a hold belongs
-// to one incarnation and a discard purge from a retired one can never reach it.
+// to one incarnation and a discard purge naming a RETIRED generation cannot reach
+// it. That is not a general immunity: a teardown for THIS incarnation, won against a
+// peer still serving it, purges by subject and does reach a hold accepted meanwhile
+// (F-062).
 // Both callers run on the inbound QoS 2 path, well after processConnect installed
 // c.mqtt.sess (which the delivery path already dereferences unguarded), and a
 // re-mint only ever happens on a discard, which ends the connection.
@@ -13308,11 +13317,14 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 //
 // This is the recoverable MOVE half of the inbound QoS 2 exchange: the held record
 // is delivered onward FIRST and only then replaced by a terminal tombstone, so no
-// window can delete the message and then fail to deliver it. The branch order is
+// window IN THIS EXCHANGE deletes the message and then fails to deliver it. (A
+// teardown running for an incarnation a peer still serves is a different matter and
+// can destroy it from outside: F-062.) The branch order is
 // load, corrupt, delivered, malformed, expired, claim, prove, store, commit; see
 // qos2_move.go for the state machine, the four design invariants it obeys, and the
-// honest guarantee (no silent loss; exactly-once for durable subscribers only while
-// deduplication survives the unresolved store..commit interval).
+// honest guarantee (no silent loss on this exchange's own paths; exactly-once for
+// durable subscribers only while deduplication survives the unresolved store..commit
+// interval).
 //
 // The claim (R) and the proof (P) are the two fences that serialize this release
 // against a concurrent session discard, and neither substitutes for the other: the
@@ -13472,9 +13484,14 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 
 	// R: the release claim — fence 1, and the last point at which a concurrent
 	// session discard can still win. It is a create-only CAS on a sibling of the hold
-	// subject, so exactly one of "release it" and "discard it" can ever succeed and
-	// the loser does nothing irreversible. It must precede everything below: the
+	// subject, so for the exchange occupancy a discard actually enumerated and competed
+	// for, exactly one of "release it" and "discard it" succeeds and the loser does
+	// nothing irreversible. It must precede everything below: the
 	// fan-out inside the onward store cannot be taken back. See qos2_release_claim.go.
+	//
+	// This fence decides only the occupancy it competed for. Two open blockers bound what
+	// that is worth, and neither is decidable here: F-036 and F-062
+	// (docs/findings/ha-arbitration.md). Do not restate their boundary in this file.
 	if sess := c.mqtt.sess; sess != nil {
 		if !sess.beginQoS2ReleaseOp() {
 			// This session is being discarded on this broker. Deliver nothing and claim
@@ -13496,8 +13513,11 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// or a peer releasing the same exchange. The claim is discard-exclusive, never
 		// releaser-exclusive.
 	case mqttQoS2ClaimDiscarded, mqttQoS2ClaimUnreadable:
-		// A discard won, or a record we cannot attribute holds the claim subject.
-		// Nothing may be delivered. Release the hold record before answering
+		// A discard won for SOME occupancy of this claim subject, or a record we cannot
+		// attribute holds it. Nothing may be delivered here — and when the marker belongs to
+		// an EARLIER exchange this is where an acknowledged later one is lost rather than
+		// fenced (F-062 mechanism 2); the branch cannot tell the two apart, which is the
+		// defect. Release the hold record before answering
 		// (invariant 3) and report the identifier as gone. The CLAIM is deliberately
 		// not reaped: a `discarded` claim is the only durable proof that a later
 		// releaser must lose, and an unreadable one may be a corrupted instance of one.
@@ -13523,8 +13543,9 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	vStatus, vSeq, verr := asm.verifyQoS2HoldForRelease(subject, gen, seq)
 	switch vStatus {
 	case mqttQoS2VerifyHeld:
-		// Our record, at our sequence. Nothing can remove it now: a discard must win
-		// the claim before it purges, and we hold the claim.
+		// Our record, at our sequence. Holding the claim fences a discard that has not yet
+		// committed to this subject's purge; see verifyQoS2HoldForRelease, and F-062 for the
+		// exceptions it does not fence.
 	case mqttQoS2VerifyDelivered:
 		// Our generation's own tombstone: a peer completed this exchange. Answer from
 		// it without re-delivering, exactly as branch T does, and reap both records
@@ -13541,8 +13562,11 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// fact DISCARDED: the orphan sweep retires an aged `discarded` marker, but only
 		// after destroying the hold and confirming it gone, so a releaser that preloaded
 		// the payload and resumed later finds an empty claim subject and then an absent
-		// record. Nothing is delivered and nothing is lost — only the reason code is
-		// more optimistic than the marker-backed 0x92. See orphan_qos2_sweep.go and the
+		// record. For the exchange that marker was written for, nothing is delivered and
+		// nothing is lost — only the reason code is more optimistic than the marker-backed
+		// 0x92. For a LATER exchange the stale marker had fenced, the hold the sweep
+		// destroyed was one the client was told was held, so that one IS lost: F-062
+		// mechanism 2. See orphan_qos2_sweep.go and the
 		// residual in docs/CONFORMANCE.md.
 		asm.reapQoS2RelClaim(claimSeq)
 		return nil
@@ -13597,9 +13621,9 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		asm.reapQoS2RelClaim(claimSeq)
 		return nil
 	case mqttQoS2FinalizeSuperseded:
-		// A newer generation owns this subject and was NOT touched. Our message was
-		// delivered, but this identifier's state is no longer ours to close, so 0x92
-		// is the honest answer (residual 5). Our own claim is stale and can go.
+		// A later exchange on this identifier owns this subject and was NOT touched. Our
+		// message was delivered, but this identifier's state is no longer ours to close, so
+		// 0x92 is the honest answer (residual 5). Our own claim is stale and can go.
 		asm.reapQoS2RelClaim(claimSeq)
 		reason = mqttReasonPacketIDNotFound
 		reasonStr = "no message found for the packet identifier"
