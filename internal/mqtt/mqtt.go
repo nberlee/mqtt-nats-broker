@@ -1057,6 +1057,16 @@ type mqttAccountSessionManager struct {
 	testQoS2ClaimStore func(subject string, expectSeq uint64, c *mqttQoS2RelClaim) (uint64, error)
 	testQoS2ClaimLoad  func(subject string) (*mqttQoS2RelClaim, *StoredMsg, error)
 
+	// testQoS2Subjects, when non-nil, replaces the discard walk's subject
+	// enumeration. Routed separately from the claim loads for the reason
+	// testInflightEnumerate is: "the identifier space could not be read" and "one
+	// claim could not be loaded" are different failures with the same remedy. It is
+	// also the only way to stage the ONE response shape the walk must refuse — a
+	// non-empty subject map with a zero last sequence, which the server can legitimately
+	// return once because State and State.Subjects are separate reads, and which a
+	// bounded purge cannot act on (F-062). Nil in production.
+	testQoS2Subjects func(filter string) (map[string]uint64, uint64, error)
+
 	// testQoS2ClaimDone, when non-nil, is invoked with the RESOLVED status of every
 	// release claim on THIS account manager. Same reason as testQoS2FinalizeDone: a
 	// releaser that correctly declines to deliver sends nothing at all, and on a
@@ -1759,8 +1769,9 @@ type mqttPersistedSession struct {
 	// Teardown, when present, means a broker has CLAIMED this record's teardown and
 	// may be part way through deleting the incarnation's resources. Nobody may
 	// resume that state: every reader that can INTERPRET the record finishes the
-	// teardown (the deletions are generation-scoped, and safe to repeat for names nothing
-	// can re-occupy — the inbound QoS 2 hold walk is the exception, F-062 A2) and releases
+	// teardown (the deletions are generation-scoped; repeating them is safe for names nothing
+	// can re-occupy, bounded per walk for the inbound QoS 2 hold walk — F-062 — and not
+	// claimed at all for the unbounded `$MQTT_inflight` purge — F-034) and releases
 	// the record before starting fresh. A reader that refuses the record's schema does not
 	// resume it either, but it does not finish it: the expiry path and the orphan
 	// sweep pick a reserved-namespace record up only while its GENERATION is valid,
@@ -4473,41 +4484,61 @@ func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 }
 
 // streamSubjects returns the subjects in streamName matching filter, mapped to
-// their message counts, via STREAM.INFO's subjects_filter. It reads no message
-// bodies at all, which is the whole reason the release claim lives on a sibling
-// subject: the discard has to enumerate a session's inbound QoS 2 state without
-// pulling every held payload (up to max_payload each) across the JS API on a
-// disconnect path.
+// their message counts, together with the stream's LAST SEQUENCE, via
+// STREAM.INFO's subjects_filter. It reads no message bodies at all, which is the
+// whole reason the release claim lives on a sibling subject: the discard has to
+// enumerate a session's inbound QoS 2 state without pulling every held payload
+// (up to max_payload each) across the JS API on a disconnect path.
+//
+// The last sequence is what lets a caller BOUND a subsequent destructive purge to
+// what it actually enumerated (F-062). The two values are NOT one snapshot: the
+// server builds State first and fills State.Subjects afterwards from a separate
+// store read, so a subject can appear in the map while its record sits ABOVE the
+// returned sequence. That direction is benign for every caller here — such a record
+// is SPARED by a bounded purge and left to the orphan sweep.
+//
+// What the pair does NOT support is any inference about where the returned subjects sit
+// relative to the sequence. The map carries per-subject COUNTS, not sequences, and it is
+// sampled after State, so its occupants may lie on either side of the watermark. LastSeq is
+// solely the earlier State watermark, and its only use is to BOUND a destructive purge;
+// reading it as "everything returned is at or below this" is false.
 //
 // A nil map means the filter matched nothing. Callers must keep their filter
 // narrow enough that the response cannot be paged: JetStream truncates the list
 // at JSMaxSubjectDetails and reports the remainder only through the paging
 // fields, which this deliberately does not follow (see mqttQoS2HoldWalkFilter,
 // whose subject space is bounded by the 16-bit packet identifier).
-func (jsa *mqttJSA) streamSubjects(streamName, filter string) (map[string]uint64, error) {
+func (jsa *mqttJSA) streamSubjects(streamName, filter string) (map[string]uint64, uint64, error) {
 	req, err := json.Marshal(&JSApiStreamInfoRequest{SubjectsFilter: filter})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	slri, err := jsa.newRequest(mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, streamName), 0, req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	slr := slri.(*JSApiStreamInfoResponse)
 	if err := slr.ToError(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if slr.StreamInfo == nil {
-		return nil, fmt.Errorf("stream info for %q unavailable", streamName)
+		return nil, 0, fmt.Errorf("stream info for %q unavailable", streamName)
 	}
-	return slr.StreamInfo.State.Subjects, nil
+	return slr.StreamInfo.State.Subjects, slr.StreamInfo.State.LastSeq, nil
 }
 
 // purgeStream removes all messages in streamName matching filter (a subject,
-// possibly wildcarded). If noWait, the request is fired without waiting for a
-// response (like deleteConsumer/deleteMsg's no-wait paths).
-func (jsa *mqttJSA) purgeStream(streamName, filter string, noWait bool) error {
-	preq := JSApiStreamPurgeRequest{Subject: filter}
+// possibly wildcarded), up to but NOT INCLUDING upToSeq. If noWait, the request is
+// fired without waiting for a response (like deleteConsumer/deleteMsg's no-wait
+// paths).
+//
+// upToSeq == 0 is the UNBOUNDED shape: the request then carries no sequence and the
+// server removes whatever matches the filter when the purge APPLIES, which on a
+// clustered stream is after the caller's own enumeration. Callers that must not
+// destroy a record they never saw pass a bound; purgeQoS2Hold refuses to be called
+// without one at all (F-062).
+func (jsa *mqttJSA) purgeStream(streamName, filter string, upToSeq uint64, noWait bool) error {
+	preq := JSApiStreamPurgeRequest{Subject: filter, Sequence: upToSeq}
 	req, _ := json.Marshal(preq)
 	subj := jsa.prefixDomain(fmt.Sprintf(JSApiStreamPurgeT, streamName))
 	if noWait {
@@ -8649,8 +8680,9 @@ RESTORE:
 	// startup sweep to it: discard its state and start fresh. Spec5 [3.1.2.11.2].
 	// A retired generation takes the SAME route rather than a second discard shape of
 	// its own: build the transient session, clear() it (which re-marks the record,
-	// finds the retirement already recorded, repeats the deletions — see F-062 A2 for the
-	// one that is not safe to repeat — and releases the record) and hand back the reset
+	// finds the retirement already recorded, repeats the deletions — the inbound QoS 2 hold
+	// walk bounded per walk, F-062; the `$MQTT_inflight` purge beside it still unbounded,
+	// F-034 — and releases the record) and hand back the reset
 	// object as a fresh session, with
 	// Session Present false — which is the truthful answer in both cases.
 	overdue := ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
@@ -9351,8 +9383,10 @@ func (sess *mqttSession) clearWindowHook(window string) {
 // means a newer owner exists and NOTHING is deleted. A release that removes no
 // record is classified by re-reading rather than assumed to be ours. And every
 // resource named here is generation-scoped. Generation scoping protects the next
-// incarnation; a resume preserves the generation, so it does not protect a peer still
-// serving the retiring one (F-062). See sess_teardown.go.
+// incarnation; a resume preserves the generation, so it never protected a peer still
+// serving the retiring one. What protects that peer's inbound QoS 2 state is the bound
+// each hold removal carries (F-062); $MQTT_inflight has no such bound and its
+// consequence is unaudited (F-034). See sess_teardown.go.
 //
 // It runs in a record transaction of the OLD generation — its record removal must
 // validate against the epoch it opened with — and ends that generation as it
@@ -9562,8 +9596,9 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// deletions below cannot name — including when one of them lands late, after a
 	// peer has finished the teardown and a new session exists. That is what makes a
 	// late delete harmless TO THE NEXT INCARNATION by construction rather than merely
-	// unlikely. It does not make one harmless to a peer still serving the RETIRING
-	// generation, which a resume preserves: see F-062. A legacy
+	// unlikely. Naming alone does not make one harmless to a peer still serving the
+	// RETIRING generation, which a resume preserves; for the inbound QoS 2 holds the
+	// purge bound does, and it is what a late walk is limited by: see F-062. A legacy
 	// session with no generation is re-minted here too, which is the only way it
 	// leaves the exposed hash-only naming. See sess_incarnation.go.
 	sess.setIncarnationLocked(mqttNewSessGen())
@@ -9646,8 +9681,9 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// only be an early-out, never what makes this safe — the read and the JetStream
 	// delete cannot be atomic. Generation-scoped naming is what keeps these deletes off
 	// the NEXT incarnation's resources; it does not establish that no peer is still
-	// serving this one (F-062, and F-034 unaudited). The hook here is how a test parks a
-	// broker in exactly that window.
+	// serving this one. For the inbound QoS 2 holds that is covered by the bound each
+	// removal carries (F-062); for $MQTT_inflight it is not covered at all (F-034,
+	// unaudited). The hook here is how a test parks a broker in exactly that window.
 	if h := mqttTestTeardownClaimedHookV.Load(); h != nil {
 		(*h)(sess, nonce, markerSeq)
 	}
@@ -13299,9 +13335,12 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 //
 // The session's incarnation generation is part of the subject, so a hold belongs
 // to one incarnation and a discard purge naming a RETIRED generation cannot reach
-// it. That is not a general immunity: a teardown for THIS incarnation, won against a
-// peer still serving it, purges by subject and does reach a hold accepted meanwhile
-// (F-062).
+// it. Naming was never the whole protection, because a resume preserves the
+// generation: a teardown for THIS incarnation, won against a peer still serving it,
+// purges by subject and would reach a hold accepted meanwhile. What stops it is the bound
+// every hold purge now carries. Which bound each arm uses, and what that does and does not
+// license, are stated once in F-062 (docs/findings/ha-arbitration.md) — it is not one
+// watermark for all four arms, so do not summarise it as one here.
 // Both callers run on the inbound QoS 2 path, well after processConnect installed
 // c.mqtt.sess (which the delivery path already dereferences unguarded), and a
 // re-mint only ever happens on a discard, which ends the connection.
@@ -13318,8 +13357,8 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 // This is the recoverable MOVE half of the inbound QoS 2 exchange: the held record
 // is delivered onward FIRST and only then replaced by a terminal tombstone, so no
 // window IN THIS EXCHANGE deletes the message and then fails to deliver it. (A
-// teardown running for an incarnation a peer still serves is a different matter and
-// can destroy it from outside: F-062.) The branch order is
+// teardown running for an incarnation a peer still serves destroys only what it can
+// prove it was entitled to destroy: F-062.) The branch order is
 // load, corrupt, delivered, malformed, expired, claim, prove, store, commit; see
 // qos2_move.go for the state machine, the four design invariants it obeys, and the
 // honest guarantee (no silent loss on this exchange's own paths; exactly-once for
@@ -13489,9 +13528,10 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// nothing irreversible. It must precede everything below: the
 	// fan-out inside the onward store cannot be taken back. See qos2_release_claim.go.
 	//
-	// This fence decides only the occupancy it competed for. Two open blockers bound what
-	// that is worth, and neither is decidable here: F-036 and F-062
-	// (docs/findings/ha-arbitration.md). Do not restate their boundary in this file.
+	// This fence decides only the occupancy it competed for. What that is worth is bounded
+	// by the marker's fence, which makes an occupancy the discard was never entitled to
+	// provable here (F-062), and by one open blocker that is not decidable here at all:
+	// F-036 (docs/findings/ha-arbitration.md). Do not restate their boundary in this file.
 	if sess := c.mqtt.sess; sess != nil {
 		if !sess.beginQoS2ReleaseOp() {
 			// This session is being discarded on this broker. Deliver nothing and claim
@@ -13513,11 +13553,14 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// or a peer releasing the same exchange. The claim is discard-exclusive, never
 		// releaser-exclusive.
 	case mqttQoS2ClaimDiscarded, mqttQoS2ClaimUnreadable:
-		// A discard won for SOME occupancy of this claim subject, or a record we cannot
-		// attribute holds it. Nothing may be delivered here — and when the marker belongs to
-		// an EARLIER exchange this is where an acknowledged later one is lost rather than
-		// fenced (F-062 mechanism 2); the branch cannot tell the two apart, which is the
-		// defect. Release the hold record before answering
+		// A discard won for THIS occupancy of the claim subject, or a record we cannot
+		// attribute holds it. Nothing may be delivered here. A marker left for an EARLIER
+		// occupancy no longer reaches this branch: it records the fence its writer was
+		// entitled to destroy, so claimQoS2Release reaps it and retries the create when our
+		// hold sits above that fence (F-062 mechanism 2). The Unreadable arm shares this
+		// branch and is by definition not a legitimate marker, which is why the claim being
+		// made here is about the Discarded VERDICT and not about the branch.
+		// Release the hold record before answering
 		// (invariant 3) and report the identifier as gone. The CLAIM is deliberately
 		// not reaped: a `discarded` claim is the only durable proof that a later
 		// releaser must lose, and an unreadable one may be a corrupted instance of one.
@@ -13544,8 +13587,9 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	switch vStatus {
 	case mqttQoS2VerifyHeld:
 		// Our record, at our sequence. Holding the claim fences a discard that has not yet
-		// committed to this subject's purge; see verifyQoS2HoldForRelease, and F-062 for the
-		// exceptions it does not fence.
+		// committed to this subject's purge, and a discard that already committed to one
+		// could not have covered this record anyway: its purge was bounded to what it
+		// enumerated (F-062). See verifyQoS2HoldForRelease.
 	case mqttQoS2VerifyDelivered:
 		// Our generation's own tombstone: a peer completed this exchange. Answer from
 		// it without re-delivering, exactly as branch T does, and reap both records
@@ -13564,10 +13608,10 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// the payload and resumed later finds an empty claim subject and then an absent
 		// record. For the exchange that marker was written for, nothing is delivered and
 		// nothing is lost — only the reason code is more optimistic than the marker-backed
-		// 0x92. For a LATER exchange the stale marker had fenced, the hold the sweep
-		// destroyed was one the client was told was held, so that one IS lost: F-062
-		// mechanism 2. See orphan_qos2_sweep.go and the
-		// residual in docs/CONFORMANCE.md.
+		// 0x92. A LATER exchange's hold is not reachable this way: the sweep's purge is
+		// bounded to the exact record it observed and re-confirmed, so a hold accepted
+		// after that observation is spared rather than destroyed (F-062). See
+		// orphan_qos2_sweep.go and the residual in docs/CONFORMANCE.md.
 		asm.reapQoS2RelClaim(claimSeq)
 		return nil
 	case mqttQoS2VerifySuperseded:

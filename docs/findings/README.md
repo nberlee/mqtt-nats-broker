@@ -17,7 +17,9 @@ work is merged into the existing finding or roadmap item whose invariant it serv
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-028](session-and-will.md#f-028).
 - Bound the inbound QoS 2 hold purge and the discard marker it leaves.
-  Status: Open. Release treatment: Alpha blocker.
+  Closed 2026-08-18: every hold removal carries a proven cutoff, and a `discarded` marker
+  records the cutoff its writer was entitled to purge through, so a later exchange can prove
+  the marker is not about it.
   Details: [F-062](ha-arbitration.md#f-062).
 - Add write lineage to shared QoS 2 assignment claims.
   Status: Open. Release treatment: Alpha blocker.
@@ -104,7 +106,7 @@ work is merged into the existing finding or roadmap item whose invariant it serv
 
 - Add write lineage to inbound QoS 2 holds and release claims.
   Closed 2026-08-17: the audit found every write already carries its per-subject
-  expectation, so no lineage was needed; it produced F-062 (still open) instead.
+  expectation, so no lineage was needed; it produced F-062 (closed 2026-08-18) instead.
   Details: [F-032](ha-arbitration.md#f-032).
 - Remove the accidental review sentence from the README attribution section.
   Details: [F-001](resolved.md#f-001).

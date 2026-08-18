@@ -19,8 +19,9 @@
 // # The guarantee
 //
 // No silent loss on any PUBREL path **of a session whose ownership has not moved
-// under it** — see F-062 for the exception, which this guarantee does not cover.
-// Once the terminal state commits, suppression
+// under it**, and none inflicted from outside by a teardown of an incarnation a peer
+// is still serving either: every hold removal now carries a durable bound on what its
+// remover was entitled to destroy (F-062). Once the terminal state commits, suppression
 // of re-delivery is indefinite and independent of the deduplication window, the
 // broker's lifetime, and the nats-server's. Across the *unresolved* interval
 // between the onward store and that commit, the durable (QoS 1/2 subscriber) path
@@ -28,9 +29,10 @@
 // at-least-once. The live core-NATS fan-out is at-least-once in that same
 // interval and cannot be made otherwise.
 //
-// The exception is a teardown running for an incarnation a peer is still serving, which
-// can lose an acknowledged PUBLISH from outside this exchange. Its mechanisms and their
-// bounds are stated once, in F-062 (docs/findings/ha-arbitration.md).
+// A teardown running for an incarnation a peer is still serving could lose an
+// acknowledged PUBLISH from outside this exchange. It no longer can: the bound each
+// removal carries, and the fence a discard marker records, are stated once in F-062
+// (docs/findings/ha-arbitration.md).
 //
 // Do not restate this as "exactly-once across nats-server restart". It is not.
 //
@@ -78,9 +80,10 @@
 // Loss on the paths this protocol controls is eliminated: the record leaves `held`
 // only after the onward delivery returned success, and no nonterminal cleanup is
 // reported to the client until it is confirmed (invariant 3; terminal tombstone
-// cleanup stays asynchronous by invariant 4). What it does NOT eliminate is loss
-// inflicted from OUTSIDE the exchange, by a teardown for an incarnation a peer is
-// still serving — that is F-062, and it is an open blocker rather than a residual.
+// cleanup stays asynchronous by invariant 4). Loss inflicted from OUTSIDE the
+// exchange, by a teardown for an incarnation a peer is still serving, is eliminated
+// too — F-062 bounded every hold removal to what its remover could prove it was
+// entitled to destroy, and put that bound in the marker a discard leaves behind.
 // What remains here:
 //
 //  1. At-least-once live fan-out. A failure between processInboundClientMsg and
@@ -688,10 +691,11 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
 		return fmt.Errorf("deny_delete is set: it blocks release, reap and terminal cleanup")
 	}
 	if cfg.DenyPurge {
-		// The purge this protects is purgeQoS2Hold's CONFIRMED exact-subject
-		// purge — the session discard's and the orphan sweep's only removal of a
-		// hold subject. (The discard's blind filter purge is gone; see
-		// qos2_release_claim.go.)
+		// The purge this protects is purgeQoS2Hold's CONFIRMED exact-subject purge,
+		// bounded to the highest sequence its caller can prove it was entitled to
+		// destroy — the session discard's and the orphan sweep's only removal of a
+		// hold subject. (The discard's blind filter purge is gone, and the surviving
+		// one is no longer unbounded either; see qos2_release_claim.go.)
 		return fmt.Errorf("deny_purge is set: it blocks the confirmed exact-subject hold purge the session discard and the orphan sweep perform")
 	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {

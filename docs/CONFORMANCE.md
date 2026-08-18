@@ -1190,7 +1190,8 @@ What it does NOT do:
      consequence audits — F-033 and F-034 respectively — which are open. **`$MQTT_qos2in`'s
      ran (F-032, closed 2026-08-17)**: every write there carries its expectation, so it
      needed no lineage, and what it found instead was a hold purge carrying no condition at
-     all — F-062 and F-036, neither of which this admission closure speaks to.
+     all — F-062 (closed 2026-08-18 by giving the purge a proven cutoff) and F-036, neither
+     of which this admission closure speaks to.
      **`$MQTT_teardown`** is not one of those: it carries its own separately documented
      residuals (the retirement watermark and the single slot), stated where they arise.
      **`$MQTT_origin` is not in scope at all**: the register was deleted by the
@@ -1545,7 +1546,7 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   `$MQTT_qos2assign` and `$MQTT_inflight`: the server mechanisms are stream-independent,
   but each of those findings owns its own consequence. **F-033 and F-034 stay open until
   each is audited on its own terms.** F-032 has since been audited and closed, producing
-  F-062, which is open. It also does not claim the two backstops below
+  F-062, which closed on 2026-08-18. It also does not claim the two backstops below
   the proved mechanisms — an entry admitted anyway is discarded by apply-time log order,
   and beneath that by the store's refusal of any sequence that is not the next one — but
   neither is mutation-proved and neither is part of any claim.
@@ -1800,7 +1801,7 @@ finds the tombstone answers `0x00` without re-delivering.
 The guarantee, stated exactly:
 
 > No silent loss on any PUBREL path **of a session whose ownership does not move under
-> it** (see the F-062 exception below). Once the terminal state commits, suppression
+> it**. Once the terminal state commits, suppression
 > of re-delivery is indefinite and independent of the deduplication window, the
 > broker's lifetime, and the nats-server's. Across the *unresolved* interval
 > between the onward store and that commit, the durable (QoS 1/2 subscriber) path
@@ -1808,23 +1809,63 @@ The guarantee, stated exactly:
 > at-least-once. The live core-NATS fan-out is at-least-once in that same interval
 > and cannot be made otherwise.
 
-**The F-062 exception, stated so the guarantee above is not read wider than it holds.**
+**What a teardown of an incarnation a peer is still serving can and cannot do.**
 *Derived from `docs/findings/ha-arbitration.md` F-062, which is authoritative for the
 mechanisms and their arms; what follows states only what a reader of the guarantee needs.*
-The guarantee covers the exchange's own paths. It does **not** cover loss inflicted from
-outside the exchange by a teardown running for an incarnation a peer is still serving. A
-teardown that WON its claim removes holds by subject filter, so an exchange accepted and
-PUBREC-acknowledged on an **already-enumerated hold subject**, while that subject's purge
-is still pending, is destroyed. (A hold on a subject the enumeration never saw is missed
-rather than destroyed — that is F-036, below, and a different direction.) Separately, the
-`discarded` marker the teardown leaves is **not reaped by any teardown or releaser path**,
-so it is read by a LATER exchange on the same packet identifier, which is then answered
-`0x92` with its hold released; only the age-qualified orphan sweep can retire it, hold
-first, and that recovery is conditional on the sweep running. Both lose an
-acknowledged PUBLISH. This is an **open alpha blocker, not a stated deviation**: see
-`docs/findings/ha-arbitration.md` F-062. Two neighbouring consequences of the same
-condition (a delivery after discard, and the orphan sweep condemning a live remote
-generation whose record is absent) belong to F-036, whose scope was widened for them.
+It can no longer destroy an acknowledged PUBLISH that no removal was entitled to reach. Every
+hold removal carries the highest sequence its remover could prove it was entitled to destroy,
+and the `discarded` marker records as its fence the cutoff its writer was entitled to purge
+through — an entitlement, not evidence the hold is gone, since the marker is written before
+the purge — so a LATER exchange
+on the same packet identifier proves the marker is not about it, reaps it and proceeds instead
+of being answered `0x92` with its hold released.
+
+**Which cutoff each PURGING arm uses is NOT uniform, and neither is what licenses a
+destruction on each.** There are four arms in the analysis and three of them purge: the arm
+that waits out a release destroys nothing at all, and re-competes instead. This document
+states neither the mapping nor the criterion, because every paraphrase of
+them attempted here has been wrong. F-062 carries the authoritative mapping and the per-arm
+criterion; read it there. The one consequence a reader of this guarantee needs, and the only
+one stated here: **"accepted after some teardown enumerated" is not by itself a safety
+property.**
+
+Neither remedy makes the claim exchange-exclusive; it is not, and must not be described that
+way.
+
+Four residuals follow from that, and they are three different kinds. **Two are ordinary
+in-contract leaks** (the first and second below). **One is loss but requires record
+corruption**, so it is outside this finding's condition. **One is not reachable in contract
+at all** and is a fail-closed disposition rather than a hazard. None is conditioned on a
+rollout:
+
+- **A spared hold above the cutoff.** `STREAM.INFO`'s `State` and `State.Subjects` are two
+  separate store reads, so a hold can appear in the enumerated map while its record sits
+  above the returned last sequence. It survives the teardown and is left to the orphan
+  sweep. Leak, not loss. Note what the pair does not license: the subject map carries
+  per-subject counts, not sequences, and is sampled after `State`, so it is not evidence that
+  the subjects returned sit below the watermark. The watermark's only use is to bound a
+  destructive purge.
+- **A stranded post-enumeration tombstone.** An exchange completing between the
+  enumeration and the purge leaves its terminal tombstone above the cutoff, so the bounded
+  purge spares it. Leak; the orphan sweep's unclaimed-hold arm reaps it, and a next PUBLISH
+  on that identifier takes the existing reap-and-retry path.
+- **A corrupt but readable fence** can over-purge up to its own value on the arm that
+  adopts a pre-existing marker. This one *is* loss, and it requires record corruption,
+  which is outside the condition above; nothing here bounds a corrupt readable fence. The
+  `MaxUint64` refusal only stops it degenerating into an unbounded purge.
+- **A refused watermark leaves a partially torn-down session.** If a walk cannot obtain a
+  usable cutoff it fails the clear rather than reporting the session destroyed, which
+  leaves the record marked and refuses that client ID's next CONNECT until an adoption
+  succeeds. Fail-closed and self-healing, and **not reachable in contract** — the last
+  sequence never rewinds under a delete, a replacement, a filtered purge, a compact at or
+  below the tail, or expiry — so it is a disposition rather than an operational hazard.
+
+Every sequence identity above, the fence included, is scoped to **one stream incarnation**;
+recreating `$MQTT_qos2in` is an all-brokers-stopped operation (`docs/ARCHITECTURE.md`,
+"Compatibility boundary"). Two neighbouring consequences of the same condition (a delivery
+after discard, and the orphan sweep condemning a live remote generation whose record is
+absent) belong to **F-036**, which is still an open alpha blocker; the cutoff widened the
+first of them, since a spared hold stays serviceable by that peer.
 
 This is **not** "exactly-once across a nats-server restart", and should not be
 described that way.
@@ -1857,7 +1898,9 @@ The deviations that remain:
   sentence: the enumeration is a one-shot snapshot, so a hold on a subject it never saw is
   never competed for and CAN still be delivered after the discard (F-036); and the claim
   subject is reused by successive exchanges, so exclusivity is per-occupancy rather than per
-  identifier for all time (F-062). What the claim does not order is the wire: a
+  identifier for all time. What makes that second limit harmless is not the claim but the
+  fence a `discarded` marker records, which lets a later exchange prove the marker is not
+  about it (F-062). What the claim does not order is the wire: a
   releaser that claimed before the discard observed the register is committed, and
   its live core-NATS fan-out may reach subscribers after the discard released the
   session record and its CONNACK reported Session Present false. The delivery
@@ -1869,11 +1912,13 @@ The deviations that remain:
   that was in flight.** The `discarded` marker is the only durable proof that a
   late releaser must lose, so nothing may reap it at teardown time — "no releaser
   is still in flight" is not provable. It is small (roughly 150 bytes, on a subject
-  scoped to the retiring incarnation), but **it is not inert**: a peer still serving that
-  incarnation can accept a LATER exchange on the same packet identifier, and the marker
-  then answers that exchange `0x92` and releases its hold. That is F-062 mechanism 2, an
-  open blocker — the marker's reach is not confined to the exchange it was written
-  for. It is retired by the periodic orphan sweep
+  scoped to the retiring incarnation), and its reach is **not confined to the exchange it
+  was written for**: a peer still serving that incarnation can accept a LATER exchange on
+  the same packet identifier and read the same marker. What bounds that reach is the
+  **fence** the marker carries — the highest sequence its writer was entitled to destroy —
+  so an exchange whose hold sits above it reaps the marker at its exact sequence and
+  proceeds, rather than being answered `0x92` (F-062 mechanism 2). It is retired by the
+  periodic orphan sweep
   once it has been **continuously observed as an orphan**, unchanged, for a
   deliberately long grace (one hour, against five minutes for construction-window
   state) and only **after** the hold record it fences has been destroyed and
@@ -1889,10 +1934,10 @@ The deviations that remain:
   sweep has destroyed the hold and removed the marker, it wins a fresh claim,
   re-reads the hold as absent, and reports success. For the exchange the marker was
   written for, nothing is delivered and nothing is lost either way — only the reason
-  code is more optimistic than the marker-backed one. **That does not extend to a
-  LATER exchange the stale marker had fenced**: there the sweep destroys a hold whose
-  client was told it was held, and the preloaded PUBREL then answers success without
-  delivering. See F-062 mechanism 2.
+  code is more optimistic than the marker-backed one. A LATER exchange is not reachable
+  this way: the sweep's purge is bounded to the exact record it observed and re-confirmed,
+  so a hold accepted after that observation is spared rather than destroyed, and its own
+  PUBREL reaps the marker because its hold sits above the fence. See F-062.
 - **A `releasing` claim whose broker died is retired the same way**, hold first.
   This does not prove a paused process can never resume; it preserves the ordering
   that already governs one. A releaser that has not passed its authoritative

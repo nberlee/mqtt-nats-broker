@@ -4252,7 +4252,7 @@ func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 			stillReserved, asPubRel)
 	}
 	// No uncorrelated PUBREL was stored, and the record this object does not own stands.
-	if n, err := e.asm.jsa.streamSubjects(mqttOutStreamName, e.sess.pubRelSubject); err == nil && len(n) != 0 {
+	if n, _, err := e.asm.jsa.streamSubjects(mqttOutStreamName, e.sess.pubRelSubject); err == nil && len(n) != 0 {
 		t.Fatalf("a foreign reservation must not store a PUBREL, found %v", n)
 	}
 	e.waitRegisterCount(t, 1)
@@ -5067,7 +5067,8 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
 		enumerations++
-		return e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+		subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+		return subjects, err
 	}
 	e.asm.mu.Unlock()
 	restore := setMQTTTestLoadNextMsgHook(func(stream, subject string, seq uint64) error {

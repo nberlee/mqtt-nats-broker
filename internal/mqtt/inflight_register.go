@@ -372,6 +372,10 @@ func (as *mqttAccountSessionManager) storeInflightCAS(subject string, expectSeq 
 
 // enumerateInflightSubjects lists one incarnation's register subjects, honoring an
 // instance-scoped test seam.
+//
+// The stream's last sequence is discarded: this walk removes nothing by filter, so it
+// has no purge to bound. Every register delete it leads to already targets an exact
+// sequence (R4).
 func (as *mqttAccountSessionManager) enumerateInflightSubjects(filter string) (map[string]uint64, error) {
 	as.mu.RLock()
 	hook := as.testInflightEnumerate
@@ -379,7 +383,8 @@ func (as *mqttAccountSessionManager) enumerateInflightSubjects(filter string) (m
 	if hook != nil {
 		return hook(filter)
 	}
-	return as.jsa.streamSubjects(mqttInflightStreamName, filter)
+	subjects, _, err := as.jsa.streamSubjects(mqttInflightStreamName, filter)
+	return subjects, err
 }
 
 // loadInflightRecord reads a register, honoring an instance-scoped test seam.

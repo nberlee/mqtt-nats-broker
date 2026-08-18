@@ -46,6 +46,16 @@ This boundary applies only to bridge persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
 covered by the conformance suites.
 
+**Every sequence identity is scoped to one stream incarnation.** Deleting and recreating
+a `$MQTT_*` stream restarts its sequence space, and every mechanism in this design that
+treats a stream sequence as an identity breaks with it: the per-subject CAS expectations,
+each exact-sequence claim delete, `releaseQoS2Record`, the orphan sweep's confirmation
+re-read, and the fence a `discarded` marker records (F-062). Recreation is therefore an
+**all-brokers-stopped** operation, which is the same conclusion the paragraph above
+reaches for a nonconforming stream shape. Stated here once so the mechanisms can rely on
+it uniformly: a design must not add a per-site diagnostic that reads like a fence without
+being one, and must not describe a mid-flight recreation as a residual it handles.
+
 ### Trusting the backend
 
 This bridge is built **on** NATS and JetStream. They are a dependency we trust, not
@@ -130,13 +140,43 @@ the "no fallbacks" stance reviewable rather than implicit.
   recreation, which are not proposal-ordering questions, and each remaining per-stream
   finding owns its own consequence audit. `$MQTT_qos2in`'s audit ran (F-032, closed):
   every write there carries its expectation, so it needed no lineage — and what it did
-  find was a hold purge carrying no condition at all, which is F-062 and F-036 rather
-  than anything this contract speaks to. `$MQTT_qos2assign` (F-033) and `$MQTT_inflight`
-  (F-034) still owe theirs.
+  find was a hold purge carrying no condition at all, which is F-062 (closed: the purge
+  now carries one, see the next bullet) and F-036 rather than anything this contract
+  speaks to. `$MQTT_qos2assign` (F-033) and `$MQTT_inflight` (F-034) still owe theirs.
   A rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
   every rejection is resolved by re-reading rather than classified directly.
+- **A stream purge takes a subject filter and a sequence CUTOFF together**
+  (`JSApiStreamPurgeRequest`). `Sequence` means "purge up to but **not including** this
+  sequence" and combines with `Subject`, so one request can remove a subject's records at
+  or below a chosen watermark and leave everything above it
+  (`server/jetstream_api.go:495-502`, v2.14.5). Three properties this design relies on:
+  `Sequence: 1` is an explicit no-op in both stores (`server/filestore.go:9933`,
+  `server/memstore.go:1447`), which is why a zero cutoff is refused rather than sent — it
+  would report success for a purge that removed nothing; the two stores agree on the
+  cutoff's **semantics** while differing in mechanics (`fileStore.PurgeEx` clamps a block's
+  upper bound only when the cutoff falls inside that block's filtered range,
+  `filestore.go:10048`, where `memStore.PurgeEx` sets it unconditionally,
+  `memstore.go:1481`); and the clustered path proposes the whole request through Raft
+  (`jetstream_cluster.go:8816`) substituting a leader-stamped `LastSeq+1` **only when
+  `Sequence == 0`** (`:4308-4317`), so a non-zero cutoff travels verbatim and upstream
+  itself treats `Sequence: 0` as the shape needing care. The corollary that matters: an
+  unconditioned purge on a clustered stream is bounded only at PROPOSAL time, which is
+  after the caller's own enumeration, and on `R1` it is not bounded at all. This is what
+  `purgeQoS2Hold` depends on (F-062); `StreamState.LastSeq` arrives with the enumeration
+  that supplies the cutoff, though see the next bullet for what it is not.
+- **`STREAM.INFO`'s `State` and `State.Subjects` are two separate store reads**, not one
+  snapshot: the response's `State` is built by `mset.stateWithDetail` and `State.Subjects`
+  is filled afterwards by `mset.store.SubjectsTotals` (`server/jetstream_api.go:2018-2045`,
+  v2.14.5). So a subject can appear in the returned map while its record sits ABOVE the
+  returned `LastSeq`, and a walk begun against an empty stream can be handed a non-empty
+  map with `LastSeq == 0`. The map carries per-subject **counts**, not sequences, and is the
+  later sample, so the pair licenses **no inference at all** about where the returned
+  occupants sit: they may lie on either side of `LastSeq`. `LastSeq` is usable for exactly
+  one thing — as a destructive cutoff — and never as an inventory of what is at or below it.
+  Both directions are handled where they are depended on (F-062): a record above the cutoff
+  is spared, and an unusable watermark is re-sampled rather than acted on.
 - **An atomic batch is indivisible at APPLY, not at Raft** (`AllowAtomicPublish`).
   Raft preserves nothing about a batch: `ProposeMulti` pushes the entries
   individually, `runAsLeader` pops whatever prefix exists, and each regrouped batch
@@ -1912,10 +1952,16 @@ resulting absence as proof the exchange had completed. So a **release claim**
 (`internal/mqtt/qos2_release_claim.go`) sits in front of the delivery — a small
 create-only CAS record on a sibling subject, the hold subject plus a `rel` token:
 
-| writer | value | when |
+| writer | readable shape | when |
 |---|---|---|
-| the releasing PUBREL | `releasing` + the exchange generation | before the onward store |
-| a session discard | `discarded` | before it destroys the hold |
+| the releasing PUBREL | `releasing` + the exchange generation, and **no fence** | before the onward store |
+| a session discard | `discarded` + a **mandatory usable `Fence`**, and no generation | before it destroys the hold |
+
+Both pairings are enforced, not conventional: `mqttQoS2RelClaimIdentityOK` refuses a
+`releasing` claim carrying a fence and a `discarded` marker whose fence is absent or
+unusable, and a refused shape classifies **unreadable** rather than being read leniently.
+A usable fence is the same predicate the purge accepts, so a marker can never carry a bound
+its own purge would reject (F-062).
 
 Exactly one create can succeed while a record occupies the claim subject, so for the
 exchange a discard **enumerated**, exactly one of "release it" and "discard it" wins and
@@ -1924,13 +1970,18 @@ releaser-exclusive**: the generation identifies the exchange rather than the bro
 so a second releaser of the same exchange reads its own generation back and
 proceeds.
 
-Two limits belong with that sentence, and both are open blockers rather than residuals.
-The enumeration is a **one-shot snapshot**, so a hold on a subject it never saw is never
-competed for at all (F-036). And the claim subject is **reused by successive exchanges**,
-so exclusivity is per-occupancy rather than per identifier for all time: a `discarded`
-marker that outlives its own exchange is read by the next one on that identifier, which
-is then answered `0x92` (F-062). Neither is a JetStream limitation — the hold purge
-supplies only a subject filter, so there is no condition for the server to enforce.
+Two limits belong with that sentence. The enumeration is a **one-shot snapshot**, so a
+hold on a subject it never saw is never competed for at all — still an open blocker
+(F-036). And the claim subject is **reused by successive exchanges**, so exclusivity is
+per-occupancy rather than per identifier for all time: a `discarded` marker outlives its
+own exchange, and the next one on that identifier reads it. That second limit is resolved
+rather than open (F-062), and not by making the claim exchange-exclusive — it is not, and
+must not be described as though it were. Instead the marker **records the fence its writer
+was entitled to destroy**, so a later exchange whose hold sits above that fence proves the
+marker is not about it, reaps it at its exact sequence and retries. The purge that
+accompanies the marker carries the same bound: it names a subject, but destroys only up to
+the sequence its caller could prove. Neither limit was ever a JetStream limitation — the
+purge simply supplied no condition, and now it does.
 
 Because the claim is a sibling record, the hold record is never
 rewritten — its payload, properties and store time (which ages the Message Expiry
@@ -1942,12 +1993,20 @@ neither replaces the other: the claim fences a *discard*, which a re-read cannot
 because read-then-fan-out is check-then-act; the re-read fences an
 *already-completed* exchange, which the claim cannot, because a peer that committed
 and reaped leaves nothing to contend with, so a stalled releaser's create-only claim
-would simply succeed. A discard that finds a `releasing` claim waits briefly and
-then leaves both records rather than destroying a payload a crashed releaser's retry
-still needs; on the same broker an in-process fence refuses to admit a release at
-all. A `discarded` marker is never reaped by a releaser or by the discard itself —
-it is the only durable proof that a late releaser must lose — and is left to be
-aged out.
+would simply succeed. A discard that finds a `releasing` claim waits briefly; if the
+subject frees it **competes for the claim again** rather than reading the emptiness as its
+own licence — the claim it waited on may have belonged to an earlier exchange and been
+reaped by the current one's releaser, which frees the subject without anything having
+terminated — and if the budget expires it leaves both records rather than destroying a
+payload a crashed releaser's retry still needs; on the same broker an in-process fence
+refuses to admit a release at all. A `discarded` marker is never reaped by the DISCARD
+itself — it is the only durable proof that a late releaser must lose — and one that
+legitimately fences an exchange is left to be aged out. A RELEASER may reap one, under a
+single condition it can prove: when its own hold sits above the fence the marker records,
+the marker was never about its exchange, so it is exact-sequence deleted and the claim
+retried (F-062, and `claimQoS2ReleaseInner`). Removing that exception would restore F-062
+mechanism 2 — a later PUBREC-acknowledged exchange answered `0x92` and its hold released —
+so it is load-bearing rather than an optimisation.
 
 `$MQTT_qos2in` must be `LimitsPolicy` + `DiscardOld` + `MaxMsgsPer: 1` (`DiscardOld`
 is what makes the terminal CAS a *replacement*; `MaxMsgsPer: 1` is what stops it
@@ -1969,7 +2028,7 @@ manager serving on its original decision while any later initialization refuses.
 Both recover the same way: stopping **all** brokers for the account and recreating
 the stream, under the compatibility boundary above. This is not a rolling upgrade.
 
-### What the write audit established, and the one gap it found
+### What the write audit established, and the gap it found
 
 *`docs/findings/ha-arbitration.md` F-062 and F-036 are authoritative for the gap's
 mechanisms, arms, directions and remedies. This section summarises and references them, as
@@ -1984,26 +2043,45 @@ is **inherited from F-030 rather than re-proved here**, per "Trusting the backen
 lineage is carried on this stream and none is needed, because a create has no base to
 descend from and the terminal commit is already generation-guarded.
 
-**The gap is the hold purge, and it is ours rather than JetStream's.** `purgeQoS2Hold`
-supplies only a subject filter, so it removes whatever occupies the subject when it
-applies; the server has no condition to enforce because the bridge never sent one. Its
-two callers are arbitrated differently and **neither arbitration makes it
-exchange-bound**:
+**The gap was the hold purge, and it was ours rather than JetStream's.** `purgeQoS2Hold`
+supplied only a subject filter, so it removed whatever occupied the subject when it
+applied; the server had no condition to enforce because the bridge never sent one. Its two
+callers are arbitrated differently and **neither arbitration makes it exchange-bound**:
 
 - The **teardown** caller runs only after `claimTeardown` is won, which fences a broker
   that lost the claim but not a peer already serving the same incarnation — a resume
   preserves the generation. That is **F-062**, together with the `discarded` marker the
-  teardown leaves behind, which outlives its own exchange and poisons the next one on
-  that identifier.
+  teardown leaves behind, which outlives its own exchange. **Closed** by three changes, and
+  the third is not a detail of the first two. No arbitration could make a subject-named
+  removal exchange-bound, so instead every call carries a cutoff it can prove, and the marker
+  records the cutoff its writer was entitled to purge through — an entitlement, not evidence
+  the hold is gone, since the marker is written before the purge — so a later exchange above
+  that fence reaps it and proceeds. **Third: the AWAITED arm gained arbitration it previously
+  lacked.** It had purged on observing the claim subject go empty, which establishes nothing
+  about the exchange it enumerated — a releaser also deletes a foreign generation's claim
+  before retrying its own create — so it now RE-COMPETES for the claim and destroys only under
+  a marker it won. Of the four analysis arms, three purge; the awaited one does not. The three
+  do **not** all use the same cutoff — the arm that adopts a pre-existing marker uses that
+  marker's fence, which may exceed the adopting walk's own watermark — and F-062 carries the
+  authoritative mapping.
+  `purgeQoS2Hold` has **no unbounded
+  form**, so no caller can opt out, and the two cutoffs that cannot bound anything (`0`,
+  which purges nothing while reporting success, and `MaxUint64`, which wraps to the
+  unbounded request) are refused rather than sent.
 - The **orphan sweep** caller runs under no teardown claim at all, and infers liveness
   from this broker's residents plus persisted records, so a live remote generation whose
   record is absent is invisible to it. With the one-shot enumeration that misses a hold on
-  a subject it never saw, that is **F-036**, whose scope was widened for both.
+  a subject it never saw, that is **F-036**, whose scope was widened for both — and widened
+  again by the cutoff, which spares an enumerated hold that landed above the watermark
+  rather than destroying it. Sparing an acknowledged payload is a leak where destroying it
+  was a loss, so that is the right direction, but it is a larger population for F-036 to
+  answer.
 
-For the record, the dependency does offer a `Sequence` cutoff combinable with `Subject`,
-and `StreamState.LastSeq` already arrives with the enumeration — that is F-062's leading
-remedy, not a limitation of the backend. What JetStream does **not** offer is an
-expected-sequence (CAS) purge, so no design here may assume one.
+What JetStream does **not** offer is an expected-sequence (CAS) purge, so no design here
+may assume one; the cutoff is a watermark, not an identity. What the cutoff therefore
+does not do is make the teardown own exactly the set it enumerated — see
+"JetStream behaviors this design depends on" for why `State` and `State.Subjects` are not
+one snapshot, and `docs/CONFORMANCE.md` for the residuals that follow.
 
 ## Session-affine shared-subscription QoS 2
 
@@ -3031,8 +3109,10 @@ read one as durable authority and rewrite it to take ownership. The filter
 names a generation `clear()` has already re-minted, so it cannot reach the next
 incarnation. That is the extent of the claim. A resume preserves the generation, so a
 peer may still be serving this incarnation; whether the filter purge costs anything there
-is `$MQTT_inflight`'s own consequence question (**F-034**, unaudited), and the same
-premise's cost on `$MQTT_qos2in` is **F-062**.
+is `$MQTT_inflight`'s own consequence question (**F-034**, unaudited). The same premise's
+cost on `$MQTT_qos2in` was **F-062**, and it was paid by bounding every hold purge to a
+proven cutoff — a remedy `$MQTT_inflight` cannot simply copy, because this filter purge
+enumerates nothing and so has no watermark to bound it by. Giving it one is F-034's work.
 
 **Cost, stated plainly.** One create-only CAS round trip per *first* transmission of
 every outbound QoS 1/2 message, one delete per completion, and on QoS 2 a confirmed
@@ -3082,8 +3162,11 @@ plain reconnect or resume **preserves** it, because a resumed session must still
 find its own PUBRELs, QoS 2 holds and Will. The invariant this buys is exactly one
 thing: a late delete from a retired incarnation cannot name a FRESH incarnation's
 resources. It does not establish that no live resource exists under the retiring
-generation — a resume preserves the generation, so a peer may still be serving it. For
-what that costs per stream, see F-062 (and F-034, unaudited).
+generation — a resume preserves the generation, so a peer may still be serving it. Where a
+late removal had to be made safe against that peer, the bound came from the removal rather
+than the name: on `$MQTT_qos2in` every hold purge carries the highest sequence its remover
+could prove it was entitled to destroy (F-062). What that premise costs on
+`$MQTT_inflight` is still unaudited (F-034).
 
 This is the same conclusion the QoS 2 move protocol and the affine delivery path
 reached independently, and it is why the fix is naming rather than a lock: a nonce
@@ -3107,9 +3190,12 @@ Nobody resumes a marked record. Every CONNECT that can interpret the record (and
 record-driven expiry path) **finishes** the teardown when it finds a marker —
 repeating the generation-scoped deletions and releasing the record — and
 only then starts a fresh session with a fresh generation and Session Present false.
-Repetition is safe for names nothing can re-occupy. It is **not** universally safe: the
-inbound QoS 2 hold walk purges by subject, so a repeat that meets an earlier finisher's
-`discarded` marker destroys whatever occupies that subject now (**F-062**, arm A2).
+Repetition is safe for names nothing can re-occupy. The inbound QoS 2 hold walk purges by
+subject, so a repeat can name a subject re-occupied since: what makes it safe is the bound
+each call carries, per walk, which naming alone never gave — see **F-062** for what that
+bounds and what it deliberately does not. It is **not** claimed for the deletion set as a
+whole: the same teardown purges `$MQTT_inflight` by filter with no bound at all, and that
+consequence is **F-034**, unaudited.
 That also makes a crashed teardown self-healing instead of leaking until the orphan
 sweep. The exception is a record the restore boundary refuses outright — a subscription
 in the reserved `$MQTT.>` namespace, or a missing or malformed generation: the CONNECT
@@ -3266,10 +3352,11 @@ A broker that dies in the wrong window leaves durable state nothing else ever
 revisits: an inbound QoS 2 hold and its release claim on `$MQTT_qos2in`, a
 session-affine `$MQTT_Q2AFF_*` consumer on `$MQTT_out`, an assignment claim on
 `$MQTT_qos2assign`, and the teardown marker that pins all three in place. None of
-them loses a message BY ACCUMULATING — a stalled claim is honored, never released (a
-stale `discarded` marker among them is a different matter: it can fence a later
-exchange, and retiring it can leave that exchange lost — F-062 mechanism 2) — but all of
-them accumulate. A periodic per-account sweep converges them
+them loses a message BY ACCUMULATING — a stalled claim is honored, never released (nor is
+a stale `discarded` marker among them a counterexample any longer: it records the fence its
+writer was entitled to destroy, so a later exchange above that fence reaps it and proceeds
+— F-062 mechanism 2) — but all of them accumulate. A periodic per-account sweep converges
+them
 (`internal/mqtt/orphan_qos2_sweep.go`), beside the existing session-expiry and
 orphaned-consumer sweeps.
 
@@ -3364,7 +3451,9 @@ over; and convergence takes several passes rather than one.
 **The hold dies before its fence.** A `discarded` marker is reaped by nobody at
 teardown time — it is the only durable proof that a late releaser must lose — and
 the sweep may retire an aged one **only** after destroying the hold record and
-confirming it gone. A releaser that preloaded the payload and resumes afterwards
+confirming it gone. (A releaser reaps one only where it can prove the marker never fenced
+its exchange; that condition and its evidence are F-062's.)
+A releaser that preloaded the payload and resumes afterwards
 then wins a fresh create-only claim against an empty subject, but its mandatory
 authoritative re-read returns `mqttQoS2VerifyGone`, so it delivers nothing.
 Reversing the two steps returns `mqttQoS2VerifyHeld` and fans the message out

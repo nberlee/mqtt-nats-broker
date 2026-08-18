@@ -51,12 +51,14 @@
 //     identifier, re-exposing that exchange to the stale-loader fan-out fence 2
 //     exists to stop. Same rule as releaseQoS2Record and invariant 2 of
 //     qos2_move.go.
-//     The discard's HOLD purge (discardQoS2Hold) is not sequenced: it names a subject
-//     of the RETIRING incarnation, and clear() re-mints before the walk, which covers
-//     this broker's own reconnect. Generation scoping protects the next incarnation; a
-//     resume preserves the generation, so it does not protect a peer still serving the
-//     retiring one — see F-062, which owns that purge. Naming was never sufficient for
-//     a CLAIM, which is why every claim delete is sequenced.
+//     The discard's HOLD purge (purgeQoS2Hold) is not sequenced to one record, because
+//     it must remove whatever occupies the subject — a held PUBLISH, a tombstone, or a
+//     record it cannot read. It is nonetheless BOUNDED: every call carries the highest
+//     sequence its caller can prove it was entitled to destroy, and anything above that
+//     is spared (F-062). Naming a subject was never sufficient on its own — generation
+//     scoping protects the NEXT incarnation, but a resume preserves the generation, so
+//     it never protected a peer still serving the retiring one. Naming was never
+//     sufficient for a CLAIM either, which is why every claim delete is sequenced.
 //  3. A DISCARD NEVER REAPS ITS OWN `discarded` CLAIM. It is the only durable
 //     proof that a late releaser must lose, so reaping it at teardown time re-opens
 //     exactly the window this file closes — the same rule as discardQ2AffClaimsFor,
@@ -72,6 +74,12 @@
 //     re-read returns mqttQoS2VerifyHeld and the message is fanned out again.
 //     Eligibility is a stable observation on the sweeper's monotonic clock; no stored
 //     timestamp participates, and At is never consulted (rule 5).
+//     A RELEASER may retire one, under the single exception this rule admits: the
+//     marker records the Fence its writer was entitled to destroy, so a releaser whose
+//     hold occupied the subject ABOVE that fence has durable proof the marker was never
+//     about its exchange, and reaps it CONDITIONALLY at that exact sequence
+//     (claimQoS2ReleaseInner, which carries the proof). Never unconditionally, and never
+//     by a discard, which is what the rest of this rule still forbids.
 //  4. NON-MUTATING DEFAULTS. Every switch over a claim state or a verdict resolves
 //     an unhandled value to Indeterminate — suppress PUBCOMP, the client retries —
 //     never to a verdict that answers the client or deletes anything. An omitted
@@ -213,13 +221,26 @@ func (sess *mqttSession) reopenQoS2ReleaseFence() {
 
 // mqttQoS2RelClaim is the release-claim record.
 //
-// State and Gen are its identity and are validated strictly
+// State, Gen and Fence are its identity and are validated strictly
 // (mqttQoS2RelClaimIdentityOK). Origin and At are forensic: neither may ever
 // decide whether a claim is readable, because the unreadable disposition drops a
 // message and a malformed diagnostic field must not be able to cause that.
 type mqttQoS2RelClaim struct {
-	State  string `json:"state"`
-	Gen    string `json:"gen,omitempty"` // the exchange generation: required for releasing, absent for discarded
+	State string `json:"state"`
+	Gen   string `json:"gen,omitempty"` // the exchange generation: required for releasing, absent for discarded
+	// Fence is the highest $MQTT_qos2in sequence the writer of a `discarded` marker
+	// was entitled to destroy on the hold subject — the last sequence its enumeration
+	// saw. Required for discarded, absent for releasing.
+	//
+	// It is IDENTITY, not forensics, because it is read and it decides: a later
+	// exchange whose hold sits above it proves the marker is not about it (see
+	// claimQoS2ReleaseInner) and an adopting discard purges to it rather than to its own
+	// watermark (discardQoS2Hold). What it is NOT: an identity of the exchange the
+	// marker competed for. It associates the marker with a RANGE of hold occupancies,
+	// because the create-only CAS is not atomically tied to any one of them. The claim
+	// remains discard-versus-release arbitration; a fence elects no releaser and confers
+	// no ownership of the subject.
+	Fence  uint64 `json:"fence,omitempty"`
 	Origin string `json:"origin"`
 	// At is WRITE-ONLY (scope rule 5): stamped here, read by nothing, and replaced by
 	// no other timestamp either. A self-reported time from a possibly skewed broker
@@ -241,18 +262,35 @@ type mqttQoS2RelClaim struct {
 //
 // The reason this comment used to give — that a discard "can only ever concern the one
 // exchange live on that generation-scoped subject" — is FALSE; see F-062, mechanism 2.
-// What matters locally: with no generation on the marker, a stale one is
-// indistinguishable from an applicable one, so a remedy has to supply that fence some
-// other way.
+// With no generation on the marker a stale one is indistinguishable from an applicable
+// one, so the fence supplies that evidence instead, and a `discarded` marker therefore
+// REQUIRES one. A fence-less marker is an unsupported persisted shape: it is refused
+// here (classifying unreadable) rather than read as covering everything, which is what
+// a zero fence would mean to the comparison in claimQoS2ReleaseInner.
+//
+// `releasing` requires the fence to be ABSENT for the mirror reason it requires a
+// generation: a releaser destroys nothing by filter, so a bound it never uses could
+// only be misread.
+//
+// A `discarded` fence must be one that can actually BOUND a purge — the same predicate
+// purgeQoS2Hold accepts, so the two cannot drift. That excludes MaxUint64 as well as zero,
+// and the reason is a liveness one rather than tidiness: a readable maximal fence would be
+// ADOPTED by arm A2 and then rejected by the purge, failing the clear; every later CONNECT
+// adoption and every sweep pass would repeat that same failure behind a marked session
+// record, which is a permanent client-ID lockout with no route out but an operator. Refusing
+// it here instead sends it down the unreadable arm that discardQoS2Hold already has, where
+// the record is exact-deleted and the discard re-competes and writes a usable marker — the
+// self-healing repair. The releaser side is unaffected either way: `Discarded` and
+// `Unreadable` share one branch, so a maximal marker answered the same before and after.
 func mqttQoS2RelClaimIdentityOK(c *mqttQoS2RelClaim) bool {
 	if c == nil {
 		return false
 	}
 	switch c.State {
 	case mqttQoS2RelStateReleasing:
-		return mqttValidQoS2Gen(c.Gen)
+		return mqttValidQoS2Gen(c.Gen) && c.Fence == 0
 	case mqttQoS2RelStateDiscarded:
-		return c.Gen == _EMPTY_
+		return c.Gen == _EMPTY_ && mqttQoS2UsableCutoff(c.Fence)
 	default:
 		return false
 	}
@@ -283,11 +321,13 @@ func mqttQoS2SanitizeOrigin(s string) string {
 }
 
 // mqttNewQoS2RelClaim builds a claim. gen must be empty for a discard and a valid
-// exchange generation for a release.
-func mqttNewQoS2RelClaim(state, gen, origin string) *mqttQoS2RelClaim {
+// exchange generation for a release; fence must be non-zero for a discard and zero
+// for a release (mqttQoS2RelClaimIdentityOK enforces both pairings on the read side).
+func mqttNewQoS2RelClaim(state, gen, origin string, fence uint64) *mqttQoS2RelClaim {
 	return &mqttQoS2RelClaim{
 		State:  state,
 		Gen:    gen,
+		Fence:  fence,
 		Origin: mqttQoS2SanitizeOrigin(origin),
 		At:     time.Now().Unix(),
 	}
@@ -318,14 +358,17 @@ func buildQoS2RelClaimRecord(expectSeq uint64, c *mqttQoS2RelClaim) (msg []byte,
 // its claim retries forever with the hold never released.
 //
 // The expected-sequence header is budgeted at MaxUint64 although every claim write
-// is create-only (expectation 0). That deliberately over-budgets by at most 19
-// bytes: over-budgeting only rejects a PUBLISH slightly earlier, while
-// under-budgeting wedges an accepted exchange.
+// is create-only (expectation 0); Gen and Fence are budgeted TOGETHER although the identity
+// rule admits no record carrying both; and Fence is budgeted at MaxUint64 although the
+// identity rule does not admit that value either. That deliberately over-budgets:
+// over-budgeting only rejects a PUBLISH slightly earlier, while under-budgeting
+// wedges an accepted exchange.
 var mqttQoS2ClaimRecordMax = sync.OnceValue(func() int {
 	msg, _ := buildQoS2RelClaimRecord(math.MaxUint64, &mqttQoS2RelClaim{
 		// The two state literals are the same length, so either bounds both.
 		State:  mqttQoS2RelStateReleasing,
 		Gen:    strings.Repeat("z", mqttQoS2GenLen),
+		Fence:  math.MaxUint64,
 		Origin: strings.Repeat("z", mqttQoS2ClaimOriginMax),
 		At:     math.MaxInt64,
 	})
@@ -445,7 +488,9 @@ func (st mqttQoS2ClaimStatus) String() string {
 //   - `releasing`, foreign generation -> a claim left behind by the dead releaser
 //     of an earlier exchange on this identifier; reap it at the sequence just
 //     observed, CONFIRMED, and retry the create
-//   - `discarded`                   -> Discarded
+//   - `discarded`, fencing our hold -> Discarded
+//   - `discarded`, fenced BELOW our hold -> a marker that was never about this
+//     exchange; reap it at the sequence just observed, CONFIRMED, and retry the create
 //   - unreadable                    -> Unreadable
 func (as *mqttAccountSessionManager) claimQoS2Release(s *Server, holdSubject, gen string, holdSeq uint64) (mqttQoS2ClaimStatus, uint64, error) {
 	status, seq, err := as.claimQoS2ReleaseInner(s, holdSubject, gen, holdSeq)
@@ -475,7 +520,7 @@ func (as *mqttAccountSessionManager) claimQoS2ReleaseInner(s *Server, holdSubjec
 	}
 
 	claimSubject := mqttQoS2ClaimSubjectFor(holdSubject)
-	claim := mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, as.jsa.id)
+	claim := mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, as.jsa.id, 0)
 	var lastErr error
 	for attempt := 0; attempt < mqttQoS2ClaimAttempts; attempt++ {
 		seq, err := as.storeQoS2RelClaimCAS(claimSubject, 0, claim)
@@ -495,6 +540,35 @@ func (as *mqttAccountSessionManager) claimQoS2ReleaseInner(s *Server, holdSubjec
 			s.Warnf("MQTT: unusable QoS 2 release claim (%s)",
 				mqttQoS2CorruptDetail(claimSubject, smsg, "malformed claim record, or no usable claim identity"))
 			return mqttQoS2ClaimUnreadable, smsg.Sequence, nil
+		case cur.State == mqttQoS2RelStateDiscarded && holdSeq > cur.Fence:
+			// A marker that was never about this exchange. The evidence is STRICTLY
+			// INCREASING OCCUPANT SEQUENCES on one hold subject, within one $MQTT_qos2in
+			// incarnation — not "monotone occupancy", which is false: occupancy alternates
+			// between occupied and empty, and that is the point. It holds because a hold
+			// write is a create-only CAS, so a new occupant can only land on an EMPTY
+			// subject at the stream's next sequence; the terminal tombstone is not a create
+			// but an exact-sequence CAS replacement, which under MaxMsgsPer 1 + DiscardOld
+			// lands at a NEW, higher sequence; and every removal — an exact-sequence delete
+			// or the teardown's and sweep's filtered purge — leaves the stream's last
+			// sequence where it was, so no earlier occupant can return and no sequence is
+			// handed out twice.
+			//
+			// Our record occupied the subject above cur.Fence. Every occupancy at or below
+			// Fence — every occupancy the marker's writer was entitled to destroy — therefore
+			// ended before ours began and cannot come back, so reaping the marker re-exposes
+			// nothing: the only record it could still fence is ours, which it never covered.
+			// The evidence is permanent, so a stale holdSeq does not weaken it.
+			//
+			// This is the sole exception to scope rule 3, and it is exactly as narrow as the
+			// rule states: CONDITIONAL, at the EXACT observed sequence, and by a RELEASER
+			// holding this evidence — never unconditional and never by a discard. It is also
+			// not a shortcut past the fences: the retried create still has to win, and
+			// verifyQoS2HoldForRelease still has to find our record at our sequence.
+			s.Warnf("MQTT: reaping the QoS 2 discard marker on %q, fenced to %d and superseded by the hold at %d",
+				claimSubject, cur.Fence, holdSeq)
+			if st, rerr := as.releaseQoS2Record(smsg.Sequence); st != mqttQoS2Released {
+				return mqttQoS2ClaimIndeterminate, 0, rerr
+			}
 		case cur.State == mqttQoS2RelStateDiscarded:
 			return mqttQoS2ClaimDiscarded, smsg.Sequence, nil
 		case cur.State == mqttQoS2RelStateReleasing && cur.Gen == gen:
@@ -643,7 +717,7 @@ func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHas
 	if idHash == _EMPTY_ || gen == _EMPTY_ {
 		return nil
 	}
-	subjects, err := as.jsa.streamSubjects(mqttQoS2IncomingMsgsStreamName, mqttQoS2HoldWalkFilter(idHash, gen))
+	subjects, upTo, err := as.enumerateQoS2HoldsBounded(mqttQoS2HoldWalkFilter(idHash, gen))
 	if err != nil {
 		if isErrorOtherThan(err, JSStreamNotFoundErr) {
 			return err
@@ -666,11 +740,77 @@ func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHas
 	// One wait budget for the whole walk (see mqttQoS2DiscardWaitBudget).
 	deadline := time.Now().Add(mqttQoS2DiscardWaitBudget)
 	for _, holdSubject := range holds {
-		if err := as.discardQoS2Hold(s, holdSubject, deadline); err != nil {
+		if err := as.discardQoS2Hold(s, holdSubject, upTo, deadline); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// mqttQoS2UsableCutoff reports whether upTo can bound a hold purge. Sole definition, shared
+// by the walk's pre-write validation, the `discarded` identity rule and purgeQoS2Hold's own
+// refusal, so the value a marker may record and the value a purge will accept cannot drift —
+// a marker carrying a fence the purge would refuse is exactly the shape that strands a
+// teardown, so the two predicates are one.
+func mqttQoS2UsableCutoff(upTo uint64) bool {
+	return upTo != 0 && upTo != math.MaxUint64
+}
+
+// enumerateQoS2Holds lists one incarnation's inbound QoS 2 subjects with the stream's
+// last sequence, honoring an instance-scoped test seam.
+func (as *mqttAccountSessionManager) enumerateQoS2Holds(filter string) (map[string]uint64, uint64, error) {
+	as.mu.RLock()
+	hook := as.testQoS2Subjects
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(filter)
+	}
+	return as.jsa.streamSubjects(mqttQoS2IncomingMsgsStreamName, filter)
+}
+
+// enumerateQoS2HoldsBounded enumerates until the response can BOUND a purge: either it
+// matched nothing, or its last sequence is usable as a cutoff.
+//
+// The retry is not defensive padding. STREAM.INFO builds State before it fills
+// State.Subjects from a separate store read, so a walk that started against an empty
+// stream can legitimately be handed a non-empty subject map with a zero last sequence.
+// Acting on that sample is the one thing this walk must never do: a zero cutoff would
+// become a `discarded` marker's fence, the identity rule then classifies that marker
+// unreadable, and the unreadable disposition on the PUBREL path deletes the
+// acknowledged hold and answers 0x92 — manufacturing exactly the loss F-062 closes.
+// So the sample is re-taken, and NOTHING is written in between, which is what makes
+// retrying safe.
+//
+// A later sample resolves it, because once a response carries a record sequence 1 has
+// landed and the last sequence never rewinds — not under a delete, a replacement, a
+// filtered purge, a compact at or below the tail, or expiry (and this stream refuses
+// MaxAge outright). Ordinary record churn therefore cannot keep the watermark
+// unusable; exhausting the budget needs a test seam, a backend-contract violation, or
+// stream recreation, which the incarnation precondition excludes.
+//
+// Exhaustion is an ERROR, which fails the clear. It cannot be swallowed the way the
+// generationless guard above swallows its case: that guard has no identity to enumerate
+// with and nothing it could arbitrate, whereas this walk has already found real
+// generation-scoped holds and merely cannot bound its entitlement to them. Returning nil
+// would let deleteTeardownTargets complete and releaseTeardown delete the session record
+// while a releaser can still deliver from it. The cost is stated where it lands: the
+// marked, partly torn-down session refuses that client ID's next CONNECT until an
+// adoption obtains a usable watermark (docs/CONFORMANCE.md).
+func (as *mqttAccountSessionManager) enumerateQoS2HoldsBounded(filter string) (map[string]uint64, uint64, error) {
+	var lastSeen uint64
+	for attempt := 0; attempt < mqttQoS2ClaimAttempts; attempt++ {
+		subjects, lastSeq, err := as.enumerateQoS2Holds(filter)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(subjects) == 0 || mqttQoS2UsableCutoff(lastSeq) {
+			return subjects, lastSeq, nil
+		}
+		lastSeen = lastSeq
+	}
+	return nil, 0, fmt.Errorf(
+		"inbound QoS 2 holds match %q but the stream reported an unusable last sequence %d after %d attempts",
+		filter, lastSeen, mqttQoS2ClaimAttempts)
 }
 
 // discardQoS2Hold competes for one hold's release claim and, where it wins,
@@ -680,13 +820,20 @@ func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHas
 // it is what makes the discard a competitor at all, and it is what lets a releaser
 // holding the claim read the hold record's absence as "terminated" rather than
 // "discarded" (verifyQoS2HoldForRelease).
-func (as *mqttAccountSessionManager) discardQoS2Hold(s *Server, holdSubject string, deadline time.Time) error {
+//
+// upTo is the highest sequence THIS caller can prove it is entitled to destroy: the
+// walk's enumeration watermark for a session teardown, the exact re-confirmed record
+// sequence for the orphan sweep. It bounds the purge where this call's own MARKER licenses
+// it, and is deliberately NOT what bounds the arm that adopts a pre-existing marker, which
+// uses that marker's fence instead (see below). An awaited release licenses no purge of its
+// own at all: it returns to this competition rather than destroying anything.
+func (as *mqttAccountSessionManager) discardQoS2Hold(s *Server, holdSubject string, upTo uint64, deadline time.Time) error {
 	claimSubject := mqttQoS2ClaimSubjectFor(holdSubject)
-	claim := mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, as.jsa.id)
+	claim := mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, as.jsa.id, upTo)
 	var lastErr error
 	for attempt := 0; attempt < mqttQoS2ClaimAttempts; attempt++ {
 		if _, err := as.storeQoS2RelClaimCAS(claimSubject, 0, claim); err == nil {
-			return as.purgeQoS2Hold(holdSubject)
+			return as.purgeQoS2Hold(holdSubject, upTo)
 		} else {
 			lastErr = err
 		}
@@ -712,12 +859,32 @@ func (as *mqttAccountSessionManager) discardQoS2Hold(s *Server, holdSubject stri
 		case cur.State == mqttQoS2RelStateDiscarded:
 			// Ours from an earlier attempt, or a peer discard's. Either way no releaser of
 			// the exchange this marker was written for can win, so that hold is ours to
-			// destroy. NOT necessarily whatever occupies the subject NOW: on a repeated
-			// teardown attempt the marker may predate a later exchange accepted meanwhile,
-			// and this purge would destroy it (F-062, mechanism 2).
-			return as.purgeQoS2Hold(holdSubject)
+			// destroy — but only up to what THAT marker's writer was entitled to destroy,
+			// never up to our own watermark. Adopting a marker means finishing an
+			// already-durable discard decision, and its fence is the entitlement that
+			// decision recorded: its writer enumerated at Fence, so every occupancy at or
+			// below Fence predated its decision point, and it won the create-only CAS that
+			// licensed acting on it.
+			//
+			// NOT min(cur.Fence, upTo). Our own watermark is not an upper bound on a
+			// marker we merely adopted: the walk enumerates every subject up front but does
+			// not load a sibling claim until it reaches it, so a CONCURRENT teardown can
+			// enumerate higher than we did and win this marker in between. Clamping would
+			// then spare a hold that marker's own decision covered while we report the walk
+			// complete. It is also no defense against a corrupt-huge fence, where it
+			// degrades to exactly the unbounded-by-our-watermark behavior it was meant to
+			// prevent.
+			return as.purgeQoS2Hold(holdSubject, cur.Fence)
 		case cur.State == mqttQoS2RelStateReleasing:
-			return as.awaitQoS2Release(s, holdSubject, claimSubject, deadline)
+			// Wait it out, then COMPETE AGAIN rather than treating the subject's emptiness as
+			// our entitlement — the claim we waited on may have belonged to an earlier
+			// exchange and been reaped by the CURRENT one's releaser, which leaves the subject
+			// briefly empty without anything having terminated (see awaitQoS2Release).
+			again, aerr := as.awaitQoS2Release(s, holdSubject, claimSubject, deadline)
+			if aerr != nil || !again {
+				return aerr
+			}
+			continue
 		default:
 			// Unreachable, as in claimQoS2Release. Fails the clear rather than deleting
 			// anything (scope rule 4).
@@ -730,24 +897,40 @@ func (as *mqttAccountSessionManager) discardQoS2Hold(s *Server, holdSubject stri
 	return lastErr
 }
 
-// awaitQoS2Release waits, within the walk's remaining budget, for a release the
-// discard observed in flight.
+// awaitQoS2Release waits, within the walk's remaining budget, for the claim subject to
+// become free, and reports whether the caller should COMPETE FOR IT AGAIN.
 //
-// It polls the CLAIM for absence, never the hold record: the releaser deletes its
-// claim only after the terminal commit, so absence proves the exchange terminated
-// — and a claim is a tiny record, while polling the hold would pull up to
-// max_payload bytes per attempt on a disconnect path.
+// It destroys nothing, and that is the whole point. An earlier version read an empty
+// claim subject as proof that the exchange this walk enumerated had terminated, on the
+// grounds that "a releaser deletes its claim only after the terminal commit". **That
+// premise is false, and this file contains its own counterexample**: a releaser that
+// meets a FOREIGN generation's `releasing` claim reaps it at its exact sequence and only
+// then retries its own create (claimQoS2ReleaseInner). The subject is empty in between.
 //
-// The hold record is NOT deleted while a claim stands. Its payload is what a retry
-// delivers if the releasing broker died between claim and store, so destroying it
-// would turn this spec deviation into silent loss. When the budget runs out the
-// records are left for the orphan sweep filed in docs/ROADMAP.md; the releasing
-// broker is then presumed dead, and no bounded wait can prove otherwise.
-func (as *mqttAccountSessionManager) awaitQoS2Release(s *Server, holdSubject, claimSubject string, deadline time.Time) error {
+// So the window is real and the loss it produced was the F-062 class again: E1 completes
+// and leaves its claim to be reaped; E2 lands on the vacated hold subject and is answered
+// PUBREC; the teardown enumerates with E2 at or below its watermark, meets E1's stale
+// claim, and waits. E2's PUBREL then reaps that stale claim, and a poll landing in the gap
+// saw absence, concluded "terminated", and purged E2 — an acknowledged message destroyed by
+// a walk that had won no arbitration over it at all. The cutoff cannot help, because E2
+// legitimately predates the enumeration.
+//
+// The fix is to stop inferring entitlement from absence. An empty subject licenses only one
+// thing: entering the create-only competition again. If this walk wins, it holds a fresh
+// marker carrying its own fence and destroys under arm A1's entitlement like any other
+// winner; if a releaser wins, we are back to waiting, which is correct.
+//
+// It polls the CLAIM, never the hold record — a claim is tiny, while polling the hold would
+// pull up to max_payload bytes per attempt on a disconnect path — and the hold is never
+// deleted while a claim stands, because its payload is what a retry delivers if the
+// releasing broker died between claim and store. When the budget runs out the records are
+// left for the orphan sweep; the releasing broker is then presumed dead, and no bounded wait
+// can prove otherwise.
+func (as *mqttAccountSessionManager) awaitQoS2Release(s *Server, holdSubject, claimSubject string, deadline time.Time) (bool, error) {
 	for {
 		cur, smsg, err := as.loadQoS2RelClaim(claimSubject)
 		if err == nil && cur == nil && smsg == nil {
-			return as.purgeQoS2Hold(holdSubject)
+			return true, nil
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -760,25 +943,42 @@ func (as *mqttAccountSessionManager) awaitQoS2Release(s *Server, holdSubject, cl
 	}
 	s.Warnf("MQTT: leaving inbound QoS 2 hold %q to the orphan sweep: a release claimed it and did not complete within %v",
 		holdSubject, mqttQoS2DiscardWaitBudget)
-	return nil
+	return false, nil
 }
 
-// purgeQoS2Hold removes whatever record occupies one hold subject — a held
-// PUBLISH, a terminal tombstone or a corrupt record — with a CONFIRMED purge of
-// that exact subject.
+// purgeQoS2Hold removes the records occupying one hold subject — a held PUBLISH, a
+// terminal tombstone or a corrupt record — up to and INCLUDING sequence upTo, with a
+// CONFIRMED purge of that exact subject.
+//
+// upTo is the highest sequence the caller can PROVE it is entitled to destroy, and
+// there is deliberately no unbounded form of this function: generation scoping alone
+// was never a bound, because a resume preserves the generation, so a peer still
+// serving the retiring incarnation can accept and PUBREC-acknowledge a new exchange on
+// this very subject after the caller stopped looking. Whatever lands above upTo is
+// SPARED and left to a later walk or the orphan sweep (F-062, mechanism 1).
 //
 // Confirmed even where the caller asked for a no-wait teardown, for the reason
 // releaseTeardown documents: an unclassifiable outcome is not an outcome, and this
-// one licenses reporting the session's inbound QoS 2 state as destroyed. It needs
-// no sequence and reads no payload.
+// one licenses reporting the session's inbound QoS 2 state as destroyed. It reads no
+// payload.
 //
-// Generation scoping protects the next incarnation; a resume preserves the generation,
-// so this purge can still reach live state under the retiring one — see F-062, which
-// this function is.
-func (as *mqttAccountSessionManager) purgeQoS2Hold(holdSubject string) error {
-	err := as.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, holdSubject, false)
+// Two values of upTo are REFUSED rather than sent, for two different reasons:
+//
+//   - 0 would emit Sequence 1, which both stores treat as an explicit no-op. The
+//     hazard is not an over-broad purge but FALSE SUCCESS — a nil return here licenses
+//     reporting the session's inbound QoS 2 state as destroyed when nothing was
+//     removed, which is the terminal-cleanup-before-completion mistake.
+//   - MaxUint64 would wrap upTo+1 to zero and emit the genuinely unbounded request.
+//     This guard is what makes "no route can regress to an unbounded purge" true rather
+//     than nearly true, and it is the only thing standing between a corrupt maximal
+//     fence and that shape.
+func (as *mqttAccountSessionManager) purgeQoS2Hold(holdSubject string, upTo uint64) error {
+	if !mqttQoS2UsableCutoff(upTo) {
+		return fmt.Errorf("refusing to purge the inbound QoS 2 hold on %q: unusable cutoff %d", holdSubject, upTo)
+	}
+	err := as.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, holdSubject, upTo+1, false)
 	if isErrorOtherThan(err, JSStreamNotFoundErr) {
-		return fmt.Errorf("unable to purge the inbound QoS 2 hold on %q: %w", holdSubject, err)
+		return fmt.Errorf("unable to purge the inbound QoS 2 hold on %q up to %d: %w", holdSubject, upTo, err)
 	}
 	return nil
 }

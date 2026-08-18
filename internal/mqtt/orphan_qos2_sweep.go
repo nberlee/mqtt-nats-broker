@@ -11,11 +11,12 @@
 //     exists and which no contender happens to revisit.
 //
 // None of them loses a message BY ACCUMULATING — a stalled claim is honored, never
-// released. That is not a claim that the state they represent is never lost: a stale
-// `discarded` marker among them can fence a LATER exchange's hold, and this file's own
-// retirement of it (hold first, then the marker) can then leave a preloaded PUBREL
-// answering success without delivering. See F-062. What follows converges the
-// accumulation; it does not make that loss impossible.
+// released. A stale `discarded` marker among them no longer fences a LATER exchange's
+// hold either: the marker records the fence its writer was entitled to destroy, so a
+// PUBREL whose hold sits above it reaps the marker and proceeds (F-062). This file's own
+// retirement of a marker (hold first, then the marker) is likewise bounded to the exact
+// record it observed. What follows converges the accumulation; the one direction it still
+// does not cover is a live remote generation whose record this pass never sees (F-036).
 // All three accumulate. This file converges them, and it converges the fourth
 // thing that would otherwise pin the other three in place: a teardown marker whose
 // broker died after claiming the record. sess_teardown.go promises such a marker is
@@ -93,9 +94,10 @@
 //
 // The single most load-bearing rule here is that an aged release claim is deleted
 // only AFTER its hold record is confirmed gone (invariant 10). A `discarded` marker
-// is normally reaped by nobody — it is the only durable proof that a late releaser
-// must lose — and destroying the hold first is the sole thing that licenses
-// retiring it. A releaser that preloaded the payload and resumes afterwards creates
+// is reaped by no discard — it is the only durable proof that a late releaser must lose —
+// and destroying the hold first is the sole thing that licenses THIS path retiring it. (A
+// releaser reaps one only where its hold proves the marker never fenced its exchange: F-062.
+// That is a different licence from this one and does not weaken the ordering below.) A releaser that preloaded the payload and resumes afterwards creates
 // a fresh `releasing` claim against an empty subject, then performs its mandatory
 // authoritative re-read (verifyQoS2HoldForRelease) and gets mqttQoS2VerifyGone, so
 // it answers the client and delivers nothing. Reverse the two steps and that same
@@ -500,8 +502,11 @@ func (as *mqttAccountSessionManager) forgetIfQ2AffClaimGone(subject string) {
 // leave the record exactly as it was, and it continues to protect everything it
 // names. Concurrent adoption — by the original broker waking up, by another
 // sweeper, or by a CONNECT — converges on the RECORD under the existing teardown release
-// (it is not safe for the inbound hold walk, whose second run can meet the first
-// adopter's `discarded` marker and purge a later exchange: F-062 arm A2)
+// (the inbound hold walk included: a second run that meets the first adopter's
+// `discarded` marker purges to the fence THAT marker recorded, so a later exchange is
+// spared rather than destroyed — F-062 arm A2, which also states what a subject the first
+// run never reached does instead. The `$MQTT_inflight` purge in the same teardown stays
+// unbounded: F-034)
 // reconciliation: both delete the same retired, generation-scoped names, one wins
 // the record delete, and the loser's classifying re-read reports released or
 // superseded.
@@ -1342,11 +1347,12 @@ const (
 //     a paused releaser win a fresh claim and then read its hold as still Held.
 //  3. Every CLAIM delete targets the EXACT sequence just observed, so a delayed pass
 //     cannot remove a later exchange's claim on a reused packet identifier. The HOLD
-//     removal is deliberately different and this rule does not cover it:
-//     purgeQoS2Hold purges by SUBJECT, so a delayed pass can remove a later
-//     exchange's hold. What bounds it is the reference walk plus the marker ordering
-//     above, not sequence targeting — and that bound has a hole where a live remote
-//     generation's record is absent (F-036).
+//     removal is deliberately different: purgeQoS2Hold purges by SUBJECT, because it
+//     must remove whatever occupies it including a record it cannot read. It is still
+//     bounded to the sequence this pass loaded and re-confirmed, so a delayed pass
+//     spares a later exchange's hold rather than destroying it (F-062). What that
+//     bound does NOT close is the case where a live remote generation's record is
+//     absent from this pass's view altogether (F-036).
 func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQoS2InName,
 	q *mqttSweepQuarantine, holdGrace, claimGrace time.Duration) mqttQoS2SweepOutcome {
 	rec, holdSeq, herr := as.loadQoS2Record(n.hold)
@@ -1375,7 +1381,12 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 		}
 		// An expired deadline: a claim that races in as `releasing` is left alone for
 		// the next tick rather than blocking the sweep goroutine on a poll loop.
-		if err := as.discardQoS2Hold(s, n.hold, time.Now()); err != nil {
+		//
+		// The purge bound is holdSeq, the sequence of the record this pass loaded and
+		// re-confirmed through observedOrphanFor — the only sequence this pass has any
+		// evidence about. It is also the fence the fresh marker records, so a later
+		// exchange above it can prove the marker is not about it.
+		if err := as.discardQoS2Hold(s, n.hold, holdSeq, time.Now()); err != nil {
 			s.Warnf("MQTT orphaned QoS 2 sweep: unable to fence the orphaned hold on %q: %v", n.hold, err)
 			return mqttQoS2SweepDeferred
 		}
@@ -1412,7 +1423,11 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 			if !q.observedOrphanFor(mqttQuarantineHoldKey(n.hold), mqttQuarantineSeqFP(holdSeq), holdGrace) {
 				return mqttQoS2SweepNothing
 			}
-			if err := as.purgeQoS2Hold(n.hold); err != nil {
+			// Bounded to the exact sequence this pass proved aged and orphaned, NOT to any
+			// fence an adopted claim carries: this arm's entitlement is independently
+			// established (reference walk, grace, re-confirmed sequence), and clamping it to a
+			// stale low fence would make it purge nothing and defer forever.
+			if err := as.purgeQoS2Hold(n.hold, holdSeq); err != nil {
 				s.Warnf("MQTT orphaned QoS 2 sweep: unable to purge the orphaned hold on %q: %v", n.hold, err)
 				return mqttQoS2SweepDeferred
 			}

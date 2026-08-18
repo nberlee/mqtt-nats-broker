@@ -211,7 +211,9 @@ resource names from…
   inbound QoS 2 hold subjects and their purge filter, and each delayed-Will
   outbox record — so a delete issued by a retired incarnation cannot name a FRESH
   incarnation's resource. (F-062 later established the limit: a resume preserves the
-  generation, so this says nothing about a peer still serving the retiring one.) A claim
+  generation, so this says nothing about a peer still serving the retiring one; on the
+  inbound QoS 2 holds what covers that peer is the cutoff every purge now carries, which is
+  a property of the removal rather than of the name.) A claim
   alone could not have achieved that: a
   nonce re-check before each delete is a check-then-act, and a paused broker can
   verify its claim, let a peer finish the entire teardown and create a fresh
@@ -442,7 +444,9 @@ after UNSUBSCRIBE
   `releasing` before the onward store and a discard writes as `discarded` before it
   destroys the hold. Exactly one create can succeed while a record occupies that
   subject (F-062 records what that does NOT mean: the subject is reused by later
-  exchanges, and a `discarded` marker outliving its own exchange poisons one), so the
+  exchanges, so exclusivity is per-occupancy — which is why a `discarded` marker now records
+  the cutoff its writer was entitled to purge through, letting a later exchange prove the
+  marker is not about it), so the
   loser does nothing
   irreversible. The discard now arbitrates **per subject** — one `STREAM.INFO` with a
   subjects filter, then a claim and an exact-subject purge per hold — instead of
@@ -529,8 +533,9 @@ shared QoS 2 adds…
   an assignment claim whose winner generation no longer exists), and the inbound
   release claims the discard serialization adds. None of them loses a message by
   accumulating — a stalled claim is honored, not released — but all of them accumulate.
-  (F-062 later established that a stale `discarded` claim among them is not harmless: it
-  can fence a later exchange's hold, and retiring it can leave that exchange lost.)
+  (F-062 later established that a stale `discarded` claim among them was not harmless: it
+  could fence a later exchange's hold, and retiring it could leave that exchange lost. Closed
+  2026-08-18 — the marker carries its fence, so a later exchange reaps it and proceeds.)
 
   Implemented as a per-account periodic sweep (`internal/mqtt/orphan_qos2_sweep.go`)
   running beside `sweepSessionExpiries` and `sweepOrphanedConsumers`. See
@@ -617,8 +622,9 @@ shared QoS 2 adds…
   Two new conformance residuals, both recorded in `docs/CONFORMANCE.md`: a releaser
   that preloaded a hold answers `0x00` rather than the marker-backed `0x92` once the
   marker has been retired (for that marker's own exchange: nothing delivered, nothing
-  lost, only a more optimistic reason code — F-062 covers the later exchange a stale
-  marker had fenced, which IS lost); and once a session record is gone, a genuinely
+  lost, only a more optimistic reason code — F-062 closed the case of a later exchange a
+  stale marker had fenced, which used to be lost); and once a session record is gone, a
+  genuinely
   `Lost` affine copy is
   indistinguishable from a permitted session teardown, so reconciliation records
   `Discarded`. `docs/ARCHITECTURE.md`'s `Lost` discriminator is qualified accordingly

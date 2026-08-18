@@ -21,7 +21,11 @@
 // over-reading cost. A plain resume PRESERVES the generation (see below), so a peer may
 // still be serving the very incarnation a teardown is retiring, and a name-scoped
 // deletion reaches whatever that peer has created under it since. Generation scoping
-// protects the NEXT incarnation; it does not arbitrate against the current one. The generation is minted when a session is
+// protects the NEXT incarnation; it does not arbitrate against the current one. Where a
+// late removal had to be made safe, the bound came from somewhere else entirely: on
+// $MQTT_qos2in every hold purge carries the highest sequence its remover could prove it
+// was entitled to destroy (F-062), which is a fact about the removal, not about the name.
+// The generation is minted when a session is
 // first created and re-minted by clear() (which every discard path runs,
 // including the two that REUSE the session object as a fresh session); a plain
 // reconnect or resume preserves it, because a resumed session must still find its
@@ -249,8 +253,9 @@ func mqttQoS2HoldWalkFilter(idHash, gen string) string {
 // preserves the generation, so a peer may still be serving the retiring incarnation and
 // using these very subjects. Whether a late write or delete costs anything HERE is
 // $MQTT_inflight's own consequence question — F-034, unaudited — and must not be assumed
-// harmless on the strength of the naming. See inflight_register.go, and F-062 for the
-// same premise's cost on $MQTT_qos2in.
+// harmless on the strength of the naming. See inflight_register.go, and F-062 for how the
+// same premise's cost on $MQTT_qos2in was paid: not by naming, but by bounding every hold
+// removal to what its remover could prove it was entitled to destroy.
 func mqttInflightSubject(idHash, gen string, pi uint16) string {
 	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") +
 		"." + strconv.FormatUint(uint64(pi), 10)

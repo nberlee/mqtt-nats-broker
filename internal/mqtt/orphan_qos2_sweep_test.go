@@ -205,6 +205,22 @@ func (e *testOrphanEnv) putClaim(t *testing.T, holdSubject string, c *mqttQoS2Re
 	return seq
 }
 
+// putDiscardMarker writes a `discarded` marker fenced at the hold's OWN sequence,
+// which is the shape a real discard of that hold leaves.
+//
+// The fence has to be a real one. A fence-less marker is refused by the identity rule
+// and classifies UNREADABLE, and the sweep's default arm accepts an unreadable record
+// as a fence too — so a test staging one would still see the hold destroyed, while
+// having exercised the unreadable path instead of the discarded one it names.
+func (e *testOrphanEnv) putDiscardMarker(t *testing.T, holdSubject string) uint64 {
+	t.Helper()
+	_, holdSeq, err := e.asm.jsa.loadQoS2Record(holdSubject)
+	if err != nil || holdSeq == 0 {
+		t.Fatalf("read the hold's sequence on %q to fence its marker: seq=%d err=%v", holdSubject, holdSeq, err)
+	}
+	return e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "node1", holdSeq))
+}
+
 func (e *testOrphanEnv) holdPresent(t *testing.T, holdSubject string) bool {
 	t.Helper()
 	rec, _, err := e.asm.jsa.loadQoS2Record(holdSubject)
@@ -931,7 +947,7 @@ func TestOrphanSweepNoStoredTimestampDecidesEligibility(t *testing.T) {
 func TestOrphanSweepAppliesTheTwoGracesToTheirOwnClasses(t *testing.T) {
 	e := testNewOrphanEnv(t, "two-graces")
 	holdSubject := e.hold(t, 1, nuid.Next(), "payload")
-	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "node1"))
+	e.putDiscardMarker(t, holdSubject)
 	e.forget(t)
 
 	// The hold's quarantine is satisfied; the claim's is nowhere near. The claim still
@@ -1002,7 +1018,7 @@ func TestOrphanSweepRetiresAnAgedReleasingClaim(t *testing.T) {
 	e.setGraces(t, 0, 0)
 	gen := nuid.Next()
 	holdSubject := e.hold(t, 1, gen, "payload")
-	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2"))
+	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2", 0))
 	e.forget(t)
 
 	e.settle(t)
@@ -1020,7 +1036,7 @@ func TestOrphanSweepRemovesAClaimWithNoHold(t *testing.T) {
 	e := testNewOrphanEnv(t, "claim-no-hold")
 	e.setGraces(t, 0, 0)
 	holdSubject := mqttQoS2HoldSubject(e.sess.idHash, e.sess.gen, 3)
-	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "node2"))
+	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "node2", 0))
 	e.forget(t)
 
 	e.settle(t)
@@ -1124,7 +1140,7 @@ func TestOrphanSweepKeepsEverythingForALiveGeneration(t *testing.T) {
 	e.setGraces(t, 0, 0)
 	gen := nuid.Next()
 	holdSubject := e.hold(t, 1, gen, "payload")
-	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2"))
+	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2", 0))
 
 	e.settle(t)
 	if !e.holdPresent(t, holdSubject) || !e.claimPresent(t, holdSubject) {
@@ -1160,7 +1176,7 @@ func TestOrphanSweepHoldDiesBeforeItsFence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("preload the hold: %v", err)
 		}
-		e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "node1"))
+		e.putDiscardMarker(t, holdSubject)
 		e.forget(t)
 
 		e.settle(t)
@@ -1169,7 +1185,7 @@ func TestOrphanSweepHoldDiesBeforeItsFence(t *testing.T) {
 		}
 		// The releaser wakes: its claim succeeds against the empty subject...
 		if _, err := e.asm.jsa.storeQoS2RelClaimCAS(mqttQoS2ClaimSubjectFor(holdSubject), 0,
-			mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2")); err != nil {
+			mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2", 0)); err != nil {
 			t.Fatalf("the stalled releaser could not re-claim: %v", err)
 		}
 		// ...and its authoritative re-read refuses to authorize a delivery.
@@ -1191,7 +1207,7 @@ func TestOrphanSweepHoldDiesBeforeItsFence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("preload the hold: %v", err)
 		}
-		claimSeq := e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "node1"))
+		claimSeq := e.putDiscardMarker(t, holdSubject)
 		e.forget(t)
 
 		// The forbidden order, performed by hand: the fence goes first.
@@ -1199,7 +1215,7 @@ func TestOrphanSweepHoldDiesBeforeItsFence(t *testing.T) {
 			t.Fatalf("removing the marker: %v", err)
 		}
 		if _, err := e.asm.jsa.storeQoS2RelClaimCAS(mqttQoS2ClaimSubjectFor(holdSubject), 0,
-			mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2")); err != nil {
+			mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, gen, "node2", 0)); err != nil {
 			t.Fatalf("the stalled releaser could not re-claim: %v", err)
 		}
 		st, _, err := e.asm.verifyQoS2HoldForRelease(holdSubject, gen, preloadedSeq)
@@ -1221,7 +1237,11 @@ func TestOrphanSweepClaimReapTargetsTheExactSequence(t *testing.T) {
 	e.setGraces(t, 0, 0)
 	gen := nuid.Next()
 	holdSubject := e.hold(t, 1, gen, "payload")
-	stale := mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "node1")
+	_, holdSeq, err := e.asm.jsa.loadQoS2Record(holdSubject)
+	if err != nil || holdSeq == 0 {
+		t.Fatalf("read the hold's sequence to fence its marker: seq=%d err=%v", holdSeq, err)
+	}
+	stale := mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "node1", holdSeq)
 	staleSeq := e.putClaim(t, holdSubject, stale)
 	e.forget(t)
 
@@ -1231,7 +1251,7 @@ func TestOrphanSweepClaimReapTargetsTheExactSequence(t *testing.T) {
 		t.Fatalf("removing the first claim: %v", err)
 	}
 	newerGen := nuid.Next()
-	newerSeq := e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, newerGen, "node2"))
+	newerSeq := e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, newerGen, "node2", 0))
 	if newerSeq == staleSeq {
 		t.Fatal("this test needs the replacement claim to sit at a different sequence")
 	}
@@ -1256,7 +1276,7 @@ func TestOrphanSweepLoadsACounterpartTheBatchMissed(t *testing.T) {
 	e := testNewOrphanEnv(t, "split-batch")
 	e.setGraces(t, 0, 0)
 	holdSubject := e.hold(t, 1, nuid.Next(), "payload")
-	e.putClaim(t, holdSubject, mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "node1"))
+	e.putDiscardMarker(t, holdSubject)
 	e.forget(t)
 
 	// One record per pass: whichever half the walk lands on, the other must be

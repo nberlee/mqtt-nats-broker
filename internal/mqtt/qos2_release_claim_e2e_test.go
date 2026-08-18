@@ -63,16 +63,20 @@ func TestQoS2ReleaseDiscardedMidClaimDeliversNothing(t *testing.T) {
 	// A peer broker discards this session while our PUBREL sits between its load and
 	// its claim: it writes the discard marker and destroys the hold, in that order.
 	var discarded bool
-	testQoS2SetPreClaim(t, b, func(subject, _ string, _ uint64) error {
+	testQoS2SetPreClaim(t, b, func(subject, _ string, holdSeq uint64) error {
 		if subject != holdSubject || discarded {
 			return nil
 		}
 		discarded = true
+		// The marker is fenced AT this hold's sequence and the purge bounded to it: the
+		// peer enumerated this very record, so it is entitled to destroy it and its marker
+		// legitimately covers the exchange. That is what makes 0x92 the right answer here
+		// rather than a marker our PUBREL would be allowed to reap.
 		if _, err := b.jsa.storeQoS2RelClaimCAS(mqttQoS2ClaimSubjectFor(subject), 0,
-			mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "peer")); err != nil {
+			mqttNewQoS2RelClaim(mqttQoS2RelStateDiscarded, _EMPTY_, "peer", holdSeq)); err != nil {
 			t.Errorf("peer discard claim: %v", err)
 		}
-		if err := b.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, subject, false); err != nil {
+		if err := b.jsa.purgeStream(mqttQoS2IncomingMsgsStreamName, subject, holdSeq+1, false); err != nil {
 			t.Errorf("peer discard purge: %v", err)
 		}
 		return nil
@@ -177,7 +181,7 @@ func TestQoS2ReleaseAdoptsItsOwnClaimAcrossRetries(t *testing.T) {
 		t.Fatalf("load hold record: rec=%v err=%v", rec, err)
 	}
 	if _, err := b.jsa.storeQoS2RelClaimCAS(mqttQoS2ClaimSubjectFor(holdSubject), 0,
-		mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, rec.gen, "peer")); err != nil {
+		mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, rec.gen, "peer", 0)); err != nil {
 		t.Fatalf("plant our own generation's claim: %v", err)
 	}
 
@@ -214,7 +218,7 @@ func TestQoS2ReleaseForeignClaimIsReapedAndRetried(t *testing.T) {
 	testMQTTReadPubRecV5(t, b.rp, pi)
 
 	if _, err := b.jsa.storeQoS2RelClaimCAS(mqttQoS2ClaimSubjectFor(holdSubject), 0,
-		mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "dead-broker")); err != nil {
+		mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "dead-broker", 0)); err != nil {
 		t.Fatalf("plant a dead releaser's claim: %v", err)
 	}
 
@@ -320,7 +324,7 @@ func TestQoS2DupPublishWhileClaimedStillAnswersPubRec(t *testing.T) {
 		t.Fatalf("load hold record: rec=%v err=%v", before, err)
 	}
 	claimSeq, err := b.jsa.storeQoS2RelClaimCAS(mqttQoS2ClaimSubjectFor(holdSubject), 0,
-		mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, before.gen, "peer"))
+		mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, before.gen, "peer", 0))
 	if err != nil {
 		t.Fatalf("plant a claim: %v", err)
 	}

@@ -20,8 +20,10 @@
 //     and only then complete its delete. With generations, a late delete from a
 //     retired incarnation cannot name a resource the FRESH incarnation owns. It can
 //     still reach one a peer created under the retiring generation, which a resume
-//     preserves — that is F-062, and it is why naming is not a substitute for
-//     arbitration on a subject a live peer can still write.
+//     preserves — which is why naming is not a substitute for arbitration on a subject
+//     a live peer can still write. On the inbound QoS 2 holds what supplies the rest is
+//     F-062's purge bound: a removal names a subject but destroys only up to the
+//     sequence its remover could prove it was entitled to.
 //
 //  2. This claim. Its remaining job is narrower but still necessary: keep two
 //     brokers from tearing down and resuming the same record at once, and stop
@@ -33,7 +35,9 @@
 // overwriting it: it adopts the teardown, repeats the deletions for the RETIRING
 // generation, releases the record, and only then starts a fresh session with a fresh
 // generation and Session Present false. (Repeating them is safe for names nothing can
-// re-occupy; the inbound QoS 2 hold walk is the exception — F-062 A2.) That also makes a crashed teardown
+// re-occupy; for the inbound QoS 2 hold walk it is bounded per walk, and not claimed at all
+// for the unbounded `$MQTT_inflight` purge. F-062 and F-034 state those two; do not restate
+// them here.) That also makes a crashed teardown
 // self-healing, which today leaks until the orphan sweep. A record the restore
 // boundary refuses is never adopted by the CONNECT: a reserved-namespace record whose
 // generation is valid is still finished by the expiry path and the orphan sweep, while
@@ -69,9 +73,15 @@ type mqttSessTeardown struct {
 // generation-scoped or already unique per incarnation, so no deletion here can reach a
 // FRESH incarnation's resources however late it lands.
 //
-// That is not the same as "safe to repeat". The inbound QoS 2 hold walk purges by
-// SUBJECT, and a peer that resumed this generation can re-occupy one of those subjects,
-// so a repeat can destroy an acknowledged exchange written since — F-062 arm A2.
+// The inbound QoS 2 hold walk is the one target here that a repeat can re-reach on a subject
+// a live peer re-occupied, and it is bounded PER WALK rather than frozen at the first walk's
+// watermark. What that bounds, what it deliberately does not, and why freezing it would be
+// unsafe are stated once in F-062 (docs/findings/ha-arbitration.md); do not re-derive them
+// here, and do not paraphrase the entitlement criterion — three review rounds were spent on
+// restatements of it that were a shade too strong.
+//
+// It does not extend to `$MQTT_inflight`, whose filter purge is unbounded on equally
+// re-occupiable subjects: F-034, unaudited.
 //
 // sharedDurs is deliberately separate: a shared group durable is not owned by one
 // session, and is released only after the record is gone, by the last-holder scan.
@@ -705,9 +715,10 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 // or per-incarnation unique, so none reaches a fresh incarnation), which is what lets an
 // adopting broker run it again.
 //
-// Tolerating "already gone" is NOT the same as being idempotent: the inbound QoS 2 hold
-// walk purges by subject, so a subject re-occupied since the first run is destroyed by
-// the second (F-062 arm A2). Repetition is safe for the names nothing can re-occupy.
+// Tolerating "already gone" is not by itself what makes this repeatable. For the
+// inbound QoS 2 hold walk, which purges by subject and so can name a subject re-occupied
+// since the first run, what makes a second run safe is the bound each call carries (F-062).
+// The `$MQTT_inflight` purge below carries none: F-034 owes that audit.
 //
 // Shared group durables are NOT here; they are released by the caller after the
 // record is gone, so the last-holder scan does not count this session.
@@ -799,9 +810,15 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// statement about this broker, not about the cluster. Whether that costs anything is
 	// $MQTT_inflight's own consequence question — F-034, unaudited — and the same premise's
 	// cost on $MQTT_qos2in is F-062. Do not read this paragraph as clearing either.
+	//
+	// This purge stays UNBOUNDED (upToSeq 0) on purpose. F-062 bounded the $MQTT_qos2in
+	// hold purge to what its walk enumerated, and this purge has the same unbounded shape
+	// for the same reason it is unaudited: it enumerates nothing, so there is no watermark
+	// to bound it BY. Giving it one is F-034's work, not F-062's, and inventing a bound
+	// here would claim an audit that has not happened.
 	if t.idHash != _EMPTY_ && t.gen != _EMPTY_ {
 		filter := mqttInflightWalkFilter(t.idHash, t.gen)
-		if err := sess.jsa.purgeStream(mqttInflightStreamName, filter, noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
+		if err := sess.jsa.purgeStream(mqttInflightStreamName, filter, 0, noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
 			return fmt.Errorf("unable to purge the outbound in-flight registers of session %q: %v", t.id, err)
 		}
 	}
@@ -925,11 +942,10 @@ func (sess *mqttSession) releaseSharedTeardownDurables(t *mqttTeardownTarget, no
 // both delete the same retired names, one wins the record delete, and the loser's
 // classifying re-read reports released or superseded.
 //
-// "Idempotent" is NOT claimed for the inbound QoS 2 hold walk, and F-062 A2 is why: a
-// repeat observes the `discarded` marker an earlier finisher left and purges by subject,
-// so if a peer still serving this generation accepted a new exchange on that identifier
-// meanwhile, the repeat destroys it. Repetition is safe for names nothing can re-occupy;
-// it is not safe for a subject a live peer can still write.
+// The inbound QoS 2 hold walk carries a bound of its own, per walk, which is what makes a
+// repeat of it safe where naming alone would not have. "Idempotent" is still not claimed for
+// it, and not claimed at all for the unbounded `$MQTT_inflight` purge beside it. F-062 states
+// the first and F-034 owes the second; neither is restated here.
 //
 // This is also what makes a CRASHED teardown self-healing, which previously leaked
 // until the orphan sweep.
