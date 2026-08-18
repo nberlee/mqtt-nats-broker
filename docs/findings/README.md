@@ -22,8 +22,25 @@ work is merged into the existing finding or roadmap item whose invariant it serv
   the marker is not about it.
   Details: [F-062](ha-arbitration.md#f-062).
 - Add write lineage to shared QoS 2 assignment claims.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed 2026-08-18. Release treatment: Alpha blocker.
+  Closed as an audit: no lineage was needed. It produced three findings, one per falsified
+  premise — F-063 (retention evidence unbound from the source ack), F-064 (a live reference
+  left to owner resume) and F-065 (a reap on a stale copy reading) — plus F-066, and one
+  manifestation added to F-036. Unconditioned `CONSUMER.DELETE` on the interest-retained
+  `$MQTT_out` is the enabling mechanism on some of those routes, not the premise of any.
   Details: [F-033](ha-arbitration.md#f-033).
+- Prove a copy was retained before acknowledging its source.
+  Status: Open. Release treatment: Alpha blocker.
+  Details: [F-063](ha-arbitration.md#f-063).
+- Reconcile shared QoS 2 assignments independently of owner resume.
+  Status: Open. Release treatment: Alpha blocker.
+  Details: [F-064](ha-arbitration.md#f-064).
+- Re-read copy absence after the reaper's own SourceAcked transition.
+  Status: Open. Release treatment: Alpha blocker.
+  Details: [F-065](ha-arbitration.md#f-065).
+- Generalise cross-stream identity coupling instead of two ad hoc instances.
+  Status: Open. Release treatment: Alpha blocker.
+  Details: [F-066](ha-arbitration.md#f-066).
 - Add write lineage to outbound in-flight registers.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-034](ha-arbitration.md#f-034).

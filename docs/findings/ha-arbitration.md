@@ -12,10 +12,12 @@ evidence, the pinned source mechanisms, and the NATS maintainer's explicit confi
 that leader-local in-flight ownership and applied-before-serving enforce the header
 across elections. The mechanisms are stream-independent, so the per-stream findings
 inherit the server contract and the canary — but each owns a consequence of its own, and
-none closes on this evidence alone. **F-033 and F-034 still owe their audits.** F-032's ran
+none closes on this evidence alone. **F-034 still owes its audit.** F-032's ran
 on 2026-08-17: it inherited the contract without re-proving it, needed no lineage, and
 found a local defect that JetStream's guarantees never spoke to — **F-062**, filed below
-and since closed.
+and since closed. F-033's ran on 2026-08-18 to the same shape: no lineage, and three local
+defects the server contract never spoke to — **F-063**, **F-064**, **F-065** and
+**F-066**.
 
 Multi-frontend HA is supported alpha scope (decided 2026-08-10, `docs/ROADMAP.md`
 section 0.2), so every finding here is an unconditional alpha blocker.
@@ -392,8 +394,9 @@ Leader-only admission is therefore part of the resolution, not a weakness left b
   the store itself — so they are stated as observed and are not part of the claim.
 - **Not that the other streams are closed.** The server mechanisms are
   stream-independent, but each per-stream finding owns a consequence of its own and stays
-  open until it is audited on its own terms. **F-033 and F-034 are still open on those
-  terms.** F-032's audit has since run and closed, producing F-062, which is closed too.
+  open until it is audited on its own terms. **F-034 is still open on those terms.**
+  F-032's audit has since run and closed, producing F-062, which is closed too; F-033's has
+  too, producing F-063, F-064, F-065 and F-066.
 - **Not that a Will is never published twice.** The sanctioned at-least-once duplicate
   is untouched, and its boundary is unchanged: external publication with no durable
   evidence of completion. What is retired is the class where evidence EXISTED and was
@@ -577,14 +580,218 @@ correcting them is part of filing it.
 
 **Title:** Add write lineage to shared QoS 2 assignment claims
 
-- Status: Open. The shared cross-term premise is closed
-  (see the note at the top of this file and F-030); what remains for this finding is its
-  OWN consequence audit against that
-  route inventory, plus a fixture and a discriminating mutation for anything the
-  audit finds still reachable.
+- Status: **Closed 2026-08-18 — no lineage was needed, and the audit produced F-063, F-064
+  and F-065.** The two results are separate and neither implies the other.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 33
+
+### What the audit established
+
+**Clauses (a) and (b) answer NO: no write on `$MQTT_qos2assign` is unconditional, and
+none takes a base it did not read.** Every claim write is funnelled through
+`storeQ2AffClaimCAS` (`qos2_shared_affine.go:647`, `:690`), which *always* emits
+`JSExpectedLastSubjSeq`; there is no unconditioned store to find. Three primitives, and
+each is conditioned:
+
+| # | mutation | condition sent | base |
+|---|---|---|---|
+| W1 | claim election, `moveStartedSharedQoS2:1477` | `JSExpectedLastSubjSeq: 0` | create-only: no base exists |
+| W2 | every transition, `advanceQ2AffClaim:1257` | `JSExpectedLastSubjSeq: <seq>` | the sequence loaded in the same attempt; a rejection re-reads |
+| D1 | claim reap, `reapQ2AffClaim:1328` | `deleteMsg(..., seq, true)` | the exact sequence this call loaded |
+
+The inventory is **complete over bridge-authored data mutations with the test seams
+nil**, derived from three mechanical sweeps — over `mqttQoS2AssignStreamName` and
+`mqttQoS2AssignStreamSubjectPrefix`, over the subject builder `mqttQ2AffClaimSubject`,
+and over the destructive primitives `purgeStream(` / `deleteMsg(` / `deleteConsumer(`.
+It is not "complete by construction": those sweeps enumerate in-tree references and
+cannot enumerate a direct NATS publication, which stays scoped out by
+`docs/CONFORMANCE.md`'s three-part same-base boundary plus the reserved-namespace deny
+and the required ACL.
+
+Eviction routes that would erase a claim with no writer at all are refused at startup:
+`LimitsPolicy`, `DiscardOld`, `MaxMsgsPer: 1`, `MaxMsgs`/`MaxBytes`/`MaxAge` unlimited,
+no sources, no `MaxMsgSize`, no `SubjectDeleteMarkerTTL` (`validateQoS2AssignStream`).
+
+**Clause (c): `test/depproof/`'s route inventory, inherited by citation from F-030.** No
+new depproof row — the server mechanisms are stream-independent and re-proving them is
+the error `docs/ARCHITECTURE.md`, "Trusting the backend" warns against. R-old, R-new,
+R-elect, R-inflight and R-apply are inherited. R-unclustered is refused by the shared
+replica check in `validateBrokerOwnedStreamShape`. R-batch: no writer here emits
+`Nats-Batch-*`. R-forward and R-mirror/source are refuted in writing, with the
+post-start configuration-drift residual unchanged. **R-purge is not applicable, and that
+is positive evidence rather than an absence**: `purgeStream` has exactly three
+appearances in the tree (`mqtt.go:4540` the primitive, `qos2_release_claim.go:979` on
+`$MQTT_qos2in`, `sess_teardown.go:821` on `$MQTT_inflight`), so nothing purges this
+stream.
+
+**What the audit did NOT find: any need for write lineage.** W1 is create-only, so there
+is no base to descend from. W2 CASes at a base it read in the same attempt, which alone
+answers "is this record still the one I reasoned about?" more strongly than a parent
+pointer would — a peer that moved the subject wins and this write is rejected. Seven of
+the ten transitions additionally assert the winner's identity (`wantWinner`/`wantGen`);
+the other three deliberately do not, because the facts they record are owner-independent,
+and the per-subject CAS is what makes them safe rather than the identity check. D1 targets
+an exact sequence, and a peer's later transition lands at a new sequence that
+`MaxMsgsPer: 1` evicts, so the delete cannot reach it. §0.2's own write-lineage audit
+deleted the create side of `$MQTT_sess`'s lineage for the same reason.
+
+### Where the yield actually is: an unconditioned CONSUMER.DELETE, not a purge
+
+As in F-032, the value lies in the one operation that carries no condition:
+**`CONSUMER.DELETE` on `$MQTT_out`**, which is interest-retained, so deleting a consumer
+destroys every copy it still held. Measured, not assumed: `jsConsumerDeleteRequest`
+(nats-server v2.14.5, `server/jetstream_api.go:5116`) rejects any non-empty request body,
+so there is no precondition field in the API at all. By the "whose gap is it" rule this
+is **ours wherever we act on evidence weaker than the destruction**, and a dependency
+question nowhere.
+
+### The five route inventories, dispositioned
+
+**1. Claim transitions (ten, all inheriting W2).** All ten CAS at a sequence loaded in
+the same attempt and preserve proven facts through `mergeProven`, so a transition can
+only ever ADD to what is known. Seven carry an explicit `wantWinner`/`wantGen` identity
+assertion and mutate nothing on a mismatch: `qos2_shared_affine.go:1636` (materialize),
+`:1713` (the on-behalf discard arm), `:2051` (`discardQ2AffClaimsFor`), `:2131` (`Lost`),
+`:2146` (recovery's `Discarded + SourceAcked`), `orphan_qos2_sweep.go:1871`
+(`discardAbsentWinnerClaim`) and `:1975` (the sweep's pre-delete discard). Three pass no
+identity because the fact they record is owner-independent — `SourceAcked` is a statement
+about the group delivery and `AffineDone` about a copy the gate has already attributed:
+`qos2_shared_affine.go:1318` (the reaper's unofferable-source inference), `:1374`
+(`confirmSourceAckAndRecord`) and `:1931` (`mqttFinishQ2AffineDelivery`). None is
+unconditional and none takes a stale base. The two sweep transitions are the ones whose
+EVIDENCE is weaker than a CAS can express; that is F-064, not a lineage gap.
+
+**2. Claim reaps (twelve, all inheriting D1).** Every one re-reads the claim and
+re-derives both proofs before deleting, and deletes only the exact sequence it loaded:
+`qos2_shared_affine.go:1525`, `:1534`, `:1577`, `:1720`, `:1750`, `:1942`, `:2058`,
+`:2110`, `:2153`, `orphan_qos2_sweep.go:1796`, `:1879`, `:2068`. The re-read is what
+makes reaping from every proof-writer correct rather than redundant: the two proofs are
+produced by unordered paths, so whichever commits second observes the first. All twelve
+inherit the same internal TOCTOU on the copy-absence reading, which is **F-065** — one
+defect in the primitive, not twelve.
+
+**3. Affine consumer deletes (four).** `orphan_qos2_sweep.go:2058` (the sweep, the only
+one running under no session claim, and a check-then-act whose delete is BY NAME),
+`qos2_shared_affine.go:1088` (provisioning rollback, `minted` only — nothing durable ever
+referenced that generation), `:2369` (`finishQ2AffineUnwind`, under the session's own
+fence) and `sess_teardown.go:750` (teardown, under a won `claimTeardown`, and after
+`discardQ2AffClaimsFor` has marked every assignment of the generation). Only the sweep's
+acts on evidence weaker than its consequence; that is F-036's third manifestation below.
+The two **PUBREL** consumer deletes on the same stream — `orphan_qos2_sweep.go:2202` and
+`sess_teardown.go:732` — are **outside this finding's bound**: no assignment claim
+references a PUBREL durable or its copies (`CopySubject` and `AffDurable` are Q2AFF-shaped
+and `mqttParsePubRelDurable` parses a disjoint namespace), so destroying them destroys
+nothing a claim points at. Their consequence is already routed elsewhere by that file's
+header; this audit does not adjudicate which finding owns it. Every other
+`deleteConsumer` hit targets `mqttStreamName` or another stream and destroys neither
+claims nor affine copies.
+
+**4. Copy acknowledgements (six), each destroying exactly one copy.** Five reach
+`mqttFinishQ2AffineDelivery`, which records `AffineDone`, confirms the copy's ack and
+only then attempts D1 — the inverted window (recorded, not yet acked) is benign and
+self-correcting, and the opposite order would make an absent copy indistinguishable from
+a lost one. Those five are the delivery gate's `Discarded` disposition
+(`qos2_shared_affine.go:1832`), its `AffineDone || Lost` disposition (`:1840`), the
+expiry drop (`:1881`), the oversize drop (`:1905`) and the client's own PUBREC
+(`mqtt.go:14095`). **The sixth is different in kind and gets its own disposition**: the
+owner-mismatch arm sends a bare `sendAck` (`qos2_shared_affine.go:1826`), destroying the
+copy with no claim transition, no `AffineDone` and no reap attempt. That is correct
+rather than defective, and the reason is ownership, not accounting: the claim names a
+different session, so this copy is an artifact — the real owner has, or will have, its
+own, and the claim it is attributed to is untouched. A lost ack is equally safe: the copy
+is re-offered, the gate re-runs, the claim still names the other owner, and the same arm
+disposes of it again. The one thing it must never do is record `AffineDone`, which would
+assert a delivery on a claim this session does not own.
+
+**5. Source acknowledgements of the GROUP delivery (nine), scoped to
+`moveStartedSharedQoS2`.** The scope boundary is part of the claim; the reply is the group
+delivery's ack subject by the input's own definition. Confirmed through
+`confirmSourceAckAndRecord`, which acks and only then records `SourceAcked`, at five:
+`:1522` (terminal contender), `:1531` (foreign already materialized), `:1565` (own claim),
+`:1717` (the on-behalf discard arm) and `:1745` (on-behalf materialized). Fire-and-forget
+`sendAck` on the same reply at four: the expiry drop (`:1446`), the oversize drop
+(`:1471`) and the two already-`SourceAcked` shortcuts (`:1521`, `:1562`) — each releasing
+a delivery whose arbitration is already durably settled, so a lost ack only causes a
+redelivery that takes the same arm. Two **pre-dispatch** acks of the same group delivery
+sit before the mover and are refuted rather than dispositioned: subscribe-deny
+suppression (`mqtt.go:14796-14803`) is unreachable because `checkDenySub` returns false
+unconditionally (`shim_engine.go:591`), and reserved-subject suppression
+(`mqtt.go:14790-14793`) cannot produce a consequence because
+`group durable → effective subject → reserved flag` is invariant across the members of
+one durable (`mqtt.go:2390-2394`, `:15958-15959`) — qualified by the pre-existing
+negligible-collision assumption of the 16-character truncated hash, which this audit
+inherits rather than re-argues. No Local is rejected outright on shared subscriptions
+(`mqtt.go:14427-14428`) and the drain routes exclude shared consumers
+(`unsub_drain.go:304-305`).
+
+**6. Copy stores — one primitive, three control-flow routes, two precondition
+families.** The primitive is `storeQ2AffCopy`
+(`qos2_shared_affine.go:1613`), written only by
+`materializeQ2AffCopy`. The own-claim family reaches it through `completeQ2AffOwnClaim`
+(`:1558`) from two entry points, a fresh election (`:1491`) and a resumed own claim
+(`:1511`), gated only by `beginQ2AffOp`'s local state. The on-behalf family reaches it on
+`:1742`, gated by a consumer lookup that nothing binds to the store. Both counts are
+stated so neither reading looks like an omission. These two families are **F-063**.
+
+### What the audit found instead: three defects, sorted by falsified premise
+
+Consequences are classified by **the premise each falsifies**, never by where a fix could
+be installed — the axis F-036's own dossier uses and the one F-062 was filed on. Eleven
+interleavings were worked; they resolve into three premises of ours, one F-036
+manifestation, and two dispositions that are not defects at all.
+
+- **F-063** — nothing binds evidence that a copy was RETAINED to the irreversible source
+  acknowledgement that follows it.
+- **F-064** — a live generation reference is treated as reason enough to leave every
+  claim of that generation to owner resume.
+- **F-065** — `reapQ2AffClaim` deletes on a copy-absence reading taken before its own
+  `SourceAcked` transition.
+
+**A fourth consequence sorts onto F-036, and that sort was CORRECTED during review.** The
+sweep's affine consumer delete is by name, and a session resuming inside its final window
+ADOPTS the consumer rather than recreating it — provisioning is a create-or-UPDATE — so
+step (5)'s `Created` fingerprint does not discriminate it. The audit first filed this as a
+defect of ours, reasoning that the record was genuinely absent when step (4) read it and
+so no false-absence inference was involved. **That reasoning does not hold.**
+`sess.q2AffGen` is only ever populated from a persisted record (`mqtt.go:6045`, `:8702`,
+`:8755`), and provisioning mints a FRESH generation when it is empty
+(`qos2_shared_affine.go:1021`), so a session resuming with no record cannot adopt the
+condemned generation's consumer at all. Adoption requires a session already resident with
+that generation while its record is absent, and the sweeping broker counts only its own
+residents — F-036's premise exactly. It is therefore recorded there as a third widening
+manifestation. What is genuinely new, and belongs to whoever fixes F-036, is that the
+`Created` fingerprint cannot be relied on as a defense.
+
+**Not defects of ours.** A contender's discard arm firing on an *absent* winner record
+(`materializeQ2AffOnBehalf`) rests on the same F-036 premise and is recorded there; a
+local guard that would mitigate it does not convert it into a separate finding. The
+*different-generation* arm is **settled** on the clean-start route and rests on no false
+premise: `clear()` drains the affine fence and re-mints the incarnation, and teardown
+marks every assignment of the retiring generation `Discarded` before deleting its consumer
+(`sess_teardown.go:738-753`), so the old session really has ended and [MQTT-4.8.2-6]
+permits the delivery to die with it. What F-036 owns there is the obsolete broker object
+continuing to serve after that termination, not the discard.
+
+**Also benign, and stated so rather than filed.** The sweep's consumer delete committing
+while its response is lost skips that pass's reaps (`orphan_qos2_sweep.go:2058-2070`), but
+the next pass independently revisits orphan `Discarded` claims and calls the reaper
+(`:1783-1793`). The end state is a bounded delay in reaping an otherwise-reapable subset,
+not durable accumulation.
+
+### Correcting the statements that made these unrecognisable
+
+Per F-032, correcting the prose that deferred the question is part of filing the answer.
+Four in-code markers across three sites said "F-033, unaudited":
+`qos2_shared_affine.go` twice inside `materializeQ2AffOnBehalf`'s discard arm (two
+markers, one site), `orphan_qos2_sweep.go` in `discardAbsentWinnerClaim`, and the same
+file's step (4). Each now states the audit's answer and cites this section rather than
+deferring to it. Three further sites that asserted something this audit falsified are
+corrected at the same time: `beginQ2AffOp` (admission on local state alone),
+`materializeQ2AffCopy` (a successful store is not evidence of retention) and the sweep's
+reference skip. The class bounds at `orphan_qos2_sweep.go`'s header and
+`docs/ARCHITECTURE.md`'s orphan-reconciliation section keep F-034 and F-036 and drop
+F-033.
 
 ### Original finding record
 
@@ -725,6 +932,49 @@ fixed. A further five sites assert consequences for `$MQTT_inflight`, the affine
 the PUBREL durables; those were deliberately converted to refusals-to-answer rather than
 corrected, because their consequences belong to **F-033, F-034** and this finding, none of
 which had been audited when they were written.
+
+**The affine ones among those five have since been answered.** F-033's audit closed on
+2026-08-18 and rewrote its four markers across three sites to state their answer rather
+than defer it. Two of the affine consequences sort onto **this** finding's premise and are
+recorded as its population — a contender discarding an assignment on an absent winner
+record, and the different-generation reading whose residue is a previous owner still
+serving. The rest are defects of ours with premises of their own: **F-063**, **F-064** and
+**F-065**. The `$MQTT_inflight` and PUBREL refusals stand, still owed by F-034.
+
+### A third manifestation added by F-033's audit (2026-08-18): the adoption blind spot
+
+`deleteOrphanQ2AffConsumers` deletes an orphaned affine consumer **by name**, after two
+guards: a final session-record re-read (step 4) and a check that the consumer is still the
+INSTANCE quarantine observed, by `ConsumerInfo.Created` (step 5). **Neither discriminates
+a
+session that RESUMES onto the consumer between them.** A resume preserves the incarnation
+generation and derives the same durable name, and affine provisioning is a
+create-or-**UPDATE** — so no new instance is created and `Created` is unchanged. Step (5)
+therefore passes, and step (6) destroys a live session's consumer together with every copy
+interest retention was holding for it.
+
+This is **this finding's** population, not a separate one, and the audit corrected itself
+on
+exactly that point. It first read the window as independent of false absence, on the grounds
+that the record was genuinely absent when step (4) read it. But `sess.q2AffGen` is only ever
+populated from a persisted record (`mqtt.go:6045`, `:8702`, `:8755`) and provisioning mints
+a FRESH generation when it is empty (`qos2_shared_affine.go:1021`), so a session resuming
+with no record cannot adopt the condemned generation's consumer at all. Adoption requires
+a
+session **already resident with that generation while its record is absent** — and the
+sweeping broker's reference set covers only persisted records and its OWN residents. That
+is
+this finding's premise verbatim.
+
+**What is new, and what a fixer must not assume.** The `Created` fingerprint reads as a
+defense against acting on a stale candidate, and its own comment describes the case it was
+built for — a durable deleted and recreated under the same name. Against an adoption it is
+not a defense at all. Any fix for this finding that leans on the instance fingerprint to
+bound the consumer delete will still delete a live adopted consumer; the delete needs
+arbitration, not a third read. The resulting state — a live matching record whose affine
+consumer is gone — is also precisely **F-064**'s precondition, so this manifestation
+reaches that finding's permanent stall as well as destroying the copies directly.
+`TestQ2AffResumeAdoptsConsumerKeepingItsCreated` pins the adoption mechanism.
 
 ## F-062
 
@@ -1138,3 +1388,326 @@ occupancy, and an unbounded purge then destroyed an occupant neither entitlement
 no bound, over subjects a peer serving the retiring generation can re-occupy, so the deletion
 set as a whole is not repeat-safe — that is **F-034**, unaudited, and this finding does not
 touch it.
+
+## F-063
+
+**Title:** A source acknowledgement bound to a copy store that never proved retention
+
+- Status: **Open.** Found by F-033's consequence audit, 2026-08-18.
+- Classification: HA arbitration architecture / data loss
+- Release treatment: **Alpha blocker.** The message lost was accepted — the publisher was
+  answered for it — and multi-frontend HA is supported alpha scope.
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+
+### The finding
+
+`$MQTT_out` is interest-retained: a store onto a subject no consumer filters **succeeds
+and keeps nothing**. The affine protocol nevertheless treats a successful create-only copy
+store as proof the copy exists, advances the claim to `materialized` on it, and then
+acknowledges the group source — which is irreversible and releases the message from the
+shared group forever. Nothing between those two steps establishes that any consumer
+retained the copy.
+
+**The premise, stated so it covers all three routes:** *nothing binds evidence that the
+copy was RETAINED to the irreversible source acknowledgement that follows it.* The routes
+differ in which link is missing, not in the premise:
+
+- **Own-claim path — the evidence is never gathered at all.** `beginQ2AffOp` admits a move
+  on LOCAL session state only: a readiness flag, a non-empty generation and a non-nil
+  `q2AffConsumer` POINTER (`qos2_shared_affine.go:925`). Nothing consults the durable
+  consumer. `materializeQ2AffCopy` then stores and does not verify: the only re-read is on
+  the CAS-REJECTION path (`:1613-1623`), so a store that SUCCEEDS is never checked.
+  `completeQ2AffOwnClaim` acknowledges the source at `:1565`.
+- **On-behalf path — the evidence is gathered and then not bound.** The contender DOES look
+  the consumer up (`:1727-1733`), but nothing ties that lookup to the store at `:1742`; a
+  deletion in between produces the identical leftover.
+- **The materialized observation — evidence about a copy that has since gone.** A consumer
+  deleted between observing `materialized` and acknowledging the source (`:1531`, `:1565`,
+  `:1745`) leaves the same state, with no missing consumer at the moment of the check.
+
+**Leftover in every case: a `materialized + SourceAcked` claim with no copy**, which only
+a
+later owner resume can turn into `Lost` — and if that session never resumes, the loss is
+never even recorded. The source is gone, so no redelivery re-elects.
+
+**Why an owner-independent reconciler does not close this**, and why it is therefore not
+F-064: a periodic reconciler at F-064's two gates cannot make consumer existence atomic
+with the copy store and the source acknowledgement. The remedy here is arbitration on that
+ordering — proving retention before acknowledging, or making the acknowledgement
+conditional on it — not reconciliation afterwards. That difference in remedy is what
+establishes the premises are distinct.
+
+## F-064
+
+**Title:** A live generation reference leaves every assignment of that generation to owner
+resume
+
+- Status: **Open.** Found by F-033's consequence audit, 2026-08-18.
+- Classification: HA arbitration architecture / liveness
+- Release treatment: **Alpha blocker** for the stall. The accumulation is a resource leak
+  and is stated here as a residual of the same premise rather than filed separately.
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+
+### The finding
+
+`buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen` **alone**
+(`orphan_qos2_sweep.go:884`), and `reconcileOrphanQ2AffClaims` skips every claim of a
+referenced generation (`:1765`); `deleteOrphanQ2AffConsumers` skips the generation for
+the same reason. Under a live, matching record the sweep therefore touches **no claim of
+that generation at all** — deliberately, because the owner is presumed to be coming back.
+The premise that makes that safe is **"a live generation reference makes owner resume a
+sufficient reconciler"**, and `recoverQ2AffClaims` is indeed the only thing that ever
+revisits such a claim. A session that never resumes — and MQTT permits a session that never
+expires — is the counterexample.
+
+**Consequence 1 — a permanently stalled shared group.** This is the consequence the original
+roadmap bullet named. Record live and matching, affine consumer authoritatively absent,
+owner never resumes:
+
+- every contender's `materializeQ2AffOnBehalf` fails at the consumer lookup
+  (`qos2_shared_affine.go:1727-1733`), forever, and acknowledges nothing;
+- `discardAbsentWinnerClaim` defers because the generation matches
+  (`orphan_qos2_sweep.go:1855`);
+- `reconcileOrphanQ2AffClaims` never reaches the claim at all;
+- `Lost` has exactly one writer in the tree, `recoverQ2AffClaims`
+  (`qos2_shared_affine.go:2131`), on the owner's own resume.
+
+The shared group consumer sets **no `MaxDeliver`** (`mqtt.go:15925-15937`), so AckWait
+re-offers that source message forever while it holds a `MaxAckPending` slot, with nothing
+logged. Enough of them and the shared subscription stops delivering for every member.
+Reachable through the out-of-band consumer destruction `docs/CONFORMANCE.md` documents, and
+through F-036's third manifestation below.
+
+**Consequence 2 — unbounded accumulation of settled records (residual).** Three windows
+leave a claim that nothing under a live reference revisits. The reap is the LAST step of
+`mqttFinishQ2AffineDelivery` (`:1926-1942`) and is skipped both by a crash and by a copy ack
+whose confirmation response is merely lost — recovery's own comment names both.
+`confirmSourceAckAndRecord` can likewise commit its ack while the response is lost,
+returning before the terminal contender's reap (`:1522-1525`). And W1 can commit with the
+copy store then failing, so a later redelivery finds the Message Expiry Interval elapsed and
+bare-acks the source **before** consulting or electing any claim (`:1412`, `:1445-1448`),
+leaving `claimed`, `SourceAcked == false`, no copy, and the source genuinely gone. `Lost`
+records are retained by design and are not this.
+
+**The premise is enforced TWICE, and that is measured rather than assumed.** The reference
+skip is not the only gate: `discardAbsentWinnerClaim` independently defers on
+`ps.Q2AffGen == e.claim.Gen`. The fixture below was run against each mutation separately and
+**passed both times**, failing only when both gates were removed. **A remedy that addresses
+one of them changes nothing** — which is the trap this note exists to prevent.
+
+**Why the silent loss is NOT here.** An earlier draft of this audit grouped the
+store-without-retention loss under this premise. It does not belong: no owner-independent
+reconciler can make consumer existence atomic with the copy store and the source
+acknowledgement, so the remedy that closes the stall leaves the loss untouched. That is
+F-063, and the remedy test is what separates them.
+
+## F-065
+
+**Title:** A claim reaped on a copy-absence reading taken before its own SourceAcked transition
+
+- Status: **Open.** Found by F-033's consequence audit, 2026-08-18.
+- Classification: HA arbitration architecture / liveness
+- Release treatment: **Alpha blocker.** A copy of an accepted QoS 2 message is pinned behind
+  the fail-closed delivery gate and holds a `MaxAckPending` slot for as long as it lasts.
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+
+### The finding
+
+`reapQ2AffClaim` reads the copy state (`qos2_shared_affine.go:1311`), may then advance
+`SourceAcked` (`:1318`) — a full JetStream round trip that loads, mutates, CASes and retries
+— and evaluates `reapable(copyAbsent)` on **the reading taken before it**. The predicate's
+whole purpose is that a copy which still exists keeps its claim; it is handed a copy state
+that may be that stale.
+
+**Worked interleaving.**
+
+1. An **on-behalf** contender loads claim `C`, not yet `Discarded`, passes
+   `materializeQ2AffCopy`'s guard and reads the copy ABSENT.
+2. Concurrently `C` becomes `Discarded` — by teardown, by the sweep, or by the on-behalf
+   discard arm — **and** its source side is proven, which the reap predicate requires before
+   anything is deletable: either by a terminal contender or by the reaper's own
+   unofferable-source inference.
+3. The reaper finds the copy absent, observes `SourceAcked`, `reapable(true)` returns true
+on
+   `Discarded`, and it deletes `C` at its exact sequence.
+4. The contender now stores the copy. Its `advanceQ2AffClaim` finds no claim and returns
+   `(nil, 0, nil)`, so materialization reports failure — but the copy is already on the
+   stream.
+
+**Leftover: source proven, claim absent, copy present.** The delivery gate takes the
+`claim == nil` branch and NAKs (`:1816-1822`), never reaching the `Discarded` branch that
+would dispose of it, so the copy NAK-loops. That is precisely the state `reapable`'s own
+comment says must never exist: deleting the claim there "would strand the copy behind the
+delivery gate, NAK'd forever with nothing left able to authorize or dispose of it".
+
+**The stale materializer must be the on-behalf one.** `prepareQ2AffineUnwind` drains every
+locally admitted move before discarding, so the owner's own materializer cannot still be in
+that window — but a contender materializing on another broker is not inside that session
+fence.
+
+**How long it lasts.** On the ordinary teardown route the same teardown next deletes the
+affine consumer (`sess_teardown.go:749-753`) and interest retention takes the stranded copy
+with it. A strand that **persists across the failure** needs one of two further facts: the
+consumer delete fails or the broker dies before it; or the dispose-first packet unwind
+discards the claims and its confirming save then fails DEFINITELY, so
+`restoreQ2AffineUnwind` puts the live path back under a session that keeps running
+(`mqtt.go:7504-7512`) — and that restore leaves `q2AffReady = false` while the delivery
+callback never tests readiness, so the copy still NAK-loops on the retained consumer. In the
+first construction a later successful orphan pass can still delete the consumer, so the
+strand is bounded by that pass rather than permanent.
+
+**Not closed by the existing guard.** `materializeQ2AffCopy`'s `Discarded` check reads the
+caller's **already-loaded** claim, which predates the concurrent transition.
+
+## F-066
+
+**Title:** Cross-stream identity coupling exists as two ad hoc instances, never as a mechanism
+
+- Status: **Open.** Found by F-033's consequence audit, 2026-08-18, during holistic review.
+- Classification: HA arbitration architecture / data loss
+- Release treatment: **Alpha blocker.** Every precondition is a recovery procedure this
+  broker's own startup error tells the operator to perform, and the messages lost or
+  misdelivered were accepted.
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+
+### The finding
+
+**Falsified premise: "recreating one stream is a self-contained recovery procedure."** When
+a broker-owned stream fails its shape validation, startup refuses and instructs the operator
+to *"stop ALL brokers for this account and recreate `<that stream>`"*. For two streams that
+instruction names a second stream and calls the pair *"one logical unit"*; for the rest it
+names one stream alone. But durable records across this broker persist identities **issued
+by other streams** — sequences, consumer durable names, and subjects — and recreating a
+stream invalidates every reference to it that survives elsewhere.
+
+**This is filed as one finding over the class, not one per member.** The audit reached it
+the wrong way round: three consecutive holistic rounds each surfaced a different member, a
+fourth surfaced a member the first sweep had missed, and each time the instance was patched
+rather than the family swept. The population below is therefore **derived** — every
+persisted field in the tree that holds an identity another stream issues — rather than
+listed, which is the only form of this finding that can be checked for completeness.
+
+### The derived population, swept by CARRIER
+
+Two earlier attempts at this table were incomplete, and both failed the same way: the
+population was enumerated from too narrow a source — first "the streams this finding
+touches", then "every `json:` struct tag". A cross-stream identity is not a schema feature;
+it is anything persisted that names something another stream issued. So the population is
+derived by sweeping every **carrier** such an identity can travel in, and the completeness
+claim is *"every carrier channel was swept"* — which is checkable, where "every field" was
+not.
+
+Five carriers exist in this tree: JSON body fields, `Nmqtt-*` message headers,
+`Nats-Msg-Id` builders, subject builders, and consumer-durable builders.
+
+| Holder | Carrier | Identity it holds | Issued by | Epoch-coupled? |
+|---|---|---|---|---|
+| `$MQTT_teardown` | body `MarkerSeq` | sequence | `$MQTT_sess` | **YES** — `mqttSessEpochMetaKey` in stream metadata, validator refuses a mismatch, paired stop-all |
+| `$MQTT_willq` | body `OriginSessionSeq` | sequence | `$MQTT_sess` | **YES** — `OriginSessEpoch` per record; the sequence is compared only when epochs are equal |
+| `$MQTT_qos2assign` | subject (`mqttQ2AffClaimSubject`) | consumer + sequence | `$MQTT_msgs` | **NO** |
+| `$MQTT_qos2assign` | body `SourceSeq`, `GroupDurable`, `ClaimHash` | sequence, consumer | `$MQTT_msgs` | **NO** |
+| `$MQTT_qos2assign` | body `CopySubject`, `AffDurable` | subject, consumer | `$MQTT_out` | **NO** |
+| `$MQTT_out` (affine copy) | subject (`mqttQ2AffCopySubject`) | claim hash derived from a sequence | `$MQTT_msgs` | **NO** |
+| `$MQTT_out` (affine copy) | header `Nmqtt-Q2Claim` | subject | `$MQTT_qos2assign` | **NO** |
+| `$MQTT_out` (affine copy) | `Nats-Msg-Id` (`mqttQ2AffMsgId`) | consumer + sequence | `$MQTT_msgs` | **NO** |
+| `$MQTT_out` (stored PUBREL) | headers `Nmqtt-Q2SrcDur`, `Nmqtt-Q2SrcSeq` | consumer + sequence | `$MQTT_msgs` | **NO** |
+| `$MQTT_out` (stored PUBREL) | `Nats-Msg-Id` (`mqttPubRelMsgId`) | consumer + sequence | `$MQTT_msgs` | **NO** |
+| `$MQTT_inflight` | body `Dur`, `Seq` | consumer, sequence | `$MQTT_msgs` / `$MQTT_out` | **NO** |
+| `$MQTT_inflight` | body `Q2AffClaim` | subject | `$MQTT_qos2assign` | **NO** |
+| `$MQTT_inflight` | body `ClaimSeq` | sequence | `$MQTT_sess` | **NO** |
+| `$MQTT_sess` | body `Q2Aff.Durable`, `PubRel.Durable` | consumers | `$MQTT_out` | **NO** |
+| `$MQTT_sess` | body drain durable + `Started[].Seq` | consumer, sequences | `$MQTT_msgs` | **NO** |
+| `$MQTT_sess` | body drain `Started[].RegSeq` | sequence | `$MQTT_inflight` | **NO** |
+
+Carriers that hold no cross-stream identity, checked and stated so the sweep is falsifiable:
+the remaining `Nmqtt-*` headers carry a generation, a subscription identifier, a topic or
+a
+client-ID hash — session-scoped identities, not something another stream issued;
+`mqttQoS2ReleaseMsgId` embeds only a generation; and the subject builders for
+`$MQTT_qos2in`, `$MQTT_inflight`, `$MQTT_teardown`, `$MQTT_willq` and `$MQTT_sess` are keyed
+by `(client-ID hash, generation, packet identifier)` or `(domain, client-ID hash)`.
+`$MQTT_rmsgs` holds none, and `$MQTT_origin` is a retired stream.
+
+### What the table actually shows: a pattern applied twice and never systematised
+
+An earlier draft of this finding stated a rule — *coupled if and only if it references
+`$MQTT_sess`* — and **the table above falsifies it**: `$MQTT_inflight`'s `ClaimSeq` is a
+`$MQTT_sess` sequence and is uncoupled. The rule is withdrawn rather than rescued by
+reclassifying its counterexample, and what remains is a sharper statement:
+
+> **Exactly two epoch couplings exist in the tree. Both were built ad hoc against
+> `$MQTT_sess`, in two different shapes, and the idea was never generalised — not even to
+> every reference to `$MQTT_sess` itself.** Thirteen of the fifteen cross-stream identities
+> above are uncoupled, including one pointing at the very stream both existing couplings
+> protect.
+
+That is why this class produced one new member per review round for four consecutive
+rounds: there is no mechanism to be absent from, only two hand-built instances of a pattern
+nobody wrote down. A remedy is therefore a *generalisation* — one way of stamping and
+validating an issuing stream's incarnation, applied across the table — not a third bespoke
+coupling.
+
+### What that costs on the affine path
+
+The logical unit F-033's protocol needs is **four** streams — `$MQTT_msgs`,
+`$MQTT_qos2assign`, `$MQTT_out` and `$MQTT_inflight`. Two earlier drafts of this finding
+claimed three and then had to correct the count, which is itself the symptom: the unit is
+whatever the carrier table says references each stream, and only a completed carrier sweep
+can tell you. Recreating any proper subset strands the references the others hold:
+
+| Recreated | Stranded reference | Direction |
+|---|---|---|
+| `$MQTT_msgs` | every claim's `SourceSeq` and `ClaimHash` | **Loss.** A new message reuses sequence `s`; the surviving claim is terminal, so the mover takes the terminal arm and acknowledges the new source with nothing delivered. A surviving `claimed` claim instead stalls the group. `q2AffSourceGone` also reads the new incarnation's reused sequence as the old claim's source still being present, breaking the source-absence inference the reaper and recovery both depend on. |
+| `$MQTT_msgs` + `$MQTT_qos2assign` | retained copies, addressed by a hash derived from `s` | **Wrong payload.** The new claim's copy subject collides with a retained old copy; `materializeQ2AffCopy`'s create-only CAS is rejected, its re-read reports the copy PRESENT, the claim advances to `materialized`, the source is acknowledged, and the gate publishes the OLD payload under the new message's assignment. |
+| `$MQTT_qos2assign` | every copy's embedded claim subject | **Stall.** The delivery gate's `claim == nil` arm NAKs, fail-closed by design, so each orphaned copy NAK-loops forever holding a `MaxAckPending` slot. `$MQTT_inflight`'s `Q2AffClaim` is stranded identically. |
+| `$MQTT_out` | claims reading `materialized`; every affine consumer; `$MQTT_inflight`'s `Dur`/`Seq`; the session record's `Q2Aff.Durable` and `PubRel.Durable` | **Loss.** Accepted copies die; only an owner resume records `Lost` (F-064). A register's `Seq` then names a sequence the recreated stream will reuse, so recovery can interpret an unrelated new copy through a stale register. |
+| `$MQTT_inflight` | every drain's `Started[].RegSeq` in `$MQTT_sess` | **Destruction of another session's record.** `RegSeq` is an EXACT sequence and `deleteInflightRegisterConfirmed` deletes it with no subject or record identity check at all, so a surviving drain releasing its register after the recreation deletes whatever register now occupies that sequence — an unrelated session's. **What that costs the victim is deliberately NOT asserted**: an absent register on the next restart leaves the tracking maps empty and the redelivery takes a freshly allocated identifier, and a live same-process entry can still complete normally. The established defect is the unconditioned destruction; its downstream consequence belongs to that mechanism's owner. |
+| any subset excluding one of the four | the excluded stream's inbound references | as above, per row |
+| all four together | none | **No stale identity survives.** |
+
+**"Clean" here means no stale identity survives to be misapplied — it does not mean
+lossless, and an earlier draft of this table wrongly conflated the two.** A copy can be
+materialized on `$MQTT_out` and its `$MQTT_msgs` source acknowledged before the client
+finishes the exchange, so recreating `$MQTT_out` destroys an accepted message whose source
+is already gone and cannot be re-offered. That loss is inherent to recreating a stream that
+holds accepted data and is not what coupling fixes; a remedy that wants to avoid it needs
+draining or preservation in the procedure itself, which is a stronger requirement than
+this finding makes.
+
+### The remedy this repository already has, twice
+
+`$MQTT_teardown` and `$MQTT_willq` both solve this against `$MQTT_sess`, by two variants of
+one idea: stamp the referenced stream's incarnation, and refuse to interpret a reference
+whose epoch does not match. `$MQTT_teardown` puts the epoch in stream metadata with a
+validator and a paired stop-all message naming both streams as *"one logical unit"*
+(`stream_prereqs.go:481`, `:561`); `$MQTT_willq` carries it per record and compares the
+sequence only when the epochs are equal. Either shape works. What the affine path needs is
+that treatment extended to the four-stream unit above and carried into **every** artifact
+derived from a source sequence — the claim subject, the claim hash and hence the copy
+subject, the copy's `Nats-Msg-Id`, the claim's own `SourceSeq`, the sweep's derived-name
+validator, and `$MQTT_inflight`'s `Dur`/`Seq`/`Q2AffClaim`.
+
+### Scope, and the method gap this exposed
+
+The population table is derived over **every** persisted cross-stream identity in the tree,
+so it is checkable for completeness in a way a list of members is not. Its rows outside the
+affine path are **named, not audited here**: `$MQTT_inflight`'s own coupling is F-034's to
+answer, and the session record's `$MQTT_out` durable references belong to the findings that
+own those mechanisms. The drain `RegSeq` row is the exception and is retained here rather
+than routed away: it is the only identity in the table whose stale use is itself
+DESTRUCTIVE — an unconditioned delete of an absolute sequence that reaches another
+session's record — so it belongs with this finding's remedy even though the drain machinery
+is not F-033's. What the victim then suffers is left to that mechanism's owner; this finding
+asserts the destruction, not a downstream consequence it has not established. Naming them
+is the point
+— the class is now visible
+whole, so no later audit has to rediscover it one member at a time.
+
+**The method gap, stated plainly.** F-033's five route inventories enumerate writers and
+destroyers: they ask what the code does, never what an OPERATOR is instructed to do, and
+never which identities cross a stream boundary. That is why this class was invisible to
+the
+audit and had to be found by review. Any later per-stream audit should add both questions
+—
+"which `stopAll` procedures name this stream alone?" and "what does this stream's persisted
+state reference that another stream issues?" — as explicit inventories.

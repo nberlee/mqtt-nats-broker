@@ -18,6 +18,18 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
+**A scope lever, recorded rather than taken (2026-08-18).** Nine of this section's open
+items sit on the session-affine shared-subscription QoS 2 path: F-045, F-047, F-048, F-049,
+F-050, and F-063 through F-066 from F-033's audit. That is the largest single block of
+release-blocking work, and it belongs to one OPTIONAL MQTT 5 feature — declining shared
+subscriptions is protocol-legal, via reason code `0x9E` on CONNACK and SUBACK. Moving it out
+of first-alpha scope would retire that block in one decision instead of nine.
+**Not taken:** shared QoS 2 remains alpha scope and those nine remain blockers. Recorded
+here so the option is visible when the cost of the block is next weighed, and because
+F-034's audit is expected to behave like F-033's. Taking it would need a README change (the
+feature is promised there) and a `docs/CONFORMANCE.md` statement; it is a different axis
+from the multi-frontend HA decision, which stays as decided.
+
 The 35 closed findings are indexed in the [finding dossiers](findings/README.md).
 Of those, 31 are retained in the
 [resolved-findings archive](findings/resolved.md); F-027, F-029, F-030 and F-031 remain
@@ -83,8 +95,9 @@ enforce the header across elections
 No further lineage is to be added on the strength of the old premise without checking it
 against that inventory.
 The per-stream findings inherit the server contract and the canary, but each needs its own
-consequence audit. **F-033 and F-034 still owe theirs.** F-032's ran on 2026-08-17: no
-lineage was needed, and it produced F-062, which is now closed too.
+consequence audit. **F-034 still owes its.** F-032's ran on 2026-08-17: no lineage was
+needed, and it produced F-062, which is now closed too. F-033's ran on 2026-08-18, with
+the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
 
 - [x] Decide and document the first-alpha HA support level. Decided: multi-frontend
   HA stays in alpha scope. The README already promises it, the architecture is
@@ -386,8 +399,9 @@ lineage was needed, and it produced F-062, which is now closed too.
   same-base conditional terminal-regression and claimant-divergence residuals are
   retired for a conforming `$MQTT_willq`. Unconditional foreign writes introduced by
   post-start stream-configuration drift remain outside F-030. The per-stream findings
-  inherit the server contract and the canary, not a checkbox: **F-033 and F-034 have still
-  not been audited.** F-032's audit has run and closed, producing F-062, closed 2026-08-18.
+  inherit the server contract and the canary, not a checkbox: **F-034 has still not been
+  audited.** F-032's audit has run and closed, producing F-062, closed 2026-08-18; F-033's
+  has too, producing F-063, F-064, F-065 and F-066.
 - [x] **Audit the session write-lineage machinery for deletion, obligation by
   obligation.** Prescribed by F-030's evidence and deliberately NOT folded into it.
   **DELETED: the whole CREATE side.** All four sources a create drew a parent from — the
@@ -567,9 +581,85 @@ lineage was needed, and it produced F-062, which is now closed too.
   which `sess_teardown.go` had called out as unbounded. Scoped to that walk, and "per walk"
   is not "frozen at the first walk's watermark" — the dossier's mapping is authoritative.
   The unbounded `$MQTT_inflight` purge in that teardown is untouched and still owes F-034.
-- [ ] [F-033: Add write lineage to shared QoS 2 assignments](findings/ha-arbitration.md#f-033).
-  **Consequence audit.** Same shape as F-032; the consequence to bound is a contender
-  waiting on a `claimed` record whose owner never materialises.
+- [x] [F-033: Add write lineage to shared QoS 2 assignments](findings/ha-arbitration.md#f-033).
+  **Closed 2026-08-18 as an audit: no lineage was needed, and it produced three findings.**
+  Clauses (a) and (b) answer NO — every claim write goes through one CAS helper that always
+  emits `JSExpectedLastSubjSeq`, W1 is create-only, W2 CASes at a base read in the same
+  attempt, and D1 deletes an exact sequence. Seven of the ten transitions additionally
+  assert the winner's identity; three record owner-independent facts and rest on the CAS
+  alone. All ten
+  transition and twelve reap call sites are dispositioned individually in the dossier.
+  Clause (c) is inherited by citation from F-030 with no new depproof row; **R-purge is
+  not applicable and that is positive evidence** — `purgeStream` has exactly three
+  appearances in the tree and none on this stream.
+  **The yield was elsewhere, as in F-032**: the unconditioned operation is
+  `CONSUMER.DELETE` on the interest-retained `$MQTT_out`, which has no precondition field
+  at all. Eleven worked interleavings sorted onto three falsified premises of ours —
+  **F-063** (nothing binds evidence that a copy was RETAINED to the irreversible source
+  ack that follows it), **F-064** (a live generation reference leaves every claim of that
+  generation to an owner resume that may never come) and **F-065** (a claim reaped on a
+  copy-absence reading taken before its own `SourceAcked` transition). Three more sort
+  onto **F-036**: the contender's discard arm, and — corrected during review — the sweep's
+  by-name affine consumer delete, whose window a resuming session's ADOPTION reaches only
+  when that session is resident while its record is absent. The different-generation arm
+  is **settled**, and a lost sweep-delete response is a bounded delay that converges. The
+  four in-code "F-033, unaudited" markers across three sites now state the answer, and
+  three further sites that asserted something the audit falsified are corrected too.
+  Holistic review then found one more, filed as **F-066**: the claim key identifies one
+  source message only within one incarnation of `$MQTT_msgs`, and recreating that stream
+  is a procedure a startup refusal instructs.
+- [ ] [F-063: Prove a copy was retained before acknowledging its source](findings/ha-arbitration.md#f-063).
+  **Alpha blocker.** `$MQTT_out` is interest-retained, so a copy stored onto a subject no
+  consumer filters **succeeds and keeps nothing** — and the only re-read in
+  `materializeQ2AffCopy` is on the CAS-REJECTION path, so a store that SUCCEEDS is never
+  verified. The claim advances to `materialized` and the group source is then acknowledged,
+  which is irreversible. Three routes, one premise: the own-claim path never gathers the
+  evidence (`beginQ2AffOp` admits on a cached POINTER), the on-behalf path gathers it and
+  does not bind it to the store, and a consumer deleted between the materialized
+  observation and the ack leaves the same state. **Not F-064**: an owner-independent
+  reconciler cannot make consumer existence atomic with the store and the ack, so the
+  remedy that closes F-064's stall leaves this untouched. That difference in remedy is
+  what establishes the premises are distinct.
+- [ ] [F-064: Reconcile assignments independently of owner resume](findings/ha-arbitration.md#f-064).
+  **Alpha blocker.** `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen` alone, so a live
+  matching record makes the sweep skip **every** claim of that generation, and
+  `recoverQ2AffClaims` — the only writer of `Lost` — runs solely on the owner's own resume.
+  Two consequences share that one premise, so they are one finding: a shared group stalled
+  forever (no `MaxDeliver` on the group consumer, so the source is re-offered indefinitely
+  while holding a `MaxAckPending` slot);
+  and unbounded accumulation of settled records. Reachable through the out-of-band
+  destruction `docs/CONFORMANCE.md` already documents, and through F-036's adoption blind
+  spot.
+  **The premise is enforced at TWO gates** — the reference skip and
+  `discardAbsentWinnerClaim`'s generation-match deferral — and mutation showed that removing
+  either alone changes nothing, so a remedy must address both.
+- [ ] [F-065: Re-read copy absence after the reaper's own SourceAcked transition](findings/ha-arbitration.md#f-065).
+  **Alpha blocker.** `reapQ2AffClaim` reads the copy state, may then perform a `SourceAcked`
+  transition that is a full JetStream round trip with retries, and evaluates
+  `reapable(copyAbsent)` on the earlier reading. A concurrent on-behalf materializer storing
+  its copy during that window leaves source proven, claim absent and copy present — the
+  delivery gate NAKs it forever, which is exactly the state `reapable`'s own comment says
+  must never exist. `materializeQ2AffCopy`'s `Discarded` guard does not close it: that guard
+  reads the caller's already-loaded claim.
+- [ ] [F-066: Generalise cross-stream identity coupling](findings/ha-arbitration.md#f-066).
+  **Alpha blocker.** Falsified premise: *recreating one stream is a self-contained recovery
+  procedure*. Durable records persist identities other streams issue — sequences, consumer
+  durables, subjects — and `stopAll` names one stream at a time. The dossier carries a
+  population derived by sweeping every CARRIER such an identity travels in — JSON bodies,
+  `Nmqtt-*` headers, `Nats-Msg-Id` builders, subject builders, consumer-durable builders —
+  because two earlier attempts that enumerated streams, then struct tags, were both
+  incomplete. Of the fifteen cross-stream identities it finds, **thirteen are uncoupled**.
+  Exactly two couplings exist, `$MQTT_teardown` (stamped stream metadata) and `$MQTT_willq`
+  (`OriginSessEpoch` per record); both were built ad hoc against `$MQTT_sess` and the idea
+  was never generalised — not even to every reference to `$MQTT_sess`, since
+  `$MQTT_inflight`'s `ClaimSeq` is one and is uncoupled. The remedy is therefore a
+  generalisation, not a third bespoke coupling. On the affine path the logical unit is
+  **four** streams — `$MQTT_msgs`, `$MQTT_qos2assign`, `$MQTT_out`, `$MQTT_inflight` —
+  and recreating a proper subset loses accepted messages, delivers an **OLD payload** for
+  a
+  new message, or NAK-loops orphaned copies forever. Per-subject CAS cannot help; the
+  semantic identity is what fails (`feedback_cas_generation_identity`). Rows outside the
+  affine path are named, not audited here: `$MQTT_inflight`'s own coupling is F-034's.
 - [ ] [F-034: Add write lineage to outbound in-flight registers](findings/ha-arbitration.md#f-034).
   **Consequence audit.** Same shape as F-032; the consequences to bound are a freed
   identifier still in flight and a register whose deletion was proven.

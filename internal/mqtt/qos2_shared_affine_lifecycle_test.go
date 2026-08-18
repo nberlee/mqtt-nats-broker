@@ -16,7 +16,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -3107,4 +3109,774 @@ func testQ2AffLoadRecord(t *testing.T, sess *mqttSession) *mqttPersistedSession 
 		t.Fatalf("unmarshalling the settled record: %v", err)
 	}
 	return ps
+}
+
+// TestQ2AffEveryWriteCarriesItsExpectation pins the claim F-033's audit rests on:
+// EVERY write this protocol makes to $MQTT_qos2assign carries a per-subject
+// expectation, the election is create-only, and every later transition CASes at a
+// sequence that record actually held. The audit's clause (a)/(b) verdict is otherwise
+// four line numbers in a dossier, which nothing would notice going stale; this makes
+// it executable for this stream. Modelled on TestQoS2InEveryWriteCarriesItsExpectation.
+//
+// TWO oracles, because neither alone is sufficient and that is measured rather than
+// assumed:
+//
+//   - The RAW EMITTED BYTES, through the process-global pre-store hook, which receives
+//     the fully encoded message. This is the only oracle that can see a header the
+//     encoder failed to write: the instance seam below observes the expectSeq ARGUMENT,
+//     which is unchanged when storeQ2AffClaimCAS stops emitting it.
+//   - The CALL-SITE ARGUMENTS, through the instance seam, delegating to the real
+//     implementation so the flow stays real. This is the only oracle that can see a call
+//     site passing the wrong base, which the raw bytes cannot distinguish from a
+//     legitimate CAS at a nonzero sequence.
+//
+// The call-site oracle checks a CHAIN rather than a fixed value, and that is what makes
+// it survive a real CAS rejection: the source ack and the affine completion are written
+// by unordered paths, so a transition may legitimately retry and commit at whatever
+// sequence became current. The invariant that holds regardless is that a later
+// transition's base is a sequence this subject HAD ALREADY HELD WHEN THE CALL WAS MADE —
+// never zero, and never a sequence produced later. The snapshot is taken per invocation
+// for exactly that reason; validating against the final list would accept a base that did
+// not yet exist. It deliberately does NOT require the base to be the most recent one: an
+// older-but-real base is rejected by the server's own per-subject CAS, which is the
+// mechanism under test rather than something this oracle should duplicate.
+//
+// Deliberately NOT parallel: mqttTestStoreMsgHookV is process-global, and testHookGate
+// bounds a closure's lifetime rather than arbitrating two installers.
+func TestQ2AffEveryWriteCarriesItsExpectation(t *testing.T) {
+	b := testQ2AffSetup(t, "everywrite")
+
+	type rawStore struct {
+		subject string
+		expects int
+		// The expectation VALUE actually emitted on the wire. Counting the header is not
+		// enough: an encoder that always writes 0 emits exactly one header and passes a
+		// presence check, while turning every transition into a rejected create-only CAS.
+		value string
+	}
+	type argStore struct {
+		writer    string
+		subject   string
+		expectSeq uint64
+		// The sequences this subject had ACTUALLY HELD at the moment of this call.
+		// Snapshotted per invocation, never read from the final list: validating a
+		// call against sequences produced after it would accept a base that did not
+		// exist yet, which is the whole property this oracle exists to check.
+		heldThen []uint64
+		// What THIS invocation actually put on the wire, captured causally rather than
+		// by matching two independent lists in order. Ordering broke down under the
+		// unordered SourceAcked/AffineDone writers and their reaper: argument order and
+		// store order can differ, which produced both false failures and a false pass
+		// for a permuted encoder defect.
+		emitted   string
+		emitCount int
+		emitSeen  int
+	}
+
+	var mu sync.Mutex
+	var orphans []rawStore
+	var args []*argStore
+
+	// storeMu serializes this broker's claim stores so that at most one is in flight,
+	// which is what makes `cur` an unambiguous attribution target. The raw store fires
+	// synchronously inside the delegation below, so with the serialization it can only
+	// belong to the invocation currently holding storeMu. curMu is separate and narrow
+	// because the raw hook runs INSIDE the delegation and must not re-enter storeMu.
+	var storeMu sync.Mutex
+	var curMu sync.Mutex
+	var cur *argStore
+	// Every sequence each claim subject has actually held, in order.
+	held := map[string][]uint64{}
+
+	// The raw oracle. Registered gate-first so the restore stops new calls and the gate
+	// then waits out any already inside (see testHookGate).
+	gate := newTestHookGate(t)
+	restore := setMQTTTestStoreMsgHook(func(subject string, hdrLen int, msg []byte) error {
+		// Filter BEFORE the gate, never after. gate.enter() returns holding a mutex, so
+		// entering first would serialize every storeMsg in the process — including other
+		// tests' servers, which run concurrently with this one — on a single lock for the
+		// whole of this test.
+		if !strings.HasPrefix(subject, mqttQoS2AssignStreamSubjectPrefix) {
+			return nil
+		}
+		if !gate.enter() {
+			return nil
+		}
+		defer gate.leave()
+		n := mqttCountHeader(JSExpectedLastSubjSeq, msg[:hdrLen])
+		v := string(getHeader(JSExpectedLastSubjSeq, msg[:hdrLen]))
+		curMu.Lock()
+		if cur != nil && cur.subject == subject {
+			cur.emitted, cur.emitCount = v, n
+			cur.emitSeen++
+		} else {
+			// A store on our prefix that no claim-store invocation of ours is inside.
+			// Recorded rather than ignored: an unattributable emission means the
+			// pairing assumption is wrong, and the oracle must say so instead of
+			// silently checking fewer writes.
+			mu.Lock()
+			orphans = append(orphans, rawStore{subject: subject, expects: n, value: v})
+			mu.Unlock()
+		}
+		curMu.Unlock()
+		return nil
+	})
+	t.Cleanup(restore)
+
+	// The member has to exist before the account manager does, and the seam below lives on
+	// it. Connecting writes no claim — nothing has been delivered yet — so installing the
+	// seam here still precedes every write the exchange makes.
+	c, r := b.member(t, "everywriteA", 300)
+	defer c.Close()
+	b.bind(t, "everywriteA")
+
+	// The call-site oracle. One seam carries BOTH writers, because both the election and
+	// every transition are funnelled through as.storeQ2AffClaimCAS — which is itself the
+	// audit's central structural claim, so classifying them by anything other than "is
+	// this the first write to this subject" would assume what is under test.
+	b.asm.mu.Lock()
+	b.asm.testQ2AffClaimStore = func(subject string, expectSeq uint64, rec *mqttQ2AffClaim) (uint64, error) {
+		storeMu.Lock()
+		defer storeMu.Unlock()
+
+		mu.Lock()
+		writer := "W2-transition"
+		if len(held[subject]) == 0 {
+			writer = "W1-elect"
+		}
+		a := &argStore{writer: writer, subject: subject, expectSeq: expectSeq,
+			heldThen: append([]uint64(nil), held[subject]...)}
+		args = append(args, a)
+		mu.Unlock()
+
+		curMu.Lock()
+		cur = a
+		curMu.Unlock()
+		seq, err := b.asm.jsa.storeQ2AffClaimCAS(subject, expectSeq, rec)
+		curMu.Lock()
+		cur = nil
+		curMu.Unlock()
+
+		if err == nil {
+			mu.Lock()
+			held[subject] = append(held[subject], seq)
+			mu.Unlock()
+		}
+		return seq, err
+	}
+	b.asm.mu.Unlock()
+
+	// The oracles are evaluated in a DEFERRED block, and that is load-bearing rather than
+	// stylistic. A call site passing the wrong expectation breaks the exchange, so a flow
+	// assertion below fatals first and an inline check would never be reached — the test
+	// would still "fail", but for the flow rather than for the expectation, and a mutation
+	// killed that way discriminates nothing. Deferring means a wrong base is reported as
+	// the wrong base, by name.
+	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		// --- Oracle 1: every invocation emitted exactly one expectation header, carrying
+		// the value that call site asked for. Both halves matter and neither implies the
+		// other: counting alone passes an encoder that writes a CONSTANT, and the
+		// call-site oracle below cannot see the wire at all.
+		//
+		// Attribution is CAUSAL, not positional. Each raw store is recorded onto the
+		// invocation that was in flight when it fired, so a reordering between the
+		// unordered SourceAcked/AffineDone writers cannot pair an argument with another
+		// call's bytes. Cardinality is asserted in both directions.
+		if len(args) == 0 {
+			t.Error("no claim store was observed at all; the seam is not installed")
+		}
+		for _, a := range args {
+			switch {
+			case a.emitSeen == 0:
+				t.Errorf("%s to %q reached the CAS helper but emitted no store; the raw hook or its prefix filter is wrong",
+					a.writer, a.subject)
+			case a.emitSeen > 1:
+				t.Errorf("%s to %q emitted %d stores for one invocation; the pairing assumption is broken",
+					a.writer, a.subject, a.emitSeen)
+			}
+			if a.emitCount != 1 {
+				t.Errorf("%s to %q emitted %d %s headers, want exactly 1",
+					a.writer, a.subject, a.emitCount, JSExpectedLastSubjSeq)
+			}
+			if want := strconv.FormatUint(a.expectSeq, 10); a.emitSeen > 0 && a.emitted != want {
+				t.Errorf("%s to %q asked for expectation %s but emitted %q on the wire",
+					a.writer, a.subject, want, a.emitted)
+			}
+		}
+		// An emission on our own subjects that belonged to no invocation would mean a
+		// writer bypassing the CAS helper, which is precisely what the audit claims does
+		// not exist. Other tests' brokers use different group durables, so their stores
+		// never land on these subjects.
+		ours := map[string]bool{}
+		for _, a := range args {
+			ours[a.subject] = true
+		}
+		for _, o := range orphans {
+			if ours[o.subject] {
+				t.Errorf("a store to %q carried expectation %q but went through no claim-store call site; some writer bypasses storeQ2AffClaimCAS",
+					o.subject, o.value)
+			}
+		}
+
+		// --- Oracle 2: each writer was reached, with the base the audit claims. ---
+		seen := map[string]bool{}
+		for _, a := range args {
+			seen[a.writer] = true
+			switch a.writer {
+			case "W1-elect":
+				// Create-only. A nonzero expectation here means the election is conditioned
+				// on a base it read, which is a different protocol from the documented one —
+				// and one under which two members could both believe they elected.
+				if a.expectSeq != 0 {
+					t.Errorf("W1-elect to %q used expectation %d, want 0 (create-only)",
+						a.subject, a.expectSeq)
+				}
+			case "W2-transition":
+				// A transition must name a sequence this record actually held. Zero would
+				// make it a create — which, on a subject whose claim still exists, is the
+				// write that reopens a started delivery's ownership.
+				if a.expectSeq == 0 {
+					t.Errorf("W2-transition to %q used expectation 0, want the sequence it loaded",
+						a.subject)
+					continue
+				}
+				ok := false
+				for _, sq := range a.heldThen {
+					if sq == a.expectSeq {
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					t.Errorf("W2-transition to %q used expectation %d, which that subject had not held at the time of the call (held then: %v)",
+						a.subject, a.expectSeq, a.heldThen)
+				}
+			}
+		}
+		for _, w := range []string{"W1-elect", "W2-transition"} {
+			if !seen[w] {
+				t.Errorf("%s was never reached; the inventory claims both writers and this run exercised %v",
+					w, seen)
+			}
+		}
+	}()
+
+	// A real shared QoS 2 exchange: the election (W1), the materialized transition, the
+	// source ack and the affine completion (all W2), then the reap.
+	b.publish(t, 1, "everywrite")
+
+	_, pi := testMQTTReadPublishV5(t, r, b.topic, []byte("everywrite"))
+	b.completeExchange(t, c, r, pi)
+}
+
+
+// affDurableFor is the affine consumer durable for one incarnation, which
+// mqttQ2AffineNames returns as its third value.
+func affDurableFor(idHash, gen string) string {
+	_, _, durable := mqttQ2AffineNames(idHash, gen)
+	return durable
+}
+
+// --------------------------------------------------------------------------
+// Fixtures for the three defects F-033's consequence audit found. Each pins the
+// DEFECTIVE behaviour, so each one's discriminating mutation is the candidate
+// remedy: apply the remedy named in the comment and the fixture must fail. That
+// is the inverse of the usual direction and it is deliberate — a finding's
+// fixture exists so the defect cannot be fixed silently or reintroduced quietly.
+// --------------------------------------------------------------------------
+
+// TestQ2AffReapUsesAStaleCopyReading pins F-065.
+//
+// reapQ2AffClaim reads the copy state, then may perform a SourceAcked transition
+// that is a full JetStream round trip, then evaluates reapable() on the EARLIER
+// reading. A copy stored during that round trip is invisible to it, so the claim
+// is deleted out from under a copy that exists.
+//
+// The interleaving is staged through testQ2AffClaimStore, which intercepts exactly
+// the transition whose duration is the window. That is the real window, not a
+// simulation of one: the hook runs where the CAS runs.
+//
+// Leftover asserted: source proven, claim absent, copy PRESENT — the state
+// reapable's own comment says must never exist, because the delivery gate takes its
+// claim == nil branch and NAKs that copy forever.
+//
+// Discriminating mutation: make reapQ2AffClaim re-read the copy state after the
+// SourceAcked advance and pass THAT to reapable. The reap then declines, the claim
+// survives, and this fixture fails at "the claim was reaped".
+func TestQ2AffReapUsesAStaleCopyReading(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "stalecopy")
+	c, _ := b.member(t, "stalecopyA", 300)
+	b.bind(t, "stalecopyA")
+
+	groupDur := b.groupDurable(t)
+	idHash := getHash("stalecopyA")
+	// The member's REAL affine generation, not a synthetic one. $MQTT_out is
+	// interest-retained, so a copy stored on a subject no live consumer filters is
+	// kept by nothing — the fixture would then assert on a copy that never existed
+	// and would prove F-063's mechanism instead of F-065's.
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("the member has no affine generation, so no consumer would retain the racing copy")
+	}
+	// A source sequence that is authoritatively GONE, so the reaper performs the
+	// SourceAcked advance itself (q2AffSourceUnofferable) — that advance is the window
+	// under test, so the fixture must actually enter it.
+	const goneSeq = uint64(999999)
+	subject := mqttQ2AffClaimSubject(groupDur, goneSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, goneSeq)
+	copySubject := mqttQ2AffCopySubject(idHash, gen, claimHash)
+
+	claim := &mqttQ2AffClaim{
+		Winner:       idHash,
+		Gen:          gen,
+		GroupDurable: groupDur,
+		SourceSeq:    goneSeq,
+		ClaimHash:    claimHash,
+		CopySubject:  copySubject,
+		AffDurable:   affDurableFor(idHash, gen),
+		Phase:        mqttQ2AffMaterialized,
+		Discarded:    true, // terminal on the discard axis, so only the copy side gates the reap
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, claim); err != nil {
+		t.Fatalf("seeding the claim: %v", err)
+	}
+	if st, _ := b.asm.loadQ2AffCopy(copySubject); st != mqttQ2AffCopyAbsent {
+		t.Fatalf("the copy must start absent for this window to be the one under test, got %v", st)
+	}
+
+	// The client leaves, keeping its session and its affine consumer. Without this the
+	// live delivery subscription consumes the racing copy the instant it lands — the
+	// gate finds the claim still present and Discarded, disposes of it, and the fixture
+	// would observe an absent copy for a reason that has nothing to do with F-065.
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	// Interpose the concurrent materializer INSIDE the SourceAcked transition.
+	var stored atomic.Bool
+	b.asm.mu.Lock()
+	b.asm.testQ2AffClaimStore = func(s string, expectSeq uint64, rec *mqttQ2AffClaim) (uint64, error) {
+		if s == subject && rec.SourceAcked && stored.CompareAndSwap(false, true) {
+			env := &mqttQ2AffineEnvelope{
+				natsSubject:  b.topic,
+				msg:          []byte("stranded"),
+				claimSubject: subject,
+				gen:          gen,
+				msgID:        mqttQ2AffMsgId(groupDur, goneSeq),
+			}
+			msg, hdrLen := mqttNewQ2AffineRecord(env)
+			if _, err := b.asm.jsa.storeMsg(copySubject, hdrLen, msg); err != nil {
+				t.Errorf("storing the racing copy: %v", err)
+			}
+		}
+		return b.asm.jsa.storeQ2AffClaimCAS(s, expectSeq, rec)
+	}
+	b.asm.mu.Unlock()
+
+	b.asm.reapQ2AffClaim(b.s, subject)
+
+	if !stored.Load() {
+		t.Fatal("the racing copy was never stored; the reaper did not enter its SourceAcked transition, so this run did not exercise the window")
+	}
+	gotClaim, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil {
+		t.Fatalf("loading the claim: %v", err)
+	}
+	st, _ := b.asm.loadQ2AffCopy(copySubject)
+	if st != mqttQ2AffCopyPresent {
+		t.Fatalf("the racing copy is not on the stream (%v); the interleaving did not complete", st)
+	}
+	if gotClaim != nil {
+		// Deliberately a FAILURE and not a skip. This fixture pins a defect, so the remedy
+		// landing is exactly when someone must come back and replace it with a regression
+		// test for the fix — a silent skip would let the pin rot into a no-op.
+		t.Fatal("the reap declined, so F-065 is fixed: replace this defect fixture with a regression test asserting the claim survives a copy stored during the SourceAcked transition")
+	}
+	// F-065, pinned: the claim is gone and its copy is not.
+	t.Log("F-065 reproduced: claim reaped at a stale copy reading, leaving a copy the delivery gate can only NAK")
+}
+
+// TestQ2AffResumeAdoptsConsumerKeepingItsCreated pins the mechanism behind F-036's third
+// manifestation, the "adoption blind spot".
+//
+// The orphan sweep's step (5) re-verifies that the consumer it is about to delete is still
+// the INSTANCE quarantine observed, by comparing ConsumerInfo.Created. That discriminates a
+// delete-and-recreate, which is what the grace exists to protect. It does NOT discriminate a
+// session that RESUMES onto the consumer it finds: a resume preserves the incarnation
+// generation, derives the same durable name, and affine provisioning is a create-or-UPDATE,
+// so no new instance is created and Created is unchanged.
+//
+// This is MECHANISM EVIDENCE, not a defect pin, and the distinction matters. Reaching the
+// sweep's step-(4)-to-step-(6) window additionally requires a session resident with that
+// generation while its record is absent — F-036's premise, and not something this fixture
+// stages. The full interleaving belongs to F-036's fix, along with the seam it would need;
+// there is none between those steps today. What this fixture owns is the half a fixer is
+// most likely to get wrong: it proves the instance fingerprint is not the defense it reads
+// as, so a fix that leans on it will still delete a live adopted consumer.
+//
+// It asserts a property of ordinary provisioning, so it is not paired with a remedy
+// mutation: arbitrating the consumer delete — the actual fix — would leave Created
+// unchanged and this test passing, correctly. The mutation it does discriminate is a
+// provisioning change to delete-and-recreate on resume, which would silently destroy
+// retained copies on every reconnect.
+func TestQ2AffResumeAdoptsConsumerKeepingItsCreated(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "adopt")
+	c, _ := b.member(t, "adoptA", 300)
+	b.bind(t, "adoptA")
+
+	idHash := getHash("adoptA")
+	durables := b.affineConsumers(t, idHash)
+	if len(durables) != 1 {
+		t.Fatalf("expected exactly one affine consumer for the member, got %v", durables)
+	}
+	durable := durables[0]
+
+	before, err := b.asm.jsa.lookupConsumer(mqttOutStreamName, durable)
+	if err != nil || before == nil {
+		t.Fatalf("looking up the affine consumer: ci=%v err=%v", before, err)
+	}
+	created := before.Created
+
+	// Leave and come back on the same session. This is the resume the sweep's window
+	// admits, and the generation it comes back on is the one the sweep condemned.
+	// Rejoining the group, not a bare reconnect: affine provisioning runs from the
+	// shared-subscription path, so a resume that never re-subscribes would leave the
+	// consumer untouched and this fixture would assert an unchanged Created for a reason
+	// that has nothing to do with adoption.
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+	c2, _ := b.member(t, "adoptA", 300)
+	defer c2.Close()
+
+	after, err := b.asm.jsa.lookupConsumer(mqttOutStreamName, durable)
+	if err != nil || after == nil {
+		t.Fatalf("the resumed session has no affine consumer %q: ci=%v err=%v", durable, after, err)
+	}
+	if !after.Created.Equal(created) {
+		t.Fatalf("F-036's adoption blind spot no longer holds: the resume changed ConsumerInfo.Created from %v to %v, so the sweep's step-(5) fingerprint WOULD discriminate an adoption",
+			created, after.Created)
+	}
+	// Pinned: a live resumed session carrying an instance fingerprint the sweep cannot
+	// tell from the one it condemned.
+	t.Log("F-036 adoption blind spot reproduced: an adopting resume leaves ConsumerInfo.Created unchanged, so step (5) cannot discriminate it")
+}
+
+// TestQ2AffLiveRecordLeavesAStrandedClaimToOwnerResume pins F-064.
+//
+// buildSessionRefs keys refs.affine on ps.Q2AffGen alone, so a live matching record
+// makes the sweep skip EVERY claim of that generation — reconciliation, the discard,
+// and the consumer pass alike. recoverQ2AffClaims, the only writer of Lost, runs on the
+// owner's own resume. So a nonterminal claim whose affine consumer is gone, under a
+// session that never comes back, is reconciled by nothing at all: contenders keep
+// failing the consumer lookup and the group's source keeps being re-offered, because
+// no MaxDeliver bounds it.
+//
+// Discriminating mutation: give the sweep an owner-independent reconciler for claims
+// under a live reference (the remedy). The claim then resolves and this fixture fails
+// at "the claim was left untouched".
+func TestQ2AffLiveRecordLeavesAStrandedClaimToOwnerResume(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "stranded")
+	c, _ := b.member(t, "strandedA", 0xFFFFFFFF) // never expires: "unbounded" is STAGED, not inferred
+	defer c.Close()
+	b.bind(t, "strandedA")
+
+	idHash := getHash("strandedA")
+	rec := testQ2AffAwaitStableRecord(t, b, idHash)
+	if rec.Q2AffGen == _EMPTY_ {
+		t.Fatal("the member has no affine generation, so there is no live reference to test")
+	}
+	gen := rec.Q2AffGen
+
+	// The affine consumer destroyed out of band — the route docs/CONFORMANCE.md already
+	// documents, and the one F-036's adoption blind spot also produces.
+	durable := affDurableFor(idHash, gen)
+	if _, err := b.asm.jsa.deleteConsumer(mqttOutStreamName, durable, false); err != nil {
+		t.Fatalf("deleting the affine consumer out of band: %v", err)
+	}
+
+	// A nonterminal claim on a source that genuinely still exists, so "the group can
+	// still re-offer it" is a property of the stream rather than of the fixture.
+	groupDur := b.groupDurable(t)
+	sourceSeq := testQ2AffLiveSourceSeq(t, b, "stranded/keep")
+	subject := mqttQ2AffClaimSubject(groupDur, sourceSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, sourceSeq)
+	claim := &mqttQ2AffClaim{
+		Winner:       idHash,
+		Gen:          gen,
+		GroupDurable: groupDur,
+		SourceSeq:    sourceSeq,
+		ClaimHash:    claimHash,
+		CopySubject:  mqttQ2AffCopySubject(idHash, gen, claimHash),
+		AffDurable:   durable,
+		Phase:        mqttQ2AffClaimed,
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, claim); err != nil {
+		t.Fatalf("seeding the stranded claim: %v", err)
+	}
+
+	// Neutralise the quarantine grace, and sweep TWICE. Both are load-bearing:
+	// observedOrphanFor RECORDS an observation on its first call and only reports the
+	// resource settled on a later one, so a single pass at the default grace would leave
+	// this claim untouched for a reason that has nothing to do with F-064 — the fixture
+	// would pass against a fully reconciling sweep and prove nothing.
+	zero := time.Duration(0)
+	b.asm.mu.Lock()
+	b.asm.testOrphanGrace = &zero
+	b.asm.mu.Unlock()
+	t.Cleanup(func() {
+		b.asm.mu.Lock()
+		b.asm.testOrphanGrace = nil
+		b.asm.mu.Unlock()
+	})
+	b.asm.sweepOrphanedQoS2State(b.s)
+	b.asm.sweepOrphanedQoS2State(b.s)
+
+	got, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil {
+		t.Fatalf("loading the claim after the sweep: %v", err)
+	}
+	if got == nil {
+		t.Fatal("the sweep reaped a nonterminal claim; that would be a different (and worse) defect than F-064")
+	}
+	if got.Discarded || got.Lost || got.AffineDone {
+		// A failure, not a skip, for the same reason as F-065's fixture above.
+		t.Fatalf("the sweep resolved the stranded claim (Discarded=%v Lost=%v AffineDone=%v), so F-064 is fixed: replace this defect fixture with a regression test for the owner-independent reconciler",
+			got.Discarded, got.Lost, got.AffineDone)
+	}
+	if got.Phase != mqttQ2AffClaimed {
+		t.Fatalf("the claim's phase moved to %v without a terminal fact", got.Phase)
+	}
+	// F-064, pinned: a full sweep pass, and the claim is exactly as it was.
+	t.Log("F-064 reproduced: a live generation reference left a nonterminal claim, whose consumer is gone, entirely untouched by the sweep")
+}
+
+// TestQ2AffSourceAckedAfterAStoreThatKeptNothing pins F-063.
+//
+// $MQTT_out is interest-retained, so a copy stored onto a subject no consumer filters
+// SUCCEEDS AND KEEPS NOTHING. The own-claim path never learns that: beginQ2AffOp admits the
+// move on local state alone (a readiness flag, a generation and a consumer POINTER), and
+// materializeQ2AffCopy re-reads only when the create-only CAS is REJECTED — a store that
+// succeeds is never verified. The claim advances to materialized and the source is then
+// acknowledged, which is irreversible and releases the message from the shared group.
+//
+// Staged with no seam at all, because none is needed: deleting the affine consumer out of
+// band leaves the live session's cached pointer intact, which is precisely the state the
+// admission gate cannot see. Everything after that is the ordinary production path.
+//
+// Leftover asserted: materialized + SourceAcked, copy AUTHORITATIVELY absent, and the group
+// source gone — an accepted QoS 2 message that no redelivery can recover and that only a
+// later owner resume would even record as Lost.
+//
+// Discriminating mutation: verify retention after the store and refuse to advance when it
+// cannot be proven. The claim then never reaches materialized, the source is never acked,
+// and this fixture fails.
+//
+// **That mutation closes THIS ROUTE, not the finding.** A post-store check still leaves a
+// consumer deleted between the check and confirmSourceAckAndRecord, and the
+// already-materialized contender route acknowledges the source at qos2_shared_affine.go
+// without any such check at all. So this fixture going green again is evidence about the
+// own-claim path only; F-063's premise is finding-wide and needs the on-behalf TOCTOU and
+// the materialized-observation route covered too, each with its own staging. The failure
+// message below says exactly that, deliberately, so a partial remedy cannot read as a
+// closed finding.
+func TestQ2AffSourceAckedAfterAStoreThatKeptNothing(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "keptnothing")
+	c, _ := b.member(t, "keptnothingA", 300)
+	defer c.Close()
+	b.bind(t, "keptnothingA")
+
+	idHash := getHash("keptnothingA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("the member has no affine generation, so there is no consumer to remove")
+	}
+
+	// The consumer goes; the session's cached pointer stays. beginQ2AffOp still admits.
+	if _, err := b.asm.jsa.deleteConsumer(mqttOutStreamName, affDurableFor(idHash, gen), false); err != nil {
+		t.Fatalf("deleting the affine consumer out of band: %v", err)
+	}
+
+	// An ordinary QoS 2 publish to the shared group. The member's own move elects a claim,
+	// stores the copy onto nothing, and acknowledges the source.
+	b.publish(t, 1, "keptnothing")
+
+	deadline := time.Now().Add(10 * time.Second)
+	var claim *mqttQ2AffClaim
+	var subject string
+	for time.Now().Before(deadline) {
+		for sub, cl := range b.claims(t) {
+			if cl.ownedBy(idHash, gen) {
+				claim, subject = cl, sub
+				break
+			}
+		}
+		if claim != nil && claim.SourceAcked && claim.Phase == mqttQ2AffMaterialized {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if claim == nil {
+		t.Fatal("no assignment claim was elected for the member; the move never ran, so this run did not exercise the path")
+	}
+	if claim.Phase != mqttQ2AffMaterialized {
+		t.Fatalf("claim on %q is %v, want materialized: the copy store did not report success",
+			subject, claim.Phase)
+	}
+	if !claim.SourceAcked {
+		// A remedy landing on the own-claim path reaches exactly this branch. Do NOT read
+		// it as F-063 closed: the on-behalf TOCTOU and the materialized-observation route
+		// are not staged here and are not covered by a post-store check.
+		t.Fatalf("claim on %q was NOT source-acked, so the OWN-CLAIM route of F-063 is closed: re-point this fixture at a regression test for that route, and confirm the on-behalf TOCTOU and the materialized-observation route separately before closing the finding",
+			subject)
+	}
+	// The copy has to be AUTHORITATIVELY absent, not merely unreadable, or the assertion
+	// would rest on a failed lookup rather than on interest retention having kept nothing.
+	if st, _ := b.asm.loadQ2AffCopy(claim.CopySubject); st != mqttQ2AffCopyAbsent {
+		t.Fatalf("the copy on %q reads %v, want absent: the store kept something after all",
+			claim.CopySubject, st)
+	}
+	if claim.AffineDone || claim.Lost || claim.Discarded {
+		t.Fatalf("claim on %q carries a terminal fact (AffineDone=%v Lost=%v Discarded=%v); nothing delivered or disposed of this message",
+			subject, claim.AffineDone, claim.Lost, claim.Discarded)
+	}
+	// F-063, pinned: the group source was released on the strength of a store that
+	// retained nothing, and the message is gone with no record that it was lost.
+	t.Log("F-063 reproduced: materialized + SourceAcked with no copy — an accepted QoS 2 message released from the group and lost")
+}
+
+// TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage pins F-066's flagship row.
+//
+// A claim is keyed `(group durable, source sequence)`. That identifies one source message
+// only within one incarnation of $MQTT_msgs — and when that stream fails shape validation,
+// startup instructs the operator to stop all brokers and recreate IT ALONE
+// (stream_prereqs.go, stopAll), leaving $MQTT_qos2assign's claims behind with their
+// sequence counter reset underneath them.
+//
+// The fixture stages the STATE that procedure produces rather than the procedure: a
+// terminal claim already occupying the subject the very next published message will
+// compute. That is exactly what a survivor of a recreation looks like, and staging it
+// directly keeps the test to one broker with no stream surgery — the half this fixture
+// proves is "a stale claim on a reused sequence eats the message", not "a recreation
+// produces stale claims", which is the operator procedure and is argued in the dossier.
+//
+// Asserted: the client receives NOTHING. The mover takes its terminal arm, acknowledges
+// the group source because the stale claim says the ack was already proven, and the
+// accepted message is released from the shared group with no copy and no delivery.
+//
+// Discriminating mutation: carry the $MQTT_msgs incarnation into the claim subject (the
+// remedy). The new message then computes a different subject, does not collide with the
+// stale claim, and is delivered — so this fixture fails at "a PUBLISH arrived".
+func TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "reused")
+	c, r := b.member(t, "reusedA", 300)
+	defer c.Close()
+	b.bind(t, "reusedA")
+
+	// The sequence the next PUBLISH will occupy on $MQTT_msgs. Read from the stream
+	// rather than assumed: a fabricated number would make the collision an artifact of
+	// the fixture instead of the real key the mover computes.
+	si, err := b.asm.jsa.lookupStream(mqttStreamName)
+	if err != nil || si == nil {
+		t.Fatalf("looking up %s: si=%v err=%v", mqttStreamName, si, err)
+	}
+	nextSeq := si.State.LastSeq + 1
+
+	groupDur := b.groupDurable(t)
+	// Constructed LITERALLY, not through mqttQ2AffClaimSubject, and that is what makes
+	// the mutation below discriminate. A claim that survived a recreation was written by
+	// the code as it stands today, so the fixture must pin today's subject SHAPE. Building
+	// it through the helper would move the seeded claim in lockstep with any remedy that
+	// changes the key, the collision would persist, and the fixture would pass against the
+	// fix — which is exactly what the first version of this test did.
+	subject := mqttQoS2AssignStreamSubjectPrefix + groupDur + "." + strconv.FormatUint(nextSeq, 10)
+	claimHash := mqttQ2AffClaimHash(groupDur, nextSeq)
+
+	// A claim left over from the previous incarnation: terminal, and its source ack
+	// already proven — the ordinary resting state of a claim awaiting only a reap.
+	stale := &mqttQ2AffClaim{
+		Winner:       getHash("someone-else"),
+		Gen:          mqttNewQ2AffGen(),
+		GroupDurable: groupDur,
+		SourceSeq:    nextSeq,
+		ClaimHash:    claimHash,
+		CopySubject:  mqttQ2AffCopySubject(getHash("someone-else"), mqttNewQ2AffGen(), claimHash),
+		AffDurable:   "$MQTT_Q2AFF_stalefromlastincarnation",
+		Phase:        mqttQ2AffMaterialized,
+		Discarded:    true,
+		// SourceAcked is seeded FALSE deliberately, and it is what makes the reap below
+		// evidence rather than a tautology. With it true the mover's terminal arm takes
+		// the fire-and-forget sendAck shortcut and the later reap would merely re-observe
+		// the bit this fixture wrote — proving nothing about the NEW source. False forces
+		// the arm through confirmSourceAckAndRecord, which confirms the reused sequence's
+		// ack with JetStream and only then records it, so a claim that subsequently
+		// vanishes can only have been reaped on a SourceAcked that that confirmation
+		// wrote. It is also the faithful resting state: a discarded claim whose group ack
+		// was never proven is exactly what must survive until some contender proves it.
+		SourceAcked: false,
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, stale); err != nil {
+		t.Fatalf("seeding the stale claim: %v", err)
+	}
+
+	b.publish(t, 1, "reused")
+
+	// The publish must have taken EXACTLY the predicted sequence, or the collision this
+	// fixture is about never happened and a silent client proves nothing. Checked as
+	// equality, not >=: a later sequence means some other activity intervened.
+	if got := b.lastSourceSeq(t); got != nextSeq {
+		t.Skipf("the publish landed at %d, not the predicted %d; concurrent stream activity, not a result", got, nextSeq)
+	}
+
+	if _, _, ready := testMQTTReadPacketReady(r, 2*time.Second); ready {
+		// The remedy landing reaches exactly this branch.
+		t.Fatal("a PUBLISH arrived, so the stale claim did not capture the reused sequence: F-066's flagship row is closed — replace this defect fixture with a regression test for the incarnation-scoped key")
+	}
+
+	// Silence alone would not prove the message was RELEASED — a stall, a deferral or any
+	// other delivery failure looks identical on the wire. The positive evidence is that the
+	// stale claim has been REAPED. reapQ2AffClaim deletes only a claim whose source ack is
+	// PROVEN, the claim was seeded with that proof ABSENT, and the only thing that can
+	// supply it on this route is the terminal arm's confirmSourceAckAndRecord against the
+	// newly reused sequence. A vanished claim is therefore positive evidence that THIS
+	// message's group delivery was irreversibly acknowledged and the accepted message is
+	// gone — not merely that nothing has been delivered yet, which a stall would also
+	// produce.
+	//
+	// A generous deadline, deliberately: the poll exits the instant the reap is observed,
+	// so a large bound costs a passing run nothing. The group-delivery callback driving the
+	// mover is asynchronous and under a loaded full-suite run can be scheduled well after
+	// the silence check above; a tight bound would turn that scheduling delay into a
+	// spurious failure of an assertion about arbitration.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		cl, _, lerr := b.asm.loadQ2AffClaim(subject)
+		if lerr != nil {
+			t.Fatalf("loading the stale claim: %v", lerr)
+		}
+		if cl == nil {
+			// F-066, pinned: source released, nothing delivered, claim reaped.
+			t.Log("F-066 reproduced: a stale terminal claim on a reused source sequence swallowed an accepted message")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the stale claim was never reaped, so the mover did not take its terminal arm: this run did not exercise the acknowledge-and-walk-away path the row asserts")
+}
+
+// lastSourceSeq is $MQTT_msgs' current last sequence, so a fixture can assert that a
+// publish landed exactly where it predicted rather than merely at or beyond it.
+func (b *testQ2AffBroker) lastSourceSeq(t *testing.T) uint64 {
+	t.Helper()
+	si, err := b.asm.jsa.lookupStream(mqttStreamName)
+	if err != nil || si == nil {
+		t.Fatalf("looking up %s: si=%v err=%v", mqttStreamName, si, err)
+	}
+	return si.State.LastSeq
 }

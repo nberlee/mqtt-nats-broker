@@ -142,7 +142,13 @@ the "no fallbacks" stance reviewable rather than implicit.
   every write there carries its expectation, so it needed no lineage — and what it did
   find was a hold purge carrying no condition at all, which is F-062 (closed: the purge
   now carries one, see the next bullet) and F-036 rather than anything this contract
-  speaks to. `$MQTT_qos2assign` (F-033) and `$MQTT_inflight` (F-034) still owe theirs.
+  speaks to. `$MQTT_qos2assign`'s ran too (F-033, closed): every claim write is funnelled
+  through one CAS helper that always emits its expectation, so it needed no lineage
+  either — and what it found instead was a source acknowledgement bound to a copy store
+  that never proved retention, a reference skip that leaves claims to owner resume, and a
+  reap on a stale copy reading, and a claim key that outlives the `$MQTT_msgs`
+  incarnation it indexes — F-063, F-064, F-065 and F-066 rather than anything this
+  contract speaks to. `$MQTT_inflight` (F-034) still owes its audit.
   A rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
@@ -2097,7 +2103,7 @@ Two durable pieces:
 
 | what | where | written by |
 |---|---|---|
-| assignment claim, one per `(group durable, source sequence)` | `$MQTT_qos2assign`, `$MQTT.qos2.assign.<group-durable>.<seq>` | a **create-only** CAS elects the winner; every later transition is a CAS at the record's exact sequence |
+| assignment claim, one per `(group durable, source sequence)` | `$MQTT_qos2assign`, `$MQTT.qos2.assign.<group-durable>.<seq>` | a **create-only** CAS elects the winner; every later transition is a CAS at the record's exact sequence. Seven of the ten transitions also assert the winner's identity; the three that do not record owner-independent facts (`SourceAcked`, `AffineDone`) and rest on the per-subject CAS alone |
 | affine copy of the message | `$MQTT_out`, `$MQTT.out.q2.<client-id-hash>.<generation>.<claim-hash>` | a **create-only** CAS, so exactly one of several legitimate materializers wins |
 
 The claim is the arbitration record and it is honored **indefinitely** — not for
@@ -2294,6 +2300,63 @@ broker serving the same shared group without consulting the claims would redistr
 a started delivery another broker had claimed, and there is no runtime capability gate
 that would stop it. See `docs/CONFORMANCE.md` for this and for the packet-identifier
 residual.
+
+### What the write audit established, and the gaps it found
+
+*`docs/findings/ha-arbitration.md` F-033, F-063, F-064, F-065 and F-066 are
+authoritative for these mechanisms, arms, directions and remedies. This section
+summarises and references them, as the compatibility boundary's precedent prescribes; it
+is not a second authority.*
+
+F-033 audited every mutation this protocol makes against `test/depproof/`'s route
+inventory. **Every claim write carries its per-subject expectation**, because they are all
+funnelled through one CAS helper that emits `JSExpectedLastSubjSeq` unconditionally: the
+election is create-only (expectation `0`), every later transition CASes at the sequence its
+own attempt loaded, and the reap deletes an exact sequence. Seven of the ten transitions
+additionally assert the winner's identity; the three that do not record owner-independent
+facts (`SourceAcked`, `AffineDone`) and rest on the per-subject CAS alone. The server-side
+contract for those writes is **inherited from F-030 rather than
+re-proved here**, per "Trusting the backend"; no lineage is carried on this stream and none
+is needed, because a create has no base to descend from and a transition that CASes at a
+base it read already answers "is this record still mine?" more strongly than a parent
+pointer would. Nothing purges this stream, and the startup validators refuse every
+configuration that would evict a claim with no writer at all.
+
+**The gaps are on the other side of the protocol — the copies, not the claims.** The one
+operation that carries no condition is `CONSUMER.DELETE` on `$MQTT_out`: the API has no
+precondition field, so it removes whatever consumer holds that name when it applies, and
+because the stream is interest-retained that destroys every copy the consumer still held.
+Three defects follow, each resting on a premise of its own:
+
+- **F-063** — nothing binds evidence that a copy was RETAINED to the irreversible source
+  acknowledgement that follows it. A store onto a deleted consumer succeeds and keeps
+  nothing, and the only re-read is on the CAS-rejection path, so the claim reaches
+  `materialized` and the group source is released for a message that no longer exists.
+- **F-064** — a live generation reference makes the sweep skip every claim of that
+  generation, leaving them to an owner resume that may never happen. This is why the `Lost`
+  narrative in `docs/CONFORMANCE.md` holds only for a session that comes back.
+- **F-065** — the reaper evaluates its two-sided predicate on a copy-absence reading taken
+  before its own `SourceAcked` transition, so a copy stored during that round trip is
+  invisible to it.
+- **F-066** — a `stopAll`-instructed recreation of ONE stream is treated as a
+  self-contained procedure, but durable records persist identities other streams issue. A
+  population derived by sweeping every CARRIER such an identity travels in — bodies,
+  `Nmqtt-*` headers, `Nats-Msg-Id` builders, subject and durable builders — finds fifteen
+  such identities, of which **thirteen are uncoupled**. The two that are, `$MQTT_teardown`
+  and `$MQTT_willq`, were built ad hoc against `$MQTT_sess` and never generalised. On this
+  path the logical unit is those four
+  streams; recreating a proper subset loses accepted messages, delivers an OLD payload for
+  a new message, or NAK-loops orphaned copies forever.
+
+Two consequences on this path are **F-036's** rather than ours. The contender's discard arm
+firing on an absent winner record rests on F-036's own falsified premise; the
+different-generation reading is settled on the clean-start route, where teardown marks every
+assignment of the retiring generation `Discarded` before deleting its consumer. And the
+orphan sweep's affine consumer delete — by name, past a `Created` fingerprint that a
+resuming session's ADOPTION leaves unchanged — reaches its window only when a session is
+resident with that generation while its record is absent, which is F-036's premise exactly.
+It is recorded there as a third manifestation, with the warning that the fingerprint is not
+the defense it reads as.
 
 ## UNSUBSCRIBE drain
 
@@ -3398,7 +3461,15 @@ covering the create-before-save window on this broker. What the walk plus this b
 residents cannot observe is a session live on **another** broker whose record is absent —
 a resume preserves the generation, so such a session still uses these names. That is
 **F-036**'s open false-absence inference; the per-resource-class consequences belong to
-F-033, F-034 and F-036 rather than to this section. The same bound is stated once for
+F-034 and F-036 rather than to this section. (`$MQTT_qos2assign`'s class was F-033, whose
+audit closed on 2026-08-18. What it found in this pass is one defect of ours — a live
+generation reference makes this pass skip every claim of that generation, leaving them to
+an
+owner resume that may never come, which is F-064 — plus one addition to F-036 itself: the
+affine consumer delete is BY NAME and a resuming session ADOPTS the consumer it finds, so
+the instance fingerprint is unchanged and does not discriminate it. That window is reached
+only under this section's own bound, so it is F-036 population.) The same
+bound is stated once for
 the code, in `internal/mqtt/orphan_qos2_sweep.go`'s header. Ownership is the
 `(client-ID hash, generation)` pair carried in the subject or durable name, never
 the hash alone. An incomplete walk, an undecodable record, a client ID that does

@@ -217,6 +217,24 @@ consumer disappear — and each affected assignment is marked `Lost`: a terminal
 state that is deliberately **not** reapable, so the record survives for an
 operator to find instead of being written off as a completed delivery.
 
+**Corrected by F-033's audit (2026-08-18): the marking is not automatic.** `Lost` has
+exactly one writer in the tree, `recoverQ2AffClaims`, and it runs on **the owning
+session's own resume**. While the record is live and names the same generation, the
+orphan sweep skips every claim of that generation by design, so an assignment orphaned
+by an out-of-band consumer destruction is marked `Lost` only if that session comes back.
+A session that never resumes — which a session expiry interval of `0xFFFFFFFF` permits —
+leaves it unmarked and its shared-group source message re-offered forever, because the
+group consumer sets no `MaxDeliver`. That is **F-064**; the sentence above describes the
+resumed case only.
+
+**A second correction from the same audit: an out-of-band destruction is not the only way
+these copies are lost.** Because `$MQTT_out` is interest-retained, a copy stored after the
+consumer is gone succeeds and keeps nothing, and the source is then acknowledged on the
+strength of that store — so the message is released from the shared group having never
+existed on any consumer. That loss is produced by the broker's own delivery path rather
+than by anything out of band, and the distinguishing write order above does not help,
+because no delivery ever ran. That is **F-063**.
+
 That discrimination holds **while the owning session record still exists**. If the
 record disappears first — the session expired, or a broker died without tearing it
 down — a legitimate teardown deleting the consumer and an out-of-band destruction
@@ -1186,8 +1204,13 @@ What it does NOT do:
      clients; they are not a guard against permitted NATS publication.
   3. **Untouched**, and the reasons differ per stream — do not collapse them.
      **Deletes** carry no per-subject expectation, so no admission closure speaks about
-     them. **`$MQTT_qos2assign` and `$MQTT_inflight`** await their own
-     consequence audits — F-033 and F-034 respectively — which are open. **`$MQTT_qos2in`'s
+     them. **`$MQTT_inflight`** awaits its own consequence audit — F-034 — which is open.
+     **`$MQTT_qos2assign`'s ran (F-033, closed 2026-08-18)**: every claim write is
+     funnelled through one CAS helper that always emits its expectation, so it needed no
+     lineage, and what it found instead was a source ack bound to a copy store that never
+     proved retention, a reference skip, a reap on a stale reading and a claim key that
+     outlives the `$MQTT_msgs` incarnation it indexes — F-063, F-064, F-065 and F-066,
+     none of which this admission closure speaks to. **`$MQTT_qos2in`'s
      ran (F-032, closed 2026-08-17)**: every write there carries its expectation, so it
      needed no lineage, and what it found instead was a hold purge carrying no condition at
      all — F-062 (closed 2026-08-18 by giving the purge a proven cutoff) and F-036, neither
@@ -1544,9 +1567,10 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   change the stream-level admission and sequence mechanisms that refuse it.
 - **What the closure says nothing about.** `$MQTT_sess`, `$MQTT_qos2in`,
   `$MQTT_qos2assign` and `$MQTT_inflight`: the server mechanisms are stream-independent,
-  but each of those findings owns its own consequence. **F-033 and F-034 stay open until
-  each is audited on its own terms.** F-032 has since been audited and closed, producing
-  F-062, which closed on 2026-08-18. It also does not claim the two backstops below
+  but each of those findings owns its own consequence. **F-034 stays open until it is
+  audited on its own terms.** F-032 has since been audited and closed, producing F-062,
+  which closed on 2026-08-18; F-033 has too, producing F-063, F-064, F-065 and F-066. It also
+  does not claim the two backstops below
   the proved mechanisms — an entry admitted anyway is discarded by apply-time log order,
   and beneath that by the store's refusal of any sequence that is not the next one — but
   neither is mutation-proved and neither is part of any claim.

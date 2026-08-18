@@ -197,10 +197,21 @@ func (p mqttQ2AffPhase) rank() int {
 // mqttQ2AffClaim is one durable assignment record, living on its own subject
 // (MaxMsgsPer:1) so each transition is a CAS at an exact sequence.
 //
-// Winner+Gen is the immutable identity every transition is matched against
+// Winner+Gen is the immutable identity a transition is matched against
 // (qos2_move.go invariant 1): the subject is keyed by group durable and source
 // sequence, which say nothing about which session generation owns it, so a
 // sequence is not an identity here either.
+//
+// SEVEN of the ten transition call sites assert it; three deliberately do not,
+// because the facts they record — SourceAcked and AffineDone — are owner-independent
+// statements about the group delivery and about a copy the delivery gate has already
+// attributed. Those three rest on the per-subject CAS alone, which is sufficient for
+// an owner-independent fact and would not be for an ownership decision. F-033's audit
+// states the split rather than glossing it as a universal check.
+//
+// The subject identifies one source message only within one incarnation of $MQTT_msgs:
+// recreating that stream restarts its sequences while these claims survive. That is
+// F-066, and no per-subject CAS speaks to it.
 type mqttQ2AffClaim struct {
 	Winner       string `json:"winner"` // winning session's client-ID hash
 	Gen          string `json:"gen"`    // winning session's durable generation
@@ -901,6 +912,13 @@ func (sess *mqttSession) q2AffCondLocked() *sync.Cond {
 //
 // ok=false means "prove nothing, write nothing, ack nothing" — the group
 // delivery is left for AckWait to re-offer.
+//
+// F-063: every condition below is LOCAL session state — a readiness flag, a
+// generation and a consumer POINTER. None of them observes the durable consumer, so
+// admitting a move here does not establish that the consumer still exists. Since
+// $MQTT_out is interest-retained, a copy stored after it was deleted succeeds and
+// keeps nothing, and the source is then acknowledged on the strength of that store.
+// See docs/findings/ha-arbitration.md.
 func (sess *mqttSession) beginQ2AffOp() (gen string, ok bool) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -1207,8 +1225,9 @@ var errQ2AffUnresolved = errors.New("affine QoS 2 state could not be resolved")
 // wantWinner/wantGen, when set, assert whose claim this must be; a mismatch
 // returns the loaded claim with errQ2AffUnresolved and mutates nothing, in the
 // same spirit as finalizeQoS2Move's Superseded. (The claim subject is keyed by
-// group durable and SOURCE SEQUENCE, and a stream sequence is never reused, so
-// the subject already identifies one source message forever; the identity check
+// group durable and SOURCE SEQUENCE, and a stream sequence is never reused WITHIN
+// ONE INCARNATION of $MQTT_msgs, so the subject already identifies one source
+// message for as long as that stream is not recreated (F-066); the identity check
 // guards against acting on a winner that is not the one the caller reasoned about.)
 //
 // A missing claim returns (nil, 0, nil): there is nothing to advance, and absence
@@ -1256,6 +1275,12 @@ func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, want
 // proven complete. It re-reads first: the caller's view is always older than the
 // record, and this is the one operation that can, if wrong, reopen the ownership
 // of a started delivery.
+//
+// F-065: the re-read is not enough on its own. The copy state below is read BEFORE
+// the SourceAcked transition this function may perform, and reapable() is then
+// evaluated on that earlier reading — so a copy stored by a concurrent on-behalf
+// materializer during the transition's round trip is invisible to it, and the claim
+// is deleted out from under a copy that exists. See docs/findings/ha-arbitration.md.
 //
 // EVERY writer that records one of the two proofs must call this afterwards. The
 // two proofs are produced by different code paths (the source ack by the move,
@@ -1561,6 +1586,14 @@ func (sess *mqttSession) completeQ2AffOwnClaim(s *Server, as *mqttAccountSession
 // The copy is stored before the phase advances, never after: the phase is what
 // authorizes delivery, and a materialized claim with no copy would let the
 // delivery gate open on nothing.
+//
+// F-063: that ordering does not achieve what it intends, because a SUCCESSFUL store
+// is not evidence the copy was retained. $MQTT_out is interest-retained, so a store
+// onto a deleted consumer succeeds and keeps nothing, and the only re-read below is
+// on the CAS-REJECTION path — a store that succeeds is never verified. The claim then
+// advances to materialized with no copy behind it, which is the very state this
+// comment says the ordering prevents, and the source is acknowledged on the strength
+// of it. See docs/findings/ha-arbitration.md.
 func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 	claim *mqttQ2AffClaim, claimSubject string, claimSeq uint64, env *mqttQ2AffineEnvelope) bool {
 
@@ -1632,9 +1665,15 @@ func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 //     after ownership moved, and it begins BEFORE the record goes absent.
 //
 // The destructive branch below fires on both, so it acts on a stronger conclusion than
-// either supports. What discarding an assignment costs in those states is
-// $MQTT_qos2assign's own consequence question — F-033, unaudited — and is deliberately
-// not answered here.
+// either supports. F-033's consequence audit has since answered what that costs, and the
+// answer is that this branch is not where the defect is: discarding on an ABSENT record
+// rests on F-036's own falsified premise and is recorded as F-036 population, while the
+// DIFFERENT-generation reading is settled on the clean-start route — teardown marks every
+// assignment of the retiring generation Discarded before deleting its consumer, so the
+// session really has ended and [MQTT-4.8.2-6] permits the delivery to die with it. The
+// residue in both directions is a previous owner still serving after ownership moved,
+// which is F-036's shape and not this function's to fix. See F-033, "What the audit
+// established", in docs/findings/ha-arbitration.md; that section is authoritative.
 //
 // Anything indeterminate leaves the claim untouched and acks nothing.
 func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *mqttQ2AffClaim,
@@ -1668,8 +1707,8 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 		// was assigned to, which [MQTT-4.8.2-6] permits; it is never released back to the
 		// group. Neither condition proves the winner stopped serving — absence is bounded
 		// evidence and a different generation means ownership moved, which F-036 says the
-		// previous owner can outlive. See this function's doc; the cost is F-033's
-		// unanswered question.
+		// previous owner can outlive. See this function's doc: F-033's audit sorted that
+		// cost onto F-036's premise rather than onto this stream's.
 		//
 		if _, _, derr := as.advanceQ2AffClaim(claimSubject, claim.Winner, claim.Gen,
 			func(c *mqttQ2AffClaim) { c.Discarded = true }); derr != nil {

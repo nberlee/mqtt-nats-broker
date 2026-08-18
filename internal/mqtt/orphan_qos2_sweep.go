@@ -44,7 +44,11 @@
 // F-032's audit (docs/findings/ha-arbitration.md). It is not restated at each site below:
 // the word "authoritative" throughout this file carries exactly the bound stated here, and
 // the consequences per resource class belong to the findings that own those classes —
-// F-033, F-034 and F-036 — not to this comment.
+// F-034 and F-036 — not to this comment. ($MQTT_qos2assign's class was F-033, whose audit
+// closed on 2026-08-18. What it found in THIS file is F-064, named at its site below
+// because it is a defect of ours rather than F-036's premise restated, plus one addition
+// to F-036 itself: the affine consumer delete's instance fingerprint does not discriminate
+// a session that ADOPTS the consumer, so it is not the defense it reads as.)
 //
 // # What makes a deletion legal here
 //
@@ -1753,6 +1757,11 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 	grace, q := as.orphanGrace(), as.quarantine()
 	var discarded, lost, retained, deferred int
 	for _, e := range inv {
+		// F-064: a live generation reference makes this pass skip EVERY claim of that
+		// generation, on the premise that the owner's own resume will reconcile them.
+		// recoverQ2AffClaims is indeed the only thing that ever does, so a session that
+		// never resumes leaves a nonterminal claim stalling its shared group forever and
+		// a terminal one accumulating. See docs/findings/ha-arbitration.md.
 		if refs.hasAffine(e.claim.Winner, e.claim.Gen) {
 			q.forget(mqttQuarantineAssignKey(e.subject))
 			continue
@@ -1825,9 +1834,18 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 // bound the file header states — persisted records and this broker's residents — so a
 // winner still serving on another broker with no record passes it. A valid record for a
 // DIFFERENT generation establishes that ownership MOVED, which is not the same fact: F-036
-// is precisely a previous owner continuing to serve after that. What committing Discarded
-// costs in either state is $MQTT_qos2assign's own consequence question (F-033, unaudited)
-// and is deliberately not answered here.
+// is precisely a previous owner continuing to serve after that. F-033's audit has since
+// answered what committing Discarded costs, and the two readings do NOT get the same
+// answer. Discarding on an ABSENT record rests on F-036's own falsified premise and is
+// recorded as F-036 population. The DIFFERENT-generation reading is settled on the
+// clean-start route and rests on no false premise: teardown marks every assignment of the
+// retiring generation Discarded before deleting its consumer, so the session really has
+// ended and [MQTT-4.8.2-6] permits the delivery to die with it. Only an obsolete previous
+// owner still serving after ownership moved belongs to F-036. Either way this function is
+// not where it is fixed. Note what the audit did NOT find here — the transition itself is
+// CAS-conditioned at a base read in the same attempt and asserts the winner's identity, so
+// no lineage is owed. See F-033, "What the audit established", in
+// docs/findings/ha-arbitration.md; that section is authoritative.
 func (as *mqttAccountSessionManager) discardAbsentWinnerClaim(s *Server, e *mqttQ2AffInvEntry) mqttQoS2SweepOutcome {
 	ps, _, err := as.loadFenceSession(e.claim.Winner)
 	if err != nil {
@@ -1983,9 +2001,19 @@ func (as *mqttAccountSessionManager) deleteOrphanQ2AffConsumers(s *Server, inv [
 		// for a DIFFERENT generation establishes that ownership MOVED; it does not
 		// establish that the previous generation stopped serving, which F-036 explicitly
 		// permits it to keep doing. An ABSENT record is the bounded absence the file header
-		// defines. What deleting this consumer costs in either state — its queued copies go
-		// with it — is $MQTT_qos2assign's and $MQTT_out's consequence question (F-033,
-		// unaudited) and is deliberately not answered here.
+		// defines. F-033's audit has since answered what deleting this consumer costs, and
+		// the two readings do NOT get the same answer. An ABSENT record rests on F-036's
+		// false-absence premise. A valid DIFFERENT-generation record is settled on the
+		// clean-start route — teardown marks every assignment of the retiring generation
+		// Discarded before deleting its consumer — and only an obsolete previous owner
+		// still serving after the move re-enters F-036. The audit's own addition is that
+		// step (5) below is
+		// NOT a second line of defense here: a session that resumes between these two steps
+		// ADOPTS this consumer rather than recreating it, because provisioning is a
+		// create-or-update, so ConsumerInfo.Created is unchanged and the instance check
+		// passes while the delete destroys a LIVE session's copies. The resulting state — a
+		// live matching record whose affine consumer is gone — is also F-064's precondition.
+		// See F-036's "adoption blind spot" in docs/findings/ha-arbitration.md.
 		ps, _, serr := as.loadFenceSession(cand.idHash)
 		if serr != nil {
 			continue
