@@ -3765,9 +3765,10 @@ func TestQ2AffSourceAckedAfterAStoreThatKeptNothing(t *testing.T) {
 // proves is "a stale claim on a reused sequence eats the message", not "a recreation
 // produces stale claims", which is the operator procedure and is argued in the dossier.
 //
-// Asserted: the client receives NOTHING. The mover takes its terminal arm, acknowledges
-// the group source because the stale claim says the ack was already proven, and the
-// accepted message is released from the shared group with no copy and no delivery.
+// Asserted: the client receives NOTHING. The mover takes its terminal arm and, because the
+// stale claim's group ack is unproven, confirms it against the NEWLY reused sequence before
+// recording it — so the accepted message is released from the shared group with no copy and
+// no delivery.
 //
 // Discriminating mutation: carry the $MQTT_msgs incarnation into the claim subject (the
 // remedy). The new message then computes a different subject, does not collide with the
@@ -3798,8 +3799,9 @@ func TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage(t *testing.T) {
 	subject := mqttQoS2AssignStreamSubjectPrefix + groupDur + "." + strconv.FormatUint(nextSeq, 10)
 	claimHash := mqttQ2AffClaimHash(groupDur, nextSeq)
 
-	// A claim left over from the previous incarnation: terminal, and its source ack
-	// already proven — the ordinary resting state of a claim awaiting only a reap.
+	// A claim left over from the previous incarnation: terminal on the discard axis with
+	// its group ack still UNPROVEN — the resting state the protocol requires, since a
+	// discarded claim must survive precisely until some contender proves that ack.
 	stale := &mqttQ2AffClaim{
 		Winner:       getHash("someone-else"),
 		Gen:          mqttNewQ2AffGen(),

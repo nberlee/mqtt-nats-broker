@@ -1561,7 +1561,7 @@ caller's **already-loaded** claim, which predates the concurrent transition.
 
 ## F-066
 
-**Title:** Cross-stream identity coupling exists as two ad hoc instances, never as a mechanism
+**Title:** Cross-stream identity coupling exists as three ad hoc instances, never as a mechanism
 
 - Status: **Open.** Found by F-033's consequence audit, 2026-08-18, during holistic review.
 - Classification: HA arbitration architecture / data loss
@@ -1581,79 +1581,79 @@ by other streams** — sequences, consumer durable names, and subjects — and r
 stream invalidates every reference to it that survives elsewhere.
 
 **This is filed as one finding over the class, not one per member.** The audit reached it
-the wrong way round: three consecutive holistic rounds each surfaced a different member, a
-fourth surfaced a member the first sweep had missed, and each time the instance was patched
-rather than the family swept. The population below is therefore **derived** — every
-persisted field in the tree that holds an identity another stream issues — rather than
-listed, which is the only form of this finding that can be checked for completeness.
+the wrong way round: four consecutive holistic rounds each surfaced a different member, and
+each time the instance was patched rather than the family swept. What that repeated failure
+finally established is recorded in the next section, and it is not a population.
 
-### The derived population, swept by CARRIER
+### What is established, and what this finding deliberately does NOT claim
 
-Two earlier attempts at this table were incomplete, and both failed the same way: the
-population was enumerated from too narrow a source — first "the streams this finding
-touches", then "every `json:` struct tag". A cross-stream identity is not a schema feature;
-it is anything persisted that names something another stream issued. So the population is
-derived by sweeping every **carrier** such an identity can travel in, and the completeness
-claim is *"every carrier channel was swept"* — which is checkable, where "every field" was
-not.
+**This finding makes no claim to have enumerated the population.** Four attempts were made
+and review falsified every one: first "the streams F-033 touches" (blind to
+`$MQTT_inflight` and `$MQTT_sess`), then "every `json:` struct tag" (blind to identities
+carried in headers and `Nats-Msg-Id`s), then a five-carrier sweep whose JSON arm was in fact
+a keyword-filtered grep (blind to `ScanFrom`, `Cons[].Durable`, `CancelledRegs[]`), and a
+"five carriers exist" claim refuted by `StreamConfig.Metadata` — the carrier the first row
+of the table below depends on. Recording a fifth confident enumeration would repeat the only
+mistake this finding has consistently made.
 
-Five carriers exist in this tree: JSON body fields, `Nmqtt-*` message headers,
-`Nats-Msg-Id` builders, subject builders, and consumer-durable builders.
+**Completeness is therefore explicitly deferred to F-034**, whose audit runs next, owns
+`$MQTT_inflight`, and should open with a field-by-field enumeration of every persisted
+record type — every field dispositioned, cross-stream or not — rather than any filtered
+sweep. What follows is a **verified sample with a worked consequence**, not a census.
 
-| Holder | Carrier | Identity it holds | Issued by | Epoch-coupled? |
+### The premise, and the members verified so far
+
+**Falsified premise: "recreating one stream is a self-contained recovery procedure."** When
+a broker-owned stream fails shape validation, startup refuses and instructs the operator to
+*"stop ALL brokers for this account and recreate `<that stream>`"*. For two streams that
+message names a second stream and calls the pair *"one logical unit"*; for the rest it names
+one. But durable records persist identities **other streams issue** — sequences, consumer
+durable names, subjects, and stream metadata — and recreating a stream invalidates every
+surviving reference to it.
+
+Identities confirmed to cross a stream boundary, by carrier:
+
+| Holder | Carrier | Identity | Issued by | Coupled? |
 |---|---|---|---|---|
-| `$MQTT_teardown` | body `MarkerSeq` | sequence | `$MQTT_sess` | **YES** — `mqttSessEpochMetaKey` in stream metadata, validator refuses a mismatch, paired stop-all |
-| `$MQTT_willq` | body `OriginSessionSeq` | sequence | `$MQTT_sess` | **YES** — `OriginSessEpoch` per record; the sequence is compared only when epochs are equal |
-| `$MQTT_qos2assign` | subject (`mqttQ2AffClaimSubject`) | consumer + sequence | `$MQTT_msgs` | **NO** |
-| `$MQTT_qos2assign` | body `SourceSeq`, `GroupDurable`, `ClaimHash` | sequence, consumer | `$MQTT_msgs` | **NO** |
+| `$MQTT_teardown` | stream `Metadata` + body `MarkerSeq` | epoch + sequence | `$MQTT_sess` | **YES** — `mqttSessEpochMetaKey`, validator refuses a mismatch, paired stop-all |
+| `$MQTT_willq` | body `OriginSessionSeq` + `OriginSessEpoch` | sequence + epoch | `$MQTT_sess` | **YES** — compared only when the epochs are equal |
+| `$MQTT_willq` | body `ScanFrom` + `ScanEpoch` | sequence + epoch | `$MQTT_sess` | **YES** |
+| `$MQTT_qos2assign` | subject, body `SourceSeq`/`GroupDurable`/`ClaimHash` | sequence, consumer | `$MQTT_msgs` | **NO** |
 | `$MQTT_qos2assign` | body `CopySubject`, `AffDurable` | subject, consumer | `$MQTT_out` | **NO** |
-| `$MQTT_out` (affine copy) | subject (`mqttQ2AffCopySubject`) | claim hash derived from a sequence | `$MQTT_msgs` | **NO** |
-| `$MQTT_out` (affine copy) | header `Nmqtt-Q2Claim` | subject | `$MQTT_qos2assign` | **NO** |
-| `$MQTT_out` (affine copy) | `Nats-Msg-Id` (`mqttQ2AffMsgId`) | consumer + sequence | `$MQTT_msgs` | **NO** |
-| `$MQTT_out` (stored PUBREL) | headers `Nmqtt-Q2SrcDur`, `Nmqtt-Q2SrcSeq` | consumer + sequence | `$MQTT_msgs` | **NO** |
-| `$MQTT_out` (stored PUBREL) | `Nats-Msg-Id` (`mqttPubRelMsgId`) | consumer + sequence | `$MQTT_msgs` | **NO** |
+| `$MQTT_out` affine copy | subject; header `Nmqtt-Q2Claim`; `Nats-Msg-Id` | claim hash, subject, consumer+sequence | `$MQTT_msgs`, `$MQTT_qos2assign` | **NO** |
+| `$MQTT_out` stored PUBREL | headers `Nmqtt-Q2SrcDur`/`Nmqtt-Q2SrcSeq`; `Nats-Msg-Id` | consumer + sequence | `$MQTT_msgs` | **NO** |
 | `$MQTT_inflight` | body `Dur`, `Seq` | consumer, sequence | `$MQTT_msgs` / `$MQTT_out` | **NO** |
 | `$MQTT_inflight` | body `Q2AffClaim` | subject | `$MQTT_qos2assign` | **NO** |
 | `$MQTT_inflight` | body `ClaimSeq` | sequence | `$MQTT_sess` | **NO** |
-| `$MQTT_sess` | body `Q2Aff.Durable`, `PubRel.Durable` | consumers | `$MQTT_out` | **NO** |
-| `$MQTT_sess` | body drain durable + `Started[].Seq` | consumer, sequences | `$MQTT_msgs` | **NO** |
+| `$MQTT_sess` | body `Q2Aff.Durable`, `PubRel.Durable`, `Cons[].Durable` | consumers | `$MQTT_out`, `$MQTT_msgs` | **NO** |
+| `$MQTT_sess` | body drain durable, `Started[].Seq` | consumer, sequences | `$MQTT_msgs` | **NO** |
 | `$MQTT_sess` | body drain `Started[].RegSeq` | sequence | `$MQTT_inflight` | **NO** |
+| `$MQTT_sess` | body `CancelledRegs[]` | register nonces | `$MQTT_inflight` | **NO** |
 
-Carriers that hold no cross-stream identity, checked and stated so the sweep is falsifiable:
-the remaining `Nmqtt-*` headers carry a generation, a subscription identifier, a topic or
-a
-client-ID hash — session-scoped identities, not something another stream issued;
-`mqttQoS2ReleaseMsgId` embeds only a generation; and the subject builders for
-`$MQTT_qos2in`, `$MQTT_inflight`, `$MQTT_teardown`, `$MQTT_willq` and `$MQTT_sess` are keyed
-by `(client-ID hash, generation, packet identifier)` or `(domain, client-ID hash)`.
-`$MQTT_rmsgs` holds none, and `$MQTT_origin` is a retired stream.
+### What the sample shows: a pattern applied three times, never systematised
 
-### What the table actually shows: a pattern applied twice and never systematised
+An earlier draft asserted a rule — *coupled if and only if it references `$MQTT_sess`* — and
+its own table falsified it: `$MQTT_inflight`'s `ClaimSeq` is a `$MQTT_sess` sequence and is
+uncoupled. The rule is withdrawn rather than rescued. What survives it is a weaker but
+defensible observation, and it is the actual finding:
 
-An earlier draft of this finding stated a rule — *coupled if and only if it references
-`$MQTT_sess`* — and **the table above falsifies it**: `$MQTT_inflight`'s `ClaimSeq` is a
-`$MQTT_sess` sequence and is uncoupled. The rule is withdrawn rather than rescued by
-reclassifying its counterexample, and what remains is a sharper statement:
+> **Three verified epoch couplings exist, implemented through two mechanisms, all against
+> `$MQTT_sess` — and
+> the idea was never generalised, not even across `$MQTT_sess` itself.** Every confirmed
+> reference to `$MQTT_msgs`, `$MQTT_out`, `$MQTT_qos2assign` and `$MQTT_inflight` is
+> uncoupled, and so is one reference to `$MQTT_sess`.
 
-> **Exactly two epoch couplings exist in the tree. Both were built ad hoc against
-> `$MQTT_sess`, in two different shapes, and the idea was never generalised — not even to
-> every reference to `$MQTT_sess` itself.** Thirteen of the fifteen cross-stream identities
-> above are uncoupled, including one pointing at the very stream both existing couplings
-> protect.
-
-That is why this class produced one new member per review round for four consecutive
-rounds: there is no mechanism to be absent from, only two hand-built instances of a pattern
-nobody wrote down. A remedy is therefore a *generalisation* — one way of stamping and
-validating an issuing stream's incarnation, applied across the table — not a third bespoke
-coupling.
+There is no mechanism here to be absent from — only hand-built instances of a pattern nobody
+wrote down. That is why the class produced a new member in each of four consecutive review
+rounds, and why the remedy is a **generalisation** rather than a fourth bespoke coupling.
 
 ### What that costs on the affine path
 
-The logical unit F-033's protocol needs is **four** streams — `$MQTT_msgs`,
-`$MQTT_qos2assign`, `$MQTT_out` and `$MQTT_inflight`. Two earlier drafts of this finding
-claimed three and then had to correct the count, which is itself the symptom: the unit is
-whatever the carrier table says references each stream, and only a completed carrier sweep
-can tell you. Recreating any proper subset strands the references the others hold:
+Four streams are CONFIRMED to be mutually entangled on this path — `$MQTT_msgs`,
+`$MQTT_qos2assign`, `$MQTT_out` and `$MQTT_inflight`. That is the verified affected subset,
+**not a proven closed universe**: two earlier drafts named three and had to correct the
+count, and only the census deferred to F-034 can say whether a fifth belongs. Recreating any
+proper subset of the four strands the references the others hold:
 
 | Recreated | Stranded reference | Direction |
 |---|---|---|
@@ -1663,7 +1663,7 @@ can tell you. Recreating any proper subset strands the references the others hol
 | `$MQTT_out` | claims reading `materialized`; every affine consumer; `$MQTT_inflight`'s `Dur`/`Seq`; the session record's `Q2Aff.Durable` and `PubRel.Durable` | **Loss.** Accepted copies die; only an owner resume records `Lost` (F-064). A register's `Seq` then names a sequence the recreated stream will reuse, so recovery can interpret an unrelated new copy through a stale register. |
 | `$MQTT_inflight` | every drain's `Started[].RegSeq` in `$MQTT_sess` | **Destruction of another session's record.** `RegSeq` is an EXACT sequence and `deleteInflightRegisterConfirmed` deletes it with no subject or record identity check at all, so a surviving drain releasing its register after the recreation deletes whatever register now occupies that sequence — an unrelated session's. **What that costs the victim is deliberately NOT asserted**: an absent register on the next restart leaves the tracking maps empty and the redelivery takes a freshly allocated identifier, and a live same-process entry can still complete normally. The established defect is the unconditioned destruction; its downstream consequence belongs to that mechanism's owner. |
 | any subset excluding one of the four | the excluded stream's inbound references | as above, per row |
-| all four together | none | **No stale identity survives.** |
+| all four together | none KNOWN | **No stale identity among those confirmed survives.** Whether that makes the set a sufficient logical unit depends on the census this finding does not claim to have done. |
 
 **"Clean" here means no stale identity survives to be misapplied — it does not mean
 lossless, and an earlier draft of this table wrongly conflated the two.** A copy can be
@@ -1689,25 +1689,28 @@ validator, and `$MQTT_inflight`'s `Dur`/`Seq`/`Q2AffClaim`.
 
 ### Scope, and the method gap this exposed
 
-The population table is derived over **every** persisted cross-stream identity in the tree,
-so it is checkable for completeness in a way a list of members is not. Its rows outside the
-affine path are **named, not audited here**: `$MQTT_inflight`'s own coupling is F-034's to
-answer, and the session record's `$MQTT_out` durable references belong to the findings that
-own those mechanisms. The drain `RegSeq` row is the exception and is retained here rather
-than routed away: it is the only identity in the table whose stale use is itself
-DESTRUCTIVE — an unconditioned delete of an absolute sequence that reaches another
-session's record — so it belongs with this finding's remedy even though the drain machinery
-is not F-033's. What the victim then suffers is left to that mechanism's owner; this finding
-asserts the destruction, not a downstream consequence it has not established. Naming them
-is the point
-— the class is now visible
-whole, so no later audit has to rediscover it one member at a time.
+The table above is a **verified sample, not a census** — the opening section states why no
+completeness claim is made and why the enumeration is deferred to F-034. Its rows outside
+the affine path are **named, not audited here**: `$MQTT_inflight`'s own coupling is F-034's
+to answer, and the session record's `$MQTT_out` durable references belong to the findings
+that own those mechanisms. The drain `RegSeq` row is the exception and is retained here
+rather than routed away: it is the only identity in the table whose stale use is itself
+DESTRUCTIVE — an unconditioned delete of an absolute sequence reaching another session's
+record — so it belongs with this finding's remedy even though the drain machinery is not
+F-033's. What the victim then suffers is left to that mechanism's owner; this finding
+asserts the destruction, not a downstream consequence it has not established.
 
 **The method gap, stated plainly.** F-033's five route inventories enumerate writers and
 destroyers: they ask what the code does, never what an OPERATOR is instructed to do, and
-never which identities cross a stream boundary. That is why this class was invisible to
-the
+never which identities cross a stream boundary. That is why this class was invisible to the
 audit and had to be found by review. Any later per-stream audit should add both questions
 —
 "which `stopAll` procedures name this stream alone?" and "what does this stream's persisted
 state reference that another stream issues?" — as explicit inventories.
+
+**And a second-order lesson, paid for four times.** Every failed enumeration here was a
+FILTER masquerading as a sweep: a set of streams already known, a `json:` tag pattern, a
+keyword-filtered grep, a hand-listed set of carriers. Each looked exhaustive, none was, and
+twice the claim was refuted by an entry in the very table it introduced. A completeness
+claim is worth making only when the enumerated thing is closed by construction — every field
+of every persisted type — and otherwise the honest artifact is a sample that says so.

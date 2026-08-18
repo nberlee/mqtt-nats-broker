@@ -38,7 +38,7 @@ work is merged into the existing finding or roadmap item whose invariant it serv
 - Re-read copy absence after the reaper's own SourceAcked transition.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-065](ha-arbitration.md#f-065).
-- Generalise cross-stream identity coupling instead of two ad hoc instances.
+- Generalise cross-stream identity coupling instead of three ad hoc instances.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-066](ha-arbitration.md#f-066).
 - Add write lineage to outbound in-flight registers.

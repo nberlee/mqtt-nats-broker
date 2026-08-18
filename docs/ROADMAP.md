@@ -645,15 +645,19 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
   **Alpha blocker.** Falsified premise: *recreating one stream is a self-contained recovery
   procedure*. Durable records persist identities other streams issue — sequences, consumer
   durables, subjects — and `stopAll` names one stream at a time. The dossier carries a
-  population derived by sweeping every CARRIER such an identity travels in — JSON bodies,
-  `Nmqtt-*` headers, `Nats-Msg-Id` builders, subject builders, consumer-durable builders —
-  because two earlier attempts that enumerated streams, then struct tags, were both
-  incomplete. Of the fifteen cross-stream identities it finds, **thirteen are uncoupled**.
-  Exactly two couplings exist, `$MQTT_teardown` (stamped stream metadata) and `$MQTT_willq`
-  (`OriginSessEpoch` per record); both were built ad hoc against `$MQTT_sess` and the idea
-  was never generalised — not even to every reference to `$MQTT_sess`, since
-  `$MQTT_inflight`'s `ClaimSeq` is one and is uncoupled. The remedy is therefore a
-  generalisation, not a third bespoke coupling. On the affine path the logical unit is
+  **verified sample of cross-stream identities — explicitly NOT a census.** Four attempts
+  to
+  enumerate the population were each falsified by review, every one a filter masquerading
+  as
+  a sweep, so the completeness claim is dropped and the enumeration is deferred to F-034,
+  which owns `$MQTT_inflight` and runs next. What the sample establishes: **three** epoch
+  couplings exist (`$MQTT_teardown` via stamped stream metadata, `$MQTT_willq` twice via
+  `OriginSessEpoch` and `ScanEpoch`), all against `$MQTT_sess`, and the pattern was never
+  generalised — not even across `$MQTT_sess` itself, since `$MQTT_inflight`'s `ClaimSeq`
+  references it and is uncoupled. Every confirmed reference to `$MQTT_msgs`, `$MQTT_out`,
+  `$MQTT_qos2assign` and `$MQTT_inflight` is uncoupled. The remedy is a generalisation, not
+  a fourth bespoke coupling. On the affine path the VERIFIED AFFECTED SUBSET — not a proven
+  closed unit, which only F-034's census can settle — is
   **four** streams — `$MQTT_msgs`, `$MQTT_qos2assign`, `$MQTT_out`, `$MQTT_inflight` —
   and recreating a proper subset loses accepted messages, delivers an **OLD payload** for
   a
@@ -663,6 +667,18 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
 - [ ] [F-034: Add write lineage to outbound in-flight registers](findings/ha-arbitration.md#f-034).
   **Consequence audit.** Same shape as F-032; the consequences to bound are a freed
   identifier still in flight and a register whose deletion was proven.
+  **It also inherits a census F-033 deliberately did not attempt.** F-066 establishes that
+  cross-stream identity coupling exists as three ad hoc instances rather than a mechanism,
+  but explicitly makes NO claim to have enumerated the identities involved — four attempts
+  were each falsified by review. F-034 owns `$MQTT_inflight`, which holds four of the
+  confirmed cross-stream references, so its audit opens with that enumeration: a
+  **field-by-field pass over every persisted record type**, every field dispositioned,
+  cross-stream or not. Not a filtered sweep — each of F-033's four failures was a filter
+  presented as a sweep (streams already known, `json:` tags, a keyword grep, a hand-listed
+  carrier set), and two were refuted by an entry in the table they introduced. Add the two
+  questions F-033's route inventories never asked: *which `stopAll` procedures name this
+  stream alone*, and *what does this stream's persisted state reference that another stream
+  issues*.
 - [x] **Slice A of the arbitration design: the session-record watch.** Ownership changes
   only by a write to the client's record subject, so the observation channel is now a
   per-broker ephemeral consumer on `$MQTT_sess` instead of the at-most-once

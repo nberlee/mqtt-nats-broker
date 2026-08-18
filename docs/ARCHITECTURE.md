@@ -2340,11 +2340,13 @@ Three defects follow, each resting on a premise of its own:
   invisible to it.
 - **F-066** — a `stopAll`-instructed recreation of ONE stream is treated as a
   self-contained procedure, but durable records persist identities other streams issue. A
-  population derived by sweeping every CARRIER such an identity travels in — bodies,
-  `Nmqtt-*` headers, `Nats-Msg-Id` builders, subject and durable builders — finds fifteen
-  such identities, of which **thirteen are uncoupled**. The two that are, `$MQTT_teardown`
-  and `$MQTT_willq`, were built ad hoc against `$MQTT_sess` and never generalised. On this
-  path the logical unit is those four
+  verified sample of such identities — explicitly not a census, since four enumeration
+  attempts were falsified and the census is deferred to F-034 — shows **three** epoch
+  couplings, all against `$MQTT_sess` and all ad hoc, with every confirmed reference to
+  `$MQTT_msgs`, `$MQTT_out`, `$MQTT_qos2assign` and `$MQTT_inflight` uncoupled, and one
+  `$MQTT_sess` reference uncoupled too. On this
+  path the VERIFIED AFFECTED SUBSET — not a proven closed unit, which only F-034's census
+  can settle — is those four
   streams; recreating a proper subset loses accepted messages, delivers an OLD payload for
   a new message, or NAK-loops orphaned copies forever.
 
