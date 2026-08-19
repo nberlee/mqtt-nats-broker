@@ -67,7 +67,7 @@ survives
   marker and resolves every rejection by re-read, and only a WON claim reaches
   `deleteTeardownTargets`. Disposing LATE is recoverable rather than stalling: a claim
   whose record no longer names its generation is detected by `materializeQ2AffOnBehalf`
-  (`qos2_shared_affine.go:1630-1642`), which discards it, acks the source and reaps it on
+  (`qos2_shared_affine.go:1800-1816`), which discards it, acks the source and reaps it on
   the next source redelivery. Both of those were verified in the code after a first
   attempt to refute the finding asserted the opposite of each. Reaching the race also
   requires the remote to hold a shared QoS 2 membership and to start a delivery under the

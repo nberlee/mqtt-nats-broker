@@ -18,18 +18,23 @@
 //   - TestQ2AffineCrossBrokerAffinity (always-run): a delivery started to a member
 //     on one broker is never handed to a member on another broker when its owner
 //     leaves, and completes through PUBCOMP when that owner returns.
+//   - TestQ2AffClusterCopyLossOnDeletedConsumer (always-run): with the affine
+//     consumers destroyed out of band, NO broker releases the group source — the
+//     copy store succeeds and keeps nothing on every one of them, and the refusal
+//     has to be read from the replicated claim rather than from either broker's
+//     memory.
 //   - TestQ2AffineOwnerBrokerLossKeepsAssignment (gated on
 //     MQTTNB_CLUSTER_FAILOVER_TESTS=1): losing the OWNER'S BROKER outright does not
 //     release the message to the group; the owner collects it from a surviving
 //     broker.
 //
-// What is deliberately NOT claimed: packet-identifier continuity across a broker
-// loss. The assertions below are only that the message reaches the SAME session,
-// is not redistributed, and is not lost — a redelivery with DUP set and a freshly
-// allocated identifier satisfies them, which is the documented HA deviation (see
-// docs/CONFORMANCE.md and the header of qos2_shared_affine.go). A test that
-// asserted the identifier was preserved would be asserting more than the protocol
-// provides.
+// Packet-identifier continuity across a broker loss IS claimed and IS asserted. It was
+// a documented HA deviation when this file was written, and the outbound in-flight
+// register on `$MQTT_inflight` closed it: the identifier is durable and restored before
+// the redelivery, which `docs/CONFORMANCE.md` states for every outbound path. The
+// broker-loss test therefore captures the original identifier and requires the same one
+// back. It previously accepted any identifier, on the strength of the old deviation, so a
+// continuity regression on this path would have passed.
 
 package mqtt
 
@@ -37,6 +42,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -275,9 +281,12 @@ func TestQ2AffineCrossBrokerAffinity(t *testing.T) {
 		t.Fatalf("a started shared QoS 2 delivery crossed to a member on another broker (payload %q)", pl)
 	}
 
-	// The owner returns to its own broker and completes what it started. The
-	// identifier may be a fresh one (documented HA deviation); what is asserted is
-	// that the SAME session gets the message and the exchange completes.
+	// The owner returns to its own broker and completes what it started. What is asserted
+	// here is that the SAME session gets the message and the exchange completes; the
+	// identifier is deliberately not compared, and that is a limit of this fixture rather
+	// than a permitted deviation — continuity is durable on every outbound path (see
+	// TestQ2AffineOwnerBrokerLossKeepsAssignment below, and the discriminating coverage in
+	// inflight_register_e2e_test.go).
 	cr, rr := testQ2AffClusterResume(t, ownerBroker, ownerID)
 	defer cr.Close()
 	_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rr, testMQTTTimeout)
@@ -289,6 +298,199 @@ func TestQ2AffineCrossBrokerAffinity(t *testing.T) {
 	}
 	testQ2AffClusterComplete(t, cr, rr, pi)
 	testMQTTExpectNothing(t, otherReader)
+}
+
+// TestQ2AffClusterCopyLossOnDeletedConsumer is F-063 across brokers.
+//
+// $MQTT_out is interest-retained, so a copy stored onto a subject no consumer filters
+// SUCCEEDS AND KEEPS NOTHING. Neither broker can tell that from its own state: the
+// winner's admission gate consults a cached consumer POINTER, and a contender's
+// on-behalf lookup happens before the store rather than binding to it. Only a
+// presence check on the copy subject distinguishes the two, and it has to hold on
+// EVERY broker, because any one of them acking the group source releases the message
+// for all of them.
+//
+// Staged as the real mechanism: every affine consumer in the account is destroyed out
+// of band, through the broker that does NOT own the sessions' connections, and the
+// members stay connected without re-subscribing so nothing re-provisions. Whichever
+// member the group elects, its copy has nowhere to live.
+//
+// **Both brokers are required to have decided, and that is enforced rather than assumed.**
+// The group durable is queue-delivered to both members' subscriptions, so each redelivery
+// runs the move on one broker or the other; the fixture waits until EACH has recorded a
+// `deferred` disposition for this claim through its own `testQ2AffMoveDone` seam. Reading
+// the replicated claim through both nodes would only prove replication. The two brokers
+// refuse for different reasons and both are needed for the invariant: the elected winner
+// refuses at the presence check (F-063's remedy), and the contender refuses when the
+// winner's affine consumer lookup fails.
+//
+// AckWait is shortened on both brokers BEFORE they start, because the group consumer bakes
+// it in at creation. With the 30-second default there is exactly one delivery inside any
+// reasonable observation window, so only the first mover would ever be exercised — the
+// first version of this fixture had that defect and claimed otherwise.
+//
+// Asserted: neither member receives a PUBLISH; through BOTH brokers the claim stays at
+// `claimed`, carries no terminal fact and is never source-acked; and — independently of the
+// claim — the SOURCE MESSAGE is still on `$MQTT_msgs`. That last one is not redundant:
+// `confirmAck` commits before the `SourceAcked` CAS, so `SourceAcked == false` alone cannot
+// distinguish "never acked" from "acked, record not yet updated". What the refusal strands
+// is F-064's; this fixture's business is that nothing was released against a store response.
+//
+// Discriminating mutation: verify only on a REJECTED create-only CAS (mutation 1).
+// Whichever broker moves then advances the claim to materialized and acknowledges the
+// group source, so this fixture fails on a released source visible from both nodes.
+func TestQ2AffClusterCopyLossOnDeletedConsumer(t *testing.T) {
+	oldTimeout := testMQTTTimeout
+	testMQTTTimeout = 40 * time.Second
+	defer func() { testMQTTTimeout = oldTimeout }()
+
+	shortAckWait := func(o *Options) { o.MQTT.AckWait = 400 * time.Millisecond }
+	c := testNewJetStreamCluster(t, 3)
+	bA := c.startBroker(t, 0, shortAckWait)
+	bB := c.startBroker(t, 1, shortAckWait)
+
+	const group, topic = "kngrp", "q2aff/kn"
+	ca, ra := testQ2AffClusterMember(t, bA, "knA", group, topic)
+	defer ca.Close()
+	cb, rb := testQ2AffClusterMember(t, bB, "knB", group, topic)
+	defer cb.Close()
+
+	// One disposition log per broker, installed before the publish. A refusal sends
+	// nothing at all, so this seam is the only thing that tells "this broker refused"
+	// from "this broker never saw a delivery".
+	moves := map[string]*testQ2AffMoveLog{}
+	for name, b := range map[string]*testClusterBroker{"A": bA, "B": bB} {
+		asm := testMQTTGetGlobalASM(t, b.s)
+		l := &testQ2AffMoveLog{seen: map[string][]mqttQ2AffMoveResult{}}
+		moves[name] = l
+		asm.mu.Lock()
+		asm.testQ2AffMoveDone = func(subject string, res mqttQ2AffMoveResult) {
+			l.mu.Lock()
+			l.seen[subject] = append(l.seen[subject], res)
+			l.mu.Unlock()
+		}
+		asm.mu.Unlock()
+		t.Cleanup(func() {
+			asm.mu.Lock()
+			asm.testQ2AffMoveDone = nil
+			asm.mu.Unlock()
+		})
+	}
+
+	// Destroyed through bB's account manager: the deletion is an operation of a broker
+	// that owns neither session's connection, which is the out-of-band route
+	// docs/CONFORMANCE.md documents and the one no in-memory signal can observe.
+	// Every affine durable, so the fixture does not depend on which member wins.
+	asmB := testMQTTGetGlobalASM(t, bB.s)
+	cis, err := asmB.jsa.consumerList(mqttOutStreamName)
+	if err != nil {
+		t.Fatalf("listing consumers on %s: %v", mqttOutStreamName, err)
+	}
+	var removed int
+	for _, ci := range cis {
+		if ci == nil || !strings.HasPrefix(ci.Name, mqttQ2AffineConsumerDurablePrefix) {
+			continue
+		}
+		if _, derr := asmB.jsa.deleteConsumer(mqttOutStreamName, ci.Name, false); derr != nil {
+			t.Fatalf("deleting the affine consumer %q out of band: %v", ci.Name, derr)
+		}
+		removed++
+	}
+	if removed < 2 {
+		t.Fatalf("removed %d affine consumers, want one per member: this run staged nothing", removed)
+	}
+
+	testQ2AffClusterPublish(t, bA, "kn-pub", topic, "keptnothing")
+
+	// The claim has to be visible from both brokers before anything is asserted about
+	// it: an assertion made through one node says nothing about what the other did.
+	var subject string
+	checkFor(t, testMQTTTimeout, 100*time.Millisecond, func() error {
+		claimsA, claimsB := testQ2AffClusterClaims(t, bA), testQ2AffClusterClaims(t, bB)
+		if len(claimsA) != 1 || len(claimsB) != 1 {
+			return fmt.Errorf("assignment visible from A: %d, from B: %d (want 1 each)\n%s",
+				len(claimsA), len(claimsB), c.describe())
+		}
+		for subj := range claimsA {
+			if _, found := claimsB[subj]; !found {
+				return fmt.Errorf("assignment %q is not visible from the other broker", subj)
+			}
+			subject = subj
+		}
+		return nil
+	})
+
+	// Neither member may receive it: the copy has nowhere to live, so a delivery here
+	// would mean the message came off the GROUP durable instead.
+	if _, pl, _, _, got := testMQTTTryReadPublishV5(ra, 5*time.Second); got {
+		t.Fatalf("a member received a shared QoS 2 delivery whose affine copy cannot exist (payload %q)", pl)
+	}
+	if _, pl, _, _, got := testMQTTTryReadPublishV5(rb, 2*time.Second); got {
+		t.Fatalf("the member on the other broker received a delivery whose affine copy cannot exist (payload %q)", pl)
+	}
+
+	// Over a window, and through BOTH brokers. Each broker must ALSO have refused at
+	// least once by the end of it: the loop keeps going until both logs carry a
+	// `deferred` for this claim, and fails if either never does — a fixture that
+	// tolerated silence from one node would assert nothing about that node.
+	deadline := time.Now().Add(testMQTTTimeout)
+	for time.Now().Before(deadline) {
+		for _, b := range []*testClusterBroker{bA, bB} {
+			asm := testMQTTGetGlobalASM(t, b.s)
+			claim, _, lerr := asm.loadQ2AffClaim(subject)
+			if lerr != nil {
+				t.Fatalf("loading the claim through a broker: %v", lerr)
+			}
+			if claim == nil {
+				t.Fatalf("the claim on %q was reaped; nothing may reap a claim whose source was never released\n%s", subject, c.describe())
+			}
+			if claim.SourceAcked {
+				t.Fatalf("a broker released the group source with no proof the copy was retained: %+v\n%s", *claim, c.describe())
+			}
+			if claim.terminal() {
+				t.Fatalf("the claim on %q acquired a terminal fact (Discarded=%v AffineDone=%v Lost=%v); nothing delivered or disposed of this message",
+					subject, claim.Discarded, claim.AffineDone, claim.Lost)
+			}
+			if claim.Phase != mqttQ2AffClaimed {
+				t.Fatalf("the claim on %q moved to phase %v with no copy behind it\n%s", subject, claim.Phase, c.describe())
+			}
+			// AUTHORITATIVELY absent, not merely unreadable: a fixture resting on a failed
+			// lookup would assert nothing about interest retention.
+			if st, _ := asm.loadQ2AffCopy(claim.CopySubject); st != mqttQ2AffCopyAbsent {
+				t.Fatalf("the copy on %q reads %v, want absent: the store kept something after all", claim.CopySubject, st)
+			}
+			// The source itself, independently of the claim, and by a POSITIVE load through
+			// THIS broker: `confirmAck` commits BEFORE the SourceAcked CAS, so an unreleased
+			// source is what proves the ack never happened. Not `!q2AffSourceGone`, which is
+			// fail-closed and answers false both when the source is present and when it could
+			// not be read — the single-broker fixtures were corrected first and this one was
+			// left behind, which is the whole reason the propagation is now swept.
+			testQ2AffAssertSourcePresent(t, asm, claim, "during the cross-broker refusal window")
+		}
+		if testQ2AffClusterRefused(moves["A"], subject) && testQ2AffClusterRefused(moves["B"], subject) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("only these brokers ever decided on %q — A=%v B=%v; a node that never ran the move proves nothing about it\n%s",
+		subject, moves["A"].results(subject), moves["B"].results(subject), c.describe())
+}
+
+// testQ2AffClusterRefused reports whether this broker resolved a move on subject as
+// `deferred` — prove nothing, write nothing, ack nothing — and never as one of the
+// dispositions that release the group source. Both halves matter: a broker that acked
+// once and then deferred forever would satisfy the first alone.
+func testQ2AffClusterRefused(l *testQ2AffMoveLog, subject string) bool {
+	var deferred bool
+	for _, res := range l.results(subject) {
+		switch res {
+		case mqttQ2AffMoveDeferred:
+			deferred = true
+		default:
+			return false
+		}
+	}
+	return deferred
 }
 
 // TestQ2AffineOwnerBrokerLossKeepsAssignment removes the owner's BROKER, not just
@@ -312,21 +514,52 @@ func TestQ2AffineOwnerBrokerLossKeepsAssignment(t *testing.T) {
 
 	const group, topic = "lossg", "q2aff/loss"
 	ca, ra := testQ2AffClusterMember(t, bA, "lossA", group, topic)
+
+	// The member on bA is the SOLE member while the delivery under test is started, so
+	// it is necessarily the owner — and bA is the broker this test stops. The previous
+	// version subscribed both up front and SKIPPED whenever the group chose the other
+	// member, so even an explicit invocation was not guaranteed to exercise anything.
+	//
+	// Two exchanges are completed first, so the session's packet-identifier allocator has
+	// moved past 1 before the delivery that is left unfinished. Without that the
+	// continuity assertion at the end would hold even if nothing were restored, because a
+	// fresh allocator produces 1 as well.
+	for i, payload := range []string{"burn-1", "burn-2"} {
+		testQ2AffClusterPublish(t, bA, fmt.Sprintf("loss-burn-%d", i), topic, payload)
+		_, got, qos, pi, ok := testMQTTTryReadPublishV5(ra, testMQTTTimeout)
+		if !ok || qos != 2 || string(got) != payload {
+			t.Fatalf("burn-in delivery %d: ok=%v qos=%d payload=%q", i, ok, qos, got)
+		}
+		testQ2AffClusterComplete(t, ca, ra, pi)
+	}
+
+	testQ2AffClusterPublish(t, bA, "loss-pub", topic, "brokerloss")
+	_, _, _, firstPI, ok := testMQTTTryReadPublishV5(ra, testMQTTTimeout)
+	if !ok {
+		ca.Close()
+		t.Fatal("the sole group member did not receive the shared QoS 2 delivery it must own")
+	}
+	if firstPI <= 1 {
+		// The same guard, for the same reason, as
+		// TestMQTTInflightQoS2IdentifierSurvivesRestartBeforePubRec: at 1 the comparison
+		// after the failover cannot distinguish a restored identifier from a fresh one.
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce; the continuity assertion below would prove nothing", firstPI)
+	}
+
+	// The second member joins only NOW, on the broker that survives. It is a group
+	// member while the delivery is in flight, which is what makes "never offered to
+	// another member" meaningful, without having competed for ownership.
 	cb, rb := testQ2AffClusterMember(t, bB, "lossB", group, topic)
 	defer cb.Close()
 
-	testQ2AffClusterPublish(t, bA, "loss-pub", topic, "brokerloss")
-
-	// This test needs the member on bA to be the owner, because bA is the broker
-	// it stops. Which member the group chooses is not ours to decide, so skip
-	// rather than assert something the test did not set up.
-	if _, _, _, _, ok := testMQTTTryReadPublishV5(ra, 5*time.Second); !ok {
-		ca.Close()
-		t.Skip("the group chose the member on the surviving broker; this case needs the other one")
-	}
-	if n := len(testQ2AffClusterClaims(t, bB)); n != 1 {
-		t.Fatalf("expected the assignment to be visible from the surviving broker, got %d claims", n)
-	}
+	// Exactly one assignment: the two burn-in exchanges completed, so their claims are
+	// reaped. Polled, because the reap is the last step of the affine completion.
+	checkFor(t, testMQTTTimeout, 100*time.Millisecond, func() error {
+		if n := len(testQ2AffClusterClaims(t, bB)); n != 1 {
+			return fmt.Errorf("expected exactly one assignment visible from the surviving broker, got %d\n%s", n, c.describe())
+		}
+		return nil
+	})
 
 	// Lose the owner's broker outright: connection, session memory and all.
 	ca.Close()
@@ -337,9 +570,17 @@ func TestQ2AffineOwnerBrokerLossKeepsAssignment(t *testing.T) {
 		t.Fatalf("losing the owner's broker released a started QoS 2 delivery to another member (payload %q)", pl)
 	}
 
-	// The owner reconnects through the SURVIVING broker and collects it. A fresh
-	// packet identifier here is expected and permitted; loss or redistribution is
-	// not.
+	// The owner reconnects through the SURVIVING broker and collects it — with the SAME
+	// packet identifier. Continuity is no longer a deviation on any outbound path: the
+	// identifier is durable in the in-flight register on $MQTT_inflight and restored
+	// before the redelivery. This assertion used to permit a fresh identifier, which left
+	// the affine path's continuity unverified while the docs claimed it.
+	//
+	// It discriminates because of the burn-in above: firstPI is > 1, so a broker that
+	// allocated a fresh identifier instead of restoring the register's would fail here.
+	// TestMQTTInflightQoS2IdentifierSurvivesRestartBeforePubRec covers the same guarantee
+	// across a LOCAL restart of one broker; what this adds is the cross-broker route —
+	// the register is read on a node that never held the delivery.
 	cr, rr := testQ2AffClusterResume(t, bB, "lossA")
 	defer cr.Close()
 	_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rr, testMQTTTimeout)
@@ -348,6 +589,10 @@ func TestQ2AffineOwnerBrokerLossKeepsAssignment(t *testing.T) {
 	}
 	if qos != 2 || string(payload) != "brokerloss" {
 		t.Fatalf("unexpected delivery after broker loss: payload=%q qos=%d", payload, qos)
+	}
+	if pi != firstPI {
+		t.Fatalf("the redelivery after broker loss carries packet identifier %d, want the original %d: the in-flight register did not restore it",
+			pi, firstPI)
 	}
 	testQ2AffClusterComplete(t, cr, rr, pi)
 	testMQTTExpectNothing(t, rb)

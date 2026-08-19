@@ -590,15 +590,15 @@ correcting them is part of filing it.
 
 **Clauses (a) and (b) answer NO: no write on `$MQTT_qos2assign` is unconditional, and
 none takes a base it did not read.** Every claim write is funnelled through
-`storeQ2AffClaimCAS` (`qos2_shared_affine.go:647`, `:690`), which *always* emits
+`storeQ2AffClaimCAS` (`qos2_shared_affine.go:696`, `:739`), which *always* emits
 `JSExpectedLastSubjSeq`; there is no unconditioned store to find. Three primitives, and
 each is conditioned:
 
 | # | mutation | condition sent | base |
 |---|---|---|---|
-| W1 | claim election, `moveStartedSharedQoS2:1477` | `JSExpectedLastSubjSeq: 0` | create-only: no base exists |
-| W2 | every transition, `advanceQ2AffClaim:1257` | `JSExpectedLastSubjSeq: <seq>` | the sequence loaded in the same attempt; a rejection re-reads |
-| D1 | claim reap, `reapQ2AffClaim:1328` | `deleteMsg(..., seq, true)` | the exact sequence this call loaded |
+| W1 | claim election, `moveStartedSharedQoS2:1526` | `JSExpectedLastSubjSeq: 0` | create-only: no base exists |
+| W2 | every transition, `advanceQ2AffClaim:1306` | `JSExpectedLastSubjSeq: <seq>` | the sequence loaded in the same attempt; a rejection re-reads |
+| D1 | claim reap, `reapQ2AffClaim:1377` | `deleteMsg(..., seq, true)` | the exact sequence this call loaded |
 
 The inventory is **complete over bridge-authored data mutations with the test seams
 nil**, derived from three mechanical sweeps — over `mqttQoS2AssignStreamName` and
@@ -651,21 +651,21 @@ question nowhere.
 **1. Claim transitions (ten, all inheriting W2).** All ten CAS at a sequence loaded in
 the same attempt and preserve proven facts through `mergeProven`, so a transition can
 only ever ADD to what is known. Seven carry an explicit `wantWinner`/`wantGen` identity
-assertion and mutate nothing on a mismatch: `qos2_shared_affine.go:1636` (materialize),
-`:1713` (the on-behalf discard arm), `:2051` (`discardQ2AffClaimsFor`), `:2131` (`Lost`),
-`:2146` (recovery's `Discarded + SourceAcked`), `orphan_qos2_sweep.go:1871`
+assertion and mutate nothing on a mismatch: `qos2_shared_affine.go:1727` (materialize),
+`:1809` (the on-behalf discard arm), `:2156` (`discardQ2AffClaimsFor`), `:2237` (`Lost`),
+`:2251` (recovery's `Discarded + SourceAcked`), `orphan_qos2_sweep.go:1871`
 (`discardAbsentWinnerClaim`) and `:1975` (the sweep's pre-delete discard). Three pass no
 identity because the fact they record is owner-independent — `SourceAcked` is a statement
 about the group delivery and `AffineDone` about a copy the gate has already attributed:
-`qos2_shared_affine.go:1318` (the reaper's unofferable-source inference), `:1374`
-(`confirmSourceAckAndRecord`) and `:1931` (`mqttFinishQ2AffineDelivery`). None is
+`qos2_shared_affine.go:1367` (the reaper's unofferable-source inference), `:1423`
+(`confirmSourceAckAndRecord`) and `:2036` (`mqttFinishQ2AffineDelivery`). None is
 unconditional and none takes a stale base. The two sweep transitions are the ones whose
 EVIDENCE is weaker than a CAS can express; that is F-064, not a lineage gap.
 
 **2. Claim reaps (twelve, all inheriting D1).** Every one re-reads the claim and
 re-derives both proofs before deleting, and deletes only the exact sequence it loaded:
-`qos2_shared_affine.go:1525`, `:1534`, `:1577`, `:1720`, `:1750`, `:1942`, `:2058`,
-`:2110`, `:2153`, `orphan_qos2_sweep.go:1796`, `:1879`, `:2068`. The re-read is what
+`qos2_shared_affine.go:1574`, `:1593`, `:1655`, `:1816`, `:1855`, `:2047`, `:2163`,
+`:2215`, `:2258`, `orphan_qos2_sweep.go:1796`, `:1879`, `:2068`. The re-read is what
 makes reaping from every proof-writer correct rather than redundant: the two proofs are
 produced by unordered paths, so whichever commits second observes the first. All twelve
 inherit the same internal TOCTOU on the copy-absence reading, which is **F-065** — one
@@ -673,8 +673,8 @@ defect in the primitive, not twelve.
 
 **3. Affine consumer deletes (four).** `orphan_qos2_sweep.go:2058` (the sweep, the only
 one running under no session claim, and a check-then-act whose delete is BY NAME),
-`qos2_shared_affine.go:1088` (provisioning rollback, `minted` only — nothing durable ever
-referenced that generation), `:2369` (`finishQ2AffineUnwind`, under the session's own
+`qos2_shared_affine.go:1137` (provisioning rollback, `minted` only — nothing durable ever
+referenced that generation), `:2474` (`finishQ2AffineUnwind`, under the session's own
 fence) and `sess_teardown.go:750` (teardown, under a won `claimTeardown`, and after
 `discardQ2AffClaimsFor` has marked every assignment of the generation). Only the sweep's
 acts on evidence weaker than its consequence; that is F-036's third manifestation below.
@@ -692,10 +692,10 @@ claims nor affine copies.
 only then attempts D1 — the inverted window (recorded, not yet acked) is benign and
 self-correcting, and the opposite order would make an absent copy indistinguishable from
 a lost one. Those five are the delivery gate's `Discarded` disposition
-(`qos2_shared_affine.go:1832`), its `AffineDone || Lost` disposition (`:1840`), the
-expiry drop (`:1881`), the oversize drop (`:1905`) and the client's own PUBREC
+(`qos2_shared_affine.go:1937`), its `AffineDone || Lost` disposition (`:1945`), the
+expiry drop (`:1986`), the oversize drop (`:2010`) and the client's own PUBREC
 (`mqtt.go:14095`). **The sixth is different in kind and gets its own disposition**: the
-owner-mismatch arm sends a bare `sendAck` (`qos2_shared_affine.go:1826`), destroying the
+owner-mismatch arm sends a bare `sendAck` (`qos2_shared_affine.go:1931`), destroying the
 copy with no claim transition, no `AffineDone` and no reap attempt. That is correct
 rather than defective, and the reason is ownership, not accounting: the claim names a
 different session, so this copy is an artifact — the real owner has, or will have, its
@@ -727,12 +727,14 @@ inherits rather than re-argues. No Local is rejected outright on shared subscrip
 
 **6. Copy stores — one primitive, three control-flow routes, two precondition
 families.** The primitive is `storeQ2AffCopy`
-(`qos2_shared_affine.go:1613`), written only by
+(`qos2_shared_affine.go:1710`), written only by
 `materializeQ2AffCopy`. The own-claim family reaches it through `completeQ2AffOwnClaim`
-(`:1558`) from two entry points, a fresh election (`:1491`) and a resumed own claim
-(`:1511`), gated only by `beginQ2AffOp`'s local state. The on-behalf family reaches it on
-`:1742`, gated by a consumer lookup that nothing binds to the store. Both counts are
-stated so neither reading looks like an omission. These two families are **F-063**.
+(`:1628`) from two entry points, a fresh election (`:1540`) and a resumed own claim
+(`:1560`), admitted on local state alone. The on-behalf family reaches it on
+`:1838`, preceded by a consumer lookup that nothing binds to the store. Both counts are
+stated so neither reading looks like an omission. These two families were **F-063**, and
+what binds them now is the presence check inside `materializeQ2AffCopy` — neither the
+admission gate nor the lookup, both of which precede the store and prove nothing about it.
 
 ### What the audit found instead: three defects, sorted by falsified premise
 
@@ -742,7 +744,8 @@ interleavings were worked; they resolve into three premises of ours, one F-036
 manifestation, and two dispositions that are not defects at all.
 
 - **F-063** — nothing binds evidence that a copy was RETAINED to the irreversible source
-  acknowledgement that follows it.
+  acknowledgement that follows it. **Fixed 2026-08-19**, with the guarantee re-scoped to a
+  fresh but non-atomic observation; see the finding below.
 - **F-064** — a live generation reference is treated as reason enough to leave every
   claim of that generation to owner resume.
 - **F-065** — `reapQ2AffClaim` deletes on a copy-absence reading taken before its own
@@ -756,7 +759,7 @@ defect of ours, reasoning that the record was genuinely absent when step (4) rea
 so no false-absence inference was involved. **That reasoning does not hold.**
 `sess.q2AffGen` is only ever populated from a persisted record (`mqtt.go:6045`, `:8702`,
 `:8755`), and provisioning mints a FRESH generation when it is empty
-(`qos2_shared_affine.go:1021`), so a session resuming with no record cannot adopt the
+(`qos2_shared_affine.go:1072`), so a session resuming with no record cannot adopt the
 condemned generation's consumer at all. Adoption requires a session already resident with
 that generation while its record is absent, and the sweeping broker counts only its own
 residents — F-036's premise exactly. It is therefore recorded there as a third widening
@@ -958,7 +961,7 @@ on
 exactly that point. It first read the window as independent of false absence, on the grounds
 that the record was genuinely absent when step (4) read it. But `sess.q2AffGen` is only ever
 populated from a persisted record (`mqtt.go:6045`, `:8702`, `:8755`) and provisioning mints
-a FRESH generation when it is empty (`qos2_shared_affine.go:1021`), so a session resuming
+a FRESH generation when it is empty (`qos2_shared_affine.go:1072`), so a session resuming
 with no record cannot adopt the condemned generation's consumer at all. Adoption requires
 a
 session **already resident with that generation while its record is absent** — and the
@@ -1393,7 +1396,8 @@ touch it.
 
 **Title:** A source acknowledgement bound to a copy store that never proved retention
 
-- Status: **Open.** Found by F-033's consequence audit, 2026-08-18.
+- Status: **Fixed, 2026-08-19**, with its stated guarantee **re-scoped** — see "What was
+  done" and "The re-scope" below. Found by F-033's consequence audit, 2026-08-18.
 - Classification: HA arbitration architecture / data loss
 - Release treatment: **Alpha blocker.** The message lost was accepted — the publisher was
   answered for it — and multi-frontend HA is supported alpha scope.
@@ -1401,32 +1405,36 @@ touch it.
 
 ### The finding
 
+*Stated as it was found, in the past tense. The citations here name FUNCTIONS rather than
+line numbers, because the code they describe no longer exists at any line — see "What was
+done".*
+
 `$MQTT_out` is interest-retained: a store onto a subject no consumer filters **succeeds
-and keeps nothing**. The affine protocol nevertheless treats a successful create-only copy
-store as proof the copy exists, advances the claim to `materialized` on it, and then
-acknowledges the group source — which is irreversible and releases the message from the
-shared group forever. Nothing between those two steps establishes that any consumer
+and keeps nothing**. The affine protocol nevertheless treated a successful create-only copy
+store as proof the copy existed, advanced the claim to `materialized` on it, and then
+acknowledged the group source — which is irreversible and releases the message from the
+shared group forever. Nothing between those two steps established that any consumer had
 retained the copy.
 
 **The premise, stated so it covers all three routes:** *nothing binds evidence that the
 copy was RETAINED to the irreversible source acknowledgement that follows it.* The routes
 differ in which link is missing, not in the premise:
 
-- **Own-claim path — the evidence is never gathered at all.** `beginQ2AffOp` admits a move
+- **Own-claim path — the evidence was never gathered at all.** `beginQ2AffOp` admits a move
   on LOCAL session state only: a readiness flag, a non-empty generation and a non-nil
-  `q2AffConsumer` POINTER (`qos2_shared_affine.go:925`). Nothing consults the durable
-  consumer. `materializeQ2AffCopy` then stores and does not verify: the only re-read is on
-  the CAS-REJECTION path (`:1613-1623`), so a store that SUCCEEDS is never checked.
-  `completeQ2AffOwnClaim` acknowledges the source at `:1565`.
-- **On-behalf path — the evidence is gathered and then not bound.** The contender DOES look
-  the consumer up (`:1727-1733`), but nothing ties that lookup to the store at `:1742`; a
-  deletion in between produces the identical leftover.
-- **The materialized observation — evidence about a copy that has since gone.** A consumer
-  deleted between observing `materialized` and acknowledging the source (`:1531`, `:1565`,
-  `:1745`) leaves the same state, with no missing consumer at the moment of the check.
+  `q2AffConsumer` POINTER. Nothing consults the durable consumer, and that is still true —
+  admission is not evidence. `materializeQ2AffCopy` then stored and did not verify: the only
+  re-read was on the CAS-REJECTION path, so a store that SUCCEEDED was never checked, and
+  `completeQ2AffOwnClaim` acknowledged the source on the strength of it.
+- **On-behalf path — the evidence was gathered and then not bound.** The contender DOES look
+  the consumer up in `materializeQ2AffOnBehalf` step (2), but nothing tied that lookup to
+  the store that followed it; a deletion in between produced the identical leftover.
+- **The materialized observation — evidence about a copy that had since gone.** A consumer
+  deleted between observing `materialized` and acknowledging the source — in the mover's
+  foreign-materialized arm, in `completeQ2AffOwnClaim` and in `materializeQ2AffOnBehalf` —
+  left the same state, with no missing consumer at the moment of the check.
 
-**Leftover in every case: a `materialized + SourceAcked` claim with no copy**, which only
-a
+**Leftover in every case: a `materialized + SourceAcked` claim with no copy**, and only a
 later owner resume can turn into `Lost` — and if that session never resumes, the loss is
 never even recorded. The source is gone, so no redelivery re-elects.
 
@@ -1436,6 +1444,142 @@ with the copy store and the source acknowledgement. The remedy here is arbitrati
 ordering — proving retention before acknowledging, or making the acknowledgement
 conditional on it — not reconciliation afterwards. That difference in remedy is what
 establishes the premises are distinct.
+
+### What was done
+
+Three changes, in `qos2_shared_affine.go`. No new durable field, no new claim state, no new
+protocol, and nothing conditioned on a rollout.
+
+1. **The proof is a presence check, and both store outcomes converge on it.** A successful
+   store is now verified exactly as a rejected create-only CAS already was. That closes the
+   own-claim and on-behalf routes **together**, because both stores funnel through
+   `materializeQ2AffCopy` — the own path via `completeQ2AffOwnClaim` and the contender via
+   `materializeQ2AffOnBehalf`.
+2. **An already-`materialized` claim is re-verified, and never re-stored.** Re-verified
+   because the phase records that a copy was proven at an earlier instant, not that one is
+   there now. Never re-stored because an absent copy under it is ambiguous — consumed by its
+   own delivery, or dropped with its consumer — and a replacement would be a copy no
+   delivery may publish. Deleting the phase guard outright, which an earlier revision of the
+   plan proposed, would have re-stored a copy for `materialized ∧ AffineDone ∧ copy absent`,
+   since `materializeQ2AffCopy` tests only `Discarded`. That is a defect review caught
+   before any code existed; `TestQ2AffMaterializedAffineDoneIsNotRestored` pins it.
+3. **The release is authorized by `sourceAckAuthorized`**, on
+   `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked` and nothing else, evaluated
+   on FRESH sequential reads taken by the decision that acts on them. `Discarded` is
+   *required*, not merely permitted: `reapable` refuses without `SourceAcked`, so gating it
+   would make every discarded claim permanently unreapable — F-064's accumulation half,
+   manufactured. `Lost` is kept for the same kind of reason: a lost claim still releases the
+   group delivery, and omitting it would over-refuse.
+
+**Both callers were restructured, and that was not optional.** They returned on a failed
+materialization *before* reaching their terminal-fact handling, so once an
+already-materialized absent copy made materialization return false, `SourceAcked`,
+`AffineDone`, `Discarded` and `Lost` would have become unreachable for exactly the claims
+that need them — and the group delivery would be re-offered forever with nothing able to
+release it. Each caller now re-reads the record (its snapshot predates every JetStream round
+trip above it) and proceeds only if that fresh record authorizes the ack.
+
+The contender's materialized arm does not route through `materializeQ2AffCopy`, so it
+takes its own decision-point copy read and consults the same predicate. That is the third
+route, and it is where the fix would otherwise have been missing entirely.
+
+Where nothing is authorized the move takes the function's existing indeterminate outcome:
+prove nothing, write nothing, ack nothing. **Refusal is F-063's disposition; F-064's
+owner-independent reconciler is the resolution** of the nonterminal claim it strands, which
+is F-064's premise verbatim. A note F-064 must inherit: assigning that resolution to F-064
+does **not** license a naive `Lost` CAS there — see the refuted designs below.
+
+### The re-scope
+
+**The dossier's premise as filed cannot be met by any finite check, and the repository
+owner decided explicitly to tick the item with the guarantee re-scoped** from "bound" to
+"conditioned on a fresh but non-atomic observation".
+
+The claim lives on `$MQTT_qos2assign` and the copy on `$MQTT_out`, so a claim read and
+a copy read are separate JetStream round trips with no atomic snapshot across them; and
+JetStream's `CONSUMER.DELETE` carries no precondition field at all, which F-033's audit had
+already established as *the* unconditioned operation. So a proven copy can be gone by
+the time `confirmAck` commits. The span between the two contains a claim LOAD on every
+route through `materializeQ2AffCopy` — `advanceQ2AffClaim` loads before it can find the
+phase unchanged — and on a fresh or on-behalf materialization the full load-and-CAS with a
+three-attempt budget. Only the contender's foreign-materialized arm, which never enters
+that function, has the ack alone. What the change does is replace an acknowledgement
+resting on a store
+response — or on evidence gathered before the store, or on the phase alone — with one
+resting on a fresh proof; it does not make that span zero, and calling it "one round trip"
+was an overclaim the holistic review caught. `docs/CONFORMANCE.md` states the residual with
+a worked interleaving that includes the phase transition.
+
+### Designs refuted in review, so none returns
+
+- **Vary the copy's `Nats-Msg-Id` per attempt.** A stale materializer with a different
+  delivery count stores a SECOND copy, because expect-0 succeeds on a now-empty subject: the
+  create-only CAS does not remember historical occupancy. If the claim has since been
+  reaped, that copy NAKs forever. The delivery count is not an attempt identity either —
+  recreating a consumer resets it.
+- **Write `Lost` owner-independently when the copy is absent.** Prescribed by one review
+  round and refuted by the next. `advanceQ2AffClaim` arbitrates claim-record writers only,
+  so a stale `claimed`-snapshot on-behalf materializer can store a copy between the
+  observer's absent-copy read and the `Lost` CAS; the CAS then sees a nonterminal
+  materialized claim and records `Lost` although a copy now exists. `Lost` is terminal and
+  never reapable, so the mistake is permanent, and the delivery gate then disposes of the
+  copy under its terminal branch. A conditional mutate closure can order this against
+  `Discarded` and `AffineDone` but **cannot** validate a fact on the other stream. Salvaging
+  it needs a real materializer fence, which is cross-stream coordination belonging to
+  F-064's reconciler and not to this ack gate.
+- **Check the consumer exists before storing.** The on-behalf path already did, and lost
+  anyway. That is the route this finding filed as "gathered and then not bound".
+- **Hold the source until the client PUBCOMPs.** Makes a never-returning winner hold the
+  source forever, manufacturing F-064's stall as the normal path.
+- **Give `$MQTT_out` limits retention.** Foreclosed: interest retention is how a discarded
+  session's undelivered copies disappear with its durable.
+- **Refuse, and call the finding closed on its filed premise.** Refuted twice, which is what
+  forced the re-scope above to be an explicit decision rather than a claim this work makes
+  for itself.
+
+### What pins it
+
+One fixture per route, each naming *its* route rather than "the finding is fixed", in
+`qos2_shared_affine_retention_test.go` unless stated:
+
+| Route or rule | Fixture |
+|---|---|
+| Own-claim: a store that kept nothing | `TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing` (lifecycle file) |
+| On-behalf: consumer deleted after the lookup | `TestQ2AffOnBehalfRefusesSourceAckWhenConsumerVanishesAfterLookup` |
+| The materialized observation | `TestQ2AffMaterializedNoCopyRefusesSourceAck` |
+| Present-now, not present-once | `TestQ2AffMaterializedCopyIsVerifiedNotAssumed` |
+| No replacement copy for a completed exchange | `TestQ2AffMaterializedAffineDoneIsNotRestored` |
+| Predicate disjuncts | `TestQ2AffAcksOnCopyPresent`, `…OnAffineDone`, `…OnDiscarded`, `…OnLost` |
+| Caller restructure, own vs on-behalf | `TestQ2AffOwnClaimAcksOnTerminalFactWhenCopyGone`, `TestQ2AffOnBehalfAcksOnTerminalFactWhenCopyGone` |
+| Fail closed on an unreadable copy | `TestQ2AffCopyLoadErrorRefusesSourceAck` |
+| The dependency behaviors the retry bound rests on | `TestQ2AffCopyStoreWithNoInterestSequenceAndDedupe` |
+| Cross-broker: no broker releases it | `TestQ2AffClusterCopyLossOnDeletedConsumer` (cluster file) |
+
+The F-064 pin (`TestQ2AffLiveRecordLeavesAStrandedClaimToOwnerResume`) and the F-065 pin
+(`TestQ2AffReapUsesAStaleCopyReading`) must keep reproducing their findings. They are
+regression guards and **not** mutation targets: F-064's runs only sweeps and F-065's calls
+`reapQ2AffClaim` directly, so neither executes this change's decision.
+
+**Two pairings differ from the plan, and both are recorded rather than dropped.**
+
+- `TestQ2AffAcksOnCopyPresent` covers the CONTENDER route only, not both. On the own-claim
+  route a *successful* materialization goes straight to the ack without consulting the
+  predicate, so `copyPresent`'s only decision point is the contender's materialized arm and
+  an own-route fixture could not fail the mutation that drops it.
+- The plan's separate `TestQ2AffOwnClaimAcksOnTerminalFactWhenCopyGone` would have duplicated
+  the own-route `AcksOn…` staging, so it was given the one interleaving those do not have:
+  the terminal fact arrives DURING the copy store, which is what the caller's re-read exists
+  for. It pins the re-read as well as the early return.
+
+### Two sites named in review that are NOT members of the corrected comment class
+
+Both assert that the on-behalf match arm materializes a copy and acknowledges the group
+source, which stays true — the ack now additionally carries a proof, and the hazard being
+described (acknowledging irreversibly for a session that can never resume) is unchanged.
+Verified against the tree rather than dropped silently: `materializeQ2AffOnBehalf`'s
+record-validation comment, and its mirror in `docs/ARCHITECTURE.md` under "Compatibility
+boundary". Neither states that the phase implies a present copy, nor that the ack follows
+from materialization.
 
 ## F-064
 
@@ -1465,12 +1609,12 @@ roadmap bullet named. Record live and matching, affine consumer authoritatively 
 owner never resumes:
 
 - every contender's `materializeQ2AffOnBehalf` fails at the consumer lookup
-  (`qos2_shared_affine.go:1727-1733`), forever, and acknowledges nothing;
+  (`qos2_shared_affine.go:1823-1829`), forever, and acknowledges nothing;
 - `discardAbsentWinnerClaim` defers because the generation matches
   (`orphan_qos2_sweep.go:1855`);
 - `reconcileOrphanQ2AffClaims` never reaches the claim at all;
 - `Lost` has exactly one writer in the tree, `recoverQ2AffClaims`
-  (`qos2_shared_affine.go:2131`), on the owner's own resume.
+  (`qos2_shared_affine.go:2237`), on the owner's own resume.
 
 The shared group consumer sets **no `MaxDeliver`** (`mqtt.go:15925-15937`), so AckWait
 re-offers that source message forever while it holds a `MaxAckPending` slot, with nothing
@@ -1513,8 +1657,8 @@ F-063, and the remedy test is what separates them.
 
 ### The finding
 
-`reapQ2AffClaim` reads the copy state (`qos2_shared_affine.go:1311`), may then advance
-`SourceAcked` (`:1318`) — a full JetStream round trip that loads, mutates, CASes and retries
+`reapQ2AffClaim` reads the copy state (`qos2_shared_affine.go:1360`), may then advance
+`SourceAcked` (`:1367`) — a full JetStream round trip that loads, mutates, CASes and retries
 — and evaluates `reapable(copyAbsent)` on **the reading taken before it**. The predicate's
 whole purpose is that a copy which still exists keeps its claim; it is handed a copy state
 that may be that stale.

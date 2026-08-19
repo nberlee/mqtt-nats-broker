@@ -403,9 +403,16 @@ func TestMQTTInflightUnprovenSourceAckSendsNoSecondPublish(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	// The exchange still advances: the PUBREL is stored and delivered.
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
-	if confirms.Load() == 0 {
-		t.Fatalf("the confirmed source acknowledgement was never attempted")
-	}
+	// POLLED, not read once. The confirmation runs on the broker's delivery goroutine and
+	// nothing orders it against the PUBREL this test just read, so a single read asserts a
+	// cross-goroutine ordering the code does not establish — it merely usually wins. A
+	// paired soak caught it failing under load while the log showed the hook had fired.
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		if confirms.Load() == 0 {
+			return fmt.Errorf("the confirmed source acknowledgement was never attempted")
+		}
+		return nil
+	})
 
 	// The source is unacknowledged, so JetStream will re-offer it. What must stop that
 	// re-offer becoming a second PUBLISH is the source being RETIRED — a fact recorded

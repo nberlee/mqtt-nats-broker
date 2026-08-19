@@ -2122,7 +2122,8 @@ mismatch **fails closed**: the consumer that cannot be accounted for may still
 hold an in-flight PUBLISH, so it is preserved for diagnosis rather than replaced.
 
 **Claim state.** A claim carries a monotonic phase (`claimed` → `materialized`,
-"does a copy provably exist?") plus three independent completion facts:
+"was a copy provably created at some earlier instant?") plus three independent
+completion facts:
 `SourceAcked` (the group delivery's ack is proven committed), `AffineDone` (the
 copy reached a terminal state) and `Discarded` (the owning session ended). Every
 transition preserves facts already proven, and a claim may be deleted only when
@@ -2140,6 +2141,49 @@ delivery is released) but never reapable, because the record is the only durable
 evidence that the loss happened and a clean reap would erase it. `Lost` and
 `AffineDone` are mutually exclusive and are not independently merged: whichever
 the durable record already proved stands.
+
+**Releasing the group source is authorized by evidence, never by the phase.** The
+phase is a record of the past: `$MQTT_out` is interest-retained, so the copy a
+`materialized` claim names can be dropped with its consumer afterwards, while the
+source ack is irreversible and releases the message from the shared group forever.
+So `materializeQ2AffCopy` proves the copy with a PRESENCE CHECK on the copy
+subject, and `sourceAckAuthorized` admits the ack on
+`copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked` and on nothing else.
+
+Three consequences, all deliberate:
+
+- **A store RESPONSE is not evidence, in either direction.** A success can be a
+  no-interest store that kept nothing; a rejected create-only CAS means "the
+  subject is not empty", not "a copy is there now". Both outcomes therefore
+  converge on one presence check rather than only the rejected one.
+- **An already-`materialized` claim is re-verified and never re-stored.** An absent
+  copy under it is ambiguous — consumed by its own delivery, or dropped with its
+  consumer — and a replacement would be a copy no delivery may publish.
+- **A failed materialization does not end the attempt.** The claim is re-read and a
+  terminal fact still authorizes the release, because `reapable` refuses without
+  `SourceAcked`: withholding it would make every discarded claim permanently
+  unreapable. `Discarded` is required here, not merely permitted.
+
+Where nothing is authorized the move proves nothing, writes nothing and acks
+nothing, leaving the source for AckWait. That refusal does not resolve the claim it
+leaves behind, which is F-064's premise and F-064's remedy. The residual it keeps —
+a consumer deleted between the final proof and the ack — is stated in
+`docs/CONFORMANCE.md`; `CONSUMER.DELETE` is unconditioned, so no finite check
+closes it.
+
+**The retry bound is conditional, and it was measured rather than assumed**
+(`TestQ2AffCopyStoreWithNoInterestSequenceAndDedupe`). The create-only expectation
+is checked against the current last message on the SUBJECT, so an absent subject
+accepts expected `0` however many no-interest stores preceded it — a retry is never
+rejected as a CAS conflict. Deduplication is checked afterwards, and its entry
+outlives the message it was recorded for, so a retry carrying the copy's stable
+`Nats-Msg-Id` stores nothing even with interest present. Once retaining interest
+exists and remains, suppression therefore lasts at most the stream's **configured**
+duplicate window — the validator WAIVES `Duplicates` rather than fixing it, so an
+accepted `$MQTT_out` may carry any window. Where interest never returns there is no
+bound at all, and that indefinite stall is F-064's. Varying the msg-id per attempt
+is **refused**: expect-0 succeeds on a now-empty subject, so a stale materializer
+would store a second copy that NAKs forever once its claim is reaped.
 
 Telling the two apart is a matter of WRITE ORDER, not of observation. `AffineDone`
 is recorded **before** the copy is acked, so an absent copy under a claim that
@@ -2298,8 +2342,10 @@ which is every broker serving the account — they all run this tree (see the
 Compatibility boundary). It is stated as scope rather than as a rollout condition: a
 broker serving the same shared group without consulting the claims would redistribute
 a started delivery another broker had claimed, and there is no runtime capability gate
-that would stop it. See `docs/CONFORMANCE.md` for this and for the packet-identifier
-residual.
+that would stop it. See `docs/CONFORMANCE.md` for this and for the residual that does
+remain: a consumer deleted between the copy proof and the source ack (F-063).
+Packet-identifier continuity is **not** among them — the in-flight register closed it on
+every outbound path.
 
 ### What the write audit established, and the gaps it found
 
@@ -2328,10 +2374,17 @@ precondition field, so it removes whatever consumer holds that name when it appl
 because the stream is interest-retained that destroys every copy the consumer still held.
 Three defects follow, each resting on a premise of its own:
 
-- **F-063** — nothing binds evidence that a copy was RETAINED to the irreversible source
-  acknowledgement that follows it. A store onto a deleted consumer succeeds and keeps
-  nothing, and the only re-read is on the CAS-rejection path, so the claim reaches
-  `materialized` and the group source is released for a message that no longer exists.
+- **F-063 — fixed 2026-08-19, guarantee re-scoped.** Nothing bound evidence that a copy was
+  RETAINED to the irreversible source acknowledgement that follows it: a store onto a
+  deleted consumer succeeds and keeps nothing, and the only re-read was on the
+  CAS-rejection path, so the claim reached `materialized` and the group source was released
+  for a message that no longer existed. Every route now proves the copy with a presence
+  check and releases the source only on
+  `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked`. Because `CONSUMER.DELETE`
+  carries no precondition, the guarantee is conditioned on a fresh but **non-atomic**
+  observation. The residual spans the final copy lookup through any intervening claim
+  load or CAS retry to the confirmed source ack — no bound narrower than that is
+  claimed — and is stated in `docs/CONFORMANCE.md`.
 - **F-064** — a live generation reference makes the sweep skip every claim of that
   generation, leaving them to an owner resume that may never happen. This is why the `Lost`
   narrative in `docs/CONFORMANCE.md` holds only for a session that comes back.

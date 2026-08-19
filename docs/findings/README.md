@@ -30,7 +30,11 @@ work is merged into the existing finding or roadmap item whose invariant it serv
   `$MQTT_out` is the enabling mechanism on some of those routes, not the premise of any.
   Details: [F-033](ha-arbitration.md#f-033).
 - Prove a copy was retained before acknowledging its source.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Fixed 2026-08-19, guarantee re-scoped. Release treatment: Alpha blocker.
+  Every route now proves the copy with a presence check and authorizes the release from
+  `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked`. The guarantee is conditioned
+  on a fresh but non-atomic observation: `CONSUMER.DELETE` is unconditioned, so the residual
+  is a consumer deleted between the final proof and the ack.
   Details: [F-063](ha-arbitration.md#f-063).
 - Reconcile shared QoS 2 assignments independently of owner resume.
   Status: Open. Release treatment: Alpha blocker.

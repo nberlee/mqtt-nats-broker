@@ -21,7 +21,10 @@
 //     The whole PUBLISH -> PUBREC -> PUBREL -> PUBCOMP exchange then runs off the
 //     winner's own consumer, where no group member can reach it.
 //
-// The group delivery is acked only after the claim says the copy exists. So the
+// The group delivery is released only against evidence: a copy PROVEN PRESENT by a
+// fresh lookup, or a terminal fact on the claim (Discarded, AffineDone, Lost) that
+// says no delivery can come of it, or a SourceAcked already recorded. A
+// materialized phase is not evidence on its own — see sourceAckAuthorized. So the
 // message is never simultaneously "released to the group" and "not yet owned".
 //
 // # Dedup is not arbitration
@@ -60,7 +63,7 @@
 //
 // A claim tracks THREE independent completion facts plus a phase:
 //
-//   - phase (claimed -> materialized): does a copy provably exist?
+//   - phase (claimed -> materialized): did a copy provably exist at some instant?
 //   - SourceAcked: has the group delivery's ack been PROVEN committed?
 //   - AffineDone: has the copy's own delivery reached a terminal state?
 //   - Discarded: the winner's session ended; the delivery dies with it.
@@ -78,12 +81,13 @@
 //
 // # Residuals
 //
-//   - Packet-identifier continuity across a broker restart or failover. A
-//     same-process reconnect reuses the original PI; after a restart the message
-//     is redelivered to the SAME session with DUP=1 but a freshly allocated PI.
-//     The message is never lost and never redistributed; HA exactly-once
-//     (identifier continuity) remains a documented deviation. See
-//     docs/CONFORMANCE.md.
+//   - The source acknowledgement rests on a FRESH but non-atomic observation. The copy
+//     is proven present by a lookup on its own subject before the group source is
+//     released, but the claim and the copy live on different streams and
+//     CONSUMER.DELETE carries no precondition, so a consumer destroyed between that
+//     proof and the confirmed ack still loses the copy. The span includes any claim
+//     load or CAS the materialization performs in between. F-063, and stated in
+//     docs/CONFORMANCE.md rather than bounded here.
 //   - Scope. Affinity is a property of the brokers that consult $MQTT_qos2assign,
 //     which is every broker serving the account. Nothing gates it at runtime: a
 //     broker serving the same shared group without consulting the claims would
@@ -165,18 +169,27 @@ const (
 	mqttQ2AffMaxSeqDigits = 20
 )
 
-// mqttQ2AffPhase is the claim's monotonic progress marker: has a copy provably
-// been created? It is deliberately NOT the whole state — completion facts are
-// separate boolean fields, because they are independent and each has its own
-// proof (see the file header).
+// mqttQ2AffPhase is the claim's monotonic progress marker: was a copy provably
+// created at some earlier instant? It is deliberately NOT the whole state —
+// completion facts are separate boolean fields, because they are independent and
+// each has its own proof (see the file header).
+//
+// It is a record of the past, not a statement about the present. $MQTT_out is
+// interest-retained, so the copy a materialized claim names can be dropped with
+// its consumer afterwards; only a fresh lookup of the copy subject says whether it
+// is there now.
 type mqttQ2AffPhase string
 
 const (
-	// mqttQ2AffClaimed: ownership is decided, no copy is proven to exist yet. The
-	// affine delivery callback must NOT publish under this phase.
+	// mqttQ2AffClaimed: ownership is decided and no copy has been proven yet. The
+	// affine delivery callback must NOT publish under this phase. It does not say a
+	// copy is absent: the store completes BEFORE the materialized CAS, so a copy can
+	// exist under this phase — the gate is what keeps it undeliverable.
 	mqttQ2AffClaimed mqttQ2AffPhase = "claimed"
-	// mqttQ2AffMaterialized: a copy provably exists on the claim-specific subject.
-	// Only now may the group delivery be acked and the copy be published.
+	// mqttQ2AffMaterialized: a copy was proven present on the claim-specific
+	// subject. Only now may the copy be published — and the group delivery released
+	// only against a copy proven present NOW, or a terminal fact (see
+	// sourceAckAuthorized); the phase alone does not authorize that ack.
 	mqttQ2AffMaterialized mqttQ2AffPhase = "materialized"
 )
 
@@ -325,6 +338,40 @@ func (c *mqttQ2AffClaim) terminal() bool {
 	return c != nil && (c.Discarded || c.AffineDone || c.Lost)
 }
 
+// sourceAckAuthorized reports whether the group source may be released. copyPresent
+// must come from a FRESH lookup of this claim's copy subject, taken by the same
+// decision that acts on the answer.
+//
+// A materialized phase is deliberately not one of the disjuncts. It records that a
+// copy was proven at some earlier instant, and $MQTT_out is interest-retained, so
+// the copy may have been dropped with its consumer since — while the source ack is
+// irreversible and releases the message from the shared group forever.
+//
+// Each disjunct is an independent authorization:
+//
+//   - copyPresent: the copy provably exists on the winner's own durable.
+//   - AffineDone: recorded BEFORE the copy is acked, so an absent copy under it was
+//     legitimately consumed by its own delivery.
+//   - Discarded: the winner's session ended and the delivery dies with it
+//     ([MQTT-4.8.2-6]). Required, not merely permitted: reapable refuses without
+//     SourceAcked, so withholding the ack here would make every discarded claim
+//     permanently unreapable.
+//   - Lost: terminal by construction, and a lost claim still releases the group
+//     delivery — the message was accepted and not delivered, which withholding the
+//     ack does not undo.
+//   - SourceAcked: the irreversible step already happened.
+//
+// The claim read and the copy read are separate JetStream round trips with no
+// atomic snapshot across them, and CONSUMER.DELETE is unconditioned, so a copy
+// proven present can still be gone when the ack lands. That residual is stated in
+// docs/CONFORMANCE.md rather than claimed away.
+func (c *mqttQ2AffClaim) sourceAckAuthorized(copyPresent bool) bool {
+	if c == nil {
+		return false
+	}
+	return copyPresent || c.AffineDone || c.Discarded || c.Lost || c.SourceAcked
+}
+
 // mqttQ2AffMoveResult is the resolved disposition of one shared QoS 2 move
 // attempt. It is an enum rather than an error because the interesting outcomes
 // are not failures: "a foreign session owns this, I acked and walked away" and
@@ -333,12 +380,15 @@ func (c *mqttQ2AffClaim) terminal() bool {
 type mqttQ2AffMoveResult int
 
 const (
-	// mqttQ2AffMoveOwned: we are the durable winner and the copy is materialized.
+	// mqttQ2AffMoveOwned: we are the durable winner and the source was released —
+	// against a copy proven present on our own durable, or against a terminal fact
+	// that arrived while we were materializing.
 	mqttQ2AffMoveOwned mqttQ2AffMoveResult = iota
-	// mqttQ2AffMoveForeign: a foreign session owns it; we acked the group delivery.
+	// mqttQ2AffMoveForeign: a foreign session owns it, its copy was proven present,
+	// and we acked the group delivery.
 	mqttQ2AffMoveForeign
-	// mqttQ2AffMoveOnBehalf: a foreign session owns it and was absent, so we
-	// materialized the copy onto ITS durable and acked the group delivery.
+	// mqttQ2AffMoveOnBehalf: a foreign session owns it and was absent, so we proved a
+	// copy onto ITS durable — or found a terminal fact — and acked the group delivery.
 	mqttQ2AffMoveOnBehalf
 	// mqttQ2AffMoveTerminal: the claim is discarded or complete; we acked the group
 	// delivery (after proving the ack where that was still owed).
@@ -913,12 +963,12 @@ func (sess *mqttSession) q2AffCondLocked() *sync.Cond {
 // ok=false means "prove nothing, write nothing, ack nothing" — the group
 // delivery is left for AckWait to re-offer.
 //
-// F-063: every condition below is LOCAL session state — a readiness flag, a
-// generation and a consumer POINTER. None of them observes the durable consumer, so
-// admitting a move here does not establish that the consumer still exists. Since
-// $MQTT_out is interest-retained, a copy stored after it was deleted succeeds and
-// keeps nothing, and the source is then acknowledged on the strength of that store.
-// See docs/findings/ha-arbitration.md.
+// Every condition below is LOCAL session state — a readiness flag, a generation and
+// a consumer POINTER. None of them observes the durable consumer, so admitting a
+// move here establishes nothing about the copy: since $MQTT_out is interest-retained,
+// a copy stored after that consumer was deleted succeeds and keeps nothing. That is
+// why admission is not evidence and materializeQ2AffCopy proves retention with a
+// presence check instead (F-063).
 func (sess *mqttSession) beginQ2AffOp() (gen string, ok bool) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -1526,8 +1576,18 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 		res = mqttQ2AffMoveTerminal
 
 	case cur.Phase == mqttQ2AffMaterialized:
-		// A foreign session owns it and its copy exists: the delivery is safely on
-		// that session's own durable, so release the group delivery.
+		// A foreign session owns it and a copy was proven present at some earlier
+		// instant. Whether one is there NOW is a different fact — interest retention
+		// drops a copy with its consumer — and the source ack is irreversible, so the
+		// reading is taken HERE, by the decision that acts on it, and the release is
+		// authorized from the claim's own facts (F-063). An unreadable copy answers
+		// "not present", which leaves only an already-recorded SourceAcked; the claim
+		// is nonterminal by the case above. Nothing authorized means prove nothing,
+		// write nothing, ack nothing — F-064 owns what that strands.
+		st, _ := as.loadQ2AffCopy(cur.CopySubject)
+		if !cur.sourceAckAuthorized(st == mqttQ2AffCopyPresent) {
+			return res
+		}
 		if aerr := as.confirmSourceAckAndRecord(claimSubject, in.reply); aerr != nil {
 			return res
 		}
@@ -1535,7 +1595,10 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 		res = mqttQ2AffMoveForeign
 
 	default:
-		// A foreign session owns it but no copy exists yet. Waiting for that
+		// A foreign session owns it and no copy has been PROVEN yet — which does not
+		// say the subject is empty: the store completes before the materialized CAS,
+		// so a copy may already be there, and the create-only CAS is what makes
+		// storing again safe. Waiting for that
 		// session to come back is not bounded by anything: a perfectly valid
 		// persistent winner may simply never reconnect, and the group delivery
 		// would stall forever. Materialize the copy ON ITS BEHALF, onto ITS
@@ -1547,26 +1610,42 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 	return res
 }
 
-// completeQ2AffOwnClaim finishes a move for a claim this session owns: store the
-// copy, commit the materialized phase, then release the group delivery. Each step
-// is idempotent, so a retry after any partial failure converges.
+// completeQ2AffOwnClaim finishes a move for a claim this session owns: prove the
+// copy present, commit the materialized phase, then release the group delivery. Each
+// step is idempotent, so a retry after any partial failure converges.
+//
+// A failed materialization does NOT end the attempt, because a terminal fact
+// authorizes the source ack on its own (sourceAckAuthorized): returning here would
+// make Discarded, AffineDone, Lost and an already-recorded SourceAcked unreachable
+// for exactly the claims that need them, and the group delivery would be re-offered
+// forever with nothing left able to release it. So the record is re-read — our
+// snapshot predates the JetStream round trips above — and the ack proceeds only if
+// that fresh record authorizes it.
 //
 // Returns false when nothing could be proven — the caller then acks nothing.
 func (sess *mqttSession) completeQ2AffOwnClaim(s *Server, as *mqttAccountSessionManager,
 	claim *mqttQ2AffClaim, claimSubject string, claimSeq uint64, env *mqttQ2AffineEnvelope, reply string) bool {
 
 	if !as.materializeQ2AffCopy(s, claim, claimSubject, claimSeq, env) {
-		return false
+		cur, _, err := as.loadQ2AffClaim(claimSubject)
+		if err != nil || cur == nil || !cur.sourceAckAuthorized(false) {
+			// Nothing proven and nothing terminal: prove nothing, write nothing, ack
+			// nothing. The source delivery is the only recoverable asset, so it is left
+			// for AckWait to re-offer.
+			return false
+		}
+		claim = cur
 	}
 	if claim.SourceAcked {
 		sess.jsa.sendAck(reply)
 		return true
 	}
 	if err := as.confirmSourceAckAndRecord(claimSubject, reply); err != nil {
-		// The copy exists and the claim is materialized, so the message is already
-		// safe on our own durable. The unacked group delivery just redelivers, and
-		// the next attempt takes the "already materialized" path.
-		s.Warnf("MQTT: shared QoS 2 assignment %q is materialized but its source ack is unconfirmed: %v", claimSubject, err)
+		// Releasing the group delivery is the only thing outstanding: either the copy
+		// was proven present on our own durable, or the claim is terminal. The unacked
+		// group delivery just redelivers, and the next attempt re-proves the same
+		// authorization.
+		s.Warnf("MQTT: the source ack of shared QoS 2 assignment %q is unconfirmed: %v", claimSubject, err)
 		return true
 	}
 	// Reap from HERE too, not only from the affine side. The materialized claim is
@@ -1578,49 +1657,62 @@ func (sess *mqttSession) completeQ2AffOwnClaim(s *Server, as *mqttAccountSession
 	return true
 }
 
-// materializeQ2AffCopy stores the affine copy (create-only CAS on the
-// claim-specific subject) and commits the claim's claimed->materialized
-// transition. Returns true only when the copy is PROVEN to exist and the claim
-// PROVEN to say so.
+// materializeQ2AffCopy proves the affine copy is PRESENT — storing it first when it
+// is not there and may be stored — and commits the claim's claimed->materialized
+// transition. Returns true only when the copy was proven present by a fresh lookup
+// and the claim is proven to say so, which is what licenses the caller's
+// irreversible source ack.
 //
 // The copy is stored before the phase advances, never after: the phase is what
-// authorizes delivery, and a materialized claim with no copy would let the
-// delivery gate open on nothing.
+// authorizes delivery, and a materialized claim with no copy would let the delivery
+// gate open on nothing.
 //
-// F-063: that ordering does not achieve what it intends, because a SUCCESSFUL store
-// is not evidence the copy was retained. $MQTT_out is interest-retained, so a store
-// onto a deleted consumer succeeds and keeps nothing, and the only re-read below is
-// on the CAS-REJECTION path — a store that succeeds is never verified. The claim then
-// advances to materialized with no copy behind it, which is the very state this
-// comment says the ordering prevents, and the source is acknowledged on the strength
-// of it. See docs/findings/ha-arbitration.md.
+// A store RESPONSE is not that proof, in either direction, and both outcomes
+// therefore converge on ONE presence check (F-063):
+//
+//   - A SUCCESS proves nothing. $MQTT_out is interest-retained, so a store onto a
+//     subject no consumer filters succeeds and keeps nothing — see "JetStream
+//     behaviors this design depends on" in docs/ARCHITECTURE.md. That is the whole
+//     failure: a copy stored after the winner's consumer was deleted returns an
+//     ordinary success carrying a sequence that holds nothing.
+//   - A REJECTED create-only CAS means "the subject is not empty", which is not "a
+//     copy is there now": it can have been consumed and acked away in between.
+//
+// An ALREADY-materialized claim is re-verified, and never re-stored. Re-verified
+// because the phase is a record of the past and its copy may have gone with its
+// consumer since. Never re-stored because an absent copy under it is ambiguous —
+// consumed by its own delivery, or dropped — and a replacement would be a copy no
+// delivery may publish (the gate disposes of it under AffineDone) or, once its claim
+// is reaped, one that NAKs forever.
 func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 	claim *mqttQ2AffClaim, claimSubject string, claimSeq uint64, env *mqttQ2AffineEnvelope) bool {
 
 	if claim.Discarded {
 		return false // the winner's session ended; nothing may be materialized for it
 	}
-	if claim.Phase != mqttQ2AffMaterialized {
-		state, _ := as.loadQ2AffCopy(claim.CopySubject)
-		switch state {
-		case mqttQ2AffCopyUnknown:
-			return false // fail closed: unreadable is not absent
-		case mqttQ2AffCopyAbsent:
-			// Absent under a not-yet-materialized claim proves the copy was never
-			// stored: the delivery gate refuses to publish (and so to ack away) a
-			// copy whose claim is not materialized, so it cannot have been consumed.
-			msg, hdrLen := mqttNewQ2AffineRecord(env)
-			if _, err := as.storeQ2AffCopy(claim.CopySubject, hdrLen, msg); err != nil {
-				if !isQoS2CASRejection(err) {
-					return false
-				}
-				// A rejected create-only CAS means "the subject is not empty", which
-				// is NOT the same as "a copy is there now": it can have been consumed
-				// and acked away in between. Re-read authoritatively.
-				if st, _ := as.loadQ2AffCopy(claim.CopySubject); st != mqttQ2AffCopyPresent {
-					return false
-				}
-			}
+	state, _ := as.loadQ2AffCopy(claim.CopySubject)
+	if state == mqttQ2AffCopyUnknown {
+		return false // fail closed: unreadable is not absent
+	}
+	if state == mqttQ2AffCopyAbsent {
+		if claim.Phase == mqttQ2AffMaterialized {
+			// Proven present once, absent now. Nothing here can tell a delivered copy
+			// from a dropped one, and storing a replacement is wrong either way. Prove
+			// nothing; the caller consults the claim's own terminal facts for the
+			// source ack, and what a refusal strands is F-064's to resolve.
+			return false
+		}
+		// Absent under a claim that is not materialized: the delivery gate refuses to
+		// publish such a copy, so nothing consumed it, and a copy that WAS stored and
+		// then dropped with its consumer is owed a replacement just as much as one
+		// that never landed. Either way this store is the right action — it is the
+		// proof afterwards, not the store, that decides anything.
+		msg, hdrLen := mqttNewQ2AffineRecord(env)
+		if _, err := as.storeQ2AffCopy(claim.CopySubject, hdrLen, msg); err != nil && !isQoS2CASRejection(err) {
+			return false
+		}
+		if st, _ := as.loadQ2AffCopy(claim.CopySubject); st != mqttQ2AffCopyPresent {
+			return false
 		}
 	}
 
@@ -1643,8 +1735,13 @@ func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 	return updated.Phase == mqttQ2AffMaterialized
 }
 
-// materializeQ2AffOnBehalf writes the copy for a foreign winner that is not here
-// to write it itself, and then releases the group delivery.
+// materializeQ2AffOnBehalf proves a copy onto a foreign winner's durable when the
+// winner is not here to do it itself, and then releases the group delivery.
+//
+// Step (2) below looks the winner's consumer up, but that lookup is not what
+// authorizes the release: it precedes the store, and the consumer can be deleted in
+// between. The proof is materializeQ2AffCopy's presence check, which is why this
+// path and the own-claim path converge on that one function (F-063).
 //
 // The verification order is load-bearing. The winner's SESSION RECORD is checked
 // FIRST, and for the exact generation: an orphaned consumer can outlive the
@@ -1740,7 +1837,16 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 	onBehalf.subID = claim.SubID
 	onBehalf.retained = claim.Retained
 	if !as.materializeQ2AffCopy(s, claim, claimSubject, claimSeq, &onBehalf) {
-		return false
+		// Same reasoning as completeQ2AffOwnClaim: a failed materialization is not the
+		// end of the attempt, because a terminal fact authorizes the source ack by
+		// itself. Returning here would make those facts unreachable on this path — the
+		// winner's own teardown can commit Discarded while this store is in flight —
+		// and the group delivery would be re-offered with nothing able to release it.
+		// The claim is re-read because this snapshot predates every round trip above.
+		cur, _, lerr := as.loadQ2AffClaim(claimSubject)
+		if lerr != nil || cur == nil || !cur.sourceAckAuthorized(false) {
+			return false
+		}
 	}
 	if aerr := as.confirmSourceAckAndRecord(claimSubject, in.reply); aerr != nil {
 		return false

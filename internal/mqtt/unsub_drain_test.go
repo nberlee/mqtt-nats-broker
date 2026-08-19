@@ -17,7 +17,12 @@ import (
 // testDrainSetup connects a persistent QoS 1/2 subscriber, publishes one message,
 // and returns the subscriber's connection, its reader, its session and the packet
 // identifier of the (unacknowledged) delivery.
-func testDrainSetup(t *testing.T, s *Server, o *Options, clientID, topic string, qos byte) (*mqttTestConn, *mqttSession, uint16) {
+// burnIn, when given, completes that many exchanges BEFORE the delivery this leaves
+// started, so the returned identifier is not 1. A caller that compares identifiers across
+// a restart needs that: at 1 the comparison holds even against a broker that restored
+// nothing, because a fresh allocator produces 1 as well. Variadic so the existing call
+// sites — none of which compares identifiers — are unaffected.
+func testDrainSetup(t *testing.T, s *Server, o *Options, clientID, topic string, qos byte, burnIn ...int) (*mqttTestConn, *mqttSession, uint16) {
 	t.Helper()
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: clientID}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
@@ -27,12 +32,27 @@ func testDrainSetup(t *testing.T, s *Server, o *Options, clientID, topic string,
 	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: clientID + "pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer pc.Close()
 	testMQTTCheckConnAck(t, pr, mqttConnAckRCConnectionAccepted, false)
-	testMQTTPublish(t, pc, pr, qos, false, false, topic, 1, []byte("payload"))
 
 	flags := mqttPubQos1
 	if qos == 2 {
 		flags = mqttPubQoS2
 	}
+	if len(burnIn) > 0 {
+		for i := 0; i < burnIn[0]; i++ {
+			testMQTTPublish(t, pc, pr, qos, false, false, topic, uint16(10+i), []byte("burn"))
+			bpi := testMQTTCheckPubMsgNoAck(t, c, r, topic, flags, []byte("burn"))
+			if qos == 2 {
+				testMQTTSendPIPacket(mqttPacketPubRec, t, c, bpi)
+				testMQTTReadPIPacket(mqttPacketPubRel, t, r, bpi)
+				testMQTTSendPIPacket(mqttPacketPubComp, t, c, bpi)
+			} else {
+				testMQTTSendPIPacket(mqttPacketPubAck, t, c, bpi)
+			}
+		}
+		testMQTTFlush(t, c, nil, r)
+	}
+
+	testMQTTPublish(t, pc, pr, qos, false, false, topic, 1, []byte("payload"))
 	pi := testMQTTCheckPubMsgNoAck(t, c, r, topic, flags, []byte("payload"))
 	return &mqttTestConn{c: c, r: r}, testMQTTResidentSession(t, s, clientID), pi
 }
@@ -1027,7 +1047,10 @@ func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	conn, sess, _ := testDrainSetup(t, s, o, "restart1", "restart1/topic", 1)
+	conn, sess, piOrig := testDrainSetup(t, s, o, "restart1", "restart1/topic", 1, 2)
+	if piOrig <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce; the continuity comparison after the restart would prove nothing", piOrig)
+	}
 
 	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "restart1/topic"}})
 	testMQTTFlush(t, conn.c, nil, conn.r)
@@ -1049,14 +1072,20 @@ func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
 
-	// A fresh identifier is expected here (the documented packet-identifier
-	// continuity deviation); what must hold is that the payload arrives, with DUP.
+	// The ORIGINAL identifier, with DUP. Continuity is no longer a deviation on any
+	// outbound path: the in-flight register is restored before source interest is, and
+	// drain recovery reserves the identifier the drain recorded. This previously discarded
+	// the original and accepted whatever arrived, so a regression here would have passed.
 	flags, pi2, topic, payload := testMQTTReadPubPacket(t, r2)
 	if topic != "restart1/topic" || string(payload) != "payload" {
 		t.Fatalf("expected the started delivery to be redelivered, got %q %q", topic, payload)
 	}
 	if flags&mqttPubFlagDup == 0 {
 		t.Errorf("a delivery that was transmitted before the restart must carry DUP, flags=%x", flags)
+	}
+	if pi2 != piOrig {
+		t.Fatalf("the redelivery after the restart used packet identifier %d, want the original %d: the drain's in-flight register did not restore it",
+			pi2, piOrig)
 	}
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, pi2)
 

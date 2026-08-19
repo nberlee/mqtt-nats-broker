@@ -87,10 +87,19 @@ func TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel(t *testing.T) {
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
 
-	// Both obligations are honored. The order between the two paths is not fixed,
-	// so accept either and complete each in its own protocol.
-	var gotPubRel, gotPublish bool
-	for i := 0; i < 2; i++ {
+	// Both obligations are honored, and the order between the two paths is not fixed —
+	// which applies to B's OWN PUBREL as much as to the two exchanges. Once B is PUBREC'd
+	// there are THREE packets outstanding across two exchanges and nothing orders them, so
+	// every one of them is dispatched through this loop.
+	//
+	// An inline ordered read used to sit in the PUBLISH branch below, waiting for B's
+	// PUBREL immediately after PUBREC'ing it. That reintroduced exactly the assumption
+	// this loop exists to avoid, and a paired soak caught it under load: "Expected PI 2
+	// got: 1" — A's replayed PUBREL arriving while B's was being waited for. The broker
+	// promises no order between two stored PUBRELs, so the test may not require one.
+	var gotPubRel, gotPublish, gotPublishPubRel bool
+	pendingB := uint16(0)
+	for reads := 0; reads < 8 && !(gotPubRel && gotPublish && gotPublishPubRel); reads++ {
 		b, pl := testMQTTReadPacket(t, r2)
 		switch b & mqttPacketMask {
 		case mqttPacketPubRel:
@@ -98,11 +107,17 @@ func TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel(t *testing.T) {
 			if err != nil {
 				t.Fatalf("reading the PUBREL identifier: %v", err)
 			}
-			if pi != piA {
-				t.Fatalf("the replayed PUBREL must keep its original identifier, got %v want %v", pi, piA)
+			switch {
+			case pi == piA:
+				gotPubRel = true
+			case pendingB != 0 && pi == pendingB:
+				gotPublishPubRel = true
+			default:
+				t.Fatalf("PUBREL for identifier %v, want the replayed %v or the PUBREC'd %v",
+					pi, piA, pendingB)
 			}
+			// Idempotent: a redelivered PUBREL is answered again rather than failing.
 			testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
-			gotPubRel = true
 		case mqttPacketPub:
 			flags, pi, topic, payload := testMQTTGetPubMsgExEx(t, nil, r2, b, pl, "q2restart/topic", nil)
 			if string(payload) != "still-publish" {
@@ -111,10 +126,13 @@ func TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel(t *testing.T) {
 			if flags&mqttPubFlagDup == 0 {
 				t.Errorf("a delivery transmitted before the restart must carry DUP, flags=%x", flags)
 			}
+			if pi != piB {
+				t.Fatalf("the resent PUBLISH-phase claim used identifier %v, want the original %v: the in-flight register did not restore it",
+					pi, piB)
+			}
 			_ = topic
 			testMQTTSendPIPacket(mqttPacketPubRec, t, c2, pi)
-			testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
-			testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
+			pendingB = pi
 			gotPublish = true
 		default:
 			t.Fatalf("unexpected packet type %x", b&mqttPacketMask)
@@ -126,7 +144,9 @@ func TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel(t *testing.T) {
 	if !gotPublish {
 		t.Fatal("the drained PUBLISH-phase claim was never redelivered")
 	}
-	_ = piB
+	if !gotPublishPubRel {
+		t.Fatal("the resent PUBLISH-phase claim never reached its PUBREL, so that exchange did not complete")
+	}
 
 	sess2 := testMQTTResidentSession(t, s, "q2restart")
 	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {

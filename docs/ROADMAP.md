@@ -24,7 +24,9 @@ F-050, and F-063 through F-066 from F-033's audit. That is the largest single bl
 release-blocking work, and it belongs to one OPTIONAL MQTT 5 feature — declining shared
 subscriptions is protocol-legal, via reason code `0x9E` on CONNACK and SUBACK. Moving it out
 of first-alpha scope would retire that block in one decision instead of nine.
-**Not taken:** shared QoS 2 remains alpha scope and those nine remain blockers. Recorded
+**Not taken:** shared QoS 2 remains alpha scope and those nine remain blockers — eight since
+F-063 closed on 2026-08-19; the count above is the one the decision was weighed against, and
+is left as recorded. Recorded
 here so the option is visible when the cost of the block is next weighed, and because
 F-034's audit is expected to behave like F-033's. Taking it would need a README change (the
 feature is promised there) and a `docs/CONFORMANCE.md` statement; it is a different axis
@@ -608,18 +610,31 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
   Holistic review then found one more, filed as **F-066**: the claim key identifies one
   source message only within one incarnation of `$MQTT_msgs`, and recreating that stream
   is a procedure a startup refusal instructs.
-- [ ] [F-063: Prove a copy was retained before acknowledging its source](findings/ha-arbitration.md#f-063).
-  **Alpha blocker.** `$MQTT_out` is interest-retained, so a copy stored onto a subject no
-  consumer filters **succeeds and keeps nothing** — and the only re-read in
-  `materializeQ2AffCopy` is on the CAS-REJECTION path, so a store that SUCCEEDS is never
-  verified. The claim advances to `materialized` and the group source is then acknowledged,
-  which is irreversible. Three routes, one premise: the own-claim path never gathers the
-  evidence (`beginQ2AffOp` admits on a cached POINTER), the on-behalf path gathers it and
-  does not bind it to the store, and a consumer deleted between the materialized
-  observation and the ack leaves the same state. **Not F-064**: an owner-independent
-  reconciler cannot make consumer existence atomic with the store and the ack, so the
-  remedy that closes F-064's stall leaves this untouched. That difference in remedy is
-  what establishes the premises are distinct.
+- [x] [F-063: Prove a copy was retained before acknowledging its source](findings/ha-arbitration.md#f-063).
+  **Alpha blocker — done.** `$MQTT_out` is interest-retained, so a copy stored onto a
+  subject no consumer filters **succeeds and keeps nothing**, and the only re-read in
+  `materializeQ2AffCopy` was on the CAS-REJECTION path: a store that SUCCEEDED was never
+  verified, the claim advanced to `materialized`, and the group source was then
+  acknowledged irreversibly. All three routes now converge on one PRESENCE CHECK — a
+  successful store is verified exactly as a rejected CAS already was, an
+  already-`materialized` claim is re-verified and never re-stored, and the release is
+  authorized by `sourceAckAuthorized`:
+  `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked`, refused otherwise. Both
+  callers were restructured so a failed materialization re-reads the record instead of
+  returning, or every terminal fact would have become unreachable for exactly the claims
+  that need it. No new durable field and no new claim state.
+  **The stated guarantee was re-scoped by an explicit decision**, from "bound/atomic" to
+  "conditioned on a fresh but non-atomic observation": the claim and the copy live on
+  different streams and `CONSUMER.DELETE` is unconditioned, so no finite check binds copy
+  existence to the ack. The residual — a consumer deleted between the final proof and the
+  ack — is in `docs/CONFORMANCE.md` with a worked interleaving. Two designs were refuted
+  in review and are recorded in the dossier so neither returns: an attempt-scoped
+  `Nats-Msg-Id`, and an owner-independent `Lost` writer (the claim CAS and the copy CAS
+  are on different streams, so it can condemn a claim a concurrent materializer has just
+  given a copy, permanently). **F-064, F-065 and F-036 are untouched**: an
+  owner-independent reconciler cannot make consumer existence atomic with the store and
+  the ack, which is what establishes the premises are distinct, and what this item's
+  refusal strands is F-064's to resolve.
 - [ ] [F-064: Reconcile assignments independently of owner resume](findings/ha-arbitration.md#f-064).
   **Alpha blocker.** `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen` alone, so a live
   matching record makes the sweep skip **every** claim of that generation, and
@@ -953,6 +968,21 @@ finding with acceptance criteria.
   count, which is only correct for exactly two attempts. Not folded into the
   acceptance-fact change: different mechanism (F-029b origin intervals), and that diff
   already spans 46 files.
+- [ ] Make `TestQ2AffineResumeDoesNotRechargeAckBudget`'s reconnect loop tolerate a closed
+  connection. **Test infrastructure, not a broker gap, and MEASURED as pre-existing.**
+  It closes and reopens the member three times in a loop
+  (`qos2_shared_affine_lifecycle_test.go:791-800`) and intermittently fails at
+  `:793` with `Error reading data: EOF` — the reconnect racing the previous
+  connection's teardown, not the MaxAckPending accounting the test is about.
+  Paired-soak rates, alternating arms under `-race`: **baseline 2/12 and candidate 0/12**
+  with the F-063 selector, then **baseline 1/20 and candidate 1/20** with the drain tests
+  added — combined **3/32 baseline against 1/32 candidate**, so it predates the tree and the
+  soak's own verdict is "comparable rate, the failure predates this tree". Deliberately NOT
+  folded into F-063: the two consults that adjudicated that change's scope set the bound
+  that a failure appearing equally on both arms becomes its own item, and the fix is to the
+  reconnect handshake rather than to anything F-063 touches. The three fixture defects that
+  soak DID attribute to F-063's load were fixed there.
+
 - [ ] Cover retained convergence for a sourced `$MQTT_rmsgs` topology.
   **Investigation.** `docs/ARCHITECTURE.md` declares a cross-account sourced
   retained stream a supported topology, but the only test of it lives in the

@@ -165,18 +165,26 @@ robust error classification
   **indefinitely**; the message is copied onto the winner's own
   generation-scoped `$MQTT_out` subject and delivered by a durable only that
   session generation can read, so the exchange completes off the queue-delivered
-  group durable entirely. The group delivery is acked only once the claim proves
-  the copy exists, and that ack is proven by a JetStream double ack before any
-  claim is reaped — a queued ack would let a lost ack reopen the assignment.
+  group durable entirely. The group delivery is released only against evidence — a
+  copy PROVEN PRESENT by a fresh lookup, or a terminal fact on the claim, never the
+  `materialized` phase on its own (F-063) — and that ack is proven by a JetStream
+  double ack before any claim is reaped, since a queued ack would let a lost ack
+  reopen the assignment.
   Assignment deliberately does **not** rest on the `Nats-Msg-Id` deduplication
   window (finite; using it recreates the violation). Completion facts are
   orthogonal and monotonic, so a discard can never stand in for an unproven
-  source ack. Residuals, both stated in `docs/CONFORMANCE.md`: packet-identifier
-  continuity across a broker restart or failover (the message stays
-  session-affine and is neither lost nor redistributed, but is redelivered with
-  DUP=1 and a fresh identifier), and mixed-version operation — the storage schema
-  is rolling-compatible, the delivery protocol is not, so affinity holds only once
-  every broker that can serve the group is q2aff-aware.
+  source ack. Residual, stated in `docs/CONFORMANCE.md`: a consumer deleted between
+  the final copy proof and the source ack, which no finite check closes because the
+  claim and the copy live on different streams and `CONSUMER.DELETE` is
+  unconditioned. **Two residuals recorded here earlier are gone, and neither was
+  retired by F-063** — both are corrected as part of it because the paragraph was
+  rewritten and they contradict what the tree now says. Packet-identifier
+  continuity across a broker restart or failover is **no longer** a deviation on
+  this or any outbound path: the identifier is durable and restored before the
+  redelivery. And mixed-version operation is not a residual at all — the
+  compatibility boundary is normative, there are no releases and no mixed fleet, so
+  affinity is stated as SCOPE (every broker serving the account runs this tree)
+  rather than as a rollout condition.
 
 ## F-009
 
@@ -285,9 +293,19 @@ after UNSUBSCRIBE
   UNSUBSCRIBE falls back to today's destructive teardown and warns), a
   best-effort clear of the escapable *per-consumer* inactivity timer whose failure
   leaves the durable reapable while offline (reported as loss, never as
-  completion), packet-identifier continuity across a restart, and mixed-version
-  operation — an older broker ignores `Drains` and its orphan sweep can delete a
-  drained durable.
+  completion). **Two further residuals recorded here are gone, and neither was retired
+  by this finding** — both are corrected in passing, for the same reasons as under the
+  shared-QoS-2 entry above: packet-identifier continuity across a restart is **no longer**
+  a deviation on any outbound path, and mixed-version operation is not a residual at all,
+  because the compatibility boundary is normative and there is no mixed fleet.
+  The three comments in `unsub_drain_test.go` and `unsub_drain_cluster_test.go` that
+  still asserted the closed identifier deviation are corrected too, and the **three
+  drain paths that accepted an arbitrary identifier now compare it with the
+  original** — after completing two exchanges, so the comparison is not the vacuous
+  one at identifier 1. Continuity was MEASURED to hold on all three before the
+  assertions were written, and disabling `recoverInflightRegisters` makes all three
+  fail, so they discriminate. A fourth site needed only a comment: its test already
+  required the resumed PUBREL under the exact identifier.
   **Verification.** The acceptance matrix from the implementation plan is complete
   and every case is mutation-checked — a mutation that breaks the behavior must
   fail its test, or the test is not evidence. Four test files:

@@ -191,7 +191,7 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 
 All are tracked in `docs/ROADMAP.md`.
 
-### Shared-subscription QoS 2: affinity holds; packet-identifier continuity does not
+### Shared-subscription QoS 2: affinity holds, against a non-atomic proof
 
 A QoS 2 message the broker has started sending to a Shared Subscription member
 now stays with that member. Ownership is a durable assignment claim on
@@ -227,13 +227,52 @@ leaves it unmarked and its shared-group source message re-offered forever, becau
 group consumer sets no `MaxDeliver`. That is **F-064**; the sentence above describes the
 resumed case only.
 
-**A second correction from the same audit: an out-of-band destruction is not the only way
-these copies are lost.** Because `$MQTT_out` is interest-retained, a copy stored after the
-consumer is gone succeeds and keeps nothing, and the source is then acknowledged on the
-strength of that store — so the message is released from the shared group having never
-existed on any consumer. That loss is produced by the broker's own delivery path rather
-than by anything out of band, and the distinguishing write order above does not help,
-because no delivery ever ran. That is **F-063**.
+**F-063, closed 2026-08-19: the broker no longer releases a source against a store
+response.** Because `$MQTT_out` is interest-retained, a copy stored after its consumer is
+gone succeeds and keeps nothing; the broker used to acknowledge the group source on the
+strength of that store, so the message was released from the shared group having never
+existed on any consumer, and the distinguishing write order above could not help because
+no delivery had run. Every route to that acknowledgement now proves the copy with a
+presence check on the copy subject and authorizes the release from
+`copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked`, refusing otherwise. A claim
+left nonterminal by that refusal is **F-064**'s to resolve; refusal preserves the only
+recoverable asset, which is the unacked group delivery.
+
+**The stated residual: a consumer deleted between the final proof and the ack.** The
+guarantee is conditioned on a fresh but **non-atomic** observation, and that wording is
+exact rather than cautious. The claim read and the copy read are separate JetStream round
+trips, the copy lives on a different stream from the claim, and JetStream's
+`CONSUMER.DELETE` carries no precondition field at all — so no finite check binds copy
+existence to the acknowledgement that follows it. The interleaving, worked:
+
+1. A broker proves the copy present on `$MQTT.out.q2.<hash>.<gen>.<claim-hash>`.
+2. On a claim that was not already `materialized`, the broker then commits the
+   `claimed`→`materialized` CAS — a load-and-CAS with a three-attempt retry budget
+   (`mqttQ2AffClaimAttempts`), each attempt a further round trip.
+3. An operator, or any other client of the JetStream API, deletes
+   `$MQTT_Q2AFF_<hash>_<gen>`. Interest retention takes the proven copy with it.
+4. The broker's `confirmAck` commits, irreversibly releasing the group source.
+
+**The window spans step 1 to step 4, and step 2 is part of it.** How much of step 2 depends
+on the route, and only ONE route omits it entirely:
+
+- The contender's foreign-materialized arm never enters `materializeQ2AffCopy`, so its span
+  really is the copy lookup and then the ack.
+- An owner re-verifying an already-`materialized` claim still calls `advanceQ2AffClaim`,
+  which **loads the claim** before finding the phase unchanged and skipping the write. The
+  CAS is a no-op; the load is not.
+- A fresh or on-behalf materialization pays the full load-and-CAS, retried up to three
+  times.
+
+An earlier draft of this section wrongly called the whole thing "one round trip that
+nothing inside the broker can widen", and its first correction still wrongly gave the
+already-materialized owner route the ack alone. What the
+change actually replaces is an acknowledgement resting on a store response, or on evidence
+gathered before the store, or on the phase alone; what it does not do is make the span
+zero. Such an assignment is left `materialized` with no copy and no `AffineDone`, which is
+exactly the state `recoverQ2AffClaims` records as `Lost` on the owner's next resume — so
+the outcome is retained as evidence rather than laundered, subject to the resume caveat
+above (F-064).
 
 That discrimination holds **while the owning session record still exists**. If the
 record disappears first — the session expired, or a broker died without tearing it
@@ -245,7 +284,11 @@ that occurred before the record vanished and that no broker had yet recorded. A
 discarded assignment is itself retained until the source is proven closed, so
 reaping it can never let a redelivery elect a second winner.
 
-One deviation remains.
+**What remains in this section**, therefore: the out-of-band consumer destruction above,
+whose `Lost` marking depends on the owner resuming (F-064), and F-063's non-atomic span
+between the final copy proof and the source ack. Both are stated with their mechanism
+rather than a bound they do not have. Not this, despite the heading this section carried
+until F-063 closed:
 
 Packet-identifier continuity across a broker restart or failover is **no longer** a
 deviation, here or on any other outbound path: a started delivery's identifier is

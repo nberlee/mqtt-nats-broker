@@ -1105,7 +1105,7 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 // runs after confirmSourceAckAndRecord (moveStartedSharedQoS2's foreign-winner
 // branch). Driving it directly is what makes the ordering deterministic — an
 // unconfirmed source ack cannot be produced from the wire, since the broker acks
-// the group delivery as soon as the claim materializes.
+// the group delivery as soon as it can prove the copy present.
 func TestQ2AffineContenderCannotReapALostDelivery(t *testing.T) {
 	t.Parallel()
 	b := testQ2AffSetup(t, "contreap")
@@ -3273,6 +3273,20 @@ func TestQ2AffEveryWriteCarriesItsExpectation(t *testing.T) {
 	// killed that way discriminates nothing. Deferring means a wrong base is reported as
 	// the wrong base, by name.
 	defer func() {
+		// Shut the raw hook FIRST, and wait out any call already inside it. The oracles
+		// below read the per-invocation emission fields (`emitted`, `emitCount`,
+		// `emitSeen`), which that hook writes from the DELIVERY goroutine under `curMu`
+		// while this block holds only `mu` — a mutex mismatch, and a real data race the
+		// paired soak caught under `-race`. Taking `curMu` here instead would invert the
+		// hook's own curMu→mu order and could deadlock; closing the gate removes the
+		// concurrent writer altogether, which is what the gate is for. The gate's own
+		// t.Cleanup closes it again, which is idempotent.
+		//
+		// The window is not hypothetical: an exchange's last claim transitions are written
+		// by the JetStream delivery callback, so a store can still be in flight when the
+		// subtest returns.
+		gate.close()
+
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -3655,41 +3669,37 @@ func TestQ2AffLiveRecordLeavesAStrandedClaimToOwnerResume(t *testing.T) {
 	t.Log("F-064 reproduced: a live generation reference left a nonterminal claim, whose consumer is gone, entirely untouched by the sweep")
 }
 
-// TestQ2AffSourceAckedAfterAStoreThatKeptNothing pins F-063.
+// TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing is F-063's own-claim route,
+// as a regression test. It began life as that finding's defect pin, asserting the
+// released source; the remedy inverted it, which is what the pin was written to force.
 //
 // $MQTT_out is interest-retained, so a copy stored onto a subject no consumer filters
-// SUCCEEDS AND KEEPS NOTHING. The own-claim path never learns that: beginQ2AffOp admits the
-// move on local state alone (a readiness flag, a generation and a consumer POINTER), and
-// materializeQ2AffCopy re-reads only when the create-only CAS is REJECTED — a store that
-// succeeds is never verified. The claim advances to materialized and the source is then
-// acknowledged, which is irreversible and releases the message from the shared group.
+// SUCCEEDS AND KEEPS NOTHING, and the own-claim path is where nothing else can catch that:
+// beginQ2AffOp admits the move on local state alone (a readiness flag, a generation and a
+// consumer POINTER), so the store is the first operation that touches the durable consumer
+// at all. materializeQ2AffCopy therefore proves the copy with a PRESENCE CHECK after the
+// store, and the group source is released only against that proof.
 //
 // Staged with no seam at all, because none is needed: deleting the affine consumer out of
 // band leaves the live session's cached pointer intact, which is precisely the state the
 // admission gate cannot see. Everything after that is the ordinary production path.
 //
-// Leftover asserted: materialized + SourceAcked, copy AUTHORITATIVELY absent, and the group
-// source gone — an accepted QoS 2 message that no redelivery can recover and that only a
-// later owner resume would even record as Lost.
+// Asserted: the claim stays at `claimed`, carries no terminal fact, is never source-acked,
+// and its source message is still on $MQTT_msgs — the accepted message is still owned by
+// somebody. What that refusal strands is F-064's to resolve, and its pin above reproduces
+// it; this fixture's business is only that nothing was released against a store response.
 //
-// Discriminating mutation: verify retention after the store and refuse to advance when it
-// cannot be proven. The claim then never reaches materialized, the source is never acked,
-// and this fixture fails.
-//
-// **That mutation closes THIS ROUTE, not the finding.** A post-store check still leaves a
-// consumer deleted between the check and confirmSourceAckAndRecord, and the
-// already-materialized contender route acknowledges the source at qos2_shared_affine.go
-// without any such check at all. So this fixture going green again is evidence about the
-// own-claim path only; F-063's premise is finding-wide and needs the on-behalf TOCTOU and
-// the materialized-observation route covered too, each with its own staging. The failure
-// message below says exactly that, deliberately, so a partial remedy cannot read as a
-// closed finding.
-func TestQ2AffSourceAckedAfterAStoreThatKeptNothing(t *testing.T) {
+// Discriminating mutation: verify only on a REJECTED create-only CAS (mutation 1), which is
+// what the code did when F-063 was filed. The store then succeeds unverified, the claim
+// advances to materialized, and the source is acknowledged — so this fixture fails on the
+// released source rather than on silence.
+func TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing(t *testing.T) {
 	t.Parallel()
 	b := testQ2AffSetup(t, "keptnothing")
 	c, _ := b.member(t, "keptnothingA", 300)
 	defer c.Close()
 	b.bind(t, "keptnothingA")
+	moves := testQ2AffWatchMoves(t, b)
 
 	idHash := getHash("keptnothingA")
 	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
@@ -3702,52 +3712,33 @@ func TestQ2AffSourceAckedAfterAStoreThatKeptNothing(t *testing.T) {
 		t.Fatalf("deleting the affine consumer out of band: %v", err)
 	}
 
-	// An ordinary QoS 2 publish to the shared group. The member's own move elects a claim,
-	// stores the copy onto nothing, and acknowledges the source.
+	// An ordinary QoS 2 publish to the shared group. The member's own move elects a claim
+	// and stores the copy onto nothing.
 	b.publish(t, 1, "keptnothing")
 
-	deadline := time.Now().Add(10 * time.Second)
-	var claim *mqttQ2AffClaim
-	var subject string
-	for time.Now().Before(deadline) {
-		for sub, cl := range b.claims(t) {
-			if cl.ownedBy(idHash, gen) {
-				claim, subject = cl, sub
-				break
-			}
-		}
-		if claim != nil && claim.SourceAcked && claim.Phase == mqttQ2AffMaterialized {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	subject, claim := testQ2AffOnlyClaim(t, b)
+	if !claim.ownedBy(idHash, gen) {
+		t.Fatalf("the claim on %q names %q/%q, not the member under test: this run did not exercise the own-claim route",
+			subject, claim.Winner, claim.Gen)
 	}
-	if claim == nil {
-		t.Fatal("no assignment claim was elected for the member; the move never ran, so this run did not exercise the path")
-	}
-	if claim.Phase != mqttQ2AffMaterialized {
-		t.Fatalf("claim on %q is %v, want materialized: the copy store did not report success",
-			subject, claim.Phase)
-	}
-	if !claim.SourceAcked {
-		// A remedy landing on the own-claim path reaches exactly this branch. Do NOT read
-		// it as F-063 closed: the on-behalf TOCTOU and the materialized-observation route
-		// are not staged here and are not covered by a post-store check.
-		t.Fatalf("claim on %q was NOT source-acked, so the OWN-CLAIM route of F-063 is closed: re-point this fixture at a regression test for that route, and confirm the on-behalf TOCTOU and the materialized-observation route separately before closing the finding",
-			subject)
-	}
+
+	// The move RAN and refused. Without this the assertions below would also pass on a
+	// run where the group delivery never reached the member at all.
+	moves.await(t, subject, mqttQ2AffMoveDeferred, "the owner refused to release a source for a store that kept nothing")
+	moves.never(t, subject, mqttQ2AffMoveOwned, mqttQ2AffMoveTerminal)
+
 	// The copy has to be AUTHORITATIVELY absent, not merely unreadable, or the assertion
 	// would rest on a failed lookup rather than on interest retention having kept nothing.
 	if st, _ := b.asm.loadQ2AffCopy(claim.CopySubject); st != mqttQ2AffCopyAbsent {
 		t.Fatalf("the copy on %q reads %v, want absent: the store kept something after all",
 			claim.CopySubject, st)
 	}
-	if claim.AffineDone || claim.Lost || claim.Discarded {
-		t.Fatalf("claim on %q carries a terminal fact (AffineDone=%v Lost=%v Discarded=%v); nothing delivered or disposed of this message",
-			subject, claim.AffineDone, claim.Lost, claim.Discarded)
-	}
-	// F-063, pinned: the group source was released on the strength of a store that
-	// retained nothing, and the message is gone with no record that it was lost.
-	t.Log("F-063 reproduced: materialized + SourceAcked with no copy — an accepted QoS 2 message released from the group and lost")
+	testQ2AffAssertNotReleased(t, b, moves, subject, mqttQ2AffClaimed, 2)
+	// Positive evidence that the message is still the group's to re-offer, rather than
+	// released and gone. A POSITIVE load, not `!q2AffSourceGone`: that production predicate
+	// is fail-closed and answers false both when the source is present and when it could
+	// not be read, so negating it would let an indeterminate read pass for evidence.
+	testQ2AffAssertSourcePresent(t, b.asm, claim, "after the refusal")
 }
 
 // TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage pins F-066's flagship row.

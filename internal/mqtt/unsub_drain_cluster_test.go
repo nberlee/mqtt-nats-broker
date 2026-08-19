@@ -51,6 +51,21 @@ func TestMQTTDrainClusterResumesOnAnotherBroker(t *testing.T) {
 	if _, reason, _ := testMQTTReadConnAckV5(t, pr); reason != mqttReasonSuccess {
 		t.Fatalf("CONNACK for the publisher: reason=%v", reason)
 	}
+	// Two exchanges completed first, so the subscriber's identifier allocator has moved
+	// past 1 before the delivery that is left unfinished. Without this the continuity
+	// comparison after the resume is vacuous: a broker allocating fresh would also
+	// produce 1. Measured before this was written — the original identifier here is 3.
+	for i, body := range []string{"burn-1", "burn-2"} {
+		pi := uint16(10 + i)
+		testMQTTPublishV5(t, pc, 2, pi, topic, []byte(body))
+		testMQTTReadPIPacket(mqttPacketPubRec, t, pr, pi)
+		testQoS2SendPubRel(t, pc, pi)
+		testMQTTReadPIPacket(mqttPacketPubComp, t, pr, pi)
+		_, spi := testMQTTReadPublishV5(t, ra, topic, []byte(body))
+		testMQTTSendPIPacket(mqttPacketPubRec, t, ca, spi)
+		testMQTTReadPIPacket(mqttPacketPubRel, t, ra, spi)
+		testMQTTSendPIPacket(mqttPacketPubComp, t, ca, spi)
+	}
 	testMQTTPublishV5(t, pc, 2, 1, topic, []byte("payload"))
 	testMQTTReadPIPacket(mqttPacketPubRec, t, pr, 1)
 	testQoS2SendPubRel(t, pc, 1)
@@ -61,6 +76,9 @@ func TestMQTTDrainClusterResumesOnAnotherBroker(t *testing.T) {
 	qos, piA := testMQTTReadPublishV5(t, ra, topic, []byte("payload"))
 	if qos != 2 {
 		t.Fatalf("delivered QoS=%v, want 2", qos)
+	}
+	if piA <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce; the continuity comparison after the resume would prove nothing", piA)
 	}
 
 	if codes := testMQTTUnsubV5(t, ca, ra, 2, []string{topic}); len(codes) != 1 || codes[0] != mqttReasonSuccess {
@@ -91,8 +109,11 @@ func TestMQTTDrainClusterResumesOnAnotherBroker(t *testing.T) {
 		t.Fatal("broker B must report Session Present: it is resuming a persisted session, not starting one")
 	}
 
-	// B redelivers the claim and completes the exchange. The identifier is B's own
-	// (the documented packet-identifier continuity deviation across a failover).
+	// B redelivers the claim and completes the exchange UNDER THE ORIGINAL IDENTIFIER.
+	// Continuity is no longer a deviation on any outbound path: the in-flight register on
+	// $MQTT_inflight is restored before source interest is, and drain recovery reserves the
+	// identifier the drain already recorded. This assertion previously discarded piA on the
+	// strength of the old deviation, so a continuity regression here would have passed.
 	qos, piB := testMQTTReadPublishV5(t, rb, topic, []byte("payload"))
 	if qos != 2 {
 		t.Fatalf("broker B delivered QoS=%v, want 2", qos)
@@ -101,7 +122,10 @@ func TestMQTTDrainClusterResumesOnAnotherBroker(t *testing.T) {
 	testMQTTReadPIPacket(mqttPacketPubRel, t, rb, piB)
 	testMQTTSendPIPacket(mqttPacketPubComp, t, cb, piB)
 	testMQTTFlush(t, cb, nil, rb)
-	_ = piA
+	if piB != piA {
+		t.Fatalf("broker B redelivered under packet identifier %d, want the original %d: the drain's in-flight register did not restore it",
+			piB, piA)
+	}
 
 	sessB := testMQTTResidentSession(t, b.s, clientID)
 	checkFor(t, testMQTTTimeout, 50*time.Millisecond, func() error {
@@ -123,9 +147,9 @@ func TestMQTTDrainClusterResumesOnAnotherBroker(t *testing.T) {
 // ORIGINAL packet identifier.
 //
 // This is the guarantee the durable intent buys. Everywhere else across a failover
-// a delivery is re-offered with a fresh identifier (the documented
-// packet-identifier continuity deviation), because nothing durable ties an
-// in-flight PUBLISH to its identifier. Past the intent there is such a record, so
+// a delivery's PUBLISH phase restarts, but under the identifier the in-flight register
+// preserved — continuity itself is not a deviation. What the durable intent adds is that
+// the SECOND phase resumes instead of restarting, so
 // the second phase completes as the same exchange rather than restarting as a new
 // one — and the client, which is still holding that identifier, can PUBCOMP it.
 func TestMQTTDrainClusterPubRecToPubCompAcrossBrokers(t *testing.T) {
@@ -339,6 +363,19 @@ func TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere(t *testing.T) {
 	if _, reason, _ := testMQTTReadConnAckV5(t, pr); reason != mqttReasonSuccess {
 		t.Fatalf("CONNACK for the publisher: reason=%v", reason)
 	}
+	// Two exchanges completed first, so the identifier allocator has moved past 1 and the
+	// comparison after the resume is not vacuous — a fresh allocator would produce 1 too.
+	for i, payload := range []string{"burn-1", "burn-2"} {
+		pi := uint16(10 + i)
+		testMQTTPublishV5(t, pc, 2, pi, topic, []byte(payload))
+		testMQTTReadPIPacket(mqttPacketPubRec, t, pr, pi)
+		testQoS2SendPubRel(t, pc, pi)
+		testMQTTReadPIPacket(mqttPacketPubComp, t, pr, pi)
+		_, spi := testMQTTReadPublishV5(t, ra, topic, []byte(payload))
+		testMQTTSendPIPacket(mqttPacketPubRec, t, ca, spi)
+		testMQTTReadPIPacket(mqttPacketPubRel, t, ra, spi)
+		testMQTTSendPIPacket(mqttPacketPubComp, t, ca, spi)
+	}
 	testMQTTPublishV5(t, pc, 2, 1, topic, []byte("payload"))
 	testMQTTReadPIPacket(mqttPacketPubRec, t, pr, 1)
 	testQoS2SendPubRel(t, pc, 1)
@@ -354,6 +391,9 @@ func TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere(t *testing.T) {
 		piA = p
 	}
 	sessA.mu.Unlock()
+	if piA <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce; the comparison after the resume would prove nothing", piA)
+	}
 	if piA == 0 {
 		t.Fatal("expected an in-flight delivery on broker A")
 	}
@@ -397,6 +437,15 @@ func TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere(t *testing.T) {
 	qos, piB := testMQTTReadPublishV5(t, rb, topic, []byte("payload"))
 	if qos != 2 {
 		t.Fatalf("broker B delivered QoS=%v, want 2", qos)
+	}
+	// Under the ORIGINAL identifier. The PUBLISH phase legitimately restarts here — no
+	// durable intent means the exchange never got past PUBREC — but the identifier it
+	// restarts under is the one the in-flight register preserved, so this comparison is
+	// what separates "re-offered as the same exchange" from "restarted as a new message".
+	// It previously accepted any identifier, which a continuity regression would pass.
+	if piB != piA {
+		t.Fatalf("broker B re-offered under packet identifier %d, want the original %d: the in-flight register did not restore it",
+			piB, piA)
 	}
 	testMQTTSendPIPacket(mqttPacketPubRec, t, cb, piB)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, rb, piB)
