@@ -173,7 +173,7 @@ func TestOrphanSweepRetiresRetiredGenerationAndSparesLive(t *testing.T) {
 // TestOrphanSweepSharedSourceHonorsDiscardedAssignment pins that reconciling an
 // orphan winner's assignment does NOT hand its started delivery to another member.
 //
-// [MQTT-4.8.2-6] permits the message to die with the session it was assigned to and
+// [MQTT-4.8.2-5] permits the message to die with the session it was assigned to and
 // forbids redistributing it. The claim is therefore marked Discarded and kept for
 // as long as the source could still be re-offered — never deleted in a way that
 // would let a redelivery elect a fresh winner.
@@ -232,7 +232,7 @@ func TestOrphanSweepSharedSourceHonorsDiscardedAssignment(t *testing.T) {
 	}
 	if _, payload, _, _, ok := testMQTTTryReadPublishV5(otherReader, 3*time.Second); ok {
 		t.Fatalf("the started delivery was redistributed to a second member (payload %q), "+
-			"which [MQTT-4.8.2-6] forbids\n%s", payload, c.describe())
+			"which [MQTT-4.8.2-5] forbids\n%s", payload, c.describe())
 	}
 }
 

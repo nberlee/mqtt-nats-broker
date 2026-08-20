@@ -3,7 +3,7 @@
 // Conformance and invariant tests for session-affine ownership of a STARTED
 // shared-subscription QoS 2 delivery (qos2_shared_affine.go).
 //
-// The property under test is [MQTT-4.8.2-5]/[MQTT-4.8.2-6]: once the server has
+// The property under test is [MQTT-4.8.2-4]/[MQTT-4.8.2-5]: once the server has
 // begun delivering a shared message to one client it completes that delivery with
 // THAT client, and the message may only die with that client's session — never be
 // handed to another member. Every test here is written so it FAILS on the
@@ -16,12 +16,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
 )
 
 type testQ2AffBroker struct {
@@ -375,7 +379,7 @@ func TestQ2AffineUnsubscribeMidWindowKeepsDelivery(t *testing.T) {
 	b.waitForNoClaims(t)
 }
 
-// Dying with the session is PERMITTED ([MQTT-4.8.2-6]); being handed to another
+// Dying with the session is PERMITTED ([MQTT-4.8.2-5]); being handed to another
 // member is not. A discarded session's claim must go terminal, and the message
 // must not reappear anywhere.
 func TestQ2AffineSessionEndDiscardsRatherThanRedistributes(t *testing.T) {
@@ -1012,13 +1016,19 @@ func TestQ2AffineUnreadableClaimFailsScanClosed(t *testing.T) {
 	})
 }
 
-// Losing the affine consumer out of band is message loss, and recovery must not
-// launder it into a completed delivery. $MQTT_out is interest-retained, so
-// deleting the consumer deletes the copies it held; an absent copy under a
-// materialized claim then means two different things, and only one of them is a
-// success. The claim must end up recorded as LOST — terminal, so nothing waits on
-// it, but never reaped, so the durable evidence of an undelivered QoS 2 message
-// survives.
+// Losing the affine consumer out of band is unproven delivery, and recovery must
+// not launder it into a completed one. $MQTT_out is interest-retained, so deleting
+// the consumer deletes the copies it held; an absent copy under a materialized
+// claim then means two different things, and only one of them is a success. The
+// claim must end up recorded as LOST — terminal, so nothing waits on it, but never
+// reaped, so the durable evidence survives.
+//
+// "Unproven", not "lost": the inference behind LOST is sound for the JetStream
+// copy ack, which is recorded before the copy is acked, but NOT for the client's
+// PUBREC, which is answered earlier still — so this shape can also be a message
+// that arrived (F-064's residual 1). Nothing this fixture asserts depends on which
+// it was; the direction it pins is that recovery must not record COMPLETION it
+// cannot prove.
 func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 	t.Parallel()
 	b := testQ2AffSetup(t, "lostcons")
@@ -1069,10 +1079,10 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 			t.Fatalf("loading the claim: %v", err)
 		}
 		if claim == nil {
-			t.Fatal("the assignment for an undelivered QoS 2 message was REAPED; the only durable evidence of the loss is gone")
+			t.Fatal("the assignment for an unproven QoS 2 delivery was REAPED; the only durable evidence of it is gone")
 		}
 		if claim.AffineDone {
-			t.Fatal("an undelivered QoS 2 message was recorded as a completed delivery")
+			t.Fatal("a QoS 2 delivery that was never proven was recorded as completed")
 		}
 		if claim.Lost {
 			if !claim.terminal() {
@@ -1098,8 +1108,11 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 // contender confirms the ack and runs the reaper — on a broker that has never
 // seen the owner's consumer and cannot know whether it survived. Concluding
 // "materialized with no copy left ⇒ delivered" there deletes the only durable
-// record of a message the broker accepted and never delivered, and it happens
-// BEFORE the owner ever resumes to record it as lost.
+// record of a message the broker accepted and could not prove it delivered, and
+// it happens BEFORE the owner ever resumes to record it as lost. ("Could not
+// prove", not "never delivered": the client's PUBREC precedes the affine record,
+// so this shape can also be a message that arrived — F-064's residual 1. The
+// evidence is worth keeping either way, which is all this fixture asserts.)
 //
 // The reaper call below is not a stand-in: it is literally what the contender
 // runs after confirmSourceAckAndRecord (moveStartedSharedQoS2's foreign-winner
@@ -1178,7 +1191,7 @@ func TestQ2AffineContenderCannotReapALostDelivery(t *testing.T) {
 		t.Fatalf("reloading the claim: %v", err)
 	}
 	if after == nil {
-		t.Fatal("a contender reaped an undelivered QoS 2 message's assignment; the owner can no longer record it as lost, and the evidence is gone")
+		t.Fatal("a contender reaped an unproven QoS 2 delivery's assignment; the owner can no longer record it as lost, and the evidence is gone")
 	}
 	if after.AffineDone {
 		t.Fatal("a contender concluded the affine side was complete from an absent copy it could not account for")
@@ -1390,7 +1403,7 @@ func TestQ2AffineLossSurvivesConsumerRecreateAndHandoff(t *testing.T) {
 		t.Fatalf("loading the claim: %v", err)
 	}
 	if got == nil {
-		t.Fatal("the assignment for an undelivered QoS 2 message was reaped after the consumer was recreated")
+		t.Fatal("the assignment for an unproven QoS 2 delivery was reaped after the consumer was recreated")
 	}
 	if got.AffineDone {
 		t.Fatal("a recreated consumer made a lost delivery look completed; the continuity decision is not durable")
@@ -1402,8 +1415,8 @@ func TestQ2AffineLossSurvivesConsumerRecreateAndHandoff(t *testing.T) {
 
 // A claim already recorded as Lost must never be revisited into AffineDone by a
 // later resume — by then the consumer has been recreated and looks intact, so the
-// ordinary inference would fire and leave a record claiming both that the message
-// was delivered and that it was lost.
+// ordinary inference would fire and leave a record claiming both that the delivery
+// was proven and that it could not be proven.
 func TestQ2AffineLostClaimIsNotRevisited(t *testing.T) {
 	t.Parallel()
 	b := testQ2AffSetup(t, "lostonce")
@@ -1952,7 +1965,7 @@ func TestQ2AffineAmbiguousProvisioningIsUnwoundAfterPacketRollback(t *testing.T)
 // membership survived the packet), which is what leaves the map empty for this
 // test to seed. The guard is kept because what it prevents is irreversible —
 // assignments discarded out from under a delivery already started, the
-// redistribution [MQTT-4.8.2-6] forbids.
+// redistribution [MQTT-4.8.2-5] forbids.
 //
 // The fixture deliberately leaves NO outstanding affine claim. With one, the later
 // q2AffineGenerationOwnsClaims arm retains the path anyway and the assertions below
@@ -2038,7 +2051,7 @@ func TestQ2AffineReclaimYieldsToALiveSharedMembership(t *testing.T) {
 // the two apart — and this generation may owe a delivery already started to it.
 // Registering the continuation here would discard that assignment and delete a
 // consumer a started delivery is waiting on, which is precisely the redistribution
-// [MQTT-4.8.2-6] forbids.
+// [MQTT-4.8.2-5] forbids.
 //
 // Mutation M8: drop the `minted` restriction on the registration and the claim is
 // discarded and the durable deleted.
@@ -2439,8 +2452,8 @@ func TestQ2AffineReclaimKeepsAPathThatStillOwesADelivery(t *testing.T) {
 
 // A TERMINAL assignment is not an outstanding obligation, and must not block the
 // reclaim. `Lost` is the case that matters: it is deliberately never reaped —
-// it is the only durable evidence that a message the broker accepted was never
-// delivered — so a guard that treated it as owed would retain this path for the
+// it is the only durable evidence of a QoS 2 delivery the
+// broker accepted and could not prove — so a guard that treated it as owed would retain this path for the
 // life of the session, which for a never-expiring one is the broker's. That is
 // precisely the leak the reclaim exists to close, so the guard turns on
 // `terminal()` rather than on `Discarded` alone.
@@ -2493,7 +2506,7 @@ func TestQ2AffineReclaimIsNotBlockedByATerminalClaim(t *testing.T) {
 	if got, _, err := a.b.asm.loadQ2AffClaim(claimSubject); err != nil {
 		t.Fatalf("re-loading the terminal assignment: %v", err)
 	} else if got == nil {
-		t.Fatal("the reclaim reaped a Lost assignment; it is the only durable evidence that an accepted message was never delivered")
+		t.Fatal("the reclaim reaped a Lost assignment; it is the only durable evidence that an accepted message could not be proven delivered")
 	} else if !got.Lost {
 		t.Fatal("the reclaim erased the Lost marker")
 	}
@@ -3386,7 +3399,6 @@ func TestQ2AffEveryWriteCarriesItsExpectation(t *testing.T) {
 	b.completeExchange(t, c, r, pi)
 }
 
-
 // affDurableFor is the affine consumer durable for one incarnation, which
 // mqttQ2AffineNames returns as its third value.
 func affDurableFor(idHash, gen string) string {
@@ -3579,21 +3591,41 @@ func TestQ2AffResumeAdoptsConsumerKeepingItsCreated(t *testing.T) {
 	t.Log("F-036 adoption blind spot reproduced: an adopting resume leaves ConsumerInfo.Created unchanged, so step (5) cannot discriminate it")
 }
 
-// TestQ2AffLiveRecordLeavesAStrandedClaimToOwnerResume pins F-064.
+// The split F-064 delivers, asserted from both sides.
 //
 // buildSessionRefs keys refs.affine on ps.Q2AffGen alone, so a live matching record
 // makes the sweep skip EVERY claim of that generation — reconciliation, the discard,
-// and the consumer pass alike. recoverQ2AffClaims, the only writer of Lost, runs on the
-// owner's own resume. So a nonterminal claim whose affine consumer is gone, under a
-// session that never comes back, is reconciled by nothing at all: contenders keep
-// failing the consumer lookup and the group's source keeps being re-offered, because
-// no MaxDeliver bounds it.
+// and the consumer pass alike. That has NOT changed and is not a defect: the sweep
+// has no payload to materialize with, so it could only ever resolve such a claim by
+// erasing it, and reaping a claim of a live generation needs the reaper fence that
+// is F-065's remedy.
 //
-// Discriminating mutation: give the sweep an owner-independent reconciler for claims
-// under a live reference (the remedy). The claim then resolves and this fixture fails
-// at "the claim was left untouched".
-func TestQ2AffLiveRecordLeavesAStrandedClaimToOwnerResume(t *testing.T) {
+// What has changed is that the stall no longer waits for the owner. A group
+// redelivery — which does have the payload — restores the destroyed consumer and
+// materializes onto it, so the source is released instead of being re-offered
+// forever against no MaxDeliver.
+//
+// Both halves are asserted here because either alone is misleading: the first would
+// read as F-064 still being open, and the second would not show that the sweep is
+// deliberately still passive.
+func TestQ2AffLiveRecordStrandedClaimIsResolvedByAContender(t *testing.T) {
 	t.Parallel()
+	t.Run("a sweep pass alone leaves it, which is F-065's half", func(t *testing.T) {
+		t.Parallel()
+		testQ2AffSweepLeavesAStrandedClaim(t)
+	})
+
+	t.Run("a group redelivery resolves it, which is this item's half", func(t *testing.T) {
+		t.Parallel()
+		st := testQ2AffStageContender(t, "strandedfix", nil, nil, nil)
+		st.deleteWinnerDurable(t)
+		// One redelivery is enough: the contender restores the winner's consumer,
+		// materializes onto it and releases the group source.
+		testQ2AffAwaitMaterialized(t, st)
+	})
+}
+
+func testQ2AffSweepLeavesAStrandedClaim(t *testing.T) {
 	b := testQ2AffSetup(t, "stranded")
 	c, _ := b.member(t, "strandedA", 0xFFFFFFFF) // never expires: "unbounded" is STAGED, not inferred
 	defer c.Close()
@@ -3658,15 +3690,19 @@ func TestQ2AffLiveRecordLeavesAStrandedClaimToOwnerResume(t *testing.T) {
 		t.Fatal("the sweep reaped a nonterminal claim; that would be a different (and worse) defect than F-064")
 	}
 	if got.Discarded || got.Lost || got.AffineDone {
-		// A failure, not a skip, for the same reason as F-065's fixture above.
-		t.Fatalf("the sweep resolved the stranded claim (Discarded=%v Lost=%v AffineDone=%v), so F-064 is fixed: replace this defect fixture with a regression test for the owner-independent reconciler",
+		// A failure, not a skip. The sweep has no payload, so the only way it could
+		// have resolved this claim is by asserting a fact it cannot prove —
+		// recording a delivery that never happened, or discarding a message the
+		// client is still owed.
+		t.Fatalf("the sweep resolved the stranded claim (Discarded=%v Lost=%v AffineDone=%v); it has no payload, so it cannot have proven any of them",
 			got.Discarded, got.Lost, got.AffineDone)
 	}
 	if got.Phase != mqttQ2AffClaimed {
 		t.Fatalf("the claim's phase moved to %v without a terminal fact", got.Phase)
 	}
-	// F-064, pinned: a full sweep pass, and the claim is exactly as it was.
-	t.Log("F-064 reproduced: a live generation reference left a nonterminal claim, whose consumer is gone, entirely untouched by the sweep")
+	// Pinned: the sweep stays passive under a live reference. Its reap half is
+	// F-065's, and the stall itself is closed by the redelivery route instead.
+	t.Log("the sweep left a nonterminal claim of a live generation untouched, which is F-065's half of F-064")
 }
 
 // TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing is F-063's own-claim route,
@@ -3872,4 +3908,2118 @@ func (b *testQ2AffBroker) lastSourceSeq(t *testing.T) uint64 {
 		t.Fatalf("looking up %s: si=%v err=%v", mqttStreamName, si, err)
 	}
 	return si.State.LastSeq
+}
+
+// ---------------------------------------------------------------------------
+// F-064 — the owner's provisioning path gains no new refusals
+// ---------------------------------------------------------------------------
+
+// testQ2AffOwnerArm imposes one condition that on-behalf restoration teaches the
+// CONTENDER to refuse, and that the owner must go on ignoring. lookups, when
+// non-nil, reports how many affine consumer lookups the arm observed.
+type testQ2AffOwnerArm struct {
+	name  string
+	apply func(t *testing.T, b *testQ2AffBroker) (lookups func() int32)
+}
+
+// A function rather than a package-level var, deliberately: a var here is
+// process-global state, and TestParallelTestsTouchNoProcessGlobalState correctly
+// refuses to let a t.Parallel() test reach one. Same reason as
+// testBrokerStreamSpecs (stream_prereqs_test.go).
+func testQ2AffOwnerArms() []testQ2AffOwnerArm {
+	return []testQ2AffOwnerArm{
+		{
+			// A stream-forced inactivity limit imposed AFTER startup, so
+			// validateOutStream has already run and passed. nats-server substitutes the
+			// stream's limit into any create whose own InactiveThreshold is zero, and the
+			// affine config deliberately sends zero — so this is the condition under
+			// which the owner creates a durable the stream may later reap. A contender
+			// refuses it outright; the owner accepts it, exactly as it does today.
+			name: "a stream inactivity limit imposed after startup",
+			apply: func(t *testing.T, b *testQ2AffBroker) func() int32 {
+				t.Helper()
+				si, err := b.jsa.lookupStream(mqttOutStreamName)
+				if err != nil || si == nil {
+					t.Fatalf("looking up %s: %v", mqttOutStreamName, err)
+				}
+				cfg := si.Config
+				// Minutes rather than milliseconds, deliberately. This arm pins that the
+				// owner ACCEPTS the substituted threshold; a short one would reap the
+				// durable during the disconnect window and fail the resume shapes for a
+				// reason this fixture does not own.
+				cfg.ConsumerLimits.InactiveThreshold = 5 * time.Minute
+				if _, err := b.jsa.updateStream(&cfg); err != nil {
+					t.Fatalf("imposing a consumer inactivity limit on %s: %v", mqttOutStreamName, err)
+				}
+				return nil
+			},
+		},
+		{
+			// The seam that catches a lookup added to the owner's path. The owner
+			// performs none, so failing every lookup must change nothing; a preflight
+			// would turn this into a failed provision, which is what distinguishes a
+			// preflight from the post-failure recovery the owner is allowed.
+			name: "every affine consumer lookup failing",
+			apply: func(t *testing.T, b *testQ2AffBroker) func() int32 {
+				t.Helper()
+				var n atomic.Int32
+				b.asm.mu.Lock()
+				b.asm.testQ2AffConsumerLookup = func(string) (*ConsumerInfo, error) {
+					n.Add(1)
+					return nil, fmt.Errorf("test: the affine consumer lookup is unavailable")
+				}
+				b.asm.mu.Unlock()
+				return n.Load
+			},
+		},
+	}
+}
+
+// testQ2AffRestartSameStore cycles only the MQTT layer, leaving JetStream and
+// every record and consumer in place. The resume shapes below need it: within one
+// process a reconnect finds q2AffReady still set and takes
+// ensureQ2AffineConsumerSubscription's fast path, so provisioning would never run
+// and the shape would assert nothing.
+func testQ2AffRestartSameStore(t *testing.T, b *testQ2AffBroker) {
+	t.Helper()
+	dir := b.o.StoreDir
+	b.s.Shutdown()
+	b.o.Port = -1
+	b.o.MQTT.Port = -1
+	b.o.StoreDir = dir
+	b.s = testMQTTRunServer(t, b.o)
+	t.Cleanup(func() { testMQTTShutdownServer(b.s) })
+}
+
+// testQ2AffReadRecordAfterRestart binds this side of a restart to an account
+// manager and returns the quiescent record. The throwaway client is what runs the
+// startup stream validation, which must happen BEFORE an arm is imposed:
+// validateOutStream refuses a nonzero ConsumerLimits.InactiveThreshold outright,
+// so arming first would fail the broker at boot rather than test the owner.
+func testQ2AffReadRecordAfterRestart(t *testing.T, b *testQ2AffBroker, name, idHash string) *mqttPersistedSession {
+	t.Helper()
+	cq, rq := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: name, cleanStart: true}, b.o.MQTT.Host, b.o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rq)
+	b.bind(t, name)
+	ps := testQ2AffAwaitStableRecord(t, b, idHash)
+	cq.Close()
+	return ps
+}
+
+// Decision 4's guard, and the only fixture in this file that fails when the
+// implementation is MORE defensive than it needs to be.
+//
+// On-behalf restoration teaches a contender a set of preconditions before it may
+// recreate somebody else's affine durable. None of them may reach the owner's own
+// provisioning, because a refusal costs different things on the two paths. On the
+// contender it is free: nothing is stored, no source is acked, and the stall is
+// left exactly as it is today with no client connected to notice. On the owner it
+// provably costs a live connection — a refusal while a saved shared filter is
+// being restored at CONNECT is silently skipped (mqtt.go:7089-7093, :7187-7190)
+// because there is no SUBACK on that path, and the only remedy that removes the
+// silence closes the connection, which publishes the client's Will and, at a zero
+// Session Expiry Interval, deletes the session.
+//
+// "No closed connection, no Will, no cleared session" is deliberately NOT the
+// oracle here, and must never become it: a per-filter refusal never closes the
+// connection anyway, so an implementation that silently dropped the restored
+// filter would satisfy all three while delivering nothing. Every shape below
+// asserts a POSITIVE outcome instead — a success reason code, or a message
+// carried end to end over the path the arm was supposed to have broken.
+func TestQ2AffOwnerProvisioningGainsNoNewRefusals(t *testing.T) {
+	t.Parallel()
+	for _, arm := range testQ2AffOwnerArms() {
+		t.Run(arm.name, func(t *testing.T) {
+			t.Parallel()
+
+			// (1) A fresh shared SUBSCRIBE. The owner mints a generation and creates
+			// the durable with no prior state of any kind.
+			t.Run("a fresh shared subscribe", func(t *testing.T) {
+				t.Parallel()
+				b := testQ2AffSetup(t, "ownfresh")
+				// Bootstrap the account manager first, so the arm is imposed out of
+				// band on a running broker — as a deployment change would be — rather
+				// than before the startup validation that would refuse it.
+				boot, bootr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ownfresh-boot", cleanStart: true}, b.o.MQTT.Host, b.o.MQTT.Port)
+				testMQTTReadConnAckV5(t, bootr)
+				b.bind(t, "ownfresh-boot")
+				boot.Close()
+
+				lookups := arm.apply(t, b)
+
+				// member asserts the SUBACK reason code is 2, which is this shape's
+				// first oracle: a refusal here would surface as 0x80.
+				c, r := b.member(t, "ownfreshA", 300)
+				defer c.Close()
+				b.publish(t, 1, "fresh")
+				_, payload, qos, pi, ok := testMQTTTryReadPublishV5(r, 10*time.Second)
+				if !ok {
+					t.Fatal("a fresh shared QoS 2 subscribe provisioned no working affine path")
+				}
+				if qos != 2 || string(payload) != "fresh" {
+					t.Fatalf("unexpected delivery: payload=%q qos=%d", payload, qos)
+				}
+				b.completeExchange(t, c, r, pi)
+				testQ2AffAssertNoOwnerLookup(t, lookups)
+			})
+
+			// (2) A resume that RESTORES a saved shared filter. This is the route
+			// through processSubs (mqtt.go:7089) — the one with no SUBACK to carry a
+			// refusal, and the one round 32 found a remedy had missed.
+			t.Run("a resume restoring a saved shared filter", func(t *testing.T) {
+				t.Parallel()
+				b := testQ2AffSetup(t, "ownsaved")
+				c, _ := b.member(t, "ownsavedA", 300)
+				b.bind(t, "ownsavedA")
+				idHash := getHash("ownsavedA")
+				c.Close()
+				testQ2AffRestartSameStore(t, b)
+
+				ps := testQ2AffReadRecordAfterRestart(t, b, "ownsaved-reader", idHash)
+				// Anti-vacuity: without a saved shared filter this shape restores
+				// nothing and would pass against any implementation at all.
+				if len(ps.SharedSubs) == 0 {
+					t.Fatalf("no saved shared filter for the resume to restore: %+v", ps)
+				}
+
+				lookups := arm.apply(t, b)
+
+				cr, rr := b.reconnect(t, "ownsavedA", 300)
+				defer cr.Close()
+				// The delivery is the oracle, not the absence of an error: the filter
+				// is restored with no SUBACK, so only a message arriving over it proves
+				// the restoration installed anything.
+				b.publish(t, 2, "saved")
+				_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rr, 10*time.Second)
+				if !ok {
+					t.Fatal("the restored shared filter delivered nothing: its affine provisioning was refused and the failure silently skipped")
+				}
+				if qos != 2 || string(payload) != "saved" {
+					t.Fatalf("unexpected delivery: payload=%q qos=%d", payload, qos)
+				}
+				b.completeExchange(t, cr, rr, pi)
+				testQ2AffAssertNoOwnerLookup(t, lookups)
+			})
+
+			// (3) A resume with NO saved shared filter, whose record still names the
+			// affine generation. This is the other route (mqtt.go:10481, guarded at
+			// :10477), and it is reachable only this way: while any shared filter is
+			// saved, the restoration pass above provisions first and this call finds
+			// the path already ready.
+			t.Run("a resume with no saved shared filter", func(t *testing.T) {
+				t.Parallel()
+				b := testQ2AffSetup(t, "ownbare")
+				c, r := b.member(t, "ownbareA", 300)
+				b.bind(t, "ownbareA")
+				idHash := getHash("ownbareA")
+
+				// Leave a started delivery UNCOMPLETED, then leave the group. The
+				// affine path outlives the membership because the copy is owed to the
+				// client regardless of it — which is what leaves a record naming a
+				// generation with no shared filter beside it.
+				b.publish(t, 1, "bare")
+				if _, _, _, _, ok := testMQTTTryReadPublishV5(r, 10*time.Second); !ok {
+					t.Fatal("the sole group member never received the delivery this shape must strand")
+				}
+				b.unsubscribe(t, c, r, 2, []string{"$share/" + b.group + "/" + b.topic})
+				c.Close()
+				testQ2AffRestartSameStore(t, b)
+
+				ps := testQ2AffReadRecordAfterRestart(t, b, "ownbare-reader", idHash)
+				// Anti-vacuity, in both directions: a generation to re-establish, and
+				// no shared filter, or the shape covers the other route instead.
+				if ps.Q2AffGen == _EMPTY_ || ps.Q2Aff == nil {
+					t.Fatalf("the record names no affine path for the resume to re-establish: %+v", ps)
+				}
+				if len(ps.SharedSubs) != 0 {
+					t.Fatalf("a shared filter survived the unsubscribe, so this shape would exercise the restoration route instead: %+v", ps.SharedSubs)
+				}
+
+				lookups := arm.apply(t, b)
+
+				cr, rr := b.reconnect(t, "ownbareA", 300)
+				defer cr.Close()
+				// The copy stranded before the restart is redelivered from the durable
+				// this resume had to re-establish. Nothing else can produce it: the
+				// session holds no subscription of any kind.
+				_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rr, 10*time.Second)
+				if !ok {
+					t.Fatal("the resume did not re-establish the affine path its record named, so the stranded copy was never redelivered")
+				}
+				if qos != 2 || string(payload) != "bare" {
+					t.Fatalf("unexpected delivery: payload=%q qos=%d", payload, qos)
+				}
+				b.completeExchange(t, cr, rr, pi)
+
+				sess := testMQTTGetClient(t, b.s, "ownbareA").mqtt.sess
+				sess.mu.Lock()
+				ready := sess.q2AffReady
+				sess.mu.Unlock()
+				if !ready {
+					t.Fatal("the affine readiness gate never opened on a resume that had a generation to re-establish")
+				}
+				testQ2AffAssertNoOwnerLookup(t, lookups)
+			})
+		})
+	}
+}
+
+// testQ2AffAssertNoOwnerLookup pins the negative directly, rather than leaving it
+// to the delivery oracles alone: the owner's provisioning performs no affine
+// consumer lookup, so the seam must never have been reached.
+func testQ2AffAssertNoOwnerLookup(t *testing.T, lookups func() int32) {
+	t.Helper()
+	if lookups == nil {
+		return
+	}
+	if n := lookups(); n != 0 {
+		t.Fatalf("the owner's provisioning performed %d affine consumer lookup(s); it must perform none", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F-064 — the canonical affine consumer configuration
+// ---------------------------------------------------------------------------
+
+// testQ2AffFieldDisposition is one ConsumerConfig field's verdict in the audit
+// below. There are exactly two, and the bijection is what makes the audit
+// closed: a dependency bump that adds a field fails naming it, rather than
+// silently landing in whichever bucket a default would have chosen.
+type testQ2AffFieldDisposition struct {
+	// variable: the record supplies this field's value, so a contender must
+	// accept a difference in it and bound it separately.
+	variable bool
+	// mutate changes the field to a value that is NOT the canonical one, so the
+	// comparison must refuse it. Required for a pinned field.
+	mutate func(*ConsumerConfig)
+	// reason is the audit. Non-empty prose is enforced: the reason IS the record
+	// of why this field is safe to pin or unsafe to.
+	reason string
+}
+
+// testQ2AffineConfigDispositions is the audit itself, one entry per
+// ConsumerConfig field. Written as a function rather than a package var for the
+// same reason as testQ2AffOwnerArms: a var here is process-global state.
+func testQ2AffineConfigDispositions() map[string]testQ2AffFieldDisposition {
+	tm := time.Unix(1755000000, 0).UTC()
+	return map[string]testQ2AffFieldDisposition{
+		// The three the record owns. A contender replays them from the winner's
+		// record rather than imposing its own, so a difference here is legitimate
+		// and is bounded by q2AffVariableFieldsInBounds instead.
+		"AckWait":       {variable: true, reason: "the owner's broker AckWait, which may legitimately differ from the contender's; bounded positive"},
+		"MaxAckPending": {variable: true, reason: "the owner's broker MaxAckPending; bounded to 1..mqttMaxAckTotalLimit and to the live stream limit"},
+		"MemoryStorage": {variable: true, reason: "immutable once created, so a contender adopts the durable's own value rather than imposing one; both values are broker-produced"},
+
+		// The identity. Derived from (idHash, gen), so a deviation names a
+		// consumer this session does not own.
+		"Durable":        {mutate: func(c *ConsumerConfig) { c.Durable += "x" }, reason: "derived from idHash and the generation; a different durable is a different session's consumer"},
+		"FilterSubject":  {mutate: func(c *ConsumerConfig) { c.FilterSubject += ".x" }, reason: "the generation-scoped copy subject; a different filter reads another session's copies"},
+		"DeliverSubject": {mutate: func(c *ConsumerConfig) { c.DeliverSubject += "x" }, reason: "the generation-scoped delivery subject the owner's subscription is bound to"},
+
+		// The delivery semantics. Both are immutable in JetStream, so a
+		// create-or-update cannot converge a durable that differs in either.
+		"AckPolicy":     {mutate: func(c *ConsumerConfig) { c.AckPolicy = AckNone }, reason: "AckExplicit is what gates delivery on the client's PUBREC; the zero value is AckNone, which would ack on send"},
+		"DeliverPolicy": {mutate: func(c *ConsumerConfig) { c.DeliverPolicy = natsserver.DeliverAll }, reason: "DeliverNew; the zero value is DeliverAll, which would replay the subject from its start"},
+
+		// Pinned at zero. Each would change what the consumer delivers, how often,
+		// or whether it survives — and each is a field some other writer could set.
+		"MaxDeliver":         {mutate: func(c *ConsumerConfig) { c.MaxDeliver = 1 }, reason: "a delivery cap would abandon an owed QoS 2 message after N attempts, reopening the stall this feature closes"},
+		"InactiveThreshold":  {mutate: func(c *ConsumerConfig) { c.InactiveThreshold = time.Minute }, reason: "an inactivity delete would reap the durable while its client is offline, dropping every copy it holds"},
+		"HeadersOnly":        {mutate: func(c *ConsumerConfig) { c.HeadersOnly = true }, reason: "the copy's payload IS the message; delivering headers only would deliver an empty PUBLISH"},
+		"DeliverGroup":       {mutate: func(c *ConsumerConfig) { c.DeliverGroup = "g" }, reason: "a queue group on the affine consumer would share this session's private delivery with whoever else joined it"},
+		"PauseUntil":         {mutate: func(c *ConsumerConfig) { c.PauseUntil = &tm }, reason: "a paused consumer delivers nothing, which is the stall in another form"},
+		"FlowControl":        {mutate: func(c *ConsumerConfig) { c.FlowControl = true }, reason: "flow control changes the delivery protocol the affine callback expects"},
+		"Heartbeat":          {mutate: func(c *ConsumerConfig) { c.Heartbeat = time.Second }, reason: "idle heartbeats are delivered to the same subject and would reach the affine callback as if they were copies"},
+		"ReplayPolicy":       {mutate: func(c *ConsumerConfig) { c.ReplayPolicy = natsserver.ReplayOriginal }, reason: "original-rate replay would pace an owed redelivery by the original publish spacing"},
+		"RateLimit":          {mutate: func(c *ConsumerConfig) { c.RateLimit = 1024 }, reason: "a rate limit throttles an owed QoS 2 redelivery"},
+		"OptStartSeq":        {mutate: func(c *ConsumerConfig) { c.OptStartSeq = 7 }, reason: "meaningful only under a start-sequence DeliverPolicy, which is itself pinned; a stray value is a record this broker did not write"},
+		"OptStartTime":       {mutate: func(c *ConsumerConfig) { c.OptStartTime = &tm }, reason: "as OptStartSeq; also the only other time pointer, so it pins that DeepEqual is comparing pointees"},
+		"BackOff":            {mutate: func(c *ConsumerConfig) { c.BackOff = []time.Duration{time.Second} }, reason: "a redelivery backoff schedule overrides AckWait for an owed delivery; also pins that the comparison sees slices"},
+		"FilterSubjects":     {mutate: func(c *ConsumerConfig) { c.FilterSubjects = []string{"a.b"} }, reason: "a multi-filter consumer would read subjects outside this session's generation"},
+		"Metadata":           {mutate: func(c *ConsumerConfig) { c.Metadata = map[string]string{"k": "v"} }, reason: "not set by this broker; also pins that the comparison sees maps"},
+		"Name":               {mutate: func(c *ConsumerConfig) { c.Name = "n" }, reason: "the broker names the consumer through Durable; a separate Name is a record it did not write"},
+		"Description":        {mutate: func(c *ConsumerConfig) { c.Description = "d" }, reason: "not set by this broker"},
+		"SampleFrequency":    {mutate: func(c *ConsumerConfig) { c.SampleFrequency = "100%" }, reason: "ack sampling publishes to a system subject; not set by this broker"},
+		"MaxWaiting":         {mutate: func(c *ConsumerConfig) { c.MaxWaiting = 1 }, reason: "a pull-consumer field; the affine consumer is push, so a value here is a record this broker did not write"},
+		"MaxRequestBatch":    {mutate: func(c *ConsumerConfig) { c.MaxRequestBatch = 1 }, reason: "a pull-consumer field, as MaxWaiting"},
+		"MaxRequestExpires":  {mutate: func(c *ConsumerConfig) { c.MaxRequestExpires = time.Second }, reason: "a pull-consumer field, as MaxWaiting"},
+		"MaxRequestMaxBytes": {mutate: func(c *ConsumerConfig) { c.MaxRequestMaxBytes = 1 }, reason: "a pull-consumer field, as MaxWaiting"},
+		"Replicas":           {mutate: func(c *ConsumerConfig) { c.Replicas = 3 }, reason: "the affine consumer inherits the stream's replication; an override is a record this broker did not write"},
+		"Direct":             {mutate: func(c *ConsumerConfig) { c.Direct = true }, reason: "a server-set field; a record carrying it was not built from a request this broker sent"},
+		"Sourcing":           {mutate: func(c *ConsumerConfig) { c.Sourcing = true }, reason: "a server-set field, as Direct"},
+		"PriorityGroups":     {mutate: func(c *ConsumerConfig) { c.PriorityGroups = []string{"p"} }, reason: "priority delivery would arbitrate a private consumer's messages between claimants; not set by this broker"},
+		"PriorityPolicy":     {mutate: func(c *ConsumerConfig) { c.PriorityPolicy = natsserver.PriorityOverflow }, reason: "as PriorityGroups"},
+		"PinnedTTL":          {mutate: func(c *ConsumerConfig) { c.PinnedTTL = time.Minute }, reason: "a priority-pinning lifetime; as PriorityGroups"},
+	}
+}
+
+// testQ2AffineConfigFields reflects every ConsumerConfig field name.
+func testQ2AffineConfigFields(t *testing.T) []string {
+	t.Helper()
+	tp := reflect.TypeOf(ConsumerConfig{})
+	fields := make([]string, 0, tp.NumField())
+	for i := 0; i < tp.NumField(); i++ {
+		fields = append(fields, tp.Field(i).Name)
+	}
+	return fields
+}
+
+// The drift guard for the canonical comparison, and the reason that comparison
+// is whole-struct rather than a list.
+//
+// A list of interesting fields cannot close a struct that a dependency bump can
+// extend, and this design's earlier revisions each wrote one that the next
+// review round falsified — MaxDeliver, HeadersOnly, DeliverGroup, PauseUntil,
+// FlowControl and Heartbeat were each found outside a list that was believed
+// complete, and MaxDeliver alone reopens the stall. So the check compares the
+// whole struct, and THIS test is what keeps the audit behind it honest: every
+// field is named, exactly once, as either supplied by the record or pinned at
+// the canonical value, and every pinned one is mutated and must be refused.
+//
+// It fails on a dependency bump, by design. That failure is the review: somebody
+// has to decide which bucket the new field belongs in and write down why.
+func TestQ2AffineConsumerConfigFieldCoverage(t *testing.T) {
+	t.Parallel()
+	fields := testQ2AffineConfigFields(t)
+	disp := testQ2AffineConfigDispositions()
+
+	// Bijection, iterated in both directions. A field with no disposition is a
+	// dependency bump nobody audited; a disposition with no field is an audit
+	// entry that has rotted.
+	for _, f := range fields {
+		if _, ok := disp[f]; !ok {
+			t.Errorf("ConsumerConfig field %q has no disposition: a dependency bump added a field the affine audit does not cover", f)
+		}
+	}
+	for f := range disp {
+		if !slices.Contains(fields, f) {
+			t.Errorf("the affine audit names ConsumerConfig field %q, which no longer exists", f)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	const idHash, gen = "abcdefgh", "Zq1Zq1Zq1Zq1Zq1Zq1Zq1Z"
+	const ackWait, maxAckPending = 3 * time.Second, 17
+
+	// The baseline must be accepted, or every refusal below is vacuous.
+	base := buildQ2AffineConsumerConfig(idHash, gen, ackWait, maxAckPending, true)
+	if err := q2AffConfigMatchesCanonical(&base, idHash, gen); err != nil {
+		t.Fatalf("the canonical configuration is not accepted as canonical: %v", err)
+	}
+	// And it must be accepted for a session it does NOT belong to only if the
+	// names really are derived — a comparison that ignored idHash and gen would
+	// accept this everywhere.
+	if err := q2AffConfigMatchesCanonical(&base, "hgfedcba", gen); err == nil {
+		t.Fatal("a configuration built for one session was accepted as canonical for another")
+	}
+
+	for _, f := range fields {
+		f := f
+		t.Run(f, func(t *testing.T) {
+			t.Parallel()
+			fd := disp[f]
+			if fd.reason == "" {
+				t.Fatalf("the disposition for %q carries no reason; the reason IS the audit", f)
+			}
+			if fd.variable {
+				if fd.mutate != nil {
+					t.Fatalf("%q is dispositioned variable but also carries a mutator", f)
+				}
+				return
+			}
+			if fd.mutate == nil {
+				t.Fatalf("%q is pinned but carries no mutator, so nothing proves it is checked", f)
+			}
+
+			mutated := buildQ2AffineConsumerConfig(idHash, gen, ackWait, maxAckPending, true)
+			fd.mutate(&mutated)
+
+			// The mutator must actually change its own field, and only it. A
+			// mutator that changed nothing would make the refusal below impossible
+			// to fail, and one that changed a second field would credit this field
+			// with a refusal another field earned.
+			changed := testQ2AffChangedFields(t, &base, &mutated)
+			if len(changed) != 1 || changed[0] != f {
+				t.Fatalf("the mutator for %q changed %v, want exactly [%s]", f, changed, f)
+			}
+			if err := q2AffConfigMatchesCanonical(&mutated, idHash, gen); err == nil {
+				t.Fatalf("a configuration deviating in %q was accepted as replayable", f)
+			}
+		})
+	}
+}
+
+// testQ2AffChangedFields names the top-level ConsumerConfig fields that differ.
+func testQ2AffChangedFields(t *testing.T, a, b *ConsumerConfig) []string {
+	t.Helper()
+	va, vb := reflect.ValueOf(*a), reflect.ValueOf(*b)
+	tp := va.Type()
+	var out []string
+	for i := 0; i < tp.NumField(); i++ {
+		if !reflect.DeepEqual(va.Field(i).Interface(), vb.Field(i).Interface()) {
+			out = append(out, tp.Field(i).Name)
+		}
+	}
+	return out
+}
+
+// The bounds on the three fields the comparison above deliberately accepts from
+// the record. Without them a canonical-shaped record could still name a consumer
+// that cannot be provisioned — which a contender would discover only by having
+// its create rejected, after it had already decided the record was replayable.
+func TestQ2AffineVariableFieldBounds(t *testing.T) {
+	t.Parallel()
+	const idHash, gen = "abcdefgh", "Zq1Zq1Zq1Zq1Zq1Zq1Zq1Z"
+	canonical := func(ackWait time.Duration, maxAckPending int) *ConsumerConfig {
+		c := buildQ2AffineConsumerConfig(idHash, gen, ackWait, maxAckPending, false)
+		return &c
+	}
+	for _, tc := range []struct {
+		name             string
+		cfg              *ConsumerConfig
+		streamMaxAckPend int
+		wantErr          bool
+	}{
+		{"a provisionable pair", canonical(time.Second, 100), 0, false},
+		{"at the global cap", canonical(time.Second, mqttMaxAckTotalLimit), 0, false},
+		{"exactly at the stream limit", canonical(time.Second, 100), 100, false},
+		{"a zero ack_wait", canonical(0, 100), 0, true},
+		{"a negative ack_wait", canonical(-time.Second, 100), 0, true},
+		{"a zero max_ack_pending", canonical(time.Second, 0), 0, true},
+		{"a negative max_ack_pending", canonical(time.Second, -1), 0, true},
+		{"above the global cap", canonical(time.Second, mqttMaxAckTotalLimit+1), 0, true},
+		{"above the stream limit", canonical(time.Second, 101), 100, true},
+		// A negative stream limit reads as unlimited: the broker option it would
+		// have to exceed is a uint16, so no record can be out of bounds against it.
+		{"a negative stream limit imposes nothing", canonical(time.Second, 100), -1, false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := q2AffVariableFieldsInBounds(tc.cfg, tc.streamMaxAckPend)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected %s to be refused", tc.name)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected %s to be accepted, got %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// One constructor, asserted by ENTRY rather than by result.
+//
+// The property is that both writers of an affine consumer configuration go
+// through buildQ2AffineConsumerConfig. No assertion about the configurations
+// themselves can establish it: a literal copied to one call site produces bytes
+// identical to the constructor's, so the two are indistinguishable downstream.
+// Only observing that the constructor was entered from that site can tell them
+// apart, which is what the hook here does.
+//
+// It matters because the contender decides whether a persisted config is
+// replayable by comparing it WHOLE against what the constructor returns. A second
+// literal anywhere is a second canonical shape, and a record written through one
+// would be refused by the other — the session would simply stop being resumable
+// on behalf of anyone.
+//
+// Deliberately NOT parallel: mqttTestQ2AffineConfigBuiltHookV is process-global,
+// so a test running beside this one would have its own provisioning counted here.
+func TestQ2AffineConsumerConfigHasOneConstructor(t *testing.T) {
+	var mu sync.Mutex
+	callers := map[string]int{}
+	hook := func(caller string) {
+		mu.Lock()
+		callers[caller]++
+		mu.Unlock()
+	}
+	mqttTestQ2AffineConfigBuiltHookV.Store(&hook)
+	t.Cleanup(func() { mqttTestQ2AffineConfigBuiltHookV.Store(nil) })
+
+	// One stage drives both sites: the connected member provisions its own affine
+	// path, and then restores the absent winner's on its behalf.
+	st := testQ2AffStageContender(t, "onector", nil, nil, nil)
+	st.deleteWinnerDurable(t)
+	testQ2AffAwaitMaterialized(t, st)
+
+	mu.Lock()
+	seen := map[string]int{}
+	for k, v := range callers {
+		seen[k] = v
+	}
+	mu.Unlock()
+
+	for _, want := range []string{"ensureQ2AffineConsumerSubscription", "materializeQ2AffOnBehalf"} {
+		if seen[want] == 0 {
+			t.Fatalf("%s did not build its configuration through the shared constructor; entries seen: %v", want, seen)
+		}
+	}
+	// And no OTHER production caller has appeared. Test helpers legitimately build
+	// one to stage a record, so they are named and excluded rather than letting the
+	// check degrade to "at least two".
+	for caller := range seen {
+		switch caller {
+		// q2AffConfigMatchesCanonical is the third legitimate production caller
+		// and the reason the other two must be exclusive: it builds the canonical
+		// config to compare a persisted one AGAINST, so it defines what "canonical"
+		// means. A writer that bypassed the constructor would be measured against
+		// this one and refused.
+		case "ensureQ2AffineConsumerSubscription", "materializeQ2AffOnBehalf",
+			"q2AffConfigMatchesCanonical",
+			"testQ2AffSyntheticWinnerWith", "testQ2AffineConfigDispositions":
+		default:
+			if !strings.HasPrefix(caller, "testQ2Aff") && !strings.HasPrefix(caller, "TestQ2Aff") {
+				t.Fatalf("an unexpected call site builds an affine consumer configuration: %q (all: %v)", caller, seen)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F-064 — the owner recovers from a storage conflict it did not cause
+// ---------------------------------------------------------------------------
+
+// testQ2AffStrandAffinePathAcrossReload leaves a session with an undelivered
+// affine copy (undelivered here is a FACT of the fixture's own staging, not an
+// inference from an absent copy), an affine durable created under the OLD MQTT.ConsumerMemoryStorage,
+// a record naming both, and NO saved shared filter — then restarts the MQTT layer
+// with the option flipped, which is what an operator reload looks like from the
+// broker's side.
+//
+// No shared filter, deliberately: with one, the CONNECT restoration pass
+// provisions first and the resume route under test is never reached.
+func testQ2AffStrandAffinePathAcrossReload(t *testing.T, b *testQ2AffBroker, id, payload string) (idHash string, oldStorage bool) {
+	t.Helper()
+	c, r := b.member(t, id, 300)
+	b.bind(t, id)
+	idHash = getHash(id)
+
+	b.publish(t, 1, payload)
+	if _, _, _, _, ok := testMQTTTryReadPublishV5(r, 10*time.Second); !ok {
+		t.Fatal("the sole group member never received the delivery this fixture must strand")
+	}
+	b.unsubscribe(t, c, r, 2, []string{"$share/" + b.group + "/" + b.topic})
+	c.Close()
+
+	oldStorage = b.o.MQTT.ConsumerMemoryStorage
+	b.o.MQTT.ConsumerMemoryStorage = !oldStorage
+	testQ2AffRestartSameStore(t, b)
+
+	ps := testQ2AffReadRecordAfterRestart(t, b, id+"-reader", idHash)
+	// Anti-vacuity, three ways. Without a generation there is nothing to
+	// re-establish; with a shared filter the wrong route runs; and if the option
+	// did not actually reach getOpts() no conflict arises and the whole fixture
+	// passes for the wrong reason.
+	if ps.Q2AffGen == _EMPTY_ || ps.Q2Aff == nil {
+		t.Fatalf("the record names no affine path to re-establish: %+v", ps)
+	}
+	if len(ps.SharedSubs) != 0 {
+		t.Fatalf("a shared filter survived, so the restoration route would run instead: %+v", ps.SharedSubs)
+	}
+	if ps.Q2Aff.MemoryStorage != oldStorage {
+		t.Fatalf("the record's persisted storage is %v, want the pre-reload %v", ps.Q2Aff.MemoryStorage, oldStorage)
+	}
+	if got := b.s.getOpts().MQTT.ConsumerMemoryStorage; got == oldStorage {
+		t.Fatalf("the reload did not reach getOpts(): consumer_memory_storage is still %v", got)
+	}
+	// And the durable really is still there, carrying the old type — the conflict
+	// this fixture is about cannot happen against an absent one.
+	ci, err := b.jsa.lookupConsumer(mqttOutStreamName, ps.Q2Aff.Durable)
+	if err != nil || ci == nil || ci.Config == nil {
+		t.Fatalf("the affine durable %q did not survive the restart: %v", ps.Q2Aff.Durable, err)
+	}
+	if ci.Config.MemoryStorage != oldStorage {
+		t.Fatalf("the surviving durable's storage is %v, want the pre-reload %v", ci.Config.MemoryStorage, oldStorage)
+	}
+	return idHash, oldStorage
+}
+
+// testQ2AffCountLookups installs a COUNTING PASSTHROUGH on the affine consumer
+// lookup seam. Counting matters as much as the count: the owner's provisioning
+// performs no lookup, so any lookup observed here belongs to the recovery, and
+// "exactly one" is what pins the retry bound.
+func testQ2AffCountLookups(t *testing.T, b *testQ2AffBroker) func() int32 {
+	t.Helper()
+	var n atomic.Int32
+	jsa := b.jsa
+	b.asm.mu.Lock()
+	b.asm.testQ2AffConsumerLookup = func(durable string) (*ConsumerInfo, error) {
+		n.Add(1)
+		return jsa.lookupConsumer(mqttOutStreamName, durable)
+	}
+	b.asm.mu.Unlock()
+	return n.Load
+}
+
+// subSharedTolerant sends a shared QoS 2 SUBSCRIBE and returns the SUBACK's
+// reason codes and properties, skipping PUBLISH packets that arrive first.
+//
+// The interleaving is real rather than defensive. ensureQ2AffineConsumerSubscription
+// installs the delivery subscription BEFORE it creates the durable, so where the
+// durable already exists and holds a pending copy, that copy is pushed to the
+// client the moment the subscription appears — which is before the create can
+// fail. testMQTTSubV5PropsEx treats anything that is not a SUBACK as fatal, so a
+// fixture that drives provisioning against a durable with pending state needs
+// this instead.
+func (b *testQ2AffBroker) subSharedTolerant(t *testing.T, c net.Conn, r *mqttReader, pi uint16, topic string) ([]byte, *mqttProperties) {
+	t.Helper()
+	vh := newMQTTWriter(0)
+	vh.WriteUint16(pi)
+	vh.WriteVarInt(0)
+	vh.WriteBytes([]byte(topic))
+	vh.WriteByte(2)
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("writing SUBSCRIBE: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		pb, pl, ready := testMQTTReadPacketReady(r, time.Second)
+		if !ready {
+			continue
+		}
+		start := r.pos
+		switch pb & mqttPacketMask {
+		case mqttPacketSubAck:
+			rpi, err := r.readUint16("suback pi")
+			if err != nil || rpi != pi {
+				t.Fatalf("SUBACK for packet identifier %d, want %d (err=%v)", rpi, pi, err)
+			}
+			props, err := r.readProperties(mqttPacketSubAck)
+			if err != nil {
+				t.Fatalf("reading SUBACK properties: %v", err)
+			}
+			var codes []byte
+			for r.pos-start < pl {
+				rc, err := r.readByte("suback reason code")
+				if err != nil {
+					t.Fatalf("reading a SUBACK reason code: %v", err)
+				}
+				codes = append(codes, rc)
+			}
+			return codes, props
+		case mqttPacketPub:
+			r.pos = start + pl // a copy the pre-create subscription let through
+		default:
+			t.Fatalf("unexpected packet 0x%x while awaiting SUBACK", pb&mqttPacketMask)
+		}
+	}
+	t.Fatal("no SUBACK arrived")
+	return nil, nil
+}
+
+// The owner recovers from a storage conflict it did not cause.
+//
+// MemoryStorage is immutable on a JetStream consumer, and the owner rebuilds its
+// create request from the CURRENT broker option while the durable keeps whatever
+// type it was made with. So an operator who reloads consumer_memory_storage
+// breaks affine resume for every session whose durable predates the reload —
+// permanently, since every later resume rebuilds the same rejected request.
+//
+// That defect is PRE-EXISTING and reachable with no contender anywhere, which is
+// why this fixture stages none. It is also what makes on-behalf restoration safe
+// to add: without the recovery, a contender that legitimately creates the durable
+// from the winner's persisted value would leave the owner in exactly this state,
+// and F-064 would have introduced the very thing it is here to prevent.
+func TestQ2AffOwnerRecoversFromAStorageConflictItDidNotCause(t *testing.T) {
+	t.Parallel()
+
+	// The reload, with no contender at all. This needs an EXISTING durable: with
+	// none, the owner simply creates one under the new option and no conflict
+	// arises, so an absent-durable staging would assert nothing.
+	t.Run("an operator reload with no contender anywhere", func(t *testing.T) {
+		t.Parallel()
+		b := testQ2AffSetup(t, "ownrec")
+		idHash, oldStorage := testQ2AffStrandAffinePathAcrossReload(t, b, "ownrecA", "recovered")
+		lookups := testQ2AffCountLookups(t, b)
+
+		cr, rr := b.reconnect(t, "ownrecA", 300)
+		defer cr.Close()
+
+		// The delivery is the oracle. A resume that failed logs and carries on, so
+		// nothing on the wire says "refused" — only the stranded copy arriving says
+		// the durable was re-established.
+		_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rr, 10*time.Second)
+		if !ok {
+			t.Fatal("the resume did not recover from the storage conflict: the stranded copy was never redelivered")
+		}
+		if qos != 2 || string(payload) != "recovered" {
+			t.Fatalf("unexpected delivery: payload=%q qos=%d", payload, qos)
+		}
+		b.completeExchange(t, cr, rr, pi)
+
+		sess := testMQTTGetClient(t, b.s, "ownrecA").mqtt.sess
+		sess.mu.Lock()
+		ready, cfg := sess.q2AffReady, sess.q2AffConsumer
+		sess.mu.Unlock()
+		if !ready {
+			t.Fatal("the affine readiness gate never opened after the recovery")
+		}
+		// The session's view — which is what the record persists — must name what
+		// was actually created, not the request that was refused.
+		if cfg == nil || cfg.MemoryStorage != oldStorage {
+			t.Fatalf("the session kept the REFUSED request's storage: got %+v, want MemoryStorage=%v", cfg, oldStorage)
+		}
+		// Exactly one, which is the bound. Zero would mean the recovery never ran
+		// and the delivery came from somewhere else; more than one would mean it
+		// loops.
+		if n := lookups(); n != 1 {
+			t.Fatalf("the recovery performed %d affine consumer lookup(s), want exactly 1", n)
+		}
+		_ = idHash
+	})
+
+	// The recovery's own lookup fails. The caller must be told why the CREATE
+	// failed, not why the recovery could not run — the lookup's error is never
+	// substituted for the original.
+	//
+	// Driven through a SUBSCRIBE rather than the resume, deliberately: a resume
+	// failure is only logged, so the distinction between the two errors is not
+	// observable there. A shared SUBSCRIBE reaches the same function and puts the
+	// reason on the SUBACK, where a client can see it.
+	t.Run("the recovery's own lookup fails", func(t *testing.T) {
+		t.Parallel()
+		b := testQ2AffSetup(t, "ownrecf")
+		testQ2AffStrandAffinePathAcrossReload(t, b, "ownrecfA", "notrecovered")
+
+		var lookups atomic.Int32
+		b.asm.mu.Lock()
+		b.asm.testQ2AffConsumerLookup = func(string) (*ConsumerInfo, error) {
+			lookups.Add(1)
+			return nil, fmt.Errorf("test: the affine consumer lookup is unavailable")
+		}
+		b.asm.mu.Unlock()
+
+		cr, rr := b.reconnect(t, "ownrecfA", 300)
+		defer cr.Close()
+
+		codes, props := b.subSharedTolerant(t, cr, rr, 1, "$share/"+b.group+"/"+b.topic)
+		if len(codes) != 1 || codes[0] < mqttSubAckFailure {
+			t.Fatalf("expected the shared QoS 2 subscribe to fail while the recovery cannot run, got %v", codes)
+		}
+		if props == nil {
+			t.Fatal("the SUBACK carried no properties, so no reason reached the client")
+		}
+		// THE assertion: the reported failure is the create's, not the lookup's.
+		if !strings.Contains(props.reasonString, "storage type can not be updated") {
+			t.Fatalf("the SUBACK reported %q; it must report the original create failure", props.reasonString)
+		}
+		if strings.Contains(props.reasonString, "lookup is unavailable") {
+			t.Fatalf("the recovery's own lookup error was substituted for the create failure: %q", props.reasonString)
+		}
+		if n := lookups.Load(); n == 0 {
+			t.Fatal("the recovery never attempted its lookup, so this subtest exercised nothing")
+		}
+
+		// The durable is NOT torn down: this call did not mint the generation, so
+		// its rollback undoes only what it did. Asserting this is what keeps the
+		// failure recoverable rather than terminal.
+		ps := testQ2AffAwaitStableRecord(t, b, getHash("ownrecfA"))
+		if ci, err := b.jsa.lookupConsumer(mqttOutStreamName, ps.Q2Aff.Durable); err != nil || ci == nil {
+			t.Fatalf("the failed recovery destroyed the affine durable %q: %v", ps.Q2Aff.Durable, err)
+		}
+
+		// And it really is recoverable: with the lookup working, the same subscribe
+		// succeeds and the stranded copy arrives.
+		b.asm.mu.Lock()
+		b.asm.testQ2AffConsumerLookup = nil
+		b.asm.mu.Unlock()
+		codes, _ = b.subSharedTolerant(t, cr, rr, 2, "$share/"+b.group+"/"+b.topic)
+		if len(codes) != 1 || codes[0] != 2 {
+			t.Fatalf("the subscribe did not succeed once the recovery could run: %v", codes)
+		}
+		_, payload, _, pi, ok := testMQTTTryReadPublishV5(rr, 10*time.Second)
+		if !ok {
+			t.Fatal("the stranded copy was never redelivered after the recovery succeeded")
+		}
+		if string(payload) != "notrecovered" {
+			t.Fatalf("unexpected delivery: payload=%q", payload)
+		}
+		b.completeExchange(t, cr, rr, pi)
+	})
+
+	// The owner's recovery must not MAKE things worse than the failure it is
+	// recovering from, and this is the case where retrying would.
+	//
+	// A create refused for an immutable mismatch mutates nothing: JetStream checks
+	// convergence before it applies anything. The retry, being accepted, does apply
+	// — and a create-or-update carrying a zero InactiveThreshold has the stream's
+	// limit substituted into it, arming an existing durable's deletion timer. So
+	// under a stream mutated after startup, retrying could leave a session that is
+	// still unresumable AND a durable that will now be reaped with the copies it
+	// holds. Today the mismatch simply fails and the durable survives untouched.
+	t.Run("a stream mutated after startup suspends the recovery", func(t *testing.T) {
+		t.Parallel()
+		b := testQ2AffSetup(t, "ownrecl")
+		idHash, oldStorage := testQ2AffStrandAffinePathAcrossReload(t, b, "ownreclA", "notreaped")
+		ps := testQ2AffAwaitStableRecord(t, b, idHash)
+
+		si, err := b.jsa.lookupStream(mqttOutStreamName)
+		if err != nil || si == nil {
+			t.Fatalf("looking up %s: %v", mqttOutStreamName, err)
+		}
+		cfg := si.Config
+		cfg.ConsumerLimits.InactiveThreshold = 30 * time.Minute
+		if _, err := b.jsa.updateStream(&cfg); err != nil {
+			t.Fatalf("imposing a consumer inactivity limit on %s: %v", mqttOutStreamName, err)
+		}
+
+		cr, _ := b.reconnect(t, "ownreclA", 300)
+		defer cr.Close()
+		// Give the resume time to attempt and fail. Deliberately NOT asserted by
+		// "nothing was delivered": ensureQ2AffineConsumerSubscription subscribes to
+		// the deliver subject BEFORE it creates the durable, and the durable still
+		// exists holding the stranded copy, so that copy is pushed whether or not
+		// provisioning then succeeds.
+		time.Sleep(2 * time.Second)
+		sess := testMQTTGetClient(t, b.s, "ownreclA").mqtt.sess
+		sess.mu.Lock()
+		ready := sess.q2AffReady
+		sess.mu.Unlock()
+		if ready {
+			t.Fatal("the recovery ran under a stream limit that would reap the durable it repaired")
+		}
+
+		// THE assertion: the durable is exactly as the failing create left it —
+		// still carrying the old storage type, and still with NO deletion timer.
+		// A retry would have armed one.
+		ci, err := b.jsa.lookupConsumer(mqttOutStreamName, ps.Q2Aff.Durable)
+		if err != nil || ci == nil || ci.Config == nil {
+			t.Fatalf("the durable did not survive the refused recovery: %v", err)
+		}
+		if ci.Config.InactiveThreshold != 0 {
+			t.Fatalf("the recovery armed a deletion timer on a durable the failing create had left alone: %v", ci.Config.InactiveThreshold)
+		}
+		if ci.Config.MemoryStorage != oldStorage {
+			t.Fatalf("the durable's storage changed to %v, want the untouched %v", ci.Config.MemoryStorage, oldStorage)
+		}
+	})
+
+	// The negative control, and the reason the classifier matches one exact
+	// flattened cause rather than "the create failed".
+	//
+	// JetStream forbids changing several consumer fields, and reports every one of
+	// them through the same generic error 10012 with the reason flattened into its
+	// description. Only the storage-type cause is recoverable: a durable whose
+	// DELIVER POLICY differs is not one this broker can converge, and looking it up
+	// to retry would be a round trip that cannot change the outcome — the shape a
+	// classifier matching any create error would produce.
+	t.Run("a different immutable mismatch does not enter the retry", func(t *testing.T) {
+		t.Parallel()
+		b := testQ2AffSetup(t, "ownrecn")
+		c, r := b.member(t, "ownrecnA", 300)
+		b.bind(t, "ownrecnA")
+		idHash := getHash("ownrecnA")
+		b.unsubscribe(t, c, r, 2, []string{"$share/" + b.group + "/" + b.topic})
+		c.Close()
+		testQ2AffRestartSameStore(t, b)
+
+		ps := testQ2AffReadRecordAfterRestart(t, b, "ownrecn-reader", idHash)
+		if ps.Q2AffGen == _EMPTY_ || ps.Q2Aff == nil {
+			t.Fatalf("the record names no affine path: %+v", ps)
+		}
+
+		// Replace the durable with one that differs ONLY in an immutable field
+		// that is not the storage type, so the create below fails with the same
+		// outer error and a different cause.
+		if _, err := b.jsa.deleteConsumer(mqttOutStreamName, ps.Q2Aff.Durable, false); err != nil {
+			t.Fatalf("removing the affine durable: %v", err)
+		}
+		clash := buildQ2AffineConsumerConfig(idHash, ps.Q2AffGen, ps.Q2Aff.AckWait, ps.Q2Aff.MaxAckPending, ps.Q2Aff.MemoryStorage)
+		clash.DeliverPolicy = natsserver.DeliverAll
+		if _, err := b.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttOutStreamName, Config: clash}); err != nil {
+			t.Fatalf("staging a durable with a clashing deliver policy: %v", err)
+		}
+
+		lookups := testQ2AffCountLookups(t, b)
+		cr, rr := b.reconnect(t, "ownrecnA", 300)
+		defer cr.Close()
+		codes, props := b.subSharedTolerant(t, cr, rr, 1, "$share/"+b.group+"/"+b.topic)
+		if len(codes) != 1 || codes[0] < mqttSubAckFailure {
+			t.Fatalf("expected the shared QoS 2 subscribe to fail against an unconvergeable durable, got %v", codes)
+		}
+		if props == nil || !strings.Contains(props.reasonString, "deliver policy can not be updated") {
+			t.Fatalf("the SUBACK did not report the deliver-policy conflict: %+v", props)
+		}
+		// THE discriminating assertion. Both the correct classifier and one that
+		// matched any create error end in the same refusal; only the absence of a
+		// lookup says the retry was never entered.
+		if n := lookups(); n != 0 {
+			t.Fatalf("a non-storage immutable mismatch entered the recovery: %d lookup(s)", n)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// F-064 — on-behalf restoration of a destroyed affine consumer
+// ---------------------------------------------------------------------------
+
+// testQ2AffContenderStage is a claimed assignment owned by an absent winner, with
+// exactly one connected member to contend for it.
+//
+// A SYNTHETIC winner — a record and a durable with no client — rather than a
+// second member that disconnects. The reason is the one testQ2AffSyntheticWinner
+// documents: a winner with a client competes for the group delivery, so the mover
+// can turn out to be the winner itself and take the own-claim path, consuming the
+// one-shot seams these fixtures stage and letting them pass with nothing entered.
+type testQ2AffContenderStage struct {
+	b       *testQ2AffBroker
+	winner  string // the winner's idHash
+	gen     string
+	durable string
+	subject string // the claim subject under test
+
+	// creates returns every create-or-update the contender issued, in order.
+	// Counting them is how "refused with no create attempted" is asserted, which
+	// most of D1's refusals are otherwise indistinguishable from.
+	creates func() []ConsumerConfig
+	// results returns every resolved move disposition for the claim under test.
+	results func() []mqttQ2AffMoveResult
+	lookups func() int32
+
+	// setCreate and setLookup replace the INNER half of the seams the stage owns.
+	// A fixture must go through these rather than assigning the asm fields, which
+	// would clobber the stage's counters and silently make creates() report zero —
+	// a failure that reads as "no create was attempted" when in fact none was
+	// observed.
+	setCreate func(func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error))
+	setLookup func(func(string) (*ConsumerInfo, error))
+	// realCreate issues a create-or-update straight to JetStream, bypassing the
+	// stage's counter. A fixture simulating a RIVAL uses it, so the rival's create
+	// is not counted as one of the contender's attempts.
+	realCreate func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error)
+
+	// release lifts the copy-store hold the stage installs before publishing.
+	// Every fixture must call it, directly or through deleteWinnerDurable.
+	//
+	// The hold exists because the contender materializes as soon as the claim is
+	// elected, which RACES a fixture that then destroys the winner's durable: when
+	// materialization wins, the copy is stored, the delete drops it, and its
+	// Nats-Msg-Id survives in the duplicate window so the restoration's own store
+	// keeps nothing. That is residual 3 arriving in a fixture that does not own it,
+	// and it is intermittent — it surfaced once in a full-suite run after eleven
+	// clean targeted ones. Holding the store removes the racer instead of racing
+	// it.
+	release func(t *testing.T)
+}
+
+// stageContender wires the seams, stages the winner, seeds the claim and
+// publishes. record and consumer deviate the staged record and durable; either
+// may be nil. perturb runs after staging and before the publish, which is where a
+// fixture changes the stream or installs its own seam.
+func testQ2AffStageContender(t *testing.T, name string,
+	record func(*mqttPersistedSession), consumer func(*ConsumerConfig),
+	perturb func(st *testQ2AffContenderStage)) *testQ2AffContenderStage {
+	return testQ2AffStageContenderSeeded(t, name, record, consumer, perturb, nil)
+}
+
+// testQ2AffStageContenderSeeded additionally adjusts the elected CLAIM before it
+// is written, which is how a phase this broker would not otherwise produce on
+// demand — a materialized claim whose source was never acknowledged — is staged.
+func testQ2AffStageContenderSeeded(t *testing.T, name string,
+	record func(*mqttPersistedSession), consumer func(*ConsumerConfig),
+	perturb func(st *testQ2AffContenderStage), seed func(*mqttQ2AffClaim)) *testQ2AffContenderStage {
+	t.Helper()
+	b := testQ2AffSetup(t, name)
+	c, _ := b.member(t, name+"A", 300)
+	t.Cleanup(func() { c.Close() })
+	b.bind(t, name+"A")
+
+	wHash, wGen := testQ2AffSyntheticWinnerWith(t, b, name+"W", record, consumer)
+	st := &testQ2AffContenderStage{b: b, winner: wHash, gen: wGen, durable: affDurableFor(wHash, wGen)}
+
+	var (
+		mu      sync.Mutex
+		creates []ConsumerConfig
+		// Keyed by subject and filtered at READ time, not written into a
+		// single-claim slice at hook time. Two reasons, and both are defects the
+		// first version had: the hook runs on a server goroutine while the test
+		// goroutine is still assigning st.subject, which is a data race; and the
+		// first move can resolve before the seeding helper has reported the
+		// subject at all, so a hook that filtered early would silently drop it.
+		results map[string][]mqttQ2AffMoveResult
+	)
+	results = map[string][]mqttQ2AffMoveResult{}
+	var lookups atomic.Int32
+	var held atomic.Bool
+	held.Store(true)
+	jsa := b.jsa
+	innerCreate := func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+		return jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttOutStreamName, Config: *cfg})
+	}
+	innerLookup := func(durable string) (*ConsumerInfo, error) {
+		return jsa.lookupConsumer(mqttOutStreamName, durable)
+	}
+	b.asm.mu.Lock()
+	b.asm.testQ2AffConsumerCreate = func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+		mu.Lock()
+		creates = append(creates, *cfg)
+		inner := innerCreate
+		mu.Unlock()
+		return inner(cfg)
+	}
+	b.asm.testQ2AffConsumerLookup = func(durable string) (*ConsumerInfo, error) {
+		lookups.Add(1)
+		mu.Lock()
+		inner := innerLookup
+		mu.Unlock()
+		return inner(durable)
+	}
+	b.asm.testQ2AffCopyStore = func(subject string, hdrLen int, msg []byte) (uint64, error) {
+		if held.Load() {
+			return 0, fmt.Errorf("the copy store is held by the test until its staging is complete")
+		}
+		return testQ2AffRealCopyStore(b, subject, hdrLen, msg)
+	}
+	b.asm.testQ2AffMoveDone = func(subject string, res mqttQ2AffMoveResult) {
+		mu.Lock()
+		results[subject] = append(results[subject], res)
+		mu.Unlock()
+	}
+	b.asm.mu.Unlock()
+	t.Cleanup(func() {
+		b.asm.mu.Lock()
+		b.asm.testQ2AffConsumerCreate, b.asm.testQ2AffConsumerLookup, b.asm.testQ2AffMoveDone = nil, nil, nil
+		b.asm.testQ2AffCopyStore = nil
+		b.asm.mu.Unlock()
+	})
+	st.creates = func() []ConsumerConfig {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]ConsumerConfig(nil), creates...)
+	}
+	st.results = func() []mqttQ2AffMoveResult {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]mqttQ2AffMoveResult(nil), results[st.subject]...)
+	}
+	st.lookups = lookups.Load
+	st.setCreate = func(f func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error)) {
+		mu.Lock()
+		innerCreate = f
+		mu.Unlock()
+	}
+	st.setLookup = func(f func(string) (*ConsumerInfo, error)) {
+		mu.Lock()
+		innerLookup = f
+		mu.Unlock()
+	}
+	// The unhooked create, for a fixture that wants to drive a real one from
+	// inside its own replacement.
+	st.realCreate = innerCreate
+	st.release = func(t *testing.T) {
+		t.Helper()
+		held.Store(false)
+	}
+
+	if perturb != nil {
+		perturb(st)
+	}
+
+	seeded := testQ2AffSeedElectedClaim(t, b, func(c *mqttQ2AffClaim) {
+		c.Winner, c.Gen = wHash, wGen
+		c.CopySubject = mqttQ2AffCopySubject(wHash, wGen, c.ClaimHash)
+		c.AffDurable = st.durable
+		if seed != nil {
+			seed(c)
+		}
+	})
+	b.publish(t, 1, name+"-payload")
+	st.subject = testQ2AffAwaitSeeded(t, seeded)
+	return st
+}
+
+// awaitRefusal waits until the contender has resolved the claim as DEFERRED at
+// least once — which is the observable form of "proved nothing, wrote nothing,
+// acked nothing" — and fails if it ever resolves any other way.
+func (st *testQ2AffContenderStage) awaitRefusal(t *testing.T, what string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, r := range st.results() {
+			if r != mqttQ2AffMoveDeferred {
+				t.Fatalf("%s: the contender resolved the assignment as %v; it must refuse", what, r)
+			}
+		}
+		if len(st.results()) > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s: the contender never resolved the assignment at all, so nothing was exercised", what)
+}
+
+// assertNoCreate is the discriminating half of most refusal fixtures. Asserting
+// only the refusal does not distinguish "refused before touching the durable"
+// from "issued a create-or-update that was then rejected" — and for the
+// inactivity-threshold arm those differ by whether a live durable's deletion
+// timer was restarted.
+func (st *testQ2AffContenderStage) assertNoCreate(t *testing.T, what string) {
+	t.Helper()
+	if got := st.creates(); len(got) != 0 {
+		t.Fatalf("%s: the contender issued %d create-or-update(s) before refusing: %+v", what, len(got), got)
+	}
+}
+
+// assertCopyAbsent proves nothing was materialized. Used with assertNoSourceAck.
+func (st *testQ2AffContenderStage) assertCopyAbsent(t *testing.T, what string) {
+	t.Helper()
+	claim := testQ2AffLoadClaim(t, st.b, st.subject)
+	if claim.Phase != mqttQ2AffClaimed {
+		t.Fatalf("%s: the claim advanced to %v; nothing should have been materialized", what, claim.Phase)
+	}
+	if claim.SourceAcked {
+		t.Fatalf("%s: the contender acknowledged the group source", what)
+	}
+	if state, _ := st.b.asm.loadQ2AffCopy(claim.CopySubject); state == mqttQ2AffCopyPresent {
+		t.Fatalf("%s: a copy was stored despite the refusal", what)
+	}
+}
+
+// A record the broker cannot replay exactly is refused, and no create is
+// attempted for it.
+//
+// The comparison behind this is whole-struct rather than a list of interesting
+// fields, so the table below is not a sample of what happens to be checked — it
+// is a sample of a closed rule. TestQ2AffineConsumerConfigFieldCoverage is what
+// keeps the rule closed; this fixture is what proves it reaches a real contender.
+func TestQ2AffContenderRefusesAnUnreplayableConsumerConfig(t *testing.T) {
+	t.Parallel()
+
+	// The two shapes that are not merely a deviating field.
+	t.Run("no consumer configuration at all", func(t *testing.T) {
+		t.Parallel()
+		st := testQ2AffStageContender(t, "unrepnil",
+			func(ps *mqttPersistedSession) { ps.Q2Aff = nil }, nil, nil)
+		st.release(t)
+		st.awaitRefusal(t, "a record carrying a generation but no consumer configuration")
+		st.assertNoCreate(t, "a nil consumer configuration")
+		st.assertCopyAbsent(t, "a nil consumer configuration")
+	})
+
+	t.Run("a names-only stub", func(t *testing.T) {
+		t.Parallel()
+		// The shape restoreQ2AffineUnwind really produces: three names and nothing
+		// else, which buildPersistedSessionLocked then persists verbatim. Its zero
+		// values are not incomplete but WRONG — AckPolicy zero is AckNone, which
+		// would ack on send, and DeliverPolicy zero is DeliverAll, which would
+		// replay the subject from its start.
+		st := testQ2AffStageContender(t, "unrepstub",
+			func(ps *mqttPersistedSession) {
+				ps.Q2Aff = &ConsumerConfig{
+					Durable:        ps.Q2Aff.Durable,
+					FilterSubject:  ps.Q2Aff.FilterSubject,
+					DeliverSubject: ps.Q2Aff.DeliverSubject,
+				}
+			}, nil, nil)
+		st.release(t)
+		st.awaitRefusal(t, "a names-only consumer configuration")
+		st.assertNoCreate(t, "a names-only consumer configuration")
+		st.assertCopyAbsent(t, "a names-only consumer configuration")
+	})
+
+	// A deviation in any single field, and a variable field outside its bound.
+	for _, tc := range []struct {
+		name   string
+		deform func(*ConsumerConfig)
+	}{
+		{"a delivery cap", func(c *ConsumerConfig) { c.MaxDeliver = 1 }},
+		{"headers only", func(c *ConsumerConfig) { c.HeadersOnly = true }},
+		{"a queue group", func(c *ConsumerConfig) { c.DeliverGroup = "g" }},
+		{"a pause", func(c *ConsumerConfig) { tm := time.Unix(1755000000, 0).UTC(); c.PauseUntil = &tm }},
+		{"flow control and heartbeats", func(c *ConsumerConfig) { c.FlowControl = true; c.Heartbeat = time.Second }},
+		{"a negative max_ack_pending", func(c *ConsumerConfig) { c.MaxAckPending = -1 }},
+		{"a max_ack_pending above the global cap", func(c *ConsumerConfig) { c.MaxAckPending = mqttMaxAckTotalLimit + 1 }},
+		{"a zero ack_wait", func(c *ConsumerConfig) { c.AckWait = 0 }},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := testQ2AffStageContender(t, "unrep"+strconv.Itoa(len(tc.name)),
+				func(ps *mqttPersistedSession) { tc.deform(ps.Q2Aff) }, nil, nil)
+			st.release(t)
+			st.awaitRefusal(t, tc.name)
+			st.assertNoCreate(t, tc.name)
+			st.assertCopyAbsent(t, tc.name)
+		})
+	}
+}
+
+// A record whose max_ack_pending the stream would reject is refused BEFORE any
+// create, not by letting JetStream reject it.
+//
+// The distinction is the whole assertion. JetStream would refuse an over-limit
+// consumer by itself, so a fixture that only checked the final state would pass
+// against an implementation with no pre-check at all.
+func TestQ2AffContenderRefusesToRestoreBeyondTheStreamAckLimit(t *testing.T) {
+	t.Parallel()
+	// The limit is set ABOVE the consumers that already exist and the record is
+	// deviated above the limit, rather than the other way round: JetStream refuses
+	// a stream update that would violate a live consumer (error 10069), so a limit
+	// low enough to catch the default 1024 cannot be imposed at all.
+	const streamLimit, recordWants = 2048, 4096
+	st := testQ2AffStageContender(t, "acklimit",
+		func(ps *mqttPersistedSession) { ps.Q2Aff.MaxAckPending = recordWants }, nil,
+		func(st *testQ2AffContenderStage) {
+			si, err := st.b.jsa.lookupStream(mqttOutStreamName)
+			if err != nil || si == nil {
+				t.Fatalf("looking up %s: %v", mqttOutStreamName, err)
+			}
+			cfg := si.Config
+			cfg.ConsumerLimits.MaxAckPending = streamLimit
+			if _, err := st.b.jsa.updateStream(&cfg); err != nil {
+				t.Fatalf("imposing a consumer ack limit on %s: %v", mqttOutStreamName, err)
+			}
+		})
+	st.release(t)
+	// Anti-vacuity: the record must be inside the GLOBAL cap, or the refusal below
+	// would be the global bound firing rather than the stream limit.
+	if recordWants > mqttMaxAckTotalLimit {
+		t.Fatalf("this fixture needs a value inside the global cap %d, got %d", mqttMaxAckTotalLimit, recordWants)
+	}
+	st.awaitRefusal(t, "a record above the stream's consumer ack limit")
+	st.assertNoCreate(t, "a record above the stream's consumer ack limit")
+	st.assertCopyAbsent(t, "a record above the stream's consumer ack limit")
+}
+
+// The inactivity-threshold arms, whose oracles differ and must not be conflated.
+func TestQ2AffContenderRefusesAConsumerTheStreamWouldReap(t *testing.T) {
+	t.Parallel()
+
+	// Both signs of a limit imposed BEFORE the create. The oracle is that no
+	// create-or-update was issued AT ALL — because for an already-present durable
+	// a create-or-update applies the substituted threshold first and restarts the
+	// server's deletion timer, so refusing afterwards refuses a durable the
+	// refusal itself just made reapable.
+	//
+	// The negative case is what catches a `> 0` predicate. InactiveThreshold is a
+	// signed Duration; the server substitutes the stream limit unconditionally and
+	// its own limit rejection fires only for a positive limit, so a negative one
+	// would slip past `> 0` and mutate the durable before the returned-config arm
+	// refused it.
+	for _, tc := range []struct {
+		name  string
+		limit time.Duration
+	}{
+		{"a positive limit", 5 * time.Minute},
+		{"a negative limit", -5 * time.Minute},
+	} {
+		tc := tc
+		t.Run("imposed before the create: "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := testQ2AffStageContender(t, "reap"+strconv.Itoa(int(tc.limit/time.Minute)+9), nil, nil,
+				func(st *testQ2AffContenderStage) {
+					si, err := st.b.jsa.lookupStream(mqttOutStreamName)
+					if err != nil || si == nil {
+						t.Fatalf("looking up %s: %v", mqttOutStreamName, err)
+					}
+					cfg := si.Config
+					cfg.ConsumerLimits.InactiveThreshold = tc.limit
+					if _, err := st.b.jsa.updateStream(&cfg); err != nil {
+						t.Fatalf("imposing a consumer inactivity limit on %s: %v", mqttOutStreamName, err)
+					}
+				})
+			st.release(t)
+			st.awaitRefusal(t, tc.name)
+			st.assertNoCreate(t, tc.name)
+			st.assertCopyAbsent(t, tc.name)
+
+			// And the already-present durable was not touched on the way to
+			// refusing: its effective threshold is still zero, so no deletion timer
+			// was armed and none was cleared.
+			ci, err := st.b.jsa.lookupConsumer(mqttOutStreamName, st.durable)
+			if err != nil || ci == nil || ci.Config == nil {
+				t.Fatalf("the winner's durable is unreadable after the refusal: %v", err)
+			}
+			if ci.Config.InactiveThreshold != 0 {
+				t.Fatalf("%s: the refusal mutated the durable's inactivity threshold to %v", tc.name, ci.Config.InactiveThreshold)
+			}
+		})
+	}
+
+	// The RACE the pre-check cannot close: a stream update landing between the
+	// pre-check and the create, so the returned effective threshold is nonzero.
+	// The pre-check is not atomic with the create, and this arm is what catches
+	// that.
+	//
+	// Run in BOTH signs, and the negative one is the point. A positive substituted
+	// threshold is refused by `!= 0` and by a `> 0` mutant alike, so it
+	// discriminates nothing; only a negative one separates them. The debris differs
+	// too — a positive limit arms the server's deletion timer, a negative one
+	// clears it and leaves a timerless durable nothing reaps on a threshold — but
+	// that is documented in docs/CONFORMANCE.md rather than asserted here, because
+	// a positive-only mutant leaves the same timerless durable and the observation
+	// would not discriminate either.
+	for _, tc := range []struct {
+		name  string
+		limit time.Duration
+	}{
+		{"a positive limit", 3 * time.Minute},
+		{"a negative limit", -3 * time.Minute},
+	} {
+		tc := tc
+		t.Run("imposed between the pre-check and the create: "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := testQ2AffStageContender(t, "reaprace"+strconv.Itoa(int(tc.limit/time.Minute)+9), nil, nil,
+				func(st *testQ2AffContenderStage) {
+					// The pre-check reads the stream through this seam and sees a
+					// clean one; the create below then lands against a stream that
+					// has since acquired the limit.
+					jsa := st.b.jsa
+					st.b.asm.mu.Lock()
+					st.b.asm.testQ2AffOutStreamInfo = func() (*StreamInfo, error) {
+						si, err := jsa.lookupStream(mqttOutStreamName)
+						if err != nil || si == nil {
+							return si, err
+						}
+						clean := *si
+						cfg := si.Config
+						cfg.ConsumerLimits.InactiveThreshold = 0
+						clean.Config = cfg
+						return &clean, nil
+					}
+					st.b.asm.mu.Unlock()
+					t.Cleanup(func() {
+						st.b.asm.mu.Lock()
+						st.b.asm.testQ2AffOutStreamInfo = nil
+						st.b.asm.mu.Unlock()
+					})
+					si, err := jsa.lookupStream(mqttOutStreamName)
+					if err != nil || si == nil {
+						t.Fatalf("looking up %s: %v", mqttOutStreamName, err)
+					}
+					cfg := si.Config
+					cfg.ConsumerLimits.InactiveThreshold = tc.limit
+					if _, err := jsa.updateStream(&cfg); err != nil {
+						t.Fatalf("imposing a consumer inactivity limit on %s: %v", mqttOutStreamName, err)
+					}
+				})
+			st.release(t)
+			// The create IS issued here — that is what distinguishes this arm from
+			// the pre-check one — and the refusal comes from the returned config.
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) && len(st.creates()) == 0 {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if len(st.creates()) == 0 {
+				t.Fatalf("%s: no create was issued, so the post-create arm was never reached", tc.name)
+			}
+			st.awaitRefusal(t, tc.name)
+			st.assertCopyAbsent(t, tc.name)
+		})
+	}
+
+	// A stream lookup that FAILS is indeterminate, not "no limits".
+	t.Run("the stream lookup fails", func(t *testing.T) {
+		t.Parallel()
+		st := testQ2AffStageContender(t, "reapsi", nil, nil, func(st *testQ2AffContenderStage) {
+			st.b.asm.mu.Lock()
+			st.b.asm.testQ2AffOutStreamInfo = func() (*StreamInfo, error) {
+				return nil, fmt.Errorf("test: %s is unreadable", mqttOutStreamName)
+			}
+			st.b.asm.mu.Unlock()
+			t.Cleanup(func() {
+				st.b.asm.mu.Lock()
+				st.b.asm.testQ2AffOutStreamInfo = nil
+				st.b.asm.mu.Unlock()
+			})
+		})
+		st.release(t)
+		st.awaitRefusal(t, "an unreadable stream")
+		st.assertNoCreate(t, "an unreadable stream")
+	})
+}
+
+// A record carrying a teardown marker is refused, and no create is attempted.
+func TestQ2AffContenderRefusesToRestoreUnderTeardown(t *testing.T) {
+	t.Parallel()
+	st := testQ2AffStageContender(t, "tdown",
+		func(ps *mqttPersistedSession) {
+			ps.Teardown = &mqttSessTeardown{}
+		}, nil, nil)
+	st.release(t)
+	st.awaitRefusal(t, "a record carrying a teardown marker")
+	st.assertNoCreate(t, "a record carrying a teardown marker")
+	st.assertCopyAbsent(t, "a record carrying a teardown marker")
+}
+
+// A durable whose identity does not match the claim is never materialized onto.
+func TestQ2AffContenderRefusesADurableThatIsNotTheClaimsOwn(t *testing.T) {
+	t.Parallel()
+	st := testQ2AffStageContender(t, "wrongdur", nil,
+		func(c *ConsumerConfig) { c.FilterSubject = mqttOutSubjectPrefix + "someone.else" }, nil)
+	st.release(t)
+	st.awaitRefusal(t, "a durable filtering another session's subject")
+	st.assertNoCreate(t, "a durable filtering another session's subject")
+	st.assertCopyAbsent(t, "a durable filtering another session's subject")
+}
+
+// Storage adoption: the create-or-update carries the DURABLE's immutable storage
+// type, never the contender's own local option and never the record's value where
+// a durable exists to be adopted.
+//
+// "The redelivery succeeded" is not the oracle. A contender forcing its own local
+// option would hit the immutable rejection and refuse, which is visible; but a
+// contender reading the RECORD's value when a durable exists would silently
+// diverge whenever the two disagree, and only the carried-storage assertion
+// catches that.
+func TestQ2AffContenderAdoptsAnExistingConsumersStorage(t *testing.T) {
+	t.Parallel()
+	// The durable really is memory-backed while the record and the contender's own
+	// option both say otherwise, so all three sources are distinguishable.
+	st := testQ2AffStageContender(t, "adopt", nil,
+		func(c *ConsumerConfig) { c.MemoryStorage = true }, nil)
+	st.release(t)
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && len(st.creates()) == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	creates := st.creates()
+	if len(creates) == 0 {
+		t.Fatal("the contender never issued a create-or-update, so no adoption was exercised")
+	}
+	if !creates[0].MemoryStorage {
+		t.Fatalf("the contender's create carried MemoryStorage=false; it must adopt the durable's own true: %+v", creates[0])
+	}
+	if st.b.o.MQTT.ConsumerMemoryStorage {
+		t.Fatal("this fixture needs the contender's LOCAL option to differ from the durable's, or adoption is indistinguishable from imposing it")
+	}
+
+	// The durable's own storage is unchanged, and the assignment completes.
+	ci, err := st.b.jsa.lookupConsumer(mqttOutStreamName, st.durable)
+	if err != nil || ci == nil || ci.Config == nil {
+		t.Fatalf("the winner's durable is unreadable: %v", err)
+	}
+	if !ci.Config.MemoryStorage {
+		t.Fatal("the adoption changed the durable's storage type, which is immutable")
+	}
+	testQ2AffAwaitMaterialized(t, st)
+}
+
+// testQ2AffAwaitMaterialized waits for the claim under test to be materialized on
+// the winner's behalf and its group source acknowledged.
+func testQ2AffAwaitMaterialized(t *testing.T, st *testQ2AffContenderStage) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		claim := testQ2AffLoadClaim(t, st.b, st.subject)
+		if claim.Phase == mqttQ2AffMaterialized && claim.SourceAcked {
+			if state, _ := st.b.asm.loadQ2AffCopy(claim.CopySubject); state == mqttQ2AffCopyPresent {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("the assignment was never materialized on the absent winner's behalf: %s", st.b.dumpClaims(t))
+}
+
+// An on-behalf restoration restores an EXISTING logical consumer, so it is not
+// charged to the contender session's MaxAckPending budget. Charging it would bill
+// a contender for somebody else's consumer, once per redelivery.
+func TestQ2AffOnBehalfRestorationIsNotChargedToTmaxack(t *testing.T) {
+	t.Parallel()
+	st := testQ2AffStageContender(t, "notmax", nil, nil, nil)
+	st.release(t)
+	sess := testMQTTGetClient(t, st.b.s, "notmaxA").mqtt.sess
+	sess.mu.Lock()
+	before := sess.tmaxack
+	sess.mu.Unlock()
+
+	testQ2AffAwaitMaterialized(t, st)
+
+	sess.mu.Lock()
+	after := sess.tmaxack
+	sess.mu.Unlock()
+	if after != before {
+		t.Fatalf("the on-behalf restoration charged the contender's ack budget: %d -> %d", before, after)
+	}
+}
+
+// deleteWinnerDurable destroys the winner's affine consumer out of band, which
+// is F-064's premise: CONSUMER.DELETE carries no precondition, and $MQTT_out is
+// interest-retained, so this drops every copy the durable held.
+func (st *testQ2AffContenderStage) deleteWinnerDurable(t *testing.T) {
+	t.Helper()
+	if _, err := st.b.jsa.deleteConsumer(mqttOutStreamName, st.durable, false); err != nil {
+		t.Fatalf("destroying the winner's affine consumer %q: %v", st.durable, err)
+	}
+	if _, err := st.b.jsa.lookupConsumer(mqttOutStreamName, st.durable); !IsNatsErr(err, JSConsumerNotFoundErr) {
+		t.Fatalf("the winner's durable %q did not go away: %v", st.durable, err)
+	}
+	// Only now may a copy be written: the durable this fixture is about is gone,
+	// and no store has recorded a msg-id that would dedupe the restoration's own.
+	st.release(t)
+}
+
+// THE headline fixture: a contender restores a destroyed affine consumer on
+// behalf of an absent winner, and the group delivery stops stalling.
+//
+// Before this, nothing owner-independent could RESOLVE such an assignment. The
+// dispatcher rereads the claim on every redelivery and the sweep skips any claim
+// of a referenced generation, so the source was re-offered forever while holding
+// a MaxAckPending slot — enough of them and the shared subscription stops
+// delivering for every member.
+//
+// A REAL member as the winner here, rather than the synthetic record-plus-durable
+// the refusal fixtures use, because the closing assertion is [MQTT-4.8.2-4]: the
+// winner comes back and the delivery is completed WITH IT. That needs a session
+// that really subscribed, since the PUBREL half of the exchange runs off the
+// PUBREL consumer its subscription provisions. The winner is disconnected before
+// the contention starts, so the racing-mover hazard testQ2AffSyntheticWinner
+// avoids does not arise.
+func TestQ2AffContenderRestoresADestroyedAffineConsumer(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "restore")
+	ca, ra := b.member(t, "restoreA", 300)
+	cb, rb := b.member(t, "restoreB", 300)
+	defer cb.Close()
+	b.bind(t, "restoreA")
+
+	// Hold the COPY STORE, not the claimed->materialized CAS, so the assignment
+	// is still `claimed` when its consumer is destroyed and NO copy has ever been
+	// written for it.
+	//
+	// Holding the CAS instead looks equivalent and is not. The copy is stored
+	// before that CAS, so a held CAS leaves a copy on the winner's subject; the
+	// out-of-band consumer delete then drops it, but the store's Nats-Msg-Id
+	// survives in $MQTT_out's duplicate window, and the restoration's own store
+	// therefore lands nothing. That is residual 3 — measured here, not assumed —
+	// and it would make this fixture fail for a reason it does not own.
+	var held atomic.Bool
+	held.Store(true)
+	b.asm.mu.Lock()
+	b.asm.testQ2AffCopyStore = func(subject string, hdrLen int, msg []byte) (uint64, error) {
+		if held.Load() {
+			return 0, fmt.Errorf("the copy store is held by the test")
+		}
+		return testQ2AffRealCopyStore(b, subject, hdrLen, msg)
+	}
+	b.asm.mu.Unlock()
+	t.Cleanup(func() {
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyStore = nil
+		b.asm.mu.Unlock()
+	})
+
+	b.publish(t, 1, "restored")
+	_, claim := b.waitForClaim(t, "claimed", func(c *mqttQ2AffClaim) bool { return c.Phase == mqttQ2AffClaimed })
+
+	winnerID, winnerConn, otherReader := "restoreA", ca, rb
+	if claim.Winner != getHash("restoreA") {
+		winnerID, winnerConn, otherReader = "restoreB", cb, ra
+	}
+	winnerConn.Close()
+
+	// THE premise, out of band: CONSUMER.DELETE carries no precondition, and
+	// $MQTT_out is interest-retained, so this drops every copy the durable held.
+	if _, err := b.jsa.deleteConsumer(mqttOutStreamName, claim.AffDurable, false); err != nil {
+		t.Fatalf("destroying the winner's affine consumer %q: %v", claim.AffDurable, err)
+	}
+	if _, err := b.jsa.lookupConsumer(mqttOutStreamName, claim.AffDurable); !IsNatsErr(err, JSConsumerNotFoundErr) {
+		t.Fatalf("the winner's durable %q did not go away: %v", claim.AffDurable, err)
+	}
+
+	held.Store(false)
+	b.asm.mu.Lock()
+	b.asm.testQ2AffCopyStore = nil
+	b.asm.mu.Unlock()
+
+	// The surviving member takes the redelivery and restores what the winner
+	// owns. It must not deliver the message itself.
+	b.waitForClaim(t, "materialized on behalf of the absent winner", func(c *mqttQ2AffClaim) bool {
+		return c.Phase == mqttQ2AffMaterialized && c.Winner == claim.Winner
+	})
+	if _, pl, _, _, got := testMQTTTryReadPublishV5(otherReader, 1500*time.Millisecond); got {
+		t.Fatalf("the contender delivered a message assigned to another session (payload %q)", pl)
+	}
+
+	ci, err := b.jsa.lookupConsumer(mqttOutStreamName, claim.AffDurable)
+	if err != nil || ci == nil || ci.Config == nil {
+		t.Fatalf("the affine consumer was not restored: %v", err)
+	}
+	if verr := mqttValidateQ2AffineNames(ci.Config, claim.Winner, claim.Gen); verr != nil {
+		t.Fatalf("the restored consumer is not the one the claim names: %v", verr)
+	}
+	if ci.Config.AckPolicy != AckExplicit || ci.Config.DeliverPolicy != DeliverNew {
+		t.Fatalf("the restored consumer has the wrong delivery semantics: %+v", ci.Config)
+	}
+	if ci.Config.InactiveThreshold != 0 {
+		t.Fatalf("the restored consumer carries an inactivity threshold of %v", ci.Config.InactiveThreshold)
+	}
+
+	// [MQTT-4.8.2-4]: the winner returns and the delivery is completed WITH IT.
+	// This is what the feature is for; a restored durable that delivered nothing
+	// would satisfy every claim-record assertion above.
+	cw, rw := b.reconnect(t, winnerID, 300)
+	defer cw.Close()
+	_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rw, 15*time.Second)
+	if !ok {
+		t.Fatal("the winner returned and never received the delivery restored on its behalf")
+	}
+	if qos != 2 || string(payload) != "restored" {
+		t.Fatalf("unexpected delivery: payload=%q qos=%d", payload, qos)
+	}
+	b.completeExchange(t, cw, rw, pi)
+	testMQTTExpectNothing(t, otherReader)
+}
+
+// The refusals that guard the restoration, each with an oracle a mutant cannot
+// satisfy by reaching the same final state.
+func TestQ2AffContenderRefusesAnIndeterminateRestoration(t *testing.T) {
+	t.Parallel()
+
+	// An indeterminate LOOKUP is not an absence, and all three shapes are
+	// reachable from a request that SUCCEEDED: lookupConsumer returns
+	// cir.ConsumerInfo unchecked, so a malformed reply yields nil info, and a
+	// non-nil ConsumerInfo may carry a nil Config.
+	for _, tc := range []struct {
+		name string
+		hook func(string) (*ConsumerInfo, error)
+	}{
+		{"a transport error", func(string) (*ConsumerInfo, error) {
+			return nil, fmt.Errorf("test: the lookup request failed")
+		}},
+		{"a successful reply carrying no consumer info", func(string) (*ConsumerInfo, error) {
+			return nil, nil
+		}},
+		{"a consumer info carrying no config", func(string) (*ConsumerInfo, error) {
+			return &ConsumerInfo{}, nil
+		}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := testQ2AffStageContender(t, "indet"+strconv.Itoa(len(tc.name)), nil, nil,
+				func(st *testQ2AffContenderStage) { st.setLookup(tc.hook) })
+			st.release(t)
+			st.awaitRefusal(t, tc.name)
+			// THE assertion: no create was attempted. Reading any of these as
+			// "absent" would create a durable against an unknown one.
+			st.assertNoCreate(t, tc.name)
+			st.assertCopyAbsent(t, tc.name)
+		})
+	}
+
+	// A create whose RESPONSE cannot be trusted. "Nothing stored and no source
+	// acked" does not discriminate here: with the durable absent, a mutant that
+	// proceeds stores a copy no consumer retains, finds it gone on the re-read and
+	// reaches the same final state. The oracle is that materializeQ2AffCopy was
+	// never ENTERED, witnessed by the copy store — sound in this staging precisely
+	// because the copy is provably absent, so entering means attempting a store.
+	alter := func(real func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error), f func(*ConsumerConfig)) func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+		return func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+			resp, err := real(cfg)
+			if resp == nil || resp.ConsumerInfo == nil || resp.Config == nil {
+				return resp, err
+			}
+			altered := *resp.Config
+			f(&altered)
+			info := *resp.ConsumerInfo
+			info.Config = &altered
+			return &JSApiConsumerCreateResponse{ConsumerInfo: &info}, err
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		hook func(*testQ2AffContenderStage) func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error)
+	}{
+		{"a nil create response", func(*testQ2AffContenderStage) func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+			return func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error) { return nil, nil }
+		}},
+		{"a response naming a different durable", func(st *testQ2AffContenderStage) func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+			return alter(st.realCreate, func(c *ConsumerConfig) { c.Durable += "x" })
+		}},
+		{"a response naming a different filter", func(st *testQ2AffContenderStage) func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+			return alter(st.realCreate, func(c *ConsumerConfig) { c.FilterSubject = mqttOutSubjectPrefix + "someone.else" })
+		}},
+		{"a response carrying a substituted inactivity threshold", func(st *testQ2AffContenderStage) func(*ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+			return alter(st.realCreate, func(c *ConsumerConfig) { c.InactiveThreshold = time.Minute })
+		}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var stores atomic.Int32
+			st := testQ2AffStageContender(t, "badresp"+strconv.Itoa(len(tc.name)), nil, nil,
+				func(st *testQ2AffContenderStage) {
+					st.setCreate(tc.hook(st))
+					st.b.asm.mu.Lock()
+					st.b.asm.testQ2AffCopyStore = func(subject string, hdrLen int, msg []byte) (uint64, error) {
+						stores.Add(1)
+						return testQ2AffRealCopyStore(st.b, subject, hdrLen, msg)
+					}
+					st.b.asm.mu.Unlock()
+					t.Cleanup(func() {
+						st.b.asm.mu.Lock()
+						st.b.asm.testQ2AffCopyStore = nil
+						st.b.asm.mu.Unlock()
+					})
+				})
+			st.deleteWinnerDurable(t)
+			st.awaitRefusal(t, tc.name)
+			if n := stores.Load(); n != 0 {
+				t.Fatalf("%s: materialization was entered %d time(s) after an untrustworthy create response", tc.name, n)
+			}
+			st.assertCopyAbsent(t, tc.name)
+		})
+	}
+}
+
+// With no durable to adopt from, the create carries the RECORD's persisted
+// storage type — never the contender's own local option. This is what keeps a
+// contender-created durable compatible with the owner's later create.
+func TestQ2AffContenderCreatesFromTheRecordsStorageWhenAbsent(t *testing.T) {
+	t.Parallel()
+	st := testQ2AffStageContender(t, "absstore",
+		func(ps *mqttPersistedSession) { ps.Q2Aff.MemoryStorage = true },
+		func(c *ConsumerConfig) { c.MemoryStorage = true }, nil)
+	if st.b.o.MQTT.ConsumerMemoryStorage {
+		t.Fatal("this fixture needs the contender's LOCAL option to differ from the record's, or the two sources are indistinguishable")
+	}
+	st.deleteWinnerDurable(t)
+
+	testQ2AffAwaitMaterialized(t, st)
+	creates := st.creates()
+	if len(creates) == 0 {
+		t.Fatal("no create-or-update was issued, so nothing was restored")
+	}
+	if !creates[0].MemoryStorage {
+		t.Fatalf("the create carried the contender's local storage option rather than the record's: %+v", creates[0])
+	}
+}
+
+// The storage conflict a racing restoration produces, and the bound on the retry
+// that resolves it.
+//
+// The race is SIMULATED rather than run with two live contenders, deliberately:
+// two brokers both finding the durable absent and both creating it is not
+// schedulable on demand, and a fixture that waited for it would be
+// timing-dependent. The seam instead does what the rival would have done — really
+// creates the durable with the other storage type — and then lets the requested
+// create fail for real. The error the classifier sees is a genuine server error
+// with a genuine flattened cause, not a fabricated one.
+func TestQ2AffRacingAbsenceConverge(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the loser adopts the winner's storage and converges", func(t *testing.T) {
+		t.Parallel()
+		var attempts atomic.Int32
+		st := testQ2AffStageContender(t, "raceconv", nil, nil, func(st *testQ2AffContenderStage) {
+			real := st.realCreate
+			st.setCreate(func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+				if attempts.Add(1) == 1 {
+					rival := *cfg
+					rival.MemoryStorage = !cfg.MemoryStorage
+					if _, err := real(&rival); err != nil {
+						t.Errorf("staging the rival's create: %v", err)
+					}
+				}
+				return real(cfg)
+			})
+		})
+		st.deleteWinnerDurable(t)
+
+		testQ2AffAwaitMaterialized(t, st)
+		got := st.creates()
+		if len(got) < 2 {
+			t.Fatalf("the conflict was never retried: %d create(s) issued", len(got))
+		}
+		if got[0].MemoryStorage == got[1].MemoryStorage {
+			t.Fatalf("the retry did not adopt the durable's storage: %v then %v", got[0].MemoryStorage, got[1].MemoryStorage)
+		}
+		// THE assertion that the retry is IN-ATTEMPT. Without it this subtest does
+		// not discriminate: with no retry at all the contender refuses, AckWait
+		// re-offers, and the next attempt finds the rival's durable and adopts it —
+		// reaching two creates and the same final state by a slower route. A
+		// deferred disposition is the observable difference, and there must be none.
+		for _, r := range st.results() {
+			if r == mqttQ2AffMoveDeferred {
+				t.Fatalf("the conflict was resolved by a later redelivery rather than by the in-attempt retry: %v", st.results())
+			}
+		}
+		ci, err := st.b.jsa.lookupConsumer(mqttOutStreamName, st.durable)
+		if err != nil || ci == nil || ci.Config == nil {
+			t.Fatalf("the durable is unreadable after convergence: %v", err)
+		}
+		if ci.Config.MemoryStorage != got[1].MemoryStorage {
+			t.Fatalf("the retry carried MemoryStorage=%v but the durable has %v", got[1].MemoryStorage, ci.Config.MemoryStorage)
+		}
+	})
+
+	// The relookup finds the durable GONE again. Equality with the request that
+	// was just refused is not a reason to stop here: the obstacle has been removed,
+	// so the identical request is exactly the retry that now succeeds. Refusing
+	// would defer restoration to another AckWait redelivery for no reason.
+	t.Run("the relookup finds it absent again", func(t *testing.T) {
+		t.Parallel()
+		var attempts atomic.Int32
+		st := testQ2AffStageContender(t, "raceabs", nil, nil, func(st *testQ2AffContenderStage) {
+			real, jsa := st.realCreate, st.b.jsa
+			st.setCreate(func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+				if attempts.Add(1) == 1 {
+					rival := *cfg
+					rival.MemoryStorage = !cfg.MemoryStorage
+					if _, err := real(&rival); err != nil {
+						t.Errorf("staging the rival's create: %v", err)
+					}
+					resp, err := real(cfg)
+					if _, derr := jsa.deleteConsumer(mqttOutStreamName, cfg.Durable, false); derr != nil {
+						t.Errorf("removing the rival's durable: %v", derr)
+					}
+					return resp, err
+				}
+				return real(cfg)
+			})
+		})
+		st.deleteWinnerDurable(t)
+
+		testQ2AffAwaitMaterialized(t, st)
+		got := st.creates()
+		if len(got) < 2 {
+			t.Fatalf("the conflict was never retried after the durable vanished: %d create(s) issued", len(got))
+		}
+		// With nothing to adopt, the retry carries the RECORD's value — which here
+		// equals the refused request. That equality is precisely what an earlier
+		// version of this code read as "nothing to do".
+		if got[1].MemoryStorage != got[0].MemoryStorage {
+			t.Fatalf("the retry did not fall back to the record's storage: %v then %v", got[0].MemoryStorage, got[1].MemoryStorage)
+		}
+		for _, r := range st.results() {
+			if r == mqttQ2AffMoveDeferred {
+				t.Fatalf("the restoration was deferred to a later redelivery instead of retrying in-attempt: %v", st.results())
+			}
+		}
+	})
+
+	t.Run("an unrelated immutable mismatch does not enter the retry", func(t *testing.T) {
+		t.Parallel()
+		var attempts atomic.Int32
+		st := testQ2AffStageContender(t, "racenon", nil, nil, func(st *testQ2AffContenderStage) {
+			real := st.realCreate
+			st.setCreate(func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+				if attempts.Add(1) == 1 {
+					// A rival differing in an immutable field the retry must not
+					// touch: same outer error 10012, different flattened cause.
+					rival := *cfg
+					rival.DeliverPolicy = natsserver.DeliverAll
+					if _, err := real(&rival); err != nil {
+						t.Errorf("staging the rival's create: %v", err)
+					}
+				}
+				return real(cfg)
+			})
+		})
+		st.deleteWinnerDurable(t)
+		st.awaitRefusal(t, "a deliver-policy mismatch")
+		if n := len(st.creates()); n != 1 {
+			t.Fatalf("a non-storage immutable mismatch was retried: %d create(s) issued", n)
+		}
+		st.assertCopyAbsent(t, "a deliver-policy mismatch")
+	})
+
+	t.Run("a second conflict refuses rather than looping", func(t *testing.T) {
+		t.Parallel()
+		st := testQ2AffStageContender(t, "racetwice", nil, nil, func(st *testQ2AffContenderStage) {
+			real, jsa := st.realCreate, st.b.jsa
+			st.setCreate(func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+				// Every attempt loses the same way: the rival re-creates the durable
+				// with whatever this attempt did NOT ask for, so the conflict recurs
+				// and an unbounded retry would spin here forever.
+				if _, err := jsa.deleteConsumer(mqttOutStreamName, cfg.Durable, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+					t.Errorf("clearing the durable between attempts: %v", err)
+				}
+				rival := *cfg
+				rival.MemoryStorage = !cfg.MemoryStorage
+				if _, err := real(&rival); err != nil {
+					t.Errorf("staging the rival's create: %v", err)
+				}
+				return real(cfg)
+			})
+		})
+		st.deleteWinnerDurable(t)
+		st.awaitRefusal(t, "a recurring storage conflict")
+		st.assertCopyAbsent(t, "a recurring storage conflict")
+
+		// THE bound: two creates per attempt and never a third.
+		if n := len(st.creates()); n%2 != 0 || n == 0 {
+			t.Fatalf("the retry is not bounded at one per attempt: %d create(s) issued", n)
+		}
+	})
+}
+
+// Residual 8, pinned: the stall is NOT closed for a MATERIALIZED assignment whose
+// copy is gone.
+//
+// This is the half of F-064's own title this item does not deliver, and it is the
+// easiest thing in the change to gloss, so it is asserted rather than described.
+// D1 is the dispatcher's `default` arm, reached only for a claim that has not been
+// materialized. A foreign `materialized` claim with no copy takes the arm above
+// it, where sourceAckAuthorized grants nothing: the contender proves nothing,
+// writes nothing and acks nothing, and the source keeps its MaxAckPending slot
+// until the owner resumes and records a terminal fact.
+//
+// The claim is SEEDED materialized with its source unacknowledged, because that
+// combination is the population and the broker will not produce it on demand:
+// materializing normally releases the source in the same operation, after which
+// nothing re-offers the delivery and the arm under test is never re-entered. An
+// earlier version of this fixture drove materialization the ordinary way and was
+// vacuous for exactly that reason — M20 survived it.
+//
+// It fails if somebody routes this population into on-behalf restoration, which
+// would be a duplicate PUBLISH for an exchange that may already be past PUBREC —
+// the reason the re-store arm was cut from this design.
+func TestQ2AffMaterializedClaimWithNoCopyStillWaitsForItsOwner(t *testing.T) {
+	t.Parallel()
+	var entered atomic.Int32
+	st := testQ2AffStageContenderSeeded(t, "resid8", nil, nil,
+		func(st *testQ2AffContenderStage) {
+			// Count entries into on-behalf restoration by counting what only it
+			// does here: look the winner's durable up. Nothing else on this path
+			// makes that call, so any count above zero is D1 being entered.
+			st.setLookup(func(durable string) (*ConsumerInfo, error) {
+				entered.Add(1)
+				return st.b.jsa.lookupConsumer(mqttOutStreamName, durable)
+			})
+		},
+		func(c *mqttQ2AffClaim) {
+			c.Phase = mqttQ2AffMaterialized
+			c.SourceAcked = false
+		})
+	st.release(t)
+
+	// Anti-vacuity: the arm under test must actually be reached, repeatedly,
+	// which is what "the source is still being re-offered" means here.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && len(st.results()) < 2 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	got := st.results()
+	if len(got) < 2 {
+		t.Fatalf("the assignment was resolved fewer than twice (%v), so the re-offer this residual is about never happened", got)
+	}
+	for _, r := range got {
+		if r != mqttQ2AffMoveDeferred {
+			t.Fatalf("a contender resolved a materialized claim whose copy is gone as %v; that population must wait for its owner", r)
+		}
+	}
+
+	claim := testQ2AffLoadClaim(t, st.b, st.subject)
+	if claim.Phase != mqttQ2AffMaterialized {
+		t.Fatalf("the claim left the materialized phase: %+v", *claim)
+	}
+	if claim.AffineDone || claim.Lost || claim.Discarded {
+		t.Fatalf("a contender recorded a terminal fact for a materialized claim whose copy is gone: %+v", *claim)
+	}
+	if claim.SourceAcked {
+		t.Fatal("a contender released the group source for a claim it could prove nothing about")
+	}
+	if state, _ := st.b.asm.loadQ2AffCopy(claim.CopySubject); state == mqttQ2AffCopyPresent {
+		t.Fatal("a replacement copy was materialized for a claim that may already be past PUBREC")
+	}
+	// THE discriminating assertion. Every check above is also satisfied by a
+	// restoration that ran and then failed; only this one says it was never
+	// entered.
+	if n := entered.Load(); n != 0 {
+		t.Fatalf("on-behalf restoration was entered %d time(s) for a materialized claim; that population is residual 8 and must wait for its owner", n)
+	}
+}
+
+// The regression this item would have introduced without the owner's recovery,
+// staged the way it would actually arise: a CONTENDER creates the durable first.
+//
+// With the durable absent, a contender legitimately creates it from the winner's
+// PERSISTED storage type — the only value it may impose. If an operator has since
+// reloaded consumer_memory_storage, the owner then rebuilds its own request from
+// the CURRENT option, meets an immutable mismatch, and without the recovery could
+// never resume. Trading F-064's stall for a permanently unresumable session is not
+// a trade this item may make, which is why decision 4 admits one post-failure
+// recovery on the owner's path.
+//
+// The oracle is a FRESH delivery, not a stranded one. Recreating a durable with
+// the other storage type necessarily destroys it first, and $MQTT_out is
+// interest-retained, so any copy it held is gone — a stranded-copy oracle would
+// fail here for a reason this fixture does not own. What the regression is about
+// is whether the session can be resumed and served at all.
+func TestQ2AffOwnerResumesAfterAContenderCreatedItsDurable(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "ownctd")
+	c, r := b.member(t, "ownctdA", 300)
+	b.bind(t, "ownctdA")
+	idHash := getHash("ownctdA")
+
+	// Leave the group so the record keeps the affine path with no shared filter
+	// beside it, which is what puts the resume on the standalone route.
+	b.unsubscribe(t, c, r, 2, []string{"$share/" + b.group + "/" + b.topic})
+	c.Close()
+
+	ps := testQ2AffAwaitStableRecord(t, b, idHash)
+	if ps.Q2AffGen == _EMPTY_ || ps.Q2Aff == nil {
+		t.Fatalf("the record names no affine path: %+v", ps)
+	}
+	recorded := ps.Q2Aff.MemoryStorage
+
+	// A contender's restoration, reproduced exactly: the durable is destroyed and
+	// recreated from the RECORD's persisted storage, which is what
+	// materializeQ2AffOnBehalf does when it finds nothing to adopt.
+	if _, err := b.jsa.deleteConsumer(mqttOutStreamName, ps.Q2Aff.Durable, false); err != nil {
+		t.Fatalf("destroying the affine durable: %v", err)
+	}
+	restored := buildQ2AffineConsumerConfig(idHash, ps.Q2AffGen, ps.Q2Aff.AckWait, ps.Q2Aff.MaxAckPending, recorded)
+	if _, err := b.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttOutStreamName, Config: restored}); err != nil {
+		t.Fatalf("recreating the durable the way a contender would: %v", err)
+	}
+
+	// The operator reload, which is what turns the contender's correct choice into
+	// a conflict for the owner.
+	b.o.MQTT.ConsumerMemoryStorage = !recorded
+	testQ2AffRestartSameStore(t, b)
+	if got := b.s.getOpts().MQTT.ConsumerMemoryStorage; got == recorded {
+		t.Fatalf("the reload did not reach getOpts(): consumer_memory_storage is still %v", got)
+	}
+	testQ2AffReadRecordAfterRestart(t, b, "ownctd-reader", idHash)
+	lookups := testQ2AffCountLookups(t, b)
+
+	cr, rr := b.reconnect(t, "ownctdA", 300)
+	defer cr.Close()
+	// Polled, not read once: the success CONNACK is sent BEFORE the resume
+	// re-establishes the affine path, so an immediate read races the work it is
+	// trying to observe.
+	sess := testMQTTGetClient(t, b.s, "ownctdA").mqtt.sess
+	deadline := time.Now().Add(10 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) && !ready {
+		sess.mu.Lock()
+		ready = sess.q2AffReady
+		sess.mu.Unlock()
+		if !ready {
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+	if !ready {
+		t.Fatal("the owner could not re-establish its affine path against a durable a contender created for it: F-064 traded a stall for an unresumable session")
+	}
+	if n := lookups(); n != 1 {
+		t.Fatalf("the recovery performed %d affine consumer lookup(s), want exactly 1", n)
+	}
+
+	// And the session really is serviceable, not merely non-failing: it rejoins
+	// the group and a shared QoS 2 message is carried end to end.
+	codes, _ := b.subSharedTolerant(t, cr, rr, 1, "$share/"+b.group+"/"+b.topic)
+	if len(codes) != 1 || codes[0] != 2 {
+		t.Fatalf("the resumed session could not rejoin the shared group: %v", codes)
+	}
+	b.publish(t, 2, "after-recovery")
+	_, payload, qos, pi, ok := testMQTTTryReadPublishV5(rr, 10*time.Second)
+	if !ok {
+		t.Fatal("the resumed session received nothing after rejoining the group")
+	}
+	if qos != 2 || string(payload) != "after-recovery" {
+		t.Fatalf("unexpected delivery: payload=%q qos=%d", payload, qos)
+	}
+	b.completeExchange(t, cr, rr, pi)
 }

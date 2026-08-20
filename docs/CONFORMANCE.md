@@ -209,13 +209,24 @@ session generation can read (`internal/mqtt/qos2_shared_affine.go`). So:
 
 One failure mode is outside the protocol's control and is recorded rather than
 hidden: if the session's affine JetStream consumer is destroyed out of band,
-`$MQTT_out`'s interest retention deletes the copies it still held, and those
-QoS 2 messages are lost. Because the affine side of an assignment is recorded
-**before** its copy is acked, that outcome is distinguishable from a completed
-delivery in the durable state alone — no broker has to have witnessed the
-consumer disappear — and each affected assignment is marked `Lost`: a terminal
-state that is deliberately **not** reapable, so the record survives for an
-operator to find instead of being written off as a completed delivery.
+`$MQTT_out`'s interest retention deletes the copies it still held, and delivery
+of those QoS 2 messages can no longer be PROVEN. Because the affine side of an
+assignment is recorded **before** its copy is acked, that outcome is
+distinguishable from a *proven* delivery in the durable state alone — no broker
+has to have witnessed the consumer disappear — and each affected assignment is
+marked `Lost`: a terminal state that is deliberately **not** reapable, so the
+record survives for an operator to find instead of being written off as a
+completed delivery.
+
+**`Lost` is what the broker can prove, not what necessarily happened**, and the
+difference matters to anyone acting on the marking. The write order above is
+sound for the JetStream copy acknowledgement and **not** for the client's PUBREC,
+which is answered earlier: `mqttProcessPublishReceived` stores the correlated
+PUBREL before it reaches `mqttFinishQ2AffineDelivery`. So a client may already
+have received and acknowledged the PUBLISH while only the copy acknowledgement is
+unproven, and the assignment is still marked `Lost`. That is a reporting defect
+rather than a deviation — see the paragraph below on why nothing is
+redistributed and the client is not deprived — and it has its own roadmap item.
 
 **Corrected by F-033's audit (2026-08-18): the marking is not automatic.** `Lost` has
 exactly one writer in the tree, `recoverQ2AffClaims`, and it runs on **the owning
@@ -223,9 +234,14 @@ session's own resume**. While the record is live and names the same generation, 
 orphan sweep skips every claim of that generation by design, so an assignment orphaned
 by an out-of-band consumer destruction is marked `Lost` only if that session comes back.
 A session that never resumes — which a session expiry interval of `0xFFFFFFFF` permits —
-leaves it unmarked and its shared-group source message re-offered forever, because the
-group consumer sets no `MaxDeliver`. That is **F-064**; the sentence above describes the
-resumed case only.
+leaves it unmarked. That was **F-064**, and it is now **partly closed**: for an
+assignment that never reached `materialized`, a contender taking the group redelivery
+restores the destroyed consumer from the winner's record and materializes onto it, so
+the source is released without the owner. For an assignment that DID reach
+`materialized`, nothing changes — a replacement copy there could become a second
+PUBLISH for an exchange already past PUBREC — so its source is still re-offered
+forever, because the group consumer sets no `MaxDeliver`. That remainder is F-064's
+**residual 8**, and the sentence above still describes the resumed case only.
 
 **F-063, closed 2026-08-19: the broker no longer releases a source against a store
 response.** Because `$MQTT_out` is interest-retained, a copy stored after its consumer is
@@ -285,10 +301,70 @@ discarded assignment is itself retained until the source is proven closed, so
 reaping it can never let a redelivery elect a second winner.
 
 **What remains in this section**, therefore: the out-of-band consumer destruction above,
-whose `Lost` marking depends on the owner resuming (F-064), and F-063's non-atomic span
-between the final copy proof and the source ack. Both are stated with their mechanism
-rather than a bound they do not have. Not this, despite the heading this section carried
-until F-063 closed:
+whose `Lost` marking depends on the owner resuming (F-064's residuals 1 and 8), and
+F-063's non-atomic span between the final copy proof and the source ack. Both are stated
+with their mechanism rather than a bound they do not have.
+
+**And a reporting defect that is not a conformance one, stated here so it is not
+rediscovered as one.** `mqttProcessPublishReceived` stores the correlated PUBREL before
+it records `AffineDone`, so PUBREC → broker stop → out-of-band consumer destruction
+leaves `materialized ∧ ¬AffineDone ∧ copy absent` for a message the client already
+answered. The owner's resume records that as `Lost`, which is untruthful. It is not a
+deviation: `Lost` releases the group delivery without re-offering the message, so
+nothing is redistributed, and the client is not deprived — the PUBREL is persisted
+independently and replayed, so the handshake completes. The observable cost is an
+erroneous log line and a claim that is never reaped. Writing `Discarded` instead is not
+available as a shortcut, and the reason is phase-sensitive: where a correlated PUBREL
+proves PUBREC it is merely untruthful, but for the undifferentiated shape, where nothing
+proves the client was reached, it would deprive a client still owed the PUBLISH and
+`[MQTT-4.8.2-4]` does bite. Correcting it has its own roadmap item.
+
+**Residuals of on-behalf restoration itself.** A contender restoring a destroyed
+consumer refuses, storing nothing and acking nothing, on: a record whose `Q2Aff` is not
+exactly the canonical provisioning shape or whose variable fields are out of bounds; a
+record carrying a teardown marker; an indeterminate consumer lookup or stream read; a
+nonzero `ConsumerLimits.InactiveThreshold`; an unconvergeable immutable mismatch; and a
+second storage conflict after one bounded retry. The owner's own recovery
+additionally declines to retry while `$MQTT_out` carries a nonzero
+`ConsumerLimits.InactiveThreshold`, because the retry would arm a deletion timer on
+a durable the refused create had left untouched — so an operator who mutates that
+limit after startup keeps today's inert provisioning failure rather than gaining a
+reapable durable.
+
+**That read is not atomic with the retry, and the remaining window is stated here
+rather than narrowed again.** It requires all three of:
+
+1. the owner's initial create meets the exact `MemoryStorage` immutable conflict
+   against an existing affine durable, so the recovery is entered at all;
+2. `$MQTT_out`'s `ConsumerLimits.InactiveThreshold` changes from zero to a
+   **positive** value after the recovery has read the stream and before its retry
+   is applied — which `validateOutStream` refuses at startup, so it can only be a
+   stream mutated afterwards;
+3. the retry is applied server-side, arming the durable's deletion timer, but its
+   response is lost, so the recovery still reports failure.
+
+If the client then stays disconnected through that threshold, the durable and the
+copies it holds are reaped. **This is the same fate an ordinary owner create
+already meets under that post-startup mutation** — it is not a new class of
+debris. What the window removes is an accidental preservation that the storage
+conflict itself was providing, and which came bundled with a session that could
+never resume. Closing it is not available: JetStream's consumer create carries no
+precondition, so nothing can fence the update against a concurrent stream change.
+
+Three of the contender-side refusals leave debris worth naming. The teardown check
+narrows but does not close its race, because consumer
+creation has no precondition on the record's sequence — `deleteOrphanQ2AffConsumers`
+removes a recreated durable only once the reference is gone. A stream update landing
+between the inactivity pre-check and the create yields a nonzero effective threshold
+that the returned-config arm refuses; a positive one leaves a durable carrying a
+deletion timer, which that same limit later reaps, while a **negative** one leaves a
+timerless durable that nothing reaps on a threshold, since there is none — ordinary
+teardown deletes it, and the orphan pass is the fallback. And restoration can still
+keep nothing while `$MQTT_out`'s configured duplicate window has an entry for the
+copy's stable `Nats-Msg-Id` from an earlier no-interest store; the validator waives
+`Duplicates`, so that bound is operator-configured.
+
+Not this, despite the heading this section carried until F-063 closed:
 
 Packet-identifier continuity across a broker restart or failover is **no longer** a
 deviation, here or on any other outbound path: a started delivery's identifier is
@@ -766,7 +842,7 @@ it does *not* promise:
 - **The packet's two unwinds discard this generation's assignments BEFORE the CAS that
   arbitrates whether they still own them**, so a cleanup save lost to a remote winner that
   PRESERVED the generation leaves that winner's started QoS 2 delivery discarded —
-  terminated for a session that is still live, which is the [MQTT-4.8.2-6] outcome applied
+  terminated for a session that is still live, which is the [MQTT-4.8.2-5] outcome applied
   to the wrong owner. `restoreQ2AffineUnwind` cannot undo it: the discard is monotonic by
   design. The settlement reclaim does NOT have this exposure — it prepares its unwind with
   `disposeNow` false and discards only once the cleanup record is confirmed — but the

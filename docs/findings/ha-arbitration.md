@@ -772,7 +772,7 @@ local guard that would mitigate it does not convert it into a separate finding. 
 *different-generation* arm is **settled** on the clean-start route and rests on no false
 premise: `clear()` drains the affine fence and re-mints the incarnation, and teardown
 marks every assignment of the retiring generation `Discarded` before deleting its consumer
-(`sess_teardown.go:738-753`), so the old session really has ended and [MQTT-4.8.2-6]
+(`sess_teardown.go:738-753`), so the old session really has ended and [MQTT-4.8.2-5]
 permits the delivery to die with it. What F-036 owns there is the obsolete broker object
 continuing to serve after that termination, not the discard.
 
@@ -1586,11 +1586,70 @@ from materialization.
 **Title:** A live generation reference leaves every assignment of that generation to owner
 resume
 
-- Status: **Open.** Found by F-033's consequence audit, 2026-08-18.
+- Status: **Partly remedied, 2026-08-20. Still open.** Found by F-033's consequence audit,
+  2026-08-18.
 - Classification: HA arbitration architecture / liveness
 - Release treatment: **Alpha blocker** for the stall. The accumulation is a resource leak
   and is stated here as a residual of the same premise rather than filed separately.
 - Roadmap section: §0.2 (multi-frontend HA blockers)
+
+### What landed, and what it deliberately does not touch
+
+**On-behalf restoration of a destroyed affine consumer.** A contender taking the group
+redelivery rebuilds the winner's durable from its record and materializes onto it, so
+consequence 1 is closed **for assignments that never reached `materialized`** — without
+the owner, and without going through the sweep at all. Neither gate below is addressed,
+and neither needs to be: the redelivery carries the payload, which is the thing the sweep
+does not have.
+
+The mechanism, its refusals and its residuals are in `docs/ARCHITECTURE.md`
+("On-behalf restoration of a destroyed affine consumer") and `docs/CONFORMANCE.md`.
+
+**Three things did not land, and each is recorded so it is not rediscovered as an
+oversight.**
+
+1. *The stall for a `materialized` assignment whose copy is gone.* That population takes a
+   different dispatcher arm and still waits for its owner.
+2. *The accumulation, consequence 2.* Moved to **F-065**'s bullet: reaping claims of a live
+   generation needs the reaper fence that is F-065's remedy.
+3. *The `Lost`-truthfulness defect.* Its own roadmap bullet.
+
+### Refuted designs, recorded so none returns
+
+- **A sweep-side `Lost` writer.** The sweep has no payload, so it can only resolve a claim
+  by asserting a fact it cannot prove.
+- **Discard on a live record.** The rationale is **two-part**, and the blanket version an
+  earlier draft carried overclaimed. Where nothing proves PUBREC, writing `Discarded`
+  deprives a client still owed the PUBLISH and is non-conformant under `[MQTT-4.8.2-4]`.
+  Where a correlated PUBREL **does** prove PUBREC, the PUBREL is persisted independently
+  and replayed, so the handshake completes and the client is not deprived — there it is
+  untruthful rather than non-conformant.
+- **Re-storing a copy for a `materialized` claim.** Refuted twice, in successive review
+  rounds, and the second time unpatchable from the claim side: the copy CAS and the claim
+  CAS are on different streams, so no claim-side fence can order a contender's store
+  against the winner's authorization of the original PUBLISH. The replacement copy can
+  become a second PUBLISH for an exchange already past PUBREC. This is the same
+  cross-stream non-atomicity that refuted the owner-independent `Lost` writer in F-063.
+- **An enumerated field predicate for replayability.** Five successive lists were each
+  falsified by the next review round — `MaxDeliver`, `HeadersOnly`, `DeliverGroup`,
+  `PauseUntil`, `FlowControl`+`Heartbeat` — and `MaxDeliver` alone reopens the stall. A
+  list cannot close a struct a dependency bump can extend; whole-struct equality against a
+  single constructor can.
+- **Refusing an unconvergeable durable on the OWNER's path too.** Sound in isolation, but
+  a refusal costs a live connection there: a CONNECT-time restoration failure is silently
+  skipped because there is no SUBACK on that path, and the only remedy that removes the
+  silence closes the connection, publishing the Will and, at a zero expiry interval,
+  deleting the session. Confined to the contender instead.
+- **Owner-side storage ADOPTION.** Rejected in favour of a post-failure recovery: adoption
+  is not monotonic, because it needs a lookup that can fail and because adopting one value
+  can meet a durable recreated with another, refused as immutable where today's
+  local-option create would have succeeded.
+- **A preflight lookup on the owner's path.** Turns a failing lookup into a failed
+  provision. The recovery cannot, because it runs only after a create that already failed.
+
+The caller analysis from the rounds that produced those last three is **overtaken by the
+contender-only decision** rather than dropped; it is why the decision is worded as
+monotonicity — the owner's failure set may shrink and must never grow.
 
 ### The finding
 
@@ -1608,8 +1667,8 @@ expires — is the counterexample.
 roadmap bullet named. Record live and matching, affine consumer authoritatively absent,
 owner never resumes:
 
-- every contender's `materializeQ2AffOnBehalf` fails at the consumer lookup
-  (`qos2_shared_affine.go:1823-1829`), forever, and acknowledges nothing;
+- every contender's `materializeQ2AffOnBehalf` used to fail at the consumer lookup,
+  forever, acknowledging nothing — this is the half that landed;
 - `discardAbsentWinnerClaim` defers because the generation matches
   (`orphan_qos2_sweep.go:1855`);
 - `reconcileOrphanQ2AffClaims` never reaches the claim at all;

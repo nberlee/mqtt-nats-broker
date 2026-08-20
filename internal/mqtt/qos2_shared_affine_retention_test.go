@@ -207,22 +207,49 @@ func testQ2AffAwaitSeeded(t *testing.T, seeded func() (string, bool)) string {
 // another broker, or gone while its delivery was in flight.
 func testQ2AffSyntheticWinner(t *testing.T, b *testQ2AffBroker, id string) (idHash, gen string) {
 	t.Helper()
-	idHash, gen = getHash(id), mqttNewQ2AffGen()
-	testQ2AffForeignStoreWith(t, testQ2AffPeerASM(t, b, "synthetic-"+id), id,
-		func(ps *mqttPersistedSession) { ps.Q2AffGen = gen })
+	return testQ2AffSyntheticWinnerWith(t, b, id, nil, nil)
+}
 
-	filter, deliver, durable := mqttQ2AffineNames(idHash, gen)
+// testQ2AffSyntheticWinnerWith is testQ2AffSyntheticWinner with two hooks for
+// fixtures that need the staged shape to DEVIATE: record adjusts the persisted
+// record (including its Q2Aff) after the canonical config is built, and consumer
+// adjusts the durable that is actually created. Either may be nil.
+//
+// They are separate on purpose. A record that no longer matches the durable is
+// precisely what several of F-064's refusals are about, so a helper that kept the
+// two in step could not stage them.
+func testQ2AffSyntheticWinnerWith(t *testing.T, b *testQ2AffBroker, id string,
+	record func(*mqttPersistedSession), consumer func(*ConsumerConfig)) (idHash, gen string) {
+	t.Helper()
+	idHash, gen = getHash(id), mqttNewQ2AffGen()
+	// The record carries the consumer CONFIG, not just the generation, because a
+	// session-provisioned record does: ensureQ2AffineConsumerSubscription persists
+	// the request it sent. A generation with no config is a real but DIFFERENT
+	// shape — restoreQ2AffineUnwind's names-only stub — and on-behalf restoration
+	// refuses it, because its zero values are not merely incomplete but wrong
+	// (AckPolicy zero is AckNone, DeliverPolicy zero is DeliverAll). Staging one
+	// here would make every fixture built on this helper observe THAT refusal
+	// instead of the window it is trying to enter. Built through the single
+	// constructor for the same reason the production writers are.
+	cfg := buildQ2AffineConsumerConfig(idHash, gen, time.Minute, mqttDefaultMaxAckPending, false)
+	testQ2AffForeignStoreWith(t, testQ2AffPeerASM(t, b, "synthetic-"+id), id,
+		func(ps *mqttPersistedSession) {
+			ps.Q2AffGen = gen
+			q2aff := cfg
+			ps.Q2Aff = &q2aff
+			if record != nil {
+				record(ps)
+			}
+		})
+
+	durable := cfg.Durable
+	staged := cfg
+	if consumer != nil {
+		consumer(&staged)
+	}
 	if _, err := b.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
 		Stream: mqttOutStreamName,
-		Config: ConsumerConfig{
-			DeliverSubject: deliver,
-			Durable:        durable,
-			AckPolicy:      AckExplicit,
-			DeliverPolicy:  DeliverNew,
-			FilterSubject:  filter,
-			AckWait:        time.Minute,
-			MaxAckPending:  mqttDefaultMaxAckPending,
-		},
+		Config: staged,
 	}); err != nil {
 		t.Fatalf("creating the synthetic winner's affine consumer: %v", err)
 	}
@@ -234,8 +261,10 @@ func testQ2AffSyntheticWinner(t *testing.T, b *testQ2AffBroker, id string) (idHa
 	if err != nil || ci == nil || ci.Config == nil {
 		t.Fatalf("looking up the synthetic winner's affine consumer: ci=%v err=%v", ci, err)
 	}
-	if verr := mqttValidateQ2AffineNames(ci.Config, idHash, gen); verr != nil {
-		t.Fatalf("the synthetic winner's consumer fails the on-behalf identity check: %v", verr)
+	if consumer == nil {
+		if verr := mqttValidateQ2AffineNames(ci.Config, idHash, gen); verr != nil {
+			t.Fatalf("the synthetic winner's consumer fails the on-behalf identity check: %v", verr)
+		}
 	}
 	return idHash, gen
 }
@@ -786,7 +815,7 @@ func TestQ2AffAcksOnAffineDone(t *testing.T) {
 }
 
 // Discarded. The winner's session ended and the delivery dies with it
-// ([MQTT-4.8.2-6]). Required rather than merely permitted: reapable refuses without
+// ([MQTT-4.8.2-5]). Required rather than merely permitted: reapable refuses without
 // SourceAcked, so withholding the ack here would make every discarded claim
 // permanently unreapable — the accumulation half of F-064, manufactured on purpose.
 //
@@ -801,10 +830,15 @@ func TestQ2AffAcksOnDiscarded(t *testing.T) {
 	testQ2AffAwaitClaim(t, b, subject, "reaped", func(c *mqttQ2AffClaim) bool { return c == nil })
 }
 
-// Lost. A QoS 2 message the broker accepted and never delivered. Withholding the
-// group ack does not undo that, and the claim is terminal, so the source is released
-// — while the record itself is RETAINED, because it is the only durable evidence
-// that it happened.
+// Lost. A QoS 2 message the broker accepted and could not prove it delivered.
+// Withholding the group ack does not undo that, and the claim is terminal, so the
+// source is released — while the record itself is RETAINED, because it is the only
+// durable evidence that it happened.
+//
+// Not "never delivered": the client's PUBREC is answered before the affine side is
+// recorded, so a Lost claim can name a message that in fact arrived (F-064's
+// residual 1). Nothing this fixture asserts depends on which it was — the release
+// and the retention are right either way — but the label is not proof of loss.
 //
 // Both halves are asserted. The retention half is not decoration: it is what
 // separates releasing the source from laundering a compliance failure into a clean

@@ -2135,12 +2135,21 @@ ack (`jsa.confirmAck`), not by the ordinary fire-and-forget `sendAck`.
 
 A fifth field, `Lost`, records the one outcome that is neither completion nor a
 permitted discard: the affine consumer was destroyed out of band, and interest
-retention took its pending copies with it, so a QoS 2 message the broker accepted
-was never delivered. `Lost` is terminal (no contender waits on it, and the group
-delivery is released) but never reapable, because the record is the only durable
-evidence that the loss happened and a clean reap would erase it. `Lost` and
-`AffineDone` are mutually exclusive and are not independently merged: whichever
-the durable record already proved stands.
+retention took its pending copies with it, so delivery of a QoS 2 message the
+broker accepted can no longer be PROVEN. `Lost` is terminal (no contender waits
+on it, and the group delivery is released) but never reapable, because the record
+is the only durable evidence of that unproven outcome and a clean reap would
+erase it. `Lost` and `AffineDone` are mutually exclusive and are not
+independently merged: whichever the durable record already proved stands.
+
+**`Lost` is not proof that the message failed to reach the client**, and the
+distinction is operator-facing. The write order that justifies the inference
+holds for the JetStream copy acknowledgement, not for the client's PUBREC, which
+is answered before `AffineDone` is recorded — see the write-order paragraph
+below. A client may therefore have received and acknowledged the PUBLISH while
+the assignment is still marked `Lost`. Nothing is redistributed and the client is
+not deprived, so this is a reporting defect rather than a deviation; it is stated
+in `docs/CONFORMANCE.md` and has its own roadmap item.
 
 **Releasing the group source is authorized by evidence, never by the phase.** The
 phase is a record of the past: `$MQTT_out` is interest-retained, so the copy a
@@ -2165,8 +2174,11 @@ Three consequences, all deliberate:
   unreapable. `Discarded` is required here, not merely permitted.
 
 Where nothing is authorized the move proves nothing, writes nothing and acks
-nothing, leaving the source for AckWait. That refusal does not resolve the claim it
-leaves behind, which is F-064's premise and F-064's remedy. The residual it keeps —
+nothing, leaving the source for AckWait. For a claim that reached `materialized`
+that refusal still does not resolve anything, and the delivery waits for its owner
+— F-064's residual 8. For a claim that never did, the contender now RESTORES the
+winner's destroyed consumer and materializes onto it (see "On-behalf restoration"
+below), so the stall is closed without the owner. The residual it keeps —
 a consumer deleted between the final proof and the ack — is stated in
 `docs/CONFORMANCE.md`; `CONSUMER.DELETE` is unconditioned, so no finite check
 closes it.
@@ -2187,10 +2199,27 @@ would store a second copy that NAKs forever once its claim is reaped.
 
 Telling the two apart is a matter of WRITE ORDER, not of observation. `AffineDone`
 is recorded **before** the copy is acked, so an absent copy under a claim that
-never reached `AffineDone` was never acked by a delivery — it was dropped with its
-consumer. Every broker reads that identically, which an "I saw the consumer
-disappear" flag could not: the broker that observed it may be gone, or the
+never reached `AffineDone` was never acked **by the JetStream delivery** — it was
+dropped with its consumer. Every broker reads that identically, which an "I saw the
+consumer disappear" flag could not: the broker that observed it may be gone, or the
 consumer may have been recreated, by the time anyone reconciles.
+
+**That inference is about the copy ack, and it does NOT extend to the client's
+PUBREC.** `mqttProcessPublishReceived` calls `trackAsPubRel` and stores the
+correlated PUBREL *before* it reaches `mqttFinishQ2AffineDelivery`, which is what
+records `AffineDone`. So PUBREC, then a broker stop, then an out-of-band consumer
+destruction leaves `materialized ∧ ¬AffineDone ∧ copy absent` for a message the
+client has already answered. An earlier revision of this paragraph said such a copy
+"was never acked by a delivery" without that qualification; it is corrected here
+because two decisions rest on the distinction:
+
+- Re-materializing a `materialized` claim is **refused**, precisely because a
+  replacement copy there can become a second PUBLISH for an exchange already past
+  PUBREC.
+- The `Lost` that owner-side recovery records for this shape is therefore
+  sometimes a **false loss report**. It is not a conformance defect — `Lost`
+  releases the group delivery without re-offering the message, so nothing is
+  redistributed — but it is untruthful, and correcting it is its own roadmap item.
 
 That inference is authoritative **while the owning session record still exists**.
 Once it is gone, a legitimate teardown deleting the consumer and an out-of-band
@@ -2271,7 +2300,7 @@ Refusing it is not bookkeeping. `Q2AffGen` is what a contender compares a claim
 against to conclude its winner is gone, and an **empty** one mismatches every
 claim: read rather than refused, such a record turns a malformed shape into proof
 of absence and discards an assignment owed to a delivery already started — the
-redistribution [MQTT-4.8.2-6] forbids. `materializeQ2AffOnBehalf` therefore
+redistribution [MQTT-4.8.2-5] forbids. `materializeQ2AffOnBehalf` therefore
 validates the winner's record **before the comparison**, not inside one of its arms,
 because the record is used in both directions: a mismatch discards the assignment,
 and a match materializes the copy and **acknowledges the group source**, which is
@@ -2347,6 +2376,119 @@ remain: a consumer deleted between the copy proof and the source ack (F-063).
 Packet-identifier continuity is **not** among them — the in-flight register closed it on
 every outbound path.
 
+### On-behalf restoration of a destroyed affine consumer
+
+`$MQTT_out` is interest-retained and `CONSUMER.DELETE` carries no precondition, so
+a winner's affine durable can be destroyed out of band while it is away — taking
+every copy it held. Nothing owner-independent used to RESOLVE such an assignment:
+the dispatcher rereads the claim on every redelivery, the sweep skips any claim of
+a referenced generation, and `recoverQ2AffClaims` runs only from the owner's own
+resume. Since MQTT permits a session that never expires, "the owner comes back" is
+not a reconciler, and the group consumer sets no `MaxDeliver`, so the source is
+re-offered forever while holding a `MaxAckPending` slot.
+
+A contender taking such a redelivery now restores the durable from the winner's
+record and materializes onto it. **Presence and authoritative absence are not two
+paths**: the same create-or-update runs either way, differing only in which
+`MemoryStorage` it carries.
+
+- **Replayability is whole-struct equality, not a field list.** The canonical
+  configuration has a single constructor, `buildQ2AffineConsumerConfig`, and the
+  record's `Q2Aff` is accepted only when it `reflect.DeepEqual`s what that
+  constructor returns for the same names plus the record's own three variable
+  fields (`AckWait`, `MaxAckPending`, `MemoryStorage`). A list cannot close a
+  struct a dependency bump can extend, and `MaxDeliver` alone — outside every list
+  an earlier design wrote — reopens the stall. This is not defensive padding:
+  `mqttValidateRecordAffinePair` permits `Q2AffGen` with a nil `Q2Aff`, and
+  `restoreQ2AffineUnwind` produces a real names-only record whose zero values are
+  actively wrong (`AckPolicy` zero is `AckNone`, `DeliverPolicy` zero is
+  `DeliverAll`). The comparison is against the persisted REQUEST, which is what
+  the record holds.
+- **The three variable fields are bounded** at the provisionable domain: `AckWait`
+  positive, `MaxAckPending` within `1..mqttMaxAckTotalLimit` and within
+  `$MQTT_out`'s live `ConsumerLimits.MaxAckPending` when that is positive.
+- **`ConsumerLimits.InactiveThreshold` is read BEFORE the create and refused when
+  it is nonzero**, with no create attempted. nats-server substitutes the stream's
+  limit whenever the request field is zero, and this configuration deliberately
+  sends zero — so for an already-present durable a create-or-update would apply
+  the substitution and restart the deletion timer, and refusing afterwards would
+  refuse a durable the refusal itself had just made reapable. The predicate is
+  `!= 0`, not `> 0`: the field is a signed duration, and the server's own limit
+  rejection fires only for a positive limit, so a negative one would slip past and
+  mutate the durable anyway. The returned-config check stays, because the
+  pre-check is not atomic with the create.
+- **A storage type is immutable, so the contender adopts rather than imposes.** It
+  builds with the actual durable's `MemoryStorage` where one exists and the
+  record's where none does, never its own local option — the owner will meet this
+  durable later. On a create refused for that exact cause it looks up **once** and
+  retries; a second conflict refuses. Where the relookup finds the durable
+  **authoritatively gone**, the retry is issued even though it carries the same
+  value the refused request did: the obstacle has been removed, so the identical
+  request is exactly what now succeeds, and stopping on that equality would defer
+  restoration to another redelivery for no reason. One attempt is a bounded
+  fail-closed policy, not a proof the conflict cannot recur, and it is safe
+  because no copy has been stored and no source acknowledged at that point.
+- **An indeterminate lookup is not an absence.** Only `JSConsumerNotFoundErr`
+  authorizes the absent branch; a transport error, a `nil` `ConsumerInfo` and a
+  non-nil one carrying a `nil` `Config` all refuse with no create attempted.
+
+**Every refusal above is on the CONTENDER's path only, and that asymmetry is
+deliberate.** A refusal costs different things on the two paths. On the contender
+it is free: nothing is stored, no source is acked, and no client is connected to
+notice. On the owner it costs a live connection — a refusal while a saved shared
+filter is being restored at CONNECT is silently skipped, because there is no SUBACK
+on that path, and the only remedy that removes the silence closes the connection,
+publishing the client's Will and, at a zero Session Expiry Interval, deleting the
+session. `ensureQ2AffineConsumerSubscription` therefore gains **no** new refusal:
+its initial create is unchanged and it performs no lookup and no stream preflight.
+
+It gains exactly one thing, and it can only turn a current failure into a success:
+**a post-failure recovery on a storage-type conflict**. `MemoryStorage` is
+immutable, and the owner rebuilds its request from the CURRENT local option while
+the durable keeps whatever it was made with — so an operator who reloads
+`consumer_memory_storage` breaks affine resume for every session whose durable
+predates the reload, permanently, with no contender involved. On that exact
+flattened cause the owner looks the durable up once and retries with the storage it
+actually has. On a failed lookup or a failed retry the caller-visible outcome and
+the reported error are unchanged from today; the lookup's own error is never
+substituted for the create's.
+
+**Why this path has that defect and its siblings do not** — which is also the
+route that would remove the residual below, if it is ever worth taking.
+`ensurePubRelConsumerSubscription` verifies before it creates: it looks the
+durable up, marks it verified and RETURNS when it is there, and reaches its
+current-option create only when the durable is confirmed absent. An absent
+durable cannot conflict on an immutable field, so a reload never reaches one. The
+per-subscription consumers escape for the SAME reason, not because of their
+names: a persisted `sess.cons[sid]` is verified by the resume reconciliation
+phase and then adopted IN PLACE at CONNECT, with no create-or-update carrying
+current options. Their `nuid`-bearing identities are minted only where there is
+no present consumer to conflict with — a genuinely new subscription, or repair
+after the old durable was found authoritatively absent — so the `nuid` protects
+those cases rather than the reload. The affine path is the
+deviant: it issues an unconditional create-or-update, deliberately, because that
+create doubles as the verification that a persisted config still describes a
+consumer which exists and still looks like this. That is what puts the current
+local option in front of an existing durable, and it is the whole origin of the
+conflict this recovery absorbs.
+
+It first reads the live stream and **declines to retry at all** while
+`ConsumerLimits.InactiveThreshold` is nonzero. The refused create mutated nothing,
+because JetStream checks convergence before it applies anything; the retry is
+accepted and would therefore have the stream's limit substituted into it, arming a
+deletion timer on a durable the failure had left alone. A retry whose response is
+then lost would report failure while leaving that durable due to be reaped with the
+session's interest-retained copies — an unresumable session turned into a losing
+one. Monotonicity is about state as well as about the caller's outcome, and this is
+where the two could have diverged.
+
+The read is **not atomic** with the retry, so a limit landing between them still
+reaches it. That window is stated in `docs/CONFORMANCE.md` with the three
+conditions it needs, rather than narrowed a third time: consumer create carries no
+precondition, so nothing here can fence the update against a concurrent stream
+change, and the debris it leaves is the same one an ordinary owner create already
+produces under the same mutation.
+
 ### What the write audit established, and the gaps it found
 
 *`docs/findings/ha-arbitration.md` F-033, F-063, F-064, F-065 and F-066 are
@@ -2386,8 +2528,13 @@ Three defects follow, each resting on a premise of its own:
   load or CAS retry to the confirmed source ack — no bound narrower than that is
   claimed — and is stated in `docs/CONFORMANCE.md`.
 - **F-064** — a live generation reference makes the sweep skip every claim of that
-  generation, leaving them to an owner resume that may never happen. This is why the `Lost`
-  narrative in `docs/CONFORMANCE.md` holds only for a session that comes back.
+  generation. The sweep still does, deliberately: it carries no payload, so it could only
+  resolve such a claim by asserting a fact it cannot prove. What has changed is that the
+  STALL no longer waits for the owner — a group redelivery does carry the payload, and
+  restores the winner's consumer on its behalf. Two things remain: settled claims of a live
+  generation are still not reaped (**F-065**'s fence), and a `materialized` claim whose copy
+  is gone is still owner-dependent, which is why the `Lost` narrative in
+  `docs/CONFORMANCE.md` still holds only for a session that comes back.
 - **F-065** — the reaper evaluates its two-sided predicate on a copy-absence reading taken
   before its own `SourceAcked` transition, so a copy stored during that round trip is
   invisible to it.

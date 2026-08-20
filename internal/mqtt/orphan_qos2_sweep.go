@@ -929,7 +929,7 @@ func mqttValidateRecordAffinePair(ps *mqttPersistedSession, idHash string) error
 		// compares a claim against to conclude the winner is gone, so an empty one
 		// mismatches EVERY claim: a record read instead of refused turns a malformed
 		// shape into proof of absence and discards an assignment owed to a delivery
-		// already started — the redistribution [MQTT-4.8.2-6] forbids.
+		// already started — the redistribution [MQTT-4.8.2-5] forbids.
 		if mqttRecordHasSharedQoS2(ps) {
 			return fmt.Errorf("record carries a shared QoS 2 subscription with no affine generation")
 		}
@@ -1713,7 +1713,7 @@ func validateOrphanQ2AffClaim(subject string, c *mqttQ2AffClaim) error {
 	}
 	if c.Lost && c.AffineDone {
 		// Mutually exclusive by construction (mergeProven). A record asserting both
-		// says the message was delivered AND never delivered.
+		// says the message was proven delivered AND could not be proven delivered.
 		return fmt.Errorf("claim on %q asserts both AffineDone and Lost", subject)
 	}
 	if !mqttValidIDHashToken(c.Winner) {
@@ -1757,11 +1757,19 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 	grace, q := as.orphanGrace(), as.quarantine()
 	var discarded, lost, retained, deferred int
 	for _, e := range inv {
-		// F-064: a live generation reference makes this pass skip EVERY claim of that
-		// generation, on the premise that the owner's own resume will reconcile them.
-		// recoverQ2AffClaims is indeed the only thing that ever does, so a session that
-		// never resumes leaves a nonterminal claim stalling its shared group forever and
-		// a terminal one accumulating. See docs/findings/ha-arbitration.md.
+		// A live generation reference makes this pass skip EVERY claim of that
+		// generation, and that is deliberate rather than a gap this sweep should
+		// close: it has no payload, so the only way it could resolve such a claim is
+		// by asserting a fact it cannot prove.
+		//
+		// The STALL that used to leave behind is closed elsewhere, and
+		// owner-independently: a group redelivery does carry the payload, so a
+		// contender restores the winner's destroyed consumer and materializes onto it
+		// (materializeQ2AffOnBehalf). What remains here is the ACCUMULATION — settled
+		// claims of a live generation are still not reaped, which needs the reaper
+		// fence that is F-065's remedy — and the materialized-copy-gone population,
+		// which is still owner-dependent (F-064's residual 8). See
+		// docs/findings/ha-arbitration.md.
 		if refs.hasAffine(e.claim.Winner, e.claim.Gen) {
 			q.forget(mqttQuarantineAssignKey(e.subject))
 			continue
@@ -1775,9 +1783,11 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 		// account fill the shared table and permanently refuse every new hold, claim,
 		// consumer and teardown key: the sweep would switch itself off for good.
 		if e.claim.Lost {
-			// The only durable evidence that a QoS 2 message the broker accepted was
-			// never delivered. Surface it; never reap it (reapable() refuses it
-			// unconditionally, so there is nothing to attempt either).
+			// The only durable evidence that a QoS 2 message the broker accepted could
+			// not be proven delivered. Surface it; never reap it (reapable() refuses
+			// it unconditionally, so there is nothing to attempt either). The label is
+			// not proof of loss — see F-064's residual 1 — but it is the only record
+			// that anything happened at all.
 			q.forget(mqttQuarantineAssignKey(e.subject))
 			lost++
 			s.Errorf("MQTT orphaned QoS 2 sweep: shared QoS 2 assignment %q is recorded LOST for session %q and is retained for inspection",
@@ -1840,7 +1850,7 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 // recorded as F-036 population. The DIFFERENT-generation reading is settled on the
 // clean-start route and rests on no false premise: teardown marks every assignment of the
 // retiring generation Discarded before deleting its consumer, so the session really has
-// ended and [MQTT-4.8.2-6] permits the delivery to die with it. Only an obsolete previous
+// ended and [MQTT-4.8.2-5] permits the delivery to die with it. Only an obsolete previous
 // owner still serving after ownership moved belongs to F-036. Either way this function is
 // not where it is fixed. Note what the audit did NOT find here — the transition itself is
 // CAS-conditioned at a base read in the same attempt and asserts the winner's identity, so

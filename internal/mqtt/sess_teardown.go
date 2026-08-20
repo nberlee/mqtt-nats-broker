@@ -740,7 +740,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// tells a contender the delivery died with its session rather than being
 	// available to redistribute. The claims are marked, never released, and the
 	// undelivered copies are dropped by $MQTT_out's interest retention when the
-	// affine durable goes. Spec5 [MQTT-4.8.2-6].
+	// affine durable goes. Spec5 [MQTT-4.8.2-5].
 	if t.q2AffGen != _EMPTY_ && sess.asm != nil {
 		if err := sess.asm.discardQ2AffClaimsFor(t.idHash, t.q2AffGen); err != nil {
 			return fmt.Errorf("unable to terminate the shared QoS 2 assignments of session %q: %w", t.id, err)

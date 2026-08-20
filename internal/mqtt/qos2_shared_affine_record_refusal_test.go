@@ -30,7 +30,7 @@ import (
 // against to conclude the winner is gone, and an EMPTY one mismatches every claim:
 // read instead of refused, such a record turns a malformed shape into proof of
 // absence and discards an assignment owed to a delivery already started, which is
-// the redistribution [MQTT-4.8.2-6] forbids.
+// the redistribution [MQTT-4.8.2-5] forbids.
 //
 // testG7Cases carries that shape and the shapes the rule must NOT over-refuse, in
 // one table shared by every enforcement point, so the refusal and the exemptions

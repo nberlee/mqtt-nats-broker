@@ -78,6 +78,7 @@ const (
 	JSBatchCommit            = server.JSBatchCommit
 	JSBatchId                = server.JSBatchId
 	JSBatchSeq               = server.JSBatchSeq
+	JSConsumerCreateErrF     = server.JSConsumerCreateErrF
 	JSConsumerNotFoundErr    = server.JSConsumerNotFoundErr
 	JSExpectedLastSubjSeq    = server.JSExpectedLastSubjSeq
 	JSMessageTTL             = server.JSMessageTTL

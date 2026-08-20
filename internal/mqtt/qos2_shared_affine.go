@@ -5,7 +5,7 @@
 // window the group durable is the only thing that owns it, so a member leaving
 // (UNSUBSCRIBE, disconnect, session end) made AckWait redeliver the started
 // message to a DIFFERENT member — or dropped it when the leaver was the last
-// holder. Spec5 [MQTT-4.8.2-5]/[MQTT-4.8.2-6] require the opposite: once the
+// holder. Spec5 [MQTT-4.8.2-4]/[MQTT-4.8.2-5] require the opposite: once the
 // server has begun delivering a shared message to one client it must complete
 // that delivery with that client, and it may only die with that client's session.
 //
@@ -102,9 +102,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nuid"
 )
@@ -255,17 +259,24 @@ type mqttQ2AffClaim struct {
 	// copy is authoritatively absent).
 	AffineDone bool `json:"adone,omitempty"`
 	// Discarded: the winning session ended. The delivery dies with it, which
-	// [MQTT-4.8.2-6] permits; it is NEVER released back to the group.
+	// [MQTT-4.8.2-5] permits; it is NEVER released back to the group.
 	Discarded bool `json:"disc,omitempty"`
-	// Lost: mutually exclusive with AffineDone. The copy is gone and was NEVER
-	// delivered — the affine consumer was destroyed out of band, and $MQTT_out is
-	// interest-retained, so its pending
-	// copies went with it. This is a QoS 2 message the broker accepted and did not
-	// deliver. It is deliberately NOT AffineDone: recording it as a completed
-	// delivery would launder a compliance failure into a clean reap, and the
-	// evidence would then be deleted. A lost claim is never reapable, so the
-	// durable record survives for an operator to find; it is terminal, so no
-	// contender waits on it and the group delivery is still released.
+	// Lost: mutually exclusive with AffineDone. The copy is gone and its delivery
+	// cannot be PROVEN — the affine consumer was destroyed out of band, and
+	// $MQTT_out is interest-retained, so its pending copies went with it. It is
+	// deliberately NOT AffineDone: recording it as a completed delivery would
+	// launder an unproven outcome into a clean reap, and the evidence would then be
+	// deleted. A lost claim is never reapable, so the durable record survives for
+	// an operator to find; it is terminal, so no contender waits on it and the
+	// group delivery is still released.
+	//
+	// NOT proof that the client missed the message. The write order that licenses
+	// the inference — AffineDone before the copy ack — covers the JETSTREAM copy
+	// acknowledgement only. mqttProcessPublishReceived stores the correlated PUBREL
+	// before it reaches mqttFinishQ2AffineDelivery, so a client can have answered
+	// PUBREC and still leave this shape behind. Nothing is redistributed and the
+	// handshake still completes from the persisted PUBREL, which is why this is a
+	// reporting defect rather than a conformance one; see docs/CONFORMANCE.md.
 	Lost bool `json:"lost,omitempty"`
 }
 
@@ -289,8 +300,8 @@ func (c *mqttQ2AffClaim) mergeProven(prev *mqttQ2AffClaim) {
 	c.AffineDone = c.AffineDone || prev.AffineDone
 	c.Discarded = c.Discarded || prev.Discarded
 	c.Lost = c.Lost || prev.Lost
-	// AffineDone and Lost are mutually exclusive — the message was either
-	// delivered or it was not — so they are NOT independently OR-merged. Whichever
+	// AffineDone and Lost are mutually exclusive — a delivery is either
+	// PROVEN or it is not — so they are NOT independently OR-merged. Whichever
 	// the durable record already proved stands; a later writer cannot add its
 	// opposite on top and leave a record asserting both.
 	if prev.AffineDone {
@@ -316,8 +327,16 @@ func (c *mqttQ2AffClaim) reapable(copyAbsent bool) bool {
 		return false
 	}
 	if c.Lost {
-		// A message the broker accepted and never delivered. Deleting the record
-		// would destroy the only durable evidence that it happened.
+		// A message the broker accepted and could not prove it delivered. Deleting
+		// the record would destroy the only durable evidence that it happened.
+		//
+		// "Could not prove", not "never delivered": the writer of Lost infers a
+		// missing delivery from a missing copy, and that inference is sound for the
+		// JetStream copy ack but NOT for the client's PUBREC, which is answered
+		// before the affine side is recorded. So a Lost claim may name a message the
+		// client in fact received. The retention rule is unaffected — the evidence is
+		// worth keeping either way — but the label is not proof of loss. See F-064's
+		// residual 1 and docs/ARCHITECTURE.md.
 		return false
 	}
 	if !copyAbsent {
@@ -353,12 +372,13 @@ func (c *mqttQ2AffClaim) terminal() bool {
 //   - AffineDone: recorded BEFORE the copy is acked, so an absent copy under it was
 //     legitimately consumed by its own delivery.
 //   - Discarded: the winner's session ended and the delivery dies with it
-//     ([MQTT-4.8.2-6]). Required, not merely permitted: reapable refuses without
+//     ([MQTT-4.8.2-5]). Required, not merely permitted: reapable refuses without
 //     SourceAcked, so withholding the ack here would make every discarded claim
 //     permanently unreapable.
 //   - Lost: terminal by construction, and a lost claim still releases the group
-//     delivery — the message was accepted and not delivered, which withholding the
-//     ack does not undo.
+//     delivery — the message was accepted and its delivery cannot be proven, which
+//     withholding the ack does not undo. (Cannot be proven, not "was not
+//     delivered": see the Lost field's own comment for the PUBREC window.)
 //   - SourceAcked: the irreversible step already happened.
 //
 // The claim read and the copy read are separate JetStream round trips with no
@@ -774,6 +794,336 @@ func (as *mqttAccountSessionManager) storeQ2AffCopy(subject string, hdrLen int, 
 	return resp.Sequence, nil
 }
 
+// mqttTestQ2AffineConfigBuiltHookV fires on every construction of an affine QoS 2
+// consumer configuration, naming the function that asked for one. It exists to
+// prove that both writers really do go through the single constructor: an
+// identical literal copied to one of them produces an identical config, so no
+// comparison of the RESULT can tell the two apart — only observing the entry can.
+// The caller is resolved by reflection on the stack, and only while the hook is
+// installed, so the constructor's signature carries no test-only parameter.
+// Stored and cleared by the test directly, with no setter beside it. The other
+// hooks in this package have one because they are installed from untagged tests;
+// this one is reachable only from the mqttport_fulltests suite, so a setter would
+// be dead code in every build the linter sees.
+var mqttTestQ2AffineConfigBuiltHookV atomic.Pointer[func(caller string)]
+
+// buildQ2AffineConsumerConfig is the SOLE constructor of an affine QoS 2
+// consumer's configuration, and that exclusivity is load-bearing rather than
+// tidiness. Two writers build one: the session provisioning its own path, and a
+// contender restoring a destroyed durable on behalf of an absent winner. The
+// contender decides whether a persisted config is replayable by comparing it
+// WHOLE against what this function returns, so a second literal anywhere would be
+// a second canonical shape — and a record written through one would be refused by
+// the other.
+//
+// Comparing the whole struct, rather than a list of interesting fields, is what
+// makes the check closed against a dependency that adds a field: a field neither
+// side sets is zero on both and passes, and any writer that sets one deviates and
+// is refused. An enumerated list cannot close a struct upstream can extend, and
+// MaxDeliver alone — outside every list an earlier revision of this design
+// wrote — reopens the stall the feature exists to close.
+//
+// The three variable fields belong to the caller. The owner passes its local
+// options. A contender passes the record's persisted values, except for
+// MemoryStorage where a durable already exists: that type is immutable, so a
+// contender must never impose its own local option on a durable the owner will
+// later meet.
+func buildQ2AffineConsumerConfig(idHash, gen string, ackWait time.Duration, maxAckPending int, memStorage bool) ConsumerConfig {
+	if h := mqttTestQ2AffineConfigBuiltHookV.Load(); h != nil {
+		(*h)(mqttCallerName(2))
+	}
+	filter, deliver, durable := mqttQ2AffineNames(idHash, gen)
+	return ConsumerConfig{
+		DeliverSubject: deliver,
+		Durable:        durable,
+		AckPolicy:      AckExplicit,
+		DeliverPolicy:  DeliverNew,
+		FilterSubject:  filter,
+		AckWait:        ackWait,
+		MaxAckPending:  maxAckPending,
+		MemoryStorage:  memStorage,
+		// InactiveThreshold is deliberately left at zero, unconditionally and
+		// independently of MQTT.ConsumerInactiveThreshold: an inactivity delete
+		// would reap this durable while the client is offline, and with it the
+		// interest that keeps its pending copies alive. That is precisely the
+		// resumable-session state this feature exists to preserve.
+		//
+		// Sending zero does not MAKE the effective threshold zero: nats-server
+		// substitutes the stream's ConsumerLimits.InactiveThreshold whenever the
+		// request field is zero (consumer.go:658-669). validateOutStream refuses a
+		// nonzero limit at startup, and a contender re-checks it live because the
+		// limit can be imposed afterwards.
+	}
+}
+
+// errQ2AffStorageImmutable is nats-server's flattened cause for a create-or-update
+// that would change a durable's storage type (server/consumer.go:2475, reached
+// through checkNewConsumerConfig and wrapped in the generic JSConsumerCreateErrF).
+// Measured, not recalled: the API error carries ErrCode 10012 and this exact
+// Description.
+var errQ2AffStorageImmutable = errors.New("storage type can not be updated")
+
+// recoverQ2AffineStorageConflict makes ONE bounded attempt to complete a create
+// that JetStream refused because the durable already exists with the other
+// storage type. MemoryStorage is immutable (server/consumer.go:2474-2475), so the
+// only way forward is to re-send the request built with the storage the durable
+// ACTUALLY has.
+//
+// It is a recovery, not a preflight, and that distinction is the whole reason the
+// owner's path may have it. F-064's decision 4 forbids adding a REFUSAL here,
+// because a refusal during CONNECT-time restoration of a saved shared filter is
+// silently skipped — there is no SUBACK on that path — and the only remedy that
+// removes the silence closes the connection, publishing the client's Will and, at
+// a zero Session Expiry Interval, deleting the session. This function is entered
+// only AFTER a create that has already failed, and only on one exact cause, so it
+// can turn a current failure into a success and can never produce one. A
+// speculative lookup before the create could not say the same.
+//
+// It also closes a defect that exists with no contender anywhere: an operator who
+// reloads MQTT.ConsumerMemoryStorage breaks affine resume for every session whose
+// durable was created under the old value, permanently, because the owner rebuilds
+// its request from the CURRENT local option while the durable keeps the old type.
+//
+// On a failed lookup, an absent or unchanged durable, or a failed retry, it
+// reports false and the caller keeps TODAY's outcome: the original create error is
+// returned and the caller's rollback runs. The lookup's own error is never
+// substituted for it — the caller is entitled to be told why the create failed,
+// not why the recovery could not run. That is deliberately narrower than "leaves
+// identical state": a retry whose response was lost may have landed.
+func (sess *mqttSession) recoverQ2AffineStorageConflict(ccr *CreateConsumerRequest, createErr error) (*JSApiConsumerCreateResponse, bool) {
+	// Exactly this cause. Every other immutable mismatch — an AckPolicy or a
+	// DeliverPolicy, which JetStream equally forbids changing — means the durable
+	// is not one this broker can converge, and retrying would only repeat the
+	// refusal with a different field.
+	if sess.asm == nil || !isJSErrCausedBy(createErr, JSConsumerCreateErrF, errQ2AffStorageImmutable) {
+		return nil, false
+	}
+	// The refused create mutated NOTHING: checkNewConsumerConfig runs before
+	// updateConfig applies anything, so an immutable mismatch is rejected with the
+	// durable untouched. The retry, by contrast, is accepted — and a create-or-
+	// update carrying a zero InactiveThreshold has the stream's limit substituted
+	// into it, which for an existing durable ARMS the server's deletion timer. A
+	// retry whose response is then lost leaves this function reporting failure
+	// while the durable it just made reapable keeps the session's interest-retained
+	// copies until the threshold expires.
+	//
+	// Today that combination cannot occur: the mismatch fails inertly and the
+	// durable survives. So retrying under a nonzero limit would convert an
+	// unresumable session into a LOSING one, which is the one thing the monotonicity
+	// this recovery is allowed under does not permit. Read the limit and decline.
+	//
+	// Checking it here costs nothing the caller did not already lose: this path is
+	// entered only after a create that has already failed, and every exit from it
+	// preserves that original error. `validateOutStream` refuses a nonzero limit at
+	// startup, so this can only be a stream mutated afterwards.
+	if si, serr := sess.asm.lookupQ2AffOutStream(); serr != nil || si == nil ||
+		si.Config.ConsumerLimits.InactiveThreshold != 0 {
+		return nil, false
+	}
+	ci, lerr := sess.asm.lookupQ2AffineConsumer(ccr.Config.Durable)
+	if lerr != nil || ci == nil || ci.Config == nil {
+		return nil, false
+	}
+	if ci.Config.MemoryStorage == ccr.Config.MemoryStorage {
+		// The durable no longer differs in the field the refusal named, so this
+		// request has nothing to adopt and re-sending it would repeat the refusal.
+		// One attempt is a bounded fail-closed policy, not a proof that the
+		// conflict cannot recur: nothing makes the refusal and this lookup atomic.
+		return nil, false
+	}
+	retry := ccr.Config
+	retry.MemoryStorage = ci.Config.MemoryStorage
+	resp, rerr := sess.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: ccr.Stream, Config: retry})
+	if rerr != nil {
+		return nil, false
+	}
+	// The caller stores &ccr.Config as the session's view and persists it, so the
+	// record must name what was actually created, not what was first requested.
+	ccr.Config = retry
+	return resp, true
+}
+
+// retryQ2AffineStorageConflict makes ONE bounded attempt to complete a
+// contender's create that JetStream refused because the durable exists with the
+// other storage type. Same rule as the owner's recovery, and the same single
+// cause: any other immutable mismatch means the durable is not one this broker
+// can converge, and retrying would repeat the refusal with a different field.
+//
+// persisted is the winner record's own MemoryStorage, used when the relookup
+// finds the durable gone again — the only value a contender may impose when
+// there is nothing to adopt.
+//
+// One attempt is a bounded fail-closed policy, not a proof that the conflict
+// cannot recur: nothing makes the refusal and the relookup atomic. What is
+// guaranteed is narrower and sufficient — at this point no copy has been stored
+// and no group source acknowledged, both of which happen strictly later.
+func (as *mqttAccountSessionManager) retryQ2AffineStorageConflict(want *ConsumerConfig, createErr error, persisted bool) (*JSApiConsumerCreateResponse, bool) {
+	if !isJSErrCausedBy(createErr, JSConsumerCreateErrF, errQ2AffStorageImmutable) {
+		return nil, false
+	}
+	next := *want
+	var gone bool
+	ci, lerr := as.lookupQ2AffineConsumer(want.Durable)
+	switch {
+	case lerr != nil:
+		if !IsNatsErr(lerr, JSConsumerNotFoundErr) {
+			return nil, false
+		}
+		// The durable that caused the conflict is authoritatively GONE. The record's
+		// value is the only one a contender may impose with nothing to adopt.
+		gone, next.MemoryStorage = true, persisted
+	case ci == nil || ci.Config == nil:
+		return nil, false
+	default:
+		next.MemoryStorage = ci.Config.MemoryStorage
+	}
+	// Equality is only a reason to stop when the conflicting durable is still
+	// THERE: then the field the refusal named no longer differs, so re-sending
+	// would repeat the refusal. When it is gone, equality says nothing — the
+	// obstacle has been removed, and the identical request is exactly the retry
+	// that now succeeds. Refusing there would defer restoration to another AckWait
+	// redelivery for no reason, holding a MaxAckPending slot meanwhile.
+	if !gone && next.MemoryStorage == want.MemoryStorage {
+		return nil, false
+	}
+	resp, rerr := as.createQ2AffineConsumer(&next)
+	if rerr != nil {
+		return nil, false
+	}
+	*want = next
+	return resp, true
+}
+
+// q2AffConfigMatchesCanonical reports whether cfg is EXACTLY the affine QoS 2
+// configuration this broker provisions for (idHash, gen), and returns the reason
+// when it is not.
+//
+// A contender replays a persisted config to restore a durable somebody else owns,
+// so "replayable" has to mean "identical to what we would have built", not
+// "plausible". The comparison is therefore whole-struct against the single
+// constructor, with cfg's own three variable fields substituted in so that a
+// legitimate difference in AckWait, MaxAckPending or MemoryStorage is not read as
+// a deviation — those are bounded separately, by q2AffVariableFieldsInBounds.
+//
+// Why not a list of fields worth checking: a list cannot close a struct that a
+// dependency bump can extend, and every list an earlier revision of this design
+// wrote turned out to be missing one. MaxDeliver alone, left unchecked, reopens
+// the indefinite stall the feature exists to close. Whole-struct equality is
+// closed by construction instead — a field neither side sets is zero on both and
+// passes, and any writer that sets one deviates and is refused.
+//
+// It is DeepEqual rather than ==, and that is not stylistic: ConsumerConfig
+// carries slices, maps and time pointers, so == does not compile and a shallow
+// comparison would miss a PauseUntil or a BackOff.
+//
+// The comparison is against the persisted REQUEST, which is what the record
+// holds: ensureQ2AffineConsumerSubscription stores &ccr.Config, the request it
+// sent, not the server's normalized response. A record built from the response
+// would carry server-filled fields and be refused here, so that is a property
+// this check depends on rather than an accident.
+func q2AffConfigMatchesCanonical(cfg *ConsumerConfig, idHash, gen string) error {
+	if cfg == nil {
+		// Reachable for real, not defensive: mqttValidateRecordAffinePair permits a
+		// record carrying Q2AffGen with a nil Q2Aff, and restoreQ2AffineUnwind
+		// produces a names-only record that buildPersistedSessionLocked persists
+		// verbatim. Nothing can be replayed from it.
+		return fmt.Errorf("the record names an affine QoS 2 generation but carries no consumer configuration to replay")
+	}
+	want := buildQ2AffineConsumerConfig(idHash, gen, cfg.AckWait, cfg.MaxAckPending, cfg.MemoryStorage)
+	if !reflect.DeepEqual(*cfg, want) {
+		return fmt.Errorf("the persisted affine QoS 2 consumer configuration is not the one this broker provisions: got %+v, want %+v", *cfg, want)
+	}
+	return nil
+}
+
+// q2AffVariableFieldsInBounds bounds the three fields q2AffConfigMatchesCanonical
+// deliberately accepts from the record, at the domain a create could actually be
+// provisioned in rather than merely at "non-zero".
+//
+// streamMaxAckPending is the live $MQTT_out ConsumerLimits.MaxAckPending; zero
+// means the stream imposes none. A negative one reads as unlimited, because the
+// broker option it would have to exceed is a uint16.
+//
+// MemoryStorage is deliberately unbounded: both of its values are ones this
+// broker produces.
+func q2AffVariableFieldsInBounds(cfg *ConsumerConfig, streamMaxAckPending int) error {
+	if cfg.AckWait <= 0 {
+		// A zero AckWait is not "the default" on this path: the owner substitutes
+		// mqttDefaultAckWait before building, so a record carrying zero was not
+		// written by a provisioning this broker would recognize.
+		return fmt.Errorf("the persisted affine QoS 2 consumer has a non-positive ack_wait (%v)", cfg.AckWait)
+	}
+	if cfg.MaxAckPending <= 0 || cfg.MaxAckPending > mqttMaxAckTotalLimit {
+		return fmt.Errorf("the persisted affine QoS 2 consumer has a max_ack_pending of %d, outside the provisionable range 1..%d", cfg.MaxAckPending, mqttMaxAckTotalLimit)
+	}
+	if streamMaxAckPending > 0 && cfg.MaxAckPending > streamMaxAckPending {
+		return fmt.Errorf("the persisted affine QoS 2 consumer has a max_ack_pending of %d, above the stream's consumer limit of %d: JetStream would reject the create",
+			cfg.MaxAckPending, streamMaxAckPending)
+	}
+	return nil
+}
+
+// mqttCallerName names the function skip frames up the stack. Test-seam support
+// only; it is never called while no hook is installed.
+func mqttCallerName(skip int) string {
+	pc, _, _, ok := runtime.Caller(skip)
+	if !ok {
+		return _EMPTY_
+	}
+	fn := runtime.FuncForPC(pc)
+	if fn == nil {
+		return _EMPTY_
+	}
+	name := fn.Name()
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
+
+// lookupQ2AffineConsumer reads one affine durable's ConsumerInfo, honoring an
+// instance-scoped test seam. EVERY affine consumer lookup goes through here, so
+// that a test can force one to fail and thereby assert where lookups are and are
+// not performed. A JSConsumerNotFoundErr is an authoritative absence; every other
+// error, and a successful response carrying nil info or a nil Config, is
+// indeterminate and its callers fail closed.
+func (as *mqttAccountSessionManager) lookupQ2AffineConsumer(durable string) (*ConsumerInfo, error) {
+	as.mu.RLock()
+	hook := as.testQ2AffConsumerLookup
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(durable)
+	}
+	return as.jsa.lookupConsumer(mqttOutStreamName, durable)
+}
+
+// lookupQ2AffOutStream reads $MQTT_out's live configuration for the contender's
+// limit checks, honoring an instance-scoped test seam.
+func (as *mqttAccountSessionManager) lookupQ2AffOutStream() (*StreamInfo, error) {
+	as.mu.RLock()
+	hook := as.testQ2AffOutStreamInfo
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook()
+	}
+	return as.jsa.lookupStream(mqttOutStreamName)
+}
+
+// createQ2AffineConsumer issues the create-or-update that restores an affine
+// durable on behalf of an absent winner, honoring an instance-scoped test seam.
+// Only the CONTENDER's create is routed through here: the owner's own
+// provisioning is deliberately left on the direct path, so a seam installed to
+// probe D1 can never perturb it.
+func (as *mqttAccountSessionManager) createQ2AffineConsumer(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error) {
+	as.mu.RLock()
+	hook := as.testQ2AffConsumerCreate
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(cfg)
+	}
+	return as.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttOutStreamName, Config: *cfg})
+}
+
 // mqttQ2AffCopyState is the authoritative answer to "does this claim's copy
 // exist?". Absent is a DECISION, not a default: only a confirmed no-message
 // response produces it.
@@ -1076,7 +1426,7 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 			return fmt.Errorf("session %q has an unaccountable affine QoS 2 consumer: %w", id, err)
 		}
 	}
-	filter, deliver, durable := mqttQ2AffineNames(idHash, gen)
+	_, deliver, durable := mqttQ2AffineNames(idHash, gen)
 
 	opts := c.srv.getOpts()
 	ackWait := opts.MQTT.AckWait
@@ -1175,23 +1525,19 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 	// still looks like this.
 	ccr := &CreateConsumerRequest{
 		Stream: mqttOutStreamName,
-		Config: ConsumerConfig{
-			DeliverSubject: deliver,
-			Durable:        durable,
-			AckPolicy:      AckExplicit,
-			DeliverPolicy:  DeliverNew,
-			FilterSubject:  filter,
-			AckWait:        ackWait,
-			MaxAckPending:  maxAckPending,
-			MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
-			// InactiveThreshold is deliberately left at zero, unconditionally and
-			// independently of MQTT.ConsumerInactiveThreshold: an inactivity delete
-			// would reap this durable while the client is offline, and with it the
-			// interest that keeps its pending copies alive. That is precisely the
-			// resumable-session state this feature exists to preserve.
-		},
+		Config: buildQ2AffineConsumerConfig(idHash, gen, ackWait, maxAckPending, opts.MQTT.ConsumerMemoryStorage),
 	}
 	resp, err := sess.jsa.createDurableConsumer(ccr)
+	if err != nil {
+		// One bounded recovery, from a cause that is ALREADY fatal today. See
+		// recoverQ2AffineStorageConflict: it can convert this failure into a
+		// success and can never manufacture one, which is what distinguishes it
+		// from the preflight this path is not allowed to grow.
+		if rresp, ok := sess.recoverQ2AffineStorageConflict(ccr, err); ok {
+			c.Warnf("The affine QoS 2 consumer for client %q already existed with the other storage type; adopted it rather than failing the resume", id)
+			resp, err = rresp, nil
+		}
+	}
 	if err != nil {
 		c.Errorf("Unable to add the affine QoS 2 JetStream consumer for client %q: %v", id, err)
 		rollback()
@@ -1767,7 +2113,7 @@ func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 // rests on F-036's own falsified premise and is recorded as F-036 population, while the
 // DIFFERENT-generation reading is settled on the clean-start route — teardown marks every
 // assignment of the retiring generation Discarded before deleting its consumer, so the
-// session really has ended and [MQTT-4.8.2-6] permits the delivery to die with it. The
+// session really has ended and [MQTT-4.8.2-5] permits the delivery to die with it. The
 // residue in both directions is a previous owner still serving after ownership moved,
 // which is F-036's shape and not this function's to fix. See F-033, "What the audit
 // established", in docs/findings/ha-arbitration.md; that section is authoritative.
@@ -1801,7 +2147,7 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 	if ps == nil || ps.Q2AffGen != claim.Gen {
 		// No record for this generation in the evidence available here, or a later
 		// generation of the same client ID holds it. The delivery dies with the session it
-		// was assigned to, which [MQTT-4.8.2-6] permits; it is never released back to the
+		// was assigned to, which [MQTT-4.8.2-5] permits; it is never released back to the
 		// group. Neither condition proves the winner stopped serving — absence is bounded
 		// evidence and a different generation means ownership moved, which F-036 says the
 		// previous owner can outlive. See this function's doc: F-033's audit sorted that
@@ -1818,15 +2164,130 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 		return true
 	}
 
-	// (2) Does the winner's affine consumer actually exist, with the identity the
-	// claim recorded? $MQTT_out is interest-retained: without it the copy store
-	// would return success and keep nothing.
-	ci, err := as.jsa.lookupConsumer(mqttOutStreamName, claim.AffDurable)
-	if err != nil || ci == nil || ci.Config == nil {
+	// (2) Bring the winner's affine consumer to the configuration its record
+	// names, and refuse anything this broker cannot replay EXACTLY.
+	//
+	// $MQTT_out is interest-retained, so the consumer is not a detail of delivery:
+	// without it the copy store returns success and keeps nothing. And
+	// CONSUMER.DELETE carries no precondition, so the durable can be destroyed out
+	// of band while its owner is away — which is F-064's premise. Restoring it here
+	// is what makes the stall resolvable without the owner.
+	//
+	// Every refusal below is CONTENDER-side and costs nothing: nothing has been
+	// stored, no source has been acked, and no client is connected to be told. The
+	// same check on the owner's path would cost a live connection, so it is not
+	// made there. See F-064 decision 4 and docs/ARCHITECTURE.md.
+	if ps.Teardown != nil {
+		// The winner's session is being torn down, and its consumer is deleted
+		// before the record is released. Recreating it here would race that
+		// deletion. This NARROWS the window and does not close it: consumer
+		// creation has no precondition on the record's sequence, so a marker
+		// written after this read is not seen. See docs/CONFORMANCE.md.
 		return false
 	}
-	if verr := mqttValidateQ2AffineNames(ci.Config, claim.Winner, claim.Gen); verr != nil {
-		s.Warnf("MQTT: refusing to materialize shared QoS 2 assignment %q on behalf of %q: %v", claimSubject, claim.AffDurable, verr)
+	if verr := q2AffConfigMatchesCanonical(ps.Q2Aff, claim.Winner, claim.Gen); verr != nil {
+		s.Warnf("MQTT: refusing to restore the affine QoS 2 consumer for assignment %q: %v", claimSubject, verr)
+		return false
+	}
+	si, serr := as.lookupQ2AffOutStream()
+	if serr != nil || si == nil {
+		return false // indeterminate: the limits below are not knowable
+	}
+	// Before the create, not after, and the difference matters. nats-server
+	// substitutes the stream's limit into any create whose own InactiveThreshold is
+	// zero, and this config deliberately sends zero; for an ALREADY-PRESENT durable
+	// the create-or-update applies that substitution and restarts the deletion
+	// timer before returning. Refusing afterwards would refuse a durable the
+	// refusal itself had just made reapable.
+	//
+	// The predicate is != 0, not > 0. InactiveThreshold is a signed Duration, the
+	// server normalizes a negative REQUEST field but substitutes the stream limit
+	// unconditionally, and its own limit rejection fires only for a positive limit
+	// — so a negative stream limit would slip past > 0, reach create-or-update and
+	// clear an existing durable's timer before the returned-config arm refused it.
+	// validateOutStream refuses any nonzero value at startup for the same reason;
+	// this is that posture one level down.
+	if si.Config.ConsumerLimits.InactiveThreshold != 0 {
+		s.Warnf("MQTT: refusing to restore the affine QoS 2 consumer for assignment %q: %s imposes a consumer inactivity limit (%v), which would reap it",
+			claimSubject, mqttOutStreamName, si.Config.ConsumerLimits.InactiveThreshold)
+		return false
+	}
+	if berr := q2AffVariableFieldsInBounds(ps.Q2Aff, si.Config.ConsumerLimits.MaxAckPending); berr != nil {
+		s.Warnf("MQTT: refusing to restore the affine QoS 2 consumer for assignment %q: %v", claimSubject, berr)
+		return false
+	}
+
+	// The lookup has exactly two jobs, and gating on PRESENCE is not among them: it
+	// supplies the actual durable's immutable storage type for adoption, and it
+	// separates an authoritative absence from an indeterminate answer.
+	//
+	// A successful response can still be unusable, and that is indeterminate rather
+	// than absent: lookupConsumer returns cir.ConsumerInfo unchecked, so a
+	// malformed-but-successful reply yields nil info, and a non-nil ConsumerInfo
+	// may carry a nil Config. Reading either as "absent" would create a durable
+	// against an unknown one.
+	memStorage := ps.Q2Aff.MemoryStorage
+	ci, lerr := as.lookupQ2AffineConsumer(claim.AffDurable)
+	switch {
+	case lerr != nil:
+		if !IsNatsErr(lerr, JSConsumerNotFoundErr) {
+			return false // indeterminate: fail closed, no create attempted
+		}
+		// AUTHORITATIVELY absent, which is F-064's own premise: $MQTT_out is
+		// interest-retained and CONSUMER.DELETE carries no precondition, so the
+		// winner's durable can be destroyed out of band while it is away, taking
+		// every copy it held. Nothing owner-independent could resolve such an
+		// assignment before; restoring the durable from the winner's record is what
+		// makes the group delivery releasable without waiting for a session that
+		// may never return.
+		//
+		// Absence and presence are deliberately NOT two paths from here: the same
+		// create-or-update runs either way, with the only difference being which
+		// MemoryStorage it carries — the durable's where one exists, the record's
+		// where none does. A contender must never impose its own local option,
+		// because the type is immutable and the owner will meet this durable later.
+	case ci == nil || ci.Config == nil:
+		return false // a successful request that told us nothing
+	default:
+		if verr := mqttValidateQ2AffineNames(ci.Config, claim.Winner, claim.Gen); verr != nil {
+			s.Warnf("MQTT: refusing to materialize shared QoS 2 assignment %q on behalf of %q: %v", claimSubject, claim.AffDurable, verr)
+			return false
+		}
+		// A storage type is immutable, so a contender must never impose its OWN
+		// local option on a durable the owner will later meet. Adopt what is there.
+		memStorage = ci.Config.MemoryStorage
+	}
+
+	want := buildQ2AffineConsumerConfig(claim.Winner, claim.Gen, ps.Q2Aff.AckWait, ps.Q2Aff.MaxAckPending, memStorage)
+	resp, cerr := as.createQ2AffineConsumer(&want)
+	if cerr != nil {
+		if rresp, ok := as.retryQ2AffineStorageConflict(&want, cerr, ps.Q2Aff.MemoryStorage); ok {
+			resp, cerr = rresp, nil
+		}
+	}
+	if cerr != nil {
+		s.Warnf("MQTT: unable to restore the affine QoS 2 consumer %q for assignment %q: %v", claim.AffDurable, claimSubject, cerr)
+		return false
+	}
+	// Unconditionally, unlike the owner's own conditional check: a contender is
+	// about to store a copy onto a consumer it did not previously have, so "the
+	// response told us nothing" is not a reason to proceed.
+	if resp == nil || resp.ConsumerInfo == nil || resp.Config == nil {
+		return false
+	}
+	if verr := mqttValidateQ2AffineNames(resp.Config, claim.Winner, claim.Gen); verr != nil {
+		s.Warnf("MQTT: refusing to materialize shared QoS 2 assignment %q: the restored consumer is not the one the claim names: %v", claimSubject, verr)
+		return false
+	}
+	// The pre-check above is not atomic with the create: a stream update landing
+	// between them yields a nonzero EFFECTIVE threshold of either sign, and this is
+	// the arm that catches it. What it leaves behind differs by sign — a positive
+	// limit arms a deletion timer that later reaps the durable, a negative one
+	// clears the timer and leaves a drifted config nothing reaps. Both are refused;
+	// docs/CONFORMANCE.md states the debris.
+	if resp.Config.InactiveThreshold != 0 {
+		s.Warnf("MQTT: refusing to materialize shared QoS 2 assignment %q: the restored consumer carries an inactivity threshold of %v",
+			claimSubject, resp.Config.InactiveThreshold)
 		return false
 	}
 
@@ -1933,7 +2394,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 		return
 	case claim.Discarded:
 		// The session ended between the claim and the delivery. The message dies
-		// with it [MQTT-4.8.2-6]; record the affine side complete so the claim can
+		// with it [MQTT-4.8.2-5]; record the affine side complete so the claim can
 		// be reaped once its source ack is proven.
 		cc.mqttFinishQ2AffineDelivery(claimSubject, reply)
 		return
@@ -2023,8 +2484,16 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 // what previously required a per-broker "I saw the consumer disappear" flag, and
 // an in-memory flag cannot survive the broker handoff that makes the ambiguity
 // matter. Recording first removes the ambiguity from the data itself: an absent
-// copy under a claim that never reached AffineDone was NEVER acked by a delivery,
-// so it was lost — and every broker reads that the same way.
+// copy under a claim that never reached AffineDone was never acked by the
+// JETSTREAM delivery — and every broker reads that the same way.
+//
+// That is a fact about the copy acknowledgement, and it is NOT a proof that the
+// client missed the message. mqttProcessPublishReceived stores the correlated
+// PUBREL before it reaches this function, so a client can have answered PUBREC
+// and still leave an absent copy under a claim with no AffineDone. What the
+// ordering buys is a reading every broker agrees on; what it does not buy is
+// certainty about the client. See the Lost field's comment and
+// docs/CONFORMANCE.md.
 //
 // The inverted window is benign and self-correcting: AffineDone recorded but the
 // copy not yet acked leaves the copy live, the claim un-reapable (see reapable),
@@ -2132,7 +2601,7 @@ func (as *mqttAccountSessionManager) scanQ2AffClaimRecords(fn func(claim *mqttQ2
 
 // discardQ2AffClaimsFor marks every nonterminal assignment owned by one session
 // generation as discarded, so its started deliveries die with the session rather
-// than being released back to the group. [MQTT-4.8.2-6] permits the first and
+// than being released back to the group. [MQTT-4.8.2-5] permits the first and
 // forbids the second.
 //
 // The discard PRESERVES facts already proven, and specifically does not imply
@@ -2171,19 +2640,30 @@ func (as *mqttAccountSessionManager) discardQ2AffClaimsFor(idHash, gen string) e
 // Its job is to leave no claim in a state that stalls something:
 //
 //   - materialized, not discarded, AffineDone never recorded, and the copy gone:
-//     a LOST message. The affine side is always recorded BEFORE the copy is acked
-//     (mqttFinishQ2AffineDelivery), so a copy that vanished without that record
-//     was never acked by a delivery — the only other thing that removes a message
-//     from $MQTT_out is deleting the consumer that held it, which is exactly the
-//     loss. This reads the same on every broker and across a handoff, which a
-//     "did I see the consumer disappear" flag could not: the broker that observed
-//     it may be gone by the time anyone reconciles.
+//     recorded as LOST. The affine side is always recorded BEFORE the copy is acked
+//     (mqttFinishQ2AffineDelivery), so a copy that vanished without that record was
+//     never acked BY THE JETSTREAM DELIVERY — the only other thing that removes a
+//     message from $MQTT_out is deleting the consumer that held it, which is
+//     exactly the loss. This reads the same on every broker and across a handoff,
+//     which a "did I see the consumer disappear" flag could not: the broker that
+//     observed it may be gone by the time anyone reconciles.
+//
+//     That inference does NOT extend to the client's PUBREC, and the difference is
+//     a known reporting defect rather than a subtlety. mqttProcessPublishReceived
+//     stores the correlated PUBREL before it reaches mqttFinishQ2AffineDelivery, so
+//     PUBREC then a crash then an out-of-band consumer delete leaves exactly this
+//     shape for a message the client already answered. Lost is therefore sometimes
+//     a false loss report. It is not a conformance defect — Lost releases the group
+//     delivery without re-offering the message, so nothing is redistributed — and
+//     correcting it is its own roadmap item. See F-064's residual 1.
+//
 //   - claimed with the SOURCE MESSAGE authoritatively gone and no copy: no PUBLISH
 //     can ever have passed the materialization gate, and no group delivery can
 //     ever be re-offered. Mark it discarded and affine-complete, and let the reap
 //     prove the source side from the group consumer's absence. Without this the
 //     claim would sit at `claimed` forever, and contenders would keep honoring a
 //     winner for a message that no longer exists.
+//
 //   - claimed with the source still present: leave it. The group's AckWait
 //     re-offers the source, and whichever member receives it (this one included)
 //     materializes from the payload it carries — which recovery does not have.
@@ -2200,7 +2680,7 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 			// Lost is terminal, never reapable and mutually exclusive with
 			// AffineDone: revisiting it on a later resume — when the consumer has
 			// since been recreated and so looks intact — would only risk asserting
-			// both that the message was delivered and that it was lost.
+			// both that the delivery was proven and that it could not be proven.
 			return nil
 		}
 		if claim.AffineDone {
@@ -2225,11 +2705,17 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 			if claim.Discarded {
 				break // its session ended; the terminal path below reaps it
 			}
-			// The copy is gone and no delivery ever recorded disposing of it. That
-			// is a QoS 2 message the broker accepted and never delivered. Record it
-			// as LOST: terminal, so no contender waits on it and the group delivery
-			// is released, but never reapable, so the evidence survives instead of
-			// being erased by a clean reap.
+			// The copy is gone and no delivery ever recorded disposing of it. Record
+			// it as LOST: terminal, so no contender waits on it and the group
+			// delivery is released, but never reapable, so the evidence survives
+			// instead of being erased by a clean reap.
+			//
+			// LOST is what this broker can prove, not what necessarily happened. A
+			// client that answered PUBREC before the broker stopped leaves this same
+			// shape, because the PUBREL is stored before the affine side is recorded
+			// — so this arm can name a message that was in fact received. The write
+			// stays as it is: the alternative readings are worse, and the correction
+			// belongs to the separate Lost-truthfulness item. See F-064 residual 1.
 			if s != nil {
 				s.Errorf("MQTT: shared QoS 2 assignment %q for session %q was materialized, but its copy is gone with no record of it being delivered; recording it as a LOST QoS 2 delivery",
 					subject, idHash)
@@ -2325,7 +2811,7 @@ type mqttQ2AffUnwind struct {
 //
 // Either way the assignments are marked DISCARDED, never released: a delivery
 // already started to this session dies with the subscription that was never
-// established, which [MQTT-4.8.2-6] permits, rather than being handed to another
+// established, which [MQTT-4.8.2-5] permits, rather than being handed to another
 // member.
 //
 // Runs from the client's readLoop, or from the resolver. sess.mu not held on entry.
@@ -2379,7 +2865,7 @@ func (sess *mqttSession) prepareQ2AffineUnwind(c *client, disposeNow bool) mqttQ
 // mean no further MQTT delivery can come of the claim, and two of them PERSIST:
 // an `AffineDone` claim outlives a failed ack or reap, and a `Lost` claim is
 // deliberately never reaped, because it is the only durable evidence that a
-// message the broker accepted was never delivered. Treating either as an
+// message the broker accepted could not be proven delivered. Treating either as an
 // outstanding obligation would retain this path forever — for a never-expiring
 // session, the broker's lifetime — which is the exact leak the reclaim exists to
 // close.
@@ -2554,7 +3040,7 @@ func mqttRecordHasSharedQoS2(ps *mqttPersistedSession) bool {
 //
 // The claims this discards are the ones the packet's own unwind would have
 // discarded had the write been confirmed — a delivery started to a session whose
-// subscription never became durable dies with it, which [MQTT-4.8.2-6] permits.
+// subscription never became durable dies with it, which [MQTT-4.8.2-5] permits.
 // Deferred to the settlement rather than done at failure time so it is one
 // arbitrated CAS on a record we have proof of, not a guess against one we do not.
 //
@@ -2584,7 +3070,7 @@ func (sess *mqttSession) unwindProvisionedQ2AffineOnLanded(c *client, tok record
 	// membership to find. It stays because the two do not state the same fact: the
 	// refusal rejects a record shape at load, this refuses an IRREVERSIBLE disposal
 	// given the in-memory state, and any hole in the refusal would otherwise become
-	// assignments discarded out from under a started delivery ([MQTT-4.8.2-6]).
+	// assignments discarded out from under a started delivery ([MQTT-4.8.2-5]).
 	if sess.hasSharedQoS2Sub() {
 		return
 	}

@@ -1607,7 +1607,7 @@ func TestOrphanSweepAffineValidatorDoesNotWidenTheSharedFloor(t *testing.T) {
 }
 
 // TestOrphanSweepKeepsADiscardedAssignmentWhoseSourceCouldRedeliver pins the rule
-// that keeps [MQTT-4.8.2-6] intact through reconciliation.
+// that keeps [MQTT-4.8.2-5] intact through reconciliation.
 //
 // Discarding an assignment does not imply the group ack committed. If the source
 // delivery can still be re-offered, deleting the claim would let that redelivery

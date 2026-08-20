@@ -636,18 +636,82 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
   the ack, which is what establishes the premises are distinct, and what this item's
   refusal strands is F-064's to resolve.
 - [ ] [F-064: Reconcile assignments independently of owner resume](findings/ha-arbitration.md#f-064).
-  **Alpha blocker.** `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen` alone, so a live
-  matching record makes the sweep skip **every** claim of that generation, and
-  `recoverQ2AffClaims` — the only writer of `Lost` — runs solely on the owner's own resume.
-  Two consequences share that one premise, so they are one finding: a shared group stalled
-  forever (no `MaxDeliver` on the group consumer, so the source is re-offered indefinitely
-  while holding a `MaxAckPending` slot);
-  and unbounded accumulation of settled records. Reachable through the out-of-band
-  destruction `docs/CONFORMANCE.md` already documents, and through F-036's adoption blind
-  spot.
+  **Alpha blocker. Partly landed; the box stays open deliberately.**
+  `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen` alone, so a live matching record
+  makes the sweep skip **every** claim of that generation, and `recoverQ2AffClaims` — the
+  only writer of `Lost` — runs solely on the owner's own resume.
+  **What landed:** on-behalf restoration of a destroyed affine consumer. A contender
+  taking a group redelivery rebuilds the winner's durable from its record and materializes
+  onto it, so the stall is closed **without the owner for assignments that never reached
+  `materialized`**. Neither gate below is addressed — the remedy bypasses both, because a
+  redelivery carries the payload and the sweep does not.
+  **What did not, and why the box is not ticked:**
+  - *The stall for a `materialized` assignment whose copy is gone* — residual 8. That
+    population takes a different dispatcher arm and still waits for its owner. Re-storing
+    there was designed and **refuted twice**: the copy CAS and the claim CAS are on
+    different streams, so no claim-side fence orders a contender's store against the
+    winner's authorization of the original PUBLISH, and the replacement copy can become a
+    second PUBLISH for an exchange already past PUBREC. The route back to this is the
+    PUBREL-carried claim reference in the `Lost`-truthfulness item below, because that
+    PUBREL is durable and account-wide — but note the direction: it gives PUBREL → claim,
+    and a contender needs claim → PUBREL, which is a reverse lookup that must be costed
+    before it is promised.
+  - *The accumulation half* — settled claims of a live generation are still not reaped.
+    Carried by **F-065**'s bullet, because reaping them needs the reaper fence that is
+    F-065's remedy.
   **The premise is enforced at TWO gates** — the reference skip and
   `discardAbsentWinnerClaim`'s generation-match deferral — and mutation showed that removing
-  either alone changes nothing, so a remedy must address both.
+  either alone changes nothing, so any remedy that works THROUGH the sweep must address
+  both. The landed remedy does not go through the sweep.
+- [ ] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
+  Split out of F-064; not a conformance defect, so not an alpha blocker.
+  *The finding:* `materialized ∧ ¬AffineDone ∧ copy absent` is reported `Lost` for a
+  message the client answered with PUBREC, because `mqttProcessPublishReceived` stores the
+  correlated PUBREL before it reaches `mqttFinishQ2AffineDelivery`.
+  *Why it is not a deviation:* `Lost` releases the group delivery without re-offering the
+  message, so nothing is redistributed. Writing `Discarded` instead is **not** an
+  `[MQTT-4.8.2-4]` violation for this population either — the PUBREL is persisted
+  independently and replayed, so the handshake completes — it is simply untruthful. The
+  conformance objection applies only to the undifferentiated shape, where nothing proves
+  the client was reached.
+  *Five refuted mechanisms, with the code behind each:* gating the in-flight register
+  transitions on the write (duplicate PUBLISH); issuing the write inline at the
+  classification site (per-record round trips inside the pre-CONNACK barrier); an in-memory
+  carrier from classification to `recoverQ2AffClaims` (does not survive broker
+  displacement, while the `Retired` register does); a retry for an unproven write
+  (`mergeProven` forces `AffineDone` false forever once `Lost` is on the record, so no
+  retry terminates); and an unresolved-joins set in a *suppressing* role (redundant with
+  the durable `AffineDone` the recovery arm already reads — but see the constraint below,
+  which narrows that refutation).
+  *Binding constraints on any design:* the writer must call `reapQ2AffClaim` itself, since
+  discharging it by ordering is unavailable — the recovery-and-reap route is skipped
+  whenever affine consumer restoration fails. The pass must run **before**
+  `recoverQ2AffClaims`, and an unproven advancement must suppress that function's `Lost`
+  transition for the affected claim, or `mergeProven` prevents any later `AffineDone` from
+  ever sticking; the suppressing set is redundant only once `AffineDone` has been
+  *successfully persisted*. And PUBCOMP must not destroy the only proof, which needs the
+  equivalent of `secureRetiredSource`'s persist-before-ack.
+  *The design to evaluate first:* make the correlated PUBREL carry the `Q2AffClaim`
+  subject. The association is in hand at PUBREC immediately before the PUBREL is stored,
+  and a post-CONNACK pass over those PUBRELs could advance the named claims directly. The
+  ordering property that makes it safe is read-loop serialization — no PUBCOMP can be
+  processed until `mqttProcessConnect` returns — **not** "before PUBREL redelivery is
+  enabled", which is false. It adds one persisted header, so it needs its own
+  compatibility and F-066 analysis, which is why it is a separate item.
+  *A residual any register-based design inherits:* an authoritatively absent consumer
+  resolves `mqttInflightSourceLost`, not Unknown, so the retire branch is forced while the
+  durable is gone; once the consumer exists — including after on-behalf restoration
+  recreated it for some other claim — the same absent copy resolves `Complete` and the
+  register is dropped, destroying the only record joining the PUBREL's `(Dur, Seq)` to the
+  claim.
+- [ ] **A saved shared filter that fails restoration at CONNECT is silently dropped.**
+  Pre-existing and unrelated to F-064, which only declined to enlarge it. There is no
+  SUBACK on the CONNECT restoration path: the success CONNACK precedes it, a per-filter
+  failure only sets a local result and continues, the installation pass skips it, and the
+  error never reaches the caller. The client holds a Session-Present connection whose
+  subscription delivers nothing. Any fix must weigh what the F-064 review established: the
+  obvious remedy, failing the CONNECT, is ungraceful and therefore publishes the Will and
+  can delete a zero-expiry session.
 - [ ] [F-065: Re-read copy absence after the reaper's own SourceAcked transition](findings/ha-arbitration.md#f-065).
   **Alpha blocker.** `reapQ2AffClaim` reads the copy state, may then perform a `SourceAcked`
   transition that is a full JetStream round trip with retries, and evaluates
@@ -656,6 +720,12 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
   delivery gate NAKs it forever, which is exactly the state `reapable`'s own comment says
   must never exist. `materializeQ2AffCopy`'s `Discarded` guard does not close it: that guard
   reads the caller's already-loaded claim.
+  **Also carries F-064's accumulation half.** Settled claims of a live generation are
+  never reaped, because `buildSessionRefs` makes the sweep skip every claim of a
+  referenced generation. Reaping them is exactly what needs the fence this item builds, so
+  the two are one piece of work: a reaper that may act on a claim whose generation is
+  still live must first be safe against a concurrent materializer, which is the window
+  above.
 - [ ] [F-066: Generalise cross-stream identity coupling](findings/ha-arbitration.md#f-066).
   **Alpha blocker.** Falsified premise: *recreating one stream is a self-contained recovery
   procedure*. Durable records persist identities other streams issue — sequences, consumer

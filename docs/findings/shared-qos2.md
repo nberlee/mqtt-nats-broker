@@ -20,7 +20,7 @@ survives
 
 - [ ] The packet's two affine unwinds treat a FAILED PACKET as an ENDED SESSION. They mark
   the generation's assignments `Discarded`, which this design defines as "the owning
-  session ended" (`docs/ARCHITECTURE.md`, claim state) and which [MQTT-4.8.2-6] permits on
+  session ended" (`docs/ARCHITECTURE.md`, claim state) and which [MQTT-4.8.2-5] permits on
   that basis — but the session survives a failed SUBSCRIBE, and [MQTT-4.8.2-5] requires a
   live session to complete a delivery already started to it. Reachable when a packet
   carries a SECOND shared QoS 2 filter: it re-enters `ensureQ2AffineConsumerSubscription`
@@ -54,7 +54,7 @@ survives
 - [ ] The packet's two affine unwinds discard this generation's assignments BEFORE the CAS
   that arbitrates whether they still own them, so a cleanup CAS lost to a remote winner
   that PRESERVED the generation leaves that winner's started QoS 2 delivery discarded —
-  terminated rather than redistributed, which is the [MQTT-4.8.2-6] outcome for the wrong
+  terminated rather than redistributed, which is the [MQTT-4.8.2-5] outcome for the wrong
   session, and unrecoverable because the discard is monotonic. The two sites are
   `prepareQ2AffineUnwind(c, true)` from the packet's unused-path unwind (`mqtt.go:6755`)
   and from `rollbackSubscribePacket` (`mqtt.go:7262`). The settlement reclaim

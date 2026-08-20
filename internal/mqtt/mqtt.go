@@ -1108,6 +1108,32 @@ type mqttAccountSessionManager struct {
 	// exists for. A returned error abandons the transition. Nil in production.
 	testQ2AffPreMaterialize func(claimSubject string, seq uint64) error
 
+	// testQ2AffConsumerLookup, when non-nil, replaces EVERY affine consumer
+	// lookup: the contender's, before it restores a durable on behalf of an absent
+	// winner, and the owner's, inside the recovery that follows a create already
+	// refused for a storage-type conflict. It exists to prove a negative — the
+	// owner's PROVISIONING path performs no lookup at all, so a lookup forced to
+	// fail must leave every owner-side shape working exactly as it does today
+	// (F-064). A lookup added outside lookupQ2AffineConsumer is invisible here,
+	// which is why that helper is the single route. Nil in production.
+	testQ2AffConsumerLookup func(durable string) (*ConsumerInfo, error)
+
+	// testQ2AffConsumerCreate, when non-nil, replaces the create-or-update a
+	// CONTENDER issues to restore an absent winner's affine durable. It carries the
+	// request so a test can assert WHAT was sent — which storage type was adopted,
+	// and, by counting, that a refusal happened with no create attempted at all.
+	// That last one is not observable any other way: most of D1's refusals produce
+	// the same final state as a create that was issued and then rejected. Nil in
+	// production.
+	testQ2AffConsumerCreate func(cfg *ConsumerConfig) (*JSApiConsumerCreateResponse, error)
+
+	// testQ2AffOutStreamInfo, when non-nil, replaces the $MQTT_out lookup a
+	// CONTENDER makes to read the live consumer limits before restoring a durable.
+	// An unreadable stream must be indeterminate rather than "no limits", and there
+	// is no non-destructive way to stage that against a real stream. Nil in
+	// production.
+	testQ2AffOutStreamInfo func() (*StreamInfo, error)
+
 	// Seams for the outbound in-flight register (inflight_register.go),
 	// instance-scoped and set/read under mu. Routed only through the register's own
 	// store and load so a test can fail, stall or observe the write that must
@@ -14858,7 +14884,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// here: the exchange has to complete with the client the server chose, and a
 	// message pending on the group durable is redelivered to whichever member
 	// AckWait reaches next. The move takes durable ownership of it and hands it to
-	// this session's own consumer. Spec5 [MQTT-4.8.2-5], [MQTT-4.8.2-6]; see
+	// this session's own consumer. Spec5 [MQTT-4.8.2-5]; see
 	// qos2_shared_affine.go.
 	//
 	// Unconditional, deliberately: there is no "only if this delivery already
