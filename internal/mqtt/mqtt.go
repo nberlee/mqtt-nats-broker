@@ -1142,6 +1142,14 @@ type mqttAccountSessionManager struct {
 	// production.
 	testQ2AffOutStreamInfo func() (*StreamInfo, error)
 
+	// testQ2AffSourceProbe, when non-nil, is called at the top of q2AffSourceGone and
+	// changes NOTHING about its answer. A pure observer, and the only way to prove the
+	// ORDER of the sourceless rule's two reads: that rule must read the source first and
+	// the copy LAST, so the reading its CAS consumes is as fresh as possible, and no
+	// existing seam can witness the source read at all. Nil in production, where the
+	// cost is one nil check.
+	testQ2AffSourceProbe func(*mqttQ2AffClaim)
+
 	// Seams for the outbound in-flight register (inflight_register.go),
 	// instance-scoped and set/read under mu. Routed only through the register's own
 	// store and load so a test can fail, stall or observe the write that must

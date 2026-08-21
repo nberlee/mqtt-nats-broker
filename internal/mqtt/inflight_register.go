@@ -3448,6 +3448,59 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 		sess.secureRetiredSource(c, mqttDeferredKey{fr.rec.Dur, fr.rec.Seq})
 	}
 
+	// Then re-classify every retirement this pass installed, against the source as it is
+	// NOW rather than as the earlier snapshot saw it — and do it in ONE BATCHED pass.
+	//
+	// Why the re-classification is needed: the entries above were installed from a
+	// snapshot taken earlier in this recovery, and this session is registered in
+	// sessByHash BEFORE recovery runs, so the orphan sweep's affine register arm can
+	// settle the very same exchange in between — deleting the copy, reaping the claim,
+	// removing the register and clearing the resident retirement while this map is still
+	// EMPTY. The install would then put a stale retirement back with its copy already
+	// gone, and nothing revisits one afterwards: both other resolveRetiredSource call
+	// sites run only where a retirement is CREATED, and a redelivery cannot happen
+	// without the copy. One permanent heap entry per interleaving.
+	//
+	// Why it is BATCHED, and not a per-retirement resolveRetiredSource call: this runs
+	// before the CONNACK, and this function supports 65_535 records. resolveRetiredSource
+	// performs a synchronous consumer lookup and an exact message load per call, which is
+	// exactly the "upwards of 100_000 serial round trips" mqttInflightSourceCache exists
+	// to avoid — and the accumulation-heavy population this item targets is precisely
+	// where the count would be highest, so a per-record loop would make the largest
+	// sessions unable to resume at all. One cache, one lookup per distinct durable, a few
+	// batched message reads.
+	if len(retired) > 0 {
+		fresh := as.newInflightSourceCache()
+		recs := make([]*mqttInflightRecord, 0, len(retired))
+		for _, fr := range retired {
+			recs = append(recs, fr.rec)
+		}
+		fresh.resolve(recs)
+		for _, fr := range retired {
+			if fresh.state(fr.rec) != mqttInflightSourceComplete {
+				continue // live or unknown: the retirement still has something to suppress
+			}
+			// Identity-fenced on the register's own nonce, so a retirement belonging to a
+			// different exchange on the same key is never dropped.
+			key := mqttDeferredKey{fr.rec.Dur, fr.rec.Seq}
+			sess.mu.Lock()
+			cur := sess.srcAckOwed[key]
+			if cur != nil && cur.nonce == fr.rec.Nonce {
+				delete(sess.srcAckOwed, key)
+			} else {
+				cur = nil
+			}
+			sess.mu.Unlock()
+			if cur != nil {
+				if cur.regSeq != 0 {
+					as.deleteInflightRegister(cur.regSeq)
+				}
+				c.Debugf("MQTT: dropping the recovered retirement of QoS 2 source %s/%d for client %q: its "+
+					"source is provably complete", fr.rec.Dur, fr.rec.Seq, sess.id)
+			}
+		}
+	}
+
 	for _, seq := range drop {
 		as.deleteInflightRegister(seq)
 	}

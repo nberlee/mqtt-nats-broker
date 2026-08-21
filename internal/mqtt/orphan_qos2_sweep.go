@@ -1468,6 +1468,55 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 type mqttInflightCandidate struct {
 	name *mqttInflightName
 	seq  uint64
+	// rec is the DECODED register, carried because the discovery walk already read
+	// these bytes to attribute the subject, so decoding here costs nothing and saves
+	// a per-candidate load in the live-generation arm below. Nil when the body could
+	// not be decoded, which is not fatal: such a candidate reaches only the arms that
+	// need no body (the header comment on this walk explains why an unattributable
+	// SUBJECT is retained rather than swept, and an unreadable BODY is the same
+	// judgement one level down).
+	rec *mqttInflightRecord
+}
+
+// mqttQ2AffSettleableRegister reports whether a register is one the live-generation
+// affine arm may act on at all. Every clause refuses a shape no supported writer emits,
+// and under the compatibility boundary meeting one means the state is not interpretable
+// rather than that it needs handling.
+//
+// Retired is the clause the whole arm's licence rests on: a NORMAL pre-PUBREC affine
+// register is non-retired and already carries Q2AffClaim and Q2AffCopy, so without it
+// the arm would record AffineDone and delete a copy the client has not completed.
+func mqttQ2AffSettleableRegister(rec *mqttInflightRecord, name *mqttInflightName) error {
+	if rec == nil || name == nil {
+		return fmt.Errorf("no register to settle")
+	}
+	if !mqttInflightRecordIdentityOK(rec) {
+		return fmt.Errorf("register carries no usable identity")
+	}
+	if rec.PI != name.pi {
+		// The body names an identifier other than its own subject's. Recovery already
+		// refuses this; the arm would otherwise act on a register it cannot attribute.
+		return fmt.Errorf("register body names packet identifier %d on the subject of %d", rec.PI, name.pi)
+	}
+	if !rec.Retired {
+		return fmt.Errorf("register is not retired, so it is a live PUBLISH-phase delivery")
+	}
+	if rec.Q2AffClaim == _EMPTY_ || rec.Q2AffCopy == _EMPTY_ {
+		return fmt.Errorf("register carries no affine assignment reference")
+	}
+	if rec.QoS != 2 {
+		// A retired exchange is past PUBREC, which QoS 1 has no phase for.
+		return fmt.Errorf("retired affine register carries QoS %d", rec.QoS)
+	}
+	if rec.Cancelled {
+		// Never-transmitted and past-PUBREC are mutually exclusive facts.
+		return fmt.Errorf("register asserts both cancellation and retirement")
+	}
+	if mqttInflightSourceStream(rec.Dur) != mqttOutStreamName {
+		// An affine pair on a non-affine durable names a source on the wrong stream.
+		return fmt.Errorf("affine register names non-affine durable %q", rec.Dur)
+	}
+	return nil
 }
 
 // collectInflightCandidates walks $MQTT.inflight.> once and returns every register it
@@ -1528,7 +1577,16 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 				s.Warnf("MQTT orphaned QoS 2 sweep: retaining an unattributable in-flight register on %q at sequence %d: %v",
 					smsg.Subject, smsg.Sequence, perr)
 			} else {
-				out = append(out, &mqttInflightCandidate{name: name, seq: smsg.Sequence})
+				// Decoded here because these bytes are already in hand. A decode failure
+				// leaves rec nil rather than dropping the candidate: the orphan arm judges
+				// by the SUBJECT and says so ("readability is irrelevant here: an
+				// unreadable orphan is still an orphan"), while the live-generation affine
+				// arm needs a body and simply never matches a nil one.
+				rec := &mqttInflightRecord{}
+				if uerr := json.Unmarshal(smsg.Data, rec); uerr != nil {
+					rec = nil
+				}
+				out = append(out, &mqttInflightCandidate{name: name, seq: smsg.Sequence, rec: rec})
 			}
 
 			if records >= recordLimit {
@@ -1610,12 +1668,52 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, candidates []*mqttInflightCandidate, refs *mqttSessRefs, budget *int) {
 	grace, q := as.orphanGrace(), as.quarantine()
 	var deleted int
+	// Sources for every settleable retired affine candidate, classified in ONE batch
+	// through the same cache the resume path uses — so the source state and the
+	// pair-proven-by-source predicate come from one definition, and the pass costs a
+	// handful of round trips rather than two per record.
+	var affine []*mqttInflightCandidate
+	for _, cand := range candidates {
+		if refs.hasInbound(cand.name.idHash, cand.name.gen) &&
+			mqttQ2AffSettleableRegister(cand.rec, cand.name) == nil {
+			affine = append(affine, cand)
+		}
+	}
+	var srcCache *mqttInflightSourceCache
+	if len(affine) > 0 {
+		srcCache = as.newInflightSourceCache()
+		recs := make([]*mqttInflightRecord, 0, len(affine))
+		for _, cand := range affine {
+			recs = append(recs, cand.rec)
+		}
+		srcCache.resolve(recs)
+	}
 	for _, cand := range candidates {
 		n := cand.name
 		if refs.hasInbound(n.idHash, n.gen) {
 			// A live incarnation owns this identifier. Drop any wait accumulated while
 			// it looked absent: a session that came back must not inherit it.
 			q.forget(mqttQuarantineInflightKey(n.subject))
+			// A live record protects a register through the INBOUND key, which is a
+			// different key from the claim's affine one — so a remedy written for claims
+			// alone leaves retired affine registers accumulating here forever for a
+			// session that never resumes. That is F-064's accumulation half, and this is
+			// the arm that collects them together with the copy and the claim they name.
+			serr := mqttQ2AffSettleableRegister(cand.rec, n)
+			switch {
+			case serr == nil && srcCache != nil:
+				as.settleRetiredAffineRegister(s, cand, srcCache, budget)
+			case serr != nil && cand.rec != nil && (cand.rec.Q2AffClaim != _EMPTY_ || cand.rec.Q2AffCopy != _EMPTY_):
+				// A register that CARRIES an affine reference and is nonetheless not
+				// settleable is retained — and SAID SO. The state is permanent and does
+				// not self-heal: nothing else revisits such a register while its session
+				// generation is referenced, so silence would hide continuing accumulation
+				// and an unsupported persisted shape from the operator who has to act on
+				// it. Registers carrying no affine reference at all are the ordinary case
+				// and are skipped without a word.
+				s.Warnf("MQTT orphaned QoS 2 sweep: retaining the in-flight register on %q at sequence %d: "+
+					"it names affine QoS 2 state but is not settleable: %v", n.subject, cand.seq, serr)
+			}
 			continue
 		}
 		if !q.observedOrphanFor(mqttQuarantineInflightKey(n.subject), mqttQuarantineSeqFP(cand.seq), grace) {
@@ -1645,6 +1743,205 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, candidat
 
 // mqttQoS2RelClaimLabel names a claim for a log line, including the one that could
 // not be decoded — a nil claim is a state this path handles, not an impossibility.
+// settleRetiredAffineRegister collects a RETIRED affine in-flight register of a LIVE
+// session generation, together with the copy and the assignment claim it names.
+//
+// This is F-064's accumulation half for the register class. On the successful-PUBREC
+// path, if the incarnation-fenced AffineDone write fails, the copy stays unacknowledged
+// and the register is durably rewritten retired; the immediate source probe sees the
+// copy still live and removes neither. A live record then preserves the claim through
+// its affine reference and the register through its INBOUND one, so for a session that
+// never resumes all three accumulate, one triple per failed exchange.
+//
+// Two arms, on what the register's own source proves. For an affine delivery the source
+// IS the copy, so the source classification is the copy's state.
+//
+// Nothing here takes a quarantine observation: a grace exists to keep a
+// mid-construction resource from being acted on, and both arms act on positive,
+// freshly revalidated evidence under a matching live record.
+func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand *mqttInflightCandidate,
+	srcCache *mqttInflightSourceCache, budget *int) {
+
+	rec, shape := cand.rec, q2AffShapePrecheck(cand.rec.Q2AffClaim)
+
+	switch srcCache.state(rec) {
+	case mqttInflightSourceComplete:
+		// The copy was acknowledged, or is authoritatively absent while its consumer
+		// still holds interest, so the exchange is over. This mirrors
+		// resolveRetiredSource minus its in-memory half.
+		//
+		// It does NOT rely on the record-before-ack invariant to conclude the claim is
+		// terminal. A Complete copy under a nonterminal claim of this assignment is a
+		// state no supported path produces, so it is treated as a CONTRADICTION and
+		// everything is retained.
+		claim, cerr := as.q2AffClaimForCarriedCopy(rec.Q2AffClaim, rec.Q2AffCopy)
+		switch {
+		case errors.Is(cerr, errQ2AffCarriedCopySuperseded):
+			// A POSITIVE fact about a record just read: the claim subject now holds a
+			// LATER incarnation, so this register's carried copy can never be authorized
+			// by anybody. The successor made no delivery and nothing is written to it.
+			// Without this arm the old register accumulates for as long as that successor
+			// stays nonterminal, which is the very accumulation this item closes.
+			if *budget <= 0 {
+				return
+			}
+			*budget--
+			as.deleteInflightRegister(cand.seq)
+			as.forgetResidentRetirement(cand.name, rec)
+		case cerr != nil:
+			s.Warnf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: %v", rec.Q2AffClaim, cerr)
+		case claim == nil:
+			// The claim is already reaped, which IS the fact this register's deletion
+			// waits on.
+			if *budget <= 0 {
+				return
+			}
+			*budget--
+			as.deleteInflightRegister(cand.seq)
+			as.forgetResidentRetirement(cand.name, rec)
+		case shape(claim) != nil:
+			s.Warnf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: its claim's shape is not one this broker writes", rec.Q2AffClaim)
+		case claim.terminal():
+			if *budget <= 0 {
+				return
+			}
+			*budget--
+			// Only a PROVEN reap licenses deleting the register: it is the record that
+			// carries this exchange's only remaining reference to the claim, so an
+			// indeterminate outcome must retain it for a later pass.
+			if as.reapQ2AffClaimChecked(s, rec.Q2AffClaim, shape) == mqttQ2AffReapIndeterminate {
+				s.Warnf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: its claim's reap was indeterminate", rec.Q2AffClaim)
+				return
+			}
+			as.deleteInflightRegister(cand.seq)
+			as.forgetResidentRetirement(cand.name, rec)
+		default:
+			s.Errorf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: its copy is complete while the claim is NONTERMINAL, "+
+				"which no supported path produces", rec.Q2AffClaim)
+		}
+
+	case mqttInflightSourceLive:
+		// The register is durable evidence that this exchange passed a SUCCESSFUL
+		// PUBREC — markInflightRegisterRetired is only reached from secureRetiredSource,
+		// itself gated on one — and the live message at rec.Seq sitting on rec.Q2AffCopy
+		// binds that evidence to THIS copy. That is a positive fact in hand, which is
+		// what separates this write from the refuted designs that inferred an outcome
+		// from an absence.
+		observed, proven := srcCache.affinePairProvenBySource(rec)
+		if !proven {
+			s.Warnf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: its own source is %q rather than the copy it names",
+				rec.Q2AffClaim, observed)
+			return
+		}
+		if *budget <= 0 {
+			return
+		}
+		// Charged on ENTRY to the write, after every refusal that precedes it. A no-op
+		// or a precheck refusal inside is therefore over-charged, which defers work to
+		// the next pass; under-charging would remove the bound.
+		*budget--
+
+		// (1) The snapshot is older than the record, so re-read at the EXACT sequence and
+		// re-establish the shape against what the arm will act on.
+		cur, smsg, lerr := as.loadInflightRecord(cand.name.subject)
+		if lerr != nil || smsg == nil || smsg.Sequence != cand.seq ||
+			mqttQ2AffSettleableRegister(cur, cand.name) != nil ||
+			cur.Q2AffClaim != rec.Q2AffClaim || cur.Q2AffCopy != rec.Q2AffCopy {
+			return
+		}
+		// (2) proven above. (3) Record AffineDone, through the ONE definition of that
+		// transition, with a retry-time veto that refuses an unsupported shape and
+		// requires the phase a retired register implies. A retired register is evidence
+		// of a PUBREC, and the copy cannot have reached the client before its claim
+		// became materialized — a cross-record fact neither record proves alone.
+		if as.proveQ2AffCopyDelivered(rec.Q2AffClaim, rec.Q2AffCopy,
+			func(c *mqttQ2AffClaim) error {
+				if verr := shape(c); verr != nil {
+					return verr
+				}
+				if c.Phase != mqttQ2AffMaterialized {
+					return fmt.Errorf("%w: a retired register implies a materialized claim, and this one is %q",
+						errQ2AffPrecheckRefused, c.Phase)
+				}
+				return nil
+			}, s.Warnf) == nil {
+			return
+		}
+		// (4) Delete the copy at its EXACT sequence and CONFIRM it gone. Not
+		// fire-and-forget: the steps after this depend on it, and a delete whose failure
+		// is only logged would let them proceed on an unproven premise.
+		if derr := as.jsa.deleteMsg(mqttOutStreamName, rec.Seq, true); derr != nil &&
+			isErrorOtherThan(derr, JSSequenceNotFoundErrF) &&
+			!isJSErrCausedBy(derr, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
+			// Indeterminate: re-read, because a response is not a verdict in either
+			// direction ("did not land" is not something a failed response establishes).
+			if st, _ := as.loadQ2AffCopy(rec.Q2AffCopy); st != mqttQ2AffCopyAbsent {
+				s.Warnf("MQTT orphaned QoS 2 sweep: recorded the completion of %q but could not prove its copy gone, retaining the register: %v",
+					rec.Q2AffClaim, derr)
+				return
+			}
+		}
+		// (5) Reap, and (6) delete the register LAST, because it is the only proof of
+		// step 3's licence.
+		//
+		// Step 6 requires `reaped` SPECIFICALLY, and that is stricter than arm (a) on
+		// purpose. Arm (a) reaches its delete on a legitimate `retained` too, because
+		// there the exchange is already over and the claim is retained for a reason that
+		// has nothing to do with this register. Here the register is the only remaining
+		// carrier of a claim this pass has just written to, so anything short of a proven
+		// deletion leaves it for the next pass.
+		if as.reapQ2AffClaimChecked(s, rec.Q2AffClaim, shape) != mqttQ2AffReaped {
+			return
+		}
+		as.deleteInflightRegister(cand.seq)
+		as.forgetResidentRetirement(cand.name, rec)
+
+	default:
+		// Unknown, or Lost. Neither settles anything: an unreadable source is not an
+		// absent one, and a consumer that is knowably GONE means the delivery was lost
+		// rather than finished — which this arm must never launder into a completion.
+	}
+}
+
+// forgetResidentRetirement drops the IN-MEMORY retirement a settled register belonged
+// to, on this broker, identity-fenced to the exact exchange.
+//
+// It exists because settling the durable triple otherwise leaves the resident half
+// behind FOREVER, and this arm is what makes that permanent. The in-memory entry is
+// created by the same failed-AffineDone path this item targets; nothing re-examines it
+// afterwards — both resolveRetiredSource callers run at the moment a retirement is
+// CREATED, not periodically — so the only thing that used to clear it was a later
+// redelivery of the copy reaching settleRetiredAffineSource. Deleting that copy removes
+// exactly that route. Without this, a session that stays resident accumulates one map
+// entry per such exchange, which is the same growth law the durable cleanup just closed,
+// moved into the heap.
+//
+// Three fences, because clearing another exchange's retirement would resurrect a delivery
+// this broker still owes: the session must be the one the register's SUBJECT names, its
+// generation must match that subject's, and the entry's nonce must be the register's own.
+// A session that is not resident here has no in-memory half to clear, and a peer that
+// holds it will clear its own on the same evidence.
+func (as *mqttAccountSessionManager) forgetResidentRetirement(name *mqttInflightName, rec *mqttInflightRecord) {
+	if name == nil || rec == nil || rec.Dur == _EMPTY_ || rec.Seq == 0 {
+		return
+	}
+	as.mu.RLock()
+	sess := as.sessByHash[name.idHash]
+	as.mu.RUnlock()
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.gen != name.gen {
+		return // a different incarnation's map; not ours to touch
+	}
+	key := mqttDeferredKey{rec.Dur, rec.Seq}
+	if cur := sess.srcAckOwed[key]; cur != nil && cur.nonce == rec.Nonce {
+		delete(sess.srcAckOwed, key)
+	}
+}
+
 func mqttQoS2RelClaimLabel(c *mqttQoS2RelClaim) string {
 	if c == nil {
 		return "unreadable"
@@ -1770,13 +2067,40 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 		// The STALL that used to leave behind is closed elsewhere, and
 		// owner-independently: a group redelivery does carry the payload, so a
 		// contender restores the winner's destroyed consumer and materializes onto it
-		// (materializeQ2AffOnBehalf). What remains here is the ACCUMULATION — settled
-		// claims of a live generation are still not reaped, which needs the reaper
-		// fence that is F-065's remedy — and the materialized-copy-gone population,
-		// which is still owner-dependent (F-064's residual 8). See
-		// docs/findings/ha-arbitration.md.
+		// (materializeQ2AffOnBehalf). The materialized-copy-gone population is still
+		// owner-dependent (F-064's residual 8). See docs/findings/ha-arbitration.md.
+		//
+		// What this pass DOES now do under a live reference is reap the claims that are
+		// already durably TERMINAL, which is the accumulation half of F-064.
 		if refs.hasAffine(e.claim.Winner, e.claim.Gen) {
 			q.forget(mqttQuarantineAssignKey(e.subject))
+			switch {
+			case e.claim.Lost:
+				// UNTOUCHED, and not even attempted: reapable() refuses Lost
+				// unconditionally, so a call here would be a pure round trip. The
+				// absent-winner path below logs it once; this branch adds nothing.
+			case e.claim.Discarded || e.claim.AffineDone:
+				// Durably terminal with the reap unperformed — the shape a crash or a
+				// lost ack response leaves, and which nothing else revisits while the
+				// reference is live: recoverQ2AffClaims runs only on the owner's own
+				// resume. No quarantine observation, because the claim is already
+				// terminal rather than mid-construction, and NO budget charge, because
+				// the reap may write nothing and an inventory headed by
+				// retained-by-design claims would otherwise consume the whole budget on
+				// the same prefix every pass.
+				//
+				// The CHECKED reaper: between the inventory's validation and the
+				// reaper's own fresh load, a same-copy unsupported rewrite can appear,
+				// and the plain reaper would delete it or normalise it through its
+				// SourceAcked advance.
+				as.reapQ2AffClaimChecked(s, e.subject, q2AffShapePrecheck(e.subject))
+				retained++
+			}
+			// Everything else of a live generation is left exactly as it was, and the
+			// NONTERMINAL population is deliberate rather than an omission: no fact this
+			// pass could write is both true and terminal for it. See
+			// settleSourcelessQ2AffClaim's own comment for why the sweep does not call
+			// that rule, and F-064's bullet for the population it leaves open.
 			continue
 		}
 		// Terminal and retained claims are resolved BEFORE any quarantine observation,

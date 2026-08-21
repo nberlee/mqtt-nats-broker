@@ -3801,7 +3801,14 @@ an
 owner resume that may never come, which is F-064 — plus one addition to F-036 itself: the
 affine consumer delete is BY NAME and a resuming session ADOPTS the consumer it finds, so
 the instance fingerprint is unchanged and does not discriminate it. That window is reached
-only under this section's own bound, so it is F-036 population.) The same
+only under this section's own bound, so it is F-036 population. **F-064's accumulation
+half has since narrowed the skip**: under a live reference the pass now reaps claims that
+are already durably TERMINAL, and collects the retired affine `$MQTT_inflight` register
+class with the copy and claim each names. The skip still protects every NONTERMINAL claim
+of a live generation, and that is a proof rather than caution — no fact such a pass could
+write is both true and terminal for that population, and writing `Discarded` there makes
+a concurrent materializer withdraw an unpublished copy for a session that never ended.
+See the F-064 bullet in `docs/ROADMAP.md` for the worked interleaving.) The same
 bound is stated once for
 the code, in `internal/mqtt/orphan_qos2_sweep.go`'s header. Ownership is the
 `(client-ID hash, generation)` pair carried in the subject or durable name, never
@@ -3926,6 +3933,41 @@ after a complete assignment inventory, a second complete inventory as a
 verification barrier, and a final re-read of the session record; a capped or
 failed scan authorizes nothing. Assignments are deleted only through
 `reapQ2AffClaim`, whose existing predicate refuses a claim marked `Lost`.
+
+**Two abort-capable siblings carry every refusal this pass makes about a claim.**
+`advanceQ2AffClaimChecked` and `reapQ2AffClaimChecked` take a caller-supplied precheck;
+`advanceQ2AffClaim` and `reapQ2AffClaim` are thin wrappers passing nil, so their existing
+callers are unaffected. The precheck runs on EVERY attempt, against the record that
+attempt will actually CAS, after the load and the existing identity fences and **before
+`next := *cur`, before `mutate`, and before `mergeProven`** — the only placement that
+vetoes. Carrying the same condition inside `mutate` cannot veto at all: `mergeProven`
+runs after it unconditionally, and on an `AffineDone ∧ Lost` record `mergeProven` clears
+`Lost` by itself, so the CAS lands with the closure having mutated nothing, normalising
+the very shape the condition existed to refuse. The checked reaper applies its precheck
+at TWO points — its own initial load, and inside the conditional `SourceAcked` advance —
+and deliberately not a third after that advance returns, because the precheck is an
+invariant that transition preserves and a post-return call is not a fresh load.
+
+`reapQ2AffClaimChecked` also returns a typed outcome, `reaped` / `retained` /
+`indeterminate`, because a caller that deletes an in-flight register only once the claim
+it references is provably gone cannot distinguish those three from a function that
+returns nothing. An authoritatively absent claim and a not-found delete are both
+`reaped`; a refused precheck is `indeterminate`, never `retained`, since a refusal proves
+nothing about the record and must not license a dependent deletion.
+
+**The retired affine register class is collected with its copy and its claim.** A live
+record protects such a register through the INBOUND session key, a different key from the
+claim's affine one, so it needs its own arm. `settleRetiredAffineRegister` acts on what
+the register's own source proves — and for an affine delivery the source IS the copy.
+Where that source is `Complete` the exchange is over and the triple is resolved; a
+nonterminal claim of the same assignment there is a CONTRADICTION and everything is
+retained rather than trusted to the record-before-ack ordering. Where the source is
+`Live` and the message at the register's own sequence sits on the copy the register
+names, the register is durable evidence of a successful PUBREC, which licenses recording
+`AffineDone` — deleting the copy at its exact sequence with a CONFIRMED delete, reaping,
+and deleting the register LAST because it is the only proof of that licence. `Unknown`
+and `Lost` settle nothing: an unreadable source is not an absent one, and a knowably gone
+consumer means the delivery was lost rather than finished.
 
 No stream gains a `MaxAge`: JetStream age eviction cannot perform this ordering or
 these cross-stream proofs, so protocol state stays explicitly reconciled (every

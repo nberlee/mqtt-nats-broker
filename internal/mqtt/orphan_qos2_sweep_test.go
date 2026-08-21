@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,12 @@ type testOrphanEnv struct {
 }
 
 func testNewOrphanEnv(t *testing.T, clientID string) *testOrphanEnv {
+	return testNewOrphanEnvWithLogger(t, clientID, nil)
+}
+
+// testNewOrphanEnvWithLogger is testNewOrphanEnv with the broker's logger replaced, so a
+// test can assert on a diagnostic the sweep is required to emit.
+func testNewOrphanEnvWithLogger(t *testing.T, clientID string, h slog.Handler) *testOrphanEnv {
 	t.Helper()
 	// The account manager sweeps once at startup, on its own goroutine. That pass
 	// advances the discovery cursor and would otherwise interleave with whatever a
@@ -37,6 +44,9 @@ func testNewOrphanEnv(t *testing.T, clientID string) *testOrphanEnv {
 		nodeName: "node1",
 	}
 	s.running.Store(true)
+	if h != nil {
+		s.log.Store(slog.New(h))
+	}
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	t.Cleanup(func() { close(s.quitCh) })
 

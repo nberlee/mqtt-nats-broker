@@ -275,20 +275,58 @@ license collecting it. A retained copy is invisible to the client: it is never
 published, because the delivery gate refuses a copy no live claim of its own incarnation
 authorizes.
 
-**Additional residual, owned by F-064's accumulation half.** On the successful-PUBREC
-path, if the incarnation-fenced `AffineDone` write fails, the affine copy remains
-unacknowledged and the register is durably rewritten as retired. The immediate
-source-state probe sees the copy still live and therefore removes neither. Settlement then
-requires a later affine-copy delivery callback or recovery on the owning session's resume.
-If the client completes PUBCOMP, disconnects before AckWait redelivery, and keeps a
-non-expiring session that never resumes, the live session record makes orphan
-reconciliation preserve the `$MQTT_qos2assign` claim and, separately through its
-session-generation reference, the retired `$MQTT_inflight` register; the copy remains on
-the referenced affine consumer. Before F-065 this path already accumulated the
-copy-and-claim pair and unconditionally deleted the register. F-065 therefore adds one
-retired register per failed-`AffineDone` exchange in that population: **unbounded in
-count, bounded in kind, with the same growth law as the pre-existing pair**. F-064's
-accumulation bullet owns the live-generation reconciliation that must collect all three.
+**That residual is now CLOSED, and what replaced it is narrower.** On the
+successful-PUBREC path, if the incarnation-fenced `AffineDone` write fails, the affine
+copy remains unacknowledged and the register is durably rewritten as retired; the
+immediate source-state probe sees the copy still live and removes neither. For a client
+that completes PUBCOMP, disconnects before AckWait redelivery and keeps a non-expiring
+session that never resumes, the live record used to preserve all three — the
+`$MQTT_qos2assign` claim through its affine reference, the retired `$MQTT_inflight`
+register through its separate session-generation reference, and the copy on the
+referenced consumer — unbounded in count and bounded only in kind. Orphan reconciliation
+now collects that triple: the register is durable evidence of a successful PUBREC, so
+under a live reference the sweep records `AffineDone` from it, deletes the copy at its
+exact sequence with a confirmed delete, reaps the claim and deletes the register last.
+Terminal claims of a live generation are likewise reaped rather than left to an owner
+resume that may never come.
+
+**What remains open in that area, stated with its direction.** Two populations:
+
+- **A `materialized` assignment whose copy is gone** still waits for its owner. That is
+  F-064's residual 8, unchanged, and re-storing a replacement copy is refuted twice in
+  the dossier.
+- **A NONTERMINAL claim of a live generation whose source is authoritatively gone** is
+  reconciled only by its owner's resume, and that is a proof rather than an omission. No
+  fact an owner-independent pass could write there is both true and terminal:
+  `AffineDone` would assert a delivery that never happened, `Lost` is unprovable without
+  the payload and is never reapable, `SourceAcked` alone leaves the claim nonterminal,
+  and `Discarded` is false while the session is live — and committing it makes a
+  concurrent materializer withdraw an unpublished copy, because that materializer stores
+  the copy BEFORE its own phase CAS, so no phase guard can see the store. So the claim,
+  and any copy a late materializer gives it, are retained until the owner returns.
+
+**A residual on the owner's own path, narrowed rather than closed.** `recoverQ2AffClaims`
+does settle that nonterminal population, and its window is the final copy read to the
+CAS — bounded RETRIES, not one round trip, since the transition may repeat load-and-CAS
+up to three times. Within that window a dispatched materializer can store a copy the
+transition then discards. The ordering (source read first, copy read LAST) and a
+retry-time phase veto narrow it; nothing closes it, because the claim and the copy live
+on different streams and JetStream commits to one stream at a time. It is narrowed
+further in practice by `moveStartedSharedQoS2` dropping a message whose Message Expiry
+Interval has elapsed BEFORE it elects or stores anything, so the actor that could store
+the copy refuses to when the source expired.
+
+**And a stated limit on shape refusal, in the direction it actually runs.** Every checked
+transition and reap this reconciliation performs refuses a record failing
+`q2AffShapePrecheck` — the sweep shape validator, the generation floor and the
+direct-decision identity floor — inside the CAS loop, before any mutation. Those reject
+the enumerated structural defects; they do NOT reconstruct the order in which this
+broker's writers may set these fields. A self-consistent record that no supported writer
+emits may therefore pass and be interpreted. Under the compatibility boundary no such
+record exists, because no release produced one. The converse is not assertable: an
+invariant of the form `AffineDone ⇒ materialized` would refuse a LEGITIMATE record, since
+the delivery gate's `Discarded` arm records `AffineDone` before its phase arm is
+reached.
 
 **F-063, closed 2026-08-19: the broker no longer releases a source against a store
 response.** Because `$MQTT_out` is interest-retained, a copy stored after its consumer is

@@ -1883,6 +1883,50 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 // lets AckWait re-offer the delivery.
 var errQ2AffUnresolved = errors.New("affine QoS 2 state could not be resolved")
 
+// errQ2AffPrecheckRefused marks a transition or reap a caller-supplied PRECHECK
+// vetoed against the freshly loaded record. It is deliberately distinct from
+// errQ2AffUnresolved: "I refused this record" and "I could not tell" license
+// different things, and collapsing them is what made an earlier design unable to
+// tell an already-settled claim (still reap it) from a vetoed one (do not).
+var errQ2AffPrecheckRefused = errors.New("affine QoS 2 record refused by the caller's precheck")
+
+// q2AffShapePrecheck refuses a record whose SHAPE this broker does not write, for
+// every checked transition and reap the orphan sweep and the owner's sourceless
+// recovery attach it to.
+//
+// Three checks, and each is here because the other two do not make it:
+//
+//   - validateOrphanQ2AffClaim is the only one that rejects an unknown Phase and
+//     the AffineDone∧Lost contradiction.
+//   - mqttValidQ2AffGen is the account-wide generation floor, which
+//     validateOrphanQ2AffClaim omits only because its own callers had already
+//     passed it.
+//   - q2AffClaimUsableForDecision is the only one that validates the INCARNATION,
+//     without which a record valid at a checked reap's first load can be rewritten
+//     with a malformed nonce and a recomputed, internally consistent CopySubject and
+//     still receive SourceAcked.
+//
+// It is NOT "every shape this broker does not write": these reject the enumerated
+// structural defects, not the ORDER in which this broker's writers may set these
+// fields. A self-consistent record violating that order passes. Under the
+// compatibility boundary no such record exists, because no release produced one.
+// docs/CONFORMANCE.md states that residual in the direction it actually runs —
+// false-negative acceptance.
+func q2AffShapePrecheck(subject string) func(*mqttQ2AffClaim) error {
+	return func(c *mqttQ2AffClaim) error {
+		if verr := validateOrphanQ2AffClaim(subject, c); verr != nil {
+			return fmt.Errorf("%w: %w", errQ2AffPrecheckRefused, verr)
+		}
+		if !mqttValidQ2AffGen(c.Gen) {
+			return fmt.Errorf("%w: generation %q is not a valid identity", errQ2AffPrecheckRefused, c.Gen)
+		}
+		if verr := q2AffClaimUsableForDecision(subject, c); verr != nil {
+			return fmt.Errorf("%w: %w", errQ2AffPrecheckRefused, verr)
+		}
+		return nil
+	}
+}
+
 // advanceQ2AffClaim applies mutate to the claim on subject and commits it with a
 // CAS at the sequence the claim was loaded at, retrying against the record's
 // latest state. Facts already proven by the loaded record are preserved
@@ -1900,6 +1944,30 @@ var errQ2AffUnresolved = errors.New("affine QoS 2 state could not be resolved")
 // is never manufactured into a new claim here.
 func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, wantGen, wantNonce, wantCopy string,
 	mutate func(*mqttQ2AffClaim)) (*mqttQ2AffClaim, uint64, error) {
+
+	return as.advanceQ2AffClaimChecked(subject, wantWinner, wantGen, wantNonce, wantCopy, nil, mutate)
+}
+
+// advanceQ2AffClaimChecked is advanceQ2AffClaim with a caller-supplied VETO, and the
+// placement of that veto is the whole correctness property.
+//
+// precheck runs on EVERY attempt, against the record this attempt will actually CAS,
+// after the load and after the existing winner/nonce/copy fences — and BEFORE
+// `next := *cur`, before mutate, and before mergeProven. A refusal returns
+// errQ2AffPrecheckRefused immediately and neither mutate nor mergeProven runs.
+//
+// Nothing weaker works, and this is measured rather than assumed. Carrying the same
+// condition inside `mutate` cannot veto at all: mergeProven runs after it
+// unconditionally, and on an AffineDone∧Lost record mergeProven clears Lost by itself,
+// so `next != cur` and the CAS lands with the closure having mutated nothing —
+// normalising the very shape the condition existed to refuse. The signature
+// `mutate func(*mqttQ2AffClaim)` simply cannot express an abort, so no placement
+// inside it could have been right.
+//
+// A nil precheck makes this exactly advanceQ2AffClaim, which is what lets the ten
+// existing callers keep their behaviour without an edit.
+func (as *mqttAccountSessionManager) advanceQ2AffClaimChecked(subject, wantWinner, wantGen, wantNonce, wantCopy string,
+	precheck func(*mqttQ2AffClaim) error, mutate func(*mqttQ2AffClaim)) (*mqttQ2AffClaim, uint64, error) {
 
 	var lastErr error
 	for attempt := 0; attempt < mqttQ2AffClaimAttempts; attempt++ {
@@ -1949,6 +2017,16 @@ func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, want
 			}
 			if cur.CopySubject != wantCopy {
 				return cur, seq, errQ2AffUnresolved
+			}
+		}
+		// THE VETO, and its placement is the correctness property: after the load and
+		// after every fence above, but before `next := *cur`, before mutate and before
+		// mergeProven. Refusing here is the only thing that stops a write; mergeProven
+		// runs unconditionally below and can itself change the record (it clears Lost on
+		// an AffineDone∧Lost pair), so a condition evaluated inside mutate cannot veto.
+		if precheck != nil {
+			if verr := precheck(cur); verr != nil {
+				return cur, seq, verr
 			}
 		}
 		next := *cur
@@ -2008,9 +2086,58 @@ func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, want
 // exists to prevent. The one caller that CAN tell is recoverQ2AffClaims, on the
 // owner's own resume, where the consumer's absence has actually been observed.
 func (as *mqttAccountSessionManager) reapQ2AffClaim(s *Server, subject string) {
+	_ = as.reapQ2AffClaimChecked(s, subject, nil)
+}
+
+// mqttQ2AffReapOutcome is what a reap ATTEMPT established, and it exists because a
+// caller that must act on the result — deleting an in-flight register only once the
+// claim it references is provably gone — cannot distinguish "reaped", "deliberately
+// retained" and "I could not tell" from a function that returns nothing.
+//
+// Every silent return of the reap body maps to exactly one of these; the mapping is
+// the contract, not an implementation detail, so it is stated here and pinned by its
+// own mutations.
+type mqttQ2AffReapOutcome int
+
+const (
+	// mqttQ2AffReaped: the claim record is GONE — deleted by this call, already
+	// absent when it loaded, or reported not-found by the delete. All three are the
+	// same fact for a caller that needs the record not to exist.
+	mqttQ2AffReaped mqttQ2AffReapOutcome = iota
+	// mqttQ2AffRetained: the record is readable, attributable and DELIBERATELY kept,
+	// because reapable() refuses it. A positive answer, not a failure.
+	mqttQ2AffRetained
+	// mqttQ2AffReapIndeterminate: nothing was established. A load failure, a refused
+	// validation or precheck, a failed source transition, an unreadable copy, or a
+	// delete that failed for any other reason. It must never be read as either of the
+	// others: treating it as reaped would license deleting a register whose claim may
+	// still be live.
+	mqttQ2AffReapIndeterminate
+)
+
+// reapQ2AffClaimChecked is reapQ2AffClaim with a caller-supplied VETO and a typed
+// outcome. A nil precheck makes it exactly reapQ2AffClaim, which is what lets the
+// twelve existing callers keep their behaviour without an edit — they invoke it as a
+// statement and discard the outcome.
+//
+// The precheck runs at TWO points and deliberately not a third: on this function's own
+// initial load, before it interprets or deletes anything; and inside the conditional
+// SourceAcked advance, on every retry's freshly loaded record. NOT again after that
+// advance returns — the precheck is an invariant that transition PRESERVES, since only
+// SourceAcked is added and a prechecked record cannot trigger mergeProven's
+// AffineDone∧Lost normalisation, and a post-return call is not a fresh load so it could
+// not retroactively veto a write that already happened.
+func (as *mqttAccountSessionManager) reapQ2AffClaimChecked(s *Server, subject string,
+	precheck func(*mqttQ2AffClaim) error) mqttQ2AffReapOutcome {
+
 	claim, seq, err := as.loadQ2AffClaim(subject)
-	if err != nil || claim == nil {
-		return
+	if err != nil {
+		return mqttQ2AffReapIndeterminate
+	}
+	if claim == nil {
+		// Authoritatively absent: somebody else reaped it. That IS the fact a caller
+		// gating on "the claim is gone" needs, so it is reaped rather than indeterminate.
+		return mqttQ2AffReaped
 	}
 	if verr := q2AffClaimUsableForDecision(subject, claim); verr != nil {
 		// This function DELETES a claim on what its copy subject says, so a record
@@ -2018,15 +2145,27 @@ func (as *mqttAccountSessionManager) reapQ2AffClaim(s *Server, subject string) {
 		// interpreted: it would otherwise inspect a copy the record does not own and
 		// delete the claim over a live one.
 		s.Warnf("MQTT: refusing to reap shared QoS 2 assignment %q: %v", subject, verr)
-		return
+		return mqttQ2AffReapIndeterminate
+	}
+	if precheck != nil {
+		if verr := precheck(claim); verr != nil {
+			// Refused on THIS function's own load, before it interprets or deletes
+			// anything. Indeterminate, never retained: a refusal proves nothing about the
+			// record, so it must not license a caller's dependent deletion.
+			s.Warnf("MQTT: refusing to reap shared QoS 2 assignment %q: %v", subject, verr)
+			return mqttQ2AffReapIndeterminate
+		}
 	}
 
 	if !claim.SourceAcked && as.q2AffSourceUnofferable(claim) {
 		// No identity of any kind: an unofferable source is a fact about the source
-		// MESSAGE, true of whichever incarnation holds this subject.
-		claim, seq, err = as.advanceQ2AffClaim(subject, _EMPTY_, _EMPTY_, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
+		// MESSAGE, true of whichever incarnation holds this subject. The precheck is
+		// threaded in, because this advance is the one write this function issues and it
+		// must not land on a record the caller would refuse.
+		claim, seq, err = as.advanceQ2AffClaimChecked(subject, _EMPTY_, _EMPTY_, _EMPTY_, _EMPTY_,
+			precheck, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
 		if err != nil || claim == nil {
-			return
+			return mqttQ2AffReapIndeterminate
 		}
 		// Re-validated, because that transition is identity-unfenced BY DESIGN — a
 		// SourceAcked write is a fact about the source message, so it applies to whichever
@@ -2044,7 +2183,7 @@ func (as *mqttAccountSessionManager) reapQ2AffClaim(s *Server, subject string) {
 		// strand the original copy with no claim.
 		if verr := q2AffClaimUsableForDecision(subject, claim); verr != nil {
 			s.Warnf("MQTT: refusing to reap shared QoS 2 assignment %q after its source transition: %v", subject, verr)
-			return
+			return mqttQ2AffReapIndeterminate
 		}
 	}
 
@@ -2053,18 +2192,25 @@ func (as *mqttAccountSessionManager) reapQ2AffClaim(s *Server, subject string) {
 	// function issues. F-065.
 	copyState, _ := as.loadQ2AffCopy(claim.CopySubject)
 	if copyState == mqttQ2AffCopyUnknown {
-		return // fail closed: an unreadable copy is not an absent copy
+		return mqttQ2AffReapIndeterminate // fail closed: an unreadable copy is not an absent copy
 	}
 	if !claim.reapable(copyState == mqttQ2AffCopyAbsent) {
-		return
+		// Readable, attributable and deliberately kept. A POSITIVE answer.
+		return mqttQ2AffRetained
 	}
 	// Delete the EXACT sequence loaded (qos2_move.go invariant 2): deleting a
 	// sequence cannot reach a record written after it.
-	if derr := as.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); derr != nil &&
-		isErrorOtherThan(derr, JSSequenceNotFoundErrF) &&
-		!isJSErrCausedBy(derr, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
-		s.Warnf("MQTT: unable to reap the completed shared QoS 2 assignment %q: %v", subject, derr)
+	if derr := as.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); derr != nil {
+		if isErrorOtherThan(derr, JSSequenceNotFoundErrF) &&
+			!isJSErrCausedBy(derr, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
+			s.Warnf("MQTT: unable to reap the completed shared QoS 2 assignment %q: %v", subject, derr)
+			return mqttQ2AffReapIndeterminate
+		}
+		// Either authoritative not-found form: the record is gone, which is the
+		// ordinary-success reading this delete has always applied.
+		return mqttQ2AffReaped
 	}
+	return mqttQ2AffReaped
 }
 
 // q2AffSourceUnofferable reports whether the group delivery behind this claim can
@@ -3089,24 +3235,64 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 // leaving the copy stalled with no route to completion. False therefore means "keep
 // the register" — the identifier is spent either way, so retaining it costs a record
 // the next resume resolves, while dropping it costs the delivery.
+// proveQ2AffCopyDelivered records AffineDone for the claim that owns carriedCopy and
+// returns that claim ONLY when the fact is durably on it. nil means "not proven", and
+// no caller may acknowledge anything on a nil.
+//
+// Extracted so there is one definition of this transition and its proof rather than a
+// second one for the sweep's register arm. Every rule is the original's:
+//
+//   - The carried pair becomes a claim through the single helper
+//     q2AffClaimForCarriedCopy, which requires the record to be attributable AND to name
+//     the copy this delivery carried. Fencing on an incarnation alone would accept a
+//     reference to a DIFFERENT claim carrying its own correct incarnation.
+//   - The advance asserts the claim's Nonce and the carried copy, and deliberately NOT
+//     Winner+Gen: AffineDone is owner-independent, a statement about a copy the caller
+//     has already attributed. Owner-independent is not the same as unfenced.
+//   - A NIL ERROR IS NOT THE PROOF. advanceQ2AffClaim reports (nil, 0, nil) when the
+//     record disappeared between the validation and its own load, and reports success
+//     for a no-op write. Treating either as recorded would let a caller take its
+//     irreversible step with the completion durable NOWHERE. So the fact has to be ON
+//     the record this call left behind, and that record still has to be the one this
+//     copy belongs to.
+//
+// precheck is threaded into the CAS loop, so a caller needing a retry-time veto gets one
+// without a second transition site. warnf is passed in so each caller keeps its own
+// logging: the delivery path logs through its *client, the sweep through its *Server,
+// and neither's output changes.
+func (as *mqttAccountSessionManager) proveQ2AffCopyDelivered(claimSubject, carriedCopy string,
+	precheck func(*mqttQ2AffClaim) error, warnf func(string, ...any)) *mqttQ2AffClaim {
+
+	claim, cerr := as.q2AffClaimForCarriedCopy(claimSubject, carriedCopy)
+	if cerr != nil {
+		warnf("Refusing to record the completion of affine QoS 2 assignment %q: %v", claimSubject, cerr)
+		return nil
+	}
+	if claim == nil {
+		return nil
+	}
+	updated, _, err := as.advanceQ2AffClaimChecked(claimSubject, _EMPTY_, _EMPTY_, claim.Nonce, carriedCopy,
+		precheck, func(cl *mqttQ2AffClaim) { cl.AffineDone = true })
+	if err != nil {
+		// Not recorded: the caller must not ack. AckWait re-offers the copy, the gate
+		// re-runs, and nothing has been made ambiguous.
+		warnf("Unable to record the completion of affine QoS 2 assignment %q: %v", claimSubject, err)
+		return nil
+	}
+	if updated == nil || !updated.AffineDone || updated.CopySubject != carriedCopy ||
+		q2AffClaimUsableForDecision(claimSubject, updated) != nil {
+		warnf("Refusing to acknowledge an affine QoS 2 delivery for %q: the transition reported success but the "+
+			"record it left does not carry the completion of this copy (%+v)", claimSubject, updated)
+		return nil
+	}
+	return updated
+}
+
 func (c *client) mqttFinishQ2AffineDelivery(claimSubject, carriedCopy, ackSubject string) (recorded, acked bool) {
 	as := c.mqtt.asm
 	if as == nil || c.mqtt.sess == nil {
 		return false, false
 	}
-	// The carried pair is turned back into a claim by ONE helper, which requires the
-	// record to be attributable AND to name the copy this delivery carried. Fencing the
-	// transition on an incarnation alone would accept a reference to a DIFFERENT claim
-	// that happens to carry its own correct incarnation.
-	claim, cerr := as.q2AffClaimForCarriedCopy(claimSubject, carriedCopy)
-	if cerr != nil {
-		c.Warnf("Refusing to record the completion of affine QoS 2 assignment %q: %v", claimSubject, cerr)
-		return false, false
-	}
-	if claim == nil {
-		return false, false
-	}
-	claimNonce := claim.Nonce
 	as.mu.RLock()
 	ackHook := as.testQ2AffCopyAck
 	as.mu.RUnlock()
@@ -3114,26 +3300,9 @@ func (c *client) mqttFinishQ2AffineDelivery(claimSubject, carriedCopy, ackSubjec
 	if ackHook != nil {
 		confirm = ackHook
 	}
-	updated, _, err := as.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_, claimNonce, carriedCopy,
-		func(cl *mqttQ2AffClaim) { cl.AffineDone = true })
-	if err != nil {
-		// Not recorded: do NOT ack. AckWait re-offers the copy, the gate re-runs,
-		// and nothing has been made ambiguous.
-		c.Warnf("Unable to record the completion of affine QoS 2 assignment %q: %v", claimSubject, err)
-		return false, false
-	}
-	// A nil error is NOT the proof this function's contract needs, and that gap was
-	// reachable: advanceQ2AffClaim reports (nil, 0, nil) when the record DISAPPEARED
-	// between the validation above and its own load, and it returns success for a
-	// no-op write. Treating either as recorded would confirm-ack the copy — the
-	// irreversible half — with the completion durable NOWHERE, which is exactly the
-	// ambiguity the write order exists to remove. So the fact has to be ON the record
-	// this call left behind, and that record still has to be the one this copy belongs
-	// to.
-	if updated == nil || !updated.AffineDone || updated.CopySubject != carriedCopy ||
-		q2AffClaimUsableForDecision(claimSubject, updated) != nil {
-		c.Warnf("Refusing to acknowledge an affine QoS 2 delivery for %q: the transition reported success but the "+
-			"record it left does not carry the completion of this copy (%+v)", claimSubject, updated)
+	// Nil precheck: this caller's behaviour must not change, which is the property the
+	// extraction exists to preserve. The sweep's register arm passes a real one.
+	if as.proveQ2AffCopyDelivered(claimSubject, carriedCopy, nil, c.Warnf) == nil {
 		return false, false
 	}
 	if err := confirm(ackSubject); err != nil {
@@ -3347,10 +3516,14 @@ func (as *mqttAccountSessionManager) discardQ2AffClaimsFor(idHash, gen string) e
 //
 //   - claimed with the SOURCE MESSAGE authoritatively gone and no copy: no PUBLISH
 //     can ever have passed the materialization gate, and no group delivery can
-//     ever be re-offered. Mark it discarded and affine-complete, and let the reap
-//     prove the source side from the group consumer's absence. Without this the
+//     ever be re-offered. Mark it `Discarded ∧ SourceAcked` and reap. Without this the
 //     claim would sit at `claimed` forever, and contenders would keep honoring a
-//     winner for a message that no longer exists.
+//     winner for a message that no longer exists. That rule is
+//     settleSourcelessQ2AffClaim, extracted so there is ONE definition of it, and it
+//     is the arm this comment used to describe as marking the claim "discarded and
+//     affine-complete" and letting the reap prove the source side — which was never
+//     what the code did: AffineDone would assert a delivery that never happened, and
+//     the source side is asserted here rather than inferred later.
 //
 //   - claimed with the source still present: leave it. The group's AckWait
 //     re-offers the source, and whichever member receives it (this one included)
@@ -3426,26 +3599,11 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 				return nil
 			}
 		default:
-			if !as.q2AffSourceGone(claim) {
-				return nil
-			}
-			// Claimed, no copy, and the SOURCE message itself is gone: no PUBLISH can
-			// ever have passed the materialization gate, and none ever will. Mark it
-			// discarded — not AffineDone, which would assert a delivery that never
-			// happened — and record the source side too: a source message that no
-			// longer exists cannot be re-offered to anybody, which is exactly what
-			// SourceAcked asserts. Without that the claim could never become
-			// reapable, since nothing would be left to ack the group delivery.
-			// Nonce-fenced even though SourceAcked alone would not need it: the
-			// Discarded half rests on THIS incarnation's copy being absent, and a
-			// replacement may already be storing its own. Codex ruled the combined
-			// mutation incarnation-specific for exactly that reason.
-			if _, _, aerr := as.advanceQ2AffClaim(subject, idHash, gen, claim.Nonce, _EMPTY_, func(c *mqttQ2AffClaim) {
-				c.Discarded = true
-				c.SourceAcked = true
-			}); aerr != nil {
-				return nil
-			}
+			// The sourceless rule, and it REAPS INTERNALLY — so this arm returns before
+			// the common tail reap below rather than falling through to it. Leaving it
+			// to fall through would reap twice.
+			as.settleSourcelessQ2AffClaim(s, subject, claim)
+			return nil
 		}
 		as.reapQ2AffClaim(s, subject)
 		return nil
@@ -3455,10 +3613,100 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 	}
 }
 
+// settleSourcelessQ2AffClaim is the rule for a NONTERMINAL claim whose SOURCE message
+// is authoritatively gone: nothing can ever have passed the materialization gate for
+// it and no group delivery can ever be re-offered, so it is marked
+// `Discarded ∧ SourceAcked` and reaped.
+//
+// ONE definition, and exactly ONE caller: recoverQ2AffClaims, on the owning session's
+// own resume. **The orphan sweep deliberately does NOT call this**, and that is a
+// decision rather than an omission. A sweep-side caller would be acting on a claim
+// whose session record is LIVE, and the write can be lost:
+//
+//  1. it proves the source gone and the copy absent;
+//  2. a materializer dispatched earlier, holding the payload, STORES the copy — the
+//     store precedes its own phase CAS, so the record is still `claimed`;
+//  3. this transition therefore passes its precheck and commits;
+//  4. the materializer's advance merges Discarded in, and q2AffCopyIsDisowned
+//     withdraws the copy UNPUBLISHED.
+//
+// The session never ended, so that disposal falsifies the [MQTT-4.8.2-5] premise
+// q2AffCopyIsDisowned itself states, and it is the write F-064's dossier refutes as
+// non-conformant under [MQTT-4.8.2-4]. No positive fact licenses it: source absence
+// does not revoke an already-dispatched payload, copy absence is instantaneous, a
+// `claimed` phase does not prove no store is in flight, and there is neither a
+// cross-stream transaction nor a bound on how long a materializer may be in flight.
+//
+// On the OWNER's resume the same window exists and this arm predates it; removing the
+// arm would remove existing convergence, so it is HARDENED rather than presented as
+// fixed. Three properties do that:
+//
+//   - The reads run source FIRST and copy LAST, so the copy reading is one round trip
+//     old at the CAS rather than two (F-065's R1 discipline: the reading a decision
+//     consumes must be no older than the decision).
+//   - `Phase != materialized` is a PRECHECK, evaluated against the record the CAS will
+//     be applied to. It cannot live in `mutate`, which cannot veto at all.
+//   - The shape precheck runs with it, so an unsupported record met mid-window is
+//     refused rather than mutated.
+//
+// The residual is the final copy read to the CAS, which is bounded RETRIES rather than
+// one round trip (advanceQ2AffClaimChecked may repeat load-and-CAS up to
+// mqttQ2AffClaimAttempts times). It is stated in docs/CONFORMANCE.md, narrowed by the
+// fact that moveStartedSharedQoS2 drops a message whose Message Expiry Interval has
+// elapsed BEFORE it elects or stores anything — so the actor that could store the copy
+// refuses to when the source expired.
+func (as *mqttAccountSessionManager) settleSourcelessQ2AffClaim(s *Server, subject string, claim *mqttQ2AffClaim) {
+	if !as.q2AffSourceGone(claim) {
+		return
+	}
+	// LAST read before the write.
+	if copyState, _ := as.loadQ2AffCopy(claim.CopySubject); copyState != mqttQ2AffCopyAbsent {
+		return // present, or unreadable: fail closed either way
+	}
+	shape := q2AffShapePrecheck(subject)
+	_, _, err := as.advanceQ2AffClaimChecked(subject, claim.Winner, claim.Gen, claim.Nonce, claim.CopySubject,
+		func(c *mqttQ2AffClaim) error {
+			if verr := shape(c); verr != nil {
+				return verr
+			}
+			// A materializer holding the payload can have completed since our reads, and
+			// it stores the copy BEFORE its own phase CAS — so this is checked where a
+			// refusal stops the write.
+			if c.Phase == mqttQ2AffMaterialized {
+				return fmt.Errorf("%w: the assignment materialized since this pass read it", errQ2AffPrecheckRefused)
+			}
+			return nil
+		},
+		func(c *mqttQ2AffClaim) {
+			// Discarded, NOT AffineDone, which would assert a delivery that never
+			// happened; and SourceAcked, because a source message that no longer exists
+			// cannot be re-offered to anybody, which is exactly what it asserts. Without
+			// that the claim could never become reapable.
+			c.Discarded = true
+			c.SourceAcked = true
+		})
+	if err != nil {
+		// Refused or unresolved: nothing written, and NOTHING REAPED — reaping a claim a
+		// materializer just advanced is F-065's harm re-entered.
+		return
+	}
+	// A no-op success still reaps: an already `Discarded ∧ SourceAcked` claim is exactly
+	// the shape this arm exists to clear.
+	as.reapQ2AffClaimChecked(s, subject, shape)
+}
+
 // q2AffSourceGone reports whether the claim's SOURCE message is authoritatively
 // absent from $MQTT_msgs. Only a confirmed no-message answer counts; an
 // unreadable stream is not an empty one.
 func (as *mqttAccountSessionManager) q2AffSourceGone(claim *mqttQ2AffClaim) bool {
+	as.mu.RLock()
+	probe := as.testQ2AffSourceProbe
+	as.mu.RUnlock()
+	if probe != nil {
+		// Pure observation, before any decision: it cannot change the answer, and it is
+		// what lets a test prove this read happens BEFORE the copy read.
+		probe(claim)
+	}
 	if claim.SourceSeq == 0 {
 		return false
 	}

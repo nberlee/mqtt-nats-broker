@@ -1617,14 +1617,45 @@ oversight.**
 
 1. *The stall for a `materialized` assignment whose copy is gone.* That population takes a
    different dispatcher arm and still waits for its owner.
-2. *The accumulation, consequence 2.* Moved to **F-065**'s bullet: reaping claims of a live
-   generation needs the reaper fence that is F-065's remedy.
+2. *The accumulation, consequence 2.* **Partly closed 2026-08-21.** Under a live
+   reference the sweep now reaps claims that are already durably TERMINAL, and collects
+   the retired affine `$MQTT_inflight` register class together with the copy and the
+   claim each register names. Two of the three windows are closed. The third — a
+   NONTERMINAL claim whose source is gone — stays owner-only, and the reason is the new
+   refuted design above rather than unfinished work.
 3. *The `Lost`-truthfulness defect.* Its own roadmap bullet.
 
 ### Refuted designs, recorded so none returns
 
 - **A sweep-side `Lost` writer.** The sweep has no payload, so it can only resolve a claim
   by asserting a fact it cannot prove.
+- **A reconciler-side sourceless settle of a NONTERMINAL claim**, by any actor whose
+  concurrent set can include a dispatched materializer. This is the remedy F-064's own
+  roadmap bullet prescribed for the accumulation half, and it is unsound. Worked, and
+  measured against the code rather than argued: (1) the pass proves the source
+  authoritatively gone and the copy absent; (2) a materializer dispatched earlier, holding
+  the payload, STORES the copy — `materializeQ2AffCopy` stores before its own phase CAS,
+  so the record is still `claimed`; (3) the pass's own fresh read therefore sees `claimed`
+  and commits `Discarded ∧ SourceAcked`; (4) the materializer's phase advance merges
+  `Discarded` in, because `mergeProven` ORs it and never clears it; (5)
+  `q2AffCopyIsDisowned` reads a TERMINAL claim of this very incarnation and
+  `withdrawQ2AffCopy` deletes the copy UNPUBLISHED. The session record is live by
+  construction in this arm, so that disposal falsifies the `[MQTT-4.8.2-5]` premise
+  `q2AffCopyIsDisowned` itself states, and the write is the "discard on a live record"
+  this list already refutes.
+  **The guard the bullet proposed does not save it.** An in-`mutate` "still
+  nonmaterialized" check cannot veto anything: `advanceQ2AffClaim` calls `mergeProven`
+  after `mutate` unconditionally, and the phase is `claimed` at the harmful step anyway.
+  **And no positive fact licenses the write:** source absence does not revoke an
+  already-dispatched payload, copy absence is an instantaneous observation, a `claimed`
+  phase does not prove no store is in flight, a live record supplies no quiescence, and
+  there is neither a cross-stream transaction nor any bound on how long a materializer may
+  be in flight. **Nor is there a truthful terminal fact to write instead:** `AffineDone`
+  asserts a delivery that never happened, `Lost` is unprovable without the payload and is
+  never reapable, and `SourceAcked` alone leaves the claim nonterminal so `reapable`
+  still refuses it. The rule therefore has exactly ONE caller — `recoverQ2AffClaims`, on
+  the owner's own resume, where it predates this finding — and is hardened there rather
+  than presented as fixed.
 - **Discard on a live record.** The rationale is **two-part**, and the blanket version an
   earlier draft carried overclaimed. Where nothing proves PUBREC, writing `Discarded`
   deprives a client still owed the PUBLISH and is non-conformant under `[MQTT-4.8.2-4]`.

@@ -657,49 +657,66 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
     PUBREL is durable and account-wide — but note the direction: it gives PUBREL → claim,
     and a contender needs claim → PUBREL, which is a reverse lookup that must be costed
     before it is promised.
-  - *The accumulation half* — settled claims of a live generation are still not reaped.
-    It was carried by F-065's bullet because reaping them needs a reaper that is safe
-    against a concurrent materializer; **F-065 has now landed that fence**, so this half
-    is unblocked and stays here rather than becoming a separate box. What it needs:
-    `refs.hasAffine` makes `reconcileOrphanQ2AffClaims` skip every claim of a referenced
-    generation (`orphan_qos2_sweep.go`), so only `recoverQ2AffClaims` on the owner's own
-    resume ever revisits one, and a session that never resumes accumulates one
-    `$MQTT_qos2assign` record per message forever plus the per-pass scan cost. **Three
-    windows** (dossier, F-064 "Consequence 2"): a skipped reap after `AffineDone`; a
-    `SourceAcked` committed with its response lost before the terminal contender's reap;
-    and — NONTERMINAL, so `reapable` refuses it however much else is proven — a claim
-    left `claimed` with `SourceAcked` false and no copy after a later redelivery found
-    the Message Expiry Interval elapsed and bare-acked the source before electing
-    anything. The remedy: in the live-generation arm, `Discarded ∨ AffineDone` →
-    `reapQ2AffClaim`; `Lost` → untouched (`reapable` refuses it, so a call is a pure
-    round trip); nonterminal with the source authoritatively gone → the rule
-    `recoverQ2AffClaims`'s default arm already applies, EXTRACTED so there is one
-    definition and two callers. `discardAbsentWinnerClaim`'s generation-match deferral —
-    F-064's second gate — stays untouched, because the new arms never reason about the
-    winner. **The trap that makes it hard:** "source authoritatively gone" does NOT imply
-    no materializer holds the payload — MQTT 5 messages carry a per-message `Nats-TTL`
-    and the validator requires that capability, and a confirmed ack cannot revoke an
-    already-dispatched callback. So the sourceless rule must not act on the inventory's
-    snapshot: "still nonmaterialized" has to be evaluated INSIDE
-    `advanceQ2AffClaim`'s mutate attempt against the freshly loaded record, carrying the
-    inventory incarnation's nonce (F-065 makes that expectation available), no-opping and
-    declining the reap when that record is now `materialized`. Otherwise the sweep adds
-    `Discarded` to a claim a live materializer just completed, the gate drops the live
-    copy as terminal, the source is already gone, and the delivery is lost — and F-065's
-    compensation cannot help, because the materializer finished its decision first. Tests
-    need the **load-count oracle** (an instance-scoped `testQ2AffClaimLoad` counter for
-    the subject), because a reap of a nonterminal or `Lost` claim merely DECLINES and a
-    survival-only assertion passes against the mutation; `refs.hasAffine`'s arm has no
-    quarantine gate, so its tests must not require a second sweep pass. The same
-    accumulation population also includes retired affine `$MQTT_inflight` registers
-    (`Retired` with `Q2AffClaim`): because a live record protects them through
-    `refs.hasInbound(idHash, ps.Gen)` rather than `refs.hasAffine(idHash, ps.Q2AffGen)`,
-    the remedy must add the corresponding live-session-generation in-flight arm and
-    settle each register together with its referenced copy and `$MQTT_qos2assign` claim.
-  **The premise is enforced at TWO gates** — the reference skip and
+  - *The accumulation half* — **PARTLY LANDED.** Under a live generation reference the
+    sweep now reaps the claims that are already durably TERMINAL, and collects the
+    retired affine `$MQTT_inflight` register class together with the copy and the claim
+    each register names. Two windows of the three are therefore closed: a skipped reap
+    after `AffineDone`, and a `SourceAcked` committed with its response lost before the
+    terminal contender's reap. `Lost` is untouched and not even attempted, since
+    `reapable` refuses it unconditionally. Both live-generation arms reap through a
+    CHECKED reaper carrying a shape precheck, because between the inventory's validation
+    and the reaper's own fresh load a same-copy unsupported rewrite can appear and the
+    plain reaper would delete it or normalise it through its `SourceAcked` advance.
+    The register class is collected by `settleRetiredAffineRegister`: source `Complete`
+    resolves the triple, source `Live` with the pair proven by that source records
+    `AffineDone` from the register's own PUBREC evidence, deletes the copy at its exact
+    sequence with a CONFIRMED delete, reaps, and deletes the register last because it is
+    the only proof of that licence. Source `Unknown` and `Lost` settle nothing.
+  - *W-c, the NONTERMINAL population, STAYS OPEN, and this is the reason — do not
+    re-derive the remedy the earlier draft of this bullet prescribed.* That draft said
+    the sweep should settle a claim left `claimed` with `SourceAcked` false and no copy
+    once its source is authoritatively gone, guarded by an in-`mutate`
+    "still nonmaterialized" check. **That is unsound, and the guard cannot save it.**
+    Worked: (1) the pass proves the source gone and the copy absent; (2) a materializer
+    dispatched earlier, holding the payload, STORES the copy — the store precedes its
+    own phase CAS, so the record is still `claimed`; (3) the pass's fresh read therefore
+    sees `claimed`, passes any phase guard, and commits `Discarded ∧ SourceAcked`;
+    (4) the materializer's advance merges `Discarded` in (`mergeProven`); (5)
+    `q2AffCopyIsDisowned` reads a terminal claim of this very incarnation and
+    `withdrawQ2AffCopy` deletes the copy UNPUBLISHED. The session never ended, so that
+    disposal falsifies the `[MQTT-4.8.2-5]` premise `q2AffCopyIsDisowned` itself states,
+    and it is the write this finding's own dossier refutes as non-conformant under
+    `[MQTT-4.8.2-4]`. No positive fact licenses it: source absence does not revoke an
+    already-dispatched payload, copy absence is an instantaneous observation, a
+    `claimed` phase does not prove no store is in flight, a live record supplies no
+    quiescence, and there is neither a cross-stream transaction nor any bound on how
+    long a materializer may be in flight. Nor is there a truthful terminal fact to write
+    instead: `AffineDone` would assert a delivery that never happened, `Lost` is refuted
+    for an actor with no payload and is never reapable anyway, and `SourceAcked` alone
+    leaves the claim nonterminal so `reapable` still refuses it. **What did land for
+    this population instead:** the rule is EXTRACTED as `settleSourcelessQ2AffClaim`
+    with exactly one caller, `recoverQ2AffClaims` on the owner's own resume, and
+    HARDENED there — source read first and copy read LAST, the phase condition moved
+    from `mutate` (which cannot veto, because `mergeProven` runs after it) to a
+    PRECHECK inside the CAS loop, and a shape precheck beside it. Its remaining window,
+    the final copy read to the CAS, is bounded RETRIES rather than one round trip and is
+    stated in `docs/CONFORMANCE.md`.
+  - *Retired affine registers*, the class this half also had to collect: a live record
+    protects them through `refs.hasInbound(idHash, ps.Gen)` rather than
+    `refs.hasAffine(idHash, ps.Q2AffGen)` — a DIFFERENT key, so a remedy written for
+    claims alone misses them. That arm landed; see above.
+  **The premise was enforced at TWO gates** — the reference skip and
   `discardAbsentWinnerClaim`'s generation-match deferral — and mutation showed that removing
   either alone changes nothing, so any remedy that works THROUGH the sweep must address
-  both. The landed remedy does not go through the sweep.
+  both. The on-behalf remedy does not go through the sweep at all. The accumulation
+  remedy DOES go through the reference skip, and it addresses that gate by NARROWING it
+  rather than removing it: the skip still protects every nonterminal claim of a live
+  generation, and `discardAbsentWinnerClaim` is untouched, because the new arms never
+  reason about the winner's disposition — they act only on facts the claim itself already
+  carries.
+  **What keeps the box open:** residual 8, and W-c above. Both are argued rather than
+  pending, and both have a named route: residual 8 through the `Lost`-truthfulness item's
+  PUBREL-carried claim reference, W-c through nothing currently available.
 - [ ] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
   Split out of F-064; not a conformance defect, so not an alpha blocker.
   *The finding:* `materialized ∧ ¬AffineDone ∧ copy absent` is reported `Lost` for a
