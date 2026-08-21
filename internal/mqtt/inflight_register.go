@@ -179,10 +179,23 @@ const (
 // the one this session wrote.
 //
 // Q2AffClaim carries the session-affine assignment claim for a shared QoS 2 copy, and
-// is not optional decoration: after a restart the recovered pending entry is the ONLY
-// route by which the claim reaches the terminal paths that must record the affine side
-// as complete (see the mqttPending comment on q2AffClaim). Empty for every ordinary
+// is not optional decoration: after a restart the recovered pending entry — or the
+// recovered RETIREMENT, where the stored PUBREL won that race — is the ONLY route by
+// which the claim reaches the terminal paths that must record the affine side as
+// complete (see the mqttPending comment on q2AffClaim). Empty for every ordinary
 // delivery.
+//
+// Q2AffCopy is the SUBJECT of the copy this delivery carried, and it is what binds the
+// pair together. It replaces an earlier incarnation field for two reasons: the copy
+// subject already CONTAINS the incarnation, so a separate nonce was redundant with it;
+// and a nonce alone cannot say WHICH copy the claim reference belongs to, so a register
+// naming another claim's valid subject and incarnation would credit that claim with this
+// delivery and let its own copy be acknowledged away unpublished — losing that message.
+// Every user therefore requires the loaded claim's CopySubject to EQUAL this value, and
+// recovery additionally requires the stored message at this register's own Dur/Seq to be
+// on it. A record carrying a Q2AffClaim without a valid Q2AffCopy is REFUSED rather than
+// interpreted — there are no releases, so that shape does not exist (F-065, and the
+// compatibility boundary in docs/ARCHITECTURE.md).
 // Retired marks the one state a register can reach that is NOT a PUBLISH-phase
 // delivery: the exchange is past PUBREC and its source's acknowledgement could not be
 // proven, so the payload must never be sent again but the source may still be re-offered
@@ -207,6 +220,7 @@ type mqttInflightRecord struct {
 	Claim      string `json:"claim,omitempty"`
 	ClaimSeq   uint64 `json:"claimseq,omitempty"`
 	Q2AffClaim string `json:"q2aff,omitempty"`
+	Q2AffCopy  string `json:"q2affcopy,omitempty"`
 	Retired    bool   `json:"retired,omitempty"`
 	// Cancelled marks a register whose delivery was NEVER TRANSMITTED: the allocation was
 	// withdrawn — by an UNSUBSCRIBE staging a drain, a discard, a takeover — while its
@@ -265,6 +279,16 @@ func mqttInflightRecordIdentityOK(r *mqttInflightRecord) bool {
 		return false
 	}
 	if r.QoS != 1 && r.QoS != 2 {
+		return false
+	}
+	// A record naming an affine assignment must also name its INCARNATION, and this
+	// is a refusal rather than a tolerated gap: _EMPTY_ is the deliberate OPT-OUT
+	// value at the fence in advanceQ2AffClaim, so a restored register carrying a claim
+	// subject with no valid incarnation would silently disable the fence and let a
+	// stale exchange record AffineDone against a replacement claim — the exact write
+	// F-065 exists to prevent. There are no releases, so a record of that shape does
+	// not exist; meeting one means the state is not interpretable and it is refused.
+	if r.Q2AffClaim != _EMPTY_ && mqttQ2AffCopyIncarnation(r.Q2AffCopy) == _EMPTY_ {
 		return false
 	}
 	return mqttValidInflightNonce(r.Nonce)
@@ -1048,7 +1072,7 @@ func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending) {
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) markInflightRegisterRetired(c *client, pi uint16, dur string, sseq, regSeq uint64,
-	nonce, q2AffClaim string) (uint64, bool) {
+	nonce, q2AffClaim, q2AffCopy string) (uint64, bool) {
 	as := sess.asm
 	if as == nil || pi == 0 || regSeq == 0 || nonce == _EMPTY_ {
 		return 0, false
@@ -1062,7 +1086,7 @@ func (sess *mqttSession) markInflightRegisterRetired(c *client, pi uint16, dur s
 	subject := mqttInflightSubject(idHash, gen, pi)
 	rec := &mqttInflightRecord{
 		PI: pi, Dur: dur, Seq: sseq, QoS: 2,
-		Nonce: nonce, Claim: regClaim, ClaimSeq: regClaimSeq, Q2AffClaim: q2AffClaim, Retired: true,
+		Nonce: nonce, Claim: regClaim, ClaimSeq: regClaimSeq, Q2AffClaim: q2AffClaim, Q2AffCopy: q2AffCopy, Retired: true,
 	}
 
 	var lastErr error
@@ -1220,7 +1244,7 @@ func (sess *mqttSession) secureRetiredSource(c *client, key mqttDeferredKey) boo
 	if rs == nil || rs.durable {
 		return true // nothing owed, or already durable
 	}
-	seq, ok := sess.markInflightRegisterRetired(c, rs.pi, key.jsDur, key.sseq, rs.regSeq, rs.nonce, rs.q2AffClaim)
+	seq, ok := sess.markInflightRegisterRetired(c, rs.pi, key.jsDur, key.sseq, rs.regSeq, rs.nonce, rs.q2AffClaim, rs.q2AffCopy)
 	if !ok {
 		return false
 	}
@@ -1880,6 +1904,11 @@ type mqttInflightSourceCache struct {
 	known     map[string]bool          // durable -> a lookup has been ATTEMPTED
 	resolved  map[string]bool          // durable -> that lookup completed, so nil means absent
 	states    map[string]mqttInflightSourceState
+	// subjects holds the SUBJECT of every source the load found LIVE, keyed the same way
+	// as states. It costs nothing — the message was read to classify the source anyway —
+	// and it is what lets an affine register be checked against the message it actually
+	// names rather than against its own two fields (F-065).
+	subjects map[string]string
 }
 
 func (as *mqttAccountSessionManager) newInflightSourceCache() *mqttInflightSourceCache {
@@ -1889,6 +1918,7 @@ func (as *mqttAccountSessionManager) newInflightSourceCache() *mqttInflightSourc
 		known:     make(map[string]bool),
 		resolved:  make(map[string]bool),
 		states:    make(map[string]mqttInflightSourceState),
+		subjects:  make(map[string]string),
 	}
 }
 
@@ -1986,12 +2016,51 @@ func (sc *mqttInflightSourceCache) resolve(recs []*mqttInflightRecord) {
 					sc.states[batch[i].key] = mqttInflightSourceComplete
 				case mqttInflightResponsePresent:
 					sc.states[batch[i].key] = mqttInflightSourceLive
+					sc.subjects[batch[i].key] = resp.Message.Subject
 				default:
 					// Indeterminate: stays Unknown, never Complete.
 				}
 			}
 		}
 	}
+}
+
+// affinePairProvenBySource reports whether a register's carried affine pair is PROVEN by
+// the source that register names, and — when it is not — what was observed instead.
+//
+// This is the third leg of the pair's binding, and it is the one neither of the others can
+// supply. The record's own shape is checked by mqttInflightRecordIdentityOK, and the claim
+// it names is required to name the carried copy back (q2AffClaimForCarriedCopy) — but both
+// of those are satisfied by a register that names some OTHER claim's copy while its own
+// delivery is a different message entirely. Such a register would credit that claim with a
+// delivery it never made and let its copy be acknowledged away unpublished, which is the
+// loss F-065 exists to prevent. The source is what says which copy this register was
+// written for, so it is the arbiter: for an affine register the source IS the copy.
+//
+// The predicate is deliberately POSITIVE, and that is a reversal of the first form built
+// here. That one refused only a live source naming a DIFFERENT subject, reasoning that an
+// absent or unreadable source is not evidence of a forgery — which is true, and beside the
+// point: nothing licenses installing an authoritative pair on the strength of a source
+// that was never read. Under the contradiction-only form an indeterminate consumer lookup
+// or message read, or a consumer that is authoritatively gone, admitted the forgery whole.
+// So only a live source whose subject IS the carried copy proves the pair; every other
+// state leaves it unproven and the record is reserved rather than interpreted.
+//
+// A COMPLETE source is not this predicate's business: no pair is installed for one, since
+// the register is dropped as a delivery whose exchange finished. Callers check that first.
+func (sc *mqttInflightSourceCache) affinePairProvenBySource(r *mqttInflightRecord) (observed string, proven bool) {
+	if r == nil || r.Q2AffClaim == _EMPTY_ {
+		return _EMPTY_, true // not an affine register: nothing for the source to bind
+	}
+	key := mqttPubRelSourceKey(r.Dur, r.Seq)
+	if sc.states[key] != mqttInflightSourceLive {
+		return _EMPTY_, false // never read, unreadable, or knowably gone: unproven
+	}
+	subject, ok := sc.subjects[key]
+	if !ok {
+		return _EMPTY_, false
+	}
+	return subject, subject == r.Q2AffCopy
 }
 
 // state returns a resolved source's classification, defaulting to Unknown for anything
@@ -2062,7 +2131,7 @@ func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) 
 //     and destroying it would strand the identifier the client is holding.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim string) bool {
+func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
 	as := sess.asm
 	// Opportunistic, and free when nothing is pending: one of the convergence points that
 	// is guaranteed to come round again on a live session, so a void verdict whose save was
@@ -2117,6 +2186,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		Claim:      regClaim,
 		ClaimSeq:   regClaimSeq,
 		Q2AffClaim: q2AffClaim,
+		Q2AffCopy:  q2AffCopy,
 	}
 
 	var lastErr error
@@ -2909,6 +2979,10 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 	// acknowledged and discarded rather than delivered. This is the half a memory-only
 	// retirement loses across a restart.
 	var retired []mqttRecoveredInflightReg
+	// Affine registers whose carried pair its own source does not prove. Kept apart only
+	// until the claim pass has run, then folded in as unowned members of their source's
+	// group: nothing here may be claimed, installed or settled.
+	var unprovenAffine []mqttRecoveredInflightReg
 	live := make([]mqttRecoveredInflightReg, 0, len(regs))
 	for _, fr := range regs {
 		if fr.rec.Cancelled || cancelledNonces[fr.rec.Nonce] {
@@ -2938,6 +3012,39 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 			}
 			drop = append(drop, fr.seq)
 			continue
+		}
+		if fr.rec.Q2AffClaim != _EMPTY_ && srcCache.state(fr.rec) != mqttInflightSourceComplete {
+			// An affine register's carried pair is installed only where the register's OWN
+			// SOURCE proves it, because for an affine delivery the source IS the copy.
+			// Anything else — a live source naming a DIFFERENT copy, a source that could
+			// not be read, a consumer that is knowably gone — leaves the pair unproven, and
+			// interpreting it anyway is what would credit another claim with this delivery
+			// and lose that claim's message. A COMPLETE source is excluded because no pair
+			// is installed for one: the arms below drop that register outright.
+			if observed, proven := srcCache.affinePairProvenBySource(fr.rec); !proven {
+				if observed != _EMPTY_ {
+					c.Errorf("MQTT: the in-flight register on packet identifier %d of client %q carries affine QoS 2 copy %q "+
+						"but its own delivery %s/%d is %q: the register is reserved, nothing is written to the claim it names, "+
+						"and new outbound QoS 1/2 allocation is withheld for this session",
+						fr.rec.PI, sess.id, fr.rec.Q2AffCopy, fr.rec.Dur, fr.rec.Seq, observed)
+				} else {
+					c.Errorf("MQTT: the in-flight register on packet identifier %d of client %q carries affine QoS 2 copy %q "+
+						"but its own delivery %s/%d could not be proven to be that copy: the register is reserved, nothing is "+
+						"written to the claim it names, and new outbound QoS 1/2 allocation is withheld for this session",
+						fr.rec.PI, sess.id, fr.rec.Q2AffCopy, fr.rec.Dur, fr.rec.Seq)
+				}
+				// It joins the duplicate-source grouping as an UNOWNED member rather than
+				// being set aside on its own, and that is the difference between reserving
+				// this identifier and actually failing closed. An unproven pair does not
+				// prove the identifier was never transmitted — the client may hold THIS one
+				// rather than a sibling's — so a sibling naming the same delivery must not
+				// be installed as an authoritative singleton with a cpending mapping, or the
+				// source's redelivery follows that mapping and re-sends the payload under a
+				// second identifier. As an unowned member it poisons every sibling of its
+				// source, exactly as a register whose claim could not be established does.
+				unprovenAffine = append(unprovenAffine, fr)
+				continue
+			}
 		}
 		if drainAmbiguous[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)] {
 			continue // already routed to opaque above: reserved, kept, never released
@@ -3018,6 +3125,10 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 			drop = append(drop, fr.seq)
 		}
 	}
+	// Never claimed, because a claim rewrite would move a record this pass refuses to
+	// interpret; grouped with the members whose claim FAILED, whose treatment is exactly
+	// what an unproven pair needs.
+	claimFailed = append(claimFailed, unprovenAffine...)
 	var retiredFailed, retiredDisplaced []mqttRecoveredInflightReg
 	retired, claimClosed, retiredFailed, retiredDisplaced = sess.claimRecoveredSharedInflight(c, retired)
 	displaced = append(displaced, retiredDisplaced...)
@@ -3087,7 +3198,8 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 			}
 		}
 		if unowned > 0 {
-			// At least one member of this source's group could not be claimed, so
+			// At least one member of this source's group is not this session's to install —
+			// another owner's claim, or an affine pair its own source does not prove — so
 			// nothing about the group is this session's to decide: every member is
 			// reserved, none is installed, and the source gets no cpending mapping.
 			// The members keep their identity in poisoned, because a same-object
@@ -3095,7 +3207,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 			// demotes it to the same reservation a fresh object would get.
 			if len(group) > unowned {
 				c.Errorf("MQTT: %d in-flight register(s) of client %q for delivery %s/%d share the source with %d "+
-					"register(s) another session owner holds: all are reserved, none is installed, and new outbound "+
+					"register(s) this pass may not install: all are reserved, none is installed, and new outbound "+
 					"QoS 1/2 allocation is withheld for this session",
 					len(group)-unowned, sess.id, group[0].fr.rec.Dur, group[0].fr.rec.Seq, unowned)
 			}
@@ -3201,6 +3313,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 			regSeq:     fr.seq,
 			nonce:      fr.rec.Nonce,
 			q2AffClaim: fr.rec.Q2AffClaim,
+			q2AffCopy:  fr.rec.Q2AffCopy,
 			durable:    fr.rec.Retired,
 		})
 	}
@@ -3261,6 +3374,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 			jsDur:      rv.rec.Dur,
 			sseq:       rv.rec.Seq,
 			q2AffClaim: rv.rec.Q2AffClaim,
+			q2AffCopy:  rv.rec.Q2AffCopy,
 			regSeq:     rv.seq,
 			regNonce:   rv.rec.Nonce,
 		}

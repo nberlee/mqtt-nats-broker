@@ -1522,7 +1522,8 @@ func testValidQ2AffClaim(idHash, gen, groupDur string, sseq uint64) *mqttQ2AffCl
 	return &mqttQ2AffClaim{
 		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: sseq,
 		ClaimHash:   hash,
-		CopySubject: mqttQ2AffCopySubject(idHash, gen, hash),
+		Nonce:       testQ2AffFixtureNonce,
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, hash, testQ2AffFixtureNonce),
 		AffDurable:  durable,
 		Phase:       mqttQ2AffClaimed,
 	}
@@ -1545,6 +1546,13 @@ func TestOrphanSweepAffineValidatorChecksEveryDerivedName(t *testing.T) {
 		{"wrong subject", mqttQ2AffClaimSubject(groupDur, sseq+1), nil},
 		{"wrong claim hash", subject, func(c *mqttQ2AffClaim) { c.ClaimHash = "0000000000000000" }},
 		{"wrong copy subject", subject, func(c *mqttQ2AffClaim) { c.CopySubject = "$MQTT.out.q2.elsewhere" }},
+		// An INTERNALLY VALID copy subject for a DIFFERENT incarnation. The arbitrary
+		// string above is rejected by any derivation, so it cannot show that the
+		// incarnation takes part in the binding; this row can, and it is the only shape
+		// that discriminates a binding derived without the nonce. F-065.
+		{"copy subject of another incarnation", subject, func(c *mqttQ2AffClaim) {
+			c.CopySubject = mqttQ2AffCopySubject(c.Winner, c.Gen, c.ClaimHash, mqttNewQ2AffGen())
+		}},
 		{"wrong affine durable", subject, func(c *mqttQ2AffClaim) { c.AffDurable = "$MQTT_Q2AFF_elsewhere" }},
 		{"unknown phase", subject, func(c *mqttQ2AffClaim) { c.Phase = "teleported" }},
 		{"both AffineDone and Lost", subject, func(c *mqttQ2AffClaim) { c.AffineDone, c.Lost = true, true }},

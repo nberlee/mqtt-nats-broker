@@ -243,6 +243,53 @@ PUBLISH for an exchange already past PUBREC — so its source is still re-offere
 forever, because the group consumer sets no `MaxDeliver`. That remainder is F-064's
 **residual 8**, and the sentence above still describes the resumed case only.
 
+**F-065, closed: a reaped claim no longer strands its copy — with a re-scoped
+guarantee.** What is guaranteed: no reaper deletes a claim on a copy reading older than
+its own last write; no actor writes an incarnation-specific fact onto a claim
+incarnation it did not observe; and every copy a materialization attempt proves present
+is withdrawn once that attempt proves no claim of that copy's own incarnation remains to
+authorize it.
+
+What is NOT guaranteed. This is a RE-SCOPE of the same kind F-063's re-scope
+records. The withdrawal is a **compensation, not an arbitration** — the claim lives on
+`$MQTT_qos2assign` and the copy on `$MQTT_out`, and JetStream cannot commit a write to
+both together (its atomic batches are per-stream), so no claim-side state can arbitrate a
+copy-side store. The compensation can therefore be lost three ways, and in each the copy
+is RETAINED rather than collected:
+
+1. the attempt crashes between proving the copy present and withdrawing it;
+2. the withdrawing delete is unconfirmed — **whether it failed definitely or
+   indeterminately**, because no confirming read follows it;
+3. the attempt's final claim observation is itself indeterminate, which retains the copy
+   by design rather than guessing at it.
+
+Three later events remove such a copy: the winner's ordinary session teardown, which
+deletes the affine consumer and takes its retained copies with it; a later orphan-sweep
+pass deleting that consumer once no session record references it; or, where a LATER
+incarnation now holds the claim subject, the delivery gate disposing the superseded copy
+on its next redelivery — a positive fact about a record just read, not an inference from
+an absence. Where none of the three occurs — a session that keeps running, never resumes,
+and whose claim subject no later incarnation claims — the copy is retained until an
+operator removes it or F-066's stream-identity remedy supplies the fact that would
+license collecting it. A retained copy is invisible to the client: it is never
+published, because the delivery gate refuses a copy no live claim of its own incarnation
+authorizes.
+
+**Additional residual, owned by F-064's accumulation half.** On the successful-PUBREC
+path, if the incarnation-fenced `AffineDone` write fails, the affine copy remains
+unacknowledged and the register is durably rewritten as retired. The immediate
+source-state probe sees the copy still live and therefore removes neither. Settlement then
+requires a later affine-copy delivery callback or recovery on the owning session's resume.
+If the client completes PUBCOMP, disconnects before AckWait redelivery, and keeps a
+non-expiring session that never resumes, the live session record makes orphan
+reconciliation preserve the `$MQTT_qos2assign` claim and, separately through its
+session-generation reference, the retired `$MQTT_inflight` register; the copy remains on
+the referenced affine consumer. Before F-065 this path already accumulated the
+copy-and-claim pair and unconditionally deleted the register. F-065 therefore adds one
+retired register per failed-`AffineDone` exchange in that population: **unbounded in
+count, bounded in kind, with the same growth law as the pre-existing pair**. F-064's
+accumulation bullet owns the live-generation reconciliation that must collect all three.
+
 **F-063, closed 2026-08-19: the broker no longer releases a source against a store
 response.** Because `$MQTT_out` is interest-retained, a copy stored after its consumer is
 gone succeeds and keeps nothing; the broker used to acknowledge the group source on the
@@ -571,14 +618,36 @@ Residuals:
   after a restart the redelivery waits out `AckWait`.
 - **An unaccountable identifier space withholds new QoS 1/2 deliveries rather than
   refusing the session.** If the durable identifier space cannot be fully accounted for
-  on resume — the walk failed, a register's body is corrupt, or two registers name one
-  delivery on different identifiers — the session stops allocating identifiers until a
+  on resume — the walk failed, a register's body is corrupt, two registers name one
+  delivery on different identifiers, or a register's affine QoS 2 pair is not PROVEN by its
+  own source (contradicted by it, or unprovable because the source could not be read or its
+  consumer is gone) — the session stops allocating identifiers until a
   later resume reads it cleanly: QoS 0 keeps flowing and reserved exchanges complete,
   but new QoS 1/2 deliveries are withheld and redelivered by AckWait. This is a
   deliberate choice over denying the CONNECT, and over letting a redelivery proceed
   under an identifier that cannot be proven to be the one the client holds. A session
   discard lifts it, since the identifier space it protected is retired with the
   incarnation.
+- **A copy whose header names a different assignment than its own subject is refused
+  forever, not collected.** Both parts of that pairing are well formed, so nothing can say
+  which of the two assignments the message belongs to — and this broker writes no such
+  copy, so per the compatibility boundary it is refused rather than interpreted. The copy
+  therefore stays on `$MQTT_out`, re-offered on the refusal backoff below, holding one
+  `MaxAckPending` slot of the session's affine consumer until the consumer is deleted with
+  its generation. Deleting it is the alternative and is worse: the assignment whose copy
+  subject it is may be live, and acknowledging the copy away would lose that message and
+  leave its claim stranded without `AffineDone`.
+- **A copy the broker cannot act on yet is re-offered on a backoff, so a refusal costs
+  latency rather than throughput.** Every refusal on the session-affine QoS 2 delivery path
+  hands the copy back with a NAK carrying a delay that doubles from 100 ms to a 30-second
+  cap, derived from JetStream's own delivery count for that message. The first retry is
+  therefore prompt, which is what the ordinary case needs (a copy is stored before its
+  claim records the phase, so a delivery can legitimately outrun that advance), and a
+  refusal that persists — an unreadable or absent claim record, an unavailable backend —
+  settles at the cap instead of spinning. The cost is bounded added latency on a claim that
+  becomes actionable late: up to one cap interval per exchange, once the backoff has grown.
+  A plain NAK was measured at 9214 re-offers in ten seconds for one copy, which is the
+  behaviour this replaces.
 - **A source acknowledgement that cannot be confirmed costs one discarded
   redelivery.** On the QoS 2 PUBREC path the source ack is confirmed; if that
   confirmation fails the source is *retired* — left unacknowledged on purpose, so

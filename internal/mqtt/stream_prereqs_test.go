@@ -848,6 +848,12 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		interest()
 		d["AllowMsgTTL"] = fieldDisposition{kind: dispWaived, reason: "this owner sends no Nats-TTL header, so the capability is inert if enabled"}
 		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispRejected, errWant: "inactivity"}
+		// Overrides the interest-commons waiver above: since F-065 this owner DOES
+		// delete a message here — a materialization attempt withdraws the exact
+		// sequence of a copy no claim of its incarnation can authorize, and denied,
+		// that copy NAK-loops behind the fail-closed delivery gate for the session's
+		// whole life. DenyPurge stays waived: nothing purges by subject.
+		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
 		d["Duplicates"] = fieldDisposition{kind: dispWaived, reason: "the drained-PUBREL msgId is best-effort narrowing only; arbitration is the durable drain record, never the window (pubrel_correlation.go)"}
 	case mqttRetainedMsgsStreamName:
 		register()

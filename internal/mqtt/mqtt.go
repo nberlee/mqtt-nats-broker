@@ -1101,6 +1101,14 @@ type mqttAccountSessionManager struct {
 	// "still running" look identical to a reader. Nil in production.
 	testQ2AffMoveDone func(claimSubject string, res mqttQ2AffMoveResult)
 
+	// testQ2AffCopyAck, when non-nil, replaces the CONFIRMED acknowledgement of an
+	// affine copy on the retired-source recovery route. That route's correctness is an
+	// ORDER — record AffineDone, then confirm the ack, then forget the retirement — and
+	// the order is only observable if a test can make each step succeed or fail
+	// independently. A real confirmed ack needs a live JetStream delivery, which cannot
+	// be staged around a seeded claim. Nil in production.
+	testQ2AffCopyAck func(reply string) error
+
 	// testQ2AffPreMaterialize, when non-nil, runs immediately BEFORE the
 	// claimed->materialized CAS, after the copy has been stored. It is the only
 	// seam inside the window where the copy is visible to a live affine consumer
@@ -2289,6 +2297,15 @@ type mqttPending struct {
 	// recorded from the terminal paths (PUBREC, expiry, oversize discard), which
 	// see the packet identifier and nothing else. See qos2_shared_affine.go.
 	q2AffClaim string
+	// q2AffCopy is the SUBJECT of the copy this delivery carried, OBSERVED by the
+	// delivery gate rather than derived from anything. It travels with the claim
+	// subject because the terminal transition must be bound to the copy it belongs to:
+	// re-reading whatever claim occupies the subject at PUBREC time would credit a
+	// replacement election with a delivery it never made, and a bare incarnation
+	// cannot say WHICH copy a claim reference is for — so a reference naming another
+	// claim's valid subject would let that claim's own copy be acknowledged away
+	// unpublished (F-065).
+	q2AffCopy string
 
 	// regSeq is the stream sequence of this delivery's durable in-flight register on
 	// $MQTT_inflight, and regNonce the register's immutable identity. Every delete
@@ -2303,12 +2320,15 @@ type mqttPending struct {
 	// before any sequence for it exists. regSeq appears only on confirmation.
 	regSeq   uint64
 	regNonce string
-	// regForeign marks a reservation left by a LOST shared-claim arbitration: the
-	// register at regSeq is another session object's claimed identity. The identifier
-	// stays reserved (the client may hold it, and the non-zero regSeq keeps
-	// dropUnredeliverableRetained from reading it as a retained send), but no terminal
-	// path may settle the record — deleting a register this object does not own would
-	// destroy the rival's only durable identity. See inflight_register.go.
+	// regForeign marks a reservation NO TERMINAL PATH MAY SETTLE. The identifier stays
+	// reserved (the client may hold it, and the non-zero regSeq keeps
+	// dropUnredeliverableRetained from reading it as a retained send), but nothing acts
+	// on the record behind it. Two states reach it, and the flag is one flag because the
+	// prohibition is the same: the register is another session object's claimed identity
+	// (a LOST shared-claim arbitration), where deleting it would destroy the rival's only
+	// durable identity; or it is a record this object cannot INTERPRET — an affine pair
+	// its own source contradicts — where settling it would destroy the evidence on the
+	// strength of the state that was just refused. See inflight_register.go.
 	regForeign bool
 
 	// (see the session's piSpaceIncomplete for the other half of R3)
@@ -10154,12 +10174,12 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 // qos2_shared_affine.go.
 //
 // Lock held on entry
-func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject, q2AffClaim string) {
+func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject, q2AffClaim, q2AffCopy string) {
 	ack := sess.untrackPublishEntry(pi)
 	if ack == nil {
-		return _EMPTY_, _EMPTY_
+		return _EMPTY_, _EMPTY_, _EMPTY_
 	}
-	return ack.jsAckSubject, ack.q2AffClaim
+	return ack.jsAckSubject, ack.q2AffClaim, ack.q2AffCopy
 }
 
 // untrackPublishEntry is untrackPublish returning the whole removed entry, so a
@@ -10205,6 +10225,7 @@ type mqttRetiredSource struct {
 	regSeq     uint64 // the register's current sequence: CAS base while unmarked, delete target once settled
 	nonce      string // the register's identity, so a later CAS can prove the record is ours
 	q2AffClaim string // preserved across the rewrite; empty for an ordinary delivery
+	q2AffCopy  string // the copy SUBJECT this delivery carried, which binds the claim reference to it (F-065)
 	durable    bool
 }
 
@@ -10275,6 +10296,161 @@ func (sess *mqttSession) sourceRetiredLocked(jsDur string, sseq uint64) bool {
 	return owed
 }
 
+// settleRetiredAffineSource is settleRetiredSource for a SESSION-AFFINE shared QoS 2
+// copy, and it exists because that copy's claim owes an affine-side completion that
+// an ordinary source ack does not discharge.
+//
+// The route here is the one F-065's review found unowned. A successful PUBREC stores
+// the correlated PUBREL BEFORE it records AffineDone, so a crash between the two
+// leaves both the PUBREL and the register; on restart the PUBREL wins over
+// pendingPublish, the live register is classified RETIRED rather than restored, and
+// its claim reference lands in mqttRetiredSource. Nothing then discharged the affine
+// side: the affine delivery callback went straight to trackPublish, which returns
+// identifier zero because the restored PUBREL already reserves that source, and
+// returned without acknowledging the copy — so the copy NAK-looped and the claim
+// never completed, which is F-065's own harm re-entered through recovery.
+//
+// Three dispositions, and the ORDER inside each is the correctness property:
+//
+//   - The claim record is gone or unreadable: acknowledge NOTHING and keep the
+//     retirement. An absent claim is not a fact (feedback_absence_is_not_a_fact), so
+//     the copy NAKs and a later attempt resolves it.
+//   - The claim names a DIFFERENT incarnation: that is a positive fact — a live
+//     record naming another copy subject — so this copy can never be delivered by
+//     anybody. Confirm-ack it and clear the retirement, and write NOTHING onto the
+//     replacement: it made no delivery and must not be credited with one.
+//   - The claim is this copy's own incarnation: record AffineDone FIRST, fenced to
+//     that incarnation, then confirm the copy ack, then clear the retirement and its
+//     register. A failure at either of the first two steps retains BOTH cleanup
+//     records so the next redelivery retries — persist before ack, ack before
+//     forget, exactly as mqttFinishQ2AffineDelivery and secureRetiredSource require.
+//
+// Lock NOT held on entry: every step issues a JetStream request.
+func (sess *mqttSession) settleRetiredAffineSource(c *client, jsDur string, sseq uint64,
+	reply, deliveredCopy, claimSubject, carriedCopy string) {
+
+	as := sess.asm
+	if as == nil {
+		return
+	}
+	as.mu.RLock()
+	ackHook := as.testQ2AffCopyAck
+	as.mu.RUnlock()
+	confirm := as.jsa.confirmAck
+	if ackHook != nil {
+		confirm = ackHook
+	}
+	// The pair comes from the RETIREMENT's own durable record, not from arguments derived
+	// at this delivery: the register is what survived the restart, and the delivered
+	// subject only says which copy is in hand. Falling back to the caller's values would
+	// make the persisted pair dead data — which is how a mutation removing it survived.
+	sess.mu.Lock()
+	if rs := sess.srcAckOwed[mqttDeferredKey{jsDur, sseq}]; rs != nil {
+		if rs.q2AffClaim != _EMPTY_ {
+			claimSubject = rs.q2AffClaim
+		}
+		if rs.q2AffCopy != _EMPTY_ {
+			carriedCopy = rs.q2AffCopy
+		}
+	}
+	sess.mu.Unlock()
+
+	// The copy IN HAND is bound to the carrier FIRST, before any arm that can acknowledge
+	// one, because what an acknowledgement destroys is the copy in hand and not the
+	// carrier. Every disposition below proves something about carriedCopy; only this
+	// equality makes that proof a statement about the message actually being settled.
+	//
+	// Review found the previous order wrong for exactly that reason: the superseded arm
+	// proved the CARRIER belonged to an older incarnation and then acknowledged whatever
+	// was delivered, so a third, cross-assignment copy passed the successor guard and was
+	// destroyed — a live assignment's message, lost, with its claim stranded.
+	//
+	// Reaching this refusal means the message at this retirement's own source sequence is
+	// not the copy the carrier names, which the pair's source binding refuses on recovery
+	// and which no in-process path can produce (the retirement carries the very subject its
+	// delivery was handed). A stream sequence names one immutable message, so the safe
+	// direction is to acknowledge nothing.
+	if deliveredCopy != _EMPTY_ && deliveredCopy != carriedCopy {
+		c.Warnf("MQTT: refusing to settle retired affine QoS 2 source %s/%d: the copy in hand is %q while the "+
+			"retirement carries %q, so nothing here may acknowledge either", jsDur, sseq, deliveredCopy, carriedCopy)
+		sess.refuseQ2AffCopy(reply)
+		return
+	}
+
+	// ONE helper turns the carried pair back into a claim, so this route is bound exactly
+	// as the live one is: attributable record, and it must name the copy the carrier was
+	// created for.
+	claim, cerr := as.q2AffClaimForCarriedCopy(claimSubject, carriedCopy)
+	switch {
+	case errors.Is(cerr, errQ2AffCarriedCopySuperseded):
+		// A SUPERSEDED INCARNATION of this claim subject: the live record is attributable
+		// and names a different copy, so nothing will ever authorize the one this
+		// retirement carries. Disposing of it is what keeps the redelivery from NAK-looping
+		// for the life of the session, and the equality above is what makes the disposal
+		// safe — the copy in hand IS the carrier this arm just proved superseded, so it is
+		// neither the successor's own nor some third assignment's.
+		//
+		// A caller with NO copy in hand (a settlement driven from the retirement alone)
+		// reaches here having proven nothing about what an acknowledgement would destroy,
+		// so disposal is refused: the superseded copy is collected by the delivery gate's
+		// own terminal arm on its next redelivery, where a delivered subject exists.
+		if deliveredCopy == _EMPTY_ {
+			c.Warnf("MQTT: refusing to settle retired affine QoS 2 source %s/%d: its carrier %q is superseded but "+
+				"no copy is in hand, so nothing here may acknowledge one", jsDur, sseq, carriedCopy)
+			return
+		}
+		if aerr := confirm(reply); aerr != nil {
+			c.Warnf("MQTT: could not acknowledge a superseded affine QoS 2 copy for retired source %s/%d: %v", jsDur, sseq, aerr)
+			return
+		}
+		sess.clearRetiredSource(c, jsDur, sseq)
+		return
+	case cerr != nil:
+		// Unattributable or unreadable: this route both acknowledges and mutates, so it
+		// refuses like every other direct decision path. Nothing is acked and the
+		// retirement is kept for a later attempt.
+		c.Warnf("MQTT: refusing to settle retired affine QoS 2 source %s/%d: %v", jsDur, sseq, cerr)
+		sess.refuseQ2AffCopy(reply)
+		return
+	case claim == nil:
+		sess.refuseQ2AffCopy(reply) // absent: never guess
+		return
+	}
+	// The SAME nonce-fenced finish path the live delivery uses — record AffineDone,
+	// then confirm the copy ack, then reap — rather than a second transition site of its
+	// own. The plan requires that reuse, and the reason is not tidiness: an independent
+	// CAS here would be an eleventh claim-transition call site with its own
+	// load-to-transition window, needing its own fence and its own mutation to prove it.
+	// A failure inside it acknowledges nothing, which is exactly what must happen: the
+	// retirement then stays for the next redelivery to retry.
+	// Only a CONFIRMED copy acknowledgement licenses forgetting the retirement: it is
+	// what suppresses redelivery, so clearing it on an unproven ack would leave the copy
+	// re-offerable with the state that governs it already gone. A recorded-but-unacked
+	// outcome therefore leaves the retirement for the next redelivery to retry.
+	if _, acked := c.mqttFinishQ2AffineDelivery(claimSubject, carriedCopy, reply); !acked {
+		return
+	}
+	sess.clearRetiredSource(c, jsDur, sseq)
+}
+
+// clearRetiredSource drops a settled retirement and deletes the retired register at
+// its exact sequence. Split out of settleRetiredSource so the affine route above
+// reaches the identical cleanup after its own, longer proof.
+func (sess *mqttSession) clearRetiredSource(c *client, jsDur string, sseq uint64) {
+	key := mqttDeferredKey{jsDur, sseq}
+	sess.mu.Lock()
+	var regSeq uint64
+	if rs := sess.srcAckOwed[key]; rs != nil {
+		regSeq = rs.regSeq
+	}
+	delete(sess.srcAckOwed, key)
+	sess.mu.Unlock()
+	if regSeq != 0 && sess.asm != nil {
+		sess.asm.deleteInflightRegister(regSeq)
+	}
+	c.Debugf("MQTT: settled retired QoS 2 source %s/%d for client %q", jsDur, sseq, sess.id)
+}
+
 // settleRetiredSource acknowledges a retired source's delivery attempt with
 // CONFIRMATION, using THIS attempt's reply subject — never the stale one whose
 // acknowledgement could not be proven — and releases the entry only once that lands. A
@@ -10288,21 +10464,10 @@ func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint6
 			jsDur, sseq, sess.id, err)
 		return
 	}
-	key := mqttDeferredKey{jsDur, sseq}
-	sess.mu.Lock()
-	var regSeq uint64
-	if rs := sess.srcAckOwed[key]; rs != nil {
-		regSeq = rs.regSeq
-	}
-	delete(sess.srcAckOwed, key)
-	sess.mu.Unlock()
 	// The source is provably gone, so the retired register has nothing left to protect
 	// and is removed at its exact sequence — otherwise every retirement would leave a
 	// record behind for the orphan sweep to collect much later.
-	if regSeq != 0 && sess.asm != nil {
-		sess.asm.deleteInflightRegister(regSeq)
-	}
-	c.Debugf("MQTT: settled retired QoS 2 source %s/%d for client %q", jsDur, sseq, sess.id)
+	sess.clearRetiredSource(c, jsDur, sseq)
 }
 
 // retrackPublishLocked reinstates an entry removed by untrackPublishEntry, under
@@ -12832,6 +12997,14 @@ func mqttMaxQoS2FormSize(pp *mqttPublish, delivered int, retained bool) int {
 	if claim := mqttQoS2ClaimRecordMax(); claim > total {
 		total = claim
 	}
+	// ASSIGNMENT CLAIM form: the shared-subscription election record on
+	// $MQTT_qos2assign. Payload-independent like the two above, so it too can dominate
+	// for a small payload with a short topic, and unbudgeted it wedges the group
+	// durable from the other side — no election can be won, so nothing is ever acked.
+	// See qos2_shared_affine.go.
+	if aff := mqttQ2AffClaimRecordMax(); aff > total {
+		total = aff
+	}
 	// AFFINE form: the copy written when this message is delivered to a shared
 	// subscription at effective QoS 2 and moved onto the chosen session's own
 	// subject. Same class of eternal wedge: the claim never materializes, the group
@@ -13981,7 +14154,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 
 	pubRecFailed := isPubRec && reason >= 0x80
 
-	var jsAckSubject, q2AffClaim string
+	var jsAckSubject, q2AffClaim, q2AffCopy string
 	var removed *mqttPending
 	// Set when this PUBREC stored a PUBREL for a DRAINED source, whose claim only a
 	// confirmed PUBREL may release.
@@ -13993,9 +14166,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		return errMQTTInvalidSession
 	}
 	if ack := sess.pendingPublish[pi]; ack != nil && ack.regForeign {
-		// A FOREIGN reservation: the register behind this identifier is another
-		// session object's claimed identity (a lost shared-claim arbitration), so the
-		// exchange is not this object's to advance. Acting here would convert the
+		// A FOREIGN reservation: the register behind this identifier is either another
+		// session object's claimed identity (a lost shared-claim arbitration) or a record
+		// recovery could not interpret, so the exchange is not this object's to advance. Acting here would convert the
 		// reservation into durable state for an exchange this object does not own —
 		// a PUBREC would store an UNCORRELATED PUBREL (the bodyless entry has no
 		// source), which a later resume reads as identifier-first with no source
@@ -14013,7 +14186,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	}
 	removed = sess.untrackPublishEntry(pi)
 	if removed != nil {
-		jsAckSubject, q2AffClaim = removed.jsAckSubject, removed.q2AffClaim
+		jsAckSubject, q2AffClaim, q2AffCopy = removed.jsAckSubject, removed.q2AffClaim, removed.q2AffCopy
 	}
 	// PUBACK / failed PUBREC freed an in-flight slot (a successful PUBREC is
 	// net-zero under a Receive Maximum and yields no NAKs): release withheld
@@ -14118,7 +14291,73 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// CONFIRMED source ack.
 	switch {
 	case q2AffClaim != _EMPTY_:
-		c.mqttFinishQ2AffineDelivery(q2AffClaim, jsAckSubject)
+		// RETIRE FIRST, on a successful PUBREC, and only then attempt the affine side.
+		// The order is the correctness property and the reason is the same one the
+		// unconfirmed-source-ack arm below states: the in-memory half is what suppresses
+		// a redelivery arriving on this broker, and this handler has ALREADY removed the
+		// pending entry and its source-to-identifier mapping. The completion below can
+		// spend several JetStream load-and-CAS retries failing, and if AckWait expires
+		// inside that interval the delivery callback finds no retirement, trackPublish
+		// finds no mapping, allocates a FRESH identifier and re-sends a payload the
+		// client has already answered with PUBREC. Installing the retirement afterwards
+		// leaves exactly that window open.
+		//
+		// Gated on a SUCCESSFUL PUBREC, and the gate is the point rather than a
+		// precaution. This case is selected by q2AffClaim alone, so it also sees a
+		// NEGATIVE PUBREC — and there no pendingPubRel entry and no PUBREL record are
+		// created, so there is no PUBCOMP and therefore no event at which an unlanded
+		// durable mark could ever be retried. Retiring there would install machinery
+		// whose retry point does not exist. A rejected delivery keeps its pre-F-065
+		// behaviour instead: complete the affine side if it can be, then release the
+		// register. Nothing is stranded by that, because with no PUBREL there is nothing
+		// for recovery to arbitrate against and the live copy stays independently
+		// attributable — its claim from its header, its incarnation from its own subject.
+		affineRetired := isPubRec && !pubRecFailed && removed != nil
+		var retiredKey mqttDeferredKey
+		if affineRetired {
+			retiredKey = mqttDeferredKey{removed.jsDur, removed.sseq}
+			sess.mu.Lock()
+			sess.retireSourceLocked(removed.jsDur, removed.sseq, &mqttRetiredSource{
+				pi:         pi,
+				regSeq:     removed.regSeq,
+				nonce:      removed.regNonce,
+				q2AffClaim: q2AffClaim,
+				q2AffCopy:  q2AffCopy,
+			})
+			sess.mu.Unlock()
+		}
+		if recorded, _ := c.mqttFinishQ2AffineDelivery(q2AffClaim, q2AffCopy, jsAckSubject); recorded {
+			// Discharged, so the retirement has nothing left to suppress and no durable
+			// mark was ever written for it: drop it here rather than leaving one to
+			// outlive its exchange and be re-established by every later resume. The
+			// register goes with it, because its claim and incarnation are no longer the
+			// only carrier of anything.
+			if affineRetired {
+				sess.mu.Lock()
+				delete(sess.srcAckOwed, retiredKey)
+				sess.mu.Unlock()
+			}
+			sess.deleteInflightRegisterFor(removed)
+			break
+		}
+		// NOT recorded. The retirement stays, and now it needs its durable half: the
+		// PUBREL is already stored and its delivery is in flight, so a PUBCOMP that found
+		// no retirement would acknowledge that PUBREL and remove the last durable
+		// evidence that this source is past PUBREC. The register is that retirement's
+		// durable half and is deliberately kept.
+		if affineRetired {
+			// An unproven acknowledgement is ambiguous: read the source first, so a
+			// retirement with nothing to suppress is dropped rather than made durable.
+			if !sess.resolveRetiredSource(c, retiredKey) {
+				sess.secureRetiredSource(c, retiredKey)
+			}
+			c.Warnf("MQTT: keeping the in-flight register of packet identifier %d for client %q and retiring its source: "+
+				"the affine side of assignment %q is unproven", pi, sess.id, q2AffClaim)
+			break
+		}
+		// A rejected delivery: no retirement, and the register is released as it was
+		// before F-065. The copy stays unacknowledged, so AckWait re-offers it and the
+		// gate re-runs once the claim store heals.
 		sess.deleteInflightRegisterFor(removed)
 	case drainedPubRel:
 		// Deliberately nothing — not even the register delete. See the intent block
@@ -14191,6 +14430,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 				regSeq:     removed.regSeq,
 				nonce:      removed.regNonce,
 				q2AffClaim: removed.q2AffClaim,
+				q2AffCopy:  removed.q2AffCopy,
 			})
 			sess.mu.Unlock()
 			// An unproven acknowledgement is AMBIGUOUS, and most often it landed with only
@@ -15017,7 +15257,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// discarded rather than sent has no identifier to make durable, so it should not
 	// pay a round trip for one. Still strictly BEFORE the enqueue below, which is the
 	// send.
-	if isNew && !sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_) {
+	if isNew && !sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_) {
 		return
 	}
 	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, subID, originalTopic, msg, props) {

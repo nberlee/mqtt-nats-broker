@@ -1700,7 +1700,12 @@ func validateOrphanQ2AffClaim(subject string, c *mqttQ2AffClaim) error {
 	if want := mqttQ2AffClaimHash(c.GroupDurable, c.SourceSeq); c.ClaimHash != want {
 		return fmt.Errorf("claim on %q carries claim hash %q (want %q)", subject, c.ClaimHash, want)
 	}
-	if want := mqttQ2AffCopySubject(c.Winner, c.Gen, c.ClaimHash); c.CopySubject != want {
+	// Derived WITH the incarnation nonce, so a claim whose CopySubject is valid for
+	// some OTHER incarnation is refused rather than acted on: the reaper and the
+	// recovery arms read CopySubject to decide, and a subject that does not follow
+	// from this record's own fields makes them inspect a copy the record does not own
+	// (F-065).
+	if want := mqttQ2AffCopySubject(c.Winner, c.Gen, c.ClaimHash, c.Nonce); c.CopySubject != want {
 		return fmt.Errorf("claim on %q names copy subject %q (want %q)", subject, c.CopySubject, want)
 	}
 	if _, _, want := mqttQ2AffineNames(c.Winner, c.Gen); c.AffDurable != want {
@@ -1878,7 +1883,8 @@ func (as *mqttAccountSessionManager) discardAbsentWinnerClaim(s *Server, e *mqtt
 	// Discarded ONLY. Not AffineDone, which would assert a delivery that never
 	// happened, and not SourceAcked, which would let a source redelivery elect a
 	// fresh winner if the group ack never actually committed.
-	updated, _, aerr := as.advanceQ2AffClaim(e.subject, e.claim.Winner, e.claim.Gen,
+	// No nonce: this rests on the WINNER's disposition, a session fact.
+	updated, _, aerr := as.advanceQ2AffClaim(e.subject, e.claim.Winner, e.claim.Gen, _EMPTY_, _EMPTY_,
 		func(c *mqttQ2AffClaim) { c.Discarded = true })
 	if aerr != nil || updated == nil {
 		return mqttQoS2SweepDeferred
@@ -1982,7 +1988,8 @@ func (as *mqttAccountSessionManager) deleteOrphanQ2AffConsumers(s *Server, inv [
 				break
 			}
 			*budget--
-			if _, _, aerr := as.advanceQ2AffClaim(e.subject, cand.idHash, cand.gen,
+			// No nonce: the generation's consumer is being deleted, a session fact.
+			if _, _, aerr := as.advanceQ2AffClaim(e.subject, cand.idHash, cand.gen, _EMPTY_, _EMPTY_,
 				func(c *mqttQ2AffClaim) { c.Discarded = true }); aerr != nil {
 				stalled = true
 				break

@@ -222,9 +222,15 @@ func (p mqttQ2AffPhase) rank() int {
 // SEVEN of the ten transition call sites assert it; three deliberately do not,
 // because the facts they record — SourceAcked and AffineDone — are owner-independent
 // statements about the group delivery and about a copy the delivery gate has already
-// attributed. Those three rest on the per-subject CAS alone, which is sufficient for
-// an owner-independent fact and would not be for an ownership decision. F-033's audit
-// states the split rather than glossing it as a universal check.
+// attributed. F-033's audit states the split rather than glossing it as a universal
+// check.
+//
+// Of those three, only the TWO SourceAcked writes rest on the per-subject CAS alone,
+// which is sufficient for a fact about the source MESSAGE and would not be for an
+// ownership decision. AffineDone is owner-independent but NOT unfenced: it states
+// something about ONE incarnation's own copy, so F-065 fenced it on the claim's Nonce
+// and on the copy subject the delivery carried. Owner-independent is not the same as
+// unfenced, and the two questions are answered by different fields.
 //
 // The subject identifies one source message only within one incarnation of $MQTT_msgs:
 // recreating that stream restarts its sequences while these claims survive. That is
@@ -235,6 +241,18 @@ type mqttQ2AffClaim struct {
 	GroupDurable string `json:"gdur"`
 	SourceSeq    uint64 `json:"sseq"`
 	ClaimHash    string `json:"chash"`
+	// Nonce identifies this INCARNATION of the claim subject, and is what stops a
+	// stale actor from acting on a successor's claim. The subject is keyed by group
+	// durable and source sequence, and its create-only election can be won AGAIN
+	// after a reap — by a group delivery callback that was already dispatched when
+	// the reap happened — so Winner+Gen+ClaimHash name the assignment but not the
+	// attempt. Without it two incarnations share one copy subject, and a replacement
+	// adopts the copy a superseded materializer is about to withdraw.
+	//
+	// Minted once, at the election, and NEVER rewritten: renaming it would rename a
+	// copy the winner is already reading. Same form as Gen, so its width is an
+	// accounting invariant rather than "some subject token". F-065.
+	Nonce string `json:"nonce"`
 	// CopySubject and AffDurable record the EXACT destination the winner was
 	// elected with, so a contender materializing on the winner's behalf writes
 	// where that generation (and only that generation) can read it, instead of
@@ -474,10 +492,185 @@ func mqttQ2AffClaimSubject(groupDurable string, sseq uint64) string {
 }
 
 // mqttQ2AffCopySubject is the claim-specific copy subject on $MQTT_out. The
-// generation namespaces it against a later session of the same client ID; the
-// claim hash makes the store a create-only CAS with exactly one winner.
-func mqttQ2AffCopySubject(idHash, gen, claimHash string) string {
-	return mqttQ2AffineSubjectPrefix + idHash + "." + gen + "." + claimHash
+// generation namespaces it against a later session of the same client ID; the claim
+// hash makes the store a create-only CAS with exactly one winner; and the claim's
+// NONCE namespaces it against a later INCARNATION of the same claim subject, so a
+// replacement claim can never read, adopt or lose the copy of the incarnation it
+// replaced (F-065). It stays under the affine consumer's generation-prefixed filter,
+// so the consumer's three names are unaffected.
+func mqttQ2AffCopySubject(idHash, gen, claimHash, nonce string) string {
+	return mqttQ2AffineSubjectPrefix + idHash + "." + gen + "." + claimHash + "." + nonce
+}
+
+// errQ2AffCarriedCopySuperseded reports the one carried-pair failure that is a POSITIVE
+// fact rather than a refusal: the record on the subject is attributable and simply names a
+// different copy, so nothing will ever authorize the copy this carrier was created for.
+//
+// It is separate from every other error out of q2AffClaimForCarriedCopy because the two
+// licence opposite actions. An unattributable or unreadable record licenses nothing — no
+// write, no acknowledgement. A superseded copy may be DISPOSED of, which is what keeps a
+// retired source's redelivery from NAK-looping for the life of the session; the delivery
+// gate draws the same distinction on the same evidence. The claim is returned alongside
+// this error so a caller can check the copy IN HAND against the live record before
+// disposing of anything, since the successor's own copy must never be destroyed.
+//
+// It is deliberately NARROWER than "the copy subjects differ". A carried copy belonging to
+// a DIFFERENT assignment is not superseded by anything — the claim that owns it may be
+// perfectly live — so it is an ordinary refusal, and only a copy of THIS assignment under
+// another incarnation reaches this error. Review found the wider form reachable: a carrier
+// naming a foreign claim survives the immediate transition (which refuses), and the
+// retirement it leaves behind then acknowledged the foreign claim's live copy away on its
+// next redelivery.
+var errQ2AffCarriedCopySuperseded = errors.New("the claim on this subject names a different copy")
+
+// q2AffClaimForCarriedCopy loads the claim a carrier names and returns it ONLY if it
+// agrees with the copy that carrier was created for. It is the single place that turns a
+// carried (claim subject, copy subject) pair back into a claim, so every consumer of such
+// a pair gets the same binding.
+//
+// Three things have to hold, and none of them follows from the others:
+//
+//   - the record must be operationally attributable, which binds it to its own subject
+//     and source (q2AffClaimUsableForDecision);
+//   - it must name THIS copy. A pair naming some other claim's valid subject would
+//     otherwise credit that claim with this delivery, and its own copy would then be
+//     acknowledged away unpublished — losing that message. This is the check a bare
+//     incarnation cannot make, because the incarnation says which ATTEMPT, not which COPY;
+//   - the carried copy subject must itself be well formed, so an empty or malformed value
+//     cannot pass by matching an equally malformed record.
+//
+// Returns nil with no error when the claim is simply absent, which every caller treats as
+// "nothing to record" rather than as a failure. F-065.
+func (as *mqttAccountSessionManager) q2AffClaimForCarriedCopy(claimSubject, carriedCopy string) (*mqttQ2AffClaim, error) {
+	if mqttQ2AffCopyIncarnation(carriedCopy) == _EMPTY_ {
+		return nil, fmt.Errorf("carried copy subject %q is not one this broker emits", carriedCopy)
+	}
+	claim, _, err := as.loadQ2AffClaim(claimSubject)
+	if err != nil {
+		return nil, err
+	}
+	if claim == nil {
+		return nil, nil
+	}
+	if verr := q2AffClaimUsableForDecision(claimSubject, claim); verr != nil {
+		return nil, verr
+	}
+	if claim.CopySubject != carriedCopy {
+		// A mismatch is SUPERSEDED only when the carried copy is a copy of THIS assignment
+		// under a different incarnation — same owner, same generation, same claim hash, so
+		// the two subjects differ in their incarnation token and nothing else. That is the
+		// only shape a reap-and-re-election produces, and it is the only one whose copy
+		// nothing can ever authorize.
+		//
+		// A copy of a DIFFERENT assignment is not superseded by anything: it belongs to
+		// another claim that may be perfectly live, and disposing of it on this evidence
+		// destroys that claim's message — the very loss the pair exists to prevent,
+		// committed by the remedy for it. So it is refused outright instead.
+		if q2AffCopyIsSupersededIncarnationOf(claim, carriedCopy) {
+			return claim, fmt.Errorf("claim on %q names copy %q, not the carried %q: %w",
+				claimSubject, claim.CopySubject, carriedCopy, errQ2AffCarriedCopySuperseded)
+		}
+		return claim, fmt.Errorf("claim on %q names copy %q, and the carried %q is a copy of a DIFFERENT assignment",
+			claimSubject, claim.CopySubject, carriedCopy)
+	}
+	return claim, nil
+}
+
+// A REFUSED affine copy is re-offered on an exponential backoff, and the reason is a
+// measurement rather than a preference: a plain NAK is re-offered immediately, so a refusal
+// state that PERSISTS becomes a request storm. One copy under an absent claim was measured
+// at 9214 deliveries in ten seconds — a tight load-and-refuse loop against JetStream, with
+// one log line per turn.
+//
+// The states that reach it are not exotic. docs/CONFORMANCE.md states three windows in
+// which a copy legitimately outlives the claim that would authorize it (a crash, a delete
+// that could not be confirmed, an indeterminate final reading), and an unreadable claim
+// record or an unavailable backend produces the same shape for as long as it lasts. So the
+// storm is reachable in ordinary degraded operation, not only from a corrupt record.
+//
+// The delay is derived from JetStream's OWN delivery count for that message, which is why
+// this needs no per-copy state to remember: no map to grow, nothing to evict, and nothing
+// that a broker restart loses. The first refusal is paced at the base delay, which keeps
+// the COMMON race fast — a copy delivered before its claim's phase advance is a normal
+// interleaving, not an error, and it resolves in one retry — and a persistent refusal
+// settles at the cap, which also paces its diagnostics.
+const (
+	mqttQ2AffRefusalBaseDelay = 100 * time.Millisecond
+	mqttQ2AffRefusalMaxDelay  = 30 * time.Second
+	mqttQ2AffRefusalMaxShift  = 12 // 100ms << 12 is already past the cap
+)
+
+// mqttQ2AffRefusalNak is a NAK carrying the backoff for a delivery count. Exported as a
+// value rather than sent here so both the gate and the retired settlement use one rule.
+func mqttQ2AffRefusalNak(deliveryCount uint64) []byte {
+	delay := mqttQ2AffRefusalBaseDelay
+	if deliveryCount > 1 {
+		shift := deliveryCount - 1
+		if shift > mqttQ2AffRefusalMaxShift {
+			shift = mqttQ2AffRefusalMaxShift
+		}
+		delay = mqttQ2AffRefusalBaseDelay << shift
+	}
+	if delay > mqttQ2AffRefusalMaxDelay {
+		delay = mqttQ2AffRefusalMaxDelay
+	}
+	return []byte(fmt.Sprintf("%s {\"delay\":%d}", AckNak, int64(delay)))
+}
+
+// refuseQ2AffCopy declines to act on a copy and hands it back for a LATER attempt, paced.
+// Every refusal on the affine path goes through here rather than sending AckNak directly:
+// the arms differ in what they could not prove, not in how soon it is worth asking again.
+func (sess *mqttSession) refuseQ2AffCopy(reply string) {
+	_, _, dc, _, _ := ackReplyInfo(reply)
+	sess.jsa.sendMsg(reply, mqttQ2AffRefusalNak(dc))
+}
+
+// q2AffCopyIsSupersededIncarnationOf reports whether copySubject is a copy of the SAME
+// assignment as claim under a DIFFERENT incarnation, which is the only copy/claim mismatch
+// that licenses disposing of the copy.
+//
+// It exists as one predicate because two paths dispose on that mismatch — the delivery
+// gate, which takes its claim subject from the copy's own header, and the retired
+// settlement, which takes it from a carrier — and review found each of them in turn
+// disposing on bare subject inequality. Bare inequality is not the same statement: a copy
+// of a DIFFERENT assignment mismatches too, and the claim that owns it may be perfectly
+// live, so acknowledging it away destroys that claim's message and leaves it stranded
+// without AffineDone. Same owner, same generation, same claim hash, differing in the
+// incarnation token alone is the only shape a reap-and-re-election produces, and it is the
+// only shape nothing can ever authorize.
+//
+// A cross-assignment mismatch is a persisted shape this broker does not write. Per the
+// compatibility boundary it is REFUSED rather than interpreted, which on this path means
+// handing the copy back paced and leaving it for an actor with evidence.
+func q2AffCopyIsSupersededIncarnationOf(claim *mqttQ2AffClaim, copySubject string) bool {
+	if claim == nil || copySubject == _EMPTY_ || claim.CopySubject == _EMPTY_ ||
+		copySubject == claim.CopySubject {
+		return false
+	}
+	incarnation := mqttQ2AffCopyIncarnation(copySubject)
+	if incarnation == _EMPTY_ {
+		return false
+	}
+	return mqttQ2AffCopySubject(claim.Winner, claim.Gen, claim.ClaimHash, incarnation) == copySubject
+}
+
+// mqttQ2AffCopyIncarnation returns the claim incarnation a copy subject names, or
+// _EMPTY_ if the subject is not one this builder produced. The subject IS the
+// identity, so a delivered copy needs no extra header to say which incarnation it
+// belongs to — and deriving it here rather than trusting a header means a copy
+// cannot claim an incarnation its own subject contradicts. F-065.
+func mqttQ2AffCopyIncarnation(copySubject string) string {
+	if !strings.HasPrefix(copySubject, mqttQ2AffineSubjectPrefix) {
+		return _EMPTY_
+	}
+	toks := strings.Split(copySubject[len(mqttQ2AffineSubjectPrefix):], ".")
+	if len(toks) != 4 {
+		return _EMPTY_ // idHash.gen.claimHash.nonce, exactly
+	}
+	if !mqttValidQ2AffGen(toks[3]) {
+		return _EMPTY_
+	}
+	return toks[3]
 }
 
 // mqttQ2AffineNames returns the three generation-scoped names of a session's
@@ -491,11 +684,21 @@ func mqttQ2AffineNames(idHash, gen string) (filter, deliver, durable string) {
 	return filter, deliver, durable
 }
 
-// mqttQ2AffMsgId returns the copy's deduplication key. Stable across every retry
-// of one claim, and distinct per (group, source message) so two groups moving the
-// same $MQTT_msgs message never dedup each other.
-func mqttQ2AffMsgId(groupDurable string, sseq uint64) string {
-	return mqttQ2AffMsgIdPrefix + groupDurable + "-" + strconv.FormatUint(sseq, 10)
+// mqttQ2AffMsgId returns the copy's deduplication key. Stable across every retry of
+// one claim INCARNATION, and distinct per (group, source message, incarnation) so
+// two groups moving the same $MQTT_msgs message never dedup each other and a
+// replacement incarnation is never deduped against the one it replaced.
+//
+// The incarnation belongs in here because a dedupe entry OUTLIVES its message
+// (measured, TestQ2AffCopyStoreWithNoInterestSequenceAndDedupe): with an
+// incarnation-blind key a replacement's store onto its own fresh subject would be
+// silently discarded for the whole Duplicates window, and that claim would never
+// materialize. It is NOT the attempt-scoped key F-063 refuted — one durable
+// incarnation has many delivery attempts and every one produces this same key,
+// which is what keeps a retry idempotent — so the value comes from the PERSISTED
+// claim, never from an election candidate that may have lost.
+func mqttQ2AffMsgId(groupDurable string, sseq uint64, nonce string) string {
+	return mqttQ2AffMsgIdPrefix + groupDurable + "-" + strconv.FormatUint(sseq, 10) + "-" + nonce
 }
 
 // mqttValidateQ2AffineNames checks a persisted affine consumer config against the
@@ -658,9 +861,65 @@ func mqttQ2AffMaxIdentityWidths() (claimSubject, msgID, gen int) {
 	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
 	maxSeq := mqttQ2AffMaxSeqDigits
 	claimSubject = len(mqttQoS2AssignStreamSubjectPrefix) + maxDur + 1 + maxSeq
-	msgID = len(mqttQ2AffMsgIdPrefix) + maxDur + 1 + maxSeq
+	// +1+gen for the claim INCARNATION the dedup key now carries: the nonce is minted
+	// by the same generator as Gen, so its width is fixed and this stays a bound
+	// rather than an estimate (F-065).
+	msgID = len(mqttQ2AffMsgIdPrefix) + maxDur + 1 + maxSeq + 1 + mqttQ2AffGenLen
 	gen = mqttQ2AffGenLen
 	return claimSubject, msgID, gen
+}
+
+// mqttQ2AffClaimRecordMax bounds the ASSIGNMENT CLAIM record — the other thing a
+// shared QoS 2 delivery stores, on $MQTT_qos2assign — computed by running the real
+// encoder over the largest record this owner can reach.
+//
+// It is budgeted for the same reason the affine copy is, and the failure is the same
+// eternal wedge from the other side: a PUBLISH admitted at PUBREC time, delivered to
+// a shared group, whose CLAIM cannot be stored means no election can ever be won,
+// the group delivery is never acked, and AckWait retries it forever. Nothing checked
+// this before; F-065 widened the record and made the omission worth closing.
+//
+// The construction is explicit rather than "maximal widths", because the record also
+// carries variable delivery decisions: maximal identity widths, the maximum
+// Subscription Identifier, and Retained true — the same treatment the affine bound
+// already gives them, and for the same reason (both come from a SUBSCRIBE that has
+// not happened at admission time). Both reachable terminal shapes are compared, not
+// just the initial election form: a later transition must not be the thing that
+// exceeds the limit. AffineDone and Lost are mutually exclusive, so taking the max
+// over the two shapes over-budgets by nothing, while setting Discarded alongside
+// AffineDone over-budgets by one boolean deliberately.
+func mqttQ2AffClaimRecordMax() int {
+	claimW, _, genW := mqttQ2AffMaxIdentityWidths()
+	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
+	pad := strings.Repeat("x", claimW)
+	rec := mqttQ2AffClaim{
+		Winner:       strings.Repeat("x", genW),
+		Gen:          strings.Repeat("x", genW),
+		Nonce:        strings.Repeat("x", genW),
+		GroupDurable: strings.Repeat("x", maxDur),
+		SourceSeq:    math.MaxUint64,
+		ClaimHash:    strings.Repeat("x", mqttQ2AffClaimHashLen),
+		CopySubject:  pad,
+		AffDurable:   pad,
+		SubID:        mqttMaxVarInt,
+		Retained:     true,
+		Phase:        mqttQ2AffMaterialized,
+		SourceAcked:  true,
+		Discarded:    true,
+	}
+	size := func(r mqttQ2AffClaim) int {
+		b, _ := json.Marshal(&r)
+		// The create-only CAS header is not stripped before storage, so it counts.
+		return len(hdrLine) + len(JSExpectedLastSubjSeq) + 1 +
+			len(strconv.FormatUint(math.MaxUint64, 10)) + 2 + 2 + len(b)
+	}
+	done, lost := rec, rec
+	done.AffineDone = true
+	lost.Lost = true
+	if n := size(lost); n > size(done) {
+		return n
+	}
+	return size(done)
 }
 
 // mqttQ2AffineFormMax is the upper bound on the affine copy of pp, computed by
@@ -1227,8 +1486,11 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
 // validateOutStream verifies $MQTT_out can carry the affine copies. It is a
 // DIFFERENT list from validateQoS2AssignStream's, derived from what this owner
 // does to $MQTT_out: append-only stores (one of them a create-only CAS), consumer
-// delivery, and interest-based drop when a session's durable goes away. It never
-// deletes or purges messages there, so DenyDelete/DenyPurge are not prerequisites.
+// delivery, interest-based drop when a session's durable goes away, and — since
+// F-065 — the DELETE of an exact sequence by which a materialization attempt
+// withdraws a copy no claim of its incarnation can authorize. DenyDelete is
+// therefore fatal; DenyPurge remains an audited NON-prerequisite, because nothing
+// here purges by subject.
 //
 // InterestPolicy is load-bearing in BOTH directions: it is how a discarded
 // session's undelivered copies disappear when its durable is deleted, and it is
@@ -1283,6 +1545,14 @@ func validateOutStream(si *StreamInfo, wantReplicas, maxAckPending int) error {
 		// durable a delete timer, reaping resumable-session state while the client
 		// is offline — exactly what this feature exists to preserve.
 		return fmt.Errorf("stream imposes a consumer inactivity limit (%v): it would reap a disconnected session's affine QoS 2 consumer", cfg.ConsumerLimits.InactiveThreshold)
+	}
+	if cfg.DenyDelete {
+		// A materialization attempt withdraws the copy it proved present once nothing
+		// of that copy's incarnation can authorize it. Denied, that copy stays on an
+		// interest-retained stream behind the fail-closed delivery gate, NAK-looping and
+		// holding a MaxAckPending slot for the session's whole life — which is F-065's
+		// own harm, reintroduced by configuration.
+		return fmt.Errorf("deny_delete is set: a materialization attempt could not withdraw a disowned session-affine QoS 2 copy, which would then NAK-loop behind the delivery gate")
 	}
 	if l := cfg.ConsumerLimits.MaxAckPending; l != 0 && l < maxAckPending {
 		return fmt.Errorf("stream consumer max_ack_pending limit is %d, below the broker's effective cap %d: JetStream would reject the PUBREL and affine durable creates, failing every QoS 2 resume", l, maxAckPending)
@@ -1628,7 +1898,7 @@ var errQ2AffUnresolved = errors.New("affine QoS 2 state could not be resolved")
 //
 // A missing claim returns (nil, 0, nil): there is nothing to advance, and absence
 // is never manufactured into a new claim here.
-func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, wantGen string,
+func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, wantGen, wantNonce, wantCopy string,
 	mutate func(*mqttQ2AffClaim)) (*mqttQ2AffClaim, uint64, error) {
 
 	var lastErr error
@@ -1643,6 +1913,43 @@ func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, want
 		}
 		if wantWinner != _EMPTY_ && !cur.ownedBy(wantWinner, wantGen) {
 			return cur, seq, errQ2AffUnresolved
+		}
+		// The INCARNATION gate, and it is here — before mutate, and before the
+		// no-op-success return below — rather than a check on the outcome. An
+		// incarnation-specific fact (the phase, AffineDone, Lost, and the source-gone
+		// discard, each an inference about THIS attempt's own copy) must not be written
+		// onto a claim that a later election put on this subject, because Winner+Gen
+		// alone cannot tell two incarnations apart. Deciding after the write is too
+		// late: the write has already moved the successor's record. F-065.
+		//
+		// _EMPTY_ opts out, independently of the winner check, because the two are
+		// different questions: SourceAcked is a fact about the source MESSAGE and the
+		// teardown discards are facts about the SESSION, so each applies to whichever
+		// incarnation holds the subject.
+		if wantNonce != _EMPTY_ && cur.Nonce != wantNonce {
+			return cur, seq, errQ2AffUnresolved
+		}
+		// The COPY fence, for a caller that reached here holding one. It is inside this
+		// loop, not at the caller, because the caller's validation was performed against a
+		// DIFFERENT load: this function reads the record again, and between the two reads
+		// the record can be deleted or rewritten. A same-nonce record whose other identity
+		// fields no longer follow from its subject would otherwise be mutated on the
+		// strength of a snapshot that is gone, and the caller would then treat the write as
+		// proof and acknowledge away the copy.
+		//
+		// Attributability is asserted here rather than everywhere because it belongs to the
+		// same question: a caller that names a copy is acting on THAT copy's claim, so a
+		// record that cannot be attributed to its own subject cannot be the one. The
+		// account-wide floor (mqttQ2AffClaimIdentityOK) is deliberately left alone for the
+		// callers that carry no copy — SourceAcked and the teardown discards — for the
+		// reason q2AffClaimUsableForDecision's own comment gives.
+		if wantCopy != _EMPTY_ {
+			if verr := q2AffClaimUsableForDecision(subject, cur); verr != nil {
+				return cur, seq, errQ2AffUnresolved
+			}
+			if cur.CopySubject != wantCopy {
+				return cur, seq, errQ2AffUnresolved
+			}
 		}
 		next := *cur
 		mutate(&next)
@@ -1672,11 +1979,13 @@ func (as *mqttAccountSessionManager) advanceQ2AffClaim(subject, wantWinner, want
 // record, and this is the one operation that can, if wrong, reopen the ownership
 // of a started delivery.
 //
-// F-065: the re-read is not enough on its own. The copy state below is read BEFORE
-// the SourceAcked transition this function may perform, and reapable() is then
-// evaluated on that earlier reading — so a copy stored by a concurrent on-behalf
-// materializer during the transition's round trip is invisible to it, and the claim
-// is deleted out from under a copy that exists. See docs/findings/ha-arbitration.md.
+// The re-read is not enough on its own, which is what F-065 was: the copy state must
+// be read AFTER the SourceAcked transition this function may perform, because that
+// transition is a full JetStream round trip with retries and reapable() would
+// otherwise be evaluated on a reading older than this function's own last write — so
+// a copy stored during it would be invisible, and the claim deleted out from under a
+// copy that exists. The order below is load, transition, read the copy, decide,
+// delete, and NOTHING is added between the copy read and the delete.
 //
 // EVERY writer that records one of the two proofs must call this afterwards. The
 // two proofs are produced by different code paths (the source ack by the move,
@@ -1703,20 +2012,50 @@ func (as *mqttAccountSessionManager) reapQ2AffClaim(s *Server, subject string) {
 	if err != nil || claim == nil {
 		return
 	}
+	if verr := q2AffClaimUsableForDecision(subject, claim); verr != nil {
+		// This function DELETES a claim on what its copy subject says, so a record
+		// whose subject does not follow from its own identity is refused rather than
+		// interpreted: it would otherwise inspect a copy the record does not own and
+		// delete the claim over a live one.
+		s.Warnf("MQTT: refusing to reap shared QoS 2 assignment %q: %v", subject, verr)
+		return
+	}
 
+	if !claim.SourceAcked && as.q2AffSourceUnofferable(claim) {
+		// No identity of any kind: an unofferable source is a fact about the source
+		// MESSAGE, true of whichever incarnation holds this subject.
+		claim, seq, err = as.advanceQ2AffClaim(subject, _EMPTY_, _EMPTY_, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
+		if err != nil || claim == nil {
+			return
+		}
+		// Re-validated, because that transition is identity-unfenced BY DESIGN — a
+		// SourceAcked write is a fact about the source message, so it applies to whichever
+		// incarnation holds the subject — and it therefore returns whatever record it
+		// loaded, which may be a concurrently rewritten occupant. The copy subject below
+		// comes from that record and decides whether this claim is DELETED, so trusting an
+		// unvalidated one would let a malformed rewrite redirect the absence check and
+		// strand the original copy with no claim.
+		// Re-validated, because that transition is identity-unfenced BY DESIGN — a
+		// SourceAcked write is a fact about the source message, so it applies to whichever
+		// incarnation holds the subject — and it therefore returns whatever record it
+		// loaded, which may be a concurrently rewritten occupant. The copy subject below
+		// comes from that record and decides whether this claim is DELETED, so trusting an
+		// unvalidated one would let a malformed rewrite redirect the absence check and
+		// strand the original copy with no claim.
+		if verr := q2AffClaimUsableForDecision(subject, claim); verr != nil {
+			s.Warnf("MQTT: refusing to reap shared QoS 2 assignment %q after its source transition: %v", subject, verr)
+			return
+		}
+	}
+
+	// AFTER the transition above, and with nothing but the delete after it. This is
+	// R1: the reading reapable() consumes must be no older than the last write this
+	// function issues. F-065.
 	copyState, _ := as.loadQ2AffCopy(claim.CopySubject)
 	if copyState == mqttQ2AffCopyUnknown {
 		return // fail closed: an unreadable copy is not an absent copy
 	}
-	copyAbsent := copyState == mqttQ2AffCopyAbsent
-
-	if !claim.SourceAcked && as.q2AffSourceUnofferable(claim) {
-		claim, seq, err = as.advanceQ2AffClaim(subject, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
-		if err != nil || claim == nil {
-			return
-		}
-	}
-	if !claim.reapable(copyAbsent) {
+	if !claim.reapable(copyState == mqttQ2AffCopyAbsent) {
 		return
 	}
 	// Delete the EXACT sequence loaded (qos2_move.go invariant 2): deleting a
@@ -1767,7 +2106,8 @@ func (as *mqttAccountSessionManager) confirmSourceAckAndRecord(claimSubject, rep
 	if err := as.jsa.confirmAck(reply); err != nil {
 		return err
 	}
-	_, _, err := as.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
+	// No identity: a confirmed group ack is a fact about the source MESSAGE.
+	_, _, err := as.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
 	return err
 }
 
@@ -1829,7 +2169,13 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 
 	idHash := sess.idHash
 	claimHash := mqttQ2AffClaimHash(in.groupDurable, sseq)
-	copySubject := mqttQ2AffCopySubject(idHash, gen, claimHash)
+	// This attempt's CANDIDATE incarnation. It becomes the claim's Nonce only if the
+	// create-only election below wins; a losing candidate's value is discarded, and
+	// materializeQ2AffCopy re-derives both identities from the PERSISTED claim so a
+	// loser's nonce can never reach a stored copy. The width is fixed, so the size
+	// preflight below is valid whichever value ends up persisted. F-065.
+	nonce := mqttNewQ2AffGen()
+	copySubject := mqttQ2AffCopySubject(idHash, gen, claimHash, nonce)
 	_, _, affDurable := mqttQ2AffineNames(idHash, gen)
 
 	// A message whose Message Expiry Interval has elapsed was never STARTED to
@@ -1853,7 +2199,7 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 		subID:        in.subID,
 		claimSubject: claimSubject,
 		gen:          gen,
-		msgID:        mqttQ2AffMsgId(in.groupDurable, sseq),
+		msgID:        mqttQ2AffMsgId(in.groupDurable, sseq, nonce),
 	}
 	// Backstop for a message that never met the affine admission bound: a
 	// PUBLISH is bounded at admission (mqttMaxQoS2FormSize), but a QoS 1/2 Will
@@ -1861,6 +2207,17 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 	// member unbounded. A copy that can never be stored would wedge the group
 	// durable in eternal retry; drop it with a logged error instead — the same
 	// disposal an undeliverable oversize PUBLISH already gets.
+	// The CLAIM record is checked here too, and not only in the admission preflight,
+	// because a QoS 1/2 Will store bypasses that preflight entirely: an election whose
+	// record cannot be stored would leave the group delivery retrying forever with no
+	// claim able to exist. Both forms are checked before either is written.
+	if in.maxPayload > 0 && mqttQ2AffClaimRecordMax() > int(in.maxPayload) {
+		s.Errorf("MQTT: discarding a shared QoS 2 message on %q: its assignment claim record (%d bytes) exceeds the account max payload (%d)",
+			in.natsSubject, mqttQ2AffClaimRecordMax(), in.maxPayload)
+		sess.jsa.sendAck(in.reply)
+		res = mqttQ2AffMoveDropped
+		return res
+	}
 	if !mqttQ2AffineRecordFits(env, in.maxPayload) {
 		s.Errorf("MQTT: discarding a shared QoS 2 message on %q: its session-affine form (%d bytes) exceeds the account max payload (%d); it was stored without the affine admission bound, which a QoS 1/2 Will bypasses",
 			in.natsSubject, mqttComputeQ2AffineSize(env), in.maxPayload)
@@ -1873,6 +2230,7 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 	claim := &mqttQ2AffClaim{
 		Winner:       idHash,
 		Gen:          gen,
+		Nonce:        nonce,
 		GroupDurable: in.groupDurable,
 		SourceSeq:    sseq,
 		ClaimHash:    claimHash,
@@ -1898,6 +2256,13 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 	if lerr != nil || cur == nil {
 		// Indeterminate, or the claim vanished between the rejection and this read.
 		// Either way nothing is proven; AckWait re-offers.
+		return res
+	}
+
+	if verr := q2AffClaimUsableForDecision(claimSubject, cur); verr != nil {
+		// Refused, not interpreted: every arm below acts on this record's derived copy
+		// identity, and the source delivery is simply left for AckWait.
+		s.Warnf("MQTT: refusing to act on shared QoS 2 assignment %q: %v", claimSubject, verr)
 		return res
 	}
 
@@ -1974,7 +2339,10 @@ func (sess *mqttSession) completeQ2AffOwnClaim(s *Server, as *mqttAccountSession
 
 	if !as.materializeQ2AffCopy(s, claim, claimSubject, claimSeq, env) {
 		cur, _, err := as.loadQ2AffClaim(claimSubject)
-		if err != nil || cur == nil || !cur.sourceAckAuthorized(false) {
+		// An unattributable record authorizes nothing either: releasing the source on one
+		// would be irreversible.
+		if err != nil || cur == nil || q2AffClaimUsableForDecision(claimSubject, cur) != nil ||
+			!cur.sourceAckAuthorized(false) {
 			// Nothing proven and nothing terminal: prove nothing, write nothing, ack
 			// nothing. The source delivery is the only recoverable asset, so it is left
 			// for AckWait to re-offer.
@@ -2033,12 +2401,31 @@ func (sess *mqttSession) completeQ2AffOwnClaim(s *Server, as *mqttAccountSession
 func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 	claim *mqttQ2AffClaim, claimSubject string, claimSeq uint64, env *mqttQ2AffineEnvelope) bool {
 
+	if verr := q2AffClaimUsableForDecision(claimSubject, claim); verr != nil {
+		s.Warnf("MQTT: refusing to materialize shared QoS 2 assignment %q: %v", claimSubject, verr)
+		return false
+	}
 	if claim.Discarded {
 		return false // the winner's session ended; nothing may be materialized for it
 	}
-	state, _ := as.loadQ2AffCopy(claim.CopySubject)
+	// Both derived identities come from the PERSISTED claim, never from the envelope
+	// the mover built before the election. A candidate that LOST the election still
+	// carries its own nonce in env.msgID, and storing under it would give one durable
+	// incarnation two dedup keys — which is the attempt-scoped identity F-063 refuted.
+	// The width is identical, so the mover's size preflight still holds. F-065.
+	env.msgID = mqttQ2AffMsgId(claim.GroupDurable, claim.SourceSeq, claim.Nonce)
+
+	state, smsg := as.loadQ2AffCopy(claim.CopySubject)
 	if state == mqttQ2AffCopyUnknown {
 		return false // fail closed: unreadable is not absent
+	}
+	// provenSeq is the sequence of a copy this call PROVED present, taken from the
+	// proof and never from a store response: the response is absent in exactly the
+	// landed-but-unreported case that most needs it, and on an interest-retained
+	// stream it can name a store that kept nothing (F-063).
+	var provenSeq uint64
+	if smsg != nil {
+		provenSeq = smsg.Sequence
 	}
 	if state == mqttQ2AffCopyAbsent {
 		if claim.Phase == mqttQ2AffMaterialized {
@@ -2053,13 +2440,19 @@ func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 		// then dropped with its consumer is owed a replacement just as much as one
 		// that never landed. Either way this store is the right action — it is the
 		// proof afterwards, not the store, that decides anything.
+		//
+		// EVERY store outcome now converges on that proof, including an error: a
+		// response is not evidence in either direction, and "the write did not land"
+		// is not a verdict a failed response establishes (F-063,
+		// project_ambiguous_write_reattempt). The old early return on a non-CAS error
+		// abandoned exactly the copy that had landed with its response lost.
 		msg, hdrLen := mqttNewQ2AffineRecord(env)
-		if _, err := as.storeQ2AffCopy(claim.CopySubject, hdrLen, msg); err != nil && !isQoS2CASRejection(err) {
+		_, _ = as.storeQ2AffCopy(claim.CopySubject, hdrLen, msg)
+		st, sm := as.loadQ2AffCopy(claim.CopySubject)
+		if st != mqttQ2AffCopyPresent {
 			return false
 		}
-		if st, _ := as.loadQ2AffCopy(claim.CopySubject); st != mqttQ2AffCopyPresent {
-			return false
-		}
+		provenSeq = sm.Sequence
 	}
 
 	as.mu.RLock()
@@ -2071,14 +2464,105 @@ func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 		}
 	}
 
-	updated, _, err := as.advanceQ2AffClaim(claimSubject, claim.Winner, claim.Gen,
+	updated, _, err := as.advanceQ2AffClaim(claimSubject, claim.Winner, claim.Gen, claim.Nonce, _EMPTY_,
 		func(c *mqttQ2AffClaim) { c.Phase = mqttQ2AffMaterialized })
+	if err == nil && updated != nil {
+		// The transition reloads the record and matches identity fields only, so a
+		// concurrent rewrite that preserves winner, generation and incarnation while
+		// making CopySubject inconsistent lands `materialized` on a record nothing can
+		// attribute. Reporting success then licenses the caller's IRREVERSIBLE source
+		// acknowledgement, and the delivery gate — which does validate — would NAK that
+		// copy forever. Same post-transition trust window the reaper closes, closed the
+		// same way: prove nothing rather than act on an unattributable record.
+		if verr := q2AffClaimUsableForDecision(claimSubject, updated); verr != nil {
+			s.Warnf("MQTT: refusing to complete shared QoS 2 assignment %q: its record changed to one that cannot be attributed: %v", claimSubject, verr)
+			return false
+		}
+	}
+	if as.q2AffCopyIsDisowned(claimSubject, claim, updated, err) {
+		// Nothing can ever authorize this copy again, so withdraw the exact sequence
+		// this call proved present. Compensation, not arbitration: the claim and the
+		// copy are on different streams and no write can commit to both, so the honest
+		// bound is "the attempt that proved the copy resolves it" — see F-065's
+		// re-scoped guarantee in docs/CONFORMANCE.md for what a lost attempt leaves.
+		as.withdrawQ2AffCopy(s, claim.CopySubject, provenSeq)
+		return false
+	}
 	if err != nil || updated == nil {
 		return false
 	}
 	// A claim that turned discarded while we were storing keeps its copy dropped
 	// by the delivery gate; the copy itself dies with the session's consumer.
 	return updated.Phase == mqttQ2AffMaterialized
+}
+
+// q2AffCopyIsDisowned reports whether the copy this call proved present can never
+// be delivered by anybody, which is what licenses withdrawing it. cur/err are the
+// claimed->materialized transition's own outcome; claim is the snapshot this call
+// acted on.
+//
+// The reading must be AUTHORITATIVE and it must be the most recent one available:
+// an advance that reached the record supplies it directly, and only an
+// indeterminate advance costs an extra load. Anything unreadable RETAINS the copy —
+// "I could not tell" must never destroy an accepted message.
+//
+// Three positive readings disown a copy, and each is monotone, so none can be
+// undone by a later writer:
+//
+//   - no claim on the subject. Nothing authorizes the copy, and with the
+//     incarnation nonce nothing later will: a replacement election mints its own
+//     and reads a different subject.
+//   - a claim naming a different winner, generation or INCARNATION. The copy
+//     subject is derived from all three, so such a claim can never adopt this copy.
+//   - a TERMINAL claim of this very incarnation. The gate publishes only under
+//     materialized-and-nonterminal, so the copy is either a duplicate of a PUBLISH
+//     the client already answered (AffineDone) or a delivery that died with its
+//     session (Discarded, [MQTT-4.8.2-5]); the gate's own terminal branch disposes
+//     of it for that reason, and withdrawing reaches the same state without
+//     depending on the consumer being live.
+func (as *mqttAccountSessionManager) q2AffCopyIsDisowned(claimSubject string,
+	claim, cur *mqttQ2AffClaim, err error) bool {
+
+	if err != nil && !errors.Is(err, errQ2AffUnresolved) {
+		// Indeterminate: one fresh, authoritative reading, and a load error retains.
+		var lerr error
+		cur, _, lerr = as.loadQ2AffClaim(claimSubject)
+		if lerr != nil {
+			return false
+		}
+	}
+	if cur == nil {
+		return true
+	}
+	if q2AffClaimUsableForDecision(claimSubject, cur) != nil {
+		// Unattributable: it cannot establish that the copy is disowned any more than it
+		// could authorize a delivery. Retain, and leave it to an actor with evidence.
+		return false
+	}
+	if !cur.ownedBy(claim.Winner, claim.Gen) || cur.Nonce != claim.Nonce {
+		return true
+	}
+	return cur.terminal()
+}
+
+// withdrawQ2AffCopy deletes the EXACT sequence a materialization attempt proved
+// present. The exactness is the safety property: a sequence cannot name a copy
+// stored after it, so no later incarnation's copy can be destroyed by a stale
+// withdrawal (qos2_move.go invariant 2, applied to the copy stream).
+//
+// A no-interest store consumes a sequence that holds nothing, so "not found" is an
+// ordinary success here rather than a failure.
+func (as *mqttAccountSessionManager) withdrawQ2AffCopy(s *Server, copySubject string, seq uint64) {
+	if seq == 0 {
+		return
+	}
+	if derr := as.jsa.deleteMsg(mqttOutStreamName, seq, true); derr != nil &&
+		isErrorOtherThan(derr, JSSequenceNotFoundErrF) &&
+		!isJSErrCausedBy(derr, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
+		// Stated residual: nothing else collects this copy. See docs/CONFORMANCE.md.
+		s.Warnf("MQTT: unable to withdraw the disowned shared QoS 2 copy %q at sequence %d: %v",
+			copySubject, seq, derr)
+	}
 }
 
 // materializeQ2AffOnBehalf proves a copy onto a foreign winner's durable when the
@@ -2122,6 +2606,14 @@ func (as *mqttAccountSessionManager) materializeQ2AffCopy(s *Server,
 func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *mqttQ2AffClaim,
 	claimSubject string, claimSeq uint64, env *mqttQ2AffineEnvelope, in *mqttQ2AffMoveInput) bool {
 
+	if verr := q2AffClaimUsableForDecision(claimSubject, claim); verr != nil {
+		// Every step below acts on this record — it discards, restores a consumer from
+		// it, and materializes onto its derived copy subject — so an unattributable
+		// record is refused before any of them. Contender-side, so the refusal is free.
+		s.Warnf("MQTT: refusing to act on behalf of shared QoS 2 assignment %q: %v", claimSubject, verr)
+		return false
+	}
+
 	// (1) Is the winning generation still a live session?
 	ps, _, err := as.loadFenceSession(claim.Winner)
 	if err != nil {
@@ -2153,7 +2645,9 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 		// previous owner can outlive. See this function's doc: F-033's audit sorted that
 		// cost onto F-036's premise rather than onto this stream's.
 		//
-		if _, _, derr := as.advanceQ2AffClaim(claimSubject, claim.Winner, claim.Gen,
+		// No nonce: the winning GENERATION ended or moved, a session fact true of
+		// every incarnation of this subject.
+		if _, _, derr := as.advanceQ2AffClaim(claimSubject, claim.Winner, claim.Gen, _EMPTY_, _EMPTY_,
 			func(c *mqttQ2AffClaim) { c.Discarded = true }); derr != nil {
 			return false
 		}
@@ -2305,7 +2799,8 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 		// and the group delivery would be re-offered with nothing able to release it.
 		// The claim is re-read because this snapshot predates every round trip above.
 		cur, _, lerr := as.loadQ2AffClaim(claimSubject)
-		if lerr != nil || cur == nil || !cur.sourceAckAuthorized(false) {
+		if lerr != nil || cur == nil || q2AffClaimUsableForDecision(claimSubject, cur) != nil ||
+			!cur.sourceAckAuthorized(false) {
 			return false
 		}
 	}
@@ -2332,7 +2827,7 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 // away, and leave recovery looking at a `claimed` claim with no copy — which it
 // would resolve by materializing a SECOND copy. So: no claim, or a claim that is
 // not durably materialized, means NAK and wait.
-func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply string, rmsg []byte) {
+func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
 	if reply == _EMPTY_ {
 		return
 	}
@@ -2374,16 +2869,77 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 	jsDur := sess.q2AffConsumer.Durable
 	sess.mu.Unlock()
 
+	// Everything downstream fences on the DELIVERED COPY SUBJECT rather than on an
+	// incarnation lifted out of it, and never on a header: the subject is the
+	// identity, so a copy cannot assert an incarnation its subject contradicts, and
+	// naming the whole subject also refuses a reference to a different claim that
+	// happens to carry the right incarnation.
+	sseq, _, _, _, _ := ackReplyInfo(reply)
+
+	// The RETIREMENT check comes before the claim gate's own branches, and before
+	// trackPublish, because four of those branches acknowledge and return: taking one
+	// of them first would dispose of the copy while leaving the retirement and its
+	// register behind, and taking trackPublish first yields identifier zero (the
+	// restored PUBREL already reserves this source) and returns without acknowledging
+	// anything at all. Either way the affine side is never discharged. F-065.
+	sess.mu.Lock()
+	retired := sess.sourceRetiredLocked(jsDur, sseq)
+	sess.mu.Unlock()
+	if retired {
+		// The CARRIED pair comes from the retirement record itself; this call supplies
+		// only the copy actually in hand, so the two can be compared.
+		sess.settleRetiredAffineSource(cc, jsDur, sseq, reply, subject, claimSubject, _EMPTY_)
+		return
+	}
+
 	claim, _, err := as.loadQ2AffClaim(claimSubject)
 	switch {
 	case err != nil:
-		sess.jsa.sendMsg(reply, AckNak) // indeterminate: retry, never guess
+		sess.refuseQ2AffCopy(reply) // indeterminate: ask again later, never guess
 		return
 	case claim == nil:
-		// FAIL CLOSED. Safe by construction: nothing may delete a claim whose
-		// affine side is unproven, so a missing claim here is a transient read or
-		// an operator action, not authorization to deliver.
-		sess.jsa.sendMsg(reply, AckNak)
+		// FAIL CLOSED on an ABSENCE — which is all this arm is. It is no longer the
+		// claim that "nothing may delete a claim whose affine side is unproven": F-065
+		// was exactly such a deletion. A missing record is simply not a fact
+		// (feedback_absence_is_not_a_fact), so the copy is NAK'd and left for an actor
+		// with positive evidence; the superseded-incarnation arm below is what disposes
+		// of a copy on proof rather than on silence. Paced, because this absence can last:
+		// an immediate NAK here is what made one copy re-offer 9214 times in ten seconds.
+		sess.refuseQ2AffCopy(reply)
+		return
+	case q2AffClaimUsableForDecision(claimSubject, claim) != nil:
+		// Unattributable: refuse to deliver against it, and do not dispose of the copy
+		// either — nothing here can prove what it belongs to.
+		cc.Errorf("MQTT: refusing to deliver an affine QoS 2 copy on %q: %v", claimSubject, q2AffClaimUsableForDecision(claimSubject, claim))
+		sess.refuseQ2AffCopy(reply)
+		return
+	case q2AffCopyIsSupersededIncarnationOf(claim, subject):
+		// A copy of a SUPERSEDED INCARNATION of this claim subject. The live claim
+		// names a different copy subject, so nothing will ever authorize this one —
+		// and that is a POSITIVE fact about a record we just read, not an inference
+		// from an absence, which is what separates it from the claim == nil arm above
+		// (feedback_absence_is_not_a_fact). Dispose of it rather than NAK it forever.
+		//
+		// Reachable because the claim subject's create-only election can be won again
+		// after a reap, by a group delivery callback dispatched before that reap. F-065.
+		cc.Errorf("MQTT: dropping an affine QoS 2 copy on %q: it belongs to a superseded incarnation of that assignment (copy %q, claim names %q)",
+			claimSubject, subject, claim.CopySubject)
+		sess.jsa.sendAck(reply)
+		return
+	case subject != _EMPTY_ && claim.CopySubject != _EMPTY_ && subject != claim.CopySubject:
+		// The claim this copy's HEADER names is attributable, and it is about a DIFFERENT
+		// ASSIGNMENT: not the same claim hash, or not the same owner or generation. So this
+		// copy is nothing that claim can authorize, and it is equally nothing this branch
+		// may destroy — the assignment whose copy subject this actually is may be perfectly
+		// live, and acknowledging it away would lose that message and strand its claim
+		// without AffineDone.
+		//
+		// It is a persisted shape this broker does not write, so it is REFUSED rather than
+		// interpreted (the compatibility boundary in docs/ARCHITECTURE.md), paced like
+		// every other refusal here.
+		cc.Errorf("MQTT: refusing an affine QoS 2 copy on %q: the copy subject %q belongs to a DIFFERENT assignment than the claim its header names (that claim's copy is %q)",
+			claimSubject, subject, claim.CopySubject)
+		sess.refuseQ2AffCopy(reply)
 		return
 	case !claim.ownedBy(idHash, gen):
 		// The claim says this message belongs to another session. Our copy is an
@@ -2396,7 +2952,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 		// The session ended between the claim and the delivery. The message dies
 		// with it [MQTT-4.8.2-5]; record the affine side complete so the claim can
 		// be reaped once its source ack is proven.
-		cc.mqttFinishQ2AffineDelivery(claimSubject, reply)
+		cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 		return
 	case claim.AffineDone || claim.Lost:
 		// The affine side is already recorded complete, so this is a redelivery of
@@ -2404,10 +2960,15 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 		// into a recorded loss. Publishing it again would duplicate a PUBLISH the
 		// client has already answered. Dispose of it and let the reap proceed now
 		// that the copy is actually going away.
-		cc.mqttFinishQ2AffineDelivery(claimSubject, reply)
+		cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 		return
 	case claim.Phase != mqttQ2AffMaterialized:
-		sess.jsa.sendMsg(reply, AckNak)
+		// The copy exists but its claim has not recorded the phase yet, which is an
+		// ORDINARY interleaving: materializeQ2AffCopy stores the copy before it advances
+		// the record, and the interest-based push can outrun that advance. So the first
+		// retry is the fast one, and only a phase that never advances — a materializer
+		// that died in the window — pays the backoff.
+		sess.refuseQ2AffCopy(reply)
 		return
 	}
 
@@ -2422,12 +2983,14 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 	}
 	if pi != 0 {
 		if p := sess.pendingPublish[pi]; p != nil {
-			// Carry the claim into the pending entry: the terminal paths (PUBREC,
-			// expiry, oversize discard) see a packet identifier and nothing else.
+			// Carry the claim AND its incarnation into the pending entry: the terminal
+			// paths (PUBREC, expiry, oversize discard) see a packet identifier and
+			// nothing else, and the incarnation is what fences their write to the claim
+			// this copy actually belongs to (F-065).
 			p.q2AffClaim = claimSubject
+			p.q2AffCopy = subject
 		}
 	}
-	sseq, _, _, _, _ := ackReplyInfo(reply)
 	sess.mu.Unlock()
 	if pi == 0 {
 		return
@@ -2445,7 +3008,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 			// confirmed copy ack below. Normally a no-op, since expiry is decided before
 			// the register is written.
 			sess.deleteInflightRegisterFor(removed)
-			cc.mqttFinishQ2AffineDelivery(claimSubject, reply)
+			cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 			return
 		}
 	}
@@ -2453,11 +3016,13 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 	// A newly allocated identifier is not sendable until its in-flight register is
 	// confirmed (R1, inflight_register.go), and no earlier than it has to be: a
 	// message discarded on expiry above never pays for one. The register carries the
-	// claim subject, which is not decoration here — after a restart the recovered
-	// pending entry is the only route by which the claim reaches the terminal paths
-	// above, so a register without it would leave a post-restart PUBREC unable to
-	// record AffineDone.
-	if isNew && !sess.storeInflightRegister(cc, pi, 2, jsDur, sseq, regNonce, claimSubject) {
+	// claim subject AND its incarnation, which is not decoration here — after a
+	// restart the recovered pending entry (or, if the PUBREL won the race, the
+	// recovered RETIREMENT) is the only route by which the claim reaches the terminal
+	// paths above, so a register without them would leave a post-restart PUBREC
+	// unable to record AffineDone, or able to record it against the wrong
+	// incarnation. F-065.
+	if isNew && !sess.storeInflightRegister(cc, pi, 2, jsDur, sseq, regNonce, claimSubject, subject) {
 		return
 	}
 	topic := natsSubjectStrToMQTTTopic(string(h.subject))
@@ -2469,7 +3034,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
 		sess.deleteInflightRegisterFor(removed)
-		cc.mqttFinishQ2AffineDelivery(claimSubject, reply)
+		cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 	}
 }
 
@@ -2498,23 +3063,89 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, _, reply s
 // The inverted window is benign and self-correcting: AffineDone recorded but the
 // copy not yet acked leaves the copy live, the claim un-reapable (see reapable),
 // and the redelivered copy disposed of by the delivery gate's terminal branch.
-func (c *client) mqttFinishQ2AffineDelivery(claimSubject, ackSubject string) {
+// carriedCopy fences the write to the INCARNATION the delivery gate attributed, by
+// naming the copy subject the delivery actually carried and requiring the record now
+// on claimSubject to name that same copy. Re-reading whatever claim occupies the
+// subject now is exactly the mistake F-065 closes: a replacement election would
+// otherwise be told a delivery it never made is complete.
+// Winner and generation are deliberately NOT asserted — AffineDone is owner
+// independent, a statement about a copy the gate already attributed — but the
+// incarnation is, because the copy belongs to one.
+// It reports TWO facts, because its two callers are licensed by different ones and
+// collapsing them would give one of them the wrong answer:
+//
+//   - recorded: AffineDone is durable. That is what the PUBREC path needs, because the
+//     in-flight register exists to let recovery reconstruct this exchange, and once the
+//     fact is on the claim the register has nothing left to carry.
+//   - acked: the copy's acknowledgement is CONFIRMED. That is what the retired-source
+//     path needs, because a retirement exists to suppress redelivery and clearing it on
+//     an unproven ack would leave the copy re-offerable with the state that governs it
+//     already gone — the same reasoning settleRetiredSource applies to its own entry.
+//
+// The first return is load-bearing on the PUBREC path. The correlated PUBREL is stored before this runs
+// and the pending entry is already gone, so the in-flight register is the ONLY
+// remaining carrier of the claim and its incarnation: deleting it after a failed
+// transition destroys the one thing a restart could reconstruct the retirement from,
+// leaving the copy stalled with no route to completion. False therefore means "keep
+// the register" — the identifier is spent either way, so retaining it costs a record
+// the next resume resolves, while dropping it costs the delivery.
+func (c *client) mqttFinishQ2AffineDelivery(claimSubject, carriedCopy, ackSubject string) (recorded, acked bool) {
 	as := c.mqtt.asm
 	if as == nil || c.mqtt.sess == nil {
-		return
+		return false, false
 	}
-	if _, _, err := as.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_,
-		func(cl *mqttQ2AffClaim) { cl.AffineDone = true }); err != nil {
+	// The carried pair is turned back into a claim by ONE helper, which requires the
+	// record to be attributable AND to name the copy this delivery carried. Fencing the
+	// transition on an incarnation alone would accept a reference to a DIFFERENT claim
+	// that happens to carry its own correct incarnation.
+	claim, cerr := as.q2AffClaimForCarriedCopy(claimSubject, carriedCopy)
+	if cerr != nil {
+		c.Warnf("Refusing to record the completion of affine QoS 2 assignment %q: %v", claimSubject, cerr)
+		return false, false
+	}
+	if claim == nil {
+		return false, false
+	}
+	claimNonce := claim.Nonce
+	as.mu.RLock()
+	ackHook := as.testQ2AffCopyAck
+	as.mu.RUnlock()
+	confirm := as.jsa.confirmAck
+	if ackHook != nil {
+		confirm = ackHook
+	}
+	updated, _, err := as.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_, claimNonce, carriedCopy,
+		func(cl *mqttQ2AffClaim) { cl.AffineDone = true })
+	if err != nil {
 		// Not recorded: do NOT ack. AckWait re-offers the copy, the gate re-runs,
 		// and nothing has been made ambiguous.
 		c.Warnf("Unable to record the completion of affine QoS 2 assignment %q: %v", claimSubject, err)
-		return
+		return false, false
 	}
-	if err := as.jsa.confirmAck(ackSubject); err != nil {
+	// A nil error is NOT the proof this function's contract needs, and that gap was
+	// reachable: advanceQ2AffClaim reports (nil, 0, nil) when the record DISAPPEARED
+	// between the validation above and its own load, and it returns success for a
+	// no-op write. Treating either as recorded would confirm-ack the copy — the
+	// irreversible half — with the completion durable NOWHERE, which is exactly the
+	// ambiguity the write order exists to remove. So the fact has to be ON the record
+	// this call left behind, and that record still has to be the one this copy belongs
+	// to.
+	if updated == nil || !updated.AffineDone || updated.CopySubject != carriedCopy ||
+		q2AffClaimUsableForDecision(claimSubject, updated) != nil {
+		c.Warnf("Refusing to acknowledge an affine QoS 2 delivery for %q: the transition reported success but the "+
+			"record it left does not carry the completion of this copy (%+v)", claimSubject, updated)
+		return false, false
+	}
+	if err := confirm(ackSubject); err != nil {
 		c.Warnf("Unable to confirm the acknowledgement of an affine QoS 2 delivery for %q: %v", claimSubject, err)
-		return
+		// The affine side IS recorded, which is the fact recovery needs; only the
+		// copy's own acknowledgement is unproven, and the gate's terminal branch
+		// disposes of the redelivery. Discharged as far as the REGISTER is concerned,
+		// and deliberately not as far as a retirement is.
+		return true, false
 	}
 	as.reapQ2AffClaim(c.srv, claimSubject)
+	return true, true
 }
 
 // ---------------------------------------------------------------------------
@@ -2541,6 +3172,62 @@ func mqttQ2AffClaimIdentityOK(c *mqttQ2AffClaim) bool {
 		c.GroupDurable != _EMPTY_ &&
 		c.SourceSeq != 0 &&
 		c.CopySubject != _EMPTY_
+}
+
+// q2AffClaimUsableForDecision reports whether a claim record can safely be ACTED on
+// by a direct decision path — the mover, the delivery gate, either materialization
+// path, the reaper, and the owner's recovery. All of them consume the record's
+// derived copy identity, and none of them consults a validator today.
+//
+// It is deliberately NOT mqttQ2AffClaimIdentityOK, and the split is the point.
+// That predicate is the shared attribution FLOOR for the account-wide scans, where
+// one failure aborts the whole walk and, from clear(), fails the discard and can
+// lock an unrelated client ID out of its next CONNECT. Winner+Gen still attributes a
+// claim to its session even when its nonce is malformed, so nonce-format and
+// derivation checks must not be able to do that to unrelated sessions. Here, by
+// contrast, refusing costs nothing: prove nothing, write nothing, ack nothing.
+//
+// What it refuses, and why each matters:
+//
+//   - a Nonce that is not the exact minted form. The incarnation is what fences
+//     every incarnation-specific transition, and a malformed one would be passed
+//     into that fence and match only the equally malformed record it came from.
+//   - a CopySubject that does not follow from this record's own fields. The reaper
+//     reads it to decide whether to DELETE the claim, and recovery reads it before
+//     writing Lost or the source-gone disposition; a subject that does not follow
+//     from the record makes both inspect a copy the record does not own.
+func q2AffClaimUsableForDecision(subject string, c *mqttQ2AffClaim) error {
+	if c == nil {
+		return fmt.Errorf("no claim")
+	}
+	if !mqttValidQ2AffGen(c.Nonce) {
+		return fmt.Errorf("claim incarnation %q is not a valid identity", c.Nonce)
+	}
+	if c.GroupDurable == _EMPTY_ || c.SourceSeq == 0 {
+		return fmt.Errorf("claim names group %q and source sequence %d, which cannot identify a source", c.GroupDurable, c.SourceSeq)
+	}
+	// BOUND TO THE SUBJECT IT WAS STORED ON, and to its own source, which internal
+	// self-consistency does NOT give. Every derived name below follows from ClaimHash, so a
+	// rewrite that changes ClaimHash and recomputes CopySubject from it is internally
+	// consistent and passes every identity comparison — including the incarnation fence,
+	// which compares winner, generation and nonce only. Acting on such a record
+	// materializes and then IRREVERSIBLY releases a source under a claim hash that belongs
+	// to some other (group, sequence), and the delivery gate then reads the real copy's
+	// subject as a superseded incarnation and acknowledges it away without publishing:
+	// the message is lost. Same discipline F-058 applies to Will records — a record is
+	// refused unless it agrees with the subject it was found on.
+	if want := mqttQ2AffClaimHash(c.GroupDurable, c.SourceSeq); c.ClaimHash != want {
+		return fmt.Errorf("claim hash is %q, which does not follow from group %q and source sequence %d (want %q)", c.ClaimHash, c.GroupDurable, c.SourceSeq, want)
+	}
+	if subject != _EMPTY_ {
+		if want := mqttQ2AffClaimSubject(c.GroupDurable, c.SourceSeq); subject != want {
+			return fmt.Errorf("record on %q describes group %q and source sequence %d, whose subject is %q", subject, c.GroupDurable, c.SourceSeq, want)
+		}
+	}
+	if want := mqttQ2AffCopySubject(c.Winner, c.Gen, c.ClaimHash, c.Nonce); c.CopySubject != want {
+		return fmt.Errorf("copy subject is %q, which does not follow from the record's own identity (want %q)", c.CopySubject, want)
+	}
+	return nil
 }
 
 // scanQ2AffClaims walks every assignment claim in the account, calling fn with
@@ -2623,7 +3310,8 @@ func (as *mqttAccountSessionManager) discardQ2AffClaimsFor(idHash, gen string) e
 		if !claim.ownedBy(idHash, gen) || claim.Discarded {
 			return nil
 		}
-		updated, _, err := as.advanceQ2AffClaim(subject, idHash, gen, func(c *mqttQ2AffClaim) { c.Discarded = true })
+		// No nonce: teardown of the winning generation is a session fact.
+		updated, _, err := as.advanceQ2AffClaim(subject, idHash, gen, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.Discarded = true })
 		if err != nil {
 			return fmt.Errorf("discard assignment %q: %w", subject, err)
 		}
@@ -2676,6 +3364,16 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 	}
 	s := as.server()
 	err := as.scanQ2AffClaims(func(subject string, claim *mqttQ2AffClaim, _ uint64) error {
+		if verr := q2AffClaimUsableForDecision(subject, claim); verr != nil {
+			// SKIPPED, not failed: this walk is account-wide and its error aborts the
+			// caller, so one unattributable record must not stop an unrelated session's
+			// reconciliation. Every arm below writes an incarnation-specific fact or
+			// reads this record's copy subject, so neither is safe here.
+			if s != nil {
+				s.Warnf("MQTT: skipping shared QoS 2 assignment %q during recovery: %v", subject, verr)
+			}
+			return nil
+		}
 		if !claim.ownedBy(idHash, gen) || claim.Lost {
 			// Lost is terminal, never reapable and mutually exclusive with
 			// AffineDone: revisiting it on a later resume — when the consumer has
@@ -2720,7 +3418,10 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 				s.Errorf("MQTT: shared QoS 2 assignment %q for session %q was materialized, but its copy is gone with no record of it being delivered; recording it as a LOST QoS 2 delivery",
 					subject, idHash)
 			}
-			if _, _, aerr := as.advanceQ2AffClaim(subject, idHash, gen,
+			// Nonce-fenced: Lost is an inference from THIS claim's copy being absent,
+			// so it must not be written onto a later incarnation of the subject that
+			// has its own copy.
+			if _, _, aerr := as.advanceQ2AffClaim(subject, idHash, gen, claim.Nonce, _EMPTY_,
 				func(c *mqttQ2AffClaim) { c.Lost = true }); aerr != nil {
 				return nil
 			}
@@ -2735,7 +3436,11 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 			// longer exists cannot be re-offered to anybody, which is exactly what
 			// SourceAcked asserts. Without that the claim could never become
 			// reapable, since nothing would be left to ack the group delivery.
-			if _, _, aerr := as.advanceQ2AffClaim(subject, idHash, gen, func(c *mqttQ2AffClaim) {
+			// Nonce-fenced even though SourceAcked alone would not need it: the
+			// Discarded half rests on THIS incarnation's copy being absent, and a
+			// replacement may already be storing its own. Codex ruled the combined
+			// mutation incarnation-specific for exactly that reason.
+			if _, _, aerr := as.advanceQ2AffClaim(subject, idHash, gen, claim.Nonce, _EMPTY_, func(c *mqttQ2AffClaim) {
 				c.Discarded = true
 				c.SourceAcked = true
 			}); aerr != nil {

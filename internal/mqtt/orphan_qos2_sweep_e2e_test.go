@@ -263,7 +263,7 @@ func TestOrphanSweepConsumerDeleteDropsOnlyRetiredGeneration(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("creating affine consumer %q: %v", durable, err)
 		}
-		copySubject = mqttQ2AffCopySubject(idHash, gen, "1234567890123456")
+		copySubject = mqttQ2AffCopySubject(idHash, gen, "1234567890123456", testQ2AffFixtureNonce)
 		if _, err := asm.jsa.storeMsg(copySubject, 0, []byte("copy for "+idHash)); err != nil {
 			t.Fatalf("storing a copy on %q: %v", copySubject, err)
 		}
@@ -583,7 +583,8 @@ func TestOrphanSweepLateClaimFromAnotherBrokerRetainsTheConsumer(t *testing.T) {
 	if _, err := asmB.storeQ2AffClaimCAS(claimSubject, 0, &mqttQ2AffClaim{
 		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: sseq,
 		ClaimHash:   claimHash,
-		CopySubject: mqttQ2AffCopySubject(idHash, gen, claimHash),
+		Nonce:       testQ2AffFixtureNonce,
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, claimHash, testQ2AffFixtureNonce),
 		AffDurable:  durable,
 		Phase:       mqttQ2AffClaimed,
 	}); err != nil {

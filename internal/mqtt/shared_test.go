@@ -79,3 +79,10 @@ func TestV5SharedSubscription(t *testing.T) {
 		t.Errorf("distinct messages = %d, want %d", len(seen), total)
 	}
 }
+
+// testQ2AffFixtureNonce is a valid claim INCARNATION for fixtures that are not about
+// incarnations. Exactly 22 characters of the NUID alphabet, so it satisfies
+// q2AffClaimUsableForDecision the way a real election's minted nonce does. A test
+// that stages TWO incarnations of one claim subject must use distinct values instead
+// — that distinction is the whole of F-065.
+const testQ2AffFixtureNonce = "F065fixtureNonce000001"

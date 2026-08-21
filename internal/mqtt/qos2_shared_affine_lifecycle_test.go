@@ -634,12 +634,14 @@ func TestQ2AffineReapRequiresBothSidesProven(t *testing.T) {
 		GroupDurable: groupDur,
 		SourceSeq:    sourceSeq,
 		ClaimHash:    mqttQ2AffClaimHash(groupDur, sourceSeq),
-		// A copy subject that provably has no message on it, so "copy absent" is a
-		// real answer from the stream rather than an assumption.
-		CopySubject: mqttQ2AffCopySubject(getHash("reapA"), mqttNewQ2AffGen(), "deadbeefdeadbeef"),
-		AffDurable:  "$MQTT_Q2AFF_reaptest",
-		Phase:       mqttQ2AffMaterialized,
+		AffDurable:   "$MQTT_Q2AFF_reaptest",
+		Phase:        mqttQ2AffMaterialized,
 	}
+	// The copy subject is DERIVED from the record's own identity, and nothing ever
+	// stores a message on it — so "copy absent" is still a real answer from the
+	// stream, and the record is now one a real election could have written. A
+	// hand-built subject is refused outright since F-065.
+	testQ2AffSelfConsistent(base)
 
 	t.Run("discarded but source unproven survives", func(t *testing.T) {
 		c := *base
@@ -691,13 +693,15 @@ func TestQ2AffineDiscardPreservesProvenSourceAck(t *testing.T) {
 	subject := mqttQ2AffClaimSubject(groupDur, 7)
 	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, &mqttQ2AffClaim{
 		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: 7,
-		CopySubject: mqttQ2AffCopySubject(idHash, gen, "cafecafecafecafe"),
+		ClaimHash:   mqttQ2AffClaimHash(groupDur, 7),
+		Nonce:       testQ2AffFixtureNonce,
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, 7), testQ2AffFixtureNonce),
 		Phase:       mqttQ2AffMaterialized, SourceAcked: true,
 	}); err != nil {
 		t.Fatalf("writing the claim: %v", err)
 	}
 
-	got, _, err := b.asm.advanceQ2AffClaim(subject, idHash, gen, func(c *mqttQ2AffClaim) { c.Discarded = true })
+	got, _, err := b.asm.advanceQ2AffClaim(subject, idHash, gen, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.Discarded = true })
 	if err != nil {
 		t.Fatalf("discarding: %v", err)
 	}
@@ -724,7 +728,7 @@ func TestQ2AffineDiscardPreservesProvenSourceAck(t *testing.T) {
 
 	// A transition must also refuse to touch a claim owned by a different
 	// generation, rather than reshape it.
-	if _, _, err := b.asm.advanceQ2AffClaim(subject, idHash, mqttNewQ2AffGen(),
+	if _, _, err := b.asm.advanceQ2AffClaim(subject, idHash, mqttNewQ2AffGen(), _EMPTY_, _EMPTY_,
 		func(c *mqttQ2AffClaim) { c.AffineDone = true }); err == nil {
 		t.Fatal("a transition was applied to a claim owned by another generation")
 	}
@@ -1262,7 +1266,8 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, &mqttQ2AffClaim{
 			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: 5150,
 			ClaimHash:   mqttQ2AffClaimHash(groupDur, 5150),
-			CopySubject: mqttQ2AffCopySubject(idHash, gen, "1111111111111111"),
+			Nonce:       testQ2AffFixtureNonce,
+			CopySubject: mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, 5150), testQ2AffFixtureNonce),
 			AffDurable:  "$MQTT_Q2AFF_unreaped",
 			Phase:       mqttQ2AffMaterialized, SourceAcked: true, AffineDone: true,
 		}); err != nil {
@@ -1289,7 +1294,8 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, &mqttQ2AffClaim{
 			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: absentSeq,
 			ClaimHash:   mqttQ2AffClaimHash(groupDur, absentSeq),
-			CopySubject: mqttQ2AffCopySubject(idHash, gen, "3333333333333333"),
+			Nonce:       testQ2AffFixtureNonce,
+			CopySubject: mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, absentSeq), testQ2AffFixtureNonce),
 			AffDurable:  "$MQTT_Q2AFF_unreaped",
 			Phase:       mqttQ2AffMaterialized, AffineDone: true,
 		}); err != nil {
@@ -1314,12 +1320,13 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 		// those two steps. Deleting the claim there would strand the copy behind the
 		// delivery gate.
 		subject := mqttQ2AffClaimSubject(groupDur, 5151)
-		copySubject := mqttQ2AffCopySubject(idHash, gen, "2222222222222222")
+		copySubject := mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, 5151), testQ2AffFixtureNonce)
 		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, &mqttQ2AffClaim{
 			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: 5151,
-			ClaimHash: mqttQ2AffClaimHash(groupDur, 5151), CopySubject: copySubject,
-			AffDurable: "$MQTT_Q2AFF_unreaped",
-			Phase:      mqttQ2AffMaterialized, SourceAcked: true, AffineDone: true,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, 5151), Nonce: testQ2AffFixtureNonce,
+			CopySubject: copySubject,
+			AffDurable:  "$MQTT_Q2AFF_unreaped",
+			Phase:       mqttQ2AffMaterialized, SourceAcked: true, AffineDone: true,
 		}); err != nil {
 			t.Fatalf("writing the claim: %v", err)
 		}
@@ -1327,7 +1334,7 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 		// holds interest on the whole generation prefix, so it is retained.
 		env := &mqttQ2AffineEnvelope{
 			natsSubject: "unreaped.topic", msg: []byte("still here"),
-			claimSubject: subject, gen: gen, msgID: mqttQ2AffMsgId(groupDur, 5151),
+			claimSubject: subject, gen: gen, msgID: mqttQ2AffMsgId(groupDur, 5151, testQ2AffFixtureNonce),
 		}
 		msg, hdrLen := mqttNewQ2AffineRecord(env)
 		if _, err := b.asm.storeQ2AffCopy(copySubject, hdrLen, msg); err != nil {
@@ -1390,7 +1397,7 @@ func TestQ2AffineLossSurvivesConsumerRecreateAndHandoff(t *testing.T) {
 	if _, err := b.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttOutStreamName, Config: *cfg}); err != nil {
 		t.Fatalf("recreating the affine consumer: %v", err)
 	}
-	if state, _ := b.asm.loadQ2AffCopy(mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(b.groupDurable(t), 1))); state == mqttQ2AffCopyPresent {
+	if state, _ := b.asm.loadQ2AffCopy(mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(b.groupDurable(t), 1), testQ2AffFixtureNonce)); state == mqttQ2AffCopyPresent {
 		t.Fatal("the copy should have gone with its consumer")
 	}
 
@@ -1434,7 +1441,8 @@ func TestQ2AffineLostClaimIsNotRevisited(t *testing.T) {
 	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, &mqttQ2AffClaim{
 		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: 4711,
 		ClaimHash:   mqttQ2AffClaimHash(groupDur, 4711),
-		CopySubject: mqttQ2AffCopySubject(idHash, gen, "beefbeefbeefbeef"),
+		Nonce:       testQ2AffFixtureNonce,
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, 4711), testQ2AffFixtureNonce),
 		AffDurable:  "$MQTT_Q2AFF_lostonce",
 		Phase:       mqttQ2AffMaterialized, SourceAcked: true, Lost: true,
 	}); err != nil {
@@ -1597,7 +1605,8 @@ func TestQ2AffClaimRecordRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := &mqttQ2AffClaim{
 		Winner: "abc", Gen: mqttNewQ2AffGen(), GroupDurable: "$MQTT_SHARED_x", SourceSeq: 99,
-		ClaimHash: "0123456789abcdef", CopySubject: "$MQTT.out.q2.abc.g.h", AffDurable: "$MQTT_Q2AFF_abc_g",
+		ClaimHash: "0123456789abcdef", Nonce: testQ2AffFixtureNonce,
+		CopySubject: "$MQTT.out.q2.abc.g.h", AffDurable: "$MQTT_Q2AFF_abc_g",
 		SubID: 7, Retained: true, Phase: mqttQ2AffMaterialized,
 		SourceAcked: true, AffineDone: true, Discarded: true,
 	}
@@ -2078,7 +2087,8 @@ func TestQ2AffineAmbiguousResumeKeepsAnUnmintedGeneration(t *testing.T) {
 	if _, err := b.asm.storeQ2AffClaimCAS(claimSubject, seq, &mqttQ2AffClaim{
 		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: sourceSeq,
 		ClaimHash:   claimHash,
-		CopySubject: mqttQ2AffCopySubject(idHash, gen, claimHash),
+		Nonce:       testQ2AffFixtureNonce,
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, claimHash, testQ2AffFixtureNonce),
 		AffDurable:  durable,
 		Phase:       mqttQ2AffMaterialized,
 	}); err != nil {
@@ -2324,7 +2334,8 @@ func TestQ2AffineReclaimRejectedByAGenerationPreservingWinnerKeepsItsClaim(t *te
 		if _, err := a.b.asm.storeQ2AffClaimCAS(claimSubject, seq, &mqttQ2AffClaim{
 			Winner: a.idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: sourceSeq,
 			ClaimHash:   claimHash,
-			CopySubject: mqttQ2AffCopySubject(a.idHash, gen, claimHash),
+			Nonce:       testQ2AffFixtureNonce,
+			CopySubject: mqttQ2AffCopySubject(a.idHash, gen, claimHash, testQ2AffFixtureNonce),
 			AffDurable:  durable,
 			Phase:       mqttQ2AffMaterialized,
 		}); err != nil {
@@ -2415,7 +2426,8 @@ func TestQ2AffineReclaimKeepsAPathThatStillOwesADelivery(t *testing.T) {
 	if _, err := a.b.asm.storeQ2AffClaimCAS(claimSubject, seq, &mqttQ2AffClaim{
 		Winner: a.idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: sourceSeq,
 		ClaimHash:   claimHash,
-		CopySubject: mqttQ2AffCopySubject(a.idHash, gen, claimHash),
+		Nonce:       testQ2AffFixtureNonce,
+		CopySubject: mqttQ2AffCopySubject(a.idHash, gen, claimHash, testQ2AffFixtureNonce),
 		AffDurable:  durable,
 		Phase:       mqttQ2AffMaterialized,
 	}); err != nil {
@@ -2487,7 +2499,8 @@ func TestQ2AffineReclaimIsNotBlockedByATerminalClaim(t *testing.T) {
 	if _, err := a.b.asm.storeQ2AffClaimCAS(claimSubject, seq, &mqttQ2AffClaim{
 		Winner: a.idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: sourceSeq,
 		ClaimHash:   claimHash,
-		CopySubject: mqttQ2AffCopySubject(a.idHash, gen, claimHash),
+		Nonce:       testQ2AffFixtureNonce,
+		CopySubject: mqttQ2AffCopySubject(a.idHash, gen, claimHash, testQ2AffFixtureNonce),
 		AffDurable:  durable,
 		Phase:       mqttQ2AffMaterialized,
 		Lost:        true,
@@ -3401,6 +3414,63 @@ func TestQ2AffEveryWriteCarriesItsExpectation(t *testing.T) {
 
 // affDurableFor is the affine consumer durable for one incarnation, which
 // mqttQ2AffineNames returns as its third value.
+// testQ2AffSelfConsistent makes a seeded claim describe a shape a real election
+// could have produced: it mints an incarnation if the fixture did not choose one and
+// derives CopySubject from the record's OWN winner, generation, claim hash and
+// nonce.
+//
+// It exists because several fixtures predate F-065 and built CopySubject from
+// unrelated values — a fresh random generation, a hand-written claim hash — which no
+// election ever emits. q2AffClaimUsableForDecision now refuses such a record on every
+// direct decision path, correctly: a copy subject that does not follow from the
+// record makes the reaper inspect a copy the record does not own. Deriving here is a
+// FIXTURE correction, not a relaxed assertion — the assertions are untouched; what
+// changes is that the staged state is now reachable.
+//
+// A fixture that is ABOUT incarnations must set Nonce itself, with distinct values.
+func testQ2AffSelfConsistent(c *mqttQ2AffClaim) *mqttQ2AffClaim {
+	if c.Nonce == _EMPTY_ {
+		c.Nonce = testQ2AffFixtureNonce
+	}
+	c.CopySubject = mqttQ2AffCopySubject(c.Winner, c.Gen, c.ClaimHash, c.Nonce)
+	return c
+}
+
+// testQ2AffAwaitClaimFor returns the single claim elected for a group, waiting for
+// the election to land. Returns a COPY, so a later transition cannot rewrite what an
+// assertion already read.
+func testQ2AffAwaitClaimFor(t *testing.T, as *mqttAccountSessionManager, groupDur string) *mqttQ2AffClaim {
+	t.Helper()
+	var found *mqttQ2AffClaim
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		found = nil
+		if err := as.scanQ2AffClaims(func(_ string, cl *mqttQ2AffClaim, _ uint64) error {
+			if cl.GroupDurable == groupDur {
+				c := *cl
+				found = &c
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if found == nil {
+			return fmt.Errorf("no claim elected for %q yet", groupDur)
+		}
+		return nil
+	})
+	return found
+}
+
+// testQ2AffSessionClient builds the client the affine terminal paths expect: they reach
+// the account manager and the session THROUGH it, so a bare &client{} makes
+// mqttFinishQ2AffineDelivery return false before doing anything and a test would then be
+// asserting on a no-op.
+func testQ2AffSessionClient(b *testQ2AffBroker, sess *mqttSession) *client {
+	c := &client{srv: b.s}
+	c.mqtt = &mqtt{asm: b.asm, sess: sess}
+	return c
+}
+
 func affDurableFor(idHash, gen string) string {
 	_, _, durable := mqttQ2AffineNames(idHash, gen)
 	return durable
@@ -3414,25 +3484,28 @@ func affDurableFor(idHash, gen string) string {
 // fixture exists so the defect cannot be fixed silently or reintroduced quietly.
 // --------------------------------------------------------------------------
 
-// TestQ2AffReapUsesAStaleCopyReading pins F-065.
+// TestQ2AffReapRefusesACopyStoredDuringItsSourceAck is the regression test F-065's
+// defect fixture BECAME when the remedy landed. It used to assert the claim was
+// reaped and to instruct whoever fixed it to come back and invert it; this is that
+// inversion rather than a new fixture, so the interleaving it stages is exactly the
+// one the finding was filed against.
 //
-// reapQ2AffClaim reads the copy state, then may perform a SourceAcked transition
-// that is a full JetStream round trip, then evaluates reapable() on the EARLIER
-// reading. A copy stored during that round trip is invisible to it, so the claim
-// is deleted out from under a copy that exists.
+// reapQ2AffClaim may perform a SourceAcked transition that is a full JetStream round
+// trip with retries. R1 requires the copy reading reapable() consumes to be taken
+// AFTER that transition and to be the last observation before the delete, so a copy
+// stored during the round trip is seen and the claim is kept.
 //
 // The interleaving is staged through testQ2AffClaimStore, which intercepts exactly
 // the transition whose duration is the window. That is the real window, not a
 // simulation of one: the hook runs where the CAS runs.
 //
-// Leftover asserted: source proven, claim absent, copy PRESENT — the state
-// reapable's own comment says must never exist, because the delivery gate takes its
-// claim == nil branch and NAKs that copy forever.
+// What must NOT be left behind: source proven, claim absent, copy PRESENT — the
+// state reapable's own comment says must never exist, because the delivery gate takes
+// its claim == nil branch and NAKs that copy forever.
 //
-// Discriminating mutation: make reapQ2AffClaim re-read the copy state after the
-// SourceAcked advance and pass THAT to reapable. The reap then declines, the claim
-// survives, and this fixture fails at "the claim was reaped".
-func TestQ2AffReapUsesAStaleCopyReading(t *testing.T) {
+// Paired mutation M1: move loadQ2AffCopy back above the advance. The reap then acts
+// on the pre-transition reading, deletes the claim, and this test fails.
+func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 	t.Parallel()
 	b := testQ2AffSetup(t, "stalecopy")
 	c, _ := b.member(t, "stalecopyA", 300)
@@ -3454,7 +3527,7 @@ func TestQ2AffReapUsesAStaleCopyReading(t *testing.T) {
 	const goneSeq = uint64(999999)
 	subject := mqttQ2AffClaimSubject(groupDur, goneSeq)
 	claimHash := mqttQ2AffClaimHash(groupDur, goneSeq)
-	copySubject := mqttQ2AffCopySubject(idHash, gen, claimHash)
+	copySubject := mqttQ2AffCopySubject(idHash, gen, claimHash, testQ2AffFixtureNonce)
 
 	claim := &mqttQ2AffClaim{
 		Winner:       idHash,
@@ -3462,6 +3535,7 @@ func TestQ2AffReapUsesAStaleCopyReading(t *testing.T) {
 		GroupDurable: groupDur,
 		SourceSeq:    goneSeq,
 		ClaimHash:    claimHash,
+		Nonce:        testQ2AffFixtureNonce,
 		CopySubject:  copySubject,
 		AffDurable:   affDurableFor(idHash, gen),
 		Phase:        mqttQ2AffMaterialized,
@@ -3491,7 +3565,7 @@ func TestQ2AffReapUsesAStaleCopyReading(t *testing.T) {
 				msg:          []byte("stranded"),
 				claimSubject: subject,
 				gen:          gen,
-				msgID:        mqttQ2AffMsgId(groupDur, goneSeq),
+				msgID:        mqttQ2AffMsgId(groupDur, goneSeq, testQ2AffFixtureNonce),
 			}
 			msg, hdrLen := mqttNewQ2AffineRecord(env)
 			if _, err := b.asm.jsa.storeMsg(copySubject, hdrLen, msg); err != nil {
@@ -3515,14 +3589,14 @@ func TestQ2AffReapUsesAStaleCopyReading(t *testing.T) {
 	if st != mqttQ2AffCopyPresent {
 		t.Fatalf("the racing copy is not on the stream (%v); the interleaving did not complete", st)
 	}
-	if gotClaim != nil {
-		// Deliberately a FAILURE and not a skip. This fixture pins a defect, so the remedy
-		// landing is exactly when someone must come back and replace it with a regression
-		// test for the fix — a silent skip would let the pin rot into a no-op.
-		t.Fatal("the reap declined, so F-065 is fixed: replace this defect fixture with a regression test asserting the claim survives a copy stored during the SourceAcked transition")
+	if gotClaim == nil {
+		t.Fatal("the claim was reaped out from under a copy that exists: reapable() consumed a copy reading older than the reap's own SourceAcked transition (F-065)")
 	}
-	// F-065, pinned: the claim is gone and its copy is not.
-	t.Log("F-065 reproduced: claim reaped at a stale copy reading, leaving a copy the delivery gate can only NAK")
+	// Declining to reap must not mean declining to prove the source side, or the claim
+	// could never become reapable at all.
+	if !gotClaim.SourceAcked {
+		t.Fatal("the reap declined without recording the source side it had just proven")
+	}
 }
 
 // TestQ2AffResumeAdoptsConsumerKeepingItsCreated pins the mechanism behind F-036's third
@@ -3657,7 +3731,8 @@ func testQ2AffSweepLeavesAStrandedClaim(t *testing.T) {
 		GroupDurable: groupDur,
 		SourceSeq:    sourceSeq,
 		ClaimHash:    claimHash,
-		CopySubject:  mqttQ2AffCopySubject(idHash, gen, claimHash),
+		Nonce:        testQ2AffFixtureNonce,
+		CopySubject:  mqttQ2AffCopySubject(idHash, gen, claimHash, testQ2AffFixtureNonce),
 		AffDurable:   durable,
 		Phase:        mqttQ2AffClaimed,
 	}
@@ -3829,13 +3904,23 @@ func TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage(t *testing.T) {
 	// A claim left over from the previous incarnation: terminal on the discard axis with
 	// its group ack still UNPROVEN — the resting state the protocol requires, since a
 	// discarded claim must survive precisely until some contender proves that ack.
+	// The CLAIM SUBJECT above is what this fixture pins, and it stays literal. The COPY
+	// subject is derived from the record's own identity instead: since F-065 a record
+	// whose copy subject does not follow from its own fields is refused on every direct
+	// decision path, so a hand-built one would make the mover decline before it ever
+	// reached the terminal arm this row asserts — the fixture would then fail for a
+	// reason that has nothing to do with F-066. Note what this does NOT change: the
+	// collision is on the claim subject, which carries no incarnation, so F-065's nonce
+	// does not close this row.
+	staleGen := mqttNewQ2AffGen()
 	stale := &mqttQ2AffClaim{
 		Winner:       getHash("someone-else"),
-		Gen:          mqttNewQ2AffGen(),
+		Gen:          staleGen,
 		GroupDurable: groupDur,
 		SourceSeq:    nextSeq,
 		ClaimHash:    claimHash,
-		CopySubject:  mqttQ2AffCopySubject(getHash("someone-else"), mqttNewQ2AffGen(), claimHash),
+		Nonce:        testQ2AffFixtureNonce,
+		CopySubject:  mqttQ2AffCopySubject(getHash("someone-else"), staleGen, claimHash, testQ2AffFixtureNonce),
 		AffDurable:   "$MQTT_Q2AFF_stalefromlastincarnation",
 		Phase:        mqttQ2AffMaterialized,
 		Discarded:    true,
@@ -5022,7 +5107,8 @@ func testQ2AffStageContenderSeeded(t *testing.T, name string,
 
 	seeded := testQ2AffSeedElectedClaim(t, b, func(c *mqttQ2AffClaim) {
 		c.Winner, c.Gen = wHash, wGen
-		c.CopySubject = mqttQ2AffCopySubject(wHash, wGen, c.ClaimHash)
+		c.Nonce = testQ2AffFixtureNonce
+		c.CopySubject = mqttQ2AffCopySubject(wHash, wGen, c.ClaimHash, testQ2AffFixtureNonce)
 		c.AffDurable = st.durable
 		if seed != nil {
 			seed(c)
@@ -6022,4 +6108,3256 @@ func TestQ2AffOwnerResumesAfterAContenderCreatedItsDurable(t *testing.T) {
 		t.Fatalf("unexpected delivery: payload=%q qos=%d", payload, qos)
 	}
 	b.completeExchange(t, cr, rr, pi)
+}
+
+// --------------------------------------------------------------------------
+// F-065: a claim incarnation has an identity, and a superseded incarnation can
+// neither be written to nor have its copy adopted.
+// --------------------------------------------------------------------------
+
+// TestQ2AffReplacementIncarnationKeepsItsOwnCopy is route C, the interleaving that
+// took three review rounds to state correctly.
+//
+// A claim subject's election is create-only, so it can be won AGAIN after a reap —
+// by a group delivery callback that was already dispatched when the reap happened.
+// Before F-065 both incarnations derived the SAME copy subject, so the replacement
+// adopted the copy a superseded materializer was about to withdraw, and that
+// materializer's advance (which asserted only Winner+Gen) mutated the REPLACEMENT's
+// record. Two things stop it now: the copy subject carries the incarnation, and
+// advanceQ2AffClaim refuses a write whose expected nonce does not match the record
+// it loaded.
+//
+// The ordering below is the only one the create-only election permits, which is what
+// round 5 corrected: the replacement cannot win the CAS until the first claim is
+// gone. So C1 is completed and reaped FIRST, and the stale actor is held across it.
+//
+// Paired mutations: M6 (drop the nonce from advanceQ2AffClaim's identity check) —
+// the stale advance is then accepted; M9 (derive the copy subject without the nonce)
+// — the two incarnations then share a subject and the withdrawal destroys C2's copy.
+func TestQ2AffReplacementIncarnationKeepsItsOwnCopy(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "reincarn")
+	c, _ := b.member(t, "reincarnA", 300)
+	b.bind(t, "reincarnA")
+	idHash := getHash("reincarnA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("the member has no affine generation, so no consumer would retain either copy")
+	}
+	groupDur := b.groupDurable(t)
+
+	// The client leaves but keeps its session and its affine consumer, so both copies
+	// are retained by interest rather than consumed the instant they land.
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	const srcSeq = uint64(778899)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, srcSeq)
+
+	// C1: the superseded incarnation. A stale materializer proved its copy present.
+	c1 := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: claimHash, Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen),
+		Phase:      mqttQ2AffClaimed,
+	})
+	env1 := &mqttQ2AffineEnvelope{
+		natsSubject: b.topic, msg: []byte("superseded"),
+		claimSubject: subject, gen: gen,
+		msgID: mqttQ2AffMsgId(groupDur, srcSeq, c1.Nonce),
+	}
+	msg1, hdr1 := mqttNewQ2AffineRecord(env1)
+	seq1, err := b.asm.storeQ2AffCopy(c1.CopySubject, hdr1, msg1)
+	if err != nil {
+		t.Fatalf("staging the superseded copy: %v", err)
+	}
+	if st, _ := b.asm.loadQ2AffCopy(c1.CopySubject); st != mqttQ2AffCopyPresent {
+		t.Fatalf("the superseded copy is not on the stream (%v); interest retention did not keep it", st)
+	}
+
+	// C1 is completed and REAPED, which is what frees the subject for a replacement.
+	// Seeded directly: the point of the fixture is the state after the reap.
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, c1); err != nil {
+		t.Fatalf("seeding C1: %v", err)
+	}
+	_, c1seq, _ := b.asm.loadQ2AffClaim(subject)
+	if err := b.asm.jsa.deleteMsg(mqttQoS2AssignStreamName, c1seq, true); err != nil {
+		t.Fatalf("reaping C1: %v", err)
+	}
+
+	// C2: the replacement, elected by the still-running delivery, with its OWN
+	// incarnation and therefore its own copy subject.
+	c2 := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: claimHash, Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen),
+		Phase:      mqttQ2AffClaimed,
+	})
+	if c2.CopySubject == c1.CopySubject {
+		t.Fatal("two incarnations of one claim subject derived the SAME copy subject: the replacement can adopt the copy the superseded materializer is about to withdraw (F-065 route C)")
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, c2); err != nil {
+		t.Fatalf("electing C2: %v", err)
+	}
+	c2claim, c2seq, _ := b.asm.loadQ2AffClaim(subject)
+
+	// C2 materializes its own copy, through production code.
+	env2 := &mqttQ2AffineEnvelope{
+		natsSubject: b.topic, msg: []byte("replacement"),
+		claimSubject: subject, gen: gen,
+	}
+	if !b.asm.materializeQ2AffCopy(b.s, c2claim, subject, c2seq, env2) {
+		t.Fatal("the replacement incarnation could not materialize its own copy")
+	}
+
+	// Now the stale actor resumes: its advance must be REFUSED, and its withdrawal
+	// must remove only its own copy.
+	updated, _, aerr := b.asm.advanceQ2AffClaim(subject, c1.Winner, c1.Gen, c1.Nonce, _EMPTY_,
+		func(cl *mqttQ2AffClaim) { cl.Phase = mqttQ2AffMaterialized })
+	if aerr == nil {
+		t.Fatal("a superseded incarnation's transition was ACCEPTED: it has just written a fact about its own copy onto the replacement's record (F-065)")
+	}
+	if !b.asm.q2AffCopyIsDisowned(subject, c1, updated, aerr) {
+		t.Fatal("the superseded copy was not recognised as disowned, so nothing will ever withdraw it")
+	}
+	b.asm.withdrawQ2AffCopy(b.s, c1.CopySubject, seq1)
+
+	// The replacement is untouched: its record still says materialized, and its copy
+	// is still there.
+	after, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil || after == nil {
+		t.Fatalf("the replacement claim is gone: %v", err)
+	}
+	if after.Nonce != c2.Nonce {
+		t.Fatalf("the record no longer names the replacement incarnation: got %q, want %q", after.Nonce, c2.Nonce)
+	}
+	if after.Phase != mqttQ2AffMaterialized {
+		t.Fatalf("the replacement's phase was rolled back to %v", after.Phase)
+	}
+	if st, _ := b.asm.loadQ2AffCopy(c2.CopySubject); st != mqttQ2AffCopyPresent {
+		t.Fatalf("the replacement's own copy was destroyed by the superseded materializer's withdrawal (%v)", st)
+	}
+	if st, _ := b.asm.loadQ2AffCopy(c1.CopySubject); st != mqttQ2AffCopyAbsent {
+		t.Fatalf("the superseded copy survived its withdrawal (%v); it can never be delivered and would NAK forever", st)
+	}
+}
+
+// TestQ2AffWithdrawsACopyNothingCanAuthorize covers the withdrawal rule's arms.
+//
+// A materialization attempt that PROVED a copy present withdraws it once the same
+// attempt proves, authoritatively, that no claim of that copy's own incarnation
+// remains to authorize it. The rule is deliberately conditional: a copy no attempt is
+// currently examining is not collected by anything, which is the residual F-065's
+// re-scoped guarantee states.
+//
+// Each subtest names the mutation it kills, because two prior review rounds struck
+// out mutation claims that changed a code path without changing an observable.
+func TestQ2AffWithdrawsACopyNothingCanAuthorize(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "withdraw")
+	c, _ := b.member(t, "withdrawA", 300)
+	b.bind(t, "withdrawA")
+	idHash := getHash("withdrawA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation, so no consumer would retain a staged copy")
+	}
+	groupDur := b.groupDurable(t)
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	// seed elects one claim incarnation and returns it with its loaded sequence.
+	seed := func(t *testing.T, srcSeq uint64, phase mqttQ2AffPhase, mut func(*mqttQ2AffClaim)) (*mqttQ2AffClaim, string, uint64) {
+		t.Helper()
+		subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+		cl := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+			AffDurable: affDurableFor(idHash, gen), Phase: phase,
+		})
+		if mut != nil {
+			mut(cl)
+		}
+		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, cl); err != nil {
+			t.Fatalf("seeding the claim: %v", err)
+		}
+		got, seq, err := b.asm.loadQ2AffClaim(subject)
+		if err != nil || got == nil {
+			t.Fatalf("loading the seeded claim: %v", err)
+		}
+		return got, subject, seq
+	}
+	env := func() *mqttQ2AffineEnvelope {
+		return &mqttQ2AffineEnvelope{natsSubject: b.topic, msg: []byte("body")}
+	}
+	deleteClaim := func(t *testing.T, subject string) {
+		t.Helper()
+		_, seq, err := b.asm.loadQ2AffClaim(subject)
+		if err != nil {
+			t.Fatalf("loading before delete: %v", err)
+		}
+		if err := b.asm.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); err != nil {
+			t.Fatalf("deleting the claim: %v", err)
+		}
+	}
+
+	// M2: delete the withdrawal call. The stranded copy then stays present.
+	t.Run("claim reaped between the proof and the CAS: the copy is withdrawn", func(t *testing.T) {
+		cl, subject, seq := seed(t, 811001, mqttQ2AffClaimed, nil)
+		b.asm.mu.Lock()
+		b.asm.testQ2AffPreMaterialize = func(string, uint64) error { deleteClaim(t, subject); return nil }
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffPreMaterialize = nil; b.asm.mu.Unlock() }()
+
+		if b.asm.materializeQ2AffCopy(b.s, cl, subject, seq, env()) {
+			t.Fatal("materialization reported success against a claim that no longer exists")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(cl.CopySubject); st != mqttQ2AffCopyAbsent {
+			t.Fatalf("the copy survived with no claim able to authorize it (%v): the delivery gate can only NAK it, forever", st)
+		}
+	})
+
+	// M3: withdraw on the error arm without taking the fresh read. A live claim's
+	// copy is then destroyed on an answer that was never authoritative.
+	t.Run("an indeterminate transition retains the copy", func(t *testing.T) {
+		cl, subject, seq := seed(t, 811002, mqttQ2AffClaimed, nil)
+		b.asm.mu.Lock()
+		b.asm.testQ2AffClaimStore = func(string, uint64, *mqttQ2AffClaim) (uint64, error) {
+			return 0, fmt.Errorf("backend unavailable")
+		}
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffClaimStore = nil; b.asm.mu.Unlock() }()
+
+		if b.asm.materializeQ2AffCopy(b.s, cl, subject, seq, env()) {
+			t.Fatal("materialization reported success although its transition never committed")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(cl.CopySubject); st != mqttQ2AffCopyPresent {
+			t.Fatalf("an indeterminate answer destroyed a live claim's copy (%v); it must fail closed", st)
+		}
+		if after, _, _ := b.asm.loadQ2AffClaim(subject); after == nil {
+			t.Fatal("the claim itself disappeared")
+		}
+	})
+
+	// M5: drop the !terminal() test. Route B's copy then survives with nothing able
+	// to deliver it — the interleaving that needs no reaper race at all.
+	t.Run("a terminal claim of our own incarnation: the copy is withdrawn", func(t *testing.T) {
+		cl, subject, seq := seed(t, 811003, mqttQ2AffClaimed, nil)
+		b.asm.mu.Lock()
+		b.asm.testQ2AffPreMaterialize = func(string, uint64) error {
+			// The claim completes under us, exactly as route B describes.
+			if _, _, err := b.asm.advanceQ2AffClaim(subject, _EMPTY_, _EMPTY_, cl.Nonce, _EMPTY_,
+				func(c *mqttQ2AffClaim) { c.AffineDone = true }); err != nil {
+				t.Errorf("completing the claim mid-flight: %v", err)
+			}
+			return nil
+		}
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffPreMaterialize = nil; b.asm.mu.Unlock() }()
+
+		if b.asm.materializeQ2AffCopy(b.s, cl, subject, seq, env()) {
+			t.Fatal("materialization reported success for a claim that had already completed")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(cl.CopySubject); st != mqttQ2AffCopyAbsent {
+			t.Fatalf("a copy stored under a completed claim survived (%v): it duplicates a PUBLISH the client already answered", st)
+		}
+	})
+
+	// M7 / M8: the AMBIGUOUS store — it LANDED and its response was lost. Revision 7
+	// requires this, and it is the case that most needs the presence proof: the store
+	// reports nothing, so a design keyed on the response would abandon a copy that is
+	// really there, and one that returned early on a non-CAS error would never look.
+	// Either regression leaves a real copy NAK-looping behind the gate forever.
+	t.Run("a store that landed but reported an error is still resolved", func(t *testing.T) {
+		cl, subject, seq := seed(t, 811005, mqttQ2AffClaimed, nil)
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyStore = func(subj string, hdrLen int, msg []byte) (uint64, error) {
+			if _, err := b.asm.jsa.storeMsg(subj, hdrLen, msg); err != nil {
+				t.Errorf("landing the copy: %v", err)
+			}
+			return 0, fmt.Errorf("test: the store response was lost")
+		}
+		b.asm.testQ2AffPreMaterialize = func(string, uint64) error { deleteClaim(t, subject); return nil }
+		b.asm.mu.Unlock()
+		defer func() {
+			b.asm.mu.Lock()
+			b.asm.testQ2AffCopyStore, b.asm.testQ2AffPreMaterialize = nil, nil
+			b.asm.mu.Unlock()
+		}()
+
+		if b.asm.materializeQ2AffCopy(b.s, cl, subject, seq, env()) {
+			t.Fatal("materialization reported success against a claim that no longer exists")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(cl.CopySubject); st != mqttQ2AffCopyAbsent {
+			t.Fatalf("a copy that LANDED while its response was lost survived with nothing able to authorize it (%v): the attempt either returned before the presence check or took its sequence from the missing response", st)
+		}
+	})
+
+	// The property is about the PROOF, not about who stored the copy: a call that found
+	// the copy ALREADY present still resolves it, because the copy's incarnation is
+	// what has ended and a copy nothing can authorize must not be left NAK-looping just
+	// because some other actor stored it. Round 2 required the guarantee to be stated
+	// this way, since the narrower "only what I stored" version was not what the code
+	// did.
+	//
+	// M4: require an own store before withdrawing. The copy then survives here.
+	// T5, with revision 7's OWN M4: the claim subject is taken over by a DIFFERENT
+	// generation after this call proved its copy, so advanceQ2AffClaim returns
+	// errQ2AffUnresolved with a non-nil claim. That arm must withdraw. Recorded because
+	// the ledger previously labelled a different mutation M4 — the own-store guard — so
+	// the documented kill did not establish this behaviour at all.
+	t.Run("the subject taken over by another generation: the copy is withdrawn", func(t *testing.T) {
+		cl, subject, seq := seed(t, 811006, mqttQ2AffClaimed, nil)
+		b.asm.mu.Lock()
+		b.asm.testQ2AffPreMaterialize = func(string, uint64) error {
+			deleteClaim(t, subject)
+			other := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+				Winner: idHash, Gen: mqttNewQ2AffGen(), GroupDurable: groupDur, SourceSeq: 811006,
+				ClaimHash: mqttQ2AffClaimHash(groupDur, 811006), Nonce: mqttNewQ2AffGen(),
+				Phase: mqttQ2AffClaimed,
+			})
+			other.AffDurable = affDurableFor(other.Winner, other.Gen)
+			if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, other); err != nil {
+				t.Errorf("installing the other generation's claim: %v", err)
+			}
+			return nil
+		}
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffPreMaterialize = nil; b.asm.mu.Unlock() }()
+
+		if b.asm.materializeQ2AffCopy(b.s, cl, subject, seq, env()) {
+			t.Fatal("materialization reported success although the subject is held by another generation")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(cl.CopySubject); st != mqttQ2AffCopyAbsent {
+			t.Fatalf("the copy survived under a subject held by another generation (%v): nothing can ever authorize it, because a claim naming a different winner or generation derives a different copy subject", st)
+		}
+	})
+
+	t.Run("a copy this call only OBSERVED is still withdrawn", func(t *testing.T) {
+		cl, subject, seq := seed(t, 811004, mqttQ2AffClaimed, nil)
+		// Pre-store the copy, so the call finds it present and stores nothing.
+		e := env()
+		e.claimSubject, e.gen, e.msgID = subject, gen, mqttQ2AffMsgId(groupDur, 811004, cl.Nonce)
+		msg, hdr := mqttNewQ2AffineRecord(e)
+		if _, err := b.asm.storeQ2AffCopy(cl.CopySubject, hdr, msg); err != nil {
+			t.Fatalf("pre-storing the copy: %v", err)
+		}
+		b.asm.mu.Lock()
+		b.asm.testQ2AffPreMaterialize = func(string, uint64) error { deleteClaim(t, subject); return nil }
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffPreMaterialize = nil; b.asm.mu.Unlock() }()
+
+		if b.asm.materializeQ2AffCopy(b.s, cl, subject, seq, env()) {
+			t.Fatal("materialization reported success against a claim that no longer exists")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(cl.CopySubject); st != mqttQ2AffCopyAbsent {
+			t.Fatalf("a copy whose incarnation has ended survived because this call had not stored it itself (%v)", st)
+		}
+	})
+}
+
+// TestQ2AffCopyDedupKeyIsScopedToTheIncarnation is the subtlest of the non-recovery
+// wirings, which is why Codex's plan review asked for it early.
+//
+// A dedupe entry OUTLIVES its message (measured, see
+// TestQ2AffCopyStoreWithNoInterestSequenceAndDedupe). So the key has to be scoped to
+// the claim INCARNATION twice over:
+//
+//   - Across incarnations it must DIFFER, or a replacement's store onto its own fresh
+//     subject is silently discarded for the whole Duplicates window and that claim
+//     never materializes.
+//   - Within one incarnation it must be STABLE, or every retry stores a second copy —
+//     which is the attempt-scoped identity F-063 refuted.
+//
+// The stability half is asserted the way round 4 required: by DELETING the copy and
+// retrying, so the dedupe entry is the only thing that can suppress the second store.
+// Asserting only "two incarnations both land" would not kill M10, because deriving the
+// key from the pre-election envelope also makes two stores land.
+func TestQ2AffCopyDedupKeyIsScopedToTheIncarnation(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "dedupinc")
+	c, _ := b.member(t, "dedupincA", 300)
+	b.bind(t, "dedupincA")
+	idHash := getHash("dedupincA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation, so no consumer would retain a staged copy")
+	}
+	groupDur := b.groupDurable(t)
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	const srcSeq = uint64(922001)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	materialize := func(t *testing.T, nonce string) *mqttQ2AffClaim {
+		t.Helper()
+		cl := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: nonce,
+			AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffClaimed,
+		})
+		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, cl); err != nil {
+			t.Fatalf("electing incarnation %s: %v", nonce, err)
+		}
+		got, seq, err := b.asm.loadQ2AffClaim(subject)
+		if err != nil || got == nil {
+			t.Fatalf("loading incarnation %s: %v", nonce, err)
+		}
+		// Deliberately built as the MOVER builds it — before the election, carrying
+		// this attempt's own candidate values — so the production path is the thing
+		// that has to rebind the key from the persisted claim.
+		env := &mqttQ2AffineEnvelope{
+			natsSubject: b.topic, msg: []byte("body-" + nonce),
+			claimSubject: subject, gen: gen,
+			msgID: mqttQ2AffMsgId(groupDur, srcSeq, mqttNewQ2AffGen()),
+		}
+		if !b.asm.materializeQ2AffCopy(b.s, got, subject, seq, env) {
+			t.Fatalf("incarnation %s could not materialize its own copy", nonce)
+		}
+		if st, _ := b.asm.loadQ2AffCopy(got.CopySubject); st != mqttQ2AffCopyPresent {
+			t.Fatalf("incarnation %s materialized but its copy is not on the stream (%v): its store was deduped away against a previous incarnation's key", nonce, st)
+		}
+		return got
+	}
+
+	first := materialize(t, mqttNewQ2AffGen())
+
+	// Reap the first incarnation and elect a second on the same claim subject.
+	_, seq, _ := b.asm.loadQ2AffClaim(subject)
+	if err := b.asm.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); err != nil {
+		t.Fatalf("reaping the first incarnation: %v", err)
+	}
+	second := materialize(t, mqttNewQ2AffGen())
+	if second.CopySubject == first.CopySubject {
+		t.Fatal("the two incarnations shared a copy subject")
+	}
+
+	// Stability within ONE incarnation. This half has to be staged on a claim that is
+	// still `claimed`: once a claim is materialized, materializeQ2AffCopy refuses to
+	// re-store for it at all (F-063), so a retry there proves nothing about the dedup
+	// key — which is how the first version of this assertion passed against M10.
+	const staySeq = uint64(922002)
+	staySubject := mqttQ2AffClaimSubject(groupDur, staySeq)
+	stay := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: staySeq,
+		ClaimHash: mqttQ2AffClaimHash(groupDur, staySeq), Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffClaimed,
+	})
+	if _, err := b.asm.storeQ2AffClaimCAS(staySubject, 0, stay); err != nil {
+		t.Fatalf("electing the stability incarnation: %v", err)
+	}
+	// A first attempt of THIS incarnation stores its copy under the incarnation's own
+	// key, and the phase deliberately stays `claimed`.
+	firstEnv := &mqttQ2AffineEnvelope{
+		natsSubject: b.topic, msg: []byte("first-attempt"),
+		claimSubject: staySubject, gen: gen,
+		msgID: mqttQ2AffMsgId(groupDur, staySeq, stay.Nonce),
+	}
+	fm, fh := mqttNewQ2AffineRecord(firstEnv)
+	if _, err := b.asm.storeQ2AffCopy(stay.CopySubject, fh, fm); err != nil {
+		t.Fatalf("storing the first attempt's copy: %v", err)
+	}
+	if _, sm := b.asm.loadQ2AffCopy(stay.CopySubject); sm != nil {
+		if err := b.asm.jsa.deleteMsg(mqttOutStreamName, sm.Sequence, true); err != nil {
+			t.Fatalf("deleting the first attempt's copy: %v", err)
+		}
+	}
+	if st, _ := b.asm.loadQ2AffCopy(stay.CopySubject); st != mqttQ2AffCopyAbsent {
+		t.Fatal("the copy was not removed, so the retry below would prove nothing")
+	}
+
+	// The retry carries a FRESH candidate key, which is what the mover hands in: the
+	// envelope is built before the election, so every attempt arrives with its own
+	// candidate nonce. Rebinding it from the PERSISTED claim is the only thing that can
+	// make this retry dedup against the first attempt above.
+	cur, curSeq, _ := b.asm.loadQ2AffClaim(staySubject)
+	retry := &mqttQ2AffineEnvelope{
+		natsSubject: b.topic, msg: []byte("retry"),
+		claimSubject: staySubject, gen: gen,
+		msgID: mqttQ2AffMsgId(groupDur, staySeq, mqttNewQ2AffGen()),
+	}
+	b.asm.materializeQ2AffCopy(b.s, cur, staySubject, curSeq, retry)
+	if st, _ := b.asm.loadQ2AffCopy(stay.CopySubject); st != mqttQ2AffCopyAbsent {
+		t.Fatalf("a retry of the SAME incarnation stored a second copy (%v): its key came from the attempt rather than from the persisted claim, which is the identity F-063 refuted", st)
+	}
+}
+
+// TestQ2AffGateDisposesASupersededIncarnationsCopy covers the delivery gate's new
+// arm, and the boundary that makes it legitimate.
+//
+// A live claim naming a DIFFERENT copy subject is positive evidence that the copy in
+// hand belongs to an incarnation that is over, so the gate disposes of it. That is
+// not the same as an ABSENT claim, which stays fail-closed and NAKs — absence is
+// producible by a supported operation (F-066's stream recreation), so it never
+// licenses destroying an accepted message (feedback_absence_is_not_a_fact). Both
+// halves are asserted here, because the arm is only safe if the boundary holds.
+//
+// Paired mutation M11: drop the gate's CopySubject comparison. The superseded copy is
+// then NAK'd forever instead of disposed of.
+func TestQ2AffGateDisposesASupersededIncarnationsCopy(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "gatesup")
+	c, r := b.member(t, "gatesupA", 300)
+	defer c.Close()
+	b.bind(t, "gatesupA")
+	idHash := getHash("gatesupA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+
+	const srcSeq = uint64(733001)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, srcSeq)
+
+	// The live claim is incarnation TWO, materialized, with its own copy subject.
+	live := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: claimHash, Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen),
+		Phase:      mqttQ2AffMaterialized,
+	})
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, live); err != nil {
+		t.Fatalf("seeding the live claim: %v", err)
+	}
+
+	// The copy on the stream belongs to incarnation ONE, which the live claim does not
+	// name. Stored on the SUPERSEDED subject, which the consumer's generation filter
+	// still covers — so the gate really does receive it.
+	supersededNonce := mqttNewQ2AffGen()
+	supersededSubject := mqttQ2AffCopySubject(idHash, gen, claimHash, supersededNonce)
+	if supersededSubject == live.CopySubject {
+		t.Fatal("the two incarnations share a copy subject, so this fixture cannot stage the case")
+	}
+	env := &mqttQ2AffineEnvelope{
+		natsSubject: b.topic, msg: []byte("from-a-dead-incarnation"),
+		claimSubject: subject, gen: gen,
+		msgID: mqttQ2AffMsgId(groupDur, srcSeq, supersededNonce),
+	}
+	msg, hdr := mqttNewQ2AffineRecord(env)
+	if _, err := b.asm.storeQ2AffCopy(supersededSubject, hdr, msg); err != nil {
+		t.Fatalf("staging the superseded copy: %v", err)
+	}
+
+	// The client is connected, so the gate runs on delivery. It must NOT publish, and
+	// the copy must go away rather than NAK-loop.
+	if _, _, ready := testMQTTReadPacketReady(r, 1500*time.Millisecond); ready {
+		t.Fatal("a PUBLISH arrived for a copy belonging to a superseded incarnation: the live claim does not authorize it")
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		st, _ := b.asm.loadQ2AffCopy(supersededSubject)
+		if st == mqttQ2AffCopyAbsent {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the superseded copy is still on the stream: the gate NAK'd it instead of disposing of it, and with no MaxDeliver it will do so forever")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// The live claim is untouched: nothing was asserted about ITS delivery.
+	after, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil || after == nil {
+		t.Fatalf("the live claim vanished: %v", err)
+	}
+	if after.AffineDone || after.Lost || after.Discarded {
+		t.Fatalf("disposing of a superseded copy wrote a terminal fact onto the LIVE claim: %+v", after)
+	}
+}
+
+// TestQ2AffUnattributableClaimIsRefusedButDoesNotWedgeTheAccount pins the SPLIT
+// between the two validators, which round 3 required and round 4 completed.
+//
+// A claim whose copy subject does not follow from its own identity cannot be acted
+// on: the reaper reads that subject to decide whether to DELETE the claim, and
+// recovery reads it before writing the incarnation-specific Lost and source-gone
+// dispositions. Both refuse it.
+//
+// But it must still be ATTRIBUTABLE. mqttQ2AffClaimIdentityOK is the shared floor for
+// the account-wide scans, where one failure aborts the whole walk — and from clear()
+// that fails the discard, strands the teardown marker and locks an unrelated client ID
+// out of its next CONNECT. Winner+Gen still attributes such a claim to its session, so
+// the floor deliberately does NOT check the nonce.
+//
+// Paired mutations: M12a (drop the nonce from the operational validator) — the reaper
+// then deletes a claim on a copy subject the record does not own; M13 (add the nonce
+// checks to mqttQ2AffClaimIdentityOK) — the account-wide discard then aborts.
+func TestQ2AffUnattributableClaimIsRefusedButDoesNotWedgeTheAccount(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "unattrib")
+	c, _ := b.member(t, "unattribA", 300)
+	b.bind(t, "unattribA")
+	idHash := getHash("unattribA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["unattribA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	const srcSeq = uint64(644001)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	// Terminal and source-proven, so the ONLY thing standing between this record and a
+	// reap is the refusal under test.
+	bad := &mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq),
+		Nonce:     mqttNewQ2AffGen(),
+		// Derived for a DIFFERENT incarnation: a shape no election can emit.
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, srcSeq), mqttNewQ2AffGen()),
+		AffDurable:  affDurableFor(idHash, gen),
+		Phase:       mqttQ2AffMaterialized, SourceAcked: true, AffineDone: true,
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, bad); err != nil {
+		t.Fatalf("seeding the unattributable claim: %v", err)
+	}
+	if err := q2AffClaimUsableForDecision(subject, bad); err == nil {
+		t.Fatal("the operational validator accepted a copy subject that does not follow from the record's own identity")
+	}
+	// Every unattributable SHAPE the plan names, not just the mismatched subject. A nonce
+	// of the wrong LENGTH is the interesting one: its copy subject still derives from it
+	// consistently, so only the minted-form check can refuse it.
+	for name, mut := range map[string]func(*mqttQ2AffClaim){
+		"no incarnation":        func(c *mqttQ2AffClaim) { c.Nonce = _EMPTY_ },
+		"short incarnation":     func(c *mqttQ2AffClaim) { c.Nonce = "tooshort" },
+		"out-of-alphabet nonce": func(c *mqttQ2AffClaim) { c.Nonce = strings.Repeat(".", mqttQ2AffGenLen) },
+	} {
+		shape := *bad
+		mut(&shape)
+		shape.CopySubject = mqttQ2AffCopySubject(shape.Winner, shape.Gen, shape.ClaimHash, shape.Nonce)
+		if err := q2AffClaimUsableForDecision(subject, &shape); err == nil {
+			t.Fatalf("a claim with a %s was accepted even though its copy subject derives from it: the incarnation would then be passed to the fence, where an unmintable value cannot match any real record", name)
+		}
+	}
+
+	// The reaper refuses it. Without the refusal it would delete this claim on what a
+	// copy subject the record does not own happens to say.
+	b.asm.reapQ2AffClaim(b.s, subject)
+	if got, _, err := b.asm.loadQ2AffClaim(subject); err != nil || got == nil {
+		t.Fatal("the reaper acted on a claim whose copy subject does not follow from its own identity: it inspected a copy the record does not own")
+	}
+
+	// Recovery skips it WITHOUT failing, so an unrelated session's reconciliation is
+	// unaffected.
+	b.asm.recoverQ2AffClaims(idHash, gen)
+	if got, _, err := b.asm.loadQ2AffClaim(subject); err != nil || got == nil {
+		t.Fatal("recovery acted on the unattributable claim")
+	}
+
+	// The shape above only proves recovery does not REAP, because its AffineDone arm
+	// delegates to reapQ2AffClaim, whose own validator refuses the same record — so
+	// removing the guard from recovery alone would leave that assertion green. This shape
+	// reaches recovery's own WRITE instead: materialized, not terminal, copy absent, and
+	// an incarnation that is malformed but SELF-CONSISTENT, so the derivation check passes
+	// and the nonce-equality fence cannot save it either. Without the guard, recovery
+	// marks it LOST — a terminal, never-reapable verdict against a record the broker
+	// cannot attribute.
+	const lostSeq = uint64(644003)
+	lostSubject := mqttQ2AffClaimSubject(groupDur, lostSeq)
+	shortNonce := strings.Repeat("q", mqttQ2AffGenLen-1)
+	lostClaim := &mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: lostSeq,
+		ClaimHash: mqttQ2AffClaimHash(groupDur, lostSeq), Nonce: shortNonce,
+		AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+	}
+	lostClaim.CopySubject = mqttQ2AffCopySubject(idHash, gen, lostClaim.ClaimHash, shortNonce)
+	if q2AffClaimUsableForDecision(lostSubject, lostClaim) == nil {
+		t.Fatal("the staged claim is attributable, so it cannot exercise recovery's own refusal")
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(lostSubject, 0, lostClaim); err != nil {
+		t.Fatalf("seeding the claim recovery would mark lost: %v", err)
+	}
+	b.asm.recoverQ2AffClaims(idHash, gen)
+	lostAfter, _, err := b.asm.loadQ2AffClaim(lostSubject)
+	if err != nil || lostAfter == nil {
+		t.Fatalf("the claim vanished: %v", err)
+	}
+	if lostAfter.Lost {
+		t.Fatal("recovery recorded LOST against a claim the broker cannot attribute: that verdict is terminal and never reapable, so an unattributable record becomes a permanent loss report")
+	}
+
+	// The account-wide floor still ATTRIBUTES it, so the walk completes and the
+	// teardown discard lands. This is the half that must not tighten.
+	if !mqttQ2AffClaimIdentityOK(bad) {
+		t.Fatal("the shared attribution floor rejected a claim its winner and generation identify: one such record would abort every account-wide walk, and from clear() would strand the teardown marker")
+	}
+	if err := b.asm.discardQ2AffClaimsFor(idHash, gen); err != nil {
+		t.Fatalf("the account-wide discard was aborted by one unattributable claim: %v", err)
+	}
+	after, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil {
+		t.Fatalf("loading after the discard: %v", err)
+	}
+	if after == nil || !after.Discarded {
+		t.Fatalf("teardown could not discard a claim its own session owns: %+v", after)
+	}
+}
+
+// TestQ2AffRetiredAffineSourceDischargesItsOwnIncarnation covers the recovery route
+// round 5 found unowned, and the disposition round 6 found missing from it.
+//
+// A successful PUBREC stores the correlated PUBREL BEFORE it records AffineDone. A
+// crash between those two leaves both the PUBREL and the in-flight register; on
+// restart the PUBREL wins over pendingPublish, so the register is classified RETIRED
+// and its claim reference lands in mqttRetiredSource. Nothing used to discharge the
+// affine side from there: the affine callback went straight to trackPublish, which
+// returns identifier zero because the restored PUBREL already reserves that source,
+// and returned without acknowledging the copy — so the copy NAK-looped and the claim
+// never completed. F-065's own harm, re-entered through recovery.
+//
+// Two dispositions are asserted, because the incarnation is what distinguishes them:
+//
+//   - the SAME incarnation: AffineDone is recorded, then the copy is acked, then the
+//     retirement and its register are cleared. Persist before ack, ack before forget.
+//   - a REPLACEMENT incarnation: the copy is disposed of and the retirement cleared,
+//     but NOTHING is written onto the replacement — it made no delivery and must not
+//     be credited with one. Round 6's finding: without this the path either NAK-loops
+//     the copy forever or strands the retirement.
+//
+// Paired mutations: M16b (drop the incarnation from mqttRetiredSource, so the retired
+// route cannot fence its write) and M16c (make the mismatch disposition NAK, or ack
+// without clearing).
+func TestQ2AffRetiredAffineSourceDischargesItsOwnIncarnation(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "retired")
+	c, _ := b.member(t, "retiredA", 300)
+	b.bind(t, "retiredA")
+	idHash := getHash("retiredA")
+	sessRec := testQ2AffAwaitStableRecord(t, b, idHash)
+	gen := sessRec.Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	// Taken while the client is still connected: sessions is keyed by CLIENT ID, and a
+	// disconnect removes the resident entry.
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["retiredA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	sess.mu.Lock()
+	sessGen := sess.gen
+	sess.mu.Unlock()
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	var supersededCopy atomic.Value
+	supersededCopy.Store(_EMPTY_)
+	stage := func(t *testing.T, srcSeq uint64) (*mqttQ2AffClaim, string, uint64) {
+		t.Helper()
+		subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+		cl := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+			AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+		})
+		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, cl); err != nil {
+			t.Fatalf("seeding the claim: %v", err)
+		}
+		env := &mqttQ2AffineEnvelope{
+			natsSubject: b.topic, msg: []byte("retired-body"),
+			claimSubject: subject, gen: gen,
+			msgID: mqttQ2AffMsgId(groupDur, srcSeq, cl.Nonce),
+		}
+		msg, hdr := mqttNewQ2AffineRecord(env)
+		seq, err := b.asm.storeQ2AffCopy(cl.CopySubject, hdr, msg)
+		if err != nil {
+			t.Fatalf("staging the copy: %v", err)
+		}
+		return cl, subject, seq
+	}
+
+	// The confirmed ack is stubbed, because the ORDER is what this test pins and each
+	// step has to be able to succeed or fail on its own. A real confirmed ack needs a
+	// live JetStream delivery, which cannot be staged around a seeded claim.
+	ackOK := func() func() {
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(string) error { return nil }
+		b.asm.mu.Unlock()
+		return func() { b.asm.mu.Lock(); b.asm.testQ2AffCopyAck = nil; b.asm.mu.Unlock() }
+	}
+	ackFails := func() func() {
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(string) error { return fmt.Errorf("ack unconfirmed") }
+		b.asm.mu.Unlock()
+		return func() { b.asm.mu.Lock(); b.asm.testQ2AffCopyAck = nil; b.asm.mu.Unlock() }
+	}
+	retired := func(t *testing.T, jsDur string, copySeq uint64) bool {
+		t.Helper()
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return sess.sourceRetiredLocked(jsDur, copySeq)
+	}
+
+	t.Run("an unconfirmed copy ack retains the retirement", func(t *testing.T) {
+		cl, subject, _ := stage(t, 555003)
+		const jsDur, copySeq = "$MQTT_Q2AFF_retiredunconf", uint64(43)
+		sess.mu.Lock()
+		sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+			pi: 9, nonce: "regnonce3", q2AffClaim: subject, q2AffCopy: cl.CopySubject, durable: true,
+		})
+		sess.mu.Unlock()
+		defer ackFails()()
+
+		sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq, "ack.subject", cl.CopySubject, subject, cl.CopySubject)
+
+		got, _, _ := b.asm.loadQ2AffClaim(subject)
+		if got == nil || !got.AffineDone {
+			t.Fatalf("the affine side was not persisted BEFORE the ack was attempted: %+v", got)
+		}
+		if !retired(t, jsDur, copySeq) {
+			t.Fatal("the retirement was cleared although the copy ack was never confirmed: a lost ack then leaves the copy re-offerable with the state that governs it already gone")
+		}
+	})
+
+	t.Run("a failed AffineDone acknowledges nothing", func(t *testing.T) {
+		cl, subject, _ := stage(t, 555004)
+		const jsDur, copySeq = "$MQTT_Q2AFF_retiredfailed", uint64(44)
+		sess.mu.Lock()
+		sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+			pi: 10, nonce: "regnonce4", q2AffClaim: subject, q2AffCopy: cl.CopySubject, durable: true,
+		})
+		sess.mu.Unlock()
+		var acked bool
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(string) error { acked = true; return nil }
+		b.asm.testQ2AffClaimStore = func(string, uint64, *mqttQ2AffClaim) (uint64, error) {
+			return 0, fmt.Errorf("backend unavailable")
+		}
+		b.asm.mu.Unlock()
+		defer func() {
+			b.asm.mu.Lock()
+			b.asm.testQ2AffCopyAck, b.asm.testQ2AffClaimStore = nil, nil
+			b.asm.mu.Unlock()
+		}()
+
+		sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq, "ack.subject", cl.CopySubject, subject, cl.CopySubject)
+
+		if acked {
+			t.Fatal("the copy was acknowledged although its affine side was never recorded: an absent copy under a claim with no AffineDone is indistinguishable from a lost one")
+		}
+		if !retired(t, jsDur, copySeq) {
+			t.Fatal("the retirement was cleared although nothing was proven")
+		}
+	})
+
+	t.Run("same incarnation: the affine side is recorded and the retirement cleared", func(t *testing.T) {
+		defer ackOK()()
+		cl, subject, _ := stage(t, 555001)
+		const jsDur, copySeq = "$MQTT_Q2AFF_retiredsame", uint64(41)
+		sess.mu.Lock()
+		sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+			pi: 7, nonce: "regnonce", q2AffClaim: subject, q2AffCopy: cl.CopySubject, durable: true,
+		})
+		installed := sess.sourceRetiredLocked(jsDur, copySeq)
+		sess.mu.Unlock()
+		if !installed {
+			t.Fatal("the retirement was not installed, so this run exercises nothing")
+		}
+
+		sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq,
+			"ack.subject", cl.CopySubject, subject, cl.CopySubject)
+
+		got, _, err := b.asm.loadQ2AffClaim(subject)
+		if err != nil {
+			t.Fatalf("loading the claim: %v", err)
+		}
+		if got == nil || !got.AffineDone {
+			t.Fatalf("the retired route did not record the affine side against its own incarnation: %+v", got)
+		}
+		if retired(t, jsDur, copySeq) {
+			t.Fatal("the retirement survived a settled affine source, so every later redelivery repeats the work")
+		}
+	})
+
+	t.Run("replacement incarnation: the copy is disposed and nothing is written to it", func(t *testing.T) {
+		// The stubbed ack RECORDS its reply and removes the staged copy, because a
+		// confirmed acknowledgement is what disposes of it in production. Review found
+		// the earlier version proved neither: it returned success without touching the
+		// copy, so it passed even if the mismatch branch cleared the retirement without
+		// ever confirming an acknowledgement.
+		var ackedReply atomic.Value
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(reply string) error {
+			ackedReply.Store(reply)
+			if _, sm := b.asm.loadQ2AffCopy(supersededCopy.Load().(string)); sm != nil {
+				if derr := b.asm.jsa.deleteMsg(mqttOutStreamName, sm.Sequence, true); derr != nil {
+					t.Errorf("disposing of the acknowledged copy: %v", derr)
+				}
+			}
+			return nil
+		}
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffCopyAck = nil; b.asm.mu.Unlock() }()
+		cl, subject, _ := stage(t, 555002)
+		supersededCopy.Store(cl.CopySubject)
+		// The claim on the subject is now a LATER incarnation.
+		_, seq, _ := b.asm.loadQ2AffClaim(subject)
+		if err := b.asm.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); err != nil {
+			t.Fatalf("reaping the first incarnation: %v", err)
+		}
+		replacement := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: 555002,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, 555002), Nonce: mqttNewQ2AffGen(),
+			AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffClaimed,
+		})
+		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, replacement); err != nil {
+			t.Fatalf("electing the replacement: %v", err)
+		}
+
+		// A REAL persisted register, so the exact-sequence delete has something to
+		// target and its omission is observable. regSeq == 0 made the earlier version
+		// unable to detect that omission at all.
+		const jsDur, copySeq = "$MQTT_Q2AFF_retiredrepl", uint64(42)
+		regNonce := mqttNewInflightNonce()
+		regSubject := mqttInflightSubject(idHash, sessGen, 8)
+		regSeq, rerr := b.asm.jsa.storeInflightCAS(regSubject, 0, &mqttInflightRecord{
+			PI: 8, Dur: jsDur, Seq: copySeq, QoS: 2, Nonce: regNonce,
+			Q2AffClaim: subject, Q2AffCopy: cl.CopySubject, Retired: true,
+		})
+		if rerr != nil {
+			t.Fatalf("persisting the retired register: %v", rerr)
+		}
+		sess.mu.Lock()
+		sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+			pi: 8, regSeq: regSeq, nonce: regNonce, q2AffClaim: subject, q2AffCopy: cl.CopySubject, durable: true,
+		})
+		sess.mu.Unlock()
+
+		sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq,
+			"ack.subject", cl.CopySubject, subject, cl.CopySubject)
+
+		after, _, err := b.asm.loadQ2AffClaim(subject)
+		if err != nil || after == nil {
+			t.Fatalf("the replacement claim is gone: %v", err)
+		}
+		if after.Nonce != replacement.Nonce {
+			t.Fatalf("the record no longer names the replacement: %+v", after)
+		}
+		if after.AffineDone || after.Lost || after.Discarded {
+			t.Fatalf("a superseded incarnation's settlement credited the REPLACEMENT with a delivery it never made: %+v", after)
+		}
+		if retired(t, jsDur, copySeq) {
+			t.Fatal("the retirement survived: the superseded copy is disposed of but its retirement and register are stranded, so the copy NAK-loops forever")
+		}
+		// The three things review required this subtest to prove, none of which the
+		// earlier version could: the acknowledgement was CONFIRMED, the superseded copy
+		// is gone, and the register was deleted at its exact sequence.
+		if ackedReply.Load() == nil {
+			t.Fatal("the retirement was cleared without confirming the copy's acknowledgement")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(cl.CopySubject); st != mqttQ2AffCopyAbsent {
+			t.Fatalf("the superseded copy survived its disposal (%v)", st)
+		}
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			rec, _, lerr := b.asm.jsa.loadInflightRecord(regSubject)
+			if lerr != nil {
+				return fmt.Errorf("loading the register: %w", lerr)
+			}
+			if rec != nil {
+				return fmt.Errorf("the retired register was not deleted at its exact sequence: %+v", rec)
+			}
+			return nil
+		})
+	})
+
+	// The other side of that disposal, and the reason it is guarded rather than
+	// unconditional: the copy IN HAND may be the SUCCESSOR'S own. Disposing of it on the
+	// strength of a stale carrier destroys a live claim's message — the same loss the
+	// carried pair exists to prevent, committed by the remedy for it.
+	t.Run("a successor's own copy in hand is disposed of by nothing here", func(t *testing.T) {
+		var acked atomic.Bool
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(string) error { acked.Store(true); return nil }
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffCopyAck = nil; b.asm.mu.Unlock() }()
+
+		const srcSeq = uint64(555005)
+		cl, subject, _ := stage(t, srcSeq)
+		_, seq, _ := b.asm.loadQ2AffClaim(subject)
+		if err := b.asm.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); err != nil {
+			t.Fatalf("reaping the first incarnation: %v", err)
+		}
+		replacement := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+			AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+		})
+		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, replacement); err != nil {
+			t.Fatalf("electing the replacement: %v", err)
+		}
+		// The successor's copy is REAL and present, so its survival is an observation
+		// rather than the absence of a fixture.
+		env := &mqttQ2AffineEnvelope{
+			natsSubject: b.topic, msg: []byte("successor-body"),
+			claimSubject: subject, gen: gen,
+			msgID: mqttQ2AffMsgId(groupDur, srcSeq, replacement.Nonce),
+		}
+		msg, hdr := mqttNewQ2AffineRecord(env)
+		if _, err := b.asm.storeQ2AffCopy(replacement.CopySubject, hdr, msg); err != nil {
+			t.Fatalf("staging the successor's copy: %v", err)
+		}
+		const jsDur, copySeq = "$MQTT_Q2AFF_retiredsucc", uint64(45)
+		sess.mu.Lock()
+		sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+			pi: 11, nonce: "regnonce5", q2AffClaim: subject, q2AffCopy: cl.CopySubject, durable: true,
+		})
+		sess.mu.Unlock()
+
+		// The retirement carries the SUPERSEDED copy; the delivery in hand is the
+		// SUCCESSOR'S.
+		sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq,
+			"ack.subject", replacement.CopySubject, subject, cl.CopySubject)
+
+		if acked.Load() {
+			t.Fatal("the successor's own copy was acknowledged away on the strength of a stale carrier: that message was never delivered and can never be delivered now")
+		}
+		if st, _ := b.asm.loadQ2AffCopy(replacement.CopySubject); st != mqttQ2AffCopyPresent {
+			t.Fatal("the successor's copy is gone")
+		}
+		after, _, err := b.asm.loadQ2AffClaim(subject)
+		if err != nil || after == nil {
+			t.Fatalf("the replacement claim is gone: %v", err)
+		}
+		if after.AffineDone || after.Lost || after.Discarded {
+			t.Fatalf("a stale carrier wrote to the successor's claim: %+v", after)
+		}
+		if !retired(t, jsDur, copySeq) {
+			t.Fatal("the retirement was cleared although nothing about it was settled")
+		}
+	})
+}
+
+// TestQ2AffFinishRefusesAForeignIncarnation pins the carried incarnation on the path
+// where nothing else can supply it.
+//
+// The terminal transition runs from PUBREC, expiry and the oversize discard, and all
+// three see a packet identifier and nothing else — no delivered subject to derive the
+// incarnation from. So the incarnation travels with the claim subject: in memory on
+// the pending entry, and durably in the in-flight register for the restart case.
+// Without it the transition credits whatever claim occupies the subject at PUBREC
+// time, which after a reap-and-re-election is a claim that made no delivery at all.
+//
+// Deliberately separate from the retirement route, which has a delivered copy subject to
+// compare its carried one against; here there is nothing but the carrier. That distinction
+// is why this mutation pairs here and not there.
+//
+// Paired mutations M16a/M16b: stop carrying the incarnation (pending entry, or the
+// in-flight register for the restart case), leaving the transition fenced by nothing.
+func TestQ2AffFinishRefusesAForeignIncarnation(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "finishinc")
+	c, _ := b.member(t, "finishincA", 300)
+	defer c.Close()
+	b.bind(t, "finishincA")
+	idHash := getHash("finishincA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["finishincA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	cc := testQ2AffSessionClient(b, sess)
+	cc.mqtt = &mqtt{asm: b.asm, sess: sess}
+
+	const srcSeq = uint64(466001)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	// The copy the delivery carried, belonging to an incarnation since reaped. It is a
+	// WELL-FORMED copy subject of this very claim, so the refusal below is attributable to
+	// the incarnation mismatch and not to a malformed carrier — a bare nonce, or any value
+	// that is not a copy subject at all, is refused one step earlier and would prove
+	// nothing about the fence.
+	supersededCopy := mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, srcSeq), mqttNewQ2AffGen())
+	// The claim now on the subject is a REPLACEMENT: same winner, same generation, same
+	// claim hash — only the incarnation differs, which is the whole point.
+	replacement := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+	})
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, replacement); err != nil {
+		t.Fatalf("electing the replacement: %v", err)
+	}
+	if replacement.CopySubject == supersededCopy {
+		t.Fatal("the two incarnations derived one copy subject, so this fixture stages nothing")
+	}
+
+	// A PUBREC belonging to the OLD incarnation must not complete the replacement.
+	cc.mqttFinishQ2AffineDelivery(subject, supersededCopy, _EMPTY_)
+	after, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil || after == nil {
+		t.Fatalf("the replacement claim is gone: %v", err)
+	}
+	if after.AffineDone {
+		t.Fatal("a PUBREC belonging to a reaped incarnation recorded the affine side of the REPLACEMENT: that claim made no delivery, and its own copy would become reapable behind a completion it never earned (F-065)")
+	}
+
+	// The matching incarnation DOES complete it, so the refusal is a fence rather than
+	// a blanket refusal that would stop every delivery from ever completing.
+	cc.mqttFinishQ2AffineDelivery(subject, replacement.CopySubject, _EMPTY_)
+	done, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil || done == nil {
+		t.Fatalf("loading after the matching completion: %v", err)
+	}
+	if !done.AffineDone {
+		t.Fatal("the transition refused its OWN incarnation, so no delivery could ever complete")
+	}
+}
+
+// TestQ2AffRetiredAffineSourceRecoveredEndToEnd is the fixture the holistic review
+// demanded, and the reason it exists is worth stating: the first version of this
+// coverage seeded an in-memory mqttRetiredSource directly, stubbed the confirmed ack
+// and called the settlement function, so it created no persisted register, performed
+// no restart, and asserted no deletion. It could pass while register validation,
+// propagation, classification and deletion were all broken — and they were: the
+// review found the register deleted after a FAILED transition, a nonceless register
+// silently opting out of the incarnation fence, and the settlement ignoring its own
+// durable identity.
+//
+// So this one drives the whole route: a real shared QoS 2 delivery, a real PUBREC
+// whose affine transition FAILS (leaving the correlated PUBREL stored and the register
+// as the only surviving carrier of the claim and its incarnation), a real restart, and
+// then the redelivery that must settle it. Nothing is stubbed except the one claim CAS
+// that has to fail.
+func TestQ2AffRetiredAffineSourceRecoveredEndToEnd(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	b := &testQ2AffBroker{s: s, o: o, topic: "e2eretired/topic", group: "e2eretiredgrp"}
+
+	c, r := b.member(t, "e2eretiredA", 300)
+	b.bind(t, "e2eretiredA")
+	idHash := getHash("e2eretiredA")
+	asm := b.asm
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+
+	// The affine transition fails at PUBREC. The PUBREL is already stored by then, so
+	// this is exactly the crash window: nothing records AffineDone, and the register
+	// must therefore SURVIVE as the only carrier of the claim and its incarnation.
+	// Route everything except the AffineDone write to the real implementation.
+	// The hook also pins the ORDER, deterministically rather than by racing AckWait: at
+	// the moment the AffineDone write is attempted the retirement must ALREADY be
+	// installed. This handler has removed the pending entry and its source mapping by
+	// then, so a redelivery arriving during these retries would allocate a fresh
+	// identifier and re-send a payload the client has already answered with PUBREC —
+	// which is precisely what installing the retirement afterwards allows.
+	var retiredWhenAttempted atomic.Bool
+	var affineAttempts atomic.Int32
+	asm.mu.Lock()
+	asm.testQ2AffClaimStore = func(subject string, expectSeq uint64, rec *mqttQ2AffClaim) (uint64, error) {
+		if rec.AffineDone {
+			affineAttempts.Add(1)
+			sess := func() *mqttSession {
+				asm.mu.RLock()
+				defer asm.mu.RUnlock()
+				return asm.sessions["e2eretiredA"]
+			}()
+			if sess != nil {
+				sess.mu.Lock()
+				if len(sess.srcAckOwed) > 0 {
+					retiredWhenAttempted.Store(true)
+				}
+				sess.mu.Unlock()
+			}
+			return 0, fmt.Errorf("test: the affine completion is unproven")
+		}
+		return asm.jsa.storeQ2AffClaimCAS(subject, expectSeq, rec)
+	}
+	asm.mu.Unlock()
+
+	b.publish(t, 1, "e2e-retired")
+	topic, payload, qos, pi, ok := testMQTTTryReadPublishV5(r, 5*time.Second)
+	if !ok || qos != 2 || topic != b.topic || string(payload) != "e2e-retired" {
+		t.Fatalf("the member did not receive the shared QoS 2 delivery: topic=%q payload=%q qos=%d ok=%v", topic, payload, qos, ok)
+	}
+	// The client completes the handshake IN FULL, PUBCOMP included, because that is the
+	// ordinary case and it is the one that exposes the defect holistic round 2 found:
+	// retaining the register is not enough on its own, since a PUBCOMP that finds no
+	// retirement acknowledges the PUBREL and removes the last durable evidence that this
+	// source is past PUBREC. An earlier version of this fixture stopped at PUBREL and
+	// therefore passed while that route was broken.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
+	testMQTTFlush(t, c, nil, r)
+
+	// The claim must NOT be complete, and its register must still be there: that pair
+	// is the state the restart has to recover from.
+	claim := testQ2AffAwaitClaimFor(t, asm, groupDur)
+	if claim == nil {
+		t.Fatal("no claim was elected for the shared delivery")
+	}
+	if claim.AffineDone {
+		t.Fatal("the affine side was recorded although its write was made to fail: this run does not stage the window")
+	}
+	if claim.Nonce == _EMPTY_ {
+		t.Fatal("the elected claim carries no incarnation")
+	}
+	asm.mu.Lock()
+	asm.testQ2AffClaimStore = nil
+	asm.mu.Unlock()
+
+	// The register subject carries the SESSION generation, which is a different
+	// identity from the affine one — mixing them up finds nothing and reads as a
+	// deleted register.
+	asm.mu.RLock()
+	sess := asm.sessions["e2eretiredA"]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the member's session is not resident")
+	}
+	sess.mu.Lock()
+	sessGen := sess.gen
+	sess.mu.Unlock()
+	if affineAttempts.Load() == 0 {
+		t.Fatal("the affine completion was never attempted, so this run does not stage the window")
+	}
+	if !retiredWhenAttempted.Load() {
+		t.Fatal("the source was not retired BEFORE the affine completion was attempted: the pending entry and its source mapping are already gone, so an AckWait redelivery inside those retries allocates a fresh identifier and re-sends a payload the client has answered with PUBREC")
+	}
+	rec, _, err := asm.jsa.loadInflightRecord(mqttInflightSubject(idHash, sessGen, pi))
+	if err != nil {
+		t.Fatalf("loading the register: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("the in-flight register was deleted after a FAILED affine transition: it was the only surviving carrier of the claim and its incarnation, so nothing can reconstruct the retirement")
+	}
+	if rec.Q2AffClaim == _EMPTY_ || rec.Q2AffCopy != claim.CopySubject {
+		t.Fatalf("the register does not carry the claim AND the copy it was delivered under: %+v (claim copy %q)", rec, claim.CopySubject)
+	}
+	c.Close()
+
+	// Restart, so recovery is the thing that rebuilds the retirement.
+	s = testInflightRestart(t, s, o)
+	defer testMQTTShutdownServer(s)
+	b.s = s
+
+	// Reconnect FIRST: the account manager is looked up through a connected client.
+	c2, r2 := b.member(t, "e2eretiredA", 300)
+	defer c2.Close()
+	asm = testMQTTGetAccountSessionManager(t, s, "e2eretiredA")
+
+	// The client is past PUBREC, so the stored PUBREL is legitimately REPLAYED on
+	// resume and must be answered; what must never arrive is another PUBLISH, which
+	// would re-send the payload of an exchange the client has already answered. So the
+	// assertion is on the packet TYPE, not on silence.
+	deadline := time.Now().Add(3 * o.MQTT.AckWait)
+	for time.Now().Before(deadline) {
+		pb, pl, ready := testMQTTReadPacketReady(r2, 500*time.Millisecond)
+		if !ready {
+			continue
+		}
+		start := r2.pos
+		switch pb & mqttPacketMask {
+		case mqttPacketPubRel:
+			got, rerr := r2.readUint16("pi")
+			if rerr != nil {
+				t.Fatalf("reading the replayed PUBREL: %v", rerr)
+			}
+			r2.pos = start + pl
+			testMQTTSendPIPacket(mqttPacketPubComp, t, c2, got)
+		case mqttPacketPub:
+			r2.pos = start + pl
+			t.Fatal("the payload was re-published after recovery: the client had already answered PUBREC, so this is a duplicate QoS 2 delivery")
+		default:
+			r2.pos = start + pl
+		}
+	}
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		got, _, lerr := asm.loadQ2AffClaim(mqttQ2AffClaimSubject(claim.GroupDurable, claim.SourceSeq))
+		if lerr != nil {
+			return fmt.Errorf("loading the claim: %w", lerr)
+		}
+		if got == nil {
+			return nil // reaped: both sides proven, which is the completed outcome
+		}
+		if !got.AffineDone {
+			return fmt.Errorf("the recovered retirement never recorded the affine side against its own incarnation: %+v", got)
+		}
+		return nil
+	})
+	if st, _ := asm.loadQ2AffCopy(claim.CopySubject); st == mqttQ2AffCopyPresent {
+		t.Fatal("the affine copy is still on the stream after recovery settled its source: it can only NAK from here")
+	}
+}
+
+// TestQ2AffRegisterWithoutAnIncarnationIsRefused pins the refusal the holistic review
+// found missing, and the reason it must BE a refusal rather than a tolerated gap:
+// _EMPTY_ is the deliberate OPT-OUT value at advanceQ2AffClaim's incarnation fence, so
+// a restored register naming an affine claim with no valid incarnation would silently
+// disable the fence and let a stale exchange record AffineDone against a replacement
+// claim — the exact write F-065 exists to prevent. There are no releases, so that
+// shape does not exist; meeting one means the state is not interpretable.
+//
+// The register carries the COPY SUBJECT, so the incarnation is read back OUT of it,
+// which is why every refused case here is a subject rather than a bare nonce: a
+// truncated subject, or one whose last token is not a NUID, yields no incarnation and
+// must be refused for the same reason an absent one is.
+//
+// Paired mutation: drop the Q2AffCopy clause from mqttInflightRecordIdentityOK.
+func TestQ2AffRegisterWithoutAnIncarnationIsRefused(t *testing.T) {
+	t.Parallel()
+	const groupDur = "$MQTT_SHARED_abcdef0123456789"
+	idHash, affGen := getHash("regincarn"), mqttNewQ2AffGen()
+	claimHash := mqttQ2AffClaimHash(groupDur, 11)
+	base := func() *mqttInflightRecord {
+		return &mqttInflightRecord{
+			PI: 3, Dur: groupDur, Seq: 11, QoS: 2,
+			Nonce: mqttNewInflightNonce(),
+		}
+	}
+	ordinary := base()
+	if !mqttInflightRecordIdentityOK(ordinary) {
+		t.Fatal("an ordinary QoS 2 register carrying no affine claim was refused")
+	}
+	withBoth := base()
+	withBoth.Q2AffClaim = mqttQ2AffClaimSubject(groupDur, 11)
+	withBoth.Q2AffCopy = mqttQ2AffCopySubject(idHash, affGen, claimHash, mqttNewQ2AffGen())
+	if !mqttInflightRecordIdentityOK(withBoth) {
+		t.Fatal("a register carrying an affine claim AND the copy it was delivered under was refused")
+	}
+	for name, copySubject := range map[string]string{
+		"empty":                  _EMPTY_,
+		"a bare incarnation":     mqttNewQ2AffGen(),
+		"outside the namespace":  "foo." + idHash + "." + affGen + "." + claimHash + "." + mqttNewQ2AffGen(),
+		"no incarnation token":   mqttQ2AffineSubjectPrefix + idHash + "." + affGen + "." + claimHash,
+		"an extra token":         mqttQ2AffCopySubject(idHash, affGen, claimHash, mqttNewQ2AffGen()) + ".x",
+		"incarnation not a NUID": mqttQ2AffCopySubject(idHash, affGen, claimHash, "abc"),
+		"wrong length NUID":      mqttQ2AffCopySubject(idHash, affGen, claimHash, mqttNewQ2AffGen()+"x"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := base()
+			rec.Q2AffClaim = mqttQ2AffClaimSubject(groupDur, 11)
+			rec.Q2AffCopy = copySubject
+			if mqttInflightRecordIdentityOK(rec) {
+				t.Fatalf("a register naming an affine claim with %s as its copy was ACCEPTED: recovery would restore it, PUBREC would pass a value the fence reads as no incarnation, and the fence would opt out — marking a replacement claim complete for a delivery it never made", name)
+			}
+		})
+	}
+}
+
+// TestQ2AffRetirementSettlesFromItsDurableIdentity pins the second half of the same
+// review finding: the retirement settlement must decide from the identity it PERSISTED,
+// not from arguments derived at the current delivery.
+//
+// That is the whole point of persisting it. The register is what survived the restart;
+// a delivered subject only says which copy is in hand, never which incarnation the
+// exchange that retired this source belonged to. When the two disagree, the durable one
+// is the truth — and if the settlement prefers the arguments, the persisted identity is
+// dead data, which is exactly why a mutation removing it once survived.
+//
+// Paired mutation: drop the srcAckOwed lookup so the caller's arguments win.
+func TestQ2AffRetirementSettlesFromItsDurableIdentity(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "durident")
+	c, _ := b.member(t, "duridentA", 300)
+	b.bind(t, "duridentA")
+	idHash := getHash("duridentA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["duridentA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	const srcSeq = uint64(377001)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	live := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+	})
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, live); err != nil {
+		t.Fatalf("seeding the live claim: %v", err)
+	}
+
+	// The retirement carries the LIVE incarnation, because that is the exchange that
+	// retired this source. The caller's arguments name a different one.
+	const jsDur, copySeq = "$MQTT_Q2AFF_durident", uint64(77)
+	sess.mu.Lock()
+	sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+		pi: 5, nonce: "regnonce", q2AffClaim: subject, q2AffCopy: live.CopySubject, durable: true,
+	})
+	sess.mu.Unlock()
+	b.asm.mu.Lock()
+	b.asm.testQ2AffCopyAck = func(string) error { return nil }
+	b.asm.mu.Unlock()
+	defer func() { b.asm.mu.Lock(); b.asm.testQ2AffCopyAck = nil; b.asm.mu.Unlock() }()
+
+	staleCopy := mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, 999999), mqttNewQ2AffGen())
+	sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq, "ack.subject",
+		_EMPTY_, mqttQ2AffClaimSubject(groupDur, 999999), staleCopy)
+
+	got, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil {
+		t.Fatalf("loading the claim: %v", err)
+	}
+	if got == nil {
+		return // reaped: both sides proven, the completed outcome
+	}
+	if !got.AffineDone {
+		t.Fatal("the settlement decided from its caller's arguments rather than from the identity it persisted: the retirement it was asked to settle names a live incarnation, so the persisted identity is the truth and the arguments are stale")
+	}
+}
+
+// TestQ2AffNegativePubRecAcquiresNoRetirement pins the boundary of the retirement
+// machinery, and the shape of this fixture was ruled by review rather than chosen by
+// me — my previous two attempts in this area each passed while avoiding the route they
+// claimed to cover.
+//
+// The affine PUBREC arm is selected by the claim subject alone, so it also sees a
+// NEGATIVE PUBREC. That path creates no pendingPubRel entry and stores no PUBREL, so
+// there is no PUBCOMP — and therefore no event at which an unlanded durable retirement
+// mark could ever be retried. Retiring there would install machinery whose retry point
+// does not exist. A rejected delivery keeps its pre-F-065 behaviour instead: complete
+// the affine side if it can be, then release the register.
+//
+// The negative PUBREC is written on the WIRE with a reason code >= 0x80 and goes
+// through the read loop. Calling the completion routine directly, seeding a retirement,
+// or using the success-shaped PUBREC helper would each dodge the route under test.
+//
+// Paired mutation: remove the isPubRec && !pubRecFailed gate. A retirement is then
+// installed and a Retired register rewrite attempted, and both assertions below fire.
+func TestQ2AffNegativePubRecAcquiresNoRetirement(t *testing.T) {
+	b := testQ2AffSetup(t, "negrec")
+	c, r := b.member(t, "negrecA", 300)
+	defer c.Close()
+	b.bind(t, "negrecA")
+	idHash := getHash("negrecA")
+	if gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen; gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["negrecA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+
+	// Fail ONLY the AffineDone write, and count every attempt so the test can prove the
+	// transition was actually reached rather than skipped.
+	var affineAttempts atomic.Int32
+	b.asm.mu.Lock()
+	b.asm.testQ2AffClaimStore = func(subject string, expectSeq uint64, rec *mqttQ2AffClaim) (uint64, error) {
+		if rec.AffineDone {
+			affineAttempts.Add(1)
+			return 0, fmt.Errorf("test: the affine completion is unproven")
+		}
+		return b.asm.jsa.storeQ2AffClaimCAS(subject, expectSeq, rec)
+	}
+	b.asm.mu.Unlock()
+	sess.mu.Lock()
+	sessGen := sess.gen
+	sess.mu.Unlock()
+
+	b.publish(t, 1, "rejected")
+	topic, payload, qos, pi, ok := testMQTTTryReadPublishV5(r, 5*time.Second)
+	if !ok || qos != 2 || topic != b.topic || string(payload) != "rejected" {
+		t.Fatalf("the member did not receive the shared QoS 2 delivery: topic=%q payload=%q qos=%d ok=%v", topic, payload, qos, ok)
+	}
+
+	// A NEGATIVE PUBREC, on the wire: reason 0x80, through the read loop.
+	if _, err := testMQTTWrite(c, []byte{mqttPacketPubRec, 3, byte(pi >> 8), byte(pi), 0x80}); err != nil {
+		t.Fatalf("writing the negative PUBREC: %v", err)
+	}
+	testMQTTFlush(t, c, nil, r)
+
+	// The transition must have been attempted and failed: otherwise this run proves
+	// nothing about what happens when it does.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if affineAttempts.Load() == 0 {
+			return fmt.Errorf("the affine completion was never attempted")
+		}
+		return nil
+	})
+	// No PUBREL, in memory or on the wire: a rejected delivery has no PUBREL phase, and
+	// that absence is precisely why no retry point exists.
+	sess.mu.Lock()
+	pubRels := len(sess.pendingPubRel)
+	owed := len(sess.srcAckOwed)
+	sess.mu.Unlock()
+	if pubRels != 0 {
+		t.Fatalf("a rejected delivery entered the PUBREL phase (%d pending)", pubRels)
+	}
+	if owed != 0 {
+		t.Fatalf("a retirement was installed for a rejected delivery (%d owed): there is no PUBCOMP on this path, so an unlanded durable mark could never be retried", owed)
+	}
+	// The register is RELEASED, as it was before F-065, and nothing rewrites it as
+	// Retired. Polled, because a register delete is deliberately asynchronous and
+	// ignores failure (R5) — so the claim pinned here is the narrower one review
+	// insisted on: this branch no longer deliberately retains or rewrites such a
+	// register, not that a stale one can never transiently exist.
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		rec, _, lerr := b.asm.jsa.loadInflightRecord(mqttInflightSubject(idHash, sessGen, pi))
+		if lerr != nil {
+			return fmt.Errorf("loading the register: %w", lerr)
+		}
+		if rec == nil {
+			return nil
+		}
+		if rec.Retired {
+			return fmt.Errorf("the register was rewritten as RETIRED for a rejected delivery: %+v", rec)
+		}
+		return fmt.Errorf("the register was retained for a rejected delivery: %+v", rec)
+	})
+	// No PUBREL on the wire either. A PUBLISH redelivery, by contrast, IS expected: the
+	// affine write is failing, so the copy stays unacknowledged and AckWait re-offers
+	// it. That re-publishing of a rejected message is the PRE-EXISTING negative-PUBREC
+	// behaviour this change restores rather than introduces, it converges as soon as the
+	// claim store heals, and it is named in the dossier's "what this does not close"
+	// list. Asserting silence here would assert something F-065 never promised.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		pb, pl, ready := testMQTTReadPacketReady(r, 250*time.Millisecond)
+		if !ready {
+			continue
+		}
+		start := r.pos
+		pt := pb & mqttPacketMask
+		r.pos = start + pl
+		if pt == mqttPacketPubRel {
+			t.Fatal("the broker sent a PUBREL after a negative PUBREC: a rejected delivery has no PUBREL phase, which is exactly why there is no PUBCOMP to retry a durable retirement mark")
+		}
+	}
+}
+
+// TestQ2AffRestoredPendingCarriesItsIncarnation closes the gap review demonstrated: the
+// OTHER recovery route — a restart BEFORE PUBREC, where no PUBREL exists so recovery
+// restores the register into pendingPublish rather than classifying it retired — had no
+// discriminating fixture. Removing the incarnation from those restored entries leaves the
+// claim subject intact and passes _EMPTY_ to the fence, which is the deliberate OPT-OUT
+// value, so a post-restart PUBREC would credit a replacement claim with the old
+// incarnation's delivery.
+//
+// It asserts the CARRIER rather than the end-to-end exchange, deliberately and with the
+// reason stated: on reconnect the affine consumer promptly redelivers its pending copy,
+// and the gate then legitimately re-attributes it to whatever claim now holds the subject
+// — so an end-to-end version cannot isolate the restored entry, and would pass or fail on
+// the redelivery instead. What the restored entry does WITH a carried incarnation is
+// covered by TestQ2AffFinishRefusesAForeignIncarnation; together they close the route.
+//
+// Paired mutation M16a': drop `q2AffCopy: rv.rec.Q2AffCopy` from the restored entry.
+func TestQ2AffRestoredPendingCarriesItsIncarnation(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 30 * time.Second // no redelivery inside the window under test
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	b := &testQ2AffBroker{s: s, o: o, topic: "restnonce/topic", group: "restnoncegrp"}
+
+	c, r := b.member(t, "restnonceA", 300)
+	defer c.Close()
+	b.bind(t, "restnonceA")
+	idHash := getHash("restnonceA")
+	if gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen; gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+
+	// A REAL delivery, so the register recovery classifies is one the broker actually
+	// wrote — a synthetic record does not survive classification, and a fixture that
+	// staged one would assert on a path recovery never took.
+	b.publish(t, 1, "restored")
+	topic, payload, qos, pi, ok := testMQTTTryReadPublishV5(r, 5*time.Second)
+	if !ok || qos != 2 || topic != b.topic || string(payload) != "restored" {
+		t.Fatalf("no shared QoS 2 delivery: topic=%q payload=%q qos=%d ok=%v", topic, payload, qos, ok)
+	}
+	claim := testQ2AffAwaitClaimFor(t, b.asm, groupDur)
+	if claim == nil || claim.Nonce == _EMPTY_ {
+		t.Fatalf("no claim with an incarnation was elected: %+v", claim)
+	}
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["restnonceA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	sess.mu.Lock()
+	sessGen := sess.gen
+	sess.mu.Unlock()
+	// The register must be durable before recovery can restore it.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		rec, _, lerr := b.asm.jsa.loadInflightRecord(mqttInflightSubject(idHash, sessGen, pi))
+		if lerr != nil {
+			return fmt.Errorf("loading the register: %w", lerr)
+		}
+		if rec == nil {
+			return fmt.Errorf("no register yet")
+		}
+		if rec.Q2AffCopy != claim.CopySubject {
+			return fmt.Errorf("the register carries copy %q, want %q", rec.Q2AffCopy, claim.CopySubject)
+		}
+		return nil
+	})
+
+	// Drop the in-memory view and let RECOVERY rebuild it, which is what a restart does.
+	// The client has not answered, so no PUBREL owns this identifier and the register is
+	// restored into pendingPublish rather than classified retired.
+	sess.mu.Lock()
+	delete(sess.pendingPublish, pi)
+	sess.mu.Unlock()
+	if err := sess.recoverInflightRegisters(testQ2AffSessionClient(b, sess)); err != nil {
+		t.Fatalf("recovering the registers: %v", err)
+	}
+
+	sess.mu.Lock()
+	restored := sess.pendingPublish[pi]
+	sess.mu.Unlock()
+	if restored == nil {
+		t.Fatal("recovery did not restore the register into pendingPublish, so the carrier under test was never exercised")
+	}
+	if restored.q2AffClaim != mqttQ2AffClaimSubject(claim.GroupDurable, claim.SourceSeq) {
+		t.Fatalf("the restored entry names claim %q", restored.q2AffClaim)
+	}
+	if restored.q2AffCopy != claim.CopySubject {
+		t.Fatalf("the restored entry carries copy %q, want %q: the terminal transition would then be handed the OPT-OUT value and could credit a replacement claim with this delivery (F-065)", restored.q2AffCopy, claim.CopySubject)
+	}
+
+	// And the incarnation must reach the TRANSITION, not merely the map. Review found
+	// that inspecting pendingPublish here while a separate test called the finish routine
+	// directly left a gap between them: a mutation that kept recovery correct but dropped
+	// the incarnation when the PUBREC path REMOVES the pending entry would pass both. So
+	// the client answers for real, against a subject a replacement incarnation now holds.
+	subject := mqttQ2AffClaimSubject(claim.GroupDurable, claim.SourceSeq)
+	_, seq, _ := b.asm.loadQ2AffClaim(subject)
+	if err := b.asm.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); err != nil {
+		t.Fatalf("reaping the delivered incarnation: %v", err)
+	}
+	replacement := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: claim.Winner, Gen: claim.Gen, GroupDurable: claim.GroupDurable,
+		SourceSeq: claim.SourceSeq, ClaimHash: claim.ClaimHash, Nonce: mqttNewQ2AffGen(),
+		AffDurable: claim.AffDurable, Phase: mqttQ2AffMaterialized,
+	})
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, replacement); err != nil {
+		t.Fatalf("electing the replacement: %v", err)
+	}
+
+	// No flush: this connection may legitimately carry a resume-style resend of the
+	// pending PUBLISH, and a flush would read that instead of a PINGRESP. The claim record
+	// is the observable that matters here.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
+
+	// Wait for a POSITIVE signal that the PUBREC was actually PROCESSED — its PUBREL
+	// tracking — before asserting anything about the claim. Polling for the ABSENCE of
+	// AffineDone succeeds on the first sample, before the broker has even read the packet,
+	// which is exactly why the first version of this assertion could not fail.
+	sessObj := func() *mqttSession {
+		b.asm.mu.RLock()
+		defer b.asm.mu.RUnlock()
+		return b.asm.sessions["restnonceA"]
+	}()
+	if sessObj == nil {
+		t.Fatal("the session is not resident")
+	}
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		sessObj.mu.Lock()
+		_, tracked := sessObj.pendingPubRel[pi]
+		sessObj.mu.Unlock()
+		if !tracked {
+			return fmt.Errorf("the PUBREC has not been processed yet")
+		}
+		return nil
+	})
+	final, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil || final == nil {
+		t.Fatalf("loading the replacement claim: %v", err)
+	}
+	if final.AffineDone {
+		t.Fatal("a PUBREC answered from a RESTORED pending entry credited a REPLACEMENT claim with the delivery: the incarnation did not survive the journey from the register through recovery to the terminal transition, so the fence was handed its opt-out value (F-065)")
+	}
+}
+
+// TestQ2AffForgedRegisterCannotCreditAnotherClaim covers the third leg of the affine
+// pair's binding, which is the one neither of the other two can reach.
+//
+// A register carrying (claim, copy) is checked in two places: its own shape
+// (mqttInflightRecordIdentityOK) and the claim naming the carried copy back
+// (q2AffClaimForCarriedCopy). Both are satisfied by a register that names ANOTHER live
+// claim's copy — every field is well formed and mutually consistent, it is simply about a
+// different delivery. Interpreting one credits that claim with a delivery it never made,
+// and the gate's terminal branch then disposes of its copy on the next redelivery: the
+// message is lost, which is exactly the F-065 failure in a different disguise. The
+// arbiter is the SOURCE, because for an affine delivery the source IS the copy.
+//
+// Both forgeries are staged on ONE session with TWO claims, which is what makes the
+// result attributable: both claims name the same affine durable, so every register here
+// is shape-valid and only its source distinguishes them. A two-session fixture would
+// have been refused by the owner check instead, and would have proved nothing about this.
+//
+// Paired mutations, one per subcase, and they are what tell the two legs apart:
+//   - drop the affinePairContradictedBySource block in recoverInflightRegisters: the
+//     internally consistent forgery is then installed and its PUBREC records AffineDone
+//     on the victim.
+//   - drop the claim.CopySubject == carriedCopy clause in q2AffClaimForCarriedCopy: the
+//     mismatched forgery is then accepted at the transition and does the same.
+func TestQ2AffForgedRegisterCannotCreditAnotherClaim(t *testing.T) {
+	type delivery struct {
+		pi          uint16
+		regSubject  string
+		claim       string
+		copySubject string
+	}
+	type staged struct {
+		b      *testQ2AffBroker
+		c      net.Conn
+		r      *mqttReader
+		sess   *mqttSession
+		answer delivery // the exchange whose PUBREC the client sends
+		victim delivery // the claim a forged register would credit
+	}
+
+	// stage brings a session to TWO in-flight affine QoS 2 deliveries, each with a durable
+	// register carrying its own pair. Nothing synthetic: a hand-built register does not
+	// survive classification, so a fixture that staged one would assert on a route
+	// recovery never takes.
+	stage := func(t *testing.T, name string) *staged {
+		t.Helper()
+		o := testMQTTDefaultOptionsV5()
+		o.MQTT.AckWait = 30 * time.Second // no redelivery inside the window under test
+		s := testMQTTRunServer(t, o)
+		t.Cleanup(func() { testMQTTShutdownServer(s) })
+		b := &testQ2AffBroker{s: s, o: o, topic: name + "/topic", group: name + "grp"}
+		id := name + "A"
+		c, r := b.member(t, id, 300)
+		t.Cleanup(func() { c.Close() })
+		b.bind(t, id)
+		idHash := getHash(id)
+		if gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen; gen == _EMPTY_ {
+			t.Fatal("no affine generation")
+		}
+		b.publish(t, 1, "first")
+		b.publish(t, 2, "second")
+		var pis []uint16
+		for i := 0; i < 2; i++ {
+			topic, _, qos, pi, ok := testMQTTTryReadPublishV5(r, 10*time.Second)
+			if !ok || qos != 2 || topic != b.topic {
+				t.Fatalf("shared QoS 2 delivery %d: topic=%q qos=%d ok=%v", i, topic, qos, ok)
+			}
+			pis = append(pis, pi)
+		}
+		b.asm.mu.RLock()
+		sess := b.asm.sessions[id]
+		b.asm.mu.RUnlock()
+		if sess == nil {
+			t.Fatal("the session is not resident")
+		}
+		sess.mu.Lock()
+		sessGen := sess.gen
+		sess.mu.Unlock()
+		var ds []delivery
+		checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+			ds = ds[:0]
+			for _, pi := range pis {
+				subj := mqttInflightSubject(idHash, sessGen, pi)
+				rec, _, lerr := b.asm.jsa.loadInflightRecord(subj)
+				if lerr != nil {
+					return fmt.Errorf("loading the register of %d: %w", pi, lerr)
+				}
+				if rec == nil {
+					return fmt.Errorf("no register for %d yet", pi)
+				}
+				if rec.Q2AffClaim == _EMPTY_ || rec.Q2AffCopy == _EMPTY_ {
+					return fmt.Errorf("the register for %d carries no affine pair yet", pi)
+				}
+				ds = append(ds, delivery{pi: pi, regSubject: subj, claim: rec.Q2AffClaim, copySubject: rec.Q2AffCopy})
+			}
+			return nil
+		})
+		if ds[0].claim == ds[1].claim || ds[0].copySubject == ds[1].copySubject {
+			t.Fatalf("the two deliveries share an assignment, so there is no second claim to forge against: %+v", ds)
+		}
+		for _, d := range ds {
+			if st, _ := b.asm.loadQ2AffCopy(d.copySubject); st != mqttQ2AffCopyPresent {
+				t.Fatalf("the copy of %d is not staged, so its later presence proves nothing", d.pi)
+			}
+		}
+		return &staged{b: b, c: c, r: r, sess: sess, answer: ds[0], victim: ds[1]}
+	}
+
+	// forge rewrites the answering delivery's register in place — same nonce, same
+	// identifier, same source — so the ONLY thing wrong with it is the pair it carries.
+	forge := func(t *testing.T, st *staged, copySubject string) {
+		t.Helper()
+		rec, sm, err := st.b.asm.jsa.loadInflightRecord(st.answer.regSubject)
+		if err != nil || rec == nil || sm == nil {
+			t.Fatalf("loading the register to forge: %v", err)
+		}
+		rec.Q2AffClaim = st.victim.claim
+		rec.Q2AffCopy = copySubject
+		if _, err := st.b.asm.jsa.storeInflightCAS(st.answer.regSubject, sm.Sequence, rec); err != nil {
+			t.Fatalf("forging the register: %v", err)
+		}
+	}
+
+	// recover drops the in-memory entry and lets RECOVERY rebuild it from the record,
+	// which is the route a restart takes and the only route a forged register can enter by.
+	recover := func(t *testing.T, st *staged) {
+		t.Helper()
+		st.sess.mu.Lock()
+		delete(st.sess.pendingPublish, st.answer.pi)
+		st.sess.mu.Unlock()
+		if err := st.sess.recoverInflightRegisters(testQ2AffSessionClient(st.b, st.sess)); err != nil {
+			t.Fatalf("recovering the registers: %v", err)
+		}
+	}
+
+	// answerPubRec sends the PUBREC and then PROVES it was processed, which polling for
+	// the absence of a write cannot: a refused forgery leaves nothing to wait for, so a
+	// checkFor on "the victim is untouched" would succeed before the packet was even read.
+	// The read loop is sequential per connection, so a PINGRESP that follows the PUBREC
+	// is proof the PUBREC is done. A PUBLISH is tolerated in between only because a
+	// redelivery is legal protocol; with AckWait at 30s none is expected.
+	answerPubRec := func(t *testing.T, st *staged) {
+		t.Helper()
+		testMQTTSendPIPacket(mqttPacketPubRec, t, st.c, st.answer.pi)
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketPing)
+		w.WriteByte(0)
+		if _, err := st.c.Write(w.Bytes()); err != nil {
+			t.Fatalf("sending PINGREQ: %v", err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			pb, pl, ready := testMQTTReadPacketReady(st.r, time.Second)
+			if !ready {
+				continue
+			}
+			start := st.r.pos
+			switch pb & mqttPacketMask {
+			case mqttPacketPingResp:
+				return
+			case mqttPacketPub, mqttPacketPubRel:
+				st.r.pos = start + pl // legal in-flight traffic; keep looking
+			default:
+				t.Fatalf("unexpected packet 0x%x while proving the PUBREC was processed", pb&mqttPacketMask)
+			}
+		}
+		t.Fatal("no PINGRESP after the PUBREC, so nothing proves it was processed")
+	}
+
+	// victimUntouched is the loss this whole binding exists to prevent, stated once:
+	// nothing was written to the victim's claim, and its copy is still there to deliver.
+	//
+	// It deliberately does NOT assert that the answering delivery's own copy survived.
+	// jsAckSubject is memory-only — a JetStream reply subject is valid for one delivery
+	// attempt — so a RECOVERED entry has no ack subject at all and can never acknowledge
+	// its copy, forged or genuine. An assertion on that copy's presence would therefore
+	// hold for every implementation, which is no assertion. What discriminates is
+	// AffineDone on the answering delivery's OWN claim: refused here, recorded by the
+	// control subtest below on the same field.
+	victimUntouched := func(t *testing.T, st *staged) {
+		t.Helper()
+		v, _, err := st.b.asm.loadQ2AffClaim(st.victim.claim)
+		if err != nil {
+			t.Fatalf("loading the victim claim: %v", err)
+		}
+		if v == nil {
+			t.Fatal("the victim's claim was REAPED on the strength of a forged register")
+		}
+		if v.AffineDone || v.Lost || v.Discarded {
+			t.Fatalf("a forged register credited the victim's claim with a delivery it never made, so the gate's terminal branch will now dispose of its copy and the message is lost: %+v", v)
+		}
+		if state, _ := st.b.asm.loadQ2AffCopy(st.victim.copySubject); state != mqttQ2AffCopyPresent {
+			t.Fatal("the victim's copy is gone, so its message can never be delivered")
+		}
+		own, _, err := st.b.asm.loadQ2AffClaim(st.answer.claim)
+		if err != nil {
+			t.Fatalf("loading the answering delivery's own claim: %v", err)
+		}
+		if own == nil || own.AffineDone {
+			t.Fatalf("a refused pair still recorded a completion, on the answering delivery's own claim: %+v", own)
+		}
+		rec, _, err := st.b.asm.jsa.loadInflightRecord(st.answer.regSubject)
+		if err != nil {
+			t.Fatalf("loading the register: %v", err)
+		}
+		if rec == nil {
+			t.Fatal("the refused register was DELETED, so the state an operator has to resolve was destroyed on the strength of a record that was refused as uninterpretable")
+		}
+		if rec.Q2AffClaim != st.victim.claim {
+			t.Fatalf("the refused register was rewritten to name %q", rec.Q2AffClaim)
+		}
+	}
+
+	t.Run("the pair's two fields disagree", func(t *testing.T) {
+		st := stage(t, "forgemix")
+		// Claim B with A's OWN copy. Recovery's source check cannot see anything wrong —
+		// the carried copy IS this register's source — so the refusal has to come from the
+		// claim, which names its own copy and not this one.
+		forge(t, st, st.answer.copySubject)
+		recover(t, st)
+		st.sess.mu.Lock()
+		restored := st.sess.pendingPublish[st.answer.pi]
+		st.sess.mu.Unlock()
+		if restored == nil || restored.q2AffClaim != st.victim.claim {
+			t.Fatalf("the forged pair was not restored, so the transition under test never ran: %+v", restored)
+		}
+		answerPubRec(t, st)
+		victimUntouched(t, st)
+		st.sess.mu.Lock()
+		_, held := st.sess.pendingPubRel[st.answer.pi]
+		st.sess.mu.Unlock()
+		if !held {
+			t.Fatal("the identifier was released although its exchange is past PUBREC")
+		}
+	})
+
+	t.Run("the pair is internally consistent", func(t *testing.T) {
+		st := stage(t, "forgecons")
+		// Claim B with B's OWN copy: every field agrees with every other, and only this
+		// register's SOURCE says the pair belongs to a different delivery.
+		forge(t, st, st.victim.copySubject)
+		recover(t, st)
+		st.sess.mu.Lock()
+		restored := st.sess.pendingPublish[st.answer.pi]
+		st.sess.mu.Unlock()
+		if restored == nil {
+			t.Fatal("the identifier was not reserved, so a later allocation could reuse one the client may hold")
+		}
+		if restored.q2AffClaim != _EMPTY_ || restored.q2AffCopy != _EMPTY_ {
+			t.Fatalf("recovery installed a pair its own source contradicts: %+v", restored)
+		}
+		if !restored.regForeign {
+			t.Fatal("the reservation is settleable, so the client's own acknowledgement will delete the refused record")
+		}
+		answerPubRec(t, st)
+		victimUntouched(t, st)
+		st.sess.mu.Lock()
+		reserved := st.sess.pendingPublish[st.answer.pi] != nil
+		st.sess.mu.Unlock()
+		if !reserved {
+			t.Fatal("the identifier was released, so it can be reused while the client may still hold it")
+		}
+	})
+
+	// The control. Without it every assertion above passes for a fixture whose PUBREC
+	// never reached the affine path at all — which is how four earlier affine fixtures in
+	// this file passed for the wrong reason.
+	t.Run("the genuine register completes", func(t *testing.T) {
+		st := stage(t, "forgectl")
+		recover(t, st)
+		answerPubRec(t, st)
+		// AffineDone AND the register gone, which is the pair of facts the two subcases
+		// above are each denied. The copy is not asserted on: a recovered entry has no
+		// ack subject (see victimUntouched), so the copy is disposed of by the delivery
+		// gate's terminal branch on the next redelivery rather than here.
+		checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+			cl, _, err := st.b.asm.loadQ2AffClaim(st.answer.claim)
+			if err != nil {
+				return fmt.Errorf("loading the claim: %w", err)
+			}
+			if cl == nil {
+				return fmt.Errorf("the claim was reaped although its copy ack was never confirmed")
+			}
+			if !cl.AffineDone {
+				return fmt.Errorf("the affine side is not recorded yet: %+v", cl)
+			}
+			rec, _, lerr := st.b.asm.jsa.loadInflightRecord(st.answer.regSubject)
+			if lerr != nil {
+				return fmt.Errorf("loading the register: %w", lerr)
+			}
+			if rec != nil {
+				return fmt.Errorf("the register is still there: %+v", rec)
+			}
+			return nil
+		})
+	})
+}
+
+// testQ2AffOneDelivery brings a session to ONE in-flight affine QoS 2 delivery and
+// returns everything the forgery fixtures below need: the claim it elected, the copy it
+// carries, the packet identifier, and the register's subject.
+//
+// One delivery rather than two, deliberately: with a single copy on the affine consumer,
+// that consumer's redelivery counter is unambiguous evidence that THIS copy was re-offered,
+// which is what the retirement fixtures need as a positive signal. The second claim those
+// fixtures forge against is elected by hand instead.
+type testQ2AffOne struct {
+	b           *testQ2AffBroker
+	c           net.Conn
+	r           *mqttReader
+	sess        *mqttSession
+	idHash      string
+	affGen      string
+	groupDur    string
+	pi          uint16
+	claim       string
+	copySubject string
+	regSubject  string
+	jsDur       string
+	sseq        uint64
+}
+
+func testQ2AffOneDelivery(t *testing.T, name string, ackWait time.Duration) *testQ2AffOne {
+	t.Helper()
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = ackWait
+	srv := testMQTTRunServer(t, o)
+	t.Cleanup(func() { testMQTTShutdownServer(srv) })
+	b := &testQ2AffBroker{s: srv, o: o, topic: name + "/topic", group: name + "grp"}
+	id := name + "A"
+	c, r := b.member(t, id, 300)
+	t.Cleanup(func() { c.Close() })
+	b.bind(t, id)
+	idHash := getHash(id)
+	affGen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if affGen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	b.publish(t, 1, "one")
+	topic, _, qos, pi, ok := testMQTTTryReadPublishV5(r, 10*time.Second)
+	if !ok || qos != 2 || topic != b.topic {
+		t.Fatalf("no shared QoS 2 delivery: topic=%q qos=%d ok=%v", topic, qos, ok)
+	}
+	b.asm.mu.RLock()
+	sess := b.asm.sessions[id]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	sess.mu.Lock()
+	sessGen := sess.gen
+	sess.mu.Unlock()
+	out := &testQ2AffOne{
+		b: b, c: c, r: r, sess: sess, idHash: idHash, affGen: affGen,
+		groupDur: b.groupDurable(t), pi: pi,
+		regSubject: mqttInflightSubject(idHash, sessGen, pi),
+	}
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		rec, _, lerr := b.asm.jsa.loadInflightRecord(out.regSubject)
+		if lerr != nil {
+			return fmt.Errorf("loading the register: %w", lerr)
+		}
+		if rec == nil || rec.Q2AffClaim == _EMPTY_ || rec.Q2AffCopy == _EMPTY_ {
+			return fmt.Errorf("the register does not carry its affine pair yet: %+v", rec)
+		}
+		out.claim, out.copySubject, out.jsDur, out.sseq = rec.Q2AffClaim, rec.Q2AffCopy, rec.Dur, rec.Seq
+		return nil
+	})
+	return out
+}
+
+// testQ2AffElectByHand elects a self-consistent claim on an unrelated source sequence of
+// the SAME group and session, so a register forged to name it is shape-valid: same winner,
+// same affine generation, same affine durable. Its copy is stored only when asked for,
+// because a fixture that needs an unambiguous redelivery signal must not put a second copy
+// on the affine consumer.
+func testQ2AffElectByHand(t *testing.T, st *testQ2AffOne, srcSeq uint64, withCopy bool) *mqttQ2AffClaim {
+	t.Helper()
+	claim := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: st.idHash, Gen: st.affGen, GroupDurable: st.groupDur, SourceSeq: srcSeq,
+		ClaimHash: mqttQ2AffClaimHash(st.groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(st.idHash, st.affGen), Phase: mqttQ2AffMaterialized,
+	})
+	subject := mqttQ2AffClaimSubject(st.groupDur, srcSeq)
+	if _, err := st.b.asm.storeQ2AffClaimCAS(subject, 0, claim); err != nil {
+		t.Fatalf("electing the second claim: %v", err)
+	}
+	if withCopy {
+		env := &mqttQ2AffineEnvelope{
+			natsSubject: st.b.topic, msg: []byte("second-body"),
+			claimSubject: subject, gen: st.affGen,
+			msgID: mqttQ2AffMsgId(st.groupDur, srcSeq, claim.Nonce),
+		}
+		msg, hdr := mqttNewQ2AffineRecord(env)
+		if _, err := st.b.asm.storeQ2AffCopy(claim.CopySubject, hdr, msg); err != nil {
+			t.Fatalf("staging the second claim's copy: %v", err)
+		}
+	}
+	return claim
+}
+
+// testQ2AffForgeRegister rewrites a register's affine pair in place — same nonce, same
+// identifier, same source — so the only thing wrong with it is the pair it carries.
+func testQ2AffForgeRegister(t *testing.T, st *testQ2AffOne, claimSubject, copySubject string) {
+	t.Helper()
+	rec, sm, err := st.b.asm.jsa.loadInflightRecord(st.regSubject)
+	if err != nil || rec == nil || sm == nil {
+		t.Fatalf("loading the register to forge: %v", err)
+	}
+	rec.Q2AffClaim, rec.Q2AffCopy = claimSubject, copySubject
+	if _, err := st.b.asm.jsa.storeInflightCAS(st.regSubject, sm.Sequence, rec); err != nil {
+		t.Fatalf("forging the register: %v", err)
+	}
+}
+
+// testQ2AffRecoverRegisters drops the in-memory entry and lets RECOVERY rebuild it from
+// the record, which is the route a restart takes and the only one a forged register enters
+// by.
+func testQ2AffRecoverRegisters(t *testing.T, st *testQ2AffOne) {
+	t.Helper()
+	st.sess.mu.Lock()
+	delete(st.sess.pendingPublish, st.pi)
+	st.sess.mu.Unlock()
+	if err := st.sess.recoverInflightRegisters(testQ2AffSessionClient(st.b, st.sess)); err != nil {
+		t.Fatalf("recovering the registers: %v", err)
+	}
+}
+
+// TestQ2AffForgedRegisterAcknowledgesNoForeignCopy is holistic round 15's H15, which found
+// the first fix for the carried pair had moved the loss rather than closed it.
+//
+// A carrier naming a FOREIGN claim survives the immediate transition, because that refuses
+// — but the PUBREC has already installed a retirement carrying the same forged pair, and
+// the retirement outlives the transition. On the copy's next redelivery the retired
+// settlement took its superseded-incarnation arm (the claim it loads names a different
+// copy), confirm-acked the copy IN HAND and cleared the retirement. That copy belongs to
+// the answering delivery's OWN claim, which never recorded AffineDone: its only copy is
+// gone and its message can never be delivered. The immediate transition passing is exactly
+// what made the earlier fixture pass — it stopped before AckWait.
+//
+// So a mismatch is superseded only WITHIN one assignment identity: same owner, same
+// generation, same claim hash, differing in the incarnation token alone. A copy of a
+// different assignment is refused instead, and refusing costs one NAK'd redelivery.
+//
+// Paired mutation M42: treat every copy mismatch as superseded (drop the assignment-identity
+// derivation in q2AffClaimForCarriedCopy). The redelivery then acknowledges the answering
+// claim's live copy away.
+func TestQ2AffForgedRegisterAcknowledgesNoForeignCopy(t *testing.T) {
+	// Short enough that the copy is genuinely re-offered inside the test, long enough that
+	// the forge-recover-PUBREC sequence completes before the first redelivery.
+	st := testQ2AffOneDelivery(t, "forgeack", 2*time.Second)
+	// The victim claim carries NO copy: with one copy on the affine consumer, that
+	// consumer's redelivery counter is unambiguous evidence that the answering delivery's
+	// own copy was re-offered, which is the positive signal this fixture rests on.
+	victim := testQ2AffElectByHand(t, st, 611001, false)
+	victimSubject := mqttQ2AffClaimSubject(st.groupDur, 611001)
+
+	// The forged pair names the VICTIM's claim while carrying the answering delivery's own
+	// copy — so the register's source agrees with it and recovery installs it.
+	testQ2AffForgeRegister(t, st, victimSubject, st.copySubject)
+	testQ2AffRecoverRegisters(t, st)
+	st.sess.mu.Lock()
+	restored := st.sess.pendingPublish[st.pi]
+	st.sess.mu.Unlock()
+	if restored == nil || restored.q2AffClaim != victimSubject || restored.q2AffCopy != st.copySubject {
+		t.Fatalf("the forged pair was not restored, so nothing under test ever runs: %+v", restored)
+	}
+
+	// A real PUBREC: the affine transition refuses (the victim's claim does not name this
+	// copy), so a retirement carrying the forged pair is left behind. That retirement is
+	// what the redelivery below settles.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, st.c, st.pi)
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		st.sess.mu.Lock()
+		defer st.sess.mu.Unlock()
+		if !st.sess.sourceRetiredLocked(st.jsDur, st.sseq) {
+			return fmt.Errorf("the PUBREC has not installed its retirement yet")
+		}
+		return nil
+	})
+	before := testQ2AffRedeliveries(t, st)
+
+	// The redelivery is REAL, and so is its JetStream reply subject: a synthetic one would
+	// make the acknowledgement fail for want of a real subject and the defect would hide
+	// behind that failure.
+	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
+		if testQ2AffRedeliveries(t, st) <= before {
+			return fmt.Errorf("the copy has not been re-offered yet, so the retired settlement never ran")
+		}
+		return nil
+	})
+
+	if state, _ := st.b.asm.loadQ2AffCopy(st.copySubject); state != mqttQ2AffCopyPresent {
+		t.Fatal("the answering delivery's OWN copy was acknowledged away by a retirement carrying a foreign claim: that claim never recorded AffineDone, so its message can never be delivered (F-065, H15)")
+	}
+	after, _, err := st.b.asm.loadQ2AffClaim(victimSubject)
+	if err != nil || after == nil {
+		t.Fatalf("the victim's claim is gone: %v", err)
+	}
+	if after.AffineDone || after.Lost || after.Discarded {
+		t.Fatalf("the retirement wrote to a claim it never delivered for: %+v", after)
+	}
+	if after.Nonce != victim.Nonce {
+		t.Fatalf("the victim's claim was replaced: %+v", after)
+	}
+	st.sess.mu.Lock()
+	stillRetired := st.sess.sourceRetiredLocked(st.jsDur, st.sseq)
+	st.sess.mu.Unlock()
+	if !stillRetired {
+		t.Fatal("the retirement was cleared although nothing about it was settled: the payload's suppression is gone while the copy is still re-offerable")
+	}
+}
+
+// testQ2AffRedeliveries is the affine consumer's CUMULATIVE delivery count, which is how
+// these fixtures prove a copy was RE-OFFERED rather than assuming it.
+//
+// Deliberately Delivered.Consumer and not NumRedelivered: the latter is how many messages
+// are CURRENTLY in a redelivered state, so it sits at 1 for a single copy no matter how
+// many times that copy is re-offered — measured, and it made the first version of this
+// fixture time out against a consumer that was in fact re-offering thousands of times.
+func testQ2AffRedeliveries(t *testing.T, st *testQ2AffOne) uint64 {
+	t.Helper()
+	ci, err := st.b.asm.jsa.lookupConsumer(mqttOutStreamName, affDurableFor(st.idHash, st.affGen))
+	if err != nil || ci == nil {
+		t.Fatalf("looking up the affine consumer: %v", err)
+	}
+	return ci.Delivered.Consumer
+}
+
+// TestQ2AffRegisterWithAnUnprovenSourceIsNotInstalled is holistic round 15's H16: the
+// source binding has to be POSITIVE.
+//
+// The first form refused only a live source naming a DIFFERENT copy, on the reasoning that
+// an absent or unreadable source is not evidence of a forgery. True, and beside the point:
+// nothing licenses installing an authoritative pair on the strength of a source that was
+// never read. An indeterminate consumer lookup, an indeterminate message read, or a
+// consumer that is authoritatively GONE all admitted the forgery whole — and the forged
+// pair here is internally consistent, so no other check can catch it.
+//
+// The consumer is deleted to reach that state, which makes the source knowably Lost. An
+// unreadable one takes the identical branch: the predicate proves nothing without a live
+// source whose subject IS the carried copy.
+//
+// Paired mutation M43: restore the contradiction-only form (refuse only when a LIVE source
+// names a different subject). The forged pair is then installed and its PUBREC records
+// AffineDone on a claim that delivered nothing.
+func TestQ2AffRegisterWithAnUnprovenSourceIsNotInstalled(t *testing.T) {
+	st := testQ2AffOneDelivery(t, "unprovensrc", 30*time.Second)
+	victim := testQ2AffElectByHand(t, st, 622001, true)
+	victimSubject := mqttQ2AffClaimSubject(st.groupDur, 622001)
+
+	// Internally consistent: the register names the victim's claim AND the victim's own
+	// copy, so only its source could ever say the pair belongs to a different delivery.
+	testQ2AffForgeRegister(t, st, victimSubject, victim.CopySubject)
+
+	// Destroying the affine consumer is what makes the source unprovable — and it is a
+	// real state, not a contrivance: an out-of-band consumer deletion is the premise of
+	// this feature's Lost outcome.
+	if _, err := st.b.asm.jsa.deleteConsumer(mqttOutStreamName, affDurableFor(st.idHash, st.affGen), true); err != nil {
+		t.Fatalf("deleting the affine consumer: %v", err)
+	}
+	testQ2AffRecoverRegisters(t, st)
+
+	st.sess.mu.Lock()
+	restored := st.sess.pendingPublish[st.pi]
+	mapped, hasMapping := st.sess.cpending[st.jsDur][st.sseq]
+	st.sess.mu.Unlock()
+	if restored == nil {
+		t.Fatal("the identifier was not reserved, so a later allocation could reuse one the client may hold")
+	}
+	if restored.q2AffClaim != _EMPTY_ || restored.q2AffCopy != _EMPTY_ {
+		t.Fatalf("recovery installed an affine pair its own source never proved: %+v", restored)
+	}
+	if !restored.regForeign {
+		t.Fatal("the reservation is settleable, so the client's own acknowledgement will delete the record an operator has to resolve")
+	}
+	if hasMapping {
+		t.Fatalf("the unproven register's source was entered in the delivery map under identifier %d", mapped)
+	}
+	after, _, err := st.b.asm.loadQ2AffClaim(victimSubject)
+	if err != nil || after == nil {
+		t.Fatalf("the victim's claim is gone: %v", err)
+	}
+	if after.AffineDone || after.Lost || after.Discarded {
+		t.Fatalf("a pair no source proved was credited to the claim it named: %+v", after)
+	}
+}
+
+// TestQ2AffUnprovenRegisterPoisonsItsSibling is holistic round 15's H17.
+//
+// An unproven pair does not prove the identifier was never transmitted — the client may
+// hold THAT identifier rather than a sibling's. The first fix set such a register aside on
+// its own, before the duplicate-source grouping, which turned a two-member group into a
+// one-member one: the sibling was then installed as an authoritative singleton WITH a
+// cpending mapping, and the source's redelivery follows that mapping and re-sends the
+// payload under a second identifier. Reserving both identifiers does not prevent that,
+// because the mapping is what the redelivery consults.
+//
+// So an unproven register joins the grouping as an UNOWNED member and poisons every
+// sibling of its source, exactly as a register whose claim could not be established does.
+//
+// Paired mutation M44: set the unproven register aside before the grouping (append to
+// opaque and continue). The sibling is then installed with a source mapping.
+func TestQ2AffUnprovenRegisterPoisonsItsSibling(t *testing.T) {
+	st := testQ2AffOneDelivery(t, "poisonsib", 30*time.Second)
+	victim := testQ2AffElectByHand(t, st, 633001, true)
+	victimSubject := mqttQ2AffClaimSubject(st.groupDur, 633001)
+
+	// A GENUINE sibling: a second register naming the SAME delivery on a different
+	// identifier, which is what a superseded broker leaves behind. Its own pair is correct,
+	// so nothing but the group makes it refusable.
+	const siblingPI = uint16(4242)
+	st.sess.mu.Lock()
+	sessGen := st.sess.gen
+	st.sess.mu.Unlock()
+	siblingSubject := mqttInflightSubject(st.idHash, sessGen, siblingPI)
+	if _, err := st.b.asm.jsa.storeInflightCAS(siblingSubject, 0, &mqttInflightRecord{
+		PI: siblingPI, Dur: st.jsDur, Seq: st.sseq, QoS: 2, Nonce: mqttNewInflightNonce(),
+		Q2AffClaim: st.claim, Q2AffCopy: st.copySubject,
+	}); err != nil {
+		t.Fatalf("writing the sibling register: %v", err)
+	}
+	// The answering register's pair is now contradicted by its own source: it carries the
+	// victim's copy while its delivery is its own.
+	testQ2AffForgeRegister(t, st, victimSubject, victim.CopySubject)
+	testQ2AffRecoverRegisters(t, st)
+
+	st.sess.mu.Lock()
+	answering := st.sess.pendingPublish[st.pi]
+	sibling := st.sess.pendingPublish[siblingPI]
+	mapped, hasMapping := st.sess.cpending[st.jsDur][st.sseq]
+	st.sess.mu.Unlock()
+	if answering == nil || sibling == nil {
+		t.Fatalf("both identifiers must stay reserved: answering=%+v sibling=%+v", answering, sibling)
+	}
+	if hasMapping {
+		t.Fatalf("the source was entered in the delivery map under identifier %d although one register naming it could not be interpreted: its redelivery now re-sends the payload under that identifier", mapped)
+	}
+	// The UNPROVEN member is the one nothing may settle. Its genuine sibling is this
+	// session's own record and stays settleable, which is the existing duplicate-source
+	// policy (only unowned members are marked foreign) and is deliberately not changed
+	// here: what this finding is about is the source MAPPING, which is what a redelivery
+	// consults.
+	if !answering.regForeign {
+		t.Fatal("the unproven register is settleable, so the client's own acknowledgement will delete the record an operator has to resolve")
+	}
+	if sibling.q2AffClaim != _EMPTY_ || sibling.q2AffCopy != _EMPTY_ {
+		t.Fatalf("the sibling was installed with its pair although its group was poisoned: %+v", sibling)
+	}
+	for subject, what := range map[string]string{st.regSubject: "answering", siblingSubject: "sibling"} {
+		rec, _, err := st.b.asm.jsa.loadInflightRecord(subject)
+		if err != nil {
+			t.Fatalf("loading the %s register: %v", what, err)
+		}
+		if rec == nil {
+			t.Fatalf("the %s register was deleted although the group was never arbitrated", what)
+		}
+	}
+}
+
+// TestQ2AffRefusalBackoffIsDerivedFromTheDeliveryCount pins the wire form and the curve,
+// because both are load-bearing and neither is visible from the end-to-end fixture below:
+// a payload nats-server cannot parse is treated as a PLAIN NAK (consumer.go:3186-3200), so
+// a typo here silently restores the storm this exists to bound.
+//
+// Paired mutation M45: return AckNak unchanged. The end-to-end pacing fixture then fails.
+func TestQ2AffRefusalBackoffIsDerivedFromTheDeliveryCount(t *testing.T) {
+	t.Parallel()
+	parse := func(t *testing.T, raw []byte) time.Duration {
+		t.Helper()
+		prefix := string(AckNak) + " "
+		if !strings.HasPrefix(string(raw), prefix) {
+			t.Fatalf("a refusal must be a NAK with a delay payload, got %q", raw)
+		}
+		var opts struct {
+			Delay int64 `json:"delay"`
+		}
+		if err := json.Unmarshal(raw[len(prefix):], &opts); err != nil {
+			t.Fatalf("nats-server parses this payload as JSON and falls back to a PLAIN NAK when it cannot: %v (%q)", err, raw)
+		}
+		return time.Duration(opts.Delay)
+	}
+	// An unparseable reply subject yields delivery count zero, which must not become a
+	// zero delay: that is the immediate NAK by another route.
+	if d := parse(t, mqttQ2AffRefusalNak(0)); d != mqttQ2AffRefusalBaseDelay {
+		t.Fatalf("delivery count 0 paced at %v, want the base delay %v", d, mqttQ2AffRefusalBaseDelay)
+	}
+	if d := parse(t, mqttQ2AffRefusalNak(1)); d != mqttQ2AffRefusalBaseDelay {
+		t.Fatalf("the first delivery paced at %v, want the base delay %v: the common phase race must retry fast", d, mqttQ2AffRefusalBaseDelay)
+	}
+	if d := parse(t, mqttQ2AffRefusalNak(2)); d != 2*mqttQ2AffRefusalBaseDelay {
+		t.Fatalf("the second delivery paced at %v, want %v", d, 2*mqttQ2AffRefusalBaseDelay)
+	}
+	prev := parse(t, mqttQ2AffRefusalNak(2))
+	for dc := uint64(3); dc < 40; dc++ {
+		d := parse(t, mqttQ2AffRefusalNak(dc))
+		if d < prev {
+			t.Fatalf("the backoff went BACKWARDS at delivery %d: %v after %v", dc, d, prev)
+		}
+		if d > mqttQ2AffRefusalMaxDelay {
+			t.Fatalf("delivery %d paced at %v, past the cap %v", dc, d, mqttQ2AffRefusalMaxDelay)
+		}
+		prev = d
+	}
+	if prev != mqttQ2AffRefusalMaxDelay {
+		t.Fatalf("the backoff settled at %v rather than the cap %v, so a sustained refusal never reaches its bound", prev, mqttQ2AffRefusalMaxDelay)
+	}
+}
+
+// TestQ2AffSustainedRefusalIsPaced is holistic round 16's finding, and its own measurement
+// is what makes the bound meaningful: before the backoff, ONE copy under an absent claim
+// was re-offered 9214 times in ten seconds — a tight load-and-refuse loop against
+// JetStream with a log line per turn.
+//
+// The state is not forgery-only, which is why this is a defect rather than a curiosity.
+// docs/CONFORMANCE.md states three windows in which a copy legitimately outlives the claim
+// that would authorize it, and an unreadable record or an unavailable backend produces the
+// same shape for as long as it lasts. So the fixture stages the legitimate version: a live
+// copy whose claim record is simply gone.
+//
+// Paired mutations M45 (return AckNak unchanged from mqttQ2AffRefusalNak) and M46 (send
+// AckNak directly from the claim == nil arm). Either restores the storm and this fixture
+// fails on the count.
+func TestQ2AffSustainedRefusalIsPaced(t *testing.T) {
+	// A short AckWait so the refusal loop actually starts inside the test; the pacing
+	// under test is the NAK's delay, which is what governs every turn after the first.
+	st := testQ2AffOneDelivery(t, "refusepace", time.Second)
+
+	// The claim record is deleted, so the gate's claim == nil arm refuses every
+	// redelivery. Nothing else can settle it: the copy stays, and the loop is sustained.
+	_, seq, err := st.b.asm.loadQ2AffClaim(st.claim)
+	if err != nil || seq == 0 {
+		t.Fatalf("loading the claim to delete: %v (seq %d)", err, seq)
+	}
+	if derr := st.b.asm.jsa.deleteMsg(mqttQoS2AssignStreamName, seq, true); derr != nil {
+		t.Fatalf("deleting the claim: %v", derr)
+	}
+	if state, _ := st.b.asm.loadQ2AffCopy(st.copySubject); state != mqttQ2AffCopyPresent {
+		t.Fatal("the copy is gone, so no refusal loop can be staged")
+	}
+	before := testQ2AffRedeliveries(t, st)
+
+	// The refusal must actually RUN — a bound that holds because nothing happened is no
+	// bound at all — so the loop is first observed to start, and only then measured.
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		if testQ2AffRedeliveries(t, st) <= before {
+			return fmt.Errorf("the copy has not been re-offered yet, so no refusal has run")
+		}
+		return nil
+	})
+	start := testQ2AffRedeliveries(t, st)
+	time.Sleep(5 * time.Second)
+	grown := testQ2AffRedeliveries(t, st) - start
+	// The backoff doubles from 100ms, so five seconds of sustained refusal admits a
+	// handful of turns. The measured unbounded form managed several thousand per second,
+	// so the threshold does not need to be tight to discriminate.
+	const bound = 40
+	if grown > bound {
+		t.Fatalf("a sustained refusal was re-offered %d times in five seconds (bound %d): an immediate NAK turns every legitimate claim-absence window into a request storm against JetStream", grown, bound)
+	}
+}
+
+// TestQ2AffGateRefusesACrossAssignmentCopy is holistic round 17's finding, and it is the
+// same defect the retired settlement had one round earlier, in the one place I did not
+// sweep: the delivery gate disposed of a copy on BARE subject inequality.
+//
+// The gate takes its claim subject from the copy's own HEADER. So a copy persisted on
+// assignment A's copy subject while its header names a valid, attributable assignment B
+// passes every other check and reaches the mismatch arm — where an acknowledgement destroys
+// A's message and leaves A's claim without AffineDone, irrecoverably. Bare inequality is
+// not the statement the disposal needs: only a copy of THE SAME assignment under another
+// incarnation is unauthorizable by construction, and that is now one predicate
+// (q2AffCopyIsSupersededIncarnationOf) shared by both paths.
+//
+// A cross-assignment copy is a persisted shape this broker does not write, so it is
+// refused, not interpreted.
+//
+// Paired mutation M47: restore the broad disposal (ack whenever subject != CopySubject).
+// The copy is then acknowledged away and this fixture fails on its presence.
+func TestQ2AffGateRefusesACrossAssignmentCopy(t *testing.T) {
+	st := testQ2AffOneDelivery(t, "crossassign", 2*time.Second)
+	// Two hand-elected assignments of this same session and generation, so both are
+	// attributable and owned: the copy will be stored on A's subject with B's header.
+	a := testQ2AffElectByHand(t, st, 644001, false)
+	b := testQ2AffElectByHand(t, st, 644002, false)
+	bSubject := mqttQ2AffClaimSubject(st.groupDur, 644002)
+	if a.CopySubject == b.CopySubject {
+		t.Fatal("the two assignments derived one copy subject, so this fixture stages nothing")
+	}
+
+	before := testQ2AffRedeliveries(t, st)
+	// The copy lives on A's subject and its header names B. Everything about it is
+	// well formed; only the pairing is a shape this broker never writes.
+	env := &mqttQ2AffineEnvelope{
+		natsSubject: st.b.topic, msg: []byte("cross-assignment-body"),
+		claimSubject: bSubject, gen: st.affGen,
+		msgID: mqttQ2AffMsgId(st.groupDur, 644002, b.Nonce),
+	}
+	msg, hdr := mqttNewQ2AffineRecord(env)
+	if _, err := st.b.asm.storeQ2AffCopy(a.CopySubject, hdr, msg); err != nil {
+		t.Fatalf("staging the cross-assignment copy: %v", err)
+	}
+
+	// It must actually REACH the gate: the affine consumer's cumulative delivery count is
+	// what says so, and without that the presence assertion below would hold for a copy
+	// nothing ever looked at.
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		if testQ2AffRedeliveries(t, st) <= before {
+			return fmt.Errorf("the cross-assignment copy has not been delivered yet, so the gate never ran")
+		}
+		return nil
+	})
+
+	if state, _ := st.b.asm.loadQ2AffCopy(a.CopySubject); state != mqttQ2AffCopyPresent {
+		t.Fatal("the gate acknowledged away a copy of a DIFFERENT assignment than the claim its header named: that assignment's claim never records AffineDone, so its message is lost and its claim is stranded (F-065, round 17)")
+	}
+	for subject, claim := range map[string]*mqttQ2AffClaim{
+		mqttQ2AffClaimSubject(st.groupDur, 644001): a,
+		bSubject: b,
+	} {
+		got, _, err := st.b.asm.loadQ2AffClaim(subject)
+		if err != nil || got == nil {
+			t.Fatalf("loading the claim on %q: %v", subject, err)
+		}
+		if got.AffineDone || got.Lost || got.Discarded {
+			t.Fatalf("a cross-assignment copy wrote to the claim on %q: %+v", subject, got)
+		}
+		if got.Nonce != claim.Nonce {
+			t.Fatalf("the claim on %q was replaced: %+v", subject, got)
+		}
+	}
+}
+
+// TestQ2AffCompletionAcknowledgesOnlyWhatItRecorded is holistic round 18's first finding,
+// and it is a window between two loads rather than a missing check.
+//
+// q2AffClaimForCarriedCopy validates ONE load; advanceQ2AffClaim then performs its own. In
+// between the record can be deleted — advanceQ2AffClaim reports that as (nil, 0, nil),
+// because a claim that is simply gone is not an error for its other callers — or rewritten
+// to something that keeps the incarnation and loses its attributability. Either way a nil
+// error was being read as proof, and the copy was then confirm-acked: the irreversible
+// half, with the completion durable NOWHERE. That is precisely the ambiguity the
+// record-before-ack order exists to remove.
+//
+// The two subtests are the two shapes, and they are deliberately driven through the claim
+// LOAD seam rather than by racing a real writer: what has to be pinned is which reading
+// each decision rests on, and a race would prove that only by luck.
+//
+// Paired mutations M48 (drop the updated-record validation in mqttFinishQ2AffineDelivery)
+// and M49 (drop the copy fence inside advanceQ2AffClaim's CAS loop).
+func TestQ2AffCompletionAcknowledgesOnlyWhatItRecorded(t *testing.T) {
+	b := testQ2AffSetup(t, "finishwin")
+	c, _ := b.member(t, "finishwinA", 300)
+	defer c.Close()
+	b.bind(t, "finishwinA")
+	idHash := getHash("finishwinA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["finishwinA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	cc := testQ2AffSessionClient(b, sess)
+
+	// stage elects a real, self-consistent claim and returns it with the sequence its
+	// record occupies, so a hooked load can hand back a record the CAS would accept.
+	stage := func(t *testing.T, srcSeq uint64) (*mqttQ2AffClaim, string, uint64) {
+		t.Helper()
+		claim := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+			AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+		})
+		subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+		seq, err := b.asm.storeQ2AffClaimCAS(subject, 0, claim)
+		if err != nil {
+			t.Fatalf("electing the claim: %v", err)
+		}
+		return claim, subject, seq
+	}
+
+	t.Run("the record disappears between the validation and the transition", func(t *testing.T) {
+		claim, subject, seq := stage(t, 655001)
+		var acked atomic.Bool
+		var loads atomic.Int64
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(string) error { acked.Store(true); return nil }
+		b.asm.testQ2AffClaimLoad = func(subj string) (*mqttQ2AffClaim, uint64, error) {
+			if subj != subject {
+				return nil, 0, fmt.Errorf("unexpected subject %q", subj)
+			}
+			if loads.Add(1) == 1 {
+				cp := *claim
+				return &cp, seq, nil // what the validation sees
+			}
+			return nil, 0, nil // GONE by the time the transition reads it
+		}
+		b.asm.mu.Unlock()
+		defer func() {
+			b.asm.mu.Lock()
+			b.asm.testQ2AffCopyAck, b.asm.testQ2AffClaimLoad = nil, nil
+			b.asm.mu.Unlock()
+		}()
+
+		recorded, ackedOK := cc.mqttFinishQ2AffineDelivery(subject, claim.CopySubject, "ack.subject")
+
+		if loads.Load() < 2 {
+			t.Fatalf("the transition never performed its own load (%d), so this run does not stage the window", loads.Load())
+		}
+		if acked.Load() {
+			t.Fatal("the copy was acknowledged although the record carrying its completion had DISAPPEARED: an absent copy under no claim at all is indistinguishable from a lost delivery, and nothing can ever record the completion now")
+		}
+		if recorded || ackedOK {
+			t.Fatalf("the completion was reported as recorded=%v acked=%v with nothing durable behind it: the PUBREC path would then delete the register that is the exchange's last carrier", recorded, ackedOK)
+		}
+	})
+
+	t.Run("the record keeps its incarnation and loses its attributability", func(t *testing.T) {
+		claim, subject, seq := stage(t, 655002)
+		var acked atomic.Bool
+		var loads atomic.Int64
+		// Same incarnation, so the nonce fence passes; a ClaimHash that no longer follows
+		// from GroupDurable/SourceSeq, so the record is not attributable to its own
+		// subject. The sequence is the REAL one, so a mutation that removes the in-loop
+		// fence lands its CAS and the defect is observable rather than masked by a
+		// rejected write.
+		corrupt := *claim
+		corrupt.ClaimHash = mqttQ2AffClaimHash(groupDur, 999999)
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(string) error { acked.Store(true); return nil }
+		b.asm.testQ2AffClaimLoad = func(subj string) (*mqttQ2AffClaim, uint64, error) {
+			if subj != subject {
+				return nil, 0, fmt.Errorf("unexpected subject %q", subj)
+			}
+			if loads.Add(1) == 1 {
+				cp := *claim
+				return &cp, seq, nil
+			}
+			cp := corrupt
+			return &cp, seq, nil
+		}
+		b.asm.mu.Unlock()
+		defer func() {
+			b.asm.mu.Lock()
+			b.asm.testQ2AffCopyAck, b.asm.testQ2AffClaimLoad = nil, nil
+			b.asm.mu.Unlock()
+		}()
+
+		recorded, _ := cc.mqttFinishQ2AffineDelivery(subject, claim.CopySubject, "ack.subject")
+
+		if loads.Load() < 2 {
+			t.Fatalf("the transition never performed its own load (%d), so this run does not stage the window", loads.Load())
+		}
+		if acked.Load() {
+			t.Fatal("the copy was acknowledged against a record that cannot be attributed to its own subject")
+		}
+		if recorded {
+			t.Fatal("an unattributable record was reported as carrying the completion")
+		}
+		// And the write itself must not have happened: the fence is inside the CAS loop
+		// precisely so an unproven record is never mutated. Read through the seam removal.
+		b.asm.mu.Lock()
+		b.asm.testQ2AffClaimLoad = nil
+		b.asm.mu.Unlock()
+		after, _, err := b.asm.loadQ2AffClaim(subject)
+		if err != nil || after == nil {
+			t.Fatalf("loading the record after the refusal: %v", err)
+		}
+		if after.AffineDone {
+			t.Fatalf("the transition MUTATED a record it could not attribute: %+v", after)
+		}
+	})
+}
+
+// TestQ2AffRetiredSettlementBindsTheCopyInHand is holistic round 18's second finding: the
+// superseded arm proved something about the CARRIER and then acknowledged whatever was
+// DELIVERED.
+//
+// The two are not the same message. A third, cross-assignment delivered copy passed the
+// successor guard, so a live assignment's message was acknowledged away with its claim left
+// stranded — the same class as the gate's cross-assignment disposal one round earlier, in
+// the other path. The delivered-versus-carried equality now runs BEFORE every arm that can
+// acknowledge anything.
+//
+// Paired mutation M50: move that equality back below the switch, where the superseded arm
+// bypasses it.
+func TestQ2AffRetiredSettlementBindsTheCopyInHand(t *testing.T) {
+	b := testQ2AffSetup(t, "settlebind")
+	c, _ := b.member(t, "settlebindA", 300)
+	defer c.Close()
+	b.bind(t, "settlebindA")
+	idHash := getHash("settlebindA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["settlebindA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	elect := func(t *testing.T, srcSeq uint64, nonce string) (*mqttQ2AffClaim, string) {
+		t.Helper()
+		claim := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+			Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+			ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: nonce,
+			AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+		})
+		subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+		if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, claim); err != nil {
+			t.Fatalf("electing the claim on %q: %v", subject, err)
+		}
+		return claim, subject
+	}
+	retired := func(t *testing.T, jsDur string, copySeq uint64) bool {
+		t.Helper()
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return sess.sourceRetiredLocked(jsDur, copySeq)
+	}
+
+	t.Run("a superseded carrier acknowledges no third assignment's copy", func(t *testing.T) {
+		// The live claim is a REPLACEMENT incarnation, so the carrier below is genuinely
+		// superseded and the arm under test is genuinely entered.
+		const srcSeq = uint64(666001)
+		live, subject := elect(t, srcSeq, mqttNewQ2AffGen())
+		supersededCarrier := mqttQ2AffCopySubject(idHash, gen, mqttQ2AffClaimHash(groupDur, srcSeq), mqttNewQ2AffGen())
+		if supersededCarrier == live.CopySubject {
+			t.Fatal("the carrier and the live claim derived one copy subject, so nothing is superseded here")
+		}
+		// A THIRD assignment, perfectly live, whose copy is the one in hand.
+		third, thirdSubject := elect(t, 666002, mqttNewQ2AffGen())
+
+		var acked atomic.Value
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(reply string) error { acked.Store(reply); return nil }
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffCopyAck = nil; b.asm.mu.Unlock() }()
+
+		const jsDur, copySeq = "$MQTT_Q2AFF_settlebindthird", uint64(71)
+		sess.mu.Lock()
+		sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+			pi: 21, nonce: "regnonce21", q2AffClaim: subject, q2AffCopy: supersededCarrier, durable: true,
+		})
+		sess.mu.Unlock()
+
+		sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq,
+			"ack.subject", third.CopySubject, subject, supersededCarrier)
+
+		if acked.Load() != nil {
+			t.Fatal("a superseded CARRIER licensed acknowledging a third assignment's DELIVERED copy: that assignment's claim never records AffineDone, so its message is lost and its claim is stranded")
+		}
+		if !retired(t, jsDur, copySeq) {
+			t.Fatal("the retirement was cleared although nothing about it was settled")
+		}
+		for subj := range map[string]struct{}{subject: {}, thirdSubject: {}} {
+			got, _, err := b.asm.loadQ2AffClaim(subj)
+			if err != nil || got == nil {
+				t.Fatalf("loading the claim on %q: %v", subj, err)
+			}
+			if got.AffineDone || got.Lost || got.Discarded {
+				t.Fatalf("the settlement wrote to the claim on %q: %+v", subj, got)
+			}
+		}
+	})
+
+	t.Run("a live carrier acknowledges no other copy in hand", func(t *testing.T) {
+		// Here the carrier IS the live claim's copy, so the helper succeeds and the
+		// completion path would run — but the copy in hand is a different assignment's,
+		// which is the refusal the equality above the switch exists for.
+		const srcSeq = uint64(666003)
+		live, subject := elect(t, srcSeq, mqttNewQ2AffGen())
+		other, otherSubject := elect(t, 666004, mqttNewQ2AffGen())
+
+		var acked atomic.Value
+		b.asm.mu.Lock()
+		b.asm.testQ2AffCopyAck = func(reply string) error { acked.Store(reply); return nil }
+		b.asm.mu.Unlock()
+		defer func() { b.asm.mu.Lock(); b.asm.testQ2AffCopyAck = nil; b.asm.mu.Unlock() }()
+
+		const jsDur, copySeq = "$MQTT_Q2AFF_settlebindlive", uint64(72)
+		sess.mu.Lock()
+		sess.retireSourceLocked(jsDur, copySeq, &mqttRetiredSource{
+			pi: 22, nonce: "regnonce22", q2AffClaim: subject, q2AffCopy: live.CopySubject, durable: true,
+		})
+		sess.mu.Unlock()
+
+		sess.settleRetiredAffineSource(testQ2AffSessionClient(b, sess), jsDur, copySeq,
+			"ack.subject", other.CopySubject, subject, live.CopySubject)
+
+		if acked.Load() != nil {
+			t.Fatal("the settlement acknowledged a copy its retirement does not name")
+		}
+		if !retired(t, jsDur, copySeq) {
+			t.Fatal("the retirement was cleared on the strength of a copy it does not name")
+		}
+		for subj := range map[string]struct{}{subject: {}, otherSubject: {}} {
+			got, _, err := b.asm.loadQ2AffClaim(subj)
+			if err != nil || got == nil {
+				t.Fatalf("loading the claim on %q: %v", subj, err)
+			}
+			if got.AffineDone {
+				t.Fatalf("the settlement recorded a completion for a copy that was never in hand: %q %+v", subj, got)
+			}
+		}
+	})
+}
+
+// TestQ2AffOversizeClaimIsDroppedBeforeElection drives the RUNTIME backstop, which is the
+// half of the claim-size bound that matters for a QoS 1/2 Will: a Will store bypasses the
+// PUBLISH admission preflight entirely, so an assignment claim that cannot be stored would
+// otherwise be discovered only by an election that can never succeed — and the group
+// delivery would then be re-offered forever.
+//
+// The payload window is chosen so the COPY fits and only the CLAIM does not, which is what
+// makes the assertion attributable to the check under test rather than to the pre-existing
+// affine-form bound.
+//
+// Paired mutation M18: delete the runtime claim-size check. The election then proceeds and
+// writes a claim for a message whose claim record cannot be stored.
+func TestQ2AffOversizeClaimIsDroppedBeforeElection(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "oversizeclaim")
+	c, _ := b.member(t, "oversizeclaimA", 300)
+	defer c.Close()
+	b.bind(t, "oversizeclaimA")
+	idHash := getHash("oversizeclaimA")
+	if gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen; gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	b.asm.mu.RLock()
+	sess := b.asm.sessions["oversizeclaimA"]
+	b.asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the session is not resident")
+	}
+	groupDur := b.groupDurable(t)
+
+	claimMax := mqttQ2AffClaimRecordMax()
+	env := &mqttQ2AffineEnvelope{
+		natsSubject:  b.topic,
+		msg:          []byte("tiny"),
+		claimSubject: mqttQ2AffClaimSubject(groupDur, 1),
+		gen:          mqttNewQ2AffGen(),
+		msgID:        mqttQ2AffMsgId(groupDur, 1, mqttNewQ2AffGen()),
+	}
+	copySize := mqttComputeQ2AffineSize(env)
+	if claimMax <= copySize {
+		t.Skipf("the claim form (%d) does not exceed the copy form (%d) here, so this window does not exist", claimMax, copySize)
+	}
+	// Above the copy, below the claim: only the claim check can drop this.
+	maxPayload := int32(claimMax - 1)
+
+	res := sess.moveStartedSharedQoS2(b.s, b.asm, &mqttQ2AffMoveInput{
+		groupDurable: groupDur,
+		natsSubject:  b.topic,
+		msg:          []byte("tiny"),
+		maxPayload:   maxPayload,
+	})
+	if res != mqttQ2AffMoveDropped {
+		t.Fatalf("the move returned %v, want dropped: a message whose assignment claim exceeds the account max payload must be discarded, not elected", res)
+	}
+	// And nothing was written: an election here would be a claim the broker can never
+	// store, so every later attempt at that subject wedges on it.
+	if got := b.claims(t); len(got) != 0 {
+		t.Fatalf("an assignment claim was elected for a message whose claim record cannot be stored: %v", got)
+	}
+}
+
+// TestQ2AffMoverRefusesAnUnattributableClaim drives the MOVER's validation at its
+// production site, which review found T11 was bypassing: it called the predicate directly
+// and then exercised only the reaper and recovery, so removing the validator from
+// moveStartedSharedQoS2 was unobservable and an unattributable claim could reach
+// materialization.
+//
+// The claim subject is predicted the way F-066's fixture predicts it — from the next
+// source sequence — because the mover derives it from the delivery's own reply subject,
+// so a synthetic input elects on a different subject entirely and proves nothing. A
+// prediction that misses SKIPS rather than passing: concurrent stream activity is not a
+// result.
+//
+// Paired mutation: remove the q2AffClaimUsableForDecision call from the mover's
+// post-rejection load. The delivery is then materialized against a record whose copy
+// subject does not follow from its own identity.
+func TestQ2AffMoverRefusesAnUnattributableClaim(t *testing.T) {
+	b := testQ2AffSetup(t, "moverrefuse")
+	c, r := b.member(t, "moverrefuseA", 300)
+	defer c.Close()
+	b.bind(t, "moverrefuseA")
+	idHash := getHash("moverrefuseA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+
+	// The subject the NEXT publish will elect on.
+	nextSeq := b.lastSourceSeq(t) + 1
+	subject := mqttQ2AffClaimSubject(groupDur, nextSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, nextSeq)
+	bad := &mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: nextSeq,
+		ClaimHash: claimHash, Nonce: mqttNewQ2AffGen(),
+		// Derived for a DIFFERENT incarnation: a shape no election can emit.
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, claimHash, mqttNewQ2AffGen()),
+		AffDurable:  affDurableFor(idHash, gen),
+		// TERMINAL, and that is the point: a claimed record routes the mover into
+		// materializeQ2AffCopy, whose own refusal then shadows this one and makes the
+		// mutation unobservable. The terminal arm is where the mover acts ALONE — it
+		// confirms the source acknowledgement and reaps — so it is the arm where its
+		// refusal is load-bearing.
+		Discarded: true,
+		Phase:     mqttQ2AffMaterialized,
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, bad); err != nil {
+		t.Fatalf("seeding the unattributable claim: %v", err)
+	}
+
+	// A POSITIVE signal that the mover RAN, and with what disposition. Without it every
+	// assertion below passes when the group callback is merely delayed — the inbound
+	// publish only proves the source was stored, not that the move was attempted.
+	moved := make(chan mqttQ2AffMoveResult, 4)
+	b.asm.mu.Lock()
+	b.asm.testQ2AffMoveDone = func(cs string, res mqttQ2AffMoveResult) {
+		if cs == subject {
+			select {
+			case moved <- res:
+			default:
+			}
+		}
+	}
+	b.asm.mu.Unlock()
+	defer func() { b.asm.mu.Lock(); b.asm.testQ2AffMoveDone = nil; b.asm.mu.Unlock() }()
+
+	b.publish(t, 1, "unattributable")
+	if got := b.lastSourceSeq(t); got != nextSeq {
+		t.Skipf("the publish landed at %d, not the predicted %d; concurrent stream activity, not a result", got, nextSeq)
+	}
+	select {
+	case res := <-moved:
+		if res != mqttQ2AffMoveDeferred {
+			t.Fatalf("the mover resolved %v against an unattributable claim, want deferred: it must prove nothing, write nothing and acknowledge nothing", res)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the mover never ran for the predicted claim subject, so nothing below exercises its refusal")
+	}
+
+	// Nothing may be delivered against a record the broker cannot attribute, and the
+	// record itself must be untouched: the mover proves nothing, writes nothing and
+	// acknowledges nothing.
+	if _, _, _, _, ok := testMQTTTryReadPublishV5(r, 2*time.Second); ok {
+		t.Fatal("a PUBLISH was delivered against a claim whose copy subject does not follow from its own identity")
+	}
+	after, _, err := b.asm.loadQ2AffClaim(subject)
+	if err != nil || after == nil {
+		t.Fatalf("the unattributable claim was acted on: %v", err)
+	}
+	if after.SourceAcked {
+		t.Fatalf("the mover CONFIRMED the source acknowledgement of a claim it cannot attribute, which is irreversible: %+v", after)
+	}
+	if st, _ := b.asm.loadQ2AffCopy(bad.CopySubject); st != mqttQ2AffCopyAbsent {
+		t.Fatalf("a copy was materialized onto a subject the record does not own (%v)", st)
+	}
+}
+
+// TestQ2AffGateRefusesAnUnattributableClaim drives the DELIVERY GATE's refusal, which the
+// earlier version of this coverage could not: it staged the copy while the member was
+// DISCONNECTED, so the gate never ran and removing its refusal changed nothing. That was
+// the eighth fixture in this change to bypass the wiring it claimed to cover, and it was
+// caught by RUNNING the mutation rather than by reading the test.
+//
+// The claim carries an incarnation that is not a mintable value but IS the one its copy
+// subject derives from, so the derivation check passes and only the minted-form check can
+// refuse. The member stays CONNECTED, so the copy really reaches the gate.
+//
+// Paired mutation M20: remove the gate's q2AffClaimUsableForDecision arm. The copy is then
+// published to the client against a record the broker cannot attribute.
+func TestQ2AffGateRefusesAnUnattributableClaim(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "gaterefuse")
+	c, r := b.member(t, "gaterefuseA", 300)
+	defer c.Close()
+	b.bind(t, "gaterefuseA")
+	idHash := getHash("gaterefuseA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+
+	// One character short of a minted incarnation: its copy subject derives from it
+	// consistently, which is what isolates the minted-form check.
+	shortNonce := strings.Repeat("z", mqttQ2AffGenLen-1)
+	const srcSeq = uint64(755001)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, srcSeq)
+	bad := &mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: claimHash, Nonce: shortNonce,
+		CopySubject: mqttQ2AffCopySubject(idHash, gen, claimHash, shortNonce),
+		AffDurable:  affDurableFor(idHash, gen),
+		Phase:       mqttQ2AffMaterialized,
+	}
+	if q2AffClaimUsableForDecision(subject, bad) == nil {
+		t.Fatal("the staged claim is attributable, so this fixture cannot exercise the refusal")
+	}
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, bad); err != nil {
+		t.Fatalf("seeding the claim: %v", err)
+	}
+	env := &mqttQ2AffineEnvelope{
+		natsSubject: b.topic, msg: []byte("unattributable"),
+		claimSubject: subject, gen: gen,
+		msgID: mqttQ2AffMsgId(groupDur, srcSeq, shortNonce),
+	}
+	// A POSITIVE signal that the GATE ran: it loads the claim named in the copy's header,
+	// and nothing else in this fixture touches that subject. Without it, "no PUBLISH" and
+	// "the copy is still present" both pass when the affine callback simply never fired.
+	var gateLoads atomic.Int32
+	b.asm.mu.Lock()
+	b.asm.testQ2AffClaimLoad = func(subj string) (*mqttQ2AffClaim, uint64, error) {
+		if subj == subject {
+			gateLoads.Add(1)
+		}
+		return b.asm.jsa.loadQ2AffClaim(subj)
+	}
+	b.asm.mu.Unlock()
+	defer func() { b.asm.mu.Lock(); b.asm.testQ2AffClaimLoad = nil; b.asm.mu.Unlock() }()
+
+	msg, hdr := mqttNewQ2AffineRecord(env)
+	if _, err := b.asm.storeQ2AffCopy(bad.CopySubject, hdr, msg); err != nil {
+		t.Fatalf("staging the copy: %v", err)
+	}
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		if gateLoads.Load() == 0 {
+			return fmt.Errorf("the delivery gate has not run for this copy yet")
+		}
+		return nil
+	})
+
+	// Delivered to a CONNECTED member, so the gate really runs. It must publish nothing.
+	if topic, payload, _, _, ok := testMQTTTryReadPublishV5(r, 2*time.Second); ok {
+		t.Fatalf("the gate published a copy whose claim the broker cannot attribute: topic=%q payload=%q", topic, payload)
+	}
+	// And it must not dispose of it either: nothing here can prove what an unattributable
+	// record's copy belongs to, so the copy is NAK'd and left for an actor with evidence.
+	if st, _ := b.asm.loadQ2AffCopy(bad.CopySubject); st != mqttQ2AffCopyPresent {
+		t.Fatalf("the gate disposed of the copy (%v) instead of NAKing it", st)
+	}
+}
+
+// TestQ2AffReapRevalidatesAfterItsOwnTransition pins the refusal on the claim the reaper's
+// OWN SourceAcked transition returns, which review found unvalidated.
+//
+// That transition is identity-unfenced by design — a SourceAcked write is a fact about the
+// source MESSAGE, so it applies to whichever incarnation holds the subject — and it
+// therefore returns whatever record it loaded, which may be a concurrently rewritten
+// occupant. The copy subject that decides whether the claim is DELETED comes from that
+// record, so an unvalidated one lets a malformed rewrite redirect the absence check and
+// strand the original copy with no claim to authorize or dispose of it.
+//
+// The rewrite is interposed on the load INSIDE the transition, which is the real window
+// rather than a simulation of one. The load counter is the positive signal that the
+// interposition actually happened — without it this test would pass whenever the reaper
+// took a different path.
+//
+// Paired mutation M24: drop the post-transition re-validation. The reaper then reads the
+// malformed record's copy subject, finds nothing there, and deletes the claim.
+func TestQ2AffReapRevalidatesAfterItsOwnTransition(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "reapreval")
+	c, _ := b.member(t, "reaprevalA", 300)
+	b.bind(t, "reaprevalA")
+	idHash := getHash("reaprevalA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	// A source sequence that is authoritatively gone, so the reaper performs the
+	// SourceAcked transition itself — that transition is the window under test.
+	const goneSeq = uint64(866001)
+	subject := mqttQ2AffClaimSubject(groupDur, goneSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, goneSeq)
+	good := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: goneSeq,
+		ClaimHash: claimHash, Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen),
+		Phase:      mqttQ2AffMaterialized, Discarded: true,
+	})
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, good); err != nil {
+		t.Fatalf("seeding the claim: %v", err)
+	}
+	// A REAL copy on the claim's own subject: it is what must survive, and what a
+	// redirected absence check would strand.
+	env := &mqttQ2AffineEnvelope{
+		natsSubject: b.topic, msg: []byte("stranded"),
+		claimSubject: subject, gen: gen,
+		msgID: mqttQ2AffMsgId(groupDur, goneSeq, good.Nonce),
+	}
+	msg, hdr := mqttNewQ2AffineRecord(env)
+	if _, err := b.asm.storeQ2AffCopy(good.CopySubject, hdr, msg); err != nil {
+		t.Fatalf("staging the copy: %v", err)
+	}
+
+	// Interpose a MALFORMED occupant on the load inside the transition: same identity, but
+	// a copy subject that does not follow from it, pointing somewhere empty.
+	var loads atomic.Int32
+	b.asm.mu.Lock()
+	b.asm.testQ2AffClaimLoad = func(subj string) (*mqttQ2AffClaim, uint64, error) {
+		cl, sq, err := b.asm.jsa.loadQ2AffClaim(subj)
+		if subj != subject || cl == nil || err != nil {
+			return cl, sq, err
+		}
+		if loads.Add(1) == 1 {
+			return cl, sq, nil // the reaper's own first read: the good record
+		}
+		rewritten := *cl
+		rewritten.CopySubject = mqttQ2AffCopySubject(idHash, gen, claimHash, mqttNewQ2AffGen())
+		return &rewritten, sq, nil
+	}
+	b.asm.mu.Unlock()
+	defer func() { b.asm.mu.Lock(); b.asm.testQ2AffClaimLoad = nil; b.asm.mu.Unlock() }()
+
+	b.asm.reapQ2AffClaim(b.s, subject)
+
+	if loads.Load() < 2 {
+		t.Fatalf("the reaper loaded the claim %d time(s); it never entered its SourceAcked transition, so this run does not exercise the window", loads.Load())
+	}
+	if got, _, err := b.asm.loadQ2AffClaim(subject); err != nil || got == nil {
+		t.Fatal("the claim was reaped on a copy subject taken from an unvalidated post-transition record: the real copy is still on the stream and now has no claim able to authorize or dispose of it")
+	}
+	if st, _ := b.asm.loadQ2AffCopy(good.CopySubject); st != mqttQ2AffCopyPresent {
+		t.Fatalf("the staged copy is gone (%v), so the assertion above proved nothing", st)
+	}
+}
+
+// TestQ2AffMaterializeRefusesAnUnattributablePostTransitionRecord is the materialization
+// half of the post-transition trust window — the same class as the reaper's, found one
+// round later because closing it in one place did not close it in the other.
+//
+// advanceQ2AffClaim reloads the record and matches identity fields ONLY, so a concurrent
+// rewrite that preserves winner, generation and incarnation while making CopySubject
+// inconsistent gets `materialized` written onto it. Reporting that as success licenses the
+// caller's IRREVERSIBLE group-source acknowledgement, and the delivery gate — which does
+// validate — then NAKs the retained copy forever: the message is released from the group
+// and can never be delivered.
+//
+// The rewrite is interposed on the load INSIDE the transition, and the load counter is the
+// positive signal that the interposition actually happened.
+//
+// Paired mutation M25: drop the post-transition validation in materializeQ2AffCopy.
+func TestQ2AffMaterializeRefusesAnUnattributablePostTransitionRecord(t *testing.T) {
+	t.Parallel()
+	b := testQ2AffSetup(t, "matreval")
+	c, _ := b.member(t, "matrevalA", 300)
+	b.bind(t, "matrevalA")
+	idHash := getHash("matrevalA")
+	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
+	if gen == _EMPTY_ {
+		t.Fatal("no affine generation")
+	}
+	groupDur := b.groupDurable(t)
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	const srcSeq = uint64(977001)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	claimHash := mqttQ2AffClaimHash(groupDur, srcSeq)
+	good := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: claimHash, Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffClaimed,
+	})
+	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, good); err != nil {
+		t.Fatalf("seeding the claim: %v", err)
+	}
+	cur, seq, _ := b.asm.loadQ2AffClaim(subject)
+
+	// Identity fields preserved, CopySubject made inconsistent: the shape the fence
+	// cannot catch, because the fence compares winner, generation and incarnation.
+	var loads atomic.Int32
+	b.asm.mu.Lock()
+	b.asm.testQ2AffClaimLoad = func(subj string) (*mqttQ2AffClaim, uint64, error) {
+		cl, sq, err := b.asm.jsa.loadQ2AffClaim(subj)
+		if subj != subject || cl == nil || err != nil {
+			return cl, sq, err
+		}
+		loads.Add(1)
+		rewritten := *cl
+		rewritten.CopySubject = mqttQ2AffCopySubject(idHash, gen, claimHash, mqttNewQ2AffGen())
+		return &rewritten, sq, nil
+	}
+	b.asm.mu.Unlock()
+	defer func() { b.asm.mu.Lock(); b.asm.testQ2AffClaimLoad = nil; b.asm.mu.Unlock() }()
+
+	env := &mqttQ2AffineEnvelope{natsSubject: b.topic, msg: []byte("attributable?")}
+	ok := b.asm.materializeQ2AffCopy(b.s, cur, subject, seq, env)
+
+	if loads.Load() == 0 {
+		t.Fatal("the transition never reloaded the record, so this run does not exercise the window")
+	}
+	if ok {
+		t.Fatal("materialization reported SUCCESS after writing `materialized` onto a record that cannot be attributed: its caller would then confirm the group-source acknowledgement irreversibly, while the delivery gate — which does validate — NAKs the retained copy forever")
+	}
+}
+
+// TestQ2AffClaimMustAgreeWithItsOwnSubject pins the binding that closes review's bypass of
+// the post-transition validator, and the shape is the whole point: a rewrite that preserves
+// winner, generation and incarnation while changing ClaimHash and RECOMPUTING CopySubject
+// from it is internally self-consistent. It passes the incarnation fence — which compares
+// winner, generation and nonce only — and it passed the first version of the validator,
+// which checked only that CopySubject followed from the record's own fields.
+//
+// Acting on such a record materializes and then IRREVERSIBLY releases a source under a
+// claim hash belonging to some other (group, sequence); the delivery gate then reads the
+// real copy's subject as a superseded incarnation and acknowledges it away without
+// publishing. The message is lost, which is worse than the stranding F-065 set out to fix.
+//
+// So a record must agree with the SUBJECT it was found on and with its own source, which
+// self-consistency does not give. Same discipline F-058 applies to Will records.
+//
+// Paired mutation M26: drop the ClaimHash / subject binding from the validator.
+func TestQ2AffClaimMustAgreeWithItsOwnSubject(t *testing.T) {
+	t.Parallel()
+	const groupDur = "$MQTT_SHARED_0123456789abcdef"
+	const srcSeq = uint64(4242)
+	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
+	idHash, gen := getHash("agreeA"), mqttNewQ2AffGen()
+
+	good := testQ2AffSelfConsistent(&mqttQ2AffClaim{
+		Winner: idHash, Gen: gen, GroupDurable: groupDur, SourceSeq: srcSeq,
+		ClaimHash: mqttQ2AffClaimHash(groupDur, srcSeq), Nonce: mqttNewQ2AffGen(),
+		AffDurable: affDurableFor(idHash, gen), Phase: mqttQ2AffMaterialized,
+	})
+	if err := q2AffClaimUsableForDecision(subject, good); err != nil {
+		t.Fatalf("a record that agrees with its own subject was refused: %v", err)
+	}
+
+	// The bypass: a DIFFERENT claim hash, with every derived name recomputed from it.
+	forged := *good
+	forged.ClaimHash = mqttQ2AffClaimHash(groupDur, srcSeq+1)
+	forged.CopySubject = mqttQ2AffCopySubject(forged.Winner, forged.Gen, forged.ClaimHash, forged.Nonce)
+	if want := mqttQ2AffCopySubject(forged.Winner, forged.Gen, forged.ClaimHash, forged.Nonce); forged.CopySubject != want {
+		t.Fatal("the forged record is not self-consistent, so it does not stage the bypass")
+	}
+	if forged.ownedBy(good.Winner, good.Gen) != true || forged.Nonce != good.Nonce {
+		t.Fatal("the forged record must preserve winner, generation and incarnation, or the identity fence would catch it and this proves nothing")
+	}
+	if err := q2AffClaimUsableForDecision(subject, &forged); err == nil {
+		t.Fatal("a self-consistent record whose claim hash belongs to a DIFFERENT source was accepted: materializing on it would irreversibly release this source, and the gate would then acknowledge the real copy away as a superseded incarnation without publishing it")
+	}
+
+	// The same discipline in the other direction: a well-formed record found on the WRONG
+	// subject is refused, because agreement with the subject is what makes it attributable.
+	if err := q2AffClaimUsableForDecision(mqttQ2AffClaimSubject(groupDur, srcSeq+7), good); err == nil {
+		t.Fatal("a record was accepted on a subject that does not follow from the group and source sequence it names")
+	}
 }

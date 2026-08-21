@@ -312,7 +312,7 @@ func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte)
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
 	}
-	if !e.sess.storeInflightRegister(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_) {
+	if !e.sess.storeInflightRegister(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("storeInflightRegister(%d, %s/%d) refused", pi, dur, sseq)
 	}
 	return pi
@@ -459,7 +459,7 @@ func TestMQTTInflightStoreDefiniteFailureUntracks(t *testing.T) {
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
 	}
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 300, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 300, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("an unrecordable identifier must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -498,7 +498,7 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 	if pi != 42 || !isNew {
 		t.Fatalf("expected the allocation to land on 42, got pi=%d isNew=%v", pi, isNew)
 	}
-	if e.sess.storeInflightRegister(e.c, pi, 2, dur, 500, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, 500, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("an identifier held by a live foreign register must be refused")
 	}
 	// The foreign record is untouched: it may be a live delivery's identity.
@@ -543,7 +543,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	}
 	// The stale record's source (sequence 7) is absent from an empty stream while its
 	// consumer exists, so it is provably complete.
-	if !e.sess.storeInflightRegister(e.c, pi, 1, dur, 600, e.nonceOf(pi), _EMPTY_) {
+	if !e.sess.storeInflightRegister(e.c, pi, 1, dur, 600, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a stale register must not block its identifier")
 	}
 	rec, smsg := e.loadRegister(t, 11)
@@ -1019,7 +1019,7 @@ func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T
 	e.sess.mu.Lock()
 	ack := e.sess.pendingPublish[pi]
 	e.sess.mu.Unlock()
-	if _, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, ack.regSeq, ack.regNonce, _EMPTY_); !ok {
+	if _, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, ack.regSeq, ack.regNonce, _EMPTY_, _EMPTY_); !ok {
 		t.Fatalf("could not mark the register retired")
 	}
 	// The source turns out to have been acknowledged after all: with its consumer still
@@ -1341,7 +1341,7 @@ func TestMQTTInflightAbandonedRegisterKeepsFirstSendDupClear(t *testing.T) {
 	e.sess.mu.Lock()
 	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1500, 1))
 	e.sess.mu.Unlock()
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1500, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1500, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("an unrecordable identifier must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -1480,7 +1480,7 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 	}
 
 	// And the store's ownership revalidation refuses the send.
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1600, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1600, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 }
@@ -1683,7 +1683,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 2000, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 2000, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	rec, _ := e.loadRegister(t, pi)
@@ -1923,7 +1923,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 
 	// The store settles: it refuses the send, removes the record, and releases the
 	// reserved identifier.
-	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -2571,7 +2571,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1900, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1900, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -2590,7 +2590,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 	e.sess.mu.Lock()
 	pi2, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1901, 1))
 	e.sess.mu.Unlock()
-	if !e.sess.storeInflightRegister(e.c, pi2, 1, dur, 1901, e.nonceOf(pi2), _EMPTY_) {
+	if !e.sess.storeInflightRegister(e.c, pi2, 1, dur, 1901, e.nonceOf(pi2), _EMPTY_, _EMPTY_) {
 		t.Fatalf("the follow-up delivery must register normally")
 	}
 	ps, _, err := e.asm.loadFenceSession(idHash)
@@ -2747,7 +2747,7 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 	})
 	e.sess.mu.Unlock()
 	// The record's copy carries the retirement mark, as secureRetiredSource would leave it.
-	if newSeq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, regSeq, nonce, _EMPTY_); !ok {
+	if newSeq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, regSeq, nonce, _EMPTY_, _EMPTY_); !ok {
 		t.Fatalf("the retirement must be durable for this test")
 	} else {
 		regSeq = newSeq
@@ -3180,7 +3180,7 @@ func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
 		return 0, fmt.Errorf("test: response lost after takeover claimed the write")
 	}
 	e.asm.mu.Unlock()
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, nonce, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
 		t.Fatal("stale store adopted the new owner's claimed sequence")
 	}
 	if storeAttempts != 1 {
@@ -3226,7 +3226,7 @@ func TestMQTTInflightClaimFencesRetirementReconcile(t *testing.T) {
 	if err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
-	if seq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, msgA.Sequence, recA.Nonce, _EMPTY_); ok || seq != 0 {
+	if seq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, msgA.Sequence, recA.Nonce, _EMPTY_, _EMPTY_); ok || seq != 0 {
 		t.Fatalf("stale retirement unexpectedly succeeded at %d", seq)
 	}
 	rec, _, err := asmB.jsa.loadInflightRecord(mqttInflightSubject(sessB.idHash, sessB.gen, pi))
@@ -3328,7 +3328,7 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 	}
 	e.sess.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, n2, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, n2, _EMPTY_, _EMPTY_) {
 		t.Fatal("a stale same-delivery store must lose the arbitration, not take the slot")
 	}
 	rec, msg, err := asmB.jsa.loadInflightRecord(subject)
@@ -4767,7 +4767,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	nonce2 := e.sess.pendingPublish[pi2].regNonce
 	e.sess.voidRegistrationsLocked(dur)
 	e.sess.mu.Unlock()
-	if e.sess.storeInflightRegister(e.c, pi2, 1, dur, 4400, e.nonceOf(pi2), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi2, 1, dur, 4400, e.nonceOf(pi2), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -4823,7 +4823,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 	}
 
 	// A's stale store finally settles. It must not touch B's reservation or verdict.
-	if e.sess.storeInflightRegister(e.c, piA, 1, dur, 5100, nonceA, _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, piA, 1, dur, 5100, nonceA, _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -5295,7 +5295,7 @@ func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1700, e.nonceOf(pi), _EMPTY_) {
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1700, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	if len(deleted) < 2 {

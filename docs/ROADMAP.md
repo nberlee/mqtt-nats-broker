@@ -588,8 +588,9 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
   Clauses (a) and (b) answer NO — every claim write goes through one CAS helper that always
   emits `JSExpectedLastSubjSeq`, W1 is create-only, W2 CASes at a base read in the same
   attempt, and D1 deletes an exact sequence. Seven of the ten transitions additionally
-  assert the winner's identity; three record owner-independent facts and rest on the CAS
-  alone. All ten
+  assert the winner's identity; three record owner-independent facts, of which the two
+  `SourceAcked` writes rest on the CAS alone while `AffineDone` is additionally
+  incarnation- and copy-fenced (F-065). All ten
   transition and twelve reap call sites are dispositioned individually in the dossier.
   Clause (c) is inherited by citation from F-030 with no new depproof row; **R-purge is
   not applicable and that is positive evidence** — `purgeStream` has exactly three
@@ -657,8 +658,44 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
     and a contender needs claim → PUBREL, which is a reverse lookup that must be costed
     before it is promised.
   - *The accumulation half* — settled claims of a live generation are still not reaped.
-    Carried by **F-065**'s bullet, because reaping them needs the reaper fence that is
-    F-065's remedy.
+    It was carried by F-065's bullet because reaping them needs a reaper that is safe
+    against a concurrent materializer; **F-065 has now landed that fence**, so this half
+    is unblocked and stays here rather than becoming a separate box. What it needs:
+    `refs.hasAffine` makes `reconcileOrphanQ2AffClaims` skip every claim of a referenced
+    generation (`orphan_qos2_sweep.go`), so only `recoverQ2AffClaims` on the owner's own
+    resume ever revisits one, and a session that never resumes accumulates one
+    `$MQTT_qos2assign` record per message forever plus the per-pass scan cost. **Three
+    windows** (dossier, F-064 "Consequence 2"): a skipped reap after `AffineDone`; a
+    `SourceAcked` committed with its response lost before the terminal contender's reap;
+    and — NONTERMINAL, so `reapable` refuses it however much else is proven — a claim
+    left `claimed` with `SourceAcked` false and no copy after a later redelivery found
+    the Message Expiry Interval elapsed and bare-acked the source before electing
+    anything. The remedy: in the live-generation arm, `Discarded ∨ AffineDone` →
+    `reapQ2AffClaim`; `Lost` → untouched (`reapable` refuses it, so a call is a pure
+    round trip); nonterminal with the source authoritatively gone → the rule
+    `recoverQ2AffClaims`'s default arm already applies, EXTRACTED so there is one
+    definition and two callers. `discardAbsentWinnerClaim`'s generation-match deferral —
+    F-064's second gate — stays untouched, because the new arms never reason about the
+    winner. **The trap that makes it hard:** "source authoritatively gone" does NOT imply
+    no materializer holds the payload — MQTT 5 messages carry a per-message `Nats-TTL`
+    and the validator requires that capability, and a confirmed ack cannot revoke an
+    already-dispatched callback. So the sourceless rule must not act on the inventory's
+    snapshot: "still nonmaterialized" has to be evaluated INSIDE
+    `advanceQ2AffClaim`'s mutate attempt against the freshly loaded record, carrying the
+    inventory incarnation's nonce (F-065 makes that expectation available), no-opping and
+    declining the reap when that record is now `materialized`. Otherwise the sweep adds
+    `Discarded` to a claim a live materializer just completed, the gate drops the live
+    copy as terminal, the source is already gone, and the delivery is lost — and F-065's
+    compensation cannot help, because the materializer finished its decision first. Tests
+    need the **load-count oracle** (an instance-scoped `testQ2AffClaimLoad` counter for
+    the subject), because a reap of a nonterminal or `Lost` claim merely DECLINES and a
+    survival-only assertion passes against the mutation; `refs.hasAffine`'s arm has no
+    quarantine gate, so its tests must not require a second sweep pass. The same
+    accumulation population also includes retired affine `$MQTT_inflight` registers
+    (`Retired` with `Q2AffClaim`): because a live record protects them through
+    `refs.hasInbound(idHash, ps.Gen)` rather than `refs.hasAffine(idHash, ps.Q2AffGen)`,
+    the remedy must add the corresponding live-session-generation in-flight arm and
+    settle each register together with its referenced copy and `$MQTT_qos2assign` claim.
   **The premise is enforced at TWO gates** — the reference skip and
   `discardAbsentWinnerClaim`'s generation-match deferral — and mutation showed that removing
   either alone changes nothing, so any remedy that works THROUGH the sweep must address
@@ -712,20 +749,58 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
   subscription delivers nothing. Any fix must weigh what the F-064 review established: the
   obvious remedy, failing the CONNECT, is ungraceful and therefore publishes the Will and
   can delete a zero-expiry session.
-- [ ] [F-065: Re-read copy absence after the reaper's own SourceAcked transition](findings/ha-arbitration.md#f-065).
-  **Alpha blocker.** `reapQ2AffClaim` reads the copy state, may then perform a `SourceAcked`
-  transition that is a full JetStream round trip with retries, and evaluates
-  `reapable(copyAbsent)` on the earlier reading. A concurrent on-behalf materializer storing
-  its copy during that window leaves source proven, claim absent and copy present — the
-  delivery gate NAKs it forever, which is exactly the state `reapable`'s own comment says
-  must never exist. `materializeQ2AffCopy`'s `Discarded` guard does not close it: that guard
-  reads the caller's already-loaded claim.
-  **Also carries F-064's accumulation half.** Settled claims of a live generation are
-  never reaped, because `buildSessionRefs` makes the sweep skip every claim of a
-  referenced generation. Reaping them is exactly what needs the fence this item builds, so
-  the two are one piece of work: a reaper that may act on a claim whose generation is
-  still live must first be safe against a concurrent materializer, which is the window
-  above.
+- [x] [F-065: Re-read copy absence after the reaper's own SourceAcked transition](findings/ha-arbitration.md#f-065).
+  **Alpha blocker — done, with the stated guarantee RE-SCOPED** (the same shape as
+  F-063's), which is what the tick rests on. `reapQ2AffClaim` evaluated `reapable` on a
+  copy reading taken BEFORE its own `SourceAcked` transition — a full JetStream round
+  trip with retries — so a copy stored during it was invisible and the claim was deleted
+  out from under it, leaving a copy the delivery gate can only NAK, forever, holding a
+  `MaxAckPending` slot. Seven plan-review rounds established that this is **three
+  routes, not one**, and only the first is the ordering: a stale-snapshot materializer
+  needs no reaper race at all (its `advanceQ2AffClaim` returns no-op SUCCESS on a claim
+  that has since completed, so any remedy keyed on "my CAS failed" misses it), and a
+  group callback dispatched before the reap re-wins the create-only election, which
+  `DeliverNew` cannot cancel.
+  **What landed.** (1) The reaper's copy reading is taken after its own last write and
+  is the last observation before the delete. (2) The claim carries an **incarnation
+  nonce**, minted at the election and never rewritten, which scopes the copy subject and
+  the copy's `Nats-Msg-Id` and fences the four incarnation-specific transitions inside
+  `advanceQ2AffClaim` before it mutates — `SourceAcked` (a fact about the source
+  message) and the teardown discards (facts about the session) deliberately opt out.
+  (3) A materialization attempt WITHDRAWS the exact copy sequence it proved present once
+  it proves no claim of that copy's incarnation remains; every store outcome now
+  converges on the presence proof, so a landed-but-unreported store is resolved rather
+  than abandoned. (4) The delivery gate disposes a copy whose live claim names a
+  different copy subject — a positive fact, unlike the `claim == nil` arm, which still
+  fails closed because an absence is not a fact. (5) A per-claim OPERATIONAL validator
+  refuses an unattributable record on the six direct decision paths, while
+  `mqttQ2AffClaimIdentityOK` deliberately stays as it is: it is the account-wide
+  attribution floor, and tightening it would abort an unrelated session's teardown.
+  (6) The claim record is now size-bounded at all, in the admission calculation and in
+  the runtime backstop, over every reachable terminal shape — a QoS 1/2 Will bypasses
+  admission entirely. (7) `DenyDelete` on `$MQTT_out` is now fatal at startup.
+  **A second residual this change ADDS, and the tick also rests on it:** on the
+  successful-PUBREC path a failed `AffineDone` leaves the copy unacknowledged and durably
+  retires its register, and if the client completes PUBCOMP, disconnects before AckWait
+  redelivery and keeps a non-expiring session that never resumes, nothing revisits any of
+  it — the live session record makes orphan reconciliation preserve both the claim and,
+  through a SEPARATE key (`refs.hasInbound` on the session generation, not
+  `refs.hasAffine` on the affine one), the retired register. Before this change that path
+  already accumulated the copy-and-claim pair and deleted the register unconditionally, so
+  what F-065 adds is one retired register per such exchange: **unbounded in count, bounded
+  in kind**, with the same growth law as the pair. F-064's accumulation half owns the
+  live-generation reconciliation that must collect all three, and its bullet now names the
+  register class explicitly so the remedy cannot close without it.
+  **The residual, which the tick rests on:** the withdrawal is a compensation, not an
+  arbitration — claim and copy are on separate streams and JetStream's atomic batches
+  are per-stream, so no claim-side state can arbitrate a copy-side store. A copy
+  stranded by an attempt that crashed, whose delete was unconfirmed either definitely or
+  indeterminately, or whose final claim reading was indeterminate, is bounded by ordinary
+  teardown, a later orphan-sweep consumer deletion, or the gate's superseded-incarnation
+  disposal, and is otherwise retained. Stated in `docs/CONFORMANCE.md`. Also refuted and
+  recorded so none returns: a `storing` phase marker, an owner-independent disposal on
+  claim absence, a reaper-side cleanup, and two compensation designs keyed on which CAS
+  failed.
 - [ ] [F-066: Generalise cross-stream identity coupling](findings/ha-arbitration.md#f-066).
   **Alpha blocker.** Falsified premise: *recreating one stream is a self-contained recovery
   procedure*. Durable records persist identities other streams issue — sequences, consumer
@@ -763,7 +838,11 @@ the same result on lineage and four new findings: F-063, F-064, F-065 and F-066.
   carrier set), and two were refuted by an entry in the table they introduced. Add the two
   questions F-033's route inventories never asked: *which `stopAll` procedures name this
   stream alone*, and *what does this stream's persisted state reference that another stream
-  issues*.
+  issues*. One input is already known and must be dispositioned as a PAIR rather than as
+  two fields: a register's `(Q2AffClaim, Q2AffCopy)` names a record on
+  `$MQTT_qos2assign` and a message on `$MQTT_out`, and F-065 established that neither
+  field alone identifies the delivery — the binding that does is the register's own
+  source.
 - [x] **Slice A of the arbitration design: the session-record watch.** Ownership changes
   only by a write to the client's record subject, so the observation channel is now a
   per-broker ephemeral consumer on `$MQTT_sess` instead of the at-most-once

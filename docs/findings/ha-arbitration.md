@@ -630,8 +630,11 @@ is no base to descend from. W2 CASes at a base it read in the same attempt, whic
 answers "is this record still the one I reasoned about?" more strongly than a parent
 pointer would — a peer that moved the subject wins and this write is rejected. Seven of
 the ten transitions additionally assert the winner's identity (`wantWinner`/`wantGen`);
-the other three deliberately do not, because the facts they record are owner-independent,
-and the per-subject CAS is what makes them safe rather than the identity check. D1 targets
+the other three deliberately do not, because the facts they record are owner-independent.
+For the two `SourceAcked` writes the per-subject CAS is what makes them safe rather than an
+identity check. `AffineDone` is owner-independent too but NOT unfenced: F-065 gave it the
+claim's incarnation and the copy the delivery carried, because it states something about one
+incarnation's own copy. D1 targets
 an exact sequence, and a peer's later transition lands at a new sequence that
 `MaxMsgsPer: 1` evicts, so the delete cannot reach it. §0.2's own write-lineage audit
 deleted the create side of `$MQTT_sess`'s lineage for the same reason.
@@ -658,7 +661,11 @@ assertion and mutate nothing on a mismatch: `qos2_shared_affine.go:1727` (materi
 identity because the fact they record is owner-independent — `SourceAcked` is a statement
 about the group delivery and `AffineDone` about a copy the gate has already attributed:
 `qos2_shared_affine.go:1367` (the reaper's unofferable-source inference), `:1423`
-(`confirmSourceAckAndRecord`) and `:2036` (`mqttFinishQ2AffineDelivery`). None is
+(`confirmSourceAckAndRecord`) and `:2036` (`mqttFinishQ2AffineDelivery`). Of those three
+only the two `SourceAcked` writes rest on the per-subject CAS alone; F-065 fenced
+`AffineDone` on the claim's INCARNATION and on the COPY the delivery carried, so an
+owner-independent fact about one incarnation's copy cannot be written onto another's
+record. None is
 unconditional and none takes a stale base. The two sweep transitions are the ones whose
 EVIDENCE is weaker than a CAS can express; that is F-064, not a lineage gap.
 
@@ -1708,7 +1715,10 @@ F-063, and the remedy test is what separates them.
 
 **Title:** A claim reaped on a copy-absence reading taken before its own SourceAcked transition
 
-- Status: **Open.** Found by F-033's consequence audit, 2026-08-18.
+- Status: **Fixed 2026-08-20**, with the stated guarantee RE-SCOPED (the same shape as
+  F-063's). The re-scope is what the tick rests on and is put to the repository owner at
+  the commit gate; declining it lands the mechanism and leaves this finding open. Found by
+  F-033's consequence audit, 2026-08-18.
 - Classification: HA arbitration architecture / liveness
 - Release treatment: **Alpha blocker.** A copy of an accepted QoS 2 message is pinned behind
   the fail-closed delivery gate and holds a `MaxAckPending` slot for as long as it lasts.
@@ -1761,6 +1771,210 @@ strand is bounded by that pass rather than permanent.
 
 **Not closed by the existing guard.** `materializeQ2AffCopy`'s `Discarded` check reads the
 caller's **already-loaded** claim, which predates the concurrent transition.
+
+### What the review established: THREE routes, not one
+
+Seven plan-review rounds turned one finding into three, and a remedy that closes only
+the first leaves the finding open.
+
+- **Route A, the ordering.** The interleaving above: the copy reading predates the
+  reaper's own `SourceAcked` transition.
+- **Route B, a stale snapshot with no reaper race at all.** A materializer holding a
+  `claimed` snapshot stores its copy after the claim has completed and been reaped —
+  `materializeQ2AffCopy`'s only phase guard tests the CALLER'S snapshot — and its
+  `advanceQ2AffClaim` then finds `next == *cur` and returns **success without writing**,
+  so the claim's sequence is unchanged and the reaper's delete lands. Any remedy keyed on
+  "my CAS failed" misses this entirely.
+- **Route C, a replacement incarnation.** A group delivery callback dispatched before the
+  source ack was proven is still running and unconditionally attempts the create-only
+  election, so after the reap it wins the subject again for the SAME winner and
+  generation. `DeliverNew` on the group durable rules out FUTURE redeliveries but cannot
+  cancel a callback already in flight. Before the fix both incarnations derived one copy
+  subject, so the replacement adopted the copy a superseded materializer was about to
+  withdraw, and that materializer's advance — which asserted only `Winner+Gen` — mutated
+  the REPLACEMENT's record, manufacturing F-064's residual-8 stall.
+
+### The remedy as built
+
+1. **The reaper's copy reading is no older than its own last write**, and nothing but the
+   delete follows it.
+2. **The claim carries an incarnation `Nonce`**, minted at the election and never
+   rewritten. It scopes the copy subject and the copy's `Nats-Msg-Id`, and it fences the
+   four incarnation-specific transitions — the `claimed → materialized` phase,
+   `AffineDone`, `Lost`, and the source-gone `Discarded` — inside `advanceQ2AffClaim`,
+   checked after the load and BEFORE the mutate, because deciding afterwards is too late:
+   the write has already moved the successor's record. `SourceAcked` (a fact about the
+   source message) and the teardown discards (facts about the session) opt out.
+3. **A materialization attempt withdraws the exact copy sequence it proved present** once
+   it proves, on an authoritative reading, that no claim of that copy's incarnation
+   remains — no claim, a different winner/generation/incarnation, or a terminal claim of
+   its own incarnation. Every store outcome converges on the presence proof, so a
+   landed-but-unreported store is resolved rather than abandoned, and the withdrawn
+   sequence comes from that proof rather than from a store response.
+4. **The delivery gate disposes a copy whose live claim names a different copy subject.**
+   A positive fact about a record just read — unlike the `claim == nil` arm, which still
+   fails closed, because an absence is not a fact.
+5. **A per-claim operational validator** refuses an unattributable record on the six
+   direct decision paths, while `mqttQ2AffClaimIdentityOK` stays exactly as it is: it is
+   the account-wide attribution floor, and tightening it would abort an unrelated
+   session's teardown and lock a client ID out of its next CONNECT.
+6. **The claim record is size-bounded**, in the admission calculation (as another max
+   among independently stored forms) and in the runtime backstop before the election,
+   over every reachable terminal shape — a QoS 1/2 Will bypasses admission entirely.
+7. **`DenyDelete` on `$MQTT_out` is fatal at startup**, since this owner now deletes
+   there.
+8. **The carriers hold the copy SUBJECT, and three independent checks bind it.** The
+   pending entry and the in-flight register are reached holding a packet identifier and
+   nothing else, so they carry `(claim subject, copy subject)`. A bare incarnation — the
+   first form built here — is not enough: it says which incarnation a claim reference
+   belongs to but never which COPY, so a carrier naming another live claim's subject with
+   that claim's own valid incarnation is internally consistent and still about a different
+   delivery, and crediting it records a completion on a claim that delivered nothing,
+   whose copy the gate's terminal branch then disposes of. The three checks are the
+   record's own shape (a carried copy yielding no incarnation is refused, because `_EMPTY_`
+   is the fence's opt-out); the claim naming THIS copy, in the single helper that turns a
+   carried pair back into a claim; and, on recovery, the register's own SOURCE — for an
+   affine delivery the source IS the copy, so the pair is installed only where the source
+   is LIVE and its stored subject IS the carried copy. Every other state leaves the pair
+   unproven and the register is reserved rather than interpreted, with allocation withheld
+   and the reservation marked so no terminal path settles the record.
+
+   Two narrowings were forced by holistic review and both are load-bearing. A mismatch is
+   a SUPERSEDED INCARNATION — the only mismatch that licenses disposing of a copy — only
+   when the carried copy is a copy of THAT assignment under another incarnation; a copy
+   of a different assignment is refused, because the claim that owns it may be live. And an
+   unproven register joins the DUPLICATE-SOURCE GROUPING as an unowned member rather than
+   being set aside, so it poisons every sibling of its source: setting it aside turned a
+   two-member group into a one-member one, and the sibling was then installed as an
+   authoritative singleton with a `cpending` mapping the source's redelivery follows,
+   re-sending the payload under a second identifier.
+9. **The superseded-incarnation disposal is ONE predicate, and every other mismatch is
+   refused.** Two paths dispose of a copy on a claim/copy mismatch — the retired settlement
+   and the delivery gate — and review caught each of them, a round apart, disposing on bare
+   subject inequality. The gate is the worse of the two because it takes its claim subject
+   from the copy's own HEADER: a copy persisted on assignment A's subject whose header names
+   a valid, attributable assignment B passes every other check, and acknowledging it away
+   loses A's message and strands A's claim without `AffineDone`. Only a copy of the same
+   assignment under another incarnation is unauthorizable by construction, so that is the
+   predicate (`q2AffCopyIsSupersededIncarnationOf`), shared by both paths; a
+   cross-assignment mismatch is a shape this broker does not write and is refused rather
+   than interpreted.
+10. **Every refusal on this path is PACED.** A plain NAK is re-offered immediately, so the
+   fail-closed refusals the rest of this remedy adds turned a persistent refusal into a
+   request storm — measured at 9214 deliveries in ten seconds for one copy under an absent
+   claim, each a claim load and a log line. That state is not forgery-only: this document's
+   own residuals include three windows in which a copy legitimately outlives its claim, and
+   an unavailable backend produces the same shape for as long as it lasts. Refusals now NAK
+   with a delay that doubles from 100 ms to a 30-second cap, derived from JetStream's own
+   delivery count so that no per-copy state has to be kept, evicted, or survive a restart.
+   The first retry stays fast, which the ordinary phase-advance interleaving needs.
+
+### The re-scope, which the tick rests on
+
+The withdrawal is a **compensation, not an arbitration**: the claim and the copy are on
+separate streams and JetStream's atomic batches are per-stream, so no claim-side state
+can arbitrate a copy-side store. A durable arbitration would additionally need a bound on
+how long a materializer may remain in flight, and nothing supplies one — a tombstone that
+never expires is unbounded accumulation, and one that expires on a timer is a dedup window
+wearing an arbitration hat. The three surviving routes and their three bounds are stated
+in `docs/CONFORMANCE.md`.
+
+### Designs refuted in review, so none returns
+
+- **A `storing` phase the reaper must respect.** The actor that would clear the marker is
+  the one that died, so a crashed materializer leaves a terminal claim behind an
+  unclearable marker — the accumulation defect, manufactured.
+- **Disposing any copy whose claim is absent, at the gate.** A missing claim record is
+  producible by a supported operation (F-066's stream recreation), so an absence never
+  licenses destroying an accepted message.
+- **A reaper-side cleanup.** Its evidence is "absent when I looked, present now" — a
+  second stale reading that says nothing about which claim may still authorize the copy.
+- **Withdrawing on "my CAS reported the claim gone or renamed"**, and the same rule
+  extended with "or returned a terminal claim". Refuted on the same seam twice: the first
+  misses route B, the second loses route C, because with a shared copy subject a
+  replacement adopts exactly the copy the withdrawal is about to delete.
+- **Checking the incarnation AFTER `advanceQ2AffClaim` returns.** Too late: that function
+  authorized mutation on `Winner+Gen` alone, so the stale actor's advance had already
+  written to the replacement's record.
+- **Carrying a bare incarnation on the pending entry and the register.** Built first, then
+  refuted: an incarnation identifies which incarnation of a claim a reference means, never
+  which copy the reference is about, so a carrier naming a foreign claim and that claim's
+  own incarnation passes every check and is still about a different delivery. The carriers
+  hold the copy subject instead, and the register's own source is what decides when the
+  two disagree.
+- **Binding the carried pair to its source by CONTRADICTION rather than by proof.** Built
+  first, then refuted: refusing only a LIVE source that names a different copy left an
+  indeterminate consumer lookup, an indeterminate message read and an authoritatively absent
+  consumer all admitting an internally consistent forgery whole. "An absence is not evidence
+  of a forgery" is true and beside the point — nothing licenses installing an authoritative
+  pair on the strength of a source that was never read. The cost of the positive form is
+  that a transient read failure reserves a legitimate register and withholds that session's
+  new allocation until a later resume reads cleanly, which is the treatment an unaccountable
+  identifier space already gets.
+- **Setting an unproven register aside before the duplicate-source grouping.** Also built
+  first: it reserved the identifier but removed the record from arbitration, so a genuine
+  sibling naming the same delivery became an authoritative singleton with a source mapping,
+  and the redelivery re-sent the payload under a second identifier. An unproven pair is not
+  proof the identifier was never transmitted, so the record has to poison its group.
+- **Disposing of a copy on bare claim/copy subject inequality.** Written twice, in the two
+  places that dispose, and refuted both times: inequality does not say the copy is
+  unauthorizable, only that this claim does not name it. The cross-assignment case has an
+  owner that may be live, so the disposal is a message loss with a stranded claim behind it.
+  Named-sites are a sample: the second instance was found only because the first was fixed
+  without sweeping the family.
+- **Refusing with a plain, immediate NAK.** What every refusal on this path did before
+  round 16 measured it. The refusal itself is right; re-offering the copy at once is what
+  turns a persistent refusal into a storm against JetStream, and a bound that needed a
+  per-copy retry map would have been a new accumulating mechanism. JetStream's own delivery
+  count already carries the state.
+- **Treating every carried-copy mismatch as a superseded incarnation.** The transition
+  refuses either way, so this looked safe — but the retirement the PUBREC leaves behind
+  outlives the transition, and on the next redelivery it confirm-acked the copy IN HAND,
+  which for a carrier naming a foreign claim is the answering delivery's own copy. The claim
+  that owned it never recorded `AffineDone`: its only copy is gone and its message can never
+  be delivered. The mismatch must be qualified by assignment identity.
+
+### What this does NOT close
+
+**A rejected delivery whose affine completion cannot be written.** The affine PUBREC arm
+is selected by the claim subject alone, so it also sees a NEGATIVE PUBREC — and that path
+creates no `pendingPubRel` entry and stores no PUBREL, so there is no PUBCOMP and
+therefore no event at which an unlanded durable retirement mark could ever be retried.
+The retirement machinery is deliberately gated on a SUCCESSFUL PUBREC for that reason,
+and a rejected delivery keeps its pre-F-065 behaviour: complete the affine side if it can
+be completed, then release the register. While the `AffineDone` write is failing the copy
+stays unacknowledged and AckWait re-offers it, so the client sees the payload again —
+which sits in tension with the broker's own rule that a rejected message must not be
+redelivered (`mqtt.go`, at the failed-PUBREC ack). That behaviour PREDATES F-065 and
+converges as soon as the claim store heals. It is named here rather than restored
+silently, and deliberately NOT recorded as a residual of this change, because this change
+neither introduced nor widened it.
+
+**The accumulation this change ADDS, and where it is owned.** On the successful-PUBREC
+path a failed `AffineDone` leaves the copy unacknowledged and durably retires its
+register. A client that completes PUBCOMP, disconnects before AckWait redelivery and keeps
+a non-expiring session that never resumes supplies none of the events that would settle it
+— another affine-copy callback, recovery on resume, teardown, or operator action — and the
+live session record makes orphan reconciliation preserve the claim through
+`refs.hasAffine(idHash, ps.Q2AffGen)` and the retired register through the SEPARATE
+`refs.hasInbound(idHash, ps.Gen)`. Before F-065 this path already accumulated the
+copy-and-claim pair and deleted the register unconditionally, so the delta is one retired
+register per such exchange: unbounded in count, bounded in kind. F-064's accumulation half
+owns collecting all three, and its roadmap bullet now names the register class and the
+different key, so the remedy cannot be written for claims alone. Stated in
+`docs/CONFORMANCE.md`.
+
+One precision, because the absolute form of the claim is false: register deletion is
+asynchronous and ignores failure (R5), so a crash before the queued delete lands can still
+leave a stale register transiently. What this change establishes is the narrower statement
+— the affine branch no longer deliberately RETAINS or REWRITES such a register on the
+rejected path — not that the state is unreachable.
+
+F-064's residual 8 and its accumulation half, F-036, and F-066 — whose flagship row is
+still reproduced by its own fixture, because the collision there is on the CLAIM subject,
+which carries no incarnation. The incarnation does narrow one F-066 consequence
+incidentally: a stale claim on a reused `$MQTT_msgs` sequence can no longer make a new
+message deliver an OLD payload, because the new incarnation's copy subject differs.
 
 ## F-066
 

@@ -310,7 +310,7 @@ func testQ2AffStoreCopyFor(t *testing.T, b *testQ2AffBroker, claimSubject string
 		msg:          []byte(payload),
 		claimSubject: claimSubject,
 		gen:          claim.Gen,
-		msgID:        mqttQ2AffMsgId(claim.GroupDurable, claim.SourceSeq),
+		msgID:        mqttQ2AffMsgId(claim.GroupDurable, claim.SourceSeq, testQ2AffFixtureNonce),
 	}
 	msg, hdrLen := mqttNewQ2AffineRecord(env)
 	if _, err := b.asm.jsa.storeMsg(claim.CopySubject, hdrLen, msg); err != nil {
@@ -511,7 +511,8 @@ func TestQ2AffOnBehalfRefusesSourceAckWhenConsumerVanishesAfterLookup(t *testing
 			t.Errorf("the election came from %q, want the sole connected member: the own-claim path is reachable after all", seed.Winner)
 		}
 		seed.Winner, seed.Gen = wHash, wGen
-		seed.CopySubject = mqttQ2AffCopySubject(wHash, wGen, seed.ClaimHash)
+		seed.Nonce = testQ2AffFixtureNonce
+		seed.CopySubject = mqttQ2AffCopySubject(wHash, wGen, seed.ClaimHash, testQ2AffFixtureNonce)
 		seed.AffDurable = wDurable
 		copySubject.Store(seed.CopySubject)
 	})
@@ -568,7 +569,8 @@ func TestQ2AffMaterializedNoCopyRefusesSourceAck(t *testing.T) {
 	var copySubject atomic.Value
 	seeded := testQ2AffSeedElectedClaim(t, b, func(seed *mqttQ2AffClaim) {
 		seed.Winner, seed.Gen = foreign, foreignGen
-		seed.CopySubject = mqttQ2AffCopySubject(foreign, foreignGen, seed.ClaimHash)
+		seed.Nonce = testQ2AffFixtureNonce
+		seed.CopySubject = mqttQ2AffCopySubject(foreign, foreignGen, seed.ClaimHash, testQ2AffFixtureNonce)
 		_, _, seed.AffDurable = mqttQ2AffineNames(foreign, foreignGen)
 		seed.Phase = mqttQ2AffMaterialized
 		copySubject.Store(seed.CopySubject)
@@ -780,7 +782,8 @@ func TestQ2AffAcksOnCopyPresent(t *testing.T) {
 
 	seeded := testQ2AffSeedElectedClaim(t, b, func(seed *mqttQ2AffClaim) {
 		seed.Winner, seed.Gen = bHash, bGen
-		seed.CopySubject = mqttQ2AffCopySubject(bHash, bGen, seed.ClaimHash)
+		seed.Nonce = testQ2AffFixtureNonce
+		seed.CopySubject = mqttQ2AffCopySubject(bHash, bGen, seed.ClaimHash, testQ2AffFixtureNonce)
 		_, _, seed.AffDurable = mqttQ2AffineNames(bHash, bGen)
 		seed.Phase = mqttQ2AffMaterialized
 		testQ2AffStoreCopyFor(t, b, mqttQ2AffClaimSubject(seed.GroupDurable, seed.SourceSeq), seed, "ackpresent")
@@ -901,7 +904,7 @@ func testQ2AffDiscardOnStore(t *testing.T, b *testQ2AffBroker, armed *atomic.Boo
 				t.Errorf("the copy on %q carries no claim header, so the fixture cannot terminalize its claim", subject)
 			} else {
 				captured.Store(claimSubject)
-				if _, _, err := b.asm.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_,
+				if _, _, err := b.asm.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_, _EMPTY_, _EMPTY_,
 					func(c *mqttQ2AffClaim) { c.Discarded = true }); err != nil {
 					t.Errorf("discarding the claim on %q mid-store: %v", claimSubject, err)
 				}
@@ -990,7 +993,8 @@ func TestQ2AffOnBehalfAcksOnTerminalFactWhenCopyGone(t *testing.T) {
 			t.Errorf("the election came from %q, want the sole connected member: the own-claim path is reachable after all", seed.Winner)
 		}
 		seed.Winner, seed.Gen = wHash, wGen
-		seed.CopySubject = mqttQ2AffCopySubject(wHash, wGen, seed.ClaimHash)
+		seed.Nonce = testQ2AffFixtureNonce
+		seed.CopySubject = mqttQ2AffCopySubject(wHash, wGen, seed.ClaimHash, testQ2AffFixtureNonce)
 		seed.AffDurable = affDurableFor(wHash, wGen)
 	})
 
@@ -1077,13 +1081,13 @@ func TestQ2AffCopyStoreWithNoInterestSequenceAndDedupe(t *testing.T) {
 	groupDur := b.groupDurable(t)
 
 	record := func(gen string, sseq uint64, hash string) (string, []byte, int) {
-		copySubject := mqttQ2AffCopySubject(idHash, gen, hash)
+		copySubject := mqttQ2AffCopySubject(idHash, gen, hash, testQ2AffFixtureNonce)
 		env := &mqttQ2AffineEnvelope{
 			natsSubject:  b.topic,
 			msg:          []byte("measured"),
 			claimSubject: mqttQ2AffClaimSubject(groupDur, sseq),
 			gen:          gen,
-			msgID:        mqttQ2AffMsgId(groupDur, sseq),
+			msgID:        mqttQ2AffMsgId(groupDur, sseq, testQ2AffFixtureNonce),
 		}
 		msg, hdrLen := mqttNewQ2AffineRecord(env)
 		return copySubject, msg, hdrLen

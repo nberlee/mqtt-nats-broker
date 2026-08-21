@@ -1491,6 +1491,13 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 				mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax},
 			{"terminal", mqttQoS2TerminalRecordMax()},
 			{"affine", mqttQ2AffineFormMax(tiny, false)},
+			// The ASSIGNMENT CLAIM form, added by F-065. It is payload-independent, so
+			// for a tiny payload it can dominate — and an admission budget that omits it
+			// admits a PUBLISH whose claim can never be stored, so no election can ever
+			// be won and the group delivery is re-offered forever. This row is what makes
+			// the WIRING observable: the bound existing is not the same as
+			// mqttMaxQoS2FormSize taking it into account.
+			{"assignment claim", mqttQ2AffClaimRecordMax()},
 		} {
 			if f.size > budget {
 				t.Fatalf("the %s form is %d bytes but the admission budget is only %d", f.name, f.size, budget)

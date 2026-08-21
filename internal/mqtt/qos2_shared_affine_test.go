@@ -2,6 +2,9 @@ package mqtt
 
 import (
 	"bytes"
+	"encoding/json"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +22,7 @@ func TestQ2AffineEncoderMatchesSizeCalculator(t *testing.T) {
 			msg:          []byte("payload"),
 			claimSubject: mqttQ2AffClaimSubject("$MQTT_SHARED_0123456789abcdef", 4242),
 			gen:          mqttNewQ2AffGen(),
-			msgID:        mqttQ2AffMsgId("$MQTT_SHARED_0123456789abcdef", 4242),
+			msgID:        mqttQ2AffMsgId("$MQTT_SHARED_0123456789abcdef", 4242, testQ2AffFixtureNonce),
 		}
 	}
 	for _, tc := range []struct {
@@ -78,7 +81,7 @@ func TestQ2AffineRecordCarriesOnlyItsOwnIdentity(t *testing.T) {
 		subID:        9,
 		claimSubject: mqttQ2AffClaimSubject("$MQTT_SHARED_dead", 7),
 		gen:          mqttNewQ2AffGen(),
-		msgID:        mqttQ2AffMsgId("$MQTT_SHARED_dead", 7),
+		msgID:        mqttQ2AffMsgId("$MQTT_SHARED_dead", 7, testQ2AffFixtureNonce),
 	}
 	msg, hdrLen := mqttNewQ2AffineRecord(env)
 	hdr := msg[:hdrLen]
@@ -130,16 +133,16 @@ func TestQ2AffineRecordCarriesOnlyItsOwnIdentity(t *testing.T) {
 // would turn that optimization into silent loss for the second group.
 func TestQ2AffMsgIdNamespacing(t *testing.T) {
 	t.Parallel()
-	a := mqttQ2AffMsgId("$MQTT_SHARED_aaa", 10)
-	b := mqttQ2AffMsgId("$MQTT_SHARED_bbb", 10)
-	c := mqttQ2AffMsgId("$MQTT_SHARED_aaa", 11)
+	a := mqttQ2AffMsgId("$MQTT_SHARED_aaa", 10, testQ2AffFixtureNonce)
+	b := mqttQ2AffMsgId("$MQTT_SHARED_bbb", 10, testQ2AffFixtureNonce)
+	c := mqttQ2AffMsgId("$MQTT_SHARED_aaa", 11, testQ2AffFixtureNonce)
 	if a == b {
 		t.Fatal("two groups moving one source message must not share a dedup key")
 	}
 	if a == c {
 		t.Fatal("two source messages in one group must not share a dedup key")
 	}
-	if a != mqttQ2AffMsgId("$MQTT_SHARED_aaa", 10) {
+	if a != mqttQ2AffMsgId("$MQTT_SHARED_aaa", 10, testQ2AffFixtureNonce) {
 		t.Fatal("the dedup key must be stable across retries")
 	}
 	if !strings.HasPrefix(a, mqttQ2AffMsgIdPrefix) {
@@ -175,7 +178,7 @@ func TestQ2AffineNamesAreGenerationScopedAndClaimSpecific(t *testing.T) {
 	if ch1 != mqttQ2AffClaimHash("$MQTT_SHARED_aaa", 1) {
 		t.Fatal("the claim hash must be deterministic: the winner and an on-behalf contender must compute the same subject")
 	}
-	copy1 := mqttQ2AffCopySubject(idHash, g1, ch1)
+	copy1 := mqttQ2AffCopySubject(idHash, g1, ch1, testQ2AffFixtureNonce)
 	if !strings.HasPrefix(copy1, strings.TrimSuffix(f1, ">")) {
 		t.Fatalf("copy subject %q is not covered by the consumer filter %q", copy1, f1)
 	}
@@ -371,7 +374,6 @@ func TestValidateQoS2AssignStream(t *testing.T) {
 		{"wrong replicas", func(c *StreamConfig) { c.Replicas = 1 }},
 		{"max msg size", func(c *StreamConfig) { c.MaxMsgSize = 1024 }},
 		{"no ack", func(c *StreamConfig) { c.NoAck = true }},
-		{"deny delete", func(c *StreamConfig) { c.DenyDelete = true }},
 		{"sealed", func(c *StreamConfig) { c.Sealed = true }},
 		{"subject transform", func(c *StreamConfig) { c.SubjectTransform = &SubjectTransformConfig{Source: "a", Destination: "b"} }},
 		{"republish", func(c *StreamConfig) { c.RePublish = &RePublish{Source: "a", Destination: "b"} }},
@@ -419,7 +421,6 @@ func TestValidateOutStream(t *testing.T) {
 		name string
 		mut  func(cfg *StreamConfig)
 	}{
-		{"deny delete is not a prerequisite", func(c *StreamConfig) { c.DenyDelete = true }},
 		{"deny purge is not a prerequisite", func(c *StreamConfig) { c.DenyPurge = true }},
 		// The explicit boundary of the MaxAckPending threshold form: a stream
 		// limit AT the broker's effective cap changes nothing, so it must start.
@@ -453,6 +454,13 @@ func TestValidateOutStream(t *testing.T) {
 		{"wrong replicas", func(c *StreamConfig) { c.Replicas = 1 }},
 		{"max msg size", func(c *StreamConfig) { c.MaxMsgSize = 1024 }},
 		{"no ack", func(c *StreamConfig) { c.NoAck = true }},
+		// Since F-065 this owner DELETES an exact sequence here, to withdraw a copy no
+		// claim of its incarnation can authorize. DenyDelete is therefore a CHANGED
+		// PREREQUISITE, not a weakened test: the fact the accepted table above used to
+		// assert — "this owner issues no delete on $MQTT_out" — has stopped being true, so
+		// the assertion moves tables rather than relaxing. Denied, such a copy stays
+		// behind the fail-closed delivery gate, NAK-looping for the session's whole life.
+		{"deny delete", func(c *StreamConfig) { c.DenyDelete = true }},
 		{"sealed", func(c *StreamConfig) { c.Sealed = true }},
 		{"subject transform", func(c *StreamConfig) { c.SubjectTransform = &SubjectTransformConfig{Source: "a", Destination: "b"} }},
 		{"republish", func(c *StreamConfig) { c.RePublish = &RePublish{Source: "a", Destination: "b"} }},
@@ -506,7 +514,7 @@ func TestQ2AffineFormMaxBoundsEveryRealRecord(t *testing.T) {
 		subID:        mqttMaxVarInt,
 		claimSubject: mqttQ2AffClaimSubject(widestDur, widestSeq),
 		gen:          mqttNewQ2AffGen(),
-		msgID:        mqttQ2AffMsgId(widestDur, widestSeq),
+		msgID:        mqttQ2AffMsgId(widestDur, widestSeq, testQ2AffFixtureNonce),
 	}
 	if got := mqttComputeQ2AffineSize(env); got > bound {
 		t.Fatalf("worst-case real record is %d bytes, but the admission bound is %d", got, bound)
@@ -534,5 +542,75 @@ func TestQ2AffineFormMaxBoundsEveryRealRecord(t *testing.T) {
 	}
 	if !mqttQ2AffineRecordFits(env, 0) {
 		t.Fatal("no configured max payload must not reject anything")
+	}
+}
+
+// The ASSIGNMENT CLAIM record is budgeted against the REAL encoder, at the widest
+// identity and delivery values it can carry, and over every reachable terminal shape
+// — not just the initial election form.
+//
+// It is budgeted for the same reason the copy is, and the wedge is the mirror image:
+// a PUBLISH admitted at PUBREC time whose CLAIM cannot be stored means no election
+// can ever be won, so the group delivery is never acked and AckWait retries forever.
+// Nothing checked this before F-065 widened the record.
+//
+// Paired mutation M15: omit the nonce from mqttQ2AffMaxIdentityWidths, or drop the
+// terminal shapes and budget only the election form. Either makes the bound fall
+// below what the encoder actually emits.
+func TestQ2AffClaimRecordMaxCoversEveryReachableShape(t *testing.T) {
+	t.Parallel()
+	bound := mqttQ2AffClaimRecordMax()
+	claimW, _, genW := mqttQ2AffMaxIdentityWidths()
+	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
+	pad := strings.Repeat("x", claimW)
+	base := mqttQ2AffClaim{
+		Winner:       strings.Repeat("x", genW),
+		Gen:          strings.Repeat("x", genW),
+		Nonce:        strings.Repeat("x", genW),
+		GroupDurable: strings.Repeat("x", maxDur),
+		SourceSeq:    math.MaxUint64,
+		ClaimHash:    strings.Repeat("x", mqttQ2AffClaimHashLen),
+		CopySubject:  pad,
+		AffDurable:   pad,
+		SubID:        mqttMaxVarInt,
+		Retained:     true,
+	}
+	// Every shape a transition can actually reach, including the initial election
+	// form. mergeProven keeps AffineDone and Lost mutually exclusive, so those two are
+	// separate shapes rather than one record carrying both.
+	shapes := map[string]func(*mqttQ2AffClaim){
+		"elected": func(c *mqttQ2AffClaim) { c.Phase = mqttQ2AffClaimed },
+		"materialized": func(c *mqttQ2AffClaim) {
+			c.Phase = mqttQ2AffMaterialized
+		},
+		"source acked": func(c *mqttQ2AffClaim) {
+			c.Phase, c.SourceAcked = mqttQ2AffMaterialized, true
+		},
+		"complete": func(c *mqttQ2AffClaim) {
+			c.Phase, c.SourceAcked, c.AffineDone = mqttQ2AffMaterialized, true, true
+		},
+		"complete and discarded": func(c *mqttQ2AffClaim) {
+			c.Phase, c.SourceAcked, c.AffineDone, c.Discarded = mqttQ2AffMaterialized, true, true, true
+		},
+		"lost and discarded": func(c *mqttQ2AffClaim) {
+			c.Phase, c.SourceAcked, c.Lost, c.Discarded = mqttQ2AffMaterialized, true, true, true
+		},
+	}
+	for name, mut := range shapes {
+		t.Run(name, func(t *testing.T) {
+			rec := base
+			mut(&rec)
+			body, err := json.Marshal(&rec)
+			if err != nil {
+				t.Fatalf("marshalling: %v", err)
+			}
+			// The create-only CAS header is not stripped before storage, so it counts
+			// toward max_payload exactly as the record body does.
+			hdr := len(hdrLine) + len(JSExpectedLastSubjSeq) + 1 +
+				len(strconv.FormatUint(math.MaxUint64, 10)) + 2 + 2
+			if got := hdr + len(body); got > bound {
+				t.Fatalf("the %s record encodes to %d bytes but the admission bound is %d: a PUBLISH would be accepted whose claim can never be stored, and its group delivery would retry forever", name, got, bound)
+			}
+		})
 	}
 }
