@@ -12,12 +12,13 @@ evidence, the pinned source mechanisms, and the NATS maintainer's explicit confi
 that leader-local in-flight ownership and applied-before-serving enforce the header
 across elections. The mechanisms are stream-independent, so the per-stream findings
 inherit the server contract and the canary — but each owns a consequence of its own, and
-none closes on this evidence alone. **F-034 still owes its audit.** F-032's ran
-on 2026-08-17: it inherited the contract without re-proving it, needed no lineage, and
-found a local defect that JetStream's guarantees never spoke to — **F-062**, filed below
-and since closed. F-033's ran on 2026-08-18 to the same shape: no lineage, and three local
-defects the server contract never spoke to — **F-063**, **F-064**, **F-065** and
-**F-066**.
+none closes on this evidence alone. All three per-stream audits have now run, F-034's
+last, on 2026-08-22, and it is the only one whose consequence turned out to be reachable.
+F-032's ran on 2026-08-17: it inherited the contract without re-proving it, needed no
+lineage, and found a local defect that JetStream's guarantees never spoke to — **F-062**,
+filed below and since closed. F-033's ran on 2026-08-18 to the same shape: no lineage, and
+three local defects the server contract never spoke to — **F-063**, **F-064**, **F-065**
+and **F-066**.
 
 Multi-frontend HA is supported alpha scope (decided 2026-08-10, `docs/ROADMAP.md`
 section 0.2), so every finding here is an unconditional alpha blocker.
@@ -394,9 +395,10 @@ Leader-only admission is therefore part of the resolution, not a weakness left b
   the store itself — so they are stated as observed and are not part of the claim.
 - **Not that the other streams are closed.** The server mechanisms are
   stream-independent, but each per-stream finding owns a consequence of its own and stays
-  open until it is audited on its own terms. **F-034 is still open on those terms.**
-  F-032's audit has since run and closed, producing F-062, which is closed too; F-033's has
-  too, producing F-063, F-064, F-065 and F-066.
+  open until it is audited on its own terms. **All three have since been audited on those
+  terms.** F-032's produced F-062, which is closed too; F-033's produced F-063, F-064,
+  F-065 and F-066; F-034's closed on 2026-08-22, producing F-067 and F-068 and routing its
+  live-owner residue to F-036.
 - **Not that a Will is never published twice.** The sanctioned at-least-once duplicate
   is untouched, and its boundary is unchanged: external publication with no durable
   evidence of completion. What is retired is the class where evidence EXISTED and was
@@ -814,11 +816,24 @@ F-033.
 
 **Title:** Add write lineage to outbound in-flight registers
 
-- Status: Open. The shared cross-term premise is closed
-  (see the note at the top of this file and F-030); what remains for this finding is its
-  OWN consequence audit against that
-  route inventory, plus a fixture and a discriminating mutation for anything the
-  audit finds still reachable.
+- Status: **Closed 2026-08-22 as an audit plus a census.** The shared cross-term premise
+  was already closed (see the note at the top of this file and F-030); what this finding
+  owed was its OWN consequence audit against that route inventory, plus a fixture and a
+  discriminating mutation for anything still reachable. **No lineage is owed** — and unlike
+  F-032's and F-033's audits, this one found a REACHABLE defect. It is **V1**: the drain
+  release deleting by a persisted absolute `RegSeq` after an `$MQTT_inflight` recreation,
+  the route this file's own F-066 table documents and assigns to "that mechanism's owner".
+  The remedy is an identity-conditioned exact-sequence delete plus **subject** addressing
+  for the drain plus a retained enumeration watermark for the teardown purge — two
+  mechanisms closing two windows, no new persisted field, and explicitly NOT a per-register
+  CAS arbitration protocol, because the route is identity confusion rather than contention.
+  Provenance classes A (the terminal paths) and D (the orphan sweep) are **refuted as
+  already protected** rather than conditioned, because the conditioning could not be
+  mutation-proved. The live-owner residue routes to **F-036** under the plan's necessity
+  test, with a passing reproducer as the artifact. Replacing the teardown's filter purge
+  also retired a stream prerequisite: `validateInflightStream`'s obsolete `DenyPurge`
+  rejection is removed and the waiver recorded, since nothing on `$MQTT_inflight` purges
+  by subject any more. Produced **F-067** and **F-068**, filed and not fixed.
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 34
@@ -829,6 +844,50 @@ F-033.
   packet identifier that is still in flight (so a later delivery can collide with it) or,
   in the other direction, leaves a register whose deletion was proven, reserving an
   identifier and a Receive Maximum slot for the life of the session.
+
+### The census: what it established, and the four defects the oracle found
+
+The cross-stream identity enumeration F-033 deferred here is landed as
+[the persisted-identity census](persisted-identity-census.md), enforced by eight tests
+rather than asserted — and it does **not** discharge F-066's completeness deferral. The
+interpretation-surface guard is bijective against a hand-maintained root set and keys
+sites by unqualified function name, so it catches real drift without proving closure, and
+the plan's no-fallback rule makes that a reason to claim neither completeness nor the
+discharge. Three things about it are worth
+keeping here, because each is a conclusion rather than a description.
+
+**Closure is anchored to the interpretation surface, not to a list of transitions.**
+Producer closure was reopened three times in review, each time by a transition class
+deeper inside JetStream, and each addition was correct. "Enumerate every durable-state
+transition" enumerates JetStream's implementation and has no dry-out criterion. Anchoring
+instead on *"in scope iff it can change the outcome of an enumerated interpretation
+site"* gives the completion test the transition model lacked, and it is finite here: 161
+sites, derived by parsing this package with `go/ast`.
+
+**The surface is the SEMANTIC layer, and a mutation is what proved it.** An early version
+anchored the surface at the `mqttJSA` methods. A mutation adding a new caller of
+`loadInflightRecord` — a package wrapper, not a transport method — **passed**. Widening to
+the wrappers that establish an outcome partition of their own added 39 sites, a third
+again of the 117 it had then; the manifest now stands at 161, having grown with the code.
+
+**F-066's sample is an ORACLE, applied afterwards, and it found four real defects** in the
+first independent enumeration: `mqttQ2AffClaim` missing entirely though two sample rows
+name it; `mqttPersistedDrainSeq.RegSeq` dispositioned as not-an-identity because F-034
+demotes it to a hint, when demoting what a mechanism *relies on* does not stop the field
+being a cross-stream reference; no way to express that `CancelledRegs`' *elements* are
+`$MQTT_inflight` identities; and `ConsumerConfig` deferred though three sample rows
+resolve to `ConsumerConfig.Durable`.
+
+**Two findings were filed and not fixed**, per the census's disposition-not-repair rule:
+[F-067](runtime-correctness.md#f-067) (a pre-release drain record shape accommodated
+rather than refused) and [F-068](runtime-correctness.md#f-068) (an enqueue that
+revalidates nothing after a local discard).
+
+**A pattern the census surfaced that a sample could not.** The JS domain token appears in
+exactly three streams' subject spaces, and those three are exactly the three F-066
+records as coupled; every stream that omits it is one F-066 records as uncoupled. Not
+asserted as causal — recorded because a pattern across the whole population is what
+distinguishes a census from a sample in kind rather than in length.
 
 ## F-036
 
@@ -949,7 +1008,48 @@ than defer it. Two of the affine consequences sort onto **this** finding's premi
 recorded as its population — a contender discarding an assignment on an absent winner
 record, and the different-generation reading whose residue is a previous owner still
 serving. The rest are defects of ours with premises of their own: **F-063**, **F-064** and
-**F-065**. The `$MQTT_inflight` and PUBREL refusals stand, still owed by F-034.
+**F-065**. The `$MQTT_inflight` and PUBREL refusals are ANSWERED since F-034's audit
+(2026-08-22); the manifestation it added is below.
+
+### A fourth manifestation added by F-034's audit (2026-08-22): register contention
+
+F-034 audited every route by which an `$MQTT_inflight` register could be destroyed by an
+actor not entitled to it, and closed all of them: the drain's release addresses the register
+its own packet identifier names and deletes only a matching occupant at the exact sequence
+it read; the teardown's reap enumerates, loads, classifies and deletes only at or below the
+watermark its own enumeration returned; and the orphan sweep's exact-sequence revalidation
+was found sufficient, with identity conditioning there REFUTED because no mismatching record
+can occupy that sequence within one stream incarnation, so no mutation could prove it.
+
+**Every destructive path that reads a body binds it to its subject** — where destructive
+means DELETE OR OVERWRITE. That invariant took three review rounds to state correctly, and
+the intermediate versions were wrong in a way worth recording: rounds 4 and 5 swept *delete*
+sites and concluded "no other delete site reads a body it classifies", which was true and
+insufficient. The read-after-CAS reconciliations delete nothing — they CAS-REPLACE at the
+sequence they just read — and that is destructive by the same route, because it turns a
+record recovery calls unreadable, whose identifier is therefore RESERVED, into a valid
+tombstone for the subject's own identifier that a later resume reads as freeable. Seven
+sites now carry the binding: the drain's release, the teardown's reap, the store's
+ambiguous resolution, the retirement and both cancellation marks, and the resume claim
+contest. Each refuses and KEEPS, which differs deliberately from the reader, which reserves
+and keeps: both preserve the record, and only the reader is in a position to claim the
+identifier as well.
+
+**What none of that closes is contention with a genuinely live owner**, and the reason is
+structural rather than an omission. A register a peer is still using presents *exactly* the
+shape a legitimate release expects: the same subject, the same `(Dur, Seq)`, a valid
+identity, a body that agrees with its subject. Naming cannot separate the two actors,
+because they do not disagree about identity — they disagree about who owns the session. The
+predicate that would separate them is this finding's: **a resident session object can run
+register recovery against a generation whose durable ownership has moved, because a resident
+object never reads the retirement watermark that the record-restoring CONNECT path does**
+(`mqtt.go:8711-8741`).
+
+The necessity result is carried as a **passing reproducer** rather than prose:
+`TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate` asserts positively that every
+F-034 check is satisfied by such a register, so none of them is what would stop the
+deletion. If a future change makes any of those assertions fail, the residual has been
+closed by something other than this finding and the routing must be re-derived.
 
 ### A third manifestation added by F-033's audit (2026-08-18): the adoption blind spot
 
@@ -1394,10 +1494,12 @@ has its marker won during its occupancy and is SPARED, staying serviceable after
 A1's marker was created while the subject was EMPTY and A2's belonged to an earlier
 occupancy, and an unbounded purge then destroyed an occupant neither entitlement included.
 
-**Scoped to that walk only.** The same teardown still purges `$MQTT_inflight` by filter with
+**Scoped to that walk only.** The same teardown then purged `$MQTT_inflight` by filter with
 no bound, over subjects a peer serving the retiring generation can re-occupy, so the deletion
-set as a whole is not repeat-safe — that is **F-034**, unaudited, and this finding does not
-touch it.
+set as a whole was not repeat-safe. That was **F-034**'s, not this finding's, and F-034 paid
+it on 2026-08-22: the filter purge is now an enumerate-load-classify pass bounded by the
+watermark its own enumeration returned, deleting only a record whose identity and subject
+agree.
 
 ## F-063
 
@@ -2044,10 +2146,14 @@ a keyword-filtered grep (blind to `ScanFrom`, `Cons[].Durable`, `CancelledRegs[]
 of the table below depends on. Recording a fifth confident enumeration would repeat the only
 mistake this finding has consistently made.
 
-**Completeness is therefore explicitly deferred to F-034**, whose audit runs next, owns
-`$MQTT_inflight`, and should open with a field-by-field enumeration of every persisted
-record type — every field dispositioned, cross-stream or not — rather than any filtered
-sweep. What follows is a **verified sample with a worked consequence**, not a census.
+**Completeness is therefore explicitly deferred to F-034**, which owns `$MQTT_inflight`.
+That deferral was discharged on 2026-08-22 in the shape this section asked for — a
+field-by-field enumeration of every persisted record type, every field dispositioned,
+cross-stream or not, over a type universe derived by a recursive walk rather than any
+filtered sweep. See [the persisted-identity census](persisted-identity-census.md); note
+that its interpretation-surface half is a drift guard rather than a closure proof, so
+F-066's own completeness deferral is NOT discharged by it. What follows is a **verified
+sample with a worked consequence**, not a census.
 
 ### The premise, and the members verified so far
 
@@ -2100,7 +2206,9 @@ rounds, and why the remedy is a **generalisation** rather than a fourth bespoke 
 Four streams are CONFIRMED to be mutually entangled on this path — `$MQTT_msgs`,
 `$MQTT_qos2assign`, `$MQTT_out` and `$MQTT_inflight`. That is the verified affected subset,
 **not a proven closed universe**: two earlier drafts named three and had to correct the
-count, and only the census deferred to F-034 can say whether a fifth belongs. Recreating any
+count. The census deferred to F-034 has since landed and enumerates the population, but it
+is a drift guard over the interpretation surface rather than a closure proof, so it does not
+settle whether a fifth belongs either. Recreating any
 proper subset of the four strands the references the others hold:
 
 | Recreated | Stranded reference | Direction |
@@ -2137,16 +2245,18 @@ validator, and `$MQTT_inflight`'s `Dur`/`Seq`/`Q2AffClaim`.
 
 ### Scope, and the method gap this exposed
 
-The table above is a **verified sample, not a census** — the opening section states why no
-completeness claim is made and why the enumeration is deferred to F-034. Its rows outside
-the affine path are **named, not audited here**: `$MQTT_inflight`'s own coupling is F-034's
-to answer, and the session record's `$MQTT_out` durable references belong to the findings
-that own those mechanisms. The drain `RegSeq` row is the exception and is retained here
-rather than routed away: it is the only identity in the table whose stale use is itself
-DESTRUCTIVE — an unconditioned delete of an absolute sequence reaching another session's
-record — so it belongs with this finding's remedy even though the drain machinery is not
-F-033's. What the victim then suffers is left to that mechanism's owner; this finding
-asserts the destruction, not a downstream consequence it has not established.
+The table above is a **verified sample, not a census** — the opening section states why
+no completeness claim is made and why the enumeration was deferred to F-034, which
+landed it on 2026-08-22 without discharging this finding's completeness deferral. Its
+rows outside the affine path were **named, not audited here**: `$MQTT_inflight`'s own
+coupling was F-034's to answer and has been answered, and the session record's
+`$MQTT_out` durable references belong to the findings that own those mechanisms. The
+drain `RegSeq` row is the exception and is retained here rather than routed away: it is
+the only identity in the table whose stale use is itself DESTRUCTIVE — an unconditioned
+delete of an absolute sequence reaching another session's record — so it belongs with
+this finding's remedy even though the drain machinery is not F-033's. What the victim
+then suffers is left to that mechanism's owner; this finding asserts the destruction,
+not a downstream consequence it has not established.
 
 **The method gap, stated plainly.** F-033's five route inventories enumerate writers and
 destroyers: they ask what the code does, never what an OPERATOR is instructed to do, and

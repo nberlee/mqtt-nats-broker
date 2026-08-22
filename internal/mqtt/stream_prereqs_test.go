@@ -838,7 +838,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 	case mqttInflightStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
-		d["DenyPurge"] = fieldDisposition{kind: dispRejected, errWant: "deny_purge"}
+		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject SINCE F-034: the teardown's per-incarnation filter purge was replaced by reapIncarnationRegisters, which enumerates, loads, classifies and deletes at exact sequences, so the DenyDelete rejection above is the whole of this owner's need. Same shape as $MQTT_qos2assign's waiver directly above"}
 	case mqttStreamName:
 		interest()
 		d["AllowMsgTTL"] = fieldDisposition{kind: dispRejected, errWant: "allow_msg_ttl"}

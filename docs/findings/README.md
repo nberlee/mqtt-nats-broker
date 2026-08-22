@@ -11,6 +11,13 @@ Cross-cutting JetStream feature decisions that are not independent correctness
 findings live in the [NATS platform-adoption audit](nats-platform.md). Its actionable
 work is merged into the existing finding or roadmap item whose invariant it serves.
 
+What durable state this bridge holds, and which of its identities another stream
+issues, is enumerated once in the
+[persisted-identity census](persisted-identity-census.md). It is owned by F-034 and
+cited by F-066. Its field-level dispositions are enforced by tests; its
+interpretation-surface half is a drift guard rather than a closure proof, so it does
+**not** discharge F-066's completeness deferral.
+
 ## Active findings
 
 - Preserve deferred disconnect state during foreign disposition.
@@ -18,13 +25,15 @@ work is merged into the existing finding or roadmap item whose invariant it serv
   Details: [F-028](session-and-will.md#f-028).
 - Bound the inbound QoS 2 hold purge and the discard marker it leaves.
   Closed 2026-08-18: every hold removal carries a proven cutoff, and a `discarded` marker
-  records the cutoff its writer was entitled to purge through, so a later exchange can prove
+  records the cutoff its writer was entitled to purge through, so a later exchange can
+  prove
   the marker is not about it.
   Details: [F-062](ha-arbitration.md#f-062).
 - Add write lineage to shared QoS 2 assignment claims.
   Status: Closed 2026-08-18. Release treatment: Alpha blocker.
   Closed as an audit: no lineage was needed. It produced three findings, one per falsified
-  premise — F-063 (retention evidence unbound from the source ack), F-064 (a live reference
+  premise — F-063 (retention evidence unbound from the source ack), F-064 (a live
+  reference
   left to owner resume) and F-065 (a reap on a stale copy reading) — plus F-066, and one
   manifestation added to F-036. Unconditioned `CONSUMER.DELETE` on the interest-retained
   `$MQTT_out` is the enabling mechanism on some of those routes, not the premise of any.
@@ -32,21 +41,88 @@ work is merged into the existing finding or roadmap item whose invariant it serv
 - Prove a copy was retained before acknowledging its source.
   Status: Fixed 2026-08-19, guarantee re-scoped. Release treatment: Alpha blocker.
   Every route now proves the copy with a presence check and authorizes the release from
-  `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked`. The guarantee is conditioned
-  on a fresh but non-atomic observation: `CONSUMER.DELETE` is unconditioned, so the residual
+  `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked`. The guarantee is
+  conditioned
+  on a fresh but non-atomic observation: `CONSUMER.DELETE` is unconditioned, so the
+  residual
   is a consumer deleted between the final proof and the ack.
   Details: [F-063](ha-arbitration.md#f-063).
 - Reconcile shared QoS 2 assignments independently of owner resume.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-064](ha-arbitration.md#f-064).
 - Re-read copy absence after the reaper's own SourceAcked transition.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Fixed 2026-08-21, guarantee re-scoped. Release treatment: Alpha blocker.
   Details: [F-065](ha-arbitration.md#f-065).
 - Generalise cross-stream identity coupling instead of three ad hoc instances.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-066](ha-arbitration.md#f-066).
+- Refuse a pre-release delayed-drain record shape instead of repairing it.
+  Status: Open. Release treatment: Post-alpha cleanup.
+  Filed by F-034's census. The compatibility boundary refuses an unsupported persisted
+  shape; this one is accommodated and repaired instead. Its dossier must first separate
+  a genuinely unsupported old record from a current-schema crash state that
+  legitimately carries a zero.
+  Details: [F-067](runtime-correctness.md#f-067).
+- Revalidate an enqueue against the session it was allocated under.
+  Status: Open. Release treatment: Post-alpha cleanup.
+  Filed by F-034's audit. A confirmed register store can be followed by a local discard
+  and then an enqueue, and the enqueue revalidates neither generation, binding, pending
+  nonce nor subscription closure. Bounded: it targets the captured connection object, so
+  the packet is dropped or reaches that same discarded session's own client, never
+  another session's.
+  Details: [F-068](runtime-correctness.md#f-068).
+- Derive the outgoing DUP flag from MQTT retransmission, not the JetStream delivery count.
+  Status: **Open. Alpha blocker.**
+  Release treatment: Alpha blocker.
+  `trackPublish` sets DUP from `dcount > 1` and that reaches the wire via `mqttPubFlagDup`.
+  MQTT-3.3.1-3 ties DUP to whether **the outgoing PUBLISH** is a retransmission; a copy
+  refused before `trackPublish` produced no PUBLISH, so the next offer is a FIRST
+  transmission and must carry DUP=0. **An in-memory fix is insufficient**: the register is
+  confirmed and the message enqueued in two operations, and a crash between them makes
+  recovery treat an unsent PUBLISH as started, so the fix owes DURABLE semantics and two
+  deterministic tests. F-071's capture shows seven of eight messages arriving
+  with DUP=1 on their first client-visible PUBLISH. Found by review of that capture, which
+  I had recorded as legitimate behaviour.
+  Details: [F-072](release-investigations.md#f-072).
+- Preserve same-topic ordering for affine QoS 2 deliveries.
+  Status: **Open. Alpha blocker, and demonstrated to be OURS.**
+  Release treatment: Alpha blocker.
+  Found while verifying F-034 and reproduced from a SINGLE publishing Client — an earlier
+  cross-publisher capture could not support the claim and was withdrawn. The packet
+  identifier is allocated immediately before the synchronous register gate and enqueue, on
+  a subscription `nats.go` dispatches with one goroutine, so allocation order equals enqueue
+  order — and the capture shows a later-published message holding `pi=1`. A reader cannot
+  invent an identifier allocation, so the harness is eliminated.
+  **NOT a bare spec violation:** §4.6's ordering requirements are conditional on an Ordered
+  Topic and on NON-shared subscriptions. It violates an INTENDED implementation property in
+  `docs/PORTING.md`, which states per-(Topic,QoS) ordering as intended on EVERY path via one
+  ordered carrier per topic-filter+QoS; the affine path adds a second carrier and so violates
+  the intention rather than being excluded from it.
+  **Three of four explanations were refuted**, each by evidence already in the tree, and the
+  cause remains UNTESTED.
+  Details: [F-071](release-investigations.md#f-071).
+- Establish the affine contender fixture's rival-create premise rather than racing it.
+  Status: Open. Release treatment: Post-alpha cleanup.
+  Found while verifying F-034, and the attribution is settled against a baseline rather
+  than argued: the fixture stages a rival consumer under a durable name it does not own,
+  which JetStream refuses as an immutable-field update once that durable exists. 6/60 on
+  the change against **16/60** on a clean baseline — the first isolated batch read 1/10
+  against 0/10, which inverted at scale.
+  Details: [F-070](release-investigations.md#f-070).
+- Fence the orphan-reconcile fixture against the background sweep it does not drive.
+  Status: Open. Release treatment: Post-alpha cleanup.
+  Found while verifying F-034, with the mechanism PROVEN by construction rather than
+  inferred from timing: `TestMQTTInflightOrphanReconcile` asserts that a first sighting
+  must not delete, while the account manager's own goroutine can take that first sighting
+  before the test's explicit pass. With the grace at zero, two sightings of any spacing
+  suffice. The assertion is right; its premise is not established.
+  Details: [F-069](release-investigations.md#f-069).
 - Add write lineage to outbound in-flight registers.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed 2026-08-22 as an audit plus a census. No lineage was needed — but unlike
+  F-032's and F-033's audits this one found a REACHABLE defect, and its remedy is identity
+  conditioning plus bounded destruction. Produced F-067 and F-068, and routed its
+  live-owner
+  residue to F-036 as that finding's fourth manifestation.
   Details: [F-034](ha-arbitration.md#f-034).
 - Bound every server-initiated courtesy DISCONNECT write.
   Status: Open. Release treatment: Alpha blocker.

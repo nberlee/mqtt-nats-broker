@@ -148,7 +148,9 @@ the "no fallbacks" stance reviewable rather than implicit.
   that never proved retention, a reference skip that leaves claims to owner resume, and a
   reap on a stale copy reading, and a claim key that outlives the `$MQTT_msgs`
   incarnation it indexes — F-063, F-064, F-065 and F-066 rather than anything this
-  contract speaks to. `$MQTT_inflight` (F-034) still owes its audit.
+  contract speaks to. `$MQTT_inflight`'s audit ran on 2026-08-22 (F-034) and reached the
+  same verdict on lineage — but it is the one of the three that found a REACHABLE defect,
+  and the remedy is identity conditioning plus bounded destruction rather than lineage.
   A rejection is reported structurally
   (`JSStreamWrongLastSequenceErrF` 10071, or 10164 under clustered inflight
   contention). 10164 means *transient contention*, not "the subject moved", so
@@ -285,7 +287,7 @@ per-owner:
 | `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker) | **`DenyDelete`** (the owner issues no delete API request at all; the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
 | `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL` | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
 | `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_inflight` | create-only register CAS, exact-sequence deletes, per-incarnation filter purge (teardown), bounded walk; no consumers | as `$MQTT_qos2in` (`DenyDelete` and `DenyPurge` both fatal) | `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_inflight` | create-only register CAS, exact-sequence deletes, bounded enumerate-load-classify reap per retiring incarnation (teardown), bounded walk; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
 | `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
 
 Three asymmetries in that table are deliberate, and each is pinned by an
@@ -337,6 +339,37 @@ survives beside it** — recreate both together and startup admits — and **wit
 kept, `$MQTT_teardown` may be recreated and is admitted**, starting cleanly with no
 historical fences. `docs/CONFORMANCE.md` records that loss; the two-stream recovery is
 specified as a procedure for that reason rather than because every mistake fails closed.
+
+### What a persisted record references that another stream issues
+
+Which durable identities cross a stream boundary is enumerated in
+`docs/findings/persisted-identity-census.md`. A new FIELD of a persisted artifact fails by
+name, over a type universe derived by a recursive walk from the persisted roots. The
+INTERPRETATION-SITE half is a drift guard rather than a closure proof: its root set is
+hand-maintained and it keys a site by unqualified function name, so a new branch inside an
+already-named function, a new wrapper around the transport primitives, or a same-named
+method on another receiver can still pass. That is why the census does not discharge
+F-066's completeness deferral.
+
+Two facts from it belong here, because they bear directly on the table above.
+
+**Seven of the nine validators above assert a single-stream recovery procedure**, and
+that is operator guidance rather than proof. `$MQTT_sess` and `$MQTT_teardown` name each
+other and are one logical unit; the other seven name themselves alone. But records on
+those seven persist identities other streams issue — sequences, consumer durable names,
+subjects — so recreating one of them strands every surviving reference to it. F-066 owns
+generalising the coupling; what the census adds is that the population is now enumerated
+rather than sampled.
+
+**Scope over that population is anchored to the bridge's INTERPRETATION SURFACE**, not to
+a list of JetStream transitions. A transition is in scope if and only if it can change the
+outcome of an enumerated interpretation site — 161 of them, derived from the source.
+Delivery, timer-driven redelivery, pause, expiry and snapshot restoration therefore enter
+through the reads and callbacks that observe them, rather than as classes of their own,
+and a new row is required only for a new site, observable, outcome partition or authority.
+That is what makes the enumeration bounded at all: "every durable-state transition" is
+not, because it enumerates the server's implementation. It is a better-founded scope rule,
+**not a proof of closure** — see the three drift classes above.
 
 Startup validation is a **snapshot**: a stream config mutated after
 initialization is not re-checked until the next process start or manager
@@ -2672,12 +2705,14 @@ Three defects follow, each resting on a premise of its own:
 - **F-066** — a `stopAll`-instructed recreation of ONE stream is treated as a
   self-contained procedure, but durable records persist identities other streams issue. A
   verified sample of such identities — explicitly not a census, since four enumeration
-  attempts were falsified and the census is deferred to F-034 — shows **three** epoch
+  attempts were falsified and the census was deferred to F-034, which landed it on
+  2026-08-22 — shows **three** epoch
   couplings, all against `$MQTT_sess` and all ad hoc, with every confirmed reference to
   `$MQTT_msgs`, `$MQTT_out`, `$MQTT_qos2assign` and `$MQTT_inflight` uncoupled, and one
   `$MQTT_sess` reference uncoupled too. On this
-  path the VERIFIED AFFECTED SUBSET — not a proven closed unit, which only F-034's census
-  can settle — is those four
+  path the VERIFIED AFFECTED SUBSET — not a proven closed unit; F-034's census enumerates
+  the population but is a drift GUARD over the interpretation surface rather than a closure
+  proof, so it does not settle that either — is those four
   streams; recreating a proper subset loses accepted messages, delivers an OLD payload for
   a new message, or NAK-loops orphaned copies forever.
 
@@ -3228,6 +3263,20 @@ The invariants, in the order they matter:
   before the claim removal and the ack — in its finalizer. That retry must read BOTH
   authoritative shapes of "the sequence is already gone" as success, or a crash between
   the delete and the claim save would withhold the exchange's completion forever.
+- **The drain's release is fenced against its own session being cleared, twice.** The
+  finalizer captures its drain and sequence, unlocks, and does JetStream work; `clear()`
+  meanwhile nils the drain maps, RE-MINTS the generation, and resets the packet-identifier
+  allocator. So the incarnation identity is captured in the same critical section that
+  proves the captured drain is still the session's — without that, a stale finalizer pairs
+  the retired delivery's identifier with the fresh generation, and since the release matches
+  on the subject's identifier plus `(Dur, Seq)` with group durables named deterministically,
+  the FRESH incarnation's register is a full match and is deleted while its client may still
+  hold that identifier. A **second** check runs after the release and after the record
+  fence, because `clear()` can also finish during the release's own round trips, after which
+  the fence opens legitimately against the new epoch while every local still names the
+  retired drain: the token is released and the delivery withheld rather than undone, since
+  the release itself is irreversible. Neither check arbitrates a genuinely LIVE owner of the
+  same register — that stays F-036's predicate.
 - **Ownership transfers explicitly, it is never assumed.** Three teardown paths take a
   register out of the ordinary terminal path's reach, and each takes the delete with it.
   A **drained** QoS 2 exchange holds its source claim until its PUBREL is proven, so
@@ -3498,17 +3547,24 @@ The invariants, in the order they matter:
   was never sent, so it is never registered. A retained-message send has no JetStream
   backing at all, so it has no register and no post-restart redelivery.
 
-A session discard purges the retiring incarnation's registers by filter, rather than
-arbitrating each one as the inbound hold walk does: on the discarding broker nothing is
-competing for a register — no claim record, no marker — though a resuming session does
-read one as durable authority and rewrite it to take ownership. The filter
-names a generation `clear()` has already re-minted, so it cannot reach the next
-incarnation. That is the extent of the claim. A resume preserves the generation, so a
-peer may still be serving this incarnation; whether the filter purge costs anything there
-is `$MQTT_inflight`'s own consequence question (**F-034**, unaudited). The same premise's
-cost on `$MQTT_qos2in` was **F-062**, and it was paid by bounding every hold purge to a
-proven cutoff — a remedy `$MQTT_inflight` cannot simply copy, because this filter purge
-enumerates nothing and so has no watermark to bound it by. Giving it one is F-034's work.
+A session discard removes the retiring incarnation's registers with a **bounded reap**
+rather than arbitrating each one as the inbound hold walk does: on the discarding broker
+nothing is competing for a register — no claim record, no marker — though a resuming
+session does read one as durable authority and rewrite it to take ownership. Its
+enumeration filter names a generation `clear()` has already re-minted, so it cannot reach
+the next incarnation. That is the extent of the claim. A resume preserves the generation,
+so a peer may still be serving this incarnation; whether removing a register costs anything
+there is `$MQTT_inflight`'s own consequence question, and **F-034 answered it on
+2026-08-22**.
+
+Until F-034 this was a blind FILTER PURGE, and that is why the remedy `$MQTT_qos2in` had
+already received could not simply be copied: **F-062** bounded every hold purge to a proven
+cutoff, and a filter purge enumerates nothing, so it has no watermark to be bounded by.
+Giving `$MQTT_inflight` one was F-034's work and is done — `reapIncarnationRegisters`
+enumerates, loads, classifies and deletes only at or below the sequence its own enumeration
+returned, and only a record whose identity and subject agree. **No filter purge of this
+stream remains anywhere in the broker**, which is also why `DenyPurge` moved from a fatal
+prerequisite to a waiver in the table above.
 
 **Cost, stated plainly.** One create-only CAS round trip per *first* transmission of
 every outbound QoS 1/2 message, one delete per completion, and on QoS 2 a confirmed
@@ -3562,7 +3618,9 @@ generation — a resume preserves the generation, so a peer may still be serving
 late removal had to be made safe against that peer, the bound came from the removal rather
 than the name: on `$MQTT_qos2in` every hold purge carries the highest sequence its remover
 could prove it was entitled to destroy (F-062). What that premise costs on
-`$MQTT_inflight` is still unaudited (F-034).
+`$MQTT_inflight` was audited by F-034 (2026-08-22), and the answer is the same in kind: the
+teardown's register pass carries the watermark its own enumeration returned, and conditions
+each delete on the identity it loaded at the sequence it loaded.
 
 This is the same conclusion the QoS 2 move protocol and the affine delivery path
 reached independently, and it is why the fix is naming rather than a lock: a nonce
@@ -3590,8 +3648,9 @@ Repetition is safe for names nothing can re-occupy. The inbound QoS 2 hold walk 
 subject, so a repeat can name a subject re-occupied since: what makes it safe is the bound
 each call carries, per walk, which naming alone never gave — see **F-062** for what that
 bounds and what it deliberately does not. It is **not** claimed for the deletion set as a
-whole: the same teardown purges `$MQTT_inflight` by filter with no bound at all, and that
-consequence is **F-034**, unaudited.
+whole on naming alone — but the other unbounded member is gone: the same teardown used to
+purge `$MQTT_inflight` by filter with no bound at all, and **F-034** replaced that with an
+enumerate-load-classify pass carrying its own watermark.
 That also makes a crashed teardown self-healing instead of leaking until the orphan
 sweep. The exception is a record the restore boundary refuses outright — a subscription
 in the reserved `$MQTT.>` namespace, or a missing or malformed generation: the CONNECT
@@ -3794,7 +3853,9 @@ covering the create-before-save window on this broker. What the walk plus this b
 residents cannot observe is a session live on **another** broker whose record is absent —
 a resume preserves the generation, so such a session still uses these names. That is
 **F-036**'s open false-absence inference; the per-resource-class consequences belong to
-F-034 and F-036 rather than to this section. (`$MQTT_qos2assign`'s class was F-033, whose
+F-034 — whose audit closed on 2026-08-22, routing its own live-owner residue back to F-036
+as that finding's fourth manifestation — and to F-036, rather than to this section.
+(`$MQTT_qos2assign`'s class was F-033, whose
 audit closed on 2026-08-18. What it found in this pass is one defect of ours — a live
 generation reference makes this pass skip every claim of that generation, leaving them to
 an
@@ -4055,6 +4116,14 @@ socket, its `s.clients` registration, its `clientWG` token, a readLoop goroutine
 and a writeLoop goroutine for as long as the peer kept the TCP connection open.
 MQTT 3.1.1 / 5.0 [3.1.4] says the Server SHOULD close a Network Connection that
 does not deliver a CONNECT in reasonable time.
+
+**Two promises, and only the first is enforced.** The bound makes a silent connection's
+LIFETIME finite — the callback closes the socket whenever it runs, which is the resource
+argument. It does NOT enforce refusal of a CONNECT that arrives after the window: admission
+tests whether the callback has already transitioned the state, never whether the window has
+elapsed, so the effective admissibility bound is the configured value plus the callback's
+scheduling delay. `docs/CONFORMANCE.md` states that gap and marks it not accepted; the
+paragraphs below describe the mechanism as built.
 
 **Unconditional and fail-closed.** It is armed for every accepted connection,
 not only when an authentication mechanism is configured: the resources a silent

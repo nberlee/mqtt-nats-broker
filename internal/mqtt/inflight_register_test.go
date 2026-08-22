@@ -205,7 +205,6 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 		{"max msg size", func(c *StreamConfig) { c.MaxMsgSize = 1024 }},
 		{"no ack", func(c *StreamConfig) { c.NoAck = true }},
 		{"deny delete", func(c *StreamConfig) { c.DenyDelete = true }},
-		{"deny purge", func(c *StreamConfig) { c.DenyPurge = true }},
 		{"sealed", func(c *StreamConfig) { c.Sealed = true }},
 		{"subject transform", func(c *StreamConfig) {
 			c.SubjectTransform = &SubjectTransformConfig{Source: ">", Destination: "x.>"}
@@ -231,6 +230,19 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 	si.Config.ConsumerLimits.InactiveThreshold = time.Minute
 	if err := validateInflightStream(si, 0); err != nil {
 		t.Fatalf("a consumer inactivity limit is irrelevant to a stream with no consumers: %v", err)
+	}
+
+	// DenyPurge stopped being a prerequisite with F-034, and this asserts the removal
+	// positively rather than leaving its absence to be inferred. The teardown's
+	// per-incarnation FILTER PURGE was replaced by reapIncarnationRegisters, which deletes
+	// at exact sequences — covered by the DenyDelete rejection above. Refusing DenyPurge
+	// would reject a hardened stream this broker can use, for a purge that no longer
+	// exists, so this test would fail if the rejection came back.
+	si = good()
+	si.Config.DenyPurge = true
+	if err := validateInflightStream(si, 0); err != nil {
+		t.Fatalf("deny_purge must be accepted since F-034 replaced the filter purge with "+
+			"exact-sequence deletes: %v", err)
 	}
 }
 
@@ -5360,7 +5372,14 @@ func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
 
 // A session discard destroys the registers of the incarnation it retires: every
 // identifier it held is void.
-func TestMQTTInflightTeardownPurgesRegisters(t *testing.T) {
+//
+// Named for the REAP rather than a purge since F-034: the removal is an
+// enumerate-load-classify pass deleting at exact sequences, and this fixture asserts the
+// outcome for the case where every register is readable and at or below the watermark.
+// It does not assert that removal is unconditional — the reap spares an above-watermark
+// record and refuses on an unreadable one, which the fixtures in
+// inflight_identity_release_test.go cover.
+func TestMQTTInflightTeardownReapsRegisters(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-teardown")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -5381,7 +5400,7 @@ func TestMQTTInflightTeardownPurgesRegisters(t *testing.T) {
 	// Count against the RETIRED generation: the live one is fresh and empty.
 	filter := mqttInflightWalkFilter(e.sess.idHash, retiring)
 	if _, err := e.asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, 1); err == nil {
-		t.Fatalf("the retired incarnation's registers must be purged")
+		t.Fatalf("the retired incarnation's registers must be reaped")
 	} else if isErrorOtherThan(err, JSNoMessageFoundErr) {
 		t.Fatalf("walk the retired registers: %v", err)
 	}

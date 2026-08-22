@@ -51,11 +51,12 @@ the floor buys, but it never becomes the surviving record, because an apply-time
 log-order check that both generations have discards it.
 
 That closure belongs to `$MQTT_willq`. The per-stream findings inherit the server contract
-and the canary, and each needs its own consequence audit before it closes. **F-034 still
-needs its.** F-032's ran on 2026-08-17 and closed without lineage, producing F-062, which
+and the canary, and each needs its own consequence audit before it closes. **All three
+have now run.** F-032's ran on 2026-08-17 and closed without lineage, producing F-062, which
 closed on 2026-08-18; F-033's ran on 2026-08-18, also closed without lineage, producing
-F-063, F-064, F-065 and F-066. The lineage-deletion audit is its own roadmap bullet and
-is now unblocked.
+F-063, F-064, F-065 and F-066; and F-034's ran on 2026-08-22, closing without lineage too
+but as the one of the three whose consequence turned out to be REACHABLE, producing F-067
+and F-068. The lineage-deletion audit is its own roadmap bullet and is now unblocked.
 Fields used for other facts, notably `RWID` as possible positive retirement evidence
 for F-036, do not
 fall merely because the term window does.

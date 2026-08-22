@@ -1165,6 +1165,27 @@ type mqttAccountSessionManager struct {
 	// not be read at all" and "one register could not be loaded" are different failures
 	// with the same remedy, and a test needs to reach each on its own. Nil in production.
 	testInflightEnumerate func(filter string) (map[string]uint64, error)
+	// testInflightLoadMulti, when non-nil, replaces the BATCHED register read the
+	// teardown reap uses. Separate from testInflightLoad because the reap's window is
+	// the one BETWEEN the enumeration and the load — a register written after the
+	// watermark was taken — and a fixture that served both from one seam could not
+	// stage it.
+	testInflightLoadMulti func(subjects []string) ([]*JSApiMsgGetResponse, error)
+	// testInflightEnumerateBounded, when non-nil, replaces the teardown reap's
+	// enumeration. Distinct from testInflightEnumerate because the reap needs the
+	// stream WATERMARK the resume walk deliberately discards: the resume walk removes
+	// nothing by filter, so it has no purge to bound, while the reap's entitlement IS
+	// that watermark.
+	testInflightEnumerateBounded func(filter string) (map[string]uint64, uint64, error)
+
+	// testDrainBeforeRegisterRelease, when non-nil, runs in finalizeDrainDelivery between
+	// the entry capture of (drain, seq) and the critical section that proves the drain is
+	// still current and captures the incarnation identity. It exists for one hazard: a
+	// concurrent clear() in exactly that window re-mints the generation and resets the
+	// packet-identifier allocator, so a stale finalizer could address a FRESH incarnation's
+	// register. No other seam sits in that window, and a fixture that cannot stage it
+	// cannot distinguish the guard from its absence. Nil in production.
+	testDrainBeforeRegisterRelease func()
 
 	// testInflightSourceAck, when non-nil, replaces the CONFIRMED source acknowledgement
 	// on the QoS 2 PUBREC path — the one that licenses deleting the in-flight register.
@@ -1812,8 +1833,8 @@ type mqttPersistedSession struct {
 	// may be part way through deleting the incarnation's resources. Nobody may
 	// resume that state: every reader that can INTERPRET the record finishes the
 	// teardown (the deletions are generation-scoped; repeating them is safe for names nothing
-	// can re-occupy, bounded per walk for the inbound QoS 2 hold walk — F-062 — and not
-	// claimed at all for the unbounded `$MQTT_inflight` purge — F-034) and releases
+	// can re-occupy, bounded per walk for the inbound QoS 2 hold walk — F-062 — and bounded
+	// by its own enumeration watermark for the `$MQTT_inflight` reap — F-034) and releases
 	// the record before starting fresh. A reader that refuses the record's schema does not
 	// resume it either, but it does not finish it: the expiry path and the orphan
 	// sweep pick a reserved-namespace record up only while its GENERATION is valid,
@@ -8642,10 +8663,14 @@ RESTORE:
 	// record, and start fresh — with a fresh generation, so nothing this session
 	// creates can collide with what the previous owner may still be deleting — and
 	// Session Present false. See sess_teardown.go.
-	// The generation is validated BEFORE anything derives a name from it — the
-	// adopted teardown below deletes by generation-scoped name and purges by
-	// generation-scoped FILTER, so a malformed stored value could widen that purge
-	// across other incarnations. Fails closed. See mqttSessGenFromRecord.
+	// The generation is validated BEFORE anything derives a name from it — the adopted
+	// teardown below deletes by generation-scoped name, and it WALKS by generation-scoped
+	// filter (the inbound QoS 2 holds; $MQTT_inflight's own filter purge is gone since
+	// F-034, replaced by a bounded reap whose enumeration uses the same kind of filter).
+	// A malformed stored value would widen those walks across other incarnations, and
+	// what each pass then destroys is bounded per F-062 and F-034 rather than blind — but
+	// a walk that names the wrong incarnation is still the wrong inventory. Fails closed.
+	// See mqttSessGenFromRecord.
 	recGen, err := mqttSessGenFromRecord(ps.Gen)
 	if err != nil {
 		return nil, false, fmt.Errorf("restoring session %q: %w", clientID, err)
@@ -8735,8 +8760,8 @@ RESTORE:
 	// A retired generation takes the SAME route rather than a second discard shape of
 	// its own: build the transient session, clear() it (which re-marks the record,
 	// finds the retirement already recorded, repeats the deletions — the inbound QoS 2 hold
-	// walk bounded per walk, F-062; the `$MQTT_inflight` purge beside it still unbounded,
-	// F-034 — and releases the record) and hand back the reset
+	// walk bounded per walk, F-062; the `$MQTT_inflight` reap beside it bounded by its own
+	// enumeration watermark, F-034 — and releases the record) and hand back the reset
 	// object as a fresh session, with
 	// Session Present false — which is the truthful answer in both cases.
 	overdue := ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
@@ -9439,8 +9464,10 @@ func (sess *mqttSession) clearWindowHook(window string) {
 // resource named here is generation-scoped. Generation scoping protects the next
 // incarnation; a resume preserves the generation, so it never protected a peer still
 // serving the retiring one. What protects that peer's inbound QoS 2 state is the bound
-// each hold removal carries (F-062); $MQTT_inflight has no such bound and its
-// consequence is unaudited (F-034). See sess_teardown.go.
+// each hold removal carries (F-062); $MQTT_inflight now carries the same kind of bound,
+// its reap's own enumeration watermark (F-034). What neither bound does is arbitrate a
+// peer that is genuinely still serving the retiring incarnation — that needs an ownership
+// predicate, which is F-036's. See sess_teardown.go.
 //
 // It runs in a record transaction of the OLD generation — its record removal must
 // validate against the epoch it opened with — and ends that generation as it
@@ -9590,7 +9617,15 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// Retired sources belonged to the discarded incarnation's consumers, which are being
 	// deleted: nothing can redeliver them, so nothing needs settling.
 	sess.srcAckOwed = nil
-	// The whole generation's registers are purged by the teardown, so nothing is owed.
+	// These verdicts are per-incarnation and they only ever reach durable state through
+	// the session record (CancelledRegs on the way out, mqttNonceSet on the way back in),
+	// and a discard DELETES that record — so no later reader can obtain a retired
+	// generation's verdicts, whatever survives on $MQTT_inflight. That is the reason, and
+	// it deliberately does NOT rest on the teardown having removed every register: since
+	// F-034 the reap spares anything above its enumeration watermark and refuses outright
+	// on an unreadable one, and clear()'s no-record branch has no marker to re-drive it,
+	// so survivors are possible. They are the orphan sweep's, and the sweep reads durable
+	// state rather than this object.
 	// The handoff watermark goes with them, and for the same reason the two paths that
 	// REUSE this object as a fresh session need it: an old generation's value left
 	// standing would suppress the new generation's handoffs until its revisions caught
@@ -9736,8 +9771,10 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// delete cannot be atomic. Generation-scoped naming is what keeps these deletes off
 	// the NEXT incarnation's resources; it does not establish that no peer is still
 	// serving this one. For the inbound QoS 2 holds that is covered by the bound each
-	// removal carries (F-062); for $MQTT_inflight it is not covered at all (F-034,
-	// unaudited). The hook here is how a test parks a broker in exactly that window.
+	// removal carries (F-062); for $MQTT_inflight it is the bound F-034 added, its reap's
+	// own enumeration watermark. Neither bound arbitrates a genuinely live owner of the
+	// same record — that is F-036's predicate. The hook here is how a test parks a broker
+	// in exactly that window.
 	if h := mqttTestTeardownClaimedHookV.Load(); h != nil {
 		(*h)(sess, nonce, markerSeq)
 	}

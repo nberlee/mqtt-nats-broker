@@ -2414,7 +2414,10 @@ the generation-and-origin-sequence scope used by displaced-connection cleanup.
 `internal/mqtt/connect_deadline.go` bounds every accepted connection between
 accept and CONNECT. MQTT 3.1.1 / 5.0 [3.1.4] says the Server SHOULD close a
 Network Connection that does not deliver a CONNECT in reasonable time; the broker
-did not, because the timer the ported code armed was unreachable. `createMQTTClient`
+did not, because the timer the ported code armed was unreachable. What this closed
+is the SHOULD for a connection that stays **silent**; a CONNECT that arrives after
+the window and takes `c.mu` before a delayed callback is still admitted, which
+`docs/CONFORMANCE.md` records as an unenforced half rather than a residual. `createMQTTClient`
 gated it on `s.info.AuthRequired || s.mqtt.authOverride`, and neither input has a
 writer in this repository — the first has no writer at all, and the second's only
 writer, `mqttConfigAuth`, has no caller. So `setAuthTimer` was never called and a

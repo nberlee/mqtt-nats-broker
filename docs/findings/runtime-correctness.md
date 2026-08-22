@@ -316,3 +316,88 @@ applies on the success path, whose write error is part of its verdict. Then the
 call site's trace stops claiming a packet that was not sent. A connection whose
 CONNECT lost the race to the connect deadline is a different case and must stay
 silent: its socket is already closed, and it was never authenticated.
+
+## F-067
+
+**Title:** Refuse a pre-release delayed-drain record shape instead of repairing it
+
+- Status: Open. Filed 2026-08-22 by F-034's persisted-identity census.
+- Classification: Pre-release persistence compatibility
+- Release treatment: Post-alpha cleanup. Not an alpha blocker: the accommodation is
+  benign at runtime, and what it violates is a project rule about how unsupported
+  shapes are treated rather than a conformance guarantee.
+
+### The finding
+
+`mqttPersistedDrainSeq.RegSeq` documents itself as tolerating a record written before
+the field existed:
+
+> *Optional: a record written before this field existed carries none, and the resume
+> barrier repairs it from the register scan rather than treating it as "no register".*
+
+`docs/ARCHITECTURE.md`'s **Compatibility boundary** is normative and says the opposite:
+there are no releases and no mixed fleet, so an older broker is a population that does
+not exist, and an unsupported persisted shape is **refused** rather than migrated or
+repaired. That is the rule F-056, F-057 and F-058 each implemented for their own record
+type. This is the same class, still open.
+
+### The analysis its fix must do FIRST, and why the obvious fix is wrong
+
+**A zero `RegSeq` is not proof of a legacy record.** A current-schema drain can carry
+zero legitimately, by at least two routes verified in the code:
+
+- the finalizer clears `regSeq` after a **proven** release but before acquiring and
+  saving the claim-removal transaction, and another concurrent save can persist that
+  intermediate state;
+- recovery deliberately clears it for **ambiguous duplicate** drain registers, where two
+  registers named one delivery and neither may be trusted.
+
+So a refusal keyed on `RegSeq == 0` would refuse live sessions in an ordinary crash
+window. The fix must first distinguish *provenance* — a shape this broker no longer
+writes — from *a value this broker writes today*, and only the former may be refused.
+
+Until then the accommodation stands, and it is recorded here rather than left as a
+comment nobody owns.
+
+## F-068
+
+**Title:** Revalidate an enqueue against the session it was allocated under
+
+- Status: Open. Filed 2026-08-22 by F-034's consequence audit.
+- Classification: Runtime correctness
+- Release treatment: Post-alpha cleanup, on the bound established below.
+
+### The finding
+
+An outbound QoS 1/2 delivery persists its in-flight register **before** the send, and
+the two are adjacent but not atomic: `storeInflightRegister` returns through
+`confirmInflightRegister`, which clears `regPending` and so releases the entry for
+transmission, and only then does the caller enqueue. A local `clear()` inside that
+window erases `pendingPublish` entirely, and `mqttEnqueuePublishMsgTo` then queues the
+packet without revalidating the session generation, the client binding, the pending
+entry's nonce, or whether the subscription was closed.
+
+### Why it is bounded, and why F-034 did not fix it
+
+Measured against F-034's two owned consequences it is **neither**: the register was
+confirmed, so no identifier is freed — the whole identifier space retires with the
+incarnation `clear()` ended — and none is reserved, because the entry is gone.
+
+And the exposure is bounded by where the packet can go. The delivery callback captures
+the connection object and the enqueue queues onto **that same object**; it never
+resolves a destination through the session. A takeover rebinds the *session* to another
+client object, it does not retarget the old one. So the packet is either dropped because
+that connection is closing, or delivered to the discarded session's **own** old client.
+**It cannot reach a different session's client**, which is what keeps this out of the
+data-leak class.
+
+An earlier draft of F-034's plan posited that third outcome and made it the one branch
+F-034 would fix. Review refuted it on the code, and the whole race was filed here
+instead.
+
+### What a fix looks like
+
+An **in-process** enqueue fence: revalidate generation and binding under the lock that
+owns them, before queueing. Deliberately **not** durable arbitration — there is no
+second party contending for anything here, and inflating an in-process ordering problem
+into a durable protocol is the mistake F-034's own review cycle rejected twice.

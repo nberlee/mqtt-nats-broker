@@ -160,11 +160,19 @@ were adapted as follows:
 - **Cross-topic / cross-QoS delivery order (3 rewritten)** — MQTT orders
   delivery only per (Topic, QoS): an "Ordered Topic" server sends PUBLISHes
   "for the same Topic and QoS in the order that they were received"
-  [MQTT-4.6.0-9]; it does
+  (Spec5 §4.6 — the citation here previously read [MQTT-4.6.0-9], which does
+  not exist; §4.6's normative statements end at MQTT-4.6.0-6); it does
   **not** order across different topics or across QoS levels. That
-  per-(Topic,QoS) guarantee **is** preserved here — each topic-filter+QoS
-  stream rides a single ordered carrier (one core-NATS subscription for QoS0,
-  one JetStream push consumer for QoS1/2) on a single dispatch goroutine.
+  per-(Topic,QoS) guarantee is **INTENDED on every path** — each
+  topic-filter+QoS stream is meant to ride a single ordered carrier (one
+  core-NATS subscription for QoS0, one JetStream push consumer for QoS1/2) on a
+  single dispatch goroutine — and it holds on the non-affine paths these three
+  rewritten tests exercise. **The affine shared-subscription QoS 2 path
+  currently VIOLATES it**, delivering copies through a second carrier: see
+  [F-071](findings/release-investigations.md#f-071), an open alpha blocker.
+  That is stated as a defect against the intention, NOT as a carve-out from
+  it — the guarantee is not scoped to exclude the affine path, which is
+  precisely why F-071 blocks.
   Two Subscription-Identifier cases now validate both topic/property pairs in
   either arrival order, and `TestMQTTv5OutboundTopicAliasMixedQoS` validates
   that whichever QoS path arrives first binds the alias and the other reuses

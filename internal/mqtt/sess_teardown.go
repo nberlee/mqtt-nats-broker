@@ -35,9 +35,10 @@
 // overwriting it: it adopts the teardown, repeats the deletions for the RETIRING
 // generation, releases the record, and only then starts a fresh session with a fresh
 // generation and Session Present false. (Repeating them is safe for names nothing can
-// re-occupy; for the inbound QoS 2 hold walk it is bounded per walk, and not claimed at all
-// for the unbounded `$MQTT_inflight` purge. F-062 and F-034 state those two; do not restate
-// them here.) That also makes a crashed teardown
+// re-occupy; for the inbound QoS 2 hold walk it is bounded per walk, and for the
+// `$MQTT_inflight` reap it is bounded by that pass's own enumeration watermark — F-034
+// replaced the unbounded purge that used to sit there. F-062 and F-034 state those two; do
+// not restate them here.) That also makes a crashed teardown
 // self-healing, which today leaks until the orphan sweep. A record the restore
 // boundary refuses is never adopted by the CONNECT: a reserved-namespace record whose
 // generation is valid is still finished by the expiry path and the orphan sweep, while
@@ -80,8 +81,10 @@ type mqttSessTeardown struct {
 // here, and do not paraphrase the entitlement criterion — three review rounds were spent on
 // restatements of it that were a shade too strong.
 //
-// It does not extend to `$MQTT_inflight`, whose filter purge is unbounded on equally
-// re-occupiable subjects: F-034, unaudited.
+// It extends to `$MQTT_inflight` too, since F-034: the blind filter purge there was
+// replaced by an enumerate-load-classify-delete pass whose entitlement is its own
+// enumeration watermark, so a subject re-occupied since the enumeration is SPARED rather
+// than destroyed.
 //
 // sharedDurs is deliberately separate: a shared group durable is not owned by one
 // session, and is released only after the record is gone, by the last-holder scan.
@@ -718,7 +721,9 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 // Tolerating "already gone" is not by itself what makes this repeatable. For the
 // inbound QoS 2 hold walk, which purges by subject and so can name a subject re-occupied
 // since the first run, what makes a second run safe is the bound each call carries (F-062).
-// The `$MQTT_inflight` purge below carries none: F-034 owes that audit.
+// The `$MQTT_inflight` reap below carries the same kind of bound, since F-034: its
+// entitlement is the watermark its own enumeration returned, and it deletes only records
+// at or below that, at exact sequences, after checking each occupant's identity.
 //
 // Shared group durables are NOT here; they are released by the caller after the
 // record is gone, so the last-holder scan does not count this session.
@@ -795,31 +800,56 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// outbound QoS 1/2 delivery session state, and a discard destroys it rather than
 	// carrying it into whatever session next uses this client ID.
 	//
-	// A filter purge is used here rather than the arbitrated walk above, and the contrast
+	// A BOUNDED REAP is used here rather than the arbitrated walk above, and the contrast
 	// is deliberate: on THIS broker nothing else is competing for a register — no claim
 	// record, no marker — whereas a hold record is a payload another broker's releaser may
 	// still be committed to delivering. (A register is not inert even so: a resuming
 	// session reads one as durable authority and rewrites it to take ownership, see
-	// claimRecoveredSharedInflight.) The filter names the RETIRING
-	// generation, which clear() re-mints before this runs, so a delayed purge cannot name a
-	// subject the NEXT incarnation occupies.
+	// claimRecoveredSharedInflight.) Until F-034 this was a blind FILTER PURGE; it is now
+	// reapIncarnationRegisters, which enumerates, loads, checks each occupant's identity
+	// and deletes at exact sequences at or below its own enumeration watermark. The
+	// enumeration filter names the RETIRING generation, which clear() re-mints before this
+	// runs, so a delayed pass cannot name a subject the NEXT incarnation occupies.
 	//
 	// That is the whole of what is established, and it is deliberately NOT a correctness
 	// verdict. A resume preserves the generation, so a peer may still be serving this
 	// incarnation and holding registers under these very subjects; "no second party" is a
-	// statement about this broker, not about the cluster. Whether that costs anything is
-	// $MQTT_inflight's own consequence question — F-034, unaudited — and the same premise's
-	// cost on $MQTT_qos2in is F-062. Do not read this paragraph as clearing either.
+	// statement about this broker, not about the cluster. F-034 AUDITED what that costs:
+	// the destruction itself is now bounded and identity-checked (below), so a register
+	// this pass was not entitled to is spared rather than destroyed. What remains is
+	// contention with a genuinely LIVE owner of the same register, which naming cannot
+	// arbitrate and which is F-036's predicate, not this pass's. The same premise's cost
+	// on $MQTT_qos2in is F-062.
 	//
-	// This purge stays UNBOUNDED (upToSeq 0) on purpose. F-062 bounded the $MQTT_qos2in
-	// hold purge to what its walk enumerated, and this purge has the same unbounded shape
-	// for the same reason it is unaudited: it enumerates nothing, so there is no watermark
-	// to bound it BY. Giving it one is F-034's work, not F-062's, and inventing a bound
-	// here would claim an audit that has not happened.
+	// F-034 REPLACED the blind filter purge here. It used to be
+	// purgeStream(filter, upToSeq 0), which read nothing, and the two things wrong with
+	// that needed two different mechanisms: it could not NAME what it destroyed, and it
+	// had nothing to BOUND itself by because it enumerated nothing. The replacement
+	// enumerates, loads in batches, checks each occupant's identity, skips anything above
+	// the watermark the enumeration itself took, and deletes at exact sequences.
+	//
+	// It also changes this function's failure posture, deliberately: an unreadable or
+	// indeterminate register now ABORTS the teardown rather than being purged blind, so
+	// the record is not released while a register of unknown status remains. What can then
+	// re-drive it is branch-specific: a record-backed teardown keeps its marked record and
+	// its retirement watermark, so a later attempt re-enumerates, while clear()'s
+	// no-record branch (seq == 0) returns before the claim and has neither — there nothing
+	// re-drives it and the orphan sweep is the only cleanup. A permanently unreadable
+	// register therefore wedges this client's teardown until an operator removes it, which
+	// is stated per call site in docs/CONFORMANCE.md and is the right trade against
+	// releasing a record on a read that failed.
+	//
+	// noWait no longer applies to this phase: a conditional delete must receive and
+	// classify its outcome, so the classification cannot be fire-and-forget.
 	if t.idHash != _EMPTY_ && t.gen != _EMPTY_ {
-		filter := mqttInflightWalkFilter(t.idHash, t.gen)
-		if err := sess.jsa.purgeStream(mqttInflightStreamName, filter, 0, noWait); isErrorOtherThan(err, JSStreamNotFoundErr) {
-			return fmt.Errorf("unable to purge the outbound in-flight registers of session %q: %v", t.id, err)
+		if sess.asm == nil {
+			// Unreachable for a real session: every session carries an account manager.
+			// Fail closed rather than skip the reap, since skipping it silently is what
+			// the blind purge effectively did.
+			return fmt.Errorf("cannot reap the outbound in-flight registers of session %q: no account manager", t.id)
+		}
+		if err := sess.asm.reapIncarnationRegisters(sess.jsa.c, t.idHash, t.gen); err != nil {
+			return fmt.Errorf("unable to reap the outbound in-flight registers of session %q: %w", t.id, err)
 		}
 	}
 	return nil
@@ -943,9 +973,10 @@ func (sess *mqttSession) releaseSharedTeardownDurables(t *mqttTeardownTarget, no
 // classifying re-read reports released or superseded.
 //
 // The inbound QoS 2 hold walk carries a bound of its own, per walk, which is what makes a
-// repeat of it safe where naming alone would not have. "Idempotent" is still not claimed for
-// it, and not claimed at all for the unbounded `$MQTT_inflight` purge beside it. F-062 states
-// the first and F-034 owes the second; neither is restated here.
+// repeat of it safe where naming alone would not have. The `$MQTT_inflight` reap beside it
+// carries the same kind of bound since F-034. "Idempotent" is still not claimed for either:
+// a repeat is SAFE, which is a weaker and sufficient statement. F-062 states the first and
+// F-034 the second; neither is restated here.
 //
 // This is also what makes a CRASHED teardown self-healing, which previously leaked
 // until the orphan sweep.

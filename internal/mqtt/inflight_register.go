@@ -411,6 +411,36 @@ func (as *mqttAccountSessionManager) enumerateInflightSubjects(filter string) (m
 	return subjects, err
 }
 
+// enumerateInflightSubjectsBounded lists one incarnation's register subjects TOGETHER
+// with the stream watermark that bounds what a destructive pass is entitled to remove,
+// honoring an instance-scoped test seam.
+//
+// The watermark is used in the one direction streamSubjects supports: as a bound on
+// destruction. Its contract is explicit that State and State.Subjects are not one
+// snapshot, so a returned subject may sit ABOVE the watermark and is then SPARED — and
+// that reading everything returned as at-or-below would be false.
+func (as *mqttAccountSessionManager) enumerateInflightSubjectsBounded(filter string) (map[string]uint64, uint64, error) {
+	as.mu.RLock()
+	hook := as.testInflightEnumerateBounded
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(filter)
+	}
+	return as.jsa.streamSubjects(mqttInflightStreamName, filter)
+}
+
+// loadInflightRecordsMulti is the batched register read, honoring an instance-scoped
+// test seam. Used by the teardown reap; the resume walk has its own batching.
+func (as *mqttAccountSessionManager) loadInflightRecordsMulti(subjects []string) ([]*JSApiMsgGetResponse, error) {
+	as.mu.RLock()
+	hook := as.testInflightLoadMulti
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(subjects)
+	}
+	return as.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+}
+
 // loadInflightRecord reads a register, honoring an instance-scoped test seam.
 func (as *mqttAccountSessionManager) loadInflightRecord(subject string) (*mqttInflightRecord, *StoredMsg, error) {
 	as.mu.RLock()
@@ -442,6 +472,460 @@ func (as *mqttAccountSessionManager) deleteInflightRegister(seq uint64) {
 		return
 	}
 	_ = as.jsa.deleteMsg(mqttInflightStreamName, seq, false)
+}
+
+// recomputeDrainRegisterStateLocked re-derives every claimed drain entry's register hint
+// and its AMBIGUITY from one complete recovery scan, and returns which keys came out owned
+// and which ambiguous.
+//
+// It resets first, over every claimed entry, and that ordering is the whole point. An
+// earlier revision only cleared the flag for groups the scan still found, so when BOTH
+// duplicates of a pair disappeared the loop visited nothing for that key and the old flag
+// stood — leaving the drain unfinalizable, and outbound allocation withheld, while no
+// ambiguous register remained. A flag that only ever sets is a latch, not an observation.
+// Review of F-034 caught it.
+//
+// sess.mu must be held.
+func (sess *mqttSession) recomputeDrainRegisterStateLocked(
+	drainRegs map[string][]mqttRecoveredInflightReg) (owned, ambiguous map[string]bool) {
+
+	owned, ambiguous = make(map[string]bool), make(map[string]bool)
+	for _, d := range sess.drains {
+		for _, st := range d.seqs {
+			st.regAmbiguous = false
+		}
+	}
+	for key, group := range drainRegs {
+		fr := group[0]
+		d := sess.drainByDur[fr.rec.Dur]
+		if d == nil {
+			continue
+		}
+		st := d.seqs[fr.rec.Seq]
+		if st == nil || !st.claimed {
+			continue
+		}
+		if len(group) > 1 {
+			// More than one register names this delivery, on different identifiers. Record
+			// the AMBIGUITY explicitly: zeroing the hint alone used to be the whole signal,
+			// and the drain's release then read a zero hint as "nothing to do" and
+			// finalized anyway.
+			st.regSeq = 0
+			st.regAmbiguous = true
+			ambiguous[key] = true
+			continue
+		}
+		// A SINGLETON is only unambiguous if it is the identifier this drain entry
+		// addresses. Review of F-034 found the gap: with duplicates on PI A and PI B, if A
+		// vanishes the next scan sees a singleton B and would clear ambiguity — while the
+		// release still addresses A, finds it absent, reads AlreadyGone, and lets the claim
+		// and the consumer go while B survives as a phantom holding a Receive Maximum slot.
+		//
+		// So a singleton on a DIFFERENT identifier stays ambiguous. It is not that the
+		// register is unknown; it is that this entry cannot say which identifier the client
+		// holds, which is the same fact the duplicate case records.
+		if fr.rec.PI != st.pi {
+			st.regSeq = 0
+			st.regAmbiguous = true
+			ambiguous[key] = true
+			continue
+		}
+		st.regSeq = fr.seq
+		owned[key] = true
+	}
+	return owned, ambiguous
+}
+
+// mqttInflightRecordMatchesSubject reports whether a decoded register's body agrees with
+// the subject it was addressed by — specifically that its PI is the identifier that
+// subject names.
+//
+// The reader's own rule is in recoverInflightRegisters, in the scan's `rec.PI != name.pi`
+// term: a record whose body names another identifier is UNREADABLE, its identifier is
+// RESERVED and the record is KEPT. Cited rather than paraphrased so a future reader can
+// check the claim, and so that if the reader's rule ever loosens this mirror is findable.
+//
+// A DESTRUCTIVE path must be at least as strict. Review of F-034's first implementation
+// found the release and the reap both matching only on (Dur, Seq), so an inconsistent
+// record the reader would have refused could be deleted and the caller allowed to progress.
+// Being more permissive than the reader is how a destructive path removes evidence for an
+// identifier the client still holds.
+//
+// Destructive covers OVERWRITES, not just deletes — a later review round found the audit
+// scoped to deletes and the read-after-CAS reconciliations replacing a record they had
+// classified, which turns "reserved, unreadable" into "cancelled, freeable" by exactly the
+// route a delete would.
+//
+// The two dispositions deliberately DIFFER in one respect. The reader reserves AND keeps;
+// the destructive paths refuse AND keep. Both preserve the record; only the reader also
+// claims the identifier, because only it is in a position to.
+func mqttInflightRecordMatchesSubject(rec *mqttInflightRecord, subject string) bool {
+	if rec == nil {
+		return false
+	}
+	name, err := mqttParseInflightSubject(subject)
+	if err != nil {
+		return false
+	}
+	return rec.PI == name.pi
+}
+
+// mqttInflightIdentityOutcome is how an identity-conditioned release ended. The three
+// values are distinct because their CALLERS differ: two authorize the caller to record
+// its own progress, and the third must withhold it.
+type mqttInflightIdentityOutcome int
+
+const (
+	// mqttInflightReleased: our register was found at this subject and deleted at the
+	// exact sequence it was found at.
+	mqttInflightReleased mqttInflightIdentityOutcome = iota
+	// mqttInflightAlreadyGone: the subject is empty, or it holds a register that is
+	// NOT ours. Either way this caller has nothing to release, so it may record its
+	// progress — but nothing was destroyed.
+	mqttInflightAlreadyGone
+	// mqttInflightUndecided: the occupant could not be read, or the read itself was
+	// indeterminate. Nothing was deleted and the caller must WITHHOLD its progress.
+	mqttInflightUndecided
+)
+
+// releaseInflightRegisterByIdentity releases a register the caller can NAME, addressing
+// it by SUBJECT and deleting only the exact sequence the subject currently holds — and
+// only when the occupant's identity matches.
+//
+// # Why a subject and not a sequence
+//
+// R4 says sequences are not identities, and every delete in this file already targets an
+// exact sequence. What R4 does not say, and what F-034 found, is that WHICH sequence to
+// read is itself a question with a right answer. A caller holding a sequence it recorded
+// EARLIER is holding a guess: the store path's replacement branch rewrites a register for
+// the same (Dur, Seq) at a new sequence, and after $MQTT_inflight is recreated the
+// recorded sequence names an unrelated register entirely. Deleting there destroys another
+// session's register — the defect F-034 owns, which F-066's table had already assigned to
+// "that mechanism's owner".
+//
+// A subject is an identity. Addressing by subject and matching the occupant makes the two
+// failure modes asymmetric in the safe direction: a stale subject finds nothing or finds
+// someone else and skips, where a stale sequence finds a victim and deletes it.
+//
+// # The contract
+//
+// Six outcomes, and each one is a caller obligation rather than an implementation detail:
+//
+//	absent                  -> AlreadyGone. Our record is not here; nothing to do.
+//	readable, identity match -> Released, at the sequence the load returned.
+//	readable, mismatch       -> AlreadyGone. The occupant belongs to another exchange and
+//	                            is PRESERVED. This is the common legitimate case: a later
+//	                            exchange on the same identifier.
+//	unreadable               -> Undecided. Fail closed: an unattributable record may not be
+//	                            deleted, and may not be assumed absent either.
+//	indeterminate read       -> Undecided. Never guessed into an absence.
+//	ambiguous delete         -> resolved inside the confirmed delete, which retries and
+//	                            reads an already-absent sequence as success.
+//
+// The exact-sequence delete is the linearization point. A rewrite between the load and
+// the delete moves the record to a new sequence, so the delete removes nothing and the
+// next pass sees the replacement — which is why no fence is needed here beyond the
+// identity match. A concurrent LIVE stream recreation between the two is outside the
+// supported all-brokers-stopped recovery procedure.
+//
+// wantDur and wantSeq are the caller's authority. For the UNSUBSCRIBE drain that is
+// (Cons.Durable, Started.Seq), the register's own source-delivery key, which the record
+// already persists — so this needs no new persisted field. It is deliberately not
+// interchangeable with a nonce: recreating the SOURCE stream that issues wantSeq is
+// F-066's coupling problem, not this contract's.
+func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client,
+	subject, wantDur string, wantSeq uint64) mqttInflightIdentityOutcome {
+
+	cur, smsg, err := as.loadInflightRecord(subject)
+	switch {
+	case err != nil:
+		// Indeterminate. Not an absence, and not a licence to delete.
+		mqttWarnf(c, "MQTT: cannot release the in-flight register on %q: the read was indeterminate: %v",
+			subject, err)
+		return mqttInflightUndecided
+	case smsg == nil:
+		// Empty subject: our register is already gone.
+		return mqttInflightAlreadyGone
+	case cur == nil:
+		// Present but unattributable. Fail closed: it cannot be proven ours, so it
+		// cannot be deleted, and it cannot be proven foreign either.
+		mqttWarnf(c, "MQTT: cannot release the in-flight register on %q at sequence %d: "+
+			"the record is unreadable", subject, smsg.Sequence)
+		return mqttInflightUndecided
+	case !mqttInflightRecordMatchesSubject(cur, subject):
+		// The body disagrees with the subject that addressed it. Recovery already treats
+		// rec.PI != subject.PI as UNREADABLE, and a destructive path must not be more
+		// permissive than the reader: deleting here would remove evidence for an
+		// identifier the client may still hold, on a record the rest of the tree refuses
+		// to interpret.
+		mqttWarnf(c, "MQTT: cannot release the in-flight register on %q at sequence %d: its body "+
+			"names packet identifier %d, which that subject does not", subject, smsg.Sequence, cur.PI)
+		return mqttInflightUndecided
+	case cur.Dur != wantDur || cur.Seq != wantSeq:
+		// Someone else's exchange holds this identifier. PRESERVE it. Under sequence
+		// addressing this is the case that destroyed a victim.
+		if c != nil {
+			c.Debugf("MQTT: leaving the in-flight register on %q at sequence %d alone: it names "+
+				"delivery %s/%d, not %s/%d", subject, smsg.Sequence, cur.Dur, cur.Seq, wantDur, wantSeq)
+		}
+		return mqttInflightAlreadyGone
+	}
+	if err := as.deleteInflightRegisterConfirmed(smsg.Sequence); err != nil {
+		mqttWarnf(c, "MQTT: unable to release the in-flight register on %q at sequence %d: %v",
+			subject, smsg.Sequence, err)
+		return mqttInflightUndecided
+	}
+	// The delete landed, OR the sequence was already absent — deleteInflightRegisterConfirmed
+	// reads the second as success, which it must, because a crash between a landed delete
+	// and the caller's own progress would otherwise withhold the exchange forever.
+	//
+	// But "already absent" is exactly what a REWRITE of the same delivery looks like from
+	// here: the store path's replacement branch moves a register for the same (Dur, Seq)
+	// to a new sequence, so S vanishes and S2 appears. Returning Released on that reading
+	// would let the caller clear its progress, persist its claim removal, acknowledge the
+	// source and delete the consumer while S2 survives — the same phantom subject
+	// addressing exists to prevent, reached one step later.
+	//
+	// So the loop re-reads and re-classifies through the SAME states rather than trusting
+	// one round. It terminates: each iteration either deletes a strictly newer sequence or
+	// reaches absent/mismatch/undecided, and the attempt bound stops a pathological
+	// rewrite-per-iteration from spinning.
+	for attempt := 1; attempt < mqttInflightStoreAttempts; attempt++ {
+		cur, smsg, err := as.loadInflightRecord(subject)
+		switch {
+		case err != nil:
+			// The delete landed but the confirming re-read did not. The caller must not
+			// record progress on an unverified state.
+			mqttWarnf(c, "MQTT: released the in-flight register on %q but could not confirm the "+
+				"subject is clear: %v", subject, err)
+			return mqttInflightUndecided
+		case smsg == nil:
+			return mqttInflightReleased // genuinely clear
+		case cur == nil:
+			mqttWarnf(c, "MQTT: an unreadable in-flight register occupies %q at sequence %d after "+
+				"the release", subject, smsg.Sequence)
+			return mqttInflightUndecided
+		case !mqttInflightRecordMatchesSubject(cur, subject):
+			mqttWarnf(c, "MQTT: an in-flight register whose body names packet identifier %d occupies "+
+				"%q at sequence %d after the release", cur.PI, subject, smsg.Sequence)
+			return mqttInflightUndecided
+		case cur.Dur != wantDur || cur.Seq != wantSeq:
+			// A different exchange took the subject. Ours is gone and this is not ours.
+			return mqttInflightReleased
+		}
+		// Still our delivery, at a new sequence: a rewrite. Delete that one too.
+		if err := as.deleteInflightRegisterConfirmed(smsg.Sequence); err != nil {
+			mqttWarnf(c, "MQTT: unable to release a rewritten in-flight register on %q at sequence "+
+				"%d: %v", subject, smsg.Sequence, err)
+			return mqttInflightUndecided
+		}
+	}
+	// Rewritten faster than it could be released. Not a licence to record progress.
+	mqttWarnf(c, "MQTT: the in-flight register on %q is being rewritten faster than it can be "+
+		"released; withholding", subject)
+	return mqttInflightUndecided
+}
+
+// reapIncarnationRegisters removes one retiring incarnation's registers by ENUMERATING
+// them, loading each, and deleting at the exact sequence the load returned — bounded by
+// the watermark the enumeration itself took.
+//
+// It replaces an unbounded `purgeStream(..., filter, 0, ...)` that read nothing. That
+// purge had two problems and they need two different mechanisms:
+//
+//  1. IT COULD NOT NAME WHAT IT DESTROYED. A peer may still be serving this incarnation —
+//     a resume preserves the generation — so "no second party" was a statement about this
+//     broker, not about the cluster. Enumerating and loading is what gives every deletion
+//     a subject and a record to check, which is R4 applied to the purge rather than only
+//     to the singleton deletes.
+//
+//  2. IT HAD NOTHING TO BOUND ITSELF BY, because it enumerated nothing. That is fixed
+//     here by keeping the watermark `streamSubjects` already returns and SKIPPING any
+//     record above it. A register created after the enumeration is not this pass's to
+//     destroy, and a replacement landing between the enumeration and the load is exactly
+//     the case the identity check cannot see — the pass learns both the nonce and the
+//     sequence from the same load, so it holds no prior identity to call it a mismatch.
+//     Only the watermark distinguishes them.
+//
+// That second point is why the identity check ALONE is insufficient and why F-062's
+// cutoff mechanism, which an earlier draft of this design rejected outright, is half the
+// answer. The two mechanisms close two different windows.
+//
+// The watermark is used in the ONE direction `streamSubjects` supports: as a bound on
+// destruction. Its contract is explicit that `State` and `State.Subjects` are not one
+// snapshot, so a returned subject may sit ABOVE the watermark — "that direction is benign
+// for every caller here — such a record is SPARED by a bounded purge" — and that reading
+// everything returned as at-or-below is FALSE. This spares; it never infers.
+//
+// A zero watermark is not a licence: with no bound available the pass deletes nothing and
+// reports failure. What that buys depends on the caller: a record-backed teardown keeps its
+// marked record, so a later attempt re-enumerates, while clear()'s no-record branch has
+// neither record nor marker and is not re-driven at all — there the orphan sweep is the only
+// cleanup. docs/CONFORMANCE.md states the split per call site.
+//
+// Failure semantics are fail-closed, and the caller's contract is the important half: an
+// unreadable or indeterminate occupant aborts with an error, so the teardown does not
+// release the record while a register of unknown status remains. That is a deliberate
+// wedge — a permanently unreadable record blocks this client's teardown until an operator
+// removes it — and it is the correct trade against releasing a record on a read that
+// failed. The diagnostic names the stream, the subject and the sequence for exactly that
+// reason.
+func (as *mqttAccountSessionManager) reapIncarnationRegisters(c *client, idHash, gen string) error {
+	filter := mqttInflightWalkFilter(idHash, gen)
+	// RESAMPLE for a usable watermark rather than refusing on the first zero, which is
+	// the rule the inbound hold walk already applies and for the same reason: STREAM.INFO
+	// builds State before filling State.Subjects from a separate store read, so a walk
+	// that started against an empty stream can legitimately be handed a non-empty subject
+	// map with a zero last sequence. Nothing is written between samples, which is what
+	// makes retrying safe, and the watermark never rewinds, so a later sample resolves it.
+	//
+	// Exhaustion is an ERROR, not an unbounded pass: this walk has found real
+	// generation-scoped registers and merely cannot bound its entitlement to them.
+	var subjects map[string]uint64
+	var watermark uint64
+	var lastSeen uint64
+	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		var err error
+		subjects, watermark, err = as.enumerateInflightSubjectsBounded(filter)
+		if err != nil {
+			if isErrorOtherThan(err, JSStreamNotFoundErr) {
+				return fmt.Errorf("enumerating the outbound in-flight registers: %w", err)
+			}
+			return nil // no stream, nothing to reap
+		}
+		if len(subjects) == 0 {
+			return nil
+		}
+		if watermark != 0 {
+			break
+		}
+		lastSeen = watermark
+	}
+	if watermark == 0 {
+		return fmt.Errorf("outbound in-flight registers match %q but the stream reported an "+
+			"unusable last sequence %d after %d attempts, so this pass has no proven bound",
+			filter, lastSeen, mqttInflightStoreAttempts)
+	}
+
+	doomed := make([]uint64, 0, len(subjects))
+	names := make([]string, 0, len(subjects))
+	for subject := range subjects {
+		names = append(names, subject)
+	}
+	// Deterministic, so a log line or a test does not depend on map iteration.
+	sort.Strings(names)
+
+	// Batched, for the reason the resume walk states: one incarnation may legitimately
+	// hold up to 65_535 identifiers, and a per-record round trip would put tens of
+	// thousands of serial requests on a teardown.
+	for start := 0; start < len(names); start += mqttInflightLoadBatch {
+		end := min(start+mqttInflightLoadBatch, len(names))
+		batch := names[start:end]
+		resps, berr := as.loadInflightRecordsMulti(batch)
+		if berr != nil {
+			return fmt.Errorf("loading outbound in-flight registers for %q/%q: %w", idHash, gen, berr)
+		}
+		for i, resp := range resps {
+			subject := batch[i]
+			switch mqttClassifyMsgGetResponse(resp) {
+			case mqttInflightResponseAbsent:
+				// Enumerated and now gone. Benign HERE, unlike on the resume path,
+				// because this pass is destroying rather than reserving: an absent
+				// register is one less thing to delete.
+				continue
+			case mqttInflightResponsePresent:
+			default:
+				return fmt.Errorf("in-flight register on %q for %q/%q could not be read, so this "+
+					"teardown cannot prove what it would destroy: remove or repair that record",
+					subject, idHash, gen)
+			}
+			smsg := resp.Message
+			if smsg.Sequence > watermark {
+				// Above this pass's entitlement: written after the enumeration took its
+				// watermark, so it is not ours to destroy. Left to the next teardown
+				// pass, the store path's reconcile, a later resume, or the orphan sweep.
+				continue
+			}
+			rec := &mqttInflightRecord{}
+			if uerr := json.Unmarshal(smsg.Data, rec); uerr != nil || !mqttInflightRecordIdentityOK(rec) {
+				return fmt.Errorf("in-flight register on %q at sequence %d for %q/%q is unreadable, "+
+					"so this teardown cannot prove what it would destroy: remove or repair that record",
+					subject, smsg.Sequence, idHash, gen)
+			}
+			// The identity that authorizes this deletion is the incarnation the subject
+			// names, which is what the enumeration filtered on — so a record whose own
+			// body disagrees with its subject is refused rather than deleted.
+			name, perr := mqttParseInflightSubject(subject)
+			if perr != nil || name.gen != gen || name.idHash != idHash {
+				return fmt.Errorf("in-flight register subject %q does not name incarnation %q/%q: %v",
+					subject, idHash, gen, perr)
+			}
+			// And the body must agree with the subject, at least as strictly as recovery
+			// requires. A destructive path may not be more permissive than the reader.
+			if rec.PI != name.pi {
+				return fmt.Errorf("in-flight register on %q at sequence %d names packet identifier "+
+					"%d, which that subject does not: remove or repair that record",
+					subject, smsg.Sequence, rec.PI)
+			}
+			doomed = append(doomed, smsg.Sequence)
+		}
+	}
+	return as.deleteInflightRegistersPipelined(doomed)
+}
+
+// mqttInflightReapConcurrency bounds the reap's in-flight confirmed deletes.
+//
+// One incarnation may hold up to 65_535 registers, and a confirmed delete is a round trip
+// with retries. Issuing them serially is the shape inflight_register.go's own resume walk
+// forbids for exactly this reason — "a per-record round trip would put tens of thousands of
+// serial requests in front of every reconnect" — and the teardown path is no more able to
+// absorb that than the CONNECT path is. Named rather than inline so the cost is a decision
+// with a place to argue about it, and kept beside mqttInflightLoadBatch, which bounds the
+// same pass's reads.
+const mqttInflightReapConcurrency = 16
+
+// deleteInflightRegistersPipelined issues confirmed deletes under a bounded concurrency
+// cap and AGGREGATES failures rather than stopping at the first.
+//
+// Aggregation matters for the caller's contract: the teardown must not release the record
+// while ANY register of unknown status remains, so a partial pass has to report that it was
+// partial. Progress is still real — every delete that landed stays landed. Whether anything
+// re-enumerates the survivors is the CALLER's property, not this function's: a marked record
+// anchors a retry, and clear()'s no-record branch has no marker to anchor one.
+func (as *mqttAccountSessionManager) deleteInflightRegistersPipelined(seqs []uint64) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		failed int
+		first  error
+	)
+	sem := make(chan struct{}, mqttInflightReapConcurrency)
+	for _, seq := range seqs {
+		seq := seq
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := as.deleteInflightRegisterConfirmed(seq); err != nil {
+				mu.Lock()
+				failed++
+				if first == nil {
+					first = fmt.Errorf("deleting the in-flight register at sequence %d: %w", seq, err)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if failed > 0 {
+		return fmt.Errorf("%d of %d outbound in-flight register deletions failed; first: %w",
+			failed, len(seqs), first)
+	}
+	return nil
 }
 
 // deleteInflightRegisterConfirmed removes a register at its exact sequence and WAITS for
@@ -1107,6 +1591,14 @@ func (sess *mqttSession) markInflightRegisterRetired(c *client, pi uint16, dur s
 			// The subject is empty. Nothing left to mark, and nothing can read an absent
 			// register as an owed delivery either, so the window is closed by absence.
 			return 0, true
+		case cur != nil && !mqttInflightRecordMatchesSubject(cur, subject):
+			// Before the nonce is consulted at all: a body naming another identifier is
+			// what recovery calls unreadable, and every arm below is destructive of it —
+			// the retired fast path answers for it, and the replace arm OVERWRITES it.
+			// Fail closed, which here means the caller keeps its PUBREL.
+			c.Warnf("MQTT: cannot retire the in-flight register on %q for client %q: the record there "+
+				"names a different packet identifier", subject, sess.id)
+			return 0, false
 		case cur != nil && cur.Nonce == nonce && !sess.ownsSharedInflightRegister(dur, cur.Claim):
 			sess.abandonForeignSharedInflightRegister(c, dur, nonce, subject)
 			return 0, false
@@ -1116,9 +1608,17 @@ func (sess *mqttSession) markInflightRegisterRetired(c *client, pi uint16, dur s
 		case cur != nil && cur.Nonce == nonce:
 			expectSeq = smsg.Sequence // our record, moved: retry the CAS against it
 		default:
-			// A foreign or unreadable record holds the subject, so this register is gone
-			// and cannot be marked. Not a hazard by itself — an unreadable register is
-			// itself treated as unaccountable on resume — but not a success either.
+			// A FOREIGN record (readable, another exchange's) or an UNREADABLE one
+			// (loadInflightRecord's second outcome) holds the subject. The two are
+			// different facts and this arm deliberately does not distinguish them,
+			// because the disposition is the same and fail-closed for both: no
+			// retirement is claimed, so the caller keeps its PUBREL.
+			//
+			// Stated explicitly because the equivalent arm in markInflightRegisterCancelled
+			// returns SUCCESS, and review found that unsound for the unreadable half —
+			// "our register is gone" is a positive conclusion, and a failed read licenses
+			// no positive conclusion. Here nothing positive is concluded, so the two
+			// outcomes may share an arm.
 			c.Warnf("MQTT: cannot retire the in-flight register on %q for client %q: it no longer holds our record",
 				subject, sess.id)
 			return 0, false
@@ -1213,6 +1713,34 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		switch {
 		case smsg == nil:
 			return nil // gone: the delete landed after all, which is the better outcome
+		case cur == nil:
+			// PRESENT BUT UNREADABLE — loadInflightRecord's second outcome, which is a
+			// definite fact about the record and not an indeterminate read.
+			//
+			// The `default` arm below concludes "our register is gone" and reports
+			// SUCCESS. For a FOREIGN readable record that is sound: something else
+			// demonstrably occupies the subject. For an unreadable one it is a positive
+			// claim drawn from a read that failed, and its cost is real — the caller
+			// forgets the nonce verdict and goes on to destroy the consumer, so nothing
+			// anywhere records that this delivery was never transmitted, while the record
+			// still occupies the identifier. Review of F-034 found this arm reporting
+			// success; the release and the store already fail closed here.
+			return fmt.Errorf("an unreadable record occupies %q at sequence %d", subject, smsg.Sequence)
+		case !mqttInflightRecordMatchesSubject(cur, subject):
+			// Unreadable by recovery's own rule, and the arms below would either claim
+			// this cancellation resolved or overwrite the record to make it so.
+			//
+			// An ERROR rather than the `default` arm's nil, and deliberately BEFORE the
+			// nonce is consulted. `default` concludes "our register is gone" from a
+			// foreign record, which is sound only for a record that can be READ — and a
+			// body naming another identifier is exactly what the reader refuses to
+			// interpret, whosever nonce it carries. Concluding anything positive from it
+			// would be a claim built on state this broker cannot interpret.
+			//
+			// Failing closed costs nothing here: both callers answer an error by
+			// recording the nonce verdict on the session record, which is the same fact
+			// this write was for, on a rung this subject cannot corrupt.
+			return fmt.Errorf("packet identifier %d is held by a record naming another identifier on %q", pi, subject)
 		case cur != nil && cur.Nonce == nonce && !sess.ownsSharedInflightRegister(jsDur, cur.Claim):
 			sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject)
 			return nil
@@ -1221,7 +1749,10 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		case cur != nil && cur.Nonce == nonce:
 			expectSeq = smsg.Sequence
 		default:
-			// A foreign or unreadable record holds the subject, so our register is gone.
+			// A FOREIGN record holds the subject: readable, and naming another exchange.
+			// Our register is gone, and this arm is reached only for that case — the
+			// UNREADABLE outcome is answered above, because "our register is gone" is a
+			// positive conclusion and a failed read licenses none.
 			return nil
 		}
 	}
@@ -1389,7 +1920,10 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 // settles, and a withheld marker keeps the eventual first transmission at DUP=0 if this packet
 // rolls back ([MQTT-3.3.1-1]) — and its cancellation is returned so a tombstone can be written
 // promptly. A TRANSMITTED delivery's register needs none of that: its entry is left for the
-// teardown's purge to remove, exactly as before, and only the verdict is recorded.
+// teardown's REAP to remove, and only the verdict is recorded. Since F-034 that removal is
+// no longer unconditional — the reap spares records above its enumeration watermark and
+// refuses outright on an unreadable one — so what is guaranteed here is that nothing is
+// destroyed by leaving it, not that the teardown will certainly free it.
 //
 // The verdict is keyed by the register's NONCE, and that is the whole point. A durable-scoped
 // verdict cannot work: shared group durables are named deterministically, so the same name
@@ -1428,7 +1962,10 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCance
 		}
 		if !ack.regPending {
 			// Transmitted: the register exists (or is being deleted) and its identifier is
-			// about to be freed by the purge. Record the verdict and leave the rest alone.
+			// the teardown reap's to free — which since F-034 it may decline to do, sparing
+			// an above-watermark record or refusing on an unreadable one. Record the verdict
+			// and leave the rest alone; the verdict is what a later reader needs, and it does
+			// not depend on the removal having happened.
 			sess.voidRegNonceLocked(ack.regNonce)
 			transmitted = append(transmitted, ack.regNonce)
 			continue
@@ -1802,6 +2339,13 @@ func (sess *mqttSession) markInflightRegisterCancelledPending(c *client, rc mqtt
 		case smsg == nil:
 			expectSeq = 0
 			continue // raced away; retry the create
+		case cur != nil && !mqttInflightRecordMatchesSubject(cur, subject):
+			// The arms below would read a mismatched body as an authoritative tombstone,
+			// or select it for replacement — and on the success side the caller then
+			// FORGETS the nonce verdict, so the only remaining record of "never
+			// transmitted" would be discarded on the strength of a record recovery
+			// refuses to read. Fail closed; the caller leaves the cancellation owed.
+			return fmt.Errorf("packet identifier %d is held by a record naming another identifier on %q", rc.pi, subject)
 		case cur != nil && cur.Nonce == rc.nonce && !sess.ownsSharedInflightRegister(rc.durable, cur.Claim):
 			sess.abandonForeignSharedInflightRegister(c, rc.durable, rc.nonce, subject)
 			return nil
@@ -1810,9 +2354,10 @@ func (sess *mqttSession) markInflightRegisterCancelledPending(c *client, rc mqtt
 		case cur != nil && cur.Nonce == rc.nonce:
 			expectSeq = smsg.Sequence // the store landed; replace it at that sequence
 		default:
-			// Foreign or unreadable, and nothing here can say which of the two it is.
-			// Fail closed rather than overwrite a record that may belong to a delivery
-			// the client is holding.
+			// Foreign or unreadable, and nothing here can say which of the two it is —
+			// which costs nothing, because this arm concludes nothing positive. Fail
+			// closed rather than overwrite a record that may belong to a delivery the
+			// client is holding, and leave the cancellation owed.
 			return fmt.Errorf("packet identifier %d is held by another record on %q", rc.pi, subject)
 		}
 	}
@@ -2207,6 +2752,19 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		switch {
 		case smsg == nil:
 			continue // raced away; retry the create
+		case cur != nil && !mqttInflightRecordMatchesSubject(cur, subject):
+			// The occupant's body names a DIFFERENT packet identifier than this subject.
+			// Recovery classifies exactly this shape as unreadable and RESERVES the
+			// identifier; this path must not be more permissive, because every branch
+			// below either replaces or deletes on the strength of the body it just read.
+			// Erasing it here and then transmitting under this identifier is how a
+			// corrupted record becomes a reused identifier the client may still hold.
+			// Review of F-034 found this was the third such path.
+			c.Warnf("MQTT: refusing packet identifier %d for client %q: the record on %q at "+
+				"sequence %d names packet identifier %d, which that subject does not",
+				pi, sess.id, subject, smsg.Sequence, cur.PI)
+			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+			return false
 		case cur != nil && cur.Nonce == rec.Nonce && !sess.ownsSharedInflightRegister(jsDur, cur.Claim):
 			// The write belongs to this allocation, but a resumed peer has since
 			// claimed it. Learning that peer's sequence would let this stale object
@@ -2620,7 +3178,15 @@ func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecove
 						// The close's exact-sequence delete won. Absence is the durable
 						// decision and this identifier is free.
 						results[i].outcome = mqttInflightClaimClosed
-					case cur == nil || cur.Nonce != fr.rec.Nonce:
+					case cur == nil || cur.Nonce != fr.rec.Nonce ||
+						!mqttInflightRecordMatchesSubject(cur, subject):
+						// A body naming another identifier belongs in THIS arm, beside
+						// `cur == nil`, because that is what the reader makes of it: the
+						// scan at recoverInflightRegisters treats a subject/body PI
+						// disagreement as unreadable. Left to the arms below it would be
+						// taken for a close decision and DELETED, or for our own claim
+						// having landed. Opaque here reserves the identifier and destroys
+						// nothing, which is the same disposition the reader reaches.
 						results[i].reg.seq = smsg.Sequence
 					case cur.Cancelled:
 						// A matching-nonce tombstone is the close decision. Delete only
@@ -2939,27 +3505,8 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 		drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)] = append(
 			drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)], fr)
 	}
-	drainOwned := make(map[string]bool)
-	drainAmbiguous := make(map[string]bool)
 	sess.mu.Lock()
-	for key, group := range drainRegs {
-		fr := group[0]
-		d := sess.drainByDur[fr.rec.Dur]
-		if d == nil {
-			continue
-		}
-		st := d.seqs[fr.rec.Seq]
-		if st == nil || !st.claimed {
-			continue
-		}
-		if len(group) > 1 {
-			st.regSeq = 0
-			drainAmbiguous[key] = true
-			continue
-		}
-		st.regSeq = fr.seq
-		drainOwned[key] = true
-	}
+	drainOwned, drainAmbiguous := sess.recomputeDrainRegisterStateLocked(drainRegs)
 	sess.mu.Unlock()
 	for key := range drainAmbiguous {
 		group := drainRegs[key]
@@ -3554,10 +4101,14 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) error {
 // The list is derived from what THIS owner does, which is the doctrine every
 // validator here follows and the reason no two of these lists are the same: a
 // create-only CAS per identifier, a per-subject singleton, deletes at an exact
-// sequence, a filter purge per retiring incarnation, and a bounded forward walk. It
+// sequence, and a bounded forward walk. Since F-034 there is NO filter purge: the
+// teardown's per-incarnation purge was replaced by reapIncarnationRegisters, which
+// enumerates, loads, classifies and deletes at exact sequences — which is why
+// DenyPurge is a waiver here and not a rejection. It
 // therefore requires the CAS and acknowledgement semantics, and — unlike
-// $MQTT_teardown, which never removes anything — it requires deletion AND purging
-// to be permitted.
+// $MQTT_teardown, which never removes anything — it requires DELETION to be
+// permitted. Purging is not required and stopped being required with F-034: the
+// reap is the only remover left, and it deletes at exact sequences.
 //
 // It deliberately does NOT check ConsumerLimits.InactiveThreshold: nothing ever
 // creates a consumer on this stream, so a stream-forced consumer limit cannot affect
@@ -3608,9 +4159,13 @@ func validateInflightStream(si *StreamInfo, wantReplicas int) error {
 	if cfg.DenyDelete {
 		return fmt.Errorf("deny_delete is set: it blocks the exact-sequence delete every terminal path performs")
 	}
-	if cfg.DenyPurge {
-		return fmt.Errorf("deny_purge is set: it blocks the per-incarnation purge a session teardown performs")
-	}
+	// DenyPurge is deliberately NOT a prerequisite, and it stopped being one with F-034.
+	// The teardown's per-incarnation FILTER PURGE was replaced by reapIncarnationRegisters,
+	// which enumerates, loads, classifies and deletes at exact sequences — so DenyDelete
+	// above is the whole of what this owner needs. Refusing DenyPurge would reject a
+	// hardened stream this broker can now use, on the strength of a purge that no longer
+	// exists: the audit that removed the purge is the same one that must remove its
+	// prerequisite (feedback_delete_redundant_mechanisms).
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on register subjects would be parsed as records", cfg.SubjectDeleteMarkerTTL)
 	}

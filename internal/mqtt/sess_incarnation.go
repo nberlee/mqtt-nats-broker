@@ -251,11 +251,14 @@ func mqttQoS2HoldWalkFilter(idHash, gen string) string {
 //
 // That is the whole of the invariant. It is NOT that the subject is unused: a resume
 // preserves the generation, so a peer may still be serving the retiring incarnation and
-// using these very subjects. Whether a late write or delete costs anything HERE is
-// $MQTT_inflight's own consequence question — F-034, unaudited — and must not be assumed
-// harmless on the strength of the naming. See inflight_register.go, and F-062 for how the
-// same premise's cost on $MQTT_qos2in was paid: not by naming, but by bounding every hold
-// removal to what its remover could prove it was entitled to destroy.
+// using these very subjects. F-034 paid that cost the same way F-062 paid it on
+// $MQTT_qos2in — not by naming, but by BOUNDING every removal to what its remover could
+// prove it was entitled to destroy. The teardown's reap enumerates, loads, checks each
+// occupant's identity and deletes only at or below its own enumeration watermark; the
+// drain's release addresses a register by the subject its packet identifier names and
+// deletes only a matching occupant. What neither can arbitrate is a genuinely live owner
+// of the same register, which is F-036's predicate. So the naming here is still not the
+// safety argument — the bound is.
 func mqttInflightSubject(idHash, gen string, pi uint16) string {
 	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") +
 		"." + strconv.FormatUint(uint64(pi), 10)
@@ -263,7 +266,8 @@ func mqttInflightSubject(idHash, gen string, pi uint16) string {
 
 // mqttInflightWalkFilter returns the filter enumerating one incarnation's in-flight
 // registers, and only those: exactly one token past the generation. Used by the
-// resume barrier and by the teardown purge.
+// resume barrier and by the teardown's BOUNDED REAP — since F-034 there is no purge on
+// this stream; the reap enumerates with this filter and then deletes at exact sequences.
 func mqttInflightWalkFilter(idHash, gen string) string {
 	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") + ".*"
 }

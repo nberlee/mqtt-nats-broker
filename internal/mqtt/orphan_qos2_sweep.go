@@ -510,7 +510,7 @@ func (as *mqttAccountSessionManager) forgetIfQ2AffClaimGone(subject string) {
 // `discarded` marker purges to the fence THAT marker recorded, so a later exchange is
 // spared rather than destroyed — F-062 arm A2, which also states what a subject the first
 // run never reached does instead. The `$MQTT_inflight` purge in the same teardown stays
-// unbounded: F-034)
+// bounded since F-034 by the enumeration watermark of the pass that removes it)
 // reconciliation: both delete the same retired, generation-scoped names, one wins
 // the record delete, and the loser's classifying re-read reports released or
 // superseded.
@@ -1654,9 +1654,14 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 // consult that identifier space again. Absence here means absent from the complete
 // session walk and this broker's residents, in the bounded sense the file header defines
 // — which does not observe a session live on another broker whose record was removed, a
-// resume having preserved its generation. Whether deleting a register in THAT state costs
-// anything is $MQTT_inflight's own consequence question (F-034, unaudited) and is
-// deliberately not answered here.
+// resume having preserved its generation. F-034 AUDITED what deleting a register in that
+// state costs, and the answer splits: the deletion here is already conditioned on a
+// re-read at the exact candidate sequence, so it cannot destroy a REPLACEMENT — and F-034
+// refuted adding an identity comparison on top, because within one stream incarnation no
+// mismatching record can occupy the sequence being deleted, so the comparison could not be
+// mutation-proved. What remains is contention with a genuinely LIVE owner of the same
+// register, which naming cannot arbitrate: that is F-036's predicate, and this sweep's
+// share of it is recorded there rather than assumed away here.
 //
 // What it does share with every other class: absence is established by the complete
 // session walk rather than inferred from a partial one, and eligibility is a STABLE

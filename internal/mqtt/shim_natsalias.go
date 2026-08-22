@@ -41,6 +41,7 @@ type (
 	StoredMsg                   = server.StoredMsg
 	StreamConfig                = server.StreamConfig
 	StreamInfo                  = server.StreamInfo
+	StreamState                 = server.StreamState
 	StreamSource                = server.StreamSource
 	User                        = server.User
 )

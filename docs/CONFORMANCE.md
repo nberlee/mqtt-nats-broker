@@ -62,7 +62,12 @@ CI gates on *new* failures only:
   withheld delivery on its JetStream ack subject
   (`sess.deferredNaksLocked` → `jsa.sendMsg(subj, AckNak)`), forcing JetStream to
   redeliver within milliseconds instead of after the consumer's AckWait (default
-  30 s). Ordering is preserved (ascending stream sequence, [MQTT-4.6.0-1]) and
+  30 s). Ordering is preserved on THIS path (ascending stream sequence, Spec5 §4.6) — the
+  citation was [MQTT-4.6.0-1], which governs CLIENT retransmission rather than server
+  ordering, so it is corrected to the section; the claim is about the withheld-delivery NAK,
+  and it does **not**
+  extend to the affine shared-subscription path, where F-071 records an OPEN same-topic
+  ordering violation (see Known deviations) — and
   the redelivery is a first transmission (DUP=0, [MQTT-3.3.1-1]) since the
   withheld message was never sent. The same NAK path drains deferred deliveries
   on session resume (`resendPendingRedelivery`). Spec5 [4.9]. Tests:
@@ -190,6 +195,84 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 ## Known deviations
 
 All are tracked in `docs/ROADMAP.md`.
+
+### Outgoing DUP on a first transmission — OPEN, and NOT ACCEPTED
+
+**A defect, not a residual**, recorded here because this file otherwise reads as describing
+conformant PUBLISH flags. It is an **alpha blocker** (F-072) and the fix is owed.
+
+`trackPublish` derives the DUP flag from the **JetStream delivery count** (`dcount > 1` from
+`ackReplyInfo`), and that value reaches the wire unchanged via `mqttPubFlagDup`.
+MQTT-3.3.1-3 ties the outgoing DUP flag to whether **the outgoing PUBLISH** is a
+retransmission of that packet. A copy offered and refused *before* `trackPublish` — by the
+claim or materialization gate, or by the register gate that declines while a store is in
+flight — produced **no MQTT PUBLISH at all**, so the next offer is still a FIRST transmission
+and must carry DUP=0.
+
+Observed on the affine QoS 2 path: in a single-publisher capture of eight messages, seven
+arrived with DUP=1 on their **first** client-visible PUBLISH. Only the one delivered on its
+first JetStream offer carried DUP=0.
+
+The flag is wrong on the wire: conformance suites test it, packet captures mislead anyone
+reading them, and clients that are themselves non-conforming in this respect carry
+interoperability risk. It is **not** data loss for a conforming receiver — §3.3.1.1 says a
+receiver cannot assume DUP=1 means it has seen an earlier copy, and QoS 2 is protected by
+the packet-identifier exchange regardless. See
+[F-072](findings/release-investigations.md#f-072).
+
+### Same-topic ordering on the affine QoS 2 path — OPEN, and NOT ACCEPTED
+
+**This is a defect, not a residual.** It is recorded here because the rest of this file
+would otherwise read as claiming ordering the broker does not currently deliver, and
+because
+an account of conformance that omits a known client-visible violation is misleading.
+Nothing
+about this entry accepts the behaviour: it is an **alpha blocker** (F-071) and the fix is
+owed.
+
+Same-topic QoS 2 messages delivered to a member of a Shared Subscription through the affine
+path can reach the client **out of publication order**. This is **not** a bare MQTT
+violation: MQTT-4.6.0-5 is conditional on an *Ordered Topic*, MQTT-4.6.0-6 requires ordered
+treatment only for **Non-shared** Subscriptions, and §4.8.2 does not extend it to Shared
+Subscriptions. Nor does this file promise ordering globally — its only
+ordering statement is scoped to the Receive Maximum prompt-release path. What exists is an
+**INTENDED implementation property** in `docs/PORTING.md`, stated for EVERY path: each
+topic-filter+QoS stream is meant to ride "a single ordered carrier ... on a single dispatch
+goroutine". It sits under *Testing strategy*, justifying why three upstream ordering tests
+were rewritten, so it is load-bearing for those. The affine path adds a SECOND carrier —
+copies through a `$MQTT_Q2AFF_*` consumer on `$MQTT_out` — and so **violates the intention
+rather than being excluded from it.** The blocker status therefore rests on that property
+plus a judgement about acceptable broker behaviour, not on a specification requirement.
+
+Reproduced from a **SINGLE publishing Client on one connection**, each QoS 2 handshake
+completed before the next was sent — 2 inversions in 120 attempts under concurrent load. In
+both, exactly one arbitrary message was transmitted first with DUP=0 while every other
+followed in publication order with DUP=1. The evidence is the broker's own packet identifier,
+minted immediately before the synchronous register gate and enqueue, on a subscription
+`nats.go` dispatches with a single goroutine — so the harness cannot be the source.
+
+An earlier version of this entry rested on a capture whose eight messages came from eight
+DIFFERENT publishing Clients, which §4.6 does not order. That claim did not follow from its
+evidence and was withdrawn; the single-publisher reproduction above replaced it.
+
+Scope, as far as it is established: the affine shared-subscription delivery path. Not
+observed on plain subscriptions, and no claim is made either way about them. Rate is
+load-sensitive — 1 in 240 attempts under concurrent `full-suite` load, 0 in 40 unloaded,
+which does not establish that load is necessary.
+
+**Cause untested.** Three candidate mechanisms are already REFUTED — an AckWait
+redelivery,
+a fixture defect, and a register-store race between sibling callbacks — each by evidence
+in
+the tree. Since a subscription's callbacks are serialized, the reordering must already
+exist
+in the order JetStream OFFERS the copies. See
+[F-071](findings/release-investigations.md#f-071) before proposing a fourth, and do not
+weaken the ordering assertion that caught it.
+
+**A passing test suite means F-071 did not trigger in that run**, not that this deviation
+is
+closed.
 
 ### Shared-subscription QoS 2: affinity holds, against a non-atomic proof
 
@@ -354,10 +437,12 @@ existence to the acknowledgement that follows it. The interleaving, worked:
    `$MQTT_Q2AFF_<hash>_<gen>`. Interest retention takes the proven copy with it.
 4. The broker's `confirmAck` commits, irreversibly releasing the group source.
 
-**The window spans step 1 to step 4, and step 2 is part of it.** How much of step 2 depends
+**The window spans step 1 to step 4, and step 2 is part of it.** How much of step 2
+depends
 on the route, and only ONE route omits it entirely:
 
-- The contender's foreign-materialized arm never enters `materializeQ2AffCopy`, so its span
+- The contender's foreign-materialized arm never enters `materializeQ2AffCopy`, so its
+span
   really is the copy lookup and then the ack.
 - An owner re-verifying an already-`materialized` claim still calls `advanceQ2AffClaim`,
   which **loads the claim** before finding the phase unchanged and skipping the write. The
@@ -657,8 +742,10 @@ Residuals:
 - **An unaccountable identifier space withholds new QoS 1/2 deliveries rather than
   refusing the session.** If the durable identifier space cannot be fully accounted for
   on resume — the walk failed, a register's body is corrupt, two registers name one
-  delivery on different identifiers, or a register's affine QoS 2 pair is not PROVEN by its
-  own source (contradicted by it, or unprovable because the source could not be read or its
+  delivery on different identifiers, or a register's affine QoS 2 pair is not PROVEN by
+  its
+  own source (contradicted by it, or unprovable because the source could not be read or
+  its
   consumer is gone) — the session stops allocating identifiers until a
   later resume reads it cleanly: QoS 0 keeps flowing and reserved exchanges complete,
   but new QoS 1/2 deliveries are withheld and redelivered by AckWait. This is a
@@ -676,14 +763,17 @@ Residuals:
   subject it is may be live, and acknowledging the copy away would lose that message and
   leave its claim stranded without `AffineDone`.
 - **A copy the broker cannot act on yet is re-offered on a backoff, so a refusal costs
-  latency rather than throughput.** Every refusal on the session-affine QoS 2 delivery path
+  latency rather than throughput.** Every refusal on the session-affine QoS 2 delivery
+  path
   hands the copy back with a NAK carrying a delay that doubles from 100 ms to a 30-second
   cap, derived from JetStream's own delivery count for that message. The first retry is
   therefore prompt, which is what the ordinary case needs (a copy is stored before its
   claim records the phase, so a delivery can legitimately outrun that advance), and a
   refusal that persists — an unreadable or absent claim record, an unavailable backend —
-  settles at the cap instead of spinning. The cost is bounded added latency on a claim that
-  becomes actionable late: up to one cap interval per exchange, once the backoff has grown.
+  settles at the cap instead of spinning. The cost is bounded added latency on a claim
+  that
+  becomes actionable late: up to one cap interval per exchange, once the backoff has
+  grown.
   A plain NAK was measured at 9214 re-offers in ten seconds for one copy, which is the
   behaviour this replaces.
 - **A source acknowledgement that cannot be confirmed costs one discarded
@@ -789,10 +879,12 @@ Residuals:
     record still says `ExpiryInterval > 0` and `Clean = false`: a non-clean reconnect that
     meets the surviving record resumes a session the DISCONNECT ended and reports Session
     Present true, against Spec5 [3.1.2.11]. Same violation as the reconnect-race item in
-    `docs/ROADMAP.md` §0 but a different mechanism — that one is purely in-memory, this one
+    `docs/ROADMAP.md` §0 but a different mechanism — that one is purely in-memory, this
+    one
     is a durable record on a broker that may never have seen the DISCONNECT — and it has
     its own §0 bullet there. All three loss paths above reach it, the declined one without
-    any crash or takeover, so the deviation must not be described as crash-or-takeover-only.
+    any crash or takeover, so the deviation must not be described as
+    crash-or-takeover-only.
   - A crash in the CLEAN close's window leaves an expiry-0, `Clean = true` record with its
     consumers: nothing reaps it autonomously (the retry pass needs residency, the expiry
     sweep skips `ExpiryInterval == 0`, and the consumer sweep reads the record's consumers
@@ -817,11 +909,13 @@ Residuals:
   - A crash in the EXPIRY window can leave a finite record still saying
     `DisconnectedAt = 0` when the original disconnect save had failed, since that save is
     best-effort and the timer is armed regardless. An origin or standalone sweep may then
-    stamp a new, LATER disconnect time, and a clustered non-origin broker deliberately will
+    stamp a new, LATER disconnect time, and a clustered non-origin broker deliberately
+    will
     not — so if the origin never returns, the record can read as connected indefinitely.
     Pre-existing (the failed-disconnect-save residual), reachable through this window too.
   - A CONNECT refused this way asks the client to retry, and a crash after that rejection
-    still loses the memory-only continuations the rejection preserved. Strictly smaller than
+    still loses the memory-only continuations the rejection preserved. Strictly smaller
+    than
     the eviction it replaces, which lost them immediately.
 - **For a session whose ambiguity never resolves, the recovery holds the object and the
   record instead of reaping them.** The expiry sweep's fallback — stamp a disconnect time
@@ -835,7 +929,8 @@ Residuals:
   its subscriptions, consumers, drains, pending deliveries, retained continuations and
   its parked action; both
   the object and the record keep the referenced consumers out of the orphan sweep's reach;
-  and `reconcileResidentRecordState` performs a synchronous readback per unresolved candidate
+  and `reconcileResidentRecordState` performs a synchronous readback per unresolved
+  candidate
   with no budget, ahead of the expiry, orphan-consumer and orphan-QoS2 sweeps on the same
   goroutine, so N unresolved sessions delay those three by roughly N × the JetStream API
   timeout and make shutdown latency linear in the same walk. For a record carrying
@@ -1430,7 +1525,9 @@ What it does NOT do:
      clients; they are not a guard against permitted NATS publication.
   3. **Untouched**, and the reasons differ per stream — do not collapse them.
      **Deletes** carry no per-subject expectation, so no admission closure speaks about
-     them. **`$MQTT_inflight`** awaits its own consequence audit — F-034 — which is open.
+     them. **`$MQTT_inflight`'s ran (F-034, closed 2026-08-22)**: no lineage was needed
+     there either, and what it found instead was a reachable identity-confusion route,
+     remedied by identity conditioning plus bounded destruction.
      **`$MQTT_qos2assign`'s ran (F-033, closed 2026-08-18)**: every claim write is
      funnelled through one CAS helper that always emits its expectation, so it needed no
      lineage, and what it found instead was a source ack bound to a copy store that never
@@ -1793,9 +1890,10 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   change the stream-level admission and sequence mechanisms that refuse it.
 - **What the closure says nothing about.** `$MQTT_sess`, `$MQTT_qos2in`,
   `$MQTT_qos2assign` and `$MQTT_inflight`: the server mechanisms are stream-independent,
-  but each of those findings owns its own consequence. **F-034 stays open until it is
-  audited on its own terms.** F-032 has since been audited and closed, producing F-062,
-  which closed on 2026-08-18; F-033 has too, producing F-063, F-064, F-065 and F-066. It also
+  but each of those findings owns its own consequence, and **all of them have now been
+  audited on their own terms.** F-032 closed producing F-062, which closed on 2026-08-18;
+  F-033 closed producing F-063, F-064, F-065 and F-066; F-034 closed on 2026-08-22
+  producing F-067 and F-068. It also
   does not claim the two backstops below
   the proved mechanisms — an entry admitted anyway is discarded by apply-time log order,
   and beneath that by the store's refusal of any sequence that is not the next one — but
@@ -2399,17 +2497,43 @@ are not supported topologies.
 
 MQTT 3.1.1 / 5.0 [3.1.4]: if the Server does not receive a CONNECT Packet within a
 reasonable amount of time after the Network Connection is established, the Server
-SHOULD close the connection. The broker implements this SHOULD. A connection that
-sends nothing, or an incomplete CONNECT, is closed after `-connect-timeout`
+SHOULD close the connection. The broker's timer implements that SHOULD **for a connection
+that stays silent or incomplete** — the qualification matters, and the paragraphs below give
+the case it excludes. Such a connection is closed after `-connect-timeout`
 (default 5s, `MQTTNB_CONNECT_TIMEOUT`); the window is absolute rather than
 restarted per byte received, and the bound is fail-closed — a value of `0` or
 below is refused at startup rather than read as "unlimited". See
 `docs/ARCHITECTURE.md`, "Connection liveness bounds".
 
-The CONNECT that races the expiry is refused before any authentication is
-attempted, so a connection the deadline closed never dials a per-client NATS
-connection and never binds session state. CONNECT authentication itself is
-unchanged: credentials are still adjudicated by the configured client dialer.
+**If the expiry callback transitions the state before admission**, the racing CONNECT is
+refused before any authentication is attempted, so a connection the deadline closed never
+dials a per-client NATS connection and never binds session state. That conditional is
+load-bearing: the other order is reachable and is described below. CONNECT authentication
+itself is unchanged either way: credentials are still adjudicated by the configured client
+dialer.
+
+**What "closed after `-connect-timeout`" does and does not promise, since the two are easy
+to read as one.** The bound makes a silent connection's LIFETIME finite: the timer callback
+closes the socket whenever it is scheduled, so no such connection is held indefinitely, and
+that is the resource guarantee. It does **not** guarantee that a CONNECT arriving after the
+configured window is refused. The arbitration is a race between two facts under `c.mu` —
+the CONNECT arrived, or the deadline expired — and admission tests only whether the callback
+has ALREADY transitioned the state, never whether the window has elapsed. So a CONNECT that
+takes the mutex before a delayed callback does is admitted and served, and the effective
+admissibility bound is the configured value plus however late that callback is scheduled.
+
+**This is a known gap and it is NOT accepted**: an operator setting `-connect-timeout`
+reasonably expects the second promise as well as the first, and the fix is for admission to
+consult the elapsed window rather than the callback's state. Nor is the timeout a strict
+pre-authentication admission bound, which is the reading to guard against.
+
+On [3.1.4]: it is a SHOULD, and the timer generally implements it — a connection that
+stays silent is closed. **What is not claimed is that the late-admission case honours
+the configured window**: there the callback finds the CONNECT already admitted, does
+nothing, and the connection proceeds under the keep-alive rules instead — which are
+themselves no bound at all when the client negotiates Keep Alive 0, as the next residual
+states. So nothing closed it for exceeding the window. The finding specifying the fix is
+filed separately from the change that added this paragraph.
 
 **The residual is on the other side of CONNECT**, and it is pre-existing rather
 than introduced here: a client that completes CONNECT with **Keep Alive 0** is
@@ -2424,3 +2548,200 @@ This bound is not a denial-of-service defense and is not documented as one. It
 makes an idle connection's lifetime finite; a peer can still hold roughly
 `accept rate x window` connections open, and `-max-conns` remains the absolute
 cap.
+
+### The persisted-identity census is complete over a stated span, not over everything
+
+`docs/findings/persisted-identity-census.md` enumerates what durable state this bridge
+holds and which of its identities another stream issues, and eight tests enforce that
+enumeration rather than leaving it to care. What it claims is bounded, and the bound is
+stated here rather than left to be inferred:
+
+- **Mechanically enforced, over a derived type universe:** every field of every
+  persisted body type, plus `StreamConfig`, `ConsumerConfig`, `ConsumerInfo`,
+  `SequenceInfo` and the configuration types reachable from them — including unexported
+  fields, with each field's encoding recorded, and with the type universe DERIVED by a
+  recursive walk from the persisted roots rather than hand-listed. A type the walk stops
+  at must declare why.
+- **A drift GUARD, not a closure proof:** the interpretation surface, 161 sites derived
+  by parsing the package with `go/ast` and checked against the manifest in both
+  directions. Its root set is hand-maintained and it keys a site by unqualified function
+  name, so three kinds of drift still pass — a new branch or call inside an
+  already-named function, a new wrapper around the transport primitives, and a same-named
+  method on another receiver.
+- **Named and NOT enumerated field by field:** message headers and subjects. Three of
+  F-066's fourteen sample rows are deferred to named families, and the test requires a
+  deferral to carry its family and reason rather than allowing a row to be silently
+  absent.
+
+**So F-066's completeness deferral is NOT discharged**, and the census says so at its
+head rather than in a footnote. The plan's own rule is that an unproven closure class
+means claiming neither completeness nor that discharge, and the interpretation surface is
+such a class: a guard that catches real drift is not a proof that no drift is possible.
+F-066's remedy depends on the population, so it inherits the same bound.
+
+The reason for stopping there rather than claiming more is the history of this
+enumeration. Four earlier attempts were each falsified as a filter presented as a sweep,
+and two were refuted by an entry in the table they themselves introduced. A stated partial
+span that a test defends is worth more than a total claim that a fifth review round
+falsifies.
+
+### A session teardown fails closed on an unreadable in-flight register
+
+F-034 replaced the blind `$MQTT_inflight` filter purge at teardown with a pass that
+enumerates, loads, checks each occupant's identity, and deletes only at or below the
+watermark its own enumeration returned. That pass **cannot** proceed past a register it
+could not read, and the consequence is a deliberate liveness cost rather than an
+oversight.
+
+**What happens.** An unreadable or indeterminate register makes `deleteTeardownTargets`
+return an error, so the session record is **not released**. Every deletion that already
+landed stays landed, so progress is real.
+
+**Whether anything retries is BRANCH-SPECIFIC, and the table below is the statement of
+record.** On a record-backed teardown the generation-retirement watermark stands and the
+record stays marked, so a later attempt re-enumerates and finishes the remainder. On the
+**no-record** branch (`mqtt.go:9706`, `seq == 0`) there is no record and no marker to
+anchor anything: that branch returns before the claim, so nothing re-drives it and cleanup
+falls to the orphan sweep alone. An earlier draft of this passage said the marker stands
+and every caller retries, without that split; it was wrong for one of the three call sites
+and is corrected here.
+
+**Who is affected.** Every caller of that path: the ordinary discard, a teardown
+**adopted** from a broker that vanished, session **expiry**, and the **orphan sweep**'s
+reach into the same state. None of them completes a teardown on a state it could not read
+— which is the guarantee. Which of them can RETRY it is the separate question the second
+table answers.
+
+**And the wedge reaches the shared group durables too.** At all three call sites —
+`mqtt.go:9706` (no record), `mqtt.go:9794` (ordinary discard) and `sess_teardown.go:1052`
+(adopted teardown) — `deleteTeardownTargets` runs BEFORE `releaseSharedTeardownDurables`
+and its error arm returns immediately. The blind filter purge it replaced could not refuse,
+so this is new with F-034.
+
+Four earlier drafts of this passage each overstated something, so it is now a table of
+outcomes rather than prose. **What a refused reap leaves**, in the order
+`deleteTeardownTargets` performs it (`sess_teardown.go:730` onward):
+
+| Step, in order | On a refused reap |
+|---|---|
+| `$MQTT_msgs` subscription consumers | delete ISSUED; confirmed only when `noWait` is false |
+| the PUBREL consumer on `$MQTT_out` | delete ISSUED, same caveat |
+| affine assignment claims | `discardQ2AffClaimsFor` has marked them DISCARDED; the reap of each is conditional, so a discarded-but-retained claim can remain |
+| the affine consumer on `$MQTT_out` | delete ISSUED, same caveat |
+| inbound QoS 2 release claims | `arbitrateQoS2ReleaseClaims` has run and may deliberately leave a hold and claim for the orphan sweep |
+| **the register reap** | **REFUSES here — this is the abort point** |
+| the shared group durables | never reached on this attempt |
+
+**What can be retried, and by what.** This is where the drafts went wrong twice:
+
+| Call site | Marker/record after a refused reap | Adoption retry possible? |
+|---|---|---|
+| `mqtt.go:9706`, no record (`seq == 0`) | none exists — `releaseTeardown` is not part of this branch at all | **No.** Nothing anchors a retry; the orphan sweep is the only path |
+| `mqtt.go:9794`, ordinary discard | record and marker stand, since `releaseTeardown` was never reached | Yes |
+| `sess_teardown.go:1052`, adopted teardown | as above | Yes |
+
+**And a successful attempt is not atomic either.** `releaseTeardown` removes the record
+BEFORE the shared release loop runs, so if that loop deletes some durables and then fails,
+the marker is already gone and no adoption retry can re-run it — cleanup falls to the
+orphan-consumer sweep. A durable another member still holds is deliberately retained, not
+deleted: the last-holder scan decides, and for a group with other members the answer is to
+keep it. An earlier draft's "released once the register can be read" was simply wrong.
+
+**The cost, stated.** If the register is *permanently* unreadable — a shape no broker in
+this tree writes, which is what makes it unreadable — that client ID's teardown never
+completes on its own. The record stays marked, the client's next CONNECT is refused
+rather than resumed hollow, and **automatic convergence is impossible until an operator
+removes or repairs the record**. The diagnostic names the stream, the subject and the
+sequence for exactly that purpose.
+
+**Why this is the right trade.** The alternative is releasing the session record while a
+register of unknown status remains, which asserts that nothing is in flight on the
+strength of a read that failed, and which can free a packet identifier the client is
+still holding. A refusal an operator can see and repair is preferable to a silent loss,
+and it is the posture this tree already takes toward a persisted shape it cannot
+interpret (F-056, F-057, F-058).
+
+### A drain interrupted by its own session's clear withholds that completion
+
+The drain's finalizer captures its drain and sequence, then does JetStream work to release
+the delivery's in-flight register. A `clear()` landing in that window — a discard, an expiry,
+a takeover — retires the incarnation the captured state belongs to, and the finalizer refuses
+rather than carrying a retired delivery's decisions forward.
+
+Two refusals, and they are visibly different to an operator:
+
+- **Before the release**, the finalize simply reports the delivery as not its own,
+exactly as it does for a drain it never had. Nothing is logged, because nothing was
+attempted. - **After the release but before the save**, it logs *"withholding the
+completion of drained sequence N ... the session was cleared while its in-flight
+register was being released"* and leaves the source unacknowledged. The register release
+already happened and is not undone; what is withheld is the claim removal and the
+acknowledgement.
+
+**The cost** is that the source message stays pending and is redelivered. The retired
+incarnation's own claim state is left untouched, so nothing about the fresh session is
+disturbed. That is strictly better than the alternative the second refusal exists to prevent:
+saving a retired delivery's decisions into a fresh incarnation's record.
+
+**What neither refusal covers** is a genuinely live owner of the same register on another
+broker — naming cannot separate that actor from this one, and it stays F-036's predicate.
+
+### A drained delivery with duplicate in-flight registers does not complete
+
+When recovery finds MORE THAN ONE `$MQTT_inflight` register naming one drained delivery on
+different packet identifiers, which one the client holds is unknowable — a stream sequence
+orders the writes and not the sends. The pre-existing posture is that all such registers are
+reserved, none is released, and new outbound QoS 1/2 allocation is withheld for the session.
+
+F-034 adds one thing: the drain no longer **finalizes over** that state. It previously
+removed its claim and acknowledged the source while both registers survived behind a
+consumer about to be deleted, which stranded them and reserved their identifiers for the
+life of the session. Now the delivery is withheld instead.
+
+**Convergence is at the next resume, not mid-connection.** The ambiguity is an observation
+rather than a latch: it is not persisted, and every complete recovery scan recomputes it
+over all claimed entries — clearing first, so a pair that has since vanished entirely does
+not leave it standing. Nor does it clear on group SIZE: a scan finding exactly one
+surviving register clears the ambiguity only when that register is on the identifier this
+delivery addresses. A lone survivor on a DIFFERENT identifier leaves the delivery withheld,
+because it does not say which identifier the client holds — which is the same fact the
+duplicate pair recorded. A session that never resumes stays degraded, which is the same bound
+`piSpaceIncomplete` already carries for the same underlying state: that flag too is cleared
+only by "the next resume that completes its scans and finds nothing unaccountable".
+
+So the cost is one drained exchange that does not complete until the session resumes, on a
+session the broker has already declared unable to allocate. The alternative — completing it
+— is a false completion, and it is what F-034 removed.
+
+### An in-flight register that names another identifier is refused, never rewritten
+
+`$MQTT_inflight` addresses a register by the packet identifier its subject names, and
+recovery treats a record whose BODY names a different one as unreadable: the identifier is
+reserved and the record is kept. Since F-034, every path that reads a register and then
+destroys it — by delete OR by overwrite — is at least as strict. That closes a route by
+which a record the reader deliberately preserves could be replaced with a valid tombstone
+for the subject's own identifier, which a later resume would read as free.
+
+No broker in this tree writes a register of that shape, which is exactly why meeting one
+is treated as uninterpretable state rather than repaired. What an operator would see:
+
+- **A QoS 2 retirement cannot be recorded**, so the exchange's PUBREL is kept rather than
+  acknowledged away. The exchange stays recoverable and a restart re-reads it as past
+  PUBREC — the outcome a lost retirement is already designed for.
+- **A cancellation tombstone cannot be written**, so the fact that the delivery was never
+  transmitted is recorded on the session record's nonce verdict instead. That rung is
+  sufficient: a later resume still knows not to treat the identifier as an owed delivery.
+  If neither rung lands, the identifier stays reserved for the life of the session, which
+  is the pre-existing cost of an unproven cancellation. The same holds for a record that is
+  present but UNREADABLE, and for the same reason — a read that failed licenses no
+  conclusion that the register is gone.
+- **A resume reserves the identifier rather than claiming or closing it.** The reservation
+  is per identifier, not a session-wide withholding: allocation continues around it. What
+  is also withheld is the SOURCE — an unclaimed member poisons its whole source group, so
+  no member is installed and the source gets no pending mapping, because resolving a
+  duplicate by installing its sibling is exactly the guess the grouping refuses to make.
+  A later resume that reads the register cleanly settles it.
+
+Each of these is a liveness cost on one identifier or one session, accepted for the same
+reason as the teardown refusal above: releasing an identifier on the strength of a record
+that could not be read is a silent loss, and a refusal an operator can see is not.
