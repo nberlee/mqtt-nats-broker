@@ -1501,9 +1501,12 @@ branches of one generation can hold different configs for one durable. Nothing e
 carried — `Will`, `ExpiryInterval`, `DisconnectedAt` and `Clean` are per-connection terms
 the reconnecting CONNECT establishes, `Origin`/`ID` are identity, `Gen`/`WID`/`PWID` are
 the anchor, `Q2Aff*` belongs to the affine path's own reclaim, `Teardown` is a marker, and
-`SharedSubs` is excluded pending F-050 (the success CONNACK precedes shared restoration,
-so a re-asserted group membership would be durable while a per-filter failure leaves no
-join and no consumer — the accepted-but-dead state F-050 records).
+`SharedSubs` is excluded. **The ordering that forced that exclusion is gone**: F-050
+moved subscription restoration before the success CONNACK, so a per-filter failure
+now refuses the CONNECT instead of leaving a durable membership with no join and no
+consumer. Widening the repair set to shared membership is F-027's own work and has
+its own roadmap bullet; until it lands the exclusion stands as a choice rather than
+a consequence.
 
 **Seven mint sites, at the point the verdict is MADE.** Every disposition arm returns
 after its record transaction is released, so minting at the classification point is what
@@ -2911,23 +2914,142 @@ The pass:
    rule closes. The phase gate is released last, in the same critical section,
    so every delivery parked on it wakes, re-reads the fields just written, and
    goes out under this filter's live options.
-6. **Sweep what restoration did not adopt.** Restoration can legitimately skip
-   a collected filter after the CONNACK (a PUBREL setup failure fails a QoS 2
-   filter; a raw-subscription failure continues) while the connection stays
-   live — and nothing else would ever remove that subscription: it would sit
-   closed forever, holding consumer interest, and a later re-SUBSCRIBE's
-   metadata refresh does not clear `closed`. So still-phase-owned
-   subscriptions are swept immediately after `processSubs` (before its error
-   is even tested), and an idempotent deferred fallback covers the exits that
-   never reach it (the CONNACK write failure, the 3.1.1 forced-leave failure
-   returns). Every reclamation path — the sweep and the phase's own undo —
-   releases the gate **before** unsubscribing, so a parked delivery wakes,
-   finds the subscription still closed, and skips instead of waiting out the
-   bound. A swept filter stays unavailable until the next CONNECT.
+6. **Sweep what restoration did not adopt** — and note that F-050 emptied this
+   step's population. It was written for a filter restoration skipped *after* the
+   CONNACK while the connection stayed live, which nothing else would ever
+   reclaim: the subscription would sit closed forever holding consumer interest,
+   and a later re-SUBSCRIBE's metadata refresh does not clear `closed`. **That
+   state is no longer reachable for a supported record.** Restoration now runs
+   before the CONNACK and a filter it cannot install refuses the CONNECT, so an
+   unadopted collected filter always ends in a refusal and a teardown rather than
+   a live connection. The sweep is retained as the reclaimer of last resort — it
+   still runs immediately after `processSubs`, before its error is tested, with an
+   idempotent deferred fallback for the exits that never reach it — but it is now
+   belt-and-braces rather than the only thing standing between a skipped filter
+   and permanent dead interest. The phase's own `undo` is unaffected and remains
+   live. Every reclamation path releases the gate **before** unsubscribing, so a
+   parked delivery wakes, finds the subscription still closed, and skips instead
+   of waiting out the bound.
+
+## The restore gate: the CONNACK follows a complete restoration
+
+A resuming CONNECT used to acknowledge the session with Session Present = 1 and
+only **then** restore the subscriptions its record names. On that path there is no
+SUBACK, `sess.update` is skipped, and a per-filter failure only sets a local
+result and continues — so the failure reached nobody. The record kept the
+membership, no queue subscription and no group consumer existed, and a client that
+is not required to re-subscribe waited forever (F-050).
+
+**Restoration therefore runs BEFORE the CONNACK, and a filter it cannot install
+refuses the CONNECT** through the same abort discipline the section below
+describes. Five exits are reachable while restoring a saved filter — the PUBREL
+consumer, the session-affine QoS 2 consumer, the raw subject subscription, the
+plain or group JetStream consumer, and the level-up companion of the last two —
+and `processSubs` already records each outcome in the filter itself, because on a
+SUBSCRIBE those bytes become the SUBACK. `mqttFirstUnrestoredFilter` reads that
+value; it is **local failure aggregation and nothing more**. It does not arbitrate
+ownership, does not prove this broker still owns the record, does not prove a
+group durable exists, and does not prove an installed subscription yields
+end-to-end delivery. What it proves is that no step of this restoration reported
+failure, which is what the CONNACK is about to claim.
+
+One unrestored filter refuses the whole CONNECT: there is no packet on this path
+that could say *which* filter died, which is the finding. A v5 connection is told
+the reason (0x83, with the filter named) because that refusal is the first packet
+and a filter that can never be restored — a subscribe permission revoked since it
+was saved is the reachable case — would otherwise be an endless silent close with
+no hint that a clean start is the recovery. A 3.1.1 connection has no reason code
+above 5 and gets the bare close. The other pre-CONNACK refusals still close
+silently; generalising the signal is its own roadmap item.
+
+**The reorder needs one new fact, and it is a property of the CONNECTION.**
+[MQTT-3.2.0-1] makes the CONNACK the first packet a client sees, and restoration
+installs live delivery interest, so something must withhold transmission until the
+CONNACK is written. That something cannot be per-subscription, for two structural
+reasons: a per-subscription flag cannot be armed before the subscription exists —
+`ensurePubRelConsumerSubscription` uses a bare `c.processSub`, whose NATS handler
+goes live *before* `processSub` returns, so a stored PUBREL can enter its callback
+with no metadata attached at all — and a per-subscription gate that has been
+released is indistinguishable from one that never existed, so a refusal cannot
+express "woken, and still not allowed out" that way.
+
+So the fact is one atomically-published verdict on the session
+(`sess_restore_gate.go`), consulted by every delivery callback **before** it
+touches `sub.mqtt`:
+
+- **armed**, unconditionally on every accepted CONNECT — clean start, cleared
+  session and zero-filter resume included — before the first subscription the
+  CONNECT installs, which is before the reconciliation phase rather than merely
+  before restoration. **Both the earliness and the unconditionality are defence in
+  depth**, and neither is a proved behaviour: the phase's own subscriptions are
+  installed closed behind their own gate, and a mutation making the arm conditional
+  on the record naming a filter survives, because a refusal leaves the record's
+  filters exactly as it found them so the CONNECT after one always has some. They
+  are kept so no future path has to re-derive either argument.
+- **opened** immediately after a confirmed success CONNACK. `opened` is stored
+  strictly before the channel closes, so a waiter released by that close reads the
+  final value rather than racing it.
+- **abandoned** on every refusal, before the client detaches. The verdict is
+  **not cleared**: a delivery arriving after the abandon must still be blocked,
+  and the abort helper deliberately leaves `c.mqtt.sess` in place, so `sess.c`
+  still names this connection. Waking the waiters is what lets a withheld QoS 1/2
+  delivery record itself as never transmitted instead of waiting out its whole
+  bound — but that recording is **best-effort across a rebind, deliberately**. The
+  marker is scoped to the connection that withheld the delivery, and the refusal
+  returns and releases the ownership gate, so a reconnect can bind first and leave
+  the woken callback stale. Two remedies were built and withdrawn (a drain, which
+  cannot be an admission barrier, and a durable-scoped predicate, which removes the
+  race but not the lateness); HEAD already treats this boundary the same way. The
+  consequence — a lost prompt NAK, and DUP on a first sight — is stated in
+  `docs/CONFORMANCE.md`, with the DUP derivation itself belonging to F-072.
+
+Both terminal transitions are CAS-guarded. They are exclusive today; the guard is
+what keeps that from being an invariant a later caller can break with a
+double close, which panics the process.
+
+The four delivery callbacks, and why they differ:
+
+| Callback | Disposition while the verdict is armed and not opened |
+|---|---|
+| `mqttDeliverMsgCbQoS12` | **waits**, bounded by the same deadline the reconciliation gate uses; a withheld delivery is recorded — **when the connection that withheld it is still the session's**, which is best-effort across a rebind (above) — so the attempt that finally goes out is a first transmission ([MQTT-3.3.1-1]) and a freed slot can NAK it forward. The recording is shared with the reconciliation phase's own gate through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
+| `mqttDeliverMsgCbQoS0` | **drops.** QoS 0 has no redelivery, so parking a NATS delivery goroutine on an MQTT handshake would buy nothing |
+| `mqttDeliverPubRelCb` | **waits**, then disposes by WHY the wait ended. A refusal returns silently, so JetStream redelivers on its own schedule and nothing spins against a session with no client. A TIMEOUT **NAKs**: the bound is min(AckWait, cap), so with AckWait above the cap the wait ends long before any redelivery would, and a PUBREL carries no withheld marker — without the NAK an owed one sits unsent for the rest of that AckWait on a resume that SUCCEEDED. PUBREL carries no DUP ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing further is owed |
+| `mqttDeliverQ2AffineCb` | **waits**, then disposes by why the wait ended, exactly as PUBREL does above: silent on a refusal, **NAK** on a timeout. The NAK matters most for a copy that was materialized and never delivered — absent from the resume's pending snapshot, so nothing else re-drives it. No withheld bookkeeping: the affine path derives DUP from the JetStream delivery count, which is F-072's open defect, and a copy refused here before `trackPublish` is exactly that finding's population. Waiting is what keeps the ordinary case out of it |
+
+Two orderings around it are load-bearing. The **grant point** moves after
+restoration, because its own rule is that the requested Session Expiry Interval
+and Clean flag are applied only once everything that can refuse the CONNECT has
+passed — restoration is now one of those things, and a granted interval of 0 on a
+CONNECT that is then refused would have the close path discard a persistent
+session. And the **3.1.1 forced leave** stays *after* the CONNACK, so the
+pre-CONNACK restore must exclude shared filters for a non-v5 connection
+explicitly; the old code achieved that by ordering alone. Provisioning an affine
+consumer, a PUBREL consumer and a group join for memberships the forced leave then
+removes is what that exclusion prevents.
+
+**What a restore-path failure no longer destroys.** A per-filter failure used to
+reach `cleanupFailedSub`, which for a plain filter whose level-up companion failed
+after the main half succeeded deleted a durable the session record still names.
+That was survivable while the CONNECT was accepted anyway — the next resume's
+reconciliation repaired it — and it is the wrong disposition for a refused
+CONNECT, whose record still references that durable and whose backlog is retained
+by its interest. On the restore path the cleanup is now the connection-local
+subscriptions alone. What the connection did add to `tmaxack` is refunded per
+filter, from the amount each group join **reported**: the config comes back
+whether a call charged it or reused a resident entry, so refunding by durable
+would erase an earlier connection's charge and leave the accounting permanently
+short.
+
+The reconciliation phase below needs **no** change for any of this, which is worth
+stating: its `phaseOwned`/`closed`/`phaseGate` triple keeps its own meaning, its
+adoption still clears `closed` and releases its own gate, and
+`sweepUnadoptedPhaseSubs` still keys on `phaseOwned` alone. A delivery that wakes
+from the phase's gate simply meets the connection's verdict next.
 
 **Pre-CONNACK abort discipline.** Every post-bind failure exit before a
 confirmed success CONNACK — the register-recovery error, the reconciliation
-refusals, the lifetime-grant failure below, the CONNACK size/write failure
+refusals, **the restoration refusals above**, the lifetime-grant failure below,
+the CONNACK size/write failure
 (`sendConnAck` now surfaces its write error, so "a success CONNACK was written"
 is a checked fact) — goes through one abort helper that discards this
 connection's Will and clears the parser's pre-CONNACK connected flag. Without

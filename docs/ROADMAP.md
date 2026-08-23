@@ -758,14 +758,44 @@ further findings it surfaced are filed separately, for the reason its own bullet
   the durable is gone; once the consumer exists — including after on-behalf restoration
   recreated it for some other claim — the same absent copy resolves `Complete` and the
   register is dropped, destroying the only record joining the PUBREL's `(Dur, Seq)` to
-  the claim. - [ ] **A saved shared filter that fails restoration at CONNECT is silently
-  dropped.** Pre-existing and unrelated to F-064, which only declined to enlarge it.
-  There is no SUBACK on the CONNECT restoration path: the success CONNACK precedes it, a
-  per-filter failure only sets a local result and continues, the installation pass skips
-  it, and the error never reaches the caller. The client holds a Session-Present
-  connection whose subscription delivers nothing. Any fix must weigh what the F-064
-  review established: the obvious remedy, failing the CONNECT, is ungraceful and
-  therefore publishes the Will and can delete a zero-expiry session. - [x] [F-065:
+  the claim. - [x] **A saved shared filter that fails restoration at CONNECT is silently
+  dropped.** **This was F-050 filed twice** — same mechanism, same consequence, same
+  dossier — and closing it ticks both boxes; see §0.3's F-050 entry for what landed.
+  Kept here rather than deleted because this filing is the one that carried the F-064
+  review's constraint on any fix: failing the CONNECT *after* the CONNACK is ungraceful,
+  so it publishes the Will and can delete a zero-expiry session. The remedy respects that
+  by not acknowledging at all — restoration moved BEFORE the CONNACK, where the existing
+  pre-CONNACK abort discipline already discards the Will and leaves the lifetime
+  ungranted. - [ ] **Prove a shared group durable exists when a resume restores its
+  membership.** Surfaced by F-050's plan review, which falsified the obvious remedy.
+  `processSharedJSConsumer`'s resume fall-through subscribes to the recorded deliver
+  subject and stops, so a group durable deleted out of band — a concurrent leaver's
+  last-holder race, an operator, an account reset — leaves a live subscription on a
+  subject nothing publishes to, with no error anywhere. It is NOT F-050's: F-050 is about
+  a per-filter FAILURE being dropped, and this reaches the same accepted-but-dead state
+  with no failure at all. **The obvious fix is refuted**: shared consumer configurations
+  are deliberately not persisted (`SharedSubs` is the authority and group-owned configs
+  are filtered out of `Cons`), so the fall-through's `cc` is a stale in-memory config from
+  an earlier join, and re-issuing it with `ActionCreateOrUpdate` would overwrite a live
+  group durable's `AckWait`/`MaxAckPending`/storage **for every other member**. A remedy
+  must derive a canonical current configuration, separate "present and valid" from
+  "authoritatively absent, recreate", and answer what a stale broker recreating the
+  durable after a newer owner removed the membership does. This is why F-050 does not
+  claim to prove an end-to-end delivery path. - [ ] **The 3.1.1 forced leave's
+  post-CONNACK destructive exit.** Also surfaced by F-050's review, and deliberately not
+  folded into it. The forced leave removes a resuming 3.1.1 client's persisted shared
+  memberships and releases their group consumers, and it runs AFTER the success CONNACK;
+  its save failure returns an error there, so the client holds an acknowledged session and
+  a closed connection. Moving it before the CONNACK was tried in F-050's plan and
+  refuted: it converts an UNACKNOWLEDGED CONNECT attempt into a permanent destructive
+  mutation of session state, which is strictly worse. It is none of F-050's five restore
+  exits. - [ ] **Generalise the pre-CONNACK refusal signal.** F-050 tells a v5 client why
+  its restoration refused the CONNECT (0x83, naming the filter), because a permanently
+  unrestorable filter would otherwise be an endless silent close with no hint that a clean
+  start is the recovery. The other pre-CONNACK refusals — register recovery, the
+  reconciliation verdicts, the lifetime grant — still close silently. **F-061 does not own
+  this**: it is specifically the authorization path, and F-050's review corrected an
+  earlier draft that attributed general failure signalling to it. **Small.** - [x] [F-065:
   Re-read copy absence after the reaper's own SourceAcked
   transition](findings/ha-arbitration.md#f-065). **Alpha blocker — done, with the stated
   guarantee RE-SCOPED** (the same shape as F-063's), which is what the tick rests on.
@@ -1102,9 +1132,54 @@ takeover.
   `sharedSubs` restoration, not a JetStream CAS failure.
 - [ ] [F-045: Release stranded shared pending state at membership removal](findings/runtime-correctness.md#f-045).
   **Medium.**
-- [ ] [F-050: Refuse or retry an incomplete shared-subscription restore](findings/shared-qos2.md#f-050).
-  **Medium.** CONNECT must not report a resumable session whose delivery path was
-  not restored.
+- [x] [F-050: Refuse or retry an incomplete shared-subscription restore](findings/shared-qos2.md#f-050).
+  **Closed 2026-08-23 by refusing, not retrying.** CONNECT no longer reports a resumable
+  session whose delivery path was not restored: subscription restoration runs BEFORE the
+  success CONNACK, and a filter it cannot install refuses the CONNECT through the abort
+  discipline that already discards the Will and leaves the requested lifetime ungranted —
+  which is what the F-064 review's objection to "fail the CONNECT" was actually about.
+  **Filed twice**: this entry and §0.2's unnamed bullet are one defect, and both are
+  ticked. **Five reachable exits**, each with its own fixture, because a remedy shown on
+  one says nothing about the others: the PUBREL consumer, the session-affine QoS 2
+  consumer, the raw subject subscription, the plain-or-group JetStream consumer, and the
+  level-up companion of the last two. The verdict is `mqttFirstUnrestoredFilter`, reading
+  a value `processSubs` was always required to set, and it is named **local failure
+  aggregation** rather than arbitration: it proves no step reported failure, not that
+  ownership is still current. **The reorder needed exactly one new fact**, and three
+  revisions of the plan were spent discovering it cannot be per-subscription — a
+  per-subscription flag cannot be armed before the subscription exists (a bare
+  `c.processSub` makes the NATS handler live before it returns, so a stored PUBREL can
+  enter its callback with no metadata at all), and a released gate is indistinguishable
+  from one that never existed, so a refusal cannot express "woken and still not allowed
+  out". So transmission suppression is ONE connection-scoped verdict on the session,
+  consulted by all four delivery callbacks before they touch `sub.mqtt`, armed
+  unconditionally on every accepted CONNECT and deliberately left installed after a
+  refusal. `mqttSub` gains no field, `processSub` is unchanged, and the reconciliation
+  phase's adoption and sweep are untouched. Two orderings are load-bearing: the grant
+  point moves after restoration (its own rule is "after everything that can refuse"), and
+  the 3.1.1 forced leave stays after the CONNACK, so the pre-CONNACK restore now excludes
+  shared filters for a non-v5 connection **explicitly** where the old code relied on
+  ordering. A restore-path failure also stops being destructive: it no longer deletes a
+  plain durable the record still names, and it refunds `tmaxack` per filter from the
+  amount each join **reported**, because the config comes back whether a call charged it
+  or reused a resident entry. **Residuals in `docs/CONFORMANCE.md`**: a permanently
+  unrestorable filter refuses every resume (clean start is the recovery), a shared QoS 0
+  message can be swallowed during the restore window, **a withheld QoS 1/2 delivery can
+  lose its never-transmitted marker to a rebind racing the refusal and then waits out
+  AckWait rather than being NAKed forward — the lost prompt NAK is this item's own residual
+  while the DUP derivation is F-072's**, the same marker is lost for a shared durable even
+  without that race because the ordinary close purges it, a timed-out affine wait falls
+  into F-072's population, and the displaced-broker window has no upper bound. **A
+  malformed persisted shared key now refuses the resume rather than being skipped**, which
+  holistic round 4 found was the same accepted-but-dead state in miniature.
+  **Refuted designs, so none returns:** failing the CONNECT after the
+  CONNACK, retrying in place, removing the filter from the record, duplicating the
+  provisioning into the reconciliation phase, installing the raw subscription ungated in a
+  final pre-CONNACK sub-pass (it makes a QoS 0 PUBLISH the first packet), proving the group
+  durable by re-issuing its recorded config (shared configs are not persisted, and
+  `ActionCreateOrUpdate` with a stale one rewrites a live durable for every other member),
+  moving the 3.1.1 forced leave before the CONNACK (it makes an unacknowledged CONNECT
+  destructive), and carrying the restore state on each subscription.
 - [ ] [F-028: Preserve deferred disconnect state during foreign disposition](findings/session-and-will.md#f-028).
   **Medium.** Split the parked-disconnect loss and retained-continuation cleanup
   into separately testable changes.

@@ -1897,105 +1897,15 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T15 — an unadopted phase subscription is reclaimed
+// Recovered after an editing mistake
 // ---------------------------------------------------------------------------
-
-// Restoration skips a collected QoS 2 filter (its PUBREL setup fails on the
-// exhausted MaxAckPending budget after the PUBREL durable was reaped): the
-// post-processSubs sweep must IMMEDIATELY remove the phase's closed
-// subscription — nothing else ever would, and it holds consumer interest while
-// delivering nothing (M16). The filter stays unavailable until the next
-// CONNECT: a live re-SUBSCRIBE reaches the exists-branch and never recreates
-// missing interest (a stated residual).
-func TestMQTTReconcileUnadoptedPhaseSubReclaimed(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptions()
-	// Comfortably longer than the whole test: nothing here waits on an AckWait
-	// redelivery, and a short one would only add DUP copies of the two backlog
-	// messages while they sit unacked.
-	o.MQTT.AckWait = 30 * time.Second
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	const cid, topic, sid = "t15-skip", "t15/a", "t15.a"
-	c, _ := testReconcileSubscribe(t, o, cid, topic, 2)
-	sess := testMQTTResidentSession(t, s, cid)
-	sess.mu.Lock()
-	dur := sess.cons[sid].Durable
-	deliver := sess.cons[sid].DeliverSubject
-	pubRelDur := sess.pubRelConsumer.Durable
-	sess.mu.Unlock()
-	c.Close()
-	testReconcileClientGone(t, s, cid)
-
-	// The PUBREL durable is reaped; its recreation at restore time will hit an
-	// exhausted MaxAckPending budget and fail the QoS 2 filter — the natural
-	// "restoration skipped a collected filter" lever.
-	asm := testMQTTGetGlobalASM(t, s)
-	if _, err := asm.jsa.deleteConsumer(mqttOutStreamName, pubRelDur, true); err != nil {
-		t.Fatalf("delete the PUBREL durable: %v", err)
-	}
-	sess.mu.Lock()
-	sess.tmaxack = mqttMaxAckTotalLimit
-	sess.mu.Unlock()
-
-	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
-	// The PINGRESP fences CONNECT processing: the sweep has run.
-	testMQTTFlush(t, c2, nil, r2)
-
-	// IMMEDIATE reclamation: the phase's subscription is gone (no interest),
-	// while the verified consumer itself is untouched.
-	client := testMQTTGetClient(t, s, cid)
-	client.mu.Lock()
-	leftover := client.subs[deliver]
-	client.mu.Unlock()
-	if leftover != nil {
-		t.Fatal("the unadopted phase subscription is still installed; it would hold consumer interest forever while delivering nothing")
-	}
-	if !testReconcileConsumerPresent(t, asm, dur) {
-		t.Fatalf("the verified consumer %q was removed; the sweep owns only the interest", dur)
-	}
-
-	// The filter is dead on this connection...
-	testReconcileQoS1Publish(t, o, topic, []byte("m1-skipped"))
-	testMQTTExpectNothing(t, r2)
-
-	// ...and a live re-SUBSCRIBE cannot recover it: the exists-branch refreshes
-	// metadata and never recreates missing interest. (The budget is sane again,
-	// so the PUBREL consumer recreates and the SUBACK grants QoS 2 — and still
-	// no delivery.)
-	sess.mu.Lock()
-	sess.tmaxack = 0
-	sess.mu.Unlock()
-	testMQTTSub(t, 2, c2, r2, []*mqttFilter{{filter: topic, qos: 2}}, []byte{2})
-	testMQTTFlush(t, c2, nil, r2)
-	testReconcileQoS1Publish(t, o, topic, []byte("m2-resub"))
-	testMQTTExpectNothing(t, r2)
-	c2.Close()
-	testReconcileClientGone(t, s, cid)
-
-	// The next CONNECT's phase restores it: the pending messages are delivered in
-	// order as the FIRST transmissions they are — they were never put on the wire
-	// while the filter was unavailable, and the phase gate holds the backlog
-	// JetStream pushes before the CONNACK rather than burning an attempt on it.
-	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	defer c3.Close()
-	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
-	// Both are already on the wire back to back, so they are read first and
-	// acknowledged after: a flush between them would meet the second PUBLISH.
-	for _, payload := range []string{"m1-skipped", "m2-resub"} {
-		pi := testMQTTCheckPubMsgNoAck(t, c3, r3, topic, mqttPubQos1, []byte(payload))
-		if pi == 0 {
-			t.Fatalf("delivery of %q carried no packet identifier", payload)
-		}
-		testMQTTSendPIPacket(mqttPacketPubAck, t, c3, pi)
-	}
-	testMQTTFlush(t, c3, nil, r3)
-	testReconcileQoS1Publish(t, o, topic, []byte("m3-restored"))
-	testReconcileExpectQoS1(t, c3, r3, topic, []byte("m3-restored"))
-}
+//
+// These two tests were deleted by accident while re-aiming the two neighbouring
+// fixtures for F-050, by a block replacement that swallowed them. Neither has
+// anything to do with F-050: the first pins the still-live 3.1.1 forced-leave
+// save-failure exit, which F-050 explicitly leaves out of scope, and the second
+// pins the stale-unmatched-Cons residual, which F-050 does not retire. Restored
+// verbatim from the commit the change was written against.
 
 // A post-CONNACK failure exit that never reaches processSubs — the 3.1.1
 // forced-leave save failure — leaves the deferred fallback to reclaim the
@@ -2144,6 +2054,99 @@ func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
 	}
 	testReconcileQoS1Publish(t, o, staleTopic, []byte("reconciled"))
 	testReconcileExpectQoS1(t, c3, r3, staleTopic, []byte("reconciled"))
+}
+
+// ---------------------------------------------------------------------------
+// T15 — a filter restoration cannot complete: the resume is REFUSED
+// ---------------------------------------------------------------------------
+
+// Restoration cannot complete a collected QoS 2 filter (its PUBREL setup fails on
+// the exhausted MaxAckPending budget after the PUBREL durable was reaped), so the
+// CONNECT is REFUSED — no packet at all, under the pre-CONNACK abort discipline.
+//
+// **This test was re-aimed by F-050.** It used to assert the opposite disposition:
+// the CONNECT was ACCEPTED with Session Present, the post-processSubs sweep removed
+// the phase's closed subscription, and the filter stayed silently dead until the
+// next CONNECT while the client held a connection that delivered nothing. That was
+// the defect, stated as a residual in docs/CONFORMANCE.md; restoration now runs
+// before the CONNACK and a filter it cannot install refuses the resume instead. The
+// two properties worth keeping are kept: the sweep owns only the INTEREST, never the
+// verified consumer, and the backlog survives to be delivered as a first
+// transmission on a resume that completes.
+//
+// What this test no longer covers, deliberately: "a live re-SUBSCRIBE cannot
+// recover a skipped filter". There is no live connection to re-SUBSCRIBE on any
+// more. The neighbouring residual it shared that assertion with — a live
+// re-SUBSCRIBE matching a stale unmatched Cons entry — is untouched by F-050 and
+// keeps its own statement in docs/CONFORMANCE.md.
+func TestMQTTReconcileSkippedFilterRefusesTheResume(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	// Comfortably longer than the whole test: nothing here waits on an AckWait
+	// redelivery, and a short one would only add DUP copies of the backlog message
+	// while it sits unacked.
+	o.MQTT.AckWait = 30 * time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const cid, topic, sid = "t15-skip", "t15/a", "t15.a"
+	c, _ := testReconcileSubscribe(t, o, cid, topic, 2)
+	sess := testMQTTResidentSession(t, s, cid)
+	sess.mu.Lock()
+	dur := sess.cons[sid].Durable
+	pubRelDur := sess.pubRelConsumer.Durable
+	sess.mu.Unlock()
+	c.Close()
+	testReconcileClientGone(t, s, cid)
+
+	// A message published while the client is away is held by the durable, so the
+	// resume that finally completes owes it as a first transmission.
+	testReconcileQoS1Publish(t, o, topic, []byte("m1-held"))
+
+	// The PUBREL durable is reaped; its recreation at restore time hits an
+	// exhausted MaxAckPending budget and fails the QoS 2 filter — the natural
+	// "restoration cannot complete a collected filter" lever.
+	asm := testMQTTGetGlobalASM(t, s)
+	if _, err := asm.jsa.deleteConsumer(mqttOutStreamName, pubRelDur, true); err != nil {
+		t.Fatalf("delete the PUBREL durable: %v", err)
+	}
+	sess.mu.Lock()
+	sess.tmaxack = mqttMaxAckTotalLimit
+	sess.mu.Unlock()
+
+	// REFUSED: no CONNACK and no DISCONNECT. The client is told nothing rather
+	// than told its session is present and then served nothing.
+	testReconcileRefusedConnect(t, o, cid)
+	testReconcileClientGone(t, s, cid)
+
+	// The verified consumer is untouched. The sweep withdraws interest; it never
+	// owns the durable, and a refusal must not turn into a deletion.
+	if !testReconcileConsumerPresent(t, asm, dur) {
+		t.Fatalf("the verified consumer %q was removed by a refused resume", dur)
+	}
+	// The membership is still the record's, so nothing was silently dropped.
+	sess.mu.Lock()
+	_, stillSubscribed := sess.subs[sid]
+	sess.mu.Unlock()
+	if !stillSubscribed {
+		t.Fatalf("the refused resume dropped the persisted filter %q", sid)
+	}
+
+	// With the budget sane the next CONNECT completes the restoration and the held
+	// message is delivered as the FIRST transmission it is: it was never put on the
+	// wire while the filter could not be restored.
+	sess.mu.Lock()
+	sess.tmaxack = 0
+	sess.mu.Unlock()
+
+	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c3.Close()
+	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
+	pi := testMQTTCheckPubMsgNoAck(t, c3, r3, topic, mqttPubQos1, []byte("m1-held"))
+	if pi == 0 {
+		t.Fatal("delivery carried no packet identifier")
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c3, pi)
 }
 
 // ---------------------------------------------------------------------------
@@ -2702,26 +2705,37 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 }
 
 // A delivery gated for a SURVIVING consumer is still recorded as never
-// transmitted when restoration skips its filter and the sweep reclaims it.
+// transmitted when the resume it was gated by is REFUSED.
 //
-// Review finding: disowning every phase subscription before opening its gate is
+// Review finding: disowning every gated subscription before opening its gate is
 // right only for a durable that is being deleted. For a verified consumer that
-// survives — the sweep leaves the consumer alone, it just withdraws the
-// interest — the message is still owed, so the woken delivery must record
-// itself or its eventual redelivery reaches the client marked DUP on first
-// sight, contradicting what CONFORMANCE promises for swept filters.
+// survives, the message is still owed, so the woken delivery must record itself or
+// its eventual redelivery reaches the client marked DUP on first sight —
+// contradicting [MQTT-3.3.1-1].
 //
-// Mutation check: disown unconditionally (M27) and the redelivery below arrives
-// with DUP set.
-func TestMQTTReconcileSweptSurvivorStillRecordsDelivery(t *testing.T) {
+// **Re-aimed by F-050**, which moved that property from the swept-but-accepted
+// connection to the REFUSED one. The lever is unchanged (a PUBREL setup the budget
+// cannot complete), but it now refuses the resume instead of accepting it and
+// leaving the filter dead, so the delivery is woken by the refusal's abandon rather
+// than by the sweep. The abandon is the harder case and the reason this test earns
+// its keep: it wakes every withheld delivery WITHOUT opening it for transmission,
+// and the connection-scoped verdict it wakes them from outlives the reconciliation
+// phase's own undo — so a recording rule that did not discriminate would either
+// lose this marker or strand one for a durable the undo deleted.
+//
+// Mutation checks: drop the withheld recording on the verdict's arm and the
+// redelivery below arrives with DUP set; record unconditionally (ignoring the
+// owed-delivery predicate) and TestMQTTReconcileFailedRepairStrandsNoDeferredMarker
+// strands a marker instead.
+func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// Comfortably longer than the wait inside the verification below, so the
-	// delivery parked on the gate is released by the SWEEP rather than by its own
-	// bound — the timeout path records a marker of its own and would mask what
-	// this test is about. It also means the redelivery below can only be prompt
-	// if the marker exists: resendPendingRedelivery NAKs recorded withholdings,
-	// while an unrecorded one waits out this AckWait.
+	// delivery parked on the gate is released by the REFUSAL rather than by its own
+	// bound — the timeout path records a marker of its own and would mask what this
+	// test is about. It also means the redelivery below can only be prompt if the
+	// marker exists: resendPendingRedelivery NAKs recorded withholdings, while an
+	// unrecorded one waits out this AckWait.
 	o.MQTT.AckWait = 10 * time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2731,12 +2745,13 @@ func TestMQTTReconcileSweptSurvivorStillRecordsDelivery(t *testing.T) {
 	sess := testMQTTResidentSession(t, s, cid)
 	sess.mu.Lock()
 	pubRelDur := sess.pubRelConsumer.Durable
+	dur := sess.cons[sid].Durable
 	sess.mu.Unlock()
 	c.Close()
 	testReconcileClientGone(t, s, cid)
 
-	// The same lever T15 uses to make restoration SKIP a collected filter: its
-	// PUBREL consumer is gone and the budget cannot recreate it.
+	// The lever that makes restoration fail a collected filter: its PUBREL consumer
+	// is gone and the budget cannot recreate it.
 	asm := testMQTTGetGlobalASM(t, s)
 	if _, err := asm.jsa.deleteConsumer(mqttOutStreamName, pubRelDur, true); err != nil {
 		t.Fatalf("delete the PUBREL durable: %v", err)
@@ -2751,9 +2766,8 @@ func TestMQTTReconcileSweptSurvivorStillRecordsDelivery(t *testing.T) {
 	asm.testResumeReconcileLookup = func(durables []string) ([]*ConsumerInfo, []bool, error) {
 		testReconcileQoS1Publish(t, o, topic, []byte("gated"))
 		// Generous: the delivery must provably reach the gate before the
-		// verification returns and the sweep runs. Under parallel load a short
-		// wait lets the sweep win, and the message is then pushed at a dead
-		// subject instead of being recorded — which is a test artifact, not the
+		// verification returns. Under parallel load a short wait lets the refusal
+		// win, and the message is then never gated at all — a test artifact, not the
 		// behavior under test.
 		time.Sleep(2 * time.Second)
 		infos := make([]*ConsumerInfo, len(durables))
@@ -2765,35 +2779,26 @@ func TestMQTTReconcileSweptSurvivorStillRecordsDelivery(t *testing.T) {
 	}
 	asm.mu.Unlock()
 
-	c2, _ := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	// The CONNACK is read off the wire by the dial helper. The sweep is fenced by
-	// its own observable effect — the phase subscription is gone — rather than by
-	// a PING round trip, which would race the very delivery this test is about.
-	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
-		sess.mu.Lock()
-		cc := sess.cons[sid]
-		sess.mu.Unlock()
-		if cc == nil {
-			return fmt.Errorf("no consumer entry for %q", sid)
-		}
-		client := testMQTTGetClient(t, s, cid)
-		if client == nil {
-			return fmt.Errorf("no client yet")
-		}
-		client.mu.Lock()
-		sub := client.subs[cc.DeliverSubject]
-		client.mu.Unlock()
-		if sub != nil {
-			return fmt.Errorf("the unadopted phase subscription is still installed")
-		}
-		return nil
-	})
-	c2.Close()
+	testReconcileRefusedConnect(t, o, cid)
 	testReconcileClientGone(t, s, cid)
 
-	// Budget and lookup back to normal; the next CONNECT restores the filter and
-	// the message is redelivered — as the client's FIRST sight of it.
+	// The marker is the property, asserted DIRECTLY rather than inferred from the
+	// redelivery alone: the consumer survived the refusal, so the message is still
+	// owed, and only a recorded withholding makes the attempt that finally goes out
+	// a first transmission.
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		for k := range sess.deferred {
+			if k.jsDur == dur {
+				return nil
+			}
+		}
+		return fmt.Errorf("no never-transmitted marker for the surviving durable %q", dur)
+	})
+
+	// Budget and lookup back to normal; the next CONNECT restores the filter and the
+	// message is redelivered — as the client's FIRST sight of it.
 	asm.mu.Lock()
 	asm.testResumeReconcileLookup = nil
 	asm.mu.Unlock()
@@ -2804,11 +2809,11 @@ func TestMQTTReconcileSweptSurvivorStillRecordsDelivery(t *testing.T) {
 	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c3.Close()
 	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
-	// The property under test is the flags on THIS delivery: recorded as
-	// withheld, so it is the client's first sight of the message. Nothing is
-	// asserted about what follows it — an unacknowledged copy may still be in
-	// flight behind it — so the test ends on the acknowledgement rather than on
-	// a PING that a second copy could answer first.
+	// The property under test is the flags on THIS delivery: recorded as withheld,
+	// so it is the client's first sight of the message. Nothing is asserted about
+	// what follows it — an unacknowledged copy may still be in flight behind it — so
+	// the test ends on the acknowledgement rather than on a PING that a second copy
+	// could answer first.
 	pi := testMQTTCheckPubMsgNoAck(t, c3, r3, topic, mqttPubQos1, []byte("gated"))
 	if pi == 0 {
 		t.Fatal("delivery carried no packet identifier")

@@ -680,10 +680,93 @@ Residuals:
     client re-grants them on its next connection — which, for a requested
     interval of 0, means the session ends at that close exactly as the client
     requested.
-  - A filter subscription restoration skipped after the CONNACK (e.g. its
-    PUBREL setup failed) has its reconciliation subscription swept and stays
-    unavailable until the next CONNECT — a live re-SUBSCRIBE reaches the
-    exists-branch and never recreates missing interest.
+  - A filter subscription restoration that fails no longer leaves an accepted
+    session behind it: restoration runs before the success CONNACK and a filter
+    it cannot install **refuses the CONNECT** (F-050, see
+    `docs/ARCHITECTURE.md` "The restore gate"). The residual that used to sit
+    here — a filter skipped after the CONNACK, swept, and unavailable until the
+    next CONNECT — is retired with it. What replaces it is narrower and is
+    listed below: a filter that can never be restored refuses every resume.
+  - **A filter that can never be restored refuses every resume.** The reachable
+    cause is a subscribe permission revoked since the filter was saved: the raw
+    subscription install fails deterministically, so each `Clean Start = 0`
+    CONNECT is refused. That is deliberate — the alternative is a Session-Present
+    connection that silently never delivers, which is the defect — and it is
+    recoverable two ways: the operator restores the permission, or the client
+    connects with `Clean Start = 1`, which discards the session and succeeds. A
+    v5 client is told the reason (0x83, naming the filter); a 3.1.1 client sees
+    only the close. Each refused attempt also restarts the session's expiry clock
+    from its own close, as any ended network connection does, so a client that
+    keeps retrying keeps the session alive.
+  - **A shared QoS 0 message can be swallowed during a resume's restoration.** A
+    restored shared subscription holds NATS queue-group interest from the moment
+    it is installed, and nothing may be transmitted until the verdict OPENS, so a
+    QoS 0 group message selected for that member in the window is dropped where
+    another live member would otherwise have received it. QoS 0 only, at-most-once
+    and best-effort. The window is the pre-CONNACK restoration — O(filters)
+    JetStream round trips and, under auth passthrough, possibly one flush per
+    filter — **plus the interval between the CONNACK write and the open**, which is
+    a channel close and therefore negligible but not zero. The window ends at the
+    open rather than at the CONNACK deliberately: opening first would let a woken
+    delivery race the CONNACK write and reach the client ahead of it, violating
+    [MQTT-3.2.0-1]. The alternatives were worse: buffering is a new unbounded
+    mechanism, a NATS subscription's queue group cannot be joined late, and
+    installing the subscription outside the verdict makes a QoS 0 PUBLISH the
+    client's first packet, violating [MQTT-3.2.0-1]. For a **plain** filter the
+    same drop happens today, because no raw subscription exists in that window at
+    all.
+  - **A QoS 1/2 delivery withheld by a REFUSED resume can lose its
+    never-transmitted marker to a rebind, and then waits out AckWait and arrives
+    with DUP set.** The refusal wakes every withheld delivery so it can record
+    itself, but it then returns and releases the session's ownership gate, so a
+    reconnect can bind before a woken callback runs. That callback is stale — the
+    marker is scoped to the connection that withheld the delivery — so nothing
+    records it. The message stays owed and is redelivered, but it **waits for
+    AckWait instead of being NAKed promptly forward**, and its first client-visible
+    PUBLISH can carry DUP = 1.
+
+    Two remedies were built and withdrawn across three review rounds: draining the
+    woken callbacks (a counter is not an admission barrier — a callback can be
+    descheduled before it registers, or arrive after the drain saw zero, and
+    delivery interest stays live until teardown), and deciding on the durable
+    rather than the connection (removes the race but not the lateness, and the set
+    of places a durable can live is neither complete nor sequence-precise). Closing
+    it needs a real callback-admission boundary, which this item does not justify.
+
+    **F-072 owns the DUP half** — deriving the MQTT flag from the JetStream
+    delivery count is its open defect — but **not** the lost prompt NAK, which is
+    stated here as F-050's own residual. The population is new to this change:
+    before it, a restore failure never refused, so no marker was owed on that path.
+  - **A shared QoS 1/2 delivery loses that marker even without the rebind race.**
+    The ordinary close of the refused connection runs `purgeSharedPending`, which
+    removes withheld markers for shared durables along with the pending entries and
+    their identifiers — deliberate behaviour that stops a resume NAK-stealing group
+    messages. Kept as a separate statement from the race above because it does not
+    depend on any interleaving. Fixing it means changing what a disconnect does to
+    shared pending state, which is not F-050's.
+  - **A timed-out affine gate wait falls into F-072's population.** An affine QoS 2
+    copy that reaches its callback before the CONNACK waits, and a wait that runs
+    out returns the copy unacknowledged. The affine path derives DUP from the
+    JetStream delivery count, so the redelivery can carry DUP on a first
+    transmission — which is F-072's open defect, not a new one. Waiting rather
+    than dropping is what keeps the ordinary case out of it.
+  - **A displaced broker can acknowledge and serve, and the window has no upper
+    bound.** Nothing at the CONNACK proves this broker still owns the record: the
+    accept CAS arbitrated one instant, restoration only aggregates local failures,
+    and an unchanged lifetime, an already-recorded affine consumer and ordinary
+    shared restoration all write nothing. So a peer can take the record while this
+    broker restores, and this broker still sends its CONNACK and serves until the
+    eviction closes it. Moving restoration before the CONNACK does not change that
+    consequence — under the old order the same interleaving served the client from
+    an earlier CONNACK onward, and one interleaving strictly improves, since a
+    displaced broker whose restoration fails now refuses instead of silently
+    dropping a filter. What it does add is one QoS 0 loss shape inside that
+    window: a group message selected for the displaced member is dropped rather
+    than transmitted to its stale connection. Convergence rests on the
+    session-record watch and the record-state backstop; the backstop's interval
+    (15 minutes by default) is the **first opportunity**, not a bound — a busy or
+    refused pass defers the decision to a later one. F-036 owns the consequence
+    and its remedy is what would bound it.
   - A live re-SUBSCRIBE that matches a **stale unmatched `Cons` entry** (an
     entry with no corresponding subscription, which the reconciliation
     deliberately does not verify) likewise installs no delivery interest and
@@ -1288,13 +1371,14 @@ What it does NOT do:
     those bytes only on the fork path, never on a save — an earlier revision built it on
     every save attempt under the session lock, which measured 2.5 ms and ~1 MB per attempt
     at 1000 filters;
-  - a repaired **QoS 2** membership whose PUBREL provisioning then fails is
-    accepted-but-dead: `processSubs` runs after the success CONNACK. The same shape as
-    F-050's, not a new one;
-  - **shared-subscription membership is excluded until F-050 closes.** The success CONNACK
-    precedes shared restoration, so a re-asserted group membership would be durable while
-    a per-filter restore failure leaves no join and no consumer. Repairing into that
-    ordering would extend an open finding rather than respect it.
+  - a repaired **QoS 2** membership whose PUBREL provisioning then fails is no longer
+    accepted-but-dead: `processSubs` runs before the success CONNACK now, and that
+    failure refuses the CONNECT (F-050);
+  - **shared-subscription membership is still excluded, but by choice rather than by
+    ordering.** The ordering that forced it — the success CONNACK preceding shared
+    restoration — is gone with F-050. Widening the repair set to shared membership is
+    F-027's own work, tracked as its own roadmap bullet, and until it lands the
+    exclusion stands.
 - **The verdict does not prove the survivor erased us.** A teardown claim is a full-body
   CAS off the same base, so a sibling can merely have become current after `clear()`
   deleted our record. What is established is only that the survivor is not demonstrably

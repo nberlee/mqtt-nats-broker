@@ -2987,6 +2987,26 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		return
 	}
 
+	// A resuming CONNECT provisions this affine consumer before its CONNACK, and
+	// [MQTT-3.2.0-1] makes the CONNACK the first packet the client may see. Wait
+	// rather than skip, and on a withheld verdict return WITHOUT acknowledging so
+	// JetStream redelivers. No withheld-marker bookkeeping: the affine path derives
+	// DUP from the JetStream delivery count, which is F-072's open defect, and a
+	// copy refused here before trackPublish is exactly that finding's
+	// offered-but-never-transmitted population. Waiting is what keeps the ordinary
+	// case out of it. See sess_restore_gate.go.
+	switch sess.awaitRestoreGate(cc) {
+	case mqttRestoreGateWithheld:
+		mqttTestRestoreGateBlockedHook("affine")
+		return
+	case mqttRestoreGateTimedOut:
+		// NAK rather than simply returning: an affine copy carries no withheld
+		// marker, so nothing else would re-drive it. See mqttRestoreGateTimedOut.
+		mqttTestRestoreGateBlockedHook("affine")
+		sess.jsa.sendMsg(reply, AckNak)
+		return
+	}
+
 	hdr, msg := pc.msgParts(rmsg)
 	h := mqttParsePublishNATSHeader(hdr)
 	if h == nil || h.qos != 2 || len(h.subject) == 0 {

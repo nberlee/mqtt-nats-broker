@@ -421,13 +421,20 @@ var (
 	// shorten it; the orphan QoS 2 sweep additionally supports an instance-scoped
 	// override, because it is read by a goroutine a test cannot synchronize with.
 	mqttOrphanSweepGrace = 5 * time.Minute
-	// Ceiling on how long a QoS 1/2 delivery waits for the resume reconciliation
-	// phase to release its subscription. The effective bound is the consumer's
-	// AckWait (mqttPhaseGateWaitFor): waiting past it buys nothing, because
-	// JetStream re-pushes the message at exactly that point anyway. The bound
-	// exists so a CONNECT that dies without releasing — every ordinary exit
-	// releases, so that means a panic — cannot park a delivery goroutine
-	// indefinitely. A var so tests can shorten it. See mqttSub.phaseGate.
+	// Ceiling on how long a delivery waits for a gate to release its subscription:
+	// the reconciliation phase's per-subscription gate, and the connection-scoped
+	// restore verdict. The bound exists so a CONNECT that dies without releasing —
+	// every ordinary exit releases, so that means a panic — cannot park a delivery
+	// goroutine indefinitely. A var so tests can shorten it.
+	//
+	// **It is a CAP, not the AckWait.** The effective bound is
+	// min(AckWait, this), and an earlier comment here claimed waiting past it buys
+	// nothing "because JetStream re-pushes the message at exactly that point
+	// anyway" — true only while AckWait is inside the cap. With a configured
+	// AckWait above it the wait ends long before any redelivery, which is why a
+	// timed-out wait is a DISTINCT verdict from a refusal and why the two classes
+	// carrying no withheld marker (PUBREL, affine copies) NAK on it rather than
+	// returning. See mqttRestoreGateTimedOut and mqttSub.phaseGate.
 	mqttPhaseGateWaitMax = 30 * time.Second
 )
 
@@ -1203,6 +1210,14 @@ type mqttAccountSessionManager struct {
 	// suppress the delete rather than race it. Nil in production.
 	testInflightDelete func(seq uint64) error
 
+	// testRestoreFilterFail fails exactly ONE named exit of the CONNECT restore, for
+	// exactly one sid. Per-exit rather than a blanket failure because a fixture has
+	// to prove WHICH route it took: F-050 has five reachable exits and a remedy
+	// demonstrated on one says nothing about the others. Consulted only when
+	// fromSubProto is false, and only AFTER the real call has run, so the fixture
+	// reaches the production path and then fails it rather than replacing it.
+	testRestoreFilterFail func(exit, sid string) error
+
 	// qos2SweepCursor is the orphan QoS 2 sweep's position in $MQTT_qos2in, and
 	// qos2SweepSeeded whether it has been seeded yet. Scheduling state only: every
 	// candidate it discovers is authoritatively revalidated before any mutation, so
@@ -1551,7 +1566,12 @@ type mqttSession struct {
 	// from the session record is never charged (only the create path charges), so
 	// refunding its config's MaxAckPending on teardown drove tmaxack negative after
 	// a resume and inflated the account's remaining budget. In-memory only.
-	consCharged    map[string]int
+	consCharged map[string]int
+	// restoreGate is this CONNECT's "nothing may be transmitted yet" verdict, read
+	// by every delivery callback BEFORE it touches sub.mqtt. Atomic rather than
+	// lock-guarded because a PUBREL can enter its callback before the subscription
+	// it arrived on has any metadata at all. See sess_restore_gate.go.
+	restoreGate    atomic.Pointer[mqttRestoreGate]
 	pubRelConsumer *ConsumerConfig
 	// pubRelVerified is the PUBREL path's equivalent of q2AffReady: this connection
 	// has PROVEN the durable exists, rather than trusting a config restored from the
@@ -7145,7 +7165,11 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 
 		if f.qos == 2 {
-			if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+			err := sess.ensurePubRelConsumerSubscription(c)
+			if err == nil {
+				err = as.restoreExitFail(fromSubProto, "pubrel", f.sessionKey())
+			}
+			if err != nil {
 				c.Errorf("failed to initialize PUBREL processing: %v", err)
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
@@ -7161,7 +7185,11 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// SUBSCRIBE that never took effect should leave behind. Spec5 [4.8.2];
 			// see qos2_shared_affine.go.
 			if f.shared {
-				if err := sess.ensureQ2AffineConsumerSubscription(c, tok); err != nil {
+				err := sess.ensureQ2AffineConsumerSubscription(c, tok)
+				if err == nil {
+					err = as.restoreExitFail(fromSubProto, "affine", f.sessionKey())
+				}
+				if err != nil {
 					c.Errorf("failed to initialize session-affine QoS 2 delivery: %v", err)
 					f.qos = mqttSubAckFailure
 					f.reasonStr = err.Error()
@@ -7341,6 +7369,14 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		var sub *subscription
 		var err error
 
+		// Group-consumer charges THIS filter added to tmaxack, so a per-filter
+		// failure on the CONNECT restore path refunds exactly them. Recorded here
+		// rather than derived from the returned config, because that config comes
+		// back whether this call charged or merely reused a resident entry, and
+		// refunding by durable would erase an EARLIER connection's charge and leave
+		// tmaxack permanently short. See sess_restore_gate.go.
+		var filterCharged []mqttSharedCharge
+
 		// Deferred consumer deletes recorded by THIS filter, so a later per-filter
 		// failure can cancel them (restore the sess.cons entry, keep the durable).
 		filterDefStart := len(deferredDels)
@@ -7374,6 +7410,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		sess.mu.Unlock()
 		as.mu.Unlock()
 
+		if err == nil {
+			err = as.restoreExitFail(fromSubProto, "raw", sid)
+		}
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
@@ -7386,8 +7425,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				return subs, rerr
 			}
 			if doCleanup {
-				sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
+				sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
 			}
+			sess.refundSharedCharges(fromSubProto, filterCharged)
 			continue
 		}
 
@@ -7397,7 +7437,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// consumer will be deleted. Shared subscriptions always join the group
 		// consumer (even at QoS0, so stored messages are delivered at QoS0).
 		if f.shared {
-			jscons, jssub, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+			var amt int
+			jscons, jssub, amt, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+			filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, subject), amt)
 		} else {
 			var dd *ConsumerConfig
 			jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
@@ -7419,6 +7461,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				}
 			}
 		}
+		if err == nil {
+			err = as.restoreExitFail(fromSubProto, "consumer", sid)
+		}
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
@@ -7431,8 +7476,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				return subs, rerr
 			}
 			if doCleanup {
-				sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
+				sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
 			}
+			sess.refundSharedCharges(fromSubProto, filterCharged)
 			continue
 		}
 
@@ -7457,6 +7503,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				subRMS, trace, as)
 			sess.mu.Unlock()
 			as.mu.Unlock()
+			if err == nil {
+				err = as.restoreExitFail(fromSubProto, "raw-fwc", fwcsid)
+			}
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
@@ -7467,13 +7516,16 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					return subs, rerr
 				}
 				if doCleanup {
-					sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
+					sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
 				}
+				sess.refundSharedCharges(fromSubProto, filterCharged)
 				continue
 			}
 
 			if f.shared {
-				fwjscons, fwjssub, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+				var fwamt int
+				fwjscons, fwjssub, fwamt, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+				filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, fwcsubject), fwamt)
 			} else {
 				var fwdd *ConsumerConfig
 				fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
@@ -7492,6 +7544,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					}
 				}
 			}
+			if err == nil {
+				err = as.restoreExitFail(fromSubProto, "consumer-fwc", fwcsid)
+			}
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
@@ -7502,9 +7557,10 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					return subs, rerr
 				}
 				if doCleanup {
-					sess.cleanupFailedSub(c, tok, sub, jscons, jssub)
-					sess.cleanupFailedSub(c, tok, fwcsub, fwjscons, fwjssub)
+					sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
+					sess.cleanupFailedSub(c, tok, fromSubProto, fwcsub, fwjscons, fwjssub)
 				}
+				sess.refundSharedCharges(fromSubProto, filterCharged)
 				continue
 			}
 
@@ -7514,6 +7570,13 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 
 		subs = append(subs, sub)
 		addJSConsToSess(sid, jscons)
+		if !fromSubProto {
+			// One filter's installs are complete and later filters are not started.
+			// The seam is here rather than at the end of the restore because that is
+			// the only place a test can tell "installed behind the connection's
+			// restore verdict" from "installed live" for a SPECIFIC subscription.
+			mqttTestRestorePauseHook("filter:" + sid)
+		}
 	}
 
 	if fromSubProto {
@@ -11829,9 +11892,23 @@ restoreSession:
 	// flag are not applied until the grant point below, so the session still
 	// holds — and its record still describes — the lifetime it had when this
 	// CONNECT arrived.
+	//
+	// It also ABANDONS this CONNECT's restore verdict: every delivery withheld
+	// because nothing may precede the CONNACK is woken so it can record itself as
+	// never transmitted, and none of them is allowed out, because no CONNACK was
+	// written. The verdict stays installed — a delivery arriving after this and
+	// before the client detaches must still be blocked, and this helper
+	// deliberately leaves c.mqtt.sess in place. See sess_restore_gate.go.
 	abortAcceptedResume := func(bool) {
+		es.abandonRestoreGate()
 		c.mqttAbortAcceptedConnect()
 	}
+	// ARM the verdict before the first subscription this CONNECT installs, and
+	// unconditionally — a clean start and a resume naming no filters included.
+	// An abandoned verdict is left installed on purpose, so the next arm is the
+	// only thing that replaces it: arming conditionally would leave a reused
+	// session object's later live subscriptions behind a dead verdict forever.
+	es.armRestoreGate()
 	if sessp {
 		if err := es.recoverInflightRegisters(c); err != nil {
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, err)
@@ -11870,6 +11947,119 @@ restoreSession:
 		}
 	}
 
+	// RESTORE the subscriptions the record names, still BEFORE the CONNACK. A
+	// per-filter restore failure used to be dropped in silence — no SUBACK exists
+	// on this path, sess.update is skipped, and the error never reached the caller
+	// — so the client got Session Present = 1 on a session whose membership was
+	// durable and whose delivery path was gone, forever (F-050). Restoration is
+	// therefore one more thing that can REFUSE the CONNECT, which puts it on this
+	// side of the acknowledgement.
+	//
+	// Nothing here transmits: the restore path never serialises retained messages
+	// (rmSubjects is populated only under fromSubProto), and every asynchronous
+	// delivery route consults this connection's restore verdict, armed above.
+	//
+	// A resuming MQTT 3.1.1 client cannot express, observe or UNSUBSCRIBE a
+	// "$share/..." filter, and the forced leave below removes its persisted shared
+	// memberships outright — so they are not restored here either. The old code
+	// achieved that by ordering (the forced leave ran first); now that restoration
+	// comes earlier, the exclusion is EXPLICIT. Spec5 [4.8.2].
+	restoreShared := c.mqtt.proto == mqttProtoLevel5
+	// refuseRestore tells the client WHY, which the other pre-CONNACK refusals do
+	// not. It is not decoration: a filter that can never be restored — a subscribe
+	// permission revoked since it was saved is the reachable case — refuses every
+	// resume, and without a reason an automatic client sees only an endless silent
+	// close. Its recovery, a clean start, is one the client can only choose if it
+	// knows there is something to recover from. v5 only: a 3.1.1 CONNACK has no
+	// reason code above 5, so that connection gets the bare close it gets today.
+	// Generalising this to the register-recovery, reconciliation and lifetime-grant
+	// refusals is its own roadmap item.
+	refuseRestore := func(rerr error) {
+		if c.mqtt.proto == mqttProtoLevel5 {
+			sendConnAck(mqttReasonImplementationSpecificError, false, rerr.Error())
+		}
+	}
+	if l := len(es.subs) + len(es.sharedSubs); l > 0 {
+		filters := make([]*mqttFilter, 0, l)
+		for subject, qos := range es.subs {
+			_, noLocal := es.noLocalSubs[subject]
+			_, rap := es.rapSubs[subject]
+			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal, retainAsPublished: rap, subID: es.subIDs[subject]})
+		}
+		// The persisted key is the sole authority; parse it back into group +
+		// underlying subject. Spec5 [4.8.2].
+		//
+		// A key that does NOT parse is carried as an already-failed filter rather
+		// than skipped. Skipping it is the finding this whole change is about in
+		// miniature: the membership stays in the record, nothing reports a failure,
+		// the aggregation below sees nothing wrong, and the client is told Session
+		// Present for a subscription that will never deliver. Corruption or schema
+		// drift is the way in — `mqttReservedMembershipInRecord` deliberately skips
+		// malformed shared keys rather than refusing the record — so this path must
+		// refuse rather than trust. A pre-failed filter reaches
+		// mqttFirstUnrestoredFilter through processSubs untouched (both of its loops
+		// skip a filter already at or above mqttSubAckFailure), which keeps ONE
+		// refusal path rather than adding a second.
+		//
+		// Not needed for 3.1.1: shared filters are not restored there at all, and the
+		// forced leave below removes the membership outright.
+		if restoreShared {
+			for key, qos := range es.sharedSubs {
+				group, subject, ok := mqttParseSharedKey(key)
+				if !ok {
+					// `reason`, not just `qos`: processSubs' first loop clamps any
+					// qos above 2 down to 2 BEFORE it tests the failure sentinel, so
+					// a filter marked only through qos is silently converted into a
+					// QoS 2 subscription. `reason` is the field that loop reads to
+					// carry a pre-decided failure through untouched.
+					filters = append(filters, &mqttFilter{
+						filter:    key,
+						qos:       mqttSubAckFailure,
+						reason:    mqttSubAckFailure,
+						reasonStr: "persisted shared-subscription key is malformed",
+					})
+					continue
+				}
+				_, rap := es.rapSubs[key]
+				filters = append(filters, &mqttFilter{shared: true, group: group, filter: subject, qos: qos, retainAsPublished: rap, subID: es.subIDs[key]})
+			}
+		}
+		_, serr := asm.processSubs(es, c, acceptTok, filters, false, trace)
+		// The sweep runs BEFORE the error is tested: a subscription restoration
+		// skipped stays closed and phase-owned, holding consumer interest while
+		// delivering nothing, and nothing later would remove it. The deferred
+		// fallback above stays armed for the exits that never reach here.
+		if len(phaseSubs) > 0 {
+			es.sweepUnadoptedPhaseSubs(c, phaseSubs)
+		}
+		if serr != nil {
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, serr)
+			abortAcceptedResume(false)
+			refuseRestore(serr)
+			return formatError(serr)
+		}
+		// AGGREGATE the per-filter outcomes. This is local failure aggregation and
+		// nothing more — it does not arbitrate ownership, does not prove this broker
+		// still owns the record, and does not prove an installed subscription yields
+		// end-to-end delivery. What it proves is that no step of this restoration
+		// reported failure, which is exactly what the CONNACK is about to claim.
+		//
+		// One unrestored filter refuses the whole CONNECT: there is no packet on
+		// this path that could tell the client WHICH filter died, which is the
+		// finding. The v5 failure CONNACK is what stops a persistently unrestorable
+		// filter from becoming an unexplained silent-close loop; it is legal here
+		// precisely because no CONNACK has been written, so it is the first packet
+		// ([MQTT-3.2.0-1]). A 3.1.1 connection gets the bare close it gets today.
+		if f := mqttFirstUnrestoredFilter(filters); f != nil {
+			rerr := fmt.Errorf("subscription %q could not be restored: %s", f.filter, f.reasonStr)
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+			abortAcceptedResume(false)
+			refuseRestore(rerr)
+			return formatError(rerr)
+		}
+	}
+	mqttTestRestorePauseHook("before-connack")
+
 	// GRANT the requested Session Expiry Interval and Clean flag. Everything that
 	// could refuse this CONNECT has now passed, so this is the first moment the
 	// session may take on what the client asked for — and it is persisted here
@@ -11898,6 +12088,14 @@ restoreSession:
 		abortAcceptedResume(false)
 		return fmt.Errorf("unable to deliver the success CONNACK")
 	}
+	mqttTestRestorePauseHook("before-open")
+
+	// The CONNACK is written, so the restore verdict OPENS: every delivery the
+	// restore withheld goes out now, as the first transmission it is. Never before
+	// this point — that is the whole of [MQTT-3.2.0-1] here — and never skipped on
+	// a success, or the session's backlog would sit until AckWait. See
+	// sess_restore_gate.go.
+	es.openRestoreGate()
 
 	// A resuming MQTT 3.1.1 client cannot express, observe, or UNSUBSCRIBE a
 	// "$share/..." filter (shared-subscription parsing is v5-only), so restoring
@@ -12021,39 +12219,10 @@ restoreSession:
 		commitLeave(acceptTok)
 	}
 
-	// Process possible saved subscriptions.
-	if l := len(es.subs) + len(es.sharedSubs); l > 0 {
-		filters := make([]*mqttFilter, 0, l)
-		for subject, qos := range es.subs {
-			_, noLocal := es.noLocalSubs[subject]
-			_, rap := es.rapSubs[subject]
-			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal, retainAsPublished: rap, subID: es.subIDs[subject]})
-		}
-		// Restore shared subscriptions (v5 only; a 3.1.1 resume force-left them
-		// above). The persisted key is the sole authority; parse it back into
-		// group + underlying subject. Spec5 [4.8.2].
-		for key, qos := range es.sharedSubs {
-			if group, subject, ok := mqttParseSharedKey(key); ok {
-				_, rap := es.rapSubs[key]
-				filters = append(filters, &mqttFilter{shared: true, group: group, filter: subject, qos: qos, retainAsPublished: rap, subID: es.subIDs[key]})
-			}
-		}
-		_, serr := asm.processSubs(es, c, acceptTok, filters, false, trace)
-		// The sweep runs BEFORE the error is tested: a subscription restoration
-		// skipped stays closed and phase-owned, holding consumer interest while
-		// delivering nothing, and nothing later would remove it — the connection
-		// stays live and a re-SUBSCRIBE's metadata refresh does not clear
-		// `closed`. (On this restore path per-filter failures all continue rather
-		// than harden the return, and the hard exits are fromSubProto-only, but
-		// the sweep's promise must not be path-dependent.) The deferred fallback
-		// above stays armed for the exits that never reach here.
-		if len(phaseSubs) > 0 {
-			es.sweepUnadoptedPhaseSubs(c, phaseSubs)
-		}
-		if serr != nil {
-			return serr
-		}
-	}
+	// Subscription restoration ran BEFORE the CONNACK above, which is F-050's fix:
+	// a filter whose delivery path could not be installed refuses the CONNECT
+	// rather than being dropped in silence behind a Session-Present acknowledgement.
+	//
 	// The CONNECT's record transaction ends HERE, before the resume work below.
 	// resendPendingRedelivery re-establishes the affine QoS 2 path under a
 	// transaction of its own, and the fence's blocking form would deadlock against
@@ -14808,6 +14977,18 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// This is immutable
 	sess := cc.mqtt.sess
 
+	// A resuming CONNECT installs this raw subscription before its CONNACK, and
+	// [MQTT-3.2.0-1] makes the CONNACK the first packet the client may see. QoS 0
+	// is DROPPED rather than waited on: it has no redelivery, so parking a NATS
+	// delivery goroutine would buy nothing. For a plain filter this is the same
+	// outcome as today, where no raw subscription exists in that window at all;
+	// for a shared one it is an accepted cost, stated in docs/CONFORMANCE.md. See
+	// sess_restore_gate.go.
+	if sess.restoreGateBlocksQoS0() {
+		mqttTestRestoreGateBlockedHook("qos0")
+		return
+	}
+
 	// Lock here, otherwise we may be called with sub.mqtt == nil. Ignore
 	// wildcard subscriptions if this subject starts with '$', per Spec
 	// [MQTT-4.7.2-1].
@@ -14959,6 +15140,24 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// This is immutable
 	sess := cc.mqtt.sess
 
+	// The connection's own verdict comes FIRST, before any lock and before
+	// sub.mqtt is touched: a resuming CONNECT installs live delivery interest
+	// before its CONNACK, and [MQTT-3.2.0-1] makes the CONNACK the first packet
+	// the client may see. A withheld delivery was never transmitted, so it is
+	// recorded the way an in-flight-cap withholding is, which is what makes the
+	// attempt that finally goes out a first send [MQTT-3.3.1-1]. See
+	// sess_restore_gate.go.
+	// Anything but Open blocks, and both blocking verdicts owe the same thing here:
+	// the marker is what makes the attempt that finally goes out a first
+	// transmission, whether the restore was refused or this wait simply ran out.
+	// Comparing against Withheld ALONE is a defect — a timed-out verdict would fall
+	// through and transmit before the CONNACK.
+	if sess.awaitRestoreGate(cc) != mqttRestoreGateOpen {
+		mqttTestRestoreGateBlockedHook("qos12")
+		sess.recordWithheldDelivery(cc, sub, reply)
+		return
+	}
+
 	// We lock to check some of the subscription's fields and if we need to keep
 	// track of pending acks, etc. There is no need to acquire the subsMu RLock
 	// since sess.Lock is overarching for modifying subscriptions.
@@ -14991,28 +15190,14 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// waiting out AckWait). Only for a phase-owned subscription: an ordinary
 		// closed one was torn down (a QoS downgrade, an UNSUBSCRIBE) and its
 		// messages are not owed to this client at all.
-		// sess.c == nil is the refused-CONNECT case: the connection was detached
-		// before this delivery woke, and the message is still owed to the SESSION,
-		// so the marker belongs to it. A session rebound to a DIFFERENT client is
-		// that connection's to account for, not this stale callback's.
 		//
-		// The nil arm covers a RACE, not a state a test can schedule: a refusal
-		// releases the gates and then detaches, microseconds apart, so whether a
-		// woken delivery sees the client or nil depends on which goroutine takes
-		// sess.mu first. A mutation removing it therefore SURVIVES — the honest
-		// signal that this is defensive breadth rather than a pinned behavior;
-		// without it, the deliveries that lose that race are the ones whose
-		// redelivery reaches the client wrongly marked DUP. Same posture as the
-		// stale-attempt re-validation in sess_uncertain.go.
-		if (sess.c == cc || sess.c == nil) && sub.mqtt != nil && sub.mqtt.phaseOwned && sub.mqtt.jsDur != _EMPTY_ {
-			sseq, _, _, _, _ := ackReplyInfo(reply)
-			if sseq > 0 {
-				if sess.deferred == nil {
-					sess.deferred = make(map[mqttDeferredKey]string)
-				}
-				sess.deferred[mqttDeferredKey{sub.mqtt.jsDur, sseq}] = reply
-			}
-		}
+		// The recording itself — the owed-delivery predicate, and its sess.c == nil
+		// arm, which covers a RACE rather than a state a test can schedule — lives in
+		// recordWithheldDeliveryLocked, shared with the connection-scoped restore
+		// verdict so both withholdings owe the client the same thing. In THIS branch
+		// the subscription is always closed, so that predicate reduces to the
+		// phase-owned test this arm used to make inline.
+		sess.recordWithheldDeliveryLocked(cc, sub, reply)
 		sess.mu.Unlock()
 		return
 	}
@@ -15339,6 +15524,27 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 
 	// This is immutable
 	sess := cc.mqtt.sess
+
+	// Before anything, and before sub.mqtt is touched: ensurePubRelConsumerSubscription
+	// installs this subscription with a bare c.processSub, whose NATS handler goes
+	// live BEFORE processSub returns, so a stored PUBREL can arrive here with no
+	// per-subscription metadata attached at all. The connection-scoped verdict is
+	// armed before any subscribe, which is what makes it readable here. WITHOUT
+	// ACKNOWLEDGING on a withheld verdict, so JetStream redelivers; PUBREL carries
+	// no DUP ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing is owed
+	// beyond that. See sess_restore_gate.go.
+	switch sess.awaitRestoreGate(cc) {
+	case mqttRestoreGateWithheld:
+		mqttTestRestoreGateBlockedHook("pubrel")
+		return
+	case mqttRestoreGateTimedOut:
+		// NAK rather than simply returning: a PUBREL carries no withheld marker, so
+		// nothing else would re-drive it, and the wait's bound can be well short of
+		// AckWait. See mqttRestoreGateTimedOut.
+		mqttTestRestoreGateBlockedHook("pubrel")
+		sess.jsa.sendMsg(reply, AckNak)
+		return
+	}
 
 	// A PUBREL that completes a DRAINED source is owned end to end here, with ONE
 	// ordering on every path — first delivery and replay alike: confirm the phase
@@ -15774,14 +15980,29 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error)
 //
 // Runs from client's readLoop.
 // Lock not held on entry, but session is in the locked map.
-func (sess *mqttSession) cleanupFailedSub(c *client, tok recordTx, sub *subscription, cc *ConsumerConfig, jssub *subscription) {
+func (sess *mqttSession) cleanupFailedSub(c *client, tok recordTx, fromSubProto bool, sub *subscription, cc *ConsumerConfig, jssub *subscription) {
 	if sub != nil {
 		c.processUnsub(sub.sid)
 	}
 	if jssub != nil {
 		c.processUnsub(jssub.sid)
 	}
-	if cc != nil {
+	// On the CONNECT RESTORE path the consumer is left exactly as it is, and the
+	// cleanup is the connection-local subscriptions alone.
+	//
+	// This used to dispose of it, which was survivable while a restore failure was
+	// dropped and the CONNECT accepted anyway — the next resume's reconciliation
+	// would repair a deleted plain durable. It is the wrong disposition now that
+	// the failure REFUSES the CONNECT: the record still names that durable, its
+	// backlog is retained by its interest, and nothing about this connection going
+	// away makes it unwanted. The reachable shape is a multi-level filter whose
+	// level-up companion fails after the main half succeeded, which arrives here
+	// with the main half's config in hand.
+	//
+	// What this connection did add to tmaxack is refunded by the caller, per
+	// filter, from the amounts the joins reported — never derived from cc, which
+	// says nothing about who charged it. See sess_restore_gate.go.
+	if cc != nil && fromSubProto {
 		// A shared group consumer must never be deleted outright on a local
 		// failure — other members may hold it. Route through the last-holder
 		// release (the caller has already rolled back this session's membership).
@@ -16173,8 +16394,12 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 // returned so the caller's cleanup can release it. Spec5 [4.8.2].
 //
 // Runs from the client's readLoop. sess.mu not held on entry.
+// The third result is the MaxAckPending THIS INVOCATION added to tmaxack, and 0
+// when it reused a resident cons entry instead. The caller needs the distinction:
+// cc comes back on both paths, so a cleanup refunding by cc.Durable would erase a
+// charge an EARLIER connection made and leave tmaxack permanently short.
 func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
-	qos byte, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
+	qos byte, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, int, error) {
 
 	sess.mu.Lock()
 	cc, exists := sess.cons[sid]
@@ -16199,7 +16424,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 			}
 			sess.subsMu.Unlock()
 			sess.mu.Unlock()
-			return cc, sub, nil
+			return cc, sub, 0, nil
 		}
 		// exists but no live deliver sub (session resume on a new connection):
 		// fall through to (re)subscribe without recreating or recharging.
@@ -16210,7 +16435,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 	if maxAckPending == 0 {
 		maxAckPending = mqttDefaultMaxAckPending
 	}
-	var charged bool
+	var charged int
 	if !exists {
 		// A stream-level consumer InactiveThreshold would give the group durable
 		// a delete timer, reaping it while all members are offline. Check the
@@ -16220,17 +16445,17 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		// (the client can retry) instead of risking a reapable durable. Spec5 [4.8.2].
 		si, err := sess.jsa.lookupStream(mqttStreamName)
 		if err != nil || si == nil {
-			return nil, nil, fmt.Errorf("shared subscriptions unavailable: unable to verify messages stream consumer limits: %v", err)
+			return nil, nil, 0, fmt.Errorf("shared subscriptions unavailable: unable to verify messages stream consumer limits: %v", err)
 		}
 		if si.Config.ConsumerLimits.InactiveThreshold != 0 {
-			return nil, nil, fmt.Errorf("shared subscriptions unavailable: messages stream imposes a consumer inactivity limit")
+			return nil, nil, 0, fmt.Errorf("shared subscriptions unavailable: messages stream imposes a consumer inactivity limit")
 		}
 		ackWait := opts.MQTT.AckWait
 		if ackWait == 0 {
 			ackWait = mqttDefaultAckWait
 		}
 		if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
-			return nil, nil, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
+			return nil, nil, 0, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
 				after, mqttMaxAckTotalLimit)
 		}
 		ccr := &CreateConsumerRequest{
@@ -16252,7 +16477,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		// is idempotent (ActionCreateOrUpdate). Spec5 [4.8.2].
 		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 			c.Errorf("Unable to add shared JetStream consumer for subscription on %q: err=%v", subject, err)
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
 		cc = &ccr.Config
 		sess.mu.Lock()
@@ -16262,7 +16487,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		}
 		sess.sharedCharged[durable] = maxAckPending
 		sess.mu.Unlock()
-		charged = true
+		charged = maxAckPending
 	}
 
 	sess.mu.Lock()
@@ -16273,10 +16498,10 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		c.Errorf("Unable to create subscription for shared JetStream consumer on %q: %v", subject, err)
 		// Return cc (only when we created it this call) so the caller's cleanup,
 		// after rolling back the early-persisted membership, can release it.
-		if charged {
-			return cc, nil, err
+		if charged != 0 {
+			return cc, nil, charged, err
 		}
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	// Verify/repair the join: a concurrent leaver whose last-holder scan finished
 	// before this session's membership was persisted may have issued a (queued,
@@ -16284,13 +16509,13 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 	// Re-issue the idempotent CreateOrUpdate now that our membership is persisted
 	// and the queue interest is up: it recreates the durable if it was deleted and
 	// is a no-op otherwise, closing the join/leave race window. Spec5 [4.8.2].
-	if charged {
+	if charged != 0 {
 		ccr := &CreateConsumerRequest{Stream: mqttStreamName, Config: *cc}
 		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 			c.Warnf("Unable to verify shared JetStream consumer for subscription on %q: %v", subject, err)
 		}
 	}
-	return cc, sub, nil
+	return cc, sub, charged, nil
 }
 
 // releaseSharedConsumer removes this session's local delivery subscription and
