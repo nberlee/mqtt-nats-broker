@@ -59,7 +59,18 @@ func testSharedResidentSession(t *testing.T, b *testQ2AffBroker, id, durable str
 // T1. The defect itself: a group durable deleted out of band between a disconnect and a
 // resume. Before F-076 the reconnect was ACCEPTED with Session Present = 1 and the client
 // held a subscription on a subject nothing publishes to, forever and silently.
-func TestMQTTSharedGroupAbsentDurableRefusesTheResume(t *testing.T) {
+//
+// F-076 REFUSED that resume. F-077 REPAIRS it, and this fixture was rewritten rather than
+// relaxed: the assertion it used to make — CONNACK 0x83, reason "does not exist" — pinned a
+// behaviour F-076's own docs/CONFORMANCE.md entry called a residual and assigned to F-077
+// ("Making recovery the broker's own job is F-077"). What it asserts now is strictly MORE
+// than before: the resume succeeds, the durable exists again carrying the canonical
+// configuration, and the ownership CAS that licenses serving it actually ran.
+//
+// The two verdicts that are NOT repairable keep their refusals, and the fixtures below
+// prove it: a non-canonical durable may be serving other members and is not this broker's
+// to normalize, and an indeterminate reading establishes nothing at all.
+func TestMQTTSharedGroupAbsentDurableRepairsTheResume(t *testing.T) {
 	t.Parallel()
 	b := testQ2AffSetup(t, "absent")
 	ca, _ := b.member(t, "absentA", 300)
@@ -72,24 +83,28 @@ func TestMQTTSharedGroupAbsentDurableRefusesTheResume(t *testing.T) {
 		t.Fatalf("deleting the group durable out of band: %v", err)
 	}
 
-	c, _, reason, props := testSharedResidentReconnect(t, b, "absentA", 300)
+	c, _, reason, _ := testSharedResidentReconnect(t, b, "absentA", 300)
 	defer c.Close()
-	if reason != mqttReasonImplementationSpecificError {
-		t.Fatalf("resume with an absent group durable got CONNACK reason 0x%x, want 0x%x: the "+
-			"client would otherwise be told Session Present with a subscription that never delivers",
-			reason, mqttReasonImplementationSpecificError)
+	if reason != mqttConnAckRCConnectionAccepted {
+		t.Fatalf("resume with an absent group durable got CONNACK reason 0x%x, want 0x%x: F-077 "+
+			"recreates the durable rather than refusing the session",
+			reason, mqttConnAckRCConnectionAccepted)
 	}
-	// The reason string must name the filter and say the durable is GONE, not merely that
-	// something went wrong: absence and indeterminacy lead to the same refusal, and an
-	// operator (and the mutation that collapses the two) can only tell them apart here.
-	if props == nil || props.reasonString == _EMPTY_ {
-		t.Fatal("the refusal carried no reason string")
+	// The repair is the point, so the durable's EXISTENCE is the oracle — an accepted
+	// CONNACK alone would also be produced by a build that skipped the verification
+	// entirely, which is the F-076 defect this file exists to hold down.
+	ci, lerr := b.jsa.lookupConsumer(mqttStreamName, durable)
+	if lerr != nil || ci == nil {
+		t.Fatalf("the resume was accepted but the group durable %q was not recreated: %v", durable, lerr)
 	}
-	if !strings.Contains(props.reasonString, "does not exist") {
-		t.Fatalf("refusal reason %q does not report the group consumer as absent", props.reasonString)
+	if ci.Config == nil {
+		t.Fatalf("recreated group durable %q carries no configuration", durable)
 	}
-	if !strings.Contains(props.reasonString, b.group) {
-		t.Fatalf("refusal reason %q does not name the shared filter", props.reasonString)
+	// Canonical, not merely present: a repair that provisioned a shape this broker would
+	// refuse on the next resume would leave the session refusing forever.
+	if ci.Config.DeliverGroup == _EMPTY_ || ci.Config.AckPolicy != AckExplicit ||
+		ci.Config.MaxDeliver != -1 || ci.Config.InactiveThreshold != 0 {
+		t.Fatalf("recreated group durable %q is not the canonical shape: %+v", durable, ci.Config)
 	}
 }
 
@@ -299,7 +314,7 @@ func testSetSharedGroupLookupFail(as *mqttAccountSessionManager, durable string)
 // nothing, which is this finding in miniature. Both directions are checked, because a
 // collection keyed by durable rather than by sid, or one deriving only half the pair,
 // would pass one direction and fail the other.
-func TestMQTTSharedGroupLevelUpCompanionIsVerifiedToo(t *testing.T) {
+func TestMQTTSharedGroupLevelUpCompanionIsRepairedToo(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -363,13 +378,25 @@ func TestMQTTSharedGroupLevelUpCompanionIsVerifiedToo(t *testing.T) {
 				props:      mqttV5ConnPropsSessionExpiry(300),
 			}, o.MQTT.Host, o.MQTT.Port)
 			defer c2.Close()
-			_, reason, props := testMQTTReadConnAckV5(t, r2)
-			if reason != mqttReasonImplementationSpecificError {
-				t.Fatalf("deleting %s left the resume ACCEPTED (0x%x): the other half of the pair "+
-					"answered for it, so a dead consumer was restored", tc.name, reason)
+			_, reason, _ := testMQTTReadConnAckV5(t, r2)
+			if reason != mqttConnAckRCConnectionAccepted {
+				t.Fatalf("deleting %s left the resume REFUSED (0x%x): F-077 repairs an "+
+					"authoritatively absent group durable", tc.name, reason)
 			}
-			if props == nil || !strings.Contains(props.reasonString, "does not exist") {
-				t.Fatalf("refusal did not report the durable as absent: %+v", props)
+			// The companion is verified — and now repaired — ON ITS OWN ACCOUNT. Asserting
+			// that the SPECIFIC deleted durable came back is what keeps "the other half of
+			// the pair answered for it" from passing: a build that classified only the main
+			// half would leave the companion absent and this lookup would fail.
+			if ci, lerr := jsa.lookupConsumer(mqttStreamName, target); lerr != nil || ci == nil {
+				t.Fatalf("deleting %s left it unrepaired: the other half of the pair answered "+
+					"for it, so a dead consumer was restored: %v", tc.name, lerr)
+			}
+			// And the half that was never deleted must still be there, so the repair did not
+			// disturb it.
+			for _, d := range durs {
+				if ci, lerr := jsa.lookupConsumer(mqttStreamName, d); lerr != nil || ci == nil {
+					t.Fatalf("durable %q is missing after the repair: %v", d, lerr)
+				}
 			}
 		})
 	}

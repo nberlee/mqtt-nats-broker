@@ -2980,10 +2980,13 @@ aggregation, so there is one refusal path rather than two.
 a clone of the live configuration in place of the remembered one. *Present and not canonical*
 refuses, and neither updates nor deletes: the durable may be serving other members, and a
 configuration this broker would not have built is not one it may normalize on their behalf.
-*Authoritatively absent* refuses. *Indeterminate* — a failed read, a reply carrying no
-consumer, a consumer carrying no configuration — refuses too, but is kept distinct from
-absence, because recreating on an unproven absence turns one broker's transient error into
-a group-wide change.
+*Authoritatively absent* is **repairable** — the durable provably is not there, so the next
+section recreates it and arbitrates the membership it is recreated into. *Indeterminate* —
+a failed read, a reply carrying no consumer, a consumer carrying no configuration — refuses,
+and is kept distinct from absence precisely because recreating on an unproven absence turns
+one broker's transient error into a group-wide change. That distinction was the reason to
+keep the two verdicts apart before anything acted on either, and it is what now decides
+which one may be acted on.
 
 **Validation is whole-struct and closed by construction.** Every `ConsumerConfig` field
 carries exactly one disposition, enforced by a reflection bijection, because a list of
@@ -2999,17 +3002,16 @@ remembered.
 
 **What this establishes is CONFIGURATION evidence, never OWNERSHIP evidence.** A present
 canonical durable does not prove this broker still owns the membership the restore is keyed
-on. A stale resident broker can validate one and serve from it, and a co-restored filter
-with no resident entry still creates through the join path unarbitrated. Both belong to
-F-077, and both are properties of the design before this change rather than consequences of
-it. The verification arm itself performs no group-durable write — a claim about the arm, not
-about the restore operation, which still creates for every non-resident filter.
+on. That is a separate fact needing a separate instrument, and the next section is it: on
+the CONNECT path every restoration of shared interest — whether it created, repaired or
+merely adopted — now proves ownership with a classified record write before the CONNACK. On
+the **live SUBSCRIBE** path nothing does, and that is F-078.
 
 The window is narrowed, not closed: `CONSUMER.DELETE` and `CONSUMER.CREATE` are
 unconditioned, so a durable deleted or altered after the post-pass gets no further check on
-that CONNECT. And nothing self-repairs — this broker will not recreate the durable, so the
-same resident session goes on refusing while the condition persists, recovering if it
-clears by any means. Both are recorded in `docs/CONFORMANCE.md`.
+that CONNECT. Self-repair now exists for exactly one verdict — an authoritative absence is
+recreated — while a non-canonical or unreadable durable still goes on refusing until the
+condition clears by any means. All of it is recorded in `docs/CONFORMANCE.md`.
 
 A record carrying a shared group consumer configuration in `Cons` is a shape this broker
 never writes, and is **refused** at every ingress that reads one rather than accommodated:
@@ -3019,6 +3021,124 @@ they would claim, rewrite and delete the record, normalizing a format nothing he
 understands — and the orphan sweep **aborts** rather than skipping, because that walk
 decides what to delete by absence of a reference and a partial view must never be reported
 as a complete one.
+
+## A restored shared membership is arbitrated against the record
+
+The verification above establishes what a group durable *is*. It establishes nothing about
+whether this broker still *owns* the membership being restored into it, and those are
+different facts needing different instruments. This section is the second one, for the
+CONNECT/resume path.
+
+**The finding (F-077).** Broker A holds a resident session with a shared membership. B
+accepts a newer CONNECT for the same client ID, its path removes the membership — a 3.1.1
+forced leave, an UNSUBSCRIBE, or `clear()` — and B's last-holder scan deletes the group
+durable. A restores that membership anyway and serves the group. "Serves" includes
+**acknowledging**: the QoS 1/2 delivery callback acks and drops on a reserved-subject
+violation, on a subscribe deny, on No Local suppression, and delivers-and-acks a shared
+QoS 0 member. Each of those destroys a group message for the members that legitimately hold
+the membership.
+
+**Three routes reach it, and only two of them create anything.** A resume whose durables
+all verify present-and-canonical adopts and creates nothing, yet installs delivery interest
+under a membership it never revalidated. A resume whose durable is authoritatively absent
+now recreates it (below). A record-sourced filter — every shared filter of a session
+rebuilt from its record, since shared configs are never persisted — takes the join path and
+creates. All three are arbitrated; a create-scoped rule would have covered only the last
+two.
+
+**The instrument is a classified record write, and it has to be a write.** A read cannot
+arbitrate: JetStream returns 10164 from the clustered pre-proposal check while a write for
+the subject is in process, so "the record did not move" is not provable from a load — the
+contender's proposal can commit a moment later. `proveSharedMembershipOwnership` performs
+the ordinary record write under its per-subject CAS at `sess.seq`, inside the CONNECT's
+still-open accept transaction, and classifies the outcome. On a resume the body is normally
+the same membership that was read, so it looks like a no-op rewrite and is not one: every
+write stamps a fresh `WID` and parents it to the current lineage, and the CAS is what no
+read could be.
+
+Five outcomes, and the two rejection kinds are deliberately not equivalent:
+
+- **landed** — this broker owned the record at the write's linearization point. The only
+  outcome that permits the CONNACK.
+- **10071**, the single-writer check, means another broker wrote after the accept save. It
+  disposes *without* consulting the contention resolver, so this is the only place a
+  sibling lineage can be recognised on that arm: the record is read once and classified,
+  which both narrows 0x8E to 0x89 where the record only supports it and mints the fork
+  grant. Collapsing 10071 to a bare takeover would lose both.
+- **10164** is clustered contention rather than a lost race, and gets the bounded
+  re-read/retry treatment, whose verdicts map onto the same five.
+- **ambiguous** — the mutation is KEPT, no further write is permitted, and the resolver
+  settles it. No CONNACK is written, so nothing is served meanwhile.
+- **definite local failure** — nothing was stored; refuse.
+
+Every refusal reuses the pre-CONNACK abort discipline, which already discards the Will and
+leaves the lifetime ungranted. **No `0x8E` reaches the client**: the displacement's
+DISCONNECT is gated on the CONNACK having been written, which is false for every refusal
+inside the CONNECT, so the connection closes silently. That is the same signal the
+reconciliation refusals give, and generalising it is a roadmap item of its own.
+
+**Why this path needs no transmission gate.** The restore gate is armed before the first
+subscription the CONNECT installs and opens only after a confirmed success CONNACK, and
+every delivery callback consults it — the QoS 0 raw subscription, the QoS 1/2 deliver
+subject, and the PUBREL and affine subscriptions a shared QoS 2 filter provisions before
+the group consumer exists. So nothing this connection could transmit or acknowledge escapes
+the window. One caveat, which is a claim about this connection's outputs rather than about
+the group: the gate stops transmission and acknowledgement but cannot undo *queue
+selection*, so a shared QoS 0 message selected for this member while the gate is closed is
+dropped and reaches no member at all. That is the restore gate's existing residual.
+
+**The trigger is restored interest, and it is stack-local.** The fact that a restore
+installed, repaired or adopted shared interest is raised at the sites that do it and
+aggregated on the caller's stack — committed per filter only once the whole filter succeeds,
+its level-up companion included. It is deliberately not a field on the session: a fact
+parked there outlives the operation that raised it and would govern the next one. It is also
+kept apart from two accounting facts it used to be inferred from, because each inference
+was wrong in a different way. The repair creates a durable this session already holds the
+`MaxAckPending` charge for, so it creates while charging nothing; a verify create gated on
+the charge would skip exactly the population that just recreated a durable, and a refund
+keyed on anything but this invocation's own charge would erase an earlier connection's.
+
+**Absence is repairable; nothing else is.** The verification's four outcomes are re-cut into
+one predicate — *terminal unless repairable* — with the authoritative absence as the only
+repairable verdict. That is stated as a class rather than as a special case at each decision
+site, because the batching seam it touches closed only when the special cases were deleted.
+Repairability has to move three decisions together, and moving fewer leaves the repair
+unreachable: the batch's termination, the pre-pass's filter-failure, and the resume arm's
+own return. A chunk-level transport failure is not a per-target verdict and stays terminal
+whatever sits around it.
+
+The asymmetry between the two passes is the mechanism. The **pre-pass** treats absence as
+repairable, so the join path recreates the durable and the ownership write then proves the
+membership is still ours. The **post-pass** treats absence as terminal: a durable absent
+again *after* the repair is not one this broker may create, it is one something is deleting
+underneath this CONNECT.
+
+**A durable this broker created and then lost the arbitration for is left in place**, and
+that is a decision rather than an omission. Every available deletion is refuted — the
+last-holder scan skips same-client-ID records, so after a takeover a blind last-holder
+delete destroys the *new* owner's durable, and the shared release helper refunds a historic
+charge and purges through an already-rejected transaction. If the new owner does hold the
+membership, the durable is what it needs. It is not inert, though: the messages stream is
+interest-retained so the durable keeps interest, it can accumulate pending across the
+orphan sweep's grace window, and a later joiner may receive messages published while no
+authoritative membership existed. `docs/CONFORMANCE.md` states that rather than implying it
+away.
+
+**What this establishes, and what it does not.** Ownership of the *record*, at the write's
+linearization point — not continuously, and not the presence of the *consumer*.
+`CONSUMER.CREATE` and `CONSUMER.DELETE` carry no precondition field at all, so no finite
+check binds the durable's existence to the record's ownership: the durable may vanish at any
+point after the last verification or write, this write included, and only the next resume
+detects it. A takeover *after* a landed write is the session-record watch's and its
+committed-read backstop's to converge.
+
+**The live SUBSCRIBE path is not arbitrated at all**, and that is F-078 rather than a
+residual of this design. It installs and revives the same interest with no ownership write,
+and closing it needs a packet-scoped transmission gate this path has no equivalent of,
+because the restore gate is already open on a live connection. The defect is the one `main`
+carries today; this change does not worsen it, but the repair does broaden the set of states
+that reach it — an authoritatively absent durable used to refuse the CONNECT outright and
+now yields a live, repaired connection.
 
 ## The restore gate: the CONNACK follows a complete restoration
 

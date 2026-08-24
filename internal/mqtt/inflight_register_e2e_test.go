@@ -930,9 +930,22 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	})
 	defer restoreSave()
 	landed := 0
+	// The record AS THE ACCEPT SAVE LEFT IT, captured the moment that write lands.
+	//
+	// It has to be captured rather than loaded afterwards. A resumed SHARED membership is
+	// arbitrated by a further record write before the CONNACK (F-077), and `$MQTT_sess`
+	// keeps one message per subject — so that second write DELETES the accept save's
+	// record, and "load the record after the reconnect" cannot see it at all. Between the
+	// two writes is the only moment it exists, which is exactly where this hook runs.
+	var acceptRecord *mqttPersistedSession
 	restoreCount := setMQTTTestSessStoreResultHook(func(cur *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
 		if cur == sess && err == nil {
 			landed++
+			if acceptRecord == nil {
+				if got, _, lerr := asm.loadFenceSession(sess.idHash); lerr == nil && got != nil {
+					acceptRecord = got
+				}
+			}
 		}
 		return resp, err
 	})
@@ -978,10 +991,10 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 		t.Fatal("the reconnect's accept save must have landed")
 	}
 
-	// The record it wrote carries the inherited verdict...
-	ps, _, err := asm.loadFenceSession(sess.idHash)
-	if err != nil || ps == nil {
-		t.Fatalf("load the session record after the reconnect: ps=%+v err=%v", ps, err)
+	// The record IT wrote carries the inherited verdict.
+	ps := acceptRecord
+	if ps == nil {
+		t.Fatal("the accept save's own record was never captured, so what it carried is unknown")
 	}
 	for _, n := range nonces {
 		found := false

@@ -15,15 +15,18 @@
 // WHAT THIS FILE ESTABLISHES, AND WHAT IT DELIBERATELY DOES NOT. It establishes
 // CONFIGURATION EVIDENCE: the durable exists and carries a configuration this broker would
 // recognise. It establishes NOTHING about ownership — a present canonical consumer does not
-// prove this broker still owns the membership the restore is keyed on, and a stale resident
-// broker can validate one and serve from it. That is F-077, and it is a defect that exists
-// independently of this file: no group-durable create on any path is followed by a
-// revalidation of the membership's record ownership.
+// prove this broker still owns the membership the restore is keyed on. That fact needs its
+// own instrument, and F-077 added it: on the CONNECT path a classified record write proves
+// ownership before the CONNACK (shared_group_arbitrate.go). On the LIVE SUBSCRIBE path
+// nothing does, which is F-078.
 //
-// The verification arm issues NO group-durable write. It reads, and where it cannot prove
-// what it needs, it refuses the filter — which reaches the pre-CONNACK refusal through the
-// existing per-filter aggregation. It does not recreate: recreating is a provisioning act,
-// it belongs with the ownership arbitration that must accompany it, and both are F-077.
+// The verification arm still issues no group-durable write of its own. What changed with
+// F-077 is which verdicts it may hand on to a repair: an AUTHORITATIVE ABSENCE is
+// repairable, so the resume arm recreates the durable and the ownership write then proves
+// the membership it was recreated into is still ours. Every other error stays terminal, and
+// the POST-pass keeps absence terminal too — a durable absent again after the repair is one
+// something is deleting underneath this CONNECT, not one this broker may create. See
+// mqttSharedGroupVerdictIsTerminal and mqttSharedGroupVerdictEndsRestore.
 package mqtt
 
 import (
@@ -40,13 +43,61 @@ import (
 // established it.
 var (
 	// errSharedGroupAbsent: the lookup COMPLETED and reported the consumer not there.
-	// Authoritative. Nothing here acts on it beyond refusing, because recreating under a
-	// membership whose ownership is unrevalidated is F-077's problem to solve.
+	// Authoritative, and the ONE verdict F-077 made repairable: the CONNECT pre-pass hands
+	// it to the resume arm, which recreates the durable, and the ownership CAS then proves
+	// the membership it was recreated into is still ours. It stays terminal in the
+	// POST-pass, where an absence is no longer something to create but something being
+	// deleted underneath this CONNECT. See mqttSharedGroupVerdictIsTerminal.
 	errSharedGroupAbsent = errors.New("the shared group consumer does not exist")
 	// errSharedGroupIndeterminate: nothing was established. A failed read, a response
 	// carrying no consumer, or a consumer carrying no configuration. Fails closed.
 	errSharedGroupIndeterminate = errors.New("the shared group consumer could not be verified")
 )
+
+// mqttSharedGroupVerdictIsTerminal reports whether a verdict ends the restore for its
+// filter — the batch stops, everything unexamined is judged indeterminate, and the filter
+// is failed so the pre-CONNACK aggregation refuses.
+//
+// The rule is stated as a CLASS, not as a list of failure modes, and that is deliberate.
+// F-076's batching seam took four review rounds and closed only when the rule became "any
+// verdict carrying an error is terminal, no special cases"; re-opening it with an
+// `if errors.Is(v.err, errSharedGroupAbsent)` at each decision site is the regression those
+// rounds paid for. So there is exactly one predicate, and repairability is a property of
+// the VERDICT rather than of how the failure arose:
+//
+//	terminal  <=>  the verdict carries an error that is not repairable
+//
+// errSharedGroupAbsent is the only repairable verdict, because it is the only one an
+// authoritative reading can act on: the durable provably is not there, so recreating it
+// under a proven membership is a defined operation (F-077). A non-canonical durable may be
+// serving other members and is not this broker's to normalize; an indeterminate reading
+// established nothing at all, and recreating on it turns one broker's transient error into
+// a group-wide change (feedback_absence_is_not_a_fact).
+//
+// A CHUNK-LEVEL transport failure is not a per-target verdict, and stays terminal whatever
+// sits around it: it is mapped to errSharedGroupIndeterminate before reaching here.
+func mqttSharedGroupVerdictIsTerminal(v mqttSharedGroupVerdict) bool {
+	return v.err != nil && !mqttSharedGroupVerdictIsRepairable(v)
+}
+
+// mqttSharedGroupVerdictIsRepairable reports whether F-077's resume repair may act on this
+// verdict. Exactly one verdict qualifies; see mqttSharedGroupVerdictIsTerminal.
+//
+// PRE-PASS ONLY. The post-pass calls the terminal predicate through
+// mqttSharedGroupVerdictEndsRestore instead, so an absence observed AFTER the repair ran
+// refuses: it is no longer a durable this broker can create, it is one something is
+// deleting underneath this CONNECT. That asymmetry is the mechanism, not an oversight.
+func mqttSharedGroupVerdictIsRepairable(v mqttSharedGroupVerdict) bool {
+	return errors.Is(v.err, errSharedGroupAbsent)
+}
+
+// mqttSharedGroupVerdictEndsRestore is the POST-pass's terminal test: every error ends the
+// restore, absence included. Named apart from mqttSharedGroupVerdictIsTerminal so the
+// pre/post asymmetry is visible at both call sites rather than carried in a boolean
+// argument that a later caller can pass wrongly.
+func mqttSharedGroupVerdictEndsRestore(v mqttSharedGroupVerdict) bool {
+	return v.err != nil
+}
 
 // mqttSharedGroupVerdict is what the batched classification concluded for one durable.
 type mqttSharedGroupVerdict struct {
@@ -414,7 +465,9 @@ func (sess *mqttSession) collectResidentSharedGroups(filters []*mqttFilter) []mq
 // closed rather than skipping the bound.
 //
 // No lock held on entry.
-func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGroupTarget) map[string]mqttSharedGroupVerdict {
+func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGroupTarget,
+	ends func(mqttSharedGroupVerdict) bool) map[string]mqttSharedGroupVerdict {
+
 	out := make(map[string]mqttSharedGroupVerdict, len(targets))
 	if len(targets) == 0 {
 		return out
@@ -447,18 +500,24 @@ func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGr
 	//     unlimited, so one unbounded request would let a single reconnect build an
 	//     arbitrary request set.
 	//
-	//   - Abandoned the moment any target's verdict is a refusal. A refusal — for ANY
-	//     reason: a transport failure, an unreadable reply, an absence, a non-canonical
-	//     configuration — already refuses the whole CONNECT through the per-filter
-	//     aggregation. Every lookup after that point is work whose result cannot change
-	//     the outcome, and each carries its own timeout, so continuing lets the client
-	//     choose how long the CONNECT stalls. In the POST-pass that is not merely latency:
-	//     this connection's shared queue interest is already installed, so QoS 0 messages
-	//     selected for it are dropped behind the restore gate for the whole walk.
+	//   - Abandoned the moment a verdict is TERMINAL, which the caller's `ends` predicate
+	//     decides. A terminal verdict already refuses the whole CONNECT through the
+	//     per-filter aggregation, so every lookup after it is work whose result cannot
+	//     change the outcome, and each carries its own timeout — continuing would let the
+	//     client choose how long the CONNECT stalls. In the POST-pass that is not merely
+	//     latency: this connection's shared queue interest is already installed, so QoS 0
+	//     messages selected for it are dropped behind the restore gate for the whole walk.
+	//
+	// The predicate is the caller's because the two passes disagree about exactly one
+	// verdict. In the PRE-pass an authoritative absence is REPAIRABLE, so classification
+	// continues and the resume arm recreates the durable (F-077); in the POST-pass it is
+	// terminal, because an absence after the repair is something being deleted underneath
+	// this CONNECT rather than something to create. Everything else is terminal in both.
 	//
 	// Earlier revisions special-cased only the transport error, which is why a
-	// response-level refusal kept walking. There is no special case now: a transport
-	// failure is simply one way a verdict comes back refusing.
+	// response-level refusal kept walking. There is still no special case here: a transport
+	// failure is one way a verdict comes back refusing, and repairability is a property of
+	// the verdict rather than of how the failure arose.
 	for start := 0; start < len(targets); start += mqttInflightLoadBatch {
 		end := min(start+mqttInflightLoadBatch, len(targets))
 		chunk := targets[start:end]
@@ -504,7 +563,7 @@ func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGr
 				v = classifySharedGroupConsumer(info, ok, t.group, t.subject, streamMaxAckPending)
 			}
 			out[t.sid] = v
-			if v.err == nil {
+			if !ends(v) {
 				continue
 			}
 			// Terminal. Keep what this chunk established, judge everything still
@@ -531,9 +590,21 @@ func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGr
 // reading is the one adopted. A refusal-only post-pass makes those claims false.
 //
 // sess.mu is taken internally, per the discipline every other cons writer follows.
-func applySharedGroupPostPass(sess *mqttSession, filters []*mqttFilter,
-	verdicts map[string]mqttSharedGroupVerdict) {
+// It CLASSIFIES as well as applies, and that is the point of the signature: the post-pass
+// is strict — every error ends the restore, absence included — and taking `targets` rather
+// than a verdict map means the caller has no predicate to choose and therefore no way to
+// wire the lenient pre-pass rule in here by mistake. An earlier revision passed the map,
+// the call site selected the predicate, and it selected the wrong one; the review that
+// caught it then found the corrected call site was still unpinned by any test, because a
+// direct-call test proves the predicate and not the wiring. Deleting the choice is what
+// closes both.
+func applySharedGroupPostPass(as *mqttAccountSessionManager, sess *mqttSession,
+	filters []*mqttFilter, targets []mqttSharedGroupTarget) {
 
+	if len(targets) == 0 {
+		return
+	}
+	verdicts := as.classifySharedGroups(targets, mqttSharedGroupVerdictEndsRestore)
 	if len(verdicts) == 0 {
 		return
 	}
@@ -549,7 +620,7 @@ func applySharedGroupPostPass(sess *mqttSession, filters []*mqttFilter,
 		}
 	}
 	sess.mu.Unlock()
-	failSharedGroupFilters(filters, verdicts)
+	failSharedGroupFilters(filters, verdicts, mqttSharedGroupVerdictEndsRestore)
 }
 
 // failSharedGroupFilters marks every filter whose group durable did not verify, so the
@@ -561,7 +632,16 @@ func applySharedGroupPostPass(sess *mqttSession, filters []*mqttFilter,
 //
 // A filter is failed by its OWN sid or by its level-up companion's, because either dead
 // half makes the subscription the client is being told about incomplete.
-func failSharedGroupFilters(filters []*mqttFilter, verdicts map[string]mqttSharedGroupVerdict) {
+//
+// `ends` decides WHICH verdicts fail a filter, and the two passes pass different
+// predicates. That is the second of the three decisions repairability has to move — the
+// first is the batch termination in classifySharedGroups, the third is the resume arm's own
+// return — and moving only one of them leaves the repair unreachable: a filter failed here
+// never reaches processSubs at all, because mqttFirstUnrestoredFilter refuses the CONNECT
+// before it (F-077).
+func failSharedGroupFilters(filters []*mqttFilter, verdicts map[string]mqttSharedGroupVerdict,
+	ends func(mqttSharedGroupVerdict) bool) {
+
 	if len(verdicts) == 0 {
 		return
 	}
@@ -576,7 +656,7 @@ func failSharedGroupFilters(filters []*mqttFilter, verdicts map[string]mqttShare
 		}
 		for _, s := range sids {
 			v, seen := verdicts[s]
-			if !seen || v.err == nil {
+			if !seen || !ends(v) {
 				continue
 			}
 			f.qos = mqttSubAckFailure

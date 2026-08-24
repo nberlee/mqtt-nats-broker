@@ -7193,9 +7193,18 @@ func mqttShouldSendRetained(retainHandling byte, subs map[string]byte, filter st
 // sid, and nil on the SUBSCRIBE path. It is passed explicitly rather than parked on the
 // session so its lifetime is one restore and nothing can read a previous connection's
 // judgement. See shared_group_verify.go.
+// The second result is F-077's arbitration trigger: this operation installed, repaired,
+// adopted or refreshed shared group delivery interest. It is a RETURN VALUE rather than a
+// session field on purpose — see mqttSharedJoinResult.installed.
+//
+// What the caller owes on it differs by path, and the asymmetry is the open defect rather
+// than an oversight. The CONNECT caller MUST prove ownership before the CONNACK, and does.
+// mqttProcessSubs deliberately DISCARDS the fact, so live interest serves unarbitrated —
+// closing that needs a packet-scoped transmission gate the CONNECT path has no equivalent
+// of, because the restore gate is already open on a live connection. That is F-078.
 func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, tok recordTx,
 	filters []*mqttFilter, fromSubProto, trace bool,
-	sharedVerdicts map[string]mqttSharedGroupVerdict) ([]*subscription, error) {
+	sharedVerdicts map[string]mqttSharedGroupVerdict) ([]*subscription, bool, error) {
 
 	// Hold the subs barrier for the whole SUBSCRIBE (or CONNECT session
 	// restore) processing: concurrent QoS 1/2 stores wait in
@@ -7414,6 +7423,13 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	// back: those deliveries stay live and still owe their identifiers.
 	var voidedSent []string
 
+	// sharedInterestRestored is F-077's arbitration trigger, aggregated on THIS STACK and
+	// nowhere else: a fact parked on mqttSession would outlive the operation that raised it
+	// and govern the next one. It is committed per filter only at the whole-filter success
+	// boundary below, so a filter whose level-up companion fails is rolled back out of it
+	// exactly as it is rolled back out of everything else.
+	var sharedInterestRestored bool
+
 	var err error
 	subs := make([]*subscription, 0, len(filters))
 	for _, f := range filters {
@@ -7479,7 +7495,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					// want of proof, so there is no landed continuation to register.
 					// Spec5 [4.8.2]. See sess_uncertain.go.
 					c.Errorf("MQTT: shared membership write for %q is unresolved; abandoning the SUBSCRIBE with its state intact: %v", sess.id, err)
-					return nil, err
+					return nil, sharedInterestRestored, err
 				}
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
@@ -7506,6 +7522,10 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// refunding by durable would erase an EARLIER connection's charge and leave
 		// tmaxack permanently short. See sess_restore_gate.go.
 		var filterCharged []mqttSharedCharge
+
+		// Whether THIS filter touched shared delivery interest, in either half. Promoted
+		// to the packet aggregate only once the whole filter succeeds.
+		var filterInstalled bool
 
 		// Deferred consumer deletes recorded by THIS filter, so a later per-filter
 		// failure can cancel them (restore the sess.cons entry, keep the durable).
@@ -7552,7 +7572,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// Rollback persistence not confirmed: hard-error WITHOUT releasing
 				// resources, so we never delete a group durable the record may still
 				// claim membership in. Spec5 [4.8.2].
-				return subs, rerr
+				return subs, sharedInterestRestored, rerr
 			}
 			if doCleanup {
 				sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
@@ -7567,9 +7587,11 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// consumer will be deleted. Shared subscriptions always join the group
 		// consumer (even at QoS0, so stored messages are delivered at QoS0).
 		if f.shared {
-			var amt int
-			jscons, jssub, amt, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto, sharedVerdicts)
-			filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, subject), amt)
+			var jr mqttSharedJoinResult
+			jr, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto, sharedVerdicts)
+			jscons, jssub = jr.cc, jr.sub
+			filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, subject), jr.charged)
+			filterInstalled = filterInstalled || jr.installed
 		} else {
 			var dd *ConsumerConfig
 			jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
@@ -7603,7 +7625,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// Rollback persistence not confirmed: hard-error WITHOUT releasing
 				// resources, so we never delete a group durable the record may still
 				// claim membership in. Spec5 [4.8.2].
-				return subs, rerr
+				return subs, sharedInterestRestored, rerr
 			}
 			if doCleanup {
 				sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
@@ -7643,7 +7665,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				cancelFilterDeferred()
 				doCleanup, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
 				if rerr != nil {
-					return subs, rerr
+					return subs, sharedInterestRestored, rerr
 				}
 				if doCleanup {
 					sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
@@ -7653,9 +7675,11 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			}
 
 			if f.shared {
-				var fwamt int
-				fwjscons, fwjssub, fwamt, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto, sharedVerdicts)
-				filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, fwcsubject), fwamt)
+				var fwjr mqttSharedJoinResult
+				fwjr, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto, sharedVerdicts)
+				fwjscons, fwjssub = fwjr.cc, fwjr.sub
+				filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, fwcsubject), fwjr.charged)
+				filterInstalled = filterInstalled || fwjr.installed
 			} else {
 				var fwdd *ConsumerConfig
 				fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
@@ -7684,7 +7708,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				cancelFilterDeferred()
 				doCleanup, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
 				if rerr != nil {
-					return subs, rerr
+					return subs, sharedInterestRestored, rerr
 				}
 				if doCleanup {
 					sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
@@ -7700,6 +7724,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 
 		subs = append(subs, sub)
 		addJSConsToSess(sid, jscons)
+		// THE COMMIT BOUNDARY. Both halves are installed and every per-filter failure exit
+		// above has been passed, so this filter's interest is the client's.
+		sharedInterestRestored = sharedInterestRestored || filterInstalled
 		if !fromSubProto {
 			// One filter's installs are complete and later filters are not started.
 			// The seam is here rather than at the end of the restore because that is
@@ -7733,7 +7760,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// resolver must hold the fence. The readLoop resolves after it closes.
 				// See mqttResolveAfterPacket.
 				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state: %v", sess.id, err)
-				return nil, err
+				return nil, sharedInterestRestored, err
 			}
 			sess.reopenTeardownDelivery(closedDeliveries)
 			sess.unvoidRegNonces(voidedSent)
@@ -7794,7 +7821,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 	}
 
-	return subs, err
+	return subs, sharedInterestRestored, err
 }
 
 // rollbackSharedSub undoes the early membership persistence done for a shared
@@ -12175,7 +12202,7 @@ restoreSession:
 		// Only resident sids are in scope. A filter with no resident cons entry takes
 		// the join path, which creates the durable and thereby proves it.
 		sharedTargets := es.collectResidentSharedGroups(filters)
-		sharedVerdicts := asm.classifySharedGroups(sharedTargets)
+		sharedVerdicts := asm.classifySharedGroups(sharedTargets, mqttSharedGroupVerdictIsTerminal)
 		// STOP HERE if the pre-pass already refused, and do not restore at all.
 		//
 		// The same rule classifySharedGroups applies internally, applied at the level it
@@ -12190,7 +12217,12 @@ restoreSession:
 		// subscriptions BEFORE this point, and they hold consumer interest until something
 		// reclaims them. That is why this shares the refusal shape below rather than
 		// returning early on its own.
-		failSharedGroupFilters(filters, sharedVerdicts)
+		// The PRE-pass: a REPAIRABLE verdict — an authoritative absence — does not fail its
+		// filter and does not stop the restore, because F-077's resume repair recreates the
+		// durable under a membership the ownership CAS then proves is still ours. Every
+		// other error is terminal exactly as before. See
+		// mqttSharedGroupVerdictIsTerminal.
+		failSharedGroupFilters(filters, sharedVerdicts, mqttSharedGroupVerdictIsTerminal)
 		if f := mqttFirstUnrestoredFilter(filters); f != nil {
 			if len(phaseSubs) > 0 {
 				es.sweepUnadoptedPhaseSubs(c, phaseSubs)
@@ -12201,7 +12233,7 @@ restoreSession:
 			refuseRestore(rerr)
 			return formatError(rerr)
 		}
-		_, serr := asm.processSubs(es, c, acceptTok, filters, false, trace, sharedVerdicts)
+		_, sharedInterestRestored, serr := asm.processSubs(es, c, acceptTok, filters, false, trace, sharedVerdicts)
 		// The sweep runs BEFORE the error is tested: a subscription restoration
 		// skipped stays closed and phase-owned, holding consumer interest while
 		// delivering nothing, and nothing later would remove it. The deferred
@@ -12239,7 +12271,70 @@ restoreSession:
 			if between != nil {
 				between()
 			}
-			applySharedGroupPostPass(es, filters, asm.classifySharedGroups(sharedTargets))
+			// The post-pass classifies STRICTLY and does it itself: every error ends the
+			// restore, absence included. There is deliberately no predicate to pass here —
+			// see applySharedGroupPostPass.
+			applySharedGroupPostPass(asm, es, filters, sharedTargets)
+		}
+		// ARBITRATE. Everything above proved the durables' CONFIGURATION; nothing proved
+		// this broker still OWNS the membership they were restored into (F-077). One
+		// classified record write, CAS'd at sess.seq under the accept transaction, does —
+		// and only a write can, because a load cannot distinguish "the record did not move"
+		// from "a contender's proposal has not committed yet".
+		//
+		// Conditioned on interest having actually been restored, not on a durable having
+		// been created: a resume that finds every durable present-and-canonical creates
+		// nothing and still serves. And not on the record merely naming a shared filter: if
+		// every shared filter failed before installing anything, the aggregation below is
+		// already refusing this CONNECT and a write here would arbitrate nothing.
+		//
+		// It runs AFTER the last group-durable write of the restore — the join create and
+		// the post-subscribe verify create both sit inside processSubs — and BEFORE the
+		// CONNACK, so every delivery in the window is still withheld by the restore gate.
+		if sharedInterestRestored {
+			v := es.proveSharedMembershipOwnership(acceptTok)
+			mqttTestSharedArbitratePause("after-ownership-cas")
+			switch v.outcome {
+			case mqttGroupOwnershipOurs:
+				// Still ours at the write's linearization point. Proceed.
+			case mqttGroupOwnershipForeign, mqttGroupOwnershipForked:
+				// Another owner holds the record, or a sibling erased our write. Either way
+				// this connection must not serve the group. The pre-CONNACK abort discards
+				// the Will and leaves the lifetime ungranted; the vocabulary decides whether
+				// the client is told 0x8E (stop) or 0x89 (reconnect).
+				rerr := fmt.Errorf("shared subscription ownership could not be confirmed for session %q: %v", cid, v.err)
+				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+				// abortAcceptedResume BEFORE the disposal, which is the opposite order to
+				// the reconciliation phase's foreign arm, and deliberately so: the disposal
+				// schedules closeConnection on another goroutine, and this connection's Will
+				// must already be discarded when that close runs. The reconcile path is
+				// unaffected either way because its own exits clear the same exposure, and
+				// nothing here depends on the order — mqttAbortAcceptedConnect touches only
+				// c.mqtt (the Will and connectReceived), never sess.c, so the disposal's
+				// identity check still sees this connection as the session's owner.
+				//
+				// No 0x8E reaches the client: mqttNotifyDisplaced is gated on
+				// c.connAckWritten, which is false for every pre-CONNACK refusal, so the
+				// displacement closes SILENTLY. That is the same signal the reconciliation
+				// refusals give, and generalising it is its own roadmap item — this change
+				// does not add a new refusal packet.
+				abortAcceptedResume(false)
+				es.disposeForeignSessionLocked(asm, c, v.voc)
+				return formatError(rerr)
+			case mqttGroupOwnershipUnresolved:
+				// The write may have landed. The restored state is KEPT — that is what the
+				// resolver re-attempts and proves durable — and no further write is
+				// permitted until it settles. No CONNACK, so nothing is served meanwhile.
+				rerr := fmt.Errorf("shared subscription ownership is unresolved for session %q: %v", cid, v.err)
+				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+				abortAcceptedResume(false)
+				return formatError(rerr)
+			default: // mqttGroupOwnershipLocal
+				rerr := fmt.Errorf("shared subscription ownership could not be established for session %q: %v", cid, v.err)
+				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+				abortAcceptedResume(false)
+				return formatError(rerr)
+			}
 		}
 		// AGGREGATE the per-filter outcomes. This is local failure aggregation and
 		// nothing more — it does not arbitrate ownership, does not prove this broker
@@ -16180,7 +16275,13 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error)
 			c.Errorf("MQTT: %v", err)
 		}
 	}()
-	return asm.processSubs(sess, c, tok, filters, true, trace, nil)
+	// The live SUBSCRIBE path does NOT arbitrate: it installs and revives the same shared
+	// interest with no ownership write, which is the defect F-078 closes. It needs a
+	// packet-scoped transmission gate this path has no equivalent of, because the restore
+	// gate is already open on a live connection — so the trigger is deliberately discarded
+	// here rather than acted on half-way. See docs/ROADMAP.md F-078.
+	subs, _, err := asm.processSubs(sess, c, tok, filters, true, trace, nil)
+	return subs, err
 }
 
 // Cleanup that is performed in processSubs if there was an error.
@@ -16642,19 +16743,32 @@ func buildSharedGroupConsumerConfig(group, subject string, ackWait time.Duration
 // when it reused a resident cons entry instead. The caller needs the distinction:
 // cc comes back on both paths, so a cleanup refunding by cc.Durable would erase a
 // charge an EARLIER connection made and leave tmaxack permanently short.
-// verdicts carries the restore path's batched group-durable classification, keyed by sid,
-// and is nil on every other path. Only the resume arm reads it: a live SUBSCRIBE cannot
-// reach that arm (a connected session with a cons entry already has its deliver
-// subscription), and a filter with no resident entry takes the create path, which proves
-// the durable by creating it.
+// verdicts carries the CONNECT restore's batched group-durable classification, keyed by
+// sid, and is nil on the live SUBSCRIBE path. A filter with no resident entry takes the
+// create path either way, which proves the durable by creating it.
+//
+// F-076 justified the nil with "a live SUBSCRIBE cannot reach the resume arm, because a
+// connected session with a cons entry already has its deliver subscription". THAT IS FALSE,
+// and F-078 records the chain: a SUBSCRIBE whose rollback save fails DEFINITELY has
+// `readd` restore cons[sid] while sharedSubs stays at the pre-packet snapshot; the client
+// reconnects; the CONNECT builds its filters from sharedSubs, which lacks the key, so the
+// sid is never collected; and the resident cons entry then survives with no deliver
+// subscription. A later live SUBSCRIBE reaches this arm with nil verdicts, verifies
+// nothing and arbitrates nothing. Do not restore the old justification.
 func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
 	qos byte, retainAsPublished bool, subID int, fromSubProto bool,
-	verdicts map[string]mqttSharedGroupVerdict) (*ConsumerConfig, *subscription, int, error) {
+	verdicts map[string]mqttSharedGroupVerdict) (mqttSharedJoinResult, error) {
 
 	sess.mu.Lock()
 	cc, exists := sess.cons[sid]
 	tmaxack := sess.tmaxack
 	sess.mu.Unlock()
+
+	// repairing marks the S1 route: a resident entry whose durable the pre-pass proved
+	// AUTHORITATIVELY ABSENT, which takes the join arm below to recreate it. It is kept
+	// apart from `exists` because the charge decision differs — this session already holds
+	// the historic charge for that durable, so re-charging would double-count tmaxack.
+	var repairing bool
 
 	queue, deliver, durable := mqttSharedNames(group, subject)
 
@@ -16674,7 +16788,9 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 			}
 			sess.subsMu.Unlock()
 			sess.mu.Unlock()
-			return cc, sub, 0, nil
+			// A refresh REVIVES delivery interest under a membership this operation has not
+			// revalidated, so it raises the arbitration trigger exactly as a create does.
+			return mqttSharedJoinResult{cc: cc, sub: sub, installed: true}, nil
 		}
 		// exists but no live deliver sub: a session resume on a new connection.
 		//
@@ -16689,17 +16805,33 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		// processQOS12Sub, keeps the join path's own rule: a group durable must not deliver
 		// to this member until the join is proven. See shared_group_verify.go.
 		if v, judged := verdicts[sid]; judged {
-			if v.err != nil {
-				return nil, nil, 0, v.err
+			switch {
+			case mqttSharedGroupVerdictIsRepairable(v):
+				// AUTHORITATIVELY ABSENT, and this broker recreates it (F-077). The pre-pass
+				// deliberately does not fail the filter for this verdict, so control reaches
+				// here; `exists` is forced false so the join arm below creates the durable and
+				// thereby proves it, exactly as a filter with no resident entry does.
+				//
+				// Only this verdict. A non-canonical durable may be serving other members and
+				// is not this broker's to normalize on their behalf; an indeterminate reading
+				// established nothing, and recreating on it turns one broker's transient error
+				// into a group-wide change. Both keep refusing.
+				c.Warnf("MQTT: recreating the absent shared group consumer for filter %q of "+
+					"session %q (messages published while it was gone were not retained)",
+					sid, sess.id)
+				exists, repairing = false, true
+			case v.err != nil:
+				return mqttSharedJoinResult{}, v.err
+			default:
+				// Adopt the LIVE configuration in place of the remembered one. The remembered
+				// copy was captured on an earlier connection, and a member on another broker may
+				// legitimately have moved a variable field since; keeping it would finish the
+				// CONNECT holding state the account no longer agrees with.
+				sess.mu.Lock()
+				sess.cons[sid] = v.cfg
+				cc = v.cfg
+				sess.mu.Unlock()
 			}
-			// Adopt the LIVE configuration in place of the remembered one. The remembered
-			// copy was captured on an earlier connection, and a member on another broker may
-			// legitimately have moved a variable field since; keeping it would finish the
-			// CONNECT holding state the account no longer agrees with.
-			sess.mu.Lock()
-			sess.cons[sid] = v.cfg
-			cc = v.cfg
-			sess.mu.Unlock()
 		}
 	}
 
@@ -16709,7 +16841,12 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		maxAckPending = mqttDefaultMaxAckPending
 	}
 	var charged int
-	if !exists {
+	// created is THIS invocation's own fact, kept apart from charged because S1 repairs a
+	// durable this session already holds the charge for. Correctness must never be keyed on
+	// an accounting quantity: the verify create below and the arbitration trigger both read
+	// created, while the refund reads charged.
+	var created bool
+	if !exists || repairing {
 		// A stream-level consumer InactiveThreshold would give the group durable
 		// a delete timer, reaping it while all members are offline. Check the
 		// LIVE stream config (it can change after startup) and refuse rather
@@ -16718,18 +16855,33 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		// (the client can retry) instead of risking a reapable durable. Spec5 [4.8.2].
 		si, err := sess.jsa.lookupStream(mqttStreamName)
 		if err != nil || si == nil {
-			return nil, nil, 0, fmt.Errorf("shared subscriptions unavailable: unable to verify messages stream consumer limits: %v", err)
+			return mqttSharedJoinResult{}, fmt.Errorf("shared subscriptions unavailable: unable to verify messages stream consumer limits: %v", err)
 		}
 		if si.Config.ConsumerLimits.InactiveThreshold != 0 {
-			return nil, nil, 0, fmt.Errorf("shared subscriptions unavailable: messages stream imposes a consumer inactivity limit")
+			return mqttSharedJoinResult{}, fmt.Errorf("shared subscriptions unavailable: messages stream imposes a consumer inactivity limit")
 		}
 		ackWait := opts.MQTT.AckWait
 		if ackWait == 0 {
 			ackWait = mqttDefaultAckWait
 		}
-		if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
-			return nil, nil, 0, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
-				after, mqttMaxAckTotalLimit)
+		// Whether this session ALREADY holds the charge for this durable decides both the
+		// ceiling check and the charge itself, so it is sampled once, here, ahead of both.
+		//
+		// The two must move together. A repair recreates a durable this object was charged
+		// for on an earlier connection, so it adds nothing to tmaxack — and a ceiling check
+		// that still evaluated tmaxack + maxAckPending would refuse to repair a session
+		// sitting near the limit, on the strength of a charge already counted inside
+		// tmaxack. That refusal is permanent for as long as the session stays near capacity,
+		// which turns a recoverable absent durable back into the F-076 dead end this item
+		// exists to end.
+		sess.mu.Lock()
+		_, alreadyCharged := sess.sharedCharged[durable]
+		sess.mu.Unlock()
+		if !alreadyCharged {
+			if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
+				return mqttSharedJoinResult{}, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
+					after, mqttMaxAckTotalLimit)
+			}
 		}
 		ccr := &CreateConsumerRequest{
 			Stream: mqttStreamName,
@@ -16741,17 +16893,24 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		// is idempotent (ActionCreateOrUpdate). Spec5 [4.8.2].
 		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 			c.Errorf("Unable to add shared JetStream consumer for subscription on %q: err=%v", subject, err)
-			return nil, nil, 0, err
+			return mqttSharedJoinResult{}, err
 		}
 		cc = &ccr.Config
-		sess.mu.Lock()
-		sess.tmaxack = tmaxack + maxAckPending
-		if sess.sharedCharged == nil {
-			sess.sharedCharged = make(map[string]int)
+		created = true
+		mqttTestSharedArbitratePause("after-group-create:" + sid)
+		// A REPAIR does not charge: this session object already holds sharedCharged for
+		// this durable from the connection that first joined the group, and charging again
+		// would leave tmaxack permanently overcounted for the life of the session.
+		if !alreadyCharged {
+			sess.mu.Lock()
+			sess.tmaxack = tmaxack + maxAckPending
+			if sess.sharedCharged == nil {
+				sess.sharedCharged = make(map[string]int)
+			}
+			sess.sharedCharged[durable] = maxAckPending
+			sess.mu.Unlock()
+			charged = maxAckPending
 		}
-		sess.sharedCharged[durable] = maxAckPending
-		sess.mu.Unlock()
-		charged = maxAckPending
 	}
 
 	sess.mu.Lock()
@@ -16762,10 +16921,10 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		c.Errorf("Unable to create subscription for shared JetStream consumer on %q: %v", subject, err)
 		// Return cc (only when we created it this call) so the caller's cleanup,
 		// after rolling back the early-persisted membership, can release it.
-		if charged != 0 {
-			return cc, nil, charged, err
+		if created {
+			return mqttSharedJoinResult{cc: cc, charged: charged, created: created}, err
 		}
-		return nil, nil, 0, err
+		return mqttSharedJoinResult{}, err
 	}
 	// Verify/repair the join: a concurrent leaver whose last-holder scan finished
 	// before this session's membership was persisted may have issued a (queued,
@@ -16773,13 +16932,14 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 	// Re-issue the idempotent CreateOrUpdate now that our membership is persisted
 	// and the queue interest is up: it recreates the durable if it was deleted and
 	// is a no-op otherwise, closing the join/leave race window. Spec5 [4.8.2].
-	if charged != 0 {
+	if created {
 		ccr := &CreateConsumerRequest{Stream: mqttStreamName, Config: *cc}
 		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 			c.Warnf("Unable to verify shared JetStream consumer for subscription on %q: %v", subject, err)
 		}
+		mqttTestSharedArbitratePause("after-group-verify:" + sid)
 	}
-	return cc, sub, charged, nil
+	return mqttSharedJoinResult{cc: cc, sub: sub, charged: charged, created: created, installed: true}, nil
 }
 
 // releaseSharedConsumer removes this session's local delivery subscription and

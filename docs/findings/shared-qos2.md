@@ -339,9 +339,12 @@ into F-050's existing pre-CONNACK aggregation rather than adding a second refusa
 replacing the remembered one. Present-and-non-canonical refuses, and never updates or
 deletes: the durable may be serving other members, and a configuration this broker would
 not have built is not one it may silently normalize on their behalf. Authoritatively
-absent refuses. Anything else — a failed read, a response carrying no consumer, a consumer
-carrying no configuration — is **indeterminate** and refuses, because recreating on an
-unproven absence is how one broker's transient error becomes a group-wide change.
+absent refused too **as F-076 left it** — F-077 later made that one verdict REPAIRABLE in
+the CONNECT pre-pass, and terminal still in the post-pass; see the F-077 entry. Anything
+else — a failed read, a response carrying no consumer, a consumer carrying no
+configuration — is **indeterminate** and refuses, because recreating on an unproven absence
+is how one broker's transient error becomes a group-wide change. That last sentence is
+exactly why absence is the only verdict that became repairable.
 
 **One canonical derivation.** `buildSharedGroupConsumerConfig` is the single constructor:
 the join path builds with it and the resume path validates against it, so "what we would
@@ -382,11 +385,15 @@ of a reference and a partial view must never be reported as a complete one.
 
 ### What this establishes, and what it does not
 
-It establishes **configuration evidence**: the durable exists and carries a configuration
+**This section describes what F-076 established. It is not the current contract** — F-077
+took up both of the residuals below, and its own entry is authoritative for what the broker
+does today.
+
+F-076 establishes **configuration evidence**: the durable exists and carries a configuration
 this broker recognises. It establishes **nothing about ownership**. A stale resident broker
 can validate a present canonical durable and serve from it, and a co-restored filter with
-no resident entry still creates through the untouched join path, unarbitrated. Both are
-**F-077**, and both are defects that exist independently of this change.
+no resident entry still creates through the untouched join path, unarbitrated. Both were
+**F-077**, and both were defects that existed independently of F-076.
 
 The verification arm itself performs no group-durable write. That claim is about the arm,
 not about the restore operation: a filter with no resident entry still takes the create
@@ -400,11 +407,17 @@ path, which is every filter after a broker restart.
 - **The proof is fresh but not atomic.** `CONSUMER.DELETE` and `CONSUMER.CREATE` are both
   unconditioned, so a durable deleted *or made non-canonical* after the post-pass gets no
   further check on this CONNECT.
-- **No self-repair.** This broker will not recreate the durable, so the same resident
-  session goes on refusing while the condition persists. It recovers if the condition
-  clears by any means — a transient read becoming readable, an operator restoring the
-  durable, another member recreating the deterministic name. F-077 is what makes recovery
-  the broker's own job.
+- **No self-repair — CLOSED by F-077 for one verdict.** As F-076 left it, this broker
+  would not recreate the durable at all. F-077 made an **authoritative absence** repairable:
+  the CONNECT pre-pass hands it to the resume arm, which recreates the durable, and a
+  classified record CAS then proves the membership it was recreated into is still this
+  broker's. A **non-canonical** or **indeterminate** verdict still refuses, for the reasons
+  that made the verdicts distinct in the first place, and recovers only when the condition
+  clears by any means. The post-pass keeps absence terminal.
+- **Ownership was unarbitrated — CLOSED by F-077 on the CONNECT path only.** Every
+  restoration of shared interest now proves ownership before the CONNACK. A **live
+  SUBSCRIBE** still installs and revives that interest with no ownership write, which is
+  **F-078**.
 
 ### Refuted designs, kept so they are not re-proposed
 
@@ -426,66 +439,258 @@ path, which is every filter after a broker restart.
 
 **Title:** Arbitrate ownership after any shared group durable create
 
+- Status: **Open — the CONNECT half landed; the live SUBSCRIBE half is F-078.**
+- Classification: HA arbitration / delivery safety
+- Release treatment: Alpha blocker
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+- Split out of F-076 by a scope consult. **This is a defect on `main`, not one F-076
+  introduced.** Split again — CONNECT half / live half — by a non-convergence escalation
+  after three plan rounds each re-cut the live interest gate and every finding of the third
+  faulted the mechanism the second had just introduced.
+
+### The finding
+
+**No route that restores shared group delivery interest revalidated that this broker still
+owns the membership it was keyed on.** A commits its accept save; B commits a newer accept
+for the same client and removes the membership; B's last-holder path deletes the group
+durable; A restores the membership anyway and serves the group.
+
+"Serves" includes **acknowledging**, and that is what makes it a delivery-safety defect
+rather than a tidiness one: `mqttDeliverMsgCbQoS12` acks and drops on a reserved-subject
+violation, on a subscribe deny, on No Local suppression, and delivers-and-acks a shared
+QoS 0 member. Each destroys a group message for the members that legitimately hold the
+membership.
+
+### The class is wider than "a create", which was review round 1's finding
+
+- **R1 — a resume whose durables all verify present-and-canonical.** Adopts, creates
+  nothing, installs interest under a membership it never revalidated.
+  `docs/ARCHITECTURE.md` assigned exactly this to F-077 by name.
+- **S1 — the resume repair F-076 declined to perform.** An authoritatively absent durable.
+- **S2 — the CONNECT `!exists` create.** Every shared filter of a record-sourced session
+  takes this arm, because shared configs are never persisted.
+- **R2, S3 — the live SUBSCRIBE fall-through and its `!exists` create.** **F-078.**
+
+`createDurableConsumer` has nine production call sites; exactly two carry a non-empty
+`DeliverGroup`, both inside `processSharedJSConsumer`. `TestSharedGroupCreateCensus` holds
+that down as a drift guard — a config reaching a create through a variable escapes it, and
+the test says so.
+
+### What landed for R1, S1 and S2
+
+**One classified record write**, `proveSharedMembershipOwnership`, CAS'd at `sess.seq` inside
+the CONNECT's still-open accept transaction, run once per restore that installed, repaired
+or adopted shared interest, after the last group-durable write and before the CONNACK.
+
+It is a **write** because a read cannot arbitrate: JetStream returns 10164 from the
+clustered pre-proposal check while a write for the subject is in process, so "the record did
+not move" is unprovable from a load. It is a **semantic** no-op rather than a byte-level one:
+every write mints a fresh `WID` and parents it to the current lineage.
+
+Five outcomes. **10071 keeps its own lineage classification** through
+`disposalForDirectRejection` — the only place a sibling record is recognised on that arm,
+and the place the fork grant is minted, so collapsing it to a bare takeover would assert 0x8E
+where the record supports only 0x89 and lose the grant. **10164** goes through
+`resolveContendedRecordSave`. **Ambiguous** keeps the mutation and permits no further write.
+**Definite local** refuses.
+
+**The trigger is restored interest, and it is stack-local.** Committed per filter only once
+the whole filter succeeds, its level-up companion included; deliberately not a session field,
+because a fact parked there outlives its operation and would govern the next one — which is
+F-078's D2 in miniature. It is kept apart from `created` (which drives the post-subscribe
+verify create) and `charged` (which drives the refund), because each had previously been
+inferred from the other wrongly: the repair creates while charging nothing, so a verify
+create gated on the charge skips exactly the population that just recreated a durable.
+
+**Absence became repairable, and nothing else did.** The verification's four outcomes are
+re-cut into one predicate, *terminal unless repairable*, stated as a class rather than an
+`if absent` at each site because F-076's batching seam closed only when the special cases
+were deleted. Repairability moves **three** decisions together — the batch termination in
+`classifySharedGroups`, the pre-pass filter failure in `failSharedGroupFilters`, and the
+resume arm's own `v.err` return — and moving fewer leaves the repair arm unreachable, which
+is the defect plan round 4 found. The **post-pass keeps absence terminal**: a durable absent
+again after the repair is one something is deleting underneath this CONNECT.
+
+**No transmission gate is needed here.** The restore gate is armed before the first
+subscription the CONNECT installs and opens only after a confirmed success CONNACK, and all
+four delivery callbacks consult it — including the PUBREL and affine subscriptions a shared
+QoS 2 filter provisions before the group consumer exists. The caveat is that it stops
+transmission and acknowledgement but cannot undo queue selection, so a shared QoS 0 message
+selected while it is closed is dropped.
+
+### Designs refuted, so none returns
+
+- **The accept transaction fences it.** An in-process fence on one `mqttSession`.
+- **`sweepOrphanedConsumers` bounds the damage.** It skips candidates a resident session's
+  `cons` or `sharedSubs` names, so the stale broker's own object protects the durable it
+  just recreated. Eventual cleanup is not arbitration.
+- **A bare forced record write.** Plain `save` formats the store error and destroys the
+  10071/10164 distinction the verdicts depend on.
+- **Read the record and compare the sequence.** 10164 is returned while a write is in
+  process, so a matching read proves nothing.
+- **Delete the created durable on a foreign verdict.** The holder scan skips same-client-ID
+  records, which is exactly false after a takeover, so it deletes the NEW owner's durable.
+- **Reuse `releaseSharedConsumer` for the foreign cleanup.** It refunds the whole historic
+  charge, purges through an already-rejected transaction, and inherits the same-ID hole.
+- **Blind canonical `CreateOrUpdate` on an unverified resident config.** F-076's refutation,
+  unchanged: the repair acts only on an authoritatively absent verdict.
+- **A per-subscription transmission gate.** Refuted for the live path; see F-078.
+
+### Residuals
+
+In `docs/CONFORMANCE.md`. Ownership is proven at the write's linearization point, not
+continuously. The proof does not extend to the consumer, which may vanish at any point after
+the last verification. A durable created and then lost to a foreign verdict is left in place
+and is **not inert**. A refused resume is closed silently. And the repair **broadens the
+population** that reaches the still-unarbitrated live SUBSCRIBE path.
+
+### Two F-076 fixtures were rewritten rather than relaxed
+
+`TestMQTTSharedGroupAbsentDurableRefusesTheResume` became `...RepairsTheResume`, and
+`...LevelUpCompanionIsVerifiedToo` became `...IsRepairedToo`. Both pinned the refusal F-076's
+own conformance entry called a residual and assigned to F-077 ("Making recovery the broker's
+own job is F-077"). What they assert now is strictly more: the resume succeeds, the specific
+deleted durable is back, and it carries the canonical shape.
+
+## F-078
+
+**Title:** Arbitrate a live SUBSCRIBE's shared interest before it serves
+
 - Status: **Open.**
 - Classification: HA arbitration / delivery safety
 - Release treatment: Alpha blocker
 - Roadmap section: §0.2 (multi-frontend HA blockers)
-- Split out of F-076 by a scope consult after three plan-review rounds kept re-cutting the
-  same seam. **This is a defect on `main` today, not one F-076 introduced.**
+- The live half of F-077, split out by that item's non-convergence escalation.
 
 ### The finding
 
-**No group-durable create is followed by any revalidation that this broker still owns the
-membership the create was keyed on.** Broker A commits its accept save; B commits a newer
-accept for the same client and removes the membership; B's last-holder path deletes the
-group durable; A creates it again and CONNACKs. A then serves group deliveries under a
-membership the authoritative record no longer carries.
+A live SUBSCRIBE that installs or revives shared group delivery interest serves under a
+membership it never revalidated. Same consequence as F-077's: group messages acknowledged
+and destroyed for the members that legitimately hold the membership. F-077 closed the
+CONNECT path; this is the defect `main` carries today.
 
-The class is **three sites**: the resume repair F-076 deliberately does not perform, the
-CONNECT `!exists` create, and the live SUBSCRIBE `!exists` create — whose final update saves
-only when something changed, which by then is normally false, so no second CAS happens.
+**S3 — the `!exists` create**, plus the post-subscribe verify `CreateOrUpdate`, which
+genuinely recreates a durable a concurrent leaver deleted. On `main` that second create was
+gated on the charge; F-077 replaced that with the explicit `created` fact, so F-078 inherits
+`created`.
 
-### Two answers were tried and refuted
+**R2 — the resume fall-through**, which creates nothing, verifies nothing and arbitrates
+nothing. Its reachability took two review rounds to establish and must not be re-derived:
 
-- **The accept transaction fences it.** False. It is an in-process fence on one
-  `mqttSession` and fences no other broker.
-- **`sweepOrphanedConsumers` reaps the stale recreate, so the consequence is bounded.**
-  False as a discharge. The sweep skips every candidate referenced by a **resident**
-  session's in-memory `sharedSubs`, so the stale broker's own session object protects the
-  durable it just recreated — and during that interval its queue subscription can receive
-  **and acknowledge** group messages. Eventual cleanup is not arbitration.
+1. a SUBSCRIBE packet adds a shared filter;
+2. its rollback save fails **definitely**, so `readd` restores `sess.cons[sid]` while
+   `sess.sharedSubs` has already been reset to the pre-packet snapshot;
+3. the client disconnects and reconnects to the same broker;
+4. the CONNECT builds its filters from `sharedSubs`, which lacks the key, so
+   `collectResidentSharedGroups` never sees the sid and `processSubs` never touches it — the
+   resident `cons[sid]` survives while the new connection has no deliver subscription;
+5. the client SUBSCRIBEs to that filter and the fall-through subscribes on a remembered
+   config.
 
-### The remedy, and its constraints
+**`readd` alone is not sufficient**, and a plan revision that cited it alone was wrong:
+`reopenTeardownDelivery` clears `closed` and the subscription was never unsubscribed, so on
+the *same* connection the refresh arm still runs. Step 3 is what makes `sub == nil` real.
 
-A record-CAS rule applied **class-wide**: after any deterministic group create or recreate,
-revalidate the membership's record ownership through the existing
-`saveClassifiedDetail` / `resolveContendedRecordSave` machinery, whose 10071 / 10164 /
-ambiguous verdicts are already specified. A separate group-lock artifact is **not** required
-if the rule is class-wide. Closing it only on the repair would leave the same hole open on
-the join path.
+F-076 justified passing nil verdicts on this path with "a live SUBSCRIBE cannot reach that
+arm". R2 falsifies that.
 
-Three further constraints, each established by refuting a design:
+### A per-subscription gate cannot work, and this is settled
 
-- **A bare forced record write is not the mechanism.** The ordinary update path calls plain
-  `save`, which loses the 10071 / 10164 distinction the verdicts depend on.
-- **`releaseSharedConsumer` cannot be reused for foreign cleanup.** It refunds the whole
-  historic charge rather than this invocation's, purges pending state through an
-  already-rejected transaction, and silently skips undecodable records.
-- **A blind last-holder delete on a foreign verdict is wrong.** The holder scan skips
-  records with the same client ID, on the assumption that this session object represents
-  them — which is exactly false after a takeover, so it would delete a durable the **new
-  owner** holds. A foreign-aware scan must include the authoritative same-ID record and
-  fail closed on decode errors.
+A shared **QoS 2** SUBSCRIBE runs `ensurePubRelConsumerSubscription`, and
+`ensureQ2AffineConsumerSubscription` after it, **before** `processSharedJSConsumer` is
+reached. So the live path contains the bare `c.processSub` whose NATS handler goes live
+before `processSub` returns — `mqttDeliverPubRelCb`'s own comment says so — and both that
+callback and the affine one consult only the connection-scoped restore gate, which is
+already open on a live connection. This is F-050's first refutation and it applies here. Do
+not re-propose an `mqttSub` field.
 
-### The fifth mechanism, which is why this is its own item
+**The callback census is complete at four**: the QoS 0 raw subscription, the QoS 1/2 deliver
+subject, PUBREL, and the affine path. There is no fifth production delivery callback. Plain
+QoS 0 is excludable because it cannot acknowledge a stored group message.
 
-Unlike CONNECT, a live SUBSCRIBE has **no restore gate**. Between interest installation and
-any ownership CAS, shared QoS 0 deliveries and denied / reserved / No Local deliveries are
-already acknowledged. Closing that needs a packet-scoped interest gate, or an explicitly
-documented and weakened invariant.
+A **session-scoped** gate covers all of them by construction — reused subscriptions, the
+level-up companion, shadow subscriptions, PUBREL, affine, and the plain subscriptions of a
+mixed packet — which is why it is preferred to an enumeration a later round extends.
 
-### Test-harness note
+### Four open defects in that gate
 
-`make cluster-failover-tests` runs only
-`^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)`, so a new replicated test is
-invisible to it. Whoever closes this extends that regex as part of the change.
+- **D1, the arming point.** Raising the fact only in `processSharedJSConsumer`'s arms is too
+  late for PUBREL and affine. Arming before them creates a different reachable case: every
+  shared filter can then fail per-filter, no ownership write is owed, and the connection
+  still gets a SUBACK and stays live with the gate never opened. Needs an explicit
+  **no-effect terminal outcome**: an early-armed gate must open when the packet finishes
+  with no surviving shared interest.
+- **D2, an abandoned verdict crosses packets and connections.** Copying
+  `abandonRestoreGate`'s leave-installed rule is unsound: restore can leave one installed
+  because *every* accepted CONNECT unconditionally replaces it, while a packet gate is
+  re-armed only by a later effectful shared SUBSCRIBE. So a local, unresolved or
+  deliberately non-disposing forked outcome leaves a resident session carrying a gate that
+  permanently blocks its QoS 1/2, PUBREL, affine and shared QoS 0 traffic — and a later
+  CONNECT re-arms only the restore gate, so deliveries pass the new verdict and are then
+  blocked by the stale one. The gate must be connection/generation scoped.
+- **D3, the wait needs the restore gate's THREE-way verdict.** `mqttPhaseGateWaitFor` is a
+  cap, not AckWait; above it a timeout leaves PUBREL or the affine copy unsent for the
+  remainder of AckWait. The restore gate distinguishes resolved-but-withheld (return, no
+  ack) from timeout (**NAK** for PUBREL and affine), and that distinction is load-bearing.
+  QoS 1/2 additionally needs the withheld-delivery bookkeeping so a timed-out attempt is not
+  later presented as a first-sight DUP.
+- **D4, a waiter escapes a later packet's gate.** Packets are serialized but delivery
+  callbacks are not: a callback loads gate G1 and waits, the packet opens G1, the readLoop
+  installs armed G2, and the callback wakes, sees *its* G1 opened, and transmits or
+  acknowledges without ever consulting G2. `awaitRestoreGate` loads one pointer and never
+  re-validates it — safe for CONNECT, because another CONNECT cannot begin on a live
+  connection, and unsafe for recurring packet generations. Needs a generation-aware recheck
+  under one absolute deadline.
+
+Once D2 is fixed, a delivery meeting both gates should require **both** open, under one wait
+budget.
+
+### The disposition, and its two precedents
+
+Only **foreign** takes the takeover arm. **Forked** says a record claiming our parent erased
+our write and that nobody was demonstrated to own the session, so on the live path it neither
+disposes nor discards the Will — `mqttRejectionForked`'s precedent, and suppressing a Will
+there would be silent loss. The CONNECT path disposes on both, matching
+`mqttReconcileRefuseForeign`, because pre-CONNACK there is no acknowledged session to
+preserve. Two paths, two existing precedents, followed rather than re-derived.
+
+Order: **dispose state → end the record transaction → release the ownership gate → notify
+and close**, with both the gate and the fence held across the disposal, and the notify/close
+tail synchronous on the readLoop. `disposeForeignStateLocked` applies only if this session
+object is still current. `mqttProcessSubs` must keep idempotent defers for abnormal exits,
+because a test hook calling `t.Fatal` unwinds with `runtime.Goexit`.
+
+Inside `processSubs`, before returning the foreign error: mark this packet's shared filters
+failed, close the subscriptions it installed, and resolve or abandon the gate.
+
+### Residuals F-078 must state
+
+The **operation-wide** active-durable residual: F-077 states a narrower version covering only
+a durable created by a *resume*, which does not cover S3's live create. A durable created
+and then lost to a foreign verdict holds stream interest, can accumulate pending across the
+sweep grace, may feed a later joiner, and its verify `CreateOrUpdate` can move group-wide
+settings before arbitration loses. Also: the gate's collateral cost (other QoS 1/2, PUBREL
+and affine deliveries wait; shared QoS 0 drops; plain QoS 0 ungated), and the interval
+between a foreign verdict and `sess.c = nil` in which the session's other shared
+subscriptions are briefly still live.
+
+### Tests it inherits, and five it still needs
+
+Carried from the pre-split plan: R2's full chain; the four ack arms driven in production
+ordering with a second-member positive oracle; shared-QoS-0-drop with an unrelated plain
+QoS 0 control; reused and companion subscriptions; PUBREL and affine inside the window;
+a mixed packet; resolve-exactly-once; the gate-and-fence disposal assertion with an
+exactly-one-DISCONNECT oracle; the forked-keeps-the-Will case with the Will **armed**; and
+the replicated case whose ordering must land A's early membership save first, pause after
+the verify create, and only then let B take over — with three terminal oracles (A acknowledged
+nothing, A is disposed, a publish reaches the legitimate member).
+
+Still missing, and these pin D1 to D4: an early-armed gate followed by every shared filter
+failing per-filter; an abandoned gate followed by a later CONNECT; a waiter captured on G1
+while G2 is armed; a timeout with AckWait above the cap; and a stale trigger fact across a
+later non-shared packet.
+
+Note the mutation whose delivery must be driven at the `"after-ownership-cas"` boundary
+rather than after the verify create — driving it earlier does not discriminate a gate opened
+before the write. F-077 already extends `make cluster-failover-tests`' regex, so the
+replicated case is visible when it lands.

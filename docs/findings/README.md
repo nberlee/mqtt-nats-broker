@@ -62,15 +62,26 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   group durable still existed, so a durable deleted out of band left the client with Session
   Present and a subscription that never delivered. Now classified in two batched passes and
   refused when it cannot be proved. Establishes configuration evidence only, never ownership
-  evidence — that half is F-077.
+  evidence — that half is F-077, which has since closed it for the CONNECT path and made an
+  authoritatively absent durable repairable rather than merely refused.
   Details: [F-076](shared-qos2.md#f-076).
 - Arbitrate ownership after any shared group durable create.
-  Status: Open. Release treatment: Alpha blocker.
-  Split out of F-076, and a defect on `main` rather than one it introduced: no group-durable
-  create is followed by a revalidation that this broker still owns the membership it was
-  keyed on. Three sites, one class-wide record-CAS rule; the orphan sweep does NOT discharge
-  it, because it skips durables a resident session still references.
+  Status: Open — the CONNECT half landed; the live SUBSCRIBE half is F-078.
+  Release treatment: Alpha blocker.
+  Split out of F-076, and a defect on `main` rather than one it introduced: no route that
+  restored shared group interest revalidated that this broker still owned the membership it
+  was keyed on. On the CONNECT path one classified record write now proves it before the
+  CONNACK, and an authoritatively absent durable is repaired rather than refused. The orphan
+  sweep does NOT discharge any of this, because it skips durables a resident session still
+  references.
   Details: [F-077](shared-qos2.md#f-077).
+- Arbitrate a live SUBSCRIBE's shared interest before it serves.
+  Status: Open. Release treatment: Alpha blocker.
+  The live half of F-077, split out by a non-convergence escalation. A live SUBSCRIBE
+  installs and revives shared group interest with no ownership write, so a superseded broker
+  can acknowledge group messages under a membership the record no longer carries. Needs a
+  packet-scoped transmission gate the CONNECT path has no equivalent of.
+  Details: [F-078](shared-qos2.md#f-078).
 - Refuse a pre-release delayed-drain record shape instead of repairing it.
   Status: Open. Release treatment: Post-alpha cleanup.
   Filed by F-034's census. The compatibility boundary refuses an unsupported persisted

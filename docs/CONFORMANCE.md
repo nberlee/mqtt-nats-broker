@@ -2497,43 +2497,69 @@ the compatibility boundary (no released contract exists for either):
   `MaxMsgsPer` in place either — `$MQTT_rmsgs` is create-then-validate like
   every other broker-owned stream.
 
-### A resumed shared subscription proves its group durable, but cannot repair it
+### A resumed shared subscription proves its group durable, repairs it, and arbitrates
 
-A resume now verifies the JetStream group durable behind every shared subscription whose
+A resume verifies the JetStream group durable behind every shared subscription whose
 consumer configuration is still resident on this broker, and refuses the CONNECT before the
-CONNACK when it cannot prove the durable exists and is usable (F-076). Previously such a
-resume was accepted with Session Present = 1 and a subscription on a subject nothing
-publishes to. Three residuals remain, and the closure rests on them.
+CONNACK when it cannot prove the durable exists and is usable (F-076). It then proves that
+this broker still **owns** the membership it is restoring, through a classified record write
+under the accept transaction's CAS (F-077). Previously such a resume was accepted with
+Session Present = 1 and a subscription on a subject nothing publishes to.
 
-- **The messages published while the durable was absent are gone, and the refusal does not
-  recover them.** `$MQTT_msgs` is interest-retained: with no consumer there is no interest,
-  so nothing was kept. What changes is that the state is now reported rather than silent —
-  a v5 client receives `0x83` naming the shared filter, and a 3.1.1 client gets the bare
-  close its protocol allows.
+**The self-repair residual is closed for one verdict and retained for the others.** An
+**authoritatively absent** durable is now recreated rather than refused, so a session whose
+group consumer was deleted out of band recovers on its next reconnect instead of refusing
+forever. The other two verdicts keep their refusals, and the reasons are the ones that made
+them distinct in the first place: a **present but non-canonical** durable may be serving
+other members, and a configuration this broker would not have built is not one it may
+normalize on their behalf; an **indeterminate** reading established nothing at all, and
+recreating on it would turn one broker's transient error into a group-wide change. Both
+still recover as soon as the condition clears by any means, and a clean start always
+recovers at the cost of the session.
 
-- **The proof is fresh but not atomic.** The verification reads the durable before the
-  connection's queue interest is installed and again immediately before the CONNACK, which
-  narrows the window without closing it: `CONSUMER.DELETE` and `CONSUMER.CREATE` are both
-  unconditioned, so a durable deleted **or altered into a shape this broker would not
-  provision** after the second reading receives no further check on that CONNECT. This is
-  the same shape as the affine path's retention residual, and it now covers configuration
-  drift as well as deletion.
+**The messages published while the durable was absent are gone, and the repair does not
+recover them.** The messages stream is interest-retained: with no consumer there was no
+interest, so nothing was kept. What the repair restores is future delivery, not the backlog.
 
-- **There is no self-repair.** This broker does not recreate the group durable. The same
-  resident session therefore goes on refusing for as long as the durable stays absent or
-  non-canonical, or the lookup stays unreadable. It recovers as soon as that condition
-  clears **by any means** — a transient read becoming readable, an operator restoring the
-  durable, or another member of the group recreating the deterministic name — and a clean
-  start always recovers, at the cost of the session. Making recovery the broker's own job
-  is F-077.
+**Ownership is proven at the write's linearization point, not continuously.** A takeover
+that lands after a landed ownership write leaves this broker serving a membership it no
+longer holds until it learns otherwise, which is the session-record watch's and its
+committed-read backstop's convergence window rather than an admission check.
 
-**What the verification does not establish.** It is evidence about the durable's
-*configuration*, never about *ownership*. A present, canonical group durable does not prove
-this broker still owns the membership the resume is keyed on, so a superseded broker can
-validate one and serve from it; and a filter restored on the same CONNECT that has no
-resident configuration still creates its durable through the ordinary join path, which is
-not arbitrated either. Both are F-077, and both are properties of the design that predate
-this change rather than consequences of it.
+**The proof does not extend to the consumer.** `CONSUMER.CREATE` and `CONSUMER.DELETE` carry
+no precondition field, so nothing binds the durable's existence to the record's ownership.
+A durable deleted — or altered into a shape this broker would not provision — at any point
+after the last verification or write receives no further check on that CONNECT, the interval
+between the ownership write and the CONNACK included. Only the next resume detects it.
+
+**A durable this broker created and then lost the arbitration for is left in place.** Every
+available deletion is refuted: the last-holder scan skips same-client-ID records, so after
+a takeover a blind last-holder delete destroys the **new** owner's durable. Leaving it is
+the least unsafe option and it is not inert — it holds stream interest, it can accumulate
+pending messages for at least the orphan sweep's grace window, and a later joiner to the
+same deterministic name may receive messages published while no authoritative membership
+existed. It is reaped by the orphan-consumer sweep **only if no record references it**, only
+after that grace, and only on a complete fail-closed walk.
+
+**A refused resume is closed silently.** The displacement DISCONNECT is gated on the CONNACK
+having been written, which is false for every refusal inside the CONNECT, so a client whose
+ownership write was rejected sees a closed socket rather than `0x8E` or `0x89`. A filter that
+fails *verification* still gets the v5 failure CONNACK naming it; generalising that signal
+to the ownership, register-recovery, reconciliation and lifetime refusals is a roadmap item
+of its own.
+
+**A live SUBSCRIBE is not arbitrated at all.** It installs and revives the same shared group
+interest with no ownership write, so a superseded broker can acknowledge group messages under
+a membership the record no longer carries. This is the defect `main` carries today, unchanged
+by F-077 and unmasked by it, and it is **F-078** — closing it needs a packet-scoped
+transmission gate the CONNECT path has no equivalent of, because the restore gate is already
+open on a live connection. F-077's repair does **broaden the population that reaches it**:
+an authoritatively absent durable used to refuse the CONNECT outright and now yields a
+live, repaired connection.
+
+**What the verification establishes, and what it does not.** It is evidence about the
+durable's *configuration*. Ownership is the ownership write's to establish, and only for the
+CONNECT path.
 
 **An unsupported record shape is refused rather than repaired.** A session record
 carrying a shared group consumer configuration in `Cons` is a format this broker never

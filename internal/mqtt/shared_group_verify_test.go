@@ -160,7 +160,7 @@ func TestMQTTClassifyConsumerInfoResponse(t *testing.T) {
 			resp:        &JSApiConsumerInfoResponse{ApiResponse: ApiResponse{Error: ApiErrors[JSConsumerNotFoundErr]}},
 			wantInfo:    nil,
 			wantSettled: true,
-			why:         "not-found is the one error that PROVES absence, and callers turn it into a terminal verdict",
+			why:         "not-found is the one error that PROVES absence, which is what makes it the one verdict the CONNECT pre-pass may repair (and the post-pass still treats as terminal)",
 		},
 		{
 			name:        "success carrying a nil ConsumerInfo",
@@ -845,7 +845,7 @@ func TestSharedGroupLookupBatchIsBounded(t *testing.T) {
 		e.asm.mu.Unlock()
 	})
 
-	verdicts := e.asm.classifySharedGroups(targets)
+	verdicts := e.asm.classifySharedGroups(targets, mqttSharedGroupVerdictIsTerminal)
 
 	if len(sizes) == 0 {
 		t.Fatal("no lookup was issued, so this proves nothing about the batch size")
@@ -917,7 +917,7 @@ func TestSharedGroupLookupStopsAtTheFirstFailedChunk(t *testing.T) {
 		e.asm.mu.Unlock()
 	})
 
-	verdicts := e.asm.classifySharedGroups(targets)
+	verdicts := e.asm.classifySharedGroups(targets, mqttSharedGroupVerdictIsTerminal)
 
 	if calls != 1 {
 		t.Fatalf("issued %d lookups after the first one failed, want exactly 1: each carries its own "+
@@ -975,7 +975,7 @@ func TestSharedGroupLookupStopsAtAResponseLevelRefusal(t *testing.T) {
 		e.asm.mu.Unlock()
 	})
 
-	verdicts := e.asm.classifySharedGroups(targets)
+	verdicts := e.asm.classifySharedGroups(targets, mqttSharedGroupVerdictIsTerminal)
 
 	if calls != 1 {
 		t.Fatalf("issued %d lookups after a response-level refusal, want exactly 1: the outcome was "+

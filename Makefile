@@ -32,8 +32,8 @@ lint-md: ## Run markdownlint over the project's own Markdown
 full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 	go test -tags mqttport_fulltests ./internal/mqtt/
 
-cluster-failover-tests: ## Run the 3-node JetStream tests: Will-outbox failover and takeover arbitration.
-	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)' ./internal/mqtt/
+cluster-failover-tests: ## Run the 3-node JetStream tests: Will-outbox failover, takeover arbitration, and shared group ownership.
+	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated)' ./internal/mqtt/
 
 depproof: ## Dependency canary: JetStream write-contract regressions plus every mutation
 	./test/depproof/run.sh --matrix
