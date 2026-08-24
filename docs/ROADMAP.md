@@ -552,7 +552,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   including the headline "no silent loss on any PUBREL path", "exactly one create can
   ever succeed", a `discarded` marker concerning "only ever" its own exchange, and "a
   late purge is harmless by naming". Those sentences are why it survived review, so
-  correcting them is part of filing it. - [x] [F-062: Bound the inbound QoS 2 hold purge
+  correcting them is part of filing it.
+
+  - [x] [F-062: Bound the inbound QoS 2 hold purge
   and the discard marker it leaves](findings/ha-arbitration.md#f-062). **Alpha blocker,
   found by F-032's audit. DONE 2026-08-18.** *The dossier is authoritative for the
   mechanisms, their arms and the remedy; this bullet is a derived summary.* Two
@@ -600,7 +602,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   walk's watermark" — the dossier's mapping is authoritative. The unbounded
   `$MQTT_inflight` purge in that teardown was untouched then and owed F-034; F-034
   replaced it on 2026-08-22 with an enumerate-load-classify pass bounded by its own
-  enumeration watermark. - [x] [F-033: Add write lineage to shared QoS 2
+  enumeration watermark.
+
+  - [x] [F-033: Add write lineage to shared QoS 2
   assignments](findings/ha-arbitration.md#f-033). **Closed 2026-08-18 as an audit: no
   lineage was needed, and it produced three findings.** Clauses (a) and (b) answer NO —
   every claim write goes through one CAS helper that always emits
@@ -627,8 +631,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   now state the answer, and three further sites that asserted something the audit
   falsified are corrected too. Holistic review then found one more, filed as **F-066**:
   the claim key identifies one source message only within one incarnation of
-  `$MQTT_msgs`, and recreating that stream is a procedure a startup refusal instructs. -
-  [x] [F-063: Prove a copy was retained before acknowledging its
+  `$MQTT_msgs`, and recreating that stream is a procedure a startup refusal instructs.
+
+  - [x] [F-063: Prove a copy was retained before acknowledging its
   source](findings/ha-arbitration.md#f-063). **Alpha blocker — done.** `$MQTT_out` is
   interest-retained, so a copy stored onto a subject no consumer filters **succeeds and
   keeps nothing**, and the only re-read in `materializeQ2AffCopy` was on the
@@ -651,8 +656,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   condemn a claim a concurrent materializer has just given a copy, permanently).
   **F-064, F-065 and F-036 are untouched**: an owner-independent reconciler cannot make
   consumer existence atomic with the store and the ack, which is what establishes the
-  premises are distinct, and what this item's refusal strands is F-064's to resolve. - [
-  ] [F-064: Reconcile assignments independently of owner
+  premises are distinct, and what this item's refusal strands is F-064's to resolve.
+
+  - [ ] [F-064: Reconcile assignments independently of owner
   resume](findings/ha-arbitration.md#f-064). **Alpha blocker. Partly landed; the box
   stays open deliberately.** `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen`
   alone, so a live matching record makes the sweep skip **every** claim of that
@@ -728,8 +734,10 @@ further findings it surfaced are filed separately, for the reason its own bullet
   winner's disposition — they act only on facts the claim itself already carries. **What
   keeps the box open:** residual 8, and W-c above. Both are argued rather than pending,
   and both have a named route: residual 8 through the `Lost`-truthfulness item's
-  PUBREL-carried claim reference, W-c through nothing currently available. - [ ]
-  **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.** Split out
+  PUBREL-carried claim reference, W-c through nothing currently available.
+
+  - [ ] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
+  Split out
   of F-064; not a conformance defect, so not an alpha blocker. *The finding:*
   `materialized ∧ ¬AffineDone ∧ copy absent` is reported `Lost` for a message the client
   answered with PUBREC, because `mqttProcessPublishReceived` stores the correlated
@@ -767,7 +775,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   the durable is gone; once the consumer exists — including after on-behalf restoration
   recreated it for some other claim — the same absent copy resolves `Complete` and the
   register is dropped, destroying the only record joining the PUBREL's `(Dur, Seq)` to
-  the claim. - [x] **A saved shared filter that fails restoration at CONNECT is silently
+  the claim.
+
+  - [x] **A saved shared filter that fails restoration at CONNECT is silently
   dropped.** **This was F-050 filed twice** — same mechanism, same consequence, same
   dossier — and closing it ticks both boxes; see §0.3's F-050 entry for what landed.
   Kept here rather than deleted because this filing is the one that carried the F-064
@@ -775,7 +785,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   so it publishes the Will and can delete a zero-expiry session. The remedy respects that
   by not acknowledging at all — restoration moved BEFORE the CONNACK, where the existing
   pre-CONNACK abort discipline already discards the Will and leaves the lifetime
-  ungranted. - [x] [F-076: Prove a shared group durable exists before restoring its
+  ungranted.
+
+  - [x] [F-076: Prove a shared group durable exists before restoring its
   membership](findings/shared-qos2.md#f-076). **Alpha blocker — done 2026-08-23, with the
   guarantee SCOPED and the other half split out as F-077.** Surfaced by F-050's plan
   review. `processSharedJSConsumer`'s resume fall-through subscribed to the recorded
@@ -801,7 +813,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   blind canonical `CreateOrUpdate`, any-error-means-absent, a short field allowlist,
   copying the normalized fields, and dropping the local entry so the next CONNECT
   recreates. Residuals in `docs/CONFORMANCE.md`: the delivery gap is not repaired, the
-  proof is fresh but not atomic, and there is no self-repair. - [ ] [F-077: Arbitrate
+  proof is fresh but not atomic, and there is no self-repair.
+
+  - [ ] [F-077: Arbitrate
   ownership after any shared group durable create](findings/shared-qos2.md#f-077).
   **Alpha blocker.** Split out of F-076 by a scope consult after three plan rounds re-cut
   the same seam, and **a defect on `main` today rather than one F-076 introduced**: no
@@ -826,7 +840,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   denied/reserved/No-Local deliveries are acknowledged before any CAS could run, which needs
   a packet-scoped interest gate. Note `make cluster-failover-tests` runs only
   `^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)`, so a new replicated test
-  is invisible to it until that regex is extended. - [ ] **The 3.1.1 forced leave's
+  is invisible to it until that regex is extended.
+
+  - [ ] **The 3.1.1 forced leave's
   post-CONNACK destructive exit.** Also surfaced by F-050's review, and deliberately not
   folded into it. The forced leave removes a resuming 3.1.1 client's persisted shared
   memberships and releases their group consumers, and it runs AFTER the success CONNACK;
@@ -834,13 +850,17 @@ further findings it surfaced are filed separately, for the reason its own bullet
   a closed connection. Moving it before the CONNACK was tried in F-050's plan and
   refuted: it converts an UNACKNOWLEDGED CONNECT attempt into a permanent destructive
   mutation of session state, which is strictly worse. It is none of F-050's five restore
-  exits. - [ ] **Generalise the pre-CONNACK refusal signal.** F-050 tells a v5 client why
+  exits.
+
+  - [ ] **Generalise the pre-CONNACK refusal signal.** F-050 tells a v5 client why
   its restoration refused the CONNECT (0x83, naming the filter), because a permanently
   unrestorable filter would otherwise be an endless silent close with no hint that a clean
   start is the recovery. The other pre-CONNACK refusals — register recovery, the
   reconciliation verdicts, the lifetime grant — still close silently. **F-061 does not own
   this**: it is specifically the authorization path, and F-050's review corrected an
-  earlier draft that attributed general failure signalling to it. **Small.** - [x] [F-065:
+  earlier draft that attributed general failure signalling to it. **Small.**
+
+  - [x] [F-065:
   Re-read copy absence after the reaper's own SourceAcked
   transition](findings/ha-arbitration.md#f-065). **Alpha blocker — done, with the stated
   guarantee RE-SCOPED** (the same shape as F-063's), which is what the tick rests on.
@@ -892,7 +912,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   deletion, or the gate's superseded-incarnation disposal, and is otherwise retained.
   Stated in `docs/CONFORMANCE.md`. Also refuted and recorded so none returns: a
   `storing` phase marker, an owner-independent disposal on claim absence, a reaper-side
-  cleanup, and two compensation designs keyed on which CAS failed. - [ ] [F-066:
+  cleanup, and two compensation designs keyed on which CAS failed.
+
+  - [ ] [F-066:
   Generalise cross-stream identity coupling](findings/ha-arbitration.md#f-066). **Alpha
   blocker.** Falsified premise: *recreating one stream is a self-contained recovery
   procedure*. Durable records persist identities other streams issue — sequences,
@@ -919,8 +941,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   proper subset loses accepted messages, delivers an **OLD payload** for a new message,
   or NAK-loops orphaned copies forever. Per-subject CAS cannot help; the semantic
   identity is what fails (`feedback_cas_generation_identity`). Rows outside the affine
-  path are named, not audited here: `$MQTT_inflight`'s own coupling is F-034's. - [x]
-  [F-034: Add write lineage to outbound in-flight
+  path are named, not audited here: `$MQTT_inflight`'s own coupling is F-034's.
+
+  - [x] [F-034: Add write lineage to outbound in-flight
   registers](findings/ha-arbitration.md#f-034). **Closed 2026-08-22 as an audit plus a
   census: no lineage was needed, and the audit found a real defect with a remedy that is
   not lineage.** The verdict is **not** what the title says: no lineage is owed, and the
@@ -1003,7 +1026,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   known and must be dispositioned as a PAIR rather than as two fields: a register's
   `(Q2AffClaim, Q2AffCopy)` names a record on `$MQTT_qos2assign` and a message on
   `$MQTT_out`, and F-065 established that neither field alone identifies the delivery —
-  the binding that does is the register's own source. - [x] **Slice A of the arbitration
+  the binding that does is the register's own source.
+
+  - [x] **Slice A of the arbitration
   design: the session-record watch.** Ownership changes only by a write to the client's
   record subject, so the observation channel is now a per-broker ephemeral consumer on
   `$MQTT_sess` instead of the at-most-once `$MQTT.JSA.*.SP.*.*` notification, and a
@@ -1015,7 +1040,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   can be lost entirely". The eviction worker gained a digest arm so a watch delivering
   this broker's OWN ambiguous landing can never evict the rightful client over its own
   write, and refuses equally when an unusable load leaves nothing to compare. Residuals
-  in `docs/CONFORMANCE.md`. - [ ] [F-036: Revalidate quiet resident-session
+  in `docs/CONFORMANCE.md`.
+
+  - [ ] [F-036: Revalidate quiet resident-session
   ownership](findings/ha-arbitration.md#f-036). **Was: very large; now the remainder of
   one shape.** Slice A above converges every MOVED record, bound sessions included. What
   is left is the DELETED record on a BOUND session: arming the ownership marker hands it
@@ -1059,7 +1086,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   so the field now has **no reader** — this item and the vanished-record one are the
   only candidates left. The default is still to keep it until the evidence is in:
   deleting one unread field is small, and re-adding a required field to a permanent
-  record is not. - [ ] Make ephemeral-consumer cleanup guaranteed rather than
+  record is not.
+
+  - [ ] Make ephemeral-consumer cleanup guaranteed rather than
   best-effort. A failed manager initialization now rolls back both per-broker ephemeral
   consumers, including a create whose response was lost, so retries no longer ACCUMULATE
   them. What is left is the rollback delete itself failing or being lost: the stray
@@ -1070,8 +1099,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   purpose, process instance and schema; `InactiveThreshold` remains crash cleanup. Do
   not use a user-configurable node name that two live brokers could share. See the
   [platform
-  audit](findings/nats-platform.md#stable-ephemeral-consumer-identities-and-metadata). -
-  [ ] Give a vanished record its own disposal vocabulary. The deleted-record arm reports
+  audit](findings/nats-platform.md#stable-ephemeral-consumer-identities-and-metadata).
+
+  - [ ] Give a vanished record its own disposal vocabulary. The deleted-record arm reports
   0x8E "session taken over by a new connection", which is right about the ownership fact
   and wrong about the cause when the deletion was expiry-driven: no new connection need
   exist. **Small.** A third `mqttDisposalVocabulary` value, not a new verdict. **This is
