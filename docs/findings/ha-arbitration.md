@@ -310,7 +310,8 @@ a transition, and each is refused by a named mechanism:
 - **R-old — CLOSED.** An operation whose captured proposing term outlives that term,
   refused by Raft's comparison of the captured term against the current one
   ([`nats-io/nats-server#8370`](https://github.com/nats-io/nats-server/pull/8370), in
-  the 2.14.5 floor). Two mutations discriminate it: removing the comparison, and
+  the pinned floor since 2.14.4 and re-verified on each bump by `make depproof`). Two
+  mutations discriminate it: removing the comparison, and
   substituting the node's current term for the one the operation captured.
 - **R-new — CLOSED.** A newly elected leader admitting a
   CURRENT-term write, which the term comparison cannot refuse. Refused by two
@@ -444,8 +445,8 @@ JetStream propagates the term an operation captured.
 conditional write, which is one `Propose`. Every accepted CONNECT writes through
 `storeAcceptBatch`, an `AllowAtomicPublish` two-message batch, and the inventory's R-batch
 row is a written refutation rather than a fixture because `$MQTT_willq` never uses
-batches. At the pinned v2.14.5 no Raft-level field preserves "these entries came from one
-`ProposeMulti`" — entries are pushed individually, popped as whatever prefix exists,
+batches. At the pinned nats-server no Raft-level field preserves "these entries came from
+one `ProposeMulti`" — entries are pushed individually, popped as whatever prefix exists,
 regrouped by size thresholds, and each group rechecks leadership on its own — so the two
 writers are not equivalent and this finding's evidence does not reach the batch one. That
 gap is its own `docs/ROADMAP.md` §0.2 item, and it is why the session record's

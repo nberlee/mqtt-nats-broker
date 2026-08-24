@@ -1575,8 +1575,8 @@ What it does NOT do:
 
   The reason previously stated for that retention was an evidence gap in the accepted
   CONNECT's writer, and **that gap is now closed**. Every one of its Raft-level facts
-  holds — at the pinned v2.14.5 no Raft-level field preserves "these entries came from
-  one `ProposeMulti`"; entries are pushed individually, popped as whatever prefix
+  holds — at the pinned nats-server no Raft-level field preserves "these entries came
+  from one `ProposeMulti`"; entries are pushed individually, popped as whatever prefix
   exists, regrouped by size thresholds, and each group rechecks leadership on its own —
   but the consequence drawn from them was false. Batch identity is carried in the stream
   entry encoding and enforced at apply, so a committed prefix applies **nothing**, and
@@ -1951,8 +1951,9 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   after a committed `done` has replaced `S` by one of two routes. **R-old** — an
   operation whose captured proposing term outlives that term — is refused by Raft's
   comparison of the captured term against the current one (`nats-io/nats-server#8370`,
-  in the 2.14.5 floor), with two discriminating mutations and a control run on the
-  pre-fence generation. That route is closed. Seven further shapes are refuted in
+  in the pinned floor since 2.14.4 and re-verified on each bump by `make depproof`),
+  with two discriminating mutations and a control run on the pre-fence generation.
+  That route is closed. Seven further shapes are refuted in
   writing in `test/depproof/README.md`; post-start mirror/source drift is classified
   outside F-030 rather than left unnamed or falsely refuted.
   **R-new** — a newly elected leader admitting a CURRENT-term write — is refused by a

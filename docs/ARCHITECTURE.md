@@ -113,6 +113,44 @@ Correctness rests on these specific semantics, each stated as the contract the
 code assumes. This is the list a version bump has to re-verify — it is what makes
 the "no fallbacks" stance reviewable rather than implicit.
 
+The pinned dependency is **nats-server v2.15.0-preview.1**. It was raised from v2.14.5
+for the fix to an upstream `CONSUMER.CREATE` versus `CONSUMER.LIST` data race
+([`nats-io/nats-server#8478`](https://github.com/nats-io/nats-server/pull/8478)):
+`getPublicConsumers` read `o.cfg.Direct` while `updateConfig` wrote `o.cfg` under a
+different lock, and it now reads an immutable `o.direct` instead. The measured rows of
+this list are re-verified on every bump by `make depproof`, which is what turns the
+paragraph above into a gate rather than an aspiration; that run also had to be re-pointed
+for this bump, because upstream moved the atomic-batch apply state off the stream and into
+a monitor-goroutine local (see `test/depproof/README.md`).
+
+The rows `depproof` does **not** measure were audited against the two source trees for that
+bump, row by row. Unchanged: the purge request still carries filter and sequence together
+and `PurgeEx`'s `sequence == 1` no-op is byte-identical in both stores; `STREAM.INFO` still
+fills `State` and, separately and only when subjects are requested, `SubjectsTotals`;
+`PubAck.Duplicate` is the same field on the same struct; per-message TTL
+(`AllowMsgTTL`) and the double-ack path (`processAckMsg`) are unchanged; and
+`enforceMsgPerSubjectLimit`, the leader-only message-get guards, the dedup map's
+independence from message removal, the `ConsumerLimits.InactiveThreshold` application and
+the `JSExpectedLastSubjSeq` handling all carry over.
+
+**Three deltas were found, and the third is the one that mattered.** One `InterestPolicy`
+guard was dropped from the stream **update** path, which governs a stream whose retention
+is *changed* after creation — something this bridge never does, since it creates each stream
+with its intended retention and refuses an unsupported persisted shape — while the
+store-side `interestRetention` check the QoS 2 affine path depends on is intact. The dedup
+map gained a reference rather than losing any. And **`recalculateClusteredSeq` dropped its
+`+ batchCount` term**, computing `mset.clseq = lseq + mset.clfs` where v2.14.5 computed
+`lseq + mset.clfs + batchCount`.
+
+That last one is a real change to how a new leader picks the next sequence, and it is safe
+for the same reason the batch state moved: a buffered batch's members are now folded into
+`clfs` when the batch is abandoned (`rejectBatchState` does `mset.clfs += batch.count`), so
+the count `recalculateClusteredSeq` used to add separately is already inside `clfs` by the
+time a new leader recalculates. Adding it again would now **skip** sequences rather than
+protect against reuse. The bridge does not take this on source reading alone: the
+accept-batch fixture's post-`StepDown` assertion is exactly that every replica's CLFS equals
+the abandoned prefix length, so the folding is measured on every `make depproof` run.
+
 - **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
   is accepted only if the subject's last sequence matches. The check is made before
   the proposal and is not repeated at clustered apply (`canConsistencyCheck :=

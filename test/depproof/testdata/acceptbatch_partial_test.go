@@ -38,17 +38,27 @@ import (
 )
 
 const (
-	// The prefix reached the apply layer and was BUFFERED there. Requiring it is what
-	// keeps the negative assertion from being satisfied by a run in which nothing ever
-	// arrived: "no message was stored" is only evidence about buffering if the members
-	// were demonstrably committed and held.
+	// The prefix is COMMITTED and PROCESSED on every replica, with the applied watermark
+	// WITHHELD for retained batch state. Requiring it is what keeps the negative
+	// assertion from being satisfied by a run in which nothing ever arrived: "no message
+	// was stored" is only evidence about the batch if the members demonstrably reached
+	// every replica and the applied watermark is withheld for retained batch state.
 	//
-	// Both halves are required, and read under ONE batch.mu acquisition. The count
-	// alone is not the observation: it is incremented in the batchMsgOp arm, while the
-	// retention of the containing entry happens hundreds of lines later at function
-	// exit, so a server that counted and then dropped the entries would satisfy a
-	// count-only marker while storing nothing -- and the negative assertion would hold
-	// for the wrong reason.
+	// Not "the members are being retained": the same counterexample applies here. A build
+	// retaining only the batch id, count and maxApplied while dropping every
+	// CommittedEntry container would satisfy this marker, both store assertions and the
+	// CLFS check.
+	//
+	// IT DOES NOT ESTABLISH NON-APPLICATION, and the name is historical. The paired
+	// m-batch-apply-eager mutation emits this marker too: it applies each member as it is
+	// committed without touching batch.maxApplied, so the watermark stays withheld, the
+	// barrier passes, and every one of that mutation's kills comes from the STORED marker
+	// instead. Non-application is the store assertions' to prove, not this one's.
+	//
+	// (Through v2.14.5 this marker did witness the buffering, read under one batch.mu
+	// acquisition off mset.batchApply. That state is a monitor-goroutine local from
+	// v2.15.0-preview.1 and is not observable from a test at all; the count-versus-
+	// retention distinction the old comment drew no longer has anything to read.)
 	acceptBatchPrefixBufferedMarker = "ACCEPT-BATCH-PREFIX-BUFFERED"
 
 	// A member of an uncommitted prefix reached the STORE. This is the failure the
@@ -64,7 +74,7 @@ const (
 
 // TestJetStreamAcceptBatchPrefixStoresNothing: an atomic batch whose members are
 // committed without their commit entry stores nothing on the target subject, on ANY
-// replica, either while the prefix is still buffered or after the leader change that
+// replica, either while the applied watermark is still withheld or after the leader change that
 // abandons it.
 func TestJetStreamAcceptBatchPrefixStoresNothing(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
@@ -97,37 +107,105 @@ func TestJetStreamAcceptBatchPrefixStoresNothing(t *testing.T) {
 		entries = append(entries, newEntry(EntryNormal, esm))
 	}
 	n := mset.raftNode()
+
+	// The PRE-PROPOSAL index, captured before anything is enqueued. The barrier below
+	// requires every replica to advance PAST it, which is what stops the barrier passing
+	// on the pre-proposal state: ProposeMulti only enqueues, and runAsLeader removes
+	// entries from the proposal queue before sendAppendEntry advances pindex, so there is
+	// a window in which prop.len() == 0 and pindex == processed still describe the log as
+	// it was before the batch existed.
+	rnl := n.(*raft)
+	rnl.RLock()
+	preIndex := rnl.pindex
+	rnl.RUnlock()
+
 	require_NoError(t, n.ProposeMulti(n.Term(), entries))
 
-	// The barrier: every server has COMMITTED the whole prefix and is holding it.
-	// Without this the store assertions below would be a race against replication.
+	// The barrier: every server has COMMITTED and PROCESSED the whole prefix. Without
+	// this the store assertions below would be a race against replication.
+	//
+	// This is a RAFT-level barrier rather than a read of the buffered batch state, and
+	// the reason is a dependency change rather than a preference. Through v2.14.5 the
+	// batch-apply state hung off the stream (`mset.batchApply`) with its own mutex, so a
+	// test could read the buffered member count directly; from v2.15.0-preview.1 it is a
+	// monitor-goroutine LOCAL (`batch := &batchApply{}` in the stream monitor, threaded
+	// into applyStreamEntries) with no field on *stream and no mutex, so nothing outside
+	// that goroutine can observe it at all.
+	//
+	// Upstream re-pointed its own partial-batch test to a Raft barrier and this follows
+	// that idiom, with two additions its context does not need. First, every replica must
+	// advance PAST the pre-proposal index: prop.len() == 0 with pindex == processed is
+	// also true of the log before ProposeMulti's entries reach it, because ProposeMulti
+	// only enqueues and runAsLeader drains the queue before pindex moves. Second, applied
+	// must be BEHIND processed, because a retained batch is reported through
+	// n.Processed(ce.Index, min(maxApplied, ce.Index)) with batch.maxApplied pinned at the
+	// applied value from before the batch's first member.
+	//
+	// WHAT THIS BARRIER PROVES, AND WHAT IT DOES NOT. It proves the whole prefix is
+	// committed and processed on every replica and that the applied watermark is being
+	// WITHHELD for retained batch state. It does NOT prove the members had no early side
+	// effects, and the paired mutation is the proof that it cannot: m-batch-apply-eager
+	// applies each member as it is committed without touching batch.maxApplied, so the
+	// watermark is still held back, this barrier still passes, and the marker below is
+	// still logged. Every one of that mutation's kills comes from the store assertions.
+	//
+	// So the two are separate evidence and both are needed: the barrier is what makes the
+	// store assertions non-racy, and the store assertions are what establish that nothing
+	// was applied. An earlier revision of this comment claimed the barrier alone witnessed
+	// the buffering; it does not.
+	var pindexMax uint64
 	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		pindexMax = 0
 		for _, s := range c.servers {
 			ms, err := s.globalAccount().lookupStream(acceptBatchStream)
 			if err != nil {
 				return err
 			}
-			ms.mu.RLock()
-			batch := ms.batchApply
-			ms.mu.RUnlock()
-			if batch == nil {
-				return fmt.Errorf("server %q has no batch apply state", s.Name())
+			rn, ok := ms.raftNode().(*raft)
+			if !ok {
+				return fmt.Errorf("server %q: stream has no raft node", s.Name())
 			}
-			batch.mu.Lock()
-			count, held := batch.count, len(batch.entries)
-			batch.mu.Unlock()
-			if count != acceptBatchPrefix || held == 0 {
-				return fmt.Errorf("server %q buffered %d of %d member(s) in %d retained entry container(s)",
-					s.Name(), count, acceptBatchPrefix, held)
+			rn.RLock()
+			prop, pindex := rn.prop.len(), rn.pindex
+			processed, applied := rn.processed, rn.applied
+			rn.RUnlock()
+			if prop > 0 {
+				return fmt.Errorf("server %q still has inflight proposals", s.Name())
+			}
+			// PAST the pre-proposal index, not merely self-consistent with it.
+			if pindex <= preIndex {
+				return fmt.Errorf("server %q: pindex %d has not advanced past the "+
+					"pre-proposal index %d", s.Name(), pindex, preIndex)
+			}
+			if pindex != processed {
+				return fmt.Errorf("server %q: pindex %d != processed %d", s.Name(), pindex, processed)
+			}
+			// AND the applied watermark is being withheld, which is how retained batch
+			// state shows at this layer: a batch reports through
+			// n.Processed(ce.Index, min(maxApplied, ce.Index)) with batch.maxApplied pinned
+			// at the pre-batch applied value. applied == processed here would mean no batch
+			// state shows at all. See the note above for why this is not by itself proof
+			// that the prefix is retained, or that the members were unapplied.
+			if applied >= processed {
+				return fmt.Errorf("server %q: applied %d is not behind processed %d, so no "+
+					"batch is being held", s.Name(), applied, processed)
+			}
+			if pindexMax == 0 {
+				pindexMax = pindex
+			} else if pindex != pindexMax {
+				return fmt.Errorf("server %q: pindex %d != max %d", s.Name(), pindex, pindexMax)
 			}
 		}
 		return nil
 	})
-	t.Logf("%s: every replica has committed all %d members of the uncommitted prefix and "+
-		"is holding their entries", acceptBatchPrefixBufferedMarker, acceptBatchPrefix)
+	t.Logf("%s: every replica has committed and processed all %d members of the "+
+		"uncommitted prefix, with the applied watermark withheld for retained batch state",
+		acceptBatchPrefixBufferedMarker, acceptBatchPrefix)
 
-	// The claim itself: committed, buffered, and nothing applied.
-	acceptBatchAssertNothingStored(t, c, "while the prefix is buffered")
+	// The claim itself. The barrier above established that every replica committed and
+	// processed the prefix with its applied watermark withheld; THIS is what establishes
+	// that nothing was applied, and it is the assertion the paired mutation breaks.
+	acceptBatchAssertNothingStored(t, c, "with the applied watermark withheld")
 
 	// And the abandonment, which is what a real leader change does to it. The CLFS
 	// wait is the apply barrier -- StepDown() returning is not one.

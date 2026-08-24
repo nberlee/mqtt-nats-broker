@@ -190,10 +190,16 @@ apply_mutation() {
       # unstored, and the fixture's negative assertion would hold for the wrong reason
       # and score the mutant a survivor.
       #
-      # batch.mu is released across the apply and retaken afterwards, because
-      # applyStreamMsgOp is called with needLock and takes mset.mu -- the stream lock is
-      # acquired BEFORE the batch lock everywhere else in this function, and holding
-      # batch.mu across it would invert that order.
+      # NO batch lock is taken. Through v2.14.5 batchApply hung off the stream with its
+      # own mutex, and this mutation had to release it across the apply because
+      # applyStreamMsgOp takes mset.mu and the stream lock is acquired BEFORE the batch
+      # lock everywhere else in that function. From v2.15.0-preview.1 batchApply is a
+      # monitor-goroutine LOCAL with no mutex at all, so there is no lock to juggle and
+      # no order to invert. mset.mu is already released at the insertion point.
+      #
+      # This patch therefore targets the PINNED version's shape. Re-pinning below
+      # v2.15.0 needs the batch.mu form back; the fixture that pairs with it carries the
+      # same note.
       edit "$tree/server/jetstream_cluster.go" 1 \
         '				// If the sequence is not monotonically increasing/we identify gaps, the batch can'"'"'t be accepted.' \
         '				// depproof m-batch-apply-eager: apply the member as it is committed.
@@ -202,11 +208,7 @@ apply_mutation() {
 					if eerr != nil {
 						panic(eerr.Error())
 					}
-					batch.mu.Unlock()
-					eerr = js.applyStreamMsgOp(mset, eop, ebuf, isRecovering, true)
-					batch.mu.Lock()
-					if eerr != nil {
-						batch.mu.Unlock()
+					if eerr = js.applyStreamMsgOp(mset, eop, ebuf, isRecovering, true); eerr != nil {
 						return 0, eerr
 					}
 				}
@@ -311,7 +313,8 @@ one_run() {
 
   # Markers are scored on BOTH directions, because they state what the run OBSERVED and
   # that is a claim about a passing row as much as a failing one. A clean row whose
-  # whole contract is "the prefix was buffered AND nothing was stored" is unenforced if
+  # whole contract is "every replica committed and processed the prefix AND nothing was
+  # stored" is unenforced if
   # a PASS is accepted without reading them: the required marker would go unchecked if
   # the observation never happened, and the forbidden one would go unchecked if it did.
   # BROKEN and OFFTARGET are left alone -- there is no run to make a claim about.
@@ -552,7 +555,7 @@ matrix() {
 
     # The accepted-CONNECT batch: a committed prefix with no commit entry applies
     # nothing. The clean row forbids the stored marker as well as requiring the
-    # buffered one, so it cannot be satisfied by a run in which the prefix never
+    # committed-and-processed one, so it cannot be satisfied by a run in which the prefix never
     # arrived. The fixture is named by the ROW rather than chosen from the version,
     # which keeps it off the control run without any version branching.
     "PASS $pinned ^TestJetStreamAcceptBatchPrefixStoresNothing +acceptbatch_partial_test.go @ACCEPT-BATCH-PREFIX-BUFFERED !ACCEPT-BATCH-PREFIX-STORED"
