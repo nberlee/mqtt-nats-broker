@@ -275,6 +275,7 @@ var censusInterpreters = map[string]string{
 	"rollbackEphemeralConsumers":         "deletes both ephemeral consumer names including the FAILING create's own, because an error is not proof nothing was created",
 	"processJSConsumer":                  "creates or adopts a plain QoS 1/2 consumer; an existing durable makes the create an UPDATE, and the response's config is what the record then persists",
 	"processSharedJSConsumer":            "joins the shared group consumer; membership is persisted BEFORE the create so a concurrent leaver's last-holder scan sees this joiner",
+	"classifySharedGroups":               "reads, in one batch, whether each group durable a RESIDENT shared membership is about to be restored into exists and is canonical; a settled absence and an unreadable reply are kept distinct, and neither licenses a write",
 	"createQ2AffineConsumer":             "creates the session-affine QoS 2 consumer; an immutable-field mismatch is distinguished from an ordinary failure",
 	"ensureQ2AffineConsumerSubscription": "provisions the affine delivery path, participating in the SUBSCRIBE packet's rollback because it costs a consumer, a MaxAckPending charge and a persisted generation",
 	"ensurePubRelConsumerSubscription":   "provisions PUBREL delivery; must run before the drain barrier because $MQTT_out is interest-retained and a recreate with no consumer keeps nothing",
@@ -386,7 +387,7 @@ var censusInterpreters = map[string]string{
 
 	// ---- orphan reconciliation ---------------------------------------------
 	"sweepOrphanedQoS2State":            "the orphan pass over inbound QoS 2 state; authoritative over persisted records and this broker's residents, explicitly not over a session live elsewhere",
-	"sweepOrphanedConsumers":            "the orphan pass over consumers, whose exact-sequence revalidation protects reoccupation but not a remote live owner",
+	"sweepOrphanedConsumersBefore":      "the orphan pass over consumers, whose exact-sequence revalidation protects reoccupation but not a remote live owner; the eligibility cutoff is a parameter so a test can reach the pass at all, and an unreadable record ABORTS it rather than being skipped, since the walk deletes by absence of a reference",
 	"deleteOrphanPubRelConsumers":       "deletes an orphaned PUBREL consumer by name, behind the same instance check as the affine one",
 	"enumerateInflightSubjectsBounded":  "the reap's enumeration, returning the subject set AND the watermark that bounds what the pass may destroy; the resume walk's own enumeration discards that watermark because it removes nothing by filter",
 	"loadInflightRecordsMulti":          "the reap's batched register read, kept separate from the resume walk's batching because the window the reap must get right lies between the enumeration and this load",

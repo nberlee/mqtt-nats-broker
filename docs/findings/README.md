@@ -56,6 +56,21 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
 - Generalise cross-stream identity coupling instead of three ad hoc instances.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-066](ha-arbitration.md#f-066).
+- Prove a shared group durable exists before restoring its membership.
+  Status: Closed 2026-08-23, guarantee scoped. Release treatment: Alpha blocker.
+  The resume fall-through subscribed to a recorded deliver subject without ever proving the
+  group durable still existed, so a durable deleted out of band left the client with Session
+  Present and a subscription that never delivered. Now classified in two batched passes and
+  refused when it cannot be proved. Establishes configuration evidence only, never ownership
+  evidence — that half is F-077.
+  Details: [F-076](shared-qos2.md#f-076).
+- Arbitrate ownership after any shared group durable create.
+  Status: Open. Release treatment: Alpha blocker.
+  Split out of F-076, and a defect on `main` rather than one it introduced: no group-durable
+  create is followed by a revalidation that this broker still owns the membership it was
+  keyed on. Three sites, one class-wide record-CAS rule; the orphan sweep does NOT discharge
+  it, because it skips durables a resident session still references.
+  Details: [F-077](shared-qos2.md#f-077).
 - Refuse a pre-release delayed-drain record shape instead of repairing it.
   Status: Open. Release treatment: Post-alpha cleanup.
   Filed by F-034's census. The compatibility boundary refuses an unsupported persisted

@@ -2432,6 +2432,21 @@ func mqttClassifyMsgGetResponse(resp *JSApiMsgGetResponse) mqttInflightResponseK
 	return mqttInflightResponsePresent
 }
 
+// applyConsumerLookup records ONE batched consumer lookup outcome.
+//
+// Extracted so the production mapping from (info, settled) to the cache's two maps can be
+// driven by a test, rather than a test pre-seeding those maps and proving only its own
+// fixture. The distinction this carries is terminal: a SETTLED absence resolves to Lost —
+// knowably unrecoverable — while an unsettled lookup stays Unknown. Encoding a reply that
+// established nothing as the former is the defect mqttClassifyConsumerInfoResponse fixes,
+// and this is the seam through which that fix is observable end to end.
+func (sc *mqttInflightSourceCache) applyConsumerLookup(durable string, info *ConsumerInfo, settled bool) {
+	if !settled {
+		return // nothing established: no entry, which resolves to Unknown
+	}
+	sc.consumers[durable], sc.resolved[durable] = info, true
+}
+
 // mqttInflightSourceCache resolves the state of many source deliveries with a bounded
 // number of JetStream requests instead of two per record: one consumer lookup per
 // DURABLE, and one batched message load per stream.
@@ -2441,8 +2456,15 @@ func mqttClassifyMsgGetResponse(resp *JSApiMsgGetResponse) mqttInflightResponseK
 // a handful of consumer lookups plus a few batches.
 //
 // Every uncertainty is preserved exactly as the single-record path preserves it: a
-// consumer that cannot be read, a consumer that is gone, and a message load with no
-// response are all Unknown, never Complete.
+// consumer that cannot be READ and a message load with no response are Unknown, never
+// Complete.
+//
+// A consumer authoritatively GONE is not an uncertainty and is deliberately not in that
+// list — it resolves to Lost, which is terminal. An earlier version of this comment said
+// gone was Unknown too, which the state branch below has never done. The distinction is
+// the whole reason the cache keeps `known` and `resolved` apart, and it is why the batched
+// lookup must never encode "the reply said nothing" the same way as "the consumer is not
+// there": see mqttClassifyConsumerInfoResponse.
 type mqttInflightSourceCache struct {
 	as        *mqttAccountSessionManager
 	consumers map[string]*ConsumerInfo // durable -> info; nil means absent or unreadable
@@ -2495,12 +2517,15 @@ func (sc *mqttInflightSourceCache) resolve(recs []*mqttInflightRecord) {
 				continue
 			}
 			for i, dur := range batch {
-				if i >= len(ok) || !ok[i] {
-					continue // unreadable: no entry, which resolves to Unknown
+				var info *ConsumerInfo
+				var settled bool
+				if i < len(infos) {
+					info = infos[i]
 				}
-				// A nil info with ok means authoritatively ABSENT, which classifies as Lost
-				// rather than Unknown: unrecoverable, but known to be so.
-				sc.consumers[dur], sc.resolved[dur] = infos[i], true
+				if i < len(ok) {
+					settled = ok[i]
+				}
+				sc.applyConsumerLookup(dur, info, settled)
 			}
 		}
 	}

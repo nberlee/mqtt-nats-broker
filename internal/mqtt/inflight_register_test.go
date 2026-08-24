@@ -5156,15 +5156,90 @@ func TestMQTTClassifyMsgGetResponse(t *testing.T) {
 	}
 }
 
-// The source cache never reads a consumer's absence as a completed delivery.
-func TestMQTTInflightSourceCacheConsumerGoneIsUnknown(t *testing.T) {
+// A consumer lookup that was ATTEMPTED but never completed leaves the source Unknown —
+// never Complete, and never Lost either.
+//
+// The name and the message used to say "gone", which is the opposite of the invariant
+// this fixture exercises: it sets `known` and leaves `resolved` false, which is the
+// could-not-read case. An authoritative absence is Lost, and the sibling below pins that.
+// A future reader taking the old name at face value would have concluded the cache treats
+// a gone consumer as recoverable.
+func TestMQTTInflightSourceCacheUnreadableConsumerIsUnknown(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-batch-consumer")
 	cache := e.asm.newInflightSourceCache()
-	cache.known["missing_durable"] = true // looked up, found nothing
+	cache.known["missing_durable"] = true // a lookup was attempted; it did not complete
 	cache.resolve([]*mqttInflightRecord{{Dur: "missing_durable", Seq: 1}})
 	if got := cache.state(&mqttInflightRecord{Dur: "missing_durable", Seq: 1}); got != mqttInflightSourceUnknown {
-		t.Fatalf("a source whose consumer is gone must be unknown, never complete, got %v", got)
+		t.Fatalf("a source whose consumer lookup did not complete must be unknown, never complete or lost, got %v", got)
+	}
+}
+
+// The other half of that distinction: a lookup that COMPLETED and found nothing is an
+// authoritative absence, which is Lost — knowably unrecoverable rather than uncertain.
+// Pinning both directions is what stops the two being collapsed again.
+func TestMQTTInflightSourceCacheAbsentConsumerIsLost(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-batch-consumer")
+	cache := e.asm.newInflightSourceCache()
+	cache.known["absent_durable"] = true
+	cache.resolved["absent_durable"] = true // the lookup completed and reported not-found
+	cache.resolve([]*mqttInflightRecord{{Dur: "absent_durable", Seq: 1}})
+	if got := cache.state(&mqttInflightRecord{Dur: "absent_durable", Seq: 1}); got != mqttInflightSourceLost {
+		t.Fatalf("a source whose consumer is authoritatively absent must be lost, got %v", got)
+	}
+}
+
+// The two tests above pin the cache's ARMS. This pins the WIRING between the decoder and
+// those arms, which is the part neither of them reaches.
+//
+// A holistic review found the gap: the decoder test proves the (info, settled) tuple, and
+// the arm tests pre-seed resolved and prove the branch, but nothing proved the production
+// mapping from one to the other. A regression that settled a successful nil ConsumerInfo
+// could therefore select the terminal Lost verdict again while every one of those tests
+// still passed. So this drives the real applyConsumerLookup with the exact tuples
+// mqttClassifyConsumerInfoResponse produces, instead of reaching into the maps.
+func TestMQTTInflightSourceCacheAppliesTheLookupContract(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-batch-wiring")
+
+	for _, tc := range []struct {
+		name string
+		dur  string
+		resp *JSApiConsumerInfoResponse
+		want mqttInflightSourceState
+		why  string
+	}{
+		{
+			name: "authoritative not-found is Lost",
+			dur:  "wiring_notfound",
+			resp: &JSApiConsumerInfoResponse{ApiResponse: ApiResponse{Error: ApiErrors[JSConsumerNotFoundErr]}},
+			want: mqttInflightSourceLost,
+			why:  "the lookup completed and proved the consumer gone, which is terminal",
+		},
+		{
+			name: "a success carrying no consumer is Unknown",
+			dur:  "wiring_nilinfo",
+			resp: &JSApiConsumerInfoResponse{},
+			want: mqttInflightSourceUnknown,
+			why: "the reply established nothing. Encoding it as an absence is what made the cache " +
+				"conclude Lost - knowably unrecoverable - from a response that proved nothing",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cache := e.asm.newInflightSourceCache()
+			cache.known[tc.dur] = true
+
+			// The production decode, then the production application of its result.
+			info, settled := mqttClassifyConsumerInfoResponse(tc.resp)
+			cache.applyConsumerLookup(tc.dur, info, settled)
+
+			cache.resolve([]*mqttInflightRecord{{Dur: tc.dur, Seq: 1}})
+			if got := cache.state(&mqttInflightRecord{Dur: tc.dur, Seq: 1}); got != tc.want {
+				t.Fatalf("state = %v, want %v: %s", got, tc.want, tc.why)
+			}
+		})
 	}
 }
 

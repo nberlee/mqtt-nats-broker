@@ -766,22 +766,58 @@ further findings it surfaced are filed separately, for the reason its own bullet
   so it publishes the Will and can delete a zero-expiry session. The remedy respects that
   by not acknowledging at all — restoration moved BEFORE the CONNACK, where the existing
   pre-CONNACK abort discipline already discards the Will and leaves the lifetime
-  ungranted. - [ ] **Prove a shared group durable exists when a resume restores its
-  membership.** Surfaced by F-050's plan review, which falsified the obvious remedy.
-  `processSharedJSConsumer`'s resume fall-through subscribes to the recorded deliver
-  subject and stops, so a group durable deleted out of band — a concurrent leaver's
-  last-holder race, an operator, an account reset — leaves a live subscription on a
-  subject nothing publishes to, with no error anywhere. It is NOT F-050's: F-050 is about
-  a per-filter FAILURE being dropped, and this reaches the same accepted-but-dead state
-  with no failure at all. **The obvious fix is refuted**: shared consumer configurations
-  are deliberately not persisted (`SharedSubs` is the authority and group-owned configs
-  are filtered out of `Cons`), so the fall-through's `cc` is a stale in-memory config from
-  an earlier join, and re-issuing it with `ActionCreateOrUpdate` would overwrite a live
-  group durable's `AckWait`/`MaxAckPending`/storage **for every other member**. A remedy
-  must derive a canonical current configuration, separate "present and valid" from
-  "authoritatively absent, recreate", and answer what a stale broker recreating the
-  durable after a newer owner removed the membership does. This is why F-050 does not
-  claim to prove an end-to-end delivery path. - [ ] **The 3.1.1 forced leave's
+  ungranted. - [x] [F-076: Prove a shared group durable exists before restoring its
+  membership](findings/shared-qos2.md#f-076). **Alpha blocker — done 2026-08-23, with the
+  guarantee SCOPED and the other half split out as F-077.** Surfaced by F-050's plan
+  review. `processSharedJSConsumer`'s resume fall-through subscribed to the recorded
+  deliver subject and stopped, so a group durable deleted out of band left a live
+  subscription on a subject nothing publishes to, with no error anywhere — and because
+  shared configs are never persisted, `exists == true` means a RESIDENT session, which
+  makes the defective path the **ordinary same-broker reconnect**. **What landed:** two
+  batched classifications around the restore (a pre-pass before `processSubs`, acting
+  before the subscribe; a post-pass after it repeating the FULL classification and feeding
+  F-050's existing pre-CONNACK aggregation), four outcomes with absence and indeterminacy
+  kept distinct, one canonical constructor shared by the join path and the validator, and
+  whole-struct validation closed by a reflection bijection over every `ConsumerConfig`
+  field — three bounded member-variable, two compared against an EXPECTED normalized value,
+  one server-owned and constrained to the three named server metadata keys, with the
+  normalized set MEASURED against a real create rather than listed. A `Cons` entry carrying
+  a `DeliverGroup` is refused at all five ingresses. It also fixed a latent defect in a
+  shared helper: `lookupConsumersMulti` encoded an authoritative not-found and a successful
+  nil `ConsumerInfo` identically, so the in-flight source cache was concluding a terminal
+  `Lost` from a reply that proved nothing; it now resolves `Unknown`. **What it does NOT
+  establish, and the tick rests on this:** configuration evidence, never ownership
+  evidence. It does not recreate, and a stale resident broker can still validate a present
+  durable and serve from it. **Refuted and recorded:** re-issuing the remembered config,
+  blind canonical `CreateOrUpdate`, any-error-means-absent, a short field allowlist,
+  copying the normalized fields, and dropping the local entry so the next CONNECT
+  recreates. Residuals in `docs/CONFORMANCE.md`: the delivery gap is not repaired, the
+  proof is fresh but not atomic, and there is no self-repair. - [ ] [F-077: Arbitrate
+  ownership after any shared group durable create](findings/shared-qos2.md#f-077).
+  **Alpha blocker.** Split out of F-076 by a scope consult after three plan rounds re-cut
+  the same seam, and **a defect on `main` today rather than one F-076 introduced**: no
+  group-durable create on any path is followed by a revalidation that this broker still
+  owns the membership it was keyed on, so a superseded broker can recreate a durable a
+  newer owner's leave deleted and then serve group deliveries under a membership the record
+  no longer carries. **The class is three sites** — the resume repair F-076 declines to
+  perform, the CONNECT `!exists` create, and the live SUBSCRIBE `!exists` create, whose
+  final update saves only when something changed and so performs no second CAS. **Two
+  answers are already refuted:** the accept transaction is an in-process fence and fences
+  no other broker; and `sweepOrphanedConsumers` does not discharge it, because it skips
+  candidates referenced by a RESIDENT session's `sharedSubs` — the stale broker's own object
+  protects the durable, and meanwhile its queue subscription can receive AND ACKNOWLEDGE
+  group messages. **The remedy is a record-CAS rule applied CLASS-WIDE** through
+  `saveClassifiedDetail`/`resolveContendedRecordSave`; a separate group-lock artifact is not
+  required if it is class-wide, and closing it only on the repair leaves the join path open.
+  Three further designs are refuted in the dossier: a bare forced record write (plain `save`
+  loses the 10071/10164 distinction), reusing `releaseSharedConsumer` for foreign cleanup,
+  and a blind last-holder delete on a foreign verdict (the holder scan skips same-client-ID
+  records, so after a takeover it deletes the NEW owner's durable). **A fifth mechanism is
+  why this is its own item:** a live SUBSCRIBE has no restore gate, so shared QoS 0 and
+  denied/reserved/No-Local deliveries are acknowledged before any CAS could run, which needs
+  a packet-scoped interest gate. Note `make cluster-failover-tests` runs only
+  `^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)`, so a new replicated test
+  is invisible to it until that regex is extended. - [ ] **The 3.1.1 forced leave's
   post-CONNACK destructive exit.** Also surfaced by F-050's review, and deliberately not
   folded into it. The forced leave removes a resuming 3.1.1 client's persisted shared
   memberships and releases their group consumers, and it runs AFTER the success CONNACK;

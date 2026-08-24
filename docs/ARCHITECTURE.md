@@ -2931,6 +2931,95 @@ The pass:
    parked delivery wakes, finds the subscription still closed, and skips instead
    of waiting out the bound.
 
+## Shared group durables are verified on resume, not assumed
+
+The plain reconciliation above deliberately covers only plain filters. Its collect step
+says shared subscriptions "live in `SharedSubs` and their group durables have their own
+machinery" — and until F-076 that machinery did not exist. This section is it.
+
+`processSharedJSConsumer` has three arms. A re-SUBSCRIBE with a live delivery subscription
+refreshes the mutable per-subscription fields. A filter with **no resident `cons` entry**
+joins: it creates the group durable, which proves it. Between them sat a fall-through for
+a resident entry with no live subscription — a session resume on a new connection — which
+subscribed to the recorded deliver subject on the strength of a configuration remembered
+from an earlier connection, and proved nothing.
+
+That is the ordinary same-broker reconnect, not an edge case. Shared consumer configs are
+**never persisted** (`buildPersistedSessionLocked` skips every entry whose `DeliverGroup`
+is non-empty, because `SharedSubs` is the sole authority), so a session rebuilt from its
+record has no shared `cons` entry at all and takes the join path. A resident `cons` entry
+therefore means the session object survived in this process. If the group durable had been
+deleted meanwhile — a concurrent leaver's last-holder race, the orphan sweep's grace
+window, an operator — the client was told Session Present = 1 and handed a live
+subscription on a subject nothing publishes to, silently.
+
+**Two batched passes, around `processSubs`.** A pre-pass collects exactly the shared sids
+with a resident entry — derivable before restoration runs, since the sid is the filter's
+session key and the level-up companion follows the same rule `processSubs` applies — and
+resolves them through `lookupConsumersMulti` in **bounded chunks** of
+`mqttInflightLoadBatch`, the same cap every other resume-time batch here uses. The bound is
+a correctness property, not tuning: a session's shared filter count is client-controlled,
+each lookup carries its own timeout, and an indeterminate verdict refuses — so one
+unbounded request would let a single lost response fail a large session closed on every
+reconnect. For the same reason the **first** chunk-level failure stops the pass and marks
+every unresolved target indeterminate rather than paying a timeout per remaining chunk:
+one indeterminate filter already refuses the CONNECT, so continuing cannot rescue it, and
+in the post-pass the stall would run while this connection's queue interest is already
+installed and dropping QoS 0 deliveries. The resume arm then acts on its verdict
+**before** subscribing, which keeps the join path's own rule that a group durable must not
+deliver to a member until the join is proven.
+
+A post-pass runs after `processSubs` returns, after its phase-sub sweep, and immediately
+before the per-filter aggregation. It repeats the **full** classification rather than a
+presence check, because a consumer can be deleted *or altered* between the two readings,
+and it adopts the second one — a member-variable field may legitimately have moved. A
+filter that regresses is marked failed and refused by the restore gate's existing
+aggregation, so there is one refusal path rather than two.
+
+**Four outcomes, and the distinctions are the mechanism.** *Present and canonical* adopts
+a clone of the live configuration in place of the remembered one. *Present and not canonical*
+refuses, and neither updates nor deletes: the durable may be serving other members, and a
+configuration this broker would not have built is not one it may normalize on their behalf.
+*Authoritatively absent* refuses. *Indeterminate* — a failed read, a reply carrying no
+consumer, a consumer carrying no configuration — refuses too, but is kept distinct from
+absence, because recreating on an unproven absence turns one broker's transient error into
+a group-wide change.
+
+**Validation is whole-struct and closed by construction.** Every `ConsumerConfig` field
+carries exactly one disposition, enforced by a reflection bijection, because a list of
+fields worth checking cannot close a struct a dependency bump can extend — the same
+reasoning the affine path records. Three fields are legitimately variable across members
+and are bounded rather than ignored; two are server-normalized and compared against an
+**expected value** rather than accepted from the live consumer, since copying `MaxDeliver`
+would admit a durable that discards a delivery after one attempt; one, `Metadata`, is
+server-**owned**, its content moving with the dependency, and is constrained instead by
+requiring it to carry nothing but the three named server keys. A test measures the
+normalized set against a real create, so the expected values are observed rather than
+remembered.
+
+**What this establishes is CONFIGURATION evidence, never OWNERSHIP evidence.** A present
+canonical durable does not prove this broker still owns the membership the restore is keyed
+on. A stale resident broker can validate one and serve from it, and a co-restored filter
+with no resident entry still creates through the join path unarbitrated. Both belong to
+F-077, and both are properties of the design before this change rather than consequences of
+it. The verification arm itself performs no group-durable write — a claim about the arm, not
+about the restore operation, which still creates for every non-resident filter.
+
+The window is narrowed, not closed: `CONSUMER.DELETE` and `CONSUMER.CREATE` are
+unconditioned, so a durable deleted or altered after the post-pass gets no further check on
+that CONNECT. And nothing self-repairs — this broker will not recreate the durable, so the
+same resident session goes on refusing while the condition persists, recovering if it
+clears by any means. Both are recorded in `docs/CONFORMANCE.md`.
+
+A record carrying a shared group consumer configuration in `Cons` is a shape this broker
+never writes, and is **refused** at every ingress that reads one rather than accommodated:
+the CONNECT restore prologue, record-driven expiry, the session-expiry sweep, the
+orphan-consumer sweep, and the shared record validator. The two expiry paths matter most —
+they would claim, rewrite and delete the record, normalizing a format nothing here
+understands — and the orphan sweep **aborts** rather than skipping, because that walk
+decides what to delete by absence of a reference and a partial view must never be reported
+as a complete one.
+
 ## The restore gate: the CONNACK follows a complete restoration
 
 A resuming CONNECT used to acknowledge the session with Session Present = 1 and

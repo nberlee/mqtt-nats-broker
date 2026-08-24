@@ -383,8 +383,12 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 
 	// ---- Step 1: collect --------------------------------------------------
 	//
-	// Plain filters only: shared subscriptions live in sharedSubs and their
-	// group durables have their own machinery; drained sids are not in cons
+	// Plain filters only: shared subscriptions live in sharedSubs, and their group
+	// durables are verified by their own machinery — the two batched passes the CONNECT
+	// restore runs around processSubs (shared_group_verify.go, F-076). That comment used
+	// to name a mechanism that did not exist, which is the gap F-076 closed.
+	//
+	// Drained sids are not in cons
 	// (stageDrain removed them) and their filters are not in subs unless a
 	// re-SUBSCRIBE adopted the drain — in which case the entry is back in cons
 	// and is verified here like any other. A stale Cons entry with no matching

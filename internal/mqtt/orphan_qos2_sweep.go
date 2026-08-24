@@ -964,6 +964,14 @@ func mqttValidateSessionRecord(ps *mqttPersistedSession, idHash string) error {
 	if _, gerr := mqttSessGenFromRecord(ps.Gen); gerr != nil {
 		return gerr
 	}
+	// A shared group consumer config in Cons is a shape this broker never writes, and every
+	// reader reached through here acts DESTRUCTIVELY on what a record says: the reference
+	// walk decides what may be deleted, and discardAbsentWinnerClaim's call authorizes a
+	// Discarded transition. A record that cannot be accounted for must not license either.
+	// See mqttSharedConsInRecord.
+	if sid, found := mqttSharedConsInRecord(ps); found {
+		return mqttSharedConsRecordErr(ps.ID, sid)
+	}
 	return mqttValidateRecordAffinePair(ps, idHash)
 }
 

@@ -121,3 +121,19 @@ var (
 	IsNatsErr             = server.IsNatsErr
 	NewJSInvalidJSONError = server.NewJSInvalidJSONError
 )
+
+// The metadata keys nats-server sets on an asset of its own accord.
+//
+// A separate block, deliberately: these names are longer than every alias above, and
+// folding them into that block makes gofmt re-align ninety lines of it for three
+// additions — churn that buries the real change in a file whose header asks for light
+// edits.
+//
+// Named rather than matched by their shared "_nats." prefix, so a key a future server
+// adds fails a test and forces a decision instead of being silently absorbed. See
+// sharedGroupMetadataIsServerOnly.
+const (
+	JSRequiredLevelMetadataKey = server.JSRequiredLevelMetadataKey
+	JSServerVersionMetadataKey = server.JSServerVersionMetadataKey
+	JSServerLevelMetadataKey   = server.JSServerLevelMetadataKey
+)

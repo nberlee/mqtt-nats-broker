@@ -2497,6 +2497,54 @@ the compatibility boundary (no released contract exists for either):
   `MaxMsgsPer` in place either — `$MQTT_rmsgs` is create-then-validate like
   every other broker-owned stream.
 
+### A resumed shared subscription proves its group durable, but cannot repair it
+
+A resume now verifies the JetStream group durable behind every shared subscription whose
+consumer configuration is still resident on this broker, and refuses the CONNECT before the
+CONNACK when it cannot prove the durable exists and is usable (F-076). Previously such a
+resume was accepted with Session Present = 1 and a subscription on a subject nothing
+publishes to. Three residuals remain, and the closure rests on them.
+
+- **The messages published while the durable was absent are gone, and the refusal does not
+  recover them.** `$MQTT_msgs` is interest-retained: with no consumer there is no interest,
+  so nothing was kept. What changes is that the state is now reported rather than silent —
+  a v5 client receives `0x83` naming the shared filter, and a 3.1.1 client gets the bare
+  close its protocol allows.
+
+- **The proof is fresh but not atomic.** The verification reads the durable before the
+  connection's queue interest is installed and again immediately before the CONNACK, which
+  narrows the window without closing it: `CONSUMER.DELETE` and `CONSUMER.CREATE` are both
+  unconditioned, so a durable deleted **or altered into a shape this broker would not
+  provision** after the second reading receives no further check on that CONNECT. This is
+  the same shape as the affine path's retention residual, and it now covers configuration
+  drift as well as deletion.
+
+- **There is no self-repair.** This broker does not recreate the group durable. The same
+  resident session therefore goes on refusing for as long as the durable stays absent or
+  non-canonical, or the lookup stays unreadable. It recovers as soon as that condition
+  clears **by any means** — a transient read becoming readable, an operator restoring the
+  durable, or another member of the group recreating the deterministic name — and a clean
+  start always recovers, at the cost of the session. Making recovery the broker's own job
+  is F-077.
+
+**What the verification does not establish.** It is evidence about the durable's
+*configuration*, never about *ownership*. A present, canonical group durable does not prove
+this broker still owns the membership the resume is keyed on, so a superseded broker can
+validate one and serve from it; and a filter restored on the same CONNECT that has no
+resident configuration still creates its durable through the ordinary join path, which is
+not arbitrated either. Both are F-077, and both are properties of the design that predate
+this change rather than consequences of it.
+
+**An unsupported record shape is refused rather than repaired.** A session record
+carrying a shared group consumer configuration in `Cons` is a format this broker never
+writes — shared membership is held in `SharedSubs` alone — and every path that reads one
+refuses it and
+leaves the record untouched: the CONNECT restore, both expiry paths, the orphan-consumer
+sweep, and the shared record validator. The orphan-consumer sweep **aborts its whole pass**
+on meeting one, because that walk deletes by absence of a reference and must never act on
+a partial view. The recovery is the compatibility boundary's: stop the account's brokers and
+recreate the bridge-owned `$MQTT_*` streams. This is not a rolling upgrade.
+
 ### The retained index is not arbitrated by sequence, and a lost application is not repaired
 
 Retained state is durably arbitrated: `$MQTT_rmsgs` holds exactly one record per

@@ -252,3 +252,240 @@ re-asserted group membership would be durable while a per-filter failure leaves 
 and no consumer — the accepted-but-dead state above. **F-027's repair set widens to shared
 membership when this closes**, and its snapshot constructor is where that exclusion lives
 (`sess_fork_repair.go`).
+
+## F-076
+
+**Title:** Prove a shared group durable exists before restoring its membership
+
+- Status: **Closed 2026-08-23.**
+- Classification: Confirmed correctness defect
+- Release treatment: Alpha blocker
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+- **ID note.** Filed as F-076, not F-073: F-073, F-074 and F-075 were allocated on
+  2026-08-22 by F-034's scope ruling and their filing commit has not landed, so `docs/`
+  reports them free while they are not.
+
+### The finding
+
+An MQTT 5.0 shared subscriber reconnects to a broker where its `mqttSession` object is
+still resident. `processSharedJSConsumer` finds the consumer config left by the previous
+connection, finds no live delivery subscription on this connection, and takes its
+fall-through: it subscribes to the deterministic deliver subject and returns success.
+
+Every proof that the group durable still exists sits behind that function's `!exists`
+branch, and its post-subscribe repair sits behind `charged != 0`, which is false on this
+path by construction. **So if the durable is gone, nothing notices.** The client is told
+Session Present = 1 and holds a live NATS subscription on a subject nothing publishes to —
+no error, no reason code — and it recurs on every reconnect to the same broker while the
+condition persists. The only recovery available to the client is a clean start, which
+discards the session it was trying to resume.
+
+It is **not** F-050. That refuses a CONNECT whose restoration *reports a failure*; here
+every step returns success, so `mqttFirstUnrestoredFilter` cannot see it. This is why
+F-050's dossier does not claim to prove an end-to-end delivery path.
+
+### Two populations reach the fall-through
+
+**A resident session, which is the ordinary case.** Shared configs are never persisted —
+`buildPersistedSessionLocked` skips every entry whose `DeliverGroup` is non-empty, because
+`SharedSubs` is the sole authority — so a session rebuilt from its record has no shared
+`cons` entry and takes the create path. A resident one does not. **The defective path is
+therefore the ordinary same-broker reconnect, not an exotic one.**
+
+The narrow claim the design rests on, pinned by test rather than left as prose: no writer
+of `sess.cons` can introduce a *shared* entry that was not already resident. The SUBSCRIBE
+rollback restores this session's own snapshot; fork repair's config comes from a record
+body, which carries no shared config; resume reconciliation is plain-only; drains skip
+shared filters.
+
+**An unsupported persisted record**, which the restore used to assign verbatim. See
+"The record shape" below.
+
+### How the durable disappears
+
+- **A concurrent leaver's last-holder race.** The scan walks in-memory membership plus
+  every other session's record; a leaver whose scan completed before this session's
+  membership was durable issues a queued, fire-and-forget delete that can land later. The
+  join path already treats this as real — it has dedicated repair code for it — which is
+  the internal evidence that the resume path's omission is a defect and not a theory.
+- **The orphan consumer sweep's own grace window.**
+- **Administrative deletion, or an account reset.**
+
+**One route was proposed and falsified, and is recorded so it does not return.** A
+stream-level `ConsumerLimits.InactiveThreshold` imposed after startup does **not** reap an
+existing group durable: nats-server applies a stream's consumer limits to a consumer's
+config only when the consumer requests zero and only at create or update time, and a
+stream update is rejected only when an existing consumer *exceeds* the new limit, which a
+consumer at zero does not. The converse does hold and is load-bearing — a consumer
+*created* while such a limit is in force inherits a delete timer — which is why the join
+path refuses under a live stream limit.
+
+### What landed
+
+**A batched classification, twice, around the restore.** A pre-pass before `processSubs`
+collects exactly the shared sids that have a resident `cons` entry and resolves them through
+`lookupConsumersMulti` in **bounded chunks** of `mqttInflightLoadBatch`, stopping at the
+first chunk-level failure and marking every unresolved target indeterminate — the filter
+count is client-controlled, each lookup has its own timeout, and an indeterminate verdict
+already refuses the CONNECT, so continuing would only stall it while installed queue
+interest drops QoS 0 deliveries. The resume arm acts on the verdict *before* subscribing,
+keeping
+the join path's own create-before-subscribe rule. A post-pass after `processSubs` repeats
+the **full** classification — not a presence check, because a consumer can become
+non-canonical between the two reads — adopts the second reading, and feeds any regression
+into F-050's existing pre-CONNACK aggregation rather than adding a second refusal path.
+
+**Four outcomes, and no fifth.** Present-and-canonical adopts a clone of the live config,
+replacing the remembered one. Present-and-non-canonical refuses, and never updates or
+deletes: the durable may be serving other members, and a configuration this broker would
+not have built is not one it may silently normalize on their behalf. Authoritatively
+absent refuses. Anything else — a failed read, a response carrying no consumer, a consumer
+carrying no configuration — is **indeterminate** and refuses, because recreating on an
+unproven absence is how one broker's transient error becomes a group-wide change.
+
+**One canonical derivation.** `buildSharedGroupConsumerConfig` is the single constructor:
+the join path builds with it and the resume path validates against it, so "what we would
+have created" and "what we accept" cannot drift.
+
+**Whole-struct validation, closed by construction.** Every `ConsumerConfig` field carries
+exactly one of four dispositions, enforced by a reflection bijection, because a list of
+fields worth checking cannot close a struct a dependency bump can extend. Three fields are
+legitimately variable across members and are *bounded* rather than ignored. Two are
+server-normalized and compared against an **expected value**, never copied from the live
+consumer — copying `MaxDeliver` would accept a group durable that discards a delivery after
+one attempt. One is server-*owned*: `Metadata`, whose content moves with the dependency, so
+it is constrained instead by requiring it to hold nothing but the three **named** server
+keys. A test measures the normalized set against a real create rather than trusting the
+table — and caught a real error on its first run, where `Metadata` had been pinned as unset
+and a whole-struct comparison would have refused every healthy group durable.
+
+**The batched lookup can now express what it needs to.** `lookupConsumersMulti` encoded an
+authoritative not-found and a successful response carrying a nil `ConsumerInfo` identically,
+so absence and indeterminacy were indistinguishable. The per-response decode is extracted
+and a successful nil now leaves the outcome unsettled. **That fixed a latent defect beyond
+this path**: the in-flight source cache reads a settled absence as
+`mqttInflightSourceLost`, a terminal verdict, so it was concluding "known to be gone and
+unrecoverable" from a reply that proved nothing. It now resolves to `Unknown`, the
+conservative arm. Downstream treats both as non-`Complete`, so this corrects a
+classification invariant rather than a demonstrated delivery bug.
+
+### The record shape
+
+A `Cons` entry whose `DeliverGroup` is non-empty is a format this broker never writes. Under
+the compatibility boundary it is **refused**, not accommodated, at every ingress — the
+CONNECT restore prologue (which also covers the overdue/retired branch built from the same
+record), record-driven expiry, the session-expiry sweep, the orphan-consumer sweep, and the
+common `mqttValidateSessionRecord`. The two expiry paths matter most: they would claim,
+rewrite and delete the record, normalizing a shape nothing here understands. The orphan
+sweep **aborts** rather than skipping, because that walk decides what to delete by absence
+of a reference and a partial view must never be reported as a complete one.
+
+### What this establishes, and what it does not
+
+It establishes **configuration evidence**: the durable exists and carries a configuration
+this broker recognises. It establishes **nothing about ownership**. A stale resident broker
+can validate a present canonical durable and serve from it, and a co-restored filter with
+no resident entry still creates through the untouched join path, unarbitrated. Both are
+**F-077**, and both are defects that exist independently of this change.
+
+The verification arm itself performs no group-durable write. That claim is about the arm,
+not about the restore operation: a filter with no resident entry still takes the create
+path, which is every filter after a broker restart.
+
+### Residuals
+
+- **The delivery gap is not repaired.** Messages published while the durable was absent are
+  gone: with no consumer, an interest-retained stream keeps nothing. The refusal makes the
+  state visible; it does not recover the messages.
+- **The proof is fresh but not atomic.** `CONSUMER.DELETE` and `CONSUMER.CREATE` are both
+  unconditioned, so a durable deleted *or made non-canonical* after the post-pass gets no
+  further check on this CONNECT.
+- **No self-repair.** This broker will not recreate the durable, so the same resident
+  session goes on refusing while the condition persists. It recovers if the condition
+  clears by any means — a transient read becoming readable, an operator restoring the
+  durable, another member recreating the deterministic name. F-077 is what makes recovery
+  the broker's own job.
+
+### Refuted designs, kept so they are not re-proposed
+
+- **Re-issuing the remembered config.** `ActionCreateOrUpdate` against a live group durable
+  rewrites its `AckWait`, `MaxAckPending` and storage for every other member on every other
+  broker. The join path is acceptable only because it derives fresh; a remembered config is
+  not a derived one.
+- **Blind canonical `CreateOrUpdate` on every resume.** Correct config, but it writes to a
+  live durable on the common path where nothing is wrong. A proof is a read.
+- **Treating any lookup error as absent.**
+- **Validating a short allowlist of identity fields.** A list cannot close a struct.
+- **Copying the server-normalized fields out of the live consumer.**
+- **Dropping the local `cons` entry on an absent verdict** so the next CONNECT recreates
+  through the join path. Mechanically safe, and rejected on scope: retiring the charge is
+  the accounting half of F-077, and steering the next CONNECT into the unarbitrated create
+  means this change caused a recreation by another route.
+
+## F-077
+
+**Title:** Arbitrate ownership after any shared group durable create
+
+- Status: **Open.**
+- Classification: HA arbitration / delivery safety
+- Release treatment: Alpha blocker
+- Roadmap section: §0.2 (multi-frontend HA blockers)
+- Split out of F-076 by a scope consult after three plan-review rounds kept re-cutting the
+  same seam. **This is a defect on `main` today, not one F-076 introduced.**
+
+### The finding
+
+**No group-durable create is followed by any revalidation that this broker still owns the
+membership the create was keyed on.** Broker A commits its accept save; B commits a newer
+accept for the same client and removes the membership; B's last-holder path deletes the
+group durable; A creates it again and CONNACKs. A then serves group deliveries under a
+membership the authoritative record no longer carries.
+
+The class is **three sites**: the resume repair F-076 deliberately does not perform, the
+CONNECT `!exists` create, and the live SUBSCRIBE `!exists` create — whose final update saves
+only when something changed, which by then is normally false, so no second CAS happens.
+
+### Two answers were tried and refuted
+
+- **The accept transaction fences it.** False. It is an in-process fence on one
+  `mqttSession` and fences no other broker.
+- **`sweepOrphanedConsumers` reaps the stale recreate, so the consequence is bounded.**
+  False as a discharge. The sweep skips every candidate referenced by a **resident**
+  session's in-memory `sharedSubs`, so the stale broker's own session object protects the
+  durable it just recreated — and during that interval its queue subscription can receive
+  **and acknowledge** group messages. Eventual cleanup is not arbitration.
+
+### The remedy, and its constraints
+
+A record-CAS rule applied **class-wide**: after any deterministic group create or recreate,
+revalidate the membership's record ownership through the existing
+`saveClassifiedDetail` / `resolveContendedRecordSave` machinery, whose 10071 / 10164 /
+ambiguous verdicts are already specified. A separate group-lock artifact is **not** required
+if the rule is class-wide. Closing it only on the repair would leave the same hole open on
+the join path.
+
+Three further constraints, each established by refuting a design:
+
+- **A bare forced record write is not the mechanism.** The ordinary update path calls plain
+  `save`, which loses the 10071 / 10164 distinction the verdicts depend on.
+- **`releaseSharedConsumer` cannot be reused for foreign cleanup.** It refunds the whole
+  historic charge rather than this invocation's, purges pending state through an
+  already-rejected transaction, and silently skips undecodable records.
+- **A blind last-holder delete on a foreign verdict is wrong.** The holder scan skips
+  records with the same client ID, on the assumption that this session object represents
+  them — which is exactly false after a takeover, so it would delete a durable the **new
+  owner** holds. A foreign-aware scan must include the authoritative same-ID record and
+  fail closed on decode errors.
+
+### The fifth mechanism, which is why this is its own item
+
+Unlike CONNECT, a live SUBSCRIBE has **no restore gate**. Between interest installation and
+any ownership CAS, shared QoS 0 deliveries and denied / reserved / No Local deliveries are
+already acknowledged. Closing that needs a packet-scoped interest gate, or an explicitly
+documented and weakened invariant.
+
+### Test-harness note
+
+`make cluster-failover-tests` runs only
+`^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated)`, so a new replicated test is
+invisible to it. Whoever closes this extends that regex as part of the change.

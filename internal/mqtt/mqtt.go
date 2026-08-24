@@ -1116,6 +1116,43 @@ type mqttAccountSessionManager struct {
 	// be staged around a seeded claim. Nil in production.
 	testQ2AffCopyAck func(reply string) error
 
+	// testSharedGroupLookupFail, when non-nil, is consulted for each group durable the
+	// resume's batched verification classifies, and a non-nil return replaces that
+	// durable's outcome with an INDETERMINATE one.
+	//
+	// It exists because absence and indeterminacy are the two outcomes this verification
+	// must not confuse, and only one of them can be staged by deleting a consumer. Without
+	// a seam for the other, the fixture for "the lookup established nothing" would have to
+	// pre-seed a verdict — which tests the fixture rather than the classification, and
+	// leaves the mutation that collapses the two classifications alive. Nil in production.
+	testSharedGroupLookupFail func(durable string) error
+
+	// testSharedGroupBetweenPasses, when non-nil, runs once after the resume's PRE-pass
+	// classification and before its post-pass, which is the only window in which a test
+	// can change what the second reading will see.
+	//
+	// That window is the post-pass's entire reason for existing — a durable can be
+	// deleted, altered, or have a legitimately variable field moved by another member
+	// between the two readings — and it is unreachable from outside without a seam.
+	// Nil in production.
+	testSharedGroupBetweenPasses func()
+
+	// testSharedGroupLookupBatch, when non-nil, is called with the size of each batched
+	// consumer lookup the resume verification issues.
+	//
+	// The bound it observes is not a tuning choice: a session's shared filter count is
+	// client-controlled, one batch shares one timeout, and an indeterminate verdict
+	// refuses — so an unbounded batch lets a large session fail closed on every reconnect.
+	// Only a seam can see the size actually requested. Nil in production.
+	testSharedGroupLookupBatch func(n int)
+
+	// testSharedGroupLookupErr, when non-nil and returning non-nil, makes ONE batched
+	// consumer lookup fail as a transport error would, so a test can prove the
+	// verification stops at the first failure rather than paying a timeout per remaining
+	// chunk. The counter argument is its own: the call index is passed in. Nil in
+	// production.
+	testSharedGroupLookupErr func(call int) error
+
 	// testQ2AffPreMaterialize, when non-nil, runs immediately BEFORE the
 	// claimed->materialized CAS, after the copy has been stored. It is the only
 	// seam inside the window where the copy is visible to a live affine consumer
@@ -4667,12 +4704,13 @@ func (jsa *mqttJSA) lookupConsumer(streamName, consName string) (*ConsumerInfo, 
 	return cir.ConsumerInfo, nil
 }
 
-// consumerList returns ConsumerInfo for every consumer of the stream, walking
-// the paged CONSUMER.LIST API to completion.
 // lookupConsumersMulti fetches several consumers' info in ONE pipelined batch, in the
-// order given. Each entry is nil where that consumer does not exist; ok is false for any
-// request whose response could not be read, so a caller can tell "gone" from "unknown"
-// — a distinction the resume path turns into a delivery decision.
+// order given. Each response is decoded by mqttClassifyConsumerInfoResponse, so ok is
+// true only where the response SETTLED the question — the consumer was read, or it is
+// authoritatively absent — and false wherever nothing was established, including a
+// success carrying a nil ConsumerInfo. That is the distinction the resume path and the
+// in-flight source cache turn into delivery and classification decisions, so it is
+// decided in one tested place rather than re-derived per caller.
 //
 // The serial sibling above is fine for one lookup. This exists because the resume barrier
 // needs one per DURABLE before the CONNACK, and a session with a few thousand
@@ -4697,19 +4735,51 @@ func (jsa *mqttJSA) lookupConsumersMulti(streamName string, durables []string) (
 		if !isCIR {
 			continue
 		}
-		if aerr := cir.ToError(); aerr != nil {
-			// Only "consumer not found" proves absence; anything else is a failed read.
-			if isErrorOtherThan(aerr, JSConsumerNotFoundErr) {
-				continue
-			}
-			ok[i] = true // absent, authoritatively
-			continue
-		}
-		infos[i], ok[i] = cir.ConsumerInfo, true
+		infos[i], ok[i] = mqttClassifyConsumerInfoResponse(cir)
 	}
 	return infos, ok, err
 }
 
+// mqttClassifyConsumerInfoResponse decodes ONE consumer-info response into the
+// (info, settled) pair every batched caller reasons about. Extracted so the decision
+// lives in one place and can be tested directly: it is the whole difference between
+// "authoritatively gone" and "could not tell", and its callers turn that difference
+// into terminal verdicts.
+//
+// settled=true means the response SETTLES the question — either the consumer is
+// authoritatively absent (nil info) or it was read (non-nil info). settled=false means
+// nothing was established and the caller must treat the durable as indeterminate.
+//
+// A successful response carrying a NIL ConsumerInfo is deliberately NOT settled, and
+// that is the correction this function exists for. It used to be encoded exactly like
+// an authoritative absence, so the two were indistinguishable — and the in-flight
+// source cache reads a settled absence as mqttInflightSourceLost, a terminal verdict.
+// Concluding "known to be gone and unrecoverable" from a reply that proved nothing is
+// the shape docs/ARCHITECTURE.md forbids: an absence is not a fact unless something
+// established it.
+//
+// A non-nil ConsumerInfo with a nil Config IS settled here — the consumer was read.
+// Whether that shape is USABLE is a question about the config, and the callers that
+// care answer it themselves rather than having this decode fail closed on their behalf.
+func mqttClassifyConsumerInfoResponse(cir *JSApiConsumerInfoResponse) (*ConsumerInfo, bool) {
+	if cir == nil {
+		return nil, false
+	}
+	if aerr := cir.ToError(); aerr != nil {
+		// Only "consumer not found" proves absence; anything else is a failed read.
+		if isErrorOtherThan(aerr, JSConsumerNotFoundErr) {
+			return nil, false
+		}
+		return nil, true // absent, authoritatively
+	}
+	if cir.ConsumerInfo == nil {
+		return nil, false // a success that says nothing: not an absence
+	}
+	return cir.ConsumerInfo, true
+}
+
+// consumerList returns ConsumerInfo for every consumer of the stream, walking
+// the paged CONSUMER.LIST API to completion.
 func (jsa *mqttJSA) consumerList(streamName string) ([]*ConsumerInfo, error) {
 	var all []*ConsumerInfo
 	for {
@@ -6105,6 +6175,14 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 		s.Warnf("MQTT session expiry: refusing to act on %q: %v", ps.ID, aerr)
 		return
 	}
+	// And a shared group consumer in Cons, for the same reason as the affine pair above but
+	// one step sharper: this path builds a transient session from ps and hands it to
+	// clear(), which walks Cons. A record whose shape this broker does not write is not one
+	// it may claim, rewrite or delete. See mqttSharedConsInRecord.
+	if sid, found := mqttSharedConsInRecord(ps); found {
+		s.Warnf("MQTT session expiry: refusing to act on %q: %v", ps.ID, mqttSharedConsRecordErr(ps.ID, sid))
+		return
+	}
 
 	if ps.Teardown != nil {
 		if err := as.finishAdoptedTeardown(ps, idHash, seq, s.getOpts()); err != nil {
@@ -6208,6 +6286,14 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 			s.Warnf("MQTT session expiry sweep: refusing to act on the record of %q: %v", ps.ID, aerr)
 			continue
 		}
+		// Same rule, same reason as the affine pair: the stamp below is a full record
+		// write, and writing an unsupported shape NORMALIZES it — the record would come
+		// back looking like something this broker authored. See mqttSharedConsInRecord.
+		if sid, found := mqttSharedConsInRecord(ps); found {
+			s.Warnf("MQTT session expiry sweep: refusing to act on the record of %q: %v",
+				ps.ID, mqttSharedConsRecordErr(ps.ID, sid))
+			continue
+		}
 		if ps.DisconnectedAt == 0 {
 			// The record claims a connected client. If we own the record and
 			// have no session for it in memory, the owner (us) went down while
@@ -6271,6 +6357,13 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 // (fail closed: never delete on a partial view). Runs from the account
 // session manager's sweep go routine. Spec5 [4.8.2].
 func (as *mqttAccountSessionManager) sweepOrphanedConsumers(s *Server) {
+	as.sweepOrphanedConsumersBefore(s, time.Now().Add(-mqttOrphanSweepGrace))
+}
+
+// sweepOrphanedConsumersBefore is sweepOrphanedConsumers with the eligibility cutoff as a
+// parameter. The grace window is real time, so a test that could not move it would have no
+// eligible candidates and every "nothing was deleted" assertion would hold vacuously.
+func (as *mqttAccountSessionManager) sweepOrphanedConsumersBefore(s *Server, cutoff time.Time) {
 	consumers, err := as.jsa.consumerList(mqttStreamName)
 	if err != nil {
 		s.Debugf("MQTT orphaned consumer sweep ended: %v", err)
@@ -6280,7 +6373,6 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumers(s *Server) {
 	// delivering to "$MQTT.sub.") and older than the grace window. Anything
 	// else on the stream is not ours to judge. A consumer the clustered LIST
 	// could not report (Missing) is not a candidate until a later sweep sees it.
-	cutoff := time.Now().Add(-mqttOrphanSweepGrace)
 	candidates := make(map[string]struct{})
 	for _, ci := range consumers {
 		if ci == nil || ci.Config == nil || !ci.Created.Before(cutoff) {
@@ -6337,6 +6429,15 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumers(s *Server) {
 		if err := json.Unmarshal(smsg.Data, ps); err != nil {
 			// An undecodable record may still reference candidates: abort.
 			s.Warnf("MQTT orphaned consumer sweep: unable to decode session record at sequence %v: %v", smsg.Sequence, err)
+			return
+		}
+		// A record whose shape this broker does not write is treated exactly like an
+		// undecodable one: ABORT the whole sweep, never skip the record. This walk decides
+		// what to DELETE by absence of a reference, so a record it cannot account for may
+		// well be referencing candidates — and a partial view must never be reported as a
+		// complete one. See mqttSharedConsInRecord.
+		if sid, found := mqttSharedConsInRecord(ps); found {
+			s.Warnf("MQTT orphaned consumer sweep: aborting, %v", mqttSharedConsRecordErr(ps.ID, sid))
 			return
 		}
 		for _, cc := range ps.Cons {
@@ -7064,8 +7165,13 @@ func mqttShouldSendRetained(retainHandling byte, subs map[string]byte, filter st
 // update are one transaction, so no other writer can persist a half-applied
 // SUBSCRIBE. The CONNECT restore path passes its own transaction's token down.
 // See sess_recordtx.go.
+// sharedVerdicts is the CONNECT restore's batched group-durable classification, keyed by
+// sid, and nil on the SUBSCRIBE path. It is passed explicitly rather than parked on the
+// session so its lifetime is one restore and nothing can read a previous connection's
+// judgement. See shared_group_verify.go.
 func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, tok recordTx,
-	filters []*mqttFilter, fromSubProto, trace bool) ([]*subscription, error) {
+	filters []*mqttFilter, fromSubProto, trace bool,
+	sharedVerdicts map[string]mqttSharedGroupVerdict) ([]*subscription, error) {
 
 	// Hold the subs barrier for the whole SUBSCRIBE (or CONNECT session
 	// restore) processing: concurrent QoS 1/2 stores wait in
@@ -7438,7 +7544,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// consumer (even at QoS0, so stored messages are delivered at QoS0).
 		if f.shared {
 			var amt int
-			jscons, jssub, amt, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+			jscons, jssub, amt, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto, sharedVerdicts)
 			filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, subject), amt)
 		} else {
 			var dd *ConsumerConfig
@@ -7524,7 +7630,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 
 			if f.shared {
 				var fwamt int
-				fwjscons, fwjssub, fwamt, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+				fwjscons, fwjssub, fwamt, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto, sharedVerdicts)
 				filterCharged = appendSharedCharge(filterCharged, mqttSharedNamesDurable(f.group, fwcsubject), fwamt)
 			} else {
 				var fwdd *ConsumerConfig
@@ -8718,6 +8824,17 @@ RESTORE:
 			"development broker; this format is not supported: stop this account's "+
 			"brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
 			"streams)", clientID, mqttPrefix, key)
+	}
+
+	// A shared group consumer config in Cons is likewise an unsupported shape, refused
+	// here for the same reasons and in the same place: the teardown adoption and the
+	// overdue discard below both copy durable names straight out of Cons, and the resume
+	// would take it for a resident join it never made. See mqttSharedConsInRecord.
+	//
+	// This one refusal covers the overdue/retired branch further down too, which builds a
+	// transient session from the same ps.
+	if sid, found := mqttSharedConsInRecord(ps); found {
+		return nil, false, mqttSharedConsRecordErr(clientID, sid)
 	}
 
 	// A CLAIMED teardown must be FINISHED, never resumed and never overwritten: some
@@ -12024,7 +12141,43 @@ restoreSession:
 				filters = append(filters, &mqttFilter{shared: true, group: group, filter: subject, qos: qos, retainAsPublished: rap, subID: es.subIDs[key]})
 			}
 		}
-		_, serr := asm.processSubs(es, c, acceptTok, filters, false, trace)
+		// PRE-PASS. Prove every group durable a RESIDENT shared membership is about to
+		// be restored into actually exists, and carries a configuration this broker
+		// recognises, before processSubs subscribes to its deliver subject (F-076).
+		//
+		// One batched lookup rather than one per filter: a session may hold thousands,
+		// and this runs before the CONNACK on every reconnect.
+		//
+		// Only resident sids are in scope. A filter with no resident cons entry takes
+		// the join path, which creates the durable and thereby proves it.
+		sharedTargets := es.collectResidentSharedGroups(filters)
+		sharedVerdicts := asm.classifySharedGroups(sharedTargets)
+		// STOP HERE if the pre-pass already refused, and do not restore at all.
+		//
+		// The same rule classifySharedGroups applies internally, applied at the level it
+		// actually governs. A refused filter makes the aggregation below refuse the
+		// CONNECT no matter what happens in between, so running processSubs would install
+		// subscriptions and enter create paths for non-resident filters on a connection
+		// that is already lost — and would then pay a second classification pass whose
+		// result cannot change the outcome either. Both are work a client can amplify by
+		// holding more filters.
+		//
+		// The sweep still runs: the reconciliation phase installed phase-owned
+		// subscriptions BEFORE this point, and they hold consumer interest until something
+		// reclaims them. That is why this shares the refusal shape below rather than
+		// returning early on its own.
+		failSharedGroupFilters(filters, sharedVerdicts)
+		if f := mqttFirstUnrestoredFilter(filters); f != nil {
+			if len(phaseSubs) > 0 {
+				es.sweepUnadoptedPhaseSubs(c, phaseSubs)
+			}
+			rerr := fmt.Errorf("subscription %q could not be restored: %s", f.sessionKey(), f.reasonStr)
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+			abortAcceptedResume(false)
+			refuseRestore(rerr)
+			return formatError(rerr)
+		}
+		_, serr := asm.processSubs(es, c, acceptTok, filters, false, trace, sharedVerdicts)
 		// The sweep runs BEFORE the error is tested: a subscription restoration
 		// skipped stays closed and phase-owned, holding consumer interest while
 		// delivering nothing, and nothing later would remove it. The deferred
@@ -12037,6 +12190,32 @@ restoreSession:
 			abortAcceptedResume(false)
 			refuseRestore(serr)
 			return formatError(serr)
+		}
+		// POST-PASS. The pre-pass observed each durable BEFORE this connection's queue
+		// interest existed, so a delete or a configuration change landing in between
+		// would have been accepted. Repeat the FULL classification now that interest is
+		// up — not a bare presence check, because a consumer can become non-canonical
+		// between the two reads — and adopt the second reading, since a member-variable
+		// field may legitimately have moved.
+		//
+		// It sits here deliberately: after processSubs and its sweep, and immediately
+		// before the aggregation below, which is the existing machinery that turns a
+		// failed filter into a pre-CONNACK refusal naming it. Nothing between the two
+		// transmits an MQTT packet or mutates durable state, so a refusal here costs the
+		// connection and nothing else.
+		//
+		// This NARROWS the window; it does not close it. CONSUMER.DELETE and
+		// CONSUMER.CREATE are both unconditioned, so a durable deleted or altered after
+		// this reading gets no further check on this CONNECT. Stated in
+		// docs/CONFORMANCE.md rather than implied away.
+		if len(sharedTargets) > 0 {
+			asm.mu.RLock()
+			between := asm.testSharedGroupBetweenPasses
+			asm.mu.RUnlock()
+			if between != nil {
+				between()
+			}
+			applySharedGroupPostPass(es, filters, asm.classifySharedGroups(sharedTargets))
 		}
 		// AGGREGATE the per-filter outcomes. This is local failure aggregation and
 		// nothing more — it does not arbitrate ownership, does not prove this broker
@@ -12051,7 +12230,11 @@ restoreSession:
 		// precisely because no CONNACK has been written, so it is the first packet
 		// ([MQTT-3.2.0-1]). A 3.1.1 connection gets the bare close it gets today.
 		if f := mqttFirstUnrestoredFilter(filters); f != nil {
-			rerr := fmt.Errorf("subscription %q could not be restored: %s", f.filter, f.reasonStr)
+			// sessionKey rather than filter: for a shared subscription the two differ, and
+			// the topic alone is ambiguous — the same client may hold both a plain and a
+			// shared subscription on it, and the operator reading this needs to know which
+			// one refused. For every other filter the two are identical.
+			rerr := fmt.Errorf("subscription %q could not be restored: %s", f.sessionKey(), f.reasonStr)
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
 			abortAcceptedResume(false)
 			refuseRestore(rerr)
@@ -15973,7 +16156,7 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error)
 			c.Errorf("MQTT: %v", err)
 		}
 	}()
-	return asm.processSubs(sess, c, tok, filters, true, trace)
+	return asm.processSubs(sess, c, tok, filters, true, trace, nil)
 }
 
 // Cleanup that is performed in processSubs if there was an error.
@@ -16377,6 +16560,43 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 	}
 }
 
+// buildSharedGroupConsumerConfig is the SINGLE constructor for a shared group durable's
+// configuration. Every name in it is deterministic in (group, subject) through
+// mqttSharedNames, so members across the cluster converge on one consumer.
+//
+// It is a named constructor rather than an inline literal because the join path BUILDS
+// with it and the resume path VALIDATES against it. Two derivations of "the configuration
+// this broker provisions" would drift, and a validator comparing against a drifted second
+// copy would either refuse healthy groups or accept shapes the join path would never
+// create. Same reasoning, and the same shape, as buildQ2AffineConsumerConfig.
+//
+// The three parameters are exactly the fields a legitimate member may differ on, and they
+// are parameters rather than reads of this broker's options so the validator can substitute
+// the LIVE consumer's values when it compares. Everything else is fixed here, which is what
+// makes a whole-struct comparison meaningful.
+//
+// No InactiveThreshold is set, deliberately: an all-offline group must keep its backlog
+// rather than be reaped. A recreate issued while the stream imposes a
+// ConsumerLimits.InactiveThreshold would inherit one anyway (nats-server applies the stream
+// limit to a consumer that requests zero, at create time), which is why the join path
+// refuses under a live stream limit rather than creating a reapable durable.
+func buildSharedGroupConsumerConfig(group, subject string, ackWait time.Duration,
+	maxAckPending int, memoryStorage bool) ConsumerConfig {
+
+	queue, deliver, durable := mqttSharedNames(group, subject)
+	return ConsumerConfig{
+		DeliverSubject: deliver,
+		DeliverGroup:   queue,
+		Durable:        durable,
+		AckPolicy:      AckExplicit,
+		DeliverPolicy:  DeliverNew,
+		FilterSubject:  mqttStreamSubjectPrefix + subject,
+		AckWait:        ackWait,
+		MaxAckPending:  maxAckPending,
+		MemoryStorage:  memoryStorage,
+	}
+}
+
 // processSharedJSConsumer creates (or joins) the single JetStream consumer that
 // backs an MQTT 5.0 Shared Subscription group for a (ShareName, subject) pair,
 // and subscribes this session to its deliver subject as a queue member so
@@ -16398,8 +16618,14 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 // when it reused a resident cons entry instead. The caller needs the distinction:
 // cc comes back on both paths, so a cleanup refunding by cc.Durable would erase a
 // charge an EARLIER connection made and leave tmaxack permanently short.
+// verdicts carries the restore path's batched group-durable classification, keyed by sid,
+// and is nil on every other path. Only the resume arm reads it: a live SUBSCRIBE cannot
+// reach that arm (a connected session with a cons entry already has its deliver
+// subscription), and a filter with no resident entry takes the create path, which proves
+// the durable by creating it.
 func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
-	qos byte, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, int, error) {
+	qos byte, retainAsPublished bool, subID int, fromSubProto bool,
+	verdicts map[string]mqttSharedGroupVerdict) (*ConsumerConfig, *subscription, int, error) {
 
 	sess.mu.Lock()
 	cc, exists := sess.cons[sid]
@@ -16426,8 +16652,31 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 			sess.mu.Unlock()
 			return cc, sub, 0, nil
 		}
-		// exists but no live deliver sub (session resume on a new connection):
-		// fall through to (re)subscribe without recreating or recharging.
+		// exists but no live deliver sub: a session resume on a new connection.
+		//
+		// This used to fall straight through to (re)subscribe, on the strength of a config
+		// remembered from an earlier connection — which is F-076. Nothing proved the group
+		// durable still existed, so a client whose durable had been deleted out of band was
+		// told Session Present = 1 and handed a subscription on a subject nothing publishes
+		// to, silently, on every reconnect while the condition persisted.
+		//
+		// The restore path now classifies every resident shared sid in one batch BEFORE
+		// this runs and hands the verdicts in. Acting on the verdict here, before
+		// processQOS12Sub, keeps the join path's own rule: a group durable must not deliver
+		// to this member until the join is proven. See shared_group_verify.go.
+		if v, judged := verdicts[sid]; judged {
+			if v.err != nil {
+				return nil, nil, 0, v.err
+			}
+			// Adopt the LIVE configuration in place of the remembered one. The remembered
+			// copy was captured on an earlier connection, and a member on another broker may
+			// legitimately have moved a variable field since; keeping it would finish the
+			// CONNECT holding state the account no longer agrees with.
+			sess.mu.Lock()
+			sess.cons[sid] = v.cfg
+			cc = v.cfg
+			sess.mu.Unlock()
+		}
 	}
 
 	opts := c.srv.getOpts()
@@ -16460,17 +16709,8 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		}
 		ccr := &CreateConsumerRequest{
 			Stream: mqttStreamName,
-			Config: ConsumerConfig{
-				DeliverSubject: deliver,
-				DeliverGroup:   queue,
-				Durable:        durable,
-				AckPolicy:      AckExplicit,
-				DeliverPolicy:  DeliverNew,
-				FilterSubject:  mqttStreamSubjectPrefix + subject,
-				AckWait:        ackWait,
-				MaxAckPending:  maxAckPending,
-				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
-			},
+			Config: buildSharedGroupConsumerConfig(group, subject, ackWait, maxAckPending,
+				opts.MQTT.ConsumerMemoryStorage),
 		}
 		// Create before subscribing: a pre-existing group durable must not deliver
 		// to (or be ack-consumed by) this member until the join is proven. Create
