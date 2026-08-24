@@ -2400,6 +2400,116 @@ Land one delayed-Will format-hardening commit:
 The resolution must not change unscoped reconnect cancellation of valid records or
 the generation-and-origin-sequence scope used by displaced-connection cleanup.
 
+## F-043
+
+**Title:** Fix the removeSessFromFlappers data race
+
+- Status: Resolved
+- Classification: Confirmed correctness or liveness defect
+- Release treatment: Completed; one new observable behavior (a deferred close that
+  could not take the ownership gate no longer clears the flappers jail), no new option
+- Original dossier: `runtime-correctness.md`
+
+### Resolution
+
+`mqttDeferDisconnectEx` (`internal/mqtt/sess_uncertain.go`) parks a close whose
+session-record write is unresolved and then cleared the closing client ID from the
+flappers jail. That removal was the one runtime access to `as.flappers` in the tree
+taken with no lock at all, while CONNECT reads the same map under `asm.mu`
+(`mqttProcessConnect`'s `CHECK` label), every displacement writes it under
+`asm.mu`, and the account manager's own cleanup timer sweeps it under `asm.mu`.
+Concurrent map access, so the exposure is not only a `-race` report: the Go
+runtime's own detector can abort the process outright.
+
+A census of every runtime `flappers` and `flapTimer` access established that this
+was the **only** unguarded one; the rest are all inside an `asm.mu` critical
+section. The fix takes `asm.mu` at that call site — not inside the helper, which
+would self-deadlock against the CONNECT caller that already holds it — and
+`addSessToFlappers` / `removeSessFromFlappers` were renamed to
+`addSessToFlappersLocked` / `removeSessFromFlappersLocked`, the suffix this package
+already uses for `asm.mu`-held helpers, so a future call site's omission is visible
+at the call rather than in a doc comment two screens away.
+
+**The removal is also conditional now, which the original finding did not ask for.**
+Locking alone would have left the park free to delete an entry it cannot identify.
+The predicate is OWNERSHIP, and it is named rather than inferred: the single
+`mqttDeferDisconnect` wrapper was split into `mqttDeferDisconnectOwned` — where OWNED
+is a precondition, the caller holds the session ownership gate — and
+`mqttDeferDisconnectUngated`, and the shared body takes `ungated`. One fact drives
+both of that parameter's consequences: without the gate the park must re-check
+uncertainty atomically, because nothing else serializes it against the resolver that
+would discharge it, AND it may not touch the jail. An earlier draft keyed the removal
+off `requireUncertain` instead, which is equivalent at today's call sites but was
+rejected: the wrapper hardcoded that flag while neither its name nor its signature
+stated an ownership precondition, so a future ungated caller reaching for the
+convenient wrapper would have compiled, been race-free, and silently deleted a live
+jail entry. Under a held gate neither producer of a jail entry can run —
+`evictDecideOnce` returns `evictBusy`, and `discardTakenOverClient` is downstream of
+a CONNECT that would need the same gate — so any entry present is a stale one from
+an earlier displacement and removing it is the ordinary teardown's behaviour. On the
+gate-less route nothing of the sort holds: `lockSessionForTeardown` releases
+`asm.mu` between attempts and samples ownership in a separate critical section, so
+the holder this close lost to can release and let `evictDecideOnce` detach the old
+client and jail this client ID in the interval before the park. Deleting there would
+cancel a live displacement's jail, so that route leaves it alone. The cost is up to
+one `mqttSessJailDur` of reconnect enforcement on an entry that may have been stale — the
+fail-closed direction, and it removes the residual the unconditional fix would have
+had to state. Found by Codex plan review, which produced the interleaving that
+refuted the unconditional design.
+
+**Reproduced first, at both lock states.** Three call sites reach
+`mqttDeferDisconnectEx`, but the never-expiring one parks only after ending its own
+record transaction with the ownership gate held, which makes it lock-state-identical
+to the plain gated one. What the two tests separate is therefore gate-held from
+gate-NOT-held, and each baseline reproduction named its own route in the race stack.
+The
+ungated route is forced by the test holding the ownership gate across the whole close,
+which is what makes lockSessionForTeardown fail every attempt. Both live in the default
+(untagged) tree, because `make full-suite` runs without `-race` and only `make test`
+would discriminate.
+
+**Lock ordering, verified rather than assumed.** At the removal no `sess.mu` is held
+(`deferDisconnectIfUncertain` releases it inside its own critical section) and this
+caller holds no record fence on any of the three routes, so the fix does not take
+`asm.mu` inside `sess.mu` — the inversion the finding warned about — and adds no edge
+to the established `as.mu` → `sess.mu` order. Taking `asm.mu` with the gate held is
+already what `mqttHandleClosedClient` and `unlockSession` do. The section performs one
+map delete and waits on nothing, so it has no outward edge that could close a cycle,
+including with the record fence's waiter priority, which it neither acquires nor waits
+for.
+
+**What the reproduction cost to get right.** The first fixture widened the race window
+by having the test goroutine hold `sess.mu` across the close and read the jail itself.
+It reproduced nothing, because releasing `sess.mu` is a happens-before edge from the
+test to the closing goroutine and ordered those reads ahead of the removal. The
+mutation run is what caught it; the reader is now an independent goroutine that shares
+no lock and no channel with whoever releases the close into the window.
+
+### Residual
+
+None of the kind the unconditional fix would have carried. What the conditional
+removal leaves is stated behaviour rather than a gap: a deferred close that could not
+take the ownership gate does not un-jail its client ID, so a reconnect for it can be
+delayed by up to `mqttSessJailDur` even when the entry was stale. Not in
+`docs/CONFORMANCE.md`: the flappers jail is an anti-flap heuristic inherited from
+upstream with no MQTT surface — the specification says nothing about how quickly a
+displaced client ID may reconnect — so filing it as a conformance gap would misfile it.
+
+### Original finding record
+
+- [ ] Fix the `removeSessFromFlappers` data race, with a reproduction first.
+  `mqttDeferDisconnectEx` calls `asm.removeSessFromFlappers` WITHOUT holding
+  `asm.mu` (`sess_uncertain.go`), while that helper documents "Lock held on entry"
+  and deletes from `as.flappers` directly (`mqtt.go`) — and CONNECT reads the same
+  map under `asm.mu`. A real pre-existing race at both of that function's call
+  sites. Found by the plan review of the `clear()`-recovery item and verified
+  against the code; that item's design does not go through
+  `mqttDeferDisconnectEx`, so it neither widens nor fixes it. Needs, in this order:
+  a `-race` reproduction covering BOTH call sites; a lock-order and deadlock
+  analysis for `sess.mu` against `asm.mu`, since the call sites hold or take
+  `sess.mu` and the naive fix takes `asm.mu` inside it; and then a focused fix with
+  a regression test.
+
 ## F-051
 
 **Title:** Bound a connection that never sends CONNECT

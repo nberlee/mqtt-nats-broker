@@ -930,6 +930,18 @@ type mqttAccountSessionManager struct {
 	// rebound" is an ordering rather than a probability. Nil in production.
 	testBeforeTeardownLock func(clientID string)
 
+	// testAfterParkedJailDecision, when non-nil, is invoked by mqttDeferDisconnectEx
+	// once it has decided what to do about the flappers jail, before it returns.
+	//
+	// Stored in an atomic rather than under mu like its siblings, and that is
+	// load-bearing rather than a style choice: a test uses this seam to hold the
+	// closing goroutine still while another goroutine reads the jail, and the whole
+	// point of that read is that it must NOT be ordered against the removal. Reading
+	// the hook under mu would acquire and release the very lock the removal is
+	// supposed to be holding, which is a happens-before edge that hides exactly the
+	// race the seam exists to expose.
+	testAfterParkedJailDecision atomic.Pointer[func(clientID string)]
+
 	// testBeforeTakeoverDiscard, when non-nil, is invoked by mqttProcessConnect for
 	// THIS account manager only (instance-scoped) after a takeover has rebound the
 	// session to the new connection and before it decides the displaced
@@ -3424,7 +3436,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		// session resolved meanwhile falls through to retaking the gate (the
 		// resolver is finishing), with the Will restored for the ordinary
 		// teardown that follows.
-		if s.mqttDeferDisconnectEx(c, asm, sess, true) {
+		if s.mqttDeferDisconnectUngated(c, asm, sess) {
 			return
 		}
 	}
@@ -3438,7 +3450,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 	// resolution discharge them. Unresolved is NOT takeover, so nothing may be
 	// dropped and nothing may be deleted. See sess_uncertain.go.
 	if sess.isSeqUncertain() {
-		s.mqttDeferDisconnect(c, asm, sess)
+		s.mqttDeferDisconnectOwned(c, asm, sess)
 		return
 	}
 
@@ -3496,7 +3508,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 			}
 			if unresolved {
 				// Park after the release: the deferred discharge takes the fence itself.
-				s.mqttDeferDisconnect(c, asm, sess)
+				s.mqttDeferDisconnectOwned(c, asm, sess)
 				return
 			}
 		} else {
@@ -3546,7 +3558,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		asm.removeSession(sess, false)
 	}
 	// Remove in case it was in the flappers map.
-	asm.removeSessFromFlappers(sess.id)
+	asm.removeSessFromFlappersLocked(sess.id)
 	asm.mu.Unlock()
 
 	// This needs to be done outside of any lock.
@@ -5467,7 +5479,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 	d.displacedGen, d.displacedSeq = sess.gen, sess.seq
 	ec := sess.c
 	if ec != nil {
-		as.addSessToFlappers(sess.id)
+		as.addSessToFlappersLocked(sess.id)
 		ec.Warnf("MQTT: session %q %s", sess.id, voc.logReason)
 		// Disassociate the client from the session so that on client close,
 		// nothing will be done with regards to cleaning up the session, such as
@@ -5811,7 +5823,7 @@ func (as *mqttAccountSessionManager) reconcileRemoteSessionExpiry(s *Server, idH
 // for map cleanup.
 //
 // Lock held on entry.
-func (as *mqttAccountSessionManager) addSessToFlappers(clientID string) {
+func (as *mqttAccountSessionManager) addSessToFlappersLocked(clientID string) {
 	as.flappers[clientID] = time.Now()
 	if as.flapTimer == nil {
 		as.flapTimer = time.AfterFunc(mqttFlapCleanItvl, func() {
@@ -5835,7 +5847,7 @@ func (as *mqttAccountSessionManager) addSessToFlappers(clientID string) {
 // Remove this client ID from the flappers map.
 //
 // Lock held on entry.
-func (as *mqttAccountSessionManager) removeSessFromFlappers(clientID string) {
+func (as *mqttAccountSessionManager) removeSessFromFlappersLocked(clientID string) {
 	delete(as.flappers, clientID)
 	// Do not stop/set timer to nil here. Better leave the timer run at its
 	// regular interval and detect that there is nothing to do. The timer
@@ -6853,6 +6865,18 @@ func (as *mqttAccountSessionManager) beforeTeardownLock(clientID string) {
 	as.mu.RUnlock()
 	if hook != nil {
 		hook(clientID)
+	}
+}
+
+// afterParkedJailDecision runs the parked-close jail seam, if one is installed.
+//
+// Deliberately takes NO lock: see the field's comment. In production the hook is nil
+// and this is one atomic load.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) afterParkedJailDecision(clientID string) {
+	if hook := as.testAfterParkedJailDecision.Load(); hook != nil {
+		(*hook)(clientID)
 	}
 }
 
@@ -11496,7 +11520,7 @@ CHECK:
 		// If the last time it tried to connect was more than 1 sec ago,
 		// then accept and remove from flappers map.
 		if time.Since(tm) > mqttSessJailDur {
-			asm.removeSessFromFlappers(cid)
+			asm.removeSessFromFlappersLocked(cid)
 		} else {
 			// Will hold this client for a second and then close it. We
 			// do this so that if the client has a reconnect feature we

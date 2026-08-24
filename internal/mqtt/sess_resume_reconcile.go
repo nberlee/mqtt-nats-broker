@@ -1085,7 +1085,7 @@ func (sess *mqttSession) sweepUnadoptedPhaseSubs(c *client, delivers []string) {
 //     re-applied only if the readback proves the write landed. Keeping the
 //     speculative terms instead would be actively dangerous: the CONNECT is
 //     refused, the connection closes while the session is still unresolved, and
-//     mqttDeferDisconnect SNAPSHOTS the lifetime into the deferred action — so a
+//     mqttDeferDisconnectOwned SNAPSHOTS the lifetime into the deferred action — so a
 //     requested interval of 0 that never landed would still discard a persistent
 //     session, because applyDeferredDisconnect acts on that snapshot rather than
 //     on whatever the readback later restores. Preferring the confirmed terms

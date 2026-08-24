@@ -165,9 +165,6 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   Status: Investigating. Release treatment: Block only on a confirmed defect or
   unexplained repeatable failure.
   Details: [F-042](release-investigations.md#f-042).
-- Fix the removeSessFromFlappers data race.
-  Status: Open. Release treatment: Alpha blocker.
-  Details: [F-043](runtime-correctness.md#f-043).
 - Determine whether the phase-2 shutdown scan-stop observation is real.
   Status: Investigating. Release treatment: Block only on a confirmed defect or
   unexplained repeatable failure.
@@ -308,3 +305,5 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   Details: [F-051](resolved.md#f-051).
 - Remove declarations unused by production and the full suite.
   Details: [F-053](resolved.md#f-053).
+- Fix the removeSessFromFlappers data race.
+  Details: [F-043](resolved.md#f-043).

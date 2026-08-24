@@ -3562,6 +3562,37 @@ The invariants, in the order they matter:
   alone and never on "is the session uncertain now", because any other failure means a lost
   teardown claim or a half-done teardown, where re-parking would resurrect an obligation
   that is not this broker's to discharge.
+- **A parked close un-jails its client ID only where it still owns the session, and takes
+  `as.mu` to do it.** The flappers jail (`as.flappers`) is `as.mu` state end to end: CONNECT
+  reads it, every displacement writes it, and the account manager's own cleanup timer sweeps
+  it. A close whose record write is unresolved parks and then clears its client ID from the
+  jail exactly as an ordinary teardown does — but it reaches the park by routes with
+  different lock states, and only one of them can say what the entry it would delete IS.
+  With the ownership gate held (the `mqttDeferDisconnectOwned` routes; the never-expiring
+  one parks only after ending its own record transaction, so it holds no fence either)
+  **neither producer can run**: `evictDecideOnce` refuses outright under a held gate, and
+  `discardTakenOverClient` sits downstream of a CONNECT that would need the same gate. Any
+  entry present is therefore a STALE one from an earlier displacement, and removing it is
+  the ordinary teardown's behaviour. On the gate-less route nothing of the sort can be
+  proven — `lockSessionForTeardown` releases `as.mu` between attempts and samples ownership
+  in a separate critical section, so the holder it lost to can release and let
+  `evictDecideOnce` jail this client ID in the interval before the park — so
+  `mqttDeferDisconnectUngated` leaves the jail alone. The two entry points exist so the
+  precondition is visible at the call: one boolean silently carrying both "must still be
+  uncertain" and "may delete a jail entry" is what would let a future ungated caller
+  compile into a wrong deletion. Deleting there would cancel a live displacement's jail;
+  leaving it
+  costs at most one `mqttSessJailDur` of reconnect *enforcement* on an entry that may
+  have been stale — CONNECT compares the stored timestamp against that duration, and the
+  cleanup timer runs on its own longer interval, so an expired entry can sit in the map
+  well past the window in which it jails anything — which is the fail-closed direction.
+  The lock is taken at the park rather than
+  inherited (the gated callers hold the session gate, not `as.mu`) and taken BARE —
+  `sess.mu` is released inside the park's own critical section — so it adds no edge to the
+  `as.mu` → `sess.mu` order, and the section holds one map delete and waits on nothing, so
+  it has no outward edge that could close a cycle with the gate, the record fence or `c.mu`.
+  No `docs/CONFORMANCE.md` entry: the jail is an inherited anti-flap heuristic, not an MQTT
+  surface.
 - **`clear()` always refuses before its first deletion on an unclassified sequence.** That
   is the delivered invariant, and it is unconditional: both refusals — at entry and with the
   fence held — always carry the sentinel. What each caller then does is NOT uniform, and

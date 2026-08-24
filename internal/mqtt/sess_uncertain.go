@@ -1209,8 +1209,8 @@ func (a *mqttDeferredDisconnect) willDue(now time.Time) bool {
 	return a.willDeadline > 0 && now.UnixNano() >= a.willDeadline
 }
 
-// mqttDeferDisconnect captures everything a close would have done and parks it on
-// the session, then detaches the client. Nothing is written and nothing is
+// mqttDeferDisconnectOwned captures everything a close would have done and parks
+// it on the session, then detaches the client. Nothing is written and nothing is
 // deleted: the session's record state is unresolved, so no teardown decision can
 // be made from it yet.
 //
@@ -1220,20 +1220,38 @@ func (a *mqttDeferredDisconnect) willDue(now time.Time) bool {
 // client still exists (a denied Will is never captured, exactly as mqttHandleWill
 // never enqueues one).
 //
+// OWNED is a precondition, not a description: the caller holds the session
+// ownership gate. That is what entitles the park to clear this client ID from the
+// flappers jail, and a caller that does not hold it must use
+// mqttDeferDisconnectUngated instead. The two entry points exist so that
+// requirement is visible at the call rather than carried by a boolean whose name
+// is about something else.
+//
 // Runs from the client's readLoop. No lock held on entry.
-func (s *Server) mqttDeferDisconnect(c *client, asm *mqttAccountSessionManager, sess *mqttSession) {
+func (s *Server) mqttDeferDisconnectOwned(c *client, asm *mqttAccountSessionManager, sess *mqttSession) {
 	s.mqttDeferDisconnectEx(c, asm, sess, false)
 }
 
-// mqttDeferDisconnectEx is mqttDeferDisconnect with the park made conditional
-// on the session still being uncertain, for a close that could not take the
+// mqttDeferDisconnectUngated is the park for a close that could NOT take the
 // ownership gate. Returns whether the teardown is now someone's responsibility
 // (parked here, or already parked by an earlier close); false means the session
-// resolved while this close was building the action, so the caller must retake
-// the gate and tear down ordinarily — and the Will this function consumed has
-// been put back exactly as it was, or that ordinary teardown would publish
-// nothing.
-func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager, sess *mqttSession, requireUncertain bool) bool {
+// resolved while this close was building the action, so the caller must retake the
+// gate and tear down ordinarily — and the Will this function consumed has been put
+// back exactly as it was, or that ordinary teardown would publish nothing.
+func (s *Server) mqttDeferDisconnectUngated(c *client, asm *mqttAccountSessionManager, sess *mqttSession) bool {
+	return s.mqttDeferDisconnectEx(c, asm, sess, true)
+}
+
+// mqttDeferDisconnectEx is the shared body of the two entry points above.
+//
+// ONE fact drives the parameter, and both of its consequences: this close does not
+// hold the session ownership gate. Without the gate the park must be conditional on
+// the session still being uncertain, because nothing else serializes it against the
+// resolver that would discharge it; and without the gate the jail entry cannot be
+// identified, because the producers the gate excludes are free to run. A future
+// caller that gets this wrong changes what is deleted, which is why the callers name
+// it rather than pass it.
+func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager, sess *mqttSession, ungated bool) bool {
 	now := time.Now()
 	sess.mu.Lock()
 	action := &mqttDeferredDisconnect{
@@ -1283,7 +1301,7 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 	}
 	c.mu.Unlock()
 
-	parked, stillUncertain := sess.deferDisconnectIfUncertain(action, requireUncertain)
+	parked, stillUncertain := sess.deferDisconnectIfUncertain(action, ungated)
 	if !parked {
 		if !stillUncertain {
 			// Resolved while the action was being built: nothing may be parked
@@ -1301,7 +1319,31 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 		}
 		return true // an earlier close already parked its (original) deadlines
 	}
-	asm.removeSessFromFlappers(sess.id)
+	// Un-jail this client ID only where THIS CLOSE OWNS THE SESSION, which is what
+	// makes the entry provably a stale one from an earlier displacement rather than a
+	// live one somebody just installed. Under a held gate neither producer can run:
+	// evictDecideOnce refuses outright (evictBusy) and discardTakenOverClient sits
+	// downstream of a CONNECT that would need the same gate.
+	//
+	// Ungated, nothing here can be proven. The gate holder this close lost to may have
+	// released between lockSessionForTeardown's last attempt and this park, leaving
+	// evictDecideOnce free to detach the old client and jail this client ID in the
+	// interval — and deleting THAT entry would cancel a displacement's jail. Leaving it
+	// costs at most one mqttSessJailDur of reconnect ENFORCEMENT on an entry that may
+	// have been stale — the entry can outlive that window in the map, but CONNECT
+	// stops acting on it — which is the fail-closed direction.
+	//
+	// The lock is taken here rather than inherited: the owning callers hold the session
+	// gate, not asm.mu. It is taken BARE — deferDisconnectIfUncertain released sess.mu
+	// inside its own critical section, and this caller holds no record fence on any
+	// route (the never-expiring one parks only after endRecordTx) — so it nests inside
+	// nothing and adds no edge to the established as.mu -> sess.mu order.
+	if !ungated {
+		asm.mu.Lock()
+		asm.removeSessFromFlappersLocked(sess.id)
+		asm.mu.Unlock()
+	}
+	asm.afterParkedJailDecision(sess.id)
 	c.Warnf("MQTT: session %q has an unresolved record write; deferring its disconnect handling until it resolves", sess.id)
 	return true
 }

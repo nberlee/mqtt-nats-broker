@@ -60,30 +60,6 @@ it existed on 2026-08-10.
   longer exists. Either restore both maps in the rollback, or make the release
   walk both. Found by the plan review of the purge bullet above.
 
-## F-043
-
-**Title:** Fix the removeSessFromFlappers data race
-
-- Status: Open
-- Classification: Confirmed correctness or liveness defect
-- Release treatment: Alpha blocker
-- Original roadmap order: 43
-
-### Original finding record
-
-- [ ] Fix the `removeSessFromFlappers` data race, with a reproduction first.
-  `mqttDeferDisconnectEx` calls `asm.removeSessFromFlappers` WITHOUT holding
-  `asm.mu` (`sess_uncertain.go`), while that helper documents "Lock held on entry"
-  and deletes from `as.flappers` directly (`mqtt.go`) — and CONNECT reads the same
-  map under `asm.mu`. A real pre-existing race at both of that function's call
-  sites. Found by the plan review of the `clear()`-recovery item and verified
-  against the code; that item's design does not go through
-  `mqttDeferDisconnectEx`, so it neither widens nor fixes it. Needs, in this order:
-  a `-race` reproduction covering BOTH call sites; a lock-order and deadlock
-  analysis for `sess.mu` against `asm.mu`, since the call sites hold or take
-  `sess.mu` and the naive fix takes `asm.mu` inside it; and then a focused fix with
-  a regression test.
-
 ## F-045
 
 **Title:** Release stranded shared pending state when membership is removed

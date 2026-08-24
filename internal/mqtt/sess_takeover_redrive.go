@@ -232,7 +232,7 @@ func (asm *mqttAccountSessionManager) discardTakenOverClient(c *client, ec *clie
 	// late to cancel. See mqttDiscardWillOnTakeover.
 	ec.mqttDiscardWillOnTakeover()
 	asm.mu.Lock()
-	asm.addSessToFlappers(cid)
+	asm.addSessToFlappersLocked(cid)
 	asm.mu.Unlock()
 	c.Warnf("Replacing old client %q since both have the same client ID %q", ec, cid)
 	// Tell the evicted v5 client why before the close (no-op for 3.1.1), through the

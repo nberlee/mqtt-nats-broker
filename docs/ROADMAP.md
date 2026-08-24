@@ -54,6 +54,7 @@ formats that no user release depends on. Each checkbox is one commit.
   store evicts the record it replaces. An undecodable record is now rejected with
   a log and evicted rather than silently ignored. Filed while doing it: F-059 and
   F-060 below.
+
 - [x] [F-058: Reject generationless delayed-Will records](findings/resolved.md#f-058).
   The empty-generation legacy bucket is gone. Every decoded `$MQTT_willq` record is
   validated — generation, origin sequence and epoch, state, and identity fields that
@@ -112,6 +113,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   cross-instance takeover), and a single-frontend alpha would defer the epic
   this project exists to deliver. The items below stop being conditional, and
   the dossier release-treatment lines record the same resolution.
+
 - [x] [F-027: Repair a recognised session-record fork](findings/ha-arbitration.md#f-027).
   **Slice C of the arbitration design.** A fork's durable loss is exactly the record
   DELTA, and because `classifyRecordLineage` matches on a shared parent that parent is a
@@ -138,6 +140,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   filter the survivor decided about, and **not shared-subscription membership, which stays
   excluded until F-050 closes** because the success CONNACK precedes shared restoration.
   `docs/CONFORMANCE.md` states every bound and the cap-forfeiture residual.
+
 - [x] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
   **Slice B of the arbitration design.** Every session-record write is now conditional,
   base 0 included, which closes the defect found while designing it: a clean-start
@@ -158,6 +161,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   **What it does NOT close** was filed as two blockers below rather than recorded as
   residuals; the claim-won deletion window is now closed by the retirement watermark,
   and cross-term create × create recognition is closed by F-029b below.
+
 - [x] **The claim-won deletion window** (F-029a) **and the PUBREL orphan class.** The
   window was real: a teardown that wins its claim deletes the retiring generation's
   resources before its release can say whether it still owns the claim, and a cross-term
@@ -186,6 +190,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   post-check windows, the same bound the affine reaper has; `$MQTT_teardown` recreated
   alone loses every open fence. A finish that outruns the survivor broker's own
   observation is a new route into F-036 and is listed under that blocker, not here.
+
 - [x] **Sweep the rollout-qualified residuals out of the docs.** DONE. Every residual
   qualified by "an older broker", "mid-rollout" or "once every broker upgrades" was
   re-read against what its feature does for a broker running this tree and rewritten:
@@ -322,6 +327,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   overwrote. Slice C's repair is untouched and deliberately so: a create has a parent
   POINTER and no parent CONTENT, so a create-parented fork is recognised and repaired by
   nothing, merging against an empty base being the union Slice C refuted.
+
 - [x] **A durable identity for an interval with no retirement history** (F-029b's R0).
   **SUPERSEDED AND DELETED by the write-lineage audit** — the register, its stream, its
   validator and every residual below it are gone, and `$MQTT_origin` is now refused at
@@ -371,6 +377,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   pruning of the register losing recognition for the pruned client; and mixed-arm
   divergence. R1 and R4 are WIDENED to the no-watermark population, stated rather than
   claimed away.
+
 - [x] [F-030: Add write lineage to the Will outbox](findings/ha-arbitration.md#f-030).
   **CLOSED 2026-08-16 by disproving the failure premise; no lineage was added.** Every
   `$MQTT_willq` write is already conditional on the sequence its writer read, so the
@@ -410,6 +417,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   now run. F-032's produced F-062, closed 2026-08-18; F-033's produced F-063, F-064, F-065
   and F-066; F-034's closed on 2026-08-22, producing F-067 and F-068 and routing its
   live-owner residue to F-036.
+
 - [x] **Audit the session write-lineage machinery for deletion, obligation by
   obligation.** Prescribed by F-030's evidence and deliberately NOT folded into it.
   **DELETED: the whole CREATE side.** All four sources a create drew a parent from — the
@@ -433,6 +441,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   `ensureBrokerStream` creates an absent stream before validating it. Nine provisioned
   streams, down from ten. Six tests and five mutations (M1, M2, M5, M7, M9); no
   obligation was deleted on the strength of the term proof alone.
+
 - [x] **Prove or retire the accepted-CONNECT atomic-batch write path.** F-030's
   dependency inventory (`test/depproof`) fixtures `$MQTT_willq`'s SINGLE-MESSAGE
   conditional write. Every accepted CONNECT writes something else: `storeAcceptBatch`
@@ -1102,8 +1111,36 @@ takeover.
   `MQTTNB_CONNECT_TIMEOUT` (default 5s) is the operator surface, refused at `<= 0`
   because the bound is fail-closed. `TestMQTTAuthTimeout` was tightened: with the
   timer never armed its negative case read a success CONNACK and passed.
-- [ ] [F-043: Fix the `removeSessFromFlappers` data race](findings/runtime-correctness.md#f-043).
-  **Small to medium.** Reproduce both call sites and verify lock ordering first.
+
+- [x] [F-043: Fix the `removeSessFromFlappers` data race](findings/resolved.md#f-043).
+  The parked deferred close in `sess_uncertain.go` held nothing while deleting from
+  `asm.flappers` — the one access to that map in the tree with no lock, against a CONNECT
+  that reads it under `asm.mu` and a cleanup timer that sweeps it under `asm.mu`, so the
+  exposure was the runtime's own concurrent-map abort and not merely a `-race` report. A
+  census of every runtime `flappers` / `flapTimer` access establishes it as the only
+  unguarded one; the helpers were renamed to the `…Locked` suffix this package already uses
+  so a future call site's omission is visible at the call. **Wider than "add the lock":**
+  the removal is now conditional on the close still OWNING the session. Under the gate neither
+  producer can run (`evictDecideOnce` refuses, `discardTakenOverClient` is downstream of a
+  CONNECT needing the same gate), so the entry is provably stale and is removed as before;
+  on the gate-less route nothing can be proven — the holder it lost to can release between
+  `lockSessionForTeardown`'s last attempt and the park, letting `evictDecideOnce` jail this
+  client ID in the interval — so that route leaves the jail alone rather than cancelling a
+  live displacement's. The two cases are now separate entry points
+  (`mqttDeferDisconnectOwned` / `mqttDeferDisconnectUngated`) so the ownership precondition
+  is stated at the call rather than carried by a boolean named for something else. Cost: up
+  to one `mqttSessJailDur` of reconnect enforcement on an entry that
+  may have been stale, which is the fail-closed direction and replaces the residual the
+  unconditional fix would have had to state. **Reproduced before it was fixed, at both lock
+  states**, as the finding asked: three call sites reach `mqttDeferDisconnectEx`, but the
+  never-expiring one parks after ending its record transaction with the gate held and is
+  lock-state-identical to the plain gated one, so the two untagged `-race` tests separate
+  gate-held from gate-NOT-held and each baseline reproduction names its own route in the
+  stack. `make full-suite` runs without `-race`, so the tests are deliberately in the default
+  tree. Lock ordering verified rather than assumed: the removal holds no `sess.mu` (the park
+  released it) and no record fence on any route, so it adds no edge to the established
+  `as.mu` → `sess.mu` order, and the section performs one map delete with no outward wait.
+
 - [ ] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
   **Alpha blocker.** `trackPublish` sets DUP from the JetStream delivery count
   (`dcount > 1`) and that value reaches the wire through `mqttPubFlagDup`. MQTT-3.3.1-3
@@ -1120,6 +1157,7 @@ takeover.
   runs, then restart, recover, re-offer, and DUP=0 on the first client-visible PUBLISH.
   Test (1) alone is satisfied by transient state while the crash path still emits DUP=1, so
   a fix passing only (1) has NOT closed this. Neither may be load-sensitive.
+
 - [ ] [F-071: Preserve same-topic ordering for affine QoS 2 deliveries](findings/release-investigations.md#f-071).
   **Alpha blocker, and a defect rather than a flake — but NOT a spec violation, and the
   basis is weaker than three earlier drafts of this bullet claimed.** MQTT-4.6.0-5 is
@@ -1157,17 +1195,22 @@ takeover.
   require and would catch a single-publisher violation only by coincidence; a correct fixture
   publishes from one Client. What is also owed is instrumentation correlating source
   sequence, copy sequence, claim phase, callback entry and enqueue.
+
 - [ ] [F-035: Bound every courtesy DISCONNECT write](findings/runtime-correctness.md#f-035).
   **Medium.** One watchdog must cover mutex acquisition and socket writing at
   every server-initiated DISCONNECT site.
+
 - [ ] [F-041: Persist the MQTT 5 DISCONNECT expiry override](findings/session-and-will.md#f-041).
   **Medium.** The durable record and resume decision must agree even after an
   ambiguous write.
+
 - [ ] [F-039: Restore shared membership during SUBSCRIBE rollback](findings/runtime-correctness.md#f-039).
   **Small.** Independent of the F-030 term-fence work: this is a missing in-memory
   `sharedSubs` restoration, not a JetStream CAS failure.
+
 - [ ] [F-045: Release stranded shared pending state at membership removal](findings/runtime-correctness.md#f-045).
   **Medium.**
+
 - [x] [F-050: Refuse or retry an incomplete shared-subscription restore](findings/shared-qos2.md#f-050).
   **Closed 2026-08-23 by refusing, not retrying.** CONNECT no longer reports a resumable
   session whose delivery path was not restored: subscription restoration runs BEFORE the
@@ -1216,19 +1259,25 @@ takeover.
   `ActionCreateOrUpdate` with a stale one rewrites a live durable for every other member),
   moving the 3.1.1 forced leave before the CONNACK (it makes an unacknowledged CONNECT
   destructive), and carrying the restore state on each subscription.
+
 - [ ] [F-028: Preserve deferred disconnect state during foreign disposition](findings/session-and-will.md#f-028).
   **Medium.** Split the parked-disconnect loss and retained-continuation cleanup
   into separately testable changes.
+
 - [ ] [F-037: Make the rejected finite-disconnect stamp crash-safe](findings/session-and-will.md#f-037).
   **Medium.**
+
 - [ ] [F-038: Prevent takeover races from publishing or dropping the wrong Will](findings/session-and-will.md#f-038).
   **Large.** Treat this as durable Will-intent/outbox design, not a local close-path
   patch.
+
 - [ ] [F-047: Keep affine assignments when a SUBSCRIBE packet fails](findings/shared-qos2.md#f-047).
   **Medium.**
+
 - [ ] [F-048: Arbitrate affine cleanup before discarding assignments](findings/shared-qos2.md#f-048).
   **Medium to large.** Design and test F-047 and F-048 as one transactional-cleanup
   cluster.
+
 - [ ] [F-059: Arbitrate retained-index application by stream sequence](findings/runtime-correctness.md#f-059).
   **Medium.** The volatile retained index applies stream events and local seeds
   without comparing sequences, so a delayed or lost application can leave a stale
@@ -1242,10 +1291,12 @@ takeover.
   by stream sequence, while keeping explicit empty-body MQTT tombstones. Markers do
   not replace replay/reconciliation and require an `AllowRollup`/purge ACL review.
   See the [platform audit](findings/nats-platform.md#subject-delete-markers-for-retained-convergence).
+
 - [ ] [F-060: Report a failed retained store to the publisher](findings/runtime-correctness.md#f-060).
   **Small to medium.** A PUBLISH whose RETAIN side failed to store is reported as
   successful, contrary to [MQTT-3.3.1-5]. Decide the contract for QoS 0 —
   which has no acknowledgement to withhold — alongside QoS 1 and 2.
+
 - [ ] **Reclaim CONNECT acceptance facts, or bound them.** **Medium.** Every accepted
   CONNECT writes one permanent record on a unique `$MQTT.accept.>` subject, and
   `$MQTT_sess` carries no `MaxMsgs`, `MaxBytes` or `MaxAge` (it cannot: those limits
@@ -1314,10 +1365,13 @@ finding with acceptance criteria.
 
 - [ ] [F-040: Reproduce reconnect versus DISCONNECT expiry-zero](findings/session-and-will.md#f-040).
   **Investigation.** A confirmed mechanism is a protocol blocker.
+
 - [ ] [F-042: Identify the unexplained full-suite failure](findings/release-investigations.md#f-042).
   **Investigation.** Do not truncate suite output.
+
 - [ ] [F-044: Determine whether the phase-2 shutdown observation is real](findings/release-investigations.md#f-044).
   **Investigation.**
+
 - [ ] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
   **Confirmed defect, bounded scope, NOT an investigation.** The worker does not renew,
   and the construction check bounds one JetStream REQUEST below the lease — not the
@@ -1348,6 +1402,7 @@ finding with acceptance criteria.
   Verification: a two-broker regression holding one broker's barrier past a shortened
   lease (`mqttTestSubsBarrierHeldHookV` already provides the seam) and asserting the
   subscriber receives the Will exactly once.
+
 - [x] Fix `TestMQTTOriginFirstEverCreateRaceReplicated`'s rejection-count assertion.
   **RETIRED by deletion, not fixed.** The write-lineage audit deleted the
   session-interval register and every test of it, this one included, so there is no
@@ -1370,6 +1425,7 @@ finding with acceptance criteria.
   count, which is only correct for exactly two attempts. Not folded into the
   acceptance-fact change: different mechanism (F-029b origin intervals), and that diff
   already spans 46 files.
+
 - [ ] Make `TestQ2AffineResumeDoesNotRechargeAckBudget`'s reconnect loop tolerate a closed
   connection. **Test infrastructure, not a broker gap, and MEASURED as pre-existing.**
   It closes and reopens the member three times in a loop
@@ -1402,6 +1458,7 @@ operation can trigger correctness loss or unbounded resource growth.
 - [ ] [F-046: Split the in-flight stabilization follow-ups](findings/inflight-followups.md#f-046).
   Decide the compatibility-sensitive schema naming before alpha; schedule the
   stale-metadata cleanup and settlement-fence work independently.
+
 - [ ] [F-061: Send a CONNACK before closing an unauthorized CONNECT](findings/runtime-correctness.md#f-061).
   **Small.** The shim's `authViolation` only closes the socket, so a client whose
   per-client NATS dial is refused never receives CONNACK 0x05 / 0x87 — while
@@ -1411,9 +1468,11 @@ operation can trigger correctness loss or unbounded resource growth.
   F-051, not caused by it. Both conformance suites pass today (124/124, 106/106),
   which is why it is a post-alpha candidate rather than a blocker; promote it if a
   suite or an operator report contradicts that.
+
 - [ ] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
   Keep basic diagnostics in alpha scope; automatic quarantine or repair may follow
   alpha if broker-owned state cannot create the malformed record.
+
 - [ ] Consolidate embedded NATS servers across the fork-repair test fixtures. **Test
   infrastructure, not a broker gap.** `sess_fork_repair_test.go` starts one embedded
   server per subtest through `testNewInflightEnv`/`runNATS` — roughly 37 for the file —
@@ -1497,12 +1556,16 @@ behavior when no container limit is configured.
 - [ ] Split `internal/mqtt/mqtt.go` along stable responsibilities: protocol
   parsing, connection lifecycle, sessions, subscriptions, retained messages,
   QoS flows, MQTT 5 properties, JetStream persistence, and transports.
+
 - [ ] Keep behavior unchanged during the split and run the upstream and native
   suites after each extraction.
+
 - [ ] Preserve provenance for code derived from NATS Server through NOTICE and
   concise file or package documentation.
+
 - [ ] Do not preserve file layout merely to keep a line-by-line upstream diff;
   maintainability of this broker is the controlling requirement.
+
 - [ ] Introduce a narrow JetStream transport boundary and migrate ordinary
   stream/consumer CRUD, info, publish-ack and double-ack operations incrementally to
   `nats.go/jetstream`. Preserve per-client authorization connections and a thin raw
@@ -1520,25 +1583,32 @@ them in order where a later lint change depends on an earlier cleanup.
 - [ ] [F-052: Connect MQTT option validation to production startup](findings/dead-code.md#f-052).
   Adapt or retire the upstream validator, and make its tests exercise the real
   standalone startup boundary.
+
 - [x] [F-053: Remove independent dead declarations](findings/resolved.md#f-053).
   Delete the unreferenced constants, errors, leaf wrappers, singular shared-holder
   helper, superseded no-sequence message lookup, and the two orphaned JetStream-name
   compatibility helpers found by the final reference scan. No live call site changed.
+
 - [x] [F-053: Remove obsolete upstream integration clusters](findings/resolved.md#f-053).
   Delete the unused configuration-reload, embedded-routing, and retained-permission
   rescan paths with the imports and shim state they strand. The standalone broker
   now carries no dormant embedded-server account/reload mechanism.
+
 - [ ] [F-054: Move test-only helper APIs out of production files](findings/dead-code.md#f-054).
   Keep live hook points, but place tagged-test setters and convenience methods in
   the test build where possible.
+
 - [ ] [F-054: Reconcile the constant-state v5 capability](findings/dead-code.md#f-054).
   Derive it from supported configuration or collapse its impossible false branch.
+
 - [ ] [F-054: Isolate the parked WebSocket path](findings/dead-code.md#f-054).
   Keep the future transport milestone explicit without carrying an apparently
   selectable non-nil WebSocket path in current production flow.
+
 - [ ] [F-054: Isolate upstream-only QoS compatibility switches](findings/dead-code.md#f-054).
   Keep reference-test behavior without presenting the switches as reachable
   production configuration.
+
 - [ ] [F-055: Re-enable reachability lint for `mqtt.go`](findings/dead-code.md#f-055).
   Replace the file-wide exclusions with default- and full-suite analysis plus
   narrowly documented exceptions.
@@ -1555,15 +1625,18 @@ them in order where a later lint change depends on an earlier cleanup.
   coherence. The [platform audit](findings/nats-platform.md#deliberate-non-adoptions)
   records this and the pinned-consumer, KV/counter, pause/reset, and fast-batch
   non-adoptions so the audit starts from decisions rather than rediscovering them.
+
 - [ ] Benchmark the current and proposed JetStream paths under connect,
   subscribe, publish, reconnect, retained-message, and session-recovery loads.
   Record request counts, transferred bytes, latency, and NATS/JetStream load;
   change a query path only when measurements show an improvement without
   weakening MQTT semantics, authorization, consistency, or HA behavior.
+
 - [ ] Perform a full memory and resource-lifetime scan of the broker. Cover
   clients, sessions, subscriptions, retained-message caches, QoS state,
   JetStream request state, timers, goroutines, channels, buffers, NATS
   connections/subscriptions, TLS reload state, and shutdown paths.
+
 - [ ] Add churn and soak tests that repeatedly connect, subscribe, publish,
   disconnect, expire sessions, fail over, and reload TLS. Use heap and goroutine
   profiles plus leak detection to prove memory and resource counts return to a
@@ -1574,6 +1647,7 @@ them in order where a later lint change depends on an earlier cleanup.
 - [ ] Enable `js_ack_fc_v2` in clustered CI and prove the bridge's dual-layout ACK
   parser and ACLs accept the domain/account-aware subjects announced as the v2.15
   default. This is a compatibility test, not a production feature toggle.
+
 - [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
   A schedule may publish only into its own stream, so the ADR must preserve F-031's
   atomic `$MQTT_sess` record/acceptance fact and must not claim cross-stream
@@ -1586,38 +1660,52 @@ them in order where a later lint change depends on an earlier cleanup.
 ### TLS and certificate rollover
 
 - [x] Support MQTT TLS and mutual TLS as tested production listener modes.
+
 - [x] Expose TLS on a second listener, or document why a single configurable
   listener (`-port`, plaintext or TLS) is sufficient. Decided and documented in
   the README: one listener, `-port` selects it in either mode, no implicit port
   change when TLS flags are set, and TLS deployments use `-port 8883`. Serving
   1883 and 8883 at once would need multiple listeners and is not supported.
+
 - [ ] Reload certificate, private-key, and client-CA changes from projected
   Kubernetes Secrets without restarting the process or pod.
+
 - [ ] Do not require Stakater Reloader or another rollout controller.
+
 - [ ] Replace the active TLS configuration atomically only after the complete
   replacement configuration validates.
+
 - [ ] Keep the last valid configuration active when a projected update is
   incomplete, malformed, or contains a mismatched key.
+
 - [ ] Prove that new handshakes use the replacement certificate while existing
   MQTT connections remain connected.
+
 - [ ] Cover expiry, malformed files, mismatched keys, CA rollover, concurrent
   handshakes, and failed reload recovery in native tests.
 
 ### WebSocket
 
 - [ ] Implement MQTT over WebSocket and secure WebSocket.
+
 - [ ] Define listener, path, origin, proxy-header, timeout, and TLS settings.
+
 - [ ] Add native integration tests for MQTT 3.1.1 and 5.0 over WebSocket.
+
 - [ ] Replace or retire the parked upstream WebSocket reference tests once
   equivalent behavior is covered.
 
 ## 4. Build the runtime image
 
 - [ ] Build the runtime image `FROM scratch`.
+
 - [ ] Copy the system CA bundle into the runtime image.
+
 - [ ] Run as a numeric non-root user with a read-only root filesystem.
+
 - [ ] Verify outbound TLS connections to NATS, mounted MQTT TLS Secrets,
   health probes, graceful shutdown, and signal handling.
+
 - [ ] Build and smoke-test linux/amd64 and linux/arm64 images in CI.
 
 ## 5. Package for Kubernetes
@@ -1626,22 +1714,30 @@ them in order where a later lint change depends on an earlier cleanup.
 
 - [ ] Replace JSON-like flow mappings and sequences in the example manifest
   with readable block-style YAML.
+
 - [ ] Set the effective Go memory limit to 90 percent of the container memory
   limit.
+
 - [ ] Include secure defaults, probes, resource requests and limits, graceful
   termination, and optional TLS Secret mounts.
 
 ### Helm chart
 
 - [ ] Add a production Helm chart for the broker.
+
 - [ ] Include Deployment, Service, TLS mounts, probes, resources, security
   context, autoscaling options, PodDisruptionBudget, and graceful termination.
+
 - [ ] Support an external NATS/JetStream cluster.
+
 - [ ] Add the official NATS chart as an optional dependency.
+
 - [ ] Expose the dependency configuration under `nats:` so users can place
   normal NATS chart values there without translating every field.
+
 - [ ] Add Helm lint, template, install, upgrade, rollback, and optional-NATS
   tests to CI.
+
 - [ ] Package and publish the chart as an OCI artifact in GitHub Container
   Registry only as part of an alpha release.
 
@@ -1649,19 +1745,25 @@ them in order where a later lint change depends on an earlier cleanup.
 
 - [ ] Write a migration guide from NATS Server's embedded MQTT listener to this
   standalone broker.
+
 - [ ] Cover listener cutover, DNS or load-balancer changes, expected downtime,
   rollback, and verification.
+
 - [ ] State explicitly whether sessions, retained messages, QoS state, and
   delayed Wills can be migrated. Do not imply persisted-state compatibility
   where none exists.
+
 - [ ] Explain service credentials, anonymous-client defaults, and per-client
   authentication passthrough separately.
+
 - [ ] Provide NATS user/password and JWT/account examples for MQTT
   authentication and publish/subscribe authorization.
+
 - [x] Document MQTT-topic to NATS-subject mapping and denial of the internal
   `$MQTT.>` namespace. See "Reserved `$MQTT.>` namespace" in
   `docs/ARCHITECTURE.md`; the migration guide should link it rather than restate
   it.
+
 - [ ] Include Kubernetes Secret and live TLS rollover examples.
 
 ## 7. Finish provenance and release documentation
@@ -1670,28 +1772,38 @@ them in order where a later lint change depends on an earlier cleanup.
 
 - [ ] Rename the `mqttport_fulltests`, `mqttport_clustertests`,
   `mqttport_wstests`, and `mqttport_tlstests` build tags and CI references.
+
 - [ ] Preferred replacements are `mqtt_upstream_suite`,
   `mqtt_cluster_reference`, `mqtt_websocket_reference`, and
   `mqtt_tls_reference`.
+
 - [ ] Remove `port`, `ported`, and `porting` as project-identity language from
   the README, CI, lint configuration, comments, and documentation.
+
 - [ ] Keep technically necessary networking terms such as listener port,
   `containerPort`, and port numbers.
+
 - [ ] Replace `docs/PORTING.md` before alpha with concise provenance
   documentation covering the MQTT 3.1.1 source, upstream revision, license,
   modifications, and intentional divergence.
+
 - [ ] Keep attribution in NOTICE and the README after removing the porting
   narrative.
 
 ### Release documentation
 
 - [ ] Remove the pre-release changelog before the first alpha.
+
 - [ ] Start a changelog with the first published alpha, or generate release
   notes from Git history and pull requests.
+
 - [x] Replace the README's duplicate roadmap with a short link to this file.
+
 - [ ] Make version-controlled files under `docs/` the source of truth for a
   GitHub Wiki.
+
 - [ ] Publish the wiki from CI so it cannot drift from repository docs.
+
 - [ ] Include installation, configuration, architecture, TLS, Helm/Kubernetes,
   authentication and authorization, migration, operations, troubleshooting,
   conformance, and provenance pages.
@@ -1701,21 +1813,31 @@ them in order where a later lint change depends on an earlier cleanup.
 The first alpha may be tagged only when:
 
 - [ ] Every unconditional alpha blocker is complete.
+
 - [x] The supported HA scope is documented: multi-frontend (section 0.2,
   decided 2026-08-10). Its blockers are unconditional, so the gate above
   covers them.
+
 - [ ] Every release-verification investigation is closed or has produced a
   confirmed finding with an explicit release disposition.
+
 - [ ] Every post-alpha candidate has an explicit disposition; an unchecked
   post-alpha item does not by itself block the alpha.
+
 - [ ] A repository documentation check proves every canonical `F-###` dossier
   appears exactly once in the active or resolved finding index and that the
   roadmap's closed total matches the index.
+
 - [ ] The full test, race, lint, conformance, Paho, container, and deployment
   gates pass with no unexplained failures or skips.
+
 - [ ] CI is green from a clean checkout on every supported architecture.
+
 - [ ] MQTT 3.1.1 and 5.0 conformance baselines have no unexplained regression.
+
 - [ ] The scratch image and Helm chart install successfully in a clean cluster.
+
 - [ ] TLS rollover, WebSocket, authentication, authorization, migration, backup,
   restore, upgrade, rollback, and shutdown procedures are documented and tested.
+
 - [ ] Release artifacts use the final product name consistently.
