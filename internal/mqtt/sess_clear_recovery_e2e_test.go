@@ -6,6 +6,7 @@ package mqtt
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -42,18 +43,22 @@ func testResidentSession(t *testing.T, s *Server, clientID string) (*mqttAccount
 // serialize it. Only a check made under the fence can still see it.
 func testArmAmbiguityAtClearPreFence(t *testing.T, sess *mqttSession) func() bool {
 	t.Helper()
-	armed := false
+	// ATOMIC, not a plain bool. The hook runs on the BROKER'S readLoop goroutine —
+	// clear() reaches it through mqttHandleClosedClient — while the reporter below is
+	// called from the test goroutine, so a plain bool is a genuine data race and the
+	// race detector reports it as one. It is invisible without -race and was found that
+	// way; the two sides are this write and the returned closure's read.
+	var armed atomic.Bool
 	restore := setMQTTTestClearWindowHook(func(cur *mqttSession, window string) {
-		if cur != sess || window != mqttClearWindowPreFence || armed {
+		if cur != sess || window != mqttClearWindowPreFence || !armed.CompareAndSwap(false, true) {
 			return
 		}
-		armed = true
 		cur.mu.Lock()
 		testMarkUncertainLocked(cur, cur.seq, testAmbiguousBodyLocked(cur, "ambiguous"))
 		cur.mu.Unlock()
 	})
 	t.Cleanup(restore)
-	return func() bool { return armed }
+	return armed.Load
 }
 
 func testSessionResident(asm *mqttAccountSessionManager, sess *mqttSession) bool {
