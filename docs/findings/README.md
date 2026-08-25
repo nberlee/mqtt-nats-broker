@@ -82,6 +82,30 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   can acknowledge group messages under a membership the record no longer carries. Needs a
   packet-scoped transmission gate the CONNECT path has no equivalent of.
   Details: [F-078](shared-qos2.md#f-078).
+- A denied publish is accepted, stored and delivered.
+  Status: Open. Release treatment: Alpha blocker.
+  Auth passthrough enforces subscribe but not publish: core-NATS denial is asynchronous,
+  so `PublishMsg` observes nothing, `pubAllowedFullCheck` always permits, and the
+  `permIssue` arm is dead code. Every effect that does not ride the per-client
+  connection proceeds -- the `$MQTT_msgs` store, the retained store, the QoS 2 hold, and
+  internally replayed Wills (which keep their live fan-out too). Stated as a property,
+  not a route list, because three review rounds each found another route.
+  Details: [F-079](runtime-correctness.md#f-079).
+- The authenticated identity's NATS account is never bound.
+  Status: Open. Release treatment: Alpha blocker.
+  Split out of F-079. Clients are bound to the synthetic service account before
+  authentication, and a successful dial replaces only `c.nrc`, never `c.acc`. The
+  documented v1 same-account constraint is unenforced, so credentials from another
+  account authenticate while durable state lands in the service account.
+  Details: [F-080](runtime-correctness.md#f-080).
+- A subscribe deny overlapped by a wildcard is not enforced on delivery.
+  Status: Open. Release treatment: Alpha blocker.
+  Sibling of F-079 on the subscribe side. Enforcement stops at SUBSCRIBE: a filter
+  denied outright gives SUBACK 0x80, but a wildcard overlapping a narrower deny is
+  not filtered per message on the QoS 1/2 or retained paths, which ride the service
+  connection. The inherited per-message guards are inert -- `mperms` has no writer
+  anywhere and `checkDenySub` is a stub returning false.
+  Details: [F-081](runtime-correctness.md#f-081).
 - Refuse a pre-release delayed-drain record shape instead of repairing it.
   Status: Open. Release treatment: Post-alpha cleanup.
   Filed by F-034's census. The compatibility boundary refuses an unsupported persisted

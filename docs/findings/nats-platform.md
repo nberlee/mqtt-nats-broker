@@ -164,6 +164,83 @@ retains the present acceptance proof. Schedules also imply rollup/purge capabili
 - **Fast-ingest batch publishing:** adds a second framing protocol and is justified
   only if the roadmap benchmark proves publish ingress is the bottleneck. Atomic
   batches remain appropriate for the F-031 session-record/acceptance-fact commit.
+- **Upstream MQTT PR 8416's in-memory `qos2Exchanges` map:** a per-connection,
+  PI-keyed cache holding the staged PUBLISH (so PUBREL skips the load) and a nil
+  entry marking "released, discard in flight" (so a retransmitted PUBREL is
+  screened). Three reasons it does not transfer. It is **connection-scoped**, and
+  here a PUBREL can be served by a peer, so an in-memory fact is not evidence about
+  the exchange. Its duplicate detection **swallows a `max_msgs_per_subject`
+  rejection**, which learns only "the subject was occupied" — ported here it would
+  collapse `held`, the `delivered` tombstone and `corrupt` into one verdict, and
+  misreading a tombstone as a duplicate is the case that silently loses a payload;
+  `mqttStoreQoS2MsgOnce`'s create-and-reconcile loop classifies the occupant
+  instead. And the **fences cannot be cached away**: `verifyQoS2HoldForRelease` is a
+  re-read whose job is to catch what changed between the load and the claim.
+  *Precisely one fetch could go* — a subordinate cache carrying the generation, the
+  hold sequence, an owned copy of the payload and the record's **expiry origin**
+  (PUBREL ages Message Expiry from `stored.Time`, so restarting it at PUBREL would
+  extend the message's lifetime), with explicit eviction on PUBCOMP, teardown and PI
+  reuse, could skip the load on a same-connection hit and still run the claim and the
+  proof. That is a performance option, not a reason to adopt the protocol.
+- **PR 8416's fire-and-forget subject purge:** an unbounded subject purge can apply
+  after PI reuse and destroy a later occupant. Every removal here carries a proven
+  cutoff — see F-062 in [ha-arbitration.md](ha-arbitration.md).
+- **PR 8416's `mqttIsMaxMsgsPerSubjectErr` / `exceptDuplicateError`:** interpret a
+  store error to infer a duplicate. `qos2_move.go` deliberately replaced that with
+  structural expected-sequence CAS classification.
+- **Upstream MQTT PR 8415's `LoadAndDelete` in the JS API reply dispatcher:** the
+  non-atomic `Load`+`Delete` in `processJSAPIReplies` is safe here because the handler
+  is registered on exactly one wildcard subscription per `mqttJSA` and nats-go
+  dispatches a subscription's callbacks on a single goroutine. Splitting that
+  subscription — floated in `createSubscriptions` — does **not** by itself make the
+  race reachable: disjoint parts give concurrent callbacks for *different* reply
+  subjects. Only an overlapping or duplicate subscription would. The inherited comment
+  claiming multi-goroutine dispatch was corrected instead, and it now records the four
+  preconditions a split must satisfy.
+
+## Already better than upstream
+
+- **Invalid staged QoS 2 records.** PR 8416 changes upstream to fail the connection
+  immediately on an invalid staged message rather than deferring PUBCOMP, so client
+  retries converge. `mqttProcessPubRel` is stronger and already shipped: it answers
+  0x92 only after **confirmed exact-sequence cleanup**, and where cleanup cannot be
+  confirmed it suppresses PUBCOMP and closes — because PUBCOMP frees the packet
+  identifier, and a surviving record would then swallow the client's next PUBLISH on
+  it (invariant 3, `qos2_move.go`).
+
+## Deferred prior art, not rejected
+
+Distinct from the non-adoptions above: these are upstream mechanisms this broker has
+**not assessed against measurements of its own**, not ones it has refused.
+
+- **PR 8415, pipelining inbound QoS 1 stores.** A per-connection ack goroutine drains
+  a bounded FIFO so the readLoop no longer blocks on the JetStream round trip. Our
+  inbound QoS 1 path is the pre-8415 synchronous shape. Upstream reports 2.7K → 68K
+  msg/s single-connection on an R3 cluster (p99 102ms → 5ms), with 1.1–1.2x
+  aggregate gain across many connections.
+- **PR 8416's pipelining half**, separable from the dedup protocol rejected above:
+  moving QoS 2 PUBLISH and PUBREL work behind the same FIFO and carrying PUBREC and
+  PUBCOMP through it. Evaluable against **this broker's existing durable protocol**.
+  Upstream reports 690/s → 18.1K/s single-connection (p99 384ms → 19ms) and
+  **1.4–1.5x aggregate** across many connections — a materially better aggregate
+  result than 8415's, so the two must not be quoted with one shared figure.
+
+  **Those numbers measure the whole of PR 8416, not the half proposed here.** 8416
+  attributes its single-connection gain to dropping the load and the waited delete,
+  and its aggregate gain to removing per-message JetStream API round trips — i.e. to
+  exactly the mechanisms rejected above. **No published measurement isolates a
+  pipeline-only QoS 2 design**, so the QoS 2 case rests on the QoS 1 result plus the
+  structural argument, and producing a pipeline-only number is part of the
+  evaluation rather than an input to it.
+
+Both are recorded against the roadmap's *Performance and resource audits* item,
+together with the invariants any pipeline here must preserve. Treat upstream's numbers
+as **comparison data, not this broker's cap or target**: this port uses real `nats.go`
+connections and a standalone JSA dispatcher, and a retained PUBLISH incurs an extra
+store. The roadmap's own rule applies — benchmark before changing a query path.
+
+For the inbound QoS 2 mechanism itself, see `docs/ARCHITECTURE.md`'s inbound-move
+section rather than a second description here.
 
 ## Version and forward-compatibility actions
 
@@ -173,6 +250,14 @@ create-or-validate provisioning makes that patch directly relevant; see the
 [2.14.5 release](https://github.com/nats-io/nats-server/releases/tag/v2.14.5).
 The external-server floor is therefore 2.14.5 on every JetStream peer, not merely
 2.14.4 where the term fence first appeared.
+
+Upstream MQTT PRs **8415** and **8416** are **open**, not merged, and titled for
+2.15; 8416 is based on 8415's `mqtt-qos1-pipeline` branch rather than `main`. Note
+that a `go.mod` bump does **not** update `internal/mqtt/mqtt.go`, which is a *copy* of
+upstream's `server/mqtt.go` — so tracking these is a **manual source-port audit** on a
+future dependency bump, not something a version bump does for us. Their dispositions
+are above: two protocol mechanisms rejected, one dispatcher change declined, and both
+pipelining halves deferred pending our own benchmark.
 
 The `js_ack_fc_v2` feature flag changes ACK and flow-control subjects to include the
 JetStream domain and account hash and is announced as the v2.15 default in the

@@ -37,8 +37,9 @@ go test  -tags mqttport_fulltests ./internal/mqtt/   # upstream suite
 - **Small shims** (`shim_small.go`): `subscription`, `Account`, `ipQueue`,
   `msgHandler`.
 - **Engine shims** (`shim_engine.go`): the `client` and `Server` structs,
-  `Options`/`MQTTOpts`, client flags, permissions (permissive — NATS enforces via
-  auth passthrough), and TLS/listener helpers.
+  `Options`/`MQTTOpts`, client flags, permissions (permissive — NATS enforces
+  subscribe via auth passthrough; publish is enforced by nobody, see F-079), and
+  TLS/listener helpers.
 
 **Milestone: the core compiles, serves, and passes tests in the default build**
 (no build tag). No `TODO(port)` markers remain.
@@ -80,11 +81,12 @@ done):
    existing CONNECT auth gate) dials a per-client `*nats.Conn` from the CONNECT
    username/password via the configured dialer (`Server.SetClientDialer` →
    `backend.DialClient`). NATS accepting the credentials authorizes the MQTT
-   client and binds its routing connection so NATS enforces per-client authz;
-   rejection returns a "not authorized" CONNACK. The per-client connection is
-   drained on disconnect. Verified by `shim_auth_test.go` (valid creds accepted,
-   invalid rejected). With no dialer configured, clients fall back to the shared
-   service connection (tests).
+   client and binds its routing connection so NATS enforces per-client
+   subscribe authz (publish authz is not enforced — F-079 — and the authenticated
+   account is never bound — F-080); rejection returns a "not authorized"
+   CONNACK. The per-client connection is drained on disconnect. Verified by
+   `shim_auth_test.go` (valid creds accepted, invalid rejected). With no dialer
+   configured, clients fall back to the shared service connection (tests).
 
 6. ✅ **Done** — graduated the core out of the `mqttport_wip` build tag: it
    builds, vets, and serves in the default tree. Two `go vet` printf-wrapper
@@ -111,7 +113,8 @@ parked, unbuilt, as reference material under their own tags:
   inaccessible from this package regardless of architecture, and any test whose
   defense boundary is `Options.Users[].Permissions`, which the shim does not
   enforce (authorization is delegated to NATS via auth passthrough,
-  `Server.isClientAuthorized`).
+  `Server.isClientAuthorized` — a delegation that holds for subscribe and, per
+  F-079, not for publish).
 - `mqttport_wstests` (`mqtt_ws_ref_test.go`): MQTT-over-WebSocket (the
   `websocket` shim is a placeholder).
 - `mqttport_tlstests` (`mqtt_tls_ref_test.go`): TLS config tests needing cert
@@ -153,7 +156,12 @@ were adapted as follows:
   `Users[].Permissions` are inert in the shim; authorization is delegated to
   NATS via auth passthrough (`Server.isClientAuthorized`), and the harness
   wires no per-client dialer. The seven tests of that inapplicable surface were
-  removed rather than permanently skipped. Exercising equivalent behavior
+  removed rather than permanently skipped. **Read this bullet with F-079 in
+  hand:** the delegation it relies on holds for subscribe and not for publish, so
+  "inapplicable surface" was true of the *mechanism* those tests exercised
+  (`Options.Users[].Permissions`) but not of the *property* some of them stood
+  for. Removing them left no publish-authorization coverage of any kind, which is
+  part of why the gap went unnoticed. Exercising equivalent behavior
   here would mean translating those options into embedded-nats-server accounts
   plus a per-client dialer; the architecturally correct auth path is covered by
   `shim_auth_test.go`.
@@ -454,6 +462,7 @@ Fields: `client`, `mqtt`, `shadow`, `sid`, `subject`. A thin adapter that wraps 
 - **MQTT 5 always-on**: delete `v5Enabled` and the "experimental" warning; the
   CONNECT version gate accepts 3, 4 and 5 unconditionally.
 - **Single account (v1)**: session/retained/QoS streams are account-scoped, so
-  all MQTT users share the service connection's NATS account. Auth passthrough
-  still enforces per-client publish/subscribe permissions.
+  all MQTT users share the service connection's NATS account — a constraint
+  nothing enforces (F-080). Auth passthrough still enforces per-client subscribe
+  permissions; publish permissions are not enforced (F-079).
 - **WebSocket**: deferred (see README roadmap).

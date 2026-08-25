@@ -1920,11 +1920,15 @@ type mqttPersistedSession struct {
 	DisconnectedAt int64  `json:"disconnected,omitempty"`
 }
 
-// mqttPersistedWill is a delayed Will stored in the session record so it still
-// fires if the server restarts during its Will Delay Interval. Publisher
-// permissions are not serializable, so the Will's publish permission is
-// checked before persisting and a denied Will is never stored. Spec5
+// mqttPersistedWill was a delayed Will stored in the session record so it would
+// still fire if the server restarted during its Will Delay Interval. Spec5
 // [3.1.3.2.2].
+//
+// VESTIGIAL: nothing assigns sess.will in production, so the `will` field is
+// always omitted from the record and this shape is never written or read back.
+// The active durable path for a delayed Will is the $MQTT_willq outbox
+// (mqttWillOutbox, will_outbox.go), and THAT is where the F-079 authorization gap
+// bites -- not here.
 type mqttPersistedWill struct {
 	Topic  string `json:"topic"`
 	Msg    []byte `json:"msg,omitempty"`
@@ -5110,7 +5114,34 @@ func isJSErrCausedBy(err error, id ErrorIdentifier, cause error) bool {
 
 // Process JS API replies.
 //
-// Can run from various go routines (consumer's loop, system send loop, etc..).
+// Runs on ONE goroutine. Every reply for this account arrives on the single
+// wildcard subscription `jsa.rplyr+">"` created in createSubscriptions, and
+// nats-go dispatches a subscription's messages serially, so two invocations
+// never race for the same reply subject. That is what makes the load-then-delete
+// below safe without being atomic: the entry is consumed exactly once because
+// only one goroutine can reach it.
+//
+// Upstream's comment here said the opposite ("can run from various go
+// routines"), which is true where MQTT rides nats-server internals and false in
+// this standalone port. It is corrected rather than kept because it describes
+// the one execution model this function is NOT safe under.
+//
+// Splitting the wildcard into per-kind subscriptions -- floated in
+// createSubscriptions -- keeps that safety only under all four of:
+//
+//   - the parts form an EXHAUSTIVE, non-overlapping partition of the reply
+//     prefix. Non-overlap alone gives "at most one" matching callback, not
+//     "exactly one"; a gap silently drops replies into the request timeout.
+//   - each part still dispatches its callbacks serially.
+//   - each part is subscribed before the send loop starts, on the same NATS
+//     connection, so the server processes the SUB before any later PUB. (The
+//     readiness Flush in processSub covers $MQTT.sub.* only, NOT $MQTT.JSA.*,
+//     so a partition that loses same-connection ordering needs its own flush.)
+//   - each correlation entry is stored before its request enters sendq, as
+//     newRequestExMultiSubjectsCID and newAtomicBatchRequest already do --
+//     otherwise a fast reply finds no entry and is discarded.
+//
+// If any of those cannot hold, make the removal atomic (LoadAndDelete) first.
 func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *client, _ *Account, subject, _ string, msg []byte) {
 	token := tokenAt(subject, mqttJSATokenPos)
 	if token == _EMPTY_ {
@@ -8293,6 +8324,10 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			}
 		}
 		// A broad wildcard subscription can overlap a subscribe deny clause.
+		// DEAD GUARD: mperms has no writer anywhere and checkDenySub is a stub
+		// returning false, so this never fires and the overlapped subject IS
+		// delivered. Retained replay rides the service connection, so nothing else
+		// filters it either. F-081.
 		c.mu.Lock()
 		denied := c.mperms != nil && c.checkDenySub(string(subj))
 		c.mu.Unlock()
@@ -11473,7 +11508,10 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		}
 		return ErrAuthentication
 	}
-	// Now that we are authenticated, we have the client bound to the account.
+	// Authenticated -- but NOT account-bound. isClientAuthorized only replaces
+	// c.nrc; c.acc was set to the synthetic global account BEFORE authentication and
+	// is what selects the session manager on the next line, so credentials valid in
+	// another NATS account still land here. F-080.
 	// Get the account's level MQTT sessions manager. If it does not exists yet,
 	// this will create it along with the streams where sessions and messages
 	// are stored.
@@ -13073,7 +13111,10 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32, sessGen string,
 		// id, and two clients can share a hash.
 		clientID := c.mqtt.cid
 		// A delayed Will cannot re-check publish permissions at fire time (they are
-		// not serializable), so evaluate them now and never enqueue a denied Will.
+		// not serializable), so they are evaluated now -- the intent being to never
+		// enqueue a denied Will. That intent is NOT met: pubAllowedFullCheck is
+		// hardcoded to true, so willAllowed is always true and a denied Will is
+		// enqueued and later replayed through the internal client. F-079.
 		willAllowed := c.pubAllowedFullCheck(string(will.subject), false, true)
 		c.mu.Unlock()
 		// Record the Will on the durable outbox ($MQTT_willq) so a surviving
@@ -13134,7 +13175,9 @@ func (s *Server) mqttPublishOwedWill(c *client, asm *mqttAccountSessionManager) 
 	user := c.opts.Username
 	// The internal account client publishes with permissions of its own, so the
 	// dying connection's are checked here, while it is still around to ask —
-	// exactly as the delayed path does before it enqueues.
+	// exactly as the delayed path does before it enqueues, and just as vacuously:
+	// pubAllowedFullCheck is hardcoded to true, so this never withholds a Will the
+	// account's ACL denies. F-079.
 	allowed := will != nil && c.pubAllowedFullCheck(string(will.subject), false, true)
 	c.mu.Unlock()
 	if will == nil || !allowed {
@@ -15592,6 +15635,9 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	}
 
 	// A broad wildcard subscription can overlap a subscribe deny clause.
+	// DEAD GUARD: mperms has no writer anywhere and checkDenySub is a stub
+	// returning false, so this never fires. QoS 1/2 delivery rides the service
+	// connection, so the overlapped subject IS delivered. F-081.
 	cc.mu.Lock()
 	denied := cc.mperms != nil && cc.checkDenySub(strippedSubj)
 	cc.mu.Unlock()

@@ -148,7 +148,9 @@ All notable changes to this project are documented here. The format is based on
   "experimental" warning; the CONNECT version gate defaults to accepting 5.0.
 - Per-client auth passthrough: the CONNECT auth gate dials a per-client
   `*nats.Conn` from the MQTT username/password so NATS enforces per-client
-  authorization; invalid credentials are rejected with a not-authorized CONNACK
+  authorization (subscribe only, as F-079 later established: publish denial is
+  asynchronous and is not observed); invalid credentials are rejected with a
+  not-authorized CONNACK
   and the per-client connection is drained on disconnect. Verified by
   `shim_auth_test.go`. Enabled in the `cmd` binary via `-auth-passthrough`.
 - **Graduated the MQTT core out of the `mqttport_wip` build tag**: it now builds,
@@ -206,7 +208,8 @@ All notable changes to this project are documented here. The format is based on
   `mqttport_tlstests`. `go test -tags mqttport_fulltests -race
   ./internal/mqtt/` passes with 0 failures and 0 skips. Seven upstream tests
   for the inapplicable config-based auth surface were removed (authorization
-  is delegated to NATS auth passthrough); three cross-topic/cross-QoS tests
+  is delegated to NATS auth passthrough -- a delegation later found to hold for
+  subscribe only, see F-079); three cross-topic/cross-QoS tests
   were made order-independent; the obsolete arbitrary-client-ID rejection
   case was removed; and the inherited QoS2 flaky-test skip was re-enabled.
   See `docs/PORTING.md` ("Testing strategy").

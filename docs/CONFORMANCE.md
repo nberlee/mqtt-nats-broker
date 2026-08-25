@@ -196,6 +196,48 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 
 All are tracked in `docs/ROADMAP.md`.
 
+### A denied PUBLISH is accepted, stored and delivered — OPEN, and NOT ACCEPTED
+
+**A defect, not a residual.** An **alpha blocker** (F-079, and F-080 alongside it);
+recorded here because this file describes a broker whose authorization is delegated to
+NATS, and for publishing that delegation does not happen.
+
+Auth passthrough enforces **subscribe at SUBSCRIBE time**: `processSub` flushes and
+reads `LastError`, so a filter the account denies outright becomes SUBACK 0x80 (see
+*Subscribe failure* above). It does not filter per message, which is F-081. Publish
+has no enforcement at all. A core-NATS publish denial is **asynchronous**, so
+`PublishMsg` returns nil and `processInboundClientMsg` reports
+`permIssue = false` on every path; the `permIssue`
+arm in `mqttInitiateMsgDeliveryJSA` is dead code, and `pubAllowedFullCheck` returns
+`true` unconditionally.
+
+The live fan-out rides the per-client connection and *is* dropped. Everything else
+proceeds on the full-rights service connection, so the direction of the deviation is:
+
+- **QoS 1 and QoS 2** — the message is stored in `$MQTT_msgs` and **delivered** to
+  durable subscribers.
+- **Retained, any QoS including 0** — the copy is **persisted** and replayed to future
+  subscribers.
+- **Internally replayed Wills** (delayed, takeover, uncertainty-parked) — additionally
+  **fanned out live**, because they are published by the internal client. An
+  *immediate* Will is not: its core publish rides the client connection and is denied,
+  leaving only its persistence. A non-retained immediate QoS 0 Will has no deviation at
+  all.
+
+Separately, the v1 same-account constraint is unenforced: `isClientAuthorized` binds
+only `c.nrc`, never `c.acc`, so credentials from another NATS account authenticate while
+durable state lands in the service account (F-080).
+
+**Measured**, not merely read: with `alice` denied publish on `denied.>`, the NATS
+server logged `Permissions Violation for Publish to "denied.q1"` for every denied
+publish, and the subscriber received the QoS 1 and QoS 2 messages while the QoS 0
+one was dropped. The QoS 1 and QoS 2 publishes were **acknowledged to the publisher
+as success**; QoS 0 has no acknowledgement, and its send merely raised nothing.
+
+**The Paho suite passing is not evidence against this.** Its only publish deny is
+`$MQTT.>`, which `mqttProcessPub` rejects before any store, so the deny never reaches
+the bypass; there is no ordinary-topic publish deny in the conformance config.
+
 ### Outgoing DUP on a first transmission — OPEN, and NOT ACCEPTED
 
 **A defect, not a residual**, recorded here because this file otherwise reads as describing

@@ -54,7 +54,9 @@ func (rf *readCacheFlag) set(c readCacheFlag)       { *rf |= c }
 
 // ---------------------------------------------------------------------------
 // Permissions (auth is passed through to NATS, so in-broker checks are
-// permissive: NATS enforces per-client publish/subscribe authorization).
+// permissive). NATS enforces the per-client SUBSCRIBE side; the PUBLISH side is
+// NOT enforced anywhere today, because a core-NATS publish denial is
+// asynchronous and nothing here observes it -- F-079.
 // ---------------------------------------------------------------------------
 
 type permissions struct{}
@@ -89,7 +91,8 @@ type Options struct {
 	Token       string
 	// Authorization: test-suite compatibility with upstream's single-token
 	// top-level auth field name; unused by the broker (authorization is
-	// enforced by NATS via auth passthrough, see Server.isClientAuthorized).
+	// enforced by NATS via auth passthrough -- for SUBSCRIBE only; publish is
+	// unenforced, see Server.isClientAuthorized and F-079).
 	Authorization string
 	NoAuthUser    string
 	Users         []*User
@@ -333,9 +336,18 @@ func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas
 // isClientAuthorized implements auth passthrough: it dials a per-client NATS
 // connection using the CONNECT credentials. Success (NATS accepted the
 // credentials) authorizes the MQTT client and binds its routing connection so
-// NATS enforces that client's publish/subscribe permissions. Failure rejects the
+// NATS enforces that client's SUBSCRIBE permissions. Failure rejects the
 // CONNECT with "not authorized". When no dialer is configured, the client falls
 // back to the shared service connection (used in tests).
+//
+// Two gaps, both alpha blockers, both filed rather than fixed here:
+//   - PUBLISH permissions are NOT enforced: a core-NATS publish denial is
+//     asynchronous, so PublishMsg observes nothing and every effect that does
+//     not ride c.nrc proceeds on the service connection (F-079).
+//   - The authenticated connection's ACCOUNT is never derived or compared. This
+//     binds c.nrc and nothing else; c.acc still points at the synthetic service
+//     account, so the documented v1 same-account constraint is unenforced
+//     (F-080).
 func (s *Server) isClientAuthorized(c *client) bool {
 	if s.dialClient == nil {
 		if c.nrc == nil {
@@ -509,7 +521,10 @@ type client struct {
 	// nrc is the NATS routing connection for this client: the per-client
 	// (auth-passthrough) connection for real MQTT clients, or the service
 	// connection for the internal JSA client. All MQTT publishes/subscriptions
-	// and JSA requests for this client ride nrc so NATS enforces authorization.
+	// and JSA requests for this client ride nrc so NATS can enforce authorization
+	// -- which it does for SUBSCRIBE only. A publish denial on nrc is asynchronous
+	// and is never observed, and the QoS 1/2, retained and QoS 2 hold stores do not
+	// ride nrc at all: they ride the service connection (F-079).
 	nrc *nats.Conn
 	// ownNRC is true when nrc is a per-client connection this client owns and
 	// must close on disconnect (as opposed to the shared service connection).
@@ -586,7 +601,14 @@ func (c *client) traceOutOp(op string, arg []byte) {}
 func (c *client) isClosed() bool    { return c.closed.Load() }
 func (c *client) isWebsocket() bool { return false }
 
-// Permission checks: permissive in-broker (NATS enforces via auth passthrough).
+// Permission checks: permissive in-broker, on the premise that NATS enforces via
+// auth passthrough. That premise holds for subscribe and NOT for publish.
+//
+// pubAllowedFullCheck therefore ALWAYS RETURNS TRUE, and its three callers are all
+// Will authorization (delayed-Will capture, takeover-time publication, uncertainty
+// parking) -- so a Will denied by the account's ACL is authorized here anyway, and an
+// internally replayed one is then published by the internal client on the service
+// connection, live fan-out included. F-079; do not read this as a check.
 func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bool { return true }
 func (c *client) checkDenySub(subject string) bool                                 { return false }
 func (c *client) selectMappedSubject() bool                                        { return false }
@@ -1097,6 +1119,11 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	// it stores/clears the retained copy in $MQTT_rmsgs. It no-ops for
 	// non-retained publishes. The internal JSA client has c.mqtt == nil and is
 	// correctly skipped.
+	//
+	// "Once permissions pass" is upstream's condition, NOT this port's: the
+	// PublishMsg above returns before any asynchronous denial is known, so this
+	// runs whether or not the publish was authorized, and the retained copy is
+	// stored on the service connection either way. F-079.
 	if c.mqtt != nil {
 		c.mqttHandlePubRetain()
 	}

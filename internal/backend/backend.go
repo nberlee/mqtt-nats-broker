@@ -7,7 +7,9 @@
 //     (stream/consumer create, message store/load) — the transport that the
 //     ported mqttJSA layer plugs into;
 //   - a per-MQTT-client dial (Auth passthrough) so that NATS enforces
-//     authorization for each MQTT client's publishes and subscriptions.
+//     authorization for each MQTT client's subscriptions. Publish authorization
+//     is NOT enforced today -- a core-NATS denial is asynchronous and is not
+//     observed, and the durable stores ride the service connection (F-079).
 package backend
 
 import (
@@ -97,9 +99,12 @@ func (b *Backend) JetStream() jetstream.JetStream { return b.js }
 // credentials, implementing auth passthrough. When user is empty the
 // configured default credentials (if any) are used for anonymous clients.
 //
-// The returned connection carries that client's NATS authorization; all of the
-// client's MQTT publishes and subscriptions ride it so NATS enforces per-client
-// permissions. Close it when the MQTT client disconnects.
+// The returned connection carries that client's NATS authorization; the client's
+// MQTT publishes and subscriptions ride it so NATS can enforce per-client
+// permissions. Enforcement is real for SUBSCRIBE; for PUBLISH the denial is
+// asynchronous and unobserved, so it does not gate the durable stores, which ride
+// the service connection anyway (F-079). Close it when the MQTT client
+// disconnects.
 func (b *Backend) DialClient(clientID, user, pass string) (*nats.Conn, error) {
 	if user == "" {
 		user, pass = b.cfg.DefaultUser, b.cfg.DefaultPass

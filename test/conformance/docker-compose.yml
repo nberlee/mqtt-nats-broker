@@ -38,6 +38,9 @@ services:
       # Auth passthrough so NATS enforces per-client permissions. Anonymous MQTT
       # clients (the Paho suite connects without credentials) dial as the "mqtt"
       # user, which is denied subscribe on test/nosubscribe (test_subscribe_failure).
+      # NOTE: this suite exercises SUBSCRIBE denial only. Its sole publish deny is
+      # "$MQTT.>", which mqttProcessPub rejects before any store, so a green run is
+      # not evidence that publish authorization works -- it does not (F-079).
       MQTTNB_AUTH_PASSTHROUGH: "true"
       MQTTNB_DEFAULT_USER: "mqtt"
       MQTTNB_DEFAULT_PASS: "mqtt"

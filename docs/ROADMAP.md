@@ -1182,6 +1182,51 @@ the README currently reports as supported. They remain blockers independently of
 the HA-scope decision except where the dossier explicitly requires a remote
 takeover.
 
+- [ ] [F-079: A denied publish is accepted, stored and
+  delivered](findings/runtime-correctness.md#f-079). Auth passthrough enforces
+  subscribe (`processSub` flushes and reads `LastError`, giving SUBACK 0x80) but not
+  publish: a core-NATS denial is asynchronous, so `PublishMsg` observes nothing,
+  `processInboundClientMsg` always reports `permIssue = false`, and
+  `mqttInitiateMsgDeliveryJSA`'s `permIssue` arm is dead code. `pubAllowedFullCheck`
+  returns `true` unconditionally by design, because NATS was supposed to enforce.
+  Everything that does not ride the per-client `c.nrc` therefore proceeds on the
+  full-rights service connection: the `$MQTT_msgs` store, the retained store (any QoS,
+  including 0), the QoS 2 hold, and internally replayed Wills — which keep their live
+  fan-out too, unlike the other three. An *immediate* Will is not in that set; its core
+  publish rides `c.nrc` and is denied. **The dossier states this as a property** — no
+  MQTT-originated publication may have a visible or durable effect before authorization
+  of the CONNECT-authenticated identity for *that publication and its effective
+  subject* is established — because three review rounds each produced another route.
+  The current conformance config cannot exhibit it: its only publish deny is `$MQTT.>`,
+  which `mqttProcessPub` rejects before any store, so the green suite is not evidence.
+  Fixtures and fix design are in the dossier; the `Flush`-based remedy is not
+  automatically correct and does not address F-080.
+
+- [ ] [F-080: The authenticated identity's NATS account is never
+  bound](findings/runtime-correctness.md#f-080). Split out of F-079. Clients are bound
+  to the synthetic service account before authentication; `isClientAuthorized` replaces
+  only `c.nrc` on a successful dial and never derives or compares the authenticated
+  connection's account, while session/JSA selection still reads `c.acc`. The v1
+  same-account constraint `docs/ARCHITECTURE.md` states is therefore unenforced:
+  credentials valid in another account authenticate while every durable operation lands
+  in the service account's streams. Kept separate from F-079 because a fix for either
+  leaves the other standing.
+
+- [ ] [F-081: A subscribe deny overlapped by a wildcard is not enforced on
+  delivery](findings/runtime-correctness.md#f-081). Subscribe authorization is
+  enforced at SUBSCRIBE time only — `processSub` flushes and reads `LastError`, so a
+  filter the account denies outright becomes SUBACK 0x80. A **wildcard subscription
+  overlapping a narrower deny** is not filtered per message: QoS 1/2 delivery and
+  retained replay ride the service connection, and the per-message guard this port
+  inherited for exactly that case is dead on both halves — `mperms` has no writer
+  anywhere, and `checkDenySub` is a shim stub returning `false`. A client allowed
+  `foo/#` but denied `foo/secret` therefore receives stored QoS 1/2 and retained
+  messages on `foo/secret`. QoS 0 on a user topic is unaffected: that subscription
+  rides `c.nrc`, so NATS still filters it — which a fixture must use as a control so
+  it cannot pass on the wrong mechanism. Same root cause as F-079 (delivery moved to
+  the full-rights service connection while the client-connection permission hooks
+  stayed inert stubs), opposite direction, separate fix.
+
 - [x] [F-051: Bound a connection that never sends CONNECT](findings/resolved.md#f-051).
   A CONNECT deadline (`internal/mqtt/connect_deadline.go`) bounds every accepted
   connection between accept and CONNECT, closing the MQTT 3.1.1 / 5.0 [3.1.4]
@@ -1718,6 +1763,85 @@ them in order where a later lint change depends on an earlier cleanup.
   coherence. The [platform audit](findings/nats-platform.md#deliberate-non-adoptions)
   records this and the pinned-consumer, KV/counter, pause/reset, and fast-batch
   non-adoptions so the audit starts from decisions rather than rediscovering them.
+
+- [ ] Evaluate pipelining the inbound QoS 1 (and QoS 2) ack paths, using upstream
+  nats-server PRs 8415 and 8416 as prior art. Our inbound QoS 1 path is the
+  pre-8415 synchronous shape: `mqttProcessPub` case 1 stores through
+  `mqttInitiateMsgDeliveryJSA` and only then sends PUBACK, so throughput is capped
+  at one store round trip per connection. Upstream reports 2.7K → 68K msg/s (QoS 1)
+  and 690/s → 18.1K/s (QoS 2) single-connection on R3. The aggregate many-connection
+  gains differ by PR and must not be conflated: **1.1–1.2x for QoS 1 (8415)** but
+  **1.4–1.5x for QoS 2 (8416)**. Note that 8416's figures measure its **whole**
+  implementation, including the load-skip and round-trip removal this project
+  rejects — **no published number isolates a pipeline-only QoS 2 design**, so
+  producing one is part of the evaluation. All of it is **comparison data, not
+  this broker's cap or target**, since this port uses real `nats.go` connections
+  plus a standalone JSA dispatcher and a retained PUBLISH incurs an extra store.
+  Benchmark before changing
+  the path, per the bullet below. 8416's dedup/discard protocol is separately
+  **rejected**; only its pipelining half is in scope. See the
+  [platform audit](findings/nats-platform.md#deferred-prior-art-not-rejected).
+
+  The invariants such a pipeline must preserve, enumerated up front so they are not
+  rediscovered one review round at a time:
+
+  - **`jsa.subsBarrier.wait` still precedes every `$MQTT_msgs` store.**
+    Interest-based retention means a store racing a SUBSCRIBE is discarded outright.
+    Note the scope: the *retained* store runs inside `processInboundClientMsg`
+    before the barrier, so "every store" would be false.
+  - **Store-submission order, not only PUBACK order.** Same-connection `$MQTT_msgs`
+    writes must be *issued* in PUBLISH order so JetStream consumers keep an ordered
+    carrier; FIFO acks over out-of-order stores is not sufficient.
+  - **One ack rule, and it must say when a position is reserved.** Every
+    response-producing inbound PUBLISH or PUBREL **reserves a position in the
+    per-connection ack FIFO in readLoop receipt order, before any asynchronous work
+    begins**; store completion — or a no-store result — only marks that reserved
+    position ready; emission drains ready positions from the head. Without the
+    reservation clause, an implementation that enqueues on completion satisfies the
+    words and still emits in completion order. Scope: **one FIFO per connection**
+    across PUBACK, PUBREC and PUBCOMP; a per-type split needs its own argument about
+    client flow control, not silent adoption. Examples that make the rule concrete,
+    not its definition: the pre-store rejections written directly today (reserved
+    topic 0x87, quota 0x97, payload-format 0x99); permission-denied once F-079 is
+    fixed; and QoS 2's own no-store answers — a duplicate held PUBLISH answers PUBREC
+    without storing, and a missing record or terminal tombstone answers PUBCOMP
+    without an onward store.
+  - **Owned queued data — a complete snapshot, not a field list.** `c.mqtt.pp`,
+    `c.pa` and their slices are readLoop scratch, and `mqttHandlePubRetain` reads the
+    *whole* `c.mqtt.pp` plus the client username. Either an immutable
+    publish/retained snapshot, or a fully pre-encoded retained operation.
+  - **No Local origin and the retained flag captured before handoff.**
+    `c.mqtt.pubOrigin` is valid only for the synchronous delivery call.
+  - **Message Expiry keeps ageing while queued** — a delayed async store must not
+    restart the original PUBLISH's interval.
+  - **Wills stay synchronous.** No client PI, no PUBACK obligation, and delayed-Will
+    terminalization depends on `deliverWillRecord` returning only after its store
+    completes. This is the port-specific reason to carry upstream's
+    `hasClientPI` / `owesPubAck` distinction.
+  - **Receive Maximum accounting keyed on packet identifiers.** Today's check counts
+    only `qos2InFlight` *because* QoS 1 is synchronous. Queued QoS 1 PUBLISHes become
+    observable unfinished work, but a count of queued messages is the wrong unit: it
+    must track unique outstanding PIs, must not double-count a DUP retransmission
+    (mirroring the existing QoS 2 exception), and must define what a *non-DUP* reuse
+    of a still-queued PI means. Completion happens on another goroutine, so "the
+    check stays on the readLoop" is not by itself a concurrency design.
+  - **Teardown ordering.** A worker failure must close the socket so the readLoop
+    runs `mqttHandleClosedClient` before `closeConnection`, preserving session detach
+    and Will handling; calling `closeConnection` from the ack goroutine bypasses it.
+  - **No post-DISCONNECT or post-takeover ack.** Pending work must be cancelled or
+    drained when a connection is displaced, or when shutdown consumes its one
+    DISCONNECT claim.
+  - **Bounded window, and every JSA reply registration released** on timeout,
+    pipeline rejection, connection close and shutdown — registrations here are
+    account-scoped, not connection-scoped.
+  - **The ack worker needs an owner in the shutdown graph.** `clientWG` covers
+    readLoops only, and shutdown waits for clients *before* stopping the account/JSA
+    infrastructure the worker would still be calling into. Name the wait group, the
+    admission gate's closing point, and what proves the worker cannot outlive its JSA.
+  - **Store-failure-closes-connection scoped to the `$MQTT_msgs` store**, or
+    deliberately coordinated with F-060 (a retained store failure is only logged).
+  - **Trace at emission time**, where the ack is written, not where the store is
+    submitted.
 
 - [ ] Benchmark the current and proposed JetStream paths under connect,
   subscribe, publish, reconnect, retained-message, and session-recovery loads.

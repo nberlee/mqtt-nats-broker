@@ -1116,10 +1116,21 @@ func TestMQTTv5WillDelay(t *testing.T) {
 	})
 }
 
-// A delayed Will must still be subject to the publisher's publish permissions
-// when the timer fires, exactly as an immediate Will is: a Will on a denied
-// topic is dropped (not delivered, not retained), while one on an allowed topic
-// is delivered. Guards against the deferred publish running with no permissions.
+// PARTLY UNMET, and the split matters. A Will ought to be subject to the
+// publisher's publish permissions when it fires: denied topic dropped, allowed
+// topic delivered.
+//
+// For an IMMEDIATE Will that largely holds, but not because the broker checks:
+// the live publish rides the dying client's own c.nrc, so NATS drops a denied one
+// (a non-retained QoS 0 immediate Will is therefore fully covered). Its QoS 1/2
+// and retained persistence still bypass, because those ride the service
+// connection.
+//
+// For a DELAYED, takeover or uncertainty-replayed Will nothing holds:
+// pubAllowedFullCheck is hardcoded to true, so none is ever withheld, and the
+// replay publishes through the internal client on the service connection -- live
+// fan-out included. F-079; this orphan comment is kept because it states the
+// requirement the fix must satisfy.
 
 // testMQTTConnectRetryV5 is testMQTTConnectRetry for a v5 CONNECT: it dials and
 // sends the CONNECT, retrying on transient errors (useful while a cluster's JS

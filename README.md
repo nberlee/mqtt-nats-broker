@@ -10,7 +10,8 @@ retained messages, QoS1/2 persistence, and message routing.
 > **Status: pre-release working broker.** There is no public bridge release or
 > supported persisted-state format yet. The default build serves MQTT 3.1.1/5.0
 > end-to-end — CONNECT, SUBSCRIBE, PUBLISH (QoS0), retained/sessions via
-> JetStream, and NATS-enforced auth passthrough — verified with a real MQTT
+> JetStream, and auth passthrough (partially NATS-enforced; see F-079 through
+> F-081) — verified with a real MQTT
 > client in CI. The upstream regression suite runs in CI against the
 > standalone broker (behind the `mqttport_fulltests` tag). See
 > [docs/PORTING.md](docs/PORTING.md).
@@ -106,10 +107,23 @@ is not implemented yet — see [docs/ROADMAP.md](docs/ROADMAP.md).
 ## Authentication
 
 Auth is **passed through to NATS**: an MQTT client's username/password dial a
-dedicated `*nats.Conn`, so NATS enforces that client's publish/subscribe
-permissions on every topic. Anonymous clients use the configured default
-credentials. In v1, all MQTT users share the service connection's NATS account
-(session/retained/QoS streams are account-scoped).
+dedicated `*nats.Conn`. Anonymous clients use the configured default credentials.
+
+> **Do not treat this as tenant isolation yet.** Three gaps are open alpha
+> blockers, and each is documented rather than fixed:
+>
+> - NATS enforces **subscribe filter admission** (a filter the account denies
+>   outright becomes SUBACK 0x80) and per-message denial on the **QoS 0** path.
+>   It does **not** filter a wildcard that overlaps a narrower deny on the
+>   QoS 1/2 or retained paths — those ride the service connection.
+>   [F-081](docs/findings/runtime-correctness.md#f-081).
+> - **Publish denial is not enforced at all.** A core-NATS publish denial is
+>   asynchronous, so the broker never observes it, and a denied publish is
+>   accepted, stored and delivered.
+>   [F-079](docs/findings/runtime-correctness.md#f-079).
+> - In v1 all MQTT users must share the service connection's NATS account
+>   (session/retained/QoS streams are account-scoped) — a constraint nothing
+>   enforces. [F-080](docs/findings/runtime-correctness.md#f-080).
 
 The broker reserves `$MQTT.>` for its own state and refuses client publishes,
 subscribes, and Will topics that target it. Deny both directions on that prefix
@@ -129,7 +143,7 @@ the topic mapping and the exact permissions.
 | Will (+ delay) | ✅ | ✅ (delay) |
 | Message / session expiry, reason codes, properties | — | ✅ |
 | TLS / mTLS | ✅ | ✅ |
-| Auth passthrough (per-client NATS authz) | ✅ | ✅ |
+| Auth passthrough (per-client NATS authz — partial: see F-079, F-080, F-081) | ✅ | ✅ |
 | HA cross-instance session takeover | ✅ | ✅ |
 | WebSocket | roadmap | roadmap |
 

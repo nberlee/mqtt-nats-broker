@@ -192,9 +192,13 @@ type mqttDeferredDisconnect struct {
 	willGen string
 	// will / willProps / willUser are the Will itself, captured at the disconnect
 	// because the client is closing and c.mqtt.cp will not be readable later. nil
-	// will means there is nothing owed. Publish permission was already evaluated at
-	// capture time — it is not serializable and cannot be re-checked here — so a
-	// denied Will is simply never captured, matching mqttHandleWill.
+	// will means there is nothing owed.
+	//
+	// Publish permission is evaluated at capture time — it is not serializable and
+	// cannot be re-checked here — but that evaluation is currently VACUOUS:
+	// pubAllowedFullCheck always returns true, so a Will denied by the account ACL
+	// IS captured here and is later replayed through the internal client on the
+	// service connection, live fan-out included. F-079.
 	will      *mqttWill
 	willProps []byte
 	willUser  string
@@ -1217,8 +1221,9 @@ func (a *mqttDeferredDisconnect) willDue(now time.Time) bool {
 // The Will is captured HERE rather than re-derived on resolution, for two reasons:
 // the closing client's CONNECT packet is about to become unreachable, and its
 // publish permission is not serializable, so it has to be evaluated while the
-// client still exists (a denied Will is never captured, exactly as mqttHandleWill
-// never enqueues one).
+// client still exists. That evaluation is currently VACUOUS in exactly the same
+// way mqttHandleWill's is: pubAllowedFullCheck always returns true, so a denied
+// Will IS captured here and IS replayed later. F-079.
 //
 // OWNED is a precondition, not a description: the caller holds the session
 // ownership gate. That is what entitles the park to clear this client ID from the
@@ -1280,7 +1285,9 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 			delayed = mqttWillIsDelayed(c.mqtt.proto, will, action.expiryInterval)
 		}
 		if !c.pubAllowedFullCheck(string(will.subject), false, true) {
-			// Denied: never captured, so it can never be published later either.
+			// Intended: a denied Will is not captured, so it can never be published
+			// later either. UNREACHABLE today -- pubAllowedFullCheck is hardcoded to
+			// true, so this arm never runs and a denied Will is captured. F-079.
 			will = nil
 		}
 		if will != nil {

@@ -58,8 +58,10 @@ type Config struct {
 
 	// Auth passthrough.
 	// When true, MQTT username/password are used to dial a per-client NATS
-	// connection so NATS enforces per-client authorization. When a client
-	// connects without credentials, DefaultUser/DefaultPass (if set) are used.
+	// connection so NATS enforces per-client authorization -- SUBSCRIBE only;
+	// publish denial is asynchronous and is not observed today (F-079). When a
+	// client connects without credentials, DefaultUser/DefaultPass (if set) are
+	// used.
 	AuthPassthrough bool
 	DefaultUser     string
 	DefaultPass     string

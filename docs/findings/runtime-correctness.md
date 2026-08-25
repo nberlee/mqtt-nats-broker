@@ -377,3 +377,239 @@ An **in-process** enqueue fence: revalidate generation and binding under the loc
 owns them, before queueing. Deliberately **not** durable arbitration — there is no
 second party contending for anything here, and inflating an in-process ordering problem
 into a durable protocol is the mistake F-034's own review cycle rejected twice.
+
+## F-079
+
+**Title:** A denied publish is accepted, stored and delivered
+
+- Status: Open. Filed 2026-08-25 while auditing upstream nats-server PR 8415.
+- Classification: Authorization
+- Release treatment: **Alpha blocker.** The broker's stated authorization model does
+  not hold for publishing, and the broker never acts on the denial: no MQTT
+  refusal is returned, no publication-correlated enforcement happens, and the
+  message reaches subscribers. It is not literally log-silent — nats.go's default
+  asynchronous error handler prints the permission violation to stderr (DialClient
+  installs no custom handler), and the NATS server logs it too. Nothing
+  *correlates* either log with the MQTT publication or stops it.
+
+### The property this broker must satisfy, and does not
+
+> For each MQTT-originated application publication, authorization of the
+> **CONNECT-authenticated identity** to publish **that publication, to its final
+> effective NATS subject**, must be established **before or atomically with its
+> first application-visible or durable effect**.
+>
+> None of these is evidence of it: successful CONNECT authentication; authorization
+> observed for a different publication or a different subject; a `PublishMsg` that
+> returned nil; or the authority of the service or internal client the work was
+> moved onto. The decision must **remain attached through persistence and any later
+> replay**.
+
+It is stated as a property, not a list of broken call sites, deliberately. Three
+review rounds each produced another route, which is the signal that enumeration is
+the wrong instrument — `feedback_named_sites_are_a_sample`. The routes below are
+**evidence for the property, explicitly not the set**.
+
+### Why the property fails today
+
+Auth passthrough dials a per-client `*nats.Conn` from the CONNECT credentials and
+binds it as `c.nrc`, so NATS can enforce that identity's permissions. For
+**subscribe** it does: `processSub` issues a post-`Subscribe` `Flush`, the violation
+surfaces in `LastError`, and the broker answers SUBACK 0x80 (see
+`docs/CONFORMANCE.md`, *Subscribe failure*).
+
+For **publish** there is no equivalent, and three facts compose into a bypass:
+
+1. `pubAllowedFullCheck` returns `true` unconditionally — in-broker checks are
+   deliberately permissive *because* NATS is supposed to enforce.
+2. A core-NATS publish denial is **asynchronous**. The server answers `-ERR
+   Permissions Violation`, which `c.nrc.PublishMsg(m)` never observes.
+   `processInboundClientMsg` therefore returns `permIssue = false` on every path.
+3. Consequently the `permIssue` arm in `mqttInitiateMsgDeliveryJSA` is **dead
+   code**. It must not be mistaken for coverage.
+
+The live fan-out does ride `c.nrc` and is genuinely dropped. Everything that does
+not ride `c.nrc` proceeds:
+
+- **QoS 1/2** — `jsa.storeMsg(mqttStreamSubjectPrefix + ...)` runs on the account
+  manager's JSA, i.e. the **service connection**. The message lands in `$MQTT_msgs`
+  and is delivered to durable subscribers through service-owned delivery
+  subscriptions.
+- **Retained, any QoS including 0** — `mqttHandlePubRetain` runs inside
+  `processInboundClientMsg` after `PublishMsg` returns nil, and its store is also on
+  the service connection. The copy is persisted and replayed to future subscribers.
+- **QoS 2 hold** — `mqttProcessPub` case 2 goes straight to `mqttStoreQoS2MsgOnce`;
+  it does not attempt the per-client publish at all until PUBREL.
+- **Internally replayed Wills** — `pubAllowedFullCheck`'s three real callers are all
+  Will authorization (delayed capture and takeover publication in `mqtt.go`,
+  uncertainty parking in `sess_uncertain.go`), and the Will is later published by an
+  **internal client** via `deliverWillRecord`. These bypass **including their live
+  fan-out**, which is strictly worse than the other three routes.
+
+  An **immediate** Will is different and must not be lumped in: it calls
+  `mqttInitiateMsgDelivery` on the *original* client, so its core publish rides
+  `c.nrc` and **is** denied; only its persistence bypasses. A non-retained immediate
+  QoS 0 Will has **no bypass at all**. The delayed path's own comment explains why
+  the permissive check is load-bearing: a delayed Will cannot re-check permissions at
+  fire time, so the check at capture is the only gate — and it always says yes.
+
+The service connection holds full rights by design (`test/conformance/nats.conf`
+grants `service` `publish: ">"`), which is exactly what makes it the bypass.
+
+### Measured, not merely read
+
+Confirmed empirically on 2026-08-25 with an in-process NATS server denying user
+`alice` publish on `denied.>`, one MQTT client publishing and another subscribing
+(both as `alice`, subscribe allowed). The server logged
+`Permissions Violation for Publish to "denied.q1"` for each denied publish, and:
+
+| publish      | NATS verdict  | client outcome                | delivered to subscriber |
+|--------------|---------------|-------------------------------|-------------------------|
+| `allowed/q1` | allowed       | PUBACK                        | yes (control)           |
+| `denied/q0`  | **violation** | no ack exists at QoS 0; the send completed without rejection | **no** |
+| `denied/q1`  | **violation** | **PUBACK (success)**          | **yes**                 |
+| `denied/q2`  | **violation** | **PUBREC/PUBCOMP (success)**  | **yes**                 |
+
+That is the property's failure in one table: QoS 0 rides `c.nrc` and is dropped;
+QoS 1 and QoS 2 go through the service connection and are delivered. The QoS 1 and
+QoS 2 publishes were **acknowledged as success** — the publisher is told its denied
+message was accepted. QoS 0 has no acknowledgement to be wrong about; its only
+observable is that the send raised nothing.
+
+The probe was a measurement instrument and is not committed: a fixture asserting
+today's behavior would encode the defect as expected. The fix's fixtures are named
+below, and this matrix is what they must invert.
+
+### The current conformance suite is not evidence against this
+
+Its only publish deny is `$MQTT.>`, and `mqttProcessPub` rejects the reserved
+namespace *before* any store is attempted, so the deny never reaches the bypass.
+There is no ordinary-topic publish deny in the config at all. A green suite here
+says nothing about publish authorization —
+`feedback_fixture_must_reach_its_route`, at the configuration level.
+
+### An inherited fixture for this already exists, and cannot run
+
+`TestMQTTv5WillDelayPermViolation` (`internal/mqtt/mqtt_v5_cluster_ref_test.go`)
+makes two assertions about a delayed Will on a denied topic, and **only one of them
+is this finding's**:
+
+- *not persisted with the session record* — holds today, but **vacuously**:
+  `mqttPersistedWill` is vestigial, nothing assigns `sess.will`, so no Will is ever
+  written there regardless of permissions. Porting this assertion would produce a
+  fixture that passes for the wrong reason.
+- *dropped when the timer fires* — **this is the applicable one**, and it is what
+  F-079 breaks. The active durable path is the `$MQTT_willq` outbox, and the replay
+  publishes through the internal client whatever the ACL says.
+
+Its own comment gives this finding's rationale — *"a restart cannot re-check
+permissions, so a restored Will would bypass them."*
+
+It has never been able to fail, because it sits behind the `mqttport_clustertests`
+tag, which **does not compile** (`go vet -tags mqttport_clustertests` fails with
+`undefined: cluster`) and which no `make` target builds. `docs/PORTING.md` records
+that tag as carrying unbuilt references.
+
+So the assertion whose violation this finding reports was inherited and is
+invisible. Whoever fixes F-079 should port the **fire-time suppression** assertion
+and retarget it at `$MQTT_willq`, and should not port the session-record absence
+check as-is — it would pass against a completely broken broker.
+
+### What a fix must add
+
+Fixtures are **evidence for the property, not a definition of it**. Four, all
+deny-publish on an *ordinary* topic: QoS 0-retained, QoS 1, QoS 2, and — the one that
+must not be generic — a **delayed or takeover Will, non-retained QoS 0**. That shape
+is chosen because every competing *delivery or message-storage* route is absent from
+it (retained handling returns immediately; QoS 0 skips the `$MQTT_msgs` store), so a
+live-subscriber assertion can only be satisfied by the internal client's fan-out. Note
+the precision: a *delayed* Will does write its own durable outbox record, so the claim
+is about competing **delivery** routes, not "no persistence at all" — use the
+**takeover** variant if the fixture must also assert no preceding outbox record. An
+unqualified "Will" fixture would most likely exercise an immediate Will, which is not
+bypassed live, and would prove the opposite of what it claims.
+
+The fix design is **not settled here**. The subscribe side's `Flush` + `LastError`
+is the obvious starting point and is not automatically correct: it cannot probe QoS 2
+before PUBREL without publishing prematurely, cannot probe a delayed Will without
+firing it, reintroduces a synchronous round trip on the hot path, and does not address
+F-080 at all.
+
+## F-080
+
+**Title:** The authenticated identity's NATS account is never bound
+
+- Status: Open. Filed 2026-08-25, split out of F-079.
+- Classification: Authorization / tenancy
+- Release treatment: **Alpha blocker.** A documented constraint that nothing enforces.
+
+### The finding
+
+`docs/ARCHITECTURE.md` states the v1 constraint that all MQTT users must belong to
+the same NATS account as the service connection, because the session, retained and
+QoS streams are account-scoped.
+
+Nothing enforces it. Every MQTT client is bound to the synthetic service account
+*before* authentication, and `isClientAuthorized` — on a successful dial — replaces
+only `c.nrc`. It never derives or compares the authenticated connection's account,
+and session/JSA state is still selected through `c.acc`.
+
+So credentials valid in a **different** NATS account authenticate successfully while
+every durable operation lands in the service account's streams.
+
+This is kept separate from F-079 rather than folded into it because the mechanism and
+the fix differ: F-079 is about observing authorization for a publication, F-080 is
+about binding an identity to an account at CONNECT. A fix for either leaves the other
+standing.
+
+## F-081
+
+**Title:** A subscribe deny overlapped by a wildcard is not enforced on delivery
+
+- Status: Open. Filed 2026-08-25 by the sweep F-079 triggered.
+- Classification: Authorization
+- Release treatment: **Alpha blocker.** Sibling of F-079 on the subscribe side.
+
+### The finding
+
+Subscribe authorization is enforced **at SUBSCRIBE time only**: `processSub` issues
+a post-`Subscribe` `Flush` and reads `LastError`, so a filter the account denies
+outright becomes SUBACK 0x80 (`docs/CONFORMANCE.md`, *Subscribe failure*). That is
+real, and it is the whole of the enforcement.
+
+It does not cover a **wildcard subscription that overlaps a narrower deny**. NATS
+would filter the denied subjects during delivery on the client's own connection,
+and for QoS 0 on a user topic it still does, because that subscription rides
+`c.nrc`. But **QoS 1/2 delivery and retained replay ride the service connection**
+(`$MQTT.sub.<nuid>`), which holds full rights, so nothing filters them there.
+
+The port inherited upstream's per-message guard for exactly this case — both
+delivery sites carry the comment *"A broad wildcard subscription can overlap a
+subscribe deny clause"* and test `c.mperms != nil && c.checkDenySub(...)`. **Both
+halves are dead:**
+
+- `mperms` is declared on the shim's `client` and has **no writer anywhere** — only
+  the field declaration and these two nil-guarded reads.
+- `checkDenySub` is a shim stub returning `false` unconditionally.
+
+So the guard is always false and the message is delivered. A client allowed
+`foo/#` but denied `foo/secret` receives stored QoS 1/2 and retained messages on
+`foo/secret`.
+
+### Relationship to F-079
+
+Same root cause — the broker moved delivery and persistence onto the full-rights
+service connection and kept upstream's client-connection permission hooks as inert
+stubs — but the opposite direction, and a separate fix. F-079 is about a publish
+whose authorization was never observed; F-081 is about a delivery whose denial was
+observed at subscribe time and then not applied per message. Neither fix implies
+the other.
+
+### What a fix must add
+
+An authenticated end-to-end fixture with a wildcard subscription overlapping a
+narrower subscribe deny, asserting non-delivery over **both** the QoS 1/2 path and
+retained replay — and, as a control, that the QoS 0 path on a user topic already
+filters, so the fixture cannot pass by accident on the wrong mechanism. Then a
+per-client subscribe ACL that the service-owned delivery paths can actually
+consult, replacing the two dead stubs.

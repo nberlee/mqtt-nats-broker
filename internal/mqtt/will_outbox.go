@@ -587,8 +587,10 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 // enqueueDelayedWill writes a new pending outbox record for a delayed Will. A
 // local fire timer publishes it at FireAt; the claim loops (on every replica,
 // including this one) are the backstop and fire it once FireAt passes.
-// Called from the disconnect path; the Will's publish permission was checked
-// before this and a denied Will is never enqueued.
+// Called from the disconnect path. The Will's publish permission is checked
+// before this, but that check is currently VACUOUS — pubAllowedFullCheck always
+// returns true — so a Will denied by the account ACL IS enqueued here, and the
+// replay publishes it through the internal client. F-079.
 //
 // The outbox is the only durable fire mechanism, so a transient store failure
 // must not silently drop the Will: the create is retried (idempotently — the

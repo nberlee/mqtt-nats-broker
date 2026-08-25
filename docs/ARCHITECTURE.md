@@ -4482,16 +4482,36 @@ startup rather than surfacing later as unroutable requests.
 | QoS1/2 persistence | JetStream durable consumers                           |
 | QoS0 routing       | NATS core pub/sub                                     |
 | Asset management   | `mqttJSA` request/reply over the service `*nats.Conn` |
-| Per-client authz   | Auth passthrough: one `*nats.Conn` per MQTT client    |
+| Per-client authz   | Auth passthrough: one `*nats.Conn` per MQTT client. Subscribe only; publish is unenforced (F-079) |
 
 ## Auth passthrough
 
 On CONNECT, the MQTT username/password are used to dial a per-client
-`*nats.Conn`. NATS then enforces that client's publish/subscribe permissions for
-every MQTT topic (mapped to a NATS subject). JetStream asset operations use a
-separate service connection with its own credentials. In v1 all MQTT users must
-belong to the same NATS account as the service connection, because the
-session/retained/QoS streams are account-scoped.
+`*nats.Conn`. NATS then enforces that client's **subscribe** permissions **at
+SUBSCRIBE time**: `processSub` flushes and reads `LastError`, so a filter the
+account denies outright becomes SUBACK 0x80. JetStream asset operations use a
+separate service connection with its own credentials.
+
+Three limits of this model are open alpha blockers, stated here because this
+section previously claimed more than the code delivers:
+
+- **Publish permissions are not enforced.** A core-NATS publish denial is
+  asynchronous, so `PublishMsg` observes nothing and `permIssue` is always
+  false. Every effect that does not ride the per-client connection then proceeds
+  on the full-rights service connection: the `$MQTT_msgs` store, the retained
+  store, the QoS 2 hold, and internally replayed Wills. See
+  [F-079](findings/runtime-correctness.md#f-079).
+- **The authenticated account is not bound.** In v1 all MQTT users must belong to
+  the same NATS account as the service connection, because the
+  session/retained/QoS streams are account-scoped - but nothing checks it.
+  `isClientAuthorized` replaces only `c.nrc`; `c.acc` still points at the
+  synthetic service account. See
+  [F-080](findings/runtime-correctness.md#f-080).
+- **Subscribe enforcement stops at SUBSCRIBE.** A wildcard subscription
+  overlapping a narrower deny is not filtered per message on the QoS 1/2 or
+  retained paths, because those ride the service connection and the inherited
+  per-message guards (`mperms`, `checkDenySub`) are inert stubs. See
+  [F-081](findings/runtime-correctness.md#f-081).
 
 ## Connection liveness bounds
 
