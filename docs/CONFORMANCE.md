@@ -2926,18 +2926,18 @@ skipped, and absence was then reported out of a record set that had not been rea
 2. **The retention is unbounded in count**, not merely bounded in kind. One unreadable
    record spares the durables of every group released afterwards, for as long as it is
    present.
-3. **One caller withholds more than the durable.** `releaseFailedSharedFilter` tests the
-   scan's answer *before* removing its own local state, so a refusal there also strands the
-   resident `cons` entry, the closed delivery state and the ack-budget accounting — not just
-   the group consumer. **The indeterminate-walk arm already causes the same suppression, and
-   just as durably**: that cleanup is the *one-shot* landed continuation of an ambiguous
-   save, so recovery of the transient JS error does not retry it either. What the new arms
-   add is a **stable trigger** while an unsupported record remains, not a new persistence
-   class. The resulting strand is **not persisted** — a shared consumer config is excluded
-   from the record — so it is confined to the resident session object, where it may impair
-   that session's ack budget across reconnects, and it is cleared when the session is
-   discarded or reconstructed. It is tracked as its own `docs/ROADMAP.md` item and is
-   deliberately not fixed here.
+3. **One caller used to withhold more than the durable. That is CLOSED (F-082).**
+   `releaseFailedSharedFilter` tested the scan's answer before touching any of its own state,
+   so a refusal stranded the resident `cons` entry, the closed delivery state, the pending
+   deliveries and the ack-budget accounting as well as the group consumer. It now separates
+   the three dispositions the single `held` bit conflates — this session still holds the
+   durable through another of its own keys, some other session holds it or the walk refused,
+   or the walk reported it unheld — and only the last authorizes a `CONSUMER.DELETE`. The
+   same item fixed the larger half the roadmap bullet had not stated: the release re-derived
+   its work from `sess.cons`, which the failing attempt has not written to yet, so on the
+   common shape it discharged nothing whatever the scan said. **A refusal now withholds
+   exactly the group consumer, and nothing else.** What a refusal still costs is items 1 and
+   2 above, unchanged.
 
 **What this does NOT close.** The scan is a non-snapshot read that authorizes a
 deletion, not

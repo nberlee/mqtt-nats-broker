@@ -2031,11 +2031,25 @@ func (sess *mqttSession) unvoidRegNonces(nonces []string) {
 //
 // sess.mu must be held.
 func (sess *mqttSession) closeTeardownDeliveryLocked(c *client, cc *ConsumerConfig) *subscription {
-	if c == nil || cc == nil || cc.DeliverSubject == _EMPTY_ {
+	if cc == nil {
+		return nil
+	}
+	return sess.closeSharedDeliveryLocked(c, cc.DeliverSubject)
+}
+
+// closeSharedDeliveryLocked is closeTeardownDeliveryLocked keyed on the deliver SUBJECT.
+//
+// A shared filter's deliver subject is deterministic (mqttSharedGroupNamesForKey), so the
+// abandoned join of a FAILED filter can be barriered by name — which the config form cannot
+// do, because that join has no sess.cons entry until the whole filter succeeds. F-082.
+//
+// sess.mu must be held.
+func (sess *mqttSession) closeSharedDeliveryLocked(c *client, deliverSubject string) *subscription {
+	if c == nil || deliverSubject == _EMPTY_ {
 		return nil
 	}
 	c.mu.Lock()
-	sub := c.subs[cc.DeliverSubject]
+	sub := c.subs[deliverSubject]
 	c.mu.Unlock()
 	if sub == nil || sub.mqtt == nil || sub.mqtt.closed {
 		return nil

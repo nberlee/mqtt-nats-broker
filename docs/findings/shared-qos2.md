@@ -876,3 +876,231 @@ Note the mutation whose delivery must be driven at the `"after-ownership-cas"` b
 rather than after the verify create — driving it earlier does not discriminate a gate opened
 before the write. F-077 already extends `make cluster-failover-tests`' regex, so the
 replicated case is visible when it lands.
+
+## F-082
+
+**Title:** Release a failed shared filter's own state independently of the last-holder answer
+
+- Status: **Closed.** Alpha blocker, filed by `docs/ROADMAP.md` §0.2 and split out of the
+  last-holder fail-closed change (`b659236`) by its plan review.
+
+### The finding, in four parts
+
+`releaseFailedSharedFilter` is the cleanup a live shared SUBSCRIBE owes when one of its
+filters failed and the compensating membership REMOVAL was only proven durable later — it
+is
+registered as a landed continuation by `rollbackSharedSub`'s `saveMaybeLanded` arm and run
+by
+`settleLandedAttempt` under the resolver's fence. It began by computing
+`sharedDurablesHeldByOthers` and skipping the whole loop body on a "held" answer.
+
+**D1 — a refusal withheld this session's own cleanup, not just the group delete.**
+`held[durable]` authorizes exactly one thing: destroying a group consumer whose backlog is
+interest-retained, which is other members' business. The resident `cons` entry, the
+deliver-subject subscription, the pending deliveries with their reserved packet identifiers
+and the `MaxAckPending` charge are this session's own, and are owed whatever the answer.
+Since `b659236` the scan also reports held for an indeterminate walk and for a record it
+cannot interpret, so one unreadable record anywhere in the account suppressed this session's
+cleanup indefinitely. The other four callers of the scan withhold only the delete.
+
+**D2 — the release was keyed on `sess.cons`, which the failing attempt has not written to.**
+The half the roadmap bullet did not state, and the larger one. `addJSConsToSess` runs only
+once the WHOLE filter has succeeded, so a `cons` walk cannot see the join a failing filter
+just made, which makes the no-config branch the COMMON shape of this route rather than a
+corner. **That is not the same as "there is never an entry", and the difference is
+load-bearing:** a PRE-EXISTING entry for the same durable can be resident — F-078's `readd`
+shape leaves one with no membership behind it — which is why the release sweeps every matching
+entry instead of treating absence as given, and why one test arm seeds two of them. What that
+branch left behind was created by the failing packet itself: the `sharedCharged`/`tmaxack`
+charge (taken at create time, before the failing exit), the pending deliveries under that
+durable, and the deliver-subject subscription. `refundSharedCharges` deliberately skips the
+SUBSCRIBE path because "it disposes of the consumer through `releaseSharedConsumer`, which
+refunds as part of the release" — true of the INLINE cleanup, which passes the join's
+returned config, and false of this continuation.
+
+**The consequence is stated from the code, not from that comment.** There is **no double
+count**: `processSharedJSConsumer` samples `alreadyCharged` and does not re-charge a durable
+already in `sharedCharged`. The defect is that the orphan charge permanently consumes the
+resident session's ack budget — `tmaxack` stays raised for a membership that no longer
+exists, and the ceiling check then refuses later joins the session is entitled to. A
+never-expiring resident session is never reconstructed, so this is indefinite.
+
+**D3 — the scan's answer merges two facts, and only one licenses a release.**
+`sharedDurablesHeldByOthers` marks a durable held from THIS session's own remaining
+`sharedSubs` before it walks any record, and `mqttProcessUnsubs` relies on that. For this
+caller the own-hold half is load-bearing twice over. *Overlapping filters:* a multi-level
+key
+joins two group consumers, and the level-up one of `$share/g/foo.>` IS the consumer of the
+plain filter `$share/g/foo`, so an unconditional local cleanup would purge a surviving
+filter's pending state, unsubscribe its delivery and refund its charge. *The `priorExisted`
+branch:* `undo()` is shared, so the re-SUBSCRIBE branch — whose write is an ADD that KEEPS
+the membership — registered the same continuation, and only the own-hold arm stood between
+that and a live membership's consumers being released.
+
+**D4 — the pre-save delivery barrier was `cons`-keyed too.** `rollbackSharedSub`'s removal
+arm
+lowered the barrier by walking `sess.cons` while taking the register snapshot BY DURABLE.
+Mixed, that is the worst combination: on the common shape the barrier was never lowered, and
+`closeTeardownDeliveryLocked` states why that matters — the snapshot is then "only a
+moment in
+time", and a delivery arriving after it allocates an identifier whose cancellation misses
+the
+membership-removal write.
+
+### What closed it
+
+**Three dispositions per group consumer, not two.** Own-held → discharge nothing and delete
+nothing. A foreign holder found, or the scan refused → discharge this session's state,
+withhold the delete. The scan reported unheld → both. Own-hold is decided in the caller from
+`sess.sharedSubs` via `mqttSharedKeyOwnsDurable`, so `sharedDurablesHeldByOthers` is
+unchanged and is consulted only for targets that survive that test.
+
+**The release is keyed on the group consumer's NAMES.** `releaseSharedGroupTarget` /
+`...Classified` is the former `releaseSharedConsumerClassified` body re-keyed on `(durable,
+deliverSubject)`, with the config form kept as a thin wrapper; both names come from
+`mqttSharedGroupNamesForKey`, the ONE derivation of what a shared key joins, over which
+`mqttSharedDurablesForKey` and `mqttSharedKeyOwnsDurable` are now projections rather than
+independent copies of the same main/level-up rule. The `held`-gated delete lives in exactly
+one place, so a refusal can no longer reach a `CONSUMER.DELETE` by another route, and the
+duplicate scan the old config branch performed is gone.
+
+**The `cons` sweep deletes EVERY match**, not the first: a durable can be named by more than
+one stale entry, and one left behind has no membership to reach it by.
+
+**The staging half is keyed the same way**, through `closeSharedDeliveryLocked`, and its
+ownership test EXCLUDES the doomed key — it runs before the removal, so counting that key
+would make every closure suppress itself. A durable a REMAINING key still reaches keeps both
+its delivery and its registrations.
+
+**BOTH halves of this release apply the own-hold fence.** The landed continuation is one;
+the
+other is the CONFIRMED inline cleanup, `cleanupFailedSubClassified`, which hands the join's
+returned config straight to the whole-durable release. Without the fence there, the
+overlapping level-up case closes and unsubscribes the SURVIVING filter's delivery, purges
+its
+pending identifiers and refunds its charge — and the last-holder scan stops none of that,
+because it withholds the consumer DELETE and nothing more. The extracted helper does not
+assume the invariant: it names the two callers that enforce it and points the others at F-083.
+
+**The `priorExisted` branch registers nothing**, which is the same rule the early per-filter
+save already states for its own ambiguous arm: nothing was deferred for want of proof, so
+there is no landed continuation to register. The own-hold fence stays as an independent second
+fence, and the two are pinned by separate mutations — one fails only the overlap test, the
+other only the registration test.
+
+### Five designs refuted while planning this, recorded so none returns
+
+A maintainer simplifying any of these back is the failure mode the plan's own review round
+raised, so each carries the code that kills it.
+
+1. **"Just move the `held[dur]` check down to the delete."** D1 alone. It leaves D2
+   entirely —
+   the common shape still discharges nothing, because the work is still derived from `sess.cons`
+   — and it walks straight into D3, releasing an overlapping live membership's state and
+   running a release the `priorExisted` branch never owed.
+2. **"Call the existing config-keyed release unconditionally, passing the precomputed
+   answer."** Same D3 exposure, and it still only fires when a resident config happens to
+   exist, so the common shape is untouched.
+3. **"Refund by `cc.Durable` from the join's returned config."** `processSharedJSConsumer`'s
+   own comment refutes this for the CONNECT path: the config comes back whether the call
+   charged or reused a resident entry, so refunding by durable can erase an EARLIER
+   connection's charge and leave `tmaxack` permanently short. Here the release is
+   whole-durable — the own-held fence establishes that this session ends up holding no
+   membership for it — so the whole `sharedCharged` entry is exactly what goes. Same numbers,
+   different justification, and the justification is what a later reader needs.
+4. **"Capture `jscons`/`jssub` in the continuation closure."** `rollbackSharedSub` does not
+   have them; its callers do. It means plumbing two more parameters through four call
+   sites and
+   rooting a `*subscription` in a closure that may run much later — the shape F-078 had to
+   undo
+   for its gate's `owner` field. The names are deterministic, so deriving them from the key
+   costs nothing and roots nothing.
+5. **"Sample ownership once, at registration time."** Wrong for both halves. In the
+   continuation the membership may legitimately have been re-added by a later SUBSCRIBE, and
+   own-held must then refuse the discharge; in the staging half the doomed key is still present
+   and must be EXCLUDED, or every closure suppresses itself.
+
+### The precondition the design rests on
+
+Every production path that runs a landed continuation holds the session's OWNERSHIP GATE as
+well as the record fence: the periodic pass and CONNECT take `lockSession` before
+`resolveUncertainSession`, `resolveUncertainNow` takes it for a resident session (its ungated
+arm is `sess.asm == nil`, which a live SUBSCRIBE's session never is), and the live SUBSCRIBE
+tail keeps the packet's. That is what makes the own-hold sample still true after `sess.mu`
+is
+released — `sess.mu` alone would only make each map access race-free. A TEST can reach
+`resolveUncertainWrite` without the gate and must take it explicitly.
+
+### Two claims that were REFUTED during review, so neither returns
+
+- **"A forked verdict leaves the strand unreleased forever."** False for this route. A
+  failed-filter rollback makes `processSubs` return an error, so `mqttProcessSubs` returns
+  with `resolveEventually` false, `mqttSettleLiveArbitration` never runs and
+  `settledOwnAmbiguity` stays false — `mqttResolveAfterPacket` therefore runs the generic
+  resolver, whose forked arm EVICTS the session. There is no resident object left to strand,
+  and no conformance residual was added.
+- **"The next resume charges again."** False, as above: `alreadyCharged` prevents it. The
+  defect is budget permanently spent, not a double count.
+
+### What this does NOT change
+
+`sharedDurablesHeldByOthers` and its three fail-closed arms; the non-snapshot-read
+residual (a
+leaver completing its scan before a joiner's record lands); the same-client-ID own-record
+skip;
+and the fact that a durable spared by a refusal is reclaimed by nothing, since the
+orphan-consumer sweep aborts on the same record. The helper's existing behaviour on a
+CAS-rejected or unsecured register write is inherited verbatim: it logs, unsubscribes and
+still issues the delete, and a re-armed ambiguity is settled by the NEXT resolution rather
+than
+by re-running this continuation, which `takeUncertainActions` has already consumed.
+
+### Coverage
+
+Nine unit cases over the continuation and the staging arm, one route case, and one row
+added to
+the scan's own table. The route case matters because a fixture that calls the release directly
+cannot show that anything still REGISTERS it: it drives a real multi-level shared SUBSCRIBE
+whose level-up join is refused by a real production check (the messages stream is given a
+consumer inactivity limit between the two joins, which `processSharedJSConsumer` refuses to
+create a reapable consumer under), with the rollback's own save suppressed so it goes ambiguous
+and the readLoop's resolver then settles it. Both of its arming confirmations are load-bearing:
+without them it passes for the wrong reason when the filter fails BEFORE its first join, or
+when the rollback save fails definitely and registers nothing.
+
+The scan-table row is **C7, the indeterminate walk**, which predates `b659236` and was pinned
+by nothing at either layer — the three existing fixtures using that seam drive the PUBREL
+barrier scan and the in-flight walks. Its paired mutation is the first thing that has ever
+made
+that arm's deletion fail a test.
+
+## F-083
+
+**Title:** Release UNSUBSCRIBE's own shared state independently of the last-holder answer
+
+- Status: **Open.** Filed by F-082's second consult as a separate item — another caller with
+  its own commit path — rather than folded in, which keeps F-082's "the other four callers
+  are
+  out of scope" boundary intact.
+
+Three statements, all of the same class as F-082's D2 and D3:
+
+1. `removeUnsubConsumer` gates the group-consumer DELETE on `heldShared` but not the
+   durable-scoped local purge, so leaving `$share/g/foo.>` while still holding
+   `$share/g/foo` purges the pending state and unsubscribes the deliver subject the SURVIVING
+   filter still needs. The overlap is real for the same reason it is in F-082: the two keys
+   share the level-up durable.
+2. Its staging half `stageUnsubCancellationsLocked` has F-082's D4 keying mismatch — the
+   delivery barrier via `sess.cons`, the void snapshot by durable.
+3. Its no-`cons` branch discharges no local state at all: it derives the durables from the
+   key
+   and deletes the consumer, purging nothing. The code already names that population —
+   `purgeSharedPending` exists because "a 3.1.1 forced leave and UNSUBSCRIBE's no-cons branch
+   each strand transmitted entries with NEITHER view left".
+
+The remedy is expected to be F-082's, applied to this caller: derive the targets from the
+key,
+separate own-hold from the scan's answer, and gate only the delete. What must be re-derived
+rather than assumed is the exclusion — an UNSUBSCRIBE removes its filters from `sharedSubs`
+BEFORE `commitUnsub` runs, so the doomed key is already gone there, which is not F-082's
+staging situation.

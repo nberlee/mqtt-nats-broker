@@ -256,6 +256,14 @@ func mqttSharedNamesDurable(group, subject string) string {
 // A SUBSCRIBE (fromSubProto) is untouched: it disposes of the consumer through
 // releaseSharedConsumer, which refunds as part of the release.
 //
+// That held only because the inline cleanup passes the join's RETURNED config. The landed
+// continuation of an AMBIGUOUS rollback re-derived it from sess.cons, which the failing
+// attempt has not written to yet, so it refunded nothing and the charge outlived its membership for the
+// life of the resident session — not as a double count (processSharedJSConsumer does not
+// re-charge a durable already in sharedCharged) but as budget permanently spent, which the
+// MaxAckPending ceiling then refuses later joins against. F-082 keyed that release on the
+// filter's own names instead; see releaseSharedGroupTarget.
+//
 // No lock held on entry.
 func (sess *mqttSession) refundSharedCharges(fromSubProto bool, charges []mqttSharedCharge) {
 	if fromSubProto || len(charges) == 0 {

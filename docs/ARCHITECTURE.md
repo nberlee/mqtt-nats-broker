@@ -3327,6 +3327,45 @@ durable, which covers the principal leave race but not all of it: a leaver can c
 scan before the join record lands and delete after the joiner's final verification. Failing
 closed on an unreadable record does not close that, and does not claim to.
 
+## The scan answers a DESTRUCTION question, and its answer merges two facts
+
+`sharedDurablesHeldByOthers` authorizes one act: destroying a group consumer. It says nothing
+about what the CALLER still owes for its own session, and its single `held` bit answers two
+different questions — "some other session holds this durable, or the walk refused" and "THIS
+session still reaches it through another of its own shared keys", because the scan marks the
+session's own remaining `sharedSubs` before it walks any record. A caller releasing its own
+state has to separate them, and a caller deciding a delete does not.
+
+**Three dispositions per group consumer, therefore, not two.** Own-held: discharge nothing
+and
+delete nothing — the pending purge, the ack-budget refund and the unsubscribe are all
+whole-durable, so acting would silently stop a live subscription delivering. A foreign holder,
+or a refusal: discharge this session's own state, withhold the delete. Unheld: both. The
+overlap that makes this real is deterministic rather than exotic — a multi-level key joins
+a
+second group consumer for its level-up parent, and that parent IS the consumer of the plain
+filter one level up, so `$share/g/foo.>` and `$share/g/foo` share a durable.
+
+**`sess.cons` is not the authority for what a failed filter must release.** `addJSConsToSess`
+runs only once a whole filter has succeeded, so the join a FAILING filter made has no resident
+config — while its `MaxAckPending` charge, its pending deliveries and its deliver-subject
+subscription are all already real. Everything a shared key joins is derived instead from the
+key itself, through the one derivation `mqttSharedGroupNamesForKey`, which is also what
+`mqttSharedDurablesForKey` and `mqttSharedKeyOwnsDurable` project rather than re-deriving.
+The
+release then takes `(durable, deliverSubject)`; the resident-config form is a thin wrapper
+over
+it, and the `held`-gated delete lives in exactly one place, so no refusal can reach a
+`CONSUMER.DELETE` by a second route.
+
+**The same keying applies to the pre-save delivery barrier**, and there the ownership test
+must
+EXCLUDE the key being released: the barrier is lowered before the membership removal, so the
+doomed key is still present and counting it would make every closure suppress itself. Two
+independent fences protect a live membership from a release it never owed — that
+exclusion, and
+the rule that a rollback which RESTORES a membership registers no landed release at all.
+
 ## The restore gate: the CONNACK follows a complete restoration
 
 A resuming CONNECT used to acknowledge the session with Session Present = 1 and

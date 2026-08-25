@@ -803,7 +803,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   field — three bounded member-variable, two compared against an EXPECTED normalized value,
   one server-owned and constrained to the three named server metadata keys, with the
   normalized set MEASURED against a real create rather than listed. A `Cons` entry carrying
-  a `DeliverGroup` is refused at all five ingresses. It also fixed a latent defect in a
+  a `DeliverGroup` was refused at all five ingresses **that existed then**; the live count
+  is six and the three canonical enumerations carry it, the sixth being the shared
+  last-holder scan's own refusal. It also fixed a latent defect in a
   shared helper: `lookupConsumersMulti` encoded an authoritative not-found and a successful
   nil `ConsumerInfo` identically, so the in-flight source cache was concluding a terminal
   `Lost` from a reply that proved nothing; it now resolves `Unknown`. **What it does NOT
@@ -1012,34 +1014,89 @@ further findings it surfaced are filed separately, for the reason its own bullet
   non-snapshot read rather than an arbitration, so the leaver-versus-joiner
   `CONSUMER.DELETE` race is untouched.
 
-  - [ ] **`releaseFailedSharedFilter` gates its own local cleanup on the last-holder
-  answer.** Split out by the plan review of the item above, as a caller-specific lifecycle
-  defect rather than part of that scan's repair. `mqtt.go:8092` tests `held[dur]` **before**
-  removing the resident `sess.cons` entry and taking either of its two exits —
-  `releaseSharedConsumer` when a matching `cc` is found, a direct `deleteConsumer` when it
-  is not — so a refusal strands the closed delivery state, the `cons` entry and the
-  ack-budget accounting, not only the group durable. The other four callers withhold the
-  consumer delete alone. **The indeterminate-walk arm already causes the same suppression,
-  and just as durably** — the cleanup is the one-shot landed continuation of an ambiguous
-  save, so recovery of the transient JS error does not retry it either. An earlier draft of
-  this bullet said the fail-closed change turned the defect from transient into permanent;
-  that was wrong and the tie-break consult refuted it. What the new arms add is a **stable,
-  deterministic trigger** while an unsupported record remains. The strand is in-memory only,
-  since a shared consumer config never reaches the record, so it is confined to the resident
-  session object and cleared when that session is discarded or reconstructed. **In-memory
-  is
-  NOT the same as short-lived, and this bullet must not be read as saying so.** A
-  never-expiring resident session is retained across reconnects and may never be discarded
-  or
-  reconstructed at all, and the one-shot continuation is never retried, so the stranded
-  `cons` entry and ack-budget charge can impair that session **indefinitely**. What separates
-  this from the scan's own defect is the **scope ruling** recorded above — a caller-specific
-  lifecycle defect, deferred by an explicit decision — not any inference that memory-only
-  state decays on its own. The fix must separate
-  "this session's own
-  cleanup is owed" from "the group durable may be destroyed" — they are different facts and
-  only the second depends on other members — and must not reintroduce a deletion the
-  last-holder answer refused.
+  - [x] [F-082: Release a failed shared filter's own state independently of the last-holder
+  answer](findings/shared-qos2.md#f-082). **Alpha blocker — done.** Split out by the plan
+  review of the item above as a caller-specific lifecycle defect, and given its finding ID
+  and
+  dossier by this run's first consult. **The bullet's own statement of it was the smaller
+  half.** As filed: `releaseFailedSharedFilter` tested `held[dur]` **before** removing the
+  resident `cons` entry and taking either of its two exits, so a refusal stranded the closed
+  delivery state, the `cons` entry and the ack-budget accounting, not only the group durable,
+  while the other four callers withhold the consumer delete alone. That is fixed. **What the
+  research added, and what a future reader should not re-derive:**
+
+    - *The release was keyed on `sess.cons`, which the failing attempt has not written to.*
+      `addJSConsToSess` runs only once the WHOLE filter has succeeded, so the no-config branch
+      is the **common** shape of this route, not a corner — and it discharged nothing
+      **whatever the scan answered**. The charge, the pending deliveries and the deliver-subject
+      subscription are all created before the failing exit. `refundSharedCharges`'s comment
+      ("a SUBSCRIBE disposes of the consumer through `releaseSharedConsumer`, which
+      refunds as
+      part of the release") is true of the INLINE cleanup, which passes the join's returned
+      config, and was false of the landed continuation; it is corrected in place.
+    - *The consequence was overstated in an earlier draft and is now stated from the code.*
+      There is **no double count** — `processSharedJSConsumer` samples `alreadyCharged`
+      and does
+      not re-charge — so the defect is budget **permanently spent**: `tmaxack` stays
+      raised for
+      a membership that no longer exists, and the ceiling check then refuses later joins the
+      session is entitled to. Indefinite for a never-expiring resident session, as this bullet
+      already insisted.
+    - *`held` merges two facts, and the obvious fix destroys a live membership.* The scan
+      marks
+      this session's own remaining `sharedSubs` before it walks any record. A multi-level
+      key
+      joins a second consumer for its level-up parent, and that parent IS the plain filter's
+      consumer, so `$share/g/foo.>` and `$share/g/foo` share a durable — an unconditional
+      local
+      cleanup purges a surviving filter's state. Worse, `undo()` is shared by both rollback
+      branches, so the **`priorExisted`** branch, whose write is an ADD that KEEPS the
+      membership, registered the same continuation; only the own-hold arm stood between that
+      and a live membership's consumers being released.
+    - *The pre-save delivery barrier had the same keying defect* (`cons`-keyed barrier, durable-
+      keyed void snapshot), which on the common shape left the barrier up and made the snapshot
+      "only a moment in time" — the exact window the membership-removal write exists to close.
+
+  **What landed:** a three-way per-durable disposition (own-held → nothing; foreign or refused
+  → this session's state, no delete; unheld → both), with own-hold decided in the caller so
+  `sharedDurablesHeldByOthers` is untouched; the release re-keyed on `(durable, deliverSubject)`
+  as `releaseSharedGroupTarget`, with the config form a thin wrapper and the `held`-gated
+  delete
+  in exactly one place; `mqttSharedGroupNamesForKey` as the ONE derivation of what a
+  shared key
+  joins, with `mqttSharedDurablesForKey` and `mqttSharedKeyOwnsDurable` projections of it;
+  a
+  `cons` sweep that deletes EVERY match; the staging barrier keyed the same way with the doomed
+  key EXCLUDED from its ownership test; the SAME fence on the confirmed inline half
+  (`cleanupFailedSubClassified`), which holistic round 3 found had none — the scan withholds
+  the consumer delete and nothing else, so the overlapping case tore down a surviving
+  membership's delivery, identifiers and charge; and no landed release registered at all
+  on the
+  restore branch. **Two claims were refuted in review and must not return:** that a forked
+  verdict
+  leaves the strand alive (this route's forked arm EVICTS the session, so there is no resident
+  object to strand — no conformance residual was added), and the double-count reading above.
+  **Coverage:** nine unit cases, a production-route case whose two arming confirmations are
+  load-bearing, and one row (**C7**) added to the last-holder scan's own table for the
+  **indeterminate-walk arm, which predated `b659236` and was pinned by nothing at either
+  layer**. Sixteen mutations were run and each kills a named test. `docs/CONFORMANCE.md`
+  residual 3 of the unreadable-record entry is now closed; items 1 and 2 there are unchanged.
+
+  - [ ] **Release UNSUBSCRIBE's own shared state independently of the last-holder answer**
+  ([F-083](findings/shared-qos2.md#f-083)). **Alpha blocker.** Filed by F-082's second consult
+  as a separate caller with its own commit path, rather than folded in — which is what keeps
+  F-082's "the other four callers are out of scope" boundary intact. Three statements, all
+  of
+  F-082's classes: `removeUnsubConsumer` gates the group-consumer DELETE on `heldShared` but
+  not the durable-scoped local purge, so leaving `$share/g/foo.>` while still holding
+  `$share/g/foo` purges the pending state and unsubscribes the deliver subject the SURVIVING
+  filter needs; `stageUnsubCancellationsLocked` mixes a `cons`-keyed barrier with a
+  durable-keyed void snapshot; and the no-`cons` branch discharges no local state at all,
+  which is the population `purgeSharedPending` already documents ("a 3.1.1 forced leave and
+  UNSUBSCRIBE's no-cons branch each strand transmitted entries with NEITHER view left"). The
+  remedy is expected to be F-082's applied here, with ONE thing re-derived rather than assumed:
+  an UNSUBSCRIBE removes its filters from `sharedSubs` **before** `commitUnsub` runs, so the
+  doomed key is already gone and F-082's staging exclusion does not transfer.
 
   - [ ] **The 3.1.1 forced leave's
   post-CONNACK destructive exit.** Also surfaced by F-050's review, and deliberately not

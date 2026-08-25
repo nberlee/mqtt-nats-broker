@@ -284,10 +284,9 @@ var censusInterpreters = map[string]string{
 	"cleanupFailedSubClassified":           "releases what a failed filter created; runs only when the rollback's persistence was CONFIRMED, so a group durable the record may still claim is never deleted",
 	"execDeferredConsumerDeleteClassified": "the irreversible half of a QoS downgrade, deferred until the packet's save is confirmed so a failed save can restore the pre-packet consumer; the classified form also reports whether either of its record writes was CAS-rejected, which a live SUBSCRIBE needs before it may open its transmission gate (F-078)",
 	"removeUnsubConsumer":                  "deletes an UNSUBSCRIBEd filter's consumer after its registrations are withdrawn, since a register landing afterwards would hold its identifier for the session's life",
-	"releaseSharedConsumerClassified":      "releases a group durable only when this session was the last holder",
+	"releaseSharedGroupTargetClassified":   "releases one group consumer BY NAME: this session's own delivery, pending and ack-budget state unconditionally, and the durable itself only when the last-holder scan reported it unheld. Keyed on the names rather than on a resident config because the failing attempt of a shared filter has not written its join to cons yet (F-082); the config form and the failed-filter release are both thin callers of it, which is why neither appears in this census any more",
 	"releaseSharedTeardownDurables":        "releases the group durables a teardown owed, after the record is gone so the last-holder scan does not count this session",
-	"sharedDurablesHeldByOthers":           "reads the record set to decide last-holder status; the answer authorizes an irreversible consumer delete",
-	"releaseFailedSharedFilter":            "unwinds a shared filter whose restoration failed, without asserting the membership was never stored",
+	"sharedDurablesHeldByOthers":           "reads the record set to decide last-holder status; the answer authorizes an irreversible consumer delete, and it merges 'another session holds it' with 'this session still holds it through another of its own keys' — a caller releasing its OWN state must separate the two (F-082)",
 	"drainingAllowed":                      "reads whether a stream-forced InactiveThreshold would reap a drained durable, refusing at RUNTIME because a startup check cannot see a limit imposed later",
 	"clearDrainInactivityTimers":           "clears the timers a drain armed once its durable is verified",
 

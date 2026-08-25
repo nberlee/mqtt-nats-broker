@@ -108,6 +108,24 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   connection. The inherited per-message guards are inert -- `mperms` has no writer
   anywhere and `checkDenySub` is a stub returning false.
   Details: [F-081](runtime-correctness.md#f-081).
+- Release a failed shared filter's own state independently of the last-holder answer.
+  Status: Closed. Release treatment: Alpha blocker.
+  Split out of the last-holder fail-closed change by its plan review. The failed-filter
+  release skipped its WHOLE body on a "held" answer, so a refusal withheld this session's
+  own cleanup as well as the group delete -- and it re-derived that work from `sess.cons`,
+  which the failing attempt has not written to yet, so on the common shape it discharged nothing
+  either way and the orphan ack-budget charge permanently consumed the resident session's
+  MaxAckPending budget. Closed by a three-way per-durable disposition (own-held, foreign or
+  refused, unheld) with the release keyed on the group consumer's deterministic names.
+  Details: [F-082](shared-qos2.md#f-082).
+- Release UNSUBSCRIBE's own shared state independently of the last-holder answer.
+  Status: Open. Release treatment: Alpha blocker.
+  Filed by F-082's consult as a separate caller with its own commit path. Three statements:
+  the local durable-scoped purge is not gated the way the delete is, so leaving one filter
+  strips state an overlapping surviving filter still needs; the staging half mixes a
+  cons-keyed barrier with a durable-keyed void snapshot; and the no-cons branch discharges
+  no local state at all.
+  Details: [F-083](shared-qos2.md#f-083).
 - Refuse a pre-release delayed-drain record shape instead of repairing it.
   Status: Open. Release treatment: Post-alpha cleanup.
   Filed by F-034's census. The compatibility boundary refuses an unsupported persisted

@@ -1,6 +1,8 @@
 package mqtt
 
 import (
+	"errors"
+	"sync/atomic"
 	"testing"
 )
 
@@ -109,6 +111,29 @@ func TestMQTTSharedLastHolderScanFailsClosed(t *testing.T) {
 			// and the scan answers "not held", which is the destructive answer.
 			testPlantSessionRecordJSON(t, e.asm, "impostorsubject",
 				testSharedConsRecord(clientID, "somegroup", "somesubject"))
+		}, true, true},
+		{"C7 indeterminate walk", func(t *testing.T, e *testOrphanEnv) {
+			// The one refusal arm that predates the other two and, until F-082, was pinned
+			// by NOTHING at either layer: the three sibling fixtures using this seam drive
+			// the PUBREL barrier scan and the in-flight walks, not this one. A record cannot
+			// express it — the walk has to fail — so the case arms the load seam instead of
+			// planting bytes, and asserts the seam actually fired, because a hook that
+			// silently never matched would leave this arm passing for the reason C1 passes.
+			var fired atomic.Bool
+			restore := setMQTTTestLoadNextMsgHook(func(stream, subject string, _ uint64) error {
+				if stream != mqttSessStreamName {
+					return nil
+				}
+				fired.Store(true)
+				return errors.New("test: session record walk unavailable")
+			})
+			t.Cleanup(func() {
+				restore()
+				if !fired.Load() {
+					t.Error("the $MQTT_sess walk seam never fired, so this case never reached " +
+						"the indeterminate arm")
+				}
+			})
 		}, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
