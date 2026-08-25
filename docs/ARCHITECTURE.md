@@ -3043,7 +3043,8 @@ canonical durable does not prove this broker still owns the membership the resto
 on. That is a separate fact needing a separate instrument, and the next section is it: on
 the CONNECT path every restoration of shared interest — whether it created, repaired or
 merely adopted — now proves ownership with a classified record write before the CONNACK. On
-the **live SUBSCRIBE** path nothing does, and that is F-078.
+the **live SUBSCRIBE** path is arbitrated by its own packet-scoped gate and the same
+classified proof (F-078, below).
 
 The window is narrowed, not closed: `CONSUMER.DELETE` and `CONSUMER.CREATE` are
 unconditioned, so a durable deleted or altered after the post-pass gets no further check on
@@ -3170,13 +3171,105 @@ point after the last verification or write, this write included, and only the ne
 detects it. A takeover *after* a landed write is the session-record watch's and its
 committed-read backstop's to converge.
 
-**The live SUBSCRIBE path is not arbitrated at all**, and that is F-078 rather than a
-residual of this design. It installs and revives the same interest with no ownership write,
-and closing it needs a packet-scoped transmission gate this path has no equivalent of,
-because the restore gate is already open on a live connection. The defect is the one `main`
-carries today; this change does not worsen it, but the repair does broaden the set of states
-that reach it — an authoritatively absent durable used to refuse the CONNECT outright and
-now yields a live, repaired connection.
+**The live SUBSCRIBE path is arbitrated by the section below** (F-078). It reaches the same
+interest by different routes and needs a packet-scoped transmission gate this path does not,
+because the restore gate is already open on a live connection.
+
+## A live SUBSCRIBE arbitrates its shared interest before it serves
+
+The section above proves ownership for the CONNECT/resume path. A live SUBSCRIBE reaches the
+same interest and, until F-078, revalidated nothing — so the consequence above was reachable
+on a connection that was never restoring at all. Three routes get there: the `!exists`
+create and its post-subscribe verify `CreateOrUpdate`; the resume fall-through, whose
+resident consumer entry survives a rollback that reset the membership map, so a later
+SUBSCRIBE subscribes on a remembered config having verified nothing; and the **refresh** arm,
+which revives delivery interest on an existing subscription by updating its mutable fields.
+All three are the same fact — *interest was touched* — which is why the trigger is that
+rather than "a durable was created".
+
+**The instrument is the same classified record write**, reused unchanged, under the packet's
+own record transaction and placed after the packet's final save and its optional affine
+unwind, so it is the last record write of the packet and its CAS linearizes where the packet
+left the record.
+
+**When it runs is a wider question than the trigger.** The gate opens without a proof only
+for a packet that committed no trigger **and** none of whose record writes was rejected by
+its per-subject CAS. The second half is load-bearing and not obvious: the early per-filter
+membership save converts a definite rejection into a per-filter failure code and
+continues, so a record that demonstrably *moved* leaves both the trigger and the returned
+error empty. Three further writes lose the same evidence — the affine provisioning save,
+the affine unwind, and the void-register verdict store, the last reached through two
+chains and through the failed-filter cleanup as well. A packet-local fact records them;
+the rejection marker they arm is only consulted before the *next* inbound packet, which is
+far too late for a delivery callback already running.
+
+**A CAS rejection, and nothing else, raises the question.** The distinction is evidential,
+and not cosmetic: a CAS rejection means the expected-sequence write was *refused*, which
+is positive evidence the subject moved; a definite local failure moved nothing and
+re-authorised nothing; and an ambiguous write is this broker's own bytes maybe-landing,
+which if they landed landed under its own CAS. Treating any failure as evidence turns an
+ordinary per-filter failure into a connection-level refusal, which is a contract the
+affine paths own rather than this one. The fact is read from the store-boundary detail,
+because the outward error is reformatted and loses its identity, and because the
+definite-failure classification deliberately merges a CAS rejection with a local failure
+and a refused transaction.
+
+**An AMBIGUOUS write does not withhold the gate either, and that ordering is deliberate.**
+The quiet check precedes the unresolved-write check, so a packet whose ancillary save went
+ambiguous opens the gate while the session still carries that write — and an unresolved
+write is an outcome nobody *read*, so it includes "CAS-rejected, response lost". It stands
+because a quiet packet installed **nothing**: with no trigger, no shared interest was
+created or revived, so the open releases only traffic backed by interest that *predates* the
+packet.
+Withholding it would give one packet type a stronger delivery guarantee than this broker
+provides for any other ambiguous record write, and it would turn an ambiguous affine
+provisioning failure into a connection-level refusal — the contract the affine paths own,
+which the wider trigger predicate already broke once. The read loop does attempt resolution
+synchronously before the failure SUBACK is enqueued, but that attempt can itself return
+unresolved, so the exposure is stated as a residual rather than as a bounded window.
+
+**The transmission gate.** Armed before the packet installs anything — before the PUBREL and
+affine subscriptions a shared QoS 2 filter provisions — and resolved exactly once through
+a defer, so an error path or an abnormal unwind cannot leave it pending. It is scoped to the
+connection that armed it *and* to a per-session generation: the first stops an abandoned
+verdict crossing into the next connection, the second stops a waiter that watched one packet's
+gate from escaping the next packet's — **up to that waiter's final read**, which is the
+honest boundary: a gate published before the read is observed by it, and a waiter past it
+is the final-check residual the generation does not reach. Its terminal state is a single
+CAS, unlike the restore
+gate's store-then-CAS pair, because this gate has more terminal paths and a losing opener
+must not be able to flip a withheld verdict to open.
+
+All four delivery callbacks consult **both** gates, and the three that can wait — QoS 1/2
+delivery, PUBREL and the affine copy — do it through **one** wait under **one absolute
+deadline**, re-reading the current generation on each pass; two sequential waits would permit
+nearly twice the intended cap. The fourth, shared QoS 0, consults the same two verdicts
+without waiting on either and **drops**, as it does for the restore gate. Plain QoS 0
+stays ungated: it acknowledges nothing on the group's behalf.
+
+**The disposition follows the two existing precedents rather than inventing a third.** A
+demonstrated takeover disposes and discards the Will exactly as a local takeover does, then
+notifies `0x8E` and closes — and the packet returns *nothing* to the parser, because speaking
+again would race the displacer for the reason the client is left with. Every other
+non-owning outcome — a sibling that erased our write, a definite local failure, an
+unresolvable ambiguity — neither disposes nor discards: none of them demonstrates another
+owner, so the client is told `0x89` "try again" and the session is left intact.
+
+**Every non-Foreign close consumes the Will while the ownership gate is still held**, rather
+than leaving it to the ordinary close. A record-observation eviction can detach the session
+in between, and the detached path publishes only an already-owed *immediate* Will — so a
+delayed one would never reach the durable outbox. The Will disposition is consumed exactly
+once, so the later close's own attempt is inert; nothing else about that close changes.
+
+**An ambiguous proof is resolved by the packet itself, under the gate it already holds.**
+Releasing first would let the periodic pass — which resolves *bound* uncertain sessions —
+classify it first and apply the generic policy, which disposes on a forked verdict. A forked
+resolution therefore retires the uncertainty *without* disposing: it clears the pending write
+and discards the continuations that were owed only if those bytes had landed, leaves the
+void-register revision uncredited, and leaves the sequence, lineage and record body at the
+acknowledged base, because at forked those bytes demonstrably are not the record. Without
+that retirement the close would park a teardown that a later generic disposal consumes,
+losing the Will.
 
 ## The restore gate: the CONNACK follows a complete restoration
 

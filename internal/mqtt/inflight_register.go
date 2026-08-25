@@ -1848,10 +1848,23 @@ type mqttVoidedReg struct {
 //
 // Session lock NOT held on entry: each of these issues JetStream requests.
 func (sess *mqttSession) deleteInflightRegisters(c *client, tok recordTx, voided []mqttVoidedReg) {
-	if sess.voidRegistersOnStream(c, voided) && !sess.proveVoidedRegs(c, tok) {
+	_ = sess.deleteInflightRegistersClassified(c, tok, voided)
+}
+
+// deleteInflightRegistersClassified is deleteInflightRegisters reporting whether its record
+// write was rejected by the per-subject CAS. Same reason as
+// secureRegCancellationsClassified: this is the SECOND chain that reaches proveVoidedRegs,
+// and a rule that covered only the first would leave the hole open through this one.
+func (sess *mqttSession) deleteInflightRegistersClassified(c *client, tok recordTx, voided []mqttVoidedReg) bool {
+	if !sess.voidRegistersOnStream(c, voided) {
+		return false
+	}
+	proven, casRejected := sess.proveVoidedRegs(c, tok)
+	if !proven {
 		mqttErrorf(c, "MQTT: the void-register verdict(s) of client %q are not durably recorded yet; "+
 			"the next convergence point retries", sess.id)
 	}
+	return casRejected
 }
 
 // voidRegistersOnStream is deleteInflightRegisters' ladder over the REGISTER STREAM
@@ -2248,8 +2261,21 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoide
 //
 // Session lock NOT held on entry: this issues JetStream requests.
 func (sess *mqttSession) secureRegCancellations(c *client, tok recordTx, cancels []mqttRegCancellation) bool {
+	secured, _ := sess.secureRegCancellationsClassified(c, tok, cancels)
+	return secured
+}
+
+// secureRegCancellationsClassified is secureRegCancellations with the record write's CAS
+// verdict preserved, for the live SUBSCRIBE path.
+//
+// A packet that arms the operation gate, downgrades a plain consumer successfully, and then
+// meets a remote takeover during this late record write would otherwise reach the tail with
+// no trigger and no visible failure — and open the gate while the session's SURVIVING shared
+// subscriptions serve under a membership another broker now owns. That is the same
+// destructive shape as the early membership save's.
+func (sess *mqttSession) secureRegCancellationsClassified(c *client, tok recordTx, cancels []mqttRegCancellation) (bool, bool) {
 	if !sess.tombstoneCancellationsOnStream(c, cancels) {
-		return true
+		return true, false
 	}
 	return sess.proveVoidedRegs(c, tok)
 }
@@ -2281,26 +2307,34 @@ func (sess *mqttSession) tombstoneCancellationsOnStream(c *client, cancels []mqt
 // verdicts, saving it if it does not.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) proveVoidedRegs(c *client, tok recordTx) bool {
+// The second result reports whether the record-borne fallback below was rejected by its
+// PER-SUBJECT CAS. That is the one failure here carrying ownership evidence — the record
+// demonstrably moved — and a live SUBSCRIBE must not open its transmission gate as "quiet"
+// after it. It cannot be recovered from the bool: proven-or-not merges a CAS rejection with
+// a local failure and an ambiguity. See mqttSubPacketFacts.recordCASRejected.
+func (sess *mqttSession) proveVoidedRegs(c *client, tok recordTx) (bool, bool) {
 	sess.mu.Lock()
 	rev, saved := sess.voidedRegsRev, sess.voidedRegsSavedRev
 	sess.mu.Unlock()
 	if rev == saved {
-		return true
+		return true, false
 	}
 	if tok == (recordTx{}) {
-		return sess.persistVoidedRegs(c)
+		return sess.persistVoidedRegs(c), false
 	}
 	// The caller's transaction, since these paths hold their packet's fence and a
 	// transaction of our own would simply be refused. An ambiguous outcome counts as not
 	// proven: the caller withholds its irreversible step and the readback settles it.
-	if err := sess.save(tok); err != nil {
+	//
+	// saveWithDetail rather than save: the outward error cannot answer the CAS question,
+	// because persistRecord formats the store error with %v and destroys its NATS identity.
+	if detail, err := sess.saveWithDetail(tok); err != nil {
 		mqttWarnf(c, "MQTT: could not persist the void-register verdicts of client %q: %v", sess.id, err)
-		return false
+		return false, mqttIsRecordCASRejection(detail.rawErr)
 	}
 	// The save credited the revision it marshalled — at least rev, since the set can only
 	// have grown since the sample above. See creditVoidedRegsLocked.
-	return true
+	return true, false
 }
 
 // markInflightRegisterCancelledPending writes the cancellation tombstone of an allocation

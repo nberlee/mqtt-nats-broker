@@ -18,7 +18,8 @@
 // prove this broker still owns the membership the restore is keyed on. That fact needs its
 // own instrument, and F-077 added it: on the CONNECT path a classified record write proves
 // ownership before the CONNACK (shared_group_arbitrate.go). On the LIVE SUBSCRIBE path
-// nothing does, which is F-078.
+// nothing did, which was F-078 — now closed: the live path arbitrates through its own
+// packet-scoped gate and the same classified proof. See sub_operation_gate.go.
 //
 // The verification arm still issues no group-durable write of its own. What changed with
 // F-077 is which verdicts it may hand on to a repair: an AUTHORITATIVE ABSENCE is

@@ -339,7 +339,8 @@ func TestSharedGroupCreateCensus(t *testing.T) {
 // operation that raised it.
 //
 // A fact parked on mqttSession would govern the NEXT operation on the same object, which is
-// exactly the stale-generation defect F-078 has to solve for its packet gate. The mutation
+// exactly the stale-generation defect F-078 solved for its packet gate, by scoping it to the
+// connection AND a per-session generation. The mutation
 // this kills is the stale form specifically: a session field that is reset per invocation
 // behaves correctly, so the mutation must omit the reset to be the defect (M3b).
 func TestSharedOwnershipTriggerIsStackLocal(t *testing.T) {

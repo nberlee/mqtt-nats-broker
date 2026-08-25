@@ -40,9 +40,12 @@
 // docs/CONFORMANCE.md carries it.
 //
 // SCOPE. This file is the CONNECT/resume half. A live SUBSCRIBE installs and revives the
-// same interest with no arbitration at all, which is F-078: it needs a packet-scoped
-// transmission gate this path does not, because the restore gate already withholds
-// everything until the CONNACK.
+// same interest, and it USED to do so with no arbitration at all; that was F-078, and it
+// now runs this same classified write as the packet's last record write, behind a
+// packet-scoped transmission gate this path does not need because the restore gate already
+// withholds everything until the CONNACK. See sub_operation_gate.go. The trigger differs:
+// this path arbitrates on interestRestored alone, the live path also on a swallowed
+// per-subject CAS rejection.
 //
 // See docs/ARCHITECTURE.md, "A restored shared membership is arbitrated against the
 // record".
@@ -83,7 +86,8 @@ type mqttSharedJoinResult struct {
 	//
 	// It is aggregated on the CALLER'S STACK, never on the session: a fact parked on
 	// mqttSession outlives the operation that raised it and would govern the next one,
-	// which is exactly the stale-generation defect F-078 has to solve for its packet gate.
+	// which is exactly the stale-generation defect F-078 solved for its packet gate, by
+	// scoping the gate to the connection AND a per-session generation.
 	installed bool
 }
 

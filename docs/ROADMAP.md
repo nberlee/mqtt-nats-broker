@@ -812,16 +812,18 @@ further findings it surfaced are filed separately, for the reason its own bullet
   the current behaviour is described: the "no self-repair" residual is closed for the
   authoritatively-absent verdict (that one is now recreated) and retained for the other two,
   and ownership is proven on the CONNECT path by a classified record write — while the live
-  SUBSCRIBE path stays unarbitrated as F-078. Read this bullet as the account of what F-076
+  SUBSCRIBE path was left unarbitrated as F-078, which has since landed. Read this bullet
+  as the account of what F-076
   itself established, not as the current contract. **Refuted and recorded:** re-issuing the
   remembered config, blind canonical `CreateOrUpdate`, any-error-means-absent, a short field
   allowlist, copying the normalized fields, and dropping the local entry so the next CONNECT
   recreates. Residuals in `docs/CONFORMANCE.md`: the delivery gap is not repaired, and the
   proof is fresh but not atomic.
 
-  - [ ] [F-077: Arbitrate
+  - [x] [F-077: Arbitrate
   ownership after any shared group durable create](findings/shared-qos2.md#f-077).
-  **Alpha blocker. The CONNECT half is done; the box stays open on F-078.** Split out of
+  **Alpha blocker — DONE.** The CONNECT half landed in `5cc8081`; the box stayed open on
+  F-078, which has now landed and closes it. Split out of
   F-076 by a scope consult, and **a defect on `main` rather than one F-076 introduced**: no
   route that restores shared group interest revalidated that this broker still owns the
   membership it was keyed on, so a superseded broker can serve — and ACKNOWLEDGE — group
@@ -853,15 +855,97 @@ further findings it surfaced are filed separately, for the reason its own bullet
   `releaseSharedConsumer` refunds a historic charge through an already-rejected transaction.
   A refused resume is closed SILENTLY — the displacement DISCONNECT is gated on the CONNACK
   having been written. `make cluster-failover-tests`' regex is extended here, so F-078's
-  replicated case is visible when it lands. **What keeps the box open: F-078**, the live
-  SUBSCRIBE path, which installs and revives the same interest with no ownership write at
-  all. The CONNECT path needs no transmission gate because the restore gate already
-  withholds everything until the CONNACK; the live path has no equivalent and that is the
+  replicated case is visible when it lands. **What kept the box open was F-078**, the live
+  SUBSCRIBE path, which installed and revived the same interest with no ownership write at
+  all — and which has since landed, closing this box with it. The CONNECT path needs no
+  transmission gate because the restore gate already withholds everything until the
+  CONNACK; the live path has no equivalent and that is the
   whole reason it is a separate item. Note also that the repair BROADENS the population
-  reaching the unarbitrated live path.
+  reaching the live path, which F-078 now arbitrates.
 
-  - [ ] [F-078: Arbitrate a live SUBSCRIBE's shared interest before it
-  serves](findings/shared-qos2.md#f-078). **Alpha blocker.** The live half of F-077, split
+  - [x] [F-078: Arbitrate a live SUBSCRIBE's shared interest before it
+  serves](findings/shared-qos2.md#f-078). **Alpha blocker — DONE.** A live SUBSCRIBE now
+  proves this broker still owns the membership before anything it touched may serve. What
+  is withheld until that proof lands is stated exactly, because one class is deliberately
+  exempt: the connection's QoS 1/2, PUBREL and affine deliveries WAIT, its **shared**
+  QoS 0 ones are DROPPED, and its **plain** QoS 0 ones keep flowing. A plain QoS 0
+  delivery acknowledges nothing on the group's behalf, so gating it would lose messages
+  while protecting nobody, and a mixed packet therefore authorises plain QoS 0 traffic
+  before the proof lands. `TestLiveSubPlainQoS0IsNotGated` requires that exemption
+  positively. **What landed:** the
+  same classified record write F-077 uses, reused unchanged, placed as the packet's LAST
+  record write; a packet-scoped transmission gate armed before the packet installs
+  anything, scoped to the CONNECTION and a per-session GENERATION and resolved by exactly
+  one CAS through a defer that survives `runtime.Goexit`; ONE combined wait over that gate
+  and the restore gate under ONE absolute deadline, which replaced `awaitRestoreGate`
+  entirely (deleted — two mechanisms stated one fact); and a disposition tail following the
+  two existing precedents, Foreign disposing and closing with 0x8E while every other
+  non-owning outcome says 0x89 and disposes nothing. **The trigger is wider than F-077's,
+  and that is the subtle half:** the gate opens without a proof only for a packet that
+  committed no trigger AND none of whose record writes was rejected by its **per-subject
+  CAS**, because FOUR record writes in a SUBSCRIBE lose that evidence before the caller
+  sees it — the early membership save converts a definite rejection into a per-filter code
+  and continues, and the affine provisioning save, the affine unwind and the void-register
+  store each swallow their own, the last through two chains AND through the failed-filter
+  cleanup. A packet-local fact carries them. **Only a CAS rejection counts:** a local or
+  ambiguous failure is evidence about nothing (an ambiguity is our own bytes maybe-landing
+  under our own CAS), and treating any failure as evidence turned an ordinary per-filter
+  failure into a connection-level refusal and broke 1352 ported-suite tests — a contract
+  the affine items own, not this one. **The Will is consumed under the held gate on every
+  non-Foreign close**, because a record-observation eviction can detach the session first
+  and the detached path publishes only an already-owed IMMEDIATE Will. **An ambiguous proof
+  is resolved by the packet itself under the gate it already holds** — releasing first lets
+  the periodic pass, which resolves BOUND uncertain sessions, apply its generic policy,
+  which disposes on forked; a forked resolution therefore retires the uncertainty WITHOUT
+  disposing, discarding the landed-only continuations and leaving the void revision
+  uncredited and the sequence, lineage and body at the acknowledged base. **Residuals** in
+  `docs/CONFORMANCE.md`: a delivery admitted before the arm can still escape the gate
+  (bounded, with the direction stated — it can only be interest predating the packet); the
+  gate's collateral cost to the connection's other traffic; and the window between a
+  foreign verdict and the detach. **Follow-up coverage, accepted as non-blocking and NOT
+  claimed as done:** the four ack arms at the ownership-CAS boundary with a second-member
+  oracle; the resume fall-through chain end to end; a **shared** QoS 0 drop (only the plain
+  control is asserted — the paired half needs a v5 fixture, since shared subscriptions are
+  MQTT 5.0 and a 3.1.1 attempt failed its own positive control); PUBREL and affine inside
+  the window; a mixed packet; the disposal-ordering assertion with an
+  exactly-one-DISCONNECT oracle; forked-keeps-the-Will with the Will armed, in both
+  forms; and **the eventual-Foreign arm**, which needs a SECOND BROKER — a local
+  contender cannot interleave a takeover while the SUBSCRIBE holds the session's
+  ownership gate — so the single-broker fixture reaches the unclassified arm only.
+  What DID land is TWO end-to-end oracles plus the gate's unit invariants, and they cover
+  different arms. The replicated production-order fixture drives a live SUBSCRIBE against
+  a real second-broker takeover and requires A's FIRST packet to be DISCONNECT **0x8E**,
+  the Foreign arm's own vocabulary and reachable from nowhere else in the tail, which pins
+  the **verdict**: "not a SUBACK" was too weak, and a mutation collapsing Foreign into a
+  non-disposing refusal passed the earlier form. The disposal's own **state effects stay
+  unproved there** — a tail that said 0x8E and disposed nothing would still pass, because
+  the second member preserves the durable and the delivery on its own — and they stay with
+  the owed disposal-ordering and forked-keeps-the-Will fixtures below. The single-broker
+  fixture covers the **unclassified** arm, where the wire output cannot discriminate at
+  all — the discriminating signal there is the store-attempt count on an unchanged
+  re-SUBSCRIBE: exactly two, the proof and the tail's own byte-identical reattempt, so a
+  third store means the generic resolver re-ran what the tail had settled. A THIRD fixture
+  pins the quiet branch's ORDERING as correct: a review round read it as a defect, since
+  a packet whose ancillary save went AMBIGUOUS opens the gate while the session carries an
+  unresolved write. Withholding there was implemented, measured and **reverted** — it takes
+  the ported suite from 0 failures to **1355**, since it turns an ambiguous affine
+  provisioning failure into a connection-level refusal, the contract the affine items own.
+  The consult REFUTED the finding rather than deferring it: a quiet packet installed
+  nothing, so its open releases only traffic backed by interest predating the packet, the
+  convergence window `docs/CONFORMANCE.md` documents and now names this case in. **Eleven**
+  mutations kill their paired tests, one of them added because the later-generation unit test
+  was flaky: it asserted that the generation blocks a gate published before the waiter's
+  SEND, where the code closes one published before its final READ, so a correct waiter failed
+  it 26 times in 200 runs. A pre-wait seam made the property measurable and narrowed the
+  claim to the boundary the code actually holds.
+  **Refuted and recorded so none returns:** a
+  per-subscription flag (F-050's first refutation — there is no subscription to hang it on);
+  copying the restore gate's store-then-CAS ordering; releasing the gate and re-acquiring
+  it
+  around resolution; and treating a fence-busy resolution as a terminal outcome.
+
+  The **superseded** description of the open defect follows, kept because it carries the
+  analysis the fix rests on. The live half of F-077, split
   out by a non-convergence escalation after three plan rounds each re-cut the same seam and
   every finding of the third faulted the mechanism the second had just introduced. *The
   finding:* a live SUBSCRIBE that installs or revives shared group delivery interest serves

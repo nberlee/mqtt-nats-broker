@@ -2572,10 +2572,18 @@ committed-read backstop's convergence window rather than an admission check.
 **The proof does not extend to the consumer.** `CONSUMER.CREATE` and `CONSUMER.DELETE` carry
 no precondition field, so nothing binds the durable's existence to the record's ownership.
 A durable deleted — or altered into a shape this broker would not provision — at any point
-after the last verification or write receives no further check on that CONNECT, the interval
-between the ownership write and the CONNACK included. Only the next resume detects it.
+after the last verification or write receives no further check on that operation — the
+interval between the ownership write and the CONNACK on a resume, and between the ownership
+write and the SUBACK on a live SUBSCRIBE. What detects it later is an operation reaching
+the create-and-verify arm: a resume, whose pre-pass classifies every resident shared sid,
+or a SUBSCRIBE for a filter this session holds no resident entry for, which creates the
+durable and thereby proves it. A **re**-SUBSCRIBE on a filter the session already holds
+takes the refresh arm and verifies nothing.
 
-**A durable this broker created and then lost the arbitration for is left in place.** Every
+**A durable this broker created and then lost the arbitration for is left in place** — on
+**either** path. The live SUBSCRIBE's `!exists` create and its post-subscribe verify
+`CreateOrUpdate` produce the same state as a resume's, and the verify create can move
+group-wide settings before the arbitration is lost. Every
 available deletion is refuted: the last-holder scan skips same-client-ID records, so after
 a takeover a blind last-holder delete destroys the **new** owner's durable. Leaving it is
 the least unsafe option and it is not inert — it holds stream interest, it can accumulate
@@ -2591,18 +2599,48 @@ fails *verification* still gets the v5 failure CONNACK naming it; generalising t
 to the ownership, register-recovery, reconciliation and lifetime refusals is a roadmap item
 of its own.
 
-**A live SUBSCRIBE is not arbitrated at all.** It installs and revives the same shared group
-interest with no ownership write, so a superseded broker can acknowledge group messages under
-a membership the record no longer carries. This is the defect `main` carries today, unchanged
-by F-077 and unmasked by it, and it is **F-078** — closing it needs a packet-scoped
-transmission gate the CONNECT path has no equivalent of, because the restore gate is already
-open on a live connection. F-077's repair does **broaden the population that reaches it**:
-an authoritatively absent durable used to refuse the CONNECT outright and now yields a
-live, repaired connection.
+**A delivery admitted before the operation gate was armed can still escape it.** A live
+SUBSCRIBE arms its gate before it installs anything, but a delivery callback that has
+already completed its final gate check and is then descheduled before its irreversible send
+cannot observe a gate armed in between — there is no further wake, and shared QoS 0 does not
+wait at all. Worked: a QoS 1/2 callback reads both gates open and is descheduled; the
+readLoop begins a shared SUBSCRIBE and arms generation N; the callback resumes and
+transmits. **The direction is what bounds it**: because arming precedes every install, that
+callback was admitted by interest which *predates* the packet — authorised by whatever
+operation installed it, the CONNECT that F-077 arbitrates or an earlier SUBSCRIBE that this
+one does — and never by the un-arbitrated interest the packet is about to install. It
+therefore belongs to the point-in-time-ownership convergence window below, not to F-078's
+new-interest guarantee. Closing it entirely needs a real callback-admission boundary, whose
+cheap form (a counter registered after the check) is already refuted: a callback can be
+descheduled between loading the verdict and registering.
+
+**The operation gate's collateral cost.** While a shared SUBSCRIBE is unresolved, the
+connection's *other* QoS 1/2, PUBREL and affine deliveries wait too, and its shared QoS 0
+deliveries are dropped rather than waited on — the gate is packet-scoped, not
+subscription-scoped, because a shared QoS 2 SUBSCRIBE installs delivery interest before any
+subscription exists to hang a flag on. Plain QoS 0 is ungated throughout. A mixed packet
+therefore gates plain QoS 1/2 traffic on a shared filter's arbitration.
+
+**A foreign verdict leaves a brief window before the session is detached.** Between the
+verdict and `sess.c` being cleared, the session's other shared subscriptions are still live.
+
+**A quiet packet opens its gate even when it left an ancillary record write ambiguous.** A
+live shared SUBSCRIBE whose filters all fail may leave such a write behind without installing
+or reviving any shared membership — a shared QoS 2 filter provisions the session-affine
+delivery path before the group consumer is created, so a provisioning save whose outcome is
+never learnt fails the *filter* and continues. Its operation gate opens, because the packet
+created no shared interest for the arbitration to be about. The read loop attempts uncertainty
+resolution synchronously before enqueueing the failure SUBACK, but **that attempt can itself
+return unresolved**, in which case the session stays uncertain and existing delivery interest
+may go on serving until ordinary settlement or an ownership observation converges. That
+interest predates the packet and belongs to the point-in-time-ownership convergence window
+above; F-078 makes no stronger guarantee for it, and withholding it here would give one packet
+type a guarantee this broker provides for no other ambiguous record write — while converting
+an ambiguous affine provisioning failure into a connection-level refusal, which is a contract
+the affine items own.
 
 **What the verification establishes, and what it does not.** It is evidence about the
-durable's *configuration*. Ownership is the ownership write's to establish, and only for the
-CONNECT path.
+durable's *configuration*. Ownership is the ownership write's to establish.
 
 **An unsupported record shape is refused rather than repaired.** A session record
 carrying a shared group consumer configuration in `Cons` is a format this broker never

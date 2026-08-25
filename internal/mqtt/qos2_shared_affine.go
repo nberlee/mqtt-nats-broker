@@ -1665,11 +1665,19 @@ func (sess *mqttSession) closeQ2AffAndDrain() (gen, durable string) {
 // explicitly rather than inferred — see sess_recordtx.go.
 //
 // Runs from the client's readLoop. sess.mu not held on entry.
-func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recordTx) error {
+// The bool result reports whether THIS call's own session-record save was rejected by its
+// per-subject CAS. Its caller in a live SUBSCRIBE needs that specific fact: a CAS rejection
+// is positive evidence the record MOVED, while the bare error below also covers consumer
+// creation, the delivery subscription, validation and a test seam — none of which write the
+// record at all. See mqttSubPacketFacts.recordCASRejected.
+func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recordTx) (bool, error) {
+	// casRejected is this call's own record-write verdict; see the doc comment.
+	var casRejected bool
+
 	sess.mu.Lock()
 	if sess.q2AffClosing {
 		sess.mu.Unlock()
-		return fmt.Errorf("session is terminating")
+		return casRejected, fmt.Errorf("session is terminating")
 	}
 	idHash, id := sess.idHash, sess.id
 	gen := sess.q2AffGen
@@ -1680,20 +1688,20 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 	sess.mu.Unlock()
 
 	if ready && subscribed && existing != nil {
-		return nil
+		return casRejected, nil
 	}
 
 	// A persisted consumer with no generation is unaccountable state: we can
 	// neither derive the names it owns nor safely replace it. Refuse.
 	if existing != nil && gen == _EMPTY_ {
-		return fmt.Errorf("session %q has a persisted affine QoS 2 consumer %q with no generation; refusing to resume it", id, existing.Durable)
+		return casRejected, fmt.Errorf("session %q has a persisted affine QoS 2 consumer %q with no generation; refusing to resume it", id, existing.Durable)
 	}
 	minted := gen == _EMPTY_
 	if minted {
 		gen = mqttNewQ2AffGen()
 	} else if existing != nil {
 		if err := mqttValidateQ2AffineNames(existing, idHash, gen); err != nil {
-			return fmt.Errorf("session %q has an unaccountable affine QoS 2 consumer: %w", id, err)
+			return casRejected, fmt.Errorf("session %q has an unaccountable affine QoS 2 consumer: %w", id, err)
 		}
 	}
 	_, deliver, durable := mqttQ2AffineNames(idHash, gen)
@@ -1718,7 +1726,7 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 	charge := existing == nil
 	if charge {
 		if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
-			return fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v", after, mqttMaxAckTotalLimit)
+			return casRejected, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v", after, mqttMaxAckTotalLimit)
 		}
 	}
 
@@ -1781,7 +1789,7 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 		if err != nil {
 			c.Errorf("Unable to create subscription for the affine QoS 2 consumer on %q: %v", deliver, err)
 			rollback()
-			return err
+			return casRejected, err
 		}
 		didSubscribe = true
 		sess.mu.Lock()
@@ -1811,13 +1819,13 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 	if err != nil {
 		c.Errorf("Unable to add the affine QoS 2 JetStream consumer for client %q: %v", id, err)
 		rollback()
-		return err
+		return casRejected, err
 	}
 	if resp != nil && resp.ConsumerInfo != nil {
 		if verr := mqttValidateQ2AffineNames(resp.Config, idHash, gen); verr != nil {
 			c.Errorf("The affine QoS 2 consumer for client %q does not match its expected identity: %v", id, verr)
 			rollback()
-			return verr
+			return casRejected, verr
 		}
 	}
 	sess.mu.Lock()
@@ -1832,7 +1840,11 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 	// that no record names is unfindable after a restart, so its copies would be
 	// stored into a subject nothing will ever deliver from.
 	if existing == nil {
-		outcome, err := sess.saveClassified(tok)
+		outcome, sdetail, err := sess.saveClassifiedDetail(tok)
+		// The one failure here that carries ownership evidence.
+		if mqttIsRecordCASRejection(sdetail.rawErr) {
+			casRejected = true
+		}
 		if err != nil {
 			c.Errorf("Unable to persist the affine QoS 2 consumer for client %q: %v", id, err)
 			// Undo only when the write DEFINITELY did not land. An ambiguous one may
@@ -1865,13 +1877,13 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 					sess.retainOnLanded(func(rtok recordTx) { sess.unwindProvisionedQ2AffineOnLanded(c, rtok) })
 				}
 			}
-			return err
+			return casRejected, err
 		}
 	}
 	sess.mu.Lock()
 	sess.q2AffReady = true
 	sess.mu.Unlock()
-	return nil
+	return casRejected, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2995,13 +3007,13 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	// copy refused here before trackPublish is exactly that finding's
 	// offered-but-never-transmitted population. Waiting is what keeps the ordinary
 	// case out of it. See sess_restore_gate.go.
-	switch sess.awaitRestoreGate(cc) {
-	case mqttRestoreGateWithheld:
+	switch sess.awaitTransmissionGates(cc) {
+	case mqttTransmissionWithheld:
 		mqttTestRestoreGateBlockedHook("affine")
 		return
-	case mqttRestoreGateTimedOut:
+	case mqttTransmissionTimedOut:
 		// NAK rather than simply returning: an affine copy carries no withheld
-		// marker, so nothing else would re-drive it. See mqttRestoreGateTimedOut.
+		// marker, so nothing else would re-drive it. See mqttTransmissionTimedOut.
 		mqttTestRestoreGateBlockedHook("affine")
 		sess.jsa.sendMsg(reply, AckNak)
 		return

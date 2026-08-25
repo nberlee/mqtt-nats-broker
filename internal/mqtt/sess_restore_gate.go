@@ -15,7 +15,6 @@ package mqtt
 
 import (
 	"sync/atomic"
-	"time"
 )
 
 // The success CONNACK follows a complete restoration, or the CONNECT is refused.
@@ -152,20 +151,20 @@ func (sess *mqttSession) abandonRestoreGate() {
 	}
 }
 
-// mqttRestoreGateVerdict is what a delivery callback learns by consulting the
+// mqttTransmissionVerdict is what a delivery callback learns by consulting the
 // verdict.
-type mqttRestoreGateVerdict int
+type mqttTransmissionVerdict int
 
 const (
-	// mqttRestoreGateOpen: no restore is in progress, or this one succeeded.
+	// mqttTransmissionOpen: no restore is in progress, or this one succeeded.
 	// Transmission is allowed.
-	mqttRestoreGateOpen mqttRestoreGateVerdict = iota
-	// mqttRestoreGateWithheld: the restore RESOLVED without opening — the CONNECT
+	mqttTransmissionOpen mqttTransmissionVerdict = iota
+	// mqttTransmissionWithheld: the restore RESOLVED without opening — the CONNECT
 	// was refused. The caller must not send the delivery, and — where its message
 	// class carries DUP — must record it as withheld so the attempt that finally
 	// goes out is still a first transmission [MQTT-3.3.1-1].
-	mqttRestoreGateWithheld
-	// mqttRestoreGateTimedOut: the wait's bound expired while the restore was still
+	mqttTransmissionWithheld
+	// mqttTransmissionTimedOut: the wait's bound expired while the restore was still
 	// working, so nothing is decided yet.
 	//
 	// Distinct from Withheld because the two owe JetStream different things. The
@@ -175,46 +174,18 @@ const (
 	// long before any redelivery — so a class that carries no withheld bookkeeping
 	// must NAK, or an owed PUBREL or affine copy sits unsent for the rest of that
 	// AckWait even though the resume went on to SUCCEED. Found by holistic round 6.
-	mqttRestoreGateTimedOut
+	mqttTransmissionTimedOut
 )
 
-// awaitRestoreGate is the whole of a delivery callback's dealing with the verdict.
+// A delivery callback does NOT consult this gate on its own. It calls
+// awaitTransmissionGates, which waits on this verdict and the live SUBSCRIBE packet's
+// together under one absolute deadline (F-078). Two sequential waits would permit nearly
+// twice the intended cap, and a callback that satisfied only one of them could transmit
+// under interest the other had not authorised.
 //
-// It WAITS rather than dropping, bounded by the same deadline the reconciliation
-// phase's gate uses (past which JetStream re-pushes the message anyway, so
-// waiting buys nothing and a dead CONNECT cannot park a delivery goroutine
-// forever). Waiting rather than skipping is what keeps a resume's backlog as
-// first deliveries, in order, at CONNACK speed.
-//
-// Callers must hold NO session lock: the CONNECT goroutine needs sess.mu to
-// finish, and every condition the caller checked before this must be
-// re-evaluated afterwards.
-//
-// QoS 0 does not call this — it has no redelivery, so parking a NATS delivery
-// goroutine for it would buy nothing; it consults restoreGateBlocksQoS0 instead.
-func (sess *mqttSession) awaitRestoreGate(cc *client) mqttRestoreGateVerdict {
-	g := sess.restoreGate.Load()
-	if g == nil || g.opened.Load() {
-		return mqttRestoreGateOpen
-	}
-	timer := time.NewTimer(mqttPhaseGateWaitFor(cc))
-	select {
-	case <-g.done:
-	case <-timer.C:
-	}
-	timer.Stop()
-	if g.opened.Load() {
-		return mqttRestoreGateOpen
-	}
-	// `resolved` is CAS'd true before either transition closes the channel, and the
-	// open path stores `opened` before that — so having reached here, a resolved
-	// verdict means the CONNECT was refused and an unresolved one means this wait
-	// simply ran out while the restore was still going.
-	if g.resolved.Load() {
-		return mqttRestoreGateWithheld
-	}
-	return mqttRestoreGateTimedOut
-}
+// The single-gate wait this file used to export was deleted when that combined wait landed:
+// it had no production caller left, and two mechanisms stating "may this connection transmit
+// yet" is exactly the redundancy that grows a seam between them. See sub_operation_gate.go.
 
 // mqttFirstUnrestoredFilter reports the first filter whose restoration reported a
 // failure, or nil when none did.

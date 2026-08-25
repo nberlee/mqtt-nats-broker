@@ -434,7 +434,7 @@ var (
 	// AckWait above it the wait ends long before any redelivery, which is why a
 	// timed-out wait is a DISTINCT verdict from a refusal and why the two classes
 	// carrying no withheld marker (PUBREL, affine copies) NAK on it rather than
-	// returning. See mqttRestoreGateTimedOut and mqttSub.phaseGate.
+	// returning. See mqttTransmissionTimedOut and mqttSub.phaseGate.
 	mqttPhaseGateWaitMax = 30 * time.Second
 )
 
@@ -1620,7 +1620,18 @@ type mqttSession struct {
 	// by every delivery callback BEFORE it touches sub.mqtt. Atomic rather than
 	// lock-guarded because a PUBREL can enter its callback before the subscription
 	// it arrived on has any metadata at all. See sess_restore_gate.go.
-	restoreGate    atomic.Pointer[mqttRestoreGate]
+	restoreGate atomic.Pointer[mqttRestoreGate]
+	// subGate is the CURRENT live-SUBSCRIBE packet's "nothing this packet touched may be
+	// transmitted yet" verdict, and subGateGen mints its generation. Both are in-memory
+	// only. Atomic for the same reason restoreGate is: a PUBREL can enter its callback
+	// before the subscription it arrived on has any metadata at all.
+	//
+	// A waiter must satisfy the gate's OWNER and GENERATION, not merely a non-nil pointer
+	// — see mqttSubGate, where the two together are what keep an abandoned verdict from
+	// crossing into the next connection and a waiter from escaping the next packet's
+	// gate, up to that waiter's final read. See sub_operation_gate.go.
+	subGate        atomic.Pointer[mqttSubGate]
+	subGateGen     atomic.Uint64
 	pubRelConsumer *ConsumerConfig
 	// pubRelVerified is the PUBREL path's equivalent of q2AffReady: this connection
 	// has PROVEN the durable exists, rather than trusting a config restored from the
@@ -3122,8 +3133,28 @@ func (c *client) mqttParse(buf []byte) error {
 				c.traceInOp("SUBSCRIBE", errOrTrace(err, mqttSubscribeTrace(pi, filters)))
 			}
 			if err == nil {
-				subs, err = c.mqttProcessSubs(filters)
-				c.mqttResolveAfterPacket()
+				var arb mqttSubArbitration
+				subs, arb, err = c.mqttProcessSubs(filters)
+				if arb.disposed {
+					// The live arbitration proved this connection foreign: it has
+					// already been notified and closed, on this readLoop, by the
+					// packet's own tail. Return as the graceful DISCONNECT branch
+					// does — an error here would put the footer in the race for the
+					// REASON the client is left with, and the connection's one
+					// DISCONNECT claim refuses whichever attempt is second, so the
+					// cost would be a WRONG reason rather than a second packet. The
+					// same shape mqttGateDispatchOnRejection uses above. See
+					// sub_operation_gate.go (F-078).
+					return nil
+				}
+				// NOT called when the live tail owned this packet's ambiguity: it
+				// resolved under the ownership gate it was already holding, and a
+				// second attempt here would either be a no-op or hand the generic
+				// resolver — whose forked arm DISPOSES — a session the live matrix
+				// says must not be disposed.
+				if !arb.settledOwnAmbiguity {
+					c.mqttResolveAfterPacket()
+				}
 			}
 			if err == nil {
 				// Trace only if the SUBACK was actually sent (a tiny client
@@ -7228,14 +7259,17 @@ func mqttShouldSendRetained(retainHandling byte, subs map[string]byte, filter st
 // adopted or refreshed shared group delivery interest. It is a RETURN VALUE rather than a
 // session field on purpose — see mqttSharedJoinResult.installed.
 //
-// What the caller owes on it differs by path, and the asymmetry is the open defect rather
-// than an oversight. The CONNECT caller MUST prove ownership before the CONNACK, and does.
-// mqttProcessSubs deliberately DISCARDS the fact, so live interest serves unarbitrated —
-// closing that needs a packet-scoped transmission gate the CONNECT path has no equivalent
-// of, because the restore gate is already open on a live connection. That is F-078.
+// BOTH callers owe a proof, and both make one. The CONNECT caller proves ownership before
+// the CONNACK. mqttProcessSubs proves it as the packet's last record write and withholds
+// every delivery the packet could authorise until that proof lands, through a packet-scoped
+// transmission gate — which the CONNECT path needs no equivalent of, because its restore
+// gate is already withholding everything until the CONNACK.
+//
+// The paths were asymmetric until F-078: mqttProcessSubs used to DISCARD this fact, which is
+// what left live interest serving unarbitrated. See sub_operation_gate.go.
 func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, tok recordTx,
 	filters []*mqttFilter, fromSubProto, trace bool,
-	sharedVerdicts map[string]mqttSharedGroupVerdict) ([]*subscription, bool, error) {
+	sharedVerdicts map[string]mqttSharedGroupVerdict) ([]*subscription, mqttSubPacketFacts, error) {
 
 	// Hold the subs barrier for the whole SUBSCRIBE (or CONNECT session
 	// restore) processing: concurrent QoS 1/2 stores wait in
@@ -7279,6 +7313,14 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	// alongside the subscription snapshot further down because the loop provisions
 	// it, and a rollback must be able to tell "this packet built it" from "it was
 	// already there". Spec5 [4.8.2].
+	// facts is this packet's own account of what it did, aggregated on THIS STACK and
+	// nowhere else: a fact parked on mqttSession would outlive the operation that raised it
+	// and govern the next one. interestRestored is committed per filter only at the
+	// whole-filter success boundary below, so a filter whose level-up companion fails is
+	// rolled back out of it exactly as it is rolled back out of everything else. See
+	// mqttSubPacketFacts for why recordCASRejected cannot be recovered from err.
+	var facts mqttSubPacketFacts
+
 	var q2AffPrePacket bool
 	if fromSubProto {
 		sess.mu.Lock()
@@ -7355,11 +7397,26 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// SUBSCRIBE that never took effect should leave behind. Spec5 [4.8.2];
 			// see qos2_shared_affine.go.
 			if f.shared {
-				err := sess.ensureQ2AffineConsumerSubscription(c, tok)
+				affCAS, err := sess.ensureQ2AffineConsumerSubscription(c, tok)
+				if affCAS {
+					// Only the provisioning save's own CAS rejection, never the
+					// rest of this arm's error surface. See
+					// mqttSubPacketFacts.recordCASRejected.
+					facts.recordCASRejected = true
+				}
 				if err == nil {
 					err = as.restoreExitFail(fromSubProto, "affine", f.sessionKey())
 				}
 				if err != nil {
+					// Deliberately NOT marked. This arm's error covers consumer
+					// creation, the delivery subscription, validation and the
+					// restore-exit seam as well as the provisioning record save, and
+					// none of those except the save touches the session record at all.
+					// Marking the whole arm converted an ordinary per-filter failure
+					// into a connection-level refusal, which is a contract owned by the
+					// affine items rather than by F-078. The provisioning save's own CAS
+					// rejection HAS its own narrower signal: the helper returns it
+					// separately, and it is ORed into the fact above.
 					c.Errorf("failed to initialize session-affine QoS 2 delivery: %v", err)
 					f.qos = mqttSubAckFailure
 					f.reasonStr = err.Error()
@@ -7454,13 +7511,6 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	// back: those deliveries stay live and still owe their identifiers.
 	var voidedSent []string
 
-	// sharedInterestRestored is F-077's arbitration trigger, aggregated on THIS STACK and
-	// nowhere else: a fact parked on mqttSession would outlive the operation that raised it
-	// and govern the next one. It is committed per filter only at the whole-filter success
-	// boundary below, so a filter whose level-up companion fails is rolled back out of it
-	// exactly as it is rolled back out of everything else.
-	var sharedInterestRestored bool
-
 	var err error
 	subs := make([]*subscription, 0, len(filters))
 	for _, f := range filters {
@@ -7512,7 +7562,23 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				priorSubID = sess.subIDs[sid]
 			}
 			wasUncertain := sess.isSeqUncertain()
-			if err := sess.update(tok, []*mqttFilter{f}, true); err != nil {
+			detail, err := sess.updateWithDetail(tok, []*mqttFilter{f}, true)
+			if err != nil {
+				// A CAS REJECTION here is the one failure that carries ownership
+				// evidence: the expected-sequence write was refused, so the record
+				// demonstrably MOVED. It is recorded BEFORE the arms below diverge,
+				// because the definite arm turns the failure into a per-filter code and
+				// continues — after which neither the trigger nor `err` carries any
+				// trace of it.
+				//
+				// Read from the DETAIL, never from `err`: persistRecord formats the
+				// store error with %v and destroys its NATS identity. And not from
+				// saveDefinitelyFailed, which merges a CAS rejection with a local
+				// failure and a refused transaction. See
+				// mqttSubPacketFacts.recordCASRejected.
+				if mqttIsRecordCASRejection(detail.rawErr) {
+					facts.recordCASRejected = true
+				}
 				if sess.classifySave(wasUncertain, err) != saveDefinitelyFailed {
 					// POSSIBLY LANDED. Continuing would be worse than failing: the final
 					// update() skips filters marked failed, so the client would get a
@@ -7526,7 +7592,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					// want of proof, so there is no landed continuation to register.
 					// Spec5 [4.8.2]. See sess_uncertain.go.
 					c.Errorf("MQTT: shared membership write for %q is unresolved; abandoning the SUBSCRIBE with its state intact: %v", sess.id, err)
-					return nil, sharedInterestRestored, err
+					return nil, facts, err
 				}
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
@@ -7598,15 +7664,20 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
 			cancelFilterDeferred()
-			doCleanup, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			if rbCAS {
+				facts.recordCASRejected = true
+			}
 			if rerr != nil {
 				// Rollback persistence not confirmed: hard-error WITHOUT releasing
 				// resources, so we never delete a group durable the record may still
 				// claim membership in. Spec5 [4.8.2].
-				return subs, sharedInterestRestored, rerr
+				return subs, facts, rerr
 			}
 			if doCleanup {
-				sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
+				if sess.cleanupFailedSubClassified(c, tok, fromSubProto, sub, jscons, jssub) {
+					facts.recordCASRejected = true
+				}
 			}
 			sess.refundSharedCharges(fromSubProto, filterCharged)
 			continue
@@ -7651,15 +7722,20 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
 			cancelFilterDeferred()
-			doCleanup, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			if rbCAS {
+				facts.recordCASRejected = true
+			}
 			if rerr != nil {
 				// Rollback persistence not confirmed: hard-error WITHOUT releasing
 				// resources, so we never delete a group durable the record may still
 				// claim membership in. Spec5 [4.8.2].
-				return subs, sharedInterestRestored, rerr
+				return subs, facts, rerr
 			}
 			if doCleanup {
-				sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
+				if sess.cleanupFailedSubClassified(c, tok, fromSubProto, sub, jscons, jssub) {
+					facts.recordCASRejected = true
+				}
 			}
 			sess.refundSharedCharges(fromSubProto, filterCharged)
 			continue
@@ -7694,12 +7770,17 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
 				cancelFilterDeferred()
-				doCleanup, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				if rbCAS {
+					facts.recordCASRejected = true
+				}
 				if rerr != nil {
-					return subs, sharedInterestRestored, rerr
+					return subs, facts, rerr
 				}
 				if doCleanup {
-					sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
+					if sess.cleanupFailedSubClassified(c, tok, fromSubProto, sub, jscons, jssub) {
+						facts.recordCASRejected = true
+					}
 				}
 				sess.refundSharedCharges(fromSubProto, filterCharged)
 				continue
@@ -7737,13 +7818,20 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
 				cancelFilterDeferred()
-				doCleanup, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				if rbCAS {
+					facts.recordCASRejected = true
+				}
 				if rerr != nil {
-					return subs, sharedInterestRestored, rerr
+					return subs, facts, rerr
 				}
 				if doCleanup {
-					sess.cleanupFailedSub(c, tok, fromSubProto, sub, jscons, jssub)
-					sess.cleanupFailedSub(c, tok, fromSubProto, fwcsub, fwjscons, fwjssub)
+					if sess.cleanupFailedSubClassified(c, tok, fromSubProto, sub, jscons, jssub) {
+						facts.recordCASRejected = true
+					}
+					if sess.cleanupFailedSubClassified(c, tok, fromSubProto, fwcsub, fwjscons, fwjssub) {
+						facts.recordCASRejected = true
+					}
 				}
 				sess.refundSharedCharges(fromSubProto, filterCharged)
 				continue
@@ -7757,7 +7845,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		addJSConsToSess(sid, jscons)
 		// THE COMMIT BOUNDARY. Both halves are installed and every per-filter failure exit
 		// above has been passed, so this filter's interest is the client's.
-		sharedInterestRestored = sharedInterestRestored || filterInstalled
+		facts.interestRestored = facts.interestRestored || filterInstalled
 		if !fromSubProto {
 			// One filter's installs are complete and later filters are not started.
 			// The seam is here rather than at the end of the restore because that is
@@ -7791,7 +7879,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// resolver must hold the fence. The readLoop resolves after it closes.
 				// See mqttResolveAfterPacket.
 				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state: %v", sess.id, err)
-				return nil, sharedInterestRestored, err
+				return nil, facts, err
 			}
 			sess.reopenTeardownDelivery(closedDeliveries)
 			sess.unvoidRegNonces(voidedSent)
@@ -7802,9 +7890,21 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// this packet downgraded to QoS0.
 			// Durable in the packet's record already; this lets the registers go now
 			// rather than at the next resume.
-			sess.secureRegCancellations(c, tok, stagedCancels)
+			//
+			// Both record writes below are reached on an OTHERWISE-SUCCESSFUL packet,
+			// so a CAS rejection in either is precisely the swallowed evidence that
+			// would let the gate open as "quiet" while the session's surviving shared
+			// subscriptions serve under a membership another broker now owns. The
+			// classified forms exist so the bare bool — which merges a CAS rejection
+			// with a local failure and an ambiguity — cannot hide it. See
+			// mqttSubPacketFacts.recordCASRejected.
+			if _, casRejected := sess.secureRegCancellationsClassified(c, tok, stagedCancels); casRejected {
+				facts.recordCASRejected = true
+			}
 			for _, dd := range deferredDels {
-				sess.execDeferredConsumerDelete(c, tok, dd.sid, dd.cc)
+				if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc) {
+					facts.recordCASRejected = true
+				}
 			}
 			// The affine path is provisioned in the first loop, before any filter is
 			// known to succeed, so a packet whose shared QoS 2 filters all failed
@@ -7828,7 +7928,14 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// to dispose-after-confirm is filed as its own §0 item, because the
 				// rollback around it has distinct failure semantics of its own.
 				if u := sess.prepareQ2AffineUnwind(c, true); u.prepared {
-					outcome, serr := sess.saveClassified(tok)
+					outcome, udetail, serr := sess.saveClassifiedDetail(tok)
+					// serr never travels outward from here — every arm below logs it
+					// and returns normally — so the packet records the fact itself, and
+					// only for the failure that carries ownership evidence. See
+					// mqttSubPacketFacts.recordCASRejected.
+					if mqttIsRecordCASRejection(udetail.rawErr) {
+						facts.recordCASRejected = true
+					}
 					switch {
 					case serr == nil:
 						sess.finishQ2AffineUnwind(c, u)
@@ -7852,7 +7959,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 	}
 
-	return subs, sharedInterestRestored, err
+	return subs, facts, err
 }
 
 // rollbackSharedSub undoes the early membership persistence done for a shared
@@ -7872,9 +7979,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 // diverge and a later save writes the wrong one. An AMBIGUOUS failure keeps it: the
 // record may already carry the rolled-back state, and the readback recognises this
 // session by a digest of exactly those bytes. See sess_uncertain.go.
-func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilter, fromSubProto, priorExisted bool, priorQoS byte, priorRap bool, priorSubID int) (run bool, err error) {
+func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilter, fromSubProto, priorExisted bool, priorQoS byte, priorRap bool, priorSubID int) (run bool, casRejected bool, err error) {
 	if !fromSubProto || !f.shared {
-		return true, nil
+		return true, casRejected, nil
 	}
 	// The state as it stands NOW — what this packet attempted and what the record
 	// currently holds — so a definite failure can put it back exactly.
@@ -7939,23 +8046,27 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 		restore := &mqttFilter{shared: true, group: f.group, filter: f.filter, qos: priorQoS, retainAsPublished: priorRap, subID: priorSubID}
 		if e := sess.update(tok, []*mqttFilter{restore}, true); e != nil {
 			undo(e)
-			return false, e
+			return false, casRejected, e
 		}
 		// A failed re-SUBSCRIBE must keep delivering with the OLD state: the
 		// processSub/processSharedJSConsumer refresh already overwrote the live
 		// subscription's QoS/RAP/subID with the attempted values, so restore them.
 		// Spec5 [4.8.2].
 		sess.restoreSharedLiveMetadata(c, f, priorQoS, priorRap, priorSubID)
-		return false, nil
+		return false, casRejected, nil
 	}
 	if e := sess.update(tok, []*mqttFilter{f}, false); e != nil {
 		undo(e)
-		return true, e
+		return true, casRejected, e
 	}
 	// The removal is durable, so a tombstone can release the cancelled registers now
 	// instead of leaving them to the next resume.
-	sess.secureRegCancellations(c, tok, sharedCancels)
-	return true, nil
+	// CLASSIFIED, because this function returns NORMALLY after it: a rejection
+	// swallowed here leaves the packet looking quiet while the record has moved.
+	if _, cancelCAS := sess.secureRegCancellationsClassified(c, tok, sharedCancels); cancelCAS {
+		casRejected = true
+	}
+	return true, casRejected, nil
 }
 
 // addedCons is one consumer a SUBSCRIBE packet created, paired with its sid.
@@ -10091,7 +10202,23 @@ func (sess *mqttSession) clear(noWait bool) error {
 //
 // Runs from the client's readLoop.
 // Lock not held on entry, but session is in the locked map.
+// update persists this packet's membership changes. Callers that must know whether a
+// failure was a per-subject CAS REJECTION use updateWithDetail instead: the error returned
+// here cannot answer that, because save() re-formats the store error with %v and destroys
+// its NATS identity.
 func (sess *mqttSession) update(tok recordTx, filters []*mqttFilter, add bool) error {
+	_, err := sess.updateWithDetail(tok, filters, add)
+	return err
+}
+
+// updateWithDetail is update with the store-boundary detail preserved.
+//
+// It exists for the early per-filter membership save, which must distinguish a CAS
+// rejection — evidence that the record MOVED — from a local failure or an ambiguity, which
+// are evidence of neither. saveDefinitelyFailed cannot make that distinction: it
+// deliberately merges a CAS rejection with a local failure, a refused transaction, and a
+// refusal caused by an earlier uncertainty. See mqttSubPacketFacts.recordCASRejected.
+func (sess *mqttSession) updateWithDetail(tok recordTx, filters []*mqttFilter, add bool) (mqttSessSaveDetail, error) {
 	// Evaluate if we need to persist anything.
 	var needUpdate bool
 	// The membership maps are read under sess.mu by the delivery callbacks, so the
@@ -10165,11 +10292,12 @@ func (sess *mqttSession) update(tok recordTx, filters []*mqttFilter, add bool) e
 	}
 	sess.mu.Unlock()
 
+	var detail mqttSessSaveDetail
 	var err error
 	if needUpdate {
-		err = sess.save(tok)
+		detail, err = sess.saveWithDetail(tok)
 	}
-	return err
+	return detail, err
 }
 
 func (sess *mqttSession) bumpPI() uint16 {
@@ -10980,7 +11108,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 		// Standalone caller, so it opens its own record transaction and passes the
 		// token down. See sess_recordtx.go.
 		tok := sess.beginRecordTx()
-		err := sess.ensureQ2AffineConsumerSubscription(c, tok)
+		_, err := sess.ensureQ2AffineConsumerSubscription(c, tok)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			c.Errorf("MQTT: %v", terr)
 		}
@@ -12271,7 +12399,7 @@ restoreSession:
 			refuseRestore(rerr)
 			return formatError(rerr)
 		}
-		_, sharedInterestRestored, serr := asm.processSubs(es, c, acceptTok, filters, false, trace, sharedVerdicts)
+		_, restoreFacts, serr := asm.processSubs(es, c, acceptTok, filters, false, trace, sharedVerdicts)
 		// The sweep runs BEFORE the error is tested: a subscription restoration
 		// skipped stays closed and phase-owned, holding consumer interest while
 		// delivering nothing, and nothing later would remove it. The deferred
@@ -12329,7 +12457,7 @@ restoreSession:
 		// It runs AFTER the last group-durable write of the restore — the join create and
 		// the post-subscribe verify create both sit inside processSubs — and BEFORE the
 		// CONNACK, so every delivery in the window is still withheld by the restore gate.
-		if sharedInterestRestored {
+		if restoreFacts.interestRestored {
 			v := es.proveSharedMembershipOwnership(acceptTok)
 			mqttTestSharedArbitratePause("after-ownership-cas")
 			switch v.outcome {
@@ -15354,6 +15482,19 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		return
 	}
 
+	// A live SUBSCRIBE that installed or revived SHARED group interest has not yet proved
+	// this broker still owns the membership, and delivering-and-acking a shared QoS 0
+	// member destroys that message for the members who legitimately hold it. Dropped
+	// rather than waited on, exactly as the restore gate's QoS 0 arm is, and for the same
+	// reason. PLAIN QoS 0 is deliberately ungated: it acknowledges nothing on the group's
+	// behalf, so gating it would lose messages while protecting nobody. This check sits
+	// AFTER the metadata read because `shared` is not knowable before it. See
+	// sub_operation_gate.go (F-078).
+	if shared && sess.subGateBlocksQoS0(cc) {
+		mqttTestRestoreGateBlockedHook("qos0")
+		return
+	}
+
 	hdr, msg := pc.msgParts(rmsg)
 	var topic []byte
 	var props []byte
@@ -15497,7 +15638,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// transmission, whether the restore was refused or this wait simply ran out.
 	// Comparing against Withheld ALONE is a defect — a timed-out verdict would fall
 	// through and transmit before the CONNACK.
-	if sess.awaitRestoreGate(cc) != mqttRestoreGateOpen {
+	if sess.awaitTransmissionGates(cc) != mqttTransmissionOpen {
 		mqttTestRestoreGateBlockedHook("qos12")
 		sess.recordWithheldDelivery(cc, sub, reply)
 		return
@@ -15881,14 +16022,14 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// ACKNOWLEDGING on a withheld verdict, so JetStream redelivers; PUBREL carries
 	// no DUP ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing is owed
 	// beyond that. See sess_restore_gate.go.
-	switch sess.awaitRestoreGate(cc) {
-	case mqttRestoreGateWithheld:
+	switch sess.awaitTransmissionGates(cc) {
+	case mqttTransmissionWithheld:
 		mqttTestRestoreGateBlockedHook("pubrel")
 		return
-	case mqttRestoreGateTimedOut:
+	case mqttTransmissionTimedOut:
 		// NAK rather than simply returning: a PUBREL carries no withheld marker, so
 		// nothing else would re-drive it, and the wait's bound can be well short of
-		// AckWait. See mqttRestoreGateTimedOut.
+		// AckWait. See mqttTransmissionTimedOut.
 		mqttTestRestoreGateBlockedHook("pubrel")
 		sess.jsa.sendMsg(reply, AckNak)
 		return
@@ -16298,7 +16439,17 @@ func (c *client) mqttFlushVoidedRegs() {
 	sess.persistVoidedRegs(c)
 }
 
-func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error) {
+// The results are NAMED, and that is load-bearing rather than a style choice. The
+// arbitration tail runs in a DEFER — it has to, because it must observe the packet
+// transaction closed and the ownership gate still held — and an unnamed result is COPIED at
+// the return statement, before any defer runs. With unnamed results everything the tail
+// decides is invisible to the caller: `settledOwnAmbiguity` never suppresses
+// mqttResolveAfterPacket, so the generic resolver gets a second attempt and can apply its
+// DISPOSING forked policy to an ambiguity this tail deliberately retained; and an eventual
+// Foreign disposal never reports `disposed`, so mqttParse falls through to the 0x89 footer
+// instead of staying silent for the 0x8E already sent. Named results give the defer the real
+// return slot.
+func (c *client) mqttProcessSubs(filters []*mqttFilter) (subs []*subscription, arb mqttSubArbitration, err error) {
 	// Those things are immutable, but since processing subs is not
 	// really in the fast path, let's get them under the client lock.
 	c.mu.Lock()
@@ -16307,27 +16458,153 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error)
 	trace := c.trace
 	c.mu.Unlock()
 
-	if err := asm.lockSession(sess, c); err != nil {
-		return nil, err
+	// The notify/close tail is registered FIRST so LIFO runs it LAST — after the record
+	// transaction has ended AND after the ownership gate has been released. Notifying or
+	// closing under the gate is what disposeForeignSessionLocked has to dodge by
+	// dispatching its close to another goroutine; here the tail runs on this readLoop,
+	// which is what mqttGateDispatchOnRejection does for the same reason.
+	var tail func()
+	defer func() {
+		if tail != nil {
+			tail()
+		}
+	}()
+
+	if lerr := asm.lockSession(sess, c); lerr != nil {
+		return nil, arb, lerr
 	}
 	defer asm.unlockSession(sess)
+
+	// The operation gate is armed BEFORE processSubs, and therefore before
+	// ensurePubRelConsumerSubscription and ensureQ2AffineConsumerSubscription install
+	// anything — which is what bounds the residual to deliveries whose interest predates
+	// this packet. Only for a packet that actually carries a shared filter: a purely plain
+	// SUBSCRIBE authorises nothing on a group's behalf and must not gate its own traffic.
+	//
+	// The resolve is a DEFER on the exact instance armed here, so every error path and an
+	// abnormal unwind resolves it — a test hook calling t.Fatal unwinds with
+	// runtime.Goexit, which no explicit return covers. Its terminal state defaults to
+	// WITHHELD: a packet that dies without establishing ownership must not leave its
+	// deliveries free.
+	var gate *mqttSubGate
+	gateState := mqttSubGateWithheld
+	if mqttFiltersCarryShared(filters) {
+		gate = sess.armSubGate(c)
+		defer func() { gate.resolve(gateState) }()
+	}
 
 	// The whole SUBSCRIBE is one record transaction: its membership changes, its
 	// per-filter rollbacks and its final persist either all become visible or none
 	// do. Outermost readLoop entry point, so it takes the blocking form.
 	tok := sess.beginRecordTx()
+	// Registered AFTER unlockSession and BEFORE endRecordTx, so LIFO gives exactly
+	// endRecordTx -> this -> unlockSession -> tail: the eventual resolution runs with the
+	// packet transaction CLOSED (it takes a fence of its own, and the fence cannot be
+	// acquired twice on one goroutine) and the ownership gate STILL HELD, so nothing else
+	// may classify this session's uncertainty meanwhile. See sub_operation_gate.go.
+	var resolveEventually bool
 	defer func() {
-		if err := sess.endRecordTx(tok); err != nil {
-			c.Errorf("MQTT: %v", err)
+		if resolveEventually {
+			c.mqttSettleLiveArbitration(asm, sess, &arb, &gateState, &tail)
 		}
 	}()
-	// The live SUBSCRIBE path does NOT arbitrate: it installs and revives the same shared
-	// interest with no ownership write, which is the defect F-078 closes. It needs a
-	// packet-scoped transmission gate this path has no equivalent of, because the restore
-	// gate is already open on a live connection — so the trigger is deliberately discarded
-	// here rather than acted on half-way. See docs/ROADMAP.md F-078.
-	subs, _, err := asm.processSubs(sess, c, tok, filters, true, trace, nil)
-	return subs, err
+	defer func() {
+		if terr := sess.endRecordTx(tok); terr != nil {
+			c.Errorf("MQTT: %v", terr)
+		}
+	}()
+
+	var facts mqttSubPacketFacts
+	subs, facts, err = asm.processSubs(sess, c, tok, filters, true, trace, nil)
+	if err != nil {
+		// The packet already failed and its own error is what closes the connection. It
+		// owes no ownership proof, and the gate stays WITHHELD so nothing it installed
+		// serves on the way out.
+		return subs, arb, err
+	}
+
+	// ARBITRATE. Everything above may have installed or revived shared group delivery
+	// interest; nothing yet proved this broker still OWNS the membership it was keyed on
+	// (F-078). One classified record write does, and only a write can: a load cannot
+	// distinguish "the record did not move" from "a contender's proposal has not committed
+	// yet".
+	//
+	// It is the LAST record write of the packet — after sess.update's final save and after
+	// the optional affine unwind — so its CAS linearizes at the sequence the packet left.
+	if !facts.ownershipQuestionRaised() {
+		// PROVENLY QUIET: no trigger committed AND no record write CAS-rejected, so this
+		// packet owes no proof and inherits the previous operation's landed ownership CAS.
+		// Both halves are required — see mqttSubPacketFacts.ownershipQuestionRaised.
+		//
+		// THIS PRECEDES THE isSeqUncertain CHECK BELOW, DELIBERATELY, and a review round
+		// read the ordering as a defect: a packet whose ancillary save went AMBIGUOUS
+		// opens the gate while the session carries an unresolved write, and an unresolved
+		// write is an outcome nobody read, so it includes "CAS-rejected, response lost".
+		// The ordering stands because a quiet packet installed NOTHING — no trigger means
+		// no shared interest was created or revived — so what this open releases is
+		// traffic backed by interest that PREDATES the packet, authorised by whatever
+		// operation installed it. Withholding it would give one packet type a stronger
+		// delivery guarantee than the broker provides for any other ambiguous record
+		// write, and it would convert an ambiguous affine provisioning failure into a
+		// connection-level refusal — which is the contract the affine items own, the same
+		// one the wider trigger predicate already broke once. That population is the
+		// point-in-time-ownership convergence window in docs/CONFORMANCE.md, and F-078
+		// makes no stronger guarantee for it. Mutating this order is M34.
+		gateState = mqttSubGateOpen
+		return subs, arb, nil
+	}
+
+	// A session already carrying an unresolved write cannot prove anything: the proof is
+	// refused at entry. That is NOT a permission to serve, so it takes the Unresolved arm
+	// and the tail resolves it under the still-held gate.
+	if sess.isSeqUncertain() {
+		resolveEventually = true
+		return subs, arb, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+	}
+
+	v := sess.proveSharedMembershipOwnership(tok)
+	mqttTestSharedArbitratePause("after-ownership-cas")
+	switch v.outcome {
+	case mqttGroupOwnershipOurs:
+		// Still ours at the write's linearization point. Everything this packet installed
+		// may serve, and the SUBACK follows.
+		gateState = mqttSubGateOpen
+		return subs, arb, nil
+
+	case mqttGroupOwnershipForeign:
+		// A demonstrated takeover. An armed Will goes with the connection the displacement
+		// closes and one already owed now is not the takeover's to cancel — the identical
+		// rule the takeover itself applies, so whichever side notices first applies it and
+		// the other's is a no-op. NO mqttHandleWill on this arm.
+		c.mqttDiscardWillOnTakeover()
+		stale, applied := sess.disposeForeignStateLocked(asm, c)
+		if applied && stale != nil {
+			voc := v.voc
+			arb.disposed = true
+			tail = func() {
+				stale.mqttNotifyForeignDisposal(sess.id, voc)
+				stale.closeConnection(voc.closeReason)
+			}
+			return subs, arb, nil
+		}
+		// The identity check refused: something rebound while this verdict was being
+		// reached, so the disposal — and the notification — are not ours to make.
+		return subs, arb, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+
+	case mqttGroupOwnershipUnresolved:
+		// The write may have landed. The packet's state is KEPT — that is what the
+		// resolver re-attempts and proves durable — and the tail owns the resolution.
+		resolveEventually = true
+		return subs, arb, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+
+	default:
+		// FORKED and LOCAL. Neither demonstrates another owner, so neither disposes and
+		// neither discards the Will: suppressing it here would be silent loss. Both are
+		// non-Foreign closes, so both CONSUME the Will under the still-held gate rather
+		// than leaving it to a later close a record-observation eviction can pre-empt.
+		c.mqttConsumeWillUnderGate(asm, sess)
+		return subs, arb, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+	}
 }
 
 // Cleanup that is performed in processSubs if there was an error.
@@ -16335,6 +16612,16 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) ([]*subscription, error)
 // Runs from client's readLoop.
 // Lock not held on entry, but session is in the locked map.
 func (sess *mqttSession) cleanupFailedSub(c *client, tok recordTx, fromSubProto bool, sub *subscription, cc *ConsumerConfig, jssub *subscription) {
+	_ = sess.cleanupFailedSubClassified(c, tok, fromSubProto, sub, cc, jssub)
+}
+
+// cleanupFailedSubClassified is cleanupFailedSub reporting whether any record write it
+// performed was rejected by the per-subject CAS. Same reason as
+// releaseSharedConsumerClassified: this runs on a failed filter and returns normally, so a
+// swallowed rejection would open the gate as quiet.
+func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fromSubProto bool, sub *subscription, cc *ConsumerConfig, jssub *subscription) bool {
+	var casRejected bool
+
 	if sub != nil {
 		c.processUnsub(sub.sid)
 	}
@@ -16362,11 +16649,12 @@ func (sess *mqttSession) cleanupFailedSub(c *client, tok recordTx, fromSubProto 
 		// release (the caller has already rolled back this session's membership).
 		// Spec5 [4.8.2].
 		if cc.DeliverGroup != _EMPTY_ {
-			sess.releaseSharedConsumer(c, tok, cc, nil)
+			casRejected = sess.releaseSharedConsumerClassified(c, tok, cc, nil) || casRejected
 		} else {
 			sess.deleteConsumer(cc)
 		}
 	}
+	return casRejected
 }
 
 // Make sure we are set up to deliver PUBREL messages to this QoS2-subscribed
@@ -16692,6 +16980,17 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 // mqttDeliverMsgCbQoS12 skip instead while leaving sub.mqtt valid for an
 // already-committed enqueue.
 func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid string, cc *ConsumerConfig) {
+	_ = sess.execDeferredConsumerDeleteClassified(c, tok, sid, cc)
+}
+
+// execDeferredConsumerDeleteClassified is execDeferredConsumerDelete reporting whether
+// either of its record writes was rejected by the per-subject CAS.
+//
+// The live SUBSCRIBE path runs this inside an otherwise-SUCCESSFUL packet — the QoS
+// downgrade whose teardown was deferred until the save was confirmed — so a rejection here
+// is exactly the swallowed evidence that would let the operation gate open as "quiet". See
+// mqttSubPacketFacts.recordCASRejected.
+func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok recordTx, sid string, cc *ConsumerConfig) bool {
 	c.mu.Lock()
 	sub := c.subs[cc.DeliverSubject]
 	c.mu.Unlock()
@@ -16711,7 +17010,7 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 	}
 	regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
 	sess.mu.Unlock()
-	sess.deleteInflightRegisters(c, tok, regs)
+	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs)
 
 	// Anything the purge found here arrived AFTER this packet staged its cancellations
 	// (a delivery already in the callback when the durable's subscription was closed),
@@ -16720,7 +17019,9 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 	// has nothing to redeliver through whether the durable lives or not — and an
 	// unreferenced durable nothing reaps is worse than none. So it is reported and the
 	// obligation is left to the convergence points.
-	if !sess.secureRegCancellations(c, tok, cancels) {
+	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels)
+	casRejected = casRejected || cancelCAS
+	if !secured {
 		c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for client %q "+
 			"are not durably recorded yet; their identifiers stay reserved until the cleanup "+
 			"is discharged", cc.Durable, sess.id)
@@ -16729,6 +17030,7 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 	if sub != nil {
 		c.processUnsub(sub.sid)
 	}
+	return casRejected
 }
 
 // buildSharedGroupConsumerConfig is the SINGLE constructor for a shared group durable's
@@ -16799,8 +17101,12 @@ func buildSharedGroupConsumerConfig(group, subject string, ackWait time.Duration
 // `readd` restore cons[sid] while sharedSubs stays at the pre-packet snapshot; the client
 // reconnects; the CONNECT builds its filters from sharedSubs, which lacks the key, so the
 // sid is never collected; and the resident cons entry then survives with no deliver
-// subscription. A later live SUBSCRIBE reaches this arm with nil verdicts, verifies
-// nothing and arbitrates nothing. Do not restore the old justification.
+// subscription. A later live SUBSCRIBE reaches this arm with nil verdicts and verifies
+// nothing — no pre-pass classified that sid, and this arm issues no verify of its own — so
+// it subscribes on a remembered config. What it no longer does is serve unarbitrated: the
+// packet proves ownership after its last record write and withholds transmission until it
+// lands (F-078, sub_operation_gate.go). The verification gap is local and stands; the
+// arbitration gap does not. Do not restore the old justification.
 func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
 	qos byte, retainAsPublished bool, subID int, fromSubProto bool,
 	verdicts map[string]mqttSharedGroupVerdict) (mqttSharedJoinResult, error) {
@@ -16998,8 +17304,18 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 //
 // Runs from the client's readLoop. sess.mu not held on entry.
 func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *ConsumerConfig, held map[string]bool) {
+	_ = sess.releaseSharedConsumerClassified(c, tok, cc, held)
+}
+
+// releaseSharedConsumerClassified is releaseSharedConsumer reporting whether either of its
+// register record writes was rejected by the per-subject CAS.
+//
+// It is reached from a live SUBSCRIBE's FAILED-FILTER cleanup, which returns NORMALLY — so a
+// rejection swallowed here leaves the packet looking quiet and opens the operation gate while
+// the record has demonstrably moved. See mqttSubPacketFacts.recordCASRejected.
+func (sess *mqttSession) releaseSharedConsumerClassified(c *client, tok recordTx, cc *ConsumerConfig, held map[string]bool) bool {
 	if cc == nil || cc.DeliverGroup == _EMPTY_ {
-		return
+		return false
 	}
 	var sub *subscription
 	if c != nil {
@@ -17022,10 +17338,12 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *Cons
 		delete(sess.sharedCharged, cc.Durable)
 	}
 	sess.mu.Unlock()
-	sess.deleteInflightRegisters(c, tok, regs)
+	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs)
 	// As in execDeferredConsumerDelete: anything found here arrived after the staging,
 	// and keeping the durable would not make its identifier recoverable.
-	if !sess.secureRegCancellations(c, tok, cancels) && c != nil {
+	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels)
+	casRejected = casRejected || cancelCAS
+	if !secured && c != nil {
 		c.Errorf("MQTT: the cancelled in-flight registration(s) of shared consumer %q for client %q "+
 			"are not durably recorded yet; their identifiers stay reserved until the cleanup "+
 			"is discharged", cc.Durable, sess.id)
@@ -17045,6 +17363,7 @@ func (sess *mqttSession) releaseSharedConsumer(c *client, tok recordTx, cc *Cons
 			c.Errorf("Unable to delete shared consumer %q: %v", cc.Durable, err)
 		}
 	}
+	return casRejected
 }
 
 // purgeSharedPending drops this session's pending QoS 1/2 delivery state for its

@@ -674,7 +674,7 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 
 		restore := definiteFail()
 		tok := sess.beginRecordTx()
-		_, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
+		_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			t.Fatalf("endRecordTx: %v", terr)
 		}
@@ -703,7 +703,7 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 
 		restore := ambiguousFail()
 		tok := sess.beginRecordTx()
-		_, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
+		_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			t.Fatalf("endRecordTx: %v", terr)
 		}
@@ -737,7 +737,7 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 		restore := definiteFail()
 		tok := sess.beginRecordTx()
 		// priorExisted: the filter was subscribed at QoS 1 before this packet.
-		_, err := sess.rollbackSharedSub(c, tok, f, true, true, 1, false, 0)
+		_, _, err := sess.rollbackSharedSub(c, tok, f, true, true, 1, false, 0)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			t.Fatalf("endRecordTx: %v", terr)
 		}
@@ -893,7 +893,7 @@ func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
 	sess.mu.Unlock()
 
 	tok := sess.beginRecordTx()
-	_, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
+	_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}

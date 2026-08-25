@@ -19,8 +19,8 @@ func TestRestoreGateVerdictTransitions(t *testing.T) {
 	// CONNECT restore, and it must cost a delivery nothing.
 	t.Run("unarmed is open", func(t *testing.T) {
 		sess := &mqttSession{}
-		got := sess.awaitRestoreGate(nil)
-		if got != mqttRestoreGateOpen {
+		got := sess.awaitTransmissionGates(nil)
+		if got != mqttTransmissionOpen {
 			t.Fatalf("unarmed verdict = %v, want open", got)
 		}
 		if sess.restoreGateBlocksQoS0() {
@@ -44,14 +44,14 @@ func TestRestoreGateVerdictTransitions(t *testing.T) {
 	t.Run("open releases waiters for transmission", func(t *testing.T) {
 		sess := &mqttSession{}
 		sess.armRestoreGate()
-		got := make(chan mqttRestoreGateVerdict, 1)
-		go func() { got <- sess.awaitRestoreGate(nil) }()
+		got := make(chan mqttTransmissionVerdict, 1)
+		go func() { got <- sess.awaitTransmissionGates(nil) }()
 		// The waiter is either parked or about to park; either way the open below
 		// is what it must observe.
 		sess.openRestoreGate()
 		select {
 		case v := <-got:
-			if v != mqttRestoreGateOpen {
+			if v != mqttTransmissionOpen {
 				t.Fatalf("verdict after open = %v, want open", v)
 			}
 		case <-time.After(5 * time.Second):
@@ -68,12 +68,12 @@ func TestRestoreGateVerdictTransitions(t *testing.T) {
 	t.Run("abandon wakes waiters without allowing transmission", func(t *testing.T) {
 		sess := &mqttSession{}
 		sess.armRestoreGate()
-		got := make(chan mqttRestoreGateVerdict, 1)
-		go func() { got <- sess.awaitRestoreGate(nil) }()
+		got := make(chan mqttTransmissionVerdict, 1)
+		go func() { got <- sess.awaitTransmissionGates(nil) }()
 		sess.abandonRestoreGate()
 		select {
 		case v := <-got:
-			if v != mqttRestoreGateWithheld {
+			if v != mqttTransmissionWithheld {
 				t.Fatalf("verdict after abandon = %v, want withheld", v)
 			}
 		case <-time.After(5 * time.Second):
@@ -89,8 +89,8 @@ func TestRestoreGateVerdictTransitions(t *testing.T) {
 		sess := &mqttSession{}
 		sess.armRestoreGate()
 		sess.abandonRestoreGate()
-		got := sess.awaitRestoreGate(nil)
-		if got != mqttRestoreGateWithheld {
+		got := sess.awaitTransmissionGates(nil)
+		if got != mqttTransmissionWithheld {
 			t.Fatalf("late verdict = %v, want withheld", got)
 		}
 		if !sess.restoreGateBlocksQoS0() {
@@ -108,8 +108,8 @@ func TestRestoreGateVerdictTransitions(t *testing.T) {
 		sess.abandonRestoreGate()
 		sess.armRestoreGate()
 		sess.openRestoreGate()
-		got := sess.awaitRestoreGate(nil)
-		if got != mqttRestoreGateOpen {
+		got := sess.awaitTransmissionGates(nil)
+		if got != mqttTransmissionOpen {
 			t.Fatalf("verdict after re-arm and open = %v, want open", got)
 		}
 		if sess.restoreGateBlocksQoS0() {

@@ -66,7 +66,8 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   authoritatively absent durable repairable rather than merely refused.
   Details: [F-076](shared-qos2.md#f-076).
 - Arbitrate ownership after any shared group durable create.
-  Status: Open — the CONNECT half landed; the live SUBSCRIBE half is F-078.
+  Status: Closed — the CONNECT half landed first; the live SUBSCRIBE half is F-078, which
+  has now landed and closes this.
   Release treatment: Alpha blocker.
   Split out of F-076, and a defect on `main` rather than one it introduced: no route that
   restored shared group interest revalidated that this broker still owned the membership it
@@ -76,10 +77,11 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   references.
   Details: [F-077](shared-qos2.md#f-077).
 - Arbitrate a live SUBSCRIBE's shared interest before it serves.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed 2026-08-25. Release treatment: Alpha blocker.
   The live half of F-077, split out by a non-convergence escalation. A live SUBSCRIBE
-  installs and revives shared group interest with no ownership write, so a superseded broker
-  can acknowledge group messages under a membership the record no longer carries. Needs a
+  installed and revived shared group interest with no ownership write, so a superseded
+  broker could acknowledge group messages under a membership the record no longer carried.
+  Closed by the same classified proof placed as the packet's last record write, plus a
   packet-scoped transmission gate the CONNECT path has no equivalent of.
   Details: [F-078](shared-qos2.md#f-078).
 - A denied publish is accepted, stored and delivered.
