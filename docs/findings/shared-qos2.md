@@ -1076,31 +1076,151 @@ that arm's deletion fail a test.
 
 ## F-083
 
-**Title:** Release UNSUBSCRIBE's own shared state independently of the last-holder answer
+**Title:** Release a shared UNSUBSCRIBE's and a SUBSCRIBE rollback's own state independently
+of the last-holder answer
 
-- Status: **Open.** Filed by F-082's second consult as a separate item — another caller with
-  its own commit path — rather than folded in, which keeps F-082's "the other four callers
-  are
-  out of scope" boundary intact.
+- Status: **Closed.** Alpha blocker. Filed by F-082's second consult as a separate item —
+  another caller with its own commit path — and WIDENED during planning to a fourth site by an
+  explicit decision (see "The scope decision" below).
 
-Three statements, all of the same class as F-082's D2 and D3:
+### The finding
 
-1. `removeUnsubConsumer` gates the group-consumer DELETE on `heldShared` but not the
-   durable-scoped local purge, so leaving `$share/g/foo.>` while still holding
-   `$share/g/foo` purges the pending state and unsubscribes the deliver subject the SURVIVING
-   filter still needs. The overlap is real for the same reason it is in F-082: the two keys
-   share the level-up durable.
-2. Its staging half `stageUnsubCancellationsLocked` has F-082's D4 keying mismatch — the
-   delivery barrier via `sess.cons`, the void snapshot by durable.
-3. Its no-`cons` branch discharges no local state at all: it derives the durables from the
-   key
-   and deletes the consumer, purging nothing. The code already names that population —
-   `purgeSharedPending` exists because "a 3.1.1 forced leave and UNSUBSCRIBE's no-cons branch
-   each strand transmitted entries with NEITHER view left".
+F-082 established that `sharedDurablesHeldByOthers`'s single `held` bit merges two facts and
+that only one licenses a caller to release its OWN state. Everything
+`releaseSharedGroupTargetClassified` does is whole-durable, so a durable this session still
+reaches through another of its own shared keys must never reach it. The overlap is
+deterministic: `$share/g/foo.>` joins a level-up group consumer whose durable AND deliver
+subject are the plain filter `$share/g/foo`'s.
 
-The remedy is expected to be F-082's, applied to this caller: derive the targets from the
-key,
-separate own-hold from the scan's answer, and gate only the delete. What must be re-derived
-rather than assumed is the exclusion — an UNSUBSCRIBE removes its filters from `sharedSubs`
-BEFORE `commitUnsub` runs, so the doomed key is already gone there, which is not F-082's
-staging situation.
+**D-a. The UNSUBSCRIBE commit half killed a surviving filter's delivery.** Leaving
+`$share/g/foo/#` while still holding `$share/g/foo` handed the level-up config to the
+whole-durable release: the survivor's pending state was purged, its identifiers freed, its
+`sharedCharged` amount subtracted from `tmaxack`, and its delivery closed and unsubscribed.
+The scan withheld only the `CONSUMER.DELETE`. A resident never-expiring session is never
+reconstructed, so nothing repaired it short of a reconnect.
+
+**D-b. It discharged nothing without a `cons` entry**, the population `purgeSharedPending`'s
+comment already named. **And a second leak in that branch, found by enumeration:** guarded by
+`!HasSuffix(sid, " fwc")`, so in the mixed shape — a config for the main shared sid but none
+for its companion — *neither* level-up durable was released: the main sid hit `cons` and
+released only its own durable, and the companion was excluded by the suffix guard.
+
+**D-c. The staging half mixed a `cons`-keyed barrier with a durable-keyed void snapshot**, so
+for the no-`cons` population the barrier was never lowered and the snapshot was "only a moment
+in time"; and neither half was fenced, so it also barriered and voided the survivor.
+
+**D-d. `finishSubscribeRollback` was the same defect at a fourth site**, with no roadmap
+bullet. A SUBSCRIBE adding `$share/g/foo/#` to a session already holding `$share/g/foo` gives
+the level-up companion a distinct `cons` key but the SAME durable, so a failed save put it in
+`added`; both rollback halves then stripped the pre-existing filter. `sess.sharedSubs =
+snap.shared` is restored before `saveClassified`, so the rescan reported held and withheld
+only the delete.
+
+### The scope decision
+
+Consult 2 (`task-mt8zt7du-i3r8a8`) ruled D-d into F-083 rather than a fifth finding: it is
+F-082's TWIN — the packet-level variant of the two sites F-082 fenced — and the class had by
+then produced instances three times, which makes the enumeration the defect. The precedent was
+put against the recommendation (F-082's consults had excluded "the other four callers" without
+enumerating them) and Codex ruled it did not require a separately filed item for every later
+instance of the same invariant.
+
+### What closed it
+
+**One property, four authorities.** The fence asks *does a membership that SURVIVES this
+operation still reach this durable?*, of an explicit immutable `mqttSharedSurvivors` key set
+the operation supplies: the live map minus the packet's whole doomed SET at UNSUBSCRIBE
+staging; the live map at its commit half; the live map for a failed filter's release; and the
+PRE-PACKET SNAPSHOT at both rollback halves. An exclusion-list API was refused because it
+encodes the UNSUBSCRIBE's ordering rather than the invariant and misdescribes a rollback.
+`sharedKeyStillOwnsLocked` is deleted and its two F-082 callers converted.
+
+**The doomed SET, not one `exceptKey`.** One packet can leave both overlapping filters, and a
+single exclusion lets each doomed key protect the other, suppressing a release nothing will
+then owe.
+
+**Three operations at the commit half, not one.** "This config is doomed" and "this durable is
+owed" are different questions: the doomed keys' configs go unconditionally, then the owed
+targets are computed, then every REMAINING config naming an owed durable is swept and the
+target released. Without the first, a doomed multi-level key's `" fwc"` config outlives its
+membership whenever the plain key keeps the durable alive.
+
+**`removeUnsubConsumer` is DELETED, not guarded.** Two review rounds each cut the same seam —
+a plain-path fallthrough, then the lexical guard that fix invited — and the third named the
+cause. `execDeferredConsumerDeleteClassified` already was the correct plain teardown; the
+deleted function duplicated it, mutated `sess.cons` without `sess.mu`, and never unsubscribed
+`cc.DeliverSubject`. It now serves the QoS downgrade and the plain UNSUBSCRIBE alike.
+
+**No lexical shared/plain discrimination, anywhere.** `mqttToNATSSubjectConversion` encodes a
+literal `.` as `//`, so plain `$share.foo` has the sid `$share//foo`. `sessionKey`'s own
+comment claimed a plain sid "never contains `/`" and is corrected in place. The authorities are
+`f.shared` and `cc.DeliverGroup`.
+
+### Designs refuted in review, so none returns
+
+1. **"Move the `heldShared` check down to the delete."** A NO-OP for D-a: the release was
+   already unconditional below the delete and the answer is already "held".
+2. **"Skip the whole release when held."** The pre-F-082 shape; one unreadable record anywhere
+   in the account then suppresses this session's cleanup indefinitely.
+3. **"Reuse `sharedKeyStillOwnsLocked(durable, sid)` at both halves."** Wrong in opposite
+   directions — meaningless at commit, and a single-key exclusion at staging.
+4. **"Test against the live `sess.sharedSubs` everywhere."** Wrong at D-d, whose live map is
+   the attempted membership.
+5. **A `$share/` prefix guard on the plain path.** Strands ordinary plain filters.
+6. **A `cc.DeliverGroup` guard as a second authority with its own test.** Refused as a test of
+   a state no production constructor can build; `f.shared` is the dispatch authority and the
+   config check is a backstop, not a second rule.
+
+### Residuals, unchanged by this item
+
+The scan remains a non-snapshot read that authorizes a deletion, not an arbitration: the
+non-snapshot join/delete race and the same-client-ID skip stand. The surviving-key sample is
+LOCAL-SESSION truth held by the ownership gate, not cluster-global truth. A crash after the
+save but before the release completes leaves any prefix of a fixed per-target order, and
+reclamation is not guaranteed — the orphan sweep aborts on the same unreadable records the
+scan fails closed on. All pre-existing; `docs/CONFORMANCE.md` carries them.
+
+### Out of scope, and why
+
+The 3.1.1 forced leave and teardown are **vacuous** for this property — neither can have a
+surviving membership. The forced leave nonetheless carries its own separate defect, a
+`cons`-versus-membership target mismatch, deferred to its own roadmap item. Teardown carries
+none and is deferred nowhere.
+
+### Coverage, stated as delivered rather than as planned
+
+**12 tests — ten unit and two fulltests — and 18 mutations, 18 kills.** The separations that matter are proven rather than
+asserted: the commit and staging fences fail DIFFERENT tests (M1/M2), the rollback's two halves
+fail different ASSERTIONS of one test (M8/M9), the rollback control catches over-fencing
+(M10/T10), and the two rollback obligations are pinned separately (M15a/M15b).
+
+**Production routes actually exercised.** Two end-to-end tests drive real packets through
+`mqttProcessUnsubs`: one for the plain `$share.foo` teardown, one for a shared UNSUBSCRIBE
+against a planted foreign holder — the latter is the only test that reaches `commitUnsub`'s
+`f.shared` dispatch. The rollback tests drive `rollbackSubscribePacket` itself, so both of its
+halves run.
+
+**What is NOT covered, and is therefore not claimed.** The plan called for two tests running
+the UNSUBSCRIBE and rollback LANDED CONTINUATIONS through the resolver while contesting the
+ownership gate. Neither was written. The continuation mechanism itself is untouched by this
+item — `retainOnLanded` and the resolver fence are unchanged, and the existing F-082 resolver
+fulltest exercises that route for the shared release — but the premise that a
+`mqttSharedSurvivors` sample stays true across the gate is **argued from the call sites, not
+tested**. A future change to the gate or to either continuation should add those tests before
+relying on this item's evidence.
+
+**A three-part redundant defence, and what the mutations do and do not establish.** An
+ungated `CONSUMER.DELETE` on a shared durable is prevented by THREE independent things: the
+commit half removes the doomed shared configs before the plain loop runs, `commitUnsub`
+dispatches on `f.shared`, and `plainConsumerForUnsub` refuses a config with a `DeliverGroup`.
+Removing any ONE changes no observable behaviour (M16), so **none of the three is individually
+pinned**. M16b removes all three together and the end-to-end test then fails, which proves the
+CONJUNCTION protects the delete — **it does not establish that any one of them, ordering
+included, is individually load-bearing**, and no test here distinguishes them. A maintainer
+removing one should not read that as safe: it means the failure would be invisible to this
+suite, not that it is harmless.
+
+The lane's `mutation-ledger.md` records three defects the mutation run and the holistic review
+found in the tests themselves: a helper that reimplemented the code under test so every
+mutation passed, an assertion that demanded the opposite of a documented contract, and a suite
+that bypassed the dispatch it claimed to pin.

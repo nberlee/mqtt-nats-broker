@@ -3366,6 +3366,65 @@ independent fences protect a live membership from a release it never owed — th
 exclusion, and
 the rule that a rollback which RESTORES a membership registers no landed release at all.
 
+**The fence is a PROPERTY over the membership that survives the operation, not a rule per
+caller.** F-082 fenced two sites and F-083 then found two more by enumerating the callers, so
+the enumeration was the defect rather than the sites. The question is always the same — *does
+a membership that SURVIVES this operation still reach this durable?* — and only the membership
+it is asked of differs. `mqttSharedSurvivors` is that membership, and every operation supplies
+its own as an explicit immutable set of keys:
+
+| Operation | Its surviving membership |
+|---|---|
+| UNSUBSCRIBE, staging half | the live map **minus the packet's whole doomed set** — the removals have not been applied yet, and one packet can leave BOTH overlapping filters, so excluding only the key in hand lets each protect the other |
+| UNSUBSCRIBE, commit half | the live map as it stands: `sess.update` has already applied the removals, so it IS the surviving membership |
+| a failed shared filter's release, both halves | the live map; the compensating removal is already durable |
+| a SUBSCRIBE packet's rollback, both halves | the **pre-packet snapshot** — a historical value, because the live map still names the very key being rolled back |
+
+Passing the membership is what keeps the last row honest. An exclusion-list API would encode
+the UNSUBSCRIBE's ordering rather than the invariant, and would misdescribe a rollback whose
+authority is a snapshot. The set is built under `sess.mu` and immutable thereafter; what keeps
+it TRUE once the lock is released is the session's **ownership gate**, which every production
+route holds. That truth is LOCAL to this session — it says nothing about another broker, and
+the non-snapshot join/delete race and the same-client-ID skip are untouched by it.
+
+**Two sites are vacuous rather than exempt**, and the difference matters because only one of
+them owes anything. The 3.1.1 forced leave removes EVERY shared membership and teardown runs
+after `sharedSubs` is niled, so no key survives at either and the whole-durable release is
+always owed. The forced leave nonetheless carries a separate defect of its own — its commit
+purge walks `es.cons` while its staging void walks the membership keys — which is its own
+roadmap item. Teardown carries none.
+
+**"This config is doomed" and "this durable is owed a release" are different questions**, and
+the second does not imply the first. A multi-level key's level-up companion has its own
+`sess.cons` entry but shares its durable with the plain filter one level up: when the
+multi-level key leaves alone, that durable is NOT owed, yet the companion's config must still
+go or it outlives the membership with nothing left to reach it by. So an UNSUBSCRIBE's commit
+half is three operations — remove the doomed keys' configs unconditionally, compute the owed
+targets, then sweep every remaining config naming an owed durable and release it.
+
+**Nothing may discriminate a shared sid from a plain one lexically**, and that includes a
+rollback deciding whether a raw subscription predates its packet: both membership snapshots
+are consulted, because the two keyspaces are disjoint by construction and a prefix test
+misfiles a plain filter that merely looks shared.
+
+`mqttToNATSSubjectConversion` encodes a literal `.` as `//`, so the ordinary plain filter
+`$share.foo` has the sid `$share//foo` and satisfies a `$share/` prefix test. The authorities
+are `f.shared`, set at parse time, and `cc.DeliverGroup` on a resident config. A plain
+UNSUBSCRIBE therefore routes through the same deferred plain-consumer teardown a QoS downgrade
+uses; the separate UNSUBSCRIBE-only teardown that used to exist was deleted, having duplicated
+that machinery while mutating `sess.cons` without `sess.mu` and never unsubscribing the
+deliver subject.
+
+**An ungated `CONSUMER.DELETE` on a shared durable is prevented three times over, and the
+three are REDUNDANT WITH EACH OTHER.** The commit half removes the doomed shared configs
+before the plain loop runs, so a shared sid reaching that loop finds no config; `f.shared`
+dispatches away from it; and the plain accessor refuses a config carrying a `DeliverGroup`.
+Removing any ONE changes no observable behaviour, so none of the three is individually pinned
+by a test; only removing all three together produces the failure, which is what the paired
+mutation demonstrates. That establishes the conjunction and nothing finer — **it does not
+license removing any one of them**, and a change that drops one would be invisible to this
+suite rather than proven harmless.
+
 ## The restore gate: the CONNACK follows a complete restoration
 
 A resuming CONNECT used to acknowledge the session with Session Present = 1 and

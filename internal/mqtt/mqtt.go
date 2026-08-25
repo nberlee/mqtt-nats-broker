@@ -2592,8 +2592,14 @@ type mqttFilter struct {
 // sessionKey returns the key used for this filter in the session's subscription
 // maps and as the NATS subscription sid. A shared subscription embeds its
 // ShareName so distinct groups (and a plain subscription) on the same subject do
-// not collide; a plain subscription just uses its NATS subject (which never
-// contains '/'). Spec5 [4.8.2].
+// not collide; a plain subscription just uses its NATS subject. Spec5 [4.8.2].
+//
+// A plain sid IS NOT distinguishable from a shared one by prefix, and nothing may test it
+// that way. This comment used to claim a plain sid "never contains '/'", which is false:
+// mqttToNATSSubjectConversion encodes a literal '.' as "//", so the ordinary plain filter
+// "$share.foo" has the sid "$share//foo" and satisfies HasPrefix(sid, "$share/"). The
+// authorities are f.shared, set at parse time, and cc.DeliverGroup on a resident config.
+// F-083.
 func (f *mqttFilter) sessionKey() string {
 	if f.shared {
 		return string(mqttSharedSubPrefix) + f.group + "/" + f.filter
@@ -8008,12 +8014,13 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 	var sharedCancels []mqttRegCancellation
 	if !priorExisted {
 		sess.mu.Lock()
+		// The doomed key is EXCLUDED from the surviving membership: this runs before the
+		// removal below, so sharedSubs still names it, and counting it would make every
+		// closure suppress itself. A durable a REMAINING key still reaches keeps its
+		// delivery and its registrations — the overlapping level-up case. F-082.
+		surv := sess.survivingSharedLocked(map[string]bool{sid: true})
 		for _, t := range mqttSharedGroupNamesForKey(sid) {
-			// The doomed key is EXCLUDED from the ownership test: this runs before the
-			// removal below, so sharedSubs still names it, and counting it would make every
-			// closure suppress itself. A durable a REMAINING key still reaches keeps its
-			// delivery and its registrations — the overlapping level-up case. F-082.
-			if sess.sharedKeyStillOwnsLocked(t.durable, sid) {
+			if surv.ownsDurable(t.durable) {
 				continue
 			}
 			// By DELIVER SUBJECT, not through sess.cons: this filter's own join has no cons
@@ -8093,29 +8100,97 @@ type addedCons struct {
 	cc  *ConsumerConfig
 }
 
-// sharedKeyStillOwnsLocked reports whether this session reaches the given group durable
-// through a shared membership OTHER than exceptKey.
+// mqttSharedSurvivors is the set of shared-subscription session keys this session STILL
+// holds once the operation in progress completes.
 //
-// It is the half of the last-holder answer that is about THIS session, split out because the
-// scan merges it with "another session holds it" and the two license different things: only
-// the second permits a caller to release its own state (F-082).
+// It is the half of the last-holder answer that is about THIS session, split out because
+// sharedDurablesHeldByOthers merges it with "another session holds it, or the walk refused",
+// and the two license different things: only the second permits a caller to release its own
+// state (F-082). Everything a whole-durable release does — the pending purge, the ack-budget
+// refund, the deliver-subject unsubscribe, the delivery barrier — belongs to every key that
+// reaches the durable, so a durable a SURVIVING key still reaches must not be touched.
 //
-// exceptKey is the key whose release is being decided, and passing it is mandatory wherever
-// this runs BEFORE that key's membership removal has been applied — otherwise the doomed key
-// counts itself and every closure suppresses itself. _EMPTY_ means the removal is already
-// applied, so nothing needs excluding.
+// Each operation supplies its OWN set, because the surviving membership is not always the
+// live map (F-083):
 //
-// sess.mu must be held.
-func (sess *mqttSession) sharedKeyStillOwnsLocked(durable, exceptKey string) bool {
-	for key := range sess.sharedSubs {
-		if key == exceptKey {
-			continue
-		}
+//   - an UNSUBSCRIBE's staging half runs BEFORE its removals are applied, so its set is the
+//     live map minus the PACKET's whole doomed set — one packet can leave both overlapping
+//     filters, and excluding only the key in hand would let each protect the other;
+//   - an UNSUBSCRIBE's commit half runs after sess.update applied them, so the live map
+//     already IS the surviving membership;
+//   - a SUBSCRIBE rollback's authority is the PRE-PACKET snapshot, a historical value: its
+//     live map still names the very key being rolled back.
+//
+// Taking the membership rather than reading sess.sharedSubs behind an exclusion list is what
+// keeps that last case honest — an exclusion API would encode the UNSUBSCRIBE's ordering
+// instead of the invariant.
+//
+// A set built under sess.mu is immutable thereafter. sess.mu alone only makes each map
+// access race-free; what keeps the sample TRUE after the lock is released is the session's
+// OWNERSHIP GATE, which every production route here holds (mqttProcessUnsubs and
+// mqttProcessSubs take it for the packet; the landed continuations run under the resolver's
+// fence, which holds it). A test driving these paths directly must take the gate itself.
+// The truth is LOCAL to this session: it says nothing about another broker, and the
+// non-snapshot join/delete race and the same-client-ID skip are unaffected by it.
+type mqttSharedSurvivors map[string]struct{}
+
+// ownsDurable reports whether any surviving key reaches the given group durable.
+func (s mqttSharedSurvivors) ownsDurable(durable string) bool {
+	for key := range s {
 		if mqttSharedKeyOwnsDurable(key, durable) {
 			return true
 		}
 	}
 	return false
+}
+
+// targetsOwed returns the group consumers of keys that no surviving key still reaches — the
+// targets this operation owes a whole-durable action on.
+//
+// Deduplicated by durable: two keys of one packet can name one group consumer, and acting
+// twice on it would purge state the first pass already accounted for.
+func (s mqttSharedSurvivors) targetsOwed(keys []string) []mqttSharedGroupNames {
+	var owed []mqttSharedGroupNames
+	seen := make(map[string]struct{})
+	for _, key := range keys {
+		for _, t := range mqttSharedGroupNamesForKey(key) {
+			if _, dup := seen[t.durable]; dup {
+				continue
+			}
+			if s.ownsDurable(t.durable) {
+				continue
+			}
+			seen[t.durable] = struct{}{}
+			owed = append(owed, t)
+		}
+	}
+	return owed
+}
+
+// survivingSharedLocked snapshots this session's shared membership minus doomed, as the set
+// that survives the operation in progress. doomed is nil where the removals have already
+// been applied.
+//
+// sess.mu must be held.
+func (sess *mqttSession) survivingSharedLocked(doomed map[string]bool) mqttSharedSurvivors {
+	surv := make(mqttSharedSurvivors, len(sess.sharedSubs))
+	for key := range sess.sharedSubs {
+		if doomed[key] {
+			continue
+		}
+		surv[key] = struct{}{}
+	}
+	return surv
+}
+
+// mqttSharedSurvivorsOf views a membership snapshot as a surviving-key set, for a caller
+// whose authority is a historical value rather than the live map.
+func mqttSharedSurvivorsOf(membership map[string]byte) mqttSharedSurvivors {
+	surv := make(mqttSharedSurvivors, len(membership))
+	for key := range membership {
+		surv[key] = struct{}{}
+	}
+	return surv
 }
 
 // releaseFailedSharedFilter releases what a shared filter joined, for a filter whose
@@ -8154,19 +8229,11 @@ func (sess *mqttSession) sharedKeyStillOwnsLocked(durable, exceptKey string) boo
 // No lock held on entry.
 func (sess *mqttSession) releaseFailedSharedFilter(c *client, tok recordTx, f *mqttFilter) {
 	sid := f.sessionKey()
-	targets := mqttSharedGroupNamesForKey(sid)
-	if len(targets) == 0 {
-		return
-	}
 	// Own-hold first, so a durable this session still reaches through another key is never
-	// scanned for and never touched.
-	owed := make([]mqttSharedGroupNames, 0, len(targets))
+	// scanned for and never touched. The removal is already durable on this route, so the
+	// live map IS the surviving membership and nothing needs excluding.
 	sess.mu.Lock()
-	for _, t := range targets {
-		if !sess.sharedKeyStillOwnsLocked(t.durable, _EMPTY_) {
-			owed = append(owed, t)
-		}
-	}
+	owed := sess.survivingSharedLocked(nil).targetsOwed([]string{sid})
 	sess.mu.Unlock()
 	if len(owed) == 0 {
 		return
@@ -8351,8 +8418,18 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	var rollbackCancels []mqttRegCancellation
 	var rollbackClosed []*subscription
 	var rollbackVoided []string
+	// What survives THIS ROLLBACK is the PRE-PACKET membership, not sess.sharedSubs — which
+	// is still the attempted one here and names the very keys being rolled back. A shared
+	// consumer this packet created can be the level-up companion of a filter the session
+	// already held ("$share/g/foo.>" joins the durable of "$share/g/foo"), and everything
+	// below is whole-durable, so acting on it would close a SURVIVING filter's delivery and
+	// withdraw its registrations. F-083.
+	rollbackSurv := mqttSharedSurvivorsOf(snap.shared)
 	for _, a := range added {
 		if a.cc == nil {
+			continue
+		}
+		if a.cc.DeliverGroup != _EMPTY_ && rollbackSurv.ownsDurable(a.cc.Durable) {
 			continue
 		}
 		if sub := sess.closeTeardownDeliveryLocked(c, a.cc); sub != nil {
@@ -8424,13 +8501,13 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 			// nothing else resumes them, so the packet's consumers and their charges
 			// would be leaked.
 			sess.retainOnLanded(func(rtok recordTx) {
-				sess.finishSubscribeRollback(c, rtok, subs, added, rollbackCancels, snap, q2AffUnwind)
+				sess.finishSubscribeRollback(c, rtok, subs, added, rollbackCancels, snap, q2AffUnwind, rollbackSurv)
 			})
 		}
 		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
 		return
 	}
-	sess.finishSubscribeRollback(c, tok, subs, added, rollbackCancels, snap, q2AffUnwind)
+	sess.finishSubscribeRollback(c, tok, subs, added, rollbackCancels, snap, q2AffUnwind, rollbackSurv)
 }
 
 // finishSubscribeRollback releases what a SUBSCRIBE packet created, once the
@@ -8439,9 +8516,17 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 // rolled-back session while the packet's consumers, their MaxAckPending charges and
 // its raw subscriptions stay behind, referenced by nothing.
 //
+// surv is the membership that survives this rollback, built by the staging half from the
+// PRE-PACKET snapshot and passed down rather than rebuilt here, for two reasons: the two
+// halves must agree on one answer, and snap.shared is assigned BY REFERENCE into
+// sess.sharedSubs by the restoration, so on the landed-continuation route — which runs from
+// the resolver, arbitrarily later — rebuilding from it would read a map another packet may
+// since have mutated. mqttSharedSurvivorsOf copies, so the set here is immutable. F-083.
+//
 // No lock held on entry.
 func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs []*subscription, added []addedCons,
-	cancels []mqttRegCancellation, snap *mqttSubSnapshot, q2AffUnwind mqttQ2AffUnwind) {
+	cancels []mqttRegCancellation, snap *mqttSubSnapshot, q2AffUnwind mqttQ2AffUnwind,
+	surv mqttSharedSurvivors) {
 	// Durable in the rolled-back record already; the tombstone is cleanup.
 	sess.secureRegCancellations(c, tok, cancels)
 	sess.finishQ2AffineUnwind(c, q2AffUnwind)
@@ -8449,14 +8534,21 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs [
 	// A raw subscription "existed before" this packet if the restored membership
 	// still holds its filter. The level-up sid ("<mainsid without .>> fwc") maps
 	// back to the main membership key ("<...>.>").
+	//
+	// BOTH maps are consulted, and the sid is NOT classified by prefix. A plain filter can
+	// carry the "$share/" prefix — mqttToNATSSubjectConversion encodes a literal '.' as "//",
+	// so plain "$share.foo" has the sid "$share//foo" — and classifying it as shared looked
+	// its key up in snap.shared alone, found nothing, and unsubscribed a subscription that
+	// PREDATED the packet on a rollback that is supposed to restore it. The two keyspaces are
+	// disjoint by construction (a shared key is "$share/<group>/<subject>", a plain one is a
+	// NATS subject), so testing both is exact rather than merely safe. F-083.
 	existedBefore := func(sid string) bool {
 		key := sid
 		if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
 			key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
 		}
-		if strings.HasPrefix(key, string(mqttSharedSubPrefix)) {
-			_, ok := snap.shared[key]
-			return ok
+		if _, ok := snap.shared[key]; ok {
+			return true
 		}
 		_, ok := snap.subs[key]
 		return ok
@@ -8468,6 +8560,13 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs [
 	}
 	for _, a := range added {
 		if a.cc.DeliverGroup != _EMPTY_ {
+			// A durable a SURVIVING membership still reaches is not this rollback's to
+			// release: the release is whole-durable, and the last-holder scan would withhold
+			// only the CONSUMER.DELETE while the purge, the refund and the deliver-subject
+			// unsubscribe all still landed on a live filter. F-083.
+			if surv.ownsDurable(a.cc.Durable) {
+				continue
+			}
 			sess.releaseSharedConsumer(c, tok, a.cc, nil)
 		} else {
 			sess.execDeferredConsumerDelete(c, tok, a.sid, a.cc)
@@ -16735,11 +16834,10 @@ func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fro
 			// the surviving filter's: releasing it would close that subscription, purge its
 			// pending identifiers and refund its charge, and the last-holder scan would not
 			// stop any of it — the scan withholds the consumer DELETE, nothing more. The
-			// failing filter's own membership is already rolled back on this path, so no key
-			// needs excluding. The wrapper's other callers keep their present behaviour;
-			// theirs is F-083. F-082.
+			// failing filter's own membership is already rolled back on this path, so the
+			// live map IS the surviving membership and no key needs excluding. F-082.
 			sess.mu.Lock()
-			stillOwn := sess.sharedKeyStillOwnsLocked(cc.Durable, _EMPTY_)
+			stillOwn := sess.survivingSharedLocked(nil).ownsDurable(cc.Durable)
 			sess.mu.Unlock()
 			if !stillOwn {
 				casRejected = sess.releaseSharedConsumerClassified(c, tok, cc, nil) || casRejected
@@ -17878,9 +17976,6 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 		}
 	}()
 
-	// One record scan (heldShared, computed after the record save below) decides
-	// every shared durable this packet may release.
-	var heldShared map[string]bool
 	// The record token is a PARAMETER, never the packet's: this closure is reached from
 	// commitUnsub, which also runs as a LANDED CONTINUATION under the resolver's
 	// transaction — and every write below (the shared release, the cancellation
@@ -17970,24 +18065,24 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 		// inactivity timer an ordinary subscription is created with.
 		sess.clearDrainInactivityTimers(c, timedDrains)
 
-		var sharedDurs []string
+		var sharedKeys []string
 		for _, f := range filters {
 			if f.shared {
-				sharedDurs = append(sharedDurs, mqttSharedDurablesForKey(f.sessionKey())...)
+				sharedKeys = append(sharedKeys, f.sessionKey())
 			}
 		}
-		if len(sharedDurs) > 0 {
-			heldShared = sess.sharedDurablesHeldByOthers(sharedDurs)
-		}
+		sess.releaseUnsubSharedTargets(c, tok, sharedKeys)
 		for _, f := range filters {
 			sid := f.sessionKey()
 			for _, s := range mqttUnsubSids(sid) {
 				// A DRAINED sid keeps its durable, its delivery subscription and its
 				// pending deliveries — that is the whole point — so it is skipped here.
 				// Only the client-facing subscription goes, because the client really did
-				// unsubscribe.
-				if !drainedSids[s] {
-					sess.removeUnsubConsumer(c, tok, s, heldShared)
+				// unsubscribe. Shared filters are handled above, by KEY rather than by sid.
+				if !drainedSids[s] && !f.shared {
+					if cc := sess.plainConsumerForUnsub(s); cc != nil {
+						sess.execDeferredConsumerDelete(c, tok, s, cc)
+					}
 				}
 				if err := c.processUnsub([]byte(s)); err != nil {
 					c.Errorf("error unsubscribing from %q: %v", s, err)
@@ -18180,83 +18275,89 @@ func setMQTTTestUnsubAckWindowHook(h func(c *client)) func() {
 	return func() { mqttTestUnsubAckWindowHookV.Store(prev) }
 }
 
-// removeUnsubConsumer releases one sid's consumer state for an UNSUBSCRIBE that is
-// known durable: the shared group release, the cancellation tombstones, the register
-// deletes and the consumer delete.
+// plainConsumerForUnsub returns the resident PLAIN consumer config an UNSUBSCRIBE sid names,
+// or nil when there is none or the sid names a shared group consumer.
 //
-// A METHOD rather than a closure inside mqttProcessUnsubs, deliberately. It is reached
-// from commitUnsub, which also runs as a LANDED CONTINUATION under the resolver's
-// transaction long after the packet's has closed — and every write here is refused at
-// entry under a closed token, silently, since none of these calls is checked for an
-// outcome. As a closure it captured the packet's transaction and kept using it after
-// its caller's signature changed to take one; with no enclosing scope there is nothing
-// to capture, so the token can only arrive as an argument. Passing the WRONG one
-// explicitly is still possible and is NOT covered by any test: the end-to-end
-// unsubscribe test releases a consumer with no pending registers, so the token-gated
-// record fallback below is never reached and the mutation survives. Stated as a known
-// gap in docs/ROADMAP.md rather than implied to be guarded.
+// It exists because commitUnsub must read sess.cons under sess.mu and then act without it —
+// execDeferredConsumerDeleteClassified takes the lock itself. The DeliverGroup test is a
+// structural backstop, not the routing authority: commitUnsub already dispatches on f.shared,
+// which is the parse-time truth. Nothing here may discriminate shared from plain LEXICALLY —
+// a literal '.' encodes as "//" (mqttToNATSSubjectConversion), so the ordinary plain filter
+// "$share.foo" has the sid "$share//foo" and a "$share/" prefix test would strand it. F-083.
 //
-// The caller holds the session-manager lock AND an open record transaction — the
-// packet's on the confirmed path, the resolver's on the landed continuation — and tok
-// is that transaction's token, which the cancellation fallback writes under. sess.mu
-// must NOT be held: this takes it.
-func (sess *mqttSession) removeUnsubConsumer(c *client, tok recordTx, sid string, heldShared map[string]bool) {
+// sess.mu must NOT be held: this takes it.
+func (sess *mqttSession) plainConsumerForUnsub(sid string) *ConsumerConfig {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
 	cc, ok := sess.cons[sid]
-	if !ok {
-		// A shared filter's group durable must be released even without a
-		// local consumer entry (e.g. a per-filter restore failure left the
-		// membership persisted with no live join): derive the durable(s) from
-		// the session key — the persisted authority — like clear() does, and
-		// delete each that has no remaining holder. The membership was already
-		// removed and persisted above, so the scan is correct. Spec5 [4.8.2].
-		if strings.HasPrefix(sid, string(mqttSharedSubPrefix)) && !strings.HasSuffix(sid, mqttMultiLevelSidSuffix) {
-			for _, dur := range mqttSharedDurablesForKey(sid) {
-				if heldShared[dur] {
-					continue
-				}
-				if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-					c.Errorf("Unable to delete shared consumer %q: %v", dur, err)
-				}
+	if !ok || cc == nil || cc.DeliverGroup != _EMPTY_ {
+		return nil
+	}
+	return cc
+}
+
+// releaseUnsubSharedTargets discharges what an UNSUBSCRIBE's shared filters held, for a
+// packet whose membership removals are already durable.
+//
+// THREE separate operations, because "this config is doomed" and "this durable is owed a
+// release" are different questions and the second does not imply the first. A durable an
+// overlapping key still holds is not owed — but the leaving key's own cons entries must go
+// regardless, or they outlive the membership with nothing left to reach them by. F-083.
+//
+// The three dispositions per group consumer are F-082's, applied here: own-held discharges
+// nothing and deletes nothing; a foreign holder or a REFUSED scan discharges this session's
+// own state and withholds the delete; unheld does both. Own-held targets are dropped before
+// the scan runs, so its answer can no longer be this session's own membership.
+//
+// PRECONDITION: the caller holds the session's OWNERSHIP GATE as well as an open record
+// transaction — mqttProcessUnsubs takes it for the packet, and the landed continuation runs
+// under the resolver's fence, which holds it. That is what keeps the surviving-membership
+// sample true after sess.mu is released; sess.mu alone would only make each access
+// race-free. A test driving this directly must take the gate itself.
+//
+// Returns the last-holder answer it computed, for a caller that needs it. sess.mu must NOT
+// be held: this takes it.
+func (sess *mqttSession) releaseUnsubSharedTargets(c *client, tok recordTx, sharedKeys []string) map[string]bool {
+	if len(sharedKeys) == 0 {
+		return nil
+	}
+	// (1) and (2) in ONE critical section: the doomed configs go, and the surviving
+	// membership is sampled without a cons mutation of this same packet in between.
+	// sess.update already applied the removals, so the live map IS what survives and nothing
+	// needs excluding — the opposite of the staging half, which runs before them.
+	sess.mu.Lock()
+	for _, key := range sharedKeys {
+		for _, sid := range mqttUnsubSids(key) {
+			delete(sess.cons, sid)
+		}
+	}
+	owed := sess.survivingSharedLocked(nil).targetsOwed(sharedKeys)
+	sess.mu.Unlock()
+	if len(owed) == 0 {
+		return nil
+	}
+	durs := make([]string, 0, len(owed))
+	for _, t := range owed {
+		durs = append(durs, t.durable)
+	}
+	// One scan for the whole packet.
+	held := sess.sharedDurablesHeldByOthers(durs)
+	for _, t := range owed {
+		// (3) Every REMAINING config naming an owed durable, not the first: a durable can be
+		// named by more than one stale entry (two `readd` shapes), and one left behind has no
+		// membership to reach it by. After (1) any such entry is stale by definition, since
+		// no surviving key reaches an owed durable.
+		sess.mu.Lock()
+		for csid, cfg := range sess.cons {
+			if cfg != nil && cfg.Durable == t.durable {
+				delete(sess.cons, csid)
 			}
 		}
-		return
+		sess.mu.Unlock()
+		// Outside sess.mu: the release takes it itself.
+		sess.releaseSharedGroupTarget(c, tok, t.durable, t.deliver, held)
 	}
-	delete(sess.cons, sid)
-	// A shared group consumer is released (deleted only if no other member
-	// remains); the leaving filter has already been removed from sharedSubs
-	// and persisted below, so the last-holder scan is correct. Spec5 [4.8.2].
-	if cc.DeliverGroup != _EMPTY_ {
-		sess.releaseSharedConsumer(c, tok, cc, heldShared)
-		return
-	}
-
-	c.mu.Lock()
-	sub := c.subs[cc.DeliverSubject]
-	c.mu.Unlock()
-
-	// Need lock here since these are accessed by callbacks
-	sess.mu.Lock()
-	// Mark the delivery sub closed so an in-flight QoS 1/2 callback stops
-	// tracking new messages after the purge (deleteConsumer is async);
-	// same barrier as the QoS 0 downgrade path in processJSConsumer.
-	if sub != nil && sub.mqtt != nil {
-		sess.subsMu.Lock()
-		sub.mqtt.closed = true
-		sess.subsMu.Unlock()
-	}
-	regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
-	sess.mu.Unlock()
-	// The consumer delete moved BELOW the purge, which is also what the barrier
-	// above always wanted: the closed flag is now set before the durable goes, and
-	// a cancelled registration is durably named before the consumer that would
-	// classify its source disappears.
-	if !sess.secureRegCancellations(c, tok, cancels) {
-		c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for client %q "+
-			"are not durably recorded yet", cc.Durable, sess.id)
-	}
-	// Before the consumer, for the reason given in deleteInflightRegisters.
-	sess.deleteInflightRegisters(c, tok, regs)
-	sess.deleteConsumer(cc)
+	return held
 }
 
 // mqttUnsubSids returns the sid(s) one UNSUBSCRIBE filter covers: its own, plus

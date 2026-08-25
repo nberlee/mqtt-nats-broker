@@ -2123,7 +2123,27 @@ func (sess *mqttSession) stageUnsubCancellationsLocked(c *client, filters []*mqt
 		out = append(out, cancels...)
 		transmitted = append(transmitted, sent...)
 	}
+	// Every shared key this packet leaves. The removals have NOT been applied yet, so the
+	// membership that survives is the live map minus this whole set — not minus the one key
+	// in hand: a single packet can leave BOTH overlapping filters, and excluding only the
+	// current one would let each doomed key protect the other and suppress a release nothing
+	// will then owe. F-083.
+	doomed := make(map[string]bool, len(filters))
+	var sharedKeys []string
 	for _, f := range filters {
+		if !f.shared {
+			continue
+		}
+		key := f.sessionKey()
+		if !doomed[key] {
+			doomed[key] = true
+			sharedKeys = append(sharedKeys, key)
+		}
+	}
+	for _, f := range filters {
+		if f.shared {
+			continue // handled by the fenced, name-keyed arm below
+		}
 		for _, sid := range mqttUnsubSids(f.sessionKey()) {
 			if drainedSids[sid] {
 				continue // the drain KEEPS this consumer: it is not abandoned at all
@@ -2137,10 +2157,20 @@ func (sess *mqttSession) stageUnsubCancellationsLocked(c *client, filters []*mqt
 			}
 			void(cc.Durable)
 		}
-		if f.shared {
-			for _, dur := range mqttSharedDurablesForKey(f.sessionKey()) {
-				void(dur)
+	}
+	// A shared filter's targets come from its KEY, and the barrier is lowered by DELIVER
+	// SUBJECT rather than through sess.cons. The two used to be keyed differently — the
+	// barrier through cons, the void by durable — so for a persisted membership with no live
+	// join the barrier was never lowered at all, leaving the void snapshot "only a moment in
+	// time" (closeTeardownDeliveryLocked). A shared filter never drains, so nothing here is
+	// owed to the drain arm above. F-083.
+	if len(sharedKeys) > 0 {
+		surv := sess.survivingSharedLocked(doomed)
+		for _, t := range surv.targetsOwed(sharedKeys) {
+			if sub := sess.closeSharedDeliveryLocked(c, t.deliver); sub != nil {
+				closed = append(closed, sub)
 			}
+			void(t.durable)
 		}
 	}
 	return out, closed, transmitted

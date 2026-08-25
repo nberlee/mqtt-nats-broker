@@ -2957,6 +2957,16 @@ generation, which the generation-scoped orphan pass does; that is deliberate, si
 tightening attribution here would alter the takeover residual rather than the readability
 defect.
 
+**Scoped, because the scope is the point.** A refusal now withholds exactly the group consumer
+**at every site that can have a surviving membership** — the failed-filter release's two
+halves, UNSUBSCRIBE's two halves, and a SUBSCRIBE packet's rollback's two halves. F-083 closed
+the last two by stating the rule as a property over the membership that survives the
+operation, rather than as a rule per caller; `docs/ARCHITECTURE.md` carries the mechanism and
+the four authorities. The 3.1.1 forced leave and teardown are **vacuous** for that property —
+neither can have a surviving membership — so neither is exempted from it and neither is fixed
+by it. The forced leave does still carry a separate defect of its own, its
+`cons`-versus-membership target mismatch, which is its own roadmap item; teardown carries none.
+
 ### A drain interrupted by its own session's clear withholds that completion
 
 The drain's finalizer captures its drain and sequence, then does JetStream work to release

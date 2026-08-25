@@ -1082,21 +1082,46 @@ further findings it surfaced are filed separately, for the reason its own bullet
   layer**. Sixteen mutations were run and each kills a named test. `docs/CONFORMANCE.md`
   residual 3 of the unreadable-record entry is now closed; items 1 and 2 there are unchanged.
 
-  - [ ] **Release UNSUBSCRIBE's own shared state independently of the last-holder answer**
-  ([F-083](findings/shared-qos2.md#f-083)). **Alpha blocker.** Filed by F-082's second consult
-  as a separate caller with its own commit path, rather than folded in — which is what keeps
-  F-082's "the other four callers are out of scope" boundary intact. Three statements, all
-  of
-  F-082's classes: `removeUnsubConsumer` gates the group-consumer DELETE on `heldShared` but
-  not the durable-scoped local purge, so leaving `$share/g/foo.>` while still holding
-  `$share/g/foo` purges the pending state and unsubscribes the deliver subject the SURVIVING
-  filter needs; `stageUnsubCancellationsLocked` mixes a `cons`-keyed barrier with a
-  durable-keyed void snapshot; and the no-`cons` branch discharges no local state at all,
-  which is the population `purgeSharedPending` already documents ("a 3.1.1 forced leave and
-  UNSUBSCRIBE's no-cons branch each strand transmitted entries with NEITHER view left"). The
-  remedy is expected to be F-082's applied here, with ONE thing re-derived rather than assumed:
-  an UNSUBSCRIBE removes its filters from `sharedSubs` **before** `commitUnsub` runs, so the
-  doomed key is already gone and F-082's staging exclusion does not transfer.
+  - [x] **Release a shared UNSUBSCRIBE's and a SUBSCRIBE rollback's own state independently of
+  the last-holder answer** ([F-083](findings/shared-qos2.md#f-083)). **Alpha blocker — done.**
+  Filed by F-082's second consult as a separate caller with its own commit path. **The item
+  WIDENED during planning, by an explicit decision recorded in the lane's `DECISIONS.md`:**
+  enumerating the callers of the whole-durable release turned up a FOURTH unfenced site that
+  no bullet owned — `finishSubscribeRollback` and its staging half in
+  `rollbackSubscribePacket` — where a failed SUBSCRIBE that rolls back cleanly strips a
+  *pre-existing, still-persisted* overlapping subscription of its delivery, its pending state
+  and its charge. Because that is the same invariant and F-082's own twin, it landed here
+  rather than as a fifth site-by-site item.
+  **What closed it, and it is a PROPERTY rather than four patches:** the fence is now "does a
+  membership that SURVIVES this operation still reach this durable?", asked of an explicit
+  immutable `mqttSharedSurvivors` key set that each operation supplies — the live map minus
+  the packet's whole doomed set at UNSUBSCRIBE staging (a SET, because one packet can leave
+  both overlapping filters and a single `exceptKey` lets each protect the other), the live map
+  at its commit half, and the PRE-PACKET SNAPSHOT at both halves of a rollback, whose live map
+  still names the key being rolled back. `sharedKeyStillOwnsLocked` is deleted and its two
+  F-082 callers converted, so one mechanism states the rule.
+  **Three defects the bullet had not stated, found while planning:** the no-`cons` branch also
+  released *neither* level-up durable in the mixed shape, because it excluded `" fwc"` sids;
+  "this config is doomed" and "this durable is owed" are different questions, so a doomed key's
+  config must go even when its durable survives (the commit half is three operations, not one);
+  and `removeUnsubConsumer` was a REDUNDANT MECHANISM, deleted rather than guarded a third
+  time — `execDeferredConsumerDeleteClassified` already was the correct plain teardown, while
+  the deleted one mutated `sess.cons` without `sess.mu` and never unsubscribed the deliver
+  subject.
+  **A regression the review caught and the tests now pin:** nothing may discriminate a shared
+  sid from a plain one LEXICALLY. A literal `.` encodes as `//`, so the ordinary plain filter
+  `$share.foo` has the sid `$share//foo`; a `$share/` prefix guard strands its consumer. The
+  authorities are `f.shared` and `cc.DeliverGroup`.
+  **ONE site is deferred, not two:** the 3.1.1 forced leave's `cons`-versus-membership target
+  mismatch, to the item below. Teardown is vacuous for this property and owes no separate fix,
+  so it is deferred nowhere.
+  **A defect the holistic review found in this change and this change fixed:** the SUBSCRIBE
+  rollback's own `existedBefore` still classified sids lexically, so a rollback unsubscribed a
+  pre-existing plain `$share.foo` subscription it was supposed to restore. **And a coverage
+  limit stated rather than implied away:** the two planned resolver-continuation tests were not
+  written, so the premise that the surviving-key sample stays true across the ownership gate is
+  argued from the call sites rather than tested; the continuation mechanism itself is untouched
+  by this item. See the dossier's coverage section.
 
   - [ ] **The 3.1.1 forced leave's
   post-CONNACK destructive exit.** Also surfaced by F-050's review, and deliberately not
