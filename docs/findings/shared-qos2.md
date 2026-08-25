@@ -377,11 +377,14 @@ classification invariant rather than a demonstrated delivery bug.
 A `Cons` entry whose `DeliverGroup` is non-empty is a format this broker never writes. Under
 the compatibility boundary it is **refused**, not accommodated, at every ingress — the
 CONNECT restore prologue (which also covers the overdue/retired branch built from the same
-record), record-driven expiry, the session-expiry sweep, the orphan-consumer sweep, and the
-common `mqttValidateSessionRecord`. The two expiry paths matter most: they would claim,
-rewrite and delete the record, normalizing a shape nothing here understands. The orphan
-sweep **aborts** rather than skipping, because that walk decides what to delete by absence
-of a reference and a partial view must never be reported as a complete one.
+record), record-driven expiry, the session-expiry sweep, the orphan-consumer sweep, the
+common `mqttValidateSessionRecord`, and the shared last-holder scan
+(`sharedDurablesHeldByOthers`). The two expiry paths matter most: they would claim,
+rewrite and delete the record, normalizing a shape nothing here understands. The two walks
+that decide by absence of a reference refuse in the way that withholds their destructive
+act, because a partial view must never be reported as a complete one: the orphan sweep
+**aborts** rather than skipping, and the last-holder scan **reports every requested durable
+held** rather than skipping, which withholds the group-consumer deletion.
 
 ### What this establishes, and what it does not
 

@@ -17463,7 +17463,14 @@ func (sess *mqttSession) collectSharedPendingPurge() ([]mqttVoidedReg, []mqttReg
 // subscriptions, or any other session's persisted record (which covers the
 // cluster). One record walk answers for all durables, so a caller releasing
 // several in one operation (clear, forced leave, UNSUBSCRIBE) pays a single
-// scan. Spec5 [4.8.2].
+// scan.
+//
+// It FAILS CLOSED: an indeterminate walk, a record that does not decode, and a record
+// carrying shared group consumers in Cons each report every requested durable held,
+// because none of them establishes shared-holder absence. It deliberately does NOT
+// refuse an unattributable client ID or an unvalidatable generation the way the
+// generation-scoped orphan pass does — the own-record skip below is keyed on the record's
+// own ID and is a stated residual. Spec5 [4.8.2].
 func (sess *mqttSession) sharedDurablesHeldByOthers(durables []string) map[string]bool {
 	held := make(map[string]bool, len(durables))
 	uniq := make([]string, 0, len(durables))
@@ -17482,6 +17489,16 @@ func (sess *mqttSession) sharedDurablesHeldByOthers(durables []string) map[strin
 			}
 		}
 	}
+	// This answer authorizes an IRREVERSIBLE delete of a group consumer whose backlog
+	// is interest-retained, so "no other holder" may only be reported out of a record
+	// set this walk read in full. A record it cannot establish shared-holder absence
+	// from is reported as a HOLDER instead, which withholds the delete. Spec5 [4.8.2].
+	holdAll := func() {
+		for _, d := range uniq {
+			held[d] = true
+		}
+		pending = 0
+	}
 
 	sess.mu.Lock()
 	for key := range sess.sharedSubs {
@@ -17499,16 +17516,34 @@ func (sess *mqttSession) sharedDurablesHeldByOthers(durables []string) map[strin
 			// caller never deletes a group durable other members may still hold.
 			// Spec5 [4.8.2].
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				for _, d := range uniq {
-					held[d] = true
-				}
+				holdAll()
 			}
 			break
 		}
 		seq = smsg.Sequence + 1
 		ps := &mqttPersistedSession{}
 		if err := json.Unmarshal(smsg.Data, ps); err != nil {
-			continue
+			// Skipping it would report absence out of a record that may be the very
+			// holder, which is the same partial-view-as-a-complete-one error
+			// sweepOrphanedConsumers aborts its pass to avoid.
+			sess.jsa.c.Warnf("MQTT: shared last-holder scan for session %q: unable to decode the "+
+				"session record on stream %q subject %q at sequence %v, reporting every group "+
+				"durable held: %v", sess.id, mqttSessStreamName, smsg.Subject, smsg.Sequence, err)
+			holdAll()
+			break
+		}
+		// A shape this broker never writes is refused for the same reason, and BEFORE
+		// the own-record skip below: that skip presumes an interpretable record, and a
+		// same-ID one may be a takeover winner's. Holders are read out of SharedSubs
+		// alone, so a record carrying shared group consumers in Cons hides exactly the
+		// holder whose durable the caller is about to delete.
+		if sid, found := mqttSharedConsInRecord(ps); found {
+			sess.jsa.c.Warnf("MQTT: shared last-holder scan for session %q: reporting every group "+
+				"durable held for the record on stream %q subject %q at sequence %v: %v",
+				sess.id, mqttSessStreamName, smsg.Subject, smsg.Sequence,
+				mqttSharedConsRecordErr(ps.ID, sid))
+			holdAll()
+			break
 		}
 		// This session's own record is covered by the in-memory check above; it
 		// may also be stale relative to a just-completed remove.

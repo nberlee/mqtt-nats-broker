@@ -3055,11 +3055,18 @@ condition clears by any means. All of it is recorded in `docs/CONFORMANCE.md`.
 A record carrying a shared group consumer configuration in `Cons` is a shape this broker
 never writes, and is **refused** at every ingress that reads one rather than accommodated:
 the CONNECT restore prologue, record-driven expiry, the session-expiry sweep, the
-orphan-consumer sweep, and the shared record validator. The two expiry paths matter most —
-they would claim, rewrite and delete the record, normalizing a format nothing here
-understands — and the orphan sweep **aborts** rather than skipping, because that walk
-decides what to delete by absence of a reference and a partial view must never be reported
-as a complete one.
+orphan-consumer sweep, the shared record validator, and the shared last-holder scan. The
+refusals divide by what each one protects. The two **expiry** paths would claim, rewrite
+and delete the record, normalizing a format nothing here understands, so they refuse to act
+on it — the session-expiry sweep only once the record is otherwise eligible for expiry
+processing, since a zero or never-expiring interval ends that pass before the shape is
+reached. The two **delete-by-absence** readers decide what to destroy from the absence
+of a
+reference across the whole record set, so for them a partial view must never be reported as
+a complete one: the orphan-consumer sweep **aborts** its pass rather than skipping, and the
+last-holder scan **reports every requested durable held** rather than skipping. "The
+last-holder scan fails closed on a record it cannot read", below, is that scan's own
+section.
 
 ## A restored shared membership is arbitrated against the record
 
@@ -3270,6 +3277,55 @@ void-register revision uncredited, and leaves the sequence, lineage and record b
 acknowledged base, because at forked those bytes demonstrably are not the record. Without
 that retirement the close would park a teardown that a later generic disposal consumes,
 losing the Will.
+
+## The last-holder scan fails closed on a record it cannot read
+
+The two sections above establish that a group durable is *present and canonical* and that
+this broker still *owns* the membership. Neither says when a durable may be **destroyed**,
+and that decision has its own instrument: `sharedDurablesHeldByOthers`, the scan five
+release paths consult before deleting a group consumer — teardown, a failed shared
+SUBSCRIBE's rollback, the 3.1.1 forced leave, the per-consumer release, and UNSUBSCRIBE.
+
+**Its answer authorizes an irreversible deletion**, and `$MQTT_msgs` is interest-retained,
+so deleting a group durable destroys the backlog of every member of that group with it.
+That is why "no other holder" may only be reported out of a record set the walk read in
+full. Three dispositions therefore report **every requested durable held**, which withholds
+the deletion: an indeterminate walk (a JS API timeout, a meta-leader failover), a record
+whose bytes do not decode, and a record carrying shared group consumers in `Cons` — the
+last because holders are read out of `SharedSubs` alone, so that shape hides precisely the
+holder whose durable the caller is about to delete.
+
+**The discriminator, so a future walk is classified rather than re-argued.** A walk that
+decides by the **absence of a reference across the whole record set** must fail closed on
+any record it cannot interpret; a walk that decides only about the **record in front of it**
+is already fail closed when it skips one. That is why `buildSessionRefs` and the
+orphan-consumer sweep abort, why the last-holder scan reports held, and why
+`sweepSessionExpiries` and `adoptAbandonedTeardowns` correctly *skip* — for those two,
+skipping performs no action and the record goes on protecting everything it names.
+
+**What this scan deliberately does NOT refuse**, because the temptation is to assume it
+inherits the orphan pass's whole set. It does not validate that a record's client ID hashes
+back to its subject token, and it does not validate a generation. Its own-record skip is
+keyed on the record's `ps.ID`, which is the documented takeover residual recorded below and
+in `docs/CONFORMANCE.md`; tightening attribution here would change that residual rather than
+this scan's readability defect. The shape check is placed **above** the own-record skip for
+the matching reason: that skip presumes an interpretable record, and a same-ID one may
+be a
+takeover winner's.
+
+**The cost is stated rather than implied away.** A durable spared by a refusal is not
+reclaimed by anything else — the orphan-consumer sweep aborts on the very same record — and
+the retention is unbounded in count, since one such record spares the durables of every
+later group as well. `docs/CONFORMANCE.md` carries it, with the diagnostic naming the
+stream, the subject and the sequence so an operator can act.
+
+**And this scan is a read, not an arbitration.** Membership and record ownership are
+arbitrated by the session subject's CAS; this walk is a non-snapshot read that merely
+authorizes a deletion, and `CONSUMER.DELETE` carries no precondition binding the consumer's
+existence to the record. A joiner persists its membership *before* creating the group
+durable, which covers the principal leave race but not all of it: a leaver can complete its
+scan before the join record lands and delete after the joiner's final verification. Failing
+closed on an unreadable record does not close that, and does not claim to.
 
 ## The restore gate: the CONNACK follows a complete restoration
 

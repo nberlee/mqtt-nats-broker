@@ -2647,9 +2647,12 @@ carrying a shared group consumer configuration in `Cons` is a format this broker
 writes — shared membership is held in `SharedSubs` alone — and every path that reads one
 refuses it and
 leaves the record untouched: the CONNECT restore, both expiry paths, the orphan-consumer
-sweep, and the shared record validator. The orphan-consumer sweep **aborts its whole pass**
-on meeting one, because that walk deletes by absence of a reference and must never act on
-a partial view. The recovery is the compatibility boundary's: stop the account's brokers and
+sweep, the shared record validator, and the shared last-holder scan. The two paths that
+decide by **absence of a reference** across the whole record set refuse in the way that
+withholds their destructive act, because neither may act on a partial view: the
+orphan-consumer sweep **aborts its whole pass**, and the last-holder scan **reports every
+requested durable held**, which withholds the group-consumer deletion. The recovery is the
+compatibility boundary's: stop the account's brokers and
 recreate the bridge-owned `$MQTT_*` streams. This is not a rolling upgrade.
 
 ### The retained index is not arbitrated by sequence, and a lost application is not repaired
@@ -2899,6 +2902,60 @@ strength of a read that failed, and which can free a packet identifier the clien
 still holding. A refusal an operator can see and repair is preferable to a silent loss,
 and it is the posture this tree already takes toward a persisted shape it cannot
 interpret (F-056, F-057, F-058).
+
+### A group durable owed a last-holder delete is retained while a record is unreadable
+
+`sharedDurablesHeldByOthers` decides whether any session other than this one still holds a
+group durable, and five release paths delete the group consumer on a "no": teardown, a
+failed shared SUBSCRIBE's rollback, the 3.1.1 forced leave, the per-consumer release, and
+UNSUBSCRIBE. Because `$MQTT_msgs` is interest-retained, that deletion destroys every
+member's backlog with it, so the scan now **fails closed** — an indeterminate walk, a record
+whose bytes do not decode, and a record carrying shared group consumers in `Cons` each
+report every requested durable held. Previously only the first did; the other two were
+skipped, and absence was then reported out of a record set that had not been read.
+
+**What that costs, stated three ways.**
+
+1. **Nothing reclaims the retained durable.** The orphaned-consumer sweep is the only other
+   path to it and it **aborts** on the very same record, so a durable spared here stays
+   until an operator repairs or removes that record. It is not inert: it holds stream
+   interest and can accumulate pending messages, and a later joiner to the same
+   deterministic name may receive messages published while no authoritative membership
+   existed. The diagnostic names the stream, the subject and the sequence for exactly that
+   purpose.
+2. **The retention is unbounded in count**, not merely bounded in kind. One unreadable
+   record spares the durables of every group released afterwards, for as long as it is
+   present.
+3. **One caller withholds more than the durable.** `releaseFailedSharedFilter` tests the
+   scan's answer *before* removing its own local state, so a refusal there also strands the
+   resident `cons` entry, the closed delivery state and the ack-budget accounting — not just
+   the group consumer. **The indeterminate-walk arm already causes the same suppression, and
+   just as durably**: that cleanup is the *one-shot* landed continuation of an ambiguous
+   save, so recovery of the transient JS error does not retry it either. What the new arms
+   add is a **stable trigger** while an unsupported record remains, not a new persistence
+   class. The resulting strand is **not persisted** — a shared consumer config is excluded
+   from the record — so it is confined to the resident session object, where it may impair
+   that session's ack budget across reconnects, and it is cleared when the session is
+   discarded or reconstructed. It is tracked as its own `docs/ROADMAP.md` item and is
+   deliberately not fixed here.
+
+**What this does NOT close.** The scan is a non-snapshot read that authorizes a
+deletion, not
+an arbitration: membership and record ownership are arbitrated by the session subject's CAS,
+while `CONSUMER.DELETE` carries no precondition binding a consumer's existence to a record.
+A joiner persists its membership before creating the group durable, which covers the
+principal leave race but not all of it — a leaver can complete its scan before the join
+record lands and delete after the joiner's final verification. That residual is unchanged.
+Equally unchanged is the **same-client-ID skip** recorded above: the scan skips records whose
+`ps.ID` matches its own session, so after a takeover the new owner's record is invisible to
+it. The new unsupported-shape check is placed above that skip and narrows only records this
+broker never writes, so the residual and F-077's refutations that rest on it stand
+exactly as
+before. This scan validates neither a client ID that hashes back to its subject token
+nor a
+generation, which the generation-scoped orphan pass does; that is deliberate, since
+tightening attribution here would alter the takeover residual rather than the readability
+defect.
 
 ### A drain interrupted by its own session's clear withholds that completion
 

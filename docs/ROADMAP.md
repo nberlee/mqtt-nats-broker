@@ -978,16 +978,68 @@ further findings it surfaced are filed separately, for the reason its own bullet
   and the residual F-078 must widen from F-077's resume-scoped version to the whole
   operation class.
 
-  - [ ] **`sharedDurablesHeldByOthers` fails OPEN on an undecodable record.** Authorised as
-  its own item by F-077's escalation. The holder scan `continue`s past a record it cannot
-  decode, while `sweepOrphanedConsumers` — which makes the same kind of
+  - [x] **`sharedDurablesHeldByOthers` fails OPEN on an undecodable record.** Authorised as
+  its own item by F-077's escalation. **Done.** The holder scan `continue`d past a
+  record it
+  could not decode, while `sweepOrphanedConsumers` — which makes the same kind of
   delete-by-absence-of-a-reference decision — **aborts its whole pass** on exactly that
   shape. An undecodable record may be the very thing holding the durable, so skipping it
-  can delete a group consumer other members still hold. F-077 deliberately does not touch
-  it: it adds no caller, and does not use that scan to delete anything on a foreign
-  verdict. The
-  fix is to make it fail closed like the sweep, with a test that a record whose bytes do not
-  decode is reported as a holder rather than skipped.
+  could delete a group consumer other members still hold, taking the interest-retained
+  backlog of every member with it. **The finding was stated too narrowly and the fix is
+  wider than the bullet's words**, per the plan review: an implementation that only replaced
+  the `continue` satisfies this text and keeps the bug, because holders are read out of
+  `SharedSubs` **alone**, so a record carrying shared group consumers in `Cons` — the shape
+  `mqttSharedConsInRecord` exists for, which `buildPersistedSessionLocked` never writes and
+  both sibling readers already refuse — decodes perfectly and hides exactly the holder whose
+  durable is about to be deleted. Reachability is identical for the two shapes, so both
+  landed. The restated property is that the scan must never report a durable **unheld** on
+  the strength of a record it cannot establish shared-holder absence from; all three arms
+  (indeterminate walk, undecodable, unsupported shape) now converge on one `holdAll`
+  disposition. **The shape check sits ABOVE the own-record skip**, because that skip
+  presumes an interpretable record and a same-ID one may be a takeover winner's; that
+  ordering is pinned by its own test case and its own mutation. **Deliberately NOT widened**
+  to the orphan pass's other aborts — an unattributable client ID and an unvalidatable
+  generation — since the own-record skip is keyed on `ps.ID` and is the documented takeover
+  residual F-077's deletion refutations rest on, so tightening attribution would change that
+  residual rather than this defect. The four sibling `$MQTT_sess` walks were swept and
+  **none changed**: `buildSessionRefs` and the orphan-consumer sweep already abort, while
+  `sweepSessionExpiries` and `adoptAbandonedTeardowns` correctly *skip*, because they decide
+  what to write about the record in front of them rather than what to delete by absence.
+  `docs/ARCHITECTURE.md` states that discriminator once, and its "refused at every ingress"
+  enumeration gained this sixth ingress. **Residuals, in `docs/CONFORMANCE.md`:** nothing
+  reclaims a durable spared by a refusal, since the orphan sweep aborts on the same record;
+  the retention is **unbounded in count**, not merely in kind; and the scan remains a
+  non-snapshot read rather than an arbitration, so the leaver-versus-joiner
+  `CONSUMER.DELETE` race is untouched.
+
+  - [ ] **`releaseFailedSharedFilter` gates its own local cleanup on the last-holder
+  answer.** Split out by the plan review of the item above, as a caller-specific lifecycle
+  defect rather than part of that scan's repair. `mqtt.go:8092` tests `held[dur]` **before**
+  removing the resident `sess.cons` entry and taking either of its two exits —
+  `releaseSharedConsumer` when a matching `cc` is found, a direct `deleteConsumer` when it
+  is not — so a refusal strands the closed delivery state, the `cons` entry and the
+  ack-budget accounting, not only the group durable. The other four callers withhold the
+  consumer delete alone. **The indeterminate-walk arm already causes the same suppression,
+  and just as durably** — the cleanup is the one-shot landed continuation of an ambiguous
+  save, so recovery of the transient JS error does not retry it either. An earlier draft of
+  this bullet said the fail-closed change turned the defect from transient into permanent;
+  that was wrong and the tie-break consult refuted it. What the new arms add is a **stable,
+  deterministic trigger** while an unsupported record remains. The strand is in-memory only,
+  since a shared consumer config never reaches the record, so it is confined to the resident
+  session object and cleared when that session is discarded or reconstructed. **In-memory
+  is
+  NOT the same as short-lived, and this bullet must not be read as saying so.** A
+  never-expiring resident session is retained across reconnects and may never be discarded
+  or
+  reconstructed at all, and the one-shot continuation is never retried, so the stranded
+  `cons` entry and ack-budget charge can impair that session **indefinitely**. What separates
+  this from the scan's own defect is the **scope ruling** recorded above — a caller-specific
+  lifecycle defect, deferred by an explicit decision — not any inference that memory-only
+  state decays on its own. The fix must separate
+  "this session's own
+  cleanup is owed" from "the group durable may be destroyed" — they are different facts and
+  only the second depends on other members — and must not reintroduce a deletion the
+  last-holder answer refused.
 
   - [ ] **The 3.1.1 forced leave's
   post-CONNACK destructive exit.** Also surfaced by F-050's review, and deliberately not
