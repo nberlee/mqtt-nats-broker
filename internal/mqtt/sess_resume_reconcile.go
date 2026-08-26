@@ -18,7 +18,7 @@
 //	          of a multi-level filter included, since it is an independent
 //	          consumer — and mint an identity outright for a QoS 1/2 sid with
 //	          no Cons entry at all (the restore path would otherwise create its
-//	          consumer after the CONNACK and never persist it);
+//	          consumer later in the resume and never persist it);
 //	subscribe every recorded deliver subject CLOSED and flushed, BEFORE the
 //	          lookup: a consumer that is present at lookup can be reaped a
 //	          moment later — the lookup alone does not stop the inactivity
@@ -39,9 +39,11 @@
 //	          the create-to-subscribe gap;
 //	save      the repaired identities in ONE record write, still pre-CONNACK.
 //	          By construction this is the first write after the accept save:
-//	          processSubs and everything it can reach runs only after the
-//	          CONNACK, so no general subscription-processing write can observe
-//	          a half-committed replacement.
+//	          this phase runs BEFORE processSubs, so no general
+//	          subscription-processing write can observe a half-committed
+//	          replacement. Note what that does NOT say — processSubs itself is
+//	          also pre-CONNACK (F-050 moved restoration there), so a later
+//	          pre-CONNACK write can and does observe state it provisioned.
 //
 // Every phase-installed subscription carries a phase-owned marker and stays
 // CLOSED until subscription restoration adopts it IN PLACE (processJSConsumer's
@@ -64,35 +66,96 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// mqttResumeReconcileVerdict is how the reconciliation phase ended. Anything
-// but "proceed" refuses the CONNECT through the pre-CONNACK abort discipline.
-type mqttResumeReconcileVerdict int
+// mqttPreConnackOutcome is how a pre-CONNACK step that can refuse the CONNECT
+// ended. ONE partition for the reconciliation phase and the lifetime grant,
+// because they classify the same record write the same way.
+//
+// Anything but "proceed" refuses the CONNECT through the pre-CONNACK abort
+// discipline, and the two DISPOSING outcomes additionally carry a disposal
+// vocabulary. That vocabulary is what the DISPOSAL claims; what the CLIENT is
+// told is preConnackRefusalFor's projection, which is deliberately a different
+// thing — see mqttPreConnackRefusal in mqtt.go.
+type mqttPreConnackOutcome int
 
 const (
-	// mqttReconcileProceed: every collected durable is verified or repaired, and
+	// mqttPreConnackProceed: every collected durable is verified or repaired, and
 	// any repair is durably named by the record. The CONNACK may be sent.
-	mqttReconcileProceed mqttResumeReconcileVerdict = iota
-	// mqttReconcileRefuseLocal: the phase failed definitively and undid its own
-	// work. The resident session is still ours, stays mapped, and detaches
-	// through ordinary close bookkeeping under the lifetime it already had — the
-	// CONNECT's requested Session Expiry Interval is applied only at the grant
-	// point, after this phase, so a refused resume leaves nothing to repair. The
-	// client reconnects and resumes.
-	mqttReconcileRefuseLocal
-	// mqttReconcileRefuseForeign: the repair save proved another broker owns the
-	// session record; it has been foreign-disposed (DISCONNECT suppressed, since
-	// no success CONNACK was written). The phase's consumers are referenced by
-	// no record and no live session, so the orphan sweep reclaims them.
-	mqttReconcileRefuseForeign
-	// mqttReconcileRefuseUnresolved: the repair save's outcome is unknown. The
+	mqttPreConnackProceed mqttPreConnackOutcome = iota
+	// mqttPreConnackLocal: the step failed definitively and undid its own work.
+	// The resident session is still ours, stays mapped, and detaches through
+	// ordinary close bookkeeping under the lifetime it already had — the CONNECT's
+	// requested Session Expiry Interval is applied only at the grant point, so a
+	// refused resume leaves nothing to repair. The client reconnects and resumes.
+	//
+	// Reached without a save at all on five of the reconciliation phase's returns
+	// (an indeterminate verification, a failed or refused create, the tmaxack
+	// limit), which is why this partition is named for the STEP rather than for a
+	// save: "nothing was stored" holds trivially when nothing was attempted.
+	mqttPreConnackLocal
+	// mqttPreConnackDisposingNonForked: the record CAS was rejected and nothing
+	// narrowed it to a sibling. Deliberately NOT called "foreign": that arm is
+	// also reached when the record could not be read, was absent, did not decode,
+	// was released, or sat at or below our base, none of which establishes another
+	// owner. The disposal's own claim is unchanged and still comes from the
+	// vocabulary; the CLIENT is told only that ownership could not be confirmed.
+	// See F-084 for the claim the vocabulary itself still over-states.
+	mqttPreConnackDisposingNonForked
+	// mqttPreConnackDisposingForked: the authoritative body has a non-empty,
+	// distinct identity and claims the same parent as our acknowledged record.
+	// That is a positive fact and 0x89 "try again" states exactly what it
+	// licenses — not that a fork was proved, since provenance is not validated.
+	// See sess_fork_lineage.go.
+	mqttPreConnackDisposingForked
+	// mqttPreConnackUnresolved: the record write's outcome is unknown. The
 	// pending-write state carries the attempt's identity and its exact bytes, the
 	// replaced entries are KEPT (the record may name them, and a resolution that
 	// re-attempts those bytes makes it so), and resolution is deferred: the accept
 	// transaction is still open, so it runs from the deferred-close path, the
 	// periodic uncertain pass, or the next CONNECT. No traffic is served meanwhile
-	// — no CONNACK was sent and every phase subscription is closed.
-	mqttReconcileRefuseUnresolved
+	// — no SUCCESS CONNACK was sent (the refusal carries 0x83 and this step's own
+	// diagnostic, which opens nothing) and every phase subscription is closed.
+	mqttPreConnackUnresolved
 )
+
+// disposes reports whether this outcome hands the session to the foreign
+// disposition. Only these two carry a vocabulary.
+func (o mqttPreConnackOutcome) disposes() bool {
+	return o == mqttPreConnackDisposingNonForked || o == mqttPreConnackDisposingForked
+}
+
+// mqttResumeReconcileResult is how the reconciliation phase ended, and it keeps
+// the two facts APART on purpose: outcome decides what the client is told, voc
+// decides what the disposal claims, and neither is derived from the other.
+//
+// installed is non-nil only on Proceed; voc is the zero vocabulary unless the
+// outcome disposes.
+type mqttResumeReconcileResult struct {
+	installed []string
+	outcome   mqttPreConnackOutcome
+	voc       mqttDisposalVocabulary
+	err       error
+}
+
+// mqttLifetimeGrantResult is the same shape for the lifetime grant, which used to
+// return a bare error and dispose on the way out — so its caller could neither
+// order the refusal signal before the close it scheduled, nor tell a fork from
+// anything else.
+type mqttLifetimeGrantResult struct {
+	outcome mqttPreConnackOutcome
+	voc     mqttDisposalVocabulary
+	err     error
+}
+
+// mqttClassifiedPreConnackSave is what classifyPreConnackSave found: the outcome,
+// the vocabulary the route that reached it computed, and whether that route was
+// the CONTENDED one, which is the only thing that distinguishes the two
+// unresolved arms from each other.
+type mqttClassifiedPreConnackSave struct {
+	outcome   mqttPreConnackOutcome
+	voc       mqttDisposalVocabulary
+	err       error
+	contended bool
+}
 
 // mqttReconcileEntry is one plain QoS 1/2 delivery identity the phase owes a
 // verdict: a sid (the filter itself, or its level-up companion), the subject
@@ -126,8 +189,11 @@ const (
 	// succeeded, or a re-read found our exact bytes at a newer sequence — the
 	// response was lost to contention). sess.seq has adopted the landed sequence.
 	mqttRepairSaveLanded mqttRepairSaveVerdict = iota
-	// mqttRepairSaveForeign: the record moved to content that is not our write
-	// (or is gone). Another owner is authoritative.
+	// mqttRepairSaveForeign: the record moved to content that is not our write, or is
+	// gone. Deliberately NOT "another owner is authoritative": that is the inference
+	// F-084 rejects, and this arm is also reached by a gone, unreadable, undecodable or
+	// below-base record, none of which establishes a successor. What IS established is
+	// that our write did not land and this CONNECT cannot proceed.
 	mqttRepairSaveForeign
 	// mqttRepairSaveForked: the record moved to content provably CLAIMING the same parent, a sibling of
 	// the one this broker was acknowledged for. Every consequence of foreign holds —
@@ -363,14 +429,20 @@ func (c *client) mqttAbortAcceptedConnect() {
 // the session held in asm.sessLocked (which is the ownership gate the foreign
 // disposition requires).
 //
-// On mqttReconcileProceed it returns the deliver subjects of every
+// On mqttPreConnackProceed it returns the deliver subjects of every
 // still-phase-owned subscription, for the post-processSubs sweep (and its
-// deferred fallback) to reclaim if restoration skips a filter. On any refusal
-// the caller aborts the CONNECT through mqttAbortAcceptedConnect; the phase has
-// already put the session in the state its verdict names.
+// deferred fallback) to reclaim if restoration skips a filter.
+//
+// It REPORTS its refusal rather than acting on the disposing half of it: the
+// caller aborts the CONNECT, signals the client, and only then hands the session
+// to the foreign disposition. Disposing here instead would schedule
+// closeConnection on another goroutine before the caller could enqueue a
+// CONNACK, which is what kept this site silent (docs/ROADMAP.md's
+// pre-CONNACK-signal item). Everything else the verdict names — the phase's own
+// undo, its gate releases — has already happened on return.
 //
 // No lock held on entry.
-func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession, c *client, tok recordTx) ([]string, mqttResumeReconcileVerdict, error) {
+func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession, c *client, tok recordTx) mqttResumeReconcileResult {
 	opts := c.srv.getOpts()
 	ackWait := opts.MQTT.AckWait
 	if ackWait == 0 {
@@ -426,7 +498,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	}
 	sess.mu.Unlock()
 	if len(entries) == 0 {
-		return nil, mqttReconcileProceed, nil
+		return mqttResumeReconcileResult{outcome: mqttPreConnackProceed}
 	}
 
 	// Everything the phase does is tracked so a failure undoes exactly that and
@@ -565,8 +637,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		}
 		if err := subscribeClosed(e, e.cc.DeliverSubject, e.cc.Durable); err != nil {
 			undo()
-			return nil, mqttReconcileRefuseLocal,
-				fmt.Errorf("unable to install delivery interest for durable %q of filter %q: %v", e.cc.Durable, e.sid, err)
+			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
+				err: fmt.Errorf("unable to install delivery interest for durable %q of filter %q: %v", e.cc.Durable, e.sid, err)}
 		}
 		installed[e.cc.DeliverSubject] = struct{}{}
 	}
@@ -601,8 +673,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		// resume a session whose subscriptions may be silently dead. Fail closed;
 		// the client reconnects.
 		undo()
-		return nil, mqttReconcileRefuseLocal,
-			fmt.Errorf("unable to verify the session's QoS 1/2 consumers: %v", err)
+		return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
+			err: fmt.Errorf("unable to verify the session's QoS 1/2 consumers: %v", err)}
 	}
 
 	// ---- Step 3: repair each absent durable --------------------------------
@@ -621,8 +693,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		durName := idHash + "_" + nuid.Next()
 		if err := subscribeClosed(e, inbox, durName); err != nil {
 			undo()
-			return nil, mqttReconcileRefuseLocal,
-				fmt.Errorf("unable to install delivery interest for the replacement consumer of filter %q: %v", e.sid, err)
+			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
+				err: fmt.Errorf("unable to install delivery interest for the replacement consumer of filter %q: %v", e.sid, err)}
 		}
 		installed[inbox] = struct{}{}
 		mintedInbox[inbox] = true
@@ -660,8 +732,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		if after := sess.tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
 			sess.mu.Unlock()
 			undo()
-			return nil, mqttReconcileRefuseLocal,
-				fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v", after, mqttMaxAckTotalLimit)
+			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
+				err: fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v", after, mqttMaxAckTotalLimit)}
 		}
 		sess.mu.Unlock()
 
@@ -698,8 +770,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		}
 		if cerr != nil {
 			undo()
-			return nil, mqttReconcileRefuseLocal,
-				fmt.Errorf("unable to recreate the QoS %d consumer for filter %q: %v", e.qos, e.sid, cerr)
+			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
+				err: fmt.Errorf("unable to recreate the QoS %d consumer for filter %q: %v", e.qos, e.sid, cerr)}
 		}
 		newCC := &ccr.Config
 		created = append(created, newCC)
@@ -737,7 +809,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	}
 
 	if !repairedAny {
-		return installedList(), mqttReconcileProceed, nil
+		return mqttResumeReconcileResult{installed: installedList(), outcome: mqttPreConnackProceed}
 	}
 
 	// ---- Step 4: persist the repaired identity ------------------------------
@@ -747,64 +819,122 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// kind is destroyed by save()'s formatting) plus the exact base sequence and
 	// body bytes sent, so the 10164 re-read compares against what was actually
 	// stored.
-	outcome, detail, serr := sess.saveClassifiedDetail(tok)
-	if serr == nil {
-		return installedList(), mqttReconcileProceed, nil
-	}
-
-	if outcome == saveMaybeLanded {
+	cs := sess.classifyPreConnackSave(tok)
+	switch cs.outcome {
+	case mqttPreConnackProceed:
+		return mqttResumeReconcileResult{installed: installedList(), outcome: mqttPreConnackProceed}
+	case mqttPreConnackUnresolved:
 		// The record may already name the replacements, so the replaced entries are
 		// KEPT — and nothing further is owed when the resolver proves them durable:
 		// the record names them and the next resume verifies them present, so there
 		// is no landed continuation to register. Resolution is necessarily deferred:
 		// the accept transaction is still open, so it runs from the deferred-close
 		// path, the periodic uncertain pass, or the next CONNECT — and no traffic is
-		// served meanwhile (no CONNACK, every phase subscription closed).
+		// served meanwhile: no SUCCESS CONNACK is written (the caller's refusal carries
+		// 0x83 and this step's own diagnostic, which opens nothing) and every phase
+		// subscription stays closed.
 		releaseGates()
-		return nil, mqttReconcileRefuseUnresolved, serr
+		err := cs.err
+		if cs.contended {
+			// The 10164 route says so, because a rejection whose resolution is
+			// unavailable is a different report from a store whose response was lost.
+			err = fmt.Errorf("repair save contended and its resolution is unavailable: %v", cs.err)
+		}
+		return mqttResumeReconcileResult{outcome: mqttPreConnackUnresolved, err: err}
+	case mqttPreConnackDisposingNonForked, mqttPreConnackDisposingForked:
+		// The disposal is the CALLER'S, not this phase's: it schedules
+		// closeConnection on another goroutine, so a CONNACK enqueued after it has
+		// lost a race with its own socket close. The phase releases its gates and
+		// reports; mqttProcessConnect aborts, signals, then disposes.
+		releaseGates()
+		return mqttResumeReconcileResult{outcome: cs.outcome, voc: cs.voc, err: cs.err}
+	default: // mqttPreConnackLocal
+		// Nothing was stored and sess.seq is right: undo and refuse.
+		undo()
+		return mqttResumeReconcileResult{outcome: mqttPreConnackLocal, err: cs.err}
+	}
+}
+
+// classifyPreConnackSave classifies a CAS-arbitrated record write made inside a
+// pre-CONNACK step's still-open transaction. It is the ONE classification the
+// reconciliation phase's repair save and the lifetime grant share: both split
+// 10071 from 10164, both narrow the first through a single record read, and both
+// hand the second to the bounded contention resolver. Written twice, a new CAS
+// kind would have to be found twice.
+//
+// It returns the vocabulary ITS OWN ROUTE computed, never one a caller
+// re-derives: the two routes reach it differently — disposalForDirectRejection
+// reads the record for the 10071 arm, mqttDisposalForRepairSave maps the
+// resolver's verdict for the 10164 arm — and the 10071 route MINTS THE FORK
+// GRANT, which must happen inside the caller's transaction. A caller re-deriving
+// would need a second read and would have to know which route ran.
+//
+// contended reports the 10164 route, which is the only difference between the two
+// unresolved arms: saveMaybeLanded surfaces the store error bare, while a
+// contention whose resolution is unavailable says so.
+//
+// proveSharedMembershipOwnership deliberately keeps its own copy of this shape.
+// Unifying that third consumer is what let an unclassifiable rejection reach
+// F-078's live-SUBSCRIBE Foreign arm and change WILL DISPOSITION, which is a
+// different question from this one. See F-084.
+//
+// tok must be the CALLER'S OWN open transaction. No lock held on entry; performs
+// JetStream requests.
+func (sess *mqttSession) classifyPreConnackSave(tok recordTx) mqttClassifiedPreConnackSave {
+	outcome, detail, serr := sess.saveClassifiedDetail(tok)
+	if serr == nil {
+		return mqttClassifiedPreConnackSave{outcome: mqttPreConnackProceed}
+	}
+	if outcome == saveMaybeLanded {
+		return mqttClassifiedPreConnackSave{outcome: mqttPreConnackUnresolved, err: serr}
 	}
 
 	// Definite. The CAS kinds are deliberately not equivalent: 10071 (the
-	// single-writer check) means another broker wrote after our accept save —
-	// the session was taken over mid-CONNECT; 10164 signals clustered
-	// contention, not a lost race, and gets the bounded re-read/retry treatment.
+	// single-writer check) means THE SUBJECT MOVED after our accept save — not that
+	// another broker owns the session, which is a stronger claim the readback below
+	// often cannot support (F-084); 10164 signals clustered contention, not a lost
+	// race, and gets the bounded re-read/retry treatment.
 	switch {
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceErrF):
-		// 10071 disposes without ever reading the record, so until now this arm claimed
-		// a takeover on nothing but the failed CAS. It reads once and classifies; the
-		// control flow is unchanged, only what the disposition says.
-		releaseGates()
-		sess.disposeForeignSessionLocked(as, c, sess.disposalForDirectRejection(&detail))
-		return nil, mqttReconcileRefuseForeign, serr
+		// 10071 disposes without ever consulting the resolver, so this is the only
+		// place a sibling lineage is recognised on that arm: one record read, which
+		// narrows the vocabulary and mints the fork grant when the body claims our
+		// parent. Collapsing it would assert 0x8E where the record supports 0x89.
+		voc := sess.disposalForDirectRejection(&detail)
+		out := mqttPreConnackDisposingNonForked
+		if voc == mqttDisposalForked {
+			out = mqttPreConnackDisposingForked
+		}
+		return mqttClassifiedPreConnackSave{outcome: out, voc: voc, err: serr}
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
 		switch v := sess.resolveContendedRecordSave(&detail); v {
 		case mqttRepairSaveLanded:
-			return installedList(), mqttReconcileProceed, nil
+			return mqttClassifiedPreConnackSave{outcome: mqttPreConnackProceed}
 		case mqttRepairSaveForeign, mqttRepairSaveForked:
 			// One arm: a fork is refused exactly as a foreign record is — the write did
 			// not land and this CONNECT cannot proceed — and differs only in what the
-			// disposition claims.
-			releaseGates()
-			sess.disposeForeignSessionLocked(as, c, mqttDisposalForRepairSave(v))
-			return nil, mqttReconcileRefuseForeign, serr
+			// disposition claims and what the client is told.
+			out := mqttPreConnackDisposingNonForked
+			if v == mqttRepairSaveForked {
+				out = mqttPreConnackDisposingForked
+			}
+			return mqttClassifiedPreConnackSave{
+				outcome: out, voc: mqttDisposalForRepairSave(v), err: serr, contended: true}
 		case mqttRepairSaveUnresolved:
 			// The pending-write state (base, digest and the exact bytes) is already
 			// established by resolveContendedRecordSave — deliberately, because a CAS
 			// rejection is definite and save() did not mark it uncertain, so without
-			// that the resolver would have nothing to classify or re-attempt. The
-			// replacements are kept and nothing further is owed, exactly as above.
-			releaseGates()
-			return nil, mqttReconcileRefuseUnresolved,
-				fmt.Errorf("repair save contended and its resolution is unavailable: %v", serr)
+			// that the resolver would have nothing to classify or re-attempt.
+			return mqttClassifiedPreConnackSave{
+				outcome: mqttPreConnackUnresolved, err: serr, contended: true}
 		default: // mqttRepairSaveLocalDefinite
-			undo()
-			return nil, mqttReconcileRefuseLocal, serr
+			return mqttClassifiedPreConnackSave{
+				outcome: mqttPreConnackLocal, err: serr, contended: true}
 		}
 	default:
-		// A definite non-CAS failure (a refused fence, a refusal at entry, a test
-		// seam): nothing was stored, sess.seq is right, undo and refuse.
-		undo()
-		return nil, mqttReconcileRefuseLocal, serr
+		// A definite non-CAS failure: a refused fence, a refusal at entry, a test
+		// seam. Nothing was stored.
+		return mqttClassifiedPreConnackSave{outcome: mqttPreConnackLocal, err: serr}
 	}
 }
 
@@ -841,13 +971,15 @@ func mqttVerifyConsumersBatched(durables []string, bound int,
 }
 
 // resolveContendedRecordSave is the bounded re-read/retry for a record save
-// rejected with 10164 (used by the repair save and by the lifetime restore): contention is a rejection, never a verdict, so the
+// rejected with 10164. FOUR callers, not two: the pre-CONNACK classification the repair
+// save and the lifetime grant share (classifyPreConnackSave), the shared-membership
+// ownership write, and the 3.1.1 forced leave. Contention is a rejection, never a verdict, so the
 // record is re-read and the attempt classified by its own identity — the base
 // sequence it CAS'd against and the digest of the exact bytes it sent:
 //
 //	readSeq == base                  -> nothing moved; retry the SAME bytes
 //	readSeq  > base && digest match  -> our write landed, response lost; adopt
-//	anything else (incl. gone)       -> another owner is authoritative
+//	anything else (incl. gone)       -> not ours; refuse (NOT "another owner", F-084)
 //	the re-read/retry unclassifiable -> establish the pending-write state and
 //	                                    let the readback machinery decide later
 //
@@ -945,8 +1077,9 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	// Retries exhausted. The last rejection was never classified — a CAS
 	// rejection says the subject moved, not who moved it — so read once more
 	// rather than assuming the contention was ours to lose: a 10071 on the final
-	// attempt means another broker took the session over, and returning
-	// local-definite there would undo our work while leaving a session we no
+	// attempt means the subject moved past our base (who moved it is F-084's
+	// question), and returning local-definite there would undo our work while
+	// leaving a session we no
 	// longer own mapped and bound.
 	smsg, lerr := sess.jsa.loadSessionMsg(d.domainTk, d.cidHash)
 	switch classifyRecordAgainstAttempt(smsg, lerr, d.baseSeq) {
@@ -1019,7 +1152,7 @@ func (sess *mqttSession) reattemptPendingStore(domainTk, cidHash string, pw *mqt
 
 // sweepUnadoptedPhaseSubs removes every reconciliation-phase subscription that
 // subscription restoration did not adopt. Restoration can legitimately skip a
-// collected filter after the CONNACK — a PUBREL setup failure fails a QoS 2
+// collected filter — it runs before the CONNACK, and a PUBREL setup failure fails a QoS 2
 // filter, a raw-subscription failure continues without reaching
 // processJSConsumer — and the connection stays live, so nothing else would ever
 // remove that subscription: it would sit closed forever, holding consumer
@@ -1091,24 +1224,35 @@ func (sess *mqttSession) sweepUnadoptedPhaseSubs(c *client, delivers []string) {
 //     on whatever the readback later restores. Preferring the confirmed terms
 //     costs at most one disconnect honoring the older lifetime; the alternative
 //     costs the session.
-//   - 10071: another broker wrote after our accept save and owns this session.
-//     Restoring or re-writing anything would be a stale write, so it is handed
-//     over instead (DISCONNECT suppressed: no CONNACK was written).
+//   - 10071: the subject moved after our accept save. Restoring or re-writing
+//     anything would be a stale write, so the session is handed over instead
+//     (DISCONNECT suppressed: no SUCCESS CONNACK was written, so the refusal
+//     carries the reason instead).
 //   - 10164: clustered contention is a rejection, not a verdict, so the bounded
 //     same-base/same-body re-read decides.
 //   - Definitely failed: nothing was stored, so memory goes back and the record
 //     still describes the lifetime the session had.
 //
+// Like the reconciliation phase, it REPORTS a disposing verdict rather than
+// acting on it: the disposal schedules closeConnection on another goroutine, so
+// the caller must abort and signal the client BEFORE it runs. That is why this
+// returns an outcome and a vocabulary instead of a bare error, and why a forked
+// record's 0x89 now reaches the client instead of being computed, spent on a
+// suppressed DISCONNECT and discarded.
+//
 // Runs inside the CONNECT's accept transaction, whose token it must be given.
 // No lock held on entry.
-func (sess *mqttSession) grantRequestedLifetime(asm *mqttAccountSessionManager, c *client,
-	tok recordTx, expiry uint32, clean bool) error {
+// It takes neither the session manager nor the client, and that is the visible
+// consequence of not disposing: both existed only to hand the session over. Keeping
+// them would leave the next reader looking for the disposal that used to be here.
+func (sess *mqttSession) grantRequestedLifetime(tok recordTx, expiry uint32,
+	clean bool) mqttLifetimeGrantResult {
 
 	sess.mu.Lock()
 	wasExpiry, wasClean := sess.expiryInterval, sess.clean
 	if wasExpiry == expiry && wasClean == clean {
 		sess.mu.Unlock()
-		return nil
+		return mqttLifetimeGrantResult{outcome: mqttPreConnackProceed}
 	}
 	sess.expiryInterval, sess.clean = expiry, clean
 	// Whatever teardown was already parked when this grant was attempted, so the
@@ -1137,33 +1281,27 @@ func (sess *mqttSession) grantRequestedLifetime(asm *mqttAccountSessionManager, 
 		sess.retargetDeferredLifetime(priorDeferred, expiry)
 	}
 
-	outcome, detail, err := sess.saveClassifiedDetail(tok)
-	switch {
-	case err == nil:
-		return nil
-	case outcome == saveMaybeLanded:
+	// The same classification the reconciliation phase's repair save uses, and for
+	// the same reasons — one place for the two CAS kinds, one place that mints the
+	// fork grant. See classifyPreConnackSave.
+	cs := sess.classifyPreConnackSave(tok)
+	switch cs.outcome {
+	case mqttPreConnackProceed:
+		return mqttLifetimeGrantResult{outcome: mqttPreConnackProceed}
+	case mqttPreConnackUnresolved:
 		restore()
 		sess.retainOnLanded(apply)
-	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceErrF):
-		// As in reconcileResumedConsumers: the 10071 arm classifies the record it is
-		// about to concede to, instead of asserting a takeover from the CAS failure
-		// alone. No restore() on either disposing arm — the session is being evicted,
-		// so putting the pre-grant terms back would only mutate an object nobody reads.
-		sess.disposeForeignSessionLocked(asm, c, sess.disposalForDirectRejection(&detail))
-	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
-		switch v := sess.resolveContendedRecordSave(&detail); v {
-		case mqttRepairSaveLanded:
-			return nil
-		case mqttRepairSaveUnresolved:
-			restore()
-			sess.retainOnLanded(apply)
-		case mqttRepairSaveForeign, mqttRepairSaveForked:
-			sess.disposeForeignSessionLocked(asm, c, mqttDisposalForRepairSave(v))
-		default:
-			restore()
-		}
-	default:
+	case mqttPreConnackDisposingNonForked, mqttPreConnackDisposingForked:
+		// No restore() on either disposing arm — the session is being evicted, so
+		// putting the pre-grant terms back would only mutate an object nobody reads.
+		//
+		// And no disposal HERE: it schedules closeConnection on another goroutine, so
+		// the caller aborts, signals the client, and only then disposes with the
+		// vocabulary this returns. That ordering is the whole point of the return
+		// type; disposing inline is what kept this site's refusal unexplained.
+		return mqttLifetimeGrantResult{outcome: cs.outcome, voc: cs.voc, err: cs.err}
+	default: // mqttPreConnackLocal
 		restore()
 	}
-	return err
+	return mqttLifetimeGrantResult{outcome: cs.outcome, err: cs.err}
 }

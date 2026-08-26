@@ -2098,11 +2098,17 @@ func (sess *mqttSession) recordStateBlocksServing() bool {
 }
 
 // saveClassifiedDetail is saveClassified plus the attempted write's raw
-// identity, for the one caller that must turn a DEFINITE CAS rejection into a
-// decision by kind — 10071 (taken over) versus 10164 (contention) — and retry
-// or read back the exact bytes it sent. save() itself re-formats the store
-// error and destroys the kind, which is why the detail is captured at the
-// boundary. See sess_resume_reconcile.go.
+// identity, for the callers that must turn a DEFINITE CAS rejection into a
+// decision by kind — 10071 (the subject moved) versus 10164 (contention) — and
+// retry or read back the exact bytes they sent. save() itself re-formats the
+// store error and destroys the kind, which is why the detail is captured at the
+// boundary.
+//
+// There are SEVERAL such callers, not one: the pre-CONNACK classification shared
+// by the reconciliation phase and the lifetime grant, the shared-membership
+// ownership write, and the 3.1.1 forced leave. And 10071 says the subject moved,
+// which is weaker than "taken over" — see F-084. See
+// classifyPreConnackSave in sess_resume_reconcile.go.
 func (sess *mqttSession) saveClassifiedDetail(tok recordTx) (saveOutcome, mqttSessSaveDetail, error) {
 	wasUncertain := sess.isSeqUncertain()
 	detail, err := sess.saveWithDetail(tok)

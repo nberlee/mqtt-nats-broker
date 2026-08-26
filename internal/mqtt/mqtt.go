@@ -966,10 +966,15 @@ type mqttAccountSessionManager struct {
 	// refuses them, superseded by a later verdict for the same client, or evicted by the
 	// bound. See sess_fork_repair.go.
 	forkedGrants map[string]*mqttForkedGrant
-	retmsgs      *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
-	rmsCache     *sync.Map                              // map[subject]mqttRetainedMsg
-	jsa          mqttJSA
-	domainTk     string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+	// forkedGrantStores counts SUCCESSFUL capsule stores on this manager. Read only by
+	// tests, and per-manager rather than package-global so parallel tests cannot observe
+	// each other's mints. See storeForkedGrantLocked for why the count is the only
+	// observable that can tell one mint from two.
+	forkedGrantStores atomic.Int64
+	retmsgs           *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
+	rmsCache          *sync.Map                              // map[subject]mqttRetainedMsg
+	jsa               mqttJSA
+	domainTk          string // Domain (with trailing "."), or possibly empty. This is added to session subject.
 
 	// sessStreamEpoch is the $MQTT_sess incarnation identity resolved once at
 	// account-manager init from the stream's mqtt_sess_epoch metadata (form
@@ -9734,7 +9739,7 @@ func (sess *mqttSession) save(tok recordTx) error {
 // base sequence, the exact bytes (body for the digest a readback compares,
 // framed for a byte-identical retry), and the store-boundary error with its
 // TYPE intact. It exists because save() re-formats the store error with %v,
-// destroying the CAS kind — and 10071 (taken over) versus 10164 (clustered
+// destroying the CAS kind — and 10071 (the subject moved) versus 10164 (clustered
 // contention) demand opposite dispositions, so a caller that must turn the
 // rejection into a DECISION captures it here, at the boundary, rather than
 // parsing it back out of a string. See sess_resume_reconcile.go.
@@ -12477,11 +12482,13 @@ restoreSession:
 	// stores PUBRELs under recorded identifiers that must already be reserved.
 	//
 	// Before the CONNACK rather than beside those steps, for a reason that is not
-	// aesthetic: a client may publish the instant its CONNACK lands, and every
-	// JetStream round trip taken after the CONNACK but before processSubs widens the
-	// window in which a QoS 0 subscription does not yet exist and a message is simply
-	// dropped. It also reads better as a rule — the identifier space is reconstructed
-	// before the session is declared usable at all.
+	// aesthetic: a client may publish the instant its CONNACK lands, so every JetStream
+	// round trip the resume still owes at that moment widens the window in which a
+	// QoS 0 subscription does not yet exist and a message is simply dropped. Doing this
+	// work early shortens that window. (An earlier version of this comment described the
+	// window as "after the CONNACK but before processSubs", which F-050 made impossible:
+	// restoration now precedes the CONNACK.) It also reads better as a rule — the
+	// identifier space is reconstructed before the session is declared usable at all.
 	//
 	// A failure REFUSES the CONNECT: unlike a drain, whose barrier can withhold one
 	// durable's interest, the identifier space is a single shared resource and half of
@@ -12495,20 +12502,18 @@ restoreSession:
 	// close handling could publish the NEW connection's Will for a session that
 	// was never granted. See sess_resume_reconcile.go.
 	//
-	// It also puts back the session lifetime this CONNECT overwrote. The accept
-	// save has already persisted the requested interval, but the resume was
-	// never acknowledged, so the client cannot know its session was touched —
-	// and a requested interval of 0 would otherwise have the close path discard
-	// a persistent session outright (doClean in mqttHandleClosedClient), after
-	// which the client's retry gets Session Present 0 and the state is gone. The
-	// close path re-persists the restored interval, so memory and record
-	// converge. Spec5 [3.1.2.11.2].
-	// foreign says the session has been disposed of because another owner holds
-	// it: nothing about it may be restored, re-saved or re-armed here.
-	// A refused resume needs no lifetime repair: the requested interval and Clean
-	// flag are not applied until the grant point below, so the session still
-	// holds — and its record still describes — the lifetime it had when this
-	// CONNECT arrived.
+	// It does NOT put the session lifetime back, and does not need to: the requested
+	// interval and Clean flag are not applied until the grant point below, so a resume
+	// refused BEFORE that point still holds — and its record still describes — the
+	// lifetime it had when this CONNECT arrived. A grant that was successfully
+	// persisted deliberately stands even if the success CONNACK is then refused,
+	// because it is durable and the record describes it. Spec5 [3.1.2.11.2].
+	//
+	// (An earlier version of this comment described lifetime restoration here and a
+	// `foreign` parameter that told it whether another owner held the session. Neither
+	// exists: the parameter was retained unused for the reconciliation verdicts' benefit
+	// and has since been deleted, because the fact it was reserved for now arrives in a
+	// typed result instead.)
 	//
 	// It also ABANDONS this CONNECT's restore verdict: every delivery withheld
 	// because nothing may precede the CONNACK is woken so it can record itself as
@@ -12516,7 +12521,7 @@ restoreSession:
 	// written. The verdict stays installed — a delivery arriving after this and
 	// before the client detaches must still be blocked, and this helper
 	// deliberately leaves c.mqtt.sess in place. See sess_restore_gate.go.
-	abortAcceptedResume := func(bool) {
+	abortAcceptedResume := func() {
 		es.abandonRestoreGate()
 		c.mqttAbortAcceptedConnect()
 	}
@@ -12535,26 +12540,55 @@ restoreSession:
 	// clears connectReceived). Suppression when the frame exceeds the client's Maximum Packet
 	// Size is tolerated, exactly as it already was here: the refusal proceeds regardless.
 	//
-	// NOT called by the reconciliation verdicts, and not by the failed success-CONNACK write.
-	// See the roadmap's pre-CONNACK-signal bullet for the first; the second has no channel left
-	// to explain itself on, because the channel is what just failed.
-	refusePreConnack := func(reason byte, rerr error) {
+	// SCOPE, and it is narrower than "every refusal": this covers the POST-ACCEPT-SAVE,
+	// pre-success-CONNACK window, which is where this closure is defined and where every
+	// call to it sits. Exits EARLIER in the CONNECT — an unresolved record state, a
+	// post-clear failure that disposes the old client — return without a signal and are
+	// deliberately out of scope, as they were for the F-050 half of this work.
+	//
+	// Within that window the ONE exit still silent is the failed success-CONNACK write,
+	// which has no channel left to explain itself on, because the channel is what just
+	// failed. The reconciliation verdicts and the lifetime grant used to be silent too,
+	// for a reason that was about their own code rather than a choice: both disposed the
+	// session internally before returning, so a CONNACK the caller enqueued had already
+	// lost the race with its own socket close. Both now report their verdict instead.
+	// See refuseDisposing.
+	refusePreConnack := func(reason byte, reasonStr string) {
 		if c.mqtt.proto == mqttProtoLevel5 {
-			sendConnAck(reason, false, rerr.Error())
+			sendConnAck(reason, false, reasonStr)
 		}
 	}
-	// mqttConnAckReasonForDisposal projects a disposal vocabulary onto a code a CONNACK may
-	// legally carry. It exists because the vocabulary's own reason is a DISCONNECT reason:
-	// 0x8E "Session taken over" is not in [3.2.2.2]'s permitted set, so sending it here would
-	// be a protocol violation, while 0x89 "Server busy" IS permitted and keeps its exact
-	// meaning ("reconnect and resolve the ambiguity"). A takeover therefore degrades to 0x83
-	// plus the vocabulary's Reason String: the client learns WHY but not "stop reconnecting",
-	// which no CONNACK code can express.
-	connAckReasonForDisposal := func(voc mqttDisposalVocabulary) byte {
-		if voc.reason == mqttReasonServerBusy {
-			return mqttReasonServerBusy
+	// refuseDisposing is the ONE pre-CONNACK refusal sequence for an outcome that
+	// DISPOSES, and the order is the whole point:
+	//
+	//  1. abort   — discards this connection's Will and clears connectReceived, so the
+	//     close scheduled in (3) cannot publish the NEW CONNECT's Will and the parser
+	//     cannot send a v5 DISCONNECT as the first packet ([MQTT-3.2.0-1]);
+	//  2. signal  — the failure CONNACK, enqueued BEFORE any close is scheduled;
+	//  3. dispose — last, because it schedules closeConnection on another goroutine, and
+	//     a CONNACK written after that has lost a race with its own socket close.
+	//
+	// The two arguments are two DIFFERENT facts and are not interchangeable: outcome
+	// decides what the CLIENT is told, voc decides what the DISPOSAL claims. The
+	// vocabulary's own Reason String never reaches the client, because on most arms that
+	// reach here it asserts a takeover the classifier never established — see F-084 and
+	// mqttPreConnackRefusal.
+	//
+	// mqttAbortAcceptedConnect touches only c.mqtt (the Will and connectReceived), never
+	// sess.c, so the disposal's owner recheck still sees this connection as the session's.
+	refuseDisposing := func(outcome mqttPreConnackOutcome, voc mqttDisposalVocabulary) {
+		abortAcceptedResume()
+		if r, ok := preConnackRefusalFor(outcome); ok {
+			refusePreConnack(r.code, r.reasonStr)
+		} else {
+			// An outcome nobody gave an answer to. Say NOTHING rather than guess: a wrong
+			// ownership claim is the defect this whole mechanism is about, and a bare close
+			// is exactly the pre-existing behavior. Loud, because it is a programming
+			// error and never a protocol state.
+			c.Errorf("MQTT: refusing to resume session %q with no pre-CONNACK signal:"+
+				" unhandled refusal outcome %v", cid, outcome)
 		}
-		return mqttReasonImplementationSpecificError
+		es.disposeForeignSessionLocked(asm, c, voc)
 	}
 	// ARM the verdict before the first subscription this CONNECT installs, and
 	// unconditionally — a clean start and a resume naming no filters included.
@@ -12565,8 +12599,8 @@ restoreSession:
 	if sessp {
 		if err := es.recoverInflightRegisters(c); err != nil {
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, err)
-			abortAcceptedResume(false)
-			refusePreConnack(mqttReasonImplementationSpecificError, err)
+			abortAcceptedResume()
+			refusePreConnack(mqttReasonImplementationSpecificError, err.Error())
 			return formatError(err)
 		}
 	}
@@ -12589,13 +12623,20 @@ restoreSession:
 	// forced-leave failure returns). Idempotent, so the double run is harmless.
 	var phaseSubs []string
 	if sessp {
-		installed, verdict, rerr := asm.reconcileResumedConsumers(es, c, acceptTok)
-		if verdict != mqttReconcileProceed {
-			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
-			abortAcceptedResume(verdict == mqttReconcileRefuseForeign)
-			return formatError(rerr)
+		r := asm.reconcileResumedConsumers(es, c, acceptTok)
+		if r.outcome != mqttPreConnackProceed {
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, r.err)
+			if r.outcome.disposes() {
+				refuseDisposing(r.outcome, r.voc)
+			} else {
+				// Local and Unresolved are not ownership statements: the client gets the
+				// phase's own diagnostic, and nothing is disposed.
+				abortAcceptedResume()
+				refusePreConnack(mqttReasonImplementationSpecificError, r.err.Error())
+			}
+			return formatError(r.err)
 		}
-		phaseSubs = installed
+		phaseSubs = r.installed
 		if len(phaseSubs) > 0 {
 			defer es.sweepUnadoptedPhaseSubs(c, phaseSubs)
 		}
@@ -12619,19 +12660,23 @@ restoreSession:
 	// achieved that by ordering (the forced leave ran first); now that restoration
 	// comes earlier, the exclusion is EXPLICIT. Spec5 [4.8.2].
 	restoreShared := c.mqtt.proto == mqttProtoLevel5
-	// refuseRestore tells the client WHY, which the other pre-CONNACK refusals do
-	// not. It is not decoration: a filter that can never be restored — a subscribe
+	// refuseRestore is refusePreConnack at the restore path's own reason code, kept as a
+	// name because the restore sites read better for it. It was once the ONLY refusal in
+	// this window that told the client why; every other one does now too, so what is left
+	// here is the specific argument for this site. It is not decoration: a filter that can
+	// never be restored — a subscribe
 	// permission revoked since it was saved is the reachable case — refuses every
 	// resume, and without a reason an automatic client sees only an endless silent
 	// close. Its recovery, a clean start, is one the client can only choose if it
 	// knows there is something to recover from. v5 only: a 3.1.1 CONNACK has no
 	// reason code above 5, so that connection gets the bare close it gets today.
-	// Generalising this to the register-recovery, reconciliation and lifetime-grant
-	// refusals is its own roadmap item.
+	// Every other refusal in the post-accept-save window now carries a reason too — that
+	// generalisation has landed and is no longer an open roadmap item. Earlier exits in
+	// the CONNECT are outside that window and stay silent; see refusePreConnack.
 	// refuseRestore is refusePreConnack at the restore path's own reason code. Kept as a name
 	// because the restore sites read better for it, not as a second mechanism.
 	refuseRestore := func(rerr error) {
-		refusePreConnack(mqttReasonImplementationSpecificError, rerr)
+		refusePreConnack(mqttReasonImplementationSpecificError, rerr.Error())
 	}
 	if l := len(es.subs) + len(es.sharedSubs); l > 0 {
 		filters := make([]*mqttFilter, 0, l)
@@ -12715,7 +12760,7 @@ restoreSession:
 			}
 			rerr := fmt.Errorf("subscription %q could not be restored: %s", f.sessionKey(), f.reasonStr)
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
-			abortAcceptedResume(false)
+			abortAcceptedResume()
 			refuseRestore(rerr)
 			return formatError(rerr)
 		}
@@ -12729,7 +12774,7 @@ restoreSession:
 		}
 		if serr != nil {
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, serr)
-			abortAcceptedResume(false)
+			abortAcceptedResume()
 			refuseRestore(serr)
 			return formatError(serr)
 		}
@@ -12784,33 +12829,27 @@ restoreSession:
 			case mqttGroupOwnershipOurs:
 				// Still ours at the write's linearization point. Proceed.
 			case mqttGroupOwnershipForeign, mqttGroupOwnershipForked:
-				// Another owner holds the record, or a sibling erased our write. Either way
-				// this connection must not serve the group. The pre-CONNACK abort discards
-				// the Will and leaves the lifetime ungranted; the vocabulary decides whether
-				// the client is told 0x8E (stop) or 0x89 (reconnect).
+				// A record this broker could not confirm it still owns, or a sibling that
+				// erased our write. Either way this connection must not serve the group.
+				//
+				// It goes through refuseDisposing, the one sequence every pre-CONNACK
+				// disposing refusal shares — abort, signal, dispose — so this site no longer
+				// states the ordering itself and no fourth site can get it wrong. The
+				// displacement stays silent (mqttNotifyDisplaced is gated on
+				// c.connAckWritten, false for every pre-CONNACK refusal), so the REFUSAL is
+				// what carries the reason.
+				//
+				// Its own verdict is mapped rather than shared: mqttGroupOwnership stays the
+				// vocabulary of the shared-membership write, because F-078's live-SUBSCRIBE
+				// consumer switches on it and its Foreign arm's Will handling is a different
+				// question. See F-084.
 				rerr := fmt.Errorf("shared subscription ownership could not be confirmed for session %q: %v", cid, v.err)
 				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
-				// abortAcceptedResume BEFORE the disposal, which is the opposite order to
-				// the reconciliation phase's foreign arm, and deliberately so: the disposal
-				// schedules closeConnection on another goroutine, and this connection's Will
-				// must already be discarded when that close runs. The reconcile path is
-				// unaffected either way because its own exits clear the same exposure, and
-				// nothing here depends on the order — mqttAbortAcceptedConnect touches only
-				// c.mqtt (the Will and connectReceived), never sess.c, so the disposal's
-				// identity check still sees this connection as the session's owner.
-				//
-				// The displacement itself is still silent — mqttNotifyDisplaced is gated on
-				// c.connAckWritten, false for every pre-CONNACK refusal — so the REFUSAL
-				// carries the reason instead, projected onto a code a CONNACK may legally
-				// hold: 0x89 keeps a fork's "reconnect" meaning exactly, while a takeover
-				// degrades to 0x83, because 0x8E is DISCONNECT-only.
-				//
-				// Enqueued BEFORE the disposal, which schedules closeConnection on another
-				// goroutine: a CONNACK written after that has lost a race with its own
-				// socket close.
-				abortAcceptedResume(false)
-				refusePreConnack(connAckReasonForDisposal(v.voc), rerr)
-				es.disposeForeignSessionLocked(asm, c, v.voc)
+				outcome := mqttPreConnackDisposingNonForked
+				if v.outcome == mqttGroupOwnershipForked {
+					outcome = mqttPreConnackDisposingForked
+				}
+				refuseDisposing(outcome, v.voc)
 				return formatError(rerr)
 			case mqttGroupOwnershipUnresolved:
 				// The write may have landed. The restored state is KEPT — that is what the
@@ -12819,14 +12858,14 @@ restoreSession:
 				// meanwhile; the failure CONNACK below opens nothing.
 				rerr := fmt.Errorf("shared subscription ownership is unresolved for session %q: %v", cid, v.err)
 				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
-				abortAcceptedResume(false)
-				refusePreConnack(mqttReasonImplementationSpecificError, rerr)
+				abortAcceptedResume()
+				refusePreConnack(mqttReasonImplementationSpecificError, rerr.Error())
 				return formatError(rerr)
 			default: // mqttGroupOwnershipLocal
 				rerr := fmt.Errorf("shared subscription ownership could not be established for session %q: %v", cid, v.err)
 				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
-				abortAcceptedResume(false)
-				refusePreConnack(mqttReasonImplementationSpecificError, rerr)
+				abortAcceptedResume()
+				refusePreConnack(mqttReasonImplementationSpecificError, rerr.Error())
 				return formatError(rerr)
 			}
 		}
@@ -12849,7 +12888,7 @@ restoreSession:
 			// one refused. For every other filter the two are identical.
 			rerr := fmt.Errorf("subscription %q could not be restored: %s", f.sessionKey(), f.reasonStr)
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
-			abortAcceptedResume(false)
+			abortAcceptedResume()
 			refuseRestore(rerr)
 			return formatError(rerr)
 		}
@@ -12894,7 +12933,7 @@ restoreSession:
 			rerr := fmt.Errorf("shared subscription %q cannot be parsed, so it cannot be released "+
 				"for a 3.1.1 resume of session %q", badKey, cid)
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
-			abortAcceptedResume(false)
+			abortAcceptedResume()
 			refuseRestore(rerr)
 			return formatError(rerr)
 		}
@@ -12912,12 +12951,21 @@ restoreSession:
 	// needs unwinding, because the record was never made to describe the new
 	// lifetime — which is precisely what the earlier restore-after-the-fact
 	// machinery existed to repair. Spec5 [3.1.2.11.2].
+	//
+	// The grant used to dispose the session ITSELF and return a bare error, so this
+	// caller signalled 0x83 after the close was already scheduled and could not tell a
+	// forked record — where 0x89 "try again" is both legal and exactly right — from
+	// anything else. It now reports its verdict and this frame runs the one sequence.
 	if sessp {
-		if err := es.grantRequestedLifetime(asm, c, acceptTok, expiry, sessClean); err != nil {
-			c.Errorf("MQTT: refusing to resume session %q: could not grant the requested session lifetime: %v", cid, err)
-			abortAcceptedResume(false)
-			refusePreConnack(mqttReasonImplementationSpecificError, err)
-			return formatError(err)
+		if g := es.grantRequestedLifetime(acceptTok, expiry, sessClean); g.outcome != mqttPreConnackProceed {
+			c.Errorf("MQTT: refusing to resume session %q: could not grant the requested session lifetime: %v", cid, g.err)
+			if g.outcome.disposes() {
+				refuseDisposing(g.outcome, g.voc)
+			} else {
+				abortAcceptedResume()
+				refusePreConnack(mqttReasonImplementationSpecificError, g.err.Error())
+			}
+			return formatError(g.err)
 		}
 	}
 
@@ -12926,7 +12974,7 @@ restoreSession:
 	// this send is guaranteed to fit; the guard is defensive — but the WRITE can
 	// still fail, and an unacknowledged session must not proceed as accepted.
 	if !sendConnAck(mqttConnAckRCConnectionAccepted, sessp, _EMPTY_) {
-		abortAcceptedResume(false)
+		abortAcceptedResume()
 		return fmt.Errorf("unable to deliver the success CONNACK")
 	}
 	mqttTestRestorePauseHook("before-open")
@@ -13340,15 +13388,15 @@ restoreSession:
 				// a settlement that proves the removal durable would run no commit at all,
 				// stranding the durables with no membership left to reach them by.
 				es.retainOnLanded(func(rtok recordTx) {
-				// The verdict is reported rather than discarded. On this path there is no
-				// connection left to refuse, so the diagnostic IS the disposition — and a
-				// silently dropped verdict was how a withheld release became invisible.
-				if v := commitLeave(rtok, settleBeforeRelease); v != mqttForcedLeaveOwnershipOurs {
-					c.Errorf("MQTT: the resolver-driven shared-membership release of session %q "+
-						"withheld its group-consumer release (%v); the periodic pass retries it",
-						es.id, v)
-				}
-			})
+					// The verdict is reported rather than discarded. On this path there is no
+					// connection left to refuse, so the diagnostic IS the disposition — and a
+					// silently dropped verdict was how a withheld release became invisible.
+					if v := commitLeave(rtok, settleBeforeRelease); v != mqttForcedLeaveOwnershipOurs {
+						c.Errorf("MQTT: the resolver-driven shared-membership release of session %q "+
+							"withheld its group-consumer release (%v); the periodic pass retries it",
+							es.id, v)
+					}
+				})
 				return refuseLeave(fmt.Errorf("contention on the shared-membership release of "+
 					"session %q is unresolved: %v", cid, err))
 			}
@@ -13629,6 +13677,67 @@ const mqttReasonStrOwnershipUnsettled = "session ownership could not be establis
 // Reason String sent with the DISCONNECT to every connected client when the
 // broker is draining connections for shutdown. Spec5 [3.14.2.1].
 const mqttReasonStrServerShuttingDown = "server shutting down"
+
+// Reason String sent with the 0x83 pre-CONNACK refusal of a resume whose record CAS
+// was rejected and whose evidence established nothing beyond that. Deliberately NOT
+// mqttReasonStrSessionTakenOver: the rejection is also reached when the record could
+// not be read, was absent, did not decode, was released, or sat at or below our own
+// base, none of which demonstrates a successor. See mqttPreConnackRefusal.
+const mqttReasonStrOwnershipUnconfirmed = "session ownership could not be confirmed"
+
+// mqttPreConnackRefusal is what a pre-CONNACK refusal is licensed to tell a v5
+// client, and it is DELIBERATELY NOT the disposal vocabulary.
+//
+// That bundle's contract governs the DISCONNECT, its Reason String, the log line and
+// the close state, and its takeover text asserts a successor that most arms reaching
+// it never established — the class F-084 owns. The CONNACK is a separate projection
+// onto a code [3.2.2.2] permits, and this type is the whole of it: no disposal
+// vocabulary is ever read on the way to the wire.
+type mqttPreConnackRefusal struct {
+	code      byte
+	reasonStr string
+}
+
+var (
+	// A body claiming our parent IS a positive fact — a non-empty, distinct identity
+	// naming the same parent as our acknowledged record — and 0x89 "try again later"
+	// states exactly what it licenses and nothing more. It does not claim a fork was
+	// PROVED: provenance is not validated (sess_fork_lineage.go).
+	mqttRefusalOwnershipUnsettled = mqttPreConnackRefusal{
+		code: mqttReasonServerBusy, reasonStr: mqttReasonStrOwnershipUnsettled,
+	}
+	// Every other disposing outcome. 0x83 because 0x8E "Session taken over" is
+	// DISCONNECT-only ([3.2.2.2]) and no legal CONNACK code says "stop reconnecting";
+	// the text says only what is true on every one of these arms — the CAS was
+	// rejected and this broker could not confirm it still owns the session.
+	mqttRefusalOwnershipUnconfirmed = mqttPreConnackRefusal{
+		code: mqttReasonImplementationSpecificError, reasonStr: mqttReasonStrOwnershipUnconfirmed,
+	}
+)
+
+// preConnackRefusalFor maps an outcome onto what the client is told, and reports
+// whether that outcome HAS an answer.
+//
+// EXHAUSTIVE over every outcome, with NO default arm: a default is exactly how a new
+// outcome would silently inherit an ownership claim it has no evidence for, which is
+// the defect class this mechanism exists to stop making worse.
+//
+// THREE outcomes are non-disposing and are listed rather than assumed. Proceed does
+// not refuse at all; Local and Unresolved refuse through refusePreConnack directly,
+// carrying the step's own error, because nothing about either is an ownership
+// statement. They report false, so a caller reaching here with one sends NOTHING
+// rather than a 0x00 CONNACK.
+func preConnackRefusalFor(o mqttPreConnackOutcome) (mqttPreConnackRefusal, bool) {
+	switch o {
+	case mqttPreConnackDisposingForked:
+		return mqttRefusalOwnershipUnsettled, true
+	case mqttPreConnackDisposingNonForked:
+		return mqttRefusalOwnershipUnconfirmed, true
+	case mqttPreConnackProceed, mqttPreConnackLocal, mqttPreConnackUnresolved:
+		return mqttPreConnackRefusal{}, false
+	}
+	return mqttPreConnackRefusal{}, false
+}
 
 // mqttReasonString returns reasonStr if it may accompany a server-generated
 // packet of type pktType, or empty otherwise: v5 only; a client that sent

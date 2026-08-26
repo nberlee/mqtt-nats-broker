@@ -126,6 +126,28 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   cons-keyed barrier with a durable-keyed void snapshot; and the no-cons branch discharges
   no local state at all.
   Details: [F-083](shared-qos2.md#f-083).
+- Prove a successor before claiming a takeover.
+  Status: Open. Release treatment: Alpha blocker.
+  Split out of the pre-CONNACK refusal signal by an escalation consult. The broker reports
+  `0x8E` "session taken over by a new connection" — which tells a client to stop reconnecting
+  — whenever a record CAS is rejected and nothing narrows it to a sibling, including when
+  the
+  record was unreadable, absent, undecodable, released, at or below our own base, or a verbatim
+  replay of our own bytes. Roughly eight sites, two of them hardcoded past every mapper, and
+  the remedy needs a successor-evidence predicate that cannot yet be stated as a proof
+  plus a
+  Will-disposition decision per class.
+  Details: [F-084](ha-arbitration.md#f-084-prove-a-successor-before-claiming-a-takeover).
+- Sweep the comment corpus for three false-claim families, indexed by claim.
+  Status: Open. Release treatment: Post-alpha cleanup.
+  Filed by the pre-CONNACK-signal item's tenth holistic round after nine rounds fixed instance
+  after instance without exhausting the families: comments claiming `abortAcceptedResume`
+  restores the session lifetime (it does not; ordering protects it), comments reading a
+  rejected CAS or an absent record as proof another owner holds the session (F-084's
+  distinction), and comments saying a pre-CONNACK refusal writes no packet when it now carries
+  a v5 failure CONNACK. Some name mutations that cannot be written. Seeds are in the roadmap
+  bullet; closing it needs a claim-indexed read, not a grep.
+  Details: `docs/ROADMAP.md` §0.5.
 - Refuse a pre-release delayed-drain record shape instead of repairing it.
   Status: Open. Release treatment: Post-alpha cleanup.
   Filed by F-034's census. The compatibility boundary refuses an unsupported persisted

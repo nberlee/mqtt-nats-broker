@@ -863,7 +863,9 @@ func TestSharedGroupLookupBatchIsBounded(t *testing.T) {
 	//
 	// Note what is NOT asserted: that the chunks cover every target. These durables do not
 	// exist, so the first chunk's first verdict is a refusal and the pass stops there by
-	// design — one refusal already refuses the CONNECT, so any further lookup is work whose
+	// design — one refusal already refuses the CONNECT (F-077 later made an authoritatively
+	// ABSENT verdict repairable instead, which is a different arm and does not reach this
+	// batching rule) — so any further lookup is work whose
 	// result cannot change the outcome. An earlier version of this test required full
 	// coverage and had to change when that rule landed; the discriminating property, and
 	// the one M21 violates, is the request SIZE.
@@ -943,7 +945,8 @@ func TestSharedGroupLookupStopsAtTheFirstFailedChunk(t *testing.T) {
 // round 6 on continuing after a perfectly transported response that happened to classify as
 // a refusal. Each earlier fix special-cased the failure it had just been shown.
 //
-// There is no special case now: any verdict carrying an error is terminal, because one
+// There is no special case now: any verdict carrying an error is terminal for THIS BATCHING
+// RULE, because one
 // refused filter already refuses the whole CONNECT, so every later lookup is work whose
 // result cannot change the outcome — while each one carries its own timeout and the
 // post-pass runs with this connection's queue interest already installed, dropping QoS 0.

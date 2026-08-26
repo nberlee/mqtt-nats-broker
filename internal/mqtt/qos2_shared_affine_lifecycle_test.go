@@ -6074,9 +6074,9 @@ func TestQ2AffOwnerResumesAfterAContenderCreatedItsDurable(t *testing.T) {
 
 	cr, rr := b.reconnect(t, "ownctdA", 300)
 	defer cr.Close()
-	// Polled, not read once: the success CONNACK is sent BEFORE the resume
-	// re-establishes the affine path, so an immediate read races the work it is
-	// trying to observe.
+	// Polled, not read once: the CONNACK's arrival does not order this read against the
+	// tail of the resume still running behind it, so an immediate read races the work it
+	// is trying to observe.
 	sess := testMQTTGetClient(t, b.s, "ownctdA").mqtt.sess
 	deadline := time.Now().Add(10 * time.Second)
 	ready := false

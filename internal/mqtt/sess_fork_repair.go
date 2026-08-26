@@ -194,8 +194,8 @@ func (e *mqttGrantEntry) sidState(sid string) mqttSidState {
 // mqttGrantSnap is the grant of ONE session record: the per-filter map plus the two
 // session-scoped members, so the capsule's whole payload has a single provenance.
 //
-// Shared-subscription membership is deliberately absent. The success CONNACK is written
-// before shared restoration runs, so a re-asserted SharedSubs membership would be durable
+// Shared-subscription membership is deliberately absent. A per-filter shared restore can
+// fail while the membership stays durable, so a re-asserted SharedSubs membership would be
 // while a per-filter restore failure leaves no group join and no consumer — the
 // accepted-but-dead state F-050 already records. Repairing into that ordering would extend
 // an open finding rather than respect it; shared membership becomes repairable when F-050
@@ -599,6 +599,16 @@ func (as *mqttAccountSessionManager) mintForkedGrantLocked(sess *mqttSession, ac
 
 // as.mu must be held.
 func (as *mqttAccountSessionManager) storeForkedGrantLocked(sess *mqttSession, g *mqttForkedGrant) {
+	// Counted because the final state cannot reveal a SECOND store: every one replaces
+	// as.forkedGrants[id] with a fresh pointer and mintedAt, so "a usable capsule exists"
+	// is satisfied by one mint and by two alike, and a double mint means the record and
+	// the acknowledged pair were sampled twice under one fence. Per ACCOUNT MANAGER rather
+	// than package-global, so parallel tests cannot read each other's mints.
+	//
+	// It counts STORES, not calls: mintForkedGrant stores nothing when the candidate delta
+	// is empty, so a fixture asserting on it must construct a real delta first or it is
+	// comparing zero to zero.
+	as.forkedGrantStores.Add(1)
 	if as.forkedGrants == nil {
 		as.forkedGrants = make(map[string]*mqttForkedGrant, 1)
 	}

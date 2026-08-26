@@ -9,10 +9,13 @@ import (
 // Path 3: the CONNECT-time classified saves.
 //
 // reconcileResumedConsumers and grantRequestedLifetime do not wait for the rejection
-// settlement. They dispose the session themselves — directly on 10071, and through
-// resolveContendedRecordSave on 10164 — and both branches close the connection claiming
-// the session "is now owned elsewhere". Two revisions of the plan enumerated "the two
-// paths" and both were wrong; this is the third.
+// settlement: they classify it themselves — directly on 10071, and through
+// resolveContendedRecordSave on 10164. They no longer DISPOSE, though, which is what the
+// pre-CONNACK-signal item changed: each returns an outcome and a vocabulary, and
+// mqttProcessConnect's refuseDisposing aborts, signals the client and only then hands the
+// session over. Disposing inside the helper is what left a CONNACK racing the socket close
+// its own disposal scheduled. Two revisions of the plan enumerated "the two paths" and both
+// were wrong; this is the third.
 //
 // The CHRONOLOGY here is not the obvious one and revision 8 got it wrong. mqttProcessConnect
 // performs and CONFIRMS the accept save before calling either helper, so by the time one
@@ -43,14 +46,22 @@ func testNewConnectForkEnv(t *testing.T, clientID string,
 // testGrantLifetime drives grantRequestedLifetime with a real record transaction, as the
 // CONNECT does. The expiry differs from the session's so the helper does not take its
 // no-change early return.
-func testGrantLifetime(t *testing.T, e *testRejectionEnv, c *client) error {
+//
+// The grant no longer disposes the session itself, so this driver performs the caller's
+// own sequence for a disposing verdict — the same abort-signal-dispose order
+// mqttProcessConnect's refuseDisposing runs — or the assertions below would be asserting
+// a disposal nobody performed.
+func testGrantLifetime(t *testing.T, e *testRejectionEnv, c *client) mqttLifetimeGrantResult {
 	t.Helper()
 	tok := e.sess.beginRecordTx()
-	err := e.sess.grantRequestedLifetime(e.asm, c, tok, 600, false)
+	g := e.sess.grantRequestedLifetime(tok, 600, false)
 	if terr := e.sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
-	return err
+	if g.outcome.disposes() {
+		e.sess.disposeForeignSessionLocked(e.asm, c, g.voc)
+	}
+	return g
 }
 
 // TestSessForkedAtConnectTimeDirectRejection is the 10071 half of tests 8c-8f (M19a).
@@ -79,8 +90,23 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 
 			// The record has moved, so this save's CAS is rejected by the single-writer
 			// check: a real 10071, not a seam.
-			if err := testGrantLifetime(t, e.testRejectionEnv, b.bc); err == nil {
-				t.Fatal("the grant's save must be rejected by the moved record")
+			g := testGrantLifetime(t, e.testRejectionEnv, b.bc)
+			if !g.outcome.disposes() {
+				t.Fatalf("the grant's save must be rejected by the moved record: outcome %v (%v)",
+					g.outcome, g.err)
+			}
+			// The SPLIT verdict, which the merged one could not express: a sibling body is
+			// its own outcome, and the caller's projection reads it rather than the
+			// vocabulary. A helper that returns one disposing outcome for both fails here.
+			wantOutcome := mqttPreConnackDisposingNonForked
+			if tc.want == mqttReasonServerBusy {
+				wantOutcome = mqttPreConnackDisposingForked
+			}
+			if g.outcome != wantOutcome {
+				t.Fatalf("outcome %v, want %v", g.outcome, wantOutcome)
+			}
+			if g.voc.reason != tc.want {
+				t.Fatalf("vocabulary reason %#x, want %#x", g.voc.reason, tc.want)
 			}
 			if e.resident(e.sess) {
 				t.Fatal("both verdicts dispose; only the claim differs")
@@ -93,8 +119,17 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 			// transaction, which is where the repair is minted. See sess_fork_repair.go.
 			if tc.want == mqttReasonServerBusy {
 				testAssertMinted(t, e.testRejectionEnv)
+				// EXACTLY once. The capsule alone cannot say so — a second mint replaces
+				// the map entry with an equivalent one — so the store counter is the only
+				// observable that distinguishes them (M9).
+				if n := e.asm.forkedGrantStores.Load(); n != 1 {
+					t.Fatalf("the forked verdict stored %d capsules, want exactly 1", n)
+				}
 			} else {
 				testAssertNotMinted(t, e.testRejectionEnv)
+				if n := e.asm.forkedGrantStores.Load(); n != 0 {
+					t.Fatalf("a verdict that established no fork stored %d capsules, want 0", n)
+				}
 			}
 		})
 	}
@@ -113,8 +148,8 @@ func TestSessUnrelatedLineageAtConnectTimeStaysForeign(t *testing.T) {
 		})
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 
-	if err := testGrantLifetime(t, e.testRejectionEnv, b.bc); err == nil {
-		t.Fatal("the grant's save must be rejected")
+	if g := testGrantLifetime(t, e.testRejectionEnv, b.bc); !g.outcome.disposes() {
+		t.Fatalf("the grant's save must be rejected: outcome %v (%v)", g.outcome, g.err)
 	}
 	if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != mqttReasonSessionTakenOver {
 		t.Fatalf("an UNRELATED lineage is conceded exactly as before: got %x (wire %x)",
@@ -411,19 +446,42 @@ func testLandUnrelated(t *testing.T, e *testInflightEnv, mutate func(*mqttPersis
 // testReconcileResumedConsumers drives the OTHER CONNECT-time helper. A QoS-1 filter with
 // no consumer config makes step 3 repair, which is what produces the one record write this
 // phase makes — and therefore the rejection the classification is about.
-func testReconcileResumedConsumers(t *testing.T, e *testRejectionEnv, c *client) (mqttResumeReconcileVerdict, error) {
+//
+// Three things it now does that the earlier driver did not, each because the phase REPORTS
+// its disposing verdict instead of acting on it:
+//
+//   - it takes the OWNERSHIP GATE around the classification, which the phase documents as
+//     its precondition (asm.sessLocked) and which the old driver simply did not honour;
+//   - it puts the client into PRE-CONNACK state, which is the state the real site is in:
+//     the fixture binds a socket as if the connection were already accepted, so leaving
+//     connAckWritten set would test a connection that cannot exist here;
+//   - it performs the caller's own abort-signal-dispose sequence for a disposing verdict,
+//     because after the move nothing else does.
+func testReconcileResumedConsumers(t *testing.T, e *testRejectionEnv, c *client) mqttResumeReconcileResult {
 	t.Helper()
 	e.sess.mu.Lock()
 	e.sess.subs = map[string]byte{"forked/reconcile": 1}
 	e.sess.cons = nil
 	e.sess.mu.Unlock()
 
+	// Pre-CONNACK: no success CONNACK has been written at this point in a real CONNECT,
+	// which is exactly why its refusal has to carry the reason itself.
+	c.connAckWritten.Store(false)
+
+	if err := e.asm.lockSession(e.sess, c); err != nil {
+		t.Fatalf("taking the ownership gate the phase requires: %v", err)
+	}
 	tok := e.sess.beginRecordTx()
-	_, verdict, err := e.asm.reconcileResumedConsumers(e.sess, c, tok)
+	r := e.asm.reconcileResumedConsumers(e.sess, c, tok)
 	if terr := e.sess.endRecordTx(tok); terr != nil {
+		e.asm.unlockSession(e.sess)
 		t.Fatalf("endRecordTx: %v", terr)
 	}
-	return verdict, err
+	if r.outcome.disposes() {
+		e.sess.disposeForeignSessionLocked(e.asm, c, r.voc)
+	}
+	e.asm.unlockSession(e.sess)
+	return r
 }
 
 // TestSessForkedAtReconcileDirectRejection is the second cell of M19a's pairing.
@@ -450,20 +508,54 @@ func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
 			b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 			tc.stage(t, e.testInflightEnv)
 
-			verdict, err := testReconcileResumedConsumers(t, e, b.bc)
-			if verdict != mqttReconcileRefuseForeign {
-				t.Fatalf("the phase's save is rejected by the moved record: verdict %v (%v)", verdict, err)
+			r := testReconcileResumedConsumers(t, e, b.bc)
+			if !r.outcome.disposes() {
+				t.Fatalf("the phase's save is rejected by the moved record: outcome %v (%v)",
+					r.outcome, r.err)
 			}
-			if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != tc.want {
-				t.Fatalf("reason codes %x, want exactly one %x (wire %x)",
-					reasons, tc.want, b.out.bytes())
+			// THE SPLIT. The merged verdict could not express this, which is why the
+			// caller could not project the right CONNACK code: a sibling body is its own
+			// outcome, and the projection reads the OUTCOME rather than the vocabulary.
+			// A phase that returns one disposing outcome for both fails here — and only
+			// here, because the caller groups the two arms and the wire tests would still
+			// see whatever the unchanged vocabulary projects to.
+			wantOutcome := mqttPreConnackDisposingNonForked
+			if tc.want == mqttReasonServerBusy {
+				wantOutcome = mqttPreConnackDisposingForked
+			}
+			if r.outcome != wantOutcome {
+				t.Fatalf("outcome %v, want %v", r.outcome, wantOutcome)
+			}
+			if r.voc.reason != tc.want {
+				t.Fatalf("vocabulary reason %#x, want %#x", r.voc.reason, tc.want)
+			}
+			// The disposal happened, at the CALLER, and the session is gone from the maps.
+			if e.resident(e.sess) {
+				t.Fatal("both disposing outcomes evict; only the claim differs")
+			}
+			// And NO DISCONNECT, positively. This replaces the reason-code assertion this
+			// test used to make on the wire, and it is a correction rather than a
+			// weakening: the fixture had connAckWritten set as for an ACCEPTED connection,
+			// so it was asserting a packet the real pre-CONNACK site cannot send —
+			// mqttNotifyDisplaced is gated on that flag. Being unable to speak here is
+			// exactly why the refusal CONNACK exists, and the codes themselves are pinned
+			// on the wire by the end-to-end fixtures.
+			if reasons := b.disconnectAttempts(t); len(reasons) != 0 {
+				t.Fatalf("a pre-CONNACK refusal must send no DISCONNECT, got %x (wire %x)",
+					reasons, b.out.bytes())
 			}
 			// disposalForDirectRejection reaches its verdict inside the caller's record
 			// transaction, which is where the repair is minted. See sess_fork_repair.go.
 			if tc.want == mqttReasonServerBusy {
 				testAssertMinted(t, e)
+				if n := e.asm.forkedGrantStores.Load(); n != 1 {
+					t.Fatalf("the forked verdict stored %d capsules, want exactly 1", n)
+				}
 			} else {
 				testAssertNotMinted(t, e)
+				if n := e.asm.forkedGrantStores.Load(); n != 0 {
+					t.Fatalf("a verdict that established no fork stored %d capsules, want 0", n)
+				}
 			}
 		})
 	}

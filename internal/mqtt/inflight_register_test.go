@@ -2827,7 +2827,8 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 //
 // Shared group consumer configs are deliberately excluded from the persisted Cons
 // (buildPersistedSessionLocked): the group is arbitrated by SharedSubs and the configs are
-// rebuilt by processSubs during post-CONNACK restoration. So a session that comes back from
+// rebuilt by processSubs during restoration, which runs after register recovery. So a
+// session that comes back from
 // its record — a broker restart, a failover, a resume elsewhere, or a CONNECT refused before
 // restoration ran at all — has NO shared entry in cons, while recoverInflightRegisters has
 // already rebuilt its pending entries under the deterministic group durable names. A purge

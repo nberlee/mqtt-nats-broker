@@ -22,6 +22,7 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -70,7 +71,13 @@ func testCountSessionStores(t *testing.T) *testRecordStoreCounter {
 // acknowledge group deliveries under a membership the record no longer carries. A FAILURE
 // CONNACK does neither: mqttRecordConnAckWrittenLocked records the [MQTT-3.2.0-1] flag only for
 // an accepted code, and [MQTT-3.2.2-4] forces Session Present to 0.
-func testSharedRefusalReason(t *testing.T, b *testQ2AffBroker, id string, expiry uint32) (net.Conn, byte, bool) {
+// It reads the FULL v5 CONNACK, properties included, because the reason code alone can no
+// longer tell the story: a disposing refusal and a local one both carry 0x83, and only the
+// Reason String says which. Returning it is what lets the callers assert that a shared
+// refusal says "ownership could not be confirmed" and never "session taken over by a new
+// connection" — the disposal vocabulary's text, which this site used to have no way of
+// sending and must still never send. See F-084.
+func testSharedRefusalReason(t *testing.T, b *testQ2AffBroker, id string, expiry uint32) (net.Conn, byte, string, bool) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
 		clientID:   id,
@@ -80,7 +87,7 @@ func testSharedRefusalReason(t *testing.T, b *testQ2AffBroker, id string, expiry
 	pt, _, ready := testMQTTReadPacketReady(r, 2*time.Second)
 	if !ready {
 		// No answer at all. Still a refusal, and still not an acceptance.
-		return c, 0, false
+		return c, 0, _EMPTY_, false
 	}
 	if pt&mqttPacketMask != mqttPacketConnectAck {
 		t.Fatalf("a refused CONNECT answered with packet type 0x%x, which is not a CONNACK", pt)
@@ -94,13 +101,37 @@ func testSharedRefusalReason(t *testing.T, b *testQ2AffBroker, id string, expiry
 		t.Fatalf("reading the connack reason: %v", err)
 	}
 	if reason == mqttConnAckRCConnectionAccepted {
-		return c, reason, true
+		return c, reason, _EMPTY_, true
 	}
 	if sp&0x1 != 0 {
 		t.Fatalf("a failure CONNACK (reason %#x) carried Session Present = 1, which "+
 			"[MQTT-3.2.2-4] forbids", reason)
 	}
-	return c, reason, false
+	// The properties, which this helper used to skip. Reading them is what makes the
+	// assertion below possible at all, and that assertion is the one the shared site owes:
+	// its refusal must say what the evidence supports and no more.
+	props, perr := r.readProperties(mqttPacketConnectAck)
+	if perr != nil {
+		t.Fatalf("reading the connack properties: %v", perr)
+	}
+	if props != nil && props.reasonString == mqttReasonStrSessionTakenOver {
+		t.Fatalf("a pre-CONNACK shared refusal told the client %q; nothing on this path "+
+			"establishes a takeover, and the disposal vocabulary's text must never reach "+
+			"the wire here (F-084)", props.reasonString)
+	}
+	// A DISPOSING refusal carries one of the two projections exactly. A local or unresolved
+	// one carries its own diagnostic instead, so only the disposing codes are constrained —
+	// and 0x89 is reachable here only through the disposing arm.
+	if props != nil && reason == mqttReasonServerBusy &&
+		props.reasonString != mqttReasonStrOwnershipUnsettled {
+		t.Fatalf("a 0x89 shared refusal carried Reason String %q, want exactly %q",
+			props.reasonString, mqttReasonStrOwnershipUnsettled)
+	}
+	reasonStr := _EMPTY_
+	if props != nil {
+		reasonStr = props.reasonString
+	}
+	return c, reason, reasonStr, false
 }
 
 func testCountArbitrations(t *testing.T) *atomic.Int32 {
@@ -236,7 +267,10 @@ func TestMQTTSharedGroupOwnershipWriteRunsWithoutAnyCreate(t *testing.T) {
 }
 
 // TestMQTTSharedGroupForeignOwnershipRefusesTheResume is case 3: the ownership write is
-// rejected 10071, so another broker owns the record and this connection must not serve.
+// rejected 10071, so this broker cannot confirm it still owns the record and must not
+// serve. Deliberately NOT "another broker owns it" — the rejection says the subject moved,
+// and the record this fixture lands establishes no successor at all, which is why the
+// refusal says only that ownership could not be confirmed. That inference is F-084's.
 //
 // It is deliberately built on a CREATE (the durable is deleted out of band first, so the
 // resume repairs it) rather than on a healthy resume, and for two reasons:
@@ -262,15 +296,33 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 		t.Fatalf("deleting the group durable out of band: %v", err)
 	}
 
-	// Arm only once the restore has recreated the durable, so the accept save and every
-	// write before it lands normally and the refusal below can only be the ownership
-	// attempt's.
-	var armed atomic.Bool
+	// A REAL 10071, not a fabricated one. An earlier revision rewrote a SUCCESSFUL store's
+	// result into 10071 after the write had already landed, which tells the broker its write
+	// failed when it did not — so the fixture exercised the rejection HANDLING without ever
+	// producing the race it names. Instead a foreign record is landed unconditionally at the
+	// last boundary before the ownership CAS, and the CAS then genuinely rejects.
+	//
+	// The boundary is "after-group-verify", the final group-durable write of the restore, and
+	// NOT "after-group-create": the replicated fixture in shared_group_arbitrate_cluster_test.go
+	// records why the earlier seam does not discriminate.
+	hash := getHash("ownforeignA")
+	var bumped, rejected atomic.Bool
 	var arbitrated atomic.Int32
 	ph := func(boundary string) {
 		switch {
-		case strings.HasPrefix(boundary, "after-group-create:"):
-			armed.Store(true)
+		case strings.HasPrefix(boundary, "after-group-verify:"):
+			if bumped.Swap(true) {
+				return
+			}
+			// An unrelated body: a fresh identity of its own and no claim on our parent, so
+			// disposalForDirectRejection reads it, establishes no sibling, and the refusal is
+			// the NON-FORKED one — 0x83 plus "ownership could not be confirmed".
+			ps := &mqttPersistedSession{ID: "ownforeignA", WID: mqttNewRecordWID(), Origin: "elsewhere"}
+			body, _ := json.Marshal(ps)
+			if _, err := b.jsa.storeMsg(mqttSessStreamSubjectPrefix+b.jsa.domain+hash, -1, body); err != nil {
+				return
+			}
+			rejected.Store(true)
 		case boundary == "after-ownership-cas":
 			arbitrated.Add(1)
 		}
@@ -278,22 +330,11 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 	mqttTestSharedArbitratePauseV.Store(&ph)
 	defer mqttTestSharedArbitratePauseV.Store(nil)
 
-	var rejected atomic.Bool
-	sh := func(_ *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
-		if !armed.Load() || rejected.Load() {
-			return resp, err
-		}
-		rejected.Store(true)
-		return nil, ApiErrors[JSStreamWrongLastSequenceErrF]
-	}
-	mqttTestSessStoreResultHookV.Store(&sh)
-	defer mqttTestSessStoreResultHookV.Store(nil)
-
-	c, reason, accepted := testSharedRefusalReason(t, b, "ownforeignA", 300)
+	c, reason, reasonStr, accepted := testSharedRefusalReason(t, b, "ownforeignA", 300)
 	defer c.Close()
 	if !rejected.Load() {
-		t.Fatal("no record write was attempted after the group-durable create, so the " +
-			"ownership write never ran and this fixture proves nothing")
+		t.Fatal("the foreign record was never landed before the ownership CAS, so the CAS " +
+			"was never rejected and this fixture proves nothing")
 	}
 	if got := arbitrated.Load(); got != 1 {
 		t.Fatalf("the restore arbitrated %d times, want 1", got)
@@ -308,13 +349,22 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 	}
 	// It IS now told why, which this test's earlier revision asserted the opposite of. That
 	// expectation was correct at the time and said so — "generalising it is its own roadmap
-	// item" — and the item has landed. A takeover projects to 0x83 rather than 0x8E because
-	// 0x8E is not a permitted CONNACK reason code ([3.2.2.2]); the projection is what carries
-	// the reason without violating the packet's own reason-code set.
+	// item" — and the item has landed. 0x83 rather than 0x8E because 0x8E is not a permitted
+	// CONNACK reason code ([3.2.2.2]) — and, on this fixture, because nothing established a
+	// successor to project from in the first place: the record it lands establishes no
+	// ownership at all, which is why the refusal says only that ownership could not be
+	// confirmed. See F-084.
 	if reason != mqttReasonImplementationSpecificError {
 		t.Fatalf("the 10071 refusal answered with reason %#x, want %#x: a pre-CONNACK refusal "+
 			"tells a v5 client why instead of closing in silence", reason,
 			mqttReasonImplementationSpecificError)
+	}
+	// And the EXACT text. 0x83 alone cannot tell an ownership refusal from a local failure,
+	// and the projection's whole job is to say what the evidence supports and no more — so
+	// asserting only "not the takeover string" would let any wrong text through.
+	if reasonStr != mqttReasonStrOwnershipUnconfirmed {
+		t.Fatalf("the refusal carried Reason String %q, want exactly %q", reasonStr,
+			mqttReasonStrOwnershipUnconfirmed)
 	}
 	// The durable must survive the foreign verdict.
 	if ci, lerr := b.jsa.lookupConsumer(mqttStreamName, durable); lerr != nil || ci == nil {

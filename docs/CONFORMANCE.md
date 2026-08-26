@@ -2592,12 +2592,53 @@ same deterministic name may receive messages published while no authoritative me
 existed. It is reaped by the orphan-consumer sweep **only if no record references it**, only
 after that grace, and only on a complete fail-closed walk.
 
-**A refused resume is closed silently.** The displacement DISCONNECT is gated on the CONNACK
-having been written, which is false for every refusal inside the CONNECT, so a client whose
-ownership write was rejected sees a closed socket rather than `0x8E` or `0x89`. A filter that
-fails *verification* still gets the v5 failure CONNACK naming it; generalising that signal
-to the ownership, register-recovery, reconciliation and lifetime refusals is a roadmap item
-of its own.
+**A refused resume is answered, but never with a DISCONNECT.** The displacement
+DISCONNECT is gated on the CONNACK having been written, which is false for every
+refusal inside the CONNECT, so no `0x8E` or `0x89` DISCONNECT is ever sent for one.
+
+What the client gets instead is a v5 **failure CONNACK** carrying a legal reason code
+and a Reason String — **within the post-accept-save, pre-success-CONNACK window**,
+which is the scope of this claim and no more. In that window the sites are the
+register recovery, the restore path, the shared-membership ownership write, the plain
+QoS 1/2 reconciliation verdicts and the lifetime grant, and the only one still silent
+is the **failed success-CONNACK write**, whose channel is the thing that failed.
+
+**Exits EARLIER in the CONNECT stay silent, and that is a stated residual rather than
+an oversight.** A CONNECT refused before the accept save — an unresolved record state,
+or a post-clear failure that disposes the old client — returns without a CONNACK.
+Those exits precede the point at which this connection is bound and its session
+accepted, which is the boundary the signal was scoped to when F-050 introduced it;
+generalising past it was never part of this work.
+
+A **3.1.1** client still gets a bare close wherever it is refused: its CONNACK has no
+reason code above 5.
+
+Three residuals attach to that signal.
+
+- **It deliberately UNDER-claims.** A disposing refusal says "session ownership could not
+  be
+  confirmed" even where a child-shaped body was observed and the existing disposal classifies
+  it as a takeover, because the broker cannot currently prove which of those it is. Only a
+  body claiming our parent gets the stronger, and truthful, `0x89` "try again". The
+  DISCONNECT and log paths are unchanged and may still over-claim in the other direction;
+  the
+  whole class is **F-084**.
+- **The Reason String can be dropped for a client with a tight Maximum Packet Size.**
+  `mqttMakeConnAckV5Frame` drops it **wholesale** rather than truncating when the frame would
+  exceed the client's limit, and suppresses the frame entirely if it still does not fit. Such
+  a client learns the reason code and nothing more, or nothing at all; the refusal proceeds
+  either way.
+- **The failure CONNACK is written with an unbounded socket write.** `enqueueProtoErr` calls
+  `writeSocket` with no deadline, and the signal precedes the disposal by design, so a
+  non-reading client can stall that write while this frame still holds the session gate, the
+  open record transaction and — for the reconciliation and lifetime sites — the session's
+  residency and its binding. A local same-client-ID CONNECT can be delayed for as long as
+  the
+  stall lasts. Remote durable ownership is unaffected: it is arbitrated by the record CAS,
+  not
+  by the gate. The ownership gate and the transaction were already held across this write
+  at
+  every pre-existing refusal site, so what is new is residency and binding at those two.
 
 **A delivery admitted before the operation gate was armed can still escape it.** A live
 SUBSCRIBE arms its gate before it installs anything, but a delivery callback that has
@@ -3010,10 +3051,12 @@ survive on purpose.
    path** — where the connection may already be gone — is logged and left to the marker or
    uncertainty the write itself armed. Nothing is serving there, so there is nothing to gate;
    the asymmetry with the in-connection path is stated rather than implied.
-6. **A pre-CONNACK takeover refusal can tell a v5 client why, but not "do not retry".** `0x8E`
-   "Session taken over" is not a legal CONNACK Reason Code ([3.2.2.2]) and no legal code
-   carries that instruction, so the refusal degrades to `0x83` with a Reason String. A client
-   that reconnects will contend for the session again. A protocol limit, not a gap.
+6. **A pre-CONNACK ownership refusal can tell a v5 client why, but not "do not retry".**
+   `0x8E` "Session taken over" is not a legal CONNACK Reason Code ([3.2.2.2]) and no legal
+   code carries that instruction, so the refusal uses `0x83` with a Reason String. A client
+   that reconnects will contend for the session again. A protocol limit, not a gap. Note the
+   refusal does not claim a takeover either: on most of these arms nothing established one,
+   which is F-084's subject.
 7. **PRE-EXISTING and unchanged:** a malformed shared membership key still fails to
    protect its
    group durable against the orphaned-consumer sweep, on any record. The pre-CONNACK preflight

@@ -42,8 +42,10 @@ func testReconcileSubscribe(t testing.TB, o *Options, cid, filter string, qos by
 // for sid.
 //
 // Callers asserting on a just-completed CONNECT must fence first
-// (testMQTTFlush): subscription restoration runs AFTER the CONNACK, so reading
-// the session the instant the CONNACK lands samples a resume still in progress.
+// (testMQTTFlush). Not because restoration follows the CONNACK — it precedes it
+// (F-050) — but because the CONNACK's arrival at the client says nothing about
+// the tail of the resume the broker is still running behind it, so reading the
+// session the instant it lands samples work in progress.
 func testReconcileConsDur(t testing.TB, s *Server, cid, sid string) string {
 	t.Helper()
 	sess := testMQTTResidentSession(t, s, cid)
@@ -119,10 +121,12 @@ func testReconcileExpectQoS1(t testing.TB, c net.Conn, r *mqttReader, topic stri
 }
 
 // testReconcileRefusedConnect sends a persistent-session CONNECT for cid and
-// asserts the broker REFUSES it with no packet at all: the connection closes
-// without a CONNACK and without a DISCONNECT (the pre-CONNACK abort
-// discipline). testMQTTConnect cannot be used here — it fatals when no CONNACK
-// arrives, which is exactly the outcome under test.
+// asserts the broker REFUSES it: the connection closes without a SUCCESS CONNACK
+// and without a DISCONNECT (the pre-CONNACK abort discipline). A v5 connection
+// additionally receives a FAILURE CONNACK carrying the reason; this helper is
+// used by the 3.1.1 fixtures, which have no reason code above 5 and so still see
+// the bare close. testMQTTConnect cannot be used here — it fatals when no
+// accepted CONNACK arrives, which is exactly the outcome under test.
 func testReconcileRefusedConnect(t testing.TB, o *Options, cid string) {
 	t.Helper()
 	addr := net.JoinHostPort(o.MQTT.Host, fmt.Sprintf("%d", o.MQTT.Port))
@@ -183,7 +187,8 @@ func TestMQTTReconcileResumeAfterReap(t *testing.T) {
 			c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 			defer c2.Close()
 			testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
-			// Fence: subscription restoration runs after the CONNACK.
+			// Fence: the CONNACK's arrival does not order this read against the
+			// resume tail still running behind it.
 			testMQTTFlush(t, c2, nil, r2)
 
 			// The repair minted a fresh identity: new name in memory AND in the
@@ -441,7 +446,7 @@ func TestMQTTReconcileChargeAccounting(t *testing.T) {
 			asm.mu.Unlock()
 		}()
 
-		// The CONNECT is REFUSED: closed with no packet at all.
+		// The CONNECT is REFUSED: a failure CONNACK, then the close.
 		testReconcileRefusedConnect(t, o, cid)
 
 		// The undo restored the old (absent) entry UNCHARGED and permanently
@@ -1176,13 +1181,19 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T8 — takeover between the accept save and the repair save (10071)
+// T8 — a foreign write between the accept save and the repair save (10071)
 // ---------------------------------------------------------------------------
 
 // A foreign write lands on the session record between the accept save and the
 // repair save; the repair save CAS-rejects with 10071 (the single-writer
-// check), the session is foreign-disposed, and the CONNECT is refused with no
-// packet at all.
+// check), the session is disposed, and the CONNECT is refused — with a v5
+// failure CONNACK carrying the reason, and no DISCONNECT.
+//
+// "Takeover" is deliberately NOT the word for what this fixture stages. It changes
+// only Origin and keeps our WID and PWID, so nothing establishes a successor: it is
+// the DisposingNonForked case, and the refusal says only that ownership could not be
+// confirmed. Reading a 10071 as proof another broker owns the record is the inference
+// F-084 exists to fix.
 //
 // M9 is pinned by IMMEDIATE-state assertions on a finite-expiry session, not by
 // the reconnect (a bare-removeSession mutant's next reconnect also succeeds by
@@ -1251,11 +1262,15 @@ func TestMQTTReconcileTakeoverDuringPhase(t *testing.T) {
 	})
 	defer restoreHook()
 
-	// The reconnect is REFUSED: no CONNACK, no DISCONNECT, connection closed.
-	c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+	// The reconnect is REFUSED: a failure CONNACK, no DISCONNECT, connection closed.
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
-	testMQTTExpectDisconnect(t, c2)
+	// The reconciliation refusals used to write NO PACKET AT ALL, and this fixture pinned
+	// that. The pre-CONNACK-signal item replaced it: a v5 refusal now says WHY. This helper
+	// asserts strictly more than the bare close did — a failure reason AND Session Present 0
+	// AND the close — so what the fixture is really about is unchanged.
+	testMQTTExpectRefusalThenDisconnect(t, c2, r2)
 	if bumpSeq.Load() == 0 {
 		t.Fatal("the foreign bump never landed; the test proved nothing")
 	}
@@ -1709,12 +1724,32 @@ func TestMQTTReconcileAmbiguousRepairSaveIsSettledForward(t *testing.T) {
 // T13 — refusal discipline with a Will
 // ---------------------------------------------------------------------------
 
-// A v5 CONNECT carrying a Will, refused in each branch: the client sees no
-// packet at all (no CONNACK, no pre-CONNACK DISCONNECT — connection close
-// only), and the NEW connection's Will is not published for a session that was
-// never granted. M12 (drop the abort helper's Will/connectReceived clearing)
-// fails both halves: the readLoop's v5 error path sends a DISCONNECT as the
-// first packet, and close handling publishes the Will.
+// A v5 CONNECT carrying a Will, refused in each branch. It used to assert that the
+// client saw NO PACKET AT ALL, and that is the behaviour the pre-CONNACK-signal item
+// replaced: this site was one of the TWO still refusing in silence — the lifetime grant
+// was the other, which the roadmap bullet had wrongly reported as done — so an automatic
+// client could not tell a refusal from a network fault or learn that a clean start is
+// the recovery.
+//
+// The replacement is a semantic one, not a loosening. Each branch now asserts, through
+// the FULL v5 CONNACK reader so the properties are actually parsed:
+//
+//   - the exact reason code for its outcome — 0x83 for a local or unresolved failure,
+//     0x83 for a disposing verdict that established no sibling, 0x89 for one that did;
+//   - the exact Reason String, which is what tells a 0x83 local failure apart from a
+//     0x83 ownership refusal;
+//   - Session Present = 0 [MQTT-3.2.2-4];
+//   - NO further packet before the close, positively — a pre-CONNACK refusal must not
+//     also emit a DISCONNECT, and the CONNACK must not open the connection;
+//   - and everything the earlier version pinned: the NEW connection's Will is never
+//     published for a session that was never granted, and the local branch still runs
+//     ordinary close bookkeeping.
+//
+// M5 (drop the abort helper's Will/connectReceived clearing) fails the Will half.
+// M8a (send the disposal vocabulary's Reason String instead of the projection) fails
+// the non-forked disposing rows, which is the whole point of the projection: that
+// vocabulary would tell this client "session taken over by a new connection" on
+// evidence that established no such thing (F-084).
 func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 	const willTopic = "will/t13"
 
@@ -1723,6 +1758,15 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 		// arm installs the refusal injection; it may use the save seam and must
 		// clean up via the returned func.
 		arm func(t *testing.T, asm *mqttAccountSessionManager, cid, sid, oldDur string) func()
+		// wantReason is the CONNACK reason code, and wantReasonStr is either the exact
+		// Reason String or, for the arms that forward the step's own diagnostic, a
+		// substring of it.
+		wantReason    byte
+		wantReasonStr string
+		// exactReasonStr distinguishes the two: the ownership projections are FIXED
+		// strings and are compared exactly, because their whole job is to say neither
+		// more nor less than the evidence supports.
+		exactReasonStr bool
 	}
 	branches := []branch{
 		{"indeterminate lookup", func(t *testing.T, asm *mqttAccountSessionManager, _, _, _ string) func() {
@@ -1736,7 +1780,7 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 				asm.testResumeReconcileLookup = nil
 				asm.mu.Unlock()
 			}
-		}},
+		}, mqttReasonImplementationSpecificError, "simulated verification outage", false},
 		{"failed create", func(t *testing.T, asm *mqttAccountSessionManager, _, _, _ string) func() {
 			asm.mu.Lock()
 			asm.testResumeReconcilePreCreate = func(*mqttSession, string) error {
@@ -1748,7 +1792,7 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 				asm.testResumeReconcilePreCreate = nil
 				asm.mu.Unlock()
 			}
-		}},
+		}, mqttReasonImplementationSpecificError, "simulated consumer create rejection", false},
 		{"definite CAS", func(t *testing.T, asm *mqttAccountSessionManager, cid, sid, oldDur string) func() {
 			// A foreign write interleaved immediately before the repair save's
 			// CAS, from inside the save seam (the T8 machinery).
@@ -1777,7 +1821,7 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 				})
 				return nil
 			})
-		}},
+		}, mqttReasonImplementationSpecificError, mqttReasonStrOwnershipUnconfirmed, true},
 		{"ambiguous save", func(t *testing.T, asm *mqttAccountSessionManager, cid, sid, oldDur string) func() {
 			var mu sync.Mutex
 			var armed, suppressed bool
@@ -1810,7 +1854,47 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 				restoreResult()
 				mqttTestSessStoreSuppressV.Store(false)
 			}
-		}},
+		}, mqttReasonImplementationSpecificError, "session record store suppressed", false},
+		// The two rows the merged verdict made unreachable end to end. "definite CAS"
+		// above lands a body with the SAME WID/PWID and only a different Origin, so
+		// nothing establishes a sibling and it takes the non-forked arm; this one lands a
+		// body that CLAIMS OUR PARENT, which is the positive fact that licenses 0x89
+		// "try again" instead. Without it, an implementation that projects every
+		// disposing arm to 0x83 passes.
+		{"forked bump", func(t *testing.T, asm *mqttAccountSessionManager, cid, sid, oldDur string) func() {
+			hash := getHash(cid)
+			var once sync.Once
+			return setMQTTTestSessSaveHook(func(sess *mqttSession) error {
+				if sess.id != cid || !testReconcileIsRepairSave(sess, sid, oldDur) {
+					return nil
+				}
+				once.Do(func() {
+					smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, hash)
+					if err != nil {
+						t.Errorf("load record for the sibling bump: %v", err)
+						return
+					}
+					ps := &mqttPersistedSession{}
+					if err := json.Unmarshal(smsg.Data, ps); err != nil {
+						t.Errorf("unmarshal record for the sibling bump: %v", err)
+						return
+					}
+					// A SIBLING, and every part of that is the predicate in
+					// classifyRecordLineage: keep the PWID, which is the parent our
+					// acknowledged record claims, mint a distinct WID of its own, and give
+					// it content so its digest can never match anything we attempted. The
+					// "definite CAS" row above changes only Origin and so keeps our WID,
+					// which is exactly why it concedes instead.
+					ps.WID = mqttNewRecordWID()
+					ps.Origin = "sibling"
+					b, _ := json.Marshal(ps)
+					if _, err := asm.jsa.storeMsg(mqttSessStreamSubjectPrefix+asm.domainTk+hash, -1, b); err != nil {
+						t.Errorf("store the sibling bump: %v", err)
+					}
+				})
+				return nil
+			})
+		}, mqttReasonServerBusy, mqttReasonStrOwnershipUnsettled, true},
 	}
 
 	for _, br := range branches {
@@ -1853,15 +1937,108 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 			cleanup := br.arm(t, asm, cid, sid, oldDur)
 			defer cleanup()
 
-			// The refused CONNECT, carrying a Will: NO packet at all, and no Will.
-			c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+			// THE ORDER, for the disposing branches: the failure CONNACK must be attempted
+			// while the session is still bound and still resident, i.e. BEFORE the
+			// disposal. disposeForeignStateLocked clears sess.c and removes residency
+			// SYNCHRONOUSLY before it schedules the close, so this is deterministic rather
+			// than a timing bet. M1 (signal after dispose) and M6 (dispose inside the phase
+			// as well as at the caller) both flip these.
+			//
+			// Recorded into atomics and asserted in the test body — never t.Errorf from
+			// inside a hook, which can outlive its test and panic the whole binary.
+			var attempts atomic.Int32
+			var boundAtAttempt, residentAtAttempt atomic.Bool
+			restoreAck := setMQTTTestConnAckAttemptHook(func(rc byte) {
+				if rc == mqttConnAckRCConnectionAccepted {
+					return
+				}
+				attempts.Add(1)
+				sessObj.mu.Lock()
+				boundAtAttempt.Store(sessObj.c != nil)
+				sessObj.mu.Unlock()
+				asm.mu.RLock()
+				_, resident := asm.sessions[cid]
+				asm.mu.RUnlock()
+				residentAtAttempt.Store(resident)
+			})
+			defer restoreAck()
+
+			// The refused CONNECT, carrying a Will: a failure CONNACK that says WHY,
+			// then the close, and no Will.
+			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 				props: mqttV5ConnPropsSessionExpiry(300),
 				will:  &mqttWill{topic: []byte(willTopic), message: []byte("boom"), qos: 1}},
 				o.MQTT.Host, o.MQTT.Port)
 			defer c2.Close()
+
+			// The FULL v5 reader, so the properties are parsed rather than skipped: the
+			// Reason String is the only thing that tells a 0x83 local failure apart from a
+			// 0x83 ownership refusal, and a reader that stops at the reason byte cannot
+			// see it.
+			sp, reason, props := testMQTTReadConnAckV5(t, r2)
+			if reason != br.wantReason {
+				t.Fatalf("v5 CONNACK reason = %#x, want %#x", reason, br.wantReason)
+			}
+			if sp {
+				t.Fatal("a failure CONNACK must carry Session Present = 0 [MQTT-3.2.2-4]")
+			}
+			if props == nil {
+				t.Fatal("a failure CONNACK must carry a Reason String property")
+			}
+			if br.exactReasonStr {
+				if props.reasonString != br.wantReasonStr {
+					t.Fatalf("Reason String %q, want exactly %q: an ownership refusal says "+
+						"neither more nor less than the evidence supports",
+						props.reasonString, br.wantReasonStr)
+				}
+			} else if !strings.Contains(props.reasonString, br.wantReasonStr) {
+				t.Fatalf("Reason String %q, want it to carry %q",
+					props.reasonString, br.wantReasonStr)
+			}
+			// NOTHING follows the CONNACK before the close. A pre-CONNACK refusal must not
+			// also emit a DISCONNECT, and a failure CONNACK opens the connection for
+			// nothing: mqttRecordConnAckWrittenLocked records the [MQTT-3.2.0-1] flag only
+			// for an ACCEPTED code, so no takeover notification is unblocked by it.
 			testMQTTExpectDisconnect(t, c2)
 			testReconcileClientGone(t, s, cid)
 			testMQTTExpectNothing(t, wr)
+
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("the refusal attempted %d failure CONNACK(s), want exactly 1", got)
+			}
+			// Zero on THESE branches, and for a reason narrower than an earlier draft of this
+			// comment claimed. A fork capsule's candidate delta is built from acknowledged
+			// grant TERMS, each sid's DRAIN presence, in-flight register nonces and a PUBREL
+			// consumer the parent lacked (mqttGrantEntriesDiffer, buildForkedGrantLocked).
+			// This session owns one plain QoS 1 filter, so the restore provisions no PUBREL
+			// consumer and no register, and a CONNECT acknowledges no SUBSCRIBE and no
+			// UNSUBSCRIBE — so nothing supplies a delta and the fork is classified without
+			// minting. A repair's new consumer identity is invisible to the predicate on
+			// purpose.
+			//
+			// It would be FALSE to generalise that to "no pre-CONNACK write can produce a
+			// delta": processSubs runs BEFORE the CONNACK (F-050 moved it there), so a resume
+			// restoring a QoS 2 or shared filter DOES provision grant-tracked state that a
+			// later pre-CONNACK save confirms. That route, and the caller-side double-mint
+			// mutation it makes detectable, is covered by
+			// TestPreConnackForkMintIsExactlyOncePerVerdict.
+			if n := asm.forkedGrantStores.Load(); n != 0 {
+				t.Fatalf("a refusal after the confirmed accept save minted %d fork capsules; "+
+					"none of a capsule's ingredients can change in that window, so this is "+
+					"either a new delta source or a mint that should not be here", n)
+			}
+			// Only the DISPOSING branches order against a disposal; the others never
+			// dispose at all, so there is nothing for the signal to precede.
+			if br.exactReasonStr {
+				if !boundAtAttempt.Load() {
+					t.Fatal("the failure CONNACK was attempted AFTER the disposal cleared " +
+						"sess.c: it is racing the socket close the disposal schedules")
+				}
+				if !residentAtAttempt.Load() {
+					t.Fatal("the failure CONNACK was attempted AFTER the disposal evicted " +
+						"the session")
+				}
+			}
 
 			// The "failed create" branch is the finite-expiry LOCAL refusal: the
 			// resident session must have gone through ORDINARY close bookkeeping —
@@ -1907,9 +2084,12 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 // pins the stale-unmatched-Cons residual, which F-050 does not retire. Restored
 // verbatim from the commit the change was written against.
 
-// A post-CONNACK failure exit that never reaches processSubs — the 3.1.1
-// forced-leave save failure — leaves the deferred fallback to reclaim the
-// phase's subscriptions, and the session resumable.
+// A post-CONNACK failure exit — the 3.1.1 forced-leave save failure — leaves the
+// deferred fallback to reclaim the phase's subscriptions, and the session
+// resumable. "Post-CONNACK" is about the forced leave's own position, not about
+// processSubs: restoration runs BEFORE the CONNACK (F-050), so what this exit
+// misses is the sweep that follows processSubs, which is why the deferred
+// fallback is the thing that has to reclaim.
 func TestMQTTReconcileForcedLeaveFailureFallback(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -2062,7 +2242,7 @@ func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
 
 // Restoration cannot complete a collected QoS 2 filter (its PUBREL setup fails on
 // the exhausted MaxAckPending budget after the PUBREL durable was reaped), so the
-// CONNECT is REFUSED — no packet at all, under the pre-CONNACK abort discipline.
+// CONNECT is REFUSED under the pre-CONNACK abort discipline, and now with a reason.
 //
 // **This test was re-aimed by F-050.** It used to assert the opposite disposition:
 // the CONNECT was ACCEPTED with Session Present, the post-processSubs sweep removed
@@ -2114,8 +2294,9 @@ func TestMQTTReconcileSkippedFilterRefusesTheResume(t *testing.T) {
 	sess.tmaxack = mqttMaxAckTotalLimit
 	sess.mu.Unlock()
 
-	// REFUSED: no CONNACK and no DISCONNECT. The client is told nothing rather
-	// than told its session is present and then served nothing.
+	// REFUSED: no SUCCESS CONNACK and no DISCONNECT. The client is refused rather
+	// than told its session is present and then served nothing. (This fixture uses the
+	// 3.1.1 helper, which sees the bare close; a v5 client is additionally told why.)
 	testReconcileRefusedConnect(t, o, cid)
 	testReconcileClientGone(t, s, cid)
 
@@ -2161,11 +2342,17 @@ func TestMQTTReconcileSkippedFilterRefusesTheResume(t *testing.T) {
 // never told the resume happened, retries and finds Session Present 0 with its
 // subscriptions and durables gone.
 //
-// The abort helper restores the lifetime the session had before this CONNECT,
-// so a refused resume leaves it exactly as it found it.
+// What actually protects it is ORDERING, not a restore: the requested interval and
+// Clean flag are applied at the GRANT point, which runs after this phase, so a resume
+// refused here never overwrote the lifetime in the first place and there is nothing
+// to put back. (An earlier version of this comment claimed abortAcceptedResume
+// restores it, and named a "drop the restore in abortAcceptedResume" mutation. No
+// such restore exists in that helper — it abandons the restore gate and clears the
+// Will and connectReceived — so that mutation was unwritable and is not claimed.)
 //
-// Mutation check: drop the restore in abortAcceptedResume and this test fails —
-// the retry reports Session Present 0 and delivers nothing.
+// The mutation that DOES discriminate is moving the grant before this phase: the
+// refusal would then leave interval 0 applied and the retry reports Session Present
+// 0 with its subscriptions gone, which is exactly what this test asserts against.
 func TestMQTTReconcileRefusedResumeKeepsSessionLifetime(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -2197,10 +2384,14 @@ func TestMQTTReconcileRefusedResumeKeepsSessionLifetime(t *testing.T) {
 
 	// The refused reconnect asks for Session Expiry Interval 0 — "discard my
 	// session when this connection ends". It is never granted.
-	c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(0)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
-	testMQTTExpectDisconnect(t, c2)
+	// The reconciliation refusals used to write NO PACKET AT ALL, and this fixture pinned
+	// that. The pre-CONNACK-signal item replaced it: a v5 refusal now says WHY. This helper
+	// asserts strictly more than the bare close did — a failure reason AND Session Present 0
+	// AND the close — so what the fixture is really about is unchanged.
+	testMQTTExpectRefusalThenDisconnect(t, c2, r2)
 	testReconcileClientGone(t, s, cid)
 
 	// The session survived with the lifetime it had: still resident, still
@@ -2327,8 +2518,11 @@ func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
 // the next restore-from-record discarded it as a clean session, losing
 // subscriptions and durables the client still believed it had.
 //
-// Mutation check: skip the save in restoreRefusedResumeLifetime and the
-// restarted broker reports Session Present 0 here.
+// Mutation check: make the refusing phase run AFTER grantRequestedLifetime, so the
+// refused CONNECT's Clean=true / ExpiryInterval=0 is applied and persisted before the
+// refusal — the restarted broker then reports Session Present 0 here. (An earlier
+// version named "skip the save in restoreRefusedResumeLifetime"; no such function
+// exists, so that mutation was unwritable and is not claimed.)
 func TestMQTTReconcileRefusedResumePersistsRestoredLifetime(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -2351,10 +2545,14 @@ func TestMQTTReconcileRefusedResumePersistsRestoredLifetime(t *testing.T) {
 	asm.mu.Unlock()
 
 	// A v5 reconnect asking for Session Expiry Interval 0 — refused.
-	c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(0)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
-	testMQTTExpectDisconnect(t, c2)
+	// The reconciliation refusals used to write NO PACKET AT ALL, and this fixture pinned
+	// that. The pre-CONNACK-signal item replaced it: a v5 refusal now says WHY. This helper
+	// asserts strictly more than the bare close did — a failure reason AND Session Present 0
+	// AND the close — so what the fixture is really about is unchanged.
+	testMQTTExpectRefusalThenDisconnect(t, c2, r2)
 	testReconcileClientGone(t, s, cid)
 
 	// The RECORD describes the session as it was, so a broker that restarts and
@@ -2495,12 +2693,14 @@ func TestMQTTReconcileFailedRepairStrandsNoDeferredMarker(t *testing.T) {
 // A refused resume whose lifetime write cannot be issued yet still converges
 // the record once the earlier write resolves.
 //
-// Review finding: restoreRefusedResumeLifetime skipped its save while the
-// session was already unresolved (save refuses at entry then), so the restored
-// lifetime lived only in memory while the record still carried the refused
-// CONNECT's — and the readback's continuations only reconciled the consumer
-// replacements, never the lifetime. A restart in between would read the wrong
-// one and discard the session.
+// Review finding, in the terms the code actually uses: while a session is already
+// unresolved, save refuses at entry, so a lifetime write issued then lives only in
+// memory while the record still carries the earlier CONNECT's — and the readback's
+// continuations reconciled only the consumer replacements, never the lifetime. A
+// restart in between would read the wrong one and discard the session. (The finding
+// was once written against a "restoreRefusedResumeLifetime" helper, which does not
+// exist; what carries the lifetime is grantRequestedLifetime and its landed
+// continuation.)
 //
 // Mutation check: drop the lifetime restore's save and the record still carries the
 // refused CONNECT's zero interval after resolution.
@@ -2551,10 +2751,14 @@ func TestMQTTReconcileUncertainRefusalStillRestoresLifetime(t *testing.T) {
 	defer mqttTestSessStoreSuppressV.Store(false)
 
 	// The refused reconnect asks for expiry 0 — never granted.
-	c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(0)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
-	testMQTTExpectDisconnect(t, c2)
+	// The reconciliation refusals used to write NO PACKET AT ALL, and this fixture pinned
+	// that. The pre-CONNACK-signal item replaced it: a v5 refusal now says WHY. This helper
+	// asserts strictly more than the bare close did — a failure reason AND Session Present 0
+	// AND the close — so what the fixture is really about is unchanged.
+	testMQTTExpectRefusalThenDisconnect(t, c2, r2)
 	testReconcileClientGone(t, s, cid)
 	mu.Lock()
 	fired := suppressed
@@ -2609,7 +2813,8 @@ func TestMQTTReconcileUncertainRefusalStillRestoresLifetime(t *testing.T) {
 //
 // Review finding: every CAS rejection inside the retry loop continued, and the
 // loop then returned local-definite without ever classifying the last one — so a
-// 10071 on the final attempt (another broker took the session over) undid our
+// 10071 on the final attempt (the subject moved past our base; who moved it is
+// F-084's question) undid our
 // work and left a session we no longer own mapped and bound.
 //
 // Mutation check: return mqttRepairSaveLocalDefinite at the end of the loop
@@ -2694,8 +2899,9 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 		t.Fatalf("only %d repair-save attempts were made, want the retries exhausted (%d)", got, mqttRepairSaveAttempts+1)
 	}
 
-	// Foreign, not local: the session another broker now owns is evicted rather
-	// than left mapped as ours.
+	// Disposing, not local: a session this broker can no longer confirm it owns is
+	// evicted rather than left mapped as ours. (What the record establishes about WHO
+	// owns it is F-084's question; the eviction does not depend on answering it.)
 	asm.mu.RLock()
 	_, resident := asm.sessions[cid]
 	asm.mu.RUnlock()
@@ -2833,9 +3039,9 @@ func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
 // A takeover discovered while a refused resume is being unwound hands the
 // session over instead of restoring it locally.
 //
-// Review finding: the lifetime restore's own save can be the thing that proves
-// another broker took the session — and the code merely logged, then detached
-// and armed a local expiry timer for a session it no longer owned, which is the
+// Review finding: the grant's own save can be the thing that shows the record moved
+// past our base — and the code merely logged, then detached and armed a local expiry
+// timer for a session it could no longer confirm it owned, which is the
 // stale-write posture disposeForeignSessionLocked exists to prevent.
 //
 // A successful repair leaves no never-transmitted marker naming the durable it
@@ -3350,10 +3556,14 @@ func TestMQTTReconcileResolvedSessionDischargesParkedTeardown(t *testing.T) {
 	defer restoreResult()
 	defer mqttTestSessStoreSuppressV.Store(false)
 
-	c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
-	testMQTTExpectDisconnect(t, c2)
+	// The reconciliation refusals used to write NO PACKET AT ALL, and this fixture pinned
+	// that. The pre-CONNACK-signal item replaced it: a v5 refusal now says WHY. This helper
+	// asserts strictly more than the bare close did — a failure reason AND Session Present 0
+	// AND the close — so what the fixture is really about is unchanged.
+	testMQTTExpectRefusalThenDisconnect(t, c2, r2)
 	testReconcileClientGone(t, s, cid)
 	restoreSave()
 	restoreResult()

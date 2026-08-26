@@ -3023,8 +3023,8 @@ func TestMQTTPersistedSession(t *testing.T) {
 	// Check that qos1 publish message is received.
 	testMQTTCheckPubMsg(t, c, r, "foo/bar", mqttPubQos1, []byte("msg0"))
 
-	// Flush to prevent publishes to be done too soon since we are
-	// receiving the CONNACK before the subscriptions are restored.
+	// Flush before publishing: the CONNACK's arrival at the client does not order this
+	// publish against the tail of the resume the broker is still running behind it.
 	testMQTTFlush(t, c, nil, r)
 
 	// Now publish some messages to all subscriptions.

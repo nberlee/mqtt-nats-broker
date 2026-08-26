@@ -247,9 +247,12 @@ down to 2 before it tests the failure sentinel.
 ### Downstream
 
 F-027's forked-record repair (closed 2026-08-12) excludes shared-subscription membership
-for exactly this ordering: the success CONNACK precedes shared restoration, so a
-re-asserted group membership would be durable while a per-filter failure leaves no join
-and no consumer — the accepted-but-dead state above. **F-027's repair set widens to shared
+for exactly this failure asymmetry: a re-asserted group membership would be durable while
+a
+per-filter failure leaves no join and no consumer — the accepted-but-dead state above. (The
+reason was once stated as an ordering, "the success CONNACK precedes shared restoration".
+F-050 moved restoration BEFORE the CONNACK, so that phrasing is no longer true; the exclusion
+rests on the asymmetry.) **F-027's repair set widens to shared
 membership when this closes**, and its snapshot constructor is where that exclusion lives
 (`sess_fork_repair.go`).
 
@@ -546,7 +549,10 @@ selected while it is closed is dropped.
 In `docs/CONFORMANCE.md`. Ownership is proven at the write's linearization point, not
 continuously. The proof does not extend to the consumer, which may vanish at any point after
 the last verification. A durable created and then lost to a foreign verdict is left in place
-and is **not inert**. A refused resume is closed silently. And the repair **broadens the
+and is **not inert**. A refused resume sends no DISCONNECT, though it is no longer silent
+—
+the pre-CONNACK refusal signal now carries a v5 failure CONNACK. And the repair **broadens
+the
 population** that reaches the live SUBSCRIBE path — which F-078 has since arbitrated.
 
 ### Two F-076 fixtures were rewritten rather than relaxed

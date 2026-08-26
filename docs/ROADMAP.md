@@ -138,7 +138,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   unbound-only while a displaced connection is still attached. It is bounded repair, not
   general repair: not a record this broker did not author, not across a restart, not a
   filter the survivor decided about, and **not shared-subscription membership, which stays
-  excluded until F-050 closes** because the success CONNACK precedes shared restoration.
+  excluded** because a per-filter shared restore can fail while the membership stays durable.
+  (The original reason given here — that the success CONNACK precedes shared restoration —
+  stopped being true when F-050 moved restoration before the CONNACK; the exclusion stands
+  on
+  the failure asymmetry, not on the ordering.)
   `docs/CONFORMANCE.md` states every bound and the cap-forfeiture residual.
 
 - [x] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
@@ -855,8 +859,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   Every deletion is refuted: the holder scan skips same-client-ID records, so after a
   takeover a blind last-holder delete destroys the NEW owner's durable, and
   `releaseSharedConsumer` refunds a historic charge through an already-rejected transaction.
-  A refused resume is closed SILENTLY — the displacement DISCONNECT is gated on the CONNACK
-  having been written. `make cluster-failover-tests`' regex is extended here, so F-078's
+  A refused resume sends no DISCONNECT — that notification is gated on the CONNACK having
+  been written — but it is no longer SILENT: the pre-CONNACK refusal signal now carries a
+  v5
+  failure CONNACK here, within its scoped window. `make cluster-failover-tests`' regex is
+  extended here, so F-078's
   replicated case is visible when it lands. **What kept the box open was F-078**, the live
   SUBSCRIBE path, which installed and revived the same interest with no ownership write at
   all — and which has since landed, closing this box with it. The CONNECT path needs no
@@ -1186,45 +1193,121 @@ further findings it surfaced are filed separately, for the reason its own bullet
   the orphan sweep. **Shape:** 6 plan-review rounds (2 producing nothing — one cancelled for
   plan drift, one failed launch), 19 findings all folded or refuted.
 
-  - [ ] **Generalise the pre-CONNACK refusal signal.** **MOSTLY DONE; open on ONE site.**
-  F-050 told a v5 client why its restoration refused the CONNECT (0x83, naming the filter),
-  because a permanently unrestorable filter would otherwise be an endless silent close
-  with no
-  hint that a clean start is the recovery. **F-061 does not own this**: it is
-  specifically the
-  authorization path, and F-050's review corrected an earlier draft that attributed general
-  failure signalling to it. **Small.**
-  **This bullet named three silent sites and there were six.** The three it omitted are the
-  shared-ownership arms — and one of them was already promised here by a comment in the tree
-  ("No 0x8E reaches the client ... generalising it is its own roadmap item"). Swept
-  rather than
-  taken at face value. **Landed:** register recovery, and the shared-ownership foreign/forked,
-  unresolved and local arms, and the lifetime grant, all now carry a v5 failure CONNACK
-  with a
-  Reason String. Two facts shaped it: **0x8E "Session taken over" is NOT a legal CONNACK Reason
-  Code** ([3.2.2.2] — checked against the spec, not recalled), while 0x89 is, so the disposal
-  vocabulary is **projected** onto a legal code and a takeover degrades to 0x83; and the
-  refusal CONNACK must be enqueued **before** the foreign disposal, which schedules the socket
-  close on another goroutine. The claim is scoped to the **post-accept-save,
-  pre-success-CONNACK** window — earlier exits exist and are out of scope.
-  **What keeps the box open: S2, the reconciliation verdicts, treated as ONE atomic site.**
-  `reconcileResumedConsumers` **disposes the session internally before it returns**, so a
-  CONNACK added at the caller has already lost the race with its own close; and
-  `mqttReconcileRefuseForeign` **merges takeover with forked**, which need different
-  projections. Closing it means either returning the vocabulary without disposing, or invoking
-  a signal callback before the internal disposal, plus splitting that verdict — and then
-  S2-local, S2-unresolved and S2-forked tests, not just S2-foreign. Signalling only half the
-  site was rejected: it would leave an operator comparing a local verdict that explains itself
-  against a foreign one that does not.
-  **`abortAcceptedResume`'s unused `bool` parameter is RETAINED on purpose.** It is
-  where S2's
-  foreign-versus-forked fact would arrive, so deleting it now would destroy the carrier
-  the fix
-  needs. A test pins that S2 stays silent, with a comment saying so, to stop a later reader
-  "fixing" it without the redesign.
-  **The failed success-CONNACK write stays silent too, permanently** — the channel it would
-  explain itself on is the one that just failed.
+  - [x] **Generalise the pre-CONNACK refusal signal.** **DONE — and the bullet was wrong
+  about how much was left: it said ONE site and there were TWO.** The reconciliation verdicts
+  (S2) were the site it named. `grantRequestedLifetime` had **both** of the properties this
+  bullet gave as the reason S2 stayed open — it disposed the session internally before
+  returning, and it collapsed a takeover with a fork — and the fixture that made it look done
+  (`TestPreConnackRefusalSignalAtTheLifetimeGrant`) injects a PRE-STORE failure, so it drives
+  the local arm only and the disposing arms had no coverage at all. `feedback_named_sites_are_a_sample`
+  for the second time on this one bullet.
+  **What landed.** Both helpers now RETURN an outcome and a disposal vocabulary instead of
+  acting on the disposing half, and one caller-side closure, `refuseDisposing`, runs
+  **abort → signal → dispose** for all THREE disposing sites **in the post-accept-save,
+  pre-success-CONNACK window** — the shared-membership ownership write included, which was
+  already in that order but is no longer the only site that states it. That window is the
+  claim's scope: exits earlier in the CONNECT still refuse without a CONNACK, which is a
+  stated residual rather than an oversight and was out of scope for F-050's half too.
+  `mqttResumeReconcileVerdict` is **deleted** in favour of one
+  `mqttPreConnackOutcome` shared by the two steps, with the merged verdict SPLIT into
+  `DisposingNonForked` and `DisposingForked`; the classification behind both is extracted
+  once
+  as `classifyPreConnackSave`. `abortAcceptedResume`'s reserved `bool` is deleted — its stated
+  purpose (carrying S2's foreign-versus-forked fact) is discharged by a typed result — and
+  so
+  are `connAckReasonForDisposal` and `grantRequestedLifetime`'s now-unused `asm`/`c` parameters.
+  **The client is told something DIFFERENT from what the disposal claims, and that is the
+  mechanism rather than an accident.** Three plan-review rounds established that sending
+  `mqttDisposalTakenOver.reasonStr` would make this item's own purpose false: the disposing
+  arms are also reached when the record could not be read, was absent, did not decode, was
+  released, or sat at or below our base. So the CONNACK has its own two-value vocabulary —
+  `0x89` + "ownership could not be established; try again" for a body claiming our parent,
+  `0x83` + "session ownership could not be confirmed" for every other disposing verdict, and
+  `0x83` + the step's own diagnostic for local and unresolved. `preConnackRefusalFor` is
+  exhaustive with **no `default`**, because a default is how a future outcome would
+  inherit an
+  ownership claim it has no evidence for; an unlisted outcome gets a loud log and a bare close.
+  A `panic` there was proposed by review and **refused**: `internal/mqtt` has zero production
+  panics, and crashing a broker over an unhandled enum inside a reporting helper is worse
+  than
+  what it guards.
+  **`docs/ARCHITECTURE.md` promised something the code never did.** It said the CONNACK
+  carries "the vocabulary's Reason String", and `mqtt.go`'s shared-ownership site
+  forwarded its
+  own error text instead. That sentence is rewritten rather than fulfilled.
+  **Residuals, all three in `docs/CONFORMANCE.md`:** the signal deliberately UNDER-claims
+  (F-084 owns the other direction); the Reason String is dropped WHOLESALE, never truncated,
+  for a client with a tight Maximum Packet Size; and the failure CONNACK is written with an
+  **unbounded** socket write while the gate, the transaction, residency and binding are held,
+  so a non-reading client can delay a local same-ID CONNECT. Bounding the shim's write is
+  out
+  of scope.
+  **Shape:** 7 plan-review rounds (1 relaunched — a launch whose job never registered) plus
+  one escalation consult that CUT THE ITEM. Rounds 1-3 each cut the same seam wider — what
+  the
+  broker is licensed to CLAIM — until the enumeration itself was the defect
+  (`feedback_close_the_class_with_a_property`), and the consult split at the claim boundary:
+  this item ships the signal, F-084 owns the claim. **Refuted and recorded so none
+  returns:** a
+  caller-side vocabulary re-derivation (two routes, and the 10071 route mints the fork grant);
+  a signal callback inside the helper; sending the vocabulary's Reason String; fixing the
+  takeover over-claim inside this item (its remedy needs a successor-evidence predicate that
+  cannot yet be stated as a proof, and it changes F-078's Will disposition); and a mutation
+  that "proves" a shared classifier is shared rather than copied (two correct copies survive
+  it).
+  **What a future change must not undo:** the CONNACK never reads a disposal vocabulary, the
+  projection has no `default`, and the disposal is the CALLER'S so the signal can precede
+  it.
 
+  - [ ] [F-084: Prove a successor before claiming a takeover](findings/ha-arbitration.md#f-084-prove-a-successor-before-claiming-a-takeover).
+  **Alpha blocker.** Split out of the pre-CONNACK-signal item above by an escalation consult
+  after three plan-review rounds cut this same seam wider each time. *The finding:* the broker
+  asserts **`mqttDisposalTakenOver` — "session taken over by a new connection", `0x8E`, which
+  tells a client to STOP reconnecting — on evidence that establishes no successor at all.*
+  `mqttLineageNotForked` expressly covers a legitimate successor, an unrelated lineage, a
+  record carrying no identity, and a verbatim REPLAY of our own bytes, and every one of them
+  concedes to the takeover vocabulary. *The population, which took three rounds to enumerate
+  and is a sample rather than a census:* `disposalForDirectRejection`'s four conceding branches
+  (unreadable, absent, undecodable, at-or-below-base); `resolveContendedRecordSave`'s **two**
+  gone arms — the in-loop one and the post-exhaustion one — plus `movedVerdict`'s below-base
+  fail-safe and its above-base non-sibling arm; `mqttDisposalForRepairSave`,
+  `mqttDisposalForForeignResolution` and `mqttDisposalForRejection`, each of which maps a
+  verdict that has already discarded the evidence; `disposalForRemotePersist`; and **two
+  hardcoded takeovers that bypass every mapper**, in `mqtt.go` and in `sess_rejected_write.go`.
+  *Why it is not a wording fix:* the remedy needs a predicate for what POSITIVELY proves a
+  successor, and the obvious candidate — a usable record above our base whose digest differs
+  and whose `PWID` names our `ackWID`, with both identities non-empty — identifies a
+  *child-shaped body*, not proven ownership. Restore adopts `WID`/`PWID` **without validating
+  provenance**, valid-shaped bodies can arrive through unconditional publication, and replay
+  policy is unsettled. So it first needs decisions on trusted-versus-valid-shaped provenance,
+  replayed child records, **parentless clean-start successors**, **descent beyond one hop**,
+  and — for each resulting class — whether it **discards or consumes the Will**. That last
+  one
+  is behavioural, not vocabulary: F-078's live-SUBSCRIBE Foreign arm discards the Will *as
+  a
+  takeover* while Forked and Local take ordinary non-foreign handling, so an honest
+  "unsettled" class reaching that arm would change Will disposition, and every bound
+  displacement path needs the same review. *Design already sketched and reviewed:* a fourth
+  vocabulary carrying `0x89` and reusing `mqttReasonStrOwnershipUnsettled` (the
+  `mqttDisposalTeardownIncomplete` precedent — same code and text, its own `logReason`) that
+  **mints nothing**, because a fork grant is a repair anchored to a record proven to claim
+  our
+  parent; a **sixth** outcome rather than folding unsettled into a disposing arm, since
+  outcome-not-vocabulary is what F-078 switches on; and the deletion of
+  `mqttDisposalForRepairSave` and of `mqttRepairSaveVerdict`, whose whole job is to guess
+  a
+  vocabulary from a verdict that discarded the evidence. *Refuted, so neither returns:*
+  documenting it as a residual (it would ship a newly visible false claim), and fixing only
+  the named mappers (the two hardcoded sites bypass them, so the invariant would be false
+  immediately). *Tests it owes:* real direct-10071 **and forced-10164** fixtures, since a
+  plain record deletion reaches the direct arm and credits nothing to the contended one; a
+  no-mint mutation for the new outcome; and the DISCONNECT-side coverage on a **live v5
+  shared-SUBSCRIBE** path — NOT the 3.1.1 forced leave, whose `mqttBuildDisconnect` returns
+  nil for 3.1.1 so that route cannot send `0x8E` or `0x89` at all. *Availability consequence
+  to weigh:* moving existing DISCONNECT paths from `0x8E` to `0x89` invites repeated
+  reconnects while permanently unclassifiable state remains — worse than silence, better than
+  a false takeover claim. *What the pre-CONNACK signal already does NOT do, so this is the
+  only remaining exposure:* the failure CONNACK never carries the takeover text on any arm.
   - [x] [F-065:
   Re-read copy absence after the reaper's own SourceAcked
   transition](findings/ha-arbitration.md#f-065). **Alpha blocker — done, with the stated
@@ -1930,6 +2013,42 @@ finding with acceptance criteria.
   TTL behavior differs, so the unsourced test is not a substitute.
 
 ### 0.5 Post-alpha candidates and scope cleanup
+
+- [ ] **Sweep the comment corpus for three false-claim families, indexed by CLAIM rather than
+  by phrasing.** Filed 2026-08-26 by the pre-CONNACK-signal item's tenth holistic review round,
+  which ruled: *"Stop iterating on this code item after recording them in a separate
+  corpus-sweep finding"* and *"No further implementation review round is justified by the
+  evidence; the code itself clears the commit gate."* **Not an alpha blocker** — every instance
+  is a comment or a doc sentence, and the same round confirmed the code sound.
+  *Why it is its own item.* Nine holistic rounds fixed instance after instance and the families
+  kept producing more, because they were being enumerated by **grep pattern** — and a claim
+  written five different ways is not greppable. The families are:
+  **(1) the lifetime-restoration fiction** — comments saying `abortAcceptedResume` puts the
+  session lifetime back. It does not: it abandons the restore gate and calls
+  `mqttAbortAcceptedConnect`. What protects the lifetime is ORDERING, because
+  `grantRequestedLifetime` runs after the earlier refusal sites. Some of these comments name
+  mutations that **cannot be written** (`restoreRefusedResumeLifetime` does not exist), which
+  is the `feedback_mutation_run_must_compile` failure in prose.
+  **(2) the F-084 ownership inference** — verdict comments asserting that a rejected CAS,
+  an
+  absent record or a gone record means another owner holds the session. It means the attempted
+  write did not land. This subset is F-084's distinction and is what can mislead later
+  Will/disposal work into treating a concession as a demonstrated takeover.
+  **(3) refusal-signal contradictions** — comments still saying a pre-CONNACK refusal
+  writes no
+  packet, or that no packet can identify an unrestored filter, when the code three lines later
+  builds that filter's key into the Reason String the v5 failure CONNACK carries.
+  *Seed locations, from the review that filed this — a SAMPLE and explicitly not a census:*
+  family 1 at `internal/mqtt/sess_resume_reconcile.go:407` and
+  `internal/mqtt/sess_resume_reconcile_e2e_test.go:2696-2706`; family 2 at
+  `sess_resume_reconcile.go:283` (`mqttRejectionForeign`, reached by
+  `classifyRejectedProbe` from an ABSENT record), `shared_group_arbitrate.go:107` and `:149`,
+  `sess_uncertain.go:419-421` and `:858-870`, `mqtt.go:12135` and `:13354`; family 3 at
+  `mqtt.go:12878` and `docs/ARCHITECTURE.md:3495-3497`.
+  *How to close it:* index by the CLAIM — read every comment that asserts one of the three,
+  rather than grepping for the wording that happened to be used. **F-084 cross-links
+  family 2
+  only**, and stays scoped to successor evidence.
 
 These do not block the alpha unless investigation shows that ordinary broker
 operation can trigger correctness loss or unbounded resource growth.

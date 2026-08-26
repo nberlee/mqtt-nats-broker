@@ -20,6 +20,7 @@ package mqtt
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -602,18 +603,24 @@ func TestForcedLeaveRefusalTerminatesTheRestoreVerdict(t *testing.T) {
 	}
 }
 
-// NOTE on the one site this change deliberately leaves silent, and why there is no test here.
+// NOTE on the site this file's own change deliberately left silent, and what closed it.
 //
-// The reconciliation verdicts stay silent: reconcileResumedConsumers DISPOSES the session
-// internally before it returns, so a CONNACK added at the caller has already lost the race with
-// its own socket close, and mqttReconcileRefuseForeign merges takeover with forked, which need
-// different projections. That remainder is recorded on the roadmap's pre-CONNACK-signal bullet.
+// It used to say the reconciliation verdicts stay silent, because reconcileResumedConsumers
+// DISPOSED the session internally before returning — so a CONNACK added at the caller had
+// already lost the race with its own socket close — and because its foreign verdict merged
+// takeover with forked, which need different projections.
 //
-// A fixture for it was written and then DELETED rather than shipped. Injecting a CAS rejection
-// keyed on the session hit the ACCEPT save, not the reconciliation's, so it exercised a
-// different refusal entirely — a test that cannot reach the route it names is worse than none,
-// because it reads as coverage. Reaching that route needs a reconciliation-scoped injection
-// seam that does not exist yet, and building one belongs with the S2 work itself.
+// Both are gone. The phase now RETURNS an outcome and a vocabulary, mqttProcessConnect's
+// refuseDisposing runs abort → signal → dispose, and the merged verdict is split into
+// DisposingNonForked and DisposingForked. The same treatment closed the lifetime grant, which
+// this note never mentioned because the roadmap bullet said the reconciliation verdicts were
+// the only site left and it was wrong.
+//
+// The claim that reaching the route needed "a reconciliation-scoped injection seam that does
+// not exist yet" was ALSO wrong: TestMQTTReconcileRefusalDisciplineWithWill already had one —
+// a save hook narrowed by testReconcileIsRepairSave — and that is where the production
+// coverage now lives, alongside
+// TestPreConnackRefusalSignalAtTheLifetimeGrantDisposingArms here.
 
 // testMQTTExpectRefusalThenDisconnect reads the failure CONNACK a pre-CONNACK refusal now sends
 // and then asserts the close, for fixtures that previously expected the close alone.
@@ -889,4 +896,357 @@ func TestForcedLeaveWithholdsTheReleaseWhenOwnershipIsUnresolved(t *testing.T) {
 	if !testForcedLeaveConsumerExists(t, s, durable) {
 		t.Fatalf("the group durable %q was deleted with ownership unresolved", durable)
 	}
+}
+
+// TestPreConnackRefusalSignalAtTheLifetimeGrantDisposingArms is T6, and it covers the
+// population the roadmap bullet wrongly reported as done.
+//
+// TestPreConnackRefusalSignalAtTheLifetimeGrant above injects a PRE-STORE failure, which
+// reaches the grant's local arm — no vocabulary, no disposal. Its DISPOSING arms had no
+// production coverage at all, and they were the ones with the defect: the grant used to
+// dispose the session itself and return a bare error, so its caller attempted 0x83 after
+// the close was already scheduled on another goroutine, and a record CLAIMING OUR PARENT
+// — where 0x89 "try again" is both legal and exactly right — had its vocabulary computed,
+// spent on a DISCONNECT that connAckWritten == false suppresses, and thrown away.
+//
+// Two rows, and the difference between them is the whole point of splitting the verdict:
+//
+//   - a SIBLING body (same PWID, a fresh WID of its own) is positive evidence that
+//     nothing established a takeover, so the client is invited to retry with 0x89;
+//   - anything else — here a body that keeps our own WID and only differs in content —
+//     establishes nothing, so the client is told only that ownership could not be
+//     confirmed, never that it was taken over.
+//
+// The grant save is targeted the way the local-arm test targets it: by REQUESTING A
+// DIFFERENT INTERVAL, so the save whose session already carries the requested value is
+// the grant's own and no other. The record is bumped from inside that seam, so the CAS
+// that follows is a real 10071 rather than a fabricated error.
+func TestPreConnackRefusalSignalAtTheLifetimeGrantDisposingArms(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// sibling decides whether the interleaved record claims our parent.
+		sibling       bool
+		wantReason    byte
+		wantReasonStr string
+	}{
+		{"a body claiming our parent", true, mqttReasonServerBusy, mqttReasonStrOwnershipUnsettled},
+		{"a body establishing nothing", false, mqttReasonImplementationSpecificError, mqttReasonStrOwnershipUnconfirmed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := testMQTTDefaultOptions()
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			cid := "grant-dispose-" + getHash(tc.name)
+			hash := getHash(cid)
+
+			// Establish the session with one interval, so the reconnect's accept save has a
+			// parent to claim and the grant below actually changes something.
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
+				props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
+			if sp, reason, _ := testMQTTReadConnAckV5(t, r); reason != mqttReasonSuccess || sp {
+				t.Fatalf("v5 CONNACK: sp=%v reason=%x", sp, reason)
+			}
+			testMQTTDisconnect(t, c, nil)
+			c.Close()
+
+			asm := testMQTTGetGlobalASM(t, s)
+
+			// Interleave a record write immediately before the grant save's CAS, from
+			// inside the save seam, so the rejection is a real 10071.
+			var mu sync.Mutex
+			var fired bool
+			restore := setMQTTTestSessSaveHook(func(sess *mqttSession) error {
+				if sess.id != cid {
+					return nil
+				}
+				sess.mu.Lock()
+				granting := sess.expiryInterval == 600
+				sess.mu.Unlock()
+				if !granting {
+					return nil
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if fired {
+					return nil
+				}
+				fired = true
+				smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, hash)
+				if err != nil {
+					t.Errorf("load record for the bump: %v", err)
+					return nil
+				}
+				ps := &mqttPersistedSession{}
+				if err := json.Unmarshal(smsg.Data, ps); err != nil {
+					t.Errorf("unmarshal record for the bump: %v", err)
+					return nil
+				}
+				// The discriminator, and it is exactly classifyRecordLineage's predicate:
+				// keeping the PWID and minting a distinct WID makes this a sibling, while
+				// keeping our WID makes it a body that establishes nothing.
+				if tc.sibling {
+					ps.WID = mqttNewRecordWID()
+				}
+				ps.Origin = "interleaved"
+				b, _ := json.Marshal(ps)
+				if _, err := asm.jsa.storeMsg(mqttSessStreamSubjectPrefix+asm.domainTk+hash, -1, b); err != nil {
+					t.Errorf("store the bump: %v", err)
+				}
+				return nil
+			})
+			defer restore()
+
+			// Count the CONNACKs the broker ATTEMPTS and check the session was still bound
+			// and resident AT THAT MOMENT. That is the ordering assertion, and it is
+			// deterministic rather than timing-dependent: disposeForeignStateLocked clears
+			// sess.c and removes residency SYNCHRONOUSLY before it schedules the close, so
+			// a signal emitted after the disposal sees neither. M1 (signal after dispose)
+			// and M6 (dispose twice, once inside the helper) both flip these two booleans.
+			var attempts atomic.Int32
+			var boundAtAttempt, residentAtAttempt atomic.Bool
+			sessObj := testMQTTResidentSession(t, s, cid)
+			restoreAck := setMQTTTestConnAckAttemptHook(func(rc byte) {
+				if rc == mqttConnAckRCConnectionAccepted {
+					return
+				}
+				attempts.Add(1)
+				sessObj.mu.Lock()
+				boundAtAttempt.Store(sessObj.c != nil)
+				sessObj.mu.Unlock()
+				asm.mu.RLock()
+				_, resident := asm.sessions[cid]
+				asm.mu.RUnlock()
+				residentAtAttempt.Store(resident)
+			})
+			defer restoreAck()
+
+			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+				props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
+			defer c2.Close()
+
+			sp, reason, props := testMQTTReadConnAckV5(t, r2)
+			mu.Lock()
+			didFire := fired
+			mu.Unlock()
+			if !didFire {
+				t.Fatal("the grant save's interleaved bump never fired; the test proved nothing")
+			}
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("the refused grant attempted %d failure CONNACK(s), want exactly 1", got)
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("v5 CONNACK reason = %#x, want %#x", reason, tc.wantReason)
+			}
+			if sp {
+				t.Fatal("a failure CONNACK must carry Session Present = 0 [MQTT-3.2.2-4]")
+			}
+			if props == nil || props.reasonString != tc.wantReasonStr {
+				t.Fatalf("Reason String %q, want exactly %q", func() string {
+					if props == nil {
+						return "<absent>"
+					}
+					return props.reasonString
+				}(), tc.wantReasonStr)
+			}
+			// THE ORDER: signalled while the session was still bound and resident, i.e.
+			// before the disposal ran.
+			if !boundAtAttempt.Load() {
+				t.Fatal("the failure CONNACK was attempted AFTER the disposal cleared sess.c: " +
+					"it is racing the socket close the disposal schedules")
+			}
+			if !residentAtAttempt.Load() {
+				t.Fatal("the failure CONNACK was attempted AFTER the disposal evicted the session")
+			}
+			// And the disposal did happen: the session is gone afterwards.
+			checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+				asm.mu.RLock()
+				_, resident := asm.sessions[cid]
+				asm.mu.RUnlock()
+				if resident {
+					return fmt.Errorf("a disposing verdict must evict the session")
+				}
+				return nil
+			})
+			testMQTTExpectDisconnect(t, c2)
+			// Zero on THESE branches, and for a reason narrower than an earlier draft of this
+			// comment claimed. A fork capsule's candidate delta is built from acknowledged
+			// grant TERMS, each sid's DRAIN presence, in-flight register nonces and a PUBREL
+			// consumer the parent lacked (mqttGrantEntriesDiffer, buildForkedGrantLocked).
+			// This session owns one plain QoS 1 filter, so the restore provisions no PUBREL
+			// consumer and no register, and a CONNECT acknowledges no SUBSCRIBE and no
+			// UNSUBSCRIBE — so nothing supplies a delta and the fork is classified without
+			// minting. A repair's new consumer identity is invisible to the predicate on
+			// purpose.
+			//
+			// It would be FALSE to generalise that to "no pre-CONNACK write can produce a
+			// delta": processSubs runs BEFORE the CONNACK (F-050 moved it there), so a resume
+			// restoring a QoS 2 or shared filter DOES provision grant-tracked state that a
+			// later pre-CONNACK save confirms. That route, and the caller-side double-mint
+			// mutation it makes detectable, is covered by
+			// TestPreConnackForkMintIsExactlyOncePerVerdict.
+			if n := asm.forkedGrantStores.Load(); n != 0 {
+				t.Fatalf("the grant path stored %d fork capsules; it minted none when this "+
+					"was measured, and a change to that reopens whether a caller-side "+
+					"double mint is detectable here", n)
+			}
+		})
+	}
+}
+
+// TestPreConnackForkMintIsExactlyOncePerVerdict is the production-caller half of the fork
+// mint's exactly-once property, and it exists because holistic review round 3 refuted the
+// premise I had used to argue it was unreachable.
+//
+// I claimed a pre-CONNACK write could never produce a non-empty candidate delta, because
+// registers and the PUBREL consumer are provisioned "after the CONNACK". **That is false, and
+// this project's own design is why:** F-050 moved subscription restoration BEFORE the CONNACK,
+// so `processSubs` provisions the PUBREL consumer a QoS 2 filter needs while the CONNACK is
+// still unwritten. A later pre-CONNACK save then confirms a body carrying `PubRel` against an
+// accept body that lacked it — and `buildForkedGrantLocked` reads exactly that as a delta.
+//
+// So the route is live, and this is it, end to end through a real CONNECT:
+//
+//  1. a v5 session takes a plain QoS 2 filter, so its resume must provision a PUBREL
+//     consumer, and disconnects without a clean start;
+//  2. the reconnect's accept save lands a body with no `PubRel`;
+//  3. restoration, still pre-CONNACK, creates the PUBREL consumer, and the next successful
+//     record save adopts a body that has it — the retained pair now differs;
+//  4. the lifetime grant's save is rejected by a SIBLING record, so the classifier reaches a
+//     forked verdict and mints a capsule whose delta is non-empty.
+//
+// The assertion is EXACTLY ONE store. The capsule itself cannot show that — every store
+// replaces the map entry with an equivalent one — so the per-manager counter is the only
+// observable, and it is what kills a second mint added anywhere on the caller's side of the
+// classification, which is where the approved plan's M9 placed it.
+func TestPreConnackForkMintIsExactlyOncePerVerdict(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const cid, topic = "fork-mint-once", "fork/mint/q2"
+	hash := getHash(cid)
+
+	// A QoS 2 filter is what makes the resume provision a PUBREL consumer, which is the
+	// grant-tracked state the delta comes from.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
+	if sp, reason, _ := testMQTTReadConnAckV5(t, r); reason != mqttReasonSuccess || sp {
+		t.Fatalf("v5 CONNACK: sp=%v reason=%x", sp, reason)
+	}
+	// The SHARED filter is not decoration: it is what makes a record save happen AFTER
+	// restoration and before the grant, namely proveSharedMembershipOwnership's own write.
+	// Without it nothing adopts the post-restore body and the retained pair never differs.
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{
+		{topic: topic, opts: 2},
+		{topic: "$share/gmint/fork/mint/shared", opts: 1},
+	})
+	testMQTTFlush(t, c, nil, r)
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	asm := testMQTTGetGlobalASM(t, s)
+
+	// Strip PubRel from the stored record, out of band. The first connection persisted it,
+	// so without this the reconnect's accept body ALREADY carries it and the restore
+	// provisions nothing new — which is exactly what an earlier version of this fixture
+	// measured as an empty delta. Removing it makes the resume recreate the PUBREL consumer
+	// pre-CONNACK, which is the grant-tracked state the delta is made of.
+	func() {
+		smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, hash)
+		if err != nil {
+			t.Fatalf("load the record to strip PubRel: %v", err)
+		}
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			t.Fatalf("unmarshal the record to strip PubRel: %v", err)
+		}
+		if ps.PubRel == nil {
+			t.Fatal("the QoS 2 subscription did not persist a PubRel consumer, so this " +
+				"fixture cannot create the delta it needs")
+		}
+		ps.PubRel = nil
+		b, _ := json.Marshal(ps)
+		if _, err := asm.jsa.storeMsg(mqttSessStreamSubjectPrefix+asm.domainTk+hash, -1, b); err != nil {
+			t.Fatalf("store the PubRel-stripped record: %v", err)
+		}
+	}()
+
+	// The sibling lands at the GRANT save, identified the way the other grant fixtures
+	// identify it: by the session already carrying the requested interval. Keeping the PWID
+	// and minting a distinct WID is classifyRecordLineage's predicate for a body claiming our
+	// parent, which is the verdict that mints.
+	var mu sync.Mutex
+	var fired bool
+	restore := setMQTTTestSessSaveHook(func(sess *mqttSession) error {
+		if sess.id != cid {
+			return nil
+		}
+		sess.mu.Lock()
+		granting := sess.expiryInterval == 600
+		sess.mu.Unlock()
+		if !granting {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if fired {
+			return nil
+		}
+		fired = true
+		smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, hash)
+		if err != nil {
+			t.Errorf("load record for the sibling bump: %v", err)
+			return nil
+		}
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			t.Errorf("unmarshal record for the sibling bump: %v", err)
+			return nil
+		}
+		ps.WID = mqttNewRecordWID()
+		ps.Origin = "sibling"
+		b, _ := json.Marshal(ps)
+		if _, err := asm.jsa.storeMsg(mqttSessStreamSubjectPrefix+asm.domainTk+hash, -1, b); err != nil {
+			t.Errorf("store the sibling bump: %v", err)
+		}
+		return nil
+	})
+	defer restore()
+
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+		props: mqttV5ConnPropsSessionExpiry(600)}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+
+	sp, reason, props := testMQTTReadConnAckV5(t, r2)
+	mu.Lock()
+	didFire := fired
+	mu.Unlock()
+	if !didFire {
+		t.Fatal("the grant save's sibling bump never fired; the test proved nothing")
+	}
+	if reason != mqttReasonServerBusy {
+		t.Fatalf("a body claiming our parent must be refused 0x89, got %#x", reason)
+	}
+	if sp {
+		t.Fatal("a failure CONNACK must carry Session Present = 0 [MQTT-3.2.2-4]")
+	}
+	if props == nil || props.reasonString != mqttReasonStrOwnershipUnsettled {
+		t.Fatalf("Reason String %v, want exactly %q", props, mqttReasonStrOwnershipUnsettled)
+	}
+
+	// The delta was real — otherwise the count below is zero either way and this fixture
+	// proves nothing about a second mint. Checked FIRST, so a change that empties the delta
+	// reports that rather than silently turning the next assertion vacuous.
+	n := asm.forkedGrantStores.Load()
+	if n == 0 {
+		t.Fatal("the forked verdict minted nothing, so its candidate delta was empty: this " +
+			"fixture can no longer discriminate a second mint, and the pre-CONNACK PUBREL " +
+			"provisioning it relies on must have changed")
+	}
+	if n != 1 {
+		t.Fatalf("the forked verdict stored %d capsules, want exactly 1: one verdict samples "+
+			"the record and the acknowledged pair once, under one fence", n)
+	}
+	testMQTTExpectDisconnect(t, c2)
 }

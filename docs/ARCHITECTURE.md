@@ -2855,8 +2855,8 @@ The pass:
    pairs from the restored subscriptions — the level-up companion of a
    multi-level filter included, since it is an independent consumer. A QoS 1/2
    sid with **no** `Cons` entry at all is classified *absent identity* and
-   minted here (left alone, restoration would create its consumer after the
-   CONNACK and never persist it: the restore path runs no final subscription
+   minted here (left alone, restoration would create its consumer later in the
+   resume and never persist it: the restore path runs no final subscription
    save). No filter here can be in the reserved `$MQTT.>` namespace: such a
    record is refused at restore, and a resident session could never have
    subscribed to one. A stale `Cons` entry with **no** matching subscription is not an active
@@ -2922,8 +2922,8 @@ The pass:
    at that instant — there is no lease. The two wrong-last-sequence kinds are
    deliberately not equivalent, and the raw store error is captured at the
    store boundary (`saveWithDetail`) because `save()`'s formatting destroys the
-   kind: **10071** (the single-writer check) means another broker wrote after
-   our accept save — the session was taken over mid-CONNECT — and is disposed
+   kind: **10071** (the single-writer check) means the subject MOVED after our
+   accept save — which is weaker than a takeover, and F-084 owns the gap — and is disposed
    through `disposeForeignSessionLocked` in a DISCONNECT-suppressing mode (no
    success CONNACK was written, so no packet may precede one). **10164**
    (clustered contention) is a rejection, never a verdict: a bounded re-read
@@ -2939,9 +2939,11 @@ The pass:
    them and the next resume verifies them present — nothing further is owed, so
    no continuation is registered. Resolution is
    necessarily deferred — the accept transaction is still open — and no traffic
-   is served meanwhile: no CONNACK was sent and every phase subscription is
-   closed.
-5. **Adopt in place.** After the CONNACK, subscription restoration reaches each
+   is served meanwhile: no SUCCESS CONNACK was sent — a failure CONNACK carrying
+   0x83 and the phase's own diagnostic is, which opens nothing — and every phase
+   subscription is closed.
+5. **Adopt in place.** Subscription restoration — which runs BEFORE the CONNACK
+   (F-050) and after this phase — reaches each
    collected filter through `processJSConsumer`'s restore exists-branch, which
    — on finding a phase-owned delivery subscription — refreshes the MQTT
    metadata and clears the closed flag and the marker **on the same
@@ -3106,7 +3108,8 @@ Five outcomes, and the two rejection kinds are deliberately not equivalent:
 
 - **landed** — this broker owned the record at the write's linearization point. The only
   outcome that permits the CONNACK.
-- **10071**, the single-writer check, means another broker wrote after the accept save. It
+- **10071**, the single-writer check, means the subject moved after the accept save — not
+  that another broker owns the session, which is the stronger claim F-084 owns. It
   disposes *without* consulting the contention resolver, so this is the only place a
   sibling lineage can be recognised on that arm: the record is read once and classified,
   which both narrows 0x8E to 0x89 where the record only supports it and mints the fork
@@ -3114,14 +3117,17 @@ Five outcomes, and the two rejection kinds are deliberately not equivalent:
 - **10164** is clustered contention rather than a lost race, and gets the bounded
   re-read/retry treatment, whose verdicts map onto the same five.
 - **ambiguous** — the mutation is KEPT, no further write is permitted, and the resolver
-  settles it. No CONNACK is written, so nothing is served meanwhile.
+  settles it. No SUCCESS CONNACK is written, so nothing is served meanwhile; the
+  refusal itself carries 0x83 and the step's own diagnostic.
 - **definite local failure** — nothing was stored; refuse.
 
 Every refusal reuses the pre-CONNACK abort discipline, which already discards the Will and
 leaves the lifetime ungranted. **No `0x8E` reaches the client**: the displacement's
 DISCONNECT is gated on the CONNACK having been written, which is false for every refusal
-inside the CONNECT, so the connection closes silently. That is the same signal the
-reconciliation refusals give, and generalising it is a roadmap item of its own.
+inside the CONNECT, so no DISCONNECT is sent at all. The refusal is not silent, though —
+it goes through `refuseDisposing` and carries a **failure CONNACK** whose reason code and
+Reason String say what the evidence supports and no more. See "The pre-CONNACK refusal
+signal", and F-084 for the claim the disposal vocabulary still over-states.
 
 **Why this path needs no transmission gate.** The restore gate is armed before the first
 subscription the CONNECT installs and opens only after a confirmed success CONNACK, and
@@ -3492,8 +3498,11 @@ the reason (0x83, with the filter named) because that refusal is the first packe
 and a filter that can never be restored — a subscribe permission revoked since it
 was saved is the reachable case — would otherwise be an endless silent close with
 no hint that a clean start is the recovery. A 3.1.1 connection has no reason code
-above 5 and gets the bare close. The other pre-CONNACK refusals still close
-silently; generalising the signal is its own roadmap item.
+above 5 and gets the bare close. Every other refusal **in the post-accept-save,
+pre-success-CONNACK window** now carries a reason too: that generalisation has
+landed, and inside that window only the failed success-CONNACK write is still
+silent. Exits earlier in the CONNECT remain silent and are a stated residual. See
+"The pre-CONNACK refusal signal".
 
 **The reorder needs one new fact, and it is a property of the CONNECTION.**
 [MQTT-3.2.0-1] makes the CONNACK the first packet a client sees, and restoration
@@ -3633,7 +3642,8 @@ grant only once a readback proves the write landed — because a close happening
 while the write is unresolved snapshots the lifetime into its deferred
 teardown, so speculative terms there would let a grant that never landed
 discard the session, and the landed continuation correspondingly retargets that
-snapshot; a 10071 hands the session to the broker that now owns it, with 10164
+snapshot; a 10071 hands the session over — to whoever holds the record, which the
+rejection alone does not establish (F-084) — with 10164
 resolved by the same bounded re-read the repair save uses. A resume
 refused before this point therefore leaves the session exactly as it found it,
 in memory and in the record, with no repair machinery at all. A session that
@@ -3726,34 +3736,76 @@ redelivery reaches the client marked DUP.
 
 ### The pre-CONNACK refusal signal
 
-A v5 client is told **why** its resume was refused, at every refusal on the pre-CONNACK
-side of
-the acknowledgement: register recovery, the shared-ownership foreign, forked, unresolved and
-local arms, the lifetime grant, and the restore path that already did this. Without it a
-permanently unrestorable session is an endless silent close, and a clean start — the
-recovery —
-is a choice the client can only make if it knows there is something to recover from.
+A v5 client is told **why** its resume was refused, at every refusal in the
+**post-accept-save, pre-success-CONNACK window** — which is the scope of this claim, and
+exits earlier in the CONNECT are a stated residual in `docs/CONFORMANCE.md`. In that window
+the sites are: register recovery, the shared-ownership disposing, unresolved
+and
+local arms, the **plain QoS 1/2 reconciliation verdicts**, the **lifetime grant**, and the
+restore path that started this. Without it a permanently unrestorable session is an endless
+silent close, and a clean start — the recovery — is a choice the client can only make if it
+knows there is something to recover from.
 
 Two limits are structural rather than chosen. It is **v5 only**: a 3.1.1 CONNACK has no reason
-code above 5, so that connection gets a bare close. And the disposal vocabulary must be
-**projected** onto a code a CONNACK may legally carry — `0x89` "Server busy" is
-permitted and
-keeps a fork's "reconnect and resolve this" meaning exactly, but `0x8E` "Session taken
-over" is
-DISCONNECT-only, so a takeover degrades to `0x83` plus the vocabulary's Reason String. The
-client learns why; it cannot be told "stop reconnecting", because no CONNACK code says that.
+code above 5, so that connection gets a bare close. And the code must be one a CONNACK may
+legally carry — `0x89` "Server busy" is permitted and keeps "reconnect and resolve this"
+exactly, but `0x8E` "Session taken over" is DISCONNECT-only, so nothing here can tell a client
+"stop reconnecting".
 
-Two exits stay silent, deliberately. The **failed success-CONNACK write** has no channel left
-to explain itself on — the channel is what failed. And the **reconciliation verdicts** remain
-silent as one atomic site: that helper disposes the session internally before it
-returns, so a
-CONNACK added at the caller has already lost the race with its own socket close, and its
-foreign verdict merges takeover with fork, which need different projections. Signalling
-half a
-site would leave an operator comparing a local verdict that explains itself against a foreign
-one that does not. That remainder is `docs/ROADMAP.md`'s pre-CONNACK-signal bullet,
-which stays
-open on it.
+**What the client is told is NOT the disposal vocabulary, and that separation is the
+mechanism.** The vocabulary's bundled contract — reason code, Reason String, log line, close
+state — governs the **DISCONNECT**. The CONNACK is a separate projection, and it has its own
+two-value vocabulary (`mqttPreConnackRefusal`):
+
+| Outcome | CONNACK | Reason String |
+|---|---|---|
+| a body claiming our parent | `0x89` | "session ownership could not be established; try again" |
+| any other disposing verdict | `0x83` | "session ownership could not be confirmed" |
+| local, unresolved | `0x83` | the step's own diagnostic |
+
+The reason the projection exists rather than forwarding `mqttDisposalTakenOver.reasonStr`
+is
+that most arms reaching a disposing verdict never established a takeover: the rejection is
+also reached when the record could not be read, was absent, did not decode, was released,
+or
+sat at or below our own base. Sending that text would make this mechanism's whole purpose
+false. `preConnackRefusalFor` is exhaustive with no `default`, because a default is exactly
+how a new outcome would inherit an ownership claim it has no evidence for; an unlisted
+outcome reaches a loud log and a bare close instead.
+
+**One exit stays silent, deliberately**: the **failed success-CONNACK write** has no channel
+left to explain itself on — the channel is what failed.
+
+The two sites that used to be silent were silent for a reason about their own code, and both
+are closed. `reconcileResumedConsumers` and `grantRequestedLifetime` each **disposed the
+session internally before returning**, so a CONNACK the caller enqueued had already lost the
+race with the `closeConnection` that disposal schedules; and each collapsed a takeover and
+a
+fork into one verdict, so the caller could not project the right code even with the ordering
+fixed. Both now **report** an outcome and a vocabulary, and one caller-side sequence —
+`refuseDisposing` — runs **abort, then signal, then dispose**, in that order, for all three
+disposing pre-CONNACK sites (the shared-membership ownership write included). The order is
+load-bearing at every step: the abort discards this connection's Will before the close it
+schedules can publish it, the signal precedes any scheduled close, and the disposal is last.
+
+**The intermediate asymmetry, stated rather than discovered.** The CONNACK deliberately
+**under-claims**: it says ownership could not be confirmed even where a child-shaped body
+was
+observed and the existing disposal classifies it as a takeover, because the broker cannot
+currently prove which of those it is. The DISCONNECT and log paths, unchanged here, may still
+**over-claim** in the other direction. That whole class — what positively proves a successor,
+which sites decide it, and whether each resulting class discards or consumes the Will — is
+**F-084**.
+
+The classification behind those two sites is one function, `classifyPreConnackSave`,
+shared by
+the reconciliation phase and the lifetime grant: both split 10071 from 10164 identically,
+and
+written twice a new CAS kind would have to be found twice.
+`proveSharedMembershipOwnership` deliberately keeps its own copy — unifying that third
+consumer is what let an unclassifiable rejection reach F-078's live-SUBSCRIBE Foreign arm
+and
+change **Will disposition**, which is a different question and F-084's.
 
 ## Outbound in-flight registers
 
@@ -4057,7 +4109,8 @@ The invariants, in the order they matter:
   have redelivered to other members. Neither view of the group can name what it has to
   reach. A session restored from its record has the membership but no configs — shared
   consumer configs are deliberately excluded from the persisted `Cons` and rebuilt only by
-  the post-CONNACK subscription restoration — while register recovery has already rebuilt
+  subscription restoration, which runs later in the CONNECT than register recovery (and,
+  since F-050, still before the CONNACK) — while register recovery has already rebuilt
   its pending entries under the deterministic group durable names, so a config walk finds
   nothing. A SUBSCRIBE whose rolled-back save definitely failed leaves the opposite: the
   re-added configs are live and their group key is not back in the membership, so a

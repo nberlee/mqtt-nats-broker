@@ -1112,8 +1112,16 @@ const testForkEnvDeltaFilter = "fork/env/delta"
 
 // testAssertMinted checks that a forked verdict recorded the CANDIDATE delta. Whether the
 // survivor lacks any of it is a merge-time question this mint-time assertion cannot ask.
+//
+// It also checks the capsule was stored EXACTLY ONCE, which the capsule itself cannot show:
+// every store replaces the map entry with a fresh pointer, so a second mint leaves state
+// indistinguishable from a single one. Callers arm the counter with
+// testCountForkedGrantStores; a caller that does not is unaffected.
 func testAssertMinted(t *testing.T, e *testRejectionEnv) *mqttForkedGrant {
 	t.Helper()
+	if n := e.asm.forkedGrantStores.Load(); n > 1 {
+		t.Fatalf("the capsule was stored %d times; one verdict mints once, under one fence", n)
+	}
 	g := e.capsule(t)
 	for _, ch := range g.changes {
 		if ch.filter == testForkEnvDeltaFilter {
@@ -1588,8 +1596,8 @@ func TestForkRepairCarriesNoWill(t *testing.T) {
 
 // TestForkRepairSharedMembershipIsNeverCarried is test 19 (M27).
 //
-// The success CONNACK is written before shared restoration runs, so a re-asserted SharedSubs
-// membership would be durable while a per-filter restore failure leaves no group join and no
+// A per-filter shared restore can fail while the membership stays durable, so a re-asserted
+// SharedSubs membership would be durable while that failure leaves no group join and no
 // consumer — the accepted-but-dead state F-050 already records. Repairing into that ordering
 // would extend an open finding rather than respect it.
 func TestForkRepairSharedMembershipIsNeverCarried(t *testing.T) {

@@ -2380,3 +2380,126 @@ ending where it began.
    independent single-stream recreation. That is a product and operational-contract decision.
 
 Splitting the finding or shipping a partial mechanism is not among them.
+
+## F-084: Prove a successor before claiming a takeover
+
+**Alpha blocker. Filed 2026-08-26**, split out of `docs/ROADMAP.md`'s pre-CONNACK-signal
+item by an escalation consult after three consecutive plan-review rounds cut this same seam
+wider each time. That escalation is the finding's own history and belongs here: the
+enumeration kept growing because the enumeration was the defect
+(`feedback_close_the_class_with_a_property`), and the cut was made at the CLAIM boundary so
+the signalling half could ship without shipping a newly visible false claim.
+
+### The finding
+
+The broker asserts `mqttDisposalTakenOver` — "session taken over by a new connection",
+DISCONNECT reason `0x8E`, which tells a client to **stop reconnecting** — on evidence that
+establishes no successor at all.
+
+`classifyRecordLineage`'s negative verdict, `mqttLineageNotForked`, expressly covers a
+legitimate successor, an unrelated lineage, a different incarnation, a record carrying no
+identity, and a verbatim REPLAY of our own acknowledged bytes. Its own comment says
+"nothing is established". Every one of those concedes to the takeover vocabulary, and the
+conclusion the broker then reports is the strongest one it has.
+
+The verdict is safe where it is CONSUMED negatively — a body claiming our parent does not
+establish a takeover, so `0x89` "try again" is licensed and truthful. It is unsafe wherever
+the *absence* of sibling evidence is read as a takeover.
+
+### The population — a sample, not a census
+
+Three rounds enumerated this and each found more, which is why it is filed as a sample:
+
+- `disposalForDirectRejection`'s **four** conceding branches: the record could not be read,
+  was absent, did not decode, or sat at or below our own base.
+- `resolveContendedRecordSave`'s **two** gone arms — the in-loop one and the
+  post-exhaustion one — plus `movedVerdict`'s below-base fail-safe ("foreign fail-safe
+  whatever its identity says") and its above-base non-sibling arm.
+- The three mappers that guess a vocabulary from a verdict which has already discarded the
+  evidence: `mqttDisposalForRepairSave`, `mqttDisposalForForeignResolution`,
+  `mqttDisposalForRejection`.
+- `disposalForRemotePersist`.
+- **Two hardcoded takeovers that bypass every mapper**, in `mqtt.go` and in
+  `sess_rejected_write.go`. These are why fixing only the named mappers was refuted: the
+  invariant would be false the moment it was stated.
+
+### Why it is not a wording fix
+
+The remedy needs a predicate for what POSITIVELY proves a successor, and the obvious
+candidate is not one. A usable record above our base, whose digest differs from our bytes,
+whose `WID` is non-empty and differs from `ackWID`, and whose `PWID` names `ackWID`,
+identifies a **child-shaped body** — not proven ownership. `createOrRestoreSession` adopts
+`WID` and `PWID` **without validating provenance**, valid-shaped bodies can arrive through
+unconditional publication (the same route that makes the fork classifier necessary at all),
+and replay policy is unsettled.
+
+So the predicate cannot be stated as a proof yet, and five decisions come first:
+
+1. trusted provenance versus merely valid-shaped lineage;
+2. replayed child records;
+3. **parentless clean-start successors**;
+4. **descent beyond one hop**;
+5. for each resulting class, whether it **discards or consumes the Will**.
+
+Decision 5 is behavioural rather than vocabulary, and it is the one that makes this a
+second item's work: F-078's live-SUBSCRIBE Foreign arm discards the Will *as a takeover*,
+while Forked and Local take ordinary non-foreign handling. An honest "unsettled" class
+reaching that arm therefore CHANGES Will disposition, and every bound displacement path
+needs the same review.
+
+### Design already sketched and reviewed, so it is not re-derived
+
+- A **fourth disposal vocabulary** carrying `0x89` and reusing
+  `mqttReasonStrOwnershipUnsettled`, with its own `logReason` — exactly the
+  `mqttDisposalTeardownIncomplete` precedent, which also reuses that code and text because
+  the NAME is what is read at the call site. It **mints nothing**: a fork grant is a repair
+  anchored to a record proven to claim our parent, and none was.
+- A **sixth outcome** rather than folding unsettled into an existing disposing arm. Folding
+  it in is what routes it to `mqttGroupOwnershipForeign` and changes the Will action;
+  F-078 switches on the outcome, not on the vocabulary.
+- The **deletion** of `mqttDisposalForRepairSave` and of `mqttRepairSaveVerdict`, whose
+  whole job is to reconstruct a vocabulary from a verdict that discarded the evidence. The
+  vocabulary should be returned by the classifier that has the evidence, which is the shape
+  `classifyPreConnackSave` already uses for the two kinds it does distinguish.
+
+### Refuted, so neither returns
+
+- **Documenting it as a residual.** It would ship a newly visible false claim on a signal
+  whose entire purpose is to tell the client the truth.
+- **Fixing only the named mappers.** The two hardcoded sites bypass them.
+
+### Tests it owes
+
+- Real **direct-10071 and forced-10164** fixtures, separately. A plain record deletion
+  reaches the direct arm and credits nothing to the contended one, so a single fixture
+  cannot pin both.
+- A **no-mint** assertion for the new outcome, through the per-manager store counter that
+  the pre-CONNACK-signal item added — the final capsule state cannot reveal a second mint.
+- DISCONNECT-side coverage on a **live v5 shared-SUBSCRIBE** path. **Not** the 3.1.1 forced
+  leave: `mqttBuildDisconnect` returns nil for 3.1.1, so that route cannot send `0x8E` or
+  `0x89` at all.
+
+### Availability consequence to weigh, not to discover later
+
+Moving existing DISCONNECT paths from `0x8E` to `0x89` invites repeated reconnects while
+permanently unreadable or unclassifiable state remains. That is an availability cost, not
+a
+state-safety failure, and it is preferable to telling a client its session was taken over
+when nothing established that — but it is a real cost and the fix should state it.
+
+### Cross-link
+
+The **comment-corpus sweep** filed in `docs/ROADMAP.md` §0.5 carries family 2 — verdict
+comments that read a rejected CAS, an absent record or a gone record as proof another owner
+holds the session. Those are this finding's distinction stated in prose, and they are swept
+there rather than here so that F-084 stays scoped to the successor-evidence question and does
+not become a documentation item.
+
+### What is already contained
+
+The pre-CONNACK **failure CONNACK never carries the takeover text on any arm**. Its
+projection is a separate two-value vocabulary that asserts only what the evidence supports,
+and it is exhaustive with no `default` so a new outcome cannot inherit a claim. So the
+exposure this finding names is confined to the DISCONNECT and log paths, which is where it
+was before, plus the CONNACK's deliberate UNDER-claim in the other direction — both stated
+in `docs/CONFORMANCE.md`.
