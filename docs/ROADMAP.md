@@ -1215,7 +1215,35 @@ further findings it surfaced are filed separately, for the reason its own bullet
   and the pattern was never generalised — not even across `$MQTT_sess` itself, since
   `$MQTT_inflight`'s `ClaimSeq` references it and is uncoupled. Every confirmed
   reference to `$MQTT_msgs`, `$MQTT_out`, `$MQTT_qos2assign` and `$MQTT_inflight` is
-  uncoupled. The remedy is a generalisation, not a fourth bespoke coupling. On the
+  uncoupled. The remedy is a generalisation, not a fourth bespoke coupling.
+  **ATTEMPTED BY CONSTRUCTION AND STOPPED UNRESOLVED, 2026-08-26**, after five
+  non-converging plan-review rounds and no implementation; the box stays open
+  deliberately. The dossier records four structural failures so the next attempt
+  inherits them rather than re-deriving them: issuer provenance needs a hand-authored
+  relation — the very seed the bar forbids, and `mqttSharedNames` derives a durable
+  with no sequence source at all, so the wrong stream's epoch would compile; a route
+  classifier over raw egress was neither uniquely rooted nor disjoint nor syntactically
+  decidable; final-sink discovery is circular, since naming the publish method is a seed
+  rather than discovery by kind; and verbatim token preservation — REQUIRED, because a
+  record holding a foreign reference must stay writable or rebuilding it drops the
+  reference as migration by omission — is ITSELF the encoding escape that defeats the
+  access boundary it exists to protect. A pre-registered stop rule fired on its own
+  predicate — round 5 was still non-converging and its structural findings sat inside
+  machinery the previous revision had introduced, so the fixes were generating the
+  findings — rather than on a trend: total findings fell steadily while the structural
+  count fell once and then rose in every round after, ending where it began.
+  **What is owed is a decision, not a cleverer design**: accept hand-maintained seeds
+  with drift guards plus a residual (which the standing definition of done says cannot
+  support ticking this box), redefine what closing F-066 permits including an explicit
+  serialization exception, leave it blocked pending a genuinely different construction,
+  or **change the supported recovery contract** so the hazard is eliminated rather than
+  generalised — one mandatory recreation unit, or no independent single-stream
+  recreation. Splitting the finding or shipping a partial mechanism is excluded. The
+  attempt also corrected the dossier table: the drain `RegSeq` destruction is historical
+  (F-034), the "wrong payload" row is closed by F-065's nonce leaving only the claim
+  subject, `$MQTT_origin` is gone, and **three rows were never cross-stream at all** —
+  `mqttQoS2RelClaim.Fence`, `mqttQoS2RelClaim.Gen` and `mqttAcceptFact.SessEpoch`, each
+  wrong in the census manifest too and corrected there. On the
   affine path the VERIFIED AFFECTED SUBSET — not a proven closed unit, and F-034's
   census does not settle that either, for the reason above — is **four** streams —
   `$MQTT_msgs`, `$MQTT_qos2assign`, `$MQTT_out`, `$MQTT_inflight` — and recreating a

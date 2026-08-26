@@ -2273,3 +2273,110 @@ keyword-filtered grep, a hand-listed set of carriers. Each looked exhaustive, no
 twice the claim was refuted by an entry in the very table it introduced. A completeness
 claim is worth making only when the enumerated thing is closed by construction — every field
 of every persisted type — and otherwise the honest artifact is a sample that says so.
+
+### Corrections to the table above
+
+Four rows are stale and one class of row was wrong. Recorded here rather than edited away,
+because the table's errors are themselves evidence about the enumeration.
+
+- **The drain `RegSeq` row's destructive consequence is HISTORICAL.** F-034 closed it: the
+  drain never reads `RegSeq` to authorize a release, and addresses the register by a subject
+  derived from the packet identifier under a record-identity condition
+  (`unsub_drain.go`, "regSeq is deliberately NOT read here … a hint … may never authorize
+  progress"). The field remains a cross-stream reference; the destruction does not.
+- **The `$MQTT_msgs` + `$MQTT_qos2assign` "wrong payload" row is CLOSED by F-065.** The affine
+  copy subject carries the claim's incarnation nonce, so a new incarnation's copy subject
+  cannot collide with a retained old copy. What remains from that row is the **claim subject**,
+  which is the create-only election key and therefore cannot carry the nonce.
+- **`$MQTT_origin` is gone** — deleted by the write-lineage audit and now refused at startup.
+- **THREE ROWS WERE NOT CROSS-STREAM AT ALL**, and it takes **two distinct unverified
+  properties** to account for them, not one. **Two** fail a holder-versus-issuer comparison
+  nothing performs: `mqttQoS2RelClaim.Fence` is an absolute sequence in `$MQTT_qos2in`'s own
+  space on a record stored in that stream, and `mqttAcceptFact.SessEpoch` is the epoch of
+  the very stream the record sits on — each named its issuer **correctly** and was wrong
+  only in calling the reference foreign. **The third fails a different property, and that
+  comparison would have ACCEPTED it**: `mqttQoS2RelClaim.Gen` declared issuer `$MQTT_sess`
+  on a holder of `$MQTT_qos2in`, so the two differ and a foreignness check passes it as
+  cross-stream. It is wrong because **no stream issues that value at all** — it is the
+  exchange generation, minted
+  in process at PUBLISH time and merely stamped onto the hold, not the session incarnation
+  generation `$MQTT_sess` issues. The distinction is load-bearing for whoever builds the guard:
+  one written for issuer provenance would not have caught `Fence` or `SessEpoch`, and one
+  written for holder-versus-issuer foreignness would not have caught `Gen`. All three were
+  also wrong in the census manifest and are corrected there — see the
+  [persisted-identity census](persisted-identity-census.md).
+
+### Attempted and STOPPED, 2026-08-26: the by-construction route
+
+F-066 was planned as a generalisation — one epoch mechanism, with coverage closed **by
+construction** rather than by a fifth enumeration — and **stopped as UNRESOLVED after five
+non-converging plan-review rounds, with no implementation**. The box stays open. This section
+records why, so the next attempt does not re-derive it.
+
+**The bar.** Omission must have an executable falsifier without a hand-maintained seed,
+and no residual may claim unproven coverage. That bar is not incidental: a residual saying
+the interpretation surface is unclosed is the exact condition that blocks discharging this
+finding,
+so it cannot both stand and support ticking the box.
+
+**Four structural failures, each established against the code:**
+
+1. **Issuer provenance needs a hand-authored relation.** The affine claim's source sequence
+   enters as a bare `uint64` from `ackReplyInfo`. Typing that integer's consumer does not
+   prove the constructor chose the right issuing stream, and recovering the origin needs another
+   hand-authored relation — the seed the bar prohibits. `mqttSharedNames` is the sharper case:
+   it derives a group durable from group and subject with **no sequence source at all**, so
+   supplying the wrong stream's epoch would compile.
+2. **A route classifier over raw egress was neither uniquely rooted, disjoint, nor
+   syntactically decidable.** A route can have two roots; a multi-parameter function can
+   satisfy two class predicates; and "an ack subject, with no broker-stream subject
+   reachable" is a dataflow property rather than a syntactic one.
+3. **Final-sink discovery is circular.** Naming the connection's publish method is a seed,
+   not discovery by kind, and a receiver alias or a differently named publishing method
+   defeats a syntactic scan. Banning "an undiscovered sink" presupposes a way to find one.
+4. **Verbatim serialization contradicts the access boundary it was introduced to protect.**
+   Preserving a foreign reference's exact token is REQUIRED — a record holding one must stay
+   writable, since rebuilding it without the reference is migration by omission — but that
+   preservation is itself an encoding escape, handing a caller the value with no comparison.
+   Decoder discovery keyed on the target type also escapes through `any`, an interface,
+   or a generic parameter.
+
+**A pre-registered stop rule fired.** The rule was recorded before the round that fired it:
+if the round still returned not-converging with new structural findings inside the property
+machinery, the item stops rather than taking a sixth revision. What fired it was that
+predicate, not a trend: round 5 was still non-converging and its structural findings sat
+inside machinery the previous revision had introduced — the fixes were generating the
+findings. For the record the total findings fell steadily (40 → 25 → 20 → 15 → 12) while
+the **structural** count fell once and then rose in every round after (4 → 1 → 2 → 3 → 4),
+ending where it began.
+
+**Constraints the attempt established, which a future one inherits rather than rediscovers:**
+
+- Cross-stream identities divide into a **reissued value space** (sequences and names
+  deterministically derived from one — the dangerous class, because a stale reference matches
+  new unrelated state), a **stable logical name rebindable to a new physical instance**, and
+  one **not reissued by a recreation**. The middle class is a property of each USE, not of
+  the name,
+  and its instance-identity check already exists in the orphan sweep as JetStream's own
+  `ConsumerInfo.Created` fingerprint.
+- `mqttPersistedSession.Drains` is the **only** field rebuilt from operational state that
+  carries such a reference: `Cons` excludes shared consumers, and its persisted durables are
+  randomly minted. A gated-out drain must therefore be preserved opaquely across a save,
+  or it is dropped — migration by omission.
+- The shared group durable is **not a persisted reference**; it is recomputed at restore
+  from the membership key, so its hazard belongs to derivation, not to a stored field.
+- Discarded `json.Marshal` errors are harmless with today's plain record types and become
+  **precondition** on any future change that introduces a fallible marshaler.
+
+**What must be decided before a further attempt**, and it is not a design question:
+
+1. Accept hand-maintained issuer-origin and sink seeds with strong drift guards and an explicit
+   residual — under the current definition of done, F-066 then stays open;
+2. Redefine what closing F-066 permits, including both seeded coverage and an explicit
+   serialization exception to the access boundary, and require a fresh approved plan;
+3. Leave it blocked under the current bar pending a genuinely different construction;
+4. **Change the supported recovery contract** so the hazard is eliminated rather than
+   generalised — make the affected streams one mandatory recreation unit, or withdraw
+   independent single-stream recreation. That is a product and operational-contract decision.
+
+Splitting the finding or shipping a partial mechanism is not among them.

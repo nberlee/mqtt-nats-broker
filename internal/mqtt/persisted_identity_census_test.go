@@ -312,16 +312,38 @@ func censusManifest() map[string]map[string]censusDisposition {
 	}
 
 	m["mqttAcceptFact"] = map[string]censusDisposition{
-		"ClientID":  {kind: notAnIdentity, encoding: encJSON, reason: "the client ID this acceptance belongs to; the subject addresses it"},
-		"SessEpoch": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the $MQTT_sess incarnation epoch, which is what makes an acceptance comparable at all"},
+		"ClientID": {kind: notAnIdentity, encoding: encJSON, reason: "the client ID this acceptance belongs to; the subject addresses it"},
+		// LOCAL, not cross-stream: an acceptance fact is stored ON $MQTT_sess, and this
+		// is that same stream's incarnation identity, compared against the epoch this
+		// account adopted from it. No other stream issues it and no other stream's
+		// recreation invalidates it. It is an identity rather than a forensic stamp
+		// because it decides whether the fact is comparable and usable at all.
+		"SessEpoch": {kind: identityLocal, encoding: encJSON, reason: "the $MQTT_sess incarnation epoch, on a record that lives on $MQTT_sess: it is what makes an acceptance comparable at all, and it is issued by the stream holding it"},
 		"AcceptID":  {kind: identityLocal, encoding: encJSON, reason: "this acceptance's own identity, minted per accepted CONNECT"},
 		"At":        {kind: notAnIdentity, encoding: encJSON, reason: "a wall-clock stamp"},
 	}
 
 	m["mqttQoS2RelClaim"] = map[string]censusDisposition{
-		"State":  {kind: notAnIdentity, encoding: encJSON, reason: "the claim's phase"},
-		"Gen":    {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the incarnation generation whose hold this release claims"},
-		"Fence":  {kind: identityCrossStream, issuer: mqttQoS2IncomingMsgsStreamName, encoding: encJSON, reason: "F-062's proven purge cutoff, a sequence in the hold stream's own space"},
+		"State": {kind: notAnIdentity, encoding: encJSON, reason: "the claim's phase"},
+		// Both LOCAL, not cross-stream — but for TWO DIFFERENT reasons, and collapsing them
+		// is what an earlier draft of these rows did. Neither is forensic: each is read and
+		// each decides.
+		//
+		// Gen is the EXCHANGE generation, and NO STREAM ISSUES IT: mqttStoreQoS2MsgOnce
+		// mints it in process with nuid.Next(), and mqttNewDeliverableMessage only STAMPS
+		// the supplied value into the held record's Nmqtt-Q2Gen header (qos2_move.go:
+		// "the exchange's identity for its whole lifetime"). So the old row's error was a
+		// FALSE ISSUER — it named $MQTT_sess, whose session incarnation generation this is
+		// not — rather than a holder/issuer mix-up.
+		"Gen": {kind: identityLocal, encoding: encJSON, reason: "the EXCHANGE generation: minted in process with nuid.Next() at PUBLISH time and stamped onto the hold, shared by the hold and its .rel sibling; no stream issues it, and it decides whether a releasing claim is this exchange's or a foreign one"},
+		// Fence is the other reason: $MQTT_qos2in DOES issue it — it is an absolute sequence
+		// in that stream's own space — but the record carrying it also lives there, so the
+		// reference is not foreign. Its old row named the issuer CORRECTLY and was wrong
+		// only about cross-stream-ness, which is exactly what this row's own prose already
+		// said ("the hold stream's own space") while its kind claimed otherwise.
+		// qos2_release_claim.go states the identity half directly: "It is IDENTITY, not
+		// forensics, because it is read and it decides."
+		"Fence":  {kind: identityLocal, encoding: encJSON, reason: "F-062's proven purge cutoff: the highest $MQTT_qos2in sequence a discarded marker's writer was entitled to destroy, in the hold stream's own space, on a record stored in that same stream"},
 		"Origin": {kind: notAnIdentity, encoding: encJSON, reason: "the authoring broker, for diagnostics"},
 		"At":     {kind: notAnIdentity, encoding: encJSON, reason: "a wall-clock stamp"},
 	}

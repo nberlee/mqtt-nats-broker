@@ -238,6 +238,32 @@ absent, and the test enforces that distinction.
 
 ## Residuals
 
+- **Three rows claimed `identityCrossStream` and none of them was**, and it takes **two
+  different unverified properties** to account for them. All three are corrected to
+  `identityLocal`, and every census test passed throughout — before and after.
+- **Property one: the HOLDER stream is never compared against the declared issuer.** Two rows
+  fail only this. `mqttAcceptFact.SessEpoch` (holder `$MQTT_sess`, issuer `$MQTT_sess`) and
+  `mqttQoS2RelClaim.Fence` (holder `$MQTT_qos2in`, issuer `$MQTT_qos2in`) each named their
+  issuer **correctly** and were wrong only in calling the reference foreign. `Fence`
+  contradicted itself outright: its kind said cross-stream while its own reason said *"a
+  sequence in the hold stream's own space"*.
+- **Property two: a declared ISSUER is never verified.** Exactly one row fails this, and it
+  is the one a holder-versus-issuer comparison would have **accepted**: `mqttQoS2RelClaim.Gen`
+  declared issuer `$MQTT_sess` on a holder of `$MQTT_qos2in`, so those differ and the
+  comparison passes it as cross-stream. It is wrong anyway, because **no stream issues that
+  value at all** — it is the exchange generation, minted in process with `nuid.Next()` at
+  PUBLISH time and merely stamped onto the held record.
+- **Keeping the two apart is the point.** A guard built for issuer provenance would not have
+  caught `SessEpoch` or `Fence`; a guard built for holder-versus-issuer foreignness would
+  not have caught `Gen`. Both properties are unverified today. This is the encoding-axis failure
+  recorded above (*"an encoding axis nobody verifies is a comment"*) reappearing on two more
+  axes — found by F-066's 2026-08-26 attempt rather than by the guard.
+- **The F-066 oracle cannot catch that class.** It iterates the fourteen sample rows and compares
+  issuers only where a manifest row is **already** declared `identityCrossStream` and the
+  sample names the same field. So a false cross-stream declaration on a field **outside**
+  the sample is invisible to it, which is exactly what happened to all three rows above.
+  The oracle detects a manifest that omits or under-classifies a sampled row; it does not
+  detect one that over-classifies an unsampled one.
 - **The interpretation-surface guard is not a closure proof**, for the three reasons in
   "The surface, measured". It is the load-bearing limitation, and it is why F-066's
   deferral is not discharged.
