@@ -28,7 +28,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"

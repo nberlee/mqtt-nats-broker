@@ -355,15 +355,23 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 	hash := mqttQ2AffClaimHash("$MQTT_SHARED_S", 9)
 	copySubj := mqttQ2AffCopySubject(idHash, affGen, hash, testQ2AffFixtureNonce)
 
+	// Named locals rather than two inline composite literals in one multi-value
+	// return, and that is a formatting fix rather than a style preference: gofmt
+	// and golangci-lint's formatter indent the inline form OPPOSITELY (a change in
+	// gofmt between the Go release the toolchain runs and the one golangci-lint was
+	// built with), so whichever way it was written, one of the two rewrote it and
+	// re-broke the other. Assignments format identically under both.
 	base := func() (*mqttInflightRecord, *mqttInflightName) {
-		return &mqttInflightRecord{
-				PI: 7, Dur: affDur, Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce(),
-				Q2AffClaim: mqttQ2AffClaimSubject("$MQTT_SHARED_S", 9), Q2AffCopy: copySubj,
-				Retired: true,
-			}, &mqttInflightName{
-				idHash: idHash, gen: gen, pi: 7,
-				subject: mqttInflightSubject(idHash, gen, 7),
-			}
+		rec := &mqttInflightRecord{
+			PI: 7, Dur: affDur, Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce(),
+			Q2AffClaim: mqttQ2AffClaimSubject("$MQTT_SHARED_S", 9), Q2AffCopy: copySubj,
+			Retired: true,
+		}
+		name := &mqttInflightName{
+			idHash: idHash, gen: gen, pi: 7,
+			subject: mqttInflightSubject(idHash, gen, 7),
+		}
+		return rec, name
 	}
 	if rec, name := base(); mqttQ2AffSettleableRegister(rec, name) != nil {
 		t.Fatalf("the baseline record must be ACTIONABLE, or every subcase below refuses for the wrong reason: %v",

@@ -62,17 +62,12 @@ import (
 // continuation produces.
 var mqttTestRestoreOpenHookV atomic.Pointer[func()]
 
-// setMQTTTestRestoreOpenHook installs (or, with nil, clears) the gate-open hook and returns a
-// function that restores the previous value.
-func setMQTTTestRestoreOpenHook(h func()) func() {
-	prev := mqttTestRestoreOpenHookV.Load()
-	if h == nil {
-		mqttTestRestoreOpenHookV.Store(nil)
-	} else {
-		mqttTestRestoreOpenHookV.Store(&h)
-	}
-	return func() { mqttTestRestoreOpenHookV.Store(prev) }
-}
+// Its setter lives beside its ONE caller, in the mqttport_fulltests test file that
+// installs it, rather than here. The variable stays because openRestoreGate reads it;
+// the setter is test-only, and a test-only helper in a production file that no
+// default build can reach is exactly what `unused` is for. Moving it is the fix
+// rather than excluding the file, which would also stop `unused` finding a real
+// orphan here later.
 
 // mqttRestoreGate is one CONNECT's "nothing may be transmitted yet" verdict.
 //

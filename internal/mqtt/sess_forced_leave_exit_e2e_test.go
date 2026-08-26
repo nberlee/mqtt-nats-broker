@@ -28,6 +28,23 @@ import (
 	"time"
 )
 
+// setMQTTTestRestoreOpenHook installs (or, with nil, clears) the gate-open hook and
+// returns a function that restores the previous value.
+//
+// It lives HERE, beside its only caller, rather than next to
+// mqttTestRestoreOpenHookV in sess_restore_gate.go. The variable belongs there because
+// openRestoreGate reads it; the setter is test-only and reachable from no default
+// build, so leaving it in a production file made `unused` right to flag it.
+func setMQTTTestRestoreOpenHook(h func()) func() {
+	prev := mqttTestRestoreOpenHookV.Load()
+	if h == nil {
+		mqttTestRestoreOpenHookV.Store(nil)
+	} else {
+		mqttTestRestoreOpenHookV.Store(&h)
+	}
+	return func() { mqttTestRestoreOpenHookV.Store(prev) }
+}
+
 // testForcedLeaveSession drives a v5 session that owns a shared QoS 1 subscription, then
 // disconnects it cleanly so the next CONNECT is a resume rather than a takeover race.
 //

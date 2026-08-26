@@ -16,10 +16,11 @@ import (
 	"net"
 	"strings"
 
-	"github.com/nats-io/nuid"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nuid"
 )
 
 // F-029 (Slice B): the re-drive's BINDING transitions, which need a live CONNECT.
