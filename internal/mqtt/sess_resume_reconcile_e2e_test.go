@@ -3112,10 +3112,13 @@ func TestMQTTReconcileAmbiguousGrantAppliesOnlyOnProof(t *testing.T) {
 	defer restoreResult()
 	defer mqttTestSessStoreSuppressV.Store(false)
 
-	c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(0)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
-	testMQTTExpectDisconnect(t, c2)
+	// The refused grant now tells the client WHY before closing: generalising the
+	// pre-CONNACK refusal signal was a roadmap item and it has landed. This asserts more
+	// than the bare close it replaces, not less.
+	testMQTTExpectRefusalThenDisconnect(t, c2, r2)
 	testReconcileClientGone(t, s, cid)
 	restoreSave()
 	restoreResult()
@@ -3236,10 +3239,13 @@ func TestMQTTReconcileLandedAmbiguousGrantAppliesToTeardown(t *testing.T) {
 	defer restoreResult()
 
 	// Requested: "end my session when this connection closes".
-	c2, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(0)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
-	testMQTTExpectDisconnect(t, c2)
+	// The refused grant now tells the client WHY before closing: generalising the
+	// pre-CONNACK refusal signal was a roadmap item and it has landed. This asserts more
+	// than the bare close it replaces, not less.
+	testMQTTExpectRefusalThenDisconnect(t, c2, r2)
 	testReconcileClientGone(t, s, cid)
 	restoreResult()
 	mu.Lock()

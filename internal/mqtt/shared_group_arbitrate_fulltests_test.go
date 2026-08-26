@@ -59,30 +59,48 @@ func testCountSessionStores(t *testing.T) *testRecordStoreCounter {
 
 // testCountArbitrations counts "after-ownership-cas" firings, which is exactly one per
 // ownership verdict.
-// testSharedSilentRefusal resumes a session and reports whether ANY CONNACK arrived.
+// testSharedRefusalReason performs the resume and reports the CONNACK reason code it was
+// refused with, plus whether the CONNECT was ACCEPTED.
 //
-// A pre-CONNACK foreign verdict closes the connection SILENTLY — mqttNotifyDisplaced is
-// gated on c.connAckWritten, which is false for every refusal inside the CONNECT — so there
-// is no packet to read and no reason code to compare. "The socket closed without a CONNACK"
-// is the observable, and a helper that fataled on EOF would report the correct behaviour as
-// a test failure.
-func testSharedSilentRefusal(t *testing.T, b *testQ2AffBroker, id string, expiry uint32) (net.Conn, bool) {
+// It used to be testSharedSilentRefusal and to assert no CONNACK at all. Its own comment said
+// why that was the expectation — "the same signal the reconciliation refusals give, and
+// generalising it is its own roadmap item" — and that item has now landed, so a pre-CONNACK
+// refusal carries a reason. The invariant being protected is unchanged and is the one that
+// matters: this broker must not be ACCEPTED, because an accepted resume would serve and
+// acknowledge group deliveries under a membership the record no longer carries. A FAILURE
+// CONNACK does neither: mqttRecordConnAckWrittenLocked records the [MQTT-3.2.0-1] flag only for
+// an accepted code, and [MQTT-3.2.2-4] forces Session Present to 0.
+func testSharedRefusalReason(t *testing.T, b *testQ2AffBroker, id string, expiry uint32) (net.Conn, byte, bool) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
 		clientID:   id,
 		cleanStart: false,
 		props:      mqttV5ConnPropsSessionExpiry(expiry),
 	}, b.o.MQTT.Host, b.o.MQTT.Port)
-	// A CONNACK is 4 bytes; anything at all means the CONNECT was answered.
 	pt, _, ready := testMQTTReadPacketReady(r, 2*time.Second)
 	if !ready {
-		return c, false
+		// No answer at all. Still a refusal, and still not an acceptance.
+		return c, 0, false
 	}
-	if pt&mqttPacketMask == mqttPacketConnectAck {
-		return c, true
+	if pt&mqttPacketMask != mqttPacketConnectAck {
+		t.Fatalf("a refused CONNECT answered with packet type 0x%x, which is not a CONNACK", pt)
 	}
-	t.Fatalf("a refused CONNECT answered with packet type 0x%x, which is not a CONNACK", pt)
-	return c, false
+	sp, err := r.readByte("connack flags")
+	if err != nil {
+		t.Fatalf("reading the connack flags: %v", err)
+	}
+	reason, err := r.readByte("connack reason")
+	if err != nil {
+		t.Fatalf("reading the connack reason: %v", err)
+	}
+	if reason == mqttConnAckRCConnectionAccepted {
+		return c, reason, true
+	}
+	if sp&0x1 != 0 {
+		t.Fatalf("a failure CONNACK (reason %#x) carried Session Present = 1, which "+
+			"[MQTT-3.2.2-4] forbids", reason)
+	}
+	return c, reason, false
 }
 
 func testCountArbitrations(t *testing.T) *atomic.Int32 {
@@ -271,7 +289,7 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 	mqttTestSessStoreResultHookV.Store(&sh)
 	defer mqttTestSessStoreResultHookV.Store(nil)
 
-	c, acked := testSharedSilentRefusal(t, b, "ownforeignA", 300)
+	c, reason, accepted := testSharedRefusalReason(t, b, "ownforeignA", 300)
 	defer c.Close()
 	if !rejected.Load() {
 		t.Fatal("no record write was attempted after the group-durable create, so the " +
@@ -280,13 +298,23 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 	if got := arbitrated.Load(); got != 1 {
 		t.Fatalf("the restore arbitrated %d times, want 1", got)
 	}
-	// NO CONNACK AT ALL, success or failure. The disposal's DISCONNECT is suppressed
-	// pre-CONNACK, so the whole client-visible outcome is a closed socket — the same signal
-	// the reconciliation refusals give, and generalising it is its own roadmap item.
-	if acked {
-		t.Fatal("a resume whose ownership write was rejected 10071 was ANSWERED: this " +
+	// NOT ACCEPTED — that is the invariant, and it is unchanged. An accepted resume would serve
+	// group deliveries under a membership the record no longer carries and acknowledge them,
+	// destroying them for the member that legitimately holds the group.
+	if accepted {
+		t.Fatal("a resume whose ownership write was rejected 10071 was ACCEPTED: this " +
 			"broker would serve group deliveries under a membership the record no longer " +
 			"carries, acknowledging messages that belong to the legitimate members")
+	}
+	// It IS now told why, which this test's earlier revision asserted the opposite of. That
+	// expectation was correct at the time and said so — "generalising it is its own roadmap
+	// item" — and the item has landed. A takeover projects to 0x83 rather than 0x8E because
+	// 0x8E is not a permitted CONNACK reason code ([3.2.2.2]); the projection is what carries
+	// the reason without violating the packet's own reason-code set.
+	if reason != mqttReasonImplementationSpecificError {
+		t.Fatalf("the 10071 refusal answered with reason %#x, want %#x: a pre-CONNACK refusal "+
+			"tells a v5 client why instead of closing in silence", reason,
+			mqttReasonImplementationSpecificError)
 	}
 	// The durable must survive the foreign verdict.
 	if ci, lerr := b.jsa.lookupConsumer(mqttStreamName, durable); lerr != nil || ci == nil {

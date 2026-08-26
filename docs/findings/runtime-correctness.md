@@ -64,14 +64,45 @@ it existed on 2026-08-10.
 
 **Title:** Release stranded shared pending state when membership is removed
 
-- Status: Open
+- Status: **Closed**, by two separate items — see the attribution below.
 - Classification: Confirmed correctness or liveness defect
 - Release treatment: Alpha blocker
 - Original roadmap order: 45
 - Narrowed since: the preserved record below names three stranding paths;
-  `purgeReservedSubs` was deleted by [F-057](resolved.md#f-057), so two remain (the
-  3.1.1 forced leave and UNSUBSCRIBE's no-`cons` branch). The finding stands
-  unchanged on those.
+  `purgeReservedSubs` was deleted by [F-057](resolved.md#f-057), leaving two.
+
+### Closed at both remaining sites, by different items
+
+Neither item changed both sites, so the closure is **joint** and says so rather than implying
+one fix covered everything:
+
+- **UNSUBSCRIBE's no-`cons` branch — closed by [F-083](shared-qos2.md#f-083)**, whose commit
+  half releases the leaving key's own state (pending deliveries, identifiers, ack-budget charge
+  and deliver-subject subscription) independently of the last-holder answer.
+- **The 3.1.1 forced leave — closed by the forced-leave item** in `docs/ROADMAP.md`
+  §0.2. It
+  derives its pending purge from the pending maps (`cpending`, `deferred`, `srcAckOwed`,
+  filtered by the shared durable prefix) rather than from either structural view, and it does
+  so at the **staging** half as well as the commit — because the write that removes the
+  membership must also carry "these allocations were never transmitted", and a crash in between
+  would otherwise leave a live register with no cancellation recorded and no membership
+  able to
+  trigger another leave.
+
+**Two facts found while closing it**, recorded because they are not in the original record.
+A pending-only target is purged but must **never** be deleted: pending state is not evidence
+that this session was the group durable's last holder. And an **unparseable** membership key
+strands its durable silently — `mqttSharedDurablesForKey` returns nil, so the delete loop
+iterates nothing while the membership is removed anyway; the forced leave now refuses
+such a
+resume pre-CONNACK instead.
+
+**What this did NOT close:** the stranding was an identifier and Receive-Maximum hold,
+not a
+spurious NAK. A candidate claim that the stranded entry gets NAK'd into the group on
+resume was
+**refuted** — both resume NAK loops require a live ack subject, which a register-rebuilt entry
+does not have.
 
 ### Original finding record
 

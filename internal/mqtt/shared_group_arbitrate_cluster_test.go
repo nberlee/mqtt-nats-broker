@@ -153,15 +153,56 @@ func TestMQTTSharedGroupOwnershipArbitratedReplicated(t *testing.T) {
 		t.Fatalf("A's restore arbitrated %d times, want 1: without the ownership write "+
 			"there is nothing for B's takeover to be observed by", got)
 	}
-	// A must NOT be acknowledged. A pre-CONNACK refusal writes no packet at all — the
-	// displacement DISCONNECT is gated on the CONNACK having been written — so a closed
-	// socket is the whole observable.
-	if answered && pt&mqttPacketMask == mqttPacketConnectAck {
-		t.Fatal("broker A was ACKNOWLEDGED after another broker took the session over: it " +
-			"would serve group deliveries under a membership the record no longer carries, " +
-			"and ACKNOWLEDGE them, destroying them for the member that legitimately holds " +
-			"the group")
+	// A must NOT be ACCEPTED. That is the invariant: an accepted resume would serve group
+	// deliveries under a membership the record no longer carries and ACKNOWLEDGE them,
+	// destroying them for the member that legitimately holds the group.
+	//
+	// A refusal now carries a REASON, where this test's earlier revision expected no packet at
+	// all. That expectation was right at the time and said so; generalising the pre-CONNACK
+	// refusal signal was a roadmap item and it has landed. A failure CONNACK accepts nothing:
+	// mqttRecordConnAckWrittenLocked records the [MQTT-3.2.0-1] flag only for an accepted code,
+	// so the displacement DISCONNECT stays gated exactly as before.
+	// UNCONDITIONAL. An earlier revision of this assertion was guarded on `answered &&
+	// pt == CONNACK`, which meant an EOF, a timeout, a non-CONNACK packet or a missing refusal
+	// signal all skipped every check — so a mutation that removed the signal, or moved it after
+	// the asynchronous disposal, survived. The holistic review caught that, and it refuted the
+	// claim that re-aiming this test asserted strictly more than before. It does now.
+	if !answered {
+		t.Fatal("broker A received nothing at all after another broker took the session over: a " +
+			"pre-CONNACK refusal must tell a v5 client why, and an automatic client cannot " +
+			"distinguish silence from a network fault")
 	}
+	if pt&mqttPacketMask != mqttPacketConnectAck {
+		t.Fatalf("broker A was answered with packet type 0x%x, want a CONNACK", pt)
+	}
+	sp, err := rr.readByte("connack flags")
+	if err != nil {
+		t.Fatalf("reading A's connack flags: %v", err)
+	}
+	reason, err := rr.readByte("connack reason")
+	if err != nil {
+		t.Fatalf("reading A's connack reason: %v", err)
+	}
+	// NOT ACCEPTED is the invariant: an accepted resume would serve group deliveries under a
+	// membership the record no longer carries and ACKNOWLEDGE them, destroying them for the
+	// member that legitimately holds the group.
+	if reason == mqttConnAckRCConnectionAccepted {
+		t.Fatal("broker A was ACCEPTED after another broker took the session over: it would " +
+			"serve group deliveries under a membership the record no longer carries, and " +
+			"ACKNOWLEDGE them, destroying them for the member that legitimately holds the group")
+	}
+	// The exact legal projection. 0x8E "Session taken over" is DISCONNECT-only ([3.2.2.2]), so a
+	// takeover degrades to 0x83; sending 0x8E here would be a protocol violation.
+	if reason != mqttReasonImplementationSpecificError {
+		t.Fatalf("A's refusal carried reason %#x, want %#x: the disposal vocabulary is projected "+
+			"onto a code a CONNACK may legally hold", reason, mqttReasonImplementationSpecificError)
+	}
+	if sp&0x1 != 0 {
+		t.Fatalf("A's failure CONNACK (reason %#x) carried Session Present = 1, which "+
+			"[MQTT-3.2.2-4] forbids", reason)
+	}
+	// And the connection is then CLOSED: the refusal is a refusal, not a demotion.
+	testMQTTExpectDisconnect(t, cr)
 
 	// The group durable survives: B holds the membership, and deleting it on A's foreign
 	// verdict would break the legitimate member.

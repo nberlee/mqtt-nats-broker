@@ -508,6 +508,111 @@ func setMQTTTestSessExpirySweepPassHook(h func(as *mqttAccountSessionManager)) f
 // cleanup races a disconnect-path save still in flight.
 var mqttTestSessSaveHookV atomic.Pointer[func(sess *mqttSession) error]
 
+// Test hook: counts every CONNACK the broker ATTEMPTS to enqueue, whatever becomes of it.
+//
+// The count is the observable a wire read cannot provide. A test asking "did this refusal tell
+// the client anything?" must distinguish "never enqueued" from "enqueued into a socket that was
+// already closing", and only the first is a site that stays silent by design. Reading the wire
+// conflates the two, which lets a mutation that signals from the wrong place look correct.
+var mqttTestConnAckAttemptHookV atomic.Pointer[func(rc byte)]
+
+// setMQTTTestConnAckAttemptHook installs (or, with nil, clears) the CONNACK attempt counter and
+// returns a function that restores the previous value.
+func setMQTTTestConnAckAttemptHook(h func(rc byte)) func() {
+	prev := mqttTestConnAckAttemptHookV.Load()
+	if h == nil {
+		mqttTestConnAckAttemptHookV.Store(nil)
+	} else {
+		mqttTestConnAckAttemptHookV.Store(&h)
+	}
+	return func() { mqttTestConnAckAttemptHookV.Store(prev) }
+}
+
+// Test hook: fired when the 3.1.1 forced leave's COMMIT completes, whichever arm ran it.
+//
+// It exists because the commit's effects are all maskable by something else: the in-memory
+// membership is nil'd by the STAGING half whether or not the commit runs, and the group durable
+// it releases can also be deleted later by the orphaned-consumer sweep. A test that watched
+// either would pass against a broker that resolved its ambiguity and then skipped the commit
+// entirely, which is precisely the mistake registering the landed continuation too late makes.
+var mqttTestForcedLeaveCommitHookV atomic.Pointer[func()]
+
+// Test hook: fired at the entry to the forced leave's PHASE 3 — after every record write it
+// makes and after the ownership settlement, immediately before the last-holder scan and the
+// CONSUMER.DELETEs.
+//
+// It exists because the invariant here is an ORDER, and no state check can express it: a test
+// asking "was the durable deleted?" cannot distinguish "the code correctly declined" from "the
+// code tried and the scan happened to say held". This hook makes the attempt itself observable,
+// so a test can assert that an unsettled record state means phase 3 is never entered at all.
+var mqttTestForcedLeaveReleaseHookV atomic.Pointer[func()]
+
+// Test hook: fired immediately BEFORE the forced leave's ownership settlement.
+//
+// Its sibling fires immediately after, and the pair exists because the commit has TWO independent
+// gates in front of its irreversible phase — the ownership settlement and the void-verdict
+// durability check — and a fixture that enters the state after the first one cannot kill removing
+// the first one. One hook per gate, so each is pinned by its own test.
+var mqttTestForcedLeavePreSettleHookV atomic.Pointer[func(sess *mqttSession)]
+
+// setMQTTTestForcedLeavePreSettleHook installs (or, with nil, clears) the pre-settlement hook and
+// returns a function that restores the previous value.
+func setMQTTTestForcedLeavePreSettleHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestForcedLeavePreSettleHookV.Load()
+	if h == nil {
+		mqttTestForcedLeavePreSettleHookV.Store(nil)
+	} else {
+		mqttTestForcedLeavePreSettleHookV.Store(&h)
+	}
+	return func() { mqttTestForcedLeavePreSettleHookV.Store(prev) }
+}
+
+// Test hook: fired AFTER the forced leave's ownership settlement and BEFORE its durability
+// check, which is the one instant where a test can make a verdict owed that the settlement has
+// already passed.
+//
+// It exists because the phase-3 authorization boundary is otherwise unreachable: reproducing a
+// cleanup write that goes ambiguous *and* leaves a verdict uncredited needs a fixture nobody has
+// built, and without one, removing or moving the durability gate is killed by nothing. Staging an
+// uncredited nonce here is the smallest deterministic stand-in for that state.
+var mqttTestForcedLeavePostSettleHookV atomic.Pointer[func(sess *mqttSession)]
+
+// setMQTTTestForcedLeavePostSettleHook installs (or, with nil, clears) the post-settlement hook
+// and returns a function that restores the previous value.
+func setMQTTTestForcedLeavePostSettleHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestForcedLeavePostSettleHookV.Load()
+	if h == nil {
+		mqttTestForcedLeavePostSettleHookV.Store(nil)
+	} else {
+		mqttTestForcedLeavePostSettleHookV.Store(&h)
+	}
+	return func() { mqttTestForcedLeavePostSettleHookV.Store(prev) }
+}
+
+// setMQTTTestForcedLeaveReleaseHook installs (or, with nil, clears) the phase-3 entry hook and
+// returns a function that restores the previous value.
+func setMQTTTestForcedLeaveReleaseHook(h func()) func() {
+	prev := mqttTestForcedLeaveReleaseHookV.Load()
+	if h == nil {
+		mqttTestForcedLeaveReleaseHookV.Store(nil)
+	} else {
+		mqttTestForcedLeaveReleaseHookV.Store(&h)
+	}
+	return func() { mqttTestForcedLeaveReleaseHookV.Store(prev) }
+}
+
+// setMQTTTestForcedLeaveCommitHook installs (or, with nil, clears) the forced-leave commit
+// hook and returns a function that restores the previous value.
+func setMQTTTestForcedLeaveCommitHook(h func()) func() {
+	prev := mqttTestForcedLeaveCommitHookV.Load()
+	if h == nil {
+		mqttTestForcedLeaveCommitHookV.Store(nil)
+	} else {
+		mqttTestForcedLeaveCommitHookV.Store(&h)
+	}
+	return func() { mqttTestForcedLeaveCommitHookV.Store(prev) }
+}
+
 // setMQTTTestSessSaveHook installs (or, with nil, clears) the save hook and
 // returns a function that restores the previous value.
 func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
@@ -12415,6 +12520,42 @@ restoreSession:
 		es.abandonRestoreGate()
 		c.mqttAbortAcceptedConnect()
 	}
+	// refusePreConnack tells a v5 client WHY a pre-CONNACK refusal happened, instead of
+	// closing in silence. F-050 did this for one site — a permanently unrestorable filter,
+	// where an automatic client would otherwise see only an endless silent close with no hint
+	// that a clean start is the recovery — and the same argument covers every other refusal on
+	// this side of the acknowledgement.
+	//
+	// v5 ONLY, and that is a protocol limit rather than a choice: a 3.1.1 CONNACK has no reason
+	// code above 5, so that connection gets the bare close it gets today.
+	//
+	// A failure CONNACK does not open the connection: mqttRecordConnAckWrittenLocked stores the
+	// [MQTT-3.2.0-1] flag only for an accepted code with no write error, so no later takeover
+	// notification is unblocked by this and the outer caller sends no DISCONNECT (the abort
+	// clears connectReceived). Suppression when the frame exceeds the client's Maximum Packet
+	// Size is tolerated, exactly as it already was here: the refusal proceeds regardless.
+	//
+	// NOT called by the reconciliation verdicts, and not by the failed success-CONNACK write.
+	// See the roadmap's pre-CONNACK-signal bullet for the first; the second has no channel left
+	// to explain itself on, because the channel is what just failed.
+	refusePreConnack := func(reason byte, rerr error) {
+		if c.mqtt.proto == mqttProtoLevel5 {
+			sendConnAck(reason, false, rerr.Error())
+		}
+	}
+	// mqttConnAckReasonForDisposal projects a disposal vocabulary onto a code a CONNACK may
+	// legally carry. It exists because the vocabulary's own reason is a DISCONNECT reason:
+	// 0x8E "Session taken over" is not in [3.2.2.2]'s permitted set, so sending it here would
+	// be a protocol violation, while 0x89 "Server busy" IS permitted and keeps its exact
+	// meaning ("reconnect and resolve the ambiguity"). A takeover therefore degrades to 0x83
+	// plus the vocabulary's Reason String: the client learns WHY but not "stop reconnecting",
+	// which no CONNACK code can express.
+	connAckReasonForDisposal := func(voc mqttDisposalVocabulary) byte {
+		if voc.reason == mqttReasonServerBusy {
+			return mqttReasonServerBusy
+		}
+		return mqttReasonImplementationSpecificError
+	}
 	// ARM the verdict before the first subscription this CONNECT installs, and
 	// unconditionally — a clean start and a resume naming no filters included.
 	// An abandoned verdict is left installed on purpose, so the next arm is the
@@ -12425,6 +12566,7 @@ restoreSession:
 		if err := es.recoverInflightRegisters(c); err != nil {
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, err)
 			abortAcceptedResume(false)
+			refusePreConnack(mqttReasonImplementationSpecificError, err)
 			return formatError(err)
 		}
 	}
@@ -12486,10 +12628,10 @@ restoreSession:
 	// reason code above 5, so that connection gets the bare close it gets today.
 	// Generalising this to the register-recovery, reconciliation and lifetime-grant
 	// refusals is its own roadmap item.
+	// refuseRestore is refusePreConnack at the restore path's own reason code. Kept as a name
+	// because the restore sites read better for it, not as a second mechanism.
 	refuseRestore := func(rerr error) {
-		if c.mqtt.proto == mqttProtoLevel5 {
-			sendConnAck(mqttReasonImplementationSpecificError, false, rerr.Error())
-		}
+		refusePreConnack(mqttReasonImplementationSpecificError, rerr)
 	}
 	if l := len(es.subs) + len(es.sharedSubs); l > 0 {
 		filters := make([]*mqttFilter, 0, l)
@@ -12657,26 +12799,34 @@ restoreSession:
 				// c.mqtt (the Will and connectReceived), never sess.c, so the disposal's
 				// identity check still sees this connection as the session's owner.
 				//
-				// No 0x8E reaches the client: mqttNotifyDisplaced is gated on
-				// c.connAckWritten, which is false for every pre-CONNACK refusal, so the
-				// displacement closes SILENTLY. That is the same signal the reconciliation
-				// refusals give, and generalising it is its own roadmap item — this change
-				// does not add a new refusal packet.
+				// The displacement itself is still silent — mqttNotifyDisplaced is gated on
+				// c.connAckWritten, false for every pre-CONNACK refusal — so the REFUSAL
+				// carries the reason instead, projected onto a code a CONNACK may legally
+				// hold: 0x89 keeps a fork's "reconnect" meaning exactly, while a takeover
+				// degrades to 0x83, because 0x8E is DISCONNECT-only.
+				//
+				// Enqueued BEFORE the disposal, which schedules closeConnection on another
+				// goroutine: a CONNACK written after that has lost a race with its own
+				// socket close.
 				abortAcceptedResume(false)
+				refusePreConnack(connAckReasonForDisposal(v.voc), rerr)
 				es.disposeForeignSessionLocked(asm, c, v.voc)
 				return formatError(rerr)
 			case mqttGroupOwnershipUnresolved:
 				// The write may have landed. The restored state is KEPT — that is what the
 				// resolver re-attempts and proves durable — and no further write is
-				// permitted until it settles. No CONNACK, so nothing is served meanwhile.
+				// permitted until it settles. No SUCCESS CONNACK, so nothing is served
+				// meanwhile; the failure CONNACK below opens nothing.
 				rerr := fmt.Errorf("shared subscription ownership is unresolved for session %q: %v", cid, v.err)
 				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
 				abortAcceptedResume(false)
+				refusePreConnack(mqttReasonImplementationSpecificError, rerr)
 				return formatError(rerr)
 			default: // mqttGroupOwnershipLocal
 				rerr := fmt.Errorf("shared subscription ownership could not be established for session %q: %v", cid, v.err)
 				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
 				abortAcceptedResume(false)
+				refusePreConnack(mqttReasonImplementationSpecificError, rerr)
 				return formatError(rerr)
 			}
 		}
@@ -12706,6 +12856,50 @@ restoreSession:
 	}
 	mqttTestRestorePauseHook("before-connack")
 
+	// PREFLIGHT the shared memberships a 3.1.1 resume is about to force-leave, BEFORE the
+	// CONNACK and before any void is staged.
+	//
+	// mqttSharedDurablesForKey returns nil for a key it cannot parse, and the leave's delete
+	// loop would then iterate nothing while the membership was still removed from the record:
+	// the durable would lose its last reference with no diagnostic. Retaining just that one
+	// membership does not work either — it names no durable, so it cannot make the last-holder
+	// scan report anything held, and the same commit would still delete a target a resident
+	// cons entry supplied.
+	//
+	// So an unparseable key REFUSES THE RESUME, and it does so here rather than at the leave:
+	// this is the side of the CONNACK where refusing costs nothing the client can observe. The
+	// pre-CONNACK abort discards the Will and leaves the lifetime ungranted, no acknowledged
+	// session is left unusable, and being pre-CONNACK it is a site the refusal signal can
+	// explain to a v5 client.
+	//
+	// A broker-minted key always parses (mqttFilter.sessionKey writes the shape
+	// mqttParseSharedKey accepts), so this is corrupt, unsupported or out-of-band state — which
+	// the compatibility boundary says to REFUSE rather than migrate or repair.
+	if c.mqtt.proto != mqttProtoLevel5 {
+		es.mu.Lock()
+		var badKey string
+		var foundBadKey bool
+		for key := range es.sharedSubs {
+			if len(mqttSharedDurablesForKey(key)) == 0 {
+				badKey, foundBadKey = key, true
+				break
+			}
+		}
+		es.mu.Unlock()
+		// A SEPARATE found flag, never `badKey != _EMPTY_`: the empty string is itself an
+		// unparseable key and a shape JSON permits, so using it as the sentinel would let
+		// exactly the corrupt record this preflight exists to refuse through to a success
+		// CONNACK and on into destructive processing.
+		if foundBadKey {
+			rerr := fmt.Errorf("shared subscription %q cannot be parsed, so it cannot be released "+
+				"for a 3.1.1 resume of session %q", badKey, cid)
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+			abortAcceptedResume(false)
+			refuseRestore(rerr)
+			return formatError(rerr)
+		}
+	}
+
 	// GRANT the requested Session Expiry Interval and Clean flag. Everything that
 	// could refuse this CONNECT has now passed, so this is the first moment the
 	// session may take on what the client asked for — and it is persisted here
@@ -12722,6 +12916,7 @@ restoreSession:
 		if err := es.grantRequestedLifetime(asm, c, acceptTok, expiry, sessClean); err != nil {
 			c.Errorf("MQTT: refusing to resume session %q: could not grant the requested session lifetime: %v", cid, err)
 			abortAcceptedResume(false)
+			refusePreConnack(mqttReasonImplementationSpecificError, err)
 			return formatError(err)
 		}
 	}
@@ -12736,20 +12931,37 @@ restoreSession:
 	}
 	mqttTestRestorePauseHook("before-open")
 
-	// The CONNACK is written, so the restore verdict OPENS: every delivery the
-	// restore withheld goes out now, as the first transmission it is. Never before
-	// this point — that is the whole of [MQTT-3.2.0-1] here — and never skipped on
-	// a success, or the session's backlog would sit until AckWait. See
-	// sess_restore_gate.go.
-	es.openRestoreGate()
+	// The restore verdict does NOT open here, and the delay is deliberate.
+	//
+	// [MQTT-3.2.0-1] forbids opening it before the CONNACK, which is why it cannot move
+	// earlier. What moved is the other end: the 3.1.1 forced leave below can still REFUSE this
+	// connection — a record that has demonstrably moved, or one nothing can read — and an
+	// opened gate is IMMEDIATE permission for the delivery callbacks, which run on their own
+	// goroutines. A transmission cannot be retracted by a refusal that comes afterwards, so the
+	// gate opens only once the leave has settled.
+	//
+	// The cost is bounded and paid by QoS 0 alone: it has no redelivery to wait for, so
+	// mqttDeliverMsgCbQoS0 DROPS while the verdict is unopened, whereas QoS 1/2, PUBREL and
+	// affine deliveries wait. A dropped QoS 0 message is what QoS 0 means; serving one under a
+	// membership whose ownership is still unproven is not recoverable.
+	//
+	// Every exit below therefore owes the verdict a terminal: open on success, abandon on
+	// refusal. See sess_restore_gate.go.
 
 	// A resuming MQTT 3.1.1 client cannot express, observe, or UNSUBSCRIBE a
 	// "$share/..." filter (shared-subscription parsing is v5-only), so restoring
 	// shared membership would create deliveries it can never manage and a phantom
 	// holder no UNSUBSCRIBE could clear. Force-leave any persisted shared
 	// subscriptions instead: remove them (transactionally) and release the group
-	// consumers. On save failure keep membership and close the connection so a
-	// later reconnect retries. Spec5 [4.8.2].
+	// consumers. Spec5 [4.8.2].
+	//
+	// This is broker-side hygiene the client neither asked for nor can observe, so its FAILURE
+	// owes the client nothing — and the connection is refused only where refusing is the right
+	// answer, never merely because a write did not succeed. The definite bucket cannot contain
+	// a transient store failure at all: persistRecord arms uncertainty for every non-CAS store
+	// error, so an ordinary "JetStream was briefly unavailable" is AMBIGUOUS and is resolved in
+	// line below. What is left definite is 10071 (the subject moved), 10164 (contention), and
+	// refusals that never reached JetStream.
 	if c.mqtt.proto != mqttProtoLevel5 && len(es.sharedSubs) > 0 {
 		es.mu.Lock()
 		prior := es.sharedSubs
@@ -12773,6 +12985,22 @@ restoreSession:
 				voidLeave(dur)
 			}
 		}
+		// And every shared durable the PENDING MAPS name, which neither view above can reach.
+		// A record-restored session has membership without configs, so the cons walk names
+		// nothing; a durable whose membership some earlier operation already removed is in no
+		// key either. Its register is still live, and staging is the only place its verdict can
+		// be written: the write that removes the membership is the write that must say "these
+		// allocations were never transmitted" (voidRegistrationsLocked). Left to the commit, a
+		// crash in between would leave a live register with no CancelledRegs entry and NO
+		// membership able to trigger another leave — recovery would then reserve it forever.
+		//
+		// srcAckOwed retirements are NOT voided, and voidRegistrationsLocked skips them for its
+		// own stated reason: a retirement is the durable suppression of a completed exchange,
+		// not a claim on an identifier, and voiding it would have recovery drop the suppression
+		// and re-offer a completed payload as a QoS 2 duplicate.
+		for _, dur := range es.sharedPendingDurablesLocked() {
+			voidLeave(dur)
+		}
 		es.mu.Unlock()
 		// Everything the forced leave does once its record write is CONFIRMED. A
 		// closure, because that confirmation can also arrive later from the resolver:
@@ -12784,86 +13012,377 @@ restoreSession:
 		// The record token is a PARAMETER, never the captured acceptTok: as a landed
 		// continuation this runs under the RESOLVER'S transaction, and the CONNECT's
 		// own is long closed by then — every write under it would be refused at entry.
-		commitLeave := func(tok recordTx) {
-			// Also drop the resident session's in-memory shared consumer state
-			// (cons entries, tmaxack charge, pending deliveries): a later v5
-			// resubscribe of the same filter must not find a stale cons entry and
-			// skip recreating a durable this forced leave may delete below.
+		// Reports whether any write it performed was rejected by its per-subject CAS. The
+		// caller does not act on that bool alone — recordStateBlocksServing covers the whole
+		// class, ambiguity included — but returning it keeps the diagnostic honest.
+		// settleBeforeRelease answers "is this session's record state still ours?" using the
+		// mechanisms that can actually settle it, and it is called from inside the commit —
+		// after the cleanup writes, before the first CONSUMER.DELETE.
+		//
+		// Refusing on an unsettled state is NOT enough, and a revision that only refused
+		// recreated this item's own defect one level deeper: a cleanup write whose response was
+		// merely lost would close an already-acknowledged connection and publish its Will, which
+		// is exactly what the forced leave stopped doing. So an ambiguity is RESOLVED and a
+		// rejection is PROBED; only a state neither can settle refuses.
+		settleBeforeRelease := func(tok recordTx) mqttForcedLeaveOwnership {
 			es.mu.Lock()
-			var regs []mqttVoidedReg
-			var cancels []mqttRegCancellation
+			uncertain := es.seqUncertain
+			rejected := es.recordRejectionGatesServingLocked()
+			es.mu.Unlock()
+			if uncertain {
+				switch res, _ := es.resolveUncertainWriteInTx(tok); res {
+				case mqttUncertainOurs:
+					// Settled as ours. Re-sample below: the resolution's own continuations can
+					// have written again.
+				case mqttUncertainForeign, mqttUncertainForked:
+					return mqttForcedLeaveOwnershipForeign
+				default:
+					return mqttForcedLeaveOwnershipUnresolved
+				}
+				es.mu.Lock()
+				rejected = es.recordRejectionGatesServingLocked()
+				es.mu.Unlock()
+			}
+			if rejected {
+				// The probe settles a rejection by RE-ATTEMPTING the write, never by reading the
+				// record back: a readback cannot tell "somebody else moved it" from "our own
+				// write landed and we lost the response".
+				switch v := es.probeRecordRejectionInTx(tok); v {
+				case mqttRejectionOurs:
+					return mqttForcedLeaveOwnershipOurs
+				case mqttRejectionForeign, mqttRejectionForked:
+					return mqttForcedLeaveOwnershipForeign
+				default:
+					return mqttForcedLeaveOwnershipUnresolved
+				}
+			}
+			return mqttForcedLeaveOwnershipOurs
+		}
+		commitLeave := func(tok recordTx, settle func(recordTx) mqttForcedLeaveOwnership) mqttForcedLeaveOwnership {
+			// TWO AUTHORITIES, because "this config is doomed" and "this durable is owed a
+			// release" are different questions and only one of them can be answered by either
+			// structural view.
+			//
+			// STRUCTURAL (membership keys + cons entries) decides the doomed configs and the
+			// candidates for a consumer release. For this caller the two questions collapse:
+			// every membership is going, so nothing local survives to hold anything — which is
+			// what licenses one set here where UNSUBSCRIBE needs a surviving-key fence.
+			//
+			// PENDING (the pending maps) decides the purge, and only the purge. A target found
+			// only there is purged and NEVER offered for deletion: pending state is not
+			// evidence that this session was the last holder of a group durable.
+			es.mu.Lock()
+			structural := make(map[string]string)
 			for sid, cc := range es.cons {
 				if cc.DeliverGroup == _EMPTY_ {
 					continue
 				}
+				// The doomed config goes whatever happens to its durable.
 				delete(es.cons, sid)
-				pregs, pcancels := es.purgeConsumerPendingLocked(cc.Durable)
-				regs = append(regs, pregs...)
-				cancels = append(cancels, pcancels...)
-				if amt, ok := es.sharedCharged[cc.Durable]; ok {
-					es.tmaxack -= amt
-					if es.tmaxack < 0 {
-						es.tmaxack = 0
-					}
-					delete(es.sharedCharged, cc.Durable)
+				if _, dup := structural[cc.Durable]; !dup {
+					structural[cc.Durable] = cc.DeliverSubject
 				}
 			}
+			for key := range prior {
+				for _, t := range mqttSharedGroupNamesForKey(key) {
+					if _, dup := structural[t.durable]; !dup {
+						structural[t.durable] = t.deliver
+					}
+				}
+			}
+			var regs []mqttVoidedReg
+			var cancels []mqttRegCancellation
+			for _, dur := range es.sharedPendingDurablesLocked() {
+				if _, isStructural := structural[dur]; isStructural {
+					continue
+				}
+				pregs, pcancels := es.purgeConsumerPendingLocked(dur)
+				regs = append(regs, pregs...)
+				cancels = append(cancels, pcancels...)
+			}
+			// Every STRUCTURAL target: CLOSE its delivery, then purge, then refund — all in this
+			// one critical section, and the close strictly before the purge.
+			//
+			// A delivery callback takes sess.mu too, so any gap between closing and purging lets
+			// one observe an open subscription, reinstate a pending entry, and head toward storing
+			// a register this collection has already walked past — absent from regs, from cancels
+			// and from cancelledRegNonces, after which the consumer may be deleted. That is what
+			// makes the durability predicate's completeness an OPERATION-level property rather
+			// than a per-nonce one, and a holistic round caught it as a regression of the split.
+			durs := make([]string, 0, len(structural))
+			subs := make([]*subscription, 0, len(structural))
+			for dur := range structural {
+				durs = append(durs, dur)
+			}
 			es.mu.Unlock()
-			es.deleteInflightRegisters(c, tok, regs)
-			// The staged cancellations are already in this CONNECT's record; anything the
-			// purge just found arrived after that write, and the group durables below stay
-			// while such a cancellation is unaccounted for — an unexplained register costs
-			// an identifier for the life of the session, a surviving durable only costs
-			// resources.
-			es.secureRegCancellations(c, tok, leaveCancels)
-			if !es.secureRegCancellations(c, tok, cancels) {
+			// The subscription pointers are resolved under c.mu, so they cannot be taken while
+			// sess.mu is held.
+			for _, dur := range durs {
+				deliver := structural[dur]
+				var sub *subscription
+				if c != nil && deliver != _EMPTY_ {
+					c.mu.Lock()
+					sub = c.subs[deliver]
+					c.mu.Unlock()
+				}
+				subs = append(subs, sub)
+			}
+			es.mu.Lock()
+			for i, dur := range durs {
+				es.closeSharedGroupTargetDeliveryLocked(subs[i])
+				pregs, pcancels := es.purgeConsumerPendingLocked(dur)
+				regs = append(regs, pregs...)
+				cancels = append(cancels, pcancels...)
+				es.refundSharedGroupChargeLocked(dur)
+			}
+			es.mu.Unlock()
+			// The network unsubscribe stays outside the lock.
+			for i := range durs {
+				if c != nil && subs[i] != nil {
+					c.processUnsub(subs[i].sid)
+				}
+			}
+
+			// ONE aggregate write pair, never one per target. A per-target pair cannot be made
+			// safe and was tried twice: persistRecord refuses every write AT ENTRY while the
+			// session is unresolved, so if target A's fallback goes ambiguous then target B's is
+			// never sent — and resolving A credits only the revision A marshalled, leaving B's
+			// verdict owed while the resolution legitimately reports "ours". One write cannot
+			// have that shape. This is also the form collectSharedPendingPurge already uses, so
+			// it deletes a variant rather than adding a mechanism.
+			casRejected := es.deleteInflightRegistersClassified(c, tok, regs)
+			// The staged cancellations are already in this CONNECT's record; anything the purge
+			// just found arrived after that write, and the group durables below stay while such a
+			// cancellation is unaccounted for — an unexplained register costs an identifier for
+			// the life of the session, a surviving durable only costs resources.
+			// ONE secure call, so "one aggregate pair" is literally true: the staging's own
+			// cancellations and anything the purge just found go together. Two calls was the
+			// remnant of the per-target shape and a holistic round pointed out that it made the
+			// singular claim false.
+			secured, cancelCAS := es.secureRegCancellationsClassified(c, tok,
+				append(append([]mqttRegCancellation(nil), leaveCancels...), cancels...))
+			if cancelCAS {
+				casRejected = true
+			}
+			if !secured {
 				c.Errorf("MQTT: the cancelled in-flight registration(s) of client %q are not "+
 					"durably recorded yet on a 3.1.1 forced leave", es.id)
 			}
-			var durs []string
-			for key := range prior {
-				durs = append(durs, mqttSharedDurablesForKey(key)...)
+			// SETTLE BEFORE ANYTHING IRREVERSIBLE. Every write above is a session-record write
+			// that can leave this session unresolved or arm the rejection marker, and what
+			// follows is a CONSUMER.DELETE on an interest-retained stream — which destroys the
+			// backlog of every member that still holds the group.
+			//
+			// The ownership question must be answered BEFORE that delete, not after it: noticing
+			// afterwards and closing the connection is no remedy, because the delete has already
+			// happened. And the last-holder scan cannot cover for it, because
+			// sharedDurablesHeldByOthers SKIPS records whose ID equals this session's own — so
+			// under a remote same-client-ID rejoin the winner's fresh membership is precisely
+			// what the scan cannot see, while this object's sharedSubs is already nil. The scan
+			// would answer "unheld" and authorize the delete.
+			// ALWAYS, including on the resolver-continuation path. Passing nil there was wrong,
+			// and the holistic review caught it: the resolver proved the MEMBERSHIP write, but
+			// this commit then performs its own fresh cleanup writes, and
+			// resolutionAfterContinuations can only downgrade the resolver's verdict AFTER the
+			// commit returns — by which time the deletes have happened.
+			{
+				if h := mqttTestForcedLeavePreSettleHookV.Load(); h != nil {
+					(*h)(es)
+				}
+				if v := settle(tok); v != mqttForcedLeaveOwnershipOurs {
+					c.Errorf("MQTT: the shared-membership release of session %q stopped before "+
+						"releasing any group consumer: its own cleanup left the record state "+
+						"unsettled (%v), and a CONSUMER.DELETE here could destroy a durable "+
+						"another owner holds", es.id, v)
+					return v
+				}
 			}
+			// AND every staged void verdict must be DURABLY CREDITED, which is a different
+			// question from "the record is still ours" — and conflating the two is one defect
+			// stated three ways across three review rounds.
+			//
+			// They come apart exactly when a write is refused at entry: if an earlier fallback
+			// went ambiguous, persistRecord refuses the later ones, and resolving the earlier
+			// one credits only the revision IT marshalled. The resolution then legitimately
+			// reports "ours" while a cancellation is still owed — and deleting the consumer
+			// there strands a live register with no verdict, no membership and no consumer,
+			// reserving its identifier and its Receive Maximum slot for good.
+			//
+			// Naming the requirement is what makes this complete, where enumerating the writes
+			// was not: the predicate holds whatever the commit wrote, including writes a later
+			// change adds.
+			if h := mqttTestForcedLeavePostSettleHookV.Load(); h != nil {
+				(*h)(es)
+			}
+			if !es.voidVerdictsDurable() {
+				c.Errorf("MQTT: the shared-membership release of session %q stopped before "+
+					"releasing any group consumer: a staged in-flight void verdict is not yet "+
+					"durably credited, so a delete here would strand a live register no future "+
+					"leave can reach", es.id)
+				return mqttForcedLeaveOwnershipUnresolved
+			}
+			if h := mqttTestForcedLeaveReleaseHookV.Load(); h != nil {
+				(*h)()
+			}
+			// PHASE 3, and the only irreversible part: ONE scan for the whole operation over
+			// the STRUCTURAL candidates, then the deletes. Reached only on an `ours` verdict.
 			held := es.sharedDurablesHeldByOthers(durs)
 			for _, dur := range durs {
-				if held[dur] {
-					continue
-				}
-				if _, err := es.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-					c.Errorf("MQTT: unable to delete shared consumer %q on 3.1.1 forced leave: %v", dur, err)
-				}
+				es.deleteSharedGroupTargetIfUnheld(c, dur, held)
+			}
+			if casRejected {
+				c.Errorf("MQTT: a record write of the 3.1.1 forced leave of session %q was "+
+					"rejected by its CAS; the session's ownership is in question", es.id)
 			}
 			c.Warnf("MQTT: dropped %d shared subscription(s) not supported for a 3.1.1 session resume", len(prior))
-		}
-		outcome, err := es.saveClassified(acceptTok)
-		if err != nil {
-			// Put the memberships back only if the removal DEFINITELY did not land.
-			// An ambiguous write may already have stored the record without them, and
-			// the resolver settles it forward by re-attempting exactly those bytes;
-			// restoring here would leave memory holding entries the record has dropped,
-			// and the next save would resurrect a shared membership the client cannot
-			// see, observe or UNSUBSCRIBE. See sess_uncertain.go.
-			undoLeave := func() {
-				es.mu.Lock()
-				es.sharedSubs = prior
-				es.mu.Unlock()
-				es.unvoidRegNonces(leaveVoided)
+			if h := mqttTestForcedLeaveCommitHookV.Load(); h != nil {
+				(*h)()
 			}
-			switch outcome {
-			case saveDefinitelyFailed:
+			return mqttForcedLeaveOwnershipOurs
+		}
+		// Put the memberships back only if the removal DEFINITELY did not land. An ambiguous
+		// write may already have stored the record without them, and the resolver settles it
+		// forward by re-attempting exactly those bytes; restoring here would leave memory
+		// holding entries the record has dropped, and the next save would resurrect a shared
+		// membership the client cannot see, observe or UNSUBSCRIBE. See sess_uncertain.go.
+		//
+		// saveDefinitelyFailed REQUIRES this rollback, inside the still-open transaction, or
+		// another writer can persist the state being undone. Un-voiding is right on these arms
+		// for the same reason it always was: they all close, and the close's own
+		// purgeSharedPending frees the identifiers.
+		undoLeave := func() {
+			es.mu.Lock()
+			es.sharedSubs = prior
+			es.mu.Unlock()
+			es.unvoidRegNonces(leaveVoided)
+		}
+		// refuseLeave is the ONE exit for every arm below that cannot proceed. It owes the
+		// restore verdict its terminal — and specifically abandonRestoreGate, NOT
+		// abortAcceptedResume: the CONNACK is already written, so the Will may not be discarded
+		// ([MQTT-3.1.2-8]) and acceptance may not be cleared. Waking the withheld deliveries is
+		// what lets them record themselves as never transmitted; left parked they wait out
+		// their bound, find the session detached, and their redelivery reaches the client
+		// marked DUP.
+		refuseLeave := func(rerr error) error {
+			es.abandonRestoreGate()
+			c.Errorf("MQTT: refusing the resume of session %q after its shared-membership "+
+				"release: %v", cid, rerr)
+			return formatError(rerr)
+		}
+		// The detail, not just the error: save() re-formats the store error and destroys its
+		// NATS identity, and the two CAS rejections mean different things. 10071 is positive
+		// evidence that the subject MOVED; 10164 is contention and decides nothing on its own.
+		outcome, detail, err := es.saveClassifiedDetail(acceptTok)
+		switch {
+		case err == nil:
+			if v := commitLeave(acceptTok, settleBeforeRelease); v != mqttForcedLeaveOwnershipOurs {
+				return refuseLeave(fmt.Errorf("the shared-membership release of session %q could not "+
+					"confirm the record is still ours (%v)", cid, v))
+			}
+
+		case outcome == saveMaybeLanded:
+			// The write may be durable. Register the continuation FIRST — a settlement that
+			// lands runs it inside settleLandedAttempt, which drains the continuations before
+			// returning — then resolve in line under THIS transaction. resolveUncertainNow
+			// cannot be used here and never could: it takes the ownership gate this CONNECT
+			// already holds and needs a fence this frame already owns, so it returned
+			// "unresolved" without attempting anything.
+			es.retainOnLanded(func(rtok recordTx) {
+				// The verdict is reported rather than discarded. On this path there is no
+				// connection left to refuse, so the diagnostic IS the disposition — and a
+				// silently dropped verdict was how a withheld release became invisible.
+				if v := commitLeave(rtok, settleBeforeRelease); v != mqttForcedLeaveOwnershipOurs {
+					c.Errorf("MQTT: the resolver-driven shared-membership release of session %q "+
+						"withheld its group-consumer release (%v); the periodic pass retries it",
+						es.id, v)
+				}
+			})
+			res, rerr := es.resolveUncertainWriteInTx(acceptTok)
+			switch res {
+			case mqttUncertainOurs:
+				// Settled as ours and the continuation has already run. Never call commitLeave
+				// again here: the continuation is the single run path.
+			case mqttUncertainForeign, mqttUncertainForked:
+				// Another owner holds this session. The Locked form, because this frame holds
+				// the ownership gate and the wrapper fails fast on a gate it finds held, which
+				// would silently skip the disposition.
+				es.abandonRestoreGate()
+				es.disposeForeignSessionLocked(asm, c, mqttDisposalForForeignResolution(res))
+				return formatError(fmt.Errorf("session %q is owned elsewhere: %v", cid, err))
+			default:
+				// Unresolved: the record could not be read, so nothing further may be
+				// persisted. The continuation stays parked and the periodic pass converges it.
+				return refuseLeave(fmt.Errorf("the shared-membership release of session %q is "+
+					"unresolved: %v (%v)", cid, err, rerr))
+			}
+
+		case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
+			// 10164: CONTENTION, not a verdict. The bounded re-read/retry classifies it by the
+			// attempt's own identity rather than guessing from the rejection.
+			switch v := es.resolveContendedRecordSave(&detail); v {
+			case mqttRepairSaveLanded:
+				if v := commitLeave(acceptTok, settleBeforeRelease); v != mqttForcedLeaveOwnershipOurs {
+					return refuseLeave(fmt.Errorf("the shared-membership release of session %q could "+
+						"not confirm the record is still ours (%v)", cid, v))
+				}
+			case mqttRepairSaveForeign, mqttRepairSaveForked:
+				es.abandonRestoreGate()
+				es.disposeForeignSessionLocked(asm, c, mqttDisposalForRepairSave(v))
+				return formatError(fmt.Errorf("session %q is owned elsewhere: %v", cid, err))
+			case mqttRepairSaveLocalDefinite:
+				// Retries exhausted with the base sequence still ours: nothing was stored, so
+				// the rollback is owed exactly as on any definite failure.
 				undoLeave()
-			case saveMaybeLanded:
-				// The CONNECT is refused either way, so this connection does not stay to
-				// finish the leave — which is exactly why the LANDED continuation matters:
-				// nothing else would ever run it. Resolve now so the resident session is
-				// usable again rather than permanently unable to persist.
-				es.retainOnLanded(func(rtok recordTx) { commitLeave(rtok) })
-				es.resolveUncertainNow(c)
+				return refuseLeave(err)
+			default: // mqttRepairSaveUnresolved
+				// Unclassifiable: the retry established a pending write, so the readback
+				// machinery decides later. The continuation must be parked BEFORE returning or
+				// a settlement that proves the removal durable would run no commit at all,
+				// stranding the durables with no membership left to reach them by.
+				es.retainOnLanded(func(rtok recordTx) {
+				// The verdict is reported rather than discarded. On this path there is no
+				// connection left to refuse, so the diagnostic IS the disposition — and a
+				// silently dropped verdict was how a withheld release became invisible.
+				if v := commitLeave(rtok, settleBeforeRelease); v != mqttForcedLeaveOwnershipOurs {
+					c.Errorf("MQTT: the resolver-driven shared-membership release of session %q "+
+						"withheld its group-consumer release (%v); the periodic pass retries it",
+						es.id, v)
+				}
+			})
+				return refuseLeave(fmt.Errorf("contention on the shared-membership release of "+
+					"session %q is unresolved: %v", cid, err))
 			}
-			return formatError(err)
+
+		case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceErrF):
+			// 10071: the subject MOVED. Classify the lineage so the client is disposed of with
+			// the right vocabulary — takeover or fork — rather than closed unclassified.
+			undoLeave()
+			es.abandonRestoreGate()
+			es.disposeForeignSessionLocked(asm, c, es.disposalForDirectRejection(&detail))
+			return formatError(fmt.Errorf("session %q is owned elsewhere: %v", cid, err))
+
+		default:
+			// A pre-store refusal: an earlier write already unresolved, a rejected
+			// transaction, or the test hook. None reached JetStream and none is evidence about
+			// ownership — but none can proceed either, so fail closed.
+			undoLeave()
+			return refuseLeave(err)
 		}
-		commitLeave(acceptTok)
+		// The commit ran on some arm above. Its own register cleanup performs record writes, so
+		// ask the SESSION whether anything it did leaves this connection unable to serve:
+		// an unresolved write, or an armed rejection whose ownership question is outstanding.
+		// One property rather than a result threaded up through three helpers, because it also
+		// covers writes this code never named.
+		if es.recordStateBlocksServing() {
+			return refuseLeave(fmt.Errorf("a record write of the shared-membership release of "+
+				"session %q left its state unsettled", cid))
+		}
 	}
+
+	// The leave has settled, so the restore verdict may OPEN: every delivery it withheld goes
+	// out now, as the first transmission it is. Never skipped on a success, or the session's
+	// backlog would sit until AckWait. See sess_restore_gate.go.
+	es.openRestoreGate()
 
 	// Subscription restoration ran BEFORE the CONNACK above, which is F-050's fix:
 	// a filter whose delivery path could not be installed refuses the CONNECT
@@ -12961,6 +13480,9 @@ func mqttConnAckReasonFromRC(rc byte) byte {
 // mutex, a notifier entering the critical section after the write completed is
 // guaranteed to see the flag.
 func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr string) (bool, error) {
+	if h := mqttTestConnAckAttemptHookV.Load(); h != nil {
+		(*h)(rc)
+	}
 	// Spec [MQTT-3.2.2-4], spec5 [3.2.2.1.1]: when the (reason) code indicates
 	// failure, the session present flag must be 0.
 	sp := byte(0)
@@ -17540,9 +18062,37 @@ func (sess *mqttSession) releaseSharedGroupTarget(c *client, tok recordTx, durab
 func (sess *mqttSession) releaseSharedGroupTargetClassified(c *client, tok recordTx,
 	durable, deliverSubject string, held map[string]bool) bool {
 
+	casRejected := sess.discardSharedGroupTargetStateClassified(c, tok, durable, deliverSubject)
+	sess.deleteSharedGroupTargetIfUnheld(c, durable, held)
+	return casRejected
+}
+
+// discardSharedGroupTargetStateClassified is the FIRST half of a group-target release: everything
+// that touches this session's own state and the record, and nothing that is irreversible for
+// anybody else. It closes the delivery, purges the pending entries, refunds the ack-budget
+// charge, discharges the register-stream obligations and unsubscribes the deliver subject, and
+// it reports whether any of its record writes was rejected by its per-subject CAS.
+//
+// It is split from the delete for ONE caller's sake, and the reason is a correctness ordering
+// rather than tidiness: this half performs record writes, and those writes can leave the session
+// unresolved or arm the rejection marker. A caller that must not destroy another owner's durable
+// therefore needs to settle the ownership question BETWEEN the two halves — after every write it
+// is going to make, before the first thing it cannot undo. Callers with no such requirement
+// compose the two back to back through releaseSharedGroupTargetClassified and see no change.
+//
+// sess.mu must NOT be held: this takes it.
+func (sess *mqttSession) discardSharedGroupTargetStateClassified(c *client, tok recordTx,
+	durable, deliverSubject string) bool {
+
 	if durable == _EMPTY_ {
 		return false
 	}
+	// CLOSE BEFORE PURGE, in ONE critical section, and that ordering is the whole reason this
+	// looks fussier than it reads. A delivery callback takes sess.mu too: purge first and release
+	// the lock, and a callback entering the gap observes closed=false, repopulates
+	// pendingPublish/cpending, and proceeds toward storing its register — an entry absent from
+	// regs, from cancels and from cancelledRegNonces, after which the consumer may be deleted.
+	// Splitting these two apart is exactly the regression a holistic round caught.
 	var sub *subscription
 	if c != nil && deliverSubject != _EMPTY_ {
 		c.mu.Lock()
@@ -17550,20 +18100,13 @@ func (sess *mqttSession) releaseSharedGroupTargetClassified(c *client, tok recor
 		c.mu.Unlock()
 	}
 	sess.mu.Lock()
-	if sub != nil && sub.mqtt != nil {
-		sess.subsMu.Lock()
-		sub.mqtt.closed = true
-		sess.subsMu.Unlock()
-	}
+	sess.closeSharedGroupTargetDeliveryLocked(sub)
 	regs, cancels := sess.purgeConsumerPendingLocked(durable)
-	if amt, ok := sess.sharedCharged[durable]; ok {
-		sess.tmaxack -= amt
-		if sess.tmaxack < 0 {
-			sess.tmaxack = 0
-		}
-		delete(sess.sharedCharged, durable)
-	}
+	sess.refundSharedGroupChargeLocked(durable)
 	sess.mu.Unlock()
+	if c != nil && sub != nil {
+		c.processUnsub(sub.sid)
+	}
 	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs)
 	// As in execDeferredConsumerDelete: anything found here arrived after the staging,
 	// and keeping the durable would not make its identifier recoverable.
@@ -17574,13 +18117,69 @@ func (sess *mqttSession) releaseSharedGroupTargetClassified(c *client, tok recor
 			"are not durably recorded yet; their identifiers stay reserved until the cleanup "+
 			"is discharged", durable, sess.id)
 	}
-	if c != nil && sub != nil {
-		c.processUnsub(sub.sid)
-	}
+	return casRejected
+}
 
-	// Delete the group durable only if no other session still references it. A
-	// caller releasing several durables in one operation passes one precomputed
-	// scan result (held); nil means scan for this durable alone.
+// discardSharedGroupTargetLocalState is the part of a group-target release that touches only
+// process-local state: it closes the delivery so nothing more is transmitted on it, refunds the
+// ack-budget charge, and unsubscribes the deliver subject.
+//
+// It performs NO record write, which is why a caller that must order its writes against
+// something irreversible can call it freely at any point. Separated for that caller's sake: the
+// 3.1.1 forced leave collects every target's pending state in one pass and issues ONE aggregate
+// register/record write pair, because a per-target write pair cannot be made safe — an ambiguous
+// first write causes `persistRecord` to refuse every later one at entry, and resolving the first
+// credits only its own revision.
+//
+// sess.mu must NOT be held: this takes it.
+// closeSharedGroupTargetDeliveryLocked marks one group target's delivery closed, so nothing more
+// is transmitted on it and no callback repopulates its pending state.
+//
+// It MUST run in the same sess.mu critical section as the purge that follows, and before it: a
+// delivery callback takes sess.mu, so any gap between the two lets a callback observe an open
+// subscription, reinstate a pending entry and head toward storing a register that the purge has
+// already walked past.
+//
+// sess.mu must be held.
+func (sess *mqttSession) closeSharedGroupTargetDeliveryLocked(sub *subscription) {
+	if sub == nil || sub.mqtt == nil {
+		return
+	}
+	sess.subsMu.Lock()
+	sub.mqtt.closed = true
+	sess.subsMu.Unlock()
+}
+
+// refundSharedGroupChargeLocked returns one group durable's MaxAckPending charge to the session's
+// budget. Keyed by durable, which is what makes it right for a membership-only target: refunding
+// by cons entry missed every durable no config named.
+//
+// sess.mu must be held.
+func (sess *mqttSession) refundSharedGroupChargeLocked(durable string) {
+	amt, ok := sess.sharedCharged[durable]
+	if !ok {
+		return
+	}
+	sess.tmaxack -= amt
+	if sess.tmaxack < 0 {
+		sess.tmaxack = 0
+	}
+	delete(sess.sharedCharged, durable)
+}
+
+// deleteSharedGroupTargetIfUnheld is the SECOND half: the irreversible one.
+//
+// Delete the group durable only if no other session still references it. A caller releasing
+// several durables in one operation passes one precomputed scan result (held); nil means scan for
+// this durable alone. Because $MQTT_msgs is interest-retained, this deletion destroys the backlog
+// of every member that still holds the group, which is why it is the half a caller may need to
+// withhold.
+func (sess *mqttSession) deleteSharedGroupTargetIfUnheld(c *client, durable string,
+	held map[string]bool) {
+
+	if durable == _EMPTY_ {
+		return
+	}
 	if held == nil {
 		held = sess.sharedDurablesHeldByOthers([]string{durable})
 	}
@@ -17589,7 +18188,6 @@ func (sess *mqttSession) releaseSharedGroupTargetClassified(c *client, tok recor
 			c.Errorf("Unable to delete shared consumer %q: %v", durable, err)
 		}
 	}
-	return casRejected
 }
 
 // purgeSharedPending drops this session's pending QoS 1/2 delivery state for its
@@ -17604,9 +18202,14 @@ func (sess *mqttSession) releaseSharedGroupTargetClassified(c *client, tok recor
 // while recoverInflightRegisters has already rebuilt its pending entries under the
 // deterministic group durable names, so a cons walk purges nothing. A SUBSCRIBE whose
 // rolled-back save failed leaves a config outside the membership (rollbackSubscribePacket's
-// readd restores cons, not sharedSubs), so a sharedSubs walk misses it. A 3.1.1 forced
-// leave and UNSUBSCRIBE's no-cons branch each strand transmitted entries with NEITHER
-// view left, which is why even the union is not enough.
+// readd restores cons, not sharedSubs), so a sharedSubs walk misses it. Transmitted entries
+// with NEITHER view left are reachable, which is why even the union is not enough.
+//
+// Both operations that used to STRAND that shape now discharge it at the membership removal
+// rather than leaving it to this close: UNSUBSCRIBE's no-cons branch (F-083) and the 3.1.1
+// forced leave, which stages its void and purges its pending state over the same
+// pending-map derivation this function uses (sharedPendingDurablesLocked). This purge remains
+// the backstop for a session that simply disconnects.
 //
 // For broker-minted state the durable name IS the protocol fact "deliveries under this
 // consumer are group deliveries": mqttSharedNames is the single source of the prefix, and
@@ -17642,6 +18245,49 @@ func (sess *mqttSession) purgeSharedPendingStaged(c *client) bool {
 		owed = true
 	}
 	return owed
+}
+
+// sharedPendingDurablesLocked returns every shared group durable this session still holds
+// PENDING state for, derived from the pending maps rather than from either view of the group
+// membership. It is collectSharedPendingPurge's derivation with the purge left out, for a
+// caller that needs the target NAMES before it has decided to drop anything.
+//
+// The two structural views provably miss real shapes, which is why this exists: a session
+// restored from its record has membership without configs, so a cons walk names nothing, and a
+// rolled-back SUBSCRIBE leaves a config outside the membership, so a sharedSubs walk misses
+// that one. The 3.1.1 forced leave needs the union of all three, and it needs it BEFORE its
+// record write rather than after — the write that removes the membership is the write that
+// must carry "these allocations were never transmitted" (see voidRegistrationsLocked).
+//
+// The durable NAME is the protocol fact, exactly as it is for the purge: mqttSharedNames is
+// the single source of the prefix and no other class can collide with it.
+//
+// sess.mu must be held.
+func (sess *mqttSession) sharedPendingDurablesLocked() []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(durable string) {
+		if !strings.HasPrefix(durable, mqttSharedConsumerDurablePrefix) {
+			return
+		}
+		if _, dup := seen[durable]; dup {
+			return
+		}
+		seen[durable] = struct{}{}
+		out = append(out, durable)
+	}
+	// The same three sources collectSharedPendingPurge walks, for the same reason: every map
+	// purgeConsumerPendingLocked removes from is a source of targets.
+	for durable := range sess.cpending {
+		add(durable)
+	}
+	for k := range sess.deferred {
+		add(k.jsDur)
+	}
+	for key := range sess.srcAckOwed {
+		add(key.jsDur)
+	}
+	return out
 }
 
 // collectSharedPendingPurge drops the pending state in memory and reports what the

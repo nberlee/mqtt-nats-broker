@@ -3367,7 +3367,8 @@ exclusion, and
 the rule that a rollback which RESTORES a membership registers no landed release at all.
 
 **The fence is a PROPERTY over the membership that survives the operation, not a rule per
-caller.** F-082 fenced two sites and F-083 then found two more by enumerating the callers, so
+caller.** F-082 fenced two sites and F-083 then found two more by enumerating the
+callers, so
 the enumeration was the defect rather than the sites. The question is always the same — *does
 a membership that SURVIVES this operation still reach this durable?* — and only the membership
 it is asked of differs. `mqttSharedSurvivors` is that membership, and every operation supplies
@@ -3387,14 +3388,52 @@ it TRUE once the lock is released is the session's **ownership gate**, which eve
 route holds. That truth is LOCAL to this session — it says nothing about another broker, and
 the non-snapshot join/delete race and the same-client-ID skip are untouched by it.
 
-**Two sites are vacuous rather than exempt**, and the difference matters because only one of
+**Two sites are vacuous rather than exempt**, and the difference matters because only
+one of
 them owes anything. The 3.1.1 forced leave removes EVERY shared membership and teardown runs
 after `sharedSubs` is niled, so no key survives at either and the whole-durable release is
-always owed. The forced leave nonetheless carries a separate defect of its own — its commit
-purge walks `es.cons` while its staging void walks the membership keys — which is its own
-roadmap item. Teardown carries none.
+always owed. Teardown carries nothing further.
 
-**"This config is doomed" and "this durable is owed a release" are different questions**, and
+**The forced leave's own target derivation.** It used to purge over `es.cons` while
+voiding over
+the membership keys, so the two halves of one operation disagreed about what they were acting
+on. It now uses **two authorities, for two different obligations**:
+
+| Obligation | Authority | What only it can see |
+|---|---|---|
+| the doomed configs, and the CANDIDATES for a consumer release | the membership keys **plus** the `cons` entries | a membership with no config (every record-restored resume), and a config no surviving key names (the `readd` shapes) |
+| the pending-state purge | the **pending maps** — `cpending`, `deferred`, `srcAckOwed`, filtered by the shared durable prefix | pending state named by *neither* structural view |
+
+For this caller the two questions F-083 separates — is this config doomed, is this
+durable owed
+a release — **collapse**, because every membership is going, so nothing local survives
+to hold
+anything. That is what licenses one candidate set here where UNSUBSCRIBE needs a
+surviving-key fence. But a target found **only** through the pending maps is purged and
+**never deleted**: pending state is not evidence that this session was the group
+durable's last
+holder, and only the last-holder scan authorizes a `CONSUMER.DELETE`.
+
+The pending derivation runs at **both** halves, not just the commit. The write that
+removes the
+membership is the write that must also say "these allocations were never transmitted",
+so a
+pending-only durable's verdict has to be staged with the rest; left to the commit, a
+crash in
+between would leave a live register with no cancellation recorded and **no membership
+able to
+trigger another leave**, and recovery would reserve its identifier indefinitely. `srcAckOwed`
+retirements stay exempt from voiding, for the reason `voidRegistrationsLocked` already
+gives: a
+retirement suppresses a completed exchange rather than claiming an identifier, and
+voiding it
+would re-offer a completed payload as a QoS 2 duplicate.
+
+This closes F-045's forced-leave instance. It does not alter or re-own the UNSUBSCRIBE
+transaction; F-083 already closed the no-`cons` UNSUBSCRIBE instance.
+
+**"This config is doomed" and "this durable is owed a release" are different
+questions**, and
 the second does not imply the first. A multi-level key's level-up companion has its own
 `sess.cons` entry but shares its durable with the plain filter one level up: when the
 multi-level key leaves alone, that durable is NOT owed, yet the companion's config must still
@@ -3480,10 +3519,22 @@ touches `sub.mqtt`:
   on the record naming a filter survives, because a refusal leaves the record's
   filters exactly as it found them so the CONNECT after one always has some. They
   are kept so no future path has to re-derive either argument.
-- **opened** immediately after a confirmed success CONNACK. `opened` is stored
-  strictly before the channel closes, so a waiter released by that close reads the
-  final value rather than racing it.
-- **abandoned** on every refusal, before the client detaches. The verdict is
+- **opened** after a confirmed success CONNACK — but **not immediately**, and the gap is
+  deliberate. `[MQTT-3.2.0-1]` forbids opening it any earlier; what pushes it later is the
+  3.1.1 forced leave, which can still refuse the connection after the CONNACK is
+  written. An
+  opened verdict is *immediate* permission for the delivery callbacks, which run on
+  their own
+  goroutines, and a transmission cannot be retracted by a refusal that follows it — so the
+  verdict opens only once that leave has settled. `opened` is stored strictly before the
+  channel closes, so a waiter released by that close reads the final value rather than racing
+  it.
+- **abandoned** on every refusal, before the client detaches. Two shapes, and the difference
+  is the acknowledgement: a **pre-CONNACK** refusal abandons through the abort helper, which
+  also discards the Will and clears acceptance; a **post-CONNACK** refusal — only the forced
+  leave's settlement arms — calls `abandonRestoreGate` **alone**, because the CONNACK is
+  already written and neither the Will ([MQTT-3.1.2-8]) nor the acceptance may be taken back.
+  Both shapes owe the wake for the same reason. The verdict is
   **not cleared**: a delivery arriving after the abandon must still be blocked,
   and the abort helper deliberately leaves `c.mqtt.sess` in place, so `sess.c`
   still names this connection. Waking the waiters is what lets a withheld QoS 1/2
@@ -3520,6 +3571,16 @@ pre-CONNACK restore must exclude shared filters for a non-v5 connection
 explicitly; the old code achieved that by ordering alone. Provisioning an affine
 consumer, a PUBREL consumer and a group join for memberships the forced leave then
 removes is what that exclusion prevents.
+
+One thing does move *before* the CONNACK: the leave's memberships are **parsed** there.
+A key
+`mqttSharedDurablesForKey` cannot expand names no durable, so a leave that met one would remove
+the membership and release nothing — and retaining just that key would not help, because
+a key
+that names no durable cannot make the last-holder scan report anything held. Corrupt or
+unsupported persisted state is therefore **refused pre-CONNACK**, where the abort
+discards the
+Will and leaves the lifetime ungranted, rather than discovered after the acknowledgement.
 
 **What a restore-path failure no longer destroys.** A per-filter failure used to
 reach `cleanupFailedSub`, which for a plain filter whose level-up companion failed
@@ -3609,6 +3670,90 @@ reaped inherits a dead entry — as today — and the **next CONNECT** repairs i
 while `recoverDrains` keeps owning drain-side loss reporting. Both stated in
 `docs/CONFORMANCE.md`, together with the delivery-start policy: a replacement
 is `DeliverNew`, and no backlog is guaranteed recoverable across a reap.
+
+## The 3.1.1 forced leave is a convergence obligation, not a CONNECT exit
+
+Force-leaving a resuming 3.1.1 client's shared memberships is **broker-side hygiene the client
+neither asked for nor can observe**. Its failure therefore owes the client nothing, and the
+connection is refused only where refusing is the right answer — never merely because a write
+did not succeed. Previously both failure arms returned an error from `mqttProcessConnect`,
+which closes: the client held Session Present = 1 and a dead socket, and its Will was published
+because the broker could not persist its own bookkeeping.
+
+**The definite bucket cannot contain a transient store failure**, and that fact is what shapes
+the whole mechanism. `persistRecord` arms *uncertainty* for every non-CAS-rejection store
+error, so an ordinary "JetStream was briefly unavailable" classifies as **ambiguous**, not
+definite. What is left definite is exactly: 10071, 10164, and refusals that never reached
+JetStream at all.
+
+| Outcome | Disposition |
+|---|---|
+| landed | commit the leave |
+| **ambiguous** | register the landed continuation **first**, then resolve **in line under the CONNECT's own transaction**; continue only on *ours* |
+| **10164** (contention) | the bounded re-read/retry classifies it; continue only on *landed*. An unclassifiable outcome parks the continuation **before** returning |
+| **10071** (the subject moved) | classify the lineage, dispose with takeover-or-fork vocabulary, refuse |
+| any other definite | roll the removal back inside the still-open transaction, and refuse |
+
+Two properties hold the design together. **Continue only on proof**: no arm proceeds
+with an
+ownership question outstanding, which is why the restore gate can wait for the settlement
+rather than needing a second admission barrier. And **one property, not an
+enumeration**: the
+commit's own register cleanup performs record writes, so rather than threading classified
+results back through three helpers, the caller asks the *session* whether anything it did
+leaves the connection unable to serve — `recordStateBlocksServing`, one lock-safe
+accessor over
+"unresolved write **or** armed rejection". That covers writes this code never named, including
+ones a later change adds; it does not cover a pre-store refusal, and does not need to, because
+none of those is evidence about ownership.
+
+The CONNECT may resolve inside its own transaction where a SUBSCRIBE or UNSUBSCRIBE
+defers to
+the readLoop, and the difference is structural: `mqttResolveAfterPacket` runs *after*
+`mqttProcessConnect` returns, but the resume work inside it needs a resolved session
+first. The
+CONNECT already resolves once for that reason before its accept transaction is opened; this
+ambiguity arises *inside* that transaction, so the in-transaction resolver body is the form
+that fits. The old call at this site could never work — it took the ownership gate the CONNECT
+already holds and needed a fence the frame already owned, so it reported "unresolved" without
+attempting anything.
+
+Every refusing arm owes the restore verdict its terminal, and owes it as
+`abandonRestoreGate` **alone**: post-CONNACK there is no licence to discard the Will or clear
+acceptance. Waking the withheld deliveries is the point — parked, they wait out their bound,
+find the session detached, and can no longer record themselves as never transmitted, so their
+redelivery reaches the client marked DUP.
+
+### The pre-CONNACK refusal signal
+
+A v5 client is told **why** its resume was refused, at every refusal on the pre-CONNACK
+side of
+the acknowledgement: register recovery, the shared-ownership foreign, forked, unresolved and
+local arms, the lifetime grant, and the restore path that already did this. Without it a
+permanently unrestorable session is an endless silent close, and a clean start — the
+recovery —
+is a choice the client can only make if it knows there is something to recover from.
+
+Two limits are structural rather than chosen. It is **v5 only**: a 3.1.1 CONNACK has no reason
+code above 5, so that connection gets a bare close. And the disposal vocabulary must be
+**projected** onto a code a CONNACK may legally carry — `0x89` "Server busy" is
+permitted and
+keeps a fork's "reconnect and resolve this" meaning exactly, but `0x8E` "Session taken
+over" is
+DISCONNECT-only, so a takeover degrades to `0x83` plus the vocabulary's Reason String. The
+client learns why; it cannot be told "stop reconnecting", because no CONNACK code says that.
+
+Two exits stay silent, deliberately. The **failed success-CONNACK write** has no channel left
+to explain itself on — the channel is what failed. And the **reconciliation verdicts** remain
+silent as one atomic site: that helper disposes the session internally before it
+returns, so a
+CONNACK added at the caller has already lost the race with its own socket close, and its
+foreign verdict merges takeover with fork, which need different projections. Signalling
+half a
+site would leave an operator comparing a local verdict that explains itself against a foreign
+one that does not. That remainder is `docs/ROADMAP.md`'s pre-CONNACK-signal bullet,
+which stays
+open on it.
 
 ## Outbound in-flight registers
 

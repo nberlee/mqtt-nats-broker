@@ -53,6 +53,27 @@ import (
 //
 // See docs/ARCHITECTURE.md "The restore gate".
 
+// Test hook: fired immediately before the restore verdict OPENS.
+//
+// It exists to express one ORDERING invariant that no state check can: everything the CONNECT
+// owes before it may serve — for a 3.1.1 resume, the forced leave's commit — must have happened
+// by this point. A test that only asks "did the commit eventually run" cannot see a commit that
+// ran afterwards, under an unrelated later transaction, which is what a mis-registered landed
+// continuation produces.
+var mqttTestRestoreOpenHookV atomic.Pointer[func()]
+
+// setMQTTTestRestoreOpenHook installs (or, with nil, clears) the gate-open hook and returns a
+// function that restores the previous value.
+func setMQTTTestRestoreOpenHook(h func()) func() {
+	prev := mqttTestRestoreOpenHookV.Load()
+	if h == nil {
+		mqttTestRestoreOpenHookV.Store(nil)
+	} else {
+		mqttTestRestoreOpenHookV.Store(&h)
+	}
+	return func() { mqttTestRestoreOpenHookV.Store(prev) }
+}
+
 // mqttRestoreGate is one CONNECT's "nothing may be transmitted yet" verdict.
 //
 // done is closed exactly once, by openRestoreGate or abandonRestoreGate, from the
@@ -116,6 +137,9 @@ func (sess *mqttSession) armRestoreGate() {
 //
 // No lock held on entry.
 func (sess *mqttSession) openRestoreGate() {
+	if h := mqttTestRestoreOpenHookV.Load(); h != nil {
+		(*h)()
+	}
 	g := sess.restoreGate.Load()
 	if g == nil {
 		return

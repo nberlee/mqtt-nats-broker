@@ -1082,7 +1082,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   layer**. Sixteen mutations were run and each kills a named test. `docs/CONFORMANCE.md`
   residual 3 of the unreadable-record entry is now closed; items 1 and 2 there are unchanged.
 
-  - [x] **Release a shared UNSUBSCRIBE's and a SUBSCRIBE rollback's own state independently of
+  - [x] **Release a shared UNSUBSCRIBE's and a SUBSCRIBE rollback's own state
+    independently of
   the last-holder answer** ([F-083](findings/shared-qos2.md#f-083)). **Alpha blocker — done.**
   Filed by F-082's second consult as a separate caller with its own commit path. **The item
   WIDENED during planning, by an explicit decision recorded in the lane's `DECISIONS.md`:**
@@ -1092,18 +1093,24 @@ further findings it surfaced are filed separately, for the reason its own bullet
   *pre-existing, still-persisted* overlapping subscription of its delivery, its pending state
   and its charge. Because that is the same invariant and F-082's own twin, it landed here
   rather than as a fifth site-by-site item.
-  **What closed it, and it is a PROPERTY rather than four patches:** the fence is now "does a
+  **What closed it, and it is a PROPERTY rather than four patches:** the fence is now
+  "does a
   membership that SURVIVES this operation still reach this durable?", asked of an explicit
   immutable `mqttSharedSurvivors` key set that each operation supplies — the live map minus
   the packet's whole doomed set at UNSUBSCRIBE staging (a SET, because one packet can leave
-  both overlapping filters and a single `exceptKey` lets each protect the other), the live map
-  at its commit half, and the PRE-PACKET SNAPSHOT at both halves of a rollback, whose live map
+  both overlapping filters and a single `exceptKey` lets each protect the other), the
+  live map
+  at its commit half, and the PRE-PACKET SNAPSHOT at both halves of a rollback, whose
+  live map
   still names the key being rolled back. `sharedKeyStillOwnsLocked` is deleted and its two
   F-082 callers converted, so one mechanism states the rule.
-  **Three defects the bullet had not stated, found while planning:** the no-`cons` branch also
+  **Three defects the bullet had not stated, found while planning:** the no-`cons`
+  branch also
   released *neither* level-up durable in the mixed shape, because it excluded `" fwc"` sids;
-  "this config is doomed" and "this durable is owed" are different questions, so a doomed key's
-  config must go even when its durable survives (the commit half is three operations, not one);
+  "this config is doomed" and "this durable is owed" are different questions, so a
+  doomed key's
+  config must go even when its durable survives (the commit half is three operations,
+  not one);
   and `removeUnsubConsumer` was a REDUNDANT MECHANISM, deleted rather than guarded a third
   time — `execDeferredConsumerDeleteClassified` already was the correct plain teardown, while
   the deleted one mutated `sess.cons` without `sess.mu` and never unsubscribed the deliver
@@ -1112,34 +1119,111 @@ further findings it surfaced are filed separately, for the reason its own bullet
   sid from a plain one LEXICALLY. A literal `.` encodes as `//`, so the ordinary plain filter
   `$share.foo` has the sid `$share//foo`; a `$share/` prefix guard strands its consumer. The
   authorities are `f.shared` and `cc.DeliverGroup`.
-  **ONE site is deferred, not two:** the 3.1.1 forced leave's `cons`-versus-membership target
-  mismatch, to the item below. Teardown is vacuous for this property and owes no separate fix,
-  so it is deferred nowhere.
+  **ONE site was deferred, not two:** the 3.1.1 forced leave's `cons`-versus-membership target
+  mismatch, to the forced-leave item below, which has since **closed it**. Teardown is vacuous
+  for this property and owes no separate fix, so it was deferred nowhere.
   **A defect the holistic review found in this change and this change fixed:** the SUBSCRIBE
-  rollback's own `existedBefore` still classified sids lexically, so a rollback unsubscribed a
+  rollback's own `existedBefore` still classified sids lexically, so a rollback
+  unsubscribed a
   pre-existing plain `$share.foo` subscription it was supposed to restore. **And a coverage
-  limit stated rather than implied away:** the two planned resolver-continuation tests were not
-  written, so the premise that the surviving-key sample stays true across the ownership gate is
+  limit stated rather than implied away:** the two planned resolver-continuation tests
+  were not
+  written, so the premise that the surviving-key sample stays true across the ownership
+  gate is
   argued from the call sites rather than tested; the continuation mechanism itself is untouched
   by this item. See the dossier's coverage section.
 
-  - [ ] **The 3.1.1 forced leave's
-  post-CONNACK destructive exit.** Also surfaced by F-050's review, and deliberately not
-  folded into it. The forced leave removes a resuming 3.1.1 client's persisted shared
-  memberships and releases their group consumers, and it runs AFTER the success CONNACK;
-  its save failure returns an error there, so the client holds an acknowledged session and
-  a closed connection. Moving it before the CONNACK was tried in F-050's plan and
-  refuted: it converts an UNACKNOWLEDGED CONNECT attempt into a permanent destructive
-  mutation of session state, which is strictly worse. It is none of F-050's five restore
-  exits.
+  - [x] **The 3.1.1 forced leave's
+  post-CONNACK destructive exit.** **Done. The leave is now a convergence obligation rather
+  than a CONNECT exit, and it also closes the target mismatch F-083 deferred here plus F-045's
+  forced-leave instance.** Surfaced by F-050's review. Moving the leave before the
+  CONNACK was
+  tried in F-050's plan and stays refuted — it converts an UNACKNOWLEDGED attempt into a
+  permanent destructive mutation — so the leave did **not** move; what changed is how its
+  failure is classified.
+  **The finding was narrower and sharper than this bullet said.** `saveDefinitelyFailed` cannot
+  contain a transient store failure at all: `persistRecord` arms uncertainty for every non-CAS
+  store error, so the ordinary failure is **ambiguous**, and the ambiguous arm's remedy was
+  DEAD CODE — `resolveUncertainNow` took the ownership gate the CONNECT already holds and
+  needed a fence the frame already owned, so it reported "unresolved" without attempting
+  anything. Five arms now: landed commits; ambiguous parks the continuation then
+  resolves **in
+  line under the accept transaction**; 10164 goes through the bounded contention retry; 10071
+  disposes with a **classified** takeover-or-fork vocabulary instead of a bare close;
+  everything else rolls the removal back inside the still-open transaction and fails closed.
+  **Continue only on proof** is the invariant, which is why the restore verdict can
+  simply wait
+  for the settlement instead of needing a second admission barrier.
+  **Two of this bullet's own claims were wrong and are recorded rather than quietly dropped.**
+  "Can delete a zero-expiry session" is **vacuous** here: a non-clean 3.1.1 CONNECT always
+  grants `mqttSessionNeverExpire`, and a clean start has no persisted membership to
+  leave, so
+  the two conditions cannot co-occur — pinned by a test so a later change that makes it
+  reachable fails rather than passes. And a candidate harm I asserted while planning — the
+  stranded entry being NAK'd into the group — is **unreachable**: both resume NAK loops require
+  a live ack subject, which a register-rebuilt entry does not have.
+  **The mismatch, closed:** doomed configs and release candidates come from the
+  membership keys
+  plus `cons`; the pending purge comes from the pending maps; a pending-only target is
+  purged and
+  **never** deleted. The pending derivation runs at **staging** too, because the write that
+  removes the membership must also carry "these allocations were never transmitted" — otherwise
+  a crash leaves a live register with no cancellation and no membership able to trigger another
+  leave. `srcAckOwed` retirements stay exempt. The hand-rolled release sequence is
+  deleted in
+  favour of `releaseSharedGroupTargetClassified`, which also fixed a refund driven by `cons`
+  entries that missed every membership-only durable.
+  **Also landed:** an unparseable membership key is **refused pre-CONNACK** (no Will, lifetime
+  ungranted) rather than silently stranding its durable; the restore verdict opens after the
+  settlement and every post-CONNACK refusal terminates it with `abandonRestoreGate` alone;
+  `recordStateBlocksServing` samples the session after the commit, covering cleanup
+  writes by
+  property rather than by enumeration.
+  **Residuals** in `docs/CONFORMANCE.md`: three surviving destructive exits, an enlarged plain
+  QoS 0 drop window, `resolutionAfterContinuations`'s marker gap for *other* callers, the
+  continuation path's late-rejection asymmetry, and the pre-existing malformed-key
+  exposure in
+  the orphan sweep. **Shape:** 6 plan-review rounds (2 producing nothing — one cancelled for
+  plan drift, one failed launch), 19 findings all folded or refuted.
 
-  - [ ] **Generalise the pre-CONNACK refusal signal.** F-050 tells a v5 client why
-  its restoration refused the CONNECT (0x83, naming the filter), because a permanently
-  unrestorable filter would otherwise be an endless silent close with no hint that a clean
-  start is the recovery. The other pre-CONNACK refusals — register recovery, the
-  reconciliation verdicts, the lifetime grant — still close silently. **F-061 does not own
-  this**: it is specifically the authorization path, and F-050's review corrected an
-  earlier draft that attributed general failure signalling to it. **Small.**
+  - [ ] **Generalise the pre-CONNACK refusal signal.** **MOSTLY DONE; open on ONE site.**
+  F-050 told a v5 client why its restoration refused the CONNECT (0x83, naming the filter),
+  because a permanently unrestorable filter would otherwise be an endless silent close
+  with no
+  hint that a clean start is the recovery. **F-061 does not own this**: it is
+  specifically the
+  authorization path, and F-050's review corrected an earlier draft that attributed general
+  failure signalling to it. **Small.**
+  **This bullet named three silent sites and there were six.** The three it omitted are the
+  shared-ownership arms — and one of them was already promised here by a comment in the tree
+  ("No 0x8E reaches the client ... generalising it is its own roadmap item"). Swept
+  rather than
+  taken at face value. **Landed:** register recovery, and the shared-ownership foreign/forked,
+  unresolved and local arms, and the lifetime grant, all now carry a v5 failure CONNACK
+  with a
+  Reason String. Two facts shaped it: **0x8E "Session taken over" is NOT a legal CONNACK Reason
+  Code** ([3.2.2.2] — checked against the spec, not recalled), while 0x89 is, so the disposal
+  vocabulary is **projected** onto a legal code and a takeover degrades to 0x83; and the
+  refusal CONNACK must be enqueued **before** the foreign disposal, which schedules the socket
+  close on another goroutine. The claim is scoped to the **post-accept-save,
+  pre-success-CONNACK** window — earlier exits exist and are out of scope.
+  **What keeps the box open: S2, the reconciliation verdicts, treated as ONE atomic site.**
+  `reconcileResumedConsumers` **disposes the session internally before it returns**, so a
+  CONNACK added at the caller has already lost the race with its own close; and
+  `mqttReconcileRefuseForeign` **merges takeover with forked**, which need different
+  projections. Closing it means either returning the vocabulary without disposing, or invoking
+  a signal callback before the internal disposal, plus splitting that verdict — and then
+  S2-local, S2-unresolved and S2-forked tests, not just S2-foreign. Signalling only half the
+  site was rejected: it would leave an operator comparing a local verdict that explains itself
+  against a foreign one that does not.
+  **`abortAcceptedResume`'s unused `bool` parameter is RETAINED on purpose.** It is
+  where S2's
+  foreign-versus-forked fact would arrive, so deleting it now would destroy the carrier
+  the fix
+  needs. A test pins that S2 stays silent, with a comment saying so, to stop a later reader
+  "fixing" it without the redesign.
+  **The failed success-CONNACK write stays silent too, permanently** — the channel it would
+  explain itself on is the one that just failed.
 
   - [x] [F-065:
   Re-read copy absence after the reaper's own SourceAcked
@@ -1592,8 +1676,19 @@ takeover.
   **Small.** Independent of the F-030 term-fence work: this is a missing in-memory
   `sharedSubs` restoration, not a JetStream CAS failure.
 
-- [ ] [F-045: Release stranded shared pending state at membership removal](findings/runtime-correctness.md#f-045).
-  **Medium.**
+- [x] [F-045: Release stranded shared pending state at membership removal](findings/runtime-correctness.md#f-045).
+  **Closed by TWO items, and the joint provenance is the point — neither one changed both
+  sites.** F-045 tracked one defect at two removal paths: their purges walked only
+  `cons`-derived durables, so a record-restored session (membership without configs)
+  stranded a
+  TRANSMITTED delivery's `cpending`/`pendingPublish` entries until the close, holding packet
+  identifiers and Receive Maximum slots meanwhile — under a Receive Maximum of 1, a
+  session that
+  can no longer deliver at all. **UNSUBSCRIBE's no-`cons` branch was closed by F-083**; the
+  **3.1.1 forced leave** by the forced-leave item in §0.2, which derives its pending
+  purge from
+  the pending maps at both its staging and its commit half. `purgeSharedPending` remains the
+  backstop for a session that simply disconnects.
 
 - [x] [F-050: Refuse or retry an incomplete shared-subscription restore](findings/shared-qos2.md#f-050).
   **Closed 2026-08-23 by refusing, not retrying.** CONNECT no longer reports a resumable

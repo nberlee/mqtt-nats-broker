@@ -119,7 +119,7 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   refused, unheld) with the release keyed on the group consumer's deterministic names.
   Details: [F-082](shared-qos2.md#f-082).
 - Release UNSUBSCRIBE's own shared state independently of the last-holder answer.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed. Release treatment: Alpha blocker.
   Filed by F-082's consult as a separate caller with its own commit path. Three statements:
   the local durable-scoped purge is not gated the way the delete is, so leaving one filter
   strips state an overlapping surviving filter still needs; the staging half mixes a
@@ -225,7 +225,10 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   unexplained repeatable failure.
   Details: [F-044](release-investigations.md#f-044).
 - Release stranded shared pending state when membership is removed.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed, jointly. Release treatment: Alpha blocker.
+  One defect at two removal paths, closed by two different items and neither changed both
+  sites: UNSUBSCRIBE's no-`cons` branch by F-083, the 3.1.1 forced leave by the forced-leave
+  item in ROADMAP §0.2.
   Details: [F-045](runtime-correctness.md#f-045).
 - Complete the deferred in-flight-register stabilization follow-ups.
   Status: Open. Release treatment: Split before scheduling; most work is a post-alpha

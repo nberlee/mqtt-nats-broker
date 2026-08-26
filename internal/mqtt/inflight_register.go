@@ -1219,6 +1219,44 @@ func mqttErrorf(c *client, format string, args ...any) {
 // readback.
 //
 // Session lock NOT held on entry.
+// voidVerdictsDurable reports whether every void verdict this session has staged is durably
+// credited — that is, whether the revision counter and the credited-revision watermark agree.
+//
+// It exists because "the record is still ours" and "everything I staged is persisted" are
+// DIFFERENT questions, and conflating them is one defect stated three ways. They come apart
+// exactly when one fallback write goes ambiguous: `persistRecord` then refuses every later write
+// at entry while the session is unresolved, so a second target's cancellation is never sent —
+// and resolving the FIRST write credits only the revision that write marshalled. The resolution
+// legitimately reports "ours", and the second verdict is still owed.
+//
+// A caller about to do something irreversible therefore needs both: an ownership verdict AND
+// this. Naming the requirement is what makes it complete, where enumerating the writes was not.
+//
+// No lock held on entry.
+func (sess *mqttSession) voidVerdictsDurable() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	// Over the OUTSTANDING insertions, never over the global mutation counter.
+	//
+	// voidedRegsRev counts removals as well as insertions: forgetCancelledReg increments it when
+	// a register-stream proof RETIRES an already-durable verdict, and that path runs no
+	// session-record save because none is owed. Comparing the counter to the saved watermark
+	// therefore reports "not durable" for a session whose cleanup entirely SUCCEEDED — which on
+	// the direct path would close an already-acknowledged connection, recreating the exact defect
+	// this change exists to remove. A holistic round caught that, and it was a new defect rather
+	// than another variant of the ordering seam.
+	//
+	// This is the same test releaseSettledVoidReservationsLocked already applies per nonce: a
+	// verdict is durable when the save that landed provably SERIALIZED it, i.e. its insertion
+	// revision is at or below the credited watermark.
+	for _, insertRev := range sess.cancelledRegNonces {
+		if insertRev > sess.voidedRegsSavedRev {
+			return false
+		}
+	}
+	return true
+}
+
 func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 	sess.mu.Lock()
 	rev, saved := sess.voidedRegsRev, sess.voidedRegsSavedRev

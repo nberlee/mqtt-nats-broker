@@ -2039,6 +2039,64 @@ func (sess *mqttSession) saveClassified(tok recordTx) (saveOutcome, error) {
 	return sess.classifySave(wasUncertain, err), err
 }
 
+// mqttForcedLeaveOwnership is what the 3.1.1 forced leave's commit concluded about this
+// session's record state, sampled after its own cleanup writes and BEFORE it releases any group
+// consumer.
+//
+// It exists because the commit performs both kinds of operation: session-record writes, which
+// can leave the record unresolved or arm the rejection marker, and a CONSUMER.DELETE on an
+// interest-retained stream, which destroys the backlog of every member that still holds the
+// group. The second must not happen while the first is unsettled, and "notice afterwards and
+// close the connection" is not a remedy — the delete has already happened.
+type mqttForcedLeaveOwnership int
+
+const (
+	// mqttForcedLeaveOwnershipOurs: the record is still this session's, either because nothing
+	// was left unsettled or because the resolution or the probe proved it. The only verdict that
+	// licenses releasing a group consumer.
+	mqttForcedLeaveOwnershipOurs mqttForcedLeaveOwnership = iota
+	// mqttForcedLeaveOwnershipForeign: the record belongs to another owner (or to a sibling
+	// nothing can attribute). Release nothing and stop serving.
+	mqttForcedLeaveOwnershipForeign
+	// mqttForcedLeaveOwnershipUnresolved: neither the resolution nor the probe could settle it.
+	// Release nothing; the periodic pass settles it later.
+	mqttForcedLeaveOwnershipUnresolved
+)
+
+func (v mqttForcedLeaveOwnership) String() string {
+	switch v {
+	case mqttForcedLeaveOwnershipOurs:
+		return "ours"
+	case mqttForcedLeaveOwnershipForeign:
+		return "foreign"
+	default:
+		return "unresolved"
+	}
+}
+
+// recordStateBlocksServing reports whether this session's own durable state forbids the
+// connection proceeding: an unresolved write, or an armed rejection whose ownership question is
+// still outstanding.
+//
+// It exists so a caller that has just run a compound operation does not have to enumerate which
+// of that operation's writes might have failed and how. Every session-record write goes through
+// persistRecord, which arms one or the other for any STORE error, so sampling the session
+// afterwards covers writes the caller never named — including ones a later change adds. It does
+// NOT cover a pre-store refusal (the save hook, a rejected transaction, an entry refusal for an
+// earlier uncertainty), and it does not need to: none of those is evidence about ownership, and
+// each is already visible to its own caller as a definite failure.
+//
+// ONE accessor rather than two calls, because the two predicates have different locking rules:
+// recordRejectionGatesServingLocked requires sess.mu while isSeqUncertain takes it itself, so
+// composing them naively is a lock error rather than merely untidy.
+//
+// No lock held on entry.
+func (sess *mqttSession) recordStateBlocksServing() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.seqUncertain || sess.recordRejectionGatesServingLocked()
+}
+
 // saveClassifiedDetail is saveClassified plus the attempted write's raw
 // identity, for the one caller that must turn a DEFINITE CAS rejection into a
 // decision by kind — 10071 (taken over) versus 10164 (contention) — and retry

@@ -4276,12 +4276,17 @@ func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 
 // The purge reaches the strays a membership removal deliberately LEAVES BEHIND.
 //
-// The 3.1.1 forced leave runs before processSubs (so there is no shared cons entry), nils
-// the membership, and stages only register verdicts: voidRegistrationsLocked leaves a
-// TRANSMITTED delivery's cpending/pendingPublish entries "for the teardown's purge to
-// remove". UNSUBSCRIBE's no-cons branch leaves the same shape. After
-// either of them BOTH views of the group are empty while the pending state is still live —
-// which is why the purge derives its targets from that state instead.
+// This fixture builds the shape by hand: the membership nil'd, no shared cons entry, and a
+// TRANSMITTED delivery's cpending/pendingPublish entries left behind — which is what
+// voidRegistrationsLocked does, recording the verdict and leaving the entry "for the
+// teardown's purge to remove". BOTH views of the group are then empty while the pending state
+// is still live, which is why the purge derives its targets from that state instead.
+//
+// Note on how the real forced leave reaches this shape, since it changed: since F-050 it runs
+// AFTER processSubs, not before, and there is no shared cons entry because the pre-CONNACK
+// restore excludes shared filters for a non-v5 connection — a different reason for the same
+// absence. A RESIDENT session can still carry shared cons entries from an earlier v5
+// connection, so "no cons entry" is a property of this fixture, not of every forced leave.
 //
 // Mutation check: derive the targets from sharedSubs (or from any union of the two views)
 // and this test fails; the strays are unreachable through either.

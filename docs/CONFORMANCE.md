@@ -2961,11 +2961,64 @@ defect.
 **at every site that can have a surviving membership** — the failed-filter release's two
 halves, UNSUBSCRIBE's two halves, and a SUBSCRIBE packet's rollback's two halves. F-083 closed
 the last two by stating the rule as a property over the membership that survives the
-operation, rather than as a rule per caller; `docs/ARCHITECTURE.md` carries the mechanism and
-the four authorities. The 3.1.1 forced leave and teardown are **vacuous** for that property —
+operation, rather than as a rule per caller; `docs/ARCHITECTURE.md` carries the
+mechanism and
+the four authorities. The 3.1.1 forced leave and teardown are **vacuous** for that
+property —
 neither can have a surviving membership — so neither is exempted from it and neither is fixed
-by it. The forced leave does still carry a separate defect of its own, its
-`cons`-versus-membership target mismatch, which is its own roadmap item; teardown carries none.
+by it. The forced leave's own `cons`-versus-membership target mismatch is **now
+closed**: it
+derives its doomed configs and its release candidates from the membership keys plus
+`cons`, and
+its pending purge from the pending maps, at the staging half as well as the commit. Teardown
+carried no such defect.
+
+### What the 3.1.1 forced leave still costs after it stopped being a CONNECT exit
+
+The leave is broker hygiene, so its failure no longer closes an acknowledged connection merely
+because a write did not succeed. Seven residuals remain, and the first three are the
+exits that
+survive on purpose.
+
+1. **A post-CONNACK refusal still closes, and therefore still publishes the Will**
+   ([MQTT-3.1.2-8] requires it on a close not preceded by a DISCONNECT, and post-CONNACK there
+   is no licence to discard it). Three arms reach it: an **unresolvable** ambiguous
+   write, a
+   **10164** outcome that is local-definite or unresolved, and a **10071** classified takeover
+   or fork. The first two are the right trade — a connection serving a session that can persist
+   nothing is worse — and the third is an ownership disposition, where stopping is the point.
+   Each abandons the restore verdict so withheld deliveries are woken rather than parked.
+2. **A leave that never completes leaves the memberships durable and their group durables
+   alive** until a later resume re-derives it. This belongs to the refusing arms only:
+   on the
+   arms that continue, the leave has completed.
+3. **The plain QoS 0 drop window is enlarged by the duration of the leave's
+   settlement**, for a
+   3.1.1 resume carrying shared memberships. The restore verdict now opens after that
+   settlement, and QoS 0 has no redelivery to wait for, so it drops while the verdict is
+   unopened; QoS 1/2, PUBREL and affine deliveries wait and are unaffected. Serving a message
+   under a membership whose ownership is still unproven cannot be undone, and a dropped
+   QoS 0
+   message is what QoS 0 means.
+4. **`resolutionAfterContinuations` considers only uncertainty, not an armed
+   rejection.** The
+   forced leave samples both itself, so it is covered; the shared helper remains
+   incomplete for
+   other continuation callers, which were not analysed here. A known gap, stated rather than
+   widened under an item that never planned for it.
+5. **A late rejection or ambiguity raised by the commit's register cleanup on the CONTINUATION
+   path** — where the connection may already be gone — is logged and left to the marker or
+   uncertainty the write itself armed. Nothing is serving there, so there is nothing to gate;
+   the asymmetry with the in-connection path is stated rather than implied.
+6. **A pre-CONNACK takeover refusal can tell a v5 client why, but not "do not retry".** `0x8E`
+   "Session taken over" is not a legal CONNACK Reason Code ([3.2.2.2]) and no legal code
+   carries that instruction, so the refusal degrades to `0x83` with a Reason String. A client
+   that reconnects will contend for the session again. A protocol limit, not a gap.
+7. **PRE-EXISTING and unchanged:** a malformed shared membership key still fails to
+   protect its
+   group durable against the orphaned-consumer sweep, on any record. The pre-CONNACK preflight
+   stops the forced leave from compounding it and makes the condition visible to an operator;
+   it does not make malformed keys safe elsewhere.
 
 ### A drain interrupted by its own session's clear withholds that completion
 
