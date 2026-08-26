@@ -1988,6 +1988,61 @@ finding with acceptance criteria.
   acceptance-fact change: different mechanism (F-029b origin intervals), and that diff
   already spans 46 files.
 
+- [ ] Make the two `AbortsThePassOnATransientFactOutage` fixtures tolerate concurrent
+  load — and settle whether the candidate-only half is really only a fixture.
+  `TestWillClaimantAbortsThePassOnATransientFactOutage` and its sibling
+  `TestWillPendingArmAbortsThePassOnATransientFactOutage`
+  (`will_accept_fence_test.go:427` and `:476`) seed TWO expired records, inject a
+  fact-read failure on the first, and assert the pass issued exactly ONE read — the
+  point being that an outage costs one timeout per PASS, not one per record. Under
+  load the assertion intermittently sees 2.
+  **What was measured, at exact-test granularity.** A paired soak against `eadb22d`
+  (the commit before the pre-CONNACK-signal work), selector
+  `TestQ2Aff|TestMQTTQ2Aff|TestWill|TestMQTTWill`, 450 tests per run, **20 runs per
+  arm POOLED FROM TWO INVOCATIONS of `make soak` (8 then 12)** with the same selector,
+  refs and candidate tree — the script resets its worktree, logs and alternation
+  between invocations, so the provenance matters for reproducing this. Pooled runs
+  failing: baseline 9/20, candidate 7/20. Every failing test name is shared between
+  the arms EXCEPT this pair, and the split is exactly one half each: **the Claimant
+  test failed 2/20 in the candidate arm and 0/20 in the baseline; the Pending test
+  failed 2/20 in the baseline and 0/20 in the candidate.**
+  **COVERAGE CAVEAT, because it bounds the comparison.** 38 of the 40 runs executed
+  the full 450 tests; **two did not** — one per arm, run 3 of the 12-run invocation —
+  because `TestQ2AffOnBehalfRestorationIsNotChargedToTmaxack` PANICKED, truncating
+  those runs at 286 (baseline) and 309 (candidate) tests. Both Will tests above did
+  execute in all 20 runs of each arm, which is checked and is what makes their
+  2/20 and 0/20 counts sound; but tests ordered after the panic had no chance to run
+  in those two, so "no other name is arm-exclusive" is a claim about 38 full runs and
+  2 partial ones rather than 40 full ones.
+  **What that does and does not establish.** The two halves exercise separate switch
+  arms, so reading them as one family is a POST-HOC aggregation, not the
+  pre-registered rule — which said a candidate-only name is a regression signal
+  whatever the totals. So this bullet does NOT claim "not a regression". What is
+  established: the aggregate rate did not rise, no other name is arm-exclusive, and
+  the scan and fixture code are untouched by that work. What is inferred but not
+  settled: that concurrent passes inflate the count, which the observed value of
+  exactly 2 supports. The isolation evidence covers **only the Claimant half** —
+  0/30 on each arm run alone — and the Pending half was not run that way.
+  **What would settle it:** run each half alone under injected concurrency, or make
+  the assertion count reads for THIS pass rather than for the fixture's lifetime, so
+  a neighbouring pass cannot contribute. Until then treat the Claimant half as
+  suspect rather than dismissed.
+
+- [ ] Stop `testQ2AffAwaitMaterialized` dereferencing a reaped claim.
+  **Test infrastructure, and it CRASHES the run rather than failing a test.**
+  `qos2_shared_affine_lifecycle_test.go:5499` reads `claim.Phase` on the result of
+  `testQ2AffLoadClaim`, which is nil once the claim has been reaped — so the poll
+  loop nil-derefs and the whole test binary takes a SIGSEGV, ending that run early
+  and taking every later test with it. Reached through
+  `TestQ2AffOnBehalfRestorationIsNotChargedToTmaxack`
+  (`qos2_shared_affine_lifecycle_test.go:5521`).
+  **MEASURED as pre-existing and symmetric**: it fired once in each arm of the
+  paired soak above — the baseline arm at `eadb22d` and the candidate arm alike —
+  so it is neither introduced nor fixed by the pre-CONNACK-signal work. It is
+  recorded because a panic is worse than a flake: it truncates the run, which is
+  what put the coverage caveat on that soak. A nil check that keeps polling until
+  the deadline is the obvious fix; the awaited condition is already "the claim
+  exists AND is materialized".
 - [ ] Make `TestQ2AffineResumeDoesNotRechargeAckBudget`'s reconnect loop tolerate a closed
   connection. **Test infrastructure, not a broker gap, and MEASURED as pre-existing.**
   It closes and reopens the member three times in a loop
