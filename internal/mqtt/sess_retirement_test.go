@@ -330,8 +330,8 @@ func TestRetirementWatermarkIsPermanentAndMonotonic(t *testing.T) {
 	// create — the write-lineage audit removed that reader — but it remains what the
 	// watermark ATTRIBUTES the retirement to, and a fence that advanced its marker
 	// sequence while keeping an earlier RWID would name a record a different teardown
-	// removed. See docs/ROADMAP.md's F-036 and vanished-record bullets, which decide
-	// whether the field keeps a reader.
+	// removed. See docs/ROADMAP.md's VANISHED-RECORD bullet, which now decides alone
+	// whether the field keeps a reader: F-036 disproved it as a predicate on 2026-08-27.
 	if r2.RWID != secondRec.WID {
 		t.Fatalf("the advanced fence must name the SECOND retired record: RWID=%q want %q "+
 			"(the first was %q)", r2.RWID, secondRec.WID, firstRec.WID)

@@ -323,10 +323,13 @@ type mqttGenRetirement struct {
 	// It has NO reader today. The create that inherited it as a parent pointer was
 	// deleted by the write-lineage audit, and the field is retained deliberately
 	// rather than removed with it: what it states is a durable fact about which
-	// record a retirement attributes to, and docs/ROADMAP.md's F-036 and
-	// vanished-record bullets are the items that decide whether that fact gains a
-	// reader again. Retiring it now would have to be undone by whichever of them
-	// needs it.
+	// record a retirement attributes to, and docs/ROADMAP.md's vanished-record
+	// bullet is the ONE item left that decides whether that fact gains a reader
+	// again. F-036 was the other candidate and is no longer one: its 2026-08-27
+	// attempt disproved this predicate, because a one-slot-per-client watermark
+	// makes an ackWID == RWID conjunct recreate the superseded-watermark false
+	// negative that fix exists to close. Retiring the field now would have to be
+	// undone if the vanished-record item needs it.
 	//
 	// REQUIRED, and validated as such: a watermark that cannot name what it retired
 	// attributes a deletion to nothing, and accepting an empty value would be

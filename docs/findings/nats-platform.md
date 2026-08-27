@@ -57,9 +57,11 @@ closed on 2026-08-18; F-033's ran on 2026-08-18, also closed without lineage, pr
 F-063, F-064, F-065 and F-066; and F-034's ran on 2026-08-22, closing without lineage too
 but as the one of the three whose consequence turned out to be REACHABLE, producing F-067
 and F-068. The lineage-deletion audit is its own roadmap bullet and is now unblocked.
-Fields used for other facts, notably `RWID` as possible positive retirement evidence
-for F-036, do not
-fall merely because the term window does.
+Fields used for other facts do not fall merely because the term window does — though
+`RWID` is no longer one of them for F-036: that finding's 2026-08-27 attempt **disproved**
+it as the predicate, because the watermark holds one slot per client, so an
+`ackWID == rwid` conjunct recreates the superseded-watermark false negative the fix exists
+to close. The field is now retained for the vanished-record vocabulary item alone.
 
 ### Rejected follower-local apply-time CAS
 

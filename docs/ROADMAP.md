@@ -438,7 +438,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   sites, the disposal vocabulary and `sess_fork_repair.go`, because the AUTHORED-RECORD
   fork's retirement is unproved on the writer every accepted CONNECT uses (the next
   bullet); `WID`/`PWID` stamping at all three writers; `RWID`, now with **no reader**,
-  pinned until F-036 and the vanished-record vocabulary decide; the create arm's
+  pinned until the vanished-record vocabulary decides — F-036's 2026-08-27 attempt
+  DISPROVED it as that finding's predicate; the create arm's
   corrupt-watermark REFUSAL, which is a separate obligation from the inheritance beside
   it; and the independent sequence fail-safes. **`$MQTT_origin` is REFUSED at startup**,
   not tolerated — a lookup-only preflight before the provisioning loop, since
@@ -1580,50 +1581,170 @@ further findings it surfaced are filed separately, for the reason its own bullet
   in `docs/CONFORMANCE.md`.
 
   - [ ] [F-036: Revalidate quiet resident-session
-  ownership](findings/ha-arbitration.md#f-036). **Was: very large; now the remainder of
-  one shape.** Slice A above converges every MOVED record, bound sessions included. What
-  is left is the DELETED record on a BOUND session: arming the ownership marker hands it
-  to the record-rejection settlement, whose unbound half refuses while a client is
-  attached and whose bound half runs pre-dispatch on that connection's own readLoop — so
-  a client that negotiated Keep Alive 0 and then goes silent still holds a session
-  another broker tore down, which is precisely the failure this finding names. Closing
-  it needs a bound-session disposal that does not depend on future client traffic, and
-  that fix has to answer why taking the shared client-ID gate for a bound session is
-  safe here when it is not for a concurrent SUBSCRIBE (`docs/ARCHITECTURE.md`, "A
-  definite record-CAS rejection is outstanding work"). Found by the Slice A holistic
-  review. **Scope WIDENED 2026-08-17 by F-032's audit, from the absent-record tail to
-  "the previous owner keeps serving, or is misread as gone, after ownership moved".**
-  Two manifestations were added, both consequences of this finding's own condition
-  rather than new findings: (1) `arbitrateQoS2ReleaseClaims` enumerates hold subjects
-  ONCE, so a hold on a subject ABSENT from that snapshot is never arbitrated, and a peer
-  that has not yet observed the ownership marker delivers it **after the session was
-  discarded** — a delivery that should not have happened, not a loss, and deliberately
-  not something F-062's purge cutoff addresses. That cutoff, now landed, WIDENS this
-  manifestation: a hold enumerated but above the watermark is spared too, so the
-  population that survives a teardown and stays serviceable by the peer includes those
-  as well as never-enumerated ones. (A replacement on an already-enumerated subject used
-  to be reached by name and destroyed — F-062 mechanism 1 — and is now spared, which
-  removes the loss and leaves this direction.); (2) the orphan sweep runs under no
-  teardown claim and infers liveness from this broker's residents plus persisted records
-  only, so a live remote generation whose record is absent is invisible and its hold is
-  condemned — including when a bridge-authored teardown was what deleted that record. A
-  fix must answer both, not only the silent-Keep-Alive-0 case, and should stage the
-  post-enumeration ordering explicitly. **`RWID` may be the predicate this needs.** The
-  retirement watermark's `RWID` is now the only durable statement of *"this specific
-  record was retired"* — record-absence is ambiguous, and the generation test needs a
-  surviving record to compare, whereas `ackWID == RWID` is positive proof that does not
-  wait for client traffic. That is an unwritten design, not a promise. **If this item
-  turns out NOT to need it, and neither does "give a vanished record its own disposal
-  vocabulary" below, then whoever closes the LATER of the two should CONSIDER removing
-  `RWID`** — the field, its validator row, and the valid arm of the record-absent create
-  re-pointed at the session-interval register identity, which can serve it. The
-  consideration is what is prescribed, not the removal. **Updated by the write-lineage
-  audit**: the create's valid arm no longer reads `RWID` at all, and the
-  session-interval register that sentence offered as the alternative no longer exists,
-  so the field now has **no reader** — this item and the vanished-record one are the
-  only candidates left. The default is still to keep it until the evidence is in:
-  deleting one unread field is small, and re-adding a required field to a permanent
-  record is not.
+  ownership](findings/ha-arbitration.md#f-036). **Alpha blocker. ATTEMPTED BY CONSTRUCTION
+  AND STOPPED UNRESOLVED 2026-08-27**, after three plan-review rounds and two scope
+  consults. **No implementation code was written**: the only working-tree changes the attempt
+  produced are this documentation filing and the `RWID` comment correction it propagates.
+  Slice A above converges every MOVED record, bound sessions included. What is left is
+  three enforcement sites of one causal defect — *the previous owner keeps serving, or is
+  misread as gone, after durable ownership moved*: (1) the DELETED record on a BOUND
+  session, where arming the ownership marker hands the case to the record-rejection
+  settlement, whose unbound half refuses while a client is attached and whose bound half
+  runs pre-dispatch on that connection's own readLoop, so a client that negotiated Keep
+  Alive 0 and then goes silent still holds a session another broker tore down; (2)
+  `arbitrateQoS2ReleaseClaims` enumerating hold subjects ONCE, so a peer that has not
+  observed the ownership marker delivers onward after the session was discarded — widened
+  rather than narrowed by F-062's landed cutoff, which also spares an enumerated hold
+  above the watermark; (3) the orphan sweep inferring liveness from this broker's
+  residents plus persisted records only, so a live remote generation whose record is
+  absent has its state condemned. A fix must answer all three; the attempt's scope consult
+  ruled that restating the widened manifestations as residuals cannot close an alpha blocker.
+  **What the attempt ESTABLISHED, so none of it is re-derived.** *The site-1 licence is
+  found and it is sound*: a valid retirement watermark whose `MarkerSeq > sess.seq`, plus
+  the record absent, plus a full in-fence revalidation, positively proves a teardown marker
+  landed on this client's record subject after the record this broker is acknowledged for
+  — because a claim marker is a CAS against the sequence the claiming party believed current,
+  a failed `recordGenRetirement` aborts before any deletion and leaves the record MARKED,
+  a landed local write moves `sess.seq` while an ambiguous one arms `seqUncertain`, and
+  apply-time watermark regression can only cause a false NEGATIVE. It survived three separate
+  attempts to break it, including a session RESTORED at CONNECT (authorship of the base is
+  irrelevant) and `finishAdoptedTeardown`'s transient session (never in `as.sessions`). *No
+  new durable state is needed for it.* **`RWID` is NOT the predicate this finding needs, and
+  that is now disproven rather than untried**: the watermark is one slot per client and
+  `recordGenRetirement` treats any standing higher `MarkerSeq` as sufficient, so requiring
+  `Gen`/`RWID` equality recreates exactly the superseded-watermark false negative the licence
+  exists to close — after two teardowns the original silent bound session could never be
+  proven displaced. The disproof is propagated as a
+  PROPERTY rather than as a site list, because four review rounds each found one more
+  instance of the list and that made the enumeration itself the defect. The property, and
+  note that it is NOT scoped to sites mentioning F-036 — an earlier draft was, and that is
+  exactly how it missed one: **every site that speaks to `RWID`'s RETENTION, its READERS or
+  its REMOVAL must agree that the field has no production reader, that the vanished-record
+  bullet alone decides whether it gains one, and that F-036 is not a candidate.** The close
+  set is therefore all `RWID`/`rwid` guidance across `*.md` and `*.go`, test files included,
+  whether or not F-036 is named — no count is given, because a count is the part that goes
+  stale. Res judicata, so the next reader does not re-run the sweep: a site that merely
+  states F-036's false-absence PREMISE, or calls the ownership fact it needs "F-036's
+  predicate" WITHOUT naming `RWID`, and a site that merely ASSERTS the field serializes or
+  replicates, are all deliberately untouched and still true — a test asserting a field
+  travels is not a statement about whether it should exist. The field therefore still has
+  NO reader, and the "consider removing
+  `RWID`" prescription stays live and passes wholly to the vanished-record item below. *The
+  gate-safety question this bullet used to pose is answered*: `docs/ARCHITECTURE.md`'s refusal
+  to claim the shared client-ID gate for a bound session is about the rejection PROBE's absent
+  verdict, not about the lock — the periodic pass's own ambiguous-write arm already claims
+  it as the bound client — and SUBSCRIBE's and UNSUBSCRIBE's gates are both taken at entry,
+  before any subscription effect or membership mutation, so a disposal that wins the gate
+  costs a connection it was about to close anyway. *For site 2, only the PLACEMENT and TWO
+  of the four outcomes are established; two are OPEN, and two successive review rounds
+  each caught this bullet claiming more than that.* Settled: read the
+  generation-retirement proof AFTER the release claim is acquired and BEFORE the onward
+  fan-out, the point past which the store cannot be taken back; a watermark naming THIS
+  generation refuses the fan-out, releases the hold nonterminally and answers PUBREL
+  **0x92**, which is what the durable claim already answers when the discard is on another
+  broker, and it is sound because a valid watermark naming the generation is POSITIVE
+  evidence; and an UNREADABLE or indeterminate watermark **fails the release** and sends
+  no PUBCOMP, because the surrounding PUBREL contract already suppresses PUBCOMP for an
+  unresolved proof and the hold verification's own indeterminate arm fails rather than
+  delivers. Those two refusals are wire-distinguishable — 0x92 with the hold released
+  versus no PUBCOMP at all — which is what makes them separately testable. **OPEN 1: "no
+  watermark" is NOT proof, and an earlier draft of this bullet wrongly said it was** on
+  the grounds that nothing deletes a watermark. Per-record permanence does not survive
+  stream recreation: `$MQTT_teardown` recreated ALONE stamps the current epoch, validates
+  clean and **admits empty**, which `docs/CONFORMANCE.md` already states loses every open
+  fence. So retire G1, recreate that stream alone, and a stale broker releasing G1's
+  surviving hold reads "no watermark" and performs the very post-discard fan-out site 2
+  exists to prevent. This arm must either be conditioned on an intact teardown-stream
+  incarnation — carrying that partial-recreation residual into this finding — or require
+  some other durable proof; a retirement → recreation → stale-PUBREL fixture is owed
+  either way. **OPEN 2: the DIFFERENT-generation outcome, and the reason it is open is NOT
+  that historical per-generation state is necessary** — a draft of this bullet claimed
+  that too, and it is unproven. Proceeding on a bare generation mismatch is certainly
+  wrong, because the slot is replaced by increasing `MarkerSeq` alone: retire G1, then
+  create and retire G2, and the slot names G2 while a broker still serving G1 reads
+  "different generation" and fans out. But the watermark also carries `MarkerSeq`, and this
+  same attempt established `MarkerSeq > sess.seq` as positive proof that the record subject
+  advanced — and a PUBREL is bound to `c.mqtt.sess`, with its hold subject derived from that
+  incarnation. So the unexplored direction is a **two-dimensional** classification, the
+  generation relation crossed with `MarkerSeq` against a fully revalidated `sess.seq`, and
+  it must be proved or refuted before anyone concludes historical storage is required. The
+  loss example a draft gave here — "a live generation whose client merely had a LATER
+  generation retired" — is **backwards** for that classifier and is withdrawn. What the two
+  settled outcomes DO catch is both populations this manifestation names, the
+  never-enumerated hold and the one spared above F-062's cutoff, whenever the standing
+  watermark still names the hold's own generation; and they promise NOTHING about a fence
+  landing after the read, which is the pre-existing post-claim residual and stays. Cost: one
+  watermark read per QoS 2 PUBREL release, on a path that already performs a claim CAS, an
+  onward store and a delete. **The no-cache rule applies to the NEGATIVE outcomes only** —
+  absent, unreadable/indeterminate, and different-generation — because each can be
+  invalidated by a retirement landing afterwards, and there a finite window never arbitrates
+  ownership. A draft of this bullet prohibited caching outright; that over-applied the
+  principle. A VALID MATCHING-generation observation is positive and monotone: once a
+  generation is retired it never becomes rightful again, single-slot replacement can erase
+  discoverability but not the fact, and the CONNECT reader already treats any valid matching
+  `Gen` as retired. So that result may be memoized per client and session generation, with
+  eviction merely falling back to another read. *The
+  destructive-decision census is complete*: ten decisions, six keyed by the SESSION
+  generation (the hold discard, the hold purge and the release-claim delete in
+  `reconcileOneInboundQoS2`; the absent-reference register delete; and both the absent and
+  different-generation arms of the PUBREL consumer delete) and four keyed by the AFFINE
+  generation (`discardAbsentWinnerClaim`, `deleteOrphanQ2AffConsumers`' step-2 `Discarded`
+  transitions and its step-6 consumer delete, and `materializeQ2AffOnBehalf`'s combined
+  absent-or-different-generation arm) — together with the decisions deliberately EXCLUDED
+  and the positive fact discharging each (`settleRetiredAffineRegister` and the
+  live-reference reaps act on source state, a pair proven by source, a terminal claim, or
+  a positively identified superseded copy). **What BLOCKS the affine half, and it is
+  structural.** The retirement watermark records only the SESSION generation:
+  `mqttTeardownTarget` carries both `gen` and `q2AffGen` but `recordGenRetirement` writes
+  `Gen: t.gen` alone, and `refs.hasInbound(idHash, ps.Gen)` versus `refs.hasAffine(idHash,
+  ps.Q2AffGen)` are genuinely different keys. So no retirement proof can license the four
+  affine decisions, and **recording `Q2AffGen` in the watermark is refused**: it is a new
+  persisted field, and a latest-only field would prove only the currently recorded affine
+  retirement anyway.
+  **Three designs REFUTED during the attempt, so they are not tried again.** *"A retired
+  affine generation's claims are already terminal, so the absent arms are only reachable
+  where nothing proves death"* — false: teardown's `discardQ2AffClaimsFor` is a stream scan
+  plus per-claim CAS and installs NO fence against future claim creation, so a broker still
+  serving the affine generation can create a fresh nonterminal claim afterwards through the
+  ordinary create-only path. *Keeping `materializeQ2AffOnBehalf`'s arm as a named exception
+  to the invariant* — rejected: absence plus possession of the payload still does not prove
+  the session ended, writing `Discarded` can withdraw an already-materialized copy from a
+  previous owner still serving, and an invariant with an exception is not one. Its correct
+  disposition is to RETAIN — write nothing, ack nothing, return false so `moveStartedSharedQoS2`
+  leaves the move deferred and AckWait re-offers it — which is worse only in AVAILABILITY,
+  and whose residual is an **unbounded redelivery stall** that can consume the group's
+  `MaxAckPending`; `MaxDeliver` cannot bound it, because the shared-group validator REQUIRES
+  the server-normalized `-1`. Acking without a terminal fact is refused too: it would regress
+  F-063's closed `sourceAckAuthorized` guarantee. *"Step 6's consumer delete falls out of
+  step 2, so one gate suffices"* — false, and this is what stopped the attempt:
+  `mqttQ2AffGenerationSettled` returns true for an EMPTY inventory and for a generation whose
+  claims are all `Discarded` or `Lost`, so with no transition written it still succeeds
+  vacuously and the consumer is deleted with no positive fact — in three cases, including
+  a nonterminal claim created after the verification scan.
+  **What is OWED before this is attempted again**, and it is mechanism plus test
+  infrastructure rather than another classifier revision: (a) a positive authorization for
+  the step-6 affine consumer delete that is INDEPENDENT of step 2, or the outright removal
+  of its destructive arm — plus a definition of "independently terminal" that covers `AffineDone`,
+  which the two earlier terminal arms do not; (b) a valid abnormal-exit construction for the
+  bound disposal — deferred WRAPPERS reading mutable variables, as `mqttProcessConnect`
+  already does, because a `defer` of a variable captures its value at the `defer`
+  statement — together with a take-and-clear before invocation rather than after, since
+  clearing after the Will action cannot prevent a second application when it panics; (c) a
+  **pre-disposal** identity-change seam, because `applied == false` is decided inside the
+  disposal before it returns and no post-disposal hook can reach it; (d) a controllable
+  between-read seam, so removing the in-fence proof re-run is mutation-provable; and (e)
+  gate- and phase-reach assertions, without which removing the off-gate absence check, the
+  separately listed in-fence checks, the gate-held precondition on the Will, and the defer
+  ORDER are all masked by checks that refuse anyway. The lane is `~/.claude/lanes/f-036/`:
+  it holds plan revision 3, the review ledger with every round's findings classified new/repeat/
+  caused-by-last-fix, both consults, and all three round results verbatim. Revisions 1 and
+  2 were overwritten in place and survive only in the round prompts and results beside them,
+  which is why every durable conclusion is filed HERE rather than left there.
+  **Scope was confirmed to be ONE executable item** throughout, so this is not a candidate
+  for splitting. Two earlier manifestations of this finding remain as stated: the
+  post-enumeration serving direction and the sweep's false-absence inference, both widened
+  into it by F-032's audit, plus F-033's affine-consumer adoption blind spot and F-034's
+  live-owner register contention.
 
   - [ ] Make ephemeral-consumer cleanup guaranteed rather than
   best-effort. A failed manager initialization now rolls back both per-broker ephemeral
@@ -1645,13 +1766,29 @@ further findings it surfaced are filed separately, for the reason its own bullet
   item is now a REFINEMENT of that `0x89` waypoint rather than a correction of a false
   claim, and its ceiling is fixed: `RWID` proves a RETIREMENT CAUSE, not a successor, so
   this item may **never** restore 0x8E or takeover-style Will discard. **Small.** A
-  vocabulary value, not a new verdict. **This is
-  the second of the two items that decide `RWID`'s future**, and for the same reason:
-  telling an expiry-driven vanishing apart from a takeover needs positive evidence that
-  THIS record was retired, which is what `RWID` states. If neither this item nor F-036
-  above needs that predicate, whoever closes the later of the two should **CONSIDER
-  removing `RWID`** — see the note on F-036 for what that involves and why the default
-  until then is to keep it.
+  vocabulary value, not a new verdict. **This is now the
+  ONLY remaining item that could give `RWID` a reader**, and for the same reason: telling
+  an expiry-driven vanishing apart from a takeover needs positive evidence that THIS
+  record was retired, which is what `RWID` states. **F-036 no longer competes for it** — its
+  2026-08-27 attempt DISPROVED `RWID` as its predicate, because the watermark is one slot
+  per client and requiring `Gen`/`RWID` equality recreates the superseded-watermark false
+  negative that attempt existed to close; the licence it found is `MarkerSeq`-only. So if
+  this item turns out not to need the predicate either, **whoever closes it should CONSIDER
+  removing `RWID`**. The removal set is compile-complete and larger than "the field and its
+  validator row", which an earlier draft of this prescription claimed: the struct field on
+  `mqttGenRetirement`; the validator's non-empty check; **the writer's `RWID: retiredWID`
+  initializer**, without which the tree does not compile; the now-dead `retiredWID`
+  parameter of `recordGenRetirement` and its threading from BOTH callers — `clear()`'s
+  `retiringWID`, captured before its reset, and `finishAdoptedTeardown`'s `ps.PWID`; the
+  persisted-identity census entry; and the `RWID`-specific assertions and comments in the
+  retirement, write-lineage-audit, fork-lineage and cluster fixtures. **What must be KEPT
+  is the record-absent create's own watermark read**: it is not an `RWID` reader at all —
+  it refuses a create over a watermark this broker cannot READ AT ALL — and deleting it would
+  admit a session whose later teardown could never record a retirement, leaving the record
+  MARKED for every future finisher. An earlier draft listed that arm as part of the removal;
+  that step was wrong and is deleted rather than reworded. The default until then is still
+  to keep the field: deleting one unread field is small, and re-adding a required field to
+  a permanent record is not.
 
 ### 0.3 Confirmed alpha blockers
 
@@ -2131,6 +2268,22 @@ finding with acceptance criteria.
   native test can stand it up; if it can, the test is release verification. Include
   TTL expiry and any F-059 delete marker through the source: source/mirror marker and
   TTL behavior differs, so the unsourced test is not a substitute.
+
+- [ ] [F-070: Establish the affine contender fixture's rival-create premise rather than
+  racing it](findings/release-investigations.md#f-070). **Test-harness race.** Filed with
+  the mechanism PROVEN and the attribution SETTLED against a baseline on 2026-08-22, but never
+  given an authoritative checkbox here, so it was invisible to the roadmap's own todo.
+  `TestQ2AffRacingAbsenceConverge/the_relookup_finds_it_absent_again` installs a create hook
+  that stages a RIVAL consumer under the same durable name with `MemoryStorage` inverted;
+  JetStream treats `CONSUMER.CREATE` against an existing durable as an update and refuses
+  a change to an immutable field, so the staging succeeds only while that durable does not
+  yet exist. The fixture assumes it wins that race and does not establish it, and under
+  load it loses. **The assertions the test makes are correct** — this is a fixture
+  premise, not broker behaviour, which is why it is release verification rather than a
+  blocker. F-084's soak re-measured it independently on 2026-08-27 at 4/10 failures on a
+  clean `HEAD` worktree against 1/10 on its own tree, i.e. the flake is pre-existing and load-sensitive
+  rather than attributable to any change; that measurement is further evidence for the same
+  rival-create signature, not a second finding.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 

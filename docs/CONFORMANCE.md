@@ -2216,8 +2216,10 @@ the CONNECT restore, which discards a retired record instead of resuming it holl
 the orphan sweep, which condemns one with no CONNECT at all. A FOURTH was deleted by the
 write-lineage audit: the record-absent create, which inherited the retired record's
 identity as its own parent (F-029b). Its `RWID` field is retained with no reader, because
-what it states — which record a retirement attributes its deletion to — is what F-036 and
-the vanished-record vocabulary may need. Nothing ever reaps a watermark. See
+what it states — which record a retirement attributes its deletion to — is what the
+vanished-record vocabulary may need. **F-036 no longer may**: its 2026-08-27 attempt
+disproved the predicate, since a one-slot-per-client watermark makes `ackWID == rwid`
+recreate the superseded-watermark false negative. Nothing ever reaps a watermark. See
 `docs/ARCHITECTURE.md`, "The generation-retirement watermark".
 
 What the repair is, exactly: **truthful termination, never restoration.** The deleted

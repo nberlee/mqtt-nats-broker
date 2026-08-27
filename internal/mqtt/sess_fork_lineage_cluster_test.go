@@ -250,8 +250,12 @@ func TestMQTTForkedRecordRepairOnAReplicatedStream(t *testing.T) {
 // The single-stream tests prove the fields serialize. This one proves the fact TRAVELS
 // through Raft: the watermark one broker's teardown wrote, naming the record it removed,
 // is readable by ANOTHER broker — the two never share memory, so nothing but
-// $MQTT_teardown can carry that identity between them. RWID is retained on exactly this
-// basis, and it is now the ONLY cross-broker consumer of the fact.
+// $MQTT_teardown can carry that identity between them. This test is the only CROSS-BROKER
+// assertion of the fact — but it is an assertion, not a production reader, and a test
+// asserting that a field serializes is not a reason to keep the field. RWID has NO
+// production reader; what decides whether it gains one is docs/ROADMAP.md's
+// vanished-record bullet, alone (F-036 was the other candidate and its 2026-08-27 attempt
+// disproved the predicate).
 //
 // The second half is the reader that was REMOVED: broker B's create no longer draws a
 // parent from the watermark it can plainly read, which is what makes a parentless create

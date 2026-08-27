@@ -333,8 +333,11 @@ func TestMQTTAuthoredForkStillClassifies(t *testing.T) {
 
 // TestMQTTRetirementNamesTheRecordThatActuallyStood is the RWID obligation, which is
 // RETAINED: no create reads it any more, but it remains the fact the watermark
-// attributes a retirement to, pinned until F-036 and the vanished-record vocabulary
-// decide whether it keeps a reader.
+// attributes a retirement to, pinned until the VANISHED-RECORD VOCABULARY item decides
+// whether it keeps a reader. F-036 was the other candidate and is no longer one — its
+// 2026-08-27 attempt disproved the predicate, because a one-slot-per-client watermark
+// makes an ackWID == RWID conjunct recreate the superseded-watermark false negative that
+// fix exists to close.
 //
 // Two things make this discriminating where the existing assertion in
 // sess_retirement_test.go is not.

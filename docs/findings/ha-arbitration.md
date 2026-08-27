@@ -235,13 +235,16 @@ its effective-lifetime branch, the parked discard, and the generation-blind clas
 What survives on the record is `rwid`, the only durable statement of *"this specific
 record was retired"* — now with **no reader at all**, since the create's valid arm no
 longer consults it and the register that was once offered as its replacement does not
-exist. It is retained because F-036's remaining shape plausibly needs exactly that
-predicate: a bound, silent Keep Alive 0 client whose record another broker deleted needs
-a disposal that does not wait for client traffic, and record-absence is ambiguous where
-`ackWID == rwid` is positive proof. **If neither F-036 nor "give a vanished record its own
-disposal vocabulary" needs it, whoever closes the later of the two should CONSIDER
-removing `rwid`.** Both roadmap bullets carry the note; the consideration is what is
-prescribed, not the removal.
+exist. It used to be retained because F-036's remaining shape plausibly needed exactly
+that predicate. **That is now DISPROVEN.** F-036's 2026-08-27 attempt established that the
+watermark holds ONE SLOT per client and that `recordGenRetirement` treats any standing
+higher `MarkerSeq` as sufficient, so requiring `ackWID == rwid` recreates the
+superseded-watermark false negative the fix exists to close: after two teardowns for one
+client ID the original silent bound session could never be proven displaced. The licence
+that attempt found is `MarkerSeq`-only and consults neither `Gen` nor `rwid`. So the field
+is retained for **"give a vanished record its own disposal vocabulary" alone**, and
+**whoever closes that item should CONSIDER removing `rwid`** if it turns out not to need
+the predicate either. The consideration is what is prescribed, not the removal.
 
 The bounds that held for the false-fork routes still hold for what remains: no false
 verdict can resurrect state, because the anchor's generation conjunct drops any capsule
@@ -894,18 +897,40 @@ distinguishes a census from a sample in kind rather than in length.
 
 **Title:** Revalidate ownership for otherwise quiet resident sessions
 
-- Status: Open — NARROWED, not resolved. Slice A landed on 2026-08-11 (the
-  session-record watch plus its committed-read backstop,
-  `internal/mqtt/sess_record_watch.go`; `docs/ARCHITECTURE.md`, "The session-record
-  watch"): ownership changes only by a record write, so the watch observes every one
-  of them, a quiet session still costs no write per interval, and every MOVED record
-  now converges — bound sessions included, through the eviction worker itself. What
-  remains is the DELETED record on a BOUND session: the backstop arms the ownership
-  marker, and the record-rejection settlement that answers it is packet-driven for a
-  bound connection, so a Keep Alive 0 client that goes silent still holds a session
-  whose record was durably deleted. (Deleted by a teardown, which is what the deletion
-  shows; it does not name the broker that ran it, and nothing here needs it to — F-084.)
-  That is this finding's own failure shape, so the finding
+- Status: Open — NARROWED, not resolved, and **ATTEMPTED BY CONSTRUCTION AND STOPPED
+  UNRESOLVED on 2026-08-27** after three plan-review rounds and two scope consults, with no
+  code written. The attempt found and verified the site-1 licence — a valid retirement
+  watermark whose `MarkerSeq > sess.seq`, plus record absence, plus a full in-fence
+  revalidation — and **disproved `RWID` as this finding's predicate**, because the watermark
+  is one slot per client so requiring `Gen`/`RWID` equality recreates the
+  superseded-watermark false negative the licence exists to close. It also established that
+  the watermark records only the SESSION generation, so no retirement proof can license the
+  four AFFINE-generation destructive decisions, and that recording `Q2AffGen` is refused
+  as a new persisted field. **Site 2 is only PARTLY established, and two review
+  rounds each caught the roadmap bullet overstating it.** Settled: the proof's placement,
+  the matching-generation refusal, and the unreadable-watermark fail-closed. OPEN: the
+  no-watermark arm, because `$MQTT_teardown` recreated alone admits EMPTY and loses every
+  open fence, so absence is not proof; and the different-generation arm, where proceeding
+  on a bare generation mismatch is wrong but the unexplored direction is a two-dimensional
+  classifier crossing the generation relation with `MarkerSeq` against a fully revalidated
+  `sess.seq` — so it is NOT established that historical per-generation state is required.
+  What stopped it: `mqttQ2AffGenerationSettled` returns true for an empty inventory and
+  for an all-`Discarded`/`Lost` generation, so the affine consumer delete cannot be
+  authorized by suppressing the `Discarded` transitions that precede it, and needs a
+  positive authorization of its own or the removal of its destructive arm. The complete
+  ten-decision census, the refuted designs and the mechanism-plus-test-infrastructure list
+  that is owed are in this finding's `docs/ROADMAP.md` bullet; the working lane is
+  `~/.claude/lanes/f-036/`. Slice A landed on 2026-08-11 (the session-record watch plus
+  its committed-read backstop, `internal/mqtt/sess_record_watch.go`;
+  `docs/ARCHITECTURE.md`, "The session-record watch"): ownership changes only by a record
+  write, so the watch observes every one of them, a quiet session still costs no write per
+  interval, and every MOVED record now converges — bound sessions included, through the
+  eviction worker itself. What remains is the DELETED record on a BOUND session: the
+  backstop arms the ownership marker, and the record-rejection settlement that answers it
+  is packet-driven for a bound connection, so a Keep Alive 0 client that goes silent still
+  holds a session whose record was durably deleted. (Deleted by a teardown, which is what
+  the deletion shows; it does not name the broker that ran it, and nothing here needs it
+  to — F-084.) That is this finding's own failure shape, so the finding
   stays open until a bound-session disposal exists that does not wait for client
   traffic. Residuals in `docs/CONFORMANCE.md`.
 

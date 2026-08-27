@@ -1305,8 +1305,11 @@ nothing** already: a create had a parent POINTER and no parent CONTENT, so
 
 `RWID` survives the deletion with no reader (see "The generation-retirement watermark"):
 what it states is which record a retirement attributes its deletion to, and
-`docs/ROADMAP.md`'s F-036 and vanished-record bullets are the items that decide whether
-that fact gains a reader again.
+`docs/ROADMAP.md`'s vanished-record bullet is now the ONLY item that decides whether that
+fact gains a reader again. **F-036 no longer competes for it**: its 2026-08-27 attempt
+disproved the predicate, because the watermark holds one slot per client, so requiring
+`ackWID == rwid` recreates the superseded-watermark false negative that attempt existed to
+close. The licence it found is `MarkerSeq`-only.
 
 **`$MQTT_origin` is REFUSED, not merely unused.** An account still holding the register is
 an unsupported persisted shape under "Compatibility boundary", so a lookup-only preflight
@@ -4705,8 +4708,9 @@ never the marker that claimed it — and it is REQUIRED: a watermark without it 
 to every reader, because a retirement that cannot say which record it removed attributes
 that deletion to nothing. It has **no consumer today**; the create that inherited it as a
 parent was deleted by the write-lineage audit (see "Recognising a forked session record"),
-and the field is retained because `docs/ROADMAP.md`'s F-036 and vanished-record bullets
-are the items that decide whether it gains a reader again. It cannot be optional and
+and the field is retained because `docs/ROADMAP.md`'s vanished-record bullet is the one
+item left that decides whether it gains a reader again — F-036 disproved it as a predicate
+on 2026-08-27, so that bullet decides alone. It cannot be optional and
 cannot be filled in later: the validator cannot tell "field absent" from "field present
 and empty", so accepting an empty one would accept the pre-`rwid` shape the compatibility
 boundary refuses. By the same rule, a teardown of a record carrying no `WID` **fails closed**
