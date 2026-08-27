@@ -11,8 +11,12 @@ import (
 )
 
 // End-to-end cover for a BOUND session's record-CAS settlement: real sockets, a real
-// CONNECT, a real remote takeover of the session record, and a real client left publishing
-// into a session another broker owns.
+// CONNECT, a real remote WRITE to the session record, and a real client left publishing
+// into a session whose record is no longer this broker's to write.
+//
+// "Takeover" is not the word for it. The fixture knows a peer wrote the record; the broker
+// under test knows only that its CAS was rejected and the content is not its own, which
+// licenses eviction and the ownership-unsettled 0x89, never a takeover claim (F-084).
 //
 // Two prerequisites make it the production shape rather than a seam. The record must be
 // moved by ANOTHER account session manager over the same JetStream — the cross-broker
@@ -22,8 +26,8 @@ import (
 
 // testBoundE2EMoveRecord restores the same client ID through a second account session
 // manager sharing this server's NATS connection, and persists it. That is what moves the
-// $MQTT_sess subject out from under the local session, exactly as another broker taking the
-// session over would.
+// $MQTT_sess subject out from under the local session, exactly as any peer write to that
+// subject would.
 func testBoundE2EMoveRecord(t *testing.T, s *Server, node, clientID string) {
 	t.Helper()
 	peer := &Server{nrc: s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}
@@ -51,7 +55,10 @@ func testBoundE2EMoveRecord(t *testing.T, s *Server, node, clientID string) {
 // TestMQTTBoundRejectionE2EForeignClosesConnection is the roadmap item's own scenario over
 // real connections: a live client whose session record has moved to another broker, with
 // the persist notification lost, must be told and closed BEFORE its next packet takes
-// effect — [MQTT-3.1.4-3] — and its Will must go the way a takeover's does.
+// effect — [MQTT-3.1.4-3]. Its Will is PUBLISHED: the probe found a record that is not ours
+// and identified no successor, and only a displacement this broker holds both ends of may
+// suppress a Will (F-084). This contract used to read "its Will must go the way a
+// takeover's does", which was the defect.
 func TestMQTTBoundRejectionE2EForeignClosesConnection(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -117,27 +124,34 @@ func TestMQTTBoundRejectionE2EForeignClosesConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the DISCONNECT reason: %v", err)
 	}
-	if reason != mqttReasonSessionTakenOver {
-		t.Fatalf("expected 0x8E session taken over, got %x", reason)
+	// 0x89 ownership-unsettled: the bound settlement's probe found a record that is not
+	// ours, which establishes that this session may no longer be written and nothing about
+	// who holds it. F-084.
+	if reason != mqttReasonServerBusy {
+		t.Fatalf("expected 0x89 ownership unsettled, got %x", reason)
 	}
 
-	// Nothing follows the 0x8E — a served PUBLISH would have been acked BEFORE it, which
-	// the packet-type assertion above already caught — and the socket really closes.
+	// Nothing follows the DISCONNECT on THIS socket — a served PUBLISH would have been
+	// acked BEFORE it, which the packet-type assertion above already caught — and the
+	// socket really closes.
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var buf [64]byte
 	n, rerr := c.Read(buf[:])
 	if n > 0 {
-		t.Fatalf("nothing may follow the takeover DISCONNECT: got %x", buf[:n])
+		t.Fatalf("nothing may follow the displacement DISCONNECT: got %x", buf[:n])
 	}
 	var nerr net.Error
 	if rerr == nil || (errors.As(rerr, &nerr) && nerr.Timeout()) {
-		t.Fatalf("the connection must be CLOSED after the 0x8E, not merely idle: %v", rerr)
+		t.Fatalf("the connection must be CLOSED after the DISCONNECT, not merely idle: %v", rerr)
 	}
 
-	// The Will goes the way a local takeover's does: this connection was displaced, and a
-	// displacement is not a Will publication trigger. The window covers the teardown that
-	// follows the close; the sentinel afterwards proves the watcher would have seen one.
-	testMQTTExpectNothingFor(t, wr, 500*time.Millisecond)
-	testMQTTPublish(t, wc, wr, 0, false, false, "bounde2e/will", 0, []byte("sentinel"))
-	testMQTTCheckPubMsg(t, wc, wr, "bounde2e/will", 0, []byte("sentinel"))
+	// The Will IS PUBLISHED, and this is F-084's correction rather than a relaxed
+	// assertion. This connection was displaced by a RECORD probe, which establishes that
+	// the session is no longer ours and NOT that anybody took it over — and only a
+	// demonstrated takeover owns a Will's fate. Suppressing it here was silent loss on
+	// evidence that established nothing.
+	//
+	// Asserted on the payload, so a broker that merely stopped discarding without
+	// publishing cannot pass.
+	testMQTTCheckPubMsg(t, wc, wr, "bounde2e/will", 0, []byte("bye"))
 }

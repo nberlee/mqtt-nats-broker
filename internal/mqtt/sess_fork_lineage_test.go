@@ -48,7 +48,7 @@ func TestSessLineageRuleArms(t *testing.T) {
 		// The one shape the rule exists for: same parent, different identity.
 		{"claims our parent", testLineageRecord(ourGen, "b", "p"), mqttLineageForked},
 
-		// 5c: a CHILD of our acknowledged record is a legitimate successor and a lost
+		// 5c: a CHILD of our acknowledged record CLAIMS descent from it — a lost
 		// race, not a fork. It must not become forked now that the sibling arm is
 		// defined against the acknowledged pair.
 		{"child of the acknowledged record", testLineageRecord(ourGen, "d", "a"), mqttLineageNotForked},
@@ -388,10 +388,14 @@ func testLandSibling(t *testing.T, e *testInflightEnv, mutate func(*mqttPersiste
 	return &sibling
 }
 
-// testLandSuccessor is testLandSibling's counterpart: a record that is a legitimate CHILD
-// of our acknowledged one. Every forked test has a paired successor test, because a change
-// that reported forked for any moved record would pass the first and fail this.
-func testLandSuccessor(t *testing.T, e *testInflightEnv, mutate func(*mqttPersistedSession)) *mqttPersistedSession {
+// testLandChildRecord is testLandSibling's counterpart: a record that is CHILD-SHAPED
+// against our acknowledged one, because whoever wrote it read ours first. Every forked test
+// has a paired child-shaped test, because a change that reported forked for any moved
+// record would pass the first and fail this.
+//
+// It is named for the SHAPE and not for a successor: child-shaped is a lineage fact, and
+// F-084 is the rule that no lineage fact licenses a claim about who holds the session.
+func testLandChildRecord(t *testing.T, e *testInflightEnv, mutate func(*mqttPersistedSession)) *mqttPersistedSession {
 	t.Helper()
 	e.sess.mu.Lock()
 	child := e.sess.buildPersistedSessionLocked()
@@ -405,7 +409,7 @@ func testLandSuccessor(t *testing.T, e *testInflightEnv, mutate func(*mqttPersis
 	}
 	body, _ := json.Marshal(&child)
 	if _, err := e.sess.jsa.storeSessionMsg(domainTk, idHash, 0, body); err != nil {
-		t.Fatalf("land the successor record: %v", err)
+		t.Fatalf("land the child-shaped record: %v", err)
 	}
 	return &child
 }

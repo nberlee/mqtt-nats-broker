@@ -2554,8 +2554,9 @@ func TestMQTTv5SessionTakenOverDisconnect(t *testing.T) {
 // first packet a client sees [MQTT-3.2.0-1], and mqttAbortAcceptedConnect leaves a refused
 // connection bound until its readLoop detaches it, so the takeover branch can find one.
 //
-// This is the CONNECT-takeover route's half of the gate every displacement path now shares
-// (mqttNotifyTakenOver); the persist, resolver and settlement routes are covered in
+// This is the CONNECT-takeover route's half of the CONNACK gate every displacement path
+// shares (mqttNotifyDisplaced — the takeover-CLAIMING tail above it is this route's alone
+// since F-084); the persist, resolver and settlement routes are covered in
 // disconnect_claim_test.go. Forcing connAckWritten false is targeted state injection — the
 // second CONNECT still runs the real mqttProcessConnect displacement branch — and the test
 // makes no claim about how such a connection arises. Its positive twin is the test above,
@@ -5941,8 +5942,8 @@ func TestMQTTv5SessionExpiryPersistedAcrossRestart(t *testing.T) {
 }
 
 // A stale remote session-persist ack (an older stream sequence than the local
-// session's) must not cancel the local expiry timer; a newer one is a takeover
-// and must.
+// session's) must not cancel the local expiry timer; a newer one means the subject moved
+// past our base and must.
 func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -5995,8 +5996,8 @@ func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
 		t.Fatal("expected the pending expiry to survive a stale persist ack")
 	}
 
-	// Newer ack: a remote takeover. The eviction now runs on a classifying
-	// worker, so a GENUINE successor record is planted above the session's
+	// Newer ack: the subject moved past our base. The eviction now runs on a classifying
+	// worker, so a CHILD-SHAPED record is planted above the session's
 	// acknowledged sequence before its observation is delivered — the old
 	// synthetic seq+1 with no record behind it would make the worker load the
 	// session's own record and correctly refuse on equality. The completion
@@ -6017,7 +6018,7 @@ func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
 	select {
 	case applied := <-done:
 		if !applied {
-			t.Fatal("expected the worker to evict on a demonstrated takeover")
+			t.Fatal("expected the worker to evict on a record that moved past our base")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the eviction worker never completed")

@@ -362,7 +362,7 @@ var censusInterpreters = map[string]string{
 	"expireSession":                 "expires a session; a higher record sequence is not read as a remote owner while this broker's own write is unresolved",
 	"loadExpiringSessionRecord":     "reads a record for the expiry decision, inside one transaction spanning the load, the sequence read and the decision",
 	"sweepSessionExpiries":          "the periodic expiry pass; skips never-expire records outright",
-	"reconcileRemoteSessionExpiry":  "reconciles an expiry another broker owns",
+	"reconcileRemoteSessionExpiry":  "reconciles the expiry deadline carried by a record this broker does not own",
 	"reconcileResidentOwnership":    "the committed-read backstop: feeds the eviction trigger when a record MOVED, arms the marker when it is GONE, and re-fires a trigger a refusal left undecided",
 	"evictDisplacedOnRemotePersist": "evicts a displaced resident on a peer's landed write, with a digest arm so this broker's OWN ambiguous landing cannot evict the rightful client",
 	"buildSessionRefs":              "builds the liveness view the orphan sweep uses: this broker's residents plus persisted records ONLY, which is F-036's recorded premise",

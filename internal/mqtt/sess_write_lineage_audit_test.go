@@ -3,8 +3,9 @@
 // no longer defined.
 //
 // The pairing across this file is deliberate and is the discrimination the whole change
-// rests on. "Takeover" is the DEFAULT verdict, so a test that only asserts a create
-// concedes would pass equally against a classifier that had been deleted or bypassed
+// rests on. CONCEDING is the DEFAULT verdict — ownership-unsettled since F-084, the
+// takeover vocabulary before it — so a test that only asserts a create concedes would pass
+// equally against a classifier that had been deleted or bypassed
 // (feedback_mutation_checks_must_discriminate). Every parentlessness assertion here is
 // therefore paired with TestMQTTAuthoredForkStillClassifies, which proves the classifier
 // is still reached and still reports the shape it was built for.
@@ -28,7 +29,7 @@ import (
 // TestMQTTParentlessCreateConcedesFromBothOrientations walks EVERY production route that
 // reaches mqttSessionCreate and asserts that none of them hands the new object a parent —
 // then drives the ordinary foreign disposition over the resulting record and asserts the
-// takeover vocabulary from both sides of the pair.
+// UNSETTLED vocabulary from both sides of the pair.
 //
 // The three routes are the three that used to differ:
 //
@@ -113,8 +114,13 @@ func TestMQTTParentlessCreateConcedesFromBothOrientations(t *testing.T) {
 }
 
 // testAssertParentlessCreate is test 1's shared body: the object holds no parent, its
-// first save stamps none, and the resulting record settles to the TAKEOVER vocabulary
-// from both orientations against a sibling of the identity it declined to inherit.
+// first save stamps none, and the resulting record settles to the UNSETTLED-OWNERSHIP
+// vocabulary from both orientations against a sibling of the identity it declined to
+// inherit.
+//
+// Unsettled, not taken-over: a sibling establishes no successor, so nothing here licenses
+// a takeover claim (F-084). The behavioural half is
+// TestMQTTParentlessCreateSettlesToUnsettledBothOrientations, whose name says the same.
 //
 // available is the non-empty identity that WAS reachable at the create — the watermark's
 // RWID, the marker's parent, or the record clear() claimed. Passing it in is what keeps
@@ -149,9 +155,9 @@ func testAssertParentlessCreate(t *testing.T, env *testTeardownEnv, sess *mqttSe
 
 	// The classifier's own answer, as a MUTATION CONTROL rather than as the behavioural
 	// claim: a sibling of the identity we declined to inherit establishes nothing. The
-	// behavioural claim — that this reaches the takeover vocabulary through a real
+	// behavioural claim — that this reaches the unsettled vocabulary through a real
 	// settlement, in both orientations — is
-	// TestMQTTParentlessCreateSettlesToTakeoverBothOrientations, because
+	// TestMQTTParentlessCreateSettlesToUnsettledBothOrientations, because
 	// mqttLineageNotForked is this enum's DEFAULT, so a consult path that bypassed or
 	// mis-mapped the classifier would satisfy the assertion below unchanged.
 	sibling := testLineageRecord(created.Gen, mqttNewRecordWID(), available)
@@ -160,7 +166,7 @@ func testAssertParentlessCreate(t *testing.T, env *testTeardownEnv, sess *mqttSe
 	}
 }
 
-// TestMQTTParentlessCreateSettlesToTakeoverBothOrientations drives the concession through
+// TestMQTTParentlessCreateSettlesToUnsettledBothOrientations drives the concession through
 // the ORDINARY foreign disposition — a real rejected CAS, settled by
 // settleRecordRejection — and asserts the vocabulary the verdict is MAPPED to rather than
 // a constant the test chose.
@@ -180,7 +186,7 @@ func testAssertParentlessCreate(t *testing.T, env *testTeardownEnv, sess *mqttSe
 // disagreeing about one event, and only this pairing catches it.
 //
 // NOT parallel: the envs install process-global store hooks.
-func TestMQTTParentlessCreateSettlesToTakeoverBothOrientations(t *testing.T) {
+func TestMQTTParentlessCreateSettlesToUnsettledBothOrientations(t *testing.T) {
 	t.Run("both records parentless: the parentless create pair", func(t *testing.T) {
 		// One save only, so the acknowledged pair is a create's: {c, ""}.
 		e := testNewRejectionEnv(t, "parentless-settle-a")
@@ -200,7 +206,7 @@ func TestMQTTParentlessCreateSettlesToTakeoverBothOrientations(t *testing.T) {
 		if sib.PWID != _EMPTY_ {
 			t.Fatalf("fixture: the survivor must be parentless too, got %q", sib.PWID)
 		}
-		testAssertSettlesToTakeover(t, e)
+		testAssertSettlesToUnsettled(t, e)
 	})
 
 	t.Run("mixed: acknowledged for a PARENTED record, a parentless create stands", func(t *testing.T) {
@@ -217,18 +223,18 @@ func TestMQTTParentlessCreateSettlesToTakeoverBothOrientations(t *testing.T) {
 			testMutateSibling(ps)
 			ps.PWID = _EMPTY_
 		})
-		testAssertSettlesToTakeover(t, e)
+		testAssertSettlesToUnsettled(t, e)
 	})
 }
 
-// testAssertSettlesToTakeover rejects a real save, settles it through the production
+// testAssertSettlesToUnsettled rejects a real save, settles it through the production
 // path, and asserts the verdict AND the vocabulary it maps to.
 //
 // The vocabulary comes from mqttDisposalForRejection applied to the verdict the
 // settlement actually returned, never from a constant chosen here: that is what makes
 // this fail if a consult path stops reaching the classifier, or maps its result to the
 // wrong claim.
-func testAssertSettlesToTakeover(t *testing.T, e *testRejectionEnv) {
+func testAssertSettlesToUnsettled(t *testing.T, e *testRejectionEnv) {
 	t.Helper()
 	e.rejectSave(t, e.sess)
 
@@ -237,8 +243,12 @@ func testAssertSettlesToTakeover(t *testing.T, e *testRejectionEnv) {
 		t.Fatalf("a pair with no shared parent establishes no sibling-hood: "+
 			"settleRecordRejection = %v, want foreign", got)
 	}
-	if v := mqttDisposalForRejection(got); v.reason != mqttReasonSessionTakenOver {
-		t.Fatalf("the conceding verdict must map to 0x8E 'session taken over': got %#v", v)
+	// The conceding verdict maps to OWNERSHIP UNSETTLED, not to a takeover. "No shared
+	// parent" is the absence of sibling evidence, and an absence is not a successor: the
+	// probe established that this record is not ours and nothing whatever about who holds
+	// it. Asserting 0x8E here was asserting F-084's defect.
+	if v := mqttDisposalForLineage(got == mqttRejectionForked); v != mqttDisposalOwnershipUnsettled {
+		t.Fatalf("the conceding verdict must map to 0x89 'ownership unsettled': got %#v", v)
 	}
 	// Nothing is repairable from a verdict that never recognised a claim on our parent.
 	if g := e.capsuleOrNil(); g != nil {
@@ -295,15 +305,25 @@ func TestMQTTAuthoredForkStillClassifies(t *testing.T) {
 	if got := classifyRecordLineage(sibling, ackWID, ackPWID); got != mqttLineageForked {
 		t.Fatalf("a body claiming one HELD base is recognised: got %v", got)
 	}
-	if got := mqttDisposalForForeignResolution(mqttUncertainForked); got.reason != mqttReasonServerBusy {
-		t.Fatalf("a body claiming our parent licenses 0x89, not a takeover claim: %#v", got)
+	if got := mqttDisposalForLineage(true); got != mqttDisposalForked {
+		t.Fatalf("a body claiming our parent licenses the fork vocabulary: %#v", got)
 	}
 
-	// And a legitimate successor of the acknowledged record still concedes, so the arm
-	// above is not simply reporting "foreign".
+	// And a CHILD-SHAPED body still concedes, so the arm above is not simply reporting
+	// "foreign".
+	//
+	// It is not called a "legitimate successor" any more, and that is F-084's correction
+	// rather than a wording change: createOrRestoreSession adopts WID/PWID WITHOUT
+	// validating provenance, and valid-shaped bodies arrive through unconditional
+	// publication, so this shape is a claim of descent and not proof of one. Conceding
+	// therefore means UNSETTLED, not taken-over — which is what the second assertion pins.
 	child := testLineageRecord("gen-other", mqttNewRecordWID(), ackWID)
 	if got := classifyRecordLineage(child, ackWID, ackPWID); got != mqttLineageNotForked {
-		t.Fatalf("a child of the acknowledged record is a successor, not a fork: got %v", got)
+		t.Fatalf("a child-shaped body does not claim our parent, so it is not a fork: got %v", got)
+	}
+	if got := mqttDisposalForLineage(false); got != mqttDisposalOwnershipUnsettled {
+		t.Fatalf("a child-shaped body proves no successor, so it licenses 0x89 unsettled, "+
+			"never 0x8E: %#v", got)
 	}
 }
 

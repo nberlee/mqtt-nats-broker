@@ -133,7 +133,7 @@ func (e *testDeferredEnv) assertRefusedDiscardParked(t *testing.T, disconnectedA
 		t.Fatalf("the parked action must end at disconnect (expiryInterval 0), got %d", action.expiryInterval)
 	}
 	if action.will != nil {
-		t.Fatal("the recovery must not park a Will: a memory-only Will is dropped by a takeover")
+		t.Fatal("the recovery must not park a Will: a memory-only Will is dropped by a crash")
 	}
 	if action.disconnectedAt != disconnectedAt {
 		t.Fatalf("the parked action must carry the earned disconnect time: got %d, want %d",

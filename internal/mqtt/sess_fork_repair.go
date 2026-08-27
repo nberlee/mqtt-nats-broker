@@ -7,7 +7,7 @@
 //
 // sess_fork_lineage.go recognises that a surviving record is a SIBLING of the one this
 // broker was acknowledged for, and stops there. The client is told 0x89 "server busy"
-// rather than 0x8E — which invites the reconnect — but the subscriptions it was SUBACKed
+// rather than a takeover claim — which invites the reconnect — but the subscriptions it was SUBACKed
 // for, and the UNSUBSCRIBEs it was UNSUBACKed for, are gone. MQTT requires the Session
 // State to carry the client's subscriptions ([MQTT-4.1.0-1], Spec5 [4.1.1]), so an
 // acknowledged SUBSCRIBE or UNSUBSCRIBE silently ceasing to exist is a conformance break.

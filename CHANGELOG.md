@@ -8,6 +8,31 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **A displaced connection is only told "session taken over" where the broker holds the
+  successor.** Every other displacement now closes with `0x89` "server busy, try again
+  later" and the ownership-unsettled Reason String. A session record shows that its subject
+  moved and that the bytes are not ours; it cannot tell a genuine replacement from a
+  replay, a stranger or a forged shape, so `0x8E` — which instructs an MQTT 5 client to
+  STOP RECONNECTING — was a claim no record supported. Only an in-process same-client-ID
+  replacement this broker holds both ends of still says it, and `mqttDisposalTakenOver` now
+  has exactly one reader, asserted over the sources rather than enumerated.
+
+  **The Will follows the same licence.** A displacement that cannot prove a successor may
+  not suppress the displaced session's Will either, and four routes were losing one: a
+  foreign disposal dropped a parked deferred action outright, a detached client's close
+  published only an immediate Will so an owed-delayed one vanished, the remote-persist
+  eviction performed no Will action at all, and the takeover discard reached classes that
+  had demonstrated no takeover. Every record-derived disposal now consumes a live Will
+  through ordinary handling, or discharges a parked action against its ORIGINAL deadline.
+  A pre-CONNACK abort still discards the ARRIVING connection's Will, which is unrelated and
+  unchanged.
+
+  **Behaviour change for clients:** a client displaced by a remote broker, a resolver, or
+  a rejected record write now receives `0x89` where it previously received `0x8E`, and should
+  retry rather than stop. A Will that a genuine remote takeover would have suppressed can
+  now be published, because nothing durable distinguishes that takeover from the three
+  shapes above; that trade is stated as a residual in `docs/CONFORMANCE.md`.
+
 - **Deleted the create side of the session write-lineage machinery, obligation by
   obligation.** A session record write no longer inherits a parent identity when the
   session holds no record: the record-absent watermark inheritance, the adopted teardown
@@ -17,9 +42,13 @@ All notable changes to this project are documented here. The format is based on
   forked verdict was already documented as a FALSE fork — an identity that outlived the
   interval it named, reached by a replayed register, a stale watermark read, a regressed
   teardown slot, a delayed proposal or an out-of-band deletion — and no route reached a
-  true verdict without them. What it concedes is the cross-term create pair, which now
-  answers 0x8E "session taken over" where it briefly answered 0x89; that is a stated
-  residual conditioned on evidence. The AUTHORED-RECORD fork — two writes off a base the
+  true verdict without them. What it concedes is the cross-term create pair, which is no
+  longer RECOGNISED as a fork; that is a stated residual conditioned on evidence. (It
+  answered 0x8E "session taken over" when this entry was written. **F-084, later in this
+  same unreleased series, withdrew that claim**: conceding now answers 0x89 "ownership
+  unsettled", because failing to recognise sibling-hood leaves the broker knowing less, and
+  less knowledge cannot license a stronger claim.) The AUTHORED-RECORD fork — two writes
+  off a base the
   broker held — still classifies and is still repaired, because its retirement is
   unproved on the atomic-batch writer every accepted CONNECT uses.
 

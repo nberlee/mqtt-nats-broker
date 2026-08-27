@@ -94,7 +94,8 @@ func testSessionDurables(sess *mqttSession) []string {
 // an ExpiryInterval == 0 record.
 //
 // The WILL is the other half. It must still be published by this close, immediately, as it
-// is today after a failed clear(): a parked Will is memory-only and a takeover drops it.
+// is today after a failed clear(): a parked Will is memory-only, so a CRASH drops it.
+// (A remote eviction no longer does — it discharges the action since F-084.)
 //
 // Mutation MU-B: log on the sentinel instead of parking. It is killed by the RESIDENCY and
 // parked-obligation assertions, NOT by the reconnect's durable deletion at the end — that

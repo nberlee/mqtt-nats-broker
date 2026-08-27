@@ -46,7 +46,9 @@ import (
 // It kills two mutations. M1 — discard the trigger and skip the proof, which is what `main`
 // does. And M33 — collapse the Foreign arm into a non-disposing refusal, which the earlier
 // "first packet is not a SUBACK" oracle PASSED, because every other refusal in the tail is
-// also not a SUBACK. That is why the oracle below asserts 0x8E positively.
+// also not a SUBACK. The oracle below therefore asserts the DISPOSAL positively: F-084 gave
+// Foreign the same 0x89 and Reason String as Forked, so no byte on the wire separates them
+// any more, and the disposal is the fact the old 0x8E assertion stood proxy for.
 //
 // Which boundary the takeover is staged at is load-bearing; the reason is at the handler.
 func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
@@ -152,20 +154,23 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 			"about F-078")
 	}
 
-	// A's FIRST packet must be DISCONNECT 0x8E, and asserting that positively is what
-	// makes this fixture discriminate. "Not a SUBACK" would accept every other verdict
-	// in the tail — Forked, Local and an unresolvable ambiguity all refuse the packet
-	// too, and all three say 0x89 and dispose nothing — and the durable-survival and
-	// delivery-to-B oracles below cannot tell those apart either, because B holds the
-	// group throughout whatever A is told. 0x8E is reachable only from the Foreign arm,
-	// after disposeForeignStateLocked, so it is the observable that pins the VERDICT.
-	// Reading the FIRST packet also catches a SUBACK emitted before the notification.
+	// A's FIRST packet must be a DISCONNECT, and the DISPOSAL must have happened. Both,
+	// because F-084 took away the observable this fixture used to lean on.
 	//
-	// What it does not prove: the state effects of the disposal itself. The Will discard
-	// is covered by the owed forked-keeps-the-Will pair, not here.
+	// It used to require 0x8E, on the reasoning that the code was reachable only from the
+	// Foreign arm after disposeForeignStateLocked, while Forked, Local and an unresolvable
+	// ambiguity all said 0x89 and disposed nothing. The Foreign arm now says 0x89 too —
+	// its verdict never established a successor, only that the record is not ours — and it
+	// shares BOTH the code and the Reason String with the forked vocabulary, so no byte on
+	// the wire separates them any more.
+	//
+	// So the fixture asserts the fact the 0x8E stood proxy for, directly: A's session was
+	// DISPOSED — detached and evicted — which is exactly what Forked and Local do not do.
+	// Reading the FIRST packet still catches a SUBACK emitted before the notification.
 	if !answered {
-		t.Fatal("broker A was told nothing after a proven takeover: the displacing " +
-			"connection is established, so A is owed DISCONNECT 0x8E rather than silence")
+		t.Fatal("broker A was told nothing after its ownership write was refused: the " +
+			"displacing connection is established, so A is owed a DISCONNECT rather than " +
+			"silence")
 	}
 	var reason byte
 	if start := ra.pos; pl > 0 {
@@ -178,11 +183,43 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 			"ACKNOWLEDGE them, destroying them for the member that legitimately holds the " +
 			"group")
 	}
-	if pt&mqttPacketMask != mqttPacketDisconnect || reason != mqttReasonSessionTakenOver {
+	if pt&mqttPacketMask != mqttPacketDisconnect || reason != mqttReasonServerBusy {
 		t.Fatalf("broker A got packet %#x reason %#x after a record CAS its own takeover "+
-			"caused; want DISCONNECT %#x with 0x8E, which is the Foreign arm's own "+
-			"vocabulary. 0x89 here would mean the packet was refused WITHOUT disposing "+
-			"the state another broker now owns", pt&mqttPacketMask, reason, mqttPacketDisconnect)
+			"caused; want DISCONNECT %#x with 0x89 ownership-unsettled. A takeover is NOT "+
+			"claimed here: A observed a moved record, which establishes that the session is "+
+			"no longer A's and nothing about who holds it (F-084)",
+			pt&mqttPacketMask, reason, mqttPacketDisconnect)
+	}
+
+	// THE VERDICT, asserted on state rather than on a reason code. This is what separates
+	// the Foreign arm from Forked and Local, which refuse the packet and leave the session
+	// resident and bound. Without it the wire assertion above is satisfied by every
+	// refusing arm, since they all send the same 0x89 with the same Reason String.
+	// A NON-FATAL probe: testMQTTGetClient fatals when the client is absent, and absence is
+	// precisely what is being asserted here.
+	stillBound := func() bool {
+		b0.s.mu.Lock()
+		defer b0.s.mu.Unlock()
+		for _, cc := range b0.s.clients {
+			cc.mu.Lock()
+			match := cc.isMqtt() && cc.mqtt != nil && cc.mqtt.cid == clientA
+			cc.mu.Unlock()
+			if match {
+				return true
+			}
+		}
+		return false
+	}
+	disposedBy := time.Now().Add(5 * time.Second)
+	for stillBound() {
+		if time.Now().After(disposedBy) {
+			t.Fatal("broker A's packet was refused but its session was NOT disposed: the " +
+				"Foreign arm must detach and evict it, or A keeps serving a group the " +
+				"record no longer carries for it. Forked and Local refuse WITHOUT " +
+				"disposing, and since F-084 they are indistinguishable from Foreign on " +
+				"the wire, so this is the assertion that separates them")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	// The group durable survives. B holds the membership, and deleting it on A's foreign

@@ -127,16 +127,17 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   no local state at all.
   Details: [F-083](shared-qos2.md#f-083).
 - Prove a successor before claiming a takeover.
-  Status: Open. Release treatment: Alpha blocker.
-  Split out of the pre-CONNACK refusal signal by an escalation consult. The broker reports
-  `0x8E` "session taken over by a new connection" — which tells a client to stop reconnecting
-  — whenever a record CAS is rejected and nothing narrows it to a sibling, including when
-  the
-  record was unreadable, absent, undecodable, released, at or below our own base, or a verbatim
-  replay of our own bytes. Roughly eight sites, two of them hardcoded past every mapper, and
-  the remedy needs a successor-evidence predicate that cannot yet be stated as a proof
-  plus a
-  Will-disposition decision per class.
+  Status: **Done (2026-08-27).** Release treatment: Alpha blocker.
+  The broker reported `0x8E` "session taken over by a new connection" — which tells a client
+  to stop reconnecting — whenever a record CAS was rejected and nothing narrowed it to a
+  sibling, including when the record was unreadable, absent, undecodable, released, at or
+  below our own base, or a verbatim replay of our own bytes. **The successor predicate was
+  avoided rather than found**: no persisted shape proves a successor, so the claim was
+  withdrawn from every route that cannot hold one, and `0x8E` is now licensed only by an
+  in-process same-client-ID replacement this broker holds both ends of. Everything
+  record-derived says `0x89` ownership-unsettled. The Will half turned out to be **five
+  routes, four of them real losses**, and now follows the same licence: only a demonstrated
+  takeover may suppress a Will.
   Details: [F-084](ha-arbitration.md#f-084-prove-a-successor-before-claiming-a-takeover).
 - Sweep the comment corpus for three false-claim families, indexed by claim.
   Status: Open. Release treatment: Post-alpha cleanup.

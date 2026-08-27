@@ -28,8 +28,10 @@ import (
 // used to notify the client itself. Two of them racing put two server DISCONNECTs on one
 // socket, which [MQTT-3.14.4-1] forbids and which tells the client the opposite of what is
 // true, in an order neither path controls. mqttClaimDisconnectLocked makes the
-// notification a claim consumed once per connection, and mqttNotifyTakenOver is the one
-// tail all four take.
+// notification a claim consumed once per connection, and mqttNotifyDisplaced is the one
+// tail all four take. (Its takeover-CLAIMING wrapper, mqttNotifyTakenOver, is the local
+// CONNECT route's alone since F-084 — the other three reach their verdict from a record,
+// which proves no successor.)
 //
 // Two layers of test, and the distinction is load-bearing. ROUTE tests drive the real
 // production branch, because a test that calls the shared helper directly passes just as
@@ -41,8 +43,10 @@ import (
 
 // TestMQTTDisplacementClaimsTheOneDisconnect is the residual the roadmap item names, run
 // through both production routes: a remote persist observation evicts this connection with
-// 0x8E, and the parse footer then tries to append the settlement's 0x89 sentinel on the
-// same socket. Exactly one DISCONNECT may be attempted, and it must be the takeover's.
+// the unsettled 0x89, and the parse footer then tries to append the settlement's own 0x89
+// sentinel on the same socket. Exactly one DISCONNECT may be attempted, and it must be the
+// eviction's. (The eviction said 0x8E before F-084, so the two codes used to differ; the
+// property under test was always the COUNT.)
 //
 // The capture keeps recording after the close on purpose. The persist path closes
 // asynchronously, so a capture that dropped post-close writes would report one frame
@@ -75,7 +79,7 @@ func TestMQTTDisplacementClaimsTheOneDisconnect(t *testing.T) {
 	// hands the eviction to processSessionPersist's classifying worker. The whole route is
 	// asynchronous now, but the worker's notification still precedes its
 	// `go closeConnection`, so a closed connection proves the notification was attempted.
-	e.remoteTakeover(t, "node2", "dispclaim")
+	e.remoteRecordWrite(t, "node2", "dispclaim")
 	deadline := time.Now().Add(testRejectionWait)
 	for !b.closed() {
 		if time.Now().After(deadline) {
@@ -91,10 +95,14 @@ func TestMQTTDisplacementClaimsTheOneDisconnect(t *testing.T) {
 		t.Fatalf("the second contender must reach the footer on the sentinel: %v", err)
 	}
 
-	reasons := b.disconnectAttempts(t)
-	if len(reasons) != 1 || reasons[0] != mqttReasonSessionTakenOver {
-		t.Fatalf("exactly one DISCONNECT may be ATTEMPTED on one connection [MQTT-3.14.4-1]; "+
-			"got reasons %x (wire %x)", reasons, b.out.bytes())
+	// EXACTLY ONE, and it says ownership-unsettled: the eviction learned of the
+	// displacement from a record, which proves no successor (F-084). What this fixture
+	// pins is the CLAIM COUNT, and that is unchanged — a second contender reaching the
+	// footer must not append a second DISCONNECT.
+	claims := b.disconnectClaims(t)
+	if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+		t.Fatalf("exactly one DISCONNECT may be ATTEMPTED on one connection [MQTT-3.14.4-1], "+
+			"and it may not claim a takeover; got %+v (wire %x)", claims, b.out.bytes())
 	}
 }
 
@@ -124,19 +132,20 @@ func TestMQTTDisconnectClaimConsumedOnce(t *testing.T) {
 	}
 }
 
-// TestMQTTPersistTakeoverHonorsTheConnAckGate is the [MQTT-3.2.0-1] half, on the persist
-// route. mqttAbortAcceptedConnect leaves a refused connection bound until its readLoop
-// detaches it, so a displacement can find a bound connection that never saw a CONNACK; the
-// takeover 0x8E used to go out anyway, ahead of the CONNACK the client is still waiting
-// for. The CONNACKed case is the positive control: it asserts the default, and it exists
+// TestMQTTPersistDisplacementHonorsTheConnAckGate is the [MQTT-3.2.0-1] half, on the
+// persist route. mqttAbortAcceptedConnect leaves a refused connection bound until its
+// readLoop detaches it, so a displacement can find a bound connection that never saw a
+// CONNACK; the displacement's DISCONNECT used to go out anyway, ahead of the CONNACK the
+// client is still waiting for. (It said 0x8E then, on this route; F-084 made it 0x89. The
+// gate is what this test is about, and it is the same gate either way.) The CONNACKed case is the positive control: it asserts the default, and it exists
 // so a gate that failed closed into total silence could not pass the case below it.
-func TestMQTTPersistTakeoverHonorsTheConnAckGate(t *testing.T) {
+func TestMQTTPersistDisplacementHonorsTheConnAckGate(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		connAckd bool
 	}{
-		{"a CONNACKed connection is told 0x8E", true},
+		{"a CONNACKed connection is told why", true},
 		{"a pre-CONNACK connection is closed silently", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,7 +155,7 @@ func TestMQTTPersistTakeoverHonorsTheConnAckGate(t *testing.T) {
 				b.forgetConnAck()
 			}
 
-			e.remoteTakeover(t, "node2", "persistgate")
+			e.remoteRecordWrite(t, "node2", "persistgate")
 			deadline := time.Now().Add(testRejectionWait)
 			for !b.closed() {
 				if time.Now().After(deadline) {
@@ -155,13 +164,21 @@ func TestMQTTPersistTakeoverHonorsTheConnAckGate(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 			}
 
-			reasons := b.disconnectAttempts(t)
+			claims := b.disconnectClaims(t)
 			if tc.connAckd {
-				if len(reasons) != 1 || reasons[0] != mqttReasonSessionTakenOver {
-					t.Fatalf("a CONNACKed displaced client must be told 0x8E: got %x (wire %x)", reasons, b.out.bytes())
+				// The claim is ownership-unsettled, not a takeover: this route learns of the
+				// displacement from a RECORD, and a record cannot distinguish a genuine
+				// replacement from a replay, a stranger or a forged shape. F-084. The
+				// positive control is unchanged in purpose — it still asserts that a
+				// CONNACKed connection is TOLD something, so a gate failing closed into
+				// total silence cannot pass the row below.
+				if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+					t.Fatalf("a CONNACKed displaced client must be told ownership-unsettled: got %+v (wire %x)",
+						claims, b.out.bytes())
 				}
 				return
 			}
+			reasons := b.disconnectAttempts(t)
 			if len(reasons) != 0 {
 				t.Fatalf("nothing may precede a client's CONNACK [MQTT-3.2.0-1]; got DISCONNECT reasons %x (wire %x)",
 					reasons, b.out.bytes())
@@ -216,7 +233,7 @@ func TestMQTTPeriodicForeignDisposalHonorsTheConnAckGate(t *testing.T) {
 		name     string
 		connAckd bool
 	}{
-		{"a CONNACKed connection is told 0x8E", true},
+		{"a CONNACKed connection is told why", true},
 		{"a pre-CONNACK connection is closed silently", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -226,7 +243,7 @@ func TestMQTTPeriodicForeignDisposalHonorsTheConnAckGate(t *testing.T) {
 				b.forgetConnAck()
 			}
 
-			// An unresolved write of ours, and a record another owner has since moved:
+			// An unresolved write of ours, and a record something has since moved:
 			// the periodic pass resolves that to a foreign verdict.
 			e.sess.mu.Lock()
 			testMarkUncertainLocked(e.sess, e.sess.seq, []byte(`{"attempted":"ours"}`))
@@ -244,13 +261,19 @@ func TestMQTTPeriodicForeignDisposalHonorsTheConnAckGate(t *testing.T) {
 			if bound != nil {
 				t.Fatal("a foreign verdict must detach the bound client, or the disposal never ran")
 			}
-			reasons := b.disconnectAttempts(t)
+			claims := b.disconnectClaims(t)
 			if tc.connAckd {
-				if len(reasons) != 1 || reasons[0] != mqttReasonSessionTakenOver {
-					t.Fatalf("a CONNACKed disposed client must be told 0x8E: got %x (wire %x)", reasons, b.out.bytes())
+				// Ownership-unsettled, not a takeover: a foreign verdict is reached from a
+				// record, which establishes that the session is not ours and nothing about
+				// who holds it. F-084. Still a POSITIVE control — the connection is told
+				// something — so a gate failing closed into silence cannot pass the row below.
+				if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+					t.Fatalf("a CONNACKed disposed client must be told ownership-unsettled: got %+v (wire %x)",
+						claims, b.out.bytes())
 				}
 				return
 			}
+			reasons := b.disconnectAttempts(t)
 			if len(reasons) != 0 {
 				t.Fatalf("nothing may precede a client's CONNACK [MQTT-3.2.0-1]; got DISCONNECT reasons %x (wire %x)",
 					reasons, b.out.bytes())
@@ -269,7 +292,7 @@ func TestMQTTBoundSettlementForeignArmHonorsTheConnAckGate(t *testing.T) {
 		name     string
 		connAckd bool
 	}{
-		{"a CONNACKed connection is told 0x8E", true},
+		{"a CONNACKed connection is told why", true},
 		{"a pre-CONNACK connection is closed silently", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -279,7 +302,7 @@ func TestMQTTBoundSettlementForeignArmHonorsTheConnAckGate(t *testing.T) {
 			if !tc.connAckd {
 				b.forgetConnAck()
 			}
-			e.remoteTakeover(t, "node2", "settlegate")
+			e.remoteRecordWrite(t, "node2", "settlegate")
 			e.rejectSave(t, e.sess)
 
 			if err := b.deliver(t, []byte{mqttPacketPing, 0}); err != nil {
@@ -290,13 +313,19 @@ func TestMQTTBoundSettlementForeignArmHonorsTheConnAckGate(t *testing.T) {
 					b.closed(), e.resident(e.sess))
 			}
 
-			reasons := b.disconnectAttempts(t)
+			claims := b.disconnectClaims(t)
 			if tc.connAckd {
-				if len(reasons) != 1 || reasons[0] != mqttReasonSessionTakenOver {
-					t.Fatalf("a CONNACKed disposed client must be told 0x8E: got %x (wire %x)", reasons, b.out.bytes())
+				// Ownership-unsettled, not a takeover: a foreign verdict is reached from a
+				// record, which establishes that the session is not ours and nothing about
+				// who holds it. F-084. Still a POSITIVE control — the connection is told
+				// something — so a gate failing closed into silence cannot pass the row below.
+				if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+					t.Fatalf("a CONNACKed disposed client must be told ownership-unsettled: got %+v (wire %x)",
+						claims, b.out.bytes())
 				}
 				return
 			}
+			reasons := b.disconnectAttempts(t)
 			if len(reasons) != 0 {
 				t.Fatalf("nothing may precede a client's CONNACK [MQTT-3.2.0-1]; got DISCONNECT reasons %x (wire %x)",
 					reasons, b.out.bytes())

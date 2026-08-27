@@ -17,8 +17,10 @@ import (
 // incarnation's enqueued delayed Will on evidence that a leader-transition fork
 // also produces. The eviction now runs on a per-client worker
 // (evictDisplacedOnRemotePersist) that reads and classifies the surviving record
-// first: only a record that is not a proven same-base sibling licenses the
-// takeover claim and the scoped Will cancel.
+// first: a proven same-base sibling is a FORK, which mints a repair grant, and
+// everything else is ownership-unsettled, which mints nothing. Neither claims a
+// takeover — no record shape proves a successor (F-084) — and this route cancels no
+// Will on any verdict.
 //
 // Every fixture here is a REAL record over a real JetStream; observations are
 // either real peer saves (delivered on the real subscription) or synthetic
@@ -195,7 +197,7 @@ func (e *testRejectionEnv) landRecord(t *testing.T, shape func(*mqttPersistedSes
 	// resulting push has already been dropped. A test that stages its own record is by
 	// construction a synthetic-delivery test — it decouples the observed sequence from
 	// the planted record, which is the whole reason to stage one — and the tests that
-	// exercise the REAL channel (siblingTakeover, remoteTakeover) never stage.
+	// exercise the REAL channel (siblingRecordWrite, remoteRecordWrite) never stage.
 	e.asm.mu.Lock()
 	e.asm.testSessPersistDrop = func(h string) bool { return h == idHash }
 	e.asm.mu.Unlock()
@@ -206,12 +208,16 @@ func (e *testRejectionEnv) landRecord(t *testing.T, shape func(*mqttPersistedSes
 	return resp.Sequence
 }
 
-// siblingTakeover restores the same client through a peer manager, points the
+// siblingRecordWrite restores the same client through a peer manager, points the
 // peer object's acknowledged WID at OUR acknowledged PARENT, and saves: the
 // peer's write then CLAIMS the same parent as our acknowledged record — which is
 // what the classifier recognises — and its REAL persist observation is what our
 // subscription delivers. Returns the sequence the record now sits at.
-func (e *testRejectionEnv) siblingTakeover(t *testing.T, node, clientID string) uint64 {
+//
+// A sibling is the one lineage shape that licenses the FORKED vocabulary, and even that
+// is not a takeover claim: forked says our acknowledged record was erased by a write
+// that is not demonstrably descended from it (F-084).
+func (e *testRejectionEnv) siblingRecordWrite(t *testing.T, node, clientID string) uint64 {
 	t.Helper()
 	_, psess, _ := e.peer(t, node, clientID)
 	e.sess.mu.Lock()
@@ -344,7 +350,7 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 	e.armExpiryTimer()
 	done := e.armEvictObserver()
 
-	e.siblingTakeover(t, "node2", "pevfork")
+	e.siblingRecordWrite(t, "node2", "pevfork")
 
 	if !testAwaitEvictDone(t, done) {
 		t.Fatal("a forked verdict still evicts — only the CLAIM differs")
@@ -360,7 +366,7 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 		t.Fatal("the displaced session must be evicted")
 	}
 	if e.hasPendingExpiry() {
-		t.Fatal("the expiry timer must be cancelled: the record is owned remotely now")
+		t.Fatal("the expiry timer must be cancelled: this broker may no longer write the record")
 	}
 	if st := e.willOutboxState(t, will); st != mqttWillPending {
 		t.Fatalf("a forked verdict must NOT cancel the Will outbox record, got %v", st)
@@ -370,31 +376,39 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 	testAssertMinted(t, e)
 }
 
-// TestMQTTPersistEvictTakeoverPreservesWill is the paired successor case: a real
-// peer RESUME save is a child of our acknowledged record — a demonstrated
-// takeover — so the claim is 0x8E.
+// TestMQTTPersistEvictDisplacementPreservesWill is the paired child-shaped case: a real
+// peer RESUME save is a child of our acknowledged record. That is a CLAIM of descent and
+// not proof of one — restore adopts WID/PWID without validating provenance — so since
+// F-084 the claim is 0x89 ownership-unsettled, not 0x8E.
 //
 // And the delayed Will is PRESERVED even so, which is the change this pins. The
 // eviction used to run a scoped outbox cancel here; it no longer does, on either
 // verdict, because "somebody took the session over" is not the question a Will
-// turns on. A reconnect after the Will Delay has elapsed leaves the Will owed
+// turns on — and on this route it is not a question this broker could answer anyway.
+// A reconnect after the Will Delay has elapsed leaves the Will owed
 // ([MQTT-3.1.2-8]), and this path has no idea whether it did. The claimant decides,
-// at FireAt, against the permanent acceptance facts — which the takeover's own
-// accepted CONNECT wrote.
-func TestMQTTPersistEvictTakeoverPreservesWill(t *testing.T) {
+// at FireAt, against the permanent acceptance facts, which only a genuinely accepted
+// CONNECT writes.
+func TestMQTTPersistEvictDisplacementPreservesWill(t *testing.T) {
 	t.Parallel()
 	e := testNewEvictEnv(t, "pevtake")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	will := e.plantPendingWill(t)
 	done := e.armEvictObserver()
 
-	e.remoteTakeover(t, "node2", "pevtake")
+	e.remoteRecordWrite(t, "node2", "pevtake")
 
 	if !testAwaitEvictDone(t, done) {
-		t.Fatal("a demonstrated takeover must evict")
+		t.Fatal("a record that moved past our base must evict")
 	}
-	if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != mqttReasonSessionTakenOver {
-		t.Fatalf("a demonstrated successor licenses 0x8E, got %x", reasons)
+	// This displacement is observed through a RECORD, and a record is not a successor
+	// proof: this broker sees a body it did not write and cannot tell a real replacement
+	// from a replay, a stranger or a forged shape. So the claim is ownership-unsettled.
+	// 0x8E is reserved for the in-process replacement this broker holds both ends of.
+	// F-084.
+	claims := b.disconnectClaims(t)
+	if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+		t.Fatalf("a remote record observation licenses ownership-unsettled, got %+v", claims)
 	}
 	if e.resident(e.sess) {
 		t.Fatal("the displaced session must be evicted")
@@ -459,10 +473,11 @@ func TestMQTTPersistEvictResidentUnbound(t *testing.T) {
 // TestMQTTPersistEvictLicenseTable drives the concede/refuse table with planted
 // records and synthetic observations. The license is the OBSERVATION: a record
 // the worker cannot read — absent, undecodable, or older than the write that
-// licensed the eviction — narrows nothing, so those rows concede to 0x8E and
-// still cancel the Will. The one refusal is equality: no remote write can land
+// licensed the eviction — narrows nothing, so those rows CONCEDE. Since F-084 they
+// concede to 0x89 ownership-unsettled rather than 0x8E, and this route cancels no
+// Will on any verdict. The one refusal is equality: no remote write can land
 // AT our acknowledged sequence within a stream epoch, so the session's own
-// record is never a takeover.
+// record never displaces it.
 func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 	t.Parallel()
 	type row struct {
@@ -470,9 +485,18 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 		// stage returns the sequence to deliver as the observation.
 		stage   func(t *testing.T, e *testRejectionEnv) uint64
 		evicted bool
-		reason  byte
+		// voc is the WHOLE claim, not its reason code. Since F-084 the forked and the
+		// unsettled vocabularies both carry 0x89, so a code-only assertion cannot tell a
+		// proven sibling from an unclassifiable observation — and telling them apart is
+		// exactly what decides whether a fork grant is minted.
+		voc mqttDisposalVocabulary
 	}
 	for _, tc := range []row{
+		// Each "concedes" row now concedes to OWNERSHIP UNSETTLED, not to a takeover. An
+		// absent, undecodable, identity-less or below-target record is an observation this
+		// broker cannot classify; it establishes that the subject is no longer ours and
+		// nothing whatever about who holds it, so 0x8E asserted a successor none of them
+		// produced. F-084.
 		{"absent record concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
 			smsg, err := e.asm.jsa.loadSessionMsg(e.asm.domainTk, e.idHash)
 			if err != nil {
@@ -482,14 +506,14 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 				t.Fatalf("delete the session record: %v", err)
 			}
 			return smsg.Sequence + 1
-		}, true, mqttReasonSessionTakenOver},
+		}, true, mqttDisposalOwnershipUnsettled},
 		{"undecodable record concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
 			resp, err := e.sess.jsa.storeSessionMsg(e.asm.domainTk, e.idHash, 0, []byte("{not-a-record"))
 			if err != nil {
 				t.Fatalf("land the undecodable record: %v", err)
 			}
 			return resp.Sequence
-		}, true, mqttReasonSessionTakenOver},
+		}, true, mqttDisposalOwnershipUnsettled},
 		// INVERTED by F-029, deliberately. This row used to assert that a different
 		// incarnation concedes, which was the generation short-circuit in
 		// classifyRecordLineage. That short-circuit hid the one fork the rule exists to
@@ -500,21 +524,21 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 		// verdict proved no session continuation, so it may not destroy the outbox.
 		{"sibling of another incarnation is forked", func(t *testing.T, e *testRejectionEnv) uint64 {
 			return e.landRecord(t, func(ps *mqttPersistedSession) { ps.Gen = mqttNewSessGen() })
-		}, true, mqttReasonServerBusy},
+		}, true, mqttDisposalForked},
 		{"absent lineage concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
 			return e.landRecord(t, func(ps *mqttPersistedSession) { ps.WID, ps.PWID = _EMPTY_, _EMPTY_ })
-		}, true, mqttReasonSessionTakenOver},
+		}, true, mqttDisposalOwnershipUnsettled},
 		{"below-target sibling concedes through the license", func(t *testing.T, e *testRejectionEnv) uint64 {
 			// A FORKED record below the trigger: classifying it would answer
 			// 0x89 for a write it cannot speak for (M14). The license path
 			// concedes at the observation level instead.
 			return e.landRecord(t, nil) + 1
-		}, true, mqttReasonSessionTakenOver},
+		}, true, mqttDisposalOwnershipUnsettled},
 		{"equality is never a takeover", func(t *testing.T, e *testRejectionEnv) uint64 {
 			e.sess.mu.Lock()
 			defer e.sess.mu.Unlock()
 			return e.sess.seq
-		}, false, 0},
+		}, false, mqttDisposalVocabulary{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewEvictEnv(t, "pevlic-"+tc.name[:6])
@@ -532,13 +556,13 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 			if e.resident(e.sess) == tc.evicted {
 				t.Fatalf("residency must match the verdict: evicted=%v", tc.evicted)
 			}
-			reasons := b.disconnectAttempts(t)
+			claims := b.disconnectClaims(t)
 			if !tc.evicted {
-				if len(reasons) != 0 {
-					t.Fatalf("a refused eviction must write NO DISCONNECT, got %x", reasons)
+				if len(claims) != 0 {
+					t.Fatalf("a refused eviction must write NO DISCONNECT, got %+v", claims)
 				}
-			} else if len(reasons) != 1 || reasons[0] != tc.reason {
-				t.Fatalf("DISCONNECT reasons = %x, want [%x]", reasons, tc.reason)
+			} else if len(claims) != 1 || !claims[0].matches(tc.voc) {
+				t.Fatalf("DISCONNECT claims = %+v, want exactly one %+v", claims, tc.voc)
 			}
 			if st := e.willOutboxState(t, will); st != mqttWillPending {
 				t.Fatalf("no eviction verdict may destroy a delayed Will, got %v", st)
@@ -564,7 +588,7 @@ func TestMQTTPersistEvictReplacementObject(t *testing.T) {
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, true)
 
-	// A foreign successor moves the record; its observation spawns the worker,
+	// A child-shaped record moves the subject; its observation spawns the worker,
 	// which loads it and parks post-load.
 	seq := e.landRecord(t, func(ps *mqttPersistedSession) {
 		e.sess.mu.Lock()
@@ -805,8 +829,9 @@ func TestMQTTPersistEvictDefersToOpenRecordTx(t *testing.T) {
 
 // TestMQTTPersistEvictFreshTriggerReloads is plan test 8: a strictly newer
 // observation delivered while the worker is parked post-load makes it RE-LOAD
-// and apply the newer record's verdict — here flipping takeover to forked, which
-// both the vocabulary and the Will record's final state assert (M9).
+// and apply the newer record's verdict — here flipping UNSETTLED to forked, which the
+// vocabulary and the Will record's final state assert (M9). ("Takeover to forked" before
+// F-084; this route claims no takeover now.)
 func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
 	t.Parallel()
 	e := testNewEvictEnv(t, "pevfresh")
@@ -815,7 +840,7 @@ func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, true)
 
-	// A successor at N: verdict takeover.
+	// A child-shaped record at N: verdict UNSETTLED (it proves no successor, F-084).
 	succ := e.landRecord(t, func(ps *mqttPersistedSession) {
 		e.sess.mu.Lock()
 		ps.PWID = e.sess.wid
@@ -846,9 +871,10 @@ func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
 // arm (holistic round 2): an UNREADABLE record concedes, but a strictly newer
 // observation delivered before the decision is DELIVERED knowledge, not a lost
 // one — the worker must re-load, and the record readable at the new level may
-// prove the fork. A worker that skips the freshness arm on the unusable path
-// concedes 0x8E at the old level and irreversibly cancels a Will that delivered
-// knowledge would have preserved.
+// prove the fork. A worker that skips the freshness arm on the unusable path decides at
+// the old level and loses the fork — and with it the repair grant. (It also conceded
+// 0x8E and cancelled a Will there; F-084 removed the first and an earlier item the
+// second, so what the freshness arm now protects is the classification and the mint.)
 func TestMQTTPersistEvictUnusableLoadFreshTrigger(t *testing.T) {
 	t.Parallel()
 	e := testNewEvictEnv(t, "pevunusable")
@@ -889,7 +915,7 @@ func TestMQTTPersistEvictUnusableLoadFreshTrigger(t *testing.T) {
 // at S+2 whose observation the worker consumes. The decision runs under the
 // fence, which the parked save holds until it has adopted — so the pair the
 // classifier sees is {c,a}, which proves {b,a} forked. A pair sampled at or
-// before the load sees {a,p} and concedes 0x8E (M8).
+// before the load sees {a,p} and CONCEDES — unsettled, and mints nothing (M8).
 func TestMQTTPersistEvictClassifiesAtDecisionTime(t *testing.T) {
 	e := testNewEvictEnv(t, "pevpair")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
@@ -957,8 +983,10 @@ func TestMQTTPersistEvictClassifiesAtDecisionTime(t *testing.T) {
 // staleness, and their asymmetry is the point:
 //
 //   - a remote sibling of the UNADOPTED attempt ({b,a}) reads unrelated against
-//     {a,p} and CONCEDES to 0x8E plus the scoped Will cancel — the stated
-//     one-hop recognition miss, byte-identical to the pre-change behavior;
+//     {a,p} and CONCEDES to the UNSETTLED vocabulary — the stated one-hop
+//     recognition miss. It used to concede to 0x8E; F-084 corrected that, because
+//     failing to recognise a sibling leaves the broker knowing LESS, not more, and
+//     the weaker knowledge cannot license the stronger claim;
 //   - a remote sibling of the ACKNOWLEDGED record ({b,p}) still classifies
 //     FORKED — 0x89, Will preserved — a true positive the staleness cannot
 //     destroy. A stale pair only ever narrows the verdict; no record shape
@@ -967,10 +995,10 @@ func TestMQTTPersistEvictUnresolvedAttemptPair(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		siblingOf string // "attempt" or "acknowledged"
-		reason    byte
+		voc       mqttDisposalVocabulary
 	}{
-		{"sibling of the unadopted attempt concedes", "attempt", mqttReasonSessionTakenOver},
-		{"sibling of the acknowledged record still proves the fork", "acknowledged", mqttReasonServerBusy},
+		{"sibling of the unadopted attempt concedes", "attempt", mqttDisposalOwnershipUnsettled},
+		{"sibling of the acknowledged record still proves the fork", "acknowledged", mqttDisposalForked},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewEvictEnv(t, "pevunres-"+tc.siblingOf)
@@ -1014,8 +1042,12 @@ func TestMQTTPersistEvictUnresolvedAttemptPair(t *testing.T) {
 			if !testAwaitEvictDone(t, done) {
 				t.Fatal("both rows evict; only the claim differs")
 			}
-			if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != tc.reason {
-				t.Fatalf("DISCONNECT reasons = %x, want [%x]", reasons, tc.reason)
+			// The WHOLE claim: both rows now carry 0x89, so only the Reason String separates
+			// the recognised fork from the unrecognised one — and that difference is what
+			// decides whether a repair grant is minted.
+			claims := b.disconnectClaims(t)
+			if len(claims) != 1 || !claims[0].matches(tc.voc) {
+				t.Fatalf("DISCONNECT claims = %+v, want exactly one %+v", claims, tc.voc)
 			}
 			if st := e.willOutboxState(t, will); st != mqttWillPending {
 				t.Fatalf("no eviction verdict may destroy a delayed Will, got %v", st)
@@ -1127,7 +1159,7 @@ func TestMQTTPersistEvictCleanupHandoff(t *testing.T) {
 // retry; at cleanup entry the gate is released and record N+1's own DELAYED
 // observation delivered — equal to the loaded sequence, so an implementation
 // that credited the refused iteration with the loaded level reads it as already
-// consumed and strands a genuine successor's trigger, leaving the stale client
+// consumed and strands a genuine displacement's trigger, leaving the stale client
 // serving indefinitely. The same worker must loop and apply the eviction.
 func TestMQTTPersistEvictBusyExitConsumesOnlyItsTrigger(t *testing.T) {
 	t.Parallel()
@@ -1135,7 +1167,7 @@ func TestMQTTPersistEvictBusyExitConsumesOnlyItsTrigger(t *testing.T) {
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, false)
 
-	// Trigger N: a successor at N, observed while the gate is held.
+	// Trigger N: a child-shaped record at N, observed while the gate is held.
 	succ := e.landRecord(t, func(ps *mqttPersistedSession) {
 		e.sess.mu.Lock()
 		ps.PWID = e.sess.wid
@@ -1167,7 +1199,7 @@ func TestMQTTPersistEvictBusyExitConsumesOnlyItsTrigger(t *testing.T) {
 	close(release)
 
 	if !testAwaitEvictDone(t, done) {
-		t.Fatal("the successor's delayed observation must be consumed by the same worker, not stranded")
+		t.Fatal("the delayed observation must be consumed by the same worker, not stranded")
 	}
 	select {
 	case <-done:

@@ -221,7 +221,9 @@ const (
 	// be classified. Never a verdict about ownership.
 	mqttRecordAttemptUnreadable mqttRecordAttemptVerdict = iota
 	// mqttRecordAttemptGone: the record is absent. A write of ours cannot have landed
-	// and then vanished on its own, so somebody released this session.
+	// and then vanished on its own, so SOMETHING released this session — a teardown, an
+	// expiry, an operator. Which, and whether anyone succeeded us, is exactly what an
+	// absence cannot say (F-084).
 	mqttRecordAttemptGone
 	// mqttRecordAttemptAtBase: the record is still exactly the one we CAS'd against.
 	// This is CONTENTION, never ownership — JetStream returns 10164 while a write for
@@ -281,7 +283,8 @@ const (
 	// favour, and the advanced sequence invalidates the marker.
 	mqttRejectionOurs
 	// mqttRejectionForeign: the probe definitively did not land and the record is not
-	// this attempt's. Another owner holds the session.
+	// this attempt's. That is ALL it establishes — the subject moved past our base, and
+	// nothing about who moved it (F-084).
 	mqttRejectionForeign
 	// mqttRejectionUnresolved: the probe's own outcome is unknown. The uncertainty
 	// machinery owns the session until a readback classifies it.
@@ -333,8 +336,9 @@ func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg 
 		// client whose session is resident.
 		//
 		// That reasoning establishes the record is not OURS. It does not establish
-		// that it SUCCEEDS ours, which is the separate claim the foreign verdict goes
-		// on to make: an UNCONDITIONAL foreign write can erase us off our own base
+		// that it SUCCEEDS ours — and since F-084 the foreign verdict no longer claims
+		// that either, which is why this test decides the MINT rather than the claim:
+		// an UNCONDITIONAL foreign write can erase us off our own base
 		// without succeeding us, and no CAS excludes one (the same-base boundary,
 		// docs/CONFORMANCE.md). Asked here, on the branch that already concluded
 		// foreign, and only above the base — a record below it stays foreign fail-safe,
@@ -899,10 +903,15 @@ func (sess *mqttSession) classifyPreConnackSave(tok recordTx) mqttClassifiedPreC
 		// 10071 disposes without ever consulting the resolver, so this is the only
 		// place a sibling lineage is recognised on that arm: one record read, which
 		// narrows the vocabulary and mints the fork grant when the body claims our
-		// parent. Collapsing it would assert 0x8E where the record supports 0x89.
-		voc := sess.disposalForDirectRejection(&detail)
+		// parent. Collapsing it would assert a fork's 0x89 where the record supports
+		// only the unsettled one, and mint a grant with nothing to anchor it.
+		//
+		// The outcome is keyed on the fork BIT the classification returned, never on the
+		// vocabulary's reason code: both 0x89 vocabularies share that code, so a code
+		// comparison would route an unsettled record to the forked outcome. F-084.
+		voc, forked := sess.disposalForDirectRejection(&detail)
 		out := mqttPreConnackDisposingNonForked
-		if voc == mqttDisposalForked {
+		if forked {
 			out = mqttPreConnackDisposingForked
 		}
 		return mqttClassifiedPreConnackSave{outcome: out, voc: voc, err: serr}
@@ -919,7 +928,7 @@ func (sess *mqttSession) classifyPreConnackSave(tok recordTx) mqttClassifiedPreC
 				out = mqttPreConnackDisposingForked
 			}
 			return mqttClassifiedPreConnackSave{
-				outcome: out, voc: mqttDisposalForRepairSave(v), err: serr, contended: true}
+				outcome: out, voc: mqttDisposalForLineage(v == mqttRepairSaveForked), err: serr, contended: true}
 		case mqttRepairSaveUnresolved:
 			// The pending-write state (base, digest and the exact bytes) is already
 			// established by resolveContendedRecordSave — deliberately, because a CAS
@@ -1031,7 +1040,8 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 			sess.mu.Unlock()
 			return mqttRepairSaveUnresolved
 		case mqttRecordAttemptGone:
-			// The record is gone: somebody released this session. Not ours.
+			// The record is gone: something released this session, and an absence names
+			// neither the releaser nor a successor. Not ours.
 			return mqttRepairSaveForeign
 		case mqttRecordAttemptAtBase:
 			// Still exactly the record we CAS'd against: the rejection was
@@ -1089,7 +1099,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 		sess.mu.Unlock()
 		return mqttRepairSaveUnresolved
 	case mqttRecordAttemptGone:
-		return mqttRepairSaveForeign // the record is gone: somebody released it
+		return mqttRepairSaveForeign // gone: not ours, and an absence names no successor
 	case mqttRecordAttemptAtBase:
 		return mqttRepairSaveLocalDefinite // still ours, still unwritten
 	default: // mqttRecordAttemptMoved

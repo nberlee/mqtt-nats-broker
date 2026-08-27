@@ -118,7 +118,7 @@ type mqttSubPacketFacts struct {
 	// trigger and the returned error empty — and the packet would then take the "quiet,
 	// nothing owed" path, open the operation gate and SUBACK, while asynchronous delivery
 	// callbacks immediately serve the session's SURVIVING shared subscriptions under a
-	// membership another broker now owns. The rejection marker does arm, but
+	// membership this broker can no longer speak for. The rejection marker does arm, but
 	// mqttGateDispatchOnRejection only settles it before the NEXT inbound packet, which is
 	// far too late for a callback already running.
 	//
@@ -158,10 +158,11 @@ type mqttSubPacketFacts struct {
 	//
 	// The void-register route is the subtle one, and it is a live hole without this: a
 	// mixed packet can arm the gate through a failed shared filter, downgrade a plain
-	// consumer SUCCESSFULLY, and then meet a remote takeover during that late record
-	// write. With no trigger committed and the rejection swallowed by a bare bool, the
-	// packet would look quiet, the gate would open, and the session's SURVIVING shared
-	// subscriptions would deliver and acknowledge under a membership another broker owns.
+	// consumer SUCCESSFULLY, and then meet a competing remote write during that late
+	// record write. With no trigger committed and the rejection swallowed by a bare bool,
+	// the packet would look quiet, the gate would open, and the session's SURVIVING shared
+	// subscriptions would deliver and acknowledge under a membership this broker can no
+	// longer speak for.
 	recordCASRejected bool
 }
 
@@ -473,8 +474,10 @@ func (sess *mqttSession) subGateBlocksQoS0(cc *client) bool {
 // no-op: it still detaches, clears or purges, saves the disconnect time and schedules
 // expiry.
 //
-// NOT ON THE FOREIGN ARM. A demonstrated takeover discards the Will instead
-// (mqttDiscardWillOnTakeover), and discarding is right there: the displacement's own rule.
+// THE FOREIGN ARM USES THIS TOO, since F-084. It used to discard instead, on the reasoning
+// that a takeover owns the Will's fate — but that arm demonstrates no takeover, only that
+// the record is not ours, so suppressing there was silent loss. The discard is now reached
+// only from a displacement this broker holds both ends of (mqttDiscardWillOnTakeover).
 //
 // The ownership gate is held on entry; sess.mu is not.
 func (c *client) mqttConsumeWillUnderGate(asm *mqttAccountSessionManager, sess *mqttSession) {
@@ -482,7 +485,6 @@ func (c *client) mqttConsumeWillUnderGate(asm *mqttAccountSessionManager, sess *
 		return
 	}
 	sess.mu.Lock()
-	expiry := sess.expiryInterval
 	sessGen := sess.gen
 	originSessionSeq := sess.seq
 	sess.mu.Unlock()
@@ -493,7 +495,60 @@ func (c *client) mqttConsumeWillUnderGate(asm *mqttAccountSessionManager, sess *
 	// only (mqttAcceptFactQualifies / scanAcceptFacts) and no session record, so an
 	// ordinary disconnect save — which creates no fact — cannot move this baseline against
 	// us either.
-	c.srv.mqttHandleWill(c, expiry, sessGen, originSessionSeq, asm.sessStreamEpoch)
+	// nil expiry: read from the CONNECTION, under the same lock that consumes the Will. The
+	// interval is connection-owned and stays mutable through an MQTT 5 DISCONNECT override,
+	// so a value sampled here could be stale by the time the Will is claimed — and it
+	// decides whether the Will is due now or after a delay, and whether that delay is
+	// capped. Reading sess.expiryInterval was doubly wrong: a replacement connection may
+	// already have overwritten it (see mqttSessionExpiry). F-084.
+	c.srv.mqttHandleWill(c, nil, sessGen, originSessionSeq, asm.sessStreamEpoch)
+}
+
+// mqttWillFence is the delayed-Will baseline captured BEFORE an operation that resets the
+// session object, for a disposal whose Will action runs after it.
+//
+// It exists for exactly one caller and the reason is specific: the post-reset
+// teardown-incomplete arm disposes an object whose clear() has already re-minted its
+// generation and set its sequence to 0. Sampling the session there would hand
+// enqueueDelayedWill a zero origin sequence, which its validation refuses — so the delay
+// would be sacrificed and the Will published immediately, for a session that had merely
+// failed to tear itself down. The fence carries the RETIRING incarnation's identity, which
+// is the one the Will actually belongs to. F-084.
+//
+// It carries the IDENTITY only. The Session Expiry Interval is deliberately not part of it:
+// that is connection-owned and stays mutable, so it is read under the lock that consumes
+// the Will rather than snapshotted here. What clear() destroys is the generation and the
+// sequence, and those are what the fence preserves.
+type mqttWillFence struct {
+	gen string
+	seq uint64
+}
+
+// mqttCaptureWillFenceLocked samples the fence. Must be called before the reset.
+//
+// sess.mu must NOT be held.
+func (sess *mqttSession) mqttCaptureWillFence() *mqttWillFence {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return &mqttWillFence{gen: sess.gen, seq: sess.seq}
+}
+
+// mqttConsumeWillWithFence is mqttConsumeWillUnderGate against an explicit baseline. A nil
+// fence means "sample the session now", which is right everywhere the session still carries
+// the incarnation the Will belongs to.
+//
+// The ownership gate is held on entry; sess.mu is not.
+func (c *client) mqttConsumeWillWithFence(asm *mqttAccountSessionManager, sess *mqttSession,
+	f *mqttWillFence) {
+
+	if f == nil {
+		c.mqttConsumeWillUnderGate(asm, sess)
+		return
+	}
+	if c == nil || sess == nil || asm == nil || c.srv == nil {
+		return
+	}
+	c.srv.mqttHandleWill(c, nil, f.gen, f.seq, asm.sessStreamEpoch)
 }
 
 // mqttSettleLiveArbitration is the EVENTUAL half of the live SUBSCRIBE's tail: it resolves an
@@ -541,15 +596,21 @@ func (c *client) mqttSettleLiveArbitration(asm *mqttAccountSessionManager, sess 
 		c.mqttConsumeWillUnderGate(asm, sess)
 
 	case mqttUncertainForeign:
-		// Demonstrated takeover. Same disposition as the direct arm, and for the same
-		// reason: the Will goes with the connection the displacement closes.
-		c.mqttDiscardWillOnTakeover()
-		stale, applied := sess.disposeForeignStateLocked(asm, c)
+		// The resolver found a record that is not ours. Same DISPOSITION as the direct arm
+		// and for the same reason — this object may not write and must not serve — but the
+		// Will is CONSUMED, not discarded: nothing here demonstrated a successor, which is
+		// exactly what the forked arm below already says of itself. F-084.
+		//
+		// Phase 1, then the transaction, then the Will: the consume does JetStream work and
+		// the fence cannot be held across it, and the ownership gate is still held, which is
+		// what mqttConsumeWillUnderGate requires.
+		d := sess.disposeForeignStateLocked(asm, c, false)
 		if err := sess.endRecordTx(tok); err != nil {
 			c.Errorf("MQTT: %v", err)
 		}
-		if applied && stale != nil {
-			voc := mqttDisposalForForeignResolution(res)
+		d.applyWill(sess, asm)
+		if d.applied && d.stale != nil {
+			voc, stale := mqttDisposalForLineage(res == mqttUncertainForked), d.stale
 			arb.disposed = true
 			*tail = func() {
 				stale.mqttNotifyForeignDisposal(sess.id, voc)

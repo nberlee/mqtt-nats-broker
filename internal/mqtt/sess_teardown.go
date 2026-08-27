@@ -27,8 +27,9 @@
 //
 //  2. This claim. Its remaining job is narrower but still necessary: keep two
 //     brokers from tearing down and resuming the same record at once, and stop
-//     treating a vanished record as proof of OUR OWN success. A lost claim CAS means
-//     a newer owner exists, so delete nothing. A release is a sequence-targeted
+//     treating a vanished record as proof of OUR OWN success. A lost claim CAS means the
+//     claim is not ours — not that a newer owner exists, which it cannot say — so delete
+//     nothing. A release is a sequence-targeted
 //     delete whose no-op is classified by re-reading, never assumed to be ours.
 //
 // Every CONNECT that can INTERPRET the record FINISHES a marker it reads rather than
@@ -107,8 +108,9 @@ const (
 	mqttTeardownReleased mqttTeardownRelease = iota
 	// mqttTeardownRetry: our marker is still current; the delete did not take.
 	mqttTeardownRetry
-	// mqttTeardownSuperseded: a newer owner holds the record (a different nonce, or
-	// no marker at all). Touch nothing further.
+	// mqttTeardownSuperseded: the record is no longer the one this claim held (a different
+	// nonce, or no marker at all). It does not name a newer owner — nothing here can.
+	// Touch nothing further.
 	mqttTeardownSuperseded
 	// mqttTeardownIndeterminate: the classifying re-read failed. Nothing may be
 	// concluded, so nothing further may be deleted.
@@ -145,9 +147,9 @@ type mqttTeardownClaim int
 const (
 	// mqttTeardownClaimWon: the marker is durably ours; the deletions may run.
 	mqttTeardownClaimWon mqttTeardownClaim = iota
-	// mqttTeardownClaimSuperseded: a newer owner (or another teardown) holds the
-	// record. Delete NOTHING. This is a complete outcome, not a failure: there is
-	// nothing left for this session to do.
+	// mqttTeardownClaimSuperseded: the record moved past the base this claim held, or
+	// carries a teardown marker that is not ours. Delete NOTHING. This is a complete
+	// outcome, not a failure: there is nothing left for this session to do.
 	mqttTeardownClaimSuperseded
 	// mqttTeardownClaimIndeterminate: the outcome is unknown. Delete nothing and
 	// report it, so the caller fails closed rather than believing a teardown ran.
@@ -223,8 +225,9 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 				return 0, nonce, mqttTeardownClaimIndeterminate,
 					fmt.Errorf("unable to resolve the teardown claim of session %q: %w", ps.ID, lerr)
 			}
-			// The record is gone, so somebody else already released this session. There
-			// is nothing to claim and nothing to delete on its behalf.
+			// The record is gone, so this session was already released — by what, an
+			// absence cannot say. There is nothing to claim and nothing to delete on its
+			// behalf.
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
 		}
 		cur := &mqttPersistedSession{}
@@ -237,12 +240,12 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 			// Our write landed after all; only the response was lost.
 			return smsg.Sequence, nonce, mqttTeardownClaimWon, nil
 		case cur.Teardown != nil:
-			// Another broker's teardown owns this record. It (or the next reader that
-			// can interpret the record — a CONNECT, or a sweep) finishes it; we delete
-			// nothing.
+			// A teardown marker that is not ours holds this record. Whoever wrote it — or
+			// the next reader that can interpret the record, a CONNECT or a sweep —
+			// finishes it; we delete nothing.
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
 		case smsg.Sequence != seq:
-			// The record moved: a newer owner exists.
+			// The record moved past the sequence this claim resolved against.
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
 		default:
 			// Still exactly the record we resolved against, so the rejection was
@@ -683,9 +686,12 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 		return
 	}
 	if cur.Gen != t.gen {
-		// A fresh-generation successor: legitimate, and none of this teardown's
-		// business. This comparison is what keeps the repair from being collateral
-		// damage, so it is the one the mutation matrix removes.
+		// A DIFFERENT generation, so this teardown - which retires one generation, not a
+		// client ID - has no business with it. That is a lineage fact and not a claim that
+		// anyone holds the session (F-084); it does not need to be one, because the
+		// conclusion drawn is the negative one: do not condemn. This comparison is what
+		// keeps the repair from being collateral damage, so it is the one the mutation
+		// matrix removes.
 		return
 	}
 	if cur.Teardown != nil {
@@ -930,8 +936,8 @@ func (sess *mqttSession) releaseTeardown(tok recordTx, t *mqttTeardownTarget, no
 			lastErr = fmt.Errorf("session %q teardown marker still present at sequence %v", t.id, smsg.Sequence)
 			continue
 		}
-		// A different nonce, or no marker at all: a newer owner exists. This teardown
-		// is over and nothing further may be deleted on its behalf. The record and its
+		// A different nonce, or no marker at all: the marker this teardown held is gone.
+		// This teardown is over and nothing further may be deleted on its behalf. The record and its
 		// sequence go back to the caller, which is what lets the claim-won deletion
 		// window be recognised and repaired instead of merely reported.
 		return mqttTeardownSuperseded, ps, smsg.Sequence, nil
@@ -1041,7 +1047,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 		// the same generation's, naming what is now gone. Condemn it before returning the
 		// sentinel below, which is unchanged.
 		sess.condemnRetiredSurvivor(tok, target, cur, curSeq)
-		// Somebody else's record is there now. Nothing further is ours to delete —
+		// A record that is not ours is there now. Nothing further is ours to delete —
 		// and in particular the group durables its membership may hold are not.
 		//
 		// SURFACED, not swallowed. Returning nil here told createOrRestoreSession the

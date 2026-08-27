@@ -14,9 +14,11 @@ import (
 // FORKED under the connection, and a real client left publishing into it.
 //
 // The companion is TestMQTTBoundRejectionE2EForeignClosesConnection, which stages a
-// legitimate SUCCESSOR through the same machinery and must still get 0x8E. Read them
-// together: this file's assertion is only meaningful because that one exists — a change
-// that downgraded every rejection to 0x89 would pass here and fail there.
+// child-SHAPED record through the same machinery. Both now get 0x89 — F-084 withdrew the
+// takeover claim from every record-derived route, a child-shaped body proving no successor
+// — so the DISCRIMINATOR moved: the two are separated by the Reason String and by whether a
+// fork grant is minted, not by the reason code. A change that collapsed the two classes
+// would still fail one of them.
 
 // testE2ELandSibling stores a record CLAIMING the SAME parent as the bound session's
 // acknowledged one, unconditionally — no per-subject expectation, so nothing excludes it.
@@ -284,8 +286,8 @@ func testE2ELiveCompetingOwner(t *testing.T, s *Server, node, clientID string, i
 // It is called AFTER the local session has written again, which is what makes the two
 // writes siblings rather than parent and child: both are derived from the record the peer
 // restored, and only one of them could have committed under a working CAS. Getting that
-// ordering wrong yields a legitimate successor and a 0x8E — which is the correct answer to
-// a different question.
+// ordering wrong yields a child-shaped body, which is unsettled-and-no-mint — the correct
+// answer to a different question.
 func testE2ELandCompetingWrite(t *testing.T, sess *mqttSession, idHash string) {
 	t.Helper()
 	sess.mu.Lock()
@@ -322,11 +324,16 @@ func testE2ELandCompetingWrite(t *testing.T, sess *mqttSession, idHash string) {
 // on the shape that actually produces it and at the only layer where a Will publication is
 // observable.
 //
-// A body claiming our parent does not prove the survivor is an orphan. Here the competing broker is
-// real, resident, and holds the surviving record — a genuine takeover, as far as anything
-// durable can show — and the displaced client's Will is nonetheless PUBLISHED, because the
-// fork verdict withholds the takeover claim and the connection ends through ordinary close
-// bookkeeping instead of mqttDiscardWillOnTakeover.
+// A body claiming our parent does not prove the survivor is an orphan. Here the competing
+// broker is real, resident, and holds the surviving record — the FIXTURE knows that, and
+// the displaced client's Will is nonetheless PUBLISHED, because the fork verdict withholds
+// the takeover claim and the connection ends through ordinary close bookkeeping instead of
+// mqttDiscardWillOnTakeover.
+//
+// That the competitor is genuine here is precisely what makes this the residual rather
+// than a defect: nothing durable distinguishes this from a replay or a stranger, so the
+// broker must answer the same way in all three, and the price is a Will published where a
+// provable takeover would have suppressed it (F-084).
 //
 // This asserts the residual, so it FAILS if the behavior is ever changed. That is
 // deliberate: docs/CONFORMANCE.md states it and the plan approved it, and pinning it is
@@ -402,7 +409,7 @@ func TestMQTTForkedRecordE2EWithALiveCompetingOwnerPublishesTheWill(t *testing.T
 		t.Fatalf("read the DISCONNECT reason: %v", err)
 	}
 	if reason != mqttReasonServerBusy {
-		t.Fatalf("a sibling with a LIVE competing owner is still only unsettled, so 0x89: got %x", reason)
+		t.Fatalf("a sibling is only ever unsettled, live competitor or not, so 0x89: got %x", reason)
 	}
 
 	// The residual itself: the Will goes out. A demonstrated takeover would have
@@ -449,28 +456,36 @@ func testAssertCurrentOwner(t *testing.T, sess *mqttSession, idHash string) {
 // T9: the finding itself, over real connections
 // ---------------------------------------------------------------------------
 
-// TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient is T9 after the write-lineage
+// TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient is T9 after the write-lineage
 // audit, and it pins the RESIDUAL on the wire rather than a capability.
 //
 // The bound session's record here is a PRODUCTION create whose ONLY save is the accept
 // save: the client's previous clean-start close deleted its record, and the reconnect's
 // create used to inherit the retirement watermark's RWID. That inheritance is gone, so
-// the create is parentless, a sibling of it can no longer be proven, and the displaced
-// client is told 0x8E "session taken over" — a claim that somebody legitimately owns the
-// session, when the two creates arbitrated nothing.
+// the create is parentless and a sibling of it can no longer be proven.
+//
+// The RESIDUAL is that unprovability. What the displaced client is TOLD is no longer part
+// of it: F-084 replaced the old 0x8E "session taken over" — a claim that somebody
+// legitimately owns the session, when the two creates arbitrated nothing — with 0x89
+// "ownership unsettled", which is what the evidence actually supports.
 //
 // Asserting it end to end is deliberate. The residual is stated in docs/CONFORMANCE.md,
 // and a residual nothing exercises is a sentence rather than a fact; this is also the
 // test that would fail first if a future change restored an inheritance without saying so.
 //
-// No Will assertion here, unlike the rejection-settlement e2e above: this verdict is
-// reached by the eviction route, which detaches the client first, and a Will lost that way
-// is a residual already recorded for BOTH verdicts (docs/CONFORMANCE.md).
+// No Will assertion here, unlike the rejection-settlement e2e above, and the reason is no
+// longer a residual: this verdict is reached by the eviction route, whose Will behaviour
+// F-084 fixed and whose fixtures live with it
+// (TestF084RemotePersistEvictionDischargesWill for a live Will,
+// TestF084RemotePersistEvictionEnqueuesDelayedWill for a delayed one, and
+// TestF084RemotePersistEvictionDischargesParkedAction for a parked action). Asserting
+// it again here would duplicate them without discriminating anything this test is for,
+// which is the INHERITANCE the displaced client is answered about.
 //
 // The verdict is reached through the persist observation rather than the rejection
 // settlement, because the latter needs a record write to reject and any such write would
 // itself give the record a parent.
-func TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient(t *testing.T) {
+func TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -549,11 +564,20 @@ func TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the DISCONNECT reason: %v", err)
 	}
-	if reason != mqttReasonSessionTakenOver {
-		t.Fatalf("a create whose sibling erased it answers 0x8E 'session taken over', because "+
-			"nothing establishes the two as siblings any more. This is the residual, not the "+
-			"goal: 0x89 would require an inherited parent identity, which every documented "+
-			"route also made available to a FALSE fork. Got %x", reason)
+	// 0x89 ownership-unsettled. The write-lineage audit made a parentless create concede
+	// here, because two unrelated first creates are indistinguishable and calling them
+	// siblings would manufacture a FALSE fork — that part is unchanged and is still the
+	// residual. What changed is what conceding SAYS: F-084 stopped it claiming a takeover,
+	// since failing to recognise sibling-hood leaves this broker knowing LESS about who
+	// holds the session, and less knowledge cannot license a stronger claim.
+	//
+	// This is now strictly closer to the goal than the 0x8E it replaced: the client is
+	// invited to reconnect rather than told to stop, which is the truthful instruction on
+	// evidence that established no successor.
+	if reason != mqttReasonServerBusy {
+		t.Fatalf("a create whose sibling erased it answers 0x89 'ownership unsettled': "+
+			"nothing establishes the two as siblings, and nothing establishes a successor "+
+			"either. Got %x", reason)
 	}
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var buf [256]byte

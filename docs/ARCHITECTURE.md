@@ -940,7 +940,8 @@ first-creates racing across a leader term apart from two unrelated ones — **re
 deliberately.** F-029b closed it by having a create inherit the retired record's identity;
 the write-lineage audit deleted that inheritance and every other one, because each route
 by which such a verdict was reached was equally a FALSE fork. Every create is parentless
-again, the pair concedes 0x8E, and that is residual R-create in `docs/CONFORMANCE.md` —
+again, the pair CONCEDES, and that is residual R-create in `docs/CONFORMANCE.md` —
+what conceding says being `0x89` ownership-unsettled since F-084, not `0x8E` —
 the principal safety cost of this design, not a gap awaiting a fix. See "Recognising a
 forked session record". The other — the window in which a teardown that WON its claim has
 already deleted the consumers a surviving foreign record still names — is closed by
@@ -951,7 +952,10 @@ therefore outside this design's reach (see "The generation-retirement watermark"
 
 Ownership of a session changes only by a write to its record subject on `$MQTT_sess`,
 so **observing that stream is observing every ownership change** — and a session
-nobody writes about needs no revalidation at all. That is what lets convergence cost
+nobody writes about needs no revalidation at all. What one observation establishes is
+that the record MOVED, and so is no longer ours; it identifies no successor, and no
+route downstream of it may claim one (see "Only a held successor licenses a takeover
+claim"). That is what lets convergence cost
 nothing per quiet session, which the rejected alternatives could not: a periodic READ
 per resident session proves nothing when it finds the record unmoved (10164 is
 returned while a write is in process upstream), and a periodic CAS would be a write
@@ -961,7 +965,7 @@ What this replaced was an at-most-once core-NATS notification on the JetStream r
 subject of every other broker's session store (`$MQTT.JSA.*.SP.*.*`). Lost meant lost:
 a never-expiring session — **every** MQTT 3.1.1 persistent session — has no expiry
 timer, the expiry sweep skips it, and nothing else re-validated a resident object, so
-a displaced client kept being served against a session another broker owned, which is
+a displaced client kept being served against a session whose record had moved, which is
 the split-brain [MQTT-3.1.4-3] forbids.
 
 **The watch is not a durable channel either, and the design does not claim it is.** It
@@ -1025,21 +1029,22 @@ Two shapes trigger, and the second is the one no sequence comparison can see:
   claim CAS won — so a record can only vanish under a party that first claimed it.
   The CONNECT rollback used to be a second, unclaimed one; it now tears down through
   `clear()` instead, which is the stronger statement this arm always wanted. The bound
-  outcome is therefore **0x8E**, not 0x89; `docs/CONFORMANCE.md` records the one
-  imprecision that leaves.
+  outcome was **0x8E** when this was written; **F-084 made it `0x89`
+  ownership-unsettled**, because record absence is an ownership fact and not a successor
+  fact. `docs/CONFORMANCE.md` records what that leaves.
 
 **Observing our own writes is new, and one shape of it is dangerous.** The old channel
 never delivered this broker's own stores; a stream watch delivers everything. A save
 that LANDED with its response lost arms `seqUncertain` and leaves the acknowledged
 lineage pair stale, so the delivered record is strictly past `sess.seq` and lineage
-would read our own bytes as unrelated — evicting the rightful client with 0x8E over
+would read our own bytes as unrelated — evicting the rightful client over
 its own write. Two layers answer it: before the write settles, the writer's open
 record transaction refuses the worker's fence; after it arms, the worker's **digest
 arm** (`evictOwnLanding`) recognises the record as the attempt's own bytes, using the
 resolver's identity test verbatim, and defers to the resolver without deciding
 anything. The same refusal covers the case with NO bytes to compare: while an attempt
-is unresolved, an unusable load (absent, unreadable, undecodable) may not concede to
-the takeover vocabulary, because the trigger can be that very write — the backstop
+is unresolved, an unusable load (absent, unreadable, undecodable) may not concede at
+all, because the trigger can be that very write — the backstop
 reaches this path carrying no record at all, so nothing else can screen it. The record's
 `Origin` is used only as a **spawn filter** on the delivery
 path — `Origin` proves no authorship, so the backstop deliberately passes no record at
@@ -1104,7 +1109,8 @@ reproduces the same late-landing false-foreign shape, one arm over.
 same base sequence.** That is an arbitration, not a repair. A success proves the attempt's
 CONTENT durable at the sequence it reports; a rejection
 proves the subject moved, and one further read (through the same classification helper,
-so the two cannot drift) says by whom — ours if the original landed in the window, foreign
+so the two cannot drift) classifies WHAT is there — never by whom, which no record can say
+(F-084): ours if the original landed in the window, not-ours
 if the record moved to other content, **unresolved** if it is at base again (contention)
 or unreadable, and for an absent record whatever the REJECTION KIND says (below: 10164
 defers, 10071 is fail-safe foreign). An ambiguous re-attempt keeps the identity EXACTLY
@@ -1172,8 +1178,9 @@ disposition too and can be re-armed by a different attempt. A connection the set
 DISPLACED is not acknowledged, and what makes that hold is the **DISCONNECT claim read
 inside the enqueue's own `c.mu` critical section**: a displacement notifies through that
 claim and `processSessionPersist` holds no lock of ours, so any check made and released
-before the enqueue is a check-then-act and an acknowledgment appended behind the 0x8E
-would violate [MQTT-3.14.4-1]. The tail also samples ownership (`sess.c == c` under
+before the enqueue is a check-then-act and an acknowledgment appended behind the
+displacement's DISCONNECT would violate
+[MQTT-3.14.4-1]. The tail also samples ownership (`sess.c == c` under
 `sess.mu`, rather than the asynchronous close flag), but that half is defensive: every
 displacement that can reach the tail has a written CONNACK and therefore consumes the
 claim, so removing the sample changes no reachable outcome today. It states a different
@@ -1274,7 +1281,9 @@ recognition changes.
 
 What that concedes is the PARENTLESS CREATE PAIR: two records both carrying no parent, so
 arm 2's `ackPWID != ""` conjunct concedes from either orientation and the erased side
-answers 0x8E about a takeover nothing arbitrated.
+cannot recognise the pair as siblings. **Since F-084 the erased side answers `0x89`
+ownership-unsettled** rather than asserting a takeover nothing arbitrated: the
+unrecognisability is still the residual, but the claim it produces is now truthful.
 
 Its stated route used to be a cross-term one — both brokers find the subject empty,
 both are admitted at base 0, both apply. **That route is closed**: a create is
@@ -1286,8 +1295,8 @@ unconditional foreign write, or an out-of-band deletion followed by a create, pr
 parentless record beside ours just as well. That is the pre-F-029b behavior, restated
 as a residual in
 `docs/CONFORMANCE.md` and pinned end to end by
-`TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient`. It is a residual conditioned on
-EVIDENCE, not on a rollout: it stands unless a route is found that produces the verdict
+`TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient`. It is a residual conditioned
+on EVIDENCE, not on a rollout: it stands unless a route is found that produces the verdict
 without also producing the false ones.
 
 Nothing was lost on the repair side, because a create-parented fork was **repaired by
@@ -1308,10 +1317,13 @@ present is refused; any other lookup failure fails startup rather than being fol
 absence.
 
 Sibling-hood is defined against the **acknowledged** pair, never the in-flight attempt:
-with acknowledged `{a,p}` and attempt `{c,a}`, survivor `{b,p}` is the fork, `{d,a}` is a
-legitimate child, and `{c,a}` is our own late landing (recognised by digest before lineage
-is reached). All four conjuncts of arm 2 are load-bearing, and the last one is the least
-obvious: `storeFramedSessionMsg` replays our acknowledged bytes verbatim and a clustered
+with acknowledged `{a,p}` and attempt `{c,a}`, survivor `{b,p}` is the fork, `{d,a}` is
+child-shaped, and `{c,a}` is our own late landing (recognised by digest before lineage is
+reached). Child-shaped is a lineage verdict and nothing more: it says our record was read
+before that write, not that its author holds the session now.
+
+All four conjuncts of arm 2 are load-bearing, and the last one is the least obvious:
+`storeFramedSessionMsg` replays our acknowledged bytes verbatim and a clustered
 duplicate proposal can land them at a higher sequence, so without `found.WID != ackWID`
 that replay is reported as a fork of itself.
 
@@ -1325,7 +1337,7 @@ already had, changing only what is reported:
 
 | Path | On a body claiming our parent |
 |---|---|
-| definite rejection, **bound** (`sess_rejected_write.go`) | `mqttBoundUnsettled` → **0x89** and the ORDINARY close bookkeeping. Deliberately not the foreign arm's shape: that arm calls `mqttDiscardWillOnTakeover` first, and suppressing a Will on a takeover nothing demonstrated is a silent loss |
+| definite rejection, **bound** (`sess_rejected_write.go`) | `mqttBoundUnsettled` → **0x89** and the ORDINARY close bookkeeping. Deliberately not the foreign arm's shape — but the difference is the DISPOSAL, not the Will: since F-084 that arm consumes the Will too, suppressing one on a takeover nothing demonstrated having been the defect on either arm |
 | definite rejection, **unbound** | the same foreign disposition, with the forked vocabulary. It passes `nil` for the client, so the helper returns before the notification and *nothing observable differs*; the arm exists so the classifier has one meaning everywhere |
 | ambiguity resolution (`sess_uncertain.go`) | the same foreign disposition, verbatim — the same eviction, residency, continuation and parked-action treatment — with the forked vocabulary |
 | CONNECT-time classified saves (`reconcileResumedConsumers`, `grantRequestedLifetime`) | the same disposition, forked vocabulary. Their **10071** arms disposed with no readback at all, so they now read once and classify — the only new I/O in the mechanism, on a pre-CONNACK rejection path |
@@ -1370,10 +1382,11 @@ in-process coalescing — arbitration stays with the record CAS and the rejectio
   knowledge, so the loop is bounded by observation count.
 - **The observation licenses; the read only narrows.** An absent, undecodable,
   unreadable, or below-trigger record cannot revoke the license the observation granted:
-  those arms concede the takeover vocabulary and decide at the observation level
-  (evict only if `target > sess.seq`). A record older than the write that licensed the
-  eviction is never classified — classifying it could answer 0x89 for a write it cannot
-  speak for.
+  those arms concede the UNSETTLED vocabulary and decide at the observation level
+  (evict only if `target > sess.seq`). They used to concede the takeover one, which was
+  the strongest claim available on the weakest evidence there is; F-084 corrected it. A
+  record older than the write that licensed the eviction is never classified — classifying
+  it could answer *forked* for a write it cannot speak for, and mint a grant with it.
 - **The gate is observed, never claimed.** The decision is one `as.mu` critical section;
   `lockSession` itself needs `as.mu`, so no gate can be newly taken while it runs, and a
   gate already held defers the worker (bounded retries, then a refused exit). That is a
@@ -1388,8 +1401,9 @@ in-process coalescing — arbitration stays with the record CAS and the rejectio
   the classification runs HERE, at decision time, never from a pair sampled at load
   time. An AMBIGUOUS attempt (store landed, response lost) closes its transaction with
   the pair still stale behind `seqUncertain`; that staleness only narrows — a sibling of
-  the unadopted attempt concedes to the takeover claim (the one-hop recognition miss,
-  today's behavior exactly), a sibling of the acknowledged record still classifies
+  the unadopted attempt concedes as UNSETTLED (the one-hop recognition miss — failing to
+  recognise sibling-hood leaves the broker knowing LESS, and less knowledge cannot license
+  a stronger claim), a sibling of the acknowledged record still classifies
   forked, and no shape manufactures a false forked verdict from a stale pair.
 - **Strict staleness.** Eviction requires `loadedSeq > sess.seq`. Equality is the
   session's own record — no remote write can land AT our acknowledged sequence within a
@@ -1411,14 +1425,19 @@ in-process coalescing — arbitration stays with the record CAS and the rejectio
   record it happened to load, so an observation at exactly that record's level still
   forces a decision once the gate frees.
 
-On the takeover verdict the worker cancels the displaced incarnation's delayed-Will
-outbox records, scoped by generation and origin sequence, inline (it is already off the
-delivery goroutine and tracked). On the forked verdict that scan does not run: the
-records stay pending, and their fate at `FireAt` still belongs to the fire-time fences.
+The worker cancels no delayed-Will outbox record, on any verdict. It used to run a
+generation-and-origin-scoped cancel on the takeover verdict; that was removed when the
+displaced incarnation's Will became the claimant's business, decided when it becomes due
+against the permanent acceptance facts. What the worker does owe is the displaced
+connection's OWN Will, which F-084 added: before the notification and the close, the
+eviction tail discharges a parked action or hands a live Will to ordinary handling. Records
+already pending stay pending, and their fate at `FireAt` belongs to the fire-time fences.
 
 ### Repairing a recognised fork
 
-Recognition stops a false takeover claim; it does not give the client back the
+Recognition earns the FORK vocabulary and the repair grant that goes with it — stopping a
+false takeover claim is no longer what it buys, since F-084 withdrew that claim from every
+record-derived route. It does not give the client back the
 subscriptions it was SUBACKed for, nor the UNSUBSCRIBEs it was UNSUBACKed for. MQTT
 requires the Session State to carry the client's subscriptions ([MQTT-4.1.0-1], Spec5
 [4.1.1]), so that loss is a conformance break. `sess_fork_repair.go` closes the
@@ -1561,8 +1580,9 @@ nothing is a property, not a special case — **an empty delta mints nothing**, 
 means no changes, no nonces and no PUBREL consumer, since those are independent persisted
 members. No other verdict
 mints: the write landed (`mqttRejectionOurs`), contention is never ownership (`Keep`),
-nothing was established (`Unresolved`), and a demonstrated successor descends from our
-record so our change is in its ancestry. `evictDecideOnce` holds `as.mu` for its whole
+nothing was established (`Unresolved`), and a CHILD-SHAPED record descends from ours by
+its own claim, so our change is in the ancestry it asserts. `evictDecideOnce` holds
+`as.mu` for its whole
 decision and calls a `...Locked` form; the other six take `as.mu` themselves. Two named
 functions, not one that guesses.
 
@@ -1681,15 +1701,16 @@ session — **every** MQTT 3.1.1 persistent session — has no expiry timer eith
 expiry sweep skips it outright. So with the notification lost the object stays resident
 indefinitely, holding the client ID's reaping duty it can no longer discharge (both the
 cross-replica expiry handoff and the sweep's stamp-a-deadline branch defer to a resident
-object), and a **bound** one keeps serving a client against a session another broker owns
-— which [MQTT-3.1.4-3] requires to be closed.
+object), and a **bound** one keeps serving a client against a session whose record this
+broker may no longer write — which [MQTT-3.1.4-3] requires to be closed.
 
 **What settles it is a write, not a read.** JetStream returns 10164 while a write for the
 subject is *in process* upstream, so a load that finds the record still at our base
 sequence proves nothing — the contender's proposal can commit a moment later. The
 settlement is therefore a **probe**: re-attempt the save of CURRENT memory so a fresh CAS
-arbitrates ownership, and let the readback distinguish only contention from a foreign
-owner. The probe re-marshals memory rather than replaying the rejected bytes, because a
+arbitrates ownership, and let the readback distinguish only contention from a record that
+is not ours — not from an OWNER, which nothing on this path identifies. The probe
+re-marshals memory rather than replaying the rejected bytes, because a
 definitely-failed caller has since rolled its mutation back. It CASes at our own
 last-known sequence, so it can neither overwrite a record that moved (a foreign record
 rejects it) nor recreate a released one (a rejection implies a non-zero base, so the CAS
@@ -1756,16 +1777,17 @@ probe and the next opportunity to re-probe.
 **Fail closed on everything but a landed CAS.** The settlement claims the ownership gate as
 the bound client (the claim a SUBSCRIBE makes), takes the record fence in its blocking form
 as an outermost readLoop entry point, and probes. *Landed* → dispatch, marker retired.
-*Foreign* → the Will is discarded as a local takeover discards it, the session state is
-disposed under the gate, and then — off the gate, on the readLoop — the takeover
-notification is ATTEMPTED through the shared tail (`mqttNotifyTakenOver`; suppressed if this
+*Foreign* → the Will is **consumed normally**, the session state is
+disposed under the gate, and then — off the gate, on the readLoop — the
+notification is ATTEMPTED through the shared tail (suppressed if this
 connection never saw its CONNACK, or if another displacement path already claimed its one
 DISCONNECT) and the connection closed synchronously before `mqttParse` returns, which is the
 graceful DISCONNECT branch's own shape: no re-entry, no second DISCONNECT, and no socket I/O
 under the gate. *No verdict with the gate held* — contended, unreadable, probe ambiguous,
 suspended by an unresolved write — establishes nothing and closes the connection with
-`errMQTTSessionOwnershipUnsettled`, a parse error mapped to **0x89 "server busy"** rather
-than 0x8E, because announcing a takeover nobody proved would tell a client to stop
+`errMQTTSessionOwnershipUnsettled`, a parse error mapped to **0x89 "server busy"** — the
+same code the *Foreign* verdict now reports, because announcing a takeover nobody proved
+would tell a client to stop
 reconnecting on a guess. Returning that as a parse error is what makes the stop a real
 stop: the readLoop's ordinary close bookkeeping runs, and the periodic pass settles the
 marker after the unbind.
@@ -1825,10 +1847,12 @@ displacement has its own single owner:
   may call it; one runs.
 - **Will disposition**: `willDisposition`, transitioned only under `c.mu` and consumed
   exactly once by `mqttTakeWillLocked`, with the takeover discard rule applied by whichever
-  side observes the displacement first while holding that lock.
+  side observes the displacement first while holding that lock — and applied **only** where
+  a successor is held in hand; every record-derived displacement consumes instead. See
+  "Only a held successor licenses a takeover claim".
 
-The four takeover notifications share one tail, `mqttNotifyTakenOver`, which is also the only
-home of the [MQTT-3.2.0-1] CONNACK gate for them: a connection displaced before its own
+Every displacement notification shares one tail, `mqttNotifyDisplaced`, which is also the
+only home of the [MQTT-3.2.0-1] CONNACK gate for them: a connection displaced before its own
 CONNACK is closed silently, because CONNACK must be the first packet a client sees and
 `mqttAbortAcceptedConnect` leaves a refused connection bound until its readLoop detaches it.
 That gate reads `connAckWritten` under `c.mu`, which is why `mqttEnqueueConnAck` stores the
@@ -3112,8 +3136,9 @@ Five outcomes, and the two rejection kinds are deliberately not equivalent:
   that another broker owns the session, which is the stronger claim F-084 owns. It
   disposes *without* consulting the contention resolver, so this is the only place a
   sibling lineage can be recognised on that arm: the record is read once and classified,
-  which both narrows 0x8E to 0x89 where the record only supports it and mints the fork
-  grant. Collapsing 10071 to a bare takeover would lose both.
+  which distinguishes a proven sibling from an unclassifiable stranger and mints the fork
+  grant for the first only. Both classes now report `0x89`; what separates them is the
+  Reason String and, decisively, the mint.
 - **10164** is clustered contention rather than a lost race, and gets the bounded
   re-read/retry treatment, whose verdicts map onto the same five.
 - **ambiguous** — the mutation is KEPT, no further write is permitted, and the resolver
@@ -3127,7 +3152,7 @@ DISCONNECT is gated on the CONNACK having been written, which is false for every
 inside the CONNECT, so no DISCONNECT is sent at all. The refusal is not silent, though —
 it goes through `refuseDisposing` and carries a **failure CONNACK** whose reason code and
 Reason String say what the evidence supports and no more. See "The pre-CONNACK refusal
-signal", and F-084 for the claim the disposal vocabulary still over-states.
+signal", and "Only a held successor licenses a takeover claim".
 
 **Why this path needs no transmission gate.** The restore gate is armed before the first
 subscription the CONNECT installs and opens only after a confirmed success CONNACK, and
@@ -3260,15 +3285,21 @@ nearly twice the intended cap. The fourth, shared QoS 0, consults the same two v
 without waiting on either and **drops**, as it does for the restore gate. Plain QoS 0
 stays ungated: it acknowledges nothing on the group's behalf.
 
-**The disposition follows the two existing precedents rather than inventing a third.** A
-demonstrated takeover disposes and discards the Will exactly as a local takeover does, then
-notifies `0x8E` and closes — and the packet returns *nothing* to the parser, because speaking
-again would race the displacer for the reason the client is left with. Every other
+**The disposition follows the two existing precedents rather than inventing a third.** The
+FOREIGN outcome disposes — the record is not ours, so this connection may not serve the
+group — then notifies and closes, and the packet returns *nothing* to the parser, because
+speaking again would race the displacer for the reason the client is left with. Every other
 non-owning outcome — a sibling that erased our write, a definite local failure, an
-unresolvable ambiguity — neither disposes nor discards: none of them demonstrates another
-owner, so the client is told `0x89` "try again" and the session is left intact.
+unresolvable ambiguity — does not dispose: the session is left intact.
 
-**Every non-Foreign close consumes the Will while the ownership gate is still held**, rather
+**Since F-084 the Will is treated the same on ALL of them**, Foreign included, and the
+client is told `0x89` on all of them too. This section used to call the Foreign outcome a
+"demonstrated takeover" that discarded the Will and notified `0x8E`; it demonstrates no
+such thing — a rejected ownership CAS establishes that the subject moved and nothing about
+who moved it — and suppressing a Will on it was silent loss. What still separates Foreign
+from the rest is the DISPOSAL, not the claim and not the Will.
+
+**Every close here consumes the Will while the ownership gate is still held**, rather
 than leaving it to the ordinary close. A record-observation eviction can detach the session
 in between, and the detached path publishes only an already-owed *immediate* Will — so a
 delayed one would never reach the durable outbox. The Will disposition is consumed exactly
@@ -3643,7 +3674,8 @@ while the write is unresolved snapshots the lifetime into its deferred
 teardown, so speculative terms there would let a grant that never landed
 discard the session, and the landed continuation correspondingly retargets that
 snapshot; a 10071 hands the session over — to whoever holds the record, which the
-rejection alone does not establish (F-084) — with 10164
+rejection alone does not establish (see "Only a held successor licenses a takeover
+claim") — with 10164
 resolved by the same bounded re-read the repair save uses. A resume
 refused before this point therefore leaves the session exactly as it found it,
 in memory and in the record, with no repair machinery at all. A session that
@@ -3701,7 +3733,7 @@ JetStream at all.
 | landed | commit the leave |
 | **ambiguous** | register the landed continuation **first**, then resolve **in line under the CONNECT's own transaction**; continue only on *ours* |
 | **10164** (contention) | the bounded re-read/retry classifies it; continue only on *landed*. An unclassifiable outcome parks the continuation **before** returning |
-| **10071** (the subject moved) | classify the lineage, dispose with takeover-or-fork vocabulary, refuse |
+| **10071** (the subject moved) | classify the lineage, dispose with the fork or the ownership-unsettled vocabulary (takeover-or-fork before F-084), refuse |
 | any other definite | roll the removal back inside the still-open transaction, and refuse |
 
 Two properties hold the design together. **Continue only on proof**: no arm proceeds
@@ -3788,14 +3820,10 @@ disposing pre-CONNACK sites (the shared-membership ownership write included). Th
 load-bearing at every step: the abort discards this connection's Will before the close it
 schedules can publish it, the signal precedes any scheduled close, and the disposal is last.
 
-**The intermediate asymmetry, stated rather than discovered.** The CONNACK deliberately
-**under-claims**: it says ownership could not be confirmed even where a child-shaped body
-was
-observed and the existing disposal classifies it as a takeover, because the broker cannot
-currently prove which of those it is. The DISCONNECT and log paths, unchanged here, may still
-**over-claim** in the other direction. That whole class — what positively proves a successor,
-which sites decide it, and whether each resulting class discards or consumes the Will — is
-**F-084**.
+**The asymmetry that used to sit here is gone.** The CONNACK still deliberately
+**under-claims** — it says ownership could not be confirmed even where a child-shaped body
+was observed — and the DISCONNECT and log paths no longer over-claim in the other
+direction. F-084 closed that: see "Only a held successor licenses a takeover claim".
 
 The classification behind those two sites is one function, `classifyPreConnackSave`,
 shared by
@@ -3806,6 +3834,118 @@ written twice a new CAS kind would have to be found twice.
 consumer is what let an unclassifiable rejection reach F-078's live-SUBSCRIBE Foreign arm
 and
 change **Will disposition**, which is a different question and F-084's.
+
+## Only a held successor licenses a takeover claim
+
+`0x8E` "session taken over by a new connection" is the one DISCONNECT reason that tells a
+client to **stop reconnecting under this session**. The broker used to send it wherever a
+record-derived verdict concluded "not ours" — a record that could not be read, was absent,
+did not decode, sat at or below our base, or moved to a body that is merely valid-shaped.
+`classifyRecordLineage`'s negative verdict says of exactly those cases that *nothing is
+established*, and the broker reported the strongest claim it had.
+
+**The rule.** `mqttDisposalTakenOver` and `mqttDiscardWillOnTakeover` are licensed only by
+an in-process, causal, same-client-ID replacement in which this broker holds **both** the
+connecting client and a **non-nil** displaced client, under the client-ID ownership gate.
+That is `discardTakenOverClient`, whose two callers are the ordinary `processConnect`
+takeover and the re-drive's T1b. No persisted record shape is positive successor evidence.
+
+The rule is structural rather than asserted: `mqttDisposalTakenOver` has one reader,
+`mqttNotifyTakenOver`, which has one caller.
+
+**Why no predicate over the record works.** The obvious candidate is a usable record above
+our base whose digest differs, whose `WID` is non-empty and differs from `ackWID`, and
+whose `PWID` names `ackWID`. That identifies a **child-shaped body**, not proven ownership:
+`createOrRestoreSession` adopts `WID`/`PWID` without validating provenance, valid-shaped
+bodies arrive through unconditional publication, and `storeFramedSessionMsg` replays
+acknowledged bytes verbatim. So the claim is not narrowed by a better classifier; it is
+withdrawn from every route that cannot hold the successor.
+
+**The fourth vocabulary.** `mqttDisposalOwnershipUnsettled` carries `0x89` and
+`mqttReasonStrOwnershipUnsettled`, and says what those routes actually know: this broker
+may no longer write the record, and nothing established who may. It is a separate value
+from `mqttDisposalForked` on the `mqttDisposalTeardownIncomplete` precedent — same code and
+text, different name, because the name is read at the call site as the claim being made —
+and it **mints nothing**, because a fork grant is a repair anchored to a record proven to
+claim our parent.
+
+Both `0x89` vocabularies therefore share a reason code, which makes two things load-bearing.
+The fork bit travels **explicitly** from the classification to the mint rather than being
+recovered from `voc.reason`; recovering it would mint a grant for every unsettled record.
+And a test that asserts only the reason code can no longer tell them apart, so the claim
+assertions read the Reason String too.
+
+**The Will follows the licence, not the vocabulary.** A displacement that cannot prove a
+successor may not suppress a Will either — that is the same rule the shared-membership
+Forked and Local arms already stated ("neither demonstrates another owner, so neither
+disposes and neither discards the Will: suppressing it here would be silent loss"), applied
+to the classes that were wrongly excluded from it.
+
+Every disposal that goes through the prepared disposition now chooses exactly one typed
+`mqttWillAction` and executes it in a second phase. Two rows of the table below are reached
+WITHOUT one and are marked as such: the licensed takeover discards through
+`discardTakenOverClient`, and the pre-CONNACK refusal discards in
+`mqttAbortAcceptedConnect`. A third route, the remote-persist eviction, takes the
+record-derived row's actions from its own tail rather than from a disposition. What the
+table states is the ACTION each class owes, not the mechanism it reaches it by:
+
+| Disposal class | Live bound Will | Parked deferred action | Reached through |
+|---|---|---|---|
+| Licensed takeover | discard, keeping the already-owed-now exception | dropped — the takeover owns it | `discardTakenOverClient`, not a disposition |
+| Record-derived: unsettled or forked | consume normally | discharge against its ORIGINAL deadline | the prepared disposition, or the eviction tail |
+| Teardown-incomplete | consume normally | discharge | the prepared disposition |
+| Pre-CONNACK refusal of the ARRIVING connection | discard — no session was granted | n/a | `mqttAbortAcceptedConnect`, not a disposition |
+
+**Phase 1 / phase 2, and why.** `disposeForeignStateLocked` runs the identity check first,
+then extracts the stale client and any parked action and chooses the action — all inside
+one `sess.mu` critical section, so a competing disposal cannot observe a half-prepared
+object and claim the same Will. Nothing irreversible happens there. Phase 2 executes the
+action **outside** `sess.mu`, with the caller's record transaction already closed and the
+ownership gate still held: the consume does JetStream work, and the discharge would
+self-deadlock on a fence its caller holds. A disposition whose identity check refused
+carries `mqttWillActionNone` and discharges nothing.
+
+The ordering at every caller **that holds an ownership gate** is `phase 1 → end record
+transaction → Will action → release the ownership gate → notify and close`. Inside
+`mqttProcessConnect` that is two defers rather than one tail: the notify/close tail is
+registered before the gate-release defer and the Will phase after it but before
+`defer endAcceptTx()`, so LIFO produces exactly that sequence.
+
+The remote-persist eviction is the one record-derived route where that ordering does not
+apply, and its contract is the **inverse**. It decides under `as.mu`, detaches inside that
+section, and runs its Will action from a tail that executes once the record token and every
+lock are released — so no ownership gate is held there at all, and asserting one would
+assert something false. What it shares with the gated callers is the fence: the record
+transaction is CLOSED before the action, because both the discharge and the consume do
+JetStream work. Two oracles pin the two contracts, and each would fail if given the other's
+route.
+
+**The five Will-loss routes this closed.** Four were real losses and one is correct:
+
+- `disposeForeignStateLocked` took the parked deferred action and dropped it.
+- A detached client's ordinary close publishes only an **immediate** Will
+  (`mqttPublishOwedWill`), so an owed-delayed one was dropped.
+- The remote-persist eviction detached, notified and closed while performing **no** Will
+  action at all.
+- The takeover discard reached classes that had demonstrated no takeover.
+- `mqttAbortAcceptedConnect` discards the **arriving** connection's Will. Correct and
+  unchanged: no session was granted to it. This is why the rule above is scoped to the
+  *displaced* session's Will — on a pre-CONNACK disposing arm both are in play and they
+  take opposite actions.
+
+`dischargeDeferredWill` is extracted from `applyDeferredDisconnect`'s lower half and is
+Will-only: no clear, no save, no purge, no re-park, and no record fence.
+`applyDeferredDisconnect` calls it too, so the discharge exists once. Re-park is
+deliberately absent — phase 1 has already deresidented the session, so putting the action
+back would strand it where no pass can reach it.
+
+**What this costs, and it is a real cost.** A genuine remote takeover — another broker
+really did take the session, and this broker sees its record — is now reported `0x89` and
+its old connection's Will is **published** rather than suppressed. The client is invited to
+reconnect against permanently unclassifiable state. That is accepted deliberately: this
+broker cannot tell that case apart from a forged, replayed, unrelated or malformed record,
+and telling a live client to stop reconnecting on evidence that establishes nothing is
+worse. Stated in `docs/CONFORMANCE.md`.
 
 ## Outbound in-flight registers
 
@@ -4214,8 +4354,8 @@ The invariants, in the order they matter:
   what every resolver needs, since the retry pass and CONNECT both scan the resident
   sessions and the expiry sweep looks at no `ExpiryInterval == 0` record at all. Park
   first, publish second: the obligation must exist before the object is reachable. The WILL
-  is deliberately NOT parked — a parked Will is memory-only and a remote takeover drops it,
-  regressing a Will the broker delivers today — so the close falls through to
+  is deliberately NOT parked — a parked Will is memory-only, so a CRASH in that window drops
+  it, regressing a Will the broker delivers today — so the close falls through to
   `mqttHandleWill`, which publishes immediately for the expiry-0 session a discard always
   is; expiry has no Will, its own was discharged by the close that started the deadline.
   The helper ARBITRATES NOTHING against an obligation already parked: it accepts only the
@@ -4236,7 +4376,10 @@ The invariants, in the order they matter:
   objects before the discard, so no save can have armed uncertainty. They keep the
   unconditional refusal as a fail-closed invariant and carry the proof as a comment. What
   the recovery does NOT make durable is stated in `docs/CONFORMANCE.md`: the obligation is
-  memory-only, so a crash or a remote takeover in that window drops it.
+  memory-only, so a CRASH in that window drops it. **A remote takeover no longer does**: as
+  this was written, a record-observation eviction consumed a parked action and discarded it;
+  since F-084 that route EXTRACTS the action and discharges its Will against the original
+  deadline (`dischargeDeferredWill`), so the surviving loss is the crash window alone.
 - **Every landed record write credits the verdicts it marshalled.** Durability of a
   verdict is a property of the write that carried it, not of the intent of whoever was
   persisting, so the credit lives at the write: `save` samples the void-register revision
@@ -4477,12 +4620,12 @@ cannot: two brokers tearing down and resuming the same record at once. Before
 deleting anything, a discard CASes a `Teardown{Origin, Nonce, StartedAt}` marker
 onto the record at the sequence it resolved against, preserving the record's
 content so any broker can finish the job and so the orphan sweep still reads its
-durables as referenced. Losing that CAS means a newer owner exists, and the loser
+durables as referenced. Losing that CAS means the claim is not ours, and the loser
 deletes **nothing** — a complete outcome, not a failure. Releasing is a
 sequence-targeted delete whose result is classified by **re-reading**, because
 `MaxMsgsPer: 1` may already have removed that sequence on a peer's behalf: absent
-means done, our own nonce means retry, and a foreign nonce or no marker means a
-newer owner exists. The release is always confirmed even on the no-wait discard
+means done, our own nonce means retry, and a foreign nonce or no marker means the
+release is not ours to make. The release is always confirmed even on the no-wait discard
 path, since an unclassifiable release is not a release.
 
 Nobody resumes a marked record. Every CONNECT that can interpret the record (and the
@@ -4580,7 +4723,9 @@ never repaired in place, because it may name a retirement newer than the reader'
 
 - **The winner's release-superseded arm.** The release now hands back the record it
   classified against; when that record carries the generation just retired and no
-  marker, it is the hollow survivor and is condemned with a fresh teardown claim.
+  marker, it is the hollow survivor and is condemned with a fresh teardown claim. A
+  record carrying a DIFFERENT generation is left alone — outside this retirement's
+  reach, which is a statement about the generation and not about who holds it.
   **Mark only** — no deletions, no release — because a marked record is already the
   fully-handled state: the survivor's broker observes the move on its session-record
   watch (or the committed-read backstop) and evicts, its client's reconnect adopts the

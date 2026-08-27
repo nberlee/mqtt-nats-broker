@@ -1121,7 +1121,7 @@ func (a *atomicOnceBool) get() bool  { return a.v.Load() }
 // The packet used to be rolled back whenever a readback found the record still at the
 // base sequence — which is not evidence that the write died, only that it has not
 // committed YET. Undoing there is what let a late-committing proposal be read later
-// as another owner's record. So the state stands, with or without a SUBACK: the
+// as not-ours. So the state stands, with or without a SUBACK: the
 // client was told nothing and must reconcile on reconnect, and this is exactly the
 // outcome a landed original with a lost response would have produced.
 //
@@ -1263,7 +1263,7 @@ func testPersistedSubs(t *testing.T, sess *mqttSession) map[string]byte {
 //
 // The stale client stays bound otherwise, and that is the harmful part: it still
 // holds c.mqtt.sess, so it goes on publishing, subscribing and acking against a
-// session another owner is authoritative for, and its own close path would act on
+// session whose record is no longer ours to write, and its own close path would act on
 // that state too.
 func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
 	t.Parallel()
@@ -1315,10 +1315,11 @@ func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
 	sess.mu.Unlock()
 	if bound != nil {
 		t.Fatal("a foreign verdict must DETACH the stale client: left bound, the periodic resolver skips this session " +
-			"and the close path can act on state another owner holds")
+			"and the close path can act on state this broker may no longer write")
 	}
 	if uncertain {
-		t.Fatal("a foreign verdict resolves the session's uncertainty (in favour of the other owner)")
+		t.Fatal("a foreign verdict resolves the session's uncertainty: the record is settled and " +
+			"is not ours, which is decided without identifying whoever wrote it")
 	}
 	if resident := testMQTTResidentSessionOrNil(sess.asm, sess.id); resident == sess {
 		t.Fatal("a foreign verdict must evict the session so a later CONNECT rebuilds from the authoritative record")
@@ -1583,7 +1584,8 @@ func TestResolutionRefusesWhileAnotherTransactionIsOpen(t *testing.T) {
 // TestForeignDispositionIsOwnershipGated pins that foreign disposition cannot
 // damage a replacement session installed by a competing CONNECT.
 //
-// A foreign verdict means another owner holds the record, so this object must go.
+// A foreign verdict means the record is not ours, so this object must go. (Not that
+// another owner holds it — nothing here establishes one; F-084.)
 // But eviction by client ID is not safe on its own: a CONNECT can have already
 // evicted this object and installed a restored replacement under the same ID, and an
 // unconditional delete then removes THAT — leaving a live connection with a session
@@ -1651,7 +1653,7 @@ func TestForeignDispositionIsOwnershipGated(t *testing.T) {
 //
 // That pass now examines bound sessions, so a foreign verdict there leaves a live
 // connection whose c.mqtt.sess points at an evicted object — free to publish and ack
-// against a session another broker owns — unless it is closed. Both resolvers must
+// against a session whose record this broker may no longer write — unless it is closed. Both resolvers must
 // go through one disposition path; that they used to differ is exactly the bug.
 func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
 	t.Parallel()
@@ -1672,7 +1674,8 @@ func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
 	testMarkUncertainLocked(sess, sess.seq, []byte(`{"attempted":"ours"}`))
 	sess.mu.Unlock()
 
-	// Another owner advances the record with different content.
+	// A competing write advances the record with different content. It makes the record NOT
+	// OURS, which is all the resolver reads from it — no successor is demonstrated (F-084).
 	subject := mqttSessStreamSubjectPrefix + sess.domainTk + sess.idHash
 	if _, err := sess.jsa.storeMsg(subject, 0, []byte(`{"owner":"someone-else"}`)); err != nil {
 		t.Fatalf("foreign write: %v", err)
@@ -1816,7 +1819,7 @@ func TestForeignDispositionSparesARenboundClient(t *testing.T) {
 	_, timerLives := asm.pendingExpiries[sess.idHash]
 	asm.mu.RUnlock()
 	if !timerLives {
-		t.Fatal("a disposition decided for the OLD connection cancelled the new owner's expiry timer")
+		t.Fatal("a disposition decided for the OLD connection cancelled the REPLACEMENT session's expiry timer")
 	}
 	if !stillDeferred {
 		t.Fatal("the refusal came AFTER discarding the deferred close: the current session's obligation " +

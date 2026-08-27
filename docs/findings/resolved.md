@@ -230,8 +230,10 @@ resource names from…
   broker resolved against) keeps two brokers from tearing down and resuming the
   same record at once: a lost claim deletes *nothing*, and the release —
   a sequence-targeted delete — is classified by re-reading rather than assumed
-  (absent means done, our nonce means retry, a foreign nonce or no marker means a
-  newer owner exists). Every CONNECT that finds a marker **finishes** it and then
+  (absent means done, our nonce means retry, a foreign nonce or no marker means the
+  claim is not ours). That last arm said "a newer owner exists" when this item closed;
+  F-084 withdrew the inference and the code says the narrower thing (`sess_teardown.go`),
+  which is all the release needs. Every CONNECT that finds a marker **finishes** it and then
   starts fresh with a fresh generation and Session Present false, which also makes
   a crashed teardown self-healing instead of leaking until the orphan sweep.
 
@@ -367,7 +369,7 @@ after UNSUBSCRIBE
   recorded, so later memory changes cannot alter what the settlement compares against,
   or re-sends.) Keeping the mutation is therefore the whole answer for the state
   itself: the settlement re-attempts those bytes, so the record ends up agreeing with
-  memory unless a foreign owner intervened, and `retainOnLanded` registers only what a
+  memory unless a foreign WRITE intervened, and `retainOnLanded` registers only what a
   caller withheld for want of PROOF. For a drain claim that distinction is the point:
   an unconfirmed removal treated as durable gets the message **acked away** (I1), or
   lets a forwarded PUBREL complete an exchange the record still owes (I10). A retained
@@ -1386,8 +1388,10 @@ newly-exposed callers…
   (`sess_uncertain.go`): park a discard-only obligation (`expiryInterval` 0, so the
   discharge takes the deferred discard branch) and restore RESIDENCY, which is what
   the retry pass and CONNECT both need and what an expiry-0 record has no other
-  reaper for. The close does NOT park the Will — a memory-only Will is dropped by a
-  takeover, a regression against today — and falls through to `mqttHandleWill`,
+  reaper for. The close does NOT park the Will — the reason given at the time was that a
+  memory-only Will is dropped by a takeover, which F-084 has since narrowed to the
+  LICENSED takeover only, the record-derived routes now discharging a parked action —
+  and falls through to `mqttHandleWill`,
   which publishes immediately for the expiry-0 session a discard always is. CONNECT's
   clean start rejects without evicting, exactly as its early path does. The helper is
   strictly IDEMPOTENT: it accepts an already-parked action only when that action ends
@@ -1438,7 +1442,10 @@ newly-exposed callers…
   mid-run — a shell field-split that ran an empty `-run` regex and reported "no tests
   to run" as a survivor, and an MU-I2a definition that re-acquired the fence and so
   never modelled deciding outside it.
-  Residuals in `docs/CONFORMANCE.md`: the obligation is memory-only, so a crash or a
+  Residuals in `docs/CONFORMANCE.md` (as recorded when this item closed; F-084 has since
+  narrowed the first of them — a record-derived remote eviction now DISCHARGES the parked
+  action's Will rather than dropping it, so only a crash and the licensed takeover remain):
+  the obligation is memory-only, so a crash or a
   remote takeover drops it, and a non-discard-only parked action makes the helper
   DECLINE — a third loss path needing neither, whose reachability is unknown; for the
   v5 expiry-override close all three leave a record a non-clean reconnect resumes (its
@@ -1475,8 +1482,10 @@ UNBOUND…
   load-bearing because an unresolved save is refused before the store and would classify
   on a zero-valued attempt), and a settlement that re-saves CURRENT memory so a fresh
   CAS arbitrates ownership. The readback then distinguishes only contention (record at
-  the probe's own base — never ownership) from a foreign owner (gone, or at another
-  sequence); there is no digest arm, because a rejected write did not land. It runs from
+  the probe's own base — never ownership) from a FOREIGN RECORD (gone, or at another
+  sequence); there is no digest arm, because a rejected write did not land. It was called
+  "a foreign owner" when this item closed, and F-084 withdrew that: foreign says the record
+  is not ours and names nobody. It runs from
   the periodic pass, renamed `reconcileResidentRecordState`, under a new
   identity-current nobody-claim gate that is the sole unboundness check on that path — a
   plain claim would let a stale object read a same-broker replacement's own record as
@@ -1530,13 +1539,16 @@ UNBOUND…
   `mqttParse`'s per-packet loop, BEFORE the dispatch switch: it claims the ownership gate
   as the bound client — the claim a SUBSCRIBE makes, so it never fails one — takes the
   record fence in its blocking form, and probes. Only a LANDED CAS lets the packet
-  through; the three non-serving outcomes are distinct. **Foreign**: discard the Will as a
-  local takeover does, dispose the session state under the gate, then attempt the 0x8E
-  through the shared tail and close SYNCHRONOUSLY on the readLoop before returning nil (the
-  graceful-DISCONNECT branch's shape; the attempt is suppressed for a pre-CONNACK
-  connection, or one whose DISCONNECT another path already claimed). **Unsettled**
+  through; the three non-serving outcomes are distinct. **Foreign**: dispose the session
+  state under the gate, then attempt the DISCONNECT through the shared tail and close
+  SYNCHRONOUSLY on the readLoop before returning nil (the graceful-DISCONNECT branch's
+  shape; the attempt is suppressed for a pre-CONNACK connection, or one whose DISCONNECT
+  another path already claimed). **As shipped by THIS item that arm discarded the Will and
+  said 0x8E**; F-084 later withdrew both, because a foreign record shows only that the
+  record is not ours — the arm now consumes the Will through ordinary handling and says
+  0x89. **Unsettled**
   (contended, unreadable, ambiguous, or suspended by an unresolved
-  write): fail closed with `errMQTTSessionOwnershipUnsettled` → **0x89**, never 0x8E,
+  write): fail closed with `errMQTTSessionOwnershipUnsettled` → **0x89**,
   through the ordinary parse-error path so the real close bookkeeping runs. **Rebound**:
   close in SILENCE — the takeover makes its own 0x8E attempt, and speaking here would race
   it for the reason the client is left with — with `mqttDiscardWillOnTakeover`
@@ -1694,6 +1706,15 @@ AT MOST ONE…
   Will-suppression bullet below,
   which defers itself to the Will-outbox analysis. Found by holistic rounds 1 and 2 of the
   bound settlement.
+
+**Post-F-084 note.** The record above is this item AS RESOLVED, and its reason codes are
+historical. It describes all four displacement paths notifying through the shared tail as
+"session taken over", and F-084 withdrew that claim from three of them: only a local
+CONNECT takeover holding the successor still says 0x8E, while a record-derived disposal
+that can show the record is not ours but cannot show who holds it says 0x89. The
+at-most-one-ATTEMPT guarantee, the claim mechanism and the CONNACK gate this item
+delivered are all unchanged; what changed is only which vocabulary each caller passes into
+the tail.
 
 ## F-023
 
@@ -1861,8 +1882,12 @@ not classify —…
   requires a strictly advanced record (`Sequence > sess.seq`; equality — the session's own
   record — no longer evicts), and classifies at decision time. A proven sibling answers
   0x89 with the ownership-unsettled Reason String and LEAVES the delayed-Will outbox
-  records pending; everything unreadable/absent/below-trigger concedes 0x8E through the
-  license rule (the observation licenses, the read only narrows). Release order is
+  records pending; everything unreadable/absent/below-trigger concedes through the
+  license rule (the observation licenses, the read only narrows). **As shipped by THIS
+  item that concession said 0x8E**; F-084 withdrew it, because this route learns of the
+  displacement from a record and a record names no successor, so the whole class now
+  answers the ownership-unsettled 0x89 and the sibling arm is no longer the exception.
+  Release order is
   `as.mu` → `endRecordTx` → notify/close, with a new handoff-free `abandonRecordTx` for
   abnormal exits (the skipped void-verdict handoff belongs to the periodic backstop).
   Residuals — asynchronous and REFUSABLE eviction (held gate/fence defers; a quiet bound

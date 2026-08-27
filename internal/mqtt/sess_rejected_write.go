@@ -23,8 +23,9 @@
 // An UNBOUND session is settled by the periodic pass, claiming the ownership gate as
 // nobody (lockSessionForRecordRejection).
 //
-// A BOUND one would otherwise keep serving a client against a session another broker owns
-// — PUBLISHes routed and acked, SUBSCRIBEs changing durable state — for the whole
+// A BOUND one would otherwise keep serving a client against a session whose record this
+// broker may no longer write — PUBLISHes routed and acked, SUBSCRIBEs changing durable
+// state — for the whole
 // remaining life of the connection, which is the split-brain [MQTT-3.1.4-3] forbids. The
 // gate such a settlement needs is the one a concurrent SUBSCRIBE claims, so the settlement
 // is made BY that connection's own readLoop rather than against it
@@ -47,7 +48,8 @@
 // design that cleared its marker there would delete the only reason anything ever looks
 // again. The settlement is therefore a PROBE — re-attempt the save of CURRENT memory,
 // so a fresh CAS arbitrates ownership — and the readback only distinguishes contention
-// from a foreign owner. See docs/ARCHITECTURE.md.
+// from a record that is not ours. Not from an OWNER: nothing in this path identifies one.
+// See docs/ARCHITECTURE.md.
 //
 // The probe re-marshals current memory rather than replaying the rejected bytes: a
 // saveDefinitelyFailed caller has since rolled its mutation back, so replaying them
@@ -199,7 +201,7 @@ func (sess *mqttSession) settleRecordRejection(asm *mqttAccountSessionManager) m
 		// the notification when there is no bound client, so no packet and no log line
 		// differ; the arm exists so the classifier has one meaning at every call site
 		// rather than a special case where the distinction happens not to be visible.
-		sess.disposeForeignSessionLocked(asm, nil, mqttDisposalForRejection(verdict))
+		sess.disposeForeignSessionLocked(asm, nil, mqttDisposalForLineage(verdict == mqttRejectionForked))
 	}
 	return verdict
 }
@@ -291,7 +293,9 @@ const (
 	// attempt can itself be suppressed (CONNACK gate) or fail.
 	mqttBoundDisplaced
 	// mqttBoundDisposed: the probe proved the session foreign and this settlement disposed
-	// it, so this connection is the one that owes the client its 0x8E.
+	// it, so this connection is the one that owes the client its DISCONNECT. Not a takeover
+	// claim: the probe established that the record is not ours and nothing about who holds
+	// it, so what it owes is 0x89 ownership-unsettled. F-084.
 	mqttBoundDisposed
 )
 
@@ -308,14 +312,14 @@ const (
 //     suspended by an unresolved write of ours. Fail closed on the sentinel; the caller's
 //     parse-error footer tells a v5 client 0x89 and the readLoop tears the connection down.
 //   - (false, nil): the connection is already closed here — because the probe proved the
-//     session FOREIGN (0x8E first, then the close) or because this connection was already
+//     session FOREIGN (the 0x89 unsettled DISCONNECT first, then the close) or because this connection was already
 //     DISPLACED by another operation (closed silently). The caller returns nil exactly as
 //     the graceful-DISCONNECT branch does.
 //
 // The silence on the displaced arm is load-bearing, not an omission. A refused claim means
 // a CONNECT takeover, a remote persist observation or a resolver disposal is running for
-// this client ID, and each of those attempts its OWN notification (0x8E, or 0x89 for a
-// record its classifier proved forked) and closes the connection asynchronously — the
+// this client ID, and each of those attempts its OWN notification (0x8E only where a local
+// replacement is held in hand, 0x89 otherwise) and closes the connection asynchronously — the
 // persist observation's eviction worker claims no gate of its own, though it defers to one
 // it observes held. Answering a refusal with 0x89 would try to append "server busy, try
 // again" to another path's verdict: the connection's one DISCONNECT claim now refuses
@@ -383,11 +387,13 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 		// next Read fails instead of parsing a queued packet against a disposed session.
 		// Doing it inline is also what keeps the ownership gate off socket I/O.
 		if stale != nil {
-			// Only mqttRejectionForeign reaches mqttBoundDisposed — the forked verdict
-			// routes to mqttBoundUnsettled above and never disposes — so the takeover
-			// vocabulary is the only one this tail can owe.
-			stale.mqttNotifyForeignDisposal(sess.id, mqttDisposalTakenOver)
-			stale.closeConnection(mqttDisposalTakenOver.closeReason)
+			// Only mqttRejectionForeign reaches mqttBoundDisposed — the forked verdict routes
+			// to mqttBoundUnsettled above and never disposes — so the UNSETTLED vocabulary is
+			// the only one this tail can owe. It used to say taken-over, which claimed a
+			// successor the probe never found: a definite rejection proves the subject moved
+			// past our base and nothing about who moved it. F-084.
+			stale.mqttNotifyForeignDisposal(sess.id, mqttDisposalOwnershipUnsettled)
+			stale.closeConnection(mqttDisposalOwnershipUnsettled.closeReason)
 		}
 		return false, nil
 	case mqttBoundDisplaced:
@@ -433,12 +439,26 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess *mqttSession) (mqttBoundSettlement, *client) {
 	if err := asm.lockSessionForTeardown(sess, c); err != nil {
 		sess.mu.Lock()
-		rebound := sess.c != c
+		stale := sess.c
 		sess.mu.Unlock()
-		if !rebound {
+		// "Not us any more" is not the same fact as "a replacement holds it". sess.c == nil
+		// is what a resolver or a record-derived disposal leaves behind, and neither
+		// demonstrates a successor — the enum above names CONNECT, remote persist and
+		// resolver displacement as the three producers of a moved binding.
+		//
+		// Only a DIFFERENT, NON-NIL local client is the licensed evidence, and only it
+		// discards. F-084.
+		switch {
+		case stale == c:
 			return mqttBoundUnsettled, nil
+		case stale != nil:
+			// A local takeover owns this connection's fate. Apply its own Will rule here —
+			// the identical call it makes a few lines later, so whichever side notices the
+			// displacement first applies it and the other's is a no-op.
+			c.mqttDiscardWillOnTakeover()
 		}
-		c.mqttDiscardWillOnTakeover()
+		// stale == nil: a disposal already ran, and THAT disposal owns the Will action. Doing
+		// one here too would leave two paths believing they owed it.
 		return mqttBoundDisplaced, nil
 	}
 	defer asm.unlockSession(sess)
@@ -449,18 +469,22 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// the marker. This connection is served again from the fast path.
 		return mqttBoundServe, nil
 	case mqttRejectionForeign:
-		// Exactly what a local takeover does: an armed Will goes away with the connection
-		// the displacement closes, and one already owed NOW is not the takeover's to
-		// cancel. Before the disposal, so the disposal's own close cannot observe a Will
-		// still armed.
-		c.mqttDiscardWillOnTakeover()
-		stale, applied := sess.disposeForeignStateLocked(asm, c)
-		if !applied {
+		// The probe found a record that is not ours. It does NOT identify who holds it, so
+		// the Will is consumed rather than discarded — the forked arm below already refuses
+		// to suppress a Will "nothing arbitrated", and this arm arbitrated no more about a
+		// SUCCESSOR than that one did. F-084.
+		//
+		// Phase 1 prepares it and phase 2 runs it here, with this frame's own record
+		// transaction already closed by settleRecordRejectionBound and the ownership gate
+		// still held — mqttConsumeWillUnderGate's precondition.
+		d := sess.disposeForeignStateLocked(asm, c, false)
+		d.applyWill(sess, asm)
+		if !d.applied {
 			// The identity check refused: the session was rebound while this verdict was
 			// being reached, so the disposal — and the notification — are not ours.
 			return mqttBoundDisplaced, nil
 		}
-		return mqttBoundDisposed, stale
+		return mqttBoundDisposed, d.stale
 	case mqttRejectionForked:
 		// A body CLAIMING the parent of the record we were acknowledged for: our own write was
 		// erased by something not demonstrably a successor of ours, and nothing established
@@ -469,14 +493,17 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// disposing this connection — so it routes there rather than to a fifth
 		// settlement, and the client is told 0x89 by the caller's sentinel.
 		//
-		// Deliberately NOT the foreign arm's shape. That arm disposes the session and
-		// calls mqttDiscardWillOnTakeover first, because a demonstrated takeover owns
-		// the Will's fate. Here nothing is demonstrated, so the connection takes the
-		// ordinary close bookkeeping — the Will handled by its own rules, the expiry
-		// save attempted, shared pending purged — and the session object stays
-		// resident with its marker armed, settled by the next reconnect's accept save
-		// or by the periodic unbound pass. Copying the foreign arm would silently
-		// suppress a Will nothing arbitrated. See docs/CONFORMANCE.md.
+		// Deliberately NOT the foreign arm's shape — but the difference is the DISPOSAL,
+		// not the Will. That arm disposes the session; this one does not, so the
+		// connection takes the ordinary close bookkeeping and the object stays resident
+		// with its marker armed, settled by the next reconnect's accept save or by the
+		// periodic unbound pass.
+		//
+		// Both arms now treat the Will the same way, and this comment used to say
+		// otherwise: the foreign arm called mqttDiscardWillOnTakeover "because a
+		// demonstrated takeover owns the Will's fate", when nothing there demonstrated
+		// one. F-084 made it consume, which is what this arm always did — suppressing a
+		// Will nothing arbitrated was the defect, on either arm.
 		return mqttBoundUnsettled, nil
 	case mqttRejectionKeep:
 		// Nothing was arbitrated by the probe — but the fence it took may have been
@@ -510,7 +537,7 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 //     the in-fence re-read must see. The unbound settlement cannot block: its caller may
 //     hold a transaction, and "not now" is a complete answer to a periodic pass.
 //   - a foreign verdict is NOT disposed here. The bound caller's disposal has a tail — the
-//     0x8E and the close — that must run off the ownership gate and on this readLoop, so
+//     DISCONNECT and the close — that must run off the ownership gate and on this readLoop, so
 //     sequencing it belongs to the caller.
 //
 // The caller holds the ownership gate, claimed as the bound client.

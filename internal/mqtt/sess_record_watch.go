@@ -5,16 +5,23 @@
 // session nobody writes about needs no revalidation at all, which is what lets this
 // cost nothing per quiet session.
 //
+// What an observation establishes is that the record MOVED, which makes the resident
+// object no longer ours. It does not establish who wrote it or that anyone holds the
+// session now, and nothing downstream of here may claim that it does (F-084): the
+// displaced client is told the ownership-unsettled 0x89 unless a route that HOLDS the
+// successor disposes of it.
+//
 // WHAT THIS REPLACES, AND WHY IT HAD TO BE REPLACED.
 //
 // The old channel was a core-NATS subscription on the JetStream reply subject of
 // every other broker's session store ($MQTT.JSA.*.SP.*.*). That is an AT-MOST-ONCE
 // notification with no retry and nothing durable behind it: when it was lost, this
-// broker never learned that a peer had taken the session over. A never-expiring
+// broker never learned that the record had moved out from under it. A never-expiring
 // session — every MQTT 3.1.1 persistent session — has no expiry timer, the expiry
 // sweep skips it, and nothing else re-validates a resident object. So the displaced
 // client kept being served indefinitely against a session another broker owned,
-// which is the split-brain [MQTT-3.1.4-3] forbids.
+// which is the split-brain [MQTT-3.1.4-3] forbids. ("Owned" there is the HAZARD, which
+// is real; it is not what a single observation proves.)
 //
 // THIS CONSUMER IS NOT A DURABLE CHANNEL EITHER, and the design does not pretend
 // otherwise. It is an ephemeral AckNone push consumer: its delivery state is not
@@ -43,7 +50,7 @@
 // seqUncertain and leaves the acknowledged lineage pair stale; a delivery of that
 // very write is strictly past sess.seq, so the eviction worker would classify our
 // own bytes against our own stale pair, find them unrelated, and evict the rightful
-// client with 0x8E over its own write.
+// client over its own write.
 //
 // Two things pay for it, and both live in the worker rather than here:
 //

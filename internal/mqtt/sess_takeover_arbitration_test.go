@@ -178,8 +178,9 @@ func TestSessSupersededClaimCannotStompTheWinner(t *testing.T) {
 // The verdict is the one this change GIVES UP, and it is asserted in both directions
 // deliberately. A resume child of base a is {b, a}. A clean-start survivor written after
 // tearing a down was briefly {c, a} and is now {c, ""} again, so the two have nothing in
-// common, and a broker whose record that survivor erased answers 0x8E "session taken
-// over" — a claim nothing arbitrated. That is the residual stated in docs/CONFORMANCE.md,
+// common, and a broker whose record that survivor erased CONCEDES — since F-084 with
+// 0x89 ownership-unsettled, which is truthful; it used to answer 0x8E "session taken over",
+// a claim nothing arbitrated. That is the residual stated in docs/CONFORMANCE.md,
 // and it is the cost of removing an inherited identity that outlived the interval it
 // named: every route by which the chain reached this verdict was reachable equally by a
 // FALSE fork. See parentForNextWriteLocked.
@@ -213,7 +214,8 @@ func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 	// Direction 1, the concession. The OTHER sibling is a broker that RESUMED the same
 	// base: its acknowledged pair is {b, a}, a child of a, and it is asked about the
 	// survivor {c, ""}. Sibling-hood is defined against the acknowledged pair, and with
-	// the survivor carrying no parent there is nothing to match — the answer is 0x8E.
+	// the survivor carrying no parent there is nothing to match — the answer is the
+	// UNSETTLED vocabulary (0x8E before F-084).
 	//
 	// The resume child's identity is synthetic because the two records cannot both be
 	// current — one erased the other. What has to come from the production path is the
@@ -240,8 +242,9 @@ func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 	}
 
 	// The authored-record fork is NOT given up, and this is the discrimination: a
-	// legitimate successor written through the production path by the other broker is
-	// not a fork, while a body CLAIMING that same parent is (TestSessAuthoredForkStillClassifies).
+	// child-shaped record written through the production path by the other broker is not a
+	// fork, while a body CLAIMING that same parent is (TestSessAuthoredForkStillClassifies).
+	// Neither verdict says who holds the session — this is lineage only (F-084).
 	sessB := testFreshSession(b, cid)
 	sessB.mu.Lock()
 	sessB.seq, sessB.wid, sessB.pwid = survivorSeq, survivor.WID, survivor.PWID
@@ -251,7 +254,7 @@ func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 	}
 	successor, _ := testLoadSessRecord(t, b, sessB.idHash)
 	if classifyRecordLineage(successor, survivor.WID, survivor.PWID) != mqttLineageNotForked {
-		t.Fatalf("a child of the acknowledged record is a successor, not a fork: %+v", successor)
+		t.Fatalf("a child of the acknowledged record is child-shaped, not a fork: %+v", successor)
 	}
 }
 
@@ -304,7 +307,7 @@ func TestSessAdoptedTeardownSupersededIsSurfaced(t *testing.T) {
 		}
 		markerPS, markerSeq = testLoadSessRecord(t, a, sessA.idHash)
 		// B's record replaces the marker on the same subject, so A's exact-sequence
-		// release removes nothing and its re-read finds a newer owner.
+		// release removes nothing and its re-read finds a record that is not its own.
 		sessB := testFreshSession(b, cid)
 		sessB.mu.Lock()
 		sessB.seq = markerSeq
@@ -571,7 +574,7 @@ func TestSessSupersededAdoptionIsTerminalForRecordExpiry(t *testing.T) {
 	}
 	if log.sawWarning(t, "finishing the claimed teardown") {
 		t.Fatal("a superseded adoption must not be reported as a failed teardown: " +
-			"it means the record is another owner's, which is the outcome, not a fault")
+			"it means the record is not ours, which is the outcome, not a fault")
 	}
 }
 

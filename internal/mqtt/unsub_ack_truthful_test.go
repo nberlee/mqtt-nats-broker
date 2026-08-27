@@ -177,8 +177,8 @@ func TestMQTTUnsubAckIsAttemptScopedNotSessionScoped(t *testing.T) {
 // connection the resolution DISPLACED is not acknowledged at all.
 //
 // A foreign verdict detaches the client and notifies it through the shared DISCONNECT
-// claim, so what the client sees is the takeover 0x8E — never an UNSUBACK claiming an
-// unsubscribe on a session somebody else owns.
+// claim, so what the client sees is the displacement's 0x89 ownership-unsettled — never an
+// UNSUBACK claiming an unsubscribe on a session whose record is no longer ours.
 //
 // The gate that produces that outcome here is the CLAIM, read inside the enqueue's own
 // c.mu critical section: every displacement reaching this tail has a written CONNACK
@@ -205,14 +205,15 @@ func TestMQTTUnsubAckSuppressedWhenDisplaced(t *testing.T) {
 	sess := testUnsubAckSession(t, s, "unsubdisp")
 
 	// The packet's write never reaches the stream: the resolver's re-attempt is what
-	// meets the takeover below, and a rejected re-attempt is what makes the verdict
+	// meets the competing write below, and a rejected re-attempt is what makes the verdict
 	// foreign.
 	restoreStore := testSuppressNextUnsubWrite(t, sess, "disp.topic")
 	defer restoreStore()
 
-	// Another owner takes the record over in the resolver's own window, so the
-	// re-attempt is rejected and the classifying re-read finds content that is not
-	// this attempt's: FOREIGN.
+	// A competing write lands on the record in the resolver's own window, so the re-attempt
+	// is rejected and the classifying re-read finds content that is not this attempt's:
+	// FOREIGN. Foreign means the record is NOT OURS; it does not identify a holder, and
+	// this connection is displaced on that basis alone (F-084).
 	var took atomicOnce
 	restoreSeam := setMQTTTestResolveReattemptHook(func(sp *mqttSession) {
 		if sp != sess || !took.fire() {
@@ -231,10 +232,14 @@ func TestMQTTUnsubAckSuppressedWhenDisplaced(t *testing.T) {
 
 	testUnsubAckSendUnsubscribeV5(t, c, 2, "disp/topic")
 
-	// Everything this connection is sent before it closes: the takeover DISCONNECT,
-	// and never an UNSUBACK for a session another owner holds. Read to the CLOSE
-	// rather than stopping at the first packet — an acknowledgment enqueued behind
-	// the 0x8E is exactly the shape being excluded.
+	// Everything this connection is sent before it closes: the displacement DISCONNECT,
+	// and never an UNSUBACK for a session whose record is no longer ours. Read to the CLOSE
+	// rather than stopping at the first packet — an acknowledgment enqueued behind that
+	// DISCONNECT is exactly the shape being excluded.
+	//
+	// The packet TYPE is the assertion and the reason code deliberately is not: this route
+	// proves no successor, so what it carries is 0x89, and pinning a code here would
+	// duplicate the vocabulary fixtures that own that question.
 	sawDisconnect := false
 	for {
 		b, pl, ok := testMQTTReadPacketReady(r, 10*time.Second)
@@ -245,13 +250,14 @@ func TestMQTTUnsubAckSuppressedWhenDisplaced(t *testing.T) {
 		switch b & mqttPacketMask {
 		case mqttPacketUnsubAck:
 			t.Fatal("a displaced connection was acknowledged: the UNSUBACK claims an unsubscribe " +
-				"on a session another owner holds, and it arrives behind the takeover DISCONNECT")
+				"on a session whose record is no longer ours, and it arrives behind the " +
+				"displacement DISCONNECT")
 		case mqttPacketDisconnect:
 			sawDisconnect = true
 		}
 	}
 	if !took.fired() {
-		t.Fatal("the takeover never ran; the test proved nothing")
+		t.Fatal("the competing write never ran; the test proved nothing")
 	}
 	if !sawDisconnect {
 		t.Fatal("the displaced connection was never notified")
@@ -263,8 +269,10 @@ func TestMQTTUnsubAckSuppressedWhenDisplaced(t *testing.T) {
 // enqueue.
 //
 // The ownership sample releases sess.mu, and the enqueue takes c.mu afterwards.
-// `processSessionPersist` holds neither, so in that interval it can notify (0x8E) and
-// detach — and an UNSUBACK appended after that DISCONNECT violates [MQTT-3.14.4-1].
+// `processSessionPersist` holds neither, so in that interval it can notify and detach — and
+// an UNSUBACK appended after that DISCONNECT violates [MQTT-3.14.4-1]. Which reason code
+// that notification carries depends on what the observed record proved and is not this
+// fixture's question (F-084); the ORDERING is.
 // What closes the window is the second gate: the DISCONNECT claim is read inside the
 // enqueue's own c.mu critical section, so the refusal is atomic with the write.
 //
@@ -300,10 +308,15 @@ func TestMQTTUnsubAckSuppressedByADisplacementInTheWindow(t *testing.T) {
 		// The persist-observation leg, in the one interval it can occupy: notify
 		// through the shared claim, then detach. Done on another goroutine so it
 		// cannot borrow the readLoop's own locks.
+		//
+		// The vocabulary is the one that leg actually passes. A persist observation
+		// shows the record is not ours and nothing more, so it is unsettled-ownership
+		// and not taken-over (F-084); calling mqttNotifyTakenOver here would model a
+		// route this seam does not stand for.
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			bc.mqttNotifyTakenOver()
+			bc.mqttNotifyDisplaced(mqttDisposalOwnershipUnsettled)
 			sess.mu.Lock()
 			sess.c = nil
 			sess.mu.Unlock()
@@ -320,7 +333,7 @@ func TestMQTTUnsubAckSuppressedByADisplacementInTheWindow(t *testing.T) {
 	}
 	r.pos += pl
 	if b&mqttPacketMask != mqttPacketDisconnect {
-		t.Fatalf("first packet 0x%x, want the takeover DISCONNECT", b&mqttPacketMask)
+		t.Fatalf("first packet 0x%x, want the displacement DISCONNECT", b&mqttPacketMask)
 	}
 	if !displaced.fired() {
 		t.Fatal("the seam never fired; the test proved nothing")
@@ -328,8 +341,8 @@ func TestMQTTUnsubAckSuppressedByADisplacementInTheWindow(t *testing.T) {
 	// And NOTHING follows it. Under the mutation the UNSUBACK is appended here.
 	if b2, _, more := testMQTTReadPacketReady(r, 500*time.Millisecond); more {
 		t.Fatalf("packet 0x%x followed the DISCONNECT: an acknowledgment appended after the "+
-			"takeover notification breaks [MQTT-3.14.4-1], and claims an unsubscribe on a session "+
-			"this connection no longer owns", b2&mqttPacketMask)
+			"displacement notification breaks [MQTT-3.14.4-1], and claims an unsubscribe on a "+
+			"session this connection no longer owns", b2&mqttPacketMask)
 	}
 }
 

@@ -2213,8 +2213,12 @@ func TestQ2AffineReclaimSaveAmbiguousDefersTheDelete(t *testing.T) {
 // landed — and the rejection settlement takes it from there. After a definite
 // rejection every moved record is FOREIGN irrespective of its bytes, so the
 // session is disposed and the consumer is left ALIVE for whoever the winning
-// record makes its owner. This is the clustered takeover-racing-the-cleanup shape
+// record makes its owner. This is the clustered displacement-racing-the-cleanup shape
 // reduced to the arm that actually decides it.
+//
+// The AFFINE claim's owner is decided by the winning record, which is a durable
+// arbitration this test may rely on. The SESSION's successor is not: a moved record shows
+// only that the session is no longer ours (F-084), which is all the disposal acts on.
 func TestQ2AffineReclaimSaveRejectedIsSettledAsForeign(t *testing.T) {
 	var peer *mqttAccountSessionManager
 	a := testQ2AffArmAmbiguousProvisioning(t, "ambrej", 300, func(b *testQ2AffBroker) {
@@ -2279,10 +2283,10 @@ func TestQ2AffineReclaimSaveRejectedIsSettledAsForeign(t *testing.T) {
 	}
 }
 
-// THE RACE THE ORDERING EXISTS FOR. A remote broker takes the session over and
-// PRESERVES the affine generation — the q2aff-aware takeover, which carries the
-// affine fields through — so the generation it now owns is the one this reclaim
-// was about to remove, and an assignment under it is a delivery already started to
+// THE RACE THE ORDERING EXISTS FOR. A remote broker writes the session record and
+// PRESERVES the affine generation — the q2aff-aware write, which carries the
+// affine fields through — so the generation that record authorizes is the one this
+// reclaim was about to remove, and an assignment under it is a delivery already started to
 // the winner. The reclaim's cleanup CAS loses to that winner, and because the
 // unwind was prepared WITHOUT disposing, nothing of the winner's was touched:
 // the claim is still live and the restore is complete rather than partial.
@@ -2898,8 +2902,8 @@ func TestQ2AffineReclaimRunsFromAReconnectResolution(t *testing.T) {
 	}
 }
 
-// A remote takeover during the unresolved window ends in a FOREIGN verdict, and a
-// foreign verdict is not ours to act on: the record belongs to somebody else, the
+// A competing remote write during the unresolved window ends in a FOREIGN verdict, and a
+// foreign verdict is not ours to act on: the record is not this broker's to write, the
 // session is evicted, and the continuation never runs. The affine consumer must
 // survive that — whether it is the winner's or the orphan sweep's is decided by
 // the winning record, never by us deleting it on the way out.
@@ -2914,7 +2918,7 @@ func TestQ2AffineForeignDispositionLeavesTheConsumerAlone(t *testing.T) {
 	dropped := testQ2AffDropPersistObservations(t, a.b, a.idHash)
 
 	// Suppression off, so the resolver's readback is the thing that decides — and
-	// what it finds is somebody else's record at a sequence past our base.
+	// what it finds is a record that is not ours, at a sequence past our base.
 	mqttTestSessStoreSuppressV.Store(false)
 	testQ2AffForeignStore(t, peer, "ambforeign")
 
@@ -2942,7 +2946,7 @@ func TestQ2AffineForeignDispositionLeavesTheConsumerAlone(t *testing.T) {
 // connection. The peer identity is what makes a direct store look remote:
 // processSessionPersist ignores a reply subject carrying its own JSA id before it
 // consults anything else, so a store issued through the local manager could never
-// exercise a takeover at all.
+// exercise the remote-write path at all.
 func testQ2AffPeerASM(t *testing.T, b *testQ2AffBroker, node string) *mqttAccountSessionManager {
 	t.Helper()
 	s := &Server{nrc: b.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}
@@ -2967,7 +2971,7 @@ func testQ2AffForeignStore(t *testing.T, peer *mqttAccountSessionManager, id str
 }
 
 // testQ2AffForeignStoreWith is testQ2AffForeignStore with the winner's record
-// content under the caller's control — for the takeover that PRESERVES the affine
+// content under the caller's control — for the remote write that PRESERVES the affine
 // fields, which is the q2aff-aware branch and the one that leaves the generation
 // authorized by somebody else's record.
 func testQ2AffForeignStoreWith(t *testing.T, peer *mqttAccountSessionManager, id string, mutate func(*mqttPersistedSession)) {

@@ -488,7 +488,8 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 	}
 }
 
-// T5: a deferred close on a STALE object cannot destroy a register a new owner has claimed,
+// T5: a deferred close on a STALE object cannot destroy a register a COMPETING WRITER has
+// claimed,
 // and cannot record a verdict about it either.
 //
 // The register-claims arbitration is what covers the deletes: a claim rewrite moves the
@@ -536,7 +537,7 @@ func TestMQTTDeferredCloseFencedByRegisterClaim(t *testing.T) {
 	}
 	if survived.Sequence != after.Sequence || survivor.Claim != sessB.regClaim ||
 		survivor.Cancelled || survivor.Nonce != claimed.Nonce {
-		t.Fatalf("the stale close changed the new owner's register: seq=%d claim=%q cancelled=%v nonce=%q, want %d/%q/false/%q",
+		t.Fatalf("the stale close changed the competing writer's register: seq=%d claim=%q cancelled=%v nonce=%q, want %d/%q/false/%q",
 			survived.Sequence, survivor.Claim, survivor.Cancelled, survivor.Nonce,
 			after.Sequence, sessB.regClaim, claimed.Nonce)
 	}
@@ -1104,7 +1105,7 @@ func TestMQTTVoidVerdictHandoffHelperSkipsNonresident(t *testing.T) {
 		t.Fatalf("a resident unbound session with a gap must converge: %v", ps.CancelledRegs)
 	}
 
-	// Evicted: the record belongs to whoever owns it now, so nothing here may write it.
+	// Evicted: this object can no longer speak for the record, so nothing here may write it.
 	e.asm.removeSession(e.sess, true)
 	e.testStageVerdict(t, "nonce-nonresident", 108)
 	e.asm.handoffVoidVerdictsOnGateRelease(e.sess)
@@ -1851,8 +1852,8 @@ func TestMQTTVoidVerdictBackstopConvergesAfterDefiniteFailure(t *testing.T) {
 	// And an EVICTED snapshot is not the backstop's business. The periodic pass holds raw
 	// pointers, so a session the manager no longer maps to this object — a remote persist, an
 	// accept rollback, an expiry, a foreign disposition — must not have its gate claimed for
-	// a JetStream store: that record belongs to whoever owns it now, and holding the shared
-	// client-ID gate would keep a replacement CONNECT out meanwhile. The per-session STEP is
+	// a JetStream store: that object can no longer speak for the record, and holding the
+	// shared client-ID gate would keep a replacement CONNECT out meanwhile. The per-session STEP is
 	// what must refuse, because the eviction window is between the pass's snapshot and this
 	// session's turn in it — by which time the map no longer lists it at all.
 	stores, restoreCount := testSessRecordStoreCounter(e.sess)

@@ -497,8 +497,9 @@ every write mints a fresh `WID` and parents it to the current lineage.
 
 Five outcomes. **10071 keeps its own lineage classification** through
 `disposalForDirectRejection` — the only place a sibling record is recognised on that arm,
-and the place the fork grant is minted, so collapsing it to a bare takeover would assert 0x8E
-where the record supports only 0x89 and lose the grant. **10164** goes through
+and the place the fork grant is minted, so collapsing it to one undifferentiated verdict
+would lose the grant. (It also asserted `0x8E` where the record supported only `0x89`, until
+F-084 withdrew that claim from every record-derived route.) **10164** goes through
 `resolveContendedRecordSave`. **Ambiguous** keeps the mutation and permits no further write.
 **Definite local** refuses.
 
@@ -620,13 +621,18 @@ affine copy — do it through **one** wait under **one** absolute deadline; that
 replaced `awaitRestoreGate`, which was deleted rather than left beside it. The fourth,
 shared QoS 0, consults both verdicts without waiting on either and drops.
 
-**The disposition follows the two existing precedents.** Foreign disposes, discards the Will
-as a local takeover does, notifies `0x8E`, closes synchronously, and returns *nothing* to
-the parser — speaking again would race the displacer for the reason the client is left with.
-Forked, Local and an unresolvable ambiguity dispose nothing and discard nothing: none
-demonstrates another owner, so the client is told `0x89`.
+**The disposition follows the two existing precedents.** Foreign disposes, closes
+synchronously, and returns *nothing* to the parser — speaking again would race the displacer
+for the reason the client is left with. Forked, Local and an unresolvable ambiguity dispose
+nothing: none demonstrates another owner.
 
-**Every non-Foreign close consumes the Will under the held gate.** A record-observation
+**REBASED BY F-084.** As this finding landed, Foreign additionally discarded the Will
+"as a local takeover does" and notified `0x8E`, while the others said `0x89`. Foreign demonstrates
+no takeover either — a rejected ownership CAS establishes that the subject moved and nothing
+about who moved it — so it now says `0x89` too and consumes the Will like the rest. What
+still separates it is the DISPOSAL alone.
+
+**Every close here consumes the Will under the held gate.** A record-observation
 eviction can detach the session first, and the detached path publishes only an already-owed
 *immediate* Will, so a delayed one would never reach the durable outbox.
 
@@ -659,9 +665,10 @@ the sequence, lineage and record body at the acknowledged base.
 The verification that landed with this finding is the replicated production-order
 fixture — a live SUBSCRIBE driven through the real packet path with a second member
 holding the group, whose oracles are that the ownership write ran, that the refused
-broker's FIRST packet is DISCONNECT **0x8E**, that the group durable survives, and that a
-publish reaches the legitimate member — plus the unit-level invariants of the gate, the
-fact accumulator and the forked settlement. **Eleven** mutations kill their paired tests:
+broker's FIRST packet is a DISCONNECT (**0x8E** as this finding landed; rebased to `0x89`
+plus a disposal assertion by F-084 — see below), that the group durable survives, and
+that a publish reaches the legitimate member — plus the unit-level invariants of the gate,
+the fact accumulator and the forked settlement. **Eleven** mutations kill their paired tests:
 M1, M5b, M6, M11, M13b, M18, M21, M32, M33, M34 and M35. They include the one reproducing
 the pre-F-078 behaviour; the one reverting `mqttProcessSubs` to unnamed results, whose only
 killer is the store-count oracle; M33, collapsing the Foreign arm into a non-disposing
@@ -709,9 +716,14 @@ in the tail — Forked, Local and an unresolvable ambiguity all refuse the packe
 all three say 0x89 and dispose nothing — while the durable-survival and delivery-to-B
 oracles cannot separate them either, because B holds the group throughout whatever A is
 told. **M33 passed the earlier fixture and fails this one**, which is the measurement:
-0x8E is reachable only from the Foreign arm, after `disposeForeignStateLocked`, so it pins
-the verdict. What it still does not pin is the disposal's own state effects; the Will
-discard belongs to the owed forked-keeps-the-Will pair below.
+`0x8E` was reachable only from the Foreign arm, after `disposeForeignStateLocked`, so it
+pinned the verdict.
+
+**F-084 REBASED that oracle**, because `0x8E` no longer reaches the wire from this arm and
+Foreign now shares both the code and the Reason String with Forked — no byte separates them.
+The fixture asserts the **disposal** instead, which is the fact the code stood proxy for and
+the one thing Forked and Local do not do. So the state effect this paragraph called unpinned
+is now pinned there, and the Will pair below carries the rest.
 
 These fixtures are **owed and deliberately not claimed**, and review accepted them as
 follow-up rather than commit-blocking once the replicated case existed:
@@ -730,8 +742,8 @@ follow-up rather than commit-blocking once the replicated case existed:
 - **the eventual-Foreign arm.** It needs a SECOND BROKER sharing the session stream: a local
   contender cannot interleave a takeover while the SUBSCRIBE holds this session's ownership
   gate, so a single-broker fixture can only reach the unclassified arm. The direct Foreign
-  **verdict** is covered by the replicated production-order fixture, through its 0x8E
-  assertion; the state effects of that disposal are the owed Will pair, not that fixture.
+  **verdict** is covered by the replicated production-order fixture — through its disposal
+  assertion since F-084 rebased it off `0x8E`; the Will pair below carries the rest.
 
 ### Residuals F-078 states
 
@@ -835,15 +847,24 @@ budget.
 
 ### The disposition, and its two precedents
 
-Only **foreign** takes the takeover arm. **Forked** says a record claiming our parent erased
-our write and that nobody was demonstrated to own the session, so on the live path it neither
-disposes nor discards the Will — `mqttRejectionForked`'s precedent, and suppressing a Will
-there would be silent loss. The CONNECT path disposes on both, matching
+Only **foreign** DISPOSES on the live path. **Forked** says a record claiming our parent
+erased our write and that nobody was demonstrated to own the session, so there it does not
+dispose — `mqttRejectionForked`'s precedent.
+
+**REBASED BY F-084.** As this finding landed, foreign additionally took the *takeover* arm:
+it discarded the Will while forked did not. Foreign demonstrates no takeover either, so it
+now consumes the Will exactly as forked does, and suppressing one on either arm would have
+been the silent loss. The two are separated by the DISPOSAL alone.
+
+The CONNECT path disposes on both, matching
 `mqttReconcileRefuseForeign`, because pre-CONNACK there is no acknowledged session to
 preserve. Two paths, two existing precedents, followed rather than re-derived.
 
-Order: **dispose state → end the record transaction → release the ownership gate → notify
-and close**, with both the gate and the fence held across the disposal, and the notify/close
+Order: **dispose state → end the record transaction → CONSUME THE WILL → release the
+ownership gate → notify and close**, the Will step added by F-084 and placed there for the
+reason that section gives: the consume does JetStream work so the fence cannot be held
+across it, and the gate must still be held so nothing rebinds between the disposal and the
+Will it owes. The gate and the fence are held across the disposal, and the notify/close
 tail synchronous on the readLoop. `disposeForeignStateLocked` applies only if this session
 object is still current. `mqttProcessSubs` must keep idempotent defers for abnormal exits,
 because a test hook calling `t.Fatal` unwinds with `runtime.Goexit`.

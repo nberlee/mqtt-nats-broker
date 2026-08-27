@@ -32,7 +32,7 @@ type testConnectForkEnv struct {
 }
 
 // testNewConnectForkEnv builds it. stage decides whether the survivor claims our parent
-// of the accept save or a legitimate successor of it.
+// of the accept save or a child-SHAPED body claiming descent from it.
 func testNewConnectForkEnv(t *testing.T, clientID string,
 	stage func(*testing.T, *testInflightEnv) *mqttPersistedSession) *testConnectForkEnv {
 
@@ -68,21 +68,25 @@ func testGrantLifetime(t *testing.T, e *testRejectionEnv, c *client) mqttLifetim
 //
 // This arm disposed with no readback at all, so it asserted a takeover on nothing but the
 // fact that the CAS failed — the weakest evidence any of the five classified paths acts on.
-// It now reads the record it is about to concede to. The successor row is what keeps that
-// from being a blanket downgrade.
+// It now reads the record it is about to concede to. The child-shaped row is what keeps
+// that from being a blanket downgrade.
 func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
-		want  byte
+		want  mqttDisposalVocabulary
 	}{
 		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
-		}, mqttReasonServerBusy},
-		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
-		}, mqttReasonSessionTakenOver},
+		}, mqttDisposalForked},
+		// NOT "legitimate successor" any more, and not a takeover. Restore adopts WID/PWID
+		// without validating provenance and valid-shaped bodies arrive through unconditional
+		// publication, so a child-SHAPED body is a claim of descent, not proof of one.
+		// F-084: it concedes to the unsettled vocabulary, which asserts only what is true.
+		{"child-shaped body", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+			return testLandChildRecord(t, e, testMutateSibling)
+		}, mqttDisposalOwnershipUnsettled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewConnectForkEnv(t, "cxfork10071-"+tc.name, tc.stage)
@@ -99,25 +103,27 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 			// its own outcome, and the caller's projection reads it rather than the
 			// vocabulary. A helper that returns one disposing outcome for both fails here.
 			wantOutcome := mqttPreConnackDisposingNonForked
-			if tc.want == mqttReasonServerBusy {
+			if tc.want == mqttDisposalForked {
 				wantOutcome = mqttPreConnackDisposingForked
 			}
 			if g.outcome != wantOutcome {
 				t.Fatalf("outcome %v, want %v", g.outcome, wantOutcome)
 			}
-			if g.voc.reason != tc.want {
-				t.Fatalf("vocabulary reason %#x, want %#x", g.voc.reason, tc.want)
-			}
+			// The WHOLE vocabulary. Both of these carry 0x89 since F-084, so a reason-code
+			// assertion would pass against a broker that mixed them up — and mixing them up
+			// is precisely a false fork claim or a lost mint.
+			testAssertVocabulary(t, tc.name, g.voc, tc.want)
 			if e.resident(e.sess) {
 				t.Fatal("both verdicts dispose; only the claim differs")
 			}
-			if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != tc.want {
-				t.Fatalf("reason codes %x, want exactly one %x (wire %x)",
-					reasons, tc.want, b.out.bytes())
+			claims := b.disconnectClaims(t)
+			if len(claims) != 1 || !claims[0].matches(tc.want) {
+				t.Fatalf("disconnect claims %+v, want exactly one %+v (wire %x)",
+					claims, tc.want, b.out.bytes())
 			}
 			// disposalForDirectRejection reaches its verdict inside the caller's record
 			// transaction, which is where the repair is minted. See sess_fork_repair.go.
-			if tc.want == mqttReasonServerBusy {
+			if tc.want == mqttDisposalForked {
 				testAssertMinted(t, e.testRejectionEnv)
 				// EXACTLY once. The capsule alone cannot say so — a second mint replaces
 				// the map entry with an equivalent one — so the store counter is the only
@@ -151,9 +157,14 @@ func TestSessUnrelatedLineageAtConnectTimeStaysForeign(t *testing.T) {
 	if g := testGrantLifetime(t, e.testRejectionEnv, b.bc); !g.outcome.disposes() {
 		t.Fatalf("the grant's save must be rejected: outcome %v (%v)", g.outcome, g.err)
 	}
-	if reasons := b.disconnectAttempts(t); len(reasons) != 1 || reasons[0] != mqttReasonSessionTakenOver {
-		t.Fatalf("an UNRELATED lineage is conceded exactly as before: got %x (wire %x)",
-			reasons, b.out.bytes())
+	// An unrelated lineage concedes to UNSETTLED. It used to concede to the takeover
+	// vocabulary, which claimed a successor the record positively contradicts: this body
+	// shares neither our identity nor our parent, so it establishes nothing about who holds
+	// the session. F-084.
+	claims := b.disconnectClaims(t)
+	if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+		t.Fatalf("an UNRELATED lineage concedes to ownership-unsettled: got %+v (wire %x)",
+			claims, b.out.bytes())
 	}
 }
 
@@ -168,8 +179,8 @@ func TestSessForkedAtConnectTimeContendedInLoop(t *testing.T) {
 		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttRepairSaveForked},
-		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
+		{"child-shaped body", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+			return testLandChildRecord(t, e, testMutateSibling)
 		}, mqttRepairSaveForeign},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -219,8 +230,8 @@ func TestSessForkedAtConnectTimeContendedAfterExhaustion(t *testing.T) {
 		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttRepairSaveForked},
-		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
+		{"child-shaped body", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+			return testLandChildRecord(t, e, testMutateSibling)
 		}, mqttRepairSaveForeign},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -494,14 +505,15 @@ func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		stage func(*testing.T, *testInflightEnv) *mqttPersistedSession
-		want  byte
+		want  mqttDisposalVocabulary
 	}{
 		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
-		}, mqttReasonServerBusy},
-		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
-		}, mqttReasonSessionTakenOver},
+		}, mqttDisposalForked},
+		// See the connect-time table above: a child-SHAPED body proves no successor.
+		{"child-shaped body", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+			return testLandChildRecord(t, e, testMutateSibling)
+		}, mqttDisposalOwnershipUnsettled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewForkEnv(t, "rcfork-"+tc.name)
@@ -520,15 +532,15 @@ func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
 			// here, because the caller groups the two arms and the wire tests would still
 			// see whatever the unchanged vocabulary projects to.
 			wantOutcome := mqttPreConnackDisposingNonForked
-			if tc.want == mqttReasonServerBusy {
+			if tc.want == mqttDisposalForked {
 				wantOutcome = mqttPreConnackDisposingForked
 			}
 			if r.outcome != wantOutcome {
 				t.Fatalf("outcome %v, want %v", r.outcome, wantOutcome)
 			}
-			if r.voc.reason != tc.want {
-				t.Fatalf("vocabulary reason %#x, want %#x", r.voc.reason, tc.want)
-			}
+			// The WHOLE vocabulary: both arms carry 0x89 since F-084, so the reason code no
+			// longer separates them and the Reason String is what does.
+			testAssertVocabulary(t, tc.name, r.voc, tc.want)
 			// The disposal happened, at the CALLER, and the session is gone from the maps.
 			if e.resident(e.sess) {
 				t.Fatal("both disposing outcomes evict; only the claim differs")
@@ -546,7 +558,7 @@ func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
 			}
 			// disposalForDirectRejection reaches its verdict inside the caller's record
 			// transaction, which is where the repair is minted. See sess_fork_repair.go.
-			if tc.want == mqttReasonServerBusy {
+			if tc.want == mqttDisposalForked {
 				testAssertMinted(t, e)
 				if n := e.asm.forkedGrantStores.Load(); n != 1 {
 					t.Fatalf("the forked verdict stored %d capsules, want exactly 1", n)

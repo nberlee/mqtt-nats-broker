@@ -968,8 +968,8 @@ Residuals:
   ambiguously and a readback later proved it — but the Will existed only in the action the
   discharge consumed. Pre-existing: making a parked Will durable earlier is Will-outbox
   scope, not purge scope.
-- **A refused discard's obligation is memory-only, so a crash or a remote takeover in that
-  window drops it.** On a broker running this code, no discard runs on an unclassified
+- **A refused discard's obligation is memory-only, so a crash in that window drops it.**
+  On a broker running this code, no discard runs on an unclassified
   sequence: `clear` refuses unconditionally, at entry and again with the record fence
   held. FIVE of the seven call sites are REFUSAL-AWARE, each acting on the sentinel
   rather than destroying, and what each then does differs: the deferred discharge re-parks
@@ -986,10 +986,12 @@ Residuals:
   the discard-only shape (below). What remains is that the parked discard exists only in
   session memory, so there are exactly THREE ways to lose it, and every statement below is
   conditional on all three: a crash before the discharge; a remote persist, whose
-  classifying eviction worker evicts the re-added object — correctly, since a record
-  another broker owns is not this one's to delete, but the obligation goes with it (the
-  eviction is asynchronous now, defers to a held ownership gate or record fence, and can
-  be refused outright, which changes when the obligation is lost, not whether); and the
+  classifying eviction worker evicts the re-added object — correctly, since a record this
+  broker may no longer write is not its to delete. **Since F-084 the obligation no longer
+  goes with it**: that eviction EXTRACTS the parked action and discharges its Will against
+  the original deadline, so what this path loses is the discard obligation, not the Will.
+  (The eviction is asynchronous, defers to a held ownership gate or record fence, and can
+  be refused outright, which changes when the obligation is lost, not whether.) And the
   helper DECLINING, which needs neither of the other two and whose reachability is
   unknown. Absent all three, the next successful local classification retries the discard
   and completes it. A remote persist has two orderings and neither is a guarantee:
@@ -1015,10 +1017,14 @@ Residuals:
     sweep skips `ExpiryInterval == 0`, and the consumer sweep reads the record's consumers
     as referenced), so only a later CONNECT on the same client ID discards it.
   - **The same crash can lose that close's WILL, because the recovery runs BEFORE the Will
-    is published.** The refusal deliberately keeps the Will out of the parked action — a
-    memory-only Will is dropped by a takeover, which is worse — so the close publishes it
-    by falling through to `mqttHandleWill`, after the recovery has parked the obligation
-    and restored residency. A crash in between loses the Will permanently: no durable
+    is published.** The refusal deliberately keeps the Will out of the parked action, so
+    the close publishes it by falling through to `mqttHandleWill`, after the recovery has
+    parked the obligation and restored residency. The original rationale for that split —
+    that a memory-only Will parked on the action would be dropped by a takeover — no longer
+    holds as stated: F-084 made every RECORD-DERIVED disposal discharge a parked action's
+    Will, so only the LICENSED takeover still drops one, and there by design. The split is
+    retained on the narrower ground that an owed-now Will must not wait on a teardown the
+    recovery may never complete. A crash in between loses the Will permanently: no durable
     intent exists for an owed-now Will. The window is PRE-EXISTING — today a failed
     `clear()` logs and reaches the same `mqttHandleWill` just as late — and this change
     keeps the same ORDERING while replacing that log with the recovery's own work: a
@@ -1116,7 +1122,7 @@ it does *not* promise:
   COMPLETES.** A SUBSCRIBE with no SUBACK, the 3.1.1 UNSUBSCRIBE (whose error closes the
   connection with no UNSUBACK), and a refused CONNECT's lifetime grant all keep their
   mutation, and once a resolution verdict is obtained that mutation is durable unless a
-  foreign owner intervened. Both outcomes were always legal — the client was told nothing
+  competing write intervened. Both outcomes were always legal — the client was told nothing
   and must reconcile on reconnect — and the landed one was always possible; what changed
   is that it became deterministic. A granted Session Expiry Interval of 0 therefore ends
   the session at that close even though the CONNECT was refused, which is the
@@ -1256,15 +1262,19 @@ it does *not* promise:
   proposal) leaves the session UNRESOLVED rather than disposing it. A refusal with
   **10071** is classified foreign, and that is the residual: an unconditional foreign
   write carries no expectation for any check to compare, so a body that lands on the
-  subject can still be read as another owner's. (For a competing CONDITIONAL write the
+  subject is still read as not-ours. (It was read as *another owner's* before F-084; the
+  disposal is the same, and the claim it makes no longer names an owner.)
+  (For a competing CONDITIONAL write the
   route is closed — see the same-base boundary below.) Narrowed from "absence is a
   verdict", not closed.
 
 ### A forked session record is RECOGNISED, and its recoverable grant REPAIRED
 
 `$MQTT_sess` records carry `WID`/`PWID`, a parent pointer, so a survivor that provably
-**CLAIMS the parent** of the record this broker was acknowledged for stops being
-reported as a takeover: the client is told **0x89 "server busy, try again later"**
+**CLAIMS the parent** of the record this broker was acknowledged for is recognised as a
+SIBLING — which is what mints the repair grant. It also stopped being reported as a
+takeover here, which F-084 has since generalised: **no** record-derived route claims one.
+The client is told **0x89 "server busy, try again later"**
 instead of 0x8E, which invites the reconnect 0x8E forbids. Five classified paths consult
 it — the definite rejection probe (bound and unbound), the ambiguity resolver, the two
 CONNECT-time saves, and the persist observation's eviction worker — plus the CONNECT
@@ -1295,14 +1305,16 @@ What it does NOT do:
     boundary), so there is no older path to be asymmetric with. It does **not** close
     F-036, which stays open for the bound deleted-record case below;
   - a record that was **deleted** rather than moved is handed to the ownership marker,
-    which converges an UNBOUND session; its bound outcome is **0x8E** when it converges
-    at all (see the next bullet, which is why F-036 stays open). Absence is a real
-    ownership fact (only a
-    party that claimed the record at our sequence can remove it), but for an
-    expiry-driven deletion the accompanying Reason String — "session taken over by a
-    new connection" — is imprecise: no new connection need exist. The disposal is
-    right either way and the client's reconnect correctly gets a fresh session; a
-    gone-specific vocabulary value is filed as its own roadmap bullet;
+    which converges an UNBOUND session; its bound outcome is **0x89 "ownership
+    unsettled"** when it converges at all (see the next bullet, which is why F-036 stays
+    open). Absence is a real ownership fact — only a party that claimed the record at our
+    sequence can remove it — but it is **not a successor fact**, and F-084 corrected the
+    claim accordingly: this text used to say the accompanying `0x8E` was "right either
+    way" and only its Reason String imprecise, which had the defect backwards. No new
+    connection need exist, and none is now asserted. The disposal is right either way and
+    the client's reconnect correctly gets a fresh session; a gone-specific vocabulary
+    value that would tell an expiry-driven vanishing from a takeover is filed as its own
+    roadmap bullet, and it may only ever refine this `0x89`, never restore `0x8E`;
   - **the deleted-record shape does NOT converge a bound session that never sends
     another packet.** Unlike the moved-record shape — where the eviction worker
     disposes a bound session itself — arming the marker hands the case to the record
@@ -1333,20 +1345,26 @@ What it does NOT do:
     the direction and the evidence. The one-hop limit applies as everywhere — including
     through an UNRESOLVED local attempt: a save whose store landed ambiguously leaves
     the acknowledged pair stale behind a free fence, so a remote sibling of that
-    unadopted attempt concedes to 0x8E (and the takeover-path Will cancel), exactly as
-    before this change, while a sibling of the acknowledged record itself still
+    unadopted attempt CONCEDES, while a sibling of the acknowledged record itself still
     classifies forked; a stale pair can only narrow the verdict, never manufacture a
-    false forked one;
+    false forked one. **What conceding says was corrected by F-084**: it used to be 0x8E
+    plus the takeover-path Will cancel, and is now `0x89` ownership-unsettled with the
+    Will taken through ordinary handling — failing to recognise sibling-hood leaves the
+    broker knowing less, and less knowledge cannot license a stronger claim;
   - the **timer-cancel** consequences are unchanged in shape: both verdicts cancel the
-    session-expiry timer (the record is owned remotely either way), which still bounds
-    what the rollback path's preserved timer is worth;
-  - a **bound connection's never-enqueued delayed Will is still lost on eviction**, on
-    both verdicts: eviction detaches `sess.c`, the close's teardown gate then fails, and
-    a delayed Will is never enqueued — the same shape as the foreign disposition's filed
-    behavior. What this item narrows is only the destruction of already-durable outbox
-    state;
-  - an **interrupted takeover-verdict cancel scan** leaves a durable partial state —
-    earlier records cancelled, later ones pending, no resume marker (pre-existing);
+    session-expiry timer (this broker may not write the record either way, so its timer
+    must not fire against it), which still bounds what the rollback path's preserved timer
+    is worth;
+  - a bound connection's never-enqueued delayed Will **was** lost on eviction, on both
+    verdicts, because eviction detached `sess.c` and the close's teardown gate then failed
+    so the Will was never enqueued. **F-084 closed that**: the eviction tail now discharges
+    a parked deferred action, or hands a live Will to ordinary handling, before the
+    notification and the close. What THIS item narrowed was only the destruction of
+    already-durable outbox state;
+  - an **interrupted cancel scan** left a durable partial state — earlier records
+    cancelled, later ones pending, no resume marker. Historical: the eviction worker runs
+    no cancel scan on any verdict now, the displaced incarnation's Wills being the
+    claimant's business at fire time;
   - on the forked verdict the preserved outbox record can **still be cancelled at
     `FireAt`** by the lineage-blind watermark/session-record fences (filed separately);
   - **shutdown-time observations are dropped** once the dispatch gate closes or the
@@ -1425,18 +1443,19 @@ What it does NOT do:
   CAS off the same base, so a sibling can merely have become current after `clear()`
   deleted our record. What is established is only that the survivor is not demonstrably
   a successor of ours.
-- **The withheld verdict can publish a Will a genuine takeover would have suppressed**, on
-  the definite-rejection bound path: the foreign settlement calls
-  `mqttDiscardWillOnTakeover` before disposing, while the 0x89 route runs ordinary close
-  bookkeeping, which marks the Will owed and publishes it. This is what
-  `errMQTTSessionOwnershipUnsettled` has always done — it is the "nothing arbitrated this"
-  path — but the forked verdict reaches it more often.
-- **The ambiguity path's treatment is unchanged in every other respect**, including that
-  `disposeForeignStateLocked` consumes the parked deferred disconnect, which can drop the
-  only copy of a Will and an original expiry deadline, and that retained `uncertainLanded`
-  continuations are not cleared. Both are PRE-EXISTING behavior on the foreign path, not
-  regressions from this item — the forked verdict reaches the disposition it would have
-  reached anyway — and both are filed separately.
+- **RESOLVED BY F-084.** This bullet used to say the withheld verdict could publish a Will
+  a genuine takeover would have suppressed, because on the definite-rejection bound path the
+  foreign settlement discarded the Will while the 0x89 route ran ordinary close bookkeeping
+  and published it. **Both arms now publish**: the foreign settlement demonstrates no
+  successor either, so it consumes the Will exactly as the 0x89 route does. There is no
+  longer a divergence for the forked verdict to reach more often.
+- **The ambiguity path's treatment is unchanged in every other respect**, and one part of
+  it was **RESOLVED BY F-084**: `disposeForeignStateLocked` still takes the parked deferred
+  disconnect, but it no longer drops it — the prepared disposition DISCHARGES that action's
+  Will against its original deadline, so the only copy of a Will and its expiry deadline are
+  no longer lost there. Retained `uncertainLanded` continuations are still not cleared; that
+  is PRE-EXISTING behavior on the foreign path, not a regression from this item, and is
+  filed separately.
 - **A preserved rollback timer can miss its record once, and the sweep is what catches
   it.** When the timer a forked rollback leaves armed fires, a surviving sibling that is
   still `DisconnectedAt == 0` makes `loadExpiringSessionRecord` report not-due, the one-shot
@@ -1482,6 +1501,13 @@ What it does NOT do:
   audit — every route by which the inheritance produced a verdict was reachable equally
   by a FALSE fork, and there was no route on which it was reachable only by a true one.
 
+  **Read the vocabulary in this subsection historically.** It records the write-lineage
+  audit as it stood, when conceding meant `0x8E` plus a takeover-path Will cancellation.
+  **F-084 changed what conceding SAYS and DOES** — `0x89` ownership-unsettled, with the Will
+  taken through ordinary handling — so every "concedes to the takeover vocabulary" below
+  describes the audit's reasoning, not today's wire behaviour. The audit's *conclusions*
+  about which pairs are recognised are unaffected.
+
   There are two failure DIRECTIONS. A **missed recognition** concedes to the takeover
   vocabulary and is exactly the behavior that preceded F-029b. A **false fork** reports
   the fork vocabulary — reason code 0x89, its Reason String, the log line and the close
@@ -1502,10 +1528,13 @@ What it does NOT do:
     Pinned in both orientations by
     `TestMQTTParentlessCreateConcedesFromBothOrientations` across all three production
     create paths, and end to end on the wire by
-    `TestMQTTCreateForkE2EAnswers0x8EToTheDisplacedClient`.
+    `TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient`.
 
-    **Its cost is not vocabulary alone.** The conceding side reports 0x8E and cancels its
-    delayed Will, where a recognised fork reports 0x89 and destroys no durable Will state.
+    **Its cost is no longer vocabulary at all.** The conceding side used to report 0x8E and
+    cancel its delayed Will; since F-084 it reports 0x89 exactly as a recognised fork does,
+    and destroys no durable Will state either. What still differs is the REPAIR: a
+    recognised fork mints a grant anchored to a record proven to claim our parent, and a
+    concession mints nothing, because nothing was proven.
 
     **The residual is conditioned on EVIDENCE, not on a rollout.** It stands unless a
     route is found that produces a true create-pair verdict without also producing the
@@ -1752,13 +1781,15 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
 - **A BOUND session is settled before its next packet is dispatched, and that is narrower
   than "never serves a displaced client".** The gate runs per packet inside `mqttParse`,
   claims the ownership gate as the bound client, and serves only on a landed CAS; every
-  other outcome closes the connection — a 0x8E ATTEMPT when the probe proved the session
-  foreign, a 0x89 "server busy" attempt when nothing was established, and SILENCE when the
-  session was found REBOUND (a takeover owns the notification and makes its own 0x8E
-  attempt; a courtesy packet here would contradict it on the same socket). Each of those is
+  other outcome closes the connection — a `0x89` ownership-unsettled ATTEMPT when the
+  probe proved the session foreign (it was `0x8E` before F-084, which claimed a successor
+  the probe never found), a `0x89` "server busy" attempt when nothing was established, and
+  SILENCE when the session was found REBOUND (the displacement owns the notification and
+  makes its own attempt; a courtesy packet here would contradict it on the same socket).
+  Each of those is
   an attempt rather than a delivered packet: a connection's one server DISCONNECT is claimed
-  once (see (12)), the takeover notification is additionally gated on the CONNACK, and a
-  write can lose to a concurrent close. A refused ownership claim is retried while this
+  once (see (12)), the displacement notification is additionally gated on the CONNACK, and
+  a write can lose to a concurrent close. A refused ownership claim is retried while this
   connection is still the owner rather than read as a verdict. What that leaves:
   1. **Outbound deliveries continue** to the displaced client until an inbound packet
      triggers the settlement, or the connection ends. Closing that needs a delivery-side
@@ -1801,9 +1832,12 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
        subject). That refusal does not prove the ORIGINAL proposal is dead, and an
        unconditional foreign write is excluded by nothing, so a body landing on the
        subject afterwards is still classified foreign — evicting
-       the session, closing a live connection with 0x8E and discarding its Will before its
-       own write lands. Narrowed (10164 now defers instead of disposing) rather than
-       closed; see the settlement section below.
+       the session and closing a live connection before its own write lands. Narrowed
+       (10164 now defers instead of disposing) rather than closed; see the settlement
+       section below. **F-084 narrowed the CONSEQUENCE too**: that close reports `0x89`
+       ownership-unsettled rather than `0x8E`, and the connection's Will is CONSUMED rather
+       than discarded, so a wrongly-classified live connection no longer loses its Will and
+       is no longer told to stop reconnecting.
   8. **An ambiguous probe's fail-closed close parks a memory-only teardown**, so a crash
      before resolution loses the parked Will and the original expiry deadline. That is the
      pre-existing parked-teardown exposure, newly reachable from this path.
@@ -1816,16 +1850,20 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   10. **The park after an ambiguous probe is not guaranteed.** Between the sentinel return
       and the close bookkeeping, the periodic pass's bound-uncertain resolver can classify
       foreign and dispose first, reaching the owed-Will arm the Will bullet below names.
-  11. **The foreign arm's 0x8E is an unbounded courtesy write too**, as is the periodic
-      pass's disposal 0x8E — which is additionally performed gate-held. Same class as (9),
+  11. **The foreign arm's DISCONNECT is an unbounded courtesy write too**, as is the
+      periodic pass's disposal DISCONNECT — which is additionally performed gate-held.
+      (Both said `0x8E` before F-084; both now say `0x89`, and the delay is the same
+      either way.) Same class as (9),
       filed as its own §0 roadmap item. (When the claim or the CONNACK gate suppresses the
       notification there is no write and no delay; that is not a bound, only a case.)
   12. **At most one server-DISCONNECT ATTEMPT per connection, which is narrower than one
       delivered packet with the right reason.** The second-DISCONNECT class is closed: the
       notification is a per-connection claim (`mqttClaimDisconnectLocked`) shared by all four
       displacement paths, the parse-error footer, the packet-too-large 0x95 and the shutdown
-      drain, so a 0x89 can no longer follow a 0x8E — or a 0x8E another 0x8E — on one socket,
-      which is what [MQTT-3.14.4-1] forbids. Every enqueue-path writer consumes it in the
+      drain, so no second server DISCONNECT can follow a first on one socket, which is what
+      [MQTT-3.14.4-1] forbids. (Stated as codes before F-084; the displacement vocabularies
+      now share `0x89`, so the guarantee is about the COUNT, which is what the claim always
+      enforced.) Every enqueue-path writer consumes it in the
       same `c.mu` critical section as its write; `shutdownDisconnect` is the exception and
       RESERVES it, claiming under the lock and attempting `writeDirect` after releasing it.
       What remains:
@@ -1834,7 +1872,8 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
         3.1.1 or size-suppressed build never reaches the claim; a connection displaced
         before its own CONNACK is closed silently by design ([MQTT-3.2.0-1]); and the
         shutdown drain can spend its reservation and then write nothing — suppressing a
-        competing 0x8E — if the process dies or the deadline-bounded `writeDirect` fails
+        competing displacement DISCONNECT — if the process dies or the deadline-bounded
+        `writeDirect` fails
         after the unlock.
       - **A notification can be dropped for an already-acknowledged client.** The CONNACK
         gate is read under `c.mu` and the flag is stored inside the CONNACK write's own
@@ -2203,10 +2242,11 @@ Residuals and hard requirements:
   newer one. Both are stacked instances of the documented apply-time CAS hole — strictly
   narrower than it, and not widened by any reaping, since nothing reaps a watermark. A
   condemnation claim admitted before a leader transition can likewise apply over a
-  fresh-generation successor's record; that resolves as the accepted takeover
-  convergence (the successor's broker observes the move and concedes, its client
-  reconnects with Session Present false, and generation-scoped deletions cannot touch
-  the successor's own resources).
+  fresh-generation record; that resolves as the accepted convergence (whichever broker
+  holds that record observes the move and concedes, its client reconnects with Session
+  Present false, and generation-scoped deletions cannot touch that generation's own
+  resources). The concession is driven by the record having moved, not by the concluding
+  broker identifying a successor, which it cannot.
 - **A finish can outrun the survivor's own observation.** Whoever finishes the
   condemnation marker deletes the record, and a bound, silent Keep Alive 0 client on the
   survivor's broker that dropped the marker observation then faces an ABSENT record — the
@@ -2616,13 +2656,11 @@ reason code above 5.
 Three residuals attach to that signal.
 
 - **It deliberately UNDER-claims.** A disposing refusal says "session ownership could not
-  be
-  confirmed" even where a child-shaped body was observed and the existing disposal classifies
-  it as a takeover, because the broker cannot currently prove which of those it is. Only a
-  body claiming our parent gets the stronger, and truthful, `0x89` "try again". The
-  DISCONNECT and log paths are unchanged and may still over-claim in the other direction;
-  the
-  whole class is **F-084**.
+  be confirmed" even where a child-shaped body was observed. Only a body claiming our parent
+  gets the more specific "ownership could not be established; try again". **The DISCONNECT
+  and log paths no longer over-claim in the other direction** — F-084 withdrew the takeover
+  assertion from every route that cannot hold the successor — so what remains here is one
+  direction, not two.
 - **The Reason String can be dropped for a client with a tight Maximum Packet Size.**
   `mqttMakeConnAckV5Frame` drops it **wholesale** rather than truncating when the frame would
   exceed the client's limit, and suppresses the frame entirely if it still does not fit. Such
@@ -3025,9 +3063,12 @@ survive on purpose.
    ([MQTT-3.1.2-8] requires it on a close not preceded by a DISCONNECT, and post-CONNACK there
    is no licence to discard it). Three arms reach it: an **unresolvable** ambiguous
    write, a
-   **10164** outcome that is local-definite or unresolved, and a **10071** classified takeover
-   or fork. The first two are the right trade — a connection serving a session that can persist
-   nothing is worse — and the third is an ownership disposition, where stopping is the point.
+   **10164** outcome that is local-definite or unresolved, and a **10071** classified as a
+   fork or as ownership-unsettled. The first two are the right trade — a connection
+   serving a session that can persist nothing is worse — and the third is an ownership
+   disposition,
+   where stopping is the point. (The third read "classified takeover or fork" before F-084
+   withdrew the takeover claim from this arm.)
    Each abandons the restore verdict so withheld deliveries are woken rather than parked.
 2. **A leave that never completes leaves the memberships durable and their group durables
    alive** until a later resume re-derives it. This belongs to the refusing arms only:
@@ -3054,14 +3095,75 @@ survive on purpose.
 6. **A pre-CONNACK ownership refusal can tell a v5 client why, but not "do not retry".**
    `0x8E` "Session taken over" is not a legal CONNACK Reason Code ([3.2.2.2]) and no legal
    code carries that instruction, so the refusal uses `0x83` with a Reason String. A client
-   that reconnects will contend for the session again. A protocol limit, not a gap. Note the
-   refusal does not claim a takeover either: on most of these arms nothing established one,
-   which is F-084's subject.
+   that reconnects will contend for the session again. A protocol limit, not a gap. The
+   refusal does not claim a takeover either, and since F-084 neither does the DISCONNECT
+   these arms would otherwise have sent: on none of them was a successor established.
 7. **PRE-EXISTING and unchanged:** a malformed shared membership key still fails to
    protect its
    group durable against the orphaned-consumer sweep, on any record. The pre-CONNACK preflight
    stops the forced leave from compounding it and makes the condition visible to an operator;
    it does not make malformed keys safe elsewhere.
+
+### A takeover this broker cannot hold is reported as unsettled, and its Will is published
+
+F-084 withdrew the `0x8E` "session taken over" claim from every route that reaches its
+verdict through a **record**, because no persisted shape proves a successor:
+`createOrRestoreSession` adopts `WID`/`PWID` without validating provenance, valid-shaped
+bodies arrive through unconditional publication, and acknowledged bytes are replayed
+verbatim. Only an in-process same-client-ID replacement this broker holds both ends of
+licenses the claim.
+
+Three residuals follow, and the alpha ships with them stated.
+
+1. **A genuine remote takeover is under-reported.** Another broker really does take the
+   session, this broker observes its record, and the displaced client is told `0x89`
+   "ownership could not be established; try again" rather than `0x8E` "stop reconnecting".
+   The client will reconnect, and against permanently unreadable or unclassifiable state it
+   will keep reconnecting. **This is an availability cost, not a state-safety failure**, and
+   it is preferred to the alternative: telling a live client its session was taken over when
+   nothing established that, on evidence a forged, replayed, unrelated or malformed record
+   produces identically.
+
+2. **That takeover's Will is published rather than suppressed.** The same routes previously
+   ran the takeover's Will discard. A displacement that cannot prove a successor may not
+   suppress a Will — suppressing it would be silent loss on evidence that establishes
+   nothing — so the displaced connection's Will now takes ordinary handling: published
+   immediately, or enqueued on the outbox against its delay where a qualifying acceptance
+   fact may still suppress it. For a real remote takeover whose client reconnects promptly
+   the acceptance fact converges it; for one whose client does not, a Will is delivered that
+   the pre-F-084 broker would have dropped. **The specified behavior is the Will, and the
+   old suppression was the deviation**, but a deployment that relied on the old silence will
+   see traffic it did not before.
+
+3. **The in-memory consume window, newly reachable.** `mqttTakeWillLocked` marks the Will
+   discharged and returns it, and the publish or enqueue follows outside `c.mu`. A crash in
+   between loses that Will. This is the identical window `mqttPublishOwedWill` and every
+   ordinary close already have — F-084 did not create it — but it is now reachable on the
+   disposal routes as well. Closing it needs a durable intent record written before the
+   in-memory consume, which is new durable state and out of scope for this item. The same
+   applies to a parked action consumed into a prepared disposition and lost to a crash
+   before its discharge: the discharge deliberately does **not** re-park, because phase 1
+   has already deresidented the session and a re-parked action would be unreachable by any
+   pass.
+
+4. **An already-due parked Will whose immediate delivery fails is LOST, and only logged.**
+   `dischargeDeferredWill` consumes the parked action and, on the already-due branch,
+   publishes through the outbox's client-free publisher. If that publish cannot proceed —
+   an undeliverable topic, a transport failure — the helper warns and returns. Nothing
+   retries it, and nothing puts the action back.
+
+   **The absence of a re-park is deliberate, not an oversight.** Phase 1 has already
+   deresidented the session, so an action put back there is unreachable by the periodic
+   pass and by the next CONNECT: re-parking would convert a logged loss into a silent one.
+   Pinned by `TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked`. Closing it
+   needs a durable intent record written before the in-memory consume, which is new durable
+   state and out of scope for this item — the same boundary residual 3 sits behind.
+
+Two adjacent outbox behaviors are **pre-existing** and unchanged, and are recorded here only
+because these routes now reach them: an enqueue whose retries are exhausted publishes
+immediately as a fail-safe, and because the create is then unconfirmed rather than proven
+absent, a record that landed with its ack lost fires later as well and the Will is published
+**twice**; actual loss requires that fail-safe publication to fail too.
 
 ### A drain interrupted by its own session's clear withholds that completion
 

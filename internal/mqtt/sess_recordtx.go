@@ -456,8 +456,9 @@ func setMQTTTestTryBeginPreLockHook(h func(sess *mqttSession)) func() {
 //
 // MaxConsumers IS a prerequisite now, and it was not before: this owner creates
 // a consumer. Every broker runs its own ephemeral session-record watch over this
-// stream (sess_record_watch.go), which is how a resident session learns that a
-// peer took it over, so a finite cap eventually rejects a legitimate broker
+// stream (sess_record_watch.go), which is how a resident session learns that its
+// record MOVED — not who moved it, which the watch cannot say (F-084) — so a
+// finite cap eventually rejects a legitimate broker
 // start — the same reasoning, and the same check, as $MQTT_rmsgs. Note that a
 // configured 0 means UNLIMITED once nats-server normalizes the config, so only a
 // positive value is hostile.

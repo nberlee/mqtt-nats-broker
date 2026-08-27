@@ -266,6 +266,12 @@ func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
 		opts:     &Options{},
 		quitCh:   make(chan struct{}),
 		nodeName: "node1",
+		// Initialized exactly as the production constructor does. Without it any path that
+		// ENQUEUES a delayed Will panics on a nil map inside scheduleWillTimer, so this env
+		// could not reach the outbox route at all — a fixture that cannot reach the code it
+		// names proves nothing about it.
+		willTimers:      make(map[string]*time.Timer),
+		willClaimStopCh: make(chan struct{}),
 	}
 	s.running.Store(true)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
@@ -2967,6 +2973,13 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 	}
 }
 
+// VOCABULARY for the register-claim tests below, because F-084 narrowed the word
+// elsewhere: "takeover" here is a resumer that completed an ACCEPTED CONNECT and then won
+// each register's own claim CAS. Both are proofs it holds in hand, which is exactly what
+// F-084 requires of anything calling itself a takeover, and neither is the record-derived
+// inference that finding withdrew. "New owner" below likewise names the winner of a claim
+// CAS, not a successor guessed from a moved session record.
+//
 // A takeover claims each shared register before installing it. Once that claim has
 // moved the register, the stale owner's close can know only the retired sequence;
 // after the new owner crashes, a third recovery still finds the ORIGINAL identifier.

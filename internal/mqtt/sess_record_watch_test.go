@@ -15,7 +15,7 @@ var errMQTTTestLostResponse = errors.New("mqtt test: the store landed but its re
 // The session-record watch and its committed-read backstop.
 //
 // The watch replaced an at-most-once notification that could simply be lost,
-// stranding a displaced client on a session another broker owned. What replaced it
+// stranding a displaced client on a session whose record had moved out from under it. What replaced it
 // is deliberately NOT a durable channel either — an ephemeral AckNone push consumer
 // can duplicate or drop a delivery — so the guarantee lives in the PAIR: the watch
 // owns latency, the periodic committed read owns convergence.
@@ -82,7 +82,7 @@ func TestMQTTWatchConvergesWithoutTheBackstop(t *testing.T) {
 	e.setWatchDelivery(true)
 	done := e.armEvictObserver()
 
-	e.remoteTakeover(t, "node2", "wchlive")
+	e.remoteRecordWrite(t, "node2", "wchlive")
 
 	if !testAwaitEvictDone(t, done) {
 		t.Fatal("the watch must converge a displaced resident with no backstop pass at all")
@@ -100,7 +100,7 @@ func TestMQTTBackstopConvergesWithoutTheWatch(t *testing.T) {
 	e := testNewWatchEnv(t, "wchdrop")
 	done := e.armEvictObserver()
 
-	e.remoteTakeover(t, "node2", "wchdrop")
+	e.remoteRecordWrite(t, "node2", "wchdrop")
 
 	// Nothing may have happened yet: the watch delivery was dropped, and with it the
 	// only prompt signal. This is the precondition that makes the pass below the
@@ -219,9 +219,8 @@ func TestMQTTWatchDoesNotEvictOnOwnAmbiguousLanding(t *testing.T) {
 // finding. The backstop deliberately passes NO record, so the Origin filter cannot
 // screen our own write, and the pass's seqUncertain check happens BEFORE the read —
 // a save can land and lose its response in between. If the worker's own load then
-// fails, there are no bytes for the digest arm, and conceding to the takeover
-// vocabulary would evict the rightful client over its own write on the one occasion
-// the digest cannot speak.
+// fails, there are no bytes for the digest arm, and conceding would evict the rightful
+// client over its own write on the one occasion the digest cannot speak.
 //
 // The control is the same unusable load with NO unresolved attempt, which must still
 // evict: the license rule is unchanged for the case the observation can only have

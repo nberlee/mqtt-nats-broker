@@ -1198,10 +1198,10 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 // M9 is pinned by IMMEDIATE-state assertions on a finite-expiry session, not by
 // the reconnect (a bare-removeSession mutant's next reconnect also succeeds by
 // reloading the record): after the refusal, ordinary close bookkeeping must
-// have been suppressed for the stolen session — no expiry timer, no disconnect
+// have been suppressed for the conceded session — no expiry timer, no disconnect
 // save on top of the foreign record, and the client detached. The mutant runs
 // that bookkeeping and produces exactly those.
-func TestMQTTReconcileTakeoverDuringPhase(t *testing.T) {
+func TestMQTTReconcileForeignWriteDuringPhase(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2867,7 +2867,7 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 		n := attempts
 		mu.Unlock()
 		mqttTestSessStoreSuppressV.Store(false)
-		// One store for the original save plus one per retry: the takeover must
+		// One store for the original save plus one per retry: the competing write must
 		// land on the LAST retry, so the loop exits with its rejection
 		// unclassified and only the post-loop re-read can decide.
 		if n >= mqttRepairSaveAttempts+1 {
@@ -3036,7 +3036,7 @@ func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
 // before any later write read the record as disposable and discarded the
 // session.
 //
-// A takeover discovered while a refused resume is being unwound hands the
+// A competing write discovered while a refused resume is being unwound hands the
 // session over instead of restoring it locally.
 //
 // Review finding: the grant's own save can be the thing that shows the record moved

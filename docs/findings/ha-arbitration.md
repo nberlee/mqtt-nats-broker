@@ -903,7 +903,9 @@ distinguishes a census from a sample in kind rather than in length.
   remains is the DELETED record on a BOUND session: the backstop arms the ownership
   marker, and the record-rejection settlement that answers it is packet-driven for a
   bound connection, so a Keep Alive 0 client that goes silent still holds a session
-  another broker tore down. That is this finding's own failure shape, so the finding
+  whose record was durably deleted. (Deleted by a teardown, which is what the deletion
+  shows; it does not name the broker that ran it, and nothing here needs it to — F-084.)
+  That is this finding's own failure shape, so the finding
   stays open until a bound-session disposal exists that does not wait for client
   traffic. Residuals in `docs/CONFORMANCE.md`.
 
@@ -2383,7 +2385,72 @@ Splitting the finding or shipping a partial mechanism is not among them.
 
 ## F-084: Prove a successor before claiming a takeover
 
-**Alpha blocker. Filed 2026-08-26**, split out of `docs/ROADMAP.md`'s pre-CONNACK-signal
+**DONE 2026-08-27.** The successor predicate was **avoided rather than found**, which is the
+resolution and not a shortcut: no persisted shape proves a successor, so the claim was
+withdrawn from every route that cannot hold one. `mqttDisposalTakenOver` now has exactly one
+reader, reachable only from `discardTakenOverClient` - the in-process same-client-ID
+replacement this broker holds both ends of under the ownership gate. Everything
+record-derived reports the new fourth vocabulary `mqttDisposalOwnershipUnsettled` (`0x89`,
+`mqttReasonStrOwnershipUnsettled`, minting nothing).
+
+**The Will half was five routes, not one**, and four were real losses that three review
+rounds uncovered one at a time: the foreign disposal dropped a parked deferred action on the
+floor; a detached client's close publishes only an *immediate* Will so an owed-delayed one
+vanished; the remote-persist eviction performed **no** Will action at all; and the takeover
+discard reached classes that had demonstrated no takeover. The fifth,
+`mqttAbortAcceptedConnect` discarding the *arriving* connection's Will, is correct and
+unchanged - which is why the rule is scoped to the **displaced** session's Will, since a
+pre-CONNACK disposing arm has both in play taking opposite actions.
+
+**What landed.** A two-phase `mqttForeignDisposition`: phase 1 runs the identity check
+first, then extracts the stale client and any parked action and chooses one typed
+`mqttWillAction`, all in a single `sess.mu` critical section; phase 2 executes it outside
+that lock, after the caller's record transaction closes and, at every caller that
+holds one, while the ownership gate is still held. The remote-persist eviction is the
+exception and its contract is the inverse: it decides under `as.mu` and runs its action
+from a tail where no gate is held at all, so a single universal oracle would have had to
+be wrong for one route or the other, and there are two. A refused identity check carries
+`mqttWillActionNone`. `dischargeDeferredWill`
+is extracted from `applyDeferredDisconnect`'s lower half - Will-only, client-free, no
+fence - and `applyDeferredDisconnect` calls it too, so the discharge exists once.
+`settleBoundRejectionGated`'s rebind predicate gained the discrimination it needed: `sess.c
+!= c` is also true when `sess.c` is **nil**, which a resolver or a record-derived disposal
+produces, so only a different **non-nil** local client is licensed evidence.
+
+**Refuted and recorded so none returns.** Reusing `applyDeferredDisconnect` for the
+discharge: it applies the whole deferred teardown, assumes the session is still resident and
+its record resolved as ours, and takes a record fence two callers already hold - a
+self-deadlock, not a race. Deleting `mqttRepairSaveVerdict`: its five control outcomes are
+load-bearing and it has three direct production callers; what the dossier actually
+wanted was the vocabulary carried in the return, which `mqttDisposalForRepairSave`'s
+deletion achieved.
+Recovering the fork bit from `voc.reason`: both `0x89` vocabularies share the code, so it
+would mint a grant for every unsettled record.
+
+**What a future change must not undo.** `mqttDisposalTakenOver` keeps exactly one reader.
+The fork bit travels explicitly from the classification to the mint. The Will action is
+chosen by the **licence**, never by the vocabulary or the verdict's name. Phase 2 stays
+outside `sess.mu` and outside the record transaction, and inside the ownership gate. The
+discharge does not re-park, because phase 1 has already deresidented the session.
+
+**Shape:** 5 plan-review rounds (findings 10 -> 7 -> 7 -> 1 -> 0, zero repeats), 2
+consults - one selecting the item and settling the five decisions below, one granting a
+bounded
+revision 5 as a recorded exception to the pre-registered three-round cap. Residuals in
+`docs/CONFORMANCE.md`; mechanism in `docs/ARCHITECTURE.md`, "Only a held successor licenses
+a takeover claim".
+
+---
+
+### The original filing, kept for its analysis — NOT current behaviour
+
+**Everything from here to the end of this finding is the record AS FILED on 2026-08-26.**
+Its present tense describes the broker as it then was: the takeover claim it enumerates has
+since been withdrawn from every route it names, and the Will-disposition question it defers
+is answered in the resolution above. Read it for the population, the refuted designs and the
+reasoning — not for what the broker does.
+
+**Filed 2026-08-26**, split out of `docs/ROADMAP.md`'s pre-CONNACK-signal
 item by an escalation consult after three consecutive plan-review rounds cut this same seam
 wider each time. That escalation is the finding's own history and belongs here: the
 enumeration kept growing because the enumeration was the defect

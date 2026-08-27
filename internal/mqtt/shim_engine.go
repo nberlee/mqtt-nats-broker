@@ -881,8 +881,8 @@ func (c *client) abortSetup(reason ClosedState) {
 // shutdownDisconnect is the per-client drain step. For a connection that
 // completed a v5 CONNACK and still holds its one DISCONNECT claim, it ATTEMPTS a
 // server DISCONNECT (0x8B "server shutting down") under a bounded write deadline,
-// then closes the socket; a pre-CONNACK or 3.1.1 connection, and one already told
-// 0x8E by a displacement, get only a socket close. It deliberately does NOT run
+// then closes the socket; a pre-CONNACK or 3.1.1 connection, and one a displacement
+// has already notified, get only a socket close. It deliberately does NOT run
 // MQTT/session/Will cleanup: closing the socket unblocks readLoop, whose
 // disconnect() performs that cleanup exactly once in the correct order
 // (mqttHandleClosedClient before closeConnection). The DISCONNECT bytes are
@@ -890,7 +890,10 @@ func (c *client) abortSetup(reason ClosedState) {
 // v5 fields. It is the one server-DISCONNECT writer that bypasses the enqueue
 // path — writeDirect, under a deadline — so it claims the connection's one
 // notification itself (mqttClaimDisconnectLocked): a displacement that already
-// told this client 0x8E must not be followed by a 0x8B [MQTT-3.14.4-1].
+// notified this client must not be followed by a 0x8B [MQTT-3.14.4-1]. What the
+// displacement said — 0x8E where it held the successor, 0x89 where it could only
+// show the record is not ours (F-084) — does not change the rule; spending the
+// claim does.
 func (c *client) shutdownDisconnect(deadline time.Time) {
 	var pkt []byte
 	if c.connAckWritten.Load() {

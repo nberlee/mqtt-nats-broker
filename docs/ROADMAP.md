@@ -509,9 +509,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   reaching the classifier, 0x89, and the Will PUBLISHED — and it runs in `make full-suite`,
   which applies no `-run` filter.
   **Deleting it would not have been a cleanup.** The forked verdict is not a reason code:
-  the bound-rejection foreign arm calls `mqttDiscardWillOnTakeover` and the forked arm
-  deliberately does not, so reporting this route as a takeover would cancel a delayed Will
-  that is still owed and skip the repair capsule
+  reporting this route as a takeover would skip the repair capsule
+  — and, as this bullet read when it was written, would also have cancelled a delayed Will
+  that was still owed, the bound-rejection foreign arm having discarded where the forked arm
+  did not. **F-084 removed that half**: both arms consume the Will now, so what deletion
+  would still cost is the capsule
   (`TestMQTTForkedRecordE2EConnectRebuildsFromRecord` pins the capsule restoring real
   delivery). One surviving route invalidates deletion however much other evidence
   converges, so the exit was fail-closed.
@@ -888,8 +890,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   one CAS through a defer that survives `runtime.Goexit`; ONE combined wait over that gate
   and the restore gate under ONE absolute deadline, which replaced `awaitRestoreGate`
   entirely (deleted — two mechanisms stated one fact); and a disposition tail following the
-  two existing precedents, Foreign disposing and closing with 0x8E while every other
-  non-owning outcome says 0x89 and disposes nothing. **The trigger is wider than F-077's,
+  two existing precedents, Foreign disposing and closing while every other non-owning
+  outcome disposes nothing. (It closed with `0x8E` when this landed; **F-084 made it
+  `0x89`**, so the arms now differ in the DISPOSAL alone.) **The trigger is wider than F-077's,
   and that is the subtle half:** the gate opens without a proof only for a packet that
   committed no trigger AND none of whose record writes was rejected by its **per-subject
   CAS**, because FOUR record writes in a SUBSCRIBE lose that evidence before the caller
@@ -923,13 +926,16 @@ further findings it surfaced are filed separately, for the reason its own bullet
   ownership gate — so the single-broker fixture reaches the unclassified arm only.
   What DID land is TWO end-to-end oracles plus the gate's unit invariants, and they cover
   different arms. The replicated production-order fixture drives a live SUBSCRIBE against
-  a real second-broker takeover and requires A's FIRST packet to be DISCONNECT **0x8E**,
-  the Foreign arm's own vocabulary and reachable from nowhere else in the tail, which pins
-  the **verdict**: "not a SUBACK" was too weak, and a mutation collapsing Foreign into a
-  non-disposing refusal passed the earlier form. The disposal's own **state effects stay
-  unproved there** — a tail that said 0x8E and disposed nothing would still pass, because
-  the second member preserves the durable and the delivery on its own — and they stay with
-  the owed disposal-ordering and forked-keeps-the-Will fixtures below. The single-broker
+  a real second-broker takeover and requires A's FIRST packet to be a DISCONNECT, which
+  pins the **verdict**: "not a SUBACK" was too weak, and a mutation collapsing Foreign into
+  a non-disposing refusal passed the earlier form. **The oracle was re-based by F-084**: it
+  required `0x8E`, reachable from nowhere else in the tail, and that code no longer reaches
+  the wire from any record-derived route — Foreign and Forked now share both the code and
+  the Reason String. The fixture asserts the DISPOSAL instead, which is the fact the code
+  stood proxy for and the one thing Forked and Local do not do. What used to stay unproved
+  there — a tail that reported correctly and disposed nothing — is therefore now proved
+  there, and the owed disposal-ordering and forked-keeps-the-Will fixtures below still carry
+  the rest. The single-broker
   fixture covers the **unclassified** arm, where the wire output cannot discriminate at
   all — the discriminating signal there is the store-attempt count on an unchanged
   re-SUBSCRIBE: exactly two, the proof and the tail's own byte-identical reattempt, so a
@@ -1156,7 +1162,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   anything. Five arms now: landed commits; ambiguous parks the continuation then
   resolves **in
   line under the accept transaction**; 10164 goes through the bounded contention retry; 10071
-  disposes with a **classified** takeover-or-fork vocabulary instead of a bare close;
+  disposes with a **classified** vocabulary — fork or ownership-unsettled since F-084,
+  takeover-or-fork when this landed — instead of a bare close;
   everything else rolls the removal back inside the still-open transaction and fails closed.
   **Continue only on proof** is the invariant, which is why the restore verdict can
   simply wait
@@ -1259,8 +1266,60 @@ further findings it surfaced are filed separately, for the reason its own bullet
   projection has no `default`, and the disposal is the CALLER'S so the signal can precede
   it.
 
-  - [ ] [F-084: Prove a successor before claiming a takeover](findings/ha-arbitration.md#f-084-prove-a-successor-before-claiming-a-takeover).
-  **Alpha blocker.** Split out of the pre-CONNACK-signal item above by an escalation consult
+  - [x] [F-084: Prove a successor before claiming a takeover](findings/ha-arbitration.md#f-084-prove-a-successor-before-claiming-a-takeover).
+  **Alpha blocker - DONE 2026-08-27.** The successor predicate was **avoided rather than
+  found**, and that is the resolution: no persisted shape proves a successor, so the claim
+  was WITHDRAWN from every route that cannot hold one. `mqttDisposalTakenOver` now has
+  exactly ONE reader, reachable only from `discardTakenOverClient` - the in-process
+  same-client-ID replacement this broker holds both ends of under the ownership gate. Every
+  record-derived route reports a fourth vocabulary, `mqttDisposalOwnershipUnsettled`
+  (`0x89`, `mqttReasonStrOwnershipUnsettled`), which MINTS NOTHING. Three pure mappers
+  collapsed into `mqttDisposalForLineage`, and the two classifying helpers now return the
+  fork BIT beside the vocabulary - because both `0x89` vocabularies share a reason code, and
+  the site that recovered the bit from `voc.reason` would have minted a grant for every
+  unsettled record. **The Will half was FIVE routes, not one**, and four were real losses
+  the review rounds found one at a time: a foreign disposal dropped a parked deferred action
+  on the floor; a detached client's close publishes only an IMMEDIATE Will so an
+  owed-delayed one vanished; the remote-persist eviction performed NO Will action at all;
+  and the takeover discard reached classes that demonstrated no takeover. The fifth,
+  `mqttAbortAcceptedConnect` discarding the ARRIVING connection's Will, is correct and
+  untouched - which is why the rule is scoped to the DISPLACED session's Will, a
+  pre-CONNACK disposing arm having both in play taking opposite actions. **What
+  landed:** a two-phase `mqttForeignDisposition` (identity check first, then extract the
+  stale client and any parked action and choose one typed `mqttWillAction`, all in one
+  `sess.mu` section; execute
+  outside it, after the caller's record transaction closes, and inside the ownership gate
+  at every caller that holds one - the remote-persist eviction runs its action from a tail
+  with no gate held at all, the INVERSE contract, and has its own oracle);
+  `dischargeDeferredWill`, extracted Will-only from `applyDeferredDisconnect`'s lower half
+  and called by it too so the discharge exists once; and the discrimination
+  `settleBoundRejectionGated` needed, since `sess.c != c` is ALSO true when `sess.c` is nil
+  and nil is what a resolver or a record-derived disposal leaves behind. **Refuted, so none
+  returns:** reusing `applyDeferredDisconnect` (it applies the whole deferred teardown,
+  assumes residency and an ours-verdict, and takes a fence two callers already hold - a
+  self-deadlock); deleting `mqttRepairSaveVerdict` (five load-bearing control outcomes,
+  three direct callers - `mqttDisposalForRepairSave` was the deletion actually wanted); and
+  recovering the fork bit from a reason code. **Residuals, in `docs/CONFORMANCE.md`:** a
+  genuine remote takeover is now under-reported as `0x89` and its Will is PUBLISHED rather
+  than suppressed - an availability cost accepted over telling a live client to stop
+  reconnecting on evidence a forged, replayed or malformed record produces identically; plus
+  the in-memory consume window, newly reachable on these routes. **Shape:** 5 plan-review
+  rounds (10 -> 7 -> 7 -> 1 -> 0 findings, ZERO repeats), 2 consults - one selecting the item
+  and settling the five decisions its own bullet said had to come first, one granting a
+  bounded revision 5 as a RECORDED exception to the pre-registered three-round cap.
+  **What a future change must not undo:** the single reader, the explicit fork bit, the Will
+  action chosen by LICENCE rather than by vocabulary, phase 2's position, and the
+  absence of a re-park.
+
+  ---
+
+  **Everything below is the finding AS FILED on 2026-08-26, kept for the analysis it
+  carries and NOT describing current behaviour.** Its present tense is the broker as it was:
+  the takeover claim it enumerates has since been withdrawn from every route named, and the
+  Will-disposition question it defers is answered above. Read it for the population and the
+  reasoning, not for what the broker does.
+
+  Split out of the pre-CONNACK-signal item above by an escalation consult
   after three plan-review rounds cut this same seam wider each time. *The finding:* the broker
   asserts **`mqttDisposalTakenOver` — "session taken over by a new connection", `0x8E`, which
   tells a client to STOP reconnecting — on evidence that establishes no successor at all.*
@@ -1508,7 +1567,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   design: the session-record watch.** Ownership changes only by a write to the client's
   record subject, so the observation channel is now a per-broker ephemeral consumer on
   `$MQTT_sess` instead of the at-most-once `$MQTT.JSA.*.SP.*.*` notification, and a
-  quiet session still costs no write per interval. The watch is lossy by construction,
+  quiet session still costs no write per interval. An observation establishes that the
+  record MOVED and so is no longer ours; it names no successor, which is why the
+  displaced client is answered 0x89 and not 0x8E (F-084). The watch is lossy by construction,
   so convergence rests on the PAIR: a committed-read backstop on the periodic pass
   re-reads each resident session's record, feeds the same trigger when it MOVED, arms
   the ownership marker when it is GONE (the shape no sequence comparison can see), and
@@ -1577,10 +1638,14 @@ further findings it surfaced are filed separately, for the reason its own bullet
   [platform
   audit](findings/nats-platform.md#stable-ephemeral-consumer-identities-and-metadata).
 
-  - [ ] Give a vanished record its own disposal vocabulary. The deleted-record arm reports
-  0x8E "session taken over by a new connection", which is right about the ownership fact
-  and wrong about the cause when the deletion was expiry-driven: no new connection need
-  exist. **Small.** A third `mqttDisposalVocabulary` value, not a new verdict. **This is
+  - [ ] Give a vanished record its own disposal vocabulary. **Rebased by F-084, which
+  landed first.** The deleted-record arm no longer reports 0x8E; it reports
+  `mqttDisposalOwnershipUnsettled` (0x89), which is truthful but UNDIFFERENTIATED - it
+  cannot tell an expiry-driven vanishing from any other unclassifiable observation. So this
+  item is now a REFINEMENT of that `0x89` waypoint rather than a correction of a false
+  claim, and its ceiling is fixed: `RWID` proves a RETIREMENT CAUSE, not a successor, so
+  this item may **never** restore 0x8E or takeover-style Will discard. **Small.** A
+  vocabulary value, not a new verdict. **This is
   the second of the two items that decide `RWID`'s future**, and for the same reason:
   telling an expiry-driven vanishing apart from a takeover needs positive evidence that
   THIS record was retired, which is what `RWID` states. If neither this item nor F-036

@@ -21,11 +21,14 @@ it existed on 2026-08-10.
   performed with the ownership gate held. `mqttEnqueueDisconnect` → `queueOutbound` →
   `writeSocket` with a ZERO deadline (`shim_engine.go`), so a client that has stopped
   reading blocks the writer indefinitely: the parse-error footer's 0x89 defers the
-  teardown that follows it, the bound settlement's foreign 0x8E pins its own readLoop, and
+  teardown that follows it, the bound settlement's foreign DISCONNECT pins its own readLoop
+  (it said 0x8E when this was filed; F-084 made that route 0x89, which changes nothing about
+  the unbounded write), and
   the periodic pass's `disposeForeignSessionLocked` performs that write while holding the
   session gate, which blocks a reconnecting CONNECT for as long as the stalled client
   lasts. The DISCONNECT claim above removes a write only when it suppresses one (a second
-  notification, or a pre-CONNACK takeover); the first claimant still writes unbounded, so
+  notification, or a pre-CONNACK displacement); the first claimant still writes unbounded,
+  so
   every site here stands. A deadline is not enough on its own: `writeSocket` installs it
   only AFTER acquiring `wmu`, so an earlier unbounded writer holding that mutex leaves the
   "bounded" write unbounded — a gap `shutdownDisconnect` shares. Three fix shapes were

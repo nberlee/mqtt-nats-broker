@@ -86,6 +86,18 @@ it existed on 2026-08-10.
   `docs/CONFORMANCE.md` meanwhile. (a) found by holistic round 2 of the rejection
   settlement, (b) by its plan round 4, (c) by plan round 2 of the bound settlement.
 
+**Post-F-084 note.** The record above is the finding AS ORIGINALLY FILED and two of its
+premises are now historical. Arm (b) is closed: a bound-foreign disposal no longer reaches
+the takeover discard at all, because F-084 withdrew the takeover claim from every route
+that cannot hold a successor, and such a disposal now CONSUMES the displaced connection's
+Will rather than classifying it against a takeover it never demonstrated. Arm (c) is
+closed too: a foreign uncertainty resolution no longer drops a parked teardown wholesale
+but discharges its Will against the original deadline. The paragraph's design argument
+against parking — "a remote takeover evicts the action under `as.mu` alone and nothing
+publishes it" — was true when written and is not now; the remote-persist eviction
+discharges the parked action. Arm (a), the ordinary close publishing before anything has
+classified the rejection, is UNCHANGED and is what keeps F-038 open.
+
 ## F-040
 
 **Title:** Reproduce and fix reconnect versus DISCONNECT expiry-zero
@@ -144,8 +156,8 @@ it existed on 2026-08-10.
   the record plays no part), while this one is a durable record that any broker can
   meet, including one that never saw the DISCONNECT. It bites whenever the owed
   discard's in-memory intent is lost, which the `clear()`-recovery item above narrowed
-  from unconditional to three cases: a crash before the discharge, a remote takeover
-  that evicts the object, and — needing neither of those — the recovery helper
+  from unconditional to three cases: a crash before the discharge, an observed remote
+  record write that evicts the object, and — needing neither of those — the recovery helper
   DECLINING for an already-parked action that is not the discard-only shape, after
   which the close evicts and logs. The third case's reachability is unknown and is not
   assumed away; `docs/CONFORMANCE.md` states all three.

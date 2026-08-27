@@ -893,7 +893,12 @@ func TestReDriveT2HandsOverTheAcceptTransaction(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestSupersededReleaseReDrivesTheCleanStart stages the OTHER superseded arm: the claim
-// is WON, and the release then finds a newer owner.
+// is WON, and the exact-sequence release then finds the marker REPLACED by a newer write.
+//
+// "Superseded" is a fact about the marker, not about who holds the session: a rival write
+// landed after our claim, and nothing here demonstrates that its author still holds
+// anything (F-084). What the re-drive rests on is our own claim's sequence no longer being
+// current, which is enough on its own.
 //
 // It matters separately because the two arms say different things about what happened.
 // The claim arm deleted nothing; this one ran the deletions first — legitimately, since

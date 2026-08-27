@@ -160,11 +160,15 @@ func TestRetirementCondemnsTheHollowSurvivor(t *testing.T) {
 	}
 }
 
-// TestRetirementLeavesAFreshSuccessorAlone is test 2, the discriminating pair for the
-// generation comparison in condemnRetiredSurvivor: a record that superseded the
-// release with a DIFFERENT generation is a legitimate successor. Condemning it would
-// be collateral damage, not repair.
-func TestRetirementLeavesAFreshSuccessorAlone(t *testing.T) {
+// TestRetirementLeavesAFreshGenerationAlone is test 2, the discriminating pair for the
+// generation comparison in condemnRetiredSurvivor: a record that superseded the release
+// with a DIFFERENT generation is outside the retirement's reach, because a watermark
+// retires ONE GENERATION and not a client ID. Condemning it would be collateral damage,
+// not repair.
+//
+// The claim is deliberately that narrow. Nothing here shows the fresh generation is held
+// by anyone (F-084), and nothing needs to: the conclusion is a refusal to destroy.
+func TestRetirementLeavesAFreshGenerationAlone(t *testing.T) {
 	a, b := testNewTeardownEnv(t)
 	const clientID = "fresh-successor"
 
@@ -203,10 +207,10 @@ func TestRetirementLeavesAFreshSuccessorAlone(t *testing.T) {
 		t.Fatal("the successor's record was deleted")
 	}
 	if ps.Gen != successorGen {
-		t.Fatalf("the successor's record was overwritten: generation %q, want %q", ps.Gen, successorGen)
+		t.Fatalf("the fresh generation's record was overwritten: generation %q, want %q", ps.Gen, successorGen)
 	}
 	if ps.Teardown != nil {
-		t.Fatal("a fresh-generation successor was condemned: the watermark retires one generation, " +
+		t.Fatal("a fresh-generation record was condemned: the watermark retires one generation, " +
 			"not a client ID")
 	}
 
@@ -216,7 +220,7 @@ func TestRetirementLeavesAFreshSuccessorAlone(t *testing.T) {
 		t.Fatalf("CONNECT over the successor: %v", cerr)
 	}
 	if !existed || sess.gen != successorGen {
-		t.Errorf("the successor must resume: existed=%v gen=%q want true/%q", existed, sess.gen, successorGen)
+		t.Errorf("the fresh generation must resume: existed=%v gen=%q want true/%q", existed, sess.gen, successorGen)
 	}
 	if r, _, status := testLoadRetirement(t, a, idHash); status != mqttRetirementValid || r.Gen != retiredGen {
 		t.Errorf("the watermark must still name the retired generation, got status=%v r=%+v", status, r)

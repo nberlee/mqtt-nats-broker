@@ -64,10 +64,13 @@
 // this machinery; the unconditional-write route is.
 //
 // The observable damage is not the lost write. It is what the broker CONCLUDES from it:
-// its next CAS is rejected, it re-reads, finds a record it did not write, and reports
-// "the session was taken over" — evicting its own rightful client with 0x8E "session
-// taken over by a new connection", which tells that client to stop reconnecting. Two
-// brokers can reach that conclusion about each other from the same event.
+// its next CAS is rejected, it re-reads, and finds a record it did not write. Two brokers
+// can reach that conclusion about each other from the same event.
+//
+// It USED to report "the session was taken over" there, evicting its own rightful client
+// with 0x8E and telling it to stop reconnecting. F-084 withdrew that: the eviction still
+// happens — the record is not ours — but the claim is now 0x89 ownership-unsettled, which
+// is what a rejected CAS actually supports.
 //
 // A sequence cannot tell the two shapes apart, because "the subject moved past my base
 // with other content" is true of a legitimate successor AND of a sibling that erased us.
@@ -161,8 +164,11 @@ func (l mqttRecordLineage) String() string {
 //
 //   - survivor {b,p} claims a's parent — our acknowledged record was erased. FORKED.
 //     Compared against the attempt {c,a} it would look unrelated and be missed entirely.
-//   - survivor {d,a} is a CHILD of a: somebody read our acknowledged record and wrote on
-//     top of it. A legitimate successor and a lost race, not a fork. Not-forked.
+//   - survivor {d,a} is CHILD-SHAPED against a: whoever wrote it read our acknowledged
+//     record first. That is a lost race, not a fork. Not-forked — and NOT a statement that
+//     anyone holds the session now, which this classifier never makes (F-084). Lineage is
+//     the only question it answers; a child-shaped body is as consistent with a writer that
+//     has since gone as with one still holding it.
 //   - survivor {c,a} is our own attempt landing late; the digest branch classifies it
 //     before lineage is reached, and its parent a is not the acknowledged parent p
 //     anyway.
@@ -224,8 +230,9 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 // regressed register, separated from its admission by a complete remote lifecycle,
 // resurrected by a regressed teardown slot, or left standing by an out-of-band deletion.
 // A parentless create concedes at classifyRecordLineage's ackPWID conjunct from either
-// orientation, which is the takeover vocabulary — the pre-F-029b behavior, restated as a
-// residual.
+// orientation — the pre-F-029b RECOGNITION, restated as a residual. What conceding SAYS is
+// no longer the takeover vocabulary: F-084 made it ownership-unsettled, because failing to
+// recognise sibling-hood leaves this broker knowing less, not more.
 //
 // What that gives up is the CLEAN-START fork, and what it does not give up is the
 // authored-record one: two CAS writes off a base both broker held. That shape still
@@ -294,9 +301,16 @@ type mqttDisposalVocabulary struct {
 }
 
 var (
-	// mqttDisposalTakenOver is the claim a demonstrated takeover makes: an
-	// authoritative record exists that is a successor of ours, so the client must stop
-	// reconnecting under this session. Spec5 [3.14.2.1] 0x8E.
+	// mqttDisposalTakenOver is the claim a demonstrated takeover makes: a REPLACEMENT
+	// CONNECTION for this client ID is held in hand, so the client must stop reconnecting
+	// under this session. Spec5 [3.14.2.1] 0x8E.
+	//
+	// NOT "an authoritative record exists that is a successor of ours", which is what this
+	// said before F-084 and which no record can establish: restore adopts WID/PWID without
+	// validating provenance, valid-shaped bodies arrive through unconditional publication,
+	// and acknowledged bytes are replayed verbatim. Its only licence is
+	// discardTakenOverClient, and the single-reader property is asserted by
+	// TestF084OnlyOneReaderOfTheTakeoverClaim.
 	mqttDisposalTakenOver = mqttDisposalVocabulary{
 		reason:      mqttReasonSessionTakenOver,
 		reasonStr:   mqttReasonStrSessionTakenOver,
@@ -311,6 +325,28 @@ var (
 		reason:      mqttReasonServerBusy,
 		reasonStr:   mqttReasonStrOwnershipUnsettled,
 		logReason:   "could not be shown to be owned elsewhere; closing this connection",
+		closeReason: StaleConnection,
+	}
+	// mqttDisposalOwnershipUnsettled is what a RECORD-DERIVED displacement is licensed to
+	// say, and it is the answer to the question F-084 asked: this broker may no longer
+	// write the record, and nothing established WHO may.
+	//
+	// It is reached wherever the evidence is an absence or a stranger — the record could
+	// not be read, was gone, did not decode, sat at or below our base, or moved to a body
+	// that is merely valid-shaped. classifyRecordLineage says of exactly that verdict
+	// "nothing is established", and 0x8E would answer it with the strongest claim the
+	// broker has. Spec5 [3.14.2.1] 0x89.
+	//
+	// A separate value rather than a reuse of mqttDisposalForked, on the same grounds
+	// mqttDisposalTeardownIncomplete is: the code and the text match, and the NAME is what
+	// is read at the call site as the claim being made. The logReason differs because the
+	// facts differ — a fork SAW a sibling body, this saw nothing — and it MINTS NOTHING,
+	// because a fork grant is a repair anchored to a record proven to claim our parent and
+	// none was.
+	mqttDisposalOwnershipUnsettled = mqttDisposalVocabulary{
+		reason:      mqttReasonServerBusy,
+		reasonStr:   mqttReasonStrOwnershipUnsettled,
+		logReason:   "could not be shown to be owned by anyone; closing this connection",
 		closeReason: StaleConnection,
 	}
 	// mqttDisposalTeardownIncomplete is what a teardown that began DESTROYING state and
@@ -332,65 +368,63 @@ var (
 	}
 )
 
-// mqttDisposalForForeignResolution maps an ambiguity resolution onto what it licenses
-// the broker to SAY. Only the two disposing verdicts reach it; anything else would be a
-// caller disposing a session it never proved gone, so the default is the conservative
-// claim rather than a silent one.
-func mqttDisposalForForeignResolution(res mqttUncertainResolution) mqttDisposalVocabulary {
-	if res == mqttUncertainForked {
+// mqttDisposalForLineage maps a record classification onto what it licenses the broker to
+// SAY, and it is the ONE mapper for every record-derived disposal.
+//
+// It replaced three — one per verdict enum, for the uncertainty resolver, the rejection
+// probe and the CONNECT-time classified save — which had become three statements of one
+// fact once F-084 removed the takeover claim from their default arms. Each took a
+// different enum and asked the same question, so each caller now answers it and this
+// answers what the answer means.
+//
+// Only a SIBLING body licenses the fork vocabulary, and only that class may mint a repair
+// grant. Everything else — a stranger, a replay, a parentless create, an absence, an
+// unreadable or undecodable record — is UNSETTLED: the record is not ours to write and
+// nothing says whose it is. Neither arm claims a takeover, because no record shape proves
+// a successor; that claim is licensed only by an in-process same-client-ID replacement
+// this broker holds both ends of. See discardTakenOverClient, and F-084.
+func mqttDisposalForLineage(forked bool) mqttDisposalVocabulary {
+	if forked {
 		return mqttDisposalForked
 	}
-	return mqttDisposalTakenOver
-}
-
-// mqttDisposalForRejection is mqttDisposalForForeignResolution for a definite rejection
-// probe's verdict.
-func mqttDisposalForRejection(v mqttRejectionVerdict) mqttDisposalVocabulary {
-	if v == mqttRejectionForked {
-		return mqttDisposalForked
-	}
-	return mqttDisposalTakenOver
-}
-
-// mqttDisposalForRepairSave is mqttDisposalForForeignResolution for a CONNECT-time
-// classified save's verdict.
-func mqttDisposalForRepairSave(v mqttRepairSaveVerdict) mqttDisposalVocabulary {
-	if v == mqttRepairSaveForked {
-		return mqttDisposalForked
-	}
-	return mqttDisposalTakenOver
+	return mqttDisposalOwnershipUnsettled
 }
 
 // disposalForRemotePersist maps the persist-observation route's lineage verdict onto
-// what it licenses the broker to SAY, the same shape as the other mqttDisposalFor*
-// helpers. The caller (evictDisplacedOnRemotePersist) keeps its strict
-// `Sequence > sess.seq` gate AHEAD of this call — that is this consult's sequence
+// what it licenses the broker to SAY. The caller (evictDisplacedOnRemotePersist) keeps its
+// strict `Sequence > sess.seq` gate AHEAD of this call — that is this consult's sequence
 // fail-safe — and calls it only on the usable-record path: an absent, undecodable or
 // below-target record concedes through the license rule without reaching lineage.
-func disposalForRemotePersist(ps *mqttPersistedSession, ackWID, ackPWID string) mqttDisposalVocabulary {
-	if classifyRecordLineage(ps, ackWID, ackPWID) == mqttLineageForked {
-		return mqttDisposalForked
-	}
-	return mqttDisposalTakenOver
+//
+// It returns the fork BIT alongside the vocabulary because the caller mints on it, and the
+// two must not be re-derived from each other. Recovering the bit from the reason code was
+// what the caller used to do, and F-084 made that unsound: the unsettled vocabulary carries
+// 0x89 too, so a reason-code test would mint a grant for a record that proved nothing.
+func disposalForRemotePersist(ps *mqttPersistedSession, ackWID, ackPWID string) (mqttDisposalVocabulary, bool) {
+	forked := classifyRecordLineage(ps, ackWID, ackPWID) == mqttLineageForked
+	return mqttDisposalForLineage(forked), forked
 }
 
 // disposalForDirectRejection classifies the record behind a 10071 rejection — the
 // CONNECT-time saves' OTHER rejection arm, which disposes immediately without consulting
 // resolveContendedRecordSave and therefore has no readback of its own.
 //
-// It adds the only new I/O in this change: one load, on the rejection path of a
-// pre-CONNACK save, never on a healthy connection. Without it the two helpers would keep
-// asserting a takeover on the bare fact that the CAS failed, which is the weakest
-// evidence any of the five classified paths acts on.
+// It performs one load, on the rejection path of a pre-CONNACK save, never on a healthy
+// connection. Without it the two helpers would reach their verdict on the bare fact that
+// the CAS failed, which is the weakest evidence any of the five classified paths acts on.
 //
-// Unreadable, undecodable, absent or at/below the base all CONCEDE — the takeover
-// vocabulary, exactly today's behavior. The verdict only ever narrows.
+// Unreadable, undecodable, absent or at/below the base all CONCEDE — but conceding is now
+// the UNSETTLED vocabulary, not the takeover one. Each of those is an absence, and an
+// absence is not a successor: the subject moved past our base, which says we may not write
+// it and says nothing about who may. F-084.
+//
+// It returns the fork bit for the same reason disposalForRemotePersist does.
 //
 // No lock held on entry. Performs one JetStream request.
-func (sess *mqttSession) disposalForDirectRejection(d *mqttSessSaveDetail) mqttDisposalVocabulary {
+func (sess *mqttSession) disposalForDirectRejection(d *mqttSessSaveDetail) (mqttDisposalVocabulary, bool) {
 	smsg, lerr := sess.jsa.loadSessionMsg(d.domainTk, d.cidHash)
 	if lerr != nil || smsg == nil {
-		return mqttDisposalTakenOver
+		return mqttDisposalOwnershipUnsettled, false
 	}
 	sess.mu.Lock()
 	ackWID, ackPWID := sess.wid, sess.pwid
@@ -401,7 +435,7 @@ func (sess *mqttSession) disposalForDirectRejection(d *mqttSessSaveDetail) mqttD
 		// callers hold a record transaction on this goroutine, so this is the in-fence mint
 		// for the reconcile and lifetime paths. See sess_fork_repair.go.
 		sess.mintForkedGrant(ackWID, ackPWID)
-		return mqttDisposalForked
+		return mqttDisposalForked, true
 	}
-	return mqttDisposalTakenOver
+	return mqttDisposalOwnershipUnsettled, false
 }

@@ -7,13 +7,15 @@ import (
 	"testing"
 )
 
-// The four paths that reported a takeover on evidence that could not support one.
+// The four paths that reported a takeover on evidence that could not support one. F-084
+// has since withdrawn that claim from every record-derived route; what these paths now
+// separate is a proven SIBLING (which mints a repair grant) from everything else.
 //
 // Each is driven with a REAL rejection against a REAL record that a real sibling moved,
-// and each has a paired SUCCESSOR case: a change that reported forked for any moved record
-// would satisfy the sibling half and fail the successor half. Nothing here asserts only
-// "not taken over" — every case asserts the exact verdict, because "not superseded" and
-// "not 0x8E" are both satisfied by outcomes that are themselves wrong.
+// and each has a paired CHILD-SHAPED case: a change that reported forked for any moved
+// record would satisfy the sibling half and fail the child-shaped half. Nothing here
+// asserts only "not taken over" — every case asserts the exact verdict, because "not
+// superseded" and "not 0x8E" are both satisfied by outcomes that are themselves wrong.
 
 // testNewForkEnv is testNewRejectionEnv with the record saved a SECOND time, so the
 // acknowledged pair has a non-empty parent.
@@ -61,9 +63,10 @@ func testMutateSibling(ps *mqttPersistedSession) {
 // ways round.
 //
 // The sibling row is the finding: the probe's CAS is rejected, the record moved, and until
-// now that alone was read as "another owner holds this session". The successor row is what
-// stops the fix from being a blanket downgrade — a legitimate takeover must still be
-// reported as one (M5, M2b).
+// now that alone was read as "another owner holds this session". The child-shaped row is
+// what stops the fix from being a blanket collapse — the two classes must stay
+// distinguishable, in the Reason String and in the mint (M5, M2b). Since F-084 they no
+// longer differ in the reason CODE: neither proves a successor, so neither claims one.
 func TestSessRejectionProbeClassifiesLineage(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -74,8 +77,8 @@ func TestSessRejectionProbeClassifiesLineage(t *testing.T) {
 		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttRejectionForked},
-		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
+		{"child-shaped body", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+			return testLandChildRecord(t, e, testMutateSibling)
 		}, mqttRejectionForeign},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,10 +146,13 @@ func TestSessForkedUnboundDisposesOrdinarily(t *testing.T) {
 // than to a fifth settlement.
 //
 // The assertions that discriminate are the ones about what did NOT happen:
-// disposeForeignStateLocked must not have run (the session is still bound and resident, so
-// close bookkeeping still has something to do) and the Will must not have been discarded.
-// Copying the foreign arm's shape — which calls mqttDiscardWillOnTakeover and disposes —
-// would silently suppress a Will nothing arbitrated (M6).
+// disposeForeignStateLocked must not have run: the session is still bound and resident, so
+// close bookkeeping still has something to do. Copying the foreign arm's shape — which
+// DISPOSES — would evict a session on evidence that established no other owner (M6).
+//
+// The Will half of this contract is gone, and that is F-084: the foreign arm used to call
+// mqttDiscardWillOnTakeover and now consumes, so "the Will must not have been discarded" no
+// longer distinguishes the arms. What distinguishes them is the disposal.
 func TestSessForkedBoundIsUnsettledNotDisposed(t *testing.T) {
 	t.Parallel()
 	e := testNewForkEnv(t, "rejfork-bound")
@@ -170,7 +176,7 @@ func TestSessForkedBoundIsUnsettledNotDisposed(t *testing.T) {
 			"and the shared-pending purge")
 	}
 	if !e.resident(e.sess) {
-		t.Fatal("the forked arm must not evict the session; only a demonstrated takeover does")
+		t.Fatal("the forked arm must not evict the session; the foreign arm does")
 	}
 }
 
@@ -227,8 +233,8 @@ func TestSessForkOnAmbiguousResolution(t *testing.T) {
 		{"claims our parent", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttUncertainForked},
-		{"legitimate successor", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
+		{"child-shaped body", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+			return testLandChildRecord(t, e, testMutateSibling)
 		}, mqttUncertainForeign},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -263,7 +269,7 @@ func TestSessForkOnAmbiguousResolution(t *testing.T) {
 				t.Fatalf("resolveUncertainWrite = %v, want %v", got, tc.want)
 			}
 			// The resolver's first readback is a mint site: only a body claiming our parent licenses a
-			// repair, so the successor row must record nothing. See sess_fork_repair.go.
+			// repair, so the child-shaped row must record nothing. See sess_fork_repair.go.
 			if tc.want == mqttUncertainForked {
 				testAssertMinted(t, e)
 			} else {
@@ -498,13 +504,24 @@ func TestSessLowerSequenceSiblingAtEveryOtherGate(t *testing.T) {
 		// accept exactly what the disposal struct exists to prevent. The close state is
 		// excluded on purpose: nothing reads it.
 		below := mqttSessSaveDetail{baseSeq: recSeq + 5, domainTk: e.sess.domainTk, cidHash: e.idHash}
-		testAssertVocabulary(t, "a sibling BELOW the base", e.sess.disposalForDirectRejection(&below),
-			mqttDisposalTakenOver)
+		// UNSETTLED, not taken-over. The gate refuses to read a below-base record's identity
+		// at all, so what survives is an unclassifiable observation — which says the subject
+		// is not ours and says nothing about who holds it. Asserting the takeover vocabulary
+		// here was asserting F-084's defect. The fork BIT must be false with it, because the
+		// bit is what mints.
+		belowVoc, belowForked := e.sess.disposalForDirectRejection(&below)
+		testAssertVocabulary(t, "a sibling BELOW the base", belowVoc, mqttDisposalOwnershipUnsettled)
+		if belowForked {
+			t.Fatal("a sibling below the base must not report the fork bit: it would mint a grant")
+		}
 		// The same record, with the base beneath it, IS forked — so the row above is
 		// about the gate and not about the fixture.
 		at := mqttSessSaveDetail{baseSeq: recSeq - 1, domainTk: e.sess.domainTk, cidHash: e.idHash}
-		testAssertVocabulary(t, "the same record above the base",
-			e.sess.disposalForDirectRejection(&at), mqttDisposalForked)
+		atVoc, atForked := e.sess.disposalForDirectRejection(&at)
+		testAssertVocabulary(t, "the same record above the base", atVoc, mqttDisposalForked)
+		if !atForked {
+			t.Fatal("a sibling above the base must report the fork bit")
+		}
 	})
 
 	t.Run("resolveContendedRecordSave", func(t *testing.T) {
@@ -552,7 +569,7 @@ func testCurrentRecordSeq(t *testing.T, e *testInflightEnv) uint64 {
 // whose write reached the subject by a route no CAS excludes produces exactly this shape
 // with a real owner on the other side — a genuine takeover — and the fork verdict cannot
 // tell that apart from a write whose author is gone. The bound arm therefore treats both as unsettled rather than
-// as a takeover, which is what this test asserts: the competing owner is real and resident,
+// as a takeover, which is what this test asserts: the competing writer is real and resident,
 // its record is the one that survives, and the verdict is still mqttBoundUnsettled with
 // nothing disposed.
 //

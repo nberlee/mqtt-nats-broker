@@ -16,9 +16,9 @@ import (
 //
 // The defect these tests are about: clearing the uncertainty there discarded the
 // digest that identifies a late-committing proposal as OURS, so the same proposal was
-// later read as another owner's record and the session was disposed of as FOREIGN —
+// later read as NOT OURS and the session was disposed of as FOREIGN —
 // evicted, and on a bound settlement closed with 0x8E and its Will discarded, with no
-// takeover anywhere.
+// takeover anywhere — and since F-084 nothing on this path claims one at all.
 
 // testUncertainEnv is one broker with a provisioned, saved session and its record's
 // base sequence — the state every arm of the contract starts from.
@@ -105,7 +105,7 @@ func TestUncertainLateProposalIsNotForeign(t *testing.T) {
 
 	if !e.resident() {
 		t.Fatalf("the session was disposed of as FOREIGN over its OWN write "+
-			"(next save: %v): a live client would have been closed with 0x8E and its Will discarded", saveErr)
+			"(next save: %v): a live client would have been closed and evicted", saveErr)
 	}
 	if saveErr != nil {
 		t.Fatalf("a settled session must be writable again: %v", saveErr)
@@ -172,7 +172,7 @@ func TestUncertainReattemptWindow(t *testing.T) {
 			seq, err := mqttStoreSessionRecordCASBody(&e.b.asm.jsa, e.b.asm.domainTk,
 				foreignBody, e.sess.idHash, e.base)
 			if err != nil {
-				t.Errorf("simulate the foreign takeover: %v", err)
+				t.Errorf("simulate the competing write: %v", err)
 				return
 			}
 			foreignSeq = seq
@@ -191,7 +191,7 @@ func TestUncertainReattemptWindow(t *testing.T) {
 			t.Fatalf("resolution = %v, want foreign", res)
 		}
 		// The re-attempt carries a real expected-last-subject-sequence header, so it
-		// was REJECTED rather than overwriting the new owner's record.
+		// was REJECTED rather than overwriting the record that moved.
 		stored := testRecordBodyAt(t, e.b, e.sess.idHash)
 		if mqttRecordDigest(stored) != mqttRecordDigest(foreignBody) {
 			t.Fatalf("the foreign record was overwritten by the re-attempt: %q", stored)

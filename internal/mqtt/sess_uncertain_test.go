@@ -168,8 +168,10 @@ func TestUncertainWriteThreeWayReadback(t *testing.T) {
 		sess.subs["ours"] = 1
 		body := testRecordBody(t, sess)
 
-		// Another broker takes over and persists DIFFERENT content at a newer
-		// sequence — the exact shape "adopt the latest sequence" would swallow.
+		// A peer persists DIFFERENT content at a newer sequence — the exact shape
+		// "adopt the latest sequence" would swallow. What the local broker can see is
+		// that the content is not its own; who wrote it is the fixture's knowledge
+		// only (F-084).
 		ps, _ := testLoadSessRecord(t, b, sess.idHash)
 		ps.Subs = map[string]byte{"theirs": 2}
 		ps.Origin = b.asm.jsa.id
@@ -179,7 +181,7 @@ func TestUncertainWriteThreeWayReadback(t *testing.T) {
 		}
 		foreignSeq, err := mqttStoreSessionRecordCASBody(&b.asm.jsa, b.asm.domainTk, foreignBody, sess.idHash, baseSeq)
 		if err != nil {
-			t.Fatalf("foreign takeover write: %v", err)
+			t.Fatalf("competing write: %v", err)
 		}
 		testMarkUncertain(sess, baseSeq, body)
 

@@ -50,11 +50,31 @@ func testNewRejectionEnv(t *testing.T, clientID string) *testRejectionEnv {
 	e.sess.mu.Lock()
 	e.sess.expiryInterval = mqttSessionNeverExpire
 	e.sess.mu.Unlock()
+	// SUPPRESS the setup save's own observation until the session is resident.
+	//
+	// The watch delivers this broker's own writes, and between the save below and
+	// addSession there is no resident session for this hash — so the delivery takes the
+	// NO-LOCAL branch, which increments `inFlight` WITHOUT setting `evictRunning`
+	// (sess_record_watch.go, deliberately, so a concurrent worker's prune cannot delete
+	// the entry first). A fixture asserting `evictRunning == false && inFlight == 0` then
+	// sees `false`/`1` from a setup worker that has nothing to do with what it is testing.
+	// Observed as a ~1-in-5 failure of TestMQTTPersistEvictAbnormalExitPreFence under load.
+	//
+	// Dropping only THIS hash's observations, and only until residency, is what closes it:
+	// a captured `inFlight` baseline does NOT, because the delivery is asynchronous and can
+	// land after the baseline is taken.
+	restore := e.asm.testSessPersistDrop
+	e.asm.mu.Lock()
+	e.asm.testSessPersistDrop = func(h string) bool { return h == e.sess.idHash }
+	e.asm.mu.Unlock()
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("persist the session record: %v", err)
 	}
 	// Resident, as a session that has been through a CONNECT is.
 	e.asm.addSession(e.sess, true)
+	e.asm.mu.Lock()
+	e.asm.testSessPersistDrop = restore
+	e.asm.mu.Unlock()
 	return &testRejectionEnv{testInflightEnv: e, clientID: clientID, idHash: e.sess.idHash}
 }
 
@@ -76,14 +96,18 @@ func (e *testRejectionEnv) dropPersistObservations(t *testing.T, idHash string) 
 	return &dropped
 }
 
-// remoteTakeover restores the same client ID through a second account session manager
+// remoteRecordWrite restores the same client ID through a second account session manager
 // and persists it, which is what moves the $MQTT_sess subject out from under the local
 // session. Returns the sequence the record now sits at.
-func (e *testRejectionEnv) remoteTakeover(t *testing.T, node, clientID string) uint64 {
+//
+// Named for what it DOES, not for a conclusion about it. The local broker sees a record
+// that moved; that it was a peer restoring the same client ID is the fixture's knowledge
+// and never the broker's, so no route under test may call this a takeover (F-084).
+func (e *testRejectionEnv) remoteRecordWrite(t *testing.T, node, clientID string) uint64 {
 	t.Helper()
 	_, psess, _ := e.peer(t, node, clientID)
 	if err := testSessSave(t, psess); err != nil {
-		t.Fatalf("%s: persist the taken-over session record: %v", node, err)
+		t.Fatalf("%s: persist the peer's session record: %v", node, err)
 	}
 	psess.mu.Lock()
 	defer psess.mu.Unlock()
@@ -200,7 +224,7 @@ func TestMQTTRejectedRecordContendedKeepsMarker(t *testing.T) {
 	// The convergence claim the arm above cannot make on its own: with contention over, the
 	// same marker settles on the next pass. One probe per pass IS the cadence — there is no
 	// licence beyond the sweep interval itself.
-	e.remoteTakeover(t, "node2", "rejcontend")
+	e.remoteRecordWrite(t, "node2", "rejcontend")
 	e.asm.reconcileResidentRecordState(e.s)
 	if e.resident(e.sess) {
 		t.Fatal("once the record has moved, the next pass must dispose the session")
@@ -208,8 +232,9 @@ func TestMQTTRejectedRecordContendedKeepsMarker(t *testing.T) {
 }
 
 // TestMQTTRejectedRecordGoneIsForeign covers the released-record arm: our write cannot
-// have landed and then vanished on its own, so an absent record means somebody released
-// this session and its state is not ours to rebuild.
+// have landed and then vanished on its own, so an absent record means SOMETHING released
+// this session and its state is not ours to rebuild. It does not name the releaser, and it
+// is not evidence of a successor (F-084).
 func TestMQTTRejectedRecordGoneIsForeign(t *testing.T) {
 	t.Parallel()
 	e := testNewRejectionEnv(t, "rejgone")
@@ -217,7 +242,7 @@ func TestMQTTRejectedRecordGoneIsForeign(t *testing.T) {
 
 	// Move the record (so the probe is rejected) and then delete it, which is what a
 	// remote teardown leaves behind.
-	e.remoteTakeover(t, "node2", "rejgone")
+	e.remoteRecordWrite(t, "node2", "rejgone")
 	e.rejectSave(t, e.sess)
 	smsg, err := e.asm.jsa.loadSessionMsg(e.asm.domainTk, e.idHash)
 	if err != nil {
@@ -430,7 +455,7 @@ func TestMQTTRejectedRecordFenceBusy(t *testing.T) {
 	}
 
 	// A later pass settles it, which is what makes the refusal a deferral.
-	e.remoteTakeover(t, "node2", "rejfence")
+	e.remoteRecordWrite(t, "node2", "rejfence")
 	e.asm.reconcileResidentRecordState(e.s)
 	if e.resident(e.sess) {
 		t.Fatal("the next pass must settle the deferred marker")
@@ -445,7 +470,7 @@ func TestMQTTRejectedRecordGateHeld(t *testing.T) {
 	e := testNewRejectionEnv(t, "rejgate")
 	e.dropPersistObservations(t, e.idHash)
 
-	e.remoteTakeover(t, "node2", "rejgate")
+	e.remoteRecordWrite(t, "node2", "rejgate")
 	e.rejectSave(t, e.sess)
 
 	saves, restoreCount := testCountSessSaves(t)
@@ -483,7 +508,7 @@ func TestMQTTRejectedRecordGateHeld(t *testing.T) {
 // REPLACEMENT object installed under the same client ID, the stale object's probe must
 // never run. Plain lockSession would grant it — it checks only sessLocked and sess.c —
 // and the stale object would then classify the replacement's own locally authored record
-// as another owner's and dispose of the live session. Residency by identity, claimed in
+// as not-ours and dispose of the live session. Residency by identity, claimed in
 // the same critical section, is what makes "a newer record is not ours" true.
 func TestMQTTRejectedRecordReplacementResident(t *testing.T) {
 	e := testNewRejectionEnv(t, "rejreplace")
@@ -534,7 +559,7 @@ func TestMQTTRejectedRecordUnreadableReadback(t *testing.T) {
 	e := testNewRejectionEnv(t, "rejunread")
 	e.dropPersistObservations(t, e.idHash)
 
-	e.remoteTakeover(t, "node2", "rejunread")
+	e.remoteRecordWrite(t, "node2", "rejunread")
 	e.rejectSave(t, e.sess)
 
 	restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
@@ -583,7 +608,7 @@ func TestMQTTRejectedRecordPassLeavesBoundSessionsAlone(t *testing.T) {
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
 
-	e.remoteTakeover(t, "node2", "rejboundalone")
+	e.remoteRecordWrite(t, "node2", "rejboundalone")
 	e.rejectSave(t, e.sess)
 
 	saves, restore := testCountSessSaves(t)
@@ -651,7 +676,7 @@ func TestMQTTRejectedRecordDeferredDischargeSite(t *testing.T) {
 			return nil
 		}
 		moved++
-		e.remoteTakeover(t, "node2", "rejdefersite")
+		e.remoteRecordWrite(t, "node2", "rejdefersite")
 		return nil
 	})
 	e.asm.reconcileResidentRecordState(e.s)
@@ -709,7 +734,7 @@ func TestMQTTRejectedRecordPurgeSaveSite(t *testing.T) {
 	e.sess.mu.Lock()
 	base := e.sess.seq
 	e.sess.mu.Unlock()
-	e.remoteTakeover(t, "node2", "rejpurgesite")
+	e.remoteRecordWrite(t, "node2", "rejpurgesite")
 
 	e.s.mqttHandleClosedClient(e.c)
 
@@ -743,7 +768,7 @@ func TestMQTTRejectedRecordFiniteCloseSite(t *testing.T) {
 	e.sess.expiryInterval = 3600
 	e.sess.mu.Unlock()
 
-	e.remoteTakeover(t, "node2", "rejfinite")
+	e.remoteRecordWrite(t, "node2", "rejfinite")
 	// The close's disconnect save is rejected by the moved record.
 	e.s.mqttHandleClosedClient(e.c)
 
@@ -1064,7 +1089,7 @@ func TestMQTTRejectedRecordNoBackstopUnlessOurs(t *testing.T) {
 	t.Run("foreign", func(t *testing.T) {
 		e := testNewRejectionEnv(t, "rejnobackstop2")
 		e.dropPersistObservations(t, e.idHash)
-		e.remoteTakeover(t, "node2", "rejnobackstop2")
+		e.remoteRecordWrite(t, "node2", "rejnobackstop2")
 		e.rejectSave(t, e.sess)
 		e.sess.mu.Lock()
 		e.sess.voidedRegsRev++
@@ -1125,7 +1150,7 @@ func TestMQTTRejectedProbeClassifierRefusal(t *testing.T) {
 }
 
 // TestMQTTRejectedRecordNotificationDropped is the reproduction: with the persist
-// observation lost, a remote takeover leaves the local session resident and its
+// observation lost, a competing remote write leaves the local session resident and its
 // deferred obligation parked, and the periodic pass is what settles it. The probe's own
 // CAS is rejected, the readback finds a newer, different record, and the session is
 // disposed.
@@ -1145,7 +1170,7 @@ func TestMQTTRejectedRecordNotificationDropped(t *testing.T) {
 	e.sess.deferredDisconnect = &mqttDeferredDisconnect{disconnectedAt: time.Now().Unix()}
 	e.sess.mu.Unlock()
 
-	newSeq := e.remoteTakeover(t, "node2", "rejdrop")
+	newSeq := e.remoteRecordWrite(t, "node2", "rejdrop")
 	base := e.rejectSave(t, e.sess)
 	if newSeq <= base {
 		t.Fatalf("the takeover must advance the record: %d <= %d", newSeq, base)
@@ -1163,7 +1188,7 @@ func TestMQTTRejectedRecordNotificationDropped(t *testing.T) {
 		t.Fatal("the pass must dispose a session whose probe found a foreign record")
 	}
 	if a := e.sess.takeDeferredDisconnect(); a != nil {
-		t.Fatal("the disposal must take the parked obligation: it belongs to the new owner now")
+		t.Fatal("the disposal must take the parked obligation, and discharge the Will it owes")
 	}
 	if dropped.Load() == 0 {
 		t.Fatal("the seam never dropped an observation, so the fixture proved nothing")
@@ -1177,7 +1202,7 @@ func TestMQTTRejectedRecordNotificationDropped(t *testing.T) {
 func TestMQTTRejectedRecordNotificationDelivered(t *testing.T) {
 	t.Parallel()
 	e := testNewRejectionEnv(t, "rejdeliver")
-	e.remoteTakeover(t, "node2", "rejdeliver")
+	e.remoteRecordWrite(t, "node2", "rejdeliver")
 
 	// Asynchronous by design: the observation is a core-NATS delivery on the JSA
 	// reply subject, so this is the one bounded poll in the file.
@@ -1210,8 +1235,8 @@ func TestMQTTRejectedRecordPersistDropIsScoped(t *testing.T) {
 	}
 	e.asm.addSession(other, true)
 
-	e.remoteTakeover(t, "node2", "rejscoped")
-	e.remoteTakeover(t, "node3", "rejscoped-other")
+	e.remoteRecordWrite(t, "node2", "rejscoped")
+	e.remoteRecordWrite(t, "node3", "rejscoped-other")
 
 	deadline := time.Now().Add(testRejectionWait)
 	for e.resident(other) {
@@ -1347,6 +1372,13 @@ func (e *testRejectionEnv) bindSocketOver(t *testing.T, proto byte, out *testWir
 		proto: proto,
 		pp:    &mqttPublish{},
 		cp:    &mqttConnectProto{},
+		// The EXACT client id, as a real CONNECT leaves it. Without it the delayed-Will
+		// enqueue hashes an empty string and lands its outbox record on a subject no
+		// assertion about THIS session can find — a fixture that cannot reach the route it
+		// names. Suppression also compares this field against an acceptance fact's client
+		// id, and two clients can share a hash, so the id and not the hash is what belongs
+		// here.
+		cid: e.clientID,
 	}
 	bc.initClient()
 	bc.mu.Lock()
@@ -1496,6 +1528,92 @@ func (b *testBoundConn) disconnectAttempts(t *testing.T) []byte {
 	return reasons
 }
 
+// disconnectClaims returns the (reason code, Reason String) of every server DISCONNECT the
+// broker tried to write, in order.
+//
+// It exists because F-084 gave the FORKED and the UNSETTLED vocabularies the same reason
+// code, 0x89: a reason-code assertion can no longer tell "a sibling body erased our record"
+// from "nothing established anything", and a test that checks only the byte would pass
+// against a broker that confused the two. The Reason String is what still separates them,
+// so a claim assertion reads the pair.
+//
+// The Reason String is property 0x1F in the DISCONNECT's property block, which follows the
+// reason byte. A DISCONNECT that carries no properties, or whose Reason String was dropped
+// to fit the client's Maximum Packet Size, yields an empty string — which is a real
+// outcome, not a parse failure.
+func (b *testBoundConn) disconnectClaims(t *testing.T) []testDisconnectClaim {
+	t.Helper()
+	var claims []testDisconnectClaim
+	for _, p := range testParseWire(t, b.out.bytes()) {
+		if p.typ != mqttPacketDisconnect {
+			continue
+		}
+		if len(p.body) == 0 {
+			claims = append(claims, testDisconnectClaim{reason: mqttReasonSuccess})
+			continue
+		}
+		claims = append(claims, testDisconnectClaim{
+			reason:    p.body[0],
+			reasonStr: testDisconnectReasonString(t, p.body[1:]),
+		})
+	}
+	return claims
+}
+
+// testDisconnectClaim is one server DISCONNECT's claim: what it says and why.
+type testDisconnectClaim struct {
+	reason    byte
+	reasonStr string
+}
+
+// matches reports whether this claim is the one a vocabulary makes. Both fields, because
+// either alone is satisfiable by the wrong vocabulary.
+func (c testDisconnectClaim) matches(voc mqttDisposalVocabulary) bool {
+	return c.reason == voc.reason && c.reasonStr == voc.reasonStr
+}
+
+// testDisconnectReasonString pulls property 0x1F out of a DISCONNECT's property block.
+func testDisconnectReasonString(t *testing.T, rest []byte) string {
+	t.Helper()
+	if len(rest) == 0 {
+		return _EMPTY_
+	}
+	var plen, mult, i int
+	for {
+		if i >= len(rest) {
+			t.Fatalf("truncated property length in DISCONNECT body %x", rest)
+		}
+		bb := rest[i]
+		i++
+		plen += int(bb&0x7f) * (1 << mult)
+		if bb&0x80 == 0 {
+			break
+		}
+		mult += 7
+	}
+	if i+plen > len(rest) {
+		t.Fatalf("truncated property block in DISCONNECT body %x", rest)
+	}
+	props := rest[i : i+plen]
+	if len(props) == 0 {
+		return _EMPTY_
+	}
+	// The Reason String is the ONLY property the disposal vocabulary sets, so anything else
+	// here means the packet changed shape and this helper's silence would be a false
+	// negative rather than an empty string.
+	if id := props[0]; id != mqttPropReasonString {
+		t.Fatalf("unexpected DISCONNECT property %#x; this helper only knows the Reason String", id)
+	}
+	if len(props) < 3 {
+		t.Fatalf("truncated Reason String length in %x", props)
+	}
+	n := int(props[1])<<8 | int(props[2])
+	if 3+n > len(props) {
+		t.Fatalf("truncated Reason String in %x", props)
+	}
+	return string(props[3 : 3+n])
+}
+
 // forgetConnAck puts a bound connection back in the state a refused CONNECT leaves it in:
 // still bound to the session, but never told its CONNECT succeeded. mqttAbortAcceptedConnect
 // produces exactly this — the connection stays bound until its readLoop detaches it — and
@@ -1577,10 +1695,10 @@ func (e *testRejectionEnv) deliveryBarrier(t *testing.T, sub *nats.Subscription,
 // demanded, and the one nine review rounds of earlier attempts never had: the packet is a
 // QoS 1 PUBLISH, not a PINGREQ. Being served first is harmless for a PINGREQ, which is
 // exactly why every earlier test read past a settlement that ran AFTER the dispatch
-// switch; a PUBLISH routed and acked from a connection whose session another broker owns
-// cannot be taken back.
+// switch; a PUBLISH routed and acked from a connection whose session record this broker
+// may no longer write cannot be taken back.
 //
-// The marker is armed the production way — a real remote takeover through a second
+// The marker is armed the production way — a real remote record write through a second
 // account session manager moves the subject, a real save is CAS-rejected by the stream,
 // and the persist notification that would otherwise evict the object is dropped.
 func TestMQTTBoundRejectionForeignStopsPublish(t *testing.T) {
@@ -1598,7 +1716,7 @@ func TestMQTTBoundRejectionForeignStopsPublish(t *testing.T) {
 			b := e.bindSocket(t, tc.proto)
 			b.armWill()
 
-			e.remoteTakeover(t, "node2", "boundforeign")
+			e.remoteRecordWrite(t, "node2", "boundforeign")
 			e.rejectSave(t, e.sess)
 
 			watch := e.watchDelivery(t, "bound/foreign")
@@ -1619,18 +1737,25 @@ func TestMQTTBoundRejectionForeignStopsPublish(t *testing.T) {
 			if e.resident(e.sess) {
 				t.Fatal("a foreign verdict must evict the session object")
 			}
-			// The Will goes the way a local takeover's does: this connection is being
-			// displaced, and the displacement is not a Will publication trigger. Asserted
-			// as the SEMANTIC outcome — no publication — because the disposition field is
-			// mqttWillDischarged either way once the close bookkeeping's mqttHandleWill
-			// has consumed an owed Will, which is another layer's guarantee and would let
-			// a skipped takeover discard pass.
-			if msg := e.deliveryBarrier(t, willWatch, "will/topic"); string(msg.Data) != "barrier" {
-				t.Fatalf("the Will must not be published: the watcher saw %q first", msg.Data)
+			// The Will IS PUBLISHED, and that is F-084's correction rather than a relaxed
+			// assertion. This arm reached its verdict from a record probe, which establishes
+			// that the record is no longer ours and NOT that anyone took the session over —
+			// the same thing the forked arm below already says of itself when it refuses to
+			// "silently suppress a Will nothing arbitrated". Only a demonstrated takeover
+			// owns a Will's fate, and no takeover was demonstrated here.
+			//
+			// Asserted POSITIVELY, on the message itself, so a broker that merely stopped
+			// discarding without consuming cannot pass: the barrier returns the Will only if
+			// the Will really reached the wire ahead of it.
+			if msg := e.deliveryBarrier(t, willWatch, "will/topic"); string(msg.Data) != "bye" {
+				t.Fatalf("an unsettled disposal must publish the Will, not suppress it: "+
+					"the watcher saw %q first", msg.Data)
 			}
 			if tc.proto == mqttProtoLevel5 {
-				if !b.sawDisconnect(t, mqttReasonSessionTakenOver) {
-					t.Fatalf("a v5 client must be told 0x8E before the close: wire %x", b.out.bytes())
+				claims := b.disconnectClaims(t)
+				if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+					t.Fatalf("a v5 client must be told ownership-unsettled before the close: %+v (wire %x)",
+						claims, b.out.bytes())
 				}
 			} else if len(b.out.bytes()) != 0 {
 				t.Fatalf("a 3.1.1 client has no server DISCONNECT: wire %x", b.out.bytes())
@@ -1847,7 +1972,7 @@ func TestMQTTBoundRejectionGatesPerPacket(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.subs = map[string]byte{"bound.gone": 0} // membership is keyed by NATS subject
 	e.sess.mu.Unlock()
-	e.remoteTakeover(t, "node2", "boundcoalesced")
+	e.remoteRecordWrite(t, "node2", "boundcoalesced")
 
 	probes, restoreProbes := testCountRejectionProbes(t)
 	defer restoreProbes()
@@ -1888,7 +2013,7 @@ func TestMQTTBoundRejectionGatesPingReq(t *testing.T) {
 	e := testNewRejectionEnv(t, "boundping")
 	e.dropPersistObservations(t, e.idHash)
 	b := e.bindSocket(t, mqttProtoLevel5)
-	e.remoteTakeover(t, "node2", "boundping")
+	e.remoteRecordWrite(t, "node2", "boundping")
 	e.rejectSave(t, e.sess)
 
 	if err := b.deliver(t, []byte{mqttPacketPing, 0}); err != nil {
@@ -1897,7 +2022,9 @@ func TestMQTTBoundRejectionGatesPingReq(t *testing.T) {
 	if b.sawPacket(t, mqttPacketPingResp) {
 		t.Fatalf("a PINGREQ must be gated too: wire %x", b.out.bytes())
 	}
-	if !b.sawDisconnect(t, mqttReasonSessionTakenOver) || !b.closed() || e.resident(e.sess) {
+	// The bound settlement's disposing arm now claims ownership-unsettled: its probe found a
+	// record that is not ours and identified no successor. F-084.
+	if !b.sawDisconnect(t, mqttReasonServerBusy) || !b.closed() || e.resident(e.sess) {
 		t.Fatalf("the settlement must run on a PINGREQ: closed=%v resident=%v wire %x",
 			b.closed(), e.resident(e.sess), b.out.bytes())
 	}
@@ -1923,7 +2050,7 @@ func TestMQTTBoundRejectionDisconnectExempt(t *testing.T) {
 			e.dropPersistObservations(t, e.idHash)
 			b := e.bindSocket(t, mqttProtoLevel5)
 			b.armWill()
-			e.remoteTakeover(t, "node2", "bounddisc")
+			e.remoteRecordWrite(t, "node2", "bounddisc")
 			e.rejectSave(t, e.sess)
 
 			probes, restore := testCountRejectionProbes(t)
@@ -1973,7 +2100,7 @@ func TestMQTTBoundRejectionGateRefused(t *testing.T) {
 		e := testNewRejectionEnv(t, "boundgateheld")
 		e.dropPersistObservations(t, e.idHash)
 		b := e.bindSocket(t, mqttProtoLevel5)
-		e.remoteTakeover(t, "node2", "boundgateheld")
+		e.remoteRecordWrite(t, "node2", "boundgateheld")
 		e.rejectSave(t, e.sess)
 
 		// The gate is held by an operation that is NOT displacing this connection — a
@@ -2063,7 +2190,7 @@ func TestMQTTBoundRejectionGateRefused(t *testing.T) {
 		e.dropPersistObservations(t, e.idHash)
 		b := e.bindSocket(t, mqttProtoLevel5)
 		b.armWill()
-		e.remoteTakeover(t, "node2", "boundrebound")
+		e.remoteRecordWrite(t, "node2", "boundrebound")
 		e.rejectSave(t, e.sess)
 
 		// A local CONNECT mid-takeover: it holds the gate for its whole duration and has
@@ -2140,7 +2267,7 @@ func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
 		// The persist observation is NOT dropped here: this is the delivered-notification
 		// ordering, which is the common one — the same remote save both moves the record
 		// (arming the marker through the rejected save below) and notifies this broker.
-		e.remoteTakeover(t, "node2", "bounddisplaced")
+		e.remoteRecordWrite(t, "node2", "bounddisplaced")
 		e.rejectSave(t, e.sess)
 
 		// Asynchronous by design: the observation is a core-NATS delivery, so this is a
@@ -2158,20 +2285,28 @@ func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		if !b.sawDisconnect(t, mqttReasonSessionTakenOver) {
-			t.Fatalf("the eviction must have told the client 0x8E: wire %x", b.out.bytes())
+		claims := b.disconnectClaims(t)
+		if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
+			t.Fatalf("the eviction must have told the client ownership-unsettled: %+v (wire %x)",
+				claims, b.out.bytes())
 		}
 
-		// What this ordering can still show: the gate refuses to SERVE, and answers with
-		// no error — a sentinel here would have appended 0x89 to that 0x8E.
+		// What this ordering can still show: the gate refuses to SERVE, and answers with no
+		// error — a sentinel here would have appended a SECOND DISCONNECT to the one above,
+		// which the exactly-one assertion is what catches now that both carry 0x89.
 		if err := b.deliver(t, testBoundPublish(true, 1, 41, "bound/displaced", "nope")); err != nil {
 			t.Fatalf("a displaced connection is closed, not errored: %v", err)
 		}
 		if b.sawPubAckSuccess(t, 41) {
 			t.Fatal("a displaced connection must not be served")
 		}
-		if b.sawDisconnect(t, mqttReasonServerBusy) {
-			t.Fatalf("0x89 must not follow the takeover's 0x8E: wire %x", b.out.bytes())
+		// EXACTLY ONE, still. The old form asked whether a 0x89 followed the displacement's
+		// 0x8E, and F-084 gave both the same code — so that question is now satisfied by the
+		// displacement's own DISCONNECT and would pass against a broker that appended a
+		// second. Counting is what the assertion was always about.
+		if got := b.disconnectAttempts(t); len(got) != 1 {
+			t.Fatalf("the gate must append no second DISCONNECT to the displacement's: "+
+				"reasons %x (wire %x)", got, b.out.bytes())
 		}
 	})
 
@@ -2179,20 +2314,24 @@ func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
 		e := testNewRejectionEnv(t, "boundwindowdisp")
 		e.dropPersistObservations(t, e.idHash)
 		b := e.bindSocket(t, mqttProtoLevel5)
-		e.remoteTakeover(t, "node2", "boundwindowdisp")
+		e.remoteRecordWrite(t, "node2", "boundwindowdisp")
 		e.rejectSave(t, e.sess)
 
 		// The two production halves of the eviction's tail, without its `go
-		// closeConnection`: the session evicted and detached, the takeover DISCONNECT
+		// closeConnection`: the session evicted and detached, the displacement DISCONNECT
 		// already on the wire, the socket still open. That is the instant the displaced
 		// readLoop can reach this gate in.
-		stale, applied := e.sess.disposeForeignStateLocked(e.asm, nil)
-		if !applied || stale != b.bc {
-			t.Fatalf("the fixture must stage the eviction's own state: applied=%v stale=%p", applied, stale)
+		// licensed=false: this stages the RECORD-DERIVED eviction, whose vocabulary is now
+		// the unsettled one. A remote persist observation establishes that our record moved,
+		// never who moved it.
+		d := e.sess.disposeForeignStateLocked(e.asm, nil, false)
+		if !d.applied || d.stale != b.bc {
+			t.Fatalf("the fixture must stage the eviction's own state: applied=%v stale=%p", d.applied, d.stale)
 		}
-		stale.mqttNotifyForeignDisposal(e.sess.id, mqttDisposalTakenOver)
-		if !b.sawDisconnect(t, mqttReasonSessionTakenOver) {
-			t.Fatalf("the staged eviction must have written 0x8E: wire %x", b.out.bytes())
+		stale := d.stale
+		stale.mqttNotifyForeignDisposal(e.sess.id, mqttDisposalOwnershipUnsettled)
+		if !b.sawDisconnect(t, mqttReasonServerBusy) {
+			t.Fatalf("the staged eviction must have written 0x89: wire %x", b.out.bytes())
 		}
 		if b.closed() {
 			t.Fatal("the window this test exists for is the one BEFORE the close: it is already shut")
@@ -2210,7 +2349,7 @@ func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
 				"close is asynchronous, and until it lands this readLoop keeps parsing")
 		}
 		if after := len(testParseWire(t, b.out.bytes())); after != before {
-			t.Fatalf("nothing may follow the takeover DISCONNECT: %d packets became %d (wire %x)",
+			t.Fatalf("nothing may follow the displacement DISCONNECT: %d packets became %d (wire %x)",
 				before, after, b.out.bytes())
 		}
 	})
@@ -2320,13 +2459,14 @@ func TestMQTTBoundRejectionKeepSuspendedInWindow(t *testing.T) {
 
 // TestMQTTBoundRejectionNoReentryAfterForeign runs the REAL readLoop, because what it
 // asserts is the shape of the foreign arm's tail rather than the content of a packet: the
-// 0x8E is written and the connection CLOSED before mqttParse returns, so the loop's next
-// Read fails instead of parsing whatever the client sent next.
+// DISCONNECT is written and the connection CLOSED before mqttParse returns, so the loop's
+// next Read fails instead of parsing whatever the client sent next.
 //
 // Closing asynchronously — the shape every off-readLoop disposal caller uses, and which
 // this arm deliberately does not — would let the loop re-enter and turn a queued packet
-// into a second, contradictory DISCONNECT (0x89 "try again later" after 0x8E "taken
-// over"), or close the socket before the 0x8E reached the client at all.
+// into a SECOND DISCONNECT on the same socket, or close it before the first reached the
+// client at all. (The two used to differ in code as well as in count, 0x89 after 0x8E;
+// since F-084 the foreign arm says 0x89 too, so what is forbidden is the second packet.)
 //
 // The second packet is staged ACROSS THE SOCKET rather than appended to the first buffer:
 // the foreign arm returns nil from mid-parse, so a same-buffer remainder is discarded
@@ -2352,7 +2492,7 @@ func TestMQTTBoundRejectionNoReentryAfterForeign(t *testing.T) {
 	e.sess.c = bc
 	e.sess.mu.Unlock()
 
-	e.remoteTakeover(t, "node2", "boundnoreentry")
+	e.remoteRecordWrite(t, "node2", "boundnoreentry")
 	e.rejectSave(t, e.sess)
 
 	e.s.clientWG.Add(1) // readLoop's defer releases the lifecycle token
@@ -2363,22 +2503,24 @@ func TestMQTTBoundRejectionNoReentryAfterForeign(t *testing.T) {
 		t.Fatalf("write the triggering PUBLISH: %v", err)
 	}
 
-	// Read until the takeover DISCONNECT arrives.
+	// Read until the displacement DISCONNECT arrives.
 	var seen []byte
 	deadline := time.Now().Add(testRejectionWait)
 	buf := make([]byte, 256)
 	for {
 		if time.Now().After(deadline) {
-			t.Fatalf("no 0x8E arrived before the connection went away: read %x", seen)
+			t.Fatalf("no displacement DISCONNECT arrived before the connection went away: read %x", seen)
 		}
 		_ = clientSide.SetReadDeadline(time.Now().Add(time.Second))
 		n, err := clientSide.Read(buf)
 		seen = append(seen, buf[:n]...)
-		if mqttTestSawDisconnect(t, seen, mqttReasonSessionTakenOver) {
+		// 0x89 ownership-unsettled: this displacement was observed through a record, which
+		// proves no successor. F-084.
+		if mqttTestSawDisconnect(t, seen, mqttReasonServerBusy) {
 			break
 		}
 		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("the connection was closed before the 0x8E: read %x (%v)", seen, err)
+			t.Fatalf("the connection was closed before the displacement DISCONNECT: read %x (%v)", seen, err)
 		}
 	}
 
@@ -2398,9 +2540,46 @@ func TestMQTTBoundRejectionNoReentryAfterForeign(t *testing.T) {
 			break
 		}
 	}
-	if mqttTestSawDisconnect(t, seen, mqttReasonServerBusy) {
-		t.Fatalf("a second DISCONNECT contradicting the first: read %x", seen)
+	// EXACTLY ONE, for the same reason as above: both vocabularies carry 0x89 since F-084,
+	// so "did a 0x89 appear" no longer distinguishes a contradicting second DISCONNECT from
+	// the first one this test just waited for.
+	if n := mqttTestCountDisconnects(t, seen); n != 1 {
+		t.Fatalf("exactly one DISCONNECT may reach the client, got %d: read %x", n, seen)
 	}
+}
+
+// mqttTestCountDisconnects counts complete server DISCONNECTs in the bytes read so far.
+// Tolerates a trailing partial packet.
+func mqttTestCountDisconnects(t *testing.T, data []byte) int {
+	t.Helper()
+	n := 0
+	for i := 0; i < len(data); {
+		typ := data[i] & mqttPacketMask
+		i++
+		var pl, mult int
+		ok := true
+		for {
+			if i >= len(data) {
+				ok = false
+				break
+			}
+			b := data[i]
+			i++
+			pl += int(b&0x7f) * (1 << mult)
+			if b&0x80 == 0 {
+				break
+			}
+			mult += 7
+		}
+		if !ok || i+pl > len(data) {
+			break
+		}
+		if typ == mqttPacketDisconnect {
+			n++
+		}
+		i += pl
+	}
+	return n
 }
 
 // mqttTestSawDisconnect reports whether the bytes read so far contain a complete server

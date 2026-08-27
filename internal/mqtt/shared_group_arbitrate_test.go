@@ -380,17 +380,17 @@ func TestSharedOwnershipTriggerIsStackLocal(t *testing.T) {
 // TestSharedOwnershipDirectRejectionClassifiesLineage pins the 10071 arm's own
 // classification, which is the one arm that never consults the contention resolver.
 //
-// A CAS rejection says the subject moved. It does NOT say who moved it, and the difference
-// is what the client is told: a record that is a legitimate SUCCESSOR of ours is a
-// demonstrated takeover and says 0x8E "stop"; a record claiming the same PARENT as ours is
-// a sibling — our write was erased by something that is not demonstrably our successor, and
-// nobody was demonstrated to own the session — so it says 0x89 "reconnect" and mints a fork
-// grant.
+// A CAS rejection says the subject moved. It does NOT say who moved it, and since F-084
+// the broker no longer pretends otherwise: BOTH classes say 0x89 "reconnect". What still
+// differs is the Reason String and the REPAIR — a record claiming the same PARENT as ours
+// is a sibling, so our write was erased by something not demonstrably our successor and a
+// fork grant is minted; a child-SHAPED body proves nothing (restore adopts WID/PWID without
+// validating provenance) so it is ownership-unsettled and mints nothing.
 //
-// Both halves are required. Without the successor case, a build that reported forked for
-// ANY moved record would pass the fork case and be wrong about every ordinary takeover;
-// without the fork case, collapsing 10071 to a bare takeover survives (which is exactly
-// what an earlier run of this mutation showed).
+// Both halves are required. Without the child-shaped case, a build that reported forked for
+// ANY moved record would pass the fork case and mint a grant with nothing to anchor it;
+// without the fork case, collapsing 10071 to one undifferentiated verdict survives (which
+// is exactly what an earlier run of this mutation showed).
 func TestSharedOwnershipDirectRejectionClassifiesLineage(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -401,9 +401,13 @@ func TestSharedOwnershipDirectRejectionClassifiesLineage(t *testing.T) {
 		{"a sibling claiming our parent is FORKED", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttGroupOwnershipForked, mqttDisposalForked},
-		{"a successor of our record is a TAKEOVER", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
-			return testLandSuccessor(t, e, testMutateSibling)
-		}, mqttGroupOwnershipForeign, mqttDisposalTakenOver},
+		// A CHILD-SHAPED body is not a takeover, and calling it one was F-084's defect:
+		// restore adopts WID/PWID without validating provenance, so this shape claims
+		// descent rather than proving it. The OUTCOME still separates it from a sibling —
+		// Foreign disposes, Forked does not mint here — while the CLAIM is the honest one.
+		{"a child-shaped body leaves ownership UNSETTLED", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
+			return testLandChildRecord(t, e, testMutateSibling)
+		}, mqttGroupOwnershipForeign, mqttDisposalOwnershipUnsettled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewInflightEnv(t, "sharedlineage")
@@ -444,9 +448,12 @@ func TestSharedOwnershipDirectRejectionClassifiesLineage(t *testing.T) {
 			if v.outcome != tc.want {
 				t.Fatalf("ownership verdict = %v, want %v (err=%v)", v.outcome, tc.want, v.err)
 			}
+			// The WHOLE vocabulary, not its reason code: since F-084 the forked and the
+			// unsettled values both carry 0x89, so only the Reason String and the log line
+			// separate a proven sibling from an unclassifiable stranger.
 			if v.voc != tc.voc {
 				t.Fatalf("disposal vocabulary = %+v, want %+v: this is what the client is "+
-					"told, and 0x8E asserts a takeover the record may not support",
+					"told, and neither arm may assert a takeover the record does not support",
 					v.voc, tc.voc)
 			}
 		})

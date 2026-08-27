@@ -265,11 +265,16 @@ func (asm *mqttAccountSessionManager) discardTakenOverClient(c *client, ec *clie
 //
 // No lock held on entry (other than the ownership gate).
 func (asm *mqttAccountSessionManager) abandonReDrivenSession(c *client, es *mqttSession) {
-	ec, _ := es.disposeForeignStateLocked(asm, nil)
-	if ec == nil {
+	// licensed=true, and this is the ONE disposal that passes it: this CONNECT holds the
+	// client-ID ownership gate and is itself the replacement, so a successor is not inferred
+	// from a record but held in hand. The disposition therefore DISCARDS the Will, and
+	// discardTakenOverClient's own discard below is the idempotent second notice.
+	d := es.disposeForeignStateLocked(asm, nil, true)
+	d.applyWill(es, asm)
+	if d.stale == nil {
 		return
 	}
-	asm.discardTakenOverClient(c, ec, es.id)
+	asm.discardTakenOverClient(c, d.stale, es.id)
 }
 
 // detachConnectingClientForReDrive is transition T2: a POST-BIND rejection, where the

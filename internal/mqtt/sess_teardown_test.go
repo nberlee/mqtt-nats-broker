@@ -415,8 +415,9 @@ func TestSessTeardownAdoptedByConnect(t *testing.T) {
 
 // TestSessTeardownReleaseIsCAS is test 0e: a release whose delete removes nothing
 // must NOT be read as success. With the marker replaced by a foreign write, the
-// re-read sees another owner and the teardown stops — in particular it must not go
-// on to release shared group durables the new owner may hold.
+// re-read sees a record that is not ours and the teardown stops — in particular it must
+// not go
+// on to release shared group durables whatever wrote that record may hold.
 func TestSessTeardownReleaseIsCAS(t *testing.T) {
 	t.Parallel()
 	a, b := testNewTeardownEnv(t)
@@ -432,14 +433,14 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 		t.Fatalf("claimTeardown = %v, err=%v", claim, err)
 	}
 
-	// A foreign owner replaces the record. MaxMsgsPer:1 removes markerSeq as it
+	// A competing writer replaces the record. MaxMsgsPer:1 removes markerSeq as it
 	// lands, so A's sequence-targeted delete will remove nothing at all.
 	foreign := *ps
 	foreign.Teardown = nil
 	foreign.Origin = b.asm.jsa.id
 	foreignSeq, err := mqttStoreSessionRecordCAS(&b.asm.jsa, b.asm.domainTk, &foreign, sessA.idHash, markerSeq)
 	if err != nil {
-		t.Fatalf("foreign takeover write: %v", err)
+		t.Fatalf("competing write: %v", err)
 	}
 
 	res, cur, curSeq, rerr := sessA.releaseTeardown(tok, target, nonce, markerSeq)

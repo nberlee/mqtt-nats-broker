@@ -104,12 +104,16 @@ const (
 	// mqttGroupOwnershipOurs: a CAS landed, so this broker still owned the record at the
 	// write's linearization point. The only outcome that permits serving.
 	mqttGroupOwnershipOurs mqttGroupOwnership = iota
-	// mqttGroupOwnershipForeign: another owner holds the record. Demonstrated takeover.
+	// mqttGroupOwnershipForeign: the record is NOT OURS. Emphatically not "a demonstrated
+	// takeover", which is what this used to say: a rejected CAS establishes that the
+	// subject moved past our base and nothing about who moved it. F-084.
 	mqttGroupOwnershipForeign
 	// mqttGroupOwnershipForked: the record claims our parent — our write was erased by
 	// something not demonstrably a successor of ours, and NOBODY was demonstrated to own
-	// the session. Distinct from Foreign because it licenses a different thing to SAY
-	// (0x89, "reconnect", rather than 0x8E, "stop").
+	// the session. Distinct from Foreign in what it licenses, though no longer in the
+	// reason CODE: both say 0x89 "reconnect" since F-084, and only this one may MINT a
+	// repair grant, because only this one is anchored to a record proven to claim our
+	// parent.
 	mqttGroupOwnershipForked
 	// mqttGroupOwnershipUnresolved: the write's outcome is unknown. The caller KEEPS its
 	// mutation and performs no further write; the resolver settles it.
@@ -146,12 +150,12 @@ type mqttGroupOwnershipVerdict struct {
 // The verdict switch is deliberately the same shape as the repair save's in
 // sess_resume_reconcile.go, and the two rules it inherits are not re-derived here:
 //
-//   - 10071 (the single-writer check) means another broker wrote after our accept save.
-//     It disposes without ever consulting the resolver, so this is the ONLY place a
-//     sibling lineage can be recognised on that arm — disposalForDirectRejection reads the
-//     record once, classifies it, and MINTS THE FORK GRANT. Collapsing it to a bare
-//     takeover would assert 0x8E where the record supports only 0x89, and would lose the
-//     grant entirely. See sess_fork_lineage.go.
+//   - 10071 (the single-writer check) means the SUBJECT MOVED after our accept save. Not
+//     that another broker wrote it: the rejection names no writer (F-084). It disposes
+//     without ever consulting the resolver, so this is the ONLY place a sibling lineage can
+//     be recognised on that arm — disposalForDirectRejection reads the record once,
+//     classifies it, and MINTS THE FORK GRANT. Collapsing it to one undifferentiated
+//     verdict would lose the grant entirely. See sess_fork_lineage.go.
 //   - 10164 signals clustered contention, not a lost race, and gets the bounded
 //     re-read/retry treatment. See resolveContendedRecordSave.
 //
@@ -181,9 +185,12 @@ func (sess *mqttSession) proveSharedMembershipOwnership(tok recordTx) mqttGroupO
 		// Definite 10071. One load, on the rejection path of a pre-CONNACK write, never on
 		// a healthy connection; it narrows the verdict and mints the grant when the record
 		// is a sibling rather than a successor.
-		voc := sess.disposalForDirectRejection(&detail)
+		// Keyed on the fork BIT, never on the vocabulary's reason code: the forked and
+		// unsettled vocabularies share 0x89, so a code comparison would call an unsettled
+		// record a fork. F-084.
+		voc, forked := sess.disposalForDirectRejection(&detail)
 		out := mqttGroupOwnershipForeign
-		if voc == mqttDisposalForked {
+		if forked {
 			out = mqttGroupOwnershipForked
 		}
 		return mqttGroupOwnershipVerdict{outcome: out, voc: voc, err: err}
@@ -194,10 +201,10 @@ func (sess *mqttSession) proveSharedMembershipOwnership(tok recordTx) mqttGroupO
 			return mqttGroupOwnershipVerdict{outcome: mqttGroupOwnershipOurs}
 		case mqttRepairSaveForeign:
 			return mqttGroupOwnershipVerdict{
-				outcome: mqttGroupOwnershipForeign, voc: mqttDisposalForRepairSave(v), err: err}
+				outcome: mqttGroupOwnershipForeign, voc: mqttDisposalForLineage(false), err: err}
 		case mqttRepairSaveForked:
 			return mqttGroupOwnershipVerdict{
-				outcome: mqttGroupOwnershipForked, voc: mqttDisposalForRepairSave(v), err: err}
+				outcome: mqttGroupOwnershipForked, voc: mqttDisposalForLineage(true), err: err}
 		case mqttRepairSaveUnresolved:
 			// The pending-write state is already established by the resolver — a CAS
 			// rejection is definite, so save() did not mark it uncertain, and without that
