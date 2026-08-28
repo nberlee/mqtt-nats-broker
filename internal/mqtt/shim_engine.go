@@ -53,13 +53,36 @@ func (rf readCacheFlag) isSet(c readCacheFlag) bool { return rf&c != 0 }
 func (rf *readCacheFlag) set(c readCacheFlag)       { *rf |= c }
 
 // ---------------------------------------------------------------------------
-// Permissions (auth is passed through to NATS, so in-broker checks are
-// permissive). NATS enforces the per-client SUBSCRIBE side; the PUBLISH side is
-// NOT enforced anywhere today, because a core-NATS publish denial is
-// asynchronous and nothing here observes it -- F-079.
+// Permissions. Delivery and persistence ride the full-rights SERVICE connection,
+// so NATS cannot police them and the broker does it here, from the identity
+// snapshot isClientAuthorized takes at CONNECT (authz_identity.go). NATS still
+// enforces the client's own connection: SUBSCRIBE admission, and QoS 0 on a user
+// topic. F-079, F-080, F-081.
 // ---------------------------------------------------------------------------
 
-type permissions struct{}
+// mqttClientOrigin distinguishes a real MQTT client from an internal
+// continuation acting on a decision taken earlier and recorded durably.
+//
+// It carries only the distinction that cannot be derived. Whether a real client
+// is governed by an identity at all depends on whether the broker has per-client
+// identities, which is the server's business and is read from there
+// (mqttAuthzApplies) rather than copied onto every client.
+type mqttClientOrigin uint8
+
+const (
+	// mqttOriginClient is a real MQTT client. Whether an identity governs it is
+	// then a question about the SERVER -- see mqttAuthzApplies -- so this is the
+	// zero value and a construction site that stamps nothing gets it. Under auth
+	// passthrough that is the strict arm, which is the direction an omission must
+	// fail in.
+	mqttOriginClient mqttClientOrigin = iota
+	// mqttOriginCapturedDecision is an internal continuation -- a replayed Will,
+	// or anything else createInternalAccountClient builds. It carries no snapshot
+	// and never will; its authority is the decision taken at capture, which the
+	// durable record embodies. Stamped POSITIVELY, because inferring it from an
+	// absent snapshot would turn every missing snapshot into a grant.
+	mqttOriginCapturedDecision
+)
 
 // websocket is a placeholder; MQTT-over-WebSocket is a later milestone.
 type websocket struct{}
@@ -91,8 +114,8 @@ type Options struct {
 	Token       string
 	// Authorization: test-suite compatibility with upstream's single-token
 	// top-level auth field name; unused by the broker (authorization is
-	// enforced by NATS via auth passthrough -- for SUBSCRIBE only; publish is
-	// unenforced, see Server.isClientAuthorized and F-079).
+	// enforced by NATS for SUBSCRIBE admission, and by the broker itself for
+	// everything that rides the service connection -- see isClientAuthorized).
 	Authorization string
 	NoAuthUser    string
 	Users         []*User
@@ -209,6 +232,11 @@ type Server struct {
 	// connection.
 	dialClient func(clientID, user, pass string) (*nats.Conn, error)
 
+	// svcID is what the broker knows about the account its own streams ride, and
+	// how currently it knows it. Established before the listener opens; see
+	// authz_identity.go.
+	svcID serviceIdentity
+
 	mqtt srvMQTT
 
 	clients      map[uint64]*client
@@ -258,11 +286,15 @@ type Server struct {
 	// timers, callbacks and account-manager references for the process lifetime.
 	willDispatchMu     sync.Mutex
 	willDispatchClosed bool
-	willTimers         map[string]*time.Timer
-	willClaimStopCh    chan struct{}
-	willTimerWG        sync.WaitGroup
-	willClaimWG        sync.WaitGroup
-	willWorkerWG       sync.WaitGroup
+	// owedWills holds authorized Wills whose destination account is momentarily
+	// unavailable, so an ordinary NATS blip defers them instead of destroying them.
+	// See will_blip_retry.go.
+	owedWills       mqttOwedWillQueue
+	willTimers      map[string]*time.Timer
+	willClaimStopCh chan struct{}
+	willTimerWG     sync.WaitGroup
+	willClaimWG     sync.WaitGroup
+	willWorkerWG    sync.WaitGroup
 
 	ldm bool
 	// nodeName identifies this bridge instance (see NodeName). It is not a NATS
@@ -334,26 +366,40 @@ func (s *Server) NodeName() string {
 func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas > 1 }
 
 // isClientAuthorized implements auth passthrough: it dials a per-client NATS
-// connection using the CONNECT credentials. Success (NATS accepted the
-// credentials) authorizes the MQTT client and binds its routing connection so
-// NATS enforces that client's SUBSCRIBE permissions. Failure rejects the
-// CONNECT with "not authorized". When no dialer is configured, the client falls
-// back to the shared service connection (used in tests).
+// connection using the CONNECT credentials, then asks that connection WHO IT IS.
 //
-// Two gaps, both alpha blockers, both filed rather than fixed here:
-//   - PUBLISH permissions are NOT enforced: a core-NATS publish denial is
-//     asynchronous, so PublishMsg observes nothing and every effect that does
-//     not ride c.nrc proceeds on the service connection (F-079).
-//   - The authenticated connection's ACCOUNT is never derived or compared. This
-//     binds c.nrc and nothing else; c.acc still points at the synthetic service
-//     account, so the documented v1 same-account constraint is unenforced
-//     (F-080).
+// The dial alone only proves the credentials authenticated. It says nothing about
+// which account they belong to, and nothing about what they may publish or
+// receive -- and since delivery and persistence ride the service connection, the
+// broker has to know both to enforce anything at all. One $SYS.REQ.USER.INFO
+// request supplies them (authz_identity.go), and this is the only place in the
+// broker where a per-client identity exists to ask.
+//
+// Everything here fails CLOSED. An unknown identity is not a weakly-privileged
+// one; it is no identity, and the CONNECT is refused. Refusal reaches
+// closeConnection, which drains the connection dialled just above, so a refused
+// CONNECT leaks nothing.
+//
+// F-079, F-080, F-081. Note what this does NOT do: the refusal is a bare socket
+// close, because authViolation sends no CONNACK. That is F-061's, filed and
+// deliberately post-alpha; nothing here makes it worse or better.
 func (s *Server) isClientAuthorized(c *client) bool {
 	if s.dialClient == nil {
+		// No per-client identity exists in this mode, so there is nothing to
+		// enforce and nothing to snapshot: the client IS the service credential.
+		// createMQTTClient has already stamped mqttOriginServiceIdentity.
 		if c.nrc == nil {
 			c.nrc = s.nrc
 		}
 		return true
+	}
+	// The service account must be known before any client can be compared against
+	// it, and it must be known to be CURRENT -- a service connection that is down
+	// cannot tell us where a buffered write would land.
+	svcAccount, svcOK := s.serviceAccount()
+	if !svcOK {
+		s.Warnf("MQTT: refusing CONNECT: the service connection's account is not currently established")
+		return false
 	}
 	var user, pass string
 	var cid string
@@ -369,11 +415,114 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		s.Debugf("MQTT auth passthrough rejected client %q: %v", cid, err)
 		return false
 	}
+	// Owned by THIS function until it is installed on the client, and closed on
+	// every path that does not install it. Ordinary teardown only drains a
+	// connection the client owns (ownNRC), so a refusal after a successful dial
+	// used to leak one -- and DialClient sets MaxReconnects(-1), so each leaked
+	// connection reconnects forever. An authenticated client that cannot be
+	// identified could accumulate them remotely, one per CONNECT attempt.
+	adopted := false
+	defer func() {
+		if !adopted {
+			nc.Close()
+		}
+	}()
+	// Handlers BEFORE the request, so a drop while it is in flight is observed
+	// rather than missed. Neither setter replays an event that already happened,
+	// which is why IsConnected is re-checked below rather than trusted from here.
+	c.armIdentityInvalidation(nc)
+	if !nc.IsConnected() {
+		s.Debugf("MQTT: per-client NATS connection for %q was already down when identity was requested", cid)
+		return false
+	}
+
+	id, ierr := mqttFetchIdentity(nc, s.nrc)
+	if ierr != nil {
+		s.Warnf("MQTT: refusing CONNECT for client %q: %v", cid, ierr)
+		return false
+	}
+	if id.account != svcAccount {
+		// The v1 same-account constraint docs/ARCHITECTURE.md states. Until now
+		// nothing checked it, so credentials valid in another account
+		// authenticated while every durable operation landed in this one's
+		// streams. F-080.
+		s.Warnf("MQTT: refusing CONNECT for client %q: identity %q is bound to account %q, not the service account %q",
+			cid, id.user, id.account, svcAccount)
+		return false
+	}
+	// The window the handler could not cover: a drop between arming and here is
+	// reported by neither setter, so the connection is asked directly. After this
+	// point the handler owns invalidation.
+	if !nc.IsConnected() {
+		s.Debugf("MQTT: per-client NATS connection for %q dropped during identity discovery", cid)
+		return false
+	}
+
 	c.mu.Lock()
 	c.nrc = nc
 	c.ownNRC = true
+	c.perms, c.mperms = id.pub, id.sub
+	c.authzSvcAccount = svcAccount
+	c.authzValid = true
 	c.mu.Unlock()
+	adopted = true // the client owns it now, and its teardown drains it
+	c.armIdentityExpiry(id.expires)
 	return true
+}
+
+// armIdentityInvalidation ties the snapshot's life to the connection's.
+//
+// A per-client connection reconnects indefinitely (backend.DialClient sets
+// MaxReconnects(-1)) and RE-AUTHENTICATES each time, possibly under changed
+// permissions, so a snapshot that outlived its connection would authorize durable
+// writes on behalf of an identity that may no longer hold them.
+//
+// Invalidation is the primitive and the socket close is only its consequence:
+// closing alone merely fails the NEXT read, while a PUBLISH already in hand
+// inside mqttParse, or a delivery callback already running, would go on to use the
+// snapshot. Every gate consults authzValid, so clearing it stops those too.
+//
+// Our own teardown Drains the connection, which also fires the closed callback;
+// the second rawConn.Close() is harmless and the invalidation is correct anyway,
+// since the client is going away.
+func (c *client) armIdentityInvalidation(nc *nats.Conn) {
+	invalidate := func() {
+		c.mu.Lock()
+		c.authzValid = false
+		c.mu.Unlock()
+		if c.rawConn != nil {
+			// The socket only. The ordered teardown belongs to readLoop's
+			// disconnect(), exactly as for the CONNECT deadline.
+			_ = c.rawConn.Close()
+		}
+	}
+	nc.SetDisconnectErrHandler(func(*nats.Conn, error) { invalidate() })
+	nc.SetClosedHandler(func(*nats.Conn) { invalidate() })
+}
+
+// armIdentityExpiry bounds the snapshot when the server reported a finite
+// lifetime for the identity.
+//
+// Zero is NOT read as "unlimited": nats-server truncates the remaining duration
+// to seconds, so zero means both "no expiry" and "under a second remains". A
+// nonzero value therefore adds a bound, and zero adds none -- the connection
+// lifecycle above is what carries the guarantee in that case, because an identity
+// that really expires loses its connection.
+func (c *client) armIdentityExpiry(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t := time.AfterFunc(d, func() {
+		c.mu.Lock()
+		c.authzValid = false
+		c.mu.Unlock()
+		if c.rawConn != nil {
+			_ = c.rawConn.Close()
+		}
+	})
+	c.mu.Lock()
+	c.authzExpiry = t
+	c.mu.Unlock()
 }
 
 // SetClientDialer installs the per-client NATS dialer used for auth passthrough.
@@ -448,7 +597,13 @@ func (s *Server) closeConnSetupGate() {
 // account, used by the session manager for JetStream-assets traffic. Its NATS
 // routing connection is the server's service connection.
 func (s *Server) createInternalAccountClient() *client {
-	return &client{srv: s, acc: s.globalAccount(), nrc: s.nrc, kind: 0}
+	// mqttOriginCapturedDecision: this client has no identity of its own and never
+	// will. Everything it publishes -- a replayed Will above all -- acts on a
+	// decision taken while a real client's snapshot was valid and recorded
+	// durably, so asking it for a snapshot would refuse every internal
+	// continuation. It is stamped positively rather than inferred from the absent
+	// snapshot, because inferring it would make every missing snapshot a grant.
+	return &client{srv: s, acc: s.globalAccount(), nrc: s.nrc, kind: 0, origin: mqttOriginCapturedDecision}
 }
 
 // ---------------------------------------------------------------------------
@@ -499,13 +654,18 @@ type client struct {
 	kind    int
 	ncs     atomic.Value // string label, lazily set
 
-	opts    clientOpts
-	flags   clientFlag
-	in      struct{ flags readCacheFlag }
-	out     outbound
-	pa      pubArg
-	perms   *permissions
-	mperms  *permissions
+	opts  clientOpts
+	flags clientFlag
+	in    struct{ flags readCacheFlag }
+	out   outbound
+	pa    pubArg
+	// perms and mperms are the authenticated identity's compiled publish and
+	// subscribe permissions, written once under c.mu by isClientAuthorized and
+	// read under c.mu by the publication gate and the delivery guards. A nil
+	// value means "no permissions configured", i.e. unrestricted -- see
+	// mqttSubjectPermissions.
+	perms   *mqttSubjectPermissions
+	mperms  *mqttSubjectPermissions
 	subs    map[string]*subscription
 	mpay    int32
 	msubs   int32
@@ -522,9 +682,11 @@ type client struct {
 	// (auth-passthrough) connection for real MQTT clients, or the service
 	// connection for the internal JSA client. All MQTT publishes/subscriptions
 	// and JSA requests for this client ride nrc so NATS can enforce authorization
-	// -- which it does for SUBSCRIBE only. A publish denial on nrc is asynchronous
-	// and is never observed, and the QoS 1/2, retained and QoS 2 hold stores do not
-	// ride nrc at all: they ride the service connection (F-079).
+	// -- which it does for SUBSCRIBE admission and for QoS 0 on a user topic. A
+	// publish denial on nrc is asynchronous and is never observed, and the QoS 1/2,
+	// retained and QoS 2 hold stores do not ride nrc at all: they ride the service
+	// connection. The broker polices those itself, from the identity snapshot taken
+	// on THIS connection at CONNECT (authz_identity.go).
 	nrc *nats.Conn
 	// ownNRC is true when nrc is a per-client connection this client owns and
 	// must close on disconnect (as opposed to the shared service connection).
@@ -558,6 +720,39 @@ type client struct {
 	// CONNACK (mqttAbortAcceptedConnect). That second reader loads it under c.mu,
 	// which is why the store lives inside the CONNACK write's critical section.
 	connAckWritten atomic.Bool
+
+	// origin says on whose authority this client's publications act. Set at
+	// construction and never changed; the zero value is the strictest
+	// (mqttClientOrigin).
+	origin mqttClientOrigin
+	// authzValid is the identity snapshot's epoch. It is true only between a
+	// successful CONNECT-time identity fetch and the moment the per-client NATS
+	// connection stops being usable, and it is what every gate consults --
+	// closing the socket is only the consequence, never the primitive, because a
+	// PUBLISH already in hand inside mqttParse would otherwise still use the
+	// snapshot of an identity that has gone. Written and read under c.mu.
+	authzValid bool
+	// authzSvcAccount is the service account this snapshot was discovered against.
+	// Every gate compares it, so an identity established for one account can never
+	// authorize a write into another -- which is the fact the invariant names. It
+	// is deliberately the ACCOUNT and not a per-reconnect generation: pinning to an
+	// incarnation made an ordinary same-account reconnect strand every live client
+	// permanently.
+	authzSvcAccount string
+	// authzExpiry invalidates the snapshot when the server reported a finite
+	// lifetime for the identity. Stopped in closeConnection alongside
+	// connectTimer, for the same reason.
+	authzExpiry *time.Timer
+	// willAuthorized records, at CONNECT and while the snapshot is provably
+	// valid, whether this connection's Will may be published -- over its FULL
+	// effective-subject set, derived certificate subject included.
+	//
+	// It is captured rather than re-derived because every site that discharges a
+	// Will runs AFTER the connection is gone: the delayed and takeover gates, the
+	// uncertainty-parked gate, and the immediate path all execute inside
+	// mqttHandleClosedClient, by which time the epoch above is already invalid.
+	// Asking there would suppress an authorized Will on every NATS blip.
+	willAuthorized bool
 }
 
 // msgParts splits a NATS message into its header and payload segments (mirrors
@@ -601,17 +796,197 @@ func (c *client) traceOutOp(op string, arg []byte) {}
 func (c *client) isClosed() bool    { return c.closed.Load() }
 func (c *client) isWebsocket() bool { return false }
 
-// Permission checks: permissive in-broker, on the premise that NATS enforces via
-// auth passthrough. That premise holds for subscribe and NOT for publish.
+// pubAllowedFullCheck reports whether this client may publish to subject, on the
+// authority its origin names. It is the single publication predicate; the gate
+// in mqttProcessPub applies it to the FULL effective-subject set of a
+// publication, not to one subject (mqttEffectivePublishSubjects).
 //
-// pubAllowedFullCheck therefore ALWAYS RETURNS TRUE, and its three callers are all
-// Will authorization (delayed-Will capture, takeover-time publication, uncertainty
-// parking) -- so a Will denied by the account's ACL is authorized here anyway, and an
-// internally replayed one is then published by the internal client on the service
-// connection, live fan-out included. F-079; do not read this as a check.
-func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bool { return true }
-func (c *client) checkDenySub(subject string) bool                                 { return false }
-func (c *client) selectMappedSubject() bool                                        { return false }
+// hasLock says c.mu is already held, matching the ported call shape.
+func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bool {
+	if !hasLock {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+	}
+	return c.pubAllowedLocked(subject)
+}
+
+// mqttAuthzApplies reports whether a per-client identity governs this client's
+// publications and deliveries at all.
+//
+// Two ways it does not, and they are different in kind. An internal continuation
+// is stamped mqttOriginCapturedDecision at construction and acts on a decision
+// already taken and durably recorded -- that has to be a POSITIVE property,
+// because inferring it from an absent snapshot would make every failure to take
+// one a grant. Whereas "this broker has no per-client identities at all" is a
+// property of the SERVER, not of the client: with no dialer configured, every
+// client rides the service connection and IS the service credential, so there is
+// nothing per-client to enforce and nothing to snapshot.
+//
+// Deriving the second from s.dialClient rather than stamping it on each client
+// keeps one fact in one place, and it does not weaken anything: where a dialer IS
+// configured, no client can become a service identity by omission, so a
+// construction site that forgets to stamp anything still lands in the strict arm.
+func (c *client) mqttAuthzApplies() bool {
+	if c.origin == mqttOriginCapturedDecision {
+		return false
+	}
+	return c.srv != nil && c.srv.dialClient != nil
+}
+
+// snapshotUsableLocked reports whether this client's identity snapshot may still
+// be acted on.
+//
+// The flag alone is not enough, for the same reason it was not enough on the
+// service side: the disconnect callback is asynchronous, so it can fire DURING
+// isClientAuthorized -- clearing the flag and closing the socket -- and the
+// installation that follows would then write `valid = true` back over it,
+// resurrecting a snapshot whose connection is already gone. Consulting the live
+// connection makes that ordering irrelevant: a dead connection is never usable,
+// whatever the flag says and whoever wrote it last.
+//
+// NO FIXTURE DISCRIMINATES THIS, and the reason is worth recording rather than
+// leaving for someone to rediscover: in the window it hardens, the same handler
+// has already closed the MQTT socket, so the CONNECT fails and no client survives
+// to use the resurrected snapshot. An attempt to test it passed identically with
+// the liveness term removed -- it was measuring the socket close, not this -- and
+// was deleted rather than kept as coverage it does not provide. What can outlive
+// that window is the Will decision captured during the CONNECT, and that is sound
+// on its own terms: the snapshot it was computed from was genuine, and the
+// destination account is checked again at discharge.
+//
+// c.mu held.
+func (c *client) snapshotUsableLocked() bool {
+	return c.authzValid && c.nrc != nil && c.nrc.IsConnected()
+}
+
+// willPublishAuthorized reports whether this connection's Will was AUTHORIZED --
+// a permanent fact about the Will's subjects, decided at CONNECT.
+//
+// It says nothing about whether the destination is reachable right now; that is
+// willDestinationAccount's business, and conflating the two would turn a
+// transient outage into a silently discarded Will.
+//
+// It reads the decision captured at CONNECT rather than asking now, because every
+// caller runs on the teardown path: the delayed and takeover gates, the
+// uncertainty-parked gate and the immediate path all execute after the connection
+// is gone and its snapshot has been invalidated, so asking would refuse every
+// Will rather than the denied ones.
+//
+// Where no identity governs, there was nothing to capture and nothing to refuse.
+// Reading the captured flag unconditionally would drop EVERY Will on a broker
+// running -auth-passthrough=false, which is what the Will fixtures caught.
+//
+// c.mu held.
+func (c *client) willPublishAuthorized() bool {
+	if !c.mqttAuthzApplies() {
+		return true
+	}
+	return c.willAuthorized
+}
+
+// willDestinationAccount is the account this connection's Will was authorized
+// for, or false when no identity governs it.
+//
+// It is deliberately SEPARATE from willPublishAuthorized, because folding the two
+// into one boolean loses the distinction that matters most on a teardown path: a
+// captured DENY is permanent and the Will must never be published, whereas a
+// service account that is momentarily unavailable is an UNKNOWN, and answering
+// "not authorized" to it would silently destroy an authorized Will on every NATS
+// blip -- the caller has already consumed it by then. The callers therefore treat
+// the two differently: denied discards, unknown declines to consume.
+func (c *client) willDestinationAccount() (string, bool) {
+	if !c.mqttAuthzApplies() {
+		return _EMPTY_, true
+	}
+	return c.authzSvcAccount, true
+}
+
+// pubAllowedLocked is pubAllowedFullCheck with c.mu held.
+//
+// Where an identity governs, an absent or invalidated snapshot is not a weaker
+// answer than a deny -- it is no answer, and it refuses.
+func (c *client) pubAllowedLocked(subject string) bool {
+	if !c.mqttAuthzApplies() {
+		return true
+	}
+	if !c.snapshotUsableLocked() {
+		return false
+	}
+	// The SERVICE connection's epoch, not this client's. While it is down nothing
+	// can be known about where a durable write would land: nats.go buffers the
+	// publish and flushes it on reconnect BEFORE the reconnect callback runs, so a
+	// callback that discovers the account changed discovers it after the effect has
+	// already been written into the new account. Refusing here is what stops the
+	// effect being buffered at all, and it costs little -- with the service
+	// connection down a JetStream store would time out anyway, so this is the same
+	// outcome reached sooner and said out loud.
+	if acc, ok := c.srv.serviceAccount(); !ok || acc != c.authzSvcAccount {
+		return false
+	}
+	return c.perms.allows(subject)
+}
+
+// mqttSubDeliveryVerdict is a delivery guard's answer. It is three-valued
+// because "the snapshot says no" and "there is no snapshot" call for opposite
+// disposals: the first is a fact about the message and is terminal, the second
+// is a fact about the broker and must not be written onto the message. Collapsing
+// them into a bool satisfies every non-delivery assertion by DESTROYING the
+// message instead of withholding it.
+type mqttSubDeliveryVerdict uint8
+
+const (
+	mqttSubDeliverAllow mqttSubDeliveryVerdict = iota
+	// mqttSubDeliverDenied: the snapshot proves the account denies this concrete
+	// subject (and queue) for this identity. Terminal -- acknowledge, so a stable
+	// deny does not redeliver forever.
+	mqttSubDeliverDenied
+	// mqttSubDeliverIndeterminate: no valid snapshot, or provenance that cannot be
+	// derived. Withhold WITHOUT acknowledging; the message must survive for the
+	// client's next connection.
+	mqttSubDeliverIndeterminate
+)
+
+// checkDenySubVerdict evaluates the DENY side of the identity's subscribe
+// permissions for one concrete delivery. Only the deny side: NATS already applied
+// the allow side when it accepted the subscription, so re-testing it here would
+// withhold deliveries NATS admitted.
+//
+// queue is the subscription's queue group, and it must be the group the delivery
+// actually belongs to -- see the affine guard, whose sub.queue is nil and whose
+// group comes from its claim instead.
+func (c *client) checkDenySubVerdict(subject, queue string) mqttSubDeliveryVerdict {
+	if !c.mqttAuthzApplies() {
+		return mqttSubDeliverAllow
+	}
+	c.mu.Lock()
+	valid, mperms, wantAcc := c.snapshotUsableLocked(), c.mperms, c.authzSvcAccount
+	c.mu.Unlock()
+	if !valid {
+		return mqttSubDeliverIndeterminate
+	}
+	// The SERVICE epoch, and it must be the SAME one the snapshot was taken in.
+	// nats.go resends service subscriptions before it queues the reconnect
+	// callback, so a delivery can arrive from a freshly connected account while the
+	// epoch is still invalid and before the mismatch handler has closed anything --
+	// an allowed subject reaching a socket whose identity was established in the
+	// previous account. Indeterminate, never a deny: the message must survive.
+	if acc, ok := c.srv.serviceAccount(); !ok || acc != wantAcc {
+		return mqttSubDeliverIndeterminate
+	}
+	if mperms.deniesSub(subject, queue) {
+		return mqttSubDeliverDenied
+	}
+	return mqttSubDeliverAllow
+}
+
+// checkDenySub keeps upstream's two-argument shape (nats-server client.go). A
+// queue-scoped deny is serialised by $SYS.REQ.USER.INFO as "<subject> <queue>",
+// so a queue-blind check silently downgrades it to a subject-only one.
+func (c *client) checkDenySub(subject, queue string) bool {
+	return c.checkDenySubVerdict(subject, queue) == mqttSubDeliverDenied
+}
+
+func (c *client) selectMappedSubject() bool { return false }
 
 // registerWithAccount binds this client to an account (single-account v1).
 func (c *client) registerWithAccount(a *Account) { c.mu.Lock(); c.acc = a; c.mu.Unlock() }
@@ -841,6 +1216,14 @@ func (c *client) closeConnection(reason ClosedState) {
 	if c.connectTimer != nil {
 		c.connectTimer.Stop()
 	}
+	// Same reason as the CONNECT deadline: this is the teardown every connection
+	// reaches, and a live AfterFunc would otherwise outlast the client it bounds.
+	if c.authzExpiry != nil {
+		c.authzExpiry.Stop()
+	}
+	// The snapshot dies with the connection. Anything still in flight that
+	// consults it from here on gets the indeterminate answer, not the old one.
+	c.authzValid = false
 	subs := c.subs
 	c.subs = nil
 	c.mu.Unlock()
@@ -986,7 +1369,9 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 		// Per-subscription delivery client carries the pubArg (header length)
 		// that msgParts needs. nats.go dispatches a subscription's messages on a
 		// single goroutine, so mutating dc.pa here is race-free.
-		dc := &client{srv: c.srv, kind: c.kind}
+		// Inherits the logical client's origin so it is never an authority in its
+		// own right; every authorization decision below consults sub.client, not dc.
+		dc := &client{srv: c.srv, kind: c.kind, origin: c.origin}
 		handler := func(m *nats.Msg) {
 			rmsg, hdrLen := frameNATSMsg(m)
 			dc.pa.hdr = hdrLen
@@ -1084,7 +1469,7 @@ func (c *client) processUnsub(sid []byte) error {
 // c.pa) to the client's NATS routing connection. This is the single seam through
 // which both JSA requests (internal client) and MQTT publishes (per-client
 // connection) reach NATS.
-func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
+func (c *client) processInboundClientMsg(msg []byte, pp *mqttPublish) (bool, bool) {
 	if c.nrc == nil {
 		return false, false
 	}
@@ -1117,18 +1502,28 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 		return false, false
 	}
 
-	// MQTT retained-message hook. Upstream nats-server invokes this inside
-	// processInboundClientMsg (client.go) for MQTT clients once permissions pass;
-	// it stores/clears the retained copy in $MQTT_rmsgs. It no-ops for
-	// non-retained publishes. The internal JSA client has c.mqtt == nil and is
-	// correctly skipped.
+	// MQTT retained-message hook: it stores or clears the retained copy in
+	// $MQTT_rmsgs, and for a Sparkplug birth it also derives, publishes and stores
+	// a "$sparkplug/certificates/..." subject. It no-ops for non-retained
+	// publishes, and the internal JSA client has c.mqtt == nil and is skipped.
 	//
-	// "Once permissions pass" is upstream's condition, NOT this port's: the
-	// PublishMsg above returns before any asynchronous denial is known, so this
-	// runs whether or not the publish was authorized, and the retained copy is
-	// stored on the service connection either way. F-079.
-	if c.mqtt != nil {
-		c.mqttHandlePubRetain()
+	// pp is passed IN rather than read from c.mqtt.pp, and that is a fix, not a
+	// refactor. c.mqtt.pp is the shared PARSER object, overwritten by every packet
+	// the client sends. mqttProcessPubRel reconstructs the released publication
+	// into a LOCAL pp and hands it down, so the hook used to retain whatever the
+	// parser had touched most recently instead. It happened to be right only
+	// because nothing usually intervenes between a retained QoS 2 PUBLISH and its
+	// PUBREL; with an intervening PUBLISH it retained the wrong message, and with
+	// an intervening DENIED Sparkplug birth it manufactured that birth's derived
+	// certificate effect on the back of an unrelated authorized exchange.
+	//
+	// Authorization is already settled by the time we get here: the gate in
+	// mqttProcessPub (or, for QoS 2, in mqttStoreQoS2MsgOnce) covered this
+	// publication's FULL effective-subject set, derived certificate subject
+	// included. That is why there is no second check here, and why adding one
+	// would double-refuse a replayed Will. F-079.
+	if c.mqtt != nil && pp != nil {
+		c.mqttHandlePubRetain(pp)
 	}
 	return true, false
 }

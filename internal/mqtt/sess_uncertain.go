@@ -198,14 +198,22 @@ type mqttDeferredDisconnect struct {
 	// because the client is closing and c.mqtt.cp will not be readable later. nil
 	// will means there is nothing owed.
 	//
-	// Publish permission is evaluated at capture time — it is not serializable and
-	// cannot be re-checked here — but that evaluation is currently VACUOUS:
-	// pubAllowedFullCheck always returns true, so a Will denied by the account ACL
-	// IS captured here and is later replayed through the internal client on the
-	// service connection, live fan-out included. F-079.
+	// Publish permission is not evaluated here and must not be: it was decided at
+	// CONNECT, while the connection's identity snapshot was valid, and this runs on
+	// the teardown path where that snapshot has already been invalidated. A denied
+	// Will is therefore never captured, so it can never be replayed. F-079.
 	will      *mqttWill
 	willProps []byte
 	willUser  string
+	// willAccount is the SERVICE account this Will's authorization was decided
+	// against, captured here for the same reason the Will itself is: by discharge
+	// time the connection is gone. Reading the live account at discharge instead
+	// would answer a different question -- where the broker is pointing NOW -- so a
+	// Will authorized against one account could be published into another, which is
+	// precisely what deliverWillRecord's fence exists to stop. Capturing it is also
+	// what lets an unavailable destination DEFER the Will rather than destroy it
+	// (will_blip_retry.go); with no account there is nothing safe to retry against.
+	willAccount string
 	// willDelayed distinguishes a Will that must go through the durable outbox (a
 	// v5 Will Delay Interval on a surviving session) from one that is published
 	// immediately.
@@ -1394,12 +1402,10 @@ func (a *mqttDeferredDisconnect) willDue(now time.Time) bool {
 // deleted: the session's record state is unresolved, so no teardown decision can
 // be made from it yet.
 //
-// The Will is captured HERE rather than re-derived on resolution, for two reasons:
-// the closing client's CONNECT packet is about to become unreachable, and its
-// publish permission is not serializable, so it has to be evaluated while the
-// client still exists. That evaluation is currently VACUOUS in exactly the same
-// way mqttHandleWill's is: pubAllowedFullCheck always returns true, so a denied
-// Will IS captured here and IS replayed later. F-079.
+// The Will is captured HERE rather than re-derived on resolution, because the
+// closing client's CONNECT packet is about to become unreachable. Its publish
+// authorization is a separate fact, decided at CONNECT and merely READ here: a
+// denied Will is not captured, so it is never replayed. F-079.
 //
 // OWNED is a precondition, not a description: the caller holds the session
 // ownership gate. That is what entitles the park to clear this client ID from the
@@ -1460,16 +1466,19 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 		if disposition == mqttWillArmed {
 			delayed = mqttWillIsDelayed(c.mqtt.proto, will, action.expiryInterval)
 		}
-		if !c.pubAllowedFullCheck(string(will.subject), false, true) {
-			// Intended: a denied Will is not captured, so it can never be published
-			// later either. UNREACHABLE today -- pubAllowedFullCheck is hardcoded to
-			// true, so this arm never runs and a denied Will is captured. F-079.
+		if !c.willPublishAuthorized() {
+			// A denied Will is not captured, so it can never be published later
+			// either. The decision is the one taken at CONNECT and READ here: this
+			// runs on the teardown path, where the connection's snapshot has already
+			// been invalidated, so asking again would drop every Will rather than the
+			// denied ones. F-079.
 			will = nil
 		}
 		if will != nil {
 			action.will = will
 			action.willProps = mqttWillForwardProps(will.props)
 			action.willUser = c.opts.Username
+			action.willAccount, _ = c.willDestinationAccount()
 			action.willDelayed = delayed
 			if delayed {
 				effDelay := will.props.willDelay
@@ -1783,7 +1792,12 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 	// client-free publisher rather than the immediate path (which writes into
 	// c.mqtt.pp). Same publish core, same bounding.
 	if !action.willDelayed || action.willDue(now) {
+		// The service account this Will's authorization was decided against, taken
+		// from the CAPTURE rather than from the connection as it stands now. The
+		// third writer of an outbox record, and it has to agree with the other two
+		// or the refusal reads an empty field and lets everything through.
 		rec := &mqttWillOutbox{
+			Account:      action.willAccount,
 			ClientIDHash: sess.idHash,
 			Gen:          action.willGen,
 			Topic:        string(action.will.topic),
@@ -1794,7 +1808,7 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 			User:         action.willUser,
 		}
 		if err := asm.deliverWillRecord(s, rec); err != nil {
-			s.Warnf("MQTT: deferred Will for session %q could not be published: %v", sess.id, err)
+			s.retainOrReportOwedWill(asm, rec, err, "the deferred Will for session "+sess.id)
 		}
 		return
 	}
@@ -1810,8 +1824,15 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 	sess.mu.Unlock()
 	// The EXACT client id, not its hash: suppression compares it against an
 	// acceptance fact's client id, and two clients can share a hash.
-	_ = asm.enqueueDelayedWill(s, sess.id, action.willGen, action.will, action.willProps,
-		action.willUser, action.willDeadline, seq, action.willSessEpoch)
+	// The error is not discardable: this action has already been detached from the
+	// connection, so a failed enqueue loses the Will outright. It cannot be
+	// retained anywhere -- the only durable store is the outbox that just refused
+	// -- but it must not vanish silently. Residual 8 in docs/CONFORMANCE.md.
+	if eerr := asm.enqueueDelayedWill(s, sess.id, action.willGen, action.will, action.willProps,
+		action.willUser, action.willDeadline, seq, action.willSessEpoch); eerr != nil {
+		s.Errorf("MQTT: the deferred delayed Will of session %q on %q was NOT enqueued and is lost: %v",
+			sess.id, action.will.topic, eerr)
+	}
 }
 
 // mqttTestDischargeWindowHookV fires after applyDeferredDisconnect's entry check and before

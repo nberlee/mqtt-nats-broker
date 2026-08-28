@@ -22,7 +22,15 @@ func runNATSAuth(t *testing.T) string {
 		Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: t.TempDir(),
 		Users: []*natsserver.User{
 			{Username: "svc", Password: "svcpw"},
-			{Username: "alice", Password: "pw"},
+			// The deny auth passthrough requires of an MQTT identity, carried here so
+			// the fixture matches a supported deployment. The broker cannot enforce
+			// it -- the identity reply is unsigned and lands in the reserved
+			// namespace, so a principal able to publish there can answer for anyone
+			// -- which is why docs/ARCHITECTURE.md states it as a prerequisite.
+			{Username: "alice", Password: "pw", Permissions: &natsserver.Permissions{
+				Publish:   &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{mqttPrefix + ">"}},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}},
+			}},
 		},
 	})
 	if err != nil {

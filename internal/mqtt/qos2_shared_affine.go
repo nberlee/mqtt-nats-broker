@@ -595,24 +595,30 @@ func (as *mqttAccountSessionManager) q2AffClaimForCarriedCopy(claimSubject, carr
 // interleaving, not an error, and it resolves in one retry — and a persistent refusal
 // settles at the cap, which also paces its diagnostics.
 const (
-	mqttQ2AffRefusalBaseDelay = 100 * time.Millisecond
-	mqttQ2AffRefusalMaxDelay  = 30 * time.Second
-	mqttQ2AffRefusalMaxShift  = 12 // 100ms << 12 is already past the cap
+	mqttPacedRefusalBaseDelay = 100 * time.Millisecond
+	mqttPacedRefusalMaxDelay  = 30 * time.Second
+	mqttPacedRefusalMaxShift  = 12 // 100ms << 12 is already past the cap
 )
 
-// mqttQ2AffRefusalNak is a NAK carrying the backoff for a delivery count. Exported as a
-// value rather than sent here so both the gate and the retired settlement use one rule.
-func mqttQ2AffRefusalNak(deliveryCount uint64) []byte {
-	delay := mqttQ2AffRefusalBaseDelay
+// mqttPacedRefusalNak is a NAK carrying the backoff for a delivery count. Returned as a
+// value rather than sent here so every route that hands a message back uses ONE rule:
+// the affine gate, the retired settlement, and the shared-group subscribe deny in
+// mqtt.go. That last one arrived with a fixed 50ms delay of its own and a comment
+// arguing that a PERMANENT refusal has nothing to back off from. The argument was
+// backwards -- permanence is the case the cap above is FOR. A denied sole member
+// re-offered every 50ms with MaxDeliver -1 is the same request storm this backoff was
+// built to stop, reachable by any client permitted to hold such a subscription.
+func mqttPacedRefusalNak(deliveryCount uint64) []byte {
+	delay := mqttPacedRefusalBaseDelay
 	if deliveryCount > 1 {
 		shift := deliveryCount - 1
-		if shift > mqttQ2AffRefusalMaxShift {
-			shift = mqttQ2AffRefusalMaxShift
+		if shift > mqttPacedRefusalMaxShift {
+			shift = mqttPacedRefusalMaxShift
 		}
-		delay = mqttQ2AffRefusalBaseDelay << shift
+		delay = mqttPacedRefusalBaseDelay << shift
 	}
-	if delay > mqttQ2AffRefusalMaxDelay {
-		delay = mqttQ2AffRefusalMaxDelay
+	if delay > mqttPacedRefusalMaxDelay {
+		delay = mqttPacedRefusalMaxDelay
 	}
 	return []byte(fmt.Sprintf("%s {\"delay\":%d}", AckNak, int64(delay)))
 }
@@ -622,7 +628,7 @@ func mqttQ2AffRefusalNak(deliveryCount uint64) []byte {
 // the arms differ in what they could not prove, not in how soon it is worth asking again.
 func (sess *mqttSession) refuseQ2AffCopy(reply string) {
 	_, _, dc, _, _ := ackReplyInfo(reply)
-	sess.jsa.sendMsg(reply, mqttQ2AffRefusalNak(dc))
+	sess.jsa.sendMsg(reply, mqttPacedRefusalNak(dc))
 }
 
 // q2AffCopyIsSupersededIncarnationOf reports whether copySubject is a copy of the SAME
@@ -3148,6 +3154,63 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		// that died in the window — pays the backoff.
 		sess.refuseQ2AffCopy(reply)
 		return
+	}
+
+	// The THIRD subscribe-deny guard, and the one the F-081 dossier does not name.
+	// This copy reaches the client through the SERVICE connection like the other
+	// two service-owned routes, so NATS filters nothing here either.
+	//
+	// It needs its own site, and its own queue, for a reason that is easy to get
+	// wrong: the affine subscription is created with a NIL queue
+	// (processQOS12Sub(..., nil, ...) above), so by the time delivery arrives
+	// sub.queue no longer names the shared group this copy came from. Deriving the
+	// group from the validated claim is the only source that still knows -- and
+	// mqttSharedNames builds the queue, the deliver subject and the durable from
+	// ONE hash, so it is a prefix swap rather than a re-derivation.
+	//
+	// Placed after the claim has been validated (so GroupDurable is trustworthy)
+	// and before trackPublish (so a refusal costs no packet identifier and no
+	// in-flight register).
+	switch queue, ok := mqttSharedQueueFromGroupDurable(claim.GroupDurable); {
+	case !ok:
+		// Provenance we cannot derive is NOT a denial. Acknowledging would consume a
+		// copy we never judged; the paced refusal keeps it and retries, so a
+		// permanently malformed claim is a bounded-rate poison record rather than a
+		// hot loop. Stated in docs/CONFORMANCE.md.
+		cc.Warnf("Affine QoS 2 copy on %q carries an underivable group durable %q; withholding without acknowledging",
+			subject, claim.GroupDurable)
+		sess.refuseQ2AffCopy(reply)
+		return
+	default:
+		// Test seam. The indeterminate arm below cannot be reached from outside:
+		// a resumed client's snapshot is fresh, and every external way of
+		// invalidating it also closes the connection the copy would arrive on.
+		// Nil in production.
+		if gate := mqttTestAffineGateV.Load(); gate != nil {
+			(*gate)(cc)
+		}
+		switch cc.checkDenySubVerdict(string(h.subject), queue) {
+		case mqttSubDeliverDenied:
+			// A proven deny is terminal for this copy: the client may never receive it,
+			// so the affine side is recorded complete and the copy is reaped, exactly as
+			// an ended session's would be. [MQTT-4.8.2-5].
+			//
+			// Terminal means the IDENTIFIER goes too, and it has to go first, in the
+			// same order the expiry and Maximum-Packet-Size disposals below use: the
+			// register is released with the identifier (R5), before the confirmed copy
+			// ack. This copy may well have been transmitted before a disconnect, in
+			// which case the resume restored its identifier and register before any
+			// guard ran, and disposing of the message while keeping them wedges the
+			// session's Receive Maximum for good.
+			sess.releaseTransmittedIdentifier(jsDur, reply)
+			cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
+			return
+		case mqttSubDeliverIndeterminate:
+			// No valid snapshot: withhold, but record NOTHING. AffineDone would assert a
+			// delivery outcome we have not established.
+			sess.refuseQ2AffCopy(reply)
+			return
+		}
 	}
 
 	sess.mu.Lock()

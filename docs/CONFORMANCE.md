@@ -196,47 +196,207 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 
 All are tracked in `docs/ROADMAP.md`.
 
-### A denied PUBLISH is accepted, stored and delivered — OPEN, and NOT ACCEPTED
+### Authorization of the authenticated identity — CLOSED, with residuals
 
-**A defect, not a residual.** An **alpha blocker** (F-079, and F-080 alongside it);
-recorded here because this file describes a broker whose authorization is delegated to
-NATS, and for publishing that delegation does not happen.
+F-079, F-080 and F-081 were three directions of one defect: the broker moved
+delivery and persistence onto the full-rights service connection while keeping
+upstream's client-connection permission hooks as inert stubs, and it never
+learned the authenticated identity's NATS account or permissions at all. It now
+asks, on the client's own connection, with `$SYS.REQ.USER.INFO`. The mechanism
+is in `docs/ARCHITECTURE.md`, "Auth passthrough"; what follows is only what the
+broker still does not promise.
 
-Auth passthrough enforces **subscribe at SUBSCRIBE time**: `processSub` flushes and
-reads `LastError`, so a filter the account denies outright becomes SUBACK 0x80 (see
-*Subscribe failure* above). It does not filter per message, which is F-081. Publish
-has no enforcement at all. A core-NATS publish denial is **asynchronous**, so
-`PublishMsg` returns nil and `processInboundClientMsg` reports
-`permIssue = false` on every path; the `permIssue`
-arm in `mqttInitiateMsgDeliveryJSA` is dead code, and `pubAllowedFullCheck` returns
-`true` unconditionally.
+What changed, against the measurements that opened these findings: a publish the
+account denies is no longer stored in `$MQTT_msgs`, no longer retained, no
+longer held for QoS 2 and no longer acknowledged as success; credentials from
+another NATS account no longer authenticate; and a wildcard subscription
+overlapping a narrower subscribe deny no longer receives QoS 1/2, retained or
+affine shared QoS 2 deliveries on the denied subject.
 
-The live fan-out rides the per-client connection and *is* dropped. Everything else
-proceeds on the full-rights service connection, so the direction of the deviation is:
+**Residual 1 — the permission snapshot is taken at CONNECT and never
+refreshed.** An ACL changed while a client is connected is enforced immediately
+on the routes NATS owns (QoS 0 on a user topic, and SUBSCRIBE admission) and
+only after the client reconnects on the service-owned routes (QoS 1/2 delivery,
+retained replay, and every durable store). There is no NATS notification for a
+permission change, and polling would put a round trip on every delivery while
+still not being atomic with a later service publish. Bounded instead by the
+connection: the snapshot dies with the per-client NATS connection.
 
-- **QoS 1 and QoS 2** — the message is stored in `$MQTT_msgs` and **delivered** to
-  durable subscribers.
-- **Retained, any QoS including 0** — the copy is **persisted** and replayed to future
-  subscribers.
-- **Internally replayed Wills** (delayed, takeover, uncertainty-parked) — additionally
-  **fanned out live**, because they are published by the internal client. An
-  *immediate* Will is not: its core publish rides the client connection and is denied,
-  leaving only its persistence. A non-retained immediate QoS 0 Will has no deviation at
-  all.
+**Residual 2 — an MQTT connection does not survive a per-client NATS
+disconnect.** Because the snapshot's validity is the connection's validity, a
+disconnect or close on the per-client connection closes the MQTT socket. A
+transient NATS outage therefore disconnects MQTT clients that would previously
+have stayed connected. This is deliberate and it is the fail-closed direction:
+before, such a client stayed connected with its QoS 0 traffic silently broken
+and its cached rights still authorizing durable stores.
 
-Separately, the v1 same-account constraint is unenforced: `isClientAuthorized` binds
-only `c.nrc`, never `c.acc`, so credentials from another NATS account authenticate while
-durable state lands in the service account (F-080).
+**Residual 3 — an MQTT 3.1.1 publisher is not told why.** 3.1.1 has no
+per-publish refusal code. [3.3.5.2] permits either a positive acknowledgement or
+closing the network connection; the broker closes the connection, so the client
+learns that something was refused but not which publication or why. MQTT 5
+clients get PUBACK/PUBREC reason 0x87 with a reason string. Note this
+deliberately differs from the reserved-`$MQTT.>` refusal, which still answers a
+3.1.1 client with a success-shaped acknowledgement; both are legal, and matching
+that behaviour here would have preserved the very outcome F-079 reported.
 
-**Measured**, not merely read: with `alice` denied publish on `denied.>`, the NATS
-server logged `Permissions Violation for Publish to "denied.q1"` for every denied
-publish, and the subscriber received the QoS 1 and QoS 2 messages while the QoS 0
-one was dropped. The QoS 1 and QoS 2 publishes were **acknowledged to the publisher
-as success**; QoS 0 has no acknowledgement, and its send merely raised nothing.
+**Residual 4 — the security principal is account plus client ID.** Any
+credentials valid in the account may resume any session in it by presenting its
+client ID, and a QoS 2 exchange held under one identity is completed under
+whatever identity presents the PUBREL. MQTT 5 [4.3.3] / [5.4.2] recommends
+authorizing access to the Client Identifier itself; doing so would require
+persisting the authenticated identity with the session, which the compatibility
+boundary in `docs/ARCHITECTURE.md` rules out. Stated rather than enforced.
 
-**The Paho suite passing is not evidence against this.** Its only publish deny is
-`$MQTT.>`, which `mqttProcessPub` rejects before any store, so the deny never reaches
-the bypass; there is no ordinary-topic publish deny in the conformance config.
+**Not a residual, two deployment requirements - and the second is UNCHECKABLE.**
+The MQTT identity must be able to publish `$SYS.REQ.USER.INFO` (a blanket publish
+deny on `$SYS.>` refuses every CONNECT and cannot be carved back with an allow,
+because NATS evaluates deny before allow). It must also be **denied publish on
+`$MQTT.>`**, and the broker cannot verify that: the identity reply is an unsigned
+account subject whose request is observable to an account subscriber, so a
+principal able to publish there can answer for any client, and every test of the
+claimed permissions is one that forger controls. The deny is therefore a security
+prerequisite of auth passthrough, not an enforced invariant. It is the same deny
+the reserved namespace has always required, and for a stronger reason: such a
+principal can already forge session records directly. See `docs/ARCHITECTURE.md`,
+"Auth passthrough".
+
+**Not a residual, a mode.** With `-auth-passthrough=false` there is no
+per-client identity, so no per-client enforcement exists: every client acts as
+the service identity. The mode assumes that credential is trusted and suitably
+privileged.
+
+**Residual 5 - a refused CONNECT is a bare socket close.** Every refusal above
+routes through `authViolation`, which closes the connection and sends no CONNACK.
+So a client refused for a cross-account credential, an unidentifiable identity or
+an expired one learns only that the socket closed, and cannot tell that from a
+network failure. That is [F-061](findings/runtime-correctness.md#f-061), which
+owns that path and is a post-alpha candidate; it is recorded here so the closure
+above is not read as claiming more than it delivers.
+
+**Residual 6 - a denied QoS 2 PUBLISH costs one JetStream read.** MQTT transfers
+ownership of a message at PUBREC, so a later PUBLISH on the same packet
+identifier must be answered from the existing exchange whatever subject it names.
+The broker therefore cannot refuse a denied QoS 2 subject without first reading
+that identifier's hold to see whether an accepted exchange is there. An
+authenticated but publish-denied client can drive one bounded read per such
+packet. It is one read, no write and no retry, and it requires valid credentials.
+A session-scoped occupancy cache would remove it and is deliberately not built:
+it would be a second source of truth about which identifiers are occupied.
+
+**Residual 7 - the account check is a check, not a transaction, and this is a
+CLASS rather than one window.** Every gate, guard and Will discharge requires the
+service connection to be bound to the account the identity was discovered
+against, and the check is repeated immediately before each durable write - the
+`$MQTT_msgs` store, the retained store, the derived Sparkplug publication and the
+QoS 2 hold CAS. None of those checks is atomic with the write it guards, and
+there is more than one layer that can hold a write in between:
+
+- nats.go's reconnect buffer on the service connection, which holds a publish
+  across a reconnect;
+- the JSA send queue (`mqttJSA.sendq`), which is drained later by the internal
+  service client and carries no record of the account that authorized each entry;
+- the per-client connections' own reconnect buffers, which can hold a live
+  fan-out (not durable state) across a reauthentication.
+
+So a write authorized against one account can, in principle, be emitted after the
+service connection has come back bound to a different one. Closing that
+absolutely needs the authorized account carried through the transport and checked
+at the socket, which is a transport change this item did not take. It is filed as
+F-085 in `docs/ROADMAP.md` §0.5, with the stopping rule stated there.
+
+**Removing one layer was tried and reverted**, and the reason is worth recording:
+disabling the service reconnect buffer narrowed nothing - the send queue behind it
+holds writes just the same - and introduced a reachable regression, because a QoS
+0 Will's publish then fails outright on an ordinary service blip and the outbox
+worker finalizes a Will that was never fanned out. The hazard needs an operator to
+repoint credentials mid-flight; the regression needed only a blip.
+
+**Residual 8 - a Will can still be lost when its authorized account is
+unavailable, but only in the cases named here.** A Will refused because
+`deliverWillRecord`'s account fence cannot establish the destination is now
+RETAINED in memory and published when that same account returns
+(`will_blip_retry.go`), so an ordinary NATS blip no longer destroys it. That was a
+regression this work introduced and it is fixed rather than accepted: an outage is
+an UNKNOWN, and answering it the way a DENY is answered destroys a Will the client
+was entitled to.
+
+What remains lost, and each of these is a deliberate bound rather than an
+oversight:
+
+- **A broker restart or shutdown.** The retention is in memory, and it cannot be
+  otherwise: the only durable park is `$MQTT_willq`, which is exactly what is
+  unreachable while the service connection is down. Shutdown reports every Will it
+  is still holding at error level rather than publishing it, because the
+  destination is still unestablished and publishing into an account nobody has
+  re-identified is the failure that would be worse.
+- **The capacity bound.** A broker holds at most `mqttOwedWillMaxBytes` of Wills
+  across an outage; beyond that the Will is refused and the loss is logged with a
+  running count. A byte bound rather than a count, because the cost is the
+  payloads.
+- **An account that never comes back.** A Will whose account is replaced rather
+  than restored stays parked and is never published into the new one. It is
+  released at shutdown with a log line.
+- **A delayed Will whose enqueue could not reach `$MQTT_willq` at all.** That one
+  is upstream of the fence: there is nothing to retain, because the record was
+  never built. See the enqueue path in `will_outbox.go`.
+
+Only the fence's own refusal is retried. A generic delivery error is not, because
+it can follow a partial effect - a fan-out that reached some subscribers, a store
+that landed - and re-attempting it would duplicate that. Such a Will is reported
+as lost rather than retried.
+
+**Residual 9 - an affine QoS 2 copy whose group cannot be derived is withheld at
+a bounded rate, not disposed of.** The affine delivery guard recovers its queue
+from the claim's group durable, because its own subscription carries none. A
+durable this broker did not generate leaves the guard unable to say whether the
+delivery is denied - and an unknown is not a denial, so the copy is refused
+WITHOUT being acknowledged rather than consumed on a verdict that was never
+reached. A permanently malformed claim therefore redelivers indefinitely, paced
+by the existing refusal backoff. Withholding is the fail-closed direction;
+acknowledging would destroy a message no one judged.
+
+**Residual 10 - a delayed Will whose account never comes back accumulates.**
+`deliverWillRecord` refuses a record whose `Account` is not the one the service
+connection is currently bound to, and leaves it in `$MQTT_willq` rather than
+finalizing it, so that a broker pointed back at the original account still fires
+it. The cost of that choice is the case where it never is: an operator who
+permanently repoints the service credential at a different account leaves every
+record authorized against the old one retrying for as long as the stream keeps it.
+Nothing publishes them and nothing deletes them. Dropping them instead is the
+alternative, and it is worse in the direction that matters - it discards a Will
+the client was entitled to have published, for what may be a transient
+misconfiguration. There is no legacy-record case here: every writer in the tree
+stamps the account it was authorized against, so a mismatch is a live operational
+change and not a persisted shape from an earlier build. See the compatibility
+boundary in `docs/ARCHITECTURE.md`.
+
+**Residual 12 - two of the four Will discharge sites read the authorization
+decision without a fixture that proves it.** The decision is captured at CONNECT
+and read at four sites: the immediate path, the delayed-outbox gate, the
+lost-session-gate route (`mqttPublishOwedWill`), and the uncertainty-parked gate
+in `sess_uncertain.go`. A per-site mutation census - forcing each site's verdict
+to `true` in turn and running the whole suite, tagged and untagged - establishes
+which of those reads are load-bearing in test and which are only asserted in
+prose. The immediate site and the delayed-outbox site each fail their paired
+fixture under that mutation. **The other two survive it**, so for those two the
+claim rests on reading the code, not on a falsifiable test. Both are the same
+one-line read of the same captured flag, and reaching them needs a record-derived
+eviction or a session-record ambiguity respectively - neither drivable from a
+connection. An attempt at the first was written, passed with a live control, and
+was then DELETED, because the mutation showed it was reaching the immediate site
+instead: a fixture that names a route it does not take is worse than an
+acknowledged gap. Filed as F-086 in `docs/ROADMAP.md`.
+
+**Residual 11 - an allowed shared member that joins late waits out the refusal
+backoff.** A group message offered to a member the account denies is handed back
+paced, on the delivery-count backoff, because a sole denied member otherwise loops
+against `MaxDeliver` of -1. The cost is on the other side of that trade: once the
+backoff has settled, a member who joins the group afterwards is not woken by the
+join and is served on the next scheduled re-offer, up to the 30s cap. Nothing is
+lost - the message is still there and still offered - but its delivery to a late
+joiner can be delayed by up to that cap. Waking the consumer on a join would remove
+the delay and needs per-message refusal state that survives nothing; the bounded
+wait was taken instead, and it is stated here rather than implied.
 
 ### Outgoing DUP on a first transmission — OPEN, and NOT ACCEPTED
 

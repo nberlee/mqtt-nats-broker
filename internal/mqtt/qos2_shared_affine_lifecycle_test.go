@@ -8483,28 +8483,28 @@ func TestQ2AffRefusalBackoffIsDerivedFromTheDeliveryCount(t *testing.T) {
 	}
 	// An unparseable reply subject yields delivery count zero, which must not become a
 	// zero delay: that is the immediate NAK by another route.
-	if d := parse(t, mqttQ2AffRefusalNak(0)); d != mqttQ2AffRefusalBaseDelay {
-		t.Fatalf("delivery count 0 paced at %v, want the base delay %v", d, mqttQ2AffRefusalBaseDelay)
+	if d := parse(t, mqttPacedRefusalNak(0)); d != mqttPacedRefusalBaseDelay {
+		t.Fatalf("delivery count 0 paced at %v, want the base delay %v", d, mqttPacedRefusalBaseDelay)
 	}
-	if d := parse(t, mqttQ2AffRefusalNak(1)); d != mqttQ2AffRefusalBaseDelay {
-		t.Fatalf("the first delivery paced at %v, want the base delay %v: the common phase race must retry fast", d, mqttQ2AffRefusalBaseDelay)
+	if d := parse(t, mqttPacedRefusalNak(1)); d != mqttPacedRefusalBaseDelay {
+		t.Fatalf("the first delivery paced at %v, want the base delay %v: the common phase race must retry fast", d, mqttPacedRefusalBaseDelay)
 	}
-	if d := parse(t, mqttQ2AffRefusalNak(2)); d != 2*mqttQ2AffRefusalBaseDelay {
-		t.Fatalf("the second delivery paced at %v, want %v", d, 2*mqttQ2AffRefusalBaseDelay)
+	if d := parse(t, mqttPacedRefusalNak(2)); d != 2*mqttPacedRefusalBaseDelay {
+		t.Fatalf("the second delivery paced at %v, want %v", d, 2*mqttPacedRefusalBaseDelay)
 	}
-	prev := parse(t, mqttQ2AffRefusalNak(2))
+	prev := parse(t, mqttPacedRefusalNak(2))
 	for dc := uint64(3); dc < 40; dc++ {
-		d := parse(t, mqttQ2AffRefusalNak(dc))
+		d := parse(t, mqttPacedRefusalNak(dc))
 		if d < prev {
 			t.Fatalf("the backoff went BACKWARDS at delivery %d: %v after %v", dc, d, prev)
 		}
-		if d > mqttQ2AffRefusalMaxDelay {
-			t.Fatalf("delivery %d paced at %v, past the cap %v", dc, d, mqttQ2AffRefusalMaxDelay)
+		if d > mqttPacedRefusalMaxDelay {
+			t.Fatalf("delivery %d paced at %v, past the cap %v", dc, d, mqttPacedRefusalMaxDelay)
 		}
 		prev = d
 	}
-	if prev != mqttQ2AffRefusalMaxDelay {
-		t.Fatalf("the backoff settled at %v rather than the cap %v, so a sustained refusal never reaches its bound", prev, mqttQ2AffRefusalMaxDelay)
+	if prev != mqttPacedRefusalMaxDelay {
+		t.Fatalf("the backoff settled at %v rather than the cap %v, so a sustained refusal never reaches its bound", prev, mqttPacedRefusalMaxDelay)
 	}
 }
 
@@ -8519,7 +8519,7 @@ func TestQ2AffRefusalBackoffIsDerivedFromTheDeliveryCount(t *testing.T) {
 // same shape for as long as it lasts. So the fixture stages the legitimate version: a live
 // copy whose claim record is simply gone.
 //
-// Paired mutations M45 (return AckNak unchanged from mqttQ2AffRefusalNak) and M46 (send
+// Paired mutations M45 (return AckNak unchanged from mqttPacedRefusalNak) and M46 (send
 // AckNak directly from the claim == nil arm). Either restores the storm and this fixture
 // fails on the count.
 func TestQ2AffSustainedRefusalIsPaced(t *testing.T) {

@@ -852,7 +852,25 @@ var (
 	errMQTTReceiveMaxExceeded           = errors.New("receive maximum exceeded")
 	errMQTTPayloadFormatInvalid         = errors.New("payload format invalid")
 	errMQTTNotAuthorizedToSubscribe     = errors.New("not authorized to subscribe")
-	errMQTTMalformedPacket              = errors.New("malformed packet")
+	// errMQTTPublishNotAuthorized ends the connection. Only a 3.1.1 publisher ever
+	// sees it: MQTT 5 gets reason 0x87 on its PUBACK/PUBREC and stays connected,
+	// while 3.1.1 has no per-publish refusal code and [3.3.5.2] offers the close as
+	// the alternative. See mqttRefuseUnauthorizedPublish.
+	errMQTTPublishNotAuthorized = errors.New("not authorized to publish")
+	// errMQTTQoS2PublishRefused says the QoS 2 store refused the publication AND
+	// has already answered the client. It never reaches the wire: mqttProcessPub
+	// consumes it to suppress the success PUBREC it would otherwise send, and to
+	// leave the Receive Maximum slot free -- a refused exchange holds no quota.
+	errMQTTQoS2PublishRefused = errors.New("qos2 publish refused")
+	// errMQTTServiceEpochMoved says the service connection's account epoch changed
+	// between authorizing a publication and writing it. The write is abandoned
+	// rather than handed to an account it was never authorized against.
+	errMQTTServiceEpochMoved = errors.New("the service connection's account epoch moved before the write")
+	// errMQTTWillFanOutFailed says a QoS 0 publication's fan-out did not leave the
+	// connection. It exists so the delayed-Will worker leaves its outbox record
+	// RETRYABLE instead of finalizing a Will nobody received.
+	errMQTTWillFanOutFailed = errors.New("qos 0 fan-out failed")
+	errMQTTMalformedPacket  = errors.New("malformed packet")
 )
 
 type srvMQTT struct {
@@ -2051,8 +2069,9 @@ type mqttPersistedSession struct {
 // VESTIGIAL: nothing assigns sess.will in production, so the `will` field is
 // always omitted from the record and this shape is never written or read back.
 // The active durable path for a delayed Will is the $MQTT_willq outbox
-// (mqttWillOutbox, will_outbox.go), and THAT is where the F-079 authorization gap
-// bites -- not here.
+// (mqttWillOutbox, will_outbox.go), and THAT is where a Will's authorization is
+// carried -- a record there exists only because the decision passed at CONNECT.
+// Not here.
 type mqttPersistedWill struct {
 	Topic  string `json:"topic"`
 	Msg    []byte `json:"msg,omitempty"`
@@ -6875,7 +6894,10 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 						c.traceOutOp("MAPPINGS", fmt.Appendf(nil, "%s -> %s", c.pa.mapped, c.pa.subject))
 					}
 				}
-				c.processInboundClientMsg(msg)
+				// nil: this is the JSA send loop, not an application publication.
+				// There is no MQTT publish to retain, and the internal client has
+				// c.mqtt == nil so the hook is skipped either way.
+				c.processInboundClientMsg(msg, nil)
 				c.flushClients(0)
 			}
 			sendq.recycle(&pmis)
@@ -8786,15 +8808,14 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 				return
 			}
 		}
-		// A broad wildcard subscription can overlap a subscribe deny clause.
-		// DEAD GUARD: mperms has no writer anywhere and checkDenySub is a stub
-		// returning false, so this never fires and the overlapped subject IS
-		// delivered. Retained replay rides the service connection, so nothing else
-		// filters it either. F-081.
-		c.mu.Lock()
-		denied := c.mperms != nil && c.checkDenySub(string(subj))
-		c.mu.Unlock()
-		if denied {
+		// A broad wildcard subscription can overlap a subscribe deny clause, and
+		// retained replay rides the SERVICE connection, so NATS does not filter it
+		// -- this guard is the only thing that does. F-081.
+		//
+		// Both non-allow verdicts return, and here they need no other disposal:
+		// nothing has been allocated yet (the packet identifier is taken below), so
+		// there is nothing to release and no JetStream delivery to acknowledge.
+		if c.checkDenySubVerdict(string(subj), string(sub.queue)) != mqttSubDeliverAllow {
 			return
 		}
 		var pi uint16
@@ -11991,10 +12012,34 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		}
 		return ErrAuthentication
 	}
-	// Authenticated -- but NOT account-bound. isClientAuthorized only replaces
-	// c.nrc; c.acc was set to the synthetic global account BEFORE authentication and
-	// is what selects the session manager on the next line, so credentials valid in
-	// another NATS account still land here. F-080.
+	// Authenticated AND account-bound: isClientAuthorized refused the CONNECT
+	// unless the identity's own NATS account is the service account, which is the
+	// v1 same-account constraint docs/ARCHITECTURE.md states. F-080.
+	//
+	// Capture the Will's authorization HERE, while the snapshot is provably valid
+	// and the connection still exists. Every site that discharges a Will -- the
+	// delayed and takeover gates, the uncertainty-parked gate, and the immediate
+	// path -- runs inside mqttHandleClosedClient, long after the connection has
+	// gone and therefore after the snapshot has been invalidated. Asking at those
+	// sites would suppress an AUTHORIZED Will on every NATS blip, which is the
+	// opposite of what an authorization fix should do. Recording the answer once,
+	// at the only moment it is well defined, is also why the durable outbox record
+	// can be read as evidence: it now embodies a decision that was actually taken.
+	//
+	// Over the FULL effective-subject set, so a Will on a Sparkplug birth topic is
+	// judged on its derived certificate subject too. Spec5 [3.1.3.2].
+	c.mu.Lock()
+	if cp.will != nil {
+		c.willAuthorized = c.mqttPublicationAuthorizedLocked(&mqttPublish{
+			topic:   cp.will.topic,
+			subject: cp.will.subject,
+			mapped:  cp.will.mapped,
+		})
+		if !c.willAuthorized {
+			c.Warnf("Will on %q is not authorized for this identity; it will not be published", cp.will.topic)
+		}
+	}
+	c.mu.Unlock()
 	// Get the account's level MQTT sessions manager. If it does not exists yet,
 	// this will create it along with the streams where sessions and messages
 	// are stored.
@@ -14145,6 +14190,8 @@ func mqttDisconnectReasonFromErr(err error) byte {
 		return mqttReasonReceiveMaxExceeded
 	case errors.Is(err, errMQTTPayloadFormatInvalid):
 		return mqttReasonPayloadFormatInvalid
+	case errors.Is(err, errMQTTPublishNotAuthorized):
+		return mqttReasonNotAuthorized
 	case errors.Is(err, errMQTTSessionOwnershipUnsettled):
 		// Nothing arbitrated the ownership question, so this is "try again later", not
 		// 0x8E: a takeover nobody proved must not be announced as one. See
@@ -14237,21 +14284,30 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 		// suppression is decided by comparing it against an acceptance fact's client
 		// id, and two clients can share a hash.
 		clientID := c.mqtt.cid
-		// A delayed Will cannot re-check publish permissions at fire time (they are
-		// not serializable), so they are evaluated now -- the intent being to never
-		// enqueue a denied Will. That intent is NOT met: pubAllowedFullCheck is
-		// hardcoded to true, so willAllowed is always true and a denied Will is
-		// enqueued and later replayed through the internal client. F-079.
-		willAllowed := c.pubAllowedFullCheck(string(will.subject), false, true)
+		// A delayed Will cannot re-check publish permissions at fire time, so the
+		// decision taken at CONNECT is what governs -- and it is READ here, not
+		// re-derived. By this point the connection is gone and its snapshot has been
+		// invalidated, so re-deriving would refuse every Will rather than the denied
+		// ones. See the capture in mqttProcessConnect. F-079.
+		willAllowed := c.willPublishAuthorized()
 		c.mu.Unlock()
 		// Record the Will on the durable outbox ($MQTT_willq) so a surviving
 		// replica fires it if this broker exits during the delay. Every replica's
 		// claim loop drives it to publication once FireAt passes; a reconnect
 		// cancels it. See will_outbox.go. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
 		if asm != nil && willAllowed {
-			// enqueueDelayedWill retries internally and logs on exhausted retries;
-			// there is nothing further to do on the disconnect path.
-			_ = asm.enqueueDelayedWill(s, clientID, sessGen, will, props, user, fireAt, originSessionSeq, originSessEpoch)
+			// enqueueDelayedWill retries internally and logs on exhausted retries.
+			// One failure it CANNOT retry is an unestablished service account: the
+			// Will has already been taken off the connection, and the only durable
+			// place to park the obligation is the outbox, which is exactly what is
+			// unreachable in that state. So the Will is lost, and the one thing that
+			// must not happen is losing it QUIETLY -- the alternative, publishing it
+			// into an account it was never authorized for, is worse. Stated as a
+			// residual in docs/CONFORMANCE.md.
+			if eerr := asm.enqueueDelayedWill(s, clientID, sessGen, will, props, user, fireAt, originSessionSeq, originSessEpoch); eerr != nil {
+				s.Errorf("MQTT: the delayed Will of client %q on %q was NOT enqueued and is lost: %v",
+					clientID, will.topic, eerr)
+			}
 		}
 		return
 	}
@@ -14269,7 +14325,71 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	// pp is the shared publish struct; replace any properties left over from
 	// the client's last PUBLISH with the Will's own. Spec5 [3.1.3.2].
 	pp.props = mqttWillForwardProps(will.props)
+	// The IMMEDIATE Will is not one of the three capture gates and writes no
+	// outbox record, so "the record embodies the decision" says nothing about it:
+	// it needs the decision read directly. Unlike the other three its core publish
+	// does ride c.nrc and so is dropped by NATS -- but its persistence and, for a
+	// Sparkplug birth topic, its derived certificate effect do not, which is
+	// exactly the bypass. F-079.
+	allowed := c.willPublishAuthorized()
 	c.mu.Unlock()
+	if !allowed {
+		return
+	}
+	// The originating connection publishes this Will -- EXCEPT when that connection
+	// is the reason there is a Will at all.
+	//
+	// A per-client NATS loss is now an unclean disconnect, so it discharges the
+	// Will; but the immediate path fans out through c.nrc, which on that trigger is
+	// the connection that just died. PublishMsg then fails, processInboundClientMsg
+	// returns before the retained hook, and a QoS 0 Will is simply gone -- fired in
+	// name only. A QoS 1/2 Will survives because its store carries it, which is why
+	// the paired fixture did not catch this.
+	//
+	// So an unusable connection hands the Will to the client-free route instead: the
+	// same one a delayed or owed Will takes, carrying the account its authorization
+	// was decided against and checked again there.
+	// WHERE AN IDENTITY GOVERNS, the immediate Will ALWAYS takes the client-free
+	// route -- there is no "publish it ourselves if the connection still looks
+	// alive" branch, because that branch cannot be made safe. Any check of the
+	// snapshot has to release c.mu before publishing, and revocation in that
+	// interval puts us back where we started: production connections reconnect
+	// without limit, so PublishMsg may buffer the Will and send it after
+	// REAUTHENTICATION, possibly into another account, or fail and silently lose a
+	// QoS 0 Will that has no store to fall back on.
+	//
+	// So the branch is deleted rather than tightened. One path, carrying the
+	// account the decision was made for and re-checked at discharge. The cost is
+	// that under auth passthrough an immediate Will is fanned out by the internal
+	// client rather than the client's own connection, so NATS no longer filters it
+	// -- which is precisely what the broker's own gate now does, and the reason this
+	// item exists.
+	//
+	// With no identity governing there is nothing to cross and no snapshot to
+	// revoke, so that mode keeps publishing exactly as it always did. Without this
+	// distinction every immediate Will on a broker running -auth-passthrough=false
+	// would be diverted, which is what TestMQTTWillRetain caught.
+	c.mu.Lock()
+	governed := c.mqttAuthzApplies()
+	svcAccount, svcOK := c.willDestinationAccount()
+	c.mu.Unlock()
+	if governed {
+		if !svcOK {
+			c.Warnf("Not publishing the immediate Will on %q: its authorized destination is not known", will.topic)
+			return
+		}
+		asm := c.mqtt.asm
+		if asm == nil {
+			c.Errorf("Unable to publish the immediate Will on %q: no account manager is available to carry it", will.topic)
+			return
+		}
+		rec := &mqttWillOutbox{WillID: nuid.Next(), Account: svcAccount}
+		willOutboxMessage(rec, will, pp.props, c.opts.Username)
+		if derr := asm.deliverWillRecord(s, rec); derr != nil {
+			s.retainOrReportOwedWill(asm, rec, derr, "the immediate Will")
+		}
+		return
+	}
 	// A Will is server-originated: no No Local origin, matching the delayed Will
 	// path so suppression does not depend on the Will Delay Interval. Spec5 [3.8.3.1].
 	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_)
@@ -14300,20 +14420,36 @@ func (s *Server) mqttPublishOwedWill(c *client, asm *mqttAccountSessionManager) 
 	}
 	will, _ := c.mqttTakeWillLocked()
 	user := c.opts.Username
-	// The internal account client publishes with permissions of its own, so the
-	// dying connection's are checked here, while it is still around to ask —
-	// exactly as the delayed path does before it enqueues, and just as vacuously:
-	// pubAllowedFullCheck is hardcoded to true, so this never withholds a Will the
-	// account's ACL denies. F-079.
-	allowed := will != nil && c.pubAllowedFullCheck(string(will.subject), false, true)
+	// The internal account client publishes with authority of its own, so this
+	// Will is governed by the decision captured at CONNECT and read here. Asking
+	// now would refuse every Will rather than the denied ones: this runs on the
+	// teardown path, where the dying connection's snapshot is already invalid.
+	// F-079.
+	allowed := will != nil && c.willPublishAuthorized()
 	c.mu.Unlock()
 	if will == nil || !allowed {
 		return
 	}
-	rec := &mqttWillOutbox{WillID: nuid.Next(), Account: asm.jsa.c.acc.GetName()}
+	// Account is the SERVICE account this Will's authorization was decided
+	// against, and deliverWillRecord refuses a record naming a different one -- so
+	// it must be the same value enqueueDelayedWill records, not the synthetic
+	// account this manager is keyed on. An indeterminate service account means we
+	// cannot say what we would be authorizing, so the Will is not published.
+	// The account this Will's authorization was CAPTURED against, carried from the
+	// connection rather than sampled from the broker now. Sampling would bind the
+	// record to whatever the service connection happens to be pointing at during a
+	// teardown, which is precisely the moment least likely to be settled.
+	c.mu.Lock()
+	svcAccount, svcOK := c.willDestinationAccount()
+	c.mu.Unlock()
+	if !svcOK {
+		c.Warnf("Not publishing the owed Will: its authorized destination is not known")
+		return
+	}
+	rec := &mqttWillOutbox{WillID: nuid.Next(), Account: svcAccount}
 	willOutboxMessage(rec, will, mqttWillForwardProps(will.props), user)
 	if err := asm.deliverWillRecord(s, rec); err != nil {
-		c.Errorf("Unable to publish the Will of a session taken over mid-disconnect: %v", err)
+		s.retainOrReportOwedWill(asm, rec, err, "the Will of a session taken over mid-disconnect")
 	}
 }
 
@@ -14949,6 +15085,31 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		}
 	}
 
+	// AUTHORIZATION, and it goes here for two reasons. It is ahead of every
+	// durable effect -- the $MQTT_msgs store, the retained store and the QoS 2
+	// hold all hang off the switch below -- and it is over the publication's FULL
+	// effective-subject set, so a Sparkplug birth cannot smuggle its derived
+	// certificate subject past a check that only looked at what the client named.
+	//
+	// QoS 2 is excluded here on purpose. An occupied packet identifier is not a new
+	// publication at all: MQTT transfers ownership at PUBREC, so a later
+	// same-identifier PUBLISH before PUBREL must be answered with PUBREC and no
+	// second delivery, WHATEVER subject it names. Checking its subject here would
+	// let a deliberately-denied subject reject an exchange the broker already owns,
+	// so the QoS 2 gate lives inside mqttStoreQoS2MsgOnce, on the path that has
+	// established the hold is new. F-079.
+	// Test seam. Parks a PUBLISH that has been PARSED but not yet authorized, which
+	// is the only window in which "the snapshot was revoked while an operation was
+	// already in hand" can be observed. Without it, closing the socket and revoking
+	// the snapshot are indistinguishable -- the socket close alone satisfies every
+	// other assertion, so a broker that only closed would pass. Nil in production.
+	if h := mqttTestPublishGatePauseV.Load(); h != nil {
+		(*h)()
+	}
+	if qos != 2 && !c.mqttPublicationAuthorized(pp) {
+		return c.mqttRefuseUnauthorizedPublish(pp, qos, trace)
+	}
+
 	switch qos {
 	case 0:
 		return s.mqttInitiateMsgDelivery(c, pp, origin)
@@ -14975,6 +15136,10 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		// sender receives the PUBREC packet, ownership of the Application
 		// Message is transferred to the receiver.
 		err := s.mqttStoreQoS2MsgOnce(c, pp)
+		if errors.Is(err, errMQTTQoS2PublishRefused) {
+			// Already answered with PUBREC 0x87, no hold created, no quota charged.
+			return nil
+		}
 		if err == nil {
 			// A success PUBREC leaves the client's quota slot occupied until the
 			// matching PUBREL frees it. A DUP re-store returns nil too, so re-adding
@@ -15077,7 +15242,7 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		c.mqtt.pubOrigin = _EMPTY_
 	}()
 
-	_, permIssue := c.processInboundClientMsg(natsMsg)
+	fannedOut, permIssue := c.processInboundClientMsg(natsMsg, pp)
 	if permIssue {
 		return nil
 	}
@@ -15085,6 +15250,17 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
 	// JetStream under "$MQTT.msgs.<delivery-subject>"
 	if qos := mqttGetQoS(pp.flags); qos == 0 {
+		// A QoS 0 publication has NO durable copy, so the fan-out above is the only
+		// thing that happened -- and its failure has to reach the caller, because
+		// one caller acts on the answer. A delayed Will's worker finalizes and
+		// DELETES its outbox record when this returns nil, so reporting success for
+		// a fan-out that never left the socket loses the Will permanently. The
+		// reconnect buffer covers a connection that is merely reconnecting; a
+		// terminally closed one (repeated reconnect authentication failures, say)
+		// fails outright, and that is the case this reports.
+		if !fannedOut {
+			return errMQTTWillFanOutFailed
+		}
 		return nil
 	}
 
@@ -15107,6 +15283,23 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	}
 	jsa.subsBarrier.wait(barrierAbort)
 
+	// Re-checked immediately before the durable write, not only at the gate. The
+	// gate ran before the live fan-out and the subs barrier, and the service epoch
+	// can have moved in between -- a write authorized against one incarnation of the
+	// service account must not be handed to another. This narrows the window to the
+	// store's own round trip; what remains is stated in docs/CONFORMANCE.md, because
+	// nats.go can buffer a publish across a reconnect and no check here can unsend
+	// it.
+	// Test seam. Parks a publication that has ALREADY passed the authorization gate
+	// and is about to be written durably, which is the only window the final fence
+	// covers and the gate does not. Without it a mutation that drops the fence's
+	// validity half survives, because the gate refuses first. Nil in production.
+	if h := mqttTestDurableWritePauseV.Load(); h != nil {
+		(*h)()
+	}
+	if !c.serviceEpochStillOurs() {
+		return errMQTTServiceEpochMoved
+	}
 	_, err := jsa.storeMsg(mqttStreamSubjectPrefix+string(c.pa.subject), headerLen, natsMsg)
 
 	return err
@@ -15144,6 +15337,49 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 	asm := c.mqtt.asm
 	subject := c.mqttQoS2InternalSubject(pp.pi)
 
+	// AUTHORIZATION for QoS 2, and the ordering below is forced by the protocol
+	// rather than chosen.
+	//
+	// MQTT transfers ownership of the message to the receiver at PUBREC, so a
+	// later PUBLISH on the SAME identifier before PUBREL must be answered with
+	// PUBREC and must not deliver again -- whatever subject it carries. An
+	// unconditional subject check ahead of everything would therefore let a
+	// deliberately-denied subject reject an exchange the broker already owns.
+	//
+	// So: the incoming subject is evaluated LOCALLY first, with no I/O. Allowed,
+	// and the ordinary CAS-and-reconcile path below runs untouched. Denied, and
+	// only then is the identifier's hold read -- solely to ask whether this is an
+	// already-accepted exchange rather than a new publication.
+	//
+	// The cost is one bounded read per denied QoS 2 PUBLISH from an authenticated
+	// client. It buys the protocol rule; it is stated in docs/CONFORMANCE.md rather
+	// than hidden.
+	if !c.mqttPublicationAuthorized(pp) {
+		rec, _, lerr := asm.loadQoS2Record(subject)
+		switch {
+		case lerr != nil:
+			// Indeterminate. Never guessed either way: no authorization, no CAS, no
+			// PUBREC. The client retries and the exchange is still whatever it was.
+			return lerr
+		case rec != nil && rec.state == mqttQoS2Held:
+			// An exchange this broker already accepted. Answer it from the HOLD; the
+			// incoming subject is not used, not stored, and not authorized.
+			return nil
+		default:
+			// Absent, done or corrupt: there is no accepted exchange to protect, so
+			// this is a new publication and it is refused. Nothing is mutated and
+			// nothing is reaped -- a denied publish must not be able to reap another
+			// exchange's record.
+			if rerr := c.mqttRefuseUnauthorizedPublish(pp, 2, false); rerr != nil {
+				return rerr // 3.1.1: closes the connection
+			}
+			// v5: PUBREC 0x87 has been sent by the refusal. The sentinel stops the
+			// caller sending a SECOND, success-shaped PUBREC and stops it charging the
+			// Receive Maximum slot for an exchange that does not exist.
+			return errMQTTQoS2PublishRefused
+		}
+	}
+
 	// The record's immutable identity for the whole exchange: it gates the terminal
 	// CAS (invariant 1) and becomes the onward store's Nats-Msg-Id. Generated once
 	// per PUBLISH, never rewritten.
@@ -15163,6 +15399,12 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 
 	var lastErr error
 	for attempt := 0; attempt < mqttQoS2StoreAttempts; attempt++ {
+		// Re-checked on every attempt, not once: the loop can span several round trips and
+		// the service account must still be the one this publication was authorized
+		// against at the moment the hold is actually created.
+		if !c.serviceEpochStillOurs() {
+			return errMQTTServiceEpochMoved
+		}
 		_, err := asm.storeQoS2HoldCAS(subject, 0, headerLen, natsMsg)
 		if err == nil {
 			return nil // freshly held; PUBREC
@@ -15573,8 +15815,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 // subscriptions that match the subject.
 //
 // Invoked from the MQTT publisher's readLoop. No client lock is held on entry.
-func (c *client) mqttHandlePubRetain() {
-	pp := c.mqtt.pp
+func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 	retainMQTT := mqttIsRetained(pp.flags)
 	isBirth, _, isCertificate := sparkbParseBirthDeathTopic(pp.topic)
 	retainSparkbBirth := isBirth && !isCertificate
@@ -15660,6 +15901,21 @@ func (c *client) mqttHandlePubRetain() {
 		rm.Flags |= mqttPubFlagRetain
 
 		if pp.sz > 0 {
+			// The derived certificate publication is an application-visible effect
+			// in its own right, and it happens BEFORE the retained store below, so
+			// the store's fence cannot retract it. Fenced here for the same reason
+			// and on the same terms.
+			// Test seam, for the same reason the durable-write one exists: this fence
+			// covers the window between the authorization gate and THIS send, and
+			// the gate refuses first, so without a pause here a mutation removing
+			// the fence survives. Nil in production.
+			if h := mqttTestDerivedSendPauseV.Load(); h != nil {
+				(*h)()
+			}
+			if !c.serviceEpochStillOurs() {
+				c.Warnf("Abandoning the derived Sparkplug publication on %q: the authorizing identity is no longer valid for this account", key)
+				return
+			}
 			// Copy the payload out of pp since we will be sending the message
 			// asynchronously.
 			msg := make([]byte, pp.sz)
@@ -15679,6 +15935,14 @@ func (c *client) mqttHandlePubRetain() {
 	// $sparkplug subject for sparkB.
 	rm.Subject = key
 	rmBytes, hdr := mqttEncodeRetainedMessage(rm) // will copy the payload bytes
+	// The retained store is its own durable write, and for a QoS 0 retained
+	// publish it is the ONLY one -- that path returns before the $MQTT_msgs store
+	// and its check. Fenced here for the same reason: a copy authorized against one
+	// service account must not be written into another.
+	if !c.serviceEpochStillOurs() {
+		c.Warnf("Abandoning the retained store for %q: the service account changed after it was authorized", key)
+		return
+	}
 	resp, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, hdr, rmBytes)
 	if err != nil {
 		c.mu.Lock()
@@ -16774,16 +17038,61 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		return
 	}
 
-	// A broad wildcard subscription can overlap a subscribe deny clause.
-	// DEAD GUARD: mperms has no writer anywhere and checkDenySub is a stub
-	// returning false, so this never fires. QoS 1/2 delivery rides the service
-	// connection, so the overlapped subject IS delivered. F-081.
-	cc.mu.Lock()
-	denied := cc.mperms != nil && cc.checkDenySub(strippedSubj)
-	cc.mu.Unlock()
-	if denied {
+	// A broad wildcard subscription can overlap a subscribe deny clause, and QoS
+	// 1/2 delivery rides the SERVICE connection, so NATS does not filter it --
+	// this guard is the only thing that does. F-081.
+	//
+	// The two non-allow verdicts are disposed of DIFFERENTLY, and that asymmetry is
+	// the point. A proven deny is a fact about the message: it will never become
+	// deliverable to this filter, so it is acknowledged, or the JS consumer
+	// redelivers it forever. An indeterminate verdict is a fact about US -- no valid
+	// snapshot -- so the message is left unacknowledged and AckWait keeps it for the
+	// client's next connection. Acking it would satisfy "not delivered" by DESTROYING
+	// it.
+	switch cc.checkDenySubVerdict(strippedSubj, string(sub.queue)) {
+	case mqttSubDeliverDenied:
 		sess.mu.Unlock()
+		// TERMINAL only for a subscription nobody else can serve. On a SHARED
+		// subscription the group consumer picked this member without consulting its
+		// ACL, so acknowledging here would consume the group's message on behalf of
+		// members who ARE allowed it -- turning one member's deny into data loss for
+		// the whole group. Hand it back instead, paced, so the group can offer it to
+		// someone else; upstream NATS gets the same outcome by filtering denied
+		// queue members before selection, which this port cannot do because the
+		// selection happens on the service connection.
+		//
+		// Whether it is acked away or handed back, this session is not going to
+		// deliver it, so an identifier a PREVIOUS transmission left behind is
+		// released here. The guard sits before trackPublish so a refusal costs no
+		// NEW identifier -- but a message transmitted before a disconnect leaves a
+		// durable register that the resume restores into the tracking maps before
+		// any guard runs, and holding it counts against Receive Maximum for the
+		// life of the session. Nothing below this point can free it: the deny
+		// returns. Note the INDETERMINATE arm deliberately does not do this --
+		// it decides nothing, and freeing an identifier is a decision.
+		sess.releaseTransmittedIdentifier(sub.mqtt.jsDur, reply)
+		if sub.mqtt.shared {
+			// Handed back PACED, on the same backoff the affine refusals use, and
+			// that shared rule is load-bearing rather than tidiness. When an allowed
+			// member is present the hand-back is one fast retry and the group serves
+			// it -- the base delay keeps that case prompt. When the denied member is
+			// the ONLY one, there is no eligible member to hand it to and no event
+			// that resolves it, so a fixed delay is not a retry: it is an unbounded
+			// loop against `MaxDeliver` of -1, at whatever rate the constant picks,
+			// driven by any client permitted to hold such a subscription and
+			// multiplied by every message it can accumulate. A permanent refusal is
+			// exactly what the cap is for. The delay comes from JetStream's own
+			// delivery count for this message, so no per-message state is kept: the
+			// first refusal is fast, a persistent one settles at the cap, and a
+			// member who later joins is still served on the next re-offer.
+			_, _, dc, _, _ := ackReplyInfo(reply)
+			sess.jsa.sendMsg(reply, mqttPacedRefusalNak(dc))
+			return
+		}
 		sess.jsa.sendAck(reply)
+		return
+	case mqttSubDeliverIndeterminate:
+		sess.mu.Unlock()
 		return
 	}
 
@@ -16848,7 +17157,18 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// Unconditional, deliberately: there is no "only if this delivery already
 	// started" test, because `started` reads in-memory tracking maps that say
 	// nothing after a restart, a failover, or on another broker.
+	//
+	// Re-checked here because the move is IRREVERSIBLE and takes several round
+	// trips: it claims durable ownership of the message for this session. The guard
+	// above ran before all of that, so an identity revoked in between would
+	// otherwise acquire ownership it is no longer entitled to. An indeterminate
+	// answer withholds without acknowledging, exactly as the guard's own
+	// indeterminate arm does -- the message must survive for the next connection.
 	if sub.mqtt.shared && qos == 2 {
+		if cc.checkDenySubVerdict(strippedSubj, string(sub.queue)) != mqttSubDeliverAllow {
+			sess.mu.Unlock()
+			return
+		}
 		groupDurable := sub.mqtt.jsDur
 		sess.mu.Unlock()
 		var props []byte

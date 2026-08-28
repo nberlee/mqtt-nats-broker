@@ -7,9 +7,10 @@
 //     (stream/consumer create, message store/load) — the transport that the
 //     ported mqttJSA layer plugs into;
 //   - a per-MQTT-client dial (Auth passthrough) so that NATS enforces
-//     authorization for each MQTT client's subscriptions. Publish authorization
-//     is NOT enforced today -- a core-NATS denial is asynchronous and is not
-//     observed, and the durable stores ride the service connection (F-079).
+//     authorization for each MQTT client's subscriptions, and so the MQTT layer
+//     can discover that client's account and permissions and police the routes
+//     NATS cannot see -- the durable stores and QoS 1/2 delivery ride the service
+//     connection, not this one.
 package backend
 
 import (
@@ -78,6 +79,22 @@ func serviceOptions(cfg *config.Config) []nats.Option {
 		nats.Name(cfg.NATSName),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(time.Second),
+		// The reconnect buffer is KEPT, and the reasoning is recorded because it was
+		// removed once and put back.
+		//
+		// Removing it was an attempt to make "an authorized write cannot cross a
+		// service-account epoch" absolute: a buffered publish can be accepted while
+		// the link is up and flushed after a reconnect, so if the connection came back
+		// bound to a different account the write lands somewhere it was never
+		// authorized for. But the buffer is only the outermost of several layers that
+		// can hold a write across a reconnect -- the JSA send queue behind it does the
+		// same -- so removing it narrowed nothing and COST something reachable: with no
+		// buffer, a service blip makes a QoS 0 Will's publish fail immediately, and the
+		// outbox worker then finalizes a Will that was never fanned out. An operator
+		// repointing credentials mid-flight is rare; a NATS blip is not.
+		//
+		// The cross-epoch window is therefore a stated residual rather than something
+		// this layer pretends to close. See docs/CONFORMANCE.md.
 		nats.ReconnectBufSize(16 * 1024 * 1024),
 	}
 	if cfg.NATSCreds != "" {
@@ -101,10 +118,13 @@ func (b *Backend) JetStream() jetstream.JetStream { return b.js }
 //
 // The returned connection carries that client's NATS authorization; the client's
 // MQTT publishes and subscriptions ride it so NATS can enforce per-client
-// permissions. Enforcement is real for SUBSCRIBE; for PUBLISH the denial is
-// asynchronous and unobserved, so it does not gate the durable stores, which ride
-// the service connection anyway (F-079). Close it when the MQTT client
-// disconnects.
+// permissions, and the MQTT layer asks it who it is so it can enforce the rest
+// itself. Close it when the MQTT client disconnects.
+//
+// MaxReconnects(-1) means this connection outlives an outage and RE-AUTHENTICATES
+// on each reconnect, possibly under changed permissions -- which is why the MQTT
+// layer ties its identity snapshot to this connection's liveness rather than
+// caching it for the session (see authz_identity.go).
 func (b *Backend) DialClient(clientID, user, pass string) (*nats.Conn, error) {
 	if user == "" {
 		user, pass = b.cfg.DefaultUser, b.cfg.DefaultPass

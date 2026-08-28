@@ -5,6 +5,7 @@ package mqtt
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -50,6 +51,16 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 // Start begins listening for MQTT connections. It returns any listener setup
 // error (Fatalf in the shim only logs).
 func (s *Server) Start() error {
+	// Before the listener, never after it. Under auth passthrough every CONNECT is
+	// judged against the account the broker's own streams ride, so a listener
+	// opened first would accept connections the broker cannot yet judge -- a
+	// window, not a theoretical one, since the identity request is a round trip.
+	// See authz_identity.go.
+	if s.dialClient != nil {
+		if err := s.establishServiceIdentity(); err != nil {
+			return fmt.Errorf("MQTT auth passthrough: %w", err)
+		}
+	}
 	s.startMQTT()
 	if s.mqtt.listenerErr != nil {
 		return s.mqtt.listenerErr
@@ -185,6 +196,11 @@ func (s *Server) runShutdown() {
 
 	// Phase 3: wait for publisher workers (and tracked control ops) to complete.
 	s.willWorkerWG.Wait()
+
+	// Anything still held for a service account that never came back. Reported
+	// rather than published: the destination is still unestablished, and the whole
+	// point of the fence is not to publish into an account nobody has identified.
+	s.discardOwedImmediateWills()
 
 	// Phase 4: stop JSA/account infrastructure and remaining background goroutines.
 	s.mu.Lock()

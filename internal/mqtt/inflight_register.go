@@ -1573,6 +1573,50 @@ func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending) {
 	sess.asm.deleteInflightRegister(ack.regSeq)
 }
 
+// releaseTransmittedIdentifier releases the packet identifier that a PREVIOUS
+// transmission of this source left behind, for a terminal path that has decided the
+// client will never be sent it.
+//
+// It exists because the subscribe-deny guards are deliberately placed BEFORE
+// trackPublish, so that a refusal costs no NEW identifier and no new register. That
+// placement says nothing about an identifier the delivery did not allocate: a copy
+// transmitted before a disconnect leaves a durable in-flight register, and the resume
+// restores it into pendingPublish and cpending before any guard runs. A terminal
+// denial that only disposed of the message would leave that entry standing forever --
+// counted by qos12InflightForCap, so with a Receive Maximum of 1 the session's whole
+// quota is consumed and every later ALLOWED delivery is withheld silently, for the
+// life of the session. Nothing on the wire says so, and non-delivery of the DENIED
+// message looks identical.
+//
+// Only for TERMINAL dispositions. A withheld-but-still-owed message keeps its
+// identifier: it will be offered again, and reusing the identifier the register
+// already names is what keeps one message in flight under one identity.
+//
+// Session lock NOT held on entry: deleteInflightRegisterFor issues a JetStream request.
+func (sess *mqttSession) releaseTransmittedIdentifier(jsDur, reply string) {
+	if jsDur == _EMPTY_ || reply == _EMPTY_ {
+		return
+	}
+	sseq, _, _, _, _ := ackReplyInfo(reply)
+	sess.mu.Lock()
+	var removed *mqttPending
+	if sseqToPi := sess.cpending[jsDur]; sseqToPi != nil {
+		if pi := sseqToPi[sseq]; pi != 0 {
+			// Two identifiers this must not take. One the PUBREL phase owns: the
+			// PUBLISH side of that exchange is already complete and its identifier is
+			// not ours to free -- the same precedence trackPublish applies. And one
+			// whose register store is still in flight (R1), which cannot be a restored
+			// entry and therefore was not ours to begin with.
+			_, asRel := sess.pendingPubRel[pi]
+			if cur := sess.pendingPublish[pi]; !asRel && cur != nil && !cur.regPending {
+				removed = sess.untrackPublishEntry(pi)
+			}
+		}
+	}
+	sess.mu.Unlock()
+	sess.deleteInflightRegisterFor(removed)
+}
+
 // markInflightRegisterRetired rewrites a register as RETIRED, in place, by a CAS at its
 // exact sequence, and reports the sequence it now occupies.
 //

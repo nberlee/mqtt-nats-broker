@@ -1797,50 +1797,128 @@ the README currently reports as supported. They remain blockers independently of
 the HA-scope decision except where the dossier explicitly requires a remote
 takeover.
 
-- [ ] [F-079: A denied publish is accepted, stored and
-  delivered](findings/runtime-correctness.md#f-079). Auth passthrough enforces
-  subscribe (`processSub` flushes and reads `LastError`, giving SUBACK 0x80) but not
-  publish: a core-NATS denial is asynchronous, so `PublishMsg` observes nothing,
-  `processInboundClientMsg` always reports `permIssue = false`, and
-  `mqttInitiateMsgDeliveryJSA`'s `permIssue` arm is dead code. `pubAllowedFullCheck`
-  returns `true` unconditionally by design, because NATS was supposed to enforce.
-  Everything that does not ride the per-client `c.nrc` therefore proceeds on the
-  full-rights service connection: the `$MQTT_msgs` store, the retained store (any QoS,
-  including 0), the QoS 2 hold, and internally replayed Wills — which keep their live
-  fan-out too, unlike the other three. An *immediate* Will is not in that set; its core
-  publish rides `c.nrc` and is denied. **The dossier states this as a property** — no
-  MQTT-originated publication may have a visible or durable effect before authorization
-  of the CONNECT-authenticated identity for *that publication and its effective
-  subject* is established — because three review rounds each produced another route.
-  The current conformance config cannot exhibit it: its only publish deny is `$MQTT.>`,
-  which `mqttProcessPub` rejects before any store, so the green suite is not evidence.
-  Fixtures and fix design are in the dossier; the `Flush`-based remedy is not
-  automatically correct and does not address F-080.
+- [x] [F-079: A denied publish is accepted, stored and
+  delivered](findings/runtime-correctness.md#f-079). **Alpha blocker — done.** The broker
+  never learned the authenticated identity's NATS permissions at all, so
+  `pubAllowedFullCheck` returned `true` by design and every effect that did not ride
+  `c.nrc` proceeded on the full-rights service connection: the `$MQTT_msgs` store, the
+  retained store, the QoS 2 hold, and internally replayed Wills with their live fan-out.
+  It now asks, with **one `$SYS.REQ.USER.INFO` request on the client's own connection at
+  CONNECT**, and enforces the answer itself. **Stated as a property, not a route list**,
+  because the dossier's history is that each round produced another route: *before the
+  first effect, authorize the snapshot against EVERY effective application subject the
+  publication will create*. That set is not always a singleton — a Sparkplug birth also
+  derives, publishes and retains a `$sparkplug/certificates/...` subject on the service
+  JSA, and a Will whose topic is a birth topic is one publication with two effective
+  subjects, a composition the first two plan revisions both missed. Gates: QoS 0/1 in
+  `mqttProcessPub`; QoS 2 **inside `mqttStoreQoS2MsgOnce`**, because an occupied packet
+  identifier must be answered from the existing hold whatever subject it names
+  ([MQTT-4.3.3] transfers ownership at PUBREC) — which costs one bounded JetStream read
+  per denied QoS 2 PUBLISH, stated in `docs/CONFORMANCE.md`; and every Will site reads a
+  decision **captured at CONNECT**, because all four run inside `mqttHandleClosedClient`
+  where the snapshot is already invalid and asking would have suppressed every
+  AUTHORIZED Will on any NATS blip. **No persisted shape changed**: a `$MQTT_willq`
+  record IS the evidence, because a denied Will is never enqueued. The observable: MQTT 5
+  gets PUBACK/PUBREC `0x87`, MQTT 3.1.1 gets the connection closed ([3.3.5.2] permits
+  either, and a success-shaped ack is the defect restated) — a deliberate divergence from
+  the reserved-`$MQTT.>` refusal beside it, documented rather than harmonised.
+  **Two things this fixed that were not in the finding.** A pre-existing bug:
+  `mqttHandlePubRetain` read the SHARED parser object `c.mqtt.pp` instead of the
+  publication being delivered, so a retained QoS 2 release stored whatever the client
+  sent last — and with a denied Sparkplug birth in between, manufactured its derived
+  effect. And a leak this work introduced and its own fixture caught: the identity reply
+  used nats.go's `_INBOX`, which an MQTT `#` subscription matches, so one client received
+  other clients' identities and permission lists as ordinary messages; the reply now
+  lands under the reserved namespace on the service connection.
+  **Constraint:** service-owned publication and persistence paths authorize against the
+  permission snapshot taken at CONNECT; an ACL change on a still-live connection may
+  remain unapplied there indefinitely until MQTT reconnect, while NATS-owned paths apply
+  it immediately.
+  **Security prerequisite, and it is UNCHECKABLE:** an MQTT identity must be denied
+  publish on `$MQTT.>`. The identity reply is an unsigned account subject and a request
+  to `$SYS.REQ.USER.INFO` is observable to an account subscriber (measured), so a
+  principal able to publish there can race the server and answer for any client — a
+  fabrication claiming "no permissions configured" reads as unrestricted. **No test of
+  the reply can detect this**, because the forger controls what the reply claims; a
+  self-referential check was tried during review and refuted (a reply denying only the
+  one inbox satisfies it while granting everything else), and was removed rather than
+  weakened. The deny is the same one the reserved namespace has always required, for the
+  stronger reason that such a principal can already forge session records directly — so
+  an account whose MQTT users are unrestricted has no isolation to protect either way.
 
-- [ ] [F-080: The authenticated identity's NATS account is never
-  bound](findings/runtime-correctness.md#f-080). Split out of F-079. Clients are bound
-  to the synthetic service account before authentication; `isClientAuthorized` replaces
-  only `c.nrc` on a successful dial and never derives or compares the authenticated
-  connection's account, while session/JSA selection still reads `c.acc`. The v1
-  same-account constraint `docs/ARCHITECTURE.md` states is therefore unenforced:
-  credentials valid in another account authenticate while every durable operation lands
-  in the service account's streams. Kept separate from F-079 because a fix for either
-  leaves the other standing.
+- [x] [F-080: The authenticated identity's NATS account is never
+  bound](findings/runtime-correctness.md#f-080). **Alpha blocker — done.** The same
+  request answers with the identity's account, and `isClientAuthorized` now requires it
+  to equal the service connection's own account — fetched at `Start` **before the
+  listener opens**, so no connection is ever accepted that the broker could not judge.
+  Everything unknown refuses: a timeout, an undecodable body, an empty user, a
+  permissions object present but missing a direction, a permission entry that is not a
+  valid subject filter, an elapsed expiry. An **absent** permissions object is the shape
+  a server with no ACLs emits and means unrestricted — the opposite reading would refuse
+  every publish on the default deployment. **The snapshot's validity is the connection's
+  validity**: the per-client connection re-authenticates on every reconnect, so a
+  disconnect invalidates the snapshot and then closes the MQTT socket. Invalidation is
+  the primitive and the close only its consequence, because `readLoop` tears down after
+  the current parse returns and a PUBLISH already in hand would otherwise still use it. A
+  service-connection disconnect invalidates the service epoch too, since nats.go flushes
+  its reconnect buffer **before** the reconnect callback runs — a callback-only check
+  would discover an account change after the effects had already landed in it. Costs, all
+  stated in `docs/CONFORMANCE.md`: an MQTT connection no longer survives a transient NATS
+  outage, and the refusal is a bare socket close because `authViolation` sends no CONNACK
+  (that is F-061's, untouched here). **The end-to-end cross-account fixture does not
+  prove the comparison** — such a client cannot even be identified, so it is refused by
+  timeout, and a mutation run showed the fixture passing with the comparison deleted;
+  a seam-driven test isolates it.
 
-- [ ] [F-081: A subscribe deny overlapped by a wildcard is not enforced on
-  delivery](findings/runtime-correctness.md#f-081). Subscribe authorization is
-  enforced at SUBSCRIBE time only — `processSub` flushes and reads `LastError`, so a
-  filter the account denies outright becomes SUBACK 0x80. A **wildcard subscription
-  overlapping a narrower deny** is not filtered per message: QoS 1/2 delivery and
-  retained replay ride the service connection, and the per-message guard this port
-  inherited for exactly that case is dead on both halves — `mperms` has no writer
-  anywhere, and `checkDenySub` is a shim stub returning `false`. A client allowed
-  `foo/#` but denied `foo/secret` therefore receives stored QoS 1/2 and retained
-  messages on `foo/secret`. QoS 0 on a user topic is unaffected: that subscription
-  rides `c.nrc`, so NATS still filters it — which a fixture must use as a control so
-  it cannot pass on the wrong mechanism. Same root cause as F-079 (delivery moved to
-  the full-rights service connection while the client-connection permission hooks
-  stayed inert stubs), opposite direction, separate fix.
+- [x] [F-081: A subscribe deny overlapped by a wildcard is not enforced on
+  delivery](findings/runtime-correctness.md#f-081). **Alpha blocker — done.** `mperms`
+  had no writer and `checkDenySub` was a stub returning `false`, so both halves of the
+  inherited per-message guard were dead. They are now fed from the snapshot's subscribe
+  permissions, **deny side only** — NATS already applied the allow side when it accepted
+  the subscription — and `checkDenySub` regained upstream's **two-argument, queue-aware**
+  shape, because `USER.INFO` serialises a queue-scoped deny as `"subject queue"` and a
+  queue-blind check silently downgrades it. **Three guards, not the dossier's two.** The
+  affine shared QoS 2 route (`qos2_shared_affine.go`) reaches the client through the
+  service connection with **no guard at all** — a route the dossier does not name — and it
+  cannot use the funnel or `sub.queue`, because its subscription is created with a **nil**
+  queue and by delivery time no longer names the group the copy came from. Its guard
+  derives the queue from `claim.GroupDurable` instead (`mqttSharedNames` builds queue,
+  deliver subject and durable from one hash, so it is a prefix swap). **The verdict is
+  tri-state, and that is load-bearing**: an indeterminate verdict — no valid
+  snapshot, or an underivable group — is withheld WITHOUT acknowledging, because
+  it is a fact about us and not about the message. Collapsing it into a boolean
+  satisfies every non-delivery assertion by destroying the message instead of
+  withholding it. A **proven deny** is disposed of per route, and the predicate is
+  whether the copy is still the group's to offer: a plain subscription acks it
+  terminally, since no other consumer will ever be offered it; the ordinary shared
+  group consumer hands it back on the paced refusal backoff, since it was selected
+  without its ACL and an allowed member may still take it - paced and not fixed
+  because a sole denied member has nobody to hand it to, and a fixed delay against
+  `MaxDeliver` of -1 is a retry loop rather than a retry; the affine shared QoS 2
+  copy records `AffineDone` and acks it terminally, since the assignment already
+  moved the exchange to one session and no other member can. Stating any one of
+  those three as the universal rule licenses either the shared data loss or an
+  unbounded redelivery loop. Plain QoS 0 on a user topic keeps **no** broker-side
+  guard: it rides `c.nrc`, NATS filters it, and leaving it unguarded is what makes
+  it a control that tells the two mechanisms apart — a mutation removing the
+  broker's guard must leave it passing.
+  **The affine arm IS proven, and getting there took three wrong fixtures.** It is
+  reachable precisely because this finding is about a filter that OVERLAPS a narrower
+  deny: `bob` is denied `aff.topic` but `$share/g/aff/#` is
+  admissible, so he can resume a session `alice` created — the principal is account plus
+  client ID — and the copy already moved to that session's affine consumer is redelivered
+  under his stricter ACL. A fixture using the *exact* denied subject instead fails at
+  subscription restore, upstream of the guard, and asserts a non-delivery with another
+  cause; that version passed while both guard mutations survived it. The committed
+  fixture has four arms — an allowed resume RECEIVES the copy, a subject-denied one does
+  not, a QUEUE-SCOPED denied one does not, and a later allowed resume finds nothing,
+  which is what attributes the deny to this guard rather than to mere withholding, since
+  its deny arm is terminal. Removing the guard kills three of them; taking the queue from
+  `sub.queue` instead of `claim.GroupDurable` kills the queue-scoped one.
+  **Constraint:** service-owned QoS 1/2, retained, and affine deliveries enforce
+  subscribe denies from the permission snapshot taken at CONNECT; a live ACL change may
+  remain unapplied there indefinitely until MQTT reconnect, while the client's
+  NATS-owned subscription paths apply it immediately.
 
 - [x] [F-051: Bound a connection that never sends CONNECT](findings/resolved.md#f-051).
   A CONNECT deadline (`internal/mqtt/connect_deadline.go`) bounds every accepted
@@ -2339,6 +2417,41 @@ operation can trigger correctness loss or unbounded resource growth.
   F-051, not caused by it. Both conformance suites pass today (124/124, 106/106),
   which is why it is a post-alpha candidate rather than a blocker; promote it if a
   suite or an operator report contradicts that.
+
+- [ ] F-085: Carry the authorizing NATS account through the transport. **Codex's
+  wording, taken verbatim from the consult that closed F-079/F-080/F-081, because
+  it is the stopping rule for residual 7 and paraphrasing it would soften the
+  atomicity requirement:** *carry the authorizing NATS account with every queued
+  service and per-client write, including JSA requests and live fan-out, and
+  validate it atomically at final transport emission after reconnect. Same-account
+  reconnects must preserve pending work; changed or unknown accounts must withhold
+  it without finalizing durable obligations, including QoS 0 Wills.* This is the
+  class residual 7 in `docs/CONFORMANCE.md` records, not a single window: the
+  pre-write account check is repeated before every durable write and is atomic with
+  none of them, and three layers can hold a write in between — nats.go's reconnect
+  buffer on the service connection, the JSA send queue (which carries no record of
+  the account that authorized each entry), and the per-client reconnect buffers.
+  **Removing one layer was tried and reverted**, and the reason bounds any plan
+  here: disabling the service reconnect buffer narrowed nothing, because the send
+  queue behind it holds writes just the same, and it made a QoS 0 Will fail outright
+  on an ordinary blip so the outbox finalized a Will that was never fanned out. The
+  hazard needs an operator to repoint credentials mid-flight; that regression needed
+  only a blip. Post-alpha because it is a transport change, and the check-not-
+  transaction gap is stated rather than hidden.
+
+- [ ] F-086: Prove the Will authorization decision at the two discharge sites that
+  no fixture reaches. **Test coverage, not a known broker gap.** The decision is
+  captured at CONNECT and read at four sites; a per-site mutation census (forcing each
+  site's verdict `true` and running the whole suite) shows the immediate path and the
+  delayed-outbox gate each fail their paired fixture, while `mqttPublishOwedWill` (the
+  lost-session-gate route) and the uncertainty-parked gate in `sess_uncertain.go`
+  survive. Reaching those two needs a record-derived eviction and a session-record
+  ambiguity respectively, neither drivable from a connection, so both want a
+  seam-driven arm with the service identity established (`svcID.account`/`valid` plus
+  the client's `authzSvcAccount`) and `willAuthorized` set on each side. **A first
+  attempt was written and deleted**: it passed with a live control and still reached
+  the IMMEDIATE site, which the mutation caught — so any arm here is only worth having
+  if its own mutation kills it. Stated as CONFORMANCE residual 12 meanwhile.
 
 - [ ] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
   Keep basic diagnostics in alpha scope; automatic quarantine or repair may follow

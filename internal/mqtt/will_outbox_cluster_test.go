@@ -63,6 +63,15 @@ func TestMQTTWillOutboxReplicatedStream(t *testing.T) {
 	// Durable enqueue of an INERT record (FireAt far in the future) so the active
 	// claim loop cannot publish or delete it while we inspect replication.
 	asm := testMQTTGetGlobalASM(t, b.s)
+	// The SAME source every production writer uses. Writing the shim account name
+	// here instead would make this fixture the last producer in the tree of a
+	// record shape the broker no longer writes, and deliverWillRecord's account
+	// fence would refuse it -- invisibly, because this record is deliberately inert
+	// and is deleted before it can ever be delivered.
+	svcAccount, svcOK := b.s.serviceAccountForWill()
+	if !svcOK {
+		t.Fatal("the service account must be established before an outbox record can be written")
+	}
 	willID := nuid.Next()
 	clientID := "smoke-" + nuid.Next()
 	cidHash := getHash(clientID)
@@ -76,7 +85,7 @@ func TestMQTTWillOutboxReplicatedStream(t *testing.T) {
 		Msg:              []byte("inert"),
 		FireAt:           time.Now().Add(time.Hour).UnixNano(),
 		State:            mqttWillPending,
-		Account:          asm.jsa.c.acc.GetName(),
+		Account:          svcAccount,
 		OriginSessionSeq: 1,
 		OriginSessEpoch:  asm.sessStreamEpoch,
 	}

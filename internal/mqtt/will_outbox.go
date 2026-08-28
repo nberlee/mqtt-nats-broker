@@ -73,6 +73,7 @@ package mqtt
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -160,7 +161,15 @@ type mqttWillOutbox struct {
 	State      mqttWillState `json:"state"`
 	ClaimOwner string        `json:"owner,omitempty"` // node name of the current publisher
 	ClaimUntil int64         `json:"until,omitempty"` // unix nanoseconds publish lease expiry
-	Account    string        `json:"acct,omitempty"`  // diagnostic only
+	// Account is the NATS SERVICE ACCOUNT this Will's authorization was decided
+	// against, and it is load-bearing rather than diagnostic. A delayed Will is
+	// published long after its connection is gone, by an internal client that has
+	// no identity of its own, so the record IS the decision -- and a decision taken
+	// for one account cannot license a publication into another. deliverWillRecord
+	// refuses a record whose account is not the one the service connection is
+	// currently bound to, and leaves it retryable rather than dropping it, because
+	// a broker pointed back at the original account must still fire it.
+	Account string `json:"acct,omitempty"`
 	// OriginSessionSeq and OriginSessEpoch identify the accepted generation that
 	// created this delayed Will: the persisted session-record stream sequence and
 	// the $MQTT_sess incarnation epoch captured at the disconnect (mqtt.go:1942).
@@ -368,6 +377,13 @@ func mqttWillIdentTk(s string) bool {
 // It applies at the persist and decode boundaries only. An outbox record used
 // purely as a publication vehicle — mqttPublishOwedWill's, and the deferred-close
 // immediate publication's — is built in memory, handed straight to
+// errMQTTWillDestinationUnavailable is deliverWillRecord's account-fence refusal:
+// the service connection is down, or is bound to an account other than the one this
+// Will's authorization was decided against. It is a statement about the DESTINATION,
+// never about the Will, which is what makes it the one refusal worth re-attempting
+// when the destination comes back.
+var errMQTTWillDestinationUnavailable = errors.New("the Will's authorized destination account is not currently established")
+
 // deliverWillRecord (which reads message fields alone) and never persisted, so it
 // carries no identity and is deliberately not validated.
 //
@@ -587,10 +603,11 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 // enqueueDelayedWill writes a new pending outbox record for a delayed Will. A
 // local fire timer publishes it at FireAt; the claim loops (on every replica,
 // including this one) are the backstop and fire it once FireAt passes.
-// Called from the disconnect path. The Will's publish permission is checked
-// before this, but that check is currently VACUOUS — pubAllowedFullCheck always
-// returns true — so a Will denied by the account ACL IS enqueued here, and the
-// replay publishes it through the internal client. F-079.
+// Called from the disconnect path, and only for a Will the caller has already
+// established is authorized — by the decision captured at CONNECT, not by a check
+// made here, which could not be truthful on a teardown path. So a record on this
+// stream IS the durable evidence that authorization passed, which is what lets the
+// replay publish through the internal client without re-deriving anything. F-079.
 //
 // The outbox is the only durable fire mechanism, so a transient store failure
 // must not silently drop the Will: the create is retried (idempotently — the
@@ -608,6 +625,18 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 // sequence of the CONNECT save a surviving session implies — so it is an
 // invariant assert that happens to have a safe arm.
 func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, sessGen string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
+	// The destination this Will was authorized for. Recorded now, while the answer
+	// is still knowable, because the replay happens on an internal client with no
+	// identity of its own. An indeterminate service account means the enqueue
+	// cannot say what it would be authorizing, so it does not enqueue at all.
+	svcAccount, svcOK := s.serviceAccountForWill()
+	if !svcOK {
+		// UNKNOWN, not denied. The caller has already taken the Will off the
+		// connection, so returning an error is what keeps it from being silently
+		// dropped: the enqueue is retried, and a Will authorized before a NATS blip
+		// still reaches the outbox once the destination is settled again.
+		return fmt.Errorf("cannot enqueue a delayed Will yet: the service connection's account is not currently established")
+	}
 	willID := nuid.Next()
 	cidHash := getHash(clientID)
 	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
@@ -618,7 +647,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, ses
 		Gen:              sessGen,
 		FireAt:           fireAt,
 		State:            mqttWillPending,
-		Account:          as.jsa.c.acc.GetName(),
+		Account:          svcAccount,
 		OriginSessionSeq: originSessionSeq,
 		OriginSessEpoch:  originSessEpoch,
 	}
@@ -1549,6 +1578,28 @@ func (as *mqttAccountSessionManager) deliverWillRecord(s *Server, rec *mqttWillO
 		// forever. Returning nil lets the caller finalize (delete).
 		s.Warnf("MQTT: dropping delayed Will %q with invalid topic %q: %v", rec.WillID, rec.Topic, err)
 		return nil
+	}
+	// The record carries the account its authorization was decided against. If the
+	// service connection is now bound elsewhere, this Will must not be published
+	// through it: the decision never referred to that account's subjects, and the
+	// internal client publishing it has no identity of its own to re-derive one
+	// from. Returning an error leaves the record for a later attempt rather than
+	// finalizing it, so a broker pointed back at the original account still fires
+	// it.
+	// EXACT equality, not "differs if set". Every writer of an outbox record
+	// stamps the account it was authorized for, so an EMPTY one under auth
+	// passthrough is a record no writer here produced -- and treating it as "no
+	// opinion" would let exactly the records this check exists to stop straight
+	// through. With auth passthrough off, serviceAccountForWill and every writer
+	// agree on the empty string, so the comparison is a no-op there.
+	if svcAccount, ok := s.serviceAccountForWill(); !ok || rec.Account != svcAccount {
+		// Wrapped in a SENTINEL, because this refusal is the only one a caller may
+		// retry. It happens before any fan-out and before any store, so nothing has
+		// been partially applied and re-attempting it later duplicates nothing. A
+		// generic delivery error is the opposite: it can follow a partial effect, so
+		// the non-durable retry in will_blip_retry.go deliberately does not take it.
+		return fmt.Errorf("%w: Will %q was authorized for account %q, and the service connection is bound to %q (established=%v)",
+			errMQTTWillDestinationUnavailable, rec.WillID, rec.Account, svcAccount, ok)
 	}
 	c := s.createInternalAccountClient()
 	c.acc = as.jsa.c.acc
