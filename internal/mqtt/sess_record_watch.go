@@ -72,8 +72,6 @@ import (
 	"encoding/json"
 	"sync/atomic"
 	"time"
-
-	"github.com/nats-io/nuid"
 )
 
 // mqttTestWatchConsumerCreateFailV forces the session-record watch's consumer create
@@ -83,14 +81,19 @@ import (
 // Nil in production.
 var mqttTestWatchConsumerCreateFailV atomic.Pointer[bool]
 
-// mqttTestConsumerCreateResultHookV lets a test turn a SUCCESSFUL ephemeral-consumer
-// create into a lost response: the consumer exists on the server and the caller sees
-// an error it cannot classify. That is the window a rollback keyed on "confirmed
-// creates only" would miss. Nil in production.
-var mqttTestConsumerCreateResultHookV atomic.Pointer[func(stream, name string, err error) error]
+// mqttTestConsumerCreateResultHookV observes the ephemeral-consumer create REQUEST as
+// submitted and may rewrite its result. Two duties, and the request half is why it
+// takes the whole *CreateConsumerRequest rather than a stream and a name: a test that
+// can only see (stream, name) cannot assert the requested DELIVERY SUBJECT or Action,
+// which is exactly what pins a derived identity.
+//
+// The result half turns a SUCCESSFUL create into a lost response: the consumer exists
+// on the server and the caller sees an error it cannot classify. Nothing may be
+// deleted on the strength of that error — see mqttEphemeralCreated. Nil in production.
+var mqttTestConsumerCreateResultHookV atomic.Pointer[func(ccr *CreateConsumerRequest, err error) error]
 
 // setMQTTTestConsumerCreateResultHook arms that seam and returns its restore function.
-func setMQTTTestConsumerCreateResultHook(h func(stream, name string, err error) error) func() {
+func setMQTTTestConsumerCreateResultHook(h func(ccr *CreateConsumerRequest, err error) error) func() {
 	prev := mqttTestConsumerCreateResultHookV.Load()
 	mqttTestConsumerCreateResultHookV.Store(&h)
 	return func() { mqttTestConsumerCreateResultHookV.Store(prev) }
@@ -124,17 +127,30 @@ const mqttSessRecordWatchInactiveThreshold = 5 * time.Minute
 //
 // AckNone because nothing here acknowledges work — the observation's only job is to
 // trigger a decision that re-reads authoritative state for itself.
-func mqttSessRecordWatchConsumerConfig(domainTk, deliverSubject string) *CreateConsumerRequest {
+// The name is DERIVED from this server run's identity rather than freshly minted, so
+// a retried initialization asks for the same consumer. Unlike the retained observer
+// this one may safely ADOPT its own: it is DeliverNew, so it has no historical
+// position to lose, and the two gaps it can suffer are both covered — an observation
+// missed while no manager exists concerns no resident session (residency requires a
+// manager, so the set is empty by construction, and a later CONNECT reads
+// authoritative record state for itself), and one missed while the manager is live is
+// recovered by reconcileResidentOwnership. So no delete precedes this create, and
+// nothing here opens a destructive window. See ephemeral_identity.go.
+func mqttSessRecordWatchConsumerConfig(domainTk, deliverSubject, ephemeralID, ephemeralOwner string) *CreateConsumerRequest {
+	// Action is NOT set here: createEphemeralConsumerOwned stamps ActionCreate on
+	// every ephemeral create, and a second home for that fact is a second place for
+	// it to drift.
 	return &CreateConsumerRequest{
 		Stream: mqttSessStreamName,
 		Config: ConsumerConfig{
-			Name:              mqttSessStreamName + "_watch_" + nuid.Next(),
+			Name:              mqttSessRecordWatchName(ephemeralID),
 			FilterSubject:     mqttSessStreamSubjectPrefix + domainTk + "*",
 			DeliverSubject:    deliverSubject,
 			ReplayPolicy:      ReplayInstant,
 			DeliverPolicy:     DeliverNew,
 			AckPolicy:         AckNone,
 			InactiveThreshold: mqttSessRecordWatchInactiveThreshold,
+			Metadata:          mqttEphemeralConsumerMetadata(ephemeralOwner, mqttEphemeralSessRecordWatch),
 		},
 	}
 }

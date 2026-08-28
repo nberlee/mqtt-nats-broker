@@ -371,9 +371,11 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"persists it: recreating the stream the consumer lives on strands the name"},
 		"Name": {kind: identityLocal, lifecycle: "the stream the consumer is created on", encoding: encJSON, reason: "the consumer's name as the server reports it; for a durable it equals Durable, scoped to the same stream lifecycle"},
 		"DeliverSubject": {kind: identityLocal, encoding: encJSON,
-			reason: "the delivery subject this bridge minted; a repair must mint a FRESH one rather than " +
-				"reuse a recorded one, because the recorded $JS.ACK/NAK subjects embed the name with " +
-				"per-instance counters (sess_resume_reconcile.go)"},
+			reason: "the delivery subject this bridge minted; a repair of a SESSION durable must mint a " +
+				"FRESH one rather than reuse a recorded one, because the recorded $JS.ACK/NAK subjects " +
+				"embed the name with per-instance counters (sess_resume_reconcile.go). The two " +
+				"per-broker EPHEMERAL consumers are the deliberate exception: their subject is derived " +
+				"from the server run's identity so a retry re-derives it (ephemeral_identity.go)"},
 		"FilterSubject":  {kind: identityLocal, encoding: encJSON, reason: "the subject space this consumer filters, derived from the MQTT filter; it names a subject pattern rather than another stream's identity"},
 		"FilterSubjects": {kind: container, elems: "filtered subject patterns", encoding: encJSON, reason: "the multi-filter form of FilterSubject; the elements are subject patterns, not identities another stream issues"},
 		"DeliverGroup":   {kind: identityLocal, encoding: encJSON, reason: "the shared-subscription queue group, derived deterministically from the group name so a rejoin returns the same one"},
@@ -410,7 +412,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Direct":         {kind: notAnIdentity, encoding: encJSON, reason: "server-set for direct-get consumers; this bridge reads via the JS API"},
 		"Sourcing":       {kind: notAnIdentity, encoding: encJSON, reason: "server-set marker for a sourcing consumer"},
 		"Description":    {kind: notAnIdentity, encoding: encJSON, reason: "cosmetic"},
-		"Metadata":       {kind: container, keys: "metadata keys", elems: "metadata values", encoding: encJSON, reason: "arbitrary key/value metadata. The census records it as a CARRIER because $MQTT_teardown's epoch coupling is carried in STREAM metadata — the consumer equivalent is unused today, and that is the assertion the guard re-checks"},
+		"Metadata":       {kind: container, keys: "metadata keys", elems: "metadata values", encoding: encJSON, reason: "arbitrary key/value metadata. The census records it as a CARRIER because $MQTT_teardown's epoch coupling is carried in STREAM metadata. Consumer metadata is no longer unused: the two per-broker ephemeral consumers stamp owner/purpose/run/schema, and the SERVER compares it as part of the ActionCreate equality check, which is what makes a colliding run's consumer unequal. No broker code reads it back (ephemeral_identity.go)"},
 		"PauseUntil":     {kind: notAnIdentity, encoding: encJSON, reason: "a pause deadline; unused by this bridge"},
 		"PriorityGroups": {kind: container, elems: "priority group names", encoding: encJSON, reason: "priority-group names; unused by this bridge"},
 		"PriorityPolicy": {kind: notAnIdentity, encoding: encJSON, reason: "priority policy; unused by this bridge"},

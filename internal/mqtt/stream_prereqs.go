@@ -14,9 +14,10 @@
 // scans in its feature file — never copied from another stream's list. That is
 // why no two lists here are the same: DenyDelete is fatal on $MQTT_sess (the
 // teardown release is the only exit a record has) and waived on $MQTT_rmsgs
-// (that owner issues no delete API request at all; the empty-body tombstone
-// plus MaxMsgsPer:1 replacement carry correctness, and both that store-time
-// eviction and TTL reaping are store-internal, which DenyDelete does not gate). A setting absent from a list is
+// (that owner issues no MESSAGE delete — the empty-body tombstone plus
+// MaxMsgsPer:1 replacement carry correctness, and both that store-time eviction
+// and TTL reaping are store-internal — and DenyDelete gates message deletion
+// only, so the CONSUMER deletes its owner does issue are not gated by it). A setting absent from a list is
 // an audited NON-prerequisite with a written reason, not an oversight:
 // rejecting a setting no owner operation depends on would refuse legitimate
 // deployments — policy hardening, not derivation. The audit is enforced by
@@ -29,8 +30,6 @@ package mqtt
 import (
 	"fmt"
 	"time"
-
-	"github.com/nats-io/nuid"
 )
 
 // validateBrokerOwnedStreamShape checks the facts that are prerequisites of
@@ -273,10 +272,14 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 // per-message Nats-TTL, including empty-body tombstones; loadLastMsgForMulti
 // reads; NO explicit message-delete or purge API calls at all;
 // and one ephemeral AckNone consumer per broker with a 5-minute
-// InactiveThreshold.
+// InactiveThreshold, which this owner CREATES and DELETES by name (see
+// ephemeral_identity.go).
 //
-// DenyDelete is deliberately NOT a prerequisite: this owner issues no delete
-// API request. The durable deletion authority is the empty-body tombstone plus
+// DenyDelete is deliberately NOT a prerequisite: this owner issues no MESSAGE
+// delete, and DenyDelete gates nothing else — the consumer deletes it does issue
+// (the observer's pre-create delete and the rollback's, see ephemeral_identity.go)
+// are CONSUMER.DELETE requests, which no stream setting here can refuse.
+// The durable deletion authority is the empty-body tombstone plus
 // MaxMsgsPer:1 replacement (docs/PORTING.md), and BOTH the store-time eviction
 // that replacement performs and TTL expiry are reaped by the store engine
 // itself, which DenyDelete does not gate. Denying deletes therefore costs
@@ -414,7 +417,7 @@ type brokerStreamSpec struct {
 // later provisioning step fails.
 func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string,
 	replicas, wantReplicas, maxAckPending int, requireMsgTTL bool, rmsubj string,
-	retainedName *string) []brokerStreamSpec {
+	ephemeralID, ephemeralOwner string, created mqttEphemeralCreated) []brokerStreamSpec {
 
 	jsa := &as.jsa
 	// The provisioning loop prefixes every error with the stream and account, so
@@ -706,27 +709,43 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 				return nil
 			},
 			post: func(_ *StreamInfo) error {
-				// Create a new, uniquely named consumer for retained messages for
-				// this server. The prior one will expire eventually.
+				// The retained observer, under a name DERIVED from this server run so
+				// a retried initialization asks for the same consumer.
+				//
+				// Deleted before it is created, and the delete must come back
+				// DEFINITE. This is the one place the two ephemeral consumers differ,
+				// and the reason is the retained INDEX: as.retmsgs is written only by
+				// this consumer's callback and by the publishing broker's own local
+				// seed, so a DeliverAll consumer ADOPTED at its current position
+				// leaves the index empty — and a wildcard SUBSCRIBE has nothing but
+				// the index (a literal filter is forced through loadRetainedMessages,
+				// a wildcard cannot be). A previous attempt of THIS run may have
+				// drained the whole backlog into a manager that was then discarded, so
+				// adoption here silently serves no retained message for the life of
+				// the process. Freshness therefore comes from the protocol order, not
+				// from inspecting the create response: a response cannot distinguish a
+				// fresh consumer that has already delivered from an adopted one.
+				name := mqttRetainedObserverName(ephemeralID)
+				if err := jsa.deleteEphemeralConsumerDefinite(mqttRetainedMsgsStreamName, name); err != nil {
+					return fmt.Errorf("retained messages consumer for account %q: %w", accName, err)
+				}
 				ccfg := &CreateConsumerRequest{
 					Stream: mqttRetainedMsgsStreamName,
 					Config: ConsumerConfig{
-						Name:              mqttRetainedMsgsStreamName + "_" + nuid.Next(),
+						Name:              name,
 						FilterSubject:     mqttRetainedMsgsStreamSubject + ">",
 						DeliverSubject:    rmsubj,
 						ReplayPolicy:      ReplayInstant,
 						AckPolicy:         AckNone,
 						InactiveThreshold: 5 * time.Minute,
+						Metadata:          mqttEphemeralConsumerMetadata(ephemeralOwner, mqttEphemeralRetainedObserver),
 					},
 				}
-				// The name is recorded BEFORE the request, not after it succeeds: a
-				// create whose response is lost may still have created the consumer,
-				// and a rollback that only knows about confirmed creates would leave
-				// exactly those behind. See mqttProvisionEphemeralConsumers.
-				if retainedName != nil {
-					*retainedName = ccfg.Config.Name
+				confirmed, err := jsa.createEphemeralConsumerOwned(ccfg)
+				if confirmed {
+					created.confirm(mqttEphemeralRetainedObserver)
 				}
-				if _, err := jsa.createEphemeralConsumer(ccfg); err != nil {
+				if err != nil {
 					return fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 				}
 				return nil
@@ -736,23 +755,28 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 }
 
 // mqttProvisionEphemeralConsumers creates this broker's session-record watch AFTER
-// every stream in the provisioning table has been created and validated, and makes
-// the pair of per-broker ephemeral consumers FAILURE-ATOMIC.
+// every stream in the provisioning table has been created and validated.
 //
-// Both properties answer the same hazard, which is a leak measured per RETRY rather
-// than per broker. Each consumer is uniquely named, so nothing later adopts or
-// replaces one; manager initialization tears down only local subscriptions; and every
-// MQTT connection retries the whole initialization. So a consumer created before a
-// step that fails is never deleted by anything, and a persistent misconfiguration
-// accumulates one per attempt until each reaches its inactivity threshold.
+// What bounds the leak is no longer atomicity but the DERIVED name: both consumers
+// are named from this server run's identity, so an initialization retry asks for the
+// same consumer instead of minting another one, and the previous attempt's is either
+// removed definitely (the observer) or adopted (this one). Retries are real —
+// startMQTT opens the listener before Start initializes the manager, so a CONNECT
+// arriving in that window drives initialization itself, and a failed attempt is
+// retried by the next CONNECT or by Start's own call.
 //
-// retainedName is the retained-messages consumer already created by its stream's post
-// step, or empty when it was not reached. On a watch-create failure it is deleted, so
-// a failed attempt leaves the account exactly as it found it.
+// The watch CREATES without deleting. It is DeliverNew, so it has no historical
+// position to lose by adopting its own consumer, and ActionCreate is what keeps the
+// adoption honest: a consumer under this name that is not config-identical to ours —
+// a different run's, or one whose config was mutated out of band — is REFUSED rather
+// than taken over. See mqttSessRecordWatchConsumerConfig.
+//
+// created records the purposes this attempt CONFIRMABLY created; a rollback deletes
+// nothing else. See mqttEphemeralCreated for why an errored create licenses nothing.
 //
 // See sess_record_watch.go for what the watch is and why the broker needs one.
-func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, srwsubj, retainedName string) error {
-	ccfg := mqttSessRecordWatchConsumerConfig(as.domainTk, srwsubj)
+func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, srwsubj, ephemeralID, ephemeralOwner string, created mqttEphemeralCreated) error {
+	ccfg := mqttSessRecordWatchConsumerConfig(as.domainTk, srwsubj, ephemeralID, ephemeralOwner)
 	err := error(nil)
 	// The seam models a FAILED CREATE, so it has to reach the same rollback the real
 	// failure does. Returning early here instead is how the first version of this
@@ -760,44 +784,64 @@ func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, sr
 	if h := mqttTestWatchConsumerCreateFailV.Load(); h != nil && *h {
 		err = fmt.Errorf("mqtt test: session-record watch consumer creation forced to fail")
 	} else {
-		_, err = as.jsa.createEphemeralConsumer(ccfg)
-		if h := mqttTestConsumerCreateResultHookV.Load(); h != nil {
-			err = (*h)(mqttSessStreamName, ccfg.Config.Name, err)
+		confirmed, cerr := as.jsa.createEphemeralConsumerOwned(ccfg)
+		if confirmed {
+			created.confirm(mqttEphemeralSessRecordWatch)
 		}
+		err = cerr
 	}
 	if err != nil {
-		// BOTH names, including the one whose create just failed: an error here does
-		// not prove the consumer was not created — a request whose response is lost
-		// leaves one behind under exactly the name we asked for — so a rollback that
-		// only removed the previous consumer would leak the failing one.
-		as.rollbackEphemeralConsumers(retainedName, ccfg.Config.Name)
+		// Only what this attempt CONFIRMABLY created. An error here does not prove the
+		// consumer was not created — a lost response leaves one behind under exactly
+		// the name we asked for — but neither does it prove the consumer at that name
+		// is OURS: both server paths return structured errors before they look the
+		// name up, so a foreign occupant plus a validation error would be deleted by a
+		// rollback that trusted the error. The unconfirmed create is left to the next
+		// attempt of this run (which adopts it, being config-identical) or to
+		// InactiveThreshold.
+		as.rollbackEphemeralConsumers(created)
 		return fmt.Errorf("create session-record watch consumer for account %q: %v", accName, err)
 	}
 	return nil
 }
 
-// rollbackEphemeralConsumers removes the per-broker ephemeral consumers a FAILED
-// initialization attempt may have created — "may have" being the operative part: each
-// name is recorded before its request is issued, so a create whose response was lost
-// is covered by the same delete as a create that plainly succeeded, and a name that
-// was never created deletes nothing.
+// rollbackEphemeralConsumers removes the per-broker ephemeral consumers this FAILED
+// initialization attempt is KNOWN to have created — known being the operative word.
+// Its licence is a confirmed create and nothing else, because no error can tell "our
+// create landed" from "a foreign consumer now occupies that name": both the
+// standalone and clustered paths return structured errors before they look the
+// existing consumer up, so deleting on the strength of an error can remove a live
+// peer's consumer.
 //
-// What this bounds is the per-RETRY accumulation, which is the real hazard: every MQTT
-// connection retries initialization, and each attempt otherwise mints another uniquely
-// named consumer that nothing deletes. It does NOT make cleanup guaranteed — a delete
-// can itself fail or be lost, and the stray consumer is then reaped by its inactivity
-// threshold as before. Removing that last window needs durable cleanup tracking or
-// stable per-broker consumer identities; docs/ROADMAP.md carries it.
-func (as *mqttAccountSessionManager) rollbackEphemeralConsumers(retainedName, watchName string) {
-	for _, c := range []struct{ stream, name string }{
-		{mqttRetainedMsgsStreamName, retainedName},
-		{mqttSessStreamName, watchName},
+// It is BEST-EFFORT and is NOT part of the cardinality guarantee: its own delete can
+// be lost and nothing retries it. What it buys is promptness for the attempt no retry
+// follows — Start's own, after which the process exits — so a cleanly failed start
+// leaves nothing rather than a five-minute stray. "No retry follows" is the common
+// case, not a guarantee: the listener opens before the eager initialization, so a
+// CONNECT can be queued on the manager mutex while that attempt fails.
+// getOrCreateMQTTAccountSessionManager refuses to create a manager once the server is
+// marked not-running, and the instant that remains is a stated residual (see
+// docs/CONFORMANCE.md), not a second mechanism.
+//
+// The guarantee lives elsewhere: derived names mean a retry reconciles the previous
+// attempt's consumer (the observer deletes it definitely before creating, the watch
+// adopts it), so cardinality stays at one per purpose whatever the attempt count. A
+// create whose response was LOST is therefore deliberately not rolled back here; it
+// waits for that reconciliation, or for InactiveThreshold. See ephemeral_identity.go.
+func (as *mqttAccountSessionManager) rollbackEphemeralConsumers(created mqttEphemeralCreated) {
+	ephemeralID, _ := as.jsa.c.srv.ephemeralIdentity()
+	for _, c := range []struct {
+		stream, name string
+		purpose      mqttEphemeralPurpose
+	}{
+		{mqttRetainedMsgsStreamName, mqttRetainedObserverName(ephemeralID), mqttEphemeralRetainedObserver},
+		{mqttSessStreamName, mqttSessRecordWatchName(ephemeralID), mqttEphemeralSessRecordWatch},
 	} {
-		if c.name == _EMPTY_ {
+		if !created.has(c.purpose) {
 			continue
 		}
 		// Not-found IS successful cleanup: the create never landed.
-		if _, derr := as.jsa.deleteConsumer(c.stream, c.name, false); isErrorOtherThan(derr, JSConsumerNotFoundErr) {
+		if derr := as.jsa.deleteEphemeralConsumerBestEffort(c.stream, c.name); isErrorOtherThan(derr, JSConsumerNotFoundErr) {
 			as.jsa.c.Warnf("MQTT: unable to roll back %s consumer %q after a failed initialization: %v",
 				c.stream, c.name, derr)
 		}

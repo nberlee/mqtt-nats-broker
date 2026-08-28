@@ -3411,3 +3411,53 @@ is treated as uninterpretable state rather than repaired. What an operator would
 Each of these is a liveness cost on one identifier or one session, accepted for the same
 reason as the teardown refusal above: releasing an identifier on the strength of a record
 that could not be read is a silent loss, and a refusal an operator can see is not.
+
+### Ephemeral-consumer cleanup is guaranteed per server RUN, and time-based across runs
+
+The broker's two per-account ephemeral consumers — the retained observer on
+`$MQTT_rmsgs` and the session-record watch on `$MQTT_sess` — are named from the server
+run's own identity rather than freshly per initialization attempt, so a retried
+initialization asks for the same consumer instead of stranding one under a name nothing
+can compute again. See "Per-run ephemeral consumer identity" in `docs/ARCHITECTURE.md`
+for the mechanism. What that does and does not guarantee, stated in full because the
+first statement is not usable without the rest:
+
+1. **The guarantee is conditional on a same-server-run retry** — the startup race (the
+   listener opens before `Start` initializes the manager, so a CONNECT can drive
+   initialization and a failed attempt is retried until one succeeds or `Start`'s own
+   failure tears the server down), a direct caller, or any future retry path. There,
+   cardinality stays at **at most one** consumer per (server run, account, purpose)
+   whatever the attempt count, delivered by two different protocols: the observer proves
+   the name ABSENT before creating it, and the watch ADOPTS its own config-identical
+   consumer. It is not a claim that every previous stray is deleted — the watch's is
+   deliberately adopted, not removed.
+2. **A cleanly failed start gets prompt best-effort rollback**, and only for the
+   consumers that attempt CONFIRMABLY created. That rollback is best-effort, not part of
+   the guarantee: its own delete can be lost and nothing retries it. Nor is a failed
+   `Start` always the last attempt of its run: the listener opens first, so a CONNECT can
+   be queued on the manager mutex while the eager initialization fails.
+   `getOrCreateMQTTAccountSessionManager` refuses to CREATE a manager once the server is
+   marked not-running, which closes that path for every CONNECT that reaches it after
+   `BeginShutdown`; one that passed the check in the instant before the flag flipped can
+   still complete a SUCCESSFUL initialization, and the success path has no rollback, so
+   its two consumers wait out `InactiveThreshold`. That window is stated rather than
+   closed with a second mechanism, because its cost is exactly the five minutes
+   statement 3 already governs.
+3. **`InactiveThreshold` (five minutes) still governs everything else** — a consumer
+   stranded by a crash, by a replacement, by a lost rollback delete, by an ambiguous
+   create that no same-run retry reconciles, or by the **normal shutdown of a
+   successfully started broker** (no rollback runs on the success path). No live broker
+   can prove another identity's process is dead, and asking one to judge would
+   reimplement `InactiveThreshold` inside the broker.
+4. **Across rapid process restarts, cardinality is bounded by restart rate × inactivity
+   window**, not by one consumer per purpose globally: each run draws a new identity,
+   which is what keeps two live brokers from sharing a consumer.
+5. **A name collision is a stated residual, not a mechanised one.** Identity rests on
+   the run's own nuid draw. Under a collision the two runs also collide their delivery
+   subjects; the watch's create is refused (its owner nonce differs), while the
+   observer's unconditional pre-create delete would remove the other broker's live
+   observer. The consequences are not one endpoint: the replacement observer may
+   temporarily feed both brokers, a later rollback may remove it, and either broker's
+   next initialization re-derives the same name. Guarding this would need a
+   read-before-delete that still could not condition the delete against a collision
+   arriving after the read.

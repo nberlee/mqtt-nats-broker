@@ -47,6 +47,10 @@ type (
 )
 
 const (
+	// ActionCreate makes a named consumer create REFUSE an existing consumer whose
+	// config differs, instead of adopting it at its current position as the zero
+	// value (create-or-update) does. See ephemeral_identity.go.
+	ActionCreate             = server.ActionCreate
 	AckExplicit              = server.AckExplicit
 	AckNone                  = server.AckNone
 	AsyncPersistMode         = server.AsyncPersistMode

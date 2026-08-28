@@ -1746,18 +1746,42 @@ further findings it surfaced are filed separately, for the reason its own bullet
   into it by F-032's audit, plus F-033's affine-consumer adoption blind spot and F-034's
   live-owner register contention.
 
-  - [ ] Make ephemeral-consumer cleanup guaranteed rather than
-  best-effort. A failed manager initialization now rolls back both per-broker ephemeral
-  consumers, including a create whose response was lost, so retries no longer ACCUMULATE
-  them. What is left is the rollback delete itself failing or being lost: the stray
-  consumer is then reaped by its five-minute inactivity threshold, which bounds lifetime
-  rather than cardinality. **Small.** Close it with one unguessable process identity
-  that derives a stable consumer name AND delivery subject per account/purpose, so a
-  retry repeats the same consumer configuration. Add consumer metadata for owner,
-  purpose, process instance and schema; `InactiveThreshold` remains crash cleanup. Do
-  not use a user-configurable node name that two live brokers could share. See the
+  - [x] Make ephemeral-consumer cleanup guaranteed rather than
+  best-effort. **DONE.** Both per-broker ephemeral consumers now derive their name AND
+  delivery subject from a per-`Server`-run identity, so a retried initialization asks for
+  the same consumer instead of stranding one under a name nothing can compute again —
+  which was the real defect: a stray whose rollback delete was lost had a name that
+  existed only in the failed attempt's stack. Consumer metadata carries owner, purpose,
+  run and schema. See "Per-run ephemeral consumer identity" in ARCHITECTURE.md.
+
+  **This bullet's own premise was imprecise, and the correction matters more than the
+  fix.** "Every MQTT connection retries the whole initialization" is inherited from
+  upstream's multi-account world; here there is one account and `Start` initializes
+  eagerly. But `startMQTT` opens the listener BEFORE that eager call, so a CONNECT
+  arriving in the startup window drives initialization itself and a failed attempt IS
+  retried within one run — until one succeeds or `Start`'s own failure tears the server
+  down. The retry population is real and is a production one; four code comments stating
+  it without that scope are corrected (§0.5's comment-corpus sweep gains them).
+
+  **Two things the prescription did not anticipate, both measured against the pinned
+  server.** A repeated named create ADOPTS the existing consumer at its current position,
+  so a stable name alone would have left a retry's retained INDEX empty — invisible to
+  every wildcard subscription, for the life of the process; the observer therefore proves
+  its name absent (a definite delete, one re-attempt, then fail closed) before creating,
+  while the watch safely adopts its own. And no error distinguishes "our create landed"
+  from "a foreign consumer is at that name", because both server paths fail before
+  looking the name up — so a rollback delete is licensed by a CONFIRMED create and
+  nothing else, which means an ambiguous create is left for the next attempt or for
+  `InactiveThreshold` rather than deleted.
+
+  **Residuals**, all five stated in CONFORMANCE.md: the guarantee is conditional on a
+  same-run retry (at most one consumer per run/account/purpose); the rollback is
+  best-effort and outside it; `InactiveThreshold` still governs a crash, a replacement, a
+  lost rollback delete, an unreconciled ambiguous create and the normal shutdown of a
+  successful broker; across rapid restarts cardinality is bounded by restart rate ×
+  inactivity window; and a nuid name collision is stated rather than mechanised. See the
   [platform
-  audit](findings/nats-platform.md#stable-ephemeral-consumer-identities-and-metadata).
+  audit](findings/nats-platform.md#stable-ephemeral-consumer-identities-and-metadata-—-done).
 
   - [ ] Give a vanished record its own disposal vocabulary. **Rebased by F-084, which
   landed first.** The deleted-record arm no longer reports 0x8E; it reports
@@ -2365,7 +2389,7 @@ finding with acceptance criteria.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 
-- [ ] **Sweep the comment corpus for three false-claim families, indexed by CLAIM rather than
+- [ ] **Sweep the comment corpus for five false-claim families, indexed by CLAIM rather than
   by phrasing.** Filed 2026-08-26 by the pre-CONNACK-signal item's tenth holistic review round,
   which ruled: *"Stop iterating on this code item after recording them in a separate
   corpus-sweep finding"* and *"No further implementation review round is justified by the
@@ -2396,8 +2420,26 @@ finding with acceptance criteria.
   `classifyRejectedProbe` from an ABSENT record), `shared_group_arbitrate.go:107` and `:149`,
   `sess_uncertain.go:419-421` and `:858-870`, `mqtt.go:12135` and `:13354`; family 3 at
   `mqtt.go:12878` and `docs/ARCHITECTURE.md:3495-3497`.
-  *How to close it:* index by the CLAIM — read every comment that asserts one of the three,
-  rather than grepping for the wording that happened to be used. **F-084 cross-links
+  **(4) the unscoped retry premise** — four sites stating that "every MQTT connection retries
+  the whole initialization" without the scope that makes it true. It holds only until one
+  attempt succeeds or `Start`'s own attempt fails and exits: `startMQTT` opens the listener
+  before the eager initialization, so a CONNECT in that window drives initialization itself,
+  and after any success the CONNECT path re-initializes nothing. Corrected 2026-08-28 by the
+  ephemeral-consumer identity item at `mqtt.go` (the watch-provisioning comment),
+  `stream_prereqs.go` (two) and `sess_record_watch_test.go`; filed here because the
+  family is what a future reader needs, not the four instances.
+  **(5) the "$MQTT_rmsgs issues no delete API request" claim** — seven sites, corrected
+  by the same item, and a worked example of why this bullet exists: five review rounds
+  each found another instance, including one WRAPPED across two lines that no
+  line-based grep can match and one phrased passively. It was closed only by a wrap-
+  and phrasing-insensitive sweep plus a frozen close set with a res-judicata rule. The
+  claim was **already false before that item** (the rollback has always issued
+  `CONSUMER.DELETE` against `$MQTT_rmsgs`); what stays true, and is what the corrected
+  sites now say, is that the owner issues no MESSAGE delete, which is the only thing
+  `DenyDelete` gates.
+  *How to close it:* index by the CLAIM — read every comment that asserts one of the five,
+  rather than grepping for the wording that happened to be used. Family 5's history is the
+  argument: a grep-shaped sweep will keep returning one more instance. **F-084 cross-links
   family 2
   only**, and stays scoped to successor evidence.
 

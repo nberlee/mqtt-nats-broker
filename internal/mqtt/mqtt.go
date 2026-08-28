@@ -894,6 +894,12 @@ type srvMQTT struct {
 	// an accepted, safe degradation of No Local for persisted messages across a
 	// restart/failover, not a security gap. Spec5 [3.8.3.1].
 	originKey []byte
+	// ephemeralID NAMES this server run's per-account ephemeral consumers, and
+	// ephemeralOwner WITNESSES its ownership of them. Two INDEPENDENT draws, minted
+	// lazily by ephemeralIdentity, which is where the reason for each lives. See
+	// ephemeral_identity.go.
+	ephemeralID    string
+	ephemeralOwner string
 }
 
 type mqttSessionManager struct {
@@ -4196,6 +4202,17 @@ func (s *Server) getOrCreateMQTTAccountSessionManager(c *client) (*mqttAccountSe
 	if ok {
 		return asm, nil
 	}
+	// A shutting-down server does not CREATE a manager, only hand back one that
+	// already exists. Start opens the listener before it initializes eagerly, so a
+	// CONNECT can be queued on this very mutex while that initialization fails; without
+	// this check it would then build a fresh manager — two ephemeral consumers included
+	// — for a server that is on its way out, and the success path has no rollback. The
+	// residual window this leaves (a CONNECT that passed here in the instant before
+	// BeginShutdown flipped the flag) is stated in docs/CONFORMANCE.md rather than
+	// closed with a second mechanism: its cost is bounded by InactiveThreshold.
+	if s.isShuttingDown() {
+		return nil, fmt.Errorf("MQTT server is shutting down")
+	}
 	// Need to create one here.
 	asm, err := s.mqttCreateAccountSessionManager(acc, quitCh)
 	if err != nil {
@@ -4314,9 +4331,14 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		return nil, err
 	}
 
-	// We create the subscription on "$MQTT.sub.<nuid>" to limit the subjects
-	// that a user would allow permissions on.
-	rmsubj := mqttSubPrefix + nuid.Next()
+	// We create the subscription on "$MQTT.sub.<ephemeralID>.rmsgs" to limit the
+	// subjects that a user would allow permissions on. DERIVED, not freshly minted:
+	// the retained observer this feeds is named from the same token, so an
+	// initialization retry asks for the same consumer instead of stranding the
+	// previous attempt's under a name nothing can compute again. See
+	// ephemeral_identity.go.
+	ephemeralID, ephemeralOwner := s.ephemeralIdentity()
+	rmsubj := mqttRetainedObserverDeliverSubject(ephemeralID)
 	if err := as.createSubscription(rmsubj, as.processRetainedMsg, &sid, &subs); err != nil {
 		return nil, err
 	}
@@ -4328,8 +4350,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// lost, stranding a displaced client indefinitely.
 	// Under "$MQTT.sub." and on the SERVICE connection, like the retained consumer,
 	// so the recommended client ACL denying "$MQTT.>" stays correct.
-	// See sess_record_watch.go.
-	srwsubj := mqttSubPrefix + nuid.Next()
+	// Derived from the same per-run token as the retained observer's, for the same
+	// reason. See sess_record_watch.go and ephemeral_identity.go.
+	srwsubj := mqttSessRecordWatchDeliverSubject(ephemeralID)
 	if err := as.createSubscription(srwsubj, as.processSessionRecordDelivery, &sid, &subs); err != nil {
 		return nil, err
 	}
@@ -4376,33 +4399,40 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}
-	// Recorded by the $MQTT_rmsgs post step so a later failure can roll it back: the
-	// two per-broker ephemeral consumers are provisioned as one unit.
-	var retainedConsumerName string
-	for _, spec := range as.brokerStreamSpecs(s, accName, replicas, wantReplicas, maxAckPending, requireMsgTTL, rmsubj, &retainedConsumerName) {
+	// Which purposes this attempt CONFIRMABLY created, which is the rollback's only
+	// licence: an errored create — of any shape, definite or not — licenses nothing,
+	// because a structured error can be returned before the server even looks the
+	// name up. See mqttEphemeralCreated in ephemeral_identity.go.
+	created := mqttEphemeralCreated{}
+	for _, spec := range as.brokerStreamSpecs(s, accName, replicas, wantReplicas, maxAckPending, requireMsgTTL, rmsubj, ephemeralID, ephemeralOwner, created) {
 		si, err := ensureBrokerStream(jsa, spec.cfg, spec.validate, spec.preCreate, spec.observe)
 		if err != nil {
-			as.rollbackEphemeralConsumers(retainedConsumerName, _EMPTY_)
+			as.rollbackEphemeralConsumers(created)
 			return nil, fmt.Errorf("MQTT %s stream for account %q: %w", spec.txt, accName, err)
 		}
 		if spec.post != nil {
 			if err := spec.post(si); err != nil {
-				// A post step that failed may still have created its consumer — the
-				// retained one records its name before issuing the request precisely
-				// so this path can remove it. Without this the loop's own failures
-				// leak exactly what the post-loop rollback was added to prevent.
-				as.rollbackEphemeralConsumers(retainedConsumerName, _EMPTY_)
+				// A post step that failed may still have created its consumer, and
+				// the retained one records a CONFIRMED create before returning, so
+				// this path removes exactly what is known to exist. Without this the
+				// loop's own failures leak what the post-loop rollback was added to
+				// prevent.
+				as.rollbackEphemeralConsumers(created)
 				return nil, err
 			}
 		}
 	}
 
 	// The session-record watch, created only once EVERY stream has provisioned and
-	// validated, and rolling the retained-messages consumer back if it fails: an
-	// ephemeral consumer left behind by a failed attempt is deleted by nothing, and
-	// every connection retries this whole function. See
-	// mqttProvisionEphemeralConsumers.
-	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, retainedConsumerName); err != nil {
+	// validated, and rolling the retained-messages consumer back if it fails.
+	//
+	// Every connection retries this whole function UNTIL one attempt succeeds, or
+	// until Start's own attempt fails and tears the server down: the listener opens
+	// in startMQTT before Start initializes the manager, so a CONNECT arriving in
+	// that window drives initialization itself. What a retry must not do is mint
+	// another consumer, which is why both names are derived. See
+	// mqttProvisionEphemeralConsumers and ephemeral_identity.go.
+	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, ephemeralID, ephemeralOwner, created); err != nil {
 		return nil, err
 	}
 

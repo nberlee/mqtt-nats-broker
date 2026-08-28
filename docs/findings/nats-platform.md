@@ -98,21 +98,29 @@ ADR-43 records delete-API and purge-API markers as not yet implemented. The sour
 `$MQTT_rmsgs` topology must be in the test matrix because source handling of TTL and
 markers has its own rules.
 
-## Stable ephemeral-consumer identities and metadata
+## Stable ephemeral-consumer identities and metadata — DONE
 
-The retained observer and session-record watch currently use a fresh consumer name
-on every manager initialization. One unguessable broker-process identity should
-instead derive a stable name **and delivery subject** for each purpose within that
-process/account. An initialization retry then repeats the same consumer
-configuration instead of increasing cardinality. A restarted process receives a new
-identity; `InactiveThreshold` remains the crash cleanup.
+**Landed.** The retained observer and session-record watch derive a stable name **and
+delivery subject** from a per-`Server`-run identity, so an initialization retry asks
+for the same consumer instead of increasing cardinality. A restarted process receives a
+new identity; `InactiveThreshold` remains the crash cleanup. See "Per-run ephemeral
+consumer identity" in `docs/ARCHITECTURE.md` and the five residual statements in
+`docs/CONFORMANCE.md`.
 
-Populate `ConsumerConfig.Metadata` with at least owner, purpose, process instance,
-and schema version. The field has been supported since nats-server 2.10 and is
-documented in the current
-[`nats.go/jetstream` API](https://pkg.go.dev/github.com/nats-io/nats.go@v1.52.0/jetstream#ConsumerConfig).
-This gives rollback and any future orphan sweep an exact ownership predicate rather
-than a loose name-prefix convention.
+**Two corrections this audit item needed, both found by implementing it:**
+
+- **A stable name alone does not suffice**, and would have been a silent regression. A
+  repeated named create ADOPTS the existing consumer at its current position, so a retry
+  would inherit an observer already drained by a discarded manager and leave the retained
+  index empty — invisible to every wildcard subscription. The observer therefore proves
+  its name ABSENT before creating it, and `ActionCreate` keeps an unexpected occupant a
+  refusal rather than an adoption.
+- **Metadata is not an ownership predicate for the rollback.** The rollback reads no
+  metadata: its licence is a confirmed create, because no error distinguishes "our create
+  landed" from "a foreign consumer is at that name". The metadata's only machine reader
+  is the server's own `ActionCreate` equality check, where the independent per-run nonce
+  is what makes a colliding run's config unequal; an operator and any future sweep are
+  the human readers.
 
 ## Staged use of the high-level JetStream client
 

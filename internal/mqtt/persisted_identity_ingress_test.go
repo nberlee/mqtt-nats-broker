@@ -77,7 +77,7 @@ var censusIngressMethods = map[string]string{
 
 	// Consumer creation, which for an existing durable is an UPDATE, so its response
 	// carries configuration and state the bridge interprets.
-	"createEphemeralConsumer": "create or update an ephemeral consumer",
+	"createEphemeralConsumer": "create an ephemeral consumer; with ActionCreate its response partitions into CONFIRMED, adopted-because-identical, and refused",
 	"createDurableConsumer":   "create or update a durable consumer",
 	"createStream":            "create a stream",
 	"updateStream":            "update a stream configuration",
@@ -102,6 +102,9 @@ var censusIngressMethods = map[string]string{
 	// These are the wrappers that establish an outcome PARTITION of their own, so a new
 	// caller of one is a new interpretation site even though it touches no jsa method
 	// directly.
+	"deleteEphemeralConsumerDefinite":   "the two-attempt absence proof for an ephemeral consumer name: definite-absent or fail closed",
+	"deleteEphemeralConsumerBestEffort": "the rollback's single-shot ephemeral-consumer delete",
+	"createEphemeralConsumerOwned":      "the ActionCreate ephemeral create whose bool is the rollback's ONLY licence",
 	"loadInflightRecord":                "the four-outcome register read",
 	"storeInflightCAS":                  "the register CAS",
 	"enumerateInflightSubjects":         "the bounded register enumeration",
@@ -268,11 +271,14 @@ var censusInterpreters = map[string]string{
 
 	// ---- stream and consumer provisioning -------------------------------------
 	"ensureBrokerStream":                   "create-or-lose then an unconditional authoritative RE-READ, so a create-race loser and the winner both validate what actually exists rather than what they asked for",
-	"brokerStreamSpecs":                    "the ordered provisioning table; the epoch stamp is taken at the create, which is the linearization point",
 	"createOrRestoreSessionWithin":         "reads the record and the retirement watermark; a retired generation is DISCARDED rather than resumed, and an unreadable watermark refuses the CONNECT",
 	"mqttRefuseRetiredOriginStream":        "a lookup-only preflight: the presence of a retired stream is itself the refusal, since ensureBrokerStream would otherwise create an absent one before validating",
-	"mqttProvisionEphemeralConsumers":      "provisions the per-broker ephemeral consumers as a UNIT, so a partial success is rolled back rather than left half-installed",
-	"rollbackEphemeralConsumers":           "deletes both ephemeral consumer names including the FAILING create's own, because an error is not proof nothing was created",
+	"brokerStreamSpecs":                    "the ordered provisioning table; its $MQTT_rmsgs post step proves the observer's name ABSENT and interprets the create's confirmation",
+	"mqttProvisionEphemeralConsumers":      "creates the session-record watch under this run's DERIVED name, which a retry adopts rather than replacing, and interprets its confirmation",
+	"rollbackEphemeralConsumers":           "deletes only what this attempt CONFIRMABLY created, because an error proves neither that nothing was created nor that what is there is ours",
+	"deleteEphemeralConsumerDefinite":      "the two-attempt absence proof: success and not-found are definite, anything else is an ambiguity that fails initialization closed",
+	"deleteEphemeralConsumerBestEffort":    "the rollback's single-shot delete, whose outcome nothing depends on",
+	"createEphemeralConsumerOwned":         "the ActionCreate wrapper whose bool is the rollback's ONLY licence",
 	"processJSConsumer":                    "creates or adopts a plain QoS 1/2 consumer; an existing durable makes the create an UPDATE, and the response's config is what the record then persists",
 	"processSharedJSConsumer":              "joins the shared group consumer; membership is persisted BEFORE the create so a concurrent leaver's last-holder scan sees this joiner",
 	"classifySharedGroups":                 "reads, in one batch, whether each group durable a RESIDENT shared membership is about to be restored into exists and is canonical; a settled absence and an unreadable reply are kept distinct, and only the settled absence licenses a repair (F-077 made it repairable through mqttSharedGroupVerdictIsRepairable) while an unreadable or indeterminate reply still licenses nothing",

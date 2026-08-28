@@ -3,6 +3,7 @@ package mqtt
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -465,7 +466,7 @@ func TestMQTTReconcileEntrySurvivesNoLocalWorker(t *testing.T) {
 // written into the no-local expiry reconcile at every manager start.
 func TestMQTTSessRecordWatchConsumerConfig(t *testing.T) {
 	t.Parallel()
-	ccr := mqttSessRecordWatchConsumerConfig("", "$MQTT.sub.test")
+	ccr := mqttSessRecordWatchConsumerConfig("", "$MQTT.sub.test", "IDTOK", "OWNTOK")
 	if ccr.Stream != mqttSessStreamName {
 		t.Fatalf("the watch must consume the session stream, got %q", ccr.Stream)
 	}
@@ -481,9 +482,24 @@ func TestMQTTSessRecordWatchConsumerConfig(t *testing.T) {
 	if ccr.Config.InactiveThreshold != mqttSessRecordWatchInactiveThreshold {
 		t.Fatalf("the consumer must carry its own inactivity threshold, got %v", ccr.Config.InactiveThreshold)
 	}
+	// The name is DERIVED from the run's identity token, and ActionCreate is what
+	// makes an existing consumer under it a refusal rather than a silent adoption.
+	if ccr.Config.Name != mqttSessRecordWatchName("IDTOK") {
+		t.Fatalf("the watch name must derive from the run identity, got %q", ccr.Config.Name)
+	}
+	// The owner nonce is a SEPARATE token from the one in the name: it is the only
+	// field a colliding run would submit differently, so it is what the server's
+	// equality check discriminates on.
+	if got := ccr.Config.Metadata[mqttEphemeralRunKey]; got != "OWNTOK" {
+		t.Fatalf("the run metadata must carry the owner nonce, got %q", got)
+	}
+	if got := ccr.Config.Metadata[mqttEphemeralPurposeKey]; got != mqttEphemeralPurposeWatch {
+		t.Fatalf("the purpose metadata must name this consumer's purpose, got %q", got)
+	}
+
 	// With a domain configured the token carries its own separator, so the filter is
 	// still exactly one trailing token.
-	if got := mqttSessRecordWatchConsumerConfig("dom.", "$MQTT.sub.test").Config.FilterSubject; got != mqttSessStreamSubjectPrefix+"dom.*" {
+	if got := mqttSessRecordWatchConsumerConfig("dom.", "$MQTT.sub.test", "IDTOK", "OWNTOK").Config.FilterSubject; got != mqttSessStreamSubjectPrefix+"dom.*" {
 		t.Fatalf("the domain form must stay exact, got %q", got)
 	}
 }
@@ -618,90 +634,168 @@ func TestMQTTWatchSkipsOwnOriginForSpawn(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Initialization is failure-atomic for the per-broker ephemeral consumers
+// A retried initialization reconciles its own stray instead of accumulating
 // ---------------------------------------------------------------------------
 
-// TestMQTTFailedInitLeavesNoEphemeralConsumers pins the leak class the holistic review
-// found twice, in two places. Both per-broker consumers are UNIQUELY named, so nothing
-// later adopts or replaces one; manager initialization tears down only local
-// subscriptions; and every MQTT connection retries the whole initialization. A
-// consumer created before a step that fails is therefore deleted by nothing, and a
-// persistent misconfiguration accumulates one per attempt.
+// TestMQTTAmbiguousCreateIsReconciledNotAccumulated pins what bounds the per-broker
+// ephemeral consumers now that both are named from the server run's identity.
 //
-// The test forces the watch create to fail and retries initialization several times.
-// What it asserts is that the counts do not GROW — the property that distinguishes a
-// stray consumer (which the inactivity threshold eventually reaps) from an unbounded
-// per-retry accumulation (which it cannot keep up with).
-func TestMQTTFailedInitLeavesNoEphemeralConsumers(t *testing.T) {
+// It replaces TestMQTTFailedInitLeavesNoEphemeralConsumers, whose name is false for
+// the ambiguous arm: a create whose response was LOST is deliberately no longer
+// deleted by the rollback, because no error can distinguish "our create landed" from
+// "a foreign consumer occupies that name" — both server paths return structured
+// errors before they look the name up. What bounds the leak instead is the derived
+// name: the SAME run's next attempt reconciles the stray, so the count stays at one
+// however many attempts fail.
+//
+// "The count does not grow" would be too weak an assertion — zero satisfies it, so a
+// rollback that wrongly deleted a foreign consumer would pass. Every arm below
+// therefore asserts an EXACT count, and the arms are run against ONE Server, because
+// a fresh Server is a fresh identity and would legitimately create its own consumer.
+func TestMQTTAmbiguousCreateIsReconciledNotAccumulated(t *testing.T) {
 	e := testNewWatchEnv(t, "wchinitleak")
 
-	countConsumers := func() int {
+	namesOn := func(stream string) []string {
 		t.Helper()
-		sess, err := e.asm.jsa.consumerList(mqttSessStreamName)
+		cis, err := e.asm.jsa.consumerList(stream)
 		if err != nil {
-			t.Fatalf("list session-stream consumers: %v", err)
+			t.Fatalf("list %s consumers: %v", stream, err)
 		}
-		ret, err := e.asm.jsa.consumerList(mqttRetainedMsgsStreamName)
-		if err != nil {
-			t.Fatalf("list retained-stream consumers: %v", err)
+		out := make([]string, 0, len(cis))
+		for _, ci := range cis {
+			if ci != nil {
+				out = append(out, ci.Name)
+			}
 		}
-		return len(sess) + len(ret)
+		return out
+	}
+	countNamed := func(stream, name string) int {
+		t.Helper()
+		n := 0
+		for _, got := range namesOn(stream) {
+			if got == name {
+				n++
+			}
+		}
+		return n
 	}
 
-	before := countConsumers()
+	// One server, one identity, many attempts — the same-run retry the design bounds.
+	srv := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "initfail"}
+	srv.running.Store(true)
+	srv.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+	defer close(srv.quitCh)
+	id, _ := srv.ephemeralIdentity()
+	watchName := mqttSessRecordWatchName(id)
+	obsName := mqttRetainedObserverName(id)
 
-	restore := setMQTTTestWatchConsumerCreateFail(true)
-	defer restore()
-
-	// Each attempt provisions the retained consumer and then fails on the watch, which
-	// is exactly the window the rollback covers.
-	for i := 0; i < 3; i++ {
-		srv := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "initfail"}
-		srv.running.Store(true)
+	attempt := func() error {
+		srv.mqtt.sessmgr.mu.Lock()
 		srv.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-		c := srv.createInternalAccountClient()
-		if _, err := srv.getOrCreateMQTTAccountSessionManager(c); err == nil {
-			close(srv.quitCh)
+		srv.mqtt.sessmgr.mu.Unlock()
+		_, err := srv.getOrCreateMQTTAccountSessionManager(srv.createInternalAccountClient())
+		return err
+	}
+
+	// Deletes are observed, never altered: which names a run asks to delete is half
+	// the contract here, and both halves below assert on it.
+	var deletes []string
+	var deleteMu sync.Mutex
+	delRestore := setMQTTTestConsumerDeleteHook(func(stream, name string, _ int) (bool, error, bool) {
+		deleteMu.Lock()
+		deletes = append(deletes, name)
+		deleteMu.Unlock()
+		return true, nil, false
+	})
+	defer delRestore()
+	deletedNames := func() []string {
+		deleteMu.Lock()
+		defer deleteMu.Unlock()
+		return append([]string(nil), deletes...)
+	}
+	countDeletes := func(name string) int {
+		n := 0
+		for _, got := range deletedNames() {
+			if got == name {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Arm 1 — a CONFIRMED observer create followed by a forced watch failure. The
+	// observer create is confirmed, so the rollback removes it; the watch create never
+	// ran, so there is nothing of ours at that name to remove.
+	failRestore := setMQTTTestWatchConsumerCreateFail(true)
+	for i := 0; i < 3; i++ {
+		if err := attempt(); err == nil {
 			t.Fatal("fixture: initialization must fail while the watch create is forced to fail")
 		}
-		close(srv.quitCh)
+	}
+	failRestore()
+	if got := countNamed(mqttRetainedMsgsStreamName, obsName); got != 0 {
+		t.Fatalf("a confirmed observer create must be rolled back by its own failed attempt, %d left under %q", got, obsName)
+	}
+	if got := countNamed(mqttSessStreamName, watchName); got != 0 {
+		t.Fatalf("a watch create that never ran must leave nothing, %d found under %q", got, watchName)
 	}
 
-	after := countConsumers()
-	if after > before {
-		t.Fatalf("a failed initialization must leave no ephemeral consumer behind: %d before, %d after three attempts", before, after)
-	}
-	restore()
-
-	// The AMBIGUOUS half: the watch create LANDS and its response is lost, so the
-	// consumer exists under exactly the name the request carried. An error is not
-	// proof that nothing was created, which is why the rollback deletes the failing
-	// create's own name rather than only the previous consumer's.
+	// Arm 2 — the AMBIGUOUS watch create: it LANDS and its response is lost. The
+	// consumer exists under exactly the name the request carried, and the rollback
+	// must NOT delete it, because the error it saw proves nothing about whose
+	// consumer that is.
 	var landed atomic.Bool
-	hookRestore := setMQTTTestConsumerCreateResultHook(func(stream, name string, err error) error {
-		if stream == mqttSessStreamName && err == nil {
+	hookRestore := setMQTTTestConsumerCreateResultHook(func(ccr *CreateConsumerRequest, err error) error {
+		if ccr.Stream == mqttSessStreamName && err == nil {
 			landed.Store(true)
 			return errMQTTTestLostResponse
 		}
 		return err
 	})
-	defer hookRestore()
-
-	for i := 0; i < 3; i++ {
-		srv := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "initambig"}
-		srv.running.Store(true)
-		srv.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-		c := srv.createInternalAccountClient()
-		if _, err := srv.getOrCreateMQTTAccountSessionManager(c); err == nil {
-			close(srv.quitCh)
-			t.Fatal("fixture: initialization must fail when the watch create's response is lost")
-		}
-		close(srv.quitCh)
+	if err := attempt(); err == nil {
+		t.Fatal("fixture: initialization must fail when the watch create's response is lost")
 	}
 	if !landed.Load() {
-		t.Fatal("fixture: the ambiguous create never ran, so this half proves nothing")
+		t.Fatal("fixture: the ambiguous create never ran, so this arm proves nothing")
 	}
-	if ambiguous := countConsumers(); ambiguous > before {
-		t.Fatalf("a create whose response was lost must still be rolled back: %d before, %d after three attempts", before, ambiguous)
+	if got := countNamed(mqttSessStreamName, watchName); got != 1 {
+		t.Fatalf("a create whose response was lost must survive its own attempt's rollback: %d consumers under %q", got, watchName)
+	}
+	if got := countDeletes(watchName); got != 0 {
+		t.Fatalf("an unconfirmed create licenses no delete, but %q was deleted %d time(s)", watchName, got)
+	}
+
+	// Arm 3 — repeated failures stay at EXACTLY one. Each retry adopts the stray
+	// (config-identical, same run) rather than minting another.
+	for i := 0; i < 3; i++ {
+		if err := attempt(); err == nil {
+			t.Fatal("fixture: initialization must keep failing while the response is lost")
+		}
+	}
+	if got := countNamed(mqttSessStreamName, watchName); got != 1 {
+		t.Fatalf("a retried initialization must reconcile its own stray, not accumulate: %d consumers under %q", got, watchName)
+	}
+	hookRestore()
+
+	// Arm 4 — the two purposes reconcile DIFFERENTLY, and the delete log is what
+	// distinguishes them. A successful attempt must delete the observer's name before
+	// creating it (a fresh DeliverAll position is the whole point) and must NOT delete
+	// the watch's, which it adopts.
+	obsDeletesBefore := countDeletes(obsName)
+	watchDeletesBefore := countDeletes(watchName)
+	if err := attempt(); err != nil {
+		t.Fatalf("initialization must succeed once nothing is forced to fail: %v", err)
+	}
+	if got := countDeletes(obsName) - obsDeletesBefore; got == 0 {
+		t.Fatalf("the observer must establish absence before creating, but %q was never deleted", obsName)
+	}
+	if got := countDeletes(watchName) - watchDeletesBefore; got != 0 {
+		t.Fatalf("the watch adopts its own consumer and must delete nothing, but %q was deleted %d time(s)", watchName, got)
+	}
+	if got := countNamed(mqttSessStreamName, watchName); got != 1 {
+		t.Fatalf("the watch must have adopted exactly one consumer, found %d under %q", got, watchName)
+	}
+	if got := countNamed(mqttRetainedMsgsStreamName, obsName); got != 1 {
+		t.Fatalf("the observer must end with exactly one consumer, found %d under %q", got, obsName)
 	}
 }
