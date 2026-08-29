@@ -2610,3 +2610,213 @@ and it is exhaustive with no `default` so a new outcome cannot inherit a claim. 
 exposure this finding names is confined to the DISCONNECT and log paths, which is where it
 was before, plus the CONNACK's deliberate UNDER-claim in the other direction — both stated
 in `docs/CONFORMANCE.md`.
+
+## F-087: Rebuild every in-flight register rewrite from the authoritative reread
+
+**Title:** Register rewrite/claim/recovery consistency: a retargeted CAS that re-sends a
+stale body erases what a concurrent writer proved
+
+- Status: **Open. Alpha blocker, unconditional.** Filed 2026-08-29 by the F-072
+  plan-review loop (eleven Codex rounds; the analysis lives in
+  `~/.claude/lanes/f-072/`, `review-ledger.md` and `plan.md` revision 11).
+- Classification: HA arbitration — durable-record lifecycle on `$MQTT_inflight`
+- Release treatment: Alpha blocker. The `Retired` erasure below re-sends a payload the
+  client has already completed, which is a QoS 2 exactly-once violation, not a
+  bookkeeping cost.
+
+### The finding
+
+Several writers of `$MQTT_inflight` build a record body once, and when their CAS is
+rejected they reread the subject only to learn the **sequence** — then retarget the CAS
+with the **original body**. Whatever a concurrent writer put in the record between the
+build and the retarget is silently erased. The first instance was found in round 1 of the
+F-072 loop and round 2 widened it from that one site to the closed writer set below; per
+`feedback_close_the_class_with_a_property`, the fix is one rule over a frozen close set,
+not per-site patches.
+
+**The instance that makes this an alpha blocker.** The resume claim contest snapshots the
+record once (`claimed := *fr.rec`, `inflight_register.go:3329`) and, on the
+`cur.ClaimSeq < claimSeq` arm, retargets with `expectSeq = smsg.Sequence; continue`
+(`:3419`) — re-proposing the stale snapshot. A **retirement written concurrently is
+erased**: `markInflightRegisterRetired` exists precisely so a restart does not re-send a
+payload whose exchange is past PUBREC, and a claim rewrite that overwrites `Retired`
+lets exactly that re-send happen after the client's PUBCOMP. Worked end to end in the
+F-072 lane, rounds 1 and 2.
+
+### The class, extensionally
+
+The production writers of `$MQTT_inflight` (every `storeInflightCAS` caller), each with
+its disposition under the rule:
+
+1. **The resume claim contest** (`:3342`) — the alpha-blocking instance above. Owns
+   `Claim`/`ClaimSeq`; must rebuild from `cur` on every retarget.
+2. **`storeInflightRegister`'s same-delivery takeover** (`:2964`, `:2981`) — replaces a
+   foreign register naming the same `(Dur, Seq)` with this allocation's nonce. It cannot
+   rebuild from `cur` (it replaces a foreign body on purpose), so it needs a
+   **source-level converging disposition**: preserve or adopt the occupant's transmission
+   history, or quarantine the source without letting it take a second identifier. The
+   F-072 lane established the constraint set the hard way — an unconditional refusal
+   fails because `abandonInflightRegister` (`:3144`) clears the `cpending` mapping, so
+   AckWait re-offers allocate a fresh identifier; and a contested-retry reservation was
+   reviewed twice and does not settle in every lifecycle state (a stable foreign pair
+   retries forever; a cancellation arriving while the retry is parked leaves no store
+   callback to settle `regPending`). Whatever converges here must define **settlement**
+   for: occupant completes, occupant is stable, cancellation during the contest, session
+   discard during the contest.
+3. **`markInflightRegisterRetired`** (`:1640`) — owns `Retired`; already rereads, must
+   rebuild from `cur` rather than re-propose its constructed body on retry.
+4. **`markInflightRegisterCancelled`** (`:1767`) and **`markInflightRegisterCancelledPending`**
+   (`:2470`) — **inside the rule, not exceptions.** Both construct sparse bodies (`:1780`,
+   `:2483`) and retarget them (`:1832`, `:2515`), so a cancellation racing a claim rewrite
+   or a retirement erases `Claim`/`ClaimSeq` or `Retired` exactly as the contest does. The
+   F-072 loop's round 3 rejected "cancellation dominates" as licence for that: dominance is
+   a statement about the terminal DISPOSITION — recovery honors `Cancelled` over the other
+   facts — not about the right to erase what a concurrent writer proved. They rebuild from
+   `cur`, set `Cancelled`, and leave every other field as read. Their
+   identifier-lifecycle half is **F-088**, not this finding.
+5. **The recovery live-entry sequence repair** (`:4086`) — applies a claim rewrite's
+   sequence to a live entry unconditionally; a late apply can regress `regSeq` past a
+   newer sequence, aiming later exact-sequence deletes at a dead message. Application
+   must be **lineage-aware, not merely base-conditioned** — the F-072 loop refuted the
+   base-only form twice: an operation starting at S1 can legitimately retarget through S2
+   and land S3 while memory has advanced to S2, and a check accepting only the original
+   base then rejects S3, leaving `regSeq` aimed at dead S2. An application may advance
+   from **any sequence the operation authoritatively traversed**, and refuses unrelated
+   state; the traversal chain terminates on `Retired`, `Cancelled`, a foreign claim, a
+   different nonce, an unreadable record, or a subject/body mismatch.
+
+Also in scope, because the same rounds proved recovery consumes what these writers
+produce: the **post-contest routing**. Recovery sorts records into `live`/`retired`
+before the contest runs (`:3706`), so a record that gained `Retired` between the
+classification and the contest's own reread comes back retired but sits in `live`
+(`:3850`) and is installed as deliverable. Re-sorting on the returned body is necessary
+and NOT sufficient — the F-072 loop's round 3 required an explicit routing over **five
+result classes**, and a plausible implementation that preserves the `Retired` bit can
+still install a completed payload as deliverable without it:
+
+- **owned, live** — install as today;
+- **owned, newly retired** — route to the retirement arm; never re-contested, and never
+  left in the live duplicate-source grouping;
+- **failed/opaque, live** and **failed/opaque, retired** — retain the existing
+  poisoned-sibling semantics where the source identity is still trustworthy;
+- **closed / displaced** — as today.
+
+Every result converted to opaque is counted **before** `piSpaceIncomplete` is computed,
+keyed on what the walk found rather than what the pass installed (`:3988` already makes
+that distinction for the existing opaque class).
+
+**Also in scope, assigned here by the F-072 lane's residual accounting: the stale
+send-authority race.** An in-flight delivery callback's ownership check precedes its
+socket write and is never rechecked, so a teardown, a subscribe denial, a recovery apply
+or a session discard can remove its authority — and free its packet identifier — while
+the callback still writes its PUBLISH. Two exchanges can then use one identifier, and an
+acknowledgement can bind to the wrong message. Pre-existing (today's confirm→send
+interval has it identically), surfaced and repeatedly re-verified by the F-072 rounds,
+and owned here because the repair is a revalidation inside the same lifecycle this
+finding's rule governs. A dossier-satisfying implementation that closes only the CAS
+writers has NOT closed F-087.
+
+### The rule
+
+> A retargeted CAS on `$MQTT_inflight` starts from the record it just read and mutates
+> only the fields the operation owns. A body assembled before the reread describes the
+> record as it was; re-proposing it erases the winner of the round.
+
+Monotonic facts (`Retired`) merge forward; identity facts (`Nonce`) never change under
+one exchange; arbitration facts (`Claim`/`ClaimSeq`) belong to the contest alone. F-072's
+transmission fact deliberately does NOT enter this rule: its settled design records it on
+a sibling marker that is created once and deleted once, never rewritten, precisely so the
+register body carries no transmission field for these writers to erase.
+
+### What this finding is not
+
+It does not own the DUP flag (F-072, blocked behind this), the transmitted-cancellation
+identifier lifecycle (F-088), or any migration/legacy machinery — every shape here is
+current-format, and an unsupported shape stays refused.
+
+### Acceptance
+
+- A deterministic race test per class member: the contest retarget racing a retirement
+  (the payload must stay suppressed **behaviorally** — source re-offered, nothing
+  delivered — not just the stored bit intact); a cancellation retarget racing a claim
+  rewrite and racing a retirement (the tombstone must land WITHOUT erasing
+  `Claim`/`ClaimSeq` or `Retired`); the sequence repair racing a newer apply in both
+  orders **and through an intermediate retarget** (S1 → S2 → S3 with memory already at
+  S2 — the case a base-only check fails); the post-contest routing; and the stale
+  send-authority race (authority removed and identifier freed mid-write, then proving no
+  second exchange can bind the identifier).
+- The takeover disposition must include a test that drives a real AckWait re-offer and
+  proves the source never takes a second identifier, plus settlement tests for the four
+  contest lifecycle states named above.
+- Mutations: re-propose the stale body at each rebuild site; drop the reclassification;
+  apply a sequence on a nonce match alone. Each must fail its paired test
+  (`feedback_mutation_checks_must_discriminate`).
+
+## F-088: A transmitted delivery's cancellation must not free its packet identifier
+
+**Title:** `Cancelled` over a transmitted delivery lets recovery free an identifier the
+client may still hold
+
+- Status: **Open. Alpha blocker, unconditional. Ordered after F-087** — persisting this
+  state safely depends on settled rewrite rules.
+- Classification: MQTT conformance — packet-identifier lifecycle ([MQTT-2.3.1-4])
+- Release treatment: Alpha blocker. Identifier reuse while the client holds the
+  identifier can pair an acknowledgement with the wrong message.
+
+### The finding
+
+`Cancelled` is written by two functions reached from three situations, and only one of
+them proves no transmission happened:
+
+1. **Pre-send withdrawal** — `markInflightRegisterCancelledPending`
+   (`inflight_register.go:2470`), and `confirmInflightRegister`'s ladder for an
+   allocation cancelled while `regPending`. The store was still in flight; nothing was
+   ever sent. The tombstone's "never transmitted" claim is true here.
+2. **Abandonment of a delivery whose register store completed** — `purgeConsumerPendingLocked`
+   (`:2292`) collects **non-`regPending`** entries too. A cleared `regPending` proves the
+   REGISTER STORE completed, not that anything was transmitted — the confirm→send interval
+   means some of these were never sent, a distinction the F-072 lane established and its
+   marker design encodes. The population therefore includes genuinely transmitted
+   deliveries, for which the tombstone asserts a falsehood, and the
+   cleanup ladder that consumes them, `voidRegistersOnStream` (`:1963-1985`), falls back
+   to `markInflightRegisterCancelled` when their delete cannot be proven. The tombstone
+   then asserts a falsehood.
+3. **A cancellation racing a transmission-state write** — prospective, not current: once
+   F-072's marker exists, a cancellation can land between the send and the marker delete,
+   and the tombstone dominates. Named now so the lifecycle is designed with it in view.
+
+Recovery frees the identifier for any `Cancelled` register **without distinguishing these
+cases** (`:3720`), so case 2 frees an identifier the client is still holding, against
+[MQTT-2.3.1-4] and against the in-flight rule the rest of `inflight_register.go`
+enforces. The comment corpus compounds it: `storeInflightRegister:2986` and the
+`Cancelled` field comment both assert that a cancellation "records a delivery that was
+NEVER transmitted", which `purgeConsumerPendingLocked` falsifies.
+
+This is **pre-existing** — reachable today through the teardown paths that VOID a live
+in-flight delivery's registration (`purgeConsumerPendingLocked` and the ladder above; a
+drain is NOT one of them, since `stageDrain` retains confirmed deliveries in the drain
+rather than freeing their identifiers) — and was surfaced by F-072's review rounds, which
+needed to know what a cancellation proves. The F-072 lane's consult explicitly rejected
+pinning the current behavior as a documented deviation: it is a defect to fix, not a
+residual to accept.
+
+### The safe lifecycle
+
+- `Cancelled` **and provably never transmitted** → reap and free, as today.
+- `Cancelled` **and transmitted (or unprovable)** → suppress any further delivery, but
+  keep the identifier **reserved** until the protocol exchange completes
+  (PUBACK/PUBREC/PUBCOMP as applicable) or the session is destroyed. The reservation
+  must not be redeliverable through the removed consumer.
+- Every cancellation writer records which case it is writing, and recovery honors it.
+  How that fact is persisted is **F-087-dependent** (it must survive the rewrite rules),
+  which is why this finding is ordered second.
+
+### Acceptance
+
+- A teardown of a transmitted, unacknowledged QoS 1 and QoS 2 delivery followed by
+  restart: the identifier is still reserved, no new allocation reuses it, and the
+  client's late acknowledgement completes or the session's destruction frees it.
+- The pre-send case still frees promptly (the F-072 lane's fixtures cover this shape).
+- The corrected comment corpus: no comment claims `Cancelled` proves never-transmitted.
+- Mutation: recovery frees on `Cancelled` unconditionally again; the paired restart test
+  must fail.

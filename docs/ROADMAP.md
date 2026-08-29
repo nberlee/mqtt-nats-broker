@@ -2004,22 +2004,73 @@ takeover.
   released it) and no record fence on any route, so it adds no edge to the established
   `as.mu` → `sess.mu` order, and the section performs one map delete with no outward wait.
 
+- [ ] [F-087: Rebuild every in-flight register rewrite from the authoritative
+  reread](findings/ha-arbitration.md#f-087-rebuild-every-in-flight-register-rewrite-from-the-authoritative-reread).
+  **Alpha blocker, unconditional. Filed 2026-08-29 by F-072's plan-review loop; F-072 is
+  BLOCKED behind it.** Several `$MQTT_inflight` writers build a record body once and, on a
+  CAS rejection, retarget at the reread's sequence while re-proposing the **stale body** —
+  erasing whatever a concurrent writer proved. The blocking instance: the resume claim
+  contest (`claimed := *fr.rec` at `inflight_register.go:3329`, retarget at `:3419`) can
+  erase a concurrent **`Retired`**, so a payload the client already completed is re-sent
+  after PUBCOMP. The dossier carries the frozen close set (the contest, the same-delivery
+  takeover at `:2964`, `markInflightRegisterRetired`, the two cancellation writers —
+  INSIDE the rule, since dominance covers the terminal disposition and not the right to
+  erase `Claim`/`ClaimSeq`/`Retired` — and the live-entry sequence repair at `:4086`)
+  plus the five-class post-contest routing, the rule (rebuild from `cur`, mutate only
+  owned fields,
+  monotonic facts merge forward), and the acceptance tests. **Scope, per the 2026-08-29
+  decision: the converging same-delivery takeover belongs HERE** — an unconditional refusal
+  and a contested-retry reservation were both designed and refuted in the F-072 lane (the
+  refusal lets AckWait mint a second identifier because `abandonInflightRegister` clears the
+  `cpending` mapping; the retry does not settle under a stable foreign pair or a
+  cancellation parked between offers), and the dossier records the settlement states any
+  replacement must define. Read `~/.claude/lanes/f-072/` before planning: eleven review
+  rounds of analysis, refuted designs and worked interleavings live there.
+
 - [ ] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
-  **Alpha blocker.** `trackPublish` sets DUP from the JetStream delivery count
-  (`dcount > 1`) and that value reaches the wire through `mqttPubFlagDup`. MQTT-3.3.1-3
-  ties the outgoing DUP flag to whether **the outgoing PUBLISH** is a retransmission, and
-  a copy offered then refused before `trackPublish` produced no PUBLISH at all — so the next
-  offer is still a FIRST transmission and must carry DUP=0. F-071's single-publisher capture
-  shows seven of eight messages arriving with DUP=1 on their first client-visible PUBLISH.
-  Found by review of that capture; I had recorded the same observation as "legitimate",
-  which was a conclusion about the protocol drawn from what the implementation does.
-  The fix tracks whether THIS allocation has already put a PUBLISH on the wire.
-  **TWO deterministic tests are required, and the second is what forces a durable fix.**
-  (1) a pre-`trackPublish` claim/materialization refusal, then DUP=0 on the first PUBLISH;
-  (2) a seam after `storeInflightRegister` confirms and before `mqttEnqueuePublishMsgTo`
-  runs, then restart, recover, re-offer, and DUP=0 on the first client-visible PUBLISH.
+  **Alpha blocker. BLOCKED behind F-087; design settled, do not re-derive it.**
+  `trackPublish` sets DUP from the JetStream delivery count (`dcount > 1`) and it reaches
+  the wire through `mqttPubFlagDup`. MQTT-3.3.1-3 ties DUP to whether **the outgoing
+  PUBLISH** is a retransmission, and a copy offered then refused before `trackPublish`
+  produced no PUBLISH at all — so the next offer is a FIRST transmission and must carry
+  DUP=0. F-071's single-publisher capture shows seven of eight messages arriving DUP=1 on
+  their first client-visible PUBLISH. **An eleven-round plan loop (2026-08-29,
+  `~/.claude/lanes/f-072/`, stopped at a pre-registered gate) settled the design and it is
+  binding on the next attempt:** the durable fact is a sibling **unsent marker**
+  (`$MQTT.inflight.<idHash>.<gen>.<PI>.unsent`) created with the register in ONE atomic
+  batch (`$MQTT_inflight` must gain `AllowAtomicPublish`) and DELETED at its immortal exact
+  sequence to record the transmission — because eight rounds proved the seam is the
+  register **rewrite**: an in-place `Sent` field moves the record's sequence and every
+  exact-sequence operation racing it is wrong (five cover mechanisms were built and each
+  failed review; do not re-propose it, nor the plan's other refused designs — in-memory
+  only, tombstone-style reaping of an unproven register, register-after-send, holding
+  `sess.mu` across the socket write, dropping the send reservation, a durable terminal
+  verdict, re-homing the durable half, and a per-session watermark).
+  What remains open is narrow and F-087-shaped: the same-delivery contested-store
+  lifecycle, and two one-sided recovery states (register present + marker authoritatively
+  absent; register absent + orphan marker). **TWO deterministic tests remain required and
+  the second forces the durable fix.** (1) a pre-`trackPublish` claim/materialization
+  refusal, then DUP=0 on the first PUBLISH; (2) a seam after the pair confirms and before
+  the send, then restart, recover, re-offer, and DUP=0 on the first client-visible PUBLISH.
   Test (1) alone is satisfied by transient state while the crash path still emits DUP=1, so
-  a fix passing only (1) has NOT closed this. Neither may be load-sensitive.
+  a fix passing only (1) has NOT closed this. Neither may be load-sensitive. Changing this
+  acceptance was ruled the user's alone, and the user declined (2026-08-29).
+
+- [ ] [F-088: A transmitted delivery's cancellation must not free its packet
+  identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).
+  **Alpha blocker, unconditional. Ordered after F-087** — persisting the distinction safely
+  depends on settled rewrite rules. `Cancelled` is written over never-transmitted
+  allocations (true) and, via `purgeConsumerPendingLocked:2292` and the
+  `voidRegistersOnStream` ladder that consumes its records (`:1963-1985`), over
+  **transmitted** ones (false), and
+  recovery frees the identifier for any `Cancelled` register without distinguishing
+  (`:3720`) — so a teardown can free an identifier the client still holds, against
+  [MQTT-2.3.1-4]. **Pre-existing**, surfaced by F-072's rounds; the consult explicitly
+  rejected accepting it as a documented deviation. The safe lifecycle is in the dossier:
+  never-transmitted reaps as today, transmitted-or-unprovable stays reserved until the
+  exchange completes or the session is destroyed. Also owed: the comment corpus stops
+  claiming `Cancelled` proves never-transmitted (`storeInflightRegister:2986`, the field
+  comment).
 
 - [ ] [F-071: Preserve same-topic ordering for affine QoS 2 deliveries](findings/release-investigations.md#f-071).
   **Alpha blocker, and a defect rather than a flake — but NOT a spec violation, and the

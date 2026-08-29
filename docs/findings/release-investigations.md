@@ -453,11 +453,37 @@ demonstrated, and does not cover F-071, whose mechanism is unknown.
 **Title:** Derive the outgoing DUP flag from MQTT retransmission, not the JetStream
 delivery count
 
-- Status: **Open. Alpha blocker.** Filed 2026-08-22, found by review of F-071's packet
-  capture — the same trace carries two independent defects.
+- Status: **Open. Alpha blocker. BLOCKED behind
+  [F-087](ha-arbitration.md#f-087-rebuild-every-in-flight-register-rewrite-from-the-authoritative-reread)
+  since 2026-08-29, by decision at that day's hard stop.** Filed 2026-08-22, found by
+  review of F-071's packet capture — the same trace carries two independent defects.
 - Classification: MQTT conformance — PUBLISH flags
 - Release treatment: Alpha blocker. It is a wire-visible protocol error on a first
   transmission, not a liveness or performance cost.
+- **Design: SETTLED, 2026-08-29, and binding on the next attempt.** An eleven-round Codex
+  plan loop (`~/.claude/lanes/f-072/`, plan revision 11 and its review ledger) converged on
+  the **sibling unsent marker**: the register is created unchanged, a marker on
+  `$MQTT.inflight.<idHash>.<gen>.<PI>.unsent` is created in the SAME atomic batch
+  (`$MQTT_inflight` gains `AllowAtomicPublish`), and the transmission is recorded by
+  DELETING the marker at its immortal exact sequence. Neither member of the pair is ever
+  rewritten BY THIS MECHANISM — claim arbitration, retirement and cancellation still
+  rewrite registers, which is F-087's subject — so no sequence F-072 depends on ever
+  moves. The loop
+  proved the alternative — an in-place `Sent` field — unsound over eight rounds: a rewrite
+  moves the record's stream sequence, and every exact-sequence operation racing it is wrong;
+  five successive cover mechanisms (a completion-side delete, a terminal handoff, sequence
+  lineage, regression guards, an authoritative body cache) each failed review, one of them
+  leaving an unreapable `Lost`-source register holding a Receive Maximum slot. The lane's
+  plan lists every refused design so none returns. What remains open is narrow: the
+  same-delivery contested-store lifecycle (now F-087's converging-takeover scope) and two
+  one-sided recovery states (register present with the marker authoritatively absent;
+  register absent with an orphan marker). The requirement below — now worded "the durable
+register state" — binds
+  the durable **semantics** (excluding an in-memory-only flag and a `Cancelled`
+  tombstone), not one record's JSON shape; a register-plus-marker pair in one indivisible
+  batch satisfies it. Re-scoping the two acceptance tests was ruled outside the
+  implementing lane's authority, was put to the user on 2026-08-29, and was declined: both
+  tests remain binding.
 
 ### The finding
 
@@ -536,9 +562,11 @@ carries DUP=1 — the same violation, reached by a different route. **No `mqttPe
 survives a restart**, so a fix built only on in-memory state passes the obvious test and
 leaves this open.
 
-So the fix owes durable semantics: the register itself must be able to say "identity durable,
-nothing transmitted yet", distinct from "transmitted at least once". Note that a `Cancelled`
-tombstone is NOT that fact — it means never-transmitted AND withdrawn.
+So the fix owes durable semantics: the durable register state must be able to say "identity
+durable, nothing transmitted yet", distinct from "transmitted at least once". (Reworded per
+the 2026-08-29 ruling from "the register itself", which falsely mandated an in-place field;
+the settled design carries the fact on the register's sibling marker.) Note that a
+`Cancelled` tombstone is NOT that fact — it means never-transmitted AND withdrawn.
 
 ### Acceptance criteria — TWO deterministic tests, and both are required
 
