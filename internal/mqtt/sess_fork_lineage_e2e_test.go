@@ -461,7 +461,8 @@ func testAssertCurrentOwner(t *testing.T, sess *mqttSession, idHash string) {
 //
 // The bound session's record here is a PRODUCTION create whose ONLY save is the accept
 // save: the client's previous clean-start close deleted its record, and the reconnect's
-// create used to inherit the retirement watermark's RWID. That inheritance is gone, so
+// create used to inherit an identity from the retirement watermark. That inheritance is
+// gone — and so is the field it read, removed with the vanished-record item — so
 // the create is parentless and a sibling of it can no longer be proven.
 //
 // The RESIDUAL is that unprovability. What the displaced client is TOLD is no longer part
@@ -492,7 +493,7 @@ func TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 
 	// A clean-start session whose close DISCARDS its record: that teardown writes the
-	// watermark naming the record it deletes.
+	// retirement watermark before deleting anything.
 	c0, r0 := testMQTTConnect(t, &mqttConnInfo{clientID: "createe2e", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(t, r0, mqttConnAckRCConnectionAccepted, false)
 	testMQTTSub(t, 1, c0, r0, []*mqttFilter{{filter: "createe2e/gone", qos: 1}}, []byte{1})
@@ -503,13 +504,17 @@ func TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient(t *testing.T) {
 	asm := testMQTTGetGlobalASM(t, s)
 	idHash := getHash("createe2e")
 	testMQTTWaitForRecordAbsent(t, asm, idHash)
-	if r, _, st := asm.jsa.loadGenRetirement(asm.domainTk, idHash); st != mqttRetirementValid || r.RWID == _EMPTY_ {
-		t.Fatalf("the clean-start close must record a retirement naming the deleted record: status %v", st)
+	if _, _, st := asm.jsa.loadGenRetirement(asm.domainTk, idHash); st != mqttRetirementValid {
+		t.Fatalf("the clean-start close must record a valid retirement watermark: status %v", st)
 	}
 
-	// The reconnect's record is a CREATE that no longer inherits it — and stays the only
-	// save. The watermark is still asserted valid above: it remains a retirement fact,
-	// and only its READER on the create path was removed.
+	// The reconnect's record is a CREATE, and stays the only save. The watermark is
+	// asserted VALID above and nothing more: it remains a generation-retirement fact, but
+	// it no longer carries any record identity for a create to inherit — the reader was
+	// removed by the write-lineage audit and the field itself was removed later. So this
+	// fixture proves the create is the only save, not that an available identity was
+	// deliberately ignored; that property is measured where an identity still exists, in
+	// sess_write_lineage_audit_test.go's marker and clear() arms.
 	ci := &mqttV5ConnInfo{
 		clientID: "createe2e",
 		will:     &mqttWill{topic: []byte("createe2e/will"), message: []byte("bye")},

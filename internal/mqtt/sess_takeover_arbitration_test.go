@@ -894,10 +894,10 @@ func TestParentlessForeignRecordStillConcedes(t *testing.T) {
 // it. This was the fourth create-parent source, and the last one whose input a test can
 // hold in its hand.
 //
-// The claimed record's identity is not discarded, only re-scoped: the release still
-// hands it to recordGenRetirement as the RWID, which is a fact about what the teardown
-// removed rather than about the next write's ancestry. See test 3
-// (TestMQTTAdoptedTeardownRecordsTheClaimedRecordIdentity) for that half.
+// The claimed record's identity is not discarded, only re-scoped: the release still hands
+// it to recordGenRetirement, no longer as a stored field but as the PRECONDITION that the
+// record being retired has an identity at all. Either way it is a fact about the teardown
+// rather than about the next write's ancestry.
 func TestSessAdoptedTeardownCreateIsParentless(t *testing.T) {
 	testQuietExpirySweeps(t)
 	a, _ := testNewTeardownEnv(t)

@@ -293,7 +293,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   the record whose deletion emptied the subject, which is one rule with three sources
   rather than a new mechanism: the record `clear()`'s own claim held, the record an
   ADOPTED marker names in its `PWID`, and — the new one — the record the
-  generation-retirement watermark names in a required `rwid` field, for the interval
+  generation-retirement watermark named in a required `rwid` field — a field since removed
+  outright, see the vanished-record bullet in §0.2 — for the interval
   whose marker is already gone. That makes two creates in one interval siblings of each
   other and a create in a later interval a descendant, so ordering survives deletions
   with no new comparison; inheriting a fresh interval nonce instead would have missed
@@ -319,9 +320,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   which a stale, regressed, delayed or out-of-band identity manufactures a FALSE FORK —
   the dangerous direction, and the one they are named for. Three of them also concede: a
   stale read across a remote lifecycle and a regressed watermark slot give the two
-  creates of one interval different parents, and an out-of-band deletion leaves a
+  creates of one interval different parents, and an out-of-band deletion left a
   watermark naming the last RETIRED record rather than the deleted one, so a create
-  following it matches neither the record that was deleted nor its parent. All four are
+  following it matched neither the record that was deleted nor its parent. (All in the
+  past tense: this describes the create inheritance the write-lineage audit DELETED, and
+  the watermark field it read has since been removed outright.) All four are
   stated as residuals R1-R4 in `docs/CONFORMANCE.md`. Recognition succeeds exactly where
   a valid retirement history supplies the identity; nothing here claims more. One piece
   of NEW exposure comes with the rollback rework and is stated as such: the teardown
@@ -437,9 +440,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   **KEPT, each with its live obligation:** `classifyRecordLineage`, its five consult
   sites, the disposal vocabulary and `sess_fork_repair.go`, because the AUTHORED-RECORD
   fork's retirement is unproved on the writer every accepted CONNECT uses (the next
-  bullet); `WID`/`PWID` stamping at all three writers; `RWID`, now with **no reader**,
-  pinned until the vanished-record vocabulary decides — F-036's 2026-08-27 attempt
-  DISPROVED it as that finding's predicate; the create arm's
+  bullet); `WID`/`PWID` stamping at all three writers; the create arm's
   corrupt-watermark REFUSAL, which is a separate obligation from the inheritance beside
   it; and the independent sequence fail-safes. **`$MQTT_origin` is REFUSED at startup**,
   not tolerated — a lookup-only preflight before the provisioning loop, since
@@ -1609,27 +1610,18 @@ further findings it surfaced are filed separately, for the reason its own bullet
   apply-time watermark regression can only cause a false NEGATIVE. It survived three separate
   attempts to break it, including a session RESTORED at CONNECT (authorship of the base is
   irrelevant) and `finishAdoptedTeardown`'s transient session (never in `as.sessions`). *No
-  new durable state is needed for it.* **`RWID` is NOT the predicate this finding needs, and
-  that is now disproven rather than untried**: the watermark is one slot per client and
-  `recordGenRetirement` treats any standing higher `MarkerSeq` as sufficient, so requiring
-  `Gen`/`RWID` equality recreates exactly the superseded-watermark false negative the licence
-  exists to close — after two teardowns the original silent bound session could never be
-  proven displaced. The disproof is propagated as a
+  new durable state is needed for it.* **`RWID` was NOT the predicate this finding needs,
+  and the field has since been REMOVED ENTIRELY** — the watermark is one slot per client,
+  so requiring `Gen`/`RWID` equality recreates exactly the superseded-watermark false
+  negative the licence exists to close: after two teardowns the original silent bound
+  session could never be proven displaced. The disproof was propagated as a
   PROPERTY rather than as a site list, because four review rounds each found one more
-  instance of the list and that made the enumeration itself the defect. The property, and
-  note that it is NOT scoped to sites mentioning F-036 — an earlier draft was, and that is
-  exactly how it missed one: **every site that speaks to `RWID`'s RETENTION, its READERS or
-  its REMOVAL must agree that the field has no production reader, that the vanished-record
-  bullet alone decides whether it gains one, and that F-036 is not a candidate.** The close
-  set is therefore all `RWID`/`rwid` guidance across `*.md` and `*.go`, test files included,
-  whether or not F-036 is named — no count is given, because a count is the part that goes
-  stale. Res judicata, so the next reader does not re-run the sweep: a site that merely
-  states F-036's false-absence PREMISE, or calls the ownership fact it needs "F-036's
-  predicate" WITHOUT naming `RWID`, and a site that merely ASSERTS the field serializes or
-  replicates, are all deliberately untouched and still true — a test asserting a field
-  travels is not a statement about whether it should exist. The field therefore still has
-  NO reader, and the "consider removing
-  `RWID`" prescription stays live and passes wholly to the vanished-record item below. *The
+  instance of the list and that made the enumeration itself the defect. **That property is
+  now DISCHARGED**: the vanished-record item was the last candidate reader, decided against
+  the field, and removed it, so every site that spoke to `RWID`'s RETENTION, its READERS or
+  its REMOVAL has been rewritten to say the field is GONE and why. Res judicata, so the next
+  reader does not re-run the sweep: sites describing the DELETED create inheritance, or
+  F-036's own disproof, are historical and remain accurate untouched. *The
   gate-safety question this bullet used to pose is answered*: `docs/ARCHITECTURE.md`'s refusal
   to claim the shared client-ID gate for a bound session is about the rejection PROBE's absent
   verdict, not about the lock — the periodic pass's own ambiguous-write arm already claims
@@ -1783,36 +1775,52 @@ further findings it surfaced are filed separately, for the reason its own bullet
   [platform
   audit](findings/nats-platform.md#stable-ephemeral-consumer-identities-and-metadata-—-done).
 
-  - [ ] Give a vanished record its own disposal vocabulary. **Rebased by F-084, which
-  landed first.** The deleted-record arm no longer reports 0x8E; it reports
-  `mqttDisposalOwnershipUnsettled` (0x89), which is truthful but UNDIFFERENTIATED - it
-  cannot tell an expiry-driven vanishing from any other unclassifiable observation. So this
-  item is now a REFINEMENT of that `0x89` waypoint rather than a correction of a false
-  claim, and its ceiling is fixed: `RWID` proves a RETIREMENT CAUSE, not a successor, so
-  this item may **never** restore 0x8E or takeover-style Will discard. **Small.** A
-  vocabulary value, not a new verdict. **This is now the
-  ONLY remaining item that could give `RWID` a reader**, and for the same reason: telling
-  an expiry-driven vanishing apart from a takeover needs positive evidence that THIS
-  record was retired, which is what `RWID` states. **F-036 no longer competes for it** — its
-  2026-08-27 attempt DISPROVED `RWID` as its predicate, because the watermark is one slot
-  per client and requiring `Gen`/`RWID` equality recreates the superseded-watermark false
-  negative that attempt existed to close; the licence it found is `MarkerSeq`-only. So if
-  this item turns out not to need the predicate either, **whoever closes it should CONSIDER
-  removing `RWID`**. The removal set is compile-complete and larger than "the field and its
-  validator row", which an earlier draft of this prescription claimed: the struct field on
-  `mqttGenRetirement`; the validator's non-empty check; **the writer's `RWID: retiredWID`
-  initializer**, without which the tree does not compile; the now-dead `retiredWID`
-  parameter of `recordGenRetirement` and its threading from BOTH callers — `clear()`'s
-  `retiringWID`, captured before its reset, and `finishAdoptedTeardown`'s `ps.PWID`; the
-  persisted-identity census entry; and the `RWID`-specific assertions and comments in the
-  retirement, write-lineage-audit, fork-lineage and cluster fixtures. **What must be KEPT
-  is the record-absent create's own watermark read**: it is not an `RWID` reader at all —
-  it refuses a create over a watermark this broker cannot READ AT ALL — and deleting it would
-  admit a session whose later teardown could never record a retirement, leaving the record
-  MARKED for every future finisher. An earlier draft listed that arm as part of the removal;
-  that step was wrong and is deleted rather than reworded. The default until then is still
-  to keep the field: deleting one unread field is small, and re-adding a required field to
-  a permanent record is not.
+  - [x] Give a vanished record its own disposal vocabulary. **CLOSED AS REFUTED
+  2026-08-29, and `RWID` was REMOVED.** The vocabulary cannot be built, and the negative
+  result plus the field's removal is what landed. **Why it cannot be built:** the item's
+  own predicate was "positive evidence that THIS record was retired, which is what `RWID`
+  states", and `RWID` does not state that. A write identity names a record's BYTES, not one
+  OCCURRENCE of them, and two live routes put one identity on two occurrences —
+  `storeFramedSessionMsg` replays acknowledged bytes verbatim and the readback adopts the
+  higher sequence WITH the original `WID` (`sess_resume_reconcile.go`), and restore adopts
+  `WID`/`PWID` from record JSON unvalidated. Worked: a session is acknowledged for
+  `{seq:10, WID:X}`; bytes carrying `WID:X` land again at 20; a teardown claims occurrence
+  20, marks at 30 with `PWID:X`, records `{RWID:X, MarkerSeq:30}` and deletes. Against the
+  stale session `RWID == sess.wid` holds AND `MarkerSeq > sess.seq` (30 > 10), yet neither
+  teardown removed occurrence 10. `MarkerSeq` bounds SOME claimed occurrence below the
+  marker and never says WHICH, so **no conjunction of surviving durable fields is
+  occurrence-exact**. A design keyed on historical evidence alone was refuted separately:
+  with record `W` retired and a successor `Z` standing, the watermark still names `W`, so
+  the report would blame a retirement for a disposal `Z` caused. **What an exact reader
+  would need instead:** the claimed PREDECESSOR SEQUENCE, stored on the marker where
+  `claimTeardown` knows it and copied into the watermark, compared for equality with
+  `sess.seq` — two new REQUIRED fields on two PERMANENT shapes, because
+  `finishAdoptedTeardown` holds only the marker's own sequence. **Refused as
+  DISPROPORTIONATE, not as blocked**, and the distinction is deliberate: the route is
+  analyzable, since `$MQTT_teardown` is already epoch-coupled to `$MQTT_sess` and their
+  recreation is one logical unit, so it need not open fresh F-066 surface. What refused it
+  is the price — two permanent record fields to specialise a DISCONNECT Reason String and
+  a log line. **What this leaves, as a permanent stated residual in `docs/CONFORMANCE.md`:**
+  a vanished record, an unreadable one, an undecodable one, a below-base one and a
+  valid-shaped stranger all report one undifferentiated `0x89` "ownership could not be
+  established", so an operator cannot tell an ordinary retirement from a store fault from
+  that line. No client-visible behaviour changed FOR CURRENTLY VALID SUPPORTED STATE — the
+  qualifier is load-bearing, see the format-gate disclosure below. **`RWID`'s removal**,
+  which this box
+  owned: the field had no semantic reader and could not acquire one, and a future exact
+  reader needs `RetiredSeq` rather than a restored `RWID`, so the "expensive to re-add"
+  default no longer supported keeping it. **Two errors in the removal set this bullet used
+  to carry, both caught by walking the tree:** the `retiredWID` parameter of
+  `recordGenRetirement` was NOT dead — it carried the precondition that a record with no
+  identity fails its teardown CLOSED, which nothing else in the teardown path checks, so it
+  survives as an explicit guard; and deleting "its threading from BOTH callers" would have
+  removed `clear()`'s `retiringWID` capture, which also parents the teardown MARKER. **A
+  format gate went with the field and is disclosed rather than claimed away:** a watermark
+  with a valid `id`/`gen`/`mseq` but no `rwid` was CORRUPT and is now VALID, which changes
+  four readers — the CONNECT discard, the sweep's condemnation, the record-absent create's
+  refusal, and the writer — but creates no new LOGICAL false positive, because the
+  validator only ever checked non-emptiness so an arbitrary string already passed. 12 plan
+  rounds, 2 consults.
 
 ### 0.3 Confirmed alpha blockers
 

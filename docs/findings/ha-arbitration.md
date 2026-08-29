@@ -176,8 +176,9 @@ bullet carries the full refutation.
 **How it was closed.** The finding asked for a durable identity for each empty-subject
 interval that both racing creates inherit, and that fact was already recorded,
 permanently and per client, before every deletion: the generation-retirement watermark.
-It gains one required field, `rwid`, naming the RECORD its deletion removes — the record
-the teardown claimed, never the marker that claimed it — and a fourth reader, the
+It gained one required field, `rwid`, naming the RECORD its deletion removes — the record
+the teardown claimed, never the marker that claimed it; **that field has since been removed
+outright, and the reasoning is below** — and a fourth reader, the
 record-absent create, which inherits it as the parent of its first write immediately
 after the proof that the subject is empty. So a create becomes a child of the record it
 replaces: two creates in one interval are siblings of each other, a create in a later
@@ -186,7 +187,8 @@ anywhere. `classifyRecordLineage` is untouched; the whole change to the seven co
 is where a parent token comes from.
 
 **That fourth reader no longer exists.** The write-lineage audit deleted it, along with
-the other three sources; `rwid` stays on the watermark with no reader, and a create is
+the other three sources; `rwid` stayed on the watermark with no reader and has since been
+removed outright (see below), and a create is
 parentless again. The reason is in the section below and in `docs/ROADMAP.md` §0.2: every
 route by which the inheritance produced a forked verdict was a documented FALSE fork.
 
@@ -232,19 +234,32 @@ R-create in `docs/CONFORMANCE.md`.
 
 What survives F-029b is the machinery around it: the CONNECT rollback's real teardown,
 its effective-lifetime branch, the parked discard, and the generation-blind classifier.
-What survives on the record is `rwid`, the only durable statement of *"this specific
-record was retired"* — now with **no reader at all**, since the create's valid arm no
-longer consults it and the register that was once offered as its replacement does not
-exist. It used to be retained because F-036's remaining shape plausibly needed exactly
-that predicate. **That is now DISPROVEN.** F-036's 2026-08-27 attempt established that the
-watermark holds ONE SLOT per client and that `recordGenRetirement` treats any standing
-higher `MarkerSeq` as sufficient, so requiring `ackWID == rwid` recreates the
-superseded-watermark false negative the fix exists to close: after two teardowns for one
-client ID the original silent bound session could never be proven displaced. The licence
-that attempt found is `MarkerSeq`-only and consults neither `Gen` nor `rwid`. So the field
-is retained for **"give a vanished record its own disposal vocabulary" alone**, and
-**whoever closes that item should CONSIDER removing `rwid`** if it turns out not to need
-the predicate either. The consideration is what is prescribed, not the removal.
+What survived on the record was `rwid`, offered as the only durable statement of *"this
+specific record was retired"* — with **no reader at all**, since the create's valid arm no
+longer consults it and the register once offered as its replacement does not exist. **The
+field has since been REMOVED**, and both candidate readers are why.
+
+F-036 failed first. Its 2026-08-27 attempt established that the watermark holds ONE SLOT per
+client and that `recordGenRetirement` treats any standing higher `MarkerSeq` as sufficient,
+so requiring `ackWID == rwid` recreates the superseded-watermark false negative the fix
+exists to close: after two teardowns for one client ID the original silent bound session
+could never be proven displaced. The licence that attempt found is `MarkerSeq`-only and
+consults neither `Gen` nor `rwid`.
+
+"Give a vanished record its own disposal vocabulary" was the last candidate and decided
+against it too, which closed that box as refuted. The statement above is the defect: `rwid`
+is not a statement that *this specific record* was retired, because a write identity
+names a record's BYTES and not one OCCURRENCE of them. `storeFramedSessionMsg` replays
+acknowledged bytes verbatim, the readback adopts the higher sequence with the original
+`WID`, and
+restore adopts `WID`/`PWID` unvalidated — so one identity can stand at two sequences,
+and a teardown that claimed the later one satisfies `rwid == ackWID` against a session
+holding the earlier. `MarkerSeq` bounds the removed occurrence below the marker but does
+not say which, so no conjunction of surviving fields is occurrence-exact. An exact reader
+needs the claimed PREDECESSOR SEQUENCE on both the marker and the watermark, refused as
+disproportionate to a diagnostic string. What the field also enforced — a record carrying
+no `WID` fails its teardown closed — is now an explicit precondition in
+`recordGenRetirement`.
 
 The bounds that held for the false-fork routes still hold for what remains: no false
 verdict can resurrect state, because the anchor's generation conjunct drops any capsule

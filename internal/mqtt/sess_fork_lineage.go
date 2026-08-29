@@ -21,7 +21,8 @@
 // **That audit has run**, obligation by obligation, and it split this machinery in two.
 //
 // The CREATE side is DELETED. Every route by which a create could be handed a parent —
-// the retirement watermark's RWID, an adopted marker's PWID, a re-minted object's stamp,
+// the retirement watermark's retired-record identity (a field since removed outright), an
+// adopted marker's PWID, a re-minted object's stamp,
 // the session-interval register on $MQTT_origin — existed so that two creates into one
 // emptied subject were recognisable as siblings, and every route docs/CONFORMANCE.md
 // documented for such a verdict turned out to be a FALSE fork: the inherited identity

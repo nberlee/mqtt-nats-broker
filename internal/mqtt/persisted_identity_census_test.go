@@ -305,7 +305,6 @@ func censusManifest() map[string]map[string]censusDisposition {
 			reason: "the $MQTT_sess sequence this teardown's claim marker landed at, and the ONLY thing " +
 				"the advance is decided by. Comparable only within the incarnation epoch $MQTT_teardown " +
 				"carries in its stream metadata — one of F-066's three ad hoc couplings"},
-		"RWID":      {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the identity of the record this retirement's deletion removed; a record identity, so $MQTT_sess issues it"},
 		"Nonce":     {kind: identityLocal, encoding: encJSON, reason: "this teardown's own identity"},
 		"Origin":    {kind: notAnIdentity, encoding: encJSON, reason: "the authoring broker, for diagnostics; no reader arbitrates on it"},
 		"StartedAt": {kind: notAnIdentity, encoding: encJSON, reason: "a wall-clock stamp for diagnostics"},

@@ -13,7 +13,6 @@
 package mqtt
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -26,16 +25,22 @@ import (
 // Test 1: a create is parentless on every production path, from both orientations
 // ---------------------------------------------------------------------------
 
-// TestMQTTParentlessCreateConcedesFromBothOrientations walks EVERY production route that
-// reaches mqttSessionCreate and asserts that none of them hands the new object a parent —
-// then drives the ordinary foreign disposition over the resulting record and asserts the
-// UNSETTLED vocabulary from both sides of the pair.
+// TestMQTTParentlessCreateConcedesFromBothOrientations walks every production route that
+// reaches mqttSessionCreate WITH AN IDENTITY AVAILABLE TO INHERIT, and asserts that none of
+// them hands the new object a parent — then drives the ordinary foreign disposition over
+// the resulting record and asserts the UNSETTLED vocabulary from both sides of the pair.
 //
-// The three routes are the three that used to differ:
+// That qualifier is the coverage claim, and it is narrower than "every route": a route with
+// nothing available to inherit cannot discriminate, so including it would add a subtest that
+// passes whatever the implementation does. Two routes qualify:
 //
-//   - the record-absent create, which read the generation-retirement watermark's RWID;
 //   - the adopted-marker create, which read the marker's own PWID;
 //   - the reused object after clear(), which was stamped with the record it claimed.
+//
+// A THIRD subtest covered the record-absent create, which read the retirement watermark's
+// rwid. It was DELETED with that field: the identity it proved was not inherited no longer
+// exists, so there is nothing for an implementation to inherit and the subtest could only
+// pass vacuously. See docs/ROADMAP.md's vanished-record bullet.
 //
 // Each is staged so that a non-empty identity IS available at the moment of the create.
 // That is what makes the assertion a measurement rather than an absence: an
@@ -45,36 +50,6 @@ import (
 // is process-global, and TestParallelTestsTouchNoProcessGlobalState reads a t.Parallel()
 // anywhere in this function as putting the whole of it beside whatever else is running.
 func TestMQTTParentlessCreateConcedesFromBothOrientations(t *testing.T) {
-	t.Run("the record-absent create over a valid watermark", func(t *testing.T) {
-		a, _ := testNewTeardownEnv(t)
-		const cid = "parentless-absent"
-
-		sess := testProvisionSession(t, a, cid)
-		base, _ := testLoadSessRecord(t, a, sess.idHash)
-		if base == nil || base.WID == _EMPTY_ {
-			t.Fatal("the base record must carry an identity")
-		}
-		if err := sess.clear(false); err != nil {
-			t.Fatalf("the discard must succeed: %v", err)
-		}
-		// The watermark is the identity this route used to inherit, and it must be
-		// present and valid for the assertion below to mean anything.
-		r, _, status := testLoadRetirement(t, a, sess.idHash)
-		if status != mqttRetirementValid || r.RWID != base.WID {
-			t.Fatalf("the teardown must leave a valid watermark naming the removed record: "+
-				"status=%v r=%+v want RWID %q", status, r, base.WID)
-		}
-
-		fresh, existed, err := a.asm.createOrRestoreSession(cid, a.s.getOpts())
-		if err != nil {
-			t.Fatalf("creating into the emptied subject: %v", err)
-		}
-		if existed {
-			t.Fatal("an emptied subject is a fresh session: Session Present must be false")
-		}
-		testAssertParentlessCreate(t, a, fresh, r.RWID)
-	})
-
 	t.Run("the adopted-marker create", func(t *testing.T) {
 		testQuietExpirySweeps(t)
 		a, _ := testNewTeardownEnv(t)
@@ -122,10 +97,12 @@ func TestMQTTParentlessCreateConcedesFromBothOrientations(t *testing.T) {
 // a takeover claim (F-084). The behavioural half is
 // TestMQTTParentlessCreateSettlesToUnsettledBothOrientations, whose name says the same.
 //
-// available is the non-empty identity that WAS reachable at the create — the watermark's
-// RWID, the marker's parent, or the record clear() claimed. Passing it in is what keeps
-// each subtest a measurement: without it every arm would assert an emptiness that could
-// equally mean nothing was ever there.
+// available is the non-empty identity that WAS reachable at the create — the marker's
+// parent, or the record clear() claimed. Passing it in is what keeps each subtest a
+// measurement: without it every arm would assert an emptiness that could equally mean
+// nothing was ever there. The watermark was a third source until its retired-record
+// identity was removed; that subtest went with the field, because there is no longer an
+// identity there to prove uninherited.
 func testAssertParentlessCreate(t *testing.T, env *testTeardownEnv, sess *mqttSession, available string) {
 	t.Helper()
 	if available == _EMPTY_ {
@@ -328,144 +305,6 @@ func TestMQTTAuthoredForkStillClassifies(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: the retirement watermark still names the record the teardown removed
-// ---------------------------------------------------------------------------
-
-// TestMQTTRetirementNamesTheRecordThatActuallyStood is the RWID obligation, which is
-// RETAINED: no create reads it any more, but it remains the fact the watermark
-// attributes a retirement to, pinned until the VANISHED-RECORD VOCABULARY item decides
-// whether it keeps a reader. F-036 was the other candidate and is no longer one — its
-// 2026-08-27 attempt disproved the predicate, because a one-slot-per-client watermark
-// makes an ackWID == RWID conjunct recreate the superseded-watermark false negative that
-// fix exists to close.
-//
-// Two things make this discriminating where the existing assertion in
-// sess_retirement_test.go is not.
-//
-// First, the comparison is against the WID of the record that actually STOOD on the
-// subject when the teardown claimed it, read back independently, rather than against a
-// field of the same object the claim wrote. Comparing the watermark to the marker passes
-// whenever both are wrong the same way, and claimTeardown writes both — one bug produces
-// one consistent pair.
-//
-// Second, the record it is compared against is produced by the AT-BASE RETRY inside
-// resolveContendedRecordSave, not by an ordinary save. That path proves a 10164-rejected
-// write durable outside saveWithDetail's success arm, and it must adopt the lineage along
-// with the sequence: a site that moved the sequence while leaving sess.wid stale would
-// have clear() capture the OLD identity as retiringWID and record a watermark naming a
-// record the deletion did not remove. The retry is what puts a stale-lineage bug and a
-// correct one on different values here.
-//
-// NOT parallel: it installs process-global store hooks.
-func TestMQTTRetirementNamesTheRecordThatActuallyStood(t *testing.T) {
-	e := testNewRejectionEnv(t, "retirement-names-stood")
-	e.dropPersistObservations(t, e.idHash)
-
-	before := testLoadAuditRecord(t, e.asm, e.idHash)
-	if before == nil || before.WID == _EMPTY_ {
-		t.Fatal("the seeded record must carry an identity")
-	}
-
-	// A save the store reports as 10164-contended while the record has NOT moved, so
-	// resolveContendedRecordSave takes its at-base arm and the exact-byte retry lands.
-	e.sess.mu.Lock()
-	e.sess.subs = map[string]byte{"rwid/retry": 1}
-	e.sess.mu.Unlock()
-	stop := testForceContendedRejection(t, e.sess)
-	_, detail, serr := testSaveClassified(t, e.sess)
-	stop()
-	if serr == nil {
-		t.Fatal("the forced save must be rejected")
-	}
-	if got := e.sess.resolveContendedRecordSave(&detail); got != mqttRepairSaveLanded {
-		t.Fatalf("the identical retry must LAND: got %v", got)
-	}
-
-	// The record that now STANDS, read from the subject rather than from the session.
-	stood := testLoadAuditRecord(t, e.asm, e.idHash)
-	if stood == nil || stood.WID == _EMPTY_ {
-		t.Fatal("the retry must leave a record carrying an identity")
-	}
-	if stood.WID == before.WID {
-		t.Fatal("fixture: the retry's record must be a NEW write, or a stale lineage would " +
-			"be indistinguishable from a correct one")
-	}
-
-	// The teardown, through the production path. It captures retiringWID off the session
-	// before its reset, so this is where a lineage that lagged the sequence surfaces.
-	if err := e.sess.clear(false); err != nil {
-		t.Fatalf("the discard must succeed: %v", err)
-	}
-
-	r, _, status := e.asm.jsa.loadGenRetirement(e.asm.domainTk, e.idHash)
-	if status != mqttRetirementValid {
-		t.Fatalf("the teardown must record a retirement, got status %v", status)
-	}
-	if r.RWID != stood.WID {
-		t.Fatalf("the watermark must name the record that STOOD when the teardown claimed it: "+
-			"RWID=%q want %q (the record before the retry was %q)", r.RWID, stood.WID, before.WID)
-	}
-}
-
-// testLoadAuditRecord returns the client's current session record from an account
-// manager, for the tests here that hold no *testTeardownEnv.
-func testLoadAuditRecord(t *testing.T, asm *mqttAccountSessionManager, idHash string) *mqttPersistedSession {
-	t.Helper()
-	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, idHash)
-	if err != nil {
-		if isErrorOtherThan(err, JSNoMessageFoundErr) {
-			t.Fatalf("loadSessionMsg: %v", err)
-		}
-		return nil
-	}
-	ps := &mqttPersistedSession{}
-	if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
-		t.Fatalf("unmarshal session record: %v", uerr)
-	}
-	return ps
-}
-
-// ---------------------------------------------------------------------------
-// Test 4: the watermark validator's RWID row
-// ---------------------------------------------------------------------------
-
-// TestMQTTRetirementRefusesAnEmptyRWID is the RWID != "" row on its own, with every
-// other field valid, so nothing else in the validator can account for the refusal.
-//
-// The row is what makes a record carrying no identity fail its own teardown closed
-// rather than being retired under a name nothing can attribute. It survives the
-// write-lineage audit unchanged: it is a property of the watermark, not of the create
-// that used to read it.
-func TestMQTTRetirementRefusesAnEmptyRWID(t *testing.T) {
-	t.Parallel()
-
-	valid := &mqttGenRetirement{
-		ID:        "rwid-validator",
-		Gen:       mqttNewSessGen(),
-		MarkerSeq: 7,
-		RWID:      mqttNewRecordWID(),
-		Nonce:     "nonce",
-		Origin:    "originbroker",
-		StartedAt: 1,
-	}
-	// The positive control: with RWID present the same watermark is accepted, so the
-	// refusal below is attributable to that field alone.
-	if err := mqttValidateGenRetirement(valid, getHash(valid.ID)); err != nil {
-		t.Fatalf("fixture: the watermark must otherwise be valid: %v", err)
-	}
-
-	empty := *valid
-	empty.RWID = _EMPTY_
-	err := mqttValidateGenRetirement(&empty, getHash(valid.ID))
-	if err == nil {
-		t.Fatal("a watermark that cannot name the record its deletion removed must be REFUSED")
-	}
-	if !strings.Contains(err.Error(), "retired") {
-		t.Fatalf("the refusal must name what is missing, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Test 5: the create-side corrupt-watermark refusal survives the deletion beside it
 // ---------------------------------------------------------------------------
 
@@ -507,7 +346,7 @@ func TestMQTTCreateRefusesAnUnreadableRetirementWatermark(t *testing.T) {
 				if tc.status == mqttRetirementValid {
 					return &mqttGenRetirement{
 						ID: cid, Gen: mqttNewSessGen(), MarkerSeq: 3,
-						RWID: mqttNewRecordWID(), Nonce: "n", Origin: "o", StartedAt: 1,
+						Nonce: "n", Origin: "o", StartedAt: 1,
 					}, 4, mqttRetirementValid
 				}
 				return nil, 0, tc.status
@@ -528,8 +367,9 @@ func TestMQTTCreateRefusesAnUnreadableRetirementWatermark(t *testing.T) {
 			if err != nil {
 				t.Fatalf("status %v must ADMIT the create, got %v", tc.status, err)
 			}
-			// And whatever it read, it inherited nothing from it — the valid arm above
-			// supplies a real RWID precisely so this is not vacuous.
+			// And whatever it read, it inherited nothing from it. The watermark no longer
+			// carries any record identity, so this arm now measures that the CREATE draws
+			// no parent from a watermark it can read at all.
 			sess.mu.Lock()
 			held := sess.parentForNextWriteLocked()
 			sess.mu.Unlock()

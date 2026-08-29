@@ -275,13 +275,16 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 //
 // The fix is to keep the retirement fact OFF the replaceable subject. Every teardown
 // that wins its claim first records a permanent per-client watermark on
-// $MQTT_teardown naming the generation it is retiring, and only then deletes. Four
-// readers consume it: the winner's own release-superseded arm, which condemns a
-// same-generation survivor; the CONNECT restore, which refuses to resume a retired
-// generation; and the orphan sweep, which condemns one with no CONNECT at all. A
-// FOURTH reader was removed by the write-lineage audit — the record-absent create,
-// which inherited the retired record's identity as its own parent — because every
-// verdict that inheritance produced was a false fork.
+// $MQTT_teardown naming the generation it is retiring, and only then deletes. THREE
+// DESTRUCTIVE readers consume it: the winner's own release-superseded arm, which
+// condemns a same-generation survivor; the CONNECT restore, which refuses to resume a
+// retired generation; and the orphan sweep, which condemns one with no CONNECT at all.
+// A fourth route, the record-absent create, no longer draws a CONCLUSION from it: the
+// write-lineage audit removed its inheritance of the retired record's identity, because
+// every verdict that inheritance produced was a false fork, and the identity field
+// itself was removed later still. What that route retains is a corrupt-status read
+// ALONE — it refuses a create over a watermark it cannot read at all, and draws nothing
+// from one it can.
 //
 // A generation whose retirement was ever RECORDED is retired, and stays fenced:
 // nothing ever reaps a watermark, so no GC choice can widen the residual. The
@@ -317,24 +320,6 @@ type mqttGenRetirement struct {
 	ID        string `json:"id"`
 	Gen       string `json:"gen"`
 	MarkerSeq uint64 `json:"mseq"`
-	// RWID is the identity of the RECORD this retirement's deletion removes — the
-	// record the teardown CLAIMED, never the marker that claimed it.
-	//
-	// It has NO reader today. The create that inherited it as a parent pointer was
-	// deleted by the write-lineage audit, and the field is retained deliberately
-	// rather than removed with it: what it states is a durable fact about which
-	// record a retirement attributes to, and docs/ROADMAP.md's vanished-record
-	// bullet is the ONE item left that decides whether that fact gains a reader
-	// again. F-036 was the other candidate and is no longer one: its 2026-08-27
-	// attempt disproved this predicate, because a one-slot-per-client watermark
-	// makes an ackWID == RWID conjunct recreate the superseded-watermark false
-	// negative that fix exists to close. Retiring the field now would have to be
-	// undone if the vanished-record item needs it.
-	//
-	// REQUIRED, and validated as such: a watermark that cannot name what it retired
-	// attributes a deletion to nothing, and accepting an empty value would be
-	// accepting the pre-RWID shape this field was added to replace.
-	RWID      string `json:"rwid"`
 	Nonce     string `json:"nonce"`
 	Origin    string `json:"origin"`
 	StartedAt int64  `json:"started"`
@@ -505,16 +490,6 @@ func mqttValidateGenRetirement(r *mqttGenRetirement, idHash string) error {
 	if r.MarkerSeq == 0 {
 		return fmt.Errorf("watermark carries no teardown marker sequence")
 	}
-	// A watermark that cannot say WHICH record its deletion removed attributes that
-	// deletion to nothing. Refused rather than accepted-as-empty:
-	// the validator cannot tell a missing field from a present empty one, so
-	// accepting empty would accept a pre-RWID watermark, which is the legacy
-	// acceptance the compatibility boundary forbids. The development store is
-	// recreated instead. A record carrying no WID of its own therefore fails its own
-	// teardown closed, exactly as a generationless record is refused at CONNECT.
-	if r.RWID == _EMPTY_ {
-		return fmt.Errorf("watermark does not name the record its deletion retired")
-	}
 	return nil
 }
 
@@ -599,21 +574,37 @@ func (jsa *mqttJSA) loadGenRetirementRecord(domainTk, idHash string) (*mqttGenRe
 // transition applies unchecked, so apply-time regression is possible; that is the
 // stated residual, not something this loop can prevent.
 //
-// retiredWID is the identity of the record this teardown is about to delete, and it is
-// threaded in rather than read off t: the target enumerates the RESOURCES an
-// incarnation owns, and this is a fact about the claim. Both callers hold it because
-// both hold the claimed record — clear() captures it before its reset, and
-// finishAdoptedTeardown takes the marker's own PWID, the record that teardown claimed
-// rather than the marker the release deletes. Empty is refused by the validator below,
-// so a record with no identity fails its teardown closed instead of being retired
-// under a name nothing can attribute.
+// retiredWID is the identity of the record this teardown is about to delete. It is NOT
+// stored: the watermark used to carry it as an rwid field, and that field was removed
+// because a write identity names a record's BYTES rather than one OCCURRENCE of them —
+// storeFramedSessionMsg replays acknowledged bytes verbatim and restore adopts WID/PWID
+// unvalidated, so one identity can stand at two sequences and no reader could tell which
+// occurrence a retirement removed. See docs/ROADMAP.md's vanished-record bullet for the
+// worked interleaving and for what an exact reader would need instead.
+//
+// What survives is the PRECONDITION it always doubled as, and it is load-bearing: a
+// session record carrying NO identity cannot be retired by name, so its teardown fails
+// CLOSED here, before any deletion, leaving the record marked for a later finisher.
+// Nothing else in the teardown path checks WID or PWID — mqttValidateTeardownTargets
+// does not — so removing this check with the field would have turned that refusal into a
+// successful teardown of a record nothing can name. Threaded in rather than read off t
+// because the target enumerates the RESOURCES an incarnation owns, while this is a fact
+// about the claim: clear() captures it before its reset, and finishAdoptedTeardown takes
+// the marker's own PWID, the record that teardown claimed rather than the marker the
+// release deletes. See TestRetirementWIDlessRecordFailsClosed.
 func (sess *mqttSession) recordGenRetirement(t *mqttTeardownTarget, nonce, retiredWID string, markerSeq uint64) error {
+	if retiredWID == _EMPTY_ {
+		// The precondition, checked where the removed rwid field's validator row used to
+		// enforce it: before `want` is built and before any deletion, and wrapped by the
+		// same refusal below so the failure still names the retirement it could not record.
+		return fmt.Errorf("refusing to record the retirement of session %q: the record it "+
+			"would retire carries no identity", t.id)
+	}
 	subject := mqttTeardownSubject(sess.domainTk, t.idHash)
 	want := &mqttGenRetirement{
 		ID:        t.id,
 		Gen:       t.gen,
 		MarkerSeq: markerSeq,
-		RWID:      retiredWID,
 		Nonce:     nonce,
 		Origin:    sess.jsa.id,
 		StartedAt: time.Now().Unix(),
@@ -1025,10 +1016,11 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// The retired record's identity is the MARKER'S PARENT, not the marker's own WID:
 	// claimTeardown parents the marker to the record it claimed, and that record — not
 	// the marker, which this release deletes — is the one this teardown's deletions
-	// remove. Stamping ps.WID here would attribute the retirement to the marker, a
-	// record no deletion of this teardown's ever removed. An empty value is refused by
-	// the validator, which is how a record carrying no lineage fails its adoption
-	// closed. See sess_teardown.go's mqttGenRetirement.
+	// remove. It is no longer STORED on the watermark, and passing ps.WID here would
+	// still be wrong: what it supplies is recordGenRetirement's PRECONDITION, and the
+	// marker's own identity would satisfy it for a claimed record that has none. An empty
+	// value is refused there, which is how a record carrying no lineage fails its
+	// adoption closed. See recordGenRetirement.
 	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
 		return err
 	}

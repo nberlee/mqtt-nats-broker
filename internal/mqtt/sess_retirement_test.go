@@ -245,7 +245,7 @@ func TestRetirementRefusesToResumeARetiredGeneration(t *testing.T) {
 	// The state a winner that crashed after its watermark leaves: the fence stands,
 	// the record does not carry a marker.
 	testPlantRetirement(t, a, idHash, &mqttGenRetirement{
-		ID: clientID, Gen: retiredGen, MarkerSeq: recSeq, RWID: mqttNewRecordWID(),
+		ID: clientID, Gen: retiredGen, MarkerSeq: recSeq,
 		Nonce: "planted", Origin: "peer",
 	}, 0)
 
@@ -302,9 +302,6 @@ func TestRetirementWatermarkIsPermanentAndMonotonic(t *testing.T) {
 	if status != mqttRetirementValid || r1.Gen != firstGen {
 		t.Fatalf("after the first teardown: status=%v r=%+v want a valid fence naming %q", status, r1, firstGen)
 	}
-	if r1.RWID != firstRec.WID {
-		t.Fatalf("the fence must name the record THIS teardown removed: RWID=%q want %q", r1.RWID, firstRec.WID)
-	}
 
 	second := testProvisionSession(t, a, clientID)
 	secondGen := second.gen
@@ -325,17 +322,11 @@ func TestRetirementWatermarkIsPermanentAndMonotonic(t *testing.T) {
 	if r2.MarkerSeq <= r1.MarkerSeq {
 		t.Fatalf("the newer retirement must carry the higher marker sequence: %v vs %v", r2.MarkerSeq, r1.MarkerSeq)
 	}
-	// The retired record's IDENTITY advances with the fence, and that is the difference
-	// between arbitration and a deduplicated first value. RWID is no longer read by any
-	// create — the write-lineage audit removed that reader — but it remains what the
-	// watermark ATTRIBUTES the retirement to, and a fence that advanced its marker
-	// sequence while keeping an earlier RWID would name a record a different teardown
-	// removed. See docs/ROADMAP.md's VANISHED-RECORD bullet, which now decides alone
-	// whether the field keeps a reader: F-036 disproved it as a predicate on 2026-08-27.
-	if r2.RWID != secondRec.WID {
-		t.Fatalf("the advanced fence must name the SECOND retired record: RWID=%q want %q "+
-			"(the first was %q)", r2.RWID, secondRec.WID, firstRec.WID)
-	}
+	// The fence ADVANCES rather than deduplicating to a first value, and MarkerSeq alone
+	// is what says so. The watermark used to carry the retired record's identity too, and
+	// that field was removed: a write identity names a record's bytes rather than one
+	// occurrence of them, so it could not tell WHICH occurrence a retirement removed. See
+	// docs/ROADMAP.md's vanished-record bullet for why no reader could be built on it.
 	// And a create into the now-empty subject descends from NOTHING: it reads the
 	// watermark — the corrupt arm is still a refusal — but draws no identity from it.
 	third, _, cerr := a.asm.createOrRestoreSession(clientID, a.s.getOpts())
@@ -346,8 +337,7 @@ func TestRetirementWatermarkIsPermanentAndMonotonic(t *testing.T) {
 		t.Fatalf("the create's first save: %v", err)
 	}
 	if created, _ := testLoadSessRecord(t, a, idHash); created == nil || created.PWID != _EMPTY_ {
-		t.Fatalf("the create descends from nothing, not from the record the LAST retirement "+
-			"named (%q): %+v", secondRec.WID, created)
+		t.Fatalf("the create into an emptied subject must descend from NOTHING: %+v", created)
 	}
 	if err := third.clear(false); err != nil {
 		t.Fatalf("tearing the create down again: %v", err)
@@ -364,26 +354,21 @@ func TestRetirementWatermarkIsPermanentAndMonotonic(t *testing.T) {
 	r3, _, _ := testLoadRetirement(t, a, idHash)
 	// Against the RELOADED standing fence, not the second generation: the create above was
 	// torn down too, so the standing retirement is that third one's.
-	if r3.Gen != r2.Gen || r3.MarkerSeq != r2.MarkerSeq || r3.RWID != r2.RWID {
+	if r3.Gen != r2.Gen || r3.MarkerSeq != r2.MarkerSeq {
 		t.Fatalf("an older retirement regressed the fence: %+v, want %+v", r3, r2)
 	}
 
 	// (c) A retirement of the SAME generation at a HIGHER marker sequence advances
 	// it. A generation-equality early return would call this already done and leave
 	// the fence naming the older claim.
-	newerWID := mqttNewRecordWID()
 	if err := second.recordGenRetirement(&mqttTeardownTarget{id: clientID, idHash: idHash, gen: r2.Gen},
-		"newer", newerWID, r2.MarkerSeq+1); err != nil {
+		"newer", mqttNewRecordWID(), r2.MarkerSeq+1); err != nil {
 		t.Fatalf("a newer same-generation retirement: %v", err)
 	}
 	r4, _, _ := testLoadRetirement(t, a, idHash)
 	if r4.MarkerSeq != r2.MarkerSeq+1 {
 		t.Fatalf("a newer same-generation retirement did not advance the fence: MarkerSeq %v, want %v",
 			r4.MarkerSeq, r2.MarkerSeq+1)
-	}
-	if r4.RWID != newerWID {
-		t.Fatalf("the advanced fence must name the record THAT retirement passed: RWID=%q want %q "+
-			"(the standing one named %q)", r4.RWID, newerWID, r2.RWID)
 	}
 }
 
@@ -673,11 +658,6 @@ func TestRetirementMalformedWatermarkFailsClosedEverywhere(t *testing.T) {
 		{"a client ID that does not hash back", func(r *mqttGenRetirement) { r.ID = "somebody-else" }},
 		{"no marker sequence", func(r *mqttGenRetirement) { r.MarkerSeq = 0 }},
 		{"a malformed generation", func(r *mqttGenRetirement) { r.Gen = "not-a-generation" }},
-		// The shape a pre-RWID watermark has, and the one a hand-authored record has:
-		// it cannot say which record its deletion retired, so it can seed no lineage.
-		// Refused rather than read as empty — the validator cannot tell a missing field
-		// from a present empty one, so accepting it would accept the older format.
-		{"no retired record identity", func(r *mqttGenRetirement) { r.RWID = _EMPTY_ }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _ := testNewTeardownEnv(t)
@@ -689,11 +669,10 @@ func TestRetirementMalformedWatermarkFailsClosedEverywhere(t *testing.T) {
 			_, recSeq := testLoadSessRecord(t, a, idHash)
 
 			// The baseline is VALID in every field, so each row's mutation is the only
-			// thing that can make it corrupt. A baseline missing RWID would make every
-			// row pass for the wrong reason.
+			// thing that can make it corrupt. A baseline already malformed in some other
+			// field would make every row pass for the wrong reason.
 			bad := &mqttGenRetirement{
-				ID: clientID, Gen: retiredGen, MarkerSeq: recSeq,
-				RWID: mqttNewRecordWID(), Nonce: "planted",
+				ID: clientID, Gen: retiredGen, MarkerSeq: recSeq, Nonce: "planted",
 			}
 			tc.mut(bad)
 			testPlantRetirement(t, a, idHash, bad, 0)
@@ -990,11 +969,11 @@ func TestTeardownStreamIsEpochCoupledToTheSessionStream(t *testing.T) {
 			t.Fatalf("first bring-up: %v", err)
 		}
 		idHash := getHash("recreated-unit")
-		// A VALID fence, RWID included: a watermark the readers would refuse anyway
-		// is no fence, so its disappearance would demonstrate nothing.
+		// A fence VALID in every field: a watermark the readers would refuse anyway is no
+		// fence, so its disappearance would demonstrate nothing.
 		if _, serr := asm1.jsa.storeGenRetirementCAS(mqttTeardownSubject(asm1.domainTk, idHash), 0,
-			&mqttGenRetirement{ID: "recreated-unit", Gen: mqttNewSessGen(), MarkerSeq: 9,
-				RWID: mqttNewRecordWID()}); serr != nil {
+			&mqttGenRetirement{ID: "recreated-unit", Gen: mqttNewSessGen(),
+				MarkerSeq: 9}); serr != nil {
 			t.Fatalf("planting a fence: %v", serr)
 		}
 
@@ -1020,68 +999,12 @@ func TestTeardownStreamIsEpochCoupledToTheSessionStream(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// The watermark names the RECORD its deletion retired (F-029b)
-// ---------------------------------------------------------------------------
-
-// TestRetirementNamesTheRetiredRecord is T1 (M10).
-//
-// Driven through the production path rather than by calling recordGenRetirement with the
-// argument the assertion then checks: a test that supplies the token itself cannot kill a
-// mutation at the production site.
-func TestRetirementNamesTheRetiredRecord(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	const clientID = "retirement-names-record"
-
-	sessA := testProvisionSession(t, a, clientID)
-	base, _ := testLoadSessRecord(t, a, sessA.idHash)
-	if base == nil || base.WID == _EMPTY_ {
-		t.Fatal("the record this teardown retires must carry an identity")
-	}
-	if err := sessA.clear(false); err != nil {
-		t.Fatalf("clear(): %v", err)
-	}
-	r, _, status := testLoadRetirement(t, a, sessA.idHash)
-	if status != mqttRetirementValid {
-		t.Fatalf("watermark status = %v, want valid", status)
-	}
-	if r.RWID != base.WID {
-		t.Fatalf("the watermark must name the record its deletion REMOVED: RWID=%q want %q",
-			r.RWID, base.WID)
-	}
-}
-
-// TestRetirementAdoptionNamesTheClaimedRecord is T2 (M2).
-//
-// An adopted teardown retires the record the MARKER claimed, which the marker preserved as
-// its own PWID — not the marker, which the release deletes and which is nobody's base.
-// Naming the marker would give the two sides of a racing pair different tokens.
-func TestRetirementAdoptionNamesTheClaimedRecord(t *testing.T) {
-	testQuietExpirySweeps(t)
-	a, _ := testNewTeardownEnv(t)
-	const clientID = "retirement-adoption-names"
-
-	marker, _ := testStageClaimedMarker(t, a, clientID)
-	if marker.WID == _EMPTY_ || marker.PWID == _EMPTY_ || marker.WID == marker.PWID {
-		t.Fatalf("the staged marker must have its own identity and a parent: %+v", marker)
-	}
-	if _, _, err := a.asm.createOrRestoreSession(clientID, a.s.getOpts()); err != nil {
-		t.Fatalf("adopting the teardown: %v", err)
-	}
-	r, _, status := testLoadRetirement(t, a, getHash(clientID))
-	if status != mqttRetirementValid {
-		t.Fatalf("watermark status = %v, want valid", status)
-	}
-	if r.RWID != marker.PWID {
-		t.Fatalf("an adopted teardown retires the record it CLAIMED: RWID=%q want %q "+
-			"(the marker's own identity is %q)", r.RWID, marker.PWID, marker.WID)
-	}
-}
-
 // TestRetirementBodyUsesTheLowercaseKey is T12's raw-body half (M18).
 //
-// A struct tag typo spells the field "RWID", every reader and writer in this tree agrees on
-// the typo, and a replicated round trip would not notice. The persisted key is the contract.
+// A struct tag typo is invisible to every reader and writer in this tree, because they all
+// agree on the typo, and a replicated round trip would not notice either. The PERSISTED KEY
+// is the contract, so it is asserted against the raw body. Re-pointed at "mseq" and "gen"
+// when the rwid key was removed; the principle is the field's, not any one field's.
 func TestRetirementBodyUsesTheLowercaseKey(t *testing.T) {
 	a, _ := testNewTeardownEnv(t)
 	const clientID = "retirement-raw-key"
@@ -1095,8 +1018,13 @@ func TestRetirementBodyUsesTheLowercaseKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the raw watermark: %v", err)
 	}
-	if !strings.Contains(string(smsg.Data), `"rwid":"`) {
-		t.Fatalf("the persisted watermark must carry the lowercase \"rwid\" key: %s", smsg.Data)
+	for _, key := range []string{`"mseq":`, `"gen":"`} {
+		if !strings.Contains(string(smsg.Data), key) {
+			t.Fatalf("the persisted watermark must carry the lowercase %s key: %s", key, smsg.Data)
+		}
+	}
+	if strings.Contains(string(smsg.Data), `"rwid"`) {
+		t.Fatalf("the retired-record identity was removed and must not be written: %s", smsg.Data)
 	}
 }
 
@@ -1105,8 +1033,11 @@ func TestRetirementBodyUsesTheLowercaseKey(t *testing.T) {
 // TestRetirementWIDlessRecordFailsClosed is T12's record half (M9).
 //
 // A teardown retires the record BY NAME, so a record carrying no identity cannot be
-// retired: the writer refuses to write a watermark its own readers would refuse, and the
-// teardown aborts having deleted nothing, leaving the record marked. Such a record can only
+// retired: recordGenRetirement refuses on an explicit precondition, before the watermark is
+// built and before any deletion, and the teardown aborts having deleted nothing, leaving
+// the record marked. The refusal used to come from the watermark's own validator, because
+// the identity was a required stored field; the field was removed and the precondition
+// stayed, since nothing else in the teardown path checks WID or PWID. Such a record can only
 // predate the lineage work, and refusing it is the same treatment a generationless record
 // already gets at the CONNECT restore.
 func TestRetirementWIDlessRecordFailsClosed(t *testing.T) {

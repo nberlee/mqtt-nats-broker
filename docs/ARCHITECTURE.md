@@ -1359,8 +1359,9 @@ The chain used to cross the teardown re-mint. `clear()` zeroes `wid`/`pwid` — 
 is acknowledged for nothing once its record is deleted, and six sites read `wid` as
 exactly that — and it also recorded the WID of the record its claim held in a third
 field, `retiredBaseWID`, which the accessor fell back to. Three further sources fed the
-same field or stood beside it: the generation-retirement watermark's `RWID`, an adopted
-marker's own `PWID`, and the `$MQTT_origin` interval register's identity. Together they
+same field or stood beside it: the generation-retirement watermark's `RWID` (a field since
+removed outright, see "The generation-retirement watermark"), an adopted marker's own
+`PWID`, and the `$MQTT_origin` interval register's identity. Together they
 made the sibling of base `a` written after tearing `a` down `{c, a}` rather than `{c, ""}`,
 so a resume child `{b, a}` recognised it, and they made a **cross-term create pair**
 recognisable from either side.
@@ -1399,13 +1400,14 @@ Nothing was lost on the repair side, because a create-parented fork was **repair
 nothing** already: a create had a parent POINTER and no parent CONTENT, so
 `buildForkedGrantLocked` returned nil and no capsule was minted.
 
-`RWID` survives the deletion with no reader (see "The generation-retirement watermark"):
-what it states is which record a retirement attributes its deletion to, and
-`docs/ROADMAP.md`'s vanished-record bullet is now the ONLY item that decides whether that
-fact gains a reader again. **F-036 no longer competes for it**: its 2026-08-27 attempt
-disproved the predicate, because the watermark holds one slot per client, so requiring
-`ackWID == rwid` recreates the superseded-watermark false negative that attempt existed to
-close. The licence it found is `MarkerSeq`-only.
+`RWID` survived this deletion for a time, with no reader, and has since been **REMOVED
+outright** — see "The generation-retirement watermark" for the reasoning and for what an
+exact reader would need instead. Two candidates were weighed and both failed: F-036's
+2026-08-27 attempt disproved the predicate because the watermark holds one slot per client,
+so requiring `ackWID == rwid` recreates the superseded-watermark false negative that attempt
+existed to close (the licence it found is `MarkerSeq`-only); and `docs/ROADMAP.md`'s
+vanished-record bullet, which decided last and decided against, because a write identity
+names a record's bytes rather than one occurrence of them.
 
 **`$MQTT_origin` is REFUSED, not merely unused.** An account still holding the register is
 an unsupported persisted shape under "Compatibility boundary", so a lookup-only preflight
@@ -4782,7 +4784,7 @@ consumers, holds and in-flight registers that no longer exist.
 
 The fix keeps the retirement fact **off the replaceable subject**. Every teardown that
 wins its claim first records a permanent per-client watermark on `$MQTT_teardown`
-(`{id, gen, mseq, rwid, nonce, origin, started}`, one subject per client,
+(`{id, gen, mseq, nonce, origin, started}`, one subject per client,
 `MaxMsgsPer: 1`), and only then deletes. It is written on both writers — `clear()` and
 `finishAdoptedTeardown`, which deletes the same resources under a marker just as
 evictable — always confirmed, even on a no-wait discard: a fence that only reached a
@@ -4803,25 +4805,38 @@ same-generation retirement be skipped and leave a paused older writer's write fi
 The monotonicity is **decision-time** monotonicity; an admitted CAS that applies after
 a leader transition can still regress the single slot, which is a stated residual.
 
-**`rwid` names the RECORD the deletion removed** — the record the teardown claimed,
-never the marker that claimed it — and it is REQUIRED: a watermark without it is corrupt
-to every reader, because a retirement that cannot say which record it removed attributes
-that deletion to nothing. It has **no consumer today**; the create that inherited it as a
-parent was deleted by the write-lineage audit (see "Recognising a forked session record"),
-and the field is retained because `docs/ROADMAP.md`'s vanished-record bullet is the one
-item left that decides whether it gains a reader again — F-036 disproved it as a predicate
-on 2026-08-27, so that bullet decides alone. It cannot be optional and
-cannot be filled in later: the validator cannot tell "field absent" from "field present
-and empty", so accepting an empty one would accept the pre-`rwid` shape the compatibility
-boundary refuses. By the same rule, a teardown of a record carrying no `WID` **fails closed**
-with the record left marked, rather than retiring a record on a name nothing can
-attribute.
+**The watermark carried an `rwid` naming the record the deletion removed, and that field
+was REMOVED** by `docs/ROADMAP.md`'s vanished-record item, which is the box that decided
+its fate. The reasoning is the item's product and is recorded here so it is not
+re-derived:
+
+A record's write identity names its BYTES, not one OCCURRENCE of them. `storeFramedSessionMsg`
+replays acknowledged bytes verbatim and the readback adopts the new, higher sequence with
+the original `WID`; restore adopts `WID`/`PWID` from record JSON without validating
+provenance. So one identity can stand at two sequences, and a reader asking "did a
+teardown retire the record I hold?" cannot tell which occurrence a retirement removed.
+`mseq` bounds the removed occurrence below the marker but does not say WHICH occurrence it
+was, so no conjunction of surviving fields is occurrence-exact either. The field therefore
+never acquired the reader it was retained for, and could not.
+
+**What an exact reader would need instead**, if one is ever wanted: the claimed
+PREDECESSOR SEQUENCE, stored on the marker where `claimTeardown` knows it and copied into
+the watermark, compared for equality with the reader's own `sess.seq`. That is two new
+required fields on two permanent shapes; the route is analyzable — `$MQTT_teardown` is
+already epoch-coupled to `$MQTT_sess` — and it was refused as DISPROPORTIONATE to what it
+buys, which was a more specific DISCONNECT Reason String. Disproportionate, not blocked.
+
+**What the field also did, and what replaced it.** Being required, it made a teardown of a
+record carrying no `WID` **fail closed** with the record left marked, rather than retiring
+a record on a name nothing can attribute. Nothing else in the teardown path checks `WID`
+or `PWID`, so that refusal is now an explicit precondition in `recordGenRetirement`,
+checked before the watermark is built and before any deletion.
 
 Three readers consume the fence — a fourth, the record-absent create, was deleted with
 the create-parent inheritance and now reads it only to refuse a corrupt one. Each applies
 the same validation
 (`mqttValidateGenRetirement`: decodable, the client ID hashes back to the subject
-token, a valid generation, a nonzero `mseq`, a non-empty `rwid`) with the same
+token, a valid generation, a nonzero `mseq`) with the same
 fail-closed disposition — a watermark that is unreadable or malformed in any field is
 never repaired in place, because it may name a retirement newer than the reader's own:
 
@@ -4855,10 +4870,11 @@ never repaired in place, because it may name a retirement newer than the reader'
   parentless whatever the watermark says.
 
   It used to take `rwid` from the valid arm as the identity its first write descended
-  from, which is what the write-lineage audit deleted. The `rwid` field remains on the
-  watermark with no reader (see "Recognising a forked session record"), so a valid
-  watermark is read here and deliberately not used — an inheritance restored on this arm
-  would reintroduce the false-fork routes `docs/CONFORMANCE.md` records, not close a gap.
+  from, which is what the write-lineage audit deleted; the field itself has since been
+  removed, so there is no longer any record identity here to inherit. A valid watermark is
+  still read on this arm and deliberately draws nothing from it — an inheritance restored
+  here would reintroduce the false-fork routes `docs/CONFORMANCE.md` records, not close a
+  gap.
   The read's PLACEMENT after the proof of absence is likewise no longer load-bearing for
   ancestry; what remains of it is that the refusal decides on a watermark at least as new
   as the deletion that emptied the subject.

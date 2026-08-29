@@ -248,19 +248,22 @@ func TestMQTTForkedRecordRepairOnAReplicatedStream(t *testing.T) {
 // TestMQTTRetirementWatermarkTravelsAcrossBrokers is T11 after the write-lineage audit.
 //
 // The single-stream tests prove the fields serialize. This one proves the fact TRAVELS
-// through Raft: the watermark one broker's teardown wrote, naming the record it removed,
-// is readable by ANOTHER broker — the two never share memory, so nothing but
-// $MQTT_teardown can carry that identity between them. This test is the only CROSS-BROKER
-// assertion of the fact — but it is an assertion, not a production reader, and a test
-// asserting that a field serializes is not a reason to keep the field. RWID has NO
-// production reader; what decides whether it gains one is docs/ROADMAP.md's
-// vanished-record bullet, alone (F-036 was the other candidate and its 2026-08-27 attempt
-// disproved the predicate).
+// through Raft: the watermark one broker's teardown wrote is readable by ANOTHER broker —
+// the two never share memory, so nothing but $MQTT_teardown can carry it between them.
+// The load is therefore made through BROKER B's account-session manager, not the writer's
+// own: read back through broker A it would prove only that the write happened.
 //
-// The second half is the reader that was REMOVED: broker B's create no longer draws a
-// parent from the watermark it can plainly read, which is what makes a parentless create
-// pair concede. Asserting both against one replicated watermark is the point — the fact
-// is available and deliberately unused.
+// It used to assert the retired record's identity, and that field was removed with the
+// vanished-record item — a write identity names a record's bytes rather than one
+// occurrence of them, so no reader could be built on it. Gen and MarkerSeq carry the
+// cross-broker property now; MarkerSeq is in any case the only field the advance is
+// decided by.
+//
+// A SECOND HALF asserted that broker B's create drew no parent from the watermark it can
+// plainly read. It was DELETED with the field: the watermark no longer carries any record
+// identity, so there is nothing there for a create to inherit and the assertion could only
+// pass vacuously. The parentless-create property is measured where an identity IS still
+// available — sess_write_lineage_audit_test.go's marker and clear() arms.
 func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {
 	oldTimeout := testMQTTTimeout
 	testMQTTTimeout = 40 * time.Second
@@ -279,7 +282,7 @@ func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {
 	idHash := getHash(cid)
 
 	// Broker A: a clean-start session whose close DISCARDS the record. That teardown
-	// records the watermark naming the record it deletes, through Raft.
+	// records the retirement watermark, through Raft, before it deletes anything.
 	ca, ra := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true},
 		a.opts.MQTT.Host, a.opts.MQTT.Port)
 	testMQTTCheckConnAck(t, ra, mqttConnAckRCConnectionAccepted, false)
@@ -290,54 +293,34 @@ func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {
 		t.Fatal("broker A must be bound to a session")
 	}
 	sessA.mu.Lock()
-	widA := sessA.wid
+	widA, sessAGen := sessA.wid, sessA.gen
 	sessA.mu.Unlock()
 	if widA == _EMPTY_ {
+		// A fixture precondition, not a watermark fact: recordGenRetirement refuses a
+		// record carrying no identity, so without this the teardown below would fail
+		// closed and there would be no watermark to replicate.
 		t.Fatal("broker A's record must carry a minted identity")
 	}
 	testMQTTDisconnect(t, ca, nil)
 	ca.Close()
 
-	asmA := a.s.mqtt.sessmgr.sessions[globalAccountName]
+	// Read through BROKER B. Broker A wrote it, so loading it back there would demonstrate
+	// nothing about replication; B's manager has never seen A's memory.
+	asmB := b.s.mqtt.sessmgr.sessions[globalAccountName]
 	deadline := time.Now().Add(testMQTTTimeout)
 	var r *mqttGenRetirement
 	for time.Now().Before(deadline) {
-		if got, _, st := asmA.jsa.loadGenRetirement(asmA.domainTk, idHash); st == mqttRetirementValid {
+		if got, _, st := asmB.jsa.loadGenRetirement(asmB.domainTk, idHash); st == mqttRetirementValid {
 			r = got
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	if r == nil {
-		t.Fatal("the clean-start close must record a retirement watermark")
+		t.Fatal("the clean-start close must record a retirement watermark readable by broker B")
 	}
-	if r.RWID != widA {
-		t.Fatalf("the replicated watermark must name the record the teardown removed: RWID=%q want %q",
-			r.RWID, widA)
-	}
-
-	// Broker B finds the subject empty and creates. The replicated watermark is the only
-	// place a parent could have come from, and it is asserted valid and naming widA
-	// directly above — so a parentless create here is a real measurement of the removed
-	// reader rather than an absence that proves nothing.
-	cb, rb := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false},
-		b.opts.MQTT.Host, b.opts.MQTT.Port)
-	defer cb.Close()
-	testMQTTCheckConnAck(t, rb, mqttConnAckRCConnectionAccepted, false)
-
-	sessB := testMQTTGetClient(t, b.s, cid).mqtt.sess
-	if sessB == nil {
-		t.Fatal("broker B must be bound to a session")
-	}
-	sessB.mu.Lock()
-	widB, pwidB := sessB.wid, sessB.pwid
-	sessB.mu.Unlock()
-	if pwidB != _EMPTY_ {
-		t.Fatalf("broker B's CREATE must descend from NOTHING, not from the record broker A's "+
-			"teardown retired: PWID=%q (the watermark names %q, B's own WID is %q)",
-			pwidB, widA, widB)
-	}
-	if widB == _EMPTY_ || widB == widA {
-		t.Fatalf("broker B must mint its own identity: WID=%q (A's %q)", widB, widA)
+	if r.Gen != sessAGen || r.MarkerSeq == 0 {
+		t.Fatalf("the watermark broker B reads must be broker A's, naming the retired "+
+			"generation with the marker sequence it landed at: %+v want gen %q", r, sessAGen)
 	}
 }

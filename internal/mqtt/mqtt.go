@@ -9493,9 +9493,9 @@ RESTORE:
 		sess.domainTk = as.domainTk
 		// Parentless, as every create now is: this session's first write no longer
 		// descends from the record the ADOPTED teardown claimed. The marker's own PWID
-		// still names that record for the retirement watermark the release records
-		// (finishAdoptedTeardown passes it to recordGenRetirement), which is a
-		// retirement fact rather than a lineage one. See the create arm above.
+		// still names that record, and finishAdoptedTeardown passes it to
+		// recordGenRetirement as the PRECONDITION that the record being retired has an
+		// identity at all — the watermark no longer stores it. See the create arm above.
 		return sess, false, nil
 	}
 
@@ -10482,8 +10482,8 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// record so a clean-start sibling stayed recognisable; the write-lineage audit
 	// removed that, because a pointer at a record whose interval has ended is what every
 	// documented FALSE fork was built from. retiringWID is still captured above, for the
-	// retirement watermark below — which names the record this deletion removes, a fact
-	// about the teardown rather than about the next write's ancestry.
+	// teardown MARKER's parent and for the retirement precondition below — neither of which
+	// is about the next write's ancestry.
 	//
 	// The GRANT chain breaks here too, and always did: nothing of the retired incarnation
 	// may be RE-ASSERTED into the fresh one — that is the resurrection this repair is
@@ -10539,10 +10539,11 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// recording the retirement first. See sess_teardown.go.
 	//
 	// retiringWID rides along, captured above BEFORE the reset for the same reason the
-	// generation and the sequence were: the watermark names the record this deletion
-	// removes, which is what ATTRIBUTES the retirement rather than what parents any later
-	// write — no create reads it since the write-lineage audit. Reading sess.wid here
-	// would read the zero the reset just wrote.
+	// generation and the sequence were. It is no longer STORED — the watermark's rwid field
+	// was removed, because a write identity names a record's bytes rather than one
+	// occurrence of them — but it is still the PRECONDITION: a record carrying no identity
+	// cannot be retired by name, so recordGenRetirement fails the teardown closed before
+	// any deletion. Reading sess.wid here would read the zero the reset just wrote.
 	if err := sess.recordGenRetirement(target, nonce, retiringWID, markerSeq); err != nil {
 		return err
 	}

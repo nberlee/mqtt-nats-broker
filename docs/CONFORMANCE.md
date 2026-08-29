@@ -1472,9 +1472,30 @@ What it does NOT do:
     claim accordingly: this text used to say the accompanying `0x8E` was "right either
     way" and only its Reason String imprecise, which had the defect backwards. No new
     connection need exist, and none is now asserted. The disposal is right either way and
-    the client's reconnect correctly gets a fresh session; a gone-specific vocabulary
-    value that would tell an expiry-driven vanishing from a takeover is filed as its own
-    roadmap bullet, and it may only ever refine this `0x89`, never restore `0x8E`;
+    the client's reconnect correctly gets a fresh session. **A gone-specific vocabulary
+    value that would tell an expiry-driven vanishing from a takeover WILL NOT EXIST, and
+    this is a permanent stated residual rather than filed work.** Its roadmap bullet was
+    closed as refuted: the only positive evidence available, the retirement watermark's
+    retired-record identity, names a record's BYTES rather than one OCCURRENCE of them, so
+    it cannot say which occurrence a retirement removed; the field has been removed. So a
+    vanished record, an unreadable one, an undecodable one, a below-base one and a
+    valid-shaped stranger all report this one `0x89`, and an operator cannot tell an
+    ordinary retirement from a store fault from that line. Closing it needs a claimed
+    predecessor SEQUENCE on two permanent shapes, refused as disproportionate — see
+    `docs/ARCHITECTURE.md`, "The generation-retirement watermark". **Removing the field
+    also removed a FORMAT GATE, and that is disclosed rather than claimed away**: a
+    watermark carrying a valid `id`, `gen` and non-zero `mseq` but no `rwid` was CORRUPT
+    before and is VALID after, so four logical readers now ACT where they previously
+    refused — the CONNECT restore's discard of a retired record, the orphan sweep's
+    condemnation, the record-absent create's refusal (which keys on the corrupt verdict
+    alone), and `recordGenRetirement` itself, which proceeds to a no-op-or-replace and
+    then to deletion instead of failing closed. Two of those read the watermark AGAIN
+    after their first read and a no-`rwid` value can appear in between: the writer's
+    `retirementFenced` re-reads and the sweep's act-time revalidation. It creates **no new
+    LOGICAL false positive**, because the validator only ever checked the field for
+    NON-EMPTINESS and never compared it with anything, so an arbitrary non-empty string
+    already passed every one of those readers; what was lost is a format check, never a
+    semantic one. No client-visible behaviour changes for currently valid supported state;
   - **the deleted-record shape does NOT converge a bound session that never sends
     another packet.** Unlike the moved-record shape — where the eviction worker
     disposes a bound session itself — arming the marker hands the case to the record
@@ -1655,7 +1676,8 @@ What it does NOT do:
 
   **A CREATE IS PARENTLESS, and the recognition it used to supply is GIVEN UP.** The
   write-lineage audit deleted every source a create drew a parent from: the
-  generation-retirement watermark's `RWID`, an adopted marker's own `PWID`, `clear()`'s
+  generation-retirement watermark's `RWID` (a field since removed outright), an adopted
+  marker's own `PWID`, `clear()`'s
   stamp of the record its claim held, and the `$MQTT_origin` session-interval register
   with the stream itself. The reason is stated below and is the whole finding of that
   audit — every route by which the inheritance produced a verdict was reachable equally
@@ -2375,11 +2397,14 @@ release-superseded arm, which condemns a same-generation survivor with a fresh m
 the CONNECT restore, which discards a retired record instead of resuming it hollow; and
 the orphan sweep, which condemns one with no CONNECT at all. A FOURTH was deleted by the
 write-lineage audit: the record-absent create, which inherited the retired record's
-identity as its own parent (F-029b). Its `RWID` field is retained with no reader, because
-what it states — which record a retirement attributes its deletion to — is what the
-vanished-record vocabulary may need. **F-036 no longer may**: its 2026-08-27 attempt
-disproved the predicate, since a one-slot-per-client watermark makes `ackWID == rwid`
-recreate the superseded-watermark false negative. Nothing ever reaps a watermark. See
+identity as its own parent (F-029b). Its `RWID` field outlived that reader and has since
+been **REMOVED**, by the vanished-record item that was the last candidate to give it one:
+a write identity names a record's bytes rather than one occurrence of them, so it could not
+tell which occurrence a retirement removed. F-036 was the other candidate and failed
+earlier — its 2026-08-27 attempt disproved the predicate, since a one-slot-per-client
+watermark makes `ackWID == rwid` recreate the superseded-watermark false negative. What the
+field also enforced, that a record carrying no `WID` fails its teardown closed, is now an
+explicit precondition in `recordGenRetirement`. Nothing ever reaps a watermark. See
 `docs/ARCHITECTURE.md`, "The generation-retirement watermark".
 
 What the repair is, exactly: **truthful termination, never restoration.** The deleted
