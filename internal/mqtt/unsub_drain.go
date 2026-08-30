@@ -742,7 +742,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 			// Addressed by the identifier, never by regSeq. Pinned on the production path
 			// by TestFinalizeDrainDeliveryAddressesByPacketIdentifier.
 			subject := mqttInflightSubject(idHash, gen, pi)
-			switch sess.asm.releaseInflightRegisterByIdentity(c, subject, d.cc.Durable, sseq) {
+			switch sess.asm.releaseInflightRegisterByIdentity(c, sess, subject, d.cc.Durable, sseq) {
 			case mqttInflightUndecided:
 				mqttWarnf(c, "MQTT: withholding the completion of drained sequence %d for client %q: "+
 					"its in-flight register on %q could not be resolved", sseq, sess.id, subject)

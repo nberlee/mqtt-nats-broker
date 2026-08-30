@@ -674,7 +674,7 @@ func TestMQTTInflightRecoveryRestoresIdentifier(t *testing.T) {
 	pi := e.track(t, dur, sseq, 2)
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -764,7 +764,7 @@ func TestMQTTInflightRecoveryDropsCompletedSource(t *testing.T) {
 	}
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -791,7 +791,7 @@ func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
 	}
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -835,7 +835,7 @@ func TestMQTTInflightRecoveryReservesPubRelIdentifiers(t *testing.T) {
 	}
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -898,7 +898,7 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 	}
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -944,7 +944,7 @@ func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T)
 	}
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -986,7 +986,7 @@ func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
 		t.Fatalf("seed the newer register: %v", err)
 	}
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1047,7 +1047,7 @@ func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T
 	}
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1090,7 +1090,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 		t.Fatalf("seed an unusable register: %v", err)
 	}
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1145,7 +1145,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	// pendingPublish, so this pass installs nothing; a condition counting what it
 	// installed rather than what it FOUND would read that as "nothing is opaque" and
 	// re-enable allocation with the unreadable record still there.
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("second recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1170,7 +1170,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	e.sess.mu.Lock()
 	delete(e.sess.pendingPublish, pi)
 	e.sess.mu.Unlock()
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1200,7 +1200,7 @@ func TestMQTTInflightRecoveryKeepsInMemoryState(t *testing.T) {
 	live.jsAckSubject = liveAck
 	e.sess.mu.Unlock()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1257,7 +1257,7 @@ func TestMQTTInflightRecoveryWithholdsAllocationOnUnreadableWalk(t *testing.T) {
 
 			// The resume itself succeeds: taking a whole session offline over a
 			// transient scan failure is worse than withholding new deliveries.
-			if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+			if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 				t.Fatalf("an unreadable walk must not deny the resume: %v", err)
 			}
 			e.sess.mu.Lock()
@@ -1276,7 +1276,7 @@ func TestMQTTInflightRecoveryWithholdsAllocationOnUnreadableWalk(t *testing.T) {
 
 			// A resume that completes lifts the restriction.
 			restore()
-			if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+			if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 				t.Fatalf("recoverInflightRegisters: %v", err)
 			}
 			e.sess.mu.Lock()
@@ -1644,7 +1644,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 	e.sess.mu.Unlock()
 	e.forgetInMemory()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1714,7 +1714,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 	e.asm.testInflightStore, e.asm.testInflightDelete = nil, nil
 	e.asm.mu.Unlock()
 	e.forgetInMemory()
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -1797,7 +1797,7 @@ func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	restored.mu.Lock()
@@ -2111,7 +2111,7 @@ func TestMQTTInflightRecoveryDropsVoidedTransmittedRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	restored.mu.Lock()
@@ -2165,7 +2165,7 @@ func TestMQTTInflightRolledBackTeardownRestoresTransmittedRegister(t *testing.T)
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	restored.mu.Lock()
@@ -2401,7 +2401,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
@@ -2818,7 +2818,7 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	restored.mu.Lock()
@@ -2894,7 +2894,7 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 	if !present {
 		t.Fatalf("the record must be resumed, or the register walk finds nothing")
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
@@ -3013,7 +3013,7 @@ func TestMQTTInflightClaimFencesStaleClosePurge(t *testing.T) {
 	if err := testSessSave(t, sessB); err != nil {
 		t.Fatalf("persist takeover: %v", err)
 	}
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 	subject := mqttInflightSubject(sessB.idHash, sessB.gen, pi)
@@ -3052,7 +3052,7 @@ func TestMQTTInflightClaimFencesStaleClosePurge(t *testing.T) {
 	// Crash B by dropping its object without a close, then recover elsewhere.
 	asmB.removeSession(sessB, true)
 	_, sessC, cC := e.peer(t, "node3", clientID)
-	if err := sessC.recoverInflightRegisters(cC); err != nil {
+	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
 		t.Fatalf("post-crash recovery: %v", err)
 	}
 	sessC.mu.Lock()
@@ -3098,7 +3098,7 @@ func TestMQTTInflightClaimConsumesEarlierClose(t *testing.T) {
 		return asmB.jsa.storeInflightCAS(subject, expectSeq, rec)
 	}
 	asmB.mu.Unlock()
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 	if claimAttempts != 1 {
@@ -3133,7 +3133,7 @@ func TestMQTTInflightClaimFencesCancellationReconcile(t *testing.T) {
 	if err := testSessSave(t, sessB); err != nil {
 		t.Fatalf("persist takeover: %v", err)
 	}
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 
@@ -3200,7 +3200,7 @@ func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
 		if _, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, rec); err != nil {
 			return 0, err
 		}
-		if err := sessB.recoverInflightRegisters(cB); err != nil {
+		if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 			t.Fatalf("takeover recovery inside stalled store: %v", err)
 		}
 		return 0, fmt.Errorf("test: response lost after takeover claimed the write")
@@ -3249,7 +3249,7 @@ func TestMQTTInflightClaimFencesRetirementReconcile(t *testing.T) {
 	if err := testSessSave(t, sessB); err != nil {
 		t.Fatalf("persist takeover: %v", err)
 	}
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 	if seq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, msgA.Sequence, recA.Nonce, _EMPTY_, _EMPTY_); ok || seq != 0 {
@@ -3284,7 +3284,7 @@ func TestMQTTInflightClaimFencesPendingCancellation(t *testing.T) {
 	if err := testSessSave(t, sessB); err != nil {
 		t.Fatalf("persist takeover: %v", err)
 	}
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 	rc := mqttRegCancellation{pi: pi, nonce: recA.Nonce, durable: dur, sseq: sseq}
@@ -3329,7 +3329,7 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 	if err := testSessSave(t, sessB); err != nil {
 		t.Fatalf("persist takeover: %v", err)
 	}
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 	subject := mqttInflightSubject(sessB.idHash, sessB.gen, pi)
@@ -3365,11 +3365,31 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 		t.Fatalf("stale replacement rewrote B's claim: seq=%d nonce=%q claim=%q, want %d/%q/%q",
 			msg.Sequence, rec.Nonce, rec.Claim, claimedMsg.Sequence, recA.Nonce, sessB.regClaim)
 	}
+	// The loser QUARANTINES the identifier rather than abandoning it (F-087 WP2).
+	// Abandoning removes the cpending mapping, so the source's next AckWait offer
+	// allocates a DIFFERENT identifier and transmits the same message while the rival's
+	// register stands — two identifiers for one message. Held, the source is declined at
+	// every later offer.
 	e.sess.mu.Lock()
-	_, staleHeld := e.sess.pendingPublish[pi]
+	stale := e.sess.pendingPublish[pi]
+	mapped := e.sess.cpending[dur][sseq]
+	contested := e.sess.sourceForeignContestedLocked(dur, sseq)
 	e.sess.mu.Unlock()
-	if staleHeld {
-		t.Fatal("the losing allocation must be abandoned")
+	if stale == nil || !stale.regForeign || stale.jsDur != dur || stale.sseq != sseq {
+		t.Fatalf("the losing allocation must be quarantined as a foreign reservation, got %+v", stale)
+	}
+	if mapped != pi {
+		t.Fatalf("the quarantine must keep the source mapping: cpending=%d want %d", mapped, pi)
+	}
+	if !contested {
+		t.Fatal("the losing allocation must record the contest, keyed by the source")
+	}
+	// The point of holding it: a REAL re-offer of the same source allocates nothing.
+	e.sess.mu.Lock()
+	rePI, _, _, reNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	e.sess.mu.Unlock()
+	if rePI != 0 || reNew {
+		t.Fatalf("a re-offer of a quarantined source must allocate no identifier, got pi=%d isNew=%v", rePI, reNew)
 	}
 
 	// The three-owner ending: A's close purges nothing further, B crashes, and a third
@@ -3377,7 +3397,7 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 	e.sess.purgeSharedPending()
 	asmB.removeSession(sessB, true)
 	_, sessC, cC := e.peer(t, "node3", clientID)
-	if err := sessC.recoverInflightRegisters(cC); err != nil {
+	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
 		t.Fatalf("third-owner recovery: %v", err)
 	}
 	sessC.mu.Lock()
@@ -3438,7 +3458,7 @@ func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
 	if err := testSessSave(t, sessB); err != nil {
 		t.Fatalf("persist takeover: %v", err)
 	}
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 	// Armed preconditions: B failed closed on the pair, AND both registers moved under
@@ -3474,7 +3494,7 @@ func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
 	// single "authoritative" survivor.
 	asmB.removeSession(sessB, true)
 	_, sessC, cC := e.peer(t, "node3", clientID)
-	if err := sessC.recoverInflightRegisters(cC); err != nil {
+	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
 		t.Fatalf("third-owner recovery: %v", err)
 	}
 	sessC.mu.Lock()
@@ -3545,7 +3565,7 @@ func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
 		return asmC.jsa.storeInflightCAS(subject, expectSeq, rec)
 	}
 	asmC.mu.Unlock()
-	if err := sessC.recoverInflightRegisters(cC); err != nil {
+	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
 		t.Fatalf("split-claim recovery: %v", err)
 	}
 	if splitArmed != 1 {
@@ -3623,7 +3643,7 @@ func TestMQTTInflightClaimDisplacedResumeRefused(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err == nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err == nil {
 		t.Fatal("a resume that observed an active rival's claim must be refused")
 	}
 	// Nothing was installed or demoted: the pre-existing live entry stands untouched
@@ -3703,7 +3723,7 @@ func TestMQTTInflightClaimSupersedesOlderOwner(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("a newer accept must supersede an older owner's claim, got refusal: %v", err)
 	}
 	e.asm.mu.Lock()
@@ -3786,7 +3806,7 @@ func TestMQTTInflightClaimOutlastsOlderClaimChain(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("the newest owner must outlast the older-claim chain, got refusal: %v", err)
 	}
 	if interventions != 3 {
@@ -3862,7 +3882,7 @@ func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
 
 	// The rebind's barrier re-run: the register is legitimately reinstalled — and its
 	// sequence must have MOVED out from under the paused delete.
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("same-object barrier re-run: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -3888,7 +3908,7 @@ func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
 	e.waitRegisterCount(t, 1)
 
 	// The next barrier run consumes the completed source against memory.
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("healing barrier re-run: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -3943,7 +3963,7 @@ func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
 		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
 	}
 	e.asm.mu.Unlock()
-	if err := e.sess.recoverInflightRegisters(e.c); err == nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err == nil {
 		t.Fatal("a resume whose claim fence never landed must be refused")
 	}
 	e.asm.mu.Lock()
@@ -3972,7 +3992,7 @@ func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
 		return nil, nil, fmt.Errorf("test: claim re-read unavailable")
 	}
 	e.asm.mu.Unlock()
-	if err := e.sess.recoverInflightRegisters(e.c); err == nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err == nil {
 		t.Fatal("a resume whose claim fence cannot be verified must be refused")
 	}
 	e.asm.mu.Lock()
@@ -4041,7 +4061,7 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 		return e.asm.jsa.storeInflightCAS(subject, expectSeq, rec)
 	}
 	e.asm.mu.Unlock()
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("same-object barrier re-run: %v", err)
 	}
 
@@ -4118,7 +4138,7 @@ func TestMQTTInflightClaimConsumedCloseRetiresLiveMemory(t *testing.T) {
 		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
 	}
 	e.asm.mu.Unlock()
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("same-object barrier re-run: %v", err)
 	}
 
@@ -4178,7 +4198,7 @@ func TestMQTTInflightClaimLostMemberSurvivesTerminalAck(t *testing.T) {
 		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
 	}
 	e.asm.mu.Unlock()
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("same-object barrier re-run: %v", err)
 	}
 
@@ -4250,7 +4270,7 @@ func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
 	}
 	e.asm.mu.Unlock()
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("same-object barrier re-run: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -4601,7 +4621,7 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	restored.mu.Lock()
@@ -4759,7 +4779,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	}
 
 	// First resume: the register is absent, and the verdict must SURVIVE the scan.
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -4776,7 +4796,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 		t.Fatalf("land the late register: %v", err)
 	}
 	// ...and the next scan retires the verdict against the proof of its deletion.
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters (second): %v", err)
 	}
 	e.sess.mu.Lock()
@@ -4993,7 +5013,7 @@ func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
-	if err := restored.recoverInflightRegisters(e.c); err != nil {
+	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	restored.mu.Lock()
@@ -5110,7 +5130,7 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 	})
 	defer restore()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
@@ -5302,7 +5322,7 @@ func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
@@ -5346,7 +5366,7 @@ func TestMQTTInflightRecoveryMissingStreamIsIncomplete(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.sess.recoverInflightRegisters(e.c); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("a missing stream must not deny the resume: %v", err)
 	}
 	e.sess.mu.Lock()

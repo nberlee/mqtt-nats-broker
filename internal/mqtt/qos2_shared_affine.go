@@ -3266,6 +3266,16 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	if isNew && !sess.storeInflightRegister(cc, pi, 2, jsDur, sseq, regNonce, claimSubject, subject) {
 		return
 	}
+	// The SEND SECTION, exactly as the plain QoS 1/2 path: the identifier is held by the
+	// session registry until this write returns, so no removal path can free it and let
+	// bumpPI re-mint it mid-write (F-087 WP5). Armed with defer before the enqueue.
+	sess.mu.Lock()
+	sendTok, sendOK := sess.beginSendLocked(cc, pi, jsDur, sseq)
+	sess.mu.Unlock()
+	if !sendOK {
+		return // AckWait re-offers it, the same cost a regPending decline accepts
+	}
+	defer sess.endSend(cc, pi, sendTok)
 	topic := natsSubjectStrToMQTTTopic(string(h.subject))
 	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, 2, dup, h.retained, subID, topic, msg, props) {
 		// Exceeds the client's MQTT 5.0 Maximum Packet Size: discard it and

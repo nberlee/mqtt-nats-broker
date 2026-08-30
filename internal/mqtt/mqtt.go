@@ -1850,6 +1850,38 @@ type mqttSession struct {
 	// retireSourceLocked.
 	srcAckOwed map[mqttDeferredKey]*mqttRetiredSource
 
+	// foreignContested records a same-delivery takeover this session LOST: its
+	// allocation met a live register of another writer on the identifier, so the
+	// identifier is quarantined in place rather than abandoned (abandoning it would
+	// unlink the cpending mapping and let the next AckWait offer mint a SECOND
+	// identifier for one message).
+	//
+	// Keyed by the SOURCE delivery, never by the identifier: a consumer purge unlinks
+	// the cpending mapping, and a later re-subscribe re-offers the same source, so a
+	// pi-keyed quarantine would be invisible to trackPublish at exactly the moment it
+	// has to decline. There is deliberately NO live-session release edge — see the
+	// resume's final-disposition reconciliation in inflight_register.go (F-087 WP2).
+	foreignContested map[mqttDeferredKey]*mqttForeignContest
+
+	// sendsInFlight holds every packet identifier with an active send section, mapped
+	// to that section's token. It is THE authority on whether an identifier may be
+	// re-minted: bumpPI always consults it, and only endSend removes from it.
+	//
+	// Populated by the PUBLISH send sites ONLY. A PUBREL transmission does not reserve
+	// its identifier yet — F-089, an alpha blocker: a duplicate PUBREL's write can be
+	// blocked while the client's PUBCOMP for an earlier copy frees the identifier, and
+	// the mechanism here is what that fix will reuse.
+	//
+	// Deliberately NOT nilled by clear(): clear() resets last_pi to zero and a reused
+	// session object can mint PI 1 for a new incarnation while the displaced
+	// connection's PI 1 write is still blocked in a synchronous socket write. The
+	// registry is what carries the reservation across the discard (F-087 WP5 class F2).
+	sendsInFlight map[uint16]string
+
+	// inflightWalks counts this session object's register-recovery walks, so a
+	// quarantine can record which walk it predates. See mqttForeignContest.walk.
+	inflightWalks uint64
+
 	// cancelledRegNonces holds the nonces of registers this session has given up — the
 	// VOID-register verdicts. A teardown that abandons a register voids its nonce, whether
 	// the allocation was still storing or already transmitted; recovery reads a register
@@ -2603,6 +2635,100 @@ type mqttPending struct {
 	// releaseSettledVoidReservationsLocked frees the identifier once the verdict's save
 	// lands. Holding it costs one in-flight store's round trip in the common case.
 	regCancelled bool
+
+	// sendNonce names the send section currently transmitting this entry, empty when
+	// none is. It is the ENTRY-side half of the send reservation: the identifier itself
+	// is held by the session's sendsInFlight registry, because a successful PUBREC
+	// REPLACES this entry with a PUBREL one while the write may still be blocked, and
+	// per-entry state alone would strand the identifier. What this half is for is
+	// fencing the condemnation and the settle execution to one section (F-087 WP5).
+	sendNonce string
+	// sendSettle is the continuation a removal path parked because a send section was
+	// active. The FIRST parked settle wins: a later remover still performs its own
+	// durable work, but neither replaces this disposition nor executes it early, which
+	// is sound because every continuation is idempotent against another remover's
+	// durable work (an exact-sequence delete's "already gone" is the existing success
+	// reading). endSend executes it.
+	sendSettle mqttSendSettle
+}
+
+// mqttSendSettleKind names the continuation a removal path owes an entry whose send
+// section is still active. It is a KIND, not a boolean, because the paths that condemn
+// an entry mid-send owe materially different work: an acknowledgement still owes the
+// register's delete, a teardown's ladder already issued it, and a recovery pass has
+// already made every durable decision it is going to make.
+type mqttSendSettleKind uint8
+
+const (
+	// mqttSendSettleNone: nothing parked; the section ends by simply clearing.
+	mqttSendSettleNone mqttSendSettleKind = iota
+	// mqttSendSettleAckComplete: a PUBACK (or PUBCOMP-side completion) arrived while
+	// the write was in flight. The protocol answer already went out; what is deferred
+	// is the identifier-freeing untrack and the register's delete.
+	mqttSendSettleAckComplete
+	// mqttSendSettlePubRecFailed: a PUBREC whose PUBREL store failed, which frees the
+	// identifier exactly as a terminal acknowledgement does.
+	mqttSendSettlePubRecFailed
+	// mqttSendSettlePurgeTeardown: a consumer teardown condemned the entry. Its ladder
+	// owns the register's durable disposition, so only the memory untrack is deferred.
+	mqttSendSettlePurgeTeardown
+	// mqttSendSettleDenyRelease: a subscribe denial released the identifier; its own
+	// register delete is deferred with the untrack.
+	mqttSendSettleDenyRelease
+	// mqttSendSettleRecoveryDrop: a recovery apply dropped the entry. The pass already
+	// issued the durable deletes it owed, so only the memory untrack is deferred.
+	mqttSendSettleRecoveryDrop
+)
+
+// mqttSendSettle is one parked continuation.
+type mqttSendSettle struct {
+	kind   mqttSendSettleKind
+	regSeq uint64 // the register this continuation deletes, when it owns that delete
+	nonce  string // the condemned allocation's identity, so the delete can name its verdict
+}
+
+// mqttForeignContest is a quarantined identifier: our allocation met a live register
+// another writer owns, on our own subject, for our own source delivery.
+//
+// It holds no release edge of its own. Two removers exist, both outside the live
+// session: the next SUCCESSFUL resume's final-disposition reconciliation, and
+// session-generation retirement. Rounds of review refuted both live shapes the register
+// vocabulary offers — an observed absence is consumable by a late create-only CAS, and
+// a cancellation tombstone is consumable by the rival's own reap-and-retry — so a live
+// release would free an identifier whose durable custody it cannot settle (F-087 WP2).
+type mqttForeignContest struct {
+	pi      uint16 // the quarantined identifier
+	subject string // the register subject the contest is on
+	regSeq  uint64 // the rival record's sequence as last observed
+	// walk is the session's register-walk counter as it stood when this quarantine was
+	// installed. A reconciliation may decide only a contest that PREDATES its own walk:
+	// one installed while the walk ran was never covered by it, and an absence it did
+	// not look for is not a fact about this identifier.
+	walk uint64
+	// reserved is whether this contest owns the local reservation on its identifier.
+	//
+	// Usually it does. It does NOT when a consumer teardown withdrew the allocation
+	// before the quarantine could be installed: the contest is still recorded, because a
+	// re-subscribe re-offers that source and the contest is the only thing left that can
+	// decline it, but the ENTRY belongs to the teardown's cancellation bookkeeping and
+	// was never ours to convert. A release must then remove the contest ALONE — demanding
+	// a reservation that was never installed would reject it at every resume, and the
+	// source would stay declined until the generation retired.
+	reserved bool
+}
+
+// mqttPendingRedeliverable reports whether forcing a redelivery of this entry can
+// achieve anything. Three states say it cannot, and a NAK for any of them would be
+// answered by a trackPublish that declines the offer:
+//
+//   - regPending: allocated but not yet durable, so never transmitted (R1), and the
+//     identifier may still be released if the store fails;
+//   - regForeign: a quarantined identifier whose register belongs to another writer,
+//     which nothing here may transmit or settle (F-087 WP2);
+//   - an active send section: the payload is already on its way out on a write that has
+//     not returned (F-087 WP5, class E).
+func mqttPendingRedeliverable(ack *mqttPending) bool {
+	return ack != nil && !ack.regPending && !ack.regForeign && ack.sendNonce == _EMPTY_
 }
 
 // mqttPendingRef identifies one in-flight QoS 1/2 delivery. A packet identifier
@@ -10494,6 +10620,18 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// Discarded session: reset the PI counter too so a reused session object
 	// does not inherit the previous session's identifiers. Spec [MQTT-3.1.2-6].
 	sess.last_pi = 0
+	// sendsInFlight deliberately SURVIVES the discard (F-087 WP5, class F2). With the
+	// counter back at zero a reused session object can mint PI 1 for the new incarnation
+	// while the displaced connection's PI 1 write is still blocked in a synchronous
+	// socket write — the displaced connection is closed on another goroutine, so the
+	// write outlives this call. The registry is what holds those identifiers until each
+	// write returns; endSend removes the entry, and on nilled maps that removal is the
+	// whole continuation. A scan of the entries here could not do the same job: a write
+	// whose PUBLISH entry a successful PUBREC already replaced has no entry to find.
+	// The quarantines DO go: they belong to the retiring incarnation's registers, whose
+	// generation-scoped reap owns them, and a new incarnation must not inherit a decline
+	// for a source it never contested (F-087 WP2).
+	sess.foreignContested = nil
 	sess.mu.Unlock()
 
 	target := &mqttTeardownTarget{
@@ -10727,7 +10865,13 @@ func (sess *mqttSession) bumpPI() uint16 {
 
 		_, usedInPublish := sess.pendingPublish[next]
 		_, usedInPubRel := sess.pendingPubRel[next]
-		if !usedInPublish && !usedInPubRel {
+		// ALWAYS consulted, not only after a discard: an identifier whose write has not
+		// returned may have no entry at all — a successful PUBREC replaces the PUBLISH
+		// entry with a PUBREL one, and clear() removes both while the socket write is
+		// still blocked — so the registry, not the maps, is what says an identifier is
+		// still in use by a transmission (F-087 WP5).
+		_, usedInSend := sess.sendsInFlight[next]
+		if !usedInPublish && !usedInPubRel && !usedInSend {
 			sess.last_pi = next
 			avail = true
 			break
@@ -10949,6 +11093,19 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		if ack != nil && ack.regPending {
 			return 0, false, false, false
 		}
+		// A QUARANTINED identifier declines exactly as regPending does, and for a
+		// stronger reason: the register on this subject belongs to another writer, so
+		// nothing here may transmit under it and nothing may settle it. The identifier
+		// stays reserved until this session resumes (F-087 WP2).
+		if ack != nil && ack.regForeign {
+			return 0, false, false, false
+		}
+		// An active send section declines too: this entry's payload is already on its
+		// way out on a write that has not returned, and re-entering the send path would
+		// queue a second PUBLISH behind it under one identifier (F-087 WP5, class E).
+		if ack != nil && ack.sendNonce != _EMPTY_ {
+			return 0, false, false, false
+		}
 		started = true
 	} else {
 		// Gate new deliveries at the effective cap: MaxAckPending capped by the
@@ -10964,6 +11121,16 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 				sess.deferred = make(map[mqttDeferredKey]string)
 			}
 			sess.deferred[mqttDeferredKey{jsDur, sseq}] = jsAckSubject
+			return 0, false, false, false
+		}
+
+		// BEFORE bumpPI, and deliberately not through the cpending mapping: a consumer
+		// purge unlinks that mapping while the quarantine stands, and a re-subscribe then
+		// re-offers the same delivery. With only the mapping to consult, this call would
+		// allocate a SECOND identifier for a source whose first one is still held by
+		// another writer's register — the exact outcome the quarantine exists to prevent
+		// (F-087 WP2).
+		if sess.sourceForeignContestedLocked(jsDur, sseq) {
 			return 0, false, false, false
 		}
 
@@ -11286,13 +11453,17 @@ func (sess *mqttSession) clearRetiredSource(c *client, jsDur string, sseq uint64
 	key := mqttDeferredKey{jsDur, sseq}
 	sess.mu.Lock()
 	var regSeq uint64
+	var nonce string
 	if rs := sess.srcAckOwed[key]; rs != nil {
-		regSeq = rs.regSeq
+		regSeq, nonce = rs.regSeq, rs.nonce
 	}
 	delete(sess.srcAckOwed, key)
 	sess.mu.Unlock()
 	if regSeq != 0 && sess.asm != nil {
-		sess.asm.deleteInflightRegister(regSeq)
+		// Through the verdict property: this settle holds the exchange nonce, so a
+		// cancellation verdict naming the register it deletes is released against the
+		// proof of that deletion rather than stranded (F-087 WP3).
+		sess.reapRegisterWithVerdict(regSeq, nonce, false)
 	}
 	c.Debugf("MQTT: settled retired QoS 2 source %s/%d for client %q", jsDur, sseq, sess.id)
 }
@@ -11410,10 +11581,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 		if _, atResume := resumePubs[mqttPendingRef{pi, ack.sseq, ack.jsDur}]; !atResume {
 			continue
 		}
-		if ack.regPending {
-			// Allocated but not yet durable, so never transmitted (R1). Forcing a
-			// redelivery would achieve nothing — trackPublish declines a regPending
-			// entry — and the identifier may still be released if the store fails.
+		if !mqttPendingRedeliverable(ack) {
 			continue
 		}
 		if ack.jsAckSubject != _EMPTY_ {
@@ -11498,7 +11666,15 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 		if len(gone) > 0 {
 			sess.mu.Lock()
 			for _, pi := range gone {
-				sess.untrackPublish(pi)
+				// RECHECKED under this final lock, not decided by the scan above: the
+				// scan ran, the lock was released for the stream lookups, and a send
+				// section can have begun in between. Such an entry is condemned rather
+				// than untracked, exactly as a recovery drop is — this pass has issued
+				// every durable delete it owes, so endSend's continuation is the memory
+				// untrack alone (F-087 WP5).
+				if !sess.condemnSendLocked(pi, mqttSendSettleRecoveryDrop) {
+					sess.untrackPublish(pi)
+				}
 			}
 			sess.mu.Unlock()
 		}
@@ -12829,13 +13005,21 @@ restoreSession:
 	// only thing that replaces it: arming conditionally would leave a reused
 	// session object's later live subscriptions behind a dead verdict forever.
 	es.armRestoreGate()
+	// The quarantine releases this resume's register walk decided on, held FRAME-LOCAL
+	// until the resume has actually succeeded. Recovery runs long before the success
+	// CONNACK and every refusal after it preserves the session object and its maps, so
+	// applying a release at the walk would free an identifier on a resume that never
+	// completed. Committed below, past every refusal return (F-087).
+	var stagedReleases []mqttStagedRelease
 	if sessp {
-		if err := es.recoverInflightRegisters(c); err != nil {
+		staged, err := es.recoverInflightRegisters(c)
+		if err != nil {
 			c.Errorf("MQTT: refusing to resume session %q: %v", cid, err)
 			abortAcceptedResume()
 			refusePreConnack(mqttReasonImplementationSpecificError, err.Error())
 			return formatError(err)
 		}
+		stagedReleases = staged
 	}
 
 	// Reconcile the plain QoS 1/2 durables the record names BEFORE the CONNACK:
@@ -13667,6 +13851,13 @@ restoreSession:
 				"session %q left its state unsettled", cid))
 		}
 	}
+
+	// Past every refusal this CONNECT can still make — the success CONNACK, the lifetime
+	// grant, the subscription and consumer work, the forced leave's own arms and its
+	// record-state check — so a quarantine released here is released on a resume that
+	// SUCCEEDED, which is what its release rule requires. Before the gate opens, so no
+	// delivery it releases meets a stale contested decline (F-087).
+	es.commitStagedReleases(c, stagedReleases)
 
 	// The leave has settled, so the restore verdict may OPEN: every delivery it withheld goes
 	// out now, as the first transmission it is. Never skipped on a success, or the session's
@@ -16165,7 +16356,34 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// attempt.
 		sess.trackAsPubRel(pi, _EMPTY_)
 	}
-	removed = sess.untrackPublishEntry(pi)
+	// An IDENTIFIER-FREEING acknowledgement arriving while this entry's transmission has
+	// not returned parks its freeing half instead of performing it (F-087 WP5, class D).
+	// TCP ordering proves only that this acknowledgement followed an EARLIER
+	// transmission; it says nothing about a concurrent REDELIVERY of the same entry whose
+	// write is blocked on this same connection, the read loop and the JetStream
+	// dispatcher being different goroutines. Freed here, the identifier is re-minted and
+	// the new exchange's PUBLISH queues behind the blocked duplicate under one identifier.
+	//
+	// A SUCCESSFUL PUBREC is exempt and needs no transfer machinery: it replaces the
+	// entry with a PUBREL one, and the identifier is held by the sendsInFlight registry
+	// rather than by either entry.
+	deferredRelease := false
+	if !isPubRec || pubRecFailed {
+		kind := mqttSendSettleAckComplete
+		if pubRecFailed {
+			kind = mqttSendSettlePubRecFailed
+		}
+		if sess.condemnSendLocked(pi, kind) {
+			// The protocol-visible work below proceeds on a SNAPSHOT — the response
+			// packet and the source acknowledgement free no identifier — while the
+			// untrack and the register delete wait for endSend.
+			snap := *sess.pendingPublish[pi]
+			removed, deferredRelease = &snap, true
+		}
+	}
+	if !deferredRelease {
+		removed = sess.untrackPublishEntry(pi)
+	}
 	if removed != nil {
 		jsAckSubject, q2AffClaim, q2AffCopy = removed.jsAckSubject, removed.q2AffClaim, removed.q2AffCopy
 	}
@@ -16174,6 +16392,16 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// deliveries promptly. Spec5 [4.9].
 	deferredNaks := sess.deferredNaksLocked()
 	sess.mu.Unlock()
+
+	// While the freeing half is parked, the register delete is parked with it: endSend
+	// owns both, and issuing the delete here would remove the identity of a PUBLISH still
+	// being written.
+	releaseRegister := func(ack *mqttPending) {
+		if deferredRelease {
+			return
+		}
+		sess.deleteInflightRegisterFor(ack)
+	}
 
 	if isPubRec && !pubRecFailed {
 		// Name the source delivery this PUBREL completes. After a restart nothing
@@ -16318,7 +16546,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 				delete(sess.srcAckOwed, retiredKey)
 				sess.mu.Unlock()
 			}
-			sess.deleteInflightRegisterFor(removed)
+			releaseRegister(removed)
 			break
 		}
 		// NOT recorded. The retirement stays, and now it needs its durable half: the
@@ -16339,7 +16567,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// A rejected delivery: no retirement, and the register is released as it was
 		// before F-065. The copy stays unacknowledged, so AckWait re-offers it and the
 		// gate re-runs once the claim store heals.
-		sess.deleteInflightRegisterFor(removed)
+		releaseRegister(removed)
 	case drainedPubRel:
 		// Deliberately nothing — not even the register delete. See the intent block
 		// above: the claim and its JetStream delivery are held until the PUBREL is
@@ -16351,7 +16579,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	case sess.finalizeDrainSource(c, removed):
 		// A drained source, already resolved (or resolving) by the drain state
 		// machine, which owns the ack. Only the register is ours to remove.
-		sess.deleteInflightRegisterFor(removed)
+		releaseRegister(removed)
 	case isPubRec && !pubRecFailed && removed != nil && removed.regSeq != 0:
 		// The PUBLISH phase is over and the identifier's durable authority has moved
 		// to the PUBREL record stored above (R2). Deleting the register completes that
@@ -16428,14 +16656,14 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 				"the source acknowledgement was not confirmed: %v", pi, sess.id, removed.jsDur, removed.sseq, aerr)
 			break
 		}
-		sess.deleteInflightRegisterFor(removed)
+		releaseRegister(removed)
 	default:
 		// QoS 1, a failed PUBREC, and any QoS 2 source that carried no register. The
 		// register goes first, then the ordinary fire-and-forget ack: a lost ack here
 		// costs one duplicate PUBLISH, which QoS 1 permits and which [MQTT-4.4.0-1]
 		// does not bind — it governs UNACKNOWLEDGED messages — so a confirmed round
 		// trip on the hottest path would buy nothing.
-		sess.deleteInflightRegisterFor(removed)
+		releaseRegister(removed)
 		sess.jsa.sendAck(jsAckSubject)
 	}
 	for _, subj := range deferredNaks {
@@ -17329,6 +17557,25 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	if isNew && !sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_) {
 		return
 	}
+	// The SEND SECTION. queueOutbound is a synchronous socket write with no deadline, so
+	// between here and its return a teardown, a denial, a recovery pass or a terminal
+	// acknowledgement can free this identifier and bumpPI can re-mint it — two PUBLISHes
+	// under one identifier, in order, on one socket. Reserved, those paths condemn the
+	// entry instead of removing it and the continuation runs at endSend (F-087 WP5).
+	//
+	// The deferred call is armed IMMEDIATELY, before the enqueue: the registry's "only
+	// endSend removes" invariant must not depend on no early return and no recovered
+	// panic ever appearing in between.
+	sess.mu.Lock()
+	sendTok, sendOK := sess.beginSendLocked(cc, pi, sub.mqtt.jsDur, sseq)
+	sess.mu.Unlock()
+	if !sendOK {
+		// The entry is no longer sendable — a concurrent section, a condemnation, or a
+		// connection that is no longer this session's. The message stays with JetStream
+		// and AckWait re-offers it, the same cost a regPending decline already accepts.
+		return
+	}
+	defer sess.endSend(cc, pi, sendTok)
 	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, subID, originalTopic, msg, props) {
 		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
 		// it and complete the delivery so JetStream does not redeliver it forever:

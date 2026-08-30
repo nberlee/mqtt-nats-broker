@@ -383,7 +383,6 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 		breakIt func(*mqttInflightRecord)
 	}{
 		{"a retired exchange at QoS 1, which has no phase past PUBREC", func(r *mqttInflightRecord) { r.QoS = 1 }},
-		{"both cancellation and retirement, which are mutually exclusive", func(r *mqttInflightRecord) { r.Cancelled = true }},
 		{"an affine pair on a non-affine durable, naming a source on the wrong stream",
 			func(r *mqttInflightRecord) { r.Dur = idHash + "_" + nuid.Next() }},
 		{"retirement absent, so this is a LIVE pre-PUBREC delivery", func(r *mqttInflightRecord) { r.Retired = false }},
@@ -396,6 +395,18 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 			t.Errorf("a register with %s was accepted as settleable; every other clause was left intact, "+
 				"so this one must refuse on its own", tc.what)
 		}
+	}
+
+	// Retired ALONGSIDE Cancelled is a SUPPORTED shape, and the precedence rule decides
+	// it: Retired dominates, so the register is settleable exactly as a pure retirement
+	// is (F-087 WP3). Refusing it — as this clause once did, calling the two mutually
+	// exclusive — retains the register unsettled for the life of a long-lived
+	// generation, because a cancellation racing a retirement now leaves both bits
+	// durably.
+	rec, name := base()
+	rec.Cancelled = true
+	if err := mqttQ2AffSettleableRegister(rec, name); err != nil {
+		t.Errorf("a retired register carrying a cancellation must be settleable under the precedence rule: %v", err)
 	}
 }
 
@@ -2129,7 +2140,7 @@ func TestQ2AffRecoveryDoesNotReviveASettledRetirement(t *testing.T) {
 
 	rc := &client{srv: e.s}
 	rc.mqtt = &mqtt{asm: e.asm, sess: e.sess}
-	if err := e.sess.recoverInflightRegisters(rc); err != nil {
+	if _, err := e.sess.recoverInflightRegisters(rc); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 

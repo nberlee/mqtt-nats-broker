@@ -509,7 +509,7 @@ func TestMQTTDeferredCloseFencedByRegisterClaim(t *testing.T) {
 	if err := testSessSave(t, sessB); err != nil {
 		t.Fatalf("persist the takeover: %v", err)
 	}
-	if err := sessB.recoverInflightRegisters(cB); err != nil {
+	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
 	subject := mqttInflightSubject(sessB.idHash, sessB.gen, e.pi)

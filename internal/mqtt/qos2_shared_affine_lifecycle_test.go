@@ -7729,7 +7729,7 @@ func TestQ2AffRestoredPendingCarriesItsIncarnation(t *testing.T) {
 	sess.mu.Lock()
 	delete(sess.pendingPublish, pi)
 	sess.mu.Unlock()
-	if err := sess.recoverInflightRegisters(testQ2AffSessionClient(b, sess)); err != nil {
+	if _, err := sess.recoverInflightRegisters(testQ2AffSessionClient(b, sess)); err != nil {
 		t.Fatalf("recovering the registers: %v", err)
 	}
 
@@ -7929,7 +7929,7 @@ func TestQ2AffForgedRegisterCannotCreditAnotherClaim(t *testing.T) {
 		st.sess.mu.Lock()
 		delete(st.sess.pendingPublish, st.answer.pi)
 		st.sess.mu.Unlock()
-		if err := st.sess.recoverInflightRegisters(testQ2AffSessionClient(st.b, st.sess)); err != nil {
+		if _, err := st.sess.recoverInflightRegisters(testQ2AffSessionClient(st.b, st.sess)); err != nil {
 			t.Fatalf("recovering the registers: %v", err)
 		}
 	}
@@ -8222,7 +8222,7 @@ func testQ2AffRecoverRegisters(t *testing.T, st *testQ2AffOne) {
 	st.sess.mu.Lock()
 	delete(st.sess.pendingPublish, st.pi)
 	st.sess.mu.Unlock()
-	if err := st.sess.recoverInflightRegisters(testQ2AffSessionClient(st.b, st.sess)); err != nil {
+	if _, err := st.sess.recoverInflightRegisters(testQ2AffSessionClient(st.b, st.sess)); err != nil {
 		t.Fatalf("recovering the registers: %v", err)
 	}
 }

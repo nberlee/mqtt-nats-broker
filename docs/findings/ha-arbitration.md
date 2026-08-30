@@ -2616,9 +2616,20 @@ in `docs/CONFORMANCE.md`.
 **Title:** Register rewrite/claim/recovery consistency: a retargeted CAS that re-sends a
 stale body erases what a concurrent writer proved
 
-- Status: **Open. Alpha blocker, unconditional.** Filed 2026-08-29 by the F-072
-  plan-review loop (eleven Codex rounds; the analysis lives in
-  `~/.claude/lanes/f-072/`, `review-ledger.md` and `plan.md` revision 11).
+- Status: **CLOSED 2026-08-30.** Filed 2026-08-29 by the F-072 plan-review loop (eleven
+  Codex rounds; that analysis lives in `~/.claude/lanes/f-072/`). Fixed under a plan of
+  its own — thirteen review rounds, three escalation consults, one user reopening, 22
+  mutations — recorded in `~/.claude/lanes/f-087/`. What landed: the rewrite rule over the
+  frozen writer set; the `Retired`-dominates-`Cancelled` precedence at all four readers;
+  post-contest routing on the RETURNED body; lineage-aware sequence application; the
+  same-delivery takeover's four converging dispositions, including the held quarantine;
+  the verdict-reaping delete property; and the send-section identifier reservation.
+  **One residual, documented in `docs/CONFORMANCE.md` and filed as its own roadmap item:**
+  a quarantined identifier has no live-session release, because both settled shapes the
+  register vocabulary offers are consumable by the rival's supported lifecycle. It is
+  released by the next SUCCESSFUL resume's reconciliation — STAGED by the walk and
+  committed only past every refusal return, since a refused resume preserves the session's
+  maps — or by generation retirement.
 - Classification: HA arbitration — durable-record lifecycle on `$MQTT_inflight`
 - Release treatment: Alpha blocker. The `Retired` erasure below re-sends a payload the
   client has already completed, which is a QoS 2 exactly-once violation, not a
@@ -2744,7 +2755,9 @@ current-format, and an unsupported shape stays refused.
   orders **and through an intermediate retarget** (S1 → S2 → S3 with memory already at
   S2 — the case a base-only check fails); the post-contest routing; and the stale
   send-authority race (authority removed and identifier freed mid-write, then proving no
-  second exchange can bind the identifier).
+  second exchange can bind the identifier) — for the JETSTREAM-BACKED PUBLISH
+  transmissions this finding's mechanism describes; the PUBREL transmission (F-089) and
+  the retained QoS 1/2 send (F-091) are filed separately.
 - The takeover disposition must include a test that drives a real AckWait re-offer and
   proves the source never takes a second identifier, plus settlement tests for the four
   contest lifecycle states named above.
@@ -2752,13 +2765,79 @@ current-format, and an unsupported shape stays refused.
   apply a sequence on a nonce match alone. Each must fail its paired test
   (`feedback_mutation_checks_must_discriminate`).
 
+## F-089: A PUBREL transmission must hold its packet identifier until the write returns
+
+**Title:** The PUBREL send path has no send-section reservation, so a PUBCOMP for an
+earlier copy can free an identifier a duplicate PUBREL write is still using
+
+- Status: **Open. Alpha blocker, unconditional.** Filed 2026-08-30 by F-087's holistic
+  review (round 3). Scope settled by F-087's `DECISIONS.md` D6: the defect is
+  pre-existing, the path is byte-identical before and after F-087, and D2's rule is that
+  a shared standard found defective OUTSIDE the reviewed scope is repaired uniformly
+  under a new finding.
+- Classification: MQTT conformance — packet-identifier lifecycle ([MQTT-2.3.1-4])
+- Release treatment: Alpha blocker. Identifier reuse while a transmission still holds the
+  identifier can bind an acknowledgement to the wrong message, and can destroy a QoS 2
+  exchange's completion evidence — the same severity class as F-088.
+
+### The finding
+
+F-087 gave every JETSTREAM-BACKED QoS 1/2 **PUBLISH** transmission a send section: the
+session's `sendsInFlight` registry holds the identifier until the write returns, `bumpPI`
+always consults it, and removal paths condemn-and-park rather than free. Two
+identifier-bearing transmissions have no equivalent — the **PUBREL** one, which is this
+finding, and a **retained** QoS 1/2 send, which is F-091.
+
+`mqttDeliverPubRelCb` calls `trackAsPubRel`, releases
+`sess.mu`, and performs a synchronous deadline-free socket write through
+`mqttEnqueuePubResponse` with nothing reserving the identifier;
+`mqttProcessPubComp`'s `untrackPubRel` (`mqtt.go:11784`) removes the `pendingPubRel`
+entry — and with it the identifier's reservation — with no send-section check and no
+park.
+
+**The execution.** A duplicate PUBREL for identifier X is being written. That is routine,
+not exotic: the PUBREL consumer redelivers on AckWait, and `resendPendingRedelivery` NAKs
+pending PUBRELs on resume precisely to force it. While that write is blocked, the read
+loop receives the client's PUBCOMP for an EARLIER copy of the same PUBREL. `untrackPubRel`
+frees X, and `bumpPI` can re-mint it for a new PUBLISH while the PUBREL write still holds
+it. Two exchanges then share one identifier on one socket, in order.
+
+**Second-order, and worse.** The client answers the duplicate PUBREL with a second
+PUBCOMP for X. If the new exchange on X has by then reached its own PUBREL, that stray
+PUBCOMP acknowledges away the NEW exchange's PUBREL — destroying the durable evidence
+that the new exchange is past PUBREC, and completing it against an acknowledgement the
+client sent for a different message.
+
+**The argument that excluded this is RETRACTED.** F-087's plan (revision 13) put the
+PUBREL path out of scope on the grounds that "a PUBCOMP cannot precede its PUBREL's
+completed write on one connection". That is true only of a FIRST transmission. For a
+redelivery whose earlier copy the client already answered it is false — which is exactly
+the hole F-072's round 1 proved for class D on the PUBLISH side, not carried across.
+
+### Acceptance
+
+- A phase-agnostic send reservation around identifier-bearing PUBREL writes, reusing
+  F-087's registry rather than a second mechanism.
+- PUBCOMP parks its identifier-freeing continuation while a reservation is active, in the
+  shape F-087's class D already uses for PUBACK and a failed PUBREC.
+- The drain's confirmed-PUBREL release (I2b — only a CONFIRMED PUBREL releases a drained
+  claim) and the `drainedPubRel` do-nothing arm are reconciled with the park, since both
+  reach the same identifier by a different route.
+- `TestMQTTInflightEveryQoS12SendIsReserved` extends past `mqttEnqueuePublishMsgTo` to
+  the PUBREL enqueue — the structural guard missed this site because it searched only the
+  PUBLISH one — plus a behavioral test with a blocked duplicate PUBREL, a concurrent
+  PUBCOMP for the earlier copy, and an identifier re-mint attempt.
+
 ## F-088: A transmitted delivery's cancellation must not free its packet identifier
 
 **Title:** `Cancelled` over a transmitted delivery lets recovery free an identifier the
 client may still hold
 
-- Status: **Open. Alpha blocker, unconditional. Ordered after F-087** — persisting this
-  state safely depends on settled rewrite rules.
+- Status: **Open. Alpha blocker, unconditional. Ordered after F-087, which CLOSED
+  2026-08-30** — persisting this state safely depends on settled rewrite rules, and it now
+  has them. F-087 narrowed the blast radius without closing this: a `Retired ∧ Cancelled`
+  record no longer frees an identifier and no writer erases `Retired` any more, but a pure
+  `Cancelled` written over a transmitted delivery is still freed by recovery.
 - Classification: MQTT conformance — packet-identifier lifecycle ([MQTT-2.3.1-4])
 - Release treatment: Alpha blocker. Identifier reuse while the client holds the
   identifier can pair an acknowledgement with the wrong message.

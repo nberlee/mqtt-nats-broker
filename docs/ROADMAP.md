@@ -2004,31 +2004,126 @@ takeover.
   released it) and no record fence on any route, so it adds no edge to the established
   `as.mu` → `sess.mu` order, and the section performs one map delete with no outward wait.
 
-- [ ] [F-087: Rebuild every in-flight register rewrite from the authoritative
+- [x] [F-087: Rebuild every in-flight register rewrite from the authoritative
   reread](findings/ha-arbitration.md#f-087-rebuild-every-in-flight-register-rewrite-from-the-authoritative-reread).
-  **Alpha blocker, unconditional. Filed 2026-08-29 by F-072's plan-review loop; F-072 is
-  BLOCKED behind it.** Several `$MQTT_inflight` writers build a record body once and, on a
-  CAS rejection, retarget at the reread's sequence while re-proposing the **stale body** —
-  erasing whatever a concurrent writer proved. The blocking instance: the resume claim
-  contest (`claimed := *fr.rec` at `inflight_register.go:3329`, retarget at `:3419`) can
-  erase a concurrent **`Retired`**, so a payload the client already completed is re-sent
-  after PUBCOMP. The dossier carries the frozen close set (the contest, the same-delivery
-  takeover at `:2964`, `markInflightRegisterRetired`, the two cancellation writers —
-  INSIDE the rule, since dominance covers the terminal disposition and not the right to
-  erase `Claim`/`ClaimSeq`/`Retired` — and the live-entry sequence repair at `:4086`)
-  plus the five-class post-contest routing, the rule (rebuild from `cur`, mutate only
-  owned fields,
-  monotonic facts merge forward), and the acceptance tests. **Scope, per the 2026-08-29
-  decision: the converging same-delivery takeover belongs HERE** — an unconditional refusal
-  and a contested-retry reservation were both designed and refuted in the F-072 lane (the
-  refusal lets AckWait mint a second identifier because `abandonInflightRegister` clears the
-  `cpending` mapping; the retry does not settle under a stable foreign pair or a
-  cancellation parked between offers), and the dossier records the settlement states any
-  replacement must define. Read `~/.claude/lanes/f-072/` before planning: eleven review
-  rounds of analysis, refuted designs and worked interleavings live there.
+  **DONE 2026-08-30.** One rule over the frozen five-writer set: a retargeted CAS starts
+  from the record it just read and mutates only the fields the operation owns — monotonic
+  facts merge forward, identity facts are replaced only as a set by the same-delivery
+  takeover, and `Claim`/`ClaimSeq` belong to the contest alone; a body proposed at the
+  caller's OWN cached sequence stays sparse, because that CAS is itself the proof. That
+  makes `Retired ∧ Cancelled` durably reachable for the first time, so **`Retired`
+  dominates `Cancelled`** at all four readers (recovery's classification, the contest's
+  close arm, the store's tombstone reap, the affine sweep's settle gate): a record
+  carrying both reinstates its suppression and frees nothing. The post-contest routing now
+  judges every OWNED result by the body the contest RETURNED, so a newly retired record
+  leaves the live path instead of being installed as deliverable — the blocking instance.
+  Sequence application is LINEAGE-aware (the operation's traversed chain, not its base).
+  The same-delivery takeover gained its four converging dispositions: adopt a RETIRED
+  occupant behind a generation fence, reap a pure CANCELLED one and retry (ordered above
+  the takeover), replace one that is ours, and QUARANTINE a live foreign or unclaimed one
+  in place — held, never abandoned, because abandoning mints a second identifier for one
+  message. Every register delete whose caller can name the exchange nonce routes through
+  one verdict-reaping helper — where it can also REACH the verdict set, which lives on a
+  session; the orphan sweep with none resident is the stated exception (F-090) — guarded
+  by an AST walk so a new delete site cannot rejoin the stranding class. Every
+  JETSTREAM-BACKED QoS 1/2
+  PUBLISH transmission runs inside a SEND SECTION whose
+  registry holds the identifier until the write returns, across a `clear()` and across a
+  successful PUBREC's entry replacement; removal paths condemn and park rather than free.
+  The PUBREL transmission is deliberately NOT covered (F-089 below, filed by this item's
+  holistic review, which also retracts the false argument that once excluded it), and
+  neither is a RETAINED QoS 1/2 send (F-091).
+  **Residual, documented in `docs/CONFORMANCE.md`:** the quarantine has no live release —
+  both settled shapes the register vocabulary offers (an observed absence, a cancellation
+  tombstone) are consumable by the rival's own supported lifecycle, so a live release
+  could free an identifier whose durable custody it cannot settle. It is removed only by
+  the next SUCCESSFUL resume's reconciliation (STAGED by the walk, committed past every
+  refusal return) or by generation retirement, at the cost of one identifier and one
+  Receive Maximum slot for the rest of that connection. **The live release is filed
+  below** and any future design for it must prove exclusion against every supported writer
+  and recovery lifecycle, not against one racing write. Thirteen plan-review rounds, three
+  escalation consults and one user reopening are recorded in `~/.claude/lanes/f-087/`;
+  22 mutations were applied and each killed its paired test.
+
+- [ ] [F-089: A PUBREL transmission must hold its packet identifier until the write
+  returns](findings/ha-arbitration.md#f-089-a-pubrel-transmission-must-hold-its-packet-identifier-until-the-write-returns).
+  **Alpha blocker, unconditional. Filed 2026-08-30 by F-087's holistic review** (round 3;
+  scope settled by that lane's `DECISIONS.md` D6 — pre-existing, the path untouched by
+  F-087, and D2's uniform-repair rule). F-087 closed this race on the PUBLISH side with
+  the `sendsInFlight` registry; the PUBREL write is not covered.
+  `mqttDeliverPubRelCb` calls `trackAsPubRel`, releases `sess.mu`, and performs the
+  deadline-free socket write with no reservation, while `mqttProcessPubComp`'s
+  `untrackPubRel` (`mqtt.go:11784`) frees the identifier with no send-section check and no
+  park. **The execution:** a duplicate PUBREL is being written — routine, via the PUBREL
+  consumer's AckWait redelivery or `resendPendingRedelivery`'s NAKs — when the client's
+  PUBCOMP for an EARLIER copy arrives on the read loop; the identifier is freed and
+  `bumpPI` can re-mint it for a new PUBLISH while the PUBREL write still holds it
+  ([MQTT-2.3.1-4]). **Second-order, and worse:** the duplicate PUBREL's own second PUBCOMP
+  can then arrive while the NEW exchange's PUBREL is pending on that identifier and
+  acknowledge away the new exchange's completion evidence — an acknowledgement bound to
+  the wrong message, the same severity class as F-088. **The argument that once excluded
+  this is RETRACTED**: "a PUBCOMP cannot precede its PUBREL's completed write on one
+  connection" holds only for a FIRST transmission, never for a redelivery. Acceptance: a
+  phase-agnostic reservation around identifier-bearing PUBREL writes; PUBCOMP parks its
+  identifier-freeing continuation while one is active; the drain's confirmed-PUBREL
+  release (I2b) and the `drainedPubRel` do-nothing arm are reconciled with it; and
+  `TestMQTTInflightEveryQoS12SendIsReserved` is extended past
+  `mqttEnqueuePublishMsgTo` to the PUBREL enqueue, plus a behavioral test with a blocked
+  duplicate PUBREL, a concurrent PUBCOMP, and identifier re-mint.
+
+- [ ] **F-091: a retained QoS 1/2 send does not reserve its packet identifier.** Filed
+  2026-08-30 by F-087's holistic review (round 7). NOT an alpha blocker on its own
+  reading, but it is the same RB2/RB6 class as F-089 and should be judged with it: a
+  retained QoS 1/2 message allocates an identifier through `trackPublishRetained`
+  (`mqtt.go:8974`), builds its frame directly, and is buffered on `sub.mqtt.prm` to be
+  flushed by a later synchronous `queueOutbound` (`mqtt.go:17841-17847`) — with no send
+  section anywhere. A blocked retained write can therefore outlive a `clear()`, which
+  removes its pending entry and resets `last_pi`, so the reused session object can mint
+  that same identifier for the new incarnation while the old write is still in the
+  socket. Pre-existing and untouched by F-087, whose class G excluded retained sends on
+  the ground that they carry no register (true, and beside the point — the IDENTIFIER is
+  still allocated). Acceptance: either extend the reservation through retained-frame
+  flushing, or establish that a retained identifier cannot collide across a discard, and
+  strengthen `TestMQTTInflightEveryQoS12SendIsReserved` to detect direct identifier-bearing
+  PUBLISH construction rather than only the delivery callbacks' enqueue helper.
+
+- [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
+  non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).
+  NOT an alpha blocker: the residue is one nonce in `CancelledRegs` per occurrence, with
+  no payload resurrection, no identifier misaccounting and no unexplained register, since
+  the register is gone. Bounded per occurrence but CUMULATIVE — the set grows by one each
+  time and is emptied only when the generation retires with its record, so this is NOT a
+  claim that the aggregate is bounded. F-087 gave the
+  affine sweep a retention rule so it does not delete a register whose verdict it cannot
+  forget, but that rule can only see what the REGISTER carries: a register marked
+  `Cancelled` is retained when no identity-fenced session is resident. A verdict that
+  exists only in the session record's `CancelledRegs`, for a session resident nowhere, is
+  invisible from the sweep — it reads registers, not records — so such a register is
+  still deleted and its verdict never forgotten. Pre-existing in runtime terms (before
+  F-087 the sweep deleted unconditionally); what F-087 changed is that the gap is now
+  narrow enough to name. Fixing it means giving the sweep a way to consult the record's
+  verdict set for a non-resident session, which is a durable read per candidate and needs
+  a bound — the reason it is filed rather than folded.
+
+- [ ] **A quarantined packet identifier has no live-session release.** Filed 2026-08-30 by
+  F-087's plan-review loop. NOT an alpha blocker: holding is fail-closed and replaces the
+  behavior that mints a second identifier for one message; what it costs is availability —
+  one identifier and one Receive Maximum slot for the rest of a connection whose rival
+  completed remotely, converging at the next successful resume or at generation
+  retirement. The residual is stated in `docs/CONFORMANCE.md`. **Two designs are already
+  refuted and must not be re-proposed:** releasing on an observed ABSENCE (round 10 —
+  defeated by R1's own late-write rule, since a rival's create-only CAS may land after the
+  read and the new allocation's per-PI CAS cannot observe it), and releasing by writing a
+  cancellation TOMBSTONE for our own never-transmitted allocation (round 11 — the rival's
+  supported reap-and-retry confirmed-deletes a pure `Cancelled` occupant and retries its
+  create, `inflight_register.go:2923`/`:2985`, so the fence is consumed and a fresh
+  register lands at the released identifier). The shared lesson: a fence any writer may
+  lawfully consume fences nothing, so a live release needs a durable shape the rival's
+  lifecycle cannot consume — which the register vocabulary does not currently have.
 
 - [ ] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
-  **Alpha blocker. BLOCKED behind F-087; design settled, do not re-derive it.**
+  **Alpha blocker. UNBLOCKED — F-087 landed 2026-08-30. Design settled, do not re-derive
+  it.**
   `trackPublish` sets DUP from the JetStream delivery count (`dcount > 1`) and it reaches
   the wire through `mqttPubFlagDup`. MQTT-3.3.1-3 ties DUP to whether **the outgoing
   PUBLISH** is a retransmission, and a copy offered then refused before `trackPublish`
@@ -2058,9 +2153,13 @@ takeover.
 
 - [ ] [F-088: A transmitted delivery's cancellation must not free its packet
   identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).
-  **Alpha blocker, unconditional. Ordered after F-087** — persisting the distinction safely
-  depends on settled rewrite rules. `Cancelled` is written over never-transmitted
-  allocations (true) and, via `purgeConsumerPendingLocked:2292` and the
+  **Alpha blocker, unconditional. Ordered after F-087, which LANDED 2026-08-30** —
+  persisting the distinction safely depends on settled rewrite rules, and it now has them.
+  F-087 narrowed the blast radius without closing this: a `Retired ∧ Cancelled` record no
+  longer frees an identifier, and no writer erases `Retired` any more, but a pure
+  `Cancelled` over a transmitted delivery is still written and still freed.
+  `Cancelled` is written over never-transmitted allocations (true) and, via
+  `purgeConsumerPendingLocked:2292` and the
   `voidRegistersOnStream` ladder that consumes its records (`:1963-1985`), over
   **transmitted** ones (false), and
   recovery frees the identifier for any `Cancelled` register without distinguishing

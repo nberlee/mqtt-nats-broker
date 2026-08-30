@@ -1516,10 +1516,12 @@ func mqttQ2AffSettleableRegister(rec *mqttInflightRecord, name *mqttInflightName
 		// A retired exchange is past PUBREC, which QoS 1 has no phase for.
 		return fmt.Errorf("retired affine register carries QoS %d", rec.QoS)
 	}
-	if rec.Cancelled {
-		// Never-transmitted and past-PUBREC are mutually exclusive facts.
-		return fmt.Errorf("register asserts both cancellation and retirement")
-	}
+	// Cancelled ALONGSIDE Retired is a supported shape, not a contradiction, and the
+	// precedence rule decides it: Retired dominates (F-087 WP3). A cancellation racing a
+	// retirement leaves both bits durably, and refusing here would retain such a register
+	// unsettled for the life of a long-lived generation. The retirement is backed by the
+	// register's own PUBREC evidence — which is exactly what this settle consumes — while
+	// the cancellation over a transmitted delivery is F-088's known-false write.
 	if mqttInflightSourceStream(rec.Dur) != mqttOutStreamName {
 		// An affine pair on a non-affine durable names a source on the wrong stream.
 		return fmt.Errorf("affine register names non-affine durable %q", rec.Dur)
@@ -1798,9 +1800,9 @@ func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand
 			if *budget <= 0 {
 				return
 			}
-			*budget--
-			as.deleteInflightRegister(cand.seq)
-			as.forgetResidentRetirement(cand.name, rec)
+			if as.disposeSettledAffineRegister(cand.name, rec, cand.seq) {
+				*budget--
+			}
 		case cerr != nil:
 			s.Warnf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: %v", rec.Q2AffClaim, cerr)
 		case claim == nil:
@@ -1809,9 +1811,9 @@ func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand
 			if *budget <= 0 {
 				return
 			}
-			*budget--
-			as.deleteInflightRegister(cand.seq)
-			as.forgetResidentRetirement(cand.name, rec)
+			if as.disposeSettledAffineRegister(cand.name, rec, cand.seq) {
+				*budget--
+			}
 		case shape(claim) != nil:
 			s.Warnf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: its claim's shape is not one this broker writes", rec.Q2AffClaim)
 		case claim.terminal():
@@ -1826,8 +1828,7 @@ func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand
 				s.Warnf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: its claim's reap was indeterminate", rec.Q2AffClaim)
 				return
 			}
-			as.deleteInflightRegister(cand.seq)
-			as.forgetResidentRetirement(cand.name, rec)
+			as.disposeSettledAffineRegister(cand.name, rec, cand.seq)
 		default:
 			s.Errorf("MQTT orphaned QoS 2 sweep: retaining retired affine register on %q: its copy is complete while the claim is NONTERMINAL, "+
 				"which no supported path produces", rec.Q2AffClaim)
@@ -1906,14 +1907,73 @@ func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand
 		if as.reapQ2AffClaimChecked(s, rec.Q2AffClaim, shape) != mqttQ2AffReaped {
 			return
 		}
-		as.deleteInflightRegister(cand.seq)
-		as.forgetResidentRetirement(cand.name, rec)
+		as.disposeSettledAffineRegister(cand.name, rec, cand.seq)
 
 	default:
 		// Unknown, or Lost. Neither settles anything: an unreadable source is not an
 		// absent one, and a consumer that is knowably GONE means the delivery was lost
 		// rather than finished — which this arm must never launder into a completion.
 	}
+}
+
+// disposeSettledAffineRegister removes a settled affine register and the in-memory
+// retirement behind it, and reports whether it MUTATED anything.
+//
+// One route for all four of the arm's delete branches, so the two rules below hold at
+// every one of them rather than at whichever was last reviewed.
+//
+// The verdict rule: a register carrying a cancellation is deleted through the session's
+// own verdict property, which releases the verdict against the PROOF of the deletion.
+// The Retired-dominates precedence is what makes such a register reachable here at all
+// (F-087 WP3), and deleting it fire-and-forget would leave the verdict naming a register
+// that no longer exists — an unmatchable entry for the life of the session.
+//
+// The retention rule: when NO resident, identity-fenced session can durably forget that
+// verdict, the register is RETAINED rather than deleted. The register is the verdict's
+// rightful carrier: once it is gone a resume has nothing left by which to identify the
+// verdict, so the only remover would be generation retirement, over an arbitrarily
+// long-lived generation, accumulating one nonce per race. Retaining is also the safe
+// direction — a retained retirement suppresses and frees nothing — and its convergence
+// edge is real: the session's next resume recovers it as a retirement and the
+// session-path reaper runs the delete-first discipline, or the generation retires and
+// reaps record and registers together.
+//
+// Reporting the mutation is what keeps a stable prefix of retained candidates from
+// consuming the sweep's per-tick budget: the cursor advances past the scanned batch, so
+// a charged no-op would starve every actionable candidate behind it.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInflightName, rec *mqttInflightRecord, seq uint64) bool {
+	if name == nil || rec == nil || seq == 0 {
+		return false
+	}
+	as.mu.RLock()
+	sess := as.sessByHash[name.idHash]
+	as.mu.RUnlock()
+	if sess != nil {
+		sess.mu.Lock()
+		fenced := sess.gen == name.gen
+		sess.mu.Unlock()
+		if !fenced {
+			sess = nil // a different incarnation's state; not ours to touch
+		}
+	}
+	if sess == nil {
+		if rec.Cancelled {
+			return false // retained: nothing here can forget the verdict this register carries
+		}
+		// A verdict that exists ONLY in a non-resident session's persisted CancelledRegs
+		// is invisible from here — this arm reads the register, not the record — so such
+		// a register is still deleted and its verdict stranded. Pre-existing (the sweep
+		// deleted unconditionally before), bounded stale metadata, and filed as F-090.
+		as.deleteInflightRegister(seq)
+		return true
+	}
+	if !sess.reapRegisterWithVerdict(seq, rec.Nonce, false) {
+		return false
+	}
+	as.forgetResidentRetirement(name, rec)
+	return true
 }
 
 // forgetResidentRetirement drops the IN-MEMORY retirement a settled register belonged

@@ -1081,6 +1081,29 @@ Residuals:
   reserved and the record kept. Either way it costs one reserved identifier and one
   Receive Maximum slot — the safe direction, since reusing it would put a second
   message on an identifier the client still has in use.
+- **A quarantined identifier is held until the session resumes.** When a delivery's
+  create-only register CAS meets a LIVE register another writer owns on that same
+  identifier for that same source, the identifier is quarantined in place rather than
+  abandoned: abandoning it would let the source's next redelivery take a second
+  identifier while the rival's register stands, which is the exactly-once deviation
+  itself. There is no live-session release. Both durable shapes that could express "this
+  identifier is settled" — an observed absence, and a cancellation tombstone — are
+  consumable by the rival's own supported lifecycle, so a live release could free an
+  identifier whose durable custody it cannot settle. The quarantine is therefore removed
+  only by the next SUCCESSFUL resume's final-disposition reconciliation (staged during
+  recovery and applied only after the CONNACK and the forced leave have settled, so a
+  refused resume never frees it) or by session-generation retirement.
+  **The cost:** if the rival completes while this connection stays live, one packet
+  identifier and one Receive Maximum slot remain held for the rest of the connection. At
+  a Receive Maximum of 1 with the sole slot held, new outbound QoS 1/2 traffic waits for
+  disconnect-and-resume; QoS 0 and already-established exchanges are unaffected. The
+  identifier is counted exactly once by the in-flight accounting, including after a
+  consumer purge unlinks its source mapping, so this is conservative UNDER-utilization —
+  the broker sends fewer concurrent messages than Receive Maximum permits, never more.
+  It is the same fail-closed price recovery already charges for an unclaimed member, and
+  it is operator-visible through the existing lost-arbitration warning. A live release is
+  filed as its own finding; any future design for it must prove exclusion against every
+  supported writer and recovery lifecycle, not against one racing write.
 - **Shared-register takeover arbitration excludes unreadable records.** A resumed
   session CAS-claims every readable live or retired shared register before installing
   it, and every nonce-keyed rewrite honors that object claim, so a stale close cannot

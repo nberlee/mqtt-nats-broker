@@ -155,7 +155,7 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 			as := &mqttAccountSessionManager{}
 			deleted := testPlantInflight(t, as, tc.occupants, tc.loadErr)
 
-			got := as.releaseInflightRegisterByIdentity(nil, subject, ourDur, ourSeq)
+			got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, subject, ourDur, ourSeq)
 			if got != tc.want {
 				t.Errorf("outcome = %d, want %d", got, tc.want)
 			}
@@ -202,7 +202,7 @@ func TestInflightIdentityReleaseSparesAReusedSequence(t *testing.T) {
 				QoS: 2, Nonce: mqttNewInflightNonce()}, seq: rememberedSeq},
 		}, nil)
 
-		if got := as.releaseInflightRegisterByIdentity(nil, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
+		if got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
 			t.Fatalf("outcome = %d, want AlreadyGone", got)
 		}
 		if len(*deleted) != 0 {
@@ -218,7 +218,7 @@ func TestInflightIdentityReleaseSparesAReusedSequence(t *testing.T) {
 				QoS: 2, Nonce: mqttNewInflightNonce()}, seq: rememberedSeq},
 		}, nil)
 
-		if got := as.releaseInflightRegisterByIdentity(nil, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
+		if got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
 			t.Fatalf("outcome = %d, want AlreadyGone", got)
 		}
 		if len(*deleted) != 0 {
@@ -464,7 +464,7 @@ func TestInflightIdentityReleaseFollowsARewrite(t *testing.T) {
 	}
 	as.mu.Unlock()
 
-	got := as.releaseInflightRegisterByIdentity(nil, subject, ourDur, ourSeq)
+	got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, subject, ourDur, ourSeq)
 	if got != mqttInflightReleased {
 		t.Fatalf("outcome = %d, want Released once the subject is genuinely clear", got)
 	}
@@ -950,7 +950,7 @@ func TestInflightDestructivePathsBindPIToSubject(t *testing.T) {
 		deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
 			subject: {rec: inconsistent, seq: 100},
 		}, nil)
-		if got := as.releaseInflightRegisterByIdentity(nil, subject, ourDur, ourSeq); got != mqttInflightUndecided {
+		if got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, subject, ourDur, ourSeq); got != mqttInflightUndecided {
 			t.Fatalf("outcome = %d, want Undecided: a body/subject mismatch is unreadable", got)
 		}
 		if len(*deleted) != 0 {

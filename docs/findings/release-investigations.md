@@ -453,10 +453,12 @@ demonstrated, and does not cover F-071, whose mechanism is unknown.
 **Title:** Derive the outgoing DUP flag from MQTT retransmission, not the JetStream
 delivery count
 
-- Status: **Open. Alpha blocker. BLOCKED behind
+- Status: **Open. Alpha blocker. UNBLOCKED 2026-08-30** —
   [F-087](ha-arbitration.md#f-087-rebuild-every-in-flight-register-rewrite-from-the-authoritative-reread)
-  since 2026-08-29, by decision at that day's hard stop.** Filed 2026-08-22, found by
-  review of F-071's packet capture — the same trace carries two independent defects.
+  landed, so the rewrite rules this design rests on are settled: no writer erases a
+  monotonic fact any more, and the same-delivery contested store now has a converging
+  disposition. Filed 2026-08-22, found by review of F-071's packet capture — the same
+  trace carries two independent defects.
 - Classification: MQTT conformance — PUBLISH flags
 - Release treatment: Alpha blocker. It is a wire-visible protocol error on a first
   transmission, not a liveness or performance cost.

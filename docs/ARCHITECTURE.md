@@ -4639,6 +4639,140 @@ The invariants, in the order they matter:
 - **Registered if and only if transmitted.** A delivery withheld by the in-flight cap
   was never sent, so it is never registered. A retained-message send has no JetStream
   backing at all, so it has no register and no post-restart redelivery.
+- **A retargeted CAS rebuilds from the record it just read.** Several writers of
+  `$MQTT_inflight` build a body once and, when their CAS is rejected, re-read the subject
+  only to learn the SEQUENCE — then re-target with the original body, silently erasing
+  whatever a concurrent writer proved in between. The alpha-blocking instance was the
+  resume claim contest re-proposing a pre-retirement snapshot over a `Retired` mark, which
+  puts a completed exchange back in the live bucket and re-sends its payload after the
+  client's PUBCOMP. The rule is one rule over the whole writer set: a re-targeted CAS
+  starts from the reread and mutates only the fields the operation OWNS. Monotonic facts
+  (`Retired`, `Cancelled`) merge forward; identity facts (nonce, identifier, source, QoS,
+  the affine pair) never change under one exchange — the same-delivery takeover replaces
+  them as a SET, which is a new exchange identity taking the slot rather than a mutation
+  of the old one; and the arbitration fields (`Claim`/`ClaimSeq`) belong to the contest
+  alone. A body proposed at the caller's OWN cached sequence is exempt and stays sparse:
+  the CAS is itself the proof, because any intervening writer moved the sequence. What
+  those writers may not do is re-propose that body after a reread.
+- **`Retired` dominates `Cancelled`.** Rebuilding makes the two bits coexist durably for
+  the first time, whenever a cancellation races a retirement. One precedence rule decides
+  the shape at every reader — recovery's classification, the contest's close arm, the
+  store's tombstone reap, and the affine sweep's settle gate: a retirement is backed by
+  the client's own PUBREC, so the transmission provably happened, while a cancellation
+  over a transmitted delivery is F-088's known-false write. Freeing an identifier the
+  client holds is the catastrophic direction; holding one that was actually free costs a
+  slot. So a record carrying both is never consumed as a close and never frees its
+  identifier: it reinstates the suppression, exactly as a pure retirement does.
+- **A register delete whose caller can name the NONCE and reach the VERDICT routes
+  through one helper.**
+  Three separate reviews each found one more delete site that stranded a cancellation
+  verdict, which is the signal that enumerating sites is itself the defect. The boundary
+  is a decision procedure rather than a list: a caller that holds or can recover the
+  exchange nonce owes the verdict a proof, so its delete is confirmed and the verdict
+  released against that proof, while a caller whose own semantics already require
+  confirmation keeps it. THREE shapes are outside it: a site that cannot name a nonce at
+  all; a site that runs the SAME discipline through a stronger ladder of its own —
+  confirmed delete, else a tombstone on the register, else the nonce verdict — which is
+  the full version of what the helper does in one step rather than a bypass; and a site
+  that can name the nonce but cannot REACH the verdict, which lives on a session. The
+  orphan sweep's affine arm is the third: with no identity-fenced session resident it
+  retains a register that CARRIES a cancellation, but a verdict held only in that
+  session's persisted `CancelledRegs` is invisible to a walk that reads registers rather
+  than records, so such a register is still deleted and its verdict stranded — F-090,
+  filed, pre-existing, and not an alpha blocker. An AST guard parses every production
+  file in the package and fails on any register delete outside that allow-list, so a new
+  site cannot silently rejoin the stranding class. The forget's persistence stays
+  opportunistic, riding the existing
+  revision machinery — the same standard, and the same one-nonce crash window, the
+  committed recovery path already accepts.
+- **A sequence is applied to a live entry by LINEAGE, not by base.** A resume's operation
+  may legitimately re-target through several sequences, so it carries the chain it
+  authoritatively held the record at, and a live entry's register sequence is advanced to
+  the chain's end only when it names a link in that chain. Admitting only the base leaves
+  an entry aimed at a sequence that no longer exists when memory sits at an intermediate
+  link; admitting anything overwrites a fact this operation never saw. A record nothing
+  contested carries a one-element chain, which makes the rule exactly "unchanged since
+  the walk".
+- **A same-delivery takeover disposes of the occupant by what it IS.** When an
+  allocation's create-only CAS meets a register naming the same source under another
+  writer's nonce, four dispositions exhaust the cases and each is the only convergent
+  one. A RETIRED occupant is adopted, not replaced: it proves this identifier's exchange
+  for this very source is past PUBREC, so the retirement is reinstated (behind a
+  generation fence, since a discard may have re-minted the incarnation while the
+  reconcile was outside the lock) and this allocation settles through the post-CAS ladder
+  without transmitting. A pure CANCELLED occupant is reaped and the create retried, which
+  is why that arm is ordered ABOVE the takeover: our allocation IS the fresh first
+  transmission the tombstone's freeing licensed. A LIVE occupant that is ours to rewrite —
+  any plain durable, or a shared one whose claim equals ours — is replaced at its exact
+  sequence. A live occupant that is NOT ours is QUARANTINED in place.
+- **A quarantined identifier is held, not abandoned.** Abandoning it removes the source's
+  `cpending` mapping, so the next AckWait offer allocates a DIFFERENT identifier and
+  transmits the same message while the rival's register stands — two identifiers for one
+  message, which is the deviation this whole mechanism exists to remove. Held, the entry
+  becomes a foreign reservation that no terminal path may settle, the mapping stays, and
+  the contest is recorded against the SOURCE rather than the identifier — a consumer
+  purge unlinks the mapping and a re-subscribe re-offers the same delivery, so a
+  pi-keyed record would be invisible at exactly the moment it has to decline.
+- **The quarantine has exactly two removers, and neither is live.** They are the next
+  SUCCESSFUL resume's final-disposition reconciliation and session-generation retirement.
+  A live release would have to settle a durable contest from inside a live session, and
+  both shapes the register vocabulary offers for "this identifier is settled" are
+  consumable by a rival's SUPPORTED lifecycle: an observed absence by a late create-only
+  CAS, which R1's own late-write rule permits, and a cancellation tombstone by the
+  rival's reap-and-retry, which confirmed-deletes a pure `Cancelled` occupant and retries
+  its create. A fence any writer may lawfully consume fences nothing. The cost — one
+  identifier and one Receive Maximum slot held for the rest of the connection — is a
+  stated residual in `docs/CONFORMANCE.md`, and it is conservative under-utilization
+  rather than an overrun.
+- **The resume's release is STAGED by the walk and COMMITTED once the resume succeeds.**
+  Recovery runs long before the success CONNACK, and every refusal after it — the CONNACK
+  write, the lifetime grant, subscription restoration, consumer reconciliation, the 3.1.1
+  forced leave — preserves the session object and its maps. Releasing at the walk would
+  therefore free an identifier on a resume that never completed. So the reconciliation
+  appends to a FRAME-LOCAL list and the commit runs past every refusal return, immediately
+  before the restore verdict opens, re-fencing each release on the exact tuple its walk
+  recorded. A fence miss keeps the quarantine, which converges: the next resume re-observes
+  and re-stages. The list is frame-local rather than session state because session-resident
+  staging would let an aborted resume's decision be committed by a later resume whose own
+  walk never observed the absence. Two identity rules govern which disposition a
+  quarantine may consume at all. The index is keyed by the SOURCE, and a source is not
+  an identifier — a delivery can legitimately have been re-offered under a second
+  identifier after the
+  first was consumed — so evidence that does not name THIS identifier decides nothing
+  about it. And an arm that leaves the identifier HELD (a live entry, or a PUBREL
+  reservation on the same identifier) applies at once, while every arm that would FREE it
+  stages, a retirement included: the client completed that exchange, so the identifier is
+  genuinely free, but freeing it is exactly what may not happen before the resume
+  succeeds. A quarantine installed while the walk was running is
+  likewise kept, and that eligibility is judged BEFORE any disposition is consulted: the
+  walk may well have ROUTED that source — from the earlier register it read — and that
+  result describes a contest this quarantine is not part of, so applying it would dispose
+  of the quarantine on evidence predating it and free the identifier while the rival
+  register still stands.
+- **A transmission holds its identifier until the write returns.** `queueOutbound` is a
+  synchronous socket write with no deadline, so between the tracking decision and its
+  return a teardown, a subscribe denial, a recovery apply, a terminal acknowledgement or
+  a session discard could free the identifier and the allocator could re-mint it — two
+  PUBLISHes under one identifier, in order, on one socket. Every JETSTREAM-BACKED QoS 1/2
+  PUBLISH transmission therefore runs inside a SEND SECTION — the two delivery-callback
+  send sites. Two identifier-bearing transmissions are NOT covered, both filed: the
+  **PUBREL** transmission (F-089, an alpha blocker in its own right), and a **retained**
+  QoS 1/2 message, which allocates its identifier through `trackPublishRetained`, builds
+  its frame directly and is flushed by a later `queueOutbound` with no section (F-091).
+  (The argument that once excluded the PUBREL half — that a PUBCOMP cannot precede its
+  PUBREL's completed write on one connection — is FALSE for a redelivery whose earlier
+  copy the client already answered.) The authority is a session-level registry of
+  identifier-to-token rather than the entry: a successful PUBREC replaces the PUBLISH
+  entry with a PUBREL one while the write may still be blocked, so per-entry state alone
+  would strand the identifier. The allocator always consults the registry, only the
+  section's own end removes from it, and the registry deliberately survives a session
+  discard — `clear()` resets the identifier counter to zero while the displaced
+  connection's write is still in the socket. A removal path that meets an active section
+  CONDEMNS the entry instead of deleting it, parking the continuation it owes; the first
+  parked disposition wins, because every continuation is idempotent against another
+  remover's durable work. Terminal acknowledgements park their identifier-freeing half
+  (their protocol answer is unaffected), while a successful PUBREC needs no transfer
+  machinery at all, the registry holding the identifier however the entries move.
 
 A session discard removes the retiring incarnation's registers with a **bounded reap**
 rather than arbitrating each one as the inbound hold walk does: on the discarding broker
