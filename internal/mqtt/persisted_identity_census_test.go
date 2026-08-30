@@ -436,7 +436,8 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Retained":     {kind: notAnIdentity, encoding: encJSON, reason: "whether the copy was retained; a fact about the delivery"},
 		"Phase":        {kind: notAnIdentity, encoding: encJSON, reason: "the claim's phase, advanced by CAS"},
 		"SourceAcked":  {kind: notAnIdentity, encoding: encJSON, reason: "a proven fact about the source message, deliberately outside the incarnation fence because it is a fact about the source rather than about this claim"},
-		"AffineDone":   {kind: notAnIdentity, encoding: encJSON, reason: "a proven fact about the client's PUBREC"},
+		"AffineDone":   {kind: notAnIdentity, encoding: encJSON, reason: "a terminal copy DISPOSITION, written by seven routes — the session discarded, a redelivery under an already-terminal claim, a subscribe denial, expiry, an oversize discard, retired-source settlement, and the ordinary PUBREC. It is NOT proof that the client answered PUBREC; that is PubRecProven"},
+		"PubRecProven": {kind: notAnIdentity, encoding: encJSON, reason: "a proven fact about the client's PUBREC: a stored PUBREL on $MQTT_out carries a bound (claim subject, copy subject) reference to this claim incarnation. The only fact in this record that outranks Lost, and the reason it is separate from AffineDone is that AffineDone's routes include the delivery gate's own Lost arm"},
 		"Discarded":    {kind: notAnIdentity, encoding: encJSON, reason: "a teardown fact about the session, deliberately outside the incarnation fence for the same reason as SourceAcked"},
 		"Lost":         {kind: notAnIdentity, encoding: encJSON, reason: "the owner-resume verdict that releases a group delivery without re-offering it"},
 	}

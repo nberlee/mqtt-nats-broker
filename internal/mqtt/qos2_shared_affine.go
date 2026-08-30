@@ -296,6 +296,25 @@ type mqttQ2AffClaim struct {
 	// handshake still completes from the persisted PUBREL, which is why this is a
 	// reporting defect rather than a conformance one; see docs/CONFORMANCE.md.
 	Lost bool `json:"lost,omitempty"`
+	// PubRecProven: a PUBREL bound to THIS claim incarnation is durable on
+	// $MQTT_out, so the client answered PUBREC for this copy. It is the only fact in
+	// this record that outranks Lost.
+	//
+	// Deliberately NOT AffineDone, and the distinction is the whole mechanism.
+	// AffineDone means "terminal copy disposition" and is written by seven routes —
+	// the session discarded, a redelivery under an already-terminal claim, a
+	// subscribe denial, expiry, an oversize discard, retired-source settlement, and
+	// the ordinary PUBREC. One of those is the delivery gate's own `AffineDone ||
+	// Lost` arm, so if AffineDone outranked Lost then "this claim is already Lost"
+	// would become the reason to clear Lost, confirm the copy acknowledgement and
+	// reap. That is circular, and reachable: a delayed materializer holding a
+	// `claimed` snapshot can store a copy while recovery is committing Lost.
+	//
+	// This field has exactly two writers, and both hold a resolved (claim subject,
+	// copy subject) carrier read off a stored PUBREL: the owner's resume pass
+	// (reconcileQ2AffPubRelProofs) and the PUBCOMP arm that must not acknowledge a
+	// PUBREL away while the proof it carries is unrecorded.
+	PubRecProven bool `json:"prec,omitempty"`
 }
 
 // ownedBy reports whether this claim names the given session generation.
@@ -318,11 +337,25 @@ func (c *mqttQ2AffClaim) mergeProven(prev *mqttQ2AffClaim) {
 	c.AffineDone = c.AffineDone || prev.AffineDone
 	c.Discarded = c.Discarded || prev.Discarded
 	c.Lost = c.Lost || prev.Lost
-	// AffineDone and Lost are mutually exclusive — a delivery is either
-	// PROVEN or it is not — so they are NOT independently OR-merged. Whichever
-	// the durable record already proved stands; a later writer cannot add its
-	// opposite on top and leave a record asserting both.
-	if prev.AffineDone {
+	c.PubRecProven = c.PubRecProven || prev.PubRecProven
+	// A PROOF outranks an INFERENCE, and that asymmetry is why PubRecProven exists
+	// as its own field. Lost concludes a loss from a copy it cannot find; the
+	// broker's own comment on it says "could not prove", not "never delivered".
+	// PubRecProven concludes a delivery from a PUBREL that exists, bound to this
+	// exact claim incarnation. Resolving the two by arrival order — which is what
+	// this function used to do — let a mislabelling become permanent, because
+	// nothing could ever correct a Lost that landed first.
+	//
+	// Generic AffineDone is deliberately NOT given this power; see the field's own
+	// comment for the circular path that would open.
+	if c.PubRecProven {
+		c.Lost = false
+		c.AffineDone = true
+	} else if prev.AffineDone {
+		// AffineDone and Lost are mutually exclusive — a delivery is either
+		// PROVEN or it is not — so they are NOT independently OR-merged. Whichever
+		// the durable record already proved stands; a later writer cannot add its
+		// opposite on top and leave a record asserting both.
 		c.Lost = false
 	} else if prev.Lost {
 		c.AffineDone = false
@@ -679,6 +712,74 @@ func mqttQ2AffCopyIncarnation(copySubject string) string {
 	return toks[3]
 }
 
+// mqttValidBase62 reports whether s is exactly n characters of the base-62 alphabet
+// getHashSize emits. Every identity token in the two subjects below is one of those,
+// so this is the single shape test rather than four hand-rolled loops.
+func mqttValidBase62(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+// mqttValidQ2AffCopySubject reports whether copySubject is EXACTLY one this broker's
+// mqttQ2AffCopySubject produces: the affine prefix and then idHash.gen.claimHash.nonce
+// at their generated widths and alphabets.
+//
+// Stricter than mqttQ2AffCopyIncarnation, which validates the prefix, the token count
+// and the nonce alone. That is enough where the value is about to be matched against a
+// claim record that re-derives it, and not enough where the value's own well-formedness
+// is the question — a carrier read off a stored PUBREL, where a loose value would parse
+// as a usable reference, resolve to an absent claim, and take the acknowledging arm.
+func mqttValidQ2AffCopySubject(copySubject string) bool {
+	rest, ok := strings.CutPrefix(copySubject, mqttQ2AffineSubjectPrefix)
+	if !ok {
+		return false
+	}
+	toks := strings.Split(rest, ".")
+	if len(toks) != 4 {
+		return false
+	}
+	return mqttValidBase62(toks[0], sysHashLen) &&
+		mqttValidQ2AffGen(toks[1]) &&
+		mqttValidBase62(toks[2], mqttQ2AffClaimHashLen) &&
+		mqttValidQ2AffGen(toks[3])
+}
+
+// mqttValidQ2AffClaimSubject reports whether claimSubject is EXACTLY one this broker's
+// mqttQ2AffClaimSubject produces: the assignment prefix, a shared group durable this
+// broker generated, and a nonzero decimal source sequence.
+//
+// The group durable is checked through mqttSharedQueueFromGroupDurable, which is the
+// existing recogniser for "$MQTT_SHARED_ plus sixteen generated characters", so there is
+// one definition of that shape rather than a second copy of it here.
+func mqttValidQ2AffClaimSubject(claimSubject string) bool {
+	rest, ok := strings.CutPrefix(claimSubject, mqttQoS2AssignStreamSubjectPrefix)
+	if !ok {
+		return false
+	}
+	i := strings.LastIndexByte(rest, '.')
+	if i <= 0 || i == len(rest)-1 {
+		return false
+	}
+	if _, ok := mqttSharedQueueFromGroupDurable(rest[:i]); !ok {
+		return false
+	}
+	seqTok := rest[i+1:]
+	seq, err := strconv.ParseUint(seqTok, 10, 64)
+	// CANONICAL, not merely parseable. ParseUint accepts "01" and "+1"; the builder
+	// emits strconv.FormatUint, so a value that does not round-trip through it is a
+	// subject this broker never wrote — and one that would then resolve as an absent
+	// claim, which is an ACKNOWLEDGING outcome, rather than failing closed.
+	return err == nil && seq != 0 && strconv.FormatUint(seq, 10) == seqTok
+}
+
 // mqttQ2AffineNames returns the three generation-scoped names of a session's
 // affine QoS 2 delivery path: the consumer's filter subject (the generation
 // prefix, covering every claim's copy), its deliver subject, and its durable.
@@ -919,13 +1020,50 @@ func mqttQ2AffClaimRecordMax() int {
 		return len(hdrLine) + len(JSExpectedLastSubjSeq) + 1 +
 			len(strconv.FormatUint(math.MaxUint64, 10)) + 2 + 2 + len(b)
 	}
-	done, lost := rec, rec
+	done, lost, proven := rec, rec, rec
 	done.AffineDone = true
 	lost.Lost = true
-	if n := size(lost); n > size(done) {
-		return n
+	// The THIRD reachable terminal shape, and it is the largest: PubRecProven implies
+	// AffineDone (mergeProven), so the proven form is the AffineDone form plus one more
+	// member. Comparing only the first two would leave a record this broker writes
+	// outside the bound the admission preflight enforces, and the failure that causes is
+	// the eternal retry these bounds exist to prevent.
+	proven.AffineDone, proven.PubRecProven = true, true
+	max := size(done)
+	if n := size(lost); n > max {
+		max = n
 	}
-	return size(done)
+	if n := size(proven); n > max {
+		max = n
+	}
+	return max
+}
+
+// mqttQ2AffPubRelFormMax is the upper bound on a session-affine shared QoS 2 PUBREL,
+// computed by running the REAL builder at maximal identity widths.
+//
+// It is its own ALTERNATIVE form rather than an addition to mqttQ2AffineFormMax, and
+// the distinction is load-bearing: mqttMaxQoS2FormSize takes the MAXIMUM over forms,
+// the affine copy and the affine PUBREL never coexist in one stored message, and
+// folding this into the copy's bound would sum two alternatives and reject PUBLISHes
+// no real later form justifies.
+//
+// Payload-independent, like the terminal and claim forms, so for a small payload with a
+// short topic it could dominate — which is the reason it is budgeted at all rather than
+// argued to be small. Before this reference existed the PUBREL form was not budgeted;
+// that gap is closed here because this is what enlarges it.
+func mqttQ2AffPubRelFormMax() int {
+	maxClaimSubject, _, genW := mqttQ2AffMaxIdentityWidths()
+	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
+	maxCopySubject := len(mqttQ2AffineSubjectPrefix) + sysHashLen + 1 + genW + 1 +
+		mqttQ2AffClaimHashLen + 1 + genW
+	// The source correlation and the deduplication identity are budgeted alongside it:
+	// a DRAINED affine source reaches this builder carrying all three at once.
+	msgId := mqttPubRelMsgId(strings.Repeat("x", sysHashLen), strings.Repeat("x", maxDur),
+		math.MaxUint64, math.MaxUint64)
+	_, n := mqttNewCorrelatedPubRel(math.MaxUint16, strings.Repeat("x", maxDur), math.MaxUint64,
+		msgId, strings.Repeat("x", maxClaimSubject), strings.Repeat("x", maxCopySubject))
+	return n
 }
 
 // mqttQ2AffineFormMax is the upper bound on the affine copy of pp, computed by
@@ -3365,8 +3503,13 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 // without a second transition site. warnf is passed in so each caller keeps its own
 // logging: the delivery path logs through its *client, the sweep through its *Server,
 // and neither's output changes.
+// pubRecProven is the CALLER'S positive fact and is never inferred here. This function
+// is a transition funnel, not evidence: only a caller holding a resolved (claim subject,
+// copy subject) carrier read off a stored PUBREL may pass true, because that record is
+// what proves the client answered PUBREC. Every other caller passes false and records a
+// terminal copy DISPOSITION, which does not outrank a recorded loss.
 func (as *mqttAccountSessionManager) proveQ2AffCopyDelivered(claimSubject, carriedCopy string,
-	precheck func(*mqttQ2AffClaim) error, warnf func(string, ...any)) *mqttQ2AffClaim {
+	precheck func(*mqttQ2AffClaim) error, warnf func(string, ...any), pubRecProven bool) *mqttQ2AffClaim {
 
 	claim, cerr := as.q2AffClaimForCarriedCopy(claimSubject, carriedCopy)
 	if cerr != nil {
@@ -3377,7 +3520,12 @@ func (as *mqttAccountSessionManager) proveQ2AffCopyDelivered(claimSubject, carri
 		return nil
 	}
 	updated, _, err := as.advanceQ2AffClaimChecked(claimSubject, _EMPTY_, _EMPTY_, claim.Nonce, carriedCopy,
-		precheck, func(cl *mqttQ2AffClaim) { cl.AffineDone = true })
+		precheck, func(cl *mqttQ2AffClaim) {
+			cl.AffineDone = true
+			if pubRecProven {
+				cl.PubRecProven = true
+			}
+		})
 	if err != nil {
 		// Not recorded: the caller must not ack. AckWait re-offers the copy, the gate
 		// re-runs, and nothing has been made ambiguous.
@@ -3389,6 +3537,27 @@ func (as *mqttAccountSessionManager) proveQ2AffCopyDelivered(claimSubject, carri
 		warnf("Refusing to acknowledge an affine QoS 2 delivery for %q: the transition reported success but the "+
 			"record it left does not carry the completion of this copy (%+v)", claimSubject, updated)
 		return nil
+	}
+	// A PROOF caller needs its own fact on the record, for the same reason the line
+	// above needs AffineDone there: mergeProven can normalise, the CAS can be a no-op,
+	// and a caller that is about to stop protecting the PUBREL must see the proof
+	// landed rather than assume it. A nil error is not the proof here either.
+	if pubRecProven && !updated.PubRecProven {
+		warnf("Refusing to release the PUBREC proof of affine QoS 2 assignment %q: the transition reported "+
+			"success but the record it left does not carry it (%+v)", claimSubject, updated)
+		return nil
+	}
+	if pubRecProven && claim.Lost {
+		// The CORRECTION, and it is owed to whoever read the loss report. A superseded
+		// broker's PUBREL store is not CAS-conditioned, so it can land after this
+		// incarnation's scan has already completed and its loss verdict has been written
+		// and LOGGED. The proof then clears Lost and the claim is reaped — leaving the
+		// operator with an erroneous loss report and no durable record contradicting it.
+		// Retracting it in the log is the only place left to say so.
+		warnf("MQTT: retracting the LOST report for shared QoS 2 assignment %q: a stored PUBREL proves the "+
+			"client answered PUBREC for it, so that loss report was wrong. It may be read BEFORE the "+
+			"report it retracts — the two are emitted by different goroutines, and the record, not "+
+			"the log, is the authority", claimSubject)
 	}
 	return updated
 }
@@ -3407,7 +3576,14 @@ func (c *client) mqttFinishQ2AffineDelivery(claimSubject, carriedCopy, ackSubjec
 	}
 	// Nil precheck: this caller's behaviour must not change, which is the property the
 	// extraction exists to preserve. The sweep's register arm passes a real one.
-	if as.proveQ2AffCopyDelivered(claimSubject, carriedCopy, nil, c.Warnf) == nil {
+	//
+	// pubRecProven FALSE, and this is the caller the distinction exists for. This
+	// function is reached from seven routes — including the delivery gate's own
+	// `AffineDone || Lost` arm — and none of them holds a stored PUBREL naming this
+	// assignment. What they record is a terminal copy DISPOSITION, which must never
+	// outrank a recorded loss, or "this claim is already Lost" becomes the reason to
+	// clear Lost. See the PubRecProven field.
+	if as.proveQ2AffCopyDelivered(claimSubject, carriedCopy, nil, c.Warnf, false) == nil {
 		return false, false
 	}
 	if err := confirm(ackSubject); err != nil {
@@ -3598,6 +3774,143 @@ func (as *mqttAccountSessionManager) discardQ2AffClaimsFor(idHash, gen string) e
 	})
 }
 
+// mqttQ2AffProofEvidence says whether a resume managed to gather the PUBREL proofs
+// that would REFUTE a loss inference. It is one flag rather than a per-claim set on
+// purpose: a scan that failed cannot even name which assignments have proofs, and a
+// per-record failure already means this incarnation's evidence is partial.
+type mqttQ2AffProofEvidence int
+
+const (
+	// mqttQ2AffProofComplete: every stored PUBREL of this incarnation was read and
+	// every reference it carried was resolved. An absent copy under a nonterminal
+	// claim may now be read as a loss, because the thing that would have contradicted
+	// it was looked for and is not there.
+	mqttQ2AffProofComplete mqttQ2AffProofEvidence = iota
+	// mqttQ2AffProofIncomplete: the walk failed, a reference could not be resolved, or
+	// a reference was a shape this broker does not write. No loss may be inferred for
+	// this incarnation — an inference drawn from evidence that was never gathered is
+	// not fail-closed, it is a guess.
+	mqttQ2AffProofIncomplete
+)
+
+// reconcileQ2AffPubRelProofs advances every assignment this incarnation's stored
+// PUBRELs prove the client answered PUBREC for, and reports whether that evidence is
+// complete.
+//
+// It is the correction for a false loss report. mqttProcessPublishReceived stores the
+// correlated PUBREL BEFORE mqttFinishQ2AffineDelivery records AffineDone, so a broker
+// that stops in between — with the affine consumer then destroyed out of band, taking
+// its copies with it off the interest-retained $MQTT_out — leaves exactly the shape
+// recoverQ2AffClaims reads as LOST, for a message the client has already answered and
+// whose handshake will complete from that very PUBREL on this resume.
+//
+// Ordering, and both halves are constraints rather than preferences:
+//
+//   - BEFORE recoverQ2AffClaims, so the proof is on the record before the inference is
+//     attempted. Not the correctness property — PubRecProven outranks a Lost that lands
+//     first — but it is what keeps the common case from emitting a loss report at all.
+//   - BEFORE ensureQ2AffineConsumerSubscription, because the reap is THIS function's to
+//     perform: the recovery-and-reap route is skipped entirely when affine restoration
+//     fails, so discharging the reap by ordering is unavailable. Nothing here needs the
+//     consumer — it walks $MQTT_out by subject and writes to $MQTT_qos2assign.
+//
+// It is NOT serialized against affine deliveries: openRestoreGate runs before
+// resendPendingRedelivery, so a restored callback can be proving the same claim
+// concurrently. That is a fenced race, not an absence of one, and the fence is
+// proveQ2AffCopyDelivered's nonce-and-copy CAS, which both parties take. Read-loop
+// serialization prevents a SAME-CONNECTION PUBCOMP during CONNECT and nothing on
+// another broker.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) reconcileQ2AffPubRelProofs(c *client) mqttQ2AffProofEvidence {
+	as := sess.asm
+	sess.mu.Lock()
+	pubRelSubject := sess.pubRelSubject
+	// A stored PUBREL cannot exist for an incarnation that has no PUBREL consumer:
+	// $MQTT_out is interest-retained, so a store with no consumer succeeds and keeps
+	// nothing (I12). The crash-window population always has one, because the PUBREC that
+	// stores the record goes through trackAsPubRel, which refuses without it, and the
+	// consumer is persisted in the session record. So this is the exact precondition, not
+	// an optimisation — and skipping on it yields COMPLETE evidence, because "there are
+	// no records" is what the walk would have found.
+	hasPubRelConsumer := sess.pubRelConsumer != nil
+	sess.mu.Unlock()
+	if as == nil || pubRelSubject == _EMPTY_ {
+		// Nothing could be read, so nothing was ruled out.
+		return mqttQ2AffProofIncomplete
+	}
+	if !hasPubRelConsumer {
+		return mqttQ2AffProofComplete
+	}
+	s := as.server()
+	records, ok := sess.scanPubRelRecords(pubRelSubject)
+	if !ok {
+		// A partial walk is never evidence of absence (scanPubRelRecords says so), and
+		// here the absence in question is "no PUBREL proves this delivery".
+		return mqttQ2AffProofIncomplete
+	}
+	evidence := mqttQ2AffProofComplete
+	for _, r := range records {
+		if r.affRef.refused() {
+			// A shape this broker does not write. Refused, not ignored: it names an
+			// assignment that cannot be resolved, so neither the proof nor the loss
+			// inference may proceed around it.
+			c.Warnf("MQTT: refusing the affine QoS 2 reference on a stored PUBREL at sequence %v: "+
+				"claim %q copy %q is not a shape this broker writes", r.seq, r.affRef.Claim, r.affRef.Copy)
+			evidence = mqttQ2AffProofIncomplete
+			continue
+		}
+		if !r.affRef.valid() {
+			continue // no affine reference: an ordinary QoS 2, retained, drained or uncorrelated PUBREL
+		}
+		claim, cerr := as.q2AffClaimForCarriedCopy(r.affRef.Claim, r.affRef.Copy)
+		if cerr != nil {
+			if errors.Is(cerr, errQ2AffCarriedCopySuperseded) {
+				// POSITIVELY a superseded incarnation of this assignment: the record on
+				// the subject is attributable and simply names a different copy, so
+				// nothing will ever authorize the one this PUBREL was created for. There
+				// is no proof to record and nothing is left unresolved.
+				continue
+			}
+			c.Warnf("MQTT: unable to resolve the affine QoS 2 assignment %q named by a stored PUBREL: %v",
+				r.affRef.Claim, cerr)
+			evidence = mqttQ2AffProofIncomplete
+			continue
+		}
+		if claim == nil {
+			// The claim is gone. Nothing to record, and nothing left for a loss verdict
+			// to be untruthful about either — recoverQ2AffClaims will not see it.
+			continue
+		}
+		// The shape check runs BEFORE the already-proven short circuit, not only inside
+		// the transition. q2AffClaimForCarriedCopy validates attribution and the copy
+		// binding; only q2AffShapePrecheck rejects an unknown phase and the contradictory
+		// terminal shapes. Checking it only on the writing path would let a record this
+		// broker does not write skip straight to the reap on the strength of a
+		// PubRecProven it should never have been allowed to carry.
+		if verr := q2AffShapePrecheck(r.affRef.Claim)(claim); verr != nil {
+			c.Warnf("MQTT: refusing the affine QoS 2 assignment %q named by a stored PUBREL: %v",
+				r.affRef.Claim, verr)
+			evidence = mqttQ2AffProofIncomplete
+			continue
+		}
+		if !claim.PubRecProven {
+			// The same precheck threaded into the CAS loop, because the record can be
+			// rewritten between the reading above and the write.
+			if as.proveQ2AffCopyDelivered(r.affRef.Claim, r.affRef.Copy,
+				q2AffShapePrecheck(r.affRef.Claim), c.Warnf, true) == nil {
+				evidence = mqttQ2AffProofIncomplete
+				continue
+			}
+		}
+		// The reap is performed HERE and not left to the caller. See the ordering note
+		// above: the route that would otherwise do it is skipped whenever affine
+		// consumer restoration fails, which is exactly the population this pass serves.
+		as.reapQ2AffClaim(s, r.affRef.Claim)
+	}
+	return evidence
+}
+
 // recoverQ2AffClaims reconciles the assignments a resuming session still owns.
 // Its job is to leave no claim in a state that stalls something:
 //
@@ -3636,7 +3949,12 @@ func (as *mqttAccountSessionManager) discardQ2AffClaimsFor(idHash, gen string) e
 //
 // Best effort: everything here is re-derivable, so a failure just leaves the work
 // for the next contender or the next resume.
-func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
+//
+// evidence says whether this resume's PUBREL proofs were fully gathered
+// (reconcileQ2AffPubRelProofs). On anything less the LOST arm below writes nothing: an
+// absent copy is only evidence of a loss once the thing that would refute it — a stored
+// PUBREL naming this assignment — has actually been looked for.
+func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string, evidence mqttQ2AffProofEvidence) {
 	if idHash == _EMPTY_ || gen == _EMPTY_ {
 		return
 	}
@@ -3686,22 +4004,54 @@ func (as *mqttAccountSessionManager) recoverQ2AffClaims(idHash, gen string) {
 			// delivery is released, but never reapable, so the evidence survives
 			// instead of being erased by a clean reap.
 			//
-			// LOST is what this broker can prove, not what necessarily happened. A
-			// client that answered PUBREC before the broker stopped leaves this same
-			// shape, because the PUBREL is stored before the affine side is recorded
-			// — so this arm can name a message that was in fact received. The write
-			// stays as it is: the alternative readings are worse, and the correction
-			// belongs to the separate Lost-truthfulness item. See F-064 residual 1.
-			if s != nil {
-				s.Errorf("MQTT: shared QoS 2 assignment %q for session %q was materialized, but its copy is gone with no record of it being delivered; recording it as a LOST QoS 2 delivery",
-					subject, idHash)
+			// LOST is an INFERENCE from an absent copy, never a proof — the field's own
+			// comment says "could not prove", not "never delivered". A client that
+			// answered PUBREC before the broker stopped leaves this same shape, because
+			// the PUBREL is stored before the affine side is recorded. What refutes the
+			// inference is that PUBREL, and reconcileQ2AffPubRelProofs is what looks for
+			// it; PubRecProven then outranks a Lost that lands first anyway.
+			//
+			// So on incomplete evidence this writes NOTHING. Concluding a loss from a
+			// search that did not happen is a guess, not a fail-closed reading, and the
+			// next resume simply tries again.
+			if evidence != mqttQ2AffProofComplete {
+				if s != nil {
+					s.Warnf("MQTT: deferring the disposition of shared QoS 2 assignment %q for session %q: its copy is gone, but this resume could not gather the PUBREL proofs that would show the client answered PUBREC",
+						subject, idHash)
+				}
+				return nil
 			}
 			// Nonce-fenced: Lost is an inference from THIS claim's copy being absent,
 			// so it must not be written onto a later incarnation of the subject that
 			// has its own copy.
-			if _, _, aerr := as.advanceQ2AffClaim(subject, idHash, gen, claim.Nonce, _EMPTY_,
-				func(c *mqttQ2AffClaim) { c.Lost = true }); aerr != nil {
+			updated, _, aerr := as.advanceQ2AffClaim(subject, idHash, gen, claim.Nonce, _EMPTY_,
+				func(c *mqttQ2AffClaim) { c.Lost = true })
+			if aerr != nil {
 				return nil
+			}
+			// A NIL ERROR IS NOT THE VERDICT, exactly as it is not the proof on the
+			// other side of this file. advanceQ2AffClaim reports (nil, 0, nil) when the
+			// record vanished between the reading above and its own load, and reports
+			// success for a write mergeProven turned into a NO-OP — which is precisely
+			// what a concurrent PubRecProven does, since it clears Lost. Announcing a
+			// loss on either would report the very thing this item exists to stop: a
+			// delivered message called LOST, here without even a record saying so.
+			//
+			// So the diagnostic is emitted only for a loss that is ON the record this
+			// call left behind, and it is worded to assert only what a log CAN assert.
+			//
+			// There is deliberately NO ordering rule between it and the retraction a
+			// proof emits, because the code could not keep one: the record is the
+			// authority and the log is a derived view of it, the two cannot be made
+			// transactional, and a concurrent proof may clear this verdict and reap the
+			// claim between the CAS above and this line. So the report is explicitly
+			// PROVISIONAL instead, which stays truthful whichever way the two interleave.
+			if updated == nil || !updated.Lost {
+				return nil
+			}
+			if s != nil {
+				s.Errorf("MQTT: shared QoS 2 assignment %q for session %q was materialized, but its copy is gone with no record of it being delivered; recording it as a LOST QoS 2 delivery. This verdict is PROVISIONAL: a stored PUBREL proving the client answered PUBREC retracts it, possibly before this line is read, and the assignment record is the authority",
+					subject, idHash)
 			}
 		default:
 			// The sourceless rule, and it REAPS INTERNALLY — so this arm returns before

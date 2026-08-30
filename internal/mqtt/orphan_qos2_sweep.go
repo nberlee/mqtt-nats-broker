@@ -1868,6 +1868,10 @@ func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand
 		// requires the phase a retired register implies. A retired register is evidence
 		// of a PUBREC, and the copy cannot have reached the client before its claim
 		// became materialized — a cross-record fact neither record proves alone.
+		//
+		// pubRecProven FALSE: a retired register proves the SOURCE is past PUBREC, not
+		// that a PUBREL bound to THIS claim incarnation is durable. Only a resolved
+		// carrier read off such a PUBREL licenses that fact.
 		if as.proveQ2AffCopyDelivered(rec.Q2AffClaim, rec.Q2AffCopy,
 			func(c *mqttQ2AffClaim) error {
 				if verr := shape(c); verr != nil {
@@ -1878,7 +1882,7 @@ func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand
 						errQ2AffPrecheckRefused, c.Phase)
 				}
 				return nil
-			}, s.Warnf) == nil {
+			}, s.Warnf, false) == nil {
 			return
 		}
 		// (4) Delete the copy at its EXACT sequence and CONFIRM it gone. Not
@@ -2090,6 +2094,16 @@ func validateOrphanQ2AffClaim(subject string, c *mqttQ2AffClaim) error {
 		// Mutually exclusive by construction (mergeProven). A record asserting both
 		// says the message was proven delivered AND could not be proven delivered.
 		return fmt.Errorf("claim on %q asserts both AffineDone and Lost", subject)
+	}
+	// The same construction argument for the PUBREC proof, which mergeProven resolves
+	// to exactly one shape: PubRecProven implies AffineDone and implies not Lost. A
+	// record asserting either contradiction is one this broker does not write, so it
+	// is REFUSED rather than normalised by the next merge that touches it.
+	if c.PubRecProven && c.Lost {
+		return fmt.Errorf("claim on %q asserts both a proven PUBREC and Lost", subject)
+	}
+	if c.PubRecProven && !c.AffineDone {
+		return fmt.Errorf("claim on %q asserts a proven PUBREC without AffineDone", subject)
 	}
 	if !mqttValidIDHashToken(c.Winner) {
 		return fmt.Errorf("claim on %q carries a malformed winner hash %q", subject, c.Winner)

@@ -595,6 +595,19 @@ func TestQ2AffClaimRecordMaxCoversEveryReachableShape(t *testing.T) {
 		"lost and discarded": func(c *mqttQ2AffClaim) {
 			c.Phase, c.SourceAcked, c.Lost, c.Discarded = mqttQ2AffMaterialized, true, true, true
 		},
+		// The PUBREC-proof shapes. PubRecProven implies AffineDone and excludes Lost
+		// (mergeProven), so the proven form is the complete form plus one more member and
+		// is therefore the LARGEST reachable record. A bound that compares only the two
+		// older terminal shapes leaves a record this broker writes outside the admission
+		// preflight, which is the eternal-retry wedge the preflight exists to prevent.
+		"pubrec proven": func(c *mqttQ2AffClaim) {
+			c.Phase, c.SourceAcked, c.AffineDone, c.PubRecProven =
+				mqttQ2AffMaterialized, true, true, true
+		},
+		"pubrec proven and discarded": func(c *mqttQ2AffClaim) {
+			c.Phase, c.SourceAcked, c.AffineDone, c.PubRecProven, c.Discarded =
+				mqttQ2AffMaterialized, true, true, true, true
+		},
 	}
 	for name, mut := range shapes {
 		t.Run(name, func(t *testing.T) {

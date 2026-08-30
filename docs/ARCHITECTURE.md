@@ -2448,16 +2448,149 @@ broker accepted can no longer be PROVEN. `Lost` is terminal (no contender waits
 on it, and the group delivery is released) but never reapable, because the record
 is the only durable evidence of that unproven outcome and a clean reap would
 erase it. `Lost` and `AffineDone` are mutually exclusive and are not
-independently merged: whichever the durable record already proved stands.
+independently merged: whichever the durable record already proved stands, unless
+`PubRecProven` is present, which outranks both (below).
 
 **`Lost` is not proof that the message failed to reach the client**, and the
 distinction is operator-facing. The write order that justifies the inference
 holds for the JetStream copy acknowledgement, not for the client's PUBREC, which
 is answered before `AffineDone` is recorded — see the write-order paragraph
 below. A client may therefore have received and acknowledged the PUBLISH while
-the assignment is still marked `Lost`. Nothing is redistributed and the client is
-not deprived, so this is a reporting defect rather than a deviation; it is stated
-in `docs/CONFORMANCE.md` and has its own roadmap item.
+the assignment looks lost. Nothing is redistributed and the client is not
+deprived, so this was a reporting defect rather than a deviation.
+
+**A sixth field, `PubRecProven`, is what corrects it, and it exists as its own
+field rather than reusing `AffineDone` for a reason that is not stylistic.** The
+stored PUBREL is the durable, account-wide record that the client answered
+PUBREC, so it now NAMES the assignment it completes — as a bound
+`(claim subject, copy subject)` pair, never the claim subject alone, because a
+claim subject is reused by a later incarnation and a bare reference would credit
+a successor claim with a delivery it never made (the F-065 loss, committed by the
+remedy for it). `PubRecProven` is set only by the two routes that hold such a
+resolved carrier: the owner's resume pass and the PUBCOMP arm below.
+
+`PubRecProven` is the ONLY fact in the record that outranks `Lost`. `Lost` is an
+inference from an absent copy — "could not prove", not "never delivered" — and an
+inference must never outrank a proof, so `mergeProven` clears `Lost` when
+`PubRecProven` is present, in either arrival order. Before that rule a
+cross-broker race made a mislabelling permanent: whichever landed first won, and
+nothing could ever correct a `Lost` that got there first.
+
+**Generic `AffineDone` is deliberately NOT given that power.** It means *terminal
+copy disposition* and is written by seven routes — the session discarded, a
+redelivery under an already-terminal claim, a subscribe denial, expiry, an
+oversize discard, retired-source settlement, and the ordinary PUBREC. One of
+those is the delivery gate's own `AffineDone || Lost` arm, so if `AffineDone`
+outranked `Lost` then "this claim is already `Lost`" would become the reason to
+clear `Lost`, confirm the copy acknowledgement and reap — laundering an unproven
+outcome into a clean deletion. That path is reachable, not theoretical: a delayed
+materializer holding a `claimed` snapshot can store a copy while recovery is
+committing `Lost`, and the restored consumer delivers it.
+
+A record asserting `PubRecProven ∧ Lost`, or `PubRecProven ∧ ¬AffineDone`, is one
+this broker does not write. Both are REFUSED by the shape validator rather than
+normalised by the next merge, and the refusal is checked before the
+already-proven short circuit on both proof routes.
+
+**The reference is resolved on resume, before any loss can be inferred.**
+`reconcileQ2AffPubRelProofs` runs as the first step of the affine half of
+`resendPendingRedelivery`: it walks this incarnation's stored PUBRELs, resolves
+each bound reference through the single helper `q2AffClaimForCarriedCopy`, records
+`PubRecProven` through the ordinary fenced transition, and **performs the reap
+itself**. The reap cannot be discharged by ordering, because the
+recovery-and-reap route is skipped whenever affine consumer restoration fails —
+which is also why the pass runs before that restoration rather than beside
+`recoverQ2AffClaims`. It needs no consumer: it walks `$MQTT_out` by subject and
+writes to `$MQTT_qos2assign`. It is *not* serialized against affine deliveries —
+the restore gate opens first — so a restored callback may be proving the same
+claim concurrently; that is a fenced race, and the fence is the transition's
+nonce-and-copy CAS, which both parties take.
+
+The pass reports whether its evidence is COMPLETE, and `recoverQ2AffClaims`
+refuses to infer a loss on anything less. An absent copy is only evidence of a
+loss once the thing that would refute it has actually been looked for; concluding
+one from a search that failed is a guess, not a fail-closed reading. The next
+resume simply tries again. The loss diagnostic is also emitted only once its CAS
+has landed, so a write that lost its race no longer announces a loss that was
+never recorded.
+
+**PUBCOMP will not acknowledge a PUBREL away while the proof it carries is
+unrecorded**, and it holds the reservation while it refuses. The obligation is
+resolved BEFORE the pending entry is removed, and the entry is untracked only on
+the path that will acknowledge: `qos12InflightForCap` counts `pendingPubRel`
+against Receive Maximum, so an entry removed and then withheld frees its packet
+identifier, a later exchange re-mints it after a wrap, and when the original
+redelivers the duplicate branch acknowledges it away — destroying the evidence
+the withholding existed to protect. The final re-lock re-validates four things
+before removing anything, because the resolution ran without the session lock:
+the connection still owns the session, the entry is still present, it still names
+the same `(durable, sequence)`, and it still carries an acknowledgement subject.
+An AckWait redelivery of the same record is allowed through, which is why the
+acknowledgement subject is taken from the untrack rather than from the earlier
+copy. A claim that is authoritatively ABSENT acknowledges rather than wedging —
+with no record there is nothing for a later resume to report untruthfully, and
+withholding would hold the exchange on something that can never reappear — while
+an unreadable one, an unsupported shape and a malformed carrier all withhold. A refused
+carrier is reported ONCE per RECORD per connection: AckWait re-offers a withheld record
+forever, so warning on every attempt is unbounded output about one unchanging fact — and
+keying that suppression by anything coarser than the record silences a genuinely different
+one, since several PUBREL records legitimately share a packet identifier. The same
+discharge guards the **duplicate-record branch** of the PUBREL delivery callback: several
+PUBREL records under one packet identifier is a supported stale-broker shape, and the
+duplicate may carry the only reference to a *different* assignment, so it is discharged
+before it is acknowledged away rather than simply discarded.
+
+The reference's own validation is exact rather than lenient, because a lenient reading
+fails OPEN: a value that parses but is not one the broker emits resolves to an absent
+claim, and absence is an acknowledging outcome. So each header must appear **exactly
+once** — reading the first of two would silently pick one of two assignments — and the
+claim subject's sequence must be canonical, the value `strconv.FormatUint` produces, not
+merely something `ParseUint` accepts.
+
+The loss report is worded as **PROVISIONAL**, and when a proof CLEARS a `Lost` that was
+already recorded the report is RETRACTED in the log. There is deliberately **no ordering
+rule** between the two, because the code could not keep one: the record is the authority
+and the log is a derived view of it, the two cannot be made transactional, and a concurrent
+proof can clear the verdict and reap the claim between recovery's CAS and its own log line.
+Wording the report provisionally removes that requirement instead of adding machinery to
+meet it, so either interleaving reads truthfully.
+
+A superseded broker's PUBREL store is not CAS-conditioned, so it can
+land after this incarnation's scan completed and its verdict was written and logged; the
+proof then clears `Lost` and the claim is reaped, so without the retraction the operator is
+left with an erroneous report and nothing durable contradicting it.
+
+The loss diagnostic is likewise emitted only for a loss that is ON the record the
+transition left behind. A nil error is not the verdict: the transition reports success for
+a write `mergeProven` turned into a no-op, which is exactly what a concurrent
+`PubRecProven` does, and for a record that vanished between the reading and the write.
+
+**Teardown records the proofs before it destroys them.** Deleting the PUBREL consumer
+drops its records with it, and the discard that follows preserves any `Lost` already on the
+claim — which `reapable` then refuses forever, leaving an authoritative record calling a
+delivered message lost. So `deleteTeardownTargets` reconciles every stored PUBREL's
+reference into its assignment BEFORE that delete, and fails closed on a walk it could not
+complete or a claim it could not read, since the teardown is re-driven and the cost of
+failing closed is a retry. It runs for an ADOPTED teardown too — the broker that deletes
+the consumer is the one that owes the reconciliation — and every step is idempotent. The
+one case that proceeds rather than failing closed is a reference this broker does not
+write: it identifies no assignment, so no retry could succeed and failing closed would
+wedge the teardown forever.
+
+What that reconciliation does NOT do is fence the writer: it is not atomic with the
+delete, so a broker still serving the retiring generation can store a proof-bearing PUBREL
+inside the interval between the scan and the deletion. Closing that needs a durable
+mechanism — writer quiescence, a retention handoff, or a claim-side intent. A
+store-then-verify read of the retirement watermark is REFUTED on three independent counts,
+recorded together so a superficially revised version cannot repeat the other two: that
+watermark is one replaceable record per CLIENT rather than one per generation, and
+`recordGenRetirement` advances on `MarkerSeq` alone, so a teardown of one generation can
+run while the slot names another; the verifying read is not crash-persistent, so a writer
+that stops between its store and its read reopens the window; and the arm such a read would
+take does not clear a `Lost` already on the claim, so it would not have corrected the
+record even when it fired.
+
+The residuals this leaves are stated in `docs/CONFORMANCE.md`.
 
 **Releasing the group source is authorized by evidence, never by the phase.** The
 phase is a record of the past: `$MQTT_out` is interest-retained, so the copy a
@@ -2466,6 +2599,7 @@ source ack is irreversible and releases the message from the shared group foreve
 So `materializeQ2AffCopy` proves the copy with a PRESENCE CHECK on the copy
 subject, and `sourceAckAuthorized` admits the ack on
 `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked` and on nothing else.
+`PubRecProven` adds no disjunct, because it implies `AffineDone`.
 
 Three consequences, all deliberate:
 
@@ -2524,18 +2658,22 @@ because two decisions rest on the distinction:
 - Re-materializing a `materialized` claim is **refused**, precisely because a
   replacement copy there can become a second PUBLISH for an exchange already past
   PUBREC.
-- The `Lost` that owner-side recovery records for this shape is therefore
-  sometimes a **false loss report**. It is not a conformance defect — `Lost`
+- The `Lost` that owner-side recovery would record for this shape was therefore
+  sometimes a **false loss report**. It never was a conformance defect — `Lost`
   releases the group delivery without re-offering the message, so nothing is
-  redistributed — but it is untruthful, and correcting it is its own roadmap item.
+  redistributed — but it was untruthful. It is **corrected**: the stored PUBREL
+  now names the assignment it completes, and `reconcileQ2AffPubRelProofs` resolves
+  that reference before any loss can be inferred, recording `PubRecProven`, which
+  outranks `Lost`. See the `PubRecProven` paragraphs above.
 
 That inference is authoritative **while the owning session record still exists**.
 Once it is gone, a legitimate teardown deleting the consumer and an out-of-band
 destruction of it are indistinguishable — both leave a materialized claim with no
 copy and no `AffineDone` — so orphan reconciliation records `Discarded` rather
-than `Lost`. A `Lost` flag already committed is permanent and never reaped; what
-cannot always be recovered is a loss that happened before the session record
-disappeared and was never observed by the owner. See "Orphan reconciliation". The inverted
+than `Lost`. A `Lost` flag already committed is never reaped and is corrected only
+by a `PubRecProven` that a surviving PUBREL still licenses; what cannot always be
+recovered is a loss that happened before the session record disappeared and was
+never observed by the owner. See "Orphan reconciliation". The inverted
 window (recorded, not yet acked) is benign and self-correcting: the copy stays
 live, a live copy always keeps its claim (`reapable` requires the copy to be
 authoritatively absent), and the redelivered copy is disposed of by the delivery

@@ -317,7 +317,7 @@ func TestMQTTDrainClusterLateForeignPubRelStore(t *testing.T) {
 	// NOW release A's store: the superseded broker completes the write it had
 	// already begun, under the identity the exchange defines.
 	msgId := mqttPubRelMsgId(idHash, dur, sseq, 0)
-	natsMsg, headerLen := mqttNewCorrelatedPubRel(claimPI, dur, sseq, msgId)
+	natsMsg, headerLen := mqttNewCorrelatedPubRel(claimPI, dur, sseq, msgId, _EMPTY_, _EMPTY_)
 	if _, err := sessA.jsa.storeMsg(pubRelSubject, headerLen, natsMsg); err != nil {
 		t.Fatalf("A's late store: %v", err)
 	}

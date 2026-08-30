@@ -509,9 +509,11 @@ sound for the JetStream copy acknowledgement and **not** for the client's PUBREC
 which is answered earlier: `mqttProcessPublishReceived` stores the correlated
 PUBREL before it reaches `mqttFinishQ2AffineDelivery`. So a client may already
 have received and acknowledged the PUBLISH while only the copy acknowledgement is
-unproven, and the assignment is still marked `Lost`. That is a reporting defect
-rather than a deviation — see the paragraph below on why nothing is
-redistributed and the client is not deprived — and it has its own roadmap item.
+unproven. That was a reporting defect rather than a deviation — see the paragraph
+below on why nothing is redistributed and the client is not deprived — and it is
+now **corrected**: the stored PUBREL names the assignment it completes, and
+resolving that reference on resume records `PubRecProven`, which outranks `Lost`.
+The five residuals that remain are stated below.
 
 **Corrected by F-033's audit (2026-08-18): the marking is not automatic.** `Lost` has
 exactly one writer in the tree, `recoverQ2AffClaims`, and it runs on **the owning
@@ -667,7 +669,8 @@ record disappears first — the session expired, or a broker died without tearin
 down — a legitimate teardown deleting the consumer and an out-of-band destruction
 of it look identical, so orphan reconciliation records `Discarded` (which
 MQTT 5.0 [4.8.2] permits) rather than `Lost`. A `Lost` flag already committed is
-never automatically removed; what cannot always be recovered afterwards is a loss
+never automatically removed except by a `PubRecProven` a surviving PUBREL still
+licenses (below); what cannot always be recovered afterwards is a loss
 that occurred before the record vanished and that no broker had yet recorded. A
 discarded assignment is itself retained until the source is proven closed, so
 reaping it can never let a redelivery elect a second winner.
@@ -677,19 +680,76 @@ whose `Lost` marking depends on the owner resuming (F-064's residuals 1 and 8), 
 F-063's non-atomic span between the final copy proof and the source ack. Both are stated
 with their mechanism rather than a bound they do not have.
 
-**And a reporting defect that is not a conformance one, stated here so it is not
-rediscovered as one.** `mqttProcessPublishReceived` stores the correlated PUBREL before
-it records `AffineDone`, so PUBREC → broker stop → out-of-band consumer destruction
-leaves `materialized ∧ ¬AffineDone ∧ copy absent` for a message the client already
-answered. The owner's resume records that as `Lost`, which is untruthful. It is not a
-deviation: `Lost` releases the group delivery without re-offering the message, so
-nothing is redistributed, and the client is not deprived — the PUBREL is persisted
-independently and replayed, so the handshake completes. The observable cost is an
-erroneous log line and a claim that is never reaped. Writing `Discarded` instead is not
-available as a shortcut, and the reason is phase-sensitive: where a correlated PUBREL
-proves PUBREC it is merely untruthful, but for the undifferentiated shape, where nothing
-proves the client was reached, it would deprive a client still owed the PUBLISH and
-`[MQTT-4.8.2-4]` does bite. Correcting it has its own roadmap item.
+**The false loss report is CLOSED, and what remains of it is stated here.**
+`mqttProcessPublishReceived` stores the correlated PUBREL before it records
+`AffineDone`, so PUBREC → broker stop → out-of-band consumer destruction leaves
+`materialized ∧ ¬AffineDone ∧ copy absent` for a message the client already answered.
+The owner's resume used to record that as `Lost`, which was untruthful — never a
+deviation, since `Lost` releases the group delivery without re-offering the message and
+the handshake completes from the independently persisted PUBREL, but wrong in what it
+told the operator, and it left a claim that was never reaped. (Writing `Discarded`
+instead was never available as a shortcut, and the reason is phase-sensitive: where a
+correlated PUBREL proves PUBREC it is merely untruthful, but for the undifferentiated
+shape, where nothing proves the client was reached, it would deprive a client still owed
+the PUBLISH and `[MQTT-4.8.2-4]` does bite.)
+
+The stored PUBREL now names the assignment it completes, as a bound
+`(claim subject, copy subject)` pair, and `reconcileQ2AffPubRelProofs` resolves that
+reference on resume before any loss can be inferred. A resolved reference records
+`PubRecProven`, which outranks `Lost` in either arrival order, so even a `Lost` that won
+a cross-broker race is corrected. PUBCOMP will not acknowledge such a PUBREL away while
+its proof is unrecorded, and it keeps the packet identifier reserved while it refuses. A
+duplicate PUBREL record under an identifier already tracked by a different record is
+discharged before it is acknowledged, for the same reason. The loss diagnostic is emitted
+only for a verdict that actually landed, so a proof winning the race no longer produces a
+loss report with no loss behind it — and a proof that arrives AFTER a verdict was recorded
+and logged retracts that report explicitly, since it also reaps the record that would
+otherwise contradict it. The loss report itself is worded as provisional and the two lines
+carry no guaranteed order, because the record rather than the log is the authority.
+
+**Five residuals remain, each with its mechanism rather than a bound it does not have.**
+
+- **Recreating `$MQTT_out` alone destroys the proof.** The PUBREL and the copy identity
+  it names live on that stream, so recreation takes both, and a surviving `Lost` on the
+  claim can no longer be corrected. This is the accepted-data loss single-stream
+  recreation already causes, and it is F-066's rather than this mechanism's.
+- **The reconciliation is not atomic with the consumer deletion.** Teardown records every
+  stored PUBREL's proof before deleting the consumer that retains them, but a broker still
+  serving the retiring generation can store a proof-bearing PUBREL AFTER that scan's last
+  read and BEFORE the delete. That record dies with the consumer, and a `Lost` already on
+  its claim is then uncorrectable. The window is narrow — it needs a stale broker
+  completing a PUBREC inside the teardown's own delete interval — but it is real, and it
+  is the ordinary late-proof case rather than the malformed-reference one below.
+  **Closing it requires a durable mechanism, and a cheap one was refused rather than
+  shipped.** A store-then-verify read of the generation-retirement watermark is REFUTED and
+  must not be re-proposed: `$MQTT_teardown` holds one replaceable record per client and
+  `recordGenRetirement` advances on `MarkerSeq` alone, so a teardown of one generation can
+  run while the slot names another; the verifying read is not crash-persistent; and the
+  arm it would take does not clear an existing `Lost` anyway. Three candidate closures
+  remain, each its own piece of work: completing F-036's stale-serving predicate for the
+  retiring session generation, after which the existing scan-before-delete suffices; a
+  retention handoff that keeps proof records independent of the consumer; or a claim-side
+  "PUBREL owed" intent with register-driven recovery.
+- **A teardown carrying a MALFORMED carrier still loses it.** Session teardown now
+  reconciles every stored PUBREL's PUBREC proof into its assignment BEFORE deleting the
+  consumer that retains those records, and fails closed on a walk it could not complete or
+  a claim it could not read — so the ordinary late-proof-then-teardown sequence no longer
+  strands a `Lost ∧ Discarded` claim. The exception is a reference this broker does not
+  write: it names no assignment that can be identified, so nothing can be recorded and no
+  retry could ever succeed, and failing closed there would wedge the session's teardown
+  forever. Such a record is destroyed with its consumer, with a diagnostic. The claim it
+  could not name is `Discarded` regardless, which MQTT 5.0 [4.8.2] permits.
+- **A permanently unreadable claim, or a malformed carrier, defers rather than
+  resolves.** Recovery writes no loss verdict for that incarnation at all — an inference
+  drawn from a search that failed is a guess — and PUBCOMP withholds its acknowledgement,
+  holding one packet identifier and one Receive Maximum slot until the record becomes
+  readable. Fail-closed, and an availability cost rather than a correctness one. Only
+  this broker writes those headers, so a malformed one is corruption or direct backend
+  manipulation, never something a client can send.
+- **An authoritatively ABSENT claim is acknowledged, not withheld.** That is not
+  fail-closed and is not claimed to be: with no record there is nothing for a later
+  resume to report untruthfully, and withholding would hold the exchange forever on
+  something that can never reappear.
 
 **Residuals of on-behalf restoration itself.** A contender restoring a destroyed
 consumer refuses, storing nothing and acking nothing, on: a record whose `Q2Aff` is not

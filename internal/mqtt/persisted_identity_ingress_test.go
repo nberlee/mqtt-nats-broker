@@ -386,7 +386,7 @@ var censusInterpreters = map[string]string{
 	// ---- PUBREL / QoS 2 second phase ----------------------------------------
 	"mqttProcessPubRel":          "stores the correlated PUBREL, which is the handoff of identifier ownership from the register to the record",
 	"mqttProcessPubComp":         "completes the exchange, and must not ack the PUBREL away while the retirement it covers is not durably recorded",
-	"mqttProcessPublishReceived": "stores the correlated PUBREL on the PUBREC path, before the affine completion runs",
+	"mqttProcessPublishReceived": "stores the correlated PUBREL on the PUBREC path, before the affine completion runs — which is why that record also carries the bound (claim subject, copy subject) reference naming the shared QoS 2 assignment it completes: it is the durable PUBREC proof for the window between the two",
 
 	// ---- orphan reconciliation ---------------------------------------------
 	"sweepOrphanedQoS2State":            "the orphan pass over inbound QoS 2 state; authoritative over persisted records and this broker's residents, explicitly not over a session live elsewhere",

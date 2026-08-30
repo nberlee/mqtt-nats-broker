@@ -683,9 +683,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   claim-side fence orders a contender's store against the winner's authorization of the
   original PUBLISH, and the replacement copy can become a second PUBLISH for an exchange
   already past PUBREC. The route back to this is the PUBREL-carried claim reference in
-  the `Lost`-truthfulness item below, because that PUBREL is durable and account-wide —
-  but note the direction: it gives PUBREL → claim, and a contender needs claim → PUBREL,
-  which is a reverse lookup that must be costed before it is promised. - *The
+  the `Lost`-truthfulness item below, and **that reference now EXISTS** (done
+  2026-08-30): the stored PUBREL carries a bound `(claim subject, copy subject)` pair
+  naming the assignment it completes. It supplies only the direction that item needed,
+  PUBREL → claim. A contender needs claim → PUBREL, a reverse lookup over an
+  account-wide subject space, and that is still uncosted — so residual 8 is unchanged. - *The
   accumulation half* — **PARTLY LANDED.** Under a live generation reference the sweep
   now reaps the claims that are already durably TERMINAL, and collects the retired
   affine `$MQTT_inflight` register class together with the copy and the claim each
@@ -744,46 +746,73 @@ further findings it surfaced are filed separately, for the reason its own bullet
   and both have a named route: residual 8 through the `Lost`-truthfulness item's
   PUBREL-carried claim reference, W-c through nothing currently available.
 
-  - [ ] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
-  Split out
-  of F-064; not a conformance defect, so not an alpha blocker. *The finding:*
-  `materialized ∧ ¬AffineDone ∧ copy absent` is reported `Lost` for a message the client
-  answered with PUBREC, because `mqttProcessPublishReceived` stores the correlated
-  PUBREL before it reaches `mqttFinishQ2AffineDelivery`. *Why it is not a deviation:*
-  `Lost` releases the group delivery without re-offering the message, so nothing is
-  redistributed. Writing `Discarded` instead is **not** an `[MQTT-4.8.2-4]` violation
-  for this population either — the PUBREL is persisted independently and replayed, so
-  the handshake completes — it is simply untruthful. The conformance objection applies
-  only to the undifferentiated shape, where nothing proves the client was reached. *Five
-  refuted mechanisms, with the code behind each:* gating the in-flight register
-  transitions on the write (duplicate PUBLISH); issuing the write inline at the
-  classification site (per-record round trips inside the pre-CONNACK barrier); an
-  in-memory carrier from classification to `recoverQ2AffClaims` (does not survive broker
-  displacement, while the `Retired` register does); a retry for an unproven write
-  (`mergeProven` forces `AffineDone` false forever once `Lost` is on the record, so no
-  retry terminates); and an unresolved-joins set in a *suppressing* role (redundant with
-  the durable `AffineDone` the recovery arm already reads — but see the constraint
-  below, which narrows that refutation). *Binding constraints on any design:* the writer
-  must call `reapQ2AffClaim` itself, since discharging it by ordering is unavailable —
-  the recovery-and-reap route is skipped whenever affine consumer restoration fails. The
-  pass must run **before** `recoverQ2AffClaims`, and an unproven advancement must
-  suppress that function's `Lost` transition for the affected claim, or `mergeProven`
-  prevents any later `AffineDone` from ever sticking; the suppressing set is redundant
-  only once `AffineDone` has been *successfully persisted*. And PUBCOMP must not destroy
-  the only proof, which needs the equivalent of `secureRetiredSource`'s
-  persist-before-ack. *The design to evaluate first:* make the correlated PUBREL carry
-  the `Q2AffClaim` subject. The association is in hand at PUBREC immediately before the
-  PUBREL is stored, and a post-CONNACK pass over those PUBRELs could advance the named
-  claims directly. The ordering property that makes it safe is read-loop serialization —
-  no PUBCOMP can be processed until `mqttProcessConnect` returns — **not** "before
-  PUBREL redelivery is enabled", which is false. It adds one persisted header, so it
-  needs its own compatibility and F-066 analysis, which is why it is a separate item. *A
-  residual any register-based design inherits:* an authoritatively absent consumer
-  resolves `mqttInflightSourceLost`, not Unknown, so the retire branch is forced while
-  the durable is gone; once the consumer exists — including after on-behalf restoration
-  recreated it for some other claim — the same absent copy resolves `Complete` and the
-  register is dropped, destroying the only record joining the PUBREL's `(Dur, Seq)` to
-  the claim.
+  - [x] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
+  Split out of F-064; not a conformance defect, so never an alpha blocker. **Done
+  2026-08-30**, after six plan-review rounds. *The finding:*
+  `materialized ∧ ¬AffineDone ∧ copy absent` was reported `Lost` for a message the client
+  answered with PUBREC, because `mqttProcessPublishReceived` stores the correlated PUBREL
+  before it reaches `mqttFinishQ2AffineDelivery` — untruthful rather than deviant, since
+  `Lost` releases the group delivery without re-offering the message and the handshake
+  completes from that same PUBREL, but it cost an erroneous loss report and a claim that
+  was never reaped.
+  **What landed, and the ROOT CAUSE is not the one this bullet used to name.** The design
+  the bullet prescribed — make the correlated PUBREL carry the `Q2AffClaim` subject — is
+  necessary and not sufficient: `mergeProven` resolved the `AffineDone`/`Lost` exclusion
+  by whichever landed first, so a `Lost` that won a cross-broker race could never be
+  corrected however good the later evidence. The fix is therefore in two halves. (1) A
+  new claim field `PubRecProven` is the ONLY fact that outranks `Lost`, in either arrival
+  order, on the ground that `Lost` is an inference from an absent copy and this is a
+  proof. (2) The stored PUBREL carries a BOUND `(claim subject, copy subject)` pair —
+  never the claim subject alone, which would credit a successor incarnation with a
+  delivery it never made — and `reconcileQ2AffPubRelProofs` resolves it on resume, before
+  `recoverQ2AffClaims` and before affine consumer restoration, performing its own reap
+  because the recovery-and-reap route is skipped when that restoration fails.
+  **Generic `AffineDone` is deliberately NOT the dominating fact, and a review round
+  refused the version that made it one.** It means terminal copy disposition and is
+  written by seven routes, one of which is the delivery gate's own `AffineDone || Lost`
+  arm — so letting it dominate would make "this claim is already `Lost`" the reason to
+  clear `Lost`, confirm the copy ack and reap, which is circular and reachable.
+  Also landed: recovery refuses to infer a loss when the PUBREL walk was incomplete (an
+  inference from a search that failed is a guess, not a fail-closed reading); the loss
+  diagnostic moved after its CAS; the parser is a tri-state, so a malformed carrier is
+  REFUSED rather than read as absent; `PubRecProven ∧ Lost` and `PubRecProven ∧
+  ¬AffineDone` are refused record shapes, checked before the already-proven short circuit
+  on both proof routes; PUBCOMP resolves the obligation BEFORE it untracks, so a withheld
+  PUBREL keeps its packet identifier and Receive Maximum slot instead of freeing them for
+  a wrap-around re-mint that would let the duplicate branch acknowledge the original
+  away; and both enlarged records are budgeted — the proven claim shape in
+  `mqttQ2AffClaimRecordMax`, and the affine PUBREL as its own ALTERNATIVE candidate
+  `mqttQ2AffPubRelFormMax` rather than added to the copy's bound, which would sum two
+  forms that never coexist.
+  **The five mechanisms this bullet had already refuted were not re-proposed**, and three
+  more were refuted during the plan loop: global `AffineDone` dominance, an in-memory
+  per-pair suppression set (it cannot arbitrate a cross-broker race, and once dominance
+  is durable it restates what the record already says), and withholding the PUBCOMP ack
+  after untracking the entry.
+  **Residuals, in `docs/CONFORMANCE.md`:** recreating `$MQTT_out` alone destroys the
+  proof with the copy identity it names (F-066's accepted-data loss); a teardown carrying
+  a MALFORMED carrier still loses it, because such a reference identifies no assignment and
+  failing closed there would wedge the teardown forever — the ordinary late-proof case is
+  CLOSED, since teardown now reconciles every stored PUBREL's proof into its assignment
+  before deleting the consumer that retains it, and fails closed otherwise — what remains
+  there is the interval BETWEEN that scan and the delete, which a stale broker's PUBREC can
+  still fall into, and which needs a durable mechanism rather than the store-then-verify
+  watermark read that was designed and REFUTED on THREE independent counts, recorded so a
+  revised version cannot repeat the other two: the watermark is one replaceable record per
+  CLIENT and `recordGenRetirement` advances on `MarkerSeq` alone, so a teardown of one
+  generation can run while the slot names another; the verifying read is not
+  crash-persistent; and the arm it would take does not clear a `Lost` already on the claim.
+  Three candidate closures are named in `docs/CONFORMANCE.md` — completing F-036's
+  stale-serving predicate for the retiring session generation, a retention handoff that
+  keeps proof records independent of the consumer, or a claim-side "PUBREL owed" intent
+  with register-driven recovery;
+  a permanently unreadable claim or a malformed
+  carrier defers the verdict and holds one identifier and one Receive Maximum slot; and
+  an authoritatively ABSENT claim is acknowledged rather than withheld, which is stated
+  as an accepted destructive consequence rather than as fail-closed.
+  **It does NOT close F-064.** It supplies the durable PUBREL → claim association
+  residual 8 names; the owner-independent claim → PUBREL REVERSE lookup that residual 8
+  actually needs is still uncosted, and W-c still routes through nothing available.
 
   - [x] **A saved shared filter that fails restoration at CONNECT is silently
   dropped.** **This was F-050 filed twice** — same mechanism, same consequence, same

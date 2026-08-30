@@ -435,7 +435,7 @@ func testDrainStorePubRelRecord(t *testing.T, sess *mqttSession) uint64 {
 		t.Fatal("no intent-bearing drained sequence to write a PUBREL for")
 	}
 	msgId := mqttPubRelMsgId(idHash, dur, sseq, attempt)
-	natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, dur, sseq, msgId)
+	natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, dur, sseq, msgId, _EMPTY_, _EMPTY_)
 	resp, err := sess.jsa.storeMsg(subject, headerLen, natsMsg)
 	if err != nil {
 		t.Fatalf("storing the correlated PUBREL record: %v", err)

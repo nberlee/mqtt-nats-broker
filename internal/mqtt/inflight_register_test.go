@@ -829,7 +829,7 @@ func TestMQTTInflightRecoveryReservesPubRelIdentifiers(t *testing.T) {
 	// The PUBREL consumer has to exist first: $MQTT_out is interest-retained, so a
 	// store with no interest keeps nothing.
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, srcSeq, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, srcSeq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -892,7 +892,7 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -934,7 +934,7 @@ func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T)
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -5317,7 +5317,7 @@ func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
 
 	// A stored PUBREL for the same source, so the exchange is past PUBREC.
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}

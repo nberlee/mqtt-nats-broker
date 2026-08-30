@@ -1275,7 +1275,7 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("writing the claim: %v", err)
 		}
-		b.asm.recoverQ2AffClaims(idHash, gen)
+		b.asm.recoverQ2AffClaims(idHash, gen, mqttQ2AffProofComplete)
 		got, _, err := b.asm.loadQ2AffClaim(subject)
 		if err != nil {
 			t.Fatalf("loading the claim: %v", err)
@@ -1306,7 +1306,7 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 		if _, err := b.jsa.lookupConsumer(mqttStreamName, groupDur); err != nil {
 			t.Fatalf("this subtest needs a LIVE group consumer, but %q is not there: %v", groupDur, err)
 		}
-		b.asm.recoverQ2AffClaims(idHash, gen)
+		b.asm.recoverQ2AffClaims(idHash, gen, mqttQ2AffProofComplete)
 		got, _, err := b.asm.loadQ2AffClaim(subject)
 		if err != nil {
 			t.Fatalf("loading the claim: %v", err)
@@ -1346,7 +1346,7 @@ func TestQ2AffineRecoveryReapsCompletedButUnreapedClaims(t *testing.T) {
 			t.Fatalf("the copy was not retained; this subtest cannot test what it claims (state=%v)", state)
 		}
 
-		b.asm.recoverQ2AffClaims(idHash, gen)
+		b.asm.recoverQ2AffClaims(idHash, gen, mqttQ2AffProofComplete)
 		got, _, err := b.asm.loadQ2AffClaim(subject)
 		if err != nil {
 			t.Fatalf("loading the claim: %v", err)
@@ -1405,7 +1405,7 @@ func TestQ2AffineLossSurvivesConsumerRecreateAndHandoff(t *testing.T) {
 
 	// Reconcile as a broker that has observed nothing: the consumer is present and
 	// looks healthy, and no in-memory flag from anywhere is consulted.
-	b.asm.recoverQ2AffClaims(idHash, gen)
+	b.asm.recoverQ2AffClaims(idHash, gen, mqttQ2AffProofComplete)
 
 	got, _, err := b.asm.loadQ2AffClaim(subject)
 	if err != nil {
@@ -1453,7 +1453,7 @@ func TestQ2AffineLostClaimIsNotRevisited(t *testing.T) {
 
 	// A resume with an intact consumer: the ordinary path would infer completion
 	// from the absent copy.
-	b.asm.recoverQ2AffClaims(idHash, gen)
+	b.asm.recoverQ2AffClaims(idHash, gen, mqttQ2AffProofComplete)
 
 	got, _, err := b.asm.loadQ2AffClaim(subject)
 	if err != nil {
@@ -6754,7 +6754,7 @@ func TestQ2AffUnattributableClaimIsRefusedButDoesNotWedgeTheAccount(t *testing.T
 
 	// Recovery skips it WITHOUT failing, so an unrelated session's reconciliation is
 	// unaffected.
-	b.asm.recoverQ2AffClaims(idHash, gen)
+	b.asm.recoverQ2AffClaims(idHash, gen, mqttQ2AffProofComplete)
 	if got, _, err := b.asm.loadQ2AffClaim(subject); err != nil || got == nil {
 		t.Fatal("recovery acted on the unattributable claim")
 	}
@@ -6782,7 +6782,7 @@ func TestQ2AffUnattributableClaimIsRefusedButDoesNotWedgeTheAccount(t *testing.T
 	if _, err := b.asm.storeQ2AffClaimCAS(lostSubject, 0, lostClaim); err != nil {
 		t.Fatalf("seeding the claim recovery would mark lost: %v", err)
 	}
-	b.asm.recoverQ2AffClaims(idHash, gen)
+	b.asm.recoverQ2AffClaims(idHash, gen, mqttQ2AffProofComplete)
 	lostAfter, _, err := b.asm.loadQ2AffClaim(lostSubject)
 	if err != nil || lostAfter == nil {
 		t.Fatalf("the claim vanished: %v", err)

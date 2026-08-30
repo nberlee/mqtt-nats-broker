@@ -1539,6 +1539,11 @@ type mqttStoredPubRel struct {
 	pi     uint16
 	srcDur string
 	srcSeq uint64
+	// affRef is the session-affine shared QoS 2 assignment this record proves the
+	// client answered PUBREC for, as a tri-state: absent on every PUBREL that does not
+	// complete an affine copy, malformed on a shape this broker does not write, and it
+	// is the caller's job to keep those two apart.
+	affRef mqttPubRelAffineRef
 }
 
 // mqttPubRelSourceKey keys a source delivery for the indexes built over these
@@ -1576,6 +1581,7 @@ func (sess *mqttSession) scanPubRelRecords(pubRelSubject string) (records []mqtt
 		if corr := mqttParsePubRelCorrelation(smsg.Header); corr.Ok {
 			r.srcDur, r.srcSeq = corr.SrcDur, corr.SrcSeq
 		}
+		r.affRef = mqttParsePubRelAffineRef(smsg.Header)
 		records = append(records, r)
 	}
 }
@@ -1764,7 +1770,9 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 func (sess *mqttSession) recreateDrainPubRel(c *client, idHash, pubRelSubject string, d *mqttDrain, sseq uint64, pi uint16, attempt uint64) error {
 	for i := 0; i < mqttDrainPubRelAttempts; i++ {
 		msgId := mqttPubRelMsgId(idHash, d.cc.Durable, sseq, attempt)
-		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, d.cc.Durable, sseq, msgId)
+		// No affine reference: a DRAINED source is a plain QoS 2 consumer's, never a
+		// shared group's affine copy, so there is no assignment for it to name.
+		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, d.cc.Durable, sseq, msgId, _EMPTY_, _EMPTY_)
 		resp, err := sess.jsa.storeMsg(pubRelSubject, headerLen, natsMsg)
 		if err != nil {
 			return err

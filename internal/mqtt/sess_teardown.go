@@ -52,6 +52,7 @@ package mqtt
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -713,6 +714,85 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 	}
 }
 
+// secureQ2AffPubRelProofs records the PUBREC proof carried by every stored PUBREL of the
+// retiring incarnation onto the assignment it names, before the PUBREL consumer that
+// retains those records is deleted.
+//
+// It runs for an ADOPTED teardown too, and it has to: the adopting broker is the one that
+// will delete the consumer, so it is the one that owes the reconciliation. Everything it
+// does is idempotent — the proof is a monotone fact recorded through the ordinary fenced
+// transition — so a repeated run is a no-op rather than a second effect.
+//
+// FAIL CLOSED on anything it could not establish, with one deliberate exception:
+//
+//   - The walk could not be completed, or a reference named a claim this broker could not
+//     READ: abort the teardown. The condition is transient and the teardown is re-driven,
+//     so the cost is a retry, and proceeding would destroy evidence it could not read.
+//   - A MALFORMED reference proceeds, with a diagnostic. It names no assignment this
+//     broker can identify, so there is nothing to record and no retry that could ever
+//     succeed; failing closed on it would wedge this session's teardown forever, trading
+//     an unbounded liveness loss for a bounded diagnostic one. The claim it cannot name is
+//     still `Discarded` by the walk below, which is what [MQTT-4.8.2-5] permits.
+//
+// No lock held on entry.
+func (sess *mqttSession) secureQ2AffPubRelProofs(t *mqttTeardownTarget) error {
+	as := sess.asm
+	if as == nil || t.idHash == _EMPTY_ || t.gen == _EMPTY_ {
+		return nil
+	}
+	pubRelSubject, _, _ := mqttPubRelNames(t.idHash, t.gen)
+	records, ok := sess.scanPubRelRecords(pubRelSubject)
+	if !ok {
+		return fmt.Errorf("unable to read the stored PUBRELs of session %q before deleting the "+
+			"consumer that retains them: their PUBREC proofs would be destroyed unread", t.id)
+	}
+	s := as.server()
+	for _, r := range records {
+		if r.affRef.refused() {
+			if s != nil {
+				s.Warnf("MQTT: tearing down session %q with a stored PUBREL whose affine QoS 2 "+
+					"reference (claim %q copy %q) is not a shape this broker writes: it names no "+
+					"assignment that can be corrected, so the record is destroyed with its consumer",
+					t.id, r.affRef.Claim, r.affRef.Copy)
+			}
+			continue
+		}
+		if !r.affRef.valid() {
+			continue
+		}
+		claim, cerr := as.q2AffClaimForCarriedCopy(r.affRef.Claim, r.affRef.Copy)
+		if cerr != nil {
+			if errors.Is(cerr, errQ2AffCarriedCopySuperseded) {
+				continue // positively a superseded incarnation; nothing to record
+			}
+			return fmt.Errorf("unable to resolve the affine QoS 2 assignment %q named by a stored "+
+				"PUBREL of session %q before deleting the consumer that retains it: %w",
+				r.affRef.Claim, t.id, cerr)
+		}
+		if claim == nil || claim.PubRecProven {
+			continue // gone, or already durable
+		}
+		if verr := q2AffShapePrecheck(r.affRef.Claim)(claim); verr != nil {
+			if s != nil {
+				s.Warnf("MQTT: tearing down session %q without correcting affine QoS 2 assignment %q: "+
+					"its record is not a shape this broker writes (%v)", t.id, r.affRef.Claim, verr)
+			}
+			continue
+		}
+		if as.proveQ2AffCopyDelivered(r.affRef.Claim, r.affRef.Copy,
+			q2AffShapePrecheck(r.affRef.Claim), func(format string, v ...any) {
+				if s != nil {
+					s.Warnf(format, v...)
+				}
+			}, true) == nil {
+			return fmt.Errorf("unable to record the PUBREC proof of affine QoS 2 assignment %q before "+
+				"deleting the PUBREL consumer of session %q that retains its only evidence",
+				r.affRef.Claim, t.id)
+		}
+	}
+	return nil
+}
+
 // deleteTeardownTargets performs the destructive half of a teardown: everything the
 // retiring incarnation owns alone. Safe to issue late (every name is generation-scoped
 // or per-incarnation unique, so none reaches a fresh incarnation), which is what lets an
@@ -734,6 +814,19 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 		}
 	}
 	if t.pubRelDur != _EMPTY_ {
+		// BEFORE the consumer goes, the PUBREC proofs its records carry are reconciled
+		// into their assignments. Deleting the consumer drops those records with it —
+		// $MQTT_out is interest-retained — and they are the only evidence that the
+		// client answered PUBREC for an assignment recovery may have already marked
+		// Lost. Without this the discard below preserves that Lost, and reapable
+		// refuses the resulting `Lost ∧ Discarded` claim forever: an authoritative
+		// record calling a delivered message lost, permanently.
+		//
+		// This is the same ordering rule as everywhere else in this protocol —
+		// persist the proof before destroying the thing that proves it.
+		if err := sess.secureQ2AffPubRelProofs(t); err != nil {
+			return err
+		}
 		_, err := sess.jsa.deleteConsumer(mqttOutStreamName, t.pubRelDur, noWait)
 		if isErrorOtherThan(err, JSConsumerNotFoundErr) {
 			return fmt.Errorf("unable to delete consumer %q for session %q: %v", t.pubRelDur, t.id, err)

@@ -1834,6 +1834,13 @@ type mqttSession struct {
 	// pendingPubRel maps PIs to JetStream ACK subjects for QoS2 PUBREL
 	// messages pending delivery to the session's client.
 	pendingPubRel map[uint16]*mqttPending
+	// refusedCarriers remembers which PUBREL RECORDS this connection has already
+	// reported as carrying an affine reference this broker does not write, keyed by
+	// (PUBREL durable, stream sequence). A refused carrier is withheld and re-offered by
+	// AckWait forever, so the diagnostic explaining it is said once per record rather
+	// than once per attempt. See noteQ2AffCarrierRefused for why it is keyed by the
+	// record and not by the packet identifier or the pending entry.
+	refusedCarriers map[mqttDeferredKey]struct{}
 
 	// cpending maps delivery attempts (that come with a JS ACK subject) to
 	// existing PIs.
@@ -2589,6 +2596,13 @@ type mqttPending struct {
 	// claim's valid subject would let that claim's own copy be acknowledged away
 	// unpublished (F-065).
 	q2AffCopy string
+	// pubRelAffRef is the affine assignment reference carried by the STORED PUBREL
+	// this entry tracks, read back off the record by mqttDeliverPubRelCb rather than
+	// remembered from the PUBREC. That is what makes it available on a connection that
+	// did not store it — the crash window this whole mechanism exists for — so PUBCOMP
+	// can refuse to acknowledge a PUBREL away while the proof it carries is unrecorded.
+	// Meaningful on pendingPubRel entries only.
+	pubRelAffRef mqttPubRelAffineRef
 
 	// regSeq is the stream sequence of this delivery's durable in-flight register on
 	// $MQTT_inflight, and regNonce the register's immutable identity. Every delete
@@ -10519,6 +10533,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 	sess.drainByDur = nil
 	sess.pendingPublish = nil
 	sess.pendingPubRel = nil
+	sess.refusedCarriers = nil
 	sess.cpending = nil
 	sess.deferred = nil
 	// Retired sources belonged to the discarded incarnation's consumers, which are being
@@ -11688,6 +11703,13 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// pending (a resume may restore no QoS2 subscription, and a placeholder created
 	// at PUBREC may not yet carry an ack subject). Spec5 [MQTT-4.4.0-1].
 	if q2AffGen != _EMPTY_ {
+		// FIRST, and before the consumer work below. Advance every assignment this
+		// incarnation's stored PUBRELs prove the client answered PUBREC for, so the
+		// reconciliation that follows cannot report one of them as a LOST delivery. It
+		// runs here rather than beside recoverQ2AffClaims because it must run even when
+		// affine restoration fails — that is the path on which the reap has no other
+		// owner. See reconcileQ2AffPubRelProofs.
+		proofEvidence := sess.reconcileQ2AffPubRelProofs(c)
 		// Standalone caller, so it opens its own record transaction and passes the
 		// token down. See sess_recordtx.go.
 		tok := sess.beginRecordTx()
@@ -11702,7 +11724,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 			// whose copy is already gone, and reap the ones whose source message no
 			// longer exists. Both would otherwise sit forever, and a stalled claim
 			// makes every contender wait on a winner with nothing left to deliver.
-			sess.asm.recoverQ2AffClaims(sess.idHash, q2AffGen)
+			sess.asm.recoverQ2AffClaims(sess.idHash, q2AffGen, proofEvidence)
 		}
 	}
 
@@ -11757,6 +11779,15 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 // attempt to deliver the PUBREL to record the JS ack subject for it.
 //
 // Lock held on entry
+// pubRelDurable is the PUBREL consumer's durable name, or empty when none is installed.
+// sess.mu must be held.
+func (sess *mqttSession) pubRelDurable() string {
+	if sess.pubRelConsumer == nil {
+		return _EMPTY_
+	}
+	return sess.pubRelConsumer.Durable
+}
+
 func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	if sess.pubRelConsumer == nil {
 		// The cosumer MUST be set up already.
@@ -15015,51 +15046,68 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin s
 // (say) a tiny payload with a short topic is exactly the one an implementation
 // forgets to budget.
 func mqttMaxQoS2FormSize(pp *mqttPublish, delivered int, retained bool) int {
-	// RELEASE form: the delivered form plus the Nats-Msg-Id that makes a repeated
-	// onward store non-duplicating. See qos2_move.go.
-	total := delivered + mqttQoS2MsgIdHeaderMax
-	// HOLD form: the subject-encoded form plus the immutable generation header and
-	// the create-only expected-sequence header. The CAS header is NOT stripped
-	// before storage, so it counts.
-	if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained, _EMPTY_, _EMPTY_) +
-		mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax; hold > total {
-		total = hold
-	}
-	// TERMINAL form: an empty body, so its size does not depend on pp at all — for
-	// a small payload with a short topic it can be the largest. Its failure mode is
-	// the worst available: the onward store succeeds, the commit is rejected for
-	// size, and every retry repeats the delivery.
-	if terminal := mqttQoS2TerminalRecordMax(); terminal > total {
-		total = terminal
-	}
-	// CLAIM form: the release claim written on a sibling of the hold subject before
-	// the onward delivery. Payload-independent like the terminal form, so it too can
-	// dominate for a small payload with a short topic, and the same eternal wedge if
-	// it is not budgeted: the PUBLISH is accepted at PUBREC time and its PUBREL can
-	// then never write the claim it must hold before delivering. See
-	// qos2_release_claim.go.
-	if claim := mqttQoS2ClaimRecordMax(); claim > total {
-		total = claim
-	}
-	// ASSIGNMENT CLAIM form: the shared-subscription election record on
-	// $MQTT_qos2assign. Payload-independent like the two above, so it too can dominate
-	// for a small payload with a short topic, and unbudgeted it wedges the group
-	// durable from the other side — no election can be won, so nothing is ever acked.
-	// See qos2_shared_affine.go.
-	if aff := mqttQ2AffClaimRecordMax(); aff > total {
-		total = aff
-	}
-	// AFFINE form: the copy written when this message is delivered to a shared
-	// subscription at effective QoS 2 and moved onto the chosen session's own
-	// subject. Same class of eternal wedge: the claim never materializes, the group
-	// delivery is never acked, and AckWait retries forever. The subscription
-	// identifier and Retain As Published option that size it belong to a SUBSCRIBE
-	// that has not happened yet, so both are budgeted at their maximum. See
-	// qos2_shared_affine.go.
-	if affine := mqttQ2AffineFormMax(pp, retained); affine > total {
-		total = affine
+	total := 0
+	for _, n := range mqttQoS2FormCandidates(pp, delivered, retained) {
+		if n > total {
+			total = n
+		}
 	}
 	return total
+}
+
+// mqttQoS2FormCandidates is every alternative form a QoS 2 PUBLISH can later be stored
+// as, keyed by name. mqttMaxQoS2FormSize is the maximum over it and nothing else.
+//
+// The candidates are a NAMED SET rather than a chain of `if bigger { total = bigger }`
+// for one reason: which form dominates is header-size dependent and mostly accidental, so
+// a candidate that is currently smaller than another is invisible to any assertion about
+// the maximum. Enumerating them makes "this form is budgeted" a checkable fact
+// independent of whether it happens to win today.
+//
+// ALTERNATIVES, not components. Each is a different record the same PUBLISH may become;
+// none of them coexists with another in one stored message, so they are compared and
+// never summed.
+func mqttQoS2FormCandidates(pp *mqttPublish, delivered int, retained bool) map[string]int {
+	return map[string]int{
+		// RELEASE form: the delivered form plus the Nats-Msg-Id that makes a repeated
+		// onward store non-duplicating. See qos2_move.go.
+		"release": delivered + mqttQoS2MsgIdHeaderMax,
+		// HOLD form: the subject-encoded form plus the immutable generation header and
+		// the create-only expected-sequence header. The CAS header is NOT stripped
+		// before storage, so it counts.
+		"hold": mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained, _EMPTY_, _EMPTY_) +
+			mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax,
+		// TERMINAL form: an empty body, so its size does not depend on pp at all — for
+		// a small payload with a short topic it can be the largest. Its failure mode is
+		// the worst available: the onward store succeeds, the commit is rejected for
+		// size, and every retry repeats the delivery.
+		"terminal": mqttQoS2TerminalRecordMax(),
+		// CLAIM form: the release claim written on a sibling of the hold subject before
+		// the onward delivery. Payload-independent like the terminal form, so it too can
+		// dominate for a small payload with a short topic, and the same eternal wedge if
+		// it is not budgeted: the PUBLISH is accepted at PUBREC time and its PUBREL can
+		// then never write the claim it must hold before delivering. See
+		// qos2_release_claim.go.
+		"release claim": mqttQoS2ClaimRecordMax(),
+		// ASSIGNMENT CLAIM form: the shared-subscription election record on
+		// $MQTT_qos2assign. Payload-independent like the two above, and unbudgeted it
+		// wedges the group durable from the other side — no election can be won, so
+		// nothing is ever acked. See qos2_shared_affine.go.
+		"assignment claim": mqttQ2AffClaimRecordMax(),
+		// AFFINE COPY form: the copy written when this message is delivered to a shared
+		// subscription at effective QoS 2 and moved onto the chosen session's own
+		// subject. Same class of eternal wedge: the claim never materializes, the group
+		// delivery is never acked, and AckWait retries forever. The subscription
+		// identifier and Retain As Published option that size it belong to a SUBSCRIBE
+		// that has not happened yet, so both are budgeted at their maximum.
+		"affine copy": mqttQ2AffineFormMax(pp, retained),
+		// AFFINE PUBREL form: the stored PUBREL that completes an affine copy, which
+		// since the PUBREC proof also NAMES the assignment it completes. Its own
+		// alternative, never folded into the affine copy's bound: the two never coexist
+		// in one stored message, so summing them would reject PUBLISHes no real later
+		// form justifies. See qos2_shared_affine.go.
+		"affine pubrel": mqttQ2AffPubRelFormMax(),
+	}
 }
 
 // Composes a NATS message from a MQTT PUBLISH packet. The message includes an
@@ -16455,7 +16503,20 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			// pubrel_correlation.go.
 			msgId = mqttPubRelMsgId(sess.idHash, srcDur, srcSeq, attempt)
 		}
-		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, srcDur, srcSeq, msgId)
+		// Name the shared QoS 2 ASSIGNMENT this PUBREL completes, as a bound
+		// (claim subject, copy subject) pair. Both are already in hand — they came off
+		// the pending entry a few lines above — so this costs no lookup and no
+		// ordering.
+		//
+		// It is the durable, account-wide evidence that the client answered PUBREC for
+		// this copy, and it is stored HERE, before mqttFinishQ2AffineDelivery records
+		// AffineDone. That order is what creates the window this reference closes: a
+		// broker that stops in between, with the affine consumer then destroyed out of
+		// band, used to leave `materialized ∧ ¬AffineDone ∧ copy absent` and be reported
+		// as a LOST delivery for a message the client had already answered. The PAIR
+		// rather than the claim subject alone, because a claim subject is reused by a
+		// later incarnation. See pubrel_correlation.go and qos2_shared_affine.go.
+		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, srcDur, srcSeq, msgId, q2AffClaim, q2AffCopy)
 		_, err = sess.jsa.storeMsg(sess.pubRelSubject, headerLen, natsMsg)
 		if err != nil {
 			// The in-memory state was advanced BEFORE the store (it has to be:
@@ -16687,18 +16748,45 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 		return
 	}
 
-	var jsAckSubject string
+	// NOTHING IS REMOVED YET. The obligations below are resolved first, and only a
+	// PUBCOMP that will actually acknowledge removes the entry.
+	//
+	// Untracking up front and withholding afterwards destroys the very evidence the
+	// withholding protects: qos12InflightForCap counts pendingPubRel against Receive
+	// Maximum, so a removed-then-withheld entry frees its packet identifier, bumpPI
+	// re-mints it after a wrap, a different PUBREL is tracked under it, and when the
+	// original redelivers mqttDeliverPubRelCb's duplicate branch sees another sequence
+	// on that identifier and acknowledges the original away.
+	var (
+		jsDur      string
+		sseq       uint64
+		affRef     mqttPubRelAffineRef
+		hasPending bool
+	)
 	sess.mu.Lock()
 	if sess.c != c {
 		sess.mu.Unlock()
 		return
 	}
-	jsAckSubject = sess.untrackPubRel(pi)
+	if ack := sess.pendingPubRel[pi]; ack != nil {
+		jsDur, sseq, affRef, hasPending = ack.jsDur, ack.sseq, ack.pubRelAffRef, true
+	}
 	// Does this exchange still hold the ONLY durable evidence that its source is past
 	// PUBREC? Looked up before the ack below, because that ack is what destroys it.
 	retiredKey, insecure := sess.retiredSourceForLocked(pi)
-	deferredNaks := sess.deferredNaksLocked()
 	sess.mu.Unlock()
+
+	// The affine obligation, and the retired-source one below it, are CUMULATIVE: an
+	// "acknowledge" verdict from either does not license the ack on its own.
+	//
+	// A stored PUBREL naming a shared QoS 2 assignment is the durable proof that the
+	// client answered PUBREC for that copy, and on this path it can be the ONLY one
+	// left — the copy is gone and AffineDone was never recorded. Acknowledging it away
+	// with the proof unrecorded is what leaves the owner's next resume free to report a
+	// delivery the client completed as LOST. See reconcileQ2AffPubRelProofs.
+	if hasPending && !sess.dischargeQ2AffPubRelProof(c, pi, mqttDeferredKey{jsDur, sseq}, affRef) {
+		return
+	}
 
 	// A retired source whose register does not yet record the retirement is protected
 	// across a restart only by this exchange's PUBREL record: recovery reads
@@ -16714,17 +16802,141 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 		c.Warnf("MQTT: withholding the acknowledgement of the PUBREL for packet identifier %d of client %q: "+
 			"its retired source %s/%d is not durably recorded yet, and this record is the only other evidence of it",
 			pi, sess.id, retiredKey.jsDur, retiredKey.sseq)
-		for _, subj := range deferredNaks {
-			sess.jsa.sendMsg(subj, AckNak)
-		}
 		return
 	}
+
+	// Both obligations discharged, so the entry may go. RE-VALIDATED first, because the
+	// discharges above ran without the session lock: a teardown can have cleared
+	// pendingPubRel, and a clean start or a takeover can have rebound the session and
+	// re-minted this identifier for a NEW incarnation. Untracking blind there hands back
+	// an empty ack subject, or removes and acknowledges an exchange that is not the one
+	// this PUBCOMP answered.
+	//
+	// An AckWait redelivery of the SAME record is deliberately still allowed through: it
+	// changes the reply subject while (jsDur, sseq) stay put, which is why the subject is
+	// taken from untrackPubRel's return rather than from the copy above.
+	sess.mu.Lock()
+	if sess.c != c {
+		sess.mu.Unlock()
+		return
+	}
+	// Scoped to an exchange that WAS tracked when this PUBCOMP started. With no entry
+	// at all nothing was ever reserved under this identifier, so there is nothing to
+	// lose and the pre-existing behaviour stands.
+	if ack := sess.pendingPubRel[pi]; hasPending &&
+		(ack == nil || ack.jsAckSubject == _EMPTY_ || ack.jsDur != jsDur || ack.sseq != sseq) {
+		sess.mu.Unlock()
+		return
+	}
+	jsAckSubject := sess.untrackPubRel(pi)
+	// Read AFTER the untrack, so it sees the Receive Maximum slot this PUBCOMP just
+	// freed — and only on this path, because a withheld exchange freed nothing.
+	deferredNaks := sess.deferredNaksLocked()
+	sess.mu.Unlock()
 
 	// Send the ack to JS to remove the pending message from the consumer.
 	sess.jsa.sendAck(jsAckSubject)
 	for _, subj := range deferredNaks {
 		sess.jsa.sendMsg(subj, AckNak)
 	}
+}
+
+// noteQ2AffCarrierRefused reports whether the refused-carrier diagnostic is owed for the
+// PUBREL RECORD rec, and records that it has been said. False means this same record was
+// already reported on this connection.
+//
+// Keyed by the record — its PUBREL durable and stream sequence — and NOT by the packet
+// identifier or the pending entry. Two earlier shapes of this bookkeeping each broke on
+// that: an entry-lifetime flag is discarded by every AckWait redelivery, because
+// trackAsPubRel replaces the entry, and an identifier-keyed one lets a genuinely
+// DIFFERENT record inherit another's suppression on the duplicate-delivery path, where
+// several records legitimately share one identifier. The record is the thing the
+// diagnostic is about, so it is what the suppression is keyed by.
+//
+// The set lives for the connection: it is cleared with the session's pending state, and it
+// grows by at most one entry per distinct refused record, which is bounded by the refused
+// records that actually exist.
+func (sess *mqttSession) noteQ2AffCarrierRefused(rec mqttDeferredKey) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if _, said := sess.refusedCarriers[rec]; said {
+		return false
+	}
+	if sess.refusedCarriers == nil {
+		sess.refusedCarriers = make(map[mqttDeferredKey]struct{})
+	}
+	sess.refusedCarriers[rec] = struct{}{}
+	return true
+}
+
+// dischargeQ2AffPubRelProof reports whether the PUBREL for pi may be acknowledged away
+// as far as its shared QoS 2 assignment reference is concerned. False means WITHHOLD:
+// the caller returns without acknowledging and without untracking, so the identifier
+// stays reserved and AckWait redelivers the record, bringing the retry back here.
+//
+// Session lock NOT held on entry: it resolves and writes against JetStream.
+func (sess *mqttSession) dischargeQ2AffPubRelProof(c *client, pi uint16, rec mqttDeferredKey,
+	ref mqttPubRelAffineRef) bool {
+	as := sess.asm
+	switch {
+	case ref.State == mqttPubRelAffineRefAbsent:
+		return true // not an affine exchange; nothing is owed
+	case ref.refused():
+		// A persisted shape this broker does not write. Refused rather than ignored:
+		// the assignment it names cannot be resolved, so acknowledging the record away
+		// would destroy a reference nothing can interpret but which may still be the
+		// only evidence of a delivery.
+		//
+		// Reported ONCE per identifier per connection. AckWait re-offers a withheld
+		// record forever, so warning on every attempt is unbounded output about one
+		// unchanging fact.
+		if sess.noteQ2AffCarrierRefused(rec) {
+			c.Warnf("MQTT: withholding the acknowledgement of the PUBREL for packet identifier %d of client %q: "+
+				"its affine QoS 2 reference (claim %q copy %q) is not a shape this broker writes",
+				pi, sess.id, ref.Claim, ref.Copy)
+		}
+		return false
+	case as == nil:
+		return false
+	}
+	claim, cerr := as.q2AffClaimForCarriedCopy(ref.Claim, ref.Copy)
+	if cerr != nil {
+		if errors.Is(cerr, errQ2AffCarriedCopySuperseded) {
+			// POSITIVELY a superseded incarnation: nothing will ever authorize the copy
+			// this PUBREL was created for, so there is no proof to preserve.
+			return true
+		}
+		c.Warnf("MQTT: withholding the acknowledgement of the PUBREL for packet identifier %d of client %q: "+
+			"its affine QoS 2 assignment %q could not be resolved: %v", pi, sess.id, ref.Claim, cerr)
+		return false
+	}
+	if claim == nil {
+		// The claim is gone. Acknowledging is right, and the argument is POSITIVE rather
+		// than "absence is a fact": with no record there is nothing for a later resume to
+		// report untruthfully, and withholding would wedge this exchange forever on
+		// something that can never reappear.
+		return true
+	}
+	// The shape check runs BEFORE the already-proven short circuit, for the same reason
+	// the resume pass runs it there: a record this broker does not write must be refused
+	// rather than believed, and believing its PubRecProven would release the last
+	// evidence of a delivery on the strength of a shape that cannot be interpreted.
+	if verr := q2AffShapePrecheck(ref.Claim)(claim); verr != nil {
+		c.Warnf("MQTT: withholding the acknowledgement of the PUBREL for packet identifier %d of client %q: "+
+			"its affine QoS 2 assignment %q is not a shape this broker writes: %v", pi, sess.id, ref.Claim, verr)
+		return false
+	}
+	if claim.PubRecProven {
+		return true // already durable
+	}
+	if as.proveQ2AffCopyDelivered(ref.Claim, ref.Copy, q2AffShapePrecheck(ref.Claim), c.Warnf, true) == nil {
+		c.Warnf("MQTT: withholding the acknowledgement of the PUBREL for packet identifier %d of client %q: "+
+			"it is the only evidence that the client answered PUBREC for affine QoS 2 assignment %q, and "+
+			"recording that fact did not land", pi, sess.id, ref.Claim)
+		return false
+	}
+	as.reapQ2AffClaim(c.srv, ref.Claim)
+	return true
 }
 
 // Return the QoS from the given PUBLISH protocol's flags
@@ -17604,6 +17816,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		return
 	}
 	corr := mqttParsePubRelCorrelation(hdr)
+	affRef := mqttParsePubRelAffineRef(hdr)
 
 	// This is the client associated with the subscription.
 	cc := sub.client
@@ -17687,12 +17900,36 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// pending PUBREL must still be forwarded.
 	if existing, ok := sess.pendingPubRel[pi]; ok && existing != nil && existing.jsAckSubject != _EMPTY_ {
 		if sseq, _, _, _, _ := ackReplyInfo(reply); sseq != 0 && existing.sseq != 0 && sseq != existing.sseq {
+			// Read UNDER the lock. pubRelConsumer is written under sess.mu by teardown
+			// and by consumer recreation, so reading it after the unlock below is a data
+			// race — and one that would key this record's bookkeeping by an empty or
+			// replacement durable rather than by the record's own.
+			dupDur := sess.pubRelDurable()
 			sess.mu.Unlock()
+			// The duplicate is DISCHARGED before it is acknowledged, not simply
+			// discarded. Several PUBREL records under one identifier is a supported
+			// stale-broker shape, and this one may carry the only reference to an
+			// assignment DIFFERENT from the tracked entry's — acking it away would
+			// destroy that proof and let a later resume infer a loss for a message the
+			// client answered. Run outside sess.mu, exactly as the PUBCOMP arm does,
+			// and on a refusal leave the record for AckWait to re-offer.
+			if !sess.dischargeQ2AffPubRelProof(cc, pi, mqttDeferredKey{dupDur, sseq}, affRef) {
+				return
+			}
 			sess.jsa.sendAck(reply)
 			return
 		}
 	}
 	sess.trackAsPubRel(pi, reply)
+	// Carry the stored record's own affine reference onto the entry. Read off the
+	// RECORD rather than remembered from the PUBREC, which is the point: the connection
+	// that completes this exchange is usually not the one that stored the PUBREL, and
+	// on that connection the record is the only thing that knows which assignment it
+	// proves. mqttProcessPubComp reads it to decide whether acknowledging this PUBREL
+	// away would destroy the last evidence of a delivery.
+	if ack := sess.pendingPubRel[pi]; ack != nil {
+		ack.pubRelAffRef = affRef
+	}
 	trace := cc.trace
 	sess.mu.Unlock()
 

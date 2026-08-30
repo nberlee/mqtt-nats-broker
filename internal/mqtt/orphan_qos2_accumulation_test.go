@@ -983,7 +983,7 @@ func TestQ2AffResumeSettlesASourcelessClaim(t *testing.T) {
 	e.setGraces(t, 0, 0)
 	idHash, affGen, claimSubject := e.sourcelessFixture(t, "SRCGONE", true, nil)
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	if got := e.claimOn(t, claimSubject); got != nil {
 		t.Fatalf("a claim whose source is authoritatively gone was not settled and reaped: %+v; it would "+
@@ -1002,7 +1002,7 @@ func TestQ2AffResumeSourcelessRuleKeepsAClaimWhoseSourceCouldRedeliver(t *testin
 	e.setGraces(t, 0, 0)
 	idHash, affGen, claimSubject := e.sourcelessFixture(t, "SRCLIVE", false, nil)
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	got := e.claimOn(t, claimSubject)
 	if got == nil {
@@ -1037,7 +1037,7 @@ func TestQ2AffResumeSourcelessRuleFailsClosedOnAnUnreadableCopy(t *testing.T) {
 	e.asm.mu.Unlock()
 	t.Cleanup(func() { e.asm.mu.Lock(); e.asm.testQ2AffCopyLoad = nil; e.asm.mu.Unlock() })
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	got := e.claimOn(t, claimSubject)
 	if got == nil {
@@ -1076,7 +1076,7 @@ func TestQ2AffResumeSourcelessRuleRefusesACopyThatAppeared(t *testing.T) {
 	e.asm.mu.Unlock()
 	t.Cleanup(func() { e.asm.mu.Lock(); e.asm.testQ2AffCopyLoad = nil; e.asm.mu.Unlock() })
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	got := e.claimOn(t, claimSubject)
 	if got == nil {
@@ -1112,7 +1112,7 @@ func TestQ2AffResumeDeclinesTheSourcelessRuleAgainstAFreshMaterialization(t *tes
 	e.asm.mu.Unlock()
 	t.Cleanup(func() { e.asm.mu.Lock(); e.asm.testQ2AffClaimLoad = nil; e.asm.mu.Unlock() })
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	e.asm.mu.Lock()
 	e.asm.testQ2AffClaimLoad = nil
@@ -1144,7 +1144,7 @@ func TestQ2AffResumeSourcelessRuleReapsAnAlreadySettledClaim(t *testing.T) {
 	idHash, affGen, claimSubject := e.sourcelessFixture(t, "SRCSETTLED", true,
 		func(c *mqttQ2AffClaim) { c.Discarded, c.SourceAcked = true, true })
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	if got := e.claimOn(t, claimSubject); got != nil {
 		t.Fatalf("an already-settled claim was left behind: %+v. A no-op advance is a SUCCESS, and treating "+
@@ -1183,7 +1183,7 @@ func TestQ2AffResumeReadsTheCopyLastOnTheSourcelessPath(t *testing.T) {
 		e.asm.mu.Unlock()
 	})
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 	_ = claimSubject
 
 	mu.Lock()
@@ -1231,7 +1231,7 @@ func TestQ2AffResumeSourcelessRuleRefusesAStaleUnsupportedRewrite(t *testing.T) 
 	e.asm.mu.Unlock()
 	t.Cleanup(func() { e.asm.mu.Lock(); e.asm.testQ2AffClaimLoad = nil; e.asm.mu.Unlock() })
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	e.asm.mu.Lock()
 	e.asm.testQ2AffClaimLoad = nil
@@ -1281,7 +1281,7 @@ func TestQ2AffResumeSourcelessReapIsChecked(t *testing.T) {
 		e.asm.mu.Unlock()
 	})
 
-	e.asm.recoverQ2AffClaims(idHash, affGen)
+	e.asm.recoverQ2AffClaims(idHash, affGen, mqttQ2AffProofComplete)
 
 	e.asm.mu.Lock()
 	e.asm.testQ2AffClaimLoad, e.asm.testQ2AffClaimStore = nil, nil
@@ -2204,5 +2204,48 @@ func TestOrphanSweepCheckedReapTreatsAVanishedRecordAsIndeterminate(t *testing.T
 	if deleted(regSeq) {
 		t.Fatal("the register was deleted although the claim VANISHED inside the reaper's own advance. A nil " +
 			"record proves nothing, and reading it as reaped removes this exchange's last reference on no evidence")
+	}
+}
+
+// The sweep's retired-register arm proves the SOURCE is past PUBREC. It does NOT hold a
+// PUBREL bound to this claim incarnation, so it must never write PubRecProven — the one
+// fact that outranks a recorded Lost. If it could, a sweep with no carrier at all would
+// clear a genuine loss verdict and reap the evidence.
+//
+// Asserted on the TRANSITION HISTORY rather than on the final record, because the arm
+// reaps what it settles and a reaped claim cannot be read back.
+//
+// Paired mutation M15b: make settleRetiredAffineRegister's proveQ2AffCopyDelivered call
+// pass pubRecProven = true.
+func TestOrphanSweepRegisterArmNeverProvesPubRec(t *testing.T) {
+	e := testNewOrphanEnv(t, "reg-no-pubrec")
+	e.setGraces(t, 0, 0)
+	claimSubject, _, _, _ := e.testRetiredAffineRegister(t, 21, "REGNOPREC", true,
+		func(c *mqttQ2AffClaim) { c.SourceAcked = true })
+
+	var writes int
+	e.asm.mu.Lock()
+	e.asm.testQ2AffClaimStore = func(subject string, expectSeq uint64, rec *mqttQ2AffClaim) (uint64, error) {
+		if subject == claimSubject && rec != nil {
+			writes++
+			if rec.PubRecProven {
+				t.Errorf("the sweep's register arm wrote a PUBREC proof it does not hold: %+v", rec)
+			}
+		}
+		return e.asm.jsa.storeQ2AffClaimCAS(subject, expectSeq, rec)
+	}
+	e.asm.mu.Unlock()
+	t.Cleanup(func() {
+		e.asm.mu.Lock()
+		e.asm.testQ2AffClaimStore = nil
+		e.asm.mu.Unlock()
+	})
+
+	e.sweepInflight(t, 16)
+
+	// POSITIVE CONTROL: the arm really did transition this claim, so "no PubRecProven"
+	// is a fact about what it wrote rather than about it never running.
+	if writes == 0 {
+		t.Fatal("the sweep never transitioned this claim; the fixture is not on its route")
 	}
 }

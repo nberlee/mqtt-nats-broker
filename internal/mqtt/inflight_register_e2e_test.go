@@ -611,17 +611,22 @@ func TestMQTTInflightUnmarkableRetirementKeepsPubRelEvidence(t *testing.T) {
 	pubRelSubject := sess.pubRelSubject
 	sess.mu.Unlock()
 
-	// Wait for the PUBCOMP to have been processed — observable as the pending PUBREL
-	// going away — and then require the PUBREL RECORD to have survived it. That record is
-	// the evidence the restart below depends on.
-	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
-		sess.mu.Lock()
-		defer sess.mu.Unlock()
-		if _, owed := sess.pendingPubRel[pi]; owed {
-			return fmt.Errorf("the PUBCOMP has not been processed yet")
-		}
-		return nil
-	})
+	// Wait for the PUBCOMP to have been processed, observed as the REDELIVERED PUBREL
+	// arriving on the wire. That is the direct evidence the acknowledgement was withheld,
+	// and it is why it is not observed as the pending entry going away: a withheld
+	// exchange deliberately KEEPS its entry, so the identifier and the Receive Maximum
+	// slot stay reserved. Freeing them and then withholding would let a wrap-around
+	// re-mint track a different PUBREL under this identifier, and mqttDeliverPubRelCb's
+	// duplicate branch would then acknowledge the original — the very record this test is
+	// about — away.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
+	sess.mu.Lock()
+	_, stillReserved := sess.pendingPubRel[pi]
+	sess.mu.Unlock()
+	if !stillReserved {
+		t.Fatal("the withheld exchange released its packet identifier; a redelivery of this same PUBREL " +
+			"can now be acknowledged away as a duplicate of whatever re-minted it")
+	}
 	if _, err := asm.jsa.loadNextMsgFromSeq(mqttOutStreamName, pubRelSubject, 1); err != nil {
 		t.Fatalf("the PUBREL record must be kept while the retirement is not durable: %v", err)
 	}

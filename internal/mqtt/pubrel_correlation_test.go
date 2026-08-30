@@ -20,7 +20,7 @@ func TestPubRelCorrelationRoundTrip(t *testing.T) {
 		srcDur = "abcdef0123456789_XYZ"
 		srcSeq = uint64(987654321)
 	)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, srcDur, srcSeq, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, srcDur, srcSeq, _EMPTY_, _EMPTY_, _EMPTY_)
 	hdr := msg[:hdrLen]
 
 	if got := mqttParsePubRelNATSHeader(hdr); got != pi {
@@ -50,7 +50,7 @@ func TestPubRelUncorrelatedIsUnchanged(t *testing.T) {
 	t.Parallel()
 	const pi = uint16(7)
 	plain, plainLen := mqttNewDeliverablePubRel(pi)
-	got, gotLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_)
+	got, gotLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_, _EMPTY_, _EMPTY_)
 	if string(got) != string(plain) || gotLen != plainLen {
 		t.Fatalf("an uncorrelated PUBREL must be byte-identical to the plain form:\n got %q\nwant %q", got, plain)
 	}
@@ -122,12 +122,12 @@ func TestPubRelMsgIdIdentity(t *testing.T) {
 // client waiting for a PUBREL that will never exist.
 func TestCorrelatedPubRelCarriesMsgIdOnlyWhenAsked(t *testing.T) {
 	t.Parallel()
-	without, wl := mqttNewCorrelatedPubRel(9, "DUR", 3, _EMPTY_)
+	without, wl := mqttNewCorrelatedPubRel(9, "DUR", 3, _EMPTY_, _EMPTY_, _EMPTY_)
 	if got := getHeader(JSMsgId, without[:wl]); len(got) != 0 {
 		t.Errorf("an unasked-for deduplication identity was written: %q", got)
 	}
 	id := mqttPubRelMsgId("hash", "DUR", 3, 2)
-	with, l := mqttNewCorrelatedPubRel(9, "DUR", 3, id)
+	with, l := mqttNewCorrelatedPubRel(9, "DUR", 3, id, _EMPTY_, _EMPTY_)
 	if got := string(getHeader(JSMsgId, with[:l])); got != id {
 		t.Errorf("deduplication identity = %q, want %q", got, id)
 	}
