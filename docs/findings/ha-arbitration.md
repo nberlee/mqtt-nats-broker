@@ -2062,7 +2062,14 @@ in `docs/CONFORMANCE.md`.
   unclearable marker — the accumulation defect, manufactured.
 - **Disposing any copy whose claim is absent, at the gate.** A missing claim record is
   producible by a supported operation (F-066's stream recreation), so an absence never
-  licenses destroying an accepted message.
+  licenses destroying an accepted message. F-066's 2026-08-31 ruling WILL narrow that
+  PRODUCER once its enforcement lands — recreating `$MQTT_qos2assign` alone will then be
+  unsupported and refused, though it is supported today and this refutation holds
+  regardless — but
+  **the refutation does not rest on it**: the rule is that an absence is not a positive
+  fact, and a claim record is also absent to a reader whose load was indeterminate or
+  whose stream reread raced a delete. Do not read the narrowed producer as licence to
+  revive this design.
 - **A reaper-side cleanup.** Its evidence is "absent when I looked, present now" — a
   second stale reading that says nothing about which claim may still authorize the copy.
 - **Withdrawing on "my CAS reported the claim gone or renamed"**, and the same rule
@@ -2156,11 +2163,19 @@ message deliver an OLD payload, because the new incarnation's copy subject diffe
 
 **Title:** Cross-stream identity coupling exists as three ad hoc instances, never as a mechanism
 
-- Status: **Open.** Found by F-033's consequence audit, 2026-08-18, during holistic review.
+- Status: **Open, with the remedy DECIDED and the by-construction route abandoned.** Found
+  by F-033's consequence audit, 2026-08-18, during holistic review. The decision this
+  finding was blocked on was taken by the repository owner on **2026-08-31**: change the
+  supported recovery contract so **all nine broker-owned streams become one recreation
+  unit**, rather than generalising the epoch coupling. **The decision is settled and the
+  enforcement is NOT landed**, so the contract in force today is still the single-stream
+  one the validators print. See "The decision, 2026-08-31" below; the roadmap bullet
+  carries the executable remedy.
 - Classification: HA arbitration architecture / data loss
 - Release treatment: **Alpha blocker.** Every precondition is a recovery procedure this
   broker's own startup error tells the operator to perform, and the messages lost or
-  misdelivered were accepted.
+  misdelivered were accepted. Once the decided remedy LANDS, the procedure that reaches
+  every precondition becomes an unsupported, refused operation; it is supported today.
 - Roadmap section: §0.2 (multi-frontend HA blockers)
 
 ### The finding
@@ -2242,7 +2257,11 @@ defensible observation, and it is the actual finding:
 
 There is no mechanism here to be absent from — only hand-built instances of a pattern nobody
 wrote down. That is why the class produced a new member in each of four consecutive review
-rounds, and why the remedy is a **generalisation** rather than a fourth bespoke coupling.
+rounds, and why a **generalisation** rather than a fourth bespoke coupling was the intended
+remedy. **That intent is SUPERSEDED**: the by-construction attempt at the generalisation was
+abandoned and the remedy is now the all-nine recreation contract — see "The decision,
+2026-08-31". This paragraph states what the sample shows about the CODE, which is unchanged;
+it no longer states what the remedy is.
 
 ### What that costs on the affine path
 
@@ -2280,11 +2299,19 @@ one idea: stamp the referenced stream's incarnation, and refuse to interpret a r
 whose epoch does not match. `$MQTT_teardown` puts the epoch in stream metadata with a
 validator and a paired stop-all message naming both streams as *"one logical unit"*
 (`stream_prereqs.go:481`, `:561`); `$MQTT_willq` carries it per record and compares the
-sequence only when the epochs are equal. Either shape works. What the affine path needs is
-that treatment extended to the four-stream unit above and carried into **every** artifact
-derived from a source sequence — the claim subject, the claim hash and hence the copy
-subject, the copy's `Nats-Msg-Id`, the claim's own `SourceSeq`, the sweep's derived-name
-validator, and `$MQTT_inflight`'s `Dur`/`Seq`/`Q2AffClaim`.
+sequence only when the epochs are equal. Either shape works.
+
+**This section states the remedy that was INTENDED and is now SUPERSEDED**, and it is kept
+because the mechanism it describes is the one the decided remedy generalises rather than
+discards. The intended remedy was that treatment extended to the four-stream unit above and
+carried into **every** artifact derived from a source sequence — the claim subject, the
+claim hash and hence the copy subject, the copy's `Nats-Msg-Id`, the claim's own
+`SourceSeq`, the sweep's derived-name validator, and `$MQTT_inflight`'s
+`Dur`/`Seq`/`Q2AffClaim`. That per-artifact extension is what the by-construction attempt
+tried to close by construction and could not. **The decided remedy keeps the stamp-and-
+refuse idea and moves it up a level**: one recovery epoch over all nine broker-owned
+streams, compared once at startup, so no per-artifact derivation has to carry an epoch at
+all. See "The decision, 2026-08-31".
 
 ### Scope, and the method gap this exposed
 
@@ -2410,7 +2437,7 @@ ending where it began.
 - Discarded `json.Marshal` errors are harmless with today's plain record types and become
   **precondition** on any future change that introduces a fallible marshaler.
 
-**What must be decided before a further attempt**, and it is not a design question:
+**What had to be decided before a further attempt**, and it was not a design question:
 
 1. Accept hand-maintained issuer-origin and sink seeds with strong drift guards and an explicit
    residual — under the current definition of done, F-066 then stays open;
@@ -2421,7 +2448,57 @@ ending where it began.
    generalised — make the affected streams one mandatory recreation unit, or withdraw
    independent single-stream recreation. That is a product and operational-contract decision.
 
-Splitting the finding or shipping a partial mechanism is not among them.
+Splitting the finding or shipping a partial mechanism was not among them, and is not now.
+
+### The decision, 2026-08-31
+
+**Option 4 was taken, at ALL-NINE granularity: every broker-owned `$MQTT_*` stream WILL BE
+one recreation unit, and independent single-stream recreation WILL BE withdrawn — when the
+enforcement lands, which it has not.** The decision is settled; the contract change is
+owed, and until it lands the single-stream procedures the validators print are still the
+supported ones. Ruled by the
+repository owner on the four options and their costs, informed by Codex consult
+`task-mthbq7cn-xtxpjw` and an advisor read that both chose this option. The attribution is
+recorded because this decision was reserved to the owner: no consult could take it on their
+behalf, and the stopped attempt's own record says so.
+
+**Why the fourth option, and why all nine rather than the affine four.** Options 1 and 2
+each require overruling the standing definition of done — option 1's residual is verbatim
+the sentence that blocks discharging this finding — and option 3 ships nothing. Option 4's
+FOUR-STREAM variant inherits the completeness deferral this finding never discharged,
+because the table's "all four together" row is qualified by exactly the census not done. The
+all-nine variant needs no census at all: four attempts to enumerate the IDENTITIES were each
+falsified, but the STREAM SET is a single ordered provisioning table with one loop over it
+(`brokerStreamSpecs`), so the enumerable thing is the streams. That completeness is
+**demonstrable at this HEAD and GUARDED rather than impossible** — the test's nine-name set
+is itself hand-maintained — and saying so is the point, since overclaiming closure is the
+mistake this finding has made four times. `$MQTT_origin` is not a tenth member; it is
+retired state that stays separately refused.
+
+**What the decision does to this finding's mechanism.** The stamp-and-refuse idea survives
+and moves up a level: one recovery epoch over all nine streams, compared once at startup,
+instead of an epoch threaded through every artifact derived from a source sequence. The four
+structural failures the by-construction attempt established — issuer provenance needing a
+hand-authored relation, the route classifier, circular final-sink discovery, and verbatim
+preservation being itself the encoding escape — are why that route was abandoned, not an
+inheritance for a sixth revision of it. Nothing above them needs re-deriving.
+
+**What the decision does NOT buy, stated so no plan claims it.** Once the enforcement
+lands, the hazard becomes unreachable through a SUPPORTED operation rather than eliminated
+— and until it lands it is reachable exactly as this finding describes, since the decision
+alone changes no contract. Every stale-identity path in the table above will still exist in
+the code; what changes is only that no supported procedure will produce the precondition.
+Startup validation remains a snapshot, so a live operator
+deleting a stream behind initialized managers still reaches them, and the all-brokers-
+stopped precondition stays load-bearing. Accepted-data loss when recreating a stream holding
+accepted data is unchanged, and this finding already stated that coupling never fixed it.
+Recovery will become a complete account-level state reset with no partial recovery. And
+the two existing per-pair couplings will state a fact the global epoch also states, so
+they become redundancy-deletion candidates rather than part of the remedy.
+
+The executable remedy — the account-wide preflight, the epoch, the four contract obligations
+it drags in, and the documentation retirements — is carried in this finding's roadmap
+bullet, which is where the work is tracked.
 
 ## F-084: Prove a successor before claiming a takeover
 

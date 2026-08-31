@@ -420,9 +420,14 @@ Two facts from it belong here, because they bear directly on the table above.
 that is operator guidance rather than proof. `$MQTT_sess` and `$MQTT_teardown` name each
 other and are one logical unit; the other seven name themselves alone. But records on
 those seven persist identities other streams issue — sequences, consumer durable names,
-subjects — so recreating one of them strands every surviving reference to it. F-066 owns
-generalising the coupling; what the census adds is that the population is now enumerated
-rather than sampled.
+subjects — so recreating one of them strands every surviving reference to it. **F-066 owns
+that hazard, and its 2026-08-31 decision is to close it by WITHDRAWING the single-stream
+procedure rather than by generalising the coupling**: all nine broker-owned streams will
+become one recreation unit. **That enforcement is NOT landed**, so this paragraph states
+the procedure in force today; the seven single-stream procedures and the wording of every
+validator's recovery text are retired in the same change that lands it, never before.
+What the census adds is that the population is now
+enumerated rather than sampled.
 
 **Scope over that population is anchored to the bridge's INTERPRETATION SURFACE**, not to
 a list of JetStream transitions. A transition is in scope if and only if it can change the

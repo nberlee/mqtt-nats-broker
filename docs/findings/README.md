@@ -53,8 +53,13 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
 - Re-read copy absence after the reaper's own SourceAcked transition.
   Status: Fixed 2026-08-21, guarantee re-scoped. Release treatment: Alpha blocker.
   Details: [F-065](ha-arbitration.md#f-065).
-- Generalise cross-stream identity coupling instead of three ad hoc instances.
-  Status: Open. Release treatment: Alpha blocker.
+- Make all nine broker-owned streams one recreation unit, so no stale cross-stream
+  identity survives a supported recovery.
+  Status: Open, remedy DECIDED 2026-08-31 and enforcement not yet landed. Generalising
+  the coupling was the intended remedy and is ABANDONED. The decision is to withdraw
+  independent single-stream recreation WHEN the enforcement lands; until then the
+  single-stream procedures the validators print remain the supported ones.
+  Release treatment: Alpha blocker.
   Details: [F-066](ha-arbitration.md#f-066).
 - Prove a shared group durable exists before restoring its membership.
   Status: Closed 2026-08-23, guarantee scoped. Release treatment: Alpha blocker.

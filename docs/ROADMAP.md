@@ -687,7 +687,38 @@ further findings it surfaced are filed separately, for the reason its own bullet
   2026-08-30): the stored PUBREL carries a bound `(claim subject, copy subject)` pair
   naming the assignment it completes. It supplies only the direction that item needed,
   PUBREL → claim. A contender needs claim → PUBREL, a reverse lookup over an
-  account-wide subject space, and that is still uncosted — so residual 8 is unchanged. - *The
+  account-wide subject space, and that is still uncosted — so residual 8 is unchanged.
+  **A 2026-08-31 attempt to recost that lookup as cheap was WRONG and is withdrawn; what
+  it established is the real obstacle, so it is recorded rather than deleted.** The
+  attempt claimed the claim's `Winner` and `Gen` are exactly `mqttPubRelNames`' inputs.
+  They are not, and the two generations are **different identities**: the claim's `Gen`
+  is the AFFINE generation — `beginQ2AffOp` returns `sess.q2AffGen` and that is the value
+  stored (`qos2_shared_affine.go`) — while `mqttPubRelNames` namespaces the PUBREL
+  subject, delivery subject and durable by the SESSION incarnation generation `sess.gen`
+  (`sess_incarnation.go`) — the same different-keys fact F-036's bullet records for
+  `refs.hasInbound` versus `refs.hasAffine`. **The mapping is the winner's own record,
+  which carries both `Gen` and `Q2AffGen`, and the costing therefore SPLITS BY RECORD
+  STATE rather than being uniform — a second correction, because a first pass over-read
+  this as "a contender has no derivation" and that is false.** A contender already loads
+  that record: `materializeQ2AffOnBehalf` calls `loadFenceSession(claim.Winner)` and
+  compares `ps.Q2AffGen` against `claim.Gen` (`qos2_shared_affine.go`). So for the
+  **matching-record** population — the one F-064's reference skip is about — `ps.Gen` IS
+  the session generation `mqttPubRelNames` needs and the derivation already exists in
+  the tree, needing no new field. What is NOT derivable is the **absent, indeterminate or
+  mismatched** record, where there is no `Gen` to read; and whether those states belong to
+  residual 8 at all is itself unproven and is the thing to establish before costing
+  anything. Only if they do is the cost a durable recovery-safe mapping from
+  `(Winner, Q2AffGen)` to the owning `Gen`, or an additional persisted reference — priced
+  for those cases alone, not for the population as a whole. The
+  `mqttQ2AffClaim.Gen` field comment reads "winning session's durable generation", which
+  is what misled the attempt; §0.5's comment-corpus sweep gains it. Two facts the attempt
+  did establish and that survive: a filtered walk of ONE PUBREL subject already exists
+  (`unsub_drain.go`) and each PUBREL carries the bound pair (`pubrel_correlation.go`), so
+  the cost is in FINDING the subject, not in scanning it; and the `RWID`/`RetiredSeq`
+  refusal does **not** categorically forbid a new field — that was proportionality
+  against a Reason String and a log line, so a field closing an alpha blocker gets its
+  own cost judgement. Also unproven either way: whether "no matching PUBREL" settles
+  anything, since a late or in-flight store is indistinguishable from an absent one. - *The
   accumulation half* — **PARTLY LANDED.** Under a live generation reference the sweep
   now reaps the claims that are already durably TERMINAL, and collects the retired
   affine `$MQTT_inflight` register class together with the copy and the claim each
@@ -745,6 +776,21 @@ further findings it surfaced are filed separately, for the reason its own bullet
   keeps the box open:** residual 8, and W-c above. Both are argued rather than pending,
   and both have a named route: residual 8 through the `Lost`-truthfulness item's
   PUBREL-carried claim reference, W-c through nothing currently available.
+  **Which bar forbids closing W-c by residual, settled 2026-08-31**, because two wrong
+  citations were offered first: it is neither F-066's coverage ruling nor F-036's scope
+  consult — the first is specific to F-066's interpretation surface and the second
+  adjudicated F-036's own two widened manifestations. The authority is this bullet plus
+  §0's own governance, which prohibits the alpha while any blocker is incomplete.
+  F-036's ruling is strong PRECEDENT for why relabelling a defect as a residual is
+  insufficient, and is cited as precedent only.
+  **This box is NOT the next executable §0.2 item, and that is why lanes keep being
+  redirected off it.** Both remainders are argued: W-c's remedy is refuted with a worked
+  counterexample, and residual 8's reverse lookup is derivable for a matching winner
+  record but not for an absent or mismatched one, as corrected above. The next executable
+  §0.2 item is **F-066**, whose contract ruling landed 2026-08-31. The smallest useful
+  work HERE is establishing which record states residual 8's population actually occupies,
+  since the matching state needs nothing new and only the others could need a persisted
+  reference. That is research, not a plan.
 
   - [x] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
   Split out of F-064; not a conformance defect, so never an alpha blocker. **Done
@@ -1452,10 +1498,13 @@ further findings it surfaced are filed separately, for the reason its own bullet
   `storing` phase marker, an owner-independent disposal on claim absence, a reaper-side
   cleanup, and two compensation designs keyed on which CAS failed.
 
-  - [ ] [F-066:
-  Generalise cross-stream identity coupling](findings/ha-arbitration.md#f-066). **Alpha
-  blocker.** Falsified premise: *recreating one stream is a self-contained recovery
-  procedure*. Durable records persist identities other streams issue — sequences,
+  - [ ] [F-066: Make the nine broker-owned streams one recreation
+  unit](findings/ha-arbitration.md#f-066). **Alpha
+  blocker. The task is ENFORCING that unit and withdrawing independent single-stream
+  recreation — NOT generalising the coupling, which was the intended remedy and is
+  abandoned; see the 2026-08-31 ruling below.** Falsified premise: *recreating one stream
+  is a self-contained recovery procedure*. Durable records persist identities other
+  streams issue — sequences,
   consumer durables, subjects — and `stopAll` names one stream at a time. The dossier
   carries a **verified sample of cross-stream identities — explicitly NOT a census.**
   Four attempts to enumerate the population were each falsified by review, every one a
@@ -1472,10 +1521,14 @@ further findings it surfaced are filed separately, for the reason its own bullet
   and the pattern was never generalised — not even across `$MQTT_sess` itself, since
   `$MQTT_inflight`'s `ClaimSeq` references it and is uncoupled. Every confirmed
   reference to `$MQTT_msgs`, `$MQTT_out`, `$MQTT_qos2assign` and `$MQTT_inflight` is
-  uncoupled. The remedy is a generalisation, not a fourth bespoke coupling.
+  uncoupled. A generalisation was the intended remedy and **is no longer the remedy**;
+  see the ruling below.
   **ATTEMPTED BY CONSTRUCTION AND STOPPED UNRESOLVED, 2026-08-26**, after five
-  non-converging plan-review rounds and no implementation; the box stays open
-  deliberately. The dossier records four structural failures so the next attempt
+  non-converging plan-review rounds and no implementation. **That route is ABANDONED
+  rather than paused** — the ruling below replaces it, and this box is EXECUTABLE work
+  again, so a lane takes it rather than reading the stop as a block. The four structural
+  failures are recorded because they are why the route was abandoned, not as an
+  inheritance for a sixth revision of it. The dossier records them so the next attempt
   inherits them rather than re-deriving them: issuer provenance needs a hand-authored
   relation — the very seed the bar forbids, and `mqttSharedNames` derives a durable
   with no sequence source at all, so the wrong stream's epoch would compile; a route
@@ -1489,13 +1542,87 @@ further findings it surfaced are filed separately, for the reason its own bullet
   machinery the previous revision had introduced, so the fixes were generating the
   findings — rather than on a trend: total findings fell steadily while the structural
   count fell once and then rose in every round after, ending where it began.
-  **What is owed is a decision, not a cleverer design**: accept hand-maintained seeds
-  with drift guards plus a residual (which the standing definition of done says cannot
-  support ticking this box), redefine what closing F-066 permits including an explicit
-  serialization exception, leave it blocked pending a genuinely different construction,
-  or **change the supported recovery contract** so the hazard is eliminated rather than
-  generalised — one mandatory recreation unit, or no independent single-stream
-  recreation. Splitting the finding or shipping a partial mechanism is excluded. The
+  **The decision that was owed is TAKEN, 2026-08-31: change the supported recovery
+  contract, at ALL-NINE granularity. Ruled by the repository owner**, on the four
+  options and their costs, informed by Codex consult `task-mthbq7cn-xtxpjw` and an
+  advisor read that both chose this option — recorded that way because this decision was
+  reserved to the owner and no consult may take it on their behalf. The four options
+  were: accept hand-maintained
+  seeds with drift guards plus a residual; redefine what closing F-066 permits including
+  an explicit serialization exception; leave it blocked pending a genuinely different
+  construction; or change the contract so the hazard is eliminated rather than
+  generalised. Splitting the finding or shipping a partial mechanism was excluded and
+  stays excluded. **Why the fourth, and why ALL NINE rather than the affine four**:
+  options 1 and 2 each require overruling the standing definition of done — option 1's
+  residual is verbatim the sentence that blocks discharge — and option 3 ships nothing;
+  the four-stream variant inherits the undischarged census, because the "all four
+  together" row above is qualified by exactly the census this finding does not claim.
+  The all-nine variant needs no census: four enumeration attempts over IDENTITIES were
+  each falsified, but the STREAM SET is one production provisioning table with one loop
+  over it, so the enumerable thing is the streams. **That completeness is demonstrable
+  at this HEAD and GUARDED rather than impossible** — the test's nine-name set is itself
+  hand-maintained — which is stated rather than glossed, since overclaiming closure is
+  the mistake this finding has made four times. `$MQTT_origin` is not a tenth member; it
+  is retired state that stays separately refused. This is the `$MQTT_teardown`
+  stamp-and-refuse mechanism applied at the granularity that is actually enumerable,
+  not an abandonment of it.
+  **What the box now owns, and it is executable.** (1) An account-wide PREFLIGHT ahead
+  of the per-stream provisioning loop, because `ensureBrokerStream` sees one stream and
+  creates on an absent lookup, so a proper subset is silently reprovisioned before any
+  bundle comparison could exist: look up all nine creating nothing; admit ZERO present
+  (initial creation or a full reset); admit NINE present only when their bundle epochs
+  agree; REFUSE one through eight present; only then enter creation and validation.
+  (2) One recovery epoch stamped into every broker-owned stream's metadata, generalising
+  `mqtt_sess_epoch` — minted by `$MQTT_sess`, copied to `$MQTT_teardown`, compared by
+  its validator — with a mismatch refused. (3) The operator contract in
+  `docs/ARCHITECTURE.md`: enforcement PLUS documentation, because the docs are what
+  define the supported operation. The teardown-only-recreation fixture becomes a
+  startup-refusal fixture rather than disappearing.
+  **Four obligations the contract drags in, none optional.** A first-time provisioning
+  that failed after creating some streams leaves a mixed set the rule then refuses, so
+  that recovery path needs its own stated contract and a test. Concurrent zero-to-nine
+  creation must adopt ONE authoritative epoch before any later stream is created, or two
+  brokers create different subsets under different epochs. `$MQTT_rmsgs` permits
+  `Sources` as supported configuration and default auto-recreation does not reconstruct
+  that topology. And a common epoch detects an incarnation mismatch but does NOT prove
+  nine independently restored snapshots came from one coherent point in time, so the
+  contract covers backup, restore and deletion rather than recreation alone.
+  **Retiring the single-stream recovery guidance is an OBLIGATION OF THIS WORK, and it
+  is stated as a decision procedure rather than a site list**, because a list of named
+  sites is a sample and this finding has already been burned four times by one. The rule:
+  **every surface that tells an operator, a reader or a test what to recreate must name
+  the nine-stream unit**, and a surface prescribing any proper subset is retired in the
+  same change that lands the enforcement — never after it, because between the two the
+  broker refuses the very procedure its own error text prescribes, which turns one bad
+  stream into an unrecoverable account. That span covers executable diagnostics as well
+  as prose: the generic startup refusal and both coupled-unit variants in
+  `stream_prereqs.go`, the session-stream metadata error in `sess_recordtx.go`, the
+  delayed-Will outbox refusal in `will_outbox.go`, the operational notes and the stop-all
+  recovery paragraph in `docs/CONFORMANCE.md`, the recovery guidance in
+  `docs/ARCHITECTURE.md`, and every test asserting the retired wording — the
+  session-manager prerequisite tests affirm it today. Those are INSTANCES, not the set.
+  **Doc changes this also lands with**: retire the `$MQTT_out`-alone residual and the
+  teardown-only admitted recovery from `docs/CONFORMANCE.md`, revisit the
+  cross-incarnation acceptance-fact reasoning (an old-epoch Will can no longer survive
+  beside fresh acceptance facts once `$MQTT_sess` and `$MQTT_willq` always reset
+  together). **Already corrected, and deliberately NOT deferred to the enforcement**:
+  `docs/CONFORMANCE.md` claimed the startup-refusal surface covers "all eleven" streams
+  when the provisioning table's closed set is nine and `$MQTT_origin` is a lookup-only
+  refusal rather than a tenth member. That was false at the time of the ruling and
+  independent of it, so it was fixed with the ruling rather than parked behind work that
+  has not started — a current-state error is never a future change's to carry.
+  **What the ruling does NOT buy, so no plan claims it.** Once the enforcement lands the
+  hazard becomes unreachable through a SUPPORTED operation, not eliminated — and the
+  ruling ALONE changes no contract, so until then it is reachable exactly as this bullet
+  describes: the stale-identity paths remain, and startup validation is a snapshot, so a
+  live operator deleting a stream behind initialized managers still reaches them and the
+  all-brokers-stopped precondition stays load-bearing. Accepted-data loss is unchanged and
+  was never what coupling fixed. Recovery will become a complete account-level state reset
+  with no partial recovery. F-062,
+  F-063 and F-065 are unaffected: their runtime arbitration guarantees stay necessary,
+  and the bundle rule removes only the partial-recreation manifestations. The existing
+  per-pair couplings will state a fact the global epoch also states, which makes them
+  redundancy-deletion candidates rather than part of this work. The
   attempt also corrected the dossier table: the drain `RegSeq` destruction is historical
   (F-034), the "wrong payload" row is closed by F-065's nonce leaving only the claim
   subject, `$MQTT_origin` is gone, and **three rows were never cross-stream at all** —
@@ -1675,10 +1802,16 @@ further findings it surfaced are filed separately, for the reason its own bullet
   clean and **admits empty**, which `docs/CONFORMANCE.md` already states loses every open
   fence. So retire G1, recreate that stream alone, and a stale broker releasing G1's
   surviving hold reads "no watermark" and performs the very post-discard fan-out site 2
-  exists to prevent. This arm must either be conditioned on an intact teardown-stream
+  exists to prevent. **F-066's 2026-08-31 ruling DISSOLVES this arm, once it LANDS**: its
+  precondition is precisely that `$MQTT_teardown` recreated alone is admitted, and under
+  the all-nine recreation unit that is a refused state, so the arm needs neither the
+  partial-recreation residual nor some other durable proof. The dependency is on the
+  ENFORCEMENT, not on the decision, so F-066 is implemented before this is reopened; the
+  owed retirement → recreation → stale-PUBREL fixture becomes a startup-refusal fixture.
+  Absent that landing, the arm must either be conditioned on an intact teardown-stream
   incarnation — carrying that partial-recreation residual into this finding — or require
-  some other durable proof; a retirement → recreation → stale-PUBREL fixture is owed
-  either way. **OPEN 2: the DIFFERENT-generation outcome, and the reason it is open is NOT
+  some other durable proof.
+  **OPEN 2: the DIFFERENT-generation outcome, and the reason it is open is NOT
   that historical per-generation state is necessary** — a draft of this bullet claimed
   that too, and it is unproven. Proceeding on a bare generation mismatch is certainly
   wrong, because the slot is replaced by increasing `MarkerSeq` alone: retire G1, then
@@ -1742,6 +1875,16 @@ further findings it surfaced are filed separately, for the reason its own bullet
   claims are all `Discarded` or `Lost`, so with no transition written it still succeeds
   vacuously and the consumer is deleted with no positive fact — in three cases, including
   a nonterminal claim created after the verification scan.
+  **The order this is attempted in, ruled 2026-08-31.** F-066's enforcement lands first,
+  which dissolves OPEN 1. Then a BOUNDED pre-plan investigation settles exactly two
+  things before any plan is written, because both are what stopped the last attempt
+  rather than anything a plan could absorb: prove or refute OPEN 2's two-dimensional
+  classifier, and decide (a) below — authorize the step-6 affine consumer delete
+  independently of step 2, or remove its destructive arm. Site 1 and the test
+  infrastructure (b) through (e) are then carried into ONE implementation. This is
+  sequencing, **not** a split: the scope ruling that this is one executable item stands,
+  and a bounded investigation that closes neither question leaves the box open rather
+  than licensing a partial mechanism.
   **What is OWED before this is attempted again**, and it is mechanism plus test
   infrastructure rather than another classifier revision: (a) a positive authorization for
   the step-6 affine consumer delete that is INDEPENDENT of step 2, or the outright removal

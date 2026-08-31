@@ -2820,8 +2820,12 @@ recreating the stream; it is not a rolling upgrade.
 Every broker-owned `$MQTT_*` stream is now validated at account-manager
 initialization against the list its own protocol derives (see "Stream
 prerequisites" in `docs/ARCHITECTURE.md`). This extends the startup-refusal
-surface that previously covered five streams to all eleven, with the same
-consequences the `$MQTT_qos2in` precedent established:
+surface that previously covered five streams to **all nine** — the provisioning
+table's closed set, which its own test asserts. Separately, and not as a tenth
+member, the retired `$MQTT_origin` is refused by a **lookup-only** preflight run
+before the provisioning loop, because a table entry with an always-failing
+validator would provision the very stream it refuses. The consequences are the
+ones the `$MQTT_qos2in` precedent established:
 
 - **A nonconforming stream fails broker startup**, with an error naming the
   stream, the offending setting, and the recovery. Nothing is repaired or
@@ -3220,7 +3224,12 @@ stated here rather than left to be inferred:
 head rather than in a footnote. The plan's own rule is that an unproven closure class
 means claiming neither completeness nor that discharge, and the interpretation surface is
 such a class: a guard that catches real drift is not a proof that no drift is possible.
-F-066's remedy depends on the population, so it inherits the same bound.
+F-066's remedy USED TO depend on the population and would have inherited the same bound.
+**It no longer does, as of the 2026-08-31 decision**: the DECIDED remedy, whose enforcement
+is owed and not landed, is the all-nine recreation contract, which is keyed on the STREAM
+set rather than on the identities those streams carry, so an unclosed interpretation
+surface no longer bounds it. The census's own
+undischarged deferral above is unaffected and stands exactly as written.
 
 The reason for stopping there rather than claiming more is the history of this
 enumeration. Four earlier attempts were each falsified as a filter presented as a sweep,
