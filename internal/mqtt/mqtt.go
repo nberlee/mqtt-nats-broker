@@ -761,6 +761,25 @@ func setMQTTTestPubRelDeliveryDelay(h func()) func() {
 	return func() { mqttTestPubRelDeliveryDelayV.Store(prev) }
 }
 
+// mqttTestPubRelWriteBlockV stalls a PUBREL transmission INSIDE its send section —
+// after the identifier is reserved and before the socket write — so a test can hold a
+// duplicate's write open while the client's PUBCOMP for an earlier copy arrives on the
+// read loop. That interleaving is the whole of F-089's primary execution, and without a
+// seam here it is unreachable from a test: the enqueue returns too quickly to be raced,
+// so a fixture would have to call the primitive directly and would then prove nothing
+// about this callback's own wiring.
+var mqttTestPubRelWriteBlockV atomic.Pointer[func()]
+
+func setMQTTTestPubRelWriteBlock(h func()) func() {
+	prev := mqttTestPubRelWriteBlockV.Load()
+	if h == nil {
+		mqttTestPubRelWriteBlockV.Store(nil)
+	} else {
+		mqttTestPubRelWriteBlockV.Store(&h)
+	}
+	return func() { mqttTestPubRelWriteBlockV.Store(prev) }
+}
+
 func setMQTTTestLoadNextMsgHook(h func(stream, subject string, seq uint64) error) func() {
 	prev := mqttTestLoadNextMsgHookV.Load()
 	if h == nil {
@@ -1832,7 +1851,10 @@ type mqttSession struct {
 	pendingPublish map[uint16]*mqttPending
 
 	// pendingPubRel maps PIs to JetStream ACK subjects for QoS2 PUBREL
-	// messages pending delivery to the session's client.
+	// messages pending delivery to the session's client. It is NOT the whole of a
+	// PUBREL's identifier reservation: a PUBCOMP untracks the entry while a duplicate
+	// copy may still be unanswered, and sendsInFlight is what holds the identifier
+	// across that (F-089).
 	pendingPubRel map[uint16]*mqttPending
 	// refusedCarriers remembers which PUBREL RECORDS this connection has already
 	// reported as carrying an affine reference this broker does not write, keyed by
@@ -1870,20 +1892,22 @@ type mqttSession struct {
 	// resume's final-disposition reconciliation in inflight_register.go (F-087 WP2).
 	foreignContested map[mqttDeferredKey]*mqttForeignContest
 
-	// sendsInFlight holds every packet identifier with an active send section, mapped
-	// to that section's token. It is THE authority on whether an identifier may be
-	// re-minted: bumpPI always consults it, and only endSend removes from it.
+	// sendsInFlight holds every packet identifier a transmission still reserves. It is
+	// THE authority on whether an identifier may be re-minted.
 	//
-	// Populated by the PUBLISH send sites ONLY. A PUBREL transmission does not reserve
-	// its identifier yet — F-089, an alpha blocker: a duplicate PUBREL's write can be
-	// blocked while the client's PUBCOMP for an earlier copy frees the identifier, and
-	// the mechanism here is what that fix will reuse.
+	// PRESENCE IS NOT A RESERVATION; sendReservedLocked is. A hold whose write has
+	// returned and whose acknowledgement debt belongs to a connection that is no longer
+	// ours reserves nothing, and a reader that tested presence would strand the
+	// identifier — see mqttSendHold. Every reservation reader asks sendReservedLocked;
+	// the field itself is touched only by that predicate and by the four helpers that
+	// MUTATE a hold (beginSendLocked, beginPubRelSendLocked, endSend,
+	// consumePubRelAckLocked), plus clear()'s sweep.
 	//
 	// Deliberately NOT nilled by clear(): clear() resets last_pi to zero and a reused
 	// session object can mint PI 1 for a new incarnation while the displaced
 	// connection's PI 1 write is still blocked in a synchronous socket write. The
 	// registry is what carries the reservation across the discard (F-087 WP5 class F2).
-	sendsInFlight map[uint16]string
+	sendsInFlight map[uint16]*mqttSendHold
 
 	// inflightWalks counts this session object's register-recovery walks, so a
 	// quarantine can record which walk it predates. See mqttForeignContest.walk.
@@ -2664,6 +2688,44 @@ type mqttPending struct {
 	// durable work (an exact-sequence delete's "already gone" is the existing success
 	// reading). endSend executes it.
 	sendSettle mqttSendSettle
+}
+
+// mqttSendHold is one packet identifier's reservation. The identifier may not be
+// re-minted while the hold is LIVE, and it is live while EITHER condition below holds.
+// The two have different drains and behave differently across a connection change,
+// which is why one hold carries both rather than two registries carrying one each.
+type mqttSendHold struct {
+	// token names the transmission whose write has not returned, empty when none is
+	// out. It drains at endSend, on the transmitting goroutine, so it SURVIVES every
+	// connection transition including a discard (F-087 WP5, class F2).
+	token string
+	// pubCompOwed counts PUBRELs transmitted under this identifier whose PUBCOMP has
+	// not arrived. [MQTT-2.3.1-4] frees a PUBREL's identifier when its acknowledgement
+	// is processed, and for a PUBREL that acknowledgement is the PUBCOMP — not the
+	// write's return, which is only the proxy the PUBLISH side must use because no
+	// acknowledgement has been asked for yet (F-089).
+	pubCompOwed int
+	// owner is the CONNECTION IDENTITY those PUBRELs went out on — c.cid, minted by
+	// srv.gcid.Add(1), so it is monotonic, never reused and never zero for an accepted
+	// connection. A PUBCOMP is only ever processed on the session's CURRENT connection
+	// (mqttProcessPubComp refuses on sess.c != c), so a debt owed to any other
+	// connection can never be answered and must stop holding the identifier the moment
+	// ownership moves.
+	//
+	// A SCALAR, deliberately, not a *client. An inert hold outlives its connection —
+	// that is the whole point of retiring it by predicate rather than at a transition
+	// site — and a pointer here would keep the departed client's entire object graph
+	// (its connection, parse state, account and server references) reachable from a
+	// resident session for as long as that session lives, which for a never-expiring
+	// one is forever. The identity answers the only question asked of it.
+	//
+	// Read through sess.c rather than dropped at named transition sites, because the
+	// sites cannot be enumerated safely: clear() never assigns sess.c at all, a
+	// persistent-session disconnect never calls clear(), and the clean-start window
+	// runs clear() while the displaced client is still bound. A debt dropped at clear()
+	// would leak on the first and free an identifier the client still holds on the
+	// third.
+	owner uint64
 }
 
 // mqttSendSettleKind names the continuation a removal path owes an entry whose send
@@ -10647,6 +10709,12 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// generation-scoped reap owns them, and a new incarnation must not inherit a decline
 	// for a source it never contested (F-087 WP2).
 	sess.foreignContested = nil
+	// Hygiene, not a drain. Holds that reserve nothing are dropped so the registry stays
+	// bounded; the ones that still reserve something are left exactly as they are. This
+	// deliberately does NOT retire a PUBREL's acknowledgement debt: sess.c is untouched
+	// here, so on the clean-start path the displaced client is still bound and its debt
+	// is still holding an identifier the client itself still holds (F-089).
+	sess.sweepDeadSendHoldsLocked()
 	sess.mu.Unlock()
 
 	target := &mqttTeardownTarget{
@@ -10880,12 +10948,13 @@ func (sess *mqttSession) bumpPI() uint16 {
 
 		_, usedInPublish := sess.pendingPublish[next]
 		_, usedInPubRel := sess.pendingPubRel[next]
-		// ALWAYS consulted, not only after a discard: an identifier whose write has not
-		// returned may have no entry at all — a successful PUBREC replaces the PUBLISH
-		// entry with a PUBREL one, and clear() removes both while the socket write is
-		// still blocked — so the registry, not the maps, is what says an identifier is
-		// still in use by a transmission (F-087 WP5).
-		_, usedInSend := sess.sendsInFlight[next]
+		// ALWAYS consulted, not only after a discard: an identifier a transmission still
+		// reserves may have no entry at all — a successful PUBREC replaces the PUBLISH
+		// entry with a PUBREL one, clear() removes both while the socket write is still
+		// blocked, and a PUBCOMP untracks the PUBREL entry while a duplicate copy is
+		// still unanswered — so the registry, not the maps, is what says an identifier
+		// is still in use (F-087 WP5, F-089).
+		usedInSend := sess.sendReservedLocked(next)
 		if !usedInPublish && !usedInPubRel && !usedInSend {
 			sess.last_pi = next
 			avail = true
@@ -16768,6 +16837,14 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 		sess.mu.Unlock()
 		return
 	}
+	// The acknowledgement [MQTT-2.3.1-4] frees a PUBREL's identifier at has now been
+	// received, so the debt it answers is consumed HERE — before the obligations below,
+	// which decide whether the RECORD may be acknowledged and can withhold. Those are
+	// different questions: a withheld PUBCOMP costs a PUBREL redelivery, and that
+	// redelivery's own send section re-incurs the debt, so the accounting stays exact
+	// across any number of retries. Deferring the consume below the gates instead makes
+	// a withheld exchange double-count and never release its identifier (F-089).
+	sess.consumePubRelAckLocked(c, pi)
 	if ack := sess.pendingPubRel[pi]; ack != nil {
 		jsDur, sseq, affRef, hasPending = ack.jsDur, ack.sseq, ack.pubRelAffRef, true
 	}
@@ -17920,6 +17997,20 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 			return
 		}
 	}
+	// THE SEND SECTION. mqttEnqueuePubResponse is a synchronous socket write with no
+	// deadline, so between here and its return a PUBCOMP for an EARLIER copy of this
+	// same PUBREL can free the identifier and bumpPI can re-mint it — a new PUBLISH
+	// queued under an identifier whose PUBREL bytes are still going out. Opened in the
+	// SAME critical section as the tracking below, so nothing can free the identifier
+	// between deciding to transmit and reserving it (F-089).
+	sendTok, sendOK := sess.beginPubRelSendLocked(cc, pi)
+	if !sendOK {
+		// A transmission is already out under this identifier. Return WITHOUT
+		// acknowledging: the record stays pending and AckWait re-offers it once that
+		// write has returned, the same cost trackPublish's regPending decline accepts.
+		sess.mu.Unlock()
+		return
+	}
 	sess.trackAsPubRel(pi, reply)
 	// Carry the stored record's own affine reference onto the entry. Read off the
 	// RECORD rather than remembered from the PUBREC, which is the point: the connection
@@ -17933,6 +18024,13 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	trace := cc.trace
 	sess.mu.Unlock()
 
+	// Armed BEFORE the enqueue: the registry's "only endSend clears the token"
+	// invariant must not depend on no early return and no recovered panic appearing in
+	// between.
+	defer sess.endSend(cc, pi, sendTok)
+	if h := mqttTestPubRelWriteBlockV.Load(); h != nil {
+		(*h)()
+	}
 	cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
 }
 

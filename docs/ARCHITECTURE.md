@@ -4887,30 +4887,72 @@ The invariants, in the order they matter:
   result describes a contest this quarantine is not part of, so applying it would dispose
   of the quarantine on evidence predating it and free the identifier while the rival
   register still stands.
-- **A transmission holds its identifier until the write returns.** `queueOutbound` is a
-  synchronous socket write with no deadline, so between the tracking decision and its
-  return a teardown, a subscribe denial, a recovery apply, a terminal acknowledgement or
-  a session discard could free the identifier and the allocator could re-mint it — two
-  PUBLISHes under one identifier, in order, on one socket. Every JETSTREAM-BACKED QoS 1/2
-  PUBLISH transmission therefore runs inside a SEND SECTION — the two delivery-callback
-  send sites. Two identifier-bearing transmissions are NOT covered, both filed: the
-  **PUBREL** transmission (F-089, an alpha blocker in its own right), and a **retained**
-  QoS 1/2 message, which allocates its identifier through `trackPublishRetained`, builds
-  its frame directly and is flushed by a later `queueOutbound` with no section (F-091).
-  (The argument that once excluded the PUBREL half — that a PUBCOMP cannot precede its
-  PUBREL's completed write on one connection — is FALSE for a redelivery whose earlier
-  copy the client already answered.) The authority is a session-level registry of
-  identifier-to-token rather than the entry: a successful PUBREC replaces the PUBLISH
-  entry with a PUBREL one while the write may still be blocked, so per-entry state alone
-  would strand the identifier. The allocator always consults the registry, only the
-  section's own end removes from it, and the registry deliberately survives a session
-  discard — `clear()` resets the identifier counter to zero while the displaced
-  connection's write is still in the socket. A removal path that meets an active section
-  CONDEMNS the entry instead of deleting it, parking the continuation it owes; the first
-  parked disposition wins, because every continuation is idempotent against another
-  remover's durable work. Terminal acknowledgements park their identifier-freeing half
-  (their protocol answer is unaffected), while a successful PUBREC needs no transfer
-  machinery at all, the registry holding the identifier however the entries move.
+- **A transmission holds its identifier until it is no longer owed.** `queueOutbound`
+  is a synchronous socket write with no deadline, so between the tracking decision and
+  its return a teardown, a subscribe denial, a recovery apply, a terminal
+  acknowledgement or a session discard could free the identifier and the allocator could
+  re-mint it — two packets under one identifier, in order, on one socket. Every
+  JETSTREAM-BACKED QoS 1/2 **PUBLISH** transmission and every **PUBREL** transmission
+  therefore runs inside a SEND SECTION. One identifier-bearing transmission is NOT
+  covered and is filed: a **retained** QoS 1/2 message, which allocates through
+  `trackPublishRetained`, builds its frame directly and is flushed by a later
+  `queueOutbound` with no section (F-091).
+  The authority is a session-level registry of identifier-to-hold rather than the entry:
+  a successful PUBREC replaces the PUBLISH entry with a PUBREL one while the write may
+  still be blocked, and a PUBCOMP untracks the PUBREL entry while a duplicate copy is
+  still unanswered, so per-entry state alone would strand the identifier. The registry
+  deliberately survives a session discard — `clear()` resets the identifier counter to
+  zero while the displaced connection's write is still in the socket.
+- **A hold has TWO release conditions, and PRESENCE IN THE REGISTRY IS NOT A
+  RESERVATION.** A *write that has not returned* is the only fact available on the
+  PUBLISH side, because at that point no acknowledgement has been asked for yet. On the
+  PUBREL side the real event is available and it is the one [MQTT-2.3.1-4] names: the
+  identifier is free once the corresponding acknowledgement has been processed, which
+  for a PUBREL is its PUBCOMP. So a hold also counts the PUBRELs transmitted under that
+  identifier whose PUBCOMP has not arrived, and releasing on the write's return alone
+  leaves the *second-order* case open — the client answers the duplicate later, and that
+  stray PUBCOMP acknowledges away a re-minted exchange's PUBREL record, destroying the
+  evidence that it is past PUBREC (F-089, the same severity class as F-088).
+  The two halves differ across a connection change, which is why one hold carries both:
+  the write drains at `endSend` on the transmitting goroutine and survives every
+  transition, while a PUBCOMP is only ever processed on the session's CURRENT connection,
+  so a debt owed to any other connection can never be answered.
+- **The acknowledgement debt is OWNED by a connection identity and read through
+  `sess.c`, not dropped at named transition sites.** The identity is the connection's
+  `cid`, a monotonic never-reused scalar — deliberately not a client pointer, because an
+  inert hold outlives its connection by design and a pointer would keep the departed
+  client's whole object graph reachable from a resident session for as long as that
+  session lives, which for a never-expiring one is forever. A ZERO identity is refused
+  rather than recorded, so no hold can carry one: zero means uninitialized, and two
+  uninitialized connections would be indistinguishable to every ownership comparison.
+  The sites cannot be enumerated safely: `clear()`
+  never assigns `sess.c` at all, a persistent-session disconnect nils `sess.c` and never
+  calls `clear()`, and the clean-start path runs `clear()` while the displaced client is
+  still bound. A debt dropped at `clear()` would therefore leak forever on a
+  never-expiring session and free an identifier the client still holds on a clean start.
+  Read through `sess.c` instead, a debt stops reserving at exactly the moment its
+  PUBCOMP stops being processable, at any of the seven `sess.c` writers. A retransmission
+  on the next connection RESETS a dead predecessor's count rather than adding to it, or
+  the one PUBCOMP the client owes could never clear a count of two.
+  Because presence is not a reservation, an *inert* hold — no write out, no debt of ours
+  — reserves nothing, and a reader that met one and refused would strand the identifier,
+  its register and a Receive Maximum slot for the session's life. Such a hold is TAKEN
+  OVER, never refused, and dropping it loses nothing precisely because it reserved
+  nothing. `clear()`'s sweep is bounded-memory hygiene on that basis and nothing rests on
+  it. The rule is enforced as an ownership boundary rather than a habit: the registry is
+  touched only by the liveness predicate and the four helpers that mutate a hold, and
+  every other reader asks `sendReservedLocked`.
+- **A removal path that meets an active section CONDEMNS the entry** instead of deleting
+  it, parking the continuation it owes; the first parked disposition wins, because every
+  continuation is idempotent against another remover's durable work. Terminal
+  acknowledgements park their identifier-freeing half (their protocol answer is
+  unaffected), while a successful PUBREC needs no transfer machinery at all, the registry
+  holding the identifier however the entries move. A PUBCOMP parks nothing and defers
+  nothing: a PUBREL has no in-flight register — the identifier's durable authority moved
+  to the PUBREL record at the PUBREC handoff (R2) and the register was deleted there — so
+  the only durable act it owes is acknowledging that record, and doing so while a
+  duplicate write is out is both safe and preferable, since the client has answered and
+  the ack stops further redeliveries.
 
 A session discard removes the retiring incarnation's registers with a **bounded reap**
 rather than arbitrating each one as the inbound hold walk does: on the discarding broker

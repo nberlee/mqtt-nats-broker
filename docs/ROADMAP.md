@@ -2074,31 +2074,56 @@ takeover.
   escalation consults and one user reopening are recorded in `~/.claude/lanes/f-087/`;
   22 mutations were applied and each killed its paired test.
 
-- [ ] [F-089: A PUBREL transmission must hold its packet identifier until the write
-  returns](findings/ha-arbitration.md#f-089-a-pubrel-transmission-must-hold-its-packet-identifier-until-the-write-returns).
-  **Alpha blocker, unconditional. Filed 2026-08-30 by F-087's holistic review** (round 3;
-  scope settled by that lane's `DECISIONS.md` D6 — pre-existing, the path untouched by
-  F-087, and D2's uniform-repair rule). F-087 closed this race on the PUBLISH side with
-  the `sendsInFlight` registry; the PUBREL write is not covered.
-  `mqttDeliverPubRelCb` calls `trackAsPubRel`, releases `sess.mu`, and performs the
-  deadline-free socket write with no reservation, while `mqttProcessPubComp`'s
-  `untrackPubRel` (`mqtt.go:11784`) frees the identifier with no send-section check and no
-  park. **The execution:** a duplicate PUBREL is being written — routine, via the PUBREL
-  consumer's AckWait redelivery or `resendPendingRedelivery`'s NAKs — when the client's
-  PUBCOMP for an EARLIER copy arrives on the read loop; the identifier is freed and
-  `bumpPI` can re-mint it for a new PUBLISH while the PUBREL write still holds it
-  ([MQTT-2.3.1-4]). **Second-order, and worse:** the duplicate PUBREL's own second PUBCOMP
-  can then arrive while the NEW exchange's PUBREL is pending on that identifier and
-  acknowledge away the new exchange's completion evidence — an acknowledgement bound to
-  the wrong message, the same severity class as F-088. **The argument that once excluded
-  this is RETRACTED**: "a PUBCOMP cannot precede its PUBREL's completed write on one
-  connection" holds only for a FIRST transmission, never for a redelivery. Acceptance: a
-  phase-agnostic reservation around identifier-bearing PUBREL writes; PUBCOMP parks its
-  identifier-freeing continuation while one is active; the drain's confirmed-PUBREL
-  release (I2b) and the `drainedPubRel` do-nothing arm are reconciled with it; and
-  `TestMQTTInflightEveryQoS12SendIsReserved` is extended past
-  `mqttEnqueuePublishMsgTo` to the PUBREL enqueue, plus a behavioral test with a blocked
-  duplicate PUBREL, a concurrent PUBCOMP, and identifier re-mint.
+- [x] [F-089: A PUBREL transmission must hold its packet identifier until its
+  PUBCOMP](findings/ha-arbitration.md#f-089-a-pubrel-transmission-must-hold-its-packet-identifier-until-the-write-returns).
+  **Alpha blocker, unconditional — done 2026-08-30**, after five plan-review rounds.
+  Filed by F-087's holistic review (round 3); scope settled by that lane's `DECISIONS.md`
+  D6. `mqttDeliverPubRelCb` called `trackAsPubRel`, released `sess.mu` and performed a
+  deadline-free socket write with nothing reserving the identifier, while
+  `mqttProcessPubComp`'s `untrackPubRel` freed it with no send-section check.
+  **The Acceptance shape in the dossier was REFUTED and must not be re-derived.** It
+  asked for F-087's PUBLISH shape verbatim — a write-return section plus a PUBCOMP park.
+  That closes the primary race and leaves the SECOND-ORDER one open, which is the one
+  the dossier calls worse: `endSend` frees the identifier the moment the write returns,
+  and the duplicate's own later PUBCOMP then acknowledges away a re-minted exchange's
+  PUBREL record. The park is also machinery the PUBREL side does not need — a PUBREL has
+  no in-flight register, its durable authority having moved to the PUBREL record at the
+  PUBREC handoff (R2), so PUBCOMP defers nothing and acking the record while a duplicate
+  write is out is preferable, not merely safe.
+  **What landed instead:** one hold on F-087's existing registry with TWO release
+  conditions — the write has returned, AND every PUBREL transmitted under that identifier
+  has been PUBCOMPed, which is the event [MQTT-2.3.1-4] actually names. The two differ
+  across a connection change, so the hold carries both.
+  **The acknowledgement debt is OWNED by a connection and read through `sess.c`**, not
+  dropped at named transition sites. Review round 1 proved the sites cannot be enumerated
+  safely: `clear()` never assigns `sess.c` at all, a persistent-session disconnect nils
+  it and never calls `clear()`, and the clean-start path runs `clear()` while the
+  displaced client is still bound — so dropping the debt there leaks forever on a
+  never-expiring session and frees an identifier the client still holds on a clean start.
+  A retransmission RESETS a dead predecessor's count rather than adding to it. The
+  ownership identity is the connection's `cid`, a monotonic never-reused scalar rather
+  than a client pointer: an inert hold outlives its connection by design, so a pointer
+  would pin the departed client's entire object graph to a resident session; a ZERO
+  identity is refused rather than recorded, so no hold can carry one and no ownership
+  comparison can be satisfied by two defaults. Found by
+  the holistic review, which also strengthened both AST guards (pairing counted ACROSS
+  classes, allow-list entries qualified by receiver type) and replaced a synchronous
+  fixture with one that blocks a real transmission through `mqttDeliverPubRelCb` at a
+  new in-section seam.
+  **PRESENCE IN THE REGISTRY IS NOT A RESERVATION**, and round 2 found the tombstone that
+  makes this a rule rather than a habit: `beginSendLocked` refused on presence, so an
+  inert hold `bumpPI` was willing to hand out stranded the identifier, its register and a
+  Receive Maximum slot for the session's life. An inert hold is TAKEN OVER, every reader
+  goes through `sendReservedLocked`, and an AST ownership-boundary guard stops a new
+  reader appearing outside that API. `clear()`'s sweep is hygiene and nothing rests on it.
+  The structural guard is rebuilt on the AST over every non-test file in the package: it
+  selects calls, resolves a simple local alias of the packet-type constant, and requires
+  the deferred `endSend` to LEXICALLY PRECEDE each enqueue, paired one-to-one.
+  **Residual, in `docs/CONFORMANCE.md`:** a PUBREL whose enqueue is suppressed for
+  exceeding the client's Maximum Packet Size (unreachable for a connected client) owes a
+  PUBCOMP that never comes, holding one identifier for the rest of that connection.
+  F-091 stays open and separate — a retained send allocates through a different site, has
+  no pending entry, and uses neither enqueue helper.
 
 - [ ] **F-091: a retained QoS 1/2 send does not reserve its packet identifier.** Filed
   2026-08-30 by F-087's holistic review (round 7). NOT an alpha blocker on its own
@@ -2573,6 +2598,24 @@ finding with acceptance criteria.
   clean `HEAD` worktree against 1/10 on its own tree, i.e. the flake is pre-existing and load-sensitive
   rather than attributable to any change; that measurement is further evidence for the same
   rival-create signature, not a second finding.
+
+- [ ] **Attribute `TestSharedDenyDoesNotConsumeForAllowedMembers`'s intermittent failure.**
+  Filed 2026-08-30 by the F-089 lane, which met it once in a full-suite run and then
+  measured it rather than guessing. **Pre-existing and NOT attributable to that change:**
+  interleaved repetition of the test alone gave **2/12 on the F-089 tree against 1/12 on a
+  clean `HEAD` worktree**, so it fails without the change at a comparable rate; F-089 also
+  cannot reach it, because with no PUBREL debt anywhere in the flow `sendReservedLocked` is
+  semantically identical to the registry-presence test it replaced. Isolated single runs
+  pass on both arms (3/3 each), so it is load-sensitive.
+  The assertion that fails is `authz_affine_test.go:494` — *an allowed shared member
+  joining after a DENIED member was offered the group message must still receive it: a
+  terminal ACK on the deny destroyed it*. **Whether that is a fixture premise or a real
+  broker race is exactly what is unestablished**, and the two have different
+  classifications: a deny path that terminally acknowledges a group message another member
+  is entitled to would be a data-loss defect and an alpha blocker, while a fixture that
+  races the join against the deny is release verification. Do not assume the F-070 shape —
+  that one was proven a fixture premise, and reasoning by analogy is what this bullet
+  exists to prevent. Establish the mechanism against a baseline before classifying it.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 

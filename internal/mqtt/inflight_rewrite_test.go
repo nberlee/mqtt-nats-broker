@@ -20,7 +20,9 @@ import (
 	"go/token"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // F-087: every retargeted CAS on $MQTT_inflight rebuilds from the record it just read.
@@ -931,53 +933,315 @@ func TestMQTTInflightPubAckParksThroughTheAckPath(t *testing.T) {
 	}
 }
 
-// Every JETSTREAM-BACKED QoS 1/2 PUBLISH transmission is inside a send section — asserted
-// STRUCTURALLY, over the source, because the property is about the call sites rather than
-// about one execution.
-//
-// Two identifier-bearing transmissions are outside this guard, both filed rather than
-// glossed. The PUBREL transmission does not reserve its identifier (F-089). And a
-// RETAINED QoS 1/2 message allocates an identifier through trackPublishRetained, builds
-// its frame directly, and is flushed by a later queueOutbound with no section at all
-// (F-091) — this guard cannot see it because it matches the delivery callbacks' enqueue
-// helper, and the retained path does not use it. Named here so the scope reads as two
-// known holes rather than as coverage.
+// Every identifier-bearing transmission is inside a send section — asserted
+// STRUCTURALLY, over the package's own syntax tree, because the property is about the
+// call sites rather than about any one execution.
 //
 // A behavioral test can only cover the sites it happens to drive, and this is exactly
 // the class of defect that reappears at whichever site the last review did not name: a
-// new delivery path that enqueues a PUBLISH under an allocated identifier without
-// reserving it re-opens the stale-send race in full. The identifier-carrying enqueues
-// are the closed set here; the QoS 0 ones (pi == 0) allocate nothing and are excluded by
-// the same rule that keeps retained sends outside the register invariants (R6).
+// new delivery path that enqueues under an allocated identifier without reserving it
+// re-opens the stale-send race in full.
+//
+// WHAT THIS PROVES, and what it does not. It binds every identifier-bearing call to
+// mqttEnqueuePublishMsgTo and to the two PUBREL response helpers to a send section
+// whose endSend is deferred BEFORE the call. It does NOT prove that some future code
+// path could not frame a packet by hand, and it does not resolve an alias that crosses
+// a function boundary. One identifier-bearing transmission is deliberately outside it:
+// a RETAINED QoS 1/2 message allocates through trackPublishRetained, builds its frame
+// directly and is flushed by a later queueOutbound with no section at all (F-091),
+// which this guard cannot see because the retained path uses neither helper.
+//
+// The QoS 0 enqueues (a literal 0 identifier) allocate nothing and are excluded by the
+// same rule that keeps retained sends outside the register invariants (R6). The skip is
+// COUNTED and asserted nonzero: a selector that quietly matched nothing would otherwise
+// look exactly like a clean pass.
 func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 	t.Parallel()
-	for _, file := range []string{"mqtt.go", "qos2_shared_affine.go"} {
-		src, err := os.ReadFile(file)
+	type siteClass struct {
+		what     string
+		callee   string
+		piArg    int    // index into call.Args of the packet identifier
+		typeArg  int    // index of the packet-type argument, or -1 when the callee implies it
+		begin    string // the reservation this class must open
+		wantSkip bool   // whether a literal-zero identifier is a legitimate skip here
+	}
+	classes := []siteClass{
+		{"a QoS 1/2 PUBLISH", "mqttEnqueuePublishMsgTo", 2, -1, "beginSendLocked", true},
+		// The response helpers carry every acknowledgement type, so the packet type is
+		// what selects a PUBREL. Only a PUBREL bears an identifier the SERVER still owns
+		// — a PUBACK, PUBREC or PUBCOMP answers one the CLIENT owns and reserves nothing.
+		{"a PUBREL", "mqttEnqueuePubResponse", 1, 0, "beginPubRelSendLocked", false},
+		{"a PUBREL", "mqttEnqueuePubResponseReason", 1, 0, "beginPubRelSendLocked", false},
+	}
+	found := map[string]int{}
+	skipped := 0
+
+	for _, file := range testMQTTProductionFiles(t) {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, file, nil, 0)
 		if err != nil {
-			t.Fatalf("read %s: %v", file, err)
+			t.Fatalf("parse %s: %v", file, err)
 		}
-		lines := strings.Split(string(src), "\n")
-		found := 0
-		for i, line := range lines {
-			if !strings.Contains(line, "mqttEnqueuePublishMsgTo(cc, sub, pi,") {
-				continue // a QoS 0 enqueue, or the definition itself
+		for _, decl := range f.Decls {
+			fn, _ := decl.(*ast.FuncDecl)
+			if fn == nil || fn.Body == nil {
+				continue
 			}
-			found++
-			start := max(0, i-40)
-			window := strings.Join(lines[start:i], "\n")
-			if !strings.Contains(window, "beginSendLocked(cc, pi,") {
-				t.Errorf("%s:%d enqueues a QoS 1/2 PUBLISH outside a send section: the identifier can be "+
-					"freed and re-minted while the write is blocked", file, i+1)
+			// Collect the reservation landmarks of this function once, with positions:
+			// ordering is the property, not mere presence. A defer placed AFTER the
+			// enqueue leaves the window open on an early return or a recovered panic,
+			// and a presence-only check passes it.
+			beginPos := map[string]token.Pos{}
+			var deferEndSend token.Pos
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				switch v := n.(type) {
+				case *ast.CallExpr:
+					if name := testCalleeName(v); name != _EMPTY_ {
+						if _, seen := beginPos[name]; !seen {
+							beginPos[name] = v.Pos()
+						}
+					}
+				case *ast.DeferStmt:
+					if testCalleeName(v.Call) == "endSend" && deferEndSend == token.NoPos {
+						deferEndSend = v.Pos()
+					}
+				}
+				return true
+			})
+
+			// Sites are collected ACROSS every class before any pairing decision. Per
+			// class is not enough: one PUBLISH and one PUBREL in a single function
+			// would each be alone in its own class and would then share the function's
+			// one begin/defer landmark, which is exactly the second-unreserved-enqueue
+			// evasion this pairing exists to close.
+			type enqueueSite struct {
+				call *ast.CallExpr
+				cl   siteClass
 			}
-			if !strings.Contains(window, "defer sess.endSend(cc, pi,") {
-				t.Errorf("%s:%d reserves the identifier without arming endSend with defer: an early return "+
-					"or a recovered panic would hold it for the connection's life", file, i+1)
+			var sites []enqueueSite
+			for _, cl := range classes {
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					call, _ := n.(*ast.CallExpr)
+					if call == nil || testCalleeName(call) != cl.callee || len(call.Args) <= cl.piArg {
+						return true
+					}
+					if cl.typeArg >= 0 {
+						if len(call.Args) <= cl.typeArg ||
+							!testResolvesToConst(fn.Body, call.Args[cl.typeArg], "mqttPacketPubRel") {
+							return true
+						}
+					}
+					if testIsLiteralZero(call.Args[cl.piArg]) {
+						if !cl.wantSkip {
+							t.Errorf("%s: %s enqueued under a literal zero identifier, which this guard "+
+								"does not expect for this class", fset.Position(call.Pos()), cl.what)
+						}
+						skipped++
+						return true
+					}
+					sites = append(sites, enqueueSite{call, cl})
+					return true
+				})
 			}
-		}
-		if found == 0 {
-			t.Errorf("%s: no identifier-carrying enqueue was found, so this guard checks nothing", file)
+			if len(sites) == 0 {
+				continue
+			}
+			// One-to-one, and the landmarks are single: a function holding two
+			// identifier-bearing enqueues of ANY class cannot have each bound to its own
+			// preceding pair by a guard that records one begin per name and one defer.
+			// Fail closed and say what to do rather than silently pairing them.
+			if len(sites) > 1 {
+				var names []string
+				for _, st := range sites {
+					names = append(names, fset.Position(st.call.Pos()).String())
+				}
+				t.Errorf("%s: %d identifier-bearing enqueues share one enclosing function (%s), so this "+
+					"guard cannot bind each to its own send section: give the second its own section, "+
+					"or extend this guard to pair them",
+					fset.Position(sites[0].call.Pos()), len(sites), strings.Join(names, ", "))
+				continue
+			}
+			site, cl := sites[0].call, sites[0].cl
+			found[cl.what]++
+			bp, hasBegin := beginPos[cl.begin]
+			if !hasBegin || bp > site.Pos() {
+				t.Errorf("%s: %s is enqueued outside a send section (%s before it): the identifier can be "+
+					"freed and re-minted while the write is blocked",
+					fset.Position(site.Pos()), cl.what, cl.begin)
+			}
+			if deferEndSend == token.NoPos || deferEndSend > site.Pos() {
+				t.Errorf("%s: %s reserves the identifier without arming endSend with defer BEFORE the "+
+					"enqueue: an early return or a recovered panic would hold it for the connection's life",
+					fset.Position(site.Pos()), cl.what)
+			}
 		}
 	}
+
+	for _, what := range []string{"a QoS 1/2 PUBLISH", "a PUBREL"} {
+		if found[what] == 0 {
+			t.Errorf("no identifier-bearing %s enqueue was found, so this guard checks nothing for that class", what)
+		}
+	}
+	if skipped == 0 {
+		t.Error("no QoS 0 enqueue was skipped, so the literal-zero exclusion matched nothing and " +
+			"the selector is probably wrong")
+	}
+}
+
+// A hold's LIVENESS is the only thing that reserves an identifier, and presence in the
+// registry is not it: a hold whose write returned and whose acknowledgement debt is owed
+// to a connection that is no longer ours reserves nothing. A reader that tested presence
+// would strand a re-minted identifier, its register and a Receive Maximum slot for the
+// session's life (F-089).
+//
+// So the registry is behind an ownership boundary: the predicate and the four helpers
+// that MUTATE a hold may touch the field, and every other reader asks
+// sendReservedLocked. This guard is about the BOUNDARY — that a new reservation reader
+// cannot appear outside the API. Misuse INSIDE a mutation helper is the behavioural
+// tests' job, which is why the tombstone case is killed by
+// TestMQTTInflightAnInertHoldIsTakenOverNotRefused rather than here.
+//
+// Every reference is matched, not merely a direct index or range: `holds :=
+// sess.sendsInFlight` followed by `holds[pi]` is the same defect one alias away.
+func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
+	t.Parallel()
+	// Qualified by RECEIVER, not by bare name: Go lets any other type define a method
+	// called endSend or beginSendLocked, and a name-only allow-list would admit a
+	// presence reader hidden in one of those.
+	owners := map[string]struct{}{
+		// The predicate.
+		"mqttSession.pubCompHeldLocked": {}, "mqttSession.sendHoldLiveLocked": {},
+		"mqttSession.sendReservedLocked": {},
+		// The four helpers that mutate a hold.
+		"mqttSession.beginSendLocked": {}, "mqttSession.beginPubRelSendLocked": {},
+		"mqttSession.endSend": {}, "mqttSession.consumePubRelAckLocked": {},
+		// The bounded-memory sweep.
+		"mqttSession.sweepDeadSendHoldsLocked": {},
+	}
+	seen := 0
+	for _, file := range testMQTTProductionFiles(t) {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, decl := range f.Decls {
+			fn, _ := decl.(*ast.FuncDecl)
+			if fn == nil || fn.Body == nil {
+				continue
+			}
+			qualified := testQualifiedFuncName(fn)
+			_, owner := owners[qualified]
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				sel, _ := n.(*ast.SelectorExpr)
+				if sel == nil || sel.Sel.Name != "sendsInFlight" {
+					return true
+				}
+				seen++
+				if !owner {
+					t.Errorf("%s: %s reaches into sendsInFlight directly; presence in that registry is not a "+
+						"reservation, so a reservation reader must ask sendReservedLocked",
+						fset.Position(sel.Pos()), qualified)
+				}
+				return true
+			})
+		}
+	}
+	if seen == 0 {
+		t.Error("no sendsInFlight reference was found at all, so this guard checks nothing")
+	}
+}
+
+// testMQTTProductionFiles lists every non-test Go file in this package, so a guard
+// cannot be evaded by putting the new site in a file the guard's list forgot.
+func testMQTTProductionFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		t.Fatal("no production files found, so every AST guard in this file checks nothing")
+	}
+	return out
+}
+
+// testQualifiedFuncName names a declaration as <receiver type>.<method>, or just the
+// name for a plain function, so an allow-list cannot be satisfied by a same-named
+// method on a different receiver.
+func testQualifiedFuncName(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return fn.Name.Name
+	}
+	t := fn.Recv.List[0].Type
+	if star, ok := t.(*ast.StarExpr); ok {
+		t = star.X
+	}
+	if id, ok := t.(*ast.Ident); ok {
+		return id.Name + "." + fn.Name.Name
+	}
+	return fn.Name.Name
+}
+
+// testCalleeName reports the called function's own name, for both plain and method
+// calls, and empty for anything else.
+func testCalleeName(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name
+	case *ast.SelectorExpr:
+		return fn.Sel.Name
+	}
+	return _EMPTY_
+}
+
+// testResolvesToConst reports whether e names the constant want, either directly or
+// through a simple local alias assigned from it inside body. The alias case is the point:
+// `pt := mqttPacketPubRel; enqueue(pt, ...)` is the same site one indirection away, and a
+// guard that matched only the bare identifier would miss it.
+func testResolvesToConst(body *ast.BlockStmt, e ast.Expr, want string) bool {
+	id, _ := e.(*ast.Ident)
+	if id == nil {
+		return false
+	}
+	if id.Name == want {
+		return true
+	}
+	aliased := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		as, _ := n.(*ast.AssignStmt)
+		if as == nil {
+			return true
+		}
+		for i, lhs := range as.Lhs {
+			l, _ := lhs.(*ast.Ident)
+			if l == nil || l.Name != id.Name || i >= len(as.Rhs) {
+				continue
+			}
+			if r, _ := as.Rhs[i].(*ast.Ident); r != nil && r.Name == want {
+				aliased = true
+			}
+		}
+		return true
+	})
+	return aliased
+}
+
+// testIsLiteralZero reports whether e is the integer literal 0 — a QoS 0 enqueue, which
+// allocates no identifier. An expression that merely evaluates to zero is deliberately
+// NOT excluded: this guard reads syntax, and reading it as a skip would let a computed
+// identifier slip past.
+func testIsLiteralZero(e ast.Expr) bool {
+	lit, _ := e.(*ast.BasicLit)
+	return lit != nil && lit.Kind == token.INT && lit.Value == "0"
 }
 
 // A NAK is withheld from every entry a redelivery could not help, and each state is
@@ -1485,5 +1749,622 @@ func TestMQTTInflightBeginSendRefusesUnsendableEntries(t *testing.T) {
 			t.Errorf("a send section was granted over %s", tc.what)
 		}
 		delete(e.sess.sendsInFlight, 9)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F-089: a PUBREL transmission holds its identifier until its PUBCOMP
+// ---------------------------------------------------------------------------
+
+// testConnIdentity gives a fixture connection a REAL identity, minted the way an
+// accepted connection's is. testNewInflightEnv builds its client with
+// createInternalAccountClient, which never calls initClient, so its cid is zero — and
+// an ownership assertion written against zero compares a default with a default and
+// passes whatever the code does.
+func testConnIdentity(t *testing.T, e *testInflightEnv, c *client) *client {
+	t.Helper()
+	c.cid = e.s.gcid.Add(1)
+	if c.cid == 0 {
+		t.Fatal("a fixture connection must have a nonzero identity, or every ownership assertion is vacuous")
+	}
+	return c
+}
+
+// testPubRelHold reads a hold's raw fields, which several assertions below need at an
+// instant rather than through the liveness predicate.
+func testPubRelHold(t *testing.T, sess *mqttSession, pi uint16) (token string, owed int, owner uint64, present bool) {
+	t.Helper()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	h := sess.sendsInFlight[pi]
+	if h == nil {
+		return _EMPTY_, 0, 0, false
+	}
+	return h.token, h.pubCompOwed, h.owner, true
+}
+
+// testMintsPI reports whether bumpPI will hand out want, with the maps cleared so the
+// registry is the only thing that can refuse it. This is the discard shape: clear()
+// resets last_pi to zero, so a reused object walks the space from the bottom.
+func testMintsPI(t *testing.T, sess *mqttSession, want uint16) bool {
+	t.Helper()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	savedPub, savedRel, savedCp, savedLast := sess.pendingPublish, sess.pendingPubRel, sess.cpending, sess.last_pi
+	sess.pendingPublish = make(map[uint16]*mqttPending)
+	sess.pendingPubRel = make(map[uint16]*mqttPending)
+	sess.cpending = make(map[string]map[uint64]uint16)
+	sess.last_pi = 0
+	defer func() {
+		sess.pendingPublish, sess.pendingPubRel, sess.cpending, sess.last_pi = savedPub, savedRel, savedCp, savedLast
+	}()
+	for i := 0; i <= int(want)+1; i++ {
+		next := sess.bumpPI()
+		if next == 0 {
+			break
+		}
+		if next == want {
+			return true
+		}
+		sess.pendingPublish[next] = &mqttPending{}
+	}
+	return false
+}
+
+// A PUBREL transmission reserves its identifier, and the reservation OUTLIVES the
+// write: [MQTT-2.3.1-4] frees a PUBREL's identifier when its PUBCOMP is processed, not
+// when the bytes leave.
+func TestMQTTInflightPubRelSendHoldsTheIdentifier(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-pubrel-hold")
+	const pi = uint16(7)
+
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	token, ok := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if !ok || token == _EMPTY_ {
+		t.Fatal("a PUBREL transmission on this session's connection must be reservable")
+	}
+
+	// A second transmission under the same identifier is refused while the first write
+	// is out: two PUBRELs in the socket under one identifier is what produces the stray
+	// PUBCOMP this mechanism exists to prevent.
+	e.sess.mu.Lock()
+	_, twice := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if twice {
+		t.Fatal("a second PUBREL section must be refused while the first write has not returned")
+	}
+
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d was re-minted while its PUBREL write was still in flight", pi)
+	}
+
+	// The write returns. The identifier is STILL held, because the client has not
+	// answered — this is the assertion that separates this design from a plain
+	// write-return section.
+	e.sess.endSend(e.c, pi, token)
+	if tok, owed, _, present := testPubRelHold(t, e.sess, pi); !present || tok != _EMPTY_ || owed != 1 {
+		t.Fatalf("after endSend the hold must survive with the debt intact: token=%q owed=%d present=%v", tok, owed, present)
+	}
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d was re-minted while its PUBCOMP was still owed", pi)
+	}
+
+	// And the PUBCOMP releases it.
+	e.sess.mu.Lock()
+	e.sess.consumePubRelAckLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
+		t.Fatal("the PUBCOMP must release the hold, or the identifier is held for the connection's life")
+	}
+	if !testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d must be reusable once its PUBCOMP was processed", pi)
+	}
+}
+
+// Two transmitted copies owe two PUBCOMPs. The first releases nothing: the client is
+// still going to answer the duplicate, and that answer must not land on a re-minted
+// exchange.
+func TestMQTTInflightPubCompFreesOnlyTheLastOwedPubRel(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-pubrel-two-copies")
+	const pi = uint16(9)
+
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	tok1, ok1 := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if !ok1 {
+		t.Fatal("the first copy must be reservable")
+	}
+	e.sess.endSend(e.c, pi, tok1)
+
+	e.sess.mu.Lock()
+	tok2, ok2 := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if !ok2 {
+		t.Fatal("a redelivery must be transmittable once the previous write has returned")
+	}
+	e.sess.endSend(e.c, pi, tok2)
+
+	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 2 {
+		t.Fatalf("two transmitted copies owe two PUBCOMPs, got %d", owed)
+	}
+
+	e.sess.mu.Lock()
+	e.sess.consumePubRelAckLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if _, owed, _, present := testPubRelHold(t, e.sess, pi); !present || owed != 1 {
+		t.Fatalf("the first PUBCOMP must leave the duplicate's debt standing: owed=%d present=%v", owed, present)
+	}
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d was re-minted while a second PUBCOMP was still owed", pi)
+	}
+
+	e.sess.mu.Lock()
+	e.sess.consumePubRelAckLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
+		t.Fatal("the last owed PUBCOMP must release the hold")
+	}
+}
+
+// A ZERO connection identity is not a connection identity. Every accepted connection
+// takes its cid from srv.gcid.Add(1), so zero means uninitialized — and two
+// uninitialized connections would be indistinguishable, letting a foreign PUBCOMP
+// consume this debt or letting a debt stay live across a rebind. The refusal keeps that
+// case out of the predicate entirely, so no hold can ever carry a zero owner.
+func TestMQTTInflightAZeroIdentityIsNotAConnectionIdentity(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-zero-identity")
+	const pi = uint16(14)
+	zero := &client{} // cid 0, as createInternalAccountClient leaves it
+
+	e.sess.mu.Lock()
+	e.sess.c = zero
+	_, ok := e.sess.beginPubRelSendLocked(zero, pi)
+	e.sess.mu.Unlock()
+	if ok {
+		t.Fatal("a connection with no identity must not be recorded as a debt's owner")
+	}
+	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
+		t.Fatal("the refusal must leave no hold behind")
+	}
+
+	// And a hold that somehow carried a zero owner reserves nothing, even while the
+	// session's own connection is equally identity-less: the predicate must not read
+	// two defaults as a match.
+	e.sess.mu.Lock()
+	e.sess.sendsInFlight = map[uint16]*mqttSendHold{pi: {pubCompOwed: 1, owner: 0}}
+	live := e.sess.sendReservedLocked(pi)
+	e.sess.consumePubRelAckLocked(zero, pi)
+	owed := e.sess.sendsInFlight[pi].pubCompOwed
+	e.sess.mu.Unlock()
+	if live {
+		t.Fatal("a zero owner must never satisfy the liveness predicate: 0 == 0 is not ownership")
+	}
+	if owed != 1 {
+		t.Fatalf("a zero-identity PUBCOMP must consume nothing, got owed=%d", owed)
+	}
+}
+
+// A PUBCOMP that is not the hold owner's consumes nothing. It answers a transmission
+// this connection never made, and spending the debt on it would release an identifier
+// the owning connection's client may still hold.
+func TestMQTTInflightAForeignPubCompConsumesNoDebt(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-foreign-pubcomp")
+	const pi = uint16(4)
+	other := testConnIdentity(t, e, &client{})
+
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	tok, ok := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if !ok {
+		t.Fatal("the transmission must be reservable")
+	}
+	e.sess.endSend(e.c, pi, tok)
+
+	e.sess.mu.Lock()
+	e.sess.consumePubRelAckLocked(other, pi)
+	e.sess.mu.Unlock()
+
+	_, owed, owner, present := testPubRelHold(t, e.sess, pi)
+	if !present || owed != 1 || owner != e.c.cid {
+		t.Fatalf("a foreign PUBCOMP must consume nothing: owed=%d ownerIsOurs=%v present=%v",
+			owed, owner == e.c.cid, present)
+	}
+}
+
+// A PUBREL may not be transmitted while a PUBLISH write under the same identifier is
+// still out — the successful-PUBREC case, where the PUBREL is ready while the PUBLISH
+// bytes have not left. And a live PUBREL debt likewise refuses a PUBLISH section.
+func TestMQTTInflightPubRelSectionRefusesUnderALivePublishWrite(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-pubrel-vs-publish")
+	dur := e.sess.idHash + "_plain"
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	pubTok, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+	e.sess.mu.Unlock()
+	if !ok {
+		t.Fatal("the PUBLISH entry must be reservable")
+	}
+	e.sess.mu.Lock()
+	_, relOK := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if relOK {
+		t.Fatal("a PUBREL must not be written under an identifier whose PUBLISH write has not returned")
+	}
+	e.sess.endSend(e.c, pi, pubTok)
+
+	// The other direction: a live PUBREL debt refuses a PUBLISH section, because the
+	// client still holds that identifier for an exchange it has not completed.
+	e.sess.mu.Lock()
+	relTok, ok := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if !ok {
+		t.Fatal("the PUBREL must be reservable once the PUBLISH write returned")
+	}
+	e.sess.endSend(e.c, pi, relTok)
+	e.sess.mu.Lock()
+	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq}
+	_, pubAgain := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+	e.sess.mu.Unlock()
+	if pubAgain {
+		t.Fatal("a PUBLISH must not be transmitted under an identifier whose PUBCOMP is still owed")
+	}
+}
+
+// A debt owed to a connection the session no longer has can never be answered, so it
+// must stop holding the identifier at once — and the next connection's retransmission
+// must RESET it rather than add to it, or one PUBCOMP can never clear a count of two.
+//
+// This is the persistent-session shape: the close path nils sess.c and calls clear()
+// only when the expiry is zero, so a surviving session reaches the next connection with
+// the debt still recorded.
+func TestMQTTInflightPersistentDisconnectReleasesADeadPubCompDebt(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-dead-debt")
+	const pi = uint16(3)
+
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	tok, ok := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if !ok {
+		t.Fatal("the transmission must be reservable")
+	}
+	e.sess.endSend(e.c, pi, tok)
+
+	// The connection goes, the session stays. No clear() runs on this path.
+	e.sess.mu.Lock()
+	e.sess.c = nil
+	e.sess.mu.Unlock()
+	if !testMintsPI(t, e.sess, pi) {
+		t.Fatalf("a debt owed to a departed connection must not hold packet identifier %d", pi)
+	}
+
+	// The next connection retransmits the same PUBREL and takes the debt over.
+	next := testConnIdentity(t, e, &client{})
+	e.sess.mu.Lock()
+	e.sess.c = next
+	tok2, ok2 := e.sess.beginPubRelSendLocked(next, pi)
+	e.sess.mu.Unlock()
+	if !ok2 {
+		t.Fatal("the resumed connection must be able to retransmit the PUBREL")
+	}
+	e.sess.endSend(next, pi, tok2)
+	if _, owed, owner, _ := testPubRelHold(t, e.sess, pi); owed != 1 || owner != next.cid {
+		t.Fatalf("the retransmission must RESET the dead count and take ownership, got owed=%d ownerIsNext=%v",
+			owed, owner == next.cid)
+	}
+
+	// One PUBCOMP is all the client owes on this connection, and it must be enough.
+	e.sess.mu.Lock()
+	e.sess.consumePubRelAckLocked(next, pi)
+	e.sess.mu.Unlock()
+	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
+		t.Fatal("one PUBCOMP must release an identifier the resumed connection transmitted once")
+	}
+}
+
+// The REBIND retires a debt, not clear(). clear() does not touch sess.c, and on the
+// clean-start path it runs while the displaced client is still bound — so a debt
+// dropped there would free an identifier that client is still holding.
+func TestMQTTInflightRebindNotClearIsWhatRetiresAPubCompDebt(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-rebind-retires")
+	const pi = uint16(6)
+
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	tok, ok := e.sess.beginPubRelSendLocked(e.c, pi)
+	e.sess.mu.Unlock()
+	if !ok {
+		t.Fatal("the transmission must be reservable")
+	}
+	e.sess.endSend(e.c, pi, tok)
+
+	if err := e.sess.clear(true); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if _, owed, _, present := testPubRelHold(t, e.sess, pi); !present || owed != 1 {
+		t.Fatalf("clear() must not retire a debt of the still-bound connection: owed=%d present=%v", owed, present)
+	}
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d was freed while the client that owes its PUBCOMP is still bound", pi)
+	}
+
+	// The rebind is the event. From here the old client's PUBCOMP can never be
+	// processed, so its debt reserves nothing.
+	e.sess.mu.Lock()
+	e.sess.c = testConnIdentity(t, e, &client{})
+	e.sess.mu.Unlock()
+	if !testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d must be free once the connection that owed its PUBCOMP is gone", pi)
+	}
+}
+
+// An inert hold is TAKEN OVER by a PUBLISH section, never refused. Refusing it strands
+// the identifier: bumpPI hands it out, trackPublish installs the entry and its
+// register, and nothing can ever transmit under it.
+func TestMQTTInflightAnInertHoldIsTakenOverNotRefused(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-inert-takeover")
+	dur := e.sess.idHash + "_plain"
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 1)
+
+	// A debt from a connection that is gone: present in the registry, reserving nothing.
+	e.sess.mu.Lock()
+	e.sess.sendsInFlight = map[uint16]*mqttSendHold{pi: {pubCompOwed: 1, owner: testConnIdentity(t, e, &client{}).cid}}
+	e.sess.c = e.c
+	e.sess.mu.Unlock()
+
+	e.sess.mu.Lock()
+	token, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+	e.sess.mu.Unlock()
+	if !ok {
+		t.Fatal("an inert hold must be taken over, not refused: refusing strands the identifier, " +
+			"its register and a Receive Maximum slot for the session's life")
+	}
+	if tok, owed, _, _ := testPubRelHold(t, e.sess, pi); tok != token || owed != 0 {
+		t.Fatalf("the takeover must replace the inert hold: token matches=%v owed=%d", tok == token, owed)
+	}
+	e.sess.endSend(e.c, pi, token)
+	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
+		t.Fatal("the taken-over hold must be released when its own write returns")
+	}
+}
+
+// clear()'s sweep is hygiene: it drops holds that reserve nothing and leaves every one
+// that does. A hold whose write has not returned survives the discard, which is what
+// keeps a displaced connection's blocked write from colliding with a re-minted
+// identifier.
+func TestMQTTInflightClearSweepsOnlyDeadHolds(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-clear-sweep")
+
+	gone := testConnIdentity(t, e, &client{}).cid
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	e.sess.sendsInFlight = map[uint16]*mqttSendHold{
+		11: {pubCompOwed: 1, owner: gone},    // inert: a real identity that is not ours
+		12: {token: "live-write"},            // write still out
+		13: {pubCompOwed: 1, owner: e.c.cid}, // owed by us
+	}
+	e.sess.mu.Unlock()
+
+	if err := e.sess.clear(true); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if _, _, _, present := testPubRelHold(t, e.sess, 11); present {
+		t.Fatal("a hold reserving nothing must be swept")
+	}
+	if tok, _, _, present := testPubRelHold(t, e.sess, 12); !present || tok != "live-write" {
+		t.Fatal("a hold whose write has not returned must survive the discard (F-087 WP5 class F2)")
+	}
+	if _, owed, _, present := testPubRelHold(t, e.sess, 13); !present || owed != 1 {
+		t.Fatal("a debt of the still-bound connection must survive clear(): sess.c is untouched here")
+	}
+}
+
+// testDeliverPubRel drives the real PUBREL delivery callback, which is what installs
+// the send section. A unit call on the primitive cannot see a wiring defect that
+// removes the section from this callback, which is the whole reason these three tests
+// go through it.
+func testDeliverPubRel(t *testing.T, e *testInflightEnv, pi uint16, reply, claim, copySubj string) {
+	t.Helper()
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_, claim, copySubj)
+	e.c.pa.hdr = hdrLen
+	defer func() { e.c.pa.hdr = 0 }()
+	mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, reply, msg)
+}
+
+// testReadyForPubRelDelivery wires the session so the delivery callback and the PUBCOMP
+// handler both run: a bound connection, a PUBREL consumer, and no gate withholding.
+func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
+	t.Helper()
+	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
+	testConnIdentity(t, e, e.c)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	e.sess.pubRelConsumer = &ConsumerConfig{Durable: "PUBREL_F089"}
+	e.sess.mu.Unlock()
+}
+
+// EXECUTION 1, through the production route, with the duplicate's write GENUINELY
+// BLOCKED inside its own send section. A unit call on the primitive cannot see a wiring
+// defect in this callback, and a synchronous call cannot see the interleaving at all:
+// the whole finding is a PUBCOMP arriving on the read loop while a duplicate PUBREL is
+// mid-transmission on the JetStream dispatcher.
+func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
+	// Deliberately NOT t.Parallel(): setMQTTTestPubRelWriteBlock assigns a
+	// process-global atomic, so a parallel sibling driving any PUBREL delivery would
+	// block in this test's hook. TestParallelTestsTouchNoProcessGlobalState enforces
+	// exactly that, and it is the reason this seam costs a serial test rather than
+	// silently corrupting whatever runs beside it.
+	e := testNewInflightEnv(t, "client-pubcomp-blocked")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(5)
+	dur := "PUBREL_F089"
+
+	// Copy 1 goes out and its write returns; the client has not answered it yet.
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 11, 1), _EMPTY_, _EMPTY_)
+	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
+		t.Fatalf("the delivery callback must reserve the identifier: owed=%d", owed)
+	}
+
+	// Copy 2 — the AckWait redelivery — goes through the SAME callback on another
+	// goroutine and blocks inside its send section, exactly where the socket write is.
+	blocked, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	restore := setMQTTTestPubRelWriteBlock(func() {
+		close(blocked)
+		<-release
+	})
+	// The seam is torn down LAST and the write is released FIRST, so a t.Fatal below
+	// cannot leave the delivery goroutine parked in a hook that outlives this test —
+	// a late call from a leaked goroutine would fail some other test's run, not this
+	// one.
+	defer restore()
+	defer func() { unblock(); <-done }()
+	go func() {
+		defer close(done)
+		testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 11, 2), _EMPTY_, _EMPTY_)
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the duplicate never reached its send section, so this fixture never blocked a write")
+	}
+	// The seam fires INSIDE the section, which is the premise every assertion below
+	// rests on. Asserted rather than assumed: a hook that moved above the reservation
+	// would leave this test green while proving nothing.
+	if tok, _, _, _ := testPubRelHold(t, e.sess, pi); tok == _EMPTY_ {
+		t.Fatal("the write must block INSIDE the send section, or the reservation is not under test")
+	}
+
+	// The PUBCOMP for copy 1 arrives on the read loop, through the real handler, while
+	// the duplicate's write is still out.
+	e.c.mqttProcessPubComp(pi)
+
+	// (a) the exchange completed: the entry is gone and nothing was deferred.
+	e.sess.mu.Lock()
+	_, stillTracked := e.sess.pendingPubRel[pi]
+	e.sess.mu.Unlock()
+	if stillTracked {
+		t.Fatal("the PUBCOMP must complete the exchange; a PUBREL has no register, so nothing is parked")
+	}
+	// (b) the identifier is NOT available while the duplicate's bytes are out.
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d was re-minted while a duplicate PUBREL write was still in flight", pi)
+	}
+	// (c) the raw debt is exactly 1 AT THIS INSTANT. This is what distinguishes a debt
+	// incurred at the reservation from one incurred after the write returns: a late
+	// increment reaches the same final state but leaves this window open.
+	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
+		t.Fatalf("the duplicate's debt must already be recorded while its write is out, got owed=%d", owed)
+	}
+
+	unblock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocked delivery never returned")
+	}
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d must stay held until the duplicate's own PUBCOMP arrives", pi)
+	}
+	e.c.mqttProcessPubComp(pi)
+	if !testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d must be free once every transmitted copy was answered", pi)
+	}
+}
+
+// EXECUTION 2, through the production route. The duplicate's own PUBCOMP must not be
+// able to land on a re-minted exchange: the identifier stays held until every
+// transmitted copy has been answered.
+func TestMQTTInflightStrayPubCompCannotTakeAReMintedIdentifier(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-stray-pubcomp")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(2)
+	dur := "PUBREL_F089"
+
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 21, 1), _EMPTY_, _EMPTY_)
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 21, 2), _EMPTY_, _EMPTY_)
+	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 2 {
+		t.Fatalf("two transmitted copies owe two PUBCOMPs, got %d", owed)
+	}
+
+	e.c.mqttProcessPubComp(pi)
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d was freed while the duplicate's PUBCOMP was still to come — "+
+			"that stray answer would acknowledge away a new exchange's PUBREL record", pi)
+	}
+
+	// The stray arrives. Now, and only now, the identifier is genuinely free.
+	e.c.mqttProcessPubComp(pi)
+	if !testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d must be reusable once every transmitted copy was answered", pi)
+	}
+}
+
+// A PUBCOMP whose RECORD may not be acknowledged still consumes the acknowledgement
+// debt: the client answered, which is the event [MQTT-2.3.1-4] names, and whether the
+// record may go is a different question. Deferring the consume below the withhold gates
+// makes a withheld exchange double-count across its own redelivery and never release
+// its identifier.
+func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-withheld-pubcomp")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(8)
+	dur := "PUBREL_F089"
+
+	// A carrier whose copy subject is not a shape this broker's generators produce is
+	// REFUSED, so the PUBCOMP path may not acknowledge the record and withholds. Both
+	// headers are present, because the builder omits the pair entirely when either is
+	// empty — an absent reference owes nothing and would never reach the withhold.
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 31, 1), "$MQTT_q2affclaim.x", "not-a-copy-subject")
+	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
+		t.Fatalf("the delivery must reserve the identifier: owed=%d", owed)
+	}
+
+	e.c.mqttProcessPubComp(pi)
+	e.sess.mu.Lock()
+	_, stillTracked := e.sess.pendingPubRel[pi]
+	e.sess.mu.Unlock()
+	if !stillTracked {
+		t.Fatal("this fixture must reach the withhold: an acknowledged record proves nothing about it")
+	}
+	if _, owed, _, present := testPubRelHold(t, e.sess, pi); present && owed != 0 {
+		t.Fatalf("a withheld PUBCOMP must still consume its debt, or the redelivery double-counts: owed=%d", owed)
+	}
+
+	// AckWait re-offers the record; the redelivery re-incurs exactly one debt.
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 31, 2), "$MQTT_q2affclaim.x", "not-a-copy-subject")
+	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
+		t.Fatalf("the redelivery must leave exactly one PUBCOMP owed, got %d", owed)
+	}
+	e.c.mqttProcessPubComp(pi)
+	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
+		t.Fatal("the accounting must stay exact across a withheld PUBCOMP and its redelivery")
 	}
 }

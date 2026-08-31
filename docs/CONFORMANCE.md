@@ -1141,6 +1141,18 @@ Residuals:
   reserved and the record kept. Either way it costs one reserved identifier and one
   Receive Maximum slot — the safe direction, since reusing it would put a second
   message on an identifier the client still has in use.
+- **A PUBREL the client never receives holds its identifier for the rest of the
+  connection.** A PUBREL transmission reserves its packet identifier until the client's
+  PUBCOMP is processed, which is what [MQTT-2.3.1-4] makes the release event and what
+  keeps a delayed PUBCOMP from binding to a re-minted exchange. If the enqueue is
+  suppressed instead of written — the only case is a packet exceeding the client's MQTT
+  5.0 Maximum Packet Size, which a connected client's own success CONNACK makes
+  unreachable in practice — no PUBCOMP will ever arrive and the debt is never answered.
+  **The cost:** one packet identifier and one Receive Maximum slot, held until that
+  connection ends. The debt stops reserving anything the moment the connection is no
+  longer the session's, so it does not survive into the next one, and no manual
+  intervention clears it. This is the fail-closed direction: the alternative is releasing
+  an identifier the client may still hold.
 - **A quarantined identifier is held until the session resumes.** When a delivery's
   create-only register CAS meets a LIVE register another writer owns on that same
   identifier for that same source, the identifier is quarantined in place rather than

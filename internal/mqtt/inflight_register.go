@@ -3746,7 +3746,13 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	if ack.sendNonce != _EMPTY_ || ack.sendSettle.kind != mqttSendSettleNone {
 		return _EMPTY_, false // a section is already active, or one parked a settle
 	}
-	if _, sending := sess.sendsInFlight[pi]; sending {
+	// LIVENESS, not presence. An inert hold — its write returned, its acknowledgement
+	// debt owed to a connection that is no longer ours — reserves nothing, and bumpPI
+	// will hand this identifier out. Refusing here on presence is how that identifier,
+	// its register and a Receive Maximum slot get stranded for the session's life:
+	// nothing ever transmits, so nothing ever removes the hold, and every redelivery
+	// meets the same refusal (F-089). An inert hold is TAKEN OVER instead.
+	if sess.sendReservedLocked(pi) {
 		return _EMPTY_, false
 	}
 	// A per-send token, not a counter: recovery can REPLACE the entry, and a
@@ -3754,10 +3760,125 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	token := mqttNewInflightNonce()
 	ack.sendNonce = token
 	if sess.sendsInFlight == nil {
-		sess.sendsInFlight = make(map[uint16]string, 1)
+		sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
 	}
-	sess.sendsInFlight[pi] = token
+	// The takeover is a REPLACEMENT, so an inert debt cannot be inherited by this
+	// transmission. Nothing is lost with it: an inert hold reserves nothing for
+	// anybody, so keeping it and dropping it are indistinguishable to every reader.
+	sess.sendsInFlight[pi] = &mqttSendHold{token: token}
 	return token, true
+}
+
+// beginPubRelSendLocked reserves an identifier for ONE PUBREL transmission and reports
+// the token that ends it.
+//
+// The reservation is taken here rather than after the write, because the packet is
+// queued under the connection lock and can reach the client before the enqueue call
+// returns — counting the owed PUBCOMP afterwards would leave a window in which one is
+// owed and unrecorded.
+//
+// Session lock held on entry.
+func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, bool) {
+	// A ZERO cid is refused rather than recorded. Every accepted connection gets its
+	// identity from srv.gcid.Add(1), so zero is not a connection identity — it is an
+	// uninitialized one, and recording it would make two such connections
+	// indistinguishable: a foreign PUBCOMP could consume this debt, and the debt could
+	// stay live across a rebind. Refusing here is what keeps that case out of the
+	// predicate entirely, so no hold can ever carry a zero owner.
+	if cc == nil || pi == 0 || cc.cid == 0 || sess.c != cc {
+		return _EMPTY_, false
+	}
+	h := sess.sendsInFlight[pi]
+	if h != nil && h.token != _EMPTY_ {
+		// A transmission is already going out under this identifier — an earlier PUBREL
+		// copy, or the PUBLISH whose successful PUBREC replaced the entry while its
+		// write was still blocked. The caller returns WITHOUT acknowledging, so AckWait
+		// re-offers the record once that write has returned.
+		return _EMPTY_, false
+	}
+	// A standing debt is only ours to add to when this connection incurred it. One owed
+	// by a predecessor can never be answered — mqttProcessPubComp refuses a PUBCOMP from
+	// any connection that is not sess.c — so it is RESET rather than accumulated onto.
+	// Adding to it instead is what would leave a resumed session's identifier held
+	// forever: the client owes exactly one PUBCOMP on this connection, and a count of
+	// two would never reach zero.
+	if h == nil || h.owner != cc.cid {
+		h = &mqttSendHold{owner: cc.cid}
+		if sess.sendsInFlight == nil {
+			sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
+		}
+		sess.sendsInFlight[pi] = h
+	}
+	token := mqttNewInflightNonce()
+	h.token = token
+	h.owner = cc.cid
+	h.pubCompOwed++
+	return token, true
+}
+
+// consumePubRelAckLocked records that the client answered one transmitted PUBREL under
+// pi, which is the event [MQTT-2.3.1-4] frees the identifier at.
+//
+// A debt owned by another connection is left alone: it is not this connection's to
+// consume, and consuming it would release an identifier on the strength of an
+// acknowledgement for a transmission this connection never made. It already reserves
+// nothing, so leaving it costs nothing.
+//
+// Session lock held on entry.
+func (sess *mqttSession) consumePubRelAckLocked(c *client, pi uint16) {
+	h := sess.sendsInFlight[pi]
+	if h == nil || c == nil || c.cid == 0 || h.owner != c.cid || h.pubCompOwed == 0 {
+		return
+	}
+	h.pubCompOwed--
+	if h.token == _EMPTY_ && h.pubCompOwed == 0 {
+		delete(sess.sendsInFlight, pi)
+	}
+}
+
+// pubCompHeldLocked reports whether this hold still reserves its identifier because a
+// PUBCOMP is owed on THIS connection.
+//
+// Session lock held on entry.
+func (sess *mqttSession) pubCompHeldLocked(h *mqttSendHold) bool {
+	return h != nil && h.pubCompOwed > 0 && h.owner != 0 && sess.c != nil && h.owner == sess.c.cid
+}
+
+// sendHoldLiveLocked reports whether a hold reserves its identifier at all.
+//
+// Session lock held on entry.
+func (sess *mqttSession) sendHoldLiveLocked(h *mqttSendHold) bool {
+	return h != nil && (h.token != _EMPTY_ || sess.pubCompHeldLocked(h))
+}
+
+// sendReservedLocked is the question every reservation reader asks: may pi be used?
+// Lookup and liveness together, so no caller has to reach into the registry to find
+// out — which is what makes "reserved" one testable API rather than a rule five call
+// sites have to remember.
+//
+// Session lock held on entry.
+func (sess *mqttSession) sendReservedLocked(pi uint16) bool {
+	return sess.sendHoldLiveLocked(sess.sendsInFlight[pi])
+}
+
+// sweepDeadSendHoldsLocked drops holds that reserve nothing: no write out, and no
+// acknowledgement owed by the connection that is ours now.
+//
+// This is BOUNDED-MEMORY HYGIENE and nothing rests on it. An inert hold is invisible to
+// sendReservedLocked, so one this never reaches blocks no allocation and no
+// transmission. It is emphatically NOT the drain for the acknowledgement debt: clear()
+// never assigns sess.c, a persistent-session disconnect never calls clear() at all, and
+// on the clean-start path clear() runs while the displaced client is still bound — so a
+// debt dropped here would leak in the first case and free an identifier the client is
+// still holding in the third (F-089).
+//
+// Session lock held on entry.
+func (sess *mqttSession) sweepDeadSendHoldsLocked() {
+	for pi, h := range sess.sendsInFlight {
+		if !sess.sendHoldLiveLocked(h) {
+			delete(sess.sendsInFlight, pi)
+		}
+	}
 }
 
 // endSend ends a send section and executes whatever continuation a removal path parked
@@ -3773,11 +3894,18 @@ func (sess *mqttSession) endSend(c *client, pi uint16, token string) {
 		return
 	}
 	sess.mu.Lock()
-	if cur, sending := sess.sendsInFlight[pi]; !sending || cur != token {
+	h := sess.sendsInFlight[pi]
+	if h == nil || h.token != token {
 		sess.mu.Unlock()
 		return
 	}
-	delete(sess.sendsInFlight, pi)
+	h.token = _EMPTY_
+	// The hold goes only when it reserves nothing more. A PUBREL transmitted under this
+	// identifier and not yet answered keeps it, because the write returning is not the
+	// event that frees a PUBREL's identifier — its PUBCOMP is (F-089).
+	if !sess.sendHoldLiveLocked(h) {
+		delete(sess.sendsInFlight, pi)
+	}
 	var settle mqttSendSettle
 	var removed *mqttPending
 	if ack := sess.pendingPublish[pi]; ack != nil && ack.sendNonce == token {

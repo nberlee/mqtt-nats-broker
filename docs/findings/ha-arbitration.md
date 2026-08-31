@@ -2770,7 +2770,8 @@ current-format, and an unsupported shape stays refused.
 **Title:** The PUBREL send path has no send-section reservation, so a PUBCOMP for an
 earlier copy can free an identifier a duplicate PUBREL write is still using
 
-- Status: **Open. Alpha blocker, unconditional.** Filed 2026-08-30 by F-087's holistic
+- Status: **DONE 2026-08-30**, after five plan-review rounds (`~/.claude/lanes/f-089/`).
+  Alpha blocker, unconditional. Filed 2026-08-30 by F-087's holistic
   review (round 3). Scope settled by F-087's `DECISIONS.md` D6: the defect is
   pre-existing, the path is byte-identical before and after F-087, and D2's rule is that
   a shared standard found defective OUTSIDE the reviewed scope is repaired uniformly
@@ -2816,10 +2817,24 @@ the hole F-072's round 1 proved for class D on the PUBLISH side, not carried acr
 
 ### Acceptance
 
+**The second bullet below was REFUTED by the implementation and is retained only so it
+is not re-derived.** A write-return section plus a PUBCOMP park closes the primary
+execution and leaves the second-order one — the one this dossier calls worse — wide
+open, because `endSend` frees the identifier the instant the write returns and the
+duplicate's own PUBCOMP arrives after that. The park is also machinery this path does
+not need: a PUBREL has no in-flight register (the identifier's durable authority moved
+to the PUBREL record at the PUBREC handoff, R2), so PUBCOMP has nothing to defer, and
+acknowledging the record while a duplicate write is out is preferable rather than merely
+safe — the client has answered it, and the ack stops further AckWait redeliveries.
+What landed instead is one hold with TWO release conditions: the write has returned, AND
+every PUBREL transmitted under that identifier has been PUBCOMPed, which is the event
+[MQTT-2.3.1-4] names. See `docs/ARCHITECTURE.md`.
+
 - A phase-agnostic send reservation around identifier-bearing PUBREL writes, reusing
   F-087's registry rather than a second mechanism.
-- PUBCOMP parks its identifier-freeing continuation while a reservation is active, in the
-  shape F-087's class D already uses for PUBACK and a failed PUBREC.
+- ~~PUBCOMP parks its identifier-freeing continuation while a reservation is active, in
+  the shape F-087's class D already uses for PUBACK and a failed PUBREC.~~ **Refuted;
+  see above.**
 - The drain's confirmed-PUBREL release (I2b — only a CONFIRMED PUBREL releases a drained
   claim) and the `drainedPubRel` do-nothing arm are reconciled with the park, since both
   reach the same identifier by a different route.
