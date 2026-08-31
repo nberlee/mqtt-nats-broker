@@ -2061,7 +2061,8 @@ takeover.
   successful PUBREC's entry replacement; removal paths condemn and park rather than free.
   The PUBREL transmission is deliberately NOT covered (F-089 below, filed by this item's
   holistic review, which also retracts the false argument that once excluded it), and
-  neither is a RETAINED QoS 1/2 send (F-091).
+  neither is a RETAINED QoS 1/2 send — F-091, which closed it 2026-08-31 with a reservation
+  in this same registry rather than a section, fenced by the session incarnation.
   **Residual, documented in `docs/CONFORMANCE.md`:** the quarantine has no live release —
   both settled shapes the register vocabulary offers (an observed absence, a cancellation
   tombstone) are consumable by the rival's own supported lifecycle, so a live release
@@ -2122,24 +2123,138 @@ takeover.
   **Residual, in `docs/CONFORMANCE.md`:** a PUBREL whose enqueue is suppressed for
   exceeding the client's Maximum Packet Size (unreachable for a connected client) owes a
   PUBCOMP that never comes, holding one identifier for the rest of that connection.
-  F-091 stays open and separate — a retained send allocates through a different site, has
-  no pending entry, and uses neither enqueue helper.
+  F-091 was separate and is now DONE — a retained send allocates through a different site
+  and uses neither enqueue helper, so it took a reservation in the registry instead of a
+  section; see its bullet below.
 
-- [ ] **F-091: a retained QoS 1/2 send does not reserve its packet identifier.** Filed
-  2026-08-30 by F-087's holistic review (round 7). NOT an alpha blocker on its own
-  reading, but it is the same RB2/RB6 class as F-089 and should be judged with it: a
-  retained QoS 1/2 message allocates an identifier through `trackPublishRetained`
-  (`mqtt.go:8974`), builds its frame directly, and is buffered on `sub.mqtt.prm` to be
-  flushed by a later synchronous `queueOutbound` (`mqtt.go:17841-17847`) — with no send
-  section anywhere. A blocked retained write can therefore outlive a `clear()`, which
-  removes its pending entry and resets `last_pi`, so the reused session object can mint
-  that same identifier for the new incarnation while the old write is still in the
-  socket. Pre-existing and untouched by F-087, whose class G excluded retained sends on
-  the ground that they carry no register (true, and beside the point — the IDENTIFIER is
-  still allocated). Acceptance: either extend the reservation through retained-frame
-  flushing, or establish that a retained identifier cannot collide across a discard, and
-  strengthen `TestMQTTInflightEveryQoS12SendIsReserved` to detect direct identifier-bearing
-  PUBLISH construction rather than only the delivery callbacks' enqueue helper.
+- [x] **F-091: a retained QoS 1/2 send does not reserve its packet identifier.** Filed
+  2026-08-30 by F-087's holistic review (round 7). **Done 2026-08-31**, after six
+  plan-review rounds; lane `~/.claude/lanes/f-091/`. Not an alpha blocker on its own
+  reading, but the same RB2/RB6 class as F-089 and taken with it. *The finding:* a retained
+  QoS 1/2 message allocates in `serializeRetainedMsgsForSub`, frames itself, and is buffered
+  on `sub.mqtt.prm` to be written by a LATER `queueOutbound` — with no send section
+  anywhere. Across that span its only reservation was the `pendingPublish` entry, and
+  `clear()` destroys exactly that while resetting `last_pi`, so the identifier was handed
+  straight back out while the displaced connection's write was still in the socket. Class
+  G of F-087 excluded retained sends because they carry no register: true, and beside the
+  point — the IDENTIFIER is still allocated.
+  **The acceptance's second branch is REFUTED, and the argument is recorded so it is not
+  re-derived.** "A retained identifier cannot collide across a discard" fails three ways:
+  the frame's own identifier cannot be acknowledged before its write returns, but `clear()`
+  supplies the free without any acknowledgement; the sockets are NOT different during the
+  exploitable interval, because `clear()` does not rebind `sess.c` and a delivery to the
+  still-bound connection's own live subscription passes `beginSendLocked` and writes to that
+  same socket; and a buffered frame IS still written afterwards, since the SUBACK tail's
+  flush is unconditional and consults no session state.
+  **What landed:** the reservation a retained send lacked is the one `sendsInFlight` already
+  provides — the registry F-087 built to survive `clear()`, which `bumpPI` already consults.
+  `mqttSub.prm` became `[]mqttRetainedFrame` carrying each frame's identifier;
+  `mqttSendHold` gained `retainedGen`; and the reservation is taken in the SAME `sess.mu`
+  acquisition as the allocation, under `asm.sessLocked[sess.id]` so no successor can rebind
+  between the two.
+  **Two blocking findings shaped it, and neither was the retained path itself.** Round 1:
+  a third term in a shared registry obliges every mutator, and `beginPubRelSendLocked` (which
+  refuses only on a live token) and `consumePubRelAckLocked` (which re-spelled the liveness
+  condition) were both blind to it — reachable because `mqttProcessPubComp` fire-and-forget
+  acknowledges its PUBREL record, so a lost ack leaves that record AckWait-eligible while
+  a retained allocation may take the identifier. Round 3: releasing on the write's RETURN
+  reopens the defect past a `clear()`, because the entry that would otherwise carry custody
+  on is gone — so written completion is fenced by the session incarnation (`sess.gen`, which
+  `clear()` re-mints and an acknowledgement does not), while ABANDONMENT releases
+  unconditionally.
+  **A subscription leaving `c.subs` must not take an owed frame with it**, over a frozen
+  three-site set — `processUnsub`'s delete, `processSub`'s same-sid replacement and
+  `closeConnection`'s swap, the last for totality since `sess.c` is nilled first — but the
+  two dispositions DIFFER, and holistic round 4 is why. The teardown sites ABANDON, releasing
+  the reservation, because holding on would reserve the identifier against reallocation for
+  the session's life while nothing will ever write the frame. **The replacement
+  TRANSFERS**: a v5 SUBSCRIBE may carry one filter twice with the first entry asking for
+  the replay, so releasing the displaced frames would silently discard a retained delivery
+  the client is owed. They move onto the replacement, ahead of anything that packet
+  serializes, and nothing is released there — which also removed the deadlock the first
+  fix for this needed, and the capacity leak, by construction. The acceptance's second
+  half landed too: `TestMQTTInflightEveryQoS12SendIsReserved` gained a **reference-based
+  frozen close set** over identifier-bearing PUBLISH framing (`mqttMakePublishHeader`,
+  `mqttMakeAliasedPublishHeader`, `WritePublishHeader`), rejecting any production
+  reference that is not the callee of a direct call — an alias escapes a call-name guard —
+  and its "retained sends are an accepted exclusion" paragraph is deleted. Also landed: a
+  `sweepDeadSendHoldsLocked()` at the rebind, which is the only point a hold's owner
+  changes, as bounded-memory hygiene with nothing resting on it. **Residuals, in
+  `docs/CONFORMANCE.md`:** the guarantee is about the ALLOCATOR and the PUBLISH path —
+  while the reservation is live, `bumpPI` will not hand the identifier out and no PUBLISH
+  send section may open under it. PUBREL admission is untouched, and the whole
+  stale-PUBREL multiplexing class is F-092, filed with all three refuted fences. What the
+  written and abandoned paths release is the SUPPLEMENTAL reservation, not the identifier
+  — the `pendingPublish` entry reserves that until the client acknowledges, or until the
+  next resume for a frame abandoned with a rolled-back subscription. The post-write
+  stale-PUBREL hazard is F-092, filed with both refuted fences. And the identifier of a
+  retained send is not carried across a RESTART — there is no register by R6, the entry is
+  dropped on resume, and a later allocation may re-mint it while a QoS 2 client still
+  holds it. Two pre-existing items stay open and are named rather than absorbed: a
+  retained frame on a rolled-back subscription keeps its `pendingPublish` entry until the
+  next resume, and the `trackPublishRetained() == 0` downgrade delivers at QoS 0 where
+  [MQTT-3.8.4-6] / Spec5 [3.8.4-8] require the delivered QoS to EQUAL
+  min(published, granted) — this item only
+  refused to add a second route into it.
+
+- [ ] **F-092: a stale stored PUBREL can be transmitted under an identifier another exchange
+  owns.** Filed 2026-08-31 by F-091's holistic review (round 5) and its reconcile consult.
+  NOT an alpha blocker on the reading that reached it, but it is the same
+  identifier-multiplexing class as F-088/F-089 and should be judged with them. *The finding:*
+  `mqttProcessPubComp` removes `pendingPubRel[pi]` and then fire-and-forget acknowledges the
+  PUBREL record, so a lost acknowledgement leaves it AckWait-eligible while nothing
+  names the identifier. After reuse its redelivery reaches `beginPubRelSendLocked`, which
+  sees no token, and `trackAsPubRel` then installs `pendingPubRel[pi]` alongside the new owner's
+  `pendingPublish[pi]` — two exchanges through one pi-keyed slot, with the duplicate
+  check at the callback recognising only an already-FILLED entry.
+  **F-091 does NOT filter any part of this class**, deliberately: PUBREL admission is
+  unchanged from before it. THREE candidate partial fences were tried during F-091's review
+  and all three were REFUTED — see below. Do not re-propose any of them; F-092 owns the whole
+  class with one coherent design.
+  **Refutation 0, the retained-term refusal itself:** refusing while a retained
+  reservation is live blocks the retained QoS 2 exchange's OWN legitimate PUBREL, because
+  the delivery-side flusher keeps that reservation live until after it also writes the
+  triggering live PUBLISH — so a slow client's PUBREC arrives while the write is blocked
+  and the record waits out AckWait, about thirty seconds, where HEAD transmitted at once.
+  The compensating "retire the reservation at PUBREC" then needed two further fixes and
+  still lost custody across a concurrent `clear()` in one ordering or the other, so the
+  refusal and the retirement were both DELETED (holistic rounds 8-10, lane `DECISIONS.md`
+  D4). **Refutation 1, with measurements:** refusing
+  on any live `pendingPublish` entry made `TestMQTTDrainClusterLateForeignPubRelStore`,
+  `TestMQTTDrainPubRelRecreatedFromIntent` and `TestMQTTDrainBarrierFailsClosed` time out
+  with the client waiting for a PUBREL it was owed, because in-flight recovery installs it
+  as `pendingPublish[pi]` and the persisted drain intent then legitimately recreates a
+  CORRELATED PUBREL under that same identifier. "Any live entry means a different
+  exchange" is simply false.
+  **Refutation 2:** refusing on a SOURCE-LESS entry — no ack subject, no durable, no
+  register — looks exact, because no stored PUBREL can correlate to one. But an abandoned
+  retained frame leaves that empty entry behind until the session's next resume, so the
+  record would be refused for the life of the connection. It was implemented, caught by
+  F-091's holistic round 6, and removed. (It is also not a retained-entry classifier: a
+  cancellation tombstone carries the same triple.)
+  **The settled design is correlation, not entry kind:** admit only the record whose
+  `(durable, source sequence)` correlation matches the entry that owns the identifier, and
+  refuse a mismatched or uncorrelated one WITHOUT acknowledging so AckWait re-offers it. The
+  correlation is already parsed as `corr` in `mqttDeliverPubRelCb`, so the decision cannot
+  be made by the two-argument `beginPubRelSendLocked` alone: either the caller decides,
+  or the opener grows an argument. **QoS 2 subtlety not to lose:** PUBREC does not release
+  the identifier, it transitions it into the current exchange's PUBREL phase, so a mismatched
+  record must stay withheld until PUBCOMP releases it — "until the acknowledgement" is wrong.
+  If exact retained identity is ever needed, add a marker rather than infer it from fields.
+  Residual stated in `docs/CONFORMANCE.md`.
+
+- [ ] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
+  identifier.** Filed 2026-08-31 by F-091's reconcile consult, which found it while refuting
+  the general PUBREL fence. NOT an alpha blocker: the residue is one identifier and one
+  Receive Maximum slot per occurrence, not a data loss. *The finding:* `finalizeDrainDelivery`
+  releases the recovered in-flight register, but nothing appears to remove or transition the
+  recovered `pendingPublish` entry and its `cpending` mapping; the callback then installs
+  `pendingPubRel`, and PUBCOMP removes only that PUBREL entry. The stale PUBLISH entry can
+  therefore keep reserving the identifier and its Receive Maximum slot for the life of the
+  session. Filed rather than folded into F-091 because it is a drain-bookkeeping defect
+  reached from a different route, and because F-091 neither introduced it nor is chartered
+  to fix it — but note it is the reason the general fence in F-092 cannot simply be tightened
+  without looking here first.
 
 - [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
   non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).

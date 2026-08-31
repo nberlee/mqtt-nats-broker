@@ -60,7 +60,7 @@ func TestTransportPubSub(t *testing.T) {
 	}
 
 	sid := []byte("1")
-	if _, err := c.processSub([]byte("test.subj"), nil, sid, cb, false); err != nil {
+	if _, _, err := c.processSub([]byte("test.subj"), nil, sid, cb, false); err != nil {
 		t.Fatalf("processSub: %v", err)
 	}
 	// Give the async subscription a moment to register.
@@ -126,7 +126,7 @@ func TestTransportUnsub(t *testing.T) {
 		mu.Unlock()
 	}
 	sid := []byte("9")
-	if _, err := c.processSub([]byte("u.subj"), nil, sid, cb, false); err != nil {
+	if _, _, err := c.processSub([]byte("u.subj"), nil, sid, cb, false); err != nil {
 		t.Fatalf("processSub: %v", err)
 	}
 	nc.Flush()

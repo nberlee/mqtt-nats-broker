@@ -1225,8 +1225,22 @@ func (c *client) closeConnection(reason ClosedState) {
 	// consults it from here on gets the indeterminate answer, not the old one.
 	c.authzValid = false
 	subs := c.subs
+	// The MAP-SWAP teardown case: every subscription leaves c.subs at once, so all of their
+	// retained frames are detached under c.mu here and ABANDONED after the unlock. (The other
+	// two departure sites are processUnsub, which also abandons, and processSub's same-sid
+	// replacement, which TRANSFERS instead — detaching is not releasing.) F-091.
+	//
+	// Needed for TOTALITY rather than for correctness: mqttHandleClosedClient nils sess.c
+	// before this runs, so the holds this connection owned are already inert by the shared
+	// predicate. Including it is cheaper to defend than a case analysis about which site may
+	// skip it.
+	var retained []mqttRetainedFrame
+	for _, sub := range subs {
+		retained = append(retained, c.detachRetainedFramesLocked(sub)...)
+	}
 	c.subs = nil
 	c.mu.Unlock()
+	c.releaseDetachedRetainedFrames(retained)
 	for _, sub := range subs {
 		if ns, ok := sub.nsub.(*nats.Subscription); ok && ns != nil {
 			_ = ns.Unsubscribe()
@@ -1328,7 +1342,18 @@ func (s *Server) drainClients(deadline time.Time) {
 // connection. Incoming NATS messages are reframed (headers + payload) and
 // dispatched to the subscription's delivery callback (icb), reproducing the
 // NATS-server delivery contract the MQTT core expects.
-func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward bool) (*subscription, error) {
+//
+// The second return value carries the buffered retained frames a DISPLACED same-sid
+// subscription was still holding, and the caller owes them a home: they are TRANSFERRED to
+// the replacement rather than released, because they are still owed to the client.
+//
+// Releasing them here would be wrong twice over. It would DISCARD a retained replay a
+// successful duplicate-filter SUBSCRIBE still owes — the same filter twice, the first entry
+// asking for the replay — and it would need `sess.mu`, which this generic function must not
+// take: `mqttProcessSubs` holds both `as.mu` and `sess.mu` across `sess.processSub`, which
+// reaches this call, and a Go mutex is not reentrant, so taking it here self-deadlocks the
+// read loop while it holds the account lock. Both were F-091 holistic-review findings.
+func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward bool) (*subscription, []mqttRetainedFrame, error) {
 	// Re-subscribing an existing sid (e.g. MQTT re-SUBSCRIBE to an already
 	// subscribed topic, which reuses the same delivery-subject sid) must
 	// replace, not add to, the interest: otherwise the old NATS subscription's
@@ -1387,7 +1412,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 			ns, err = nrc.Subscribe(string(subject), handler)
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		sub.nsub = ns
 
@@ -1404,7 +1429,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 		if bytes.HasPrefix(subject, []byte(mqttSubPrefix)) {
 			if ferr := nrc.Flush(); ferr != nil {
 				_ = ns.Unsubscribe()
-				return nil, ferr
+				return nil, nil, ferr
 			}
 		}
 
@@ -1427,7 +1452,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 			before := c.nrc.LastError()
 			if ferr := c.nrc.Flush(); ferr != nil {
 				_ = ns.Unsubscribe()
-				return nil, ferr
+				return nil, nil, ferr
 			}
 			if after := c.nrc.LastError(); after != nil && after != before &&
 				errors.Is(after, nats.ErrPermissionViolation) {
@@ -1437,7 +1462,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 				// properties block (some clients mishandle multi-byte property-length
 				// varints) and would leak internal backend detail to the client.
 				c.Errorf("MQTT: subscribe to %q denied by NATS: %v", string(subject), after)
-				return nil, errMQTTNotAuthorizedToSubscribe
+				return nil, nil, errMQTTNotAuthorizedToSubscribe
 			}
 		}
 	}
@@ -1445,9 +1470,20 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 	if c.subs == nil {
 		c.subs = make(map[string]*subscription)
 	}
+	// The DISPLACED entry is looked up here, in the same critical section that overwrites
+	// it, not from the unlocked lookup at the head of this function: that one is only
+	// deciding whether to unsubscribe the old NATS interest, and a frame could be buffered
+	// onto the old subscription after it.
+	//
+	// A subscription leaving c.subs must not take an owed retained replay with it (F-091).
+	// Its frames are MOVED to the replacement, which is the entry every later flush and
+	// every later teardown will find, so the replay is still delivered on a successful
+	// packet and the reservation is still released on a failed one — by the ordinary
+	// written and abandoned paths, with no special case here.
+	displaced := c.detachRetainedFramesLocked(c.subs[string(sid)])
 	c.subs[string(sid)] = sub
 	c.mu.Unlock()
-	return sub, nil
+	return sub, displaced, nil
 }
 
 // processUnsub removes interest for the given sid and unsubscribes the
@@ -1455,8 +1491,14 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 func (c *client) processUnsub(sid []byte) error {
 	c.mu.Lock()
 	sub := c.subs[string(sid)]
+	// This departure is a genuine teardown, so its retained frames are ABANDONED: nothing will
+	// ever write them, and the identifier would otherwise stay reserved against reallocation
+	// for the session's life. (A same-sid replacement in processSub detaches too, but
+	// TRANSFERS instead — see detachRetainedFramesLocked.) F-091.
+	retained := c.detachRetainedFramesLocked(sub)
 	delete(c.subs, string(sid))
 	c.mu.Unlock()
+	c.releaseDetachedRetainedFrames(retained)
 	if sub != nil {
 		if ns, ok := sub.nsub.(*nats.Subscription); ok && ns != nil {
 			return ns.Unsubscribe()

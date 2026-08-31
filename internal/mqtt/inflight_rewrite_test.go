@@ -1086,6 +1086,149 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 		t.Error("no QoS 0 enqueue was skipped, so the literal-zero exclusion matched nothing and " +
 			"the selector is probably wrong")
 	}
+	testFramingCloseSet(t)
+}
+
+// testFramingCloseSet is the other half of the guarantee above, and it exists because the
+// pairing guard can only see the two enqueue helpers.
+//
+// A hand-built frame escapes it entirely, which is what F-091 was: the retained path
+// framed its own PUBLISH with mqttMakePublishHeader and was flushed by a later
+// queueOutbound with no section at all, and this guard's own comment used to record that
+// as an accepted exclusion.
+//
+// So the claim is a CLOSE SET rather than another sample. Every production reference to
+// the three framing entry points is matched, and the set of enclosing functions is
+// compared for EQUALITY against the list below. A new caller fails; a caller that
+// disappears fails too, which is what stops the list rotting into a description of code
+// that has moved on.
+//
+// REFERENCE-based, not call-based. `f := mqttMakePublishHeader; f(...)`, a stored method
+// value, or passing the constructor to a higher-order function all frame a PUBLISH while
+// never appearing as a CallExpr.Fun, so anything that is not exactly the callee of a
+// direct call is rejected outright.
+//
+// WritePublishHeader is a METHOD, and go/ast alone cannot prove a selector's receiver is a
+// *mqttWriter. The name is therefore RESERVED package-wide: every selector with that name
+// is matched whatever its receiver. That is broader than strictly necessary and it is the
+// deliberate choice — every structural guard in this package is pure go/ast, and a
+// go/types dependency for one identifier is disproportionate.
+func testFramingCloseSet(t *testing.T) {
+	t.Helper()
+	const writeHeader = "WritePublishHeader"
+	framers := map[string]struct{}{
+		"mqttMakePublishHeader": {}, "mqttMakeAliasedPublishHeader": {},
+	}
+	// Each entry names what reserves the identifier it frames. The comment is
+	// documentation; the enforceable part is the membership.
+	want := map[string]string{
+		// Reserved by beginRetainedSendLocked, in this same function, before the append.
+		"mqttAccountSessionManager.serializeRetainedMsgsForSub": "beginRetainedSendLocked",
+		// DELEGATED: its caller opens beginSendLocked, which the pairing guard above binds.
+		"client.mqttEnqueuePublishMsgTo": "the caller's beginSendLocked",
+		// The framing helpers' own bodies. mqttWriter.WritePublishHeader is deliberately
+		// NOT here: it is the innermost writer and frames the header inline, so it
+		// references none of the three names and never appears as a caller.
+		"client.mqttMakeAliasedPublishHeader": "n/a, framing helper",
+		"mqttMakePublishHeader":               "n/a, framing constructor",
+	}
+	got := map[string]struct{}{}
+
+	for _, file := range testMQTTProductionFiles(t) {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		// Parents, because "is this reference exactly a call's callee" is a question about
+		// the node ABOVE it and ast.Inspect only walks downward.
+		parent := map[ast.Node]ast.Node{}
+		// Over the WHOLE FILE, not only function bodies. A package-level alias —
+		// `var framePublish = mqttMakePublishHeader` — is a GenDecl initializer, so a walk
+		// restricted to FuncDecl bodies never sees it, and every call through it is then
+		// invisible too. That was the second holistic round's finding: the guard's comment
+		// claimed "every production reference" while the walk did not.
+		ast.Inspect(f, func(n ast.Node) bool {
+			if n == nil {
+				return false
+			}
+			ast.Inspect(n, func(ch ast.Node) bool {
+				if ch != nil && ch != n {
+					if _, seen := parent[ch]; !seen {
+						parent[ch] = n
+					}
+					return false
+				}
+				return true
+			})
+			return true
+		})
+		for _, decl := range f.Decls {
+			// The enclosing name a reference is attributed to. A FuncDecl gives its own
+			// qualified name; anything else is package scope, which is never an approved
+			// member, so a framing reference there fails the membership check as well as
+			// the direct-callee check.
+			qualified := "package scope"
+			var scope ast.Node = decl
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				if fn.Body == nil {
+					continue
+				}
+				qualified = testQualifiedFuncName(fn)
+				scope = fn.Body
+			}
+			ast.Inspect(scope, func(n ast.Node) bool {
+				// A framing entry point reaches the AST in two shapes and BOTH have to be
+				// matched at the outermost node, or the "is this the callee" test asks
+				// about the wrong parent. `mqttMakePublishHeader(...)` is a bare Ident
+				// whose parent is the CallExpr; `cc.mqttMakeAliasedPublishHeader(...)` is
+				// a SelectorExpr whose Sel is that Ident and whose PARENT is the CallExpr.
+				// Matching the inner Ident of the second shape reported every ordinary
+				// method call as an alias — which this guard did on its first run.
+				var ref ast.Node
+				switch v := n.(type) {
+				case *ast.SelectorExpr:
+					if _, ok := framers[v.Sel.Name]; ok || v.Sel.Name == writeHeader {
+						ref = v
+					}
+				case *ast.Ident:
+					if _, ok := framers[v.Name]; !ok {
+						return true
+					}
+					if sel, isSel := parent[v].(*ast.SelectorExpr); isSel && sel.Sel == v {
+						return true // counted at the SelectorExpr above
+					}
+					ref = v
+				}
+				if ref == nil {
+					return true
+				}
+				got[qualified] = struct{}{}
+				call, _ := parent[ref].(*ast.CallExpr)
+				if call == nil || call.Fun != ref {
+					t.Errorf("%s: %s takes a %s framing entry point as a VALUE rather than calling it "+
+						"directly; an identifier-bearing PUBLISH framed through an alias escapes every "+
+						"reservation guard in this package",
+						fset.Position(ref.Pos()), qualified, "PUBLISH")
+				}
+				return true
+			})
+		}
+	}
+
+	for name := range got {
+		if _, ok := want[name]; !ok {
+			t.Errorf("%s frames an identifier-bearing PUBLISH and is not in the frozen close set: "+
+				"say which reservation covers its identifier and add it here, or route it through "+
+				"mqttEnqueuePublishMsgTo", name)
+		}
+	}
+	for name, reservation := range want {
+		if _, ok := got[name]; !ok {
+			t.Errorf("%s no longer frames an identifier-bearing PUBLISH (its reservation was %q), so this "+
+				"close set describes code that has moved: remove the entry", name, reservation)
+		}
+	}
 }
 
 // A hold's LIVENESS is the only thing that reserves an identifier, and presence in the
@@ -1112,9 +1255,18 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// The predicate.
 		"mqttSession.pubCompHeldLocked": {}, "mqttSession.sendHoldLiveLocked": {},
 		"mqttSession.sendReservedLocked": {},
-		// The four helpers that mutate a hold.
+		"mqttSession.retainedHeldLocked": {},
+		// The helpers that mutate a hold.
 		"mqttSession.beginSendLocked": {}, "mqttSession.beginPubRelSendLocked": {},
 		"mqttSession.endSend": {}, "mqttSession.consumePubRelAckLocked": {},
+		// A retained frame's reservation: one opener and two release verbs, because
+		// written completion is fenced by the session incarnation and abandonment is not
+		// (F-091). endRetainedSends and abandonRetainedSends are deliberately ABSENT:
+		// they only take the lock and delegate, so the map access stays in these three.
+		"mqttSession.beginRetainedSendLocked":            {},
+		"mqttSession.releaseRetainedSendWrittenLocked":   {},
+		"mqttSession.releaseRetainedSendAbandonedLocked": {},
+		"mqttSession.dropRetainedSendLocked":             {},
 		// The bounded-memory sweep.
 		"mqttSession.sweepDeadSendHoldsLocked": {},
 	}
@@ -2008,8 +2160,11 @@ func TestMQTTInflightPubRelSectionRefusesUnderALivePublishWrite(t *testing.T) {
 	}
 	e.sess.endSend(e.c, pi, pubTok)
 
-	// The other direction: a live PUBREL debt refuses a PUBLISH section, because the
-	// client still holds that identifier for an exchange it has not completed.
+	// UNCHANGED by F-091, and deliberately so: F-091 leaves ALL PUBREL admission exactly as
+	// it was. Three candidate refusals were tried there and all three were deleted (D4), so
+	// what this test exercises is the pre-existing rule alone — an active write token refuses,
+	// nothing else does. Correlating a stored PUBREL record against the entry that owns its
+	// identifier is F-092's, not this item's.
 	e.sess.mu.Lock()
 	relTok, ok := e.sess.beginPubRelSendLocked(e.c, pi)
 	e.sess.mu.Unlock()

@@ -3796,12 +3796,38 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 		// re-offers the record once that write has returned.
 		return _EMPTY_, false
 	}
-	// A standing debt is only ours to add to when this connection incurred it. One owed
-	// by a predecessor can never be answered — mqttProcessPubComp refuses a PUBCOMP from
-	// any connection that is not sess.c — so it is RESET rather than accumulated onto.
-	// Adding to it instead is what would leave a resumed session's identifier held
-	// forever: the client owes exactly one PUBCOMP on this connection, and a count of
-	// two would never reach zero.
+	// NO retained-term refusal here, and NO fence on a live pendingPublish entry. PUBREL
+	// ADMISSION IS DELIBERATELY UNCHANGED FROM BEFORE F-091, and that is a reviewed scope
+	// decision (lane DECISIONS.md, D4) rather than an omission.
+	//
+	// A retained-only hold may therefore coexist with the PUBREL token and PUBCOMP debt this
+	// call is about to add. That is coherent: the owner matches so nothing is reset, and
+	// endSend and consumePubRelAckLocked both ask the shared liveness predicate, so each term
+	// is removed only by the event that discharges it.
+	//
+	// Three refusals were tried here and all three were REFUTED — do not re-propose any:
+	//
+	//   - refusing on a live RETAINED term refuses the retained QoS 2 exchange's OWN PUBREL,
+	//     because the delivery-side flusher keeps the hold live until after it writes the
+	//     triggering live PUBLISH; the record then waits out AckWait where HEAD transmitted at
+	//     once. The compensating "retire the term at PUBREC" needed two further fixes and
+	//     still lost custody across a concurrent clear() in one ordering or the other;
+	//   - refusing on ANY live pendingPublish entry breaks the UNSUBSCRIBE drain, which
+	//     legitimately recreates a CORRELATED PUBREL under a recovered entry's identifier
+	//     (measured: three drain tests timed out waiting for a PUBREL the client was owed);
+	//   - refusing on a SOURCE-LESS entry starves an abandoned frame's record for the life of
+	//     the connection, since that empty entry survives until the next resume.
+	//
+	// The stale-PUBREL multiplexing hazard is real and is owned WHOLLY by F-092, whose fence
+	// correlates the record's (durable, source sequence) against the entry holding the
+	// identifier — a decision only the delivery callback can make, because only it parses the
+	// correlation. F-091's reservation still stops bumpPI and any PUBLISH send section from
+	// reusing the identifier, which is what it was chartered to do.
+	// A standing debt is only ours to add to when this connection incurred it. One owed by a
+	// predecessor can never be answered — mqttProcessPubComp refuses a PUBCOMP from any
+	// connection that is not sess.c — so it is RESET rather than accumulated onto. Adding to
+	// it instead is what would leave a resumed session's identifier held forever: the client
+	// owes exactly one PUBCOMP on this connection, and a count of two would never reach zero.
 	if h == nil || h.owner != cc.cid {
 		h = &mqttSendHold{owner: cc.cid}
 		if sess.sendsInFlight == nil {
@@ -3814,6 +3840,146 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 	h.owner = cc.cid
 	h.pubCompOwed++
 	return token, true
+}
+
+// beginRetainedSendLocked reserves pi for ONE buffered retained PUBLISH, from this
+// allocation until the frame has been written or is provably unwritable. "Written" ends
+// the reservation only while the allocating incarnation is still current: past a clear()
+// this hold is the identifier's ONLY reservation and outlives the write. See
+// releaseRetainedSendWrittenLocked.
+//
+// Taken at ALLOCATION rather than at the flush, in the same sess.mu acquisition that runs
+// trackPublishRetained, so no goroutine ever observes the identifier allocated and
+// unreserved. That is also why the caller's own gate matters: serializeRetainedMsgsForSub
+// runs holding asm.sessLocked[sess.id], so no successor can rebind between the two.
+//
+// Session lock held on entry.
+func (sess *mqttSession) beginRetainedSendLocked(cc *client, pi uint16) bool {
+	// A ZERO cid is refused rather than recorded, exactly as beginPubRelSendLocked
+	// refuses it: zero is an uninitialized connection identity, not a connection
+	// identity, and two of them would be indistinguishable to every ownership
+	// comparison. sess.c != cc keeps a reservation from being opened on behalf of a
+	// connection this session no longer serves.
+	if cc == nil || pi == 0 || cc.cid == 0 || sess.c != cc {
+		return false
+	}
+	h := sess.sendsInFlight[pi]
+	// A hold that is LIVE for ANY reason refuses. Including an already-live retained
+	// reservation: one identifier is allocated per retained message, so a second live
+	// one is an invariant violation rather than a case to serve. bumpPI cannot in fact
+	// hand out a live identifier — it asks sendReservedLocked — so this is a defensive
+	// agreement with the allocator, stated as an invariant rather than relied on.
+	if sess.sendHoldLiveLocked(h) {
+		return false
+	}
+	// An INERT hold is REPLACED, and the replacement takes THIS connection's owner.
+	// Presence is not a reservation (F-089's rule 2), so an inert hold reserves nothing
+	// for anybody and taking it over is what keeps the identifier from being stranded
+	// for the session's life. Inheriting the predecessor's owner instead would leave the
+	// new reservation inert on arrival.
+	if h == nil {
+		if sess.sendsInFlight == nil {
+			sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
+		}
+		h = &mqttSendHold{}
+		sess.sendsInFlight[pi] = h
+	}
+	h.owner = cc.cid
+	h.retainedGen = sess.gen
+	return true
+}
+
+// releaseRetainedSendWrittenLocked ends the reservation of a retained frame whose bytes
+// have gone out — but only while the incarnation that allocated it is still current.
+//
+// Past a clear() this hold is the identifier's ONLY reservation: the map that would
+// otherwise carry custody on to PUBACK/PUBREC was nilled and last_pi was reset, so the
+// write returning does not free the identifier and releasing here would put a second
+// PUBLISH under it on the same socket. Held instead, it goes inert when ownership moves
+// and is swept there (F-091).
+//
+// Session lock held on entry.
+func (sess *mqttSession) releaseRetainedSendWrittenLocked(cc *client, pi uint16) {
+	h := sess.sendsInFlight[pi]
+	// Another connection's reservation is not ours to release: it already reserves
+	// nothing, and leaving it costs nothing. Same rule as consumePubRelAckLocked.
+	if h == nil || cc == nil || cc.cid == 0 || h.owner != cc.cid || h.retainedGen == _EMPTY_ {
+		return
+	}
+	if h.retainedGen != sess.gen {
+		return
+	}
+	sess.dropRetainedSendLocked(pi, h)
+}
+
+// releaseRetainedSendAbandonedLocked ends the reservation of a retained frame that is
+// provably never going to be written — its subscription has left c.subs, or the frame was
+// discarded before it was ever buffered.
+//
+// Unconditional, and the generation fence deliberately does NOT apply: no bytes reached
+// the client, so there is nothing for a re-minted identifier to collide with. Holding on
+// here would reserve the identifier against reallocation for the session's life while
+// nothing will ever write the frame (F-091).
+//
+// Session lock held on entry.
+func (sess *mqttSession) releaseRetainedSendAbandonedLocked(cc *client, pi uint16) {
+	h := sess.sendsInFlight[pi]
+	if h == nil || cc == nil || cc.cid == 0 || h.owner != cc.cid || h.retainedGen == _EMPTY_ {
+		return
+	}
+	sess.dropRetainedSendLocked(pi, h)
+}
+
+// dropRetainedSendLocked clears the retained term and removes the hold once it reserves
+// nothing more. The removal asks the shared predicate rather than re-spelling it, which
+// is what keeps a co-resident write token or PUBCOMP debt from being discarded with it.
+//
+// Session lock held on entry.
+func (sess *mqttSession) dropRetainedSendLocked(pi uint16, h *mqttSendHold) {
+	h.retainedGen = _EMPTY_
+	if !sess.sendHoldLiveLocked(h) {
+		delete(sess.sendsInFlight, pi)
+	}
+}
+
+// endRetainedSends records that these buffered retained frames have been WRITTEN, which
+// is the event that MAY end their reservation — see releaseRetainedSendWrittenLocked for
+// when it does not.
+//
+// Its ONLY callers are the two flushers. A departure never comes here: an abandoned frame
+// was not written, so it takes the UNFENCED verb through releaseDetachedRetainedFrames →
+// abandonRetainedSends instead, and conflating the two would apply the generation fence to a
+// frame no client ever saw.
+//
+// Returns immediately on an empty list WITHOUT taking the session lock.
+//
+// Session lock NOT held on entry: both flushers hold the CONNECTION lock while they take the
+// frames and must release it before reaching for sess.mu.
+func (sess *mqttSession) endRetainedSends(cc *client, pis []uint16) {
+	if len(pis) == 0 {
+		return
+	}
+	sess.mu.Lock()
+	for _, pi := range pis {
+		sess.releaseRetainedSendWrittenLocked(cc, pi)
+	}
+	sess.mu.Unlock()
+}
+
+// abandonRetainedSends is endRetainedSends' counterpart for frames that will never be
+// written, and it is the reason the two verbs are separate: this one is not fenced by the
+// generation.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) abandonRetainedSends(cc *client, pis []uint16) {
+	if len(pis) == 0 {
+		return
+	}
+	sess.mu.Lock()
+	for _, pi := range pis {
+		sess.releaseRetainedSendAbandonedLocked(cc, pi)
+	}
+	sess.mu.Unlock()
 }
 
 // consumePubRelAckLocked records that the client answered one transmitted PUBREL under
@@ -3831,7 +3997,11 @@ func (sess *mqttSession) consumePubRelAckLocked(c *client, pi uint16) {
 		return
 	}
 	h.pubCompOwed--
-	if h.token == _EMPTY_ && h.pubCompOwed == 0 {
+	// The shared predicate, NOT a hand-written "token empty and no debt". Re-spelling the
+	// condition is what made this mutator blind to the retained term: a PUBCOMP would
+	// have deleted the whole hold and with it a buffered retained PUBLISH's only
+	// reservation (F-091). endSend already asks the predicate for the same reason.
+	if !sess.sendHoldLiveLocked(h) {
 		delete(sess.sendsInFlight, pi)
 	}
 }
@@ -3844,11 +4014,25 @@ func (sess *mqttSession) pubCompHeldLocked(h *mqttSendHold) bool {
 	return h != nil && h.pubCompOwed > 0 && h.owner != 0 && sess.c != nil && h.owner == sess.c.cid
 }
 
+// retainedHeldLocked reports whether this hold still reserves its identifier because a
+// buffered retained PUBLISH under it is unwritten, or was written past a clear() that
+// destroyed the pendingPublish entry which would otherwise have carried custody on.
+//
+// Owner-scoped like pubCompHeldLocked, and sound for a different reason: once the
+// connection is no longer the session's, no ADDITIONAL identifier-bearing PUBLISH under
+// this identifier can reach that socket, so the orphaned frame is one PUBLISH under one
+// identifier and reserves nothing. See mqttSendHold.retainedGen (F-091).
+//
+// Session lock held on entry.
+func (sess *mqttSession) retainedHeldLocked(h *mqttSendHold) bool {
+	return h != nil && h.retainedGen != _EMPTY_ && h.owner != 0 && sess.c != nil && h.owner == sess.c.cid
+}
+
 // sendHoldLiveLocked reports whether a hold reserves its identifier at all.
 //
 // Session lock held on entry.
 func (sess *mqttSession) sendHoldLiveLocked(h *mqttSendHold) bool {
-	return h != nil && (h.token != _EMPTY_ || sess.pubCompHeldLocked(h))
+	return h != nil && (h.token != _EMPTY_ || sess.pubCompHeldLocked(h) || sess.retainedHeldLocked(h))
 }
 
 // sendReservedLocked is the question every reservation reader asks: may pi be used?

@@ -1076,10 +1076,50 @@ map was empty until that record was delivered.
 
 Residuals:
 
-- **Retained-message deliveries are not covered.** A retained QoS 1/2 send has no
-  JetStream backing at all, so it has no register and cannot be redelivered after a
-  restart in the first place; it is released on resume rather than kept (which is
-  unchanged, and is what stops it leaking a Receive Maximum slot).
+- **Retained-message deliveries are not covered ACROSS A RESTART, and the identifier is
+  not either.** A retained QoS 1/2 send has no JetStream backing at all, so it has no
+  register and cannot be redelivered after a restart in the first place; it is released on
+  resume rather than kept (which is unchanged, and is what stops it leaking a Receive
+  Maximum slot). The consequence for the identifier is now stated rather than left
+  implicit: a client that received a retained QoS 1/2 PUBLISH whose acknowledgement did not
+  reach this broker before a restart or a failover gets **no retransmission under the
+  original identifier**, and because `dropUnredeliverableRetained` removes that entry on
+  resume, a later allocation on the resumed session **may re-mint that identifier** while
+  a QoS 2 client is still holding it awaiting PUBREL. Closing this would mean giving a
+  retained send durable state of its own, which is a different feature from identifier
+  custody; F-091 deliberately did not do it.
+  **What F-091 does guarantee is custody WITHIN one session object**, which is where the
+  defect was: the identifier of a buffered or in-flight retained frame survives `clear()`
+  and survives the write that follows a `clear()`, so it can no longer be re-minted while
+  that write is still in the socket. What is released is the SUPPLEMENTAL retained
+  reservation, on exactly two events: the frame is WRITTEN under its own generation, or is
+  ABANDONED because no subscription will ever write it. A departure is not itself a release
+  — a same-sid replacement departs `c.subs` but its frames and their reservations are
+  TRANSFERRED intact to the replacement, because a duplicate-filter SUBSCRIBE still owes that
+  replay. The `pendingPublish` entry is NOT released by either: it goes on
+  reserving the identifier until the client acknowledges, or, for a frame abandoned with a
+  rolled-back subscription, until the session's next resume drops it
+  (`dropUnredeliverableRetained`). That surviving entry is the pre-existing held slot below,
+  not something this change introduces. The
+  reservation is memory-only by construction — a crash closes the very socket it protected
+  — so nothing here is conditioned on a rollout. The guarantee is about the ALLOCATOR and
+  the PUBLISH path: while the reservation is live, `bumpPI` will not hand the identifier
+  out and no PUBLISH send section may open under it. It says nothing about PUBREL
+  admission, which is unchanged and is F-092's.
+- **A stored PUBREL whose acknowledgement was lost may still be transmitted under an
+  identifier another exchange owns, exactly as before F-091.** A PUBCOMP removes
+  `pendingPubRel[pi]` and then fire-and-forget acknowledges the record, so a lost
+  acknowledgement leaves it AckWait-eligible while nothing names the identifier; after reuse
+  its redelivery can install `pendingPubRel[pi]` alongside the new owner's entry — two
+  exchanges through one identifier, with the delivery callback's duplicate check recognising
+  only an already-FILLED entry. **F-091 does NOT filter any part of this class**: PUBREL
+  admission is unchanged, deliberately, after three candidate partial fences were each
+  refuted in review. The whole class is **F-092**, whose fence correlates the record's
+  `(durable, source sequence)` against the entry holding the identifier, with the QoS 2
+  subtlety that PUBREC transitions the identifier rather than releasing it so a mismatched
+  record must stay withheld until PUBCOMP.
+  What F-091 does guarantee is narrower and is stated above: while a retained reservation
+  is live, neither the allocator nor a PUBLISH send section may reuse that identifier.
 - **Promptness, not continuity, still depends on the reconnect being same-process.**
   The identifier is restored either way, but the immediate NAK-driven redelivery needs
   a live per-attempt JetStream ack subject, which a recovered entry does not have — so

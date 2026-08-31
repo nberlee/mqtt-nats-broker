@@ -4893,17 +4893,17 @@ The invariants, in the order they matter:
   acknowledgement or a session discard could free the identifier and the allocator could
   re-mint it — two packets under one identifier, in order, on one socket. Every
   JETSTREAM-BACKED QoS 1/2 **PUBLISH** transmission and every **PUBREL** transmission
-  therefore runs inside a SEND SECTION. One identifier-bearing transmission is NOT
-  covered and is filed: a **retained** QoS 1/2 message, which allocates through
-  `trackPublishRetained`, builds its frame directly and is flushed by a later
-  `queueOutbound` with no section (F-091).
+  therefore runs inside a SEND SECTION, and a **retained** QoS 1/2 message — which has no
+  section, because it allocates in `serializeRetainedMsgsForSub`, frames itself, and is
+  written by a later `queueOutbound` — carries an equivalent reservation in the same
+  registry instead (F-091, below).
   The authority is a session-level registry of identifier-to-hold rather than the entry:
   a successful PUBREC replaces the PUBLISH entry with a PUBREL one while the write may
   still be blocked, and a PUBCOMP untracks the PUBREL entry while a duplicate copy is
   still unanswered, so per-entry state alone would strand the identifier. The registry
   deliberately survives a session discard — `clear()` resets the identifier counter to
   zero while the displaced connection's write is still in the socket.
-- **A hold has TWO release conditions, and PRESENCE IN THE REGISTRY IS NOT A
+- **A hold has THREE release conditions, and PRESENCE IN THE REGISTRY IS NOT A
   RESERVATION.** A *write that has not returned* is the only fact available on the
   PUBLISH side, because at that point no acknowledgement has been asked for yet. On the
   PUBREL side the real event is available and it is the one [MQTT-2.3.1-4] names: the
@@ -4917,6 +4917,70 @@ The invariants, in the order they matter:
   the write drains at `endSend` on the transmitting goroutine and survives every
   transition, while a PUBCOMP is only ever processed on the session's CURRENT connection,
   so a debt owed to any other connection can never be answered.
+- **A retained send's reservation is the third condition, and it is fenced by the session
+  INCARNATION rather than by the write.** A retained QoS 1/2 message has no JetStream
+  backing, so it has no register (R6) and never had a send section: it allocates in
+  `serializeRetainedMsgsForSub`, is buffered on `sub.mqtt.prm`, and is written by a later
+  flush — the SUBACK tail's, or the first live delivery to that subscription. Across that
+  span its only other reservation is the `pendingPublish` entry, and `clear()` destroys
+  exactly that while resetting the counter, so the identifier was handed straight back out
+  while the displaced connection's write was still in the socket. The reservation is
+  therefore taken in the same `sess.mu` acquisition as the allocation — under
+  `asm.sessLocked[sess.id]`, so no successor can rebind between the two — and each buffered
+  frame carries the identifier it was framed under.
+  **Written completion ends it only while the allocating generation is still current.**
+  Then `pendingPublish` is still there to carry custody on to the PUBACK, or a PUBACK for
+  this very frame removed it and the identifier is genuinely free. Past a `clear()` neither
+  is true, so the write returning does NOT free it: releasing there put a second PUBLISH
+  under that identifier on the same socket, because `clear()` does not rebind `sess.c` and
+  the still-bound connection's own delivery callbacks pass every gate. `sess.gen` is the
+  fence because `clear()` re-mints it and an acknowledgement does not, and it never errs
+  toward releasing — no path nils `pendingPublish` without re-minting.
+  **A subscription leaving `c.subs` must not take an owed retained frame with it**, and the
+  two dispositions differ. Its frames are detached while the connection lock is held, and
+  then either TRANSFERRED to a reachable replacement or ABANDONED with their reservations
+  released. Abandonment is UNFENCED — no bytes reached the client, so there is nothing for
+  a re-minted identifier to collide with, and holding on would reserve the identifier against
+  reallocation for the session's life while nothing will ever write the frame.
+  **The same-sid replacement TRANSFERS rather than abandons**, and that distinction is
+  load-bearing: a v5 SUBSCRIBE may legitimately carry one filter twice with the first entry
+  asking for the replay, so releasing the displaced frames would silently discard a retained
+  delivery the client is owed. Moving them onto the replacement — the entry every later flush
+  and every later teardown finds — also keeps the replacement out of the reservation
+  vocabulary entirely: the ordinary written and abandoned paths dispose of the supplemental
+  RESERVATION. Neither releases the identifier itself — the `pendingPublish` entry goes on
+  reserving that until the client acknowledges, or until the session's next resume drops an
+  abandoned frame's entry.
+  The three direct mutation sites are `processUnsub`'s delete, `processSub`'s replacement
+  and `closeConnection`'s map swap; the last is for totality rather than correctness,
+  since `mqttHandleClosedClient` nils `sess.c` first.
+  A structural test holds those three to a frozen predicate — the mutation must be inside
+  the connection lock with an unconsumed detach between the lock and the mutation. That test
+  is a bounded regression tripwire, deliberately not a proof: it recognises only direct
+  mutations through a signature-declared `*client` identifier, and does not resolve local
+  aliases or helper-mediated mutation. The invariant above is universal; only the test's
+  reach is bounded, and that boundary is fixed rather than open — see its res-judicata note.
+  Once ownership moves the term is inert, and soundly so: no additional identifier-bearing
+  PUBLISH *under that identifier* can reach the orphan's socket, because every route that
+  could frame one opens a reservation refused on `sess.c != cc`.
+  **PUBREL admission is deliberately UNCHANGED by this mechanism.** `beginPubRelSendLocked`
+  refuses an active transmission token, as it always did, and NOT a retained-only hold —
+  so a PUBREL token and PUBCOMP debt may sit beside a retained term on one hold, which is
+  coherent because the owner matches and both `endSend` and `consumePubRelAckLocked` ask
+  the shared predicate, so each term is discharged only by its own event. Three refusals
+  were tried here and all three refuted: a retained-term refusal blocks the retained QoS 2
+  exchange's OWN PUBREL (the flusher holds the term live until after the triggering live
+  PUBLISH is written, so the record waited out AckWait); a refusal on any live
+  `pendingPublish` entry breaks the UNSUBSCRIBE drain, which legitimately recreates a
+  correlated PUBREL under a recovered entry's identifier; and one on a source-less entry
+  starves an abandoned frame's record for the connection's life. The stale-PUBREL
+  multiplexing hazard is owned wholly by F-092, whose fence correlates the record against
+  the entry holding the identifier — a decision only the delivery callback can make. A
+  successful PUBREC is ordinary successor custody: it replaces the PUBLISH entry with a
+  `pendingPubRel` one, and the retained term is untouched by it. That is deliberately not
+  the stronger "every transmission passes a send gate" — QoS 0 has no gate — nor "no
+  additional identifier-bearing PUBLISH at all", since a multi-frame retained buffer holds
+  several, each under its own identifier.
 - **The acknowledgement debt is OWNED by a connection identity and read through
   `sess.c`, not dropped at named transition sites.** The identity is the connection's
   `cid`, a monotonic never-reused scalar — deliberately not a client pointer, because an
@@ -4938,10 +5002,22 @@ The invariants, in the order they matter:
   — reserves nothing, and a reader that met one and refused would strand the identifier,
   its register and a Receive Maximum slot for the session's life. Such a hold is TAKEN
   OVER, never refused, and dropping it loses nothing precisely because it reserved
-  nothing. `clear()`'s sweep is bounded-memory hygiene on that basis and nothing rests on
-  it. The rule is enforced as an ownership boundary rather than a habit: the registry is
-  touched only by the liveness predicate and the four helpers that mutate a hold, and
-  every other reader asks `sendReservedLocked`.
+  nothing. The sweep is bounded-memory hygiene on that basis and nothing rests on it; it
+  runs at `clear()` and again immediately after the CONNECT rebind assigns `sess.c`, which
+  is the only point a hold's owner changes and therefore the only point the predicate turns
+  a predecessor's owner-scoped term inert. A live write token is owner-independent and
+  survives both. That is not the "dropped at a named transition site" the debt rule
+  forbids: the rule is about a LIVE debt, and the sweep deletes only what the predicate has
+  already proved reserves nothing. The rule is enforced as an ownership boundary rather
+  than a habit: the registry is touched only by the liveness predicate and the helpers that
+  mutate a hold, and every other reader asks `sendReservedLocked`.
+  Adding a term to that predicate is NOT additive — it changes what every reader and
+  mutator means. The ones that ask the predicate adapt for free; the ones that re-spell the
+  condition do not — and when the retained term arrived, `consumePubRelAckLocked` was the
+  one that had to change, switching to the shared predicate so a PUBCOMP could no longer
+  delete a hold carrying a live retained reservation. `beginPubRelSendLocked` was given a
+  retained-term refusal too and it was DELETED again: see the PUBREL-admission paragraph
+  above for why, and do not reinstate it.
 - **A removal path that meets an active section CONDEMNS the entry** instead of deleting
   it, parking the continuation it owes; the first parked disposition wins, because every
   continuation is idempotent against another remover's durable work. Terminal
