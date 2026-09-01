@@ -25,16 +25,79 @@ import (
 func newBringUpServer(t *testing.T) (*Server, *client, *nats.Conn) {
 	t.Helper()
 	_, nc := runNATS(t)
+	return newBringUpServerOn(t, nc, "node1")
+}
+
+// testStopBringUpServer stops a bring-up broker and WAITS for it to be quiescent.
+//
+// Deresidenting the managers stops new work being handed out; the rest is Shutdown's
+// own phase order, and following it exactly is the point.
+//
+// SIGNALLING is not quiescence. Manager initialization runs the initial expiry, orphan
+// and QoS 2 sweeps before those goroutines ever reach their first quit-channel select
+// (mqtt.go), and willClaimLoop runs its initial scan the same way, so a
+// signalled-but-unfinished pass is still reading and writing JetStream while a fixture
+// deletes streams underneath it.
+//
+// Nor is grWG alone enough, which is the trap this helper fell into once: the delayed-
+// Will claim loop is tracked on willClaimWG, and the fire timers and publisher workers
+// on willTimerWG and willWorkerWG. Shutdown drains all three — after closing Will
+// dispatch — BEFORE it closes quitCh and waits on grWG, and so does this.
+//
+// Idempotent, so an explicit stop and the test cleanup can both call it.
+func testStopBringUpServer(t *testing.T, s *Server) {
+	t.Helper()
+	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+	if v, ok := testBringUpStops.Load(s); ok {
+		v.(func())()
+	}
+}
+
+// testBringUpStops holds each bring-up server's idempotent stop, so a test can stop
+// a broker mid-test (the reset contract needs that) without the cleanup then closing
+// an already-closed channel.
+var testBringUpStops sync.Map // *Server -> func()
+
+// newBringUpServerOn is newBringUpServer against an EXISTING connection, for a
+// test that needs a second, independent broker over one store — a restart, or a
+// peer.
+func newBringUpServerOn(t *testing.T, nc *nats.Conn, node string) (*Server, *client, *nats.Conn) {
+	t.Helper()
 	s := &Server{
 		nrc:      nc,
 		opts:     &Options{},
 		quitCh:   make(chan struct{}),
-		nodeName: "node1",
+		nodeName: node,
+		// Initialized because the stop below follows Shutdown's phase order, and
+		// closeWillDispatch closes this channel. NewServer does the same; a minimal
+		// literal that omits it panics on a nil-channel close the moment a fixture
+		// stops a broker properly rather than just dropping it.
+		willClaimStopCh: make(chan struct{}),
+		willTimers:      make(map[string]*time.Timer),
 	}
 	s.running.Store(true)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	c := s.createInternalAccountClient()
-	t.Cleanup(func() { close(s.quitCh) })
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			// Shutdown's own phase order, minus the client phases these fixtures
+			// never have: stop Will dispatch and drain BOTH its wait groups, then
+			// the publisher workers, and only then close quitCh and drain the
+			// background goroutines. willClaimLoop is tracked on willClaimWG, NOT
+			// grWG, and it performs its initial JetStream scan before reaching its
+			// first quit select — so waiting on grWG alone lets a claimant keep
+			// reading the very streams a reset is deleting.
+			s.closeWillDispatch()
+			s.willTimerWG.Wait()
+			s.willClaimWG.Wait()
+			s.willWorkerWG.Wait()
+			close(s.quitCh)
+			s.grWG.Wait()
+		})
+	}
+	testBringUpStops.Store(s, stop)
+	t.Cleanup(func() { stop(); testBringUpStops.Delete(s) })
 	return s, c, nc
 }
 
@@ -96,23 +159,18 @@ func TestSessionManagerEpochCreateRaceAdoptsWinner(t *testing.T) {
 	s, c, nc := newBringUpServer(t)
 	js, ctx := newJS(t, nc)
 
-	// A "winner" replica created $MQTT_sess first, with its epoch and an unrelated
-	// metadata key the manager must preserve.
-	winnerEpoch := mqttGenSessEpoch()
-	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
-		Name: mqttSessStreamName,
-		Subjects: []string{
-			mqttSessStreamSubjectPrefix + ">",
-			mqttAcceptSubjectPrefix + ">",
-		},
-		Storage:            jetstream.FileStorage,
-		Retention:          jetstream.LimitsPolicy,
-		MaxMsgsPerSubject:  1,
-		AllowAtomicPublish: true,
-		Metadata:           map[string]string{mqttSessEpochMetaKey: winnerEpoch, "unrelated_key": "keepme"},
-	}); err != nil {
-		t.Fatalf("pre-create winner session stream: %v", err)
-	}
+	// A "winner" replica got there first and provisioned the WHOLE BUNDLE, which is
+	// what a broker that completes initialization leaves behind — and, since the
+	// nine streams are one recreation unit, the only shape an arriving manager may
+	// admit at all. Pre-creating $MQTT_sess alone (as this fixture used to) is now
+	// a proper subset and is refused by the preflight before any of this is
+	// reached, so it would no longer test adoption.
+	//
+	// The unrelated metadata key rides on $MQTT_sess for the same reason as before:
+	// the manager must adopt the epoch WITHOUT updating the stream config.
+	winnerEpoch := testCreateBundle(t, nc, map[string]func(*StreamConfig){
+		mqttSessStreamName: func(cfg *StreamConfig) { cfg.Metadata["unrelated_key"] = "keepme" },
+	})
 
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
 	if err != nil {
@@ -209,11 +267,35 @@ func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
 	if !mqttValidSessEpoch(epochs[0]) || epochs[0] != epochs[1] {
 		t.Fatalf("race must converge on one valid epoch, got %q and %q", epochs[0], epochs[1])
 	}
+	// And the convergence reaches the WHOLE BUNDLE, not just the two managers'
+	// in-memory fields: all nine streams must carry that one epoch. Two racing
+	// brokers each stamp the eight non-minting streams they create, so a manager
+	// that adopted the epoch it ASKED for rather than the one that exists would
+	// leave the bundle split — and the two in-memory values above would still
+	// agree in the interleavings where the same broker won both.
+	asm, aerr := s1.getOrCreateMQTTAccountSessionManager(c1)
+	if aerr != nil || asm == nil {
+		t.Fatalf("the race left no usable account manager: %v", aerr)
+	}
+	for _, name := range mqttTestBrokerStreamNames {
+		si, err := asm.jsa.lookupStream(name)
+		if err != nil || si == nil {
+			t.Fatalf("lookup %s after the race: si=%v err=%v", name, si, err)
+		}
+		if got := si.Config.Metadata[mqttSessEpochMetaKey]; got != epochs[0] {
+			t.Fatalf("%s carries recovery epoch %q after the race, want the converged %q",
+				name, got, epochs[0])
+		}
+	}
 }
 
-// TestSessionManagerEpochRecreationYieldsDifferentEpoch (plan test 14e): deleting
-// and recreating $MQTT_sess through a fresh manager produces a different incarnation
-// epoch, so sequences from the old incarnation are never numerically comparable.
+// TestSessionManagerEpochRecreationYieldsDifferentEpoch (plan test 14e): resetting
+// the WHOLE nine-stream bundle and bringing up a fresh manager produces a different
+// recovery epoch, so sequences from the old incarnation are never numerically
+// comparable.
+//
+// The whole bundle, not $MQTT_sess alone: every broker-owned stream now carries the
+// epoch, so deleting a subset is refused by the preflight before anything is minted.
 func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
 	t.Parallel()
 	s1, c1, nc1 := newBringUpServer(t)
@@ -229,15 +311,18 @@ func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
 	// Recreate on the SAME store (an administrative recreate) and bring up a fresh
 	// manager against that same NATS; it must generate a new epoch.
 	//
-	// The unit, not $MQTT_sess alone: $MQTT_teardown is stamped with the incarnation epoch
-	// it was created against and its validator REFUSES a mismatch, so deleting only the
-	// session stream is the explicitly unsupported partial recreation
-	// (`validateTeardownStream`; asserted from the other side in
-	// TestTeardownStreamIsEpochCoupledToTheSessionStream). What this test asserts is
-	// unchanged — a fresh incarnation mints a different epoch — and recreating the unit
-	// is the documented recovery that reaches it.
+	// ALL NINE, not the $MQTT_sess/$MQTT_teardown pair this used to delete: every
+	// broker-owned stream now carries the account's recovery epoch, so the pair is
+	// a proper subset like any other and the next startup refuses it before minting
+	// anything. What this test asserts is unchanged — a fresh bundle mints a
+	// different epoch — and the whole-bundle reset is the documented recovery that
+	// reaches it.
+	// Stopped first, and waited for: the reset is an all-brokers-stopped operation,
+	// and a manager whose sweeps are still running would be writing to the streams
+	// being deleted.
+	testStopBringUpServer(t, s1)
 	js, ctx := newJS(t, nc1)
-	for _, name := range []string{mqttSessStreamName, mqttTeardownStreamName} {
+	for _, name := range mqttTestBrokerStreamNames {
 		if err := js.DeleteStream(ctx, name); err != nil {
 			t.Fatalf("delete %s: %v", name, err)
 		}
@@ -278,17 +363,12 @@ func TestSessionManagerEpochMissingFailsInit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, c, nc := newBringUpServer(t)
-			js, ctx := newJS(t, nc)
-			if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
-				Name:              mqttSessStreamName,
-				Subjects:          []string{mqttSessStreamSubjectPrefix + ">"},
-				Storage:           jetstream.FileStorage,
-				Retention:         jetstream.LimitsPolicy,
-				MaxMsgsPerSubject: 1,
-				Metadata:          tc.meta,
-			}); err != nil {
-				t.Fatalf("pre-create bad session stream: %v", err)
-			}
+			// A COMPLETE bundle whose $MQTT_sess carries the bad metadata, and
+			// deliberately NOT stamped with the account's epoch — the missing or
+			// malformed stamp IS the defect under test, so a helper that stamped it
+			// would erase what this fixture exists to catch. The other eight are
+			// present so the preflight admits and the VALIDATOR is what refuses.
+			testBundleThenPoisonEpoch(t, s, s.createInternalAccountClient(), nc, mqttSessStreamName, tc.meta)
 			_, err := s.getOrCreateMQTTAccountSessionManager(c)
 			if err == nil {
 				t.Fatal("expected manager init to fail on invalid session-stream epoch")

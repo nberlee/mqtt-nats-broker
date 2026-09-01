@@ -647,7 +647,7 @@ func (as *mqttAccountSessionManager) releaseQoS2Record(seq uint64) (mqttQoS2Rele
 // constant, not stream config.
 //
 // wantReplicas is 0 when no explicit replica count is configured (skip that check).
-func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
+func validateQoS2InStream(si *StreamInfo, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -700,6 +700,12 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int) error {
 	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on hold subjects would be classified as records", cfg.SubjectDeleteMarkerTTL)
+	}
+	// The bundle stamp: this stream carries the account's recovery epoch, which is
+	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// independently recoverable stores (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
 	}
 	return nil
 }

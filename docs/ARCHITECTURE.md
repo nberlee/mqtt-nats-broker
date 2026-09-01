@@ -46,15 +46,26 @@ This boundary applies only to bridge persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
 covered by the conformance suites.
 
-**Every sequence identity is scoped to one stream incarnation.** Deleting and recreating
-a `$MQTT_*` stream restarts its sequence space, and every mechanism in this design that
-treats a stream sequence as an identity breaks with it: the per-subject CAS expectations,
-each exact-sequence claim delete, `releaseQoS2Record`, the orphan sweep's confirmation
-re-read, and the fence a `discarded` marker records (F-062). Recreation is therefore an
-**all-brokers-stopped** operation, which is the same conclusion the paragraph above
-reaches for a nonconforming stream shape. Stated here once so the mechanisms can rely on
-it uniformly: a design must not add a per-site diagnostic that reads like a fence without
-being one, and must not describe a mid-flight recreation as a residual it handles.
+**Every sequence identity is scoped to one stream incarnation.** A `$MQTT_*` stream whose
+sequence space restarts breaks every mechanism in this design that treats a stream
+sequence as an identity: the per-subject CAS expectations, each exact-sequence claim
+delete, `releaseQoS2Record`, the orphan sweep's confirmation re-read, and the fence a
+`discarded` marker records (F-062). Recreation is therefore an **all-brokers-stopped**
+operation, which is the same conclusion the paragraph above reaches for a nonconforming
+stream shape.
+
+**And it is never a SINGLE stream.** The nine broker-owned streams are one recreation
+unit: startup refuses an account holding a proper subset, and refuses a complete bundle
+whose members carry different recovery epochs, so the supported operation is a reset of
+all nine together (F-066; see "The nine streams are one recreation unit"). Recreating one
+stream is not a smaller version of that procedure — it is the procedure the enforcement
+exists to refuse, and an operator who worked around the refusal by copying the surviving
+epoch onto a replacement would reinstate exactly the stale-identity hazard the epoch is
+there to detect.
+
+Stated here once so the mechanisms can rely on it uniformly: a design must not add a
+per-site diagnostic that reads like a fence without being one, and must not describe a
+mid-flight recreation as a residual it handles.
 
 ### Trusting the backend
 
@@ -339,15 +350,15 @@ per-owner:
 
 | Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
 |---|---|---|---|
-| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker**, created under a name derived from the server run and DELETED by name when a failed attempt rolls back what it confirmably created (see "The session-record watch" and "Per-run ephemeral consumer identity"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's | **exactly two subjects** — `$MQTT.sess.<domainTk>>` and `$MQTT.accept.<domainTk>>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch carries `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the fact and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **valid incarnation epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted); **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
-| `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's two-subject set and its atomic-publish requirement, neither of which applies |
-| `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources`; plus the **adopted `$MQTT_sess` incarnation epoch** in `Metadata`, required to match this account's (unrelated keys accepted): an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | **`DenyDelete`/`DenyPurge`** and `SubjectDeleteMarkerTTL` (no operation deletes or purges — a fence is permanent by design, so no delete marker can ever be created); `MaxConsumers`/`ConsumerLimits` (no consumers). Both denial waivers are load-bearing here, since reaping a fence would unfence a generation whose resources are already deleted |
-| `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
-| `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position (see "Per-run ephemeral consumer identity") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
-| `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL` | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
-| `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_inflight` | create-only register CAS, exact-sequence deletes, bounded enumerate-load-classify reap per retiring incarnation (teardown), bounded walk; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
+| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker**, created under a name derived from the server run and DELETED by name when a failed attempt rolls back what it confirmably created (see "The session-record watch" and "Per-run ephemeral consumer identity"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's | **exactly two subjects** — `$MQTT.sess.<domainTk>>` and `$MQTT.accept.<domainTk>>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch carries `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the fact and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **well-formed account recovery epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) — this stream MINTS it, so the requirement here is well-formedness rather than equality, and every other broker-owned stream must then carry that exact value; **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's two-subject set and its atomic-publish requirement, neither of which applies |
+| `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources`; plus the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — the same prerequisite every broker-owned stream now carries, and this stream's own reason for it is the sharpest: an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | **`DenyDelete`/`DenyPurge`** and `SubjectDeleteMarkerTTL` (no operation deletes or purges — a fence is permanent by design, so no delete marker can ever be created); `MaxConsumers`/`ConsumerLimits` (no consumers). Both denial waivers are load-bearing here, since reaping a fence would unfence a generation whose resources are already deleted |
+| `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
+| `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position (see "Per-run ephemeral consumer identity") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
+| `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL`; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
+| `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_inflight` | create-only register CAS, exact-sequence deletes, bounded enumerate-load-classify reap per retiring incarnation (teardown), bounded walk; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
 
 Three asymmetries in that table are deliberate, and each is pinned by an
 acceptance test so an over-strict "fix" fails:
@@ -375,33 +386,113 @@ acceptance test so an over-strict "fix" fails:
   fatal exactly where a foreign record could occupy a protocol CAS slot, and
   cross-account retained sourcing is a supported topology.
 
-`$MQTT_sess` and `$MQTT_teardown` are **one logical unit**, and both validators say so
-in their recreate guidance. The retirement watermarks order themselves by `$MQTT_sess`
-sequences, so a partial recreation leaves state that describes an incarnation that no
-longer exists.
+### The nine streams are one recreation unit
 
-A third stream, `$MQTT_origin`, was part of that unit until the write-lineage audit
-deleted the session-interval register. It is now **refused** rather than ignored: an
-account still holding it fails startup with delete guidance, checked by a lookup-only
-preflight that runs before the provisioning loop, because `ensureBrokerStream` creates an
-absent stream before it validates one.
+**Every broker-owned `$MQTT_*` stream is recreated, reset, backed up and restored
+as ONE unit. There is no supported procedure that recreates a proper subset**, and
+startup enforces that rather than merely advising it (F-066).
 
-Recreating `$MQTT_sess` now costs one thing more, and it is not recoverable: the
-permanent CONNECT **acceptance facts live on that stream**, so recreating it discards
-every client's acceptance history. A delayed Will enqueued before the recreation can
-then no longer be suppressed by the acceptance that was entitled to suppress it, and
-it fires. That is a deliberate consequence of putting the facts where the record is —
+The hazard the rule removes is not an empty stream, it is a stale reference that
+matches new unrelated state. Records on each of the nine persist identities the
+others issue — sequences, consumer durable names, subjects — so recreating one
+strands every surviving reference to it: an assignment claim naming a `$MQTT_msgs`
+sequence a recreated `$MQTT_msgs` has since reissued to a different message, a
+persisted drain naming a durable on a stream that no longer holds it. Per-subject
+CAS cannot help, because the semantic identity is what fails.
+
+Two mechanisms enforce it, and they are deliberately different in kind.
+
+**A COUNT rule, in an account-wide preflight that creates nothing.**
+`mqttPreflightBrokerStreamBundle` runs before the provisioning loop, over the same
+spec table the loop iterates, and takes a lookup-only interface so it cannot create
+what it is deciding about. It must be a preflight rather than a check inside
+`ensureBrokerStream`: that helper sees one stream and CREATES it when the lookup
+says absent, so by the time any validator ran, the missing member would already be
+provisioned. Each lookup's `(info, error)` PAIR is dispositioned together — present
+(positive evidence outranks a contradictory error), absent (not-found), or
+**undecided**, which fails startup rather than being read as absence. Folding
+undecided into absence is the fail-open that matters: a transient lookup outage
+would turn an eight-present account into a zero-present one and the loop would
+silently reprovision the missing stream. Then: **zero present admits** (initial
+creation, or a completed reset), **nine present admits**, and **one through eight
+REFUSES**, naming what is present and what is absent.
+
+**An EPOCH stamp, per stream, checked by every validator.** `$MQTT_sess` mints a
+recovery epoch into its own stream metadata at creation — the linearization point,
+so whichever replica wins the create sets the authoritative value — and every
+broker adopts it from `ensureBrokerStream`'s authoritative re-read. The other eight
+are stamped with the adopted value before their own create, and every validator
+compares it through `validateBundleEpochStamp`. A malformed or empty *expected*
+epoch is itself a refusal, never a wildcard. This is the `$MQTT_teardown`
+stamp-and-refuse mechanism generalised: that stream no longer carries a private
+check, because two mechanisms stating one fact is a redundancy, not a belt.
+
+The two catch different things and neither subsumes the other, and it is worth
+being exact about what each one can and cannot see.
+
+- **The count rule catches a member that is ABSENT when a broker starts** — a
+  deletion nobody has replaced, or a first provisioning that stopped part-way.
+  What it buys is that the broker does not silently recreate it, which is the
+  actual defect: before this, `ensureBrokerStream` created the missing stream and
+  validated it against its own owner's list alone.
+- **The epoch catches a member that is PRESENT but from another incarnation** —
+  a partial restore, or a replacement created without the account's stamp.
+
+Neither catches an operator who deletes a member, recreates it by hand, AND
+copies the surviving epoch onto the replacement: the count sees nine and the
+epoch sees agreement. That is the forgery case, outside what this enforcement
+claims (see "What the enforcement does not buy"), and doing it reinstates exactly
+the stale-identity hazard the epoch exists to detect.
+
+**What the preflight does NOT promise, because it is nine independent lookups
+rather than an atomic snapshot.** Under create-only concurrency — every other actor
+a broker running this same ordered provisioning — an admission cannot wrongfully
+succeed: an all-absent observation may race a peer's creation but then adopts that
+peer's epoch through create-or-lose, and an all-present observation is truthful
+because presence is monotone when nothing deletes. Concurrent DELETION breaks the
+second arm, and `docs/CONFORMANCE.md` records the interleaving; it requires
+violating the all-brokers-stopped precondition the recovery procedure states.
+
+**The recovery, for every nonconforming or partial state alike:** stop ALL brokers
+for the account, delete all nine streams, and restart, which provisions a fresh
+bundle under a fresh epoch. Recovery is therefore a complete account-level state
+reset with **no partial recovery**, and every startup refusal says so. An operator
+running a supported administrative variation — a `Sources` topology on
+`$MQTT_rmsgs` — reapplies it as part of the reset; nothing here reconstructs it.
+
+A tenth stream, `$MQTT_origin`, is not a member: it is retired state, refused by its
+own lookup-only preflight with delete guidance, for the same reason the bundle
+preflight is a preflight at all.
+
+Resetting the bundle costs things that are not recoverable, and they are worth
+stating separately because an operator may reach for the reset casually: the
+permanent CONNECT **acceptance facts live on `$MQTT_sess`**, so a reset discards
+every client's acceptance history, and the accepted messages, retained messages and
+pending delayed Wills go with the streams that hold them.
+
+**It does not, however, make a pending delayed Will FIRE** — a consequence that WAS
+true of recreating `$MQTT_sess` alone and is not true of the reset, because the reset
+takes `$MQTT_willq` as well, so the Will is discarded along with the evidence that
+would have suppressed it. Firing requires `$MQTT_sess` lost while `$MQTT_willq`
+survives: a partial operation, which is now refused, and which an administrative
+deletion or a partial restore can still produce.
+
+Where the facts live is a deliberate consequence of putting them with the record —
 the atomicity that removes the split-acceptance interval is only available within one
-stream — and it is stated here rather than mitigated, because there is no honest
-mitigation short of a second write nobody could make atomic with the first.
+stream — and there is no honest mitigation short of a second write nobody could make
+atomic with the first.
 
-Startup catches only part of that, and the exact rule matters to an operator judging
-whether a mistake would be caught. `$MQTT_teardown` carries the session epoch in STREAM
-METADATA. So **a recreated `$MQTT_sess` is refused if and only if an OLD `$MQTT_teardown`
-survives beside it** — recreate both together and startup admits — and **with `$MQTT_sess`
-kept, `$MQTT_teardown` may be recreated and is admitted**, starting cleanly with no
-historical fences. `docs/CONFORMANCE.md` records that loss; the two-stream recovery is
-specified as a procedure for that reason rather than because every mistake fails closed.
+**What the enforcement does not buy.** The hazard becomes unreachable through a
+SUPPORTED operation, not eliminated: every stale-identity path still exists in the
+code. Startup validation and the preflight are both snapshots, so a live operator
+deleting a stream behind initialized managers still reaches those paths, and the
+all-brokers-stopped precondition stays load-bearing. Accepted-data loss when
+resetting a bundle holding accepted data is unchanged. Completeness is demonstrable
+at this HEAD and GUARDED rather than proven: the nine-entry provisioning table is
+hand-maintained, and what guards it is that the preflight derives its names from
+that table, that `TestBrokerStreamSpecTable` pins the table, and that
+`TestStreamValidatorFieldCoverage` requires every validator to reject a foreign
+stamp — a validator that forgot the check fails that bijection.
 
 ### What a persisted record references that another stream issues
 
@@ -411,23 +502,23 @@ name, over a type universe derived by a recursive walk from the persisted roots.
 INTERPRETATION-SITE half is a drift guard rather than a closure proof: its root set is
 hand-maintained and it keys a site by unqualified function name, so a new branch inside an
 already-named function, a new wrapper around the transport primitives, or a same-named
-method on another receiver can still pass. That is why the census does not discharge
-F-066's completeness deferral.
+method on another receiver can still pass. That is why the census could not discharge
+F-066's completeness deferral — and why F-066 was closed at stream granularity, where
+completeness is demonstrable, instead.
 
 Two facts from it belong here, because they bear directly on the table above.
 
-**Seven of the nine validators above assert a single-stream recovery procedure**, and
-that is operator guidance rather than proof. `$MQTT_sess` and `$MQTT_teardown` name each
-other and are one logical unit; the other seven name themselves alone. But records on
-those seven persist identities other streams issue — sequences, consumer durable names,
-subjects — so recreating one of them strands every surviving reference to it. **F-066 owns
-that hazard, and its 2026-08-31 decision is to close it by WITHDRAWING the single-stream
-procedure rather than by generalising the coupling**: all nine broker-owned streams will
-become one recreation unit. **That enforcement is NOT landed**, so this paragraph states
-the procedure in force today; the seven single-stream procedures and the wording of every
-validator's recovery text are retired in the same change that lands it, never before.
-What the census adds is that the population is now
-enumerated rather than sampled.
+**No validator asserts a single-stream recovery procedure any more.** They used to:
+seven of the nine named themselves alone, and that was operator guidance rather than
+proof, because records on those seven persist identities other streams issue —
+sequences, consumer durable names, subjects — so recreating one of them strands every
+surviving reference to it. F-066 owned that hazard and closed it by **WITHDRAWING the
+single-stream procedure rather than by generalising the coupling**: all nine
+broker-owned streams are now one recreation unit, enforced as described above, and
+every validator's recovery text names the bundle. What the census adds is that the
+population is now enumerated rather than sampled — which is why the enforcement did
+not need it: the enumerable thing is the STREAMS, one provisioning table with one
+loop over it, not the identities four separate attempts failed to enumerate.
 
 **Scope over that population is anchored to the bridge's INTERPRETATION SURFACE**, not to
 a list of JetStream transitions. A transition is in scope if and only if it can change the
@@ -623,11 +714,14 @@ Two refinements keep the guarantee tight:
 
   **It is a `$MQTT_sess` SEQUENCE, so it is meaningless outside the incarnation that
   issued it**, and it therefore travels with `ScanEpoch`. The pair is validated together:
-  a bare sequence is uncomparable and a bare epoch says nothing. `$MQTT_willq` is not
-  part of the coupled recreation unit, so a pending Will SURVIVES that operation carrying
-  a floor recorded against a stream that no longer exists, while the new one restarts at
-  sequence 1 — which makes this reachable through an operation the documentation
-  supports, not a theoretical concern.
+  a bare sequence is uncomparable and a bare epoch says nothing. `$MQTT_willq` USED TO
+  sit outside the coupled recreation unit, so a pending Will survived a `$MQTT_sess`
+  recreation carrying a floor recorded against a stream that no longer existed, while
+  the new one restarted at sequence 1 — reachable through an operation the documentation
+  then supported. F-066 closed that route: all nine streams are one recreation unit, so
+  no supported operation replaces `$MQTT_sess` while `$MQTT_willq` survives. The scoping
+  stays, and is now defence in depth against administrative deletion or a partial
+  restore, which are unsupported rather than impossible.
 
   Both sides are scoped, and each was a live defect when it was not:
 
@@ -760,7 +854,9 @@ retained-message cache entry the outbox record is the only durable copy of the
 Will. Refusal is read-only, so a refused record is **reclaimed by nothing**: no
 sweep, fence or reaper will ever remove it. It is logged once per subject (Warn,
 then Debug — the claim scan meets it every 5s) with the only remedy there is,
-deleting that message from `$MQTT_willq` or recreating the stream. A refused record
+deleting that message from `$MQTT_willq` — recreating the stream is NOT an
+alternative, since the nine broker-owned streams are one recreation unit and the only
+other route is a whole-bundle reset. A refused record
 does not make a cancellation pass unresolved — no fire path will act on it either —
 so a reconnect still completes cleanly, and it never contends for a live Will's
 subject slot, because every enqueue mints a fresh WillID.
@@ -792,18 +888,35 @@ records the bridge has already said it cannot interpret.
 
 Operational constraints for the coupled streams:
 
-- **Back up, restore, delete, or recreate `$MQTT_sess` and `$MQTT_teardown` as one
-  logical unit.** Recreating `$MQTT_sess` discards every client's permanent acceptance
-  history along with the records, so a delayed Will enqueued beforehand can no longer be
-  suppressed and fires; recreating only `$MQTT_teardown` loses every open
-  generation-retirement fence. Recreating `$MQTT_sess` alone is not merely discouraged —
-  `validateTeardownStream` refuses to start against state stamped with a different
-  incarnation epoch (see "Stream prerequisites").
-- **Recreating `$MQTT_sess` requires restarting every bridge serving the account before
-  MQTT traffic resumes.** The incarnation epoch is captured once per account manager
-  (`as.sessStreamEpoch`); a live manager that outlives stream recreation retains the
-  stale epoch and with it stale session-CAS state. A process restart recreates the
-  manager and adopts the new epoch.
+- **Back up, restore, delete and recreate ALL NINE broker-owned streams as one unit,
+  from one point in time.** There is no supported single-stream or partial procedure:
+  startup refuses an account holding one to eight of the nine, and refuses a complete
+  bundle whose members carry different recovery epochs (see "The nine streams are one
+  recreation unit"). A reset discards every client's permanent acceptance history with
+  `$MQTT_sess`, every open generation-retirement fence with `$MQTT_teardown`, and every
+  pending delayed Will with `$MQTT_willq`. Note what that means for the Will: losing the
+  acceptance facts does NOT make a pending Will fire, because the reset takes the Will
+  too. The fire outcome needs `$MQTT_sess` lost while `$MQTT_willq` survives, which is a
+  partial operation this enforcement refuses.
+  A common epoch detects a bundle assembled across incarnations; it does NOT prove nine
+  independently restored snapshots came from one coherent instant, so restore skew
+  within one incarnation is undetectable and the "one point in time" is the operator's
+  to guarantee.
+- **A reset requires restarting every bridge serving the account before MQTT traffic
+  resumes.** The recovery epoch is captured once per account manager
+  (`as.sessStreamEpoch`); a live manager that outlives the reset retains the stale
+  epoch and with it stale session-CAS state. A process restart recreates the manager
+  and adopts the new epoch. The all-brokers-stopped precondition is load-bearing for
+  the enforcement too: the preflight is a snapshot, so an operator deleting streams
+  behind a running broker can still reach the stale-identity paths.
+- **A first start interrupted part-way leaves a partial bundle, and the recovery is the
+  same reset**: stop every broker, delete whichever of the nine exist, restart. This is
+  also what a concurrent first start can produce — two brokers starting together
+  against an unprovisioned account can leave one refusing, and it converges on a
+  restart once some peer has completed all nine.
+- **The reset recreates streams with broker defaults.** A supported administrative
+  variation — a `Sources` topology on `$MQTT_rmsgs` — is reapplied by the operator
+  afterwards; nothing here reconstructs it.
 - **`$MQTT_origin` must be DELETED, not kept.** The session-interval register it held is
   no longer defined, and startup refuses an account that still has the stream rather than
   leaving it to accumulate.
@@ -2329,8 +2442,11 @@ hold an in-flight PUBLISH, so it is preserved for diagnosis rather than replaced
 create-only CAS, so a claim subject can be won **again** after its record is reaped —
 by a group delivery callback that was already dispatched when the reap happened, which
 `DeliverNew` on the group durable cannot cancel. `Winner`, `Gen` and `ClaimHash` are
-identical across those attempts, and a stream sequence is not an identity
-(`$MQTT_qos2assign` can be recreated, F-066). So the record carries a `Nonce`, minted
+identical across those attempts, and a stream sequence is not an identity — a
+`$MQTT_qos2assign` whose sequence space restarts reissues them, which no supported
+operation now produces on its own (F-066 made the nine streams one recreation unit, and
+a supported reset takes the referenced state with the claims), but administrative
+deletion and partial restore still do. So the record carries a `Nonce`, minted
 once at the election and never rewritten, and it does three things:
 
 - It scopes the **copy subject**, so a replacement can neither read, adopt nor lose
@@ -5153,7 +5269,8 @@ it was, and only one of the two is recoverable:
   on a record it cannot validate, `mqttValidateTeardownTargets` rejects it through
   `mqttValidateSessionRecord`, and the orphaned-consumer sweep counts the consumers the
   record names as *referenced*, so they are not reaped either. The record, its
-  consumers and its marker persist until an operator recreates the `$MQTT_*` streams.
+  consumers and its marker persist until an operator resets the nine-stream `$MQTT_*`
+  bundle.
   That is the pre-existing consequence of the generation refusal — there is no
   generation to scope a safe deletion by — and it is why both refusals prescribe
   recreating the streams rather than offering a way to work around the record.
@@ -5284,10 +5401,11 @@ nothing, so it has none to validate.
 
 Nothing ever reaps a watermark. Storage is bounded by the client-ID population, and
 permanence is what keeps the residual from being widened by a GC choice. Because
-`mseq` is a `$MQTT_sess` sequence, the two streams are one logical unit:
-`$MQTT_teardown` carries the adopted session-stream incarnation epoch in its
-metadata and a mismatch is **refused at startup** — see
-"Stream prerequisites".
+`mseq` is a `$MQTT_sess` sequence, `$MQTT_teardown` is only comparable within the
+incarnation that issued those sequences — which is now a property of the whole
+bundle rather than of this pair: every broker-owned stream carries the account's
+recovery epoch and a mismatch is **refused at startup**, and no stream may be
+recreated without the other eight. See "The nine streams are one recreation unit".
 
 The deliberate exception to the fence is a crash *between* the won claim and the
 watermark write. It is non-destructive by construction, since the write precedes every

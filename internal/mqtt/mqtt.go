@@ -4668,9 +4668,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// nonconforming stream is a startup failure with recreate guidance, never
 	// something to mutate in place. The ordered spec table is the only route: a
 	// stream cannot be provisioned outside the helper without deleting its entry,
-	// which the table-coverage test refuses. Per-stream specials (the session
-	// epoch generation, gate hooks and adoption; the retained-messages consumer)
-	// live in the entries, not around this loop.
+	// which the table-coverage test refuses. Per-stream specials (the recovery
+	// epoch's generation, gate hooks and adoption, and the per-stream stamp that
+	// couples the nine) live in the entries, not around this loop.
 	wantReplicas := 0
 	if opts.MQTT.StreamReplicas != 0 {
 		wantReplicas = replicas
@@ -4683,39 +4683,54 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// emits a per-message Nats-TTL (Message Expiry) and must not require the
 	// capability of a pre-existing stream. Everything else accepts MQTT 5.0.
 	requireMsgTTL := opts.MQTT.MaxProtocolVersion != mqttProtoLevel
-	// Before anything is created: an account still holding the retired
-	// $MQTT_origin register is refused outright. Read-only, and ahead of the loop
-	// because the loop's own shape creates an absent stream before it validates
-	// one. See mqttRefuseRetiredOriginStream.
+	// The ordered provisioning table, built ONCE and used by both the preflight and
+	// the loop. One construction is the point: a preflight looking up a
+	// hand-maintained second list would drift from the table it is meant to police,
+	// and the table-coverage test proves the table's contents, not that some other
+	// list matches it.
+	specs := as.brokerStreamSpecs(s, replicas, wantReplicas, maxAckPending, requireMsgTTL)
+
+	// Two lookup-only preflights, before anything is created, because the loop's own
+	// shape creates an absent stream before it validates one.
+	//
+	// First: an account still holding the retired $MQTT_origin register is refused
+	// outright. Second: an account holding a PROPER SUBSET of the nine broker-owned
+	// streams is refused rather than silently completed — those nine are one
+	// recreation unit, and recreating a subset leaves records referencing identities
+	// the other streams have since reissued (F-066). Both take
+	// brokerStreamLookupAPI, so neither can create what it is deciding about.
 	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
+		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
+	}
+	if err := mqttPreflightBrokerStreamBundle(jsa, specs); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}
 	// Which purposes this attempt CONFIRMABLY created, which is the rollback's only
 	// licence: an errored create — of any shape, definite or not — licenses nothing,
 	// because a structured error can be returned before the server even looks the
 	// name up. See mqttEphemeralCreated in ephemeral_identity.go.
+	//
+	// Nothing in the loop below confirms into it any more: the retained observer
+	// moved to mqttProvisionEphemeralConsumers, so the ledger is necessarily empty
+	// until that call and a rollback from inside the loop would have nothing to
+	// remove.
 	created := mqttEphemeralCreated{}
-	for _, spec := range as.brokerStreamSpecs(s, accName, replicas, wantReplicas, maxAckPending, requireMsgTTL, rmsubj, ephemeralID, ephemeralOwner, created) {
+	for _, spec := range specs {
 		si, err := ensureBrokerStream(jsa, spec.cfg, spec.validate, spec.preCreate, spec.observe)
 		if err != nil {
-			as.rollbackEphemeralConsumers(created)
 			return nil, fmt.Errorf("MQTT %s stream for account %q: %w", spec.txt, accName, err)
 		}
 		if spec.post != nil {
 			if err := spec.post(si); err != nil {
-				// A post step that failed may still have created its consumer, and
-				// the retained one records a CONFIRMED create before returning, so
-				// this path removes exactly what is known to exist. Without this the
-				// loop's own failures leak what the post-loop rollback was added to
-				// prevent.
-				as.rollbackEphemeralConsumers(created)
 				return nil, err
 			}
 		}
 	}
 
-	// The session-record watch, created only once EVERY stream has provisioned and
-	// validated, and rolling the retained-messages consumer back if it fails.
+	// Both per-run ephemeral consumers — the retained-messages observer and the
+	// session-record watch — created only once EVERY stream has provisioned and
+	// validated, and rolling back whatever this attempt confirmably created if
+	// either fails.
 	//
 	// Every connection retries this whole function UNTIL one attempt succeeds, or
 	// until Start's own attempt fails and tears the server down: the listener opens
@@ -4723,7 +4738,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// that window drives initialization itself. What a retry must not do is mint
 	// another consumer, which is why both names are derived. See
 	// mqttProvisionEphemeralConsumers and ephemeral_identity.go.
-	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, ephemeralID, ephemeralOwner, created); err != nil {
+	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, rmsubj, ephemeralID, ephemeralOwner, created); err != nil {
 		return nil, err
 	}
 

@@ -354,18 +354,23 @@ const (
 // MaxConsumers and ConsumerLimits are waived, and no Nats-TTL is ever sent, so
 // AllowMsgTTL is inert.
 //
-// sessEpoch is the $MQTT_sess incarnation epoch this account adopted. A MarkerSeq is
-// a $MQTT_sess sequence, so watermarks are comparable to each other only within one
-// incarnation of that stream: $MQTT_teardown is epoch-COUPLED to it, stamped at
-// creation and required to match here. That refuses the partial recreation that would
-// otherwise mis-compare sequences across incarnations — $MQTT_sess recreated alone
-// mints a fresh epoch while the permanent watermarks keep the old one — instead of
-// classifying it per read. The other direction ($MQTT_teardown recreated alone) stamps
-// the current epoch, validates clean, and admits with no historical fences; that loss
-// is stated in docs/CONFORMANCE.md.
+// bundleEpoch is the account's recovery epoch, minted by $MQTT_sess and adopted from
+// its authoritative re-read. A MarkerSeq is a $MQTT_sess SEQUENCE, so watermarks are
+// comparable to each other only within one incarnation of that stream — the sharpest
+// reason any broker-owned stream needs the stamp, which is why this validator carried
+// a private version of the check before the stamp became the bundle's.
+//
+// Both partial-recreation directions this comment used to describe are now REFUSED
+// before any validator runs: the nine streams are one recreation unit, and an account
+// holding a proper subset fails the account-wide preflight
+// (mqttPreflightBrokerStreamBundle). In particular "$MQTT_teardown recreated alone
+// admits with no historical fences" was a stated residual and is no longer reachable
+// through a supported operation. What remains reachable is administrative deletion or
+// a partial restore, which the compatibility boundary does not support and which
+// docs/CONFORMANCE.md records.
 //
 // wantReplicas is 0 when no explicit replica count is configured (skip that check).
-func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, sessEpoch string) error {
+func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -392,14 +397,13 @@ func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, s
 	if cfg.MaxMsgSize > 0 {
 		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject the watermark write that must land before any teardown deletion", cfg.MaxMsgSize)
 	}
-	stamp := cfg.Metadata[mqttSessEpochMetaKey]
-	if !mqttValidSessEpoch(stamp) {
-		return fmt.Errorf("metadata %q is %q, not a well-formed session-stream incarnation epoch: a retirement watermark orders itself by a $MQTT_sess sequence, which is only comparable within the incarnation it came from",
-			mqttSessEpochMetaKey, stamp)
-	}
-	if stamp != sessEpoch {
-		return fmt.Errorf("metadata %q is %q but this account's session stream is incarnation %q: the marker sequences these watermarks carry belong to a different $MQTT_sess",
-			mqttSessEpochMetaKey, stamp, sessEpoch)
+	// The bundle stamp. This stream's own reason for needing it is the sharpest in
+	// the set — a MarkerSeq is a $MQTT_sess SEQUENCE, comparable only within the
+	// incarnation that issued it — but the check itself is the one every
+	// broker-owned stream now runs, so it is the shared helper rather than a
+	// second mechanism stating the same fact (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
 	}
 	return nil
 }

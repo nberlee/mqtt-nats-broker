@@ -709,10 +709,11 @@ carry no guaranteed order, because the record rather than the log is the authori
 
 **Five residuals remain, each with its mechanism rather than a bound it does not have.**
 
-- **Recreating `$MQTT_out` alone destroys the proof.** The PUBREL and the copy identity
-  it names live on that stream, so recreation takes both, and a surviving `Lost` on the
-  claim can no longer be corrected. This is the accepted-data loss single-stream
-  recreation already causes, and it is F-066's rather than this mechanism's.
+- **A whole-bundle reset destroys the proof.** The PUBREL and the copy identity it
+  names live on `$MQTT_out`, so a reset takes both, and a surviving `Lost` on the claim
+  can no longer be corrected. Recreating `$MQTT_out` ALONE is no longer a supported
+  operation and is refused at startup (F-066); what remains is the accepted-data loss a
+  reset causes by construction, which coupling never fixed.
 - **The reconciliation is not atomic with the consumer deletion.** Teardown records every
   stored PUBREL's proof before deleting the consumer that retains them, but a broker still
   serving the retiring generation can store a proof-bearing PUBREL AFTER that scan's last
@@ -836,8 +837,8 @@ than that one session:
   sound, so the references it contributes to those classes are complete. A record
   whose *identity* cannot be established — undecodable, unattributable, or carrying a
   malformed `Gen` — is the stronger case and still aborts the whole pass. Either way
-  the recovery is the same: stop the account's brokers and recreate the bridge-owned
-  `$MQTT_*` streams.
+  the recovery is the same: stop the account's brokers and reset the bridge-owned
+  `$MQTT_*` streams — all nine, which are one recreation unit.
 
 Plain (non-shared) subscriptions no longer drop an unacknowledged QoS 1/2 PUBLISH
 on UNSUBSCRIBE — see the next section.
@@ -1857,9 +1858,11 @@ What it does NOT do:
     route is found that produces a true create-pair verdict without also producing the
     false ones below. Two refutations stay recorded so they are not re-proposed. A
     **reserved parent token** stamped on the record-absent arm was designed and REFUTED,
-    because an absence is not a fact: `$MQTT_teardown` can be recreated alone, stamped
-    with the current session epoch, and validate clean with no historical fences (see
-    "Stream prerequisites"), and administrative deletion and partial restore do the same.
+    because an absence is not a fact: administrative deletion and partial restore can
+    leave a `$MQTT_teardown` with no historical fences. (Recreating it ALONE used to do
+    the same and was the sharper example; that operation is now refused at startup —
+    see "Stream prerequisites" — but the refutation stands on the operations that
+    remain, which are unsupported rather than impossible.)
     Every other row of this design degrades to conceding when it cannot prove something;
     that token degraded to a false affirmative. **Minting a retirement watermark at a
     first create** is refused for its own reason: a watermark carrying a fresh generation
@@ -2487,7 +2490,7 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   `TestWillRecoveryReusesThePersistedDecision` — if the first test ever starts
   suppressing, the residual is closed and both it and this entry are stale.
 
-- **Administrative loss reverses direction.** Pruning facts, or recreating `$MQTT_sess`,
+- **Administrative loss reverses direction.** Pruning facts, or resetting the bundle,
   removes suppression evidence, so an obsolete Will FIRES rather than a due Will being
   lost. That is the safer direction of the two, and it is the only direction available:
   nothing here can lose a Will by losing a fact.
@@ -2520,7 +2523,8 @@ finishes a claim it finds before starting fresh, so a crashed teardown self-heal
 rather than leaking. A record the restore boundary refuses is not adopted by the
 CONNECT at all: a reserved-namespace record with a valid generation is still finished
 by the expiry path and the orphan sweep, but one with no valid generation is adopted by
-nothing and persists with its consumers until an operator recreates the streams — the
+nothing and persists with its consumers until an operator resets the nine-stream
+bundle — the
 pre-existing consequence of the generation refusal, since a generation-scoped deletion
 has no name to use.
 
@@ -2576,12 +2580,12 @@ Residuals and hard requirements:
   (`docs/findings/ha-arbitration.md#f-036`), which this route is now listed under. The
   sweep defers its finish by a pass to narrow the case it owns; a CONNECT adoption
   finishes immediately by design.
-- **`$MQTT_teardown` recreated alone loses every open fence.** It stamps the current
-  session-stream incarnation epoch, validates clean and admits empty, so a generation
-  retired before the recreation is no longer fenced. The other direction is refused rather
-  than admitted: `$MQTT_sess` recreated alone leaves watermarks from a different
-  incarnation, and startup fails with the coupled recreate-as-a-unit guidance. Watermark
-  storage is permanent and bounded by the client-ID population.
+- **A whole-bundle reset loses every open fence**, along with everything else the nine
+  streams hold. `$MQTT_teardown` recreated ALONE is no longer admitted — it used to be,
+  stamping the current epoch and starting clean with the fences silently gone, and that
+  admission is exactly the residual F-066's enforcement withdraws: an account holding
+  eight of the nine is now refused before anything is provisioned. Watermark storage is
+  permanent and bounded by the client-ID population.
 - **An orphaned PUBREL durable is now reaped, and the PUBRELs it held go with it.**
   A `$MQTT_PUBREL_<idHash>_<gen>` consumer on the interest-retained `$MQTT_out` whose
   session generation is absent from the sweep's evidence — the persisted records plus the
@@ -2698,8 +2702,14 @@ rollout:
   below the tail, or expiry — so it is a disposition rather than an operational hazard.
 
 Every sequence identity above, the fence included, is scoped to **one stream incarnation**;
-recreating `$MQTT_qos2in` is an all-brokers-stopped operation (`docs/ARCHITECTURE.md`,
-"Compatibility boundary"). Two neighbouring consequences of the same condition (a delivery
+recreating `$MQTT_qos2in` by itself is no longer a SUPPORTED operation — the nine
+broker-owned streams are one recreation unit, and an account holding a proper subset is
+REFUSED at the next manager initialization — so the supported operation is an
+all-brokers-stopped reset of the whole bundle (`docs/ARCHITECTURE.md`, "The nine streams
+are one recreation unit"). Refused is not prevented: nothing stops an administrative
+deletion, a manual recreation, a partial restore, or a config mutation behind an already
+initialized manager. The refusal is what a broker does when it next starts. Two
+neighbouring consequences of the same condition (a delivery
 after discard, and the orphan sweep condemning a live remote generation whose record is
 absent) belong to **F-036**, which is still an open alpha blocker; the cutoff widened the
 first of them, since a spared hold stays serviceable by that peer.
@@ -2813,7 +2823,9 @@ the write, CAS, subject, acknowledgement, retention, deletion and purge semantic
 the protocol depends on). A non-conforming stream fails broker startup with
 recreate guidance rather than being mutated in place. Upgrading a pre-existing
 development store therefore means stopping **all** brokers for the account and
-recreating the stream; it is not a rolling upgrade.
+resetting the whole nine-stream bundle — recreating this stream alone is REFUSED at
+the next startup, since the broker-owned streams are one recreation unit; it is not a
+rolling upgrade.
 
 ### Broker-owned stream prerequisites: startup refusal, a snapshot, and dropped fallbacks
 
@@ -2837,29 +2849,57 @@ ones the `$MQTT_qos2in` precedent established:
   connections on its original validation decision and keeps serving, while any
   initialization afterwards — another broker, or the same one restarted — refuses,
   surfacing as CONNECT failures on the refusing broker only. The recovery for both is
-  **stop-all**: stop every broker for the account, recreate the named stream per the
-  error's guidance, then restart. The errors offer no in-place fix, and some name a
-  coupled unit — `$MQTT_sess` is recreated together with `$MQTT_teardown`, both at once,
-  or the incarnation epoch is minted against stale watermarks.
+  **stop-all**: stop every broker for the account, delete **all nine** broker-owned
+  streams, then restart, which provisions a fresh bundle. The errors offer no in-place
+  fix and no partial procedure, because there is none: the nine are one recreation unit
+  (F-066).
 
-  **The two-stream rule is a PROCEDURE, not a guarantee that every partial recreation
-  fails closed**, and the difference matters to an operator deciding whether an unsafe
-  recovery would be caught. `$MQTT_teardown` carries the session epoch in STREAM METADATA
-  and so is what can detect a recreated `$MQTT_sess`. The complete rule is two clauses:
+  **What the enforcement catches, and what it does not.** Two mechanisms, neither
+  subsuming the other. A COUNT rule in a lookup-only preflight refuses an account holding
+  one to eight of the nine — a member ABSENT when a broker starts, which is what a
+  deletion nobody replaced or an interrupted first start leaves — and its value is that
+  the broker no longer silently recreates it. A per-stream EPOCH stamp, minted by
+  `$MQTT_sess` and compared by every validator, refuses a complete bundle assembled from
+  different incarnations — a partial restore, or a replacement created without the
+  account's stamp. **Neither catches an operator who deletes a member, recreates it by
+  hand and copies the surviving epoch onto the replacement**: the count sees nine and the
+  epoch sees agreement. That is forgery, outside what this enforcement claims.
 
-  - **`$MQTT_sess` recreated** — refused if and only if an OLD `$MQTT_teardown` survives
-    beside it, which aborts account-manager initialization. Recreate both together and
-    startup ADMITS — and every client's **permanent CONNECT acceptance history goes with
-    the old stream**, since the facts live on it. A delayed Will enqueued before the
-    recreation can then no longer be suppressed by the acceptance entitled to suppress
-    it, and it fires.
-  - **`$MQTT_sess` kept** — `$MQTT_teardown` may be recreated, and is ADMITTED: brokers
-    start normally while every open generation-retirement fence is silently gone.
+  Residuals of that enforcement, stated rather than implied:
 
-    So the recovery is specified as both at once rather than left to what a validator
-  happens to catch. `$MQTT_origin`, once the third member of that unit, is no longer
-  defined by this broker: an account still holding it is REFUSED at startup with delete
-  guidance rather than validated. This is not a rolling
+  - **A reset discards every client's permanent CONNECT acceptance history**, since the
+    facts live on `$MQTT_sess`. It does NOT make a pending delayed Will fire: the reset
+    takes `$MQTT_willq` too, so the Wills those facts would have suppressed are discarded
+    along with the evidence. The fire outcome requires losing `$MQTT_sess` while KEEPING
+    `$MQTT_willq` — a partial operation, which is what the enforcement refuses, and which
+    an administrative deletion or partial restore can still produce. The reset also
+    discards every open generation-retirement fence with `$MQTT_teardown`.
+  - **Restore skew within ONE incarnation is undetectable.** A common epoch proves the
+    nine belong to the same bundle; it does not prove nine independently restored
+    snapshots came from one coherent instant. Two backups taken minutes apart carry the
+    same epoch and are admitted while being mutually inconsistent.
+  - **The preflight is nine independent lookups, not an atomic snapshot.** Under
+    create-only concurrency an admission cannot wrongfully succeed. Concurrent DELETION
+    can defeat it: an operator deleting streams behind the scan, leaving `$MQTT_sess`
+    for last, can be observed as nine-present, after which the broker adopts the
+    surviving epoch and recreates the other eight EMPTY under it — a mixed old/new
+    bundle, admitted. This requires violating the all-brokers-stopped precondition the
+    procedure states, and it is why that precondition is load-bearing rather than
+    advisory.
+  - **A concurrent first start can refuse one broker.** Two brokers starting together
+    against an unprovisioned account can have one observe a partial bundle and refuse;
+    `Server.Start` treats a failed initialization as fatal and offers no retry, so
+    recovery is a **restart** and depends on the supervisor (the shipped Deployment
+    restarts the pod). It recurs after every whole-bundle reset, not only at first
+    install. If the broker that admitted zero dies after creating one to eight streams,
+    every peer refuses and the documented reset is required.
+  - **The reset recreates streams with broker defaults.** A supported administrative
+    variation such as a `Sources` topology on `$MQTT_rmsgs` is not reconstructed and is
+    the operator's to reapply.
+
+  `$MQTT_origin`, once a member of the old `$MQTT_sess`/`$MQTT_teardown` unit, is no
+  longer defined by this broker: an account still holding it is REFUSED at startup with
+  delete guidance rather than validated. This is not a rolling
   upgrade. A *conforming* deployment restarts exactly as before —
   default broker-created streams are conforming, and so are supported administrative
   variations such as a source on `$MQTT_rmsgs`.
@@ -2890,8 +2930,10 @@ the compatibility boundary (no released contract exists for either):
   single v5 CONNECT), but administrative stream recreation under live state or
   a post-start config/stream mutation can — a persisted expiring v5 Will then
   stalls with logged store rejections and lease retries (never silently lost)
-  until the stream is fixed. Recreate per the compatibility boundary. The
-  support floor is nats-server 2.14.5, which always understands `AllowMsgTTL`.
+  until the stream is fixed. Fixing it means the whole-bundle reset per the
+  compatibility boundary — all nine broker-owned streams are one recreation unit, so
+  recreating the offending stream alone is refused. The support floor is nats-server
+  2.14.5, which always understands `AllowMsgTTL`.
 - **The two inherited upstream migrations are gone.** Pre-2.10 nats-server
   per-client `$MQTT_sess_<hash>` session streams and pre-2.10.10 single-subject
   retained messages are no longer transferred at startup — and they are no
@@ -3058,7 +3100,8 @@ withholds their destructive act, because neither may act on a partial view: the
 orphan-consumer sweep **aborts its whole pass**, and the last-holder scan **reports every
 requested durable held**, which withholds the group-consumer deletion. The recovery is the
 compatibility boundary's: stop the account's brokers and
-recreate the bridge-owned `$MQTT_*` streams. This is not a rolling upgrade.
+reset the bridge-owned `$MQTT_*` streams — all nine, which are one recreation unit.
+This is not a rolling upgrade.
 
 ### The retained index is not arbitrated by sequence, and a lost application is not repaired
 
@@ -3225,11 +3268,10 @@ head rather than in a footnote. The plan's own rule is that an unproven closure 
 means claiming neither completeness nor that discharge, and the interpretation surface is
 such a class: a guard that catches real drift is not a proof that no drift is possible.
 F-066's remedy USED TO depend on the population and would have inherited the same bound.
-**It no longer does, as of the 2026-08-31 decision**: the DECIDED remedy, whose enforcement
-is owed and not landed, is the all-nine recreation contract, which is keyed on the STREAM
-set rather than on the identities those streams carry, so an unclosed interpretation
-surface no longer bounds it. The census's own
-undischarged deferral above is unaffected and stands exactly as written.
+**It no longer does, and the enforcement is LANDED**: the all-nine recreation contract is
+keyed on the STREAM set rather than on the identities those streams carry, so an unclosed
+interpretation surface does not bound it. The census's own undischarged deferral above is
+unaffected and stands exactly as written — it is simply no longer on F-066's path.
 
 The reason for stopping there rather than claiming more is the history of this
 enumeration. Four earlier attempts were each falsified as a filter presented as a sweep,

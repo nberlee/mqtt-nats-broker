@@ -533,8 +533,8 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 		return fmt.Errorf("max_consumers is %d (want unlimited): every broker creates its own ephemeral session-record watch consumer, so a cap eventually rejects a legitimate broker start", cfg.MaxConsumers)
 	}
 	if epoch := cfg.Metadata[mqttSessEpochMetaKey]; !mqttValidSessEpoch(epoch) {
-		return fmt.Errorf("no valid %q metadata (found %q); recreate the session stream/store so a fresh incarnation epoch is generated",
-			mqttSessEpochMetaKey, epoch)
+		return fmt.Errorf("no valid %q metadata (found %q); stop ALL brokers for this account, delete ALL NINE broker-owned streams (%s) and restart, which mints a fresh recovery epoch across the whole bundle — recreating this stream alone is refused at the next startup, because the nine are one recreation unit",
+			mqttSessEpochMetaKey, epoch, mqttBrokerStreamBundleList)
 	}
 	return nil
 }

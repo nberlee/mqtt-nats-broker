@@ -3861,10 +3861,15 @@ func TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing(t *testing.T) {
 // TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage pins F-066's flagship row.
 //
 // A claim is keyed `(group durable, source sequence)`. That identifies one source message
-// only within one incarnation of $MQTT_msgs — and when that stream fails shape validation,
-// startup instructs the operator to stop all brokers and recreate IT ALONE
-// (stream_prereqs.go, stopAll), leaving $MQTT_qos2assign's claims behind with their
-// sequence counter reset underneath them.
+// only within one incarnation of $MQTT_msgs, and a recreation of that stream leaves
+// $MQTT_qos2assign's claims behind with their sequence counter reset underneath them.
+//
+// Recreating it ALONE is what startup USED TO instruct, and that reachability is what
+// made this F-066's flagship row. F-066's enforcement (2026-09-01) withdrew it: the nine
+// streams are one recreation unit and a proper subset is refused before anything is
+// provisioned, so the state below is now reachable only through an UNSUPPORTED operation
+// — administrative deletion or a partial restore. The behaviour this test pins is
+// unchanged and still worth pinning: it is defence in depth against exactly that.
 //
 // The fixture stages the STATE that procedure produces rather than the procedure: a
 // terminal claim already occupying the subject the very next published message will
@@ -6594,9 +6599,12 @@ func TestQ2AffCopyDedupKeyIsScopedToTheIncarnation(t *testing.T) {
 //
 // A live claim naming a DIFFERENT copy subject is positive evidence that the copy in
 // hand belongs to an incarnation that is over, so the gate disposes of it. That is
-// not the same as an ABSENT claim, which stays fail-closed and NAKs — absence is
-// producible by a supported operation (F-066's stream recreation), so it never
-// licenses destroying an accepted message (feedback_absence_is_not_a_fact). Both
+// not the same as an ABSENT claim, which stays fail-closed and NAKs — an absence is
+// never a positive fact, so it never licenses destroying an accepted message
+// (feedback_absence_is_not_a_fact). It used to be producible by a SUPPORTED operation,
+// F-066's single-stream recreation; that route is closed, and a whole-bundle reset
+// removes the copy along with the claim rather than leaving this state, so what
+// remains producible is administrative deletion or a partial restore. Both
 // halves are asserted here, because the arm is only safe if the boundary holds.
 //
 // Paired mutation M11: drop the gate's CopySubject comparison. The superseded copy is

@@ -152,10 +152,13 @@ All notable changes to this project are documented here. The format is based on
 
   **First-release storage format:** an outbox record without an exact client identity
   or a legal decision shape, and a `$MQTT_sess` stream without a valid generated epoch,
-  are rejected with recreate guidance. Back up, restore or recreate `$MQTT_sess` and
-  `$MQTT_teardown` as ONE unit with every broker for the account
-  stopped — and note that recreating `$MQTT_sess` discards every client's acceptance
-  history with it, after which a delayed Will enqueued beforehand fires.
+  are rejected with recreate guidance. Back up, restore, delete and recreate **all
+  nine** broker-owned `$MQTT_*` streams as ONE unit, from one point in time, with every
+  broker for the account stopped: startup refuses an account holding a proper subset,
+  and refuses a complete bundle whose members carry different recovery epochs. Note
+  that a reset discards every client's acceptance history with `$MQTT_sess` — and, since
+  it takes `$MQTT_willq` too, the pending delayed Wills those facts would have suppressed
+  go with it rather than firing.
 - Project scaffold: Go module, config (`internal/config`), NATS/JetStream backend
   with auth-passthrough dial (`internal/backend`), runnable entrypoint with
   health/readiness endpoints.
@@ -282,8 +285,9 @@ All notable changes to this project are documented here. The format is based on
   `DiscardOld` so the terminal CAS replaces rather than being rejected. A stream that
   does not match the required configuration now **fails broker startup** with
   recreate guidance instead of being updated in place. Upgrading an existing
-  development store means stopping **all** brokers for the account and recreating the
-  stream — **this is not a rolling upgrade**.
+  development store means stopping **all** brokers for the account and resetting the
+  whole nine-stream bundle — recreating this stream alone is refused, since the
+  broker-owned streams are one recreation unit — **this is not a rolling upgrade**.
 - **An MQTT client could read the entire internal `$MQTT.>` namespace by
   subscribing to it.** Only three delivery prefixes (`$MQTT.sub.`,
   `$MQTT.deliver.pubrel.`, `$MQTT.qsub.`) were rejected, carrying an upstream

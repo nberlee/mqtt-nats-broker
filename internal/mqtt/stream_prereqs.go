@@ -29,6 +29,7 @@ package mqtt
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -128,11 +129,23 @@ func validateStreamSubjectSet(got, want []string) error {
 	return nil
 }
 
+// brokerStreamLookupAPI is what a PREFLIGHT gets: reads and nothing else.
+//
+// The narrowness is the mechanism, not a style preference. Both preflights here
+// decide whether the account may be provisioned at all, and their whole value
+// rests on their creating nothing while they decide — a create from inside one
+// would provision the very shape it is deciding to refuse. Handing them an
+// interface with no createStream makes that unrepresentable rather than
+// asserted.
+type brokerStreamLookupAPI interface {
+	lookupStream(name string) (*StreamInfo, error)
+}
+
 // brokerStreamAPI is the minimal seam ensureBrokerStream needs, satisfied by
 // *mqttJSA and by test stubs.
 type brokerStreamAPI interface {
+	brokerStreamLookupAPI
 	createStream(cfg *StreamConfig) (*StreamInfo, bool, error)
-	lookupStream(name string) (*StreamInfo, error)
 }
 
 // ensureBrokerStream is the one convergence shape every broker-owned stream is
@@ -228,7 +241,7 @@ func ensureBrokerStream(api brokerStreamAPI, cfg *StreamConfig,
 // refuses every MQTT 5 CONNECT, so no owner operation ever emits the header —
 // requiring the capability there would refuse a legitimate 3.1.1-only
 // deployment, so the requirement is derived only where the operation exists.
-func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, requireMsgTTL bool) error {
+func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, requireMsgTTL bool, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -264,6 +277,12 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 	if l := cfg.ConsumerLimits.MaxAckPending; l != 0 && l < maxAckPending {
 		return fmt.Errorf("stream consumer max_ack_pending limit is %d, below the broker's effective cap %d: JetStream would reject every consumer create, failing SUBSCRIBE", l, maxAckPending)
 	}
+	// The bundle stamp: this stream carries the account's recovery epoch, which is
+	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// independently recoverable stores (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -297,7 +316,7 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 // requireMsgTTL follows validateMsgsStream: retained Message Expiry is an
 // MQTT 5.0 property, so a max_protocol_version:4 broker never emits Nats-TTL
 // on a retained store and must not require the capability.
-func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool) error {
+func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -334,7 +353,156 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool
 	if cfg.MaxConsumers > 0 {
 		return fmt.Errorf("max_consumers is %d (want unlimited): every broker creates its own ephemeral retained-messages consumer, so a cap eventually rejects a legitimate broker start", cfg.MaxConsumers)
 	}
+	// The bundle stamp: this stream carries the account's recovery epoch, which is
+	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// independently recoverable stores (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateBundleEpochStamp checks that a stream carries the account's recovery
+// epoch, which is what makes the nine broker-owned streams ONE recreation unit
+// rather than nine independently recoverable stores.
+//
+// The epoch is minted by $MQTT_sess at its creation and adopted by every broker
+// from ensureBrokerStream's authoritative re-read, so a stream stamped with a
+// different value belongs to a different incarnation of the bundle: its records
+// persist identities — sequences, consumer durables, subjects — that other
+// streams issued and that a recreation has since reissued to unrelated state
+// (docs/ARCHITECTURE.md, "Stream prerequisites"; F-066).
+//
+// wantEpoch is checked FIRST and a malformed or empty one is itself the
+// refusal, never a wildcard that admits anything. That direction is the whole
+// hazard: an epoch this broker could not read collapses every value into one
+// identity, and the comparison below would then pass for a stream from any
+// incarnation at all. The caller reaches this with an unusable wantEpoch only
+// through an ordering fault, which is exactly when admitting would be worst.
+//
+// Unrelated metadata keys are accepted: this owns one key, not the map.
+func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
+	if !mqttValidSessEpoch(wantEpoch) {
+		return fmt.Errorf("this account's recovery epoch is unusable (%q): the %s bundle cannot be compared, so no stream is admitted",
+			wantEpoch, mqttSessStreamName)
+	}
+	if got := cfg.Metadata[mqttSessEpochMetaKey]; got != wantEpoch {
+		return fmt.Errorf("%q metadata is %q, want this account's recovery epoch %q: the stream belongs to a different incarnation of the broker-owned bundle",
+			mqttSessEpochMetaKey, got, wantEpoch)
+	}
+	return nil
+}
+
+// mqttPreflightBrokerStreamBundle refuses an account whose broker-owned streams
+// are a PROPER SUBSET of the nine, before anything is created.
+//
+// It exists because ensureBrokerStream cannot enforce this: that helper sees one
+// stream and CREATES it when the lookup says absent, so by the time any
+// validator runs the missing member has already been provisioned — silently
+// re-establishing the partial-recreation hazard F-066 records. The comparison
+// has to happen where all nine are visible and nothing has been created yet.
+//
+// The names come from the SAME spec table the provisioning loop iterates, never
+// from a second list: a hand-maintained copy drifts from the table, and
+// TestBrokerStreamSpecTable proves the table's contents, not that some other
+// list matches it.
+//
+// Each lookup's (si, err) PAIR is dispositioned together, exactly as
+// mqttRefuseRetiredOriginStream does and for the same reason — deciding on one
+// half and then the other is what produced two fail-open defects there:
+//
+//	si != nil, any error   -> PRESENT. Positive evidence outranks a contradictory
+//	                          error, including a not-found one.
+//	si == nil, not-found   -> ABSENT.
+//	si == nil, other error -> UNDECIDED. An unreadable stream is not an absent one.
+//	si == nil, no error    -> UNDECIDED. A reply that decoded but carried neither.
+//
+// Both undecided arms FAIL STARTUP, naming the stream. Folding either into
+// ABSENCE is the fail-open that matters most here: a transient lookup outage
+// read as absence turns an eight-present account into a zero-present one, this
+// check admits, and the loop recreates the missing stream — the exact hazard,
+// arriving through the check meant to close it.
+//
+// Then, over the presence vector: zero admits (initial creation, or a completed
+// whole-bundle reset); nine admits (per-stream epoch validation in the loop
+// enforces the bundle's identity from there); anything between REFUSES.
+//
+// The scan is nine independent lookups and therefore NOT atomic, which bounds
+// what admission can promise. Under create-only concurrency — every other actor
+// a broker running this same ordered provisioning — an admission cannot
+// wrongfully succeed: an all-absent observation may race a peer's creation but
+// then adopts that peer's epoch through create-or-lose, and an all-present
+// observation is truthful because presence is monotone when nothing deletes.
+// Concurrent DELETION breaks the second arm and is a stated residual
+// (docs/CONFORMANCE.md): an operator deleting streams behind this scan, leaving
+// $MQTT_sess for last, can be observed as nine-present. That requires violating
+// the all-brokers-stopped precondition the reset procedure states.
+func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec) error {
+	present := make([]string, 0, len(specs))
+	absent := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		si, err := jsa.lookupStream(spec.name)
+		if h := mqttTestPreflightLookupHookV.Load(); h != nil {
+			(*h)(spec.name)
+		}
+		switch {
+		case si != nil:
+			present = append(present, spec.name)
+		case err == nil:
+			return fmt.Errorf("checking the broker-owned stream bundle: the server answered for %s "+
+				"without stream information, so whether this account holds it cannot be decided",
+				spec.name)
+		case isErrorOtherThan(err, JSStreamNotFoundErr):
+			return fmt.Errorf("checking the broker-owned stream bundle: looking up %s: %w", spec.name, err)
+		default:
+			absent = append(absent, spec.name)
+		}
+	}
+	if len(absent) == 0 || len(present) == 0 {
+		return nil
+	}
+	return fmt.Errorf("this account holds %d of the %d broker-owned streams — present: %v; absent: %v. "+
+		"These streams are ONE recreation unit: records on each persist identities the others issue "+
+		"(sequences, consumer durables, subjects), so recreating a proper subset leaves stale references "+
+		"matching new unrelated state. Recreating the absent ones alone is NOT the recovery. "+
+		"Stop ALL brokers for this account, delete every one of the %d streams (%v), and restart, which "+
+		"recreates the whole bundle — this is not a rolling upgrade, see docs/ARCHITECTURE.md "+
+		"\"Compatibility boundary\". A first start that was interrupted part-way leaves the same shape "+
+		"and takes the same recovery",
+		len(present), len(specs), present, absent, len(specs), mqttBrokerStreamNames(specs))
+}
+
+// mqttTestPreflightLookupHookV runs after each of the preflight's per-stream lookups,
+// naming the stream just observed. Nil in production.
+//
+// It exists because the preflight's presence vector is assembled from nine INDEPENDENT
+// lookups, so a broker whose scan overlaps a peer's ordered creation can observe a
+// vector that never existed durably — the reason this check promises fail-closed
+// refusal rather than an atomic snapshot. That interleaving cannot be produced by
+// starting two brokers and hoping; it needs the scan paused at a chosen point while
+// the peer provisions, which is exactly what this seam gives a test. Package-level for
+// the same reason as the watch-consumer seam: the pause has to happen before any
+// account manager exists to hang it on.
+var mqttTestPreflightLookupHookV atomic.Pointer[func(string)]
+
+// mqttBrokerStreamBundleList names the recreation unit for guidance text that
+// cannot reach the spec table — every validator's recovery sentence. It is
+// prose, and the authoritative set is the table; TestBrokerStreamSpecTable pins
+// that the two agree, because guidance naming a different set than the preflight
+// enforces is how an operator is sent to delete the wrong thing.
+const mqttBrokerStreamBundleList = mqttSessStreamName + ", " + mqttWillQStreamName + ", " +
+	mqttTeardownStreamName + ", " + mqttStreamName + ", " + mqttQoS2IncomingMsgsStreamName + ", " +
+	mqttQoS2AssignStreamName + ", " + mqttInflightStreamName + ", " + mqttOutStreamName + ", " +
+	mqttRetainedMsgsStreamName
+
+// mqttBrokerStreamNames is the bundle's names in provisioning order, for
+// diagnostics that must tell an operator exactly what to delete.
+func mqttBrokerStreamNames(specs []brokerStreamSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.name)
+	}
+	return names
 }
 
 // mqttRefuseRetiredOriginStream fails startup when this account still holds
@@ -343,7 +511,8 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool
 // It cannot be a provisioning-table entry with a validator that always fails:
 // ensureBrokerStream CREATES an absent stream before validating anything, so an
 // entry would provision the very stream this refuses. Hence a LOOKUP-ONLY check,
-// run before the provisioning loop.
+// run before the provisioning loop — and it takes brokerStreamLookupAPI, so
+// "creates nothing" is a property of the type rather than a promise.
 //
 // lookupStream returns the response's StreamInfo and its error INDEPENDENTLY, so the
 // two are decided as a PAIR rather than in sequence. Deciding on the error first and
@@ -368,7 +537,7 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool
 // design no longer defines is an unsupported persisted shape, which
 // docs/ARCHITECTURE.md's "Compatibility boundary" refuses rather than carries;
 // pre-release that costs each development account one stream deletion.
-func mqttRefuseRetiredOriginStream(jsa brokerStreamAPI) error {
+func mqttRefuseRetiredOriginStream(jsa brokerStreamLookupAPI) error {
 	si, err := jsa.lookupStream(mqttOriginStreamName)
 	switch {
 	case si != nil:
@@ -411,24 +580,88 @@ type brokerStreamSpec struct {
 // broker-owned $MQTT_* streams. wantReplicas is 0 when no explicit replica
 // count is configured; maxAckPending is the broker's effective per-consumer
 // cap; requireMsgTTL is whether this broker accepts MQTT 5.0 (see
-// validateMsgsStream); rmsubj is the delivery subject of this broker's
-// retained-messages consumer, created as the $MQTT_rmsgs post step; retainedName, when
-// non-nil, receives that consumer's generated name so the caller can roll it back if a
-// later provisioning step fails.
-func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string,
-	replicas, wantReplicas, maxAckPending int, requireMsgTTL bool, rmsubj string,
-	ephemeralID, ephemeralOwner string, created mqttEphemeralCreated) []brokerStreamSpec {
+// validateMsgsStream).
+//
+// The table carries no JetStream API and creates nothing itself: the retained
+// observer this function used to create as a post step now lives in
+// mqttProvisionEphemeralConsumers, which runs after every stream has validated.
+// $MQTT_rmsgs was already the last entry, so nothing is delayed by the move —
+// what it buys is that a reader confirms "no consumer is created until every
+// stream validated" at one call site rather than by auditing nine entries.
+func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
+	replicas, wantReplicas, maxAckPending int, requireMsgTTL bool) []brokerStreamSpec {
 
-	jsa := &as.jsa
 	// The provisioning loop prefixes every error with the stream and account, so
-	// the guidance here carries only the verdict and the recovery.
+	// the guidance here carries only the verdict and the recovery. The recovery is
+	// the WHOLE BUNDLE, never this stream alone: records on each of the nine
+	// persist identities the others issue, so recreating a proper subset leaves
+	// stale references matching new unrelated state (F-066). Startup refuses a
+	// proper subset outright (mqttPreflightBrokerStreamBundle), so guidance naming
+	// one stream would prescribe a procedure the next start rejects.
 	stopAll := func(verr error, stream, req string) error {
-		return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s with the required %s configuration (this is not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
-			verr, stream, req)
+		return fmt.Errorf("not usable: %w; stop ALL brokers for this account, delete ALL NINE broker-owned streams (%s) and restart, which recreates the bundle with the required %s configuration — these streams are ONE recreation unit and recreating %s alone is refused at the next startup (this is not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
+			verr, mqttBrokerStreamBundleList, req, stream)
 	}
 
-	// Hoisted so their own preCreate can stamp them: the $MQTT_sess incarnation epoch
-	// these streams are coupled to does not exist yet when the table is built.
+	// The account's recovery epoch is minted by $MQTT_sess at its creation and
+	// adopted from the authoritative re-read in that entry's post step, so it does
+	// not exist when this table is built. Every other stream is therefore stamped
+	// by a preCreate, which runs immediately before its own create — after
+	// $MQTT_sess's iteration, because $MQTT_sess is entry 0.
+	//
+	// A create-race loser never reaches its preCreate and validates the winner's
+	// stream instead, whose stamp is the identical value: every broker adopted the
+	// same epoch from the same session-stream re-read.
+	//
+	// An unstamped config is left unstamped rather than guessed when the epoch is
+	// somehow missing, so the validator refuses the stream instead of admitting an
+	// uncomparable one. That is unreachable in the provisioning order and is
+	// written down as fail-closed rather than as an invariant.
+	stampEpoch := func(cfg *StreamConfig) func() {
+		return func() {
+			if as.sessStreamEpoch == _EMPTY_ {
+				return
+			}
+			cfg.Metadata = map[string]string{mqttSessEpochMetaKey: as.sessStreamEpoch}
+		}
+	}
+
+	// Hoisted so stampEpoch can close over them: a config literal inside the table
+	// cannot be stamped, because the table is built before the loop that adopts
+	// the epoch.
+	sessCfg := &StreamConfig{
+		Name: mqttSessStreamName,
+		// Two subject spaces, one stream: the session records, and the permanent
+		// per-CONNECT acceptance facts an accepted CONNECT commits atomically WITH
+		// its record. A batch is per stream, so the fact cannot live anywhere else
+		// without reintroducing the interval in which a session is accepted and its
+		// evidence is not yet durable. The accept prefix is top-level rather than
+		// nested under "sess.", because every session walk in this package filters
+		// "sess.<domainTk>>" and decodes what it gets as a session record.
+		Subjects: []string{
+			mqttSessStreamSubjectPrefix + as.domainTk + ">",
+			mqttAcceptSubjectPrefix + as.domainTk + ">",
+		},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Replicas:   replicas,
+		MaxMsgsPer: 1,
+		// Required, not optional: the accept batch carries Nats-Batch-* headers,
+		// which a stream without this rejects.
+		AllowAtomicPublish: true,
+		// The account's recovery epoch, MINTED here. This is the only stream that
+		// generates one; the other eight are stamped with the value adopted from
+		// this stream's authoritative re-read.
+		Metadata: map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+	}
+	willQCfg := &StreamConfig{
+		Name:       mqttWillQStreamName,
+		Subjects:   []string{mqttWillQSubjectPrefix + as.domainTk + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Replicas:   replicas,
+		MaxMsgsPer: 1,
+	}
 	teardownCfg := &StreamConfig{
 		Name:       mqttTeardownStreamName,
 		Subjects:   []string{mqttTeardownSubjectPrefix + as.domainTk + ">"},
@@ -438,51 +671,83 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 		Replicas:   replicas,
 		MaxMsgsPer: 1,
 	}
+	msgsCfg := &StreamConfig{
+		Name:      mqttStreamName,
+		Subjects:  []string{mqttStreamSubjectPrefix + ">"},
+		Storage:   FileStorage,
+		Retention: InterestPolicy,
+		Replicas:  replicas,
+		// Honor MQTT 5.0 Message Expiry Interval: a stored PUBLISH carries a
+		// per-message Nats-TTL so JetStream drops it once its lifetime has
+		// elapsed, even if never delivered. Spec5 [3.3.2.3.3].
+		AllowMsgTTL: true,
+	}
+	qos2InCfg := &StreamConfig{
+		Name:       mqttQoS2IncomingMsgsStreamName,
+		Subjects:   []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Discard:    DiscardOld,
+		MaxMsgsPer: 1,
+		Replicas:   replicas,
+	}
+	qos2AssignCfg := &StreamConfig{
+		Name:       mqttQoS2AssignStreamName,
+		Subjects:   []string{mqttQoS2AssignStreamSubjectPrefix + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Discard:    DiscardOld,
+		MaxMsgsPer: 1,
+		Replicas:   replicas,
+	}
+	inflightCfg := &StreamConfig{
+		Name:       mqttInflightStreamName,
+		Subjects:   []string{mqttInflightStreamSubjectPrefix + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Discard:    DiscardOld,
+		MaxMsgsPer: 1,
+		Replicas:   replicas,
+	}
+	outCfg := &StreamConfig{
+		Name:      mqttOutStreamName,
+		Subjects:  []string{mqttOutSubjectPrefix + ">"},
+		Storage:   FileStorage,
+		Retention: InterestPolicy,
+		Replicas:  replicas,
+	}
+	retainedCfg := &StreamConfig{
+		Name:       mqttRetainedMsgsStreamName,
+		Subjects:   []string{mqttRetainedMsgsStreamSubject + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Replicas:   replicas,
+		MaxMsgsPer: 1,
+		// Honor MQTT 5.0 Message Expiry Interval for retained messages via a
+		// per-message Nats-TTL. Spec5 [3.3.2.3.3].
+		AllowMsgTTL: true,
+	}
 	return []brokerStreamSpec{
 		{
 			name: mqttSessStreamName,
 			txt:  "sessions",
-			// A generated incarnation epoch is stamped into the stream metadata at
+			// A generated recovery epoch is stamped into the stream metadata at
 			// creation (the linearization point): whichever replica wins the create
 			// sets the authoritative epoch, and everyone — winner included — adopts
 			// it from ensureBrokerStream's authoritative re-read in the post step,
-			// after validateSessStream has accepted it on that same snapshot.
-			cfg: &StreamConfig{
-				Name: mqttSessStreamName,
-				// Two subject spaces, one stream: the session records, and the
-				// permanent per-CONNECT acceptance facts an accepted CONNECT commits
-				// atomically WITH its record. A batch is per stream, so the fact
-				// cannot live anywhere else without reintroducing the interval in
-				// which a session is accepted and its evidence is not yet durable.
-				// The accept prefix is top-level rather than nested under "sess.",
-				// because every session walk in this package filters "sess.<domainTk>>"
-				// and decodes what it gets as a session record.
-				Subjects: []string{
-					mqttSessStreamSubjectPrefix + as.domainTk + ">",
-					mqttAcceptSubjectPrefix + as.domainTk + ">",
-				},
-				Storage:    FileStorage,
-				Retention:  LimitsPolicy,
-				Replicas:   replicas,
-				MaxMsgsPer: 1,
-				// Required, not optional: the accept batch carries Nats-Batch-*
-				// headers, which a stream without this rejects.
-				AllowAtomicPublish: true,
-				Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
-			},
+			// after validateSessStream has accepted it on that same snapshot. Every
+			// other broker-owned stream is then stamped with that value, which is
+			// what makes the nine one recreation unit.
+			cfg: sessCfg,
 			validate: func(si *StreamInfo) error {
 				if verr := validateSessStream(si, as.domainTk, wantReplicas); verr != nil {
-					// The session stream is epoch-coupled to the retirement watermarks:
-					// recreating $MQTT_sess alone mints a new incarnation epoch while
-					// they keep the old one, the partial-recreation hazard
-					// docs/ARCHITECTURE.md ("Operational constraints for the marker")
-					// warns against. It also destroys every permanent CONNECT acceptance
-					// fact, which lives on this stream — so no delayed Will enqueued
-					// before the recreation can be suppressed by the acceptance that was
-					// entitled to suppress it. The recovery is the coupled one, mirroring
-					// the watermark stream's own guidance.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s as one logical unit — recreating the session stream alone mints a new incarnation epoch against stale generation-retirement watermarks, and discards every permanent CONNECT acceptance fact with it (see docs/ARCHITECTURE.md; this is not a rolling upgrade)",
-						verr, mqttSessStreamName, mqttTeardownStreamName)
+					// $MQTT_sess MINTS the account's recovery epoch, so recreating it
+					// alone leaves every other stream stamped with an incarnation that
+					// no longer exists — and takes every permanent CONNECT acceptance
+					// fact with it, since those live on this stream, so no delayed Will
+					// enqueued beforehand can be suppressed by the acceptance entitled
+					// to suppress it. The recovery is the whole bundle.
+					return stopAll(verr, mqttSessStreamName, "session-record")
 				}
 				return nil
 			},
@@ -497,10 +762,15 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 				}
 			},
 			post: func(si *StreamInfo) error {
-				// Adopt the authoritative session-stream incarnation epoch, already
-				// validated by validateSessStream on this exact snapshot. Every
-				// accepted CONNECT and every native Will record is stamped with this
-				// identity. See will_cancel.go.
+				// Adopt the authoritative recovery epoch, already validated by
+				// validateSessStream on this exact snapshot. Every accepted CONNECT and
+				// every native Will record is stamped with this identity, and so is
+				// every other broker-owned stream. See will_cancel.go.
+				//
+				// From the RE-READ (si), never from sessCfg: the config carries the
+				// value this broker ASKED for, and a create-race loser's ask is
+				// discarded. Adopting the ask would leave two brokers stamping the
+				// other eight streams with two different epochs.
 				as.sessStreamEpoch = si.Config.Metadata[mqttSessEpochMetaKey]
 				return nil
 			},
@@ -512,16 +782,10 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			// sessions stream so its per-Will subjects and sequences never interfere
 			// with the in-memory session record's CAS token (sess.seq). MaxMsgsPer:1
 			// makes each per-Will subject a single-record CAS slot. See will_outbox.go.
-			cfg: &StreamConfig{
-				Name:       mqttWillQStreamName,
-				Subjects:   []string{mqttWillQSubjectPrefix + as.domainTk + ">"},
-				Storage:    FileStorage,
-				Retention:  LimitsPolicy,
-				Replicas:   replicas,
-				MaxMsgsPer: 1,
-			},
+			cfg:       willQCfg,
+			preCreate: stampEpoch(willQCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateWillQStream(si, as.domainTk, wantReplicas); verr != nil {
+				if verr := validateWillQStream(si, as.domainTk, wantReplicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttWillQStreamName, "delayed-Will outbox")
 				}
 				return nil
@@ -533,56 +797,27 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			// Durable per-client generation-retirement watermark stream. Permanent
 			// per-client retention (MaxMsgsPer:1, no global limits so a fence is never
 			// evicted; DiscardOld so a CAS replacement of a client's prior watermark is
-			// never rejected). Epoch-COUPLED to $MQTT_sess: the entry sits after it so
-			// the adopted incarnation epoch exists by the time preCreate stamps it. See
-			// sess_teardown.go.
-			cfg: teardownCfg,
-			// The stamp cannot be a config literal: this table is built before the
-			// provisioning loop runs, and as.sessStreamEpoch is adopted inside
-			// $MQTT_sess's own iteration. preCreate runs immediately before the create,
-			// which is after that iteration, so the value is there. A create-race loser
-			// never reaches here and validates the authoritative re-read instead — whose
-			// stamp is the identical value, because every broker adopted the same epoch
-			// from the same session-stream re-read.
-			preCreate: func() {
-				if as.sessStreamEpoch == _EMPTY_ {
-					// Unreachable in the provisioning order: $MQTT_sess validated and
-					// adopted its epoch first. Left unstamped rather than guessed, so the
-					// validator below refuses the stream instead of admitting an
-					// uncomparable one.
-					return
-				}
-				teardownCfg.Metadata = map[string]string{mqttSessEpochMetaKey: as.sessStreamEpoch}
-			},
+			// never rejected). See sess_teardown.go.
+			cfg:       teardownCfg,
+			preCreate: stampEpoch(teardownCfg),
 			validate: func(si *StreamInfo) error {
 				if verr := validateTeardownStream(si, as.domainTk, wantReplicas, as.sessStreamEpoch); verr != nil {
-					// Same coupling as the will-cancel markers, for the same reason: a
-					// MarkerSeq is a $MQTT_sess sequence, so these permanent watermarks
+					// A MarkerSeq is a $MQTT_sess sequence, so these permanent watermarks
 					// are only comparable within the incarnation they were written under.
-					// Recreating either stream alone is the hazard, and an unfenced
+					// That coupling is now the bundle's, not a private pair: an unfenced
 					// generation whose resources are already deleted is the cost.
-					return fmt.Errorf("not usable: %w; stop ALL brokers for this account and recreate %s together with %s as one logical unit — recreating the session stream alone leaves generation-retirement watermarks from a different incarnation, and recreating this stream alone discards the fences that keep a torn-down session from being resumed hollow (see docs/ARCHITECTURE.md)",
-						verr, mqttTeardownStreamName, mqttSessStreamName)
+					return stopAll(verr, mqttTeardownStreamName, "generation-retirement watermark")
 				}
 				return nil
 			},
 		},
 		{
-			name: mqttStreamName,
-			txt:  "messages",
-			cfg: &StreamConfig{
-				Name:      mqttStreamName,
-				Subjects:  []string{mqttStreamSubjectPrefix + ">"},
-				Storage:   FileStorage,
-				Retention: InterestPolicy,
-				Replicas:  replicas,
-				// Honor MQTT 5.0 Message Expiry Interval: a stored PUBLISH carries a
-				// per-message Nats-TTL so JetStream drops it once its lifetime has
-				// elapsed, even if never delivered. Spec5 [3.3.2.3.3].
-				AllowMsgTTL: true,
-			},
+			name:      mqttStreamName,
+			txt:       "messages",
+			cfg:       msgsCfg,
+			preCreate: stampEpoch(msgsCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateMsgsStream(si, wantReplicas, maxAckPending, requireMsgTTL); verr != nil {
+				if verr := validateMsgsStream(si, wantReplicas, maxAckPending, requireMsgTTL, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttStreamName, "interest-retained messages")
 				}
 				return nil
@@ -600,17 +835,10 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			// REJECT that replacement instead of performing it. storeQoS2HoldCAS and
 			// storeQoS2DoneCAS are the only writers of these subjects. See
 			// qos2_move.go.
-			cfg: &StreamConfig{
-				Name:       mqttQoS2IncomingMsgsStreamName,
-				Subjects:   []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"},
-				Storage:    FileStorage,
-				Retention:  LimitsPolicy,
-				Discard:    DiscardOld,
-				MaxMsgsPer: 1,
-				Replicas:   replicas,
-			},
+			cfg:       qos2InCfg,
+			preCreate: stampEpoch(qos2InCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateQoS2InStream(si, wantReplicas); verr != nil {
+				if verr := validateQoS2InStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttQoS2IncomingMsgsStreamName, "move-protocol")
 				}
 				return nil
@@ -623,17 +851,10 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			// (group durable, source sequence) elects and then holds the session
 			// that owns a STARTED delivery, indefinitely and independently of any
 			// deduplication window. See qos2_shared_affine.go.
-			cfg: &StreamConfig{
-				Name:       mqttQoS2AssignStreamName,
-				Subjects:   []string{mqttQoS2AssignStreamSubjectPrefix + ">"},
-				Storage:    FileStorage,
-				Retention:  LimitsPolicy,
-				Discard:    DiscardOld,
-				MaxMsgsPer: 1,
-				Replicas:   replicas,
-			},
+			cfg:       qos2AssignCfg,
+			preCreate: stampEpoch(qos2AssignCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateQoS2AssignStream(si, wantReplicas); verr != nil {
+				if verr := validateQoS2AssignStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttQoS2AssignStreamName, "assignment-claim")
 				}
 				return nil
@@ -648,17 +869,10 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			// $MQTT_out is interest-retained and would keep nothing, and a
 			// per-delivery write to the session record would put every outbound
 			// QoS 1/2 message behind the record CAS. See inflight_register.go.
-			cfg: &StreamConfig{
-				Name:       mqttInflightStreamName,
-				Subjects:   []string{mqttInflightStreamSubjectPrefix + ">"},
-				Storage:    FileStorage,
-				Retention:  LimitsPolicy,
-				Discard:    DiscardOld,
-				MaxMsgsPer: 1,
-				Replicas:   replicas,
-			},
+			cfg:       inflightCfg,
+			preCreate: stampEpoch(inflightCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateInflightStream(si, wantReplicas); verr != nil {
+				if verr := validateInflightStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttInflightStreamName, "in-flight register")
 				}
 				return nil
@@ -674,79 +888,23 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 			// consumer, and it is why a copy must never be stored before that
 			// consumer exists (a store with no interest returns success and keeps
 			// nothing).
-			cfg: &StreamConfig{
-				Name:      mqttOutStreamName,
-				Subjects:  []string{mqttOutSubjectPrefix + ">"},
-				Storage:   FileStorage,
-				Retention: InterestPolicy,
-				Replicas:  replicas,
-			},
+			cfg:       outCfg,
+			preCreate: stampEpoch(outCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateOutStream(si, wantReplicas, maxAckPending); verr != nil {
+				if verr := validateOutStream(si, wantReplicas, maxAckPending, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttOutStreamName, "interest-retained delivery")
 				}
 				return nil
 			},
 		},
 		{
-			name: mqttRetainedMsgsStreamName,
-			txt:  "retained messages",
-			cfg: &StreamConfig{
-				Name:       mqttRetainedMsgsStreamName,
-				Subjects:   []string{mqttRetainedMsgsStreamSubject + ">"},
-				Storage:    FileStorage,
-				Retention:  LimitsPolicy,
-				Replicas:   replicas,
-				MaxMsgsPer: 1,
-				// Honor MQTT 5.0 Message Expiry Interval for retained messages via a
-				// per-message Nats-TTL. Spec5 [3.3.2.3.3].
-				AllowMsgTTL: true,
-			},
+			name:      mqttRetainedMsgsStreamName,
+			txt:       "retained messages",
+			cfg:       retainedCfg,
+			preCreate: stampEpoch(retainedCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateRetainedStream(si, wantReplicas, requireMsgTTL); verr != nil {
+				if verr := validateRetainedStream(si, wantReplicas, requireMsgTTL, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttRetainedMsgsStreamName, "per-topic retained")
-				}
-				return nil
-			},
-			post: func(_ *StreamInfo) error {
-				// The retained observer, under a name DERIVED from this server run so
-				// a retried initialization asks for the same consumer.
-				//
-				// Deleted before it is created, and the delete must come back
-				// DEFINITE. This is the one place the two ephemeral consumers differ,
-				// and the reason is the retained INDEX: as.retmsgs is written only by
-				// this consumer's callback and by the publishing broker's own local
-				// seed, so a DeliverAll consumer ADOPTED at its current position
-				// leaves the index empty — and a wildcard SUBSCRIBE has nothing but
-				// the index (a literal filter is forced through loadRetainedMessages,
-				// a wildcard cannot be). A previous attempt of THIS run may have
-				// drained the whole backlog into a manager that was then discarded, so
-				// adoption here silently serves no retained message for the life of
-				// the process. Freshness therefore comes from the protocol order, not
-				// from inspecting the create response: a response cannot distinguish a
-				// fresh consumer that has already delivered from an adopted one.
-				name := mqttRetainedObserverName(ephemeralID)
-				if err := jsa.deleteEphemeralConsumerDefinite(mqttRetainedMsgsStreamName, name); err != nil {
-					return fmt.Errorf("retained messages consumer for account %q: %w", accName, err)
-				}
-				ccfg := &CreateConsumerRequest{
-					Stream: mqttRetainedMsgsStreamName,
-					Config: ConsumerConfig{
-						Name:              name,
-						FilterSubject:     mqttRetainedMsgsStreamSubject + ">",
-						DeliverSubject:    rmsubj,
-						ReplayPolicy:      ReplayInstant,
-						AckPolicy:         AckNone,
-						InactiveThreshold: 5 * time.Minute,
-						Metadata:          mqttEphemeralConsumerMetadata(ephemeralOwner, mqttEphemeralRetainedObserver),
-					},
-				}
-				confirmed, err := jsa.createEphemeralConsumerOwned(ccfg)
-				if confirmed {
-					created.confirm(mqttEphemeralRetainedObserver)
-				}
-				if err != nil {
-					return fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 				}
 				return nil
 			},
@@ -754,8 +912,16 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 	}
 }
 
-// mqttProvisionEphemeralConsumers creates this broker's session-record watch AFTER
+// mqttProvisionEphemeralConsumers creates this broker's two per-run ephemeral
+// consumers — the retained-messages observer and the session-record watch — AFTER
 // every stream in the provisioning table has been created and validated.
+//
+// BOTH live here, in that order. The observer used to be the $MQTT_rmsgs entry's
+// post step, which was already the last table entry, so moving it changes no
+// ordering; what it buys is that "no consumer is created until every stream has
+// validated" is checkable at one call site instead of by auditing nine table
+// entries, and that the provisioning table itself performs no durable mutation
+// beyond the stream creates ensureBrokerStream makes (F-066).
 //
 // What bounds the leak is no longer atomicity but the DERIVED name: both consumers
 // are named from this server run's identity, so an initialization retry asks for the
@@ -775,7 +941,51 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server, accName string
 // nothing else. See mqttEphemeralCreated for why an errored create licenses nothing.
 //
 // See sess_record_watch.go for what the watch is and why the broker needs one.
-func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, srwsubj, ephemeralID, ephemeralOwner string, created mqttEphemeralCreated) error {
+func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, srwsubj, rmsubj, ephemeralID, ephemeralOwner string, created mqttEphemeralCreated) error {
+	// The retained observer first, the watch second — the order the $MQTT_rmsgs
+	// post step and this function had between them before the move.
+	//
+	// Deleted before it is created, and the delete must come back DEFINITE. This is
+	// the one place the two ephemeral consumers differ, and the reason is the
+	// retained INDEX: as.retmsgs is written only by this consumer's callback and by
+	// the publishing broker's own local seed, so a DeliverAll consumer ADOPTED at
+	// its current position leaves the index empty — and a wildcard SUBSCRIBE has
+	// nothing but the index (a literal filter is forced through
+	// loadRetainedMessages, a wildcard cannot be). A previous attempt of THIS run
+	// may have drained the whole backlog into a manager that was then discarded, so
+	// adoption here silently serves no retained message for the life of the
+	// process. Freshness therefore comes from the protocol order, not from
+	// inspecting the create response: a response cannot distinguish a fresh
+	// consumer that has already delivered from an adopted one.
+	rmname := mqttRetainedObserverName(ephemeralID)
+	if derr := as.jsa.deleteEphemeralConsumerDefinite(mqttRetainedMsgsStreamName, rmname); derr != nil {
+		as.rollbackEphemeralConsumers(created)
+		return fmt.Errorf("retained messages consumer for account %q: %w", accName, derr)
+	}
+	rmcfg := &CreateConsumerRequest{
+		Stream: mqttRetainedMsgsStreamName,
+		Config: ConsumerConfig{
+			Name:              rmname,
+			FilterSubject:     mqttRetainedMsgsStreamSubject + ">",
+			DeliverSubject:    rmsubj,
+			ReplayPolicy:      ReplayInstant,
+			AckPolicy:         AckNone,
+			InactiveThreshold: 5 * time.Minute,
+			Metadata:          mqttEphemeralConsumerMetadata(ephemeralOwner, mqttEphemeralRetainedObserver),
+		},
+	}
+	// The confirmation is recorded BEFORE the error is handled: a create that
+	// confirmably landed is the rollback's only licence, and an errored create of
+	// any shape licenses nothing. See mqttEphemeralCreated.
+	rmconfirmed, rmerr := as.jsa.createEphemeralConsumerOwned(rmcfg)
+	if rmconfirmed {
+		created.confirm(mqttEphemeralRetainedObserver)
+	}
+	if rmerr != nil {
+		as.rollbackEphemeralConsumers(created)
+		return fmt.Errorf("create retained messages consumer for account %q: %v", accName, rmerr)
+	}
+
 	ccfg := mqttSessRecordWatchConsumerConfig(as.domainTk, srwsubj, ephemeralID, ephemeralOwner)
 	err := error(nil)
 	// The seam models a FAILED CREATE, so it has to reach the same rollback the real

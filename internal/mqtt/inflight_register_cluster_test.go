@@ -30,7 +30,8 @@ func TestMQTTInflightReplicatedStream(t *testing.T) {
 
 	c.waitStreamCurrent(t, testGlobalAccount, mqttInflightStreamName)
 
-	si, err := b.s.mqtt.sessmgr.sessions[globalAccountName].jsa.lookupStream(mqttInflightStreamName)
+	asm := b.s.mqtt.sessmgr.sessions[globalAccountName]
+	si, err := asm.jsa.lookupStream(mqttInflightStreamName)
 	if err != nil {
 		t.Fatalf("lookup %s: %v", mqttInflightStreamName, err)
 	}
@@ -38,7 +39,7 @@ func TestMQTTInflightReplicatedStream(t *testing.T) {
 		t.Fatalf("%s has %d replica(s), want 3: the failover tests would prove nothing",
 			mqttInflightStreamName, si.Config.Replicas)
 	}
-	if err := validateInflightStream(si, 3); err != nil {
+	if err := validateInflightStream(si, 3, asm.sessStreamEpoch); err != nil {
 		t.Fatalf("%s does not carry the required configuration: %v", mqttInflightStreamName, err)
 	}
 }

@@ -225,13 +225,17 @@ type mqttWillOutbox struct {
 	//
 	// It is a $MQTT_sess SEQUENCE, so it is meaningless outside the incarnation that
 	// assigned it — which is why ScanEpoch travels with it and a floor from another
-	// incarnation is IGNORED. Without that scoping the documented coupled recreation
-	// is a live defect: $MQTT_willq is not part of that unit, so a pending Will
-	// survives carrying a floor from the old stream while the new one restarts at
-	// sequence 1, and the walk then skips the very facts a cross-incarnation Will
-	// qualifies on. Worse than skipping: with the floor above the new cutoff the loop
-	// runs zero times and reports "nothing qualifies", which LICENSES a publication
-	// having read nothing at all.
+	// incarnation is IGNORED. Without that scoping a surviving floor is a live defect:
+	// the walk skips the very facts a cross-incarnation Will qualifies on, and worse
+	// than skipping, a floor above the new cutoff makes the loop run zero times and
+	// report "nothing qualifies", which LICENSES a publication having read nothing at
+	// all.
+	//
+	// That state USED TO be reachable through a supported operation, when $MQTT_willq
+	// sat outside the coupled recreation unit and survived a $MQTT_sess recreation.
+	// F-066 made all nine streams one recreation unit, so no supported operation
+	// produces it any more; the scoping stays as defence in depth against
+	// administrative deletion or a partial restore.
 	ScanFrom uint64 `json:"sfrom,omitempty"`
 	// ScanEpoch is the $MQTT_sess incarnation ScanFrom was recorded under. Set with
 	// it and cleared with it; a floor whose epoch is not this broker's is discarded
@@ -561,7 +565,7 @@ func (as *mqttAccountSessionManager) refuseWillOutboxRecord(s *Server, subject s
 		as.refusedWillRecords[subject] = struct{}{}
 	}
 	as.mu.Unlock()
-	const format = "MQTT: refusing unsupported delayed-Will outbox record on %q: %v. It will never fire, be cancelled or be reaped, and both the claim scan and this client's reconnect re-read it every time; delete that message from the %s stream (or recreate the stream) PROMPTLY, or an accumulating backlog will slow every scan, delay valid Wills, and add a round trip to every CONNECT for this client"
+	const format = "MQTT: refusing unsupported delayed-Will outbox record on %q: %v. It will never fire, be cancelled or be reaped, and the claim scan re-reads it every interval; delete that message from the %s stream PROMPTLY (recreating the stream is NOT an option: the nine broker-owned streams are one recreation unit, so the alternative is a whole-bundle reset), or an accumulating backlog will slow every scan and delay valid Wills"
 	if warned {
 		s.Debugf(format, subject, err, mqttWillQStreamName)
 		return
@@ -1635,7 +1639,7 @@ func (as *mqttAccountSessionManager) deliverWillRecord(s *Server, rec *mqttWillO
 // publishing->done transition precedes the delete, so a denied delete cannot
 // re-fire a Will — it strands one done record per fired Will forever, and
 // every scan re-walks and re-attempts all of them.
-func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int) error {
+func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -1667,6 +1671,12 @@ func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int) erro
 	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on outbox subjects would be parsed as Will records", cfg.SubjectDeleteMarkerTTL)
+	}
+	// The bundle stamp: this stream carries the account's recovery epoch, which is
+	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// independently recoverable stores (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
 	}
 	return nil
 }

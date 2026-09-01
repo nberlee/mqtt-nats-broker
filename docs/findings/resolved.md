@@ -2273,7 +2273,9 @@ Every decode boundary validates: the point loader `loadWillOutbox` (which now ta
 scan, and the cancellation scan. A record that fails is REFUSED — never claimed,
 published, cancelled or deleted — and reported once per subject with the operator
 remedy. Refusal is read-only, so a refused record is reclaimed by NOTHING; the
-diagnostic says so and prescribes deleting the message or recreating the stream.
+diagnostic says so and prescribes deleting the message. (It used to offer recreating
+the stream as an alternative; F-066 withdrew that — the nine broker-owned streams are
+one recreation unit, so the only other route is a whole-bundle reset.)
 
 Two checks are not the obvious ones and are load-bearing.
 

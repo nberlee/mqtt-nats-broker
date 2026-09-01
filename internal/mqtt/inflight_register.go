@@ -5356,8 +5356,10 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// reason: we know an identifier is in use but cannot say which delivery owns it, so
 	// no new identifier can be issued safely. The session completes what it already has
 	// and accepts nothing new; QoS 0 is unaffected. It is loud rather than silent, and
-	// an operator removing the corrupt record (or recreating the stream, per the
-	// compatibility boundary in docs/ARCHITECTURE.md) lifts it on the next resume.
+	// an operator removing the corrupt record lifts it on the next resume. Recreating
+	// $MQTT_inflight is NOT an alternative: the nine broker-owned streams are one
+	// recreation unit, so the only other route is a whole-bundle reset (F-066, and
+	// the compatibility boundary in docs/ARCHITECTURE.md).
 	//
 	// The condition is what the walk FOUND (len(opaque)), never what this pass newly
 	// reserved. On a same-broker reconnect the session object survives, so the
@@ -5519,7 +5521,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 // creates a consumer on this stream, so a stream-forced consumer limit cannot affect
 // it. A validator that listed prerequisites its owner does not have would fail
 // startups for no reason.
-func validateInflightStream(si *StreamInfo, wantReplicas int) error {
+func validateInflightStream(si *StreamInfo, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -5573,6 +5575,12 @@ func validateInflightStream(si *StreamInfo, wantReplicas int) error {
 	// prerequisite (feedback_delete_redundant_mechanisms).
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on register subjects would be parsed as records", cfg.SubjectDeleteMarkerTTL)
+	}
+	// The bundle stamp: this stream carries the account's recovery epoch, which is
+	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// independently recoverable stores (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
 	}
 	return nil
 }

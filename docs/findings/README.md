@@ -16,7 +16,9 @@ issues, is enumerated once in the
 [persisted-identity census](persisted-identity-census.md). It is owned by F-034 and
 cited by F-066. Its field-level dispositions are enforced by tests; its
 interpretation-surface half is a drift guard rather than a closure proof, so it does
-**not** discharge F-066's completeness deferral.
+**not** discharge F-066's completeness deferral — which is why F-066 was ultimately
+closed at STREAM granularity, where completeness is demonstrable, rather than over the
+identities.
 
 ## Active findings
 
@@ -55,11 +57,12 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
   Details: [F-065](ha-arbitration.md#f-065).
 - Make all nine broker-owned streams one recreation unit, so no stale cross-stream
   identity survives a supported recovery.
-  Status: Open, remedy DECIDED 2026-08-31 and enforcement not yet landed. Generalising
-  the coupling was the intended remedy and is ABANDONED. The decision is to withdraw
-  independent single-stream recreation WHEN the enforcement lands; until then the
-  single-stream procedures the validators print remain the supported ones.
-  Release treatment: Alpha blocker.
+  Status: Closed 2026-09-01. Generalising the coupling was the intended remedy and is
+  ABANDONED; the owner's 2026-08-31 ruling changed the recovery contract instead, and
+  the enforcement has landed — an account-wide count preflight plus a recovery epoch
+  stamped into all nine and compared by every validator. Independent single-stream
+  recreation is withdrawn and refused.
+  Release treatment: Alpha blocker, resolved.
   Details: [F-066](ha-arbitration.md#f-066).
 - Prove a shared group durable exists before restoring its membership.
   Status: Closed 2026-08-23, guarantee scoped. Release treatment: Alpha blocker.

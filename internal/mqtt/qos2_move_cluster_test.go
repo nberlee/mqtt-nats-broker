@@ -281,7 +281,7 @@ func TestQoS2MoveReplicatedStream(t *testing.T) {
 	if err != nil || si == nil {
 		t.Fatalf("lookup %s: si=%v err=%v", mqttQoS2IncomingMsgsStreamName, si, err)
 	}
-	if verr := validateQoS2InStream(si, 3); verr != nil {
+	if verr := validateQoS2InStream(si, 3, asm.sessStreamEpoch); verr != nil {
 		t.Fatalf("the R3 stream the broker created does not satisfy its own validator: %v", verr)
 	}
 

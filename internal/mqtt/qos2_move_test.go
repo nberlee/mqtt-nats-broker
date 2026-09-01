@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 )
 
@@ -433,15 +432,16 @@ func TestValidateQoS2InStream(t *testing.T) {
 			Discard:    DiscardOld,
 			MaxMsgsPer: 1,
 			Replicas:   3,
+			Metadata:   map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateQoS2InStream(good(), 3); err != nil {
+	if err := validateQoS2InStream(good(), 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateQoS2InStream(good(), 0); err != nil {
+	if err := validateQoS2InStream(good(), 0, testBundleEpoch); err != nil {
 		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
 	}
-	if err := validateQoS2InStream(nil, 0); err == nil {
+	if err := validateQoS2InStream(nil, 0, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 
@@ -481,7 +481,7 @@ func TestValidateQoS2InStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mutid(&si.Config)
-			if err := validateQoS2InStream(si, 3); err == nil {
+			if err := validateQoS2InStream(si, 3, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})
@@ -501,50 +501,38 @@ func TestValidateQoS2InStream(t *testing.T) {
 // overwrites of held records with nothing revalidating.
 func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 	t.Parallel()
-	_, nc := runNATS(t)
+	s, c, nc := newBringUpServer(t)
 
-	s := &Server{
-		nrc:      nc,
-		opts:     &Options{},
-		quitCh:   make(chan struct{}),
-		nodeName: "node1",
+	// A COMPLETE bundle whose $MQTT_qos2in carries a pre-move development store's
+	// configuration — DiscardNew + DiscardNewPer, which makes the terminal CAS a
+	// rejection rather than a replacement.
+	//
+	// The bundle is the fixture, not this stream alone: the nine broker-owned
+	// streams are one recreation unit and startup refuses a proper subset before
+	// any validator runs, so hand-creating $MQTT_qos2in by itself would exercise
+	// the count rule instead of the validator this test is about (F-066).
+	cfg := (*StreamConfig)(nil)
+	for _, bc := range testBundleConfigs(t, _EMPTY_, 1) {
+		if bc.Name == mqttQoS2IncomingMsgsStreamName {
+			bc.Discard = DiscardNew
+			bc.DiscardNewPer = true
+			cfg = bc
+		}
 	}
-	s.running.Store(true)
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	defer close(s.quitCh)
+	testBundleThenReplace(t, s, c, nc, map[string]*StreamConfig{mqttQoS2IncomingMsgsStreamName: cfg})
 
-	// Pre-create the stream exactly as a pre-move development store has it:
-	// DiscardNew + DiscardNewPer, which makes the terminal CAS a rejection rather
-	// than a replacement.
-	js, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("jetstream context: %v", err)
-	}
-	if _, err := js.AddStream(&nats.StreamConfig{
-		Name:                 mqttQoS2IncomingMsgsStreamName,
-		Subjects:             []string{mqttQoS2IncomingMsgsStreamSubjectPrefix + ">"},
-		Storage:              nats.FileStorage,
-		Retention:            nats.LimitsPolicy,
-		Discard:              nats.DiscardNew,
-		DiscardNewPerSubject: true,
-		MaxMsgsPerSubject:    1,
-		Replicas:             1,
-	}); err != nil {
-		t.Fatalf("pre-create the old-configuration stream: %v", err)
-	}
-
-	c := s.createInternalAccountClient()
-	_, err = s.getOrCreateMQTTAccountSessionManager(c)
+	_, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient())
 	if err == nil {
 		t.Fatal("expected initialization to fail against a pre-move $MQTT_qos2in, but it succeeded")
 	}
 	// The message must name the problem AND tell the operator what to do; a bare
-	// "not usable" would leave a stuck deployment with no next step.
+	// "not usable" would leave a stuck deployment with no next step. What to do is
+	// now the WHOLE BUNDLE, because recreating this stream alone is refused.
 	for _, want := range []string{
 		mqttQoS2IncomingMsgsStreamName,
 		"discard is DiscardNew",
 		"stop ALL brokers",
-		"recreate",
+		"ALL NINE",
 		"not a rolling upgrade",
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -555,29 +543,24 @@ func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 	// It must NOT have mutated the stream in place: a manager already serving
 	// against it would silently overwrite held records once the discard policy
 	// flipped, which is worse than refusing to start.
-	si, ierr := js.StreamInfo(mqttQoS2IncomingMsgsStreamName)
-	if ierr != nil {
-		t.Fatalf("stream info after the refused startup: %v", ierr)
-	}
-	if si.Config.Discard != nats.DiscardNew {
-		t.Fatalf("the refused startup mutated the stream: discard is now %v, want unchanged (new)", si.Config.Discard)
+	after := jsRawStreamConfig(t, nc, mqttQoS2IncomingMsgsStreamName)
+	if after.Discard != DiscardNew {
+		t.Fatalf("the refused startup mutated the stream: discard is now %v, want unchanged (new)", after.Discard)
 	}
 
-	// Recreating it in the required shape clears the failure — the documented
-	// recovery, proven rather than asserted.
-	if derr := js.DeleteStream(mqttQoS2IncomingMsgsStreamName); derr != nil {
-		t.Fatalf("delete the old-configuration stream: %v", derr)
-	}
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	asm, rerr := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient())
+	// The documented recovery, proven rather than asserted, and it is the bundle:
+	// delete all nine and initialization succeeds against a fresh one.
+	testResetBundle(t, nc, s)
+	s2, c2, _ := newBringUpServerOn(t, nc, "node-after-reset")
+	asm, rerr := s2.getOrCreateMQTTAccountSessionManager(c2)
 	if rerr != nil {
-		t.Fatalf("initialization still fails after recreating the stream: %v", rerr)
+		t.Fatalf("initialization still fails after the whole-bundle reset: %v", rerr)
 	}
 	rsi, rierr := asm.jsa.lookupStream(mqttQoS2IncomingMsgsStreamName)
 	if rierr != nil || rsi == nil {
 		t.Fatalf("lookup the recreated stream: si=%v err=%v", rsi, rierr)
 	}
-	if verr := validateQoS2InStream(rsi, 0); verr != nil {
+	if verr := validateQoS2InStream(rsi, 0, asm.sessStreamEpoch); verr != nil {
 		t.Fatalf("the recreated stream does not satisfy the validator: %v", verr)
 	}
 }

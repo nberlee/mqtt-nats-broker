@@ -21,6 +21,13 @@ import (
 // Every field validateSessStream rejects, rejected independently — and positive
 // rows for the exact configuration the create path produces and for the audited
 // non-prerequisites.
+// testBundleEpoch is a fixed, well-formed recovery epoch for validator unit
+// tests. Fixed rather than generated so a failure message is reproducible, and
+// well-formed because validateBundleEpochStamp refuses an unusable wantEpoch
+// outright — a test passing an empty one would be exercising that refusal
+// instead of the check it means to exercise.
+const testBundleEpoch = mqttSessEpochNUIDPrefix + "ABCDEFGHIJKLMNOPQRSTUV"
+
 func TestValidateSessStream(t *testing.T) {
 	t.Parallel()
 	good := func() *StreamInfo {
@@ -157,12 +164,13 @@ func TestValidateWillQStream(t *testing.T) {
 			Discard:    DiscardOld,
 			MaxMsgsPer: 1,
 			Replicas:   3,
+			Metadata:   map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateWillQStream(good(), "", 3); err != nil {
+	if err := validateWillQStream(good(), "", 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateWillQStream(nil, "", 0); err == nil {
+	if err := validateWillQStream(nil, "", 0, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -195,7 +203,7 @@ func TestValidateWillQStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateWillQStream(si, "", 3); err == nil {
+			if err := validateWillQStream(si, "", 3, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})
@@ -210,7 +218,7 @@ func TestValidateWillQStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateWillQStream(si, "", 3); err != nil {
+			if err := validateWillQStream(si, "", 3, testBundleEpoch); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
@@ -234,12 +242,13 @@ func TestValidateMsgsStream(t *testing.T) {
 			Retention:   InterestPolicy,
 			Replicas:    3,
 			AllowMsgTTL: true,
+			Metadata:    map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, true); err != nil {
+	if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, true, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateMsgsStream(nil, 0, mqttDefaultMaxAckPending, true); err == nil {
+	if err := validateMsgsStream(nil, 0, mqttDefaultMaxAckPending, true, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -272,7 +281,7 @@ func TestValidateMsgsStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, true); err == nil {
+			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, true, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})
@@ -300,7 +309,7 @@ func TestValidateMsgsStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, true); err != nil {
+			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, true, testBundleEpoch); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
@@ -313,10 +322,10 @@ func TestValidateMsgsStream(t *testing.T) {
 	t.Run("3.1.1-only broker accepts a TTL-less stream", func(t *testing.T) {
 		si := good()
 		si.Config.AllowMsgTTL = false
-		if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, false); err != nil {
+		if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, false, testBundleEpoch); err != nil {
 			t.Fatalf("requireMsgTTL=false must accept AllowMsgTTL=false: %v", err)
 		}
-		if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, false); err != nil {
+		if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, false, testBundleEpoch); err != nil {
 			t.Fatalf("requireMsgTTL=false must accept an enabled (inert) capability: %v", err)
 		}
 	})
@@ -343,12 +352,13 @@ func TestValidateRetainedStream(t *testing.T) {
 			MaxMsgsPer:  1,
 			Replicas:    3,
 			AllowMsgTTL: true,
+			Metadata:    map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateRetainedStream(good(), 3, true); err != nil {
+	if err := validateRetainedStream(good(), 3, true, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateRetainedStream(nil, 0, true); err == nil {
+	if err := validateRetainedStream(nil, 0, true, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -381,7 +391,7 @@ func TestValidateRetainedStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateRetainedStream(si, 3, true); err == nil {
+			if err := validateRetainedStream(si, 3, true, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})
@@ -399,7 +409,7 @@ func TestValidateRetainedStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateRetainedStream(si, 3, true); err != nil {
+			if err := validateRetainedStream(si, 3, true, testBundleEpoch); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
@@ -411,10 +421,10 @@ func TestValidateRetainedStream(t *testing.T) {
 	t.Run("3.1.1-only broker accepts a TTL-less stream", func(t *testing.T) {
 		si := good()
 		si.Config.AllowMsgTTL = false
-		if err := validateRetainedStream(si, 3, false); err != nil {
+		if err := validateRetainedStream(si, 3, false, testBundleEpoch); err != nil {
 			t.Fatalf("requireMsgTTL=false must accept AllowMsgTTL=false: %v", err)
 		}
-		if err := validateRetainedStream(good(), 3, false); err != nil {
+		if err := validateRetainedStream(good(), 3, false, testBundleEpoch); err != nil {
 			t.Fatalf("requireMsgTTL=false must accept an enabled (inert) capability: %v", err)
 		}
 	})
@@ -578,18 +588,29 @@ var mqttTestBrokerStreamNames = []string{
 	mqttRetainedMsgsStreamName,
 }
 
-// testBrokerStreamSpecs builds the table as provisioning sees it, with every
-// entry's preCreate already applied.
+// testBrokerStreamSpecs builds the table as PROVISIONING sees it, simulating the
+// real order rather than approximating it.
 //
-// Both are needed for the configurations to be the ones the broker actually
-// creates. The manager carries an adopted session-stream epoch because
-// $MQTT_teardown is coupled to it, and $MQTT_teardown's own preCreate is where
-// that epoch is stamped into its config — it cannot be a literal, since the real
-// table is built before the loop that adopts the epoch.
+// The order is the whole point, and getting it wrong is a live trap: the table
+// is built before any epoch exists, $MQTT_sess MINTS one into its own create
+// config, the loop adopts THAT value in $MQTT_sess's post step, and only then do
+// the other eight entries' preCreate hooks stamp it. Presetting an unrelated
+// epoch on the manager and then running every preCreate — which an earlier
+// version of this helper did — leaves $MQTT_sess carrying one value and the
+// other eight carrying another, so every caller sees a bundle that disagrees
+// with itself even against correct code.
+//
+// So: build, run entry 0's post over its own config to adopt, then run the
+// remaining preCreate hooks. The returned table is what the broker would create.
 func testBrokerStreamSpecs() []brokerStreamSpec {
 	as := &mqttAccountSessionManager{}
-	as.sessStreamEpoch = mqttGenSessEpoch()
-	specs := as.brokerStreamSpecs(&Server{}, "T", 3, 3, mqttDefaultMaxAckPending, true, "rmsub", "IDTOK", "OWNTOK", mqttEphemeralCreated{})
+	specs := as.brokerStreamSpecs(&Server{}, 3, 3, mqttDefaultMaxAckPending, true)
+	if len(specs) == 0 || specs[0].name != mqttSessStreamName {
+		panic("the provisioning table must start with " + mqttSessStreamName + ": it mints the recovery epoch")
+	}
+	if specs[0].post != nil {
+		_ = specs[0].post(&StreamInfo{Config: *specs[0].cfg})
+	}
 	for _, spec := range specs {
 		if spec.preCreate != nil {
 			spec.preCreate()
@@ -620,6 +641,31 @@ func TestBrokerStreamSpecTable(t *testing.T) {
 		}
 		if err := spec.validate(&StreamInfo{Config: *spec.cfg}); err != nil {
 			t.Fatalf("entry %q rejects its own create configuration: %v", spec.name, err)
+		}
+		// PLACEMENT, and nothing more. `post` runs between one entry's validator and
+		// the next entry's, so a durable step there would mutate state before later
+		// streams had been validated at all. Only $MQTT_sess has one, and it assigns
+		// an in-memory field; the retained observer that used to live in this table
+		// is created by mqttProvisionEphemeralConsumers AFTER the whole loop.
+		//
+		// This asserts where the callback IS, not what it may do: callback purity is
+		// a fact of the current code, read and not guarded, and no safety claim in
+		// docs/ARCHITECTURE.md rests on it (F-066).
+		if spec.post != nil && spec.name != mqttSessStreamName {
+			t.Fatalf("entry %q carries a post step; only %s may, and only to adopt the "+
+				"recovery epoch in memory — a durable step here would run before the "+
+				"remaining entries are validated", spec.name, mqttSessStreamName)
+		}
+	}
+	// And the bundle agrees on ONE epoch once the production order has run.
+	epoch := specs[0].cfg.Metadata[mqttSessEpochMetaKey]
+	if !mqttValidSessEpoch(epoch) {
+		t.Fatalf("%s must mint a well-formed recovery epoch, got %q", mqttSessStreamName, epoch)
+	}
+	for _, spec := range specs {
+		if got := spec.cfg.Metadata[mqttSessEpochMetaKey]; got != epoch {
+			t.Fatalf("entry %q would be created carrying %q, want the minted %q: the nine "+
+				"streams are one recreation unit and every one of them is stamped", spec.name, got, epoch)
 		}
 	}
 }
@@ -755,8 +801,15 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		"AllowBatchPublish":  {kind: dispWaived, reason: "the owner never emits batch headers, and client-controlled direct writes are excluded by the reserved-namespace deny plus the required ACL"},
 		"AllowMsgSchedules":  {kind: dispWaived, reason: "the owner never emits schedule headers; independently enableable under DiscardOld, so this is a waiver, not domination — note a DEPLOYED schedules-enabled stream necessarily carries AllowRollup (forced at creation, server/stream.go:1819-1822), which the shared shape rejects on readback"},
 		"Duplicates":         {kind: dispWaived, reason: "this owner sets no Nats-Msg-Id, so a deduplication window is inert"},
-		"Metadata":           {kind: dispWaived, reason: "owner-inert: server-owned compatibility metadata (required API levels) is enforced by the server itself, and arbitrary keys change nothing the owner does"},
-		"DiscardNewPer":      {kind: dispDominated, reason: "requires Discard=DiscardNew (rejected here: this owner requires DiscardOld), and has no owner-relevant effect apart from that prerequisite (server/stream.go:1784)"},
+		// REJECTED for every validator, not waived: the account's recovery epoch
+		// lives in this map, and it is what makes the nine broker-owned streams one
+		// recreation unit (F-066). This row is also the mechanical guard that no
+		// validator FORGOT the stamp check — the mutator writes a malformed epoch, so
+		// a validator missing validateBundleEpochStamp fails the bijection here rather
+		// than silently admitting a stream from another incarnation. Unrelated keys
+		// are still accepted; the audit is over this one key, not the whole map.
+		"Metadata":      {kind: dispRejected, errWant: mqttSessEpochMetaKey},
+		"DiscardNewPer": {kind: dispDominated, reason: "requires Discard=DiscardNew (rejected here: this owner requires DiscardOld), and has no owner-relevant effect apart from that prerequisite (server/stream.go:1784)"},
 	}
 
 	// The CAS-register commons (sess, willq, willcancel, qos2in, qos2assign,
@@ -807,7 +860,6 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		d["ConsumerLimits.MaxAckPending"] = fieldDisposition{kind: dispWaived, reason: "a positive stream limit is copied into the zero-request watch consumer and then rejected against AckNone at the same create, which already fails initialization"}
 		// Round-3 Q2.1: the incarnation epoch is a REAL prerequisite carried in
 		// Metadata, validated by the composed callback on the same snapshot.
-		d["Metadata"] = fieldDisposition{kind: dispRejected, errWant: mqttSessEpochMetaKey}
 		// The commons waiver said "the owner never emits batch headers". This owner
 		// now does: an accepted CONNECT commits its record and its permanent
 		// acceptance fact in ONE atomic batch, so the capability is a prerequisite of
@@ -826,7 +878,6 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		// metadata: a watermark orders itself by a $MQTT_sess sequence, so this
 		// stream is only interpretable within the session-stream incarnation it was
 		// created against. See validateTeardownStream.
-		d["Metadata"] = fieldDisposition{kind: dispRejected, errWant: mqttSessEpochMetaKey}
 	case mqttQoS2IncomingMsgsStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}

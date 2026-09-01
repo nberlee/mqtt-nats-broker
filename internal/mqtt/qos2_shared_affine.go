@@ -232,9 +232,14 @@ func (p mqttQ2AffPhase) rank() int {
 // and on the copy subject the delivery carried. Owner-independent is not the same as
 // unfenced, and the two questions are answered by different fields.
 //
-// The subject identifies one source message only within one incarnation of $MQTT_msgs:
-// recreating that stream restarts its sequences while these claims survive. That is
-// F-066, and no per-subject CAS speaks to it.
+// The subject identifies one source message only within one incarnation of $MQTT_msgs,
+// and a $MQTT_msgs whose sequences restart while these claims survive is exactly the
+// state no per-subject CAS speaks to. That WAS reachable through a supported
+// single-stream recreation, which is what made it F-066; the enforcement landed
+// 2026-09-01 and the supported reset now takes all nine streams, so it clears these
+// claims along with the source. What still produces the state is administrative
+// deletion or a partial restore — unsupported rather than impossible, which is why the
+// scoping below stays.
 type mqttQ2AffClaim struct {
 	Winner       string `json:"winner"` // winning session's client-ID hash
 	Gen          string `json:"gen"`    // winning session's durable generation
@@ -1582,7 +1587,7 @@ func (as *mqttAccountSessionManager) loadQ2AffCopy(subject string) (mqttQ2AffCop
 // sequence, delete of an exact sequence, per-subject singleton, permanent
 // retention). DenyDelete is fatal because the reap deletes; DenyPurge is not
 // listed because nothing here purges by subject.
-func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
+func validateQoS2AssignStream(si *StreamInfo, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -1624,6 +1629,12 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on claim subjects would be parsed as records", cfg.SubjectDeleteMarkerTTL)
 	}
+	// The bundle stamp: this stream carries the account's recovery epoch, which is
+	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// independently recoverable stores (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1649,7 +1660,7 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int) error {
 // raises the broker cap past the stream limit is not covered by this startup
 // check; the consumer-create rejection remains the backstop (stated residual
 // in docs/CONFORMANCE.md).
-func validateOutStream(si *StreamInfo, wantReplicas, maxAckPending int) error {
+func validateOutStream(si *StreamInfo, wantReplicas, maxAckPending int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -1700,6 +1711,12 @@ func validateOutStream(si *StreamInfo, wantReplicas, maxAckPending int) error {
 	}
 	if l := cfg.ConsumerLimits.MaxAckPending; l != 0 && l < maxAckPending {
 		return fmt.Errorf("stream consumer max_ack_pending limit is %d, below the broker's effective cap %d: JetStream would reject the PUBREL and affine durable creates, failing every QoS 2 resume", l, maxAckPending)
+	}
+	// The bundle stamp: this stream carries the account's recovery epoch, which is
+	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// independently recoverable stores (F-066).
+	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
+		return err
 	}
 	return nil
 }

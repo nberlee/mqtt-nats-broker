@@ -916,87 +916,114 @@ func TestValidateTeardownStream(t *testing.T) {
 	}
 }
 
-// TestTeardownStreamIsEpochCoupledToTheSessionStream is test 13. A retirement
-// watermark orders itself by a $MQTT_sess sequence, so the two streams are ONE
-// logical unit, and the two partial-recreation directions are deliberately different:
+// The nine broker-owned streams are ONE recreation unit, asserted from both
+// directions: a bundle missing ANY single member is refused, and a complete
+// bundle whose members disagree on the recovery epoch is refused too.
 //
-//   - $MQTT_sess recreated alone mints a fresh incarnation epoch while the permanent
-//     watermarks keep the old one, so their sequences are no longer comparable to
-//     anything. That is REFUSED at startup with the coupled guidance, not classified
-//     per read and not migrated.
-//   - $MQTT_teardown recreated alone stamps the current epoch, validates clean, and
-//     admits with NO historical fences. The lost fences are the stated residual
-//     (docs/CONFORMANCE.md), exactly as for the will-cancel watermarks.
-func TestTeardownStreamIsEpochCoupledToTheSessionStream(t *testing.T) {
-	t.Run("the session stream recreated alone is refused", func(t *testing.T) {
-		s1, c1, nc := testRetirementBringUp(t)
-		asm1, err := s1.getOrCreateMQTTAccountSessionManager(c1)
-		if err != nil {
-			t.Fatalf("first bring-up: %v", err)
-		}
-		si, err := asm1.jsa.lookupStream(mqttTeardownStreamName)
-		if err != nil || si == nil {
-			t.Fatalf("the teardown stream must be provisioned: %+v %v", si, err)
-		}
-		if got := si.Config.Metadata[mqttSessEpochMetaKey]; got != asm1.sessStreamEpoch {
-			t.Fatalf("the teardown stream must be stamped with the adopted session epoch: %q vs %q",
-				got, asm1.sessStreamEpoch)
-		}
-
-		js, ctx := testRetirementJS(t, nc)
-		if derr := js.DeleteStream(ctx, mqttSessStreamName); derr != nil {
-			t.Fatalf("delete session stream: %v", derr)
-		}
-
-		s2, c2, _ := testRetirementBringUpOn(t, nc, "node2")
-
-		_, err = s2.getOrCreateMQTTAccountSessionManager(c2)
-		if err == nil {
-			t.Fatal("a $MQTT_teardown stream from another session-stream incarnation must fail " +
-				"initialization: its watermarks order themselves by sequences of a stream that no longer exists")
-		}
-		for _, want := range []string{mqttTeardownStreamName, mqttSessStreamName, "one logical unit", mqttSessEpochMetaKey} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal must name %q, got: %v", want, err)
+// This replaces the two-subtest $MQTT_sess/$MQTT_teardown coupling fixture. The
+// pair was only ever one instance of the hazard, and its second subtest asserted
+// the OPPOSITE of what the contract now says: recreating $MQTT_teardown alone
+// used to be ADMITTED, silently losing every open fence. That admission is the
+// residual F-066 withdraws, so the assertion is inverted rather than deleted —
+// and it is inverted for all nine positions, not just that one.
+func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
+	for _, missing := range mqttTestBrokerStreamNames {
+		t.Run("without "+missing, func(t *testing.T) {
+			s1, c1, nc := testRetirementBringUp(t)
+			asm1, err := s1.getOrCreateMQTTAccountSessionManager(c1)
+			if err != nil {
+				t.Fatalf("first bring-up: %v", err)
 			}
-		}
-	})
+			// Every member carries the adopted epoch: that stamp is what makes the
+			// nine one unit, and a fixture whose premise is unchecked proves nothing.
+			for _, name := range mqttTestBrokerStreamNames {
+				si, lerr := asm1.jsa.lookupStream(name)
+				if lerr != nil || si == nil {
+					t.Fatalf("%s must be provisioned: %+v %v", name, si, lerr)
+				}
+				if got := si.Config.Metadata[mqttSessEpochMetaKey]; got != asm1.sessStreamEpoch {
+					t.Fatalf("%s carries %q, want the adopted %q", name, got, asm1.sessStreamEpoch)
+				}
+			}
 
-	t.Run("the teardown stream recreated alone admits with no fences", func(t *testing.T) {
-		s1, c1, nc := testRetirementBringUp(t)
-		asm1, err := s1.getOrCreateMQTTAccountSessionManager(c1)
-		if err != nil {
-			t.Fatalf("first bring-up: %v", err)
-		}
-		idHash := getHash("recreated-unit")
-		// A fence VALID in every field: a watermark the readers would refuse anyway is no
-		// fence, so its disappearance would demonstrate nothing.
-		if _, serr := asm1.jsa.storeGenRetirementCAS(mqttTeardownSubject(asm1.domainTk, idHash), 0,
-			&mqttGenRetirement{ID: "recreated-unit", Gen: mqttNewSessGen(),
-				MarkerSeq: 9}); serr != nil {
-			t.Fatalf("planting a fence: %v", serr)
-		}
+			js, ctx := testRetirementJS(t, nc)
+			if derr := js.DeleteStream(ctx, missing); derr != nil {
+				t.Fatalf("delete %s: %v", missing, derr)
+			}
 
-		js, ctx := testRetirementJS(t, nc)
-		if derr := js.DeleteStream(ctx, mqttTeardownStreamName); derr != nil {
-			t.Fatalf("delete teardown stream: %v", derr)
-		}
+			s2, c2, _ := testRetirementBringUpOn(t, nc, "node2")
+			_, err = s2.getOrCreateMQTTAccountSessionManager(c2)
+			if err == nil {
+				t.Fatalf("an account holding eight of the nine broker-owned streams must fail "+
+					"initialization; %s was deleted and the rest were silently reprovisioned", missing)
+			}
+			// The PREFLIGHT's reason specifically. Without this the test passes on any
+			// refusal at all — including a later epoch mismatch — which would make it
+			// blind to the preflight being removed entirely.
+			for _, want := range []string{"of the 9 broker-owned streams", "ONE recreation unit"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal must name %q, got: %v", want, err)
+				}
+			}
+			// The two LISTS, not just the name somewhere in the message: the
+			// refusal also enumerates all nine as the streams to delete, so a
+			// bare Contains passes even when both vectors are empty.
+			gotPresent, gotAbsent := testBundleRefusalLists(t, err)
+			if len(gotAbsent) != 1 || gotAbsent[0] != missing {
+				t.Errorf("the refusal's absent list is %v, want exactly [%s]", gotAbsent, missing)
+			}
+			if len(gotPresent) != len(mqttTestBrokerStreamNames)-1 {
+				t.Errorf("the refusal's present list is %v, want the other eight streams", gotPresent)
+			}
+			// And it must not have recreated what it refused: a preflight that creates
+			// is the defect this whole mechanism exists to prevent. Checked through
+			// the FIRST manager's connection, because the refused one published no
+			// manager to look through — which is itself asserted here.
+			if len(s2.mqtt.sessmgr.sessions) != 0 {
+				t.Fatalf("a refused initialization must publish no manager, found %d", len(s2.mqtt.sessmgr.sessions))
+			}
+			if si, lerr := asm1.jsa.lookupStream(missing); si != nil {
+				t.Fatalf("the refused startup recreated %s (err=%v)", missing, lerr)
+			}
+		})
+	}
+}
 
-		s2, c2, _ := testRetirementBringUpOn(t, nc, "node2")
+// A COMPLETE bundle in which one member carries a valid but FOREIGN epoch is
+// refused by that stream's validator.
+//
+// This is the coverage a partial-set test cannot give: the preflight refuses a
+// proper subset before any validator runs, so without this fixture the epoch
+// comparison would never be exercised end to end at all.
+func TestBrokerStreamBundleRefusesAForeignEpochMember(t *testing.T) {
+	for _, foreign := range mqttTestBrokerStreamNames {
+		if foreign == mqttSessStreamName {
+			// $MQTT_sess MINTS the epoch, so "foreign" is not a state it can be in:
+			// whatever well-formed value it carries becomes the account's. Its own
+			// malformed-stamp arm is TestSessionManagerEpochMissingFailsInit.
+			continue
+		}
+		t.Run(foreign+" from another incarnation", func(t *testing.T) {
+			s, c, nc := testRetirementBringUp(t)
+			testBundleThenPoisonEpoch(t, s, c, nc, foreign,
+				map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()})
 
-		asm2, err := s2.getOrCreateMQTTAccountSessionManager(c2)
-		if err != nil {
-			t.Fatalf("recreating the watermark stream alone must ADMIT: %v", err)
-		}
-		if asm2.sessStreamEpoch != asm1.sessStreamEpoch {
-			t.Fatalf("the surviving session stream keeps its incarnation: %q vs %q",
-				asm2.sessStreamEpoch, asm1.sessStreamEpoch)
-		}
-		// The residual, asserted rather than assumed: every open fence is gone.
-		if _, _, status := asm2.jsa.loadGenRetirementRecord(asm2.domainTk, idHash); status != mqttRetirementAbsent {
-			t.Fatalf("the recreated stream must be empty, got status %v", status)
-		}
-	})
+			s2, c2, _ := testRetirementBringUpOn(t, nc, "node2")
+			_, err := s2.getOrCreateMQTTAccountSessionManager(c2)
+			if err == nil {
+				t.Fatalf("%s carrying another incarnation's recovery epoch must fail initialization: "+
+					"its records reference identities the rest of the bundle no longer issues", foreign)
+			}
+			for _, want := range []string{foreign, mqttSessEpochMetaKey, "different incarnation"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal must name %q, got: %v", want, err)
+				}
+			}
+			if strings.Contains(err.Error(), "of the 9 broker-owned streams") {
+				t.Fatalf("the refusal came from the count rule, so the epoch comparison was never reached: %v", err)
+			}
+		})
+	}
 }
 
 // TestRetirementBodyUsesTheLowercaseKey is T12's raw-body half (M18).

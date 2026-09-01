@@ -65,8 +65,11 @@ formats that no user release depends on. Each checkbox is one commit.
   existing immediate-publish fail-safe, and the takeover fence's now-duplicate
   inline origin check is deleted rather than kept beside the validator. Residual,
   stated: a refused record is reclaimed by NOTHING — no sweep, fence or reaper
-  touches it — so it persists until an operator deletes the message or recreates the
-  stream, which is what the diagnostic prescribes. Permanence has a running cost, and
+  touches it — so it persists until an operator deletes the message, which is what the
+  diagnostic prescribes. It used to offer recreating the stream as an alternative; F-066
+  withdrew that, since the nine broker-owned streams are one recreation unit and
+  recreating `$MQTT_willq` alone is refused at the next startup — the only other route
+  is a whole-bundle reset. Permanence has a running cost, and
   the diagnostic says so, on two paths. The claim scan re-reads every extant record
   each interval, so a refused backlog adds `O(N)` JetStream gets per scan per broker
   and a large enough one can push a scan past its interval and delay valid due Wills.
@@ -191,8 +194,10 @@ further findings it surfaced are filed separately, for the reason its own bullet
   **Residuals** (`docs/CONFORMANCE.md`): the fence names only the LATEST retirement and
   the single slot can itself be regressed by a cross-term apply on `$MQTT_teardown`, both
   stacked instances of the documented apply-time CAS hole; the PUBREL reaper's two
-  post-check windows, the same bound the affine reaper has; `$MQTT_teardown` recreated
-  alone loses every open fence. A finish that outruns the survivor broker's own
+  post-check windows, the same bound the affine reaper has; a bundle reset loses every
+  open fence (`$MQTT_teardown` recreated ALONE used to do the same and was the sharper
+  case — F-066's enforcement refuses it as of 2026-09-01). A finish that outruns
+  the survivor broker's own
   observation is a new route into F-036 and is listed under that blocker, not here.
 
 - [x] **Sweep the rollout-qualified residuals out of the docs.** DONE. Every residual
@@ -210,9 +215,10 @@ further findings it surfaced are filed separately, for the reason its own bullet
   template — the limit is real, but it is the reach of the brokers that read a stream or
   record field, with no runtime capability gate — and one became a restart /
   post-initialization-mutation split, whose recovery was also corrected to stop-all-and-
-  recreate (the errors offer no in-place fix, and `$MQTT_sess` is coupled to
-  `$MQTT_teardown` — and, at the time, to `$MQTT_origin`, which the write-lineage audit
-  has since deleted).
+  recreate (the errors offer no in-place fix, and every broker-owned stream is coupled to
+  every other — at the time this said `$MQTT_sess` and `$MQTT_teardown` plus
+  `$MQTT_origin`, which the write-lineage audit deleted; F-066 has since made all nine
+  one recreation unit).
 
   Three sites were not merely stale. Two had framing that **hid a live producer**, so the
   rewrites gain accuracy: the affine oversize backstop is reached because a QoS 1/2
@@ -639,7 +645,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   now state the answer, and three further sites that asserted something the audit
   falsified are corrected too. Holistic review then found one more, filed as **F-066**:
   the claim key identifies one source message only within one incarnation of
-  `$MQTT_msgs`, and recreating that stream is a procedure a startup refusal instructs.
+  `$MQTT_msgs`, and recreating that stream WAS a procedure a startup refusal instructed.
+  F-066 closed that: no startup refusal names a single stream any more, and recreating
+  one is refused.
 
   - [x] [F-063: Prove a copy was retained before acknowledging its
   source](findings/ha-arbitration.md#f-063). **Alpha blocker — done.** `$MQTT_out` is
@@ -786,11 +794,12 @@ further findings it surfaced are filed separately, for the reason its own bullet
   **This box is NOT the next executable §0.2 item, and that is why lanes keep being
   redirected off it.** Both remainders are argued: W-c's remedy is refuted with a worked
   counterexample, and residual 8's reverse lookup is derivable for a matching winner
-  record but not for an absent or mismatched one, as corrected above. The next executable
-  §0.2 item is **F-066**, whose contract ruling landed 2026-08-31. The smallest useful
-  work HERE is establishing which record states residual 8's population actually occupies,
-  since the matching state needs nothing new and only the others could need a persisted
-  reference. That is research, not a plan.
+  record but not for an absent or mismatched one, as corrected above. F-066, which this
+  bullet used to name as the next executable item, **landed 2026-09-01**; the next
+  candidate is therefore F-036 below, whose OPEN 1 F-066's ruling dissolves. The
+  smallest useful work HERE is establishing which record states residual 8's population
+  actually occupies, since the matching state needs nothing new and only the others
+  could need a persisted reference. That is research, not a plan.
 
   - [x] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
   Split out of F-064; not a conformance defect, so never an alpha blocker. **Done
@@ -835,8 +844,10 @@ further findings it surfaced are filed separately, for the reason its own bullet
   per-pair suppression set (it cannot arbitrate a cross-broker race, and once dominance
   is durable it restates what the record already says), and withholding the PUBCOMP ack
   after untracking the entry.
-  **Residuals, in `docs/CONFORMANCE.md`:** recreating `$MQTT_out` alone destroys the
-  proof with the copy identity it names (F-066's accepted-data loss); a teardown carrying
+  **Residuals, in `docs/CONFORMANCE.md`:** a bundle reset destroys the proof with the
+  copy identity it names, both living on `$MQTT_out` (F-066's accepted-data loss, which
+  its enforcement never claimed to fix — recreating that stream alone is now
+  refused); a teardown carrying
   a MALFORMED carrier still loses it, because such a reference identifies no assignment and
   failing closed there would wedge the teardown forever — the ordinary late-proof case is
   CLOSED, since teardown now reconciles every stored PUBREL's proof into its assignment
@@ -1498,143 +1509,69 @@ further findings it surfaced are filed separately, for the reason its own bullet
   `storing` phase marker, an owner-independent disposal on claim absence, a reaper-side
   cleanup, and two compensation designs keyed on which CAS failed.
 
-  - [ ] [F-066: Make the nine broker-owned streams one recreation
-  unit](findings/ha-arbitration.md#f-066). **Alpha
-  blocker. The task is ENFORCING that unit and withdrawing independent single-stream
-  recreation — NOT generalising the coupling, which was the intended remedy and is
-  abandoned; see the 2026-08-31 ruling below.** Falsified premise: *recreating one stream
-  is a self-contained recovery procedure*. Durable records persist identities other
-  streams issue — sequences,
-  consumer durables, subjects — and `stopAll` names one stream at a time. The dossier
-  carries a **verified sample of cross-stream identities — explicitly NOT a census.**
-  Four attempts to enumerate the population were each falsified by review, every one a
-  filter masquerading as a sweep, so the completeness claim is dropped and the
-  enumeration was deferred to F-034, which owns `$MQTT_inflight`. **F-034 landed it on
-  2026-08-22** — see [the persisted-identity
-  census](findings/persisted-identity-census.md) — so the population is now enumerated
-  rather than sampled. That does **not** discharge this finding's completeness deferral:
-  the census's field-level span is mechanically enforced, but its interpretation-surface
-  half is a drift GUARD over a hand-maintained root set, keyed by unqualified function
-  name, so it catches real drift without proving closure. What the sample establishes:
-  **three** epoch couplings exist (`$MQTT_teardown` via stamped stream metadata,
-  `$MQTT_willq` twice via `OriginSessEpoch` and `ScanEpoch`), all against `$MQTT_sess`,
-  and the pattern was never generalised — not even across `$MQTT_sess` itself, since
-  `$MQTT_inflight`'s `ClaimSeq` references it and is uncoupled. Every confirmed
-  reference to `$MQTT_msgs`, `$MQTT_out`, `$MQTT_qos2assign` and `$MQTT_inflight` is
-  uncoupled. A generalisation was the intended remedy and **is no longer the remedy**;
-  see the ruling below.
-  **ATTEMPTED BY CONSTRUCTION AND STOPPED UNRESOLVED, 2026-08-26**, after five
-  non-converging plan-review rounds and no implementation. **That route is ABANDONED
-  rather than paused** — the ruling below replaces it, and this box is EXECUTABLE work
-  again, so a lane takes it rather than reading the stop as a block. The four structural
-  failures are recorded because they are why the route was abandoned, not as an
-  inheritance for a sixth revision of it. The dossier records them so the next attempt
-  inherits them rather than re-deriving them: issuer provenance needs a hand-authored
-  relation — the very seed the bar forbids, and `mqttSharedNames` derives a durable
-  with no sequence source at all, so the wrong stream's epoch would compile; a route
-  classifier over raw egress was neither uniquely rooted nor disjoint nor syntactically
-  decidable; final-sink discovery is circular, since naming the publish method is a seed
-  rather than discovery by kind; and verbatim token preservation — REQUIRED, because a
-  record holding a foreign reference must stay writable or rebuilding it drops the
-  reference as migration by omission — is ITSELF the encoding escape that defeats the
-  access boundary it exists to protect. A pre-registered stop rule fired on its own
-  predicate — round 5 was still non-converging and its structural findings sat inside
-  machinery the previous revision had introduced, so the fixes were generating the
-  findings — rather than on a trend: total findings fell steadily while the structural
-  count fell once and then rose in every round after, ending where it began.
-  **The decision that was owed is TAKEN, 2026-08-31: change the supported recovery
-  contract, at ALL-NINE granularity. Ruled by the repository owner**, on the four
-  options and their costs, informed by Codex consult `task-mthbq7cn-xtxpjw` and an
-  advisor read that both chose this option — recorded that way because this decision was
-  reserved to the owner and no consult may take it on their behalf. The four options
-  were: accept hand-maintained
-  seeds with drift guards plus a residual; redefine what closing F-066 permits including
-  an explicit serialization exception; leave it blocked pending a genuinely different
-  construction; or change the contract so the hazard is eliminated rather than
-  generalised. Splitting the finding or shipping a partial mechanism was excluded and
-  stays excluded. **Why the fourth, and why ALL NINE rather than the affine four**:
-  options 1 and 2 each require overruling the standing definition of done — option 1's
-  residual is verbatim the sentence that blocks discharge — and option 3 ships nothing;
-  the four-stream variant inherits the undischarged census, because the "all four
-  together" row above is qualified by exactly the census this finding does not claim.
-  The all-nine variant needs no census: four enumeration attempts over IDENTITIES were
-  each falsified, but the STREAM SET is one production provisioning table with one loop
-  over it, so the enumerable thing is the streams. **That completeness is demonstrable
-  at this HEAD and GUARDED rather than impossible** — the test's nine-name set is itself
-  hand-maintained — which is stated rather than glossed, since overclaiming closure is
-  the mistake this finding has made four times. `$MQTT_origin` is not a tenth member; it
-  is retired state that stays separately refused. This is the `$MQTT_teardown`
-  stamp-and-refuse mechanism applied at the granularity that is actually enumerable,
-  not an abandonment of it.
-  **What the box now owns, and it is executable.** (1) An account-wide PREFLIGHT ahead
-  of the per-stream provisioning loop, because `ensureBrokerStream` sees one stream and
-  creates on an absent lookup, so a proper subset is silently reprovisioned before any
-  bundle comparison could exist: look up all nine creating nothing; admit ZERO present
-  (initial creation or a full reset); admit NINE present only when their bundle epochs
-  agree; REFUSE one through eight present; only then enter creation and validation.
-  (2) One recovery epoch stamped into every broker-owned stream's metadata, generalising
-  `mqtt_sess_epoch` — minted by `$MQTT_sess`, copied to `$MQTT_teardown`, compared by
-  its validator — with a mismatch refused. (3) The operator contract in
-  `docs/ARCHITECTURE.md`: enforcement PLUS documentation, because the docs are what
-  define the supported operation. The teardown-only-recreation fixture becomes a
-  startup-refusal fixture rather than disappearing.
-  **Four obligations the contract drags in, none optional.** A first-time provisioning
-  that failed after creating some streams leaves a mixed set the rule then refuses, so
-  that recovery path needs its own stated contract and a test. Concurrent zero-to-nine
-  creation must adopt ONE authoritative epoch before any later stream is created, or two
-  brokers create different subsets under different epochs. `$MQTT_rmsgs` permits
-  `Sources` as supported configuration and default auto-recreation does not reconstruct
-  that topology. And a common epoch detects an incarnation mismatch but does NOT prove
-  nine independently restored snapshots came from one coherent point in time, so the
-  contract covers backup, restore and deletion rather than recreation alone.
-  **Retiring the single-stream recovery guidance is an OBLIGATION OF THIS WORK, and it
-  is stated as a decision procedure rather than a site list**, because a list of named
-  sites is a sample and this finding has already been burned four times by one. The rule:
-  **every surface that tells an operator, a reader or a test what to recreate must name
-  the nine-stream unit**, and a surface prescribing any proper subset is retired in the
-  same change that lands the enforcement — never after it, because between the two the
-  broker refuses the very procedure its own error text prescribes, which turns one bad
-  stream into an unrecoverable account. That span covers executable diagnostics as well
-  as prose: the generic startup refusal and both coupled-unit variants in
-  `stream_prereqs.go`, the session-stream metadata error in `sess_recordtx.go`, the
-  delayed-Will outbox refusal in `will_outbox.go`, the operational notes and the stop-all
-  recovery paragraph in `docs/CONFORMANCE.md`, the recovery guidance in
-  `docs/ARCHITECTURE.md`, and every test asserting the retired wording — the
-  session-manager prerequisite tests affirm it today. Those are INSTANCES, not the set.
-  **Doc changes this also lands with**: retire the `$MQTT_out`-alone residual and the
-  teardown-only admitted recovery from `docs/CONFORMANCE.md`, revisit the
-  cross-incarnation acceptance-fact reasoning (an old-epoch Will can no longer survive
-  beside fresh acceptance facts once `$MQTT_sess` and `$MQTT_willq` always reset
-  together). **Already corrected, and deliberately NOT deferred to the enforcement**:
-  `docs/CONFORMANCE.md` claimed the startup-refusal surface covers "all eleven" streams
-  when the provisioning table's closed set is nine and `$MQTT_origin` is a lookup-only
-  refusal rather than a tenth member. That was false at the time of the ruling and
-  independent of it, so it was fixed with the ruling rather than parked behind work that
-  has not started — a current-state error is never a future change's to carry.
-  **What the ruling does NOT buy, so no plan claims it.** Once the enforcement lands the
-  hazard becomes unreachable through a SUPPORTED operation, not eliminated — and the
-  ruling ALONE changes no contract, so until then it is reachable exactly as this bullet
-  describes: the stale-identity paths remain, and startup validation is a snapshot, so a
-  live operator deleting a stream behind initialized managers still reaches them and the
-  all-brokers-stopped precondition stays load-bearing. Accepted-data loss is unchanged and
-  was never what coupling fixed. Recovery will become a complete account-level state reset
-  with no partial recovery. F-062,
-  F-063 and F-065 are unaffected: their runtime arbitration guarantees stay necessary,
-  and the bundle rule removes only the partial-recreation manifestations. The existing
-  per-pair couplings will state a fact the global epoch also states, which makes them
-  redundancy-deletion candidates rather than part of this work. The
-  attempt also corrected the dossier table: the drain `RegSeq` destruction is historical
-  (F-034), the "wrong payload" row is closed by F-065's nonce leaving only the claim
-  subject, `$MQTT_origin` is gone, and **three rows were never cross-stream at all** —
-  `mqttQoS2RelClaim.Fence`, `mqttQoS2RelClaim.Gen` and `mqttAcceptFact.SessEpoch`, each
-  wrong in the census manifest too and corrected there. On the
-  affine path the VERIFIED AFFECTED SUBSET — not a proven closed unit, and F-034's
-  census does not settle that either, for the reason above — is **four** streams —
-  `$MQTT_msgs`, `$MQTT_qos2assign`, `$MQTT_out`, `$MQTT_inflight` — and recreating a
-  proper subset loses accepted messages, delivers an **OLD payload** for a new message,
-  or NAK-loops orphaned copies forever. Per-subject CAS cannot help; the semantic
-  identity is what fails (`feedback_cas_generation_identity`). Rows outside the affine
-  path are named, not audited here: `$MQTT_inflight`'s own coupling is F-034's.
+  - [x] [F-066: Make the nine broker-owned streams one recreation
+  unit](findings/ha-arbitration.md#f-066). **DONE 2026-09-01**, after six plan-review
+  rounds, one decision consult on a fired stop rule, and the 2026-08-31 owner ruling
+  that set the contract. The by-construction generalisation stays ABANDONED; what
+  landed is the ruling's enforcement.
+  *The finding:* deleting ONE broker-owned stream and restarting produced a SUCCESSFUL
+  start — `ensureBrokerStream` sees one stream, creates it when absent, and validates
+  the fresh stream against its own owner's list, with nothing comparing it to the other
+  eight. The cost is not an empty stream but stale cross-stream references matching new
+  unrelated state: an assignment claim naming a `$MQTT_msgs` sequence a recreated
+  `$MQTT_msgs` reissued to a different message, a persisted drain naming a durable on a
+  stream that no longer holds it.
+  **What landed, in two mechanisms that catch different things and neither of which
+  subsumes the other.** (1) A COUNT rule in `mqttPreflightBrokerStreamBundle`, an
+  account-wide preflight over the SAME spec table the provisioning loop iterates, taking
+  a new lookup-only interface so it cannot create what it is deciding about: zero present
+  admits, nine admits, one through eight REFUSES naming present and absent. Each lookup's
+  `(info, error)` PAIR is dispositioned together and UNDECIDED fails startup rather than
+  reading as absence — the fail-open that would otherwise turn a transient outage into
+  "the account is empty" and silently reprovision. (2) A per-stream EPOCH stamp:
+  `mqtt_sess_epoch`, minted by `$MQTT_sess` and adopted from the authoritative re-read,
+  is now stamped into all nine and compared by every validator through
+  `validateBundleEpochStamp`, whose refusal of a malformed or empty EXPECTED epoch is
+  itself load-bearing. `validateTeardownStream`'s private check was DELETED into that
+  helper rather than left beside it. The count rule catches a member ABSENT when a broker
+  starts, and its value is that the broker no longer silently recreates it; the epoch
+  catches a member PRESENT but from another incarnation, which the count cannot see.
+  Neither catches an operator who recreates a member by hand and copies the surviving
+  stamp onto it — that is forgery, and outside what this claims.
+  **Two structural changes came with it.** The retained-observer provisioning moved OUT
+  of the spec table into `mqttProvisionEphemeralConsumers` beside the session-record
+  watch — `$MQTT_rmsgs` was already the last entry so no ordering changed, and what it
+  buys is that "no consumer is created until every stream validated" is checkable at one
+  call site; the loop's now-dead rollback calls went with it. And `brokerStreamSpecs`
+  lost every API parameter it carried for that step.
+  **A guarantee was deliberately NOT built, and the reasoning is the item's main
+  lesson.** Three revisions tried to guard "no durable mutation from a table callback
+  before a later validator" — a `postDurable` placement test, then three assertions,
+  then a claimed structural deletion — and review refuted each: the permitted
+  `$MQTT_sess` post, `validate` and `observe` remain open, and the closures capture the
+  receiver, so `as.jsa` is reachable whatever the parameter list says. A consult ruled
+  the guard OUT: the invariant holds today, this change strengthens it, it was never
+  this finding's obligation, and the same hypothetical exists identically at HEAD. It is
+  recorded as a fact of the current code, READ NOT GUARDED, and no safety conclusion
+  rests on it — the ordering argument rests instead on the initialization order at one
+  call site.
+  **Residuals, all in `docs/CONFORMANCE.md`.** The preflight is nine independent lookups
+  rather than an atomic snapshot: under create-only concurrency an admission cannot
+  wrongfully succeed, but an operator deleting streams behind the scan with `$MQTT_sess`
+  last can be observed as nine-present and get a mixed old/new bundle — which needs the
+  all-brokers-stopped precondition violated, and is why that precondition is
+  load-bearing rather than advisory. Restore skew WITHIN one incarnation is
+  undetectable. A concurrent first start can refuse one broker: `Server.Start` is fatal
+  on a failed initialization and offers no retry, so recovery is a restart and depends
+  on the supervisor — and if the broker that admitted zero dies having created one to
+  eight streams, every peer refuses until the documented reset. The reset does not
+  reconstruct a `Sources` topology on `$MQTT_rmsgs`.
+  **What it does not buy:** the hazard is unreachable through a SUPPORTED operation, not
+  eliminated; every stale-identity path still exists, and startup validation remains a
+  snapshot. Completeness is demonstrable at this HEAD and GUARDED, not proven — the
+  nine-entry table is hand-maintained, and what guards it is the preflight deriving its
+  names from that table plus `TestStreamValidatorFieldCoverage` requiring every
+  validator to reject a foreign stamp.
 
   - [x] [F-034: Add write lineage to outbound in-flight
   registers](findings/ha-arbitration.md#f-034). **Closed 2026-08-22 as an audit plus a
@@ -1797,20 +1734,20 @@ further findings it surfaced are filed separately, for the reason its own bullet
   delivers. Those two refusals are wire-distinguishable — 0x92 with the hold released
   versus no PUBCOMP at all — which is what makes them separately testable. **OPEN 1: "no
   watermark" is NOT proof, and an earlier draft of this bullet wrongly said it was** on
-  the grounds that nothing deletes a watermark. Per-record permanence does not survive
-  stream recreation: `$MQTT_teardown` recreated ALONE stamps the current epoch, validates
-  clean and **admits empty**, which `docs/CONFORMANCE.md` already states loses every open
-  fence. So retire G1, recreate that stream alone, and a stale broker releasing G1's
-  surviving hold reads "no watermark" and performs the very post-discard fan-out site 2
-  exists to prevent. **F-066's 2026-08-31 ruling DISSOLVES this arm, once it LANDS**: its
-  precondition is precisely that `$MQTT_teardown` recreated alone is admitted, and under
-  the all-nine recreation unit that is a refused state, so the arm needs neither the
-  partial-recreation residual nor some other durable proof. The dependency is on the
-  ENFORCEMENT, not on the decision, so F-066 is implemented before this is reopened; the
-  owed retirement → recreation → stale-PUBREL fixture becomes a startup-refusal fixture.
-  Absent that landing, the arm must either be conditioned on an intact teardown-stream
-  incarnation — carrying that partial-recreation residual into this finding — or require
-  some other durable proof.
+  the grounds that nothing deletes a watermark. Per-record permanence did not survive
+  stream recreation: `$MQTT_teardown` recreated ALONE used to stamp the current epoch,
+  validate clean and **admit empty**, losing every open fence. So retire G1, recreate
+  that stream alone, and a stale broker releasing G1's surviving hold reads "no
+  watermark" and performs the very post-discard fan-out site 2 exists to prevent.
+  **DISSOLVED by F-066, which LANDED 2026-09-01**: this arm's precondition was precisely
+  that `$MQTT_teardown` recreated alone is admitted, and under the all-nine recreation
+  unit that is a REFUSED state — an account holding eight of the nine fails the
+  account-wide preflight before anything is provisioned. The arm therefore needs neither
+  the partial-recreation residual nor some other durable proof, and the owed retirement →
+  recreation → stale-PUBREL fixture is a startup-refusal fixture instead
+  (`TestBrokerStreamBundleRefusesAPartialAccount`, which covers all nine positions).
+  What remains reachable is administrative deletion or a partial restore, which the
+  compatibility boundary does not support.
   **OPEN 2: the DIFFERENT-generation outcome, and the reason it is open is NOT
   that historical per-generation state is necessary** — a draft of this bullet claimed
   that too, and it is unproven. Proceeding on a bare generation mismatch is certainly
@@ -1969,8 +1906,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   `sess.seq` — two new REQUIRED fields on two PERMANENT shapes, because
   `finishAdoptedTeardown` holds only the marker's own sequence. **Refused as
   DISPROPORTIONATE, not as blocked**, and the distinction is deliberate: the route is
-  analyzable, since `$MQTT_teardown` is already epoch-coupled to `$MQTT_sess` and their
-  recreation is one logical unit, so it need not open fresh F-066 surface. What refused it
+  analyzable, since `$MQTT_teardown` is epoch-coupled to `$MQTT_sess` and every
+  broker-owned stream is recreated as one unit (F-066), so it need not open fresh F-066
+  surface. What refused it
   is the price — two permanent record fields to specialise a DISCONNECT Reason String and
   a log line. **What this leaves, as a permanent stated residual in `docs/CONFORMANCE.md`:**
   a vanished record, an unreadable one, an undecodable one, a below-base one and a
@@ -2857,6 +2795,32 @@ finding with acceptance criteria.
   rather than attributable to any change; that measurement is further evidence for the same
   rival-create signature, not a second finding.
 
+- [ ] **Attribute the `TestMQTTInflight*` family's intermittent failures.** Filed
+  2026-09-01 by the F-066 enforcement lane, which met one in a full-suite run and then
+  MEASURED it on both arms rather than guessing. **Pre-existing and NOT attributable to
+  that change:** repeating the family under load gave **3/12 on a clean `HEAD` worktree
+  against 2/12 on the change tree**, so it fails without the change at a comparable
+  rate — and F-066's enforcement cannot reach it, since its only edits to
+  `inflight_register.go` are a startup-time validator argument and comments, neither on
+  the `endSend` path any of these assertions exercise.
+  **A different member fails each run**, which is the part that matters for attribution:
+  `HEAD` produced `TestMQTTInflightLandedButUnconfirmedAckLeavesNothing` twice and
+  `TestMQTTInflightPubAckParksThroughTheAckPath` once; the change tree produced
+  `TestMQTTInflightOrphanReconcile` and `TestMQTTInflightTerminalAckParksWhileASendIsInFlight`
+  once each. So it is a family-level load sensitivity rather than one bad fixture, and a
+  bug hunt that starts from whichever test failed today will chase the wrong thing.
+  Isolated single runs pass (5/5 on the change tree for the first one observed), so it is
+  load-sensitive in the same way as the entry below. The first question is whether the
+  shared fixture these tests build serializes something the parallel suite does not, and
+  the answer is worth having before alpha because the assertions are about deferred
+  register deletes — the F-087/F-091 machinery.
+  **A THIRD intermittent met in the same verification is a different phenomenon and is
+  recorded here so it is not merged into this one:** `TestMQTTMaxAckPending` failed once
+  under full-suite load with `TempDir RemoveAll cleanup: ... /streams/$MQTT_msgs/obs/...:
+  directory not empty` — Go's own temp-directory cleanup racing JetStream's file removal,
+  not a broker assertion at all. It reproduced 0/12 on both arms in isolation. Whoever
+  takes this bullet should not spend time on it as if it were the same defect.
+
 - [ ] **Attribute `TestSharedDenyDoesNotConsumeForAllowedMembers`'s intermittent failure.**
   Filed 2026-08-30 by the F-089 lane, which met it once in a full-suite run and then
   measured it rather than guessing. **Pre-existing and NOT attributable to that change:**
@@ -2865,6 +2829,14 @@ finding with acceptance criteria.
   cannot reach it, because with no PUBREL debt anywhere in the flow `sendReservedLocked` is
   semantically identical to the registry-presence test it replaced. Isolated single runs
   pass on both arms (3/3 each), so it is load-sensitive.
+  **A third independent measurement, 2026-09-01 by the F-066 enforcement lane**, agrees
+  and is recorded because it also shows how easily this one is misread: repetition gave
+  **3/48 on a clean `HEAD` worktree against 4/24 on the change tree**, but the HEAD figure
+  arrived as 0/12, 0/12 and then 3/24 — so a two-block sample had shown 0 against 4 and
+  looked like an attribution. It is not one (Fisher p ≈ 0.19, and the pooled rates match
+  the 1/12-versus-2/12 above). Disabling F-066's new nine-lookup startup preflight
+  entirely still left 1/12, which rules out added initialization latency as the driver.
+  **Take at least ~24 repetitions per arm before concluding anything here.**
   The assertion that fails is `authz_affine_test.go:494` — *an allowed shared member
   joining after a DENIED member was offered the group message must still receive it: a
   terminal ACK on the deny destroyed it*. **Whether that is a fixture premise or a real
@@ -3051,9 +3023,15 @@ project. Retain `mqtt-nats-bridge` only if continuity outweighs that ambiguity.
   proposed, for the one stream where it is still meaningful. (`$MQTT_origin` was the
   second such stream until the write-lineage audit deleted the register; startup now
   refuses an account that still holds it.)
-  What is left is not enforceable and is documented instead: recreating `$MQTT_sess`
-  discards every client's acceptance history along with the records, and a delayed Will
-  enqueued beforehand then fires (`docs/CONFORMANCE.md`).
+  What is left is not enforceable and is documented instead: a bundle reset discards
+  every client's acceptance history along with the records — and, because the reset takes
+  `$MQTT_willq` as well, the delayed Wills those facts would have suppressed are
+  discarded with it rather than firing (`docs/CONFORMANCE.md`). The FIRE outcome belongs
+  to a partial operation that keeps `$MQTT_willq` while losing `$MQTT_sess`, which is
+  exactly what the enforcement now refuses. **F-066 has since generalised the
+  enforcement this item proposed** from that one pair to all nine broker-owned streams,
+  landed 2026-09-01: every stream carries the epoch, and a proper subset is refused by
+  an account-wide preflight before anything is provisioned.
 
 ### Memory-limit strategy
 
@@ -3432,5 +3410,10 @@ The first alpha may be tagged only when:
 
 - [ ] TLS rollover, WebSocket, authentication, authorization, migration, backup,
   restore, upgrade, rollback, and shutdown procedures are documented and tested.
+  **Backup and restore are per-BUNDLE**: all nine broker-owned `$MQTT_*` streams are
+  one recreation unit, taken and restored together from one point in time, since
+  startup refuses a proper subset and refuses members carrying different recovery
+  epochs (F-066). Skew WITHIN one incarnation is undetectable, so the procedure has to
+  guarantee the coherent instant rather than rely on the check.
 
 - [ ] Release artifacts use the final product name consistently.

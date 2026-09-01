@@ -343,15 +343,16 @@ func TestValidateQoS2AssignStream(t *testing.T) {
 			Discard:    DiscardOld,
 			MaxMsgsPer: 1,
 			Replicas:   3,
+			Metadata:   map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateQoS2AssignStream(good(), 3); err != nil {
+	if err := validateQoS2AssignStream(good(), 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateQoS2AssignStream(good(), 0); err != nil {
+	if err := validateQoS2AssignStream(good(), 0, testBundleEpoch); err != nil {
 		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
 	}
-	if err := validateQoS2AssignStream(nil, 0); err == nil {
+	if err := validateQoS2AssignStream(nil, 0, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -385,7 +386,7 @@ func TestValidateQoS2AssignStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateQoS2AssignStream(si, 3); err == nil {
+			if err := validateQoS2AssignStream(si, 3, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})
@@ -406,15 +407,16 @@ func TestValidateOutStream(t *testing.T) {
 			Storage:   FileStorage,
 			Retention: InterestPolicy,
 			Replicas:  3,
+			Metadata:  map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateOutStream(good(), 3, mqttDefaultMaxAckPending); err != nil {
+	if err := validateOutStream(good(), 3, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateOutStream(good(), 0, mqttDefaultMaxAckPending); err != nil {
+	if err := validateOutStream(good(), 0, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
 		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
 	}
-	if err := validateOutStream(nil, 0, mqttDefaultMaxAckPending); err == nil {
+	if err := validateOutStream(nil, 0, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -432,7 +434,7 @@ func TestValidateOutStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateOutStream(si, 3, mqttDefaultMaxAckPending); err != nil {
+			if err := validateOutStream(si, 3, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
@@ -479,7 +481,7 @@ func TestValidateOutStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateOutStream(si, 3, mqttDefaultMaxAckPending); err == nil {
+			if err := validateOutStream(si, 3, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})

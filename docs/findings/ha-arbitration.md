@@ -924,8 +924,10 @@ distinguishes a census from a sample in kind rather than in length.
   as a new persisted field. **Site 2 is only PARTLY established, and two review
   rounds each caught the roadmap bullet overstating it.** Settled: the proof's placement,
   the matching-generation refusal, and the unreadable-watermark fail-closed. OPEN: the
-  no-watermark arm, because `$MQTT_teardown` recreated alone admits EMPTY and loses every
-  open fence, so absence is not proof; and the different-generation arm, where proceeding
+  no-watermark arm — DISSOLVED by F-066's landing 2026-09-01, since `$MQTT_teardown`
+  recreated alone used to admit EMPTY and lose every open fence, and an account holding
+  eight of the nine is now refused before anything is provisioned; and the
+  different-generation arm, where proceeding
   on a bare generation mismatch is wrong but the unexplored direction is a two-dimensional
   classifier crossing the generation relation with `MarkerSeq` against a fully revalidated
   `sess.seq` — so it is NOT established that historical per-generation state is required.
@@ -1339,12 +1341,15 @@ evidence is permanent, so a stale `holdSeq` does not weaken it, and the reap is 
 shortcut past the fences: the retried create must still win and `verifyQoS2HoldForRelease`
 must still find the record at its sequence.
 
-**Scope: one stream incarnation.** Deleting and recreating `$MQTT_qos2in` restarts the
-sequence space, and *every* sequence identity in this protocol breaks with it — the
-per-subject CAS expectations, scope rule 2's exact-sequence claim deletes,
-`releaseQoS2Record`, the sweep's `qos2ClaimUnchanged`, and now this fence. That
-precondition is pre-existing and repository-wide, not introduced here; recreation is an
-all-brokers-stopped operation under `docs/ARCHITECTURE.md`'s compatibility boundary. The
+**Scope: one stream incarnation.** A `$MQTT_qos2in` whose sequence space restarts breaks
+*every* sequence identity in this protocol with it — the per-subject CAS expectations,
+scope rule 2's exact-sequence claim deletes, `releaseQoS2Record`, the sweep's
+`qos2ClaimUnchanged`, and now this fence. That precondition is pre-existing and
+repository-wide, not introduced here. Recreating that stream ALONE is no longer a
+supported operation (F-066: the nine broker-owned streams are one recreation unit and a
+proper subset is refused at startup); the supported operation that restarts the space is
+an all-brokers-stopped reset of the whole bundle, under `docs/ARCHITECTURE.md`'s
+compatibility boundary. The
 change is a strict improvement inside it: the previous purge carried no bound at all.
 
 **An enumeration that cannot bound a purge is never acted on.** `STREAM.INFO` builds
@@ -2060,16 +2065,17 @@ in `docs/CONFORMANCE.md`.
 - **A `storing` phase the reaper must respect.** The actor that would clear the marker is
   the one that died, so a crashed materializer leaves a terminal claim behind an
   unclearable marker — the accumulation defect, manufactured.
-- **Disposing any copy whose claim is absent, at the gate.** A missing claim record is
-  producible by a supported operation (F-066's stream recreation), so an absence never
-  licenses destroying an accepted message. F-066's 2026-08-31 ruling WILL narrow that
-  PRODUCER once its enforcement lands — recreating `$MQTT_qos2assign` alone will then be
-  unsupported and refused, though it is supported today and this refutation holds
-  regardless — but
-  **the refutation does not rest on it**: the rule is that an absence is not a positive
-  fact, and a claim record is also absent to a reader whose load was indeterminate or
-  whose stream reread raced a delete. Do not read the narrowed producer as licence to
-  revive this design.
+- **Disposing any copy whose claim is absent, at the gate.** An absence never licenses
+  destroying an accepted message. A missing claim record USED TO be producible by a
+  SUPPORTED operation — recreating `$MQTT_qos2assign` alone — and F-066's enforcement,
+  landed 2026-09-01, removed that producer entirely rather than narrowing it: recreating
+  one stream is refused at startup, and the supported reset takes all nine, so it clears
+  the `$MQTT_out` copy along with the claim and cannot leave the absent-claim state this
+  arm reasoned about at all.
+  **The refutation does not rest on that producer**, which is why it survives its
+  removal: the rule is that an absence is not a positive fact, and a claim record is also
+  absent to a reader whose load was indeterminate or whose stream reread raced a delete.
+  Do not read the removed producer as licence to revive this design.
 - **A reaper-side cleanup.** Its evidence is "absent when I looked, present now" — a
   second stale reading that says nothing about which claim may still authorize the copy.
 - **Withdrawing on "my CAS reported the claim gone or renamed"**, and the same rule
@@ -2163,19 +2169,18 @@ message deliver an OLD payload, because the new incarnation's copy subject diffe
 
 **Title:** Cross-stream identity coupling exists as three ad hoc instances, never as a mechanism
 
-- Status: **Open, with the remedy DECIDED and the by-construction route abandoned.** Found
-  by F-033's consequence audit, 2026-08-18, during holistic review. The decision this
-  finding was blocked on was taken by the repository owner on **2026-08-31**: change the
-  supported recovery contract so **all nine broker-owned streams become one recreation
-  unit**, rather than generalising the epoch coupling. **The decision is settled and the
-  enforcement is NOT landed**, so the contract in force today is still the single-stream
-  one the validators print. See "The decision, 2026-08-31" below; the roadmap bullet
-  carries the executable remedy.
+- Status: **CLOSED 2026-09-01.** Found by F-033's consequence audit, 2026-08-18, during
+  holistic review. The decision this finding was blocked on was taken by the repository
+  owner on **2026-08-31**: change the supported recovery contract so **all nine
+  broker-owned streams become one recreation unit**, rather than generalising the epoch
+  coupling. That enforcement is now in the tree — see "What landed, 2026-09-01" below —
+  so recreating a proper subset is refused at startup and every validator's recovery
+  text names the bundle. The by-construction route stays abandoned.
 - Classification: HA arbitration architecture / data loss
-- Release treatment: **Alpha blocker.** Every precondition is a recovery procedure this
-  broker's own startup error tells the operator to perform, and the messages lost or
-  misdelivered were accepted. Once the decided remedy LANDS, the procedure that reaches
-  every precondition becomes an unsupported, refused operation; it is supported today.
+- Release treatment: **Alpha blocker, resolved.** Every precondition was a recovery
+  procedure this broker's own startup error told the operator to perform, and the
+  messages lost or misdelivered were accepted. The procedure that reached every
+  precondition is now an unsupported, refused operation.
 - Roadmap section: §0.2 (multi-frontend HA blockers)
 
 ### The finding
@@ -2452,6 +2457,12 @@ Splitting the finding or shipping a partial mechanism was not among them, and is
 
 ### The decision, 2026-08-31
 
+*Historical record of the ruling as written on 2026-08-31, when the enforcement was still
+owed. It LANDED on 2026-09-01 — see "What landed" above — so every future-tense statement
+below has since come true, and the single-stream procedures this section says are "still
+the supported ones" are the ones that change retired. Nothing here describes the contract
+in force.*
+
 **Option 4 was taken, at ALL-NINE granularity: every broker-owned `$MQTT_*` stream WILL BE
 one recreation unit, and independent single-stream recreation WILL BE withdrawn — when the
 enforcement lands, which it has not.** The decision is settled; the contract change is
@@ -2483,11 +2494,13 @@ hand-authored relation, the route classifier, circular final-sink discovery, and
 preservation being itself the encoding escape — are why that route was abandoned, not an
 inheritance for a sixth revision of it. Nothing above them needs re-deriving.
 
-**What the decision does NOT buy, stated so no plan claims it.** Once the enforcement
-lands, the hazard becomes unreachable through a SUPPORTED operation rather than eliminated
-— and until it lands it is reachable exactly as this finding describes, since the decision
-alone changes no contract. Every stale-identity path in the table above will still exist in
-the code; what changes is only that no supported procedure will produce the precondition.
+**What the decision does NOT buy, stated so no plan claims it** (written while the
+enforcement was still owed; it landed 2026-09-01, see "What landed" above). Once the
+enforcement lands, the hazard becomes unreachable through a SUPPORTED operation
+rather than eliminated — and until it lands it is reachable exactly as this finding
+describes, since the decision alone changes no contract. Every stale-identity path in
+the table above will still exist in the code; what changes is only that no supported procedure
+will produce the precondition.
 Startup validation remains a snapshot, so a live operator
 deleting a stream behind initialized managers still reaches them, and the all-brokers-
 stopped precondition stays load-bearing. Accepted-data loss when recreating a stream holding
@@ -2496,9 +2509,42 @@ Recovery will become a complete account-level state reset with no partial recove
 the two existing per-pair couplings will state a fact the global epoch also states, so
 they become redundancy-deletion candidates rather than part of the remedy.
 
-The executable remedy — the account-wide preflight, the epoch, the four contract obligations
-it drags in, and the documentation retirements — is carried in this finding's roadmap
-bullet, which is where the work is tracked.
+### What landed, 2026-09-01
+
+**DONE**, after six plan-review rounds and one decision consult on a fired stop rule. The
+ruling's enforcement is in the tree; the by-construction generalisation stays abandoned.
+
+**Two mechanisms, neither subsuming the other.** A COUNT rule
+(`mqttPreflightBrokerStreamBundle`) over the same spec table the provisioning loop
+iterates, taking a new lookup-only interface so it cannot create what it decides about:
+zero admits, nine admits, one through eight refuses. Each lookup's `(info, error)` PAIR is
+dispositioned together, with UNDECIDED failing startup rather than reading as absence. And
+a per-stream EPOCH stamp: `mqtt_sess_epoch` is now on all nine and compared by every
+validator through `validateBundleEpochStamp`, into which `validateTeardownStream`'s private
+check was deleted. The count catches a member ABSENT at startup, and what it buys is that
+the broker no longer silently recreates it; the epoch catches a member present but from
+another incarnation. NEITHER catches an operator who recreates a member by hand and copies
+the surviving stamp onto it — forgery, and outside what this claims.
+
+**The guarantee that was deliberately NOT built, which is this finding's fifth lesson about
+overclaiming.** Three revisions tried to guard "no durable mutation from a table callback
+before a later validator"; review refuted each, the last because the table's closures
+capture the receiver, so `as.jsa` is reachable whatever the parameter list says. A consult
+ruled the guard out: the invariant holds today, the change strengthens it, it was never
+this finding's obligation, and the same hypothetical exists at HEAD. It is recorded as
+READ NOT GUARDED, and the ordering argument was re-grounded on the initialization order at
+one call site so nothing depends on it.
+
+**What did not change.** The hazard is unreachable through a SUPPORTED operation, not
+eliminated. Startup validation and the preflight are snapshots; the all-brokers-stopped
+precondition stays load-bearing, and the concurrent-deletion interleaving that defeats the
+preflight is a stated residual. Accepted-data loss on a reset is unchanged. Completeness is
+demonstrable at this HEAD and GUARDED — the nine-entry table is hand-maintained — not
+proven.
+
+The residuals, the concurrent-cold-start refusal and the recovery contracts are in
+`docs/CONFORMANCE.md`; the mechanism is in `docs/ARCHITECTURE.md`, "The nine streams are
+one recreation unit".
 
 ## F-084: Prove a successor before claiming a takeover
 

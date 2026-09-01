@@ -186,12 +186,15 @@ the site itself a row asserting which type it embeds.
 
 ## The two questions F-033's route inventories never asked
 
-**Which recovery procedures name this stream alone?** Seven of the nine validators call
-the shared `stopAll` helper naming their own stream; `$MQTT_sess` and `$MQTT_teardown`
-each name the other and call the pair one logical unit. So the provisioning table itself
-asserts seven single-stream recovery procedures — F-066's falsified premise stated in
-code, at seven citable sites. That is an assertion in operator guidance, **not proof
-that the procedures are safe**; F-066 is precisely the evidence that some are not.
+**Which recovery procedures name this stream alone?** None, since F-066's enforcement
+landed 2026-09-01. They USED TO: seven of the nine validators called the shared `stopAll`
+helper naming their own stream, and `$MQTT_sess` and `$MQTT_teardown` each named the
+other and called the pair one logical unit — so the provisioning table itself asserted
+seven single-stream recovery procedures, F-066's falsified premise stated in code at
+seven citable sites. Every one of those now names the nine-stream unit, and startup
+refuses an account holding a proper subset. That is an assertion in operator guidance,
+**not proof that the procedures are safe**; F-066 is precisely the evidence that some
+were not.
 
 **What does this stream's persisted state reference that another stream issues?** The
 per-field answer is the manifest.

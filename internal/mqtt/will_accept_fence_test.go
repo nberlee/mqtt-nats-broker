@@ -1407,13 +1407,18 @@ func TestWillLicensingIsRefusedPastTheBudget(t *testing.T) {
 // $MQTT_sess SEQUENCE and therefore meaningless outside the incarnation that assigned
 // it.
 //
-// Reachable through an operation the documentation SUPPORTS. The coupled recreation
-// replaces $MQTT_sess, so every fact is gone and sequences restart at 1 — but
-// $MQTT_willq is not part of that unit, so a pending Will survives carrying a floor
-// from the old stream. Honouring it skips the new stream's early facts, which is
-// exactly what a cross-incarnation Will qualifies on. Worse than skipping: with the
-// floor above the new cutoff the walk runs ZERO times and reports "nothing
-// qualifies", licensing a publication having read nothing.
+// The state: $MQTT_sess is replaced, so every fact is gone and sequences restart at 1,
+// while a pending Will survives carrying a floor from the old stream. Honouring it
+// skips the new stream's early facts, which is exactly what a cross-incarnation Will
+// qualifies on. Worse than skipping: with the floor above the new cutoff the walk runs
+// ZERO times and reports "nothing qualifies", licensing a publication having read
+// nothing.
+//
+// This USED TO be reachable through an operation the documentation supported, because
+// $MQTT_willq sat outside the coupled recreation unit. F-066 made all nine streams one
+// recreation unit, so it is now reachable only through administrative deletion or a
+// partial restore — unsupported, not impossible. The behaviour is still pinned: a test
+// is not weakened because the route to its state got narrower.
 func TestWillScanFloorIsIgnoredAcrossIncarnations(t *testing.T) {
 	a, b := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
@@ -1985,8 +1990,10 @@ func TestWillScanProgressPersistsDespiteAStaleForeignFloor(t *testing.T) {
 
 	rec := testWillFor(a.asm, cid, "stalefloor-w", fireAt, origin)
 	// A floor from an incarnation that no longer exists, numerically far above anything
-	// the current stream will reach: what the documented coupled recreation leaves on a
-	// surviving $MQTT_willq record.
+	// the current stream will reach: what a surviving $MQTT_willq record carries when
+	// $MQTT_sess has been replaced under it. No SUPPORTED operation produces that any
+	// more (F-066 made the nine streams one recreation unit); an administrative
+	// deletion or a partial restore still can.
 	//
 	// Seeded PUBLISHING with an expired lease, because that is the only shape that can
 	// carry a floor at all: a floor is written by a claimant renewal, and a `pending`
