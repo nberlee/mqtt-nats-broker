@@ -1812,9 +1812,46 @@ further findings it surfaced are filed separately, for the reason its own bullet
   claims are all `Discarded` or `Lost`, so with no transition written it still succeeds
   vacuously and the consumer is deleted with no positive fact — in three cases, including
   a nonterminal claim created after the verification scan.
-  **The order this is attempted in, ruled 2026-08-31.** F-066's enforcement lands first,
-  which dissolves OPEN 1. Then a BOUNDED pre-plan investigation settles exactly two
-  things before any plan is written, because both are what stopped the last attempt
+  **SECOND ATTEMPT, 2026-09-01: the ordered pre-plan investigation RAN and the item
+  STOPPED AGAIN**, after five consults and four plan-review rounds, with **no
+  implementation code written**. F-066's enforcement landed (`1205d32`), so OPEN 1 is
+  dissolved and the prerequisite was met. **Gate-relevant outcome only; the dossier is
+  canonical for the mechanism, the evidence and the refuted designs.**
+
+  - **Q2 is SETTLED**: course E — delete `deleteOrphanQ2AffConsumers` outright — is the
+    decided remedy, **not yet implemented**. Its accepted price is a permanent unbounded
+    affine-consumer leak.
+  - **Q1 is CONDITIONALLY PROVED**: the sequence classifier holds, so **historical
+    per-generation watermark state is NOT required**; its identity prerequisite is not
+    proved, and that is what blocks planning.
+  - **This item is now release-blocking on SINGLE-BROKER grounds.** The attempt found a
+    third manifestation that is **silent loss of an acknowledged QoS 2 message with no
+    cluster, no crash and no peer** — an ordinary clean-start reconnect, through this
+    broker's own reused session object. It takes **no new finding ID and no second
+    checkbox**, because it is this finding's own causal defect and a second checkbox would
+    duplicate completion semantics and invite an accidental split. It stays release-blocking
+    even if multi-frontend HA scope were ever reconsidered.
+  - **Scope wording:** read "ONE executable item" below as **one completion item**, not one
+    atomic commit. The assembled work is two units — the incarnation admission invariant,
+    then the classifier with sites 1 and 3 and course E on top of it — and the first is the
+    second's foundation with nothing thrown away between them.
+  - §0.5's comment-corpus sweep gains a sixth family from this attempt.
+
+  Working lane `~/.claude/lanes/f-036-preplan/` holds four plan revisions, the ledger with
+  every round classified, all five consults and all four plan rounds verbatim; every durable
+  conclusion is filed in the dossier rather than left there.
+
+  **The order below is HISTORICAL and SUPERSEDED by the 2026-09-01 attempt above.** Both
+  of its pre-plan questions are now answered — the classifier is proved conditionally and
+  (a) is decided as course E — so a third attempt must NOT re-run them and must not choose
+  a positive authorization for the affine consumer delete: every one was refused, and the
+  "independently terminal" definition it calls owed is DISCHARGED by the existing
+  `mqttQ2AffClaim.terminal()`. **The current gate is: course E is fixed but unimplemented,
+  and planning is blocked on the identity/lifecycle property and its route audit.** The
+  text is kept because (b) through (e) are unchanged and still owed.
+  *Superseded — the order this was attempted in, ruled 2026-08-31.* F-066's enforcement
+  lands first, which dissolves OPEN 1. Then a BOUNDED pre-plan investigation settles exactly
+two   things before any plan is written, because both are what stopped the last attempt
   rather than anything a plan could absorb: prove or refute OPEN 2's two-dimensional
   classifier, and decide (a) below — authorize the step-6 affine consumer delete
   independently of step 2, or remove its destructive arm. Site 1 and the test
@@ -1823,10 +1860,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   and a bounded investigation that closes neither question leaves the box open rather
   than licensing a partial mechanism.
   **What is OWED before this is attempted again**, and it is mechanism plus test
-  infrastructure rather than another classifier revision: (a) a positive authorization for
-  the step-6 affine consumer delete that is INDEPENDENT of step 2, or the outright removal
-  of its destructive arm — plus a definition of "independently terminal" that covers `AffineDone`,
-  which the two earlier terminal arms do not; (b) a valid abnormal-exit construction for the
+  infrastructure rather than another classifier revision. *(a) is DISCHARGED by the
+  2026-09-01 attempt — course E removes the destructive arm outright and
+  `mqttQ2AffClaim.terminal()` supplies the definition — and is struck: a positive
+  authorization for the step-6 affine consumer delete INDEPENDENT of step 2 was sought and
+  every candidate refused.* (b) a valid abnormal-exit construction for the
   bound disposal — deferred WRAPPERS reading mutable variables, as `mqttProcessConnect`
   already does, because a `defer` of a variable captures its value at the `defer`
   statement — together with a take-and-clear before invocation rather than after, since
@@ -2849,7 +2887,7 @@ finding with acceptance criteria.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 
-- [ ] **Sweep the comment corpus for five false-claim families, indexed by CLAIM rather than
+- [ ] **Sweep the comment corpus for six false-claim families, indexed by CLAIM rather than
   by phrasing.** Filed 2026-08-26 by the pre-CONNACK-signal item's tenth holistic review round,
   which ruled: *"Stop iterating on this code item after recording them in a separate
   corpus-sweep finding"* and *"No further implementation review round is justified by the
@@ -2897,7 +2935,18 @@ finding with acceptance criteria.
   `CONSUMER.DELETE` against `$MQTT_rmsgs`); what stays true, and is what the corrected
   sites now say, is that the owner issues no MESSAGE delete, which is the only thing
   `DenyDelete` gates.
-  *How to close it:* index by the CLAIM — read every comment that asserts one of the five,
+  **(6) the re-minted-generation safety claim** — added 2026-09-01 by F-036's second
+  attempt. `reopenQoS2ReleaseFence` justifies reopening the release fence inside `clear()`
+  with "Safe because the incarnation has been re-minted by then, so a newly admitted release
+  works on the fresh generation's subjects, which this teardown cannot name." **False in
+  both directions.** A PUBREL derives its hold subject BEFORE it reaches
+  `beginQoS2ReleaseOp`, so a release admitted after the reopen can name the RETIRED
+  generation's subjects; and the fresh generation's subjects are not out of reach either —
+  they are exactly what a displaced connection can write to, which is the single-broker
+  silent loss F-036's bullet now records. The family, not the one site: any comment
+  asserting that a re-mint by itself puts the previous connection out of reach of the new
+  incarnation's names. F-036 owns the code fix; this bullet owns the corpus.
+  *How to close it:* index by the CLAIM — read every comment that asserts one of the six,
   rather than grepping for the wording that happened to be used. Family 5's history is the
   argument: a grep-shaped sweep will keep returning one more instance. **F-084 cross-links
   family 2

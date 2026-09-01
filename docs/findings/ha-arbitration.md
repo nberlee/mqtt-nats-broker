@@ -962,6 +962,162 @@ distinguishes a census from a sample in kind rather than in length.
   not reach the record within the widened window — the unbounded-walk residual). Neither
   is claimed to be closed by the deferral; both are listed here so this finding's
   eventual fix tests them alongside the pre-existing route.
+
+  **SECOND ATTEMPT, 2026-09-01, STOPPED UNRESOLVED** after five consults and four
+  plan-review rounds, with **no implementation code written**. F-066's enforcement had
+  landed (`1205d32`), dissolving OPEN 1, so the ordered pre-plan investigation ran. This
+  section is canonical for what it established; `docs/ROADMAP.md` carries only the gating
+  summary. Working lane `~/.claude/lanes/f-036-preplan/`.
+
+### F-036's second attempt (2026-09-01): what it established
+
+**A third manifestation, and it is the most severe thing in this finding: SINGLE-BROKER,
+NON-HA-DEPENDENT SILENT LOSS of an acknowledged QoS 2 message.** No cluster, no crash, no
+peer — an ordinary clean-start reconnect. `clear()` deliberately leaves the displaced client
+BOUND (`sess.c` untouched, F-089) while re-minting the reused session object, and
+`mqttStoreQoS2MsgOnce` derives its hold subject from whatever `sess.gen` currently is, under
+no gate. Between the re-mint and the replacement's bind the displaced connection can store
+payload A onto the **re-minted** incarnation's subject for identifier P; the replacement then
+binds, publishes B on P, its create-only CAS meets A, and the `mqttQoS2Held` arm returns
+"genuine DUP PUBLISH; PUBREC". **B is never stored, the client is told PUBREC, and the PUBREL
+releases A.** Two sibling routes share the cause: `mqttProcessPubRel` has no `sess.c`
+reference in its whole body while `mqttProcessPubRec` and `mqttProcessPubComp` both refuse
+on `sess.c != c`; and a stale PUBREC continues past the rebind and stores an uncorrelated
+PUBREL onto the fresh incarnation's `sess.pubRelSubject`. All three are **this finding's own
+causal defect reached through this broker's own reused session object** rather than through
+a peer, which is why they take no new finding ID and no second checkbox.
+
+**A false claim in the tree, owed a correction.** `reopenQoS2ReleaseFence` justifies
+reopening the release fence inside `clear()` as "Safe because the incarnation has been
+re-minted by then, so a newly admitted release works on the fresh generation's subjects,
+which this teardown cannot name." False in both directions: a PUBREL derives its hold subject
+BEFORE admission, so an admitted release can name the RETIRED generation's subjects, and the
+FRESH generation's subjects are exactly what a displaced connection can reach. Filed as
+family 6 of §0.5's comment-corpus sweep.
+
+**Q2 is SETTLED as course E, and it is a DELETION — decided, NOT YET IMPLEMENTED.** When it
+lands, `deleteOrphanQ2AffConsumers` is removed OUTRIGHT rather than only its step-6 consumer
+delete: with the delete forbidden its step-2 `Discarded` writes become an unlicensed
+destructive decision rather than preparation, both record revalidations and the
+`ConsumerInfo.Created` fingerprint guard only that delete, `mqttQ2AffGenerationSettled` loses
+its only caller, and step 7's reaps lose their premise — `reconcileOrphanQ2AffClaims` already
+retries an existing `Discarded` claim, so the general retry is not lost. **Until it lands
+the function remains defined and invoked, and its destructive route is live.** Every positive
+authorization was refused on its own terms: a retirement proof is structurally unavailable,
+because the watermark names the SESSION generation while the consumer is keyed by an affine
+generation that OUTLIVES incarnations; consumer metadata has the same mismatch; removing only
+the absent-record route still lets a stale owner create a fresh nonterminal claim after the
+verification scan, destroying a live copy and leaving F-064's claim-without-copy state; and
+`NumPending == 0` is an instantaneous observation, not a fence. **The accepted price is a
+PERMANENT UNBOUNDED LEAK** — the affine consumer's `InactiveThreshold` is deliberately zero
+and the stream refuses any `ConsumerLimits.InactiveThreshold`, so a consumer the sweep
+declines to delete has **no automatic orphan-collection backstop** left. That is
+narrower than "never collected", and deliberately so: `deleteTeardownTargets` still
+deletes `t.q2AffDur`, and the rollback and unwind paths also delete affine consumers, so a
+consumer whose session is later torn down or re-entered can still reach lifecycle cleanup.
+What leaks permanently, and without a cardinality bound, is a consumer with **no later
+authorized teardown or adoption** — and that is preferred to an unclosed
+acknowledged-message destruction path. **"Independently terminal" is
+`Discarded ∨ Lost ∨ AffineDone`, which ALREADY EXISTS as `mqttQ2AffClaim.terminal()`**, so
+the definition this finding owed is discharged by pointing at it; an empty owned inventory
+authorizes NOTHING and must never authorize by vacuous truth. **On landing** the
+destructive-decision census will drop from ten to eight and F-033's "adoption blind spot"
+manifestation below will be **dissolved rather than narrowed**, because it exists only through
+a by-name delete of a consumer a resuming session adopts. Course E also owes a
+`docs/CONFORMANCE.md` leak residual and the correction of every statement naming the orphan
+sweep as a later affine-consumer cleanup route.
+
+**Q1: OPEN 2's classifier is PROVED CONDITIONALLY.** The sequence half survived three
+adversarial rounds with no counterexample: refuse iff the watermark is valid and
+(`Gen == sessGen` ∨ `MarkerSeq > seq`); absent proceeds, now that F-066 refuses lone
+recreation of `$MQTT_teardown`; corrupt, indeterminate and `seqUncertain` fail the release
+closed. **So the necessity claim this finding had withdrawn is answered outright: historical
+per-generation watermark state is NOT required.** `MarkerSeq == seq` is unreachable for a
+bound session — every `sess.seq` adoption takes either a store response for this broker's
+own bytes or a digest-matched readback, and a marked record is never restored into a bound
+session. **What is NOT proved is the identity prerequisite**, named progressively across three
+rounds: the wrong generation term, then that generation equality is the wrong KIND of term,
+then that what is missing is the caller's authority to act for the currently bound
+incarnation. **A correction that cost a round and must not be repeated: `rec.gen` is a
+per-PUBLISH EXCHANGE identity, minted by `nuid.Next()` and carried in `Nmqtt-Q2Gen` — NOT
+the session incarnation generation.** The two are unrelated; the classifier needs the
+subject-derived session generation while the claim, fence 2 and the terminal commit keep the
+exchange one, and substituting either for the other makes nearly every legitimate record read
+as superseded.
+
+**What the four plan revisions established, so a third attempt does not re-derive it.** A
+per-connection incarnation stamp compared under the session lock is the right mechanism, and
+**its synchronization discipline was VERIFIED**: production has exactly two non-nil
+assignments to `mqttSession.c`, both already under that session's mutex, so adjoining the
+stamp write supplies the happens-before; the re-drive detach gives detach-before-next-bind
+program order; and no production path binds one client to two session objects, sets `sess.c`
+non-nil outside those two sites, or restamps the displaced client. A stamp closes the
+clear-to-bind gap by VALUE DISCRIMINATION where a fence cannot by mutual exclusion — in that
+gap `sess.c` is the displaced client and `sess.gen` is fresh, and nothing holds the fresh
+generation as its bound generation until the replacement bind writes it. **`clear()` must
+never restamp the displaced client; that mismatch IS the mechanism.**
+
+**Three designs REFUTED, so they are not tried again.** *A write-once stamp* — it misses the
+**new-session** bind site, a client rebinds across CONNECT re-drive, and two writes under
+two different session objects' mutexes are a data race. *A generalised operation fence replacing
+the release and affine fences* — `clear()` REOPENS on return, before the replacement binds,
+so admission passes in the gap and the race merely moves; the merge additionally drops the
+affine predicate's readiness, `q2AffGen` and consumer conditions, and self-deadlocks because
+`prepareQ2AffineUnwind` closes the very fence an admitted holder would be waiting on. *A
+mechanically enumerable "incarnation-derived state" set defined by `setIncarnationLocked`
+plus `clear()`'s reset block* — **not closed**: `clear()` advances `recordEpoch` INDIRECTLY
+through a deferred `endRecordTxNewGeneration`, outside both functions, and "anything derived
+at use time" is semantic taint that no source test can decide.
+
+**One exclusion is VALID and may be relied on:** an exact-sequence reap cannot reach a
+replacement record, including after a same-generation takeover, because the loaded record's
+stream sequence is immutable and a later occupant receives another. **One hypothesis is
+CLEARED:** there is no separate account-manager incarnation key and no hidden consumer-name
+root — every durable naming root traced reduces to `gen`, `q2AffGen`, the PUBREL fields, or
+state captured from pending/drain entries, so the closure failure is lifecycle and transitive
+state, not a third naming scheme.
+
+**What stopped it, and it is the same shape as 2026-08-27.** Point-linearized admission needs
+every incarnation-sensitive effect placed, and plan-review rounds 1 to 4 each found another
+that was missed — PUBREC's tail through `retireSourceLocked`, `mqttFinishQ2AffineDelivery`
+and `markInflightRegisterRetired`'s re-read of `sess.gen`; PUBCOMP's two effects separated
+by JetStream I/O, which one check cannot govern and `sess.mu` cannot span; PUBREL's release,
+tombstone and reap arms; then both PUBREC error rollbacks, `secureRetiredSource`'s write after
+its own I/O, `noteQ2AffCarrierRefused`'s write inside `dischargeQ2AffPubRelProof`, and PUBACK's
+`finalizeDrainSource` tail. The attempt to answer that class with a property instead of a
+fifth enumeration is the third refuted design above.
+
+**Constraints a third attempt must carry, all confirmed by the final review.** The
+**five-route boundary** stands — QoS 2 PUBLISH, PUBREL, PUBREC, PUBCOMP and PUBACK through
+the shared handler — and the dispatcher-wide census an earlier revision demanded was
+WITHDRAWN, because it existed only to prove a dispatcher-wide fence property that no longer
+exists. Admission is **point-linearized, not operation-duration exclusion**; the claim that
+a connection "remains bound throughout unlocked I/O" was withdrawn and must not return. The
+stamp discipline is not merely the equality: it is the write at **both** bind sites in the
+same critical section as the binding, **invalidation at the re-drive detach**, reads **only
+after `sess.c == c` is proved** under that same mutex, and an **explicit
+invalid-generation refusal** rather than bare comparison. **Success-shaped protocol
+responses are effects the next property must cover** — they have neither an
+incarnation-derived target nor a session-state write, so a predicate phrased only over
+those two misses them, which is why the last revision's placement table could not be
+generated from its own stated rule. And the mutation suite needs more than barrier
+placement: a re-read mutation must change the state actually asserted rather than a
+different subject; PUBCOMP's two helpers need a second barrier between them; the QoS 0/1
+and PUBACK boundary tests need values an admission check would actually change; the
+exact-sequence exclusion needs a paired code mutation; the enforcement test must cover
+writers and not only readers; and the race proof needs a deterministic unordered-access
+schedule rather than an asserted one.
+
+**What is OWED before a third attempt**, and it is another property design plus another route
+audit rather than a prose correction: a real lifecycle boundary covering `clear()`'s INDIRECT
+effects, interprocedural enforcement for reads AND writes, helper-internal placements, and
+a mutation suite whose barriers sit before the effects they discriminate. Of the
+first attempt's mechanism-plus-test-infrastructure list, **item (a) is DISCHARGED** — course
+E removes the destructive arm outright and `mqttQ2AffClaim.terminal()` supplies the
+"independently terminal" definition, and every positive authorization for the step-6 delete
+was sought and refused, so a third attempt must not re-run that question. **Only (b) through
+(e) remain owed**, unchanged.
+
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 36
