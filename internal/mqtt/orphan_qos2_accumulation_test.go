@@ -26,8 +26,8 @@ import (
 // reason:
 //
 //   - buildSessionRefs must report NO affine indeterminacy. A non-nil second return
-//     makes sweepOrphanedQoS2State skip every affine phase, so the arm is never entered
-//     and every assertion about "nothing happened" holds trivially.
+//     makes sweepOrphanedQoS2State suppress the affine CLAIM pass, so the arm is never
+//     entered and every assertion about "nothing happened" holds trivially.
 //   - refs.hasAffine must be TRUE for the pair. If it is false the claim takes the
 //     ABSENT-winner path instead, which can produce the same observable outcome by a
 //     completely different route.
@@ -48,8 +48,9 @@ func (e *testOrphanEnv) testLiveAffineGeneration(t *testing.T) (idHash, affGen s
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
 	if affineBad != nil {
-		t.Fatalf("the fixture's own session record makes the affine phases INDETERMINATE (%v), so the sweep "+
-			"would skip them entirely and every assertion below would hold for the wrong reason", affineBad)
+		t.Fatalf("the fixture's own session record makes the affine references INDETERMINATE (%v), so the "+
+			"sweep would suppress the claim pass entirely and every assertion below would hold for the "+
+			"wrong reason", affineBad)
 	}
 	if !refs.hasAffine(idHash, affGen) {
 		t.Fatalf("refs.hasAffine(%q, %q) is false, so this claim would take the ABSENT-winner path "+

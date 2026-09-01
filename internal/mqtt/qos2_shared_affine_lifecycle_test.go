@@ -1058,8 +1058,10 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 	}
 	subject, _ := b.waitForClaim(t, "materialized", func(c *mqttQ2AffClaim) bool { return c.Phase == mqttQ2AffMaterialized })
 
-	// The consumer is destroyed out of band, exactly as an operator (or a sweep
-	// that no longer sees a session record) could. Its pending copy goes with it.
+	// The consumer is destroyed out of band. Since F-036 course E no sweep route reclaims
+	// one by ABSENCE, so this fixture stages the state by hand rather than reproducing that
+	// route. (An operator, or a lifecycle teardown, can still delete one — this fixture
+	// simply does not depend on either.) Its pending copy goes with it.
 	ca.Close()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1630,8 +1632,8 @@ func TestQ2AffClaimRecordRoundTrip(t *testing.T) {
 // path the packet never established a membership for: shared membership is
 // persisted in a LATER loop, and every save is refused while the session is
 // unresolved. Nothing in the packet can reclaim it (the unused-path unwind's own
-// confirming save is refused for the same reason) and the orphan sweep passes
-// over it precisely because the record names it. The settlement therefore owns
+// confirming save is refused for the same reason) and no sweep collects it either —
+// F-036 course E removed that route entirely. The settlement therefore owns
 // the reclaim, and runs it under the resolver's token.
 //
 // What licenses that removal is the FAILED PACKET, not a claim that the
@@ -1741,9 +1743,9 @@ func testQ2AffArmAmbiguousProvisioning(t *testing.T, name string, expiry uint32,
 	// A confirmed PLAIN QoS 2 subscription first. It settles the record and
 	// provisions the PUBREL consumer, so the packet under test creates exactly one
 	// resource — the affine path — and every charge assertion is an affine delta
-	// rather than a bare total. The affine sweep excludes $MQTT_PUBREL_* and
-	// finishQ2AffineUnwind refunds only the affine increment, so a PUBREL consumer
-	// created INSIDE the ambiguous packet would be a second unaccounted resource.
+	// rather than a bare total. No sweep judges an affine consumer at all since F-036
+	// course E, and finishQ2AffineUnwind refunds only the affine increment, so a PUBREL
+	// consumer created INSIDE the ambiguous packet would be a second unaccounted resource.
 	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: name + "/plain", opts: 2}}); len(codes) != 1 || codes[0] != 2 {
 		t.Fatalf("expected SUBACK [2] for the plain QoS 2 filter, got %v", codes)
 	}
@@ -2277,7 +2279,8 @@ func TestQ2AffineReclaimSaveRejectedIsSettledAsForeign(t *testing.T) {
 		return nil
 	})
 	// Never deleted by us. The winning record decides the consumer's owner, and this
-	// one omits the affine fields, which makes it the orphan sweep's work.
+	// one omits the affine fields — which used to make it the orphan sweep's work and now
+	// makes it a stated leak (F-036 course E), but either way not this path's to delete.
 	if durs := a.b.affineConsumers(t, a.idHash); len(durs) != 1 {
 		t.Fatalf("the disposal deleted an affine consumer it does not own, got %v", durs)
 	}
@@ -2535,11 +2538,12 @@ func TestQ2AffineReclaimIsNotBlockedByATerminalClaim(t *testing.T) {
 // record already saying the path is gone. Only the CONSUMER DELETE waits in that
 // case — the scan that terminates assignments is account-wide and fails closed, so
 // deleting an interest-retained consumer whose claims might be outstanding would
-// take their copies with it, and the orphan sweep is the right owner for a
-// consumer no record names. Everything LOCAL still converges: the delivery
+// take their copies with it. A consumer no record names used to be the orphan sweep's;
+// since F-036 course E nothing collects it, so it is RETAINED and stated as a leak.
+// Everything LOCAL still converges: the delivery
 // subscription goes and the MaxAckPending charge comes back exactly, because
-// nothing else can ever reach them once the record stops naming the path — the
-// sweep deletes consumers, it cannot refund another broker's budget.
+// nothing else can ever reach them once the record stops naming the path — no sweep
+// could refund another broker's budget in any case.
 //
 // Mutation: return from dispose() without releaseQ2AffineUnwindLocally and the
 // charge is stranded for the life of the session, which is a slice of
@@ -2604,9 +2608,9 @@ func TestQ2AffineReclaimDiscardFailureStillReleasesTheLocalHalf(t *testing.T) {
 	}
 	// The consumer is deliberately NOT deleted: its claims could not be proven
 	// terminated. Two things this does NOT assert. It does not assert that the
-	// orphan sweep then reclaims it — the same undecodable record aborts that
-	// sweep's affine inventory too (orphan_qos2_sweep.go), so the consumer stays
-	// pending until the record is repaired or removed. And it does not assert that
+	// orphan sweep then reclaims it — it never does now (F-036 course E removed that
+	// route), and even before that the same undecodable record aborted the sweep's
+	// affine inventory, so the consumer is retained either way. And it does not assert that
 	// NO assignment was discarded: the discard streams, mutating each matching
 	// claim inside the scan, so claims reached before the malformed record are
 	// discarded while the rest are not. This fixture seeds no owned assignments, so
@@ -2905,8 +2909,9 @@ func TestQ2AffineReclaimRunsFromAReconnectResolution(t *testing.T) {
 // A competing remote write during the unresolved window ends in a FOREIGN verdict, and a
 // foreign verdict is not ours to act on: the record is not this broker's to write, the
 // session is evicted, and the continuation never runs. The affine consumer must
-// survive that — whether it is the winner's or the orphan sweep's is decided by
-// the winning record, never by us deleting it on the way out.
+// survive that: whether it is the winner's is decided by the winning record, never by us
+// deleting it on the way out. (It is no longer "or the orphan sweep's" — F-036 course E
+// removed that route, so an unclaimed consumer is retained rather than collected.)
 //
 // Mutation M7: delete the affine consumer at eviction in
 // disposeForeignStateLocked and the surviving-consumer assertion fails.
@@ -3605,10 +3610,12 @@ func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 	}
 }
 
-// TestQ2AffResumeAdoptsConsumerKeepingItsCreated pins the mechanism behind F-036's third
-// manifestation, the "adoption blind spot".
+// TestQ2AffResumeAdoptsConsumerKeepingItsCreated pins the mechanism that was behind F-036's
+// third manifestation, the "adoption blind spot" — DISSOLVED by course E, which removed the
+// delete rather than guarding it. The mechanism is still worth pinning, because it is the
+// argument that refused every guarded version.
 //
-// The orphan sweep's step (5) re-verifies that the consumer it is about to delete is still
+// The removed step (5) re-verified that the consumer it was about to delete was still
 // the INSTANCE quarantine observed, by comparing ConsumerInfo.Created. That discriminates a
 // delete-and-recreate, which is what the grace exists to protect. It does NOT discriminate a
 // session that RESUMES onto the consumer it finds: a resume preserves the incarnation
@@ -3616,16 +3623,15 @@ func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 // so no new instance is created and Created is unchanged.
 //
 // This is MECHANISM EVIDENCE, not a defect pin, and the distinction matters. Reaching the
-// sweep's step-(4)-to-step-(6) window additionally requires a session resident with that
-// generation while its record is absent — F-036's premise, and not something this fixture
-// stages. The full interleaving belongs to F-036's fix, along with the seam it would need;
-// there is none between those steps today. What this fixture owns is the half a fixer is
-// most likely to get wrong: it proves the instance fingerprint is not the defense it reads
-// as, so a fix that leans on it will still delete a live adopted consumer.
+// window the removed delete had between its record re-read and its instance re-lookup
+// additionally required a session resident with that generation while its record was
+// absent — F-036's premise, and not something this fixture stages. What this fixture owns is the half a fixer is most likely to get wrong: it proves
+// the instance fingerprint is not the defense it reads as, so ANY future re-proposal of a
+// by-name affine consumer delete that leans on it would still destroy a live adopted
+// consumer. Course E's remedy was to remove the delete instead.
 //
 // It asserts a property of ordinary provisioning, so it is not paired with a remedy
-// mutation: arbitrating the consumer delete — the actual fix — would leave Created
-// unchanged and this test passing, correctly. The mutation it does discriminate is a
+// mutation. The mutation it does discriminate is a
 // provisioning change to delete-and-recreate on resume, which would silently destroy
 // retained copies on every reconnect.
 func TestQ2AffResumeAdoptsConsumerKeepingItsCreated(t *testing.T) {
@@ -3647,8 +3653,8 @@ func TestQ2AffResumeAdoptsConsumerKeepingItsCreated(t *testing.T) {
 	}
 	created := before.Created
 
-	// Leave and come back on the same session. This is the resume the sweep's window
-	// admits, and the generation it comes back on is the one the sweep condemned.
+	// Leave and come back on the same session. This is the resume that window admitted,
+	// and the generation it comes back on is the one such a delete would have condemned.
 	// Rejoining the group, not a bare reconnect: affine provisioning runs from the
 	// shared-subscription path, so a resume that never re-subscribes would leave the
 	// consumer untouched and this fixture would assert an unchanged Created for a reason
@@ -3663,19 +3669,22 @@ func TestQ2AffResumeAdoptsConsumerKeepingItsCreated(t *testing.T) {
 		t.Fatalf("the resumed session has no affine consumer %q: ci=%v err=%v", durable, after, err)
 	}
 	if !after.Created.Equal(created) {
-		t.Fatalf("F-036's adoption blind spot no longer holds: the resume changed ConsumerInfo.Created from %v to %v, so the sweep's step-(5) fingerprint WOULD discriminate an adoption",
-			created, after.Created)
+		t.Fatalf("the adoption property no longer holds: the resume changed ConsumerInfo.Created "+
+			"from %v to %v, so an instance fingerprint WOULD discriminate an adoption and course E's "+
+			"refutation would need re-checking", created, after.Created)
 	}
-	// Pinned: a live resumed session carrying an instance fingerprint the sweep cannot
-	// tell from the one it condemned.
-	t.Log("F-036 adoption blind spot reproduced: an adopting resume leaves ConsumerInfo.Created unchanged, so step (5) cannot discriminate it")
+	// Pinned: a live resumed session carrying an instance fingerprint indistinguishable
+	// from the one a by-name delete would have condemned.
+	t.Log("adoption property reproduced: an adopting resume leaves ConsumerInfo.Created unchanged, " +
+		"so an instance check cannot discriminate it")
 }
 
 // The split F-064 delivers, asserted from both sides.
 //
 // buildSessionRefs keys refs.affine on ps.Q2AffGen alone, so a live matching record
-// makes the sweep skip EVERY claim of that generation — reconciliation, the discard,
-// and the consumer pass alike. That has NOT changed and is not a defect: the sweep
+// makes the sweep skip EVERY claim of that generation — reconciliation and the discard
+// alike. (It also skipped the consumer pass; F-036 course E removed that pass, so there
+// is no consumer decision left to skip.) That has NOT changed and is not a defect: the sweep
 // has no payload to materialize with, so it could only ever resolve such a claim by
 // erasing it, and reaping a claim of a live generation needs the reaper fence that
 // is F-065's remedy.

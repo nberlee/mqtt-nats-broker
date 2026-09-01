@@ -194,7 +194,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   **Residuals** (`docs/CONFORMANCE.md`): the fence names only the LATEST retirement and
   the single slot can itself be regressed by a cross-term apply on `$MQTT_teardown`, both
   stacked instances of the documented apply-time CAS hole; the PUBREL reaper's two
-  post-check windows, the same bound the affine reaper has; a bundle reset loses every
+  post-check windows, which used to be stated as the same bound the affine reaper has —
+  that reaper is gone (F-036 course E), so they stand on their own; a bundle reset loses every
   open fence (`$MQTT_teardown` recreated ALONE used to do the same and was the sharper
   case — F-066's enforcement refuses it as of 2026-09-01). A finish that outruns
   the survivor broker's own
@@ -251,7 +252,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   early return ... or one persistent corrupt claim would disable them account-wide,
   forever, on evidence about a different resource class". The reference walk now
   reports the affine half indeterminate **separately from a fatal failure**: an
-  affine-pair failure skips affine claim reconciliation and affine consumer deletion
+  affine-pair failure suppresses `reconcileOrphanQ2AffClaims` (and, until F-036 course E
+  removed it, affine consumer deletion)
   while inbound holds, in-flight registers and PUBREL consumers keep being reclaimed
   (that record's identity and generation are sound, so their references are
   complete); only a record whose identity cannot be established still aborts the
@@ -639,8 +641,10 @@ further findings it surfaced are filed separately, for the reason its own bullet
   reaped on a copy-absence reading taken before its own `SourceAcked` transition). Three
   more sort onto **F-036**: the contender's discard arm, and — corrected during review —
   the sweep's by-name affine consumer delete, whose window a resuming session's ADOPTION
-  reaches only when that session is resident while its record is absent. The
-  different-generation arm is **settled**, and a lost sweep-delete response is a bounded
+  reached only when that session was resident while its record was absent. **That delete
+  was REMOVED by F-036 course E (2026-09-01), so its manifestation is dissolved rather
+  than open.** The
+  different-generation arm is **settled**, and a lost sweep-delete response was a bounded
   delay that converges. The four in-code "F-033, unaudited" markers across three sites
   now state the answer, and three further sites that asserted something the audit
   falsified are corrected too. Holistic review then found one more, filed as **F-066**:
@@ -1503,8 +1507,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   JetStream's atomic batches are per-stream, so no claim-side state can arbitrate a
   copy-side store. A copy stranded by an attempt that crashed, whose delete was
   unconfirmed either definitely or indeterminately, or whose final claim reading was
-  indeterminate, is bounded by ordinary teardown, a later orphan-sweep consumer
-  deletion, or the gate's superseded-incarnation disposal, and is otherwise retained.
+  indeterminate, is bounded by ordinary teardown or the gate's superseded-incarnation
+  disposal, and is otherwise retained. (A later orphan-sweep consumer deletion was a third
+  bound until F-036 course E removed it.)
   Stated in `docs/CONFORMANCE.md`. Also refuted and recorded so none returns: a
   `storing` phase marker, an owner-independent disposal on claim absence, a reaper-side
   cleanup, and two compensation designs keyed on which CAS failed.
@@ -1675,7 +1680,20 @@ further findings it surfaced are filed separately, for the reason its own bullet
   in `docs/CONFORMANCE.md`.
 
   - [ ] [F-036: Revalidate quiet resident-session
-  ownership](findings/ha-arbitration.md#f-036). **Alpha blocker. ATTEMPTED BY CONSTRUCTION
+  ownership](findings/ha-arbitration.md#f-036). **Alpha blocker. Course E LANDED
+  2026-09-01; the box STAYS OPEN and the reason is stated here so a reader does not mistake
+  a landed course E for a closed finding.** What landed is one deletion —
+  `deleteOrphanQ2AffConsumers`, so the sweep's candidate-reclamation route no longer infers
+  affine-consumer deletion from ABSENCE — which removes two of the ten destructive decisions
+  and dissolves F-033's adoption blind spot. Read that scope exactly: teardown-marker
+  adoption still reaches `deleteTeardownTargets`, so a sweep pass can still CAUSE an
+  affine consumer delete, and that pre-existing route is not claimed race-free — it is a
+  manifestation this finding keeps, recorded in the dossier. What remains, and is the whole
+  of why this is still a blocker: the **incarnation
+  admission invariant** (including the single-broker clear-to-bind silent loss of an
+  acknowledged QoS 2 message), the **two-dimensional classifier** whose identity
+  prerequisite is unproved, and **sites 1 and 3**. Nothing in course E touched any of them.
+  Lane `~/.claude/lanes/f-036-course-e/`. **ATTEMPTED BY CONSTRUCTION
   AND STOPPED UNRESOLVED 2026-08-27**, after three plan-review rounds and two scope
   consults. **No implementation code was written**: the only working-tree changes the attempt
   produced are this documentation filing and the `RWID` comment correction it propagates.
@@ -1818,9 +1836,16 @@ further findings it surfaced are filed separately, for the reason its own bullet
   dissolved and the prerequisite was met. **Gate-relevant outcome only; the dossier is
   canonical for the mechanism, the evidence and the refuted designs.**
 
-  - **Q2 is SETTLED**: course E — delete `deleteOrphanQ2AffConsumers` outright — is the
-    decided remedy, **not yet implemented**. Its accepted price is a permanent unbounded
-    affine-consumer leak.
+  - **Q2 is SETTLED and has LANDED 2026-09-01**: course E — delete
+    `deleteOrphanQ2AffConsumers` outright — is implemented, with the transitively dead
+    `mqttQ2AffGenerationSettled`, `mqttQuarantineConsumerKey`, `mqttParseQ2AffDurable` and
+    `mqttSessRefs.affDurables` removed with it. Its accepted price is **larger than this
+    bullet first recorded**, and implementation measured it: not a consumer leak but an
+    unbounded CORRELATED leak of the consumer, its interest-retained copies, and the claims
+    whose copies remain present — `reapable` requires copy absence as well as `SourceAcked`,
+    and the removed step 6 is what used to supply it. Plus a class the plan review added:
+    every authorized cleanup route that FAILS after dropping its reference has no retry
+    anchor. Stated in `docs/CONFORMANCE.md`. **This does not close the box** — see below.
   - **Q1 is CONDITIONALLY PROVED**: the sequence classifier holds, so **historical
     per-generation watermark state is NOT required**; its identity prerequisite is not
     proved, and that is what blocks planning.
@@ -1833,8 +1858,12 @@ further findings it surfaced are filed separately, for the reason its own bullet
     even if multi-frontend HA scope were ever reconsidered.
   - **Scope wording:** read "ONE executable item" below as **one completion item**, not one
     atomic commit. The assembled work is two units — the incarnation admission invariant,
-    then the classifier with sites 1 and 3 and course E on top of it — and the first is the
-    second's foundation with nothing thrown away between them.
+    then the classifier with sites 1 and 3 — and the first is the
+    second's foundation with nothing thrown away between them. Course E was grouped with
+    the second unit and a 2026-09-01 consult established that the grouping was **not** a
+    code dependency: the sweep runs outside any client packet route or incarnation
+    admission, and deleting its consumer route leaves nothing awaiting the invariant's
+    authorization. It therefore landed on its own, ahead of both units.
   - §0.5's comment-corpus sweep gains a sixth family from this attempt.
 
   Working lane `~/.claude/lanes/f-036-preplan/` holds four plan revisions, the ledger with
@@ -1843,11 +1872,13 @@ further findings it surfaced are filed separately, for the reason its own bullet
 
   **The order below is HISTORICAL and SUPERSEDED by the 2026-09-01 attempt above.** Both
   of its pre-plan questions are now answered — the classifier is proved conditionally and
-  (a) is decided as course E — so a third attempt must NOT re-run them and must not choose
-  a positive authorization for the affine consumer delete: every one was refused, and the
+  (a) is decided as course E, which has since LANDED — so a third attempt must NOT re-run
+  them and must not choose
+  a positive authorization for the affine consumer delete: every one was refused, the route
+  is now GONE rather than guarded, and the
   "independently terminal" definition it calls owed is DISCHARGED by the existing
-  `mqttQ2AffClaim.terminal()`. **The current gate is: course E is fixed but unimplemented,
-  and planning is blocked on the identity/lifecycle property and its route audit.** The
+  `mqttQ2AffClaim.terminal()`. **The current gate is: course E has landed, and planning for
+  everything else is blocked on the identity/lifecycle property and its route audit.** The
   text is kept because (b) through (e) are unchanged and still owed.
   *Superseded — the order this was attempted in, ruled 2026-08-31.* F-066's enforcement
   lands first, which dissolves OPEN 1. Then a BOUNDED pre-plan investigation settles exactly
@@ -2951,6 +2982,39 @@ finding with acceptance criteria.
   argument: a grep-shaped sweep will keep returning one more instance. **F-084 cross-links
   family 2
   only**, and stays scoped to successor evidence.
+  *A worked precedent, 2026-09-01, and it is NOT a seventh family owed here.* F-036's
+  course E
+  had its own claim class — "the orphan sweep will later collect an unreferenced affine
+  consumer", asserted in production comments, an OPERATOR-VISIBLE error message, two census
+  dispositions, four documents and two preserved finding records. It was closed **within that
+  change**, so nothing is owed here for it. What is worth reusing is the method, because three
+  review rounds each named one more site a hand list had missed and the reviewer then ruled
+  that "manual enumeration is the wrong instrument for exact identifiers": a **zero-match
+  symbol closure** over the removed identifiers (including test-only ones, or a dead helper
+  survives it), plus a **generated prose review set** from a normalized term list with every
+  match dispositioned. Term breadth had to be MEASURED rather than argued — an unbounded
+  `Q2Aff` matched 3362 lines and made the set unusable, while word-bounded `\bQ2Aff\b` plus
+  the durable prefix `Q2AFF` kept it at 761 across 54 files. That is family 5's lesson made
+  mechanical, and it is the shape this item should take.
+
+- [ ] **Re-census F-033's claim-transition and claim-reap route inventory from the tree.**
+  Filed 2026-09-01 by F-036 course E's second holistic review round, which caught the
+  attempt to update the totals by SUBTRACTING from them. **Not an alpha blocker**: it is
+  a documentation inventory, and every mechanical claim resting on it (the fenced/unfenced
+  split, the F-065 TOCTOU-in-the-primitive argument) is unaffected by the count.
+  *Why it needs redoing rather than adjusting:* the per-site totals and line numbers in
+  `docs/findings/ha-arbitration.md`'s "What the audit did NOT find" census were
+  **already wrong before course E**. Measured at filing: the reap class has **17 direct
+  production call sites** — five in `orphan_qos2_sweep.go`, eleven in
+  `qos2_shared_affine.go`, and **one in `mqtt.go`'s PUBREL/PUBCOMP discharge path that the
+  enumeration never listed at all** — against a stated twelve, and the cited line numbers
+  do not resolve (`qos2_shared_affine.go:1727` is blank at `4afa533`). Course E removed
+  one reap site and one transition site and recorded only that MECHANICAL delta, marking the
+  totals stale rather than restating them.
+  *How to close it:* enumerate from the tree, disposition every site, and prefer a check that
+  cannot drift — the affine consumer delete count in the same census IS verifiable by
+  `deleteConsumer(mqttOutStreamName, ...)` and was verified that way, which is the model.
+  A lineage or TOCTOU audit must not trust the current numbers.
 
 These do not block the alpha unless investigation shows that ordinary broker
 operation can trigger correctness loss or unbounded resource growth.

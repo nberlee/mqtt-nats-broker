@@ -332,7 +332,6 @@ var censusInterpreters = map[string]string{
 	"q2AffSourceGone":                "infers whether a claim's source is authoritatively gone; a reused sequence after a recreation breaks this inference, which the census records",
 	"q2AffGroupConsumerGone":         "distinguishes a destroyed group consumer from an absent delivery",
 	"recoverQ2AffineStorageConflict": "resolves a storage conflict on the affine path without assuming which writer won",
-	"deleteOrphanQ2AffConsumers":     "deletes an orphaned affine consumer by name after a record re-read and an INSTANCE check, whose blind spot for a resuming session F-033's audit recorded",
 	"finishQ2AffineUnwind":           "deletes the affine resources only after a record that no longer names them is persisted",
 	"settleRetiredAffineRegister":    "resolves the retired affine register triple, deleting the register LAST because it is the only proof of that licence",
 
@@ -391,7 +390,7 @@ var censusInterpreters = map[string]string{
 	// ---- orphan reconciliation ---------------------------------------------
 	"sweepOrphanedQoS2State":            "the orphan pass over inbound QoS 2 state; authoritative over persisted records and this broker's residents, explicitly not over a session live elsewhere",
 	"sweepOrphanedConsumersBefore":      "the orphan pass over consumers, whose exact-sequence revalidation protects reoccupation but not a remote live owner; the eligibility cutoff is a parameter so a test can reach the pass at all, and an unreadable record ABORTS it rather than being skipped, since the walk deletes by absence of a reference",
-	"deleteOrphanPubRelConsumers":       "deletes an orphaned PUBREL consumer by name, behind the same instance check as the affine one",
+	"deleteOrphanPubRelConsumers":       "deletes an orphaned PUBREL consumer by name, behind a complete reference walk, a grace, a final record re-read and an instance re-lookup. It is the only consumer class this pass reclaims from a CANDIDATE LISTING — the affine one was removed by F-036 course E, because no positive fact could authorize it — though teardown-marker adoption still reaches deleteTeardownTargets, which deletes an affine durable",
 	"enumerateInflightSubjectsBounded":  "the reap's enumeration, returning the subject set AND the watermark that bounds what the pass may destroy; the resume walk's own enumeration discards that watermark because it removes nothing by filter",
 	"loadInflightRecordsMulti":          "the reap's batched register read, kept separate from the resume walk's batching because the window the reap must get right lies between the enumeration and this load",
 	"deleteInflightRegistersPipelined":  "the reap's bounded-concurrency confirmed deletes, aggregating failures so a partial pass reports that it was partial — the teardown must not release the record while any register of unknown status remains",

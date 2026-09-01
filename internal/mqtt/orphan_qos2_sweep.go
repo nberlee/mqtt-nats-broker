@@ -5,10 +5,17 @@
 //
 //   - an inbound QoS 2 hold record on $MQTT_qos2in whose session record is gone,
 //     together with the sibling release claim that arbitrates it;
-//   - a session-affine $MQTT_Q2AFF_* consumer on $MQTT_out whose session record is
-//     gone; and
 //   - an assignment claim on $MQTT_qos2assign whose winner generation no longer
-//     exists and which no contender happens to revisit.
+//     exists and which no contender happens to revisit; and
+//   - an orphaned $MQTT_PUBREL_* consumer on $MQTT_out.
+//
+// A session-affine $MQTT_Q2AFF_* consumer is deliberately NOT in that list. It
+// accumulates too, and this file used to collect it, but no positive fact can
+// authorize the delete: the retirement watermark records the SESSION generation while
+// the consumer is keyed by an AFFINE generation that outlives incarnations, and
+// $MQTT_out is interest-retained, so a wrong delete destroys acknowledged QoS 2
+// payloads. F-036 course E removed that route rather than patching it; the leak is a
+// stated residual in docs/CONFORMANCE.md.
 //
 // None of them loses a message BY ACCUMULATING — a stalled claim is honored, never
 // released. A stale `discarded` marker among them no longer fences a LATER exchange's
@@ -46,9 +53,10 @@
 // the consequences per resource class belong to the findings that own those classes —
 // F-034 and F-036 — not to this comment. ($MQTT_qos2assign's class was F-033, whose audit
 // closed on 2026-08-18. What it found in THIS file is F-064, named at its site below
-// because it is a defect of ours rather than F-036's premise restated, plus one addition
-// to F-036 itself: the affine consumer delete's instance fingerprint does not discriminate
-// a session that ADOPTS the consumer, so it is not the defense it reads as.)
+// because it is a defect of ours rather than F-036's premise restated. F-033's other
+// addition — that the affine consumer delete's instance fingerprint does not discriminate
+// a session that ADOPTS the consumer — is HISTORICAL: that delete no longer exists, so the
+// bound stated here no longer has an affine-consumer consumer at all.)
 //
 // # What makes a deletion legal here
 //
@@ -108,11 +116,16 @@
 // re-read returns mqttQoS2VerifyHeld and the message is fanned out a second time
 // from a session that no longer exists.
 //
-// The affine side has the mirror-image rule: an assignment is committed Discarded
-// BEFORE its consumer is deleted (invariant 5). $MQTT_out is interest-retained, so
-// deleting the consumer first would drop the copies it still held while the claims
-// still described a live delivery — turning a session discard that MQTT 5.0 [4.8.2]
-// permits into a recorded Lost message.
+// The affine side has NO mirror-image rule, and that is the point. Invariant 5 used to
+// be "an assignment is committed Discarded BEFORE its consumer is deleted", ordering two
+// steps of a delete this pass no longer performs: F-036 course E removed the affine
+// consumer delete outright, so the invariant it needed is GONE rather than reordered.
+// $MQTT_out is interest-retained, which is why: deleting a consumer drops the copies it
+// holds, and no positive fact available here can authorize that — the retirement
+// watermark records the SESSION generation while the consumer is keyed by an AFFINE one
+// that outlives incarnations. What survives is the claim side alone, where
+// discardAbsentWinnerClaim may commit Discarded with NO delete following it, and the
+// retained consumer plus its copies are the accepted leak in docs/CONFORMANCE.md.
 //
 // # What this file deliberately does not do
 //
@@ -171,7 +184,7 @@ var (
 
 	// mqttQ2AffSweepMutationBudget bounds assignment CAS transitions per tick. It
 	// bounds MUTATIONS only: the inventory and session-reference scans that authorize
-	// a consumer deletion are never capped (invariant 13).
+	// a claim transition are never capped (invariant 13).
 	mqttQ2AffSweepMutationBudget = 256
 )
 
@@ -239,10 +252,10 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 		as.reconcileInboundQoS2(s, inbound, refs)
 	}
 
-	// Outbound in-flight registers. Ordered here rather than with the affine phases
-	// because it shares nothing with them: it needs no inventory, no second barrier
-	// and no ordering against a consumer delete. It does share the mutation budget,
-	// so one class cannot starve the others.
+	// Outbound in-flight registers. Ordered here rather than with the affine claim
+	// pass because it shares nothing with it: it needs no inventory and no second
+	// barrier. It does share the mutation budget, so one class cannot starve the
+	// others.
 	inflightBudget := mqttQ2AffSweepMutationBudget
 	if flerr != nil {
 		s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan ended: %v", flerr)
@@ -250,24 +263,26 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 		as.reconcileOrphanInflight(s, inflight, refs, &inflightBudget)
 	}
 
-	// A malformed claim aborts the whole affine INVENTORY, which is what protects every
-	// affine consumer from deletion during this pass — and nothing more than that. It is
-	// deliberately not an early return: the phases below that share nothing with the
+	// affineUsable suppresses exactly ONE pass, reconcileOrphanQ2AffClaims, on either
+	// of two causes: a malformed claim that aborted the assignment INVENTORY, or a
+	// session record whose affine pair cannot be interpreted. It is a conservative
+	// suppression rather than a positive authorization — since F-036 course E removed
+	// the affine consumer delete, no complete inventory is needed to license anything,
+	// and what the gate buys is that a per-claim transition is never written from a
+	// partial view. Note the scope precisely: the retired affine REGISTER arm in
+	// reconcileOrphanInflight can still mutate claims and is not behind this gate.
+	// It is deliberately not an early return: the phases that share nothing with the
 	// inventory keep running, or one persistent corrupt claim would disable them
 	// account-wide, forever, on evidence about a different resource class.
-	// The reference walk's affine half is the second, independent way this pass can
-	// lose the right to judge an affine resource: a record whose affine pair does not
-	// validate contributes no affine reference while the session it describes may own
-	// one. Same consequence as an incomplete inventory, same scope — affine only.
-	// Unlike an incomplete inventory it is PERMANENT (expiry refuses such a record
-	// too), so the warning names the operator action.
+	// Unlike an incomplete inventory an uninterpretable affine pair is PERMANENT
+	// (expiry refuses such a record too), so the warning names the operator action.
 	affineUsable := cerr == nil && affRefsBad == nil
 	if cerr != nil {
 		s.Warnf("MQTT orphaned QoS 2 sweep: assignment inventory incomplete, skipping affine reconciliation: %v", cerr)
 	}
 	if affRefsBad != nil {
 		s.Warnf("MQTT orphaned QoS 2 sweep: skipping affine reconciliation because a session record's "+
-			"affine pair cannot be interpreted, so nothing proves which affine consumers are still "+
+			"affine pair cannot be interpreted, so nothing proves which affine generations are still "+
 			"referenced: %v; this will not clear on its own — stop this account's brokers and recreate "+
 			"the bridge-owned JetStream state (the $MQTT_* streams). Every other class is unaffected "+
 			"and keeps being reclaimed", affRefsBad)
@@ -278,13 +293,10 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	}
 
 	if conserr != nil {
-		// This one IS fatal to both remaining phases: each judges a consumer against a
-		// listing, and there is none.
+		// Fatal to the PUBREL phase, which is the only remaining one that judges a
+		// consumer against a listing, and there is none.
 		s.Debugf("MQTT orphaned QoS 2 sweep: unable to list $MQTT_out consumers: %v", conserr)
 		return
-	}
-	if affineUsable {
-		as.deleteOrphanQ2AffConsumers(s, inventory, consumers, refs, &budget)
 	}
 
 	// PUBREL durables, from the same $MQTT_out listing. Nothing else revisits one: a
@@ -474,7 +486,6 @@ func mqttQuarantineTeardownKey(idHash string) string   { return "teardown|" + id
 func mqttQuarantineRetirementKey(idHash string) string { return "retire|" + idHash }
 func mqttQuarantinePubRelKey(durable string) string    { return "pubrel|" + durable }
 func mqttQuarantineAssignKey(subject string) string    { return "assign|" + subject }
-func mqttQuarantineConsumerKey(durable string) string  { return "q2aff|" + durable }
 func mqttQuarantineInflightKey(subject string) string  { return "inflight|" + subject }
 
 func mqttQuarantineSeqFP(seq uint64) string { return strconv.FormatUint(seq, 10) }
@@ -723,9 +734,8 @@ func (as *mqttAccountSessionManager) condemnRetiredSurvivors(s *Server) {
 // claims. Absence from it is the ONLY thing that makes a resource an orphan, so it
 // is built completely or not at all.
 type mqttSessRefs struct {
-	inbound     map[string]struct{} // (idHash, incarnation generation)
-	affine      map[string]struct{} // (idHash, Q2Aff generation)
-	affDurables map[string]struct{}
+	inbound map[string]struct{} // (idHash, incarnation generation)
+	affine  map[string]struct{} // (idHash, Q2Aff generation)
 	// pubRelDurables is the PUBREL consumer names a record or a local session
 	// claims: the persisted name verbatim, and — for a LOCAL session — the name
 	// derived from its (idHash, generation) unconditionally, because the consumer is
@@ -772,7 +782,7 @@ func (r *mqttSessRefs) hasAffine(idHash, gen string) bool {
 // are not, because such a record either names an affine generation that cannot be
 // interpreted or (the G7 shape) carries qos-2 memberships while naming none at all,
 // so a session that owns an affine consumer and outstanding claims would contribute
-// no reference to them. The caller therefore skips the affine phases and runs the
+// no reference to them. The caller therefore skips the affine CLAIM pass and runs the
 // rest — the same rule the affine claim INVENTORY already follows below, and for
 // the reason stated there: otherwise one persistent bad record disables every other
 // class account-wide, forever, on evidence about a different resource class. That
@@ -785,7 +795,6 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, aff
 	refs = &mqttSessRefs{
 		inbound:        make(map[string]struct{}),
 		affine:         make(map[string]struct{}),
-		affDurables:    make(map[string]struct{}),
 		pubRelDurables: make(map[string]struct{}),
 	}
 
@@ -798,10 +807,6 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, aff
 	for _, sess := range sesss {
 		sess.mu.Lock()
 		idHash, gen, affGen := sess.idHash, sess.gen, sess.q2AffGen
-		var affDur string
-		if sess.q2AffConsumer != nil {
-			affDur = sess.q2AffConsumer.Durable
-		}
 		var pubRelDur string
 		if sess.pubRelConsumer != nil {
 			pubRelDur = sess.pubRelConsumer.Durable
@@ -823,11 +828,6 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, aff
 		}
 		if affGen != _EMPTY_ {
 			refs.affine[mqttSessRefKey(idHash, affGen)] = struct{}{}
-			_, _, dur := mqttQ2AffineNames(idHash, affGen)
-			refs.affDurables[dur] = struct{}{}
-		}
-		if affDur != _EMPTY_ {
-			refs.affDurables[affDur] = struct{}{}
 		}
 	}
 
@@ -852,7 +852,7 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, aff
 			return nil, nil, fmt.Errorf("%w: session record on %q at sequence %d is undecodable: %w",
 				errMQTTSessRecordUninterpretable, smsg.Subject, smsg.Sequence, uerr)
 		}
-		// The identity half is fatal; the affine half only disables the affine phases.
+		// The identity half is fatal; the affine half only disables the affine claim pass.
 		if getHash(ps.ID) != idHash {
 			return nil, nil, fmt.Errorf("%w: session record on %q names a client ID that does not hash back to it",
 				errMQTTSessRecordUninterpretable, smsg.Subject)
@@ -882,11 +882,6 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, aff
 		}
 		if ps.Q2AffGen != _EMPTY_ {
 			refs.affine[mqttSessRefKey(idHash, ps.Q2AffGen)] = struct{}{}
-			_, _, dur := mqttQ2AffineNames(idHash, ps.Q2AffGen)
-			refs.affDurables[dur] = struct{}{}
-			if ps.Q2Aff != nil {
-				refs.affDurables[ps.Q2Aff.Durable] = struct{}{}
-			}
 		}
 	}
 }
@@ -955,8 +950,9 @@ func mqttValidateRecordAffinePair(ps *mqttPersistedSession, idHash string) error
 // step was weaker than the snapshot it was re-verifying. A record whose ID does not
 // hash back to its subject, or whose affine pair is inconsistent, would then take
 // the "valid record for a different generation" path and be read as PROOF OF
-// ABSENCE: a live assignment discarded, or a referenced consumer deleted with its
-// interest-retained copies. Uninterpretable must mean indeterminate everywhere.
+// ABSENCE, and a live assignment would be discarded on it. (It could once also delete a
+// referenced consumer with its interest-retained copies; F-036 course E removed that
+// route.) Uninterpretable must mean indeterminate everywhere.
 func mqttValidateSessionRecord(ps *mqttPersistedSession, idHash string) error {
 	if getHash(ps.ID) != idHash {
 		return fmt.Errorf("record names a client ID that does not hash back to %q", idHash)
@@ -2058,14 +2054,15 @@ type mqttQ2AffInvEntry struct {
 
 // validateOrphanQ2AffClaim is the SWEEP-ONLY validator: every identity a claim
 // carries must be derivable from the two things that key it, so the sweep can trust
-// a claim's copy subject and associate it with a consumer.
+// a claim's copy subject.
 //
 // Deliberately not part of mqttQ2AffClaimIdentityOK. That predicate gates a session
 // resume and clear(), where an abort has account-wide consequences; these checks
 // are derivations from naming helpers, so a future change to mqttQ2AffineNames or
 // mqttQ2AffCopySubject would retroactively invalidate every stored claim. Inside the
-// sweep that costs one deferred pass and protects every affine consumer from
-// deletion; inside clear() it would be an account-wide teardown outage. Any change
+// sweep that costs one deferred pass and keeps a claim transition from being written
+// on an unverifiable identity; inside clear() it would be an account-wide teardown
+// outage. Any change
 // to those naming helpers must be coordinated with this validator.
 func validateOrphanQ2AffClaim(subject string, c *mqttQ2AffClaim) error {
 	if want := mqttQ2AffClaimSubject(c.GroupDurable, c.SourceSeq); subject != want {
@@ -2112,9 +2109,9 @@ func validateOrphanQ2AffClaim(subject string, c *mqttQ2AffClaim) error {
 }
 
 // collectQ2AffInventory returns EVERY assignment claim in the account, or an error.
-// Never partial and never capped: a consumer deletion is authorized by the absence
-// of an unreconciled claim, and absence taken from a capped view is not absence
-// (invariant 13).
+// Never partial and never capped: absence taken from a capped view is not absence
+// (invariant 13). It no longer authorizes a consumer deletion — F-036 course E removed
+// that route — but a per-claim transition must still not be written from a partial view.
 func (as *mqttAccountSessionManager) collectQ2AffInventory() ([]*mqttQ2AffInvEntry, error) {
 	var out []*mqttQ2AffInvEntry
 	err := as.scanQ2AffClaimRecords(func(claim *mqttQ2AffClaim, smsg *StoredMsg) error {
@@ -2309,212 +2306,6 @@ func (as *mqttAccountSessionManager) discardAbsentWinnerClaim(s *Server, e *mqtt
 }
 
 // ---------------------------------------------------------------------------
-// Affine consumers, last
-// ---------------------------------------------------------------------------
-
-// deleteOrphanQ2AffConsumers removes $MQTT_Q2AFF_* consumers on $MQTT_out that no
-// session record references — but only once every assignment they own is durably
-// terminal.
-//
-// The ordering is the central acceptance condition of this whole file. $MQTT_out is
-// interest-retained, so deleting the consumer drops the copies it still holds.
-// Doing that while a claim still described a live delivery would convert a session
-// discard MQTT 5.0 [4.8.2] permits into a recorded Lost message — laundering a
-// permitted death into a compliance failure, and in the other direction erasing the
-// distinction the write order of AffineDone exists to preserve.
-func (as *mqttAccountSessionManager) deleteOrphanQ2AffConsumers(s *Server, inv []*mqttQ2AffInvEntry,
-	consumers []*ConsumerInfo, refs *mqttSessRefs, budget *int) {
-
-	type affCand struct {
-		durable string
-		idHash  string
-		gen     string
-		created time.Time // the exact consumer instance quarantine observed
-	}
-	grace, q := as.orphanGrace(), as.quarantine()
-	var candidates []affCand
-	for _, ci := range consumers {
-		if ci == nil || ci.Config == nil {
-			continue
-		}
-		if !strings.HasPrefix(ci.Name, mqttQ2AffineConsumerDurablePrefix) {
-			continue // not ours to judge (and deliberately NOT $MQTT_PUBREL_*)
-		}
-		idHash, gen, perr := mqttParseQ2AffDurable(ci.Name)
-		if perr != nil {
-			s.Warnf("MQTT orphaned QoS 2 sweep: retaining affine consumer %q: %v", ci.Name, perr)
-			continue
-		}
-		if verr := mqttValidateQ2AffineNames(ci.Config, idHash, gen); verr != nil {
-			s.Warnf("MQTT orphaned QoS 2 sweep: retaining affine consumer %q: %v", ci.Name, verr)
-			continue
-		}
-		if refs.hasAffine(idHash, gen) {
-			q.forget(mqttQuarantineConsumerKey(ci.Name))
-			continue
-		}
-		if _, ok := refs.affDurables[ci.Name]; ok {
-			q.forget(mqttQuarantineConsumerKey(ci.Name))
-			continue
-		}
-		// Created is a FINGERPRINT here, never an age: a recreated consumer of the same
-		// name carries a different one and restarts the wait.
-		fp := strconv.FormatInt(ci.Created.UnixNano(), 10)
-		if !q.observedOrphanFor(mqttQuarantineConsumerKey(ci.Name), fp, grace) {
-			continue
-		}
-		candidates = append(candidates, affCand{durable: ci.Name, idHash: idHash, gen: gen, created: ci.Created})
-	}
-
-	for _, cand := range candidates {
-		// (1) Every assignment this generation owns, from the COMPLETE inventory.
-		owned := make([]*mqttQ2AffInvEntry, 0, 4)
-		young := false
-		for _, e := range inv {
-			if !e.claim.ownedBy(cand.idHash, cand.gen) {
-				continue
-			}
-			// The owned assignment must itself be settled; reconcileOrphanQ2AffClaims
-			// observed it earlier in this same pass.
-			if !q.observedOrphanFor(mqttQuarantineAssignKey(e.subject), mqttQuarantineSeqFP(e.seq), grace) {
-				young = true
-				break
-			}
-			owned = append(owned, e)
-		}
-		if young {
-			continue // a young assignment protects its otherwise-old consumer
-		}
-
-		// (2) Commit Discarded on each, recording a positive result per exact identity.
-		// An exhausted budget or an unresolved transition retains the consumer: "not
-		// visited this tick" may never become "owns no unreconciled claim".
-		stalled := false
-		for _, e := range owned {
-			if e.claim.Discarded || e.claim.Lost {
-				continue
-			}
-			if *budget <= 0 {
-				stalled = true
-				break
-			}
-			*budget--
-			// No nonce: the generation's consumer is being deleted, a session fact.
-			if _, _, aerr := as.advanceQ2AffClaim(e.subject, cand.idHash, cand.gen, _EMPTY_, _EMPTY_,
-				func(c *mqttQ2AffClaim) { c.Discarded = true }); aerr != nil {
-				stalled = true
-				break
-			}
-		}
-		if stalled {
-			continue
-		}
-
-		// (3) A second COMPLETE inventory as a verification barrier — not as a source
-		// of absence from a capped view. A claim created since step 1, or one still not
-		// durably discarded, retains the consumer.
-		verify, verr := as.collectQ2AffInventory()
-		if verr != nil {
-			s.Debugf("MQTT orphaned QoS 2 sweep: verification scan failed, retaining affine consumer %q: %v", cand.durable, verr)
-			continue
-		}
-		if !mqttQ2AffGenerationSettled(verify, cand.idHash, cand.gen) {
-			continue
-		}
-
-		// (4) Final revalidation: a session that reappeared owns its consumer again.
-		//
-		// Note what the two negative outcomes below do and do not establish, because this
-		// step authorizes an irreversible delete of an interest-retained consumer. A record
-		// for a DIFFERENT generation establishes that ownership MOVED; it does not
-		// establish that the previous generation stopped serving, which F-036 explicitly
-		// permits it to keep doing. An ABSENT record is the bounded absence the file header
-		// defines. F-033's audit has since answered what deleting this consumer costs, and
-		// the two readings do NOT get the same answer. An ABSENT record rests on F-036's
-		// false-absence premise. A valid DIFFERENT-generation record is settled on the
-		// clean-start route — teardown marks every assignment of the retiring generation
-		// Discarded before deleting its consumer — and only an obsolete previous owner
-		// still serving after the move re-enters F-036. The audit's own addition is that
-		// step (5) below is
-		// NOT a second line of defense here: a session that resumes between these two steps
-		// ADOPTS this consumer rather than recreating it, because provisioning is a
-		// create-or-update, so ConsumerInfo.Created is unchanged and the instance check
-		// passes while the delete destroys a LIVE session's copies. The resulting state — a
-		// live matching record whose affine consumer is gone — is also F-064's precondition.
-		// See F-036's "adoption blind spot" in docs/findings/ha-arbitration.md.
-		ps, _, serr := as.loadFenceSession(cand.idHash)
-		if serr != nil {
-			continue
-		}
-		if ps != nil {
-			if ps.Q2AffGen == cand.gen {
-				continue // returned, or indeterminate
-			}
-			// As in discardAbsentWinnerClaim: a record that appeared after the reference
-			// walk has not been validated by it, and this re-read is what authorizes the
-			// delete. A malformed-but-LIVE record may well reference this consumer, so it
-			// must never be read as evidence that nothing does.
-			if verr := mqttValidateSessionRecord(ps, cand.idHash); verr != nil {
-				continue
-			}
-			if ps.Q2Aff != nil && ps.Q2Aff.Durable == cand.durable {
-				continue
-			}
-		}
-
-		// (5) Re-verify the consumer is still the INSTANCE quarantine observed. A
-		// durable deleted and recreated under the same name since the listing is a
-		// different consumer holding different copies — and recreation is precisely
-		// what the grace exists to protect, since a peer provisions the affine consumer
-		// BEFORE saving the record that references it. Deleting by name alone would
-		// destroy that peer's fresh consumer inside the very window the wait covers,
-		// because the candidate still carries the previous instance's fingerprint.
-		ci, lerr := as.jsa.lookupConsumer(mqttOutStreamName, cand.durable)
-		if lerr != nil || ci == nil || ci.Config == nil {
-			continue // gone, or unreadable: nothing to delete, and absence is not proven
-		}
-		if !ci.Created.Equal(cand.created) {
-			// A different instance. Its own wait starts from the next listing.
-			continue
-		}
-		if verr := mqttValidateQ2AffineNames(ci.Config, cand.idHash, cand.gen); verr != nil {
-			s.Warnf("MQTT orphaned QoS 2 sweep: retaining affine consumer %q: %v", cand.durable, verr)
-			continue
-		}
-
-		// (6) Only now.
-		if _, derr := as.jsa.deleteConsumer(mqttOutStreamName, cand.durable, false); isErrorOtherThan(derr, JSConsumerNotFoundErr) {
-			s.Warnf("MQTT orphaned QoS 2 sweep: unable to delete orphaned affine consumer %q: %v", cand.durable, derr)
-			continue
-		}
-		s.Debugf("MQTT orphaned QoS 2 sweep: deleted orphaned affine consumer %q", cand.durable)
-		q.forget(mqttQuarantineConsumerKey(cand.durable))
-
-		// (7) The copies are gone with the consumer, so the assignments that were
-		// waiting only on an authoritatively absent copy can finish now.
-		for _, e := range owned {
-			as.reapQ2AffClaim(s, e.subject)
-			as.forgetIfQ2AffClaimGone(e.subject)
-		}
-	}
-}
-
-// mqttQ2AffGenerationSettled reports whether every assignment the verification scan
-// attributes to this generation is durably terminal — Discarded, or the Lost record
-// that is terminal and permanently retained.
-func mqttQ2AffGenerationSettled(inv []*mqttQ2AffInvEntry, idHash, gen string) bool {
-	for _, e := range inv {
-		if !e.claim.ownedBy(idHash, gen) {
-			continue
-		}
-		if !e.claim.Discarded && !e.claim.Lost {
-			return false
-		}
-	}
-	return true
-}
-
-// ---------------------------------------------------------------------------
 // PUBREL durables
 // ---------------------------------------------------------------------------
 
@@ -2522,7 +2313,7 @@ func mqttQ2AffGenerationSettled(inv []*mqttQ2AffInvEntry, idHash, gen string) bo
 // session record and no local session references.
 //
 // Nothing else has ever revisited one. sweepOrphanedConsumers lists $MQTT_msgs only,
-// this file's affine pass drops every name without the affine prefix, and the
+// this file no longer judges affine consumers at all (F-036 course E), and the
 // reference snapshot had no PUBREL class at all — so a consumer created just before
 // the record save that names it (mqtt.go, ensurePubRelConsumerSubscription) is
 // unreferenced forever if its broker dies in between, and it holds the
@@ -2535,8 +2326,8 @@ func mqttQ2AffGenerationSettled(inv []*mqttQ2AffInvEntry, idHash, gen string) bo
 //
 // Two windows are NARROWED and not closed, because a JetStream consumer delete is by
 // name and unconditioned: a record save can land after the final re-read, and the
-// durable can be deleted and recreated after the instance re-lookup. That is the same
-// bound the affine reaper has (docs/CONFORMANCE.md); the resume-side verify-and-recreate
+// durable can be deleted and recreated after the instance re-lookup. Both are stated in
+// docs/CONFORMANCE.md; the resume-side verify-and-recreate
 // (ensurePubRelConsumerSubscription) bounds the damage to the PUBRELs the consumer
 // held.
 func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, consumers []*ConsumerInfo, refs *mqttSessRefs) {
@@ -2561,9 +2352,9 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 			continue
 		}
 		// A consumer whose config does not match its own name is not ours to judge, at
-		// this site or the pre-delete one below. Same rule, and same reason, as the
-		// affine class: the name is what attributes it, so a mismatch means we cannot
-		// say whose delivery path this is.
+		// this site or the pre-delete one below. The name is what attributes it, so a
+		// mismatch means we cannot say whose delivery path this is. (The removed affine
+		// class had the same rule for the same reason; this one no longer mirrors it.)
 		if verr := mqttValidatePubRelNames(ci.Config, idHash, gen); verr != nil {
 			s.Warnf("MQTT orphaned QoS 2 sweep: retaining PUBREL consumer %q: %v", ci.Name, verr)
 			continue
@@ -2639,8 +2430,8 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 // mqttParsePubRelDurable splits a PUBREL consumer durable back into the identity it
 // was built from ("$MQTT_PUBREL_<idHash>_<generation>"), requiring the exact shape
 // mqttPubRelNames produces. The separator is "_", which neither a hash nor a
-// generation can contain, so the split is unambiguous. Counterpart of
-// mqttParseQ2AffDurable; anything else is not ours to judge.
+// generation can contain, so the split is unambiguous. Anything else is not ours
+// to judge.
 func mqttParsePubRelDurable(durable string) (idHash, gen string, err error) {
 	rest := strings.TrimPrefix(durable, mqttPubRelConsumerDurablePrefix)
 	if len(rest) != sysHashLen+1+mqttSessGenLen || rest[sysHashLen] != '_' {
@@ -2652,25 +2443,6 @@ func mqttParsePubRelDurable(durable string) (idHash, gen string, err error) {
 	}
 	if !mqttValidSessGen(gen) {
 		return _EMPTY_, _EMPTY_, fmt.Errorf("durable carries a malformed incarnation generation token %q", gen)
-	}
-	return idHash, gen, nil
-}
-
-// mqttParseQ2AffDurable splits an affine consumer durable back into the identity it
-// was built from ("$MQTT_Q2AFF_<idHash>_<generation>"), requiring the exact shape
-// mqttQ2AffineNames produces. The separator is "_", which neither a hash nor a
-// generation can contain, so the split is unambiguous.
-func mqttParseQ2AffDurable(durable string) (idHash, gen string, err error) {
-	rest := strings.TrimPrefix(durable, mqttQ2AffineConsumerDurablePrefix)
-	if len(rest) != sysHashLen+1+mqttQ2AffGenLen || rest[sysHashLen] != '_' {
-		return _EMPTY_, _EMPTY_, fmt.Errorf("durable does not have the affine consumer shape")
-	}
-	idHash, gen = rest[:sysHashLen], rest[sysHashLen+1:]
-	if !mqttValidIDHashToken(idHash) {
-		return _EMPTY_, _EMPTY_, fmt.Errorf("durable carries a malformed client-ID hash token %q", idHash)
-	}
-	if !mqttValidQ2AffGen(gen) {
-		return _EMPTY_, _EMPTY_, fmt.Errorf("durable carries a malformed affine generation token %q", gen)
 	}
 	return idHash, gen, nil
 }

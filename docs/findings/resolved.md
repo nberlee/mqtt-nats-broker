@@ -546,6 +546,21 @@ shared QoS 2 adds…
 - Release treatment: Completed
 - Original roadmap order: 12
 
+### Partially SUPERSEDED by F-036 course E
+
+**Appended rather than rewritten**, because the record below is preserved as written.
+
+This item delivered reaping for the `$MQTT_Q2AFF_*` consumer class among others, and
+**that half has since been removed**. F-036 course E deleted
+`deleteOrphanQ2AffConsumers` outright: no positive fact can authorize a by-name delete of
+an interest-retained consumer, since the retirement watermark records the session
+generation while the consumer is keyed by an affine generation that outlives incarnations.
+The ordering and grace this record describes for that class therefore no longer exist.
+
+Everything else this item delivered stands: inbound QoS 2 hold records, assignment claims,
+the inbound release claims, and the orphaned PUBREL durable class are all still reaped.
+The accepted cost of the removal is in `docs/CONFORMANCE.md`.
+
 ### Original finding record
 
 - [x] Reap orphaned inbound QoS 2 hold records, the two structures session-affine

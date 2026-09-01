@@ -1915,8 +1915,11 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 			}
 		}
 		if minted {
-			// Nothing durable ever referenced this generation, so dropping it leaves
-			// no orphan; keeping it would pin the session to a half-built identity.
+			// No RECORD ever referenced this generation, so dropping the in-memory
+			// identity strands nothing a reader could find; keeping it would pin the
+			// session to a half-built identity. The CONSUMER is a different matter —
+			// see the delete below.
+
 			sess.q2AffGen = _EMPTY_
 			sess.q2AffConsumer = nil
 			sess.q2AffDeliverySubject = _EMPTY_
@@ -1924,8 +1927,13 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 		}
 		sess.mu.Unlock()
 		if minted {
+			// The in-memory generation has just been cleared, so this is the ONLY
+			// attempt and no later route can name this consumer: since F-036 course E
+			// the sweep does not collect it either. A failure here is permanent, and is
+			// the no-retry-anchor residual in docs/CONFORMANCE.md.
 			if _, err := sess.jsa.deleteConsumer(mqttOutStreamName, durable, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-				c.Warnf("Unable to roll back affine QoS 2 consumer %q: %v", durable, err)
+				c.Warnf("Unable to roll back affine QoS 2 consumer %q, and nothing will retry it; "+
+					"it is retained and must be removed by hand: %v", durable, err)
 			}
 		}
 	}
@@ -4341,9 +4349,9 @@ func (sess *mqttSession) discardQ2AffineUnwindClaims(u mqttQ2AffUnwind) error {
 // have been terminated first — $MQTT_out is interest-retained, so the delete
 // takes any copies with it — while the subscription and the charge belong to a
 // path this session has already stopped owning, and nothing else can ever reach
-// them: they are not on the record, and the orphan sweep operates on consumers,
-// not on another broker's in-memory accounting. Stranding them leaks a slice of
-// mqttMaxAckTotalLimit for the life of the session.
+// them: they are not on the record, and no sweep reaches another broker's in-memory
+// accounting — nor, since F-036 course E, the consumer either. Stranding them leaks a
+// slice of mqttMaxAckTotalLimit for the life of the session.
 //
 // sess.mu not held on entry.
 func (sess *mqttSession) releaseQ2AffineUnwindLocally(c *client, u mqttQ2AffUnwind) {
@@ -4383,8 +4391,12 @@ func (sess *mqttSession) finishQ2AffineUnwind(c *client, u mqttQ2AffUnwind) {
 	if !u.charged {
 		return
 	}
+	// A failure here is TERMINAL for that consumer: this is the only attempt, the
+	// record no longer names it, and since F-036 course E no sweep collects it. See
+	// docs/CONFORMANCE.md's no-retry-anchor residual.
 	if _, err := sess.jsa.deleteConsumer(mqttOutStreamName, u.durable, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-		c.Errorf("Unable to delete the affine QoS 2 consumer %q of a rolled-back SUBSCRIBE: %v", u.durable, err)
+		c.Errorf("Unable to delete the affine QoS 2 consumer %q of a rolled-back SUBSCRIBE, and nothing will retry it; "+
+			"it is retained with any undelivered copies and must be removed by hand: %v", u.durable, err)
 	}
 }
 
@@ -4445,8 +4457,8 @@ func mqttRecordHasSharedQoS2(ps *mqttPersistedSession) bool {
 // becomes durable is the record as the FIRST filter loop serialized it: a session
 // naming this consumer and its generation. No membership this PACKET tried to add
 // can accompany it — shared memberships are persisted in a later loop, and every
-// save is refused while the session is unresolved — and the orphan sweep passes
-// over the consumer precisely because the record references it. Neither the
+// save is refused while the session is unresolved — and no sweep collects the
+// consumer in any case, since F-036 course E removed that route. Neither the
 // packet's unused-path unwind nor its rollback can reconcile it either: their own
 // confirming saves are refused for the same reason. Without this continuation the
 // path, its MaxAckPending charge and its consumer survive until the session is
@@ -4528,17 +4540,21 @@ func (sess *mqttSession) unwindProvisionedQ2AffineOnLanded(c *client, tok record
 	// dispose runs only once the record that no longer authorizes this generation
 	// is CONFIRMED. A failure to terminate the assignments stops short of the
 	// CONSUMER DELETE and of nothing else: $MQTT_out is interest-retained, so
-	// deleting it would take any copies with it, and the record no longer
-	// references it — which makes it the orphan sweep's, and the sweep
-	// grace-observes, claim-checks and revalidates before deleting. The LOCAL half
-	// is released either way: the delivery subscription and the MaxAckPending
-	// charge belong to a path this session no longer owns, they are reachable from
-	// nothing else once the record stops naming it, and the sweep cannot refund
-	// another broker's budget.
+	// deleting it would take any copies with it.
+	//
+	// That consumer is then PERMANENTLY UNCOLLECTED. This comment used to hand it to
+	// the orphan sweep; F-036 course E removed that route, and nothing replaced it —
+	// InactiveThreshold is deliberately zero and $MQTT_out refuses
+	// ConsumerLimits.InactiveThreshold. It is a stated residual in
+	// docs/CONFORMANCE.md: every authorized cleanup route that fails after dropping
+	// the reference has no retry anchor. The LOCAL half is released either way: the
+	// delivery subscription and the MaxAckPending charge belong to a path this session
+	// no longer owns, and they are reachable from nothing else once the record stops
+	// naming it.
 	dispose := func() {
 		if err := sess.discardQ2AffineUnwindClaims(u); err != nil {
 			sess.releaseQ2AffineUnwindLocally(c, u)
-			c.Errorf("MQTT: the unused affine QoS 2 path of %q is removed from its record but its assignments could not be terminated; releasing its subscription and budget and leaving the consumer %q to the orphan sweep: %v", sess.id, u.durable, err)
+			c.Errorf("MQTT: the unused affine QoS 2 path of %q is removed from its record but its assignments could not be terminated; releasing its subscription and budget, and RETAINING the consumer %q with its undelivered copies — nothing collects it, so it must be removed by hand once no session serves that affine generation: %v", sess.id, u.durable, err)
 			return
 		}
 		sess.finishQ2AffineUnwind(c, u)

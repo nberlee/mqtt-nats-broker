@@ -278,14 +278,6 @@ func (e *testOrphanEnv) settle(t *testing.T) {
 	e.sweepInbound(t)
 }
 
-// settleAffineConsumers is the same two-pass rule for the affine consumer path.
-func (e *testOrphanEnv) settleAffineConsumers(t *testing.T, budget int) {
-	t.Helper()
-	for i := 0; i < 3; i++ {
-		e.sweepAffineConsumers(t, budget)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Parsers and age policy
 // ---------------------------------------------------------------------------
@@ -338,10 +330,9 @@ func TestOrphanSweepParsesInboundSubjectsStrictly(t *testing.T) {
 	}
 }
 
-func TestOrphanSweepParsesSessionSubjectsAndAffineDurables(t *testing.T) {
+func TestOrphanSweepParsesSessionSubjects(t *testing.T) {
 	t.Parallel()
 	const hash = "abcd1234"
-	gen := nuid.Next()
 
 	for _, tc := range []struct {
 		name, subject, domainTk string
@@ -360,23 +351,6 @@ func TestOrphanSweepParsesSessionSubjectsAndAffineDurables(t *testing.T) {
 		}
 		if tc.ok && got != hash {
 			t.Fatalf("%s: hash = %q, want %q", tc.name, got, hash)
-		}
-	}
-
-	_, _, durable := mqttQ2AffineNames(hash, gen)
-	gotHash, gotGen, err := mqttParseQ2AffDurable(durable)
-	if err != nil || gotHash != hash || gotGen != gen {
-		t.Fatalf("round trip of %q gave (%q,%q,%v), want (%q,%q,nil)", durable, gotHash, gotGen, err, hash, gen)
-	}
-	for _, bad := range []string{
-		"$MQTT_Q2AFF_" + hash,
-		"$MQTT_Q2AFF_" + hash + "_short",
-		"$MQTT_Q2AFF_" + hash + "." + gen,
-		"$MQTT_Q2AFF_xyz_" + gen,
-		"$MQTT_PUBREL_" + hash + "_" + gen,
-	} {
-		if _, _, err := mqttParseQ2AffDurable(bad); err == nil {
-			t.Fatalf("%q must not parse as an affine durable", bad)
 		}
 	}
 }
@@ -563,8 +537,9 @@ func TestOrphanSweepAdoptionValidatesTheAffinePair(t *testing.T) {
 // does not hash back to the subject it sits on, its generation is malformed, or its
 // affine pair is inconsistent — it must be INDETERMINATE. Reading it as "a valid
 // record for a different generation" turns it into proof of absence, which discards
-// a live assignment or deletes a referenced consumer along with its
-// interest-retained copies.
+// a live assignment. (It could also delete a referenced consumer with its
+// interest-retained copies, until F-036 course E removed that route; the surviving
+// stake here is the claim transition.)
 func TestOrphanSweepPostSnapshotRereadsFailClosed(t *testing.T) {
 	// Each case is a record that decodes cleanly but cannot be interpreted, and that
 	// names a generation DIFFERENT from the candidate's — the shape that would
@@ -636,38 +611,6 @@ func TestOrphanSweepPostSnapshotRereadsFailClosed(t *testing.T) {
 				if cur == nil || cur.Discarded {
 					t.Fatalf("an uninterpretable raced record was read as proof the winner is gone, "+
 						"discarding a possibly-live assignment: %+v", cur)
-				}
-			})
-		}
-	})
-
-	t.Run("a raced record never authorizes deleting a consumer", func(t *testing.T) {
-		for _, tc := range malformed {
-			t.Run(tc.name, func(t *testing.T) {
-				e := testNewOrphanEnv(t, "reread-cons-"+strings.ReplaceAll(tc.name, " ", "-"))
-				e.setGraces(t, 0, 0)
-				idHash, gen := getHash("reread-owner"), mqttNewQ2AffGen()
-				durable := testCreateAffineConsumer(t, e, idHash, gen)
-
-				rec := tc.record(idHash)
-				if rec.ID == "x" {
-					rec.ID = "reread-owner"
-				}
-				e.asm.mu.Lock()
-				e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
-					return rec, 1, nil
-				}
-				e.asm.mu.Unlock()
-				t.Cleanup(func() {
-					e.asm.mu.Lock()
-					e.asm.testSessionLoad = nil
-					e.asm.mu.Unlock()
-				})
-
-				e.settleAffineConsumers(t, 16)
-				if !e.consumerExists(t, durable) {
-					t.Fatal("an uninterpretable raced record was read as evidence that nothing " +
-						"references this consumer, so it was deleted with its interest-retained copies")
 				}
 			})
 		}
@@ -795,52 +738,6 @@ func TestOrphanSweepAdoptionValidatesEveryDeletionTarget(t *testing.T) {
 					"so the teardown deleted a consumer belonging to somebody else")
 			}
 		})
-	}
-}
-
-// TestOrphanSweepRevalidatesConsumerIdentityBeforeDelete pins the recreation race.
-//
-// A peer provisions an affine consumer BEFORE saving the record that references it —
-// that create-before-save window is the whole reason the grace exists. If the sweep
-// deletes by name using a fingerprint from an earlier listing, it destroys the
-// peer's fresh consumer inside exactly that window, because the wait it accumulated
-// belongs to a consumer that no longer exists.
-func TestOrphanSweepRevalidatesConsumerIdentityBeforeDelete(t *testing.T) {
-	e := testNewOrphanEnv(t, "consumer-recreated")
-	e.setGraces(t, 0, 0)
-	idHash, gen := getHash("recreated-owner"), mqttNewQ2AffGen()
-	durable := testCreateAffineConsumer(t, e, idHash, gen)
-
-	inv, err := e.asm.collectQ2AffInventory()
-	if err != nil {
-		t.Fatalf("collectQ2AffInventory: %v", err)
-	}
-	cons, err := e.asm.jsa.consumerList(mqttOutStreamName)
-	if err != nil {
-		t.Fatalf("consumerList: %v", err)
-	}
-	refs, _, err := e.asm.buildSessionRefs()
-	if err != nil {
-		t.Fatalf("buildSessionRefs: %v", err)
-	}
-	budget := 16
-	// One pass to quarantine the instance this listing saw.
-	e.asm.deleteOrphanQ2AffConsumers(e.s, inv, cons, refs, &budget)
-
-	// A peer tears it down and provisions it again under the same name, and has not
-	// saved its record yet.
-	if _, err := e.asm.jsa.deleteConsumer(mqttOutStreamName, durable, false); err != nil {
-		t.Fatalf("deleting the consumer: %v", err)
-	}
-	time.Sleep(10 * time.Millisecond) // a distinguishable Created
-	testCreateAffineConsumer(t, e, idHash, gen)
-
-	// The sweep proceeds from its now-stale listing.
-	e.asm.deleteOrphanQ2AffConsumers(e.s, inv, cons, refs, &budget)
-
-	if !e.consumerExists(t, durable) {
-		t.Fatal("a consumer recreated since the listing was deleted on the previous instance's " +
-			"fingerprint, destroying a peer's fresh consumer inside the create-before-save window")
 	}
 }
 
@@ -1341,8 +1238,8 @@ func TestOrphanSweepRetainsUnattributableInboundState(t *testing.T) {
 // the whole destructive pass. A hidden reference is a deleted live resource.
 //
 // A record whose identity is sound but whose AFFINE PAIR does not validate is a
-// different case and is not here: it hides affine references only, so it disables
-// the affine phases alone. See
+// different case and is not here: it hides affine references only, so it suppresses
+// the affine CLAIM pass alone. See
 // TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases.
 func TestOrphanSweepReferenceSnapshotFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
@@ -1609,18 +1506,26 @@ func TestOrphanSweepAffineValidatorDoesNotWidenTheSharedFloor(t *testing.T) {
 		t.Fatalf("a session teardown must not fail on a derived-name mismatch: %v", err)
 	}
 
-	// The sweep inventory does reject it, which protects every affine consumer for
-	// this pass — an inventory that is not complete authorizes no deletion at all,
-	// including of consumers that have nothing to do with the malformed claim.
+	// The sweep inventory does reject it, which costs this pass its right to write ANY
+	// affine claim transition — including for claims that have nothing to do with the
+	// malformed one. (It used to protect affine consumers too; F-036 course E removed
+	// that delete, so the surviving stake is the claim transition.)
 	if _, err := e.asm.collectQ2AffInventory(); err == nil {
 		t.Fatal("the sweep inventory accepted a claim whose derived names do not match")
 	}
-	orphanHash, orphanGen := getHash("bystander"), mqttNewQ2AffGen()
-	durable := testCreateAffineConsumer(t, e, orphanHash, orphanGen)
-	e.setGraces(t, 0, 0)
+	bystander := mqttQ2AffClaimSubject(groupDur, sseq+1)
+	if _, err := e.asm.storeQ2AffClaimCAS(bystander, 0,
+		testValidQ2AffClaim(getHash("bystander"), mqttNewQ2AffGen(), groupDur, sseq+1)); err != nil {
+		t.Fatalf("store the bystander claim: %v", err)
+	}
 	e.asm.sweepOrphanedQoS2State(e.s)
-	if !e.consumerExists(t, durable) {
-		t.Fatal("an unrelated orphan consumer was deleted on the strength of an inventory that failed")
+	e.asm.sweepOrphanedQoS2State(e.s)
+	got, _, err := e.asm.loadQ2AffClaim(bystander)
+	if err != nil {
+		t.Fatalf("load the bystander claim: %v", err)
+	}
+	if got == nil || got.Discarded {
+		t.Fatalf("an unrelated claim was transitioned on the strength of an inventory that failed: %+v", got)
 	}
 }
 
@@ -1923,6 +1828,28 @@ func testCreateAffineConsumer(t *testing.T, e *testOrphanEnv, idHash, gen string
 	return durable
 }
 
+// copyPresent reports whether an affine copy is still on $MQTT_out AT THE SEQUENCE the
+// fixture stored it. The sequence is the point: an assertion that merely finds "a"
+// message on the subject would also pass against an implementation that dropped this
+// copy and let a later one take the subject.
+func (e *testOrphanEnv) copyPresent(t *testing.T, subject string, seq uint64) bool {
+	t.Helper()
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttOutStreamName, subject)
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			t.Fatalf("loading affine copy %q: %v", subject, err)
+		}
+		return false
+	}
+	if smsg == nil {
+		return false
+	}
+	if smsg.Sequence != seq {
+		t.Fatalf("affine copy %q is at sequence %d, want the fixture's %d", subject, smsg.Sequence, seq)
+	}
+	return true
+}
+
 func (e *testOrphanEnv) consumerExists(t *testing.T, durable string) bool {
 	t.Helper()
 	ci, err := e.asm.jsa.lookupConsumer(mqttOutStreamName, durable)
@@ -1935,152 +1862,138 @@ func (e *testOrphanEnv) consumerExists(t *testing.T, durable string) bool {
 	return ci != nil
 }
 
-func (e *testOrphanEnv) sweepAffineConsumers(t *testing.T, budget int) {
-	t.Helper()
-	inv, err := e.asm.collectQ2AffInventory()
-	if err != nil {
-		t.Fatalf("collectQ2AffInventory: %v", err)
-	}
-	cons, err := e.asm.jsa.consumerList(mqttOutStreamName)
-	if err != nil {
-		t.Fatalf("consumerList: %v", err)
-	}
-	refs, _, err := e.asm.buildSessionRefs()
-	if err != nil {
-		t.Fatalf("buildSessionRefs: %v", err)
-	}
-	// Same order as the real pass: assignments are reconciled — and so observed —
-	// before any consumer is considered for deletion.
-	e.asm.reconcileOrphanQ2AffClaims(e.s, inv, refs, &budget)
-	e.asm.deleteOrphanQ2AffConsumers(e.s, inv, cons, refs, &budget)
-}
+// ---------------------------------------------------------------------------
+// F-036 course E: the sweep does not reclaim an affine consumer by absence
+// ---------------------------------------------------------------------------
 
-// TestOrphanSweepMarksAssignmentsDiscardedBeforeDeletingTheirConsumer is the
-// central acceptance condition of the affine half.
+// TestOrphanSweepDoesNotReclaimAnAffineConsumerByAbsence is the acceptance condition that
+// replaced this file's old central one. Its name is about the CANDIDATE-RECLAMATION
+// route it drives: teardown-marker adoption can still delete an affine consumer, which
+// TestQ2AffineConsumerDeletesAreInventoried inventories.
 //
-// $MQTT_out is interest-retained, so deleting the consumer drops the copies it
-// still holds. Doing that while a claim still described a live delivery would turn
-// a session discard MQTT 5.0 [4.8.2] permits into a recorded Lost message.
-func TestOrphanSweepMarksAssignmentsDiscardedBeforeDeletingTheirConsumer(t *testing.T) {
-	e := testNewOrphanEnv(t, "consumer-ordering")
-	e.setGraces(t, 0, 0)
-	idHash, gen := getHash("aff-orphan"), mqttNewQ2AffGen()
-	groupDur := "$MQTT_SHARED_ordering"
-	const sseq = uint64(21)
-	durable := testCreateAffineConsumer(t, e, idHash, gen)
+// $MQTT_out is interest-retained, so deleting an affine consumer destroys the
+// acknowledged QoS 2 payloads it holds — and no positive fact can authorize that
+// delete: the retirement watermark records the SESSION generation while the consumer
+// is keyed by an AFFINE generation that outlives incarnations. F-036 course E removed
+// the route rather than patching it, and the accepted price is a leak.
+//
+// Every case below is a state that USED to authorize the delete, driven through the
+// REAL pass so the call site's absence is part of what is asserted. Each asserts the
+// copies too: a consumer surviving while its copies were dropped would be a different
+// bug, and must not pass this test.
+func TestOrphanSweepDoesNotReclaimAnAffineConsumerByAbsence(t *testing.T) {
+	// The old happy path, the vacuous-truth path, and a moved generation.
+	for _, tc := range []struct {
+		name  string
+		claim bool // plant a Discarded claim for the consumer's generation
+		rec   func(idHash string) *mqttPersistedSession
+	}{
+		{"absent record and a terminal claim: the old happy path", true, nil},
+		{"EMPTY inventory: what mqttQ2AffGenerationSettled admitted by vacuous truth", false, nil},
+		{"a valid record for a DIFFERENT affine generation", false, func(idHash string) *mqttPersistedSession {
+			return &mqttPersistedSession{ID: "coursee", Gen: mqttNewSessGen(), Q2AffGen: mqttNewQ2AffGen()}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := testNewOrphanEnv(t, "course-e-"+strings.ReplaceAll(tc.name, " ", "-"))
+			e.setGraces(t, 0, 0)
+			idHash, gen := getHash("coursee"), mqttNewQ2AffGen()
+			durable := testCreateAffineConsumer(t, e, idHash, gen)
+			groupDur := mqttSharedConsumerDurablePrefix + "COURSEE"
+			const sseq = uint64(51)
 
-	subject := mqttQ2AffClaimSubject(groupDur, sseq)
-	c := testValidQ2AffClaim(idHash, gen, groupDur, sseq)
-	c.Phase = mqttQ2AffMaterialized
-	if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, c); err != nil {
-		t.Fatalf("store claim: %v", err)
+			// A real copy on $MQTT_out, at a sequence this test pins, so "the copies
+			// survived" is an assertion about THIS payload and not about an absence.
+			claimHash := mqttQ2AffClaimHash(groupDur, sseq)
+			copySubject := mqttQ2AffCopySubject(idHash, gen, claimHash, testQ2AffFixtureNonce)
+			resp, cerr := e.asm.jsa.storeMsg(copySubject, 0, []byte("course-e-sentinel"))
+			if cerr != nil {
+				t.Fatalf("store the affine copy: %v", cerr)
+			}
+			copySeq := resp.Sequence
+
+			if tc.claim {
+				c := testValidQ2AffClaim(idHash, gen, groupDur, sseq)
+				c.Phase = mqttQ2AffMaterialized
+				c.Discarded = true
+				if _, serr := e.asm.storeQ2AffClaimCAS(mqttQ2AffClaimSubject(groupDur, sseq), 0, c); serr != nil {
+					t.Fatalf("store claim: %v", serr)
+				}
+			}
+			e.forget(t)
+			if tc.rec != nil {
+				testStoreRawSession(t, e, "coursee", tc.rec(idHash))
+			}
+
+			// Three passes: whatever a grace could authorize, it has authorized by now.
+			for i := 0; i < 3; i++ {
+				e.asm.sweepOrphanedQoS2State(e.s)
+			}
+
+			if !e.consumerExists(t, durable) {
+				t.Fatalf("the sweep deleted affine consumer %q, destroying the acknowledged QoS 2 "+
+					"payloads it retained", durable)
+			}
+			if !e.copyPresent(t, copySubject, copySeq) {
+				t.Fatalf("affine copy %q at sequence %d is gone although its consumer survived",
+					copySubject, copySeq)
+			}
+		})
 	}
 
-	e.settleAffineConsumers(t, 16)
-
-	if e.consumerExists(t, durable) {
-		t.Fatal("an unreferenced, fully reconciled affine consumer was not deleted")
-	}
-	// The claim reached a terminal state before its copies could be dropped: either
-	// it is still there carrying Discarded, or the two-sided predicate reaped it.
-	// What must never be true is the consumer being gone while the claim still
-	// described a live, undiscarded delivery.
-	cur, _, err := e.asm.loadQ2AffClaim(subject)
-	if err != nil {
-		t.Fatalf("load claim: %v", err)
-	}
-	if cur != nil && !cur.Discarded {
-		t.Fatal("the affine consumer was deleted while its assignment was not durably discarded, " +
-			"which drops its copies with the claim still describing a live delivery")
-	}
-}
-
-// TestOrphanSweepKeepsTheConsumerWhenTheDiscardCASFails is the mutation-sensitive
-// half of the ordering above: if committing Discarded cannot be resolved, the
-// consumer must survive. Deleting it anyway is exactly the step that would convert
-// a permitted session discard into a recorded Lost message.
-func TestOrphanSweepKeepsTheConsumerWhenTheDiscardCASFails(t *testing.T) {
-	e := testNewOrphanEnv(t, "discard-cas-fails")
-	e.setGraces(t, 0, 0)
-	idHash, gen := getHash("cas-fail"), mqttNewQ2AffGen()
-	groupDur := "$MQTT_SHARED_casfail"
-	const sseq = uint64(22)
-	durable := testCreateAffineConsumer(t, e, idHash, gen)
-
-	subject := mqttQ2AffClaimSubject(groupDur, sseq)
-	c := testValidQ2AffClaim(idHash, gen, groupDur, sseq)
-	c.Phase = mqttQ2AffMaterialized
-	if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, c); err != nil {
-		t.Fatalf("store claim: %v", err)
-	}
-
-	e.asm.mu.Lock()
-	e.asm.testQ2AffClaimStore = func(string, uint64, *mqttQ2AffClaim) (uint64, error) {
-		return 0, fmt.Errorf("injected")
-	}
-	e.asm.mu.Unlock()
-	t.Cleanup(func() {
-		e.asm.mu.Lock()
-		e.asm.testQ2AffClaimStore = nil
-		e.asm.mu.Unlock()
-	})
-
-	e.settleAffineConsumers(t, 16)
-	if !e.consumerExists(t, durable) {
-		t.Fatal("the affine consumer was deleted although its assignment could not be committed discarded")
-	}
-}
-
-// TestOrphanSweepRetainsAConsumerItCannotFullyReconcile covers the three ways step
-// 2-4 can come up short. Each must leave the consumer for a later pass rather than
-// deleting it on a partial result.
-func TestOrphanSweepRetainsAConsumerItCannotFullyReconcile(t *testing.T) {
-	groupDur := "$MQTT_SHARED_retain"
-
-	t.Run("a young assignment protects an otherwise-old consumer", func(t *testing.T) {
-		// Store times come from JetStream, so the only way to give the consumer and its
-		// assignment genuinely different ages is to create them at different times
-		// against a short grace.
-		e := testNewOrphanEnv(t, "retain-young")
-		e.setGraces(t, 200*time.Millisecond, 200*time.Millisecond)
-		idHash, gen := getHash("young-assign"), mqttNewQ2AffGen()
-		durable := testCreateAffineConsumer(t, e, idHash, gen)
-		time.Sleep(400 * time.Millisecond)
-		subject := mqttQ2AffClaimSubject(groupDur, 31)
-		if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, testValidQ2AffClaim(idHash, gen, groupDur, 31)); err != nil {
-			t.Fatalf("store claim: %v", err)
-		}
-		// The consumer is past the grace; the assignment it owns is not.
-		e.settleAffineConsumers(t, 16)
-		if !e.consumerExists(t, durable) {
-			t.Fatal("a consumer was deleted while it still owned an assignment younger than the grace")
-		}
-	})
-
-	t.Run("an exhausted mutation budget retains the consumer", func(t *testing.T) {
-		e := testNewOrphanEnv(t, "retain-budget")
+	// The adoption case needs its own body: the barrier must come from a SURVIVING
+	// phase, because the phase that used to pause here no longer exists.
+	t.Run("a session ADOPTS the consumer mid-pass", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "course-e-adoption")
 		e.setGraces(t, 0, 0)
-		idHash, gen := getHash("budget-assign"), mqttNewQ2AffGen()
+		idHash, gen := getHash("coursee"), mqttNewQ2AffGen()
 		durable := testCreateAffineConsumer(t, e, idHash, gen)
-		subject := mqttQ2AffClaimSubject(groupDur, 32)
-		if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, testValidQ2AffClaim(idHash, gen, groupDur, 32)); err != nil {
-			t.Fatalf("store claim: %v", err)
+		before, lerr := e.asm.jsa.lookupConsumer(mqttOutStreamName, durable)
+		if lerr != nil || before == nil {
+			t.Fatalf("staging error: the affine consumer must exist: %v", lerr)
 		}
-		e.settleAffineConsumers(t, 0)
-		if !e.consumerExists(t, durable) {
-			t.Fatal("a consumer was deleted with its assignments left unreconciled by an exhausted budget")
+		groupDur := mqttSharedConsumerDurablePrefix + "COURSEEADOPT"
+		const sseq = uint64(52)
+		claimHash := mqttQ2AffClaimHash(groupDur, sseq)
+		copySubject := mqttQ2AffCopySubject(idHash, gen, claimHash, testQ2AffFixtureNonce)
+		resp, cerr := e.asm.jsa.storeMsg(copySubject, 0, []byte("course-e-adoption-sentinel"))
+		if cerr != nil {
+			t.Fatalf("store the affine copy: %v", cerr)
 		}
-	})
+		copySeq := resp.Sequence
 
-	t.Run("a session that reappears keeps its consumer", func(t *testing.T) {
-		e := testNewOrphanEnv(t, "retain-reappear")
-		e.setGraces(t, 0, 0)
-		idHash, gen := getHash("reappear"), mqttNewQ2AffGen()
-		durable := testCreateAffineConsumer(t, e, idHash, gen)
+		// A claim of that generation, so the surviving claim pass actually performs a
+		// winner-record read — which is the only barrier still available here.
+		claimSubject := mqttQ2AffClaimSubject(groupDur, sseq)
+		if _, serr := e.asm.storeQ2AffClaimCAS(claimSubject, 0,
+			testValidQ2AffClaim(idHash, gen, groupDur, sseq)); serr != nil {
+			t.Fatalf("store claim: %v", serr)
+		}
+		e.forget(t)
 
+		// The barrier: that record read. The adoption happens INSIDE it, so any
+		// consumer decision the pass went on to make would be racing a live adopter.
+		// The hook must not call t.Fatalf — it runs inside the pass, so a failure is
+		// recorded and asserted after it returns.
+		var adopted bool
+		var adoptErr error
 		e.asm.mu.Lock()
 		e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
-			return &mqttPersistedSession{ID: "reappear", Gen: nuid.Next(), Q2AffGen: gen}, 1, nil
+			if !adopted {
+				// create-or-update, exactly as a resuming session provisions.
+				filter, deliver, dur := mqttQ2AffineNames(idHash, gen)
+				if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+					Stream: mqttOutStreamName,
+					Config: ConsumerConfig{
+						Durable: dur, FilterSubject: filter, DeliverSubject: deliver,
+						AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, MaxAckPending: 1024,
+					},
+				}); err != nil {
+					adoptErr = err
+				}
+				adopted = true
+			}
+			return nil, 0, nil
 		}
 		e.asm.mu.Unlock()
 		t.Cleanup(func() {
@@ -2089,74 +2002,272 @@ func TestOrphanSweepRetainsAConsumerItCannotFullyReconcile(t *testing.T) {
 			e.asm.mu.Unlock()
 		})
 
-		e.settleAffineConsumers(t, 16)
-		if !e.consumerExists(t, durable) {
-			t.Fatal("a consumer was deleted although its session reappeared during final revalidation")
+		for i := 0; i < 3; i++ {
+			e.asm.sweepOrphanedQoS2State(e.s)
+		}
+
+		if !adopted {
+			t.Fatal("staging error: the adoption barrier never fired, so this case proves nothing")
+		}
+		if adoptErr != nil {
+			t.Fatalf("staging error: the mid-pass adoption failed: %v", adoptErr)
+		}
+		after, aerr := e.asm.jsa.lookupConsumer(mqttOutStreamName, durable)
+		if aerr != nil || after == nil {
+			t.Fatalf("the adopted affine consumer was deleted: %v", aerr)
+		}
+		if !after.Created.Equal(before.Created) {
+			t.Fatalf("staging error: the adoption replaced the consumer instance (Created %v -> %v), so "+
+				"it does not exercise the blind spot an INSTANCE check cannot see",
+				before.Created, after.Created)
+		}
+		if !e.copyPresent(t, copySubject, copySeq) {
+			t.Fatalf("affine copy %q at sequence %d is gone although its consumer survived",
+				copySubject, copySeq)
 		}
 	})
 }
 
-// TestOrphanSweepRetainsAConsumerOnALateClaim pins the verification barrier: a
-// claim created between the authorizing inventory and the second scan retains the
-// consumer, because the first inventory no longer describes the generation.
-func TestOrphanSweepRetainsAConsumerOnALateClaim(t *testing.T) {
-	e := testNewOrphanEnv(t, "late-claim")
-	e.setGraces(t, 0, 0)
-	idHash, gen := getHash("late-claim"), mqttNewQ2AffGen()
-	groupDur := "$MQTT_SHARED_late"
-	durable := testCreateAffineConsumer(t, e, idHash, gen)
+// TestOrphanSweepAffineClaimPassFailureAndBudgetPaths keeps three properties that
+// used to live inside the deleted consumer tests. Each is about the SURVIVING claim
+// pass, so deleting them with their old hosts would have been lost coverage rather
+// than removed coverage; TestOrphanSweepAffineClaimPassStillDiscardsAnAbsentWinner
+// covers only the SUCCESSFUL discard.
+func TestOrphanSweepAffineClaimPassFailureAndBudgetPaths(t *testing.T) {
+	// The claim must stay INSPECTABLE: a live group durable still holding a real source
+	// message, so the two-sided reap predicate refuses and a discard cannot be confused
+	// with a discard-then-reap. Without that, "the claim is nil" is ambiguous and the
+	// budget control below cannot tell the two apart.
+	plant := func(t *testing.T, e *testOrphanEnv, name string) string {
+		t.Helper()
+		idHash, gen := getHash(name), mqttNewQ2AffGen()
+		groupDur := mqttSharedConsumerDurablePrefix + "FAILPATH"
+		topic := "failpath." + name
+		if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+			Stream: mqttStreamName,
+			Config: ConsumerConfig{
+				Durable: groupDur, FilterSubject: mqttStreamSubjectPrefix + topic,
+				DeliverSubject: mqttSharedSubDeliverPrefix + name, DeliverGroup: "g",
+				AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, MaxAckPending: 64,
+			},
+		}); err != nil {
+			t.Fatalf("create group durable: %v", err)
+		}
+		resp, err := e.asm.jsa.storeMsg(mqttStreamSubjectPrefix+topic, 0, []byte("source"))
+		if err != nil {
+			t.Fatalf("store the source message: %v", err)
+		}
+		subject := mqttQ2AffClaimSubject(groupDur, resp.Sequence)
+		c := testValidQ2AffClaim(idHash, gen, groupDur, resp.Sequence)
+		c.Phase = mqttQ2AffMaterialized
+		if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, c); err != nil {
+			t.Fatalf("store claim: %v", err)
+		}
+		return subject
+	}
+	undiscarded := func(t *testing.T, e *testOrphanEnv, subject, why string) {
+		t.Helper()
+		got, _, err := e.asm.loadQ2AffClaim(subject)
+		if err != nil {
+			t.Fatalf("load claim: %v", err)
+		}
+		if got == nil || got.Discarded {
+			t.Fatalf("%s: %+v", why, got)
+		}
+	}
 
-	inv, err := e.asm.collectQ2AffInventory()
-	if err != nil {
-		t.Fatalf("collectQ2AffInventory: %v", err)
-	}
-	// Between the inventory and the verification scan, a contender elects this
-	// generation for a new source message.
-	subject := mqttQ2AffClaimSubject(groupDur, 41)
-	if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, testValidQ2AffClaim(idHash, gen, groupDur, 41)); err != nil {
-		t.Fatalf("store the late claim: %v", err)
-	}
+	t.Run("a failed Discarded CAS leaves the claim undiscarded", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "claimpass-cas-fails")
+		e.setGraces(t, 0, 0)
+		subject := plant(t, e, "cas-fail")
+		e.forget(t)
 
-	cons, err := e.asm.jsa.consumerList(mqttOutStreamName)
-	if err != nil {
-		t.Fatalf("consumerList: %v", err)
-	}
-	refs, _, err := e.asm.buildSessionRefs()
-	if err != nil {
-		t.Fatalf("buildSessionRefs: %v", err)
-	}
-	budget := 16
-	e.asm.deleteOrphanQ2AffConsumers(e.s, inv, cons, refs, &budget)
-	e.asm.deleteOrphanQ2AffConsumers(e.s, inv, cons, refs, &budget)
+		var attempts int
+		e.asm.mu.Lock()
+		e.asm.testQ2AffClaimStore = func(string, uint64, *mqttQ2AffClaim) (uint64, error) {
+			attempts++
+			return 0, fmt.Errorf("injected")
+		}
+		e.asm.mu.Unlock()
+		t.Cleanup(func() {
+			e.asm.mu.Lock()
+			e.asm.testQ2AffClaimStore = nil
+			e.asm.mu.Unlock()
+		})
 
-	if !e.consumerExists(t, durable) {
-		t.Fatal("a consumer was deleted although a claim appeared after the authorizing inventory")
-	}
+		e.sweepAffineClaims(t, 16)
+		e.sweepAffineClaims(t, 16)
+		if attempts == 0 {
+			t.Fatal("staging error: the discard CAS was never attempted, so this case proves nothing")
+		}
+		undiscarded(t, e, subject, "a claim reads Discarded although its CAS could not be resolved")
+	})
+
+	t.Run("a zero mutation budget defers the transition", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "claimpass-zero-budget")
+		e.setGraces(t, 0, 0)
+		subject := plant(t, e, "zero-budget")
+		e.forget(t)
+
+		e.sweepAffineClaims(t, 0)
+		e.sweepAffineClaims(t, 0)
+		undiscarded(t, e, subject, "a transition was written with no mutation budget")
+
+		// The same fixture with budget DOES discard it, or the assertion above would
+		// pass against a pass that can never discard anything.
+		e.sweepAffineClaims(t, 16)
+		e.sweepAffineClaims(t, 16)
+		got, _, err := e.asm.loadQ2AffClaim(subject)
+		if err != nil {
+			t.Fatalf("load claim: %v", err)
+		}
+		if got == nil {
+			t.Fatal("control failed: the claim was reaped, so this fixture cannot distinguish a " +
+				"discard from a discard-then-reap")
+		}
+		if !got.Discarded {
+			t.Fatalf("control failed: with budget the same claim must be discarded: %+v", got)
+		}
+	})
+
+	t.Run("a young claim is not discarded on its first observation", func(t *testing.T) {
+		e := testNewOrphanEnv(t, "claimpass-young")
+		e.setGraces(t, time.Hour, time.Hour)
+		subject := plant(t, e, "young-claim")
+		e.forget(t)
+
+		// One pass records the identity and authorizes nothing; the grace has not
+		// elapsed, so no later pass may act either.
+		e.sweepAffineClaims(t, 16)
+		e.sweepAffineClaims(t, 16)
+		undiscarded(t, e, subject, "a claim inside its grace was discarded on a single observation")
+	})
 }
 
-// TestOrphanSweepLeavesForeignConsumersAlone pins the durable-prefix boundary. In
-// particular $MQTT_PUBREL_* is deliberately out of scope: those hold undelivered
-// outbound PUBREL state, so deleting one is not a free leak cleanup.
-func TestOrphanSweepLeavesForeignConsumersAlone(t *testing.T) {
-	e := testNewOrphanEnv(t, "foreign-consumers")
+// TestOrphanSweepAffineClaimPassStillDiscardsAnAbsentWinner is the positive half of
+// the deletion above: removing the consumer route must not take the CLAIM pass with
+// it. Its fixture keeps the claim inspectable — a live group durable holding a real
+// source message — so the successful path cannot reap it and leave the assertion
+// unable to tell "discarded then reaped" from "never discarded".
+func TestOrphanSweepAffineClaimPassStillDiscardsAnAbsentWinner(t *testing.T) {
+	e := testNewOrphanEnv(t, "course-e-claim-survives")
 	e.setGraces(t, 0, 0)
-	idHash, gen := getHash("pubrel-owner"), nuid.Next()
-	subject, deliver, durable := mqttPubRelNames(idHash, gen)
-	ccr := &CreateConsumerRequest{
-		Stream: mqttOutStreamName,
+	idHash, gen := getHash("claim-survivor"), mqttNewQ2AffGen()
+	groupDur := mqttSharedConsumerDurablePrefix + "CLAIMSURVIVES"
+
+	if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+		Stream: mqttStreamName,
 		Config: ConsumerConfig{
-			Durable: durable, FilterSubject: subject, DeliverSubject: deliver,
-			AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, MaxAckPending: 1024,
+			Durable: groupDur, FilterSubject: mqttStreamSubjectPrefix + "survives.topic",
+			DeliverSubject: mqttSharedSubDeliverPrefix + "survives", DeliverGroup: "g",
+			AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, MaxAckPending: 64,
 		},
+	}); err != nil {
+		t.Fatalf("create group durable: %v", err)
 	}
-	if _, err := e.asm.jsa.createDurableConsumer(ccr); err != nil {
-		t.Fatalf("create PUBREL consumer: %v", err)
+	resp, err := e.asm.jsa.storeMsg(mqttStreamSubjectPrefix+"survives.topic", 0, []byte("source"))
+	if err != nil {
+		t.Fatalf("store the source message: %v", err)
+	}
+	sseq := resp.Sequence
+
+	subject := mqttQ2AffClaimSubject(groupDur, sseq)
+	if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, testValidQ2AffClaim(idHash, gen, groupDur, sseq)); err != nil {
+		t.Fatalf("store claim: %v", err)
 	}
 	e.forget(t)
 
-	e.settleAffineConsumers(t, 16)
+	for i := 0; i < 3; i++ {
+		e.asm.sweepOrphanedQoS2State(e.s)
+	}
+
+	got, _, err := e.asm.loadQ2AffClaim(subject)
+	if err != nil {
+		t.Fatalf("load claim: %v", err)
+	}
+	if got == nil {
+		t.Fatal("the claim was deleted, so this fixture cannot tell a discard from a reap")
+	}
+	if !got.Discarded {
+		t.Fatal("the affine CLAIM pass went with the consumer route: an absent winner's assignment " +
+			"was never discarded")
+	}
+}
+
+// TestOrphanSweepDoesNotDiscardOnConsumerCandidacyAlone pins WHICH fact licenses a
+// Discarded transition, which is the one thing the removed phase and the surviving
+// one disagree about.
+//
+// discardAbsentWinnerClaim DEFERS when the winner record cannot be read. The removed
+// consumer-candidacy phase consulted no record at all before writing — its record
+// re-read came afterwards — so re-adding it writes Discarded here where the surviving
+// pass refuses. Without this test that difference is invisible.
+func TestOrphanSweepDoesNotDiscardOnConsumerCandidacyAlone(t *testing.T) {
+	e := testNewOrphanEnv(t, "course-e-candidacy")
+	e.setGraces(t, 0, 0)
+	idHash, gen := getHash("candidacy"), mqttNewQ2AffGen()
+	durable := testCreateAffineConsumer(t, e, idHash, gen)
+	groupDur := mqttSharedConsumerDurablePrefix + "CANDIDACY"
+	const sseq = uint64(53)
+
+	subject := mqttQ2AffClaimSubject(groupDur, sseq)
+	if _, err := e.asm.storeQ2AffClaimCAS(subject, 0, testValidQ2AffClaim(idHash, gen, groupDur, sseq)); err != nil {
+		t.Fatalf("store claim: %v", err)
+	}
+	e.forget(t)
+
+	// The winner re-read fails, and the count proves the pass actually reached it: a
+	// misplaced hook would otherwise make this a vacuous pass.
+	var rereads int
+	e.asm.mu.Lock()
+	e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
+		rereads++
+		return nil, 0, fmt.Errorf("injected winner re-read failure")
+	}
+	e.asm.mu.Unlock()
+	t.Cleanup(func() {
+		e.asm.mu.Lock()
+		e.asm.testSessionLoad = nil
+		e.asm.mu.Unlock()
+	})
+
+	for i := 0; i < 3; i++ {
+		e.asm.sweepOrphanedQoS2State(e.s)
+	}
+
+	if rereads == 0 {
+		t.Fatal("staging error: the winner re-read was never reached, so this case proves nothing")
+	}
+	got, _, err := e.asm.loadQ2AffClaim(subject)
+	if err != nil {
+		t.Fatalf("load claim: %v", err)
+	}
+	if got == nil || got.Discarded {
+		t.Fatalf("a claim was discarded although nothing could prove its winner gone; consumer "+
+			"candidacy is not a licence to write a terminal fact: %+v", got)
+	}
 	if !e.consumerExists(t, durable) {
-		t.Fatal("the sweep deleted a $MQTT_PUBREL_* consumer, which is out of scope for this item")
+		t.Fatalf("affine consumer %q was deleted on an indeterminate record", durable)
+	}
+}
+
+// TestOrphanSweepLeavesForeignConsumersAlone pins the durable-prefix boundary from
+// the only side that still has one. The affine pass used to own the mirror of this
+// assertion; F-036 course E removed it, so what remains is that the PUBREL pass judges
+// $MQTT_PUBREL_* and nothing else — an affine consumer must survive it untouched, even
+// with no reference to it anywhere and every grace elapsed.
+func TestOrphanSweepLeavesForeignConsumersAlone(t *testing.T) {
+	e := testNewOrphanEnv(t, "foreign-consumers")
+	e.setGraces(t, 0, 0)
+	idHash, gen := getHash("affine-owner"), mqttNewQ2AffGen()
+	durable := testCreateAffineConsumer(t, e, idHash, gen)
+	e.forget(t)
+
+	// Two passes: the first quarantines whatever it judges, the second may act.
+	e.sweepPubRelConsumers(t)
+	e.sweepPubRelConsumers(t)
+	if !e.consumerExists(t, durable) {
+		t.Fatal("the PUBREL pass deleted a $MQTT_Q2AFF_* consumer, which is not its class")
 	}
 }
 
@@ -2489,7 +2600,8 @@ func TestOrphanSweepCondemnsARetiredSurvivor(t *testing.T) {
 // TestOrphanSweepReapsAnOrphanedPubRelDurable is test 9: the companion half. A PUBREL
 // durable on $MQTT_out whose session generation is authoritatively absent was
 // referenced by NOTHING before this class existed — sweepOrphanedConsumers lists
-// $MQTT_msgs only, and the affine pass deliberately drops every other prefix — so it
+// $MQTT_msgs only, and the affine pass deliberately dropped every other prefix (and
+// since F-036 course E judges no consumer at all) — so it
 // held its interest-retained PUBRELs forever.
 func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
 	t.Run("an unreferenced durable is reaped, never on the first pass", func(t *testing.T) {
@@ -2705,18 +2817,20 @@ func TestOrphanSweepPubRelValidatesTheConsumerConfig(t *testing.T) {
 // TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory pins the class boundary in
 // the production pass, which the direct-call tests above cannot see.
 //
-// A malformed assignment claim aborts the affine INVENTORY, and that must protect the
-// affine consumers and nothing else. It used to return from the whole sweep, so one
+// A malformed assignment claim aborts the affine INVENTORY, and that must suppress the
+// affine CLAIM pass and nothing else. It used to return from the whole sweep, so one
 // persistent corrupt claim disabled PUBREL reconciliation account-wide and for good —
 // on evidence about a different resource class. PUBREL eligibility rests on its own
 // complete reference snapshot, the consumer listing, the grace, the final record
 // re-read and the instance re-lookup; none of them is an assignment claim.
 //
-// The affine half is asserted as a POSITIVE CONTROL, not as a discriminator: an
-// orphaned affine consumer is retained in the same pass, but that outcome is
-// over-determined — the phase's own second complete inventory refuses it as well, so
-// removing the guard beside this pass would not change it. What the control buys is
-// that the fix is not a licence to delete affine consumers from a partial view.
+// The affine-consumer control this test used to carry is GONE with F-036 course E: this
+// pass no longer reclaims an affine consumer by absence, so asserting that one survives an
+// incomplete inventory would pass by default.
+// TestOrphanSweepDoesNotReclaimAnAffineConsumerByAbsence owns that invariant now,
+// TestQ2AffineConsumerDeletesAreInventoried inventories the deletes that ARE
+// still reachable from the sweep, and TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases
+// owns the surviving claim-transition stake.
 func TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory(t *testing.T) {
 	e := testNewOrphanEnv(t, "pubrel-vs-affine-inventory")
 	e.setGraces(t, 0, 0)
@@ -2734,7 +2848,6 @@ func TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory(t *testing.T) {
 	}
 
 	pubRelDur := testCreatePubRelConsumer(t, e, getHash("pubrel-past-a-corrupt-claim"), mqttNewSessGen())
-	affDur := testCreateAffineConsumer(t, e, getHash("affine-past-a-corrupt-claim"), mqttNewQ2AffGen())
 
 	// The REAL pass, twice: one observation authorizes nothing.
 	e.asm.sweepOrphanedQoS2State(e.s)
@@ -2743,9 +2856,5 @@ func TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory(t *testing.T) {
 	if e.consumerExists(t, pubRelDur) {
 		t.Fatal("an unreadable affine claim disabled the PUBREL class: the orphaned durable and its " +
 			"interest-retained PUBRELs would accumulate indefinitely, on evidence about another class")
-	}
-	if !e.consumerExists(t, affDur) {
-		t.Fatal("the affine consumer was deleted from an INCOMPLETE inventory: absence taken from a " +
-			"partial view is not absence")
 	}
 }

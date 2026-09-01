@@ -85,6 +85,22 @@ survives
   malformed state
 - Original roadmap order: 49
 
+### Scope correction, F-036 course E
+
+**Appended rather than rewritten**, because the record below is preserved as written.
+
+The original text says an incomplete inventory "is what protects every affine consumer
+from deletion", and that "every affine consumer delete" stays blocked. **The orphan sweep's
+CANDIDATE-RECLAMATION route no longer deletes an affine consumer by absence** — F-036 course
+E removed `deleteOrphanQ2AffConsumers` outright, because no positive fact could authorize
+a by-name delete of an interest-retained consumer. (Not "no affine consumer delete is
+reachable from the sweep": teardown-marker adoption still reaches `deleteTeardownTargets`,
+a pre-existing route that is not claimed race-free and is F-036's fourth manifestation.) So
+what an unreadable claim now wedges is
+`reconcileOrphanQ2AffClaims` and the sweep-driven reaps, not consumer deletion. The
+fail-closed reasoning and the account-wide scope are unchanged; only the resource class
+the refusal protects is smaller.
+
 ### Original finding record
 
 - [ ] One unreadable or unattributable assignment claim wedges affine reclamation

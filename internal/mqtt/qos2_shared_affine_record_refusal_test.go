@@ -319,7 +319,9 @@ func TestQ2AffMaterializeOnBehalfRefusesAnUninterpretableWinnerRecord(t *testing
 //
 // A record whose affine PAIR does not validate contributes no affine reference,
 // while the session it describes may own an affine consumer and outstanding claims
-// — so no affine resource may be judged this pass. Its IDENTITY is sound, though:
+// — so reconcileOrphanQ2AffClaims is suppressed. That ONE pass, and not "every affine
+// resource": the retired affine register arm is outside this gate, and affine consumer
+// deletion no longer exists (F-036 course E). Its IDENTITY is sound, though:
 // the inbound, in-flight and PUBREL references it contributes are complete, so
 // those classes must keep being reclaimed. Returning early instead would let one
 // such record disable every class account-wide, and PERMANENTLY, since nothing
@@ -327,13 +329,19 @@ func TestQ2AffMaterializeOnBehalfRefusesAnUninterpretableWinnerRecord(t *testing
 // inventory below already avoids for exactly this reason.
 //
 // Both halves are asserted on every row, because each alone passes against a
-// different broken implementation: the retained consumer alone also passes if the
-// pass aborts wholesale, and the reclaimed hold alone also passes if the affine
-// skip is dropped.
+// different broken implementation: the retained CLAIM alone also passes if the pass
+// aborts wholesale, and the reclaimed hold alone also passes if the affine skip is
+// dropped.
+//
+// The affine half is asserted on a CLAIM TRANSITION rather than on a consumer. Since
+// F-036 course E this gate governs no consumer decision at all — the candidate-reclamation
+// route is gone — so a surviving-consumer assertion would pass by default against any
+// implementation, including one with the guard removed. What affineUsable still gates is
+// reconcileOrphanQ2AffClaims.
 //
 // Mutation: return early on an affine-pair failure instead of skipping — the hold
-// survives. Mutation: drop the affineUsable guard on the affine phases — the
-// consumer is deleted.
+// survives. Mutation: force affineUsable true — the bystander claim is discarded on
+// evidence no record could supply.
 func TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -359,10 +367,37 @@ func TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases(t *testing.T) {
 			e := testNewOrphanEnv(t, "affpair-"+strings.ReplaceAll(tc.name, " ", "-"))
 			e.setGraces(t, 0, 0)
 
-			// An inbound hold and an affine consumer, both orphaned: no record and no
+			// An inbound hold and an affine CLAIM, both orphaned: no record and no
 			// local session references either once the env forgets its session.
+			//
+			// The claim must stay INSPECTABLE, like every other claim-transition fixture:
+			// a LIVE group durable still holding a real source message, so the two-sided
+			// reap predicate refuses. Without that, forcing the gate open could discard
+			// AND immediately reap, and the assertion below would kill the mutation on
+			// claim ABSENCE without ever proving the forbidden Discarded state.
 			holdSubject := e.hold(t, 1, nuid.Next(), "payload")
-			affDur := testCreateAffineConsumer(t, e, getHash("affine-bystander"), mqttNewQ2AffGen())
+			bystanderGroup := mqttSharedConsumerDurablePrefix + "AFFPAIR"
+			topic := "affpair." + strings.ReplaceAll(tc.name, " ", "-")
+			if _, derr := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+				Stream: mqttStreamName,
+				Config: ConsumerConfig{
+					Durable: bystanderGroup, FilterSubject: mqttStreamSubjectPrefix + topic,
+					DeliverSubject: mqttSharedSubDeliverPrefix + "affpair", DeliverGroup: "g",
+					AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, MaxAckPending: 64,
+				},
+			}); derr != nil {
+				t.Fatalf("create the bystander's group durable: %v", derr)
+			}
+			resp, serr := e.asm.jsa.storeMsg(mqttStreamSubjectPrefix+topic, 0, []byte("source"))
+			if serr != nil {
+				t.Fatalf("store the bystander's source message: %v", serr)
+			}
+			bystander := mqttQ2AffClaimSubject(bystanderGroup, resp.Sequence)
+			if _, cerr := e.asm.storeQ2AffClaimCAS(bystander, 0,
+				testValidQ2AffClaim(getHash("affine-bystander"), mqttNewQ2AffGen(),
+					bystanderGroup, resp.Sequence)); cerr != nil {
+				t.Fatalf("store the bystander claim: %v", cerr)
+			}
 			e.forget(t)
 			testStoreRawSession(t, e, "affbad", tc.record())
 
@@ -376,7 +411,7 @@ func TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases(t *testing.T) {
 			}
 
 			// Three passes: the inbound half needs its quarantine pass and an affine
-			// consumer is grace-OBSERVED before deletion, so one pass settles neither.
+			// claim is grace-OBSERVED before a transition, so one pass settles neither.
 			for i := 0; i < 3; i++ {
 				e.asm.sweepOrphanedQoS2State(e.s)
 			}
@@ -385,9 +420,17 @@ func TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases(t *testing.T) {
 				t.Fatal("an orphaned inbound hold stopped being reclaimed because a DIFFERENT record's " +
 					"affine pair could not be interpreted; that record says nothing about this resource class")
 			}
-			if !e.consumerExists(t, affDur) {
-				t.Fatal("an affine consumer was deleted while no record could say which affine consumers " +
-					"are still referenced")
+			got, _, gerr := e.asm.loadQ2AffClaim(bystander)
+			if gerr != nil {
+				t.Fatalf("load the bystander claim: %v", gerr)
+			}
+			if got == nil {
+				t.Fatal("the bystander claim was reaped, so this fixture cannot distinguish the " +
+					"forbidden Discarded transition from a discard-then-reap")
+			}
+			if got.Discarded {
+				t.Fatalf("an affine claim was transitioned while no record could say which affine "+
+					"generations are still referenced: %+v", got)
 			}
 		})
 	}

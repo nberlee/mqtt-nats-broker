@@ -672,13 +672,17 @@ question nowhere.
 
 ### The five route inventories, dispositioned
 
-**1. Claim transitions (ten, all inheriting W2).** All ten CAS at a sequence loaded in
+**1. Claim transitions (all inheriting W2).** *F-036 course E removed the sweep's
+pre-delete discard together with the consumer delete it prepared for, so ONE sweep
+transition remains, `discardAbsentWinnerClaim`. The stated TOTAL below is **stale and
+deliberately not restated** — see the census-accuracy note at the end of this part.*
+They CAS at a sequence loaded in
 the same attempt and preserve proven facts through `mergeProven`, so a transition can
-only ever ADD to what is known. Seven carry an explicit `wantWinner`/`wantGen` identity
+only ever ADD to what is known. Six carry an explicit `wantWinner`/`wantGen` identity
 assertion and mutate nothing on a mismatch: `qos2_shared_affine.go:1727` (materialize),
 `:1809` (the on-behalf discard arm), `:2156` (`discardQ2AffClaimsFor`), `:2237` (`Lost`),
-`:2251` (recovery's `Discarded + SourceAcked`), `orphan_qos2_sweep.go:1871`
-(`discardAbsentWinnerClaim`) and `:1975` (the sweep's pre-delete discard). Three pass no
+`:2251` (recovery's `Discarded + SourceAcked`) and `orphan_qos2_sweep.go:1871`
+(`discardAbsentWinnerClaim`). Three pass no
 identity because the fact they record is owner-independent — `SourceAcked` is a statement
 about the group delivery and `AffineDone` about a copy the gate has already attributed:
 `qos2_shared_affine.go:1367` (the reaper's unofferable-source inference), `:1423`
@@ -687,25 +691,49 @@ only the two `SourceAcked` writes rest on the per-subject CAS alone; F-065 fence
 `AffineDone` on the claim's INCARNATION and on the COPY the delivery carried, so an
 owner-independent fact about one incarnation's copy cannot be written onto another's
 record. None is
-unconditional and none takes a stale base. The two sweep transitions are the ones whose
-EVIDENCE is weaker than a CAS can express; that is F-064, not a lineage gap.
+unconditional and none takes a stale base. The ONE remaining sweep transition is the one
+whose EVIDENCE is weaker than a CAS can express; that is F-064, not a lineage gap.
 
-**2. Claim reaps (twelve, all inheriting D1).** Every one re-reads the claim and
+**2. Claim reaps (all inheriting D1).** *F-036 course E removed the sweep's post-delete
+reap, whose whole premise was that the consumer delete had just made the copies absent. The
+stated TOTAL below is **stale and deliberately not restated** — see the census-accuracy note
+at the end of this part.* Every one re-reads the claim and
 re-derives both proofs before deleting, and deletes only the exact sequence it loaded:
 `qos2_shared_affine.go:1574`, `:1593`, `:1655`, `:1816`, `:1855`, `:2047`, `:2163`,
-`:2215`, `:2258`, `orphan_qos2_sweep.go:1796`, `:1879`, `:2068`. The re-read is what
+`:2215`, `:2258`, `orphan_qos2_sweep.go:1796`, `:1879`. The re-read is what
 makes reaping from every proof-writer correct rather than redundant: the two proofs are
-produced by unordered paths, so whichever commits second observes the first. All twelve
+produced by unordered paths, so whichever commits second observes the first. All of them
 inherit the same internal TOCTOU on the copy-absence reading, which is **F-065** — one
-defect in the primitive, not twelve.
+defect in the primitive, not one per site.
 
-**3. Affine consumer deletes (four).** `orphan_qos2_sweep.go:2058` (the sweep, the only
-one running under no session claim, and a check-then-act whose delete is BY NAME),
-`qos2_shared_affine.go:1137` (provisioning rollback, `minted` only — nothing durable ever
-referenced that generation), `:2474` (`finishQ2AffineUnwind`, under the session's own
-fence) and `sess_teardown.go:750` (teardown, under a won `claimTeardown`, and after
-`discardQ2AffClaimsFor` has marked every assignment of the generation). Only the sweep's
-acts on evidence weaker than its consequence; that is F-036's third manifestation below.
+**Census-accuracy note, added 2026-09-01 by F-036 course E, and it is a DEFECT IN THIS
+CENSUS rather than in the code.** This census's per-site totals and line numbers were
+already wrong before course E, so course E does **not** restate them by subtracting from
+them. Measured against the current tree: the reap class has **17 direct production call
+sites** (five in `orphan_qos2_sweep.go`, eleven in `qos2_shared_affine.go`, and **one in
+`mqtt.go` that this enumeration never listed at all**, in the PUBREL/PUBCOMP discharge
+path), excluding `reapQ2AffClaim`'s own delegation to `reapQ2AffClaimChecked`. The cited
+line numbers are stale too, verified with `git show` against HEAD `4afa533`:
+`qos2_shared_affine.go:1727` is a blank line there. Course E's own contribution is the
+MECHANICAL fact stated above — one reap site and one transition site removed — and nothing
+here should be read as a verified inventory until the class is re-censused. That re-census
+is filed in §0.5 of `docs/ROADMAP.md`; a lineage or TOCTOU audit must redo it from the tree
+rather than trusting these numbers.
+
+**3. Affine consumer deletes (THREE).** *Count updated by F-036 course E: the sweep's
+delete — the one this entry called out as acting on evidence weaker than its consequence,
+and F-036's third manifestation — was REMOVED, not hardened. Every remaining one runs
+under a session-side fence, so the class no longer contains a member that deletes on
+absence alone.* `qos2_shared_affine.go:1137` (provisioning rollback, `minted` only —
+nothing durable ever referenced that generation), `:2474` (`finishQ2AffineUnwind`, under
+the session's own fence) and `sess_teardown.go:750` (teardown, under a won
+`claimTeardown`, and after `discardQ2AffClaimsFor` has marked every assignment of the
+generation). What the removal costs is a permanent leak, stated in
+`docs/CONFORMANCE.md`; two of the three remaining deletes have no retry anchor if they
+fail, which is part of that residual. **This count IS verified against the current tree**,
+unlike the two above: `deleteConsumer(mqttOutStreamName, ...)` yields exactly these three
+affine sites plus two PUBREL ones (`sess_teardown.go` and
+`deleteOrphanPubRelConsumers`).
 The two **PUBREL** consumer deletes on the same stream — `orphan_qos2_sweep.go:2202` and
 `sess_teardown.go:732` — are **outside this finding's bound**: no assignment claim
 references a PUBREL durable or its copies (`CopySubject` and `AffDurable` are Q2AFF-shaped
@@ -779,10 +807,12 @@ manifestation, and two dispositions that are not defects at all.
 - **F-065** — `reapQ2AffClaim` deletes on a copy-absence reading taken before its own
   `SourceAcked` transition.
 
-**A fourth consequence sorts onto F-036, and that sort was CORRECTED during review.** The
-sweep's affine consumer delete is by name, and a session resuming inside its final window
+**A fourth consequence sorted onto F-036, and that sort was CORRECTED during review.**
+(Read this in the past tense: F-036 course E removed the delete, so the consequence is
+DISSOLVED. The reasoning is kept because it is what refused every guarded version.) The
+sweep's affine consumer delete was by name, and a session resuming inside its final window
 ADOPTS the consumer rather than recreating it — provisioning is a create-or-UPDATE — so
-step (5)'s `Created` fingerprint does not discriminate it. The audit first filed this as a
+step (5)'s `Created` fingerprint did not discriminate it. The audit first filed this as a
 defect of ours, reasoning that the record was genuinely absent when step (4) read it and
 so no false-absence inference was involved. **That reasoning does not hold.**
 `sess.q2AffGen` is only ever populated from a persisted record (`mqtt.go:6045`, `:8702`,
@@ -804,11 +834,12 @@ marks every assignment of the retiring generation `Discarded` before deleting it
 permits the delivery to die with it. What F-036 owns there is the obsolete broker object
 continuing to serve after that termination, not the discard.
 
-**Also benign, and stated so rather than filed.** The sweep's consumer delete committing
-while its response is lost skips that pass's reaps (`orphan_qos2_sweep.go:2058-2070`), but
-the next pass independently revisits orphan `Discarded` claims and calls the reaper
-(`:1783-1793`). The end state is a bounded delay in reaping an otherwise-reapable subset,
-not durable accumulation.
+**Also benign, and stated so rather than filed — and now MOOT.** The sweep's consumer
+delete committing while its response was lost skipped that pass's reaps, but the next pass
+independently revisited orphan `Discarded` claims and called the reaper. The end state
+was a bounded delay in reaping an otherwise-reapable subset, not durable accumulation. F-036
+course E removed that delete, so this window no longer exists; what replaced it is not
+a delay but the accepted leak in `docs/CONFORMANCE.md`.
 
 ### Correcting the statements that made these unrecognisable
 
@@ -995,37 +1026,61 @@ BEFORE admission, so an admitted release can name the RETIRED generation's subje
 FRESH generation's subjects are exactly what a displaced connection can reach. Filed as
 family 6 of §0.5's comment-corpus sweep.
 
-**Q2 is SETTLED as course E, and it is a DELETION — decided, NOT YET IMPLEMENTED.** When it
-lands, `deleteOrphanQ2AffConsumers` is removed OUTRIGHT rather than only its step-6 consumer
-delete: with the delete forbidden its step-2 `Discarded` writes become an unlicensed
+**Q2 was SETTLED as course E, and it has LANDED.** `deleteOrphanQ2AffConsumers` is removed
+OUTRIGHT rather than only its step-6 consumer
+delete: with the delete forbidden its step-2 `Discarded` writes became an unlicensed
 destructive decision rather than preparation, both record revalidations and the
-`ConsumerInfo.Created` fingerprint guard only that delete, `mqttQ2AffGenerationSettled` loses
-its only caller, and step 7's reaps lose their premise — `reconcileOrphanQ2AffClaims` already
-retries an existing `Discarded` claim, so the general retry is not lost. **Until it lands
-the function remains defined and invoked, and its destructive route is live.** Every positive
+`ConsumerInfo.Created` fingerprint guarded only that delete, `mqttQ2AffGenerationSettled`
+lost
+its only caller, and step 7's reaps lost their premise — `reconcileOrphanQ2AffClaims` already
+retries an existing `Discarded` claim, so the general retry is not lost. Removed with it,
+as
+dead once the function was gone: `mqttQuarantineConsumerKey`, `mqttParseQ2AffDurable` and
+`mqttSessRefs.affDurables`, whose only reader was the deleted candidate check. Every positive
 authorization was refused on its own terms: a retirement proof is structurally unavailable,
 because the watermark names the SESSION generation while the consumer is keyed by an affine
 generation that OUTLIVES incarnations; consumer metadata has the same mismatch; removing only
 the absent-record route still lets a stale owner create a fresh nonterminal claim after the
 verification scan, destroying a live copy and leaving F-064's claim-without-copy state; and
 `NumPending == 0` is an instantaneous observation, not a fence. **The accepted price is a
-PERMANENT UNBOUNDED LEAK** — the affine consumer's `InactiveThreshold` is deliberately zero
+PERMANENT UNBOUNDED LEAK, and implementation MEASURED it larger than this paragraph first
+recorded: it is a CORRELATED TRIPLE, not a consumer alone.** The affine consumer's
+`InactiveThreshold` is deliberately zero
 and the stream refuses any `ConsumerLimits.InactiveThreshold`, so a consumer the sweep
-declines to delete has **no automatic orphan-collection backstop** left. That is
-narrower than "never collected", and deliberately so: `deleteTeardownTargets` still
+declines to delete has **no automatic orphan-collection backstop** left. Its
+interest-retained COPIES stay with it, and so do the CLAIMS those copies belong to:
+`reapable` requires the copy to be authoritatively absent as well as `SourceAcked` — "a copy
+that still exists keeps its claim, whatever else is proven" — and step 7 worked only because
+step 6 had just made the copies absent. The surviving `discardAbsentWinnerClaim` keeps
+CREATING that third population, so it is not merely a pre-change shape.
+That is still narrower than "never collected": `deleteTeardownTargets` still
 deletes `t.q2AffDur`, and the rollback and unwind paths also delete affine consumers, so a
-consumer whose session is later torn down or re-entered can still reach lifecycle cleanup.
-What leaks permanently, and without a cardinality bound, is a consumer with **no later
-authorized teardown or adoption** — and that is preferred to an unclosed
-acknowledged-message destruction path. **"Independently terminal" is
+consumer whose session is later torn down or re-entered can still reach lifecycle
+cleanup —
+and its claims then become reapable once `SourceAcked` is also proven, since a consumer
+delete removes only the copy-side blocker. **A resuming session's adoption is not a
+deletion route** — teardown adoption is a different thing, see the manifestation below —
+but it is not inert either: a completed delivery after it, or
+`settleRetiredAffineRegister`, can retire the copy and the claim. What leaks permanently,
+and without a cardinality bound, is the
+triple with **no later authorized teardown, adoption or register settlement** — plus one
+class implementation added: every authorized cleanup route that FAILS after dropping its
+reference, with no retry anchor (`dispose`'s failure arm, `finishQ2AffineUnwind`'s failed
+delete, provisioning rollback's failed minted delete). All of that is preferred to an
+unclosed acknowledged-message destruction path. **"Independently terminal" is
 `Discarded ∨ Lost ∨ AffineDone`, which ALREADY EXISTS as `mqttQ2AffClaim.terminal()`**, so
 the definition this finding owed is discharged by pointing at it; an empty owned inventory
 authorizes NOTHING and must never authorize by vacuous truth. **On landing** the
-destructive-decision census will drop from ten to eight and F-033's "adoption blind spot"
-manifestation below will be **dissolved rather than narrowed**, because it exists only through
-a by-name delete of a consumer a resuming session adopts. Course E also owes a
-`docs/CONFORMANCE.md` leak residual and the correction of every statement naming the orphan
-sweep as a later affine-consumer cleanup route.
+destructive-decision census dropped from ten to eight; F-033's route census lost **one claim
+transition and one reap** — its own totals are stale and are NOT restated here, see that
+census's accuracy note and §0.5's re-census bullet — while its **affine consumer delete count
+of three IS verified** against the tree; and F-033's "adoption blind
+spot" manifestation below is **dissolved rather than narrowed**, because it existed only
+through a by-name delete of a consumer a resuming session adopts. The
+`docs/CONFORMANCE.md` leak residual landed with it, as did the correction of every statement
+naming the orphan sweep as a later affine-consumer cleanup route — found by a mechanical
+closure rather than a list, after three review rounds each named one more site a hand list
+had missed.
 
 **Q1: OPEN 2's classifier is PROVED CONDITIONALLY.** The sequence half survived three
 adversarial rounds with no counterexample: refuse iff the watermark is valid and
@@ -1252,9 +1307,63 @@ F-034 check is satisfied by such a register, so none of them is what would stop 
 deletion. If a future change makes any of those assertions fail, the residual has been
 closed by something other than this finding and the routing must be re-derived.
 
-### A third manifestation added by F-033's audit (2026-08-18): the adoption blind spot
+### A fourth manifestation (2026-09-01), found by course E's own structural guard
 
-`deleteOrphanQ2AffConsumers` deletes an orphaned affine consumer **by name**, after two
+**Teardown adoption's affine consumer delete.**
+
+**No new finding ID and no second checkbox**, per this finding's own precedent for
+consequences of its own causal defect — the previous owner keeps serving after durable
+ownership moved.
+
+**How it was found, which is worth recording.** Course E added
+`TestQ2AffineConsumerDeletesAreInventoried`, a package-wide inventory of every
+`$MQTT_out` consumer delete. Writing it surfaced that
+`deleteTeardownTargets` IS reachable from the sweep, because the sweep adopts abandoned
+teardown markers and finishes them (`finishAdoptedTeardown`). Five prose review rounds had
+not noticed. The guard's sixth review round then produced the interleaving below. A property
+found what an enumeration could not.
+
+**The window.** `deleteTeardownTargets` runs `discardQ2AffClaimsFor` and then deletes
+`t.q2AffDur` (`sess_teardown.go:847` then `:852`). A won `claimTeardown` arbitrates the
+**session record**; it does **not** fence a stale peer still serving the same AFFINE
+generation. So that peer can `beginQ2AffOp` and win a create-only claim CAS after the scan
+returns and before the delete lands, materialize onto the consumer, and then commit the
+irreversible source acknowledgement on a copy-presence proof taken before the delete —
+leaving a `materialized ∧ SourceAcked` claim whose payload was destroyed.
+
+**Both halves were already recorded, which is why this is a manifestation rather than a new
+defect.** The unfenced scan is this finding's own refuted-design note: "teardown's
+`discardQ2AffClaimsFor` is a stream scan plus per-claim CAS and installs NO fence against
+future claim creation." The proof-to-ack interval is **F-063's stated residual** in
+`docs/CONFORMANCE.md` — "a consumer deleted between the final proof and the ack" — and is
+cross-referenced rather than restated as a second residual.
+
+**It is PRE-EXISTING and path-independent, and course E neither introduced nor widened it.**
+`sess_teardown.go` is unchanged from HEAD `4afa533`, and the scan-then-delete sequence lives
+inside `deleteTeardownTargets`, reached identically by ordinary teardown (`mqtt.go:10876`,
+`:10930`) and by the sweep's adoption (`sess_teardown.go:1124`). Removing only the sweep's
+route would change which driver reaches the window without closing it, while permanently
+stranding the consumer and its copies for every client that never returns — which is why
+that course was **refused** rather than deferred.
+
+**What closing it needs, and why it is not course E's:** a distributed fence preventing every
+same-generation session from starting or completing a move, then a complete post-fence
+discard scan. That fence is F-036's **remaining unit** — the incarnation admission invariant
+whose placement closure stopped the 2026-08-27 and 2026-09-01 attempts with no code either
+time. The guard's inventory therefore carries this site as *known pre-existing, outside course
+E's behavioral change, owned by open F-036, retained without any claim that it is race-free*.
+
+### A third manifestation added by F-033's audit (2026-08-18): the adoption blind spot — DISSOLVED
+
+**DISSOLVED, not narrowed, by F-036 course E.** This manifestation existed only through a
+by-name delete of a consumer a resuming session adopts, and that delete no longer exists:
+`deleteOrphanQ2AffConsumers` was removed outright. There is no window left to guard, and no
+fix is owed for it. The account below is kept because its reasoning is what refused every
+guarded version of the delete — an instance fingerprint cannot see an adoption — and a
+future reader proposing one needs to meet that argument rather than rediscover it. Read it
+in the past tense.
+
+`deleteOrphanQ2AffConsumers` deleted an orphaned affine consumer **by name**, after two
 guards: a final session-record re-read (step 4) and a check that the consumer is still the
 INSTANCE quarantine observed, by `ConsumerInfo.Created` (step 5). **Neither discriminates
 a
@@ -1285,7 +1394,9 @@ bound the consumer delete will still delete a live adopted consumer; the delete 
 arbitration, not a third read. The resulting state — a live matching record whose affine
 consumer is gone — is also precisely **F-064**'s precondition, so this manifestation
 reaches that finding's permanent stall as well as destroying the copies directly.
-`TestQ2AffResumeAdoptsConsumerKeepingItsCreated` pins the adoption mechanism.
+`TestQ2AffResumeAdoptsConsumerKeepingItsCreated` pins the adoption mechanism, and is kept
+after course E precisely because it is the standing refutation of any future by-name delete
+guarded by an instance fingerprint.
 
 ## F-062
 
@@ -1999,8 +2110,10 @@ monotonicity — the owner's failure set may shrink and must never grow.
 
 `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen` **alone**
 (`orphan_qos2_sweep.go:884`), and `reconcileOrphanQ2AffClaims` skips every claim of a
-referenced generation (`:1765`); `deleteOrphanQ2AffConsumers` skips the generation for
-the same reason. Under a live, matching record the sweep therefore touches **no claim of
+referenced generation (`:1765`). (`deleteOrphanQ2AffConsumers` skipped the generation for
+the same reason; F-036 course E removed that function, so the reference skip now has one
+consumer rather than two — which changes nothing about this finding, since the skip itself
+is untouched.) Under a live, matching record the sweep therefore touches **no claim of
 that generation at all** — deliberately, because the owner is presumed to be coming back.
 The premise that makes that safe is **"a live generation reference makes owner resume a
 sufficient reconciler"**, and `recoverQ2AffClaims` is indeed the only thing that ever
@@ -2103,8 +2216,10 @@ discards the claims and its confirming save then fails DEFINITELY, so
 `restoreQ2AffineUnwind` puts the live path back under a session that keeps running
 (`mqtt.go:7504-7512`) — and that restore leaves `q2AffReady = false` while the delivery
 callback never tests readiness, so the copy still NAK-loops on the retained consumer. In the
-first construction a later successful orphan pass can still delete the consumer, so the
-strand is bounded by that pass rather than permanent.
+first construction a later successful orphan pass could once delete the consumer, which
+bounded the strand. **F-036 course E removed that pass's consumer delete, so the strand is
+now PERMANENT rather than bounded** — it is part of the accepted correlated leak in
+`docs/CONFORMANCE.md`, and this is the sharpest instance of what that removal costs.
 
 **Not closed by the existing guard.** `materializeQ2AffCopy`'s `Discarded` check reads the
 caller's **already-loaded** claim, which predates the concurrent transition.

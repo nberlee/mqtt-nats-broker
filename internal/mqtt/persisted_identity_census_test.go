@@ -638,7 +638,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 	}
 
 	m["StreamConsumerLimits"] = map[string]censusDisposition{
-		"InactiveThreshold": local("a stream-forced consumer inactivity threshold. Fatal on $MQTT_out, where it would reap a disconnected session's affine consumer; waived on $MQTT_msgs, where the drain and shared paths refuse it at RUNTIME instead"),
+		"InactiveThreshold": local("a stream-forced consumer inactivity threshold. Fatal on $MQTT_out, where it would reap a disconnected session's affine consumer; waived on $MQTT_msgs, where the drain and shared paths refuse it at RUNTIME instead. Since F-036 course E this refusal is also why an uncollected affine consumer leaks with no backstop at all"),
 		"MaxAckPending":     local("a stream-forced in-flight cap; fatal when below the broker's effective cap"),
 	}
 
@@ -647,10 +647,12 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Name":   {kind: identityLocal, encoding: encJSON, reason: "the consumer name, which the bridge minted before the create"},
 		"Config": {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "the persisted configuration, dispositioned once under its own type"},
 		"Created": {kind: identityLocal, encoding: encJSON,
-			reason: "the JetStream-issued consumer INSTANCE fingerprint. The orphan sweep uses it as an " +
-				"identity and explicitly not as an age, and a create-or-update leaves it UNCHANGED — which " +
-				"is the adoption blind spot F-033's audit recorded. Local because the consumer's own " +
-				"lifecycle issues it, but it is issued by a different Raft group than the state it guards"},
+			reason: "the JetStream-issued consumer INSTANCE fingerprint. The orphan sweep's PUBREL class " +
+				"uses it as an identity and explicitly not as an age. A create-or-update leaves it " +
+				"UNCHANGED, which is why it cannot see an adoption — the blind spot F-033's audit " +
+				"recorded against the AFFINE consumer delete, now HISTORICAL because F-036 course E " +
+				"removed that delete outright. Local because the consumer's own lifecycle issues it, " +
+				"but it is issued by a different Raft group than the state it guards"},
 		"Delivered":      {kind: embeddedType, embeds: "SequenceInfo", encoding: encJSON, reason: "the delivery cursor: consumer STATE, which acks mutate"},
 		"AckFloor":       {kind: embeddedType, embeds: "SequenceInfo", encoding: encJSON, reason: "the ack floor: the consumer state confirmAck waits for"},
 		"NumAckPending":  local("in-flight count; the accounting Receive Maximum interacts with"),

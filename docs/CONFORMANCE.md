@@ -476,6 +476,72 @@ weaken the ordering assertion that caught it.
 is
 closed.
 
+### The orphan sweep no longer reclaims an affine consumer by absence, and the leak is accepted
+
+**F-036 course E.** `deleteOrphanQ2AffConsumers` was removed outright, so the sweep's
+candidate-reclamation route no longer deletes a `$MQTT_Q2AFF_*` consumer. What replaced
+it is nothing: the route is gone rather than guarded.
+
+**Scope of that statement, precisely.** It is about the reclamation route, not about
+reachability from the sweep. Teardown-marker adoption still runs `deleteTeardownTargets`,
+which deletes `t.q2AffDur`, so a sweep pass can still cause an affine consumer delete. That
+route is pre-existing and unchanged, and it is **not** claimed to be race-free: a won
+`claimTeardown` authorizes proceeding with lifecycle teardown relative to the claimed record,
+but it does not fence a stale same-affine-generation peer's `beginQ2AffOp` and create-only
+claim CAS, so `discardQ2AffClaimsFor`'s scan can be outrun. That window belongs to **F-036**,
+with the proof-to-ack residual below behind its second half.
+
+**Why there is no guarded version.** `$MQTT_out` is interest-retained, so deleting an
+affine consumer destroys the acknowledged QoS 2 payloads it holds, and every positive
+authorization for that delete was sought and refused. A retirement proof is structurally
+unavailable — `recordGenRetirement` writes the **session** generation while the consumer is
+keyed by an **affine** generation that outlives incarnations. Consumer metadata has the
+same mismatch. `NumPending == 0` is an instantaneous observation, not a fence. Removing
+only the absent-record route still lets a stale owner create a fresh nonterminal claim
+after the verification scan, because `discardQ2AffClaimsFor` installs no fence against
+future claim creation. And the two guards that read as defenses were not: a record re-read
+cannot distinguish "no session" from "a live session whose record is absent" (F-036's own
+premise), and the `ConsumerInfo.Created` instance fingerprint cannot see an **adoption**,
+since provisioning is a create-or-update that leaves it unchanged.
+
+**What leaks is an unbounded CORRELATED population**, not a consumer alone:
+
+1. the `$MQTT_Q2AFF_*` consumer;
+2. its interest-retained copies on `$MQTT_out`;
+3. the claims on `$MQTT_qos2assign` whose copies remain present. `reapable` requires
+   **both** `SourceAcked` and the copy to be authoritatively absent — "a copy that still
+   exists keeps its claim, whatever else is proven" — and the old delete is what used to
+   make those copies absent. The surviving `discardAbsentWinnerClaim` keeps **creating**
+   this population, so it is not merely a pre-change shape.
+
+There is **no automatic consumer backstop**: the affine consumer's `InactiveThreshold` is
+deliberately zero and `$MQTT_out` refuses any `ConsumerLimits.InactiveThreshold`, so
+nothing ages it out.
+
+**It is not categorical, and the qualifiers are load-bearing.** Successful teardown
+(`deleteTeardownTargets` still deletes `t.q2AffDur`), rollback and a successful unwind
+remain authorized deletion routes; a consumer reaching one is still collected, and its
+claims become reapable **once `SourceAcked` is also proven** — a consumer delete removes
+only the copy-side blocker. **Adoption is not a deletion route**, but it is not inert
+either: a completed delivery after it (`mqttFinishQ2AffineDelivery`) records completion,
+confirms the copy acknowledgement and reaps the claim, and
+`settleRetiredAffineRegister` can do the same on its own retired-register evidence. The
+claim sweep also revisits such a claim every pass, though it cannot itself remove a
+present copy.
+
+**One class has no backstop at all, and it is stated as a class rather than a list**:
+every authorized cleanup route that **fails** after dropping the durable or in-memory
+reference, with no retry anchor. Its known members are the unused-path unwind's `dispose`
+failure arm, `finishQ2AffineUnwind`'s failed consumer delete, and provisioning rollback's
+failed minted-consumer delete. All three previously depended on orphan collection; each
+now logs that the consumer is retained and must be removed by hand.
+
+**Why this is accepted.** The alternative is an unclosed destruction path for
+acknowledged messages, which also manufactured F-064's claim-without-copy precondition.
+A leak is preferred to a loss. F-036 itself **remains an open alpha blocker**: the
+incarnation admission invariant, the two-dimensional classifier, sites 1 and 3, and the
+single-broker clear-to-bind silent loss are all untouched by this change.
+
 ### Shared-subscription QoS 2: affinity holds, against a non-atomic proof
 
 A QoS 2 message the broker has started sending to a Shared Subscription member
@@ -550,13 +616,15 @@ is RETAINED rather than collected:
 3. the attempt's final claim observation is itself indeterminate, which retains the copy
    by design rather than guessing at it.
 
-Three later events remove such a copy: the winner's ordinary session teardown, which
-deletes the affine consumer and takes its retained copies with it; a later orphan-sweep
-pass deleting that consumer once no session record references it; or, where a LATER
+Two later events remove such a copy: the winner's ordinary session teardown, which
+deletes the affine consumer and takes its retained copies with it; or, where a LATER
 incarnation now holds the claim subject, the delivery gate disposing the superseded copy
 on its next redelivery — a positive fact about a record just read, not an inference from
-an absence. Where none of the three occurs — a session that keeps running, never resumes,
-and whose claim subject no later incarnation claims — the copy is retained until an
+an absence. **A third used to exist and no longer does**: an orphan-sweep pass deleting
+that consumer once no session record referenced it, removed by F-036 course E because no
+positive fact could authorize it. Where neither of the two occurs — a session that keeps
+running, never resumes, and whose claim subject no later incarnation claims — the copy is
+retained until an
 operator removes it or F-066's stream-identity remedy supplies the fact that would
 license collecting it. A retained copy is invisible to the client: it is never
 published, because the delivery gate refuses a copy no live claim of its own incarnation
@@ -786,13 +854,16 @@ precondition, so nothing can fence the update against a concurrent stream change
 
 Three of the contender-side refusals leave debris worth naming. The teardown check
 narrows but does not close its race, because consumer
-creation has no precondition on the record's sequence — `deleteOrphanQ2AffConsumers`
-removes a recreated durable only once the reference is gone. A stream update landing
+creation has no precondition on the record's sequence, and **nothing reclaims a
+recreated affine durable by reference any more**: F-036 course E removed
+`deleteOrphanQ2AffConsumers`. A stream update landing
 between the inactivity pre-check and the create yields a nonzero effective threshold
 that the returned-config arm refuses; a positive one leaves a durable carrying a
 deletion timer, which that same limit later reaps, while a **negative** one leaves a
 timerless durable that nothing reaps on a threshold, since there is none — ordinary
-teardown deletes it, and the orphan pass is the fallback. And restoration can still
+teardown deletes it, and there is **no sweep fallback behind that**: if the session
+never reaches an authorized teardown the durable is retained until an operator removes
+it, which is the course-E leak stated above. And restoration can still
 keep nothing while `$MQTT_out`'s configured duplicate window has an entry for the
 copy's stable `Nats-Msg-Id` from an earlier no-interest store; the validator waives
 `Duplicates`, so that bound is operator-configured.
@@ -829,8 +900,10 @@ than that one session:
   present, and only that half.** The record carries qos-2 memberships while naming no
   affine generation, so it contributes no affine reference although the session it
   describes may own an affine consumer and outstanding claims; nothing can then prove
-  which affine resources are still referenced, and affine claim reconciliation and
-  affine consumer deletion are skipped for every session in the account. Since
+  which affine generations are still referenced, and `reconcileOrphanQ2AffClaims` is
+  suppressed for every session in the account. (It also suppressed affine consumer
+  deletion until F-036 course E removed that route; the retired affine **register** arm is
+  not behind the gate.) Since
   nothing removes the record, that is permanent, and it is logged as a warning naming
   the recovery on every pass. **Inbound QoS 2 holds, outbound in-flight registers and
   PUBREL consumers keep being reclaimed**: the record's identity and generation are
@@ -1441,7 +1514,9 @@ it does *not* promise:
   in this order: confirm the record that no longer names the path, discard the
   generation's assignments, release the delivery subscription and the MaxAckPending
   charge, and only then delete the consumer — a delete whose own failure is logged and
-  leaves an unreferenced durable for the orphan sweep. A generation the save merely
+  leaves an unreferenced durable with **no retry anchor**: since F-036 course E the orphan
+  sweep does not collect an affine consumer, so it is retained until an authorized lifecycle
+  cleanup reaches it or an operator removes it by hand. A generation the save merely
   re-established is deliberately excluded: it may owe assignments to a delivery already
   started to it. If the assignment scan FAILS — it is account-wide and fails closed on any
   claim it cannot read or attribute — the subscription and the charge are still released,
@@ -1449,14 +1524,17 @@ it does *not* promise:
   is a STREAMING one, so its progress is PARTIAL rather than none: the generation's claims
   the scan had already reached are discarded, and a claim that was already proven on both
   sides may also have been reaped, while the malformed record aborts the remainder. Those
-  remaining assignments and the consumer stay pending, and they are not merely deferred to
-  the orphan sweep: the same unreadable claim aborts that sweep's affine inventory too,
-  deliberately, since an incomplete inventory cannot authorize any consumer delete. Until
-  that record is repaired or removed, one malformed claim therefore wedges affine CONSUMER
-  reclamation account-wide, leaving an unreferenced consumer on `$MQTT_out` for as long as
-  it persists. The wedge is confined to that class: the sweep's other phases —
-  including PUBREL durable reclamation, which needs no assignment inventory — keep
-  running. The RESIDUAL is the crash window between the ambiguous
+  remaining assignments and the consumer stay pending, and they are not deferred to
+  the orphan sweep either: **since F-036 course E its candidate-reclamation route no longer
+  reclaims an affine consumer by absence**, and even for the CLAIMS it does reconcile the
+  same unreadable claim aborts its inventory, deliberately, since an incomplete inventory
+  cannot authorize a transition. So
+  an unreferenced consumer stays on `$MQTT_out` regardless of this record — that is the
+  accepted course-E leak, not a wedge — while what this malformed claim additionally wedges
+  is affine CLAIM reconciliation account-wide until the record is repaired or removed.
+  That wedge is confined to that class: the sweep's other phases — including PUBREL
+  durable reclamation, which needs no assignment inventory — keep running.
+  The RESIDUAL is the crash window between the ambiguous
   save and its settlement. After a restart the record names the path and the resume
   re-establishes it — without recharging, and without reclaiming it. From there session
   TEARDOWN is the only thing that removes it: a later shared QoS 2 SUBSCRIBE reuses the
@@ -2600,8 +2678,9 @@ Residuals and hard requirements:
   narrowed rather than closed, because a JetStream consumer delete is by name and
   unconditioned: a record save can land after the final re-read (no leader transition
   needed — a broker pausing between the consumer create and the record save suffices),
-  and the durable can be deleted and recreated after the instance re-lookup. Both are
-  the same bound the affine reaper already has. The consequence of losing that race is
+  and the durable can be deleted and recreated after the instance re-lookup. (These used
+  to be stated as "the same bound the affine reaper has"; that reaper is gone, so they
+  stand on their own.) The consequence of losing that race is
   bounded rather than silent: the owning session's next resume verifies its PUBREL
   durable and recreates an absent one, so what is lost is the PUBRELs it held — the
   outbound QoS 2 completions those exchanges owed are not re-sent.
