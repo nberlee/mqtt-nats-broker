@@ -6843,7 +6843,9 @@ func testMQTTStartParkedReconcile(t testing.TB, asm *mqttAccountSessionManager, 
 func testMQTTPendingExpiryTimer(asm *mqttAccountSessionManager, idHash string) *time.Timer {
 	asm.mu.Lock()
 	defer asm.mu.Unlock()
-	return asm.pendingExpiries[idHash]
+	// The entry carries its install token beside the timer since F-036 unit 1; what
+	// this helper's callers ask about is the timer.
+	return asm.pendingExpiries[idHash].timer
 }
 
 func testMQTTReconcileEntryPresent(asm *mqttAccountSessionManager, idHash string) bool {
@@ -8942,5 +8944,53 @@ func TestMQTTInjectTopicAlias(t *testing.T) {
 	// A block whose length prefix does not match its size is rejected.
 	if _, ok := mqttInjectTopicAlias([]byte{0x7f, 0x01}, 1); ok {
 		t.Fatal("expected ok=false for a malformed block")
+	}
+}
+
+// A clean-start contender that meets an incumbent whose incarnation will not drain is
+// TOLD 0x89, not just dropped (F-036 unit 1). The whole disposition of that ceiling is
+// "retry": nothing is detached, cleared or disposed, so the contender has to be able to
+// tell a retryable refusal from a transport failure, and a bare socket close leaves
+// that to the client's own guesswork. docs/CONFORMANCE.md states this reason.
+func TestMQTTv5CleanStartDrainCeilingRefusesWithServerBusy(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	prev := mqttIncarnationDrainTimeout
+	mqttIncarnationDrainTimeout = 300 * time.Millisecond
+	defer func() { mqttIncarnationDrainTimeout = prev }()
+
+	// The incumbent.
+	ci := &mqttV5ConnInfo{clientID: "drainceiling", cleanStart: true}
+	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// An owner of the incumbent's incarnation that will not release: this stands for a
+	// route admitted just before the takeover and still in flight.
+	asm := testMQTTGetAccountSessionManager(t, s, "drainceiling")
+	asm.mu.RLock()
+	sess := asm.sessByHash[getHash("drainceiling")]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the incumbent's session must be resident for this fixture to mean anything")
+	}
+	sess.mu.Lock()
+	tr := sess.leases
+	sess.mu.Unlock()
+	wedged, ok := tr.acquire()
+	if !ok {
+		t.Fatal("the incumbent's incarnation must admit an owner")
+	}
+	defer wedged.release()
+
+	// The contender: same client ID, clean start, so it drives the retirement.
+	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	_, reason, _ := testMQTTReadConnAckV5(t, r2)
+	if reason != mqttReasonServerBusy {
+		t.Fatalf("a drain-ceiling refusal must answer 0x%x (server busy, retry), got 0x%x",
+			mqttReasonServerBusy, reason)
 	}
 }

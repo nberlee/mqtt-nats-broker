@@ -159,7 +159,9 @@ func TestMQTTRetainedSendHoldsItsIdentifierAcrossADiscard(t *testing.T) {
 
 	// The discard: pendingPublish is nilled and last_pi reset, while sess.c is still this
 	// connection. From here the hold is the identifier's ONLY reservation.
-	if err := e.sess.clear(true); err != nil {
+	// A client is BOUND here, so the discard runs the production two-phase
+	// retirement (detach before the re-mint) rather than a bare clear().
+	if err := mqttTestRetireBound(t, e.asm, e.sess, true); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
 	if !e.reserved(pi) {
@@ -303,7 +305,9 @@ func TestMQTTRetainedSendHoldSurvivesTheBufferedSpan(t *testing.T) {
 	e := testNewRetainedEnv(t, "retained-buffered")
 	_, pi := e.buffer(t, "foo/bar", 2)
 
-	if err := e.sess.clear(true); err != nil {
+	// A client is BOUND here, so the discard runs the production two-phase
+	// retirement (detach before the re-mint) rather than a bare clear().
+	if err := mqttTestRetireBound(t, e.asm, e.sess, true); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
 	if !e.reserved(pi) {

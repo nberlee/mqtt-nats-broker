@@ -5308,6 +5308,164 @@ Shared group durables stay outside all of this: they are not owned by one sessio
 and are released last, by the existing last-holder record scan, only once this
 session's record is gone.
 
+### The incarnation completion lease
+
+Re-minting a generation protects the NEXT incarnation from the retiring one's late
+writes, and for years the clean-start discard did it **while the displaced client was
+still bound and still admitted**. That was F-036's own defect, and its cost was not
+theoretical: a displaced PUBREL derives its hold subject from `sess.gen` at handler
+time, so once the generation moved it looked under the FRESH incarnation's subject,
+found nothing, and answered a success-shaped PUBCOMP — telling a client an
+exactly-once exchange had completed for a payload the same teardown then destroyed.
+One broker, no crash, no peer.
+
+The property that has to hold is **P**: *a session object's incarnation generation
+changes only while no client is bound to it*. What makes P enforceable rather than
+asserted is a per-incarnation ownership ledger (`internal/mqtt/sess_lease.go`).
+
+**The tracker, and why identity is the object.** Each incarnation gets a fresh
+`mqttIncarnationTracker` — `open → closing → retired`, an owner count, and three
+per-close-cycle channels. Every owner CAPTURES the tracker it was admitted by, so a
+late release lands on the incarnation that admitted it and can never decrement the
+fresh one's count. The channels are recreated by `reopen()`, so a closed channel from
+an aborted transition can never satisfy a later transition's drain.
+
+**A lease is a capability, not a bit.** `mqttLease` is a pointer with a released
+flag, checked and changed under the same mutex as the count, so a retained copy cannot
+resurrect ownership once the drain proof exists. `promote()` converts a self-retiring
+caller's own lease into tracker-only debt — so a caller performing the retirement never
+waits on itself — and revokes it in the same operation.
+
+**The boundary is local execution, not the transport.** There is deliberately no way to
+hand ownership to a QUEUED effect. What the lease owns is execution that can outlive the
+retirement and then observe the re-minted session, mutate the reused object, derive a
+name from the fresh incarnation, or emit the old route's protocol result. A JetStream
+entry whose subject, reply, headers and body were fully captured while the parent lease
+was held is none of those: its safety is a property of its TARGET, and those rules are
+authoritative and unchanged —
+
+- an **incarnation-scoped or per-consumer-unique** target cannot reach a successor: a
+  plain durable is `idHash + "_" + nuid.Next()`, and both the plain and the drain
+  consumer deletions are restricted to such names;
+- an **exact stream sequence** is never reused;
+- a **session-record write** that times out leaves the write UNCERTAIN, and
+  `prepareClear` refuses the retirement until a readback classifies it — which is why
+  an ambiguous record write blocks a discard rather than racing it;
+- a **deterministic shared-group** target (a group ack, `deleteSharedGroupTargetIfUnheld`,
+  the teardown's own shared release) carries the existing group-lifecycle residual, which
+  needs group-scoped arbitration and not an incarnation lease;
+- a **user subject** — the derived Sparkplug publication — is a session-independent
+  application publication that a takeover may legitimately not retract.
+
+So a JSA timeout abandons the WAITER, not necessarily the already-queued operation, and
+the retirement owes no wait beyond the synchronous owner's return.
+
+**Where ownership is acquired.** Not a list of sites — three structural boundaries:
+
+- **Per packet**, at the single pre-dispatch point in `mqttParse`, against
+  `c.mqtt.tracker`: the incarnation this CONNECTION was bound to, captured at both
+  bind sites and never cleared. That is the whole discrimination — after a re-mint the
+  displaced connection still names the RETIRED tracker and is refused, while the
+  replacement names the fresh one. The read loop holds no standing lease, so a quiet
+  displaced connection cannot hold a takeover off, and the DISCONNECT route releases
+  its own lease before entering the teardown that drains it.
+- **Per delivery**, inside `sess.processSub` — the one wrapper every session-scoped
+  delivery callback reaches its NATS subscription through, so the boundary covers the
+  class by construction. This is what closes the class three earlier attempts died on:
+  an ordinary QoS 1/2 delivery passing its own `sess.c == cc` check and then lazily
+  RECREATING a map `clear()` had nilled. A refusal skips without acking, so JetStream
+  re-offers to whoever owns the consumer next.
+- **Per timer fire**, never per timer delay. A pending expiry timer holds nothing —
+  otherwise a ten-minute deadline would hold every clean-start reconnect off for ten
+  minutes — and acquires when it fires, BEFORE it takes the client-ID gate, so a fire
+  against a retiring incarnation returns without ever holding the gate a retirement
+  needs. Each timer carries an immutable install token, so a callback that fired and
+  then lost `as.mu` to a cancel-and-re-arm cannot consume the replacement's entry and
+  expire a session it never named; and a fire that finds its incarnation retiring
+  re-arms **only if its own view is still current** — same resident object, same
+  tracker, no timer already installed. An unconditional re-arm there is a fresh
+  session's data loss rather than a nicety: a callback descheduled across a re-mint
+  would replace the new incarnation's deadline with a one-second retry, and the retry
+  would expire a session that had just connected. Where the check refuses, the sweep
+  re-arms a finite expiry from the record.
+
+An in-route bounded wait is cancelled by the retirement too. Both QoS 1/2 waits — the
+transmission gates and the phase gate — select on the tracker's per-cycle closing
+signal, because their cap is up to thirty seconds, far past the drain ceiling: a
+delivery admitted just before a takeover would otherwise hold its lease long enough to
+make the takeover refuse, repeatedly, for a reason unrelated to the contender. The
+answer on that arm is the one an armed gate already gives — WITHHELD, recorded without
+acking, so the redelivery is still a first transmission.
+
+A parked retirement obligation is watched by a worker admitted **eagerly, when the
+obligation is armed** — never spawned later by whichever release happens to drain the
+tracker. A release does nothing but close the cycle's drained channel; the worker was
+already inside the server's shutdown lifecycle before it could run. Where admission is
+refused because shutdown has begun, the discard completes SYNCHRONOUSLY on the arming
+goroutine rather than being left in memory: a clean session's record carries expiry
+interval zero and the expiry sweep skips exactly those, so there is no recovery anchor
+to defer to.
+
+The obligation's identity is the pair **{session object, its tracker}**, not the client
+ID. While a finisher waits, an uncertainty resolver can evict its object and a CONNECT
+can install a replacement under the same ID; a client-ID claim would then delete the
+replacement's map entries and leave its live connection bound to a session no lookup
+finds. Both manager indexes must still name that object, and the object must still
+carry that tracker, before the claim is taken — and the eviction that completes it is
+`removeSessionIfCurrent`.
+
+**Two-phase retirement.** `clear()` is split: `prepareClear` (both uncertainty
+refusals and the record fence — nothing mutated on any path through it), then the
+permit, then `destroy` (today's destructive body). Every caller closes the tracker and
+drains it under a wall-clock ceiling before preparing, and `setIncarnationLocked`
+REQUIRES a permit that only `retireIncarnationLocked` mints, over `sess.c == nil` and
+a drained tracker. On the one caller with a client bound, the order is: close, drain,
+capture, prepare, **detach**, mint, destroy, bind.
+
+**The capsule.** The detach takes the displaced client and its parked
+deferred-disconnect action into a `mqttRetiredBinding`, atomically, because after it
+`sess.c` is nil and every later arm would otherwise rediscover nothing: the fourth
+attempt showed a bare early detach silently drops the connection's close, its
+notification, its Will, its disconnect stamp and its expiry. The success, superseded
+and teardown-incomplete arms all consume the capsule; nothing reads `sess.c` after the
+detach. The `sess.c`-reading form of the superseded disposal was deleted rather than
+kept beside the capsule one.
+
+**Failure is refusal, never disposal under a live owner.** A drain ceiling or an
+unresolved-state refusal REOPENS the tracker, wakes the parked routes, leaves the
+incumbent bound with its Will, socket, expiry and disconnect state untouched, and
+refuses the contending CONNECT. That is the disposition the fourth attempt could not
+supply. `destroy` arms the retirement resolution by defer at entry, so every
+destructive outcome — success, superseded, teardown-incomplete, any post-reset error —
+releases parked ingress exactly once.
+
+**A clean session's discard is owed even when it cannot run.** `[MQTT-3.1.2-6]`
+requires it, and the expiry sweep skips expiry-zero records, so the close path may not
+simply leave the object resident: on a ceiling it parks a **retirement-pending**
+obligation (the tracker stays closing, which is what makes the session
+non-resumable), restores residency for reachability, and completes the discard either
+from the drain trigger — scheduled off the tracker mutex, because the finisher
+reacquires the client-ID gate — or from a CONNECT that finds the mark, JOINS the
+existing cycle rather than closing a second one, and claims the obligation under the
+gate it already holds. The claim is the arbitration; the loser finds it gone.
+
+**The record epoch is not a substitute for the drain.** It invalidates transactions
+opened before the generation ended. The completion drain additionally prevents an
+already-admitted continuation from resuming after the reset, opening a NEW transaction
+at the new epoch, recreating cleared state, or deriving a target from the re-minted
+object — which is why every discard path drains, not only the two that hand the object
+back as a fresh session.
+
+**What it does not subsume.** `sess.c != c` still discriminates the wrong CLIENT on a
+live incarnation; the lease discriminates the wrong INCARNATION. The record fence still
+serializes record writers and classifies ambiguity — it does not cover pre-fence map
+mutation, which is precisely why the lease exists. The inbound-release and affine
+fences still serialize their own in-flight windows for all six callers. Send
+reservations still hold identifier custody, and F-089's rule that a displaced
+connection's PUBCOMP debt survives the discard is preserved by making that connection
+the authority for its own holds while nothing is bound in its place — self-clearing at
+the rebind, which is the event that retires the debt.
+
 ### The generation-retirement watermark
 
 The claim licenses the deletions, and the release that says whether the claim is

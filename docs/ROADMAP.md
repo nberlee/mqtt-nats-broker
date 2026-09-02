@@ -1709,9 +1709,63 @@ further findings it surfaced are filed separately, for the reason its own bullet
   in `docs/CONFORMANCE.md`.
 
   - [ ] [F-036: Revalidate quiet resident-session
-  ownership](findings/ha-arbitration.md#f-036). **Alpha blocker. Course E LANDED
-  2026-09-01; the box STAYS OPEN and the reason is stated here so a reader does not mistake
-  a landed course E for a closed finding.** What landed is one deletion —
+  ownership](findings/ha-arbitration.md#f-036). **Alpha blocker. UNIT 1 LANDED
+  2026-09-02 (the incarnation completion lease); the box STAYS OPEN for unit 2, and the
+  reason is stated here so a reader does not mistake a landed unit 1 for a closed
+  finding.**
+
+  **SIXTH ATTEMPT, 2026-09-02: unit 1 IMPLEMENTED**, after the user OVERRODE the fifth
+  attempt's binding fallback ("no sixth F-036 design; F-072 next") with a direct
+  instruction to solve this finding, Codex leading and stop triggers converted into
+  revision triggers. Seven plan-review rounds (findings 12 → 10 → 10 → 3 → 4 → 1 → 0,
+  CLEAN at round 7) and three scope consults; the `advisor` tool was unavailable for
+  every consult, so all three were Codex-only. Lane
+  `~/.claude/lanes/f-036-sixth-attempt/`; the dossier section **"F-036's sixth attempt
+  (2026-09-02)"** is canonical for the design, and `docs/ARCHITECTURE.md`'s "The
+  incarnation completion lease" for the mechanism.
+
+  **What unit 1 CLOSES: the incarnation admission invariant**, including the
+  single-broker clean-start silent loss of an acknowledged QoS 2 message. Property P —
+  a session object's incarnation generation changes only while no client is bound to it
+  — is now MECHANICAL: `setIncarnationLocked` requires a retirement permit that only a
+  closed, drained incarnation tracker over `sess.c == nil` can mint. Ownership is
+  acquired at three STRUCTURAL boundaries rather than at a list of sites — per packet at
+  the single pre-dispatch point against the tracker the CONNECTION was bound to, per
+  delivery inside the one `sess.processSub` wrapper every session-scoped callback
+  reaches its subscription through, and per timer FIRE (never per delay, and before the
+  client-ID gate) — which is what finally closes the off-read-loop continuation class
+  that stopped attempts 2, 3 and 4. `clear()` is split into `prepareClear`/`destroy`,
+  the clean-start arm detaches between them under a capsule carrying the displaced
+  client and its parked action, and every disposition arm consumes that capsule instead
+  of re-reading `sess.c` (the `sess.c`-reading superseded disposal was DELETED).
+  **Failure is refusal, never disposal under a live owner**: a drain ceiling or an
+  unresolved-state refusal reopens admission and leaves the incumbent bound with its
+  Will, socket, expiry and disconnect state intact — the disposition the fourth attempt
+  could not supply. Residuals in `docs/CONFORMANCE.md`, including that a clean session's
+  discard may be DEFERRED (parked non-resumable, completed by the drain trigger or the
+  next CONNECT) rather than abandoned, since [MQTT-3.1.2-6] requires it and the expiry
+  sweep skips expiry-zero records.
+
+  **One real regression the existing tests caught, and the rule it leaves:** detaching
+  before the destructive half made `sweepDeadSendHoldsLocked` read every F-089 debt of
+  the displaced connection as ownerless and retire a LIVE one, freeing an identifier the
+  client still held. A displaced connection now stays the authority for its own send
+  holds while nothing is bound in its place, self-clearing at the rebind — which is the
+  event F-089 already said retires the debt. **Any change that moves a detach earlier
+  must re-check every predicate that reads `sess.c` to decide liveness.**
+
+  **What unit 1 does NOT do, and what unit 2 must:** the two-dimensional PUBREL
+  classifier and sites 1 and 3 are untouched, and the lease identity is exactly the
+  identity prerequisite the second attempt found unproved — a classifier caller can now
+  prove it acquired the currently bound incarnation, separately from the subject-derived
+  session generation and the unrelated per-exchange `rec.gen`. The teardown-owned
+  release of shared group durables was ruled OUTSIDE this boundary (scope consult 2):
+  its scan-then-delete race on a deterministic group name is the pre-existing
+  shared-subscription residual, needs group-scoped arbitration rather than an
+  incarnation lease, and unit 1 neither creates nor claims to close it.
+
+  **Course E, LANDED 2026-09-01, is a separate earlier change.** What landed there is
+  one deletion —
   `deleteOrphanQ2AffConsumers`, so the sweep's candidate-reclamation route no longer infers
   affine-consumer deletion from ABSENCE — which removes two of the ten destructive decisions
   and dissolves F-033's adoption blind spot. Read that scope exactly: teardown-marker

@@ -336,6 +336,19 @@ func (sess *mqttSession) awaitTransmissionGates(cc *client) mqttTransmissionVerd
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 
+	// RETIREMENT CANCELS THE WAIT. This wait is bounded by the phase-gate cap, which
+	// is up to 30 seconds — far past the incarnation drain ceiling — so without this
+	// arm a delivery admitted just before a clean-start takeover would hold its lease
+	// long enough to make the takeover time out and refuse, repeatedly, for a reason
+	// that has nothing to do with the contender. Closing is the incarnation this
+	// CONNECTION was admitted under, so the answer is the same one an armed gate
+	// gives: WITHHELD, which the caller records without acking, keeping the eventual
+	// redelivery a first transmission (F-036 unit 1).
+	var closing <-chan struct{}
+	if cc != nil && cc.mqtt != nil && cc.mqtt.tracker != nil {
+		closing = cc.mqtt.tracker.closingSignal()
+	}
+
 	for {
 		// Re-read BOTH on every pass. A gate that resolved while we waited on the other
 		// one must be seen here, and a gate armed while we waited must be met.
@@ -393,6 +406,8 @@ func (sess *mqttSession) awaitTransmissionGates(cc *client) mqttTransmissionVerd
 
 		select {
 		case <-pending:
+		case <-closing:
+			return mqttTransmissionWithheld
 		case <-timer.C:
 			return mqttTransmissionTimedOut
 		}

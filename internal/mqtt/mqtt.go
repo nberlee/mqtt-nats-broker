@@ -986,7 +986,9 @@ type mqttAccountSessionManager struct {
 	// session (F-084); cancelling is correct either way, because this broker may no
 	// longer write that record and so its timer must not fire against it.
 	// Spec5 [3.1.2.11.2]. Guarded by mu.
-	pendingExpiries map[string]*time.Timer
+	pendingExpiries map[string]mqttPendingExpiry
+	// expiryTokens mints mqttPendingExpiry install tokens under as.mu.
+	expiryTokens uint64
 	// Per-client reconciliation ordering state, keyed by MQTT client ID hash and
 	// guarded by mu. A remote session-record write observed by the session-record watch
 	// hands the expiry reconciliation to a spawned worker; because each worker
@@ -1670,6 +1672,22 @@ type mqttSession struct {
 	idHash string // client ID hash
 	c      *client
 	jsa    *mqttJSA
+	// retiringOwnerCID is the connection a two-phase retirement DETACHED before the
+	// re-mint (F-036 unit 1). Its F-089 send-hold debts — an unanswerable PUBCOMP, an
+	// unwritten retained frame — are still owed and still hold their identifiers: the
+	// displaced connection is closed on another goroutine, so its write can outlive
+	// the discard, which is why sendsInFlight survives it at all (F-087 WP5). Without
+	// this the predicates would compare against a nil sess.c, read every one of those
+	// debts as inert, and let the fresh incarnation mint the same identifier.
+	// Cleared when the retiring owner's last hold goes, and at the next bind.
+	retiringOwnerCID uint64
+
+	// leases is the completion-ownership ledger of the CURRENT incarnation
+	// (F-036 unit 1; see sess_lease.go). Written only by setIncarnationLocked —
+	// a fresh tracker per incarnation — and read under sess.mu. Owners acquired
+	// against a retired tracker are refused, which is what stops a displaced
+	// route serving under a re-minted generation.
+	leases *mqttIncarnationTracker
 	// asm is the account session manager this session belongs to. Needed by the
 	// shared QoS 2 affinity protocol, whose durable state (the assignment claims)
 	// is account-scoped and reached through instance-scoped helpers, from paths
@@ -2439,6 +2457,14 @@ type mqtt struct {
 	asm  *mqttAccountSessionManager // quick reference to account session manager, immutable after processConnect()
 	sess *mqttSession               // quick reference to session, immutable after processConnect()
 	cid  string                     // client ID
+
+	// tracker is the incarnation this connection was BOUND to (F-036 unit 1; see
+	// sess_lease.go). Set at each bind, in the same sess.mu section as sess.c = c,
+	// and deliberately NEVER cleared: a displaced packet arriving after the detach
+	// must still acquire the OLD, retired tracker and be refused there — clearing it
+	// would leave nothing to discriminate against, and reading sess.leases instead
+	// would let a displaced route acquire the FRESH incarnation it must not serve.
+	tracker *mqttIncarnationTracker
 
 	// proto is the negotiated protocol level: mqttProtoLevel (3.1.1) or
 	// mqttProtoLevel5 (5.0). Set during CONNECT parsing and immutable after.
@@ -3425,6 +3451,18 @@ func (c *client) mqttParse(buf []byte) error {
 	var pl int
 	var complete bool
 
+	// This packet's completion lease (F-036 unit 1). Reassigned per iteration and
+	// released at the end of the iteration; the deferred release below covers every
+	// early exit out of the middle of an iteration — the rejection gate's error and
+	// displaced arms, the SUBSCRIBE live-arbitration disposal, and DISCONNECT — since
+	// release is idempotent and only the CURRENT iteration's lease can still be held.
+	var pktLease *mqttLease
+	defer func() {
+		if pktLease != nil {
+			pktLease.release()
+		}
+	}()
+
 	for err == nil && r.hasMore() {
 
 		// Keep track of the starting of the packet, in case we have a partial
@@ -3478,6 +3516,31 @@ func (c *client) mqttParse(buf []byte) error {
 		}
 		if err = mqttCheckRemainingLength(pt, c.mqtt.proto, pl); err != nil {
 			break
+		}
+
+		// ACQUIRE THIS PACKET'S COMPLETION LEASE on the incarnation this connection
+		// was bound to, before the rejection gate and before any mutable session
+		// observation (F-036 unit 1). A displaced connection whose session object has
+		// since been re-minted holds a RETIRED tracker, so it is refused here rather
+		// than serving a packet under a generation that is not the one it was admitted
+		// under — which is how an acknowledged QoS 2 message was silently lost.
+		//
+		// Per PACKET, not per read and not per connection: the readLoop holds no
+		// standing ownership, so a quiet displaced connection cannot hold a takeover
+		// off. While the tracker is CLOSING the packet parks on that cycle's decision —
+		// a reopened transition (drain ceiling, or an unresolved-state refusal) resumes
+		// serving the incumbent, a completed one refuses.
+		if connected {
+			if pktLease != nil {
+				// Defensive: the previous iteration's release is idempotent, so this
+				// only matters if a future edit adds a path that skips the epilogue.
+				pktLease.release()
+			}
+			var ok bool
+			if pktLease, ok = c.acquirePacketLease(); !ok {
+				err = errMQTTTrackerRetired
+				break
+			}
 		}
 
 		// A definitely rejected record CAS means the session subject MOVED, so this
@@ -3763,6 +3826,15 @@ func (c *client) mqttParse(buf []byte) error {
 				// to discard. Spec5 [3.14.4].
 				c.mqttOweWill(c.mqttSessionExpiry())
 			}
+			// RELEASE BEFORE THE TEARDOWN. mqttHandleClosedClient runs the discard,
+			// which closes this incarnation's tracker and waits for it to drain — so
+			// holding this packet's own lease into it would make the graceful
+			// DISCONNECT wait for itself until the ceiling (F-036 unit 1). Idempotent,
+			// so the deferred release stays correct.
+			if pktLease != nil {
+				pktLease.release()
+				pktLease = nil
+			}
 			s.mqttHandleClosedClient(c)
 			c.closeConnection(ClientClosed)
 			return nil
@@ -3771,6 +3843,15 @@ func (c *client) mqttParse(buf []byte) error {
 			err = fmt.Errorf("%w: received unknown packet type %d", errMQTTMalformedPacket, pt>>4)
 		}
 
+		// The packet's synchronous extent — its route, its helper tails and its
+		// response enqueue — is over, so its ownership ends here. An effect it
+		// handed to the transport is NOT an owner: its target was frozen while this
+		// lease was held, and its safety is a property of that target rather than of
+		// this ledger (F-036 unit 1; see sess_lease.go).
+		if pktLease != nil {
+			pktLease.release()
+			pktLease = nil
+		}
 	}
 	if err == nil && rd > 0 {
 		r.reader.SetReadDeadline(time.Now().Add(rd))
@@ -4040,7 +4121,12 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 
 	// This needs to be done outside of any lock.
 	if doClean {
-		if err := sess.clear(true); err != nil {
+		sess.mu.Lock()
+		ceilingTracker := sess.leases
+		sess.mu.Unlock()
+		if err := sess.clearInner(true, nil,
+			s.pendingDiscardFinisher(asm, sess, ceilingTracker),
+			s.armPendingDiscardWorker); err != nil {
 			// A LATE ambiguity — armed after the entry check the discard already passed —
 			// deleted nothing, so the discard is recoverable: park it and restore the
 			// residency removeSession took above. Without that the record, the consumers,
@@ -4066,6 +4152,18 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 				// re-parked either — nothing was refused, and re-parking would resurrect a
 				// discard obligation this object no longer holds.
 				c.Debugf("MQTT: discard of session %q stopped: %v", sess.id, err)
+			case errors.Is(err, errMQTTClearDrainTimeout):
+				// An admitted route or queued effect of this incarnation is still
+				// outstanding, so nothing was deleted — but the clean-session discard is
+				// OWED ([MQTT-3.1.2-6]) and the expiry sweep skips expiry-zero records,
+				// so the object may not be left ordinary-resident. The obligation is
+				// parked on the tracker (still CLOSING, which is what makes the session
+				// non-resumable), residency is restored so a CONNECT can find the mark,
+				// and the drain trigger or that CONNECT completes the discard. The Will
+				// falls through to mqttHandleWill below, exactly as on the refusal arm.
+				// See sess_lease.go and finishPendingDiscard.
+				asm.addSession(sess, true)
+				c.Warnf("MQTT: clean-session discard of %q deferred until its incarnation drains", sess.id)
 			case errors.Is(err, errMQTTClearRefusedUnresolved) && s.reparkRefusedDiscard(asm, sess, time.Now().Unix()):
 			default:
 				c.Errorf("%s", err.Error())
@@ -4566,7 +4664,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		sessByHash:      make(map[string]*mqttSession),
 		sessLocked:      make(map[string]struct{}),
 		flappers:        make(map[string]time.Time),
-		pendingExpiries: make(map[string]*time.Timer),
+		pendingExpiries: make(map[string]mqttPendingExpiry),
 		reconcileWM:     make(map[string]*sessionReconcileState),
 		jsa: mqttJSA{
 			id:      id,
@@ -5910,6 +6008,23 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 		d.out = evictBusy
 		return d
 	}
+	// COMPLETION OWNERSHIP, per decision attempt (F-036 unit 1). This worker is
+	// spawned by the record-watch delivery and outlives the callback's own lease, so
+	// it owns the incarnation for the extent of THIS decision and no longer. A
+	// retirement in progress refuses it — never parks it, because it holds as.mu
+	// here — and the observation converges on the watch's next pass or the periodic
+	// backstop, which is the same disposition the gate-held case above takes.
+	//
+	// The gate check above already excludes every retirement, each of which holds
+	// the client-ID gate for its whole transition; this makes the refusal a fact
+	// about the INCARNATION rather than about who happens to hold a lock, so a
+	// future retirement that does not take the gate is still refused here.
+	workerLease, admitted := sess.leases.acquire()
+	if !admitted {
+		d.out = evictBusy
+		return d
+	}
+	defer workerLease.release()
 	tok, acquired := sess.tryBeginRecordTx()
 	if !acquired {
 		d.out = evictBusy
@@ -6521,9 +6636,42 @@ func (as *mqttAccountSessionManager) scheduleSessionExpiryLocked(s *Server, idHa
 	}
 	// Defensive: replace any existing timer for this client ID hash.
 	if old, ok := as.pendingExpiries[idHash]; ok {
-		old.Stop()
+		old.timer.Stop()
 	}
-	as.pendingExpiries[idHash] = time.AfterFunc(delay, func() { as.expireSession(s, idHash) })
+	// The callback captures ITS OWN INSTALL TOKEN, so expireSession can prove the fire
+	// it is servicing is the one still installed. Without that, a callback that already
+	// fired and then lost as.mu to a cancel-and-re-arm would consume the REPLACEMENT's
+	// entry and act on whatever session is current by then — a stale expiry aliased
+	// onto a fresh incarnation (F-036 unit 1).
+	//
+	// A token rather than the *time.Timer the closure would otherwise have to read:
+	// AfterFunc can fire before its own assignment completes, so capturing the timer
+	// variable is a data race on the install itself.
+	token := as.nextExpiryToken()
+	as.pendingExpiries[idHash] = mqttPendingExpiry{
+		timer: time.AfterFunc(delay, func() { as.expireSessionFired(s, idHash, token) }),
+		token: token,
+	}
+}
+
+// mqttPendingExpiry is one armed session-expiry timer plus the INSTALL TOKEN its
+// callback captured. The token is what lets a fired callback prove the entry it
+// finds under its client ID hash is its own: the map is keyed by hash, and a
+// reconnect-and-redisconnect replaces the entry, so presence alone would let a
+// stale callback consume the replacement's and expire a session it never named
+// (F-036 unit 1).
+type mqttPendingExpiry struct {
+	timer *time.Timer
+	token uint64
+}
+
+// nextExpiryToken mints an install token. Monotonic per account manager and never
+// reused, so no two installs can be confused for one another.
+//
+// as.mu must be held.
+func (as *mqttAccountSessionManager) nextExpiryToken() uint64 {
+	as.expiryTokens++
+	return as.expiryTokens
 }
 
 // cancelSessionExpiry stops and removes a pending session-expiry timer for the
@@ -6545,7 +6693,7 @@ func (as *mqttAccountSessionManager) cancelSessionExpiryLocked(idHash string) bo
 	if !ok {
 		return false
 	}
-	t.Stop()
+	t.timer.Stop()
 	delete(as.pendingExpiries, idHash)
 	return true
 }
@@ -6557,7 +6705,16 @@ func (as *mqttAccountSessionManager) cancelSessionExpiryLocked(idHash string) bo
 // re-verified against the persisted record first. Spec5 [3.1.2.11.2].
 //
 // No lock held on entry.
+// expireSession runs the expiry for idHash with no timer-instance proof: it is the
+// form a direct caller (a sweep decision, a test) uses, where no timer fired.
 func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
+	as.expireSessionFired(s, idHash, 0)
+}
+
+// expireSessionFired is expireSession for a fired AfterFunc, carrying the install
+// token of the timer that fired so the identity check can prove it is still the
+// installed one (F-036 unit 1). A zero token is a direct caller and skips the check.
+func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string, fired uint64) {
 	as.mu.Lock()
 	// nil map => account manager shutdown; the entry (if any) is being torn down.
 	if as.pendingExpiries == nil {
@@ -6570,9 +6727,22 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 		as.mu.Unlock()
 		return
 	}
+	// IDENTITY, not just presence: the map is keyed by client ID hash and a
+	// reconnect-and-redisconnect replaces the entry, so an already-fired callback
+	// that lost this lock would otherwise consume the REPLACEMENT's entry. Compared
+	// and deleted in one critical section (F-036 unit 1). A zero token is a direct
+	// caller and keeps the presence-only behaviour.
+	//
+	// This is a narrowing, NOT the whole guard: a callback that passes here can still
+	// be delayed past a reconnect and a later disconnect, and what stops it acting on
+	// that newer deadline is the re-read below, under the gate.
+	if fired != 0 && t.token != fired {
+		as.mu.Unlock()
+		return
+	}
 	// We own this expiry now; drop the timer entry so a concurrent reconnect's
 	// cancelSessionExpiry becomes a no-op.
-	t.Stop()
+	t.timer.Stop()
 	delete(as.pendingExpiries, idHash)
 	sess, inMem := as.sessByHash[idHash]
 	as.mu.Unlock()
@@ -6581,6 +6751,39 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 		return
 	}
 
+	// ACQUIRE BEFORE THE GATE (F-036 unit 1). The lease proves this fire is acting
+	// for the incarnation it resolved, and taking it first is what keeps a fire
+	// against a RETIRING incarnation from holding the client-ID gate while a
+	// retirement waits: a refused acquisition re-arms and returns without ever
+	// touching the gate. tryAcquire never parks, for the same reason.
+	//
+	// The tracker pointer is READ UNDER sess.mu: setIncarnationLocked replaces it
+	// there, so sampling it unlocked is a data race with a concurrent re-mint — and
+	// would defeat the very boundary this acquisition is.
+	sess.mu.Lock()
+	tr := sess.leases
+	sess.mu.Unlock()
+	selfLease, ok := tr.acquire()
+	if !ok {
+		// The incarnation is retiring or retired: this expiry is not its business.
+		//
+		// Re-arm ONLY if this fire's own view is still current — the session object
+		// is still the resident one AND its tracker is still the one we captured, so
+		// no re-mint happened underneath us — and only if no timer is installed. A
+		// bare re-arm here is a fresh session's data loss, not a nicety: a callback
+		// descheduled across a clean-start re-mint would otherwise REPLACE the new
+		// incarnation's legitimate deadline with a one-second one, and the retry would
+		// then expire a session that had just connected. Where the check refuses, the
+		// deadline is not lost: the periodic sweep re-arms a finite expiry from the
+		// persisted record, and a reopened incumbent arms its own on its next close.
+		as.rearmExpiryIfViewCurrent(s, idHash, sess, tr)
+		return
+	}
+	// DEFERRED IMMEDIATELY, before any exit below can be taken: an owner that leaks
+	// its lease leaves the incarnation permanently undrainable, so every later
+	// retirement of this session would refuse. Promotion makes this idempotent, so
+	// the retirement path below is unaffected.
+	defer selfLease.release()
 	// Guard against a concurrent reconnect: lockSession(sess, nil) fails if a
 	// CONNECT is mid-processing or a client is bound — the reconnect then owns it.
 	if err := as.lockSession(sess, nil); err != nil {
@@ -6659,13 +6862,46 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 		return
 	}
 
+	// THE DEADLINE IS RE-READ HERE, and the placement is the point: past the
+	// superseded handoff above, this object's own copy IS the authority, so refusing
+	// on it cannot swallow a record-driven decision. A callback that passed its token
+	// check can still be delayed while the client reconnects and disconnects again on
+	// this broker: the reconnect resumes this same object and saves, so sess.seq
+	// adopts the new sequence and nothing above distinguishes the newer incarnation of
+	// the deadline from the one this fire was armed for. Expiring it then would
+	// destroy a session whose lifetime has not elapsed, its subscriptions and queued
+	// QoS state with it. The token identity narrows that window; the re-read closes it
+	// (F-036 unit 1).
+	sess.mu.Lock()
+	notDue := sess.expiryInterval > 0 && sess.expiryInterval != mqttSessionNeverExpire &&
+		sess.disconnectedAt > 0 &&
+		time.Now().Unix() < sess.disconnectedAt+int64(sess.expiryInterval)
+	sess.mu.Unlock()
+	if notDue {
+		as.unlockSession(sess)
+		return
+	}
+
 	// Authoritative cleanup: hold the session lock through clear() so a concurrent
 	// CONNECT cannot restore the (possibly stale) persisted record and race the
 	// teardown. Delete the session state (consumers, record), matching the
 	// clean-disconnect path in mqttHandleClosedClient.
 	defer as.unlockSession(sess)
 	as.removeSession(sess, true)
-	if err := sess.clear(true); err != nil {
+	// This fire's own lease is PROMOTED by the retirement below, so the drain does
+	// not wait on the caller performing it; the deferred release above then becomes
+	// an idempotent no-op (F-036 unit 1).
+	if err := sess.clearInner(true, selfLease, nil, nil); err != nil {
+		if errors.Is(err, errMQTTClearDrainTimeout) {
+			// An admitted route or a queued effect of this incarnation is still
+			// outstanding, so nothing was deleted and the object is admissible again
+			// (the tracker was reopened). Restore residency and re-arm: the deadline
+			// is still owed and a later fire retries the whole discard.
+			as.addSession(sess, true)
+			as.scheduleSessionExpiry(s, idHash, mqttExpiryRetryAfterRetiring)
+			s.Warnf("MQTT session expiry for %q deferred until its incarnation drains", sess.id)
+			return
+		}
 		// The refusal deleted nothing, and the evicted object would take the unresolved
 		// write's pendingWrite, its retained continuations and its staged void-register
 		// verdicts with it — all of them lost outright, since only this object can classify
@@ -6695,6 +6931,132 @@ func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
 		s.Warnf("MQTT session expiry cleanup for %q failed: %v", sess.id, err)
 	}
 }
+
+// pendingDiscardFinisher builds the finisher for a clean-session discard whose drain
+// ceiling fired (F-036 unit 1). It is invoked by the eagerly-admitted worker once the
+// captured close cycle has drained.
+//
+// It RETRIES the client-ID gate until it claims the obligation or sees another
+// claimant consume it. A failed acquisition does not mean a CONNECT will finish this:
+// the close path that parked the obligation holds the SAME gate across its own
+// clearInner, so the common case is meeting the gate held by the parker. Returning
+// there would strand a discard [MQTT-3.1.2-6] requires and no sweep reaches — the
+// expiry sweep skips expiry-zero records. The loop holds no lock between attempts and
+// exits on quitCh, so it cannot outlive the WaitGroup that admitted it.
+func (s *Server) pendingDiscardFinisher(asm *mqttAccountSessionManager,
+	sess *mqttSession, captured *mqttIncarnationTracker) func() {
+
+	return func() {
+		for {
+			if !captured.isRetirementPending() {
+				return
+			}
+			if err := asm.lockSession(sess, nil); err == nil {
+				s.finishPendingDiscard(asm, sess, captured)
+				asm.unlockSession(sess)
+				return
+			}
+			select {
+			case <-time.After(mqttPendingDiscardRetryItvl):
+			case <-s.quitCh:
+				return
+			}
+		}
+	}
+}
+
+// mqttPendingDiscardRetryItvl is how long the pending-discard finisher waits before
+// re-attempting the client-ID gate. Short, because the common case is the parking
+// caller's own gate hold, which ends within one bounded teardown.
+var mqttPendingDiscardRetryItvl = 25 * time.Millisecond
+
+// finishPendingDiscard claims a parked retirement-pending discard and completes it.
+//
+// THE CLAIM IS IDENTITY-CHECKED, and the identity is the PAIR {session object, its
+// tracker} rather than the client ID. A client-ID claim is not enough: while this
+// finisher waited, an uncertainty resolver could evict this object as foreign and a
+// CONNECT could install a REPLACEMENT session under the same ID — and completing the
+// discard against the stale object would then remove the replacement's map entries
+// and leave its live connection bound to a session nothing can resolve. So both
+// manager indexes must still name THIS object and the object must still carry the
+// tracker whose obligation this is; otherwise the discard is terminally superseded
+// and there is nothing left to complete. The final eviction is
+// removeSessionIfCurrent for the same reason.
+//
+// Caller holds the client-ID gate.
+func (s *Server) finishPendingDiscard(asm *mqttAccountSessionManager, sess *mqttSession,
+	captured *mqttIncarnationTracker) mqttPendingDiscardOutcome {
+
+	sess.mu.Lock()
+	current := sess.leases
+	sess.mu.Unlock()
+	if current != captured {
+		return mqttPendingDiscardSuperseded
+	}
+	asm.mu.Lock()
+	resident := asm.sessions[sess.id] == sess && asm.sessByHash[sess.idHash] == sess
+	asm.mu.Unlock()
+	if !resident {
+		// Superseded: this object is no longer the client ID's session, so its
+		// discard is not ours to make and nothing here was ours to delete.
+		if _, ok := captured.takeRetirementPending(); ok {
+			s.Debugf("MQTT: the parked discard of session %q is superseded: the object "+
+				"is no longer resident", sess.id)
+		}
+		return mqttPendingDiscardSuperseded
+	}
+	if _, ok := captured.takeRetirementPending(); !ok {
+		// Another claimant took it; whatever it decided is that claimant's outcome,
+		// and this one has nothing left to do.
+		return mqttPendingDiscardSuperseded
+	}
+	p, err := sess.prepareClear()
+	if err != nil {
+		// The uncertainty refusal: the discard is still owed but cannot run on an
+		// unclassified write. Hand the obligation to the EXISTING uncertainty
+		// machinery — reparkRefusedDiscard restores residency and parks a
+		// discard-only deferred action whose resolution re-drives clear(); the
+		// tracker stays CLOSING, so a resume attempt keeps refusing until then.
+		if !s.reparkRefusedDiscard(asm, sess, time.Now().Unix()) {
+			s.Errorf("MQTT: pending discard of session %q could not be re-parked: %v", sess.id, err)
+		}
+		// STILL OWED, and the object is still the resident one carrying the
+		// obligation and the unclassified write. A caller that went on to restore
+		// over it would orphan both.
+		return mqttPendingDiscardReparked
+	}
+	sess.mu.Lock()
+	permit, perr := sess.retireIncarnationLocked()
+	sess.mu.Unlock()
+	if perr != nil {
+		p.abort()
+		s.Errorf("MQTT: pending discard of session %q: %v", sess.id, perr)
+		return mqttPendingDiscardReparked
+	}
+	if derr := p.destroy(permit, true); derr != nil && !errors.Is(derr, errMQTTClearSuperseded) {
+		s.Warnf("MQTT: pending discard of session %q: %v", sess.id, derr)
+	}
+	asm.removeSessionIfCurrent(sess)
+	return mqttPendingDiscardCompleted
+}
+
+// mqttPendingDiscardOutcome is what a claim of a parked retirement-pending discard
+// resolved to. The distinction matters to a JOINING CONNECT: a REPARKED outcome means
+// the object is still resident and still carries both the obligation and the
+// unclassified write that refused it, so restoring over it would orphan them — and
+// for a session whose disconnect required a discard, could report Session Present and
+// resume state the client asked to have destroyed.
+type mqttPendingDiscardOutcome int
+
+const (
+	// mqttPendingDiscardCompleted: the discard ran; the session is gone.
+	mqttPendingDiscardCompleted mqttPendingDiscardOutcome = iota
+	// mqttPendingDiscardSuperseded: this object is no longer the client ID's
+	// session, or another claimant owns the obligation. Nothing was ours to delete.
+	mqttPendingDiscardSuperseded
+	// mqttPendingDiscardReparked: still owed, and the object must be left alone.
+	mqttPendingDiscardReparked
+)
 
 // mqttTestExpireDecisionHookV fires inside expireSession's record transaction, immediately
 // after the superseded decision is computed and while the fence is still held. See
@@ -6946,7 +7308,11 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 		as.mu.Lock()
 		if as.pendingExpiries != nil {
 			if _, exists := as.pendingExpiries[idHash]; !exists {
-				as.pendingExpiries[idHash] = time.AfterFunc(remaining, func() { as.expireSession(s, idHash) })
+				token := as.nextExpiryToken()
+				as.pendingExpiries[idHash] = mqttPendingExpiry{
+					timer: time.AfterFunc(remaining, func() { as.expireSessionFired(s, idHash, token) }),
+					token: token,
+				}
 				swept++
 			}
 		}
@@ -7180,7 +7546,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 		// scheduling/firing; the nil map makes expireSession a no-op for a timer
 		// already mid-callback. Spec5 [3.1.2.11.2].
 		for _, t := range as.pendingExpiries {
-			t.Stop()
+			t.timer.Stop()
 		}
 		as.pendingExpiries = nil
 		// Drop reconciliation ordering state. Any worker still in flight holds its
@@ -7659,6 +8025,12 @@ func (sess *mqttSession) processSub(
 	sess.subsMu.Lock()
 	defer sess.subsMu.Unlock()
 
+	// COMPLETION OWNERSHIP, installed here rather than at each registration: every
+	// session-scoped delivery callback in the package reaches the NATS subscription
+	// through this one wrapper, so the boundary covers the class by construction
+	// instead of by a list (F-036 unit 1). Only the QoS 1/2 handler owes the
+	// withheld-delivery record on a refusal; the others simply skip without acking.
+	h = sess.leasedHandler(h, jsDurName != _EMPTY_)
 	sub, displacedFrames, err := c.processSub(subject, queue, sid, h, false)
 	if err != nil {
 		// c.processSub already called c.Errorf(), so no need here.
@@ -10096,7 +10468,9 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, wid, pw
 		maxp:     maxp,
 		regClaim: mqttNewInflightNonce(),
 	}
-	sess.setIncarnationLocked(gen)
+	// A not-yet-reachable object has no owners to drain, so the constructor is
+	// the one caller entitled to a trivial permit (F-036 unit 1, property P).
+	sess.setIncarnationLocked(gen, mqttRetirementPermit{})
 	return sess
 }
 
@@ -10106,7 +10480,19 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, wid, pw
 // carries.
 //
 // sess.mu must be held, or the session must not yet be reachable.
-func (sess *mqttSession) setIncarnationLocked(gen string) {
+//
+// The permit is what makes property P — the generation changes only while no
+// client is bound — mechanical (F-036 unit 1): it is mintable only by
+// retireIncarnationLocked, which asserts sess.c == nil over a closed, drained
+// tracker, or as the constructor's trivial permit for an object nothing else can
+// reach. A mismatched permit here is memory-protocol corruption, not a runtime
+// condition, so it fails loudly. Each incarnation gets a FRESH tracker; owners of
+// the retired one keep their captured pointer and are refused there.
+func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementPermit) {
+	if sess.leases != nil && permit.tr != sess.leases {
+		panic("mqtt: setIncarnationLocked without a permit for the current incarnation")
+	}
+	sess.leases = newIncarnationTracker()
 	sess.gen = gen
 	subject, deliver, _ := mqttPubRelNames(sess.idHash, gen)
 	sess.pubRelSubject = subject
@@ -10630,7 +11016,111 @@ func (sess *mqttSession) clearWindowHook(window string) {
 //
 // Runs from the client's readLoop.
 // Lock not held on entry, but session is in the locked map.
+//
+// Since F-036 unit 1 this is a COMPOSITION: prepareClear (the non-mutating
+// refusals and the record fence), the retirement-permit mint, and destroy (the
+// destructive half). The caller must have CLOSED the incarnation tracker and
+// drained it — the mint fails otherwise, which is the mechanical enforcement —
+// and on a refusal the caller reopens the tracker before re-parking, so the
+// re-parked object is resolvable again. The CONNECT clean-start arm does not use
+// this composition: it interleaves the capsule capture and the detach between
+// preparation and destruction (see mqttProcessConnect).
 func (sess *mqttSession) clear(noWait bool) error {
+	return sess.clearWithSelfLease(noWait, nil)
+}
+
+// errMQTTClearDrainTimeout reports that a discard's incarnation tracker did not
+// drain within the ceiling: an admitted route or a queued effect of the retiring
+// incarnation is still outstanding. Nothing was mutated. Each caller applies its
+// own ceiling disposition (leave resident and retry, re-arm the timer, re-park),
+// per F-036 unit 1 §3.7.
+var errMQTTClearDrainTimeout = errors.New("incarnation did not drain before the discard ceiling")
+
+// mqttExpiryRetryAfterRetiring is how soon a session-expiry fire re-arms when it
+// meets an incarnation that is retiring: short, because the retirement either
+// completes (and the expiry is moot) or reopens (and the deadline is still owed),
+// and neither outcome should wait out another full interval.
+var mqttExpiryRetryAfterRetiring = time.Second
+
+// mqttIncarnationDrainTimeout bounds the wait for the retiring incarnation's
+// admitted routes and queued effects to complete. It is on the order of the JS API
+// timeout: a wedged owner turns into a bounded discard ceiling, never an unbounded
+// wait or a disposal under a live owner.
+var mqttIncarnationDrainTimeout = 2 * mqttDefaultJSAPITimeout
+
+// clearWithSelfLease is clear() for a caller that holds its own lease on the
+// incarnation being discarded (expireSession fires holding its fire-time lease):
+// that lease is PROMOTED so the drain does not wait on the caller itself. A nil
+// selfLease is the ordinary case.
+//
+// It closes the incarnation tracker, drains it under the ceiling, then runs the
+// non-mutating preparation, mints the retirement permit and destroys. On a drain
+// ceiling or a preparation refusal it REOPENS the tracker before returning, so the
+// object is admissible again for the caller's ceiling disposition.
+func (sess *mqttSession) clearWithSelfLease(noWait bool, selfLease *mqttLease) error {
+	return sess.clearInner(noWait, selfLease, nil, nil)
+}
+
+// clearInner is the shared close→drain→prepare→mint→destroy body. onCeiling, when
+// non-nil, is installed as the tracker's retirement-pending finisher IF the drain
+// ceiling fires: the tracker stays CLOSING and the finisher re-runs the discard
+// when the last owner releases, or immediately if the drain has already completed.
+// This is the clean-session discard's ceiling disposition, which may not abandon
+// the discard ([MQTT-3.1.2-6]). A nil onCeiling reopens the tracker on ceiling,
+// leaving the object admissible for the caller to retry.
+func (sess *mqttSession) clearInner(noWait bool, selfLease *mqttLease,
+	onCeiling func(), onCeilingSchedule func(*mqttIncarnationTracker, func())) error {
+	sess.mu.Lock()
+	t := sess.leases
+	sess.mu.Unlock()
+	t.close()
+	if selfLease != nil {
+		t.promote(selfLease)
+	}
+	ceiling := time.NewTimer(mqttIncarnationDrainTimeout)
+	drained := t.waitDrained(ceiling.C)
+	ceiling.Stop()
+	if !drained {
+		if onCeiling != nil {
+			// The discard is still OWED, so the obligation is armed and WATCHED by a
+			// worker admitted right here — before this call returns — rather than
+			// scheduled later by whichever release happens to drain the tracker.
+			// Eager admission is what keeps it inside the server's shutdown
+			// lifecycle; a late spawn could start a teardown after shutdown had
+			// already waited for its workers.
+			onCeilingSchedule(t, onCeiling)
+		} else {
+			t.reopen()
+		}
+		return errMQTTClearDrainTimeout
+	}
+	p, err := sess.prepareClear()
+	if err != nil {
+		t.reopen()
+		return err
+	}
+	sess.mu.Lock()
+	permit, perr := sess.retireIncarnationLocked()
+	sess.mu.Unlock()
+	if perr != nil {
+		p.abort()
+		t.reopen()
+		return fmt.Errorf("refusing to discard session %q: %w", sess.id, perr)
+	}
+	return p.destroy(permit, noWait)
+}
+
+// mqttPreparedClear owns the record transaction prepareClear opened. Exactly one
+// of abort or destroy consumes it.
+type mqttPreparedClear struct {
+	sess *mqttSession
+	tok  recordTx
+}
+
+// prepareClear runs everything in a discard that precedes the first mutation: the
+// entry uncertainty refusal, the record fence acquisition, and the in-fence
+// uncertainty refusal. Nothing is mutated on any path through it.
+func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
 	// REFUSE AT ENTRY while an earlier write is unresolved, BEFORE any consumer or
 	// record deletion. sess.seq may be stale, and this path deletes the shared
 	// durables and the record before a stale CAS could fail — so it must not run on
@@ -10646,21 +11136,37 @@ func (sess *mqttSession) clear(noWait bool) error {
 		// arrives with the write already unresolved. Returning a plain error would have
 		// either caller treat it as a partly-done teardown and drop an obligation it could
 		// have put back.
-		return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
+		return nil, fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
 	}
 	sess.clearWindowHook(mqttClearWindowPreFence)
 
 	tok := sess.beginRecordTx()
-	// Nothing has been mutated yet, so the fence is released WITHOUT ending the
-	// generation: this session is not being discarded after all, and the next resolution
-	// decides again. endRecordTxNewGeneration would bump recordEpoch and kill every token
-	// minted before it, for a discard that is not happening.
 	if sess.isSeqUncertain() {
-		if terr := sess.endRecordTx(tok); terr != nil {
-			sess.jsa.c.Errorf("MQTT: %v", terr)
-		}
-		return fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
+		p := &mqttPreparedClear{sess: sess, tok: tok}
+		p.abort()
+		return nil, fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
 	}
+	return &mqttPreparedClear{sess: sess, tok: tok}, nil
+}
+
+// abort releases the record fence WITHOUT ending the generation: nothing has been
+// mutated, this session is not being discarded after all, and the next resolution
+// decides again. endRecordTxNewGeneration would bump recordEpoch and kill every
+// token minted before it, for a discard that is not happening.
+func (p *mqttPreparedClear) abort() {
+	if terr := p.sess.endRecordTx(p.tok); terr != nil {
+		p.sess.jsa.c.Errorf("MQTT: %v", terr)
+	}
+}
+
+// destroy is the destructive half of a discard, under the retirement permit. The
+// old tracker's resolution is armed by defer ON ENTRY, so success, a superseded
+// claim, an incomplete teardown and every post-reset error all resolve parked
+// ingress exactly once — a displaced connection parked at the packet gate is never
+// stranded by a failure arm (F-036 unit 1).
+func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) error {
+	sess, tok := p.sess, p.tok
+	defer permit.tr.resolveRetired()
 	// Released on EVERY exit path, including the error returns below, after which
 	// the in-memory state is already reset and old writers must be dead anyway.
 	defer func() {
@@ -10830,7 +11336,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// purge bound does, and it is what a late walk is limited by: see F-062. A legacy
 	// session with no generation is re-minted here too, which is the only way it
 	// leaves the exposed hash-only naming. See sess_incarnation.go.
-	sess.setIncarnationLocked(mqttNewSessGen())
+	sess.setIncarnationLocked(mqttNewSessGen(), permit)
 	sess.seq = 0
 	// The lineage goes with the sequence: we are acknowledged for nothing once the
 	// retiring record is deleted, and six sites read wid as exactly that. Zeroed AFTER
@@ -10870,6 +11376,9 @@ func (sess *mqttSession) clear(noWait bool) error {
 	// deliberately does NOT retire a PUBREL's acknowledgement debt: sess.c is untouched
 	// here, so on the clean-start path the displaced client is still bound and its debt
 	// is still holding an identifier the client itself still holds (F-089).
+	// The predicate consults sess.retiringOwnerCID as well as the bound client, so a
+	// retirement that detached before this ran still reads the displaced connection's
+	// debts as LIVE and does not free an identifier it still holds (F-089).
 	sess.sweepDeadSendHoldsLocked()
 	sess.mu.Unlock()
 
@@ -12740,6 +13249,22 @@ CHECK:
 			}
 		}
 	}
+	// disposeCapturedThroughPhases is disposeThroughPhases for the retirement path,
+	// where the displaced client was detached (and its parked action taken) BEFORE the
+	// re-mint: the disposition is built from the capsule instead of from the session,
+	// which by now names a fresh incarnation. F-036 unit 1.
+	disposeCapturedThroughPhases := func(capsule *mqttRetiredBinding, voc mqttDisposalVocabulary) {
+		target := es
+		d := asm.disposeCaptured(target, capsule, false)
+		connWillPhase = func() { d.applyWill(target, asm) }
+		if d.stale != nil {
+			stale := d.stale
+			connTail = func() {
+				stale.mqttNotifyForeignDisposal(target.id, voc)
+				stale.closeConnection(voc.closeReason)
+			}
+		}
+	}
 
 	defer endAcceptTx()
 
@@ -12838,6 +13363,49 @@ restoreSession:
 	}
 
 	if exists {
+		// A RETIREMENT-PENDING session owes a clean-session discard whose drain
+		// ceiling fired ([MQTT-3.1.2-6]; F-036 unit 1). It is non-resumable, so
+		// finish the discard before deciding anything about this CONNECT: JOIN the
+		// close cycle already in progress — do NOT close it again — and claim the
+		// parked obligation under the gate this CONNECT holds, which is what
+		// arbitrates against the drain-triggered worker.
+		es.mu.Lock()
+		pendingTracker := es.leases
+		es.mu.Unlock()
+		if pendingTracker.isRetirementPending() {
+			ceiling := time.NewTimer(mqttIncarnationDrainTimeout)
+			joined := pendingTracker.waitDrained(ceiling.C)
+			ceiling.Stop()
+			if !joined {
+				// Still not drained: the mark and the closing tracker stay exactly as
+				// they are, and this CONNECT is refused rather than resuming a session
+				// whose discard is owed. A v5 client is TOLD 0x89 rather than just
+				// dropped, because the whole disposition is "retry" — a bare close
+				// leaves that to the client's own classification of a transport error.
+				// 3.1.1 has no such code and keeps the close. Codes >= 0x80 pass
+				// through the CONNACK mapping unchanged.
+				if c.mqtt.proto == mqttProtoLevel5 {
+					sendConnAck(mqttReasonServerBusy, false, "session is still completing in-flight work")
+				}
+				return formatError(fmt.Errorf("session is still completing in-flight work"))
+			}
+			if s.finishPendingDiscard(asm, es, pendingTracker) == mqttPendingDiscardReparked {
+				// STILL OWED. prepareClear refused on an unclassified write, so the
+				// object stays resident carrying both that write and the obligation.
+				// Restoring over it would install a replacement in both indexes and
+				// orphan them — and for a session whose disconnect required a discard,
+				// the CONNECT could then report Session Present and resume state the
+				// client asked to have destroyed. Reject without evicting, which is the
+				// same answer the ordinary unresolved-record refusal gives, and let the
+				// resolution re-drive the discard.
+				return formatError(fmt.Errorf("session record state is unresolved"))
+			}
+			// Completed, or superseded by another claimant: this object is not the
+			// client ID's session any more, so start over from the record.
+			es, exists, sessp = nil, false, false
+			resumePubs, resumeRels = nil, nil
+			goto restoreSession
+		}
 		// An overdue session must not be resumed even when this reconnect beat
 		// a late expiry timer to the in-memory copy (the record-restore path
 		// has the same check). Spec5 [3.1.2.11.2].
@@ -12846,6 +13414,11 @@ restoreSession:
 			es.expiryInterval != mqttSessionNeverExpire &&
 			time.Now().Unix() >= es.disconnectedAt+int64(es.expiryInterval)
 		es.mu.Unlock()
+		// The retirement capsule of the clean-start path, if that is the path taken:
+		// it outlives the retirement because the SUCCESS arm still owes the displaced
+		// client its takeover tail and still owes its parked action a disposition, and
+		// by then es.c is nil (F-036 unit 1).
+		var capsule *mqttRetiredBinding
 		// Clear the session if client wants a clean session.
 		// Also, Spec [MQTT-3.2.2-1]: don't report session present
 		if cleanSess || es.clean || overdue {
@@ -12858,8 +13431,51 @@ restoreSession:
 			// and by then its generation is re-minted and its sequence 0 — so the Will
 			// baseline has to be taken here, while it still names the incarnation the Will
 			// was armed under. See mqttWillFence.
-			willFence := es.mqttCaptureWillFence()
-			if err := es.clear(false); err != nil {
+			// THE TWO-PHASE RETIREMENT (F-036 unit 1). Today's single clear() call
+			// re-minted this object's generation while the displaced client was still
+			// bound and still admitted, so its in-flight routes derived subjects under
+			// the FRESH generation — losing an acknowledged QoS 2 message with one
+			// broker, no crash and no peer. The order below is what property P needs:
+			// close admission, drain the displaced incarnation's owners, capture what
+			// every failure arm will need, prepare (the non-mutating refusals), detach,
+			// mint the permit, and only then destroy and re-mint.
+			//
+			// Nothing here holds a lock across the drain: not es.mu, not the record
+			// fence, not the QoS fences. The client-ID gate IS held, and that is safe
+			// because no owner acquires it — the contenders all fail fast or
+			// bounded-yield. See sess_lease.go and docs/ARCHITECTURE.md.
+			var (
+				prepared *mqttPreparedClear
+				cerr     error
+			)
+			capsule, prepared, cerr = asm.retireBoundIncarnation(es)
+			if cerr != nil {
+				// NOTHING was mutated on either arm, and the incumbent is still bound,
+				// still holding its Will, its socket, its expiry and its disconnect
+				// state — so the answer is to refuse THIS CONNECT and let the client
+				// retry, exactly as the unresolved-record refusal has always done.
+				// A drain ceiling means an admitted route or a queued effect of the
+				// incumbent is still outstanding: disposing under it is what every
+				// prior F-036 attempt died on.
+				if errors.Is(cerr, errMQTTClearDrainTimeout) {
+					// Same as the JOIN arm above: the answer is RETRY, so a v5 client
+					// is told 0x89 instead of being left to infer it from a socket
+					// close. docs/CONFORMANCE.md states this reason.
+					if c.mqtt.proto == mqttProtoLevel5 {
+						sendConnAck(mqttReasonServerBusy, false,
+							"session is still completing in-flight work")
+					}
+					return formatError(fmt.Errorf("session is still completing in-flight work"))
+				}
+				if errors.Is(cerr, errMQTTClearRefusedUnresolved) {
+					return formatError(fmt.Errorf("session record state is unresolved"))
+				}
+				return formatError(cerr)
+			}
+			// The capsule carries the RETIRING incarnation's Will baseline, the
+			// displaced client and its parked disconnect action: after the detach
+			// nothing may rediscover them through es.c. See mqttWillFence, F-084.
+			if err := prepared.destroy(capsule.permit, false); err != nil {
 				if errors.Is(err, errMQTTClearSuperseded) {
 					// R1 at transition T1. The base this discard claimed is not current,
 					// and clear() has already reset this object to sequence 0 without
@@ -12872,7 +13488,12 @@ restoreSession:
 					// unreachable rather than merely unlikely. On exhaustion the CONNECT
 					// is refused with nothing resident and nothing bound, which is the
 					// state a fresh CONNECT starts from.
-					asm.abandonReDrivenSession(c, es)
+					// The capsule's client, not es.c: the detach already happened, so
+					// rediscovering the displaced connection through the session would
+					// find nil and silently drop its close, its notification, its Will,
+					// its disconnect stamp and its expiry (F-036 unit 1, and the fourth
+					// attempt's finding 4).
+					asm.abandonReDrivenSessionCaptured(c, es, capsule)
 					if aerr := rd.admitCycle(); aerr != nil {
 						return formatError(aerr)
 					}
@@ -12880,26 +13501,14 @@ restoreSession:
 					resumePubs, resumeRels = nil, nil
 					goto restoreSession
 				}
-				if errors.Is(err, errMQTTClearRefusedUnresolved) {
-					// A LATE ambiguity — armed by an off-readLoop writer while this
-					// discard waited for the fence — deleted nothing, so this case gets
-					// the SAME answer as the early one above: reject without evicting,
-					// and let the client retry. Evicting here would drop the retained
-					// continuations, so what the resolution of that ambiguous write
-					// authorizes would never be committed at all, and the
-					// gate release reads asm.sessions to decide the void-verdict handoff,
-					// which an evicted object never gets. Nothing is parked: this path has
-					// a client waiting for a CONNACK, not an obligation, and the retry's
-					// own uncertainty check resolves the session.
-					return formatError(fmt.Errorf("session record state is unresolved"))
-				}
-				// EVERY REMAINING ERROR IS POST-RESET, and that is provable rather than
-				// likely: both of clear()'s refusals happen before it deletes or claims
-				// anything and both carry errMQTTClearRefusedUnresolved, handled above.
-				// So by here the object's subscriptions, consumers and registers are
-				// erased, its sequence is 0 and its generation re-minted — an indeterminate
-				// claim, a failed target deletion, an unclassifiable release or a shared
-				// durable error all arrive in this state.
+				// EVERY REMAINING ERROR IS POST-RESET, and since F-036 unit 1 that is
+				// structural rather than merely provable: BOTH uncertainty refusals live
+				// in prepareClear, which ran (and returned above) before this destroy
+				// could start, so no errMQTTClearRefusedUnresolved can arrive here at
+				// all. By this point the object's subscriptions, consumers and registers
+				// are erased, its sequence is 0 and its generation re-minted — an
+				// indeterminate claim, a failed target deletion, an unclassifiable
+				// release or a shared durable error all arrive in this state.
 				//
 				// removeSession alone was NOT enough, and the gap was silent: it deletes
 				// map entries and never touches sess.c, so an old client stayed BOUND to a
@@ -12914,7 +13523,12 @@ restoreSession:
 				// sacrificing the delay and publishing a delayed Will immediately for a
 				// session that only failed to tear itself down. willFence carries the
 				// RETIRING incarnation, which is the one the Will belongs to. F-084.
-				disposeThroughPhases(nil, mqttDisposalTeardownIncomplete, willFence)
+				// The capsule carries the displaced client, its parked action and the
+				// retiring incarnation's Will fence, so this arm discharges all five
+				// obligations without reading es.c — which the detach nilled. F-084: no
+				// successor is established here, so the Will is preserved or discharged
+				// deferred, never discarded.
+				disposeCapturedThroughPhases(capsule, mqttDisposalTeardownIncomplete)
 				return err
 			}
 		} else {
@@ -12928,6 +13542,14 @@ restoreSession:
 		// accessed outside of the readLoop.
 		es.mu.Lock()
 		ec := es.c
+		// On the clean-start retirement path the displaced client was detached before
+		// the re-mint, so es.c is nil by now and the capsule is the only thing that
+		// still names it. The takeover tail below is owed to it either way — an
+		// ordinary resume takeover finds it here, a retirement finds it there
+		// (F-036 unit 1).
+		if ec == nil && capsule != nil {
+			ec = capsule.client
+		}
 		es.c = c
 		// Ownership has just moved, so every hold scoped to the PREDECESSOR — an
 		// unanswerable PUBCOMP debt, an unwritten retained frame — is now inert by the
@@ -12941,6 +13563,13 @@ restoreSession:
 		// is about a LIVE debt, while this deletes only what the predicate has already
 		// proved reserves nothing — a write token is owner-independent and survives here.
 		es.sweepDeadSendHoldsLocked()
+		// The connection's EXPECTED incarnation, captured in the same critical section
+		// as the binding: every packet, delivery and effect of this connection owns
+		// against THIS tracker for the rest of its life. Ordered after the sweep so the
+		// sweep stays the statement immediately following the ownership move, which is
+		// what the rebind guard requires; the capture only needs the same critical
+		// section, not a position within it (F-036 unit 1).
+		c.mqtt.tracker = es.leases
 		// The requested Session Expiry Interval and Clean flag are NOT applied
 		// here. This CONNECT has not been granted yet — the reconciliation phase
 		// below can still refuse it — and the accept save a few lines down would
@@ -12986,6 +13615,26 @@ restoreSession:
 		// transmission that must not be redelivered on top of itself.
 		resumePubs, resumeRels = mqttPendingRefs(es.pendingPublish), mqttPendingRefs(es.pendingPubRel)
 		es.mu.Unlock()
+		if capsule != nil && capsule.action != nil {
+			// A parked disconnect obligation OUTRANKS a live Will, because parking is
+			// what moved the Will off the connection: the action carries it along with
+			// the deadline, generation, sequence and epoch it was parked with. The
+			// retirement took it into the capsule with the detach, so this is the one
+			// place the successful takeover can still discharge it — dropping it here
+			// would silently lose that Will (F-036 unit 1; F-084).
+			//
+			// A successor IS held in hand here, which is what licenses discarding a
+			// LIVE Will below; a parked action is discharged rather than discarded
+			// because it is no longer this connection's to suppress.
+			d := mqttForeignDisposition{
+				applied: true,
+				stale:   capsule.client,
+				action:  capsule.action,
+				fence:   capsule.fence,
+				will:    mqttWillActionDischargeDeferred,
+			}
+			d.applyWill(es, asm)
+		}
 		if ec != nil {
 			// The one takeover tail, shared with the re-drive's T1b so the two cannot
 			// drift apart: a client displaced by a re-drive is entitled to exactly the
@@ -12998,6 +13647,8 @@ restoreSession:
 		// it MUST set Session Present to 0 in the CONNACK packet.
 		es.mu.Lock()
 		es.c, es.clean = c, sessClean
+		// Same capture as the resident-session bind above (F-036 unit 1).
+		c.mqtt.tracker = es.leases
 		es.expiryInterval = expiry
 		es.disconnectedAt = 0
 		es.mu.Unlock()
@@ -17638,8 +18289,19 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		gate := sub.mqtt.phaseGate
 		sess.mu.Unlock()
 		timer := time.NewTimer(mqttPhaseGateWaitFor(cc))
+		// The retirement of THIS connection's incarnation cancels the wait, for the
+		// same reason it cancels the transmission gates: this cap is up to 30 seconds,
+		// well past the incarnation drain ceiling, so waiting it out would make a
+		// clean-start takeover refuse for a reason unrelated to the contender. The
+		// re-checks below then take the ordinary withheld path — recorded, not acked —
+		// because sub.mqtt.closed or the ownership term will have moved (F-036 unit 1).
+		var closing <-chan struct{}
+		if cc != nil && cc.mqtt != nil {
+			closing = cc.mqtt.tracker.closingSignal()
+		}
 		select {
 		case <-gate:
+		case <-closing:
 		case <-timer.C:
 		}
 		timer.Stop()
@@ -18817,7 +19479,11 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 
 	// Subscribe before the consumer is created so we don't loose any messages.
 	if !pubRelSubscribed {
-		_, _, err := c.processSub(pubRelDeliverySubjectB, nil, pubRelDeliverySubjectB, mqttDeliverPubRelCb, false)
+		// Same completion ownership as every other session delivery callback; this is
+		// the one registered outside sess.processSub, so it wraps explicitly and the
+		// source guard asserts the pair is exhaustive (F-036 unit 1).
+		_, _, err := c.processSub(pubRelDeliverySubjectB, nil, pubRelDeliverySubjectB,
+			sess.leasedHandler(mqttDeliverPubRelCb, false), false)
 		if err != nil {
 			c.Errorf("Unable to create subscription for JetStream consumer on %q: %v", pubRelDeliverySubject, err)
 			return err
@@ -21328,4 +21994,71 @@ func (w *mqttWriter) writeProperties(p *mqttProperties) {
 	b := body.Bytes()
 	w.WriteVarInt(len(b))
 	w.Write(b)
+}
+
+// armPendingDiscardWorker arms a retirement-pending discard and starts the ONE
+// tracked worker that will complete it (F-036 unit 1).
+//
+// Admission is EAGER — taken here, in the goroutine that arms the obligation, before
+// this returns — so the worker is inside the server's shutdown lifecycle by
+// construction. A release then only closes the tracker's drained channel; it never
+// schedules work, which is what removes the window where shutdown had already waited
+// for its workers and a late release started a teardown behind it.
+//
+// Admission refusal is FAIL-CLOSED rather than hopeful: it cannot be recovered from
+// the record, because a clean session's record carries expiry interval zero and the
+// expiry sweep skips exactly those. The refusal arm therefore completes the discard
+// SYNCHRONOUSLY on this goroutine once the tracker drains, bounded by the same
+// ceiling. In production the refusal is unreachable — this path runs on the read loop
+// and shutdown waits for the client WaitGroup before closing worker admission — and
+// the arm exists so that ordering is not the only thing standing between a required
+// discard and being dropped.
+func (s *Server) armPendingDiscardWorker(t *mqttIncarnationTracker, finisher func()) {
+	drained, armed := t.armRetirementPending(finisher)
+	if !armed {
+		return
+	}
+	if !s.admitWillWorker() {
+		ceiling := time.NewTimer(mqttIncarnationDrainTimeout)
+		defer ceiling.Stop()
+		select {
+		case <-drained:
+			finisher()
+		case <-ceiling.C:
+			s.Errorf("MQTT: a clean-session discard could not be completed before " +
+				"shutdown: its incarnation did not drain")
+		}
+		return
+	}
+	go func() {
+		defer s.willWorkerWG.Done()
+		<-drained
+		finisher()
+	}()
+}
+
+// rearmExpiryIfViewCurrent re-arms a short expiry retry only when the caller's view
+// of the session is still the current one: the same resident object, still carrying
+// the tracker the caller captured, and with no timer already installed. Any of those
+// failing means somebody else owns this client ID's deadline now — a re-minted
+// incarnation, or a fresh timer armed by a newer close — and overwriting it would
+// hand a new session a deadline it never asked for (F-036 unit 1).
+func (as *mqttAccountSessionManager) rearmExpiryIfViewCurrent(s *Server, idHash string,
+	sess *mqttSession, captured *mqttIncarnationTracker) {
+
+	sess.mu.Lock()
+	current := sess.leases
+	sess.mu.Unlock()
+	if current != captured {
+		return
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.sessByHash[idHash] != sess {
+		return
+	}
+	if _, exists := as.pendingExpiries[idHash]; exists {
+		return
+	}
+	as.scheduleSessionExpiryLocked(s, idHash, mqttExpiryRetryAfterRetiring)
 }

@@ -4011,7 +4011,7 @@ func (sess *mqttSession) consumePubRelAckLocked(c *client, pi uint16) {
 //
 // Session lock held on entry.
 func (sess *mqttSession) pubCompHeldLocked(h *mqttSendHold) bool {
-	return h != nil && h.pubCompOwed > 0 && h.owner != 0 && sess.c != nil && h.owner == sess.c.cid
+	return h != nil && h.pubCompOwed > 0 && sess.holdOwnerLiveLocked(h.owner)
 }
 
 // retainedHeldLocked reports whether this hold still reserves its identifier because a
@@ -4025,7 +4025,7 @@ func (sess *mqttSession) pubCompHeldLocked(h *mqttSendHold) bool {
 //
 // Session lock held on entry.
 func (sess *mqttSession) retainedHeldLocked(h *mqttSendHold) bool {
-	return h != nil && h.retainedGen != _EMPTY_ && h.owner != 0 && sess.c != nil && h.owner == sess.c.cid
+	return h != nil && h.retainedGen != _EMPTY_ && sess.holdOwnerLiveLocked(h.owner)
 }
 
 // sendHoldLiveLocked reports whether a hold reserves its identifier at all.
@@ -4063,6 +4063,37 @@ func (sess *mqttSession) sweepDeadSendHoldsLocked() {
 			delete(sess.sendsInFlight, pi)
 		}
 	}
+}
+
+// boundOwnerCIDLocked is the cid of the connection currently bound, or 0 for none.
+func (sess *mqttSession) boundOwnerCIDLocked() uint64 {
+	if sess.c == nil {
+		return 0
+	}
+	return sess.c.cid
+}
+
+// holdOwnerLiveLocked reports whether ownerCID still holds identifiers on this
+// session.
+//
+// The bound connection does. So does one a two-phase retirement DETACHED, but only
+// while NOTHING is bound in its place (F-036 unit 1): the displaced connection is
+// closed on another goroutine, so between the detach and the next bind its write can
+// still be in the socket and its PUBCOMP debt still owed — freeing the identifier
+// there is what F-089 forbids. THE REBIND IS THE EVENT that retires it: once
+// ownership has moved, no further PUBLISH under that identifier can reach the
+// predecessor's socket, so the hold reserves nothing and the sweep at the rebind
+// drops it. Keying on "nothing bound" rather than on clearing a field at each
+// ownership move is what keeps that true for every path that binds, not just the
+// one that remembered to reset it.
+func (sess *mqttSession) holdOwnerLiveLocked(ownerCID uint64) bool {
+	if ownerCID == 0 {
+		return false
+	}
+	if bound := sess.boundOwnerCIDLocked(); bound != 0 {
+		return ownerCID == bound
+	}
+	return ownerCID == sess.retiringOwnerCID
 }
 
 // endSend ends a send section and executes whatever continuation a removal path parked

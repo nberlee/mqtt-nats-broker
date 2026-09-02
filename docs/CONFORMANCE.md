@@ -563,9 +563,65 @@ now logs that the consumer is retained and must be removed by hand.
 
 **Why this is accepted.** The alternative is an unclosed destruction path for
 acknowledged messages, which also manufactured F-064's claim-without-copy precondition.
-A leak is preferred to a loss. F-036 itself **remains an open alpha blocker**: the
-incarnation admission invariant, the two-dimensional classifier, sites 1 and 3, and the
-single-broker clear-to-bind silent loss are all untouched by this change.
+A leak is preferred to a loss. F-036 itself **remains an open alpha blocker** — see
+"A retirement refuses rather than disposing under a live owner" below for what unit 1
+closed and what it deliberately did not.
+
+### A retirement refuses rather than disposing under a live owner
+
+F-036's unit 1 landed the incarnation completion lease
+("The incarnation completion lease" in `docs/ARCHITECTURE.md`), which closes the
+**incarnation admission invariant** — including the single-broker clean-start silent
+loss of an acknowledged QoS 2 message, where a displaced PUBREL derived its hold
+subject under the re-minted generation and answered a success-shaped PUBCOMP for a
+payload the same teardown destroyed. The generation is now re-minted only under a
+permit proving no client is bound and the incarnation's owners have drained.
+
+**F-036 stays open**: the two-dimensional PUBREL classifier and sites 1 and 3 are
+unit 2, which the lease identity is the prerequisite for.
+
+Three stated consequences of the mechanism:
+
+- **A clean-start takeover is REFUSED while the incumbent has work outstanding.** A
+  wedged owner — a route blocked in a synchronous socket write, or one waiting out a
+  JetStream request's own timeout — holds its
+  lease until the drain ceiling, and the ceiling's disposition is to reopen
+  admission, leave the incumbent bound with its Will, socket, expiry and disconnect
+  state untouched, and refuse the contending CONNECT. A v5 contender is TOLD, with a
+  CONNACK carrying reason **0x89** and a Reason String, because the disposition is
+  "retry" and a bare socket close would leave that inference to the client; 3.1.1 has
+  no such code and gets the close. The client retries
+  and succeeds once the work completes. Availability degrades; nothing is disposed
+  under a live owner, which is the outcome every earlier attempt at this finding
+  foundered on. The displaced socket is deliberately NOT closed by that arm: closing
+  it would be a takeover effect with no successor established (F-084).
+- **A displaced packet parked at the admission boundary is answered by nothing.** If
+  the transition completes, the parked route is cancelled and its connection closed
+  without a protocol response — the connection is being displaced, and the client's
+  own CONNECT elsewhere is what it is waiting on.
+- **A clean session's discard can be DEFERRED past the disconnect.** `[MQTT-3.1.2-6]`
+  requires the discard, and it is still performed, but when the incarnation has not
+  drained by the ceiling the obligation is parked and completed later — by the drain
+  itself or by the next CONNECT for that client ID, which finishes it before doing
+  anything else. In that window the session is resident but **non-resumable**: it
+  reports no session present and its state is discarded before any reuse. What a
+  client observes is a slower CONNECT, never resumed state from a session it asked to
+  have discarded.
+
+**A JetStream timeout abandons the WAITER, not necessarily the queued operation.** The
+retirement waits for local execution — a route, a delivery callback, a timer fire — and
+owes no wait beyond that owner's return. An operation already handed to the transport is
+not held back, and what keeps it safe is a property of its target: an incarnation-scoped
+or per-consumer-unique name a successor cannot recreate, an exact stream sequence, a
+record write whose timeout marks the write uncertain (which refuses the discard until a
+readback classifies it), the documented shared-group residual, or ordinary application
+semantics for a user subject.
+
+The teardown-owned release of shared group durables is **outside** this boundary and
+unchanged: it is retirement work created after the displaced incarnation has drained,
+not an effect derived by an admitted displaced route, and the general
+scan-then-delete race on a deterministic group name remains exactly the
+shared-subscription residual recorded above.
 
 ### Shared-subscription QoS 2: affinity holds, against a non-atomic proof
 

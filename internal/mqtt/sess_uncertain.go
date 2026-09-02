@@ -1652,6 +1652,13 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 			case errors.Is(err, errMQTTClearRefusedUnresolved):
 				s.reparkDeferredDisconnect(sess, action)
 				return
+			case errors.Is(err, errMQTTClearDrainTimeout):
+				// An admitted route or a queued effect of this incarnation is still
+				// outstanding, so nothing was deleted and the tracker was reopened. The
+				// obligation is still owed: re-park it exactly as the unresolved refusal
+				// does, and let a later resolution re-drive the discard (F-036 unit 1).
+				s.reparkDeferredDisconnect(sess, action)
+				return
 			case errors.Is(err, errMQTTClearSuperseded):
 				// TERMINAL, in its own branch: the base this deferred discard claimed is
 				// not current, so the discard is no longer ours to make and nothing was

@@ -1569,7 +1569,9 @@ func TestMQTTInflightSendSectionSurvivesTheDiscard(t *testing.T) {
 	}
 	e.sess.mu.Unlock()
 
-	if err := e.sess.clear(false); err != nil {
+	// A client is BOUND here, so the discard runs the production two-phase
+	// retirement (detach before the re-mint) rather than a bare clear().
+	if err := mqttTestRetireBound(t, e.asm, e.sess, false); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
 
@@ -2253,7 +2255,9 @@ func TestMQTTInflightRebindNotClearIsWhatRetiresAPubCompDebt(t *testing.T) {
 	}
 	e.sess.endSend(e.c, pi, tok)
 
-	if err := e.sess.clear(true); err != nil {
+	// A client is BOUND here, so the discard runs the production two-phase
+	// retirement (detach before the re-mint) rather than a bare clear().
+	if err := mqttTestRetireBound(t, e.asm, e.sess, true); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
 	if _, owed, _, present := testPubRelHold(t, e.sess, pi); !present || owed != 1 {
@@ -2324,7 +2328,9 @@ func TestMQTTInflightClearSweepsOnlyDeadHolds(t *testing.T) {
 	}
 	e.sess.mu.Unlock()
 
-	if err := e.sess.clear(true); err != nil {
+	// A client is BOUND here, so the discard runs the production two-phase
+	// retirement (detach before the re-mint) rather than a bare clear().
+	if err := mqttTestRetireBound(t, e.asm, e.sess, true); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
 	if _, _, _, present := testPubRelHold(t, e.sess, 11); present {

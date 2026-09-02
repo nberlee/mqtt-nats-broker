@@ -681,6 +681,10 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 		"disposeForeignSessionLocked",
 		"disposeForeignStateLocked",
 		"disposeForeignStateFenced",
+		// The retirement path's phase 1 (F-036 unit 1): it builds the disposition from
+		// the capsule instead of the session, and a bypass through it would run the Will
+		// inside the accept transaction exactly as one through the others would.
+		"asm.disposeCaptured(",
 	}
 	var stray []string
 	helperCalls := 0
@@ -689,7 +693,10 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 		if idx := strings.Index(code, "//"); idx >= 0 {
 			code = code[:idx]
 		}
-		if strings.Contains(code, "disposeThroughPhases(") {
+		// Both phased helpers count: they hand phase 2 to the same connWillPhase /
+		// connTail defers, which is the property this guard is about.
+		if strings.Contains(code, "disposeThroughPhases(") ||
+			strings.Contains(code, "disposeCapturedThroughPhases(") {
 			helperCalls++
 		}
 		hit := false
@@ -702,8 +709,9 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 		if !hit {
 			continue
 		}
-		// The helper's own body is the ONE permitted caller of phase 1 here.
-		if strings.Contains(code, "d := target.disposeForeignStateFenced(asm, owner, false, fence)") {
+		// Each helper's own body is a permitted caller of its phase 1 here.
+		if strings.Contains(code, "d := target.disposeForeignStateFenced(asm, owner, false, fence)") ||
+			strings.Contains(code, "d := asm.disposeCaptured(target, capsule, false)") {
 			continue
 		}
 		stray = append(stray, fmt.Sprintf("mqtt.go:%d: %s", i+1, strings.TrimSpace(lines[i])))
@@ -717,11 +725,13 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 
 	// EXACT, not a minimum. A loose floor lets an arm be replaced by a bypass while the
 	// count still passes, which is how a guard stops guarding. The five are: the
-	// teardown-incomplete arm, refuseDisposing, and the three forced-leave arms. (The
-	// helper's own definition is not a call and is not counted.)
+	// teardown-incomplete arm (which since F-036 unit 1 is the CAPSULE-consuming
+	// helper, because by then the displaced client has been detached and es.c is nil),
+	// refuseDisposing, and the three forced-leave arms. (Neither helper's own
+	// definition is a call, and neither is counted.)
 	const wantHelperCalls = 5
 	if helperCalls != wantHelperCalls {
-		t.Fatalf("expected exactly %d disposeThroughPhases call sites in mqttProcessConnect "+
+		t.Fatalf("expected exactly %d phased-disposal call sites in mqttProcessConnect "+
 			"(teardown-incomplete, refuseDisposing, and the three forced-leave arms); found "+
 			"%d. If an arm was added or removed deliberately, update this count and say why.",
 			wantHelperCalls, helperCalls)

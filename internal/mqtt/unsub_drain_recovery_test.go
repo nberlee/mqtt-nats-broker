@@ -1718,9 +1718,9 @@ func TestForeignDispositionRefusesWhileTheGateIsHeld(t *testing.T) {
 	}
 	asm.sessions[sess.id] = sess
 	if asm.pendingExpiries == nil {
-		asm.pendingExpiries = make(map[string]*time.Timer)
+		asm.pendingExpiries = make(map[string]mqttPendingExpiry)
 	}
-	asm.pendingExpiries[sess.idHash] = time.NewTimer(time.Hour)
+	asm.pendingExpiries[sess.idHash] = mqttPendingExpiry{timer: time.NewTimer(time.Hour), token: 1}
 	asm.mu.Unlock()
 
 	// deferDisconnect detaches the client itself, so the binding is (re)established
@@ -1788,9 +1788,9 @@ func TestForeignDispositionSparesARenboundClient(t *testing.T) {
 	}
 	asm.sessions[sess.id] = sess
 	if asm.pendingExpiries == nil {
-		asm.pendingExpiries = make(map[string]*time.Timer)
+		asm.pendingExpiries = make(map[string]mqttPendingExpiry)
 	}
-	asm.pendingExpiries[sess.idHash] = time.NewTimer(time.Hour)
+	asm.pendingExpiries[sess.idHash] = mqttPendingExpiry{timer: time.NewTimer(time.Hour), token: 1}
 	asm.mu.Unlock()
 
 	// deferDisconnect detaches the client, so record the obligation first and then
@@ -1855,10 +1855,10 @@ func TestStaleDispositionSparesAReplacementExpiryTimer(t *testing.T) {
 	}
 	asm.sessions[replacement.id] = replacement
 	if asm.pendingExpiries == nil {
-		asm.pendingExpiries = make(map[string]*time.Timer)
+		asm.pendingExpiries = make(map[string]mqttPendingExpiry)
 	}
 	// The REPLACEMENT's deadline, keyed by the hash the stale object shares.
-	asm.pendingExpiries[replacement.idHash] = time.NewTimer(time.Hour)
+	asm.pendingExpiries[replacement.idHash] = mqttPendingExpiry{timer: time.NewTimer(time.Hour), token: 1}
 	asm.mu.Unlock()
 
 	sess.mu.Lock()

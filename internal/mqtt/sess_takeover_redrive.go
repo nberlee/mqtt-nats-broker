@@ -242,41 +242,6 @@ func (asm *mqttAccountSessionManager) discardTakenOverClient(c *client, ec *clie
 	go ec.closeConnection(DuplicateClientID)
 }
 
-// abandonReDrivenSession is transition T1: a PRE-BIND superseded discard, on a session
-// object that is resident in the maps.
-//
-// Resident does not imply bound — a record-restored session is inserted with no client,
-// a disconnected persistent session stays resident after its client detaches, and the
-// uncertainty re-restore produces the same shape — so it branches on what is actually
-// attached, exactly as the ordinary takeover tail does:
-//
-//	T1a  resident and unbound: evict, and tell nobody. There is no connection to
-//	     notify, no Will to discard and no flapper entry to add.
-//	T1b  an old client attached: evict, and run the full takeover tail on it.
-//
-// It runs BEFORE the caller's authoritative restore, and that ordering is what makes
-// the reset-resident state unreachable rather than merely unlikely: no failure exit
-// after this point can leave a seq == 0 object bound in the maps.
-//
-// The identity check is deliberately WAIVED (nil, not the sampled client): this
-// CONNECT holds the client-ID ownership gate, and the object is being abandoned
-// whatever is bound to it. Passing a client could only decline the disposal — and
-// declining is precisely what would leave the object resident at seq == 0.
-//
-// No lock held on entry (other than the ownership gate).
-func (asm *mqttAccountSessionManager) abandonReDrivenSession(c *client, es *mqttSession) {
-	// licensed=true, and this is the ONE disposal that passes it: this CONNECT holds the
-	// client-ID ownership gate and is itself the replacement, so a successor is not inferred
-	// from a record but held in hand. The disposition therefore DISCARDS the Will, and
-	// discardTakenOverClient's own discard below is the idempotent second notice.
-	d := es.disposeForeignStateLocked(asm, nil, true)
-	d.applyWill(es, asm)
-	if d.stale == nil {
-		return
-	}
-	asm.discardTakenOverClient(c, d.stale, es.id)
-}
-
 // detachConnectingClientForReDrive is transition T2: a POST-BIND rejection, where the
 // bound client is the one we are in the middle of accepting.
 //
@@ -299,4 +264,47 @@ func (asm *mqttAccountSessionManager) detachConnectingClientForReDrive(es *mqttS
 	}
 	es.mu.Unlock()
 	asm.removeSessionIfCurrent(es)
+}
+
+// abandonReDrivenSessionCaptured is transition T1: a PRE-BIND superseded discard on
+// a session object that is resident in the maps, taken after the two-phase
+// retirement has already detached its client and captured it (F-036 unit 1). It
+// replaced the sess.c-reading form outright, because since the retirement there is
+// no path that reaches T1 with the displaced client still attached — reading the
+// session there would find nil and silently drop everything the capsule holds.
+//
+// Resident does not imply bound — a record-restored session is inserted with no
+// client, a disconnected persistent session stays resident after its client
+// detaches, and the uncertainty re-restore produces the same shape — so it branches
+// on what the capsule actually captured, exactly as the ordinary takeover tail does:
+//
+//	T1a  nothing was bound: evict, and tell nobody. There is no connection to
+//	     notify, no Will to discard and no flapper entry to add.
+//	T1b  a client was attached: evict, and run the full takeover tail on it.
+//
+// It runs BEFORE the caller's authoritative restore, and that ordering is what makes
+// the reset-resident state unreachable rather than merely unlikely: no failure exit
+// after this point can leave a seq == 0 object bound in the maps.
+//
+// The identity check is not made here at all, and does not need to be: the detach
+// and the capture happened in ONE critical section inside the retirement, so the
+// client in hand is the one that was bound. (The form this replaced waived the check
+// explicitly, for the same reason — this CONNECT holds the client-ID ownership gate
+// and the object is being abandoned whatever was bound to it.)
+//
+// licensed=true, and this is the ONE disposal that passes it: this CONNECT holds the
+// gate and IS the replacement, so a successor is held in hand rather than inferred
+// from a record — which is what entitles the disposition to DISCARD the Will.
+// discardTakenOverClient's own discard below is the idempotent second notice. F-084.
+//
+// No lock held on entry (other than the ownership gate).
+func (asm *mqttAccountSessionManager) abandonReDrivenSessionCaptured(c *client,
+	es *mqttSession, capsule *mqttRetiredBinding) {
+
+	d := asm.disposeCaptured(es, capsule, true)
+	d.applyWill(es, asm)
+	if d.stale == nil {
+		return
+	}
+	asm.discardTakenOverClient(c, d.stale, es.id)
 }

@@ -1390,6 +1390,99 @@ connection stores payload A on the re-minted incarnation's hold subject for iden
 P; the replacement binds, publishes B on P, and B is lost behind a success-shaped
 PUBREC). That is the cheapest release-blocking oracle this finding has.
 
+### F-036's sixth attempt (2026-09-02): unit 1 implemented
+
+**UNIT 1 IS IMPLEMENTED**, after five attempts that produced no code. What changed was
+not the analysis but the authority: the user OVERRODE the fifth attempt's binding
+fallback ("do not try a sixth F-036 design ... select F-072") with a direct instruction
+to solve this finding, with Codex leading and its stop triggers converted into revision
+triggers. Working lane `~/.claude/lanes/f-036-sixth-attempt/` (`plan.md` revision 7,
+`review-ledger.md`, `DECISIONS.md`). Seven plan-review rounds — blocking findings
+12, 10, 10, 3, 4, 1, then CLEAN — and three scope consults. **The `advisor` tool was
+unavailable for all three consults**, so every one was Codex-only, and that is recorded
+rather than passed over.
+
+**The mechanism is documented in `docs/ARCHITECTURE.md`, "The incarnation completion
+lease".** What belongs here is why it is the shape it is, and what the review rounds
+killed on the way.
+
+**It answers the direction the third attempt named and the fourth could not implement**
+— operation-duration quiescence at the object-reuse transition — by making ownership a
+per-incarnation LEDGER whose identity is an object rather than a generation string, and
+by acquiring it at three structural boundaries instead of at placements:
+
+1. The single pre-dispatch point, per PACKET, against `c.mqtt.tracker` — the incarnation
+   the CONNECTION was bound to. This is the term that discriminates where the fourth
+   attempt's could not: after a re-mint the displaced connection still names the RETIRED
+   tracker, so it is refused by VALUE rather than by a fence it can outrun.
+2. Inside `sess.processSub`, per DELIVERY. The fifth attempt's challenge established
+   that every production message-delivery handler registers through `client.processSub`;
+   the boundary sits one level up, in the session-scoped wrapper, which is where the
+   session is in hand — and it covers the class BY CONSTRUCTION, which is what the
+   second attempt's four rounds of one-more-placement proved a list cannot.
+3. Per timer FIRE, never per delay, and before the client-ID gate.
+
+**Five things the rounds refuted or corrected, so a later change does not reintroduce
+them.** *(a)* Reading `sess.leases` at the packet gate instead of the connection's
+captured tracker — a displaced packet arriving after the re-mint would acquire the FRESH
+incarnation. *(b)* Clearing `c.mqtt.tracker` at the detach — the displaced packet must
+still find the retired tracker, not nil. *(c)* A copyable lease value: a retained copy
+could resurrect ownership AFTER the drain proof existed, so the lease is a pointer whose
+released bit is checked under the same mutex as the count. (The plan reached that
+conclusion about a child-ownership API that scope consult 3 then removed entirely; the
+revocation property outlived it and is what keeps the drain proof final.)
+*(d)* Timer-instance identity
+implemented by capturing the `*time.Timer` in its own callback — that is a data race on
+the install itself, which the `-race` suite caught; the identity is an immutable install
+token. *(e)* A non-waiting "discard permit" for the paths that discard rather than reuse
+the object — refuted because an outstanding delivery continuation can still recreate a
+map or open a record transaction after the reset, so EVERY caller drains.
+
+**The regression the existing suite caught, and the transferable rule.** Detaching
+before the destructive half made `sweepDeadSendHoldsLocked` see every F-089 send-hold
+debt of the displaced connection as ownerless and retire a live one — freeing a packet
+identifier the client still held. Both liveness predicates read `sess.c`, and the
+detach nilled it. The fix keeps the displaced connection the AUTHORITY for its own holds
+while nothing is bound in its place, self-clearing at the rebind, which is the event
+F-089 already named as the one that retires the debt. **The rule: moving a detach
+earlier changes every predicate that reads `sess.c` to decide liveness, and each has to
+be re-derived rather than assumed.** Two structural guards also fired and were updated
+without weakening what they demand — the F-084 phased-disposal count now counts both
+phased helpers (the retirement's capsule-consuming one included, and the
+`sess.c`-reading form it replaced was deleted), and the persisted-identity census was
+re-pointed at the renamed expiry entry point.
+
+**What unit 1 does NOT close.** The two-dimensional classifier and sites 1 and 3 are
+unit 2. The lease is that unit's prerequisite: its unproved identity term — "the
+caller's authority to act for the currently bound incarnation" — is exactly what a
+lease acquisition establishes, and it is separate both from the subject-derived session
+generation and from the per-exchange `rec.gen` a round of the second attempt confused it
+with. **Scope consult 3 corrected the fifth attempt's queue inventory — its UNIT-1
+IMPLICATION, not its mechanical census, which stands.** That census (four
+fire-and-forget classes, not two; shared-consumer identities deterministic and
+group-wide; consumer deletes and an application publication riding `sendMsg`) is
+accurate and was verified again here. What it does not establish is that those classes
+are unit 1's to fence. The controlling boundary is LOCAL EXECUTION that can outlive the
+retirement and then observe the re-minted session, mutate the reused object, derive a
+name from the fresh incarnation, or emit the old route's protocol result. A transport
+entry fully captured while the parent lease was held is none of those, and its safety is
+a property of its target — per-consumer-unique names for the plain and drain deletes
+(`idHash + "_" + nuid.Next()`, both restricted to non-shared consumers), exact sequences
+for the deletes, an uncertainty refusal for a timed-out record write, the documented
+group-lifecycle residual for every deterministic group target, and ordinary application
+semantics for the Sparkplug publication. The consult therefore ruled the child-completion
+design OUT and had the types DELETED rather than kept unused; a JSA timeout abandons the
+waiter, not necessarily the queued operation, and that shape predates the lease.
+
+Scope consult 2 additionally ruled the teardown-owned release of shared group
+durables OUTSIDE this boundary: it is retirement work created after the displaced
+incarnation drained, its scan-then-delete race on a deterministic GROUP name is the
+pre-existing shared-subscription residual in `docs/CONFORMANCE.md`, and closing it needs
+group-scoped arbitration rather than an incarnation lease. An earlier revision of the
+plan had made that release awaited; that was withdrawn, because awaiting is bounded
+waiting and not effect completion — a caller that times out leaves the request to
+publish afterwards.
+
 ### F-036's fifth attempt (2026-09-02): the premise audit, and why it stopped
 
 **STOPPED UNRESOLVED for the fifth time, with no implementation code and no design**,

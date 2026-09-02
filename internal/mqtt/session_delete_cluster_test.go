@@ -146,7 +146,10 @@ func TestMQTTSessionDeleteAlreadyDeletedReplicated(t *testing.T) {
 	if err := asm.lockSession(sess, cl); err != nil {
 		t.Fatalf("unable to lock session: %v", err)
 	}
-	err = sess.clear(false)
+	// A client is BOUND here (the test locks the session as cl), so the teardown runs
+	// the production two-phase retirement — detach before the re-mint — rather than a
+	// bare clear(), which property P now refuses. What is asserted below is unchanged.
+	err = mqttTestRetireBound(t, asm, sess, false)
 	asm.unlockSession(sess)
 	// ACCEPTANCE is the assertion, and since F-029 it has two shapes rather than one.
 	// claimTeardown has always reported an absent record as SUPERSEDED — "the record is

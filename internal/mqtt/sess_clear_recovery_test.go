@@ -365,19 +365,33 @@ func TestMQTTClearRefusesLateUncertaintyUnconditionally(t *testing.T) {
 func TestMQTTExpiryReEntryLeavesTheParkedDiscardUntouched(t *testing.T) {
 	e, _ := testExpiringEnv(t, "client-expiry-reentry", "expiry.reentry")
 
-	// The earned deadline is moved to a FEW SECONDS OUT rather than long past, because the
-	// sweep arms `time.AfterFunc(remaining, ...)` and a past deadline clamps remaining to 0 —
-	// the timer then fires at once and its own expireSession deletes the pendingExpiries
-	// entry, so the re-arm this test exists to observe would already be gone. Still an
-	// earned deadline (disconnectedAt is in the past); only the interval has not elapsed,
-	// which the in-memory expiry path does not re-check.
-	disconnectedAt := time.Now().Unix() - 58
+	// TWO deadlines, and the split is deliberate.
+	//
+	// The RECORD gets a few seconds of remaining, because the sweep arms
+	// `time.AfterFunc(remaining, ...)` from the record and a past deadline clamps that
+	// to zero — the timer would fire at once and its own expiry would consume the
+	// entry whose re-arm this test exists to observe.
+	//
+	// The IN-MEMORY copy stays ELAPSED, because an expiry fire means the session's own
+	// copy says it is due, and the in-memory path now RE-READS that deadline under the
+	// gate (F-036 unit 1): a callback delayed past a reconnect and a later disconnect
+	// would otherwise destroy a session whose lifetime had not run out. An earlier
+	// version of this fixture instead relied on that path never re-checking.
+	//
+	// The divergence is a state the broker reaches on its own — a peer's disconnect
+	// save is newer than this copy — and both halves stay legitimate under it. The
+	// record write happens HERE, while the session is still resolved; once the refusal
+	// below arms uncertainty, nothing may persist through it.
+	e.sess.mu.Lock()
+	disconnectedAt := e.sess.disconnectedAt
+	e.sess.disconnectedAt = time.Now().Unix() - 55
+	e.sess.mu.Unlock()
+	if err := testSessSave(t, e.sess); err != nil {
+		t.Fatalf("persist the record deadline the sweep will read: %v", err)
+	}
 	e.sess.mu.Lock()
 	e.sess.disconnectedAt = disconnectedAt
 	e.sess.mu.Unlock()
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist the adjusted deadline: %v", err)
-	}
 
 	opened := testArmAtClearWindow(t, e, mqttClearWindowPreFence)
 
