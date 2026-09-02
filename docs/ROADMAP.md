@@ -2414,16 +2414,169 @@ takeover.
   record would be refused for the life of the connection. It was implemented, caught by
   F-091's holistic round 6, and removed. (It is also not a retained-entry classifier: a
   cancellation tombstone carries the same triple.)
-  **The settled design is correlation, not entry kind:** admit only the record whose
-  `(durable, source sequence)` correlation matches the entry that owns the identifier, and
-  refuse a mismatched or uncorrelated one WITHOUT acknowledging so AckWait re-offers it. The
-  correlation is already parsed as `corr` in `mqttDeliverPubRelCb`, so the decision cannot
-  be made by the two-argument `beginPubRelSendLocked` alone: either the caller decides,
-  or the opener grows an argument. **QoS 2 subtlety not to lose:** PUBREC does not release
+  **The settled design is correlation, not entry kind:** the discriminator is the record's
+  `(durable, source sequence)` correlation against the source correlation of the entry that
+  owns the identifier, and a refusal WITHHOLDS without acknowledging so AckWait re-offers
+  it. **The rule "refuse a mismatched OR UNCORRELATED one" was this bullet's original
+  wording and it is CORRECTED by the 2026-09-02 attempt below** — refusing every
+  uncorrelated record indefinitely withholds an ordinary retained QoS 2 PUBREL, which is
+  refutation 0's regression arriving by another route. The established boundary is: refuse
+  a **positive** mismatch (both correlations valid and unequal, or exactly one valid); defer
+  absent/absent while a `pendingPublish` entry owns the identifier, which is what stops a
+  PUBREL preceding a still-buffered retained PUBLISH; **admit** absent/absent once a
+  legitimate PUBREC has made the owner an absent-correlated `pendingPubRel`, where the two
+  records are indistinguishable and the cost is at worst an extra PUBREL/PUBCOMP cycle; and
+  treat a **malformed** correlation as a third, distinct refusal state (see the tri-state
+  constraint below). The correlation is already parsed as `corr` in `mqttDeliverPubRelCb`,
+  so the decision cannot be made by the two-argument `beginPubRelSendLocked` alone: the
+  caller decides, and the attempt below establishes that the opener must be left
+  **unchanged** rather than grown an argument.
+  **QoS 2 subtlety not to lose:** PUBREC does not release
   the identifier, it transitions it into the current exchange's PUBREL phase, so a mismatched
   record must stay withheld until PUBCOMP releases it — "until the acknowledgement" is wrong.
   If exact retained identity is ever needed, add a marker rather than infer it from fields.
   Residual stated in `docs/CONFORMANCE.md`.
+
+  **ATTEMPTED AND STOPPED UNRESOLVED 2026-09-02**, with **no implementation code**: the only
+  working-tree change the attempt produced is this filing. Four plan-review rounds, one
+  scope consult and one not-converging escalation consult, and a pre-registered stopping
+  rule that fired. Lane `~/.claude/lanes/f-092/` keeps **revision 4 of the plan only** —
+  the earlier revisions were overwritten in place and are not archived — plus the ledger,
+  the four review outputs, and the two rulings (`DECISIONS.md` Decision 1, scope; Decision
+  2, the escalation). **F-093 below is part of this item, not a separate one** — that was
+  Decision 1's ruling and nothing since contradicted it, so a later attempt takes both or
+  neither.
+
+  **What the attempt ESTABLISHED, and must not be re-derived.** The settled design in the
+  paragraph above — correlate the record's `(durable, source sequence)` against the entry
+  owning the identifier — is *necessary and not sufficient*, and three successive traps sit
+  behind it, each of which a revision fell into:
+
+  1. **Correlation alone is not enough.** Several unrelated states deliberately carry empty
+     `jsDur`/`sseq` — a cancellation tombstone (`inflight_register.go:2224`), an opaque
+     recovered reservation (`:5331`), a demote (`:5209`) — so an absent-versus-absent
+     comparison reads them as "the retained exchange" and admits. An *eligibility* question
+     exists beside the correlation question.
+  2. **Eligibility is not the same question as source readability.** A successful PUBREC
+     installs `pendingPubRel` before removing `pendingPublish` (`mqtt.go:16629`), is
+     explicitly allowed while a PUBLISH send section is live (`:16642`), and writes a valid
+     correlation onto the record from the removed entry (`:16695`, `:16746`); every affine
+     PUBLISH entry carries `q2AffClaim`/`q2AffCopy` (`qos2_shared_affine.go:3388`) and its
+     PUBREL likewise carries a valid correlation. Gating the *source copy* on eligibility
+     leaves the owner absent-correlated while its record is valid — "exactly one valid" —
+     and **permanently refuses ordinary affine QoS 2**. Any design must keep the two
+     separate.
+  3. **Classifying every owner state is itself the premise that fails.** Enumeration does
+     not close: the census of `pendingPublish` writers is exact (ten sites) but entries
+     change class **in place** afterwards — `confirmInflightRegister` clears `regPending`
+     and sets `regSeq` (`inflight_register.go:3367`), recovery refreshes `regSeq` (`:3624`,
+     `:5292`) — and `retrackPublishLocked` reinstates an arbitrary pointer. This is
+     `feedback_close_the_class_with_a_property` in its own subsystem.
+
+  **Facts the attempt settled that a successor should take as given, not re-litigate:**
+  the register disposition for the transition must be **subject-and-identity addressed**
+  (`releaseInflightRegisterByIdentity`), never `deleteInflightRegisterFor`, which refuses
+  `regSeq == 0` and reaps at that exact sequence (`inflight_register.go:1677`, `:1224`) —
+  the addressing F-034 forbids. `untrackPublishEntry` deletes `cpending[jsDur][sseq]`
+  **unguarded** (`mqtt.go:11449`) where `inflight_register.go:3702` shows the guarded form;
+  that wants correcting for every caller. The duplicate branch must be **scoped to a
+  correlation-matching record and ordered below the admission revalidation**, or a stale
+  callback acknowledges a record away against a stale owner. `SrcDur`/`SrcSeq` must be left
+  empty unless the correlation is valid, which is what keeps the five `mqttStoredPubRel`
+  consumers safe. And a **third route into F-093** exists beyond the two named below: during
+  a takeover overlap another broker can store the correlated PUBREL after this broker's
+  recovery, because PUBREL delivery uses an ordinary non-queue subscription
+  (`mqtt.go:18808`), and that record can meet a matching **affine** PUBLISH owner here.
+
+  **Three further constraints the rounds established, each of which a successor must carry
+  or re-earn.** (1) **A malformed correlation is a third state, not an absence.**
+  `mqttParsePubRelCorrelation` (`pubrel_correlation.go:193`) folds *absent* and *malformed*
+  into one `Ok == false`; under the compatibility boundary an unsupported persisted shape
+  is refused, so it needs the absent/valid/malformed tri-state `mqttParsePubRelAffineRef`
+  already has, `SrcDur`/`SrcSeq` populated only when valid (which is what keeps the five
+  `mqttStoredPubRel` consumers safe without touching any of them), and — because a
+  malformed record has **no convergence event** — a malformed record arriving live with no
+  owner must **reserve its identifier**, or `bumpPI` hands out an identifier the client may
+  still be holding for a PUBREL exchange. (2) **Any such reservation must be protected from
+  the PUBREC path.** `mqttProcessPublishReceived` calls `trackAsPubRel` for every successful
+  PUBREC without checking the existing owner (`mqtt.go:16629`) and both write arms overwrite
+  unconditionally (`:12018`, `:12035`), so a duplicate or stale PUBREC replaces a reserving
+  entry with an ordinary placeholder and a failed store then momentarily unreserves the
+  identifier. The guard has to be a real handler-level early return, the way `regForeign`
+  is already declined at `:16615`, not a void `trackAsPubRel` no-op with the rest of the
+  PUBREC path still running. (3) **No irreversible register work while a PUBLISH send can
+  start.** The opener owns transmission admission only; it cannot undo destructive work
+  performed before it, so settling a register while the PUBLISH entry is still installed
+  lets a concurrent redelivery enter `beginSendLocked` (`inflight_register.go:3739`) and put
+  the payload on the wire after the register is gone.
+
+  **Round 4's fourth blocker was about oracles, and it is worth keeping** because the same
+  fixtures will be reached for again: a mutation naming only its fixture and no outcome
+  assertion is not paired with anything; a mutation whose "correct" baseline also fails the
+  race oracle is invalid against its own baseline (which is how B1 was found); a mutation
+  about premature PUBCOMP needs its test to actually inject one; and every negative-outcome
+  test needs a **route-reached** assertion, or a handler that returns immediately satisfies
+  every stated negative — see `feedback_fixture_must_reach_its_route`.
+
+  **The affine question is ANSWERED and is not an obstacle.** The stored PUBREL's own
+  `pubRelAffRef` **is** the durable carrier of the affine obligation past PUBREC — the
+  record stores the pair before affine completion (`mqtt.go:16746`), the callback copies it
+  onto the entry (`:18180`), PUBCOMP discharges it through `dischargeQ2AffPubRelProof`, and
+  resume reconciles it through `reconcileQ2AffPubRelProofs` (`qos2_shared_affine.go:3850`).
+  So `q2AffClaim`/`q2AffCopy` do not forbid removing the PUBLISH entry. They select a
+  different settlement arm: the source must be **retired** rather than the register
+  released, through `retireSourceLocked` (held lock, `mqtt.go:11495`) and
+  `secureRetiredSource` (no lock, `inflight_register.go:1991`), with
+  `resolveRetiredSource` (`:1851`) as the convergence step where the peer's acknowledgement
+  already landed. Retiring a source this broker never acknowledged is correct and drainable.
+
+  **What the attempt RETRACTS.** Its own escalation remedy. After three rounds re-cut the
+  admission seam, a consult ruled two changes: *deny by default* (admit only an affirmative
+  set, defer the unclassified complement, so taxonomy completeness stops being a
+  correctness premise) and a **settlement-pending `pendingPubRel` placeholder** as the
+  off-lock reservation, chosen over a fourth reservation registry. Round 4 refuted the
+  combination, and the refutation is the most valuable thing here:
+
+  - **The placeholder reserves the identifier but un-suppresses the SOURCE.** Removing the
+    PUBLISH entry's `cpending` link is what lets a fresh source redelivery miss the old
+    identifier entirely, reach `bumpPI`, allocate a *different* one and transmit
+    (`mqtt.go:11292`, `:11340`, `:11374`). Recovery's own code exists to prevent exactly
+    this and says so — it restores the source mapping because "`trackPublish` reaches
+    `pendingPubRel` only through the mapping" (`inflight_register.go:5243`). Reachable in
+    the plain arm too, since `finalizeDrainDelivery` acknowledges the source
+    fire-and-forget (`unsub_drain.go:848`). **Any successor must install the source
+    suppression atomically with the handoff**, not after it, and must cover the plain
+    lost-ack case and not only the affine one.
+  - **Deny-by-default and a resumable placeholder contradict each other.** A
+    `settlePending` owner is by construction not affirmatively admissible, so the preflight
+    returns before the retry path it needs. The two halves of one ruling are incompatible,
+    and no local revision resolves it: an affirmative "this record resuming its own
+    placeholder" row is required, which re-opens the very completeness question deny-by-
+    default was adopted to retire.
+  - **`clear()` cannot leave the record retryable.** `clear()` captures the retiring PUBREL
+    durable (`mqtt.go:10727`), removes both pending maps and `cpending` (`:10742`), re-mints
+    the generation (`:10812`) and schedules the old consumer's deletion (`:10866`,
+    `sess_teardown.go:820`). The next incarnation uses a different PUBREL subject, so the
+    old record is teardown material, not retry state. A stopping rule demanding
+    "retryable after `clear()`" was demanding the wrong thing; a successor states discard
+    semantics there instead.
+
+  **What is still OPEN, and where a fifth attempt starts.** The **marker** this bullet
+  already names is the live candidate, and the attempt's refusal of it is now weaker than
+  when it was made: it was set aside because "a matching marker proves identity, not
+  permission to act", so the `regForeign` and opaque authority checks survive it. That is
+  true and it is not disqualifying — the identity half is exactly what three rounds of
+  inference failed to reconstruct, and `mqttPending.regNonce` **already is** an
+  allocation-minted per-exchange identity, register-carried and recovery-restored, so the
+  work may be carrying it on the record rather than inventing anything. A retained send has
+  no register at all (R6), so retained still needs a minted marker. Also unresolved and
+  bounded: the **undecidable** case, a stale *uncorrelated* record colliding with a new
+  uncorrelated (retained) exchange on one identifier — both sides legitimately absent. The
+  boundary the attempt did establish is that while the retained exchange is still
+  `pendingPublish` the stale record must defer (that is what stops a PUBREL preceding the
+  retained PUBLISH), and that once a legitimate PUBREC has made it an absent-correlated
+  `pendingPubRel` the two are indistinguishable and the cost is an extra PUBREL/PUBCOMP
+  cycle, never a payload under the wrong exchange.
 
 - [ ] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
   identifier.** Filed 2026-08-31 by F-091's reconcile consult, which found it while refuting
@@ -2437,6 +2590,36 @@ takeover.
   reached from a different route, and because F-091 neither introduced it nor is chartered
   to fix it — but note it is the reason the general fence in F-092 cannot simply be tightened
   without looking here first.
+
+  **NOT A SEPARATE ITEM, decided 2026-09-02 and confirmed by the attempt above.** F-093's
+  correction **is** F-092's match-success arm: prove the record matches the PUBLISH-phase
+  owner, settle that owner's register and drain obligation, replace `pendingPublish[pi]`
+  with `pendingPubRel[pi]`, and withhold every non-matching record until that owner reaches
+  PUBCOMP. Doing F-093 alone would implement half of that transition in
+  `mqttDeliverPubRelCb` and then reopen the same seam for F-092's refusal arm; doing F-092
+  alone turns this bounded availability leak into an **unbounded** one, because F-092's
+  fence withholds a non-matching record without acknowledging it and that only converges if
+  the entry owning the identifier eventually resolves — and this box is precisely an owner
+  that never resolves. Take both or neither.
+
+  *Premise verified in the tree, so the bullet's "nothing appears to remove" hedge can go:*
+  `finalizeDrainDelivery` (`unsub_drain.go:607`) never touches `pendingPublish` or
+  `cpending`, and the only `untrackPublishEntry` in `unsub_drain.go` is `stageDrain`'s
+  never-transmitted `regPending` arm (`:390`). Recovery installs the entry at
+  `inflight_register.go:5306` with `reserveSource`; `trackAsPubRel` (`mqtt.go:12006`) then
+  installs `pendingPubRel[pi]` beside it; `mqttProcessPubComp` removes only the PUBREL entry
+  (`:12045`). `bumpPI` skips any identifier with a live `pendingPublish` entry (`:11095`)
+  and `qos12InflightForCap` counts it against Receive Maximum (`:11135`), where with
+  `rmax != 0` the one identifier is charged **twice** while both entries live. **Three
+  routes reach it, not one:** route A through `finalizeDrainDelivery`; route B where the
+  resume barrier confirms and removes the claim itself and acks the source
+  (`unsub_drain.go:1666-1753`) so `finalizeDrainDelivery` is skipped **and the register is
+  never released at all**, which is why the *next* resume rebuilds the entry and
+  re-establishes the reservation rather than clearing it; and route C, a peer's correlated
+  store during a takeover overlap, which can present an **affine** matching owner. The
+  live-path contrast is that `mqttProcessPublishReceived` untracks the PUBLISH entry at
+  PUBREC under one lock (`mqtt.go:16629`, `:16660`), so on a live connection the two never
+  coexist.
 
 - [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
   non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).
