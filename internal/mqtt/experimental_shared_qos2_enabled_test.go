@@ -2,10 +2,4 @@
 
 package mqtt
 
-import "testing"
-
 const mqttTestExperimentalSharedQoS2 = true
-
-func testRequireExperimentalSharedQoS2(t testing.TB) {
-	t.Helper()
-}
