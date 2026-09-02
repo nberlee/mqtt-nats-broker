@@ -76,7 +76,7 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 	}, b1.opts.MQTT.Host, b1.opts.MQTT.Port)
 	defer cb.Close()
 	testMQTTReadConnAckV5(t, rb)
-	if codes := testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: filter, opts: 2}}); len(codes) != 1 || codes[0] != 2 {
+	if codes := testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: filter, opts: 1}}); len(codes) != 1 || codes[0] != 1 {
 		t.Fatalf("member B SUBACK %v", codes)
 	}
 	testMQTTFlush(t, cb, nil, rb)
@@ -136,7 +136,7 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 		vh.WriteUint16(2)
 		vh.WriteVarInt(0) // empty properties
 		vh.WriteBytes([]byte(filter))
-		vh.WriteByte(2)
+		vh.WriteByte(1)
 		w := newMQTTWriter(0)
 		w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
 		w.WriteVarInt(vh.Len())

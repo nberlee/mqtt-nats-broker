@@ -256,7 +256,7 @@ func TestSharedPrePassRepairableDoesNotPoisonLaterTargets(t *testing.T) {
 	// change.
 	t.Run("the pre-pass leaves a repairable filter restorable", func(t *testing.T) {
 		mk := func() []*mqttFilter {
-			return []*mqttFilter{{shared: true, group: "g", filter: "a.topic", qos: 2}}
+			return []*mqttFilter{{shared: true, group: "g", filter: "a.topic", qos: 1}}
 		}
 		sid := mk()[0].sessionKey()
 

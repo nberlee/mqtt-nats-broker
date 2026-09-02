@@ -943,6 +943,13 @@ distinguishes a census from a sample in kind rather than in length.
 
 **Title:** Revalidate ownership for otherwise quiet resident sessions
 
+**Supported-scope ruling, 2026-09-02.** F-036 remains an alpha blocker for its ordinary
+QoS 2 and general session-ownership routes. A closure need not preserve the experimental
+session-affine shared-QoS-2 branch. Any affine-only regression caused by the sound general
+fix is accumulated under ROADMAP chapter P rather than widening this finding or blocking
+its implementation. The affine history below remains evidence about rejected mechanisms,
+not an active acceptance requirement.
+
 - Status: Open — NARROWED, not resolved, and **ATTEMPTED BY CONSTRUCTION AND STOPPED
   UNRESOLVED on 2026-08-27** after three plan-review rounds and two scope consults, with no
   code written. The attempt found and verified the site-1 licence — a valid retirement
@@ -2220,12 +2227,14 @@ from materialization.
 **Title:** A live generation reference leaves every assignment of that generation to owner
 resume
 
-- Status: **Partly remedied, 2026-08-20. Still open.** Found by F-033's consequence audit,
-  2026-08-18.
+- Status: **Partly remedied, still open, and parked outside the alpha since 2026-09-02.**
+  Found by F-033's consequence audit, 2026-08-18. The scope decision preserves the
+  implementation and this evidence; it does not declare the finding fixed.
 - Classification: HA arbitration architecture / liveness
-- Release treatment: **Alpha blocker** for the stall. The accumulation is a resource leak
-  and is stated here as a residual of the same premise rather than filed separately.
-- Roadmap section: §0.2 (multi-frontend HA blockers)
+- Release treatment: **Experimental shared-QoS-2 work, post-alpha / maybe someday.** The
+  stall and accumulation are gathered under ROADMAP chapter P and do not block supported
+  shared QoS 0/1 or ordinary QoS 2.
+- Roadmap section: chapter P (historical §0.2 record retained)
 
 ### What landed, and what it deliberately does not touch
 

@@ -199,6 +199,13 @@ type MQTTOpts struct {
 	// Information = 1. Empty = never sent. Spec5 [3.2.2.3.15].
 	ResponseInformation string
 
+	// ExperimentalSharedQoS2 enables the session-affine shared-subscription
+	// QoS 2 implementation. It is intentionally not exposed by the production
+	// command. With the zero-value default, a shared subscription requesting
+	// QoS 2 is granted and persisted at QoS 1; non-shared QoS 2 is unaffected.
+	// Persisted state created with this option has no compatibility guarantee.
+	ExperimentalSharedQoS2 bool
+
 	// Internal tuning flags carried over from upstream.
 	downgradeQoS2Sub bool
 	rejectQoS2Pub    bool

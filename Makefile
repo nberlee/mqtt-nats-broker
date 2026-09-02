@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-bridge
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite cluster-failover-tests depproof soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests depproof soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -31,6 +31,9 @@ lint-md: ## Run markdownlint over the project's own Markdown
 
 full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 	go test -tags mqttport_fulltests ./internal/mqtt/
+
+experimental-shared-qos2-tests: ## Run the parked, non-gating shared-QoS2 suite.
+	go test -tags 'mqttport_fulltests mqttport_experimental_shared_qos2' ./internal/mqtt/
 
 cluster-failover-tests: ## Run the 3-node JetStream tests: Will-outbox failover, takeover arbitration, and shared group ownership.
 	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated)' ./internal/mqtt/

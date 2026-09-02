@@ -725,6 +725,8 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 	})
 
 	t.Run("re-SUBSCRIBE, definite failure keeps the attempted QoS", func(t *testing.T) {
+		testRequireExperimentalSharedQoS2(t)
+
 		_, c, sess, _ := drainTestSession(t, "rbshared-resub-def")
 		f := &mqttFilter{shared: true, group: "g1", filter: "rb/topic", qos: 2}
 		sid := f.sessionKey()

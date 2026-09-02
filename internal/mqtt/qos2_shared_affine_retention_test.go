@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqttport_fulltests && mqttport_experimental_shared_qos2
 
 // Retention proof for session-affine shared-subscription QoS 2 (F-063).
 //

@@ -1423,11 +1423,101 @@ func TestMQTTv5SharedSubscriptionMixedQoS(t *testing.T) {
 	testMQTTExpectNothing(t, r1)
 }
 
-// A QoS2 shared subscriber receives a QoS2-published message through the group
-// consumer and completes the full PUBREC/PUBREL/PUBCOMP handshake. Spec5 [4.8.2].
-func TestMQTTv5SharedSubscriptionQoS2(t *testing.T) {
+func TestMQTTv5SharedSubscriptionQoS2ProductionCeiling(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
+	o.MQTT.ExperimentalSharedQoS2 = false
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const clientID = "q2share-capped"
+	ci := &mqttV5ConnInfo{clientID: clientID, props: mqttV5ConnPropsSessionExpiry(300)}
+	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	sp, reason, props := testMQTTReadConnAckV5(t, r)
+	if sp || reason != mqttReasonSuccess {
+		t.Fatalf("Expected a new successful session, got session-present=%v reason=0x%x", sp, reason)
+	}
+	if props.present[mqttPropMaxQoS] {
+		t.Fatalf("Maximum QoS must remain unadvertised, got %v", props.maxQoS)
+	}
+	if props.present[mqttPropSharedSubAvailable] {
+		t.Fatal("Shared Subscription Available must remain unadvertised (absence means available)")
+	}
+	codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{
+		{topic: "$share/g/foo", opts: 2},
+		{topic: "ordinary", opts: 2},
+	})
+	if len(codes) != 2 || codes[0] != 1 || codes[1] != 2 {
+		t.Fatalf("Expected shared QoS2 to be capped while ordinary QoS2 remains available, got %v", codes)
+	}
+
+	ps, _, ok := testMQTTLoadSessionRecord(t, s, clientID, clientID)
+	if !ok {
+		t.Fatal("Expected the persistent session record")
+	}
+	if got := ps.SharedSubs["$share/g/foo"]; got != 1 {
+		t.Fatalf("Persisted shared QoS = %v, want 1", got)
+	}
+	if got := ps.Subs["ordinary"]; got != 2 {
+		t.Fatalf("Persisted ordinary QoS = %v, want 2", got)
+	}
+	if ps.Q2AffGen != _EMPTY_ || ps.Q2Aff != nil {
+		t.Fatalf("Production ceiling persisted affine state: Q2AffGen=%q Q2Aff=%+v", ps.Q2AffGen, ps.Q2Aff)
+	}
+
+	// Leave the persistent member offline, then publish at QoS 2. The group
+	// consumer retains the message at the granted QoS 1 boundary.
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+	pubc, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: "q2share-capped-pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pubc.Close()
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, pubc, pubr, 2, false, false, "foo", 1, []byte("capped"))
+
+	c, r = testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	if sp, _, _ := testMQTTReadConnAckV5(t, r); !sp {
+		t.Fatal("Expected the capped shared subscription to survive session resume")
+	}
+	qos, pi := testMQTTReadPublishV5(t, r, "foo", []byte("capped"))
+	if qos != 1 {
+		t.Fatalf("QoS2 publication reached the capped shared member at QoS %v, want 1", qos)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+
+	asm := testMQTTGetClient(t, s, clientID).mqtt.asm
+	consumers, err := asm.jsa.consumerList(mqttOutStreamName)
+	if err != nil {
+		t.Fatalf("List affine-output consumers: %v", err)
+	}
+	for _, consumer := range consumers {
+		if strings.HasPrefix(consumer.Name, mqttQ2AffineConsumerDurablePrefix) {
+			t.Fatalf("Production ceiling provisioned affine consumer %q", consumer.Name)
+		}
+	}
+	var claims int
+	if err := asm.scanQ2AffClaims(func(string, *mqttQ2AffClaim, uint64) error {
+		claims++
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan affine claims: %v", err)
+	}
+	if claims != 0 {
+		t.Fatalf("Production ceiling created %v affine assignment claim(s)", claims)
+	}
+}
+
+// With the non-production option enabled, a QoS2 shared subscriber receives a
+// QoS2-published message through the group consumer and completes the full
+// PUBREC/PUBREL/PUBCOMP handshake. This preserves the parked implementation;
+// it is not part of the supported-alpha conformance claim. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionQoS2(t *testing.T) {
+	t.Parallel()
+	testRequireExperimentalSharedQoS2(t)
+	o := testMQTTDefaultOptionsV5()
+	if !o.MQTT.ExperimentalSharedQoS2 {
+		t.Fatal("shared QoS2 implementation test requires the experimental option")
+	}
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
@@ -1597,13 +1687,16 @@ func TestMQTTv5SharedSubscriptionMalformed(t *testing.T) {
 func TestMQTTSharedSubscription311Literal(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
+	o.MQTT.ExperimentalSharedQoS2 = false
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "v3share", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
-	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "$share/grp/foo", qos: 0}}, []byte{0})
+	// Even at requested QoS 2 this is an ordinary literal filter in 3.1.1, so
+	// the MQTT 5 shared-subscription ceiling must not downgrade it.
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "$share/grp/foo", qos: 2}}, []byte{2})
 
 	cp, rp := testMQTTConnect(t, &mqttConnInfo{clientID: "v3sharepub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cp.Close()

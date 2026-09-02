@@ -10,9 +10,9 @@
 //
 // The oracle is the ARBITRATION ITSELF, observed at the "after-ownership-cas" boundary,
 // which fires exactly once per ownership verdict. A raw record-write count cannot serve:
-// a shared QoS 2 resume legitimately writes several times more than a plain one (the PUBREL
-// consumer and the affine path both provision), so a differential against a plain resume
-// measures those too. The boundary measures this change and nothing else.
+// a shared resume legitimately writes for group ownership while a plain one does not, so a
+// raw-count differential would conflate that write with the behavior under test. The
+// boundary measures this change and nothing else.
 //
 // NOTHING HERE MAY RUN IN PARALLEL. Every seam these tests install —
 // mqttTestSharedArbitratePauseV, mqttTestSessStoreResultHookV — is a PACKAGE-LEVEL atomic,
@@ -77,7 +77,7 @@ func testCountSessionStores(t *testing.T) *testRecordStoreCounter {
 // refusal says "ownership could not be confirmed" and never "session taken over by a new
 // connection" — the disposal vocabulary's text, which this site used to have no way of
 // sending and must still never send. See F-084.
-func testSharedRefusalReason(t *testing.T, b *testQ2AffBroker, id string, expiry uint32) (net.Conn, byte, string, bool) {
+func testSharedRefusalReason(t *testing.T, b *testSharedBroker, id string, expiry uint32) (net.Conn, byte, string, bool) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
 		clientID:   id,
@@ -157,7 +157,7 @@ func testCountArbitrations(t *testing.T) *atomic.Int32 {
 // that can be refused by a contended record write it never needed to make.
 func TestMQTTSharedGroupOwnershipWriteRunsOnASharedResume(t *testing.T) {
 	t.Run("a shared resume arbitrates once", func(t *testing.T) {
-		b := testQ2AffSetup(t, "ownshared")
+		b := testSharedSetup(t, "ownshared")
 		ca, _ := b.member(t, "ownsharedA", 300)
 		b.bind(t, "ownsharedA")
 		durable := b.groupDurable(t)
@@ -223,7 +223,7 @@ func TestMQTTSharedGroupOwnershipWriteRunsOnASharedResume(t *testing.T) {
 //
 // Kills M2 (trigger the write only when a create happened).
 func TestMQTTSharedGroupOwnershipWriteRunsWithoutAnyCreate(t *testing.T) {
-	b := testQ2AffSetup(t, "ownnocreate")
+	b := testSharedSetup(t, "ownnocreate")
 	ca, _ := b.member(t, "ownnocreateA", 300)
 	b.bind(t, "ownnocreateA")
 	durable := b.groupDurable(t)
@@ -285,7 +285,7 @@ func TestMQTTSharedGroupOwnershipWriteRunsWithoutAnyCreate(t *testing.T) {
 //     last-holder scan skips same-client-ID records, so after a takeover a blind delete
 //     destroys the NEW owner's durable.
 func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
-	b := testQ2AffSetup(t, "ownforeign")
+	b := testSharedSetup(t, "ownforeign")
 	ca, _ := b.member(t, "ownforeignA", 300)
 	b.bind(t, "ownforeignA")
 	durable := b.groupDurable(t)
@@ -383,7 +383,7 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 //   - and the ownership write must still happen (M4: keying the trigger on the charge
 //     silently skips arbitration for exactly the population that just recreated a durable).
 func TestMQTTSharedGroupRepairDoesNotDoubleChargeAndStillArbitrates(t *testing.T) {
-	b := testQ2AffSetup(t, "ownrepair")
+	b := testSharedSetup(t, "ownrepair")
 	ca, _ := b.member(t, "ownrepairA", 300)
 	b.bind(t, "ownrepairA")
 	durable := b.groupDurable(t)
@@ -456,7 +456,7 @@ func TestMQTTSharedGroupRepairDoesNotDoubleChargeAndStillArbitrates(t *testing.T
 // have stopped the batch at the absence and judged everything after it indeterminate —
 // refusing a CONNECT whose other durables are perfectly healthy.
 func TestMQTTSharedGroupPrePassRepairableDoesNotPoisonTheBatch(t *testing.T) {
-	b := testQ2AffSetup(t, "prepassbatch")
+	b := testSharedSetup(t, "prepassbatch")
 	id := "prepassbatchA"
 
 	// Three shared filters, so an absence in the first has later targets to poison.
@@ -467,9 +467,9 @@ func TestMQTTSharedGroupPrePassRepairableDoesNotPoisonTheBatch(t *testing.T) {
 	}, b.o.MQTT.Host, b.o.MQTT.Port)
 	testMQTTReadConnAckV5(t, r1)
 	filters := []mqttV5SubFilter{
-		{topic: "$share/" + b.group + "/prepassbatch/one", opts: 2},
-		{topic: "$share/" + b.group + "/prepassbatch/two", opts: 2},
-		{topic: "$share/" + b.group + "/prepassbatch/three", opts: 2},
+		{topic: "$share/" + b.group + "/prepassbatch/one", opts: 1},
+		{topic: "$share/" + b.group + "/prepassbatch/two", opts: 1},
+		{topic: "$share/" + b.group + "/prepassbatch/three", opts: 1},
 	}
 	if codes := testMQTTSubV5(t, c1, r1, 1, filters); len(codes) != 3 {
 		t.Fatalf("SUBACK %v", codes)
@@ -526,7 +526,7 @@ func TestMQTTSharedGroupPrePassRepairableDoesNotPoisonTheBatch(t *testing.T) {
 // is one something is deleting underneath this CONNECT — so the second reading is terminal.
 // The existing between-passes seam is what makes the window reachable at all.
 func TestMQTTSharedGroupPostPassAbsenceRefuses(t *testing.T) {
-	b := testQ2AffSetup(t, "postpassabs")
+	b := testSharedSetup(t, "postpassabs")
 	ca, _ := b.member(t, "postpassabsA", 300)
 	b.bind(t, "postpassabsA")
 	durable := b.groupDurable(t)
@@ -568,7 +568,7 @@ func TestMQTTSharedGroupPostPassAbsenceRefuses(t *testing.T) {
 // performs an ownership write. The restore-exit seam fails the companion at exactly that
 // point, which is the only way to reach the window.
 func TestMQTTSharedGroupTriggerRollsBackWithItsFilter(t *testing.T) {
-	b := testQ2AffSetup(t, "triggerrollback")
+	b := testSharedSetup(t, "triggerrollback")
 	id := "triggerrollbackA"
 
 	c1, r1 := testMQTTConnectV5(t, &mqttV5ConnInfo{
@@ -579,8 +579,8 @@ func TestMQTTSharedGroupTriggerRollsBackWithItsFilter(t *testing.T) {
 	testMQTTReadConnAckV5(t, r1)
 	// "foo/#" needs a level-up companion, so this filter owns two durables.
 	if codes := testMQTTSubV5(t, c1, r1, 1, []mqttV5SubFilter{
-		{topic: "$share/" + b.group + "/triggerrollback/#", opts: 2},
-	}); len(codes) != 1 || codes[0] != 2 {
+		{topic: "$share/" + b.group + "/triggerrollback/#", opts: 1},
+	}); len(codes) != 1 || codes[0] != 1 {
 		t.Fatalf("SUBACK %v", codes)
 	}
 	testMQTTFlush(t, c1, nil, r1)
@@ -711,7 +711,7 @@ func TestMQTTSharedGroupRepairAtCapacityStillRepairs(t *testing.T) {
 // (feedback_absence_is_not_a_fact). So the oracle is that no group-durable create is issued
 // at all.
 func TestMQTTSharedGroupIndeterminateIsNeverRepaired(t *testing.T) {
-	b := testQ2AffSetup(t, "indetnorepair")
+	b := testSharedSetup(t, "indetnorepair")
 	ca, _ := b.member(t, "indetnorepairA", 300)
 	b.bind(t, "indetnorepairA")
 	durable := b.groupDurable(t)

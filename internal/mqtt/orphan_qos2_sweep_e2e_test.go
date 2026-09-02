@@ -178,6 +178,8 @@ func TestOrphanSweepRetiresRetiredGenerationAndSparesLive(t *testing.T) {
 // as long as the source could still be re-offered — never deleted in a way that
 // would let a redelivery elect a fresh winner.
 func TestOrphanSweepSharedSourceHonorsDiscardedAssignment(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	oldTimeout := testMQTTTimeout
 	testMQTTTimeout = 40 * time.Second
 	defer func() { testMQTTTimeout = oldTimeout }()

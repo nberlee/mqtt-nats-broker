@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqttport_fulltests && mqttport_experimental_shared_qos2
 
 // Conformance and invariant tests for session-affine ownership of a STARTED
 // shared-subscription QoS 2 delivery (qos2_shared_affine.go).

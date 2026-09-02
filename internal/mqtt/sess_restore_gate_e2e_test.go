@@ -120,6 +120,8 @@ func testPauseRestoreAt(t *testing.T, at string, body func()) *atomic.Int32 {
 // the injection cleared both restores and DELIVERS — which is the property the old
 // behavior violated while reporting Session Present = 1.
 func TestRestoreRefusesConnectWhenAnExitFails(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	for _, exit := range []string{"affine", "pubrel", "consumer"} {
 		t.Run(exit, func(t *testing.T) {
 			b := testQ2AffSetup(t, "f050"+exit)
@@ -261,18 +263,28 @@ func TestThreeOneOneResumeRestoresNoSharedFilter(t *testing.T) {
 	b := testQ2AffSetup(t, "f050v3")
 	id := "f050-v311"
 
-	c, _ := b.member(t, id, 300)
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   id,
+		cleanStart: false,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, b.o.MQTT.Host, b.o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	filter := "$share/" + b.group + "/" + b.topic
+	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: filter, opts: 1}}); len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("SUBACK = %v, want [1]", codes)
+	}
+	testMQTTFlush(t, c, nil, r)
 	b.bind(t, id)
 	c.Close()
 
 	// Any shared exit failing would refuse the CONNECT if the filter were restored.
-	hits := testRestoreFailExit(t, b.asm, "affine", errRestoreExitInjected)
+	hits := testRestoreFailExit(t, b.asm, "consumer", errRestoreExitInjected)
 
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: id, cleanSess: false}, b.o.MQTT.Host, b.o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
 	if got := hits.Load(); got != 0 {
-		t.Fatalf("a 3.1.1 resume reached the shared affine exit %d time(s); shared filters must not be restored for it", got)
+		t.Fatalf("a 3.1.1 resume reached the shared-consumer exit %d time(s); shared filters must not be restored for it", got)
 	}
 }
 
@@ -342,6 +354,8 @@ func testRestoreAwaitPublish(t *testing.T, r *mqttReader, want string) uint16 {
 // retry then finds Session Present 0 with its state gone. Both are asserted here
 // because both are the reason the reorder exists rather than a smaller patch.
 func TestRefusedRestorePublishesNoWillAndKeepsTheSession(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	b := testQ2AffSetup(t, "f050keep")
 	id := "f050-keep"
 	willTopic := "f050keep/will"
@@ -413,6 +427,8 @@ func TestRefusedRestorePublishesNoWillAndKeepsTheSession(t *testing.T) {
 // QoS 2 filter and deliver through it, with the backlog arriving after the CONNACK
 // rather than being dropped or stalled to AckWait.
 func TestSharedQoS2ResumeStillDeliversAfterTheReorder(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	b := testQ2AffSetup(t, "f050happy")
 	id := "f050-happy"
 
@@ -454,7 +470,16 @@ func TestNoStoredPubRelPrecedesTheConnAck(t *testing.T) {
 	b := testQ2AffSetup(t, "f050rel")
 	id := "f050-pubrel"
 
-	c, r := b.member(t, id, 300)
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   id,
+		cleanStart: false,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, b.o.MQTT.Host, b.o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: b.topic, opts: 2}}); len(codes) != 1 || codes[0] != 2 {
+		t.Fatalf("SUBACK = %v, want [2]", codes)
+	}
+	testMQTTFlush(t, c, nil, r)
 	b.bind(t, id)
 
 	b.publish(t, 1, "half-finished")
@@ -948,6 +973,8 @@ func TestRefusedRestoreDoesNotStrandTheNextConnection(t *testing.T) {
 //
 // Mutation check: drop the refund call and tmaxack is higher after the refusal.
 func TestRefusedRestoreRefundsTheSharedChargeItAdded(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	b := testQ2AffSetup(t, "f050charge")
 	id := "f050-charge"
 
@@ -1045,6 +1072,8 @@ func TestRefusedRestoreRefundsTheSharedChargeItAdded(t *testing.T) {
 // Mutation check: remove the gate consultation from mqttDeliverQ2AffineCb and the
 // block counter stays at zero.
 func TestNoAffineCopyPrecedesTheConnAck(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	b := testQ2AffSetup(t, "f050aff")
 	id := "f050-affine"
 
@@ -1119,7 +1148,17 @@ func TestMalformedSharedKeyRefusesTheResume(t *testing.T) {
 	b := testQ2AffSetup(t, "f050bad")
 	id := "f050-badkey"
 
-	c, r := b.member(t, id, 300)
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   id,
+		cleanStart: false,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, b.o.MQTT.Host, b.o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	filter := "$share/" + b.group + "/" + b.topic
+	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: filter, opts: 1}}); len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("SUBACK = %v, want [1]", codes)
+	}
+	testMQTTFlush(t, c, nil, r)
 	b.bind(t, id)
 	sess := testMQTTResidentSession(t, b.s, id)
 
@@ -1362,7 +1401,16 @@ func TestGateTimeoutNaksAStoredPubRel(t *testing.T) {
 	defer func() { mqttPhaseGateWaitMax = prevMax }()
 
 	id := "f050-relto"
-	c, r := b.member(t, id, 300)
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   id,
+		cleanStart: false,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: b.topic, opts: 2}}); len(codes) != 1 || codes[0] != 2 {
+		t.Fatalf("SUBACK = %v, want [2]", codes)
+	}
+	testMQTTFlush(t, c, nil, r)
 	b.bind(t, id)
 
 	// The PUBREL has to be STORED but never DELIVERED, or it is pending-unacked and
@@ -1442,6 +1490,8 @@ func TestGateTimeoutNaksAStoredPubRel(t *testing.T) {
 }
 
 func TestGateTimeoutNaksAnAffineCopy(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	// AckWait ABOVE the cap is the whole condition, and it has to be short enough
 	// that a REDELIVERY lands inside the held window: an affine copy cannot be
 	// materialized during that window at all, because the group delivery that would
@@ -1542,6 +1592,8 @@ func TestGateTimeoutNaksAnAffineCopy(t *testing.T) {
 //
 // Mutation check: M28 removes the affine timeout NAK and this fixture fails.
 func TestGateTimeoutNaksAnUndeliveredAffineCopy(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	// AckWait above the cap is the condition; short enough that the "without the
 	// NAK" arm is observably slower rather than hanging the suite.
 	o := testMQTTDefaultOptionsV5()

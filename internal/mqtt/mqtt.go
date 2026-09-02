@@ -2595,6 +2595,11 @@ type mqtt struct {
 	// downgradeQOS2Sub tells the MQTT client to downgrade QoS2 SUBSCRIBE
 	// requests to QoS1.
 	downgradeQoS2Sub bool
+
+	// experimentalSharedQoS2 enables the parked session-affine shared QoS 2
+	// path. Production leaves this false, capping only shared subscriptions at
+	// QoS 1. Tests of the preserved experimental implementation opt in.
+	experimentalSharedQoS2 bool
 }
 
 // mqttProperties holds the parsed MQTT 5.0 variable-header properties for a
@@ -3189,8 +3194,9 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 	now := time.Now()
 
 	mqtt := &mqtt{
-		rejectQoS2Pub:    opts.MQTT.rejectQoS2Pub,
-		downgradeQoS2Sub: opts.MQTT.downgradeQoS2Sub,
+		rejectQoS2Pub:          opts.MQTT.rejectQoS2Pub,
+		downgradeQoS2Sub:       opts.MQTT.downgradeQoS2Sub,
+		experimentalSharedQoS2: opts.MQTT.ExperimentalSharedQoS2,
 	}
 	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt, ws: ws}
 	c.headers = true
@@ -7894,6 +7900,10 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 		if f.qos > 2 {
 			f.qos = 2
+		}
+		if f.shared && f.qos == 2 && !c.mqtt.experimentalSharedQoS2 {
+			c.Warnf("Downgrading shared subscription QoS2 to QoS1 for %q; shared QoS2 is experimental", f.filter)
+			f.qos = 1
 		}
 		if c.mqtt.downgradeQoS2Sub && f.qos == 2 {
 			c.Warnf("Downgrading subscription QoS2 to QoS1 for %q, as configured", f.filter)

@@ -119,6 +119,13 @@ func TestResolveTLSNoneConfigured(t *testing.T) {
 	}
 }
 
+func TestMQTTOptionsDoNotEnableExperimentalSharedQoS2(t *testing.T) {
+	opts := mqttOptions(config.Default(), nil)
+	if opts.MQTT.ExperimentalSharedQoS2 {
+		t.Fatal("production options enabled experimental shared QoS2")
+	}
+}
+
 // TestMQTTOptionsTLSApplied drives the real startup path (config -> resolveTLS
 // -> mqttOptions) so the TLS config and the listener options cannot disagree.
 func TestMQTTOptionsTLSApplied(t *testing.T) {

@@ -14,6 +14,28 @@ The rule applies throughout this document: every residual below states what a br
 running this code does, and a limit that is real is stated as the scope of the
 mechanism that enforces it, not as a property of a fleet's version mix.
 
+## Supported-alpha boundary for shared subscriptions
+
+The alpha supports shared subscriptions through granted QoS 1. By production default, a
+shared filter requesting QoS 2 receives SUBACK Granted QoS 1 (`0x01`) and is persisted as
+QoS 1; messages published at QoS 2 may consequently be delivered to that shared
+subscription at QoS 1. Non-shared QoS 2 remains supported. MQTT 5 continues to advertise
+Shared Subscription Available, because shared QoS 0/1 is supported.
+
+The session-affine shared-QoS-2 implementation remains in the tree behind a programmatic
+test option that the production command does not expose. It is **not** part of the alpha
+conformance claim. Every affine residual and deviation below is retained as an experimental
+implementation record, not as an alpha release gate, unless the same section separately
+demonstrates a non-affine route.
+Other finding implementations may break an affine-only route without taking that repair
+into scope; ROADMAP chapter P gathers the fallout for a future investment decision.
+
+Experimental persisted state has no compatibility promise. Disabling the gate, moving it
+across an upgrade or rollback, or restoring it into another build is unsupported. Detection,
+automatic QoS-2-to-QoS-1 persisted-state downgrade and migration readers are not provided.
+Before leaving the experiment, operators must use the complete nine-stream bundle reset in
+`docs/ARCHITECTURE.md`, which also discards supported MQTT state in that account.
+
 ## vibesrc/mqttconformance (primary) ✅
 
 Rust CLI mapping tests to OASIS normative statements (e.g. `MQTT-3.1.0-1`).
@@ -66,8 +88,8 @@ CI gates on *new* failures only:
   citation was [MQTT-4.6.0-1], which governs CLIENT retransmission rather than server
   ordering, so it is corrected to the section; the claim is about the withheld-delivery NAK,
   and it does **not**
-  extend to the affine shared-subscription path, where F-071 records an OPEN same-topic
-  ordering violation (see Known deviations) — and
+  extend to the experimental affine shared-subscription path, where F-071 records a
+  parked same-topic ordering violation (see Known deviations) — and
   the redelivery is a first transmission (DUP=0, [MQTT-3.3.1-1]) since the
   withheld message was never sent. The same NAK path drains deferred deliveries
   on session resume (`resendPendingRedelivery`). Spec5 [4.9]. Tests:
@@ -415,6 +437,11 @@ Observed on the affine QoS 2 path: in a single-publisher capture of eight messag
 arrived with DUP=1 on their **first** client-visible PUBLISH. Only the one delivered on its
 first JetStream offer carried DUP=0.
 
+That capture is historical evidence, not F-072's supported acceptance fixture after the
+shared-QoS-2 scope decision. F-072 remains an alpha blocker because the same delivery-count
+rule and pre-send refusal exist on supported non-affine routes; its implementation and tests
+need not preserve the experimental affine branch.
+
 The flag is wrong on the wire: conformance suites test it, packet captures mislead anyone
 reading them, and clients that are themselves non-conforming in this respect carry
 interoperability risk. It is **not** data loss for a conforming receiver — §3.3.1.1 says a
@@ -422,15 +449,13 @@ receiver cannot assume DUP=1 means it has seen an earlier copy, and QoS 2 is pro
 the packet-identifier exchange regardless. See
 [F-072](findings/release-investigations.md#f-072).
 
-### Same-topic ordering on the affine QoS 2 path — OPEN, and NOT ACCEPTED
+### Same-topic ordering on the affine QoS 2 path — PARKED EXPERIMENTAL DEFECT
 
-**This is a defect, not a residual.** It is recorded here because the rest of this file
-would otherwise read as claiming ordering the broker does not currently deliver, and
-because
-an account of conformance that omits a known client-visible violation is misleading.
-Nothing
-about this entry accepts the behaviour: it is an **alpha blocker** (F-071) and the fix is
-owed.
+**This remains a demonstrated defect, not a residual or a fixed item.** It is retained as
+the experimental implementation record for F-071. The 2026-09-02 scope decision removed
+the affine path from the supported alpha, so this is no longer an alpha blocker; it is
+gathered under ROADMAP chapter P and becomes actionable only after a decision to invest in
+shared QoS 2.
 
 Same-topic QoS 2 messages delivered to a member of a Shared Subscription through the affine
 path can reach the client **out of publication order**. This is **not** a bare MQTT
@@ -443,8 +468,8 @@ topic-filter+QoS stream is meant to ride "a single ordered carrier ... on a sing
 goroutine". It sits under *Testing strategy*, justifying why three upstream ordering tests
 were rewritten, so it is load-bearing for those. The affine path adds a SECOND carrier —
 copies through a `$MQTT_Q2AFF_*` consumer on `$MQTT_out` — and so **violates the intention
-rather than being excluded from it.** The blocker status therefore rests on that property
-plus a judgement about acceptable broker behaviour, not on a specification requirement.
+rather than being excluded from it.** Its parked status is a product-scope decision, not a
+claim that the behavior is acceptable or conformant with that intended property.
 
 Reproduced from a **SINGLE publishing Client on one connection**, each QoS 2 handshake
 completed before the next was sent — 2 inversions in 120 attempts under concurrent load. In
@@ -472,9 +497,9 @@ in the order JetStream OFFERS the copies. See
 [F-071](findings/release-investigations.md#f-071) before proposing a fourth, and do not
 weaken the ordering assertion that caught it.
 
-**A passing test suite means F-071 did not trigger in that run**, not that this deviation
-is
-closed.
+**A passing experimental suite means F-071 did not trigger in that run**, not that this
+parked defect is closed. A failure is accumulated under ROADMAP chapter P and does not
+invalidate the supported-alpha conformance result.
 
 ### The orphan sweep no longer reclaims an affine consumer by absence, and the leak is accepted
 

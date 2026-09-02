@@ -18,20 +18,39 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
-**A scope lever, recorded rather than taken (2026-08-18).** Nine of this section's open
-items sit on the session-affine shared-subscription QoS 2 path: F-045, F-047, F-048, F-049,
-F-050, and F-063 through F-066 from F-033's audit. That is the largest single block of
-release-blocking work, and it belongs to one OPTIONAL MQTT 5 feature — declining shared
-subscriptions is protocol-legal, via reason code `0x9E` on CONNACK and SUBACK. Moving it out
-of first-alpha scope would retire that block in one decision instead of nine.
-**Not taken:** shared QoS 2 remains alpha scope and those nine remain blockers — eight since
-F-063 closed on 2026-08-19; the count above is the one the decision was weighed against, and
-is left as recorded. Recorded
-here so the option is visible when the cost of the block is next weighed, and because
-F-034's audit was expected to behave like F-033's — which it did, on 2026-08-22. Taking it
-would need a README change (the
-feature is promised there) and a `docs/CONFORMANCE.md` statement; it is a different axis
-from the multi-frontend HA decision, which stays as decided.
+**Shared-subscription QoS 2 scope decision — TAKEN 2026-09-02.** The first alpha supports
+shared subscriptions at QoS 0 and QoS 1. A shared-filter SUBSCRIBE requesting QoS 2 is
+accepted at **granted QoS 1** (`SUBACK 0x01`) by default; ordinary, non-shared QoS 2 stays
+supported. The existing session-affine shared-QoS-2 implementation is deliberately retained
+behind an explicit experimental or non-production gate, but it is no longer an alpha
+commitment. Its persistent state has no upgrade or downgrade contract: disabling the gate
+with experimental state present, or carrying that state across an incompatible build, is
+unsupported. Operators must reset that state rather than expect migration, reinterpretation
+or cleanup support from a build in which the experiment is disabled.
+
+This decision retires the shared-QoS-2-only release gates without declaring their defects
+fixed. F-047, F-048, F-049, F-064, F-070 and F-071, plus any affine-only branch of a wider
+finding, are gathered under [the dedicated post-alpha chapter](#p-shared-subscription-qos-2-post-alpha--maybe-someday).
+Other roadmap work is proved against the supported QoS-0/1 shared path and the ordinary
+QoS-2 path. It may preserve the experimental path when cheap, but it must not grow scope,
+reject a sound general fix, or fail an alpha gate merely to keep that path working. An
+experimental regression is recorded in that chapter for the later investment decision.
+
+- [x] **Enforce the alpha shared-subscription QoS ceiling.** The
+  production default must grant at most QoS 1 for a shared filter, persist that granted QoS,
+  and avoid provisioning the affine consumer, assignment, copy and correlation machinery.
+  MQTT 5 continues to advertise Shared Subscription Available; do not lower the server's
+  global Maximum QoS. MQTT 5 answers a shared QoS 2 request with granted QoS 1; MQTT 3.1.1
+  continues to treat `$share/...` as an ordinary literal topic filter because shared
+  subscriptions are not part of that protocol version.
+  Preserve the current shared-QoS-2 implementation and its tests behind an explicitly
+  experimental gate; the current gate is a programmatic test option that the production
+  command does not expose. The affine suite additionally requires the
+  `mqttport_experimental_shared_qos2` build tag and runs only in a non-gating CI job.
+  Pre-existing experimental shared-QoS-2 state must be reset before
+  running with the gate disabled; detection, automatic downgrade and migration are not part
+  of the supported contract. Enabling, disabling, upgrade, rollback, backup and restore of
+  experimental state are unsupported.
 
 The 35 closed findings are indexed in the [finding dossiers](findings/README.md).
 Of those, 31 are retained in the
@@ -86,8 +105,11 @@ guide from NATS Server's embedded MQTT listener.
 
 Decided 2026-08-10: the first alpha supports multiple MQTT frontends against a
 replicated JetStream cluster, keeping the README's horizontally scalable,
-cross-instance HA promise. Every item in this subsection is therefore an
-unconditional alpha blocker. The lineage work was designed against an observed
+cross-instance HA promise. Every item in this subsection that is reachable in the
+supported feature set is therefore an unconditional alpha blocker. The 2026-09-02
+shared-QoS-2 scope decision is orthogonal: affine-only findings and branches are parked in
+chapter P, while shared QoS 0/1 and ordinary QoS 2 remain subject to this HA bar. The
+lineage work was designed against an observed
 pre-2.14.4 window in which stale stream-leader work could propose after a fast
 election. **That premise is now RETIRED rather than assumed** (F-030, closed 2026-08-16):
 `test/depproof/` enumerates every route by which a write conditioned on a superseded
@@ -678,9 +700,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   consumer existence atomic with the store and the ack, which is what establishes the
   premises are distinct, and what this item's refusal strands is F-064's to resolve.
 
-  - [ ] [F-064: Reconcile assignments independently of owner
-  resume](findings/ha-arbitration.md#f-064). **Alpha blocker. Partly landed; the box
-  stays open deliberately.** `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen`
+  - [x] [F-064: Reconcile assignments independently of owner
+  resume](findings/ha-arbitration.md#f-064). **PARKED, NOT FIXED: removed from the alpha
+  gate by the 2026-09-02 shared-QoS-2 scope decision and gathered in chapter P.** The
+  technical finding remains open, and the partly landed implementation is retained.
+  `buildSessionRefs` keys `refs.affine` on `ps.Q2AffGen`
   alone, so a live matching record makes the sweep skip **every** claim of that
   generation, and `recoverQ2AffClaims` — the only writer of `Lost` — runs solely on the
   owner's own resume. **What landed:** on-behalf restoration of a destroyed affine
@@ -688,7 +712,7 @@ further findings it surfaced are filed separately, for the reason its own bullet
   record and materializes onto it, so the stall is closed **without the owner for
   assignments that never reached `materialized`**. Neither gate below is addressed — the
   remedy bypasses both, because a redelivery carries the payload and the sweep does not.
-  **What did not, and why the box is not ticked:** - *The stall for a `materialized`
+  **What did not, and why the technical finding remains open:** - *The stall for a `materialized`
   assignment whose copy is gone* — residual 8. That population takes a different
   dispatcher arm and still waits for its owner. Re-storing there was designed and
   **refuted twice**: the copy CAS and the claim CAS are on different streams, so no
@@ -728,9 +752,10 @@ further findings it surfaced are filed separately, for the reason its own bullet
   (`unsub_drain.go`) and each PUBREL carries the bound pair (`pubrel_correlation.go`), so
   the cost is in FINDING the subject, not in scanning it; and the `RWID`/`RetiredSeq`
   refusal does **not** categorically forbid a new field — that was proportionality
-  against a Reason String and a log line, so a field closing an alpha blocker gets its
-  own cost judgement. Also unproven either way: whether "no matching PUBREL" settles
-  anything, since a late or in-flight store is indistinguishable from an absent one. - *The
+  against a Reason String and a log line, so a field closing what was then an alpha blocker
+  would have received its own cost judgement. Also unproven either way: whether "no
+  matching PUBREL" settles anything, since a late or in-flight store is indistinguishable
+  from an absent one. - *The
   accumulation half* — **PARTLY LANDED.** Under a live generation reference the sweep
   now reaps the claims that are already durably TERMINAL, and collects the retired
   affine `$MQTT_inflight` register class together with the copy and the claim each
@@ -785,25 +810,28 @@ further findings it surfaced are filed separately, for the reason its own bullet
   still protects every nonterminal claim of a live generation, and
   `discardAbsentWinnerClaim` is untouched, because the new arms never reason about the
   winner's disposition — they act only on facts the claim itself already carries. **What
-  keeps the box open:** residual 8, and W-c above. Both are argued rather than pending,
-  and both have a named route: residual 8 through the `Lost`-truthfulness item's
-  PUBREL-carried claim reference, W-c through nothing currently available.
+  keeps the technical finding open:** residual 8, and W-c above. Both are argued rather
+  than pending, and both have a named route: residual 8 through the `Lost`-truthfulness
+  item's PUBREL-carried claim reference, W-c through nothing currently available.
   **Which bar forbids closing W-c by residual, settled 2026-08-31**, because two wrong
   citations were offered first: it is neither F-066's coverage ruling nor F-036's scope
   consult — the first is specific to F-066's interpretation surface and the second
   adjudicated F-036's own two widened manifestations. The authority is this bullet plus
   §0's own governance, which prohibits the alpha while any blocker is incomplete.
   F-036's ruling is strong PRECEDENT for why relabelling a defect as a residual is
-  insufficient, and is cited as precedent only.
-  **This box is NOT the next executable §0.2 item, and that is why lanes keep being
-  redirected off it.** Both remainders are argued: W-c's remedy is refuted with a worked
+  insufficient, and is cited as precedent only. That was the release bar before the
+  2026-09-02 scope decision; chapter P now owns these affine-only remainders and explicitly
+  removes them from the alpha gate.
+  **This box is not an executable alpha item, and later alpha lanes must not be redirected
+  into it.** Both remainders are argued: W-c's remedy is refuted with a worked
   counterexample, and residual 8's reverse lookup is derivable for a matching winner
   record but not for an absent or mismatched one, as corrected above. F-066, which this
   bullet used to name as the next executable item, **landed 2026-09-01**; the next
   candidate is therefore F-036 below, whose OPEN 1 F-066's ruling dissolves. The
   smallest useful work HERE is establishing which record states residual 8's population
   actually occupies, since the matching state needs nothing new and only the others
-  could need a persisted reference. That is research, not a plan.
+  could need a persisted reference. That research belongs to chapter P and starts only
+  after an explicit decision to invest in shared QoS 2.
 
   - [x] **Report a delivered shared QoS 2 message truthfully instead of as `Lost`.**
   Split out of F-064; not a conformance defect, so never an alpha blocker. **Done
@@ -1629,8 +1657,9 @@ further findings it surfaced are filed separately, for the reason its own bullet
   round 23 found their filings still entangled with F-034's own summaries, and the
   consult that followed ruled them out of this change and into a filing commit of their
   own. They are not lost; they are not this commit's to carry. **F-071 turned out to be
-  a real DEFECT and an alpha blocker**, not a fixture premise — though **explicitly not
-  an MQTT conformance violation**: the specification permits reordering on a shared
+  a real DEFECT rather than a fixture premise and was classified as an alpha blocker at
+  the time. The 2026-09-02 scope decision now parks it in chapter P.** It is explicitly
+  not an MQTT conformance violation: the specification permits reordering on a shared
   path, and what it breaks is an INTENDED implementation property plus a product
   judgement (see its own bullet for the basis). Reproduced from a single publishing
   Client; the broker's own packet-identifier allocation shows it transmitting a
@@ -1724,6 +1753,14 @@ further findings it surfaced are filed separately, for the reason its own bullet
   lifecycle boundary rather than site by site. Lane
   `~/.claude/lanes/f-036-property-audit/`, which keeps the SSA instrument and its outputs;
   the dossier records the seven defects in it so a rebuilt one does not repeat them.
+
+  **Alpha closure after the 2026-09-02 scope decision.** F-036 remains an alpha blocker:
+  its clean-start loss is reachable through ordinary QoS 2, and its quiet-owner and inbound
+  hold decisions are not affine-only. Close those supported paths with the quiescence,
+  classifier and sites already named here. Do **not** require the change to preserve the
+  experimental shared-QoS-2 affine integration. If a sound general fix breaks an affine
+  branch or its tests, record the regression under chapter P's single accumulation item;
+  do not widen F-036 or reject the fix on that ground.
 
   **ATTEMPTED BY CONSTRUCTION
   AND STOPPED UNRESOLVED 2026-08-27**, after three plan-review rounds and two scope
@@ -2578,6 +2615,12 @@ takeover.
   `pendingPubRel` the two are indistinguishable and the cost is an extra PUBREL/PUBCOMP
   cycle, never a payload under the wrong exchange.
 
+  **Supported-scope rule since 2026-09-02:** a later F-092/F-093 implementation must close
+  the ordinary, retained, drain and supported recovery paths. It need not preserve or
+  classify an experimental affine PUBLISH owner. The affine facts below remain useful
+  historical evidence, but an affine-only failure is appended to chapter P rather than
+  widening this item or blocking its general solution.
+
 - [ ] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
   identifier.** Filed 2026-08-31 by F-091's reconcile consult, which found it while refuting
   the general PUBREL fence. NOT an alpha blocker: the residue is one identifier and one
@@ -2620,6 +2663,8 @@ takeover.
   live-path contrast is that `mqttProcessPublishReceived` untracks the PUBLISH entry at
   PUBREC under one lock (`mqtt.go:16629`, `:16660`), so on a live connection the two never
   coexist.
+  Route C's affine subcase is experimental under the 2026-09-02 scope decision and is not
+  part of this item's supported acceptance; routes A and B remain unchanged.
 
 - [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
   non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).
@@ -2705,8 +2750,9 @@ takeover.
   claiming `Cancelled` proves never-transmitted (`storeInflightRegister:2986`, the field
   comment).
 
-- [ ] [F-071: Preserve same-topic ordering for affine QoS 2 deliveries](findings/release-investigations.md#f-071).
-  **Alpha blocker, and a defect rather than a flake — but NOT a spec violation, and the
+- [x] [F-071: Preserve same-topic ordering for affine QoS 2 deliveries](findings/release-investigations.md#f-071).
+  **PARKED, NOT FIXED: post-alpha shared-QoS-2 work in chapter P.** It is a demonstrated
+  defect rather than a flake, but NOT a spec violation, and the
   basis is weaker than three earlier drafts of this bullet claimed.** MQTT-4.6.0-5 is
   conditional on an *Ordered Topic*, MQTT-4.6.0-6 covers only **Non-shared** Subscriptions,
   and §4.8.2 does not extend it, so the specification permits reordering here.
@@ -2715,11 +2761,12 @@ takeover.
   single ordered carrier ... on a single dispatch goroutine" — which
   sits under *Testing strategy* justifying why three upstream ordering tests were REWRITTEN,
   and is therefore load-bearing for them. The affine path breaks that mechanism by delivering
-  copies through a `$MQTT_Q2AFF_*` consumer on `$MQTT_out`: a SECOND carrier. So the blocker
-  status rests on that property plus the judgement that silently reordering one client's
-  same-topic QoS 2 messages is unacceptable here regardless of the spec. **Disagreeing with
-  that judgement means reclassifying to a post-alpha product-path anomaly — not
-  weakening the assertion that found it.**
+  copies through a `$MQTT_Q2AFF_*` consumer on `$MQTT_out`: a SECOND carrier. Before the
+  2026-09-02 scope decision, its blocker status rested on that property plus the judgement
+  that silently reordering one client's same-topic QoS 2 messages was unacceptable here
+  regardless of the spec. It is now unambiguously parked outside the alpha in chapter P.
+  That reclassification preserves the evidence and the assertion that found the defect;
+  it does not call the behavior fixed or acceptable.
   Found by F-034's
   verification on 2026-08-22 and reproduced from a SINGLE publishing Client on one
   connection, each QoS 2 handshake completed before the next: 2 inversions in 120 attempts,
@@ -2829,11 +2876,12 @@ takeover.
   **Large.** Treat this as durable Will-intent/outbox design, not a local close-path
   patch.
 
-- [ ] [F-047: Keep affine assignments when a SUBSCRIBE packet fails](findings/shared-qos2.md#f-047).
-  **Medium.**
+- [x] [F-047: Keep affine assignments when a SUBSCRIBE packet fails](findings/shared-qos2.md#f-047).
+  **PARKED, NOT FIXED: chapter P.** Previously Medium.
 
-- [ ] [F-048: Arbitrate affine cleanup before discarding assignments](findings/shared-qos2.md#f-048).
-  **Medium to large.** Design and test F-047 and F-048 as one transactional-cleanup
+- [x] [F-048: Arbitrate affine cleanup before discarding assignments](findings/shared-qos2.md#f-048).
+  **PARKED, NOT FIXED: chapter P.** Previously Medium to large. Design and test F-047 and
+  F-048 as one transactional-cleanup
   cluster.
 
 - [ ] [F-059: Arbitrate retained-index application by stream sequence](findings/runtime-correctness.md#f-059).
@@ -3024,8 +3072,9 @@ finding with acceptance criteria.
   a neighbouring pass cannot contribute. Until then treat the Claimant half as
   suspect rather than dismissed.
 
-- [ ] Stop `testQ2AffAwaitMaterialized` dereferencing a reaped claim.
-  **Test infrastructure, and it CRASHES the run rather than failing a test.**
+- [x] Stop `testQ2AffAwaitMaterialized` dereferencing a reaped claim.
+  **PARKED with the experimental shared-QoS-2 suite in chapter P, not fixed.** It is test
+  infrastructure, and it CRASHES the experimental run rather than failing a test.
   `qos2_shared_affine_lifecycle_test.go:5499` reads `claim.Phase` on the result of
   `testQ2AffLoadClaim`, which is nil once the claim has been reaped — so the poll
   loop nil-derefs and the whole test binary takes a SIGSEGV, ending that run early
@@ -3039,8 +3088,9 @@ finding with acceptance criteria.
   what put the coverage caveat on that soak. A nil check that keeps polling until
   the deadline is the obvious fix; the awaited condition is already "the claim
   exists AND is materialized".
-- [ ] Make `TestQ2AffineResumeDoesNotRechargeAckBudget`'s reconnect loop tolerate a closed
-  connection. **Test infrastructure, not a broker gap, and MEASURED as pre-existing.**
+- [x] Make `TestQ2AffineResumeDoesNotRechargeAckBudget`'s reconnect loop tolerate a closed
+  connection. **PARKED with the experimental shared-QoS-2 suite in chapter P, not fixed.**
+  Test infrastructure, not a supported broker gap, and MEASURED as pre-existing.
   It closes and reopens the member three times in a loop
   (`qos2_shared_affine_lifecycle_test.go:791-800`) and intermittently fails at
   `:793` with `Error reading data: EOF` — the reconnect racing the previous
@@ -3063,8 +3113,9 @@ finding with acceptance criteria.
   TTL expiry and any F-059 delete marker through the source: source/mirror marker and
   TTL behavior differs, so the unsourced test is not a substitute.
 
-- [ ] [F-070: Establish the affine contender fixture's rival-create premise rather than
-  racing it](findings/release-investigations.md#f-070). **Test-harness race.** Filed with
+- [x] [F-070: Establish the affine contender fixture's rival-create premise rather than
+  racing it](findings/release-investigations.md#f-070). **PARKED, NOT FIXED: experimental
+  shared-QoS-2 test infrastructure in chapter P.** Filed with
   the mechanism PROVEN and the attribution SETTLED against a baseline on 2026-08-22, but never
   given an authoritative checkbox here, so it was invisible to the roadmap's own todo.
   `TestQ2AffRacingAbsenceConverge/the_relookup_finds_it_absent_again` installs a create hook
@@ -3105,8 +3156,9 @@ finding with acceptance criteria.
   not a broker assertion at all. It reproduced 0/12 on both arms in isolation. Whoever
   takes this bullet should not spend time on it as if it were the same defect.
 
-- [ ] **Attribute `TestSharedDenyDoesNotConsumeForAllowedMembers`'s intermittent failure.**
-  Filed 2026-08-30 by the F-089 lane, which met it once in a full-suite run and then
+- [x] **Attribute `TestSharedDenyDoesNotConsumeForAllowedMembers`'s intermittent failure.**
+  **PARKED with the experimental shared-QoS-2 suite in chapter P, not resolved.** Filed
+  2026-08-30 by the F-089 lane, which met it once in a full-suite run and then
   measured it rather than guessing. **Pre-existing and NOT attributable to that change:**
   interleaved repetition of the test alone gave **2/12 on the F-089 tree against 1/12 on a
   clean `HEAD` worktree**, so it fails without the change at a comparable rate; F-089 also
@@ -3212,7 +3264,8 @@ finding with acceptance criteria.
   the durable prefix `Q2AFF` kept it at 761 across 54 files. That is family 5's lesson made
   mechanical, and it is the shape this item should take.
 
-- [ ] **Re-census F-033's claim-transition and claim-reap route inventory from the tree.**
+- [x] **Re-census F-033's claim-transition and claim-reap route inventory from the tree.**
+  **PARKED with the experimental shared-QoS-2 implementation in chapter P, not done.**
   Filed 2026-09-01 by F-036 course E's second holistic review round, which caught the
   attempt to update the totals by SUBTRACTING from them. **Not an alpha blocker**: it is
   a documentation inventory, and every mechanical claim resting on it (the fenced/unfenced
@@ -3283,9 +3336,10 @@ operation can trigger correctness loss or unbounded resource growth.
   the IMMEDIATE site, which the mutation caught — so any arm here is only worth having
   if its own mutation kills it. Stated as CONFORMANCE residual 12 meanwhile.
 
-- [ ] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
-  Keep basic diagnostics in alpha scope; automatic quarantine or repair may follow
-  alpha if broker-owned state cannot create the malformed record.
+- [x] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
+  **PARKED, NOT FIXED: chapter P.** No experimental-state recovery or migration machinery
+  is in alpha scope. Operators must perform a whole-bundle reset before leaving the
+  experiment; detecting or repairing incompatible experimental state is unsupported.
 
 - [ ] Consolidate embedded NATS servers across the fork-repair test fixtures. **Test
   infrastructure, not a broker gap.** `sess_fork_repair_test.go` starts one embedded
@@ -3321,6 +3375,84 @@ operation can trigger correctness loss or unbounded resource growth.
   which is why this is a limit on what a test HERE can observe rather than a
   conformance residual. Closing it needs a seam in nats-server, so an upstream issue is
   the likelier route than anything in this repository.
+
+## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
+
+This chapter is the **only active roadmap home** for session-affine shared-subscription
+QoS 2. It is intentionally outside the dependency-ordered alpha path. Nothing here is
+selected by “next roadmap item” automation, and no item here blocks an alpha release.
+
+### Supported boundary and experimental gate
+
+The supported alpha feature is shared subscriptions with a maximum granted QoS of 1.
+Requesting QoS 2 on a shared filter succeeds at granted QoS 1; a QoS 2 publication may
+therefore enter the broker at QoS 2 and be delivered to that shared subscription at QoS 1.
+Non-shared QoS 2 is unaffected. MQTT 5 continues to advertise shared subscriptions as
+available.
+
+The existing affine implementation remains in the repository as experimental work. Its
+current gate is a programmatic test option which the production command does not expose.
+The production default therefore does not create new affine shared-QoS-2 state. The
+supported and experimental contracts are deliberately asymmetric:
+
+- entering experimental mode opts the entire MQTT persistence bundle out of compatible
+  upgrade, rollback, backup/restore and downgrade guarantees;
+- turning the gate off with experimental state present is **unsupported**; operators must
+  perform the documented all-brokers-stopped reset of all nine `$MQTT_*` streams first;
+- detection, migration, reinterpretation and cleanup of incompatible experimental state are
+  not supported or required;
+- there is no automatic conversion from a persisted shared QoS 2 membership to QoS 1, and
+  no migration or legacy reader is owed for experimental state.
+
+This cost is acceptable only for an explicit experiment: the nine streams are one recovery
+unit, so resetting experimental state also resets ordinary sessions, accepted messages,
+retained messages and pending Wills in that account.
+
+### Preservation without an alpha maintenance tax
+
+Do not delete the affine implementation, its dossiers, or its tests merely because it is
+parked. Preserve them as the starting point for a future investment decision. Preservation
+does **not** make them a compatibility or regression gate:
+
+- alpha work may change general session, QoS 2, PUBREL, in-flight, teardown or stream code
+  without preserving the experimental affine behavior;
+- a sound supported-path fix must not be rejected or enlarged because an affine test fails;
+- the default build and supported test suites must remain sound, but the experimental suite
+  is quarantined behind `mqttport_experimental_shared_qos2` and its CI job is non-gating;
+- do not repair an affine-only regression opportunistically. Append it to the single
+  completion item below, with the responsible general change and failing test recorded.
+
+Historical closed findings remain closed as evidence about the implementation that exists;
+they do not impose a promise that later alpha work preserve that implementation unchanged.
+
+### One gathered completion item
+
+- [ ] **Promote shared-subscription QoS 2 only after an explicit product investment
+  decision.** **POST-ALPHA / MAYBE SOMEDAY; not eligible for automatic selection.** This
+  one item owns all changes needed to make the experimental path supportable again. New
+  affine-only regressions discovered by unrelated roadmap work are appended here rather
+  than filed as alpha blockers or folded into that work.
+
+  The starting inventory is:
+
+  - [F-047](findings/shared-qos2.md#f-047) and
+    [F-048](findings/shared-qos2.md#f-048), the transactional SUBSCRIBE-cleanup cluster;
+  - [F-049](findings/shared-qos2.md#f-049), unreadable-claim diagnostics and recovery;
+  - [F-064](findings/ha-arbitration.md#f-064), including residual 8 and W-c;
+  - [F-070](findings/release-investigations.md#f-070) and the two parked affine fixture
+    failures in §0.4;
+  - [F-071](findings/release-investigations.md#f-071), affine same-topic ordering;
+  - the parked F-033 transition/reap census and
+    `TestSharedDenyDoesNotConsumeForAllowedMembers` investigation;
+  - every affine-only branch or regression accumulated from F-036, F-072, F-092/F-093, or
+    later supported-path work. Their non-affine acceptance remains with their original
+    finding; only the experimental delta belongs here.
+
+  Before promotion, re-audit the current code rather than assuming this inventory stayed
+  complete. Settle the affine persisted-data model and stream topology first, then declare
+  the compatibility boundary that begins with the first release which actually supports
+  shared QoS 2. Experimental records from earlier builds remain outside that boundary and
+  may require a reset; promotion does not retroactively create a migration promise.
 
 ## 1. Settle release decisions
 

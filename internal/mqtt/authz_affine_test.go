@@ -309,6 +309,8 @@ func assertAffineNothingRecorded(t *testing.T, asm *mqttAccountSessionManager, c
 // AffineDone and acknowledges - so a later resume by an allowed identity must find
 // nothing, whereas anything that merely withheld the copy leaves it owed.
 func TestAffineSharedQoS2HonoursASubscribeDenyOnResume(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	t.Run("control: an allowed identity resuming the session receives the moved copy", func(t *testing.T) {
 		if !affineMovedCopyRedeliveredTo(t, "alice") {
 			t.Fatal("the affine copy must be redelivered to an ALLOWED identity resuming the " +

@@ -7,6 +7,11 @@ retain failure mechanisms, invariants, rejected approaches, tests, and residual 
 Stable IDs do not change when a title, priority, or status changes. Plans, tests,
 commits, and architecture notes may refer to a finding by its `F-###` identifier.
 
+Since the 2026-09-02 product decision, open findings specific to session-affine shared
+QoS 2 remain technically open but are parked under `docs/ROADMAP.md` chapter P. They do
+not block the alpha's supported shared QoS 0/1 path, and an affine-only regression in a
+general change is accumulated there rather than widening that change.
+
 Cross-cutting JetStream feature decisions that are not independent correctness
 findings live in the [NATS platform-adoption audit](nats-platform.md). Its actionable
 work is merged into the existing finding or roadmap item whose invariant it serves.
@@ -50,7 +55,8 @@ identities.
   is a consumer deleted between the final proof and the ack.
   Details: [F-063](ha-arbitration.md#f-063).
 - Reconcile shared QoS 2 assignments independently of owner resume.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Open and partly remedied. Release treatment: Parked experimental shared-QoS-2
+  work; post-alpha / maybe someday.
   Details: [F-064](ha-arbitration.md#f-064).
 - Re-read copy absence after the reaper's own SourceAcked transition.
   Status: Fixed 2026-08-21, guarantee re-scoped. Release treatment: Alpha blocker.
@@ -186,8 +192,8 @@ identities.
   I had recorded as legitimate behaviour.
   Details: [F-072](release-investigations.md#f-072).
 - Preserve same-topic ordering for affine QoS 2 deliveries.
-  Status: **Open. Alpha blocker, and demonstrated to be OURS.**
-  Release treatment: Alpha blocker.
+  Status: **Open, demonstrated to be OURS, and parked outside the alpha.**
+  Release treatment: Experimental shared-QoS-2 work in ROADMAP chapter P.
   Found while verifying F-034 and reproduced from a SINGLE publishing Client — an earlier
   cross-publisher capture could not support the claim and was withdrawn. The packet
   identifier is allocated immediately before the synchronous register gate and enqueue, on
@@ -203,7 +209,7 @@ identities.
   cause remains UNTESTED.
   Details: [F-071](release-investigations.md#f-071).
 - Establish the affine contender fixture's rival-create premise rather than racing it.
-  Status: Open. Release treatment: Post-alpha cleanup.
+  Status: Open. Release treatment: Parked experimental shared-QoS-2 test cleanup.
   Found while verifying F-034, and the attribution is settled against a baseline rather
   than argued: the fixture stages a rival consumer under a durable name it does not own,
   which JetStream refuses as an immutable-field update once that durable exists. 6/60 on
@@ -266,17 +272,17 @@ identities.
   candidate.
   Details: [F-046](inflight-followups.md#f-046).
 - Keep affine assignments when a SUBSCRIBE packet fails but the session survives.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Open. Release treatment: Parked experimental shared-QoS-2 work.
   Details: [F-047](shared-qos2.md#f-047).
 - Arbitrate affine cleanup before discarding assignments.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Open. Release treatment: Parked experimental shared-QoS-2 work.
   Details: [F-048](shared-qos2.md#f-048).
 - Provide an operator recovery path for unreadable affine claims.
-  Status: Open. Release treatment: Post-alpha candidate if normal broker operation
-  cannot create the malformed state.
+  Status: Open. Release treatment: Parked experimental shared-QoS-2 work; no migration or
+  recovery mechanism is owed unless the feature is promoted.
   Details: [F-049](shared-qos2.md#f-049).
 - Refuse or retry a CONNECT with incomplete shared-subscription restoration.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed 2026-08-23 by refusing. Release treatment: Alpha blocker satisfied.
   Details: [F-050](shared-qos2.md#f-050).
 - Arbitrate retained-index application by stream sequence.
   Status: Open. Release treatment: Alpha blocker.

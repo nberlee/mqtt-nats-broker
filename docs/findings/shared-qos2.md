@@ -3,6 +3,13 @@
 These findings cover transactional affine cleanup, malformed-claim recovery, and
 truthful restoration of shared-subscription sessions.
 
+**Product disposition since 2026-09-02:** shared subscriptions through QoS 1 remain in
+the supported alpha; session-affine shared QoS 2 is preserved as experimental code and is
+not an alpha commitment. Open findings in this dossier are gathered by ROADMAP chapter P
+and are not eligible for automatic roadmap selection. Their status remains open—the scope
+decision did not fix them. Experimental state has no migration, upgrade or downgrade
+contract.
+
 The text under each “Original finding record” heading is preserved from the roadmap as
 it existed on 2026-08-10.
 
@@ -13,7 +20,7 @@ survives
 
 - Status: Open
 - Classification: Confirmed correctness or liveness defect
-- Release treatment: Alpha blocker
+- Release treatment: Parked experimental shared-QoS-2 work; post-alpha / maybe someday
 - Original roadmap order: 47
 
 ### Original finding record
@@ -46,7 +53,7 @@ survives
 
 - Status: Open
 - Classification: Confirmed correctness or liveness defect
-- Release treatment: Alpha blocker
+- Release treatment: Parked experimental shared-QoS-2 work; post-alpha / maybe someday
 - Original roadmap order: 48
 
 ### Original finding record
@@ -81,8 +88,8 @@ survives
 
 - Status: Open
 - Classification: Operational corruption hardening
-- Release treatment: Post-alpha candidate if normal broker operation cannot create the
-  malformed state
+- Release treatment: Parked experimental shared-QoS-2 work; no recovery or migration is
+  owed unless the feature is promoted
 - Original roadmap order: 49
 
 ### Scope correction, F-036 course E

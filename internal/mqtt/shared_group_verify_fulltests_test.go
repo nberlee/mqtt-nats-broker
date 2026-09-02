@@ -9,10 +9,9 @@
 // would pass against the defect. So each test connects, subscribes, disconnects WITHOUT a
 // clean start so the session object survives in the manager, and only then reconnects.
 //
-// Publishes are QoS 2 throughout, for the reason the harness's own comment gives: the
-// effective delivery QoS is the minimum of publish and subscription QoS, and a QoS 0
-// publish reaches a shared member through the RAW queue subscription without touching the
-// group durable at all. A QoS 0 fixture therefore passes whether the durable exists or not.
+// Membership is QoS 1 throughout so these required tests exercise the supported group
+// durable without entering the parked affine path. QoS 0 would use the raw queue
+// subscription and could pass whether the durable exists or not.
 package mqtt
 
 import (
@@ -26,7 +25,7 @@ import (
 
 // residentReconnect resumes a session and returns the CONNACK's reason code instead of
 // asserting success, which is what lets a test assert a REFUSAL.
-func testSharedResidentReconnect(t *testing.T, b *testQ2AffBroker, id string, expiry uint32) (net.Conn, *mqttReader, byte, *mqttProperties) {
+func testSharedResidentReconnect(t *testing.T, b *testSharedBroker, id string, expiry uint32) (net.Conn, *mqttReader, byte, *mqttProperties) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
 		clientID:   id,
@@ -41,7 +40,7 @@ func testSharedResidentReconnect(t *testing.T, b *testQ2AffBroker, id string, ex
 // than the join path. Asserted rather than assumed: if the session object were evicted
 // between the disconnect and the reconnect, every test in this file would silently
 // exercise the create path instead and pass for the wrong reason.
-func testSharedResidentSession(t *testing.T, b *testQ2AffBroker, id, durable string) {
+func testSharedResidentSession(t *testing.T, b *testSharedBroker, id, durable string) {
 	t.Helper()
 	sess := testMQTTGetClient(t, b.s, id).mqtt.sess
 	sess.mu.Lock()
@@ -72,7 +71,7 @@ func testSharedResidentSession(t *testing.T, b *testQ2AffBroker, id, durable str
 // to normalize, and an indeterminate reading establishes nothing at all.
 func TestMQTTSharedGroupAbsentDurableRepairsTheResume(t *testing.T) {
 	t.Parallel()
-	b := testQ2AffSetup(t, "absent")
+	b := testSharedSetup(t, "absent")
 	ca, _ := b.member(t, "absentA", 300)
 	b.bind(t, "absentA")
 	durable := b.groupDurable(t)
@@ -114,7 +113,7 @@ func TestMQTTSharedGroupAbsentDurableRepairsTheResume(t *testing.T) {
 // than the configuration this connection remembered.
 func TestMQTTSharedGroupPresentDurableIsAdoptedAndNotRewritten(t *testing.T) {
 	t.Parallel()
-	b := testQ2AffSetup(t, "present")
+	b := testSharedSetup(t, "present")
 	ca, _ := b.member(t, "presentA", 300)
 	b.bind(t, "presentA")
 	durable := b.groupDurable(t)
@@ -191,7 +190,7 @@ func TestMQTTSharedGroupNonCanonicalDurableRefusesTheResume(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			b := testQ2AffSetup(t, "noncanon"+strings.ToLower(tc.name))
+			b := testSharedSetup(t, "noncanon"+strings.ToLower(tc.name))
 			id := "noncanon" + tc.name
 			ca, _ := b.member(t, id, 300)
 			b.bind(t, id)
@@ -247,7 +246,7 @@ func TestMQTTSharedGroupNonCanonicalDurableRefusesTheResume(t *testing.T) {
 // an unproven absence is how one broker's transient error becomes a group-wide change.
 func TestMQTTSharedGroupIndeterminateLookupRefusesAndKeepsState(t *testing.T) {
 	t.Parallel()
-	b := testQ2AffSetup(t, "indet")
+	b := testSharedSetup(t, "indet")
 	ca, _ := b.member(t, "indetA", 300)
 	b.bind(t, "indetA")
 	durable := b.groupDurable(t)
@@ -327,6 +326,7 @@ func TestMQTTSharedGroupLevelUpCompanionIsRepairedToo(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			o := testMQTTDefaultOptionsV5()
+			o.MQTT.ExperimentalSharedQoS2 = false
 			o.MQTT.AckWait = 400 * time.Millisecond
 			s := testMQTTRunServer(t, o)
 			t.Cleanup(func() { testMQTTShutdownServer(s) })
@@ -339,8 +339,8 @@ func TestMQTTSharedGroupLevelUpCompanionIsRepairedToo(t *testing.T) {
 				props:      mqttV5ConnPropsSessionExpiry(300),
 			}, o.MQTT.Host, o.MQTT.Port)
 			testMQTTReadConnAckV5(t, r)
-			codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/" + group + "/" + filter, opts: 2}})
-			if len(codes) != 1 || codes[0] != 2 {
+			codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/" + group + "/" + filter, opts: 1}})
+			if len(codes) != 1 || codes[0] != 1 {
 				t.Fatalf("SUBACK %v", codes)
 			}
 			testMQTTFlush(t, c, nil, r)
@@ -414,7 +414,7 @@ func TestMQTTSharedGroupLevelUpCompanionIsRepairedToo(t *testing.T) {
 // field BETWEEN the two classifications, which is the post-pass's whole reason for existing.
 func TestMQTTSharedGroupPostPassAdoptsTheSecondReading(t *testing.T) {
 	t.Parallel()
-	b := testQ2AffSetup(t, "postpass")
+	b := testSharedSetup(t, "postpass")
 	ca, _ := b.member(t, "postpassA", 300)
 	b.bind(t, "postpassA")
 	durable := b.groupDurable(t)
@@ -591,12 +591,12 @@ func TestMQTTSharedGroupRefusingPrePassSkipsRestoration(t *testing.T) {
 
 	for _, tc := range []struct {
 		name    string
-		arm     func(b *testQ2AffBroker, durable string)
+		arm     func(b *testSharedBroker, durable string)
 		wantMsg string
 	}{
 		{
 			name: "transport failure",
-			arm: func(b *testQ2AffBroker, durable string) {
+			arm: func(b *testSharedBroker, durable string) {
 				b.asm.mu.Lock()
 				b.asm.testSharedGroupLookupErr = func(int) error { return fmt.Errorf("injected") }
 				b.asm.mu.Unlock()
@@ -605,7 +605,7 @@ func TestMQTTSharedGroupRefusingPrePassSkipsRestoration(t *testing.T) {
 		},
 		{
 			name: "response-level refusal",
-			arm: func(b *testQ2AffBroker, durable string) {
+			arm: func(b *testSharedBroker, durable string) {
 				b.asm.mu.Lock()
 				b.asm.testSharedGroupLookupFail = func(d string) error {
 					if d == durable {
@@ -620,7 +620,7 @@ func TestMQTTSharedGroupRefusingPrePassSkipsRestoration(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			b := testQ2AffSetup(t, "prepass"+strings.ReplaceAll(tc.name, " ", ""))
+			b := testSharedSetup(t, "prepass"+strings.ReplaceAll(tc.name, " ", ""))
 			id := "prepass-" + strings.ReplaceAll(tc.name, " ", "-")
 			ca, _ := b.member(t, id, 300)
 			b.bind(t, id)

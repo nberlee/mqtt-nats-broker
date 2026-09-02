@@ -1,3 +1,5 @@
+//go:build mqttport_experimental_shared_qos2
+
 // Fixtures for F-064's accumulation half: settled affine QoS 2 state that nothing
 // reaped while the owning session's record was live.
 //
@@ -105,22 +107,6 @@ func (e *testOrphanEnv) claimOn(t *testing.T, subject string) *mqttQ2AffClaim {
 // sweepAffineClaims drives ONE assignment-reconciliation pass. One, deliberately: the
 // live-generation arm has no quarantine gate, so a fixture that needed a second pass
 // would be asserting the opposite of what the arm promises.
-func (e *testOrphanEnv) sweepAffineClaims(t *testing.T, budget int) {
-	t.Helper()
-	inv, err := e.asm.collectQ2AffInventory()
-	if err != nil {
-		t.Fatalf("collectQ2AffInventory: %v", err)
-	}
-	refs, affineBad, err := e.asm.buildSessionRefs()
-	if err != nil {
-		t.Fatalf("buildSessionRefs: %v", err)
-	}
-	if affineBad != nil {
-		t.Fatalf("affine references indeterminate: %v", affineBad)
-	}
-	e.asm.reconcileOrphanQ2AffClaims(e.s, inv, refs, &budget)
-}
-
 // countClaimLoads installs a COUNTING wrapper over the claim load that delegates to the
 // real one, and returns a reader for the count on subject.
 //

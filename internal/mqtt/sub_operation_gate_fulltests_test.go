@@ -276,6 +276,8 @@ func TestLiveSubUnprovableOwnershipIsNotAcknowledged(t *testing.T) {
 //
 // Not parallel: both seams are package-global.
 func TestLiveSubQuietPacketOpensDespiteAnAmbiguousAncillaryWrite(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
+
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

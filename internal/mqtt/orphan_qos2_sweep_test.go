@@ -22,6 +22,25 @@ type testOrphanEnv struct {
 	sess *mqttSession
 }
 
+// sweepAffineClaims is kept in the mixed sweep fixture so that file remains
+// buildable in the supported suite. Only tests which first require the
+// experimental shared-QoS-2 tag call it.
+func (e *testOrphanEnv) sweepAffineClaims(t *testing.T, budget int) {
+	t.Helper()
+	inv, err := e.asm.collectQ2AffInventory()
+	if err != nil {
+		t.Fatalf("collectQ2AffInventory: %v", err)
+	}
+	refs, affineBad, err := e.asm.buildSessionRefs()
+	if err != nil {
+		t.Fatalf("buildSessionRefs: %v", err)
+	}
+	if affineBad != nil {
+		t.Fatalf("affine references indeterminate: %v", affineBad)
+	}
+	e.asm.reconcileOrphanQ2AffClaims(e.s, inv, refs, &budget)
+}
+
 func testNewOrphanEnv(t *testing.T, clientID string) *testOrphanEnv {
 	return testNewOrphanEnvWithLogger(t, clientID, nil)
 }
@@ -496,6 +515,7 @@ func TestOrphanSweepQuarantineRule(t *testing.T) {
 // that stream is interest-retained, the copies it still held. Validating the
 // generation alone is not enough, which is exactly how this was missed.
 func TestOrphanSweepAdoptionValidatesTheAffinePair(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "adopt-validates-affine")
 	e.setGraces(t, 0, 0)
 
@@ -1437,6 +1457,7 @@ func testValidQ2AffClaim(idHash, gen, groupDur string, sseq uint64) *mqttQ2AffCl
 }
 
 func TestOrphanSweepAffineValidatorChecksEveryDerivedName(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	t.Parallel()
 	idHash, gen, groupDur := getHash("winner"), nuid.Next(), "$MQTT_SHARED_abc"
 	const sseq = uint64(42)
@@ -1483,6 +1504,7 @@ func TestOrphanSweepAffineValidatorChecksEveryDerivedName(t *testing.T) {
 // strands the teardown marker and locks the client ID out of its next CONNECT. A
 // derived-name mismatch must cost a deferred sweep pass, never that.
 func TestOrphanSweepAffineValidatorDoesNotWidenTheSharedFloor(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "validator-boundary")
 	e.setGraces(t, 0, 0)
 	idHash, gen, groupDur := getHash("winner"), nuid.Next(), "$MQTT_SHARED_abc"
@@ -1537,6 +1559,7 @@ func TestOrphanSweepAffineValidatorDoesNotWidenTheSharedFloor(t *testing.T) {
 // elect a fresh winner — handing a started delivery to a second client, which is
 // the exact violation the assignment record exists to prevent.
 func TestOrphanSweepKeepsADiscardedAssignmentWhoseSourceCouldRedeliver(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "source-redeliverable")
 	e.setGraces(t, 0, 0)
 	idHash, gen := getHash("redeliver-winner"), mqttNewQ2AffGen()
@@ -1604,6 +1627,7 @@ func TestOrphanSweepKeepsADiscardedAssignmentWhoseSourceCouldRedeliver(t *testin
 // manufactures the affine completion the write order of AffineDone exists to
 // distinguish.
 func TestOrphanSweepDiscardsAbsentWinnerWithoutErasingProvenFacts(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "absent-winner")
 	e.setGraces(t, 0, 0)
 	idHash, gen, groupDur := getHash("gone-winner"), nuid.Next(), "$MQTT_SHARED_absent"
@@ -1661,6 +1685,7 @@ func TestOrphanSweepDiscardsAbsentWinnerWithoutErasingProvenFacts(t *testing.T) 
 // terminal. Without this, every claim whose broker died after the ack committed but
 // before the CAS recorded it would be retained forever.
 func TestOrphanSweepReapsWhenTheSourceCanNoLongerBeOffered(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "source-unofferable")
 	e.setGraces(t, 0, 0)
 	idHash, gen := getHash("unofferable-winner"), mqttNewQ2AffGen()
@@ -1704,6 +1729,7 @@ func TestOrphanSweepReapsWhenTheSourceCanNoLongerBeOffered(t *testing.T) {
 // EXISTING reapable() predicate, and the sweep's job is simply never to acquire a
 // deletion path that bypasses it.
 func TestOrphanSweepNeverReapsALostAssignment(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "lost-assignment")
 	e.setGraces(t, 0, 0)
 	idHash, gen, groupDur := getHash("lost-winner"), nuid.Next(), "$MQTT_SHARED_lost"
@@ -1736,6 +1762,7 @@ func TestOrphanSweepNeverReapsALostAssignment(t *testing.T) {
 // becomes "it is gone". A record carrying the claim's own affine generation defers
 // whether it is live or merely uninterpretable.
 func TestOrphanSweepDefersOnAnIndeterminateWinner(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "indeterminate-winner")
 	e.setGraces(t, 0, 0)
 	groupDur := "$MQTT_SHARED_defer"
@@ -1882,6 +1909,7 @@ func (e *testOrphanEnv) consumerExists(t *testing.T, durable string) bool {
 // copies too: a consumer surviving while its copies were dropped would be a different
 // bug, and must not pass this test.
 func TestOrphanSweepDoesNotReclaimAnAffineConsumerByAbsence(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	// The old happy path, the vacuous-truth path, and a moved generation.
 	for _, tc := range []struct {
 		name  string
@@ -2034,6 +2062,7 @@ func TestOrphanSweepDoesNotReclaimAnAffineConsumerByAbsence(t *testing.T) {
 // than removed coverage; TestOrphanSweepAffineClaimPassStillDiscardsAnAbsentWinner
 // covers only the SUCCESSFUL discard.
 func TestOrphanSweepAffineClaimPassFailureAndBudgetPaths(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	// The claim must stay INSPECTABLE: a live group durable still holding a real source
 	// message, so the two-sided reap predicate refuses and a discard cannot be confused
 	// with a discard-then-reap. Without that, "the claim is nil" is ambiguous and the
@@ -2150,6 +2179,7 @@ func TestOrphanSweepAffineClaimPassFailureAndBudgetPaths(t *testing.T) {
 // source message — so the successful path cannot reap it and leave the assertion
 // unable to tell "discarded then reaped" from "never discarded".
 func TestOrphanSweepAffineClaimPassStillDiscardsAnAbsentWinner(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "course-e-claim-survives")
 	e.setGraces(t, 0, 0)
 	idHash, gen := getHash("claim-survivor"), mqttNewQ2AffGen()
@@ -2203,6 +2233,7 @@ func TestOrphanSweepAffineClaimPassStillDiscardsAnAbsentWinner(t *testing.T) {
 // re-read came afterwards — so re-adding it writes Discarded here where the surviving
 // pass refuses. Without this test that difference is invisible.
 func TestOrphanSweepDoesNotDiscardOnConsumerCandidacyAlone(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "course-e-candidacy")
 	e.setGraces(t, 0, 0)
 	idHash, gen := getHash("candidacy"), mqttNewQ2AffGen()
@@ -2257,6 +2288,7 @@ func TestOrphanSweepDoesNotDiscardOnConsumerCandidacyAlone(t *testing.T) {
 // $MQTT_PUBREL_* and nothing else — an affine consumer must survive it untouched, even
 // with no reference to it anywhere and every grace elapsed.
 func TestOrphanSweepLeavesForeignConsumersAlone(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "foreign-consumers")
 	e.setGraces(t, 0, 0)
 	idHash, gen := getHash("affine-owner"), mqttNewQ2AffGen()
@@ -2832,6 +2864,7 @@ func TestOrphanSweepPubRelValidatesTheConsumerConfig(t *testing.T) {
 // still reachable from the sweep, and TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases
 // owns the surviving claim-transition stake.
 func TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory(t *testing.T) {
+	testRequireExperimentalSharedQoS2(t)
 	e := testNewOrphanEnv(t, "pubrel-vs-affine-inventory")
 	e.setGraces(t, 0, 0)
 

@@ -124,8 +124,9 @@ racing it
 - Status: Open, with the mechanism PROVEN and the attribution SETTLED against a baseline.
   Filed 2026-08-22, found while verifying F-034.
 - Classification: Test-harness race
-- Release treatment: Post-alpha cleanup. Like F-069 this is a fixture premise rather than
-  broker behaviour, and the assertions the test makes are correct.
+- Release treatment: Parked experimental shared-QoS-2 test cleanup in ROADMAP chapter P.
+  Like F-069 this is a fixture premise rather than broker behaviour; the assertions remain
+  correct, but a failure does not block the supported alpha.
 
 ### The finding
 
@@ -177,18 +178,18 @@ known absent, or stage it under a name this test alone can own.
 
 **Title:** Preserve same-topic ordering for affine QoS 2 deliveries
 
-- Status: **Open. Alpha blocker, and demonstrated to be OURS.** Filed 2026-08-22 while
+- Status: **Open, demonstrated to be OURS, and parked outside the alpha since
+  2026-09-02.** Filed 2026-08-22 while
   verifying F-034; reclassified the same day when review refuted the redelivery
   explanation; then REPRODUCED with instrumentation, which showed the broker's own
   packet-identifier allocation transmitting the sixth-published message first. The fixture
   is exonerated. The cause inside the affine path is not yet identified.
 - Classification: Ordering defect against an INTENDED implementation property — NOT a spec
   violation; see the basis discussion
-- Release treatment: **Alpha blocker — by product judgement plus a stated implementation
-  property, NOT by MQTT conformance.** The specification permits reordering on a shared
-  path; this broker says it preserves per-(Topic,QoS) order and three rewritten tests rest
-  on that. Disagreeing with the judgement means reclassifying to a post-alpha product-path
-  anomaly — not weakening the assertion that found it.
+- Release treatment: **Parked experimental shared-QoS-2 defect; ROADMAP chapter P.** The
+  specification permits reordering on a shared path, but the implementation still violates
+  its stated intended ordering property. Parking is a feature-scope decision, not a
+  refutation or acceptance of the observed behavior.
 
 ### The observation
 
@@ -302,11 +303,12 @@ promise to "the non-affine paths", which would have removed the very ground this
 stands on. Review caught that, and the wording now says the guarantee is intended everywhere
 and currently violated here.
 
-So F-071's alpha-blocker status rests on two things, neither of them a spec citation: that
-stated property, and the judgement that silently reordering one client's same-topic QoS 2
-messages is not acceptable behaviour for this broker whatever the specification permits. If
-the reviewer or the user disagrees with that judgement, the honest reclassification is
-"product-path anomaly, post-alpha" — and **not** a weakening of the assertion that found it.
+Before the 2026-09-02 scope decision, F-071's alpha-blocker status rested on two things,
+neither of them a spec citation: that stated property, and the judgement that silently
+reordering one client's same-topic QoS 2 messages was not acceptable behaviour for this
+broker whatever the specification permits. The decision has now made the honest
+reclassification: this remains an open product-path defect, but it is parked post-alpha in
+ROADMAP chapter P. That does **not** weaken the assertion or evidence that found it.
 
 **The signature is specific and constrains any explanation.** In both captures exactly ONE
 message — an arbitrary one, `m07` then `m02` — goes out first on `pi=1` with

@@ -46,6 +46,31 @@ This boundary applies only to bridge persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
 covered by the conformance suites.
 
+### Shared-subscription QoS boundary
+
+The first supported alpha caps **shared** subscriptions at granted QoS 1. A shared
+filter requesting QoS 2 is accepted and persisted at QoS 1; ordinary non-shared QoS 2
+is unaffected, and MQTT 5 still reports that shared subscriptions are available. The
+production-default gate therefore prevents a new SUBSCRIBE from provisioning the
+session-affine shared-QoS-2 resources described later in this document.
+
+Those resources and their implementation remain in the repository as experimental work,
+not as a supported persistence contract. The current gate is a programmatic test option
+which the production command does not expose. If experimental shared-QoS-2 state exists,
+turning that gate off is unsupported: operators must reset it rather than expect the broker
+to reinterpret the membership as QoS 1 or unwind it through incomplete cleanup machinery.
+Detection, migration, rollback, backup/restore and downgrade compatibility for experimental
+state are not promised. An incompatible build requires an all-brokers-stopped reset of all
+nine broker-owned streams, with the data loss described under “The nine streams are one
+recreation unit.”
+
+The architecture sections about affine claims, copies, consumers and correlated PUBRELs
+are retained as the design record and future starting point. Unless a section explicitly
+says otherwise, they describe the experimental path and do not widen the acceptance
+criteria of a supported-alpha change. A supported session/QoS fix may break that path; its
+affine-only fallout is accumulated in ROADMAP chapter P instead of repaired or migrated as
+part of the general change.
+
 **Every sequence identity is scoped to one stream incarnation.** A `$MQTT_*` stream whose
 sequence space restarts breaks every mechanism in this design that treats a stream
 sequence as an identity: the per-subject CAS expectations, each exact-sequence claim

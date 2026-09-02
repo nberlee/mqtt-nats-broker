@@ -355,6 +355,10 @@ func testMQTTDefaultOptions() *Options {
 	o.ServerName = nuid.Next()
 	o.MQTT.Host = "127.0.0.1"
 	o.MQTT.Port = -1
+	// The required suites use the production boundary. The separate
+	// mqttport_experimental_shared_qos2 build tag opts the parked suite into the
+	// preserved affine implementation.
+	o.MQTT.ExperimentalSharedQoS2 = mqttTestExperimentalSharedQoS2
 	o.JetStream = true
 	return o
 }

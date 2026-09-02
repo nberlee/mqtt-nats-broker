@@ -139,7 +139,7 @@ the topic mapping and the exact permissions.
 | QoS 0 / 1 / 2 | ✅ | ✅ |
 | Retained messages | ✅ | ✅ |
 | Persistent sessions (JetStream) | ✅ | ✅ |
-| Shared subscriptions | — | ✅ |
+| Shared subscriptions | — | ✅ QoS 0/1; QoS 2 experimental and not part of alpha |
 | Will (+ delay) | ✅ | ✅ (delay) |
 | Message / session expiry, reason codes, properties | — | ✅ |
 | TLS / mTLS | ✅ | ✅ |
@@ -147,10 +147,16 @@ the topic mapping and the exact permissions.
 | HA cross-instance session takeover | ✅ | ✅ |
 | WebSocket | roadmap | roadmap |
 
-(MQTT 5 is always enabled — there is no experimental flag. All rows above are
-covered by end-to-end tests driving real MQTT clients against the broker over
-in-process JetStream — including load-balanced shared subscriptions, message
-expiry, and reconnect-to-a-different-instance takeover.)
+(MQTT 5 is always enabled; the shared-QoS-2 gate is a separate feature boundary.
+For the alpha, a shared filter requesting QoS 2 is accepted at granted QoS 1 by
+default, while non-shared QoS 2 is unchanged. The current affine shared-QoS-2
+implementation and tests remain in the tree behind a programmatic test option that
+the production command does not expose, with no persistence upgrade or downgrade
+guarantee. All supported rows above are covered
+by end-to-end tests driving real MQTT clients against the broker over in-process
+JetStream — including load-balanced shared QoS 0/1 subscriptions, message expiry,
+and reconnect-to-a-different-instance takeover. See the
+[dedicated post-alpha roadmap chapter](docs/ROADMAP.md#p-shared-subscription-qos-2-post-alpha--maybe-someday).)
 
 ## Roadmap
 

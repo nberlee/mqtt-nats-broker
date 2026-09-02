@@ -177,10 +177,12 @@ were adapted as follows:
   single dispatch goroutine — and it holds on the non-affine paths these three
   rewritten tests exercise. **The affine shared-subscription QoS 2 path
   currently VIOLATES it**, delivering copies through a second carrier: see
-  [F-071](findings/release-investigations.md#f-071), an open alpha blocker.
-  That is stated as a defect against the intention, NOT as a carve-out from
-  it — the guarantee is not scoped to exclude the affine path, which is
-  precisely why F-071 blocks.
+  [F-071](findings/release-investigations.md#f-071). The defect and its evidence
+  are preserved, but the 2026-09-02 scope decision parks that path outside the
+  supported alpha and gathers it under ROADMAP chapter P. The supported-path
+  ordering claim no longer depends on keeping the experimental affine carrier
+  working; promotion of shared QoS 2 must repair or explicitly re-decide the
+  intended property.
   Two Subscription-Identifier cases now validate both topic/property pairs in
   either arrival order, and `TestMQTTv5OutboundTopicAliasMixedQoS` validates
   that whichever QoS path arrives first binds the alias and the other reuses
