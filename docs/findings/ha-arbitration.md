@@ -1390,6 +1390,130 @@ connection stores payload A on the re-minted incarnation's hold subject for iden
 P; the replacement binds, publishes B on P, and B is lost behind a success-shaped
 PUBREC). That is the cheapest release-blocking oracle this finding has.
 
+### F-036's fourth attempt (2026-09-02): the quiescence design, and why it stopped
+
+**STOPPED UNRESOLVED for the fourth time, with no implementation code**, after one
+design pass and one consolidated adversarial challenge, under a gate pre-registered
+before the design existed. HEAD `ea04a0b`, tree clean throughout. Working lane
+`~/.claude/lanes/f-036-quiescence/`, which holds the design (`design.md`), the ledger
+and the decisions; the selection consult that set the gate is in
+`~/.claude/lanes/selection-20260902/`. **The `advisor` tool was unavailable for this
+gate, so it was Codex-only** — the selection that preceded it had both, the gate itself
+did not. This section is canonical for what the attempt established; `docs/ROADMAP.md`
+carries only the gate result.
+
+The attempt took up the direction the third one named, **operation-duration quiescence
+at the object-reuse transition**, scoped to unit 1 — the incarnation admission invariant
+— with the classifier and sites 1 and 3 left to unit 2.
+
+**The design that was rejected**, in one paragraph so a fifth attempt recognises it: a
+third fence of the shape the tree already uses twice, admitting packets at the single
+pre-dispatch point `mqttGateDispatchOnRejection` on predicates `sess.c != c` and a new
+`routeClosing`, incrementing an in-flight counter and decrementing it after the handler
+returned; the CONNECT clean-start arm would then **detach the displaced client before
+the re-mint** (Route A), wait for the counter to reach zero under a wall-clock bound,
+run `clear()`, bind the replacement, and only then reopen admission — the reopen moving
+from `clear()`'s return, where refuted design 2 left it, to after the bind.
+
+**The gate's verdict: criteria 1, 2, 5 and 6 FAILED; 3 and 4 PASSED; stop triggers 2, 3
+and 5 fired.** Under the pre-registered rule a fired stop trigger permits no revision,
+so the single permitted revision went unspent, as the third attempt's correction budget
+did.
+
+**The five findings that stopped it, each verified against the tree before the verdict
+was accepted.** Three of them refuted claims the design itself asserted, so they are
+recorded as corrections rather than as opinions.
+
+1. *Fire-and-forget effects survive the handler.* `deleteMsg(stream, seq, false)`
+   (`mqtt.go:5552`) pushes onto `sendq` and `sendJSAPIrequests` (`:7163`) publishes
+   later on another goroutine. `confirmInflightRegister`'s own comment already names the
+   pattern — "the ordinary terminal delete which may be fire-and-forget"
+   (`inflight_register.go:3298`). So a counter decremented after the handler returns is
+   **not** after every durable effect that handler caused.
+2. *Delivery and register continuations run outside any read-loop counter.* An ordinary
+   QoS 1/2 delivery callback passing `sess.c == cc` reaches `confirmInflightRegister`
+   (`inflight_register.go:3292`) from the JetStream callback, not the readLoop.
+3. *`voidRegNonceLocked` mutates before the record fence, and can recreate a map
+   `clear()` nilled.* `persistVoidedRegs`'s own comment states the inversion outright:
+   "The nonce set is mutated BEFORE the fence is taken (`voidRegNonceLocked`), which
+   inverts the usual discipline" (`inflight_register.go:1310-1314`). Reached at `:3330`,
+   it repopulates `cancelledRegNonces` on the reset object. **This is a third instance
+   of the class the third attempt found twice** in `retireSourceLocked` and
+   `noteQ2AffCarrierRefused`; the design had asserted the opposite, that session-record
+   writers are already covered by the record fence.
+4. *The early detach strands the displaced client on every failure arm.*
+   `abandonReDrivenSession` (`sess_takeover_redrive.go:267`) calls
+   `disposeForeignStateLocked(asm, nil, true)`, which sources `stale := sess.c`. With
+   `sess.c` nilled before `clear()` this is T1a, not T1b: residency goes, but the
+   displaced connection is never closed or notified, its armed Will is never discharged,
+   no disconnect is stamped and no expiry is arranged. The same re-read breaks `clear()`'s
+   existing superseded arm (`mqtt.go:12875`) and its post-reset arms (`:12917`), and the
+   unresolved refusal — which today returns having mutated nothing — would newly leave a
+   resident unbound session behind.
+5. *Disposing on timeout races the operation whose non-completion caused the timeout.*
+   Timeout means the in-flight count is above zero by definition, so disposal tears down
+   mutable session state while a continuation still owns the object. Deferring disposal
+   to route completion is a **new proof boundary**, which is the gate's own discriminator
+   for a stop rather than a revision.
+
+**The mutation audit, which is the reusable part.** Three of the design's seven mutations
+do not discriminate, and the reason is the same each time. **M1** (ignore `routeClosing`)
+and **M4** (reopen at `clear()`'s return) are both masked by the `sess.c != c` term,
+because the closing flag and the detach are set in one `sess.mu` critical section — so
+the paired test passes against the mutated code. **M3** (defer the decrement inside the
+handler) is not a mutation at all: a Go `defer` runs after the handler body, PUBREC
+enqueue included, and before the handler returns, so it *preserves* the ordering it was
+supposed to break. And **M-P as written does not compile**, because the displaced client
+is sourced from the very call the mutation deletes. That left the design with no
+discriminating mutation for its central admission term, which is itself evidence the term
+did less work than the design claimed.
+
+**What the attempt ESTABLISHED, so a fifth does not re-derive it.**
+
+1. **The ownership term is the admission barrier; the closing flag is not.** With
+   `sess.c != c` evaluated at the pre-dispatch point, moving the reopen back to
+   `clear()`'s return does **not** reproduce the sibling PUBREL manifestation, so the
+   reopen-after-bind boundary is not load-bearing and `routeClosing` is redundant *as an
+   admission predicate for the displaced client*. This governs admission only — it says
+   nothing about effects already admitted, queued, or raised off the read loop.
+2. **The examined wait-for graph is acyclic, for a corrected reason.** No cycle exists,
+   but not because teardown is the only displaced-side consumer of the client-ID gate —
+   that claim was false. SUBSCRIBE and UNSUBSCRIBE's plain acquisition, the rejection
+   settlement's bounded acquisition, the resolvers and the void-verdict handoff all
+   contend too; each fails or yields rather than closing a cycle. `mqttPublishOwedWill`
+   (`mqtt.go:14905`) uses client and account state, not `sess.mu`, the session gate or
+   the record fence.
+3. **A wall-clock ceiling is achievable.** A `select` against a timer bounds the wait
+   even when the in-flight JetStream call's own timeout is longer; that makes a timeout
+   more frequent, not unbounded. What is **not** designed is a safe disposition once it
+   fires — see finding 5.
+4. **Three positive facts hold and can be relied on.** A packet following CONNECT in the
+   same `mqttParse` buffer *is* gated, because `connected` is set before the loop
+   advances (`mqtt.go:3691`). PUBREL *does* evaluate the pre-dispatch gate before
+   deriving its hold subject (`:3489`, `:3558`). `mqttEnqueuePubResponse` *is*
+   synchronous with the handler, appending under `c.mu` before returning (`:16480`,
+   `:14470`), and the later socket flush does not re-read the session.
+5. **Two effect classes defeat any read-loop-scoped signal** — queued JetStream effects
+   (finding 1) and off-read-loop delivery/register continuations (findings 2 and 3).
+   Either alone is fatal; the record fence does not cover the second, and neither closing
+   nor draining the read loop drains the first.
+6. **A timeout arm requires completion-owned cleanup**, and that is a new proof boundary
+   rather than a placement, an error code or a lock-release adjustment.
+
+**Constraints on a fifth attempt.** It must govern **both** escaped effect classes, not
+only readLoop routes, and it must supply a **safe post-timeout disposition** — one that
+neither races the outstanding operation nor loses the displaced client's close,
+notification, Will, disconnect stamp and expiry. Nothing here shows operation-duration
+quiescence to be impossible in general; what it shows is that a signal scoped to the read
+loop cannot express it, and that Route A's detach cannot be moved earlier without
+rebuilding every failure arm that re-reads `sess.c`.
+
+**What this attempt did NOT do.** No implementation code was written. No test suite, no
+mutation campaign and no holistic code review were run — the mutations above were audited
+on paper and found wanting, not executed. Nothing in F-036 is fixed or narrowed: the
+incarnation admission invariant, the two-dimensional classifier, sites 1 and 3 and every
+previously recorded manifestation stand exactly as they did.
+
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 36

@@ -1724,6 +1724,36 @@ further findings it surfaced are filed separately, for the reason its own bullet
   prerequisite is unproved, and **sites 1 and 3**. Nothing in course E touched any of them.
   Lane `~/.claude/lanes/f-036-course-e/`.
 
+  **FOURTH ATTEMPT, 2026-09-02, STOPPED UNRESOLVED**, again with no implementation
+  code, after one design pass and one consolidated adversarial challenge under a gate
+  pre-registered before the design existed. It took up the direction the third attempt
+  named — operation-duration quiescence at the object-reuse transition — scoped to
+  unit 1, the incarnation admission invariant. The gate failed criteria 1, 2, 5 and 6,
+  passed 3 and 4, and fired three stop triggers, which under its own rule permits no
+  revision. Advisor was unavailable, so the gate was Codex-only. Lane
+  `~/.claude/lanes/f-036-quiescence/`; the dossier section **"F-036's fourth attempt
+  (2026-09-02)"** is canonical for the design, the five findings that stopped it and
+  the mutation audit. **The box stays open and every previously outstanding item stays
+  outstanding** — nothing was fixed or narrowed.
+
+  What it ESTABLISHED, so a fifth attempt does not re-derive it: (1) the **ownership
+  term `sess.c != c` is the admission barrier** and `routeClosing` is redundant beside
+  it — but that governs ADMISSION only, not effects already admitted, queued, or raised
+  off the read loop; (2) the examined wait-for graph **is acyclic**, though not for the
+  reason the design gave, since teardown is not the only displaced-side consumer of the
+  client-ID gate; (3) a **wall-clock ceiling is achievable**, while a safe disposition
+  once it fires is not; (4) three positive facts hold — a packet following CONNECT in
+  the same buffer is gated, PUBREL evaluates the pre-dispatch gate before deriving its
+  hold subject, and `mqttEnqueuePubResponse` is synchronous with its handler; (5) **two
+  effect classes defeat any read-loop-scoped signal**, queued JetStream effects reached
+  through `deleteMsg(..., false)` and off-read-loop delivery/register continuations —
+  and the record fence does NOT cover the second, because `persistVoidedRegs` mutates
+  before taking it; (6) a timeout arm needs **completion-owned cleanup**, which is a new
+  proof boundary rather than a placement or an error code. A fifth attempt must govern
+  BOTH escaped effect classes and supply a safe post-timeout disposition. None of this
+  shows quiescence impossible in general; it shows a read-loop-scoped signal cannot
+  express it.
+
   **THIRD ATTEMPT, 2026-09-01, STOPPED UNRESOLVED**, again with no implementation code,
   after one property-and-route pass and one adversarial challenge under a pre-registered
   stopping rule. It delivered what the second attempt said was OWED — a lifecycle property
