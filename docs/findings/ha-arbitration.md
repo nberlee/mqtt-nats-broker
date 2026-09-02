@@ -1173,6 +1173,216 @@ E removes the destructive arm outright and `mqttQ2AffClaim.terminal()` supplies 
 was sought and refused, so a third attempt must not re-run that question. **Only (b) through
 (e) remain owed**, unchanged.
 
+### F-036's third attempt (2026-09-01): the property pass, and why it stopped
+
+**STOPPED UNRESOLVED for the third time, with no implementation code**, after one
+property-and-route pass and one adversarial challenge, under a stopping rule
+pre-registered before the pass began. Working lane
+`~/.claude/lanes/f-036-property-audit/`, which holds the pass (`pass.md`), the SSA
+instrument that generated its matrix (`main.go`, `go.mod`) and its four outputs, the
+decisions and the ledger. The pass produced the deliverable the second attempt said was
+OWED — a lifecycle property and an interprocedural effect matrix instead of a fifth
+enumeration — and the challenge refuted enough of its measurement and its dispositions
+that a plan may not be written on it. This section is canonical for what it established;
+`docs/ROADMAP.md` carries only the gate.
+
+**The instrument, because a fourth attempt should not rebuild it wrong.** An SSA
+analysis (`x/tools` `go/ssa`) roots the five QoS 2 packet routes — as **six** SSA
+functions, because PUBACK and PUBREC are rooted both at their wrappers and at the shared
+handler they call, so `ROOTS 6` in the outputs is not five — computes reachability
+at two boundaries — static callees plus `MakeClosure` targets plus same-named interface
+methods, and an "indirection-sound" closure admitting every signature-matching package
+function at a dynamic call — and classifies effects per instruction. **Seven** defects in
+it were found by the challenge and every one is CONFIRMED against the tree, so a rebuilt
+instrument must not repeat them:
+
+1. **A builtin `delete` is not an `*ssa.MapUpdate`.** It falls through the `Call` case
+   and is invisible, so `delete(sess.pendingPubRel, pi)` in the stale-PUBREC rollback
+   (`mqtt.go:16767`) never appeared in the matrix. Map deletion is an effect operation
+   the classifier omitted entirely.
+2. **A response predicate keyed on the callee's NAME counts refusals as successes.**
+   `mqttEnqueuePubResponseReason` carries the reason as an argument, so
+   `mqttReasonNotAuthorized` (`mqtt.go:15485`), `mqttReasonQuotaExceeded` and
+   `mqttReasonPayloadFormatInvalid` were all classified as success-shaped. The reason
+   argument has to be read.
+3. **Pointer taint "at any depth" escapes the session object.** Following `sess.asm` and
+   `sess.c` reaches account-manager and client state that is not session-incarnation
+   state at all — `mqttAccountSessionManager.refusedAcceptFacts`
+   (`sess_accept_fact.go:378`) and `.forkedGrants` are in the matrix and do not belong
+   there. That is the semantic taint the stopping rule forbids, arrived at from the
+   opposite direction: the extension that fixed a real under-count (below)
+   over-corrected into one.
+4. **The signature-matched dynamic closure collapses precision**: 1219 of 1376 package
+   functions, pulling in `mqttProcessConnect`, `mqttProcessUnsubs`,
+   `createOrRestoreSessionWithin` and connection teardown, none of which a QoS 2 packet
+   route calls. A superset that admits 89% of the package is not a reach boundary.
+5. **A "functions with effects" count must be per class.** The pass reported 72 and 148;
+   only 46 static and 105 sound-mode functions carry an in-memory-write row.
+6. **Both propagation loops are FIXED-ITERATION, not fixed-point**, though the pass
+   describes them as a fixed point: the interprocedural loop caps at 12 rounds and the
+   local one at 4, with no convergence assertion anywhere. So every count is a LOWER bound
+   on the instrument's own predicate at the same time as it is an over-approximation of the
+   real one — two errors in opposite directions inside one number. A rebuilt instrument
+   iterates to convergence and asserts it, never caps.
+7. **Closure free-variable propagation is described in a comment and never implemented.**
+   A `FuncLit` reached through a tainted enclosing frame is not tainted, so the capture side
+   of the very indirection the "indirection-sound" boundary exists to cover is not covered
+   at all — only the call side is.
+
+**The headline is RETRACTED.** The pass claimed the measurement proved that
+point-linearized per-effect placement has no closed set: 150 in-memory write sites
+across 72 functions statically, 374 across 148 soundly. The arithmetic is consistent
+with the analyzer, but at least **67 of the 150 static sites are not stale-route
+placement targets at all** — 40 are `clear()`'s own lifecycle transition, 13 hydrate the
+transient expiry object, 8 initialize an unreachable constructor object, 4 are
+`setIncarnationLocked` itself and 2 hydrate the transient adopted-teardown object —
+leaving at most 83 before excluding already-admitted critical sections. **A large
+over-approximated set is not a proof of non-closure**, and no future attempt may cite
+these numbers as one. What the measurement DOES support is narrower and still useful:
+hand-placing effect checks over this call graph is unsafe, which is consistent with
+rounds 1-4 each finding one more.
+
+**One under-count the pass found in itself, worth keeping.** Its first classifier
+reported ZERO effects for `secureRetiredSource`, which the second attempt names as
+carrying "a write after its own I/O". The write is one hop off the session —
+`cur.durable`/`cur.regSeq` through `sess.srcAckOwed[key]`
+(`inflight_register.go:2015,2017`) — and a predicate stated over direct `*mqttSession`
+fields cannot see it. **A session-state predicate that does not follow at least one hop
+through the session's own maps under-counts; one that follows every hop becomes taint.**
+Both errors were made here, in that order.
+
+**What the pass ESTABLISHED and a fourth attempt must not re-derive: the property P.**
+
+> A session object's incarnation generation changes only while no client is bound to it.
+> `setIncarnationLocked` may be called only with `sess.mu` held and `sess.c == nil`, or on
+> an object not yet reachable by another goroutine.
+
+P is **sound**, and the challenge confirmed it as such. It is stated over the object's
+lifecycle TRANSITIONS rather than over `setIncarnationLocked` and `clear()`'s reset
+block, which is what the second attempt's refuted design 3 got wrong — a
+transition-level statement covers `clear()`'s INDIRECT effects, the deferred
+`endRecordTxNewGeneration` that advances `recordEpoch` among them, without naming them.
+`setIncarnationLocked` has exactly **two** production callers: `mqttSessionCreate`
+(`mqtt.go:10089`), on an object not yet reachable, and `clear()` (`mqtt.go:10823`). Of
+`clear()`'s six callers only the **CONNECT clean-start arm (`mqtt.go:12852`) violates
+P**, and it says so itself — "clear() has already reset this object to sequence 0
+**without detaching its client**" (`mqtt.go:12855-12856`). The other five are unbound or
+transient: `mqtt.go:4037` detaches at `4013`; the expiry timer at `6662` refuses on
+`rebound` (`6587`); `expireSessionFromRecord` (`6834`) and `restoreSession`'s
+overdue/retired arm (`9920`) both build transient objects; and
+`sess_uncertain.go:1650`'s caller returns on `sess.c != nil` (`sess_uncertain.go:935`).
+That last one **satisfies P and is NOT a check-then-act race**, even though its sample and
+its `clear()` are not under one mutex: `resolveUncertainNow` takes the account-manager
+ownership gate and defers its release across both (`sess_uncertain.go:864,867`), and
+CONNECT tests that same `sessLocked` gate before it binds (`mqtt.go:12591`), so no
+reconnect can move `sess.c` from nil to bound in between. The code says as much itself —
+the gate is taken "precisely so that the resolution and this discharge cannot be split by
+a reconnect".
+
+**P retires the per-connection incarnation stamp FOR THE ENTRY GAP, and only for it.**
+The stamp's premise was that inside the clear-to-bind window `sess.c` IS the displaced
+client, so pointer identity cannot discriminate and value discrimination must. Under P
+`sess.c` is nil there, so `sess.c == c` discriminates again. That does not retire a
+DURATION mechanism, and the pass's claim that it discharged the whole matrix was
+overstated in the pass itself and cut before the challenge ran.
+
+**Enforcement, with its reach bounded — and two limits the challenge added.** A runtime
+assertion inside `setIncarnationLocked` is total over the mechanism because the field is
+written nowhere else, and a package-wide source guard bounds that premise to "no other
+assignment exists in this package's non-test source". But the assertion **cannot verify
+that `sess.mu` is held**, cannot distinguish a not-yet-reachable object, and fires
+**after much of `clear()`'s in-memory reset has already run** — so it detects a violated
+invariant rather than refusing at the transition boundary. The source guard bounds
+direct assignment, not synchronization.
+
+**The audited five-route ownership table**, by function extent at `cb26fa6`:
+
+| Route | Extent in `mqtt.go` | Ownership refusal |
+|---|---|---|
+| PUBLISH `(*Server).mqttProcessPub` | 15467-15658 | **NONE** — zero `sess.c` references |
+| PUBREL `(*Server).mqttProcessPubRel` | 16002-16308 | **NONE** — zero `sess.c` references |
+| PUBACK+PUBREC `(*client).mqttProcessPublishReceived` | 16596-16961 | `sess.c != c` at 16611, near entry, under `sess.mu` |
+| PUBCOMP `(*client).mqttProcessPubComp` | 16972-17077 | `sess.c != c` at 16994 and 17054 |
+
+Two of the five carry no ownership term at all, and they are the two the second attempt
+named. P is what would make such a term MEAN anything, because without it the displaced
+client satisfies `sess.c == c` inside the gap.
+
+**The three dispositions, and why the matrix is not closed.**
+
+*D1 — durable-name effects.* Under P plus snapshot-at-admission — names derived from
+values read inside the admitted critical section and never re-read — a displaced
+continuation's names can only be the RETIRED generation's, which is the bounded class
+F-062 (the `$MQTT_qos2in` purge bound) and F-034 (the `$MQTT_inflight` enumeration
+watermark) already accept. Sound as far as it goes, but it is a CHANGE and the pass
+named only one of its sites. There are at least two: `mqttQoS2InternalSubject`
+(`mqtt.go:15971`) re-reads `sess.gen` in its own critical section, and the shared
+handler re-reads `sess.pubRelSubject` after unlocking (`mqtt.go:16747`).
+
+*D2 — in-memory writes into the fresh object.* **REFUSED, and the pass's candidate
+disposition is REFUTED by the tree.** "Harmless because `clear()` nilled the maps" is
+false: `retireSourceLocked` (`mqtt.go:11496`) lazily RECREATES `sess.srcAckOwed` and
+inserts the retired source, so a stale PUBREC continuation writes stale incarnation
+state into the FRESH object rather than becoming a no-op; `noteQ2AffCarrierRefused`
+(`mqtt.go:17094`) recreates its cleared map the same way; and `secureRetiredSource` can
+then update that entry after further I/O. The pass's other candidate — re-check at every
+`sess.mu` re-acquisition — is not a closed boundary either: the 78/254 lock census
+counts unrelated lifecycle and `subsMu` acquisitions and locks on other or transient
+sessions, does not identify which acquisitions are continuations after admission, misses
+helper writes under a caller-held lock, and cannot cover effects that take no session
+lock at all. Threading client and token context through it, with exceptions, is the
+hand-maintained site list the stopping rule forbids.
+
+*D3 — success-shaped protocol responses: NOT DISPOSITIONED.* This is the pass's own
+worst failure. It measured the class deliberately, BECAUSE the second attempt's final
+review said a predicate phrased over durable targets and session writes misses it — and
+then split its dispositions over the other two classes and left this one out. A
+pre-detach PUBLISH can complete its store and send a success PUBREC (`mqtt.go:15651`),
+and PUBREL's deferred response (`mqtt.go:16028`) has no ownership re-check; P governs
+neither.
+
+**THE MISSING DISPOSITION, and it is where a fourth attempt starts: operation-duration
+quiescence at the object-reuse transition.** No re-mint until the displaced route's and
+read loop's lifetime has DRAINED, with admission held closed through the transition.
+That governs D1, D2 and D3 at ONE lifecycle boundary instead of site by site, and it
+is neither the point-linearized admission that stopped attempts 1 and 2 nor the
+generalised operation fence refuted as design 2 — that fence reopened on `clear()`'s
+return, before the replacement bound, which is exactly the gap a drain closes. It was
+not proposed, established or audited by this pass and is not claimed here to work.
+
+**Route A and Route B, the two ways to discharge the one P-violating site.**
+
+*Route A — detach the displaced client before the re-mint.* It does NOT inherently
+violate F-089 or F-091, and that question is now answered: detaching makes
+`pubCompOwed`'s owner and `retainedGen` inert, which is their documented semantics —
+packet identifiers belong to separate connections, and F-091 says outright that once the
+connection is no longer the session's "the orphaned frame is one PUBLISH under one
+identifier on one socket and needs no reservation at all". The owner-independent write
+token survives the sweep. **But Route A is UNSAFE WITHOUT QUIESCENCE**: it moves
+`sweepDeadSendHoldsLocked`'s deletion earlier while an already-admitted old handler may
+still respond, allocate or write, and the takeover's closure is asynchronous — `go
+ec.closeConnection(DuplicateClientID)` (`sess_takeover_redrive.go:242`) — so a detach
+supplies no drain of its own.
+
+*Route B — abandon the object and bind a fresh one.* **Its claimed precedents do not
+establish it.** `abandonReDrivenSession` (`sess_takeover_redrive.go:267`) runs after a
+SUPERSEDED `clear()` and then restores authoritatively; it is not an example of
+abandoning live clean-start state without teardown. `restoreSession`'s overdue arm
+(construct at `mqtt.go:9899`, `clear()` at `9920`, return at `9934`) constructs a
+transient object, clears it and returns THAT SAME reset object — it does not abandon a
+resident object and bind a distinct fresh one. A distinct fresh object would stop stale
+continuations corrupting the new object's memory, but stale old-object durable writes
+and success responses would remain, so it still needs quiescence or an equally closed
+permanent-retirement mechanism.
+
+**What (b) through (e) still owe is unchanged**, and the pass adds one mutation to them
+that a fourth attempt should keep because it needs no cluster, no crash and no peer:
+**M-P** — delete whatever precondition holds the re-mint back and confirm the paired
+test fails, where the test is the single-broker silent QoS 2 loss (a displaced
+connection stores payload A on the re-minted incarnation's hold subject for identifier
+P; the replacement binds, publishes B on P, and B is lost behind a success-shaped
+PUBREC). That is the cheapest release-blocking oracle this finding has.
+
 - Classification: HA arbitration architecture
 - Release treatment: Alpha blocker
 - Original roadmap order: 36

@@ -1693,7 +1693,39 @@ further findings it surfaced are filed separately, for the reason its own bullet
   admission invariant** (including the single-broker clear-to-bind silent loss of an
   acknowledged QoS 2 message), the **two-dimensional classifier** whose identity
   prerequisite is unproved, and **sites 1 and 3**. Nothing in course E touched any of them.
-  Lane `~/.claude/lanes/f-036-course-e/`. **ATTEMPTED BY CONSTRUCTION
+  Lane `~/.claude/lanes/f-036-course-e/`.
+
+  **THIRD ATTEMPT, 2026-09-01, STOPPED UNRESOLVED**, again with no implementation code,
+  after one property-and-route pass and one adversarial challenge under a pre-registered
+  stopping rule. It delivered what the second attempt said was OWED — a lifecycle property
+  and a mechanically generated interprocedural effect matrix instead of a fifth
+  enumeration — and the challenge refuted enough of both that no plan may rest on it. The
+  dossier is canonical; the gate is this. **What it ESTABLISHED and must not be
+  re-derived:** the property **P — a session object's incarnation generation changes only
+  while no client is bound to it** — is SOUND, is stated over lifecycle TRANSITIONS (so it
+  covers `clear()`'s indirect `recordEpoch` advance without naming it, which is what
+  refuted design 3 could not do), has exactly TWO enforcement points because
+  `setIncarnationLocked` has two production callers, and is violated by exactly ONE call
+  site, the CONNECT clean-start arm at `mqtt.go:12852`. P retires the per-connection
+  incarnation stamp **for the entry gap only**. The five-route ownership table is audited:
+  PUBLISH and PUBREL carry NO ownership term at all; PUBACK/PUBREC and PUBCOMP do. Route A
+  (detach before the re-mint) does NOT violate F-089 or F-091 — that question is answered
+  — but is unsafe without a drain, because the takeover's close is asynchronous. **What it
+  RETRACTS:** its own headline. The matrix's size does not prove that per-effect placement
+  has no closed set; at least 67 of the 150 measured static sites are not placement targets,
+  and the "indirection-sound" closure that reached 89% of the package is precision collapse,
+  not a reach boundary. No later attempt may cite those numbers as a proof. **What it leaves
+  OPEN, and where a fourth attempt starts:** in-memory writes by a stale continuation are
+  NOT harmless — `retireSourceLocked` and `noteQ2AffCarrierRefused` lazily RECREATE the maps
+  `clear()` nilled — success-shaped responses were measured and then left with no
+  disposition at all, and the answer neither this pass nor any before it proposed is
+  **operation-duration quiescence at the object-reuse transition**: no re-mint until the
+  displaced route and read loop have drained, governing all three effect classes at one
+  lifecycle boundary rather than site by site. Lane
+  `~/.claude/lanes/f-036-property-audit/`, which keeps the SSA instrument and its outputs;
+  the dossier records the seven defects in it so a rebuilt one does not repeat them.
+
+  **ATTEMPTED BY CONSTRUCTION
   AND STOPPED UNRESOLVED 2026-08-27**, after three plan-review rounds and two scope
   consults. **No implementation code was written**: the only working-tree changes the attempt
   produced are this documentation filing and the `RWID` comment correction it propagates.
