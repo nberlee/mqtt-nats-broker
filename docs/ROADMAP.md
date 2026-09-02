@@ -1724,6 +1724,43 @@ further findings it surfaced are filed separately, for the reason its own bullet
   prerequisite is unproved, and **sites 1 and 3**. Nothing in course E touched any of them.
   Lane `~/.claude/lanes/f-036-course-e/`.
 
+  **FIFTH ATTEMPT, 2026-09-02, STOPPED UNRESOLVED**, with no implementation code and
+  **no design** — the stop came in the PREMISE phase, one step earlier than the fourth's.
+  The gate (pre-registered by consult before any design existed) made a written premise
+  audit a deliverable of its own and required it to prove the asynchronous boundary
+  finite; the audit's adversarial challenge failed it under the gate's §2 and fired stop
+  trigger 1, which under its own rule permits no errata pass and no design round. Advisor
+  was available for the gate consult and unavailable for the challenge, so the challenge
+  was Codex-only; all eight checkable claims in its verdict were verified against the
+  tree and held. Lane `~/.claude/lanes/f-036-completion-ownership/`; the dossier section
+  **"F-036's fifth attempt (2026-09-02)"** is canonical for what the challenge
+  established and the refuted design direction. **The box stays open and every
+  previously outstanding item stays outstanding** — nothing was fixed or narrowed.
+
+  What it ESTABLISHED, so a sixth attempt does not re-derive it: (1) the unit-1
+  ingress set includes **timer-installed callbacks** — the close path's
+  `scheduleSessionExpiry` AfterFunc reaches `expireSession` outside every WaitGroup —
+  and the three account-internal delivery callbacks; (2) the fire-and-forget `sendq`
+  population is **four classes, not two** — exact-sequence deletes (identity-safe),
+  consumer acks, **consumer deletes** (`deleteConsumer(noWait=true)`, three live
+  callers) and an **application-visible publication** (`mqtt.go:16430`) — and
+  shared-consumer identities are deterministic group-wide names no generation scopes,
+  so a queued shared ack or delete can act on state a new incarnation or another
+  member has since recreated; (3) the narrower choke-point claim SURVIVES — every
+  production message-delivery handler registers through `client.processSub` — which is
+  what makes a structural ownership boundary attachable there; (4) the
+  **pre-`clear()` takeover-tail move is REFUTED** three ways: the tail never detaches
+  (`sess.c` stays bound through the re-mint), a synchronous detach cannot stop
+  already-admitted completions (`recordWithheldDeliveryLocked` deliberately ADMITS
+  `sess.c == nil` and recreates `sess.deferred`), and before `clear()`'s
+  unresolved-refusal arm it discards the incumbent's Will with no successor
+  established (F-084). Disposal is not quiescence, detach is not quiescence,
+  `sess.c == nil` is not quiescence. A sixth attempt starts from the corrected
+  constraint list in the dossier — ownership transferred into every queued effect
+  including shared deletes/acks and application publications, socket close treated as
+  cancellation never completion, re-mint only at owner count zero, the
+  unresolved-refusal arm preserved.
+
   **FOURTH ATTEMPT, 2026-09-02, STOPPED UNRESOLVED**, again with no implementation
   code, after one design pass and one consolidated adversarial challenge under a gate
   pre-registered before the design existed. It took up the direction the third attempt

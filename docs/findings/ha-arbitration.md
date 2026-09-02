@@ -1390,6 +1390,122 @@ connection stores payload A on the re-minted incarnation's hold subject for iden
 P; the replacement binds, publishes B on P, and B is lost behind a success-shaped
 PUBREC). That is the cheapest release-blocking oracle this finding has.
 
+### F-036's fifth attempt (2026-09-02): the premise audit, and why it stopped
+
+**STOPPED UNRESOLVED for the fifth time, with no implementation code and no design**,
+in the premise phase of a gate pre-registered before any design existed. HEAD
+`8e3c3db`, tree clean throughout. Working lane
+`~/.claude/lanes/f-036-completion-ownership/`, which holds the gate (`gate.md`), the
+premise audit (`premise-audit.md`), the ledger and the decisions. **The `advisor` tool
+was available for the gate consult and went unavailable before the audit challenge**,
+so the challenge was Codex-only, as the fourth attempt's was. Every checkable claim in
+the challenge's verdict was verified against the tree before it was accepted; all
+eight held.
+
+The attempt took up the fourth attempt's constraint statement — completion ownership
+extending through queued JetStream work and off-read-loop continuations, plus safe
+completion-owned cleanup after timeout — under a gate that made a **written premise
+audit a deliverable of its own**, because the fourth attempt died on three premises
+checkable against the tree in seconds. The gate ruled unit 1 not architecturally
+blocked (the boundary "appears finite": one pre-dispatch gate, one `processSub`
+registration wrapper, one `mqttJSPubMsg` type and send loop, one bound `clear()`
+caller) and required the audit to prove that boundary finite and enforceable. The
+audit was written; its adversarial challenge **failed it under the gate's §2 and
+fired stop trigger 1** — the boundary as audited was not the boundary — and ruled the
+findings ineligible for the single permitted errata pass because they change the
+proof boundary. Under the gate's own rule the attempt stops with no design round.
+
+**What the challenge established, each verified against the tree, so a sixth attempt
+starts from the corrected boundary rather than re-deriving it.**
+
+1. **Timer-installed callbacks are a unit-1 ingress the four inventories missed.**
+   A DISCONNECT/close route calls `scheduleSessionExpiry` (`mqtt.go:4099`), which
+   installs `time.AfterFunc(delay, ... expireSession)` (`mqtt.go:6526`) — a
+   session-state-touching callback a packet route leaves behind, tracked by no
+   WaitGroup (`willWorkerWG` does not cover it). The authorization-expiry and flapper
+   `AfterFunc`s and the NATS disconnect/reconnect handlers are further members. The
+   expiry callback is serialized against CONNECT by `sessLocked`, so the class is
+   finite and enforceable — but it is part of the boundary, and an audit that misses
+   it has not bounded the ingress set.
+2. **The fire-and-forget `sendq` population is four classes, not two.** Beyond the
+   exact-sequence `deleteMsg` (identity-safe: JetStream never reuses an absolute
+   sequence) and consumer acks: **consumer deletion** rides `sendMsg`
+   (`deleteConsumer(..., noWait=true)`, `mqtt.go:5097-5101`; live callers
+   `mqtt.go:12084`, `:19619`, `unsub_drain.go:888`), and an **application-visible
+   derived publication** rides it too (`mqtt.go:16430`). Neither is
+   generation-named. Worse, shared-consumer identities are **deterministic
+   group-wide names independent of any session generation**: a queued shared ack can
+   acknowledge a delivery re-offered to another member, and
+   `deleteSharedGroupTargetIfUnheld`'s queued no-wait delete (`mqtt.go:19619`) can
+   land after a new incarnation or another member has recreated the same durable,
+   deleting a live consumer and its interest-retained backlog. The premise that
+   fire-and-forget effects are safe *by naming* is therefore false as a class
+   statement; it holds only for the exact-sequence delete.
+3. **The delivery-callback inventory has seven members, not four.** The three
+   account-internal callbacks — `processJSAPIReplies`, `processRetainedMsg`,
+   `processSessionRecordDelivery` (`mqtt.go:4627`, `:4639`, `:4653`) — register
+   through the same `createSubscription`/`processSub` choke point, and the record
+   callback in particular is unit-1-relevant. The choke-point claim itself
+   SURVIVES in a narrower form: every production asynchronous NATS
+   *message-delivery handler* is registered through `client.processSub`
+   (`shim_engine.go:1363`); the challenge found no cloned subscription, reused
+   `nsub`, or alternative handler registration. (`mqttFetchIdentity`'s
+   `SubscribeSync` (`authz_identity.go:132`) makes the literal "sole creator of a
+   NATS subscription" wording false, but it registers no callback.)
+4. **Queue shutdown abandons rather than discards.** `sendJSAPIrequests` returns on
+   `closeCh`/`quitCh` without popping or draining; entries stay in `q.elts`,
+   abandoned with the manager. Awaited callers observe `ErrServerNotRunning` on
+   `quitCh` or wait out their timeout on the initialization `closeCh`, and
+   `newRequestExMulti` does not delete its reply-map entries on the `quitCh` arm.
+5. **Three audited inventories are confirmed and stand**: exactly one of the six
+   production `clear()` callers runs on a bound object (the CONNECT clean-start
+   arm); exactly two non-test sites assign `sess.c` non-nil (`mqtt.go:12931`,
+   `:13000`); both `setIncarnationLocked` callers are the constructor and
+   `clear()`. The two in-flight fan-outs (`inflight_register.go:935`, `:4362`) are
+   joined by `wg.Wait()` in the same call.
+
+**A binding ruling the stop leaves behind: the pre-`clear()` takeover-tail move is
+REFUTED, so it is not tried again.** The obvious unit-1 remedy — run
+`asm.discardTakenOverClient` before `clear()` instead of after the rebind, so the
+re-mint happens on an unbound object and property P holds by construction — fails
+three independent ways. *The tail does not detach*: `discardTakenOverClient`
+(`sess_takeover_redrive.go:228`) discards the Will, notifies and starts
+`go ec.closeConnection`, but never assigns `sess.c = nil`, and `closeConnection` does
+not either — detachment happens later, in `mqttHandleClosedClient`, behind the
+teardown gate — so `sess.c` would still be the displaced client while `clear()`
+re-mints. *Even an added synchronous detach does not stop admitted completions*: a
+delivery callback past its `sess.c == cc` check and blocked in a JetStream
+continuation resumes after the re-mint and mutates the reused object; closing the
+socket and unsubscribing do not join an already-running nats.go handler; and
+`recordWithheldDeliveryLocked` (`sess_restore_gate.go:387-405`) deliberately accepts
+`sess.c == nil` and lazily recreates `sess.deferred`, so nil is an ADMITTING value on
+that arm, not a quiescence fact. *Run before `clear()`'s unresolved-refusal arm it
+violates F-084*: the tail would kill client A and discard its Will, then `clear()`
+returns `errMQTTClearRefusedUnresolved` having deleted nothing and the CONNECT is
+rejected — no successor was established, yet the incumbent is dead and its Will
+suppressed, and the tail performs neither a disconnect stamp nor an expiry
+arrangement. The existing arm deliberately preserves the bound client precisely for
+this case.
+
+**The corrected constraint statement for any sixth attempt**, which is the
+challenge's required-direction list and supersedes the fourth attempt's narrower one:
+close acquisition at the structural packet and delivery boundaries; acquire ownership
+before the first mutable session observation and retain it through synchronous helper
+tails; transfer it into every queued effect **including shared deletes/acks and
+application publications**; capture the displaced client and its Will/disconnect/
+expiry state before any detach; treat socket close and unsubscribe as cancellation,
+never as completion; permit `clear()`, the re-mint and the bind only after old
+ownership reaches zero; preserve the unresolved-refusal arm without suppressing the
+incumbent's Will; and give queue shutdown, timeout, reply, publish, suppression and
+drop exactly-once owner release. Disposal is not quiescence; detach is not
+quiescence; `sess.c == nil` is not quiescence.
+
+**What this attempt did NOT do.** No design was written to the gate (the pre-gate
+sketch was refuted by the ruling above and is recorded only in the lane). No code, no
+tests, no mutations. Nothing in F-036 is fixed or narrowed: the incarnation admission
+invariant, the two-dimensional classifier, sites 1 and 3 and every recorded
+manifestation stand exactly as the fourth attempt left them.
+
 ### F-036's fourth attempt (2026-09-02): the quiescence design, and why it stopped
 
 **STOPPED UNRESOLVED for the fourth time, with no implementation code**, after one
