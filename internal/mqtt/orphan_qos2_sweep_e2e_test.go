@@ -56,6 +56,32 @@ func testOrphanDropSession(t *testing.T, asm *mqttAccountSessionManager, idHash 
 		}
 		return
 	}
+	// RECORD THE RETIREMENT before deleting the record, which is the order a real
+	// teardown uses: recordGenRetirement writes the watermark first, and a write it
+	// cannot confirm aborts the teardown with nothing deleted.
+	//
+	// Since F-036 unit 2 this is not optional dressing — it is the LICENCE every
+	// destructive sweep arm now requires. Deleting the record alone establishes only
+	// that nothing this broker can see names the generation, which a session live on
+	// ANOTHER broker with no record satisfies equally, so an unlicensed pass RETAINS.
+	// These tests are all about a session that is genuinely gone, so the fixture records
+	// the fact that makes it so. The RETENTION half — absence with no watermark — is
+	// asserted by TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement
+	// and its siblings.
+	if ps := mqttDecodeSessionRecord(smsg); ps != nil && ps.ID != _EMPTY_ && ps.Gen != _EMPTY_ {
+		wmSubject := mqttTeardownSubject(asm.domainTk, idHash)
+		_, wmSeq, status := asm.jsa.loadGenRetirement(asm.domainTk, idHash)
+		var expect uint64
+		if status != mqttRetirementAbsent {
+			expect = wmSeq
+		}
+		r := &mqttGenRetirement{
+			ID: ps.ID, Gen: ps.Gen, MarkerSeq: smsg.Sequence, Nonce: nuid.Next(), Origin: "orphan-e2e",
+		}
+		if _, werr := asm.jsa.storeGenRetirementCAS(wmSubject, expect, r); werr != nil {
+			t.Fatalf("recording the retirement watermark for %q: %v", idHash, werr)
+		}
+	}
 	// A concurrent teardown may already have removed it; that is the same end state.
 	if err := asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil &&
 		isErrorOtherThan(err, JSSequenceNotFoundErrF) &&
@@ -427,6 +453,16 @@ func TestOrphanSweepTwoSweepersConverge(t *testing.T) {
 	msg, hdrLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_, false, _EMPTY_, nuid.Next())
 	if _, err := asmA.storeQoS2HoldCAS(holdSubject, 0, hdrLen, msg); err != nil {
 		t.Fatalf("storing the orphan hold: %v", err)
+	}
+	// The RECLAMATION LICENCE for that generation (F-036 unit 2). This fixture writes
+	// its durable state directly and never had a record to delete, so nothing else
+	// supplies the retirement fact — and without it BOTH sweepers correctly retain, which
+	// would make this a test about the leak rather than about convergence.
+	if _, err := asmA.jsa.storeGenRetirementCAS(mqttTeardownSubject(asmA.domainTk, idHash), 0,
+		&mqttGenRetirement{
+			ID: "two-sweepers", Gen: gen, MarkerSeq: 1, Nonce: nuid.Next(), Origin: "orphan-e2e",
+		}); err != nil {
+		t.Fatalf("recording the retirement watermark: %v", err)
 	}
 
 	// Both sweep concurrently, repeatedly: the first pass fences and purges, a later

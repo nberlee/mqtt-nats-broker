@@ -116,6 +116,56 @@ func (e *testOrphanEnv) forget(t *testing.T) {
 	t.Helper()
 	e.dropLocalSession()
 	e.dropSessionRecord(t)
+	// The RETIREMENT LICENCE, which since F-036 unit 2 is a precondition of every
+	// destructive arm below rather than something a fixture may leave out. Dropping the
+	// record and the resident object establishes only that nothing THIS BROKER can see
+	// names the generation — which is exactly the inference F-036 site 3 is a finding
+	// about, since a session live on another broker whose record is absent still uses
+	// these names. So a fixture that asserts reclamation must also plant the fact that
+	// licenses it: a valid watermark naming this generation.
+	//
+	// Fixtures that assert RETENTION call dropLocalSession and dropSessionRecord
+	// directly instead, so absence stands alone and the arm must refuse.
+	e.retire(t)
+}
+
+// retire plants a valid retirement watermark naming this session's own generation — the
+// one fact that proves the generation was durably discarded rather than merely absent
+// from this broker's view. See retirementProvenFor.
+func (e *testOrphanEnv) retire(t *testing.T) {
+	t.Helper()
+	e.retireClient(t, e.sess.id, e.sess.gen)
+}
+
+// retireClient plants the watermark for any client ID and generation, for a fixture
+// whose candidate belongs to a session other than the env's own.
+func (e *testOrphanEnv) retireClient(t *testing.T, clientID, gen string) {
+	t.Helper()
+	idHash := getHash(clientID)
+	subject := mqttTeardownSubject(e.asm.domainTk, idHash)
+	_, seq, status := e.asm.jsa.loadGenRetirement(e.asm.domainTk, idHash)
+	var expect uint64
+	if status != mqttRetirementAbsent {
+		expect = seq
+	}
+	r := &mqttGenRetirement{
+		ID:        clientID,
+		Gen:       gen,
+		MarkerSeq: 1,
+		Nonce:     nuid.Next(),
+		Origin:    "node1",
+	}
+	if _, err := e.asm.jsa.storeGenRetirementCAS(subject, expect, r); err != nil {
+		t.Fatalf("planting the retirement watermark for %q: %v", clientID, err)
+	}
+	// The memo is positive-only and process-local, so a fixture that plants a watermark
+	// AFTER a pass already read an absent one must not be answered from that pass's
+	// memory. It never is — negative outcomes are not cached — and this assertion is
+	// here so a future change that starts caching them fails a fixture rather than
+	// silently retaining forever.
+	if e.asm.retirementProvenFor(idHash, gen) != mqttRetireProven {
+		t.Fatalf("the planted retirement watermark does not prove generation %q retired", gen)
+	}
 }
 
 // dropLocalSession removes the session from BOTH in-memory indexes: `sessions` is
@@ -2639,7 +2689,14 @@ func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
 	t.Run("an unreferenced durable is reaped, never on the first pass", func(t *testing.T) {
 		e := testNewOrphanEnv(t, "pubrel-orphan")
 		e.setGraces(t, 0, 0)
-		durable := testCreatePubRelConsumer(t, e, getHash("pubrel-gone"), mqttNewSessGen())
+		goneGen := mqttNewSessGen()
+		durable := testCreatePubRelConsumer(t, e, getHash("pubrel-gone"), goneGen)
+		// The reclamation licence, for the candidate's OWN client and generation: since
+		// F-036 unit 2 an absent record establishes only that nothing this broker can
+		// see names the generation, which a session live on another broker with no
+		// record also satisfies. The retention half of this property is asserted by
+		// TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement.
+		e.retireClient(t, "pubrel-gone", goneGen)
 
 		e.sweepPubRelConsumers(t)
 		if !e.consumerExists(t, durable) {

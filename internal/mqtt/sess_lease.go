@@ -445,6 +445,41 @@ type mqttRetiredBinding struct {
 func (asm *mqttAccountSessionManager) retireBoundIncarnation(sess *mqttSession) (
 	*mqttRetiredBinding, *mqttPreparedClear, error) {
 
+	return asm.retireBoundIncarnationChecked(sess, nil)
+}
+
+// retireBoundIncarnationChecked is retireBoundIncarnation with a PRE-DETACH proof.
+//
+// The callback runs at the one point where a caller's own licence can still be
+// revalidated and still be abandoned safely: after prepareClear has opened the record
+// transaction, and BEFORE the detach. A caller that checked afterwards would be checking
+// nothing — sess.c is nil and the permit is minted by then, which is what makes the
+// obvious ordering (retire, then verify) impossible rather than merely weak.
+//
+// A callback returning an error is one more PRE-MUTATION refusal arm, indistinguishable
+// in disposition from the entry refusal or the drain ceiling: the transaction is aborted,
+// the tracker reopened, and the incumbent left bound with its Will, socket, expiry and
+// disconnect state untouched.
+//
+// The callback's own obligations, because they cannot be delegated to it:
+//
+//   - Read every in-memory fact under sess.mu; an OPEN record transaction does not leave
+//     that mutex held, so an open transaction is not a substitute for taking it.
+//   - Do the DURABLE reads with neither asm.mu nor sess.mu held, then take asm.mu and
+//     nest sess.mu for the final in-memory identity check — that lock ORDER is the
+//     established one, and two facts read under two separate acquisitions are not one
+//     observation.
+//
+// "Nothing mutated" on the refusal arms is a claim about PROTOCOL state, not a literal
+// one: closing and reopening the tracker replaces its channels, and opening then aborting
+// a transaction advances internal bookkeeping. Neither is durable and neither is
+// observable to a client.
+//
+// The caller holds the client-ID gate and no session lock, no record fence and no QoS
+// fence.
+func (asm *mqttAccountSessionManager) retireBoundIncarnationChecked(sess *mqttSession,
+	proof func(*mqttSession) error) (*mqttRetiredBinding, *mqttPreparedClear, error) {
+
 	sess.mu.Lock()
 	t := sess.leases
 	sess.mu.Unlock()
@@ -473,6 +508,18 @@ func (asm *mqttAccountSessionManager) retireBoundIncarnation(sess *mqttSession) 
 	if err != nil {
 		t.reopen()
 		return nil, nil, err
+	}
+
+	// 4a. THE CALLER'S PRE-DETACH PROOF, with the record transaction open and the
+	//     tracker closed and drained — the only point where a licence can still be
+	//     revalidated against state nothing can now move, and still be abandoned with
+	//     the incumbent intact. Guarded against an abnormal exit HERE rather than in the
+	//     caller: the caller has not received p yet, so a panic or runtime.Goexit
+	//     escaping the callback cannot be cleaned up by anything but this frame.
+	if proof != nil {
+		if perr := asm.runRetirementProof(sess, t, p, proof); perr != nil {
+			return nil, nil, perr
+		}
 	}
 
 	// 5. DETACH and MINT, one critical section. The action is taken WITH the detach
@@ -504,6 +551,40 @@ func (asm *mqttAccountSessionManager) retireBoundIncarnation(sess *mqttSession) 
 	capsule.permit = permit
 	sess.mu.Unlock()
 	return capsule, p, nil
+}
+
+// runRetirementProof invokes a pre-detach proof under an abnormal-exit guard.
+//
+// The guard is here and not in the caller for a reason that is easy to get wrong: at this
+// point retireBoundIncarnationChecked has not returned the prepared clear, so a panic or
+// runtime.Goexit escaping the callback would leave the record transaction open and the
+// tracker closed with NOBODY holding a reference to either — a session that refuses every
+// write and every packet for the rest of the process's life. The deferred arm therefore
+// abandons the transaction (never the void-verdict handoff form, which is not this
+// frame's to run) and reopens the tracker, then lets the exit continue.
+//
+// The caller holds the client-ID gate.
+func (asm *mqttAccountSessionManager) runRetirementProof(sess *mqttSession,
+	t *mqttIncarnationTracker, p *mqttPreparedClear, proof func(*mqttSession) error) (err error) {
+
+	settled := false
+	defer func() {
+		if settled {
+			return
+		}
+		// Abnormal exit: unwind exactly what this frame established, in the reverse
+		// order it was established.
+		p.abort()
+		t.reopen()
+	}()
+	err = proof(sess)
+	settled = true
+	if err != nil {
+		p.abort()
+		t.reopen()
+		return err
+	}
+	return nil
 }
 
 // disposeCaptured is disposeForeignStateFenced for a caller that has ALREADY

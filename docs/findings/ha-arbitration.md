@@ -943,14 +943,22 @@ distinguishes a census from a sample in kind rather than in length.
 
 **Title:** Revalidate ownership for otherwise quiet resident sessions
 
-**Supported-scope ruling, 2026-09-02.** F-036 remains an alpha blocker for its ordinary
-QoS 2 and general session-ownership routes. A closure need not preserve the experimental
-session-affine shared-QoS-2 branch. Any affine-only regression caused by the sound general
+**Supported-scope ruling, 2026-09-02 — HISTORICAL, and it governed the closure that
+followed.** As of that date F-036 remained an alpha blocker for its ordinary QoS 2 and
+general session-ownership routes; those are what unit 2 closed on 2026-09-03. A closure
+need not preserve the experimental session-affine shared-QoS-2 branch, and it did not.
+Any affine-only regression caused by the sound general
 fix is accumulated under ROADMAP chapter P rather than widening this finding or blocking
 its implementation. The affine history below remains evidence about rejected mechanisms,
 not an active acceptance requirement.
 
-- Status: Open — NARROWED, not resolved, and **ATTEMPTED BY CONSTRUCTION AND STOPPED
+- Status: **CLOSED 2026-09-03**, in two units — unit 1 on 2026-09-02 (the incarnation
+  completion lease, `901ee8f`) and unit 2 on 2026-09-03 (the two-dimensional PUBREL
+  classifier and sites 1 and 3). The section "F-036's seventh attempt (2026-09-03)" is
+  canonical for unit 2 and states what it closed and what it deliberately did not; the
+  residuals are in `docs/CONFORMANCE.md`. The history below is retained unchanged, because
+  the refuted designs are what kept six attempts from being repeated a seventh time.
+  Previously: Open — NARROWED, not resolved, and **ATTEMPTED BY CONSTRUCTION AND STOPPED
   UNRESOLVED on 2026-08-27** after three plan-review rounds and two scope consults, with no
   code written. The attempt found and verified the site-1 licence — a valid retirement
   watermark whose `MarkerSeq > sess.seq`, plus record absence, plus a full in-fence
@@ -1389,6 +1397,114 @@ test fails, where the test is the single-broker silent QoS 2 loss (a displaced
 connection stores payload A on the re-minted incarnation's hold subject for identifier
 P; the replacement binds, publishes B on P, and B is lost behind a success-shaped
 PUBREC). That is the cheapest release-blocking oracle this finding has.
+
+### F-036's seventh attempt (2026-09-03): unit 2, and the box CLOSES
+
+**Unit 2 is implemented, and with unit 1 it closes this finding.** Working lane
+`~/.claude/lanes/f-036-unit2/` (`plan.md` revision 5, `review-ledger.md`, `DECISIONS.md`,
+`mutations.md`). Six plan-review rounds — blocking findings 8, 4, *no output*, 3, 0, then
+CLEAN — and ONE scope consult, which decided both open design questions in a single pass.
+**The `advisor` tool was AVAILABLE for that consult**, the first time in any attempt at
+this finding; the sixth attempt's three consults and the fifth's were all Codex-only, and
+that is recorded rather than passed over. Round 3 produced no review at all: its launch
+succeeded and the job appeared in `running[]`, but every by-id lookup returned "No job
+found" while the same call listed it as running, and it then vanished from the tracker —
+so it was relaunched as round 4 rather than counted.
+
+**The mechanisms are in `docs/ARCHITECTURE.md`** — "A deleted record is retired under a
+licence, not under its absence" for site 1, the two new reader entries under "The
+generation-retirement watermark" for sites 2 and 3, the `R → P → W → S` ordering under
+"The release claim", and the proof gate plus safe tail under "Orphan reconciliation". What
+belongs here is why each is that shape, and what the rounds killed.
+
+**The consult's two rulings, and one of them answered my own objection.** Site 1 takes
+route (i) — a licence-backed bound arm on the periodic pass — and NOT a GONE arm on
+`evictDisplacedOnRemotePersist`, because that worker is driven by a MOVED-record SEQUENCE
+observation and feeding it an absence would fabricate an observation level and corrupt its
+coalescing accounting. Site 3 takes a narrow B3: the proof gate, plus a bounded
+positive-only memo, plus a safe non-destructive tail — the last two being narrowings the
+advisor had not proposed. I pressed for a bounded variant of the leak, on the grounds that
+the single-slot watermark makes the unprovable population PERMANENT and `$MQTT_qos2in`
+holds full payloads. **Codex refuted it with a reason rather than a preference:** a dead
+generation with an absent record and a live remote generation with an absent record are
+observationally IDENTICAL to that pass, so waiting longer distinguishes nothing, and an
+exact bound would need permanent per-generation retirement history — trading unbounded
+payload retention for unbounded metadata — or a distributed liveness lease. It also
+refuted a candidate authorization I had not considered: an existing `discarded` claim
+beside a surviving payload is NOT sufficient, because this sweep can itself create that
+shape from false absence and the record encodes no provenance.
+
+**Six things the rounds refuted or corrected, so a later change does not reintroduce
+them.**
+
+*(a) The site-1 ordering was DRIFT and impossible as written.* The plan had the licence
+revalidated after `retireBoundIncarnation` returned — but that helper sets `sess.c = nil`
+and mints the permit before returning, so a post-return owner check can never pass. The
+proof runs in a PRE-DETACH callback instead, pausing after `prepareClear` has opened the
+record transaction. *(b) The packet lease was OVERSTATED.* It pins the incarnation and
+therefore the generation; it does NOT pin `sess.seq`, which other admitted owners and
+local record writers still advance — so the classifier's sample takes the record
+transaction, and the claim is two-part rather than one. *(c) The site-3 key claim was
+FALSE.* `deleteOrphanPubRelConsumers` is keyed by `refs.pubRelDurables` and its own record
+re-read, not by `refs.hasInbound`; the plan asserted all three arms shared one predicate,
+was corrected in round 1 and STILL carried the contradictory sentence downstream, which
+round 2 caught. *(d) The crash audit conflated process death with an abnormal Go exit* —
+a `defer` does not run when the process dies — and a recovery claim was simply false: a
+restarted broker does NOT "re-observe GONE and re-arm", because with the record already
+absent there is no resident object left for the pass to look at. *(e) The safe tail's
+justification was too broad.* It is not that a paused releaser "can only win a new claim":
+one may already hold the claim and already have passed its own proof, and deleting the
+claim does not revoke its in-memory progress. The defensible claim is only that with the
+hold authoritatively absent, deleting the unchanged claim cannot destroy a payload and
+cannot let a NEW releaser verify the old hold as Held. *(f) `licensed=false` needed
+PROVING, not asserting*, because `disposeCaptured` prefers a capsule action and would then
+leave a live connection's Will for the close path to publish again; parking consumes the
+Will and nils `sess.c`, so the pre-detach owner check refuses a parked session outright,
+and a successful retirement here captures `action == nil`.
+
+**The structural guard was DELETED on its third review, and that is the transferable
+lesson.** A guard over every orphan-sweep destructive operation was designed in revision 2
+and narrowed in revision 3 to a primitive inventory plus per-helper call-site inventories.
+Its narrow claim was honest; what did not follow was the conclusion the plan drew from it,
+that "a fifth arm cannot be added silently" — an already-inventoried destructive helper
+can acquire a NEW UNSAFE CALLER without adding any primitive or touching a monitored call
+site, and closing that needs the bounded SSA reachability this repository has already
+ruled disproportionate. Three rounds each killing one variant of one mechanism is the
+signal to delete the mechanism rather than defend it again. The property now rests on the
+recorded census, the behavioral negatives with exact payload assertions, and their
+positive controls.
+
+**A convergence gap that no review found, and the reason it is recorded here.** It came
+from READING the existing `TestMQTTRejectedRecordPassLeavesBoundSessionsAlone` rather than
+from a round: once the ownership marker is armed, `reconcileResidentRecordState` diverts
+to the unbound settlement and never reaches the GONE arm again — so the site-1 route would
+have fired exactly once and its FIRST refusal would have been final, silently. A bound
+armed session now goes to the ownership backstop instead, and the unbound one still goes
+to the settlement whose own test pins it at zero probes.
+
+**31 mutations killed, ELEVEN initially SURVIVED**, and every survivor produced a new
+discriminating test rather than a weakened assertion: the between-read seam (owed item (d)
+— the pre-existing seam fired after both durable reads, so nothing could make the record
+reappear before them), the deliberate split-index state (both manager indexes move
+together normally, exactly as round 2 predicted), a `runtime.Goexit` inside the proof, the
+Will-PUBLICATION observation (discard and consume leave the same terminal disposition, so
+only the publication distinguishes them), a PUBREL on an unresolved session, and a
+tombstone-PRESENT fixture (one starting from an absent hold cannot prove the tombstone
+order at all). **One mutation is reported as NOT DISCRIMINATING rather than forced:**
+making the terminal tombstone delete unconfirmed SURVIVES, because the mandatory
+authoritative absence read that follows subsumes the confirmation — so the plan's own claim
+that an asynchronous delete is insufficient proof was corrected, the confirmed form kept as
+defence in depth, and no seam invented to manufacture a kill. Revision 1's `>` → `>=`
+mutation was struck as invalid during plan review, `mseq == sess.seq` being unreachable for
+a bound session.
+
+**What unit 2 does NOT close**, both permanent and both in `docs/CONFORMANCE.md`: the
+no-licence half of site 1, where a record GONE with an absent, corrupt, indeterminate or
+insufficient watermark leaves the marker armed and a bound Keep Alive 0 client may strand
+until it sends traffic; and the orphan-reconciliation retention leak, which is unbounded
+because the single-slot watermark makes an unprovable generation permanent.
+`discardAbsentWinnerClaim` stays ungated under the supported-scope ruling, and the
+pre-existing post-proof paused-releaser residual is unchanged.
 
 ### F-036's sixth attempt (2026-09-02): unit 1 implemented
 
@@ -1898,10 +2014,15 @@ that course was **refused** rather than deferred.
 
 **What closing it needs, and why it is not course E's:** a distributed fence preventing every
 same-generation session from starting or completing a move, then a complete post-fence
-discard scan. That fence is F-036's **remaining unit** — the incarnation admission invariant
-whose placement closure stopped the 2026-08-27 and 2026-09-01 attempts with no code either
-time. The guard's inventory therefore carries this site as *known pre-existing, outside course
-E's behavioral change, owned by open F-036, retained without any claim that it is race-free*.
+discard scan. That fence WAS F-036's remaining unit at the time — the incarnation admission
+invariant whose placement closure stopped the 2026-08-27 and 2026-09-01 attempts with no
+code either time; unit 1 landed it on 2026-09-02. This AFFINE site was nonetheless left
+outside F-036's 2026-09-03 closure, deliberately and for a structural reason: the
+retirement licence unit 2 rests on names the SESSION generation, while the affine one
+outlives incarnations, so no retirement proof can gate it. The guard's inventory therefore
+carries this site as *known pre-existing, outside course E's behavioral change, retained
+without any claim that it is race-free* — and it is owned by ROADMAP chapter P rather than
+by this finding.
 
 ### A third manifestation added by F-033's audit (2026-08-18): the adoption blind spot — DISSOLVED
 

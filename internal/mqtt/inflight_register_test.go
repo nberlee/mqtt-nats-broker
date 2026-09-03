@@ -5530,11 +5530,65 @@ func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, u
 	rec := &mqttInflightRecord{
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
 	}
+	// The RECLAMATION LICENCE (F-036 unit 2), planted BEFORE the register exists. A
+	// register whose generation is absent from the reference walk is not thereby proven
+	// dead: a session live on another broker whose record is absent still holds this
+	// identifier and its Receive Maximum slot. So the sweep now requires a valid
+	// retirement watermark naming the generation, and a fixture asserting reclamation
+	// plants the fact that licenses it. The retention half is asserted separately, by
+	// TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement.
+	//
+	// The ORDER is load-bearing for the fixture, not just faithful to a real teardown
+	// (which also records its retirement before leaving state behind): this account
+	// manager runs its own periodic sweep goroutine, and these tests set the grace to
+	// zero. Doing the watermark's round trips AFTER the register was stored put them
+	// inside the window in which that background pass can take the register's FIRST
+	// stable observation — which then makes the test's own first pass the second
+	// sighting, and it deletes. That is what made TestMQTTInflightOrphanReconcile flake
+	// on "the first sighting of an orphan must not delete it".
+	e.retireClient(t, "client-departed", orphanGen)
 	seq, err := e.asm.jsa.storeInflightCAS(subject, 0, rec)
 	if err != nil {
 		t.Fatalf("seed an orphaned register: %v", err)
 	}
 	return subject, seq
+}
+
+// seedOrphanRegisterWithoutLicence seeds an orphan register and deliberately plants NO
+// retirement watermark — the state a session live on ANOTHER broker with no record
+// leaves behind, which is what F-036 site 3 says absence does not distinguish from death.
+func (e *testInflightEnv) seedOrphanRegisterWithoutLicence(t *testing.T, pi uint16) string {
+	t.Helper()
+	orphanHash, orphanGen := getHash("client-live-remote"), mqttNewSessGen()
+	subject := mqttInflightSubject(orphanHash, orphanGen, pi)
+	rec := &mqttInflightRecord{
+		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
+	}
+	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, rec); err != nil {
+		t.Fatalf("seed an unlicensed orphan register: %v", err)
+	}
+	return subject
+}
+
+// retireClient plants a valid retirement watermark for one client ID and generation.
+func (e *testInflightEnv) retireClient(t *testing.T, clientID, gen string) {
+	t.Helper()
+	idHash := getHash(clientID)
+	subject := mqttTeardownSubject(e.asm.domainTk, idHash)
+	_, seq, status := e.asm.jsa.loadGenRetirement(e.asm.domainTk, idHash)
+	var expect uint64
+	if status != mqttRetirementAbsent {
+		expect = seq
+	}
+	r := &mqttGenRetirement{
+		ID: clientID, Gen: gen, MarkerSeq: 1, Nonce: nuid.Next(), Origin: "node1",
+	}
+	if _, err := e.asm.jsa.storeGenRetirementCAS(subject, expect, r); err != nil {
+		t.Fatalf("planting the retirement watermark for %q: %v", clientID, err)
+	}
+	if e.asm.retirementProvenFor(idHash, gen) != mqttRetireProven {
+		t.Fatalf("the planted retirement watermark does not prove generation %q retired", gen)
+	}
 }
 
 func (e *testInflightEnv) registerPresent(t *testing.T, subject string) bool {

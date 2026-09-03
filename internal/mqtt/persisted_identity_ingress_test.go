@@ -372,6 +372,7 @@ var censusInterpreters = map[string]string{
 	"sweepSessionExpiries":          "the periodic expiry pass; skips never-expire records outright",
 	"reconcileRemoteSessionExpiry":  "reconciles the expiry deadline carried by a record this broker does not own",
 	"reconcileResidentOwnership":    "the committed-read backstop: feeds the eviction trigger when a record MOVED, arms the marker when it is GONE, and re-fires a trigger a refusal left undecided",
+	"proveGoneRetirement":           "the in-fence proof of the deleted-record retirement licence (F-036 site 1): the record must still be AUTHORITATIVELY absent, read LAST so it is the final fallible observation — an unreadable record establishes nothing and refuses, and a record present again withdraws the licence entirely",
 	"evictDisplacedOnRemotePersist": "evicts a displaced resident on a peer's landed write, with a digest arm so this broker's OWN ambiguous landing cannot evict the rightful client",
 	"buildSessionRefs":              "builds the liveness view the orphan sweep uses: this broker's residents plus persisted records ONLY, which is F-036's recorded premise",
 	"loadFenceSession":              "reads the record a fence is taken against",

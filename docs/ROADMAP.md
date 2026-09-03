@@ -1708,11 +1708,87 @@ further findings it surfaced are filed separately, for the reason its own bullet
   write, and refuses equally when an unusable load leaves nothing to compare. Residuals
   in `docs/CONFORMANCE.md`.
 
-  - [ ] [F-036: Revalidate quiet resident-session
-  ownership](findings/ha-arbitration.md#f-036). **Alpha blocker. UNIT 1 LANDED
-  2026-09-02 (the incarnation completion lease); the box STAYS OPEN for unit 2, and the
-  reason is stated here so a reader does not mistake a landed unit 1 for a closed
-  finding.**
+  - [x] [F-036: Revalidate quiet resident-session
+  ownership](findings/ha-arbitration.md#f-036). **DONE 2026-09-03, in two units. Unit 1
+  landed 2026-09-02 (the incarnation completion lease, `901ee8f`); unit 2 — the
+  two-dimensional PUBREL classifier and sites 1 and 3 — closes the box.**
+
+  **UNIT 2, 2026-09-03.** Six plan-review rounds (blocking findings 8 → 4 → *no output* →
+  3 → 0 → 0 CLEAN; round 3's job was lost by the companion and was relaunched as round 4)
+  and one scope consult that decided both open design questions. **The `advisor` tool was
+  AVAILABLE, which is the first time in any F-036 attempt** — all seven earlier consults
+  were Codex-only. Lane `~/.claude/lanes/f-036-unit2/`; the dossier section **"F-036's
+  seventh attempt (2026-09-03)"** is canonical, with the mechanisms in
+  `docs/ARCHITECTURE.md` under "A deleted record is retired under a licence, not under its
+  absence", "The generation-retirement watermark" and "Orphan reconciliation".
+
+  **Site 2, the classifier.** A PUBREL now reads the retirement watermark between its hold
+  proof and its onward store — the ordering is `R → P → W → S` — and refuses the fan-out
+  when the watermark is valid AND either it names this incarnation OR its `mseq` exceeds
+  the sequence this broker is acknowledged for. It answers the population NEITHER existing
+  fence can see: a hold the discard's one-shot enumeration never named, and one F-062's
+  cutoff SPARED above its own watermark. Both are decidable because the watermark is
+  written before any teardown deletion and an unconfirmable write aborts the teardown with
+  nothing deleted. **The identity prerequisite the second attempt found unproved is
+  supplied by unit 1's packet lease, and it was verified against the tree rather than
+  assumed** — but the plan's first revision OVERSTATED it and review round 1 corrected
+  that: the lease pins the incarnation and therefore the generation, NOT `sess.seq`, so the
+  sample takes the record transaction. Corrupt, indeterminate and `seqUncertain` fail the
+  release closed with no PUBCOMP; a confirmed refusal releases the hold nonterminally and
+  only THEN reaps its own claim.
+
+  **Site 1, the bound deleted record.** `reconcileResidentOwnership` already armed the
+  ownership marker for a record deleted under a bound session; nothing consumed it for a
+  client that never sends again. The periodic pass now retires such a session itself under
+  a LICENCE — a valid watermark whose `mseq` exceeds our sequence, plus the record
+  authoritatively absent, plus a full in-fence revalidation — never under the absence
+  alone. Round 1 found the plan's ordering was DRIFT from the consult's ruling and
+  impossible as written, because `retireBoundIncarnation` detaches and mints before it
+  returns: the proof therefore runs in a PRE-DETACH callback, after `prepareClear` has
+  opened the record transaction. Failure is refusal, never disposal under a live owner, and
+  the unwind guard lives inside the helper because the caller does not yet hold the
+  prepared clear. The Will is NOT suppressed (F-084): a watermark proves a teardown, never
+  a successor. **A convergence gap found while reading the existing bound-rejection test,
+  not by review:** once the marker is armed the periodic pass diverted to the unbound
+  settlement forever, so the FIRST refusal would have been final — a bound armed session
+  now goes to the ownership backstop instead.
+
+  **Site 3, the sweep.** One property rather than three site fixes: any arm that can still
+  destroy live session-generation state requires a valid watermark whose generation EQUALS
+  the candidate's, and RETAINS without it. Gated at three arms, each on its own terms —
+  and revision 2's claim that all three share `refs.hasInbound` was FALSE for
+  `deleteOrphanPubRelConsumers`, which round 2 caught as round 1's finding recurring. A
+  bounded positive-only memo remembers the monotone matching observation; no negative
+  outcome is ever cached. **The safe non-destructive tail still runs without proof** —
+  once the payload is absent, an unchanged claim and a terminal tombstone are reaped — which
+  is what keeps the gate from being a blanket retain. `discardAbsentWinnerClaim` is
+  deliberately UNGATED and out of scope under the supported-scope ruling.
+
+  **A structural inventory guard over the gated arms was designed, reviewed THREE TIMES
+  and DELETED**, and that deletion is the item's clearest lesson: its narrow claim was
+  honest, but the plan still concluded "a fifth arm cannot be added silently", which does
+  not follow — a primitive-only AST inventory cannot catch a new unsafe CALLER of an
+  already-inventoried destructive helper, and completing it needs the bounded SSA
+  reachability this repository has ruled disproportionate. The property rests on the census,
+  the behavioral negatives with exact payload assertions, and their positive controls.
+
+  **The accepted price, in `docs/CONFORMANCE.md`:** a permanent, unbounded retention leak
+  on the sweep side (nonterminal holds with full payloads, absent-generation registers,
+  PUBREL consumers with their copies) wherever a matching retirement is not observable,
+  because the single-slot watermark makes that population permanent; plus the no-licence
+  half of site 1, where a bound silent client may still strand. A leak is preferred to a
+  loss — the same trade course E took. **No bounded variant exists from current facts**,
+  and Codex refuted the one I pressed for: a dead generation with an absent record and a
+  live remote one with an absent record are observationally identical to the pass.
+
+  **31 mutations killed; ELEVEN initially SURVIVED** and each produced a new discriminating
+  test — the between-read seam, the split-index seam, the abnormal-exit Goexit, the
+  Will-publication observation, the `seqUncertain` release, the tombstone-present fixture.
+  **One mutation is reported as NOT DISCRIMINATING rather than forced:** making the
+  tombstone delete unconfirmed survives, because the mandatory absence read that follows
+  SUBSUMES the confirmation, so the plan's claim that an async delete is insufficient proof
+  was itself corrected. Revision 1's `>` → `>=` mutation was deleted as invalid, equality
+  being unreachable for a bound session.
 
   **SIXTH ATTEMPT, 2026-09-02: unit 1 IMPLEMENTED**, after the user OVERRODE the fifth
   attempt's binding fallback ("no sixth F-036 design; F-072 next") with a direct
@@ -1875,10 +1951,11 @@ further findings it surfaced are filed separately, for the reason its own bullet
   `~/.claude/lanes/f-036-property-audit/`, which keeps the SSA instrument and its outputs;
   the dossier records the seven defects in it so a rebuilt one does not repeat them.
 
-  **Alpha closure after the 2026-09-02 scope decision.** F-036 remains an alpha blocker:
-  its clean-start loss is reachable through ordinary QoS 2, and its quiet-owner and inbound
-  hold decisions are not affine-only. Close those supported paths with the quiescence,
-  classifier and sites already named here. Do **not** require the change to preserve the
+  **Alpha closure after the 2026-09-02 scope decision — HISTORICAL; this is the ruling
+  the closure was carried out under.** As of that date F-036 remained an alpha blocker:
+  its clean-start loss was reachable through ordinary QoS 2, and its quiet-owner and
+  inbound hold decisions were not affine-only. Those supported paths were closed with the
+  quiescence, classifier and sites named here. Do **not** require the change to preserve the
   experimental shared-QoS-2 affine integration. If a sound general fix breaks an affine
   branch or its tests, record the regression under chapter P's single accumulation item;
   do not widen F-036 or reject the fix on that ground.
@@ -3250,6 +3327,24 @@ finding with acceptance criteria.
   clean `HEAD` worktree against 1/10 on its own tree, i.e. the flake is pre-existing and load-sensitive
   rather than attributable to any change; that measurement is further evidence for the same
   rival-create signature, not a second finding.
+
+- [ ] **Page the shared `$MQTT_out` consumer enumeration.** Filed 2026-09-03 by F-036
+  unit 2's escalation consult, which ACCEPTED that this is not that item's blocker but
+  refused to let it be called closed. `consumerList` walks the entire `$MQTT_out`
+  population on every orphan-sweep pass, and the candidate collection and the sort that
+  follow grow with it. That was already true before unit 2 — the affine consumer leak
+  course E accepted rides the same enumeration — so it is pre-existing rather than
+  introduced. What changed is that it now MATTERS more: unit 2's retirement proof gate
+  retains an unbounded population of PUBREL consumers by design, so the population this
+  walk traverses grows without bound rather than converging. Unit 2 bounded the
+  per-candidate REVALIDATION round trips (a per-pass budget with a durable-name cursor,
+  so a persistent candidate is still eventually visited) and deliberately did NOT bound
+  the discovery around them; `docs/ARCHITECTURE.md` and `docs/CONFORMANCE.md` both say so
+  in those words rather than claiming bounded work.
+  **What this item owes:** paged or bounded listing, bounded discovery memory, and a
+  sort that does not require the whole population in hand — plus a decision on whether
+  the affine and PUBREL classes share one paged walk or take one each. Not a blocker for
+  F-036, which is closed.
 
 - [ ] **Attribute the `TestMQTTInflight*` family's intermittent failures.** Filed
   2026-09-01 by the F-066 enforcement lane, which met one in a full-suite run and then

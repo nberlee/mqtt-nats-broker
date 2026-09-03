@@ -143,6 +143,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -186,6 +187,28 @@ var (
 	// bounds MUTATIONS only: the inventory and session-reference scans that authorize
 	// a claim transition are never capped (invariant 13).
 	mqttQ2AffSweepMutationBudget = 256
+
+	// mqttPubRelRevalidateBudget bounds how many aged PUBREL consumer candidates ONE
+	// pass revalidates. Each revalidation costs a session-record read, a consumer
+	// lookup and a retirement-watermark read, and since F-036 unit 2 a candidate with
+	// no matching retirement is RETAINED — permanently, and in unbounded number. So
+	// without a bound the per-pass JetStream traffic grows with the accumulated leak and
+	// eventually monopolises the sweep goroutine, which is a cost the leak's acceptance
+	// did not include.
+	//
+	// The cursor below makes the bound a ROTATION rather than a truncation: each pass
+	// starts strictly after the last durable NAME it processed, so every candidate is
+	// still revisited, just not every candidate on every pass. Convergence latency grows
+	// with the backlog; convergence itself does not stop, and the supported claim is
+	// eventual visitation of a PERSISTENT candidate under a finite or serviceable churn
+	// rate — not fairness against arrivals that permanently exceed the budget.
+	//
+	// What this bounds is the per-candidate REVALIDATION round trips and nothing else.
+	// The consumer listing, the candidate collection and the sort still grow with the
+	// $MQTT_out population, which is this sweep's pre-existing shape (shared with the
+	// affine leak course E accepted) and is filed as its own roadmap item rather than
+	// held against F-036.
+	mqttPubRelRevalidateBudget = 128
 )
 
 // sweepOrphanedQoS2State reconciles abandoned teardowns and the durable QoS 2 state
@@ -1387,6 +1410,18 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 		if !q.observedOrphanFor(mqttQuarantineHoldKey(n.hold), mqttQuarantineSeqFP(holdSeq), holdGrace) {
 			return mqttQoS2SweepNothing
 		}
+		// THE RETIREMENT PROOF (F-036 site 3). Writing the `discarded` marker is
+		// destructive in itself — it is the fence a later releaser must lose to — and
+		// the purge behind it destroys the payload. Absence establishes that no record
+		// and no LOCAL resident names this generation; it cannot distinguish that from
+		// a session live on another broker whose record is absent, which still uses
+		// this very subject. So a matching retirement watermark is required, and
+		// without one the hold is RETAINED, whatever its age: a grace never arbitrated
+		// ownership. See orphan_retire_proof.go for the leak this accepts and why no
+		// bounded variant exists.
+		if as.retirementProvenFor(n.idHash, n.gen) != mqttRetireProven {
+			return mqttQoS2SweepDeferred
+		}
 		// An expired deadline: a claim that races in as `releasing` is left alone for
 		// the next tick rather than blocking the sweep goroutine on a poll loop.
 		//
@@ -1431,18 +1466,52 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 			if !q.observedOrphanFor(mqttQuarantineHoldKey(n.hold), mqttQuarantineSeqFP(holdSeq), holdGrace) {
 				return mqttQoS2SweepNothing
 			}
-			// Bounded to the exact sequence this pass proved aged and orphaned, NOT to any
-			// fence an adopted claim carries: this arm's entitlement is independently
-			// established (reference walk, grace, re-confirmed sequence), and clamping it to a
-			// stale low fence would make it purge nothing and defer forever.
-			if err := as.purgeQoS2Hold(n.hold, holdSeq); err != nil {
-				s.Warnf("MQTT orphaned QoS 2 sweep: unable to purge the orphaned hold on %q: %v", n.hold, err)
-				return mqttQoS2SweepDeferred
-			}
-			// purgeQoS2Hold is already a confirmed purge; re-reading is defensive depth,
-			// because this is the step that licenses removing the fence.
-			if after, _, aerr := as.loadQoS2Record(n.hold); aerr != nil || after != nil {
-				return mqttQoS2SweepDeferred
+			// THE RETIREMENT PROOF, and the split that keeps this from being a blanket
+			// retain (F-036 site 3). What needs a licence is destroying a NONTERMINAL
+			// hold — a payload some session may still be entitled to release. A
+			// terminal tombstone is not that: the exchange it belongs to already
+			// delivered onward and committed, so removing it destroys nothing, and the
+			// branch that answers from it (T, in mqttProcessPubRel) answers from its
+			// ABSENCE identically once it is gone.
+			//
+			// The tombstone's removal is therefore allowed without proof, but only in
+			// the order below: an EXACT-SEQUENCE CONFIRMED delete first, then an
+			// authoritative read proving the subject empty.
+			//
+			// BOTH steps earn their place, and the reason is clustered JetStream. A
+			// no-wait delete returns once the operation is queued or proposed, so the
+			// read that follows can precede its Raft application: the pair is still
+			// FAIL-SAFE either way — an unapplied delete makes the read see the record
+			// and defers the whole disposition — but with an unconfirmed delete this
+			// pass makes no progress in one pass and reports no error at the site that
+			// caused it. The confirmation is what turns "retry next pass" into "this
+			// failed, here". The absence read is separately load-bearing: it is what
+			// licenses removing the claim behind the payload.
+			if rec.state == mqttQoS2Done {
+				if st, derr := as.releaseQoS2Record(holdSeq); st != mqttQoS2Released {
+					s.Warnf("MQTT orphaned QoS 2 sweep: unable to remove the terminal QoS 2 tombstone on %q: %v", n.hold, derr)
+					return mqttQoS2SweepDeferred
+				}
+				if after, _, aerr := as.loadQoS2Record(n.hold); aerr != nil || after != nil {
+					return mqttQoS2SweepDeferred
+				}
+			} else {
+				if as.retirementProvenFor(n.idHash, n.gen) != mqttRetireProven {
+					return mqttQoS2SweepDeferred
+				}
+				// Bounded to the exact sequence this pass proved aged and orphaned, NOT to any
+				// fence an adopted claim carries: this arm's entitlement is independently
+				// established (reference walk, grace, re-confirmed sequence), and clamping it to a
+				// stale low fence would make it purge nothing and defer forever.
+				if err := as.purgeQoS2Hold(n.hold, holdSeq); err != nil {
+					s.Warnf("MQTT orphaned QoS 2 sweep: unable to purge the orphaned hold on %q: %v", n.hold, err)
+					return mqttQoS2SweepDeferred
+				}
+				// purgeQoS2Hold is already a confirmed purge; re-reading is defensive
+				// depth, because this is the step that licenses removing the fence.
+				if after, _, aerr := as.loadQoS2Record(n.hold); aerr != nil || after != nil {
+					return mqttQoS2SweepDeferred
+				}
 			}
 		}
 		// Only now, and only if nothing replaced the claim we reasoned about.
@@ -1728,6 +1797,16 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, candidat
 			continue
 		}
 		if !q.observedOrphanFor(mqttQuarantineInflightKey(n.subject), mqttQuarantineSeqFP(cand.seq), grace) {
+			continue
+		}
+		// THE RETIREMENT PROOF (F-036 site 3). This arm is reached because no record and
+		// no local resident names the register's generation — which does not distinguish
+		// a session that ended from one live on ANOTHER broker whose record is absent,
+		// and such a session still holds this identifier and its Receive Maximum slot.
+		// Deleting the register there restores it, on a crash, as an ordinary live
+		// delivery for an exchange that has moved on. So a matching retirement watermark
+		// is required and the register is otherwise RETAINED. See orphan_retire_proof.go.
+		if as.retirementProvenFor(n.idHash, n.gen) != mqttRetireProven {
 			continue
 		}
 		if *budget <= 0 {
@@ -2372,6 +2451,43 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 		candidates = append(candidates, pubRelCand{durable: ci.Name, idHash: idHash, gen: gen, created: ci.Created})
 	}
 
+	// The ROTATING BOUND, keyed by the durable NAME rather than by a slice index.
+	//
+	// A numeric cursor modulo the current length was the first attempt and it is wrong
+	// under CHURN: insertions and deletions before the index shift every candidate's
+	// identity, so a sustained arrival and departure rate can keep one candidate outside
+	// every selected window forever — a starvation that turns a bounded-cost fix into a
+	// second leak. A name is stable across both, so "start strictly after the last name
+	// processed" means the same thing whatever happened to the set in between.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].durable < candidates[j].durable })
+	total := len(candidates)
+	if total > mqttPubRelRevalidateBudget {
+		as.mu.Lock()
+		after := as.pubRelSweepAfter
+		as.mu.Unlock()
+		// Strictly after the last processed name, wrapping ONCE to the start — so a
+		// cursor naming a candidate that has since gone simply resumes at the next
+		// surviving name rather than restarting the rotation.
+		start := sort.Search(total, func(i int) bool { return candidates[i].durable > after })
+		if start >= total {
+			start = 0
+		}
+		selected := make([]pubRelCand, 0, mqttPubRelRevalidateBudget)
+		for i := 0; i < mqttPubRelRevalidateBudget; i++ {
+			selected = append(selected, candidates[(start+i)%total])
+		}
+		as.mu.Lock()
+		as.pubRelSweepAfter = selected[len(selected)-1].durable
+		as.mu.Unlock()
+		candidates = selected
+		s.Debugf("MQTT orphaned QoS 2 sweep: revalidating %d of %d aged PUBREL consumer candidate(s) this pass",
+			len(candidates), total)
+	}
+	// The pass-scoped NEGATIVE memo. Many retained candidates share a client, and within
+	// one pass an unproven answer cannot change; across passes it must be re-read, which
+	// is exactly the scope this has. See orphan_retire_proof.go.
+	proofPass := newRetireProofPass()
+
 	for _, cand := range candidates {
 		// (1) A final AUTHORITATIVE record re-read. A record saved after the reference
 		// walk names this durable and has not been validated by that walk, and a
@@ -2417,7 +2533,21 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 			continue
 		}
 
-		// (3) Only now.
+		// (3) THE RETIREMENT PROOF (F-036 site 3), and it goes here rather than beside
+		// the two refs.hasInbound arms because this class is keyed differently: it is
+		// attributed by parsing its own durable name and gated by refs.pubRelDurables
+		// plus the record re-read above, so the generation to prove only exists after
+		// that parse. Both of the states this arm can reach — no record at all, and a
+		// record naming a DIFFERENT generation — establish that ownership MOVED, which
+		// F-036 is precisely the finding that ownership moving does not stop the
+		// previous owner serving. Deleting an interest-retained PUBREL durable drops
+		// every PUBREL it holds, so a matching retirement watermark is required and the
+		// consumer is otherwise RETAINED with its copies. See orphan_retire_proof.go.
+		if as.retirementProvenForInPass(proofPass, cand.idHash, cand.gen) != mqttRetireProven {
+			continue
+		}
+
+		// (4) Only now.
 		if _, derr := as.jsa.deleteConsumer(mqttOutStreamName, cand.durable, false); isErrorOtherThan(derr, JSConsumerNotFoundErr) {
 			s.Warnf("MQTT orphaned QoS 2 sweep: unable to delete orphaned PUBREL consumer %q: %v", cand.durable, derr)
 			continue

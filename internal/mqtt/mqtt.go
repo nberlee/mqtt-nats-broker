@@ -1457,6 +1457,23 @@ type mqttAccountSessionManager struct {
 	// pass looks at. Guarded by mu. See orphan_qos2_sweep.go.
 	qos2SweepCursor uint64
 	qos2SweepSeeded bool
+	// retirementMemo is the orphan sweep's POSITIVE-ONLY memo of proven retirements
+	// (F-036 unit 2): client-ID hash -> the one generation a valid watermark was
+	// observed naming. It holds one generation per client because the durable
+	// watermark does; remembering more would claim a history the single slot never
+	// had. Only the monotone matching-generation observation is admitted — losing it
+	// costs a cleanup opportunity, never a licence — while absent,
+	// different-generation, corrupt and indeterminate are never remembered, because
+	// each can be invalidated by a retirement landing afterwards. Guarded by mu. See
+	// retirementProvenFor.
+	retirementMemo map[string]string
+	// pubRelSweepAfter rotates the orphan sweep's bounded PUBREL revalidation across
+	// passes: it is the last durable NAME a pass processed, and the next pass starts
+	// strictly after it. A NAME rather than an index deliberately — an index modulo the
+	// current length is shifted by every insertion and deletion before it, so under
+	// sustained churn a candidate can stay outside every selected window forever.
+	// Scheduling state only. Guarded by mu.
+	pubRelSweepAfter string
 
 	// inflightSweepCursor / inflightSweepSeeded are the same scheduling state for the
 	// $MQTT_inflight walk. Separate from the inbound pair because the two streams have
@@ -1688,6 +1705,20 @@ type mqttSession struct {
 	// against a retired tracker are refused, which is what stops a displaced
 	// route serving under a re-minted generation.
 	leases *mqttIncarnationTracker
+	// retiredGenProven memoizes the ONE retirement observation that is monotone
+	// (F-036 unit 2): a valid watermark naming this session's own generation. Once a
+	// generation is retired it never becomes rightful again, and the single-slot
+	// watermark can lose the fact's DISCOVERABILITY but not the fact — so remembering
+	// it costs a release nothing and survives the slot being replaced.
+	//
+	// It is keyed BY the generation rather than merely set, which is what makes a
+	// re-mint invalidate it without setIncarnationLocked having to clear anything: a
+	// fresh generation simply does not match. The three NEGATIVE outcomes are never
+	// remembered, because each can be invalidated by a retirement landing afterwards
+	// and a finite window never arbitrates ownership.
+	//
+	// Guarded by mu. See classifyQoS2ReleaseAgainstRetirement.
+	retiredGenProven string
 	// asm is the account session manager this session belongs to. Needed by the
 	// shared QoS 2 affinity protocol, whose durable state (the assignment claims)
 	// is account-scoped and reached through instance-scoped helpers, from paths
@@ -16911,6 +16942,51 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		sendPubComp = false
 		c.Errorf("Unable to verify the QoS2 hold record for packet identifier %v before release: %v", pi, verr)
 		return verr
+	}
+
+	// W: the retirement classifier — F-036 unit 2, and the last fence before the
+	// irreversible act. Neither the claim nor fence 2 can see the two populations it
+	// answers for: a hold a discard's one-shot enumeration never named, and one its
+	// F-062 cutoff SPARED above its own watermark. For both of those the session was
+	// durably discarded and this broker was never told, so without this the release
+	// fans an acknowledged payload out for a session that no longer exists and answers
+	// the client 0x00.
+	//
+	// It sits AFTER the proof so it classifies only the hold just re-proved at its own
+	// sequence, and BEFORE the store because the fan-out inside the store cannot be
+	// taken back. See qos2_retire_classify.go for the two-dimensional classification,
+	// the identity term the packet lease supplies, and why taking the record fence here
+	// cannot deadlock against a local discard.
+	if sess := c.mqtt.sess; sess != nil {
+		switch verdict, werr := sess.classifyQoS2ReleaseAgainstRetirement(asm); verdict {
+		case mqttQoS2RetireProceed:
+		case mqttQoS2RetireRetired:
+			// The session this hold belongs to was durably discarded elsewhere. Deliver
+			// nothing, and release the hold NONTERMINALLY before answering — the same
+			// invariant-3 ordering the discarded-claim arm above uses, and for the same
+			// reason: PUBCOMP frees the packet identifier, so an unconfirmed cleanup
+			// would let the client's next PUBLISH on it be matched against a surviving
+			// record and silently lost.
+			//
+			// The CLAIM stays until that release is CONFIRMED, and only then may it be
+			// reaped at the exact sequence we hold. Reaping it first would empty the
+			// claim subject while the payload is still verifiably held, which is what
+			// lets a paused releaser win a fresh claim and re-read this hold as Held.
+			if rerr := releaseNonterminal(seq, "retired"); rerr != nil {
+				return rerr
+			}
+			asm.reapQoS2RelClaim(claimSeq)
+			reason = mqttReasonPacketIDNotFound
+			reasonStr = "no message found for the packet identifier"
+			return nil
+		default: // mqttQoS2RetireUnresolved
+			// The question could not be decided, and no verdict is not permission. The
+			// exchange is unfinished: keep the hold AND the claim, and suppress the
+			// PUBCOMP so the client retries.
+			sendPubComp = false
+			c.Errorf("Unable to classify the QoS2 release for packet identifier %v against the retirement watermark: %v", pi, werr)
+			return werr
+		}
 	}
 
 	// S: the onward store, carrying a Nats-Msg-Id derived from the immutable

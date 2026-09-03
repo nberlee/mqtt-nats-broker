@@ -2028,6 +2028,27 @@ func (as *mqttAccountSessionManager) reconcileResidentRecordState(s *Server) {
 			continue
 		}
 		if rejected {
+			// A BOUND armed session is the one shape settleRejectionFromSweep cannot
+			// converge: its gate claim is unbound-only, so it is refused for as long as
+			// the client stays attached — and a Keep Alive 0 client that goes silent
+			// never sends the packet that would drive the pre-dispatch settlement
+			// either. F-036 site 1.
+			//
+			// It goes to the OWNERSHIP backstop instead, which re-reads the record and,
+			// for a GONE one, retries the licensed retirement. That retry is what makes
+			// the route converge rather than fire once: every refusal before the detach
+			// leaves the incumbent bound and the marker armed, and without this arm the
+			// FIRST refusal would be final, because from then on this branch owns the
+			// session and the backstop below is unreachable.
+			//
+			// Deliberately not the unbound settlement as well: a bound session's probe
+			// is what that function's own test pins at ZERO save attempts, because the
+			// probe's gate claim would fail a concurrent SUBSCRIBE's and close a
+			// connection this broker should keep.
+			if owner != nil {
+				as.reconcileResidentOwnership(s, sess)
+				continue
+			}
 			as.settleRejectionFromSweep(s, sess)
 			continue
 		}
@@ -2128,6 +2149,14 @@ func (as *mqttAccountSessionManager) reconcileResidentOwnership(s *Server, sess 
 			sess.markWriteRejectedLocked(ourSeq)
 		}
 		sess.mu.Unlock()
+		// And then CONSUME it for a bound session, which the settlement cannot: its
+		// bound half runs pre-dispatch on the connection's own readLoop and its unbound
+		// half claims the gate as nobody, so a Keep Alive 0 client that goes silent
+		// drives neither and strands. F-036 site 1. The retirement is licensed by this
+		// absence PLUS a valid watermark whose marker landed past our own record, never
+		// by the absence alone, and it refuses rather than disposing under a live owner.
+		// An unbound session is left to settleRejectionFromSweep exactly as before.
+		as.retireGoneBoundSession(s, sess, ourSeq)
 		return
 	}
 	if smsg.Sequence <= ourSeq {

@@ -229,13 +229,20 @@ identities.
   F-032's and F-033's audits this one found a REACHABLE defect, and its remedy is identity
   conditioning plus bounded destruction. Produced F-067 and F-068, and routed its
   live-owner
-  residue to F-036 as that finding's fourth manifestation.
+  residue to F-036 as that finding's fourth manifestation — which F-036's 2026-09-03
+  closure did NOT absorb, because it is affine state and the retirement licence names the
+  SESSION generation; it is owned by ROADMAP chapter P.
   Details: [F-034](ha-arbitration.md#f-034).
 - Bound every server-initiated courtesy DISCONNECT write.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-035](runtime-correctness.md#f-035).
 - Revalidate ownership for otherwise quiet resident sessions.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed 2026-09-03, in two units — the incarnation completion lease, then the
+  retirement classifier with the licensed bound retirement and the sweep's proof gate.
+  Release treatment: was an alpha blocker. Two residuals stated in CONFORMANCE.md (the
+  no-licence half of the deleted-record shape, and an unbounded retention leak); the
+  affine manifestation is accumulated under ROADMAP chapter P rather than under this
+  finding.
   Details: [F-036](ha-arbitration.md#f-036).
 - Make a rejected finite disconnect stamp crash-safe.
   Status: Open. Release treatment: Alpha blocker.

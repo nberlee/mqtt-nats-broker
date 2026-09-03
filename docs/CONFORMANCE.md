@@ -501,6 +501,68 @@ weaken the ordering assertion that caught it.
 parked defect is closed. A failure is accumulated under ROADMAP chapter P and does not
 invalidate the supported-alpha conformance result.
 
+### Orphan reconciliation retains session-generation state without retirement proof
+
+**F-036 unit 2.** Every orphan-sweep arm that can still destroy live session-generation
+state now requires a valid retirement watermark whose generation EQUALS the candidate's,
+and without that proof it RETAINS. The reason is that the pass's own evidence cannot
+support the destruction: a complete `$MQTT_sess` walk plus this broker's residents
+establishes that nothing THIS BROKER can see names the generation, which a session live on
+ANOTHER broker with no record satisfies equally — and a resume preserves the generation, so
+such a session still uses those exact names. Destroying its state is payload LOSS.
+
+**Three resource classes are retained where no matching retirement is observable:**
+
+- a NONTERMINAL inbound QoS 2 hold on `$MQTT_qos2in`, carrying a full application payload,
+  together with the `discarded` fence that is not written for it;
+- an absent-generation in-flight register on `$MQTT_inflight`;
+- a `$MQTT_PUBREL_*` consumer on `$MQTT_out`, with every interest-retained PUBREL it
+  holds.
+
+**The retention is PERMANENT and UNBOUNDED, and it is not conditioned on a rollout.** The
+watermark is a single slot per client, so once a later retirement replaces it the earlier
+generation can never again be proven retired: retire G1, then create and retire G2, and
+G1's state is unreclaimable for the life of the store. A restart, or eviction from the
+bounded positive-only memo, has the same effect for a generation whose watermark was
+observed but is no longer discoverable. A **valid watermark naming a DIFFERENT generation
+authorizes nothing**, which is the ordinary steady state for any client torn down more
+than once.
+
+**Cleanup that does NOT need the proof still runs**, so this is not a blanket retain: once
+the payload is authoritatively absent, an unchanged exact-sequence release claim is
+deleted, and a terminal tombstone is reaped (confirmed delete, then an authoritative
+absence read, then the claim). Neither can destroy a payload, and neither eliminates the
+pre-existing post-proof paused-releaser residual recorded elsewhere in this document.
+
+**One arm is deliberately UNGATED and out of scope**: `discardAbsentWinnerClaim`, which
+commits `Discarded` for an affine winner whose record is absent. It is affine assignment
+mutation, and F-036's supported-scope ruling of 2026-09-02 accumulates affine-only
+regressions under ROADMAP chapter P rather than widening this finding. The census of gated
+arms is today's enumeration and is **not** claimed to stay complete: the structural
+inventory guard that would have claimed that was designed, reviewed three times and
+deleted, because a primitive-only AST inventory cannot catch a new unsafe CALLER of an
+already-inventoried destructive helper.
+
+**The retained population also costs recurring WORK, and only part of that is bounded.**
+The per-candidate revalidation round trips are bounded per pass, by a budget with a cursor
+keyed by the durable name — a rotation, so a persistent candidate is still eventually
+visited under a finite or serviceable churn rate. What is NOT bounded is the discovery
+around it: the consumer listing, the candidate collection and the sort all still grow with
+the `$MQTT_out` population. That is this sweep's pre-existing shape rather than something
+this change introduced — `consumerList` already walks the whole population, the affine
+leak accepted below included — and paging that shared enumeration is filed as its own
+roadmap item. Fairness against an arrival rate that permanently exceeds the budget is also
+not claimed.
+
+**Why this is accepted.** A leak is preferred to a loss, which is the same trade course E
+took below. No bounded variant exists from the facts available: a dead generation with an
+absent record and a live remote generation with an absent record are observationally
+identical to this pass, and waiting longer does not distinguish them. An exact bound would
+need permanent per-generation retirement history — trading unbounded payload retention for
+unbounded retirement metadata — or a distributed liveness lease with a substantially
+larger failure and partition model. No stream gains a `MaxAge` or a message limit for
+this, because their bound is implemented by deleting the acknowledged payload.
+
 ### The orphan sweep no longer reclaims an affine consumer by absence, and the leak is accepted
 
 **F-036 course E.** `deleteOrphanQ2AffConsumers` was removed outright, so the sweep's
@@ -563,9 +625,11 @@ now logs that the consumer is retained and must be removed by hand.
 
 **Why this is accepted.** The alternative is an unclosed destruction path for
 acknowledged messages, which also manufactured F-064's claim-without-copy precondition.
-A leak is preferred to a loss. F-036 itself **remains an open alpha blocker** — see
-"A retirement refuses rather than disposing under a live owner" below for what unit 1
-closed and what it deliberately did not.
+A leak is preferred to a loss, and F-036 has since taken the same trade for the general
+session classes — see "Orphan reconciliation retains session-generation state without
+retirement proof" above. **F-036 itself is CLOSED** (unit 1 on 2026-09-02, unit 2 on
+2026-09-03); "A retirement refuses rather than disposing under a live owner" below states
+what each unit closed and the residuals they left.
 
 ### A retirement refuses rather than disposing under a live owner
 
@@ -577,8 +641,27 @@ subject under the re-minted generation and answered a success-shaped PUBCOMP for
 payload the same teardown destroyed. The generation is now re-minted only under a
 permit proving no client is bound and the incarnation's owners have drained.
 
-**F-036 stays open**: the two-dimensional PUBREL classifier and sites 1 and 3 are
-unit 2, which the lease identity is the prerequisite for.
+**Unit 2 has since landed**, closing the two-dimensional PUBREL classifier and sites 1
+and 3 on the lease identity unit 1 supplied, so **F-036 is CLOSED**. It introduces exactly
+THREE new residuals: the no-licence half of the deleted-record shape (in the
+deleted-record bullet below), the orphan-reconciliation retention leak with its unbounded
+discovery cost (its own section above), and the **take-to-durable-handoff window** on the
+licensed retirement's Will — an abnormal exit after `mqttTakeWillLocked` has consumed the
+Will but before it is published or durably enqueued loses it. That third one is deliberate
+rather than overlooked: the Will backstop on that route recovers an exit BEFORE the take
+and is a harmless no-op after it, and closing the remainder would need a
+claimed/completed handoff with a stable outbox identity, refused as disproportionate for a
+window no comparable route survives either — `reparkRefusedDiscard` already documents that
+a crash there drops a parked Will, and the eviction worker's guard accepts trigger loss.
+Production has no post-take abnormal-exit source on this route, and a real uncaught panic
+ends the process. "Three" counts what unit 2 ADDS, not the total: several PRE-EXISTING
+residuals in the same area are
+unchanged by it and are deliberately not absorbed into it, the most important being the
+**post-proof paused-releaser** residual on the inbound QoS 2 release path. That one is
+narrowed but NOT eliminated: the classifier catches every retirement already durable when
+it runs, so what survives is the suffix after it — a releaser that has passed the
+classifier and then pauses can still fan out while a peer completes and reaps the same
+exchange. It is stated where it arises, and unit 2 makes no claim on it.
 
 Three stated consequences of the mechanism:
 
@@ -876,8 +959,10 @@ carry no guaranteed order, because the record rather than the log is the authori
   `recordGenRetirement` advances on `MarkerSeq` alone, so a teardown of one generation can
   run while the slot names another; the verifying read is not crash-persistent; and the
   arm it would take does not clear an existing `Lost` anyway. Three candidate closures
-  remain, each its own piece of work: completing F-036's stale-serving predicate for the
-  retiring session generation, after which the existing scan-before-delete suffices; a
+  remain, each its own piece of work: a stale-serving predicate for the retiring AFFINE
+  generation — which F-036's closure does NOT supply, since its licence names the SESSION
+  generation and the affine one outlives incarnations — after which the existing
+  scan-before-delete suffices; a
   retention handoff that keeps proof records independent of the consumer; or a claim-side
   "PUBREL owed" intent with register-driven recovery.
 - **A teardown carrying a MALFORMED carrier still loses it.** Session teardown now
@@ -1757,12 +1842,24 @@ What it does NOT do:
     next manager start;
   - the MOVED-record and lost-observation subcase is closed outright, not "once a
     rollout completes". Every broker is built from this tree (see the Compatibility
-    boundary), so there is no older path to be asymmetric with. It does **not** close
-    F-036, which stays open for the bound deleted-record case below;
+    boundary), so there is no older path to be asymmetric with. It did **not** by itself
+    close F-036's bound deleted-record case, which unit 2 has since split — see the next
+    bullet;
   - a record that was **deleted** rather than moved is handed to the ownership marker,
-    which converges an UNBOUND session; its bound outcome is **0x89 "ownership
-    unsettled"** when it converges at all (see the next bullet, which is why F-036 stays
-    open). Absence is a real ownership fact — only a party that claimed the record at our
+    which converges an UNBOUND session. **Its BOUND outcome is now split by F-036 unit 2,
+    and only one half converges.** Where a valid retirement watermark's `mseq` exceeds the
+    sequence this broker is acknowledged for, that watermark plus the record's absence
+    plus a full in-fence revalidation is a LICENCE, and the periodic pass retires the
+    bound session itself with no traffic from the client — reporting **0x89 "ownership
+    unsettled"**, never a takeover, since no record shape demonstrates a successor
+    (F-084). Where there is NO such licence — the watermark absent, unreadable,
+    indeterminate, or naming a marker at or below our own sequence — nothing converges: the
+    marker stays armed and a bound Keep Alive 0 client that never sends again may strand
+    for the life of the connection, until traffic drives the pre-dispatch settlement. That
+    remaining half is a **permanent stated residual**, not filed work: the licence is the
+    only positive evidence available, and absence alone is exactly the inference F-036's
+    site 3 exists to refuse. Absence is a real ownership fact — only a party that claimed
+    the record at our
     sequence can remove it — but it is **not a successor fact**, and F-084 corrected the
     claim accordingly: this text used to say the accompanying `0x8E` was "right either
     way" and only its Reason String imprecise, which had the defect backwards. No new
@@ -2735,8 +2832,10 @@ Residuals and hard requirements:
 - **A finish can outrun the survivor's own observation.** Whoever finishes the
   condemnation marker deletes the record, and a bound, silent Keep Alive 0 client on the
   survivor's broker that dropped the marker observation then faces an ABSENT record — the
-  F-036 shape, tracked as its own §0.2 blocker
-  (`docs/findings/ha-arbitration.md#f-036`), which this route is now listed under. The
+  F-036 shape, whose §0.2 item is now CLOSED
+  (`docs/findings/ha-arbitration.md#f-036`): unit 2's licensed retirement converges that
+  client where a valid watermark's `mseq` exceeds the survivor's own sequence, and leaves
+  it stranded where no such licence exists, which is the residual stated with it. The
   sweep defers its finish by a pass to narrow the case it owns; a CONNECT adoption
   finishes immediately by design.
 - **A whole-bundle reset loses every open fence**, along with everything else the nine
@@ -2750,7 +2849,9 @@ Residuals and hard requirements:
   session generation is absent from the sweep's evidence — the persisted records plus the
   sweeping broker's own residents, which is what "authoritatively absent" means here and
   which does **not** observe a session live on another broker whose record was removed
-  (F-036's open false-absence inference) — was previously referenced by nothing and
+  (F-036's false-absence inference, now GATED: since unit 2 this delete additionally
+  requires a valid retirement watermark naming the candidate generation, and retains the
+  consumer with its PUBRELs without one) — was previously referenced by nothing and
   accumulated forever; the orphan sweep now deletes it after a complete reference walk,
   a full stable-observation grace, a final authoritative record re-read and an
   instance re-lookup. The undelivered PUBRELs it was holding are dropped with it, which
@@ -2871,8 +2972,10 @@ deletion, a manual recreation, a partial restore, or a config mutation behind an
 initialized manager. The refusal is what a broker does when it next starts. Two
 neighbouring consequences of the same condition (a delivery
 after discard, and the orphan sweep condemning a live remote generation whose record is
-absent) belong to **F-036**, which is still an open alpha blocker; the cutoff widened the
-first of them, since a spared hold stays serviceable by that peer.
+absent) belonged to **F-036**, now CLOSED: unit 2's release classifier refuses the
+delivery for the first, and its retirement proof gate retains rather than condemns for the
+second. The cutoff had widened the first of them, since a spared hold stays serviceable by
+that peer — which is precisely the population the classifier answers.
 
 This is **not** "exactly-once across a nats-server restart", and should not be
 described that way.
@@ -2903,7 +3006,9 @@ The deviations that remain:
   claim is not followed by a delivery **of the exchange it enumerated**, and the finalizer
   can no longer read a purge's absence as proof the exchange completed. Two limits on that
   sentence: the enumeration is a one-shot snapshot, so a hold on a subject it never saw is
-  never competed for and CAN still be delivered after the discard (F-036); and the claim
+  never competed for, and was therefore deliverable after the discard until F-036 unit 2's
+  retirement classifier refused exactly that population (the watermark is recorded before
+  any teardown deletion, so it is observable there); and the claim
   subject is reused by successive exchanges, so exclusivity is per-occupancy rather than per
   identifier for all time. What makes that second limit harmless is not the claim but the
   fence a `discarded` marker records, which lets a later exchange prove the marker is not

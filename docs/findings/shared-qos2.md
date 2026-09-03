@@ -102,8 +102,11 @@ CANDIDATE-RECLAMATION route no longer deletes an affine consumer by absence** �
 E removed `deleteOrphanQ2AffConsumers` outright, because no positive fact could authorize
 a by-name delete of an interest-retained consumer. (Not "no affine consumer delete is
 reachable from the sweep": teardown-marker adoption still reaches `deleteTeardownTargets`,
-a pre-existing route that is not claimed race-free and is F-036's fourth manifestation.) So
-what an unreadable claim now wedges is
+a pre-existing route that is not claimed race-free. It was F-036's fourth manifestation and
+was deliberately left OUTSIDE that finding's 2026-09-03 closure — the retirement licence
+names the SESSION generation while the affine one outlives incarnations, so no retirement
+proof can gate it — so it is owned by ROADMAP chapter P.) What an unreadable claim now
+wedges is
 `reconcileOrphanQ2AffClaims` and the sweep-driven reaps, not consumer deletion. The
 fail-closed reasoning and the account-wide scope are unchanged; only the resource class
 the refusal protects is smaller.
