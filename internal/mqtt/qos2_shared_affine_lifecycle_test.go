@@ -7045,7 +7045,7 @@ func TestQ2AffRetiredAffineSourceDischargesItsOwnIncarnation(t *testing.T) {
 		const jsDur, copySeq = "$MQTT_Q2AFF_retiredrepl", uint64(42)
 		regNonce := mqttNewInflightNonce()
 		regSubject := mqttInflightSubject(idHash, sessGen, 8)
-		regSeq, rerr := b.asm.jsa.storeInflightCAS(regSubject, 0, &mqttInflightRecord{
+		regSeq, rerr := b.asm.jsa.storeInflightCAS(regSubject, 0, &mqttInflightRecord{State: mqttInflightPublish,
 			PI: 8, Dur: jsDur, Seq: copySeq, QoS: 2, Nonce: regNonce,
 			Q2AffClaim: subject, Q2AffCopy: cl.CopySubject, Retired: true,
 		})
@@ -7445,7 +7445,7 @@ func TestQ2AffRegisterWithoutAnIncarnationIsRefused(t *testing.T) {
 	idHash, affGen := getHash("regincarn"), mqttNewQ2AffGen()
 	claimHash := mqttQ2AffClaimHash(groupDur, 11)
 	base := func() *mqttInflightRecord {
-		return &mqttInflightRecord{
+		return &mqttInflightRecord{State: mqttInflightPublish,
 			PI: 3, Dur: groupDur, Seq: 11, QoS: 2,
 			Nonce: mqttNewInflightNonce(),
 		}
@@ -8432,7 +8432,7 @@ func TestQ2AffUnprovenRegisterPoisonsItsSibling(t *testing.T) {
 	sessGen := st.sess.gen
 	st.sess.mu.Unlock()
 	siblingSubject := mqttInflightSubject(st.idHash, sessGen, siblingPI)
-	if _, err := st.b.asm.jsa.storeInflightCAS(siblingSubject, 0, &mqttInflightRecord{
+	if _, err := st.b.asm.jsa.storeInflightCAS(siblingSubject, 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: siblingPI, Dur: st.jsDur, Seq: st.sseq, QoS: 2, Nonce: mqttNewInflightNonce(),
 		Q2AffClaim: st.claim, Q2AffCopy: st.copySubject,
 	}); err != nil {

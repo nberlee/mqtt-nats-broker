@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -80,7 +81,7 @@ func TestMQTTInflightSubjectParseRejects(t *testing.T) {
 func TestMQTTInflightRecordIdentity(t *testing.T) {
 	t.Parallel()
 	ok := func() *mqttInflightRecord {
-		return &mqttInflightRecord{PI: 7, Dur: "hash_nuid", Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce()}
+		return &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "hash_nuid", Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce()}
 	}
 	if !mqttInflightRecordIdentityOK(ok()) {
 		t.Fatalf("a complete record must be usable")
@@ -115,7 +116,7 @@ func TestMQTTInflightRecordIdentity(t *testing.T) {
 
 func TestMQTTInflightRecordCodec(t *testing.T) {
 	t.Parallel()
-	rec := &mqttInflightRecord{
+	rec := &mqttInflightRecord{State: mqttInflightPublish,
 		PI: 9, Dur: "hash_nuid", Seq: 1234, QoS: 1,
 		Nonce: mqttNewInflightNonce(), Claim: mqttNewInflightNonce(),
 		Q2AffClaim: "$MQTT.qos2.assign.G.7",
@@ -125,7 +126,7 @@ func TestMQTTInflightRecordCodec(t *testing.T) {
 	if !strings.Contains(hdr, JSExpectedLastSubjSeq+":0") {
 		t.Fatalf("header %q must carry a create-only expectation", hdr)
 	}
-	got := &mqttInflightRecord{}
+	got := &mqttInflightRecord{State: mqttInflightPublish}
 	if err := json.Unmarshal(msg[hdrLen:], got); err != nil {
 		t.Fatalf("unmarshal body: %v", err)
 	}
@@ -506,7 +507,7 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.last_pi = 41
 	e.sess.mu.Unlock()
-	foreign := &mqttInflightRecord{PI: 42, Dur: dur, Seq: 999, QoS: 2, Nonce: mqttNewInflightNonce()}
+	foreign := &mqttInflightRecord{State: mqttInflightPublish, PI: 42, Dur: dur, Seq: 999, QoS: 2, Nonce: mqttNewInflightNonce()}
 	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(e.sess.idHash, e.sess.gen, 42), 0, foreign); err != nil {
 		t.Fatalf("seed a foreign register: %v", err)
 	}
@@ -537,7 +538,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.last_pi = 10
 	e.sess.mu.Unlock()
-	stale := &mqttInflightRecord{PI: 11, Dur: dur, Seq: 7, QoS: 1, Nonce: mqttNewInflightNonce()}
+	stale := &mqttInflightRecord{State: mqttInflightPublish, PI: 11, Dur: dur, Seq: 7, QoS: 1, Nonce: mqttNewInflightNonce()}
 	staleSeq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(e.sess.idHash, e.sess.gen, 11), 0, stale)
 	if err != nil {
 		t.Fatalf("seed a stale register: %v", err)
@@ -620,7 +621,7 @@ func TestMQTTInflightTerminalDeletesRegister(t *testing.T) {
 	if removed == nil || removed.regSeq == 0 {
 		t.Fatalf("the removed entry must carry its register sequence: %+v", removed)
 	}
-	e.sess.deleteInflightRegisterFor(removed)
+	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 	e.waitRegisterCount(t, 0)
 }
 
@@ -830,7 +831,7 @@ func TestMQTTInflightRecoveryReservesPubRelIdentifiers(t *testing.T) {
 	// The PUBREL consumer has to exist first: $MQTT_out is interest-retained, so a
 	// store with no interest keeps nothing.
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, srcSeq, _EMPTY_, _EMPTY_, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, srcSeq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -893,7 +894,7 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -935,7 +936,7 @@ func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T)
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -978,8 +979,8 @@ func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	sseq := e.publishSource(t, dur)
-	older := &mqttInflightRecord{PI: 3, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
-	newer := &mqttInflightRecord{PI: 4, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
+	older := &mqttInflightRecord{State: mqttInflightPublish, PI: 3, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
+	newer := &mqttInflightRecord{State: mqttInflightPublish, PI: 4, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
 	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(e.sess.idHash, e.sess.gen, 3), 0, older); err != nil {
 		t.Fatalf("seed the older register: %v", err)
 	}
@@ -1086,7 +1087,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 
 	const pi = uint16(8)
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	msg, hdrLen := buildInflightRecord(0, &mqttInflightRecord{})
+	msg, hdrLen := buildInflightRecord(0, &mqttInflightRecord{State: mqttInflightPublish})
 	if _, err := e.asm.jsa.storeMsg(subject, hdrLen, msg); err != nil {
 		t.Fatalf("seed an unusable register: %v", err)
 	}
@@ -1629,7 +1630,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 	// Two registers, one source, different identifiers: a superseded broker wrote one.
 	for _, pi := range []uint16{3, 4} {
-		rec := &mqttInflightRecord{PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
+		rec := &mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
 		if _, err := e.asm.jsa.storeInflightCAS(
 			mqttInflightSubject(e.sess.idHash, e.sess.gen, pi), 0, rec); err != nil {
 			t.Fatalf("seed register %d: %v", pi, err)
@@ -2313,7 +2314,7 @@ func TestMQTTInflightStoreReapsCancelledOccupant(t *testing.T) {
 	e.sess.last_pi = pi - 1 // hand the same identifier to the delivery below
 	idHash, gen := e.sess.idHash, e.sess.gen
 	e.sess.mu.Unlock()
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: e.sess.idHash + "_" + nuid.Next(), Seq: 4, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Cancelled: true,
 	}); err != nil {
@@ -2387,7 +2388,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	// The CAS that was already on the wire LANDS, and the broker dies before its
 	// confirmation runs: nothing marks the register, and no obligation names its sequence.
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{
+	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: nonce,
 	}); err != nil {
 		t.Fatalf("land the in-flight register: %v", err)
@@ -2694,7 +2695,7 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	}
 
 	// The CAS that was in flight LANDS...
-	seq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{
+	seq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: 3200, QoS: 2, Nonce: nonce,
 	})
 	if err != nil {
@@ -3442,7 +3443,7 @@ func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
 	staleClaim := e.sess.regClaim
 	e.sess.mu.Unlock()
 	if _, err := e.asm.jsa.storeInflightCAS(
-		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, &mqttInflightRecord{
+		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, &mqttInflightRecord{State: mqttInflightPublish,
 			PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
 		}); err != nil {
 		t.Fatalf("seed the duplicate register: %v", err)
@@ -3535,7 +3536,7 @@ func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
 	staleClaim := e.sess.regClaim
 	e.sess.mu.Unlock()
 	if _, err := e.asm.jsa.storeInflightCAS(
-		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, &mqttInflightRecord{
+		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, &mqttInflightRecord{State: mqttInflightPublish,
 			PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
 		}); err != nil {
 		t.Fatalf("seed the duplicate register: %v", err)
@@ -3902,7 +3903,7 @@ func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
 
 	// The durable half releases: the delete aims at the moved-away sequence and the
 	// source ack completes the exchange.
-	e.sess.deleteInflightRegisterFor(removed)
+	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 	if err := e.asm.jsa.deleteMsg(mqttStreamName, sseq, true); err != nil {
 		t.Fatalf("complete the source: %v", err)
 	}
@@ -4007,7 +4008,7 @@ func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
 		t.Fatal("an unverifiable fence must not install a reservation either")
 	}
 
-	e.sess.deleteInflightRegisterFor(removed)
+	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 	e.waitRegisterCount(t, 0)
 }
 
@@ -4031,7 +4032,7 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 	pi2 := pi1 + 1
 	// The sibling was written elsewhere and carries that writer's claim.
 	subj2 := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2)
-	if _, err := e.asm.jsa.storeInflightCAS(subj2, 0, &mqttInflightRecord{
+	if _, err := e.asm.jsa.storeInflightCAS(subj2, 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: "written-elsewhere",
 	}); err != nil {
 		t.Fatalf("seed the sibling register: %v", err)
@@ -4216,7 +4217,7 @@ func TestMQTTInflightClaimLostMemberSurvivesTerminalAck(t *testing.T) {
 	e.sess.mu.Lock()
 	removed := e.sess.untrackPublishEntry(pi)
 	e.sess.mu.Unlock()
-	e.sess.deleteInflightRegisterFor(removed)
+	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 
 	// The record this object does not own stands (unreadable, fail-closed).
 	e.waitRegisterCount(t, 1)
@@ -4791,7 +4792,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	}
 
 	// The late CAS lands...
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: 4300, QoS: 2, Nonce: nonce,
 	}); err != nil {
 		t.Fatalf("land the late register: %v", err)
@@ -5003,7 +5004,7 @@ func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
 	if !e.sess.persistVoidedRegs(e.c) {
 		t.Fatalf("the verdict must be durable")
 	}
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: 4500, QoS: 1, Nonce: nonce, Cancelled: true,
 	}); err != nil {
 		t.Fatalf("land the tombstone: %v", err)
@@ -5105,7 +5106,7 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 	// Many registers over ONE durable, all naming live sources.
 	sseq := e.publishSource(t, dur)
 	for i := 0; i < registers; i++ {
-		rec := &mqttInflightRecord{
+		rec := &mqttInflightRecord{State: mqttInflightPublish,
 			PI: uint16(i + 1), Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce(),
 		}
 		if _, err := e.asm.jsa.storeInflightCAS(
@@ -5210,7 +5211,7 @@ func TestMQTTInflightSourceCacheUnreadableConsumerIsUnknown(t *testing.T) {
 	cache := e.asm.newInflightSourceCache()
 	cache.known["missing_durable"] = true // a lookup was attempted; it did not complete
 	cache.resolve([]*mqttInflightRecord{{Dur: "missing_durable", Seq: 1}})
-	if got := cache.state(&mqttInflightRecord{Dur: "missing_durable", Seq: 1}); got != mqttInflightSourceUnknown {
+	if got := cache.state(&mqttInflightRecord{State: mqttInflightPublish, Dur: "missing_durable", Seq: 1}); got != mqttInflightSourceUnknown {
 		t.Fatalf("a source whose consumer lookup did not complete must be unknown, never complete or lost, got %v", got)
 	}
 }
@@ -5225,7 +5226,7 @@ func TestMQTTInflightSourceCacheAbsentConsumerIsLost(t *testing.T) {
 	cache.known["absent_durable"] = true
 	cache.resolved["absent_durable"] = true // the lookup completed and reported not-found
 	cache.resolve([]*mqttInflightRecord{{Dur: "absent_durable", Seq: 1}})
-	if got := cache.state(&mqttInflightRecord{Dur: "absent_durable", Seq: 1}); got != mqttInflightSourceLost {
+	if got := cache.state(&mqttInflightRecord{State: mqttInflightPublish, Dur: "absent_durable", Seq: 1}); got != mqttInflightSourceLost {
 		t.Fatalf("a source whose consumer is authoritatively absent must be lost, got %v", got)
 	}
 }
@@ -5276,7 +5277,7 @@ func TestMQTTInflightSourceCacheAppliesTheLookupContract(t *testing.T) {
 			cache.applyConsumerLookup(tc.dur, info, settled)
 
 			cache.resolve([]*mqttInflightRecord{{Dur: tc.dur, Seq: 1}})
-			if got := cache.state(&mqttInflightRecord{Dur: tc.dur, Seq: 1}); got != tc.want {
+			if got := cache.state(&mqttInflightRecord{State: mqttInflightPublish, Dur: tc.dur, Seq: 1}); got != tc.want {
 				t.Fatalf("state = %v, want %v: %s", got, tc.want, tc.why)
 			}
 		})
@@ -5318,7 +5319,7 @@ func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
 
 	// A stored PUBREL for the same source, so the exchange is past PUBREC.
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -5444,7 +5445,7 @@ func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
 
 	// Ten registers, ten DISTINCT sources, one durable.
 	for i := 0; i < 10; i++ {
-		rec := &mqttInflightRecord{
+		rec := &mqttInflightRecord{State: mqttInflightPublish,
 			PI: uint16(i + 1), Dur: dur, Seq: sseq + uint64(i), QoS: 1, Nonce: mqttNewInflightNonce(),
 		}
 		if _, err := e.asm.jsa.storeInflightCAS(
@@ -5457,7 +5458,7 @@ func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
 	cache := e.asm.newInflightSourceCache()
 	recs := make([]*mqttInflightRecord, 0, 10)
 	for i := 0; i < 10; i++ {
-		recs = append(recs, &mqttInflightRecord{Dur: dur, Seq: sseq + uint64(i)})
+		recs = append(recs, &mqttInflightRecord{State: mqttInflightPublish, Dur: dur, Seq: sseq + uint64(i)})
 	}
 	cache.resolve(recs)
 
@@ -5469,14 +5470,14 @@ func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
 	}
 	// The first source exists; the rest do not, and with the consumer present that
 	// absence proves them acknowledged.
-	if got := cache.state(&mqttInflightRecord{Dur: dur, Seq: sseq}); got != mqttInflightSourceLive {
+	if got := cache.state(&mqttInflightRecord{State: mqttInflightPublish, Dur: dur, Seq: sseq}); got != mqttInflightSourceLive {
 		t.Fatalf("the stored source classified as %v, want live", got)
 	}
-	if got := cache.state(&mqttInflightRecord{Dur: dur, Seq: sseq + 5}); got != mqttInflightSourceComplete {
+	if got := cache.state(&mqttInflightRecord{State: mqttInflightPublish, Dur: dur, Seq: sseq + 5}); got != mqttInflightSourceComplete {
 		t.Fatalf("an absent source with a live consumer classified as %v, want complete", got)
 	}
 	// An unknown durable is Unknown, never Complete.
-	if got := cache.state(&mqttInflightRecord{Dur: "never_looked_up", Seq: 1}); got != mqttInflightSourceUnknown {
+	if got := cache.state(&mqttInflightRecord{State: mqttInflightPublish, Dur: "never_looked_up", Seq: 1}); got != mqttInflightSourceUnknown {
 		t.Fatalf("an unresolved source classified as %v, want unknown", got)
 	}
 }
@@ -5527,7 +5528,7 @@ func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, u
 	t.Helper()
 	orphanHash, orphanGen := getHash("client-departed"), mqttNewSessGen()
 	subject := mqttInflightSubject(orphanHash, orphanGen, pi)
-	rec := &mqttInflightRecord{
+	rec := &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
 	}
 	// The RECLAMATION LICENCE (F-036 unit 2), planted BEFORE the register exists. A
@@ -5561,7 +5562,7 @@ func (e *testInflightEnv) seedOrphanRegisterWithoutLicence(t *testing.T, pi uint
 	t.Helper()
 	orphanHash, orphanGen := getHash("client-live-remote"), mqttNewSessGen()
 	subject := mqttInflightSubject(orphanHash, orphanGen, pi)
-	rec := &mqttInflightRecord{
+	rec := &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
 	}
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, rec); err != nil {
@@ -5695,5 +5696,420 @@ func TestMQTTInflightOrphanSweepSparesLiveIncarnation(t *testing.T) {
 	q.mu.Unlock()
 	if held {
 		t.Fatalf("a referenced register must not hold a quarantine slot")
+	}
+}
+
+// TestMQTTInflightRecoveryQuarantinesIllegalPublishShapes is the read side of the ONE
+// legal-shape matrix, and it exists because a holistic round found the read side checking
+// the STATE alone.
+//
+// Every illegal `publish` shape the matrix names — a half-written action, a half-written
+// PUBREL identity, half an affine pair, a QoS 1 record carrying QoS 2 fields — passed the
+// identity check, satisfied `State == publish`, and went into source classification. There a
+// partial affine pair becomes an ordinary exchange and loses its completion obligation, and
+// a record whose phase fields disagree can license a payload retransmission from state the
+// schema declares uninterpretable.
+//
+// The write boundary refuses all of these, so a record with one of these shapes came from
+// somewhere else — which is exactly what the quarantine is for: the identifier is reserved
+// and NOTHING is derived from the body. A quarantine is distinguishable from a legal
+// restore by the source: a restored register names its `(durable, sequence)` and a
+// quarantined one names nothing.
+//
+// TWO kinds of row, and the second kind is why this test survived the deletion of five
+// fields. A row is either a typed mutation of a field the record still HAS, or an extra
+// JSON key the record does not have at all. The five deleted tags moved to the second
+// kind: their refusal no longer comes from a typed field declared in order to reject
+// itself, it comes from the schema being CLOSED — which also covers the keys nobody
+// predicted, and that is the property the five fields could not deliver.
+//
+// The legal control row is not decoration. Without it every assertion below would still
+// pass against a recovery that quarantined the whole stream.
+func TestMQTTInflightRecoveryQuarantinesIllegalPublishShapes(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-shapes")
+
+	rows := []struct {
+		name  string
+		legal bool
+		// mut mutates a field the record still has; extra injects a key it does not.
+		// Exactly one of the two per row.
+		mut   func(r *mqttInflightRecord)
+		extra string
+	}{
+		{name: "the legal control", legal: true, mut: func(*mqttInflightRecord) {}},
+		{name: "a claim sequence with no claimant", mut: func(r *mqttInflightRecord) {
+			r.ClaimSeq = 9
+		}},
+		{name: "absent state", mut: func(r *mqttInflightRecord) { r.State = _EMPTY_ }},
+		{name: "a deleted PUBREL state name", mut: func(r *mqttInflightRecord) {
+			r.State = "pubrel_ready"
+		}},
+		{name: "half an affine reference", mut: func(r *mqttInflightRecord) {
+			r.Q2AffClaim = "$MQTT.q2affclaim.h.1.c"
+		}},
+		{name: "the other half of an affine reference", mut: func(r *mqttInflightRecord) {
+			r.Q2AffCopy = "$MQTT.q2aff.h.1.c.1"
+		}},
+		{name: "QoS 1 carrying an affine reference", mut: func(r *mqttInflightRecord) {
+			r.QoS = 1
+			r.Q2AffClaim, r.Q2AffCopy = "$MQTT.q2affclaim.h.1.c", "$MQTT.q2aff.h.1.c.1"
+		}},
+		{name: "QoS 1 marked retired", mut: func(r *mqttInflightRecord) {
+			r.QoS = 1
+			r.Retired = true
+		}},
+		{name: "a QoS that is neither 1 nor 2", mut: func(r *mqttInflightRecord) {
+			r.QoS = 3
+		}},
+		// The five deleted tags, now unknown keys.
+		{name: "the action token's tag", extra: `"action":"AAAAAAAAAAAAAAAAAAAAAA"`},
+		{name: "the action claimant's tag", extra: `"action_claim":"someclaim"`},
+		{name: "the action claim sequence's tag", extra: `"action_claimseq":4`},
+		{name: "the canonical PUBREL durable's tag", extra: `"pubrel_dur":"$MQTT_out_dur"`},
+		{name: "the canonical PUBREL sequence's tag", extra: `"pubrel_seq":12`},
+		// And the rows the five-field approach could never have covered.
+		{name: "a control field nobody predicted", extra: `"admission_epoch":4`},
+		{name: "a plausible future phase field", extra: `"phase":"pubrel_ready"`},
+	}
+
+	// EVERY row gets its OWN live source, and that is not tidiness. Sharing one
+	// `(durable, sequence)` across the rows made them duplicates of each other, and the
+	// duplicate-source rule fails closed by deriving no source at all — so the "an illegal
+	// shape derives NO source" assertion below would have been satisfied by the duplicate
+	// rule rather than by the quarantine, and passed against a recovery with no matrix
+	// check in it. The mutation that removes the check is what surfaced this.
+	pis := make(map[string]uint16, len(rows))
+	srcs := make(map[string]struct {
+		dur  string
+		sseq uint64
+	}, len(rows))
+	for i, row := range rows {
+		pi := uint16(100 + i)
+		pis[row.name] = pi
+		dur := e.sess.idHash + "_" + nuid.Next()
+		sseq := e.publishSource(t, dur)
+		srcs[row.name] = struct {
+			dur  string
+			sseq uint64
+		}{dur, sseq}
+		rec := &mqttInflightRecord{
+			PI: pi, Dur: dur, Seq: sseq, Nonce: nuid.Next(),
+			QoS: 2, State: mqttInflightPublish,
+		}
+		if row.mut != nil {
+			row.mut(rec)
+		}
+		// Seeded with the RAW builder, which is deliberately not the write boundary: the
+		// boundary refuses every illegal row, so there is no other way to plant one.
+		msg, hdrLen := buildInflightRecord(0, rec)
+		if row.extra != _EMPTY_ {
+			// An unknown KEY cannot be expressed through the typed record at all, so the
+			// body is edited after marshalling. The record it is injected into is the
+			// legal one, which is what makes the row about the key alone.
+			body := msg[hdrLen:]
+			if body[len(body)-1] != '}' {
+				t.Fatalf("%s: the marshalled body does not end in a brace: %q", row.name, body)
+			}
+			injected := append(append([]byte{}, body[:len(body)-1]...), ',')
+			injected = append(injected, row.extra...)
+			injected = append(injected, '}')
+			msg = append(append([]byte{}, msg[:hdrLen]...), injected...)
+		}
+		// The row's premise, checked against the DECODER rather than assumed — and against
+		// the decoder rather than the validator, because half these rows are now about a
+		// key the validator never sees. A "legal" row the decoder refuses, or an illegal
+		// one it accepts, would make the recovery assertion below prove the opposite of
+		// what it claims.
+		_, derr := mqttDecodeInflightRecord(msg[hdrLen:])
+		if row.legal != (derr == nil) {
+			t.Fatalf("%s: mqttDecodeInflightRecord = %v, want legal=%v", row.name, derr, row.legal)
+		}
+		subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+		if _, err := e.asm.jsa.storeMsg(subject, hdrLen, msg); err != nil {
+			t.Fatalf("%s: seed the register: %v", row.name, err)
+		}
+	}
+	e.forgetInMemory()
+
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+
+	e.sess.mu.Lock()
+	acks := make(map[uint16]*mqttPending, len(pis))
+	for _, pi := range pis {
+		if ack, ok := e.sess.pendingPublish[pi]; ok {
+			acks[pi] = ack
+		}
+	}
+	incomplete := e.sess.piSpaceIncomplete
+	e.sess.mu.Unlock()
+
+	for _, row := range rows {
+		pi := pis[row.name]
+		ack := acks[pi]
+		if ack == nil {
+			t.Errorf("%s: identifier %d was not reserved at all; the client may be holding it",
+				row.name, pi)
+			continue
+		}
+		if row.legal {
+			if ack.jsDur != srcs[row.name].dur || ack.sseq != srcs[row.name].sseq {
+				t.Errorf("%s: a LEGAL record must be restored with its source, got %q/%d",
+					row.name, ack.jsDur, ack.sseq)
+			}
+			continue
+		}
+		if ack.jsDur != _EMPTY_ || ack.sseq != 0 {
+			t.Errorf("%s: an illegal shape must derive NO source from its body, got %q/%d",
+				row.name, ack.jsDur, ack.sseq)
+		}
+	}
+	if !incomplete {
+		t.Error("a quarantined register leaves the identifier space incomplete: the delivery " +
+			"that owns the identifier cannot be identified, so no new one may be allocated")
+	}
+	// Every seeded record is KEPT. Deleting one would free an identifier that may be in
+	// use, and the next resume would not even know to reserve it.
+	e.waitRegisterCount(t, len(rows))
+}
+
+// TestMQTTInflightIllegalShapeWithholdsEveryDestructiveReader is the finding round 12
+// actually raised, which was NOT that recovery was unvalidated — that was round 11 — but
+// that validating recovery alone left every DESTRUCTIVE reader trusting the bytes.
+//
+// mqttSlotAdmitsDisposition checks identity and state; the loader checked identity. Between
+// them an illegal but identity-valid `publish` record counted as readable AND deletable, so
+// releaseInflightRegisterByIdentity could delete it and let drain finalization continue into
+// irreversible claim, source and consumer cleanup — on a body the schema declares
+// uninterpretable.
+//
+// Both readers are exercised per shape, and the assertion is the same on both: the record
+// is RETAINED and progress is WITHHELD. Retained rather than deleted because the identifier
+// may be one the client is holding; withheld rather than advanced because nothing about that
+// exchange has been proven.
+//
+// The shapes cover BOTH ways a record can be unreadable, because a destructive reader must
+// not care which: a known field in an illegal combination, and a key that is not in the
+// schema at all. The second kind is what the five deleted fields used to cover for exactly
+// five spellings.
+func TestMQTTInflightIllegalShapeWithholdsEveryDestructiveReader(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-destructive")
+
+	shapes := []struct {
+		name  string
+		mut   func(r *mqttInflightRecord)
+		extra string
+	}{
+		{name: "half an affine reference", mut: func(r *mqttInflightRecord) {
+			r.Q2AffCopy = "$MQTT.q2aff.h.1.c.1"
+		}},
+		{name: "a claim sequence with no claimant", mut: func(r *mqttInflightRecord) {
+			r.ClaimSeq = 5
+		}},
+		{name: "a deleted PUBREL state name", mut: func(r *mqttInflightRecord) {
+			r.State = "pubrel_sending"
+		}},
+		{name: "a deleted action tag", extra: `"action":"AAAAAAAAAAAAAAAAAAAAAA"`},
+		{name: "a deleted canonical PUBREL tag", extra: `"pubrel_dur":"$MQTT_out_dur"`},
+		{name: "an unrecognised control field", extra: `"admission_epoch":4`},
+	}
+
+	for i, sh := range shapes {
+		pi := uint16(200 + i)
+		dur := e.sess.idHash + "_" + nuid.Next()
+		sseq := e.publishSource(t, dur)
+		nonce := nuid.Next()
+		rec := &mqttInflightRecord{
+			PI: pi, Dur: dur, Seq: sseq, Nonce: nonce, QoS: 2, State: mqttInflightPublish,
+		}
+		if sh.mut != nil {
+			sh.mut(rec)
+		}
+		subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+		msg, hdrLen := buildInflightRecord(0, rec)
+		if sh.extra != _EMPTY_ {
+			body := msg[hdrLen:]
+			if body[len(body)-1] != '}' {
+				t.Fatalf("%s: the marshalled body does not end in a brace: %q", sh.name, body)
+			}
+			injected := append(append([]byte{}, body[:len(body)-1]...), ',')
+			injected = append(injected, sh.extra...)
+			injected = append(injected, '}')
+			msg = append(append([]byte{}, msg[:hdrLen]...), injected...)
+		}
+		if _, derr := mqttDecodeInflightRecord(msg[hdrLen:]); derr == nil {
+			t.Fatalf("%s: the decoder accepts this shape, so the refusals below would prove nothing",
+				sh.name)
+		}
+		resp, serr := e.asm.jsa.storeMsg(subject, hdrLen, msg)
+		if serr != nil {
+			t.Fatalf("%s: seed the register: %v", sh.name, serr)
+		}
+
+		// Reader one: the drain's identity release, naming the exchange EXACTLY. Every
+		// addressing and matching precondition it has is satisfied — only the shape is
+		// wrong — so a permissive reader would delete here.
+		if got := e.asm.releaseInflightRegisterByIdentity(e.c, e.sess, subject, dur, sseq); got != mqttInflightUndecided {
+			t.Errorf("%s: releaseInflightRegisterByIdentity = %v, want mqttInflightUndecided: an "+
+				"illegal body may not authorize a delete or let the drain finalize", sh.name, got)
+		}
+		if _, smsg, lerr := e.asm.jsa.loadInflightRecord(subject); lerr != nil || smsg == nil {
+			t.Fatalf("%s: the record must be RETAINED after the refused release (err=%v)", sh.name, lerr)
+		}
+
+		// Reader two: the generic gated reap, given a reference built from the record
+		// itself — the most favourable input it can get.
+		ref := mqttSlotRefFromRecord(subject, resp.Sequence, rec)
+		if e.sess.reapRegisterWithVerdictGated(resp.Sequence, nonce, true, ref, mqttSlotDeleteComplete) {
+			t.Errorf("%s: reapRegisterWithVerdictGated reported success; an illegal body is not an "+
+				"absence and not a licence to delete", sh.name)
+		}
+		if _, smsg, lerr := e.asm.jsa.loadInflightRecord(subject); lerr != nil || smsg == nil {
+			t.Fatalf("%s: the record must be RETAINED after the refused reap (err=%v)", sh.name, lerr)
+		}
+	}
+}
+
+// TestDuplicatePubRecReoffersTheStoredPubRel is round 20's finding, and it is a LIVENESS
+// property rather than a safety one — which is why the earlier revision looked correct.
+//
+// A client retransmits PUBREC precisely because it did not receive the PUBREL
+// ([MQTT-4.3.3]). The duplicate-classification branch correctly refuses to overwrite the
+// live pendingPubRel entry with an empty placeholder — doing that would leave the handler
+// with no source and no exchange identity, refuse the store, and terminate the connection
+// on a legitimate duplicate. But it then RETURNED, answering nothing, so the client waited
+// for JetStream's AckWait: a configurable interval that can be long, and at a Receive
+// Maximum of 1 it stalls the session's entire outbound QoS 1/2 stream behind one exchange.
+// Its comment claimed the retransmission was "answered by the exchange that already
+// exists", which nothing performed.
+//
+// The answer is a NAK on the stored PUBREL's own delivery, so JetStream re-offers it at
+// once and the ordinary delivery path retransmits it with its fencing intact.
+func TestDuplicatePubRecReoffersTheStoredPubRel(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-dup-pubrec")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(3)
+	const dur = "PUBREL_F089"
+	relAck := testInflightAckSubject(dur, 55, 1)
+
+	// Past PUBREC: the PUBLISH entry is gone and a live PUBREL entry holds the identifier,
+	// carrying its own JetStream ack subject.
+	e.sess.mu.Lock()
+	e.sess.trackAsPubRel(pi, relAck)
+	rel := e.sess.pendingPubRel[pi]
+	_, hasPub := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if rel == nil || rel.jsAckSubject != relAck {
+		t.Fatalf("the fixture must leave a live PUBREL entry with its ack subject, got %+v", rel)
+	}
+	if hasPub {
+		t.Fatal("the fixture must be PAST PUBREC: no PUBLISH entry may remain")
+	}
+
+	// Observe the record's own delivery subject: a NAK on it is what re-offers the PUBREL.
+	obs, serr := e.s.nrc.SubscribeSync(relAck)
+	if serr != nil {
+		t.Fatalf("subscribe to the PUBREL's ack subject: %v", serr)
+	}
+	defer func() { _ = obs.Unsubscribe() }()
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// The DUPLICATE PUBREC, through the real handler.
+	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess, proto: mqttProtoLevel5}
+	if err := e.c.mqttProcessPublishReceived(pi, true, 0); err != nil {
+		t.Fatalf("a duplicate PUBREC must not error: %v", err)
+	}
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush after the duplicate: %v", err)
+	}
+
+	// ANSWERED: the stored PUBREL is re-offered at once.
+	msg, aerr := obs.NextMsg(2 * time.Second)
+	if aerr != nil {
+		t.Fatalf("the duplicate PUBREC was not answered: the client retransmits because it did "+
+			"not receive the PUBREL, so nothing here would reach it until AckWait expires (%v)", aerr)
+	}
+	if !bytes.Equal(msg.Data, AckNak) {
+		t.Errorf("the answer must be a NAK, so the ordinary delivery path retransmits with its "+
+			"fencing intact; got %q", msg.Data)
+	}
+
+	// And the live entry is UNTOUCHED: replacing it with a placeholder is the failure the
+	// branch exists to prevent, and it must not have been traded for the liveness fix.
+	e.sess.mu.Lock()
+	after := e.sess.pendingPubRel[pi]
+	_, pubBack := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if after != rel {
+		t.Errorf("the duplicate must not replace the live PUBREL entry, got %+v", after)
+	}
+	if after == nil || after.jsAckSubject != relAck {
+		t.Errorf("the entry must keep its own ack subject, got %+v", after)
+	}
+	if pubBack {
+		t.Error("a duplicate PUBREC must not resurrect a PUBLISH entry")
+	}
+}
+
+// TestDuplicatePubRecOnAPlaceholderSendsNoNak is the other half of that branch: the window
+// between trackAsPubRel and the first delivery attempt, where the entry carries NO ack
+// subject yet.
+//
+// There is nothing to re-offer — the original store is still in flight and will deliver —
+// so the NAK's subject is empty and `mqttJSA.sendMsg` declines it at its own first line.
+//
+// This case is a PROPERTY guard rather than a mutation-checked clause, and the distinction
+// is worth stating. An explicit branch here was written first, and a mutation removing it
+// changed nothing observable, because sendMsg was already refusing the empty subject — two
+// mechanisms stating one fact. The branch is gone; this test remains, because the property
+// it asserts is about the placeholder window and holds whichever mechanism enforces it.
+func TestDuplicatePubRecOnAPlaceholderSendsNoNak(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-dup-pubrec-placeholder")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(4)
+
+	e.sess.mu.Lock()
+	e.sess.trackAsPubRel(pi, _EMPTY_) // the placeholder: no ack subject yet
+	rel := e.sess.pendingPubRel[pi]
+	e.sess.mu.Unlock()
+	if rel == nil || rel.jsAckSubject != _EMPTY_ {
+		t.Fatalf("the fixture must be a placeholder with no ack subject, got %+v", rel)
+	}
+
+	// Anything published to an empty subject would be a protocol error on the wire, so the
+	// observable property is that the connection stays usable and the entry is untouched.
+	// A wildcard observer catches a NAK sent anywhere under $JS.ACK.
+	obs, serr := e.s.nrc.SubscribeSync("$JS.ACK.>")
+	if serr != nil {
+		t.Fatalf("subscribe: %v", serr)
+	}
+	defer func() { _ = obs.Unsubscribe() }()
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess, proto: mqttProtoLevel5}
+	if err := e.c.mqttProcessPublishReceived(pi, true, 0); err != nil {
+		t.Fatalf("a duplicate PUBREC on a placeholder must not error: %v", err)
+	}
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush after the duplicate: %v", err)
+	}
+	if msg, aerr := obs.NextMsg(250 * time.Millisecond); aerr == nil {
+		t.Errorf("a placeholder has nothing to re-offer, so no NAK may be sent; got %q on %q",
+			msg.Data, msg.Subject)
+	}
+	e.sess.mu.Lock()
+	after := e.sess.pendingPubRel[pi]
+	e.sess.mu.Unlock()
+	if after != rel {
+		t.Errorf("the placeholder must be left exactly as it was, got %+v", after)
 	}
 }

@@ -784,7 +784,11 @@ func TestForkRepairRefusesTwoDifferingDrains(t *testing.T) {
 		name string
 		ours mqttPersistedDrainSeq
 	}{
-		{"the PUBREL intent", mqttPersistedDrainSeq{Seq: 31, PubRel: true, PI: 5}},
+		// A PubRel intent carries a mandatory exchange identity, so the fixture builds a
+		// SUPPORTED shape: the restore path refuses an intent without one, and this test is
+		// about fork repair refusing to merge two differing drains, not about that refusal.
+		{"the PUBREL intent", mqttPersistedDrainSeq{Seq: 31, PubRel: true, PI: 5,
+			OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"}},
 		{"the packet identifier", mqttPersistedDrainSeq{Seq: 31, PI: 6}},
 		{"the store attempt", mqttPersistedDrainSeq{Seq: 31, PI: 5, Attempt: 2}},
 		{"the in-flight register", mqttPersistedDrainSeq{Seq: 31, PI: 5, RegSeq: 99}},
@@ -2007,5 +2011,101 @@ func TestForkRepairRefusesToMergeOverAnUnreadableSurvivor(t *testing.T) {
 	if got := testSubsOf(t, second)["u/a"]; !got.present || got.qos != 1 {
 		t.Fatalf("the re-driven pass against a readable sibling must merge the retained "+
 			"capsule: got %+v", got)
+	}
+}
+
+// TestForkRepairRefusesAFilterWithAQuarantinedSid is round 18's second HIGH finding, and it
+// is the SAME property as the processSubs preflight at the OTHER caller of
+// adoptDrainLocked.
+//
+// Repair mutated sess.subs and the option maps first, then adopted per sid and DISCARDED
+// adoptDrainLocked's refusal. For a wildcard with a usable main drain and a quarantined
+// companion that reported the filter applied, having adopted the main drain while the
+// companion refused — and the accept save then persists the live membership and consumer
+// but no longer the adopted drain's Started obligations. Exactly the partial adoption the
+// processSubs preflight exists to prevent, reached through the other door.
+//
+// The whole change is refused, which converges: repair is a convergence step, so an
+// unrepaired fork is retried at the next resume, where a half-applied filter loses
+// obligations permanently.
+func TestForkRepairRefusesAFilterWithAQuarantinedSid(t *testing.T) {
+	t.Parallel()
+	const filter = "q.>"
+	companion := filter[:len(filter)-2] + mqttMultiLevelSidSuffix
+
+	// Built by hand rather than through the fork fixture, because the state under test is
+	// one the fixture's own reconnect cannot leave behind: our record has to describe the
+	// filter as LIVE (the adopt row) while the session still HOLDS both drains in memory.
+	usable := mqttDrainFromPersisted(testPersistedDrain("q-main-dur",
+		mqttPersistedDrainSeq{Seq: 21, PubRel: true, PI: 4,
+			OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"}))
+	quarantined := mqttDrainFromPersisted(testPersistedDrain("q-comp-dur",
+		// Past PUBREC with NO identifier: quarantined on restore.
+		mqttPersistedDrainSeq{Seq: 22, PubRel: true, PI: 0,
+			OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"}))
+	if usable == nil || quarantined == nil {
+		t.Fatal("both drains must restore")
+	}
+	sess := &mqttSession{
+		drains:     map[string]*mqttDrain{filter: usable, companion: quarantined},
+		drainByDur: map[string]*mqttDrain{"q-main-dur": usable, "q-comp-dur": quarantined},
+		subs:       map[string]byte{},
+	}
+
+	// The premise both ways: the main sid is usable and adoptable, the companion is not.
+	// Without this a refusal proves nothing about which sid caused it.
+	sess.mu.Lock()
+	mainUsable := !sess.drainQuarantinedLocked(filter)
+	compQuarantined := sess.drainQuarantinedLocked(companion)
+	sess.mu.Unlock()
+	if !mainUsable {
+		t.Fatal("the main drain must be USABLE, or a refusal proves nothing about the companion")
+	}
+	if !compQuarantined {
+		t.Fatal("the companion must be QUARANTINED")
+	}
+
+	// Our side says the filter is LIVE on both sids — the re-SUBSCRIBE-over-a-drain row
+	// that adopts.
+	ours := &mqttGrantEntry{
+		mqttGrantTerms: mqttGrantTerms{present: true, qos: 1},
+		sids: map[string]mqttSidState{
+			filter:    {con: testConsumerConfig("q-main-dur")},
+			companion: {con: testConsumerConfig("q-comp-dur")},
+		},
+	}
+	survivor := &mqttGrantEntry{
+		sids: map[string]mqttSidState{
+			filter:    {drain: testPersistedDrain("q-main-dur")},
+			companion: {drain: testPersistedDrain("q-comp-dur")},
+		},
+	}
+
+	sess.mu.Lock()
+	applied := sess.applyGrantChangeLocked(mqttGrantChange{filter: filter, ours: ours}, survivor)
+	// Nothing moved: both drains still own their sids, no consumer was installed for
+	// either, and the filter is not in the membership map. That last one is the assertion
+	// the defect failed — repair mutated membership FIRST, so the accept save would then
+	// persist a live filter whose drain obligations it no longer carries.
+	stillMain, stillComp := sess.drains[filter], sess.drains[companion]
+	_, mainLive := sess.cons[filter]
+	_, compLive := sess.cons[companion]
+	_, inSubs := sess.subs[filter]
+	sess.mu.Unlock()
+
+	if applied {
+		t.Error("a filter with a quarantined sid must be REFUSED as a whole")
+	}
+	if stillMain != usable {
+		t.Errorf("the refused repair adopted the main drain away: %v", stillMain)
+	}
+	if stillComp != quarantined {
+		t.Errorf("the refused repair moved the companion drain: %v", stillComp)
+	}
+	if mainLive || compLive {
+		t.Errorf("a refused repair must install NO consumer, got main=%v comp=%v", mainLive, compLive)
+	}
+	if inSubs {
+		t.Error("a refused repair must not leave the filter in the membership map")
 	}
 }

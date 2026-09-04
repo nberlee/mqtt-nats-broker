@@ -1360,6 +1360,95 @@ Residuals:
   record must stay withheld until PUBCOMP.
   What F-091 does guarantee is narrower and is stated above: while a retained reservation
   is live, neither the allocator nor a PUBLISH send section may reuse that identifier.
+  **Still open.** The register does **not** yet survive PUBREC — it is still deleted at the
+  handoff — and PUBREL **admission** is unchanged, so a stale record whose acknowledgement
+  was lost can still be transmitted under an identifier another exchange owns, exactly as
+  described above. What exists is the vocabulary the fix needs, not the fix: see "Outbound
+  in-flight registers" in `docs/ARCHITECTURE.md` for what landed and what did not.
+- **What IS enforced today, stated narrowly on purpose.** A stored PUBREL carries a
+  mandatory `Nmqtt-Q2Owner` exchange identity, and a record whose identity is absent or
+  malformed is **withheld** by the delivery callback — never transmitted and never
+  acknowledged away, because acknowledging would destroy the only copy of evidence
+  nothing can attribute. It reserves no identifier, so the cost is stream space until
+  an operator or a generation teardown removes it. A drained exchange's PUBREL intent
+  carries a mandatory owner nonce AND the packet identifier the client is waiting on,
+  and a record found for that intent must match **both** exactly before the drain claim
+  is finalized; a mismatch is treated as no record and the exchange's own is recreated.
+  The identifier half was missing until a review round found it: a record with the right
+  source and the right exchange under a foreign identifier confirmed the intent, after
+  which the original exchange had no PUBREL and no evidence left to rebuild one from.
+  Every production write of an in-flight register is validated against one legal-shape
+  matrix and **refused rather than written** if it does not conform.
+- **An in-flight register's schema is CLOSED, and its shape is enforced on both sides of
+  the boundary.** Every path that WRITES one is validated at the single write boundary and
+  refused rather than written. Every path that READS one decodes through a single decoder
+  that rejects **any unrecognised field**, any case variant of a known one and any
+  duplicate member, and then applies the same matrix — so an illegal
+  body, or one carrying a field this broker does not define, is **unreadable**, exactly as
+  malformed JSON is, and may not authorize a mutation, a deletion or an identifier release.
+  The closed schema replaced five declared-but-unproduced fields whose only function was to
+  refuse themselves; that was an incomplete closed schema, since a sixth plausible control
+  field would have been dropped silently by the JSON decoder and the record read as an
+  ordinary legal register. On READ, only a
+  `publish`-state record is additionally restored as a live delivery: any other state,
+  **including an absent one**, is **quarantined** — its identifier is reserved so it can
+  never be reused, and nothing acts on the record.
+  Two review rounds were needed to close the read half. The first left the matrix governing
+  writes only, so an unsupported shape read back counted as readable; the second found that
+  validating it in the recovery scan alone still left the destructive readers — drain
+  identity release, the gated reap and generation teardown — trusting an identity-valid but
+  illegal body. Enumerating readers was the defect, so the rule is now a property of the
+  one decoder rather than a check repeated per site.
+  An earlier revision tolerated an absent state as "what earlier writers produced". That
+  was rolling-upgrade machinery, which this project's compatibility boundary forbids
+  outright, and it was also incoherent: every shared register is claim-rewritten through
+  the write boundary, whose validator refuses an absent state, so a tolerated record
+  became an unresumable session a moment later. Pre-alpha, with no releases anywhere,
+  there is no population to serve — a developer stream carrying older records resets, and
+  the nine broker-owned streams are one recreation unit (F-066).
+- **A marker-less drain intent does NOT refuse the session record, contrary to the
+  plan.** A past-PUBREC intent that nothing can attribute — no usable exchange identity, or
+  no packet identifier — is restored and marked
+  **non-finalizable** — the same treatment a duplicate register gets, because which record
+  the client holds is unknowable — so nothing finalizes on evidence it cannot attribute. The
+  documented whole-record read-only refusal is **not built**: it needs an error
+  propagated through normal restore, expiry, teardown and fork-repair, and an earlier
+  attempt that simply dropped the drain was worse than restoring it, since the session
+  was then accepted without a drain whose consumer and pending exchange were stranded.
+  The broker does not write such a record — the intent's identity is validated before
+  it is saved — so this is a tolerance for records from elsewhere, not a supported shape.
+  The PHASE is read from the `PubRel` flag alone. An earlier revision required a nonzero
+  packet identifier alongside it, which folded "past PUBREC but unattributable" into "not
+  past PUBREC" — restoring such a record as an ordinary claimed source, eligible to have
+  its payload redelivered to a client that had already answered it. Whether an intent can
+  be acted on is a separate question, and its answer is the quarantine; the drain's durable
+  also joins the resume SKIP set, so no source interest is restored for it.
+  A **SUBSCRIBE** that names such a drain is refused with a failure code, **fork repair
+  refuses the whole filter change**, and each refusal covers **every sid the filter owns**:
+  a wildcard's level-up companion is quarantined
+  independently of its main sid, and refusing them one at a time adopted the usable one
+  before failing, which the next successful save turned into a lost drain. The client can
+  restore the filter only by removing the record.
+- **Adopting a drain erases an unfinished past-PUBREC intent (F-094).** A re-SUBSCRIBE
+  over a draining filter, and fork repair's equivalent row, remove the drain from both maps
+  and persist no `Started` obligations — so the stored PUBREL can complete on the ordinary
+  non-drain path while the unacknowledged source is free to redeliver as a fresh PUBLISH,
+  duplicating an exchange the client has already answered. The **unattributable** subset is
+  refused (see the marker-less bullet above); a VALID intent is not. Pre-existing, and
+  narrowed rather than introduced by the owner-slot substrate. Refusing it is
+  protocol-visible — the client would see `SUBACK 0x80` until the PUBREL completes — so it
+  is F-094's own design question.
+- **A retained QoS 2 exchange's PUBREL is still transmitted after a restart, with no
+  surviving authority.** A retained send has no register (R6), so its exchange identity
+  lives only in the in-memory reservation and that reservation is gone after a restart. The
+  record's owner is nevertheless syntactically valid, recovery filters only an absent or
+  malformed one, and the delivery gate that would otherwise check ownership is keyed on the
+  source correlation a retained record does not carry — so the PUBREL goes out under an
+  identifier another exchange may by then own. This is F-092's central hazard in the one
+  subclass where no durable fact can settle it, and it is **not** fixed here: PUBREL
+  admission is the unbuilt half. An earlier revision of this bullet claimed the record was
+  "withheld by the identity rule", which a holistic round disproved by reading the recovery
+  filter.
 - **Promptness, not continuity, still depends on the reconnect being same-process.**
   The identifier is restored either way, but the immediate NAK-driven redelivery needs
   a live per-attempt JetStream ack subject, which a recovered entry does not have — so

@@ -1,8 +1,10 @@
 package mqtt
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -260,7 +262,7 @@ func TestDrainPubRelIntentOpensTheFenceBeforeMutating(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, dfn, e := sess.recordPubRelIntent(c, "dur-intent", 11, 5)
+		_, dfn, e := sess.recordPubRelIntent(c, "dur-intent", 11, 5, "xxxxxxxxxxxxxxxxxxxxxx")
 		mu.Lock()
 		definite, err = dfn, e
 		mu.Unlock()
@@ -1062,7 +1064,7 @@ func TestDrainAmbiguousIntentIsSettledForward(t *testing.T) {
 	})
 	suppressing.set(true)
 	mqttTestSessStoreSuppressV.Store(true)
-	_, definite, err := sess.recordPubRelIntent(c, "dur-intent", 4, 77)
+	_, definite, err := sess.recordPubRelIntent(c, "dur-intent", 4, 77, "xxxxxxxxxxxxxxxxxxxxxx")
 	mqttTestSessStoreSuppressV.Store(false)
 	if err == nil {
 		t.Fatal("this test needs the intent write to fail")
@@ -1876,5 +1878,440 @@ func TestStaleDispositionSparesAReplacementExpiryTimer(t *testing.T) {
 	}
 	if testMQTTResidentSessionOrNil(asm, sess.id) != replacement {
 		t.Fatal("the replacement must remain resident")
+	}
+}
+
+// TestDrainRecoveryRefusesAPubRelForAnotherIdentifier is round 13's HIGH finding, and the
+// mechanism is worth stating precisely because the record involved looks almost right.
+//
+// The drain intent persists the packet identifier the client is waiting on. Recovery
+// indexed the stored PUBRELs by SOURCE and confirmed the intent on source plus exchange
+// owner — the identifier was parsed by the scan and then discarded. So a record naming the
+// right source and the right exchange under a DIFFERENT identifier confirmed the intent as
+// durable proof, after which the claim was finalized and the source could be acknowledged
+// while the client's original exchange had no PUBREL at all and no evidence left to
+// recreate one from. A zero identifier is the same defect with a worse ending: nothing can
+// be transmitted under it.
+//
+// The refusal is "treat it as NO record", which is what makes it safe rather than merely
+// strict: the exchange recreates its own PUBREL under its own identifier and identity, and
+// the stray record is left for the operator or generation cleanup.
+func TestDrainRecoveryRefusesAPubRelForAnotherIdentifier(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		recordPI uint16
+	}{
+		{"another exchange's identifier", 9},
+		{"no identifier at all", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, c, sess, _ := drainTestSession(t, "drain-pi-"+tc.name)
+			const (
+				dur        = "dur-pi"
+				sseq       = uint64(11)
+				intentPI   = uint16(5)
+				ownerNonce = "xxxxxxxxxxxxxxxxxxxxxx"
+			)
+			d := addTestDrain(sess, "sid", dur, "foo", 2, map[uint64]*drainSeq{
+				sseq: {claimed: true, intent: true, pi: intentPI, ownerNonce: ownerNonce},
+			})
+			// $MQTT_out is interest-retained, so a store with no consumer keeps nothing
+			// and every assertion below would pass vacuously against an empty stream.
+			if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+				t.Fatalf("ensurePubRelConsumerSubscription: %v", err)
+			}
+
+			// A record for the right source and the right EXCHANGE — the owner nonce is the
+			// intent's own — but under a different identifier. Every other precondition
+			// recovery checks is satisfied, so only the identifier can refuse it.
+			msgId := mqttPubRelMsgId(sess.idHash, dur, sseq, 0)
+			msg, hdrLen := mqttNewCorrelatedPubRel(tc.recordPI, ownerNonce, dur, sseq, msgId, _EMPTY_, _EMPTY_)
+			if tc.recordPI == 0 {
+				// The builder refuses a zero identifier, which is itself the right
+				// behaviour; the record has to be planted to test the READER.
+				msg, hdrLen = mqttNewCorrelatedPubRel(1, ownerNonce, dur, sseq, msgId, _EMPTY_, _EMPTY_)
+				msg = bytes.Replace(msg, []byte(mqttNatsPubRelHeader+":1\r\n"),
+					[]byte(mqttNatsPubRelHeader+":0\r\n"), 1)
+			}
+			if msg == nil {
+				t.Fatal("the correlated PUBREL builder refused a record this test needs")
+			}
+			if _, err := sess.jsa.storeMsg(sess.pubRelSubject, hdrLen, msg); err != nil {
+				t.Fatalf("plant the stray PUBREL: %v", err)
+			}
+
+			// The premise: the scan DOES see it, so the refusal below is a decision about
+			// the record and not an artefact of it being invisible.
+			records, refused, ok := sess.scanPubRelRecords(sess.pubRelSubject)
+			if !ok {
+				t.Fatal("the scan must succeed")
+			}
+			if len(records) != 1 {
+				t.Fatalf("the scan must RETURN the planted record either way, got %+v", records)
+			}
+			if tc.recordPI == 0 {
+				// Returned, but carrying its refusal: the scan reports what is there and
+				// each caller decides. A reader that would act on it skips it.
+				if refused != 1 || records[0].shapeErr == nil {
+					t.Fatalf("a record with no identifier must carry a decode refusal, refused=%d rec=%+v",
+						refused, records[0])
+				}
+			} else {
+				if refused != 0 || records[0].shapeErr != nil || records[0].pi != tc.recordPI {
+					t.Fatalf("a legal record under a foreign identifier must decode CLEANLY — the "+
+						"refusal below is about the identifier not matching the intent, not about "+
+						"the shape — refused=%d rec=%+v", refused, records[0])
+				}
+			}
+
+			skip := sess.recoverDrainPubRels(c)
+			if skip[dur] {
+				t.Fatalf("the drain must not be skipped: the scan succeeded")
+			}
+
+			// The intent stands under its ORIGINAL identifier. The claim is released here
+			// and that is correct rather than a gap: it is released only BECAUSE the
+			// refusal recreated this exchange's own record below, which is the positive
+			// durable fact the release rests on. Under the defect there was no such
+			// record and the claim was released anyway.
+			st := drainSeqState(sess, d, sseq)
+			if !st.intent || st.pi != intentPI {
+				t.Fatalf("the intent must stand under its ORIGINAL identifier, got %+v", st)
+			}
+			if st.phase != drainPubRelConfirmed {
+				t.Fatalf("the exchange's own record exists, so its phase must be confirmed, got %+v", st)
+			}
+
+			// THE assertion: the exchange owns a PUBREL under ITS identifier. The refusal
+			// recreates rather than merely declining, and this is what fails when the
+			// identifier comparison is removed — the stray record confirms the intent and
+			// nothing is ever written for the identifier the client is waiting on.
+			after, _, ok := sess.scanPubRelRecords(sess.pubRelSubject)
+			if !ok {
+				t.Fatal("the second scan must succeed")
+			}
+			var mine int
+			for _, r := range after {
+				if r.shapeErr == nil && r.pi == intentPI && r.srcDur == dur && r.srcSeq == sseq &&
+					r.owner.valid() && r.owner.Nonce == ownerNonce {
+					mine++
+				}
+			}
+			if mine != 1 {
+				t.Fatalf("the exchange must own exactly one PUBREL under identifier %d, got %d of %+v",
+					intentPI, mine, after)
+			}
+		})
+	}
+}
+
+// TestPubRelScanReturnsAnUnsupportedRecordForTheWalksThatMustSeeIt pins the disposition
+// split, which a first version of the one-decoder change got wrong.
+//
+// Dropping unsupported records inside the scan looked like the tidy answer: every reader
+// that would ACT on one has to skip it anyway. It is wrong, and the caller it breaks is a
+// destructive one. secureQ2AffPubRelProofs walks the stored PUBRELs of a generation about
+// to be torn down, precisely to notice affine PUBREC proofs that are about to be destroyed
+// with the consumer that retains them; mqttQ2AffProofWalk asks the same question for a
+// loss report. A record the decoder refuses can still carry a perfectly good affine
+// reference, and dropping it would have made the teardown destroy that proof unread while
+// reporting nothing.
+//
+// So the scan returns EVERY record with its verdict attached, and each caller applies its
+// own disposition. This asserts the half that no acting caller would notice.
+func TestPubRelScanReturnsAnUnsupportedRecordForTheWalksThatMustSeeIt(t *testing.T) {
+	t.Parallel()
+	_, c, sess, _ := drainTestSession(t, "drain-scan-all")
+	if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+		t.Fatalf("ensurePubRelConsumerSubscription: %v", err)
+	}
+
+	// An unsupported shape — no exchange owner — that nonetheless carries a VALID affine
+	// reference. The builder refuses to write one, which is the point: this is a record
+	// from elsewhere, and the walks still have to account for it.
+	claim := mqttQ2AffClaimSubject(mqttSharedConsumerDurablePrefix+"0123456789abcdef", 42)
+	copySubject := mqttQ2AffCopySubject("abcd1234", testQ2AffFixtureNonce,
+		strings.Repeat("a", mqttQ2AffClaimHashLen), testQ2AffFixtureNonce)
+	if !mqttValidQ2AffClaimSubject(claim) || !mqttValidQ2AffCopySubject(copySubject) {
+		t.Fatalf("the fixture's own subjects are not valid: %q %q", claim, copySubject)
+	}
+	const owner = "xxxxxxxxxxxxxxxxxxxxxx"
+	msg, hdrLen := mqttNewCorrelatedPubRel(4, owner, "dur-scan", 7, _EMPTY_, claim, copySubject)
+	if msg == nil {
+		t.Fatal("the builder refused a record this test needs")
+	}
+	// The owner header is REMOVED after the build, because the builder will not write a
+	// record without one — which is the property that makes this a record from elsewhere.
+	ownerHdr := []byte(mqttPubRelOwnerHeader + ":" + owner + _CRLF_)
+	if !bytes.Contains(msg, ownerHdr) {
+		t.Fatalf("the built record does not carry the owner header this test removes")
+	}
+	msg = bytes.Replace(msg, ownerHdr, nil, 1)
+	if _, err := sess.jsa.storeMsg(sess.pubRelSubject, hdrLen-len(ownerHdr), msg); err != nil {
+		t.Fatalf("plant the owner-less PUBREL: %v", err)
+	}
+
+	records, refused, ok := sess.scanPubRelRecords(sess.pubRelSubject)
+	if !ok {
+		t.Fatal("the scan must succeed")
+	}
+	if len(records) != 1 {
+		t.Fatalf("the scan must RETURN the record: the teardown walk decides its fate, not the "+
+			"decoder, got %+v", records)
+	}
+	if refused != 1 || records[0].shapeErr == nil {
+		t.Fatalf("the record must carry its refusal so an ACTING caller skips it, refused=%d rec=%+v",
+			refused, records[0])
+	}
+	if records[0].affRef.State != mqttPubRelAffineRefValid {
+		t.Fatalf("the affine reference the teardown walk exists to notice must be readable on the "+
+			"returned record, got %+v", records[0].affRef)
+	}
+}
+
+// TestStoredPubRelHeadersAreExactAndSingular is round 17's second HIGH finding, and both
+// halves of it were reproduced before being fixed.
+//
+// The underlying header parsers are deliberately lenient for their own callers, and this
+// boundary was trusting them. mqttParsePubRelNATSHeader discards strconv's error, so
+// `Nmqtt-PubRel:65536` came back as 65535 — a plausible identifier that is NOT the one the
+// record names, under which the PUBREL would then be transmitted. And every one of these
+// headers takes the first occurrence with no count, so a record carrying two identifiers or
+// two source-correlation pairs was accepted with the reader silently picking one.
+//
+// Both are shapes this broker never writes, so both are refused rather than resolved by an
+// arbitrary rule — the same answer a duplicate JSON member gets on the register.
+func TestStoredPubRelHeadersAreExactAndSingular(t *testing.T) {
+	t.Parallel()
+	const owner = "xxxxxxxxxxxxxxxxxxxxxx"
+	base := "NATS/1.0" + _CRLF_ + mqttPubRelOwnerHeader + ":" + owner + _CRLF_
+	pi := func(v string) string { return mqttNatsPubRelHeader + ":" + v + _CRLF_ }
+	src := func(dur, seq string) string {
+		return mqttPubRelSrcDurHeader + ":" + dur + _CRLF_ + mqttPubRelSrcSeqHeader + ":" + seq + _CRLF_
+	}
+
+	// The controls FIRST, so no refusal below can be vacuous.
+	for _, tc := range []struct {
+		name    string
+		hdr     string
+		wantPI  uint16
+		wantDur string
+		wantSeq uint64
+	}{
+		{"an uncorrelated record", base + pi("7") + _CRLF_, 7, _EMPTY_, 0},
+		{"a correlated record", base + pi("7") + src("durA", "11") + _CRLF_, 7, "durA", 11},
+		{"the largest identifier", base + pi("65535") + _CRLF_, 65535, _EMPTY_, 0},
+	} {
+		got, err := mqttDecodeStoredPubRel([]byte(tc.hdr))
+		if err != nil {
+			t.Errorf("%s must decode: %v", tc.name, err)
+			continue
+		}
+		if got.pi != tc.wantPI || got.srcDur != tc.wantDur || got.srcSeq != tc.wantSeq {
+			t.Errorf("%s decoded to pi=%d src=%q/%d", tc.name, got.pi, got.srcDur, got.srcSeq)
+		}
+	}
+
+	for _, tc := range []struct{ name, hdr string }{
+		// 65536 is the case that matters most: it SATURATES to 65535 rather than failing,
+		// so a permissive decode yields a clean, ordinary-looking identifier.
+		{"an identifier one past the 16-bit range", base + pi("65536") + _CRLF_},
+		{"an identifier far out of range", base + pi("999999") + _CRLF_},
+		{"an identifier that is not a number", base + pi("abc") + _CRLF_},
+		{"an identifier with a sign", base + pi("-1") + _CRLF_},
+		{"an identifier with trailing space", base + pi("7 ") + _CRLF_},
+		{"two identifier headers", base + pi("9") + pi("7") + _CRLF_},
+		{"two identifier headers agreeing", base + pi("7") + pi("7") + _CRLF_},
+		{"two source-correlation pairs", base + pi("7") + src("durA", "11") + src("durB", "22") + _CRLF_},
+		{"two source durables", base + pi("7") + mqttPubRelSrcDurHeader + ":durA" + _CRLF_ +
+			mqttPubRelSrcDurHeader + ":durB" + _CRLF_ + mqttPubRelSrcSeqHeader + ":11" + _CRLF_ + _CRLF_},
+		{"two source sequences", base + pi("7") + mqttPubRelSrcDurHeader + ":durA" + _CRLF_ +
+			mqttPubRelSrcSeqHeader + ":11" + _CRLF_ + mqttPubRelSrcSeqHeader + ":22" + _CRLF_ + _CRLF_},
+	} {
+		if got, err := mqttDecodeStoredPubRel([]byte(tc.hdr)); err == nil {
+			t.Errorf("%s must be refused, decoded to %+v", tc.name, got)
+		}
+	}
+}
+
+// TestDrainIntentPastPubRecWithNoIdentifierIsQuarantined is round 17's first HIGH finding.
+//
+// `owesPubRel` was `PubRel && PI != 0`, which folded "past PUBREC with no identifier" into
+// "not past PUBREC". A record explicitly saying the exchange had passed PUBREC was
+// therefore restored as an ORDINARY CLAIMED SOURCE: not quarantined, and invisible to
+// PUBREL recovery, so source interest could be restored for it and the payload of an
+// exchange the client has already answered redelivered.
+//
+// The phase is `PubRel` alone. Whether the intent can be ACTED ON is a separate question,
+// and the answer to it is the quarantine — never an adjustment to the phase.
+func TestDrainIntentPastPubRecWithNoIdentifierIsQuarantined(t *testing.T) {
+	t.Parallel()
+	const sid = "1"
+	const dur = "$MQTT_plain_no_pi"
+	for _, tc := range []struct {
+		name string
+		seq  mqttPersistedDrainSeq
+	}{
+		{"no identifier", mqttPersistedDrainSeq{Seq: 41, PubRel: true, PI: 0,
+			OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"}},
+		{"no owner nonce", mqttPersistedDrainSeq{Seq: 41, PubRel: true, PI: 7}},
+		{"neither", mqttPersistedDrainSeq{Seq: 41, PubRel: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := mqttDrainFromPersisted(&mqttPersistedDrain{
+				Cons: &ConsumerConfig{Durable: dur}, QoS: 2,
+				Started: []mqttPersistedDrainSeq{tc.seq},
+			})
+			if d == nil {
+				t.Fatal("the drain must be RESTORED: dropping it accepts the session without a " +
+					"drain whose consumer and pending exchange are still stranded")
+			}
+			st := d.seqs[41]
+			if st == nil {
+				t.Fatal("the sequence must be restored")
+			}
+			// THE phase fact, and the assertion the defect failed: the record says past
+			// PUBREC, so the restored state must say past PUBREC.
+			if !st.intent {
+				t.Error("a record saying PubRel is PAST PUBREC: reading it as a PUBLISH-phase " +
+					"delivery permits redelivering a payload the client has already answered")
+			}
+			if !st.ownerUnusable {
+				t.Error("an intent nothing can attribute must be QUARANTINED")
+			}
+			if !st.claimed {
+				t.Error("the source claim must stand: acknowledging it would lose the message")
+			}
+			// And the quarantine is visible through the property every subscription path
+			// asks, which is what keeps the drain from being adopted or staged over.
+			sess := &mqttSession{drains: map[string]*mqttDrain{sid: d}}
+			sess.mu.Lock()
+			quarantined := sess.drainQuarantinedLocked(sid)
+			sess.mu.Unlock()
+			if !quarantined {
+				t.Error("the sid must report quarantined, or a re-SUBSCRIBE can take the drain away")
+			}
+		})
+	}
+}
+
+// TestUnattributableDrainIntentSkipsSourceInterest is the other half of that finding: the
+// quarantine has to reach the SKIP SET, or recoverDrains restores source interest for the
+// drain and JetStream re-offers the payload.
+//
+// recoverDrainPubRels builds its claims from intents it can act on, and an unattributable
+// one has neither an identifier to compare a record against nor an identity to recreate one
+// under — so it cannot be a claim. Being absent from the claims is not enough: absent means
+// "nothing to skip", which is exactly the reading that restores interest.
+func TestUnattributableDrainIntentSkipsSourceInterest(t *testing.T) {
+	t.Parallel()
+	_, c, sess, _ := drainTestSession(t, "drain-skip-unattributable")
+	const dur = "dur-unattributable"
+	// The owner nonce is deliberately VALID and only the identifier is missing. With an
+	// unusable nonce as well, a recreate attempt would fail on the nonce and set the skip
+	// flag anyway — so the test would pass with the branch removed, which is exactly what a
+	// mutation showed. This fixture leaves the recreate no reason to fail except the branch.
+	d := addTestDrain(sess, "sid", dur, "foo", 2, map[uint64]*drainSeq{
+		41: {claimed: true, intent: true, pi: 0, ownerNonce: "xxxxxxxxxxxxxxxxxxxxxx",
+			ownerUnusable: true, regAmbiguous: true},
+	})
+	if d == nil {
+		t.Fatal("the fixture must install a drain")
+	}
+	// $MQTT_out is interest-retained, so a store lands only with a consumer — and this
+	// test's second assertion is that NOTHING is stored, which would hold vacuously
+	// without one.
+	if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+		t.Fatalf("ensurePubRelConsumerSubscription: %v", err)
+	}
+
+	skip := sess.recoverDrainPubRels(c)
+	if !skip[dur] {
+		t.Fatalf("the drain's durable must be SKIPPED: without it recoverDrains restores source "+
+			"interest and the payload of an exchange already past PUBREC is re-offered, got %v", skip)
+	}
+	// And NOTHING was written for it. This is the assertion that separates "skipped
+	// deliberately" from "skipped because a recreate attempt failed": an intent nobody can
+	// attribute must not reach a store at all, because the record it would write names an
+	// identifier the client is not waiting on.
+	if records, refused, ok := sess.scanPubRelRecords(sess.pubRelSubject); !ok {
+		t.Fatal("the scan must succeed")
+	} else if len(records) != 0 || refused != 0 {
+		t.Fatalf("an unattributable intent must not be recreated: %d record(s), %d refused",
+			len(records), refused)
+	}
+	// The claim and the intent are untouched: nothing was finalized, and nothing was
+	// acknowledged.
+	st := drainSeqState(sess, d, 41)
+	if !st.claimed || !st.intent || !st.ownerUnusable {
+		t.Fatalf("the quarantined intent must be left exactly as it was, got %+v", st)
+	}
+}
+
+// TestAffineProofWalkRefusesAnUnreadableRecord is round 21's finding at the route level.
+//
+// The record is the one the disposition split exists for: an OWNERLESS PUBREL — a shape
+// this broker refuses to write — carrying a perfectly well-formed affine reference. The
+// scan RETURNS it, deliberately, so this walk and the teardown can account for what is
+// about to be destroyed. Accounting for it is not the same as acting on it, and the walk
+// used to read its reference: an unattributable record could resolve an assignment, record
+// PubRecProven and AffineDone, and reap the claim — suppressing or retracting a real loss.
+//
+// INCOMPLETE rather than ignored is the assertion. The record may be the very proof the
+// walk was looking for, so its unreadability is exactly the state in which no loss may be
+// inferred either way.
+func TestAffineProofWalkRefusesAnUnreadableRecord(t *testing.T) {
+	t.Parallel()
+	_, c, sess, _ := drainTestSession(t, "aff-proof-unreadable")
+	if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+		t.Fatalf("ensurePubRelConsumerSubscription: %v", err)
+	}
+
+	claim := mqttQ2AffClaimSubject(mqttSharedConsumerDurablePrefix+"0123456789abcdef", 42)
+	copySubject := mqttQ2AffCopySubject("abcd1234", testQ2AffFixtureNonce,
+		strings.Repeat("a", mqttQ2AffClaimHashLen), testQ2AffFixtureNonce)
+	if !mqttValidQ2AffClaimSubject(claim) || !mqttValidQ2AffCopySubject(copySubject) {
+		t.Fatalf("the fixture's own subjects are not valid: %q %q", claim, copySubject)
+	}
+	const owner = "xxxxxxxxxxxxxxxxxxxxxx"
+	msg, hdrLen := mqttNewCorrelatedPubRel(4, owner, "dur-aff", 7, _EMPTY_, claim, copySubject)
+	if msg == nil {
+		t.Fatal("the builder refused a record this test needs")
+	}
+	// The owner header is REMOVED after the build, because the builder will not write a
+	// record without one — which is what makes this a record from elsewhere.
+	ownerHdr := []byte(mqttPubRelOwnerHeader + ":" + owner + _CRLF_)
+	if !bytes.Contains(msg, ownerHdr) {
+		t.Fatal("the built record does not carry the owner header this test removes")
+	}
+	msg = bytes.Replace(msg, ownerHdr, nil, 1)
+	if _, err := sess.jsa.storeMsg(sess.pubRelSubject, hdrLen-len(ownerHdr), msg); err != nil {
+		t.Fatalf("plant the owner-less PUBREL: %v", err)
+	}
+
+	// The premise: the scan RETURNS it, refused, with its affine reference READABLE. If it
+	// were dropped or its reference unparsed, the walk could not act on it either way and
+	// this test would prove nothing.
+	records, refused, ok := sess.scanPubRelRecords(sess.pubRelSubject)
+	if !ok || len(records) != 1 || refused != 1 {
+		t.Fatalf("the scan must return exactly one refused record, got ok=%v n=%d refused=%d",
+			ok, len(records), refused)
+	}
+	if records[0].shapeErr == nil {
+		t.Fatal("the record must carry a decode refusal")
+	}
+	if !records[0].affRef.valid() {
+		t.Fatalf("the affine reference must be READABLE on the refused record, or the walk has "+
+			"nothing to be tempted by: %+v", records[0].affRef)
+	}
+
+	// THE assertion: incomplete, not complete.
+	if got := sess.reconcileQ2AffPubRelProofs(c); got != mqttQ2AffProofIncomplete {
+		t.Fatalf("an unreadable record must leave the affine evidence INCOMPLETE, got %v: reading "+
+			"its reference lets an unattributable record prove a delivery and reap the assignment "+
+			"claim", got)
 	}
 }

@@ -950,6 +950,30 @@ func (sess *mqttSession) mergeForkedGrantLocked(g *mqttForkedGrant, survivor *mq
 // sess.mu must be held.
 func (sess *mqttSession) applyGrantChangeLocked(ch mqttGrantChange, survivor *mqttGrantEntry) bool {
 	sids := mqttSidsOf(survivor, ch.ours)
+
+	// A QUARANTINED drain refuses the WHOLE FILTER, checked BEFORE any membership, option,
+	// consumer or drain is touched — the same property processSubs applies, at the second
+	// caller of it.
+	//
+	// This was a fail-open path a review round found, and the shape is worth naming: the
+	// quarantine was enforced where the FIRST caller of adoptDrainLocked lives, and this is
+	// the second. Repair mutated sess.subs and the option maps first, then adopted per sid
+	// and DISCARDED adoptDrainLocked's refusal — so for a wildcard with a usable main drain
+	// and a quarantined companion it reported the filter applied, having adopted the main
+	// drain while the companion refused. The accept save then persists the live membership
+	// and consumer but no longer the adopted drain's Started obligations. That is exactly
+	// the partial adoption the processSubs preflight exists to prevent, reached through the
+	// other door.
+	//
+	// Refusing the whole change is the conservative direction: repair is a convergence
+	// step, so leaving the fork unrepaired means the next resume tries again, while a
+	// half-applied filter loses obligations permanently.
+	for sid := range sids {
+		if sess.drainQuarantinedLocked(sid) {
+			return false
+		}
+	}
+
 	terms := ch.ours.terms()
 	if terms.present {
 		if sess.subs == nil {
@@ -1024,6 +1048,16 @@ func (sess *mqttSession) applyGrantSidLocked(sid string, survivor, ours mqttSidS
 			// transition that moves drains[sid] to cons[sid] keeping the durable; written
 			// by hand, cons and drains end up both populated. It does not transfer the
 			// started obligations, which the later durable scans re-establish.
+			//
+			// Its return is deliberately NOT treated as a refusal, and getting that wrong
+			// is instructive. adoptDrainLocked returns false for TWO different facts:
+			// "quarantined" and "there is no drain here to adopt". The second is benign and
+			// reachable on this row — the SURVIVOR's record says draining, which says
+			// nothing about whether our own resume restored a drain for that sid — so
+			// refusing the whole change on it would abandon a repair for a state that is
+			// merely absent. The quarantine is handled by the filter-wide preflight above,
+			// before anything is mutated, which is where a refusal can still be honoured
+			// atomically. A mutation confirmed the check here was unreachable.
 			sess.adoptDrainLocked(sid)
 		case mqttSidAbsent:
 			// Our record's omission IS the acknowledged completion of the last claim, so

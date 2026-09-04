@@ -1062,11 +1062,16 @@ func mqttQ2AffPubRelFormMax() int {
 	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
 	maxCopySubject := len(mqttQ2AffineSubjectPrefix) + sysHashLen + 1 + genW + 1 +
 		mqttQ2AffClaimHashLen + 1 + genW
-	// The source correlation and the deduplication identity are budgeted alongside it:
-	// a DRAINED affine source reaches this builder carrying all three at once.
+	// The source correlation, the deduplication identity and the mandatory owner identity
+	// are budgeted alongside it: a DRAINED affine source reaches this builder carrying all
+	// four at once. The owner nonce is a fixed-width NUID, so its contribution is exact
+	// rather than an upper bound — but it MUST be threaded through, because this budget is
+	// derived by running the real encoder and a missing argument would silently under-count
+	// the form by the width of a whole header.
 	msgId := mqttPubRelMsgId(strings.Repeat("x", sysHashLen), strings.Repeat("x", maxDur),
 		math.MaxUint64, math.MaxUint64)
-	_, n := mqttNewCorrelatedPubRel(math.MaxUint16, strings.Repeat("x", maxDur), math.MaxUint64,
+	_, n := mqttNewCorrelatedPubRel(math.MaxUint16, strings.Repeat("x", mqttInflightNonceLen),
+		strings.Repeat("x", maxDur), math.MaxUint64,
 		msgId, strings.Repeat("x", maxClaimSubject), strings.Repeat("x", maxCopySubject))
 	return n
 }
@@ -3411,7 +3416,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 			// The identifier is released, so its register goes with it (R5), before the
 			// confirmed copy ack below. Normally a no-op, since expiry is decided before
 			// the register is written.
-			sess.deleteInflightRegisterFor(removed)
+			sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 			cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 			return
 		}
@@ -3447,7 +3452,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
-		sess.deleteInflightRegisterFor(removed)
+		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 		cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 	}
 }
@@ -3868,7 +3873,7 @@ func (sess *mqttSession) reconcileQ2AffPubRelProofs(c *client) mqttQ2AffProofEvi
 		return mqttQ2AffProofComplete
 	}
 	s := as.server()
-	records, ok := sess.scanPubRelRecords(pubRelSubject)
+	records, _, ok := sess.scanPubRelRecords(pubRelSubject)
 	if !ok {
 		// A partial walk is never evidence of absence (scanPubRelRecords says so), and
 		// here the absence in question is "no PUBREL proves this delivery".
@@ -3876,6 +3881,25 @@ func (sess *mqttSession) reconcileQ2AffPubRelProofs(c *client) mqttQ2AffProofEvi
 	}
 	evidence := mqttQ2AffProofComplete
 	for _, r := range records {
+		if r.shapeErr != nil {
+			// UNREADABLE, so no field of it authorizes anything — including its affine
+			// reference, which may be perfectly well formed on a record whose identifier,
+			// owner or source correlation is not.
+			//
+			// The scan RETURNS such a record deliberately, so this walk can account for
+			// what a teardown would destroy; accounting for it is not the same as acting
+			// on it. Reading its reference would let an unattributable record record
+			// PubRecProven and AffineDone and reap the assignment claim — suppressing or
+			// retracting a real loss on evidence nothing can attribute.
+			//
+			// INCOMPLETE rather than skipped: the record may be the very proof this walk
+			// was looking for, so its unreadability is exactly the state where a loss must
+			// not be inferred either way.
+			c.Warnf("MQTT: refusing a stored PUBREL at sequence %v as affine QoS 2 evidence: %v",
+				r.seq, r.shapeErr)
+			evidence = mqttQ2AffProofIncomplete
+			continue
+		}
 		if r.affRef.refused() {
 			// A shape this broker does not write. Refused, not ignored: it names an
 			// assignment that cannot be resolved, so neither the proof nor the loss

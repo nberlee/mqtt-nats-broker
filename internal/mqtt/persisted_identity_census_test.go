@@ -231,7 +231,10 @@ var censusComposites = []censusComposite{
 		members: []string{"Claim", "ClaimSeq"},
 		reason: "Claim identifies the session OBJECT and is minted in process, while ClaimSeq orders " +
 			"rival claims by a $MQTT_sess sequence. Either alone cannot arbitrate: the nonce says who " +
-			"but not which is newer, and the sequence says which is newer but not whose",
+			"but not which is newer, and the sequence says which is newer but not whose. " +
+			"ActionClaim/ActionClaimSeq were members of this same relation and were DELETED with the " +
+			"rest of the unproduced admission substrate; they return with it, as members of this " +
+			"relation rather than as a second one",
 	},
 	{
 		kind:    "origin interval",
@@ -269,6 +272,8 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Q2AffCopy":  {kind: identityComposite, compos: "cross-artifact binding", encoding: encJSON, reason: "see the composite oracle: paired with Q2AffClaim"},
 		"Retired":    {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this exchange's source having been retired; names nothing"},
 		"Cancelled":  {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this allocation never having been transmitted; names nothing"},
+		"State": {kind: notAnIdentity, encoding: encJSON,
+			reason: "the exchange's PHASE, which says who may act on this slot rather than naming anything. Mandatory and never defaulted: an unknown state is refused, because reading it as PUBLISH would license a PUBLISH under an identifier already past PUBREC"},
 	}
 
 	m["mqttPersistedDrainSeq"] = map[string]censusDisposition{
@@ -276,6 +281,8 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"PubRel":  {kind: notAnIdentity, encoding: encJSON, reason: "the QoS 2 second phase's intent, written before the PUBREL is stored so recovery is positive rather than a guess"},
 		"PI":      {kind: identityLocal, encoding: encJSON, reason: "the packet identifier, and since F-034 also what DERIVES the register subject the release addresses — see the drain release in inflight_register.go"},
 		"Attempt": {kind: notAnIdentity, encoding: encJSON, reason: "the deduplication attempt counter; a dedupe entry outlives its message, so a verified-absent recreate bumps this rather than trusting the window"},
+		"OwnerNonce": {kind: identityLocal, encoding: encJSON,
+			reason: "the EXCHANGE identity this drained delivery owns, persisted with the intent and before the PUBREL store. Not redundant with the record's own header: recovery may find the record missing and have to recreate it, and minting a replacement nonce there would create a DIFFERENT exchange that the durable owner slot does not name and could therefore never act"},
 		// The F-066 oracle pass corrected this. An earlier draft called it
 		// notAnIdentity on the ground that F-034 demoted it to a hint — but demoting
 		// what a mechanism RELIES on does not stop the field being a cross-stream
@@ -1230,6 +1237,17 @@ func TestPersistedIdentityCensusRediscoversF066Sample(t *testing.T) {
 	t.Parallel()
 	manifest := censusManifest()
 
+	// BACK TO 14. The durable QoS 2 owner slot briefly added a fifteenth row —
+	// `$MQTT_inflight` body PubRelDurable/PubRelStreamSeq, issued by `$MQTT_out` — and it
+	// was a genuinely new coupling: the pre-existing Dur/Seq row couples this record to a
+	// SOURCE DELIVERY, where that named one specific PUBREL RECORD's sequence in a specific
+	// consumer's space, and recreating $MQTT_out resets that space.
+	//
+	// The two fields were then deleted, because nothing produced them, so the coupling
+	// does not exist on this tree and a row asserting it would be a claim about state no
+	// record carries. It comes back with them. ActionClaim/ActionClaimSeq never had a row
+	// of their own and still do not: they were members of the arbitration relation the
+	// ClaimSeq row carries, not a second coupling to $MQTT_sess.
 	if len(censusF066Sample) != 14 {
 		t.Fatalf("the oracle carries %d rows; F-066's sample has 14. A row was dropped or added "+
 			"without re-reading the dossier", len(censusF066Sample))

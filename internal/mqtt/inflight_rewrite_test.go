@@ -1252,10 +1252,13 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 	// called endSend or beginSendLocked, and a name-only allow-list would admit a
 	// presence reader hidden in one of those.
 	owners := map[string]struct{}{
-		// The predicate.
-		"mqttSession.pubCompHeldLocked": {}, "mqttSession.sendHoldLiveLocked": {},
+		// The predicate. ONE entry, and the three that used to sit beside it —
+		// pubCompHeldLocked, sendHoldLiveLocked, retainedHeldLocked — are gone because
+		// they take a *mqttSendHold and never touch the map. They were listed for
+		// participating in the predicate rather than for reaching the registry, which is
+		// how an exemption list drifts from the access set into a description of a
+		// subsystem. Part 3 of the property below is what found them.
 		"mqttSession.sendReservedLocked": {},
-		"mqttSession.retainedHeldLocked": {},
 		// The helpers that mutate a hold.
 		"mqttSession.beginSendLocked": {}, "mqttSession.beginPubRelSendLocked": {},
 		"mqttSession.endSend": {}, "mqttSession.consumePubRelAckLocked": {},
@@ -1269,7 +1272,30 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.dropRetainedSendLocked":             {},
 		// The bounded-memory sweep.
 		"mqttSession.sweepDeadSendHoldsLocked": {},
+		// NOTHING for the PUBREL action claim, and that absence is the record of what this
+		// list got wrong.
+		//
+		// It used to exempt mergeSendActionLocked, clearSendActionLocked and
+		// publishSendIdentLocked, described as the verbs that install and clear the action
+		// subterm and the reader of its PUBLISH token. NONE OF THE THREE EXISTED: they were
+		// written from the plan rather than from the tree. Each was a standing exemption to
+		// touch sendsInFlight, waiting for whoever next used the name. The self-check below
+		// found the third after the first two were deleted by hand, which is the argument
+		// for having it: a hand-audited exemption list contained three phantoms. The local
+		// action half has since been deleted outright, so there is nothing here to exempt.
 	}
+	// The property is BIDIRECTIONAL, in three parts, and only the first was ever checked:
+	//
+	//  1. every production access belongs to an allow-listed function;
+	//  2. every allow-listed name matches a production declaration;
+	//  3. every allow-listed function actually contains an access.
+	//
+	// Parts 2 and 3 are what make the list the EXACT current access set rather than a
+	// wish-list. Part 2 caught three phantoms. Part 3 catches the slower failure: a
+	// function that once reached the map, stopped, and left its exemption behind for a
+	// later edit to walk into unreviewed.
+	declared := map[string]bool{}
+	accesses := map[string]int{}
 	seen := 0
 	for _, file := range testMQTTProductionFiles(t) {
 		fset := token.NewFileSet()
@@ -1283,6 +1309,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 				continue
 			}
 			qualified := testQualifiedFuncName(fn)
+			declared[qualified] = true
 			_, owner := owners[qualified]
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				sel, _ := n.(*ast.SelectorExpr)
@@ -1290,6 +1317,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 					return true
 				}
 				seen++
+				accesses[qualified]++
 				if !owner {
 					t.Errorf("%s: %s reaches into sendsInFlight directly; presence in that registry is not a "+
 						"reservation, so a reservation reader must ask sendReservedLocked",
@@ -1301,6 +1329,18 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 	}
 	if seen == 0 {
 		t.Error("no sendsInFlight reference was found at all, so this guard checks nothing")
+	}
+	for name := range owners {
+		switch {
+		case !declared[name]:
+			t.Errorf("the owner list exempts %q, which no production declaration matches: delete "+
+				"the entry, or the next function to take that name inherits an unreviewed "+
+				"exemption to touch sendsInFlight", name)
+		case accesses[name] == 0:
+			t.Errorf("the owner list exempts %q, which no longer touches sendsInFlight: delete the "+
+				"entry, because an exemption nothing uses is one a later edit inherits without "+
+				"review", name)
+		}
 	}
 }
 
@@ -1637,7 +1677,7 @@ func TestMQTTInflightReconciliationDecidesOnlyWhatItsWalkCovered(t *testing.T) {
 			final[key] = mqttContestDisposition{
 				class: mqttContestClosed,
 				reg: mqttRecoveredInflightReg{
-					rec: &mqttInflightRecord{PI: 7, Dur: dur, Seq: 21}, seq: 3,
+					rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: dur, Seq: 21}, seq: 3,
 				},
 			}
 		}
@@ -1684,14 +1724,14 @@ func TestMQTTInflightReconciliationRefusesEvidenceForAnotherIdentifier(t *testin
 		{"an owned-live register recovered on another identifier", mqttContestDisposition{
 			class: mqttContestOwnedLive,
 			reg: mqttRecoveredInflightReg{
-				rec: &mqttInflightRecord{PI: otherPI, Dur: dur, Seq: 31, Nonce: mqttNewInflightNonce()},
+				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: otherPI, Dur: dur, Seq: 31, Nonce: mqttNewInflightNonce()},
 				seq: 12,
 			},
 		}},
 		{"a retirement recovered on another identifier", mqttContestDisposition{
 			class: mqttContestRetired,
 			reg: mqttRecoveredInflightReg{
-				rec: &mqttInflightRecord{PI: otherPI, Dur: dur, Seq: 31, Retired: true}, seq: 12,
+				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: otherPI, Dur: dur, Seq: 31, Retired: true}, seq: 12,
 			},
 		}},
 		{"a PUBREL record owning another identifier", mqttContestDisposition{
@@ -1755,7 +1795,7 @@ func TestMQTTInflightRetiredQuarantineReleaseIsStaged(t *testing.T) {
 		map[mqttDeferredKey]mqttContestDisposition{key: {
 			class: mqttContestRetired,
 			reg: mqttRecoveredInflightReg{
-				rec: &mqttInflightRecord{PI: 6, Dur: dur, Seq: 41, Retired: true}, seq: 8,
+				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 6, Dur: dur, Seq: 41, Retired: true}, seq: 8,
 			},
 		}},
 		map[uint16]bool{6: true}, 3, func(mqttStoredPubRel) {})
@@ -2350,7 +2390,7 @@ func TestMQTTInflightClearSweepsOnlyDeadHolds(t *testing.T) {
 // go through it.
 func testDeliverPubRel(t *testing.T, e *testInflightEnv, pi uint16, reply, claim, copySubj string) {
 	t.Helper()
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_, claim, copySubj)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, claim, copySubj)
 	e.c.pa.hdr = hdrLen
 	defer func() { e.c.pa.hdr = 0 }()
 	mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, reply, msg)
@@ -2527,5 +2567,203 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	e.c.mqttProcessPubComp(pi)
 	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
 		t.Fatal("the accounting must stay exact across a withheld PUBCOMP and its redelivery")
+	}
+}
+
+// TestPubRelDeliveryWithholdsAForeignIdentifierForADrainedSource is round 14's finding, and
+// it is the SECOND reader of the same question rather than a second bug.
+//
+// Recovery compares the record's packet identifier against the drain intent's, so a record
+// naming the right source and the right exchange under a foreign identifier is refused
+// there. But PUBREL delivery is asynchronous: the restore gate opens before the PUBREL
+// consumer is installed and before recoverDrainPubRels runs, so the same record can arrive
+// at the callback FIRST. With the identifier left out of the delivery-side gate, it
+// confirmed the drain, persisted the removal of its source claim, acknowledged that source
+// and forwarded a PUBREL under the wrong identifier — after which the client's original
+// exchange had neither its PUBREL nor the evidence to rebuild one.
+//
+// Withheld rather than refused-and-acked, because the record may be the only copy of
+// whatever it does prove and AckWait re-offers it.
+func TestPubRelDeliveryWithholdsAForeignIdentifierForADrainedSource(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-pubrel-foreign-pi")
+	testReadyForPubRelDelivery(t, e)
+	const (
+		dur        = "dur-foreign"
+		sseq       = uint64(19)
+		intentPI   = uint16(6)
+		foreignPI  = uint16(9)
+		ownerNonce = "xxxxxxxxxxxxxxxxxxxxxx"
+	)
+
+	// A drained source past PUBREC, with its intent naming the identifier the client is
+	// waiting on and the exchange that owns it.
+	d := &mqttDrain{
+		cc:   &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + dur, AckPolicy: AckExplicit},
+		qos:  2,
+		seqs: map[uint64]*drainSeq{sseq: {claimed: true, intent: true, pi: intentPI, ownerNonce: ownerNonce}},
+	}
+	e.sess.mu.Lock()
+	e.sess.drains = map[string]*mqttDrain{"sid": d}
+	e.sess.drainByDur = map[string]*mqttDrain{dur: d}
+	e.sess.mu.Unlock()
+
+	// The premise, asserted against the gate itself: this exchange's OWN identifier is
+	// accepted. Without it the refusal below could be any unrelated rejection.
+	if !e.sess.drainIntentOwnedBy(dur, sseq, ownerNonce, intentPI) {
+		t.Fatal("the intent's own identifier and exchange must be accepted, or the refusal proves nothing")
+	}
+	// t.Error rather than t.Fatal: if the gate accepts a foreign identifier, the callback
+	// assertions below are exactly what must be seen to fail, and stopping here would hide
+	// the consequence the finding is about.
+	if e.sess.drainIntentOwnedBy(dur, sseq, ownerNonce, foreignPI) {
+		t.Error("a foreign identifier for a drained source past PUBREC must be refused")
+	}
+
+	// Now through the callback, which is the path that races recovery.
+	//
+	// The record's own JetStream reply subject is OBSERVED, because "withheld" is a claim
+	// about the acknowledgement and nothing else here can see it: a mismatch branch that
+	// acked and then returned would leave the drain untouched and reserve nothing, passing
+	// every other assertion below while irreversibly deleting the record — and that record
+	// may be the only evidence for whichever exchange or affine assignment it really does
+	// belong to.
+	reply := testInflightAckSubject(dur, sseq, 1)
+	ackObs, serr := e.s.nrc.SubscribeSync(reply)
+	if serr != nil {
+		t.Fatalf("subscribe to the record's reply subject: %v", serr)
+	}
+	defer func() { _ = ackObs.Unsubscribe() }()
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush the observer subscription: %v", err)
+	}
+
+	msg, hdrLen := mqttNewCorrelatedPubRel(foreignPI, ownerNonce, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	if msg == nil {
+		t.Fatal("the builder refused a record this test needs")
+	}
+	e.c.pa.hdr = hdrLen
+	mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, reply, msg)
+	e.c.pa.hdr = 0
+
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush after the delivery: %v", err)
+	}
+	if am, aerr := ackObs.NextMsg(250 * time.Millisecond); aerr == nil {
+		t.Errorf("the record was ACKNOWLEDGED (%q on %q): a withheld record must be left for "+
+			"redelivery, because acknowledging destroys the only copy of whatever it does prove",
+			am.Data, am.Subject)
+	}
+
+	e.sess.mu.Lock()
+	st := d.seqs[sseq]
+	claimed, intent, gotPI := st.claimed, st.intent, st.pi
+	phase := st.phase
+	_, reserved := e.sess.pendingPubRel[foreignPI]
+	e.sess.mu.Unlock()
+
+	if !claimed {
+		t.Error("the source claim must SURVIVE: acknowledging it on another exchange's evidence " +
+			"loses the message the client is still waiting for")
+	}
+	if !intent || gotPI != intentPI {
+		t.Errorf("the intent must stand under its ORIGINAL identifier, got intent=%v pi=%d", intent, gotPI)
+	}
+	if phase == drainPubRelConfirmed {
+		t.Error("a record for a foreign identifier must not confirm the drain")
+	}
+	if reserved {
+		t.Errorf("the withheld record must reserve nothing: identifier %d is not this session's to hold",
+			foreignPI)
+	}
+}
+
+// TestPubRelWithholdsAgainstAClaimedDrainWithNoIntent is round 18's first HIGH finding, and
+// the fail-open shape is worth stating precisely because the two cases look identical from
+// inside the gate.
+//
+// drainIntentOwnedBy returned true for BOTH "this source is not drained at all" and "this
+// drain claims the sequence but records no PUBREL intent". The second is not an absence of
+// evidence, it is a CONTRADICTION: the drain says the exchange is still in its PUBLISH
+// phase and a stored PUBREL says the client answered PUBREC, and both cannot be true of one
+// exchange. Returning true let the callback confirm the drain immediately — removing the
+// persisted claim, acknowledging the source and forwarding the PUBREL — with neither the
+// owner nonce nor the identifier compared, because there was no intent to compare them
+// against.
+//
+// A session-record fork produces exactly this pair: the surviving record keeps the
+// pre-PUBREC drain state while a superseded writer's correlated PUBREL survives on
+// $MQTT_out.
+func TestPubRelWithholdsAgainstAClaimedDrainWithNoIntent(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-drain-no-intent")
+	testReadyForPubRelDelivery(t, e)
+	const (
+		dur   = "dur-no-intent"
+		sseq  = uint64(23)
+		pi    = uint16(4)
+		owner = "xxxxxxxxxxxxxxxxxxxxxx"
+	)
+
+	// A CLAIMED drained sequence with NO intent: still in its PUBLISH phase as far as the
+	// record is concerned.
+	d := &mqttDrain{
+		cc:   &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + dur, AckPolicy: AckExplicit},
+		qos:  2,
+		seqs: map[uint64]*drainSeq{sseq: {claimed: true}},
+	}
+	e.sess.mu.Lock()
+	e.sess.drains = map[string]*mqttDrain{"sid": d}
+	e.sess.drainByDur = map[string]*mqttDrain{dur: d}
+	e.sess.mu.Unlock()
+
+	// The premise, both ways, against the gate itself.
+	if e.sess.drainIntentOwnedBy(dur, sseq, owner, pi) {
+		t.Error("a CLAIMED drain with no PUBREL intent contradicts the record and must be refused")
+	}
+	if !e.sess.drainIntentOwnedBy(dur, sseq+1, owner, pi) {
+		t.Error("a sequence this drain does not claim is not its business and must be permitted, " +
+			"or the refusal above is indiscriminate rather than a decision")
+	}
+
+	// The record's own reply subject is observed: withheld means NOT acknowledged.
+	reply := testInflightAckSubject(dur, sseq, 1)
+	ackObs, serr := e.s.nrc.SubscribeSync(reply)
+	if serr != nil {
+		t.Fatalf("subscribe to the reply subject: %v", serr)
+	}
+	defer func() { _ = ackObs.Unsubscribe() }()
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, owner, dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	if msg == nil {
+		t.Fatal("the builder refused a record this test needs")
+	}
+	e.c.pa.hdr = hdrLen
+	mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, reply, msg)
+	e.c.pa.hdr = 0
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatalf("flush after delivery: %v", err)
+	}
+
+	if am, aerr := ackObs.NextMsg(250 * time.Millisecond); aerr == nil {
+		t.Errorf("the source was ACKNOWLEDGED (%q): a record contradicting the drain may not "+
+			"consume it", am.Data)
+	}
+	e.sess.mu.Lock()
+	st := d.seqs[sseq]
+	claimed, phase := st.claimed, st.phase
+	_, reserved := e.sess.pendingPubRel[pi]
+	e.sess.mu.Unlock()
+	if !claimed {
+		t.Error("the source claim must SURVIVE: it is the only thing keeping the payload")
+	}
+	if phase == drainPubRelConfirmed {
+		t.Error("a record contradicting the drain must not confirm it")
+	}
+	if reserved {
+		t.Errorf("the withheld record must reserve nothing, yet identifier %d is held", pi)
 	}
 }

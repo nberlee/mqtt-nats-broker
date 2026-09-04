@@ -745,13 +745,30 @@ func (sess *mqttSession) secureQ2AffPubRelProofs(t *mqttTeardownTarget) error {
 		return nil
 	}
 	pubRelSubject, _, _ := mqttPubRelNames(t.idHash, t.gen)
-	records, ok := sess.scanPubRelRecords(pubRelSubject)
+	records, _, ok := sess.scanPubRelRecords(pubRelSubject)
 	if !ok {
 		return fmt.Errorf("unable to read the stored PUBRELs of session %q before deleting the "+
 			"consumer that retains them: their PUBREC proofs would be destroyed unread", t.id)
 	}
 	s := as.server()
 	for _, r := range records {
+		if r.shapeErr != nil {
+			// UNREADABLE, so no field of it authorizes anything — including a well-formed
+			// affine reference on a record whose identifier, owner or source correlation is
+			// not. Acting on it here would record PubRecProven for an assignment on the
+			// strength of a record nothing can attribute, and this path MUTATES a claim.
+			//
+			// Reported and destroyed with its consumer, which is the same disposition the
+			// refused-reference arm below takes and for the same reason: there is no
+			// assignment this record can be used to correct, and the teardown's obligation
+			// is to say what it is destroying rather than to interpret it.
+			if s != nil {
+				s.Warnf("MQTT: tearing down session %q with a stored PUBREL at sequence %v whose "+
+					"shape this broker does not write (%v): nothing may be proven from it, so it "+
+					"is destroyed with its consumer", t.id, r.seq, r.shapeErr)
+			}
+			continue
+		}
 		if r.affRef.refused() {
 			if s != nil {
 				s.Warnf("MQTT: tearing down session %q with a stored PUBREL whose affine QoS 2 "+

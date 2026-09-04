@@ -495,7 +495,7 @@ func TestPubRelAffineRefTriState(t *testing.T) {
 				strings.Repeat("a", mqttQ2AffClaimHashLen), "short"), mqttPubRelAffineRefMalformed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			msg, hdrLen := mqttNewCorrelatedPubRel(3, _EMPTY_, 0, _EMPTY_, tc.claim, tc.copy)
+			msg, hdrLen := mqttNewCorrelatedPubRel(3, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, tc.claim, tc.copy)
 			// The builder only emits the pair when BOTH are set, so a one-sided case is
 			// assembled by hand — which is the shape a corrupted record actually has.
 			hdr := msg[:hdrLen]
@@ -509,18 +509,45 @@ func TestPubRelAffineRefTriState(t *testing.T) {
 	}
 }
 
-// Every PUBREL form that carries no affine reference must be byte-for-byte what it was.
-// The reference is an addition to one form, not a change to the encoding.
+// Every PUBREL form that carries no affine reference must be byte-for-byte what it was
+// APART FROM the owner header, which is now mandatory on every stored PUBREL. The affine
+// reference is still an addition to one form rather than a change to the encoding.
+//
+// This test used to require the correlated builder's uncorrelated output to equal
+// mqttNewDeliverablePubRel's byte for byte, and that assertion is now FALSE BY DESIGN: the
+// owner identity is what turns a stored PUBREL from a claim on a packet identifier into
+// evidence about one exchange, so a form without it is one this broker refuses to write.
+// The assertion is inverted rather than dropped — the two forms must DIFFER, and by
+// exactly that header — because "they are equal" and "they differ in the way intended" are
+// different facts and only the second one is true.
 func TestOrdinaryPubRelFormsAreUnchanged(t *testing.T) {
 	t.Parallel()
+	const owner = "xxxxxxxxxxxxxxxxxxxxxx"
 	plain, plainLen := mqttNewDeliverablePubRel(9)
-	got, gotLen := mqttNewCorrelatedPubRel(9, _EMPTY_, 0, _EMPTY_, _EMPTY_, _EMPTY_)
-	if gotLen != plainLen || string(got) != string(plain) {
-		t.Fatalf("the uncorrelated form changed:\n want %q\n got  %q", plain, got)
+	got, gotLen := mqttNewCorrelatedPubRel(9, owner, _EMPTY_, 0, _EMPTY_, _EMPTY_, _EMPTY_)
+	if string(got) == string(plain) {
+		t.Fatalf("the owner header is mandatory, so the stored form cannot equal the "+
+			"deliverable one: %q", got)
+	}
+	// And it differs by the owner header ALONE: removing it recovers the plain form
+	// exactly, which is what "an addition to the encoding, not a change to it" means.
+	ownerHdr := mqttPubRelOwnerHeader + ":" + owner + _CRLF_
+	if stripped := strings.Replace(string(got[:gotLen]), ownerHdr, _EMPTY_, 1); stripped != string(plain[:plainLen]) {
+		t.Fatalf("the stored form differs from the deliverable one by more than the owner "+
+			"header:\n want %q\n got  %q", plain[:plainLen], stripped)
+	}
+	// The owner round-trips, so the header is evidence rather than padding.
+	if o := mqttParsePubRelOwner(got[:gotLen]); !o.valid() || o.Nonce != owner {
+		t.Fatalf("the owner identity does not round-trip: %+v", o)
+	}
+	// The builder REFUSES a form with no owner, which is the property that makes the
+	// inequality above a rule rather than an accident.
+	if msg, _ := mqttNewCorrelatedPubRel(9, _EMPTY_, _EMPTY_, 0, _EMPTY_, _EMPTY_, _EMPTY_); msg != nil {
+		t.Fatalf("a stored PUBREL with no exchange identity must not be built: %q", msg)
 	}
 	// A correlated PUBREL with no affine reference: the two source headers and the
 	// deduplication identity, in the order they have always been written.
-	corr, corrLen := mqttNewCorrelatedPubRel(9, "$MQTT_SHARED_0123456789abcdef", 17, "q2rel.x.y.17.0",
+	corr, corrLen := mqttNewCorrelatedPubRel(9, "xxxxxxxxxxxxxxxxxxxxxx", "$MQTT_SHARED_0123456789abcdef", 17, "q2rel.x.y.17.0",
 		_EMPTY_, _EMPTY_)
 	hdr := string(corr[:corrLen])
 	if strings.Contains(hdr, mqttPubRelAffClaimHeader) || strings.Contains(hdr, mqttPubRelAffCopyHeader) {
@@ -551,16 +578,16 @@ func TestQ2AffPubRelFormMaxMatchesTheEncoder(t *testing.T) {
 		mqttQ2AffClaimHashLen + 1 + genW
 	msgId := mqttPubRelMsgId(strings.Repeat("x", sysHashLen), strings.Repeat("x", maxDur),
 		math.MaxUint64, math.MaxUint64)
-	_, encoded := mqttNewCorrelatedPubRel(math.MaxUint16, strings.Repeat("x", maxDur), math.MaxUint64,
+	_, encoded := mqttNewCorrelatedPubRel(math.MaxUint16, "xxxxxxxxxxxxxxxxxxxxxx", strings.Repeat("x", maxDur), math.MaxUint64,
 		msgId, strings.Repeat("x", maxClaimSubject), strings.Repeat("x", maxCopySubject))
 	if bound != encoded {
 		t.Fatalf("the affine PUBREL bound is %d, the real encoder emits %d", bound, encoded)
 	}
 	// Its own candidate: the reference must not have been folded into the affine COPY's
 	// bound, which describes a record that never coexists with this one.
-	withRef, _ := mqttNewCorrelatedPubRel(1, _EMPTY_, 0, _EMPTY_,
+	withRef, _ := mqttNewCorrelatedPubRel(1, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_,
 		strings.Repeat("x", maxClaimSubject), strings.Repeat("x", maxCopySubject))
-	withoutRef, _ := mqttNewCorrelatedPubRel(1, _EMPTY_, 0, _EMPTY_, _EMPTY_, _EMPTY_)
+	withoutRef, _ := mqttNewCorrelatedPubRel(1, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, _EMPTY_, _EMPTY_)
 	if contribution := len(withRef) - len(withoutRef); contribution <= 0 {
 		t.Fatalf("the affine reference contributes %d bytes; the bound cannot be exercised", contribution)
 	}
@@ -636,7 +663,7 @@ func testQ2AffSeedClaim(t *testing.T, b *testQ2AffBroker, idHash, gen string, ss
 func testQ2AffStorePubRel(t *testing.T, sess *mqttSession, pubRelSubject string, pi uint16,
 	ref mqttPubRelAffineRef) {
 	t.Helper()
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_, ref.Claim, ref.Copy)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, ref.Claim, ref.Copy)
 	if _, err := sess.jsa.storeMsg(pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("storing the PUBREL on %q: %v", pubRelSubject, err)
 	}
@@ -1122,7 +1149,7 @@ func TestPubRelAffineRefRefusesRepeatedHeaders(t *testing.T) {
 
 	// Positive control: the single-header form of the very same pair is valid, so a
 	// failure below is about the repetition and not about the fixture's subjects.
-	single, singleLen := mqttNewCorrelatedPubRel(3, _EMPTY_, 0, _EMPTY_, goodClaim, goodCopy)
+	single, singleLen := mqttNewCorrelatedPubRel(3, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, goodClaim, goodCopy)
 	if got := mqttParsePubRelAffineRef(single[:singleLen]).State; got != mqttPubRelAffineRefValid {
 		t.Fatalf("the fixture's own single-header pair is not valid: %v", got)
 	}
@@ -1388,7 +1415,7 @@ func TestQ2AffDuplicatePubRelCallbackDischargesBeforeAcking(t *testing.T) {
 			}
 
 			// The DUPLICATE arrives on sequence 9, naming its own assignment.
-			msg, hdrLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_, claimSubject, copySubject)
+			msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, claimSubject, copySubject)
 			pc := testMQTTGetClient(t, b.s, "dcA")
 			pc.pa.hdr = hdrLen
 			t.Cleanup(func() { pc.pa.hdr = 0 })
@@ -1469,7 +1496,7 @@ func TestQ2AffRefusedCarrierIsReportedOnce(t *testing.T) {
 	// The redelivery is the part that matters: trackAsPubRel replaces the pending entry,
 	// and a suppression flag that goes with it turns "once per connection" into "once per
 	// AckWait cycle" — which is the unbounded stream the rule exists to prevent.
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_, "not-a-claim", "not-a-copy")
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, "not-a-claim", "not-a-copy")
 	pc := testMQTTGetClient(t, b.s, "woA")
 	pc.pa.hdr = hdrLen
 	t.Cleanup(func() { pc.pa.hdr = 0 })
@@ -1543,7 +1570,7 @@ func TestQ2AffDuplicatePubRelReadsItsDurableUnderTheLock(t *testing.T) {
 	prior := sess.pubRelConsumer
 	sess.mu.Unlock()
 
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, _EMPTY_, 0, _EMPTY_, "not-a-claim", "not-a-copy")
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, "not-a-claim", "not-a-copy")
 	pc := testMQTTGetClient(t, b.s, "ddA")
 	pc.pa.hdr = hdrLen
 	t.Cleanup(func() { pc.pa.hdr = 0 })

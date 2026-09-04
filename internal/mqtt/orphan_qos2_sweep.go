@@ -1549,6 +1549,13 @@ type mqttInflightCandidate struct {
 	// SUBJECT is retained rather than swept, and an unreadable BODY is the same
 	// judgement one level down).
 	rec *mqttInflightRecord
+	// decodeErr is WHY rec is nil, carried for the same reason a stored PUBREL's verdict
+	// travels with the record: an unreadable body still has to be REPORTED. Without it the
+	// affine arm below — which needs a body — skipped an unsupported shape in silence, and
+	// its own comment is the argument against that: nothing else revisits such a register
+	// while its generation is referenced, so silence hides continuing accumulation from the
+	// operator who has to act on it. Nil when the body decoded.
+	decodeErr error
 }
 
 // mqttQ2AffSettleableRegister reports whether a register is one the live-generation
@@ -1657,11 +1664,18 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 				// by the SUBJECT and says so ("readability is irrelevant here: an
 				// unreadable orphan is still an orphan"), while the live-generation affine
 				// arm needs a body and simply never matches a nil one.
-				rec := &mqttInflightRecord{}
-				if uerr := json.Unmarshal(smsg.Data, rec); uerr != nil {
+				rec, derr := mqttDecodeInflightRecord(smsg.Data)
+				if derr != nil {
+					// An ILLEGAL SHAPE is unreadable for the same reason malformed JSON is,
+					// and it lands in the same place: nil, with the REASON kept. The orphan
+					// arm is unaffected, and nothing acts on the body — which is the
+					// conservative direction, since acting on a half-written affine
+					// reference is exactly what one decoder exists to prevent.
 					rec = nil
 				}
-				out = append(out, &mqttInflightCandidate{name: name, seq: smsg.Sequence, rec: rec})
+				out = append(out, &mqttInflightCandidate{
+					name: name, seq: smsg.Sequence, rec: rec, decodeErr: derr,
+				})
 			}
 
 			if records >= recordLimit {
@@ -1783,6 +1797,15 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, candidat
 			switch {
 			case serr == nil && srcCache != nil:
 				as.settleRetiredAffineRegister(s, cand, srcCache, budget)
+			case cand.rec == nil && cand.decodeErr != nil:
+				// UNREADABLE, which since the schema was closed is where a half-written
+				// affine reference lands: the decoder refuses it, so no arm can inspect the
+				// state it names. Retained and SAID SO, for exactly the reason the arm
+				// below is said out loud — this register accumulates, nothing else will
+				// revisit it, and the operator is the only one who can act.
+				s.Warnf("MQTT orphaned QoS 2 sweep: retaining the in-flight register on %q at sequence %d: "+
+					"its body is not a shape this broker writes, so nothing may act on it: %v",
+					n.subject, cand.seq, cand.decodeErr)
 			case serr != nil && cand.rec != nil && (cand.rec.Q2AffClaim != _EMPTY_ || cand.rec.Q2AffCopy != _EMPTY_):
 				// A register that CARRIES an affine reference and is nonetheless not
 				// settleable is retained — and SAID SO. The state is permanent and does
@@ -2045,10 +2068,30 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// is invisible from here — this arm reads the register, not the record — so such
 		// a register is still deleted and its verdict stranded. Pre-existing (the sweep
 		// deleted unconditionally before), bounded stale metadata, and filed as F-090.
+		//
+		// PHASE-GATED even with no resident session (census C19), and the absence of a
+		// LOCAL session is exactly why. It does not prove the absence of an exchange: a
+		// legal retired slot in an active PUBREL state can be owned by a session live on
+		// ANOTHER BROKER, and deleting it here would vacate that exchange's only durable
+		// claimant from underneath it. F-090's stranded verdict is a separate concern and
+		// does not license bypassing the fence.
+		//
+		// The gate is applied against the record this sweep has already read, so it costs
+		// no extra round trip; only the state is in question, since the caller proved the
+		// identity to get here.
+		if !mqttInflightTransitionAllowed(mqttSlotDeleteComplete, rec.State) {
+			return false
+		}
 		as.deleteInflightRegister(seq)
 		return true
 	}
-	if !sess.reapRegisterWithVerdict(seq, rec.Nonce, false) {
+	// Census C19: PHASE-GATED. Orphan processing may dispose of a settled affine register,
+	// but it may not vacate a slot that is mid-exchange on a resident session — the whole
+	// point of the durable owner slot is that only its own exchange retires it. The
+	// reference is built from the record this sweep just read, so the gate re-proves the
+	// state at the point of the delete rather than trusting the sweep's earlier read.
+	if !sess.reapRegisterWithVerdictGated(seq, rec.Nonce, false,
+		mqttSlotRefFromRecord(name.subject, seq, rec), mqttSlotDeleteComplete) {
 		return false
 	}
 	as.forgetResidentRetirement(name, rec)

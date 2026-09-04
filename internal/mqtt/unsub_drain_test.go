@@ -1745,3 +1745,176 @@ func testDrainNewDurables(t *testing.T, sess *mqttSession, before map[string]boo
 	}
 	return extra
 }
+
+// TestQuarantinedCompanionDrainRefusesTheWholeFilterOverSubscribe is the same property as
+// TestQuarantineRefusesEverySidOfAWildcardFilter, driven through a real SUBSCRIBE so it
+// reaches processSubs, the adoption site and the session save.
+//
+// A wildcard filter owns a main sid AND a level-up companion, each with its own consumer
+// and, after an UNSUBSCRIBE, its own drain. A per-sid refusal ADOPTED the usable main drain
+// into sess.cons and only then failed on the companion. Per-filter failure cleanup removes
+// subscriptions and returned consumers but does not put an adopted drain back, and the
+// persisted record omits a consumer with no sess.subs membership — so the next SUCCESSFUL
+// save dropped the main drain's Started obligations and its durable identity outright.
+//
+// The quarantined shape is planted in the RECORD, between a restart and the reconnect,
+// because it is a shape this broker cannot write: recordPubRelIntent validates the exchange
+// identity before it saves. Restore is what turns it into a quarantine, so the fixture
+// reaches the same route a real recovery would.
+//
+// The final unrelated SUBSCRIBE is what makes the loss observable: without a successful
+// save afterwards the dropped obligations stay latent in memory.
+func TestQuarantinedCompanionDrainRefusesTheWholeFilterOverSubscribe(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 30 * time.Second // no redelivery may race the assertions
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	const filter = "pairsid/#"
+	const mainSid = "pairsid.>"
+	companionSid := mainSid[:len(mainSid)-2] + mqttMultiLevelSidSuffix
+
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "pairsid"}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: filter, qos: 2}}, []byte{2})
+	testMQTTFlush(t, c, nil, r)
+
+	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "pairsidpub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, pr, mqttConnAckRCConnectionAccepted, false)
+
+	// One unacknowledged QoS 2 delivery on EACH sid: `pairsid/x` reaches the main consumer
+	// and `pairsid` reaches the level-up companion. Both are still in the PUBLISH phase, so
+	// the UNSUBSCRIBE claims each of them and BOTH sids get a drain.
+	for _, topic := range []string{"pairsid/x", "pairsid"} {
+		testMQTTPublish(t, pc, pr, 2, false, false, topic, 1, []byte("payload"))
+		testMQTTCheckPubMsgNoAck(t, c, r, topic, mqttPubQoS2, []byte("payload"))
+	}
+	testMQTTUnsub(t, 2, c, r, []*mqttFilter{{filter: filter}})
+	testMQTTFlush(t, c, nil, r)
+	if n := testDrainCount(testMQTTResidentSession(t, s, "pairsid")); n != 2 {
+		t.Fatalf("the wildcard must leave TWO drains, one per sid, got %d", n)
+	}
+	pc.Close()
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	s = testDrainQoS2Restart(t, s, o)
+
+	// A throwaway client materializes the account session manager the record is
+	// rewritten through; the restarted broker has none until something connects.
+	probe, probeR := testMQTTConnect(t, &mqttConnInfo{clientID: "pairsidprobe", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer probe.Close()
+	testMQTTCheckConnAck(t, probeR, mqttConnAckRCConnectionAccepted, false)
+	asm := testMQTTGetGlobalASM(t, s)
+
+	idHash := string(getHash("pairsid"))
+	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, idHash)
+	if err != nil || smsg == nil {
+		t.Fatalf("loading the persisted record: %v", err)
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		t.Fatalf("decoding the persisted record: %v", err)
+	}
+	planted, mainSeq, compSeq := ps.Drains[mainSid], uint64(0), uint64(0)
+	comp := ps.Drains[companionSid]
+	if planted == nil || comp == nil || len(planted.Started) != 1 || len(comp.Started) != 1 {
+		t.Fatalf("the record must carry one claimed sequence per sid, got main=%+v comp=%+v",
+			planted, comp)
+	}
+	mainSeq = planted.Started[0].Seq
+	// Take the companion's claim past PUBREC with NO exchange identity — the shape
+	// restore quarantines. The main sid keeps its plain PUBLISH-phase claim, so it stays
+	// usable and adoptable, which is the precondition for the partial adoption.
+	comp.Started[0].PubRel = true
+	comp.Started[0].PI = 7
+	comp.Started[0].OwnerNonce = _EMPTY_
+	compSeq = comp.Started[0].Seq
+	body, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatalf("re-encoding the record: %v", err)
+	}
+	if _, err := asm.jsa.storeSessionMsg(asm.domainTk, idHash, 0, body); err != nil {
+		t.Fatalf("planting the quarantined record: %v", err)
+	}
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "pairsid", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	sess := testMQTTResidentSession(t, s, "pairsid")
+
+	var mainDur, compDur string
+	sess.mu.Lock()
+	mainD, compD := sess.drains[mainSid], sess.drains[companionSid]
+	if mainD != nil && mainD.cc != nil {
+		mainDur = mainD.cc.Durable
+	}
+	quarantined := false
+	if compD != nil && compD.cc != nil {
+		compDur = compD.cc.Durable
+		if st := compD.seqs[compSeq]; st != nil {
+			quarantined = st.ownerUnusable
+		}
+	}
+	usable := !sess.drainQuarantinedLocked(mainSid)
+	sess.mu.Unlock()
+	if mainD == nil || compD == nil || mainDur == _EMPTY_ || compDur == _EMPTY_ {
+		t.Fatalf("restore must keep BOTH drains, got main=%v comp=%v", mainD, compD)
+	}
+	if !quarantined {
+		t.Fatal("the planted companion claim has no exchange identity and must restore QUARANTINED; " +
+			"without that the refusal below proves nothing")
+	}
+	if !usable {
+		t.Fatal("the main drain must restore USABLE: a refusal driven by the main sid alone " +
+			"would not exercise the companion at all")
+	}
+
+	// The re-SUBSCRIBE must fail as a WHOLE FILTER, even though its main sid is fine.
+	testMQTTSub(t, 3, c2, r2, []*mqttFilter{{filter: filter, qos: 2}}, []byte{mqttSubAckFailure})
+	testMQTTFlush(t, c2, nil, r2)
+
+	sess.mu.Lock()
+	stillMain, stillComp := sess.drains[mainSid], sess.drains[companionSid]
+	nCons := len(sess.cons)
+	byDurMain, byDurComp := sess.drainByDur[mainDur], sess.drainByDur[compDur]
+	sess.mu.Unlock()
+	if stillMain != mainD {
+		t.Errorf("the refused filter took the main drain away: %v", stillMain)
+	}
+	if stillComp != compD {
+		t.Errorf("the refused filter took the companion drain away: %v", stillComp)
+	}
+	if byDurMain != mainD || byDurComp != compD {
+		t.Errorf("both durables must still resolve to their drain, got %v and %v", byDurMain, byDurComp)
+	}
+	if nCons != 0 {
+		t.Errorf("a refused filter must install NO consumer, got %d", nCons)
+	}
+
+	// Now force a SUCCESSFUL save with an unrelated filter: this is the save that used to
+	// drop the adopted drain's obligations. Both drains, both Started entries and both
+	// durable identities must survive it in the record.
+	testMQTTSub(t, 4, c2, r2, []*mqttFilter{{filter: "pairsid-other", qos: 1}}, []byte{1})
+	testMQTTFlush(t, c2, nil, r2)
+
+	saved := testLoadDrainRecord(t, sess)
+	for sid, want := range map[string]uint64{mainSid: mainSeq, companionSid: compSeq} {
+		pd := saved.Drains[sid]
+		if pd == nil {
+			t.Fatalf("the save dropped the drain on %q: %+v", sid, saved.Drains)
+		}
+		var found bool
+		for _, ds := range pd.Started {
+			if ds.Seq == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the save dropped %q's claim on sequence %d: %+v", sid, want, pd.Started)
+		}
+		if pd.Cons == nil || pd.Cons.Durable == _EMPTY_ {
+			t.Errorf("the save dropped %q's durable identity: %+v", sid, pd)
+		}
+	}
+}

@@ -2813,6 +2813,89 @@ takeover.
   `pendingPubRel` the two are indistinguishable and the cost is an extra PUBREL/PUBCOMP
   cycle, never a payload under the wrong exchange.
 
+  **PARTLY IMPLEMENTED 2026-09-03 — the box STAYS OPEN.** The in-flight register now
+  carries the vocabulary a durable owner slot needs, and every mutation of it is gated.
+  That is the substrate the rest is built on. **The register's lifetime is UNCHANGED —
+  it is still deleted at the PUBREC handoff.** Re-phasing it to survive as the
+  exchange's owner was implemented, failed the ported suite's restart and cross-broker
+  paths (the slot outlived the exchange, because the terminal release it needs belongs
+  to the unbuilt admission work), and was **WITHDRAWN rather than committed
+  half-done**: a surviving slot
+  with no terminal release leaks an identifier per QoS 2 message, which is worse than the
+  hazard it fixes. What the rounds did settle is the premise five whole-item plan revisions
+  failed on: rounds 1-2 established that a stale record cannot be arbitrated against a live
+  one, because identity does not confer authority and two snapshots cannot be compared
+  fail-closed. What landed, all green under `make test` with no data races: a mandatory,
+  never-defaulted `state` on the register and its single legal-shape validator
+  (`internal/mqtt/inflight_slot_state.go`); a **closed schema** at the one decoder, so any
+  unrecognised field makes a record unreadable; a mandatory `Nmqtt-Q2Owner` header on every
+  stored PUBREL with a tri-state parser, decoded as one shape by `mqttDecodeStoredPubRel`;
+  a mandatory `OwnerNonce` **and packet identifier** on the drain intent, required by both
+  the recovery comparison and the asynchronous delivery gate; one gated rewrite path
+  (`casInflightSlot`, which replaced the rebuild-from-arguments pattern in the mark
+  helpers — that pattern silently dropped every field the rebuilder did not know about);
+  and the phase gate wired into the register-mutation and identifier-release edges C01,
+  C04, C05b, C08, C09, C19, C21, C26, C27, C28, C39a/b.
+
+  **What was built and then DELETED before this landed, on a review ruling**, because
+  nothing produced any of it: the four non-`publish` states; the five durable fields
+  `ActionToken`/`ActionClaim`/`ActionClaimSeq` and `PubRelDurable`/`PubRelStreamSeq`;
+  `mqttInflightSlotRef.actionToken` and its `holdsAction`; the `mqttSlotDrainAction`,
+  `mqttSlotTransferCustody` and `mqttSlotAdvancePhase` dispositions; and the whole local
+  half — `mqttSendAction` with its four states, `mqttSendHold.action`,
+  `mqttSendHold.pubIdent`, `actionHeldLocked` and its term in the liveness disjunction.
+  The `publish` state is the only one anything writes, and the validator forbade all five
+  fields in it, so their entire function was to recognise and refuse their own hypothetical
+  semantics — an INCOMPLETE closed schema, since a sixth plausible control field would have
+  been dropped silently by `encoding/json`. A closed schema at the decoder does that job for
+  every key instead of five guessed ones, which is why the deletion STRENGTHENED the
+  F-056/F-057/F-058 posture rather than weakening it. `DisallowUnknownFields` alone was not
+  enough and a further round proved it: `encoding/json` folds case and allows duplicates
+  with the last value winning, so the decoder walks the keys itself — exact case, no
+  duplicates, permitted set derived from the struct's own tags. All of it returns
+  with the admission half, atomically, with the producers and consumers that make it
+  load-bearing. The rules those fields carried are recorded above and below.
+
+  The validator ended up behind **two** boundaries rather than one, and two review rounds
+  were spent getting there. `storeInflightCAS` governs every write. Every READ goes through
+  `mqttDecodeInflightRecord`, because validating the recovery scan alone still left the
+  destructive readers — drain identity release, the gated reap, generation teardown —
+  authorizing a delete from an identity-valid but illegal body. Enumerating the readers was
+  the defect, so an AST guard keeps the decoder the only one there is — and that guard's own
+  allow-list turned out to exempt three functions that did not exist, which is why its
+  property is now bidirectional: every access is exempt, every exemption exists, every
+  exemption is used.
+
+  **What is NOT built, so neither F-092 nor F-093 is fixed:** PUBREL **admission** is
+  unchanged and the register is still deleted at PUBREC, so the stale-record hazard is exactly
+  as before. Named explicitly because a holistic round found the docs claiming
+  otherwise: a **retained** exchange's stored PUBREL surviving a restart is still
+  transmitted. Its owner is syntactically valid, so the recovery filter — which
+  rejects only an absent or malformed one — keeps it, and the ownership gate in the
+  delivery callback is keyed on a source correlation a retained record never carries.
+  A retained send has no register at all (R6), so nothing durable can authorize it
+  and admission is the only place this closes.
+
+  Outstanding are the PUBREC re-phasing and its terminal release, the durable
+  action claim that fences the no-deadline socket write (with its arm-before-CAS holder
+  lifecycle, pre-write abort and drain retry), §7's exact live-PUBLISH-send-token refusal,
+  the terminal states and PUBCOMP's terminal cleanup, canonical/same-nonce duplicate
+  disposal, route B's four-way dispatch and its nine crash cuts, the
+  `mqttInflightClaimWithheldAction` recovery outcome, the remaining census edges, and the
+  test and mutation matrices. The lane `~/.claude/lanes/f-092-fifth-attempt/` holds the
+  signed-off plan (`plan.md`, slice-1 revision 6, IMPLEMENTABLE at round 7), six decisions,
+  the ledger and every review payload.
+
+  **Two rulings from the implementation worth keeping.** A `Claim` with no `ClaimSeq` is
+  LEGAL — the cancellation tombstones at `inflight_register.go:1956` and `:2686` write
+  exactly that and the arbitration compares `cur.ClaimSeq < claimSeq`, so a zero sequence
+  loses rather than being incoherent; only a sequence with no claimant is refused. And a
+  slot deletion needs THREE things, not two: subject addressing (F-034), identity
+  authorization, and a **freshness fence** on the observed sequence — a rewrite means a
+  concurrent operation re-targeted the exchange and reinstalled memory around it, so a stale
+  terminal continuation must preserve the record. F-034 mutation-tested the opposite as M26,
+  and `TestMQTTInflightClaimTerminalRaceHealsPhantomEntry` is the fixture that catches it.
+
   **Supported-scope rule since 2026-09-02:** a later F-092/F-093 implementation must close
   the ordinary, retained, drain and supported recovery paths. It need not preserve or
   classify an experimental affine PUBLISH owner. The affine facts below remain useful
@@ -2864,6 +2947,34 @@ takeover.
   Route C's affine subcase is experimental under the 2026-09-02 scope decision and is not
   part of this item's supported acceptance; routes A and B remain unchanged.
 
+- [ ] **F-094: adopting a drain erases an unfinished past-PUBREC intent.** Filed
+  2026-09-04 by F-092 slice 1's holistic round 19, which found it while reviewing that
+  slice's quarantine. **Pre-existing, and this slice NARROWED it rather than introducing
+  it:** `adoptDrainLocked` has always removed the drain from both maps and turned its
+  consumer back into a plain membership, for any intent; slice 1 added the `ownerUnusable`
+  guard, so an intent nothing can attribute is now refused. A VALID past-PUBREC intent
+  bypasses that guard and follows the unchanged path. *Probed rather than reasoned:*
+  adopting such a drain succeeds, it leaves both drain maps, and the next save persists no
+  `Started` obligations at all. The stored PUBREL can then complete on the ordinary
+  non-drain path while the unacknowledged source is free to redeliver as a fresh PUBLISH —
+  a duplicate of an exchange the client has already answered. Fork repair reaches the same
+  adoption, and its filter-wide quarantine preflight does not fire for a valid intent
+  either.
+
+  *Why it is not fixed in slice 1, ruled by consult 10:* refusing adoption of a valid
+  unfinished intent is **protocol-visible** — an ordinary client re-subscribing during a
+  drain would get `SUBACK 0x80` until the PUBREL completes — so it needs its own design
+  matrix rather than a round patch, and it sits on a path F-092's admission half rewrites.
+  The `docs/ARCHITECTURE.md` fork-repair table's claim that a `draining -> live` adoption's
+  started obligations "are re-established by the later durable scans" is too broad for this
+  case and is qualified there.
+
+  *The likely shape of the fix, recorded so the next attempt does not re-derive it:* the
+  predicate is not "is this intent attributable" but "is this intent DURABLY FINALIZED",
+  which makes every still-claimed past-PUBREC intent non-adoptable until recovery settles
+  it — including one whose recovery failed transiently and whose durable is therefore in
+  the resume skip set. That predicate belongs to both the SUBSCRIBE and the fork-repair
+  preflight, which already share `drainQuarantinedLocked`.
 - [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
   non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).
   NOT an alpha blocker: the residue is one nonce in `CancelledRegs` per occurrence, with

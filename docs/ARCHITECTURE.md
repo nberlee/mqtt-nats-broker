@@ -1905,7 +1905,7 @@ action rows over nine state pairs, no row unreachable:
 | absent | draining | rebuild with `mqttDrainFromPersisted` and file it in BOTH maps (`restoreDrainLocked`) |
 | live | absent | delete `cons[sid]` |
 | live | draining | delete `cons[sid]`, install our drain **with its own `Cons`**; the survivor's displaced live consumer goes to the orphan sweep |
-| draining | live | `adoptDrainLocked(sid)` — keeps the durable; the started obligations are re-established by the later durable scans |
+| draining | live | `adoptDrainLocked(sid)` — keeps the durable; the started obligations are re-established by the later durable scans, EXCEPT for an unfinished past-PUBREC intent, which adoption erases outright (F-094). A QUARANTINED sid refuses the whole filter's repair before this row is reached |
 | draining | draining, equal | nothing |
 | draining | draining, differing | **refused**, a conflict. Losing nothing: the base was already draining, a committed drain adds no fresh claims and completion only removes them, so the survivor still names everything it says is owed |
 | draining | absent | drop both map entries, delete NO durable. Reachable through last-claim completion: our record's omission IS the acknowledged completion, and `finishDrainIfEmpty` already deleted the durable after proving its own save |
@@ -4401,15 +4401,197 @@ would put every outbound QoS 1/2 message behind the record CAS and the record fe
 
 | phase | who owns the identifier |
 |---|---|
-| PUBLISH sent, not yet acknowledged | the in-flight register |
+| PUBLISH sent, not yet acknowledged | the in-flight register, in its `publish` state |
 | past PUBREC | the correlated PUBREL record on `$MQTT_out` (unchanged) |
 
-The handoff is the PUBREL store. On that path the source acknowledgement is
-**confirmed** before the register is deleted — the standing rule wherever a durable
-record is deleted on the strength of an ack — which keeps the register from being
-removed over a source that was never actually released, and so keeps the redelivery's
-identifier. Where a register and a PUBREL record name the same source at recovery,
-the PUBREL record wins.
+**The register's LIFETIME is unchanged: it is still deleted at the PUBREC handoff.**
+What changed is that the register now carries the vocabulary a durable owner slot
+needs — a mandatory `state`, the exchange's canonical PUBREL record identity, and an
+action claim's fields — and that every mutation and deletion of it goes through one
+gated path. Re-phasing it at PUBREC so it survives as the exchange's owner is F-092's
+remaining work and is deliberately **not** done here: without PUBREL admission and a
+terminal release, a surviving slot would outlive the exchange and leak an identifier
+per QoS 2 message, which is worse than the hazard it is meant to fix.
+
+Where this is going, and why: the identifier's owner is described today by **two**
+independently changing durable sets — the registers and the PUBREL records — read by
+two non-transactional scans. Nothing can arbitrate between them, which is what lets a
+stale PUBREL record be transmitted under an identifier a later exchange owns (F-092).
+One authoritative record removes the arbitration question rather than answering it,
+and the `state` field is the first half of that.
+
+The source acknowledgement is still **confirmed** before the register is deleted — the
+standing rule wherever a durable record is deleted on the strength of an ack — which
+keeps the register from being removed over a source that was never actually released,
+and so keeps the redelivery's identifier. Where a register and a PUBREL record name
+the same source at recovery, the PUBREL record wins.
+
+**Every mutation of a slot goes through one gated path.** `casInflightSlot` loads the
+record, proves the occupant is still this exchange, applies the phase gate, mutates
+only the caller's own fields and CASes at the sequence the load returned. Rebuilding a
+record from remembered arguments — which the mark helpers used to do — silently dropped
+every field the rebuilder did not know about, and once a register carries a phase and a
+canonical record identity that is a defect rather than a shortcut.
+
+Deletion is **subject-addressed, identity-authorized and freshness-fenced**, and those
+are three separate requirements. The subject is the address (F-034); the exchange nonce
+and source authorize; and the observed sequence is a CAS-version check asking whether
+the record has moved since the caller decided. A rewrite means a concurrent operation
+re-targeted this exchange and reinstalled memory around it, so a stale terminal
+continuation **preserves** the record — deleting it would remove the only durable
+evidence needed to reconcile that memory once the source completes. F-034
+mutation-tested the opposite as M26.
+
+A DUPLICATE PUBREC — the client retransmitting because it never received the PUBREL
+([MQTT-4.3.3]) — is recognised by the absence of a `pendingPublish` entry beside a live
+`pendingPubRel` one, and it is ANSWERED with a NAK on that stored PUBREL's own delivery.
+Two failure modes bound the handling and both were reached in review. Calling
+`trackAsPubRel` again overwrites the live entry with an empty placeholder, leaving the
+handler with no source and no exchange identity, refusing the store and terminating the
+connection on a legitimate duplicate. Returning silently instead leaves the client waiting
+for `AckWait` — a configurable interval, and at a Receive Maximum of 1 the session's whole
+outbound QoS 1/2 stream stalls behind that one exchange. The NAK re-offers the record at
+once so the ordinary delivery path retransmits it with its fencing, send holds and
+acknowledgement debt intact, which writing a PUBREL from the read loop would bypass. In the
+window before the first delivery attempt the entry has no ack subject yet, and `sendMsg`
+declines an empty subject, so the placeholder needs no special case.
+
+A stored PUBREL's headers are decoded as ONE shape, by `mqttDecodeStoredPubRel`, and no
+field of it authorizes anything until every field is legal. That includes CARDINALITY and
+exact parsing, because the individual header parsers are deliberately lenient for their own
+callers: `mqttParsePubRelNATSHeader` discards `strconv`'s error, so `Nmqtt-PubRel:65536`
+came back as 65535 — a plausible identifier that is not the one the record names — and
+every one of these headers takes the first occurrence, so a record carrying two identifiers
+or two source-correlation pairs was accepted with the reader silently choosing one. Both
+are refused here rather than resolved by an arbitrary rule, which is the same answer a
+duplicate member gets on the register. The identifier must be present
+and nonzero, the exchange owner must be valid, and a source correlation may be absent — a
+retained send has none — but a PARTIAL one is refused rather than read as uncorrelated,
+because uncorrelated **is** the retained shape. The affine reference is deliberately not a
+clause: a malformed one does not stop the record being transmitted, since the client is
+owed the PUBREL, but it does stop the record being acknowledged away, so it travels as the
+tri-state it is and the caller that needs it decides.
+
+The identifier clause is there because leaving it out was a live defect. Drain recovery
+indexed the stored PUBRELs by source and confirmed an intent on source plus owner, parsing
+each record's identifier and then discarding it — so a record naming the right source and
+the right exchange under a **foreign** identifier confirmed the intent as durable proof,
+the claim was finalized and the source could be acknowledged while the client's original
+exchange had no PUBREL and no evidence left to recreate one from. Recovery now requires the
+record's identifier to equal the one the intent persisted; a mismatch is treated as no
+record, so the exchange recreates its own.
+
+**Both** readers of that question ask it, and the second one is not redundancy. PUBREL
+delivery is asynchronous: the restore gate opens before the PUBREL consumer is installed and
+before drain recovery runs, so the same record can reach the delivery callback first. With
+the identifier left out of the delivery-side gate it confirmed the drain, persisted the
+removal of the source claim, acknowledged that source and forwarded a PUBREL under the wrong
+identifier. The gate is WITHHOLDING, not refusing-and-acking, because the record may be the
+only copy of whatever it does prove and `AckWait` re-offers it.
+
+The **scan does not filter**, and that split is load-bearing. `scanPubRelRecords` returns
+every record with its own decode verdict attached, because the dispositions genuinely
+differ: a reader that would DERIVE something — register recovery suppressing a source as
+past PUBREC, drain recovery confirming an intent — skips an unsupported record, while the
+affine-proof walk and the generation teardown must SEE it, since their question is what
+evidence is about to be destroyed with the consumer that retains it.
+
+**Seeing it is not acting on it, and that distinction had to be enforced rather than
+assumed.** Both affine consumers read the record's affine reference without consulting the
+verdict, so an owner-less record carrying a well-formed reference could resolve an
+assignment, record `PubRecProven`/`AffineDone` and reap the claim — suppressing or
+retracting a real loss on evidence nothing can attribute. Each of the four consumers now
+states its own disposition: register recovery and drain recovery SKIP, the proof walk
+returns INCOMPLETE (the record may be the very proof it was looking for, so no loss may be
+inferred either way), and the teardown reports it and destroys it with its consumer. A
+guard requires every consumer of the scan to consult the verdict; it catches an absent
+check, and the behavioural tests catch a disabled one. A first version
+dropped refused records inside the scan and would have made the teardown destroy an affine
+PUBREC proof unread while reporting nothing. For the same reason the decode fills every
+field before returning its verdict: a verdict describes a record, it does not license
+handing on an undescribed one.
+
+A stored PUBREL carries a **mandatory** `Nmqtt-Q2Owner` header naming its exchange, so
+it is evidence about one exchange rather than a claim on an identifier. Absent or
+malformed is an unsupported persisted shape and is refused. A retained QoS 2 send has
+no register at all (R6), so it mints its exchange nonce into the in-memory reservation
+and carries it on the record; its authority is that reservation and nothing durable. Such
+a record surviving a restart is therefore **not** refused today — its owner is
+syntactically valid and recovery has nothing to compare it against — and that is
+`docs/CONFORMANCE.md`'s stated residual rather than a property of this mechanism.
+
+A drain's past-PUBREC intent carries the same identity on the session record, as its
+`OwnerNonce`, and it is validated before the intent is saved. An intent restored WITHOUT
+one names no exchange, so nothing may act on it and nothing may take its place: the drain
+is **quarantined**, which means its sid keeps it and no subscription cycle can adopt it,
+stage over it or drop it. The broker cannot write that shape, so the quarantine exists for
+records from elsewhere.
+
+**A quarantine refuses the whole filter, not the sid, at BOTH callers.** The preflight is
+in `processSubs` and in fork repair's `applyGrantChangeLocked`; the second came a round
+later for the reason the first exists: repair mutated the membership and option maps before
+processing its sids and discarded `adoptDrainLocked`'s refusal, so a wildcard with a usable
+main drain and a quarantined companion reported the filter applied — main adopted, companion
+refused — and the accept save then persisted a live filter whose drain obligations it no
+longer carried. Refusing the whole change converges, because repair is a convergence step
+and the next resume tries again, where a half-applied filter loses obligations permanently.
+
+ A wildcard such as `foo/#` owns a
+main sid and a level-up companion, each with its own consumer and its own drain, and a
+per-sid refusal adopted the usable one before failing on the other — leaving an adopted
+drain that the per-filter failure cleanup does not put back and that the next successful
+save then dropped, obligations and durable identity together. So every sid the filter
+covers is checked before any of them is touched, and a SUBSCRIBE naming a quarantined
+drain is answered with a failure code for that filter.
+
+The register's `state` is mandatory and is **never defaulted**: reading an absent state
+as `publish` would license a PUBLISH under an identifier already past PUBREC. Legality
+is decided by one validator (`mqttValidateInflightShape`) rather than by each reader,
+because every earlier attempt at this subsystem failed by classifying owner state at
+the point of use, where the set of legal shapes never closed.
+
+That validator sits behind **two** boundaries and no other code path reaches a persisted
+register without crossing one of them: `storeInflightCAS` for every write, and
+`mqttDecodeInflightRecord` for every read. The read boundary also closes the SCHEMA, so a
+record carrying any field this broker does not define is unreadable rather than partially
+interpreted. That replaced five fields the record declared purely in order to forbid them
+in the one state anything writes: naming the keys to reject closes exactly the set someone
+guessed in advance, where closing the schema covers the ones nobody thought of.
+
+**`DisallowUnknownFields` is not enough to close it, and a review round proved that with
+counterexamples.** `encoding/json` matches member names case-insensitively and permits
+duplicates with the last value winning, so `{"state":"pubrel_ready","state":"publish"}` and
+`{"STATE":"pubrel_ready","state":"publish"}` both decoded to an ordinary `publish` record
+while carrying an unsupported state — the exact reading that licenses a PUBLISH under an
+identifier already past PUBREC, and indistinguishable downstream from a legitimate record.
+So the decoder walks the object's keys itself: each member name must be a field this broker
+defines, spelled EXACTLY, and appear at most once. The permitted set is derived from the
+struct's own JSON tags by reflection, because a hand-maintained list is what put three
+names that do not exist into an AST guard's allow-list elsewhere in this change.
+
+Trailing content is refused by `json.Unmarshal`, which is why the typed decode uses it
+rather than a `json.Decoder`. `Decoder.More` is the wrong instrument — it answers "is there
+another element in this array or object", so it returns false when the next byte is `]` or
+`}`, and a record followed by a stray closing delimiter was accepted. A second trailing
+check inside the key walk was deleted once a mutation showed it could never be the cause of
+a refusal: two mechanisms stating one fact is how a reader and a writer come to disagree.
+
+The read boundary is the later of the two and
+the reason it is a boundary rather than a check is worth keeping. Adding the matrix to the
+recovery scan alone still left `mqttSlotAdmitsDisposition` and the generation teardown
+authorizing irreversible work — a delete, a claim release, a consumer removal — from a body
+that was identity-valid and otherwise illegal. Enumerating the destructive readers was the
+defect, so there is exactly one decoder and an AST guard
+(`TestMQTTInflightRecordsAreDecodedThroughOneAPI`) keeps it the only one. An illegal shape
+is UNREADABLE, which every caller already had a conservative path for: retain the record,
+reserve the identifier, prove nothing from the body.
+
+**What is not yet built, and is deliberately named here rather than implied:** PUBREL
+admission is exactly as it was, the register is still deleted at PUBREC, and the
+durable action claim that fences the socket write, the terminal states, route B's
+dispatch and the withheld-action recovery outcome are all F-092's remaining work. The
+stale-PUBREL multiplexing hazard is therefore **still open**. What exists now is the
+shape, the identity and the gating that the rest is built on.
 
 An acknowledgement that cannot be confirmed needs one more thing. The source may still
 be pending, so JetStream will re-offer it — and its payload is past PUBREC, so sending

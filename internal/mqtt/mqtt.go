@@ -2780,6 +2780,19 @@ type mqttPending struct {
 	// per-entry state alone would strand the identifier. What this half is for is
 	// fencing the condemnation and the settle execution to one section (F-087 WP5).
 	sendNonce string
+	// slot is the CAPTURED durable identity of this delivery's owner slot: its subject and
+	// name, the sequence it was observed at, the exchange nonce, the source and the custody.
+	//
+	// Captured rather than re-derived, and that is the whole point. A destructive path that
+	// rebuilds the subject from the session's CURRENT idHash and generation plus a passed
+	// identifier loses the snapshot boundary — it would address whatever the session is now
+	// rather than the exchange this entry was about. The reference also carries the observed
+	// sequence, which is the freshness fence a stale terminal continuation is checked
+	// against (see reapRegisterWithVerdictGated).
+	//
+	// Zero for an entry with no durable slot: a retained send has none (R6).
+	slot mqttInflightSlotRef
+
 	// sendSettle is the continuation a removal path parked because a send section was
 	// active. The FIRST parked settle wins: a later remover still performs its own
 	// durable work, but neither replaces this disposition nor executes it early, which
@@ -2860,6 +2873,18 @@ type mqttSendHold struct {
 	// reservation this session refuses on sess.c != cc — so the orphaned frame is one
 	// PUBLISH under one identifier on one socket and needs no reservation at all.
 	retainedGen string
+	// NOTE: the LOCAL half of the PUBREL action claim is deliberately NOT here.
+	//
+	// mqttSendAction, its four-state lifecycle, this registry's `action` subterm and a
+	// `pubIdent` token for the admission check were all built and then DELETED before
+	// this landed, on a review ruling: nothing on this tree mints an action, because the
+	// only thing that would is the unbuilt PUBREL write path, so every one of them was a
+	// field with no producer and a liveness term that could never fire. They establish no
+	// persisted format and need no migration, so they cost nothing to re-add with the
+	// admission half that gives them a producer and a consumer — and re-adding them there
+	// is strictly better than shipping comments that describe a lifecycle the code does
+	// not have. See docs/ROADMAP.md's F-092 bullet.
+
 }
 
 // mqttRetainedFrame is one buffered retained PUBLISH and the reservation that holds its
@@ -8304,6 +8329,39 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		if f.qos > 2 {
 			f.qos = 2
 		}
+		// A QUARANTINED drain refuses the WHOLE FILTER, checked here because the filter —
+		// not the sid — is the atomicity boundary.
+		//
+		// A wildcard such as `foo/#` owns a main sid AND a level-up companion, and the
+		// per-sid refusal downstream processed them independently: a usable main drain was
+		// ADOPTED into sess.cons and only the companion then failed. The per-filter failure
+		// cleanup removes subscriptions and returned consumers but does not put an adopted
+		// drain back, and the persisted record omits a consumer with no sess.subs
+		// membership — so the next successful save dropped that drain's Started obligations
+		// and its durable identity outright.
+		//
+		// Refused up front, before anything is adopted, so there is no partial state to
+		// roll back. This is the same property three earlier rounds converged on, applied
+		// at the boundary that actually holds it.
+		if f.qos > 0 && !f.shared {
+			quarantined := _EMPTY_
+			sess.mu.Lock()
+			for _, sid := range mqttUnsubSids(f.sessionKey()) {
+				if sess.drainQuarantinedLocked(sid) {
+					quarantined = sid
+					break
+				}
+			}
+			sess.mu.Unlock()
+			if quarantined != _EMPTY_ {
+				c.Errorf("MQTT: refusing filter %q of client %q: its drained delivery on %q is past "+
+					"PUBREC with an unusable exchange identity, so nothing may act on it and nothing "+
+					"may take its place; remove that record to restore the filter",
+					f.filter, sess.id, quarantined)
+				f.qos = mqttSubAckFailure
+				continue
+			}
+		}
 		if f.shared && f.qos == 2 && !c.mqtt.experimentalSharedQoS2 {
 			c.Warnf("Downgrading shared subscription QoS2 to QoS1 for %q; shared QoS2 is experimental", f.filter)
 			f.qos = 1
@@ -11797,7 +11855,18 @@ func (sess *mqttSession) trackPublishRetained() uint16 {
 	if pi == 0 {
 		return 0
 	}
-	sess.pendingPublish[pi] = &mqttPending{}
+	// The exchange nonce is minted HERE even though a retained send has no register (R6).
+	//
+	// A retained delivery's PUBREC stores a PUBREL like any other, and that record carries a
+	// MANDATORY exchange identity — so an entry with no nonce cannot produce a storable
+	// record at all. A review found this the hard way: without the mint, every outbound
+	// retained QoS 2 replay stalled at PUBREC and could terminate the connection, because
+	// the builder refused the empty owner and the handler returned an error.
+	//
+	// Minted rather than derived: there is no register to take an identity from, which is
+	// exactly why retained is the one exchange whose identity lives only in memory. Its
+	// authority is this entry, so a retained record surviving a restart has none.
+	sess.pendingPublish[pi] = &mqttPending{regNonce: mqttNewInflightNonce()}
 
 	return pi
 }
@@ -12234,8 +12303,9 @@ func (sess *mqttSession) clearRetiredSource(c *client, jsDur string, sseq uint64
 	sess.mu.Lock()
 	var regSeq uint64
 	var nonce string
+	var retiredPI uint16
 	if rs := sess.srcAckOwed[key]; rs != nil {
-		regSeq, nonce = rs.regSeq, rs.nonce
+		regSeq, nonce, retiredPI = rs.regSeq, rs.nonce, rs.pi
 	}
 	delete(sess.srcAckOwed, key)
 	sess.mu.Unlock()
@@ -12243,7 +12313,24 @@ func (sess *mqttSession) clearRetiredSource(c *client, jsDur string, sseq uint64
 		// Through the verdict property: this settle holds the exchange nonce, so a
 		// cancellation verdict naming the register it deletes is released against the
 		// proof of that deletion rather than stranded (F-087 WP3).
-		sess.reapRegisterWithVerdict(regSeq, nonce, false)
+		//
+		// PHASE-GATED (census C08). Clearing the retired SOURCE is what this settle
+		// discharges; the exchange's owner slot is a different fact, and past PUBREC that
+		// slot is the identifier's only claimant. The reference is built from the
+		// retirement, which carries both the identifier and the exchange nonce.
+		var slot *mqttInflightSlotRef
+		sess.mu.Lock()
+		idHash, gen := sess.idHash, sess.gen
+		sess.mu.Unlock()
+		if idHash != _EMPTY_ && gen != _EMPTY_ && retiredPI != 0 {
+			if nm, perr := mqttParseInflightSubject(mqttInflightSubject(idHash, gen, retiredPI)); perr == nil {
+				slot = &mqttInflightSlotRef{
+					name: *nm, seq: regSeq, nonce: nonce,
+					state: mqttInflightPublish, dur: jsDur, sseq: sseq,
+				}
+			}
+		}
+		sess.reapRegisterWithVerdictGated(regSeq, nonce, false, slot, mqttSlotDeleteComplete)
 	}
 	c.Debugf("MQTT: settled retired QoS 2 source %s/%d for client %q", jsDur, sseq, sess.id)
 }
@@ -17364,6 +17451,54 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		return nil
 	}
 	if isPubRec && !pubRecFailed {
+		// A DUPLICATE PUBREC is classified BEFORE either map is touched, and that order is
+		// the whole point.
+		//
+		// The client may retransmit PUBREC ([MQTT-4.3.3]) and the original handoff has then
+		// already replaced pendingPublish[pi] with a PUBREL entry. Calling trackAsPubRel
+		// first would overwrite that live entry with an empty placeholder, and the rest of
+		// this handler would then find nothing to work from — no source, and no exchange
+		// identity for the record it is about to store. The store would be refused, the
+		// rollback would delete the placeholder, and the handler would return an error that
+		// TERMINATES THE CONNECTION, taking the live PUBREL tracking with it. A legitimate
+		// duplicate acknowledgement must not do any of that.
+		//
+		// The PUBLISH entry's absence is what identifies the duplicate: this exchange is
+		// already past PUBREC, so there is nothing to hand off and nothing to store. The
+		// existing PUBREL entry keeps its own identity and its own ack subject.
+		//
+		// But it must be ANSWERED, not merely left alone. A client retransmits PUBREC
+		// precisely because it did not receive the PUBREL ([MQTT-4.3.3]), so returning
+		// silently leaves it waiting for JetStream's AckWait — a configurable interval that
+		// can be long — and at a Receive Maximum of 1 that stalls the session's whole
+		// outbound QoS 1/2 stream behind one exchange. An earlier revision of this branch
+		// did exactly that, and its comment claimed the retransmission was "answered by the
+		// exchange that already exists", which nothing performed.
+		//
+		// The answer is a NAK on the stored PUBREL's own delivery, so JetStream re-offers
+		// it AT ONCE and the ordinary delivery path retransmits it — with that path's
+		// fencing, its send holds and its acknowledgement debt intact. Writing a PUBREL
+		// from this read loop instead would duplicate the send section's job and bypass
+		// them. Sent after the lock is released, like every other NAK here.
+		//
+		// A placeholder entry with no ack subject yet is the window between trackAsPubRel
+		// and the first delivery attempt: its original store is still in flight and will
+		// deliver, so there is nothing to re-offer and nothing to wait for. That case needs
+		// no branch here — the subject is empty and sendMsg declines it.
+		if _, hasPub := sess.pendingPublish[pi]; !hasPub {
+			if rel, hasRel := sess.pendingPubRel[pi]; hasRel {
+				dupNak := _EMPTY_
+				if rel != nil {
+					dupNak = rel.jsAckSubject
+				}
+				sess.mu.Unlock()
+				// Unconditionally: sendMsg's own first line returns on an empty subject, so
+				// a guard here would be a second mechanism stating one fact — and a
+				// mutation proved it unobservable, which is what that always looks like.
+				sess.jsa.sendMsg(dupNak, AckNak)
+				return nil
+			}
+		}
 		// The JS ACK subject for the PUBREL will be filled in at the delivery
 		// attempt.
 		sess.trackAsPubRel(pi, _EMPTY_)
@@ -17412,7 +17547,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		if deferredRelease {
 			return
 		}
-		sess.deleteInflightRegisterFor(ack)
+		sess.deleteInflightRegisterFor(ack, mqttSlotDeleteComplete)
 	}
 
 	if isPubRec && !pubRecFailed {
@@ -17450,7 +17585,14 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			// advance. Only a CONFIRMED PUBREL — delivered, or found present at its
 			// sequence by the resume barrier — may finalize it (I2b).
 			drainedPubRel = true
-			attempt, definite, ierr := sess.recordPubRelIntent(c, srcDur, srcSeq, pi)
+			// The intent carries the EXCHANGE identity, not a fresh one: recovery may have
+			// to recreate this record, and only the identity the owner slot already names
+			// makes the recreate the same exchange rather than a new one.
+			var intentOwner string
+			if removed != nil {
+				intentOwner = removed.regNonce
+			}
+			attempt, definite, ierr := sess.recordPubRelIntent(c, srcDur, srcSeq, pi, intentOwner)
 			if ierr != nil {
 				if definite {
 					sess.mu.Lock()
@@ -17480,7 +17622,43 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// as a LOST delivery for a message the client had already answered. The PAIR
 		// rather than the claim subject alone, because a claim subject is reused by a
 		// later incarnation. See pubrel_correlation.go and qos2_shared_affine.go.
-		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, srcDur, srcSeq, msgId, q2AffClaim, q2AffCopy)
+		// ownerNonce is the EXCHANGE's identity, taken off the entry this PUBREC removed
+		// rather than minted here: the record is evidence about that exchange, and a fresh
+		// identity would make it evidence about nothing. It is the same value the durable
+		// owner slot carries, so the delivery callback can match the two.
+		//
+		// A delivery with no entry to take it from reaches this only as a duplicate or
+		// stale PUBREC, which the handler declines before here; the builder refuses an
+		// invalid nonce as a second line rather than writing an unattributable record.
+		var ownerNonce string
+		if removed != nil {
+			ownerNonce = removed.regNonce
+		}
+		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, ownerNonce, srcDur, srcSeq, msgId, q2AffClaim, q2AffCopy)
+		if natsMsg == nil {
+			// No exchange identity, so nothing may be stored: an unattributable record
+			// would be refused by every reader anyway, and storing it would leave stream
+			// residue an operator has to remove. Roll the PUBREC back exactly as a failed
+			// store does below.
+			sess.mu.Lock()
+			if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ {
+				delete(sess.pendingPubRel, pi)
+				sess.retrackPublishLocked(pi, removed)
+			}
+			sess.mu.Unlock()
+			return errMQTTInvalidSession
+		}
+		// NOTE: the PUBREC HANDOFF is deliberately NOT here yet.
+		//
+		// The durable owner slot (inflight_slot_state.go) is in place and authoritative for
+		// the PUBLISH phase, but re-phasing it to PUBREL_READY at PUBREC — so that it
+		// survives as the exchange's owner instead of being deleted here — only becomes
+		// safe once PUBREL ADMISSION and the terminal release exist. Landing the transition
+		// without them leaves the slot outliving the exchange, which leaks an identifier
+		// per QoS 2 message: strictly worse than the hazard it is meant to fix.
+		//
+		// So the register's lifetime is UNCHANGED: it is still deleted at the handoff
+		// below, exactly as before. F-092's remaining work is what moves it.
 		_, err = sess.jsa.storeMsg(sess.pubRelSubject, headerLen, natsMsg)
 		if err != nil {
 			// The in-memory state was advanced BEFORE the store (it has to be:
@@ -18732,7 +18910,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			// message dropped here never paid for one. It runs anyway because `started`
 			// is not the only way an entry can carry a register — a drain-claimed
 			// redelivery reaches this point with one.
-			sess.deleteInflightRegisterFor(removed)
+			sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 			if !sess.finalizeDrainSource(cc, removed) {
 				sess.jsa.sendAck(reply)
 			}
@@ -18778,7 +18956,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
-		sess.deleteInflightRegisterFor(removed)
+		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 		if !sess.finalizeDrainSource(cc, removed) {
 			sess.jsa.sendAck(reply)
 		}
@@ -18794,12 +18972,37 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	}
 
 	hdr, _ := pc.msgParts(rmsg)
-	pi := mqttParsePubRelNATSHeader(hdr)
-	if pi == 0 {
+	// ONE decode, before anything is derived from any single header. See
+	// mqttDecodeStoredPubRel: the identifier, the exchange owner, the affine reference
+	// and the source correlation are one shape, and a record only some of whose headers
+	// are legal is evidence of nothing.
+	shape, derr := mqttDecodeStoredPubRel(hdr)
+	if derr != nil {
+		// WITHHELD: return without acking, exactly as the transmission gate does, and
+		// JetStream re-offers it.
+		//
+		// It may not be transmitted — the client would receive a PUBREL for an exchange
+		// nothing can attribute — and it may not be acknowledged away either, because
+		// acknowledging destroys the only copy of whatever it was. PUBREL carries no DUP
+		// ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing further is owed. An
+		// operator or generation cleanup removes it; the cost is stream space rather than
+		// an identifier, because the record reserves nothing.
+		//
+		// This does NOT yet decide admission against the owner slot — that is F-092's
+		// remaining work. It decides only that a record of an unsupported shape is not
+		// acted on at all.
+		pc.Warnf("MQTT: withholding a stored PUBREL: %v", derr)
 		return
 	}
-	corr := mqttParsePubRelCorrelation(hdr)
-	affRef := mqttParsePubRelAffineRef(hdr)
+	pi := shape.pi
+	corr := mqttPubRelCorrelation{SrcDur: shape.srcDur, SrcSeq: shape.srcSeq, Ok: shape.srcDur != _EMPTY_}
+	affRef := shape.affRef
+
+	// The owner identity is REQUIRED and was decided by the decode above — before the
+	// drain interaction, before either pending map is touched, before any
+	// acknowledgement and before the send section opens. A stored PUBREL is EVIDENCE
+	// about one exchange, not a claim on a packet identifier.
+	owner := shape.owner
 
 	// This is the client associated with the subscription.
 	cc := sub.client
@@ -18840,6 +19043,30 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// time. The cost is one session-record save before a drained PUBREL reaches the
 	// client (I10). See unsub_drain.go.
 	if corr.Ok {
+		// THE DRAIN'S OWN IDENTITY IS PROVEN BEFORE ANYTHING IS FINALIZED, and syntactic
+		// validity above is not that proof.
+		//
+		// The correlation names a SOURCE, and a source can legitimately have more than one
+		// stored PUBREL — a superseded broker's late store is a supported shape. Confirming
+		// the drain on the correlation alone therefore lets a record belonging to a
+		// DIFFERENT exchange remove the claim, acknowledge the source and forward its
+		// PUBREL: the client completes an exchange it never started, and the real one's
+		// evidence is gone. The resume barrier already refuses that by exact owner match,
+		// but PUBREL delivery is asynchronous, so this path can race ahead of the barrier
+		// and reach the same state the barrier exists to prevent.
+		//
+		// A mismatch is WITHHELD rather than acknowledged: the record may be the only copy
+		// of whatever it does prove, and AckWait re-offers it. PUBREL carries no DUP
+		// ([MQTT-3.6.1-1]), so nothing further is owed.
+		if !sess.drainIntentOwnedBy(corr.SrcDur, corr.SrcSeq, owner.Nonce, pi) {
+			sess.mu.Lock()
+			id := sess.id
+			sess.mu.Unlock()
+			cc.Warnf("MQTT: withholding a stored PUBREL for packet identifier %d of client %q: it "+
+				"names drained source %s/%d but not the exchange and identifier that source's "+
+				"intent owns", pi, id, corr.SrcDur, corr.SrcSeq)
+			return
+		}
 		if d, claimed := sess.confirmDrainPubRel(corr.SrcDur, corr.SrcSeq); d != nil && claimed {
 			sess.finalizeDrainDelivery(cc, corr.SrcDur, corr.SrcSeq, _EMPTY_)
 			sess.mu.Lock()
@@ -19679,6 +19906,17 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 	// QoS 0. See unsub_drain.go.
 	if qos > 0 {
 		sess.adoptDrainLocked(sid)
+	}
+	// A QUARANTINED drain owns its sid EXCLUSIVELY. The refusal is enforced per FILTER in
+	// processSubs, before anything is adopted, because a wildcard owns two sids and a
+	// per-sid refusal here left the main drain adopted while the companion failed. This
+	// second line stays because provisioning is reached from more than one caller.
+	if qos > 0 && sess.drainQuarantinedLocked(sid) {
+		sess.mu.Unlock()
+		c.Errorf("MQTT: refusing to provision filter %q of client %q: a drained delivery on that "+
+			"filter is past PUBREC with an unusable exchange identity, so nothing may act on it "+
+			"and nothing may take its place; remove that record to restore the filter", sid, sess.id)
+		return nil, nil, nil, fmt.Errorf("mqtt: filter %q has a quarantined drained delivery", sid)
 	}
 	cc, exists := sess.cons[sid]
 	tmaxack := sess.tmaxack

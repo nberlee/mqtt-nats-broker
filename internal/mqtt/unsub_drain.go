@@ -126,6 +126,27 @@ type mqttPersistedDrainSeq struct {
 	// barrier repairs it from the register scan rather than treating it as "no register".
 	// See inflight_register.go.
 	RegSeq uint64 `json:"reg_seq,omitempty"`
+
+	// OwnerNonce is the EXCHANGE identity this drained delivery owns, persisted with the
+	// intent and BEFORE the PUBREL is stored.
+	//
+	// Not redundant with the record's own header: recovery may find the record MISSING and
+	// have to recreate it, and minting a replacement nonce there would create a DIFFERENT
+	// exchange — one the durable owner slot does not name, so the recreated record could
+	// never act. The intent is therefore where the identity has to live, because the intent
+	// is what proves the exchange is past PUBREC in the first place.
+	//
+	// MANDATORY wherever PubRel is set. A marker-less intent cannot have been written by
+	// this broker, so it is an unsupported persisted shape and REFUSES THE WHOLE SESSION
+	// RECORD, read-only, on F-057's precedent — never per entry, because this field is
+	// nested in the authoritative $MQTT_sess record and accepting it per entry would force
+	// a later save to reserialize an unsupported shape, normalize it (migration), or refuse
+	// the save.
+	//
+	// owesPubRel() deliberately does NOT test it. A missing nonce must never read as "no
+	// PUBREL owed": that would redeliver the payload of an exchange already past PUBREC,
+	// which is strictly worse than the refusal.
+	OwnerNonce string `json:"owner,omitempty"`
 }
 
 // drainSeq is the in-memory state of one drained sequence.
@@ -188,9 +209,23 @@ type drainSeq struct {
 	// to prevent it. regSeq is a hint and may never authorize progress, including by being
 	// zero.
 	regAmbiguous bool
+	// ownerUnusable means this sequence's PERSISTED INTENT carries no usable exchange
+	// identity, so nothing may be finalized on it.
+	//
+	// Separate from regAmbiguous, and a review is the reason. I first reused that flag, but
+	// recomputeDrainRegisterStateLocked deliberately RECOMPUTES it from scratch on every
+	// complete scan — that is what lets a duplicate-register pair converge once the pair
+	// vanishes — so the marker was cleared on the next resume and the quarantine evaporated.
+	// This one is derived from the record's own bytes, not from a scan, so nothing
+	// recomputes it away.
+	ownerUnusable bool
 	// regSeq is this delivery's in-flight register (see mqttPersistedDrainSeq.RegSeq).
 	// The drain owns it from staging until the exchange completes, and releases it there.
 	regSeq uint64
+	// ownerNonce is the exchange identity (see mqttPersistedDrainSeq.OwnerNonce). Set with
+	// the intent, and what a recreate must write so the record names the same exchange the
+	// owner slot does.
+	ownerNonce string
 }
 
 // mqttDrain is a draining consumer in memory.
@@ -238,6 +273,7 @@ func (d *mqttDrain) startedSeqs() []mqttPersistedDrainSeq {
 		}
 		out = append(out, mqttPersistedDrainSeq{
 			Seq: seq, PubRel: st.intent, PI: st.pi, Attempt: st.attempt, RegSeq: st.regSeq,
+			OwnerNonce: st.ownerNonce,
 		})
 	}
 	if len(out) == 0 {
@@ -280,6 +316,24 @@ func (d *mqttDrain) persisted() *mqttPersistedDrain {
 // an adoption cannot double-charge) and every phase starts at drainPublish —
 // recovery reconstructs the real phase from the persisted intent plus the stored
 // PUBREL records, BEFORE any source interest exists.
+// An intent with no usable exchange identity is RESTORED, and marked non-finalizable
+// rather than refused, and the reason is worth stating because I got it wrong first.
+//
+// Such a record cannot have been written by this broker — recordPubRelIntent validates the
+// identity before it saves, and jsa.storeInflightCAS validates every register write — so it
+// only exists if something else produced it. The documented answer for an unsupported
+// persisted shape is a read-only refusal of the WHOLE session record (F-057's shape), and I
+// implemented it here by returning nil.
+//
+// A review caught that this does not refuse anything: restoreDrainsFromRecord passes the nil
+// to restoreDrainLocked, whose nil guard merely SKIPS the drain. The session was then accepted
+// WITHOUT its past-PUBREC drain, and a later save could erase the drain metadata while its
+// consumer and its pending exchange were stranded — strictly worse than restoring it.
+//
+// A real refusal needs an error propagated through normal restore, expiry, teardown and
+// fork-repair. That plumbing is not built, so the honest behaviour is: restore the drain, mark
+// the sequence NON-FINALIZABLE so nothing acts on evidence it cannot attribute, and say in
+// docs/CONFORMANCE.md that the whole-record refusal is unbuilt rather than claiming it.
 func mqttDrainFromPersisted(pd *mqttPersistedDrain) *mqttDrain {
 	if pd == nil || pd.Cons == nil {
 		return nil
@@ -299,9 +353,29 @@ func mqttDrainFromPersisted(pd *mqttPersistedDrain) *mqttDrain {
 		}
 		// The INTENT is what says this exchange is past PUBREC — never the mere
 		// presence of a packet identifier, which a PUBLISH-phase delivery also has.
-		d.seqs[s.Seq] = &drainSeq{
+		//
+		// `PubRel` ALONE is that fact, and folding the identifier into it was a defect a
+		// review round found. The predicate used to be `PubRel && PI != 0`, so a record
+		// explicitly saying "past PUBREC" with a zero identifier read as NOT past PUBREC:
+		// neither quarantined nor visible to PUBREL recovery, restored as an ordinary
+		// claimed source, and therefore eligible to have its payload redelivered — a
+		// duplicate of an exchange the client has already answered. An unsupported shape
+		// must never be interpreted as the SAFE-looking one.
+		ds := &drainSeq{
 			claimed: true, intent: s.owesPubRel(), pi: s.PI, attempt: s.Attempt, regSeq: s.RegSeq,
+			ownerNonce: s.OwnerNonce,
 		}
+		if ds.intent && (s.PI == 0 || !s.ownerNonceUsable()) {
+			ds.ownerUnusable = true
+			// Past PUBREC with nothing that can attribute it — no identifier, or no
+			// exchange identity: nothing may finalize on it. The same flag the
+			// duplicate-register case uses, and for the same reason — which one the client
+			// holds is unknowable, so NONE may be released and this delivery may not
+			// finalize. Convergence is at the next resume once an operator has removed the
+			// record.
+			ds.regAmbiguous = true
+		}
+		d.seqs[s.Seq] = ds
 	}
 	return d
 }
@@ -309,7 +383,22 @@ func mqttDrainFromPersisted(pd *mqttPersistedDrain) *mqttDrain {
 // owesPubRel reports whether the record says this sequence's exchange is past
 // PUBREC, so its payload must never be resent and its PUBREL must be recreated if
 // missing. Derived from the PERSISTED intent, never from the absence of evidence.
-func (s mqttPersistedDrainSeq) owesPubRel() bool { return s.PubRel && s.PI != 0 }
+//
+// `PubRel` is the whole predicate. It deliberately does NOT test the identifier or the
+// owner nonce: those say whether the intent can be ACTED ON, which is a different question
+// from whether the exchange is past PUBREC, and answering the second with the first is how
+// an unsupported record came to be read as an ordinary pre-PUBREC delivery. The callers
+// quarantine what they cannot attribute; none of them may un-know the phase.
+func (s mqttPersistedDrainSeq) owesPubRel() bool { return s.PubRel }
+
+// ownerNonceUsable reports whether this intent carries the exchange identity a recreate
+// needs. DELIBERATELY separate from owesPubRel: a missing identity must never read as "no
+// PUBREL owed", because that would redeliver the payload of an exchange already past
+// PUBREC. It is asked where the intent is RESTORED, so an unsupported one is refused
+// rather than turned into a drain nothing can ever complete.
+func (s mqttPersistedDrainSeq) ownerNonceUsable() bool {
+	return mqttValidInflightNonce(s.OwnerNonce)
+}
 
 // ---------------------------------------------------------------------------
 // State transitions
@@ -335,6 +424,23 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	seqPis := sess.cpending[cc.Durable]
 	if len(seqPis) == 0 {
 		return false // nothing was started; ordinary teardown
+	}
+	// A QUARANTINED drain already under this sid is NOT overwritten, and this closes the
+	// second-order bypass a review found in the adoption refusal.
+	//
+	// Refusing adoption keeps the quarantined drain in sess.drains[sid] but lets a fresh
+	// live consumer be provisioned under that same sid. A second UNSUBSCRIBE would then
+	// stage a NEW drain into the same map slot, leaving the quarantined one reachable only
+	// through drainByDur — and because the record serializes drains by the sid map, the
+	// next successful save omitted the marker-less intent entirely. After a restart its
+	// source looked like an ordinary delivery and could be retransmitted despite durable
+	// evidence it was past PUBREC.
+	//
+	// So the older, quarantined drain wins the slot and this consumer takes the ordinary
+	// immediate teardown instead. That is the same disposition draining-not-allowed already
+	// uses, and it keeps one owner per sid.
+	if sess.drainQuarantinedLocked(sid) {
+		return false
 	}
 
 	d := &mqttDrain{
@@ -709,7 +815,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		current := sess.drainByDur[jsDur] == d && d.seqs[sseq] == st
 		idHash, gen, pi, ambiguous := sess.idHash, sess.gen, uint16(0), false
 		if cur := d.seqs[sseq]; cur != nil {
-			pi, ambiguous = cur.pi, cur.regAmbiguous
+			pi, ambiguous = cur.pi, cur.regAmbiguous || cur.ownerUnusable
 		}
 		sess.mu.Unlock()
 		capIDHash, capGen, capturedIdentity = idHash, gen, true
@@ -1311,7 +1417,16 @@ const mqttDrainPubRelAttempts = 3
 // in the first case and resolve the sequence in the second.
 //
 // No lock held on entry.
-func (sess *mqttSession) recordPubRelIntent(c *client, jsDur string, sseq uint64, pi uint16) (attempt uint64, definite bool, err error) {
+// ownerNonce is the exchange identity, persisted HERE — before the PUBREL store — for the
+// reason the field's own comment gives: a recreate must be able to name the same exchange
+// the durable owner slot names, and the intent is the only thing that survives to tell it.
+func (sess *mqttSession) recordPubRelIntent(c *client, jsDur string, sseq uint64, pi uint16, ownerNonce string) (attempt uint64, definite bool, err error) {
+	// Validated BEFORE anything is mutated or saved. Persisting an intent with no usable
+	// exchange identity writes the very shape the restore path now refuses, so the session
+	// would be unable to resume — the broker must not be the source of that record.
+	if !mqttValidInflightNonce(ownerNonce) {
+		return 0, true, errMQTTInvalidSession
+	}
 	sess.mu.Lock()
 	d := sess.drainByDur[jsDur]
 	if d == nil {
@@ -1343,8 +1458,8 @@ func (sess *mqttSession) recordPubRelIntent(c *client, jsDur string, sseq uint64
 	}
 	// Set the phase under the lock, so a PUBREL callback that fires the instant the
 	// store lands cannot take the resend path.
-	prevPhase, prevPI, prevIntent := st.phase, st.pi, st.intent
-	st.phase, st.pi, st.intent = drainPubRelUncertain, pi, true
+	prevPhase, prevPI, prevIntent, prevOwner := st.phase, st.pi, st.intent, st.ownerNonce
+	st.phase, st.pi, st.intent, st.ownerNonce = drainPubRelUncertain, pi, true, ownerNonce
 	attempt = st.attempt
 	sess.mu.Unlock()
 
@@ -1352,7 +1467,7 @@ func (sess *mqttSession) recordPubRelIntent(c *client, jsDur string, sseq uint64
 	if outcome == saveDefinitelyFailed {
 		// Nothing landed, so put the session back exactly as it was — inside the
 		// transaction, before any other writer can see (or persist) the intent.
-		sess.rollbackPubRelIntent(d, sseq, prevPhase, prevPI, prevIntent)
+		sess.rollbackPubRelIntent(d, sseq, prevPhase, prevPI, prevIntent, prevOwner)
 	}
 	if terr := sess.endRecordTx(tok); terr != nil && c != nil {
 		c.Errorf("MQTT: %v", terr)
@@ -1375,12 +1490,65 @@ func (sess *mqttSession) recordPubRelIntent(c *client, jsDur string, sseq uint64
 
 // rollbackPubRelIntent restores a sequence's phase after an intent write that
 // definitively did not land.
-func (sess *mqttSession) rollbackPubRelIntent(d *mqttDrain, sseq uint64, phase drainPhase, pi uint16, intent bool) {
+func (sess *mqttSession) rollbackPubRelIntent(d *mqttDrain, sseq uint64, phase drainPhase, pi uint16, intent bool, ownerNonce string) {
 	sess.mu.Lock()
 	if st := d.seqs[sseq]; st != nil {
-		st.phase, st.pi, st.intent = phase, pi, intent
+		st.phase, st.pi, st.intent, st.ownerNonce = phase, pi, intent, ownerNonce
 	}
 	sess.mu.Unlock()
+}
+
+// drainIntentOwnedBy reports whether the drained sequence's own intent names BOTH owner and
+// pi — or whether this source is not a drained one at all, in which case there is no intent
+// to contradict and the ordinary path applies.
+//
+// A drained sequence with a past-PUBREC intent whose identity does NOT match is refused:
+// the record belongs to another exchange, and nothing about this source may be finalized on
+// it. An intent with no usable identity of its own is refused too, which is what keeps the
+// quarantine on a marker-less intent independent of any scan-derived ambiguity.
+//
+// The IDENTIFIER is part of the same question, and this is the second place it had to be
+// added. Recovery compares it because a record naming the right source and exchange under a
+// foreign identifier would otherwise confirm the intent; PUBREL delivery is ASYNCHRONOUS
+// and races ahead of that comparison, so the same record arriving here would confirm the
+// drain, persist the removal of its source claim, acknowledge the source and forward a
+// PUBREL under the wrong identifier — leaving the client's original exchange with neither
+// its PUBREL nor the evidence to rebuild one. Both readers now ask the whole question.
+//
+// No lock held on entry.
+func (sess *mqttSession) drainIntentOwnedBy(jsDur string, sseq uint64, owner string, pi uint16) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	d := sess.drainByDur[jsDur]
+	if d == nil {
+		return true // not a drained source
+	}
+	st := d.seqs[sseq]
+	if st == nil {
+		return true // this drain does not claim that sequence: not ours to contradict
+	}
+	if !st.intent {
+		// A CLAIMED drain with NO intent is not "no intent to contradict" — it is a
+		// contradiction. The drain says this sequence is still in its PUBLISH phase, and a
+		// stored PUBREL for it says the client answered PUBREC; both cannot be true of the
+		// same exchange, so nothing about this source may be finalized on the strength of
+		// the record.
+		//
+		// Conflating the two was a fail-open path a review round found. Returning true here
+		// let the callback call confirmDrainPubRel immediately, which — while the entry is
+		// still claimed — removes the persisted claim, acknowledges the source and forwards
+		// the PUBREL, with neither the owner nonce nor the identifier compared, because
+		// there was no intent to compare them against. A session-record fork produces
+		// exactly this pair: the surviving record keeps the pre-PUBREC drain state while a
+		// superseded writer's correlated PUBREL survives on $MQTT_out, so another
+		// exchange's record could consume this source and its register.
+		//
+		// An unclaimed entry is different and is permitted: the claim is already released,
+		// so there is nothing left for the record to consume, and confirmDrainPubRel
+		// refuses an unclaimed sequence on its own.
+		return !st.claimed
+	}
+	return mqttValidInflightNonce(st.ownerNonce) && st.ownerNonce == owner && st.pi == pi
 }
 
 // confirmDrainPubRel promotes a sequence to drainPubRelConfirmed. Only DELIVERY of
@@ -1544,6 +1712,17 @@ type mqttStoredPubRel struct {
 	// complete an affine copy, malformed on a shape this broker does not write, and it
 	// is the caller's job to keep those two apart.
 	affRef mqttPubRelAffineRef
+	// shapeErr is this record's own decode verdict from mqttDecodeStoredPubRel, non-nil for
+	// a shape this broker does not write. It travels WITH the record because the callers'
+	// dispositions differ: a reader that would act on the record skips it, while the
+	// affine-proof walk and the teardown must still see what they are about to destroy.
+	shapeErr error
+	// owner is the EXCHANGE identity this record belongs to, as a tri-state. Carried here
+	// because every consumer of this scan decides something on the record's behalf — does
+	// an intent's PUBREL exist, which identifiers are past PUBREC — and none of those
+	// decisions is safe on a record whose exchange cannot be established. Absent or
+	// malformed is refused by the consumer, not repaired here.
+	owner mqttPubRelOwner
 }
 
 // mqttPubRelSourceKey keys a source delivery for the indexes built over these
@@ -1564,37 +1743,63 @@ func mqttPubRelSourceKey(dur string, seq uint64) string {
 // partial walk is NEVER evidence of absence for either caller.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) scanPubRelRecords(pubRelSubject string) (records []mqttStoredPubRel, ok bool) {
+// Every record is RETURNED, each carrying its own decode verdict in shapeErr, and nothing
+// is filtered out here. That is deliberate and it is the correction to a first attempt that
+// dropped the refused ones.
+//
+// The dispositions genuinely differ per caller, so a refusal that is right for one is wrong
+// for another. Register recovery and drain recovery must not DERIVE anything from an
+// unsupported record — it would suppress a live source as past PUBREC, or confirm an intent
+// — so they skip it. The affine-proof walk and the teardown must SEE it: their question is
+// what evidence is about to be destroyed with the consumer that retains it, and a record
+// they cannot attribute is still evidence they may not destroy unread. Dropping it here
+// would have made the teardown silently destroy an affine PUBREC proof it exists to secure.
+//
+// refused is the count, for the diagnostic a caller emits to an operator.
+func (sess *mqttSession) scanPubRelRecords(pubRelSubject string) (records []mqttStoredPubRel, refused int, ok bool) {
 	if pubRelSubject == _EMPTY_ {
-		return nil, true
+		return nil, 0, true
 	}
 	for seq := uint64(1); ; {
 		smsg, err := sess.jsa.loadNextMsgFromSeq(mqttOutStreamName, pubRelSubject, seq)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				return records, false
+				return records, refused, false
 			}
-			return records, true
+			return records, refused, true
 		}
 		seq = smsg.Sequence + 1
-		r := mqttStoredPubRel{seq: smsg.Sequence, pi: mqttParsePubRelNATSHeader(smsg.Header)}
-		if corr := mqttParsePubRelCorrelation(smsg.Header); corr.Ok {
-			r.srcDur, r.srcSeq = corr.SrcDur, corr.SrcSeq
+		// Decoded as ONE shape rather than header by header: a record only some of whose
+		// headers are legal is evidence of nothing to any caller that would act on it.
+		// See mqttDecodeStoredPubRel.
+		//
+		// The verdict TRAVELS with the record rather than removing it, and `ok` stays true
+		// either way — conflating a per-record refusal with an unreadable SCAN would skip
+		// drains that have nothing wrong with them.
+		shape, derr := mqttDecodeStoredPubRel(smsg.Header)
+		if derr != nil {
+			refused++
 		}
-		r.affRef = mqttParsePubRelAffineRef(smsg.Header)
-		records = append(records, r)
+		records = append(records, mqttStoredPubRel{
+			seq: smsg.Sequence, pi: shape.pi, srcDur: shape.srcDur, srcSeq: shape.srcSeq,
+			affRef: shape.affRef, owner: shape.owner, shapeErr: derr,
+		})
 	}
 }
 
 func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 	sess.mu.Lock()
 	type claim struct {
-		d       *mqttDrain
-		seq     uint64
-		pi      uint16
-		attempt uint64
+		d          *mqttDrain
+		seq        uint64
+		pi         uint16
+		attempt    uint64
+		ownerNonce string
 	}
 	var claims []claim
+	// Durables whose past-PUBREC intent cannot be attributed at all. They are SKIPPED
+	// rather than claimed: see the branch below.
+	skipUnattributable := map[string]bool{}
 	for _, d := range sess.drains {
 		if d.qos < 2 {
 			continue
@@ -1604,31 +1809,71 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 			// it provably never got a durable PUBREC, so its payload is redelivered
 			// with DUP and the client re-PUBRECs ([MQTT-4.3.3]) — the ordinary
 			// failover-before-PUBREC path, which completes rather than stalls.
-			if st.claimed && st.intent && st.pi != 0 {
-				claims = append(claims, claim{d, seq, st.pi, st.attempt})
+			if !st.claimed || !st.intent {
+				continue
 			}
+			if st.pi == 0 || st.ownerUnusable {
+				// Past PUBREC and UNATTRIBUTABLE. It cannot join the claims below —
+				// there is no identifier to compare a record against, and no identity to
+				// recreate one under — but it must not be silently absent either: this
+				// drain's durable goes into the SKIP set, so recoverDrains does not
+				// restore source interest for it and the payload of an exchange the
+				// client has already answered is never redelivered. The claim stays,
+				// so the source is never acknowledged either.
+				skipUnattributable[d.cc.Durable] = true
+				continue
+			}
+			claims = append(claims, claim{d, seq, st.pi, st.attempt, st.ownerNonce})
 		}
 	}
 	pubRelSubject := sess.pubRelSubject
 	idHash := sess.idHash
 	sess.mu.Unlock()
 	if len(claims) == 0 {
-		return nil
+		// Still return the skip set: an unattributable intent with no other claim beside
+		// it is exactly the case where returning nil would let source interest be
+		// restored for it.
+		if len(skipUnattributable) == 0 {
+			return nil
+		}
+		return skipUnattributable
 	}
 
 	// Index every PUBREL record still on this session's subject by the source it
 	// names. An unreadable scan is never evidence of absence.
-	records, scanned := sess.scanPubRelRecords(pubRelSubject)
+	records, refused, scanned := sess.scanPubRelRecords(pubRelSubject)
 	if !scanned {
 		c.Errorf("MQTT: unable to scan the PUBREL records of client %q", sess.id)
 	}
-	found := make(map[string]uint64, len(records))
+	if refused > 0 {
+		c.Warnf("MQTT: ignoring %d stored PUBREL record(s) of client %q whose shape this broker "+
+			"does not write: they are never transmitted, never acknowledged and reserve no "+
+			"identifier; remove them from the %s stream", refused, sess.id, mqttOutStreamName)
+	}
+	// Indexed by SOURCE, but carrying the record's exchange identity, because the source
+	// key alone cannot answer the question this index is used for. Two records can name one
+	// source — a superseded broker's late store is a supported shape — and only one of them
+	// belongs to the exchange the intent is about.
+	type foundRel struct {
+		seq   uint64
+		pi    uint16
+		owner mqttPubRelOwner
+	}
+	found := make(map[string]foundRel, len(records))
 	key := mqttPubRelSourceKey
 	for _, r := range records {
-		found[key(r.srcDur, r.srcSeq)] = r.seq
+		if r.shapeErr != nil {
+			// Nothing may be DERIVED from an unsupported record. Left in the index it
+			// would satisfy an intent, finalize the claim and let the source be
+			// acknowledged; skipped, the exchange recreates its own record under its own
+			// identity and identifier, and the stray one is left for the operator or
+			// generation cleanup.
+			continue
+		}
+		found[key(r.srcDur, r.srcSeq)] = foundRel{seq: r.seq, pi: r.pi, owner: r.owner}
 	}
 
-	skip := make(map[string]bool)
+	skip := skipUnattributable
 	if !scanned {
 		for _, cl := range claims {
 			skip[cl.d.cc.Durable] = true
@@ -1638,12 +1883,37 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 
 	var confirmed []claim
 	for _, cl := range claims {
-		if _, ok := found[key(cl.d.cc.Durable, cl.seq)]; ok {
-			// Intent present, record present: the exchange is past PUBREC and its
-			// PUBREL exists. The callback will forward it; the claim is finalized
-			// here rather than waiting on that asynchronous delivery.
-			confirmed = append(confirmed, cl)
-			continue
+		if fr, ok := found[key(cl.d.cc.Durable, cl.seq)]; ok {
+			// Intent present, record present — but "present" is not enough. The record
+			// must belong to THIS EXCHANGE, proven by an exact owner-identity match
+			// against the identity the intent persisted.
+			//
+			// Matching on the source alone was the defect a holistic review found: a
+			// record naming the right source but a different exchange, or one whose owner
+			// header is absent or malformed, would satisfy the intent and finalize the
+			// drain claim — acknowledging a source on the strength of evidence belonging
+			// to someone else. A mismatch is treated as NO record, which is the safe
+			// reading: the recreate below stores the exchange's own record under its own
+			// identity, and the stray one is left for the operator or generation cleanup.
+			// The IDENTIFIER is part of that proof, and leaving it out was a second
+			// defect of the same kind. The scan parses each record's packet identifier;
+			// discarding it let a record with the right source and the right owner but a
+			// FOREIGN identifier confirm the intent, after which the delivery path would
+			// send a PUBREL under that other identifier — or withhold one entirely — while
+			// this exchange's source was acknowledged and its evidence removed. The
+			// intent persisted the identifier the client is waiting on, so an exact match
+			// is required.
+			if fr.owner.valid() && mqttValidInflightNonce(cl.ownerNonce) &&
+				fr.owner.Nonce == cl.ownerNonce && fr.pi == cl.pi {
+				// The exchange is past PUBREC and its own PUBREL exists. The callback
+				// will forward it; the claim is finalized here rather than waiting on
+				// that asynchronous delivery.
+				confirmed = append(confirmed, cl)
+				continue
+			}
+			c.Warnf("MQTT: the PUBREL found for drained sequence %v of client %q does not belong to "+
+				"this exchange (owner state %v, identifier %d, expected %d); recreating this "+
+				"exchange's own record", cl.seq, sess.id, fr.owner.State, fr.pi, cl.pi)
 		}
 		// Intent present, NO record: the store never landed (skipped for lack of
 		// interest, say) or the record was deleted. Recreate it under the recorded
@@ -1652,7 +1922,7 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 		// An intent that is still present also proves the exchange was not
 		// finalized — the callback removes claim and intent before forwarding — so a
 		// missing record can never mean "already completed".
-		if err := sess.recreateDrainPubRel(c, idHash, pubRelSubject, cl.d, cl.seq, cl.pi, cl.attempt); err != nil {
+		if err := sess.recreateDrainPubRel(c, idHash, pubRelSubject, cl.d, cl.seq, cl.pi, cl.attempt, cl.ownerNonce); err != nil {
 			c.Errorf("MQTT: unable to recreate the PUBREL for drained sequence %v of client %q: %v", cl.seq, sess.id, err)
 			skip[cl.d.cc.Durable] = true
 			continue
@@ -1767,12 +2037,20 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 // attempt (a fresh deduplication identity) and retries.
 //
 // No lock held on entry.
-func (sess *mqttSession) recreateDrainPubRel(c *client, idHash, pubRelSubject string, d *mqttDrain, sseq uint64, pi uint16, attempt uint64) error {
+// ownerNonce is the exchange identity from the PERSISTED INTENT, and it is not optional:
+// the recreated record must name the same exchange the durable owner slot does, so minting
+// a fresh one here would produce a record no slot authorizes and which therefore could
+// never act. An intent that carries no valid nonce is an unsupported persisted shape and
+// is refused by the caller before reaching here.
+func (sess *mqttSession) recreateDrainPubRel(c *client, idHash, pubRelSubject string, d *mqttDrain, sseq uint64, pi uint16, attempt uint64, ownerNonce string) error {
+	if !mqttValidInflightNonce(ownerNonce) {
+		return errMQTTDrainPubRelUnverified
+	}
 	for i := 0; i < mqttDrainPubRelAttempts; i++ {
 		msgId := mqttPubRelMsgId(idHash, d.cc.Durable, sseq, attempt)
 		// No affine reference: a DRAINED source is a plain QoS 2 consumer's, never a
 		// shared group's affine copy, so there is no assignment for it to name.
-		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, d.cc.Durable, sseq, msgId, _EMPTY_, _EMPTY_)
+		natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, ownerNonce, d.cc.Durable, sseq, msgId, _EMPTY_, _EMPTY_)
 		resp, err := sess.jsa.storeMsg(pubRelSubject, headerLen, natsMsg)
 		if err != nil {
 			return err
@@ -1785,8 +2063,17 @@ func (sess *mqttSession) recreateDrainPubRel(c *client, idHash, pubRelSubject st
 		// Presence at the returned sequence is the ONLY proof (I12).
 		if resp != nil && resp.Sequence > 0 {
 			if smsg, lerr := sess.jsa.loadMsg(mqttOutStreamName, resp.Sequence); lerr == nil && smsg != nil {
-				if corr := mqttParsePubRelCorrelation(smsg.Header); corr.Ok &&
-					corr.SrcDur == d.cc.Durable && corr.SrcSeq == sseq {
+				// The owner identity is verified alongside the correlation. A record at
+				// this sequence naming the right source but a DIFFERENT exchange is not
+				// the record this intent owes — it is another exchange's, and accepting
+				// it would let the drain finalize against evidence the owner slot does
+				// not authorize.
+				// Through the one decoder, so this verification is at least as strict
+				// as every reader that will act on the record afterwards — including
+				// the IDENTIFIER, which is what the client is waiting on.
+				shape, derr := mqttDecodeStoredPubRel(smsg.Header)
+				if derr == nil && shape.srcDur == d.cc.Durable && shape.srcSeq == sseq &&
+					shape.owner.Nonce == ownerNonce && shape.pi == pi {
 					return nil
 				}
 			}
@@ -1812,9 +2099,48 @@ func (sess *mqttSession) recreateDrainPubRel(c *client, idHash, pubRelSubject st
 // Returns true when a drain was adopted.
 //
 // sess.mu must be held.
+// drainQuarantinedLocked reports whether a drain under sid holds a sequence nothing may act
+// on: a past-PUBREC intent whose exchange identity is unusable.
+//
+// This is the PROPERTY three review rounds converged on, and stating it once is the point.
+// Each round found the same bypass one subscription cycle further out — adoption erased the
+// quarantine, then a second UNSUBSCRIBE took its sid, then the dual drain-and-consumer state
+// it left was lossy under fork repair. Each was a symptom of the same thing: the quarantine
+// did not OWN its sid exclusively. So it does now, and every path that would occupy or
+// provision under that sid asks this one question rather than re-deriving the condition.
+//
+// Session lock held on entry.
+func (sess *mqttSession) drainQuarantinedLocked(sid string) bool {
+	d := sess.drains[sid]
+	if d == nil {
+		return false
+	}
+	for _, st := range d.seqs {
+		if st != nil && st.ownerUnusable {
+			return true
+		}
+	}
+	return false
+}
+
 func (sess *mqttSession) adoptDrainLocked(sid string) bool {
 	d := sess.drains[sid]
 	if d == nil {
+		return false
+	}
+	// A QUARANTINED sequence REFUSES adoption, and a review found why that matters: this is
+	// reached by any ordinary QoS>0 re-SUBSCRIBE (and again by fork repair), and it removes
+	// the drain from both maps and turns its consumer back into a plain membership. That
+	// erased the marker-less-intent quarantine by routine client behaviour — a successful
+	// save then omits the persisted intent entirely, so a stored PUBREL could take the
+	// ordinary non-drain path or a later restart could redeliver a payload the record
+	// already proved was past PUBREC.
+	//
+	// Refusing keeps the drain, its consumer and its persisted intent exactly where they
+	// are. The caller reads false as "no drain to adopt" and provisions afresh, which is
+	// what it already does for a filter that never had one — so the refusal costs a
+	// consumer, not correctness, and it converges when an operator removes the record.
+	if sess.drainQuarantinedLocked(sid) {
 		return false
 	}
 	delete(sess.drains, sid)

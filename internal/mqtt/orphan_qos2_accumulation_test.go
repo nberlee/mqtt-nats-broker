@@ -349,7 +349,7 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 	// built with), so whichever way it was written, one of the two rewrote it and
 	// re-broke the other. Assignments format identically under both.
 	base := func() (*mqttInflightRecord, *mqttInflightName) {
-		rec := &mqttInflightRecord{
+		rec := &mqttInflightRecord{State: mqttInflightPublish,
 			PI: 7, Dur: affDur, Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce(),
 			Q2AffClaim: mqttQ2AffClaimSubject("$MQTT_SHARED_S", 9), Q2AffCopy: copySubj,
 			Retired: true,
@@ -457,7 +457,7 @@ func (e *testOrphanEnv) testRetiredAffineRegister(t *testing.T, pi uint16, name 
 	sessGen := e.sess.gen
 	e.sess.mu.Unlock()
 	regSubject = mqttInflightSubject(idHash, sessGen, pi)
-	regSeq, err = e.asm.jsa.storeInflightCAS(regSubject, 0, &mqttInflightRecord{
+	regSeq, err = e.asm.jsa.storeInflightCAS(regSubject, 0, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: cfg.Durable, Seq: copySeq, QoS: 2, Nonce: mqttNewInflightNonce(),
 		Q2AffClaim: claimSubject, Q2AffCopy: copySubject, Retired: true,
 	})
@@ -1638,23 +1638,40 @@ func TestOrphanSweepDiagnosesAnUnsettleableAffineRegister(t *testing.T) {
 	sessGen := e.sess.gen
 	e.sess.mu.Unlock()
 	subject := mqttInflightSubject(idHash, sessGen, 34)
-	seq, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{
+	// Seeded through the RAW builder, not storeInflightCAS. This record names affine state
+	// through the copy alone and carries no claim — half an affine reference — which the
+	// legal-shape matrix at the write boundary now REFUSES outright. That refusal is the
+	// intended behaviour and this fixture is about the SWEEP's treatment of such a record
+	// arriving from elsewhere, so it has to be planted rather than written.
+	rec := &mqttInflightRecord{State: mqttInflightPublish,
 		PI: 34, Dur: affDur, Seq: 7, QoS: 2, Nonce: mqttNewInflightNonce(),
 		// It NAMES affine state through the copy, and carries no claim — the exact clause
 		// M38 removes.
 		Q2AffCopy: mqttQ2AffCopySubject(idHash, affGen, hash, testQ2AffFixtureNonce),
 		Retired:   true,
-	})
+	}
+	if verr := mqttValidateInflightShape(rec); verr == nil {
+		t.Fatal("the matrix accepts this shape, so planting it round the write boundary is " +
+			"unnecessary and this fixture no longer describes what it claims")
+	}
+	msg, hdrLen := buildInflightRecord(0, rec)
+	resp, err := e.asm.jsa.storeMsg(subject, hdrLen, msg)
 	if err != nil {
 		t.Fatalf("persist the unsettleable register: %v", err)
 	}
+	seq := resp.Sequence
 
 	e.sweepInflight(t, 16)
 
 	if _, smsg, lerr := e.asm.jsa.loadInflightRecord(subject); lerr != nil || smsg == nil {
 		t.Fatalf("an unsettleable register was not retained (err=%v)", lerr)
 	}
-	lc.requireLine(t, "not settleable", subject)
+	// The DIAGNOSTIC moved with the refusal, and that is the point of asserting it rather
+	// than just the retention. This shape used to reach the affine arm and be reported as
+	// "not settleable"; the closed schema now refuses it at the decoder, so no arm can
+	// inspect the state it names — and the sweep reports THAT instead. Either way the
+	// operator hears about a register that accumulates and that nothing else will revisit.
+	lc.requireLine(t, "not a shape this broker writes", subject)
 	_ = seq
 }
 
@@ -1907,7 +1924,7 @@ func TestOrphanSweepResidentCleanupIsGenerationFenced(t *testing.T) {
 	e.asm.forgetResidentRetirement(&mqttInflightName{
 		idHash: idHash, gen: other, pi: 41,
 		subject: mqttInflightSubject(idHash, other, 41),
-	}, &mqttInflightRecord{
+	}, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: 41, Dur: key.jsDur, Seq: key.sseq, QoS: 2, Nonce: nonce, Retired: true,
 	})
 
@@ -1925,7 +1942,7 @@ func TestOrphanSweepResidentCleanupIsGenerationFenced(t *testing.T) {
 	e.asm.forgetResidentRetirement(&mqttInflightName{
 		idHash: idHash, gen: liveGen, pi: 41,
 		subject: mqttInflightSubject(idHash, liveGen, 41),
-	}, &mqttInflightRecord{
+	}, &mqttInflightRecord{State: mqttInflightPublish,
 		PI: 41, Dur: key.jsDur, Seq: key.sseq, QoS: 2, Nonce: nonce, Retired: true,
 	})
 	e.sess.mu.Lock()
