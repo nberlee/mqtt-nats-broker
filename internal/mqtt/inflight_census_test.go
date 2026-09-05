@@ -394,6 +394,25 @@ var mqttCensusManifest = []mqttCensusRow{
 			"indeterminate read refuses rather than being guessed into an absence",
 	},
 	{
+		id: "C63b", kind: censusEdge, fn: "advanceFinishedSlotToTerminal",
+		sink: "loadInflightRecord", status: censusLive,
+		test:     "TestF092UnresolvedTerminalAdvanceRefusesTheResume",
+		mutation: "N-advance-readback", oracle: "the resume's accept/refuse outcome per readback class",
+		why: "THE OUTCOME READBACK. A failed CAS returns one `false` for a storage failure, a " +
+			"disappearance, a replacement and a moved phase, and those owe the resume different " +
+			"things: not-ours continues, unresolved REFUSES the resume rather than accepting a " +
+			"connection whose identifier stays charged with nothing left to retry the advance",
+	},
+	{
+		id: "C67", kind: censusEdge, fn: "transferCustodyForAdmission",
+		sink: "casInflightSlot", status: censusLive,
+		test:     "TestF092AdmissionTransfersCustodyAfterPeerDrain",
+		mutation: "N-custody-transfer", oracle: "the slot's Claim/ClaimSeq after an admissible custody-only refusal",
+		why: "the inline custody repair: a quiescent slot whose ONLY failing admission check is " +
+			"custody is moved to the proven-current incarnation, under the exact observed claim " +
+			"tuple and only when the standing claim is strictly older than the proven acceptance",
+	},
+	{
 		id: "C63", kind: censusEdge, fn: "advanceFinishedSlotToTerminal",
 		sink: "casInflightSlot", status: censusLive,
 		test:     "TestMQTTInflightStaleRegisterLeavesNoPhantomSlot",

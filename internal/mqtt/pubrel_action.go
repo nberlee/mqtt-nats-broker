@@ -1065,6 +1065,23 @@ func (sess *mqttSession) disposeTerminalPubRelRecords(c *client, slot *mqttInfli
 	return true
 }
 
+// mqttSlotAdvanceOutcome is what a required terminal advance concluded, and it is
+// three-valued because "I may not" and "I could not find out" owe the resume different
+// things: the first is a normal observation, the second is unresolved work that must not
+// be carried past a CONNACK.
+type mqttSlotAdvanceOutcome int
+
+const (
+	// mqttSlotAdvanceUnresolved: the advance was required and its outcome is unknown.
+	// Refuse the resume; the next CONNECT re-establishes the proof and retries.
+	mqttSlotAdvanceUnresolved mqttSlotAdvanceOutcome = iota
+	// mqttSlotAdvanceNotOurs: a live action, or another exchange holds the identifier.
+	// Nothing is owed here and the resume continues.
+	mqttSlotAdvanceNotOurs
+	// mqttSlotAdvanced: the slot is terminal (or provably gone) and finalization may run.
+	mqttSlotAdvanced
+)
+
 // advanceFinishedSlotToTerminal moves a past-PUBREC slot that recovery has PROVEN finished
 // into `pubrel_terminal`, which is the only state terminal finalization accepts.
 //
@@ -1081,39 +1098,99 @@ func (sess *mqttSession) disposeTerminalPubRelRecords(c *client, slot *mqttInfli
 // with Receive Maximum 1 stops the session receiving anything at all —
 // TestMQTTInflightStaleRegisterLeavesNoPhantomSlot asserts exactly that on the wire.
 //
-// Returns true when the slot is ready for terminal finalization.
+// # Why the outcome is three-valued
+//
+// A bool conflated two facts the caller must treat differently. "The slot is not mine to
+// finish" — an action is live, or another exchange holds the subject — is a normal
+// observation the resume continues past. "I could not find out" — a failed CAS, an
+// unreadable record, an indeterminate read — is UNRESOLVED WORK, and continuing past it
+// accepted a resume whose identifier stays charged with nothing left to retry the advance.
+// A finite storage blip permanently consumed a Receive Maximum slot on a session that
+// looked healthy.
+//
+// So an unresolved advance now REFUSES THE RESUME instead, through the pre-CONNACK refusal
+// the caller already has. The next CONNECT re-runs recovery and re-establishes the proof.
+// A refused resume is visible and self-correcting; an accepted one with a charged
+// identifier is neither.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) advanceFinishedSlotToTerminal(c *client, ref *mqttInflightSlotRef) bool {
+func (sess *mqttSession) advanceFinishedSlotToTerminal(c *client, ref *mqttInflightSlotRef) mqttSlotAdvanceOutcome {
 	if ref == nil || !ref.slotOK() || ref.name.subject == _EMPTY_ {
-		return false
+		// An unusable reference is not a licence to continue: this pass cannot say what
+		// happened to the slot it was asked about.
+		return mqttSlotAdvanceUnresolved
 	}
 	switch ref.state {
 	case mqttInflightPubRelTerminal:
 		// Terminal finalization is already legal from here.
-		return true
+		return mqttSlotAdvanced
 	case mqttInflightPublish:
 		// This helper consumes a past-PUBREC completion proof. Ordinary PUBLISH cleanup
 		// has its own disposition and may not manufacture a terminal phase.
-		return false
+		return mqttSlotAdvanceNotOurs
 	case mqttInflightPubRelSending, mqttInflightPubRelTerminalDraining:
 		// AN ACTION IS LIVE. Recovery may not advance or delete this: the token is
 		// somebody's capability, and observing that one exists proves phase progress
 		// rather than authority to act. The identifier stays reserved and the exchange
 		// stays non-actionable until its own holder drains it (the disclosed residual).
-		return false
+		return mqttSlotAdvanceNotOurs
 	}
 	// pubrel_ready, with recovery's proof behind it.
 	seq, ok := sess.casInflightSlot(c, *ref, mqttInflightPubRelReady, mqttSlotAdvancePhase,
 		func(next *mqttInflightRecord) {
 			next.State = mqttInflightPubRelTerminal
 		})
-	if !ok {
-		return false
+	if ok {
+		ref.seq = seq
+		ref.state = mqttInflightPubRelTerminal
+		return mqttSlotAdvanced
 	}
-	ref.seq = seq
-	ref.state = mqttInflightPubRelTerminal
-	return true
+	// THE CAS RETURNS ONE `false` FOR SEVERAL DIFFERENT WORLDS — a storage failure, a
+	// disappearance, a replacement, a phase that moved — so the disposition cannot be read
+	// off it. Read the slot back and classify what is actually there.
+	cur, smsg, lerr := sess.asm.loadInflightRecord(ref.name.subject)
+	switch {
+	case lerr != nil:
+		// Indeterminate. Not an absence, and not a licence to proceed.
+		return mqttSlotAdvanceUnresolved
+	case smsg == nil:
+		// DEFINITELY ABSENT, and that is not an inference from absence: recovery already
+		// PROVED this exchange finished before the slot was queued for the advance. The
+		// absence adds no protocol conclusion and authorizes no acknowledgement — it says
+		// only that the advance this pass owed has nothing left to act on. Finalization
+		// reloads independently and the release removes only the matching empty
+		// reservation, so both remain safe on a slot that is already gone.
+		return mqttSlotAdvanced
+	case cur == nil:
+		// Present but unreadable.
+		return mqttSlotAdvanceUnresolved
+	case !mqttInflightRecordMatchesSubject(cur, ref.name.subject):
+		// A body that does not correspond to the subject it was loaded from is
+		// UNATTRIBUTABLE, not evidence of another exchange — the reader treats this shape
+		// as unreadable everywhere else, and the CAS refuses it separately. Classifying it
+		// as somebody else's would let an unreadable slot pass for a resolved one.
+		return mqttSlotAdvanceUnresolved
+	case mqttInflightActionState(cur.State):
+		// An action arrived while this advance was in flight.
+		return mqttSlotAdvanceNotOurs
+	case !ref.matchesRecord(cur):
+		// A different exchange holds the identifier now, which is genuinely not ours.
+		return mqttSlotAdvanceNotOurs
+	case cur.State == mqttInflightPubRelTerminal:
+		// OUR OWN ADVANCE LANDED and only its response was lost. Adopt the readback and
+		// finalize; treating an ambiguously landed write as unresolved would refuse a
+		// resume that has nothing left to do.
+		ref.seq = smsg.Sequence
+		ref.state = mqttInflightPubRelTerminal
+		return mqttSlotAdvanced
+	case cur.State == mqttInflightPubRelReady:
+		// Still ours, still ready, and the attempts are spent: the write did not land and
+		// nothing here will retry it.
+		return mqttSlotAdvanceUnresolved
+	default:
+		// A state no arrow from here allows. Explicit rather than inherited.
+		return mqttSlotAdvanceUnresolved
+	}
 }
 
 // admitStoredPubRel is PUBREL admission: the gate every stored PUBREL passes before
@@ -1220,6 +1297,11 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	// Reading the second made the duplicate branch's subject check reject every real
 	// canonical loaded by global sequence, the same mistake phaseSlotToPubRelReady had.
 	pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
+
+	// The custody repair is attempted AT MOST ONCE for this delivery, and the flag lives
+	// out here rather than in the loop for that reason: a `continue` after a successful
+	// transfer must not be able to re-enter it.
+	transferAttempted := false
 
 	// Two concurrent same-nonce deliveries race one CAS, and the loser must REDISPATCH
 	// rather than fall through: falling through on "the slot advanced to ready" would
@@ -1363,8 +1445,54 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 
 		// CONTEXTUAL CHECKS, which are separate from the shape the validator already
 		// proved and which can refuse even though the exchange IS past PUBREC.
-		if !sess.pubRelAdmissionContextOK(c, pi, cur, dur, deliveredSeq, corr, affRef) {
+		switch verdict := sess.pubRelAdmissionContext(c, pi, cur, dur, deliveredSeq, corr, affRef); verdict {
+		case mqttAdmissionRefused:
 			return nil, false
+		case mqttAdmissionCustodyOnly:
+			// THE CUSTODY REPAIR, and this is what closes F-092's last open item.
+			//
+			// The slot is quiescent and everything except its custody admits this
+			// delivery. That is exactly what a predecessor's drained action leaves: the
+			// drain clears the action fields and leaves the predecessor's Claim, so a
+			// successor that resumed while the action was live can never acquire — its
+			// admission fails here on every redelivery, forever, and at Receive Maximum 1
+			// that stalls the whole session.
+			//
+			// Nothing else was going to repair it. Recovery's custody refresh runs only
+			// before CONNACK, and by then this slot was active and correctly withheld.
+			//
+			// THE RETRY LOOP IS THE REDELIVERY, not a worker. A refusal here returns
+			// without acknowledging and the PUBREL consumer has no delivery limit, so the
+			// record comes back until something admits it. That is why this repair can be
+			// a single attempt on the delivery that was already going to be refused.
+			//
+			// ONCE PER CALLBACK. transferAttempted is declared outside this loop, so a
+			// reload after a successful transfer cannot re-enter the repair and a
+			// contested slot cannot spin here; the next redelivery is the next attempt.
+			if transferAttempted {
+				return nil, false
+			}
+			transferAttempted = true
+			if !sess.transferCustodyForAdmission(c, subject, smsg.Sequence, cur) {
+				return nil, false
+			}
+			// Reload and re-run every check against the record as it is NOW. The transfer
+			// grants CUSTODY and nothing else: the action CAS and the acceptance fence at
+			// the callback still decide whether anything is transmitted.
+			//
+			// This `continue` is an EFFICIENCY choice rather than a SAFETY property, and
+			// the distinction is worth stating exactly. Falling through would build the
+			// acquisition reference from the pre-transfer body, whose custody the action
+			// CAS then refuses, and the loop's existing lost-CAS redispatch would reload
+			// and reach the same state — one attempt later, AND only when that attempt's
+			// reads succeed. It is not free: the fall-through also mints a tentative
+			// action and takes the unsuccessful-acquisition readback path, so a read
+			// failure there delays progress through reconciliation. Skipping straight to
+			// the reload spends the attempt on the record that can actually be acquired.
+			// Either way it consumes one of this loop's bounded attempts, so a transfer
+			// landing on the last one is completed by the next redelivery rather than by a
+			// wider budget here.
+			continue
 		}
 
 		ref := mqttSlotRefFromRecord(subject, smsg.Sequence, cur)
@@ -1472,29 +1600,50 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	return act
 }
 
-// pubRelAdmissionContextOK proves the things the shape validator cannot: that the named
+// mqttAdmissionVerdict is what the contextual checks concluded, and it is three-valued
+// because ONE of the refusals is repairable and the rest are not.
+//
+// The helper is READ-ONLY and runs under sess.mu. It may not perform the repair itself:
+// the acceptance proof and the custody CAS both take that lock and do JetStream I/O, so
+// doing either here would deadlock. Reporting WHICH refusal happened is what lets the
+// caller repair the one it can, outside the lock, without duplicating any of the checks.
+type mqttAdmissionVerdict int
+
+const (
+	// mqttAdmissionRefused: something other than custody objects. Nothing may repair it
+	// from here — the record is left unacknowledged and AckWait re-offers it.
+	mqttAdmissionRefused mqttAdmissionVerdict = iota
+	// mqttAdmissionCustodyOnly: every other condition passed and the slot's custody names
+	// a different incarnation. This is the shape a predecessor's drained action leaves
+	// behind, and it is the one refusal a current owner may durably repair.
+	mqttAdmissionCustodyOnly
+	// mqttAdmissionOK: nothing here objects to acquiring an action.
+	mqttAdmissionOK
+)
+
+// pubRelAdmissionContext proves the things the shape validator cannot: that the named
 // source, consumer durable and delivered record actually correspond to this exchange, and
 // that nothing else about the slot forbids acting.
 //
 // These are the checks that make the direct arrow "evidence to action" rather than
 // "nonce, therefore send". None of them disproves that the exchange is past PUBREC; each
 // can still stop THIS broker from acquiring.
-func (sess *mqttSession) pubRelAdmissionContextOK(c *client, pi uint16, cur *mqttInflightRecord,
-	dur string, deliveredSeq uint64, corr mqttPubRelCorrelation, affRef mqttPubRelAffineRef) bool {
+func (sess *mqttSession) pubRelAdmissionContext(c *client, pi uint16, cur *mqttInflightRecord,
+	dur string, deliveredSeq uint64, corr mqttPubRelCorrelation, affRef mqttPubRelAffineRef) mqttAdmissionVerdict {
 
 	if dur == _EMPTY_ || deliveredSeq == 0 {
 		// No current PUBREL consumer, or a delivery whose own sequence is unreadable.
 		// Neither can name a canonical record.
-		return false
+		return mqttAdmissionRefused
 	}
 	if cur.PI != pi {
-		return false
+		return mqttAdmissionRefused
 	}
 	if mqttInflightPastPubRec(cur.State) && cur.PubRelDurable != dur {
 		// The canonical durable is contextual identity, not merely a non-empty string.
 		// Acting through a slot naming another incarnation's consumer would transmit a
 		// record that terminal cleanup can never safely dispose.
-		return false
+		return mqttAdmissionRefused
 	}
 	// ACTIONABLE CUSTODY, which admission was not checking at all.
 	//
@@ -1518,13 +1667,13 @@ func (sess *mqttSession) pubRelAdmissionContextOK(c *client, pi uint16, cur *mqt
 	if mqttInflightPastPubRec(cur.State) && cur.Claim == _EMPTY_ {
 		// Past PUBREC with no custody at all is a shape the validator forbids, so a record
 		// carrying it is one this broker did not write. Refused rather than acted on.
-		return false
+		return mqttAdmissionRefused
 	}
 	if cur.Cancelled && !cur.Retired {
 		// "Never transmitted" contradicts a stored PUBREL. A contradictory slot is
 		// refused rather than normalized: normalizing it would be deciding which half of
 		// a shape this broker does not write to believe.
-		return false
+		return mqttAdmissionRefused
 	}
 	if !corr.Ok || corr.SrcDur != cur.Dur || corr.SrcSeq != cur.Seq {
 		// The record names a DIFFERENT source than the slot's exchange. Refused: this is
@@ -1534,19 +1683,19 @@ func (sess *mqttSession) pubRelAdmissionContextOK(c *client, pi uint16, cur *mqt
 		c.Warnf("MQTT: withholding a stored PUBREL for packet identifier %d of client %q: it "+
 			"correlates to source %s/%d but the identifier's exchange came from %s/%d",
 			pi, sess.id, corr.SrcDur, corr.SrcSeq, cur.Dur, cur.Seq)
-		return false
+		return mqttAdmissionRefused
 	}
 	// The affine pair must match the slot's, when the record carries one: a record proving
 	// a DIFFERENT assignment must not be acknowledged away under this exchange.
 	if affRef.valid() &&
 		(affRef.Claim != cur.Q2AffClaim || affRef.Copy != cur.Q2AffCopy) {
-		return false
+		return mqttAdmissionRefused
 	}
 	if cur.Q2AffClaim != _EMPTY_ && affRef.State == mqttPubRelAffineRefAbsent {
 		// With no carried reference PUBCOMP would conclude that no affine proof is owed
 		// and acknowledge the record away. For an affine slot that would destroy the only
 		// evidence from which recovery can prove the copy was delivered.
-		return false
+		return mqttAdmissionRefused
 	}
 	// AN EXACT LIVE PUBLISH SEND TOKEN forbids acquiring, because the opener owns
 	// transmission admission only and cannot undo a PUBLISH already on the wire. It is
@@ -1555,22 +1704,24 @@ func (sess *mqttSession) pubRelAdmissionContextOK(c *client, pi uint16, cur *mqt
 	// which is refuted fix 1.
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	// CUSTODY AND THE CHECK ARE ONE MECHANISM. Recovery contests every positive
-	// transferable publish/pubrel_ready slot before CONNACK, including a ready slot whose
-	// in-memory pendingPubRel entry already exists. Therefore every state admission can
-	// acquire from is covered; active and terminal states are never acquired from here.
+	if h := sess.sendsInFlight[pi]; h != nil && h.pubIdent != _EMPTY_ {
+		return mqttAdmissionRefused
+	}
+	// CUSTODY IS CHECKED LAST, and the position is load-bearing rather than tidiness.
 	//
 	// Equality is checked while holding sess.mu, against the constructor-minted claim of
 	// this exact session object. Without it a predecessor delayed behind takeover
 	// notification could copy a successor's custody into a fresh action and write PUBREL
 	// bytes to its own socket.
+	//
+	// Being last is what makes mqttAdmissionCustodyOnly MEAN something: every other
+	// condition has passed, so the only thing standing between this delivery and an
+	// action is which incarnation the slot names. That is the one refusal the caller can
+	// legitimately repair, and it may only attempt the repair when nothing else objects.
 	if cur.Claim == _EMPTY_ || cur.Claim != sess.regClaim {
-		return false
+		return mqttAdmissionCustodyOnly
 	}
-	if h := sess.sendsInFlight[pi]; h != nil && h.pubIdent != _EMPTY_ {
-		return false
-	}
-	return true
+	return mqttAdmissionOK
 }
 
 // mqttStoredPubRelShapeMatchesSlot reports whether a decoded record can be the canonical
@@ -1741,4 +1892,196 @@ func (sess *mqttSession) handOffPublishEntryLocked(pi uint16, act *mqttSendActio
 		}
 	}
 	return true
+}
+
+// The accepted-incarnation proof
+// ---------------------------------------------------------------------------
+
+// mqttAcceptanceProof is the tuple a successful proof establishes: this session object's
+// generation, the write identity it was last acknowledged for, and the exact $MQTT_sess
+// stream sequence its record occupies. The SEQUENCE is what the custody transfer needs —
+// a claim is ordered against it — so the proof returns what it proved rather than leaving
+// the caller to re-sample a value that may have moved.
+type mqttAcceptanceProof struct {
+	gen string
+	wid string
+	seq uint64
+}
+
+// mqttAcceptanceOutcome is TRI-STATE, and that is the whole point of this helper.
+//
+// The two callers owe uncertainty different things. The transmission fence may not write
+// on doubt, so it refuses on anything but Current. The custody transfer must not read one
+// failed read as "you have been superseded" — a boolean folded those together, and a
+// single transient failure would then abandon the repair and leave the exchange stalled
+// exactly as F-092's open item described.
+type mqttAcceptanceOutcome int
+
+const (
+	// mqttAcceptanceIndeterminate: nothing was proved either way. Retry; conclude nothing.
+	mqttAcceptanceIndeterminate mqttAcceptanceOutcome = iota
+	// mqttAcceptanceDisplaced: DURABLE evidence that this object is no longer the current
+	// accepted incarnation, or that it is no longer bound to the connection asking.
+	mqttAcceptanceDisplaced
+	// mqttAcceptanceCurrent: the record at the head IS this object's own acknowledged
+	// write, and (when a connection was named) this object is still bound to it.
+	mqttAcceptanceCurrent
+)
+
+// proveAcceptedIncarnation proves that this session object is STILL the current accepted
+// incarnation of its client, by exact identity rather than by inference.
+//
+// # What it proves, and why each conjunct is there
+//
+// The record at the head of $MQTT_sess must be the very write this object was last
+// acknowledged for: the same stream sequence AND the same write identity. Sequence alone
+// is not enough — a foreign write lands at a sequence too — and generation alone is not
+// enough, because a generation survives a resume by another broker. Together with the
+// local connection binding they say "the acceptance this object is running under is the
+// one the stream still records".
+//
+// # Why it cannot be a fence on its own
+//
+// It reports what was true at the read. It does NOT remain true through what follows, so
+// it authorizes a custody CAS (which is itself arbitrated by an exact-tuple predicate) and
+// it gates a transmission that a durable action has ALREADY been acquired for. It is never
+// the thing that makes a write safe by itself; that is the action CAS.
+//
+// cc may be nil, which asks the OBJECT-level question and skips the connection binding.
+//
+// Session lock NOT held on entry. Performs one session-record load per attempt.
+func (sess *mqttSession) proveAcceptedIncarnation(cc *client) (mqttAcceptanceProof, mqttAcceptanceOutcome) {
+	as := sess.asm
+	if as == nil {
+		return mqttAcceptanceProof{}, mqttAcceptanceIndeterminate
+	}
+	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		ps, headSeq, lerr := as.loadFenceSession(sess.idHash)
+		if lerr != nil || ps == nil {
+			// Indeterminate, malformed, or absent. An absence is not a displacement: it
+			// says the record cannot be read as evidence, not that somebody else owns the
+			// session.
+			return mqttAcceptanceProof{}, mqttAcceptanceIndeterminate
+		}
+		sess.mu.Lock()
+		seq, wid, gen := sess.seq, sess.wid, sess.gen
+		uncertain, bound := sess.seqUncertain, sess.c
+		sess.mu.Unlock()
+
+		switch {
+		case uncertain:
+			// A write of ours may have landed with its response lost, so sess.seq is not
+			// the exact fact this proof needs. The resolver settles it; nothing here can.
+			return mqttAcceptanceProof{}, mqttAcceptanceIndeterminate
+		case cc != nil && bound != cc:
+			// The object is no longer this connection's, which is durable enough for the
+			// caller that named a connection: whatever it was about to do belongs to
+			// whoever holds the object now.
+			return mqttAcceptanceProof{}, mqttAcceptanceDisplaced
+		case ps.Gen != _EMPTY_ && ps.Gen != gen:
+			// Another incarnation's record is at the head. Our own generation changes only
+			// through clear() on this object, so this is somebody else's.
+			return mqttAcceptanceProof{}, mqttAcceptanceDisplaced
+		case headSeq == seq && ps.WID == wid && ps.WID != _EMPTY_:
+			return mqttAcceptanceProof{gen: gen, wid: wid, seq: seq}, mqttAcceptanceCurrent
+		case headSeq < seq:
+			// OUR OWN LATER SAVE probably landed between the load and the snapshot — a
+			// SUBSCRIBE on the readLoop while this runs is enough. This is a RETRY
+			// CONDITION and never an ownership conclusion: a foreign head can land after
+			// the load too, so the next attempt re-establishes exact equality itself
+			// rather than inheriting anything from this observation.
+			continue
+		case headSeq > seq:
+			// NOT readable as a foreign writer, which is the trap here. Our own save is
+			// committed by JetStream BEFORE persistRecord adopts the response, and in that
+			// window the head carries a freshly minted WID that differs from sess.wid
+			// exactly as a rival's would. A genuine successor does keep producing this
+			// observation — until the record watch or its committed-read backstop detaches
+			// this object — and refusing meanwhile costs nothing but a redelivery, where
+			// concluding displacement from it would abandon our own landed write.
+			continue
+		default:
+			return mqttAcceptanceProof{}, mqttAcceptanceIndeterminate
+		}
+	}
+	return mqttAcceptanceProof{}, mqttAcceptanceIndeterminate
+}
+
+// transferCustodyForAdmission moves a quiescent slot's custody to THIS session object so
+// the exchange it owns becomes actionable again.
+//
+// It exists because custody, once withheld, was never revisited. Recovery refreshes
+// custody before CONNACK; a slot that was mid-action then is correctly skipped, and when
+// its holder later drains it the slot goes back to a quiescent state still carrying the
+// PREDECESSOR's claim. Admission then refuses it forever. This is the repair for exactly
+// that shape, performed on the delivery that would otherwise have been refused.
+//
+// # What authorizes the write
+//
+// Not the delivery, and not an in-memory reservation — that was tried and refused, because
+// a reservation is process-local and two brokers hold matching ones during a takeover.
+// Three things together:
+//
+//   - the caller established that EVERY other admission condition passed for this exact
+//     record, so the evidence is this exchange's own durable record plus its slot;
+//   - the acceptance proof says this object is still the current accepted incarnation of
+//     the session, bound to this connection;
+//   - the CAS itself matches the exact custody tuple just observed, so a successor that
+//     transferred in between wins and this attempt loses rather than overwriting it.
+//
+// # And what it deliberately does NOT authorize
+//
+// Transmission. The proof can go stale between here and any socket write, which is why the
+// action CAS and the post-acquisition acceptance fence both still run afterwards. This
+// only makes the exchange acquirable by its rightful owner.
+//
+// Ordering: a claim standing at or past our proven acceptance sequence belongs to an owner
+// accepted no earlier than us, so it is left alone. Session lock NOT held on entry.
+func (sess *mqttSession) transferCustodyForAdmission(c *client, subject string, seq uint64,
+	cur *mqttInflightRecord) bool {
+
+	if h := mqttTestCustodyTransferV.Load(); h != nil {
+		(*h)()
+	}
+	if cur == nil || subject == _EMPTY_ {
+		return false
+	}
+	// Quiescent only. The phase gate refuses the rest anyway; refusing here keeps the
+	// intent explicit rather than relying on a downstream helper to say no.
+	if cur.State != mqttInflightPublish && cur.State != mqttInflightPubRelReady {
+		return false
+	}
+	proof, out := sess.proveAcceptedIncarnation(c)
+	if out != mqttAcceptanceCurrent {
+		// Displaced, or simply unprovable right now. Either way this broker may not move
+		// custody; the record stays unacknowledged and AckWait re-offers it.
+		return false
+	}
+	if cur.ClaimSeq >= proof.seq {
+		// The standing claim was written by an owner whose acceptance is no older than
+		// ours. Taking it would be the ordering violation the recovery contest refuses.
+		return false
+	}
+	ref := mqttSlotRefFromRecord(subject, seq, cur)
+	if ref == nil {
+		return false
+	}
+	sess.mu.Lock()
+	claim := sess.regClaim
+	sess.mu.Unlock()
+	if claim == _EMPTY_ {
+		return false
+	}
+	_, ok := sess.casInflightSlot(c, *ref, cur.State, mqttSlotTransferCustody,
+		func(next *mqttInflightRecord) {
+			// ONLY custody. Everything else about the exchange is whatever the record
+			// says it is; this write is not a rewrite of the exchange.
+			next.Claim = claim
+			next.ClaimSeq = proof.seq
+		})
+	if ok {
+		c.Debugf("MQTT: took custody of the in-flight slot on %q for client %q so its stored "+
+			"PUBREL can be completed by this incarnation", subject, sess.id)
+	}
+	return ok
 }

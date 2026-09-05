@@ -9,8 +9,11 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/nats-io/nuid"
 )
 
 // testPubRelSlot reads the durable slot for one identifier out of the fixture's store.
@@ -1437,7 +1440,7 @@ func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 }
 
 // TestF092AdmissionRefusesForeignIncarnationCustody discriminates the production custody
-// check in pubRelAdmissionContextOK (cur.Claim == sess.regClaim). The sibling test
+// check in pubRelAdmissionContext (cur.Claim == sess.regClaim). The sibling test
 // TestF092ActionAcquisitionDoesNotFollowACustodyRewrite exercises only the CAS-race guard
 // (a stale ref whose claim no longer matches the rewritten slot); it passes even with the
 // admission custody check removed, because mqttAcquirePubRelAction never runs that check.
@@ -1472,17 +1475,26 @@ func TestF092AdmissionRefusesForeignIncarnationCustody(t *testing.T) {
 	}
 	corr := mqttPubRelCorrelation{SrcDur: "SRC", SrcSeq: 41, Ok: true}
 
-	if e.sess.pubRelAdmissionContextOK(e.c, pi, cur, dur, testCanonicalPubRelSeq, corr, mqttPubRelAffineRef{}) {
-		t.Fatal("admission accepted a slot whose custody belongs to another incarnation: a " +
-			"superseded broker could acquire an action under a successor's claim (F-092)")
+	// CUSTODY-ONLY, not a flat refusal, and the distinction is the mechanism: every other
+	// condition passed, so this is the one refusal a proven-current owner may repair. It
+	// must never be mqttAdmissionOK — that is the F-092 hazard — and it must never be
+	// mqttAdmissionRefused either, which would make the repair unreachable and leave the
+	// exchange stalled on every redelivery.
+	if got := e.sess.pubRelAdmissionContext(e.c, pi, cur, dur, testCanonicalPubRelSeq, corr, mqttPubRelAffineRef{}); got != mqttAdmissionCustodyOnly {
+		if got == mqttAdmissionOK {
+			t.Fatal("admission accepted a slot whose custody belongs to another incarnation: a " +
+				"superseded broker could acquire an action under a successor's claim (F-092)")
+		}
+		t.Fatalf("a slot refused ONLY on custody must report mqttAdmissionCustodyOnly so the "+
+			"inline repair can run; got %v, which leaves the exchange stalled", got)
 	}
 
 	// Positive control: the SAME slot with THIS incarnation's claim is admitted, proving the
 	// refusal above is the custody check and not an unrelated gate.
 	cur.Claim = regClaim
-	if !e.sess.pubRelAdmissionContextOK(e.c, pi, cur, dur, testCanonicalPubRelSeq, corr, mqttPubRelAffineRef{}) {
-		t.Fatal("admission refused a slot whose custody IS this incarnation's; the test is not " +
-			"isolating the custody check")
+	if got := e.sess.pubRelAdmissionContext(e.c, pi, cur, dur, testCanonicalPubRelSeq, corr, mqttPubRelAffineRef{}); got != mqttAdmissionOK {
+		t.Fatalf("admission refused a slot whose custody IS this incarnation's (%v); the test is "+
+			"not isolating the custody check", got)
 	}
 }
 
@@ -1608,4 +1620,1034 @@ func TestF092RetainedPubRelRedeliveryIsAdmitted(t *testing.T) {
 		t.Errorf("a retained PUBREL redelivery (non-zero sseq, live owner) was not transmitted "+
 			"(%d write(s)); an sseq guard stalls the exchange and Receive Maximum 1 with it", writes)
 	}
+}
+
+// TestF092AdmissionTransfersCustodyAfterPeerDrain is the item-#2 reproducer, reduced to the
+// state the stall actually leaves behind.
+//
+// A predecessor held an action on this slot while this session resumed, so recovery
+// correctly withheld the custody transfer — an action belongs to its holder. When that
+// action later drains, the drain clears the action fields and LEAVES the predecessor's
+// claim, so the slot is quiescent and foreign-claimed with nobody left to fix it: recovery
+// already ran, and admission refuses on `cur.Claim != sess.regClaim` at every redelivery.
+// At Receive Maximum 1 that stalls the whole session.
+//
+// The repair is inline, on the delivery that was going to be refused anyway. This asserts
+// the DURABLE consequence — the slot carries this incarnation's claim afterwards — and then
+// that the exchange actually transmits, because a transfer that did not make the exchange
+// actionable would have fixed nothing.
+func TestF092AdmissionTransfersCustodyAfterPeerDrain(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-custody-after-drain")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(31)
+	testSeedPubRelReadySlot(t, e, pi)
+
+	e.sess.mu.Lock()
+	idHash, gen, ourClaim, ourSeq := e.sess.idHash, e.sess.gen, e.sess.regClaim, e.sess.seq
+	e.sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+	if ourSeq == 0 {
+		t.Fatal("the fixture must have an accepted record: with no acceptance sequence the " +
+			"ordering rule cannot be exercised at all")
+	}
+
+	// Rewrite the seeded slot into the exact post-drain shape: quiescent, no action, and
+	// still carrying the PREDECESSOR's claim at a STRICTLY OLDER acceptance sequence.
+	cur, smsg, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil || smsg == nil {
+		t.Fatalf("loading the seeded slot: rec=%v err=%v", cur, err)
+	}
+	stalled := *cur
+	stalled.Claim, stalled.ClaimSeq = "predecessor-incarnation-claim", ourSeq-1
+	if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+		t.Fatalf("installing the stalled slot: %v", err)
+	}
+
+	// Sanity: this is genuinely the stalled state, so the test cannot pass vacuously.
+	corr := mqttPubRelCorrelation{SrcDur: "SRC", SrcSeq: 41, Ok: true}
+	if got := e.sess.pubRelAdmissionContext(e.c, pi, &stalled, e.sess.pubRelDurable(),
+		testCanonicalPubRelSeq, corr, mqttPubRelAffineRef{}); got != mqttAdmissionCustodyOnly {
+		t.Fatalf("the fixture is not in the stalled state this test is about: verdict %v", got)
+	}
+
+	writes := testCountPubRelWrites(t, e, func() {
+		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
+			"xxxxxxxxxxxxxxxxxxxxxx")
+	})
+
+	after, _, err := e.asm.loadInflightRecord(subject)
+	switch {
+	case err != nil:
+		t.Fatalf("reloading the slot: %v", err)
+	case after == nil:
+		// The exchange completed and the slot was cleaned up, which is a stronger outcome
+		// than a transfer; the transmission assertion below still has to hold.
+	case after.Claim != ourClaim:
+		t.Fatalf("the stalled slot still carries custody %q (seq %d) after a delivery this "+
+			"incarnation was entitled to complete: admission will refuse it on every "+
+			"redelivery and the session stays stalled", after.Claim, after.ClaimSeq)
+	case after.ClaimSeq != ourSeq:
+		t.Fatalf("custody moved but its sequence is %d, not the proven acceptance %d: an "+
+			"ordering rule cannot compare against a sequence nothing proved", after.ClaimSeq, ourSeq)
+	}
+	if writes != 1 {
+		t.Fatalf("the repaired exchange did not transmit its PUBREL (%d write(s)): a custody "+
+			"transfer that leaves the exchange non-actionable has fixed nothing", writes)
+	}
+}
+
+// TestF092AdmissionRefusesTransferWithoutCurrentAcceptance proves the transfer is gated on
+// the acceptance proof rather than on the delivery.
+//
+// Custody is durable state shared by every broker serving the session. A broker that has
+// been superseded must not move it: it would take an exchange away from the incarnation
+// that legitimately owns it, which is F-092's hazard arriving through the repair meant to
+// close it. The refusal is silent and unacknowledged, so the record is simply re-offered to
+// whoever is current.
+func TestF092AdmissionRefusesTransferWithoutCurrentAcceptance(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-custody-proof-gate")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(32)
+	testSeedPubRelReadySlot(t, e, pi)
+
+	e.sess.mu.Lock()
+	idHash, gen, ourSeq := e.sess.idHash, e.sess.gen, e.sess.seq
+	e.sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+	cur, smsg, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil {
+		t.Fatalf("loading the seeded slot: %v", err)
+	}
+	stalled := *cur
+	stalled.Claim, stalled.ClaimSeq = "predecessor-incarnation-claim", ourSeq-1
+	if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+		t.Fatalf("installing the stalled slot: %v", err)
+	}
+
+	// The head record now belongs to ANOTHER incarnation of this client. Everything else
+	// about the delivery is unchanged, so only the proof can refuse.
+	e.asm.mu.Lock()
+	e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
+		return &mqttPersistedSession{Gen: mqttNewSessGen(), WID: "a-successors-write"}, ourSeq + 1, nil
+	}
+	e.asm.mu.Unlock()
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testSessionLoad = nil
+		e.asm.mu.Unlock()
+	}()
+
+	writes := testCountPubRelWrites(t, e, func() {
+		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
+			"xxxxxxxxxxxxxxxxxxxxxx")
+	})
+	if writes != 0 {
+		t.Fatalf("a superseded incarnation transmitted %d PUBREL(s)", writes)
+	}
+	after, _, err := e.asm.loadInflightRecord(subject)
+	if err != nil || after == nil {
+		t.Fatalf("reloading the slot: rec=%v err=%v", after, err)
+	}
+	if after.Claim != "predecessor-incarnation-claim" {
+		t.Fatalf("a superseded incarnation moved custody to %q: the transfer must be gated on "+
+			"the acceptance proof, not on the delivery", after.Claim)
+	}
+}
+
+// TestF092UnresolvedTerminalAdvanceRefusesTheResume covers the difference between "not mine
+// to finish" and "I could not find out", which one boolean used to hide.
+//
+// Recovery proves a past-PUBREC slot finished, installs a terminal reservation for its
+// identifier, and then advances it so the delete becomes legal. If that advance fails
+// finitely and recovery simply continues, the CONNECT is ACCEPTED with the reservation
+// standing and nothing left to retry: the source is already settled so nothing re-offers
+// it, and no delivery addresses the slot. One transient store failure permanently consumes
+// a Receive Maximum slot on a session that looks healthy.
+//
+// So an unresolved advance refuses the resume instead — visible, and retried by the next
+// CONNECT against a working store. A live action is a different observation entirely and
+// must NOT refuse anything, which the second arm holds the first honest about.
+func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		readback   mqttInflightState
+		wantRefuse bool
+	}{
+		{
+			// The write never landed and the slot is still ours, still ready.
+			name: "unresolved advance refuses", readback: mqttInflightPubRelReady, wantRefuse: true,
+		},
+		{
+			// An action arrived while the advance was in flight: somebody else owns the
+			// exchange now and converges it themselves.
+			name: "a live action is not ours to finish", readback: mqttInflightPubRelSending, wantRefuse: false,
+		},
+		{
+			// Our own advance landed and only its response was lost. Refusing here would
+			// reject a resume that has nothing left to do.
+			name: "an ambiguously landed advance proceeds", readback: mqttInflightPubRelTerminal, wantRefuse: false,
+		},
+		{
+			// A body that does not correspond to the subject it was loaded from is
+			// unattributable, and an unattributable observation resolves nothing.
+			name: "an unattributable readback refuses", readback: mqttInflightPubRelReady,
+			wantRefuse: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idHash, gen := getHash("f092-advance-"+nuid.Next()), mqttNewSessGen()
+			pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
+			claim := mqttNewInflightNonce()
+			// PAST PUBREC, custody ours, canonical named, and NO PUBREL record naming it —
+			// with a complete source that is recovery's own definition of FINISHED, which
+			// is what puts the slot on the required-advance path rather than into an
+			// ordinary reservation.
+			// The canonical durable is the GENERATION's own, not a literal: terminal
+			// disposal compares it against this incarnation's PUBREL consumer, so a
+			// fixture naming another one is refused and the deletion never runs.
+			_, _, genDur := mqttPubRelNames(idHash, gen)
+			rec := &mqttInflightRecord{
+				PI: 33, Dur: "SRC", Seq: 41, QoS: 2,
+				Nonce: mqttNewInflightNonce(), Claim: claim, ClaimSeq: 1,
+				State:         mqttInflightPubRelReady,
+				PubRelDurable: genDur, PubRelStreamSeq: testCanonicalPubRelSeq,
+			}
+			subject := mqttInflightSubject(idHash, gen, rec.PI)
+			const currentSeq = uint64(81)
+			liveSeq := currentSeq
+			gone := false
+			unattributable := tc.name == "an unattributable readback refuses"
+
+			advanceAttempts := 0
+			as := &mqttAccountSessionManager{}
+			as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) {
+				return nil, 0, true // no record names the slot: with a complete source it is finished
+			}
+			as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
+				return mqttInflightSourceComplete
+			}
+			as.testInflightEnumerate = func(string) (map[string]uint64, error) {
+				return map[string]uint64{subject: currentSeq}, nil
+			}
+			as.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
+				data, err := json.Marshal(rec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return []*JSApiMsgGetResponse{{Message: &StoredMsg{
+					Subject: subject, Sequence: currentSeq, Data: data,
+				}}}, nil
+			}
+			retrying := false
+			as.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+				cp := *rec
+				if advanceAttempts > 0 && !retrying {
+					// THE READBACK is what classifies an unsuccessful advance.
+					cp.State = tc.readback
+					if tc.readback == mqttInflightPubRelSending {
+						cp.ActionToken = mqttNewInflightNonce()
+						cp.ActionClaim, cp.ActionClaimSeq = cp.Claim, cp.ClaimSeq
+					}
+					if unattributable {
+						cp.PI = rec.PI + 1 // a body naming another identifier
+					}
+				}
+				if gone {
+					return nil, nil, nil
+				}
+				return &cp, &StoredMsg{Subject: subject, Sequence: liveSeq}, nil
+			}
+			as.testInflightStore = func(_ string, _ uint64, next *mqttInflightRecord) (uint64, error) {
+				if next != nil && next.State == mqttInflightPubRelTerminal && !retrying {
+					advanceAttempts++
+					return 0, errors.New("injected advance failure")
+				}
+				if next != nil {
+					cp := *next
+					rec = &cp
+				}
+				// The sequence the LOAD reports moves with the write, exactly as the stream
+				// does. A fixture whose load kept returning the old sequence would fail
+				// every freshness fence downstream, and the test would then "pass" with the
+				// slot and its reservation both still standing.
+				liveSeq++
+				return liveSeq, nil
+			}
+			as.testInflightDelete = func(uint64) error { gone = true; return nil }
+			sess := &mqttSession{
+				asm: as, id: "f092-advance", idHash: idHash, gen: gen,
+				pubRelSubject: pubRelSubject, regClaim: claim,
+			}
+			_, rerr := sess.recoverInflightRegisters(&client{})
+
+			if advanceAttempts == 0 {
+				t.Fatal("recovery never attempted the terminal advance, so this test says " +
+					"nothing about how an unresolved one is dispositioned")
+			}
+			switch {
+			case tc.wantRefuse && rerr == nil:
+				t.Fatal("recovery accepted a resume whose required terminal advance never " +
+					"resolved: the identifier stays reserved with nothing left to retry it")
+			case !tc.wantRefuse && rerr != nil:
+				t.Fatalf("recovery refused a resume it had no unresolved work in: %v", rerr)
+			}
+			if !tc.wantRefuse {
+				return
+			}
+			// THE REFUSAL IS ONLY HALF THE GUARANTEE. It is worth having because the next
+			// resume completes the work against a store that recovers — so the durable
+			// evidence must still be there, and the retry must actually finish.
+			if rec.State != mqttInflightPubRelReady {
+				t.Fatalf("the refusal rewrote the slot to %q: the evidence the retry needs "+
+					"must be preserved untouched", rec.State)
+			}
+			// THE REFUSAL IS ONLY HALF THE GUARANTEE. It is worth having because the next
+			// resume finishes the work against a store that recovers, so that retry has to
+			// actually complete: advance, delete, and release the identifier.
+			retrying = true
+			if _, rerr2 := sess.recoverInflightRegisters(&client{}); rerr2 != nil {
+				t.Fatalf("the retry against a working store still refused the resume: %v", rerr2)
+			}
+			if !gone {
+				t.Fatalf("the retry left the slot in place (state %q): a terminal advance that "+
+					"never reaches its delete leaves the identifier charged for the life of "+
+					"the session", rec.State)
+			}
+			sess.mu.Lock()
+			held := sess.pendingPubRel[rec.PI]
+			sess.mu.Unlock()
+			if held != nil && held.jsAckSubject == _EMPTY_ {
+				t.Fatal("the terminal reservation survived its slot's deletion: the identifier " +
+					"and its Receive Maximum charge are never released")
+			}
+		})
+	}
+}
+
+// TestF092PubRelFenceRefusesStaleAcceptance covers the window the action CAS cannot close.
+//
+// Acquiring an action proves no other holder may act on the exchange. It does not prove
+// that the broker holding it is still the session's current accepted incarnation: a
+// successor can commit its acceptance while this broker sits between acquiring and
+// writing. The fence is the second proof, taken AFTER the acquisition and before the send
+// section, and a refusal there must produce no bytes and leave the action drained rather
+// than abandoned.
+//
+// The positive control matters as much as the refusal: a fence that refused everything
+// would also produce zero writes, and this test would pass while every QoS 2 exchange in
+// the broker silently stopped.
+func TestF092PubRelFenceRefusesStaleAcceptance(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-fence-stale-acceptance")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(34)
+	testSeedPubRelReadySlot(t, e, pi)
+	reply := testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1)
+
+	e.sess.mu.Lock()
+	ourSeq := e.sess.seq
+	e.sess.mu.Unlock()
+
+	// A record for ANOTHER incarnation of this client sits at the head: this object is no
+	// longer current, and nothing it acquired may reach the wire.
+	e.asm.mu.Lock()
+	e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
+		return &mqttPersistedSession{Gen: mqttNewSessGen(), WID: "a-successors-write"}, ourSeq + 1, nil
+	}
+	e.asm.mu.Unlock()
+
+	stale := testCountPubRelWrites(t, e, func() {
+		testDeliverPubRelAs(t, e, pi, reply, "xxxxxxxxxxxxxxxxxxxxxx")
+	})
+	if stale != 0 {
+		t.Fatalf("a superseded incarnation transmitted %d PUBREL(s) after acquiring an action: "+
+			"the action CAS alone does not prove the holder is still current", stale)
+	}
+	// The action must be DRAINED, not abandoned: an abandoned action holds the identifier
+	// for the life of the session, which is the residual this mechanism must not create.
+	if slot := testPubRelSlot(t, e, pi); slot == nil {
+		t.Fatal("the fenced exchange lost its slot")
+	} else if slot.ActionToken != _EMPTY_ {
+		t.Fatalf("the fenced delivery left a live action token %q: the drain armed at "+
+			"admission must return the slot to pubrel_ready", slot.ActionToken)
+	}
+
+	// POSITIVE CONTROL: with the real head record the same delivery transmits, so the
+	// refusal above is the fence and not a fixture that cannot transmit at all.
+	e.asm.mu.Lock()
+	e.asm.testSessionLoad = nil
+	e.asm.mu.Unlock()
+	live := testCountPubRelWrites(t, e, func() {
+		testDeliverPubRelAs(t, e, pi, reply, "xxxxxxxxxxxxxxxxxxxxxx")
+	})
+	if live != 1 {
+		t.Fatalf("the current incarnation transmitted %d PUBREL(s); the test is not isolating "+
+			"the fence", live)
+	}
+}
+
+// TestF092CustodyTransferRespectsClaimOrdering holds the repair to the same ordering rule
+// every other custody writer obeys.
+//
+// Custody is durable state several brokers can reach. "I am current" is not sufficient
+// licence to take it: a claim standing at or past our own acceptance sequence was written
+// by an owner accepted no earlier than us, and taking that would let a broker walk over a
+// successor that legitimately owns the exchange — F-092's hazard arriving through the
+// repair built to close it.
+//
+// The arms differ ONLY in the standing claim's sequence, so nothing else can explain the
+// outcome.
+func TestF092CustodyTransferRespectsClaimOrdering(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		claimSeqFrom func(ourSeq uint64) uint64
+		wantTransfer bool
+	}{
+		{"an older claim is taken over", func(s uint64) uint64 { return s - 1 }, true},
+		{"an equal claim is left alone", func(s uint64) uint64 { return s }, false},
+		{"a newer claim is left alone", func(s uint64) uint64 { return s + 1 }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := testNewInflightEnv(t, "f092-order-"+nuid.Next())
+			testReadyForPubRelDelivery(t, e)
+			const pi = uint16(35)
+			testSeedPubRelReadySlot(t, e, pi)
+
+			e.sess.mu.Lock()
+			idHash, gen, ourClaim, ourSeq := e.sess.idHash, e.sess.gen, e.sess.regClaim, e.sess.seq
+			e.sess.mu.Unlock()
+			if ourSeq == 0 {
+				t.Fatal("the fixture needs an accepted record, or no ordering can be compared")
+			}
+			subject := mqttInflightSubject(idHash, gen, pi)
+			cur, smsg, err := e.asm.loadInflightRecord(subject)
+			if err != nil || cur == nil {
+				t.Fatalf("loading the seeded slot: %v", err)
+			}
+			stalled := *cur
+			stalled.Claim, stalled.ClaimSeq = "another-incarnations-claim", tc.claimSeqFrom(ourSeq)
+			if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+				t.Fatalf("installing the foreign-claimed slot: %v", err)
+			}
+
+			testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
+				"xxxxxxxxxxxxxxxxxxxxxx")
+
+			after, _, err := e.asm.loadInflightRecord(subject)
+			if err != nil {
+				t.Fatalf("reloading the slot: %v", err)
+			}
+			took := after == nil || after.Claim == ourClaim
+			if took != tc.wantTransfer {
+				if tc.wantTransfer {
+					t.Fatalf("a strictly older claim was not taken over (claim %q seq %d): the "+
+						"exchange stays stalled", after.Claim, after.ClaimSeq)
+				}
+				t.Fatalf("custody at sequence %d was taken from an owner accepted no earlier "+
+					"than this one (ours %d): that is the ordering violation the recovery "+
+					"contest refuses", tc.claimSeqFrom(ourSeq), ourSeq)
+			}
+		})
+	}
+}
+
+// TestF092RecoveryRefusesCustodyBehindANewerOwner covers the schedule the inline repair
+// makes reachable: a resumer that PAUSES, a newer owner that takes custody meanwhile, and
+// the paused resumer then writing over it with a first CAS that meets no conflict.
+//
+// Recovery's contest re-compares only after a CAS FAILS, so two writers arriving in
+// sequence never contested anything — the older one simply won. The ordering rule
+// therefore has to run before the first write as well.
+func TestF092RecoveryRefusesCustodyBehindANewerOwner(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		claim      string
+		claimSeq   uint64
+		ourSeq     uint64
+		wantRefuse bool
+	}{
+		{"a newer foreign claim refuses the resume", "a-newer-owner", 9, 5, true},
+		{"an older foreign claim is contested and taken", "an-older-owner", 3, 5, false},
+		{"a claimless record is untouched by the rule", _EMPTY_, 0, 5, false},
+		{"a zero-sequence foreign claim is not evidence", "an-unsaved-owner", 0, 5, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idHash, gen := getHash("f092-order-"+nuid.Next()), mqttNewSessGen()
+			pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
+			rec := &mqttInflightRecord{
+				PI: 36, Dur: "$MQTT_SHARED_grp", Seq: 41, QoS: 1,
+				Nonce: mqttNewInflightNonce(), Claim: tc.claim, ClaimSeq: tc.claimSeq,
+				State: mqttInflightPublish,
+			}
+			subject := mqttInflightSubject(idHash, gen, rec.PI)
+			const currentSeq = uint64(81)
+			cases := 0
+			as := &mqttAccountSessionManager{}
+			as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) {
+				return nil, 0, true
+			}
+			as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
+				return mqttInflightSourceLive
+			}
+			as.testInflightEnumerate = func(string) (map[string]uint64, error) {
+				return map[string]uint64{subject: currentSeq}, nil
+			}
+			as.testInflightLoadMulti = func([]string) ([]*JSApiMsgGetResponse, error) {
+				data, err := json.Marshal(rec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return []*JSApiMsgGetResponse{{Message: &StoredMsg{
+					Subject: subject, Sequence: currentSeq, Data: data,
+				}}}, nil
+			}
+			as.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+				cp := *rec
+				return &cp, &StoredMsg{Subject: subject, Sequence: currentSeq}, nil
+			}
+			as.testInflightStore = func(_ string, _ uint64, next *mqttInflightRecord) (uint64, error) {
+				// THE ORACLE: a custody CAS against this slot at all. A refusal must write
+				// nothing, not merely reach a different outcome.
+				cases++
+				return currentSeq + 1, nil
+			}
+			sess := &mqttSession{
+				asm: as, id: "f092-order", idHash: idHash, gen: gen,
+				pubRelSubject: pubRelSubject, regClaim: mqttNewInflightNonce(), seq: tc.ourSeq,
+			}
+			_, rerr := sess.recoverInflightRegisters(&client{})
+
+			switch {
+			case tc.wantRefuse && rerr == nil:
+				t.Fatal("a resumer accepted EARLIER than the standing claim took custody anyway: " +
+					"the newer owner is silently displaced by a broker it already superseded")
+			case tc.wantRefuse && cases != 0:
+				t.Fatalf("the refusal still issued %d custody write(s); it must refuse before the "+
+					"first CAS, not after losing one", cases)
+			case !tc.wantRefuse && rerr != nil:
+				t.Fatalf("recovery refused a resume it was entitled to complete: %v", rerr)
+			case !tc.wantRefuse && cases == 0:
+				t.Fatal("the contest issued no custody write at all, so this arm proves nothing " +
+					"about the rule being scoped to newer claims")
+			}
+		})
+	}
+}
+
+// TestF092ProveAcceptedIncarnationConjuncts isolates each conjunct of the acceptance proof.
+//
+// Every arm differs from the exact-match control in exactly ONE field, because a fixture
+// that changes generation, sequence and write identity together cannot tell which check is
+// load-bearing — and a proof with a missing conjunct passes such a test unchanged.
+//
+// The three outcomes are not interchangeable. Displacement is durable evidence that
+// somebody else owns the session; indeterminate means the question could not be answered,
+// and the two callers act on them differently: the transmission fence refuses on both,
+// while the custody repair must not treat one unreadable moment as a takeover.
+func TestF092ProveAcceptedIncarnationConjuncts(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-proof-conjuncts")
+	testReadyForPubRelDelivery(t, e)
+
+	e.sess.mu.Lock()
+	ourGen, ourWID, ourSeq := e.sess.gen, e.sess.wid, e.sess.seq
+	e.sess.mu.Unlock()
+	if ourWID == _EMPTY_ || ourSeq == 0 {
+		t.Fatal("the fixture must carry an acknowledged write identity and sequence")
+	}
+
+	for _, tc := range []struct {
+		name         string
+		gen          string
+		wid          string
+		seq          uint64
+		uncert       bool
+		nilConn      bool
+		useNilClient bool
+		want         mqttAcceptanceOutcome
+	}{
+		{name: "the exact acknowledged write is current", gen: ourGen, wid: ourWID, seq: ourSeq, want: mqttAcceptanceCurrent},
+		{name: "another generation is displacement", gen: mqttNewSessGen(), wid: ourWID, seq: ourSeq, want: mqttAcceptanceDisplaced},
+		{name: "a different write identity is not provable", gen: ourGen, wid: "a-different-write", seq: ourSeq, want: mqttAcceptanceIndeterminate},
+		{name: "a newer head is not proof of a rival", gen: ourGen, wid: ourWID, seq: ourSeq + 1, want: mqttAcceptanceIndeterminate},
+		{name: "an unresolved write of our own is not provable", gen: ourGen, wid: ourWID, seq: ourSeq, uncert: true, want: mqttAcceptanceIndeterminate},
+		{name: "an unbound object is displacement for a named connection", gen: ourGen, wid: ourWID, seq: ourSeq, nilConn: true, want: mqttAcceptanceDisplaced},
+		{name: "the object-level question ignores the binding", gen: ourGen, wid: ourWID, seq: ourSeq, nilConn: true, useNilClient: true, want: mqttAcceptanceCurrent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e.asm.mu.Lock()
+			e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
+				return &mqttPersistedSession{Gen: tc.gen, WID: tc.wid}, tc.seq, nil
+			}
+			e.asm.mu.Unlock()
+			defer func() {
+				e.asm.mu.Lock()
+				e.asm.testSessionLoad = nil
+				e.asm.mu.Unlock()
+			}()
+
+			e.sess.mu.Lock()
+			restoreConn, restoreUncertain := e.sess.c, e.sess.seqUncertain
+			if tc.nilConn {
+				e.sess.c = nil
+			}
+			e.sess.seqUncertain = tc.uncert
+			e.sess.mu.Unlock()
+			defer func() {
+				e.sess.mu.Lock()
+				e.sess.c, e.sess.seqUncertain = restoreConn, restoreUncertain
+				e.sess.mu.Unlock()
+			}()
+
+			asker := e.c
+			if tc.useNilClient {
+				asker = nil
+			}
+			proof, got := e.sess.proveAcceptedIncarnation(asker)
+			if got != tc.want {
+				t.Fatalf("outcome %v, want %v", got, tc.want)
+			}
+			if got == mqttAcceptanceCurrent && proof.seq != ourSeq {
+				t.Fatalf("a current proof reported sequence %d, not the acknowledged %d: the "+
+					"custody transfer orders claims against this value", proof.seq, ourSeq)
+			}
+		})
+	}
+}
+
+// TestF092ProofRetriesAnOlderHead covers the one arm a table of single observations
+// cannot: our OWN later save landing between the load and the snapshot.
+//
+// A head BEHIND our acknowledged sequence is not evidence about ownership at all — it is
+// almost always a save of ours that has not been adopted yet — so the proof retries rather
+// than reporting anything. Replacing that retry with an immediate indeterminate passes
+// every single-observation arm, because each of those returns on its first attempt; only a
+// SEQUENCE of observations distinguishes the two.
+func TestF092ProofRetriesAnOlderHead(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-proof-retry")
+	testReadyForPubRelDelivery(t, e)
+
+	e.sess.mu.Lock()
+	ourGen, ourWID, ourSeq := e.sess.gen, e.sess.wid, e.sess.seq
+	e.sess.mu.Unlock()
+
+	loads := 0
+	e.asm.mu.Lock()
+	e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
+		loads++
+		if loads == 1 {
+			// Behind us, with everything else matching: the shape our own unadopted save
+			// produces.
+			return &mqttPersistedSession{Gen: ourGen, WID: ourWID}, ourSeq - 1, nil
+		}
+		return &mqttPersistedSession{Gen: ourGen, WID: ourWID}, ourSeq, nil
+	}
+	e.asm.mu.Unlock()
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testSessionLoad = nil
+		e.asm.mu.Unlock()
+	}()
+
+	proof, out := e.sess.proveAcceptedIncarnation(e.c)
+	if out != mqttAcceptanceCurrent {
+		t.Fatalf("outcome %v after an older head: a head behind our own acknowledged sequence "+
+			"is our unadopted save, not an answer about ownership, so it must be retried", out)
+	}
+	if loads < 2 {
+		t.Fatalf("the proof read the record %d time(s): it returned without retrying, so the "+
+			"older-head observation was treated as a verdict", loads)
+	}
+	if proof.seq != ourSeq {
+		t.Fatalf("proof sequence %d, want %d", proof.seq, ourSeq)
+	}
+}
+
+// TestF092FenceFollowsTheActionCAS pins the ORDER, which is the property the fence rests on.
+//
+// A proof taken BEFORE the action CAS reports what was true before the exchange was
+// claimed, and a successor can accept in between — that is the same time-of-check race the
+// durable action exists to escape, so the proof has to come after. The oracle is the
+// observed sequence of durable operations, because a fence in the wrong place still
+// produces a correct-looking refusal in a test that only counts writes.
+func TestF092FenceFollowsTheActionCAS(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-fence-ordering")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(37)
+	testSeedPubRelReadySlot(t, e, pi)
+
+	var order []string
+	e.asm.mu.Lock()
+	realStore := e.asm.testInflightStore
+	e.asm.testInflightStore = func(subj string, expect uint64, r *mqttInflightRecord) (uint64, error) {
+		if r != nil && r.State == mqttInflightPubRelSending {
+			order = append(order, "action-cas")
+		}
+		return realStore(subj, expect, r)
+	}
+	e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
+		order = append(order, "acceptance-proof")
+		e.sess.mu.Lock()
+		gen, wid, seq := e.sess.gen, e.sess.wid, e.sess.seq
+		e.sess.mu.Unlock()
+		return &mqttPersistedSession{Gen: gen, WID: wid}, seq, nil
+	}
+	e.asm.mu.Unlock()
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testInflightStore, e.asm.testSessionLoad = realStore, nil
+		e.asm.mu.Unlock()
+	}()
+
+	writes := testCountPubRelWrites(t, e, func() {
+		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
+			"xxxxxxxxxxxxxxxxxxxxxx")
+	})
+	if writes != 1 {
+		t.Fatalf("the exchange did not transmit (%d write(s)); the ordering below would be vacuous", writes)
+	}
+	first, second := -1, -1
+	for i, step := range order {
+		if step == "action-cas" && first < 0 {
+			first = i
+		}
+		if step == "acceptance-proof" && first >= 0 && second < 0 {
+			second = i
+		}
+	}
+	if first < 0 {
+		t.Fatalf("no action CAS was observed: %v", order)
+	}
+	if second < 0 {
+		t.Fatalf("the acceptance proof never ran after the action CAS (sequence %v): a proof "+
+			"taken before the claim reports what was true before this broker owned the "+
+			"exchange, which is the race the durable action exists to escape", order)
+	}
+}
+
+// TestF092CustodyTransferRunsOncePerDelivery pins the once-per-callback contract.
+//
+// The repair sits inside admission's bounded attempt loop, and a successful transfer
+// deliberately `continue`s so every check re-runs against the new record. Without a guard
+// outside that loop, a slot a rival keeps re-claiming would make the same delivery attempt
+// the repair on every iteration — durable writes driven by a loop rather than by evidence.
+//
+// The oracle counts ENTRIES to the helper, not durable writes: one legitimate invocation
+// issues up to mqttInflightStoreAttempts of those, because casInflightSlot retries
+// internally, so a write count cannot tell one repair from three.
+func TestF092CustodyTransferRunsOncePerDelivery(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-transfer-once")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(38)
+	testSeedPubRelReadySlot(t, e, pi)
+
+	e.sess.mu.Lock()
+	idHash, gen, ourSeq := e.sess.idHash, e.sess.gen, e.sess.seq
+	e.sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+
+	// A rival re-claims the slot after every transfer, so each reload produces another
+	// custody-only verdict. Correct code still attempts the repair exactly once.
+	e.asm.mu.Lock()
+	realStore := e.asm.testInflightStore
+	e.asm.testInflightStore = func(subj string, expect uint64, r *mqttInflightRecord) (uint64, error) {
+		seq, err := realStore(subj, expect, r)
+		if err == nil && subj == subject && r.Claim != _EMPTY_ {
+			rival := *r
+			rival.Claim, rival.ClaimSeq = mqttNewInflightNonce(), ourSeq-1
+			seq, err = realStore(subj, seq, &rival)
+		}
+		return seq, err
+	}
+	e.asm.mu.Unlock()
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testInflightStore = realStore
+		e.asm.mu.Unlock()
+	}()
+
+	cur, smsg, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil {
+		t.Fatalf("loading the seeded slot: %v", err)
+	}
+	stalled := *cur
+	stalled.Claim, stalled.ClaimSeq = mqttNewInflightNonce(), ourSeq-1
+	if _, err := realStore(subject, smsg.Sequence, &stalled); err != nil {
+		t.Fatalf("installing the stalled slot: %v", err)
+	}
+
+	invocations := 0
+	restore := setMQTTTestCustodyTransfer(func() { invocations++ })
+	defer restore()
+
+	testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
+		"xxxxxxxxxxxxxxxxxxxxxx")
+
+	if invocations != 1 {
+		t.Fatalf("the custody repair ran %d times for one delivery: the retry granularity is the "+
+			"consumer's re-offer, not admission's attempt loop", invocations)
+	}
+}
+
+// TestF092TransferAcquiresAgainstPostTransferCustody observes what a repaired delivery
+// does after the custody transfer: it acquires against the record as it is AFTER the
+// transfer, and it puts exactly one PUBREL on the wire. It stops there — the client's
+// PUBCOMP and the exchange's completion belong to the wire test, not to this one.
+//
+// Note what this deliberately does NOT claim. The `continue` that jumps straight back to
+// the reload is an efficiency choice: without it the acquisition is built from the
+// pre-transfer body, the action CAS refuses that custody, and the loop's existing lost-CAS
+// redispatch reloads and reaches this same state one attempt later, provided that
+// attempt's reads succeed. A mutation removing it is therefore not killable AS A SAFETY
+// PROPERTY — the acquisition and readback behaviour it changes IS observable — and
+// pretending otherwise would assert something the code does not guarantee.
+//
+// What this test actually observes, stated so it cannot be read for more: the sequence of
+// custody values the slot presents across the delivery, and that exactly one PUBREL is
+// transmitted. It does NOT drive PUBCOMP, and it does not by itself prove the refusal of
+// an acquisition against stale custody — TestF092ActionAcquisitionDoesNotFollowACustodyRewrite
+// is the test that supplies that oracle.
+func TestF092TransferAcquiresAgainstPostTransferCustody(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-transfer-reload")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(39)
+	testSeedPubRelReadySlot(t, e, pi)
+
+	e.sess.mu.Lock()
+	idHash, gen, ourClaim, ourSeq := e.sess.idHash, e.sess.gen, e.sess.regClaim, e.sess.seq
+	e.sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+
+	cur, smsg, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil {
+		t.Fatalf("loading the seeded slot: %v", err)
+	}
+	stalled := *cur
+	stalled.Claim, stalled.ClaimSeq = mqttNewInflightNonce(), ourSeq-1
+	if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+		t.Fatalf("installing the stalled slot: %v", err)
+	}
+
+	// Record the custody every LOAD reports, so the acquisition's own view is observable.
+	var seen []string
+	e.asm.mu.Lock()
+	realLoad := e.asm.testInflightLoad
+	e.asm.testInflightLoad = func(subj string) (*mqttInflightRecord, *StoredMsg, error) {
+		rec, msg, lerr := realLoad(subj)
+		if subj == subject && rec != nil {
+			seen = append(seen, rec.Claim)
+		}
+		return rec, msg, lerr
+	}
+	e.asm.mu.Unlock()
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testInflightLoad = realLoad
+		e.asm.mu.Unlock()
+	}()
+
+	writes := testCountPubRelWrites(t, e, func() {
+		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
+			"xxxxxxxxxxxxxxxxxxxxxx")
+	})
+	// One PUBREL, and no more: the repaired exchange must end up transmitting exactly once.
+	//
+	// This count does NOT discriminate how it got there. An acquisition attempted against
+	// the pre-transfer custody is refused by the action CAS and then retried, which also
+	// ends at one transmission — so this assertion pins the outcome, not the path.
+	// TestF092ActionAcquisitionDoesNotFollowACustodyRewrite is where the refusal of a
+	// stale-custody acquisition is tested directly.
+	if writes != 1 {
+		t.Fatalf("the repaired exchange transmitted %d PUBREL(s): admission acted on the "+
+			"pre-transfer record, whose custody the action CAS no longer accepts", writes)
+	}
+
+	transferred := -1
+	for i, claim := range seen {
+		if claim == ourClaim {
+			transferred = i
+			break
+		}
+	}
+	if transferred < 0 {
+		t.Fatalf("the slot was never observed under this incarnation's custody: %v", seen)
+	}
+	if transferred == 0 {
+		t.Fatalf("the first observation already carried our claim, so the fixture never "+
+			"presented the stalled state: %v", seen)
+	}
+	// A load AFTER the transfer is what a reload is; without one, admission would have
+	// acquired straight from the record it decided the transfer from.
+	if transferred == len(seen)-1 {
+		t.Fatalf("no load followed the custody transfer (%v): admission acted on the "+
+			"pre-transfer record, so a change made in that window is ignored", seen)
+	}
+}
+
+// TestF092CompetingCustodyTransfersLandOnce covers two writers reaching the repair from the
+// SAME observed custody tuple — the shape two overlapping deliveries of one record produce.
+//
+// Both are entitled to transfer by every check they can make locally, so what has to
+// arbitrate is the durable write itself: the CAS carries the exact tuple each observed, and
+// the first to land moves it, so the second's predicate no longer matches. Without that,
+// two brokers each believe they hold custody of one exchange, which is the ambiguity the
+// owner slot exists to remove.
+func TestF092CompetingCustodyTransfersLandOnce(t *testing.T) {
+	e := testNewInflightEnv(t, "f092-competing-transfers")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(40)
+	testSeedPubRelReadySlot(t, e, pi)
+
+	e.sess.mu.Lock()
+	idHash, gen, ourSeq := e.sess.idHash, e.sess.gen, e.sess.seq
+	e.sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+
+	cur, smsg, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil {
+		t.Fatalf("loading the seeded slot: %v", err)
+	}
+	stalled := *cur
+	stalled.Claim, stalled.ClaimSeq = mqttNewInflightNonce(), ourSeq-1
+	if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+		t.Fatalf("installing the stalled slot: %v", err)
+	}
+	observed, _, err := e.asm.loadInflightRecord(subject)
+	if err != nil || observed == nil {
+		t.Fatalf("reloading the stalled slot: %v", err)
+	}
+	base, _, err := e.asm.loadInflightRecord(subject)
+	if err != nil || base == nil {
+		t.Fatalf("reloading the stalled slot: %v", err)
+	}
+	_, bmsg, _ := e.asm.loadInflightRecord(subject)
+
+	// Both writers decided from the SAME tuple, which is what makes this a contest rather
+	// than a sequence.
+	firstOK := e.sess.transferCustodyForAdmission(e.c, subject, bmsg.Sequence, observed)
+	secondOK := e.sess.transferCustodyForAdmission(e.c, subject, bmsg.Sequence, base)
+	if !firstOK {
+		t.Fatal("the first transfer from a valid observation was refused")
+	}
+	if secondOK {
+		t.Fatal("a second transfer decided from the SAME pre-transfer tuple also landed: the " +
+			"exact-custody predicate is what stops two writers both believing they own the " +
+			"exchange, and it did not")
+	}
+}
+
+// TestF092RecoveryVersusInlineTransferBothOrders covers the two PREDICATES that arbitrate
+// between recovery's custody claim and admission's inline repair when both target one slot.
+// It is not a concurrent contest between the two mechanisms; the scope paragraph below says
+// exactly what each arm does and does not run.
+//
+// They are separate writers with separate evidence, so what has to arbitrate between them
+// is the durable record and nothing else. Each arm covers one order and fails differently:
+// recovery-first must make a delivery decided from the pre-recovery body lose, and
+// inline-first must make a SUPERSEDED resumer refuse before it writes at all — the
+// schedule that motivated the pre-first-CAS ordering rule.
+//
+// SCOPED HONESTLY: these exercise the two PREDICATES against the state the other mechanism
+// leaves, not both mechanisms running concurrently. The recovery-first arm stores the
+// claimed body directly rather than running a resume, the inline-first arm seeds a newer
+// claim on a QoS 1 record and runs recovery against it, and neither observes the losing
+// callback's acknowledgement behaviour. A full concurrent cross-mechanism contest remains
+// uncovered.
+func TestF092RecoveryVersusInlineTransferBothOrders(t *testing.T) {
+	t.Run("recovery lands first and the stale inline transfer loses", func(t *testing.T) {
+		e := testNewInflightEnv(t, "f092-order-rec-first")
+		testReadyForPubRelDelivery(t, e)
+		const pi = uint16(41)
+		testSeedPubRelReadySlot(t, e, pi)
+
+		e.sess.mu.Lock()
+		idHash, gen, ourSeq := e.sess.idHash, e.sess.gen, e.sess.seq
+		e.sess.mu.Unlock()
+		subject := mqttInflightSubject(idHash, gen, pi)
+
+		cur, smsg, err := e.asm.loadInflightRecord(subject)
+		if err != nil || cur == nil {
+			t.Fatalf("loading the seeded slot: %v", err)
+		}
+		stalled := *cur
+		stalled.Claim, stalled.ClaimSeq = mqttNewInflightNonce(), ourSeq-1
+		if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+			t.Fatalf("installing the stalled slot: %v", err)
+		}
+		observed, obsMsg, err := e.asm.loadInflightRecord(subject)
+		if err != nil || observed == nil {
+			t.Fatalf("reloading: %v", err)
+		}
+
+		// Recovery's claim lands while this delivery still holds its earlier observation.
+		claimed := *observed
+		claimed.Claim, claimed.ClaimSeq = mqttNewInflightNonce(), ourSeq
+		if _, err := e.asm.testInflightStore(subject, obsMsg.Sequence, &claimed); err != nil {
+			t.Fatalf("landing recovery's claim: %v", err)
+		}
+
+		if e.sess.transferCustodyForAdmission(e.c, subject, obsMsg.Sequence, observed) {
+			t.Fatal("an inline transfer decided from the PRE-recovery body still landed: the " +
+				"exact-custody predicate is what stops a delivery overwriting a claim it " +
+				"never observed")
+		}
+		after, _, err := e.asm.loadInflightRecord(subject)
+		if err != nil || after == nil {
+			t.Fatalf("reloading after the contest: %v", err)
+		}
+		if after.Claim != claimed.Claim {
+			t.Fatalf("recovery's claim was overwritten (now %q)", after.Claim)
+		}
+	})
+
+	t.Run("an inline transfer lands first and a superseded resume refuses before writing", func(t *testing.T) {
+		// The inline repair has moved custody to an owner accepted at sequence 9. A
+		// resumer whose own acceptance is OLDER (5) must refuse before its first CAS,
+		// because its contest only re-compares after a write has already failed.
+		idHash, gen := getHash("f092-order-inline-first"), mqttNewSessGen()
+		pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
+		rec := &mqttInflightRecord{
+			PI: 42, Dur: "$MQTT_SHARED_grp", Seq: 41, QoS: 1,
+			Nonce: mqttNewInflightNonce(), Claim: "the-inline-repairs-owner", ClaimSeq: 9,
+			State: mqttInflightPublish,
+		}
+		subject := mqttInflightSubject(idHash, gen, rec.PI)
+		const currentSeq = uint64(81)
+		writes := 0
+		as := &mqttAccountSessionManager{}
+		as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) { return nil, 0, true }
+		as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
+			return mqttInflightSourceLive
+		}
+		as.testInflightEnumerate = func(string) (map[string]uint64, error) {
+			return map[string]uint64{subject: currentSeq}, nil
+		}
+		as.testInflightLoadMulti = func([]string) ([]*JSApiMsgGetResponse, error) {
+			data, err := json.Marshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return []*JSApiMsgGetResponse{{Message: &StoredMsg{
+				Subject: subject, Sequence: currentSeq, Data: data,
+			}}}, nil
+		}
+		as.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+			cp := *rec
+			return &cp, &StoredMsg{Subject: subject, Sequence: currentSeq}, nil
+		}
+		as.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
+			writes++
+			return currentSeq + 1, nil
+		}
+		sess := &mqttSession{
+			asm: as, id: "f092-order-inline-first", idHash: idHash, gen: gen,
+			pubRelSubject: pubRelSubject, regClaim: mqttNewInflightNonce(), seq: 5,
+		}
+		if _, err := sess.recoverInflightRegisters(&client{}); err == nil {
+			t.Fatal("a resumer accepted BEFORE the standing claim completed its resume: it " +
+				"would then serve an exchange a newer owner already took custody of")
+		}
+		if writes != 0 {
+			t.Fatalf("the refusal issued %d custody write(s): the ordering rule has to refuse "+
+				"BEFORE the first CAS, since the contest only re-compares after one fails", writes)
+		}
+	})
 }

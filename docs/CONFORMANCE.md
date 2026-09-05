@@ -1421,19 +1421,43 @@ Residuals:
   indeterminate cleanup keeps that reservation and retries through the shutdown-aware
   worker gate until the durable consequence is proven.
 
-  **Related, and narrower — this is open item #2.** Custody transfer is withheld for a
-  slot with a live action, so a takeover completes for the rest of the session while that
-  one exchange stays non-actionable until the action drains; a holder that already acquired
-  an action completes it across a later acceptance, so a successor may see one PUBREL
-  written to the predecessor's closing socket for a real past-PUBREC exchange, with nothing
-  durable landing under the superseded acceptance. The drain then clears the action fields
-  but LEAVES the predecessor's Claim, and nothing re-runs custody for the already-connected
-  successor, so admission keeps failing `cur.Claim==sess.regClaim` for that identifier until
-  the next reconnect — at Receive Maximum 1 stalling that session's QoS 1/2 delivery. It is
-  recoverable with no data loss and no F-092 transmission; the ruled fix is Decision 7 in
-  the work lane (a post-action-CAS `$MQTT_sess` ownership fence plus a successor reconcile),
-  a deferred focused pass whose foundational `mqttSlotTransferCustody` CAS predicate is
-  landed. A malformed or marker-less PUBREL record is never
+  **Related, and narrower — CLOSED.** Custody transfer is still withheld for a slot with a
+  live action, so a takeover completes for the rest of the session while that one exchange
+  stays non-actionable until the action drains; a holder that already acquired an action
+  completes it across a later acceptance, so a successor may see one PUBREL written to the
+  predecessor's closing socket for a real past-PUBREC exchange, with nothing durable
+  landing under the superseded acceptance. The drain then clears the action fields but
+  leaves the predecessor's Claim — and the successor now REPAIRS that at admission rather
+  than waiting for a reconnect: a stored PUBREL that passes every admission condition
+  except custody moves custody to the proving incarnation, once per delivery, and the
+  consumer's own re-offer is the retry. The transmission fence
+  (`action CAS -> acceptance proof -> socket write`) narrows the acquisition-to-write
+  window but does not close it, so the predecessor-socket PUBREL above remains possible.
+  **Recovery is redelivery-driven, so completion has no fixed wall-clock bound**: a failed
+  attempt leaves the record unacknowledged for a further AckWait, and repeated storage
+  failure means repeated intervals.
+
+  **A storage-progress dependency, stated because it is a real availability cost.** A
+  finished past-PUBREC slot whose required terminal advance cannot be resolved now REFUSES
+  the resume instead of accepting a connection whose identifier would stay charged with
+  nothing left to retry it. While the store keeps failing that refusal repeats: the three
+  attempts and the request timeout bound one attempt, not the number of refused CONNECTs.
+  A permanently malformed record does not reach that path — the scan routes it to the
+  opaque disposition instead.
+
+  **What is NOT repaired, and it predates this mechanism.** There is no general
+  successor-side reconciliation of stranded LOCAL PUBREL reservations. If a peer completes
+  an exchange and removes the slot and its canonical record before this broker completes
+  its own local release path, this broker can retain the identifier and its Receive Maximum
+  charge indefinitely — including an empty withheld reservation, and an entry whose
+  acknowledgement subject was filled before a transmission that did not happen. A
+  same-object reconnect does not guarantee release; rebuilding the session object from
+  durable state removes purely local residue, and a whole-generation discard clears it. At
+  Receive Maximum 1 one such reservation blocks further outbound QoS 1/2 delivery. It
+  requires a completion overlapping a takeover or a recovery, has no trigger in
+  single-broker steady state or on a clean takeover, and is not a cost of the inline
+  custody repair — the same reservation is reachable without it. A malformed or
+  marker-less PUBREL record is never
   interpreted and costs stream space rather than an identifier. A **retained** QoS 2
   exchange's PUBREL is not authorized across a restart — it has no register at all, so its
   authority is the live in-memory owner identity of that incarnation — and its record is

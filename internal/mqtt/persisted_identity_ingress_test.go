@@ -250,6 +250,7 @@ func TestPersistedIdentityIngressSurfaceIsEnumerated(t *testing.T) {
 // recovery-authorizing outcomes are. Where a site's own file already states the
 // partition, the entry points at it rather than paraphrasing.
 var censusInterpreters = map[string]string{
+	"advanceFinishedSlotToTerminal": "reads the slot back after an unsuccessful advance CAS and PARTITIONS the outcome: terminal-or-absent is advanced, a live action or another exchange is not-ours, and a failed, unreadable, unattributable or indeterminate observation is UNRESOLVED, which refuses the resume rather than accepting one whose identifier stays charged",
 	// ---- the transport layer itself -------------------------------------------
 	// These are the wrappers. Their "interpretation" is the outcome PARTITION they
 	// establish for everyone above them, which is why they are sites in their own

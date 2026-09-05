@@ -1302,7 +1302,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// interlock that stops an action being acquired over a PUBLISH still on the wire.
 		// It reads the hold's own pubIdent rather than asking whether the identifier is
 		// reserved, which is a different question and is sendReservedLocked's.
-		"mqttSession.pubRelAdmissionContextOK": {},
+		"mqttSession.pubRelAdmissionContext": {},
 		// actionHeldLocked is deliberately ABSENT. It is the fourth liveness term and it
 		// reads a HOLD it was handed, never the registry — the same reason
 		// pubCompHeldLocked and retainedHeldLocked are absent. A term that took the map
@@ -2426,6 +2426,34 @@ func testDeliverPubRel(t *testing.T, e *testInflightEnv, pi uint16, reply, claim
 
 // testReadyForPubRelDelivery wires the session so the delivery callback and the PUBCOMP
 // handler both run: a bound connection, a PUBREL consumer, and no gate withholding.
+// testPersistAcceptedRecord gives the fixture the durable precondition PRODUCTION always
+// has by the time a stored PUBREL can be delivered: an accepted session record at the head
+// of $MQTT_sess, whose stream sequence and write identity are the ones this session object
+// carries.
+//
+// It is not scaffolding for the assertion under test — it is the state an accepted CONNECT
+// leaves behind. The accept save runs before recovery and long before any PUBREL consumer
+// exists, so a delivery callback in production never runs against a session with no record.
+// A fixture that skipped it was exercising a state the broker cannot be in, and the
+// acceptance fence (which refuses to transmit unless the head record is this incarnation's
+// own acknowledged write) would correctly refuse every transmission in it.
+func testPersistAcceptedRecord(t *testing.T, e *testInflightEnv) {
+	t.Helper()
+	tok := e.sess.beginRecordTx()
+	if err := e.sess.save(tok); err != nil {
+		t.Fatalf("persisting the fixture's accepted session record: %v", err)
+	}
+	if err := e.sess.endRecordTx(tok); err != nil {
+		t.Fatalf("endRecordTx: %v", err)
+	}
+	// Proving it here rather than trusting the save keeps a later change to the record
+	// shape from silently turning every PUBREL fixture into a refusal test.
+	if _, out := e.sess.proveAcceptedIncarnation(e.c); out != mqttAcceptanceCurrent {
+		t.Fatalf("the fixture's session record is not provably current (%v); every slot-backed "+
+			"PUBREL transmission would be fenced off and the tests would pass for the wrong reason", out)
+	}
+}
+
 func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
 	t.Helper()
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
@@ -2434,6 +2462,7 @@ func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
 	e.sess.c = e.c
 	e.sess.pubRelConsumer = &ConsumerConfig{Durable: "PUBREL_F089"}
 	e.sess.mu.Unlock()
+	testPersistAcceptedRecord(t, e)
 
 	// Terminal cleanup now requires the source side to be provably complete for every
 	// past-PUBREC slot, not only for records whose Retired bit happened to land before a

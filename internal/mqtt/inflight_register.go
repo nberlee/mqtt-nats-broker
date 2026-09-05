@@ -4986,6 +4986,35 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 				// consumed at the next barrier run.
 
 				subject := mqttInflightSubject(idHash, gen, fr.rec.PI)
+				// ORDERING BEFORE THE FIRST WRITE, not only on a contested reread.
+				//
+				// The arms below re-target and re-compare when a CAS FAILS, which covers
+				// two writers racing one tuple. It does not cover two writers arriving in
+				// sequence: a rival accepted LATER can transfer this slot to itself
+				// (admission's custody repair does exactly that), and a resumer whose own
+				// acceptance is OLDER would then read that settled tuple and take it with
+				// a first CAS that succeeds — no conflict, no failed attempt, no contest.
+				// The rightful newer owner is silently displaced by a broker it already
+				// superseded.
+				//
+				// STRICTLY NEWER, not at-or-newer, and the difference is the invariant
+				// this rule rests on. Accept saves are what order two owners: the record
+				// CAS makes every accept sequence unique, so of two DIFFERENT accepted
+				// owners exactly one is newer and equality between two different claims is
+				// a state acceptance cannot produce. Refusing on equality would abort
+				// resumes on no evidence, while the contest below acts on an observed
+				// conflicting write, which is strictly better evidence.
+				//
+				// A claimless record is untouched (nothing to be behind); an OWN claim is
+				// still rewritten at its unmoved sequence, because moving the sequence is
+				// what fences a paused terminal delete; and a foreign claim carrying
+				// ClaimSeq ZERO is not evidence of a newer acceptance, since JetStream
+				// sequences start at 1 and zero means that writer had no confirmed record.
+				if fr.rec.Claim != _EMPTY_ && fr.rec.Claim != claim &&
+					fr.rec.ClaimSeq != 0 && fr.rec.ClaimSeq > claimSeq {
+					results[i].outcome = mqttInflightClaimDisplaced
+					continue
+				}
 				claimed := *fr.rec
 				claimed.Claim = claim
 				claimed.ClaimSeq = claimSeq
@@ -6485,10 +6514,30 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// vacate-a-live-exchange hazard F-092 exists to close.
 	for i := range pastPubRecFinished {
 		ref := pastPubRecFinished[i]
-		if !sess.advanceFinishedSlotToTerminal(c, &ref) {
+		switch sess.advanceFinishedSlotToTerminal(c, &ref) {
+		case mqttSlotAdvanceNotOurs:
 			// An action is live, or the slot moved. Either way it is not ours to finish:
 			// the identifier stays reserved and its own holder converges it.
 			continue
+		case mqttSlotAdvanceUnresolved:
+			// REQUIRED WORK WHOSE OUTCOME IS UNKNOWN, so the resume is refused rather than
+			// completed around it.
+			//
+			// This slot was PROVEN finished, and its identifier is reserved by a terminal
+			// reservation installed moments ago. Continuing here accepted the connection
+			// with that reservation standing and nothing left to retry the advance — a
+			// finite storage blip permanently consuming a Receive Maximum slot on a
+			// session that looks healthy. There is no later event: the source is already
+			// settled, so nothing re-offers it, and no delivery addresses this slot.
+			//
+			// Refusing costs a CONNECT and is self-correcting: the reservation and the
+			// durable slot are preserved, and the next resume re-derives the completion
+			// proof and retries the advance against a working store. The cost is stated in
+			// docs/CONFORMANCE.md — while the store keeps failing this refusal repeats,
+			// which is a storage-progress dependency and not a bounded number of retries.
+			return nil, fmt.Errorf("the terminal advance of a finished past-PUBREC slot for packet "+
+				"identifier %d could not be resolved, so its identifier would stay reserved with "+
+				"nothing left to retry it", ref.name.pi)
 		}
 		switch sess.finalizeTerminalSlot(c, ref) {
 		case mqttTerminalDone:

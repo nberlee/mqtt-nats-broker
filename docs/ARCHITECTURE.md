@@ -4621,6 +4621,64 @@ actionable—the client is waiting for PUBREL—where a retired flag by itself i
 Active actions retain the custody under which they were acquired, and terminal cleanup is
 custody-agnostic.
 
+**Custody withheld at recovery is repaired at admission, not by a background worker.**
+A slot that was mid-action when a successor resumed keeps the predecessor's claim after
+that action drains: the drain clears the action fields and nothing re-runs the pre-CONNACK
+refresh for a connection that is already up. Admission would then refuse the exchange on
+every redelivery. So when a stored PUBREL passes every admission condition EXCEPT custody,
+the admitting broker moves custody itself, on that delivery, under five conditions: every
+other check passed; the standing claim is non-empty and another incarnation's; the slot is
+quiescent; this object is provably the current accepted incarnation bound to this
+connection; and the standing claim's sequence is strictly older than the proven acceptance.
+The CAS carries the exact custody tuple just observed, so a successor that transferred in
+between wins. It is attempted at most once per delivery — the retry loop is the consumer's
+own re-offer, since a refused PUBREL is never acknowledged and the PUBREL consumer has no
+delivery limit.
+
+**A transfer grants custody and never transmission.** The action CAS still has to be
+acquired afterwards, and the acceptance fence below still has to pass.
+
+**The transmission fence: `action CAS -> acceptance proof -> send bookkeeping -> socket
+write`.** Acquiring an action proves no other holder may act on the exchange; it does not
+prove the holder is still the session's current accepted incarnation, because a successor
+can commit its acceptance while this broker sits between acquiring and writing. So a proof
+runs after the acquisition — the head of `$MQTT_sess` must be this object's own
+acknowledged write, by exact stream sequence AND write identity, with no uncertain
+sequence and the connection still bound — and a non-current outcome sends nothing and
+drains the action. The proof is taken BEFORE the send section, so a refusal opens no send
+token, fills no acknowledgement subject and performs no ordered handoff.
+
+That proof is three-valued on purpose. A transient read failure is INDETERMINATE, never
+displacement: the fence refuses on anything but current, while the custody repair simply
+declines and waits for the next re-offer, so one failed read cannot abandon a repair or
+manufacture a takeover. A head record NEWER than ours is also indeterminate rather than
+foreign, because a save of ours is committed before its response is adopted and carries a
+freshly minted write identity in that window. The window this fence narrows is the
+acquisition-to-write interval; it does not close it, and a successor accepting between the
+proof and the write still transmits that exchange's own PUBREL under its own identifier,
+which the client resolves with PUBCOMP.
+
+**The claim ordering is enforced by every custody writer, before the first write.**
+Recovery's contest re-compares only after a CAS fails, which covers two writers racing one
+tuple but not two arriving in sequence: a newer owner can take custody, and a paused older
+resumer would then overwrite it with a first CAS that meets no conflict. So a record
+carrying another incarnation's claim at a strictly newer acceptance sequence is refused
+before any write. Strictly newer, because accept saves are what order two owners and the
+record CAS makes every accept sequence unique; equality between two different claims is a
+state acceptance cannot produce. A claimless record, and a claim whose sequence is zero
+(its writer had no confirmed record), are not evidence of a newer owner and are left to
+the ordered contest.
+
+**A required terminal advance that cannot be resolved refuses the resume.** Recovery
+proves a past-PUBREC slot finished, reserves its identifier and advances it so the delete
+becomes legal. The advance's outcome is read back and classified: terminal or provably
+absent means it is done; a live action or another exchange means it was never ours; and a
+failed, unreadable, unattributable or indeterminate observation is UNRESOLVED, which
+returns an error through the pre-CONNACK refusal rather than accepting a connection whose
+identifier stays charged with nothing left to retry it. Continuing past it turned a finite
+storage failure into a permanently consumed Receive Maximum slot on a session that looked
+healthy.
+
 An acknowledgement that cannot be confirmed needs one more thing. The source may still
 be pending, so JetStream will re-offer it — and its payload is past PUBREC, so sending
 it again is a duplicate. The source is therefore **retired**: the next delivery attempt

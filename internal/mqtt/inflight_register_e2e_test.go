@@ -1034,3 +1034,186 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 		return nil
 	})
 }
+
+// TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire is F-092's open item #2 as a
+// client sees it, over a real connection, a real PUBREL consumer and real AckWait.
+//
+// The stall: a successor resumes while a predecessor holds a live action on the slot, so
+// recovery correctly withholds the custody transfer. When the predecessor's action later
+// drains it clears the action fields and LEAVES the predecessor's claim behind. Nothing
+// re-runs custody for a connection that is already up, so admission refuses the exchange
+// on every redelivery and the client never receives its PUBREL. With Receive Maximum 1
+// that stalls the session completely.
+//
+// The stalled state is INSTALLED on the durable slot rather than produced by a real
+// takeover: that is exactly the shape a predecessor's drain leaves — a quiescent slot
+// under another incarnation's claim — and reproducing it through two live brokers would
+// exercise the takeover machinery rather than this repair. The cost of that choice is
+// stated plainly: the recovery half of the schedule is covered by unit tests, and what
+// this test establishes is the repair and the liveness that follows it, on the wire.
+// Everything after that point is real: the record is re-offered by the consumer's own
+// AckWait, the PUBREL arrives on the unchanged connection, the client completes it with
+// PUBCOMP, and the identifier's Receive Maximum slot is released for the next message.
+//
+// Mutation check: remove the custody repair from admitStoredPubRel and the PUBREL never
+// arrives — the read below times out, which is precisely the stall.
+func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptionsV5()
+	// A short AckWait is what makes the redelivery observable within the test's patience;
+	// the repair itself is driven by that re-offer and nothing else.
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Receive Maximum 1: one stalled exchange stops the session receiving anything, so
+	// the follow-up message at the end is a real liveness assertion rather than a nicety.
+	props := append(mqttV5ConnPropsReceiveMax(1), mqttV5ConnPropsSessionExpiry(3600)...)
+	ci := &mqttV5ConnInfo{clientID: "f092-foreign-custody-wire", props: props}
+	sub, subr := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer sub.Close()
+	testMQTTReadConnAckV5(t, subr)
+	testMQTTSubV5(t, sub, subr, 1, []mqttV5SubFilter{{topic: "foo", opts: 2}})
+	testMQTTFlush(t, sub, nil, subr)
+
+	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "f092-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTReadConnAckV5(t, pubr)
+
+	// Take the exchange to PUBREC, which is where the owner slot is past PUBREC and its
+	// PUBREL record exists — the state a takeover can withhold custody on.
+	testMQTTPubV5Props(t, pub, pubr, 2, false, 1, "foo", []byte("stalled"), nil)
+	_, pi := testMQTTReadPublishV5(t, subr, "foo", []byte("stalled"))
+	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
+
+	asm := testMQTTGetAccountSessionManager(t, s, "f092-foreign-custody-wire")
+	asm.mu.RLock()
+	sess := asm.sessions["f092-foreign-custody-wire"]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("no resident session for the subscriber")
+	}
+	sess.mu.Lock()
+	idHash, gen, ourClaim := sess.idHash, sess.gen, sess.regClaim
+	sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+
+	// INSTALL THE STALL: the slot keeps its exchange identity and its canonical PUBREL,
+	// and only its custody becomes another incarnation's — with a strictly older
+	// acceptance sequence, which is what a predecessor's claim carries.
+	// WAIT FOR THE ACTION TO DRAIN FIRST. Immediately after the PUBREL write the slot is
+	// still in `pubrel_sending` holding its action, and that is not the state this test is
+	// about: the stall appears only once the holder's action has drained and left its
+	// claim behind. It is also the state the shape validator refuses to rewrite, correctly.
+	var rec *mqttInflightRecord
+	var smsg *StoredMsg
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		var lerr error
+		rec, smsg, lerr = asm.jsa.loadInflightRecord(subject)
+		switch {
+		case lerr != nil:
+			return fmt.Errorf("loading the owner slot for identifier %d: %w", pi, lerr)
+		case rec == nil || smsg == nil:
+			return fmt.Errorf("no owner slot for identifier %d", pi)
+		case rec.ActionToken != _EMPTY_:
+			return fmt.Errorf("the holder's action has not drained yet (state %q)", rec.State)
+		}
+		return nil
+	})
+	if rec.Claim != ourClaim {
+		t.Fatalf("the slot is not under this incarnation's custody to begin with (%+v)", rec)
+	}
+
+	// FIRST, THE WITHHOLDING RULE ITSELF: while the slot is ACTIVE (a live action), a
+	// custody transfer must be refused. That refusal is the step which leaves the
+	// predecessor's claim behind and creates the stall this test then exercises.
+	//
+	// STATED PRECISELY, because it is narrower than it looks: this drives the transfer
+	// helper directly on an active slot. It does NOT resume a second session object, does
+	// not install a successor's withheld reservation through recovery, and does not
+	// witness a consumer delivery refused while the predecessor is still active. Those
+	// belong to the recovery path and are covered by the unit tests over
+	// claimRecoveredInflight; what is real here is everything after the drain — the
+	// consumer's own re-offer, the repair, the client's PUBCOMP and the released
+	// Receive Maximum slot.
+	activeProbe := *rec
+	activeProbe.State = mqttInflightPubRelSending
+	activeProbe.ActionToken = mqttNewInflightNonce()
+	activeProbe.ActionClaim, activeProbe.ActionClaimSeq = activeProbe.Claim, activeProbe.ClaimSeq
+	withheldSeq, err := asm.jsa.storeInflightCAS(subject, smsg.Sequence, &activeProbe)
+	if err != nil {
+		t.Fatalf("installing the active slot: %v", err)
+	}
+	sess.mu.Lock()
+	beforeClaim := sess.regClaim
+	sess.mu.Unlock()
+	if ok := sess.transferCustodyForAdmission(sess.c, subject, withheldSeq, &activeProbe); ok {
+		t.Fatal("custody was transferred out from under a LIVE action: the action is its " +
+			"holder's capability and the transfer must be withheld until it drains")
+	}
+	activeNow, activeMsg, err := asm.jsa.loadInflightRecord(subject)
+	if err != nil || activeNow == nil {
+		t.Fatalf("reloading the active slot: %v", err)
+	}
+	if activeNow.Claim == beforeClaim && activeNow.ActionToken == _EMPTY_ {
+		t.Fatal("the fixture did not actually hold an active slot; the withholding assertion " +
+			"above proves nothing")
+	}
+
+	// NOW THE DRAIN: the action goes away and the predecessor's claim stays, which is
+	// exactly what startActionDrain leaves behind and exactly where the stall begins.
+	drained := *activeNow
+	drained.State = mqttInflightPubRelReady
+	drained.ActionToken, drained.ActionClaim, drained.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
+	if _, err := asm.jsa.storeInflightCAS(subject, activeMsg.Sequence, &drained); err != nil {
+		t.Fatalf("draining the action: %v", err)
+	}
+	rec, smsg, err = asm.jsa.loadInflightRecord(subject)
+	if err != nil || rec == nil || smsg == nil {
+		t.Fatalf("reloading the drained slot: %v", err)
+	}
+
+	stalled := *rec
+	stalled.Claim = mqttNewInflightNonce()
+	if stalled.ClaimSeq > 0 {
+		stalled.ClaimSeq--
+	}
+	if _, err := asm.jsa.storeInflightCAS(subject, smsg.Sequence, &stalled); err != nil {
+		t.Fatalf("installing the foreign-claimed slot: %v", err)
+	}
+
+	// The client has not sent PUBCOMP, so the server re-sends the PUBREL
+	// ([MQTT-4.4.0-1]) and the consumer re-offers the record. Under the stall every one
+	// of those is refused; with the repair the first re-offer takes custody and the
+	// PUBREL reaches the client on this same connection.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
+
+	// The durable proof: custody is this incarnation's again, so the exchange is
+	// actionable rather than merely retried.
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		cur, _, lerr := asm.jsa.loadInflightRecord(subject)
+		switch {
+		case lerr != nil:
+			return fmt.Errorf("loading the slot: %w", lerr)
+		case cur == nil:
+			return nil // the exchange completed and cleaned up, which is stronger
+		case cur.Claim != ourClaim:
+			return fmt.Errorf("the slot still carries foreign custody %q: admission will refuse "+
+				"it on every redelivery and the session stays stalled", cur.Claim)
+		}
+		return nil
+	})
+
+	// The client completes it, and the identifier's Receive Maximum slot is released:
+	// the next message arrives, which a stalled session could not deliver.
+	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
+	testMQTTFlush(t, sub, nil, subr)
+
+	testMQTTPubV5Props(t, pub, pubr, 2, false, 2, "foo", []byte("after"), nil)
+	_, nextPI := testMQTTReadPublishV5(t, subr, "foo", []byte("after"))
+	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, nextPI)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, nextPI)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, nextPI)
+	testMQTTFlush(t, sub, nil, subr)
+}

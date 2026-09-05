@@ -768,6 +768,23 @@ func setMQTTTestPubRelDeliveryDelay(h func()) func() {
 // seam here it is unreachable from a test: the enqueue returns too quickly to be raced,
 // so a fixture would have to call the primitive directly and would then prove nothing
 // about this callback's own wiring.
+// mqttTestCustodyTransferV counts ENTRIES to the inline custody repair, which is the only
+// way to observe its once-per-delivery contract. Counting durable writes cannot: one
+// legitimate invocation issues up to mqttInflightStoreAttempts of them, because
+// casInflightSlot retries internally, so a write count conflates "the repair ran twice"
+// with "one repair retried".
+var mqttTestCustodyTransferV atomic.Pointer[func()]
+
+func setMQTTTestCustodyTransfer(h func()) func() {
+	prev := mqttTestCustodyTransferV.Load()
+	if h == nil {
+		mqttTestCustodyTransferV.Store(nil)
+	} else {
+		mqttTestCustodyTransferV.Store(&h)
+	}
+	return func() { mqttTestCustodyTransferV.Store(prev) }
+}
+
 var mqttTestPubRelWriteBlockV atomic.Pointer[func()]
 
 func setMQTTTestPubRelWriteBlock(h func()) func() {
@@ -19381,6 +19398,39 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// so it runs first; this one then drains the durable action exactly once.
 	if act != nil {
 		defer sess.startActionDrain(cc, act)
+	}
+
+	// THE ACCEPTED-INCARNATION FENCE, and its position in the sequence is the property:
+	//
+	//	action CAS -> acceptance proof -> send bookkeeping -> socket write
+	//
+	// The action CAS above establishes that no other holder may act on this exchange. It
+	// does NOT establish that this broker is still the session's current accepted
+	// incarnation: a successor can commit its acceptance while this broker is between
+	// acquiring and writing, and the slot arbitrates the action rather than the
+	// proposition that its holder is still current. So the proof runs HERE, after the
+	// acquisition and before anything is mutated or sent.
+	//
+	// Placed before the send section deliberately. Run after it — as an earlier revision
+	// had it — a refusal would already have opened a send token, filled the entry's
+	// acknowledgement subject and performed F-093's handoff, leaving an entry that claims
+	// a delivery this broker never transmitted. Here none of that has happened: the drain
+	// armed just above returns the action to `pubrel_ready`, no send token exists so no
+	// endSend is owed, and AckWait re-offers the record to whoever is current.
+	//
+	// It NARROWS the acquisition-to-write window; it does not close it, and the
+	// documentation says so. A successor accepting between this proof and the socket write
+	// still transmits this exchange's own PUBREL under its own identifier, which is a
+	// retransmission the client resolves with PUBCOMP — not F-092's hazard of a PUBREL
+	// under an identifier a DIFFERENT exchange owns.
+	//
+	// A retained exchange has no slot and therefore no action (R6); it is authorized by
+	// the live in-memory owner identity of its incarnation and by the connection check
+	// below, so it is deliberately not fenced here.
+	if act != nil {
+		if _, out := sess.proveAcceptedIncarnation(cc); out != mqttAcceptanceCurrent {
+			return
+		}
 	}
 
 	sess.mu.Lock()

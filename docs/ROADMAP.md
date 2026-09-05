@@ -2613,19 +2613,28 @@ takeover.
   min(published, granted) — this item only
   refused to add a second route into it.
 
-- [ ] **F-092: a stale stored PUBREL can be transmitted under an identifier another
-  exchange owns.** **NOT fully closed — ONE open item as of 2026-09-05 (#2 below).** The
-  seventh increment closes the custody, census, canonical-origin and terminal-disposal gaps,
-  and three holistic review rounds are resolved EXCEPT one: **#2, the custody-after-drain
-  stall.** A slot taken over during an active action is correctly withheld at recovery, but
-  when the predecessor's action later drains it leaves the predecessor's Claim, so nothing
-  re-runs custody for the already-connected successor and admission fails
-  `cur.Claim==sess.regClaim` until the next reconnect (at Receive Maximum 1 that stalls all
-  QoS 1/2 delivery). Recoverable, no data loss / no F-092 transmission. Codex ruled the fix
-  (Decision 7, an F-036-grade post-action-CAS `$MQTT_sess` ownership fence + a successor
-  reconcile) in the lane's `DECISIONS.md`; its foundational `mqttSlotTransferCustody` CAS
-  predicate is landed, the rest is a deferred focused pass. Work record:
-  in the sixth attempt
+- [x] **F-092: a stale stored PUBREL can be transmitted under an identifier another
+  exchange owns.** **CLOSED 2026-09-05 by the eighth increment**, which completed the last
+  open item (#2, the custody-after-drain stall). Three mechanisms landed, and the division
+  of labour between them is the design: an accepted-incarnation PROOF, a transmission
+  FENCE ordered `action CAS -> proof -> socket write`, and an inline custody REPAIR on
+  admission's custody-only refusal. A slot withheld at recovery because its action was live
+  keeps the predecessor's claim once that action drains; the successor now takes custody on
+  the delivery that would otherwise have been refused, under five conditions (every other
+  admission check passed, a foreign non-empty claim, a quiescent slot, a proven-current
+  incarnation bound to this connection, and a strictly older claim sequence), at most once
+  per delivery. **The retry loop is the PUBREL consumer's own re-offer** — a refused record
+  is never acknowledged and the consumer has no delivery limit — which is why Decision 7's
+  successor-side reconcile WORKER was superseded: four plan-review rounds each found another
+  gap in the in-memory placeholder lifecycle it needed, and an escalation consult ruled the
+  worker out entirely rather than patch a fifth. The claim ordering is now enforced by every
+  custody writer BEFORE its first write, closing the schedule where a paused older resumer
+  overwrote a newer owner's custody with a CAS that met no conflict. And a required terminal
+  advance whose outcome cannot be resolved refuses the resume instead of accepting a
+  connection whose identifier stays charged. Residuals — the narrowed acquisition-to-write
+  window, the redelivery-driven progress bound, the storage-progress dependency of that
+  refusal, and the pre-existing stranded local reservation — are stated in
+  `docs/CONFORMANCE.md`. The earlier work record follows: the sixth attempt
   (`~/.claude/lanes/f-092-sixth-attempt/`). One `$MQTT_inflight` record — the owner slot —
   now owns an exchange for its WHOLE life, so the identifier has exactly one durable
   claimant instead of two independently changing durable sets nothing could arbitrate
@@ -3007,9 +3016,10 @@ takeover.
   historical evidence, but an affine-only failure is appended to chapter P rather than
   widening this item or blocking its general solution.
 
-- [ ] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
-  identifier.** **Built and tested; ticks with F-092** ("take both or neither"), which is
-  NOT fully closed pending F-092's open #2 above.
+- [x] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
+  identifier.** **CLOSED 2026-09-05 with F-092** ("take both or neither"). Its ordered
+  handoff was built and tested in the seventh increment; the eighth closed F-092's last
+  open item, which is what both boxes were waiting on.
   The ordered handoff below is built and tested, and
   it
   is the half that was missing. The ordered handoff runs under one session-lock
