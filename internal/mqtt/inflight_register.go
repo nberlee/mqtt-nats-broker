@@ -4723,11 +4723,12 @@ func (sess *mqttSession) quarantineForeignInflight(c *client, pi uint16, jsDur s
 	if ack == nil || !ack.regPending || ack.jsDur != jsDur || ack.sseq != sseq ||
 		ack.regNonce != nonce || ack.regCancelled {
 		// Our allocation is no longer the thing in this slot. A teardown that WITHDREW it
-		// is the case that matters, and it is why the contest is still recorded here: the
-		// consumer is gone, so nothing re-offers the source now — but a re-subscribe
-		// will, and with neither a cpending mapping nor a contest to consult,
-		// trackPublish would allocate a SECOND identifier for a delivery whose first one
-		// the rival's register still names.
+		// is the case that matters, and it is why the contest is still recorded here:
+		// nothing on THIS path will transmit the source now — a torn-down consumer cannot,
+		// and a retained drain answers a re-offer through its unclaimed arm rather than by
+		// sending. But a re-subscribe can, and with neither a cpending mapping nor a
+		// contest to consult, trackPublish would allocate a SECOND identifier for a
+		// delivery whose first one the rival's register still names.
 		//
 		// The ENTRY is left exactly as it is. A cancelled reservation carries the
 		// settled/proof bookkeeping the cancellation owes and installing a foreign

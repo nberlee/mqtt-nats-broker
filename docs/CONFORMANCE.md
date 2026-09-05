@@ -1280,6 +1280,53 @@ Residuals:
   PUBREL has been delivered, or found present at its sequence by the resume
   barrier. The cost is one redelivery of the source in the rare case where the
   store landed but its delivery did not; the alternative is losing the message.
+- **A drain carrying a past-PUBREC intent holds its filter (F-094).** A QoS > 0
+  re-SUBSCRIBE to that filter is answered with `0x80` until the drain is retired,
+  because adopting it would drop the drain's per-sequence state and let the
+  still-unacknowledged source be re-offered as a fresh PUBLISH of an exchange the
+  client has already answered. A **QoS 0** re-SUBSCRIBE is unaffected, and a drain
+  holding only PUBLISH-phase claims is still adopted normally.
+  - **No backlog retention is guaranteed during the refusal.** An unclaimed fresh
+    delivery that reaches the drain callback is acknowledged outright and lost; but
+    a barrier-skipped drain has no source subscription and a saturated
+    `MaxAckPending` can stop messages reaching the callback at all, so stored
+    messages may equally accumulate. The broker promises neither outcome.
+  - **The release is retirement, not a client action.** A failed PUBREL recreate or
+    an incomplete resume scan defers it to another resume, and a client that never
+    acknowledges its remaining drained deliveries can hold the filter refused for
+    the life of the session — though only where those claims also survive
+    reconciliation, since a resume that proves a source absent prunes the claim and
+    retires the drain with no client action at all. An **unusable-identity** hold is
+    operator-only and no resume repairs it.
+  - **At fork repair the refusal is not retried.** A held sid refuses the two
+    destructive rows of the transition table, and the merge counts the whole filter
+    as a conflict, so the candidate change — including otherwise applicable
+    companion and option changes — can remain unapplied once the accept save lands.
+    The client must re-issue the operation. Same residual class as the existing
+    `draining -> draining, differing` conflict.
+- **Drain retirement does not prove disposal before releasing the sid.** F-094
+  prevents adoption or destructive fork repair from erasing a resident drain's
+  past-PUBREC intent. Retirement requires no claimed or unconfirmed claim removal,
+  verifies the drain's sid ownership, and visits eligible already-empty drains as
+  well as drains emptied by successful reconciliation; barrier-skipped drains remain
+  excluded. Retirement retains the existing disposal semantics: it removes the drain
+  maps and releases its local consumer charge **before** unsubscribing and issuing an
+  **unconfirmed** consumer-delete request. Removing the hold therefore does not prove
+  the consumer was deleted or that an already-dispatched delivery callback was
+  excluded. Such a callback can pass the existing checks after map removal and reach
+  ordinary PUBLISH processing, potentially transmitting a past-PUBREC source under a
+  fresh identifier. Failed or delayed deletion can leave an unreferenced consumer.
+  **F-094 closes the adoption route, not this disposal route**, and supplies no new
+  bounded disposal or retry guarantee. SUBSCRIBE rollback can restore a previously
+  removed drain from its snapshot, and reconciliation's direct consumer-absent removal
+  lacks a local-charge refund; these lifecycle gaps are tracked with drain disposal.
+- **Delivery readiness on adoption is not addressed.** Adopting a drain that has no
+  delivery subscription installs a consumer entry with no delivery interest, after
+  which `processJSConsumer`'s existing-consumer arm returns early on every later
+  re-SUBSCRIBE and the filter silently stops delivering. F-094's intent hold covers
+  only the intent-bearing subset: CONNECT skips **every** QoS 2 drain when PUBREL
+  subscription setup fails, including drains holding only PUBLISH-phase claims, and a
+  failed delivery-subscription restoration leaves the same shape. Tracked separately.
 - **Scope.** A drain survives because the brokers that read the `Drains` record field
   exclude its durable from the orphan sweep's candidates and hand it to teardown as
   this session's own — and that is every broker serving the account, since they all run
@@ -1527,15 +1574,18 @@ Residuals:
   independently of its main sid, and refusing them one at a time adopted the usable one
   before failing, which the next successful save turned into a lost drain. The client can
   restore the filter only by removing the record.
-- **Adopting a drain erases an unfinished past-PUBREC intent (F-094).** A re-SUBSCRIBE
-  over a draining filter, and fork repair's equivalent row, remove the drain from both maps
-  and persist no `Started` obligations — so the stored PUBREL can complete on the ordinary
-  non-drain path while the unacknowledged source is free to redeliver as a fresh PUBLISH,
-  duplicating an exchange the client has already answered. The **unattributable** subset is
-  refused (see the marker-less bullet above); a VALID intent is not. Pre-existing, and
-  narrowed rather than introduced by the owner-slot substrate. Refusing it is
-  protocol-visible — the client would see `SUBACK 0x80` until the PUBREL completes — so it
-  is F-094's own design question.
+- **Adopting a drain no longer erases an unfinished past-PUBREC intent (F-094, FIXED).**
+  A re-SUBSCRIBE over a draining filter, and fork repair's destructive rows, used to remove
+  the drain from both maps and persist no `Started` obligations — so the stored PUBREL could
+  complete on the ordinary non-drain path while the unacknowledged source was free to
+  redeliver as a fresh PUBLISH, duplicating an exchange the client had already answered.
+  **Every** past-PUBREC intent now holds its sid, not just the unattributable subset, and
+  the refusal is protocol-visible: the client sees `SUBACK 0x80` for that filter. The hold
+  is released when the drain is RETIRED — deliberately not "when the PUBREL completes",
+  which would be wrong for a finalized intent held beside another outstanding claim. The
+  costs are stated in the drain-section residuals above, and what this does **not**
+  close — the disposal route to the same duplicate, and delivery readiness on
+  adoption — is tracked by its own roadmap bullets.
 - **A retained QoS 2 exchange's PUBREL surviving a restart is REFUSED, not transmitted.**
   A retained send has no register (R6), so its exchange identity lives only in the in-memory
   owner of its incarnation and that identity is gone after a restart. Admission

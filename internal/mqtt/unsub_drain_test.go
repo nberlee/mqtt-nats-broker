@@ -1856,7 +1856,10 @@ func TestQuarantinedCompanionDrainRefusesTheWholeFilterOverSubscribe(t *testing.
 			quarantined = st.ownerUnusable
 		}
 	}
-	usable := !sess.drainQuarantinedLocked(mainSid)
+	// The main sid keeps its plain PUBLISH-phase claim above, so it stays UNHELD even after
+	// F-094 widened the predicate to every past-PUBREC intent — which is the precondition
+	// for the partial adoption this test exists to prevent.
+	usable := sess.drainSidHoldLocked(mainSid) == mqttDrainNotHeld
 	sess.mu.Unlock()
 	if mainD == nil || compD == nil || mainDur == _EMPTY_ || compDur == _EMPTY_ {
 		t.Fatalf("restore must keep BOTH drains, got main=%v comp=%v", mainD, compD)

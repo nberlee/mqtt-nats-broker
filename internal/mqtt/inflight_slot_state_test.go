@@ -505,36 +505,51 @@ func TestMarkerLessDrainIntentQuarantineSurvivesSubscribeCycles(t *testing.T) {
 	// fork repair — mqttGrantFromRecord treats Drains[sid] and Cons[sid] as exclusive and
 	// drops the consumer — so a fresh durable's started deliveries would be keyed to a
 	// durable the merge omitted.
-	if !sess.drainQuarantinedLocked(sid) {
-		t.Fatal("the sid must report as quarantined, which is what every occupying path asks")
+	if got := sess.drainSidHoldLocked(sid); got != mqttDrainHeldUnusableIdentity {
+		t.Fatalf("the sid must report an unusable identity, which is what every occupying "+
+			"path asks and what names the operator action, got %v", got)
 	}
-	if sess.drainQuarantinedLocked("some-other-sid") {
-		t.Error("an unrelated sid must not report as quarantined")
+	if got := sess.drainSidHoldLocked("some-other-sid"); got != mqttDrainNotHeld {
+		t.Errorf("an unrelated sid must not be held, got %v", got)
 	}
 }
 
-// TestDrainQuarantineIsScopedToItsOwnSequences keeps the property honest in the negative
-// direction: a drain whose sequences are all usable must NOT be treated as quarantined,
-// or an ordinary re-SUBSCRIBE would be refused and the fix would be worse than the defect.
-func TestDrainQuarantineIsScopedToItsOwnSequences(t *testing.T) {
+// TestDrainHoldIsScopedToItsOwnSequences keeps the property honest in the negative
+// direction: a drain carrying NO past-PUBREC intent must not be held, or an ordinary
+// re-SUBSCRIBE would be refused and the fix would be worse than the defect.
+//
+// The fixture's premise CHANGED with F-094 and the change is the point. It used to build
+// this "ordinary" drain with a claimed valid intent — {PubRel: true, PI: 7, OwnerNonce} —
+// and assert that it adopts. That is exactly the adoption F-094 says must not happen: it
+// drops the drain and its whole seqs map, after which the unacknowledged source is re-offered
+// on the ordinary path as a fresh PUBLISH of an exchange the client has already answered.
+// So the intent case moved to TestAdoptionRefusedWhileADrainCarriesAPastPubRecIntent and
+// this test keeps only PUBLISH-phase claims, which is what "ordinary" actually means.
+func TestDrainHoldIsScopedToItsOwnSequences(t *testing.T) {
 	t.Parallel()
 	const sid, dur = "1", "$MQTT_plain_ok"
 	d := mqttDrainFromPersisted(&mqttPersistedDrain{
 		Cons: &ConsumerConfig{Durable: dur}, QoS: 2,
 		Started: []mqttPersistedDrainSeq{
-			{Seq: 41, PubRel: true, PI: 7, OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"},
-			{Seq: 42, PI: 8}, // started, not past PUBREC: no identity owed
+			{Seq: 41, PI: 7}, // started, not past PUBREC
+			{Seq: 42, PI: 8},
 		},
 	})
 	if d == nil {
 		t.Fatal("a supported drain must restore")
 	}
+	for _, seq := range []uint64{41, 42} {
+		if st := d.seqs[seq]; st == nil || st.intent {
+			t.Fatalf("seq %d must restore as a PUBLISH-phase claim, or this test proves "+
+				"nothing about the negative direction: %+v", seq, st)
+		}
+	}
 	sess := &mqttSession{
 		drains: map[string]*mqttDrain{sid: d}, drainByDur: map[string]*mqttDrain{dur: d},
 		cpending: map[string]map[uint64]uint16{dur: {41: 7}},
 	}
-	if sess.drainQuarantinedLocked(sid) {
-		t.Fatal("a drain with usable identities must not be quarantined")
+	if got := sess.drainSidHoldLocked(sid); got != mqttDrainNotHeld {
+		t.Fatalf("a drain owing no PUBREL must not be held, got %v", got)
 	}
 	if !sess.adoptDrainLocked(sid) {
 		t.Fatal("an ordinary re-SUBSCRIBE must still adopt its drain")
@@ -567,10 +582,15 @@ func TestQuarantineRefusesEverySidOfAWildcardFilter(t *testing.T) {
 		t.Fatalf("mqttUnsubSids(%q) = %v, want the main sid and its companion", mainSid, sids)
 	}
 
+	// A PUBLISH-phase claim, deliberately. Before F-094 this drain carried a valid claimed
+	// intent and the test asserted it was NOT quarantined; the widened hold makes every
+	// past-PUBREC intent hold its sid, so that fixture would now be held for its own reason
+	// and the companion would prove nothing. The subject here is wildcard ATOMICITY — a
+	// usable main sid must not be adopted when the companion is refused — so the main drain
+	// has to be genuinely unheld.
 	usable := mqttDrainFromPersisted(&mqttPersistedDrain{
 		Cons: &ConsumerConfig{Durable: "$MQTT_main_ok"}, QoS: 2,
-		Started: []mqttPersistedDrainSeq{{Seq: 41, PubRel: true, PI: 7,
-			OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"}},
+		Started: []mqttPersistedDrainSeq{{Seq: 41, PI: 7}},
 	})
 	quarantined := mqttDrainFromPersisted(&mqttPersistedDrain{
 		Cons: &ConsumerConfig{Durable: "$MQTT_companion_markerless"}, QoS: 2,
@@ -584,17 +604,17 @@ func TestQuarantineRefusesEverySidOfAWildcardFilter(t *testing.T) {
 	}
 
 	// The main sid alone looks fine — which is exactly how the partial adoption happened.
-	if sess.drainQuarantinedLocked(mainSid) {
-		t.Fatal("the main drain is usable and must not report quarantined on its own")
+	if got := sess.drainSidHoldLocked(mainSid); got != mqttDrainNotHeld {
+		t.Fatalf("the main drain owes no PUBREL and must not be held on its own, got %v", got)
 	}
-	if !sess.drainQuarantinedLocked(companion) {
-		t.Fatal("the companion drain must report quarantined")
+	if got := sess.drainSidHoldLocked(companion); got != mqttDrainHeldUnusableIdentity {
+		t.Fatalf("the companion drain must report an unusable identity, got %v", got)
 	}
 
 	// So the filter-level question is the one that has to be asked, and it must refuse.
 	any := false
 	for _, sid := range mqttUnsubSids(mainSid) {
-		if sess.drainQuarantinedLocked(sid) {
+		if sess.drainSidHoldLocked(sid) != mqttDrainNotHeld {
 			any = true
 		}
 	}

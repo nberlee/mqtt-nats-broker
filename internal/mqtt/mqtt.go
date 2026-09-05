@@ -8436,20 +8436,22 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// roll back. This is the same property three earlier rounds converged on, applied
 		// at the boundary that actually holds it.
 		if f.qos > 0 && !f.shared {
-			quarantined := _EMPTY_
+			held, hold := _EMPTY_, mqttDrainNotHeld
 			sess.mu.Lock()
 			for _, sid := range mqttUnsubSids(f.sessionKey()) {
-				if sess.drainQuarantinedLocked(sid) {
-					quarantined = sid
+				if h := sess.drainSidHoldLocked(sid); h != mqttDrainNotHeld {
+					held, hold = sid, h
 					break
 				}
 			}
 			sess.mu.Unlock()
-			if quarantined != _EMPTY_ {
-				c.Errorf("MQTT: refusing filter %q of client %q: its drained delivery on %q is past "+
-					"PUBREC with an unusable exchange identity, so nothing may act on it and nothing "+
-					"may take its place; remove that record to restore the filter",
-					f.filter, sess.id, quarantined)
+			if held != _EMPTY_ {
+				// The reason travels with the refusal. Both holds refuse identically, but
+				// they converge differently — one on an operator, one on the drained
+				// exchange completing — and a message that names the wrong one sends the
+				// operator looking for a record that is doing nothing wrong.
+				c.Errorf("MQTT: refusing filter %q of client %q: its drained delivery on %q %s",
+					f.filter, sess.id, held, hold.reason())
 				f.qos = mqttSubAckFailure
 				continue
 			}
@@ -20303,12 +20305,11 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 	// processSubs, before anything is adopted, because a wildcard owns two sids and a
 	// per-sid refusal here left the main drain adopted while the companion failed. This
 	// second line stays because provisioning is reached from more than one caller.
-	if qos > 0 && sess.drainQuarantinedLocked(sid) {
+	if hold := sess.drainSidHoldLocked(sid); qos > 0 && hold != mqttDrainNotHeld {
 		sess.mu.Unlock()
 		c.Errorf("MQTT: refusing to provision filter %q of client %q: a drained delivery on that "+
-			"filter is past PUBREC with an unusable exchange identity, so nothing may act on it "+
-			"and nothing may take its place; remove that record to restore the filter", sid, sess.id)
-		return nil, nil, nil, fmt.Errorf("mqtt: filter %q has a quarantined drained delivery", sid)
+			"filter %s", sid, sess.id, hold.reason())
+		return nil, nil, nil, fmt.Errorf("mqtt: filter %q has a held drained delivery", sid)
 	}
 	cc, exists := sess.cons[sid]
 	tmaxack := sess.tmaxack

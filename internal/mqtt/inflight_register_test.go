@@ -1459,8 +1459,9 @@ func TestMQTTInflightRetiredSourceSurvivesPubComp(t *testing.T) {
 //
 // Skipping is not enough: the delivery callback is still inside storeInflightRegister, and
 // once the session lock is released it would confirm its CAS and enqueue the PUBLISH —
-// after this UNSUBSCRIBE has purged the consumer and its tracking, leaving the client
-// holding an exchange nothing here remembers. Removing the entry hands the decision to the
+// after this UNSUBSCRIBE has given up this membership's tracking, leaving the client holding
+// an exchange nothing here remembers. (The consumer itself may SURVIVE as a drain keeping
+// its durable; what ends either way is this membership's claim on the delivery.) Removing the entry hands the decision to the
 // store's own ownership revalidation, which then refuses the send.
 //
 // Mutation check: `continue` without untracking (the original) and the entry survives, so
@@ -1518,8 +1519,9 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 //
 // Nothing was put on the wire, but the redelivery arrives with a JetStream delivery count
 // above one, and trackPublish derives dup from that count unless the sequence is known to
-// have been withheld ([MQTT-3.3.1-1]). A COMMITTED teardown drops the marker instead:
-// the consumer is gone by then and nothing will ever re-offer the sequence.
+// have been withheld ([MQTT-3.3.1-1]). A COMMITTED teardown drops the marker instead,
+// because the staging it protects is settled and no first transmission of that sequence
+// remains to protect.
 //
 // Mutation check: cancel without recording the marker and the DUP assertion fails; drop
 // the commitDrains cleanup and the committed case leaves the marker behind.
@@ -1563,7 +1565,12 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 		t.Fatalf("the first transmission of a never-sent message must carry DUP=0 [MQTT-3.3.1-1]")
 	}
 
-	// COMMITTED: the marker goes, since nothing will re-offer that sequence.
+	// COMMITTED: the marker goes, because the staging it protects is settled and no first
+	// transmission of that sequence remains to protect. Deliberately NOT "nothing will
+	// re-offer that sequence": a committed drain KEEPS its consumer, so an unacknowledged
+	// cancelled sequence can still be re-offered and is acknowledged by the delivery
+	// callback's unclaimed arm (see unsub_drain.go's commitDrains). This assertion is about
+	// marker removal and nothing more.
 	e.sess.mu.Lock()
 	e.sess.drains, e.sess.drainByDur, e.sess.deferred = nil, nil, nil
 	e.sess.pendingPublish, e.sess.cpending = nil, nil

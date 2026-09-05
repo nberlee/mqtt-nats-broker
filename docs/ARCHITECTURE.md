@@ -1905,10 +1905,10 @@ action rows over nine state pairs, no row unreachable:
 | absent | draining | rebuild with `mqttDrainFromPersisted` and file it in BOTH maps (`restoreDrainLocked`) |
 | live | absent | delete `cons[sid]` |
 | live | draining | delete `cons[sid]`, install our drain **with its own `Cons`**; the survivor's displaced live consumer goes to the orphan sweep |
-| draining | live | `adoptDrainLocked(sid)` — keeps the durable; the started obligations are re-established by the later durable scans, EXCEPT for an unfinished past-PUBREC intent, which adoption erases outright (F-094). A QUARANTINED sid refuses the whole filter's repair before this row is reached |
-| draining | draining, equal | nothing |
+| draining | live | `adoptDrainLocked(sid)` — keeps the durable; the started obligations are re-established by the later durable scans. A HELD sid refuses the whole filter's repair before this row is reached: unconditionally for an unusable identity, and for a past-PUBREC intent because adoption would erase it (F-094) |
+| draining | draining, equal | nothing — and it still APPLIES over a sid held by a past-PUBREC intent, because the row preserves the drain either way. Only the two destructive rows refuse |
 | draining | draining, differing | **refused**, a conflict. Losing nothing: the base was already draining, a committed drain adds no fresh claims and completion only removes them, so the survivor still names everything it says is owed |
-| draining | absent | drop both map entries, delete NO durable. Reachable through last-claim completion: our record's omission IS the acknowledged completion, and `finishDrainIfEmpty` already deleted the durable after proving its own save |
+| draining | absent | drop both map entries, delete NO durable. Reachable through last-claim completion on OUR branch, where `finishDrainIfEmpty` has already REQUESTED the durable's deletion — an unconfirmed request, so reaching this row is not proof the consumer is gone. **Refused for a HELD sid** — this row destroys the drain exactly as adoption does, and our omission is not evidence about the survivor's obligations: `mqttSurvivorDecidedGrant` compares drain PRESENCE only, this file's lineage recognition does not establish that the survivor descended from our baseline, and our own omission can come from `recoverDrains` pruning a source it proved absent rather than from any completion (F-094) |
 | absent | absent | nothing |
 | live | live | **nothing — the survivor's config is preserved**, stated explicitly rather than by omission; installing ours would repoint delivery at a durable the survivor may have replaced |
 
@@ -4549,27 +4549,80 @@ identity died with the process.
 
 A drain's past-PUBREC intent carries the same identity on the session record, as its
 `OwnerNonce`, and it is validated before the intent is saved. An intent restored WITHOUT
-one names no exchange, so nothing may act on it and nothing may take its place: the drain
-is **quarantined**, which means its sid keeps it and no subscription cycle can adopt it,
-stage over it or drop it. The broker cannot write that shape, so the quarantine exists for
-records from elsewhere.
+one names no exchange, so nothing may act on it and nothing may take its place.
 
-**A quarantine refuses the whole filter, not the sid, at BOTH callers.** The preflight is
+**A drain HOLDS its sid while it carries a past-PUBREC intent at all**, and the two reasons
+differ only in how they end. `drainSidHoldLocked` is the one question every path that would
+occupy a sid asks:
+
+| hold | when | released by |
+|---|---|---|
+| unusable identity | a restored intent with no identifier or no owner nonce — a shape this broker cannot write, so it exists for records from elsewhere | an operator removing the record; no resume repairs it |
+| past-PUBREC intent | any `st.intent`, unqualified | the drain's own **retirement** |
+
+The intent hold is F-094, and it is unqualified deliberately. Adoption removes the drain
+from both maps and drops its whole per-sequence state, after which the delivery callback —
+which finds a drain through `drainByDur` — no longer suppresses the still-unacknowledged
+source, and AckWait re-offers it as a **fresh PUBLISH of an exchange the client has already
+answered**, on a different identifier because PUBREC removed the original `cpending` link.
+Two narrower predicates were tried and refuted, and `drainSidHoldLocked`'s comment records
+both counterexamples: qualifying the intent with `claimed || unclaimUnconfirmed` misses a
+finalized intent whose source acknowledgement was lost, because `finalizeDrainDelivery`
+clears that guard before the fire-and-forget ack; hoisting the same test to drain level
+misses it again at the last outstanding sequence.
+
+**The hold's release is retirement, so retirement has to be reachable.** A drain is retired
+when it is DURABLY empty — no sequence `claimed` and none `unclaimUnconfirmed`, which is
+strictly stronger than the old `claimedCount() == 0` and stops a teardown running on a
+removal whose outcome is unknown — and ownership is proven through `sess.drains[sid]`
+rather than through `drainByDur`. That last point is what makes the hold releasable at all:
+`restoreDrains` deletes the `drainByDur` entry when a delivery subscription fails to
+restore and keeps the sid mapping, so a `drainByDur`-keyed guard could never retire such a
+drain and its filter would be refused for the life of the session. Reconciliation sweeps
+for retirable drains **twice** — once before its early return, catching one that was
+already empty on entry and therefore yields no pruning plan, and once after its save,
+catching one its own pruning just emptied. Both keep the barrier `skip` exclusion.
+
+**What the hold does NOT establish.** Retirement releases the sid without proving its
+consumer was disposed of: `finishDrainIfEmpty` drops the maps and refunds the charge before
+it unsubscribes and issues a `noWait` consumer delete that cannot report failure, and
+`processUnsub` does not exclude a delivery callback already dispatched. So the same
+duplicate PUBLISH is reachable through disposal with no adoption involved. F-094 closes the
+**adoption** route only; the disposal route is stated in `docs/CONFORMANCE.md` and carried
+by its own roadmap bullet.
+
+**A hold refuses the whole filter, not the sid, at BOTH callers.** The preflight is
 in `processSubs` and in fork repair's `applyGrantChangeLocked`; the second came a round
 later for the reason the first exists: repair mutated the membership and option maps before
 processing its sids and discarded `adoptDrainLocked`'s refusal, so a wildcard with a usable
 main drain and a quarantined companion reported the filter applied — main adopted, companion
 refused — and the accept save then persisted a live filter whose drain obligations it no
-longer carried. Refusing the whole change converges, because repair is a convergence step
-and the next resume tries again, where a half-applied filter loses obligations permanently.
+longer carried. Refusing the whole change is still the right disposition, because a
+half-applied filter loses obligations PERMANENTLY while a refused one loses only the
+candidate change. It is **not** a convergence: `mergeForkedGrantLocked` records the filter
+as a conflict and completes, so once the accept save lands the capsule no longer authorizes
+that merge and no resume retries it — the client must re-issue the operation. That cost is
+stated in `docs/CONFORMANCE.md`.
 
  A wildcard such as `foo/#` owns a
 main sid and a level-up companion, each with its own consumer and its own drain, and a
 per-sid refusal adopted the usable one before failing on the other — leaving an adopted
 drain that the per-filter failure cleanup does not put back and that the next successful
 save then dropped, obligations and durable identity together. So every sid the filter
-covers is checked before any of them is touched, and a SUBSCRIBE naming a quarantined
-drain is answered with a failure code for that filter.
+covers is checked before any of them is touched, and a SUBSCRIBE naming a held drain is
+answered with a failure code for that filter.
+
+At fork repair the two holds refuse **different rows**, and the split is the difference
+between "nothing may take its place" and "nothing may destroy it". An unusable identity
+refuses every row, unchanged. A past-PUBREC intent refuses only the rows that destroy the
+drain — `live`, where adoption erases it, and `absent`, where the drop does — while the two
+`draining -> draining` rows preserve the survivor's drain either way and are therefore let
+THROUGH the preflight — after which each keeps its existing disposition: the equal row
+succeeds, and the differing row remains the conflict it already was.
+Refusing every row instead would abandon repairs for a drain nothing was going to touch.
+The refusal is **not retried**: `mergeForkedGrantLocked` counts it as a conflict and the
+merge completes, so once the accept save lands the capsule's anchor no longer authorizes
+another merge. That cost is stated in `docs/CONFORMANCE.md` rather than claimed away.
 
 The register's `state` is mandatory and is **never defaulted**: reading an absent state
 as `publish` would license a PUBLISH under an identifier already past PUBREC. Legality

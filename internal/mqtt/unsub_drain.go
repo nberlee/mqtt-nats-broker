@@ -250,8 +250,8 @@ type mqttDrain struct {
 	// cancelled names the sequences whose in-flight registration this staging cancelled,
 	// each with the withheld marker installed for it. A ROLLBACK keeps those markers, so a
 	// later first transmission still carries DUP=0; a COMMIT drops them, because the
-	// consumer is gone by then and nothing will ever re-offer the sequence. Staging state
-	// only, never persisted.
+	// staging they were protecting is settled and no first transmission of theirs remains
+	// to protect. Staging state only, never persisted.
 	cancelled map[mqttDeferredKey]string
 
 	// seqs is the ONE map of per-sequence state. There is deliberately no second
@@ -436,10 +436,10 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	// source looked like an ordinary delivery and could be retransmitted despite durable
 	// evidence it was past PUBREC.
 	//
-	// So the older, quarantined drain wins the slot and this consumer takes the ordinary
+	// So the older, held drain wins the slot and this consumer takes the ordinary
 	// immediate teardown instead. That is the same disposition draining-not-allowed already
 	// uses, and it keeps one owner per sid.
-	if sess.drainQuarantinedLocked(sid) {
+	if sess.drainSidHoldLocked(sid) != mqttDrainNotHeld {
 		return false
 	}
 
@@ -473,8 +473,10 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// CANCELLED, not merely skipped. Skipping leaves the entry in place, and the
 			// delivery callback still waiting in storeInflightRegister would then confirm
 			// its CAS and enqueue the PUBLISH — after this UNSUBSCRIBE has committed and
-			// purged the consumer and its tracking, leaving the client holding an exchange
-			// nothing on this side remembers. Removing the entry hands the decision to
+			// given up this membership's tracking, leaving the client holding an exchange
+			// nothing on this side remembers. (The consumer itself may SURVIVE, as a drain
+			// keeping its durable; what ends either way is this membership's claim on the
+			// delivery.) Removing the entry hands the decision to
 			// that callback's own ownership revalidation: confirmInflightRegister finds no
 			// entry, deletes the register it just wrote and refuses the send.
 			//
@@ -486,12 +488,13 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// state, and the marker, that a delivery withheld at the in-flight cap has.
 			cancelled[mqttDeferredKey{cc.Durable, sseq}] = ack.jsAckSubject
 			// The cancellation is recorded DURABLY too, keyed by the allocation's nonce.
-			// The handoff above is in-memory only, and this packet is about to persist its
-			// removal and delete the consumer while that store may still be on the wire: if
-			// the CAS lands and this broker dies before the confirmation runs, nothing
-			// written anywhere says the delivery was never transmitted. Being inside this
-			// packet's own record transaction is what makes it durable before the consumer
-			// goes. See cancelRegPendingLocked.
+			// The handoff above is in-memory only, and this packet is about to persist the
+			// removal of this membership — tearing the consumer down, or converting it to a
+			// drain — while that store may still be on the wire: if the CAS lands and this
+			// broker dies before the confirmation runs, nothing written anywhere says the
+			// delivery was never transmitted. Being inside this packet's own record
+			// transaction is what makes it durable before that removal lands.
+			// See cancelRegPendingLocked.
 			sess.cancelRegPendingLocked(ack)
 			sess.untrackPublishEntry(pi)
 			continue
@@ -515,8 +518,8 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	// rather than recorded in place. They are withheld in exactly the I5 sense — never
 	// transmitted — and the marker is what makes their eventual first transmission carry
 	// DUP=0 if this staging is rolled back. A COMMITTED teardown drops them again, in
-	// commitDrains for a staged drain and in purgeConsumerPendingLocked otherwise, since
-	// the consumer is gone by then and nothing will ever re-offer the sequence.
+	// commitDrains for a staged drain and in purgeConsumerPendingLocked otherwise, because
+	// the staging is settled and the marker has no first transmission left to protect.
 	//
 	// BEFORE the "nothing staged" return below, not after: when every entry was cancelled
 	// there is no drain to stage, but the DUP rule is unchanged.
@@ -561,9 +564,14 @@ func (sess *mqttSession) commitDrains() []*mqttDrain {
 			continue
 		}
 		d.staged = false
-		// The teardown is committed, so the cancelled sequences' consumer is gone and
-		// nothing will ever re-offer them: their withheld markers have no first transmission
-		// left to protect and would otherwise linger. Only a rollback keeps them.
+		// The teardown is committed, so the staging these markers protect is settled and
+		// they have no first transmission left to protect; they would otherwise linger. Only
+		// a rollback keeps them.
+		//
+		// Deliberately NOT "the consumer is gone and nothing will re-offer them": this drain
+		// KEEPS its consumer, which is the whole point of draining, and an unacknowledged
+		// withheld sequence can still be re-offered — the delivery callback's unclaimed arm
+		// acknowledges it there. What ends is the marker's purpose, not the re-offer.
 		for k := range d.cancelled {
 			delete(sess.deferred, k)
 		}
@@ -986,11 +994,27 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 // No lock held on entry.
 func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
 	sess.mu.Lock()
-	if d.claimedCount() > 0 {
+	// DURABLY empty. claimedCount() alone was the test, and it is not enough: it counts
+	// st.claimed only, so a sequence whose removal is still unconfirmed read as gone and
+	// retirement tore the durable down on a write whose outcome was unknown.
+	if !d.retirable() {
 		sess.mu.Unlock()
 		return
 	}
-	if sess.drainByDur[d.cc.Durable] != d {
+	// Ownership is proven through the SID, not through drainByDur, and that is F-094's
+	// repair rather than a simplification. restoreDrains deletes the drainByDur entry when a
+	// delivery subscription fails to restore while sess.drains[sid] survives, so a
+	// drainByDur-keyed guard could never retire such a drain — and with the hold widened to
+	// every past-PUBREC intent, a drain nothing can retire is a sid refused for the life of
+	// the session.
+	//
+	// It is REPLACED, not removed: the guard exists to stop a stale call acting on a
+	// replacement, and scanning by durable and then requiring pointer equality still rejects
+	// both a replacement under a different durable and a different object under the same
+	// one. The lookup, the equality check and the removal all happen under this single
+	// acquisition, which is what makes that true.
+	sid, ok := sess.drainSidForDurable(d.cc.Durable)
+	if !ok || sess.drains[sid] != d {
 		sess.mu.Unlock()
 		return // already torn down, or replaced by an adoption
 	}
@@ -1296,6 +1320,18 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 			plans = append(plans, p)
 		}
 	}
+	// The ALREADY-EMPTY sweep, and it runs before the early return below because that is
+	// the drain it exists for. A drain that owed nothing on entry produces no plan at all,
+	// so the post-save sweep at the end of this function never sees it — and since F-094
+	// widened the hold to every past-PUBREC intent, such a drain refuses its filter until
+	// something retires it. The reachable shape is a restore whose delivery subscription
+	// failed: restoreDrains drops the drainByDur entry and keeps sess.drains[sid].
+	//
+	// This does NOT replace the post-save sweep. Moving that one here instead of adding
+	// this one loses a trigger: a drain emptied by THIS pass's own pruning is still claimed
+	// at this point, so only a sweep after the save can retire it.
+	sess.retireEmptyDrains(c, drains)
+
 	if len(plans) == 0 {
 		return
 	}
@@ -1397,10 +1433,30 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		}
 	}
 	// Pruning to empty tears the drain down through the normal path.
+	sess.retireEmptyDrains(c, drains)
+}
+
+// retireEmptyDrains hands every drain that owes nothing to the ordinary retirement path.
+//
+// Called TWICE from recoverDrains, and both calls are load-bearing. Before the early return
+// it catches a drain that was already empty on entry, which produces no pruning plan and
+// would otherwise never be visited; after the save it catches one this pass's own pruning
+// emptied, which was still claimed when the first call ran. A review round found that
+// collapsing the two into one relocated sweep silently drops the second case.
+//
+// The candidate set is the CALLER's, which is what keeps the skip-set exclusion: recoverDrains
+// builds it having already dropped every barrier-unresolved durable, whose PUBREL state is
+// unknown and about which nothing may be pruned or retired.
+//
+// No lock held on entry.
+func (sess *mqttSession) retireEmptyDrains(c *client, drains []*mqttDrain) {
 	sess.mu.Lock()
 	empty := make([]*mqttDrain, 0, len(drains))
 	for _, d := range drains {
-		if sess.drainByDur[d.cc.Durable] == d && d.claimedCount() == 0 {
+		// Ownership by SID, matching finishDrainIfEmpty's own guard: a drainByDur test here
+		// would skip exactly the drain whose delivery subscription failed to restore.
+		sid, ok := sess.drainSidForDurable(d.cc.Durable)
+		if ok && sess.drains[sid] == d && d.retirable() {
 			empty = append(empty, d)
 		}
 	}
@@ -2122,8 +2178,46 @@ func (sess *mqttSession) recreateDrainPubRel(c *client, idHash, pubRelSubject st
 // Returns true when a drain was adopted.
 //
 // sess.mu must be held.
-// drainQuarantinedLocked reports whether a drain under sid holds a sequence nothing may act
-// on: a past-PUBREC intent whose exchange identity is unusable.
+// mqttDrainHold is WHY a drain owns its sid exclusively. Any value other than
+// mqttDrainNotHeld means held; the reason exists to tell the two apart in a log line,
+// never to let a caller act on one and not the other.
+type mqttDrainHold uint8
+
+const (
+	mqttDrainNotHeld mqttDrainHold = iota
+	// mqttDrainHeldUnusableIdentity: a past-PUBREC intent carrying no usable exchange
+	// identity. Nothing may act on it and nothing may take its place, so it is released
+	// only when an operator removes the record.
+	mqttDrainHeldUnusableIdentity
+	// mqttDrainHeldPastPubRecIntent: the drain carries a past-PUBREC intent. Released
+	// when the drain is RETIRED — see drainRetirableLocked and the two sweeps.
+	mqttDrainHeldPastPubRecIntent
+)
+
+// reason renders the hold for the two refusal messages. It is load-bearing rather than
+// decoration: before F-094 both sites said "an unusable exchange identity ... remove that
+// record to restore the filter" for EVERY refusal, which for an ordinary past-PUBREC intent
+// is false twice over — the identity is usable, and the release is the drain's own
+// retirement rather than an operator.
+func (h mqttDrainHold) reason() string {
+	switch h {
+	case mqttDrainHeldUnusableIdentity:
+		return "is past PUBREC with an unusable exchange identity, so nothing may act on it " +
+			"and nothing may take its place; remove that record to restore the filter"
+	case mqttDrainHeldPastPubRecIntent:
+		// Deliberately does NOT promise release "once that exchange completes". The hold is
+		// unqualified, so it also covers an intent whose own exchange is already finalized
+		// while another sequence on the same drain is still outstanding — and there the
+		// named exchange owes nothing and completing it releases nothing. What actually
+		// frees the sid is the DRAIN being retired, so that is what the operator is told.
+		return "carries past-PUBREC evidence that adoption would erase, letting the source " +
+			"be sent again; the filter stays held until that drain is retired"
+	}
+	return _EMPTY_
+}
+
+// drainSidHoldLocked reports whether a drain under sid holds evidence no subscription cycle
+// may take, and why.
 //
 // This is the PROPERTY three review rounds converged on, and stating it once is the point.
 // Each round found the same bypass one subscription cycle further out — adoption erased the
@@ -2132,18 +2226,68 @@ func (sess *mqttSession) recreateDrainPubRel(c *client, idHash, pubRelSubject st
 // did not OWN its sid exclusively. So it does now, and every path that would occupy or
 // provision under that sid asks this one question rather than re-deriving the condition.
 //
+// F-094 WIDENED it from the unusable-identity case to EVERY past-PUBREC intent, and the
+// predicate is deliberately unqualified — no claim flag joins it. Two narrower shapes were
+// tried and both were refuted, so neither may come back:
+//
+//   - `intent && (claimed || unclaimUnconfirmed)`, per sequence. finalizeDrainDelivery
+//     clears unclaimUnconfirmed in its saveLanded arm BEFORE sending the source
+//     acknowledgement, and that send is fire-and-forget. So a finalized intent whose source
+//     ack was lost was adoptable, and the live path cannot rebuild the suppression: PUBREC
+//     already removed the source's cpending link, so the re-offer allocates a DIFFERENT
+//     identifier and sends the payload of an exchange the client has answered.
+//   - The same test hoisted to drain level — an intent anywhere plus any outstanding
+//     sequence. It fails at the LAST outstanding sequence: the claim removal lands, the
+//     guard clears, endRecordTx releases before the ack and the teardown, and a
+//     re-SUBSCRIBE in that gap sees nothing outstanding. Those flags describe claim-removal
+//     DURABILITY, not whether the retained consumer can still re-offer.
+//
+// What the hold establishes is exactly one thing: while an intent-bearing drain exists, no
+// adoption and no destructive fork-repair row can erase that intent. It is deliberately NOT
+// the claim that nothing can re-offer the source — retirement does not prove its consumer
+// was disposed of (see finishDrainIfEmpty), and F-094 does not repair that. The disposal
+// route to the same duplicate PUBLISH is stated in docs/CONFORMANCE.md and filed.
+//
 // Session lock held on entry.
-func (sess *mqttSession) drainQuarantinedLocked(sid string) bool {
+func (sess *mqttSession) drainSidHoldLocked(sid string) mqttDrainHold {
 	d := sess.drains[sid]
 	if d == nil {
-		return false
+		return mqttDrainNotHeld
 	}
+	hold := mqttDrainNotHeld
 	for _, st := range d.seqs {
-		if st != nil && st.ownerUnusable {
-			return true
+		if st == nil {
+			continue
+		}
+		if st.ownerUnusable {
+			// The stronger condition, and the one naming an operator action, so it wins
+			// outright rather than depending on map traversal order.
+			return mqttDrainHeldUnusableIdentity
+		}
+		if st.intent {
+			hold = mqttDrainHeldPastPubRecIntent
 		}
 	}
-	return false
+	return hold
+}
+
+// drainRetirableLocked reports whether a drain owes nothing further, so retiring it takes
+// nothing with it.
+//
+// DURABLY empty, not merely unclaimed, and the difference is the whole reason this is not
+// claimedCount() == 0. claimedCount counts st.claimed alone, so a sequence mid-saveMaybeLanded
+// — claimed already false, unclaimUnconfirmed still true — reads as gone while the RECORD may
+// still carry its claim. Retiring there would tear down the durable on a removal whose
+// outcome is unknown, which is I1 read backwards.
+//
+// sess.mu must be held.
+func (d *mqttDrain) retirable() bool {
+	for _, st := range d.seqs {
+		if st != nil && (st.claimed || st.unclaimUnconfirmed) {
+			return false
+		}
+	}
+	return true
 }
 
 func (sess *mqttSession) adoptDrainLocked(sid string) bool {
@@ -2151,19 +2295,19 @@ func (sess *mqttSession) adoptDrainLocked(sid string) bool {
 	if d == nil {
 		return false
 	}
-	// A QUARANTINED sequence REFUSES adoption, and a review found why that matters: this is
+	// A HELD sequence REFUSES adoption, and a review found why that matters: this is
 	// reached by any ordinary QoS>0 re-SUBSCRIBE (and again by fork repair), and it removes
 	// the drain from both maps and turns its consumer back into a plain membership. That
-	// erased the marker-less-intent quarantine by routine client behaviour — a successful
-	// save then omits the persisted intent entirely, so a stored PUBREL could take the
-	// ordinary non-drain path or a later restart could redeliver a payload the record
-	// already proved was past PUBREC.
+	// erased the intent by routine client behaviour — a successful save then omits it
+	// entirely, so a stored PUBREL could take the ordinary non-drain path while the
+	// unacknowledged source, no longer suppressed by any drain, is re-offered at AckWait and
+	// sent as a FRESH PUBLISH of an exchange the client has already answered (F-094).
 	//
 	// Refusing keeps the drain, its consumer and its persisted intent exactly where they
 	// are. The caller reads false as "no drain to adopt" and provisions afresh, which is
 	// what it already does for a filter that never had one — so the refusal costs a
-	// consumer, not correctness, and it converges when an operator removes the record.
-	if sess.drainQuarantinedLocked(sid) {
+	// consumer, not correctness.
+	if sess.drainSidHoldLocked(sid) != mqttDrainNotHeld {
 		return false
 	}
 	delete(sess.drains, sid)

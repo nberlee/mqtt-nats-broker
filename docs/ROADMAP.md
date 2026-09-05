@@ -3085,34 +3085,114 @@ takeover.
   Route C's affine subcase is experimental under the 2026-09-02 scope decision and is not
   part of this item's supported acceptance; routes A and B remain unchanged.
 
-- [ ] **F-094: adopting a drain erases an unfinished past-PUBREC intent.** Filed
-  2026-09-04 by F-092 slice 1's holistic round 19, which found it while reviewing that
-  slice's quarantine. **Pre-existing, and this slice NARROWED it rather than introducing
-  it:** `adoptDrainLocked` has always removed the drain from both maps and turned its
-  consumer back into a plain membership, for any intent; slice 1 added the `ownerUnusable`
-  guard, so an intent nothing can attribute is now refused. A VALID past-PUBREC intent
-  bypasses that guard and follows the unchanged path. *Probed rather than reasoned:*
-  adopting such a drain succeeds, it leaves both drain maps, and the next save persists no
-  `Started` obligations at all. The stored PUBREL can then complete on the ordinary
-  non-drain path while the unacknowledged source is free to redeliver as a fresh PUBLISH —
-  a duplicate of an exchange the client has already answered. Fork repair reaches the same
-  adoption, and its filter-wide quarantine preflight does not fire for a valid intent
-  either.
+- [x] **F-094: adopting a drain erases an unfinished past-PUBREC intent.** Filed
+  2026-09-04 by F-092 slice 1's holistic round 19; DONE 2026-09-05 after 5 plan-review
+  rounds (findings 8/8/8/3/0) and two escalation consults. Lane `~/.claude/lanes/f-094/`.
 
-  *Why it is not fixed in slice 1, ruled by consult 10:* refusing adoption of a valid
-  unfinished intent is **protocol-visible** — an ordinary client re-subscribing during a
-  drain would get `SUBACK 0x80` until the PUBREL completes — so it needs its own design
-  matrix rather than a round patch, and it sits on a path F-092's admission half rewrites.
-  The `docs/ARCHITECTURE.md` fork-repair table's claim that a `draining -> live` adoption's
-  started obligations "are re-established by the later durable scans" is too broad for this
-  case and is qualified there.
+  **What was wrong.** `adoptDrainLocked` refused only an `ownerUnusable` sequence, so a
+  VALID past-PUBREC intent was adopted: the drain left both maps and its whole `seqs` map
+  was dropped. The delivery callback finds a drain through `drainByDur`, so the
+  still-unacknowledged source then bypassed every drain branch and was re-offered at
+  AckWait as a **fresh PUBLISH of an exchange the client had already answered**, on a
+  different packet identifier because PUBREC had removed the original `cpending` link.
+  The window is PUBREC-after-staging until the stored PUBREL is delivered back — *not*
+  until PUBCOMP, which two plan revisions got wrong.
 
-  *The likely shape of the fix, recorded so the next attempt does not re-derive it:* the
-  predicate is not "is this intent attributable" but "is this intent DURABLY FINALIZED",
-  which makes every still-claimed past-PUBREC intent non-adoptable until recovery settles
-  it — including one whose recovery failed transiently and whose durable is therefore in
-  the resume skip set. That predicate belongs to both the SUBSCRIBE and the fork-repair
-  preflight, which already share `drainQuarantinedLocked`.
+  **What replaced it.** `drainQuarantinedLocked` became `drainSidHoldLocked`, returning a
+  reason: an unusable identity (unchanged, operator-only) or a past-PUBREC intent. The
+  intent predicate is **unqualified** — `st.intent` alone. Two narrower shapes were tried
+  and refuted and the code comment records both counterexamples, so neither may be
+  re-proposed: qualifying with `claimed || unclaimUnconfirmed` misses a finalized intent
+  whose source ack was lost, because `finalizeDrainDelivery` clears that guard before the
+  fire-and-forget ack; the same test at drain level misses it again at the last
+  outstanding sequence. Both refusal messages now name the true convergence — they
+  previously told the operator to remove a record that, for an ordinary intent, is doing
+  nothing wrong.
+
+  **The release had to be built.** An unqualified hold lasts as long as the drain object,
+  so retirement was repaired: retirable now means DURABLY empty (no `claimed`, no
+  `unclaimUnconfirmed`), ownership is proven through `sess.drains[sid]` rather than
+  `drainByDur` — without which a drain whose delivery subscription failed to restore could
+  never be retired and its filter was refused for the life of the session — and
+  reconciliation sweeps twice, before its early return for an already-empty drain and
+  after its save for one its own pruning emptied. Collapsing those two into one relocated
+  sweep loses the second case.
+
+  **At fork repair the two holds refuse different rows.** An unusable identity refuses
+  every row, unchanged. A past-PUBREC intent refuses only the destructive ones, `live` and
+  `absent`; the `draining -> draining` rows preserve the drain either way, so the hold lets
+  them THROUGH the preflight and each keeps its existing outcome — the equal row succeeds,
+  the differing row stays the conflict it already was. The
+  `absent` row is not exempt: `mqttSurvivorDecidedGrant` compares drain PRESENCE only, the
+  lineage recognition does not establish descent from our baseline, and our own omission
+  can come from pruning a source proved absent rather than from completion.
+
+  **Residuals in `docs/CONFORMANCE.md`**, and the boundary is deliberate: F-094 closes the
+  ADOPTION route to that duplicate PUBLISH and nothing more. Two bullets below carry what
+  it does not.
+
+- [ ] **Drain retirement does not prove disposal before releasing the sid.** Filed
+  2026-09-05 by F-094's plan-review rounds 2 and 3, and scoped out of F-094 by its
+  escalation consult. **Pre-existing at HEAD and not caused by F-094**, which neither
+  introduces nor worsens it. The same duplicate PUBLISH F-094 prevents through adoption is
+  reachable through disposal with **no adoption involved**: `finishDrainIfEmpty` drops both
+  drain maps and refunds the local consumer charge BEFORE it unsubscribes and issues the
+  consumer delete; `deleteConsumer` with `noWait` takes the `sendMsg` arm and returns
+  `nil, nil` unconditionally, so the existing error check is vacuous and nothing proves the
+  consumer was deleted; and `processUnsub` removes the subscription without setting
+  `sub.mqtt.closed` or waiting for a callback already executing. A delivery callback
+  dispatched before retirement can therefore pause, let retirement complete, continue past
+  its closed/ownership check, find no drain and reach ordinary PUBLISH processing —
+  transmitting a past-PUBREC source under a fresh identifier.
+
+  **The required property:** exclude old-path transmission after suppression is removed;
+  prevent an outstanding deletion from destroying a consumer returned to service; and
+  preserve coherent sid ownership and accounting.
+
+  **Whole-lifecycle scope**, because a partial fix here is what generated three rounds of
+  findings: provisioning and fork repair; already-dispatched callbacks; delete success,
+  definite failure, timeout and late completion; competing retirement attempts;
+  `snapshotSubs` / `rollbackSubscribePacket`, which shallow-copy and wholesale-restore both
+  drain maps so a SUBSCRIBE rollback can resurrect a removed drain; reconciliation's direct
+  consumer-absent removal, which never refunds the local charge; session clearing and
+  restart.
+
+  **Preserved failed-design analysis — these are design CONSTRAINTS, not descriptions of
+  HEAD, which contains no `retiring` flag.** Reordering a fire-and-forget request proves
+  nothing. Refusing adoption alone does not block provisioning, because the caller
+  provisions when `cons[sid]` is absent. Unsubscribing does not exclude a dispatched
+  callback. Clearing a `retiring` flag after a timeout lets a late delete destroy a consumer
+  that has been returned to service. A post-delete ownership check does not prevent
+  resurrection through a snapshot taken earlier. Refunding only in `finishDrainIfEmpty`
+  misses the other removal exits.
+
+  **Acceptance evidence:** deterministic schedules for each case above, a positive delivery
+  control in every negative-delivery assertion, exactly-once charge disposition on every
+  drain-removal exit, and the restart analysis — an empty drain is omitted from the record,
+  so a crash inside disposal restores no drain at all and the surviving consumer becomes
+  orphan-cleanup work, which a resident-object sweep does not cover. Cross-references the
+  delivery-readiness bullet below and F-036's queued-effect ownership work.
+
+- [ ] **An adopted drain with no delivery subscription silently stops delivering.** Filed
+  2026-09-05 by F-094's plan-review round 2, and scoped out of F-094 by its first consult.
+  **Pre-existing at HEAD.** Adopting a drain that has no delivery subscription installs
+  `cons[sid]` with no delivery interest, after which `processJSConsumer`'s
+  existing-consumer arm returns "we are done" on every later re-SUBSCRIBE and the filter
+  never delivers again for that connection.
+
+  **Two routes reach it, and only one is intent-bearing.** CONNECT skips **every** QoS 2
+  drain via `qos2DrainDurables` when PUBREL subscription setup fails — including drains
+  holding only PUBLISH-phase claims, which F-094's intent hold does not cover — and
+  `restoreDrains` withholds source interest for any barrier-skipped durable. F-094 closes
+  the intent-bearing subset as a side effect of holding those sids; the family is broader.
+
+  **Why it is not another check in the shared adoption helper:** the required property is
+  that a successfully adopted consumer has a usable delivery subscription, which intent
+  ownership cannot establish, and fork repair adopts during CONNECT **before** subscription
+  restoration — so "no subscription means refuse" would change normal repair behavior.
+  Closing it means deciding where delivery readiness is established, how a failure rolls
+  back, and how wildcard atomicity is maintained.
+
 - [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
   non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).
   NOT an alpha blocker: the residue is one nonce in `CancelledRegs` per occurrence, with

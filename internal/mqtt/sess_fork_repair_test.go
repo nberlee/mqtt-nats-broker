@@ -2025,9 +2025,12 @@ func TestForkRepairRefusesToMergeOverAnUnreadableSurvivor(t *testing.T) {
 // but no longer the adopted drain's Started obligations. Exactly the partial adoption the
 // processSubs preflight exists to prevent, reached through the other door.
 //
-// The whole change is refused, which converges: repair is a convergence step, so an
-// unrepaired fork is retried at the next resume, where a half-applied filter loses
-// obligations permanently.
+// The whole change is refused, which is the right disposition because a half-applied filter
+// loses obligations PERMANENTLY while a refused one loses only the candidate change. It is
+// NOT a convergence, and saying so was wrong: mergeForkedGrantLocked records the filter as a
+// conflict and completes, so after the accept save the capsule no longer authorizes that
+// merge and no resume retries it. See
+// TestForkRepairRefusedFilterIsCountedAsAConflictAndTheMergeCompletes.
 func TestForkRepairRefusesAFilterWithAQuarantinedSid(t *testing.T) {
 	t.Parallel()
 	const filter = "q.>"
@@ -2036,9 +2039,12 @@ func TestForkRepairRefusesAFilterWithAQuarantinedSid(t *testing.T) {
 	// Built by hand rather than through the fork fixture, because the state under test is
 	// one the fixture's own reconnect cannot leave behind: our record has to describe the
 	// filter as LIVE (the adopt row) while the session still HOLDS both drains in memory.
+	// A PUBLISH-phase claim, deliberately: F-094's widened hold makes every past-PUBREC
+	// intent hold its sid, so the valid claimed intent this fixture used to carry would now
+	// be held for its OWN reason and the companion would prove nothing. The subject is
+	// wildcard atomicity, so the main drain must be genuinely unheld.
 	usable := mqttDrainFromPersisted(testPersistedDrain("q-main-dur",
-		mqttPersistedDrainSeq{Seq: 21, PubRel: true, PI: 4,
-			OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"}))
+		mqttPersistedDrainSeq{Seq: 21, PI: 4}))
 	quarantined := mqttDrainFromPersisted(testPersistedDrain("q-comp-dur",
 		// Past PUBREC with NO identifier: quarantined on restore.
 		mqttPersistedDrainSeq{Seq: 22, PubRel: true, PI: 0,
@@ -2055,8 +2061,8 @@ func TestForkRepairRefusesAFilterWithAQuarantinedSid(t *testing.T) {
 	// The premise both ways: the main sid is usable and adoptable, the companion is not.
 	// Without this a refusal proves nothing about which sid caused it.
 	sess.mu.Lock()
-	mainUsable := !sess.drainQuarantinedLocked(filter)
-	compQuarantined := sess.drainQuarantinedLocked(companion)
+	mainUsable := sess.drainSidHoldLocked(filter) == mqttDrainNotHeld
+	compQuarantined := sess.drainSidHoldLocked(companion) == mqttDrainHeldUnusableIdentity
 	sess.mu.Unlock()
 	if !mainUsable {
 		t.Fatal("the main drain must be USABLE, or a refusal proves nothing about the companion")

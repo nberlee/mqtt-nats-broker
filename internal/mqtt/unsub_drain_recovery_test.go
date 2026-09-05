@@ -2189,10 +2189,16 @@ func TestDrainIntentPastPubRecWithNoIdentifierIsQuarantined(t *testing.T) {
 			// asks, which is what keeps the drain from being adopted or staged over.
 			sess := &mqttSession{drains: map[string]*mqttDrain{sid: d}}
 			sess.mu.Lock()
-			quarantined := sess.drainQuarantinedLocked(sid)
+			hold := sess.drainSidHoldLocked(sid)
 			sess.mu.Unlock()
-			if !quarantined {
-				t.Error("the sid must report quarantined, or a re-SUBSCRIBE can take the drain away")
+			// The REASON matters, not just that it is held: F-094 widened the predicate so
+			// every past-PUBREC intent holds its sid, and an unattributable one must still
+			// report the stronger condition — it is the one that needs an operator, and the
+			// refusal message says so.
+			if hold != mqttDrainHeldUnusableIdentity {
+				t.Errorf("the sid must report an unusable identity, got %v: otherwise a "+
+					"re-SUBSCRIBE can take the drain away, or the operator is told the wrong "+
+					"thing about why it cannot", hold)
 			}
 		})
 	}

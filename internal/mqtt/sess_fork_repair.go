@@ -951,7 +951,7 @@ func (sess *mqttSession) mergeForkedGrantLocked(g *mqttForkedGrant, survivor *mq
 func (sess *mqttSession) applyGrantChangeLocked(ch mqttGrantChange, survivor *mqttGrantEntry) bool {
 	sids := mqttSidsOf(survivor, ch.ours)
 
-	// A QUARANTINED drain refuses the WHOLE FILTER, checked BEFORE any membership, option,
+	// A HELD drain refuses the WHOLE FILTER, checked BEFORE any membership, option,
 	// consumer or drain is touched — the same property processSubs applies, at the second
 	// caller of it.
 	//
@@ -965,12 +965,33 @@ func (sess *mqttSession) applyGrantChangeLocked(ch mqttGrantChange, survivor *mq
 	// the partial adoption the processSubs preflight exists to prevent, reached through the
 	// other door.
 	//
-	// Refusing the whole change is the conservative direction: repair is a convergence
-	// step, so leaving the fork unrepaired means the next resume tries again, while a
-	// half-applied filter loses obligations permanently.
+	// THE TWO HOLDS REFUSE DIFFERENT ROWS, and F-094's review rounds cost two revisions to
+	// get this right. An unusable identity refuses EVERY row, unchanged: nothing may act on
+	// it and nothing may take its place, so even a drop is refused. A past-PUBREC intent
+	// refuses only the rows that DESTROY the drain, which against the transition table below
+	// is exactly `live` (adoption erases it) and `absent` (the drop erases it); the two
+	// draining->draining rows preserve the survivor's drain either way and are left alone.
+	//
+	// The `absent` row is NOT exempt, and an earlier revision's reasoning that it is — "our
+	// record's omission IS the acknowledged completion" — is refuted by this file's own
+	// terms. mqttSurvivorDecidedGrant compares drain PRESENCE via shape(), never the
+	// sequences or their intents; the header above disclaims that the survivor descended
+	// from our baseline at all; and our omission can equally come from recoverDrains pruning
+	// a source it proved absent rather than from any completion. So the omission proves
+	// nothing about the survivor's obligations, and dropping its maps destroys evidence.
+	//
+	// Refusing the whole change is the conservative direction, and its cost is stated in
+	// docs/CONFORMANCE.md rather than claimed away: the merge counts this filter as a
+	// conflict and completes, so the refusal is NOT retried once the accept save lands.
 	for sid := range sids {
-		if sess.drainQuarantinedLocked(sid) {
+		switch sess.drainSidHoldLocked(sid) {
+		case mqttDrainHeldUnusableIdentity:
 			return false
+		case mqttDrainHeldPastPubRecIntent:
+			switch ch.ours.sidState(sid).kind() {
+			case mqttSidLive, mqttSidAbsent:
+				return false
+			}
 		}
 	}
 
@@ -1060,10 +1081,15 @@ func (sess *mqttSession) applyGrantSidLocked(sid string, survivor, ours mqttSidS
 			// atomically. A mutation confirmed the check here was unreachable.
 			sess.adoptDrainLocked(sid)
 		case mqttSidAbsent:
-			// Our record's omission IS the acknowledged completion of the last claim, so
-			// applying it is right. The durable is already gone on our branch —
-			// finishDrainIfEmpty deletes it after proving its own save — and this drops
-			// only the two map entries, never a durable.
+			// Our record's omission is the acknowledged completion of the last claim on OUR
+			// branch, and this drops only the two map entries, never a durable.
+			//
+			// It is NOT evidence about the SURVIVOR's obligations, which is why a HELD sid
+			// refuses this row in the preflight above: mqttSurvivorDecidedGrant compares
+			// drain PRESENCE only, and our own omission can come from recoverDrains pruning
+			// a source it proved absent rather than from any completion. Nor does reaching
+			// here establish that our branch's durable was disposed of — finishDrainIfEmpty
+			// releases its maps before an UNCONFIRMED delete, which is a stated residual.
 			if d := sess.drains[sid]; d != nil {
 				sess.dropDrainLocked(d)
 			}
