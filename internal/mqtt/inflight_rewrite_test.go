@@ -116,16 +116,23 @@ func TestMQTTInflightContestRetargetPreservesConcurrentRetirement(t *testing.T) 
 	}
 
 	// Routed on what the contest RETURNED, not on the bucket the walk sorted it into: a
-	// newly retired record installs a suppression and reserves NO identifier.
+	// newly retired PUBLISH shape reinstates source suppression and reserves its known
+	// identifier on the non-actionable PUBREL side. It must not become deliverable, free
+	// its identifier, or pretend an exact PUBREL advanced the durable slot phase.
 	sessB.mu.Lock()
-	entry := sessB.pendingPublish[pi]
+	entry := sessB.pendingPubRel[pi]
+	_, deliverable := sessB.pendingPublish[pi]
 	rs := sessB.srcAckOwed[mqttDeferredKey{dur, sseq}]
+	incomplete := sessB.piSpaceIncomplete
 	sessB.mu.Unlock()
-	if entry != nil {
-		t.Fatalf("a newly retired register must not be installed as a deliverable entry: %+v", entry)
+	if entry == nil || entry.jsAckSubject != _EMPTY_ || entry.slot.state != mqttInflightPublish ||
+		deliverable || incomplete {
+		t.Fatalf("a newly retired PUBLISH slot was not reserved safely: entry=%+v deliverable=%v incomplete=%v",
+			entry, deliverable, incomplete)
 	}
 	if rs == nil || rs.nonce != rec.Nonce {
-		t.Fatalf("the retirement's suppression must be installed for this exchange: %+v", rs)
+		t.Fatalf("a newly retired source must reinstate suppression for THIS exchange (nonce %q) "+
+			"while it can be re-offered, got %+v", rec.Nonce, rs)
 	}
 }
 
@@ -229,6 +236,7 @@ func TestMQTTInflightRetiredDominatesCancelledAtRecovery(t *testing.T) {
 	}
 	sessB.mu.Lock()
 	entry := sessB.pendingPublish[pi]
+	rel := sessB.pendingPubRel[pi]
 	rs := sessB.srcAckOwed[mqttDeferredKey{dur, sseq}]
 	sessB.mu.Unlock()
 	if entry != nil {
@@ -236,6 +244,9 @@ func TestMQTTInflightRetiredDominatesCancelledAtRecovery(t *testing.T) {
 	}
 	if rs == nil {
 		t.Fatal("a Retired-and-Cancelled register must reinstate its suppression rather than free the identifier")
+	}
+	if rel == nil || rel.jsAckSubject != _EMPTY_ {
+		t.Fatalf("a Retired-and-Cancelled register must keep a non-actionable identifier reservation: %+v", rel)
 	}
 }
 
@@ -881,9 +892,10 @@ func TestMQTTInflightTerminalAckParksWhileASendIsInFlight(t *testing.T) {
 	if after != nil || stillReserved {
 		t.Fatalf("endSend must complete the parked continuation: entry=%+v reserved=%v", after, stillReserved)
 	}
-	if rec, _ := e.loadRegister(t, pi); rec != nil {
-		t.Fatal("the acknowledgement's deferred register delete must run at endSend")
-	}
+	// The ordinary completion delete is intentionally fire-and-forget. The added
+	// identity/phase read before it makes an immediate load race the asynchronous JS
+	// delete deterministically; wait for the durable consequence the test actually names.
+	e.waitRegisterCount(t, 0)
 }
 
 // The real acknowledgement path parks, not just the primitive: a PUBACK arriving while
@@ -1272,17 +1284,30 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.dropRetainedSendLocked":             {},
 		// The bounded-memory sweep.
 		"mqttSession.sweepDeadSendHoldsLocked": {},
-		// NOTHING for the PUBREL action claim, and that absence is the record of what this
-		// list got wrong.
+		// The PUBREL action claim's two verbs — and note what is NOT here.
 		//
-		// It used to exempt mergeSendActionLocked, clearSendActionLocked and
+		// This list once exempted mergeSendActionLocked, clearSendActionLocked and
 		// publishSendIdentLocked, described as the verbs that install and clear the action
 		// subterm and the reader of its PUBLISH token. NONE OF THE THREE EXISTED: they were
-		// written from the plan rather than from the tree. Each was a standing exemption to
-		// touch sendsInFlight, waiting for whoever next used the name. The self-check below
-		// found the third after the first two were deleted by hand, which is the argument
-		// for having it: a hand-audited exemption list contained three phantoms. The local
-		// action half has since been deleted outright, so there is nothing here to exempt.
+		// written from the plan rather than from the tree, and each was a standing exemption
+		// waiting for whoever next used the name. Part 3 of the property below found the
+		// third after the first two were deleted by hand — a hand-audited exemption list
+		// containing three phantoms is the argument for having the check.
+		//
+		// So these two are here because the tree has them, and they are named after what
+		// they actually do rather than after what a plan said they would:
+		"mqttSession.installTentativeActionLocked": {},
+		"mqttSession.retireActionLocked_":          {},
+		// The admission context check reads the EXACT live PUBLISH send token — the
+		// interlock that stops an action being acquired over a PUBLISH still on the wire.
+		// It reads the hold's own pubIdent rather than asking whether the identifier is
+		// reserved, which is a different question and is sendReservedLocked's.
+		"mqttSession.pubRelAdmissionContextOK": {},
+		// actionHeldLocked is deliberately ABSENT. It is the fourth liveness term and it
+		// reads a HOLD it was handed, never the registry — the same reason
+		// pubCompHeldLocked and retainedHeldLocked are absent. A term that took the map
+		// itself would be answering "is this identifier reserved" in a second place, which
+		// is exactly what sendReservedLocked exists to prevent.
 	}
 	// The property is BIDIRECTIONAL, in three parts, and only the first was ever checked:
 	//
@@ -1735,7 +1760,7 @@ func TestMQTTInflightReconciliationRefusesEvidenceForAnotherIdentifier(t *testin
 			},
 		}},
 		{"a PUBREL record owning another identifier", mqttContestDisposition{
-			class: mqttContestPubRelOwned,
+			class: mqttContestPubRelEvidenced,
 			rel:   mqttStoredPubRel{pi: otherPI, srcDur: dur, srcSeq: 31},
 		}},
 	} {
@@ -1775,46 +1800,49 @@ func TestMQTTInflightReconciliationRefusesEvidenceForAnotherIdentifier(t *testin
 	}
 }
 
-// A retirement for THIS identifier frees it — and freeing is staged, never applied by
-// the walk, because a resume refused after recovery preserves the session's maps.
-func TestMQTTInflightRetiredQuarantineReleaseIsStaged(t *testing.T) {
+// A retirement for THIS identifier proves past PUBREC, not PUBCOMP. Reconciliation must
+// replace the quarantine with a non-actionable whole-life slot reservation.
+func TestMQTTInflightRetiredQuarantineBecomesPubRelReservation(t *testing.T) {
 	t.Parallel()
-	e := testNewInflightEnv(t, "client-retired-stage")
-	dur := e.sess.idHash + "_plain"
+	idHash, gen := getHash("client-retired-stage"), mqttNewSessGen()
+	dur := idHash + "_plain"
 	key := mqttDeferredKey{dur, 41}
-	e.sess.mu.Lock()
-	e.sess.inflightWalks = 3
-	if e.sess.pendingPublish == nil {
-		e.sess.pendingPublish = make(map[uint16]*mqttPending)
+	sess := &mqttSession{
+		id: "client-retired-stage", idHash: idHash, gen: gen, inflightWalks: 3,
+		pendingPublish: map[uint16]*mqttPending{
+			6: {jsDur: dur, sseq: 41, regSeq: 8, regForeign: true},
+		},
+		cpending: map[string]map[uint64]uint16{
+			dur: {41: 6},
+		},
+		foreignContested: map[mqttDeferredKey]*mqttForeignContest{
+			key: {pi: 6, subject: mqttInflightSubject(idHash, gen, 6), regSeq: 8, walk: 2, reserved: true},
+		},
 	}
-	e.sess.pendingPublish[6] = &mqttPending{jsDur: dur, sseq: 41, regSeq: 8, regForeign: true}
-	e.sess.foreignContested = map[mqttDeferredKey]*mqttForeignContest{
-		key: {pi: 6, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, 6), regSeq: 8, walk: 2, reserved: true},
-	}
-	staged := e.sess.reconcileForeignContestsLocked(e.c,
+	sess.mu.Lock()
+	staged := sess.reconcileForeignContestsLocked(nil,
 		map[mqttDeferredKey]mqttContestDisposition{key: {
 			class: mqttContestRetired,
 			reg: mqttRecoveredInflightReg{
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 6, Dur: dur, Seq: 41, Retired: true}, seq: 8,
+				rec: &mqttInflightRecord{
+					State: mqttInflightPubRelReady, PI: 6, Dur: dur, Seq: 41, QoS: 2,
+					Nonce: mqttNewInflightNonce(), Claim: mqttNewInflightNonce(), Retired: true,
+					PubRelDurable: "PUBREL_RETIRED", PubRelStreamSeq: 19,
+				}, seq: 8,
 			},
 		}},
 		map[uint16]bool{6: true}, 3, func(mqttStoredPubRel) {})
-	stillHeld := e.sess.pendingPublish[6]
-	e.sess.mu.Unlock()
+	stillPublish := sess.pendingPublish[6]
+	stillRel := sess.pendingPubRel[6]
+	contested := sess.sourceForeignContestedLocked(dur, 41)
+	sess.mu.Unlock()
 
-	if len(staged) != 1 || staged[0].pi != 6 {
-		t.Fatalf("a retirement for this identifier must STAGE its release, got %+v", staged)
+	if len(staged) != 0 {
+		t.Fatalf("a past-PUBREC retirement must not stage identifier release, got %+v", staged)
 	}
-	if stillHeld == nil || !stillHeld.regForeign {
-		t.Fatal("the walk must not free the identifier itself: a resume refused after recovery keeps these maps")
-	}
-	e.sess.commitStagedReleases(e.c, staged)
-	e.sess.mu.Lock()
-	after := e.sess.pendingPublish[6]
-	contested := e.sess.sourceForeignContestedLocked(dur, 41)
-	e.sess.mu.Unlock()
-	if after != nil || contested {
-		t.Fatalf("the committed release must free the identifier and the contest: entry=%+v contested=%v", after, contested)
+	if stillPublish != nil || stillRel == nil || stillRel.regNonce == _EMPTY_ || contested {
+		t.Fatalf("retirement reconciliation did not install the PUBREL reservation: publish=%+v rel=%+v contested=%v",
+			stillPublish, stillRel, contested)
 	}
 }
 
@@ -2390,7 +2418,7 @@ func TestMQTTInflightClearSweepsOnlyDeadHolds(t *testing.T) {
 // go through it.
 func testDeliverPubRel(t *testing.T, e *testInflightEnv, pi uint16, reply, claim, copySubj string) {
 	t.Helper()
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", _EMPTY_, 0, _EMPTY_, claim, copySubj)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", "SRC", 41, _EMPTY_, claim, copySubj)
 	e.c.pa.hdr = hdrLen
 	defer func() { e.c.pa.hdr = 0 }()
 	mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, reply, msg)
@@ -2406,6 +2434,166 @@ func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
 	e.sess.c = e.c
 	e.sess.pubRelConsumer = &ConsumerConfig{Durable: "PUBREL_F089"}
 	e.sess.mu.Unlock()
+
+	// Terminal cleanup now requires the source side to be provably complete for every
+	// past-PUBREC slot, not only for records whose Retired bit happened to land before a
+	// crash. Give the ordinary callback fixtures that proof: SRC exists, but the seeded
+	// source sequence does not. A test that needs an unfinished source stores one matching
+	// message and rewrites its slot to the returned sequence.
+	if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+		Stream: mqttStreamName,
+		Config: ConsumerConfig{
+			DeliverSubject: "f092.source.delivery",
+			Durable:        "SRC",
+			AckPolicy:      AckExplicit,
+			DeliverPolicy:  DeliverNew,
+			FilterSubject:  mqttStreamSubjectPrefix + "f092.source",
+		},
+	}); err != nil {
+		t.Fatalf("creating the source consumer: %v", err)
+	}
+
+	// AND THE DURABLE PRECONDITION ADMISSION NOW REQUIRES. A stored slot-backed PUBREL is
+	// admitted because the slot that owns its identifier hands out a non-revocable action —
+	// whether the slot is already past PUBREC (`pubrel_ready`) or still in `publish` (the
+	// direct `publish -> pubrel_sending` arrow from a proven record) — not because the
+	// callback was reached. (A live retained exchange has no slot, R6, and is admitted by
+	// its in-memory owner instead.) So a fixture that drives the callback for a slot-backed
+	// exchange must establish that slot, or it exercises the refusal path and nothing else
+	// (feedback_fixture_must_reach_its_route).
+	//
+	// One `pubrel_ready` slot per identifier, keyed by subject, carrying the same exchange
+	// nonce testDeliverPubRel puts in the record's owner header. The store is a map so the
+	// action CAS can actually land: an immutable stub would make every acquisition fail and
+	// the fixture would pass for the wrong reason.
+	// The store assigns MONOTONIC sequences and the delete addresses BY SEQUENCE, exactly
+	// as JetStream does. A fixture that returned a constant sequence and swallowed deletes
+	// would make every freshness fence trivially satisfied and every terminal deletion a
+	// silent no-op — so the slot would appear to leak and the test would blame the broker.
+	e.asm.mu.Lock()
+	slots := map[string]*mqttInflightRecord{}
+	bySeq := map[uint64]string{}
+	seqOf := map[string]uint64{}
+	var next uint64
+	e.asm.testInflightLoad = func(subject string) (*mqttInflightRecord, *StoredMsg, error) {
+		e.asm.mu.RLock()
+		defer e.asm.mu.RUnlock()
+		rec := slots[subject]
+		if rec == nil {
+			return nil, nil, nil
+		}
+		cp := *rec
+		return &cp, &StoredMsg{Subject: subject, Sequence: seqOf[subject]}, nil
+	}
+	e.asm.testInflightStore = func(subject string, expect uint64, r *mqttInflightRecord) (uint64, error) {
+		e.asm.mu.Lock()
+		defer e.asm.mu.Unlock()
+		// A per-subject CAS, so a stale base loses rather than overwriting — which is what
+		// makes the arm-before-CAS and redispatch paths testable at all.
+		if cur, ok := seqOf[subject]; ok && expect != 0 && expect != cur {
+			return 0, fmt.Errorf("test: in-flight CAS rejected for %q", subject)
+		}
+		next++
+		cp := *r
+		slots[subject] = &cp
+		delete(bySeq, seqOf[subject])
+		seqOf[subject] = next
+		bySeq[next] = subject
+		return next, nil
+	}
+	e.asm.testInflightDelete = func(seq uint64) error {
+		e.asm.mu.Lock()
+		defer e.asm.mu.Unlock()
+		if subject, ok := bySeq[seq]; ok {
+			delete(slots, subject)
+			delete(seqOf, subject)
+			delete(bySeq, seq)
+		}
+		return nil
+	}
+	e.asm.mu.Unlock()
+	e.pubRelSlots = slots
+}
+
+// testDeliverPubRelAs delivers a stored PUBREL naming an EXPLICIT exchange nonce, which is
+// what lets a test distinguish "this record belongs to the identifier's exchange" from
+// "this record is stale" — the whole discriminator F-092 rests on.
+func testDeliverPubRelAs(t *testing.T, e *testInflightEnv, pi uint16, reply, nonce string) {
+	t.Helper()
+	testDeliverPubRelCorrelated(t, e, pi, reply, nonce, "SRC", 41)
+}
+
+// testDeliverPubRelCorrelated delivers a stored PUBREL with an EXPLICIT source correlation.
+//
+// The correlation matters more than it looks: a record with an empty one takes a different
+// route through admission, and F-092's holistic review round 1 found that every acceptance
+// fixture used the empty form — so none of them ever reached the ORDINARY correlated path,
+// which was at that moment bypassing the slot entirely. A fixture that never reaches the
+// route it names proves nothing about it (feedback_fixture_must_reach_its_route).
+func testDeliverPubRelCorrelated(t *testing.T, e *testInflightEnv, pi uint16, reply, nonce,
+	srcDur string, srcSeq uint64) {
+	t.Helper()
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, nonce, srcDur, srcSeq, _EMPTY_, _EMPTY_, _EMPTY_)
+	e.c.pa.hdr = hdrLen
+	defer func() { e.c.pa.hdr = 0 }()
+	mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, reply, msg)
+}
+
+// testCountPubRelWrites counts the PUBREL transmissions fn causes.
+//
+// Counted at the write block hook, which sits INSIDE the send section, so it observes an
+// actual transmission rather than a decision to transmit. That distinction is what makes
+// the F-092 assertions meaningful: a refusal must produce no bytes, and "no bytes" is only
+// observable here.
+func testCountPubRelWrites(t *testing.T, e *testInflightEnv, fn func()) int {
+	t.Helper()
+	n := 0
+	restore := setMQTTTestPubRelWriteBlock(func() { n++ })
+	defer restore()
+	fn()
+	return n
+}
+
+// testCanonicalPubRelSeq is the $MQTT_out sequence the seeded slot names as CANONICAL.
+//
+// Fixtures must deliver at this sequence, because admission treats a valid same-nonce
+// record at any OTHER sequence as a duplicate — correctly: the slot names exactly one
+// canonical record, and a duplicate is discharged and acknowledged rather than transmitted.
+// A fixture that delivered at an arbitrary sequence therefore exercised duplicate disposal
+// while claiming to test transmission.
+const testCanonicalPubRelSeq = uint64(7)
+
+// testSeedPubRelReadySlot installs the `pubrel_ready` slot for one identifier, so the
+// delivery callback's admission can acquire an action on it.
+func testSeedPubRelReadySlot(t *testing.T, e *testInflightEnv, pi uint16) {
+	t.Helper()
+	e.sess.mu.Lock()
+	idHash, gen := e.sess.idHash, e.sess.gen
+	// The session's OWN claim, not a literal: admission proves custody by comparing the
+	// slot's Claim against this object's stable regClaim, so a fixture seeding anything
+	// else exercises the refusal path and nothing else.
+	claim := e.sess.regClaim
+	e.sess.mu.Unlock()
+	// NO asm.mu here: the store hook takes it itself, and holding it across the call
+	// deadlocks the fixture.
+	if e.pubRelSlots == nil {
+		t.Fatal("testReadyForPubRelDelivery must run first: there is no slot store to seed")
+	}
+	subject := mqttInflightSubject(idHash, gen, pi)
+	rec := &mqttInflightRecord{
+		PI: pi, Dur: "SRC", Seq: 41, QoS: 2,
+		Nonce: "xxxxxxxxxxxxxxxxxxxxxx",
+		State: mqttInflightPubRelReady,
+		// Custody is mandatory past PUBREC, and the canonical record identity with it.
+		Claim: claim, ClaimSeq: 1,
+		PubRelDurable: "PUBREL_F089", PubRelStreamSeq: testCanonicalPubRelSeq,
+	}
+	// Seeded THROUGH the store hook, so the slot gets a real sequence in the same space
+	// deletes address. Writing straight into the map would leave it unaddressable and the
+	// terminal deletion would silently no-op.
+	if _, err := e.asm.testInflightStore(subject, 0, rec); err != nil {
+		t.Fatalf("seeding the slot for packet identifier %d: %v", pi, err)
+	}
 }
 
 // EXECUTION 1, through the production route, with the duplicate's write GENUINELY
@@ -2422,10 +2610,11 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 	e := testNewInflightEnv(t, "client-pubcomp-blocked")
 	testReadyForPubRelDelivery(t, e)
 	const pi = uint16(5)
+	testSeedPubRelReadySlot(t, e, pi)
 	dur := "PUBREL_F089"
 
 	// Copy 1 goes out and its write returns; the client has not answered it yet.
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 11, 1), _EMPTY_, _EMPTY_)
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 1), _EMPTY_, _EMPTY_)
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
 		t.Fatalf("the delivery callback must reserve the identifier: owed=%d", owed)
 	}
@@ -2447,7 +2636,7 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 	defer func() { unblock(); <-done }()
 	go func() {
 		defer close(done)
-		testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 11, 2), _EMPTY_, _EMPTY_)
+		testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 2), _EMPTY_, _EMPTY_)
 	}()
 	select {
 	case <-blocked:
@@ -2470,7 +2659,7 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 	_, stillTracked := e.sess.pendingPubRel[pi]
 	e.sess.mu.Unlock()
 	if stillTracked {
-		t.Fatal("the PUBCOMP must complete the exchange; a PUBREL has no register, so nothing is parked")
+		t.Fatal("the PUBCOMP must complete the delivered entry; the owner slot/action now carries any remaining drain")
 	}
 	// (b) the identifier is NOT available while the duplicate's bytes are out.
 	if testMintsPI(t, e.sess, pi) {
@@ -2506,10 +2695,11 @@ func TestMQTTInflightStrayPubCompCannotTakeAReMintedIdentifier(t *testing.T) {
 	e := testNewInflightEnv(t, "client-stray-pubcomp")
 	testReadyForPubRelDelivery(t, e)
 	const pi = uint16(2)
+	testSeedPubRelReadySlot(t, e, pi)
 	dur := "PUBREL_F089"
 
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 21, 1), _EMPTY_, _EMPTY_)
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 21, 2), _EMPTY_, _EMPTY_)
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 1), _EMPTY_, _EMPTY_)
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 2), _EMPTY_, _EMPTY_)
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 2 {
 		t.Fatalf("two transmitted copies owe two PUBCOMPs, got %d", owed)
 	}
@@ -2537,13 +2727,14 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	e := testNewInflightEnv(t, "client-withheld-pubcomp")
 	testReadyForPubRelDelivery(t, e)
 	const pi = uint16(8)
+	testSeedPubRelReadySlot(t, e, pi)
 	dur := "PUBREL_F089"
 
 	// A carrier whose copy subject is not a shape this broker's generators produce is
 	// REFUSED, so the PUBCOMP path may not acknowledge the record and withholds. Both
 	// headers are present, because the builder omits the pair entirely when either is
 	// empty — an absent reference owes nothing and would never reach the withhold.
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 31, 1), "$MQTT_q2affclaim.x", "not-a-copy-subject")
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 1), "$MQTT_q2affclaim.x", "not-a-copy-subject")
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
 		t.Fatalf("the delivery must reserve the identifier: owed=%d", owed)
 	}
@@ -2560,7 +2751,7 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	}
 
 	// AckWait re-offers the record; the redelivery re-incurs exactly one debt.
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, 31, 2), "$MQTT_q2affclaim.x", "not-a-copy-subject")
+	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 2), "$MQTT_q2affclaim.x", "not-a-copy-subject")
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
 		t.Fatalf("the redelivery must leave exactly one PUBCOMP owed, got %d", owed)
 	}

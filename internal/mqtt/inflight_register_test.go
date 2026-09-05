@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -257,6 +258,9 @@ type testInflightEnv struct {
 	asm  *mqttAccountSessionManager
 	sess *mqttSession
 	c    *client
+	// pubRelSlots is the fixture's durable slot store, installed by
+	// testReadyForPubRelDelivery so admission has something to acquire an action on.
+	pubRelSlots map[string]*mqttInflightRecord
 }
 
 func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
@@ -875,9 +879,9 @@ func (e *testInflightEnv) subscribePubRel(t *testing.T) {
 	}
 }
 
-// Where a register and a PUBREL record name the same source, the PUBREL owns the
-// identifier (R2) — but what happens to the register depends on the SOURCE, and both
-// branches matter.
+// Where a PUBLISH slot and an exact PUBREL record name one exchange, recovery completes
+// the durable handoff before source classification. What happens to its SOURCE still
+// depends on whether that source may be re-offered.
 //
 // Source still LIVE means the handoff's source acknowledgement was never proven, so the
 // source will be re-offered. The register must be RETIRED and kept: deleting it destroys
@@ -894,7 +898,7 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -920,15 +924,15 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 	// Kept AND marked, so the fact outlives the PUBREL the client is about to answer.
 	e.waitRegisterCount(t, 1)
 	rec, _ := e.loadRegister(t, pi)
-	if rec == nil || !rec.Retired {
-		t.Fatalf("the retained register must be marked retired, got %+v", rec)
+	if rec == nil || !rec.Retired || rec.State != mqttInflightPubRelReady || rec.PubRelStreamSeq == 0 {
+		t.Fatalf("the owner slot must be ready and marked retired, got %+v", rec)
 	}
 }
 
-// Source provably COMPLETE means the handoff finished and only the register's delete was
-// lost. Nothing can redeliver it, so the register is dropped rather than retired — which
-// is what keeps a lost delete from leaving state behind forever.
-func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T) {
+// A provably complete SOURCE does not mean the QoS 2 exchange is complete: a present
+// PUBREL means the client still owes PUBCOMP. Route B therefore preserves and re-phases
+// the owner slot, while correctly declining to install source-retirement bookkeeping.
+func TestMQTTInflightRecoveryPubRelKeepsOwnerWhenSourceComplete(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-precedence-done")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -936,7 +940,7 @@ func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T)
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -959,7 +963,11 @@ func TestMQTTInflightRecoveryPubRelDropsRegisterWhenSourceComplete(t *testing.T)
 	if retired {
 		t.Fatalf("a completed source must not be retired: nothing will ever re-offer it")
 	}
-	e.waitRegisterCount(t, 0)
+	e.waitRegisterCount(t, 1)
+	rec, _ := e.loadRegister(t, pi)
+	if rec == nil || rec.State != mqttInflightPubRelReady || rec.PubRelStreamSeq == 0 {
+		t.Fatalf("the source-complete exchange lost its continuing owner slot: %+v", rec)
+	}
 }
 
 // Two registers for one source delivery — a superseded broker wrote one — FAIL CLOSED.
@@ -2740,16 +2748,15 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	}
 }
 
-// A RETIRED register is never tombstoned and never voided: its cleanup is delete-or-leave.
+// A RETIRED register is never queued into consumer teardown at all.
 //
-// The register is not a claim on an identifier — it is the durable suppression of a
-// completed-but-unproven QoS 2 exchange. A Cancelled rewrite (or a nonce verdict) would have
-// recovery drop it without reinstating that suppression, and if the teardown crashed before
-// its consumer delete the source is still re-offerable: the completed payload would go out
-// again. Left alone, recovery re-reads it as a retirement and the suppression survives.
+// Retired proves the source crossed PUBREC, not that the slot reached an explicit
+// past-PUBREC phase or that PUBCOMP arrived. Deleting the source consumer makes the source
+// suppression unnecessary, but it does not license consumer teardown's raw deletion
+// ladder. The source-side bookkeeping goes; the slot remains for recovery to reconcile.
 //
-// Mutation check: run the tombstone rung for a retired register (or void its nonce at
-// staging) and the restart loses the retirement.
+// Mutation check: return the retired slot in the teardown batch and the assertion below
+// catches the pre-PUBCOMP delete becoming reachable again.
 func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-retired-ladder"
@@ -2778,7 +2785,7 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 		e.sess.mu.Unlock()
 	}
 
-	// The teardown stages and purges; the register delete fails.
+	// The teardown stages and purges. The retired slot is not one of its deletion targets.
 	e.sess.mu.Lock()
 	_, transmitted := e.sess.voidRegistrationsLocked(dur)
 	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
@@ -2789,16 +2796,13 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 	}
 	found := false
 	for _, v := range regs {
-		if v.seq == regSeq && v.retired {
+		if v.seq == regSeq {
 			found = true
 		}
 	}
-	if !found {
-		t.Fatalf("the purge must report the retired register as retired, got %+v", regs)
+	if found {
+		t.Fatalf("consumer teardown queued the past-PUBREC owner slot for deletion: %+v", regs)
 	}
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
-	e.asm.mu.Unlock()
 	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
 	// The session record exists, so the restart below resumes THIS incarnation rather than
 	// minting a new generation whose register walk would find nothing.
@@ -2806,16 +2810,17 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 		t.Fatalf("persist the session record: %v", err)
 	}
 
-	// The register survives UNCHANGED: still a retirement, not a tombstone.
+	// The register survives UNCHANGED: still a retirement, not a tombstone or a
+	// pre-PUBCOMP deletion.
 	rec, _ := e.loadRegister(t, pi)
 	if rec == nil || !rec.Retired || rec.Cancelled {
-		t.Fatalf("a retired register must survive a failed delete unchanged, got %+v", rec)
+		t.Fatalf("a retired register must survive consumer teardown unchanged, got %+v", rec)
 	}
 
-	// And a restart reinstates the suppression rather than dropping it.
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = nil
-	e.asm.mu.Unlock()
+	// With no exact PUBREL in this fixture, restart cannot manufacture pubrel_ready. It
+	// still knows which identifier the retired source used, so it reserves that identifier
+	// as a non-actionable PUBREL-side entry without declaring the whole identifier space
+	// opaque. It must never turn the survivor back into a deliverable PUBLISH entry.
 	restored, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
@@ -2824,10 +2829,13 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	restored.mu.Lock()
-	rs := restored.srcAckOwed[mqttDeferredKey{dur, sseq}]
+	reserved := restored.pendingPubRel[pi]
+	_, deliverable := restored.pendingPublish[pi]
+	incomplete := restored.piSpaceIncomplete
 	restored.mu.Unlock()
-	if rs == nil {
-		t.Fatalf("the restart must reinstate the retirement, or the completed payload is resent")
+	if reserved == nil || deliverable || incomplete {
+		t.Fatalf("restart did not reserve the retired publish-shaped slot safely: reserved=%+v deliverable=%v incomplete=%v",
+			reserved, deliverable, incomplete)
 	}
 }
 
@@ -3115,9 +3123,9 @@ func TestMQTTInflightClaimConsumesEarlierClose(t *testing.T) {
 	}
 }
 
-// When the stale close's exact delete fails, its nonce-keyed tombstone reconcile
-// must stop at B's foreign claim. No tombstone and no session-record verdict may
-// survive that lost arbitration.
+// When the stale close meets B's foreign claim, the identity-gated first rung stops
+// before issuing either a sequence delete or a tombstone. No write and no session-record
+// verdict may survive that lost arbitration.
 //
 // Mutation M10: allow the rung-2 re-target on nonce alone and B's record is
 // rewritten Cancelled.
@@ -3151,8 +3159,9 @@ func TestMQTTInflightClaimFencesCancellationReconcile(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 	e.sess.purgeSharedPending()
-	if deleteAttempts == 0 || tombstoneAttempts != 1 {
-		t.Fatalf("the rung-2 race was not armed: deletes=%d tombstones=%d", deleteAttempts, tombstoneAttempts)
+	if deleteAttempts != 0 || tombstoneAttempts != 0 {
+		t.Fatalf("a stale close wrote after observing B's foreign claim: deletes=%d tombstones=%d",
+			deleteAttempts, tombstoneAttempts)
 	}
 
 	rec, _, err := asmB.jsa.loadInflightRecord(mqttInflightSubject(sessB.idHash, sessB.gen, pi))
@@ -4310,6 +4319,79 @@ func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 	}
 }
 
+// A never-transmitted reservation declines every acknowledgement of it. R1 makes all three
+// undurable shapes illegitimate to acknowledge: an entry whose register has not confirmed
+// (regPending), a settled-but-unproven cancellation placeholder (regCancelled, regPending
+// cleared), and a foreign reservation (the sibling test above) were NONE of them transmitted,
+// so no PUBACK/PUBREC of them can be real. Accepting one tears the entry down, acknowledges
+// the source away — the lost message — and, on a successful PUBREC, hands off a bodyless entry
+// carrying jsDur == pubRelDurable() and regSeq 0 that admission cannot tell from a live
+// retained exchange, so a PUBREL later goes out with no durable action: F-092's own class.
+//
+// Mutation checks: drop `|| ack.regPending` from the decline at mqtt.go and both regPending
+// arms fail; drop `|| ack.regCancelled` and the settled-cancelled arm fails (its regPending is
+// already cleared, so that term is the only thing catching it).
+func TestMQTTInflightUndurableReservationDeclinesAcknowledgement(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		reason    byte
+		cancelled bool // settled cancellation placeholder: regCancelled=true, regPending=false
+	}{
+		{"regPending successful PUBREC", 0, false},
+		{"regPending failed PUBREC", 0x80, false},
+		{"settled regCancelled successful PUBREC", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := testNewInflightEnv(t, "undurable-decline")
+			const dur = "SRCDUR"
+			sseq := e.publishSource(t, dur)
+			e.sess.mu.Lock()
+			pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+			ack := e.sess.pendingPublish[pi]
+			if pi == 0 || !isNew || ack == nil || !ack.regPending {
+				e.sess.mu.Unlock()
+				t.Fatalf("the allocation must be a regPending reservation: pi=%d isNew=%v ack=%+v", pi, isNew, ack)
+			}
+			if tc.cancelled {
+				// The settled cancellation placeholder: its store settled so regPending is
+				// cleared, but the allocation was cancelled and never proven, so it was
+				// still never transmitted and the same decline must cover it.
+				ack.regPending, ack.regCancelled = false, true
+			}
+			wantPending, wantCancelled := ack.regPending, ack.regCancelled
+			e.sess.mu.Unlock()
+
+			// A late acknowledgement arrives through the REAL path on the bound client.
+			e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5}
+			e.sess.mu.Lock()
+			e.sess.c = e.c
+			e.sess.mu.Unlock()
+			if err := e.c.mqttProcessPublishReceived(pi, true, tc.reason); err != nil {
+				t.Fatalf("the decline must be silent, got %v", err)
+			}
+
+			e.sess.mu.Lock()
+			e.sess.c = nil
+			got := e.sess.pendingPublish[pi]
+			_, asPubRel := e.sess.pendingPubRel[pi]
+			e.sess.mu.Unlock()
+			if got == nil || got.regPending != wantPending || got.regCancelled != wantCancelled {
+				t.Fatalf("the undurable reservation must stand unchanged: got %+v (want regPending=%v regCancelled=%v)",
+					got, wantPending, wantCancelled)
+			}
+			if asPubRel {
+				t.Fatal("a never-transmitted reservation must not be handed off to a PUBREL entry")
+			}
+			// No PUBREL reached $MQTT_out: nothing durable was written, so admission has no
+			// slot-less record it could later misclassify as retained and transmit.
+			if n, _, err := e.asm.jsa.streamSubjects(mqttOutStreamName, e.sess.pubRelSubject); err == nil && len(n) != 0 {
+				t.Fatalf("a never-transmitted reservation must not store a PUBREL, found %v", n)
+			}
+		})
+	}
+}
+
 // The purge reaches the strays a membership removal deliberately LEAVES BEHIND.
 //
 // This fixture builds the shape by hand: the membership nil'd, no shared cons entry, and a
@@ -5031,14 +5113,14 @@ func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
 	e.waitRegisterCount(t, 0)
 }
 
-// Tearing a consumer down releases its RETIRED sources too, not just its cpending
-// entries.
+// Tearing a consumer down releases its in-memory SOURCE retirements too, not just its
+// cpending entries, but preserves their whole-life owner slots.
 //
 // A retirement is created after untrackPublishEntry has removed the source's tracking, so
 // it is not in cpending at all. A teardown that only walked cpending left the retirement
-// and its register behind while deleting the consumer that could have settled them:
-// nothing could then re-offer the source, and the next resume — seeing a register whose
-// consumer is gone — would reserve its identifier for the life of the session.
+// behind while deleting the consumer that could have settled it. The register is a
+// separate obligation: the consumer's disappearance does not prove PUBCOMP, so terminal
+// cleanup—and only terminal cleanup—may remove that owner slot.
 //
 // Mutation check: drop the srcAckOwed loop from purgeConsumerPendingLocked and both
 // assertions fail.
@@ -5051,12 +5133,22 @@ func TestMQTTInflightConsumerPurgeReleasesRetiredSources(t *testing.T) {
 	pi := e.track(t, dur, sseq, 2)
 	e.sess.mu.Lock()
 	ack := e.sess.pendingPublish[pi]
-	regSeq := ack.regSeq
+	regSeq, nonce := ack.regSeq, ack.regNonce
+	e.sess.mu.Unlock()
+	// durable:true below means the slot already carries the Retired source fact. Build
+	// that production shape rather than labelling an unmarked PUBLISH record durable only
+	// in memory; the latter made the assertion diagnose its own fixture.
+	markedSeq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, regSeq, nonce, _EMPTY_, _EMPTY_)
+	if !ok {
+		t.Fatal("could not persist the retired-source fixture")
+	}
+	regSeq = markedSeq
+	e.sess.mu.Lock()
 	// The state an unproven source acknowledgement leaves: no cpending entry, a
 	// retirement instead.
 	e.sess.untrackPublishEntry(pi)
 	e.sess.retireSourceLocked(dur, sseq, &mqttRetiredSource{
-		pi: pi, regSeq: regSeq, nonce: ack.regNonce, durable: true,
+		pi: pi, regSeq: regSeq, nonce: nonce, durable: true,
 	})
 	_, mapped := e.sess.cpending[dur][sseq]
 	e.sess.mu.Unlock()
@@ -5077,11 +5169,13 @@ func TestMQTTInflightConsumerPurgeReleasesRetiredSources(t *testing.T) {
 			found = true
 		}
 	}
-	if !found {
-		t.Fatalf("the retired register's sequence %d must be returned for deletion, got %v", regSeq, regs)
+	if found {
+		t.Fatalf("the retired owner slot %d must survive until PUBCOMP, got deletion batch %v", regSeq, regs)
 	}
 	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
-	e.waitRegisterCount(t, 0)
+	if rec, _ := e.loadRegister(t, pi); rec == nil || !rec.Retired {
+		t.Fatalf("consumer purge removed or rewrote the past-PUBREC owner slot: %+v", rec)
+	}
 }
 
 // Resume recovery reads in BATCHES, not one synchronous request per register.
@@ -5284,17 +5378,11 @@ func TestMQTTInflightSourceCacheAppliesTheLookupContract(t *testing.T) {
 	}
 }
 
-// A register a DRAIN owns is neither rewritten nor deleted by recovery, and its sequence
-// is repaired into the drain state.
-//
-// Retiring it would CAS the record to a new sequence while the drain's persisted RegSeq
-// still named the old one, so the drain's later release would target a sequence that no
-// longer exists and the real record would survive as a phantom. Repairing the field is
-// also what brings drain records written before RegSeq existed up to date.
-//
-// Mutation check: drop the drainOwned check and the register is rewritten (its sequence
-// moves) while the drain's RegSeq is left naming the old one.
-func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
+// A stored exact PUBREL moves even a drain-owned PUBLISH slot through recovery route B.
+// The drain's RegSeq is only a hint and terminal cleanup addresses the whole-life slot by
+// identity, so preserving an obsolete PUBLISH phase would strand admission under the
+// predecessor's custody after restart.
+func TestMQTTInflightRecoveryCompletesDrainOwnedPubRelHandoff(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-drain-owned")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -5319,7 +5407,7 @@ func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
 
 	// A stored PUBREL for the same source, so the exchange is past PUBREC.
 	e.subscribePubRel(t)
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
 	}
@@ -5328,23 +5416,25 @@ func TestMQTTInflightRecoveryLeavesDrainOwnedRegisterAlone(t *testing.T) {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
-	// The record is untouched at its ORIGINAL sequence, and unretired.
+	// The slot is past PUBREC, canonical, and held for terminal cleanup rather than
+	// released with the drain source.
 	rec, smsg := e.loadRegister(t, pi)
 	if rec == nil || smsg == nil {
-		t.Fatalf("a drain-owned register must not be deleted")
+		t.Fatalf("a drain-owned owner slot must not be deleted")
 	}
-	if smsg.Sequence != regSeq {
-		t.Fatalf("the register moved from %d to %d: the drain's saved sequence is now stale", regSeq, smsg.Sequence)
+	if smsg.Sequence == regSeq {
+		t.Fatalf("route B did not move the slot from its PUBLISH sequence %d", regSeq)
 	}
-	if rec.Retired {
-		t.Fatalf("a drain-owned register must not be retired: the drain owns its release (I2b)")
+	if rec.State != mqttInflightPubRelReady || rec.PubRelStreamSeq == 0 {
+		t.Fatalf("the drain-owned slot did not become canonical PUBREL authority: %+v", rec)
 	}
-	// And the drain now knows the sequence it has to release.
+	// The old hint may remain: it never selects or authorizes a release, and §10.5 skips
+	// the drain-side slot release once intent proves this exchange is past PUBREC.
 	e.sess.mu.Lock()
 	got := e.sess.drains[sid].seqs[sseq].regSeq
 	e.sess.mu.Unlock()
 	if got != regSeq {
-		t.Fatalf("the drain's register sequence is %d, want %d", got, regSeq)
+		t.Fatalf("the drain's non-authoritative register hint is %d, want original %d", got, regSeq)
 	}
 }
 
@@ -6111,5 +6201,273 @@ func TestDuplicatePubRecOnAPlaceholderSendsNoNak(t *testing.T) {
 	e.sess.mu.Unlock()
 	if after != rel {
 		t.Errorf("the placeholder must be left exactly as it was, got %+v", after)
+	}
+}
+
+// TestMQTTRecoveryCustodyRefreshUsesPositiveEligibilitySet is the direct oracle for
+// §11's recovery classifier. The control is what keeps the assertion non-vacuous: exactly
+// one custody write must occur, while each independently legal excluded flag shape gets
+// none. Dropping either flag conjunct therefore changes the observed CAS set.
+func TestMQTTRecoveryCustodyRefreshUsesPositiveEligibilitySet(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-custody-positive-set")
+	e.sess.mu.Lock()
+	idHash, gen, claim := e.sess.idHash, e.sess.gen, e.sess.regClaim
+	e.sess.seq = 10
+	e.sess.mu.Unlock()
+
+	type seed struct {
+		pi        uint16
+		retired   bool
+		cancelled bool
+	}
+	seeds := []seed{
+		{pi: 41},
+		{pi: 42, retired: true},
+		{pi: 43, cancelled: true},
+		{pi: 44, retired: true, cancelled: true},
+	}
+	in := make([]mqttRecoveredInflightReg, 0, len(seeds))
+	for _, s := range seeds {
+		rec := &mqttInflightRecord{
+			State: mqttInflightPublish, PI: s.pi, Dur: "plain-custody", Seq: uint64(s.pi),
+			QoS: 2, Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
+			Retired: s.retired, Cancelled: s.cancelled,
+		}
+		subject := mqttInflightSubject(idHash, gen, s.pi)
+		seq, err := e.asm.jsa.storeInflightCAS(subject, 0, rec)
+		if err != nil {
+			t.Fatalf("seeding packet identifier %d: %v", s.pi, err)
+		}
+		in = append(in, mqttRecoveredInflightReg{rec: rec, seq: seq})
+	}
+
+	var wroteMu sync.Mutex
+	var wrote []uint16
+	e.asm.testInflightStore = func(subject string, expect uint64, rec *mqttInflightRecord) (uint64, error) {
+		name, err := mqttParseInflightSubject(subject)
+		if err != nil {
+			return 0, err
+		}
+		wroteMu.Lock()
+		wrote = append(wrote, name.pi)
+		wroteMu.Unlock()
+		return e.asm.jsa.storeInflightCAS(subject, expect, rec)
+	}
+	defer func() { e.asm.testInflightStore = nil }()
+
+	owned, closed, opaque, displaced, withheld := e.sess.claimRecoveredTransferableInflight(e.c, in)
+	if len(owned) != len(seeds) || len(closed) != 0 || len(opaque) != 0 || len(displaced) != 0 || len(withheld) != 0 {
+		t.Fatalf("classification = owned:%d closed:%d opaque:%d displaced:%d withheld:%d, want %d/0/0/0/0",
+			len(owned), len(closed), len(opaque), len(displaced), len(withheld), len(seeds))
+	}
+	if len(wrote) != 1 || wrote[0] != 41 {
+		t.Fatalf("custody CAS set = %v, want exactly {41}", wrote)
+	}
+	for _, s := range seeds {
+		rec, _, err := e.asm.loadInflightRecord(mqttInflightSubject(idHash, gen, s.pi))
+		if err != nil || rec == nil {
+			t.Fatalf("loading packet identifier %d after classification: rec=%+v err=%v", s.pi, rec, err)
+		}
+		want := "predecessor"
+		if s.pi == 41 {
+			want = claim
+		}
+		if rec.Claim != want {
+			t.Errorf("packet identifier %d claim = %q, want %q", s.pi, rec.Claim, want)
+		}
+	}
+
+	// Retired remains excluded as a flag-only PUBLISH shape above. The one narrow
+	// exception is an already-selected pubrel_ready slot with exact external PUBREL
+	// evidence: admission can acquire from it, so recovery must refresh the custody it
+	// will inspect. Exercise that contest separately so widening the ordinary positive
+	// set cannot make this assertion pass accidentally.
+	wroteMu.Lock()
+	wrote = nil
+	wroteMu.Unlock()
+	ready := &mqttInflightRecord{
+		State: mqttInflightPubRelReady, PI: 45, Dur: "plain-custody", Seq: 45,
+		QoS: 2, Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
+		Retired: true, PubRelDurable: "PUBREL_CUSTODY", PubRelStreamSeq: 145,
+	}
+	readySubject := mqttInflightSubject(idHash, gen, ready.PI)
+	readySeq, err := e.asm.jsa.storeInflightCAS(readySubject, 0, ready)
+	if err != nil {
+		t.Fatalf("seeding evidence-selected retired ready slot: %v", err)
+	}
+	owned, closed, opaque, displaced, withheld = e.sess.claimRecoveredRetiredPubRelInflight(e.c,
+		[]mqttRecoveredInflightReg{{rec: ready, seq: readySeq}})
+	if len(owned) != 1 || len(closed) != 0 || len(opaque) != 0 || len(displaced) != 0 || len(withheld) != 0 {
+		t.Fatalf("retired ready classification = owned:%d closed:%d opaque:%d displaced:%d withheld:%d, want 1/0/0/0/0",
+			len(owned), len(closed), len(opaque), len(displaced), len(withheld))
+	}
+	wroteMu.Lock()
+	retiredWrites := append([]uint16(nil), wrote...)
+	wroteMu.Unlock()
+	if len(retiredWrites) != 1 || retiredWrites[0] != ready.PI {
+		t.Fatalf("evidence-selected retired custody CAS set = %v, want {%d}", retiredWrites, ready.PI)
+	}
+	got, _, err := e.asm.loadInflightRecord(readySubject)
+	if err != nil || got == nil || got.Claim != claim {
+		t.Fatalf("evidence-selected retired slot claim = %+v err=%v, want %q", got, err, claim)
+	}
+}
+
+// TestMQTTStoreConflictReplacementRefusesAPastPubRecSlot covers census C02w. A
+// same-source occupant is replaceable only while it is still a PUBLISH slot; once past
+// PUBREC, overwriting it would erase the canonical record identity and reopen an answered
+// payload as a fresh exchange.
+func TestMQTTStoreConflictReplacementRefusesAPastPubRecSlot(t *testing.T) {
+	e := testNewInflightEnv(t, "client-store-past-pubrec")
+	dur := e.sess.idHash + "_STORE_PAST"
+	const sourceSeq = uint64(8801)
+	e.sess.mu.Lock()
+	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	claim := e.sess.regClaim
+	e.sess.mu.Unlock()
+	if pi == 0 || !isNew {
+		t.Fatalf("allocating fixture identifier: pi=%d new=%v", pi, isNew)
+	}
+	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+	oldNonce := mqttNewInflightNonce()
+	old := &mqttInflightRecord{
+		State: mqttInflightPubRelReady, PI: pi, Dur: dur, Seq: sourceSeq, QoS: 2,
+		Nonce: oldNonce, Claim: claim, ClaimSeq: 1,
+		PubRelDurable: "PUBREL_STORE_PAST", PubRelStreamSeq: 91,
+	}
+	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, old); err != nil {
+		t.Fatalf("seeding past-PUBREC occupant: %v", err)
+	}
+
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sourceSeq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+		t.Fatal("the new PUBLISH allocation replaced a past-PUBREC owner")
+	}
+	cur, _, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil {
+		t.Fatalf("loading preserved occupant: rec=%+v err=%v", cur, err)
+	}
+	if cur.Nonce != oldNonce || cur.State != mqttInflightPubRelReady || cur.PubRelStreamSeq != 91 {
+		t.Fatalf("past-PUBREC occupant was rewritten: %+v", cur)
+	}
+}
+
+// TestMQTTStoreConflictRetirementAdoptionRefusesAPubRelSlot covers census C56. A
+// retirement on a PUBLISH register can suppress a re-offer, but a retired PUBREL slot is
+// already the continuing owner and must not be reclassified into PUBLISH bookkeeping.
+func TestMQTTStoreConflictRetirementAdoptionRefusesAPubRelSlot(t *testing.T) {
+	e := testNewInflightEnv(t, "client-store-retired-pubrel")
+	dur := e.sess.idHash + "_STORE_RETIRED"
+	const sourceSeq = uint64(8802)
+	e.sess.mu.Lock()
+	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	claim := e.sess.regClaim
+	e.sess.mu.Unlock()
+	if pi == 0 || !isNew {
+		t.Fatalf("allocating fixture identifier: pi=%d new=%v", pi, isNew)
+	}
+	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+	oldNonce := mqttNewInflightNonce()
+	old := &mqttInflightRecord{
+		State: mqttInflightPubRelReady, PI: pi, Dur: dur, Seq: sourceSeq, QoS: 2,
+		Nonce: oldNonce, Claim: claim, ClaimSeq: 1, Retired: true,
+		PubRelDurable: "PUBREL_STORE_RETIRED", PubRelStreamSeq: 92,
+	}
+	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, old); err != nil {
+		t.Fatalf("seeding retired PUBREL occupant: %v", err)
+	}
+
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sourceSeq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+		t.Fatal("the new PUBLISH allocation adopted a past-PUBREC retirement")
+	}
+	e.sess.mu.Lock()
+	_, adopted := e.sess.srcAckOwed[mqttDeferredKey{dur, sourceSeq}]
+	e.sess.mu.Unlock()
+	if adopted {
+		t.Fatal("a past-PUBREC slot was installed as PUBLISH-side retirement bookkeeping")
+	}
+	cur, _, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil || cur.Nonce != oldNonce || cur.State != mqttInflightPubRelReady {
+		t.Fatalf("retired PUBREL occupant was not preserved: rec=%+v err=%v", cur, err)
+	}
+}
+
+// TestMQTTConfirmDropsOnlyItsOwnUnconfirmedAllocation covers the map edge C55m: a
+// delayed confirmation may settle its durable register, but it must not remove a newer
+// cancellation reservation that has reused the same identifier.
+func TestMQTTConfirmDropsOnlyItsOwnUnconfirmedAllocation(t *testing.T) {
+	e := testNewInflightEnv(t, "client-confirm-map-identity")
+	dur := e.sess.idHash + "_CONFIRM_MAP"
+	const sourceSeq = uint64(8803)
+	e.sess.mu.Lock()
+	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	oldNonce := e.sess.pendingPublish[pi].regNonce
+	e.sess.mu.Unlock()
+	newNonce := mqttNewInflightNonce()
+	e.asm.mu.Lock()
+	e.asm.testInflightStore = func(subject string, expect uint64, rec *mqttInflightRecord) (uint64, error) {
+		seq, err := e.asm.jsa.storeInflightCAS(subject, expect, rec)
+		if err == nil {
+			e.sess.mu.Lock()
+			e.sess.pendingPublish[pi] = &mqttPending{
+				regNonce: newNonce, regPending: true, regCancelled: true,
+			}
+			e.sess.mu.Unlock()
+		}
+		return seq, err
+	}
+	e.asm.mu.Unlock()
+	defer func() { e.asm.mu.Lock(); e.asm.testInflightStore = nil; e.asm.mu.Unlock() }()
+
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sourceSeq, oldNonce, _EMPTY_, _EMPTY_) {
+		t.Fatal("the cancelled allocation was released for transmission")
+	}
+	e.sess.mu.Lock()
+	cur := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if cur == nil || cur.regNonce != newNonce {
+		t.Fatalf("the old confirmation removed the newer reservation: %+v", cur)
+	}
+}
+
+// TestMQTTConfirmedDeleteIsIdentityAddressed covers C55's durable edge. Between a
+// landed store and its confirmation the subject can move to another exchange; cleanup
+// must preserve that occupant rather than deleting the remembered absolute sequence.
+func TestMQTTConfirmedDeleteIsIdentityAddressed(t *testing.T) {
+	e := testNewInflightEnv(t, "client-confirm-durable-identity")
+	dur := e.sess.idHash + "_CONFIRM_DURABLE"
+	const sourceSeq = uint64(8804)
+	e.sess.mu.Lock()
+	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	oldNonce := e.sess.pendingPublish[pi].regNonce
+	e.sess.mu.Unlock()
+	foreignNonce := mqttNewInflightNonce()
+	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+	e.asm.mu.Lock()
+	e.asm.testInflightStore = func(gotSubject string, expect uint64, rec *mqttInflightRecord) (uint64, error) {
+		seq, err := e.asm.jsa.storeInflightCAS(gotSubject, expect, rec)
+		if err != nil {
+			return seq, err
+		}
+		foreign := *rec
+		foreign.Nonce = foreignNonce
+		foreign.Seq++
+		if _, err := e.asm.jsa.storeInflightCAS(gotSubject, seq, &foreign); err != nil {
+			return 0, err
+		}
+		e.sess.mu.Lock()
+		e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		return seq, nil
+	}
+	e.asm.mu.Unlock()
+	defer func() { e.asm.mu.Lock(); e.asm.testInflightStore = nil; e.asm.mu.Unlock() }()
+
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sourceSeq, oldNonce, _EMPTY_, _EMPTY_) {
+		t.Fatal("an allocation removed before confirmation was released for transmission")
+	}
+	cur, _, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil || cur.Nonce != foreignNonce {
+		t.Fatalf("cleanup destroyed the replacement occupant: rec=%+v err=%v", cur, err)
 	}
 }

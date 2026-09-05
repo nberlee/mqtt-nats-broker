@@ -1303,12 +1303,13 @@ for PUBLISH and PUBREL alike, and it now holds on every outbound path: plain
 subscriptions, shared-subscription QoS 2, and drained filters.
 
 The identity is durable. A started PUBLISH-phase delivery has an **in-flight
-register** on `$MQTT_inflight` naming its packet identifier and source delivery, and
-the PUBLISH is not transmitted until that record is confirmed; past PUBREC the
-correlated PUBREL record owns the identifier, as it already did. On resume both are
-read back before any source interest exists, so the redelivery reuses the identifier
-the client is holding and a fresh allocation can never collide with one. See
-"Outbound in-flight registers" in `docs/ARCHITECTURE.md`.
+slot** on `$MQTT_inflight` naming its packet identifier and source delivery, and
+the PUBLISH is not transmitted until that record is confirmed. At PUBREC the same
+slot is re-phased and remains the identifier's owner through terminal cleanup; the
+correlated PUBREL record is durable phase evidence and payload, not a second owner.
+On resume both are read back before any source interest exists, so the redelivery
+reuses the identifier the client is holding and a fresh allocation cannot collide
+with one. See "Outbound in-flight registers" in `docs/ARCHITECTURE.md`.
 
 What this closes, beyond the deviation itself: an allocation could previously mint an
 identifier that an unreplayed PUBREL record still owned, because the in-memory PUBREL
@@ -1344,27 +1345,99 @@ Residuals:
   reservation is memory-only by construction — a crash closes the very socket it protected
   — so nothing here is conditioned on a rollout. The guarantee is about the ALLOCATOR and
   the PUBLISH path: while the reservation is live, `bumpPI` will not hand the identifier
-  out and no PUBLISH send section may open under it. It says nothing about PUBREL
-  admission, which is unchanged and is F-092's.
-- **A stored PUBREL whose acknowledgement was lost may still be transmitted under an
-  identifier another exchange owns, exactly as before F-091.** A PUBCOMP removes
-  `pendingPubRel[pi]` and then fire-and-forget acknowledges the record, so a lost
-  acknowledgement leaves it AckWait-eligible while nothing names the identifier; after reuse
-  its redelivery can install `pendingPubRel[pi]` alongside the new owner's entry — two
-  exchanges through one identifier, with the delivery callback's duplicate check recognising
-  only an already-FILLED entry. **F-091 does NOT filter any part of this class**: PUBREL
-  admission is unchanged, deliberately, after three candidate partial fences were each
-  refuted in review. The whole class is **F-092**, whose fence correlates the record's
-  `(durable, source sequence)` against the entry holding the identifier, with the QoS 2
-  subtlety that PUBREC transitions the identifier rather than releasing it so a mismatched
-  record must stay withheld until PUBCOMP.
-  What F-091 does guarantee is narrower and is stated above: while a retained reservation
-  is live, neither the allocator nor a PUBLISH send section may reuse that identifier.
-  **Still open.** The register does **not** yet survive PUBREC — it is still deleted at the
-  handoff — and PUBREL **admission** is unchanged, so a stale record whose acknowledgement
-  was lost can still be transmitted under an identifier another exchange owns, exactly as
-  described above. What exists is the vocabulary the fix needs, not the fix: see "Outbound
-  in-flight registers" in `docs/ARCHITECTURE.md` for what landed and what did not.
+  out and no PUBLISH send section may open under it. That is F-091's boundary;
+  the PUBREL admission boundary is supplied separately by F-092 below.
+- **F-092 and F-093 are advanced by the assembled seventh increment but NOT fully closed —
+  one open item remains (#2, the custody-after-drain stall, below).** The sixth attempt
+  built the owner slot, admission, terminal release and F-093's ordered handoff, then
+  stopped at a no-ship verdict. The final increment added universal pre-CONNACK custody
+  refresh over the positive eligible set, restored admission's current-custody check,
+  closed the census, and made terminal deletion conditional on a complete same-exchange
+  PUBREL scan with affine-proof-first confirmed disposal and a final freshness reread.
+  What follows describes the resulting mechanism; F-092 and F-093 stay unchecked in
+  `docs/ROADMAP.md` pending #2, whose ruled fix is recorded as Decision 7 in the work lane.
+  A stored PUBREL is no longer transmitted under an identifier another exchange owns. One
+  `$MQTT_inflight` record — the owner slot — owns an exchange for its whole life, so the
+  identifier has exactly one durable claimant instead of two independently changing durable
+  sets nothing could arbitrate between; and no SLOT-BACKED PUBREL bytes go out without
+  first ATOMICALLY ACQUIRING a non-revocable action on that slot. A live retained exchange
+  is the one exception — it has no register (R6) and so no slot, and is authorized instead
+  by the live in-memory owner identity of its incarnation, refused rather than transmitted
+  once that identity is gone. A record naming a different
+  exchange is refused and, deliberately, **not acknowledged**: AckWait re-offers it, so a
+  refusal can never lose a PUBREL the client is owed. F-093 goes with it — a completed
+  exchange leaves no `pendingPublish` entry and no `cpending` mapping, so it no longer
+  reserves an identifier and a Receive Maximum slot for the life of the session.
+
+  **THE RESIDUAL: an abandoned action holds its identifier for an unbounded TIME.** An
+  abandoned action is any acquired action whose holder can no longer confirm its durable
+  drain. Finite failures recover — a validation or opener failure aborts before the write,
+  an ambiguous acquisition adopts its own draining successor, a recovered panic runs the
+  armed abort, a finite CAS or drain failure retries, and a proven generation discard
+  retires the holder. What does NOT recover is process termination, a permanently leaked
+  goroutine or blocked socket write, and indefinitely unavailable storage.
+
+  There is deliberately no lease, TTL or steal, and that is not conservatism: a broker can
+  pause AFTER its own expiry check and resume into the same stale write, and an MQTT client
+  cannot validate a fencing token, so the external effect is not fenceable downstream. An
+  abandoned action therefore ends only through its own holder confirming the drain, an
+  explicit whole-generation discard (clean start or session expiry), or destructive operator
+  recovery under the existing all-nine-stream reset boundary.
+
+  **The bound.** Per session it is the actions admitted under whatever limits were in force
+  when each was acquired — ultimately the 65,535 per-session identifier space, and NOT the
+  session's *current* effective capacity, because Receive Maximum is re-evaluated on every
+  CONNECT and a session may acquire many actions under a high limit and reconnect
+  advertising 1. **Across sessions there is no global bound**; the total is the sum over
+  affected sessions. CONNECT and QoS 0 continue and other identifiers stay usable, but at
+  Receive Maximum 1 a single reserved identifier stalls further QoS 1/2 delivery for that
+  session — and a reconnect at Receive Maximum 1 may find several already reserved.
+
+  **The custody gap from the sixth attempt is closed at recovery, with one open residual
+  after a drain (#2 below).** Before source interest is restored,
+  recovery contests every positively eligible publish or past-PUBREC slot and rewrites its
+  custody to the current session acceptance. Admission requires that current claim before
+  it can acquire an action. The positive set includes a retired `pubrel_ready` slot only
+  when a present PUBREL record names its exact source, identifier and exchange nonce: that
+  evidence means the client is still waiting for the step admission can acquire. A retired
+  flag alone, a cancelled slot, an active action and a terminal slot receive no custody
+  rewrite. A slot observed concurrently moving into an action or terminal state is withheld
+  rather than overwritten.
+
+  A stored PUBREL with no surviving authority remains a deliberate fail-closed residual:
+  it is refused rather than acknowledged, so genuine residue may occupy `$MQTT_out` space
+  until generation teardown or operator removal. An absent slot alone cannot prove an
+  exchange is over; terminal disposal therefore requires the terminal slot, a complete
+  same-incarnation scan, matching owner/source/affine identity, and a final freshness
+  reread before the slot is deleted. The source must also be provably non-reofferable
+  regardless of whether its `Retired` mark landed: a past-PUBREC phase is sufficient for
+  recovery to install source suppression and persist the missing mark while the source is
+  live or unknown. A positively lost consumer is distinct from a completed source and
+  never licenses PUBLISH-phase reaping, but after PUBCOMP both mean the source cannot be
+  offered again. Terminal cleanup retains its phase evidence in every other case. PUBCOMP
+  replaces its delivered in-memory entry with a nonce-bound terminal reservation under
+  the same lock, so
+  allocation cannot re-mint the identifier while those storage round trips run. An
+  indeterminate cleanup keeps that reservation and retries through the shutdown-aware
+  worker gate until the durable consequence is proven.
+
+  **Related, and narrower — this is open item #2.** Custody transfer is withheld for a
+  slot with a live action, so a takeover completes for the rest of the session while that
+  one exchange stays non-actionable until the action drains; a holder that already acquired
+  an action completes it across a later acceptance, so a successor may see one PUBREL
+  written to the predecessor's closing socket for a real past-PUBREC exchange, with nothing
+  durable landing under the superseded acceptance. The drain then clears the action fields
+  but LEAVES the predecessor's Claim, and nothing re-runs custody for the already-connected
+  successor, so admission keeps failing `cur.Claim==sess.regClaim` for that identifier until
+  the next reconnect — at Receive Maximum 1 stalling that session's QoS 1/2 delivery. It is
+  recoverable with no data loss and no F-092 transmission; the ruled fix is Decision 7 in
+  the work lane (a post-action-CAS `$MQTT_sess` ownership fence plus a successor reconcile),
+  a deferred focused pass whose foundational `mqttSlotTransferCustody` CAS predicate is
+  landed. A malformed or marker-less PUBREL record is never
+  interpreted and costs stream space rather than an identifier. A **retained** QoS 2
+  exchange's PUBREL is not authorized across a restart — it has no register at all, so its
+  authority is the live in-memory owner identity of that incarnation — and its record is
+  refused rather than dropped.
 - **What IS enforced today, stated narrowly on purpose.** A stored PUBREL carries a
   mandatory `Nmqtt-Q2Owner` exchange identity, and a record whose identity is absent or
   malformed is **withheld** by the delivery callback — never transmitted and never
@@ -1389,16 +1462,17 @@ Residuals:
   The closed schema replaced five declared-but-unproduced fields whose only function was to
   refuse themselves; that was an incomplete closed schema, since a sixth plausible control
   field would have been dropped silently by the JSON decoder and the record read as an
-  ordinary legal register. On READ, only a
-  `publish`-state record is additionally restored as a live delivery: any other state,
-  **including an absent one**, is **quarantined** — its identifier is reserved so it can
-  never be reused, and nothing acts on the record.
+  ordinary legal register.
   Two review rounds were needed to close the read half. The first left the matrix governing
   writes only, so an unsupported shape read back counted as readable; the second found that
   validating it in the recovery scan alone still left the destructive readers — drain
   identity release, the gated reap and generation teardown — trusting an identity-valid but
   illegal body. Enumerating readers was the defect, so the rule is now a property of the
   one decoder rather than a check repeated per site.
+  Recovery restores every valid state according to its phase: publish entries return to
+  the publish maps, ready/sending states reserve the PUBREL exchange or its action, and
+  terminal states finish only through the terminal disposal gate. An invalid or absent
+  state is quarantined and cannot authorize a mutation, deletion or release.
   An earlier revision tolerated an absent state as "what earlier writers produced". That
   was rolling-upgrade machinery, which this project's compatibility boundary forbids
   outright, and it was also incoherent: every shared register is claim-rewritten through
@@ -1438,17 +1512,20 @@ Residuals:
   narrowed rather than introduced by the owner-slot substrate. Refusing it is
   protocol-visible — the client would see `SUBACK 0x80` until the PUBREL completes — so it
   is F-094's own design question.
-- **A retained QoS 2 exchange's PUBREL is still transmitted after a restart, with no
-  surviving authority.** A retained send has no register (R6), so its exchange identity
-  lives only in the in-memory reservation and that reservation is gone after a restart. The
-  record's owner is nevertheless syntactically valid, recovery filters only an absent or
-  malformed one, and the delivery gate that would otherwise check ownership is keyed on the
-  source correlation a retained record does not carry — so the PUBREL goes out under an
-  identifier another exchange may by then own. This is F-092's central hazard in the one
-  subclass where no durable fact can settle it, and it is **not** fixed here: PUBREL
-  admission is the unbuilt half. An earlier revision of this bullet claimed the record was
-  "withheld by the identity rule", which a holistic round disproved by reading the recovery
-  filter.
+- **A retained QoS 2 exchange's PUBREL surviving a restart is REFUSED, not transmitted.**
+  A retained send has no register (R6), so its exchange identity lives only in the in-memory
+  owner of its incarnation and that identity is gone after a restart. Admission
+  (`retainedPubRelAdmittedLocked_`) now authorizes a slot-less PUBREL only when a live
+  `pendingPubRel` entry of this incarnation names the record's exchange nonce AND that entry
+  names this generation's PUBREL consumer (`jsDur == pubRelDurable()`, which separates it
+  from a recovered source-backed placeholder whose `jsDur` is the source consumer). After
+  a restart neither holds, so the record is refused — never transmitted under an identifier
+  another exchange may by then own, and never acknowledged away, so an operator can still
+  see it. This closes F-092's central hazard in the one subclass where no durable fact can
+  settle it. Two earlier revisions of this bullet were wrong in opposite directions: one
+  claimed the record was "withheld by the identity rule" when admission was still unbuilt
+  (a holistic round disproved it by reading the recovery filter), the other still described
+  the unbuilt state after admission had in fact been built.
 - **Promptness, not continuity, still depends on the reconnect being same-process.**
   The identifier is restored either way, but the immediate NAK-driven redelivery needs
   a live per-attempt JetStream ack subject, which a recovered entry does not have — so

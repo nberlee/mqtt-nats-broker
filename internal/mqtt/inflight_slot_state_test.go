@@ -47,13 +47,11 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 		}, false},
 		{"absent state", func(r *mqttInflightRecord) { r.State = _EMPTY_ }, false},
 		{"unknown state", func(r *mqttInflightRecord) { r.State = "somewhere-else" }, false},
-		// Every state but `publish` is now an unknown state, and that is the whole reason
-		// the row above is not decoration: the four deleted names are refused by the same
-		// clause as any other string, rather than by four cases enumerating them.
-		{"a deleted PUBREL state name", func(r *mqttInflightRecord) {
+		// Known PUBREL state names still need their own required field combinations.
+		{"a PUBREL state without its canonical tuple", func(r *mqttInflightRecord) {
 			r.State = "pubrel_ready"
 		}, false},
-		{"another deleted PUBREL state name", func(r *mqttInflightRecord) {
+		{"a terminal state without its canonical tuple", func(r *mqttInflightRecord) {
 			r.State = "pubrel_terminal"
 		}, false},
 		{"no packet identifier", func(r *mqttInflightRecord) { r.PI = 0 }, false},
@@ -76,6 +74,15 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 		{"QoS 1 publish, shared custody with no sequence", func(r *mqttInflightRecord) {
 			r.QoS, r.Claim = 1, other
 		}, true},
+		{"QoS 1 in a PUBREL-ready shape", func(r *mqttInflightRecord) {
+			r.QoS, r.State, r.Claim = 1, mqttInflightPubRelReady, other
+			r.PubRelDurable, r.PubRelStreamSeq = "PUBREL_QOS1", 9
+		}, false},
+		{"QoS 1 carrying a PUBREL action", func(r *mqttInflightRecord) {
+			r.QoS, r.State, r.Claim = 1, mqttInflightPubRelSending, other
+			r.PubRelDurable, r.PubRelStreamSeq = "PUBREL_QOS1", 9
+			r.ActionToken, r.ActionClaim = nonce, other
+		}, false},
 		{"QoS 1 carrying an affine reference", func(r *mqttInflightRecord) {
 			r.QoS = 1
 			r.Q2AffClaim, r.Q2AffCopy = "$MQTT_qos2assign.x", "$MQTT.out.x"
@@ -223,9 +230,19 @@ func TestInflightRecordKeySetIsDerivedFromTheStruct(t *testing.T) {
 			t.Errorf("the key set omits %q, so a record this broker writes would be refused", want)
 		}
 	}
-	for _, gone := range []string{"action", "action_claim", "action_claimseq", "pubrel_dur", "pubrel_seq"} {
-		if _, ok := keys[gone]; ok {
-			t.Errorf("the key set still admits %q, a field this change deleted", gone)
+	// The five action / canonical-record keys RETURNED with the admission half that
+	// produces them, so the key set must admit them — and must admit them under their
+	// real tag spellings, which is the half a hand-maintained list gets wrong.
+	for _, back := range []string{"action", "actclaim", "actclaimseq", "preldur", "prelseq"} {
+		if _, ok := keys[back]; !ok {
+			t.Errorf("the key set omits %q, so a record this broker now writes would be refused", back)
+		}
+	}
+	// And nothing else. A key the struct does not declare must never be admitted, which
+	// is the closed schema itself.
+	for _, never := range []string{"action_claim", "pubrel_dur", "pubrel_seq", "ACTION", "actiontoken"} {
+		if _, ok := keys[never]; ok {
+			t.Errorf("the key set admits %q, which no struct tag declares", never)
 		}
 	}
 	// Round-trip: every key the record MARSHALS to must be one the walk accepts, or the
@@ -234,6 +251,8 @@ func TestInflightRecordKeySetIsDerivedFromTheStruct(t *testing.T) {
 		PI: 7, Dur: "d", Seq: 41, QoS: 2, Nonce: "xxxxxxxxxxxxxxxxxxxxxx",
 		State: mqttInflightPublish, Claim: "c", ClaimSeq: 3,
 		Q2AffClaim: "a", Q2AffCopy: "b", Retired: true, Cancelled: true,
+		ActionToken: "t", ActionClaim: "c", ActionClaimSeq: 3,
+		PubRelDurable: "pd", PubRelStreamSeq: 9,
 	})
 	if err != nil {
 		t.Fatalf("marshal a fully populated record: %v", err)
@@ -256,31 +275,103 @@ func TestInflightRecordKeySetIsDerivedFromTheStruct(t *testing.T) {
 // is what stops every path written when a register's life ended at PUBREC from vacating a
 // slot mid-exchange.
 //
-// With one supported state the gate's remaining content is the clause that matters most
-// and is easiest to lose: an UNSUPPORTED state authorises NOTHING. That is what stops a
-// record from elsewhere licensing a delete, and it is what the deleted four-state arms
-// used to obscure — a table full of per-state answers reads as though the refusal came
-// from the table rather than from the guard above it.
+// The unsupported-state refusal is asserted separately because a table full of known-state
+// answers can obscure it: a record from elsewhere must authorize no disposition at all.
 func TestInflightSlotPhaseGate(t *testing.T) {
 	t.Parallel()
-	dispositions := []mqttInflightDisposition{
-		mqttSlotDeleteNeverTransmitted, mqttSlotDeleteComplete,
-		mqttSlotMarkRetired, mqttSlotMarkCancelled,
+
+	// THE WHOLE MATRIX, one expectation per (disposition, state) pair. Written as a table
+	// rather than as loops with exceptions, because the defect this gate exists to stop is
+	// a single pair silently reading the wrong way, and a loop with an exception list
+	// hides exactly that.
+	type want struct {
+		publish, ready, sending, draining, terminal bool
 	}
-	// Every disposition is permitted from the one supported state.
-	for _, d := range dispositions {
-		if !mqttInflightTransitionAllowed(d, mqttInflightPublish) {
-			t.Errorf("disposition %v must be permitted from the supported state", d)
+	for _, tc := range []struct {
+		name string
+		d    mqttInflightDisposition
+		w    want
+	}{
+		{
+			// "Never transmitted" is false past PUBREC by construction: the client
+			// answered under this identifier.
+			name: "delete-never-transmitted", d: mqttSlotDeleteNeverTransmitted,
+			w: want{publish: true},
+		},
+		{
+			// Same claim, same refusal.
+			name: "mark-cancelled", d: mqttSlotMarkCancelled,
+			w: want{publish: true},
+		},
+		{
+			// Source completion settles only a PUBLISH-phase slot. Terminal has a distinct
+			// disposition so this path cannot bypass its record-side obligations.
+			name: "delete-complete", d: mqttSlotDeleteComplete,
+			w: want{publish: true},
+		},
+		{
+			// PUBCOMP plus terminal cleanup's source/record/freshness proofs.
+			name: "delete-terminal", d: mqttSlotDeleteTerminal,
+			w: want{terminal: true},
+		},
+		{
+			// The mark is about the SOURCE, not the phase.
+			name: "mark-retired", d: mqttSlotMarkRetired,
+			w: want{publish: true, ready: true, sending: true, draining: true, terminal: true},
+		},
+		{
+			// Only the two active states have an action to drain.
+			name: "drain-action", d: mqttSlotDrainAction,
+			w: want{sending: true, draining: true},
+		},
+		{
+			// Both quiescent admission origins may acquire. The exact custody predicate is
+			// tested at the CAS boundary.
+			name: "acquire-action", d: mqttSlotAcquireAction,
+			w: want{publish: true, ready: true},
+		},
+		{
+			// Quiescent states only: transferring custody during a live action would hand
+			// the exchange to an object that cannot drain the action the old custodian
+			// still holds.
+			name: "transfer-custody", d: mqttSlotTransferCustody,
+			w: want{publish: true, ready: true},
+		},
+		{
+			// A fresh allocation may replace only a PUBLISH occupant for the same source;
+			// replacing a later phase would erase its canonical/action identity.
+			name: "replace-publish", d: mqttSlotReplacePublish,
+			w: want{publish: true},
+		},
+		{
+			// Every supported state is a legal ORIGIN for some arrow; which arrow is
+			// legal is the CAS's business, since only it knows the target.
+			name: "advance-phase", d: mqttSlotAdvancePhase,
+			w: want{publish: true, ready: true, sending: true, draining: true, terminal: true},
+		},
+	} {
+		for _, st := range []struct {
+			state mqttInflightState
+			want  bool
+		}{
+			{mqttInflightPublish, tc.w.publish},
+			{mqttInflightPubRelReady, tc.w.ready},
+			{mqttInflightPubRelSending, tc.w.sending},
+			{mqttInflightPubRelTerminalDraining, tc.w.draining},
+			{mqttInflightPubRelTerminal, tc.w.terminal},
+		} {
+			if got := mqttInflightTransitionAllowed(tc.d, st.state); got != st.want {
+				t.Errorf("%s from %q: allowed=%v, want %v", tc.name, st.state, got, st.want)
+			}
 		}
 	}
-	// And NONE is permitted from an unsupported one. The deleted state names are included
-	// deliberately: they are unsupported strings now, not states with their own arms, and
-	// a record from elsewhere carrying one must license nothing.
-	for _, st := range []mqttInflightState{
-		_EMPTY_, "not-a-state", "pubrel_ready", "pubrel_sending",
-		"pubrel_terminal_draining", "pubrel_terminal",
-	} {
-		for _, d := range dispositions {
+
+	// AN UNSUPPORTED STATE AUTHORISES NOTHING, for every disposition. This is the clause
+	// the per-state arms make easiest to lose — a table full of answers reads as though
+	// the refusal came from the table rather than from the guard above it — so it is
+	// asserted separately and against every disposition the type has.
+	for _, st := range []mqttInflightState{_EMPTY_, "not-a-state", "PUBLISH", "pubrel"} {
+		for d := mqttSlotDeleteComplete; d <= mqttSlotAdvancePhase; d++ {
 			if mqttInflightTransitionAllowed(d, st) {
 				t.Errorf("disposition %v must be refused on unsupported state %q", d, st)
 			}

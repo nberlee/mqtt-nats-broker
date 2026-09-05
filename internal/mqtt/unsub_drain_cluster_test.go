@@ -290,16 +290,28 @@ func TestMQTTDrainClusterLateForeignPubRelStore(t *testing.T) {
 			dur, sseq, claimPI = d, seq, st.pi
 		}
 	}
-	idHash, pubRelSubject := sessA.idHash, sessA.pubRelSubject
+	idHash, gen, pubRelSubject := sessA.idHash, sessA.gen, sessA.pubRelSubject
 	sessA.mu.Unlock()
 	if dur == "" {
 		t.Fatal("broker A should hold a draining consumer with a claimed sequence")
 	}
 
+	// The exchange's REAL owner nonce, read off the surviving owner slot. In production the
+	// intent and the PUBREL both carry the register's own regNonce, so the intent, the slot
+	// and the record all name ONE exchange (Decision 5). A synthetic nonce that differs from
+	// the slot is contradictory under §10.5 and would be refused, so the fixture uses the
+	// actual captured identity.
+	slotSubject := mqttInflightSubject(idHash, gen, claimPI)
+	slotRec, _, slotErr := sessA.asm.loadInflightRecord(slotSubject)
+	if slotErr != nil || slotRec == nil {
+		t.Fatalf("reading the owner slot at %q: rec=%v err=%v", slotSubject, slotRec, slotErr)
+	}
+	ownerNonce := slotRec.Nonce
+
 	// Stand in for A: persist the intent as A would have, then leave A's store
 	// un-issued. A real pause-and-release needs a seam inside another broker's
 	// process; writing the same record A would have written is the same fact.
-	if _, definite, err := sessA.recordPubRelIntent(nil, dur, sseq, claimPI, "xxxxxxxxxxxxxxxxxxxxxx"); err != nil {
+	if _, definite, err := sessA.recordPubRelIntent(nil, dur, sseq, claimPI, ownerNonce); err != nil {
 		t.Fatalf("recording the intent (definite=%v): %v", definite, err)
 	}
 	testMQTTDisconnect(t, ca, nil)
@@ -317,7 +329,7 @@ func TestMQTTDrainClusterLateForeignPubRelStore(t *testing.T) {
 	// NOW release A's store: the superseded broker completes the write it had
 	// already begun, under the identity the exchange defines.
 	msgId := mqttPubRelMsgId(idHash, dur, sseq, 0)
-	natsMsg, headerLen := mqttNewCorrelatedPubRel(claimPI, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, msgId, _EMPTY_, _EMPTY_)
+	natsMsg, headerLen := mqttNewCorrelatedPubRel(claimPI, ownerNonce, dur, sseq, msgId, _EMPTY_, _EMPTY_)
 	if _, err := sessA.jsa.storeMsg(pubRelSubject, headerLen, natsMsg); err != nil {
 		t.Fatalf("A's late store: %v", err)
 	}

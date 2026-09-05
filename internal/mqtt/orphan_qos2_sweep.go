@@ -2077,8 +2077,8 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// does not license bypassing the fence.
 		//
 		// The gate is applied against the record this sweep has already read, so it costs
-		// no extra round trip; only the state is in question, since the caller proved the
-		// identity to get here.
+		// no extra round trip. Retired is source-side suppression, not a second phase: a
+		// genuinely past-PUBREC owner is protected by its explicit slot state.
 		if !mqttInflightTransitionAllowed(mqttSlotDeleteComplete, rec.State) {
 			return false
 		}

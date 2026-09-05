@@ -1,15 +1,10 @@
 // The durable QoS 2 owner slot: the design in which one PI-scoped `$MQTT_inflight` record
 // owns one outbound QoS 2 exchange for its WHOLE life, not only its PUBLISH phase.
 //
-// WHAT THIS FILE IS, stated first because every rule below reads like a live invariant and
-// on this tree most of them are not yet reachable. This is the SUBSTRATE: the state set,
-// the one legal-shape matrix, the slot reference, the dispositions and the phase gate. The
-// mechanism that would drive a slot past `publish` — PUBREL admission and the terminal
-// release — is F-092's unbuilt half, so production writes only `publish` and the handoff
-// still deletes the record at PUBREC. Read the rules here as the contract the admission
-// half must satisfy, and the enforcement here as what is already in force for the PUBLISH
-// phase: the shape matrix and the phase gate refuse anything else outright, which is what
-// makes landing the rest a change to one file rather than a re-derivation.
+// This file is the state machine's shared substrate: the state set, the one legal-shape
+// matrix, the slot reference, the dispositions and the phase gate. PUBREL admission and
+// terminal release live in pubrel_action.go; every production write and read is checked
+// against the matrix here.
 //
 // Before this, a register's life ended at PUBREC: the handoff deleted it and the
 // correlated PUBREL record on `$MQTT_out` became the identifier's authority (R2/R5).
@@ -35,12 +30,9 @@
 // replacement, ordinary deletion, identifier release and terminal deletion all refuse, and
 // only the action's own holder can drain it.
 //
-// NONE OF THAT IS IN THIS FILE. The states, the durable action token and the dispositions
-// that referred to them were built here and deleted, because nothing mints an action: the
-// only thing that would is the unbuilt PUBREL write path. What survives is the reasoning —
-// which is why the CAS has to be the mechanism, and why no lease can substitute — and it
-// survives here because the next attempt should not have to re-derive it. See
-// docs/ROADMAP.md's F-092 bullet.
+// The CAS and action lifecycle that enforce this live in pubrel_action.go. Keeping the
+// phase vocabulary and gate here gives every delete, rewrite and release one answer to
+// the same state question.
 //
 // # Why there is no TTL, no expiry and no steal
 //
@@ -69,27 +61,66 @@ import (
 // license a PUBLISH under an identifier that is already past PUBREC — exactly the
 // duplicate delivery the compatibility boundary refuses to migrate its way around.
 //
-// ONE state is defined, and the four that used to sit beside it — `pubrel_ready`,
-// `pubrel_sending`, `pubrel_terminal_draining`, `pubrel_terminal` — were built and then
-// DELETED before this landed. Nothing produced them: the PUBREC handoff still deletes the
-// register, so `publish` is the only state ever written, and a validator that recognised
-// four unproduced names was implementing an INCOMPLETE closed schema — those four
-// rejected, any fifth plausible field silently accepted by encoding/json. The closed
-// schema now belongs to the decoder (mqttDecodeInflightRecord), which refuses ANY
-// unrecognised field, and the states come back with the admission half that produces them.
-// docs/ROADMAP.md's F-092 bullet carries the design they belong to.
+// The closed schema belongs to mqttDecodeInflightRecord, which refuses every unrecognised
+// field as well as every state/field combination this broker does not write.
 type mqttInflightState string
 
 const (
 	// mqttInflightPublish: the exchange is awaiting PUBACK or PUBREC. The PUBLISH paths
 	// own it, unchanged from before the slot existed.
 	mqttInflightPublish mqttInflightState = "publish"
+	// mqttInflightPubRelReady: past PUBREC. The exchange's PUBREL record exists and the
+	// slot names it canonically; no transmission is in progress. This is the state a
+	// PUBREL action is acquired FROM and drained BACK TO.
+	mqttInflightPubRelReady mqttInflightState = "pubrel_ready"
+	// mqttInflightPubRelSending: an action is live and a PUBREL write may be on the
+	// wire. While this state holds, custody transfer, slot replacement, ordinary
+	// deletion, identifier release and terminal deletion all refuse, and only the
+	// action's own holder may drain it.
+	mqttInflightPubRelSending mqttInflightState = "pubrel_sending"
+	// mqttInflightPubRelTerminalDraining: PUBCOMP was observed while the write had not
+	// returned. It keeps the SAME action token: PUBCOMP does not revoke an action, it
+	// records that the exchange finished. Observing it is proof an ambiguous acquisition
+	// landed, which is why the ambiguity reread accepts it (see the holder lifecycle).
+	mqttInflightPubRelTerminalDraining mqttInflightState = "pubrel_terminal_draining"
+	// mqttInflightPubRelTerminal: PUBCOMP was observed and no write is outstanding. The
+	// exchange is over; what remains is idempotent obligation completion, the complete
+	// same-nonce duplicate scan, the canonical record's acknowledgement, and the exact
+	// deletion. Nothing transmits from here, which is what makes terminal finalization
+	// custody-agnostic.
+	mqttInflightPubRelTerminal mqttInflightState = "pubrel_terminal"
 )
+
+// mqttInflightPastPubRec reports whether st is one of the four states in which the client
+// is holding the identifier for a PUBREL exchange.
+//
+// The distinction every gate below turns on: from PUBLISH an identifier may be reaped or
+// cancelled because the client may never have seen it, and past PUBREC it may not.
+func mqttInflightPastPubRec(st mqttInflightState) bool {
+	switch st {
+	case mqttInflightPubRelReady, mqttInflightPubRelSending,
+		mqttInflightPubRelTerminalDraining, mqttInflightPubRelTerminal:
+		return true
+	}
+	return false
+}
+
+// mqttInflightActionState reports whether st is one of the two states in which a durable
+// PUBREL action is live, and therefore in which the slot is non-actionable by anyone but
+// the action's own holder.
+func mqttInflightActionState(st mqttInflightState) bool {
+	return st == mqttInflightPubRelSending || st == mqttInflightPubRelTerminalDraining
+}
 
 // mqttInflightStateKnown reports whether s is a state this broker writes. Anything else
 // is refused rather than normalised.
 func mqttInflightStateKnown(s mqttInflightState) bool {
-	return s == mqttInflightPublish
+	switch s {
+	case mqttInflightPublish, mqttInflightPubRelReady, mqttInflightPubRelSending,
+		mqttInflightPubRelTerminalDraining, mqttInflightPubRelTerminal:
+		return true
+	}
+	return false
 }
 
 // mqttInflightShapeError names why a persisted slot is not a shape this broker writes. A
@@ -305,11 +336,33 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		return mqttShapeErr("claim sequence without a claimant")
 	}
 
-	// The action fields and the canonical PUBREL record identity used to be validated here
-	// as all-or-nothing pairs. Those five fields are GONE, and the closed-schema job they
-	// were doing now belongs to mqttDecodeInflightRecord, which refuses any unrecognised
-	// field rather than the handful this matrix could name in advance.
-	//
+	// The ACTION triple is whole or absent, and its claimant must equal the custody it
+	// was taken under. A partial triple names an action nobody can drain.
+	hasAction := r.ActionToken != _EMPTY_
+	if hasAction {
+		if !mqttValidInflightNonce(r.ActionToken) {
+			return mqttShapeErr("action token is not a valid nonce")
+		}
+		if r.ActionClaim == _EMPTY_ {
+			return mqttShapeErr("action token without a claimant")
+		}
+		if r.ActionClaim != r.Claim || r.ActionClaimSeq != r.ClaimSeq {
+			// The action belongs to the custody that acquired it. A mismatch means one
+			// of the two was rewritten underneath the other, which is exactly the
+			// stale-custodian case the exclusion exists to refuse.
+			return mqttShapeErr("action claimant does not match the slot's custody")
+		}
+	} else if r.ActionClaim != _EMPTY_ || r.ActionClaimSeq != 0 {
+		return mqttShapeErr("action claimant without an action token")
+	}
+
+	// The canonical PUBREL record identity is whole or absent, for the same reason: half
+	// of it names no message.
+	hasPubRel := r.PubRelDurable != _EMPTY_
+	if hasPubRel != (r.PubRelStreamSeq != 0) {
+		return mqttShapeErr("canonical PUBREL record identity is partially written")
+	}
+
 	// The affine pair is one reference, never half of one (F-065).
 	hasAff := r.Q2AffClaim != _EMPTY_
 	if hasAff != (r.Q2AffCopy != _EMPTY_) {
@@ -320,8 +373,15 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		// QoS 1 has one phase and one acknowledgement, so no affine pair belongs to it.
 		// Custody is OPTIONAL here: a plain QoS 1 register carries none and a shared one
 		// carries a valid claim, which is the pre-existing arbitration and is left alone.
-		// Cancelled is free either way. A state check is redundant now that `publish` is
-		// the only state the type has, and mqttInflightStateKnown above already required it.
+		// Cancelled is free either way. The explicit state check is load-bearing now that
+		// the type also names QoS 2 PUBREL phases: without it a QoS 1 record could borrow
+		// a canonical tuple and action and pass the generic pairing checks above.
+		if r.State != mqttInflightPublish {
+			return mqttShapeErr("QoS 1 outside the PUBLISH phase")
+		}
+		if hasAction || hasPubRel {
+			return mqttShapeErr("QoS 1 carrying PUBREL state")
+		}
 		if hasAff {
 			return mqttShapeErr("QoS 1 carrying an affine reference")
 		}
@@ -331,39 +391,70 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		return nil
 	}
 
-	// Universal QoS 2 custody is part of the UNBUILT mechanism, not of this shape rule, and
-	// the distinction cost two red suites to find.
-	//
-	// The plan requires custody on every QoS 2 slot, because custody is what a takeover
-	// transfers and what a PUBREL action binds to. Neither of those exists yet, and the
-	// tree does not populate it: a plain, non-shared QoS 2 register carries no claim today,
-	// because sess.regClaim is a shared-delivery ownership identity. Requiring it here
-	// refused ordinary outbound QoS 2 registers — the common path — which is a far larger
-	// break than the rule was worth.
-	//
-	// So custody stays OPTIONAL, exactly as today, and becomes mandatory in the same change
-	// that makes it load-bearing. That change is also where the zero-sequence question is
-	// settled: a ClaimSeq of zero names no persisted acceptance, so custody has to be
-	// refreshed to the confirmed session-record sequence before an action may bind to it.
-	// Recording it here so the next attempt does not rediscover it as a surprise.
+	// A publish-state QoS 2 slot may be read without custody for compatibility with the
+	// pre-transition shape, but production creates every new slot with custody and the
+	// pre-CONNACK classifier refreshes every eligible recovered one. Admission requires
+	// current custody before it can advance either from publish or ready. Past PUBREC the
+	// shape itself makes custody mandatory, because an action has to bind to it.
 
-	// `publish` is the only state, so this is the whole QoS 2 rule.
-	//
-	// Retired IS legal here, and that surprised me until the tree said otherwise.
-	// `Retired` is a fact about the SOURCE — "past PUBREC with an unproven
-	// acknowledgement" — not about the slot's phase, and the pre-existing design records it
-	// while the register is still in its PUBLISH shape: recovery reads
-	// register-plus-PUBREL-record as past PUBREC precisely because the register itself does
-	// not say so. Several e2e paths set it before anything could re-phase the slot.
-	// Cancelled alone is legal too: a never-transmitted allocation.
-	//
-	// The past-PUBREC half of this matrix — a canonical PUBREL record identity being
-	// mandatory, cancelled-without-retired being refused, an action requiring custody with
-	// a persisted acceptance sequence, and an action's claimant having to equal the
-	// custodian — was written and DELETED with the states and fields it spoke about. Those
-	// rules are the contract the admission half must satisfy and they are recorded in
-	// docs/ROADMAP.md's F-092 bullet; validating them here against fields nothing writes
-	// only made this function look like it was enforcing more than it was.
+	// The QoS 2 per-state matrix.
+	if r.State == mqttInflightPublish {
+		// Retired IS legal here, and that surprised me until the tree said otherwise.
+		// `Retired` is a fact about the SOURCE — "past PUBREC with an unproven
+		// acknowledgement" — not about the slot's phase, and the pre-existing design
+		// records it while the register is still in its PUBLISH shape: recovery reads
+		// register-plus-PUBREL-record as past PUBREC precisely because the register
+		// itself does not say so. Several e2e paths set it before anything could
+		// re-phase the slot. Cancelled alone is legal too: a never-transmitted
+		// allocation.
+		//
+		// What is NOT legal in `publish` is anything naming a PUBREL exchange, because
+		// no PUBREL record exists until the PUBREC handoff writes one.
+		if hasAction {
+			return mqttShapeErr("a PUBLISH-phase slot carrying a PUBREL action")
+		}
+		if hasPubRel {
+			return mqttShapeErr("a PUBLISH-phase slot naming a canonical PUBREL record")
+		}
+		return nil
+	}
+
+	// PAST PUBREC. The client is holding this identifier for a PUBREL exchange, so every
+	// rule below exists to stop something freeing or re-minting it.
+
+	// The canonical record is what the exchange IS from here on: admission correlates
+	// against it, duplicate disposal is scoped by it, and terminal cleanup acknowledges
+	// it. A past-PUBREC slot that does not name one describes an exchange nothing can
+	// complete.
+	if !hasPubRel {
+		return mqttShapeErr("a past-PUBREC slot naming no canonical PUBREL record")
+	}
+
+	// Custody is MANDATORY past PUBREC: it is what a takeover transfers and what an
+	// action binds to, so a slot without it has nothing for either to check. ClaimSeq
+	// stays free to be zero — sess.seq is zero until the session record's first save,
+	// and a zero sequence LOSES every ordering contest rather than being incoherent.
+	if !claimed {
+		return mqttShapeErr("a past-PUBREC slot carrying no custody")
+	}
+
+	// Cancelled says "never transmitted", and past PUBREC that is false by construction:
+	// the client answered under this identifier. It is legal ONLY alongside Retired,
+	// where Retired dominates and the exchange is correctly read as transmitted.
+	if r.Cancelled && !r.Retired {
+		return mqttShapeErr("a past-PUBREC slot marked cancelled but not retired")
+	}
+
+	// An action is live in exactly the two active states, and nowhere else. In
+	// `pubrel_ready` there is no transmission to fence; in `pubrel_terminal` the write
+	// has returned and PUBCOMP was observed, so a surviving token would name a licence
+	// nothing can exercise.
+	if hasAction != mqttInflightActionState(r.State) {
+		if hasAction {
+			return mqttShapeErr("an action token outside pubrel_sending / pubrel_terminal_draining")
+		}
+		return mqttShapeErr("an active state carrying no action token")
+	}
 	return nil
 }
 
@@ -396,8 +487,11 @@ type mqttInflightSlotRef struct {
 	// claim/claimSeq are the custody observed with it.
 	claim    string
 	claimSeq uint64
-	// An actionToken belongs here — the licence to drain an active slot, empty for every
-	// other holder of a reference — and went with the action itself. See mqttInflightState.
+	// actionToken is the licence to drain an active slot: empty for every other holder of
+	// a reference, and the EXACT token for the holder that acquired it. A drain matches on
+	// it and on nothing else, which is what stops one broker retiring another's action
+	// after observing that one exists.
+	actionToken string
 }
 
 // slotOK reports whether this reference names an exchange at all.
@@ -425,9 +519,14 @@ func (s mqttInflightSlotRef) matchesRecord(cur *mqttInflightRecord) bool {
 type mqttInflightDisposition int
 
 const (
-	// mqttSlotDeleteComplete: the exchange is finished and its slot may go. Legal from
-	// PUBLISH, and from the terminal state once one exists.
+	// mqttSlotDeleteComplete: a PUBLISH-phase exchange is proven complete and its slot may
+	// go. Kept separate from terminal deletion so source-retirement settlement cannot
+	// bypass terminal's duplicate scan and affine-proof disposal.
 	mqttSlotDeleteComplete mqttInflightDisposition = iota
+	// mqttSlotDeleteTerminal: PUBCOMP was observed, every record-side obligation was
+	// discharged, and terminal cleanup may remove the owner slot. Legal only from terminal;
+	// finalizeTerminalSlot is its sole production caller.
+	mqttSlotDeleteTerminal
 	// mqttSlotDeleteNeverTransmitted: a cancellation whose delivery provably never went
 	// out. Legal only from PUBLISH.
 	mqttSlotDeleteNeverTransmitted
@@ -439,14 +538,35 @@ const (
 	// only from PUBLISH: past PUBREC the client is holding the identifier, so the claim
 	// would be false and would license freeing an identifier still in use.
 	mqttSlotMarkCancelled
+	// mqttSlotDrainAction: the action's own holder finishing it — sending -> ready after a
+	// returned write with no PUBCOMP, or terminal_draining -> terminal once the write
+	// returns. Legal ONLY from the two active states, and the caller must additionally
+	// match the exact token; the phase gate answers "may this class of thing happen here",
+	// not "is this token yours".
+	mqttSlotDrainAction
+	// mqttSlotAcquireAction: a current custodian moving a quiescent PUBREL exchange into
+	// an active send. Legal from publish or pubrel_ready, and the CAS additionally requires
+	// the exact custody tuple captured by admission. That closes the race between the
+	// admission check and a successor's custody transfer.
+	mqttSlotAcquireAction
+	// mqttSlotTransferCustody: a newly accepted session object taking custody. Legal only
+	// from a QUIESCENT state — publish or pubrel_ready — because custody transfer during a
+	// live action would hand the exchange to an object that cannot drain the action the
+	// old custodian still holds. In an active state the transfer is WITHHELD: the
+	// identifier stays reserved, that one exchange is non-actionable on the newcomer, and
+	// the rest of the session resumes.
+	mqttSlotTransferCustody
+	// mqttSlotReplacePublish: the store-conflict loop replacing a foreign write for the
+	// exact same source delivery with this allocation's nonce. Legal only while the slot
+	// is still in PUBLISH; replacing a past-PUBREC slot would erase its canonical identity
+	// and durable phase, reopening the payload under a fresh exchange.
+	mqttSlotReplacePublish
+	// mqttSlotAdvancePhase: the named phase arrows of the state machine. Every arrow is a
+	// CAS against the exact subject sequence, nonce, current state and custody/action
+	// fields; this disposition is what distinguishes an intended transition from a
+	// rewrite that happens to produce a legal shape.
+	mqttSlotAdvancePhase
 )
-
-// Three more dispositions belong to this set and went with the states they applied to:
-// mqttSlotDrainAction (the action's holder finishing it), mqttSlotTransferCustody (a newly
-// accepted session object taking custody, legal only from a quiescent state) and
-// mqttSlotAdvancePhase (the named phase arrows). Every one of them was legal only from a
-// state nothing produces, so each was a permission that could never be exercised. They
-// return with admission; docs/ROADMAP.md's F-092 bullet holds the rules they carried.
 
 // mqttInflightTransitionAllowed reports whether disposition d may be applied to a slot
 // currently in state st.
@@ -456,23 +576,55 @@ const (
 // when a register's life ended at PUBREC are exactly the ones that would otherwise vacate
 // a live slot once the slot outlives PUBREC.
 //
-// With one state, every arm below reduces to "the shape is supported". That is not a
-// no-op: an UNSUPPORTED shape authorises nothing, which is the clause that stops a record
-// from elsewhere licensing a delete, and it is the clause the mutations target. The
-// per-state arms come back with the states.
+// An UNSUPPORTED shape authorises nothing — the clause that stops a record from elsewhere
+// licensing a delete — and past that, each arm is a real per-state rule. The distinction
+// the gate turns on is PUBLISH versus past PUBREC. Retired is deliberately not folded into
+// this decision: it is a fact about the source, not a second encoding of the slot phase.
 func mqttInflightTransitionAllowed(d mqttInflightDisposition, st mqttInflightState) bool {
 	if !mqttInflightStateKnown(st) {
 		return false // an unsupported shape authorises nothing
 	}
 	switch d {
-	case mqttSlotDeleteNeverTransmitted, mqttSlotDeleteComplete, mqttSlotMarkCancelled:
-		// Each of these is legal only from PUBLISH. Past PUBREC the client is holding the
-		// identifier, so reaping or cancelling would free one it still owns — which is
-		// what these arms will refuse once a slot can be past PUBREC.
+	case mqttSlotDeleteNeverTransmitted, mqttSlotMarkCancelled, mqttSlotReplacePublish:
+		// "Never transmitted" is false past PUBREC by construction — the client answered
+		// under this identifier — so these are legal only from PUBLISH. This is the arm
+		// that stops every path written when a register's life ended at PUBREC from
+		// freeing an identifier the client still owns.
 		return st == mqttInflightPublish
+	case mqttSlotDeleteComplete:
+		// Source completion settles only the PUBLISH phase. In particular it may not delete
+		// a terminal slot: that would bypass the complete PUBREL scan and affine proof.
+		return st == mqttInflightPublish
+	case mqttSlotDeleteTerminal:
+		// The terminal arm is a permission, not the whole rule — finalizeTerminalSlot must
+		// ALSO prove the source non-reofferable, run the complete same-nonce duplicate scan,
+		// discharge affine proof and hold a freshness fence at the irreversible edge.
+		return st == mqttInflightPubRelTerminal
 	case mqttSlotMarkRetired:
 		// Any known state: the mark is about the SOURCE, and it is legitimately recorded
 		// while the slot is still in its PUBLISH shape (see the validator's note).
+		return true
+	case mqttSlotDrainAction:
+		// Only the two active states have an action to drain. The caller must match the
+		// EXACT token as well; this gate says only that draining is a thing that may
+		// happen here.
+		return mqttInflightActionState(st)
+	case mqttSlotAcquireAction:
+		// The exact custody comparison is enforced by casInflightSlot; this is its phase
+		// half. Ready is ordinary admission and publish is the direct race arrow.
+		return st == mqttInflightPublish || st == mqttInflightPubRelReady
+	case mqttSlotTransferCustody:
+		// Quiescent states only. In an active state the transfer is withheld rather than
+		// refused outright — the difference matters, because withholding keeps the
+		// identifier reserved and lets the rest of the session resume, where a refusal
+		// would either strand the exchange or hand it to an object that cannot drain the
+		// action the old custodian still holds.
+		return st == mqttInflightPublish || st == mqttInflightPubRelReady
+	case mqttSlotAdvancePhase:
+		// Every state is a legal ORIGIN for some arrow; which arrow is legal from which
+		// state is the CAS's business, since it alone knows the target. What this refuses
+		// is an advance from an unsupported shape, which mqttInflightStateKnown above
+		// already caught.
 		return true
 	}
 	return false

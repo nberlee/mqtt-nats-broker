@@ -421,11 +421,12 @@ func testDrainStorePubRelRecord(t *testing.T, sess *mqttSession) uint64 {
 		sseq    uint64
 		pi      uint16
 		attempt uint64
+		owner   string
 	)
 	for _, d := range sess.drainByDur {
 		for seq, st := range d.seqs {
 			if st.intent {
-				dur, sseq, pi, attempt = d.cc.Durable, seq, st.pi, st.attempt
+				dur, sseq, pi, attempt, owner = d.cc.Durable, seq, st.pi, st.attempt, st.ownerNonce
 			}
 		}
 	}
@@ -434,8 +435,12 @@ func testDrainStorePubRelRecord(t *testing.T, sess *mqttSession) uint64 {
 	if dur == _EMPTY_ {
 		t.Fatal("no intent-bearing drained sequence to write a PUBREL for")
 	}
+	// The record carries the exchange's REAL owner nonce, which the intent persisted and
+	// the owner slot holds — in production all three are the register's own regNonce, so a
+	// synthetic nonce that differs from the slot is contradictory and admission refuses it
+	// (Decision 5). This stands in for the record a real broker would have stored.
 	msgId := mqttPubRelMsgId(idHash, dur, sseq, attempt)
-	natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, sseq, msgId, _EMPTY_, _EMPTY_)
+	natsMsg, headerLen := mqttNewCorrelatedPubRel(pi, owner, dur, sseq, msgId, _EMPTY_, _EMPTY_)
 	resp, err := sess.jsa.storeMsg(subject, headerLen, natsMsg)
 	if err != nil {
 		t.Fatalf("storing the correlated PUBREL record: %v", err)
@@ -1130,4 +1135,51 @@ func testDrainOnlyDurable(t *testing.T, sess *mqttSession) string {
 		return dur
 	}
 	return _EMPTY_
+}
+
+// TestMQTTLivePubRecAdvancesOwnerSlotToPubRelReady discriminates the LIVE PUBREC handoff
+// (phaseSlotToPubRelReady), which converges to the same end state as the direct arrow and so
+// evaded the prior census test. PUBREL delivery is STALLED, so the direct arrow cannot fire;
+// only the synchronous PUBREC handoff can advance the owner slot. It must reach pubrel_ready
+// with the canonical tuple. A broken readback (e.g. a QoS mismatch in the shape check) leaves
+// the slot in publish and fails this test.
+func TestMQTTLivePubRecAdvancesOwnerSlotToPubRelReady(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer func() { testMQTTShutdownServer(s) }()
+
+	conn, sess, pi := testDrainSetup(t, s, o, "live-rephase", "live/topic", 2)
+	sess.mu.Lock()
+	idHash, gen := sess.idHash, sess.gen
+	sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+
+	// Stall PUBREL delivery so the direct `publish -> pubrel_sending` arrow cannot fire; the
+	// only path left to advance the slot is the synchronous live handoff in the PUBREC
+	// handler.
+	restoreDelay := setMQTTTestPubRelDeliveryDelay(func() { time.Sleep(5 * time.Second) })
+	defer restoreDelay()
+
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		cur, _, err := sess.asm.loadInflightRecord(subject)
+		if err != nil {
+			return err
+		}
+		if cur == nil {
+			return fmt.Errorf("the owner slot is gone")
+		}
+		if cur.State != mqttInflightPubRelReady {
+			return fmt.Errorf("the live PUBREC handoff did not advance the slot to pubrel_ready: %+v", cur)
+		}
+		if cur.PubRelStreamSeq == 0 || cur.PubRelDurable == _EMPTY_ {
+			return fmt.Errorf("the slot reached pubrel_ready without a canonical tuple: %+v", cur)
+		}
+		return nil
+	})
+	// The discriminator is the durable advance above. The exchange is left for teardown to
+	// clean up: completing it here would race the client read against the still-stalled
+	// PUBREL delivery, which is not what this test is about.
 }

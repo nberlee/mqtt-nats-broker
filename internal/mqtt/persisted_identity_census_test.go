@@ -228,13 +228,14 @@ var censusComposites = []censusComposite{
 	{
 		kind:    "arbitration relation",
 		typ:     "mqttInflightRecord",
-		members: []string{"Claim", "ClaimSeq"},
+		members: []string{"Claim", "ClaimSeq", "ActionClaim", "ActionClaimSeq"},
 		reason: "Claim identifies the session OBJECT and is minted in process, while ClaimSeq orders " +
 			"rival claims by a $MQTT_sess sequence. Either alone cannot arbitrate: the nonce says who " +
 			"but not which is newer, and the sequence says which is newer but not whose. " +
-			"ActionClaim/ActionClaimSeq were members of this same relation and were DELETED with the " +
-			"rest of the unproduced admission substrate; they return with it, as members of this " +
-			"relation rather than as a second one",
+			"ActionClaim/ActionClaimSeq are members of this SAME relation rather than a second one: " +
+			"they record which custody acquired the live action, and the shape validator requires " +
+			"them to equal Claim/ClaimSeq exactly, so an action that outlives a custody rewrite is " +
+			"refused as an illegal shape rather than silently arbitrated",
 	},
 	{
 		kind:    "origin interval",
@@ -274,6 +275,38 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Cancelled":  {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this allocation never having been transmitted; names nothing"},
 		"State": {kind: notAnIdentity, encoding: encJSON,
 			reason: "the exchange's PHASE, which says who may act on this slot rather than naming anything. Mandatory and never defaulted: an unknown state is refused, because reading it as PUBLISH would license a PUBLISH under an identifier already past PUBREC"},
+		"ActionToken": {kind: identityLocal, encoding: encJSON,
+			reason: "the live PUBREL action's licence, minted by the acquiring holder and never rewritten. " +
+				"Local because it names nothing outside this record: it is compared for EQUALITY by the " +
+				"holder draining it and by nobody else, which is what stops one broker retiring another's " +
+				"action after merely observing that one exists. There is deliberately no expiry — a lease " +
+				"cannot help, since a broker may pause after its own expiry check and resume into the same " +
+				"stale write, and an MQTT client cannot validate a fencing token"},
+		"ActionClaim": {kind: identityComposite, compos: "arbitration relation", encoding: encJSON,
+			reason: "the custody the action was acquired under; MUST equal Claim, so it is the same " +
+				"arbitration relation rather than a second one. A mismatch means one of the two was " +
+				"rewritten underneath the other"},
+		"ActionClaimSeq": {kind: identityComposite, compos: "arbitration relation", encoding: encJSON,
+			reason: "paired with ActionClaim and required to equal ClaimSeq. An ORDERING sequence, NOT an " +
+				"acceptance sequence: ClaimSeq is sess.seq snapshotted at store time and sess.seq is " +
+				"replaced by every confirmed save, so no comparison against a current or original " +
+				"acceptance can be made to work. Current ownership is proved at admission by Claim " +
+				"equality against the constructor-minted regClaim; recovery installs that claim only " +
+				"after the session acceptance/ordering decision succeeds"},
+		"PubRelDurable": {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON,
+			reason: "the PUBREL consumer durable that delivers the canonical record, on $MQTT_out. " +
+				"Dispositioned as a cross-stream reference rather than half a composite, following " +
+				"mqttQ2AffClaim.CopySubject/AffDurable: the F-066 row carries the pairing, and each " +
+				"field is independently a reference into another stream's naming space. It is also " +
+				"what makes a record from a retired generation recognisable as belonging to an " +
+				"exchange that is gone, since the next incarnation uses a different PUBREL subject"},
+		"PubRelStreamSeq": {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON,
+			reason: "an absolute $MQTT_out sequence naming the CANONICAL PUBREL record, so recreating " +
+				"that stream strands it — the same hazard class as mqttPersistedDrainSeq.RegSeq. It is " +
+				"taken from the stored message or an exact readback and NEVER from Nats-Msg-Id, a drain " +
+				"attempt counter or the source sequence. Under F-034 it may not by itself select or " +
+				"authorize a destructive operation: the slot subject and the exchange nonce do that, and " +
+				"this pair identifies WHICH record the exchange is about"},
 	}
 
 	m["mqttPersistedDrainSeq"] = map[string]censusDisposition{
@@ -1191,6 +1224,10 @@ var censusF066Sample = []censusOracleRow{
 		reason: "the affine copy carries no JSON body of ours — its identities are entirely in the subject, the Nmqtt-Q2Claim header and the deduplication id, so this row is the headers-and-subjects family rather than any body type",
 	},
 	{
+		holder: mqttInflightStreamName, what: "body PubRelDurable + PubRelStreamSeq", issuer: mqttOutStreamName,
+		satisfiedBy: []string{"mqttInflightRecord.PubRelDurable", "mqttInflightRecord.PubRelStreamSeq"},
+	},
+	{
 		holder: mqttOutStreamName, what: "stored PUBREL: headers Nmqtt-Q2SrcDur/Nmqtt-Q2SrcSeq; Nats-Msg-Id", issuer: mqttStreamName,
 		family: "message headers",
 		reason: "pubrel_correlation.go stores the correlation as headers, deliberately, and the attempt counter in the Nats-Msg-Id exists because a dedup entry outlives its message — so the whole row is the header family",
@@ -1237,19 +1274,19 @@ func TestPersistedIdentityCensusRediscoversF066Sample(t *testing.T) {
 	t.Parallel()
 	manifest := censusManifest()
 
-	// BACK TO 14. The durable QoS 2 owner slot briefly added a fifteenth row —
-	// `$MQTT_inflight` body PubRelDurable/PubRelStreamSeq, issued by `$MQTT_out` — and it
-	// was a genuinely new coupling: the pre-existing Dur/Seq row couples this record to a
-	// SOURCE DELIVERY, where that named one specific PUBREL RECORD's sequence in a specific
+	// FIFTEEN, and the fifteenth is the one this file predicted. The durable QoS 2 owner
+	// slot couples `$MQTT_inflight` body PubRelDurable/PubRelStreamSeq to `$MQTT_out`, and
+	// it is a genuinely NEW coupling: the pre-existing Dur/Seq row couples this record to a
+	// SOURCE DELIVERY, where this names one specific PUBREL RECORD's sequence in a specific
 	// consumer's space, and recreating $MQTT_out resets that space.
 	//
-	// The two fields were then deleted, because nothing produced them, so the coupling
-	// does not exist on this tree and a row asserting it would be a claim about state no
-	// record carries. It comes back with them. ActionClaim/ActionClaimSeq never had a row
-	// of their own and still do not: they were members of the arbitration relation the
-	// ClaimSeq row carries, not a second coupling to $MQTT_sess.
-	if len(censusF066Sample) != 14 {
-		t.Fatalf("the oracle carries %d rows; F-066's sample has 14. A row was dropped or added "+
+	// The two fields were deleted once, when nothing produced them, and the row went with
+	// them because a row asserting a coupling no record carries is a claim about nothing.
+	// They are back, with the admission half that writes them, so the row is back too.
+	// ActionClaim/ActionClaimSeq still have no row of their own: they are members of the
+	// arbitration relation the ClaimSeq row carries, not a second coupling to $MQTT_sess.
+	if len(censusF066Sample) != 15 {
+		t.Fatalf("the oracle carries %d rows; F-066's sample has 15. A row was dropped or added "+
 			"without re-reading the dossier", len(censusF066Sample))
 	}
 

@@ -42,27 +42,21 @@
 //	R1 is also the takeover fence. An identifier the client can be holding implies
 //	a completed send, which implies a confirmed register, which implies the next
 //	broker's scan sees it. A superseded broker's late register write therefore
-//	concerns an identifier that never reached the client; it is inert, and the
-//	duplicate-(Dur,Seq) rule in the recovery scan reaps it.
+//	concerns an identifier that never reached the client; it is inert. If recovery
+//	cannot distinguish it from a second transmitted claimant for one source, the
+//	duplicate-(Dur,Seq) rule reserves both and fails closed rather than guessing.
 //
-// R2 ONE DURABLE AUTHORITY PER PHASE, WITH A PROVEN HANDOFF. The PUBLISH phase is
-// owned by the register; past PUBREC the correlated PUBREL record on $MQTT_out owns
-// the identifier (pubrel_correlation.go), and mqttDeliverPubRelCb already re-sends
-// under it. The handoff is the PUBREL store, and on that path the source ack is
-// CONFIRMED (jsa.confirmAck) before the register is deleted, because that is the
-// codebase's standing rule wherever a durable record is deleted on the strength of an
-// ack. What it buys here is precise and worth stating exactly: it keeps the register
-// from being deleted over a source that was never actually released, which would cost
-// the redelivery its ORIGINAL identifier. It does not, by itself, prevent a duplicate
-// — a source ack that never lands means JetStream redelivers whatever we do, which was
-// true before this file existed. QoS 1 keeps the fire-and-forget ack: there the worst
-// case is one duplicate after PUBACK, which QoS 1 permits.
-// Where a register and a PUBREL record name the same source, the PUBREL record wins.
-//
-//	What actually stops a COMPLETED exchange being resurrected is R5's proof, not
-//	this ordering: recovery classifies the source and drops a register whose delivery
-//	is provably finished. The two are complementary, and only the second one is load-
-//	bearing for correctness.
+// R2 ONE DURABLE AUTHORITY FOR THE WHOLE EXCHANGE. The slot owns the identifier from
+// PUBLISH until terminal cleanup. PUBREC re-phases that same slot to pubrel_ready only
+// after an exact read proves the correlated PUBREL record exists; the record is evidence
+// and payload, not a second identifier claimant. Admission then CAS-acquires an action on
+// the slot before any slot-backed PUBREL write, and PUBCOMP advances it to terminal before
+// disposal. (A live retained exchange has no register and so no slot, R6; it is outside R2
+// and is authorized instead by the live in-memory owner identity of its incarnation.)
+// Recovery completes a publish-state handoff only from a PRESENT record matching the
+// slot's PI, nonce, source and affine identity. Source-only correlation proves no exchange
+// and is quarantined. A complete source does not finish an exchange whose PUBREL still
+// exists—the client may still owe PUBCOMP.
 //
 // R3 RESERVE BEFORE INTEREST. On resume every identifier named by a register or by a
 // PUBREL record is reserved in the pending maps BEFORE any source interest exists.
@@ -81,8 +75,8 @@
 //	scan failure, and it contradicts the drain barrier's contract, which withholds a
 //	durable's interest rather than the connection (recoverDrainPubRels).
 //
-//	THREE conditions set it, and they are all the same condition wearing different
-//	clothes: the identifier space cannot be fully accounted for.
+//	The conditions that set it are all the same condition wearing different clothes:
+//	the identifier space cannot be fully accounted for. They include:
 //
 //	 1. A scan that could not complete — identifiers may be in use that we never saw.
 //	 2. A register whose body is UNREADABLE — we see the identifier (its subject names
@@ -91,6 +85,8 @@
 //	 3. TWO registers naming ONE source on different identifiers — we see both
 //	    identifiers but cannot say which one the client holds, because a stream
 //	    sequence orders the writes and not the sends.
+//	 4. A PUBREL and PUBLISH slot that name one source but not one whole exchange, or
+//	    an exact handoff whose phase CAS cannot be proved.
 //
 //	In each case reserving identifiers is necessary but NOT sufficient: what remains
 //	dangerous is issuing a new one, or re-sending a source under a guess. Only
@@ -103,11 +99,12 @@
 // a nonce match proves a record is ours. Same rule, same reason, as scope rule 2 of
 // qos2_release_claim.go.
 //
-// R5 NO SILENT SURVIVORS. Every terminal path that releases an identifier — PUBACK,
-// a failed PUBREC, the PUBREL store, Message Expiry, Maximum Packet Size — also
-// deletes the register. A failed delete costs a stale record that the store path's
-// reconcile, the next resume scan, or the orphan sweep removes; it never wedges an
-// identifier and never duplicates a message.
+// R5 NO SILENT SURVIVORS. Every terminal path that releases an identifier also settles
+// its slot: PUBACK, a failed PUBREC, Message Expiry and Maximum Packet Size delete a
+// PUBLISH slot; PUBCOMP moves a QoS 2 slot to terminal, disposes every matching PUBREL
+// record, then exact-deletes it. A failed or uncertain terminal delete keeps an in-memory
+// reservation and retries—it may delay reuse, but it never silently frees an identifier
+// whose durable owner may survive.
 //
 // R6 REGISTERED IFF TRANSMITTED. A delivery withheld by the in-flight cap was never
 // sent, so it is never registered (trackPublish returns before allocating). A
@@ -117,8 +114,9 @@
 // # Cost
 //
 // One create-only CAS round trip per FIRST transmission of every outbound QoS 1/2
-// message, plus one delete per completion, plus (QoS 2 only) turning the source ack
-// into a confirmed round trip. Redeliveries and recovered deliveries pay nothing.
+// message, plus one delete per completion, plus (QoS 2 only) the phase/action CASes and
+// a confirmed source ack. Recovery custody refresh and a route-B handoff also rewrite
+// selected QoS 2 slots; ordinary redelivery does not create a second register.
 // Batching was rejected: it would delay first transmissions behind a batch, and the
 // obvious alternative — register after sending — is not a cheaper version of this
 // design but a reintroduction of the deviation as a narrower window.
@@ -196,14 +194,12 @@ const (
 // on it. A record carrying a Q2AffClaim without a valid Q2AffCopy is REFUSED rather than
 // interpreted — there are no releases, so that shape does not exist (F-065, and the
 // compatibility boundary in docs/ARCHITECTURE.md).
-// Retired marks the one state a register can reach that is NOT a PUBLISH-phase
-// delivery: the exchange is past PUBREC and its source's acknowledgement could not be
-// proven, so the payload must never be sent again but the source may still be re-offered
-// and must be acknowledged away. Without it that state is indistinguishable from a
-// genuine PUBLISH-phase register — same subject, same source, same live source message —
-// so a restart would read it as "still owed" and re-send a payload the client has
-// already completed. It is the durable half of the in-memory retirement; see
-// retireSourceLocked and mqttSession.srcAckOwed.
+// Retired is the durable half of an in-memory SOURCE retirement: the client answered
+// PUBREC, but acknowledgement of the source could not be proven, so a re-offer must be
+// acknowledged away rather than transmitted again. It is not a slot phase. In particular,
+// a crash can leave State at publish even though Retired landed; only a present exact
+// PUBREL lets recovery advance that slot to pubrel_ready. See retireSourceLocked and
+// mqttSession.srcAckOwed.
 type mqttInflightRecord struct {
 	PI    uint16 `json:"pi"`
 	Dur   string `json:"dur"`
@@ -234,30 +230,54 @@ type mqttInflightRecord struct {
 	// the identifier and removes the record.
 	Cancelled bool `json:"cancelled,omitempty"`
 
-	// State is the exchange's phase, and it is MANDATORY. In the design this is the
-	// substrate for, one record owns the identifier for the exchange's whole life rather
-	// than only its PUBLISH phase, and the phase is what says who may act; on this tree
-	// only `publish` is ever written, because the PUBREC handoff still deletes the record.
-	// The field is mandatory either way: an absent or unknown state is an unsupported
+	// State is the exchange's phase, and it is MANDATORY. One record owns the identifier
+	// for the exchange's whole life rather than only its PUBLISH phase, and the phase says
+	// who may act. An absent or unknown state is an unsupported
 	// persisted shape and is REFUSED — never read as PUBLISH, which would license a
 	// PUBLISH under an identifier already past PUBREC. See inflight_slot_state.go.
 	State mqttInflightState `json:"state"`
 
-	// FIVE MORE FIELDS belong to this record and are deliberately absent: ActionToken,
-	// ActionClaim and ActionClaimSeq (the durable half of the PUBREL action exclusion) and
-	// PubRelDurable/PubRelStreamSeq (the canonical PUBREL record's identity). They were
-	// built, validated as all-or-nothing pairs, and DELETED before this landed.
+	// ActionToken is the live PUBREL action's licence: the durable half of the exclusion
+	// that lets one broker transmit a PUBREL while every other writer refuses.
 	//
-	// Nothing produced them. The only state written is `publish`, and the validator forbade
-	// all five in it — so their entire function was to recognise and refuse their own
-	// hypothetical semantics. That is an INCOMPLETE closed schema: five guessed names
-	// refused while a sixth plausible control field would have been silently ignored by
-	// encoding/json. The closed schema is now the decoder's job
-	// (mqttDecodeInflightRecord refuses ANY unrecognised field), which is strictly
-	// stronger, and the five names come back with the admission half that writes them —
-	// atomically, with their producers, their states and their validation. Pre-alpha there
-	// is no record population carrying them, so nothing is owed to one. See
-	// docs/ROADMAP.md's F-092 bullet for the rules they carried.
+	// A successful CAS installing it establishes an invariant that REMAINS TRUE THROUGH
+	// the action, which is what a re-read cannot do — see inflight_slot_state.go's
+	// "Why a re-read is not a fence". Valid ONLY in the two active states, and the
+	// validator refuses it anywhere else.
+	//
+	// There is no TTL, no expiry and no steal. An abandoned action holds its identifier
+	// until its own holder drains it, the generation is discarded, or an operator
+	// intervenes: a lease would not make this correct, because a broker can pause after
+	// its own expiry check and resume into the same stale write, and an MQTT client
+	// cannot validate a fencing token so the external effect is not fenceable
+	// downstream. That cost is stated in docs/CONFORMANCE.md rather than disguised.
+	ActionToken string `json:"action,omitempty"`
+	// ActionClaim and ActionClaimSeq are the custodian that acquired the action. They
+	// MUST equal Claim/ClaimSeq: an action belongs to the custody that took it, and a
+	// mismatch means one of the two was rewritten underneath the other.
+	//
+	// ActionClaimSeq is an ORDERING sequence, exactly as ClaimSeq is, and NOT an
+	// acceptance sequence. Defining it as one is unimplementable: ClaimSeq is sess.seq
+	// snapshotted at store time and sess.seq is replaced by every confirmed save, so
+	// comparing it to the current sequence invalidates refreshed slots while comparing
+	// it to the original acceptance rejects newly allocated ones. Current ownership is
+	// proved separately, by Claim equality against the session object's constructor-minted
+	// regClaim plus a live $MQTT_sess acceptance read.
+	ActionClaim    string `json:"actclaim,omitempty"`
+	ActionClaimSeq uint64 `json:"actclaimseq,omitempty"`
+	// PubRelDurable and PubRelStreamSeq name the CANONICAL PUBREL record: the consumer
+	// durable and the exact $MQTT_out sequence.
+	//
+	// Decided ONCE — on the live path from the confirmed store readback, and in recovery
+	// from the lowest matching sequence over a COMPLETE candidate scan — and never
+	// replaced merely because another record was delivered first. The sequence comes from
+	// the actual message or an exact readback, never from Nats-Msg-Id, a drain attempt
+	// counter or the source sequence.
+	//
+	// Mandatory in every past-PUBREC state and forbidden in `publish`, where no record
+	// exists yet.
+	PubRelDurable   string `json:"preldur,omitempty"`
+	PubRelStreamSeq uint64 `json:"prelseq,omitempty"`
 }
 
 // mqttRecoveredInflightReg is one readable register and the exact stream sequence
@@ -509,7 +529,8 @@ func (as *mqttAccountSessionManager) enumerateInflightSubjectsBounded(filter str
 }
 
 // loadInflightRecordsMulti is the batched register read, honoring an instance-scoped
-// test seam. Used by the teardown reap; the resume walk has its own batching.
+// test seam. Both teardown and resume batch through this boundary; sharing the transport
+// does not share their disposition rules.
 func (as *mqttAccountSessionManager) loadInflightRecordsMulti(subjects []string) ([]*JSApiMsgGetResponse, error) {
 	as.mu.RLock()
 	hook := as.testInflightLoadMulti
@@ -546,7 +567,7 @@ type mqttSlotMutate func(cur *mqttInflightRecord)
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) casInflightSlot(c *client, ref mqttInflightSlotRef,
-	d mqttInflightDisposition, mut mqttSlotMutate) (uint64, bool) {
+	from mqttInflightState, d mqttInflightDisposition, mut mqttSlotMutate) (uint64, bool) {
 
 	as := sess.asm
 	if as == nil || !ref.slotOK() || ref.name.subject == _EMPTY_ || mut == nil {
@@ -579,6 +600,46 @@ func (sess *mqttSession) casInflightSlot(c *client, ref mqttInflightSlotRef,
 		if !mqttInflightTransitionAllowed(d, cur.State) {
 			// The phase gate. This is what stops every path written when a register's life
 			// ended at PUBREC from vacating a slot that is now mid-exchange.
+			return 0, false
+		}
+		switch d {
+		case mqttSlotAcquireAction:
+			// Admission checked current custody before entering this CAS, but a successor
+			// can transfer the quiescent slot between that check and this load. Following
+			// the rewrite would bind a stale broker's new action to the successor's claim.
+			if ref.claim == _EMPTY_ || cur.Claim != ref.claim || cur.ClaimSeq != ref.claimSeq {
+				return 0, false
+			}
+		case mqttSlotTransferCustody:
+			// The transfer must observe the EXACT custody it means to replace, so a
+			// mid-session successor reconcile (Decision 7) and a concurrent rival cannot
+			// both win: whichever CAS lands first moves ClaimSeq, and the other sees a
+			// mismatch and loses. Recovery's own transfer passes a reference built from the
+			// slot it just read, so its predicate is trivially satisfied unless the slot
+			// moved under it — exactly when it SHOULD lose.
+			if ref.claim == _EMPTY_ || cur.Claim != ref.claim || cur.ClaimSeq != ref.claimSeq {
+				return 0, false
+			}
+		case mqttSlotDrainAction:
+			// Only the holder of this exact non-revocable token may mutate an active slot.
+			// A check inside the mutator is too late: a no-op still rewrites the record and
+			// moves its freshness sequence under the real holder.
+			if ref.actionToken == _EMPTY_ || cur.ActionToken != ref.actionToken {
+				return 0, false
+			}
+		}
+		if from != _EMPTY_ && cur.State != mqttInflightState(from) {
+			// AN EXACT PREDECESSOR, which every named phase arrow needs and which
+			// ref.matchesRecord deliberately does not supply: a reference is often taken
+			// in one state and acted on in another, so identity is compared there and the
+			// permitted transition is asked of the gate. But `ready -> sending` must
+			// observe `ready` — not merely "a state from which advancing is allowed" — or
+			// a slot another broker already moved would be advanced a second time.
+			//
+			// Checked against the record THIS load returned, never the reference's
+			// remembered state, so a slot that moved between observation and write loses
+			// the CAS rather than being overwritten. An empty `from` opts out, for the
+			// state-agnostic marks whose legality is entirely the gate's business.
 			return 0, false
 		}
 		next := *cur
@@ -652,9 +713,9 @@ func (as *mqttAccountSessionManager) loadInflightRecord(subject string) (*mqttIn
 // that the store path's reconcile, the next resume scan or the orphan sweep removes,
 // and never wedges an identifier.
 //
-// Zero is a no-op, which is what makes every terminal path able to call this
-// unconditionally on whatever entry it removed — a retained send and a delivery
-// recovered from a PUBREL record both carry no register.
+// Zero is a no-op, which lets pre-store cancellation and retained sends call this
+// unconditionally. Slot-backed exchanges recovered from PUBREL records are different:
+// their whole-life owner slot is finalized through the gated terminal path.
 func (as *mqttAccountSessionManager) deleteInflightRegister(seq uint64) {
 	if seq == 0 {
 		return
@@ -869,6 +930,13 @@ func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client
 		}
 		return mqttInflightAlreadyGone
 	}
+	if mqttInflightPastPubRec(cur.State) || cur.Retired {
+		// PAST PUBREC: not this path's to release, and NOT undecided — see the identical
+		// arm on the rewritten edge below for why reporting UNDECIDED stalls the drain.
+		// Retired is the same source-side proof in the crash cut where State is still
+		// PUBLISH; it is not itself a phase transition.
+		return mqttInflightReleased
+	}
 	if !mqttSlotAdmitsDisposition(cur, mqttSlotRefFromRecord(subject, smsg.Sequence, cur),
 		mqttSlotDeleteComplete) {
 		// The phase gate, on the record this function has ALREADY loaded and matched.
@@ -922,6 +990,22 @@ func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client
 		// Still our delivery, at a new sequence: a rewrite. Delete that one too, through
 		// the same property — the rewrite carries the exchange's nonce as much as the
 		// first record did.
+		if mqttInflightPastPubRec(cur.State) || cur.Retired {
+			// PAST PUBREC: not this path's to release, and NOT undecided.
+			//
+			// F-092's slot owns the exchange for its whole life, so once it is past PUBREC
+			// the identifier is released by PUBCOMP's terminal path and by nothing else.
+			// This drain's obligation — never leave a register naming a live delivery
+			// unreleased — is discharged by the slot having moved on to an owner that will
+			// release it. Reporting UNDECIDED instead makes the caller withhold the
+			// drain's completion, which stalls it for the life of the session.
+			//
+			// A pre-check at the caller cannot substitute: the slot can be advanced by the
+			// PUBREC handler between that check and this reread, which is exactly the
+			// interleaving a fixture found. Retired supplies the same source-side proof in
+			// a crash cut that has not yet been re-phased by route B.
+			return mqttInflightReleased
+		}
 		if !mqttSlotAdmitsDisposition(cur, mqttSlotRefFromRecord(subject, smsg.Sequence, cur),
 			mqttSlotDeleteComplete) {
 			mqttWarnf(c, "MQTT: leaving the rewritten in-flight slot on %q at sequence %d alone: "+
@@ -1505,6 +1589,14 @@ func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, nonce string, 
 	// the source completes. F-034 mutation-tested the opposite behaviour as M26, and
 	// TestMQTTInflightClaimTerminalRaceHealsPhantomEntry is the fixture that catches it.
 	if ref.seq != 0 && smsg.Sequence != ref.seq {
+		if d == mqttSlotDeleteNeverTransmitted {
+			// A cancellation must prove that THIS allocation is gone before its
+			// reservation is released. A same-identity rewrite is not that proof; the
+			// caller falls back to tombstoning the live sequence instead. Terminal and
+			// already-complete continuations may treat a rewrite as another owner taking
+			// responsibility, which is why their existing success result remains.
+			return false
+		}
 		return true // moved on: preserved, and the caller's progress is not blocked
 	}
 	return sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, mustConfirm)
@@ -1950,12 +2042,9 @@ func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
 // path.
 //
 // Session lock NOT held on entry: this issues a JetStream request.
-// The slot reference is built from the entry, so this carries the phase gate. What the gate
-// is FOR is the design's rule that past PUBREC the exchange's slot is its only durable
-// claimant, so deleting it here would free an identifier the client still holds. That rule
-// is not yet in force: the PUBREC handoff still deletes the register at exactly this point
-// (R2/R5 unchanged), and the gate is the substrate that makes the change safe to land, not
-// a claim that it already has.
+// The slot reference is built from the entry, so this carries the phase gate. Past PUBREC
+// the exchange's slot is its only durable claimant, and deleting it here would free an
+// identifier the client still holds; only PUBCOMP's terminal path releases it.
 func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInflightDisposition) {
 	if ack == nil || ack.regSeq == 0 || ack.regForeign || sess.asm == nil {
 		return
@@ -2103,12 +2192,13 @@ func (sess *mqttSession) markInflightRegisterRetired(c *client, pi uint16, dur s
 	// PUBREL phase with NO canonical record identity — a shape the validator refuses, so
 	// the mark appeared to land and then read back as unreadable.
 	//
-	// A refusal here is not a failure to handle: the phase gate refuses the mark on a
-	// PUBLISH slot, because "retired" asserts the client answered PUBREC and on a PUBLISH
-	// slot that is false. The caller's contract already covers it — a false return keeps
-	// the exchange's PUBREL, which is the durable evidence the source is past PUBREC, so
-	// nothing is lost and the next pass retries.
-	seq, ok := sess.casInflightSlot(c, ref, mqttSlotMarkRetired, func(next *mqttInflightRecord) {
+	// A refusal here is not a failure to handle: the caller's contract keeps the exchange's
+	// PUBREL, which is durable evidence that the source is past PUBREC, so nothing is lost
+	// and the next pass retries. The phase gate itself permits this source fact from every
+	// supported state; identity, shape or CAS movement can still refuse the rewrite.
+	// No expected predecessor: the retirement mark is legal from any known state, because
+	// it records a fact about the SOURCE rather than the slot's phase.
+	seq, ok := sess.casInflightSlot(c, ref, _EMPTY_, mqttSlotMarkRetired, func(next *mqttInflightRecord) {
 		next.Retired = true
 	})
 	if !ok {
@@ -2179,14 +2269,14 @@ func (sess *mqttSession) resolveRetiredSource(c *client, key mqttDeferredKey) bo
 	return true
 }
 
-// markInflightRegisterCancelled rewrites a register as CANCELLED, in place, by a CAS at
-// its exact sequence.
+// markInflightRegisterCancelled rewrites a PUBLISH-phase register as CANCELLED in place.
 //
-// Same shape and same reasoning as the retirement mark: same nonce so it stays the same
-// record, exact sequence so a register a peer has replaced is left alone (R4), bounded and
-// reconciled rather than attempted once. What differs is what it proves — not "past
-// PUBREC" but "never transmitted", which is the one fact that lets a later resume free the
-// identifier instead of holding it.
+// Cancellation is the one fact that lets a later resume free the identifier, so a cached
+// sequence is never sufficient authority for the write. Each attempt first loads the
+// subject, proves that its readable occupant is this exact exchange and that it is still in
+// PUBLISH, carries the whole record forward, and CASes at the sequence that load returned.
+// A record that crossed PUBREC between teardown and this call is therefore preserved even
+// when a stale pendingPublish entry still remembers its old sequence.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string) error {
@@ -2195,29 +2285,22 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		return fmt.Errorf("no register identity to mark cancelled")
 	}
 	sess.mu.Lock()
-	idHash, gen, regClaim, regClaimSeq := sess.idHash, sess.gen, sess.regClaim, sess.seq
+	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
 	if idHash == _EMPTY_ || gen == _EMPTY_ {
 		return fmt.Errorf("session has no incarnation identity")
 	}
 	subject := mqttInflightSubject(idHash, gen, pi)
-	// State is MANDATORY, and a tombstone is a PUBLISH-phase record by construction: it
-	// records an allocation that was NEVER TRANSMITTED. Omitting it emitted exactly the
-	// marker-less shape the compatibility rule forbids — the broker would have been the
-	// source of the unsupported records it refuses. ClaimSeq travels with Claim so the pair
-	// is coherent rather than half-written.
-	rec := &mqttInflightRecord{
-		PI: pi, Dur: jsDur, Seq: sseq, QoS: 1, State: mqttInflightPublish,
-		Nonce: nonce, Claim: regClaim, ClaimSeq: regClaimSeq, Cancelled: true,
+	nm, err := mqttParseInflightSubject(subject)
+	if err != nil {
+		return fmt.Errorf("invalid in-flight register subject %q: %w", subject, err)
+	}
+	ref := mqttInflightSlotRef{
+		name: *nm, seq: regSeq, nonce: nonce, state: mqttInflightPublish,
+		dur: jsDur, sseq: sseq,
 	}
 	var lastErr error
-	expectSeq := regSeq
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-		if _, err := as.storeInflightCAS(subject, expectSeq, rec); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
 		cur, smsg, lerr := as.loadInflightRecord(subject)
 		if lerr != nil {
 			lastErr = lerr
@@ -2254,28 +2337,33 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 			// recording the nonce verdict on the session record, which is the same fact
 			// this write was for, on a rung this subject cannot corrupt.
 			return fmt.Errorf("packet identifier %d is held by a record naming another identifier on %q", pi, subject)
-		case cur != nil && cur.Nonce == nonce && !sess.ownsSharedInflightRegister(jsDur, cur.Claim):
+		case cur.Nonce == nonce && !sess.ownsSharedInflightRegister(jsDur, cur.Claim):
 			sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject)
 			return nil
-		case cur != nil && cur.Nonce == nonce && cur.Cancelled:
-			return nil // ours, already marked
-		case cur != nil && cur.Nonce == nonce:
-			// REBUILD from the reread and set only Cancelled (F-087 WP1). The sparse
-			// body above is the first-CAS proposal and stays sound there — the CAS at
-			// our own cached sequence IS the proof that nothing intervened — but
-			// re-proposing it after a reread would erase a Retired the retirement writer
-			// just proved, along with Claim/ClaimSeq the contest owns.
-			rebuilt := *cur
-			rebuilt.Cancelled = true
-			rec = &rebuilt
-			expectSeq = smsg.Sequence
-		default:
-			// A FOREIGN record holds the subject: readable, and naming another exchange.
-			// Our register is gone, and this arm is reached only for that case — the
-			// UNREADABLE outcome is answered above, because "our register is gone" is a
-			// positive conclusion and a failed read licenses none.
+		case !ref.matchesRecord(cur):
+			// A readable foreign exchange now holds this identifier. The remembered
+			// register is gone, and the current occupant must be preserved.
 			return nil
+		case cur.Cancelled:
+			return nil // ours, already marked
+		case !mqttInflightTransitionAllowed(mqttSlotMarkCancelled, cur.State):
+			// The exchange crossed PUBREC. "Never transmitted" is now false, so retain
+			// the whole-life owner and make the caller persist its weaker nonce verdict.
+			return fmt.Errorf("in-flight register %q is in state %q and cannot be marked never-transmitted", subject, cur.State)
 		}
+
+		// Carry every field the current owner wrote and mutate only this writer's fact.
+		// In particular, Retired and custody survive a concurrent source settlement.
+		next := *cur
+		next.Cancelled = true
+		if _, serr := as.storeInflightCAS(subject, smsg.Sequence, &next); serr == nil {
+			return nil
+		} else {
+			lastErr = serr
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("could not mark in-flight register %q cancelled", subject)
 	}
 	return lastErr
 }
@@ -2283,10 +2371,9 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 // secureRetiredSource makes a retirement durable, and reports whether it now is.
 //
 // Called both where the retirement is created and again at PUBCOMP, because PUBCOMP is
-// about to destroy the other evidence: while the exchange's PUBREL record exists a
-// restart is safe regardless (recovery reads register-plus-PUBREL as "past PUBREC"), and
-// acknowledging that PUBREL away removes it. A retirement that is not durable by then
-// must therefore keep its PUBREL.
+// about to destroy the other evidence. While the whole-life slot is durably past PUBREC,
+// recovery can infer source suppression from its phase; once terminal cleanup removes
+// that slot and its PUBREL records, an unresolved retirement needs its own durable mark.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) secureRetiredSource(c *client, key mqttDeferredKey) bool {
@@ -2339,11 +2426,6 @@ type mqttVoidedReg struct {
 	pi    uint16
 	dur   string
 	sseq  uint64
-	// retired marks a register that is a QoS 2 retirement rather than a PUBLISH-phase
-	// claim. Its cleanup is delete-or-leave: a Cancelled tombstone would overwrite the
-	// suppression it carries, and recovery would then drop it without reinstating the
-	// retirement — resurrecting a completed payload if the source is still re-offerable.
-	retired bool
 }
 
 // deleteInflightRegisters removes a teardown's registers at their exact sequences, walking
@@ -2403,21 +2485,27 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 	if len(voided) == 0 || sess.asm == nil {
 		return false
 	}
+	sess.mu.Lock()
+	idHash, gen := sess.idHash, sess.gen
+	sess.mu.Unlock()
 	unproven := false
 	for _, v := range voided {
-		if err := sess.asm.deleteInflightRegisterConfirmed(v.seq); err == nil {
-			sess.forgetCancelledReg(v.nonce)
-			continue
+		// The first rung is phase-gated too. A recovered PUBLISH entry can coexist with
+		// a slot that already crossed PUBREC until F-093's ordered handoff runs; deleting
+		// its remembered sequence directly would erase the whole-life owner underneath a
+		// live PUBREL action. The reference carries the teardown's exact exchange identity,
+		// and the helper reloads the subject before deciding whether PUBLISH completion is
+		// still a permitted disposition.
+		var slot *mqttInflightSlotRef
+		if idHash != _EMPTY_ && gen != _EMPTY_ && v.pi != 0 {
+			if nm, perr := mqttParseInflightSubject(mqttInflightSubject(idHash, gen, v.pi)); perr == nil {
+				slot = &mqttInflightSlotRef{
+					name: *nm, seq: v.seq, nonce: v.nonce, state: mqttInflightPublish,
+					dur: v.dur, sseq: v.sseq,
+				}
+			}
 		}
-		if v.retired {
-			// Delete-or-leave, never tombstone and never a verdict: this register IS the
-			// durable suppression of a completed exchange, and both alternatives would
-			// have recovery drop it without reinstating the retirement — resurrecting the
-			// payload if the source is still re-offerable. Left in place, recovery
-			// re-reads it as a retirement; the residue when the consumer is also gone is
-			// a parked retirement, which reserves no identifier and no Receive Maximum
-			// slot.
-			mqttWarnf(c, "MQTT: leaving the retired-source register at sequence %d for client %q to a later scan", v.seq, sess.id)
+		if sess.reapRegisterWithVerdictGated(v.seq, v.nonce, true, slot, mqttSlotDeleteNeverTransmitted) {
 			continue
 		}
 		if v.nonce != _EMPTY_ && v.pi != 0 {
@@ -2476,18 +2564,13 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCancellation, []string) {
 	var out []mqttRegCancellation
 	var transmitted []string
-	// RETIRED QoS 2 sources (srcAckOwed) are deliberately NOT voided here, although the
-	// teardown will delete their registers too. A retirement's register is not a claim on
-	// an identifier — it is the durable SUPPRESSION of a completed-but-unproven exchange —
-	// and a void verdict would have recovery drop it without reinstating that suppression.
-	// A crash between this packet's save and the consumer delete then leaves the source
-	// live and re-offerable, and the completed payload goes out again: a QoS 2 duplicate,
-	// which is the worse trade. Left unvoided, the failure residue is instead a register
-	// recovery re-reads as a retirement (reinstated, still suppressing) — at worst a
-	// permanently parked retirement when the consumer is also gone, which is bounded stale
-	// metadata, not a wedged identifier: a retirement reserves no packet identifier and
-	// consumes no Receive Maximum slot. deleteInflightRegisters skips the tombstone rung
-	// for these for the same reason.
+	// RETIRED QoS 2 sources (srcAckOwed) are deliberately NOT voided here. Retired proves
+	// the source crossed PUBREC, so a void verdict would falsely say the delivery was never
+	// transmitted and license identifier reuse. purgeConsumerPendingLocked removes the
+	// source-side suppression when this consumer goes, but deliberately leaves the slot for
+	// phase-aware recovery or terminal cleanup. A crash before the consumer delete is safe
+	// in the other direction too: recovery sees the surviving Retired fact, suppresses the
+	// payload, and never re-sends it.
 	seqPis := sess.cpending[durable]
 	for sseq, pi := range seqPis {
 		ack := sess.pendingPublish[pi]
@@ -2720,12 +2803,12 @@ type mqttRegCancellation struct {
 // the registers naming them: a register left behind would have the next resume
 // reserve an identifier for a delivery whose consumer no longer exists.
 //
-// It also releases this durable's RETIRED sources, which are not in cpending at all: a
-// retirement is created after untrackPublishEntry has removed the source's tracking, so a
-// teardown that only walked cpending left the retirement and its register behind while
-// deleting the consumer that could have settled them. Nothing could then ever re-offer
-// that source, and the next resume — seeing a register whose consumer is gone — would
-// reserve its identifier indefinitely.
+// It also releases this durable's in-memory SOURCE retirements, which are not in cpending
+// at all. Their whole-life owner slots are deliberately NOT returned for deletion: losing
+// the source consumer makes the suppression unnecessary, but it does not prove PUBCOMP.
+// The client can still be waiting for (or answering) PUBREL, so the slot must remain until
+// terminal cleanup observes completion. Once the consumer is gone, terminal cleanup reads
+// the source as Lost and can safely remove the slot after PUBCOMP.
 //
 // Lock held on entry.
 func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoidedReg, []mqttRegCancellation) {
@@ -2799,13 +2882,14 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoide
 			delete(sess.deferred, k)
 		}
 	}
-	for key, rs := range sess.srcAckOwed {
+	for key := range sess.srcAckOwed {
 		if key.jsDur != durable {
 			continue
 		}
-		if rs != nil {
-			addReg(mqttVoidedReg{seq: rs.regSeq, nonce: rs.nonce, pi: rs.pi, dur: key.jsDur, sseq: key.sseq, retired: true})
-		}
+		// Only the source-side suppression goes with its consumer. The slot remains the
+		// packet identifier's durable owner until PUBCOMP; queuing rs.regSeq into the raw
+		// teardown delete would bypass the phase gate and strand a stored PUBREL with no
+		// admission authority.
 		delete(sess.srcAckOwed, key)
 	}
 	// last_pi stays monotonic (see untrackPublishEntry); do not reset here.
@@ -2977,6 +3061,12 @@ func (sess *mqttSession) markInflightRegisterCancelledPending(c *client, rc mqtt
 		case cur != nil && cur.Nonce == rc.nonce && cur.Cancelled:
 			return nil // already marked, by us or by the store's own fallback
 		case cur != nil && cur.Nonce == rc.nonce:
+			if !mqttInflightTransitionAllowed(mqttSlotMarkCancelled, cur.State) {
+				// The pending store settled and this exchange crossed PUBREC before the
+				// create-only cancellation could win. Never add a fresh "not transmitted"
+				// fact to that phase; its whole-life owner must remain authoritative.
+				return fmt.Errorf("in-flight register %q is in state %q and cannot be marked never-transmitted", subject, cur.State)
+			}
 			// The store landed. REBUILD from it and set only Cancelled (F-087 WP1):
 			// re-proposing the sparse create body would erase whatever the store wrote
 			// and whatever a concurrent writer has since proved — a Retired above all,
@@ -3024,6 +3114,16 @@ const (
 	// anything (only a cancellation tombstone proves never-transmitted).
 	mqttInflightSourceLost
 )
+
+// mqttInflightSourceMayReoffer reports whether a past-PUBREC exchange still needs
+// durable source suppression. Lost is deliberately false: unlike Complete it does not
+// prove that a PUBLISH-phase exchange finished, but the classifier's positive meaning is
+// that the consumer is gone and nothing can re-offer this delivery. That distinction lets
+// a terminal PUBCOMP release its identifier without weakening the stricter completion
+// test used for PUBLISH and missing-PUBREL recovery.
+func mqttInflightSourceMayReoffer(st mqttInflightSourceState) bool {
+	return st == mqttInflightSourceLive || st == mqttInflightSourceUnknown
+}
 
 // mqttInflightResponseKind is what a single batched message-get response proves.
 //
@@ -3124,6 +3224,17 @@ func (as *mqttAccountSessionManager) newInflightSourceCache() *mqttInflightSourc
 // resolve classifies every source in recs, filling the cache. Safe to call more than once;
 // sources already resolved are not re-read.
 func (sc *mqttInflightSourceCache) resolve(recs []*mqttInflightRecord) {
+	sc.as.mu.RLock()
+	hook := sc.as.testInflightSourceState
+	sc.as.mu.RUnlock()
+	if hook != nil {
+		for _, r := range recs {
+			if r != nil {
+				sc.states[mqttPubRelSourceKey(r.Dur, r.Seq)] = hook(r)
+			}
+		}
+		return
+	}
 	// One consumer lookup per distinct durable, and those lookups BATCHED. Per-durable
 	// caching alone is not enough: a session with a few thousand subscriptions, each
 	// holding one in-flight delivery, would still pay a few thousand serial round trips
@@ -3282,6 +3393,12 @@ func (sc *mqttInflightSourceCache) state(r *mqttInflightRecord) mqttInflightSour
 // is gone" proves the exchange finished only while the consumer that would have
 // delivered it still exists.
 func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) mqttInflightSourceState {
+	as.mu.RLock()
+	hook := as.testInflightSourceState
+	as.mu.RUnlock()
+	if hook != nil {
+		return hook(r)
+	}
 	stream := mqttInflightSourceStream(r.Dur)
 	ci, err := as.jsa.lookupConsumer(stream, r.Dur)
 	if err != nil && isErrorOtherThan(err, JSConsumerNotFoundErr) {
@@ -3384,12 +3501,9 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		Dur: jsDur,
 		Seq: sseq,
 		QoS: qos,
-		// Created in its PUBLISH phase, which on THIS tree is the only phase it ever has:
-		// the PUBREC handoff still DELETES the record. The design it is a substrate for
-		// keeps one slot for the whole exchange and CAS-transitions it past PUBREC, making
-		// that record the identifier's only durable claimant — but the re-phasing and its
-		// terminal release belong to the unbuilt admission half (F-092), so nothing here
-		// may be read as already holding the slot open. See inflight_slot_state.go.
+		// Every slot starts in PUBLISH. A successful PUBREC handoff or direct PUBREL
+		// admission CAS-transitions the same record through the later phases; it remains
+		// the identifier's only durable claimant until terminal cleanup.
 		State:      mqttInflightPublish,
 		Nonce:      nonce,
 		Claim:      regClaim,
@@ -3397,13 +3511,11 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		Q2AffClaim: q2AffClaim,
 		Q2AffCopy:  q2AffCopy,
 	}
-	// Custody is OPTIONAL on a QoS 2 slot today, and the shape validator deliberately
-	// accepts one without a Claim. The design wants it universal — custody is what a
-	// takeover transfers and what a PUBREL action binds to, so a QoS 2 slot without it has
-	// nothing for either to check — but neither of those exists yet, and sess.regClaim is a
-	// SHARED-delivery ownership identity, so requiring it here would refuse the ordinary
-	// outbound QoS 2 path. It becomes mandatory in the same change that makes it
-	// load-bearing; inflight_slot_state.go records why, and what that change must settle.
+	// Every newly written QoS 2 slot is created with this session object's claim, recovery
+	// refreshes eligible quiescent slots, and PUBREL admission requires equality before
+	// acquiring an action. The structural matrix still reads an unclaimed publish slot so
+	// recovery can reserve or refresh the pre-transition shape; custody is mandatory once
+	// the slot moves past PUBREC.
 	//
 	// Nothing is derived here. regClaim/regClaimSeq were captured from the session UNDER
 	// THE LOCK above, and re-reading sess.regClaim at this point would be a data race
@@ -3495,6 +3607,14 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 				return false
 			}
+		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq && cur.Retired &&
+			mqttInflightPastPubRec(cur.State):
+			// This is not a stale PUBLISH retirement to adopt. The slot is already the
+			// authoritative owner of a PUBREL exchange, so neither rewriting it nor
+			// installing a PUBLISH-side retirement is legal. Withdraw this fresh
+			// allocation and leave the past-PUBREC slot untouched.
+			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+			return false
 		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq && cur.Retired:
 			// The occupant proves THIS identifier's exchange for THIS very source is past
 			// PUBREC — the client answered under this packet identifier. Replacing it
@@ -3543,6 +3663,14 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// CAS at the exact sequence read is what makes this sound: if the occupant
 			// gains Retired or Cancelled after our read, it rejects and the loop rereads
 			// into the arms above.
+			if !mqttSlotAdmitsDisposition(cur,
+				mqttSlotRefFromRecord(subject, smsg.Sequence, cur), mqttSlotReplacePublish) {
+				// A past-PUBREC slot is this identifier's continuing authority. Replacing
+				// it with the new allocation's PUBLISH record would destroy its canonical
+				// PUBREL identity and make the answered payload eligible for retransmission.
+				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+				return false
+			}
 			c.Debugf("MQTT: replacing an in-flight register for the same delivery on %q written elsewhere", subject)
 			expectSeq = smsg.Sequence
 		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq:
@@ -3627,6 +3755,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string) bool {
 	sess.mu.Lock()
 	ack := sess.pendingPublish[pi]
+	idHash, gen := sess.idHash, sess.gen
 	if ack == nil || !ack.regPending || ack.jsDur != jsDur || ack.sseq != sseq {
 		sess.mu.Unlock()
 		// The allocation was CANCELLED under us — an UNSUBSCRIBE staging a drain, a
@@ -3646,7 +3775,16 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 		// register as an ordinary delivery holding a Receive Maximum slot forever.
 		proven := false
 		if sess.asm != nil {
-			if derr := sess.asm.deleteInflightRegisterConfirmed(regSeq); derr != nil {
+			var slot *mqttInflightSlotRef
+			if name, perr := mqttParseInflightSubject(mqttInflightSubject(idHash, gen, pi)); perr == nil {
+				slot = &mqttInflightSlotRef{
+					name: *name, seq: regSeq, nonce: nonce, state: mqttInflightPublish,
+					dur: jsDur, sseq: sseq,
+				}
+			}
+			if deleted := sess.reapRegisterWithVerdictGated(regSeq, nonce, true, slot,
+				mqttSlotDeleteNeverTransmitted); !deleted {
+				derr := fmt.Errorf("the landed register could not be identity- and phase-confirmed as never transmitted")
 				// The delete is what this path wants, and it could not be proven. So the fact
 				// is made DURABLE instead: a cancellation tombstone on the record itself,
 				// which is the only thing that can tell a later resume that this delivery was
@@ -3796,13 +3934,13 @@ const (
 	// mqttContestPoisoned: the group could not be resolved, a claim failed, or the
 	// record could not be interpreted. Fail closed.
 	mqttContestPoisoned
-	// mqttContestRetired: the exchange is past PUBREC; a suppression answers the
-	// source's offers and no identifier is reserved for it.
+	// mqttContestRetired: the source crossed PUBREC; the known identifier remains reserved
+	// while a suppression answers source re-offers. The slot phase is judged separately.
 	mqttContestRetired
-	// mqttContestPubRelOwned: a surviving PUBREL record owns the identifier (R2). The
-	// HIGHEST precedence: the PUBREL is the exchange's identity once the PUBLISH phase
-	// is over, and it outranks whatever the register walk made of the register.
-	mqttContestPubRelOwned
+	// mqttContestPubRelEvidenced: a surviving PUBREL proves the source is past PUBREC.
+	// HIGHEST precedence: that phase evidence outranks whatever the register walk made of
+	// the source, while the slot remains the identifier's sole durable owner (R2).
+	mqttContestPubRelEvidenced
 )
 
 // mqttContestDisposition is one final disposition plus the evidence behind it.
@@ -3823,7 +3961,7 @@ func mqttDispositionNamesPI(d mqttContestDisposition, pi uint16) bool {
 	switch d.class {
 	case mqttContestUnobserved:
 		return false
-	case mqttContestPubRelOwned:
+	case mqttContestPubRelEvidenced:
 		return d.rel.pi == pi
 	default:
 		return d.reg.rec != nil && d.reg.rec.PI == pi
@@ -3909,7 +4047,7 @@ func (sess *mqttSession) reconcileForeignContestsLocked(c *client, final map[mqt
 					continue // unresolved, or a register still stands there: keep declining
 				}
 				staged = append(staged, mqttStagedRelease{key: key, pi: fc.pi, regSeq: fc.regSeq})
-			case mqttContestOwnedLive, mqttContestPubRelOwned:
+			case mqttContestOwnedLive, mqttContestPubRelEvidenced:
 				// The source is this session's to serve again, and recovery's own loops
 				// installed the entry (nothing of ours was resident to make them skip it).
 				// The decline must go with the contest or it would suppress a delivery
@@ -3926,7 +4064,7 @@ func (sess *mqttSession) reconcileForeignContestsLocked(c *client, final map[mqt
 		// leaves them harmlessly in memory. An arm that would FREE the identifier stages
 		// instead, and the commit runs only once the resume has succeeded.
 		switch d.class {
-		case mqttContestPubRelOwned:
+		case mqttContestPubRelEvidenced:
 			// The rival progressed the contested exchange past PUBREC and its PUBREL
 			// survives, so the identifier is the PUBREL's (R2). The ordinary restore loop
 			// SKIPPED it — that loop passes over an identifier whose pendingPublish entry
@@ -3949,15 +4087,23 @@ func (sess *mqttSession) reconcileForeignContestsLocked(c *client, final map[mqt
 			}
 			delete(sess.foreignContested, key)
 		case mqttContestRetired:
-			// A retirement reserves no identifier — the client completed the exchange
-			// under it — so this quarantine's identifier is free, and the suppression the
-			// retired apply installed is what answers the source's offers from here.
-			//
-			// But FREEING is exactly what may not happen before the resume succeeds
-			// (a refusal after this point preserves the session and its maps), so it is
-			// STAGED like every other release. The suppression stands either way, which
-			// is what keeps the source from taking a second identifier in the meantime.
-			staged = append(staged, mqttStagedRelease{key: key, pi: fc.pi, regSeq: fc.regSeq})
+			// Retirement proves past PUBREC, not PUBCOMP. Replace the PUBLISH-side
+			// quarantine with a non-actionable PUBREL reservation for the recovered
+			// whole-life slot; freeing the PI here would permit a later exchange to reuse
+			// an identifier the client can still be holding. The source suppression was
+			// installed separately by recovery.
+			e := mqttRecoveredPending(sess.idHash, sess.gen, fc.pi, d.reg)
+			if e == nil {
+				// The final classifier should never emit Retired without an attributable
+				// slot. Keep the quarantine if it does rather than turning malformed
+				// evidence into a release.
+				continue
+			}
+			remove(key, fc)
+			if sess.pendingPubRel == nil {
+				sess.pendingPubRel = make(map[uint16]*mqttPending, 1)
+			}
+			sess.pendingPubRel[fc.pi] = e
 		case mqttContestPoisoned:
 			// Fail closed, agreeing with the group's own fail-closed state: the
 			// quarantine is refreshed at the newly observed sequence and KEPT.
@@ -4106,11 +4252,9 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	// transmission. Nothing is lost with it: an inert hold reserves nothing for
 	// anybody, so keeping it and dropping it are indistinguishable to every reader.
 	//
-	// A PUBREL action subterm was CARRIED across this replacement in an earlier revision,
-	// so that a takeover could not drop an unresolved durable claim and free an identifier
-	// whose slot still named an action nobody could drain. That is a real requirement of
-	// the design and it comes back with the action itself; on this tree there is nothing to
-	// carry, because nothing mints an action. See mqttSendHold.
+	// A live PUBREL action makes sendReservedLocked true above, so it can never reach this
+	// replacement. That property is load-bearing: dropping the action term would free an
+	// identifier whose durable slot still names a capability nobody else may drain.
 	sess.sendsInFlight[pi] = &mqttSendHold{token: token}
 	return token, true
 }
@@ -4142,9 +4286,13 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 		// re-offers the record once that write has returned.
 		return _EMPTY_, false
 	}
-	// NO retained-term refusal here, and NO fence on a live pendingPublish entry. PUBREL
-	// ADMISSION IS DELIBERATELY UNCHANGED FROM BEFORE F-091, and that is a reviewed scope
-	// decision (lane DECISIONS.md, D4) rather than an omission.
+	// NO retained-term refusal here, and NO fence on a live pendingPublish entry. Durable
+	// SLOT-BACKED PUBREL admission has already acquired the exact owner-slot action before
+	// reaching this primitive; a live retained exchange has no slot (R6) and reaches this
+	// opener with no such action, authorized instead by its in-memory owner — which is
+	// exactly the overlap the passage below turns on. Reintroducing a broader, map-shaped
+	// refusal here would contradict that authority and break the legitimate retained and
+	// drain overlaps below.
 	//
 	// A retained-only hold may therefore coexist with the PUBREL token and PUBCOMP debt this
 	// call is about to add. That is coherent: the owner matches so nothing is reset, and
@@ -4164,18 +4312,25 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 	//   - refusing on a SOURCE-LESS entry starves an abandoned frame's record for the life of
 	//     the connection, since that empty entry survives until the next resume.
 	//
-	// The stale-PUBREL multiplexing hazard is real and is owned WHOLLY by F-092, whose fence
-	// correlates the record's (durable, source sequence) against the entry holding the
-	// identifier — a decision only the delivery callback can make, because only it parses the
-	// correlation. F-091's reservation still stops bumpPI and any PUBLISH send section from
-	// reusing the identifier, which is what it was chartered to do.
+	// The stale-PUBREL multiplexing hazard is owned by F-092's owner-slot action, acquired
+	// by the delivery callback before this opener. F-091's reservation still stops bumpPI
+	// and any PUBLISH send section from reusing the identifier, which is what it was
+	// chartered to do.
 	// A standing debt is only ours to add to when this connection incurred it. One owed by a
 	// predecessor can never be answered — mqttProcessPubComp refuses a PUBCOMP from any
 	// connection that is not sess.c — so it is RESET rather than accumulated onto. Adding to
 	// it instead is what would leave a resumed session's identifier held forever: the client
 	// owes exactly one PUBCOMP on this connection, and a count of two would never reach zero.
 	if h == nil || h.owner != cc.cid {
-		h = &mqttSendHold{owner: cc.cid}
+		// An action is NOT connection-owned. A successor resets the predecessor's inert
+		// PUBCOMP debt but must carry an action it just acquired (or is still draining)
+		// across that replacement. Dropping it here makes the durable token invisible to
+		// bumpPI as soon as the new debt is consumed.
+		var action *mqttSendAction
+		if h != nil {
+			action = h.action
+		}
+		h = &mqttSendHold{owner: cc.cid, action: action}
 		if sess.sendsInFlight == nil {
 			sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
 		}
@@ -4379,15 +4534,28 @@ func (sess *mqttSession) retainedHeldLocked(h *mqttSendHold) bool {
 // Session lock held on entry.
 func (sess *mqttSession) sendHoldLiveLocked(h *mqttSendHold) bool {
 	return h != nil && (h.token != _EMPTY_ || sess.pubCompHeldLocked(h) ||
-		sess.retainedHeldLocked(h))
+		sess.retainedHeldLocked(h) || actionHeldLocked(h))
 }
 
-// A FOURTH term belongs here and is deliberately absent: an unresolved PUBREL action claim
-// holds the identifier too, and unlike the other three it is NOT owner-scoped, because a
-// durable claim on the slot outlives whoever owns the connection now. It was built, and
-// deleted with the rest of the local action half, because nothing mints an action on this
-// tree — so the term could never fire and read as a protection that was in force. It
-// returns with its producer. See mqttSendHold and docs/ROADMAP.md's F-092 bullet.
+// actionHeldLocked is the FOURTH liveness term, and the only one that is NOT owner-scoped.
+//
+// The other three ask whether the connection that incurred them is still ours, because a
+// debt owed to a departed connection can never be answered and a retained frame nobody
+// will write reserves nothing. A durable action is different in kind: it is a claim on the
+// SLOT, and it outlives whoever owns the connection now. A holder that acquired an action
+// must be able to drain it after a takeover — refusing that would abandon the action and
+// manufacture an unbounded identifier reservation out of an ordinary, fully successful
+// takeover, which is the residual this whole mechanism exists to bound rather than create.
+//
+// So the term is live from the moment the tentative holder is armed until a reread proves
+// the exact token is GONE — resolved forward, replaced by a different valid token, or the
+// slot absent. `released` alone does not end it: a locally released but durably unresolved
+// action still holds its identifier, because nothing else knows the write will not happen.
+//
+// Session lock held on entry.
+func actionHeldLocked(h *mqttSendHold) bool {
+	return h != nil && h.action != nil && !h.action.drained
+}
 
 // sendReservedLocked is the question every reservation reader asks: may pi be used?
 // Lookup and liveness together, so no caller has to reach into the registry to find
@@ -4711,10 +4879,55 @@ const (
 	// re-read. The barrier aborts on it rather than installing foreign reservations
 	// on a connection about to be (or already) displaced.
 	mqttInflightClaimDisplaced
+	// mqttInflightClaimWithheld means the selected quiescent slot moved into an
+	// action or terminal state before the custody CAS landed. Those states are
+	// deliberately not transferable: an action belongs to its holder and terminal
+	// cleanup is custody-agnostic. Recovery still reserves the exact slot, but it
+	// neither refuses the whole CONNECT nor rewrites through the phase change.
+	mqttInflightClaimWithheld
 )
 
-// claimRecoveredSharedInflight makes the recovery-versus-close decision durable
-// at each shared register's own subject sequence. A successful rewrite invalidates
+// claimRecoveredSharedInflight preserves the pre-existing shared-delivery arbitration.
+// The universal QoS 2 custody pass below uses the same contest after the recovery
+// classifier has reduced the population to its positive transferable set.
+func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecoveredInflightReg) (
+	owned, closed, opaque, displaced, withheld []mqttRecoveredInflightReg,
+) {
+	return sess.claimRecoveredInflight(c, in, mqttInflightClaimShared)
+}
+
+// claimRecoveredTransferableInflight transfers custody for the exact positive QoS 2
+// population selected by recovery: live, unpoisoned, non-retired and non-cancelled slots
+// in publish or pubrel_ready. It deliberately shares the ordered claim contest with the
+// older shared-delivery path so a refresh can never overwrite a newer accepted owner.
+func (sess *mqttSession) claimRecoveredTransferableInflight(c *client, in []mqttRecoveredInflightReg) (
+	owned, closed, opaque, displaced, withheld []mqttRecoveredInflightReg,
+) {
+	return sess.claimRecoveredInflight(c, in, mqttInflightClaimTransferable)
+}
+
+// claimRecoveredRetiredPubRelInflight is the deliberately narrow retired exception to
+// the positive transferable set. Its caller supplies only pubrel_ready slots for which a
+// present, structurally valid PUBREL record names the exact source, identifier and nonce.
+// Such a slot is still actionable—the client is waiting for PUBREL—so admission will read
+// its custody. A retired PUBLISH slot or a flag without that external evidence remains
+// excluded.
+func (sess *mqttSession) claimRecoveredRetiredPubRelInflight(c *client, in []mqttRecoveredInflightReg) (
+	owned, closed, opaque, displaced, withheld []mqttRecoveredInflightReg,
+) {
+	return sess.claimRecoveredInflight(c, in, mqttInflightClaimRetiredPubRel)
+}
+
+type mqttInflightClaimScope uint8
+
+const (
+	mqttInflightClaimShared mqttInflightClaimScope = iota
+	mqttInflightClaimTransferable
+	mqttInflightClaimRetiredPubRel
+)
+
+// claimRecoveredInflight makes the recovery-versus-close decision durable
+// at each selected register's own subject sequence. A successful rewrite invalidates
 // every sequence held by an older session object; a close that deleted or
 // tombstoned first is consumed as closed. Any state that cannot prove either fact
 // becomes opaque, so the identifier is withheld rather than guessed free.
@@ -4722,11 +4935,11 @@ const (
 // The writes are independent by subject and run in a bounded window. This remains
 // part of the pre-CONNACK barrier without turning a large resume into one serial
 // round trip per register.
-func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecoveredInflightReg) (
-	owned, closed, opaque, displaced []mqttRecoveredInflightReg,
+func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInflightReg, scope mqttInflightClaimScope) (
+	owned, closed, opaque, displaced, withheld []mqttRecoveredInflightReg,
 ) {
 	if len(in) == 0 {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	type result struct {
 		reg     mqttRecoveredInflightReg
@@ -4750,7 +4963,16 @@ func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecove
 				fr := in[i]
 				results[i].reg = fr
 				results[i].outcome = mqttInflightClaimOwned
-				if fr.rec == nil || !strings.HasPrefix(fr.rec.Dur, mqttSharedConsumerDurablePrefix) {
+				if fr.rec == nil {
+					continue
+				}
+				sharedRegister := strings.HasPrefix(fr.rec.Dur, mqttSharedConsumerDurablePrefix)
+				transferableQoS2 := scope == mqttInflightClaimTransferable && fr.rec.QoS == 2 &&
+					(fr.rec.State == mqttInflightPublish || fr.rec.State == mqttInflightPubRelReady) &&
+					!fr.rec.Retired && !fr.rec.Cancelled
+				retiredPubRel := scope == mqttInflightClaimRetiredPubRel && fr.rec.QoS == 2 &&
+					fr.rec.State == mqttInflightPubRelReady && fr.rec.Retired
+				if !sharedRegister && !transferableQoS2 && !retiredPubRel {
 					continue
 				}
 				// Deliberately no own-claim fast path: a record already carrying this
@@ -4829,6 +5051,18 @@ func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecove
 						// which the post-contest routing sends to the suppression.
 						results[i].outcome = mqttInflightClaimClosed
 						results[i].closeAt = smsg.Sequence
+					case mqttInflightActionState(cur.State) || cur.State == mqttInflightPubRelTerminal:
+						// The candidate was quiescent when selected but crossed a phase
+						// boundary before our CAS. Never rebuild a custody write over that
+						// observation: active custody is frozen into the action, and terminal
+						// finalization does not need custody. Preserve the exact reread so the
+						// caller can route it as a localized past-PUBREC reservation (or
+						// terminal cleanup) without making the whole identifier space opaque.
+						results[i].outcome = mqttInflightClaimWithheld
+						results[i].reg = mqttRecoveredInflightReg{
+							rec: cur, seq: smsg.Sequence,
+							traversed: append(traversed, smsg.Sequence),
+						}
 					case cur.Claim == claim:
 						if smsg.Sequence == expectSeq {
 							// Own claim at the UNMOVED sequence: with no own-claim fast
@@ -4929,9 +5163,11 @@ func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecove
 			opaque = append(opaque, res.reg)
 		case mqttInflightClaimDisplaced:
 			displaced = append(displaced, res.reg)
+		case mqttInflightClaimWithheld:
+			withheld = append(withheld, res.reg)
 		}
 	}
-	return owned, closed, opaque, displaced
+	return owned, closed, opaque, displaced, withheld
 }
 
 // recoverInflightRegisters rebuilds this session's outbound in-flight identifier
@@ -4942,17 +5178,19 @@ func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecove
 // instead of allocating a fresh one, and bumpPI cannot hand out an identifier that a
 // register or an unreplayed PUBREL record still owns.
 //
-// Two durable sources, and where they disagree the PUBREL record wins (R2):
+// Two durable sources, with one authority and one phase-evidence stream (R2):
 //
-//   - a PUBREL record on this incarnation's PUBREL subject is an exchange PAST
-//     PUBREC. Its identifier is reserved in pendingPubRel exactly as
+//   - a PUBREL record on this incarnation's PUBREL subject is evidence that an exchange
+//     is PAST PUBREC. Its identifier is reserved in pendingPubRel exactly as
 //     trackAsPubRel(pi, _EMPTY_) would, and — where the record names its source — the
 //     source is entered in cpending too, so the usedForPubRel guard suppresses a
 //     re-PUBLISH of a payload the client has already answered.
-//   - a register is an exchange in the PUBLISH phase. Its source is classified
-//     first: a provably complete source means the exchange finished and the register
-//     is deleted; a live or unprovable one is reserved in pendingPublish with no ack
-//     subject, waiting for the redelivery that fills it in.
+//   - a register is the whole-life owner slot. A PUBLISH-phase slot is source-classified:
+//     a provably complete source means that phase finished, while a live or unprovable
+//     one is reserved in pendingPublish with no ack subject, waiting for redelivery.
+//     A past-PUBREC slot is never restored as PUBLISH; it is reserved in pendingPubRel,
+//     custody-refreshed when actionable, or terminalized only from positive completion
+//     evidence.
 //
 // It fails closed WITHOUT denying the CONNECT (R3): an incomplete scan leaves the
 // identifier space unknown, so the session is marked piSpaceIncomplete and bumpPI
@@ -4960,8 +5198,10 @@ func (sess *mqttSession) claimRecoveredSharedInflight(c *client, in []mqttRecove
 // QoS 0 subscription — keeps working. That is the same shape as the drain barrier's
 // contract, which withholds a durable's source interest rather than the connection.
 //
-// In-memory state wins every conflict: on a same-process reconnect the tracking maps
-// are the live authority and already hold everything, so this only fills gaps.
+// In-memory state normally wins on a same-process reconnect, but a durable close,
+// quarantine or poisoned-source disposition demotes a matching resident entry first.
+// Those negative outcomes are the durable evidence that the old in-memory view is no
+// longer authoritative; every such demotion is nonce-fenced.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStagedRelease, err error) {
@@ -4994,7 +5234,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// identity work decorative.
 	//
 	// A record whose shape this broker does not write cannot be attributed to any exchange,
-	// so it must not decide anything on one's behalf. Left in, it fed relBySource —
+	// so it must not decide anything on one's behalf. Left in, it fed source evidence —
 	// suppressing a matching PUBLISH source as "past PUBREC" — and became a pendingPubRel
 	// reservation, holding a packet identifier that the delivery callback then refuses to
 	// transmit or acknowledge. With a Receive Maximum of 1 that stalls the session's QoS
@@ -5024,11 +5264,13 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		supported = append(supported, r)
 	}
 	rels = supported
-	relBySource := make(map[string]struct{}, len(rels))
-	for _, r := range rels {
-		if r.srcDur != _EMPTY_ {
-			relBySource[mqttPubRelSourceKey(r.srcDur, r.srcSeq)] = struct{}{}
+	findExactPubRel := func(rec *mqttInflightRecord) (mqttStoredPubRel, bool) {
+		for _, rel := range rels {
+			if mqttStoredPubRelMatchesSlot(rel, rec) {
+				return rel, true // scan order: the lowest matching stream sequence
+			}
 		}
+		return mqttStoredPubRel{}, false
 	}
 
 	// (2) The registers. One bounded filter over this incarnation alone, which a
@@ -5038,6 +5280,27 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// identifier this incarnation wrote. They reserve that identifier and nothing else:
 	// there is no source to classify, and nothing may be deleted.
 	var opaque []mqttRecoveredInflightReg
+	// quarantinedPublishConflicts names PUBLISH slots that recovery cannot safely route
+	// because their exact route-B handoff failed or a PUBREL names the same source but a
+	// different exchange. These identities are needed during apply to demote a same-object
+	// resident PUBLISH entry; an opaque reservation
+	// alone would lose to the existing map entry and leave the refused payload sendable.
+	var quarantinedPublishConflicts []mqttRecoveredInflightReg
+	// pastPubRec holds re-phased slots: readable, legal, and owning an exchange the
+	// client has already answered with PUBREC. They are neither ordinary PUBLISH
+	// registers nor opaque — reserving them as opaque would withhold the session's whole
+	// outbound flow, and restoring them as PUBLISH entries could retransmit an answered
+	// payload — so they get their own disposition (see settlePastPubRecSlots).
+	var pastPubRec []mqttRecoveredInflightReg
+	// routeB is the cross-stream crash cut in which the exact PUBREL record landed but
+	// the owner slot did not yet move out of PUBLISH. It is paired with the record now,
+	// while the completed scan is available, and re-phased before source classification
+	// can mistake source completion for permission to delete it.
+	type mqttRecoveryRouteB struct {
+		reg mqttRecoveredInflightReg
+		rel mqttStoredPubRel
+	}
+	var routeB []mqttRecoveryRouteB
 	// Enumerated by SUBJECT and loaded in batches, not walked one synchronous request at
 	// a time. A resumed session may legitimately hold up to 65_535 in-flight identifiers,
 	// and this runs before the CONNACK: a per-record round trip would put tens of
@@ -5080,7 +5343,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	for start := 0; start < len(subjects); start += mqttInflightLoadBatch {
 		end := min(start+mqttInflightLoadBatch, len(subjects))
 		batch := subjects[start:end]
-		resps, berr := as.jsa.loadLastMsgForMulti(mqttInflightStreamName, batch)
+		resps, berr := as.loadInflightRecordsMulti(batch)
 		if berr != nil {
 			sess.setPISpaceIncomplete(c, fmt.Sprintf("the in-flight registers could not be loaded: %v", berr))
 			return nil, nil
@@ -5158,11 +5421,12 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 			})
 			continue
 		}
-		// ONLY A `publish`-STATE RECORD IS RESTORED. Anything else — a PUBREL or terminal
-		// phase, or an ABSENT state — is quarantined: the identifier is reserved so it can
-		// never be reused, and nothing acts on the record.
+		// ONLY A KNOWN, LEGAL SHAPE IS ROUTED. PUBLISH slots enter ordinary source
+		// classification; past-PUBREC slots enter their dedicated recovery path below; an
+		// absent or unknown state is quarantined so its identifier is reserved and nothing
+		// acts on the record.
 		//
-		// Two reviews shaped this. First: with identity-only validation, a record in a
+		// Two reviews shaped this routing. First: with identity-only validation, a record in a
 		// PUBREL state flowed into the live-source bucket and became an actionable
 		// `pendingPublish` entry, and `beginSendLocked` does not inspect slot state — so it
 		// could RETRANSMIT the payload of an exchange already past PUBREC. Second, and the
@@ -5176,7 +5440,19 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		// unsupported persisted shape is REFUSED rather than migrated or tolerated. A
 		// developer stream carrying older records resets, which is the documented boundary
 		// (the nine broker-owned streams are one recreation unit, F-066).
-		if rec.State != mqttInflightPublish {
+		if !mqttInflightStateKnown(rec.State) {
+			// A state this broker genuinely does not write. Opaque: the identifier is
+			// reserved, nothing acts on the record, and the identifier space is
+			// incomplete — which withholds new outbound QoS 1/2 allocation until an
+			// operator removes it.
+			//
+			// ONE PREDICATE, and that matters. This used to read `rec.State !=
+			// mqttInflightPublish`, written when `publish` was the only state, and it was
+			// a SECOND enumeration of "states this broker writes" beside
+			// mqttInflightStateKnown. When the four past-PUBREC states arrived, that copy
+			// classified every re-phased slot as unreadable and withheld the session's
+			// entire outbound QoS 1/2 flow — two mechanisms stating one fact, disagreeing
+			// the moment one of them changed.
 			c.Warnf("MQTT: reserving packet identifier %d for client %q from an in-flight register on %q "+
 				"at sequence %d whose state %q this broker does not write: the identifier is held so it "+
 				"is never reused, and nothing acts on the record",
@@ -5186,7 +5462,69 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 			})
 			continue
 		}
-		regs = append(regs, mqttRecoveredInflightReg{rec: rec, seq: smsg.Sequence})
+		if mqttInflightPastPubRec(rec.State) {
+			// PAST PUBREC, and it must NOT join `regs`. The classification chain below
+			// installs a `pendingPublish` entry, and beginSendLocked does not inspect slot
+			// state — so a past-PUBREC slot restored as an ordinary PUBLISH entry could
+			// RETRANSMIT the payload of an exchange the client has already answered. That
+			// hazard is the reason the single-state check existed, and it is real; what was
+			// wrong was refusing the record rather than routing it.
+			pastPubRec = append(pastPubRec, mqttRecoveredInflightReg{rec: rec, seq: smsg.Sequence})
+			continue
+		}
+		fr := mqttRecoveredInflightReg{rec: rec, seq: smsg.Sequence}
+		// PUBLISH plus a PRESENT exact PUBREL is recovery route B, not ordinary
+		// source-completion evidence. Pick the lowest matching stream sequence from the
+		// complete, ordered scan; later exact records are duplicates of that canonical
+		// choice. A record naming only the same source is not enough—the PI, nonce and
+		// affine identity are part of the exchange.
+		sourceNamed := false
+		exact, exactFound := findExactPubRel(rec)
+		for i := range rels {
+			rel := &rels[i]
+			if rel.srcDur != rec.Dur || rel.srcSeq != rec.Seq {
+				continue
+			}
+			sourceNamed = true
+		}
+		switch {
+		case exactFound:
+			routeB = append(routeB, mqttRecoveryRouteB{reg: fr, rel: exact})
+			continue
+		case sourceNamed:
+			// Source-only evidence used to flow into relBySource and could delete this
+			// slot as a completed handoff even though the PUBREL belonged to another
+			// identifier or exchange. Reserve and keep it; the conflict needs an
+			// operator, not an inferred winner.
+			c.Warnf("MQTT: reserving packet identifier %d for client %q: a stored PUBREL "+
+				"names its source %s/%d but not the same exchange", rec.PI, sess.id, rec.Dur, rec.Seq)
+			quarantinedPublishConflicts = append(quarantinedPublishConflicts, fr)
+			opaque = append(opaque, mqttRecoveredInflightReg{
+				rec: &mqttInflightRecord{PI: rec.PI}, seq: smsg.Sequence,
+			})
+			continue
+		default:
+			regs = append(regs, fr)
+		}
+	}
+
+	// Complete route B before asking what happened to the source. The slot transition
+	// preserves its current custody; the ordinary past-PUBREC classifier below then
+	// performs the same ordered custody contest as every recovered actionable PUBREL.
+	for _, handoff := range routeB {
+		phased, ok := sess.phaseRecoveredPublishSlotToReady(c, handoff.reg, handoff.rel)
+		if !ok {
+			// A failed or raced CAS proves no state. Keep the identifier and the slot, and
+			// withhold new allocation rather than letting source classification free it.
+			c.Warnf("MQTT: reserving packet identifier %d for client %q: recovery could not "+
+				"complete its stored PUBREL handoff", handoff.reg.rec.PI, sess.id)
+			quarantinedPublishConflicts = append(quarantinedPublishConflicts, handoff.reg)
+			opaque = append(opaque, mqttRecoveredInflightReg{
+				rec: &mqttInflightRecord{PI: handoff.reg.rec.PI}, seq: handoff.reg.seq,
+			})
+			continue
+		}
+		pastPubRec = append(pastPubRec, phased)
 	}
 
 	// (3) Classify each register, mutating no session state yet: a JetStream lookup
@@ -5197,15 +5535,29 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// message reads, rather than two round trips per record before the CONNACK. Duplicate
 	// registers naming one source share the result.
 	srcCache := as.newInflightSourceCache()
-	if len(regs) > 0 {
-		all := make([]*mqttInflightRecord, 0, len(regs))
+	if len(regs)+len(pastPubRec) > 0 {
+		all := make([]*mqttInflightRecord, 0, len(regs)+len(pastPubRec))
 		for _, fr := range regs {
+			all = append(all, fr.rec)
+		}
+		for _, fr := range pastPubRec {
 			all = append(all, fr.rec)
 		}
 		srcCache.resolve(all)
 	}
 
 	var reserve []mqttRecoveredInflightReg
+	// A custody contest can observe the exact slot deleted after the PUBREL scan. Keep
+	// that outcome through classification so the earlier scan cannot install a slot-less
+	// placeholder which a later callback might mistake for retained in-memory authority.
+	closedPubRelOwners := make(map[uint16]string)
+	noteCustodyClosed := func(in []mqttRecoveredInflightReg) {
+		for _, fr := range in {
+			if fr.rec != nil && fr.rec.PI != 0 && fr.rec.Nonce != _EMPTY_ {
+				closedPubRelOwners[fr.rec.PI] = fr.rec.Nonce
+			}
+		}
+	}
 	// Every drop carries its NONCE alongside its sequence: the delete routes through
 	// reapRegisterWithVerdict, so a cancellation verdict attached to the register is
 	// released against the proof of its deletion instead of accumulating for the life of
@@ -5258,6 +5610,15 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)] = append(
 			drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)], fr)
 	}
+	// Route B removes its PUBLISH-shaped slot from regs before source classification,
+	// but a drain still needs the original observed register sequence repaired into its
+	// non-authoritative hint. Omitting these records reset an old-format drain's RegSeq
+	// to zero even though recovery had just found and re-phased its exact slot.
+	for _, handoff := range routeB {
+		fr := handoff.reg
+		drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)] = append(
+			drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)], fr)
+	}
 	sess.mu.Lock()
 	drainOwned, drainAmbiguous := sess.recomputeDrainRegisterStateLocked(drainRegs)
 	sess.mu.Unlock()
@@ -5271,13 +5632,12 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		}
 	}
 
-	// Retired registers first: these are not PUBLISH-phase deliveries at all. Their
-	// exchange is past PUBREC with an unproven source acknowledgement, so the payload must
-	// never be sent again while the source may still be re-offered. They reserve NO
-	// identifier — the client completed the exchange, which freed it — and instead
-	// reinstate the in-memory retirement, so the next attempt at that source is
-	// acknowledged and discarded rather than delivered. This is the half a memory-only
-	// retirement loses across a restart.
+	// Source retirements suppress a payload whose exchange is known past PUBREC while its
+	// source may still be re-offered. The Retired bit is not itself a slot phase: a crash
+	// may leave State at publish, and only a present exact PUBREL licenses route B's phase
+	// transition. Such a publish-shaped retirement still reserves its known identifier as
+	// a non-actionable PUBREL-side entry in the apply phase; it is not made deliverable and
+	// it does not make the otherwise reconstructed identifier space opaque.
 	var retired []mqttRecoveredInflightReg
 	// Affine registers whose carried pair its own source does not prove. Kept apart only
 	// until the claim pass has run, then folded in as unowned members of their source's
@@ -5363,9 +5723,9 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 			// The drain owns this record (see above): neither rewritten nor deleted here.
 			// Its identifier is reserved by the PUBREL loop when the exchange is past PUBREC,
 			// and by the live path otherwise.
-			if _, past := relBySource[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)]; !past {
-				live = append(live, fr)
-			}
+			// An exact PUBREL was removed into route B before this loop, while a
+			// same-source mismatch was quarantined. What remains is still PUBLISH-side.
+			live = append(live, fr)
 			continue
 		}
 		if fr.rec.Retired {
@@ -5380,27 +5740,6 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 				continue
 			}
 			retired = append(retired, fr)
-			continue
-		}
-		if _, past := relBySource[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)]; past {
-			// A PUBREL record names the same source, so this exchange is provably past
-			// PUBREC (R2) and the identifier is reserved by the PUBREL loop below, not
-			// here. What becomes of the register depends on the SOURCE, and the difference
-			// matters:
-			//
-			//   - source provably complete -> the handoff finished and only the register's
-			//     delete was lost. Nothing can redeliver it; drop it.
-			//   - source still live -> the handoff's source acknowledgement was never
-			//     proven, so the source WILL be re-offered. Deleting the register here
-			//     would destroy the very record that has to carry the retirement, and
-			//     once the client's PUBCOMP removes this PUBREL nothing would be left to
-			//     say the payload was already answered. So it is retired instead.
-			if srcCache.state(fr.rec) == mqttInflightSourceComplete {
-				drop = append(drop, regDrop{fr.seq, fr.rec.Nonce,
-					mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec)})
-			} else {
-				retired = append(retired, fr)
-			}
 			continue
 		}
 		if srcCache.state(fr.rec) == mqttInflightSourceComplete {
@@ -5427,8 +5766,12 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// authoritative, resolving by deletion the very ambiguity the group refused to
 	// guess about. Claimed first, every member of the group moves, and the ambiguity
 	// survives any stale close until an operator resolves it.
-	var claimClosed, claimFailed, displaced []mqttRecoveredInflightReg
-	live, claimClosed, claimFailed, displaced = sess.claimRecoveredSharedInflight(c, live)
+	var claimClosed, claimFailed, displaced, claimWithheld []mqttRecoveredInflightReg
+	live, claimClosed, claimFailed, displaced, claimWithheld = sess.claimRecoveredSharedInflight(c, live)
+	// A quiescent PUBLISH slot may have crossed into an action or terminal phase while
+	// the custody CAS was in flight. It is no longer a publish candidate; route the
+	// authoritative reread through the past-PUBREC classifier below.
+	pastPubRec = append(pastPubRec, claimWithheld...)
 	// claimConsumed carries every consumed close decision into the apply phase, so a
 	// same-object barrier re-run retires the LIVE in-memory entries those records
 	// backed; the non-zero seqs are the tombstones the confirmed delete targets.
@@ -5454,12 +5797,14 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// interpret; grouped with the members whose claim FAILED, whose treatment is exactly
 	// what an unproven pair needs.
 	claimFailed = append(claimFailed, unprovenAffine...)
-	var retiredFailed, retiredDisplaced []mqttRecoveredInflightReg
-	retired, claimClosed, retiredFailed, retiredDisplaced = sess.claimRecoveredSharedInflight(c, retired)
+	var retiredFailed, retiredDisplaced, retiredWithheld []mqttRecoveredInflightReg
+	retired, claimClosed, retiredFailed, retiredDisplaced, retiredWithheld = sess.claimRecoveredSharedInflight(c, retired)
+	pastPubRec = append(pastPubRec, retiredWithheld...)
 	displaced = append(displaced, retiredDisplaced...)
-	// The live bucket's newly retired members join the retired bucket AFTER its own
-	// contest: they are already claimed at their landed sequence, and re-contesting them
-	// would rewrite a record this pass has just taken ownership of.
+	// Retired is source-side suppression, not a substitute slot phase. A record that
+	// acquires the bit during the claim contest therefore follows the same retirement
+	// path as one the initial scan observed with it; only an exact PUBREL can route the
+	// slot through route B.
 	retired = append(retired, newlyRetired...)
 	claimConsumed = append(claimConsumed, claimClosed...)
 	for _, fr := range claimClosed {
@@ -5504,6 +5849,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		unowned bool
 	}
 	var poisoned []mqttRecoveredInflightReg
+	poisoned = append(poisoned, quarantinedPublishConflicts...)
 	bySource := make(map[string][]mqttSourceGroupMember, len(live)+len(claimFailed))
 	order := make([]string, 0, len(live))
 	addMember := func(fr mqttRecoveredInflightReg, unowned bool) {
@@ -5581,6 +5927,196 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		}
 	}
 
+	// UNIVERSAL QOS 2 CUSTODY, selected from the classifier's final OWNED set rather
+	// than from the raw scan. This is the publish half of §11's positive eligibility
+	// rule: cancelled, retired, consumed, poisoned and duplicate-source records never
+	// reach this pass. Shared records were already moved by the claim contest above;
+	// plain QoS 2 records use that same contest here so a refresh cannot overwrite a
+	// newer accepted owner.
+	claimedReserve := make([]mqttRecoveredInflightReg, 0, len(reserve))
+	var custodyCandidates []mqttRecoveredInflightReg
+	for _, rv := range reserve {
+		if rv.rec != nil && rv.rec.QoS == 2 && rv.rec.State == mqttInflightPublish &&
+			!rv.rec.Retired && !rv.rec.Cancelled &&
+			!strings.HasPrefix(rv.rec.Dur, mqttSharedConsumerDurablePrefix) {
+			custodyCandidates = append(custodyCandidates, rv)
+			continue
+		}
+		claimedReserve = append(claimedReserve, rv)
+	}
+	if len(custodyCandidates) > 0 {
+		var custodyClosed, custodyFailed, custodyDisplaced, custodyWithheld []mqttRecoveredInflightReg
+		custodyCandidates, custodyClosed, custodyFailed, custodyDisplaced, custodyWithheld =
+			sess.claimRecoveredTransferableInflight(c, custodyCandidates)
+		if len(custodyDisplaced) > 0 {
+			return nil, fmt.Errorf("could not take custody of %d QoS 2 in-flight slot(s) during resume — "+
+				"claimed by another session owner, or the claim fence could not be established (first: pi %d, %s/%d)",
+				len(custodyDisplaced), custodyDisplaced[0].rec.PI,
+				custodyDisplaced[0].rec.Dur, custodyDisplaced[0].rec.Seq)
+		}
+		claimConsumed = append(claimConsumed, custodyClosed...)
+		noteCustodyClosed(custodyClosed)
+		pastPubRec = append(pastPubRec, custodyWithheld...)
+		for _, fr := range custodyFailed {
+			opaque = append(opaque, mqttRecoveredInflightReg{
+				rec: &mqttInflightRecord{PI: fr.rec.PI}, seq: fr.seq, foreign: true,
+			})
+		}
+		claimedReserve = append(claimedReserve, custodyCandidates...)
+	}
+	reserve = claimedReserve
+
+	// Classify every past-PUBREC slot BEFORE the in-memory apply. In particular, a
+	// pubrel_ready slot is custody-contested even when a pendingPubRel entry already
+	// exists: admission reads the durable slot, so its refresh set must be a provable
+	// superset of the states admission can acquire from. Active actions remain localized
+	// reservations, terminal/finished slots bypass custody, and excluded flag shapes get
+	// no custody CAS.
+	var pastPubRecFinished []mqttInflightSlotRef
+	pastReservations := make([]mqttRecoveredInflightReg, 0, len(pastPubRec))
+	var pastCustodyCandidates []mqttRecoveredInflightReg
+	var retiredPubRelCustodyCandidates []mqttRecoveredInflightReg
+	refreshRetirement := func(updated []mqttRecoveredInflightReg) {
+		for _, next := range updated {
+			if next.rec == nil {
+				continue
+			}
+			for i := range retired {
+				if retired[i].rec != nil && retired[i].rec.Nonce == next.rec.Nonce {
+					retired[i] = next
+				}
+			}
+		}
+	}
+	for _, rv := range pastPubRec {
+		if rv.rec == nil {
+			continue
+		}
+		ref := mqttSlotRefFromRecord(
+			mqttInflightSubject(sess.idHash, sess.gen, rv.rec.PI), rv.seq, rv.rec)
+		if ref == nil {
+			opaque = append(opaque, mqttRecoveredInflightReg{
+				rec: &mqttInflightRecord{PI: rv.rec.PI}, seq: rv.seq,
+			})
+			continue
+		}
+		sourceState := srcCache.state(rv.rec)
+		sourceComplete := sourceState == mqttInflightSourceComplete
+		if mqttInflightSourceMayReoffer(sourceState) {
+			// The PHASE is durable evidence that the source is already past PUBREC, even
+			// when a crash preceded the explicit Retired mark. Install suppression before
+			// source interest opens; otherwise the source can be re-sent after PUBCOMP
+			// removes its pendingPubRel guard.
+			retired = append(retired, rv)
+		}
+		finished := rv.rec.State == mqttInflightPubRelTerminal
+		if !finished && rv.rec.State == mqttInflightPubRelReady {
+			_, exact := findExactPubRel(rv.rec)
+			finished = !exact && sourceComplete
+		}
+		if finished {
+			pastPubRecFinished = append(pastPubRecFinished, *ref)
+			continue
+		}
+		if rv.rec.State == mqttInflightPubRelReady {
+			switch {
+			case rv.rec.Retired:
+				_, exact := findExactPubRel(rv.rec)
+				if !exact {
+					break
+				}
+				// Retired is normally excluded from custody transfer. A PRESENT exact
+				// PUBREL is different: the client is still waiting for that protocol
+				// step, admission will inspect the slot, and leaving predecessor custody
+				// here would refuse it forever after restart.
+				retiredPubRelCustodyCandidates = append(retiredPubRelCustodyCandidates, rv)
+				continue
+			case !rv.rec.Retired && !rv.rec.Cancelled:
+				pastCustodyCandidates = append(pastCustodyCandidates, rv)
+				continue
+			}
+		}
+		pastReservations = append(pastReservations, rv)
+	}
+	if len(retiredPubRelCustodyCandidates) > 0 {
+		var custodyClosed, custodyFailed, custodyDisplaced, custodyWithheld []mqttRecoveredInflightReg
+		retiredPubRelCustodyCandidates, custodyClosed, custodyFailed, custodyDisplaced, custodyWithheld =
+			sess.claimRecoveredRetiredPubRelInflight(c, retiredPubRelCustodyCandidates)
+		if len(custodyDisplaced) > 0 {
+			return nil, fmt.Errorf("could not take custody of %d retired past-PUBREC slot(s) during resume — "+
+				"claimed by another session owner, or the claim fence could not be established (first: pi %d, %s/%d)",
+				len(custodyDisplaced), custodyDisplaced[0].rec.PI,
+				custodyDisplaced[0].rec.Dur, custodyDisplaced[0].rec.Seq)
+		}
+		claimConsumed = append(claimConsumed, custodyClosed...)
+		noteCustodyClosed(custodyClosed)
+		for _, fr := range custodyFailed {
+			opaque = append(opaque, mqttRecoveredInflightReg{
+				rec: &mqttInflightRecord{PI: fr.rec.PI}, seq: fr.seq, foreign: true,
+			})
+		}
+		refreshRetirement(retiredPubRelCustodyCandidates)
+		for _, fr := range retiredPubRelCustodyCandidates {
+			if fr.rec == nil || !fr.rec.Retired {
+				pastReservations = append(pastReservations, fr)
+			}
+		}
+		refreshRetirement(custodyWithheld)
+		for _, fr := range custodyWithheld {
+			if fr.rec != nil && fr.rec.State == mqttInflightPubRelTerminal {
+				if ref := mqttSlotRefFromRecord(
+					mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec); ref != nil {
+					pastPubRecFinished = append(pastPubRecFinished, *ref)
+				}
+				continue
+			}
+			pastReservations = append(pastReservations, fr)
+		}
+	}
+	if len(pastCustodyCandidates) > 0 {
+		var custodyClosed, custodyFailed, custodyDisplaced, custodyWithheld []mqttRecoveredInflightReg
+		pastCustodyCandidates, custodyClosed, custodyFailed, custodyDisplaced, custodyWithheld =
+			sess.claimRecoveredTransferableInflight(c, pastCustodyCandidates)
+		if len(custodyDisplaced) > 0 {
+			return nil, fmt.Errorf("could not take custody of %d past-PUBREC slot(s) during resume — "+
+				"claimed by another session owner, or the claim fence could not be established (first: pi %d, %s/%d)",
+				len(custodyDisplaced), custodyDisplaced[0].rec.PI,
+				custodyDisplaced[0].rec.Dur, custodyDisplaced[0].rec.Seq)
+		}
+		for _, fr := range custodyFailed {
+			opaque = append(opaque, mqttRecoveredInflightReg{
+				rec: &mqttInflightRecord{PI: fr.rec.PI}, seq: fr.seq, foreign: true,
+			})
+		}
+		refreshRetirement(pastCustodyCandidates)
+		refreshRetirement(custodyWithheld)
+		// A concurrent exact delete is a completed exchange; it needs no reservation.
+		noteCustodyClosed(custodyClosed)
+		for _, fr := range custodyWithheld {
+			if fr.rec != nil && fr.rec.State == mqttInflightPubRelTerminal {
+				if ref := mqttSlotRefFromRecord(
+					mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec); ref != nil {
+					pastPubRecFinished = append(pastPubRecFinished, *ref)
+				}
+				continue
+			}
+			pastReservations = append(pastReservations, fr)
+		}
+		pastReservations = append(pastReservations, pastCustodyCandidates...)
+	}
+	pastPubRec = pastReservations
+	if len(closedPubRelOwners) > 0 {
+		kept := rels[:0]
+		for _, rel := range rels {
+			if nonce, closed := closedPubRelOwners[rel.pi]; closed &&
+				rel.owner.State == mqttPubRelOwnerValid && rel.owner.Nonce == nonce {
+				continue
+			}
+			kept = append(kept, rel)
+		}
+		rels = kept
+	}
+
 	// The final disposition of every source this pass observed, which is what the
 	// quarantine reconciliation consumes (F-087 WP2). Built here, from the routed
 	// results, so the reconciliation reads one classification rather than re-deriving it
@@ -5601,7 +6137,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	}
 	for _, r := range rels {
 		if r.pi != 0 && r.srcDur != _EMPTY_ {
-			note(r.srcDur, r.srcSeq, mqttContestDisposition{class: mqttContestPubRelOwned}, mqttRecoveredInflightReg{}, r)
+			note(r.srcDur, r.srcSeq, mqttContestDisposition{class: mqttContestPubRelEvidenced}, mqttRecoveredInflightReg{}, r)
 		}
 	}
 	for _, fr := range append(claimConsumed, completeConsumed...) {
@@ -5726,7 +6262,14 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		// The placeholder shape trackAsPubRel(pi, _EMPTY_) writes: the ack subject is
 		// filled in by the PUBREL delivery, and mqttDeliverPubRelCb's duplicate guard
 		// already tolerates an empty one.
-		sess.pendingPubRel[r.pi] = &mqttPending{jsDur: r.srcDur, sseq: r.srcSeq}
+		//
+		// regNonce carries the exchange identity even before delivery fills the ack subject.
+		// Without it a finished-slot cleanup could delete the durable slot while this
+		// nonce-less placeholder lingered forever — installTerminalReservationLocked and
+		// releaseTerminalReservation are both nonce-keyed, so neither could adopt or remove
+		// it, leaking the identifier and its Receive Maximum charge (the F-093 crash cut a
+		// holistic round caught). With the nonce, the terminal path adopts and releases it.
+		sess.pendingPubRel[r.pi] = &mqttPending{jsDur: r.srcDur, sseq: r.srcSeq, regNonce: r.owner.Nonce}
 		if r.srcDur != _EMPTY_ {
 			// Reserve the SOURCE too, so a redelivery of it hits the usedForPubRel
 			// guard instead of re-sending a payload the client has already PUBREC'd.
@@ -5750,6 +6293,12 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		}
 		installPubRelLocked(r)
 		restoredRels++
+	}
+	// Terminal cleanup runs after dropping the lock and performs several storage round
+	// trips. Reserve those identifiers now so an outbound callback cannot re-mint one in
+	// the interval before its confirmed slot deletion.
+	for i := range pastPubRecFinished {
+		sess.installTerminalReservationLocked(pastPubRecFinished[i])
 	}
 	for _, rv := range reserve {
 		if ack, live := sess.pendingPublish[rv.rec.PI]; live {
@@ -5791,11 +6340,81 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		reserveSource(rv.rec.Dur, rv.rec.Seq, rv.rec.PI)
 		restoredPubs++
 	}
+	// PAST-PUBREC SLOTS, plus the narrow Retired/publish crash cut. The latter is source
+	// evidence, not permission to manufacture a slot phase, so it receives only the same
+	// non-actionable in-memory reservation; a present exact PUBREL is still required for
+	// route B's durable publish -> pubrel_ready transition.
+	//
+	// Three outcomes, and the middle one is the disclosed residual rather than a bug:
+	//
+	//   - the exchange is PROVABLY FINISHED — terminal, or ready with a complete source
+	//     and no PUBREL record naming it — so the slot is advanced to terminal, deleted,
+	//     and its identifier freed. This is the lost-delete case, and without it a
+	//     re-phased slot holds its identifier for the life of the session.
+	//   - an ACTION IS LIVE. Observing another holder's token proves phase progress, not
+	//     authority, so nothing is advanced, deleted or transmitted: the identifier stays
+	//     reserved and that one exchange is non-actionable until its own holder drains it.
+	//     It does NOT make the identifier space incomplete — the rest of the session
+	//     resumes normally, which is what distinguishes this from opaque.
+	//   - otherwise the exchange is genuinely outstanding: the identifier is reserved as a
+	//     NON-ACTIONABLE pendingPubRel entry, so nothing transmits from it and bumpPI
+	//     cannot re-mint it.
+	pubRelReservations := make([]mqttRecoveredInflightReg, 0, len(pastPubRec)+len(retired))
+	pubRelReservations = append(pubRelReservations, pastPubRec...)
+	for _, rv := range retired {
+		if rv.rec != nil && rv.rec.State == mqttInflightPublish {
+			pubRelReservations = append(pubRelReservations, rv)
+		}
+	}
+	for _, rv := range pubRelReservations {
+		if rv.rec == nil {
+			continue
+		}
+		pi := rv.rec.PI
+		pub := sess.pendingPublish[pi]
+		if pub != nil && (pub.regNonce != rv.rec.Nonce || pub.jsDur != rv.rec.Dur ||
+			pub.sseq != rv.rec.Seq) {
+			skipped++
+			continue // a different in-memory exchange owns this identifier
+		}
+		if rel := sess.pendingPubRel[pi]; rel != nil {
+			if pub != nil && rel.regNonce == rv.rec.Nonce {
+				// The PUBREL-side owner is already installed. Complete only the exact
+				// PUBLISH-side half of the same exchange below.
+			} else {
+				skipped++
+				continue
+			}
+		} else {
+			// OWNER FIRST. F-093 requires the new reservation to exist before the old
+			// PUBLISH entry or source mapping is removed. mqttRecoveredPending also
+			// carries the authoritative slot reference that terminal cleanup needs.
+			e := mqttRecoveredPending(sess.idHash, sess.gen, pi, rv)
+			if e == nil {
+				continue
+			}
+			sess.pendingPubRel[pi] = e
+			restoredRels++
+		}
+		if pub != nil {
+			// Source suppression was installed by the retirement loop above whenever
+			// the source may still be offered. With the PUBREL-side owner now resident,
+			// compare-delete the stale PUBLISH half and only its exact mapping. A send
+			// already in progress remains independently reserved by sendsInFlight.
+			delete(sess.pendingPublish, pi)
+			if m := sess.cpending[pub.jsDur]; m != nil && m[pub.sseq] == pi {
+				delete(sess.cpending[pub.jsDur], pub.sseq)
+			}
+			continue
+		}
+	}
+
 	// The opaque ones reserve their identifier and nothing else: there is no source to
 	// enter in cpending, because the unreadable body is exactly what would have named
 	// it. The entry carries its register sequence, which is what keeps
 	// dropUnredeliverableRetained from mistaking it for a retained send and freeing the
 	// identifier on the next reconnect.
+
 	for _, rv := range opaque {
 		if _, live := sess.pendingPublish[rv.rec.PI]; live {
 			skipped++
@@ -5803,7 +6422,7 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		}
 		if _, asRel := sess.pendingPubRel[rv.rec.PI]; asRel {
 			skipped++
-			continue // a PUBREL record owns it (R2)
+			continue // a PUBREL record proves it is past PUBREC (R2)
 		}
 		sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq, regForeign: rv.foreign}
 		installedOpaque++
@@ -5855,6 +6474,34 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		defer c.Warnf("MQTT: outbound packet identifier allocation resumed for client %q: the durable identifier space was reconstructed", sess.id)
 	}
 	sess.mu.Unlock()
+
+	// The finished past-PUBREC slots, off the lock because each is a CAS and a delete.
+	//
+	// Both steps are needed and in this order: the phase gate refuses a delete from
+	// `pubrel_ready`, deliberately, because a ready slot is the identifier's live durable
+	// claimant. Recovery's completeness proof is what licenses the advance to terminal,
+	// and the advance is what licenses the delete. Neither step alone is sound — an
+	// advance with no delete leaks the slot, and a delete with no advance is the
+	// vacate-a-live-exchange hazard F-092 exists to close.
+	for i := range pastPubRecFinished {
+		ref := pastPubRecFinished[i]
+		if !sess.advanceFinishedSlotToTerminal(c, &ref) {
+			// An action is live, or the slot moved. Either way it is not ours to finish:
+			// the identifier stays reserved and its own holder converges it.
+			continue
+		}
+		switch sess.finalizeTerminalSlot(c, ref) {
+		case mqttTerminalDone:
+			sess.releaseTerminalReservation(ref)
+		case mqttTerminalRetainedReoffer:
+			// Retained for a re-offerable source: free the reservation and reconcile the
+			// slot independently once the source settles (consult 7).
+			sess.releaseTerminalReservation(ref)
+			sess.reconcileRetainedTerminalSlot(c, ref)
+		default:
+			sess.retainAndReconcileTerminal(c, ref)
+		}
+	}
 
 	if len(opaque) > 0 {
 		c.Errorf("MQTT: withholding new outbound QoS 1/2 deliveries for client %q: %d in-flight register(s) are unreadable, "+
@@ -5941,18 +6588,15 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		// fire-and-forget delete, and a verdicted one is deleted with proof and its
 		// verdict released against that proof (F-087 WP3).
 		//
-		// Census C26: recovery's post-scan drop is UNGATED here deliberately, and this is
-		// the one place that is correct. These sequences were classified by the scan that
-		// is still in progress and the slot has not been re-read since — so passing a
-		// reference would assert a state this loop has not proven. The drop set is built
-		// only from records the scan itself read and classified as droppable, and the
-		// gate that matters for them is the classification, not a second look. Anything
-		// acting on a slot AFTER the scan completes carries a reference; see C27.
 		// Census C26: GATED. An earlier revision argued this loop was safe ungated because
 		// the scan had just classified these records; a holistic review refuted that — the
 		// loop runs AFTER the scan, so a remembered global sequence can by then name an
 		// unrelated record under stream-sequence reuse. The reference carried on the drop
 		// supplies the subject, the occupant identity and the freshness fence.
+		// If the slot has since crossed PUBREC, this PUBLISH-side cleanup is stale and
+		// refuses it. Past-PUBREC completion is classified separately above and goes
+		// through advanceFinishedSlotToTerminal plus finalizeTerminalSlot, including the
+		// complete duplicate scan that an ordinary source-completion reap must not bypass.
 		sess.reapRegisterWithVerdictGated(rd.seq, rd.nonce, false, rd.ref, mqttSlotDeleteComplete)
 	}
 	// A register the verdict set named is deleted with PROOF, and its verdict released only
@@ -5965,9 +6609,6 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		// The same property as the loop above, with confirmation forced: the verdict set
 		// names this register by construction, so the delete must be proven whether or
 		// not the map lookup is racing a concurrent forget.
-		// Census C27: also scan-time, and ungated for the same reason as C26 — the verdict
-		// set named this register by construction during this pass. Confirmation is forced,
-		// which is the proof this arm relies on.
 		// Census C27: GATED, same correction as C26. Confirmation stays forced — the verdict
 		// names this register and the delete must be proven — but proof of deletion is not
 		// proof that the right record was addressed.

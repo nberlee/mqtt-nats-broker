@@ -814,8 +814,17 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		sess.mu.Lock()
 		current := sess.drainByDur[jsDur] == d && d.seqs[sseq] == st
 		idHash, gen, pi, ambiguous := sess.idHash, sess.gen, uint16(0), false
+		pastPubRec := false
 		if cur := d.seqs[sseq]; cur != nil {
 			pi, ambiguous = cur.pi, cur.regAmbiguous || cur.ownerUnusable
+			// A recorded intent is the durable fact that this exchange is past PUBREC and
+			// owes a PUBREL, so its in-flight register is now the owner SLOT and owns the
+			// exchange for its whole life (§10.5). Releasing it here — as this path did
+			// before — leaves the recreated PUBREL naming a slot admission can no longer
+			// find, which fail-closes forever: the exact stranding the two ported drain
+			// tests reproduce. The slot is released once, at PUBCOMP terminal cleanup,
+			// addressed through the identifier the record persists.
+			pastPubRec = cur.intent
 		}
 		sess.mu.Unlock()
 		capIDHash, capGen, capturedIdentity = idHash, gen, true
@@ -838,6 +847,12 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		case pi == 0:
 			// No identifier, so no register was ever written (R6: a retained send has no
 			// JetStream backing at all). Nothing to release, and nothing to withhold for.
+		case pastPubRec:
+			// §10.5: a past-PUBREC exchange's register is the owner slot and is NOT
+			// released here. The phase gate independently refuses its deletion in every
+			// past-PUBREC state, so this is enforced, not merely chosen. The claim/intent
+			// removal below still runs (I10), the source is acknowledged, and the PUBREL
+			// forwards; PUBCOMP terminal cleanup performs the one release.
 		case idHash == _EMPTY_ || gen == _EMPTY_:
 			// A real session always carries both. Withhold rather than fall back to
 			// addressing by a remembered sequence: falling back IS the defect.
@@ -1757,6 +1772,14 @@ func mqttPubRelSourceKey(dur string, seq uint64) string {
 //
 // refused is the count, for the diagnostic a caller emits to an operator.
 func (sess *mqttSession) scanPubRelRecords(pubRelSubject string) (records []mqttStoredPubRel, refused int, ok bool) {
+	if sess.asm != nil {
+		sess.asm.mu.RLock()
+		hook := sess.asm.testInflightPubRelScan
+		sess.asm.mu.RUnlock()
+		if hook != nil {
+			return hook(pubRelSubject)
+		}
+	}
 	if pubRelSubject == _EMPTY_ {
 		return nil, 0, true
 	}

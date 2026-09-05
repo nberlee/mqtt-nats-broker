@@ -3886,10 +3886,10 @@ between would leave a live register with no cancellation recorded and **no membe
 able to
 trigger another leave**, and recovery would reserve its identifier indefinitely. `srcAckOwed`
 retirements stay exempt from voiding, for the reason `voidRegistrationsLocked` already
-gives: a
-retirement suppresses a completed exchange rather than claiming an identifier, and
-voiding it
-would re-offer a completed payload as a QoS 2 duplicate.
+gives: the source-side retirement suppresses a completed payload, while F-092's associated
+slot remains the packet identifier's whole-life owner until PUBCOMP. Voiding either fact
+would re-offer a completed payload as a QoS 2 duplicate or free an identifier the client
+still holds.
 
 This closes F-045's forced-leave instance. It does not alter or re-own the UNSUBSCRIBE
 transaction; F-083 already closed the no-`cons` UNSUBSCRIBE instance.
@@ -4401,30 +4401,47 @@ would put every outbound QoS 1/2 message behind the record CAS and the record fe
 
 | phase | who owns the identifier |
 |---|---|
-| PUBLISH sent, not yet acknowledged | the in-flight register, in its `publish` state |
-| past PUBREC | the correlated PUBREL record on `$MQTT_out` (unchanged) |
+| PUBLISH sent, not yet acknowledged | the in-flight slot, in its `publish` state |
+| past PUBREC, no transmission out | the same slot, in `pubrel_ready` |
+| a PUBREL transmission in progress | the same slot, in `pubrel_sending`, holding a non-revocable **action** |
+| PUBCOMP observed while a write was out | the same slot, in `pubrel_terminal_draining` — frees nothing |
+| PUBCOMP observed, no write out | the same slot, in `pubrel_terminal`, until its exact deletion |
 
-**The register's LIFETIME is unchanged: it is still deleted at the PUBREC handoff.**
-What changed is that the register now carries the vocabulary a durable owner slot
-needs — a mandatory `state`, the exchange's canonical PUBREL record identity, and an
-action claim's fields — and that every mutation and deletion of it goes through one
-gated path. Re-phasing it at PUBREC so it survives as the exchange's owner is F-092's
-remaining work and is deliberately **not** done here: without PUBREL admission and a
-terminal release, a surviving slot would outlive the exchange and leak an identifier
-per QoS 2 message, which is worse than the hazard it is meant to fix.
+**ONE record owns the identifier for the exchange's whole life.** That is the change.
+Before it, the identifier's authority MOVED at the PUBREC handoff — from the register to
+the correlated PUBREL record on `$MQTT_out` — leaving it described by two independently
+changing durable sets read by two non-transactional scans, with nothing able to arbitrate
+between them. F-092's whole population is a stale record meeting an identifier a later
+exchange now owns, and five plan revisions tried to arbitrate the two sets before the
+answer turned out to be that there must only ever be one claimant.
 
-Where this is going, and why: the identifier's owner is described today by **two**
-independently changing durable sets — the registers and the PUBREL records — read by
-two non-transactional scans. Nothing can arbitrate between them, which is what lets a
-stale PUBREL record be transmitted under an identifier a later exchange owns (F-092).
-One authoritative record removes the arbitration question rather than answering it,
-and the `state` field is the first half of that.
+**Why a re-read is not a fence.** Broker A reads the slot, pauses before transmitting;
+broker B performs the peer terminal release; a later exchange installs a new slot under
+that identifier; A resumes and transmits the stale PUBREL. `sendsInFlight` is
+process-local and fences nothing across brokers, so moving the read closer to the write
+only narrows the window. A successful CAS is different in kind: it establishes an
+invariant that REMAINS TRUE THROUGH the action. While an action is live, custody
+transfer, slot replacement, ordinary deletion, identifier release and terminal deletion
+all refuse, and only the action's own holder may drain it.
 
-The source acknowledgement is still **confirmed** before the register is deleted — the
-standing rule wherever a durable record is deleted on the strength of an ack — which
-keeps the register from being removed over a source that was never actually released,
-and so keeps the redelivery's identifier. Where a register and a PUBREL record name
-the same source at recovery, the PUBREL record wins.
+**There is no lease, no TTL and no steal**, and that is not conservatism. A broker can
+pause AFTER its own expiry check, let a lease lapse, and resume into the same stale write;
+and an MQTT client cannot validate a fencing token, so the external effect is not
+fenceable downstream. An abandoned action therefore holds its identifier until its own
+holder drains it, the generation is discarded, or an operator intervenes — stated as a
+real availability cost in `docs/CONFORMANCE.md` rather than disguised as bounded failover.
+
+The slot is the one authoritative owner; the PUBREL record is evidence and payload, not
+a second identifier claimant. At terminal, cleanup performs a complete scan of the
+incarnation's PUBREL subject, discharges affine proof before disposing every valid
+same-nonce canonical or duplicate record, rereads the slot's freshness fence, and only
+then exact-deletes it. It also requires the named source to be non-reofferable for every
+terminal slot, not only one whose `Retired` bit is already set. The phase itself is durable
+evidence that the payload is past PUBREC; a crash may have landed that phase but not the
+later retirement mark, and deleting the slot in that window would let a live source be
+sent again. `Complete` and `Lost` are distinct—the latter never licenses reaping a
+PUBLISH-phase exchange—but after PUBCOMP both mean no source can be re-offered. A live or
+unknown source, incomplete scan or failed disposal keeps `pubrel_terminal`.
 
 **Every mutation of a slot goes through one gated path.** `casInflightSlot` loads the
 record, proves the occupant is still this exchange, applies the phase gate, mutates
@@ -4432,6 +4449,17 @@ only the caller's own fields and CASes at the sequence the load returned. Rebuil
 record from remembered arguments — which the mark helpers used to do — silently dropped
 every field the rebuilder did not know about, and once a register carries a phase and a
 canonical record identity that is a defect rather than a shortcut.
+
+The destructive gate is phase-aware. `Retired` remains what the schema says it is: a fact
+about source suppression, not a second encoding of the slot phase. An exact stored PUBREL
+is what lets recovery complete `publish → pubrel_ready`; once that explicit phase lands,
+delete-complete, delete-never-transmitted and same-source replacement all refuse it.
+Cancellation writers load first and may set only their own bit while the current slot is
+still PUBLISH; a create-only pending cancellation that loses its first CAS likewise rereads
+and refuses to retarget past PUBREC. Consumer teardown uses that cancellation disposition
+so a same-exchange rewrite is tombstoned rather than mistaken for another owner's completed
+work. The no-resident-session affine sweep applies the same phase rule—absence of a local
+object does not make an explicitly past-PUBREC owner disposable.
 
 Deletion is **subject-addressed, identity-authorized and freshness-fenced**, and those
 are three separate requirements. The subject is the address (F-034); the exchange nonce
@@ -4516,9 +4544,8 @@ it is evidence about one exchange rather than a claim on an identifier. Absent o
 malformed is an unsupported persisted shape and is refused. A retained QoS 2 send has
 no register at all (R6), so it mints its exchange nonce into the in-memory reservation
 and carries it on the record; its authority is that reservation and nothing durable. Such
-a record surviving a restart is therefore **not** refused today — its owner is
-syntactically valid and recovery has nothing to compare it against — and that is
-`docs/CONFORMANCE.md`'s stated residual rather than a property of this mechanism.
+a record surviving a restart is refused and left unacknowledged because the live owner
+identity died with the process.
 
 A drain's past-PUBREC intent carries the same identity on the session record, as its
 `OwnerNonce`, and it is validated before the intent is saved. An intent restored WITHOUT
@@ -4586,12 +4613,13 @@ defect, so there is exactly one decoder and an AST guard
 is UNREADABLE, which every caller already had a conservative path for: retain the record,
 reserve the identifier, prove nothing from the body.
 
-**What is not yet built, and is deliberately named here rather than implied:** PUBREL
-admission is exactly as it was, the register is still deleted at PUBREC, and the
-durable action claim that fences the socket write, the terminal states, route B's
-dispatch and the withheld-action recovery outcome are all F-092's remaining work. The
-stale-PUBREL multiplexing hazard is therefore **still open**. What exists now is the
-shape, the identity and the gating that the rest is built on.
+PUBREL admission, the durable action claim, route B, the terminal states and the
+withheld-action recovery outcome are implemented together. Recovery refreshes custody
+for quiescent, live, unretired and uncancelled QoS 2 slots, plus the narrow retired-ready
+population for which a present PUBREL record names the exact exchange. The latter is still
+actionable—the client is waiting for PUBREL—where a retired flag by itself is not authority.
+Active actions retain the custody under which they were acquired, and terminal cleanup is
+custody-agnostic.
 
 An acknowledgement that cannot be confirmed needs one more thing. The source may still
 be pending, so JetStream will re-offer it — and its payload is past PUBREC, so sending
@@ -4616,6 +4644,12 @@ not optional. Without it the next resume sees an ordinary PUBLISH-phase register
 still-live source — indistinguishable from a delivery that never reached PUBREC — and
 re-sends a payload the client has already completed. Leaving the source deliberately
 unacknowledged is precisely what makes that window reachable.
+
+Recovery closes the crash cut before that mark: any slot whose durable phase is already
+past PUBREC is itself sufficient to install the in-memory suppression before source
+interest opens, and recovery then writes the missing `Retired` mark at the custody-
+refreshed sequence. Terminal cleanup retains the slot while the source can still be
+re-offered, so neither PUBCOMP nor recovery can erase the last durable proof first.
 
 That mark is not best-effort either, and the reason is worth following. While the
 exchange's **PUBREL record** exists a restart is safe whatever the register says, because
@@ -4678,11 +4712,16 @@ The invariants, in the order they matter:
   an identifier the client is holding gets handed to a second message — and because
   such a record's *source* cannot be identified either, it additionally makes the
   identifier space incomplete (above).
-- **Every terminal path deletes the register**, at its exact sequence: PUBACK, a
-  failed PUBREC, the PUBREL store, Message Expiry, Maximum Packet Size, and every
-  consumer teardown that abandons started deliveries. A failed delete costs a stale
-  record that the store path's reconcile, the next resume scan, or the orphan sweep
-  removes; it never wedges an identifier.
+- **QoS 1 and pre-PUBREC terminal paths delete the register** at its exact sequence:
+  PUBACK, a failed PUBREC, Message Expiry, Maximum Packet Size, and a pre-PUBREC consumer
+  teardown that abandons a started delivery. A failed delete costs a stale record that the
+  store path's reconcile, the next resume scan, or the orphan sweep removes; it never wedges
+  an identifier. **A QoS 2 exchange PAST PUBREC is different**: the owner slot lives the
+  whole exchange (F-092/F-093). The PUBREL store no longer deletes the register — it advances
+  the slot to `pubrel_ready` — and a past-PUBREC teardown, an active action and an
+  indeterminate terminal cleanup all deliberately PRESERVE the slot. Its one delete is at
+  terminal cleanup after PUBCOMP (or a proven-finished recovery), addressed through the slot
+  the exchange carried; an indeterminate cleanup keeps the identifier reserved and retries.
 - **A surviving register is assumed client-held unless it proves otherwise.** Two very
   different things can leave a register behind: a delivery that really went out and
   whose consumer was later destroyed, and one this session gave up — an allocation
@@ -4780,13 +4819,13 @@ The invariants, in the order they matter:
   persisted with the session record. A proven rung ends the story and forgets the
   verdict; the first two rungs share a storage domain (`$MQTT_inflight`) and usually
   fail together, which is exactly when the third matters. The one exception is a
-  **retired** QoS 2 register: its record is not a claim on an identifier but the durable
-  *suppression* of a completed-but-unproven exchange, so its cleanup is delete-or-leave
-  — a tombstone or a verdict would have recovery drop it without reinstating the
-  suppression, and a crash before the consumer delete would then resend the completed
-  payload. Left alone, recovery re-reads it as a retirement; the residue when the
-  consumer is also gone is a parked retirement, which reserves no identifier and no
-  Receive Maximum slot.
+  **retired** QoS 2 source: `Retired` proves that the source crossed PUBREC, not that the
+  slot reached an explicit past-PUBREC phase or that PUBCOMP arrived. Consumer teardown
+  removes the now-unneeded source suppression but does not queue that slot into the raw
+  never-transmitted ladder; deleting or tombstoning it would falsely license identifier
+  reuse. A present exact PUBREL lets recovery complete the durable phase handoff; without
+  one, recovery keeps a known, non-actionable identifier reservation without inventing
+  `pubrel_ready`.
 - **A withdrawn identifier is released only settled AND proven.** The reservation a
   teardown leaves on a cancelled allocation guards two different hazards, and both
   release conditions are load-bearing. Until the original store SETTLES, the identifier
@@ -5327,7 +5366,37 @@ The invariants, in the order they matter:
   Once ownership moves the term is inert, and soundly so: no additional identifier-bearing
   PUBLISH *under that identifier* can reach the orphan's socket, because every route that
   could frame one opens a reservation refused on `sess.c != cc`.
-  **PUBREL admission is deliberately UNCHANGED by this mechanism.** `beginPubRelSendLocked`
+  **PUBREL ADMISSION IS NOW A DURABLE GATE.** No SLOT-BACKED PUBREL bytes are transmitted
+  without first ATOMICALLY ACQUIRING `pubrel_sending` on the slot that owns the identifier,
+  and that acquisition is what permits the write — not the nonce, and not the callback
+  having been reached. The one exception is a live retained exchange, which has no slot
+  (R6) and is authorized instead by the live in-memory owner identity of its incarnation,
+  refused once that identity is gone. The stated invariant is deliberately NOT "the slot
+  must already say
+  `pubrel_ready`": the store is what makes a record deliverable, and JetStream delivers it
+  before the PUBREC handler's own phase CAS can run, so requiring `pubrel_ready` refused
+  the very PUBREL the PUBREC had just created and every exchange waited out AckWait. A
+  valid same-nonce record on a `publish` slot is therefore admitted through a **direct
+  `publish -> pubrel_sending` arrow** that installs the canonical record identity and the
+  action token in ONE CAS. That is sound because a stored PUBREL cannot exist without a
+  PUBREC: the ordinary producer stores only on the successful-PUBREC path, the only other
+  producer is route-B recreation from a persisted past-PUBREC intent, and the builder
+  refuses an absent or invalid owner nonce.
+
+  Exactly ONE shape is authorized without a slot: a **retained** exchange has no register
+  at all (R6) and is authorized by the exact live in-memory owner identity of this
+  incarnation, which is why a retained record surviving a restart is refused rather than
+  transmitted. A **drained** past-PUBREC exchange is NOT slot-less: §10.5 keeps its owner
+  slot for the exchange's whole life (the drain does not release the register pre-forward),
+  so its PUBREL transmits under an action acquired on that slot like every other slot-backed
+  PUBREL. Its
+  persisted drain intent is recovery EVIDENCE, not transmission authority — it authorizes
+  recreating the record under the exchange's own owner nonce and gates the recovery-time
+  reconciliation, but transmission still binds to the slot's durable action. The intent,
+  the record and the slot all carry the register's own `regNonce`, so they name one
+  exchange; a record whose nonce differs from the slot's is a different exchange, refused.
+
+  `beginPubRelSendLocked`
   refuses an active transmission token, as it always did, and NOT a retained-only hold —
   so a PUBREL token and PUBCOMP debt may sit beside a retained term on one hold, which is
   coherent because the owner matches and both `endSend` and `consumePubRelAckLocked` ask
@@ -5338,8 +5407,12 @@ The invariants, in the order they matter:
   `pendingPublish` entry breaks the UNSUBSCRIBE drain, which legitimately recreates a
   correlated PUBREL under a recovered entry's identifier; and one on a source-less entry
   starves an abandoned frame's record for the connection's life. The stale-PUBREL
-  multiplexing hazard is owned wholly by F-092, whose fence correlates the record against
-  the entry holding the identifier — a decision only the delivery callback can make. A
+  multiplexing hazard is owned wholly by F-092, whose fence admits a stored slot-backed
+  PUBREL only under an action atomically acquired on the DURABLE OWNER SLOT that owns the
+  identifier — never a correlation inferred against whatever in-memory entry holds it. A
+  live retained exchange is the one slot-less admission: no register and so no slot (R6),
+  authorized instead by the live in-memory owner identity of its incarnation and refused
+  once that identity is gone. A
   successful PUBREC is ordinary successor custody: it replaces the PUBLISH entry with a
   `pendingPubRel` one, and the retained term is untouched by it. That is deliberately not
   the stronger "every transmission passes a send gate" — QoS 0 has no gate — nor "no
@@ -5387,12 +5460,10 @@ The invariants, in the order they matter:
   continuation is idempotent against another remover's durable work. Terminal
   acknowledgements park their identifier-freeing half (their protocol answer is
   unaffected), while a successful PUBREC needs no transfer machinery at all, the registry
-  holding the identifier however the entries move. A PUBCOMP parks nothing and defers
-  nothing: a PUBREL has no in-flight register — the identifier's durable authority moved
-  to the PUBREL record at the PUBREC handoff (R2) and the register was deleted there — so
-  the only durable act it owes is acknowledging that record, and doing so while a
-  duplicate write is out is both safe and preferable, since the client has answered and
-  the ack stops further redeliveries.
+  holding the identifier however the entries move. F-089 originally required no PUBCOMP
+  park because the register was then deleted at PUBREC. F-092 replaced that handoff: the
+  same slot now survives through the PUBREL states, PUBCOMP terminalizes it, and terminal
+  cleanup disposes the matching PUBREL records before deleting the slot.
 
 A session discard removes the retiring incarnation's registers with a **bounded reap**
 rather than arbitrating each one as the inbound hold walk does: on the discarding broker

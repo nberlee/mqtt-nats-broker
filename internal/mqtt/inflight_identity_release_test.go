@@ -1485,16 +1485,16 @@ func TestClaimRecoveredSharedInflightRefusesAMismatchedOccupant(t *testing.T) {
 		rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 42, Dur: dur, Seq: 500, QoS: 2, Nonce: nonce},
 		seq: seq + 7,
 	}}
-	owned, closed, opaque, displaced := e.sess.claimRecoveredSharedInflight(e.c, in)
+	owned, closed, opaque, displaced, withheld := e.sess.claimRecoveredSharedInflight(e.c, in)
 
 	if len(closed) != 0 {
 		t.Errorf("the contest read a body naming another identifier as a CLOSE decision (%+v): "+
 			"its caller deletes at that sequence, destroying a record recovery reserves",
 			closed[0].seq)
 	}
-	if len(owned) != 0 || len(displaced) != 0 {
-		t.Errorf("the contest reached a verdict it cannot support: owned=%d displaced=%d",
-			len(owned), len(displaced))
+	if len(owned) != 0 || len(displaced) != 0 || len(withheld) != 0 {
+		t.Errorf("the contest reached a verdict it cannot support: owned=%d displaced=%d withheld=%d",
+			len(owned), len(displaced), len(withheld))
 	}
 	if len(opaque) != 1 {
 		t.Fatalf("an uninterpretable occupant must leave the identifier RESERVED, got %d opaque", len(opaque))

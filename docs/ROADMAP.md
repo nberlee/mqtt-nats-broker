@@ -2504,10 +2504,9 @@ takeover.
   That closes the primary race and leaves the SECOND-ORDER one open, which is the one
   the dossier calls worse: `endSend` frees the identifier the moment the write returns,
   and the duplicate's own later PUBCOMP then acknowledges away a re-minted exchange's
-  PUBREL record. The park is also machinery the PUBREL side does not need — a PUBREL has
-  no in-flight register, its durable authority having moved to the PUBREL record at the
-  PUBREC handoff (R2), so PUBCOMP defers nothing and acking the record while a duplicate
-  write is out is preferable, not merely safe.
+  PUBREL record. At the F-089 landing, the park was also machinery the PUBREL side did not
+  need: the register was then deleted at PUBREC and authority moved to the PUBREL record.
+  F-092 later replaced that handoff with the whole-exchange owner slot documented below.
   **What landed instead:** one hold on F-087's existing registry with TWO release
   conditions — the write has returned, AND every PUBREL transmitted under that identifier
   has been PUBCOMPed, which is the event [MQTT-2.3.1-4] actually names. The two differ
@@ -2614,7 +2613,111 @@ takeover.
   min(published, granted) — this item only
   refused to add a second route into it.
 
-- [ ] **F-092: a stale stored PUBREL can be transmitted under an identifier another exchange
+- [ ] **F-092: a stale stored PUBREL can be transmitted under an identifier another
+  exchange owns.** **NOT fully closed — ONE open item as of 2026-09-05 (#2 below).** The
+  seventh increment closes the custody, census, canonical-origin and terminal-disposal gaps,
+  and three holistic review rounds are resolved EXCEPT one: **#2, the custody-after-drain
+  stall.** A slot taken over during an active action is correctly withheld at recovery, but
+  when the predecessor's action later drains it leaves the predecessor's Claim, so nothing
+  re-runs custody for the already-connected successor and admission fails
+  `cur.Claim==sess.regClaim` until the next reconnect (at Receive Maximum 1 that stalls all
+  QoS 1/2 delivery). Recoverable, no data loss / no F-092 transmission. Codex ruled the fix
+  (Decision 7, an F-036-grade post-action-CAS `$MQTT_sess` ownership fence + a successor
+  reconcile) in the lane's `DECISIONS.md`; its foundational `mqttSlotTransferCustody` CAS
+  predicate is landed, the rest is a deferred focused pass. Work record:
+  in the sixth attempt
+  (`~/.claude/lanes/f-092-sixth-attempt/`). One `$MQTT_inflight` record — the owner slot —
+  now owns an exchange for its WHOLE life, so the identifier has exactly one durable
+  claimant instead of two independently changing durable sets nothing could arbitrate
+  between, and **no SLOT-BACKED PUBREL bytes are transmitted without first ATOMICALLY
+  ACQUIRING a non-revocable action on that slot**. A live retained exchange is the one
+  exception: it has no register (R6) and so no slot, and is authorized by the live in-memory
+  owner identity of its incarnation, refused rather than transmitted once that identity is
+  gone. A record naming a different exchange is refused and deliberately NOT acknowledged,
+  so AckWait re-offers it and a refusal can never lose a PUBREL the client is owed.
+
+  **What the attempt learned that the plan had wrong.** The stated invariant "a
+  `publish`-state slot with a matching nonce is REFUSED (the phase is the permission, not
+  the nonce)" was **incorrect**, and consult 3 confirmed the refutation: a stored PUBREL
+  cannot exist without a PUBREC — the ordinary producer stores only on the successful-PUBREC
+  path, the only other is route-B recreation from a persisted intent, and the builder refuses
+  an absent owner nonce — so a valid same-nonce record IS durable evidence of PUBREC. And
+  requiring `pubrel_ready` was not merely over-strict: the store makes a record deliverable
+  and JetStream delivers it BEFORE `storeMsg` returns, so no CAS ordering can make the phase
+  visible first, and the requirement made every ordinary outbound QoS 2 exchange wait out
+  AckWait — refutation 0's regression by another route. The corrected invariant is the
+  atomic acquisition above, satisfied by a **direct `publish -> pubrel_sending` arrow** that
+  installs the canonical record identity and the action token in ONE CAS.
+
+  **Only the retained shape is authorized without a slot**, and only by the exact live
+  in-memory owner identity of its incarnation, which is why a retained record surviving a
+  restart is refused rather than transmitted (R6 closed). A drained exchange's persisted
+  intent is recovery evidence, not transmission authority: after the past-PUBREC drain keeps
+  its owner slot to terminal, its PUBREL acquires the same durable action as every other
+  slot-backed exchange.
+
+  **The residual is stated in `docs/CONFORMANCE.md`:** an abandoned action holds its
+  identifier for an unbounded TIME. Finite failures recover; process loss, a permanently
+  blocked holder and indefinitely unavailable storage do not. There is no lease, TTL or
+  steal, because a broker can pause after its own expiry check and an MQTT client cannot
+  validate a fencing token. The per-session bound is the actions admitted under historical
+  limits, ultimately 65,535 — NOT the current effective capacity, since Receive Maximum is
+  re-evaluated on every CONNECT — and there is no global bound across sessions.
+
+  **What the sixth attempt left, and why it did not ship.** Two consecutive holistic review
+  rounds returned NO-SHIP, both on F-092's core hazard rather than on peripheral gaps, and
+  the second was explicit that "recording these risks does not make the claimed F-092
+  closure safe". `make full-suite` is RED on two drain tests
+  (`TestMQTTDrainRecreateEscapesASkippedStore`,
+  `TestMQTTDrainClusterLateForeignPubRelStore`), both traced to the unbuilt route B. The
+  lane is `~/.claude/lanes/f-092-sixth-attempt/`; `review-ledger.md` carries every round,
+  both convergence verdicts, three consults and the eleven implementation bugs found by
+  running rather than reading.
+
+  **The two entangled blockers the seventh increment settled**, after the cheaper ways round
+  them were refuted:
+
+  1. **Admission now proves actionable custody.** Recovery refreshes the positively
+     eligible `publish` and `pubrel_ready` population before CONNACK, and admission requires
+     `cur.Claim == sess.regClaim`. Action acquisition also carries the observed custody
+     tuple into its CAS predicate, so a successor's transfer between the admission check and
+     the CAS is refused rather than followed. The blanket `publish` rewrite remains
+     withdrawn because it rewrote cancelled and tombstoned records.
+  2. **Restart and skipped-store drain cases have no authority admission can recognise**,
+     which is route B. A recovered in-memory reservation was tried as authority and
+     REFUTED: it is process-local, so during a takeover two brokers hold matching ones and
+     a lagging predecessor transmits without seeing the successor's changes — F-092
+     recreated by its own fix. Codex's alternative is the right one and is the work:
+     "affirmative persisted authority comparable to a drain intent."
+
+  **Also refuted, and not to be re-proposed:** §8.1's absent-slot disposal. A register can
+  be legitimately released by the drain path while the exchange is still in `publish`,
+  so an
+  absent slot does NOT prove the exchange is over; narrowing it twice still left it
+  acknowledging away a PUBREL the client was owed. It now fails closed, and residue costs
+  `$MQTT_out` space (R3) rather than a message.
+
+  **What the sixth attempt had built, tested and mutation-checked at that checkpoint**, and
+  what the final increment completed rather than re-derived:
+
+  - **Admission's custody check was still missing there.** It had been implemented and
+    reverted because `regClaim` is not persisted and the refresh did not yet cover every
+    state admission reads. The seventh increment added the universal positive classifier,
+    completed the ready-state coverage and restored the check plus its exact-CAS predicate.
+  - **§8.1's absent-slot disposal is withdrawn as unsound**, and the reason generalises: a
+    register can be legitimately released by the drain path while the exchange is still in
+    `publish`, so an absent slot does NOT prove the exchange is over. Narrowing it twice
+    still left it acknowledging away a PUBREL the client was owed. The disposition is fail
+    closed — refuse, never acknowledge — so genuine residue occupies stream space (R3)
+    rather than costing a message.
+  - Route B's full nine-crash-cut recovery, and canonical/same-nonce duplicate disposal
+    with its complete terminal scan.
+  - **Fourteen census rows remained `planned` at that checkpoint.** The seventh increment
+    maps them to live tests and the final mode (`MQTT_CENSUS_FINAL=1`) now passes.
+
+  The original filing follows.
+
+  **F-092: a stale stored PUBREL can be transmitted under an identifier another exchange
   owns.** Filed 2026-08-31 by F-091's holistic review (round 5) and its reconcile consult.
   NOT an alpha blocker on the reading that reached it, but it is the same
   identifier-multiplexing class as F-088/F-089 and should be judged with them. *The finding:*
@@ -2813,7 +2916,8 @@ takeover.
   `pendingPubRel` the two are indistinguishable and the cost is an extra PUBREL/PUBCOMP
   cycle, never a payload under the wrong exchange.
 
-  **PARTLY IMPLEMENTED 2026-09-03 — the box STAYS OPEN.** The in-flight register now
+  **Historical sixth-attempt checkpoint (2026-09-03; superseded by the closure above).** At
+  that point the in-flight register
   carries the vocabulary a durable owner slot needs, and every mutation of it is gated.
   That is the substrate the rest is built on. **The register's lifetime is UNCHANGED —
   it is still deleted at the PUBREC handoff.** Re-phasing it to survive as the
@@ -2837,7 +2941,7 @@ takeover.
   and the phase gate wired into the register-mutation and identifier-release edges C01,
   C04, C05b, C08, C09, C19, C21, C26, C27, C28, C39a/b.
 
-  **What was built and then DELETED before this landed, on a review ruling**, because
+  **What had been built and then DELETED before that checkpoint, on a review ruling**, because
   nothing produced any of it: the four non-`publish` states; the five durable fields
   `ActionToken`/`ActionClaim`/`ActionClaimSeq` and `PubRelDurable`/`PubRelStreamSeq`;
   `mqttInflightSlotRef.actionToken` and its `holdsAction`; the `mqttSlotDrainAction`,
@@ -2866,7 +2970,7 @@ takeover.
   property is now bidirectional: every access is exempt, every exemption exists, every
   exemption is used.
 
-  **What is NOT built, so neither F-092 nor F-093 is fixed:** PUBREL **admission** is
+  **What was NOT built at that checkpoint:** PUBREL **admission** was
   unchanged and the register is still deleted at PUBREC, so the stale-record hazard is exactly
   as before. Named explicitly because a holistic round found the docs claiming
   otherwise: a **retained** exchange's stored PUBREL surviving a restart is still
@@ -2876,8 +2980,9 @@ takeover.
   A retained send has no register at all (R6), so nothing durable can authorize it
   and admission is the only place this closes.
 
-  Outstanding are the PUBREC re-phasing and its terminal release, the durable
-  action claim that fences the no-deadline socket write (with its arm-before-CAS holder
+  Outstanding at that checkpoint were the PUBREC re-phasing and its terminal
+  release, the durable action claim that fences the no-deadline socket write
+  (with its arm-before-CAS holder
   lifecycle, pre-write abort and drain retry), §7's exact live-PUBLISH-send-token refusal,
   the terminal states and PUBCOMP's terminal cleanup, canonical/same-nonce duplicate
   disposal, route B's four-way dispatch and its nine crash cuts, the
@@ -2903,6 +3008,29 @@ takeover.
   widening this item or blocking its general solution.
 
 - [ ] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
+  identifier.** **Built and tested; ticks with F-092** ("take both or neither"), which is
+  NOT fully closed pending F-092's open #2 above.
+  The ordered handoff below is built and tested, and
+  it
+  is the half that was missing. The ordered handoff runs under one session-lock
+  section: the same-nonce PUBREL
+  owner is installed, then the source suppression, then the PUBLISH entry is compare-deleted,
+  then its `cpending` mapping is compare-deleted GUARDED on the identifier it names — unlike
+  `untrackPublishEntry`, which deletes unconditionally and would remove a mapping a different
+  identifier now owns. A completed exchange leaves no `pendingPublish` entry and no mapping,
+  so it no longer reserves an identifier and a Receive Maximum slot for the life of the
+  session, and no longer charges that identifier twice while both entries live.
+
+  One subtlety worth keeping: the suppression is installed as **already durable** when an
+  action was acquired, because a past-PUBREC slot IS the durable statement that the exchange
+  is past PUBREC — marking it insecure made PUBCOMP withhold the acknowledgement until a
+  second mark was written for a fact the slot already implied, and the client got a duplicate
+  PUBREL. On the drain-intent path no retirement is installed at all: the drain state machine
+  owns that source.
+
+  The original filing follows.
+
+  **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
   identifier.** Filed 2026-08-31 by F-091's reconcile consult, which found it while refuting
   the general PUBREL fence. NOT an alpha blocker: the residue is one identifier and one
   Receive Maximum slot per occurrence, not a data loss. *The finding:* `finalizeDrainDelivery`
@@ -3751,6 +3879,35 @@ does **not** make them a compatibility or regression gate:
 
 Historical closed findings remain closed as evidence about the implementation that exists;
 they do not impose a promise that later alpha work preserve that implementation unchanged.
+
+### Fallout from F-092's admission half, filed here by the supported-scope rule
+
+F-092's sixth attempt (closed 2026-09-04) left **two experimental affine failures**, measured
+against HEAD `77c2168` in a separate worktree rather than remembered: HEAD's baseline is four
+failures in `make experimental-shared-qos2-tests` and the tree's is six. The two new
+ones are affine-only, so by the 2026-09-02 supported-scope rule they are appended
+here rather than widening that item.
+
+- **`TestQ2AffForgedRegisterCannotCreditAnotherClaim`.** The affine disposer cannot
+  delete a slot in `pubrel_ready`, because the phase gate refuses
+  `mqttSlotDeleteComplete` from every past-PUBREC state — deliberately, since a ready slot
+    is the identifier's live durable
+  claimant. The disposer needs the same **advance-then-delete** treatment recovery got:
+  a proof that the exchange is finished licenses an advance to `pubrel_terminal`, and
+  the advance licenses the delete. Neither step is sound alone.
+- **`TestQ2AffDuplicatePubRelCallbackDischargesBeforeAcking`.** An affine duplicate
+  whose slot is absent is no longer acknowledged, so it redelivers forever. The
+  supported-path stance is now FAIL-CLOSED — §8.1's absent-slot disposal was refuted, so
+  a record carrying a valid SOURCE CORRELATION with a definitely-absent slot is REFUSED,
+  not acknowledged (an absent slot cannot prove the exchange is over; a register can be
+  released by the drain path while the exchange is still in `publish`). It is genuine
+  residue that may occupy `$MQTT_out` until a complete terminal scan or operator removal
+  (R8). An affine duplicate carries an affine reference and no source correlation, so it
+  is likewise refused; a retained record is slot-less by construction and must stay
+  refused and unacknowledged (R6).
+
+Both are consequences of the phase gate and the admission scope working as specified on the
+supported paths, not of an affine defect newly introduced. Neither is an alpha blocker.
 
 ### One gathered completion item
 

@@ -306,11 +306,10 @@ func TestForcedLeavePendingOnlyTargetIsPurgedButNotDeleted(t *testing.T) {
 //
 // The pending derivation deliberately reaches srcAckOwed, because a retirement's durable can be
 // reachable through no other map. But voidRegistrationsLocked must NOT void it, and its own
-// comment gives the reason: a retirement is not a claim on a packet identifier, it is the
-// durable SUPPRESSION of a completed-but-unproven QoS 2 exchange. Void it and recovery drops the
-// suppression without reinstating it, the source becomes live and re-offerable, and the
-// completed payload goes out a second time — a QoS 2 duplicate, strictly worse than the bounded
-// stale metadata that leaving it alone costs.
+// comment gives the reason: Retired proves the source crossed PUBREC, so voiding it would
+// falsely say the delivery was never transmitted. It does not itself encode the slot phase;
+// a stored PUBREL and the explicit phase govern admission. The source suppression may go
+// with its consumer, but teardown's never-transmitted ladder may not consume the slot.
 //
 // So this asserts an ABSENCE, paired with the positive half in the same test: the retirement's
 // durable IS discovered by the derivation, and then deliberately not voided.

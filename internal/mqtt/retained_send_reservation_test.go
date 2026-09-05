@@ -512,9 +512,10 @@ func TestMQTTRetainedSendTakesOverAnInertHoldExactly(t *testing.T) {
 //
 // The other half of round 1's finding — a retained-term REFUSAL in beginPubRelSendLocked —
 // was implemented, then REFUTED across holistic rounds 8, 9 and 10 and DELETED (lane
-// DECISIONS.md, D4). PUBREL admission is unchanged from before F-091, so a PUBREL token and
-// PUBCOMP debt may now legitimately sit beside a retained term on one hold; what this test
-// asserts is that discharging one does not discharge the other.
+// DECISIONS.md, D4). F-092 later put durable admission in the delivery callback rather than
+// this primitive, so a PUBREL token/action and PUBCOMP debt may still legitimately sit
+// beside a retained term on one hold; what this test asserts is that discharging one does
+// not discharge the other.
 func TestMQTTPubCompDoesNotDestroyARetainedReservation(t *testing.T) {
 	t.Parallel()
 	e := testNewRetainedEnv(t, "retained-pubcomp")

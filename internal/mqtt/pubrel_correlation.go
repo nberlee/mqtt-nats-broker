@@ -63,19 +63,17 @@ const (
 	// unsupported persisted shape and is REFUSED — never interpreted, never transmitted,
 	// never acknowledged away.
 	//
-	// What this header does NOT yet do, stated here because an earlier revision of this
-	// comment claimed otherwise and a holistic round caught it: admission checks only that
-	// the owner is SYNTACTICALLY valid. The rule the design is heading for — a record may
-	// act under an identifier only while the slot for that identifier is in its PUBREL
-	// phase and names this same nonce — needs PUBREL admission, which is F-092's unbuilt
-	// half. Until then a valid-looking owner is enough to be transmitted.
+	// The header is evidence, not authorization. For a slot-backed PUBREL, admission loads
+	// the PI-scoped owner slot, matches this nonce together with the source and affine
+	// identity, proves current session custody, and atomically acquires a non-revocable
+	// action before transmitting.
 	//
 	// The retained case is where that gap bites hardest, and it is a stated residual rather
 	// than a property of this header. A retained QoS 2 send has no slot at all (R6): it
 	// mints its exchange nonce into the in-memory reservation and carries it here, so its
 	// authority is that reservation and nothing durable. After a restart the reservation is
-	// gone and the record's owner is still syntactically valid, so nothing refuses it — see
-	// docs/CONFORMANCE.md, which says so in those terms.
+	// gone, so admission refuses the record rather than treating this syntactic identity as
+	// durable authority; see docs/CONFORMANCE.md.
 	mqttPubRelOwnerHeader = "Nmqtt-Q2Owner"
 )
 
