@@ -247,6 +247,20 @@ type mqttDrain struct {
 	// never charged, matching restored consumers.
 	charged bool
 
+	// retired is TERMINAL: this drain has been through retirement, so its sid is
+	// released, its delivery path is closed and its consumer has been delete-requested.
+	// Nothing may hand this object back to the session.
+	//
+	// Never cleared. Clearing it once a delete looked slow is the refuted design in which
+	// a late delete destroys a consumer that has come back into service.
+	//
+	// Scope: this drain OBJECT within this resident session object's lifetime. A fork
+	// sibling's record can rebuild the drain on a fresh object, which no per-object flag
+	// reaches; that residual is stated in docs/CONFORMANCE.md. In-memory only, and it
+	// needs no crash survival — after a restart the record names no drain for a retired
+	// sid, so there is no object to protect.
+	retired bool
+
 	// cancelled names the sequences whose in-flight registration this staging cancelled,
 	// each with the withheld marker installed for it. A ROLLBACK keeps those markers, so a
 	// later first transmission still carries DUP=0; a COMMIT drops them, because the
@@ -605,6 +619,14 @@ func (sess *mqttSession) clearDrainInactivityTimers(c *client, drains []*mqttDra
 			sess.mu.Unlock()
 			continue
 		}
+		// A retired drain's durable has been delete-requested, so recreating a consumer
+		// under its name would be issuing a create for something this object no longer
+		// uses. Re-checked here, immediately before the create, because the loop releases
+		// sess.mu between items.
+		if d.retired {
+			sess.mu.Unlock()
+			continue
+		}
 		cfg := *d.cc
 		claimed := d.claimedCount()
 		sess.mu.Unlock()
@@ -690,6 +712,18 @@ func (sess *mqttSession) dropDrainLocked(d *mqttDrain) string {
 // sess.mu must be held, or the session must not yet be reachable.
 func (sess *mqttSession) restoreDrainLocked(sid string, d *mqttDrain) {
 	if sid == _EMPTY_ || d == nil || d.cc == nil {
+		return
+	}
+	// Terminal retirement, refused at the door. DEFENSIVE, and labelled so rather than
+	// presented as a live route: no production schedule reaches here with a retired object
+	// today — the fork-repair and record-restore callers all mint fresh objects through
+	// mqttDrainFromPersisted, and undoPlans restores only when p.sid is non-empty, which
+	// dropDrainLocked returns empty for an already-retired object. The guard is here
+	// because this is the package's only re-insertion of an EXISTING drain object into both
+	// maps, and a terminal invariant belongs at that one door. (stageDrain writes both maps
+	// too, but for a freshly staged drain built from a live consumer, which can never be a
+	// retired object.)
+	if d.retired {
 		return
 	}
 	if sess.drains == nil {
@@ -952,7 +986,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 			if ackNow != _EMPTY_ {
 				sess.jsa.sendAck(ackNow)
 			}
-			sess.finishDrainIfEmpty(c, d)
+			sess.finishDrainIfEmptyInTx(c, d)
 		})
 	}
 	if terr := sess.endRecordTx(tok); terr != nil && c != nil {
@@ -982,24 +1016,23 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	return true
 }
 
-// finishDrainIfEmpty tears a drain down once it claims nothing: the record entry
-// is already gone — buildPersistedSessionLocked omits a drain that claims nothing,
-// so the very save that cleared the last claim also removed the entry — which is
-// what makes the durable unreferenced before it is deleted (I3).
+// retireDrainLocked is retirement's whole no-request half: it releases the sid AND closes
+// the delivery path, both under ONE sess.mu hold, and marks the object terminally retired.
 //
-// Deleting the durable also discards any still-unacked copy of an
-// already-finalized sequence. That is intended: those exchanges are complete, or
-// are completing through their own stored PUBREL.
+// Once this returns ok, this drain object can never again deliver to this session and can
+// never be handed back to it — so a delete issued arbitrarily late by this session object
+// can only name something that object no longer uses. That is what lets the disposal WAIT
+// for an answer (disposeRetiredDrainConsumer) instead of firing and forgetting.
 //
-// No lock held on entry.
-func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
-	sess.mu.Lock()
+// It issues no request, so it is safe to call with a record transaction open.
+//
+// sess.mu must be held.
+func (sess *mqttSession) retireDrainLocked(c *client, d *mqttDrain) (durable string, ok bool) {
 	// DURABLY empty. claimedCount() alone was the test, and it is not enough: it counts
 	// st.claimed only, so a sequence whose removal is still unconfirmed read as gone and
 	// retirement tore the durable down on a write whose outcome was unknown.
 	if !d.retirable() {
-		sess.mu.Unlock()
-		return
+		return _EMPTY_, false
 	}
 	// Ownership is proven through the SID, not through drainByDur, and that is F-094's
 	// repair rather than a simplification. restoreDrains deletes the drainByDur entry when a
@@ -1013,26 +1046,176 @@ func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
 	// both a replacement under a different durable and a different object under the same
 	// one. The lookup, the equality check and the removal all happen under this single
 	// acquisition, which is what makes that true.
-	sid, ok := sess.drainSidForDurable(d.cc.Durable)
-	if !ok || sess.drains[sid] != d {
-		sess.mu.Unlock()
-		return // already torn down, or replaced by an adoption
+	sid, found := sess.drainSidForDurable(d.cc.Durable)
+	if !found || sess.drains[sid] != d {
+		return _EMPTY_, false // already torn down, or replaced by an adoption
 	}
+	d.retired = true
+
+	// The delivery barrier goes on WITH the map drop, never after it, and that ordering is
+	// the whole of the repair. A callback dispatched before retirement re-checks
+	// sub.mqtt.closed and only THEN looks the drain up, both under one acquisition of this
+	// same lock (mqttDeliverMsgCbQoS12). Setting closed here means no interleaving can
+	// observe closed==false together with an absent drain, which is the state that let such
+	// a callback fall through to ordinary PUBLISH processing and retransmit a past-PUBREC
+	// source under a fresh identifier. processUnsub alone does not reach it: it removes the
+	// subscription from c.subs while the *subscription the callback already holds stays
+	// valid, which is why execDeferredConsumerDeleteClassified and
+	// closeSharedGroupTargetDeliveryLocked both set this flag IN ADDITION to unsubscribing.
+	//
+	// Lock order sess.mu -> subsMu -> c.mu, as restoreDrains and reclaimDrainDeliveryLocked
+	// both already establish by calling processQOS12Sub with sess.mu held.
+	if c != nil && d.cc.DeliverSubject != _EMPTY_ {
+		sess.subsMu.Lock()
+		c.mu.Lock()
+		sub := c.subs[d.cc.DeliverSubject]
+		c.mu.Unlock()
+		if sub != nil && sub.mqtt != nil {
+			sub.mqtt.closed = true
+		}
+		sess.subsMu.Unlock()
+	}
+
 	sess.dropDrainLocked(d)
+	return d.cc.Durable, true
+}
+
+// disposeRetiredDrainConsumer is the ONLY delete of a drained durable. The drain is out of
+// both maps, out of this session's record and terminally retired, so the request can name
+// nothing this session object still uses — which is what lets it WAIT for an answer rather
+// than fire and forget.
+//
+// Three outcomes, two of them definite, the same classification
+// deleteEphemeralConsumerDefinite uses: deleted, confirmed already absent, or UNKNOWN. The
+// unknown one is reported and left to the orphaned-consumer sweep; there is deliberately no
+// retry loop, no worker and no timer.
+//
+// The calling goroutine must NOT be holding a record transaction: this blocks for up to
+// jsa.timeout and no save on the session can proceed while the fence is open. Note the
+// requirement is that the DISPOSING goroutine does not retain a transaction across the
+// request, not that no transaction is open anywhere — another writer may open one
+// immediately after any unlock, which neither can be nor needs to be excluded.
+//
+// No lock held on entry.
+func (sess *mqttSession) disposeRetiredDrainConsumer(c *client, durable string) {
+	noWait := false
+	if h := mqttTestDrainDeleteHookV.Load(); h != nil {
+		send, observed, override := (*h)(durable, noWait)
+		if override {
+			sess.classifyRetiredDrainDisposal(c, durable, observed)
+			return
+		}
+		if !send {
+			return
+		}
+	}
+	_, err := sess.jsa.deleteConsumer(mqttStreamName, durable, noWait)
+	sess.classifyRetiredDrainDisposal(c, durable, err)
+}
+
+// classifyRetiredDrainDisposal turns one delete outcome into one of the three dispositions.
+// Separate from the request only so the test seam can supply an observed error without
+// duplicating the classification it exists to measure.
+func (sess *mqttSession) classifyRetiredDrainDisposal(c *client, durable string, err error) {
+	switch {
+	case err == nil: // deleted
+	case !isErrorOtherThan(err, JSConsumerNotFoundErr): // confirmed already absent
+	default:
+		// Indeterminate, and this is the one outcome with a named reaper rather than a
+		// verdict. The durable is referenced by no resident object and by no record of
+		// ours, so sweepOrphanedConsumersBefore reclaims it — eventually, on a pass that
+		// completes and whose own delete succeeds, and never while a fork sibling's record
+		// still names it. docs/CONFORMANCE.md states both qualifications.
+		//
+		// It is REPORTED on both routes, and the fallback is why: the queued route runs
+		// from endRecordTxLocked with no bound client, so mqttErrorf would swallow exactly
+		// the outcome the operator needs in order to know a durable may have survived. The
+		// JS API client is this codebase's client-less logging route (see the shared
+		// last-holder scan and the forked-record repair).
+		msg := "MQTT: the disposal of retired drain consumer %q is unconfirmed (%v); " +
+			"the orphaned-consumer sweep reclaims it once no record references it"
+		switch {
+		case c != nil:
+			c.Errorf(msg, durable, err)
+		case sess.jsa != nil && sess.jsa.c != nil:
+			sess.jsa.c.Errorf(msg, durable, err)
+		}
+	}
+}
+
+// finishDrainIfEmpty tears a drain down once it claims nothing: the record entry
+// is already gone — buildPersistedSessionLocked omits a drain that claims nothing,
+// so the very save that cleared the last claim also removed the entry — which is
+// what makes the durable unreferenced before it is deleted (I3).
+//
+// Deleting the durable also discards any still-unacked copy of an
+// already-finalized sequence. That is intended: those exchanges are complete, or
+// are completing through their own stored PUBREL.
+//
+// Retirement is now two halves. retireDrainLocked releases the sid and closes the delivery
+// barrier together under one sess.mu hold, so nothing that was already dispatched can
+// deliver afterwards; then the consumer delete is CLASSIFIED rather than assumed. This form
+// disposes INLINE, so it is only for callers holding no record transaction — the other three
+// go through finishDrainIfEmptyInTx.
+//
+// No lock held on entry, and no record transaction held by this goroutine.
+func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
+	if durable, ok := sess.retireDrain(c, d); ok {
+		sess.disposeRetiredDrainConsumer(c, durable)
+	}
+}
+
+// finishDrainIfEmptyInTx is finishDrainIfEmpty for the retained continuations, which run
+// under the uncertain-write resolver's OPEN record transaction. They may not block on a
+// JetStream request while holding the fence, so the disposal is queued and drained at the
+// transaction's release boundary in endRecordTxLocked. The split is explicit HERE, at the
+// call site, rather than inferred from sess.recordTxOpen — a caller knows whether it owns a
+// transaction, and a flag read cannot distinguish "mine" from "somebody else's".
+//
+// No lock held on entry.
+func (sess *mqttSession) finishDrainIfEmptyInTx(c *client, d *mqttDrain) {
+	durable, ok := sess.retireDrain(c, d)
+	if !ok {
+		return
+	}
+	sess.mu.Lock()
+	sess.pendingDrainDisposals = append(sess.pendingDrainDisposals, durable)
+	sess.mu.Unlock()
+}
+
+// retireDrain is the locking and refund wrapper both forms share: the critical section, the
+// charge refund, then the unsubscribe. It issues no JetStream request, so it is safe under
+// an open transaction.
+//
+// No lock held on entry.
+func (sess *mqttSession) retireDrain(c *client, d *mqttDrain) (durable string, ok bool) {
+	sess.mu.Lock()
+	durable, ok = sess.retireDrainLocked(c, d)
+	if !ok {
+		sess.mu.Unlock()
+		return _EMPTY_, false
+	}
 	if d.charged {
-		sess.refundConsumerChargeLocked(d.cc.Durable)
+		sess.refundConsumerChargeLocked(durable)
 	}
 	deliverSubject := d.cc.DeliverSubject
 	sess.mu.Unlock()
+
+	// Test seam, fired with sess.mu RELEASED and the barrier and map drop already both
+	// applied: it is what lets a test hold retirement here and release a paused delivery
+	// callback, so "the barrier is atomic with the map drop" is an assertion rather than a
+	// race against the scheduler. It belongs in this caller, not in retireDrainLocked,
+	// which is called with the lock already held and neither acquires nor releases it.
+	if h := mqttTestDrainRetirementUnlockedHookV.Load(); h != nil {
+		(*h)(durable)
+	}
 
 	if c != nil && deliverSubject != _EMPTY_ {
 		if err := c.processUnsub([]byte(deliverSubject)); err != nil {
 			c.Errorf("MQTT: error unsubscribing from a finished drain on %q: %v", deliverSubject, err)
 		}
 	}
-	if _, err := sess.jsa.deleteConsumer(mqttStreamName, d.cc.Durable, true); isErrorOtherThan(err, JSConsumerNotFoundErr) && c != nil {
-		c.Errorf("MQTT: unable to delete the finished drain consumer %q: %v", d.cc.Durable, err)
-	}
+	return durable, true
 }
 
 // finalizeDrainSource is the convenience form of finalizeDrainDelivery for the
@@ -1176,6 +1359,13 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 
 	for _, p := range todo {
 		d := p.d
+		// Test seam, fired with sess.mu RELEASED and before the per-item lock: the only
+		// point from which a test can retire this captured object and then let the install
+		// proceed with nothing else failing, which is the schedule the recheck below
+		// exists for. See setMQTTTestDrainRestorePreInstallHook.
+		if h := mqttTestDrainRestorePreInstallHookV.Load(); h != nil {
+			(*h)(d.cc.Durable)
+		}
 		if skip[d.cc.Durable] {
 			// The PUBREL recovery could not resolve this drain, so establishing
 			// source interest could resend the payload of an exchange already past
@@ -1184,6 +1374,16 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 			continue
 		}
 		sess.mu.Lock()
+		// Re-check ownership AND retirement, under this lock, before installing anything.
+		// The todo snapshot was taken under an earlier acquisition and released, so this
+		// drain may have been retired in between — and retirement releases the sid and
+		// closes the delivery path, so installing a reverse-index entry and a delivery
+		// subscription for it would hand a terminally retired object a live delivery route
+		// on a durable that has been delete-requested.
+		if sid, ok := sess.drainSidForDurable(d.cc.Durable); !ok || sess.drains[sid] != d || d.retired {
+			sess.mu.Unlock()
+			continue
+		}
 		if sess.drainByDur == nil {
 			sess.drainByDur = make(map[string]*mqttDrain)
 		}
@@ -1372,7 +1572,24 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		}
 		sess.mu.Unlock()
 	}
-	clearGuards := func() {
+	// landed is what a PROVEN save owes, stated once and used by both landed arms: clear
+	// the unconfirmed-removal guards, and refund the local consumer charge of every drain
+	// this pass removed.
+	//
+	// The refund belongs HERE and not at the drop, which is the whole reason this is a
+	// helper. A charge released at the drop would be released for a removal that never
+	// landed, and saveDefinitelyFailed restores the object through undoPlans STILL CHARGED
+	// — so there would be nothing to re-charge and no honest way to re-establish it.
+	// Refunding on proof needs neither a recorded amount nor an idempotent re-charge.
+	//
+	// finishDrainIfEmpty's own refund cannot cover this: the consumer-absent arm removes
+	// the drain through p.drop without ever reaching retirement, which is the live leak —
+	// such a drain is charged by stageDrain, survives into a resume, and sess.tmaxack is
+	// otherwise reset only by clear(), so the session's consumer budget shrinks until
+	// SUBSCRIBEs are refused against mqttMaxAckTotalLimit. Double refunding is not a
+	// hazard: refundConsumerChargeLocked returns early when the entry is gone, which is
+	// also why an already-empty drain retired by this same pass cannot be refunded twice.
+	landed := func() {
 		sess.mu.Lock()
 		for i := range plans {
 			p := &plans[i]
@@ -1381,33 +1598,28 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 					st.unclaimUnconfirmed = false
 				}
 			}
+			if p.drop && p.d.charged && p.d.cc != nil {
+				sess.refundConsumerChargeLocked(p.d.cc.Durable)
+			}
 		}
 		sess.mu.Unlock()
 	}
 	switch outcome {
 	case saveLanded:
-		clearGuards()
+		landed()
 	case saveDefinitelyFailed:
-		// Undo exactly what was changed, still inside the transaction.
+		// Undo exactly what was changed, still inside the transaction. The restored drain
+		// is still charged, which is what makes landed()'s refund the only one.
 		undoPlans()
 	case saveMaybeLanded:
 		// The record may already carry the reconciliation, so keep it — the guards are
 		// already set — and the resolver settles it by re-attempting those exact bytes.
 		sess.retainOnLanded(func(recordTx) {
-			// Proven durable: the reconciliation stands, so clear the markers and tear
-			// down whatever it emptied.
-			sess.mu.Lock()
+			// Proven durable: the reconciliation stands, so discharge exactly what the
+			// immediate landed arm discharges, then tear down whatever it emptied.
+			landed()
 			for i := range plans {
-				p := &plans[i]
-				for _, seq := range p.unclaim {
-					if st := p.d.seqs[seq]; st != nil {
-						st.unclaimUnconfirmed = false
-					}
-				}
-			}
-			sess.mu.Unlock()
-			for i := range plans {
-				sess.finishDrainIfEmpty(c, plans[i].d)
+				sess.finishDrainIfEmptyInTx(c, plans[i].d)
 			}
 		})
 	}
@@ -2065,7 +2277,7 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 					if ack != _EMPTY_ {
 						sess.jsa.sendAck(ack)
 					}
-					sess.finishDrainIfEmpty(c, cl.d)
+					sess.finishDrainIfEmptyInTx(c, cl.d)
 				}
 			},
 		)
@@ -2244,9 +2456,12 @@ func (h mqttDrainHold) reason() string {
 //
 // What the hold establishes is exactly one thing: while an intent-bearing drain exists, no
 // adoption and no destructive fork-repair row can erase that intent. It is deliberately NOT
-// the claim that nothing can re-offer the source — retirement does not prove its consumer
-// was disposed of (see finishDrainIfEmpty), and F-094 does not repair that. The disposal
-// route to the same duplicate PUBLISH is stated in docs/CONFORMANCE.md and filed.
+// the claim that nothing can re-offer the source. What excludes a re-offer is retirement's
+// own delivery barrier and its classified disposal (see retireDrainLocked and
+// disposeRetiredDrainConsumer), which are a separate mechanism from this hold; F-094 does
+// not supply them. What remains is stated in docs/CONFORMANCE.md: disposal is confirmed for
+// this session object, but an indeterminate delete is reclaimed by the orphan sweep rather
+// than retried, and a fork sibling can rebuild the drain on a fresh object.
 //
 // Session lock held on entry.
 func (sess *mqttSession) drainSidHoldLocked(sid string) mqttDrainHold {

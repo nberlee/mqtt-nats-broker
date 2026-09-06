@@ -667,6 +667,117 @@ func setMQTTTestPubRelSubFailHook(h func() error) func() {
 	return func() { mqttTestPubRelSubFailHookV.Store(prev) }
 }
 
+// Test hook: when set, it is invoked in mqttDeliverMsgCbQoS12 immediately BEFORE the
+// callback takes sess.mu. That is the only point from which a test can name the
+// interleaving drain retirement has to survive — a callback already dispatched by the
+// client library, holding a valid *subscription, and not yet inside the critical section
+// where it re-checks sub.mqtt.closed and looks its drain up. Precedent:
+// setMQTTTestTryBeginPreLockHook.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDeliveryPreLockHookV atomic.Pointer[func(sub *subscription)]
+
+// setMQTTTestDeliveryPreLockHook installs (or, with nil, clears) the delivery pre-lock hook
+// and returns a function that restores the previous value.
+func setMQTTTestDeliveryPreLockHook(h func(sub *subscription)) func() {
+	prev := mqttTestDeliveryPreLockHookV.Load()
+	if h == nil {
+		mqttTestDeliveryPreLockHookV.Store(nil)
+	} else {
+		mqttTestDeliveryPreLockHookV.Store(&h)
+	}
+	return func() { mqttTestDeliveryPreLockHookV.Store(prev) }
+}
+
+// Test hook: fired from a DEFER registered beside the pre-lock hook, so it runs when the
+// delivery callback returns through any of its exits below that point. It is the completion
+// signal a negative-delivery assertion needs; see the paired seam in mqttDeliverMsgCbQoS12.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDeliveryDoneHookV atomic.Pointer[func(sub *subscription)]
+
+// setMQTTTestDeliveryDoneHook installs (or, with nil, clears) the delivery completion hook
+// and returns a function that restores the previous value.
+func setMQTTTestDeliveryDoneHook(h func(sub *subscription)) func() {
+	prev := mqttTestDeliveryDoneHookV.Load()
+	if h == nil {
+		mqttTestDeliveryDoneHookV.Store(nil)
+	} else {
+		mqttTestDeliveryDoneHookV.Store(&h)
+	}
+	return func() { mqttTestDeliveryDoneHookV.Store(prev) }
+}
+
+// Test hook: the retired-drain consumer delete seam. It OBSERVES THE REAL noWait ARGUMENT,
+// which is the point — a seam that only substituted an error could be satisfied by a
+// helper-level timeout returning the same thing whether the request waited for an answer or
+// not, so it could not discriminate a reversion to the fire-and-forget form.
+//
+// send=false suppresses the request; override=true supplies observed as the outcome to
+// classify instead of issuing one. The ephemeral path's setMQTTTestConsumerDeleteHook is
+// deliberately NOT widened to cover this, to keep the persisted-identity census bijection
+// honest.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDrainDeleteHookV atomic.Pointer[func(durable string, noWait bool) (send bool, observed error, override bool)]
+
+// setMQTTTestDrainDeleteHook installs (or, with nil, clears) the retired-drain delete seam
+// and returns a function that restores the previous value.
+func setMQTTTestDrainDeleteHook(h func(durable string, noWait bool) (send bool, observed error, override bool)) func() {
+	prev := mqttTestDrainDeleteHookV.Load()
+	if h == nil {
+		mqttTestDrainDeleteHookV.Store(nil)
+	} else {
+		mqttTestDrainDeleteHookV.Store(&h)
+	}
+	return func() { mqttTestDrainDeleteHookV.Store(prev) }
+}
+
+// Test hook: fired after retirement's critical section, with sess.mu RELEASED and both the
+// delivery barrier and the map drop already applied. It is what supplies the schedule in
+// which a paused delivery callback is released between the map drop and any LATER closure,
+// so a build that moved the barrier after the unlock is measurably different from one that
+// did not. A pre-lock hook alone names that interleaving without synchronizing it.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDrainRetirementUnlockedHookV atomic.Pointer[func(durable string)]
+
+// setMQTTTestDrainRetirementUnlockedHook installs (or, with nil, clears) the post-unlock
+// retirement pause and returns a function that restores the previous value.
+func setMQTTTestDrainRetirementUnlockedHook(h func(durable string)) func() {
+	prev := mqttTestDrainRetirementUnlockedHookV.Load()
+	if h == nil {
+		mqttTestDrainRetirementUnlockedHookV.Store(nil)
+	} else {
+		mqttTestDrainRetirementUnlockedHookV.Store(&h)
+	}
+	return func() { mqttTestDrainRetirementUnlockedHookV.Store(prev) }
+}
+
+// Test hook: fired at the top of restoreDrains' per-item loop body — after the todo capture,
+// after the inactivity-timer work, and with sess.mu RELEASED, before the per-item lock.
+//
+// It exists because setMQTTTestQOS12SubFailHook cannot serve here: that one fires inside
+// restoreDrains' own sess.mu hold, so waiting there for retirement deadlocks, returning an
+// error produces the same end state a dropped retirement check would, and returning nil
+// supplies the reverse ordering. This is the only point from which a test can retire the
+// captured object and then let the install proceed with nothing else failing.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDrainRestorePreInstallHookV atomic.Pointer[func(durable string)]
+
+// setMQTTTestDrainRestorePreInstallHook installs (or, with nil, clears) the restore
+// pre-install pause and returns a function that restores the previous value.
+func setMQTTTestDrainRestorePreInstallHook(h func(durable string)) func() {
+	prev := mqttTestDrainRestorePreInstallHookV.Load()
+	if h == nil {
+		mqttTestDrainRestorePreInstallHookV.Store(nil)
+	} else {
+		mqttTestDrainRestorePreInstallHookV.Store(&h)
+	}
+	return func() { mqttTestDrainRestorePreInstallHookV.Store(prev) }
+}
+
 // Test hook: when set, it is invoked after a teardown claim is CONFIRMED and
 // before the first deletion — the exact window a nonce re-check cannot close,
 // where a paused broker can let a peer finish the whole teardown and create a
@@ -1905,6 +2016,12 @@ type mqttSession struct {
 	// second durable on the same filter (I7). See unsub_drain.go.
 	drains     map[string]*mqttDrain
 	drainByDur map[string]*mqttDrain
+	// pendingDrainDisposals names retired drain durables whose consumer delete is owed
+	// but could not be issued where retirement ran, because that goroutine was holding an
+	// open record transaction. The disposal WAITS for an answer, and no save on the
+	// session can proceed while the fence is held, so it is drained at the release
+	// boundary in endRecordTxLocked instead. In-memory only. See unsub_drain.go.
+	pendingDrainDisposals []string
 	// sharedCharged tracks the MaxAckPending this session has added to tmaxack
 	// for each shared group durable it joined (durable -> amount), so a release
 	// subtracts exactly what was charged and only once. In-memory only. Spec5 [4.8.2].
@@ -9599,6 +9716,28 @@ func (sess *mqttSession) restoreSharedKeyInMemory(sid string, existed bool, qos 
 	sess.subIDs, _ = mqttUpdateFilterSubID(sess.subIDs, sid, mqttZeroIf(!existed, subID))
 }
 
+// mqttRestoreDrainMap copies one snapshot drain map, omitting terminally retired objects.
+// nil in, nil out, and an all-retired map collapses to nil so the session's own
+// "empty means nil" convention is preserved.
+//
+// sess.mu must be held by the caller, which is what makes reading d.retired safe.
+func mqttRestoreDrainMap(snap map[string]*mqttDrain) map[string]*mqttDrain {
+	if len(snap) == 0 {
+		return nil
+	}
+	out := make(map[string]*mqttDrain, len(snap))
+	for k, d := range snap {
+		if d == nil || d.retired {
+			continue
+		}
+		out[k] = d
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // mqttZeroIf returns 0 when cond is true, else v. Helper for map-key clears.
 func mqttZeroIf(cond bool, v int) int {
 	if cond {
@@ -9679,7 +9818,25 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// cons. Restoring cons alone would leave the session holding neither, while the
 	// record still carries the drain — and the next save would then erase a durable
 	// that still owes started deliveries. Restore both maps together.
-	sess.drains, sess.drainByDur = snap.drains, snap.drainByDur
+	//
+	// PER ENTRY, skipping any drain that has since been RETIRED. The snapshot is shallow,
+	// so it holds the same *mqttDrain pointers retirement acts on and a flag set after the
+	// snapshot was taken is visible through it — which is exactly what a post-hoc ownership
+	// check could not give us, since the resurrection arrives through a snapshot captured
+	// EARLIER. Without this, a drain retired mid-packet comes back with its sid held for the
+	// life of the session (st.intent is never cleared) and no reaper able to release it,
+	// because the durable is gone.
+	//
+	// Each map contributes its OWN entries and neither is derived from the other. They
+	// legitimately disagree: when restoreDrains' delivery subscription fails it deletes the
+	// drainByDur entry while sess.drains[sid] survives, and that absence is a deliberate
+	// rollback rather than a gap to fill — deriving the reverse index from every forward
+	// entry would re-assert a registration that was explicitly removed. Conversely
+	// retainRepairedDrain ADDS a reverse entry for a drain this packet repaired, and copying
+	// drainByDur's own entries is what preserves it. Retirement removes both entries for one
+	// object under a single sess.mu hold, so filtering per map cannot split an object across
+	// the two.
+	sess.drains, sess.drainByDur = mqttRestoreDrainMap(snap.drains), mqttRestoreDrainMap(snap.drainByDur)
 	sess.mu.Unlock()
 	// Detach a session-affine QoS 2 path this packet provisioned, BEFORE the
 	// confirm-save: the restored record must not name a consumer that is about to
@@ -11552,6 +11709,12 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	// fence release stops any that is already in flight from writing (I9).
 	sess.drains = nil
 	sess.drainByDur = nil
+	// Queued disposals go with them. The teardown below deletes this incarnation's drain
+	// durables outright, so nothing is owed; and both paths that REUSE this object as a
+	// fresh session would otherwise have the next fence release issue a retired
+	// generation's deletes. Anything the teardown misses is the orphan sweep's, which is
+	// the disposition already stated for an unconfirmed disposal.
+	sess.pendingDrainDisposals = nil
 	sess.pendingPublish = nil
 	sess.pendingPubRel = nil
 	sess.refusedCarriers = nil
@@ -18915,6 +19078,24 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		mqttTestRestoreGateBlockedHook("qos12")
 		sess.recordWithheldDelivery(cc, sub, reply)
 		return
+	}
+
+	// Test seams, PAIRED. The pre-lock one is fired before the lock: this is the point a
+	// dispatched callback occupies while drain retirement runs, and holding it here is how a
+	// test states that retirement excludes such a callback rather than racing it. The done
+	// one is deferred from the same place, so it fires when THAT callback returns, whichever
+	// of the exits below it takes.
+	//
+	// The pair is what makes a negative delivery assertion honest. Every other way of
+	// deciding "the callback has had its turn" is a disguised timeout: a delivery on another
+	// durable is no proof, because processSub gives each durable its own NATS subscription
+	// and nats.go runs an independent dispatch goroutine per subscription, so the other one
+	// can be tracked while this callback is still merely runnable.
+	if h := mqttTestDeliveryPreLockHookV.Load(); h != nil {
+		(*h)(sub)
+	}
+	if dh := mqttTestDeliveryDoneHookV.Load(); dh != nil {
+		defer (*dh)(sub)
 	}
 
 	// We lock to check some of the subscription's fields and if we need to keep

@@ -136,8 +136,10 @@ func TestMQTTReSubscribeOverAnUnfinishedDrainedIntentIsRefused(t *testing.T) {
 	// at AckWait as a fresh PUBLISH of the payload this client already answered.
 	//
 	// SCOPE: evidence about the schedule this test exercises, NOT a claim that retirement
-	// excludes every re-offer. Retirement keeps HEAD's disposal semantics and proves nothing
-	// about the consumer being gone; that route is a separate roadmap item.
+	// excludes every re-offer. Retirement's own exclusion — the delivery barrier and the
+	// confirmed disposal — is pinned by drain_disposal_test.go, and what it still does not
+	// exclude (an indeterminate delete, and a fork sibling rebuilding the drain) is stated
+	// in docs/CONFORMANCE.md.
 	//
 	// Publishing on the control filter proves the connection is alive and delivering in
 	// this very window, so "nothing else arrived" is a fact about the drained source and

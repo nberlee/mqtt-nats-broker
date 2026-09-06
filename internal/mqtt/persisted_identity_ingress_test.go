@@ -347,7 +347,11 @@ var censusInterpreters = map[string]string{
 	"recoverDrainPubRels":       "restores the drains' PUBREL state before the barrier finalizes anything",
 	"recoverDrains":             "reconciles drains against consumer state, skipping what the barrier could not resolve",
 	"finalizeDrainDelivery":     "releases the drain's register — CONFIRMED, before the claim removal and the ack — and is the site F-034's subject addressing corrects",
-	"finishDrainIfEmpty":        "completes a drain once nothing is owed, deleting its durable last",
+	// The delete MOVED out of finishDrainIfEmpty when retirement was split in two: the
+	// critical section issues nothing (so it is safe under an open record transaction) and
+	// the request is a separate, CONFIRMED and classified step. The census entry moves with
+	// it, which is the census working rather than a bookkeeping chore.
+	"disposeRetiredDrainConsumer": "deletes a terminally retired drain's durable and classifies the outcome three ways",
 
 	// ---- session records, teardown, expiry -----------------------------------
 	"persistRecord":              "the record CAS: every write is conditional, and a rejection is a positive fact about another writer rather than an error to retry blindly",

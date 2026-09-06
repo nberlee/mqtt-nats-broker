@@ -328,14 +328,43 @@ func (sess *mqttSession) endRecordTxLocked(tok recordTx, newGeneration bool) err
 	// refused, so nothing else is left owing it. Never for a generation that has just
 	// ENDED: clear() discards the session's whole state, verdicts included.
 	handoff := !newGeneration && sess.voidVerdictHandoffDueLocked()
+	// Retired drains whose disposal this transaction's holders could not issue, detached
+	// HERE — inside the critical section, before the unlock — for the same reason the
+	// handoff decision is made here: detaching after the unlock lets the NEXT
+	// transaction's queue be taken by this releaser, and lets this queue be stranded by a
+	// releaser that sampled it too early. Executed below, on this goroutine, holding
+	// neither lock and no longer holding the fence, which is precisely what the disposal
+	// needs in order to wait for an answer.
+	disposals := sess.pendingDrainDisposals
+	sess.pendingDrainDisposals = nil
 	sess.recordTxCondLocked().Broadcast()
 	sess.mu.Unlock()
+	// Test seam, fired with sess.mu released, the fence CLEARED and this release's batch
+	// already detached. It is the only point from which a test can let ANOTHER transaction
+	// open the fence and queue its own disposal while this releaser is still between its
+	// unlock and its disposals — the schedule that distinguishes detaching before the
+	// unlock from reading the queue after it, where this releaser would take the next
+	// transaction's work.
+	if h := mqttTestRecordTxPostReleaseHookV.Load(); h != nil {
+		(*h)(sess)
+	}
 	if handoff {
 		// After the unlock, and after the broadcast: the attempt takes the ownership gate
 		// and re-acquires this fence, and it runs on this goroutine, so holding either
 		// here would deadlock. No client on this path — the fence is released by paths
 		// with and without one — and every log site the attempt reaches is nil-safe.
 		sess.attemptVoidVerdictHandoff(nil)
+	}
+	// AFTER the handoff, deliberately. A disposal blocks for up to jsa.timeout, and the
+	// handoff previously ran immediately after the broadcast; putting the requests first
+	// would delay a persistence attempt that a stager is already owed by up to one timeout
+	// per queued drain. Nothing in the disposal depends on the handoff or vice versa — the
+	// drain is out of the record and out of both maps before it is ever queued.
+	for _, durable := range disposals {
+		// No client here: the fence is released by paths with and without one. The
+		// classification falls back to the JS API client's logger, so an unconfirmed
+		// disposal is still reported.
+		sess.disposeRetiredDrainConsumer(nil, durable)
 	}
 	return nil
 }
@@ -387,6 +416,24 @@ func setMQTTTestRecordTxReleaseHook(h func(sess *mqttSession)) func() {
 		mqttTestRecordTxReleaseHookV.Store(&h)
 	}
 	return func() { mqttTestRecordTxReleaseHookV.Store(prev) }
+}
+
+// mqttTestRecordTxPostReleaseHookV fires AFTER the release: sess.mu is unlocked, the fence
+// is clear, the waiters are broadcast, and this release's queued drain disposals are already
+// detached. It runs outside every lock, so a handler MAY block — which is the point. It is
+// the only seam from which a test can hold one releaser between its unlock and its disposals
+// while a SECOND transaction opens the fence and queues its own, which is what tells
+// "detached before the unlock" apart from "read after it". See endRecordTxLocked.
+var mqttTestRecordTxPostReleaseHookV atomic.Pointer[func(sess *mqttSession)]
+
+func setMQTTTestRecordTxPostReleaseHook(h func(sess *mqttSession)) func() {
+	prev := mqttTestRecordTxPostReleaseHookV.Load()
+	if h == nil {
+		mqttTestRecordTxPostReleaseHookV.Store(nil)
+	} else {
+		mqttTestRecordTxPostReleaseHookV.Store(&h)
+	}
+	return func() { mqttTestRecordTxPostReleaseHookV.Store(prev) }
 }
 
 // mqttTestRecordTxWaitHookV fires inside beginRecordTx's wait loop, under sess.mu,

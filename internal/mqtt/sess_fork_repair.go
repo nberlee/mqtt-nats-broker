@@ -1088,8 +1088,9 @@ func (sess *mqttSession) applyGrantSidLocked(sid string, survivor, ours mqttSidS
 			// refuses this row in the preflight above: mqttSurvivorDecidedGrant compares
 			// drain PRESENCE only, and our own omission can come from recoverDrains pruning
 			// a source it proved absent rather than from any completion. Nor does reaching
-			// here establish that our branch's durable was disposed of — finishDrainIfEmpty
-			// releases its maps before an UNCONFIRMED delete, which is a stated residual.
+			// here establish that our branch's durable was disposed of: retirement now
+			// CONFIRMS its delete, but this row is not retirement — it drops the two map
+			// entries and issues nothing — so the durable is left for the orphan sweep.
 			if d := sess.drains[sid]; d != nil {
 				sess.dropDrainLocked(d)
 			}

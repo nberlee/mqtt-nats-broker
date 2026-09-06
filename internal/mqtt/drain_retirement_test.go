@@ -28,11 +28,11 @@ import (
 // when a delivery subscription fails to restore and KEEPS sess.drains[sid]; both reapers
 // keyed on that entry, so nothing could ever retire such a drain.
 //
-// NOTE ON SCOPE, so a later reader does not mistake what these prove: retirement releases
-// the sid WITHOUT proving its consumer was disposed of. finishDrainIfEmpty drops the maps
-// and refunds before it unsubscribes and issues a noWait consumer delete that cannot report
-// failure. That is unchanged from HEAD and is stated in docs/CONFORMANCE.md; F-094 closes
-// the ADOPTION route to a duplicate PUBLISH, not the disposal route.
+// NOTE ON SCOPE, so a later reader does not mistake what these prove: these are about the
+// sid RELEASE, which is F-094's side. The disposal half — the delivery barrier applied with
+// the map drop, the terminal per-object flag, and the classified consumer delete — is pinned
+// by drain_disposal_test.go, and the guarantee it establishes is scoped to this drain object
+// within this resident session object's lifetime (docs/CONFORMANCE.md).
 
 // realDrainConsumer creates an actual durable so recovery's lookup finds it. Without one,
 // recoverDrains takes its consumer-absent arm and prunes through p.drop, bypassing the
@@ -185,8 +185,12 @@ func TestStaleRetirementDoesNotDeleteAnAdoptedDurable(t *testing.T) {
 		t.Fatal("a stale retirement must not disturb the consumer the adoption installed")
 	}
 
-	// The durable itself is what a stale call destroys, and the delete is fire-and-forget,
-	// so give it room to land before concluding it did not.
+	// The durable itself is what a stale call destroys. The sleep is RETAINED even though
+	// retirement's delete is now confirmed and synchronous: what this test asserts is that
+	// no delete was issued AT ALL, and the guard it exercises returns before
+	// disposeRetiredDrainConsumer is reached, so there is no request to wait on and nothing
+	// to synchronise against. The window is left open so a build that issued one anyway —
+	// through any route, confirmed or not — has time to complete it before the check.
 	time.Sleep(500 * time.Millisecond)
 	ci, err := sess.jsa.lookupConsumer(mqttStreamName, dur)
 	if err != nil || ci == nil {

@@ -1304,22 +1304,42 @@ Residuals:
     companion and option changes — can remain unapplied once the accept save lands.
     The client must re-issue the operation. Same residual class as the existing
     `draining -> draining, differing` conflict.
-- **Drain retirement does not prove disposal before releasing the sid.** F-094
-  prevents adoption or destructive fork repair from erasing a resident drain's
-  past-PUBREC intent. Retirement requires no claimed or unconfirmed claim removal,
-  verifies the drain's sid ownership, and visits eligible already-empty drains as
-  well as drains emptied by successful reconciliation; barrier-skipped drains remain
-  excluded. Retirement retains the existing disposal semantics: it removes the drain
-  maps and releases its local consumer charge **before** unsubscribing and issuing an
-  **unconfirmed** consumer-delete request. Removing the hold therefore does not prove
-  the consumer was deleted or that an already-dispatched delivery callback was
-  excluded. Such a callback can pass the existing checks after map removal and reach
-  ordinary PUBLISH processing, potentially transmitting a past-PUBREC source under a
-  fresh identifier. Failed or delayed deletion can leave an unreferenced consumer.
-  **F-094 closes the adoption route, not this disposal route**, and supplies no new
-  bounded disposal or retry guarantee. SUBSCRIBE rollback can restore a previously
-  removed drain from its snapshot, and reconciliation's direct consumer-absent removal
-  lacks a local-charge refund; these lifecycle gaps are tracked with drain disposal.
+- **Drain retirement proves disposal before releasing the sid (FIXED), with three
+  stated residuals.** Retirement now releases the sid and closes the delivery path
+  under **one** `sess.mu` hold — `sub.mqtt.closed` is set together with the map drop —
+  so an already-dispatched delivery callback cannot pass its checks after map removal
+  and reach ordinary PUBLISH processing. That closes the disposal route to the same
+  duplicate PUBLISH F-094 closed through adoption. The drain object is **terminally**
+  marked, so neither a SUBSCRIBE rollback's shallow snapshot, nor the resume's restore,
+  nor the two-map re-insertion helper, nor an inactivity-timer clear can hand it back to
+  this session object. The consumer delete is issued with a wait and **classified**:
+  deleted, confirmed already absent, or unknown. Reconciliation's direct consumer-absent
+  removal refunds its local consumer charge on a proven-landed save.
+
+  Three residuals remain, and each is a real limit rather than a restatement:
+
+  - Reclamation of a durable whose delete could **not be confirmed** is *eventual*, not
+    prompt: the orphaned-consumer sweep reclaims it on a later pass that completes its
+    consumer listing and its record walk and whose own delete succeeds, and it
+    deliberately spares a consumer that any session record — a fork sibling's included —
+    still names. There is no retry loop and no reaper of its own. The unknown outcome is
+    reported so an operator can see it. The consumer's still-pending messages, both
+    re-offers of exchanges the record no longer claims and fresh messages on a filter the
+    client unsubscribed from, go with it; no client is owed either, and deleting the
+    consumer does not destroy a message another consumer still holds interest in.
+  - Terminal retirement is scoped to the retiring **session object**, not to the
+    incarnation: a record restore builds a new session object while preserving the
+    generation, so a fork sibling's record that still names the drain can rebuild it on a
+    fresh `*mqttDrain`, and a delete the retiring object issued can land on that rebuilt
+    consumer. This is **pre-existing and unwidened** — the previous unconfirmed delete had
+    the identical exposure, and confirming the request adds no reconstruction route and no
+    deletion authority. Closing it would need a retirement fact a *sibling's* record could
+    see, which no record of ours can supply.
+  - An inactivity-timer clear already in flight when a drain is retired can land after the
+    disposal, recreating the durable under a retired name. It is absent from the retiring
+    object's maps and delivery path, so that object delivers nothing on it, and the same
+    sweep reclaims it once no resident object and no session record reference it — under
+    both qualifications above.
 - **A live SUBSCRIBE reclaims a drain that cannot deliver.** A resume can leave a
   drain with no delivery subscription — CONNECT withholds source interest from
   **every** QoS 2 drain when PUBREL subscription setup fails, including drains holding
@@ -1615,9 +1635,11 @@ Residuals:
   the refusal is protocol-visible: the client sees `SUBACK 0x80` for that filter. The hold
   is released when the drain is RETIRED — deliberately not "when the PUBREL completes",
   which would be wrong for a finalized intent held beside another outstanding claim. The
-  costs are stated in the drain-section residuals above, and what this does **not**
-  close — the disposal route to the same duplicate, and delivery readiness on
-  adoption — is tracked by its own roadmap bullets.
+  costs are stated in the drain-section residuals above. The two things F-094 did not
+  close are now closed by their own changes rather than deferred: delivery readiness on
+  adoption, by the live-SUBSCRIBE reclaim, and the disposal route to the same duplicate,
+  by retirement's delivery barrier and classified delete. What remains open is not a
+  route to a duplicate PUBLISH but the three disposal residuals stated above.
 - **A retained QoS 2 exchange's PUBREL surviving a restart is REFUSED, not transmitted.**
   A retained send has no register (R6), so its exchange identity lives only in the in-memory
   owner of its incarnation and that identity is gone after a restart. Admission

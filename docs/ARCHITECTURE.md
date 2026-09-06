@@ -3311,6 +3311,78 @@ deliberately carries none, because there the only legitimate re-store is the
 post-restart one after a redelivery, and a surviving dedupe entry would silently
 swallow it.
 
+### Retirement and disposal
+
+Retirement is what ends a drain once it claims nothing, and it is deliberately two
+halves: a critical section that issues nothing, and a request that is *classified*
+rather than assumed.
+
+**One critical section, and the delivery barrier goes on WITH the map drop.** Under a
+single `sess.mu` hold, `retireDrainLocked` proves the drain still owns its sid, marks
+the object retired, sets `sub.mqtt.closed` on its delivery subscription, and drops
+both drain maps. The ordering is the repair, not decoration: a delivery callback
+dispatched before retirement re-checks `closed` and only *then* looks its drain up,
+both under one acquisition of that same lock, so no interleaving can observe
+`closed == false` together with an absent drain. Unsubscribing alone does not reach
+such a callback — it removes the subscription from `c.subs` while the `*subscription`
+the callback already holds stays valid — which is why the deferred consumer delete
+and the shared-group teardown both set that flag *in addition to* unsubscribing.
+Without the barrier the callback falls through to ordinary PUBLISH processing and
+retransmits a past-PUBREC source under a fresh packet identifier.
+
+**A terminal per-object flag, at the insertion boundaries.** `retired` is never
+cleared: clearing it once a delete looked slow is the design in which a late delete
+destroys a consumer that has come back into service. Four routes could otherwise
+hand the same `*mqttDrain` back to the session, and each consults the flag under
+`sess.mu`: the SUBSCRIBE rollback (which restores from a **shallow** snapshot, so a
+flag set after the snapshot is visible through it — the property a post-hoc ownership
+check cannot have, because the resurrection arrives through a snapshot taken
+*earlier*), the resume's per-item restore, the two-map re-insertion helper, and the
+inactivity-timer clear. The rollback restores **each map's own entries** and does not
+derive one from the other: the two legitimately disagree, because a failed
+delivery-subscription restore deletes the reverse entry while the sid mapping
+survives, and that absence is a deliberate rollback rather than a gap to fill.
+Adoption and the delivery reclaim need no guard — both read `sess.drains[sid]`, which
+retirement empties under the same lock — and a fresh SUBSCRIBE mints a new nuid
+durable, so it can never name a retired one.
+
+**A confirmed, classified delete.** The drain is out of both maps, out of the record
+and terminally retired, so the request can name nothing this session object still
+uses — which is what lets it *wait* for an answer instead of firing and forgetting.
+Three outcomes, two definite: deleted, confirmed already absent, or **unknown**. The
+unknown one is reported and left to the orphaned-consumer sweep; there is no retry
+loop, no worker and no timer. A crash anywhere inside disposal is the same durable
+state as an unknown outcome, because the record already omits the drain: the save
+that cleared the last claim removed the entry (I3), which is what makes the durable
+unreferenced *before* it is deleted.
+
+**Where the request runs.** The disposing goroutine must not retain a record
+transaction across it: the request blocks for up to the JS API timeout and no save on
+the session can proceed while the fence is open. Ordinary callers therefore dispose
+inline; the three retained continuations, which run under the uncertain-write
+resolver's open transaction, queue the durable instead. The queue is **detached
+inside** `endRecordTxLocked`'s critical section and executed after the unlock, on the
+releasing goroutine — detaching after the unlock would let one releaser issue a later
+transaction's work and strand its own. It runs after the void-verdict handoff, so a
+persistence attempt a stager is already owed is not delayed by a timeout per queued
+drain. A refused release — an invalid token, or a non-owner — returns before the
+detach, so the batch is carried to the next successful release rather than dropped,
+and `clear()` discards it with the rest of the generation's state.
+
+**The charge follows the proof.** A drain removed by reconciliation's consumer-absent
+arm never reaches retirement, so its local consumer charge is refunded when the
+save is *proven landed* — in the immediate arm and in the retained continuation
+alike, through one helper. Not at the drop: a definitely failed save restores the
+object still charged, so there would be nothing to re-charge.
+
+**What the guarantee covers.** Once retirement has run, this drain **object** can
+never again deliver to this session and can never be handed back to it, for the
+lifetime of this **resident session object**. Not "one incarnation": a record restore
+builds a new session object while preserving the generation, so a fork sibling's
+record that still names the drain can rebuild it on a fresh object, which no
+per-object flag reaches. `docs/CONFORMANCE.md` states that residual and the two
+others — an indeterminate delete, and an inactivity-clear create already in flight.
+
 ## Plain QoS 1/2 consumer reconciliation on resume
 
 The session record persists each plain QoS 1/2 subscription's JetStream consumer

@@ -3131,47 +3131,58 @@ takeover.
   ADOPTION route to that duplicate PUBLISH and nothing more. Two bullets below carry what
   it does not.
 
-- [ ] **Drain retirement does not prove disposal before releasing the sid.** Filed
-  2026-09-05 by F-094's plan-review rounds 2 and 3, and scoped out of F-094 by its
-  escalation consult. **Pre-existing at HEAD and not caused by F-094**, which neither
-  introduces nor worsens it. The same duplicate PUBLISH F-094 prevents through adoption is
-  reachable through disposal with **no adoption involved**: `finishDrainIfEmpty` drops both
-  drain maps and refunds the local consumer charge BEFORE it unsubscribes and issues the
-  consumer delete; `deleteConsumer` with `noWait` takes the `sendMsg` arm and returns
-  `nil, nil` unconditionally, so the existing error check is vacuous and nothing proves the
-  consumer was deleted; and `processUnsub` removes the subscription without setting
-  `sub.mqtt.closed` or waiting for a callback already executing. A delivery callback
-  dispatched before retirement can therefore pause, let retirement complete, continue past
-  its closed/ownership check, find no drain and reach ordinary PUBLISH processing —
-  transmitting a past-PUBREC source under a fresh identifier.
+- [x] **Drain retirement does not prove disposal before releasing the sid.** Filed
+  2026-09-05 by F-094's plan-review rounds 2 and 3. **Closed 2026-09-06** after 8
+  plan-review rounds (4 against `d75bdb1`, 4 after revalidation against `67864e7`), a
+  Codex scope consult, and 12 mutations each confirmed to fail its paired test.
 
-  **The required property:** exclude old-path transmission after suppression is removed;
-  prevent an outstanding deletion from destroying a consumer returned to service; and
-  preserve coherent sid ownership and accounting.
+  **What landed.** `retireDrainLocked` releases the sid and closes the delivery path
+  under **one** `sess.mu` hold: the drain is proven to still own its sid, the object is
+  marked terminally `retired`, `sub.mqtt.closed` is set on its delivery subscription,
+  and both drain maps are dropped — in that order, without releasing the lock. That is
+  what excludes an already-dispatched callback, which re-checks `closed` and only then
+  looks its drain up under one acquisition of the same lock; `processUnsub` never
+  reached it, because the `*subscription` it already holds stays valid. The consumer
+  delete then **waits** and is classified three ways — deleted, confirmed absent,
+  unknown — replacing a `noWait` request whose error check could never be true. The
+  terminal flag gates the four routes that could hand the object back
+  (`rollbackSubscribePacket`, which now restores **each map's own entries** and skips a
+  retired one; `restoreDrains`; `restoreDrainLocked`; `clearDrainInactivityTimers`);
+  adoption and the delivery reclaim need none, since both read `sess.drains[sid]`.
+  Retained continuations queue their disposal, detached inside `endRecordTxLocked` and
+  issued after the unlock, so no JetStream request is made while the record fence is
+  held. Reconciliation's consumer-absent removal refunds its local consumer charge on a
+  **proven-landed** save — a live leak, since such a drain is charged, survives a resume,
+  and `tmaxack` is otherwise reset only by `clear()`.
 
-  **Whole-lifecycle scope**, because a partial fix here is what generated three rounds of
-  findings: provisioning and fork repair; already-dispatched callbacks; delete success,
-  definite failure, timeout and late completion; competing retirement attempts;
-  `snapshotSubs` / `rollbackSubscribePacket`, which shallow-copy and wholesale-restore both
-  drain maps so a SUBSCRIBE rollback can resurrect a removed drain; reconciliation's direct
-  consumer-absent removal, which never refunds the local charge; session clearing and
-  restart.
+  **The required property, QUALIFIED by what shipped.** Old-path transmission after
+  suppression is removed: **closed**. An outstanding deletion destroying a consumer
+  returned to service: **closed for this drain object within this resident session
+  object's lifetime**, which is narrower than the unconditional wording this bullet
+  originally carried. A record restore builds a new session object while preserving the
+  generation, so a fork sibling's record can rebuild the drain on a fresh `*mqttDrain`
+  and a delete this object issued can land on it. That exposure is **pre-existing and
+  unwidened** — the previous unconfirmed delete had it identically — and closing it would
+  need a retirement fact a *sibling's* record could see, which no record of ours can
+  supply. Coherent sid ownership and accounting: **closed**.
 
-  **Preserved failed-design analysis — these are design CONSTRAINTS, not descriptions of
-  HEAD, which contains no `retiring` flag.** Reordering a fire-and-forget request proves
-  nothing. Refusing adoption alone does not block provisioning, because the caller
-  provisions when `cons[sid]` is absent. Unsubscribing does not exclude a dispatched
-  callback. Clearing a `retiring` flag after a timeout lets a late delete destroy a consumer
-  that has been returned to service. A post-delete ownership check does not prevent
-  resurrection through a snapshot taken earlier. Refunding only in `finishDrainIfEmpty`
-  misses the other removal exits.
+  **Residuals in `docs/CONFORMANCE.md`**, three of them: an unconfirmed delete is
+  reclaimed *eventually* by the orphan sweep rather than retried (and is reported); the
+  fork-sibling scope above; and an inactivity-clear create already in flight when a drain
+  retires. Mechanism in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain →
+  Retirement and disposal".
 
-  **Acceptance evidence:** deterministic schedules for each case above, a positive delivery
-  control in every negative-delivery assertion, exactly-once charge disposition on every
-  drain-removal exit, and the restart analysis — an empty drain is omitted from the record,
-  so a crash inside disposal restores no drain at all and the surviving consumer becomes
-  orphan-cleanup work, which a resident-object sweep does not cover. Cross-references the
-  delivery-readiness bullet below and F-036's queued-effect ownership work.
+  **Preserved failed-design analysis — still design CONSTRAINTS, do not re-propose.**
+  Reordering a fire-and-forget request proves nothing. Refusing adoption alone does not
+  block provisioning. Unsubscribing does not exclude a dispatched callback. Clearing the
+  terminal flag after a timeout lets a late delete destroy a consumer returned to
+  service. A post-delete ownership check does not prevent resurrection through a snapshot
+  taken earlier. Refunding only in `finishDrainIfEmpty` misses the other removal exits.
+  Keeping the drain in `sess.drains` until the delete is confirmed holds the sid forever
+  on an indeterminate outcome, because `st.intent` is never cleared. A session-scoped
+  retired-**name** set is object-scoped in fact and cannot establish the fork guarantee it
+  would exist for. A durable retirement fact in **our own** record cannot supply knowledge
+  a **sibling's** record lacks.
 
 - [x] **An adopted drain with no delivery subscription silently stops delivering.**
   Filed 2026-09-05 by F-094's plan-review round 2. **Closed 2026-09-06 for delivery
