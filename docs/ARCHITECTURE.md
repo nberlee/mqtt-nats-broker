@@ -3227,10 +3227,9 @@ messages on the filter are discarded. The drain is a field on the session record
 (`Drains`), so it survives disconnect, restart and failover, and it lives until
 every started delivery completes or the session ends. It is deliberately kept
 **out** of the record's `Cons` map, because in this tree `Cons` restores straight
-into `sess.cons` and a live re-SUBSCRIBE that finds `cons[sid]` takes the
-exists-branch: a drain carried there would satisfy that lookup and the filter would
-never get a delivery subscription. Drains restore through their own path instead, and
-a re-SUBSCRIBE reclaims one by adopting it explicitly.
+into `sess.cons`, and single ownership (I7 below) requires a drained consumer to live
+in exactly one place. Drains restore through their own path instead, and a
+re-SUBSCRIBE reclaims one by adopting it explicitly.
 
 The invariants, in the order they matter:
 
@@ -3250,6 +3249,45 @@ The invariants, in the order they matter:
   `sess.drains` and its `cons[sid]` entry is gone, so nothing can reach it through
   `cons` and create a second durable on the same filter. A re-SUBSCRIBE therefore
   **adopts** the drain explicitly.
+- **A live SUBSCRIBE adopts only what can deliver.** A resume can leave a drain with
+  no delivery subscription — the blanket QoS 2 withholding when PUBREL setup fails,
+  and a restore whose own `processQOS12Sub` failed. Adoption would then move that
+  durable into `cons`, and `processJSConsumer`'s existing-consumer arm reads the entry
+  as proof a subscription exists: the filter is SUBACKed **successfully** and delivers
+  nothing for the rest of the connection. So a live SUBSCRIBE **reclaims** such a drain
+  first — installing its delivery subscription and adopting it in one `sess.mu`
+  section — or fails the filter with `0x80`. Four things about how, each of which a
+  review round established:
+  - It installs with the **SUBSCRIBE's own** terms, not the drain's. The
+    existing-consumer arm's metadata refresh runs after that lock is released, so
+    installing the drain's terms leaves a window in which the callback selects with
+    them — a drain with No Local set, against a backlog the install just made
+    available, acks away a message the client is owed.
+  - It **adopts inside the same critical section**, so nothing observes the durable as
+    neither a drain nor a consumer.
+  - It does **not** register `drainByDur` first, as `restoreDrains` does. That
+    registration is right where the drain stays a drain; here it is never observable
+    before the adoption removes it, and a mechanism whose presence and absence are
+    indistinguishable is one too many.
+  - It decides "already delivering" from the **subscription**, never from the reverse
+    index. `restoreDrainLocked` registers `drainByDur` when the record is restored,
+    before any subscription exists, and the blanket withholding leaves that entry in
+    place while installing nothing — so an index-keyed test reads a withheld drain as
+    healthy and repairs nothing. The index says a drain is known; only the
+    subscription says it can deliver.
+
+  The reclaim is recorded into the packet's restore snapshot, because it is a state a
+  rollback must **restore** rather than undo: the drain was entitled to its delivery
+  subscription and the resume failed to install one. That is also what keeps
+  `rollbackSubscribePacket` unchanged — its adopted-drain exclusion asks whether the
+  durable was a drain's before the packet, and after the reclaim the honest answer is
+  yes.
+
+  What the reclaim does **not** establish is stated in `docs/CONFORMANCE.md`: adoption
+  keeps its existing behavior, so a filter that fails *after* adopting strands the
+  durable **where the membership key is absent** — not on a sid a QoS 0 re-SUBSCRIBE
+  already gave a key — and an already-started QoS 2 exchange reclaimed by a QoS 1
+  re-SUBSCRIBE is retransmitted at QoS 1.
 
 Recovery is positive, never an inference from absence. Because the phase is
 memory-only, a restart would otherwise establish source interest and resend the

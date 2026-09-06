@@ -2290,6 +2290,93 @@ func (d *mqttDrain) retirable() bool {
 	return true
 }
 
+// reclaimDrainDeliveryLocked gives a restored drain the delivery subscription its
+// resume could not install, and adopts it, so a re-SUBSCRIBE ends with a consumer
+// that actually delivers.
+//
+// Without it a re-SUBSCRIBE over such a drain is answered SUBACK SUCCESS and then
+// delivers nothing for the rest of the connection: adoption moves the durable into
+// sess.cons, and processJSConsumer's existing-consumer arm reads that entry as proof
+// a delivery subscription exists. Two resumes leave a drain in that state — the
+// blanket QoS 2 withholding when PUBREL setup fails, and a restore whose own
+// processQOS12Sub failed.
+//
+// It installs with the SUBSCRIBE'S OWN terms and adopts in this same critical
+// section, and both halves of that are load-bearing.
+//
+// Installing with the DRAIN's terms and letting processJSConsumer's refresh correct
+// them afterwards is WRONG, because that refresh runs after this lock is released:
+// the callback can select with the old terms against a backlog this very call made
+// available. A drain carrying noLocal=true, an unclaimed pending message from this
+// session, and a re-SUBSCRIBE asking noLocal=false is enough — the callback acks
+// that message away where the unrepaired broker leaves it pending. There is no
+// window to close if the terms are right at install.
+//
+// Adopting HERE rather than leaving it to processJSConsumer keeps the durable from
+// being observable as neither a drain nor a consumer.
+//
+// It deliberately does NOT register drainByDur first. restoreDrains does, and is
+// right to, because the drain it installs for STAYS a drain. Here the drain is about
+// to stop being one, so the entry would be REDUNDANT: under this one lock nothing can
+// observe it between the registration and the adoption that removes it again, which
+// is the same fact that makes the adoption safe. A review round checked every
+// install-time reader and found none that consults the reverse index.
+//
+// What it does NOT establish, because a review round proved each in turn: that a
+// failed filter hands the drain back (adoption keeps its existing behavior, and the
+// durable an adopted-then-failed filter strands is filed), and that an
+// already-started QoS 2 exchange still completes at QoS 2 when the re-SUBSCRIBE asks
+// for QoS 1 (also filed). Both are stated in docs/CONFORMANCE.md.
+//
+// sess.mu must be held; the caller releases it before processJSConsumer, which
+// acquires it itself.
+func (sess *mqttSession) reclaimDrainDeliveryLocked(c *client, subject, sid string,
+	qos byte, noLocal, retainAsPublished bool, subID int) (*mqttDrain, error) {
+
+	d := sess.drains[sid]
+	if d == nil || d.cc == nil {
+		return nil, nil
+	}
+	// The helper's OWN refusal, not a copy of adoptDrainLocked's: it runs BEFORE that
+	// one, so nothing else covers it, and installing interest for a held drain would
+	// hand its filter delivery the hold exists to withhold (F-094).
+	if sess.drainSidHoldLocked(sid) != mqttDrainNotHeld {
+		return nil, nil
+	}
+	// Already delivering. Nothing to reclaim, and adoption stays exactly where it is
+	// for every healthy drain — this acts on the defective state alone.
+	//
+	// The test is the SUBSCRIPTION, not the reverse index, and a test that drove the
+	// real producer proved why: restoreDrainLocked registers drainByDur the moment the
+	// record is restored, BEFORE any subscription exists, and the blanket QoS 2
+	// withholding then leaves that entry in place while installing nothing. Keying on
+	// the index reads such a drain as healthy and declines to repair the one state
+	// this helper exists for. The index says a drain is known; only the subscription
+	// says it can deliver.
+	//
+	// c.mu inside sess.mu is the order closeSharedDeliveryLocked already uses.
+	inbox := d.cc.DeliverSubject
+	c.mu.Lock()
+	existing := c.subs[inbox]
+	c.mu.Unlock()
+	if existing != nil {
+		return nil, nil
+	}
+	// isMQTTReservedSubscription reads the FILTER, never the "$MQTT.sub.*" deliver
+	// subject, and the flag is set once at install and never refreshed — so deriving
+	// it from the filter is required rather than tidy. restoreDrains derives it the
+	// same way.
+	if _, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil,
+		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID,
+		d.cc.Durable, mqttDeliverMsgCbQoS12); err != nil {
+		// Nothing to roll back: no map was touched, and processSub unsubscribes its own
+		// NATS interest before c.subs[sid] is assigned, so no subscription survives.
+		return nil, err
+	}
+	sess.adoptDrainLocked(sid)
+	return d, nil
+}
+
 func (sess *mqttSession) adoptDrainLocked(sid string) bool {
 	d := sess.drains[sid]
 	if d == nil {

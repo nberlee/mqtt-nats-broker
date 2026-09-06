@@ -3173,25 +3173,95 @@ takeover.
   orphan-cleanup work, which a resident-object sweep does not cover. Cross-references the
   delivery-readiness bullet below and F-036's queued-effect ownership work.
 
-- [ ] **An adopted drain with no delivery subscription silently stops delivering.** Filed
-  2026-09-05 by F-094's plan-review round 2, and scoped out of F-094 by its first consult.
-  **Pre-existing at HEAD.** Adopting a drain that has no delivery subscription installs
-  `cons[sid]` with no delivery interest, after which `processJSConsumer`'s
-  existing-consumer arm returns "we are done" on every later re-SUBSCRIBE and the filter
-  never delivers again for that connection.
+- [x] **An adopted drain with no delivery subscription silently stops delivering.**
+  Filed 2026-09-05 by F-094's plan-review round 2. **Closed 2026-09-06 for delivery
+  READINESS only**, after 5 plan-review rounds and an escalation consult that narrowed
+  it; the obligations its original wording also carried are split out into the three
+  bullets below, because ticking it whole would have overclaimed.
 
-  **Two routes reach it, and only one is intent-bearing.** CONNECT skips **every** QoS 2
-  drain via `qos2DrainDurables` when PUBREL subscription setup fails — including drains
-  holding only PUBLISH-phase claims, which F-094's intent hold does not cover — and
-  `restoreDrains` withholds source interest for any barrier-skipped durable. F-094 closes
-  the intent-bearing subset as a side effect of holding those sids; the family is broader.
+  **What landed.** A QoS > 0 live SUBSCRIBE that meets a drain with no delivery
+  subscription **reclaims** it — `reclaimDrainDeliveryLocked` in `unsub_drain.go`
+  installs the subscription and adopts in one `sess.mu` section — or answers the filter
+  `0x80`. Called from both `processSubs` insertion points, main and level-up companion,
+  with a failure routed into each one's existing consumer-error cleanup arm rather than
+  a bare `continue`. Three details are load-bearing and each was established by a review
+  round: the install uses the **SUBSCRIBE's own** terms, because the metadata refresh
+  runs after the lock is released and the drain's terms would let the callback ack away
+  a message the client is owed; the adoption is in the **same** critical section, so
+  nothing observes the durable as neither drain nor consumer; and there is **no**
+  `drainByDur` registration first, which under that lock is indistinguishable from its
+  absence. The reclaim is recorded into the packet's restore snapshot
+  (`retainRepairedDrain`), which is what leaves `rollbackSubscribePacket` unmodified.
 
-  **Why it is not another check in the shared adoption helper:** the required property is
-  that a successfully adopted consumer has a usable delivery subscription, which intent
-  ownership cannot establish, and fork repair adopts during CONNECT **before** subscription
-  restoration — so "no subscription means refuse" would change normal repair behavior.
-  Closing it means deciding where delivery readiness is established, how a failure rolls
-  back, and how wildcard atomicity is maintained.
+  **The barrier-skipped route this bullet named was never live**, and the claim is
+  withdrawn with the code behind it: every durable in `recoverDrainPubRels`' skip set
+  is intent-bearing by construction, so F-094's hold refuses its adoption for as long
+  as the drain object exists.
+
+  **What it does NOT claim:** correct completion of every adopted exchange, any change
+  to adoption's own failure or persistence behavior, and any atomicity across duplicate
+  occurrences of one filter in a packet. Residuals in `docs/CONFORMANCE.md`; mechanism
+  in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
+
+- [ ] **A filter that fails after adopting a drain strands its durable.** Filed
+  2026-09-06 by the delivery-readiness item's plan-review rounds 1 and 2 and scoped out
+  of it by its escalation consult. **Pre-existing at HEAD and not caused by that
+  change**, which neither introduces nor worsens it: no reclaim is involved. An adopted
+  drain's filter has no membership — the client unsubscribed, which is why it is a
+  drain — and `sess.update` never gives a failed filter one, while
+  `buildPersistedSessionLocked` drops a `cons` entry whose membership key is absent. The
+  drain is already out of `Drains`, so the next successful save records **neither** and
+  the durable becomes orphan-sweep work with its started deliveries inside it. The same
+  loss arrives through a later shared filter's early membership persist, or a crash
+  after one; and an ambiguous early save returns with earlier adoptions standing, which
+  no per-filter inverse undoes. **Not reachable for every adoption:** a sid that still
+  carries a prior QoS 0 membership keeps its key and is not omitted.
+
+  **Three remedies are already refuted and must not be re-proposed.** *Un-adopting at
+  the per-filter failure exits*: the inverse must also restore the four `sub.mqtt`
+  fields the existing-consumer refresh mutates, and it still cannot retract a delivery a
+  callback selected before the abort and transmitted after it — and there is **no**
+  aggregate bound on how many, since a wildcard's two sids have separate callbacks and
+  traffic flows throughout the interval. *Refusing adoption without a delivery
+  subscription*: fork repair adopts during CONNECT before subscription restoration.
+  *Deferring adoption to the confirmed save*: duplicate filters in one packet defeat a
+  deferred-adoption list and `cancelFilterDeferred` cannot resolve the cross-occurrence
+  cases, `sess.update` returning nil does not mean a save happened so the else branch is
+  not a commit point, and `finishDrainIfEmpty` never takes the record fence so the
+  packet's `tok` only partly excludes a mid-packet retirement.
+
+  **Acceptance evidence:** the persisted RECORD, not the in-memory maps — a wildcard
+  whose companion half fails, followed by a later successful save, must leave the
+  drain named in `Drains` — plus a reconnect that shows it delivering, and the
+  early-save and crash windows each scheduled deterministically.
+
+- [ ] **An already-started QoS 2 exchange is retransmitted at QoS 1 after a QoS 1
+  re-SUBSCRIBE.** Filed 2026-09-06 by the delivery-readiness item's plan-review round 4.
+  A drain holding a *claimed*, already-transmitted QoS 2 PUBLISH — recovered register,
+  original packet identifier, no PUBREC intent — that is adopted by a QoS 1
+  re-SUBSCRIBE is retransmitted at QoS 1: the callback recomputes the effective QoS
+  against the new subscription, `trackPublish` finds the existing source mapping and
+  returns `isNew=false` so no register is rewritten, and `beginSendLocked` does not
+  reconcile QoS. The started exchange still owes its QoS 2 handshake
+  ([MQTT-3.10.4-3]), and a client whose PUBREC was lost may still be holding that state
+  open ([MQTT 5.0 §4.3.3]). **Pre-existing:** HEAD does the same whenever it adopts an
+  already-delivering drain and refreshes its metadata downward. What the delivery
+  reclaim changed is the population — a drain that used to deliver nothing now
+  delivers, so the transition became reachable where silence stood. **Not a reason to
+  install with the drain's stale options instead**, which is refuted above. Any fix
+  must decide what a subscription downgrade owes an exchange already past its first
+  transmission, which is a protocol question this item could not settle.
+
+- [ ] **A closed-but-present delivery subscription under a live `cons[sid]`.** Filed
+  2026-09-06 by the delivery-readiness item's plan-review round 1.
+  `stageDeferredDeleteLocked` closes a QoS 0 downgrade's delivery subscription while
+  `processJSConsumer`'s QoS 0 arm deliberately keeps `cons[sid]` until the confirmed
+  save, so one SUBSCRIBE packet carrying the same filter at QoS 0 and then at QoS 1
+  reaches the existing-consumer arm with `sub.mqtt.closed == true`. **Widening a
+  predicate does not fix it**: the deferred delete is still scheduled, so a branch that
+  merely reinstalled delivery would be racing a teardown the packet has already
+  committed to. Pre-existing, and untouched by the delivery reclaim, which never enters
+  that branch.
 
 - [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
   non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).
@@ -3674,6 +3744,29 @@ finding with acceptance criteria.
   sort that does not require the whole population in hand — plus a decision on whether
   the affine and PUBREL classes share one paged walk or take one each. Not a blocker for
   F-036, which is closed.
+
+- [ ] **`TestSharedDenyDoesNotConsumeForAllowedMembers` fails intermittently, and it
+  reproduces on clean HEAD.** Observed 2026-09-06 while verifying the delivery-readiness
+  change, under `-tags mqttport_fulltests`. **On the working tree:** pass, pass, fail.
+  **On a clean `d75bdb1` worktree carrying none of that change:** pass, pass, pass,
+  fail. Failing runs took ~18.2 s each.
+
+  **What that does and does not establish.** It establishes that the failure occurs
+  **without** the change, so the change is not required to produce it. It does **not**
+  establish equal failure rates — one in three against one in four is far too little
+  evidence for that — nor that the two are the same mechanism; matching durations do
+  not show matching causes, and exacerbation is not excluded. Do not cite this bullet
+  as a clean bill of health for a later change in this area; re-pair the baseline.
+
+  The failure is an **assertion**, not a timed-out harness:
+  `authz_affine_test.go:496`, "an allowed shared member joining after a DENIED member
+  was offered the group message must still receive it: a terminal ACK on the deny
+  destroyed it". The ~18 s is the wait that precedes it, so a lost delivery produces
+  exactly that shape. Mechanism unattributed. Same class as the `TestMQTTInflight*`
+  bullet below. **The baseline establishes reproduction without the change;
+  attribution of the working-tree failure remains unresolved** — reproduction on a
+  clean tree cannot tell an unrelated baseline failure apart from a change-induced one
+  reaching the same assertion.
 
 - [ ] **Attribute the `TestMQTTInflight*` family's intermittent failures.** Filed
   2026-09-01 by the F-066 enforcement lane, which met one in a full-suite run and then

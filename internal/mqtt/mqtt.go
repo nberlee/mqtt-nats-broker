@@ -625,6 +625,48 @@ func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
 	return func() { mqttTestSessSaveHookV.Store(prev) }
 }
 
+// Test hook: when set, processQOS12Sub fails for the named durable. It exists
+// because the delivery-subscription failures this broker must survive —
+// restoreDrains leaving a drain un-indexed, a reclaim that cannot install — have no
+// TARGETABLE natural trigger. A closed connection fails everything at once, and a
+// Flush timeout is not aimable at one durable either, so neither could show a single
+// drain failing while the rest of the packet proceeded. Keyed by durable, this can.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestQOS12SubFailHookV atomic.Pointer[func(durable string) error]
+
+// setMQTTTestQOS12SubFailHook installs (or, with nil, clears) the delivery-subscription
+// failure hook and returns a function that restores the previous value.
+func setMQTTTestQOS12SubFailHook(h func(durable string) error) func() {
+	prev := mqttTestQOS12SubFailHookV.Load()
+	if h == nil {
+		mqttTestQOS12SubFailHookV.Store(nil)
+	} else {
+		mqttTestQOS12SubFailHookV.Store(&h)
+	}
+	return func() { mqttTestQOS12SubFailHookV.Store(prev) }
+}
+
+// Test hook: when set, ensurePubRelConsumerSubscription fails. It is the producer of
+// the blanket QoS 2 withholding — qos2DrainDurables puts EVERY QoS 2 drain into the
+// resume's skip set when PUBREL setup fails, including drains carrying only
+// PUBLISH-phase claims, which no hold covers.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestPubRelSubFailHookV atomic.Pointer[func() error]
+
+// setMQTTTestPubRelSubFailHook installs (or, with nil, clears) the PUBREL
+// subscription failure hook and returns a function that restores the previous value.
+func setMQTTTestPubRelSubFailHook(h func() error) func() {
+	prev := mqttTestPubRelSubFailHookV.Load()
+	if h == nil {
+		mqttTestPubRelSubFailHookV.Store(nil)
+	} else {
+		mqttTestPubRelSubFailHookV.Store(&h)
+	}
+	return func() { mqttTestPubRelSubFailHookV.Store(prev) }
+}
+
 // Test hook: when set, it is invoked after a teardown claim is CONFIRMED and
 // before the first deletion — the exact window a nonce re-check cannot close,
 // where a paused broker can let a peer finish the whole teardown and create a
@@ -8149,6 +8191,11 @@ func (sess *mqttSession) processQOS12Sub(
 	c *client, // subscribing client.
 	subject, sid, queue []byte, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
 ) (*subscription, error) {
+	if hook := mqttTestQOS12SubFailHookV.Load(); hook != nil {
+		if err := (*hook)(jsDurName); err != nil {
+			return nil, err
+		}
+	}
 	return sess.processSub(c, subject, sid, queue, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
 }
 
@@ -8615,6 +8662,33 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 		sess.mu.Unlock()
 	}
+
+	// reclaimDrainDelivery gives a drain whose delivery subscription the resume could
+	// not install one now, and adopts it, before provisioning runs. Without it
+	// processJSConsumer adopts the drain and its existing-consumer arm reads the entry
+	// as proof of a delivery subscription, so the filter is SUBACKed successfully and
+	// then delivers nothing for the rest of the connection. See unsub_drain.go.
+	//
+	// Live SUBSCRIBE only: the CONNECT restore path installs for an existing entry
+	// through processJSConsumer's own fall-through. Plain filters only: draining is a
+	// plain-consumer mechanism. And positive QoS only, because the reclaim ADOPTS and a
+	// QoS 0 re-SUBSCRIBE deliberately does not — the drain keeps draining independently
+	// while the raw subscription delivers new messages at QoS 0.
+	reclaimDrainDelivery := func(f *mqttFilter, subject, sid string) error {
+		if !fromSubProto || f.shared || f.qos == 0 || f.qos >= mqttSubAckFailure {
+			return nil
+		}
+		sess.mu.Lock()
+		d, err := sess.reclaimDrainDeliveryLocked(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID)
+		if d != nil {
+			// Recorded as a state the rollback must RESTORE, not undo. See
+			// retainRepairedDrain.
+			snap.retainRepairedDrain(d)
+		}
+		sess.mu.Unlock()
+		return err
+	}
+
 	// Irreversible teardown of consumers removed by a QoS downgrade in this
 	// packet is deferred until the final session save is confirmed, so a failed
 	// save can restore the pre-packet consumer instead of having lost its
@@ -8817,7 +8891,12 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			filterInstalled = filterInstalled || jr.installed
 		} else {
 			var dd *ConsumerConfig
-			jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+			// A failed reclaim SKIPS provisioning and carries its error into the
+			// per-filter arm below: by here the raw QoS 0 subscription is already
+			// installed, so a bare continue would strand it.
+			if err = reclaimDrainDelivery(f, subject, sid); err == nil {
+				jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+			}
 			if dd != nil {
 				deferredDels = append(deferredDels, deferredDel{sid: sid, cc: dd})
 				// The teardown itself is deferred to the confirmed save, but the
@@ -8915,7 +8994,13 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				filterInstalled = filterInstalled || fwjr.installed
 			} else {
 				var fwdd *ConsumerConfig
-				fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+				// Same reclaim for the level-up companion, which owns a drain of its own.
+				// Its failure arm cleans BOTH raw subscriptions and any main consumer this
+				// filter created, which is why the error is carried there rather than
+				// short-circuiting.
+				if err = reclaimDrainDelivery(f, fwcsubject, fwcsid); err == nil {
+					fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+				}
 				if fwdd != nil {
 					// The same staging as the main half, through the same helper: the
 					// companion is a consumer in its own right and owes exactly what it
@@ -9465,6 +9550,35 @@ func (sess *mqttSession) snapshotSubs() *mqttSubSnapshot {
 		}
 	}
 	return s
+}
+
+// retainRepairedDrain records a drain whose delivery subscription THIS PACKET
+// installed, so a rollback restores the drain WITH that subscription rather than
+// without it.
+//
+// The reclaim is not the packet's change to revert: the drain was entitled to a
+// delivery subscription and its resume failed to install one. Where the pre-packet
+// drainByDur lacks the entry — a restore whose processQOS12Sub failed rolls it back —
+// restoring that map alone would leave a live subscription over a durable the reverse
+// index no longer names, so a drained source would be delivered as an ordinary PUBLISH
+// for the rest of the connection. That absence is not what DEFINES a repair, though:
+// the blanket QoS 2 withholding leaves the entry in place while installing nothing, so
+// the reclaim keys on the subscription and this recording is simply idempotent there.
+//
+// It is also what lets rollbackSubscribePacket stay unchanged: its adopted-drain
+// exclusion asks whether the durable was a drain's before the packet, and after the
+// reclaim the honest answer is yes.
+func (s *mqttSubSnapshot) retainRepairedDrain(d *mqttDrain) {
+	if s == nil || d == nil || d.cc == nil {
+		return
+	}
+	if s.drains == nil {
+		s.drains = make(map[string]*mqttDrain, 1)
+	}
+	if s.drainByDur == nil {
+		s.drainByDur = make(map[string]*mqttDrain, 1)
+	}
+	s.drainByDur[d.cc.Durable] = d
 }
 
 // restoreSharedKeyInMemory reverts the in-memory shared-subscription maps for one
@@ -20165,6 +20279,11 @@ func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fro
 // Make sure we are set up to deliver PUBREL messages to this QoS2-subscribed
 // session.
 func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
+	if hook := mqttTestPubRelSubFailHookV.Load(); hook != nil {
+		if err := (*hook)(); err != nil {
+			return err
+		}
+	}
 
 	sess.mu.Lock()
 	pubRelSubscribed := sess.pubRelSubscribed

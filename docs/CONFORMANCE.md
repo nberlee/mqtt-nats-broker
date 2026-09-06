@@ -1320,13 +1320,45 @@ Residuals:
   bounded disposal or retry guarantee. SUBSCRIBE rollback can restore a previously
   removed drain from its snapshot, and reconciliation's direct consumer-absent removal
   lacks a local-charge refund; these lifecycle gaps are tracked with drain disposal.
-- **Delivery readiness on adoption is not addressed.** Adopting a drain that has no
-  delivery subscription installs a consumer entry with no delivery interest, after
-  which `processJSConsumer`'s existing-consumer arm returns early on every later
-  re-SUBSCRIBE and the filter silently stops delivering. F-094's intent hold covers
-  only the intent-bearing subset: CONNECT skips **every** QoS 2 drain when PUBREL
-  subscription setup fails, including drains holding only PUBLISH-phase claims, and a
-  failed delivery-subscription restoration leaves the same shape. Tracked separately.
+- **A live SUBSCRIBE reclaims a drain that cannot deliver.** A resume can leave a
+  drain with no delivery subscription — CONNECT withholds source interest from
+  **every** QoS 2 drain when PUBREL subscription setup fails, including drains holding
+  only PUBLISH-phase claims that no hold covers, and a restore whose own
+  `processQOS12Sub` failed leaves the same shape. A QoS > 0 re-SUBSCRIBE over such a
+  drain now installs its delivery subscription and adopts it in one step, with the
+  terms the client asked for, or answers the filter `0x80`. Previously the filter was
+  granted and then delivered nothing for the rest of the connection, with no log line
+  and no reason code.
+
+  The **barrier-skipped** route once listed here was never live and the claim is
+  withdrawn: every durable in the PUBREL barrier's skip set is intent-bearing by
+  construction, so F-094's hold refuses its adoption for as long as the drain object
+  exists.
+
+  Three residuals are deliberate, and each is filed as its own release-blocking
+  finding rather than fixed here:
+  - **A filter that fails after adopting can strand its durable.** Adoption is
+    unchanged by this repair. **When the membership key is absent** — the ordinary case,
+    since the client unsubscribed, which is why it is a drain, and a failed filter never
+    gains one — the record builder drops the consumer while the drain is already out of
+    `Drains`, so the next save records neither and the durable becomes orphan-sweep work
+    with its started deliveries inside it. It is **not** every adoption: a QoS 0
+    re-SUBSCRIBE establishes membership without adopting, so a later failed QoS > 0
+    adoption on that sid keeps its key and its consumer is retained. Reachable without
+    the reclaim. An intervening early save, or a crash after one, loses it the
+    same way.
+  - **An already-started QoS 2 exchange reclaimed by a QoS 1 re-SUBSCRIBE is
+    retransmitted at QoS 1.** The callback recomputes the effective QoS against the new
+    subscription, the identifier is reused so no register is rewritten, and nothing
+    reconciles the QoS — so the started exchange's QoS 2 handshake is not completed
+    ([MQTT-3.10.4-3], [MQTT 5.0 §4.3.3]). This is what HEAD already does when it adopts
+    an already-delivering drain and refreshes its metadata downward; the reclaim
+    **exposes** it to drains that previously delivered nothing at all.
+  - **A closed-but-present delivery subscription under a live `cons[sid]`.** A QoS 0
+    downgrade closes the delivery while deliberately keeping the consumer entry until
+    the confirmed save, so one SUBSCRIBE packet carrying the same filter at QoS 0 and
+    then at QoS 1 reaches the existing-consumer arm with a closed subscription and a
+    deferred delete still scheduled.
 - **Scope.** A drain survives because the brokers that read the `Drains` record field
   exclude its durable from the orphan sweep's candidates and hand it to teardown as
   this session's own — and that is every broker serving the account, since they all run
