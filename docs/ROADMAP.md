@@ -3458,9 +3458,88 @@ takeover.
   publishes from one Client. What is also owed is instrumentation correlating source
   sequence, copy sequence, claim phase, callback entry and enqueue.
 
-- [ ] [F-035: Bound every courtesy DISCONNECT write](findings/runtime-correctness.md#f-035).
-  **Medium.** One watchdog must cover mutex acquisition and socket writing at
-  every server-initiated DISCONNECT site.
+- [x] [F-035: Bound every courtesy DISCONNECT write](findings/runtime-correctness.md#f-035).
+  **Closed by RESTORING a bound this port dropped, not by the watchdog the bullet asked
+  for, and the difference is the finding.** The per-site design was reviewed twice and its
+  ENUMERATION faulted five times — arming sites went 3 to 7 to 9 — while its shape was never
+  faulted. That is the enumeration being the defect
+  (`feedback_close_the_class_with_a_property`). The property those sites approximate has one
+  home: upstream nats-server bounds every client write with `opts.WriteDeadline`, clears it
+  after, and closes a missing client as `SlowConsumerWriteDeadline`
+  (`DEFAULT_FLUSH_DEADLINE` = 10s). This port lost it when the shim replaced upstream's
+  `writeLoop` and outbound buffer with a synchronous write under `wmu` and a no-op
+  `writeLoop`, leaving `writeSocket`'s deadline parameter with one caller.
+
+  **What landed.** `writeSocket` installs `mqttWriteDeadline` itself on every write and
+  CLEARS it before returning; `queueOutboundBy` carries the shutdown drain's absolute cap
+  (`min(drain deadline, now + mqttWriteDeadline)`, an already-past cap installed as-is);
+  and `writeDirect` is deleted. No per-site arming, no licence audit, no source guard, no
+  timer, no new goroutine anywhere. The slow-consumer disconnect is `queueOutbound`'s
+  existing close-on-error path, so there is no new close path and no new `ClosedState`.
+
+  **What was planned and DROPPED, by a Codex scope ruling during implementation.** The
+  plan also moved the notification into the close goroutine at the three displacement
+  tails that own both (`discardTakenOverClient`, `disposeForeignSessionLocked`, the
+  remote-persist eviction tail), to take the notification's write off those tails
+  entirely. Implemented, it failed **nine** existing tests; reverting only that move
+  turned all nine green. Eight read the DISCONNECT claim immediately after the displacing
+  call returns and merely race the notification, but the ninth
+  (`inflight_rewrite_test.go`, "endSend must issue the deferred register delete") asserts
+  a durable register delete, and 5/5 runs failed with the move against 5/5 passing
+  without — so it is not the `TestMQTTInflight*` intermittent population filed below. The
+  move is not load-bearing for the claim above, since the deadline already bounds those
+  writes; it is a scheduling change that needs its own analysis and its own oracle
+  strategy, not a rider on a bounded-writer repair. Two mechanisms stating one fact, and
+  the seam between them costing nine tests, is `feedback_delete_redundant_mechanisms`. Not
+  filed as a roadmap bullet: nothing is owed. The inline form is correct and bounded.
+
+  **The clear is not tidiness**, and its absence was the one real defect a review round
+  found in the replacement: `c.nc` may be a `*tls.Conn`, and a TLS 1.3 KeyUpdate reply
+  is written from `Read` without passing through `writeSocket`, so a deadline left in
+  place
+  expires through idle time and gives that write a PERMANENT outbound error no later MQTT
+  write can repair.
+
+  **What is claimed, and only this:** the deadline removes indefinite blocking caused by a
+  NON-READING MQTT socket, under ordinary transport and scheduling assumptions. It puts no
+  figure on the ownership gate's hold and does not bound work that is not a socket write —
+  one `c.mu` section can contain many bounded writes, and a gate-held Will phase can
+  wait on `subsBarrier.wait`, which has no elapsed-time bound at all (filed below).
+
+  The bullet's own three "do not repeat" shapes remain correct, and none of them is this
+  fix: it is not a synchronous write on the readLoop, not a goroutine that writes then
+  closes, and not `writeDirect` with a deadline — the bound is installed inside the single
+  writer, so it covers what a caller-supplied deadline never could.
+
+  **Owed, and explicitly deferred by the same ruling** rather than dropped: the plan's T6
+  (the nine gate-held routes driven through their actual producers) and the TCP-specific
+  half of T9 (a real socket-buffer backpressure observation). Both are route and transport
+  coverage around a property that is itself covered and mutation-tested at its single
+  home; the slow-consumer lifecycle chain — blocked write, deadline failure, raw closure,
+  ordinary teardown — ships here over a real readLoop instead.
+
+- [ ] **A delayed Will's `FireAt` is anchored to CONSUMPTION, not to the close.** Filed
+  2026-09-06 by F-035's plan review, which ruled it separate work rather than absorbing it.
+  `mqttHandleWill` computes `FireAt` from `time.Now()` at the moment the Will is consumed,
+  so a Will consumed late fires late, and a reconnect in the interval can qualify to
+  suppress a Will whose delay from the ACTUAL close had already elapsed. F-035 makes this
+  more reachable — a write timeout is a new producer of a late close — but did not create
+  it. **A bare timestamp field is not a complete design**: the fix must define the
+  observation point and its interaction with the existing deferred-disconnect deadlines,
+  which is why it is not a one-line change.
+
+- [ ] **`subsBarrier.wait` has no elapsed-time bound and its generation can be EXTENDED by
+  later entrants.** Filed 2026-09-06 by F-035's plan review; a confirmed liveness defect
+  found by that review, not created by it, and not closable by it. `enter`, `leave` and
+  `wait` share one count and one channel, and only a transition to zero closes it — so,
+  contrary to the barrier's own comment, later subscribers extend a generation an earlier
+  waiter already sampled. Continuously overlapping SUBSCRIBE operations can therefore
+  keep a QoS 1/2 Will waiting indefinitely, and with it the gate that Will phase is held
+  under, reached via `mqttHandleWill` → `mqttInitiateMsgDelivery` →
+  `mqttInitiateMsgDeliveryJSA`. CONNECT restoration also enters the barrier. Shutdown's
+  abort channel is not a normal-operation bound. Fixing generation membership needs its own
+  correctness argument about subscription interest and message retention, which is why
+  F-035 did not absorb it.
 
 - [ ] [F-041: Persist the MQTT 5 DISCONNECT expiry override](findings/session-and-will.md#f-041).
   **Medium.** The durable record and resume decision must agree even after an

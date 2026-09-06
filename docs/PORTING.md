@@ -402,13 +402,21 @@ Porting-facing methods: `msgParts`, `processSub`, `processUnsub`,
 `flushClients`, `closeConnection`, `registerWithAccount`, `readLoop`,
 `writeLoop`, `addToPCD`, `selectMappedSubject`, `pubAllowedFullCheck`,
 `checkDenySub`, `maxPayloadViolation`, `doTLSServerHandshake`, `writeSocket`,
-`writeDirect`, `shutdownDisconnect`, and
-`Errorf`/`Warnf`/`Debugf`/`Tracef`/`traceInOp`/`traceOutOp`.
+`queueOutboundBy`, `shutdownDisconnect`, and
+`Errorf`/`Warnf`/`Debugf`/`Tracef`/`traceInOp`/`traceOutOp`. `writeDirect` is gone:
+`shutdownDisconnect` now writes through `queueOutboundBy`, the capped form of
+`queueOutbound`.
 
 This is the broker engine: replace the NATS-server socket read/write loop with a
 per-connection handler (`internal/conn`), route `processSub`/`processInboundClientMsg`
 through a per-client `*nats.Conn` (see `backend.DialClient`), and back
 `queueOutbound`/`flushClients` with a buffered writer to the MQTT socket.
+
+`writeLoop` is a no-op here: the port replaced upstream's write loop and outbound buffer
+with a SYNCHRONOUS write under `wmu` in `writeSocket`. That write carries upstream's
+per-write deadline and clears it afterwards (`mqttWriteDeadline`, F-035), so a
+re-implementation that reinstates a buffered write loop must carry the deadline with it —
+it is the only bound on the server's side of a connection.
 
 ### `Server` — `shim_engine.go` and `shim_public.go`
 

@@ -10,10 +10,50 @@ it existed on 2026-08-10.
 
 **Title:** Bound every server-initiated courtesy DISCONNECT write
 
-- Status: Open
+- Status: Closed 2026-09-06.
 - Classification: Confirmed correctness or liveness defect
 - Release treatment: Alpha blocker
 - Original roadmap order: 35
+
+**How it closed, which is not how the finding proposed.** The finding asked for a write
+watchdog armed at every courtesy site. Two plan-review rounds faulted that design's
+ENUMERATION five times — the arming-site count went 3 to 7 to 9 — while never faulting its
+shape, which is the signal that the enumeration is itself the defect.
+
+The property those sites approximate has one home, and upstream nats-server already holds
+it while this port dropped it: every client write is bounded by `opts.WriteDeadline`,
+CLEARED after the write, with a miss closing the client as `SlowConsumerWriteDeadline`
+(`DEFAULT_FLUSH_DEADLINE` = 10s). The shim replaced upstream's `writeLoop` and outbound
+buffer with a synchronous write under `wmu` and a no-op `writeLoop`, and the deadline went
+with them, leaving `writeSocket`'s `deadline` parameter with a single caller.
+
+So F-035 is a RESTORED bound, at upstream's value. `writeSocket` computes and installs
+`mqttWriteDeadline` itself and clears it before returning; `queueOutboundBy` carries the
+shutdown drain's absolute cap; and `writeDirect` is deleted. No per-site arming, no
+licence audit, no source guard, no timer, no new goroutine anywhere.
+
+A planned fourth part — moving the notification into the close goroutine at the three
+displacement tails that own both — was DROPPED during implementation by a Codex scope
+ruling. It failed NINE existing tests; reverting only that move turned all nine green. It
+is not load-bearing for the claim, because the deadline already bounds those writes, and
+one of the nine asserts a durable register delete rather than mere observability, so the
+scheduling change needs its own analysis and its own oracle strategy rather than riding on
+a bounded-writer repair. Nothing is owed: the inline form is correct and bounded.
+`docs/ROADMAP.md` carries the evidence.
+
+**The clear is load-bearing, and its absence was the one real defect a review found in the
+replacement mechanism.** `c.nc` may be a `*tls.Conn`, and TLS writes bytes that never pass
+through `writeSocket` — a TLS 1.3 KeyUpdate response is written from `Read`. A deadline
+left installed expires through idle time and hands that write a permanent outbound error no
+later MQTT write can repair.
+
+**Residuals**, all in `docs/CONFORMANCE.md`: the slow-consumer disconnect and its
+session, QoS, shared-group and Will consequences; a frame that can be truncated mid-write;
+no gate-duration bound is claimed, because one `c.mu` section may contain many bounded
+writes and a gate-held Will phase can wait on `subsBarrier.wait`, which has no elapsed-time
+bound; and two pre-existing durable-loss exposures that become more reachable rather than
+new. Two follow-ups were filed as roadmap bullets rather than absorbed: anchoring a delayed
+Will's `FireAt` to the close instead of to consumption, and the `subsBarrier` bound.
 
 ### Original finding record
 

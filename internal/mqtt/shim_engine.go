@@ -1128,22 +1128,49 @@ func (c *client) doTLSServerHandshake(kind string, cfg *tls.Config, timeout floa
 	return nil
 }
 
+// mqttWriteDeadline bounds EVERY MQTT application write. It restores a bound
+// this port dropped rather than inventing a policy: upstream nats-server
+// installs opts.WriteDeadline on every flush (server/client.go:1842), CLEARS it
+// afterwards (:1844), and closes a client that misses it as
+// SlowConsumerWriteDeadline (:1962). The shim replaced upstream's writeLoop and
+// outbound buffer with a synchronous write under wmu and a no-op writeLoop, and
+// the deadline went with them, leaving every PUBLISH, ack, CONNACK and courtesy
+// DISCONNECT able to block its writer for as long as a non-reading client lasts.
+// Same value as upstream's DEFAULT_FLUSH_DEADLINE. A var, not a const, only so
+// tests can shorten it; there is no operator knob.
+var mqttWriteDeadline = 10 * time.Second
+
 // writeSocket writes the full buffer to the client socket, serialized against
 // concurrent writers (the parse goroutine and NATS delivery goroutines) by wmu.
-// A non-zero deadline bounds the write (used by the shutdown drain so a client
-// that stopped reading cannot block indefinitely). It returns the write error
-// and NEVER tears down the connection, so a caller holding c.mu cannot deadlock
-// on closeConnection (which re-locks c.mu). A partial write with no error is
+// Every write is bounded by mqttWriteDeadline; cap is an optional ABSOLUTE
+// earlier bound (the shutdown drain's shared deadline), zero meaning no cap. An
+// already-past cap is installed as-is so the write fails at once, which is what
+// a spent drain budget does today. It returns the write error and NEVER tears
+// down the connection, so a caller holding c.mu cannot deadlock on
+// closeConnection (which re-locks c.mu). A partial write with no error is
 // reported as io.ErrShortWrite.
-func (c *client) writeSocket(data []byte, deadline time.Time) error {
+//
+// The deadline is CLEARED before returning, and that is not tidiness. c.nc may
+// be a *tls.Conn, and TLS writes bytes this function never sees: a TLS 1.3
+// KeyUpdate response is written from Read (crypto/tls/conn.go). A deadline left
+// installed expires through subsequent idle time and hands that write a
+// PERMANENT outbound error which no later MQTT write can repair. The clear runs
+// under wmu (defers run in reverse order) and on every exit including
+// io.ErrShortWrite; its own result is ignored, as upstream's is, because on the
+// production transport a concurrent close is what makes it fail and that leaves
+// no healthy connection to rescue.
+func (c *client) writeSocket(data []byte, cap time.Time) error {
 	if c.nc == nil {
 		return nil
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	if !deadline.IsZero() {
-		_ = c.nc.SetWriteDeadline(deadline)
+	d := time.Now().Add(mqttWriteDeadline)
+	if !cap.IsZero() && cap.Before(d) {
+		d = cap
 	}
+	_ = c.nc.SetWriteDeadline(d)
+	defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
 	for len(data) > 0 {
 		n, err := c.nc.Write(data)
 		data = data[n:]
@@ -1157,21 +1184,25 @@ func (c *client) writeSocket(data []byte, deadline time.Time) error {
 	return nil
 }
 
-// writeDirect writes a complete frame under a bounded deadline, bypassing the
-// enqueue path. Used by shutdownDisconnect to send the server DISCONNECT without
-// risking an unbounded blocked write or full teardown from within the drain.
-func (c *client) writeDirect(data []byte, deadline time.Time) error {
-	return c.writeSocket(data, deadline)
-}
-
 // queueOutbound writes bytes to the client socket. On a write error it closes
 // ONLY the socket, not the full connection: this may run with c.mu held (via
 // mqttEnqueueDisconnect / mqttEnqueueFittingProto), and closeConnection re-locks
 // c.mu. Closing the socket unblocks readLoop, whose disconnect() performs the
 // single, ordered teardown (mqttHandleClosedClient before closeConnection). A
-// double socket close is harmless.
-func (c *client) queueOutbound(data []byte) {
-	if err := c.writeSocket(data, time.Time{}); err != nil && c.rawConn != nil {
+// double socket close is harmless. This error path is also the slow-consumer
+// disconnect: a client that cannot absorb a write within mqttWriteDeadline loses
+// its socket here, which is upstream's SlowConsumerWriteDeadline behaviour
+// reached through the port's existing close path rather than a new one.
+func (c *client) queueOutbound(data []byte) { c.queueOutboundBy(data, time.Time{}) }
+
+// queueOutboundBy is queueOutbound under an earlier ABSOLUTE cap, and is
+// identical in every other respect, close-on-error included. Only the shutdown
+// drain supplies a cap: it needs its own shared deadline to bound the write when
+// that is sooner than mqttWriteDeadline. Passing the cap through the writer,
+// rather than storing it on the client, keeps it out of connection state where
+// an ordinary writer and the drain would race over it.
+func (c *client) queueOutboundBy(data []byte, cap time.Time) {
+	if err := c.writeSocket(data, cap); err != nil && c.rawConn != nil {
 		_ = c.rawConn.Close()
 	}
 }
@@ -1291,13 +1322,22 @@ func (c *client) abortSetup(reason ClosedState) {
 // disconnect() performs that cleanup exactly once in the correct order
 // (mqttHandleClosedClient before closeConnection). The DISCONNECT bytes are
 // built under c.mu so this cannot race CONNECT parsing mutating the negotiated
-// v5 fields. It is the one server-DISCONNECT writer that bypasses the enqueue
-// path — writeDirect, under a deadline — so it claims the connection's one
-// notification itself (mqttClaimDisconnectLocked): a displacement that already
-// notified this client must not be followed by a 0x8B [MQTT-3.14.4-1]. What the
-// displacement said — 0x8E where it held the successor, 0x89 where it could only
-// show the record is not ours (F-084) — does not change the rule; spending the
-// claim does.
+// v5 fields. It is the one server-DISCONNECT writer that supplies its own cap to
+// the enqueue path, so it claims the connection's one notification itself
+// (mqttClaimDisconnectLocked): a displacement that already notified this client
+// must not be followed by a 0x8B [MQTT-3.14.4-1]. What the displacement said —
+// 0x8E where it held the successor, 0x89 where it could only show the record is
+// not ours (F-084) — does not change the rule; spending the claim does.
+//
+// deadline is the drain's shared absolute budget, passed as a cap so the write
+// is bounded by whichever of it and mqttWriteDeadline is sooner. It does NOT
+// bound this function's own c.mu and wmu waits: an incumbent writer may already
+// hold a deadline later than the remaining budget. Since shutdownDrainTimeout
+// equals mqttWriteDeadline the cap is usually the drain deadline itself, so what
+// this removes is the stalled-write drain OBSTRUCTION, not the drain's total
+// duration — a later client in the serial walk can still meet an already-past
+// cap and get no courtesy DISCONNECT. Bounding the drain end to end needs a real
+// budget and is separate work.
 func (c *client) shutdownDisconnect(deadline time.Time) {
 	var pkt []byte
 	if c.connAckWritten.Load() {
@@ -1306,7 +1346,7 @@ func (c *client) shutdownDisconnect(deadline time.Time) {
 		// Size too small for even the short form) sends nothing, so it must not
 		// spend the claim. Contenders may build; only a claimant writes. Unlike
 		// the enqueue path, the claim here is a RESERVATION taken before the
-		// write: it is consumed inside this critical section and writeDirect runs
+		// write: it is consumed inside this critical section and the write runs
 		// after the unlock, so a competing 0x8E can be suppressed by a 0x8B that
 		// is then never written. Stated as a residual rather than fixed — closing
 		// it would mean holding c.mu across a deadline-bounded socket write.
@@ -1317,7 +1357,21 @@ func (c *client) shutdownDisconnect(deadline time.Time) {
 		c.mu.Unlock()
 	}
 	if len(pkt) > 0 {
-		_ = c.writeDirect(pkt, deadline) // best effort; the socket close follows regardless
+		// The cap is the MINIMUM of the drain's shared budget and this frame's own
+		// write interval, and it is computed HERE rather than inside the writer.
+		// That placement is the point: writeSocket's now+mqttWriteDeadline is
+		// evaluated after wmu is acquired, so leaving the minimum to it would hand a
+		// shutdown write that had waited out a contending writer a FRESH full
+		// interval instead of the one it started with. Computing it before entering
+		// makes the wmu wait consume the cap, which is what a drain budget means.
+		// An already-spent budget stays in the past and fails the write at once.
+		cap := time.Now().Add(mqttWriteDeadline)
+		if !deadline.IsZero() && deadline.Before(cap) {
+			cap = deadline
+		}
+		// Best effort; the socket close follows regardless. queueOutboundBy's
+		// close-on-error is harmless here for the same reason.
+		c.queueOutboundBy(pkt, cap)
 	}
 	// Close the raw socket, never c.nc: this runs concurrently with a client that
 	// may still be upgrading c.nc to TLS. Closing the socket underneath the TLS

@@ -2658,7 +2658,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   makes its own attempt; a courtesy packet here would contradict it on the same socket).
   Each of those is
   an attempt rather than a delivered packet: a connection's one server DISCONNECT is claimed
-  once (see (12)), the displacement notification is additionally gated on the CONNACK, and
+  once (see (10)), the displacement notification is additionally gated on the CONNACK, and
   a write can lose to a concurrent close. A refused ownership claim is retried while this
   connection is still the owner rather than read as a verdict. What that leaves:
   1. **Outbound deliveries continue** to the displaced client until an inbound packet
@@ -2676,7 +2676,8 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
      which includes the rejected-close Will publication residual below.
   5. **While suspended by an unresolved write of ours, the connection fails closed
      immediately without probing** — no probe is possible — and the teardown follows the
-     courtesy write, per (9). That 0x89 now goes through the shared claim like every other
+     courtesy write, which is deadline-bounded rather than able to defer the teardown
+     indefinitely (F-035). That 0x89 goes through the shared claim like every other
      server DISCONNECT, so a displacement that already notified this connection suppresses
      it and the close is silent.
   6. **The protection is per OWNING broker** (see the last bullet): a session's bound
@@ -2711,22 +2712,10 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   8. **An ambiguous probe's fail-closed close parks a memory-only teardown**, so a crash
      before resolution loses the parked Will and the original expiry deadline. That is the
      pre-existing parked-teardown exposure, newly reachable from this path.
-  9. **The fail-closed teardown begins only after the courtesy 0x89 write returns, and that
-     write is unbounded**, so a stalled v5 client defers it indefinitely. Pre-existing
-     property of the parse-error footer, shared by every parse error today, and NOT
-     gate-held — the settlement releases the ownership gate before returning. A claim
-     already consumed by a displacement removes the write, and with it this delay, but only
-     in that case.
-  10. **The park after an ambiguous probe is not guaranteed.** Between the sentinel return
-      and the close bookkeeping, the periodic pass's bound-uncertain resolver can classify
-      foreign and dispose first, reaching the owed-Will arm the Will bullet below names.
-  11. **The foreign arm's DISCONNECT is an unbounded courtesy write too**, as is the
-      periodic pass's disposal DISCONNECT — which is additionally performed gate-held.
-      (Both said `0x8E` before F-084; both now say `0x89`, and the delay is the same
-      either way.) Same class as (9),
-      filed as its own §0 roadmap item. (When the claim or the CONNACK gate suppresses the
-      notification there is no write and no delay; that is not a bound, only a case.)
-  12. **At most one server-DISCONNECT ATTEMPT per connection, which is narrower than one
+  9. **The park after an ambiguous probe is not guaranteed.** Between the sentinel return
+     and the close bookkeeping, the periodic pass's bound-uncertain resolver can classify
+     foreign and dispose first, reaching the owed-Will arm the Will bullet below names.
+  10. **At most one server-DISCONNECT ATTEMPT per connection, which is narrower than one
       delivered packet with the right reason.** The second-DISCONNECT class is closed: the
       notification is a per-connection claim (`mqttClaimDisconnectLocked`) shared by all four
       displacement paths, the parse-error footer, the packet-too-large 0x95 and the shutdown
@@ -2735,15 +2724,15 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       now share `0x89`, so the guarantee is about the COUNT, which is what the claim always
       enforced.) Every enqueue-path writer consumes it in the
       same `c.mu` critical section as its write; `shutdownDisconnect` is the exception and
-      RESERVES it, claiming under the lock and attempting `writeDirect` after releasing it.
+      RESERVES it, claiming under the lock and attempting its capped write
+      (`queueOutboundBy`) after releasing it.
       What remains:
       - **Zero notifications is a legal outcome.** The displaced arm closes synchronously
         while the displacer notifies asynchronously, so the socket can be gone first; a
         3.1.1 or size-suppressed build never reaches the claim; a connection displaced
         before its own CONNACK is closed silently by design ([MQTT-3.2.0-1]); and the
         shutdown drain can spend its reservation and then write nothing — suppressing a
-        competing displacement DISCONNECT — if the process dies or the deadline-bounded
-        `writeDirect` fails
+        competing displacement DISCONNECT — if the process dies or the capped write fails
         after the unlock.
       - **A notification can be dropped for an already-acknowledged client.** The CONNACK
         gate is read under `c.mu` and the flag is stored inside the CONNACK write's own
@@ -2763,15 +2752,17 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
         lands — a PINGRESP, or an in-flight PUBLISH from a delivery goroutine — which
         [MQTT-3.14.4-1] also forbids. Nothing gates those; closing it needs a delivery-side
         gate, the "resident session never re-validates" item's territory.
-      - **The notification write is still unbounded**, per (9) and (11), though the
-        persist observation's eviction worker no longer holds any lock across it. The
-        old overlap with a gate-held probe is gone — the worker OBSERVES the gate and
-        defers to a holder — at the price that the deferral can lose the eviction
-        (bounded retries, then a refused exit).
+      - **The notification write is deadline-bounded** (F-035) and the persist
+        observation's eviction worker holds no lock across it, but it does still issue
+        it inline and it takes `c.mu` to do so, so a stalled client still occupies that
+        worker — for a time this design puts **no figure on**, only one a non-reading
+        socket can no longer make indefinite. The old overlap with a gate-held probe is
+        gone — the worker OBSERVES the gate and defers to a holder — at the price that
+        the deferral can lose the eviction (bounded retries, then a refused exit).
       - **In-process, so no wire, stream or record state is involved** (see (6)). Every
         broker is built from this tree (Compatibility boundary), so the claim is not
         qualified by a rollout.
-  13. **The gate hold is bounded against non-blocking writers only.** "At most one probe per
+  11. **The gate hold is bounded against non-blocking writers only.** "At most one probe per
       arming, roughly three JetStream timeouts" needs the record fence to reach the waiting
       settlement once its current holder releases. The TRY-BARGE half of that is closed:
       `beginRecordTx` announces itself before it contends on `sess.mu`, and every
@@ -2799,7 +2790,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       `DisconnectedAt = 0` before the fallback stamps, so that arm reaches the SAME one-body
       exposure rather than a cost-free state. Waiter priority is a per-broker property of
       an in-process fence, and no wire, stream or record state is involved either way.
-  14. **A takeover still mid-flight can have its Will published by this connection's
+  12. **A takeover still mid-flight can have its Will published by this connection's
       close.** The rebound arm applies the takeover's own discard rule as soon as the rebind
       is observable. Before the rebind there is nothing to observe: if the bounded retry
       gives up while the session is still ours (a CONNECT holding the gate for longer than
@@ -2866,7 +2857,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   blocking writer: nothing is open at the refusal, but that writer can take `sess.mu`,
   open its transaction and marshal `DisconnectedAt = 0` before the stamp is taken, so the
   exposure is the same one body rather than none. Because this site does not retry, waiter
-  priority gives more occasions of this same residual — not a cost-free arm (residual 13
+  priority gives more occasions of this same residual — not a cost-free arm (residual 11
   above).
   Stamping there is not optional: the probe is a writer this change ADDS, and skipping it
   would leave the probe free to persist current memory with `DisconnectedAt = 0` at a newer
@@ -3593,16 +3584,19 @@ Three residuals attach to that signal.
   exceed the client's limit, and suppresses the frame entirely if it still does not fit. Such
   a client learns the reason code and nothing more, or nothing at all; the refusal proceeds
   either way.
-- **The failure CONNACK is written with an unbounded socket write.** `enqueueProtoErr` calls
-  `writeSocket` with no deadline, and the signal precedes the disposal by design, so a
-  non-reading client can stall that write while this frame still holds the session gate, the
-  open record transaction and — for the reconciliation and lifetime sites — the session's
-  residency and its binding. A local same-client-ID CONNECT can be delayed for as long as
-  the
-  stall lasts. Remote durable ownership is unaffected: it is arbitrated by the record CAS,
-  not
-  by the gate. The ownership gate and the transaction were already held across this write
-  at
+- **The failure CONNACK's write no longer defers this frame indefinitely, but the frame
+  is not bounded.** `enqueueProtoErr` reaches `writeSocket`, which installs
+  `mqttWriteDeadline` (F-035), so a non-reading client can no longer stall that write for
+  the life of the connection. The signal precedes the disposal by design, so such a client
+  still delays this frame while it holds the session gate, the open record transaction
+  and, for the reconciliation and lifetime sites, the session's residency and its binding
+  — and a local same-client-ID CONNECT waits behind it. **No figure is claimed for that
+  delay.** The deadline starts only once `wmu` has been acquired, so it bounds neither the
+  preceding mutex waits nor anything else in the frame, and nothing bounds how many
+  bounded writes one critical section may contain. What changed is that a non-reading
+  socket is no longer an unbounded source of the delay; that is the whole of it. Remote
+  durable ownership is unaffected either way: it is arbitrated by the record CAS, not by
+  the gate. The ownership gate and the transaction were already held across this write at
   every pre-existing refusal site, so what is new is residency and binding at those two.
 
 **A delivery admitted before the operation gate was armed can still escape it.** A live
@@ -3741,6 +3735,52 @@ headers (properties, expiry) are still ignored rather than rejected. Legacy
 development records (a JSON body, or a `-1` marker tombstone) and mixed old/new
 development fleets deliberately change behavior per the compatibility boundary and
 are not supported topologies.
+
+### A client that cannot absorb a write within the deadline is disconnected
+
+Every MQTT application write is bounded by `mqttWriteDeadline` (10s, no operator knob),
+installed and cleared in `writeSocket`; see `docs/ARCHITECTURE.md`, "Every MQTT application
+write is deadline-bounded". This restores upstream nats-server's per-flush deadline and its
+`SlowConsumerWriteDeadline` close, which this port dropped when it replaced upstream's
+`writeLoop` and outbound buffer. Before it, a client whose socket send buffer stayed full
+blocked its writer — and any lock that writer held — for as long as the connection lasted.
+
+What the new behaviour costs, stated:
+
+1. **It is a WRITE timeout, triggered by the broker having something to send.** A silent
+   idle client is unaffected; a client that negotiated Keep Alive 0 and reads nothing
+   is still bounded by nothing until the broker next writes to it.
+2. **Session expiry zero** initiates the ordinary session discard on that close. A surviving
+   session follows its existing persistence and expiry paths.
+3. **Surviving plain QoS 1/2 exchanges** keep their ordinary unacknowledged/recovery
+   semantics, subject to expiry and to the existing recovery limitations — not "redelivered
+   to the next incarnation".
+4. **Shared-group pending work may redistribute** to another member: the ordinary close
+   purges shared pending state without acknowledging the group message and without
+   destroying the group durable. Shared QoS 2 keeps its existing affinity rules.
+5. **The Will follows abnormal-close classification**, and the timeout is a NEW producer of
+   the documented "early close" that the already-owed-now takeover exception names. A
+   delivery can hold `c.mu` while a displacer waits to discard or consume the Will; the
+   timeout closes the socket before that Will phase runs, and the readLoop can then race the
+   displacer. A peer reset could already produce that schedule — what is new is that a peer
+   which is still connected can produce it.
+6. **A frame can be truncated before the close** when a write times out mid-frame.
+   Pre-existing on a peer reset; newly reachable on a timeout. A PUBLISH header and payload
+   are separately bounded, so one frame gets two deadlines rather than one.
+7. **No caller learns a new return outcome**, only a new cause of an existing failure. In
+   particular a delivery timeout does not make `mqttEnqueuePublishMsgTo` return `false`,
+   whose caller reads `false` as a packet-size discard and acknowledges and removes state.
+8. **No gate-duration bound is claimed.** The deadline removes indefinite blocking
+   caused by a non-reading socket; it does not bound how long the gate is held. A `c.mu`
+   section can contain many bounded writes (the retained flush plus the live PUBLISH under
+   one hold), and a gate-held Will phase can wait on `subsBarrier.wait`, which has no
+   elapsed-time bound at all. Both are stated in `docs/ARCHITECTURE.md`, and the second
+   is a filed roadmap item.
+9. **Two pre-existing durable-loss exposures become MORE REACHABLE, not new.** A Will living
+   only in client or disposition memory when the socket closes, and the parked-teardown
+   exposure behind an ambiguous probe, now both have timeout-triggered schedules. Relatedly,
+   a delayed Will's `FireAt` is still computed at CONSUMPTION rather than at close, so a Will
+   consumed late fires late; that is a filed roadmap item, made more reachable here.
 
 ### A connection that never sends CONNECT is closed; a connected one may still be silent forever
 

@@ -2848,7 +2848,7 @@ type mqtt struct {
 	// Consumed only through mqttClaimDisconnectLocked, under c.mu — for every
 	// enqueue-path writer in the same critical section as the write it
 	// authorizes; shutdownDisconnect is the exception, reserving the claim under
-	// the lock and attempting its writeDirect after releasing it. The guarantee
+	// the lock and attempting its capped write after releasing it. The guarantee
 	// is at-most-one ATTEMPT: the winner's write stays best-effort (a concurrent
 	// close can fail it, and the shutdown drain can spend the claim and then
 	// write nothing at all), never exactly-once delivery.
@@ -6817,11 +6817,11 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 			}
 			if d.ec != nil {
 				// Notify and close AFTER every lock release: the notify writes to
-				// the socket under c.mu with no deadline. The shared tail claims
-				// the connection's one DISCONNECT and honors the CONNACK gate, so
-				// this cannot append a second DISCONNECT to one a racing
-				// displacement already sent; 3.1.1 closes silently. The object is
-				// already deresidented, so a replacement CONNECT proceeds
+				// the socket under c.mu, bounded by mqttWriteDeadline. The shared
+				// tail claims the connection's one DISCONNECT and honors the
+				// CONNACK gate, so this cannot append a second DISCONNECT to one a
+				// racing displacement already sent; 3.1.1 closes silently. The
+				// object is already deresidented, so a replacement CONNECT proceeds
 				// regardless of this write's duration. Spec5 [3.1.4].
 				d.ec.mqttNotifyDisplaced(d.voc)
 				go d.ec.closeConnection(d.voc.closeReason)
@@ -16047,7 +16047,7 @@ func (c *client) mqttReasonProps(pktType byte, reasonStr string) *mqttProperties
 // enqueue-path writers do it in the same c.mu critical section as their write,
 // so for them there is no check-then-act window at all. shutdownDisconnect is
 // the one exception, and there the claim is a RESERVATION: it claims under the
-// lock and writes through writeDirect after releasing it, so it can spend the
+// lock and writes through its capped queueOutboundBy after releasing it, so it can spend the
 // claim — suppressing a competing notification — and then write nothing, or
 // fail. That is why the guarantee is at most one ATTEMPT and not one delivered
 // packet. c.mu must be held.

@@ -1662,7 +1662,11 @@ in-process coalescing — arbitration stays with the record CAS and the rejectio
 - **A fixed release order.** State disposal happens under `as.mu`; then `as.mu` is
   released, then the fence (`endRecordTx` can synchronously run the void-verdict
   handoff, which takes `as.mu` — the other order self-deadlocks), and only then the
-  notification and close, so no lock is held across the unbounded socket write. Abnormal
+  notification and close, so no lock is held across the socket write. That write is
+  deadline-bounded (see "Every MQTT application write is deadline-bounded"), which is
+  what stops the inline notification pinning this account's coalescing eviction worker
+  for the life of a stalled client — no lock was ever held across it, but the worker
+  itself was. Abnormal
   exits release the fence with `abandonRecordTx` (`sess_recordtx.go`), the handoff-free
   form that is legal under `as.mu`; the handoff it skips belongs to the periodic
   backstop (`reconcileResidentRecordState` → `flushVoidVerdictGap`).
@@ -2080,8 +2084,9 @@ displacement has its own single owner:
 - **Notification**: `mqtt.disconnectSent`, consumed under `c.mu` through
   `mqttClaimDisconnectLocked` — for every enqueue-path writer in the same critical section
   as the write it authorizes, so there is no check-then-act window; `shutdownDisconnect` is
-  the one exception, reserving the claim under the lock and attempting its `writeDirect`
-  after releasing it, so it can suppress a competing 0x8E and then write nothing. The
+  the one exception, reserving the claim under the lock and attempting its capped write
+  (`queueOutboundBy`) after releasing it, so it can suppress a competing 0x8E and then
+  write nothing. The
   first ELIGIBLE claimant — of the four paths, the parse-error footer, the packet-too-large
   0x95, or the shutdown drain's 0x8B — consumes the connection's one notification and every
   later sender is silent, which is what [MQTT-3.14.4-1] requires ("after sending a DISCONNECT
@@ -2108,8 +2113,23 @@ That gate reads `connAckWritten` under `c.mu`, which is why `mqttEnqueueConnAck`
 flag inside the same critical section as the CONNACK write — storing it after the unlock
 left a window in which a notifier saw `false` for a client that had already been
 acknowledged, and dropped a DISCONNECT it was owed. `shutdownDisconnect` remains a
-separate, legitimate reader of the same flag; it claims like everyone else, but writes
-through `writeDirect` rather than the enqueue path.
+separate, legitimate reader of the same flag; it claims like everyone else, and writes
+through the enqueue path under its own absolute cap (`queueOutboundBy`) rather than
+through a separate writer of its own — `writeDirect` no longer exists.
+
+The three displacement tails that own both the notification and the close —
+`discardTakenOverClient`, `disposeForeignSessionLocked` and the remote-persist eviction
+tail — issue the notification **before** launching the close goroutine, and deliberately
+still do. Two of them run gate-held, and the takeover one runs on the ACCEPTING client's
+readLoop ahead of its own CONNACK, so a displaced client that has stopped reading delays
+them. What makes the inline form acceptable is that the delay is no longer INDEFINITE:
+the notification's socket write carries the deadline like every other. No figure is
+claimed for the delay itself — the notifier takes `c.mu` and the deadline starts only
+once `wmu` is held, so neither the mutex waits nor the surrounding work is bounded.
+Taking the write off those tails entirely was planned and was **dropped**: nine existing
+tests use the synchronous notification as their oracle, and one asserts a durable
+register delete rather than mere observability, so the move is a scheduling change
+needing its own analysis rather than a rider on a bounded-writer repair.
 
 What the mutex ordering does NOT decide is which of the two enters first. A notifier that
 takes `c.mu` BEFORE the CONNACK write reads `false`, stays silent, and the client then gets
@@ -5599,7 +5619,8 @@ The invariants, in the order they matter:
   of the quarantine on evidence predating it and free the identifier while the rival
   register still stands.
 - **A transmission holds its identifier until it is no longer owed.** `queueOutbound`
-  is a synchronous socket write with no deadline, so between the tracking decision and
+  is a synchronous socket write, bounded by `mqttWriteDeadline` but not by anything
+  shorter, so between the tracking decision and
   its return a teardown, a subscribe denial, a recovery apply, a terminal
   acknowledgement or a session discard could free the identifier and the allocator could
   re-mint it — two packets under one identifier, in order, on one socket. Every
@@ -7176,6 +7197,10 @@ window, and none of them substitutes for another:
    CONNECT, and re-armed per read only while that value is nonzero
    (`mqttParse`). A client that negotiates Keep Alive 0 is bounded by nothing
    after CONNECT; see `docs/CONFORMANCE.md`.
+4. **Write deadline** — installed on every MQTT application write and cleared
+   after it (`mqttWriteDeadline`, `shim_engine.go`). It is the only one of the
+   four that bounds the SERVER's side of the connection, and it is the subject of
+   the next subsection.
 
 The CONNECT deadline exists because a connection that has not sent CONNECT has
 no client id, no session and no subscriptions, so nothing else in the broker can
@@ -7233,3 +7258,74 @@ shutdown Phase 1 already waits for — registered (drained, readLoop exits,
 **What it is not.** It makes an idle connection's lifetime finite; it is not a
 DoS defense. A peer can still hold roughly `accept rate x window` connections
 open. `MaxConn` remains the absolute cap and `admitConnSetup` the shutdown gate.
+
+### Every MQTT application write is deadline-bounded
+
+`writeSocket` (`shim_engine.go`) is the single socket writer and the only
+production acquirer of `c.wmu`. It installs `mqttWriteDeadline` on every write and
+clears it before returning. `queueOutbound`, `enqueueProto`, `enqueueProtoErr` and
+`mqttEnqueueProtoLocked` all reach it, so every PUBLISH, every acknowledgement,
+every CONNACK, every server DISCONNECT and every courtesy write is bounded by the
+same mechanism, with **no per-site machinery anywhere**.
+
+This restores a bound the port dropped rather than introducing a policy. Upstream
+nats-server sets `c.out.wdl` from `opts.WriteDeadline`, installs it on every flush,
+clears it afterwards, and closes a client that misses it as
+`SlowConsumerWriteDeadline`; `DEFAULT_FLUSH_DEADLINE` is 10s, which is the value
+used here. The shim replaced upstream's `writeLoop` and outbound buffer with a
+synchronous write under `wmu` and a no-op `writeLoop`, and the deadline went with
+them. See `docs/PORTING.md`.
+
+**The optional cap.** `queueOutboundBy` takes an ABSOLUTE earlier bound, and only
+the shutdown drain supplies one: its shared deadline, when that is sooner than
+`mqttWriteDeadline`. An already-past cap is installed as-is so the write fails at
+once, which is what a spent drain budget did before. Passing the cap through the
+call keeps it out of connection state, where an ordinary writer and the drain
+would race over it.
+
+**The clear is not tidiness.** `c.nc` may be a `*tls.Conn`, and Go's TLS
+implementation writes bytes that never pass through `writeSocket` — a TLS 1.3
+KeyUpdate response is written from `Read`. A deadline left installed after a
+successful write expires through subsequent idle time and hands that write a
+PERMANENT outbound error which no later MQTT write can repair. The clear runs
+under `wmu` (defers run in reverse order) and on every exit, including the
+zero-progress `io.ErrShortWrite` return. It does not serialize TLS-generated
+writes — `tls.Conn`'s deadline setter delegates straight to the underlying
+connection while KeyUpdate uses TLS's own output lock — so the clear may overlap a
+TLS write, which is supported concurrent transport use rather than a race. It
+cannot repair an error TLS has already recorded; what it removes is a deadline
+left to expire. Its own result is ignored, as upstream's is.
+
+**The slow-consumer disconnect is the existing error path.** A write that times
+out returns an error, and `queueOutbound` closes `c.rawConn` — never
+`closeConnection`, which re-locks `c.mu`. That unblocks `readLoop`, whose
+`disconnect()` performs the single ordered teardown. No new close path, no new
+`ClosedState`, no timer and no goroutine. A client that cannot absorb a write
+within the deadline is therefore disconnected; before, it stalled the broker
+instead.
+
+**What the bound buys, and what it does not.** The claim is exactly this:
+
+> Restoring the per-write deadline removes indefinite blocking **caused by a
+> non-reading MQTT socket**, under ordinary transport and scheduling assumptions.
+
+It puts no figure on how long any lock or the ownership gate is held, and it does
+not bound work that is not a socket write. Two facts make the stronger claim
+false, and both are live at HEAD:
+
+- **A `c.mu` section can contain many bounded writes.**
+  `mqttEnqueuePublishMsgTo` flushes every pending retained frame and then the live
+  PUBLISH under one hold, each header and payload a separate `queueOutbound`, and
+  `mqttSendRetainedMsgsToNewSubs` writes several subscriptions' backlogs under one.
+  A peer that absorbs each chunk just before its deadline occupies that section for
+  a backlog-dependent time. It also means a PUBLISH frame gets two deadlines rather
+  than one, and that upstream likewise bounds batches rather than a whole queue.
+- **A gate-held Will phase can block on something that is not a socket.**
+  `mqttHandleWill` reaches `subsBarrier.wait`, which has no elapsed-time deadline
+  and whose generation later entrants can extend, so overlapping SUBSCRIBEs can
+  keep a QoS 1/2 Will — and its ownership gate — waiting indefinitely. That is a
+  distinct liveness defect, filed in `docs/ROADMAP.md`; it is not created by this
+  mechanism and not closed by it.
+
+`mqttWriteDeadline` is a package-level default with no operator knob. It is a
+`var` only so tests can shorten it.

@@ -1690,8 +1690,8 @@ AT MOST ONE…
   `mqttClaimDisconnectLocked`. Every server-DISCONNECT writer claims: the four displacement
   paths (through one shared tail, `mqttNotifyTakenOver`), the parse-error footer, the
   packet-too-large 0x95 and the shutdown drain's 0x8B. The enqueue-path writers claim in the
-  same critical section as the write it authorizes; the shutdown drain, which bypasses the
-  enqueue path, RESERVES the claim under the lock and writes through `writeDirect` after
+  same critical section as the write it authorizes; the shutdown drain RESERVES the claim
+  under the lock and writes through its capped `queueOutboundBy` after
   releasing it, so it can spend the claim and write nothing — which is one reason the
   guarantee is an attempt and not a packet. It builds first, so a nil build spends nothing.
   A latent second defect in the same class was fixed with it:
