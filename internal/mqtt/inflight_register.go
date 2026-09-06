@@ -1459,7 +1459,9 @@ func mqttSplitNewlyRetired(in []mqttRecoveredInflightReg) (live, newlyRetired []
 // sweep's affine arm — can consult nothing. It retains a register that CARRIES a
 // cancellation, but a verdict held only in a non-resident session's persisted
 // CancelledRegs is invisible to it and that register is still deleted. That is F-090,
-// filed and not an alpha blocker.
+// filed under docs/ROADMAP.md §P: the arm that strands a verdict needs a register carrying
+// both Q2AffClaim and Q2AffCopy, which the supported default never creates, so the
+// population is experimental-only rather than an alpha blocker.
 //
 // Two things force a confirmed delete, and either is enough:
 //

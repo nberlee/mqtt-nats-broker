@@ -2366,9 +2366,22 @@ type mqttPersistedSession struct {
 	// identifier for immediate reuse, subjects are reused within a generation, and shared
 	// group durables are named deterministically so the same name returns on a rejoin — a
 	// verdict scoped by any of those would eventually condemn a genuine later delivery. A
-	// nonce is minted with the allocation and never reused. An entry is removed when its
-	// register's deletion is proven, or by a complete resume scan that finds no register
-	// carrying it. See inflight_register.go.
+	// nonce is minted with the allocation and never reused.
+	//
+	// WHAT DOES NOT REMOVE AN ENTRY, which is the part worth stating because this comment
+	// once claimed the opposite: a resume scan that merely FAILED TO FIND a register
+	// carrying it. No such removal exists, and its absence is deliberate — scan-time
+	// absence cannot rule out a late create-only CAS landing afterwards, so the scan KEEPS
+	// the verdict ("an absence is not a fact").
+	//
+	// What DOES remove one is always a positive fact that makes the verdict unnecessary or
+	// not ours to hold: the register was never created, the cancellation is durable on the
+	// register itself, the register is provably gone, or a peer's claim on it means the
+	// durable decision is the peer's and a competing verdict must not be persisted. That
+	// list is illustrative, NOT a closed set — inflight_register.go's removal sites are
+	// the authority, and two review rounds faulted an earlier attempt here for asserting
+	// an exhaustive one. Absent such a fact the set is emptied when the generation retires
+	// with its record. See inflight_register.go.
 	CancelledRegs []string `json:"cancelled_regs,omitempty"`
 	// Teardown, when present, means a broker has CLAIMED this record's teardown and
 	// may be part way through deleting the incarnation's resources. Nobody may

@@ -2067,7 +2067,12 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// A verdict that exists ONLY in a non-resident session's persisted CancelledRegs
 		// is invisible from here — this arm reads the register, not the record — so such
 		// a register is still deleted and its verdict stranded. Pre-existing (the sweep
-		// deleted unconditionally before), bounded stale metadata, and filed as F-090.
+		// deleted unconditionally before) and filed as F-090, docs/ROADMAP.md §P.
+		//
+		// NOT "bounded stale metadata", which this comment used to claim and which is
+		// false: the residue is one nonce per occurrence and CUMULATIVE over a generation,
+		// emptied only when the generation retires with its record. Bounded per occurrence
+		// is not a bound on the aggregate.
 		//
 		// PHASE-GATED even with no resident session (census C19), and the absence of a
 		// LOCAL session is exactly why. It does not prove the absence of an exchange: a

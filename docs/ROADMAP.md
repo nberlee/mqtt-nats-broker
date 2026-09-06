@@ -2470,7 +2470,7 @@ takeover.
   in place — held, never abandoned, because abandoning mints a second identifier for one
   message. Every register delete whose caller can name the exchange nonce routes through
   one verdict-reaping helper — where it can also REACH the verdict set, which lives on a
-  session; the orphan sweep with none resident is the stated exception (F-090) — guarded
+  session; the orphan sweep with none resident is the stated exception (F-090, §P) — guarded
   by an AST walk so a new delete site cannot rejoin the stranding class. Every
   JETSTREAM-BACKED QoS 1/2
   PUBLISH transmission runs inside a SEND SECTION whose
@@ -3274,24 +3274,6 @@ takeover.
   committed to. Pre-existing, and untouched by the delivery reclaim, which never enters
   that branch.
 
-- [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a
-  non-resident session's record.** Filed 2026-08-30 by F-087's holistic review (round 5).
-  NOT an alpha blocker: the residue is one nonce in `CancelledRegs` per occurrence, with
-  no payload resurrection, no identifier misaccounting and no unexplained register, since
-  the register is gone. Bounded per occurrence but CUMULATIVE — the set grows by one each
-  time and is emptied only when the generation retires with its record, so this is NOT a
-  claim that the aggregate is bounded. F-087 gave the
-  affine sweep a retention rule so it does not delete a register whose verdict it cannot
-  forget, but that rule can only see what the REGISTER carries: a register marked
-  `Cancelled` is retained when no identity-fenced session is resident. A verdict that
-  exists only in the session record's `CancelledRegs`, for a session resident nowhere, is
-  invisible from the sweep — it reads registers, not records — so such a register is
-  still deleted and its verdict never forgotten. Pre-existing in runtime terms (before
-  F-087 the sweep deleted unconditionally); what F-087 changed is that the gap is now
-  narrow enough to name. Fixing it means giving the sweep a way to consult the record's
-  verdict set for a non-resident session, which is a durable read per candidate and needs
-  a bound — the reason it is filed rather than folded.
-
 - [ ] **A quarantined packet identifier has no live-session release.** Filed 2026-08-30 by
   F-087's plan-review loop. NOT an alpha blocker: holding is fail-closed and replaces the
   behavior that mints a second identifier for one message; what it costs is availability —
@@ -3302,11 +3284,33 @@ takeover.
   defeated by R1's own late-write rule, since a rival's create-only CAS may land after the
   read and the new allocation's per-PI CAS cannot observe it), and releasing by writing a
   cancellation TOMBSTONE for our own never-transmitted allocation (round 11 — the rival's
-  supported reap-and-retry confirmed-deletes a pure `Cancelled` occupant and retries its
-  create, `inflight_register.go:2923`/`:2985`, so the fence is consumed and a fresh
-  register lands at the released identifier). The shared lesson: a fence any writer may
-  lawfully consume fences nothing, so a live release needs a durable shape the rival's
-  lifecycle cannot consume — which the register vocabulary does not currently have.
+  supported reap-and-retry classifies a pure `Cancelled` occupant at
+  `inflight_register.go:3579`, confirmed-deletes it through `reapRegisterWithVerdict`
+  (`:3606`) and retries its create, so the fence is consumed and a fresh register lands at
+  the released identifier). The shared lesson: a fence any writer may lawfully consume
+  fences nothing, so a live release needs a durable shape the rival's lifecycle cannot
+  consume — which the register vocabulary does not currently have.
+  *The population, established 2026-09-05 rather than assumed:* the quarantine has ONE
+  install site (`inflight_register.go:3695`) and is reached only where
+  `ownsSharedInflightRegister` is false, which is true for every non-shared durable — so
+  a plain or affine `$MQTT_Q2AFF_` durable never reaches it. The population is
+  `$MQTT_SHARED_*` sources whose occupant carries another session object's claim or none,
+  and since shared QoS 2 is lowered to QoS 1 by default (the
+  `f.shared && f.qos == 2 && !c.mqtt.experimentalSharedQoS2` arm in `mqtt.go`), the SUPPORTED
+  population is shared-subscription QoS 1. Unlike F-090, this is not experimental-only,
+  so §P is not its home — it stays in §0.3, decided 2026-09-06 with corrections only and
+  no acceptance of the availability cost.
+  *Two more things settled and not to be re-derived.* **F-088 does not revive
+  release-by-tombstone:** its own stated lifecycle
+  (`docs/findings/ha-arbitration.md`) keeps "`Cancelled` and provably never
+  transmitted → reap and free, as today", and the tombstone is exactly a never-transmitted
+  cancellation, so excluding that consumption needs an ADDITIONAL rule. And **reusing
+  recovery's `ClaimSeq` ordering on the live path is EXAMINED AND NOT ESTABLISHED** —
+  neither refuted nor viable: ordering two stored snapshots does not establish a current
+  right to take custody during live service, and the tree's own live custody transfer
+  (`pubrel_action.go`, refusal test `pubrel_action_test.go`) pairs the ordering with a
+  CURRENT ACCEPTANCE PROOF and an exact CAS. A future attempt must neither re-derive it
+  nor adopt it as settled.
 
 - [ ] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
   **Alpha blocker. UNBLOCKED — F-087 landed 2026-08-30. Design settled, do not re-derive
@@ -4025,6 +4029,15 @@ operation can trigger correctness loss or unbounded resource growth.
   conformance residual. Closing it needs a seam in nats-server, so an upstream issue is
   the likelier route than anything in this repository.
 
+- [ ] **`reapRegisterWithVerdictGated`'s `nonce` parameter is dead.** Filed 2026-09-06 by
+  the F-090 disposition. The body gates on `ref.matchesRecord(cur)` and forgets against
+  `cur.Nonce` from its own fresh load (`internal/mqtt/inflight_register.go`), so the
+  parameter is never read, while every caller passes one — which reads as authority the
+  code does not use, and is why an earlier F-090 plan revision's mutation M12 was invalid.
+  Either remove the parameter and fix its callers, or state in the comment why it is kept.
+  Scoped out of the F-090 disposition deliberately: that change was docs and comments only,
+  and a signature change touching every caller belongs with the suite run it deserves.
+
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
 This chapter is the **only active roadmap home** for session-affine shared-subscription
@@ -4102,6 +4115,28 @@ here rather than widening that item.
 
 Both are consequences of the phase gate and the admission scope working as specified on the
 supported paths, not of an affine defect newly introduced. Neither is an alpha blocker.
+
+- [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a non-resident
+  session's record.** Filed 2026-08-30 by F-087's holistic review (round 5) into §0.3, and
+  moved here 2026-09-06 unimplemented: the stranding branch is
+  `disposeSettledAffineRegister`'s non-resident arm, at its
+  `deleteInflightRegister` call (`internal/mqtt/orphan_qos2_sweep.go`), whose only
+  production route requires `mqttQ2AffSettleableRegister` and therefore a register carrying
+  both `Q2AffClaim` and `Q2AffCopy`. The supported default never creates that pair
+  (`ExperimentalSharedQoS2` false at `cmd/mqtt-nats-bridge/serve.go:44`; the
+  `f.shared && f.qos == 2 && !c.mqtt.experimentalSharedQoS2` arm in `mqtt.go`
+  lowers a shared QoS 2 request to QoS 1 before provisioning), so the population is
+  experimental-only. The sweep's other register delete (`:1848`) cannot strand a verdict:
+  it requires a proven generation retirement, and by then the record carrying
+  `CancelledRegs` is already gone. F-087 gave the affine sweep a retention rule keyed on
+  what the REGISTER carries; a verdict living only in a non-resident session's persisted
+  `CancelledRegs` is invisible to a walk that reads registers rather than records, so such
+  a register is still deleted and its verdict is retired only at generation retirement —
+  one nonce per occurrence, **cumulative over a generation**, which is NOT a claim that the
+  aggregate is bounded. A corrected design (a verdict set carried on the sweep's existing
+  account-wide record walk, plus a budgeted act-time reread that fails closed to retain) is
+  drafted at `~/.claude/lanes/f-090/plan.md` revision 2, reviewed once; it is a
+  **mitigation, not a closure**, and its residual is stated there.
 
 ### One gathered completion item
 

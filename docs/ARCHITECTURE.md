@@ -5441,7 +5441,10 @@ The invariants, in the order they matter:
   retains a register that CARRIES a cancellation, but a verdict held only in that
   session's persisted `CancelledRegs` is invisible to a walk that reads registers rather
   than records, so such a register is still deleted and its verdict stranded — F-090,
-  filed, pre-existing, and not an alpha blocker. An AST guard parses every production
+  filed under `docs/ROADMAP.md` §P, pre-existing, and not an alpha blocker because the
+  stranding arm needs a register carrying both an affine claim and its copy subject, which
+  the supported default never creates. The residue is one nonce per occurrence and
+  CUMULATIVE over a generation, not bounded in aggregate. An AST guard parses every production
   file in the package and fails on any register delete outside that allow-list, so a new
   site cannot silently rejoin the stranding class. The forget's persistence stays
   opportunistic, riding the existing

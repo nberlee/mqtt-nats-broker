@@ -1853,7 +1853,8 @@ func TestMQTTInflightRetiredQuarantineBecomesPubRelReservation(t *testing.T) {
 //
 // The second clause is not decoration. The verdict set lives on a session, so a caller
 // with none resident can consult nothing however well it knows the nonce — which is
-// F-090, filed, and why one allow-list entry below reads as it does.
+// F-090, filed under docs/ROADMAP.md §P, and why one allow-list entry below reads as it
+// does.
 //
 // Three separate reviews each found one more stranding delete site — the affine sweep,
 // the store's stale-record reap, recovery's second retirement drop — which is what makes
