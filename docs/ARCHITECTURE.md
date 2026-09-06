@@ -332,6 +332,11 @@ the abandoned prefix length, so the folding is measured on every `make depproof`
 - **`PubAck.Duplicate`** flags a deduplication hit. Useful diagnostically; it does
   not remove the need for the presence check, because a no-interest skip is an
   unflagged success.
+- **Redeliveries are processed before the pending-cap check.** A consumer at
+  `MaxAckPending` still delivers messages already eligible for redelivery, so a backlog of
+  unacknowledged deliveries drains rather than wedging. This is what makes a withheld
+  delivery's `AckWait` re-offer a DELAY rather than a deadlock; see "A duplicate plain
+  filter that downgrades then upgrades keeps its consumer" in `docs/CONFORMANCE.md`.
 - **Per-message TTL** and **JetStream double ack** (`AckPolicy` explicit with a
   confirmed acknowledgment), used where a cleanup must be known to have landed.
 - **Consumer inactivity limits.** `InactiveThreshold` gives a durable a delete
@@ -4035,6 +4040,85 @@ by a test; only removing all three together produces the failure, which is what 
 mutation demonstrates. That establishes the conjunction and nothing finer — **it does not
 license removing any one of them**, and a change that drops one would be invisible to this
 suite rather than proven harmless.
+
+## A deferred QoS downgrade is revocable within its packet
+
+One SUBSCRIBE packet may carry the same topic filter more than once. MQTT 5.0 3.8.4
+requires the server to handle it "as if it had received a sequence of multiple SUBSCRIBE
+packets ... except that it combines their responses into a single SUBACK"
+[MQTT-3.8.4-4], and [MQTT-3.8.4-3] makes a later entry replace an earlier one. So a packet
+carrying `foo` at QoS 0 and then at QoS 1 must end with **one** subscription at QoS 1,
+its consumer intact and delivering.
+
+The QoS 0 occurrence stages a **deferred teardown**: the delivery barrier goes down, the
+consumer's in-flight registrations are withdrawn into the packet's own transaction, and the
+irreversible `CONSUMER.DELETE` waits for the confirmed save. The `sess.cons` entry
+deliberately stays, so a mid-packet save serializes a record consistent with a durable that
+still exists. The QoS 1 occurrence then reached the existing-consumer refresh arm, which
+sees that entry, refreshes four fields and returns success — knowing nothing about the
+pending teardown. The client was granted QoS 1, received nothing for the rest of the
+connection, and the record named a durable the packet went on to delete.
+
+**The staging is therefore revocable, and the later occurrence revokes it.**
+
+- **The packet's deferred-delete list is the single authority** on "this consumer is being
+  torn down by this packet". Each entry carries the barrier it lowered and the verdicts it
+  recorded; the two parallel stack slices that used to hold those facts are gone. They had
+  three per-filter boundaries over three different cardinalities — one staging contributes
+  at most one closed subscription and zero or more nonces — so a mid-slice removal for one
+  sid invalidated the later filters' boundaries, and "withdraw the staging for this sid"
+  could not be expressed at all.
+- **At most one LIVE entry per sid**, and it needs two proofs rather than one. The staging
+  site enforces it by looking the sid up first; that is what makes it hold. The barrier is
+  a separate fact: with the subscription closed no *fresh* allocation can accrue, so the
+  skip loses no new work — but a second `voidRegistrationsLocked` would still find the
+  transmitted entries and re-record verdicts already recorded, so the barrier alone would
+  be too weak an argument. The same invariant removes a pre-existing double
+  `CONSUMER.DELETE` for `[{foo,0},{foo,0}]`.
+- **The barrier, the terms and the un-void move in ONE critical section.** It is the
+  *split* that is forbidden, not any particular order inside it: the delivery
+  subscription's QoS is still the PRE-PACKET one until the terms are applied, so a delivery
+  dispatched between a reopen and a later refresh goes out under the old grant — a QoS 2
+  PUBLISH under a QoS 1 subscription for a packet that downgrades 2 -> 1
+  [MQTT-3.8.4-8]. Every reader holds one of the two locks the section takes, so the order
+  of the assignments within it is unobservable and no correctness claim rests on it.
+- **Readiness is proved, not assumed.** The saved subscription pointer says only what was
+  true at staging time, so the revocation re-checks that `sess.cons[sid]` is still the
+  staged config and that the installed delivery subscription is still the one whose barrier
+  it holds. Failing that it REFUSES — the filter fails `0x80` and the deferral stands.
+  Granting a QoS the broker cannot serve is the defect this repair removes, not a lesser
+  form of it.
+- **The reviver's own failure re-stages, through the same helper.** `sess.update` skips a
+  failed filter, so the earlier QoS 0 occurrence's membership stands and the downgrade is
+  owed again. Re-staging restores neither the saved barrier nor the saved verdicts: between
+  the revocation and the failure the barrier was OPEN and the durable live, so new
+  deliveries may have been tracked and new identifiers allocated, and only a fresh snapshot
+  withdraws them — into **the packet's own membership-removal write**, which is where a
+  cancellation has to be.
+- **What the revocation deliberately does NOT undo is the staged cancellations.** The
+  not-yet-transmitted allocations were destroyed outright, so their tombstones still owe the
+  packet's write, or a register store still in flight lands with nothing to explain it and
+  holds an identifier and a Receive Maximum slot. Those messages are untransmitted and
+  unacknowledged in JetStream, so they are re-offered through the restored subscription and
+  allocate fresh identifiers.
+
+**A revoked entry stays in the list.** The execution loop skips it, and nothing else reads
+the flag; keeping it is what lets a later per-filter cancellation find it again. That loop
+runs after the confirmed save, on the read loop, so the flag needs no lock of its own.
+
+**Population.** Live SUBSCRIBE only, plain filters only. A shared filter routes to the
+group-consumer path and never touches `sess.cons[sid]` or the deferral; the CONNECT restore
+path executes the teardown inline with no deferral, and a restored record's filters are map
+keys, so duplicates cannot occur there. A multi-level wildcard owns two sids and reproduces
+the case twice, once per half.
+
+**What it does not do.** It does not make duplicate occurrences of one filter atomic: the
+earlier occurrence's raw subscription is still displaced by the later one's, and a
+per-filter failure of the later occurrence still leaves the earlier membership standing.
+Deliveries the barrier skipped are not NAKed either, so each waits out `AckWait` and can be
+overtaken while it waits, and its first transmission still carries `DUP=1` until F-072
+moves that derivation off the JetStream delivery count. Both are stated in
+`docs/CONFORMANCE.md`.
 
 ## The restore gate: the CONNACK follows a complete restoration
 

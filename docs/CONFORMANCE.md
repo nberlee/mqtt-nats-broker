@@ -4231,3 +4231,70 @@ first statement is not usable without the rest:
    next initialization re-derives the same name. Guarding this would need a
    read-before-delete that still could not condition the delete against a collision
    arriving after the read.
+
+### A duplicate plain filter that downgrades then upgrades keeps its consumer
+
+One SUBSCRIBE packet may carry the same plain topic filter twice, first at QoS 0 and then
+at QoS > 0. MQTT 5.0 3.8.4 makes that a sequence of subscriptions answered by one SUBACK
+[MQTT-3.8.4-4], with the later entry replacing the earlier [MQTT-3.8.4-3], and this broker
+already declares duplicate-filter SUBSCRIBE a supported packet (the retained-frame transfer
+above). What it does now is end that packet coherently.
+
+**Closed.** The deferred QoS 0 teardown is REVOKED by the later occurrence: the consumer
+survives, the record names it, the delivery subscription reopens under the last
+occurrence's terms, and the verdicts the staging recorded on transmitted registers are
+withdrawn durably in the packet's own write. Previously the client was granted QoS 1 and
+then received nothing for the rest of the connection, while the record named a durable the
+packet went on to delete. Both halves of a multi-level wildcard are covered. Where delivery
+readiness cannot be established the filter is REFUSED `0x80` and the downgrade stands,
+because granting a QoS the broker cannot serve is the defect, not a lesser form of it.
+
+**Not claimed: atomicity across duplicate occurrences of one filter in a packet.** The
+earlier occurrence's raw subscription is still displaced by the later one's `processSub`,
+and a per-filter failure of the later occurrence still leaves the earlier occurrence's
+membership standing — the revocation re-stages the downgrade so the *consumer* stays
+coherent with the record in that case, but the packet is not transactional across
+occurrences.
+
+**A revived consumer's deliveries skipped while the barrier was down redeliver with
+`DUP=1` on their first transmission.** That is F-072's defect reached by a new route rather
+than a new one: `deferredNaksLocked` DELETES the `sess.deferred` key before NAKing it and
+`trackPublish` clears `dup` only for a key still present, so any acknowledgement in the
+interval consumes the fact that would clear the flag — the identical hole the in-flight-cap
+withholding path has today. The attribution rests on a PROPERTY, not on a case analysis:
+after F-072 the flag follows the per-identifier transmission fact F-072 makes durable, at
+its single derivation site, so every case is decided there and none of them is this item's
+to enumerate. The route therefore needs no entry in F-072's close set, and no second,
+weaker marker is added here — a marker recorded in this window cannot survive to be
+consumed, for the reason above.
+
+**A revived consumer's skipped deliveries are NOT NAKed, so each waits out `AckWait`
+before it is re-offered — and can be overtaken while it waits.** Stated separately from the
+DUP entry because **F-072 does not close it**: F-072 restores the flag, not the prompt
+re-offer. The mechanism is this item's own — the closed arm records nothing, and the
+revocation calls no `deferredNaksLocked`, so there is nothing to NAK.
+
+- **Overtaking is real.** Skip A while the barrier is down, revive, publish B: with
+  capacity available B reaches the client before A. That is the ordering gap already
+  recorded above ("Ordering across a redelivery is not preserved — the same residual any
+  AckWait or NAK redelivery carries"), reached by a new route.
+- **The delay is not confined to the skipped set.** At `MaxAckPending` the unacknowledged
+  skipped messages hold up later messages that never reached the callback at all.
+- **Saturation is neither loss nor deadlock**, because the pinned JetStream processes
+  eligible redeliveries *before* its pending-cap check. That is an upstream property, cited
+  under "JetStream behaviors this design depends on" rather than re-proven here.
+- **Delivery is preserved subject to ordinary expiry**, not unconditionally: stream and
+  message TTL apply to a message waiting out `AckWait` exactly as to any other.
+
+**A pre-existing staging residual, unwidened.** For a packet like
+`[{foo,0}, {$share/g/bar,1}, {foo,1}]` the shared filter's early membership persist
+serializes a record MID-LOOP, and that record carries occurrence 1's void verdict on a
+TRANSMITTED register beside a still-pre-packet plain membership. A crash in that window
+leaves a record saying a delivery the client is holding was never transmitted, which
+licenses re-minting its identifier. This change does not close it — closing it would mean
+either withholding the early save's `CancelledRegs`, which the revision-stamping design
+deliberately does not do, or making the staging conditional on no later occurrence
+existing, which cannot be done without failing the earlier occurrences too. What the
+revocation does change is the SUCCESS path, where the packet's own save now withdraws the
+verdict rather than leaving it to the next resume. The window is asserted in both
+directions, so a future change cannot widen it unnoticed.

@@ -2616,13 +2616,23 @@ func (sess *mqttSession) unvoidRegNonces(nonces []string) {
 		return
 	}
 	sess.mu.Lock()
+	sess.unvoidRegNoncesLocked(nonces)
+	sess.mu.Unlock()
+}
+
+// unvoidRegNoncesLocked is unvoidRegNonces for a caller that already holds the lock,
+// because it is withdrawing the verdicts inside a critical section that must not be split:
+// a revoked QoS downgrade reopens the delivery barrier, installs the new terms and
+// withdraws these verdicts as one state change. See revokeLocked.
+//
+// sess.mu must be held.
+func (sess *mqttSession) unvoidRegNoncesLocked(nonces []string) {
 	for _, n := range nonces {
 		if _, ok := sess.cancelledRegNonces[n]; ok {
 			delete(sess.cancelledRegNonces, n)
 			sess.voidedRegsRev++
 		}
 	}
-	sess.mu.Unlock()
 }
 
 // closeTeardownDeliveryLocked marks a doomed consumer's delivery subscription CLOSED, so no

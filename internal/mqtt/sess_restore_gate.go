@@ -223,18 +223,23 @@ func mqttFirstUnrestoredFilter(filters []*mqttFilter) *mqttFilter {
 	return nil
 }
 
-// restoreExitFail is the per-exit failure seam for the CONNECT restore path.
+// filterExitFail is the per-exit failure seam for BOTH phases of processSubs' filter loop.
 //
-// It returns nil on a SUBSCRIBE and whenever no fixture installed it, and it is
-// consulted only AFTER the real call it stands beside has succeeded — so a test
-// proves the production route ran and then failed it, rather than replacing it.
-// See the field's comment for why the injection is per exit.
-func (as *mqttAccountSessionManager) restoreExitFail(fromSubProto bool, exit, sid string) error {
-	if fromSubProto {
-		return nil
-	}
+// It returns nil whenever no fixture installed the seam for the running phase, and it is
+// consulted only AFTER the real call it stands beside has succeeded — so a test proves the
+// production route ran and then failed it, rather than replacing it. See the fields'
+// comments for why the injection is per exit.
+//
+// It dispatches on the phase because the seam used to be restore-only, which left the live
+// SUBSCRIBE path with no per-filter failure injection at all. A revoked downgrade owes a
+// FRESH staging when the occurrence that revoked it then fails, and without a live seam
+// that obligation could only be asserted, never proven.
+func (as *mqttAccountSessionManager) filterExitFail(fromSubProto bool, exit, sid string) error {
 	as.mu.RLock()
 	h := as.testRestoreFilterFail
+	if fromSubProto {
+		h = as.testSubFilterFail
+	}
 	as.mu.RUnlock()
 	if h == nil {
 		return nil
@@ -366,15 +371,28 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 //     and a reconciliation subscription that restoration has ADOPTED (adoption
 //     clears both `closed` and `phaseOwned`). Its durable survives, so the marker
 //     has a first transmission left to protect.
+//
 //   - `phaseOwned` covers a reconciliation subscription that has not been adopted
 //     yet: still closed, still owed.
+//
 //   - Everything else is DOOMED, and must record nothing. A phase subscription
 //     whose durable is being deleted is DISOWNED before its gate opens
-//     (`unsubscribePhase`'s doomed arm), and an ordinary subscription that was
-//     torn down by a QoS downgrade or an UNSUBSCRIBE was never owed this message
-//     at all. Writing a marker for either strands an entry nothing can consume:
-//     trackPublish clears it only when that durable delivers again, which it never
-//     will.
+//     (`unsubscribePhase`'s doomed arm), and an ordinary subscription torn down by
+//     an UNSUBSCRIBE, or by a QoS downgrade that STANDS, was never owed this
+//     message at all. Writing a marker for either strands an entry nothing can
+//     consume: trackPublish clears it only when that durable delivers again, which
+//     it never will.
+//
+//     A downgrade staged by a live SUBSCRIBE packet is the one case that is not yet
+//     settled — a later occurrence of the same filter can REVOKE it, after which the
+//     durable does deliver again. The discriminator a reader needs is that a durable
+//     whose deletion is merely STAGED is not yet doomed, while one already deleted
+//     is. This function still records nothing in that window, deliberately: the
+//     marker it would write cannot survive to be consumed, because deferredNaksLocked
+//     DELETES the sess.deferred key before NAKing it and any acknowledgement in the
+//     interval consumes the very fact that would clear DUP. Such a delivery is
+//     re-offered by AckWait and carries DUP=1 until F-072 moves the derivation off
+//     the JetStream delivery count. Stated in docs/CONFORMANCE.md.
 //
 // The doomed case is not hypothetical, and it is why the rule lives here rather
 // than at the call sites. The reconciliation phase's `undo` purges markers for the

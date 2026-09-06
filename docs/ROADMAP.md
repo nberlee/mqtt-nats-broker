@@ -3255,7 +3255,15 @@ takeover.
   returns `isNew=false` so no register is rewritten, and `beginSendLocked` does not
   reconcile QoS. The started exchange still owes its QoS 2 handshake
   ([MQTT-3.10.4-3]), and a client whose PUBREC was lost may still be holding that state
-  open ([MQTT 5.0 §4.3.3]). **Pre-existing:** HEAD does the same whenever it adopts an
+  open ([MQTT 5.0 §4.3.3]). **Pre-existing, and NOT drain-only — corrected 2026-09-06 by
+  the revocable-downgrade item, which read the same path.** The identical mismatch is
+  reachable through the PLAIN existing-consumer refresh with no drain involved: a
+  single-filter QoS 2 -> 1 re-SUBSCRIBE over a transmitted, unacknowledged exchange sets
+  `sub.mqtt.qos = 1`, the callback recomputes `min(h.qos, sub.mqtt.qos)` per delivery, and
+  `trackPublish` returns the existing identifier with `isNew = false`. So the
+  duplicate-filter route the revocable downgrade makes reachable is a **new route to an
+  existing population, not a new population**, and a fix must cover the plain refresh
+  rather than the drain adoption alone. HEAD also does the same whenever it adopts an
   already-delivering drain and refreshes its metadata downward. What the delivery
   reclaim changed is the population — a drain that used to deliver nothing now
   delivers, so the transition became reachable where silence stood. **Not a reason to
@@ -3263,16 +3271,64 @@ takeover.
   must decide what a subscription downgrade owes an exchange already past its first
   transmission, which is a protocol question this item could not settle.
 
-- [ ] **A closed-but-present delivery subscription under a live `cons[sid]`.** Filed
-  2026-09-06 by the delivery-readiness item's plan-review round 1.
-  `stageDeferredDeleteLocked` closes a QoS 0 downgrade's delivery subscription while
-  `processJSConsumer`'s QoS 0 arm deliberately keeps `cons[sid]` until the confirmed
-  save, so one SUBSCRIBE packet carrying the same filter at QoS 0 and then at QoS 1
-  reaches the existing-consumer arm with `sub.mqtt.closed == true`. **Widening a
-  predicate does not fix it**: the deferred delete is still scheduled, so a branch that
-  merely reinstalled delivery would be racing a teardown the packet has already
-  committed to. Pre-existing, and untouched by the delivery reclaim, which never enters
-  that branch.
+- [x] **A closed-but-present delivery subscription under a live `cons[sid]`.** Filed
+  2026-09-06 by the delivery-readiness item's plan-review round 1; **CLOSED by making a
+  deferred QoS downgrade REVOCABLE within its packet.** One SUBSCRIBE packet carrying the
+  same plain filter at QoS 0 and then at QoS > 0 used to leave the client granted QoS 1 on
+  a subscription that delivered nothing for the rest of the connection, with the record
+  naming a durable the packet then deleted. Widening the existing-consumer arm's predicate
+  was refuted and is not what landed: the deferred delete was still scheduled, so
+  reinstalling delivery would have raced a teardown the packet had committed to.
+
+  **What landed.** The packet's deferred-delete list became the SINGLE authority — each
+  entry carries the barrier its staging lowered and the verdicts it recorded, replacing two
+  parallel slices whose three per-filter boundaries over three cardinalities could not
+  express "withdraw the staging for this sid". A later occurrence re-establishing QoS > 0
+  revokes the staging: barrier, terms and un-void in ONE critical section (it is the SPLIT
+  that is the defect — a delivery between a reopen and a later refresh goes out at the
+  PRE-PACKET QoS), with a READINESS REFUSAL (`0x80`) rather than a grant the broker cannot
+  serve. The reviver's own failure re-stages through the same helper, never from the saved
+  snapshot, because the reopened interval had live delivery whose new registrations belong
+  in the packet's own membership-removal write. The at-most-one-live-entry invariant also
+  removed a pre-existing double `CONSUMER.DELETE` for `[{foo,0},{foo,0}]`. Two test seams
+  were added — a live-SUBSCRIBE per-filter failure seam (the existing one was restore-only,
+  so the re-stage could only be asserted, never proven) and a reply-bearing observation of
+  the closed-arm skip — plus a packet-scoped pause and a deferred-teardown counter, the
+  last because that teardown's observable effects are idempotent.
+
+  **Not claimed:** atomicity across duplicate occurrences of one filter; a prompt re-offer
+  of the deliveries the barrier skipped (each waits out `AckWait` and can be overtaken);
+  `DUP=0` on their first transmission, which is F-072's single derivation site and not a
+  second marker here. The early-shared-save window (a void verdict made durable beside a
+  still-pre-packet membership) is PRE-EXISTING and unwidened, asserted in both directions.
+  Residuals in `docs/CONFORMANCE.md`; mechanism in `docs/ARCHITECTURE.md` under "A deferred
+  QoS downgrade is revocable within its packet".
+
+- [ ] **`buildPersistedSessionLocked` keys `Cons` on membership PRESENCE, not positive
+  QoS.** Filed 2026-09-06 by the revocable-downgrade item's plan-review round 2, and
+  deliberately scoped OUT of it — it was never in that item's bullet, and its blast radius
+  is three recovery surfaces that item does not otherwise touch. The builder tests
+  `if _, ok := sess.subs[key]; !ok { continue }`, and a QoS downgrade sets
+  `sess.subs[key] = 0` rather than removing the key, so the **ordinary single-occurrence
+  QoS 1 -> 0 downgrade** persists `Cons[sid]` in its own confirmed save and then deletes
+  the durable, leaving the record naming a consumer that does not exist. Where the teardown
+  happens to have cancellations to secure, `proveVoidedRegs` saves again and incidentally
+  repairs it; where it does not, the stale reference stands until the next resume.
+  **`TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes` asserts `Cons` is STILL
+  PRESENT**, as evidence rather than as intended behavior, so fixing this means updating
+  that assertion.
+  **The three surfaces a fix owes tests on, established rather than assumed:** resume
+  reconciliation **skips QoS 0 entirely** (`sess_resume_reconcile.go`), so it is not the
+  pruner and CONNECT's inline delete is the only prompt cleanup path for such an entry —
+  omitting the entry removes it; fork repair copies `Cons` independently of QoS and its
+  APPLICATION distinguishes live from absent by config presence (`sess_fork_repair.go`), so
+  a repaired downgrade changes from preserving a survivor consumer to removing its
+  in-memory reference; and the same builder supplies `clear()`'s teardown snapshot, so the
+  change is broader than packet serialization. **"Unnamed, therefore swept" does not hold**:
+  the orphan sweep spares every local `sess.cons` entry whatever the record says, and the
+  ambiguous-save path returns before the execution loop with no deferred-delete
+  continuation registered, so a resident session can hold the consumer with the record
+  denying it.
 
 - [ ] **A quarantined packet identifier has no live-session release.** Filed 2026-08-30 by
   F-087's plan-review loop. NOT an alpha blocker: holding is fail-closed and replaces the

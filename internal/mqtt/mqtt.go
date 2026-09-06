@@ -689,6 +689,62 @@ func setMQTTTestDeliveryPreLockHook(h func(sub *subscription)) func() {
 	return func() { mqttTestDeliveryPreLockHookV.Store(prev) }
 }
 
+// Test hook: fired in mqttDeliverMsgCbQoS12's CLOSED arm, immediately before it returns
+// without acking. It carries the ack REPLY subject as well as the subscription, which is
+// what the pre-lock and done hooks above cannot do — they take only a *subscription.
+//
+// Two facts at once, and both are needed by the same test: that the skip happened, observed
+// positively rather than by an absence, and the subject to NAK so a re-offer is scheduled
+// deterministically instead of waiting out AckWait. A NEW hook rather than a widened
+// signature so no existing caller or test changes.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDeliverySkippedHookV atomic.Pointer[func(sub *subscription, reply string)]
+
+// setMQTTTestDeliverySkippedHook installs (or, with nil, clears) the closed-arm skip hook
+// and returns a function that restores the previous value.
+func setMQTTTestDeliverySkippedHook(h func(sub *subscription, reply string)) func() {
+	prev := mqttTestDeliverySkippedHookV.Load()
+	if h == nil {
+		mqttTestDeliverySkippedHookV.Store(nil)
+	} else {
+		mqttTestDeliverySkippedHookV.Store(&h)
+	}
+	return func() { mqttTestDeliverySkippedHookV.Store(prev) }
+}
+
+// mqttTestSubPauseV pauses a LIVE SUBSCRIBE packet at one named boundary of its filter
+// loop, so a test can act while the packet is in a specific state. The boundaries are the
+// ones this item's ordering claims live across, and both are outside the session locks:
+//
+//	"staged:<sid>"   after one occurrence staged a deferred downgrade: the delivery
+//	                 barrier is down and the packet is still running
+//	"revoked:<sid>"  after a later occurrence revoked that staging and before
+//	                 processJSConsumer's refresh arm re-applies the same terms
+//
+// The second is what makes "the terms are installed WITH the reopen" testable at all: a
+// post-SUBACK publication cannot distinguish the revocation's write from the refresh's.
+//
+// EVERY occurrence of a filter reaches these, so a fixture that means one occurrence counts
+// its own calls. Modelled on mqttTestRestorePauseHook, which does the same job for CONNECT.
+var mqttTestSubPauseV atomic.Pointer[func(at string)]
+
+func setMQTTTestSubPause(h func(at string)) func() {
+	prev := mqttTestSubPauseV.Load()
+	if h == nil {
+		mqttTestSubPauseV.Store(nil)
+	} else {
+		mqttTestSubPauseV.Store(&h)
+	}
+	return func() { mqttTestSubPauseV.Store(prev) }
+}
+
+func mqttTestSubPauseHook(at string) {
+	if h := mqttTestSubPauseV.Load(); h != nil {
+		(*h)(at)
+	}
+}
+
 // Test hook: fired from a DEFER registered beside the pre-lock hook, so it runs when the
 // delivery callback returns through any of its exits below that point. It is the completion
 // signal a negative-delivery assertion needs; see the paired seam in mqttDeliverMsgCbQoS12.
@@ -706,6 +762,27 @@ func setMQTTTestDeliveryDoneHook(h func(sub *subscription)) func() {
 		mqttTestDeliveryDoneHookV.Store(&h)
 	}
 	return func() { mqttTestDeliveryDoneHookV.Store(prev) }
+}
+
+// Test hook: fired once per execution of a consumer teardown a SUBSCRIBE packet deferred.
+// It COUNTS, and that is why it exists: the teardown's observable effects are idempotent —
+// a second run finds no cons entry, no pending registrations and an already-deleted durable
+// — so "it ran twice for one consumer" is invisible to every assertion on state, and the
+// at-most-one-live-staging invariant could not otherwise be pinned.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDeferredDeleteHookV atomic.Pointer[func(sid, durable string)]
+
+// setMQTTTestDeferredDeleteHook installs (or, with nil, clears) the deferred-teardown
+// counter seam and returns a function that restores the previous value.
+func setMQTTTestDeferredDeleteHook(h func(sid, durable string)) func() {
+	prev := mqttTestDeferredDeleteHookV.Load()
+	if h == nil {
+		mqttTestDeferredDeleteHookV.Store(nil)
+	} else {
+		mqttTestDeferredDeleteHookV.Store(&h)
+	}
+	return func() { mqttTestDeferredDeleteHookV.Store(prev) }
 }
 
 // Test hook: the retired-drain consumer delete seam. It OBSERVES THE REAL noWait ARGUMENT,
@@ -843,6 +920,32 @@ func setMQTTTestLoadLastMsgHook(h func(stream, subject string) error) func() {
 // Message Expiry Interval, leaving the MQTT property itself intact. See
 // mqttStoredMsgTTL.
 var mqttTestSuppressMsgTTLV atomic.Bool
+
+// mqttTestSessRecordBodyHookV observes the EXACT BYTES one session-record write is about
+// to store, taken from the same marshal the store uses.
+//
+// It exists because the live session maps are not that payload: saveWithDetail marshals
+// the record and RELEASES sess.mu before it stores, so anything a test reads off the
+// session afterwards may already have moved. Reading the record back is not an
+// alternative either — a JetStream read issued from inside the write's own completion
+// blocks the packet that is making it.
+//
+// Fired after the lock is released, on bytes that are already immutable, so the hook may
+// do whatever it likes with them. Paired with the result hook below, which is what says
+// whether these bytes actually landed.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestSessRecordBodyHookV atomic.Pointer[func(sess *mqttSession, body []byte)]
+
+func setMQTTTestSessRecordBodyHook(h func(sess *mqttSession, body []byte)) func() {
+	prev := mqttTestSessRecordBodyHookV.Load()
+	if h == nil {
+		mqttTestSessRecordBodyHookV.Store(nil)
+	} else {
+		mqttTestSessRecordBodyHookV.Store(&h)
+	}
+	return func() { mqttTestSessRecordBodyHookV.Store(prev) }
+}
 
 // mqttTestSessStoreResultHookV rewrites the outcome of a SESSION RECORD write
 // after it has been issued, so a test can produce the one case the pre-write hook
@@ -1628,6 +1731,17 @@ type mqttAccountSessionManager struct {
 	// fromSubProto is false, and only AFTER the real call has run, so the fixture
 	// reaches the production path and then fails it rather than replacing it.
 	testRestoreFilterFail func(exit, sid string) error
+
+	// testSubFilterFail is testRestoreFilterFail for the LIVE SUBSCRIBE path, consulted
+	// only when fromSubProto is true. Separate rather than one field consulted on both,
+	// so a fixture that means to fail a live filter cannot silently also fail the
+	// CONNECT restore that preceded it in the same test.
+	//
+	// One sid's exit is reached by EVERY occurrence of its filter in the packet — the
+	// staging occurrence passes through it before the reviving one does — so a fixture
+	// that fails on sid alone cancels the first downgrade before any revival exists. A
+	// test that means to fail the revival counts its own calls.
+	testSubFilterFail func(exit, sid string) error
 
 	// qos2SweepCursor is the orphan QoS 2 sweep's position in $MQTT_qos2in, and
 	// qos2SweepSeeded whether it has been seeded yet. Scheduling state only: every
@@ -8491,6 +8605,93 @@ func mqttShouldSendRetained(retainHandling byte, subs map[string]byte, filter st
 	}
 }
 
+// mqttDeferredDel is one consumer teardown a SUBSCRIBE packet deferred to its confirmed
+// save, together with everything that deferral staged — so the whole staging can be
+// WITHDRAWN as a unit when a later occurrence of the same filter in the same packet
+// re-establishes QoS > 0.
+//
+// The three facts lived in three parallel stack slices with three per-filter boundaries,
+// over three different cardinalities: one staging contributes at most one closed
+// subscription and zero or more nonces. Three boundaries over three cardinalities cannot
+// express "withdraw the staging for THIS sid", because a mid-slice removal invalidates the
+// later filters' boundaries. Collapsing them into one entry per staging is what makes the
+// revocation expressible at all.
+//
+// Package-level, rather than local to processSubs as it once was, because the readiness
+// predicate below is the part a unit test must reach: an external test can neither
+// construct a function-local type nor invoke a closure over one.
+type mqttDeferredDel struct {
+	sid string
+	cc  *ConsumerConfig
+	// The delivery barrier this staging lowered, nil when there was none to lower.
+	closed *subscription
+	// The verdicts it recorded on TRANSMITTED registers. Those deliveries stay live and
+	// still owe their identifiers, so a withdrawal has to withdraw these too.
+	voided []string
+	// A later occurrence of this sid re-established QoS > 0, so the teardown must not
+	// run. The entry STAYS in the packet's list: a per-filter cancellation still has to
+	// find it, to re-stage the downgrade when the reviving occurrence itself fails.
+	revoked bool
+}
+
+// revokeLocked undoes this staging because a LATER occurrence of the same filter in the
+// same packet re-established QoS > 0. sess.update applies the last occurrence, so the
+// record ends at that QoS and the only coherent end state is the consumer alive and
+// delivering under THIS occurrence's terms. [MQTT-3.8.4-3], [MQTT-3.8.4-4].
+//
+// It REFUSES rather than grants when delivery readiness cannot be established. The saved
+// subscription pointer proves only what was true at staging time; granting a QoS the broker
+// cannot serve is the defect this repair exists to remove, not a lesser form of it. The
+// refusal fails the filter 0x80 and leaves the deferral standing, so the packet still ends
+// coherent. That predicate is a defensive assertion rather than a reachable branch — for a
+// live entry created by this packet the pair "cons[sid] present, its delivery subscription
+// closed" has no other producer — which is why its test synthesizes the state.
+//
+// What it deliberately does NOT undo is the staged CANCELLATIONS. voidRegistrationsLocked
+// destroyed the not-yet-transmitted allocations outright: the pending slot is a cancelled
+// stub and the ack subject is parked in sess.deferred. Their tombstones must still ride the
+// packet's write, or a register store still in flight lands with nothing to explain it and
+// holds an identifier and a Receive Maximum slot for the rest of the session. The message
+// itself is untransmitted and unacked in JetStream, so it is re-offered through the
+// subscription this revocation just restored and trackPublish allocates a fresh identifier.
+//
+// sess.mu must be held for the WHOLE of it — the barrier, the terms and the un-void are one
+// state change. It is the SPLIT that is the defect: a delivery dispatched between a reopen
+// and a later refresh would be sent at the PRE-PACKET QoS, so a session this packet
+// downgrades 2 -> 1 would transmit a QoS 2 PUBLISH under a QoS 1 grant [MQTT-3.8.4-8]. The
+// order of the assignments WITHIN the section is not a correctness constraint; every reader
+// holds one of the two locks taken here.
+func (dd *mqttDeferredDel) revokeLocked(c *client, sess *mqttSession,
+	qos byte, noLocal, retainAsPublished bool, subID int) error {
+
+	if c == nil || dd.cc == nil || sess.cons[dd.sid] != dd.cc {
+		return fmt.Errorf("mqtt: filter %q no longer holds the consumer its downgrade staged", dd.sid)
+	}
+	if dd.closed == nil || dd.closed.mqtt == nil {
+		return fmt.Errorf("mqtt: filter %q has no delivery subscription to restore", dd.sid)
+	}
+	// Taken under c.mu exactly as closeSharedDeliveryLocked takes it: the pointer we hold
+	// is only evidence if it is STILL the installed one.
+	c.mu.Lock()
+	installed := c.subs[dd.cc.DeliverSubject]
+	c.mu.Unlock()
+	if installed != dd.closed {
+		return fmt.Errorf("mqtt: filter %q no longer delivers through the subscription its downgrade closed", dd.sid)
+	}
+	// The QoS 1/2 callback reads these under sess.mu and the QoS 0 shadow callback under
+	// subsMu, so write under both, as processSub and the existing-consumer refresh do.
+	sess.subsMu.Lock()
+	dd.closed.mqtt.qos = qos
+	dd.closed.mqtt.noLocal = noLocal
+	dd.closed.mqtt.retainAsPublished = retainAsPublished
+	dd.closed.mqtt.subID = subID
+	dd.closed.mqtt.closed = false
+	sess.subsMu.Unlock()
+	sess.unvoidRegNoncesLocked(dd.voided)
+	dd.revoked = true
+	return nil
+}
+
 // Process subscriptions for the given session/client.
 //
 // When `fromSubProto` is false, it means that this is invoked from the CONNECT
@@ -8677,7 +8878,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		if f.qos == 2 {
 			err := sess.ensurePubRelConsumerSubscription(c)
 			if err == nil {
-				err = as.restoreExitFail(fromSubProto, "pubrel", f.sessionKey())
+				err = as.filterExitFail(fromSubProto, "pubrel", f.sessionKey())
 			}
 			if err != nil {
 				c.Errorf("failed to initialize PUBREL processing: %v", err)
@@ -8703,7 +8904,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					facts.recordCASRejected = true
 				}
 				if err == nil {
-					err = as.restoreExitFail(fromSubProto, "affine", f.sessionKey())
+					err = as.filterExitFail(fromSubProto, "affine", f.sessionKey())
 				}
 				if err != nil {
 					// Deliberately NOT marked. This arm's error covers consumer
@@ -8823,18 +9024,93 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	// packet is deferred until the final session save is confirmed, so a failed
 	// save can restore the pre-packet consumer instead of having lost its
 	// durable/cursor. Spec5 [4.8.2].
-	type deferredDel struct {
-		sid string
-		cc  *ConsumerConfig
-	}
-	var deferredDels []deferredDel
-	// Registrations this packet withdraws, cancelled inside its own transaction, and the
-	// delivery subscriptions closed so nothing can allocate behind that snapshot.
+	//
+	// Each entry also carries what its deferral staged — the barrier it lowered and the
+	// verdicts it recorded — so the list is the SINGLE authority on "this consumer is
+	// being torn down by this packet". See mqttDeferredDel for why the two parallel
+	// slices that used to hold those facts are gone.
+	var deferredDels []*mqttDeferredDel
+	// Registrations this packet withdraws, cancelled inside its own transaction. Unlike
+	// the barrier and the verdicts these are NOT withdrawn by a revocation: the
+	// allocation is already destroyed, so its tombstone still owes the packet's write.
 	var stagedCancels []mqttRegCancellation
-	var closedDeliveries []*subscription
-	// Verdicts on TRANSMITTED registers, withdrawn if this packet (or this filter) rolls
-	// back: those deliveries stay live and still owe their identifiers.
-	var voidedSent []string
+	// The sids the CURRENT filter revoked, reset at the top of each iteration alongside
+	// filterDefStart. A wildcard filter can revoke on both halves, so it holds up to two.
+	// Its consumer is the per-filter cancellation, which owes each of them a fresh
+	// staging: the reviving occurrence failed, so the earlier occurrence's QoS 0
+	// membership stands and the downgrade is owed again.
+	var revokedThisFilter []string
+
+	// liveDeferredDel is the packet's staged-downgrade lookup for one sid, and the reason
+	// at most one LIVE entry can exist per sid: a staging consults it first and stages
+	// nothing when one is already there. That is a lookup, not a deduction — the barrier
+	// argument alone would be too strong, because a second voidRegistrationsLocked WOULD
+	// still find the transmitted entries and re-record verdicts already recorded.
+	//
+	// It also removes a pre-existing double CONSUMER.DELETE for [{foo,0},{foo,0}], where
+	// two entries for one config ran the irreversible teardown twice.
+	liveDeferredDel := func(sid string) *mqttDeferredDel {
+		for _, dd := range deferredDels {
+			if dd.sid == sid && !dd.revoked {
+				return dd
+			}
+		}
+		return nil
+	}
+	// stageDeferredDel records one deferred teardown and everything it stages, or reports
+	// that this packet has already staged this sid.
+	stageDeferredDel := func(sid string, cc *ConsumerConfig) {
+		if liveDeferredDel(sid) != nil {
+			return
+		}
+		dd := &mqttDeferredDel{sid: sid, cc: cc}
+		// The teardown itself is deferred to the confirmed save, but the CANCELLATION
+		// is not: it belongs in the write that downgrades this filter, or the
+		// identifier it withdraws has nothing to recover it. The delivery barrier
+		// comes first, so nothing allocates a further identifier behind the snapshot;
+		// a rollback — or a revocation — reopens it, because the QoS 1/2 subscription
+		// is then still the client's.
+		sess.mu.Lock()
+		cancels, sub, sent := sess.stageDeferredDeleteLocked(c, cc)
+		sess.mu.Unlock()
+		dd.closed, dd.voided = sub, sent
+		stagedCancels = append(stagedCancels, cancels...)
+		deferredDels = append(deferredDels, dd)
+		mqttTestSubPauseHook("staged:" + sid)
+	}
+
+	// revokeStagedDowngrade undoes a downgrade THIS packet staged for sid, when this
+	// later occurrence of the same filter re-establishes QoS > 0. Called at the same two
+	// points as reclaimDrainDelivery and for the same reason: it answers the same shape
+	// of question — may this filter be granted delivery it cannot actually serve? — and
+	// processJSConsumer, which cannot see the packet's stack, is where the grant is
+	// otherwise made blind.
+	//
+	// The two are mutually exclusive by I7 (a drain has no cons entry; a staged
+	// downgrade has one), so their order here is a readability choice.
+	//
+	// The QoS condition lives at the CALL SITE only. A second copy inside would be a
+	// guard no test can pin: a QoS 0 occurrence that revoked would immediately re-stage
+	// through the same site, leaving nothing observable.
+	revokeStagedDowngrade := func(f *mqttFilter, sid string) error {
+		if !fromSubProto || f.shared || f.qos == 0 || f.qos >= mqttSubAckFailure {
+			return nil
+		}
+		sess.mu.Lock()
+		dd := liveDeferredDel(sid)
+		var err error
+		if dd != nil {
+			err = dd.revokeLocked(c, sess, f.qos, f.noLocal, f.retainAsPublished, f.subID)
+		}
+		sess.mu.Unlock()
+		if dd != nil && err == nil {
+			revokedThisFilter = append(revokedThisFilter, sid)
+			// Before processJSConsumer's refresh arm re-applies the same four fields,
+			// so a test can tell the revocation's write from the refresh's.
+			mqttTestSubPauseHook("revoked:" + sid)
+		}
+		return err
+	}
 
 	var err error
 	subs := make([]*subscription, 0, len(filters))
@@ -8951,23 +9227,58 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 
 		// Deferred consumer deletes recorded by THIS filter, so a later per-filter
 		// failure can cancel them (restore the sess.cons entry, keep the durable).
+		// One boundary now, because each entry carries what its deferral staged: the
+		// delivery barrier it lowered and the verdicts it recorded. A filter that FAILS
+		// keeps its original QoS 1/2 membership — the final update simply skips it — so
+		// a barrier left down would silently stop that subscription delivering until the
+		// client reconnects.
 		filterDefStart := len(deferredDels)
-		// And the same boundary for what the deferral staged: the delivery barriers it
-		// lowered, and the registrations it withdrew. A filter that FAILS keeps its
-		// original QoS 1/2 membership — the final update simply skips it — so a barrier
-		// left down would silently stop that subscription delivering until the client
-		// reconnects.
-		filterClosedStart := len(closedDeliveries)
-		filterVoidedStart := len(voidedSent)
+		revokedThisFilter = revokedThisFilter[:0]
 		cancelFilterDeferred := func() {
 			// The sess.cons entries were never removed (removal happens at
-			// execution time, after the confirmed save), so cancelling is just
-			// dropping this filter's descriptors.
+			// execution time, after the confirmed save), so cancelling this filter's
+			// own stagings is just dropping their descriptors and undoing what they
+			// staged. Both undos are idempotent, so a revoked entry passing through
+			// either is inert.
+			var reopen []*subscription
+			var unvoid []string
+			for _, dd := range deferredDels[filterDefStart:] {
+				if dd.closed != nil {
+					reopen = append(reopen, dd.closed)
+				}
+				unvoid = append(unvoid, dd.voided...)
+			}
+			sess.reopenTeardownDelivery(reopen)
+			sess.unvoidRegNonces(unvoid)
 			deferredDels = deferredDels[:filterDefStart]
-			sess.reopenTeardownDelivery(closedDeliveries[filterClosedStart:])
-			closedDeliveries = closedDeliveries[:filterClosedStart]
-			sess.unvoidRegNonces(voidedSent[filterVoidedStart:])
-			voidedSent = voidedSent[:filterVoidedStart]
+			// And every downgrade this filter REVOKED is owed again: the revival
+			// failed, so sess.update skips it and the earlier occurrence's QoS 0
+			// membership stands. Re-staged through the same helper rather than by
+			// restoring the saved barrier and verdicts, because between the revocation
+			// and this failure the barrier was OPEN and the durable live — new
+			// deliveries may have been tracked and new identifiers allocated, and only
+			// a fresh voidRegistrationsLocked withdraws them into the packet's own
+			// membership-removal write.
+			for _, sid := range revokedThisFilter {
+				dd := func() *mqttDeferredDel {
+					for _, d := range deferredDels {
+						if d.sid == sid && d.revoked {
+							return d
+						}
+					}
+					return nil
+				}()
+				if dd == nil {
+					continue
+				}
+				dd.revoked = false
+				sess.mu.Lock()
+				cancels, sub, sent := sess.stageDeferredDeleteLocked(c, dd.cc)
+				sess.mu.Unlock()
+				dd.closed, dd.voided = sub, sent
+				stagedCancels = append(stagedCancels, cancels...)
+			}
+			revokedThisFilter = revokedThisFilter[:0]
 		}
 
 		const processShadowSubs = true
@@ -8983,7 +9294,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		as.mu.Unlock()
 
 		if err == nil {
-			err = as.restoreExitFail(fromSubProto, "raw", sid)
+			err = as.filterExitFail(fromSubProto, "raw", sid)
 		}
 		if err != nil {
 			f.qos = mqttSubAckFailure
@@ -9021,32 +9332,20 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			filterInstalled = filterInstalled || jr.installed
 		} else {
 			var dd *ConsumerConfig
-			// A failed reclaim SKIPS provisioning and carries its error into the
-			// per-filter arm below: by here the raw QoS 0 subscription is already
-			// installed, so a bare continue would strand it.
-			if err = reclaimDrainDelivery(f, subject, sid); err == nil {
-				jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+			// A failed revocation or reclaim SKIPS provisioning and carries its error
+			// into the per-filter arm below: by here the raw QoS 0 subscription is
+			// already installed, so a bare continue would strand it.
+			if err = revokeStagedDowngrade(f, sid); err == nil {
+				if err = reclaimDrainDelivery(f, subject, sid); err == nil {
+					jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+				}
 			}
 			if dd != nil {
-				deferredDels = append(deferredDels, deferredDel{sid: sid, cc: dd})
-				// The teardown itself is deferred to the confirmed save, but the
-				// CANCELLATION is not: it belongs in the write that downgrades this
-				// filter, or the identifier it withdraws has nothing to recover it.
-				// The delivery barrier comes first, so nothing allocates a further
-				// identifier behind the snapshot; a rollback reopens it, because the
-				// QoS 1/2 subscription is then still the client's.
-				sess.mu.Lock()
-				ddCancels, ddSub, ddSent := sess.stageDeferredDeleteLocked(c, dd)
-				sess.mu.Unlock()
-				stagedCancels = append(stagedCancels, ddCancels...)
-				voidedSent = append(voidedSent, ddSent...)
-				if ddSub != nil {
-					closedDeliveries = append(closedDeliveries, ddSub)
-				}
+				stageDeferredDel(sid, dd)
 			}
 		}
 		if err == nil {
-			err = as.restoreExitFail(fromSubProto, "consumer", sid)
+			err = as.filterExitFail(fromSubProto, "consumer", sid)
 		}
 		if err != nil {
 			f.qos = mqttSubAckFailure
@@ -9093,7 +9392,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			sess.mu.Unlock()
 			as.mu.Unlock()
 			if err == nil {
-				err = as.restoreExitFail(fromSubProto, "raw-fwc", fwcsid)
+				err = as.filterExitFail(fromSubProto, "raw-fwc", fwcsid)
 			}
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
@@ -9124,30 +9423,24 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				filterInstalled = filterInstalled || fwjr.installed
 			} else {
 				var fwdd *ConsumerConfig
-				// Same reclaim for the level-up companion, which owns a drain of its own.
-				// Its failure arm cleans BOTH raw subscriptions and any main consumer this
-				// filter created, which is why the error is carried there rather than
-				// short-circuiting.
-				if err = reclaimDrainDelivery(f, fwcsubject, fwcsid); err == nil {
-					fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+				// Same revocation and reclaim for the level-up companion, which owns a
+				// drain and a staged downgrade of its own. Its failure arm cleans BOTH
+				// raw subscriptions and any main consumer this filter created, which is
+				// why the error is carried there rather than short-circuiting.
+				if err = revokeStagedDowngrade(f, fwcsid); err == nil {
+					if err = reclaimDrainDelivery(f, fwcsubject, fwcsid); err == nil {
+						fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+					}
 				}
 				if fwdd != nil {
 					// The same staging as the main half, through the same helper: the
 					// companion is a consumer in its own right and owes exactly what it
 					// does.
-					deferredDels = append(deferredDels, deferredDel{sid: fwcsid, cc: fwdd})
-					sess.mu.Lock()
-					fwCancels, fwSub, fwSent := sess.stageDeferredDeleteLocked(c, fwdd)
-					sess.mu.Unlock()
-					stagedCancels = append(stagedCancels, fwCancels...)
-					voidedSent = append(voidedSent, fwSent...)
-					if fwSub != nil {
-						closedDeliveries = append(closedDeliveries, fwSub)
-					}
+					stageDeferredDel(fwcsid, fwdd)
 				}
 			}
 			if err == nil {
-				err = as.restoreExitFail(fromSubProto, "consumer-fwc", fwcsid)
+				err = as.filterExitFail(fromSubProto, "consumer-fwc", fwcsid)
 			}
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
@@ -9217,8 +9510,16 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state: %v", sess.id, err)
 				return nil, facts, err
 			}
-			sess.reopenTeardownDelivery(closedDeliveries)
-			sess.unvoidRegNonces(voidedSent)
+			var reopen []*subscription
+			var unvoid []string
+			for _, dd := range deferredDels {
+				if dd.closed != nil {
+					reopen = append(reopen, dd.closed)
+				}
+				unvoid = append(unvoid, dd.voided...)
+			}
+			sess.reopenTeardownDelivery(reopen)
+			sess.unvoidRegNonces(unvoid)
 			sess.rollbackSubscribePacket(c, tok, subs, consSnap, snap, q2AffPrePacket)
 			sess.secureRegCancellations(c, tok, stagedCancels)
 		} else {
@@ -9239,6 +9540,15 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				facts.recordCASRejected = true
 			}
 			for _, dd := range deferredDels {
+				// A REVOKED staging has no teardown left to run: a later occurrence of
+				// this filter re-established QoS > 0, so the record ends naming this
+				// durable and the client is being served by it. The entry stays in the
+				// list rather than being removed, so a per-filter cancellation can
+				// still find it. This loop runs after the confirmed save, on the read
+				// loop, so the flag needs no lock of its own.
+				if dd.revoked {
+					continue
+				}
 				if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc) {
 					facts.recordCASRejected = true
 				}
@@ -11293,6 +11603,10 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 	// path that happened to be persisting. See mqttPendingWrite.
 	voidedRev := sess.voidedRegsRev
 	sess.mu.Unlock()
+
+	if h := mqttTestSessRecordBodyHookV.Load(); h != nil {
+		(*h)(sess, body)
+	}
 
 	var resp *JSPubAckResponse
 	var err error
@@ -19151,16 +19465,18 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// way an in-flight-cap withholding is recorded, which is what makes
 		// trackPublish clear DUP on the attempt that finally goes out
 		// [MQTT-3.3.1-1] (and lets a freed slot NAK it forward rather than
-		// waiting out AckWait). Only for a phase-owned subscription: an ordinary
-		// closed one was torn down (a QoS downgrade, an UNSUBSCRIBE) and its
-		// messages are not owed to this client at all.
+		// waiting out AckWait).
 		//
-		// The recording itself — the owed-delivery predicate, and its sess.c == nil
-		// arm, which covers a RACE rather than a state a test can schedule — lives in
-		// recordWithheldDeliveryLocked, shared with the connection-scoped restore
-		// verdict so both withholdings owe the client the same thing. In THIS branch
-		// the subscription is always closed, so that predicate reduces to the
-		// phase-owned test this arm used to make inline.
+		// WHICH deliveries are still owed is not decided here. The owed-delivery
+		// predicate — and its sess.c == nil arm, which covers a RACE rather than a
+		// state a test can schedule — lives in recordWithheldDeliveryLocked, its
+		// single home, shared with the connection-scoped restore verdict so both
+		// withholdings owe the client the same thing. This arm restated that rule
+		// for its own case and the restatement went stale, which is what a second
+		// home for one fact does.
+		if h := mqttTestDeliverySkippedHookV.Load(); h != nil {
+			(*h)(sub, reply)
+		}
 		sess.recordWithheldDeliveryLocked(cc, sub, reply)
 		sess.mu.Unlock()
 		return
@@ -20823,6 +21139,9 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 // is exactly the swallowed evidence that would let the operation gate open as "quiet". See
 // mqttSubPacketFacts.recordCASRejected.
 func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok recordTx, sid string, cc *ConsumerConfig) bool {
+	if h := mqttTestDeferredDeleteHookV.Load(); h != nil {
+		(*h)(sid, cc.Durable)
+	}
 	c.mu.Lock()
 	sub := c.subs[cc.DeliverSubject]
 	c.mu.Unlock()

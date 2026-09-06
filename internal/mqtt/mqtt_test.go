@@ -5576,3 +5576,1190 @@ func BenchmarkMQTT_QoS1_PubSub2_256b_Payload(b *testing.B) {
 func BenchmarkMQTT_QoS1_PubSub2___1K_Payload(b *testing.B) {
 	mqttBenchPubQoS1(b, mqttPubSubj, sizedString(1024), 2)
 }
+
+// ---------------------------------------------------------------------------
+// A duplicate plain filter that downgrades and then upgrades in ONE SUBSCRIBE
+// packet. docs/ROADMAP.md's "closed-but-present delivery subscription under a
+// live cons[sid]"; mechanism in docs/ARCHITECTURE.md under the deferred
+// teardown.
+//
+// Every membership and consumer assertion below uses NATS SUBJECTS, not wire
+// filters: the parser converts before processSubs sees the packet, so a
+// wildcard's sids are "foo.>" and "foo fwc". An assertion on Cons["foo/#"]
+// would fail against correct code.
+// ---------------------------------------------------------------------------
+
+// testSubRevokeWrittenRecords collects the RECORD AS WRITTEN for every landed session-record
+// write of one session, in order.
+//
+// The oracle is the marshalled payload, never sess.cancelledRegNonces or sess.subs:
+// saveWithDetail marshals and RELEASES sess.mu before it stores, so the live maps read from
+// the result hook are not what was written. Reading the record back instead is not an
+// option — a JetStream read issued from inside the write's own completion blocks the packet
+// making it, which this fixture demonstrated before it took this shape.
+//
+// The two hooks are a pair: the body hook says what these bytes are, the result hook says
+// they landed. Both run on broker goroutines, so nothing here calls t.Fatal.
+type testSubRevokeWrittenRecords struct {
+	mu      sync.Mutex
+	sess    *mqttSession
+	pending []byte
+	records []*mqttPersistedSession
+	err     error
+	stop    func() bool // when it returns true, later writes are ignored
+}
+
+// armWrittenRecords, not "install": TestParallelTestsTouchNoProcessGlobalState resolves
+// call chains BY FUNCTION NAME, so a helper sharing a name with one another package file
+// already uses makes that file's parallel tests look like they reach this file's global
+// seams. The distinct name is what keeps that guard's report about real reachability.
+func (w *testSubRevokeWrittenRecords) armWrittenRecords(sess *mqttSession) func() {
+	w.sess = sess
+	restoreBody := setMQTTTestSessRecordBodyHook(func(ss *mqttSession, body []byte) {
+		if ss != w.sess {
+			return
+		}
+		w.mu.Lock()
+		w.pending = append([]byte(nil), body...)
+		w.mu.Unlock()
+	})
+	restoreResult := setMQTTTestSessStoreResultHook(func(ss *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+		if ss != w.sess || err != nil {
+			return resp, err
+		}
+		if w.stop != nil && w.stop() {
+			return resp, err
+		}
+		w.mu.Lock()
+		body := w.pending
+		w.pending = nil
+		if len(body) == 0 {
+			w.err = fmt.Errorf("a session write landed with no marshalled body observed")
+		} else {
+			ps := &mqttPersistedSession{}
+			if uerr := json.Unmarshal(body, ps); uerr != nil {
+				w.err = uerr
+			} else {
+				w.records = append(w.records, ps)
+			}
+		}
+		w.mu.Unlock()
+		return resp, err
+	})
+	return func() { restoreResult(); restoreBody() }
+}
+
+func (w *testSubRevokeWrittenRecords) landed() ([]*mqttPersistedSession, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.records, w.err
+}
+
+// carriesNonce reports whether a written record names one register nonce as cancelled.
+func carriesNonce(ps *mqttPersistedSession, nonce string) bool {
+	for _, n := range ps.CancelledRegs {
+		if n == nonce {
+			return true
+		}
+	}
+	return false
+}
+
+// testSubRevokeSession returns the live session behind a connected client id.
+func testSubRevokeSession(t testing.TB, s *Server, clientID string) *mqttSession {
+	t.Helper()
+	mc := testMQTTGetClient(t, s, clientID)
+	mc.mu.Lock()
+	sess := mc.mqtt.sess
+	mc.mu.Unlock()
+	if sess == nil {
+		t.Fatalf("no session for %q", clientID)
+	}
+	return sess
+}
+
+// testSubRevokeConsumerLives reports whether a plain durable is still on the messages
+// stream. The record can name a durable that no longer exists, which is half of this
+// item's defect, so the two are asserted separately and never one from the other.
+func testSubRevokeConsumerLives(t testing.TB, sess *mqttSession, durable string) bool {
+	t.Helper()
+	ci, err := sess.jsa.lookupConsumer(mqttStreamName, durable)
+	if err != nil {
+		if isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			t.Fatalf("lookup consumer %q: %v", durable, err)
+		}
+		return false
+	}
+	return ci != nil
+}
+
+// TestMQTTSubDuplicateFilterDowngradeThenUpgradeKeepsDelivering is the headline case.
+//
+// One packet carries "foo" at QoS 0 and then at QoS 1. [MQTT-3.8.4-4] makes that a
+// sequence of subscriptions with one SUBACK, and [MQTT-3.8.4-3] makes the second entry
+// replace the first, so the required end state is one subscription at QoS 1 with its
+// consumer intact and delivering. Before the revocation the client was granted QoS 1 and
+// then received nothing for the rest of the connection, while the record named a durable
+// the packet went on to delete.
+func TestMQTTSubDuplicateFilterDowngradeThenUpgradeKeepsDelivering(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// A TRANSMITTED, unacknowledged QoS 1 delivery. The staging records a void verdict
+	// on its register rather than cancelling it, and that verdict — durable, in
+	// CancelledRegs — is what the revocation must withdraw: it says the client was never
+	// sent this message, and licenses reuse of an identifier the client is holding.
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("held"))
+	heldPI := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("held"))
+
+	sess := testSubRevokeSession(t, s, "sub")
+	sess.mu.Lock()
+	preCfg := sess.cons["foo"]
+	var heldNonce string
+	var heldTransmitted bool
+	if ack := sess.pendingPublish[heldPI]; ack != nil {
+		heldNonce, heldTransmitted = ack.regNonce, !ack.regPending
+	}
+	sess.mu.Unlock()
+	if preCfg == nil {
+		t.Fatal("the QoS 1 subscribe must leave a consumer in sess.cons")
+	}
+	if heldNonce == _EMPTY_ || !heldTransmitted {
+		t.Fatalf("the held delivery must carry a CONFIRMED register: without one the staging "+
+			"cancels rather than voids and the un-void assertion below is vacuous "+
+			"(nonce=%q transmitted=%v)", heldNonce, heldTransmitted)
+	}
+
+	// One packet, two occurrences of the same filter. The SUBACK reports each occurrence.
+	testMQTTSub(t, 2, c, r, []*mqttFilter{{filter: "foo", qos: 0}, {filter: "foo", qos: 1}}, []byte{0, 1})
+	testMQTTFlush(t, c, nil, r)
+
+	sess.mu.Lock()
+	postCfg := sess.cons["foo"]
+	sess.mu.Unlock()
+	if postCfg != preCfg {
+		t.Fatalf("the pre-packet consumer must survive the packet, got %v", postCfg)
+	}
+	if !testSubRevokeConsumerLives(t, sess, preCfg.Durable) {
+		t.Fatalf("durable %q was deleted: the packet granted QoS 1 and then destroyed the "+
+			"consumer that serves it", preCfg.Durable)
+	}
+
+	asm := testMQTTGetAccountSessionManager(t, s, "sub")
+	ps, _ := testReconcileRecord(t, asm, "sub")
+	if ps.Subs["foo"] != 1 {
+		t.Fatalf("the record must end at the LAST occurrence's QoS, got %v", ps.Subs["foo"])
+	}
+	if rc := ps.Cons["foo"]; rc == nil || rc.Durable != preCfg.Durable {
+		t.Fatalf("the record must name the surviving durable, got %v", rc)
+	}
+	for _, n := range ps.CancelledRegs {
+		if n == heldNonce {
+			t.Fatal("the staged void verdict on a TRANSMITTED delivery must be withdrawn " +
+				"durably: left standing it says the client never saw a message it is " +
+				"holding, and licenses reuse of that identifier")
+		}
+	}
+
+	// Delivery, under the last occurrence's terms.
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 2, []byte("after"))
+	afterPI := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("after"))
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, afterPI)
+
+	// And the held exchange still completes. Its COMPLETION is the assertion, not an
+	// AckWait redelivery: the default AckWait is 30s, and shortening it to force a
+	// redelivery here would make the schedule timing-dependent for no extra claim — the
+	// message was never lost, so acknowledging it is what proves the exchange survived.
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, heldPI)
+	testMQTTFlush(t, c, nil, r)
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if len(sess.pendingPublish) != 0 {
+			return fmt.Errorf("still %d pending publishes", len(sess.pendingPublish))
+		}
+		return nil
+	})
+}
+
+// TestMQTTSubDuplicateFilterDowngradeThenUpgradeWildcardBothHalves is the same packet with
+// a multi-level wildcard, which owns TWO sids and therefore reproduces the defect twice:
+// the main "foo.>" and the level-up companion "foo fwc" each have their own staging site
+// and their own refresh arm.
+func TestMQTTSubDuplicateFilterDowngradeThenUpgradeWildcardBothHalves(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo/#", qos: 1}}, []byte{1})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	sess := testSubRevokeSession(t, s, "sub")
+	sess.mu.Lock()
+	mainCfg, fwcCfg := sess.cons["foo.>"], sess.cons["foo fwc"]
+	sess.mu.Unlock()
+	if mainCfg == nil || fwcCfg == nil {
+		t.Fatalf("a multi-level filter owns two consumers, got main=%v fwc=%v", mainCfg, fwcCfg)
+	}
+
+	testMQTTSub(t, 2, c, r, []*mqttFilter{{filter: "foo/#", qos: 0}, {filter: "foo/#", qos: 1}}, []byte{0, 1})
+	testMQTTFlush(t, c, nil, r)
+
+	sess.mu.Lock()
+	postMain, postFwc := sess.cons["foo.>"], sess.cons["foo fwc"]
+	sess.mu.Unlock()
+	if postMain != mainCfg || postFwc != fwcCfg {
+		t.Fatalf("both halves' consumers must survive, got main=%v fwc=%v", postMain, postFwc)
+	}
+	for _, cfg := range []*ConsumerConfig{mainCfg, fwcCfg} {
+		if !testSubRevokeConsumerLives(t, sess, cfg.Durable) {
+			t.Fatalf("durable %q was deleted", cfg.Durable)
+		}
+	}
+
+	asm := testMQTTGetAccountSessionManager(t, s, "sub")
+	ps, _ := testReconcileRecord(t, asm, "sub")
+	if ps.Subs["foo.>"] != 1 {
+		t.Fatalf("the record must end at QoS 1, got %v", ps.Subs["foo.>"])
+	}
+	if rc := ps.Cons["foo.>"]; rc == nil || rc.Durable != mainCfg.Durable {
+		t.Fatalf("the record must name the main durable, got %v", rc)
+	}
+	if rc := ps.Cons["foo fwc"]; rc == nil || rc.Durable != fwcCfg.Durable {
+		t.Fatalf("the record must name the companion durable, got %v", rc)
+	}
+
+	// Both routes deliver at QoS 1: "foo/bar" through the main sid, "foo" through the
+	// level-up companion.
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo/bar", 1, []byte("deep"))
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, "foo/bar", mqttPubQos1, []byte("deep"))
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 2, []byte("top"))
+	pi = testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("top"))
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+}
+
+// TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes is the regression guard in the
+// other direction: [{foo,1},{foo,0}] ends at QoS 0 and the durable must go.
+//
+// It also asserts Cons["foo"] is STILL PRESENT in the record. That is a SEPARATE,
+// pre-existing defect — buildPersistedSessionLocked keys Cons on membership PRESENCE, not
+// positive QoS, so every ordinary QoS 1 -> 0 downgrade persists a consumer reference and
+// then deletes the durable — filed as its own roadmap bullet. Pinned here rather than left
+// silent, so the day it is fixed this assertion is what flags the change.
+func TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+
+	sess := testSubRevokeSession(t, s, "sub")
+	sess.mu.Lock()
+	preCfg := sess.cons["foo"]
+	sess.mu.Unlock()
+	if preCfg == nil {
+		t.Fatal("the QoS 1 subscribe must leave a consumer in sess.cons")
+	}
+
+	testMQTTSub(t, 2, c, r, []*mqttFilter{{filter: "foo", qos: 1}, {filter: "foo", qos: 0}}, []byte{1, 0})
+	testMQTTFlush(t, c, nil, r)
+
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if testSubRevokeConsumerLives(t, sess, preCfg.Durable) {
+			return fmt.Errorf("durable %q still exists", preCfg.Durable)
+		}
+		return nil
+	})
+	sess.mu.Lock()
+	live := sess.cons["foo"]
+	sess.mu.Unlock()
+	if live != nil {
+		t.Fatalf("a downgrade that STANDS must drop the cons entry, got %v", live)
+	}
+
+	asm := testMQTTGetAccountSessionManager(t, s, "sub")
+	ps, _ := testReconcileRecord(t, asm, "sub")
+	if ps.Subs["foo"] != 0 {
+		t.Fatalf("the record must end at QoS 0, got %v", ps.Subs["foo"])
+	}
+	if ps.Cons["foo"] == nil {
+		t.Fatal("EXPECTED FAILURE POINT: the record's stale Cons entry for a QoS 0 " +
+			"membership is a separate filed defect, asserted here as evidence rather " +
+			"than hidden. If this fires, that defect was fixed and this assertion is " +
+			"what must be updated")
+	}
+}
+
+// TestMQTTSubDuplicateFilterRepeatedDowngradeDeletesOnce pins the at-most-one-live-staging
+// invariant. [{foo,0},{foo,0}] appended TWO entries for one config at HEAD and ran the
+// irreversible teardown twice; the second run is silent in every observable state, which is
+// why the assertion counts executions.
+func TestMQTTSubDuplicateFilterRepeatedDowngradeDeletesOnce(t *testing.T) {
+	// NOT parallel: it installs a PROCESS-GLOBAL seam. A parallel sibling installing the
+	// same one replaces the pointer, and the loss is silent — the counter simply reads
+	// zero, which is indistinguishable from the behaviour this test would fail on.
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+
+	sess := testSubRevokeSession(t, s, "sub")
+	sess.mu.Lock()
+	preCfg := sess.cons["foo"]
+	sess.mu.Unlock()
+	if preCfg == nil {
+		t.Fatal("the QoS 1 subscribe must leave a consumer in sess.cons")
+	}
+
+	var mu sync.Mutex
+	execs := 0
+	restore := setMQTTTestDeferredDeleteHook(func(_, durable string) {
+		if durable != preCfg.Durable {
+			return
+		}
+		mu.Lock()
+		execs++
+		mu.Unlock()
+	})
+	defer restore()
+
+	testMQTTSub(t, 2, c, r, []*mqttFilter{{filter: "foo", qos: 0}, {filter: "foo", qos: 0}}, []byte{0, 0})
+	testMQTTFlush(t, c, nil, r)
+
+	mu.Lock()
+	got := execs
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("one consumer, one irreversible teardown; ran %d times", got)
+	}
+
+	t.Run("downgrade upgrade downgrade", func(t *testing.T) {
+		ci2 := &mqttConnInfo{clientID: "sub2", cleanSess: true}
+		c2, r2 := testMQTTConnect(t, ci2, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, false)
+		testMQTTSub(t, 1, c2, r2, []*mqttFilter{{filter: "bar", qos: 1}}, []byte{1})
+
+		sess2 := testSubRevokeSession(t, s, "sub2")
+		sess2.mu.Lock()
+		cfg2 := sess2.cons["bar"]
+		sess2.mu.Unlock()
+		if cfg2 == nil {
+			t.Fatal("the QoS 1 subscribe must leave a consumer in sess.cons")
+		}
+
+		var mu2 sync.Mutex
+		execs2 := 0
+		restore2 := setMQTTTestDeferredDeleteHook(func(_, durable string) {
+			if durable != cfg2.Durable {
+				return
+			}
+			mu2.Lock()
+			execs2++
+			mu2.Unlock()
+		})
+		defer restore2()
+
+		testMQTTSub(t, 2, c2, r2, []*mqttFilter{
+			{filter: "bar", qos: 0}, {filter: "bar", qos: 1}, {filter: "bar", qos: 0},
+		}, []byte{0, 1, 0})
+		testMQTTFlush(t, c2, nil, r2)
+
+		mu2.Lock()
+		got2 := execs2
+		mu2.Unlock()
+		if got2 != 1 {
+			t.Fatalf("a revoked staging that is staged again is still ONE teardown; ran %d times", got2)
+		}
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if testSubRevokeConsumerLives(t, sess2, cfg2.Durable) {
+				return fmt.Errorf("durable %q still exists", cfg2.Durable)
+			}
+			return nil
+		})
+		asm := testMQTTGetAccountSessionManager(t, s, "sub2")
+		ps, _ := testReconcileRecord(t, asm, "sub2")
+		if ps.Subs["bar"] != 0 {
+			t.Fatalf("the record must end at the LAST occurrence's QoS 0, got %v", ps.Subs["bar"])
+		}
+	})
+}
+
+// TestMQTTDeferredDelRevokeRefusesUnreadyDelivery is a UNIT test on the readiness
+// predicate, under a SYNTHESIZED state. It claims nothing about production reachability:
+// for a live entry this packet created, "cons[sid] present and its delivery subscription
+// closed" has no producer other than that packet's own staging. Refusing is the point —
+// granting a QoS the broker cannot serve is the defect, not a lesser form of it.
+func TestMQTTDeferredDelRevokeRefusesUnreadyDelivery(t *testing.T) {
+	_, c, sess, _ := drainTestSession(t, "revoke-unready")
+
+	const sid = "foo"
+	cfg := &ConsumerConfig{Durable: "dur-revoke-unready", DeliverSubject: mqttSubPrefix + "dur-revoke-unready"}
+	staged := &subscription{mqtt: &mqttSub{closed: true, jsDur: cfg.Durable}}
+
+	// The internal account client this session is built on has no subscription map
+	// until it takes one, and the predicate reads c.subs.
+	c.mu.Lock()
+	if c.subs == nil {
+		c.subs = make(map[string]*subscription)
+	}
+	c.mu.Unlock()
+
+	install := func(inCons *ConsumerConfig, inSubs *subscription) {
+		sess.mu.Lock()
+		if sess.cons == nil {
+			sess.cons = make(map[string]*ConsumerConfig)
+		}
+		if inCons == nil {
+			delete(sess.cons, sid)
+		} else {
+			sess.cons[sid] = inCons
+		}
+		sess.mu.Unlock()
+		c.mu.Lock()
+		if inSubs == nil {
+			delete(c.subs, cfg.DeliverSubject)
+		} else {
+			c.subs[cfg.DeliverSubject] = inSubs
+		}
+		c.mu.Unlock()
+	}
+
+	for _, tc := range []struct {
+		name   string
+		cons   *ConsumerConfig
+		subs   *subscription
+		closed *subscription
+	}{
+		{
+			name:   "the installed subscription is no longer the one whose barrier we hold",
+			cons:   cfg,
+			subs:   &subscription{mqtt: &mqttSub{}},
+			closed: staged,
+		},
+		{
+			name:   "no barrier was ever lowered",
+			cons:   cfg,
+			subs:   staged,
+			closed: nil,
+		},
+		{
+			name:   "the session's consumer for this sid moved",
+			cons:   &ConsumerConfig{Durable: "dur-other", DeliverSubject: cfg.DeliverSubject},
+			subs:   staged,
+			closed: staged,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			install(tc.cons, tc.subs)
+			dd := &mqttDeferredDel{sid: sid, cc: cfg, closed: tc.closed}
+			sess.mu.Lock()
+			err := dd.revokeLocked(c, sess, 1, false, false, 0)
+			sess.mu.Unlock()
+			if err == nil {
+				t.Fatal("readiness that cannot be established must REFUSE, so the filter " +
+					"fails 0x80 and the deferral stands")
+			}
+			if dd.revoked {
+				t.Fatal("a refused revocation must leave the staging live, or the packet " +
+					"ends with neither a teardown nor a delivering consumer")
+			}
+			if tc.closed != nil && !tc.closed.mqtt.closed {
+				t.Fatal("a refused revocation must not reopen the barrier")
+			}
+		})
+	}
+}
+
+// testMQTTSendSubOnly writes a SUBSCRIBE and does NOT read its SUBACK. A test whose packet
+// transmits a PUBLISH before it completes must read the wire itself, in arrival order.
+func testMQTTSendSubOnly(t testing.TB, pi uint16, c net.Conn, filters []*mqttFilter) {
+	t.Helper()
+	w := newMQTTWriter(0)
+	pkLen := 2
+	for _, f := range filters {
+		pkLen += 2 + len(f.filter) + 1
+	}
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(pkLen)
+	w.WriteUint16(pi)
+	for _, f := range filters {
+		w.WriteBytes([]byte(f.filter))
+		w.WriteByte(f.qos)
+	}
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing SUBSCRIBE protocol: %v", err)
+	}
+}
+
+// testMQTTReadSubAckTolerantOfPubs reads until the SUBACK for pi, acknowledging any
+// PUBLISH that arrives first.
+//
+// Whether a delivery started inside the packet reaches the wire at all is NOT determined:
+// a re-staged downgrade withdraws a registration that is still pending, so the same
+// message is transmitted on one run and cancelled before transmission on another. Both are
+// correct, and both leave the assertion this test makes — the nonce in the packet's own
+// membership-removal write — unchanged, so the reader must not demand either.
+func testMQTTReadSubAckTolerantOfPubs(t testing.TB, c net.Conn, r *mqttReader, pi uint16) []byte {
+	t.Helper()
+	var codes []byte
+	for {
+		b, pl := testMQTTReadPacket(t, r)
+		switch b & mqttPacketMask {
+		case mqttPacketPub:
+			_, ppi, _, _ := testMQTTGetPubMsgExEx(t, c, r, b, pl, _EMPTY_, nil)
+			if mqttGetQoS(b&mqttPacketFlagMask) > 0 {
+				testMQTTSendPIPacket(mqttPacketPubAck, t, c, ppi)
+			}
+		case mqttPacketSubAck:
+			rpi, err := r.readUint16("packet identifier")
+			if err != nil || rpi != pi {
+				t.Fatalf("Error with packet identifier expected=%v got: %v err=%v", pi, rpi, err)
+			}
+			for rem := pl - 2; rem > 0; rem-- {
+				qos, err := r.readByte("filter qos")
+				if err != nil {
+					t.Fatal(err)
+				}
+				codes = append(codes, qos)
+			}
+			return codes
+		default:
+			t.Fatalf("unexpected packet %x while waiting for the SUBACK", b&mqttPacketMask)
+		}
+	}
+}
+
+// testMQTTReadPubAndSubAck reads until it has seen BOTH one PUBLISH and the SUBACK for pi,
+// in whichever order they arrive.
+//
+// A packet that transmits a PUBLISH from inside its own processing puts two writes on the
+// wire with no ordering between them: the delivery is written by the callback's goroutine
+// while the SUBACK is written by the read loop once the packet completes. Asserting either
+// order is a flake, and it showed up as one — the first form of these tests read the
+// PUBLISH first and failed under -race, which merely made the read loop slower.
+func testMQTTReadPubAndSubAck(t testing.TB, c net.Conn, r *mqttReader, pi uint16,
+	topic string, payload []byte) (byte, uint16, []byte) {
+	t.Helper()
+	var pflags byte
+	var ppi uint16
+	var codes []byte
+	gotPub, gotAck := false, false
+	for !gotPub || !gotAck {
+		b, pl := testMQTTReadPacket(t, r)
+		switch b & mqttPacketMask {
+		case mqttPacketPub:
+			if gotPub {
+				t.Fatalf("a second PUBLISH arrived; the schedule expects exactly one")
+			}
+			pflags, ppi, _, _ = testMQTTGetPubMsgExEx(t, c, r, b, pl, topic, payload)
+			gotPub = true
+		case mqttPacketSubAck:
+			rpi, err := r.readUint16("packet identifier")
+			if err != nil || rpi != pi {
+				t.Fatalf("Error with packet identifier expected=%v got: %v err=%v", pi, rpi, err)
+			}
+			for rem := pl - 2; rem > 0; rem-- {
+				qos, err := r.readByte("filter qos")
+				if err != nil {
+					t.Fatal(err)
+				}
+				codes = append(codes, qos)
+			}
+			gotAck = true
+		default:
+			t.Fatalf("unexpected packet %x while waiting for the PUBLISH and the SUBACK", b&mqttPacketMask)
+		}
+	}
+	return pflags, ppi, codes
+}
+
+// TestMQTTSubDuplicateFilterRevocationInstallsTheTermsWithTheReopen pins the one ordering
+// constraint the design makes: the barrier, the terms and the un-void move in ONE critical
+// section. Splitting them would let a delivery dispatched in between go out at the
+// PRE-PACKET QoS — here a QoS 2 PUBLISH under a QoS 1 grant [MQTT-3.8.4-8].
+//
+// A post-SUBACK publication cannot see that, because the existing-consumer refresh arm
+// re-applies the same four fields immediately afterwards. So the schedule runs INSIDE the
+// packet, between the revocation and that refresh.
+func TestMQTTSubDuplicateFilterRevocationInstallsTheTermsWithTheReopen(t *testing.T) {
+	// NOT parallel: process-global seams, see the note on the repeated-downgrade test.
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	// QoS 2 before the packet, so a stale-terms transmission is visible as a QoS 2
+	// PUBLISH rather than as a missing one.
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 2}}, []byte{2})
+
+	sess := testSubRevokeSession(t, s, "sub")
+	sess.mu.Lock()
+	preCfg := sess.cons["foo"]
+	sess.mu.Unlock()
+	if preCfg == nil {
+		t.Fatal("the QoS 2 subscribe must leave a consumer in sess.cons")
+	}
+
+	var mu sync.Mutex
+	var skippedReply string
+	var sawSkip bool
+	restoreSkip := setMQTTTestDeliverySkippedHook(func(sub *subscription, reply string) {
+		if sub == nil || sub.mqtt == nil || sub.mqtt.jsDur != preCfg.Durable {
+			return
+		}
+		mu.Lock()
+		if !sawSkip {
+			sawSkip, skippedReply = true, reply
+		}
+		mu.Unlock()
+	})
+	defer restoreSkip()
+
+	// storeErr and scheduleErr are written inside the pause, which runs on the client's
+	// READ LOOP, and read on the test goroutine afterwards. The socket traffic between
+	// them is not a happens-before edge, so they take the same mutex as sawSkip.
+	var storeErr, scheduleErr error
+	fail := func(err error, schedule bool) {
+		mu.Lock()
+		if schedule {
+			scheduleErr = err
+		} else {
+			storeErr = err
+		}
+		mu.Unlock()
+	}
+	restorePause := setMQTTTestSubPause(func(at string) {
+		switch at {
+		case "staged:foo":
+			// The barrier is down and the packet is still running. An ordinary MQTT
+			// publication cannot reach the callback here — processSubs holds the subs
+			// barrier for the whole packet and a concurrent store waits on it — so the
+			// source is stored directly, with the MQTT publish header the delivery path
+			// requires.
+			hdr := fmt.Appendf(nil, "NATS/1.0\r\n%s:%d\r\n\r\n", mqttNatsHeader, 2)
+			full := append(append([]byte(nil), hdr...), []byte("q2")...)
+			if _, err := sess.jsa.storeMsg(mqttStreamSubjectPrefix+"foo", len(hdr), full); err != nil {
+				fail(err, false)
+				return
+			}
+			// Wait for the skip POSITIVELY. Its absence would be indistinguishable from
+			// a delivery that never arrived.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				mu.Lock()
+				got := sawSkip
+				mu.Unlock()
+				if got {
+					return
+				}
+				if time.Now().After(deadline) {
+					fail(fmt.Errorf("the delivery was never skipped by the closed arm"), true)
+					return
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		case "revoked:foo":
+			// The revocation has installed its terms; the refresh arm has NOT run yet.
+			// Re-offer the skipped sequence by NAKing it explicitly, so the re-delivery
+			// is scheduled by this test rather than by an AckWait expiry.
+			mu.Lock()
+			reply := skippedReply
+			mu.Unlock()
+			if reply == _EMPTY_ {
+				fail(fmt.Errorf("no ack reply subject was captured for the skipped delivery"), true)
+				return
+			}
+			sess.jsa.sendMsg(reply, AckNak)
+			// The transmission must happen while this pause is HELD, or a mutation that
+			// moves the term application after it would be masked by the refresh arm.
+			// trackPublish allocating a packet identifier is that transmission.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				sess.mu.Lock()
+				n := len(sess.pendingPublish)
+				sess.mu.Unlock()
+				if n > 0 {
+					return
+				}
+				if time.Now().After(deadline) {
+					fail(fmt.Errorf("the re-offered delivery was never transmitted inside the pause"), true)
+					return
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	})
+	defer restorePause()
+
+	testMQTTSendSubOnly(t, 2, c, []*mqttFilter{{filter: "foo", qos: 0}, {filter: "foo", qos: 1}})
+
+	// The re-offer is transmitted inside the packet, so it reaches the wire first.
+	// Receipt is REQUIRED: a timeout here is a failure of the test, and the comparison
+	// below is between two deliveries that both happened, never between one and silence.
+	pflags, pi, codes := testMQTTReadPubAndSubAck(t, c, r, 2, "foo", []byte("q2"))
+	mu.Lock()
+	serr, sched := storeErr, scheduleErr
+	mu.Unlock()
+	if serr != nil {
+		t.Fatalf("storing the QoS 2 source: %v", serr)
+	}
+	if sched != nil {
+		t.Fatalf("the schedule did not reach the state it names: %v", sched)
+	}
+	if got := mqttGetQoS(pflags); got != 1 {
+		t.Fatalf("the delivery must go out at THIS occurrence's QoS 1, got %d: the terms "+
+			"and the reopen are one critical section, and a split sends under the "+
+			"pre-packet grant", got)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+
+	if len(codes) != 2 || codes[0] != 0 || codes[1] != 1 {
+		t.Fatalf("expected SUBACK [0x00 0x01], got %v", codes)
+	}
+}
+
+// TestMQTTSubDuplicateFilterRevivedFilterFailureRestagesTheDowngrade covers the reviver's
+// own failure. sess.update skips a failed filter, so the earlier QoS 0 occurrence's
+// membership stands and the downgrade is owed AGAIN.
+//
+// Re-staging goes through the same helper rather than restoring the saved barrier and
+// verdicts, because the interval between the revocation and the failure had LIVE delivery:
+// a registration allocated there is withdrawn only by a fresh snapshot, and its
+// cancellation belongs in the packet's OWN membership-removal write. That write is the
+// assertion — a post-execution check is worthless, because the teardown's own purge would
+// re-find and secure the same registration.
+func TestMQTTSubDuplicateFilterRevivedFilterFailureRestagesTheDowngrade(t *testing.T) {
+	// NOT parallel: process-global seams, see the note on the repeated-downgrade test.
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+
+	sess := testSubRevokeSession(t, s, "sub")
+	asm := testMQTTGetAccountSessionManager(t, s, "sub")
+	sess.mu.Lock()
+	preCfg := sess.cons["foo"]
+	sess.mu.Unlock()
+	if preCfg == nil {
+		t.Fatal("the QoS 1 subscribe must leave a consumer in sess.cons")
+	}
+
+	var mu sync.Mutex
+	var intervalNonce string
+	var intervalPI uint16
+	var sawPending bool
+	// Written on the read loop inside the pause, read on the test goroutine: guarded,
+	// for the same reason as test 3's.
+	var scheduleErr error
+	// The point the deferred teardown starts running. Only a record written BEFORE it is
+	// evidence about the packet's own write, because the teardown's own purge secures the
+	// same registration again and would mask a re-stage that lost it.
+	execStarted := false
+
+	// Hold the interval registration's STORE, so the allocation is still regPending when
+	// the re-stage runs. That is the branch the plan names: the cancellation must remove
+	// the allocation, park its tombstone in the packet's write, and survive the store
+	// completing afterwards. A confirmed register would exercise only the weaker
+	// transmitted-void branch.
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStore := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseStore()
+	// Released the moment the re-stage has CANCELLED the allocation, not later: the
+	// packet's own commit path waits on the register store to settle before it can
+	// secure that cancellation, so holding it past the re-stage wedges the packet
+	// rather than testing it. Watching for regCancelled makes the ordering exact — the
+	// cancellation is observed first, the store completes afterwards — where a sleep
+	// would only make it likely.
+	watchDone := make(chan struct{})
+	defer func() { <-watchDone }()
+	go func() {
+		defer close(watchDone)
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			pi, seen := intervalPI, sawPending
+			mu.Unlock()
+			if seen {
+				sess.mu.Lock()
+				ack := sess.pendingPublish[pi]
+				cancelled := ack != nil && ack.regCancelled
+				sess.mu.Unlock()
+				if cancelled {
+					break
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		releaseStore()
+	}()
+	asm.mu.Lock()
+	asm.testInflightStore = func(subject string, expectSeq uint64, rec *mqttInflightRecord) (uint64, error) {
+		if strings.Contains(subject, sess.idHash) {
+			<-release
+		}
+		return asm.jsa.storeInflightCAS(subject, expectSeq, rec)
+	}
+	asm.mu.Unlock()
+	defer func() {
+		asm.mu.Lock()
+		asm.testInflightStore = nil
+		asm.mu.Unlock()
+	}()
+
+	restorePause := setMQTTTestSubPause(func(at string) {
+		if at != "revoked:foo" {
+			return
+		}
+		// The barrier is open again. Put a message through it, so a FRESH registration
+		// exists that the saved snapshot cannot know about.
+		hdr := fmt.Appendf(nil, "NATS/1.0\r\n%s:%d\r\n\r\n", mqttNatsHeader, 1)
+		full := append(append([]byte(nil), hdr...), []byte("interval")...)
+		if _, err := sess.jsa.storeMsg(mqttStreamSubjectPrefix+"foo", len(hdr), full); err != nil {
+			mu.Lock()
+			scheduleErr = err
+			mu.Unlock()
+			return
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			sess.mu.Lock()
+			for pi, ack := range sess.pendingPublish {
+				// regPending is REQUIRED, not incidental: it is what makes this the
+				// allocated-but-not-yet-durable branch rather than the transmitted one.
+				if ack != nil && ack.regNonce != _EMPTY_ && ack.regPending {
+					mu.Lock()
+					intervalNonce, intervalPI, sawPending = ack.regNonce, pi, true
+					mu.Unlock()
+				}
+			}
+			sess.mu.Unlock()
+			mu.Lock()
+			got := intervalNonce
+			mu.Unlock()
+			if got != _EMPTY_ {
+				return
+			}
+			if time.Now().After(deadline) {
+				mu.Lock()
+				scheduleErr = fmt.Errorf("no PENDING registration was allocated in the reopened interval")
+				mu.Unlock()
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	})
+	defer restorePause()
+
+	written := &testSubRevokeWrittenRecords{stop: func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return execStarted
+	}}
+	defer written.armWrittenRecords(sess)()
+
+	restoreExec := setMQTTTestDeferredDeleteHook(func(_, durable string) {
+		if durable != preCfg.Durable {
+			return
+		}
+		mu.Lock()
+		execStarted = true
+		mu.Unlock()
+	})
+	defer restoreExec()
+
+	// Fail the "consumer" exit for sid "foo" on its SECOND call: that exit is reached by
+	// EVERY occurrence, and failing the first would cancel the downgrade before any
+	// revival exists.
+	calls := 0
+	asm.mu.Lock()
+	asm.testSubFilterFail = func(exit, sid string) error {
+		if exit != "consumer" || sid != "foo" {
+			return nil
+		}
+		calls++
+		if calls < 2 {
+			return nil
+		}
+		return fmt.Errorf("test: the reviving occurrence fails after adopting")
+	}
+	asm.mu.Unlock()
+	defer func() {
+		asm.mu.Lock()
+		asm.testSubFilterFail = nil
+		asm.mu.Unlock()
+	}()
+
+	// The interval message may or may not reach the wire, and if it does its order against
+	// the SUBACK is not determined, so the reader tolerates both.
+	testMQTTSendSubOnly(t, 2, c, []*mqttFilter{{filter: "foo", qos: 0}, {filter: "foo", qos: 1}})
+	codes := testMQTTReadSubAckTolerantOfPubs(t, c, r, 2)
+	if len(codes) != 2 || codes[0] != 0 || codes[1] != mqttSubAckFailure {
+		t.Fatalf("expected SUBACK [0x00 0x80], got %v", codes)
+	}
+	testMQTTFlush(t, c, nil, r)
+
+	mu.Lock()
+	sched := scheduleErr
+	nonce, pendingSeen, pi := intervalNonce, sawPending, intervalPI
+	mu.Unlock()
+	packetSaves, werr := written.landed()
+	if werr != nil {
+		t.Fatalf("collecting the written records: %v", werr)
+	}
+	if sched != nil {
+		t.Fatalf("the schedule did not reach the state it names: %v", sched)
+	}
+	if nonce == _EMPTY_ || !pendingSeen {
+		t.Fatal("no PENDING registration was allocated in the reopened interval: the " +
+			"assertion below would be vacuous, and the branch it exists for unreached")
+	}
+	if len(packetSaves) == 0 {
+		t.Fatal("the packet issued no session record write before its deferred teardown ran")
+	}
+	last := packetSaves[len(packetSaves)-1]
+	if !carriesNonce(last, nonce) {
+		t.Fatalf("the registration allocated while the barrier was OPEN must be withdrawn "+
+			"into the packet's own membership-removal write: a re-stage that restores "+
+			"the saved snapshot cannot know about it, and the identifier it holds has "+
+			"nothing to recover it. Stored CancelledRegs=%v", last.CancelledRegs)
+	}
+	if last.Subs["foo"] != 0 {
+		t.Fatalf("that same write must carry the QoS 0 membership the failed reviver left "+
+			"standing, got %v", last.Subs["foo"])
+	}
+
+	// The held store was released the moment the cancellation was observed, so its
+	// completion lands on an allocation that is already cancelled. It must not resurrect
+	// it: a settled-but-cancelled entry is either dropped or left parked, never handed
+	// back as sendable.
+	releaseStore()
+	checkFor(t, 3*time.Second, 15*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		ack := sess.pendingPublish[pi]
+		if ack == nil {
+			return nil
+		}
+		if ack.regPending {
+			return fmt.Errorf("the held register store has not settled yet")
+		}
+		if !ack.regCancelled {
+			return fmt.Errorf("a late store completion resurrected a CANCELLED allocation")
+		}
+		return nil
+	})
+
+	// And the end state: the downgrade stands, so the durable goes.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if testSubRevokeConsumerLives(t, sess, preCfg.Durable) {
+			return fmt.Errorf("durable %q still exists: the re-stage never happened", preCfg.Durable)
+		}
+		return nil
+	})
+	ps, _ := testReconcileRecord(t, asm, "sub")
+	if ps.Subs["foo"] != 0 {
+		t.Fatalf("a failed reviving occurrence leaves the QoS 0 membership standing, got %v", ps.Subs["foo"])
+	}
+	sess.mu.Lock()
+	live := sess.cons["foo"]
+	sess.mu.Unlock()
+	if live != nil {
+		t.Fatalf("the re-staged teardown must drop the cons entry, got %v", live)
+	}
+}
+
+// TestMQTTSubDuplicateFilterCompanionFailureRestagesBothHalves is the multi-half form: a
+// wildcard revokes on BOTH sids, and a companion-half failure after the main half revoked
+// owes a fresh staging for each.
+func TestMQTTSubDuplicateFilterCompanionFailureRestagesBothHalves(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo/#", qos: 1}}, []byte{1})
+
+	sess := testSubRevokeSession(t, s, "sub")
+	asm := testMQTTGetAccountSessionManager(t, s, "sub")
+	sess.mu.Lock()
+	mainCfg, fwcCfg := sess.cons["foo.>"], sess.cons["foo fwc"]
+	sess.mu.Unlock()
+	if mainCfg == nil || fwcCfg == nil {
+		t.Fatalf("a multi-level filter owns two consumers, got main=%v fwc=%v", mainCfg, fwcCfg)
+	}
+
+	calls := 0
+	asm.mu.Lock()
+	asm.testSubFilterFail = func(exit, sid string) error {
+		if exit != "consumer-fwc" || sid != "foo fwc" {
+			return nil
+		}
+		calls++
+		if calls < 2 {
+			return nil
+		}
+		return fmt.Errorf("test: the reviving occurrence's companion half fails")
+	}
+	asm.mu.Unlock()
+	defer func() {
+		asm.mu.Lock()
+		asm.testSubFilterFail = nil
+		asm.mu.Unlock()
+	}()
+
+	testMQTTSub(t, 2, c, r, []*mqttFilter{{filter: "foo/#", qos: 0}, {filter: "foo/#", qos: 1}},
+		[]byte{0, mqttSubAckFailure})
+	testMQTTFlush(t, c, nil, r)
+
+	// BOTH sids were revoked by the reviving filter, so both are owed a fresh staging.
+	for _, cfg := range []*ConsumerConfig{mainCfg, fwcCfg} {
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if testSubRevokeConsumerLives(t, sess, cfg.Durable) {
+				return fmt.Errorf("durable %q still exists", cfg.Durable)
+			}
+			return nil
+		})
+	}
+	ps, _ := testReconcileRecord(t, asm, "sub")
+	if ps.Subs["foo.>"] != 0 {
+		t.Fatalf("a failed reviving occurrence leaves the QoS 0 membership standing, got %v", ps.Subs["foo.>"])
+	}
+}
+
+// TestMQTTSubDuplicateFilterEarlySharedSavePersistsAVoidVerdictThenRevokes pins the
+// early-shared-save window in BOTH directions.
+//
+// A shared filter between the two occurrences persists the session record MID-LOOP, and
+// that record carries occurrence 1's void verdict on a TRANSMITTED register beside a
+// still-pre-packet plain membership. A crash there leaves a record saying a delivery the
+// client is holding was never transmitted. That exposure is PRE-EXISTING and this change
+// does not close it, so the first assertion pins it — a future change cannot widen it
+// unnoticed — and the second pins what the revocation does fix: the packet's own save
+// withdraws the verdict durably.
+//
+// MQTT 5 throughout, because shared subscriptions are a v5 feature: a 3.1.1 client's
+// "$share/g/bar" is an ordinary topic filter, which stages no early save at all and would
+// leave this test asserting nothing.
+func TestMQTTSubDuplicateFilterEarlySharedSavePersistsAVoidVerdictThenRevokes(t *testing.T) {
+	// NOT parallel: process-global seams, see the note on the repeated-downgrade test.
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "foo", opts: 1}}); len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("expected SUBACK [1], got %x", codes)
+	}
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	testMQTTPublishV5(t, cp, 1, 1, "foo", []byte("held"))
+	testMQTTReadPubAck(t, rp, 1)
+	_, heldPI, _ := testMQTTReadPubV5Raw(t, r, "foo", []byte("held"))
+
+	sess := testSubRevokeSession(t, s, "sub")
+	sess.mu.Lock()
+	var heldNonce string
+	var heldTransmitted bool
+	if ack := sess.pendingPublish[heldPI]; ack != nil {
+		heldNonce, heldTransmitted = ack.regNonce, !ack.regPending
+	}
+	sess.mu.Unlock()
+	if heldNonce == _EMPTY_ || !heldTransmitted {
+		t.Fatalf("the held delivery must carry a CONFIRMED register (nonce=%q transmitted=%v)",
+			heldNonce, heldTransmitted)
+	}
+
+	written := &testSubRevokeWrittenRecords{}
+	restoreSave := written.armWrittenRecords(sess)
+
+	// The shared filter between the two occurrences is what forces the mid-loop save.
+	codes := testMQTTSubV5(t, c, r, 2, []mqttV5SubFilter{
+		{topic: "foo", opts: 0}, {topic: "$share/g/bar", opts: 1}, {topic: "foo", opts: 1},
+	})
+	restoreSave()
+	if len(codes) != 3 || codes[0] != 0 || codes[1] != 1 || codes[2] != 1 {
+		t.Fatalf("expected SUBACK [0 1 1], got %x", codes)
+	}
+
+	got, werr := written.landed()
+	if werr != nil {
+		t.Fatalf("collecting the written records: %v", werr)
+	}
+	if len(got) < 2 {
+		t.Fatalf("expected an early shared-filter save and the packet's own save, got %d writes", len(got))
+	}
+	early, final := got[0], got[len(got)-1]
+	// The early save is the exposure: the void verdict is durable BESIDE a membership
+	// that is still the pre-packet one. Both halves are asserted, because it is the
+	// COMBINATION that makes a crash there incoherent.
+	if early.Subs["foo"] != 1 {
+		t.Fatalf("the early shared save must still carry the PRE-PACKET plain membership, "+
+			"got %v — without that the window this pins is not the one described", early.Subs["foo"])
+	}
+	if !carriesNonce(early, heldNonce) {
+		t.Fatal("EXPECTED FAILURE POINT: the early shared save carrying occurrence 1's void " +
+			"verdict is a PRE-EXISTING exposure this change does not close, asserted so a " +
+			"future change cannot widen it unnoticed. If this fires, that window was " +
+			"closed and this assertion is what must be updated")
+	}
+	if final.Subs["foo"] != 1 {
+		t.Fatalf("the packet's own save must end at the last occurrence's QoS 1, got %v", final.Subs["foo"])
+	}
+	if carriesNonce(final, heldNonce) {
+		t.Fatal("the packet's own save must carry the WITHDRAWN verdict: the revocation " +
+			"credits the un-void, so the exposure ends at the packet's commit rather " +
+			"than surviving to the next resume")
+	}
+}
