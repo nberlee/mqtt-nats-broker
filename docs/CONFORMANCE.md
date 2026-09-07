@@ -1376,10 +1376,10 @@ Residuals:
     and no reclaim — and both directions are fixed. See the exchange-QoS section of
     `docs/ARCHITECTURE.md` for the mechanism and for what it does **not** cover.
   - **A closed-but-present delivery subscription under a live `cons[sid]`.** A QoS 0
-    downgrade closes the delivery while deliberately keeping the consumer entry until
-    the confirmed save, so one SUBSCRIBE packet carrying the same filter at QoS 0 and
-    then at QoS 1 reaches the existing-consumer arm with a closed subscription and a
-    deferred delete still scheduled.
+    downgrade closes the delivery while deliberately keeping the consumer entry until the
+    packet's **final-update boundary** — later than any per-filter occurrence — so one
+    SUBSCRIBE packet carrying the same filter at QoS 0 and then at QoS 1 reaches the
+    existing-consumer arm with a closed subscription and a deferred delete still scheduled.
 - **Scope.** A drain survives because the brokers that read the `Drains` record field
   exclude its durable from the orphan sweep's candidates and hand it to teardown as
   this session's own — and that is every broker serving the account, since they all run
@@ -1470,6 +1470,38 @@ own PUBREL machinery. The membership at QoS 0 and the drain are written in **one
   confirmation and actual transmission are not equivalent; the exchanges preserved are
   the ones that classification enrols, and the existing transmission and DUP residuals
   stated elsewhere are retained rather than narrowed.
+- **A destroyed downgrade's durable is the orphan sweep's from the confirmed save.** The
+  consumer reference leaves `sess.cons` at the packet's final-update boundary, so that the
+  record carrying the QoS 0 membership does not name a durable the packet then deletes.
+  Between that save and the teardown the durable is named by neither the record nor the
+  session, so an orphan sweep may delete it first — including a **peer** broker's, whose
+  sparing pass cannot see another broker's resident sessions, and which no CAS fences. That
+  is accepted because every route into the window is destructive by construction: the
+  pending teardown is the one that would delete the same durable, so the sweep performs the
+  packet's own decision early. The acceptance is bounded to that population and does **not**
+  extend to an adopted or converted durable, whose exchanges are still owed and which the
+  record therefore names.
+- **On an AMBIGUOUS landed save the durable loses both prompt cleanup paths.** The packet
+  returns before its deferred-delete loop and a destructive downgrade registers no
+  continuation, so the record lands carrying the QoS 0 membership while the durable is still
+  alive and named nowhere. With the reference already gone from `sess.cons`, neither a
+  same-object reconnect nor a restore from the record reaches the existing-consumer arm, so
+  convergence is a **successful orphan sweep and nothing else**. Until it runs the durable
+  keeps its filter's messages on the interest-retained stream.
+  - **Convergence is demonstrated for a broker that is gone, up to a completed graceful
+    shutdown.** The cross-broker fixtures stop the owning broker, await its shutdown
+    lifecycle to completion, and reap from the peer — in both orderings, sweep before the
+    stop and stop before the sweep. An **abrupt** loss of the process is not exercised,
+    because it is not constructible in an in-process harness, so nothing here is claimed
+    about an ordering only an abrupt death produces.
+  - **The session's `MaxAckPending` charge IS recovered, by the resolution rather than by
+    the sweep.** Proving those bytes durable runs a refund-only landed continuation for
+    every released durable, so the resident session does not keep a charge no consumer of
+    its own can spend — a charge nothing gives back would cost a subscription slot for the
+    life of the session, refused at the aggregate ceiling. The continuation gives back the
+    charge and nothing else: no `Cons` entry returns, and the **durable** is still the
+    sweep's. A **forked** or **foreign** verdict discards the continuation, which is
+    correct, because the session is then being disposed of rather than kept.
 
 **One deliberate deviation.** When a replacement preserves an occupant's QoS and that
 occupant was in fact never transmitted, the resulting first transmission carries a QoS

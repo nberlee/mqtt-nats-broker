@@ -2115,3 +2115,139 @@ func TestForkRepairRefusesAFilterWithAQuarantinedSid(t *testing.T) {
 		t.Error("a refused repair must not leave the filter in the membership map")
 	}
 }
+
+// TestForkRepairAppliesADestroyedQoS0Downgrade is T12 of the consumer-release item.
+//
+// Fork repair's per-sid state comes from the RECORD's Cons and Drains presence, independent
+// of QoS (mqttGrantFromRecord). Before the release moved to the final-update boundary, a
+// destroyed downgrade left its consumer in the record, so the sid read `live` on BOTH sides
+// and applyGrantSidLocked took its live x live row — "the survivor's consumer config is
+// PRESERVED" — and the repaired session ended holding a cons entry for a QoS 0 membership.
+// That is the state sess_fork_repair.go:1035 names as the harm in the mirror direction: a
+// later re-SUBSCRIBE returns through processJSConsumer's existing-consumer arm without
+// rebuilding delivery interest, and the filter silently stops delivering.
+//
+// So the assertion is the TRANSITION — the merged session ends with the membership at QoS 0
+// and NO consumer for that sid — not the repair tally, which was already 1 either way.
+//
+// OUR record is produced through the production boundary helper rather than by poking the
+// map, because a fixture that writes the absence itself proves nothing about the boundary.
+func TestForkRepairAppliesADestroyedQoS0Downgrade(t *testing.T) {
+	t.Parallel()
+	const sid = "forkdg/a"
+	cc := &ConsumerConfig{Durable: "forkdg_durable", DeliverSubject: mqttSubPrefix + "forkdg"}
+
+	var releasedOK bool
+	e := testStageForkedGrant(t, "fork-qos0-downgrade",
+		func(s *mqttSession) {
+			// BASE: an ordinary QoS 1 subscription with its consumer.
+			s.subs = map[string]byte{sid: 1}
+			s.cons = map[string]*ConsumerConfig{sid: cc}
+		},
+		func(s *mqttSession) {
+			// OURS: the downgrade, driven through the PRODUCTION boundary helper — the
+			// membership goes to QoS 0 and releaseDowngradedConsumersLocked gives the entry
+			// up, exactly as the packet's final update does. Called with sess.mu held.
+			//
+			// FRESH MAPS, not in-place mutation. buildPersistedSessionLocked returns Subs
+			// and Cons BY REFERENCE, and the fixture kept the parent record it built from
+			// this same session — so mutating either map in place rewrites the parent
+			// snapshot too, and the "survivor" then carries our downgrade and reads as
+			// having decided the grant itself. The filter is counted a conflict and the
+			// repair never runs.
+			s.subs = map[string]byte{sid: 0}
+			s.cons = map[string]*ConsumerConfig{sid: cc}
+			releasedOK = s.releaseDowngradedConsumersLocked([]*mqttDeferredDel{{sid: sid, cc: cc}})
+		},
+		nil)
+	if !releasedOK {
+		t.Fatal("the fixture never reached the route it names: the production release must " +
+			"have taken the entry, or OUR record is not a boundary-produced one")
+	}
+
+	sess := e.reconnect(t)
+
+	terms := testSubsOf(t, sess)
+	got, present := terms[sid]
+	if !present || got.qos != 0 {
+		t.Fatalf("the merged session must carry the membership at QoS 0, got %+v (present %v)", got, present)
+	}
+	sess.mu.Lock()
+	live := sess.cons[sid]
+	ps := sess.buildPersistedSessionLocked()
+	sess.mu.Unlock()
+	if live != nil {
+		t.Fatalf("the repair must remove the survivor's in-memory consumer reference for a "+
+			"membership our branch downgraded to QoS 0, got %+v", live)
+	}
+	if rec := ps.Cons[sid]; rec != nil {
+		t.Fatalf("and the next record must not name it either, got %+v", rec)
+	}
+}
+
+// TestForkRepairConflictsWhenTheSurvivorDowngraded is T13, and it exists so a future change
+// cannot quietly turn a conflict into an applied repair on the strength of the new sid
+// shape.
+//
+// Two arms, and both must be CONFLICTS. The reason is the TERMS, not the sid:
+// mqttSurvivorDecidedGrant compares survivor.terms() against base.terms() FIRST and returns
+// there, and QoS 0 differs from QoS 1. The sid comparison could not decide it either way —
+// mqttSidShape has two values and deliberately does not distinguish "live consumer" from
+// "no consumer", so moving a sid between live and absent is invisible to the conflict
+// predicate by design.
+//
+// The second arm — both branches downgraded — is the one an earlier revision of this
+// item's plan got wrong, calling it a no-op. Equality between ours and the survivor does not
+// bypass the survivor-versus-base comparison.
+func TestForkRepairConflictsWhenTheSurvivorDowngraded(t *testing.T) {
+	t.Parallel()
+	const sid = "forkdgs/a"
+	cc := &ConsumerConfig{Durable: "forkdgs_durable", DeliverSubject: mqttSubPrefix + "forkdgs"}
+
+	run := func(t *testing.T, oursDowngrades bool) {
+		t.Helper()
+		e := testStageForkedGrant(t, "fork-qos0-survivor-"+map[bool]string{true: "both", false: "one"}[oursDowngrades],
+			func(s *mqttSession) {
+				s.subs = map[string]byte{sid: 1}
+				s.cons = map[string]*ConsumerConfig{sid: cc}
+			},
+			func(s *mqttSession) {
+				// Fresh maps: the builder hands them out by reference and the fixture kept
+				// the parent record built from this session.
+				if oursDowngrades {
+					s.subs = map[string]byte{sid: 0}
+					s.cons = map[string]*ConsumerConfig{sid: cc}
+					s.releaseDowngradedConsumersLocked([]*mqttDeferredDel{{sid: sid, cc: cc}})
+					return
+				}
+				// Ours changes something ELSE about the filter, so a change is minted at
+				// all: without a delta there is nothing for the survivor to conflict with.
+				s.subs = map[string]byte{sid: 2}
+				s.cons = map[string]*ConsumerConfig{sid: cc}
+			},
+			func(ps *mqttPersistedSession, parent *mqttPersistedSession) {
+				// THE SURVIVOR downgraded: fresh maps again, and its consumer is released
+				// the way the boundary releases one.
+				ps.Subs = map[string]byte{sid: 0}
+				ps.Cons = nil
+			})
+
+		sess := e.reconnect(t)
+		terms := testSubsOf(t, sess)
+		got, present := terms[sid]
+		if !present || got.qos != 0 {
+			t.Fatalf("the SURVIVOR's grant must stand: it decided QoS 0 for this filter and "+
+				"nothing orders the two acknowledgements, got %+v (present %v)", got, present)
+		}
+		sess.mu.Lock()
+		live := sess.cons[sid]
+		sess.mu.Unlock()
+		if live != nil {
+			t.Fatalf("the survivor released its own consumer, so the repair must not put one "+
+				"back, got %+v", live)
+		}
+	}
+
+	t.Run("only the survivor downgraded", func(t *testing.T) { t.Parallel(); run(t, false) })
+	t.Run("both branches downgraded", func(t *testing.T) { t.Parallel(); run(t, true) })
+}

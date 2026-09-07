@@ -3401,6 +3401,66 @@ client at that point reopens nothing and is normal, not an anomaly: an ambiguous
 stay unresolved while its connection closes, and the surviving drain takes its source
 interest from the ordinary resume instead.
 
+**A downgrade that is NOT converted gives up its `cons` entry at the same boundary**, and
+for the same reason the conversion is there: the membership and the consumer reference are
+one fact, so the record that carries `Subs` at QoS 0 must not still name a durable the same
+packet is about to delete. `releaseDowngradedConsumersLocked` runs one step after the
+conversion, over the same descriptors, and it deliberately does **not** require
+`dd.convert` — a stream inactivity limit stops a descriptor from ever being offered to the
+conversion, and that is precisely the route that must be released. It skips a converted,
+revoked or replaced descriptor, and a membership that is **absent** rather than zero, which
+is UNSUBSCRIBE's path. `dd.cc` already carries the config the teardown needs, so nothing
+is re-homed and no third map exists.
+
+Three things make it safe, and each is the counterpart of a conversion rule:
+
+- **A mid-packet write still carries the pre-packet pair.** `sess.subs` moves only inside
+  `update`, so a save issued before the final one sees the positive QoS *and* the consumer,
+  which is the honest state until the membership changes.
+- **The `inLock` hook reports the release**, so the record is written even when the
+  membership did not change — a QoS 0 re-SUBSCRIBE over a filter already at QoS 0 that still
+  holds a `cons` entry changes nothing else, and without this the entry would leave memory
+  while the record kept naming it.
+- **A definite save failure un-releases before the rollback enumerates.** The rollback
+  restores `sess.cons` wholesale from the pre-packet snapshot, which covers every entry that
+  predates the packet; what it cannot recover is a consumer this packet **created** and then
+  downgraded, because it finds those by walking `sess.cons`. The un-release fills only an
+  absent sid, since recording that we removed an entry does not prove nothing was installed
+  there since.
+
+**A released durable's `MaxAckPending` charge comes back at the resolution**, on the one arm
+where nothing else gives it: an ambiguous save that proves landed runs a refund-only
+continuation for every durable the boundary released. The teardown is what normally refunds,
+and that arm never reaches it; the sweep that eventually reaps the durable deletes it
+directly and has no session to refund. Refund and nothing else — no `Cons` entry returns,
+because re-persisting one under the QoS 0 membership is this item's defect, and the delete
+stays the sweep's because it needs a JetStream round trip and a classified result while the
+refund is memory-only and idempotent. The charge is honest to give back: the delivery
+subscription stayed closed on that arm, so the orphaned durable holds no in-flight
+budget the client could spend.
+
+**What this gives up is stated in `docs/CONFORMANCE.md`, not claimed away.** Between the
+confirmed save and the teardown the durable is named by neither the record nor `sess.cons`,
+so an orphan sweep — on this broker or on a peer, whose sparing pass cannot see another
+broker's residents — may delete it first. That is acceptable *only* because every route
+into the window is destructive by construction: the pending teardown is the one that would
+delete the same durable. The safety criterion is a descriptor's **current disposition, not
+its ancestry** — an adopted durable downgraded again later reaches the release like any
+other — and the same early deletion against a *drained* or *adopted* durable would be a
+loss, which is what keeps `Drains` in the record and why the builder's `Cons` predicate is
+membership **presence** rather than positive QoS. A positive-QoS predicate would omit a
+durable an adoption has just moved into `cons` while the membership is still at the
+pre-packet QoS 0, leaving it named nowhere with a started exchange inside it.
+
+Convergence in that window is a **peer sweep**, and it is demonstrated as far as a broker
+that is gone: the cross-broker fixtures stop the owning broker, await its shutdown lifecycle
+to completion, and reap from the peer. The owner's own shutdown does not delete the durable
+either, and the reason is narrow rather than flattering — its drain walks live *clients*
+(`drainClients`), and the periodic passes over `as.sessions` stop with `quitCh`, so an
+**unbound** session's consumers are reached by nothing in that lifecycle. The assertion
+is a regression barrier over that fact, not evidence about the release. An abrupt
+process death is not constructible in the harness and nothing is claimed for it.
+
 Recovery is positive, never an inference from absence. Because the phase is
 memory-only, a restart would otherwise establish source interest and resend the
 payload of an exchange already past PUBREC — before the correlated PUBREL callback
@@ -3528,7 +3588,12 @@ The pass:
    record is refused at restore, and a resident session could never have
    subscribed to one. A stale `Cons` entry with **no** matching subscription is not an active
    delivery entry and is deliberately not verified (a stated residual in
-   `docs/CONFORMANCE.md`).
+   `docs/CONFORMANCE.md`). A membership at **QoS 0** carries no `Cons` entry where its
+   consumer was *destroyed*, because the downgrade releases the reference at its packet's
+   final-update boundary — so this pass's QoS 0 skip and the record agree by construction
+   rather than by coincidence. Where such a membership *does* carry an entry the durable is
+   **live and owed** — an adoption mid-packet, or one a failed filter left behind — and it
+   is named on purpose.
 2. **Subscribe everything closed, then batch-verify.** Before any lookup, a
    **closed, flushed** delivery subscription is installed on every recorded
    deliver subject, marked *phase-owned* — for present consumers too, because a

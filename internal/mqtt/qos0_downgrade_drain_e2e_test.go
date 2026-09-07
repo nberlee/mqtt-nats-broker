@@ -349,6 +349,22 @@ func TestMQTTQoS0ReSubscribeFallsBackWhenDrainingIsRefused(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the refusal must be logged: it is a stated conformance residual, not a silent one")
 	}
+
+	// And the record must not name the consumer this route destroys. THIS is the arm that
+	// reaches the release with dd.convert FALSE: a stream inactivity limit means the
+	// descriptor is never even offered to the conversion, so a release that skipped a
+	// non-candidate would leave the record naming a durable the teardown just deleted.
+	// The other tests all go through candidates, so none of them can see it.
+	asm := testMQTTGetAccountSessionManager(t, s, "qos0dglim")
+	ps, _ := testReconcileRecord(t, asm, "qos0dglim")
+	key, _ := mqttToNATSSubjectConversion([]byte(topic), true)
+	if qos, ok := ps.Subs[string(key)]; !ok || qos != 0 {
+		t.Fatalf("the membership must be PRESENT at QoS 0, got %v (present %v)", qos, ok)
+	}
+	if cc := ps.Cons[sid]; cc != nil {
+		t.Fatalf("the destructive fallback must still release its consumer reference: the "+
+			"durable is deleted, so a record naming it is a reference to nothing, got %+v", cc)
+	}
 }
 
 // TestMQTTQoS0DowngradeSavesWhenOnlyTheConversionChanged is the save-condition contract,
@@ -916,4 +932,559 @@ func TestMQTTQoS0DowngradeAmbiguousSaveCompletesOnLandedResolution(t *testing.T)
 		t.Fatalf("the drained durable %q must survive an ambiguous-then-landed save", dur)
 	}
 	_ = pi
+}
+
+// TestMQTTQoS0DowngradeSavesWhenOnlyTheReleaseChanged is the sibling of
+// TestMQTTQoS0DowngradeSavesWhenOnlyTheConversionChanged, and it is the ONLY test that
+// reaches the production save-condition closure for the CONSUMER RELEASE.
+//
+// Same fifth-provenance fixture — a QoS 0 membership beside a live consumer, which is what
+// a failed drain adoption leaves — but with NOTHING STARTED, so the conversion refuses and
+// reports no work. The membership loop changes nothing either. The release's own return
+// value is then the only thing that can set needUpdate, and without it the entry leaves
+// sess.cons while the record keeps naming a durable the teardown is about to delete: the
+// defect this item fixes, inverted.
+//
+// The QoS 0 membership is poked directly, for the reason its sibling gives: the producer of
+// that state is the separately owned failed-adoption defect, and reproducing it here would
+// test that instead.
+func TestMQTTQoS0DowngradeSavesWhenOnlyTheReleaseChanged(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 30 * time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const topic = "qos0dgrel/topic"
+	cl, r := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgrel"}, o.MQTT.Host, o.MQTT.Port)
+	defer cl.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, cl, r, []*mqttFilter{{filter: topic, qos: 1}}, []byte{1})
+	testMQTTFlush(t, cl, nil, r)
+
+	sess := testMQTTResidentSession(t, s, "qos0dgrel")
+	dur, sid := testDowngradeDurable(t, sess, topic)
+
+	// The state a failed adoption leaves: membership at QoS 0, consumer still live. No
+	// delivery has started, which is what keeps the conversion out of this.
+	sess.mu.Lock()
+	sess.subs[sid] = 0
+	sess.mu.Unlock()
+
+	w := &testSubRevokeWrittenRecords{}
+	defer w.armWrittenRecords(sess)()
+
+	testMQTTSub(t, 2, cl, r, []*mqttFilter{{filter: topic, qos: 0}}, []byte{0})
+	testMQTTFlush(t, cl, nil, r)
+
+	records, err := w.landed()
+	if err != nil {
+		t.Fatalf("observing the written records: %v", err)
+	}
+	if len(records) == 0 {
+		t.Fatal("a RELEASE with no membership change and no conversion must still WRITE: " +
+			"unpersisted, the record goes on naming a consumer whose durable this packet " +
+			"deletes, which is exactly the stale reference this item removes")
+	}
+	ps := records[len(records)-1]
+	if qos, ok := ps.Subs[sid]; !ok || qos != 0 {
+		t.Fatalf("the record must keep the membership PRESENT at QoS 0, got %v (present %v)", qos, ok)
+	}
+	if cc := ps.Cons[sid]; cc != nil {
+		t.Fatalf("the written record must not name the released consumer, got %+v", cc)
+	}
+	if d := ps.Drains[sid]; d != nil {
+		t.Fatalf("nothing was started, so no drain may be named either, got %+v", d)
+	}
+	// And the teardown really does follow, so the omission is not premature.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if testSubRevokeConsumerLives(t, sess, dur) {
+			return fmt.Errorf("durable %q still exists", dur)
+		}
+		return nil
+	})
+}
+
+// TestMQTTQoS0DowngradeRollbackReleasesADestroyedPacketCreatedDurable is the un-remove's
+// production oracle, and it is deliberately the DESTRUCTIVE twin of
+// TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable.
+//
+// That test parks a publish so the packet-created consumer holds a TRANSMITTED delivery,
+// which makes the second occurrence CONVERT — so the un-convert is what saves it and the
+// consumer release never runs. With nothing started the same packet takes the destructive
+// arm instead: the release takes the entry out of sess.cons at the final-update boundary,
+// and rollbackSubscribePacket discovers this packet's own consumers by WALKING sess.cons.
+// Without the un-remove the durable this packet created is named nowhere in the rolled-back
+// record and released by nobody.
+//
+// The oracle is the teardown seam firing for that durable, observed rather than inferred.
+func TestMQTTQoS0DowngradeRollbackReleasesADestroyedPacketCreatedDurable(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 30 * time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const topic = "qos0dgpcd/topic"
+	cl, r := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgpcd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cl.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	sess := testMQTTResidentSession(t, s, "qos0dgpcd")
+
+	conv, _ := mqttToNATSSubjectConversion([]byte(topic), false)
+	sid := string(conv)
+
+	// The teardown seam, installed process-globally, which is why this test is not
+	// parallel. It records the durable released for THIS sid.
+	var released atomic.Value
+	restoreDel := setMQTTTestDeferredDeleteHook(func(gotSid, gotDur string) {
+		if gotSid == sid {
+			released.Store(gotDur)
+		}
+	})
+	defer restoreDel()
+
+	// Definite failure of the packet's final save, then the rollback's own save.
+	var saves atomic.Int32
+	restore := setMQTTTestSessSaveHook(func(hs *mqttSession) error {
+		if hs != sess {
+			return nil
+		}
+		if saves.Add(1) == 1 {
+			return errors.New("definite failure of the packet's final save")
+		}
+		return nil
+	})
+	defer restore()
+
+	// [{topic,1},{topic,0}] in ONE packet: the first occurrence CREATES the durable, the
+	// second stages its destruction. Written directly, because the failed save closes the
+	// connection rather than answering.
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(2 + (2 + len(topic) + 1) + (2 + len(topic) + 1))
+	w.WriteUint16(2)
+	w.WriteBytes([]byte(topic))
+	w.WriteByte(1)
+	w.WriteBytes([]byte(topic))
+	w.WriteByte(0)
+	if _, err := testMQTTWrite(cl, w.Bytes()); err != nil {
+		t.Fatalf("write SUBSCRIBE: %v", err)
+	}
+
+	// Wait for EVIDENCE THE PACKET RAN — the rollback's own save — not for an end state.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if saves.Load() < 2 {
+			return fmt.Errorf("waiting for the failed save and the rollback's own")
+		}
+		return nil
+	})
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if released.Load() == nil {
+			return fmt.Errorf("waiting for the rolled-back packet to release the durable it created")
+		}
+		return nil
+	})
+}
+
+// TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep is the ambiguous-landed
+// route's oracle, and it observes BOTH stated residuals rather than describing them.
+//
+// processSubs returns on its saveMaybeLanded arm before the deferred-delete loop, and a
+// DESTRUCTIVE descriptor registers no continuation at all — only a converted one does. So
+// when the write lands, the record carries the QoS 0 membership and names the durable
+// nowhere, while the durable is still alive. Under Design B the entry has also left
+// sess.cons, so neither a same-object reconnect nor a record restore reaches
+// processJSConsumer's existing-consumer arm: convergence is a successful orphan sweep and
+// nothing else.
+//
+// The ACCOUNTING half of that window was a second residual until holistic round 3 refused
+// it: the sweep deletes through as.jsa.deleteConsumer and cannot refund what
+// sess.deleteConsumer would have, so a charge nothing gives back costs a subscription slot
+// for the life of the session. A refund-only landed continuation now gives it back at the
+// RESOLUTION, which is why this test asserts the refund at its resolution barrier and the
+// durable at the sweep: the two convergences have different mechanisms and this test
+// separates them deliberately. The availability consequence is its sibling,
+// TestMQTTQoS0DowngradeAmbiguousLandedSaveRefundsTheCharge.
+//
+// NOTHING is started here, which is what puts the descriptor on the destructive arm.
+func TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 30 * time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const topic = "qos0dgambd/topic"
+	cl, r := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgambd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cl.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, cl, r, []*mqttFilter{{filter: topic, qos: 1}}, []byte{1})
+	testMQTTFlush(t, cl, nil, r)
+
+	sess := testMQTTResidentSession(t, s, "qos0dgambd")
+	dur, sid := testDowngradeDurable(t, sess, topic)
+	// Taken while the connection is still UP: the helper finds the manager through the live
+	// client, and the unresolved SUBSCRIBE below closes that connection.
+	asm := testMQTTGetAccountSessionManager(t, s, "qos0dgambd")
+	sess.mu.Lock()
+	chargedBefore := sess.tmaxack
+	sess.mu.Unlock()
+	if chargedBefore == 0 {
+		t.Fatal("the fixture never reached the route it names: a QoS 1 subscription must have " +
+			"charged tmaxack, or the refund asserted below is unobservable")
+	}
+
+	// The teardown must NOT run on this route. Observed rather than assumed.
+	var tornDown atomic.Bool
+	restoreDel := setMQTTTestDeferredDeleteHook(func(gotSid, _ string) {
+		if gotSid == sid {
+			tornDown.Store(true)
+		}
+	})
+	defer restoreDel()
+
+	// Lose the response to the packet's final save exactly once: the write LANDS, its
+	// acknowledgement does not.
+	var lost atomic.Int32
+	observed := make(chan struct{})
+	var once sync.Once
+	restore := setMQTTTestSessStoreResultHook(
+		func(hs *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+			if hs != sess || err != nil {
+				return resp, err
+			}
+			if lost.Add(1) == 1 {
+				once.Do(func() { close(observed) })
+				return nil, errors.New("test: session record response lost")
+			}
+			return resp, err
+		})
+	defer restore()
+
+	// No SUBACK: an unresolved packet closes the connection instead of answering.
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(2 + 2 + len(topic) + 1)
+	w.WriteUint16(2)
+	w.WriteBytes([]byte(topic))
+	w.WriteByte(0)
+	if _, err := testMQTTWrite(cl, w.Bytes()); err != nil {
+		t.Fatalf("write SUBSCRIBE: %v", err)
+	}
+	select {
+	case <-observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the packet's final save never reached the store-result hook, so the " +
+			"ambiguity this test needs was never created")
+	}
+
+	// The landed record: membership at QoS 0, durable named nowhere.
+	var landedSeq uint64
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		ps, seq := testReconcileRecord(t, asm, "qos0dgambd")
+		landedSeq = seq
+		if qos, ok := ps.Subs[sid]; !ok || qos != 0 {
+			return fmt.Errorf("waiting for the landed record to carry the QoS 0 membership, got %v (present %v)", qos, ok)
+		}
+		if cc := ps.Cons[sid]; cc != nil {
+			return fmt.Errorf("the landed record still names %q", cc.Durable)
+		}
+		if d := ps.Drains[sid]; d != nil {
+			return fmt.Errorf("the landed record names a drain, so this is not the destructive route")
+		}
+		return nil
+	})
+	if tornDown.Load() {
+		t.Fatal("the fixture never reached the route it names: the teardown ran, so this is " +
+			"not the ambiguous arm and the residual below is not what is being observed")
+	}
+
+	// SETTLE THE AMBIGUITY. Neither the record's visibility nor a FALSE isSeqUncertain() is
+	// proof that a resolution happened: the store hook signals BEFORE it returns the
+	// injected error, so when `observed` closes the packet has not yet reached its
+	// saveMaybeLanded arm and the session is not uncertain YET. A poll for
+	// !isSeqUncertain() therefore passes on the value the flag has BEFORE arming, and
+	// proves nothing about the classification it is named for.
+	//
+	// So wait for the POSITIVE fact — the ambiguity published, or the landed sequence
+	// already adopted, which only settleLandedAttempt does — and then run the resolution
+	// from here, on the route reconcileResidentRecordState takes for an unbound uncertain
+	// session. A RETURNED verdict is the completion evidence a poll cannot give.
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		sess.mu.Lock()
+		armed, adopted := sess.seqUncertain, sess.seq
+		sess.mu.Unlock()
+		if !armed && adopted < landedSeq {
+			return fmt.Errorf("waiting for the packet to publish the ambiguity of its final save")
+		}
+		return nil
+	})
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		if err := asm.lockSession(sess, nil); err != nil {
+			return fmt.Errorf("waiting for the session's ownership gate: %w", err)
+		}
+		res := s.resolveUncertainSession(asm, sess)
+		asm.unlockSession(sess)
+		if res != mqttUncertainOurs {
+			return fmt.Errorf("the resolver must classify a write that LANDED as ours, got %v", res)
+		}
+		return nil
+	})
+	// And the record fence must be IDLE. settleLandedAttempt clears the uncertainty before
+	// it runs the landed continuations, and those continuations run inside the resolver's
+	// own transaction — so an idle fence, not a cleared flag, is what proves the pass that
+	// settled this session (the one above, or a periodic pass that got there first) is not
+	// still running one behind the assertions below.
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		tok, ok := sess.tryBeginRecordTx()
+		if !ok {
+			return fmt.Errorf("waiting for the resolver to release the record fence")
+		}
+		if err := sess.endRecordTx(tok); err != nil {
+			return fmt.Errorf("releasing the probe transaction: %w", err)
+		}
+		return nil
+	})
+	if sess.isSeqUncertain() {
+		t.Fatal("the session must be RESOLVED before the residual is read: while it is " +
+			"uncertain every save is refused, so nothing below would be the residual")
+	}
+	if tornDown.Load() {
+		t.Fatal("the resolution must not run the teardown for a DESTRUCTIVE descriptor: only " +
+			"a converted one registers a continuation, and that difference is the residual")
+	}
+
+	// THE CHARGE IS REFUNDED BY THE RESOLUTION, not by the sweep. The refund runs as a
+	// landed continuation inside the resolver's own transaction, which the idle-fence check
+	// above has just proven finished, so this is asserted HERE — before either prompt path
+	// and before the sweep — because that is what pins WHICH mechanism gives it back. It
+	// replaces an earlier assertion that the charge was kept: holistic round 3 weighed that
+	// residual as lost availability (a resident session can be refused at the aggregate
+	// MaxAckPending ceiling) rather than lost tidiness, and the refund-only continuation is
+	// its fix. The DURABLE is still the sweep's, which is the residual that remains.
+	sess.mu.Lock()
+	chargedAfter := sess.tmaxack
+	_, stillCharged := sess.consCharged[dur]
+	sess.mu.Unlock()
+	if chargedAfter != 0 || stillCharged {
+		t.Fatalf("the resolution must refund the released durable's charge: tmaxack must be "+
+			"back to 0 (was %d before the packet, %d now) and consCharged must no longer "+
+			"name %q (present %v)", chargedBefore, chargedAfter, dur, stillCharged)
+	}
+
+	// The durable is ALIVE and named nowhere. That is the residual, and the sweep is its
+	// only convergence point.
+	if !testDurableExists(t, s, dur) {
+		t.Fatalf("the durable %q must still exist on this route: the teardown never ran", dur)
+	}
+
+	// PROMPT PATH 1 — a same-object reconnect. The session is still resident, so its
+	// sess.cons is what processJSConsumer would consult; the release already emptied it, so
+	// the restore reaches qos == 0 && !exists and issues NO consumer delete.
+	cl2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgambd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cl2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTFlush(t, cl2, nil, r2)
+	if tornDown.Load() {
+		t.Fatalf("stated residual: a same-object reconnect must NOT clean up %q — the "+
+			"consumer entry is gone from sess.cons, so the existing-consumer arm is "+
+			"unreachable. If this fires the prompt path came back and the CONFORMANCE "+
+			"residual must be updated with it", dur)
+	}
+	if !testDurableExists(t, s, dur) {
+		t.Fatalf("and the durable must still be there after that reconnect: %q", dur)
+	}
+	cl2.Close()
+	// Let that close finish before the session is evicted: a close still in flight would
+	// be acting on an object the eviction below has already replaced.
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		sess.mu.Lock()
+		bound := sess.c != nil
+		sess.mu.Unlock()
+		if bound {
+			return fmt.Errorf("waiting for the reconnect's close to detach the session")
+		}
+		return nil
+	})
+
+	// PROMPT PATH 2 — a restore from the RECORD, which is what a restart or another broker
+	// does. The resident session is evicted first so the CONNECT below cannot rebind this
+	// object, and it is driven as a REAL CONNECT: hydrating a session with
+	// createOrRestoreSession would prove only that Cons deserialization preserves an
+	// absence, because the delete this residual is about would come from CONNECT's own
+	// reconciliation — processSubs -> processJSConsumer — which hydration never runs.
+	asm.removeSession(sess, true)
+	cl3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgambd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cl3.Close()
+	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
+	testMQTTFlush(t, cl3, nil, r3)
+	restored := testMQTTResidentSession(t, s, "qos0dgambd")
+	if restored == sess {
+		t.Fatal("the fixture never reached the route it names: the eviction did not take, so " +
+			"this is a second same-object reconnect and not a record-sourced restore")
+	}
+	restored.mu.Lock()
+	restoredEntry := restored.cons[sid]
+	restored.mu.Unlock()
+	if restoredEntry != nil {
+		t.Fatalf("a record-sourced restore must not resurrect the released reference, got %+v", restoredEntry)
+	}
+	if tornDown.Load() {
+		t.Fatalf("stated residual: a record restore must not clean up %q either", dur)
+	}
+	if !testDurableExists(t, s, dur) {
+		t.Fatalf("and the durable must survive a CONNECT that reconciled from the record: %q", dur)
+	}
+	cl3.Close()
+
+	asm.sweepOrphanedConsumersBefore(s, time.Now().Add(time.Minute))
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		if testDurableExists(t, s, dur) {
+			return fmt.Errorf("the orphan sweep must reap a durable no record and no session names")
+		}
+		return nil
+	})
+
+}
+
+// TestMQTTQoS0DowngradeAmbiguousLandedSaveRefundsTheCharge is the availability half of the
+// same route, and it is what holistic round 3 asked for: the resident session must be able
+// to subscribe again after the resolution.
+//
+// The leak it guards is not tidiness. `tmaxack` bounds the session's aggregate
+// MaxAckPending at mqttMaxAckTotalLimit, so a charge nothing gives back is a subscription
+// slot the client never gets back either — one lost save acknowledgement near the ceiling
+// and every later QoS 1/2 SUBSCRIBE is refused for the life of the session.
+//
+// The fixture puts ONE consumer close to the ceiling (MaxAckPending 40000, so a second
+// charge would ask for 80000) rather than filling it with many: the arithmetic is then
+// unambiguous, and the assertion is a real grant rather than an inspection of a counter.
+func TestMQTTQoS0DowngradeAmbiguousLandedSaveRefundsTheCharge(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 30 * time.Second
+	// Two of these would exceed mqttMaxAckTotalLimit (0xFFFF), which is the whole point.
+	o.MQTT.MaxAckPending = 40000
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const topic = "qos0dgrefund/topic"
+	const other = "qos0dgrefund/other"
+	cl, r := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgrefund"}, o.MQTT.Host, o.MQTT.Port)
+	defer cl.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, cl, r, []*mqttFilter{{filter: topic, qos: 1}}, []byte{1})
+	testMQTTFlush(t, cl, nil, r)
+
+	sess := testMQTTResidentSession(t, s, "qos0dgrefund")
+	dur, sid := testDowngradeDurable(t, sess, topic)
+	asm := testMQTTGetAccountSessionManager(t, s, "qos0dgrefund")
+	sess.mu.Lock()
+	chargedBefore := sess.tmaxack
+	sess.mu.Unlock()
+	if chargedBefore != 40000 {
+		t.Fatalf("the fixture never reached the route it names: the QoS 1 subscription must "+
+			"have charged the configured MaxAckPending, got tmaxack=%d", chargedBefore)
+	}
+
+	// Lose the response to the packet's final save exactly once: the write LANDS, its
+	// acknowledgement does not.
+	var lost atomic.Int32
+	observed := make(chan struct{})
+	var once sync.Once
+	restore := setMQTTTestSessStoreResultHook(
+		func(hs *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+			if hs != sess || err != nil {
+				return resp, err
+			}
+			if lost.Add(1) == 1 {
+				once.Do(func() { close(observed) })
+				return nil, errors.New("test: session record response lost")
+			}
+			return resp, err
+		})
+	defer restore()
+
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(2 + 2 + len(topic) + 1)
+	w.WriteUint16(2)
+	w.WriteBytes([]byte(topic))
+	w.WriteByte(0)
+	if _, err := testMQTTWrite(cl, w.Bytes()); err != nil {
+		t.Fatalf("write SUBSCRIBE: %v", err)
+	}
+	select {
+	case <-observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the packet's final save never reached the store-result hook, so the " +
+			"ambiguity this test needs was never created")
+	}
+
+	// The landed record: the membership at QoS 0, the durable named nowhere. Keyed on the
+	// SID and requiring the membership to be PRESENT, or an absent key would satisfy this
+	// barrier without the packet ever having written.
+	var landedSeq uint64
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		ps, seq := testReconcileRecord(t, asm, "qos0dgrefund")
+		if qos, ok := ps.Subs[sid]; !ok || qos != 0 {
+			return fmt.Errorf("waiting for the landed record to carry the QoS 0 membership, got %v (present %v)", qos, ok)
+		}
+		if cc := ps.Cons[sid]; cc != nil {
+			return fmt.Errorf("the landed record still names %q", cc.Durable)
+		}
+		landedSeq = seq
+		return nil
+	})
+
+	// The same positive barrier as the sibling test: arm, then a RETURNED verdict, then an
+	// idle fence, because the refund is a landed continuation and runs inside it.
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		sess.mu.Lock()
+		armed, adopted := sess.seqUncertain, sess.seq
+		sess.mu.Unlock()
+		if !armed && adopted < landedSeq {
+			return fmt.Errorf("waiting for the packet to publish the ambiguity of its final save")
+		}
+		return nil
+	})
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		if err := asm.lockSession(sess, nil); err != nil {
+			return fmt.Errorf("waiting for the session's ownership gate: %w", err)
+		}
+		res := s.resolveUncertainSession(asm, sess)
+		asm.unlockSession(sess)
+		if res != mqttUncertainOurs {
+			return fmt.Errorf("the resolver must classify a write that LANDED as ours, got %v", res)
+		}
+		return nil
+	})
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		tok, ok := sess.tryBeginRecordTx()
+		if !ok {
+			return fmt.Errorf("waiting for the resolver to release the record fence")
+		}
+		if err := sess.endRecordTx(tok); err != nil {
+			return fmt.Errorf("releasing the probe transaction: %w", err)
+		}
+		return nil
+	})
+
+	// THE AVAILABILITY ASSERTION. A reconnect subscribes to a DIFFERENT filter at QoS 1,
+	// which needs another 40000: it is granted only if the released durable's charge came
+	// back. Without the refund the provisioning arm refuses with "max_ack_pending for all
+	// consumers would be 80000", and the client sees 0x80.
+	cl2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgrefund"}, o.MQTT.Host, o.MQTT.Port)
+	defer cl2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTSub(t, 1, cl2, r2, []*mqttFilter{{filter: other, qos: 1}}, []byte{1})
+	testMQTTFlush(t, cl2, nil, r2)
+
+	// And the counter agrees with the grant: exactly one consumer is charged, the new one.
+	sess.mu.Lock()
+	chargedAfter := sess.tmaxack
+	_, staleCharged := sess.consCharged[dur]
+	sess.mu.Unlock()
+	if staleCharged || chargedAfter != 40000 {
+		t.Fatalf("after the refund and one new subscription the session must carry exactly one "+
+			"charge: tmaxack=%d (want 40000) and consCharged must not still name the released "+
+			"durable %q (present %v)", chargedAfter, dur, staleCharged)
+	}
 }

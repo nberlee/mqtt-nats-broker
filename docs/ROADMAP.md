@@ -3532,36 +3532,58 @@ takeover.
   Residuals in `docs/CONFORMANCE.md`; mechanism in `docs/ARCHITECTURE.md` under "A deferred
   QoS downgrade is revocable within its packet".
 
-- [ ] **`buildPersistedSessionLocked` keys `Cons` on membership PRESENCE, not positive
-  QoS.** Filed 2026-09-06 by the revocable-downgrade item's plan-review round 2, and
-  deliberately scoped OUT of it — it was never in that item's bullet, and its blast radius
-  is three recovery surfaces that item does not otherwise touch. The builder tests
-  `if _, ok := sess.subs[key]; !ok { continue }`, and a QoS downgrade sets
-  `sess.subs[key] = 0` rather than removing the key, so an **ordinary single-occurrence
-  QoS 1 -> 0 downgrade that is DESTROYED rather than converted** persists `Cons[sid]` in
-  its own confirmed save and then deletes the durable, leaving the record naming a
-  consumer that does not exist. (Since the QoS 0 downgrade item landed, a downgrade
-  holding started deliveries becomes a **drain** instead: the conversion removes the
-  `cons` entry before the record is built, so that record names the durable in `Drains`
-  and this route is not entered. What remains are the destructive cases — nothing
-  started, a held drain owning the sid, or a stream-imposed inactivity limit.) Where the teardown
-  happens to have cancellations to secure, `proveVoidedRegs` saves again and incidentally
-  repairs it; where it does not, the stale reference stands until the next resume.
-  **`TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes` asserts `Cons` is STILL
-  PRESENT**, as evidence rather than as intended behavior, so fixing this means updating
-  that assertion.
-  **The three surfaces a fix owes tests on, established rather than assumed:** resume
-  reconciliation **skips QoS 0 entirely** (`sess_resume_reconcile.go`), so it is not the
-  pruner and CONNECT's inline delete is the only prompt cleanup path for such an entry —
-  omitting the entry removes it; fork repair copies `Cons` independently of QoS and its
-  APPLICATION distinguishes live from absent by config presence (`sess_fork_repair.go`), so
-  a repaired downgrade changes from preserving a survivor consumer to removing its
-  in-memory reference; and the same builder supplies `clear()`'s teardown snapshot, so the
-  change is broader than packet serialization. **"Unnamed, therefore swept" does not hold**:
-  the orphan sweep spares every local `sess.cons` entry whatever the record says, and the
-  ambiguous-save path returns before the execution loop with no deferred-delete
-  continuation registered, so a resident session can hold the consumer with the record
-  denying it.
+- [x] **A destroyed QoS 0 downgrade left the record naming its consumer.** Filed
+  2026-09-06 by the revocable-downgrade item's plan-review round 2 as
+  "`buildPersistedSessionLocked` keys `Cons` on membership PRESENCE, not positive QoS", and
+  **CLOSED by releasing the reference at the packet's final-update boundary instead.**
+
+  **THE BULLET'S OWN DIAGNOSIS WAS REFUTED, and the plan-review loop is what refuted it.**
+  The defect was real: a QoS 1 -> 0 downgrade whose consumer is DESTROYED rather than
+  converted persisted `Cons[sid]` in its own confirmed save and then deleted the durable,
+  leaving the record naming a consumer that does not exist — and three recovery surfaces
+  read that record as live. But attributing it to the builder's membership-**presence** test
+  is wrong, and the obvious positive-QoS predicate **introduces a live-exchange loss**.
+  Presence is what protects a durable that is live and OWED at a QoS 0 membership: an
+  adoption moves a drain's durable out of BOTH drain maps into `sess.cons` at once while
+  `sess.subs` still says QoS 0 until the final update, so a later shared filter's early
+  persist writes a record in which a positive-QoS predicate names that durable **nowhere**,
+  and an orphan sweep on any broker deletes it with the client's unacknowledged exchange
+  inside it. That was measured, not argued: applying the predicate as a mutation kills
+  `TestMQTTAdoptedDrainIsNamedInAMidPacketRecord`.
+
+  **What landed.** `releaseDowngradedConsumersLocked` runs at the packet's final-update
+  boundary, one step after `convertDowngradeCandidatesLocked` and inside the same `sess.mu`
+  section that applies the membership — the asymmetry `d554f13` closed for the converted arm
+  and left open for the destructive one. It does **not** require `dd.convert`, because a
+  stream inactivity limit stops a descriptor from ever reaching the conversion and that is
+  the route that can hold started exchanges. The `inLock` hook reports the release, so a
+  packet that changes no membership still writes (a QoS 0 re-SUBSCRIBE over a filter already
+  at QoS 0). A definite save failure un-releases first, filling only an absent sid, or the
+  rollback's `sess.cons` walk would miss a durable this packet created. The builder, its
+  predicate and its comment are **unchanged**.
+
+  **Three refuted designs, not to be re-proposed:** the positive-QoS builder predicate
+  above; releasing at the filter's own staging, which would let a mid-packet save
+  describe a positive-QoS membership with no consumer and make resume reconciliation
+  mint a second
+  durable; and restoring the entry on the `saveMaybeLanded` arm, which would recover the
+  prompt cleanup path and the charge refund but re-persist `Cons` under the QoS 0 membership
+  through the unchanged presence predicate — the defect again.
+
+  **Not claimed.** `:3217` is untouched, both halves: its prior-QoS-0 exemption and its
+  restore-side residual stand, and no adoption timing changed. Two residuals are stated in
+  `docs/CONFORMANCE.md` — the sweep window (accepted, because every route into it is
+  destructive by construction, and **not** extended to adopted or converted durables) and
+  the ambiguous-landed route's loss of both prompt cleanup paths. The `MaxAckPending`
+  charge that route leaked was filed as a residual too, and **holistic round 3 refused
+  it**: a charge nothing gives back costs a subscription slot for the life of the session,
+  so a **refund-only landed continuation** now gives it back at the resolution. Refund
+  only — restoring the `Cons` entry is the third refuted design above, and the durable
+  remains the sweep's. Cross-broker convergence is proven as far as a broker that is
+  GONE — the fixtures stop the owning broker and await its shutdown lifecycle before the
+  peer sweeps, in both orderings — and an ABRUPT process death is not exercised, because
+  an in-process harness cannot construct one. Mechanism in `docs/ARCHITECTURE.md` under
+  "UNSUBSCRIBE drain".
 
 - [ ] **A quarantined packet identifier has no live-session release.** Filed 2026-08-30 by
   F-087's plan-review loop. NOT an alpha blocker: holding is fail-closed and replaces the

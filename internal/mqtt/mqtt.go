@@ -8690,6 +8690,11 @@ type mqttDeferredDel struct {
 	// the irreversible teardown for this entry: the durable is a drain now, named in the
 	// record's Drains, and its started deliveries are still owed to the client.
 	converted bool
+	// consReleased says the final-update boundary took this consumer out of sess.cons, so
+	// the record that carries the QoS 0 membership does not name a durable this packet is
+	// about to delete. A definite save failure must put it back before the rollback
+	// enumerates sess.cons looking for the consumers this packet created.
+	consReleased bool
 }
 
 // revokeLocked undoes this staging because a LATER occurrence of the same filter in the
@@ -9322,11 +9327,11 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		filterDefStart := len(deferredDels)
 		revokedThisFilter = revokedThisFilter[:0]
 		cancelFilterDeferred := func() {
-			// The sess.cons entries were never removed (removal happens at
-			// execution time, after the confirmed save), so cancelling this filter's
-			// own stagings is just dropping their descriptors and undoing what they
-			// staged. Both undos are idempotent, so a revoked entry passing through
-			// either is inert.
+			// The sess.cons entries are still there — the release runs at the
+			// packet's final-update boundary, which is later than any per-filter
+			// cancellation can be — so cancelling this filter's own stagings is just
+			// dropping their descriptors and undoing what they staged. Both undos are
+			// idempotent, so a revoked entry passing through either is inert.
 			var reopen []*subscription
 			var unvoid []string
 			for _, dd := range deferredDels[filterDefStart:] {
@@ -9596,7 +9601,15 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		var conv mqttDowngradeConversion
 		convert := func() bool {
 			conv = sess.convertDowngradeCandidatesLocked(c, deferredDels)
-			return conv.any()
+			// And the downgrades that are NOT becoming drains give up their cons entry
+			// here, so this record does not name a durable the teardown below deletes.
+			// Its result is ORed into the return: the membership change usually forces
+			// the save on its own, but a QoS 0 re-SUBSCRIBE over a filter ALREADY at
+			// QoS 0 changes no membership, and without this the entry would leave
+			// memory while the record kept naming it. See
+			// releaseDowngradedConsumersLocked.
+			released := sess.releaseDowngradedConsumersLocked(deferredDels)
+			return conv.any() || released
 		}
 		// The fallback arm's tombstones ride the packet's own securing below, so they are
 		// appended once the conversion has run.
@@ -9642,6 +9655,15 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				if conv.any() {
 					sess.retainOnLanded(func(recordTx) { sess.finishDowngradeDrains(c, conv) })
 				}
+				// A RELEASED destructive downgrade owes its MaxAckPending charge back, and
+				// this is the only arm where nothing else gives it: the teardown below is
+				// never reached, and the sweep that reaps the durable has no session to
+				// refund. Refund only — the cons entry stays gone, because re-persisting it
+				// under the QoS 0 membership is the defect this item closed. See
+				// refundReleasedDowngrades.
+				if refunds := mqttReleasedDowngradeDurables(deferredDels); len(refunds) > 0 {
+					sess.retainOnLanded(func(recordTx) { sess.refundReleasedDowngrades(refunds) })
+				}
 				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state: %v", sess.id, err)
 				return nil, facts, err
 			}
@@ -9662,6 +9684,11 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// unconvertDowngradeDrainsLocked.
 			sess.mu.Lock()
 			sess.unconvertDowngradeDrainsLocked(conv)
+			// Same reason, other half: the rollback finds this packet's own consumers by
+			// walking sess.cons, and a released downgrade has left it, so a durable this
+			// packet CREATED and then downgraded would be named nowhere in the
+			// rolled-back record and released by nobody.
+			sess.restoreDowngradedConsumersLocked(deferredDels)
 			sess.mu.Unlock()
 			sess.rollbackSubscribePacket(c, tok, subs, consSnap, snap, q2AffPrePacket)
 			sess.secureRegCancellations(c, tok, stagedCancels)
@@ -21176,15 +21203,20 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		// If current QoS is 0, it means that we need to delete the existing
 		// one (that was QoS > 0)
 		if qos == 0 {
-			// When processing a SUBSCRIBE packet, DEFER the whole teardown
-			// (including removing the sess.cons entry) until the packet's final
-			// session save is confirmed — and where the consumer still holds started
-			// deliveries the packet CONVERTS it into a drain at that save instead of
-			// tearing it down at all: the save can still fail and its rollback
-			// must restore the pre-packet QoS1/2 state, and any save issued
-			// mid-packet (a later shared filter's early persist) must serialize a
-			// record consistent with reality — Subs still says QoS1/2 until the
-			// final update, so the consumer entry must stay alongside it. The
+			// When processing a SUBSCRIBE packet, DEFER the teardown until the
+			// packet's final session save is confirmed — and where the consumer
+			// still holds started deliveries the packet CONVERTS it into a drain at
+			// that save instead of tearing it down at all: the save can still fail
+			// and its rollback must restore the pre-packet QoS1/2 state, and any
+			// save issued mid-packet (a later shared filter's early persist) must
+			// serialize a record consistent with reality — Subs still says QoS1/2
+			// until the final update, so the consumer entry must stay alongside it.
+			//
+			// The cons ENTRY, though, goes one step earlier than the teardown: at
+			// the final-update boundary, in the same critical section that applies
+			// the QoS 0 membership, because the membership and the consumer
+			// reference are one fact and the record must not carry the first while
+			// still naming the second. See releaseDowngradedConsumersLocked. The
 			// caller executes execDeferredConsumerDelete after the confirmed save.
 			// Spec5 [4.8.2].
 			if fromSubProto {
@@ -21375,10 +21407,15 @@ func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok rec
 	c.mu.Unlock()
 
 	sess.mu.Lock()
-	// The entry stays in sess.cons until this irreversible teardown actually
-	// runs, so any save issued in between persists a record that still
-	// references the (still-existing) durable. Remove it only when present and
-	// still pointing at this consumer (a rollback may have reconciled the map).
+	// The entry usually left sess.cons already, at the packet's final-update boundary
+	// (releaseDowngradedConsumersLocked), which is what keeps the record that carries
+	// the QoS 0 membership from naming this durable. Every save issued BEFORE that
+	// boundary still persists it, and must: until the membership is applied, the
+	// pre-packet QoS 1/2 subscription is the truth and its consumer belongs beside it.
+	//
+	// So this removal is not the only one, and it is not redundant either — the restore
+	// path reaches here with no packet and no boundary, and a rollback may have put the
+	// entry back. Remove it only when present and still pointing at this consumer.
 	if cur, ok := sess.cons[sid]; ok && cur == cc {
 		delete(sess.cons, sid)
 	}

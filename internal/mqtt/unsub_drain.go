@@ -3043,3 +3043,143 @@ func (sess *mqttSession) unconvertDowngradeDrainsLocked(conv mqttDowngradeConver
 		sess.cons[sid] = d.cc
 	}
 }
+
+// releaseDowngradedConsumersLocked takes the DESTROYED downgrades out of sess.cons, so the
+// record about to be written does not name a durable this packet is about to delete.
+// Reports whether it released anything.
+//
+// Runs at the same boundary as the conversion and for the same reason. A downgrade's
+// membership becomes QoS 0 only in this critical section, and the consumer reference is the
+// other half of that one fact: a record carrying the membership while still naming the
+// consumer describes a state the packet has already decided against, and three recovery
+// surfaces read it as live — CONNECT restore hands it to processJSConsumer's
+// existing-consumer arm, fork repair's per-sid table reads it as a live consumer, and
+// clear()'s teardown marker offers its durable to whichever broker adopts the teardown.
+//
+// It is a SEPARATE pass rather than an arm of the conversion, because the conversion
+// deliberately skips a descriptor whose stream forbids draining (dd.convert false) and that
+// is exactly the population that must be released here.
+//
+// WHAT IT DOES NOT TOUCH, and each exclusion is the whole point:
+//
+//   - A CONVERTED descriptor. Its durable is a drain now, named in the record's Drains, and
+//     stageDrain already removed the cons entry.
+//   - A REVOKED one. A later occurrence re-established QoS > 0, so the record ends naming
+//     this durable and the client is being served by it.
+//   - An entry that is no longer IDENTICALLY dd.cc. Defensive, as in the conversion: the
+//     staging that would replace it needs the same identity, so no production producer is
+//     demonstrated — but evicting a consumer another occurrence installed would destroy a
+//     live subscription's delivery.
+//   - A membership that is ABSENT rather than zero. A missing key is a removal, which is
+//     UNSUBSCRIBE's path and already omits the consumer by the builder's own presence test.
+//     Read with the two-value form so the two facts stay distinguishable.
+//
+// The IN-MEMORY entry is what leaves; nothing else moves. dd.cc still carries the config the
+// teardown needs, so there is no second home for it, and the durable stays referenced by
+// this session's own sess.cons only until this boundary — after it, until the teardown
+// deletes the durable, an orphan sweep on ANY broker may delete it instead. That is
+// deliberate and bounded: every descriptor reaching this pass is one whose teardown is
+// already owed, so a sweep performs the packet's own decision early. The same release
+// against a drained or adopted durable would be a loss, which is why those are excluded
+// above and why Drains is in the record.
+//
+// sess.mu must be held, the membership must already be applied, and the caller must not
+// have saved since.
+func (sess *mqttSession) releaseDowngradedConsumersLocked(dels []*mqttDeferredDel) bool {
+	var released bool
+	for _, dd := range dels {
+		if dd == nil || dd.revoked || dd.converted || dd.consReleased || dd.cc == nil {
+			continue
+		}
+		if cur, ok := sess.cons[dd.sid]; !ok || cur != dd.cc {
+			continue
+		}
+		if qos, ok := sess.subs[mqttFilterForSid(dd.sid)]; !ok || qos != 0 {
+			continue
+		}
+		delete(sess.cons, dd.sid)
+		dd.consReleased = true
+		released = true
+	}
+	return released
+}
+
+// restoreDowngradedConsumersLocked is releaseDowngradedConsumersLocked's inverse, run on a
+// DEFINITE save failure before rollbackSubscribePacket enumerates.
+//
+// The rollback restores sess.cons wholesale from the pre-packet snapshot, which returns
+// every entry that predates the packet for free. What it cannot recover is a consumer THIS
+// PACKET CREATED and then downgraded: the rollback discovers those by walking sess.cons, so
+// one this boundary released would be named nowhere in the rolled-back record and released
+// by nobody. Same trap, and same fix, as unconvertDowngradeDrainsLocked above.
+//
+// It re-inserts only where the sid is ABSENT. Recording that we removed an entry does not
+// prove nothing has been installed there since, and overwriting a config another path
+// installed would repoint delivery at a durable this packet is about to delete. Where it
+// therefore skips, the released durable is left named by nothing and is the orphan sweep's
+// — the same disposition the release itself accepts, and the right one, because whatever
+// occupies that sid now is what the session is actually serving.
+//
+// sess.mu must be held.
+func (sess *mqttSession) restoreDowngradedConsumersLocked(dels []*mqttDeferredDel) {
+	for _, dd := range dels {
+		if dd == nil || !dd.consReleased || dd.cc == nil {
+			continue
+		}
+		dd.consReleased = false
+		if _, ok := sess.cons[dd.sid]; ok {
+			continue
+		}
+		if sess.cons == nil {
+			sess.cons = make(map[string]*ConsumerConfig)
+		}
+		sess.cons[dd.sid] = dd.cc
+	}
+}
+
+// mqttReleasedDowngradeDurables names the durables a released downgrade still owes a
+// MaxAckPending refund for, snapshotted while the descriptors are still the packet's.
+//
+// `consReleased` alone is the predicate, and it is exclusive with the other outcomes by
+// construction: the release skips a converted, revoked or replaced descriptor, so a set
+// bit means this packet took that consumer out of `sess.cons` and owns what follows.
+func mqttReleasedDowngradeDurables(dels []*mqttDeferredDel) []string {
+	var durs []string
+	for _, dd := range dels {
+		if dd == nil || !dd.consReleased || dd.cc == nil {
+			continue
+		}
+		durs = append(durs, dd.cc.Durable)
+	}
+	return durs
+}
+
+// refundReleasedDowngrades gives back what those durables were charged, and does NOTHING
+// else — no `sess.cons` entry returns and no durable is deleted.
+//
+// It exists for the AMBIGUOUS landed save, the one arm where the teardown that would have
+// refunded never runs: the packet returns before its deferred-delete loop, and the orphan
+// sweep that eventually reaps the durable deletes through `as.jsa.deleteConsumer`, which
+// has no session to refund. Left alone, a resident session keeps the charge for the rest of
+// its life and a later subscription can be refused by the aggregate MaxAckPending ceiling —
+// a documented residual until a holistic round weighed it as lost availability rather than
+// lost tidiness.
+//
+// **Refund only, deliberately.** Restoring the `cons` entry here is the design this item
+// refuted: it re-persists `Cons` under the QoS 0 membership through the builder's unchanged
+// presence predicate, which is the defect. And the DELETE is not moved here either — that
+// needs a JetStream call and a classified result under the resolver's fence, for a route
+// whose sweep convergence is an accepted residual, while this refund is memory-only and
+// idempotent (`refundConsumerChargeLocked` deletes the entry it consumes).
+//
+// The charge is honest to give back: the delivery subscription stayed CLOSED on this arm, so
+// the orphaned durable holds no in-flight budget the client can use.
+//
+// sess.mu must NOT be held: the resolver runs its continuations with the mutex released.
+func (sess *mqttSession) refundReleasedDowngrades(durs []string) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for _, dur := range durs {
+		sess.refundConsumerChargeLocked(dur)
+	}
+}

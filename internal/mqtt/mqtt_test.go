@@ -5892,11 +5892,12 @@ func TestMQTTSubDuplicateFilterDowngradeThenUpgradeWildcardBothHalves(t *testing
 // TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes is the regression guard in the
 // other direction: [{foo,1},{foo,0}] ends at QoS 0 and the durable must go.
 //
-// It also asserts Cons["foo"] is STILL PRESENT in the record. That is a SEPARATE,
-// pre-existing defect — buildPersistedSessionLocked keys Cons on membership PRESENCE, not
-// positive QoS, so every ordinary QoS 1 -> 0 downgrade persists a consumer reference and
-// then deletes the durable — filed as its own roadmap bullet. Pinned here rather than left
-// silent, so the day it is fixed this assertion is what flags the change.
+// It also asserts Cons["foo"] is ABSENT from the record. This assertion used to demand the
+// opposite, as pinned evidence of a filed defect: the record named a consumer the same
+// packet then deleted. The fix is not in the record BUILDER — a cons entry at a QoS 0
+// membership can be a live adopted durable, and omitting those lets a peer's orphan sweep
+// delete a started exchange — but at the packet's final-update boundary, which is where a
+// DESTROYED downgrade now gives its entry up. See releaseDowngradedConsumersLocked.
 func TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -5935,14 +5936,14 @@ func TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes(t *testing.T) {
 
 	asm := testMQTTGetAccountSessionManager(t, s, "sub")
 	ps, _ := testReconcileRecord(t, asm, "sub")
-	if ps.Subs["foo"] != 0 {
-		t.Fatalf("the record must end at QoS 0, got %v", ps.Subs["foo"])
+	// Two-value form: a MISSING key also reads as zero, and a missing key is a removal,
+	// which is a different fact and a different code path.
+	if qos, ok := ps.Subs["foo"]; !ok || qos != 0 {
+		t.Fatalf("the record must end with the membership PRESENT at QoS 0, got %v (present %v)", qos, ok)
 	}
-	if ps.Cons["foo"] == nil {
-		t.Fatal("EXPECTED FAILURE POINT: the record's stale Cons entry for a QoS 0 " +
-			"membership is a separate filed defect, asserted here as evidence rather " +
-			"than hidden. If this fires, that defect was fixed and this assertion is " +
-			"what must be updated")
+	if ps.Cons["foo"] != nil {
+		t.Fatalf("a QoS 0 membership whose consumer was DESTROYED must not be named in "+
+			"the record, got %+v", ps.Cons["foo"])
 	}
 }
 
