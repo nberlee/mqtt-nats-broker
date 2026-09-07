@@ -3833,7 +3833,18 @@ func TestMQTTReconnectForcesRedeliveryWithDUP(t *testing.T) {
 // consumer's pending (unacknowledged) deliveries must be purged too, otherwise
 // their packet identifiers leak and permanently count against the in-flight cap
 // for the life of the session (as mqttProcessUnsubs already does).
-func TestMQTTQoS0DowngradePurgesPending(t *testing.T) {
+// TestMQTTQoS0DowngradeDrainsPendingInsteadOfPurging replaces
+// TestMQTTQoS0DowngradePurgesPending, whose assertion encoded the DEFECT rather than the
+// intended behavior: it required a QoS 0 re-SUBSCRIBE to purge the pending maps, which
+// destroys an exchange the broker has already transmitted.
+//
+// [MQTT-3.8.4-3] requires the replacement to be accepted without interrupting the flow of
+// publications, so the downgrade now converts the consumer into a DRAIN and the exchange
+// stays tracked and completable — the same obligation
+// TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe below has always honored for
+// UNSUBSCRIBE under [MQTT-3.10.4-3]. The contrast between those two tests was the defect
+// in miniature.
+func TestMQTTQoS0DowngradeDrainsPendingInsteadOfPurging(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -3874,13 +3885,30 @@ func TestMQTTQoS0DowngradePurgesPending(t *testing.T) {
 		t.Fatalf("Expected 1 pending publish/cpending before downgrade, got %v/%v", np, nc)
 	}
 
-	// Re-subscribe the same filter at QoS 0: deletes the JS consumer and must
-	// purge its pending deliveries.
+	// Re-subscribe the same filter at QoS 0. The consumer is not destroyed: it becomes a
+	// drain that owes this exchange, and the QoS 0 filter is served by the raw
+	// subscription instead.
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 0}}, []byte{0})
 	testMQTTFlush(t, c, nil, r)
 
-	if np, nc := countPending(); np != 0 || nc != 0 {
-		t.Fatalf("Expected pending maps purged after QoS 0 downgrade, got pendingPublish=%v cpending=%v", np, nc)
+	if np, nc := countPending(); np != 1 || nc != 1 {
+		t.Fatalf("the downgrade must KEEP the started exchange, got pendingPublish=%v cpending=%v: "+
+			"purging it destroys a PUBLISH the broker has already sent", np, nc)
+	}
+	// And it is the drain's now, not a live consumer's (I7).
+	mc := testMQTTGetClient(t, s, "sub")
+	mc.mu.Lock()
+	sess := mc.mqtt.sess
+	mc.mu.Unlock()
+	sess.mu.Lock()
+	_, stillCons := sess.cons["foo"]
+	drains := len(sess.drains)
+	sess.mu.Unlock()
+	if stillCons {
+		t.Fatal("the downgraded consumer must leave sess.cons: the drain owns the sid")
+	}
+	if drains != 1 {
+		t.Fatalf("the downgrade must convert its consumer into a drain, got %d", drains)
 	}
 }
 
@@ -6673,21 +6701,31 @@ func TestMQTTSubDuplicateFilterCompanionFailureRestagesBothHalves(t *testing.T) 
 	}
 }
 
-// TestMQTTSubDuplicateFilterEarlySharedSavePersistsAVoidVerdictThenRevokes pins the
+// TestMQTTSubDuplicateFilterEarlySharedSaveRecordsNoVoidVerdict pins the
 // early-shared-save window in BOTH directions.
 //
-// A shared filter between the two occurrences persists the session record MID-LOOP, and
-// that record carries occurrence 1's void verdict on a TRANSMITTED register beside a
-// still-pre-packet plain membership. A crash there leaves a record saying a delivery the
-// client is holding was never transmitted. That exposure is PRE-EXISTING and this change
-// does not close it, so the first assertion pins it — a future change cannot widen it
-// unnoticed — and the second pins what the revocation does fix: the packet's own save
-// withdraws the verdict durably.
+// A shared filter between the two occurrences persists the session record MID-LOOP,
+// beside a still-pre-packet plain membership. This test used to assert that the record
+// carried occurrence 1's void verdict on a TRANSMITTED register — a record saying a
+// delivery the client is holding was never transmitted — and it pinned that as a
+// PRE-EXISTING exposure, with its own instruction that "if this fires, that window was
+// closed and this assertion is what must be updated".
+//
+// **It fired, and the window is closed.** The QoS 0 downgrade now stages a conversion
+// CANDIDATE, whose staging cancels the not-yet-transmitted allocations but records no
+// verdict on the transmitted ones — because those exchanges are about to be drained
+// rather than abandoned, and a verdict any mid-packet save makes durable would be a lie
+// that unvoiding could not retract. So the assertion is inverted rather than deleted: the
+// early save must carry NO such verdict, and a future change reintroducing one fails
+// here.
+//
+// The second direction is unchanged and still asserted: the packet's own save must not
+// carry the verdict either, so nothing survives to the next resume.
 //
 // MQTT 5 throughout, because shared subscriptions are a v5 feature: a 3.1.1 client's
 // "$share/g/bar" is an ordinary topic filter, which stages no early save at all and would
 // leave this test asserting nothing.
-func TestMQTTSubDuplicateFilterEarlySharedSavePersistsAVoidVerdictThenRevokes(t *testing.T) {
+func TestMQTTSubDuplicateFilterEarlySharedSaveRecordsNoVoidVerdict(t *testing.T) {
 	// NOT parallel: process-global seams, see the note on the repeated-downgrade test.
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -6741,25 +6779,27 @@ func TestMQTTSubDuplicateFilterEarlySharedSavePersistsAVoidVerdictThenRevokes(t 
 		t.Fatalf("expected an early shared-filter save and the packet's own save, got %d writes", len(got))
 	}
 	early, final := got[0], got[len(got)-1]
-	// The early save is the exposure: the void verdict is durable BESIDE a membership
-	// that is still the pre-packet one. Both halves are asserted, because it is the
-	// COMBINATION that makes a crash there incoherent.
+	// The early save still lands mid-loop beside the PRE-PACKET membership — that half is
+	// unchanged, and without it this test would not be pinning the window it names.
 	if early.Subs["foo"] != 1 {
 		t.Fatalf("the early shared save must still carry the PRE-PACKET plain membership, "+
 			"got %v — without that the window this pins is not the one described", early.Subs["foo"])
 	}
-	if !carriesNonce(early, heldNonce) {
-		t.Fatal("EXPECTED FAILURE POINT: the early shared save carrying occurrence 1's void " +
-			"verdict is a PRE-EXISTING exposure this change does not close, asserted so a " +
-			"future change cannot widen it unnoticed. If this fires, that window was " +
-			"closed and this assertion is what must be updated")
+	// And it must carry NO void verdict for the held delivery. A record asserting that a
+	// delivery the client is holding was never transmitted is incoherent beside a
+	// membership that still grants QoS 1, and a crash there used to leave exactly that.
+	if carriesNonce(early, heldNonce) {
+		t.Fatal("the early shared save must record NO never-transmitted verdict for a held " +
+			"delivery: the downgrade stages a conversion candidate, whose exchanges are to " +
+			"be drained rather than abandoned, so no verdict is recorded for a mid-packet " +
+			"save to make durable")
 	}
 	if final.Subs["foo"] != 1 {
 		t.Fatalf("the packet's own save must end at the last occurrence's QoS 1, got %v", final.Subs["foo"])
 	}
 	if carriesNonce(final, heldNonce) {
-		t.Fatal("the packet's own save must carry the WITHDRAWN verdict: the revocation " +
-			"credits the un-void, so the exposure ends at the packet's commit rather " +
-			"than surviving to the next resume")
+		t.Fatal("the packet's own save must not carry the verdict either: with the " +
+			"revocation there is nothing to withdraw, and nothing may survive to the " +
+			"next resume claiming a held delivery was never sent")
 	}
 }

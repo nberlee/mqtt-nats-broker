@@ -214,7 +214,8 @@ func ensureBrokerStream(api brokerStreamAPI, cfg *StreamConfig,
 // ConsumerLimits.InactiveThreshold is deliberately NOT checked: plain
 // subscriptions already run under exactly that policy via the broker's own
 // ConsumerInactiveThreshold option, and the paths that cannot tolerate it —
-// the UNSUBSCRIBE drain and the shared/affine consumers — refuse it at runtime
+// a drain (whether an UNSUBSCRIBE or a QoS 0 downgrade created it) and the
+// shared/affine consumers — refuse it at runtime
 // (drainingAllowed in unsub_drain.go; the shared-subscription guard), with the
 // residual recorded in docs/CONFORMANCE.md. The same field IS fatal on
 // $MQTT_out: that asymmetry is the derive-per-owner rule, not an inconsistency.

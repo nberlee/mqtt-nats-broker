@@ -2274,7 +2274,10 @@ func TestMQTTInflightDeferredDeleteStagingIsReversible(t *testing.T) {
 		sseq := e.publishSource(t, dur)
 		e.sess.mu.Lock()
 		e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1)) //nolint:dogsled // regPending by design
-		cancels, closed, _ := e.sess.stageDeferredDeleteLocked(e.c, cc)
+		// convert=false: this test owns the DESTRUCTIVE staging, whose cancel-and-void
+		// behavior is unchanged. The conversion candidate's staging is covered by the
+		// QoS 0 downgrade tests.
+		cancels, closed, _ := e.sess.stageDeferredDeleteLocked(e.c, cc, false)
 		e.sess.mu.Unlock()
 		if len(cancels) != 1 {
 			t.Fatalf("the deferral must withdraw the pending registration, got %+v", cancels)

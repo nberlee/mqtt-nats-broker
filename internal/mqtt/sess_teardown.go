@@ -1185,7 +1185,8 @@ func mqttTeardownTargetFromRecord(ps *mqttPersistedSession, idHash string) *mqtt
 		}
 		t.durs = append(t.durs, cc.Durable)
 	}
-	// A draining durable belongs to this session too: it outlived an UNSUBSCRIBE
+	// A draining durable belongs to this session too: it outlived the removal of its
+	// membership (an UNSUBSCRIBE, or a QoS 0 re-SUBSCRIBE)
 	// only because started deliveries were owed, and the session ending discharges
 	// that. See unsub_drain.go.
 	for _, pd := range ps.Drains {

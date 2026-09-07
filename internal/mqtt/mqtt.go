@@ -715,12 +715,25 @@ func setMQTTTestDeliverySkippedHook(h func(sub *subscription, reply string)) fun
 
 // mqttTestSubPauseV pauses a LIVE SUBSCRIBE packet at one named boundary of its filter
 // loop, so a test can act while the packet is in a specific state. The boundaries are the
-// ones this item's ordering claims live across, and both are outside the session locks:
+// ones this item's ordering claims live across.
 //
-//	"staged:<sid>"   after one occurrence staged a deferred downgrade: the delivery
-//	                 barrier is down and the packet is still running
-//	"revoked:<sid>"  after a later occurrence revoked that staging and before
-//	                 processJSConsumer's refresh arm re-applies the same terms
+// LOCK OWNERSHIP IS PER LABEL and a fixture must read it here before acting: three of
+// these run with NO session lock held, and one runs UNDER sess.mu, where a hook that
+// acquires sess.mu deadlocks and one that expects a delivery to make progress waits
+// forever.
+//
+//	"staged:<sid>"        no locks held. After one occurrence staged a deferred
+//	                      downgrade: the delivery barrier is down, the packet runs on
+//	                      "provisioned:<sid>"   no locks held. After one filter's installs
+//	                      are complete on a live SUBSCRIBE, later filters not started
+//	"revoked:<sid>"       no locks held. After a later occurrence revoked that staging and
+//	                      before processJSConsumer's refresh arm re-applies the same terms
+//	"converted:<sid>"     **sess.mu HELD.** Fired from inside the final-update boundary,
+//	                      after a downgrade's consumer became a drain and before that
+//	                      record is saved — the whole point of the boundary is that the
+//	                      membership and the map move are one critical section, so the
+//	                      hook cannot take sess.mu, cannot wait on a delivery callback,
+//	                      and must only read what it is handed or store into an atomic
 //
 // The second is what makes "the terms are installed WITH the reopen" testable at all: a
 // post-SUBACK publication cannot distinguish the revocation's write from the refresh's.
@@ -2123,7 +2136,9 @@ type mqttSession struct {
 	regClaim string
 
 	cons map[string]*ConsumerConfig
-	// drains holds consumers that survived an UNSUBSCRIBE with started deliveries
+	// drains holds consumers that survived the removal of their membership — an
+	// UNSUBSCRIBE, or a re-SUBSCRIBE downgrading the filter to QoS 0 — with started
+	// deliveries
 	// still pending, keyed by sid; drainByDur is the same set keyed by durable, for
 	// the delivery callback. A drained consumer lives EXCLUSIVELY here — its
 	// cons[sid] entry is gone — so nothing can reach it through cons and create a
@@ -2460,7 +2475,8 @@ type mqttPersistedSession struct {
 	// anything. See sess_fork_lineage.go.
 	WID  string `json:"wid,omitempty"`
 	PWID string `json:"pwid,omitempty"`
-	// Drains are the consumers that survived an UNSUBSCRIBE because deliveries they
+	// Drains are the consumers that survived their membership's removal (an UNSUBSCRIBE,
+	// or a QoS 0 re-SUBSCRIBE) because deliveries they
 	// had already STARTED must still be completed ([MQTT-3.10.4-3]). Keyed by the
 	// same sid as Cons, so a "foo/#" filter's level-up companion drains
 	// independently. Deliberately kept OUT of Cons, because Cons restores straight
@@ -2594,9 +2610,11 @@ type mqttSub struct {
 	// Spec5 [4.8.2].
 	shared bool
 
-	// closed marks the subscription as torn down (QoS downgrade to 0, or
-	// unsubscribe) so QoS 1/2 delivery callbacks stop tracking new messages for
-	// it. Guarded like qos/jsDur (sess.mu or sess.subsMu). Unlike clearing
+	// closed marks the subscription as barriered so QoS 1/2 delivery callbacks stop
+	// tracking new messages for it: a QoS downgrade to 0 or an unsubscribe. It does NOT
+	// imply the subscription is going away — a downgrade that converts its consumer into
+	// a drain reopens this same object once the record is confirmed, because the drain
+	// still owes what it transmitted. Guarded like qos/jsDur (sess.mu or sess.subsMu). Unlike clearing
 	// sub.mqtt, this keeps the struct valid for an in-flight enqueue.
 	closed bool
 
@@ -8660,6 +8678,18 @@ type mqttDeferredDel struct {
 	// run. The entry STAYS in the packet's list: a per-filter cancellation still has to
 	// find it, to re-stage the downgrade when the reviving occurrence itself fails.
 	revoked bool
+	// convert says this consumer is ELIGIBLE to become a drain instead of being destroyed,
+	// because the stream permits draining at all (drainingAllowed, checked once per
+	// packet). It says nothing about whether the consumer holds started deliveries —
+	// stageDrain decides that, once, at the conversion boundary, so there is exactly one
+	// "started deliveries" predicate. A candidate's staging cancels the not-yet-transmitted
+	// allocations but does NOT void the transmitted ones, because those are the exchanges
+	// the conversion preserves. See convertDowngradeCandidatesLocked.
+	convert bool
+	// converted says the conversion actually happened, so the confirmed save must NOT run
+	// the irreversible teardown for this entry: the durable is a drain now, named in the
+	// record's Drains, and its started deliveries are still owed to the client.
+	converted bool
 }
 
 // revokeLocked undoes this staging because a LATER occurrence of the same filter in the
@@ -8675,11 +8705,15 @@ type mqttDeferredDel struct {
 // live entry created by this packet the pair "cons[sid] present, its delivery subscription
 // closed" has no other producer — which is why its test synthesizes the state.
 //
-// What it deliberately does NOT undo is the staged CANCELLATIONS. voidRegistrationsLocked
-// destroyed the not-yet-transmitted allocations outright: the pending slot is a cancelled
-// stub and the ack subject is parked in sess.deferred. Their tombstones must still ride the
-// packet's write, or a register store still in flight lands with nothing to explain it and
-// holds an identifier and a Receive Maximum slot for the rest of the session. The message
+// What it deliberately does NOT undo is the staged CANCELLATIONS. The staging destroyed
+// the not-yet-transmitted allocations outright: the pending slot is a cancelled stub and
+// the ack subject is parked in sess.deferred. Their tombstones must still ride the packet's
+// write, or a register store still in flight lands with nothing to explain it and holds an
+// identifier and a Receive Maximum slot for the rest of the session. Their withheld markers
+// stay in sess.deferred for the same reason, and a resumed delivery consumes one normally.
+//
+// For a CONVERSION CANDIDATE there is also nothing to un-void: its staging recorded no
+// verdict on a transmitted register, precisely because those exchanges were to be drained. The message
 // itself is untransmitted and unacked in JetStream, so it is re-offered through the
 // subscription this revocation just restored and trackPublish allocates a fresh identifier.
 //
@@ -9048,14 +9082,19 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		return err
 	}
 
-	// Irreversible teardown of consumers removed by a QoS downgrade in this
-	// packet is deferred until the final session save is confirmed, so a failed
-	// save can restore the pre-packet consumer instead of having lost its
-	// durable/cursor. Spec5 [4.8.2].
+	// Teardown of consumers removed by a QoS downgrade in this packet is deferred until
+	// the final session save is confirmed, so a failed save can restore the pre-packet
+	// consumer instead of having lost its durable/cursor. Spec5 [4.8.2].
 	//
-	// Each entry also carries what its deferral staged — the barrier it lowered and the
-	// verdicts it recorded — so the list is the SINGLE authority on "this consumer is
-	// being torn down by this packet". See mqttDeferredDel for why the two parallel
+	// And it is irreversible only where the consumer is DESTROYED. One that still holds
+	// started deliveries becomes a DRAIN instead, at the final-update boundary: the
+	// client's exchange survives the downgrade because [MQTT-3.8.4-4] forbids
+	// interrupting the flow of publications. See convertDowngradeCandidatesLocked.
+	//
+	// Each entry also carries what its deferral staged — the barrier it lowered, the
+	// verdicts it recorded, and its DISPOSITION (destroy, or convert into a drain) — so
+	// the list is the SINGLE authority on "this consumer is being removed by this packet
+	// and what becomes of it". See mqttDeferredDel for why the two parallel
 	// slices that used to hold those facts are gone.
 	var deferredDels []*mqttDeferredDel
 	// Registrations this packet withdraws, cancelled inside its own transaction. Unlike
@@ -9085,13 +9124,29 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 		return nil
 	}
+	// mayDrain answers "may this packet convert a downgraded consumer into a drain at all",
+	// and it is the ELIGIBILITY half of that question only. Evaluated ONCE per packet and
+	// lazily, on the first staging: the precondition is a property of the messages stream,
+	// not of a filter, and drainingAllowed does a stream lookup with no lock held. The
+	// UNSUBSCRIBE path checks it once per packet for the same reason.
+	//
+	// False means the stream imposes a consumer inactivity limit (or it cannot be read), so
+	// a drain would be reaped with its started messages: the downgrade falls back to today's
+	// destructive teardown and says so, which is a stated residual in docs/CONFORMANCE.md.
+	mayDrainKnown, mayDrainOK := false, false
+	mayDrain := func() bool {
+		if !mayDrainKnown {
+			mayDrainOK, mayDrainKnown = sess.drainingAllowed(c), true
+		}
+		return mayDrainOK
+	}
 	// stageDeferredDel records one deferred teardown and everything it stages, or reports
 	// that this packet has already staged this sid.
 	stageDeferredDel := func(sid string, cc *ConsumerConfig) {
 		if liveDeferredDel(sid) != nil {
 			return
 		}
-		dd := &mqttDeferredDel{sid: sid, cc: cc}
+		dd := &mqttDeferredDel{sid: sid, cc: cc, convert: mayDrain()}
 		// The teardown itself is deferred to the confirmed save, but the CANCELLATION
 		// is not: it belongs in the write that downgrades this filter, or the
 		// identifier it withdraws has nothing to recover it. The delivery barrier
@@ -9099,7 +9154,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// a rollback — or a revocation — reopens it, because the QoS 1/2 subscription
 		// is then still the client's.
 		sess.mu.Lock()
-		cancels, sub, sent := sess.stageDeferredDeleteLocked(c, cc)
+		cancels, sub, sent := sess.stageDeferredDeleteLocked(c, cc, dd.convert)
 		sess.mu.Unlock()
 		dd.closed, dd.voided = sub, sent
 		stagedCancels = append(stagedCancels, cancels...)
@@ -9114,8 +9169,12 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	// processJSConsumer, which cannot see the packet's stack, is where the grant is
 	// otherwise made blind.
 	//
-	// The two are mutually exclusive by I7 (a drain has no cons entry; a staged
-	// downgrade has one), so their order here is a readability choice.
+	// The two never apply to one sid at the same moment, and the invariant is TEMPORAL
+	// rather than I7's structural one: a staged downgrade holds its cons entry for the
+	// whole filter loop, and the conversion that turns it into a drain runs after the last
+	// occurrence — so no revocation can follow it. Their order here is a readability
+	// choice. (I7 alone used to be the argument, and a downgrade that becomes a drain
+	// makes one sid reachable through both maps over the packet's lifetime.)
 	//
 	// The QoS condition lives at the CALL SITE only. A second copy inside would be a
 	// guard no test can pin: a QoS 0 occurrence that revoked would immediately re-stage
@@ -9284,9 +9343,14 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// membership stands. Re-staged through the same helper rather than by
 			// restoring the saved barrier and verdicts, because between the revocation
 			// and this failure the barrier was OPEN and the durable live — new
-			// deliveries may have been tracked and new identifiers allocated, and only
-			// a fresh voidRegistrationsLocked withdraws them into the packet's own
-			// membership-removal write.
+			// deliveries may have been tracked and new identifiers allocated, and only a
+			// fresh withdrawal takes them into the packet's own membership-removal write.
+			//
+			// WHICH withdrawal depends on the disposition, and the helper decides: a
+			// consumer being DESTROYED takes voidRegistrationsLocked, verdicts and all,
+			// while a conversion CANDIDATE takes the cancel arm alone and leaves its
+			// transmitted registers untouched, because those exchanges are about to be
+			// drained rather than abandoned.
 			for _, sid := range revokedThisFilter {
 				dd := func() *mqttDeferredDel {
 					for _, d := range deferredDels {
@@ -9301,7 +9365,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				}
 				dd.revoked = false
 				sess.mu.Lock()
-				cancels, sub, sent := sess.stageDeferredDeleteLocked(c, dd.cc)
+				cancels, sub, sent := sess.stageDeferredDeleteLocked(c, dd.cc, dd.convert)
 				sess.mu.Unlock()
 				dd.closed, dd.voided = sub, sent
 				stagedCancels = append(stagedCancels, cancels...)
@@ -9503,6 +9567,15 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		// THE COMMIT BOUNDARY. Both halves are installed and every per-filter failure exit
 		// above has been passed, so this filter's interest is the client's.
 		facts.interestRestored = facts.interestRestored || filterInstalled
+		if fromSubProto {
+			// The LIVE counterpart, and it exists for one thing a test cannot otherwise
+			// schedule: a packet carrying the same filter twice, where a delivery must be
+			// transmitted through the consumer the FIRST occurrence created before the
+			// second occurrence downgrades it. Without that transmission the second
+			// occurrence has nothing started, so no conversion happens and a test named
+			// after the conversion would pass against a broker that never converts.
+			mqttTestSubPauseHook("provisioned:" + sid)
+		}
 		if !fromSubProto {
 			// One filter's installs are complete and later filters are not started.
 			// The seam is here rather than at the end of the restore because that is
@@ -9514,12 +9587,37 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 
 	if fromSubProto {
 		wasUncertain := sess.isSeqUncertain()
-		if err = sess.update(tok, filters, true); err != nil {
+		// The QoS 0 downgrades this packet staged become DRAINS here rather than being
+		// destroyed, inside the same critical section that applies the membership and
+		// carried by the same record: either the filter is at QoS 0 and its drain exists,
+		// or neither is persisted. [MQTT-3.8.4-3] requires the replacement to be accepted
+		// without interrupting the flow of publications, so an exchange already
+		// transmitted must still complete. See unsub_drain.go.
+		var conv mqttDowngradeConversion
+		convert := func() bool {
+			conv = sess.convertDowngradeCandidatesLocked(c, deferredDels)
+			return conv.any()
+		}
+		// The fallback arm's tombstones ride the packet's own securing below, so they are
+		// appended once the conversion has run.
+		//
+		// Assigned unconditionally, in HEAD's shape. A review round read the conditional
+		// form as able to leave a stale per-filter error standing into a SUCCESSFUL save;
+		// it cannot, because every per-filter failure arm assigns an err SHADOWED inside
+		// the loop body (declared above the provisioning block) and the shared
+		// early-persist arm's comes from its own `:=`, so this outer err is always nil
+		// here. Kept unconditional anyway: the equivalence is a scoping accident, and one
+		// that a later edit moving a failure arm outside the shadow would silently
+		// destroy.
+		_, err = sess.updateWithDetailConverting(tok, filters, true, convert)
+		stagedCancels = append(stagedCancels, conv.cancels...)
+		if err != nil {
 			// The session record could not be persisted. Rather than leave a
 			// partially-applied SUBSCRIBE live with no SUBACK sent, tear down every
 			// subscription and consumer newly created in this packet, restore the
 			// pre-packet membership and consumer entries (deferred downgrade deletes
-			// were never executed, so their durables are intact), then return the
+			// were never executed, so their durables are intact, and any conversion is
+			// un-converted first so the enumeration below can see it), then return the
 			// error so the connection closes. Spec5 [4.8.2].
 			//
 			// ONLY when the write definitely did not land. An ambiguous one may have
@@ -9535,6 +9633,15 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// Not resolved here: the packet's transaction is still open and the
 				// resolver must hold the fence. The readLoop resolves after it closes.
 				// See mqttResolveAfterPacket.
+				//
+				// The converted drains stay STAGED and their delivery stays closed:
+				// nothing is committed, reopened or deleted until those exact bytes are
+				// proven durable. settleLandedAttempt runs this under the resolver's own
+				// token; a FORKED verdict discards it, which is right, because a
+				// continuation's premise is that its write landed.
+				if conv.any() {
+					sess.retainOnLanded(func(recordTx) { sess.finishDowngradeDrains(c, conv) })
+				}
 				c.Errorf("MQTT: SUBSCRIBE record write for %q is unresolved; keeping the packet's state: %v", sess.id, err)
 				return nil, facts, err
 			}
@@ -9548,11 +9655,19 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			}
 			sess.reopenTeardownDelivery(reopen)
 			sess.unvoidRegNonces(unvoid)
+			// BEFORE the rollback: it discovers this packet's own consumers by walking
+			// sess.cons, and a converted one has left that map — so without this a
+			// consumer the packet CREATED and then converted is neither restored nor
+			// released, and its durable ends up named nowhere. See
+			// unconvertDowngradeDrainsLocked.
+			sess.mu.Lock()
+			sess.unconvertDowngradeDrainsLocked(conv)
+			sess.mu.Unlock()
 			sess.rollbackSubscribePacket(c, tok, subs, consSnap, snap, q2AffPrePacket)
 			sess.secureRegCancellations(c, tok, stagedCancels)
 		} else {
-			// Save confirmed: now run the irreversible teardown of consumers that
-			// this packet downgraded to QoS0.
+			// Save confirmed: now run the irreversible teardown of the consumers that
+			// this packet downgraded to QoS 0 and did NOT convert into drains.
 			// Durable in the packet's record already; this lets the registers go now
 			// rather than at the next resume.
 			//
@@ -9574,13 +9689,22 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// list rather than being removed, so a per-filter cancellation can
 				// still find it. This loop runs after the confirmed save, on the read
 				// loop, so the flag needs no lock of its own.
-				if dd.revoked {
+				//
+				// A CONVERTED staging likewise has no teardown left: its durable is a
+				// drain now, the record names it in Drains, and its started deliveries
+				// are still owed to the client. Running the teardown here would delete
+				// the very consumer the conversion preserved.
+				if dd.revoked || dd.converted {
 					continue
 				}
 				if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc) {
 					facts.recordCASRejected = true
 				}
 			}
+			// The drains this packet created are durable now, so they may be committed
+			// and their delivery reopened. Inline here; the ambiguous arm above defers the
+			// same call to the resolver instead.
+			sess.finishDowngradeDrains(c, conv)
 			// The affine path is provisioned in the first loop, before any filter is
 			// known to succeed, so a packet whose shared QoS 2 filters all failed
 			// per-filter (a failed membership persist, a failed group-consumer
@@ -10111,7 +10235,8 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// restored QoS0 subs key, and a QoS1->QoS0 downgrade's restored subscription
 	// must be persisted WITH its pre-existing consumer config (its durable is
 	// intact because downgrade deletes are deferred until a confirmed save, which
-	// did not happen). The pre-packet consumer snapshot is authoritative for these
+	// did not happen; a converted one has been un-converted just above, so it is here
+	// to be classified rather than missing from this map). The pre-packet consumer snapshot is authoritative for these
 	// QoS transitions, which the membership maps alone cannot express. Spec5 [4.8.2].
 	var added []addedCons
 	sess.mu.Lock()
@@ -11340,10 +11465,10 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 			cons = nil
 		}
 	}
-	// Every drain is persisted, staged ones included: the UNSUBSCRIBE's save is
-	// exactly what COMMITS a staged drain, and it must carry the membership removal
-	// and the drain that replaces it in the same record — either the filter is gone
-	// and the drain exists, or neither is persisted (I4). A failed save rolls both
+	// Every drain is persisted, staged ones included: the staging packet's save is
+	// exactly what COMMITS a staged drain, and it must carry the membership change and
+	// the drain that replaces the consumer in the same record — either the filter is
+	// gone (or down at QoS 0) and the drain exists, or neither is persisted (I4). A failed save rolls both
 	// back in memory, so nothing intermediate is ever visible.
 	//
 	// A drain that claims NOTHING is deliberately omitted, which is what makes
@@ -12039,7 +12164,7 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 		}
 		durs = append(durs, cc.Durable)
 	}
-	// A draining consumer is this session's too: it survived an UNSUBSCRIBE only
+	// A draining consumer is this session's too: it survived its membership's removal only
 	// because started deliveries were still owed, and the session ending discharges
 	// that obligation. See unsub_drain.go.
 	durs = append(durs, sess.drainDurablesLocked()...)
@@ -12327,6 +12452,27 @@ func (sess *mqttSession) update(tok recordTx, filters []*mqttFilter, add bool) e
 // deliberately merges a CAS rejection with a local failure, a refused transaction, and a
 // refusal caused by an earlier uncertainty. See mqttSubPacketFacts.recordCASRejected.
 func (sess *mqttSession) updateWithDetail(tok recordTx, filters []*mqttFilter, add bool) (mqttSessSaveDetail, error) {
+	return sess.updateWithDetailConverting(tok, filters, add, nil)
+}
+
+// updateWithDetailConverting is updateWithDetail with a hook that runs INSIDE the
+// membership mutations' critical section, after them and before the lock is released.
+//
+// It exists for one caller: a SUBSCRIBE packet that must turn a QoS 0 downgrade's consumer
+// into a drain in the SAME record that carries the downgraded membership (I4, the atomicity
+// the UNSUBSCRIBE drain already has). Two things make that boundary the right one:
+//
+//   - The lock. The membership maps and sess.cons are read under sess.mu by the delivery
+//     callbacks, so applying the downgrade and moving the consumer under one acquisition is
+//     what stops a callback observing the two apart. The record fence is the packet's
+//     transaction, not this lock — the lock's claim is READER VISIBILITY.
+//   - needUpdate. A conversion must never be left in memory with nothing persisted, so the
+//     hook's return value ORs into it. Its own nil return proves nothing: this function
+//     returns a nil error when it writes nothing at all.
+//
+// Every other caller passes nil and is unaffected.
+func (sess *mqttSession) updateWithDetailConverting(tok recordTx, filters []*mqttFilter, add bool,
+	inLock func() bool) (mqttSessSaveDetail, error) {
 	// Evaluate if we need to persist anything.
 	var needUpdate bool
 	// The membership maps are read under sess.mu by the delivery callbacks, so the
@@ -12397,6 +12543,11 @@ func (sess *mqttSession) updateWithDetail(tok recordTx, filters []*mqttFilter, a
 				needUpdate = true
 			}
 		}
+	}
+	// The conversion runs HERE: after the membership this record will carry, before the
+	// lock that makes the pair atomic to every reader is released, and before the save.
+	if inLock != nil && inLock() {
+		needUpdate = true
 	}
 	sess.mu.Unlock()
 
@@ -18806,7 +18957,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// register-plus-PUBREL as "past PUBREC" and suppresses the source, while an unmarked
 	// register ALONE looks like an ordinary owed delivery and its payload is re-sent. So
 	// the evidence is not destroyed until the retirement is durable — persist before ack,
-	// the same rule the UNSUBSCRIBE drain follows.
+	// the same rule a drain follows.
 	//
 	// Withholding the acknowledgement costs a PUBREL redelivery, which [MQTT-4.4.0-1]
 	// makes legitimate and which the client answers with another PUBCOMP; that brings us
@@ -19534,8 +19685,9 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		st := d.seqs[sseq]
 		switch {
 		case st == nil || !st.claimed:
-			// A FRESH message on a drained filter: the client unsubscribed, so it is
-			// not owed this. While the drain is still staged it is left to AckWait —
+			// A FRESH message on a drained filter: the client unsubscribed, or downgraded
+			// the filter to QoS 0 and is served by the raw subscription instead, so it is
+			// not owed this at QoS 1/2. While the drain is still staged it is left to AckWait —
 			// acking before the packet's save would lose it if that save rolls back.
 			//
 			// The same applies to a sequence whose removal is UNCONFIRMED: its record
@@ -21026,7 +21178,9 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		if qos == 0 {
 			// When processing a SUBSCRIBE packet, DEFER the whole teardown
 			// (including removing the sess.cons entry) until the packet's final
-			// session save is confirmed: the save can still fail and its rollback
+			// session save is confirmed — and where the consumer still holds started
+			// deliveries the packet CONVERTS it into a drain at that save instead of
+			// tearing it down at all: the save can still fail and its rollback
 			// must restore the pre-packet QoS1/2 state, and any save issued
 			// mid-packet (a later shared filter's early persist) must serialize a
 			// record consistent with reality — Subs still says QoS1/2 until the
@@ -21208,7 +21362,8 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 // either of its record writes was rejected by the per-subject CAS.
 //
 // The live SUBSCRIBE path runs this inside an otherwise-SUCCESSFUL packet — the QoS
-// downgrade whose teardown was deferred until the save was confirmed — so a rejection here
+// downgrade whose teardown was deferred until the save was confirmed, and which the
+// conversion did not claim as a drain — so a rejection here
 // is exactly the swallowed evidence that would let the operation gate open as "quiet". See
 // mqttSubPacketFacts.recordCASRejected.
 func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok recordTx, sid string, cc *ConsumerConfig) bool {

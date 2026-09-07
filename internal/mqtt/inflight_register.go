@@ -219,7 +219,8 @@ type mqttInflightRecord struct {
 	Q2AffCopy  string `json:"q2affcopy,omitempty"`
 	Retired    bool   `json:"retired,omitempty"`
 	// Cancelled marks a register whose delivery was NEVER TRANSMITTED: the allocation was
-	// withdrawn — by an UNSUBSCRIBE staging a drain, a discard, a takeover — while its
+	// withdrawn — by a packet staging a drain (an UNSUBSCRIBE, or a QoS 0 downgrade), a
+	// discard, a takeover — while its
 	// store was still in flight, so the confirmation found no entry to release and the
 	// PUBLISH was never enqueued.
 	//
@@ -891,7 +892,7 @@ const (
 // identity match. A concurrent LIVE stream recreation between the two is outside the
 // supported all-brokers-stopped recovery procedure.
 //
-// wantDur and wantSeq are the caller's authority. For the UNSUBSCRIBE drain that is
+// wantDur and wantSeq are the caller's authority. For a drain that is
 // (Cons.Durable, Started.Seq), the register's own source-delivery key, which the record
 // already persists — so this needs no new persisted field. It is deliberately not
 // interchangeable with a nonce: recreating the SOURCE stream that issues wantSeq is
@@ -1289,8 +1290,10 @@ func (as *mqttAccountSessionManager) deleteInflightRegisterConfirmed(seq uint64)
 // and holds the identifier and its Receive Maximum slot for the life of the session.
 //
 // Recording the nonce is what closes that window, and it is durable at the right moment for
-// free on the path that matters: stageDrain runs inside the UNSUBSCRIBE's own record
-// transaction, whose save is confirmed before commitUnsub deletes the consumer.
+// free on the path that matters: stageDrain runs inside its packet's own record
+// transaction — the UNSUBSCRIBE's, whose save is confirmed before commitUnsub deletes the
+// consumer, or a SUBSCRIBE's, where the QoS 0 downgrade's conversion runs at the
+// final-update boundary and the same save carries both facts.
 //
 // sess.mu must be held.
 func (sess *mqttSession) cancelRegPendingLocked(ack *mqttPending) {
@@ -2537,6 +2540,10 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 // voidRegistrationsLocked marks every in-flight register of one consumer durable VOID, because
 // this session is abandoning that consumer, and reports the withdrawn allocations for securing.
 //
+// ABANDONING is the precondition, and it is why a QoS 0 downgrade that will DRAIN its
+// consumer instead takes cancelPendingRegistrationsLocked alone: those exchanges are not
+// abandoned, they are still owed.
+//
 // This is the STAGING half of a consumer teardown, and where it is called from is the whole
 // point: inside the transaction that removes the consumer's membership from the record, so
 // that the write saying "this subscription is gone" is the same write saying "these
@@ -2569,9 +2576,14 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 // identifiers the client is holding. A CANCELLED allocation is never reinstated (the source is
 // simply re-offered under a fresh one), so its verdict stands either way.
 //
+// It is the CANCEL arm plus the VOID arm, in that order, and the two are separable:
+// cancelPendingRegistrationsLocked below is the cancel arm on its own, for the one caller
+// that must withdraw the not-yet-transmitted allocations WITHOUT declaring the transmitted
+// ones never transmitted. Nothing else may take that half alone.
+//
 // sess.mu must be held.
 func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCancellation, []string) {
-	var out []mqttRegCancellation
+	out := sess.cancelPendingRegistrationsLocked(durable)
 	var transmitted []string
 	// RETIRED QoS 2 sources (srcAckOwed) are deliberately NOT voided here. Retired proves
 	// the source crossed PUBREC, so a void verdict would falsely say the delivery was never
@@ -2580,20 +2592,51 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCance
 	// phase-aware recovery or terminal cleanup. A crash before the consumer delete is safe
 	// in the other direction too: recovery sees the surviving Retired fact, suppresses the
 	// payload, and never re-sends it.
+	//
+	// The cancel arm above already removed every regPending entry from cpending, so what is
+	// left here is exactly the transmitted set.
+	for _, pi := range sess.cpending[durable] {
+		ack := sess.pendingPublish[pi]
+		if ack == nil || ack.regCancelled || ack.regNonce == _EMPTY_ || ack.regPending {
+			continue
+		}
+		// Transmitted: the register exists (or is being deleted) and its identifier is
+		// the teardown reap's to free — which since F-034 it may decline to do, sparing
+		// an above-watermark record or refusing on an unreadable one. Record the verdict
+		// and leave the rest alone; the verdict is what a later reader needs, and it does
+		// not depend on the removal having happened.
+		sess.voidRegNonceLocked(ack.regNonce)
+		transmitted = append(transmitted, ack.regNonce)
+	}
+	return out, transmitted
+}
+
+// cancelPendingRegistrationsLocked withdraws the allocations of one durable that are not yet
+// transmitted, and NOTHING else: it records no verdict on a transmitted register.
+//
+// It exists because a QoS 0 downgrade that will convert its consumer into a drain owes
+// exactly this half. It must cancel now, because the delivery barrier does not stop a
+// callback that is already past it: beginSendLocked tests regPending/regCancelled/regForeign
+// and never sub.mqtt.closed, so an allocation whose register store is still in flight would
+// otherwise confirm and transmit under a membership the packet has removed. And it must NOT
+// void, because the transmitted deliveries are about to be DRAINED — a never-transmitted
+// verdict on one of them is a lie that any save in this packet would make durable, and
+// unvoiding afterwards cannot retract what a save already stored.
+//
+// The withheld marker each cancellation leaves in sess.deferred is what keeps DUP honest if
+// the staging is rolled back: nothing was transmitted, so the eventual first transmission
+// must carry DUP=0 ([MQTT-3.3.1-1]). Those markers are the caller's to preserve across a
+// conversion — see convertDowngradeCandidatesLocked, which transfers the durable's LIVE
+// marker set around stageDrain because stageDrain owns that map and drops what it cannot
+// itself discover.
+//
+// sess.mu must be held.
+func (sess *mqttSession) cancelPendingRegistrationsLocked(durable string) []mqttRegCancellation {
+	var out []mqttRegCancellation
 	seqPis := sess.cpending[durable]
 	for sseq, pi := range seqPis {
 		ack := sess.pendingPublish[pi]
-		if ack == nil || ack.regCancelled || ack.regNonce == _EMPTY_ {
-			continue
-		}
-		if !ack.regPending {
-			// Transmitted: the register exists (or is being deleted) and its identifier is
-			// the teardown reap's to free — which since F-034 it may decline to do, sparing
-			// an above-watermark record or refusing on an unreadable one. Record the verdict
-			// and leave the rest alone; the verdict is what a later reader needs, and it does
-			// not depend on the removal having happened.
-			sess.voidRegNonceLocked(ack.regNonce)
-			transmitted = append(transmitted, ack.regNonce)
+		if ack == nil || ack.regCancelled || ack.regNonce == _EMPTY_ || !ack.regPending {
 			continue
 		}
 		out = append(out, mqttRegCancellation{pi: pi, nonce: ack.regNonce, durable: durable, sseq: sseq})
@@ -2610,7 +2653,7 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCance
 	if len(seqPis) == 0 {
 		delete(sess.cpending, durable)
 	}
-	return out, transmitted
+	return out
 }
 
 // unvoidRegNonces withdraws the verdicts a rolled-back packet had recorded on TRANSMITTED
@@ -2712,11 +2755,19 @@ func (sess *mqttSession) reopenTeardownDelivery(subs []*subscription) {
 // registrations could miss the membership-removal write entirely.
 //
 // sess.mu must be held.
-func (sess *mqttSession) stageDeferredDeleteLocked(c *client, cc *ConsumerConfig) ([]mqttRegCancellation, *subscription, []string) {
+// convert says the caller will try to turn this consumer into a DRAIN at its final-update
+// boundary rather than destroy it. Then only the cancel arm runs: the transmitted registers
+// keep their identifiers, because their exchanges are the ones being preserved, and a
+// never-transmitted verdict recorded here would be made durable by any save this packet
+// still issues. See cancelPendingRegistrationsLocked.
+func (sess *mqttSession) stageDeferredDeleteLocked(c *client, cc *ConsumerConfig, convert bool) ([]mqttRegCancellation, *subscription, []string) {
 	if cc == nil {
 		return nil, nil, nil
 	}
 	sub := sess.closeTeardownDeliveryLocked(c, cc)
+	if convert {
+		return sess.cancelPendingRegistrationsLocked(cc.Durable), sub, nil
+	}
 	cancels, transmitted := sess.voidRegistrationsLocked(cc.Durable)
 	return cancels, sub, transmitted
 }
@@ -2933,7 +2984,9 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoide
 // weaker but still durable tier.
 //
 // It is CLEANUP, not the guarantee: on every path that removes a membership the cancellation
-// is already in that packet's own record, staged by voidRegistrationsLocked. What
+// is already in that packet's own record — staged by voidRegistrationsLocked, or by its
+// cancel arm alone where the consumer is being converted into a drain rather than
+// abandoned. What
 // this adds is promptness — a tombstone lets the register go now rather than at the next
 // resume — plus a durable home for a cancellation that arrived too late to be staged.
 //
@@ -3810,7 +3863,7 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 	idHash, gen := sess.idHash, sess.gen
 	if ack == nil || !ack.regPending || ack.jsDur != jsDur || ack.sseq != sseq {
 		sess.mu.Unlock()
-		// The allocation was CANCELLED under us — an UNSUBSCRIBE staging a drain, a
+		// The allocation was CANCELLED under us — a packet staging a drain, a
 		// discard, a takeover — so this register describes a delivery that will never be
 		// sent. Removing it is CONFIRMED and retried, unlike the ordinary terminal delete
 		// which may be fire-and-forget: there the record is reconcilable, because its
@@ -4364,7 +4417,7 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 	//     triggering live PUBLISH; the record then waits out AckWait where HEAD transmitted at
 	//     once. The compensating "retire the term at PUBREC" needed two further fixes and
 	//     still lost custody across a concurrent clear() in one ordering or the other;
-	//   - refusing on ANY live pendingPublish entry breaks the UNSUBSCRIBE drain, which
+	//   - refusing on ANY live pendingPublish entry breaks a drain, which
 	//     legitimately recreates a CORRELATED PUBREL under a recovered entry's identifier
 	//     (measured: three drain tests timed out waiting for a PUBREL the client was owed);
 	//   - refusing on a SOURCE-LESS entry starves an abandoned frame's record for the life of

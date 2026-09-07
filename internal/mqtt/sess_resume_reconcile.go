@@ -464,10 +464,11 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// restore runs around processSubs (shared_group_verify.go, F-076). That comment used
 	// to name a mechanism that did not exist, which is the gap F-076 closed.
 	//
-	// Drained sids are not in cons
-	// (stageDrain removed them) and their filters are not in subs unless a
-	// re-SUBSCRIBE adopted the drain — in which case the entry is back in cons
-	// and is verified here like any other. A stale Cons entry with no matching
+	// Drained sids are not in cons (stageDrain removed them). Their filters are absent
+	// from subs when an UNSUBSCRIBE drained them, and present AT QoS 0 when a downgrade
+	// did — which this collection skips either way, since it takes positive QoS only. A
+	// re-SUBSCRIBE at QoS > 0 that adopted the drain puts the entry back in cons, and it
+	// is verified here like any other. A stale Cons entry with no matching
 	// subscription is not an active delivery entry and is deliberately not
 	// verified (stated residual, docs/CONFORMANCE.md).
 	var entries []*mqttReconcileEntry

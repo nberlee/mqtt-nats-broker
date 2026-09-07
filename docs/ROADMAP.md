@@ -3218,8 +3218,9 @@ takeover.
   2026-09-06 by the delivery-readiness item's plan-review rounds 1 and 2 and scoped out
   of it by its escalation consult. **Pre-existing at HEAD and not caused by that
   change**, which neither introduces nor worsens it: no reclaim is involved. An adopted
-  drain's filter has no membership — the client unsubscribed, which is why it is a
-  drain — and `sess.update` never gives a failed filter one, while
+  drain's filter has no membership **on the route this bullet describes** — the client
+  unsubscribed, which is why it is a drain — and `sess.update` never gives a failed filter
+  one, while
   `buildPersistedSessionLocked` drops a `cons` entry whose membership key is absent. The
   drain is already out of `Drains`, so the next successful save records **neither** and
   the durable becomes orphan-sweep work with its started deliveries inside it. The same
@@ -3240,6 +3241,20 @@ takeover.
   cases, `sess.update` returning nil does not mean a save happened so the else branch is
   not a commit point, and `finishDrainIfEmpty` never takes the record fence so the
   packet's `tok` only partly excludes a mid-packet retirement.
+
+  **It also now owns a SECOND loss, handed to it 2026-09-07 by the QoS 0 downgrade item's
+  scope ruling.** The state this defect leaves — a QoS 0 membership key *and* a live
+  `Cons` entry for the same filter — is destructive on the **CONNECT restore** path, not
+  merely stranded: resume reconciliation skips QoS 0 memberships
+  (`sess_resume_reconcile.go:477`), so restoration reaches `processJSConsumer`'s `qos == 0`
+  existing-consumer arm (`mqtt.go:21025`) where `fromSubProto` is false and
+  `execDeferredConsumerDelete` runs **inline** — no deferral, no packet transaction and no
+  final-update boundary, so the drain conversion that fixed the live SUBSCRIBE path has
+  nowhere to happen. **Distinct from this bullet's own no-key orphaning route**, which is
+  about a durable named nowhere; here the record names it and the restore destroys its
+  exchanges anyway. Repairing it needs a restore-side persistence and completion contract
+  of its own. Residual in `docs/CONFORMANCE.md` under "A QoS 0 re-SUBSCRIBE drains rather
+  than destroys".
 
   **Acceptance evidence:** the persisted RECORD, not the in-memory maps — a wildcard
   whose companion half fails, followed by a later successful save, must leave the
@@ -3292,14 +3307,16 @@ takeover.
   closes.
 
   **What it does NOT claim**, each deferred to its own bullet below rather than accepted:
-  a QoS 1/2 → **QoS 0** re-SUBSCRIBE, which is teardown-shaped and destroys outstanding
-  exchanges outright; the **replacing allocation's own lifecycle** under concurrent
+  a QoS 1/2 → **QoS 0** re-SUBSCRIBE, which is teardown-shaped and destroyed outstanding
+  exchanges outright — **since CLOSED for a live SUBSCRIBE by converting the consumer into
+  a drain**, with the CONNECT restore path still deferred; the **replacing allocation's
+  own lifecycle** under concurrent
   cancellation or failed-store settlement; and shared-subscription QoS 2, which branches
   to the affine move before the identifier is allocated and is capped at granted QoS 1
   for the alpha. Residuals in `docs/CONFORMANCE.md`; mechanism in `docs/ARCHITECTURE.md`
   under "An exchange's QoS is carried, not recomputed".
 
-- [ ] **A QoS 1/2 → QoS 0 re-SUBSCRIBE destroys outstanding exchanges.** Filed 2026-09-07
+- [x] **A QoS 1/2 → QoS 0 re-SUBSCRIBE destroys outstanding exchanges.** Filed 2026-09-07
   by the exchange-QoS item, and deferred out of it by an explicit scope ruling rather than
   accepted. **Pre-existing at HEAD and not worsened by that change**, which cannot reach
   this path at all: the callback's QoS 0 arm is taken *before* the send section, so a
@@ -3318,6 +3335,52 @@ takeover.
   re-SUBSCRIBE at QoS 0, must not lose the exchange — and the QoS 2 case must still reach
   PUBCOMP. The `docs/CONFORMANCE.md` entry describing the limitation links to this bullet
   rather than owning it.
+
+  **CLOSED for a LIVE SUBSCRIBE, by converting the consumer into a DRAIN.** The scope
+  limit is in the heading rather than a footnote: the CONNECT **restore** path carries the
+  same loss and is deferred, below.
+
+  **What landed.** The QoS 0 occurrence stages a **conversion candidate** rather than a
+  plain teardown when the stream permits draining at all (`drainingAllowed`, evaluated
+  once per packet), and at the packet's **final-update boundary** —
+  `updateWithDetailConverting`'s in-lock hook, inside the same `sess.mu` section that
+  applies the membership — `convertDowngradeCandidatesLocked` moves the consumer into
+  `drains[sid]`. So one record carries `Subs` at QoS 0 and the drain together (I4), and
+  `Cons` names it nowhere. The started exchanges retransmit under their original
+  identifiers and a QoS 2 one past PUBREC completes through the drain's existing PUBREL
+  machinery, which is created-blind and needed no change. Fresh messages reach the client
+  once, at QoS 0, from the raw subscription while the drain discards its copy.
+
+  **Four details are load-bearing, each established by a review round.** The
+  not-yet-transmitted allocations are cancelled at the FILTER's staging, not at the
+  boundary, because `beginSendLocked` never inspects `sub.mqtt.closed` and a callback
+  already past the barrier would otherwise confirm and transmit under a removed
+  membership. The transmitted registers are **not** voided for a candidate: a
+  never-transmitted verdict on an exchange about to be drained is a lie that any save in
+  the packet makes durable, and unvoiding cannot retract it. The durable's **live**
+  withheld markers are transferred around `stageDrain`, which owns `sess.deferred` and
+  drops what it cannot itself discover — including a cap-withheld marker that never had a
+  registration, whose loss would have been a **regression this path introduced**, since
+  the old teardown performed no such drop. And the confirmation is one operation reached
+  inline or from the resolver via `retainOnLanded`, which reopens the delivery the staging
+  closed; a detached client reopens nothing and that is normal.
+
+  **The rollback's resource enumeration needed the fifth detail.**
+  `rollbackSubscribePacket` discovers the consumers a packet created by walking
+  `sess.cons`, and a converted one has left that map — so a definite save failure
+  **un-converts first**, and without that a durable this packet created is neither
+  restored nor released and the rolled-back record names it nowhere. The population is
+  reachable and the test forces it: `mqttSubsBarrier.wait` waits only for SUBSCRIBEs
+  already in flight when it sampled, so a publisher that sampled earlier lands its store
+  after the packet's first occurrence has created its `DeliverNew` consumer.
+
+  **What it does NOT claim:** the CONNECT restore path (deferred, see the failed-adoption
+  bullet above); a stream-imposed consumer inactivity limit, where the destructive
+  teardown stands and is logged; a send already admitted past the delivery barrier;
+  crash-safety for a withheld marker, which is memory-only; and any narrowing of the
+  existing confirmed-register-versus-transmission residual, which stays F-072's. Residuals
+  in `docs/CONFORMANCE.md` under "A QoS 0 re-SUBSCRIBE drains rather than destroys";
+  mechanism in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
 
 - [ ] **The replacing allocation's lifecycle destroys or abandons an inherited exchange.**
   Filed 2026-09-07 by the exchange-QoS item's plan-review rounds 3-5, and deferred out of
@@ -3474,9 +3537,14 @@ takeover.
   deliberately scoped OUT of it — it was never in that item's bullet, and its blast radius
   is three recovery surfaces that item does not otherwise touch. The builder tests
   `if _, ok := sess.subs[key]; !ok { continue }`, and a QoS downgrade sets
-  `sess.subs[key] = 0` rather than removing the key, so the **ordinary single-occurrence
-  QoS 1 -> 0 downgrade** persists `Cons[sid]` in its own confirmed save and then deletes
-  the durable, leaving the record naming a consumer that does not exist. Where the teardown
+  `sess.subs[key] = 0` rather than removing the key, so an **ordinary single-occurrence
+  QoS 1 -> 0 downgrade that is DESTROYED rather than converted** persists `Cons[sid]` in
+  its own confirmed save and then deletes the durable, leaving the record naming a
+  consumer that does not exist. (Since the QoS 0 downgrade item landed, a downgrade
+  holding started deliveries becomes a **drain** instead: the conversion removes the
+  `cons` entry before the record is built, so that record names the durable in `Drains`
+  and this route is not entered. What remains are the destructive cases — nothing
+  started, a held drain owning the sid, or a stream-imposed inactivity limit.) Where the teardown
   happens to have cancellations to secure, `proveVoidedRegs` saves again and incidentally
   repairs it; where it does not, the stale reference stands until the next resume.
   **`TestMQTTSubDuplicateFilterUpgradeThenDowngradeStillDeletes` asserts `Cons` is STILL

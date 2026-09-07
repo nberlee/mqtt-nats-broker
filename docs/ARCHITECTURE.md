@@ -408,8 +408,9 @@ acceptance test so an over-strict "fix" fails:
   `$MQTT_msgs`** — plain subscriptions already run under the broker's own
   inactive-threshold option there and are verified (or recreated) on every
   resume (see "Plain QoS 1/2 consumer reconciliation on resume"), and the
-  paths that cannot tolerate a stream-forced limit (the UNSUBSCRIBE drain,
-  shared/affine consumers) refuse it at **runtime**, which also covers a limit
+  paths that cannot tolerate a stream-forced limit (a drain, from either of its
+  two entry points, and shared/affine consumers) refuse it at **runtime**, which
+  also covers a limit
   imposed after startup — a startup check could not (see
   `docs/CONFORMANCE.md`).
 - **`Sources` is waived on `$MQTT_rmsgs` only** — sourcing is additive, so it is
@@ -1786,8 +1787,9 @@ record can persist a companion's drain after the filter is gone).
 **The conflict predicate is membership, the options, and each sid's DRAIN PRESENCE** — not
 the `*ConsumerConfig` contents, not whether a consumer identity is present at all, and not
 a drain's started set. That line is exactly the one between a grant decision and its
-implementation. A shape change is a grant consequence: only an acknowledged UNSUBSCRIBE
-turns a live sid into a draining one. Consumer identity is not — the resume reconciliation
+implementation. A shape change is a grant consequence: only an acknowledged
+grant decision turns a live sid into a draining one — an UNSUBSCRIBE, or a re-SUBSCRIBE
+that downgrades the filter to QoS 0. Consumer identity is not — the resume reconciliation
 recreates a reaped durable with no MQTT decision behind it, so comparing identity would
 turn a server-side repair into a subscription conflict and suppress a correct repair. A
 drain's started set is in-flight accounting both sides advance independently, so it is
@@ -1903,9 +1905,20 @@ consumer's ack state, orphan our registers and eventually delete the wrong durab
 
 A change applies only where `mqttSurvivorDecidedGrant` is false — only where the
 survivor's grant for that filter equals the parent's. The one refused row below is refused
-PER SID, not per filter, and that is not a half-measure: a drained sid has no membership
-on either side, so no membership change can accompany it, and a multi-level filter's two
-sids drain and complete independently, so refusing one must not withdraw the other. Ten
+PER SID, not per filter, and what makes that safe is a **granularity** difference rather
+than an absence of membership: membership and the options are applied for the whole filter,
+while drain content is reconciled per sid and may refuse, leaving the applied membership
+standing and the survivor's drain contents preserved.
+
+Two earlier statements here were wrong. "A drained sid has no membership on either side" is
+false — a drained sid can carry a **QoS 0** membership, which is what a downgrade
+converting its consumer leaves. So is the narrower claim that the refused row cannot
+accompany a membership change: with a base holding a QoS 0 membership and a drain of two
+claims, our branch unsubscribing and the survivor completing one claim while keeping
+membership, `mqttSurvivorDecidedGrant` permits the repair — membership, options and drain
+**presence** all still equal the base — and the membership change is applied before the
+per-sid step refuses the differing started sets. A multi-level filter's two sids drain and
+complete independently, so refusing one must not withdraw the other. Ten
 action rows over nine state pairs, no row unreachable:
 
 | survivor sid | ours sid | action |
@@ -3239,11 +3252,25 @@ the correlated leak in `docs/CONFORMANCE.md`.
 
 ## UNSUBSCRIBE drain
 
+A drain has **two entry points**, and the section keeps its name because the
+UNSUBSCRIBE one came first and every cross-reference cites it.
+
 [MQTT-3.10.4-3] requires the server to complete the delivery of any QoS 1/2
 message it has already **started** sending, even after the client unsubscribes.
 UNSUBSCRIBE used to tear the plain consumer down immediately, and since
 `$MQTT_msgs` is interest-retained, deleting the durable deleted the messages it
 still held: the started PUBLISH was simply lost.
+
+**A QoS 1/2 → QoS 0 re-SUBSCRIBE owes the same completion**, under a different rule.
+[MQTT-3.8.4-3] requires a SUBSCRIBE on an identical topic filter to *replace* the
+existing subscription, and [MQTT-3.8.4-4] forbids interrupting the flow of
+publications — so the broker may neither refuse the packet nor wait for the exchange,
+and the started PUBLISH must still complete. That path used to close delivery, purge
+the pending exchanges and delete the durable, losing every outstanding exchange
+including a QoS 2 one already past PUBREC. It now converts the consumer into a drain
+instead, and the QoS 0 filter is served by the raw subscription. The two entry points
+differ only in *when* the conversion happens; see "Where each entry point converts"
+below.
 
 A **drain** is what that teardown becomes when started deliveries remain
 (`internal/mqtt/unsub_drain.go`). The durable and its delivery subscription
@@ -3270,10 +3297,14 @@ The invariants, in the order they matter:
   authorize the same actions.
 - **Only transmitted deliveries drain.** A message withheld by the in-flight cap
   was never sent, so it is discarded rather than enrolled.
-- **Single ownership.** From staging, a drained consumer lives exclusively in
-  `sess.drains` and its `cons[sid]` entry is gone, so nothing can reach it through
-  `cons` and create a second durable on the same filter. A re-SUBSCRIBE therefore
-  **adopts** the drain explicitly.
+- **Single ownership.** From the moment it is staged, a drained consumer lives
+  exclusively in `sess.drains` and its `cons[sid]` entry is gone, so nothing can reach
+  it through `cons` and create a second durable on the same filter. A re-SUBSCRIBE
+  therefore **adopts** the drain explicitly. For a QoS 0 downgrade the *staging moment*
+  is the packet's final-update boundary rather than the filter's own staging, and the
+  invariant that keeps the two mechanisms apart there is **temporal**: the downgrade
+  holds its `cons` entry for the whole filter loop, the conversion runs after the last
+  occurrence, and no revocation can follow it.
 - **A live SUBSCRIBE adopts only what can deliver.** A resume can leave a drain with
   no delivery subscription — the blanket QoS 2 withholding when PUBREL setup fails,
   and a restore whose own `processQOS12Sub` failed. Adoption would then move that
@@ -3311,8 +3342,64 @@ The invariants, in the order they matter:
   What the reclaim does **not** establish is stated in `docs/CONFORMANCE.md`: adoption
   keeps its existing behavior, so a filter that fails *after* adopting strands the
   durable **where the membership key is absent** — not on a sid a QoS 0 re-SUBSCRIBE
-  already gave a key — and an already-started QoS 2 exchange reclaimed by a QoS 1
-  re-SUBSCRIBE is retransmitted at QoS 1.
+  already gave a key. (It also named an already-started QoS 2 exchange reclaimed by a
+  QoS 1 re-SUBSCRIBE as retransmitted at QoS 1; that residual is **closed** — an
+  exchange's QoS is carried, not recomputed.)
+
+### Where each entry point converts
+
+UNSUBSCRIBE stages its drains **before** its record write and commits them after: the
+membership removal and the drain that replaces it are one record (I4).
+
+A QoS 0 downgrade cannot do that, and the reason is the shape of a SUBSCRIBE packet.
+`sess.subs` is mutated only inside `update`, which for a SUBSCRIBE runs at the **final**
+save — so a downgrade that moved `cons[sid]` into `drains[sid]` at its filter's own
+staging would leave any mid-packet write (a later shared filter's early membership
+persist) describing a positive-QoS membership with no consumer and a drain, a shape that
+does not otherwise exist. Resume reconciliation collects every positive-QoS membership
+and mints a fresh durable for one whose `cons` entry is absent, so restarting from such a
+record would put a **second** durable on the filter alongside the restored drain.
+
+So the conversion runs at the **final-update boundary**, inside the same `sess.mu`
+section that applies the membership and before the save that carries both. Four things
+about it, and each is load-bearing:
+
+- **The not-yet-transmitted allocations are cancelled at the filter's staging**, not at
+  the conversion. The delivery barrier does not stop a callback that is already past it:
+  the send gate tests the pending entry's registration state and never `sub.mqtt.closed`,
+  so an allocation whose register store is still in flight would otherwise confirm and
+  transmit under a membership the packet has removed.
+- **The transmitted registers are NOT voided** for a consumer that will convert. A void
+  says "never transmitted", and those exchanges are the ones being preserved — any save
+  in the packet would make the lie durable, and unvoiding afterwards cannot retract what
+  a save already stored. Where the conversion is refused instead, the void runs at the
+  boundary so its verdicts ride the same record.
+- **The durable's live withheld markers are transferred around `stageDrain`.** It owns
+  `sess.deferred` for its durable: it drops every entry and re-installs only the
+  cancellations it discovered itself, so a marker whose sequence the earlier cancellation
+  already removed — and a marker for a delivery withheld at the in-flight **cap**, which
+  never had a registration at all — would be destroyed. A marker is what makes a later
+  *first* transmission carry DUP=0, so the boundary snapshots the durable's live set
+  before the call and re-installs it after, merging it into the drain's own set so a
+  commit retires it and a rollback keeps it. The **live map** is the source, never a
+  packet descriptor's history: history is neither complete nor attributable to the
+  occurrence that converts, and a marker already consumed is absent from the live map and
+  so cannot be wrongly resurrected.
+- **A definite save failure un-converts before the rollback enumerates.** The rollback
+  discovers the consumers the packet created by walking `sess.cons`, so a converted one
+  has left that map; putting it back first is what lets the existing classification see
+  it as pre-packet, as packet-created, or as an adopted drain and act correctly for each.
+
+The confirmation is one operation, reached inline or from the resolver: it commits the
+drains, reopens the delivery the staging closed — the delivery callback tests
+`sub.mqtt.closed` *before* it looks for a drain, so a drain whose subscription stays
+closed can never retransmit — and clears the per-consumer inactivity timers. An ambiguous
+write keeps the drain **staged** and its barrier **closed** until those exact bytes are
+proven durable, with the operation registered as a landed continuation; a forked verdict
+discards it, because a continuation's premise is that its write landed. A **detached**
+client at that point reopens nothing and is normal, not an anomaly: an ambiguous write can
+stay unresolved while its connection closes, and the surviving drain takes its source
+interest from the ordinary resume instead.
 
 Recovery is positive, never an inference from absence. Because the phase is
 memory-only, a restart would otherwise establish source interest and resend the
@@ -4071,8 +4158,10 @@ carrying `foo` at QoS 0 and then at QoS 1 must end with **one** subscription at 
 its consumer intact and delivering.
 
 The QoS 0 occurrence stages a **deferred teardown**: the delivery barrier goes down, the
-consumer's in-flight registrations are withdrawn into the packet's own transaction, and the
-irreversible `CONSUMER.DELETE` waits for the confirmed save. The `sess.cons` entry
+consumer's not-yet-transmitted registrations are withdrawn into the packet's own
+transaction, and the `CONSUMER.DELETE` waits for the confirmed save — or, where the
+consumer still holds started deliveries, never happens at all, because the packet converts
+it into a drain instead (see "Where each entry point converts"). The `sess.cons` entry
 deliberately stays, so a mid-packet save serializes a record consistent with a durable that
 still exists. The QoS 1 occurrence then reached the existing-consumer refresh arm, which
 sees that entry, refreshes four fields and returns success — knowing nothing about the
@@ -4984,7 +5073,7 @@ simply that the second is not destroyed before the first exists: a PUBCOMP does 
 acknowledge its PUBREL away while the retirement it covers is not durably recorded. The
 cost of withholding is a PUBREL redelivery, which [MQTT-4.4.0-1] makes legitimate and
 which the client answers with another PUBCOMP — bringing the broker back to retry, paced
-by AckWait. Persist before ack, the same rule the UNSUBSCRIBE drain follows.
+by AckWait. Persist before ack, the same rule a drain follows.
 
 The source is left unacknowledged at PUBREC rather than retried best-effort: a retry that
 landed would settle the message but strand its retirement, since nothing else would drain
@@ -4996,7 +5085,7 @@ The invariants, in the order they matter:
 - **Persist before send.** A PUBLISH under a new identifier goes on the wire only
   after its register is confirmed at a sequence. Between allocation and confirmation
   the entry is *unsendable by anyone*: a concurrent redelivery declines it, the resume
-  NAK path skips it, and an UNSUBSCRIBE drain does not enrol it. A definite store
+  NAK path skips it, and a drain does not enrol it. A definite store
   failure releases the identifier and sends nothing, which is safe precisely because
   nothing could have sent it. An ambiguous store is resolved by re-reading the subject
   and matching the nonce, never by the shape of the response. This is also what makes
@@ -5109,9 +5198,14 @@ The invariants, in the order they matter:
   record that says "never transmitted" cannot be holding an identifier.
 - **The cancellation goes in the write that removes the membership.** Recording it in
   the teardown instead cannot be made equivalent, and keeping the consumer does not
-  redeem it: once the membership is gone there is no subscription left to redeliver
-  through, so a register that lands afterwards holds its identifier and its Receive
-  Maximum slot for the life of the session whatever becomes of the durable — under a
+  redeem it: once the membership is gone there is ordinarily no subscription left to
+  redeliver through, so a register that lands afterwards holds its identifier and its
+  Receive Maximum slot for the life of the session whatever becomes of the durable.
+  (A QoS 0 downgrade that converts its consumer into a **drain** is the one case where a
+  subscription does survive the membership — the drain's — and the rule still holds
+  there, because the cancelled allocations are the ones that were never transmitted and
+  the drain is owed only what was. Their tombstones ride the same write either way,
+  since the cancelled nonces are serialized into every record.) — under a
   Receive Maximum of 1, a session that can no longer deliver at all. So every
   transaction that removes a consumer's membership (an UNSUBSCRIBE, a QoS downgrade,
   a 3.1.1 forced shared leave, a SUBSCRIBE rollback) withdraws
@@ -5733,7 +5827,7 @@ The invariants, in the order they matter:
   were tried here and all three refuted: a retained-term refusal blocks the retained QoS 2
   exchange's OWN PUBREL (the flusher holds the term live until after the triggering live
   PUBLISH is written, so the record waited out AckWait); a refusal on any live
-  `pendingPublish` entry breaks the UNSUBSCRIBE drain, which legitimately recreates a
+  `pendingPublish` entry breaks a drain, which legitimately recreates a
   correlated PUBREL under a recovered entry's identifier; and one on a source-less entry
   starves an abandoned frame's record for the connection's life. The stale-PUBREL
   multiplexing hazard is owned wholly by F-092, whose fence admits a stored slot-backed
@@ -5844,9 +5938,11 @@ reserved and new allocation is withheld — rather than being guessed owned or c
 ### An exchange's QoS is carried, not recomputed
 
 **Shipping scope, stated first because the rule below is stated universally.** What ships
-is **QoS 1 ↔ QoS 2**. A QoS 1/2 → **QoS 0** re-SUBSCRIBE is not covered: that path is
-teardown-shaped and destroys outstanding exchanges outright, and it is tracked as its own
-release-blocking roadmap item. The **shared-affine** route is not covered either: an
+is **QoS 1 ↔ QoS 2**. A QoS 1/2 → **QoS 0** re-SUBSCRIBE is a different mechanism —
+teardown rather than transmission — and is **not** covered by this rule; it is covered
+instead by converting the consumer into a drain, under "UNSUBSCRIBE drain", with its own
+residuals for a stream-imposed inactivity limit and the CONNECT restore path. The
+**shared-affine** route is not covered either: an
 effective-QoS-2 shared delivery branches into the affine move before the identifier is
 allocated, and shared subscriptions are capped at granted QoS 1 for the alpha.
 

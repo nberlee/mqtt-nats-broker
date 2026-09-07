@@ -103,7 +103,7 @@ const mqttForkedGrantMax = 256
 // and draining.
 type mqttSidState struct {
 	con   *ConsumerConfig     // a live delivery consumer
-	drain *mqttPersistedDrain // draining after an acknowledged UNSUBSCRIBE
+	drain *mqttPersistedDrain // draining after an acknowledged membership removal
 }
 
 // mqttSidShape is the sid's grant CONSEQUENCE, and it has two values on purpose.
@@ -922,10 +922,26 @@ func (sess *mqttSession) mergeForkedGrantLocked(g *mqttForkedGrant, survivor *mq
 // applyGrantChangeLocked makes one filter's grant equal to ours, and reports whether every
 // sid was applied.
 //
-// The refusal is PER SID, not per filter, and that is not a half-measure: the one refused row
-// is two drains for one sid, and a drained sid has no membership on either side, so no
-// membership change can accompany it. A multi-level filter's two sids drain and complete
-// independently, so refusing one must not withdraw the other.
+// The refusal is PER SID, not per filter, and that is not a half-measure. What it rests on
+// is that the two things happen at different granularities: MEMBERSHIP AND THE OPTIONS are
+// applied for the whole filter, while DRAIN CONTENT is reconciled per sid and can refuse.
+// A refusal therefore leaves the applied membership standing and the survivor's drain
+// contents preserved — it does not, and need not, mean no membership change accompanied it.
+//
+// Two earlier statements here were WRONG and are named so they do not come back. "A
+// drained sid has no membership on either side" is false: a drained sid can carry a QoS 0
+// membership, which is what a downgrade that converts its consumer leaves. Scoping that to
+// the refused row is also false, and a review round supplied the counterexample — a base
+// with a QoS 0 membership and a drain holding two claims, our branch unsubscribing (dropping
+// membership, keeping the drain) while the survivor completes one claim and keeps
+// membership. mqttSurvivorDecidedGrant permits the repair, because membership, options and
+// drain PRESENCE all still equal the base; this function then applies the membership change
+// before the per-sid step refuses the differing started sets. So that row really can
+// accompany a membership change, and the reason refusing one sid is safe is the granularity
+// above rather than an absence of membership.
+//
+// A multi-level filter's two sids drain and complete independently, so refusing one must not
+// withdraw the other.
 //
 // The rule has two halves that come from different sides. This runs at MERGE, so the
 // survivor has already been compared and this candidate survived that comparison. The

@@ -1390,9 +1390,11 @@ Residuals:
 - An unbounded drain is deliberate: a client that never acknowledges holds one
   durable per drained filter until its session ends.
 
-The QoS 1/2 → QoS 0 re-SUBSCRIBE downgrade is out of scope — it replaces a
-subscription rather than removing one — and shared-subscription QoS 1
-redistribution to another member remains permitted.
+Shared-subscription QoS 1 redistribution to another member remains permitted. The
+QoS 1/2 → QoS 0 re-SUBSCRIBE downgrade is **no longer out of scope**: it replaces a
+subscription rather than removing one, and it now drains that subscription's started
+deliveries exactly as a removal does — see "A QoS 0 re-SUBSCRIBE drains rather than
+destroys" below.
 
 ### A started exchange keeps the QoS it was first transmitted at
 
@@ -1406,11 +1408,15 @@ CAS refuses.
 
 **Three limitations are stated rather than implied.**
 
-- **A QoS 1/2 → QoS 0 re-SUBSCRIBE is not covered.** That path does not retransmit at
+- ~~**A QoS 1/2 → QoS 0 re-SUBSCRIBE is not covered.** That path does not retransmit at
   all: it closes delivery, purges pending exchanges and registers, and deletes the
-  consumer, destroying outstanding exchanges outright. It is a different mechanism —
-  teardown rather than transmission — and it is tracked as its own release-blocking
-  item in `docs/ROADMAP.md` §0.3, not accepted here.
+  consumer, destroying outstanding exchanges outright.~~ **CLOSED for a live
+  SUBSCRIBE.** That path is teardown rather than transmission, so it was never the
+  exchange-QoS fix's to widen; it is fixed instead by making the downgrade **convert its
+  consumer into a drain** — see "A QoS 0 re-SUBSCRIBE drains rather than destroys" below
+  and `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain". Two residuals remain and are
+  stated there, not here: a stream-imposed consumer inactivity limit, and the **CONNECT
+  restore** path.
 - **The replacing allocation's lifecycle is not covered.** Where a register for the
   same delivery already exists, written by another broker, an admitted replacement
   **preserves the occupant's QoS** and a successful confirmation threads the QoS the
@@ -1422,6 +1428,48 @@ CAS refuses.
   branches into the affine move before the identifier is allocated, so that route is
   untouched. Shared subscriptions are capped at granted QoS 1 for the alpha, so the
   route is outside supported scope.
+
+### A QoS 0 re-SUBSCRIBE drains rather than destroys
+
+[MQTT-3.8.4-3] requires a SUBSCRIBE carrying a topic filter identical to an existing
+non-shared subscription's to **replace** that subscription, and [MQTT-3.8.4-4] forbids
+interrupting the flow of publications. So a re-SUBSCRIBE at QoS 0 over a live QoS 1/2
+subscription may neither be refused nor made to wait, and the QoS 1 or QoS 2 exchanges
+the broker has already transmitted on that filter must still complete.
+
+They now do. The downgrade converts its consumer into a **drain** instead of deleting
+it: the durable and its messages survive, the started exchanges are retransmitted and
+completed under their original packet identifiers, and the QoS 0 filter is served by the
+raw subscription — so a fresh message reaches the client once, at QoS 0, while the drain
+discards its own copy. A QoS 2 exchange already past PUBREC completes through the drain's
+own PUBREL machinery. The membership at QoS 0 and the drain are written in **one** record.
+
+**What it does not claim, each stated rather than implied.**
+
+- **A stream-imposed consumer inactivity limit disables it.** A drain must outlive an
+  offline session, and `ConsumerLimits.InactiveThreshold` on the messages stream gives
+  every consumer a delete timer it cannot opt out of — reaping a drained durable takes
+  its started deliveries with it, because the stream is interest-retained. Where one is
+  set, or cannot be read, the downgrade falls back to the destructive teardown and logs
+  what it costs. The identical limitation applies to UNSUBSCRIBE and is stated above.
+- **The CONNECT restore path is not covered.** A session can hold a QoS 0 membership
+  *and* a live consumer entry for the same filter — what a failed drain adoption leaves
+  behind. Resume reconciliation skips QoS 0 memberships, so the restore reaches the
+  existing-consumer arm and deletes that consumer **inline**, with no deferral, no packet
+  transaction and no final-update boundary for a conversion to happen at. Repairing it
+  needs a restore-side persistence and completion contract of its own, so it is tracked
+  with the failed-adoption item in `docs/ROADMAP.md` §0.3 rather than here.
+- **A send already admitted past the delivery barrier is not retracted.** Cancelling the
+  not-yet-transmitted allocations at the filter's staging keeps that window from widening
+  across the packet; it does not close it.
+- **A withheld marker is not crash-safe.** The evidence that a cancelled or
+  cap-withheld delivery was never transmitted lives in memory, so a process crash loses
+  it and that delivery's eventual first transmission carries DUP=1. Pre-existing, and
+  unchanged by this.
+- **"Transmitted" means what the drain's existing classification means.** Register
+  confirmation and actual transmission are not equivalent; the exchanges preserved are
+  the ones that classification enrols, and the existing transmission and DUP residuals
+  stated elsewhere are retained rather than narrowed.
 
 **One deliberate deviation.** When a replacement preserves an occupant's QoS and that
 occupant was in fact never transmitted, the resulting first transmission carries a QoS
@@ -2298,7 +2346,7 @@ What it does NOT do:
 - **The recoverable subset of the erased grant IS repaired**, and the rest is not. What
   the reconnect re-asserts is the DELTA between the record this broker was acknowledged
   for and its parent: plain membership with its v5 options, both consumer identities of a
-  multi-level filter, the drains an acknowledged UNSUBSCRIBE staged, the
+  multi-level filter, the drains an acknowledged packet staged, the
   cancelled-register verdicts, and the PUBREL consumer where the survivor has none. The
   four recorded rejections of a repair are answered rather than waived: it is
   generation-anchored, so a capsule from an incarnation a teardown retired can never
@@ -3510,7 +3558,7 @@ ones the `$MQTT_qos2in` precedent established:
 - **Startup validation is a snapshot.** A stream config mutated *after*
   initialization is not re-checked until the next process start or manager
   recreation. Runtime guards exist exactly where the code already has them: the
-  UNSUBSCRIBE-drain refusal and the shared-subscription guard for a
+  drain refusal (both entry points) and the shared-subscription guard for a
   stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, and
   JetStream's own consumer-create rejection for a `MaxAckPending` limit below
   the broker's cap. A persisted "validated" flag was considered and rejected:
@@ -4337,7 +4385,10 @@ above). What it does now is end that packet coherently.
 **Closed.** The deferred QoS 0 teardown is REVOKED by the later occurrence: the consumer
 survives, the record names it, the delivery subscription reopens under the last
 occurrence's terms, and the verdicts the staging recorded on transmitted registers are
-withdrawn durably in the packet's own write. Previously the client was granted QoS 1 and
+withdrawn durably in the packet's own write. (Where the downgrade is eligible to become a
+drain instead, its staging records no such verdict in the first place, so a revocation has
+none to withdraw — see "A QoS 0 re-SUBSCRIBE drains rather than destroys".) Previously
+the client was granted QoS 1 and
 then received nothing for the rest of the connection, while the record named a durable the
 packet went on to delete. Both halves of a multi-level wildcard are covered. Where delivery
 readiness cannot be established the filter is REFUSED `0x80` and the downgrade stands,
