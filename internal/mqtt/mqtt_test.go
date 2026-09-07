@@ -2243,7 +2243,7 @@ func TestMQTTTrackPendingOverrun(t *testing.T) {
 	sess.maxp = 0xFFFF
 
 	sess.last_pi = 0xFFFF
-	pi := sess.trackPublishRetained()
+	pi := sess.trackPublishRetained(1)
 	if pi != 1 {
 		t.Fatalf("Expected 1, got %v", pi)
 	}
@@ -2258,7 +2258,7 @@ func TestMQTTTrackPendingOverrun(t *testing.T) {
 	}
 
 	delete(sess.pendingPublish, 1234)
-	pi = sess.trackPublishRetained()
+	pi = sess.trackPublishRetained(1)
 	if pi != 1234 {
 		t.Fatalf("Expected 1234, got %v", pi)
 	}

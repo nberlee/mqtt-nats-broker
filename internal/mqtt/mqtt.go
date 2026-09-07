@@ -3039,6 +3039,34 @@ type mqttPending struct {
 	// Meaningful on pendingPubRel entries only.
 	pubRelAffRef mqttPubRelAffineRef
 
+	// qos is this exchange's RECORDED QoS, and the wire QoS of every PUBLISH admitted
+	// for it. Ordinarily that is the value its in-flight register holds; a RETAINED
+	// send has no register at all (R6), so for one it is the QoS selected when the
+	// identifier was allocated. It is NOT a claim that a transmission happened: an
+	// admitted replacement donates the occupant's QoS to an allocation that may never
+	// have been transmitted (storeInflightRegister's same-source arm), and this broker
+	// has no durable "was transmitted" fact at all.
+	//
+	// It is NOT recomputed from the subscription. A re-SUBSCRIBE may replace the
+	// filter's maximum QoS at any time ([MQTT-3.8.4-3]) and must not interrupt a
+	// publication already in flight: the client holds this identifier in a state fixed
+	// by what it already received, so changing the QoS under it abandons a QoS 2
+	// handshake (2 -> 1) or drives a PUBREC whose slot transition the CAS then refuses
+	// (1 -> 2).
+	//
+	// Sourced ONLY from per-exchange evidence, and these three are the whole list: the
+	// QoS the register actually landed holding, the register's own QoS on recovery, or
+	// -- for a retained send, which has no register -- the QoS selected at identifier
+	// allocation. Subscription-level and drain-level QoS are NOT evidence about an
+	// individual exchange: one drain routinely holds both, since a QoS 1 publication
+	// through a QoS 2 subscription is transmitted at QoS 1.
+	//
+	// Zero means "no per-exchange evidence", which for a transmissible entry is a
+	// fail-closed withhold, not a default. It is NOT a phase or history discriminator:
+	// some pendingPubRel entries are built through mqttRecoveredPending and so carry a
+	// non-zero value.
+	qos byte
+
 	// regSeq is the stream sequence of this delivery's durable in-flight register on
 	// $MQTT_inflight, and regNonce the register's immutable identity. Every delete
 	// targets regSeq exactly, because the register's subject is reused by later
@@ -10339,7 +10367,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			return
 		}
 		if qos > 0 {
-			pi = sess.trackPublishRetained()
+			pi = sess.trackPublishRetained(qos)
 
 			// The identifier has to stay reserved for the WHOLE span from here to
 			// whichever later queueOutbound writes this frame, and the pendingPublish
@@ -12531,8 +12559,15 @@ func (sess *mqttSession) dropUnredeliverableRetained() {
 // allocates a new PI and adds it to pendingPublish with an empty value (no
 // JetStream backing). Spec5 [3.3.4].
 //
+// qos is the effective QoS the caller selected for this replay, and it is the one
+// piece of per-exchange evidence a retained send ever has: there is no register to
+// recover it from (R6), so the entry's own qos field is seeded here or nowhere.
+// A retained frame is serialized under this same lock and flushed later, so it is
+// never a JetStream redelivery and never reaches the started path -- the seed is
+// for coherence with every other exchange, not because a re-offer will read it.
+//
 // Lock held on entry
-func (sess *mqttSession) trackPublishRetained() uint16 {
+func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	// Make sure we initialize the tracking maps.
 	if sess.pendingPublish == nil {
 		sess.pendingPublish = make(map[uint16]*mqttPending)
@@ -12564,7 +12599,7 @@ func (sess *mqttSession) trackPublishRetained() uint16 {
 	// Minted rather than derived: there is no register to take an identity from, which is
 	// exactly why retained is the one exchange whose identity lives only in memory. Its
 	// authority is this entry, so a retained record surviving a restart has none.
-	sess.pendingPublish[pi] = &mqttPending{regNonce: mqttNewInflightNonce()}
+	sess.pendingPublish[pi] = &mqttPending{regNonce: mqttNewInflightNonce(), qos: qos}
 
 	return pi
 }
@@ -18184,9 +18219,16 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// before any irreversible work — trackAsPubRel, the PUBLISH untrack, the PUBREL
 		// store, the source ack and the register release all happen below this point.
 		//
-		// THREE shapes reach here, and R1 unifies them: an entry not yet durable was NEVER
-		// TRANSMITTED, so no PUBACK/PUBREC/PUBREL-completing acknowledgement of it can be
-		// legitimate — the client was never sent the PUBLISH it purports to answer.
+		// THREE shapes reach here, and what unifies them is that this handler cannot
+		// ADVANCE any of them safely — not that the acknowledgement must be illegitimate.
+		// R1 makes the illegitimacy argument hold for an ordinary allocation, whose PUBLISH
+		// was never sent. It does NOT hold for one that adopted an occupant: the same-source
+		// replacement arm preserves a live occupant's QoS precisely because the client may
+		// already be holding that exchange, so its acknowledgement can be entirely
+		// legitimate. The decline is still correct, for the mechanical reasons below, and it
+		// is not self-healing: nothing replays a discarded acknowledgement. A confirmed
+		// store clears regPending and a LATER acknowledgement can proceed, ordinarily after
+		// another PUBLISH — conditional progress, not a guarantee.
 		//
 		//   - regForeign: the register behind this identifier is another session object's
 		//     claimed identity (a lost shared-claim arbitration) or a record recovery could
@@ -19839,6 +19881,37 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// endSend removes" invariant must not depend on no early return and no recovered
 	// panic ever appearing in between.
 	sess.mu.Lock()
+	// The wire QoS of every PUBLISH admitted here comes from the ENTRY, never from the
+	// subscription. sub.mqtt.qos is an input to a message's FIRST transmission and to
+	// nothing else: a re-SUBSCRIBE may replace the filter's maximum at any time
+	// ([MQTT-3.8.4-3]) without interrupting a publication already in flight, so
+	// recomputing it per offer re-derived a started exchange's QoS from whatever the
+	// subscription happened to say -- retransmitting a QoS 2 exchange at QoS 1 after a
+	// downgrade, whose PUBACK then deletes the owner slot and abandons the handshake.
+	//
+	// UNCONDITIONAL, with no branch on started or isNew. A first transmission reads
+	// back exactly the min(published, granted) it computed, so the rule costs it
+	// nothing; and the contested case that MUST take the entry's value -- the
+	// same-source replacement, which preserves an occupant's QoS the caller never
+	// supplied -- arrives with isNew true and started false, so an "if started" guard
+	// would send at one QoS while the register held another.
+	//
+	// Read HERE, in the send section, because it must be after any register store has
+	// settled: the store is synchronous and confirmInflightRegister threads the landed
+	// QoS onto the entry and clears regPending before returning.
+	if ack := sess.pendingPublish[pi]; ack != nil {
+		if ack.qos == 0 {
+			// No per-exchange evidence, so there is nothing to transmit AT. Withheld
+			// without acknowledging -- the same disposal every indeterminate arm on this
+			// callback uses -- and tested BEFORE the send is reserved, so the return
+			// leaks no token. Guessing a QoS is the defect this exists to prevent.
+			sess.mu.Unlock()
+			cc.Warnf("MQTT: withholding delivery %s/%d for client %q: packet identifier %d carries no exchange QoS",
+				sub.mqtt.jsDur, sseq, sess.id, pi)
+			return
+		}
+		qos = ack.qos
+	}
 	sendTok, sendOK := sess.beginSendLocked(cc, pi, sub.mqtt.jsDur, sseq)
 	sess.mu.Unlock()
 	if !sendOK {

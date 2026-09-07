@@ -686,6 +686,13 @@ func mqttRecoveredPending(idHash, gen string, pi uint16, rv mqttRecoveredInfligh
 		q2AffCopy:  rv.rec.Q2AffCopy,
 		regSeq:     rv.seq,
 		regNonce:   rv.rec.Nonce,
+		// The record's QoS is the ONLY per-exchange evidence a recovery has, and
+		// dropping it here was the defect: the delivery callback then re-derived the
+		// wire QoS from whatever the subscription said at re-offer time, so a
+		// re-SUBSCRIBE at a lower maximum retransmitted a started QoS 2 exchange at
+		// QoS 1 and its handshake was abandoned. Mandatory and validated to 1 or 2 on
+		// every stored record, so this never seeds a zero.
+		qos: rv.rec.QoS,
 	}
 	if name, err := mqttParseInflightSubject(mqttInflightSubject(idHash, gen, pi)); err == nil {
 		e.slot = mqttInflightSlotRef{
@@ -3549,7 +3556,9 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
 		seq, err := as.storeInflightCAS(subject, expectSeq, rec)
 		if err == nil {
-			return sess.confirmInflightRegister(c, pi, jsDur, sseq, seq, rec.Nonce)
+			// rec.QoS is what LANDED: the replacement arm above may have set it from the
+			// occupant, so the caller's qos argument is not authoritative here.
+			return sess.confirmInflightRegister(c, pi, jsDur, sseq, seq, rec.Nonce, rec.QoS)
 		}
 		lastErr = err
 		expectSeq = 0
@@ -3585,7 +3594,14 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		case cur != nil && cur.Nonce == rec.Nonce:
 			// Our own write, whose response we lost. This is the whole reason the nonce
 			// exists: the sequence cannot tell us this, since the subject is reused.
-			return sess.confirmInflightRegister(c, pi, jsDur, sseq, smsg.Sequence, rec.Nonce)
+			// cur.QoS, not rec.QoS: the nonce identifies this ALLOCATION, never an
+			// immutable record body. markInflightRegisterCancelledPending can write a
+			// sparse record carrying this same nonce with a hardcoded QoS 1, and this arm
+			// is ordered before the Cancelled classification below, so the record that
+			// actually exists is the only thing that may be threaded back. (Where it is
+			// such a tombstone the confirmation refuses anyway, so this costs nothing --
+			// but asserting the two are equal would be a false premise in the code.)
+			return sess.confirmInflightRegister(c, pi, jsDur, sseq, smsg.Sequence, rec.Nonce, cur.QoS)
 		case cur != nil && cur.Cancelled && !cur.Retired:
 			// A PURE cancellation tombstone. It records a delivery that was NEVER
 			// transmitted, so the identifier it names is free by construction and this
@@ -3684,6 +3700,30 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				return false
 			}
 			c.Debugf("MQTT: replacing an in-flight register for the same delivery on %q written elsewhere", subject)
+			// The occupant's QoS is PRESERVED, not overwritten with ours. This writer
+			// cannot prove the occupant was never transmitted -- Cancelled is not
+			// exhaustive evidence, since a cancellation may live only as a nonce in the
+			// session record's CancelledRegs -- so a live PUBLISH-phase occupant for this
+			// exact delivery is evidence about what the CLIENT may already be holding,
+			// and its QoS is the only durable trace of it. Taking ours instead destroys
+			// that trace, and for 2 -> 1 it licenses the slot deletion that abandons the
+			// exactly-once handshake.
+			//
+			// The cost, accepted deliberately: if the occupant genuinely was never
+			// transmitted, this first transmission carries a QoS the current grant no
+			// longer matches, deviating from [MQTT-3.8.4-6]. A graded-QoS inaccuracy on
+			// one message is preferred to an abandoned handshake, i.e. duplication or
+			// loss. Recorded in docs/CONFORMANCE.md.
+			//
+			// Assigned HERE rather than at the qos argument because rec was built once
+			// before this retry loop: mutating the argument would not change the record
+			// that is about to be written at the occupant's exact sequence.
+			//
+			// What this does NOT do is keep the inherited exchange alive. A concurrent
+			// cancellation or a failed store still destroys or abandons it -- those are
+			// pre-existing lifecycle defects of this arm, filed as their own roadmap
+			// item, and no claim here may say otherwise.
+			rec.QoS = cur.QoS
 			expectSeq = smsg.Sequence
 		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq:
 			// The occupant is live and NOT ours — foreign, or an UNCLAIMED shared
@@ -3764,7 +3804,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 // store was in flight) the register is deleted immediately: it names an identifier
 // nothing is tracking, and leaving it would make the next resume reserve an
 // identifier for a delivery that has no pending entry.
-func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string) bool {
+func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string, qos byte) bool {
 	sess.mu.Lock()
 	ack := sess.pendingPublish[pi]
 	idHash, gen := sess.idHash, sess.gen
@@ -3849,6 +3889,12 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 		sess.mu.Unlock()
 		return false
 	}
+	// qos is the QoS the record LANDED holding, which is not always the one the caller
+	// asked for: the same-source replacement arm preserves the occupant's. Threading it
+	// onto the entry here is what keeps the wire and the register from disagreeing --
+	// the delivery callback reads this field, under the lock that admits the send, after
+	// this confirmation has cleared regPending.
+	ack.qos = qos
 	ack.regSeq, ack.regNonce, ack.regPending = regSeq, nonce, false
 	// CAPTURE the slot's durable identity here, at the moment it becomes known: the
 	// confirmation is what tells us which sequence the record landed at, and every later

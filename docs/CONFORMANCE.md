@@ -1367,13 +1367,14 @@ Residuals:
     adoption on that sid keeps its key and its consumer is retained. Reachable without
     the reclaim. An intervening early save, or a crash after one, loses it the
     same way.
-  - **An already-started QoS 2 exchange reclaimed by a QoS 1 re-SUBSCRIBE is
-    retransmitted at QoS 1.** The callback recomputes the effective QoS against the new
-    subscription, the identifier is reused so no register is rewritten, and nothing
-    reconciles the QoS — so the started exchange's QoS 2 handshake is not completed
-    ([MQTT-3.10.4-3], [MQTT 5.0 §4.3.3]). This is what HEAD already does when it adopts
-    an already-delivering drain and refreshes its metadata downward; the reclaim
-    **exposes** it to drains that previously delivered nothing at all.
+  - ~~An already-started QoS 2 exchange reclaimed by a QoS 1 re-SUBSCRIBE is
+    retransmitted at QoS 1.~~ **CLOSED.** A started exchange's QoS is now a property of
+    the exchange: it is carried on the pending entry, sourced from the in-flight
+    register's own QoS on recovery, and read under the lock that admits the send rather
+    than recomputed from the subscription. The population was larger than this entry
+    said — the plain existing-consumer refresh reaches it with no drain, no UNSUBSCRIBE
+    and no reclaim — and both directions are fixed. See the exchange-QoS section of
+    `docs/ARCHITECTURE.md` for the mechanism and for what it does **not** cover.
   - **A closed-but-present delivery subscription under a live `cons[sid]`.** A QoS 0
     downgrade closes the delivery while deliberately keeping the consumer entry until
     the confirmed save, so one SUBSCRIBE packet carrying the same filter at QoS 0 and
@@ -1392,6 +1393,59 @@ Residuals:
 The QoS 1/2 → QoS 0 re-SUBSCRIBE downgrade is out of scope — it replaces a
 subscription rather than removing one — and shared-subscription QoS 1
 redistribution to another member remains permitted.
+
+### A started exchange keeps the QoS it was first transmitted at
+
+A subscription's maximum QoS is an input to a message's **first** transmission and to
+nothing else. A re-SUBSCRIBE may replace a filter's maximum QoS at any time
+([MQTT-3.8.4-3]) and must not interrupt a publication already in flight, so once
+transmitted a message's QoS is a property of that exchange and every retransmission
+carries it unchanged. Both directions are honored: a downgrade no longer abandons a
+QoS 2 handshake, and an upgrade no longer drives a PUBREC whose slot transition the
+CAS refuses.
+
+**Three limitations are stated rather than implied.**
+
+- **A QoS 1/2 → QoS 0 re-SUBSCRIBE is not covered.** That path does not retransmit at
+  all: it closes delivery, purges pending exchanges and registers, and deletes the
+  consumer, destroying outstanding exchanges outright. It is a different mechanism —
+  teardown rather than transmission — and it is tracked as its own release-blocking
+  item in `docs/ROADMAP.md` §0.3, not accepted here.
+- **The replacing allocation's lifecycle is not covered.** Where a register for the
+  same delivery already exists, written by another broker, an admitted replacement
+  **preserves the occupant's QoS** and a successful confirmation threads the QoS the
+  record actually landed holding back onto the pending entry. That does **not**
+  guarantee the inherited exchange survives concurrent cancellation or failed-store
+  settlement: those are pre-existing lifecycle defects of the replacement arm and are
+  tracked as their own release-blocking item in `docs/ROADMAP.md` §0.3.
+- **Shared-subscription QoS 2 is not covered.** An effective-QoS-2 shared delivery
+  branches into the affine move before the identifier is allocated, so that route is
+  untouched. Shared subscriptions are capped at granted QoS 1 for the alpha, so the
+  route is outside supported scope.
+
+**One deliberate deviation.** When a replacement preserves an occupant's QoS and that
+occupant was in fact never transmitted, the resulting first transmission carries a QoS
+the current grant no longer matches, deviating from [MQTT-3.8.4-6] / Spec5 [3.8.4-8],
+which require the delivered QoS to equal `min(published, granted)`. The replacing writer
+cannot prove the occupant was never transmitted — a cancellation may live only as a
+nonce in the session record — so the alternative is to destroy the only durable trace of
+what the client may already be holding and abandon an exactly-once handshake. A
+graded-QoS inaccuracy on one message is preferred to duplication or loss. The trigger is
+the replacement uncertainty window. **What is guaranteed is narrower than "for that
+exchange's lifetime":** the admitted replacement preserves the occupant's QoS byte, and a
+successful confirmation threads the QoS the record landed holding back onto the pending
+entry. Whether the inherited exchange then survives at all is the deferred lifecycle item
+above — concurrent cancellation or failed-store settlement can still destroy or abandon
+it.
+
+**A delivery carrying no per-exchange QoS evidence is withheld, not guessed at.** The
+identifier stays reserved and the source is not acknowledged. An audit of the removal
+sites found none that leaves a source mapping behind a missing entry, so the arm is
+believed defensive — but that is an audit result, **not a proof of production
+unreachability**, and the behaviour is exercised only by an injected fixture. Where it is
+reached the delivery stalls rather than going out at a QoS nothing established, and the
+stall is not promised to end at the next resume: only a recovery that rebuilds the entry
+from the record clears it.
 
 ### Outbound in-flight identifiers survive a restart and a failover
 

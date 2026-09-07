@@ -2729,7 +2729,7 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	restoreSave := setMQTTTestSessSaveHook(func(*mqttSession) error {
 		return fmt.Errorf("test: session record unavailable")
 	})
-	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce) {
+	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce, 1) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -6476,5 +6476,211 @@ func TestMQTTConfirmedDeleteIsIdentityAddressed(t *testing.T) {
 	cur, _, err := e.asm.loadInflightRecord(subject)
 	if err != nil || cur == nil || cur.Nonce != foreignNonce {
 		t.Fatalf("cleanup destroyed the replacement occupant: rec=%+v err=%v", cur, err)
+	}
+}
+
+// An admitted same-source replacement PRESERVES the occupant's QoS rather than
+// overwriting it with the replacing writer's.
+//
+// The window is cross-broker and needs no crash: A writes a QoS 2 register for a
+// delivery and transmits it; B's recovery scan missed that record, so B allocates the
+// same identifier for the same source, and its store meets the occupant. B's own
+// subscription may since have been re-granted at QoS 1 -- and taking B's value would
+// record QoS 1 for an exchange the client is holding at QoS 2, so every later recovery
+// on any broker retransmits it at the wrong QoS and its handshake is abandoned.
+//
+// B cannot prove the occupant was never transmitted: Cancelled is not exhaustive
+// evidence, since a cancellation may live only as a nonce in the session record. So a
+// live PUBLISH-phase occupant for this exact delivery is evidence about what the client
+// may already hold, and its QoS is the only durable trace of it.
+//
+// Paired mutation: take the caller's QoS in the replacement arm instead of cur.QoS.
+// Both assertions below fail under it -- the record and the thread-back -- and they are
+// asserted against the value the mutation produces (1), never against a default.
+func TestMQTTInflightSameSourceReplacementPreservesOccupantQoS(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-replace-qos")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sseq = uint64(4100)
+
+	// A: the occupant, at QoS 2, for this exact delivery.
+	pi := e.track(t, dur, sseq, 2)
+	recA, smsgA := e.loadRegister(t, pi)
+	if recA == nil || recA.QoS != 2 {
+		t.Fatalf("the occupant must be a QoS 2 register, got %+v", recA)
+	}
+
+	// B: a distinct session OBJECT over the same JetStream, which is the cross-broker
+	// boundary. Its recovery did not adopt A's register, so it allocates freshly.
+	if err := testSessSave(t, e.sess); err != nil {
+		t.Fatalf("persist A's session: %v", err)
+	}
+	asmB, sessB, cB := e.peer(t, "node2", "client-replace-qos")
+	if err := testSessSave(t, sessB); err != nil {
+		t.Fatalf("persist B's accept record: %v", err)
+	}
+	sessB.maxp = 100
+
+	sessB.mu.Lock()
+	piB, _, _, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	nonceB := _EMPTY_
+	if ack := sessB.pendingPublish[piB]; ack != nil {
+		nonceB = ack.regNonce
+	}
+	sessB.mu.Unlock()
+	if piB != pi {
+		t.Skipf("this fixture needs B to allocate the occupied identifier %d, got %d", pi, piB)
+	}
+	if !isNew {
+		t.Fatalf("B must allocate freshly for this fixture to reach the replacement arm")
+	}
+
+	// B stores at QoS 1 -- the value its own subscription would now compute. The
+	// replacement arm must NOT take it.
+	if !sessB.storeInflightRegister(cB, piB, 1, dur, sseq, nonceB, _EMPTY_, _EMPTY_) {
+		t.Fatalf("B's store was refused; the replacement arm was never reached")
+	}
+
+	subject := mqttInflightSubject(sessB.idHash, sessB.gen, piB)
+	recB, smsgB, err := asmB.jsa.loadInflightRecord(subject)
+	if err != nil {
+		t.Fatalf("load the replacement register: %v", err)
+	}
+	if recB == nil {
+		t.Fatalf("the replacement register is absent")
+	}
+	// It really is B's record, so the assertion below is about a replacement and not
+	// about A's record having merely survived.
+	if recB.Nonce != nonceB {
+		t.Fatalf("the register must carry B's nonce after the replacement, got %q want %q", recB.Nonce, nonceB)
+	}
+	if smsgB.Sequence == smsgA.Sequence {
+		t.Fatalf("the replacement must be a new stream sequence, got %d twice", smsgB.Sequence)
+	}
+	// THE assertion: the occupant's QoS, not the caller's.
+	if recB.QoS != 2 {
+		t.Fatalf("the replacement must preserve the occupant's QoS 2, got %d", recB.QoS)
+	}
+
+	// And the thread-back: B's own pending entry must carry what LANDED, or B would
+	// transmit at one QoS while the register said another.
+	sessB.mu.Lock()
+	ackB := sessB.pendingPublish[piB]
+	sessB.mu.Unlock()
+	if ackB == nil {
+		t.Fatalf("B's pending entry is gone")
+	}
+	if ackB.regPending {
+		t.Fatalf("B's entry must be confirmed after a successful store")
+	}
+	if ackB.qos != 2 {
+		t.Fatalf("B's entry must carry the QoS the record landed holding (2), got %d", ackB.qos)
+	}
+}
+
+// The lost-response reconciliation arm must thread back the QoS of the record that
+// ACTUALLY EXISTS, not zero and not the caller's.
+//
+// This is the arm reached when our own write landed but its response was lost: the
+// reread matches our nonce, and confirmation adopts the landed sequence. It is a
+// SEPARATE entry point from the successful CAS, and threading the QoS on only one of
+// them leaves the other adopting a record whose QoS never reaches memory — the pending
+// carrier stays zero and the delivery is then withheld for the life of the session.
+//
+// The schedule is what makes this discriminating, and it is forced rather than raced:
+// the store hook lets the REPLACEMENT CAS land and only then reports a lost response,
+// so the retry rereads into the same-nonce arm. Losing the initial conflicting create's
+// response instead would not reach this branch at all.
+//
+// Paired mutation: pass 0 (or omit the thread-back) on the reconciliation arm. Passing
+// rec.QoS there is NOT discriminating — the replacement arm has already set rec.QoS from
+// the occupant, so both arguments read 2 — which is why that variant is recorded as
+// non-discriminating rather than paired with this fixture.
+func TestMQTTInflightReplacementLostResponseThreadsLandedQoS(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-replace-lost")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sseq = uint64(4200)
+
+	pi := e.track(t, dur, sseq, 2)
+	if rec, _ := e.loadRegister(t, pi); rec == nil || rec.QoS != 2 {
+		t.Fatalf("the occupant must be a QoS 2 register, got %+v", rec)
+	}
+
+	if err := testSessSave(t, e.sess); err != nil {
+		t.Fatalf("persist A's session: %v", err)
+	}
+	asmB, sessB, cB := e.peer(t, "node2", "client-replace-lost")
+	sessB.maxp = 100
+	if err := testSessSave(t, sessB); err != nil {
+		t.Fatalf("persist B's accept record: %v", err)
+	}
+
+	sessB.mu.Lock()
+	piB, _, _, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	nonceB := _EMPTY_
+	if ack := sessB.pendingPublish[piB]; ack != nil {
+		nonceB = ack.regNonce
+	}
+	sessB.mu.Unlock()
+	if piB != pi {
+		t.Skipf("this fixture needs B to allocate the occupied identifier %d, got %d", pi, piB)
+	}
+	if !isNew {
+		t.Fatalf("B must allocate freshly to reach the replacement arm")
+	}
+
+	// Let the REPLACEMENT land, then report its response lost. expectSeq != 0 is what
+	// identifies the replacement attempt: the first, create-only attempt uses zero and
+	// is the one that must be allowed to fail normally so the arm is reached.
+	var replaced int
+	asmB.mu.Lock()
+	asmB.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
+		if expectSeq == 0 {
+			return asmB.jsa.storeInflightCAS(subject, expectSeq, r)
+		}
+		replaced++
+		if _, err := asmB.jsa.storeInflightCAS(subject, expectSeq, r); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("response lost")
+	}
+	asmB.mu.Unlock()
+
+	if !sessB.storeInflightRegister(cB, piB, 1, dur, sseq, nonceB, _EMPTY_, _EMPTY_) {
+		t.Fatalf("B's store was refused; the reconciliation arm was never reached")
+	}
+	asmB.mu.Lock()
+	asmB.testInflightStore = nil
+	asmB.mu.Unlock()
+	if replaced != 1 {
+		t.Fatalf("the replacement attempt must have run exactly once, got %d", replaced)
+	}
+
+	subject := mqttInflightSubject(sessB.idHash, sessB.gen, piB)
+	recB, _, err := asmB.jsa.loadInflightRecord(subject)
+	if err != nil || recB == nil {
+		t.Fatalf("load the replacement register: rec=%v err=%v", recB, err)
+	}
+	if recB.Nonce != nonceB {
+		t.Fatalf("the landed record must carry B's nonce, got %q", recB.Nonce)
+	}
+	if recB.QoS != 2 {
+		t.Fatalf("the landed record must preserve the occupant's QoS 2, got %d", recB.QoS)
+	}
+
+	// THE assertion: the entry adopted the landed QoS through the RECONCILIATION arm.
+	// Zero here means the carrier was never fed and every later offer withholds.
+	sessB.mu.Lock()
+	ackB := sessB.pendingPublish[piB]
+	sessB.mu.Unlock()
+	if ackB == nil {
+		t.Fatalf("B's pending entry is gone")
+	}
+	if ackB.regPending {
+		t.Fatalf("the reconciliation must confirm the entry, got regPending")
+	}
+	if ackB.qos != 2 {
+		t.Fatalf("the reconciliation arm must thread back the landed QoS 2, got %d", ackB.qos)
 	}
 }

@@ -5841,6 +5841,79 @@ rewritten while preserving the allocation identity, so a stale object may still 
 sequence. It remains in the existing loud, fail-closed opaque state — the identifier is
 reserved and new allocation is withheld — rather than being guessed owned or closed.
 
+### An exchange's QoS is carried, not recomputed
+
+**Shipping scope, stated first because the rule below is stated universally.** What ships
+is **QoS 1 ↔ QoS 2**. A QoS 1/2 → **QoS 0** re-SUBSCRIBE is not covered: that path is
+teardown-shaped and destroys outstanding exchanges outright, and it is tracked as its own
+release-blocking roadmap item. The **shared-affine** route is not covered either: an
+effective-QoS-2 shared delivery branches into the affine move before the identifier is
+allocated, and shared subscriptions are capped at granted QoS 1 for the alpha.
+
+A subscription's maximum QoS is an input to a message's **first** transmission and to
+nothing else. `sub.mqtt.qos` is mutable — the existing-consumer refresh arm writes the
+new granted QoS onto the live delivery subscription on any re-SUBSCRIBE — while
+[MQTT-3.8.4-3] requires the replacement to be accepted *without interrupting the flow of
+publications*. Recomputing the wire QoS per delivery therefore re-derived a started
+exchange's QoS from whatever the subscription said at that instant.
+
+So the exchange's QoS lives on its pending entry, and the delivery callback reads it
+there:
+
+- **Sourced only from per-exchange evidence, and the list is exhaustive:** the QoS the
+  register actually landed holding, the register's own QoS on recovery
+  (`mqttRecoveredPending`, which is where it used to be dropped), or — for a retained
+  send, which has no register at all — the QoS selected when the identifier was
+  allocated.
+- **Subscription- and drain-level QoS are not evidence about an individual exchange.**
+  Delivery QoS is `min(published, granted)`, so a QoS 1 publication through a QoS 2
+  subscription is transmitted at QoS 1: one drain routinely holds both, and a drain's
+  own `qos` is a copy of whatever the subscription said at staging time.
+- **The read is in the send section**, under the same `sess.mu` acquisition that admits
+  the send, and it is **unconditional** — there is no branch on whether the delivery is a
+  retransmission. It has to be after any register store has settled, because a
+  replacement can make the record adopt a QoS the caller never supplied; and the
+  no-evidence case is tested *before* the send is reserved, so the fail-closed return
+  leaks no reservation.
+- **Zero means no evidence, and is a withhold rather than a default.** It is not a phase
+  or history discriminator: some PUBREL reservations are built through the same recovery
+  helper and carry a non-zero value. And it is not a claim that a transmission happened —
+  an admitted replacement donates its occupant's QoS to an allocation that may never have
+  been transmitted, and this broker has no durable "was transmitted" fact.
+
+**The same-source replacement preserves the occupant's QoS.** Where a register for this
+exact delivery already exists, written elsewhere, the replacing writer takes the slot
+over at its exact sequence so the record carries its own nonce — but it cannot prove the
+occupant was never transmitted, because a cancellation may live only as a nonce in the
+session record rather than in the record body. A live PUBLISH-phase occupant is therefore
+evidence about what the client may already be holding, and its QoS is the only durable
+trace of it. The replacement is assigned in the arm rather than at the store's argument,
+because the record is built once before the retry loop. Successful confirmation then
+threads the QoS **as landed** back onto the pending entry, on both the successful-CAS and
+the lost-response reconciliation path, so the wire and the register cannot disagree; the
+reconciliation path reads the record that actually exists, since a nonce identifies the
+*allocation* and never an immutable body.
+
+**What this does not do is keep the inherited exchange alive.** A concurrent cancellation
+or a failed store still destroys or abandons it, because `regPending` is still read as
+evidence of never-transmitted at several sites. Those are pre-existing lifecycle defects
+of the replacement arm, tracked as their own release-blocking roadmap item; the
+acknowledgement guard that declines a PUBACK/PUBREC for an unconfirmed allocation stays
+in place for that reason — the handler below it cannot advance such an entry safely —
+though for an inherited allocation the client's acknowledgement may be entirely
+legitimate, and nothing replays a discarded one.
+
+**A drain owes PUBREL handling on per-exchange evidence, not on its own QoS.** Because a
+re-SUBSCRIBE can lower a drain's `qos` below the QoS of exchanges already started under
+it, gating PUBREL recreation, PUBREL-delivery establishment and the withhold-on-failure
+set on `d.qos` alone meant a QoS 2 exchange past PUBREC inside a QoS 1 drain never had
+its PUBREL recreated — loss, not a wrong header byte. One predicate answers all three:
+the drain's own QoS, **or** a persisted past-PUBREC intent on any sequence (only a QoS 2
+exchange can be past PUBREC), **or** a recovered PUBLISH entry whose register says QoS 2,
+identity-matched on durable and sequence. The third term is what covers an exchange
+transmitted but not yet past PUBREC, which carries no intent; it is sourceable because
+register recovery runs, and aborts CONNECT on failure, before any of the three gates.
+
 ## Session incarnations and teardown
 
 A client ID hashes to a stable token, and a session's JetStream resources used to

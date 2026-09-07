@@ -3246,8 +3246,168 @@ takeover.
   drain named in `Drains` — plus a reconnect that shows it delivering, and the
   early-save and crash windows each scheduled deterministically.
 
-- [ ] **An already-started QoS 2 exchange is retransmitted at QoS 1 after a QoS 1
-  re-SUBSCRIBE.** Filed 2026-09-06 by the delivery-readiness item's plan-review round 4.
+- [x] **An already-started QoS 2 exchange is retransmitted at QoS 1 after a QoS 1
+  re-SUBSCRIBE.** Filed 2026-09-06 by the delivery-readiness item's plan-review round 4;
+  **CLOSED by making an exchange's QoS a property of the EXCHANGE.**
+
+  **What landed.** The QoS is carried on the pending entry and read in the send section,
+  under the same `sess.mu` acquisition that admits the send, **unconditionally** — there
+  is no branch on whether the delivery is a retransmission, because the contested case
+  that must take the entry's value (a same-source replacement, which preserves a QoS the
+  caller never supplied) arrives with `isNew = true` and `started = false`. It is sourced
+  only from per-exchange evidence, and the list is exhaustive: the QoS the register landed
+  holding, the register's own QoS on recovery (`mqttRecoveredPending`, which is where it
+  was being **dropped**), or — for a retained send, which has no register — the QoS
+  selected at allocation. Zero means no evidence and is a **fail-closed withhold**, tested
+  before the send is reserved so the return leaks no reservation. Both directions are
+  fixed: the downgrade no longer abandons a QoS 2 handshake, and the upgrade no longer
+  drives a PUBREC whose slot transition the CAS refuses.
+
+  **The same-source replacement preserves the occupant's QoS** (`rec.QoS = cur.QoS`,
+  assigned in the arm because the record is built once before the retry loop), and
+  confirmation threads the QoS **as landed** back onto the entry on **both** success
+  paths. The reconciliation path passes the record that actually exists, not the one the
+  caller built: a nonce identifies the *allocation*, never an immutable body, and
+  `markInflightRegisterCancelledPending` writes a sparse record carrying the same nonce
+  with a hardcoded QoS 1.
+
+  **The three drain PUBREL gates now use per-exchange evidence.** A re-SUBSCRIBE can
+  lower a drain's `qos` below the QoS of exchanges started under it, so gating on `d.qos`
+  meant a QoS 2 exchange past PUBREC inside a QoS 1 drain never had its PUBREL
+  **recreated** — loss. One session-aware predicate serves all three sites: `d.qos >= 2`,
+  or a persisted past-PUBREC intent, or a recovered PUBLISH entry whose register says
+  QoS 2, identity-matched on durable and sequence.
+
+  **`d.qos` can never stand in for an exchange's QoS**, and that is not a stylistic
+  point: delivery QoS is `min(published, granted)`, so a QoS 1 publication through a
+  QoS 2 subscription is transmitted at QoS 1 and one drain routinely holds both. An
+  earlier revision proposed exactly that override and it would have reintroduced the
+  defect.
+
+  **Two corrections to this bullet's own analysis, each verified against the code.** The
+  upgrade direction does **not** produce an unreadable record — `casInflightSlot`
+  validates the mutated result before writing — so its harm is an **abandoned handshake**,
+  not corruption. And the register's QoS is **not** immutable today: the same-source
+  replacement arm rebuilds the whole record, which is the window the preservation above
+  closes.
+
+  **What it does NOT claim**, each deferred to its own bullet below rather than accepted:
+  a QoS 1/2 → **QoS 0** re-SUBSCRIBE, which is teardown-shaped and destroys outstanding
+  exchanges outright; the **replacing allocation's own lifecycle** under concurrent
+  cancellation or failed-store settlement; and shared-subscription QoS 2, which branches
+  to the affine move before the identifier is allocated and is capped at granted QoS 1
+  for the alpha. Residuals in `docs/CONFORMANCE.md`; mechanism in `docs/ARCHITECTURE.md`
+  under "An exchange's QoS is carried, not recomputed".
+
+- [ ] **A QoS 1/2 → QoS 0 re-SUBSCRIBE destroys outstanding exchanges.** Filed 2026-09-07
+  by the exchange-QoS item, and deferred out of it by an explicit scope ruling rather than
+  accepted. **Pre-existing at HEAD and not worsened by that change**, which cannot reach
+  this path at all: the callback's QoS 0 arm is taken *before* the send section, so a
+  started exchange whose subscription is now QoS 0 never reaches the entry read. The
+  mechanism is **teardown, not transmission** — the path closes delivery, purges pending
+  exchanges and registers, and deletes the consumer (`stageDeferredDeleteLocked`) — so
+  widening the exchange-QoS fix is not the shape of a repair, and moving the callback's
+  early return below `trackPublish` does not solve it.
+
+  **Distinct from two siblings, deliberately.** The revocable-downgrade item is about ONE
+  packet carrying QoS 0 then QoS > 0 for the same filter, a different population that does
+  not own this one; and the `Cons`-on-membership-presence bullet is about persisted
+  consumer *references*, not about destroying live exchanges. Ownership must stay separate.
+
+  **Acceptance:** a QoS 1/2 exchange transmitted and unacknowledged, then a single-filter
+  re-SUBSCRIBE at QoS 0, must not lose the exchange — and the QoS 2 case must still reach
+  PUBCOMP. The `docs/CONFORMANCE.md` entry describing the limitation links to this bullet
+  rather than owning it.
+
+- [ ] **The replacing allocation's lifecycle destroys or abandons an inherited exchange.**
+  Filed 2026-09-07 by the exchange-QoS item's plan-review rounds 3-5, and deferred out of
+  it by an explicit scope ruling. **Pre-existing at HEAD, and independent of QoS** — every
+  interleaving below occurs identically when both writers use the same QoS, which is what
+  makes it a separate item rather than that one's remainder. The exchange-QoS item
+  preserves the occupant's QoS on an admitted replacement and threads the landed value
+  back; it does **not** make the inherited exchange survive.
+
+  **Three interleavings, each verified against the code.** (1) *Cancellation after
+  adoption, before confirmation*: `stageDrain` classifies the allocation never-transmitted
+  on `ack.regPending` alone, cancels it and untracks the entry, and
+  `confirmInflightRegister`'s cancelled arm then reaps at `regSeq`/`nonce` with
+  `mqttSlotDeleteNeverTransmitted` or writes a `Cancelled` tombstone — a **false
+  cancellation**, F-088's class. (2) *Cancellation before adoption*: the teardown
+  placeholder deliberately **retains the allocation's nonce**, so a `regNonce == nonce`
+  identity check succeeds for an already-cancelled, bodyless entry — nonce equality is not
+  proof of a live allocation. (3) *Failed store after adoption*: retry exhaustion reaches
+  `abandonInflightRegister`, whose live path removes the entry **and its source mapping**,
+  so the next offer allocates a **different** identifier and transmits while the
+  occupant's exchange is still outstanding — the duplicate-identifier harm that refuting
+  refuse-and-abandon rests on.
+
+  **One design is already refuted and must not be re-proposed.** An in-memory "inherited"
+  bit on `mqttPending` honored at three cancel sites: its close set was wrong — **seven**
+  production readers treat `regPending` as evidence of never-transmitted, not three — and
+  `purgeConsumerPendingLocked` has **no transmitted arm** to fall back to, since it
+  removes `cpending` before its loop, so skipping its cancellation branch falls through to
+  `delete(sess.pendingPublish, pi)` and confirmation still finds no entry.
+
+  **The census is a STARTING INVENTORY, not a proven boundary**, and proving the boundary
+  is this item's work. Destructive or classifying readers, with the predicate each
+  applies and what it then does:
+
+  | Reader | Predicate | Action |
+  |---|---|---|
+  | `stageDrain` | `ack != nil && ack.regPending` | durable cancellation, then `untrackPublishEntry`; the sequence is excluded from the drain |
+  | `voidRegistrationsLocked` | `!ack.regPending` selects the *transmitted* arm, so `regPending` takes the cancel arm | cancellation collected, `regCancelled` placeholder installed |
+  | `purgeConsumerPendingLocked` | `ack.regPending` | cancellation collected; **no transmitted arm exists**, and `cpending` is removed before the loop, so skipping this branch falls through to `delete(sess.pendingPublish, pi)` |
+  | `abandonInflightRegister` | `!ack.regPending \|\| ack.regCancelled \|\| ...` guards the live path | `untrackPublishEntry` — entry **and** source mapping — then records the sequence deferred |
+  | the PUBACK/PUBREC guard | `ack.regForeign \|\| ack.regPending \|\| ack.regCancelled` | declines the acknowledgement before any irreversible work |
+  | `mqttPendingRedeliverable` | `!ack.regPending && !ack.regForeign && ack.sendNonce == ""` | declines to force a redelivery |
+  | the deny path's untrack guard | `!cur.regPending && !cur.regForeign` | guards the untrack and the register delete |
+
+  **Downstream of those, and in scope for the same audit:** `confirmInflightRegister`'s
+  cancelled arm (the reap at `regSeq`/`nonce` with `mqttSlotDeleteNeverTransmitted`, its
+  `markInflightRegisterCancelled` tombstone fallback, and the nonce-verdict rung),
+  `reapRegisterWithVerdictGated`'s freshness fence, and
+  `releaseSettledVoidReservationsLocked`'s save-keyed reservation release.
+
+  `confirmInflightRegister` and `abandonInflightRegister` must
+  **not** be dismissed as pure transmission gates: the first *selects* destructive cleanup
+  and the second *controls* abandonment, so their surrounding lifecycle outcomes are in
+  scope even where their predicates are right.
+
+  **Relationship to F-087, F-088 and F-072 must be settled before implementation.**
+  F-072's own bullet already names the same-delivery contested-store lifecycle as
+  remaining work, so the overlap is real and ownership has to be established rather than
+  assumed. This filing does **not** lift F-072's stop and does not authorize a parallel
+  transmission-history redesign — note that "distinguish registration readiness from
+  transmission history" is F-072's exact problem, and the register proves allocation,
+  never transmission.
+
+  **Acceptance, carried concretely rather than by test name.** The same-source occupied-PI
+  reproducer **including a same-QoS case**, demonstrating independence from the
+  exchange-QoS item. A **failed-store** schedule and an **ambiguous-store** schedule,
+  distinguished: a definite failure exhausts the retries and reaches
+  `abandonInflightRegister`, while an ambiguous one may have landed, so the two owe
+  different dispositions and a fixture proving one proves nothing about the other.
+  **Retry exhaustion followed by an actual subsequent offer**, asserting no second
+  identifier is transmitted while the occupant's exchange is outstanding — the offer has
+  to happen, since the harm is what the NEXT delivery does.
+
+  A schedule with the UNSUBSCRIBE completed **deterministically after
+  the replacement CAS and before confirmation**, asserting the replacement register is
+  neither deleted nor tombstoned `Cancelled`, the sequence is enrolled in the drain as
+  claimed, and the exchange reaches PUBCOMP across a resume — discrimination depends on
+  that ordering being forced, not raced. A mutation dropping the protection at exactly
+  **one** census site. A mutation omitting the identity re-read, with a schedule that
+  stalls the store across a cancellation **and a reuse** so a newer allocation occupies
+  the identifier — a stale detached `ack` pointer would not demonstrate corruption of the
+  reused entry — plus the **cancellation-without-reuse** case, since the placeholder
+  retains the same nonce. And: no second identifier for a still-outstanding source,
+  correct drain enrolment where owed, identity-safe handling across cancellation, reuse
+  and recovery.
+
+  Prior analysis and the rejected design are in
+  `~/.claude/lanes/qos2-exchange-downgraded-by-resubscribe/` (`plan.md` revision 6 §5.1.1
+  and §8, `review-ledger.md` rounds 3-5). Residual in `docs/CONFORMANCE.md` links here.
+
   A drain holding a *claimed*, already-transmitted QoS 2 PUBLISH — recovered register,
   original packet identifier, no PUBREC intent — that is adopted by a QoS 1
   re-SUBSCRIBE is retransmitted at QoS 1: the callback recomputes the effective QoS
@@ -3269,7 +3429,12 @@ takeover.
   delivers, so the transition became reachable where silence stood. **Not a reason to
   install with the drain's stale options instead**, which is refuted above. Any fix
   must decide what a subscription downgrade owes an exchange already past its first
-  transmission, which is a protocol question this item could not settle.
+  transmission. **That question is SETTLED** from fetched specification text, not recall:
+  [MQTT-3.8.4-3] requires the replacement to be accepted without interrupting the flow of
+  publications, [MQTT-4.3.3-1] makes an in-flight QoS 2 message categorically a QoS 2
+  message, and [MQTT-4.4.0-1] binds the identifier to the exchange. The subscription's
+  maximum is an input to the FIRST transmission and to nothing else. (This bullet cited
+  [MQTT-3.10.4-3], the UNSUBSCRIBE rule; the hook for a re-SUBSCRIBE is [MQTT-3.8.4-3].)
 
 - [x] **A closed-but-present delivery subscription under a live `cons[sid]`.** Filed
   2026-09-06 by the delivery-readiness item's plan-review round 1; **CLOSED by making a

@@ -1245,12 +1245,70 @@ func (sess *mqttSession) finalizeDrainSource(c *client, removed *mqttPending) bo
 // the chance to start resending one.
 //
 // No lock held on entry.
+// drainOwesPubRelLocked reports whether this drain owes PUBREL handling: recreating a
+// PUBREL, establishing PUBREL delivery on resume, or being withheld when that fails.
+//
+// The drain's own qos is a SUBSCRIPTION fact and cannot answer the question on its own.
+// A re-SUBSCRIBE can lower it below the QoS of exchanges already started under it --
+// stageDrain copies whatever sub.mqtt.qos says at staging time -- so a QoS 1 drain
+// routinely holds a QoS 2 exchange. Gating on d.qos alone is what stopped a QoS 2
+// exchange past PUBREC inside such a drain from ever having its PUBREL recreated: loss,
+// not a wrong header byte.
+//
+// Three terms, none redundant:
+//
+//   - d.qos >= 2 covers the ordinary case and needs no per-sequence evidence.
+//   - a persisted intent proves an ACCEPTED PUBREC obligation, and only a QoS 2 exchange
+//     can be past PUBREC. It is sound conservative evidence for ENABLING the PUBREL path,
+//     not a substitute for the register's QoS -- recordPubRelIntent validates identity
+//     rather than QoS.
+//   - a recovered PUBLISH entry whose register says QoS 2 covers the exchange that is
+//     transmitted but NOT yet past PUBREC, which carries no intent. Without it, a resume
+//     that fails to establish PUBREL delivery would not withhold such a drain, and source
+//     delivery would be restored with no path for the PUBREL the client is about to owe.
+//     Sourceable here because register recovery runs, and aborts CONNECT on failure,
+//     before any of this runs.
+//
+// The third term is inert for recreation specifically -- recoverDrainPubRels re-tests
+// st.intent per sequence inside its loop -- so admitting a drain on it there widens the
+// outer gate and claims nothing extra. One predicate is used at all three sites rather
+// than two spellings of the same fact.
+//
+// sess.mu must be held.
+func (sess *mqttSession) drainOwesPubRelLocked(d *mqttDrain) bool {
+	if d == nil {
+		return false
+	}
+	if d.qos >= 2 {
+		return true
+	}
+	for sseq, st := range d.seqs {
+		if st == nil {
+			continue
+		}
+		if st.intent {
+			return true
+		}
+		if st.pi == 0 || d.cc == nil {
+			continue
+		}
+		// Identity-matched, not merely present: the identifier is reused by later
+		// exchanges, so an entry that names a different durable or sequence is another
+		// exchange and says nothing about this one.
+		if ack := sess.pendingPublish[st.pi]; ack != nil && ack.qos == 2 &&
+			ack.jsDur == d.cc.Durable && ack.sseq == sseq {
+			return true
+		}
+	}
+	return false
+}
+
 func (sess *mqttSession) qos2DrainDurables() []string {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	var out []string
 	for _, d := range sess.drains {
-		if d.qos >= 2 && d.cc != nil {
+		if d.cc != nil && sess.drainOwesPubRelLocked(d) {
 			out = append(out, d.cc.Durable)
 		}
 	}
@@ -1274,7 +1332,7 @@ func (sess *mqttSession) needsPubRelDelivery() bool {
 		return true
 	}
 	for _, d := range sess.drains {
-		if d.qos >= 2 {
+		if sess.drainOwesPubRelLocked(d) {
 			sess.mu.Unlock()
 			return true
 		}
@@ -2092,7 +2150,7 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 	// rather than claimed: see the branch below.
 	skipUnattributable := map[string]bool{}
 	for _, d := range sess.drains {
-		if d.qos < 2 {
+		if !sess.drainOwesPubRelLocked(d) {
 			continue
 		}
 		for seq, st := range d.seqs {
