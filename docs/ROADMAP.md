@@ -3655,23 +3655,140 @@ takeover.
 
 - [ ] [F-088: A transmitted delivery's cancellation must not free its packet
   identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).
-  **Alpha blocker, unconditional. Ordered after F-087, which LANDED 2026-08-30** —
-  persisting the distinction safely depends on settled rewrite rules, and it now has them.
-  F-087 narrowed the blast radius without closing this: a `Retired ∧ Cancelled` record no
-  longer frees an identifier, and no writer erases `Retired` any more, but a pure
-  `Cancelled` over a transmitted delivery is still written and still freed.
-  `Cancelled` is written over never-transmitted allocations (true) and, via
-  `purgeConsumerPendingLocked:2292` and the
-  `voidRegistersOnStream` ladder that consumes its records (`:1963-1985`), over
-  **transmitted** ones (false), and
-  recovery frees the identifier for any `Cancelled` register without distinguishing
-  (`:3720`) — so a teardown can free an identifier the client still holds, against
-  [MQTT-2.3.1-4]. **Pre-existing**, surfaced by F-072's rounds; the consult explicitly
-  rejected accepting it as a documented deviation. The safe lifecycle is in the dossier:
-  never-transmitted reaps as today, transmitted-or-unprovable stays reserved until the
-  exchange completes or the session is destroyed. Also owed: the comment corpus stops
-  claiming `Cancelled` proves never-transmitted (`storeInflightRegister:2986`, the field
-  comment).
+  **Alpha blocker, unresolved; planning STOPPED at HEAD `278921c` after the second run's
+  round 6. Plan revision 7 is NOT approved for implementation. The claimed independence
+  from F-072's stopped transmission-attribution contract was REFUTED. The joint
+  cancellation/custody obligation with the inherited-allocation item (`:3385`) remains
+  UNFULFILLED — that overlap is assigned planning responsibility, not completed work. No
+  fix has landed.** Ordered after F-087, which LANDED 2026-08-30.
+
+  **The original finding.** F-087 narrowed the blast radius without closing this: a
+  `Retired ∧ Cancelled` record no longer frees an identifier, and no writer erases
+  `Retired` any more, but a pure `Cancelled` over a **transmitted** delivery is still
+  written and still freed. `Cancelled` is written over never-transmitted allocations (true)
+  and, via `purgeConsumerPendingLocked` and the `voidRegistersOnStream` ladder that
+  consumes its records, over **transmitted** ones (false); recovery frees the identifier
+  for any `Cancelled` register without distinguishing — so a teardown can free an
+  identifier the client still holds, against [MQTT-2.3.1-4]. **Pre-existing**, surfaced by
+  F-072's rounds; the consult explicitly rejected accepting it as a documented deviation.
+  The safe lifecycle is in the dossier: never-transmitted reaps as today,
+  transmitted-or-unprovable stays reserved until the exchange completes or the session is
+  destroyed. Also owed: the comment corpus stops claiming `Cancelled` proves
+  never-transmitted.
+
+  **The item is a PROPERTY over a mechanically frozen close set** of every production site
+  that removes a reservation or changes an input to a predicate `bumpPI` consults — not a
+  list of release edges. Revisions 1 and 2 enumerated edges and the enumeration grew once
+  per review round; that reframing is settled and must not be undone. **D1 is answered:**
+  terminal-completion evidence lives in an immutable create-only sibling
+  `$MQTT.inflight.<idHash>.<gen>.<PI>.done.<nonce>` carrying no `Claim`/`ClaimSeq`, so a
+  custody rewrite cannot invalidate an acknowledgement; the alternative — terminality in
+  place on the register — would reopen F-087's frozen five-writer set and is refused.
+
+  **WHY IT STOPPED, and the counterexamples are recorded HERE rather than only in a lane,
+  so losing that lane does not erase them.** One arm's disposition —
+  `storeInflightRegister`'s same-source replacement, where a second allocation under nonce
+  N2 takes over a transmitted exchange's slot at its exact sequence — has been designed and
+  refuted **six** times: two dispositions in the first planning run, three plan revisions
+  in the second, and two nonce variants a design consult refused outright. The four
+  surviving counterexamples:
+
+  1. **A landed replacement carries N2, and the matching-nonce writer can set `Cancelled`
+     on it.** `markInflightRegisterCancelledPending`'s rebuild arm matches by nonce once the
+     replacement has landed, and a **crash before confirmation** lets recovery free the
+     outstanding exchange through the record's own `Cancelled` bit. **Removing the
+     `CancelledRegs` nonce disjunct from recovery's classifier does NOT remove this route**,
+     and an exact-sequence CAS arbitrates competing *writes* while proving nothing about
+     transmission. There are **two** writers of that bit — `markInflightRegisterCancelledPending`
+     and `markInflightRegisterCancelled` — and neither's fail-closed arms cover a matching,
+     readable, PUBLISH-phase record, which is exactly the inherited case.
+  2. **Custody is destroyed before any settlement point can hand it off.** `stageDrain`
+     cancels a pending registration and calls `untrackPublishEntry`, removing **both** the
+     pending entry and its source mapping — so `bumpPI` sees the identifier as available and
+     Receive Maximum accounting excludes it. **Ordinary, uncancelled retry exhaustion** also
+     reaches `abandonInflightRegister`'s live path and untracks entry and mapping. Later
+     restoration cannot repair an allocation gap that already happened.
+  3. **Persisting verdicts does not retry tombstone writes.** `persistVoidedRegs` persists
+     the **session record** and returns immediately when the saved revision matches;
+     `secureRegCancellations` attempts tombstones only for its own supplied batch. So a
+     **finite** storage failure can cause **permanent** loss of O3 convergence — a
+     never-transmitted allocation whose identifier is never freed — which refutes the
+     "reduced promptness only" claim a revision made for that trade. Two further
+     verdict-based release consumers need an actual record-proof delivery mechanism:
+     `voidVerdictProvenLocked` and `releaseSettledVoidReservationsLocked`.
+  4. **A past-PUBREC release with no PUBCOMP**, from combining an older PUBREL scan with a
+     newer ready register. Recovery scans PUBREL records **before** registers, so between
+     the two scans another broker's outstanding PUBREC continuation can store the canonical
+     PUBREL, advance the slot to ready and complete the source acknowledgement; recovery
+     then reads `!exact && sourceComplete` as finished and reaches
+     `advanceFinishedSlotToTerminal`. **Source completion plus a snapshot absence can
+     authorize release without PUBCOMP, and an exact-sequence CAS does not validate that
+     cross-stream inference.** (An earlier explanation — "the PUBREL was never stored" — is
+     WRONG: `phaseSlotToPubRelReady` reads back and validates the canonical PUBREL before
+     advancing.)
+
+  **Also retained, each verified against the code and each still owed:**
+
+  - **The pre-landing verdict schedule.** A teardown stages N2, its tombstone attempt reads
+    the *occupant's* N1 record and correctly refuses, the session-record fallback durably
+    saves `CancelledRegs[N2]` — and *then* the replacement lands. **No post-landing teardown
+    pass is needed**; the saved verdict simply becomes applicable, and recovery's nonce
+    classifier frees it. So "PUBLISH-phase and uncancelled" is not sufficient for recovery
+    safety.
+  - **The N1 counterexample**, which refutes preserving the occupant's nonce instead of
+    taking the slot: **N1 can itself carry cancellation authority**, because the replacement
+    arm expressly admits an occupant whose cancellation exists only in `CancelledRegs`. If
+    the replacement preserves N1 and then transmits, that verdict matches the **transmitted**
+    exchange. Preserving N1 moves the hole rather than closing it.
+  - **Two further source-completion reapers** beyond the main recovery drop:
+    `resolveRetiredSource` and recovery's final retirement pass both remove suppression
+    **and** reap the register with `mqttSlotDeleteComplete` after source `Complete`. The
+    phase gate admits that disposition from PUBLISH, and **retirement proves PUBREC — a
+    custody transfer, not PUBCOMP**. Each needs the suppression/register split with its own
+    test and mutation.
+  - **The non-shared source-completion hole.** Gating only `$MQTT_SHARED_`-prefixed durables
+    is a proxy for the wrong fact: after a denial or a Maximum Packet Size rejection
+    preserves an identifier and **acknowledges the non-shared source**, the next resume's
+    AckFloor classifier says `Complete` and recovery consumes the register — no client
+    PUBACK, no completion sibling. *Source completion is not exchange completion, for every
+    durable class.*
+  - **The drain finalizer's deletion is not universally acknowledgement-authorized.** A
+    started, unacknowledged drained delivery can fail Maximum Packet Size and reach
+    `finalizeDrainSource` → `releaseInflightRegisterByIdentity`, deleting a **PUBLISH**
+    register with no terminal client acknowledgement. "The drain completed" is not itself
+    a release proof.
+  - **`purgeSharedPending` frees transmitted shared identifiers on a plain DISCONNECT** —
+    no teardown, no crash. Its own comment states it: the group durable survives, "but the
+    identifiers are freed".
+
+  **Binding constraints on any next attempt.** Neither nonce equality, `regPending`,
+  PUBLISH phase, nor sequence freshness proves never-transmission across inheritance, and
+  **both writers' outstanding cancellation continuations matter**. Preserved durable state
+  does **not** guarantee continuous memory custody, source mapping or Receive Maximum
+  accounting. Source disposal is not client completion, and **PUBREC transfers custody
+  without authorizing identifier reuse**. Completion reconciliation must be delivered
+  **with** its dependent preservation changes. Failed and ambiguous stores need **separate**
+  schedules, each followed by an actual subsequent offer and a recovery pass, and
+  **production retry convergence cannot be demonstrated by manually writing the missing
+  tombstone**. **Do not restart this seam under a new item name or with a stand-in marker**,
+  and do not re-propose: an in-memory "inherited" bit (its close set was wrong — seven
+  readers treat `regPending` as never-transmitted evidence, not three), the abandonment
+  inverse, or terminality in place on the register.
+
+  **The dependency, and who may lift it.** Closing the property needs durable transmission
+  attribution, which is **F-072**'s contract (`:3626`). F-072 is stopped by a
+  **user-approved pre-registered gate**, and a scope consult ruled that gate is **the
+  user's to lift** — general delegation of scope decisions does not override that specific
+  instruction, and a later consult that revised an *agent-set* boundary expressly preserved
+  this stop. The review that established the dependency was careful: its findings **do not
+  prove that F-072's particular marker is the only conceivable solution**, only that this
+  design's claimed independence from it is refuted. **Four §0.3 alpha blockers now sit
+  behind that one gate: this item, `:3217`, `:3385`, and F-072 itself.**
+
+  Residual in `docs/CONFORMANCE.md` under the replacement arm's deviation, as an **unfixed
+  release blocker** — no preservation guarantee or retry promise from an unapproved revision
+  is published as implemented behaviour. Full record, including the six refuted dispositions
+  and every review round, in `~/.claude/lanes/f-088/` (`review-ledger.md` is the authority).
 
 - [x] [F-071: Preserve same-topic ordering for affine QoS 2 deliveries](findings/release-investigations.md#f-071).
   **PARKED, NOT FIXED: post-alpha shared-QoS-2 work in chapter P.** It is a demonstrated

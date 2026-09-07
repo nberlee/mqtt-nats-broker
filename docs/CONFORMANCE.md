@@ -1518,6 +1518,20 @@ entry. Whether the inherited exchange then survives at all is the deferred lifec
 above — concurrent cancellation or failed-store settlement can still destroy or abandon
 it.
 
+**And its packet identifier can still be FREED while the client holds the exchange, which
+is an unfixed release blocker rather than a deviation this document accepts.** A
+cancellation of the *replacing* allocation is recorded against that allocation's nonce, and
+once the replacement has landed the record carrying that nonce **is** the inherited
+exchange's only durable trace — so the never-transmitted writers match it, recovery can
+free the identifier, and `bumpPI` may re-mint it for a different message, against
+[MQTT-2.3.1-4]. The route survives a crash between the landing and the confirmation, and it
+is also reachable with the verdict saved *before* the landing, in which case no
+post-landing teardown pass is involved at all. **F-088 owns this and has not closed it**:
+its planning stopped after establishing that the fix needs durable transmission
+attribution, which is F-072's stopped contract. See F-088's roadmap bullet for the four
+counterexamples. Nothing in this section promises that reservation is preserved here; the
+guarantee stated above is confined to the **QoS byte**.
+
 **A delivery carrying no per-exchange QoS evidence is withheld, not guessed at.** The
 identifier stays reserved and the source is not acknowledged. An audit of the removal
 sites found none that leaves a source mapping behind a missing entry, so the arm is
