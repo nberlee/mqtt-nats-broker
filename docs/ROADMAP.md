@@ -3995,9 +3995,97 @@ takeover.
   correctness argument about subscription interest and message retention, which is why
   F-035 did not absorb it.
 
-- [ ] [F-041: Persist the MQTT 5 DISCONNECT expiry override](findings/session-and-will.md#f-041).
-  **Medium.** The durable record and resume decision must agree even after an
-  ambiguous write.
+- [x] [F-041: Persist the MQTT 5 DISCONNECT expiry override](findings/session-and-will.md#f-041).
+  **Medium. DONE — the override is an OBLIGATION of the accepted connection, persisted at
+  the close and applied on every park and every discharge branch.**
+
+  **What was wrong.** A v5 DISCONNECT's Session Expiry Interval reached
+  `sess.expiryInterval` and `c.mqtt.sessionExpiry` in memory and **never** `$MQTT_sess`,
+  and it moved the interval without `clean`. Two defects, opposite directions, one cause —
+  which is why the fix is not conditioned on the override being zero. Lowering to 0 left a
+  record saying `Clean=false` with the pre-override interval, so a discard that did not
+  complete let a reconnect resume a session the DISCONNECT ended and report Session Present
+  true (Spec5 [3.1.2.11]). Raising to `mqttSessionNeverExpire` left a **finite** record with
+  `DisconnectedAt=0`, which `sweepSessionExpiries` stamps and arms a timer for —
+  deleting a session the client asked to keep forever. **Defect B was found by
+  plan-review round 1 and is in neither the bullet nor the dossier**, and it is why
+  persisting the interval alone
+  would have been strictly worse than persisting nothing: the resume decision reads `Clean`,
+  `overdue` needs a positive interval, and the sweep skips zero, so such a record is both
+  resumable and unreapable.
+
+  **What landed.** Three facts kept apart, which is the whole design: the session's
+  **confirmed** terms, a CONNECT's **requested** terms (speculative, refusable, and which
+  must never reach the close), and an accepted connection's **DISCONNECT override** — a new
+  `mqtt.lifetimeOverride`. The packet records the third and **no longer touches the session
+  at all**, so it needs no ownership test; a displaced connection's late DISCONNECT records
+  an obligation on its own client struct and its close finds the session rebound. The close
+  applies it through the CONNECT's own helper under a new `mqttLifetimeFinal` finality,
+  in its own record transaction, re-checking uncertainty **with the fence held**, and
+  handles all five classifier outcomes **per outcome** rather than through one shared
+  fall-through — a disposing verdict is ownership, not persistence, so continuing would run
+  `purgeSharedPending` and a second save against a record that is no longer ours. Under
+  `Final` a definite failure does **not** restore the pre-override terms: no refusal is
+  possible, so restoring would silently ignore the client's instruction. `clean` is derived
+  by one helper, `mqttSessionIsCleanForExpiry`.
+
+  **Both discharge branches apply it — when the action's interval IS a lifetime.** The
+  holistic review caught the last instance of this item's recurring defect class, one
+  representation carrying two facts: `action.expiryInterval` is the terms a close ends on
+  for a park built from a connection, and a bare discard **instruction** for the action
+  `reparkRefusedDiscard` synthesises — which is how **ordinary expiry recovery** retries,
+  for a session whose real lifetime is FINITE. Persisting that zero would have written
+  `Clean=true`/`ExpiryInterval=0` over the finite record, and the sweep skips interval-zero
+  records, so a later refused `clear()` left it **unreapable** where before it had a
+  deadline the sweep could retry — strictly worse than not writing.
+
+  The first fix drew that boundary at "carries a lifetime" and **widened the defect while
+  claiming to narrow it**: an ordinary parked close with no override then also ran the
+  backstop, adding a record store to every one and letting an AMBIGUOUS store repark a
+  discard HEAD simply attempts. The gate is `lifetimeOverridden` — only an override creates
+  an obligation, and only an obligation is written.
+
+  Otherwise the rule is stated as a property over every branch rather than
+  patched per arm — rounds 3, 4 and 5 each found exactly one unfixed arm. The surviving
+  branch writes the pair beside its stamp in one save; the discard branch writes the pair
+  **and the action's stamp** in a transaction of its own before `clear(true)`, because
+  `clear()` can fail without deleting anything and a drain timeout reparks with no
+  uncertainty armed. The stamp is not optional there: both resume checks need a **positive**
+  timestamp, which is what makes the `expiredBy` half of that clause work.
+
+  **A whole sub-programme was DELETED rather than shipped**, and that is the most useful
+  thing this item records. Revisions 7-9 also anchored the close's expiry deadlines at an
+  earlier close observation. Rounds 7, 8 and 9 produced four blocking findings and every one
+  was the same defect: **six** production sites derive an expiry decision from one
+  seconds-precision `disconnectedAt`, so an earlier anchor corrupted a different consumer
+  each round — round 9's being `mqttProcessConnect`'s own resident `overdue` check, the
+  resume decision this item exists to make correct. Two successive enumerations of those
+  consumers named three, then five, of the six. The programme was deleted by an explicit
+  scope ruling; F-041 now changes no clock source, converts no unit and rewrites no deadline
+  formula. **Do not re-propose anchoring the expiry deadlines earlier** without first
+  enumerating all six consumers and proving the ordering against a nanosecond `FireAt`.
+
+  **What it does NOT claim.** Round 2's P1 4 — a park's stamp dated late by the gate
+  spin — is **not** closed. The extra record write adds expiry lateness with no demonstrated
+  sub-second bound, and it can change Session Present at a one-second interval. The
+  pre-existing coarse-deadline-versus-`FireAt` inversion survives on the resident, parked
+  and record-driven routes. No cross-broker ownership semantics for `Clean`, which is a
+  resume predicate — destructive arbitration stays in `claimTeardown`.
+
+  Three more exclusions, stated here rather than left to the other two documents: a
+  **definite failure** of the lifetime write leaves the pre-override terms durable, so the
+  old deviation stands for that intersection and the close reports it at warning level; a
+  **crash before the first write** is not covered, because no durable state can precede
+  it; and a **refused discard still leaks** the record, its consumers and the generation's
+  registers with no resident object — what the backstop changes is that the leak is no
+  longer also a resumable session. Residuals in
+  `docs/CONFORMANCE.md` under "The DISCONNECT lifetime override is durable, and expiry
+  TIMING is not repaired"; mechanism in `docs/ARCHITECTURE.md` under "The DISCONNECT
+  lifetime override is a connection's OBLIGATION".
+
+  **Shape:** 10 plan-review rounds across two runs (blocking 3, 5, 2, 1, 1, 0, 2, 2, 2, 0),
+  zero relaunched, plus two scope consults. Rounds 1-6 were planned against `a8635fe` and
+  never approved; the re-anchoring to `2231651` cost rounds 7-10 and one deletion.
 
 - [ ] [F-039: Restore shared membership during SUBSCRIBE rollback](findings/runtime-correctness.md#f-039).
   **Small.** Independent of the F-030 term-fence work: this is a missing in-memory
@@ -4439,7 +4527,7 @@ finding with acceptance criteria.
   **(1) the lifetime-restoration fiction** — comments saying `abortAcceptedResume` puts the
   session lifetime back. It does not: it abandons the restore gate and calls
   `mqttAbortAcceptedConnect`. What protects the lifetime is ORDERING, because
-  `grantRequestedLifetime` runs after the earlier refusal sites. Some of these comments name
+  `applyRequestedLifetime` runs after the earlier refusal sites. Some of these comments name
   mutations that **cannot be written** (`restoreRefusedResumeLifetime` does not exist), which
   is the `feedback_mutation_run_must_compile` failure in prose.
   **(2) the F-084 ownership inference** — verdict comments asserting that a rejected CAS,

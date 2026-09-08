@@ -3634,7 +3634,7 @@ needs the same review.
 - The **deletion** of `mqttDisposalForRepairSave` and of `mqttRepairSaveVerdict`, whose
   whole job is to reconstruct a vocabulary from a verdict that discarded the evidence. The
   vocabulary should be returned by the classifier that has the evidence, which is the shape
-  `classifyPreConnackSave` already uses for the two kinds it does distinguish.
+  `classifyGatedRecordSave` already uses for the two kinds it does distinguish.
 
 ### Refuted, so neither returns
 

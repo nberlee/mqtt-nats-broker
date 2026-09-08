@@ -2040,17 +2040,21 @@ Residuals:
   — so convergence there is eventual, through the uncertainty classification calling the
   object foreign, not immediate.
   - For a v5 DISCONNECT that overrode a non-zero Session Expiry Interval to 0, losing the
-    obligation is a spec deviation and not merely a leak. The override is applied to
-    `sess.expiryInterval` and `c.mqtt.sessionExpiry` in memory and never persisted, so the
-    record still says `ExpiryInterval > 0` and `Clean = false`: a non-clean reconnect that
-    meets the surviving record resumes a session the DISCONNECT ended and reports Session
-    Present true, against Spec5 [3.1.2.11]. Same violation as the reconnect-race item in
-    `docs/ROADMAP.md` §0 but a different mechanism — that one is purely in-memory, this
-    one
-    is a durable record on a broker that may never have seen the DISCONNECT — and it has
-    its own §0 bullet there. All three loss paths above reach it, the declined one without
-    any crash or takeover, so the deviation must not be described as
-    crash-or-takeover-only.
+    obligation used to be a spec deviation rather than a leak, and **F-041 closed that**:
+    the override is now persisted as `Clean = true` with `ExpiryInterval = 0` **before**
+    the discard is attempted, so a refused discard leaves a record a reconnect declines to
+    resume. What remains on these paths is the leak — the record, its consumers and the
+    generation's registers survive with no resident object — and no longer a session that
+    reports Session Present true after the DISCONNECT ended it (Spec5 [3.1.2.11]).
+    **The reduction is claimed only for a backstop that was successfully persisted.** A
+    definite failure of the lifetime write leaves the pre-override terms durable and the
+    old deviation stands for that intersection; the close reports it at warning level. And
+    for a FINITE override the record instead carries the elapsed lifetime with its
+    disconnect stamp, which both resume checks read as overdue — a different route to the
+    same refusal, and the reason the stamp is written alongside the pair rather than left
+    to the discard.
+    The reconnect-race item in `docs/ROADMAP.md` §0 is a separate, purely in-memory
+    mechanism and is unaffected.
   - A crash in the CLEAN close's window leaves an expiry-0, `Clean = true` record with its
     consumers: nothing reaps it autonomously (the retry pass needs residency, the expiry
     sweep skips `ExpiryInterval == 0`, and the consumer sweep reads the record's consumers
@@ -2143,6 +2147,47 @@ Residuals:
   not read the stream would re-offer a started delivery under a fresh identifier and
   its orphan sweep would leave the registers behind, and there is no runtime capability
   gate that would stop it.
+
+### The DISCONNECT lifetime override is durable, and expiry TIMING is not repaired
+
+F-041 makes a v5 DISCONNECT's Session Expiry Interval override durable: `Clean`
+and `ExpiryInterval` are written together at the close, carried across every
+park, and applied on both discharge branches. Two timing residuals remain, and
+neither is the deviation that item closed.
+
+- **This change adds expiry lateness, without a demonstrated sub-second bound.**
+  The close performs one extra record write on the override path, so every
+  sample taken after it — the disconnect stamps, the expiry timer — is later than
+  it was. The bound is not "tens of milliseconds": the record fence's blocking
+  acquisition carries no bounded-wait guarantee and the JetStream API timeout is
+  five seconds. Nor is the effect confined to a rounding boundary, because the
+  close timer schedules a full relative interval **after** the finite save.
+  **It can be client-visible.** With a one-second interval, a stamp at `t.990`
+  gives a resident deadline of `t+1.000` while a delayed stamp at `t+1.010`
+  gives `t+2.000`; a reconnect at `t+1.500` is overdue under the first and
+  resumable under the second, which changes Session Present and the restored
+  subscriptions. What holds in the other direction is only this: **for a fixed
+  interval, delaying these samples cannot make a computed deadline earlier**, so
+  a Will's `FireAt` — anchored at the untouched close observation — is never
+  overtaken as a result.
+- **A coarse expiry deadline can still precede a Will's `FireAt`, and that is
+  pre-existing.** `DisconnectedAt` is a seconds field while `FireAt` is
+  nanoseconds, so the deadline derived from it can precede a capped `FireAt` by
+  up to a second. Four consumers derive one that way: the parked action, the
+  resident `overdue` check in `mqttProcessConnect`, the expiry callback's
+  recheck, and the record-driven sweep. Where that happens a session can be
+  expired before the Will it was capping fires, and a reconnect in the gap
+  suppresses that Will — the acceptance-fact predicate compares against `FireAt`
+  and has no ended-session test. **F-041 leaves all four exactly as it found
+  them.** An earlier revision of that item tried to repair the ordering by
+  anchoring the close's deadlines earlier; three review rounds found it
+  corrupting a different consumer each time, the last being the resume decision
+  itself, so the attempt was deleted rather than widened. Repairing it means
+  either widening a persisted field or capping `FireAt` against the coarse
+  deadline, and both are wider than that item.
+- **A park's disconnect stamp is still dated at the park, not at the close**, so
+  a slow ownership-gate spin dates it late. Pre-existing, unchanged, and subsumed
+  by the first residual above.
 
 ### An ambiguous record write COMPLETES rather than aborts, once it is settled
 

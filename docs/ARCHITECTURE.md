@@ -1657,7 +1657,7 @@ already had, changing only what is reported:
 | definite rejection, **bound** (`sess_rejected_write.go`) | `mqttBoundUnsettled` → **0x89** and the ORDINARY close bookkeeping. Deliberately not the foreign arm's shape — but the difference is the DISPOSAL, not the Will: since F-084 that arm consumes the Will too, suppressing one on a takeover nothing demonstrated having been the defect on either arm |
 | definite rejection, **unbound** | the same foreign disposition, with the forked vocabulary. It passes `nil` for the client, so the helper returns before the notification and *nothing observable differs*; the arm exists so the classifier has one meaning everywhere |
 | ambiguity resolution (`sess_uncertain.go`) | the same foreign disposition, verbatim — the same eviction, residency, continuation and parked-action treatment — with the forked vocabulary |
-| CONNECT-time classified saves (`reconcileResumedConsumers`, `grantRequestedLifetime`) | the same disposition, forked vocabulary. Their **10071** arms disposed with no readback at all, so they now read once and classify — the only new I/O in the mechanism, on a pre-CONNACK rejection path |
+| CONNECT-time classified saves (`reconcileResumedConsumers`, `applyRequestedLifetime`) | the same disposition, forked vocabulary. Their **10071** arms disposed with no readback at all, so they now read once and classify — the only new I/O in the mechanism, on a pre-CONNACK rejection path |
 | the persist observation (`evictDisplacedOnRemotePersist`) | the same eviction — the record provably moved with content that is not ours — with the forked vocabulary, and the displaced incarnation's **delayed-Will outbox record is left alone**, because nothing arbitrated a session continuation. See below for the worker this route required |
 
 **What is reported travels as one value** (`mqttDisposalVocabulary`): reason code, Reason
@@ -4527,7 +4527,7 @@ and the requested values are applied — and persisted, in the same breath — a
 the **grant point**, once everything that could refuse the CONNECT has passed
 and immediately before the CONNACK. The write happens only when the terms
 actually changed, so an ordinary reconnect adds none, and it owes the ordinary
-outcome discipline (`grantRequestedLifetime`): a definite failure puts the two
+outcome discipline (`applyRequestedLifetime`): a definite failure puts the two
 fields back; an ambiguous one puts them back **immediately** and re-applies the
 grant only once a readback proves the write landed — because a close happening
 while the write is unresolved snapshots the lifetime into its deferred
@@ -4542,6 +4542,104 @@ in memory and in the record, with no repair machinery at all. A session that
 was CLEARED rather than resumed — clean start, a legacy clean session, an
 overdue record — takes the requested terms at rebind instead: it has no prior
 lifetime to protect and its record is created fresh by the accept save.
+
+### The DISCONNECT lifetime override is a connection's OBLIGATION
+
+A v5 DISCONNECT may replace the Session Expiry Interval (Spec5 [3.14.2.2.2]),
+and the same helper persists it — under `mqttLifetimeFinal` rather than
+`mqttLifetimeSpeculative`, which is the whole of the difference between the two
+callers.
+
+**Three facts have to stay apart, and conflating any two of them was what made
+this hard.**
+
+| Fact | Where it lives | Who may act on it |
+|---|---|---|
+| the session's **confirmed** terms | `sess.expiryInterval` / `sess.clean`, moved only under the ownership gate | anything reading the session |
+| a CONNECT's **requested** terms — speculative, still refusable | local to `mqttProcessConnect` | the grant above, and only once it proves durable |
+| an accepted connection's **DISCONNECT override** — explicit, unrefusable | `mqtt.lifetimeOverride` | the close, and every park the close can take |
+
+The packet handler writes only the third: it records `mqtt.lifetimeOverride`
+under `c.mu` and **no longer touches the session at all**, which is why it needs
+no ownership test. A late DISCONNECT from a displaced connection records an
+obligation on its own client struct, and its close then finds the session
+rebound and does nothing with it. The requested terms must never reach the close
+— `mqttAbortAcceptedConnect` exists to guarantee that — and because
+`lifetimeOverride` is written only by this packet, a connection whose CONNECT
+was refused never has one.
+
+**`clean` and the interval are ONE fact**, derived by
+`mqttSessionIsCleanForExpiry`. Persisting the interval alone would be strictly
+worse than persisting nothing: the resume decision reads `Clean`, `overdue`
+requires a positive interval, and the expiry sweep skips zero — so the record
+would be both resumable and unreapable.
+
+**The close applies it**, after the entry uncertainty check and before the
+never-expire stamp block, in its **own** record transaction (the fence is not
+re-entrant) and re-checking uncertainty **with the fence held**, because the
+entry check is a check-then-act. The five classifier outcomes are handled per
+outcome, not by one shared fall-through: `Proceed` continues on the applied
+terms, `Local` keeps them and reports the lost durability, `Unresolved` parks,
+and both disposing verdicts terminate through the existing disposal — an
+ownership verdict, not a persistence failure, so continuing would run
+`purgeSharedPending` and a second finite save against a record that is no longer
+ours.
+
+Under `Final` a definite failure does **not** restore the pre-override terms.
+No refusal is possible and the client has already been told nothing further, so
+putting them back would silently ignore the instruction — which is the deviation
+this exists to fix. The terms stand and only the durable backstop is lost.
+
+**Every park carries the obligation, and every discharge applies it.** A park is
+not a refusal, so `mqttDeferDisconnectEx` builds the action's `expiryInterval`
+from the override when the connection has one. That also decides the Will at no
+extra cost: `mqttWillFireAt`'s cap and `mqttWillIsDelayed`'s classification both
+read the action's interval, so an override to zero reclassifies a delayed Will
+as due now and a shrink caps the delay at park time. Because the action is built
+from the override rather than from the confirmed terms, there is nothing stale
+for `retargetDeferredLifetime` to fix — which is why it is called under
+`Speculative` only.
+
+`applyDeferredDisconnect` then has exactly two operational branches and **both**
+apply the action's lifetime before anything fallible — but only when that
+interval **is** a lifetime. `action.expiryInterval` carries two different facts
+in one representation: the terms this close ends on, for a park built from a
+connection, and a bare discard **instruction**, for the action
+`reparkRefusedDiscard` synthesises. That path retries ordinary expiry recovery
+for a session whose real lifetime is **finite**, so persisting its zero as
+`Clean = true` with `ExpiryInterval = 0` would write over the finite record —
+and `sweepSessionExpiries` skips interval-zero records, so a subsequently
+refused `clear()` would leave the session unreapable where before it had a
+deadline the sweep could retry. `mqttDeferredDisconnect.lifetimeOverridden` is the
+distinction, and it is deliberately narrower than "carries a lifetime": it is set
+only when the connection actually carried an **override**. An ordinary park with
+no override carries the session's own confirmed terms, which the session and its
+record already hold — so writing them would add a record store to every parked
+close and, worse, let an **ambiguous** store repark a discard that today is simply
+attempted, which is behaviour change on a path this item does not own. Only an
+override creates an obligation, and only an obligation is written; a synthetic
+discard and a no-override park both keep their historical behaviour. The surviving branch
+writes
+the pair beside its disconnect stamp, in one save: carrying the override in the
+action is not enough, because that branch used to persist the session's retained
+lifetime and a never-expire override therefore left a finite record for a
+restart to expire. The discard branch writes the pair **and the action's stamp**
+in a transaction of its own before `clear(true)`, because `clear()` can fail
+without deleting anything — a drain timeout reopens the tracker and reparks,
+arming no uncertainty, so a CONNECT would find neither `clean` nor `overdue` and
+resume a session the DISCONNECT ended. The stamp is not optional there: both
+resume checks need a **positive** timestamp to recognise expiry, so a backstop
+that writes the lifetime and leaves it at zero leaves an already-expired finite
+session resumable — which is the `expiredBy` half of that same case clause. It is
+the **action's** stamp, never a fresh sample: the discharge stands in for a close
+that happened earlier.
+
+**What this does not do.** It changes no clock source, converts no unit and
+rewrites no deadline formula; the expiry-timing residuals are in
+`docs/CONFORMANCE.md`. It gives `Clean` no cross-broker ownership semantics —
+that predicate is a **resume** predicate, and destructive arbitration stays in
+`claimTeardown`. And it does not make the override survive a crash before its
+first write, which no durable state can.
 
 **Crash windows.** A crash after a create but before the repair save leaves a
 durable with a closed subscription that never transmitted and that no record
@@ -4669,7 +4767,7 @@ outcome reaches a loud log and a bare close instead.
 left to explain itself on — the channel is what failed.
 
 The two sites that used to be silent were silent for a reason about their own code, and both
-are closed. `reconcileResumedConsumers` and `grantRequestedLifetime` each **disposed the
+are closed. `reconcileResumedConsumers` and `applyRequestedLifetime` each **disposed the
 session internally before returning**, so a CONNACK the caller enqueued had already lost the
 race with the `closeConnection` that disposal schedules; and each collapsed a takeover and
 a
@@ -4685,7 +4783,7 @@ schedules can publish it, the signal precedes any scheduled close, and the dispo
 was observed — and the DISCONNECT and log paths no longer over-claim in the other
 direction. F-084 closed that: see "Only a held successor licenses a takeover claim".
 
-The classification behind those two sites is one function, `classifyPreConnackSave`,
+The classification behind those two sites is one function, `classifyGatedRecordSave`,
 shared by
 the reconciliation phase and the lifetime grant: both split 10071 from 10164 identically,
 and

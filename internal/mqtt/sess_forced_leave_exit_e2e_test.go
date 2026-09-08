@@ -456,7 +456,7 @@ func TestForcedLeaveMalformedMembershipKeyIsRefusedBeforeTheConnack(t *testing.T
 // there is something to recover from.
 //
 // The grant save is targeted by REQUESTING A DIFFERENT INTERVAL from the one the session holds:
-// grantRequestedLifetime applies the new values and then persists them, so the save whose
+// applyRequestedLifetime applies the new values and then persists them, so the save whose
 // session already carries the requested interval is the grant's own and no other.
 //
 // Deliberately NOT aimed at the forced leave's malformed-key preflight, which cannot exercise

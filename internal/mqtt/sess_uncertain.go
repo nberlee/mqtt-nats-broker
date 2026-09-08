@@ -182,6 +182,30 @@ type mqttDeferredDisconnect struct {
 	// it never expires, anything else is a finite deadline measured from
 	// disconnectedAt.
 	expiryInterval uint32
+	// lifetimeOverridden says whether expiryInterval above came from a v5 DISCONNECT
+	// override -- the client's explicit, unrefusable instruction -- rather than from
+	// the session's own confirmed terms or from a synthetic discard.
+	//
+	// It gates the only writes F-041 adds to the discharge, and the gate is this
+	// narrow for two separate reasons.
+	//
+	// A SYNTHETIC action is not a lifetime at all: reparkRefusedDiscard builds
+	// expiryInterval 0 to mean "discard, now", for a session whose real lifetime may
+	// be FINITE -- the ordinary expiry-recovery retry is exactly that. Persisting
+	// that zero would write Clean=true with ExpiryInterval=0 over a finite record,
+	// and sweepSessionExpiries skips interval-zero records, so a subsequently refused
+	// clear() would leave the session unreapable where before it had a deadline the
+	// sweep could retry.
+	//
+	// An ordinary park with NO override carries the session's confirmed terms, which
+	// the session and its record already hold -- so there is nothing to make durable,
+	// and writing anyway would add a record store to every parked close and, worse,
+	// let an AMBIGUOUS store repark a discard that today is simply attempted. That is
+	// behaviour change on a path this item does not own.
+	//
+	// So: only an OVERRIDE creates an obligation, and only an obligation is written.
+	// F-041.
+	lifetimeOverridden bool
 	// willDeadline is the absolute Unix time the Will becomes due (0 when there is
 	// no Will pending). A reconnect BEFORE it cancels the Will; a reconnect after
 	// it does not — the Will is still owed and is published on resolution.
@@ -1342,6 +1366,16 @@ func (sess *mqttSession) deferDisconnectIfUncertain(action *mqttDeferredDisconne
 // discarded its Will (mqttAbortAcceptedConnect), so a parked action from that
 // path carries none.
 //
+// ONE CALLER, and the reasoning above holds only for it: a CONNECT's landed
+// grant. Everything here about confirmed terms -- and the claim that "the close
+// path installs one action and refuses to replace it" makes pointer identity
+// sufficient -- is true only when the closing connection carries NO DISCONNECT
+// override. When it does, mqttDeferDisconnectEx already builds the action from
+// that override rather than from the confirmed terms, so there is nothing stale
+// to retarget and a retarget would rewrite a correct value with the same one.
+// That is why applyRequestedLifetime calls this under mqttLifetimeSpeculative
+// only. F-041.
+//
 // No lock held on entry.
 func (sess *mqttSession) retargetDeferredLifetime(prior *mqttDeferredDisconnect, expiry uint32) {
 	sess.mu.Lock()
@@ -1440,12 +1474,36 @@ func (s *Server) mqttDeferDisconnectUngated(c *client, asm *mqttAccountSessionMa
 // it rather than pass it.
 func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager, sess *mqttSession, ungated bool) bool {
 	now := time.Now()
+	// The lifetime THIS connection ends on. A DISCONNECT override is the client's
+	// explicit instruction on an accepted connection, so the obligation it creates
+	// SURVIVES a park -- a park is not a refusal. That is not the speculative-terms
+	// case applyRequestedLifetime's comment warns about: there the broker had
+	// refused the CONNECT, so its requested interval was never owed. Without this,
+	// the three early-park exits silently retain a session the client ended, or
+	// delete one it asked to keep forever. F-041.
+	//
+	// It also decides the Will, at no extra cost: the cap inside mqttWillFireAt and
+	// the armed-Will classification through mqttWillIsDelayed both read
+	// action.expiryInterval below, so an override to zero correctly reclassifies a
+	// delayed Will as due now, and a shrink caps the delay at park time rather than
+	// after it.
+	sess.mu.Lock()
+	eff := sess.expiryInterval
+	sess.mu.Unlock()
+	overridden := false
+	if ov := c.mqttLifetimeOverride(); ov != nil {
+		eff, overridden = *ov, true
+	}
 	sess.mu.Lock()
 	action := &mqttDeferredDisconnect{
 		disconnectedAt: now.Unix(),
-		expiryInterval: sess.expiryInterval,
-		willSessionSeq: sess.seq,
-		willGen:        sess.gen,
+		expiryInterval: eff,
+		// Only when the connection actually carried one. Without an override the
+		// interval above is the session's own confirmed terms, already durable, and
+		// the discharge has nothing to write.
+		lifetimeOverridden: overridden,
+		willSessionSeq:     sess.seq,
+		willGen:            sess.gen,
 	}
 	sess.mu.Unlock()
 	action.willSessEpoch = asm.sessStreamEpoch
@@ -1678,6 +1736,64 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		// failure means a lost teardown claim or a partly-done teardown, and re-parking
 		// there would resurrect an obligation that is either no longer ours or already
 		// half-discharged. Those keep the historical outcome — the object goes.
+		//
+		// THE BACKSTOP FIRST, because clear() can fail without deleting anything.
+		// A drain timeout reopens the tracker and this branch reparks, arming no
+		// uncertainty and installing no retirement-pending state -- so a CONNECT
+		// skips resolution, finds neither clean nor overdue, and RESUMES a session
+		// the DISCONNECT ended. No failed lifetime write and no foreign settlement
+		// are needed to reach that. Making the ended terms durable before the
+		// fallible discard converts it from a resumable record into a leak.
+		//
+		// ONLY for an action carrying a DISCONNECT override -- see
+		// lifetimeOverridden, which records why the gate is this narrow. A synthetic
+		// discard and an ordinary no-override park both keep their historical
+		// behaviour here: neither has an F-041 obligation to make durable.
+		//
+		// Its own transaction, opened and closed before clear() opens the one it
+		// owns: the fence is not re-entrant and clear() ends the record generation.
+		// F-041.
+		if action.lifetimeOverridden {
+			tok := sess.beginRecordTx()
+			if sess.isSeqUncertain() {
+				// In-fence, for the same reason as the surviving branch: the entry check
+				// is a check-then-act, and writing on a sequence nobody has classified
+				// is what it exists to withhold.
+				if terr := sess.endRecordTx(tok); terr != nil {
+					s.Errorf("MQTT: %v", terr)
+				}
+				s.reparkDeferredDisconnect(sess, action)
+				return
+			}
+			sess.mu.Lock()
+			sess.expiryInterval = action.expiryInterval
+			sess.clean = mqttSessionIsCleanForExpiry(action.expiryInterval)
+			// THE DISCONNECT TIME TOO, and it is not optional here. Both resume checks
+			// need a POSITIVE timestamp to recognise expiry -- the resident one in
+			// mqttProcessConnect and the record-derived twin beside it -- so a backstop
+			// that writes the lifetime and leaves DisconnectedAt at zero leaves an
+			// already-expired FINITE session resumable, which is the expiredBy half of
+			// this same case clause. The ACTION's stamp, never a fresh sample: this
+			// discharge stands in for a close that happened earlier.
+			sess.disconnectedAt = action.disconnectedAt
+			sess.mu.Unlock()
+			outcome, berr := sess.saveClassified(tok)
+			if terr := sess.endRecordTx(tok); terr != nil {
+				s.Errorf("MQTT: %v", terr)
+			}
+			switch outcome {
+			case saveMaybeLanded:
+				// Unresolved: nothing below may run on a sequence nobody has classified,
+				// and clear() would refuse anyway. Put the action back, with the terms it
+				// carries intact, and let the next resolution re-drive the discard.
+				s.reparkDeferredDisconnect(sess, action)
+				return
+			case saveDefinitelyFailed:
+				// The backstop is lost for this attempt; the discard below is still owed
+				// and still runs, exactly as the ordinary close's local arm does.
+				s.Warnf("MQTT: unable to persist the ended lifetime of session %q before discarding it; a discard that does not complete will leave a resumable record: %v", sess.id, berr)
+			}
+		}
 		if err := sess.clear(true); err != nil {
 			switch {
 			case errors.Is(err, errMQTTClearRefusedUnresolved):
@@ -1742,6 +1858,30 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		}
 		sess.mu.Lock()
 		sess.disconnectedAt = action.disconnectedAt
+		// Gated on lifetimeOverridden, like the discard branch below: without an
+		// override the action carries the session's own confirmed terms, so applying
+		// them is a no-op, and a synthetic discard's interval is not a lifetime at
+		// all. Stated on both branches so the rule lives in one place rather than
+		// being rediscovered by the next producer.
+		//
+		// The lifetime this close was OWED. The action is the only carrier of a
+		// DISCONNECT override across a park, so the discharge is where that
+		// obligation becomes the session's terms and, through the save below, the
+		// record's. Applied here rather than at park time because until this point
+		// the record state was unresolved and the session had to run on its
+		// confirmed terms.
+		//
+		// Carrying it in the action is NOT enough on its own: this branch used to
+		// save the session's existing lifetime beside the new stamp, so a
+		// never-expire override persisted the old finite interval (a restart then
+		// deletes a session the client asked to keep forever), a 3600 -> 60 override
+		// armed an early timer that expireSession's own recheck then REFUSED against
+		// the retained 3600, and a 60 -> 3600 override left the record eligible for
+		// the earlier expiry. F-041.
+		if action.lifetimeOverridden {
+			sess.expiryInterval = action.expiryInterval
+			sess.clean = mqttSessionIsCleanForExpiry(action.expiryInterval)
+		}
 		sess.mu.Unlock()
 		if owed := sess.purgeSharedPendingStaged(nil); owed {
 			s.Debugf("MQTT: the deferred close of session %q carries its void-register verdicts on the session record", sess.id)
@@ -1756,11 +1896,14 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 			s.Debugf("MQTT: the deferred disconnect of session %q was written ambiguously; the resolver will settle it: %v", sess.id, err)
 		case saveDefinitelyFailed:
 			// The in-memory purge stands, the verdicts stay staged for the next
-			// convergence point, and the timer below is still armed. Only
-			// restart-survival of the deadline is lost — the same posture as the
-			// ordinary close's failed disconnect save, and worth a warning because a
-			// lost purge verdict is not a routine debug event.
-			s.Warnf("MQTT: unable to persist the deferred disconnect of session %q; its deadline will not survive a restart: %v", sess.id, err)
+			// convergence point, and the timer below is still armed. What is lost is
+			// larger than it was: not only restart-survival of the deadline, but
+			// persistence of the LIFETIME this close was owed -- so a record read
+			// after a restart still describes the pre-override terms, which for a
+			// never-expire override means the expiry sweep can delete a session the
+			// client asked to keep forever. Same posture as the ordinary close's
+			// failed disconnect save, and worth a warning for two reasons now.
+			s.Warnf("MQTT: unable to persist the deferred disconnect of session %q; neither its deadline nor the lifetime it ends on will survive a restart: %v", sess.id, err)
 		}
 		if terr := sess.endRecordTx(tok); terr != nil {
 			s.Errorf("MQTT: %v", terr)
@@ -2437,7 +2580,7 @@ func (sess *mqttSession) recordStateBlocksServing() bool {
 // by the reconciliation phase and the lifetime grant, the shared-membership
 // ownership write, and the 3.1.1 forced leave. And 10071 says the subject moved,
 // which is weaker than "taken over" — see F-084. See
-// classifyPreConnackSave in sess_resume_reconcile.go.
+// classifyGatedRecordSave in sess_resume_reconcile.go.
 func (sess *mqttSession) saveClassifiedDetail(tok recordTx) (saveOutcome, mqttSessSaveDetail, error) {
 	wasUncertain := sess.isSeqUncertain()
 	detail, err := sess.saveWithDetail(tok)

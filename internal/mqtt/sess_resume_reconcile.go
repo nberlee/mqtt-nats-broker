@@ -146,7 +146,7 @@ type mqttLifetimeGrantResult struct {
 	err     error
 }
 
-// mqttClassifiedPreConnackSave is what classifyPreConnackSave found: the outcome,
+// mqttClassifiedPreConnackSave is what classifyGatedRecordSave found: the outcome,
 // the vocabulary the route that reached it computed, and whether that route was
 // the CONTENDED one, which is the only thing that distinguishes the two
 // unresolved arms from each other.
@@ -824,7 +824,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// kind is destroyed by save()'s formatting) plus the exact base sequence and
 	// body bytes sent, so the 10164 re-read compares against what was actually
 	// stored.
-	cs := sess.classifyPreConnackSave(tok)
+	cs := sess.classifyGatedRecordSave(tok)
 	switch cs.outcome {
 	case mqttPreConnackProceed:
 		return mqttResumeReconcileResult{installed: installedList(), outcome: mqttPreConnackProceed}
@@ -860,7 +860,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	}
 }
 
-// classifyPreConnackSave classifies a CAS-arbitrated record write made inside a
+// classifyGatedRecordSave classifies a CAS-arbitrated record write made inside a
 // pre-CONNACK step's still-open transaction. It is the ONE classification the
 // reconciliation phase's repair save and the lifetime grant share: both split
 // 10071 from 10164, both narrow the first through a single record read, and both
@@ -885,7 +885,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 //
 // tok must be the CALLER'S OWN open transaction. No lock held on entry; performs
 // JetStream requests.
-func (sess *mqttSession) classifyPreConnackSave(tok recordTx) mqttClassifiedPreConnackSave {
+func (sess *mqttSession) classifyGatedRecordSave(tok recordTx) mqttClassifiedPreConnackSave {
 	outcome, detail, serr := sess.saveClassifiedDetail(tok)
 	if serr == nil {
 		return mqttClassifiedPreConnackSave{outcome: mqttPreConnackProceed}
@@ -982,7 +982,7 @@ func mqttVerifyConsumersBatched(durables []string, bound int,
 
 // resolveContendedRecordSave is the bounded re-read/retry for a record save
 // rejected with 10164. FOUR callers, not two: the pre-CONNACK classification the repair
-// save and the lifetime grant share (classifyPreConnackSave), the shared-membership
+// save and the lifetime grant share (classifyGatedRecordSave), the shared-membership
 // ownership write, and the 3.1.1 forced leave. Contention is a rejection, never a verdict, so the
 // record is re-read and the attempt classified by its own identity — the base
 // sequence it CAS'd against and the digest of the exact bytes it sent:
@@ -1208,7 +1208,7 @@ func (sess *mqttSession) sweepUnadoptedPhaseSubs(c *client, delivers []string) {
 	}
 }
 
-// grantRequestedLifetime applies this CONNECT's Session Expiry Interval and
+// applyRequestedLifetime applies this CONNECT's Session Expiry Interval and
 // Clean flag to a RESUMED session and persists them, as one step, at the moment
 // the resume is granted.
 //
@@ -1256,8 +1256,28 @@ func (sess *mqttSession) sweepUnadoptedPhaseSubs(c *client, delivers []string) {
 // It takes neither the session manager nor the client, and that is the visible
 // consequence of not disposing: both existed only to hand the session over. Keeping
 // them would leave the next reader looking for the disposal that used to be here.
-func (sess *mqttSession) grantRequestedLifetime(tok recordTx, expiry uint32,
-	clean bool) mqttLifetimeGrantResult {
+// mqttLifetimeFinality says what a FAILED lifetime write means for the caller,
+// and it exists because the two callers differ on exactly that. It is not a
+// severity dial: each value names a fact about the caller's situation.
+type mqttLifetimeFinality int
+
+const (
+	// mqttLifetimeSpeculative is a CONNECT, which can still be refused. A write
+	// that did not prove itself leaves the session on its CONFIRMED terms,
+	// because a requested interval the broker never granted must not decide a
+	// teardown -- see this function's AMBIGUOUS note above.
+	mqttLifetimeSpeculative mqttLifetimeFinality = iota
+	// mqttLifetimeFinal is an accepted connection's close carrying a DISCONNECT
+	// override. No refusal is possible and the client has already been told
+	// nothing further, so putting the old terms back on a definite failure would
+	// silently ignore the client's instruction -- which is the Spec5
+	// [3.1.2.11.2] violation F-041 exists to fix. The terms STAND and only the
+	// durable backstop is lost.
+	mqttLifetimeFinal
+)
+
+func (sess *mqttSession) applyRequestedLifetime(tok recordTx, expiry uint32,
+	clean bool, finality mqttLifetimeFinality) mqttLifetimeGrantResult {
 
 	sess.mu.Lock()
 	wasExpiry, wasClean := sess.expiryInterval, sess.clean
@@ -1289,13 +1309,22 @@ func (sess *mqttSession) grantRequestedLifetime(tok recordTx, expiry uint32,
 		// teardown against the confirmed terms. Now that the grant is proven
 		// durable, that snapshot is the stale half — and it, not the session, is
 		// what decides whether the session is discarded and what timer is armed.
-		sess.retargetDeferredLifetime(priorDeferred, expiry)
+		//
+		// SPECULATIVE ONLY. Under Final the parked action already carries the
+		// override -- mqttDeferDisconnectEx reads it from the connection, so the
+		// action was never built against the confirmed terms in the first place --
+		// and retargeting would rewrite a correct value with the same value. Left
+		// unguarded it would also falsify the claim that this helper's retarget
+		// keeps only its CONNECT caller. F-041.
+		if finality == mqttLifetimeSpeculative {
+			sess.retargetDeferredLifetime(priorDeferred, expiry)
+		}
 	}
 
 	// The same classification the reconciliation phase's repair save uses, and for
 	// the same reasons — one place for the two CAS kinds, one place that mints the
-	// fork grant. See classifyPreConnackSave.
-	cs := sess.classifyPreConnackSave(tok)
+	// fork grant. See classifyGatedRecordSave.
+	cs := sess.classifyGatedRecordSave(tok)
 	switch cs.outcome {
 	case mqttPreConnackProceed:
 		return mqttLifetimeGrantResult{outcome: mqttPreConnackProceed}
@@ -1312,7 +1341,13 @@ func (sess *mqttSession) grantRequestedLifetime(tok recordTx, expiry uint32,
 		// type; disposing inline is what kept this site's refusal unexplained.
 		return mqttLifetimeGrantResult{outcome: cs.outcome, voc: cs.voc, err: cs.err}
 	default: // mqttPreConnackLocal
-		restore()
+		// Speculative only. Under Final the client's DISCONNECT is unrefusable, so
+		// restoring the pre-override terms here would discard the instruction and
+		// leave the teardown below acting on a lifetime the client replaced; the
+		// caller reports the lost durability instead. See mqttLifetimeFinality.
+		if finality == mqttLifetimeSpeculative {
+			restore()
+		}
 	}
 	return mqttLifetimeGrantResult{outcome: cs.outcome, err: cs.err}
 }

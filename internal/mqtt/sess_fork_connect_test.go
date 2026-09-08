@@ -8,7 +8,7 @@ import (
 
 // Path 3: the CONNECT-time classified saves.
 //
-// reconcileResumedConsumers and grantRequestedLifetime do not wait for the rejection
+// reconcileResumedConsumers and applyRequestedLifetime do not wait for the rejection
 // settlement: they classify it themselves — directly on 10071, and through
 // resolveContendedRecordSave on 10164. They no longer DISPOSE, though, which is what the
 // pre-CONNACK-signal item changed: each returns an outcome and a vocabulary, and
@@ -43,7 +43,7 @@ func testNewConnectForkEnv(t *testing.T, clientID string,
 	return &testConnectForkEnv{testRejectionEnv: e, survivor: stage(t, e.testInflightEnv)}
 }
 
-// testGrantLifetime drives grantRequestedLifetime with a real record transaction, as the
+// testGrantLifetime drives applyRequestedLifetime with a real record transaction, as the
 // CONNECT does. The expiry differs from the session's so the helper does not take its
 // no-change early return.
 //
@@ -54,7 +54,7 @@ func testNewConnectForkEnv(t *testing.T, clientID string,
 func testGrantLifetime(t *testing.T, e *testRejectionEnv, c *client) mqttLifetimeGrantResult {
 	t.Helper()
 	tok := e.sess.beginRecordTx()
-	g := e.sess.grantRequestedLifetime(tok, 600, false)
+	g := e.sess.applyRequestedLifetime(tok, 600, false, mqttLifetimeSpeculative)
 	if terr := e.sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}

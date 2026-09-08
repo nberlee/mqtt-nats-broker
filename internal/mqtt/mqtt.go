@@ -2735,6 +2735,29 @@ func (c *client) mqttSessionExpiry() uint32 {
 	return c.mqtt.sessionExpiry
 }
 
+// mqttSessionIsCleanForExpiry reports whether a session with this Session Expiry
+// Interval ends at connection close. It is the ONE definition of the derivation
+// Spec5 [3.1.2.11.2] fixes: clean and the interval are one fact, not two, and a
+// writer that moves one without the other leaves a record whose resume decision
+// and whose expiry sweep disagree (F-041).
+func mqttSessionIsCleanForExpiry(expiry uint32) bool { return expiry == 0 }
+
+// mqttLifetimeOverride reads the lifetime a v5 DISCONNECT on THIS connection
+// instructed the session to end on, or nil when it carried no Session Expiry
+// Interval property. See mqtt.lifetimeOverride: it is an obligation of an
+// accepted connection, and deliberately not the same fact as sessionExpiry
+// above, which also carries a CONNECT's merely REQUESTED terms.
+//
+// No lock held on entry.
+func (c *client) mqttLifetimeOverride() *uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mqtt == nil {
+		return nil
+	}
+	return c.mqtt.lifetimeOverride
+}
+
 // mqttOweWill records that this connection's close has been observed, moving an
 // armed Will to owed. sessionExpiry is the session's effective Session Expiry
 // Interval, read by the caller while the session is still unambiguously this
@@ -2871,6 +2894,24 @@ type mqtt struct {
 	// exactly once by mqttTakeWillLocked. See mqttHandleClosedClient,
 	// mqttHandleWill.
 	willDisposition mqttWillDisposition
+
+	// lifetimeOverride is the Session Expiry Interval a v5 DISCONNECT on this
+	// connection instructed the session to end on, or nil when no DISCONNECT
+	// carried the property. Spec5 [3.14.2.2.2].
+	//
+	// It is an OBLIGATION of this accepted connection, and the whole point of its
+	// existing separately is that it is neither of the two facts it would
+	// otherwise be confused with. Not the session's CONFIRMED terms
+	// (sess.expiryInterval / sess.clean), which move only under the ownership
+	// gate. And not a CONNECT's REQUESTED terms, which sessionExpiry above also
+	// carries and which the broker may still refuse -- those must never reach the
+	// close, which is what mqttAbortAcceptedConnect exists to guarantee. Because
+	// this is written only by the DISCONNECT packet handler, a connection whose
+	// CONNECT was refused never has one. F-041.
+	//
+	// Written and read only under c.mu, never marshalled, never crossing a
+	// broker.
+	lifetimeOverride *uint32
 
 	// closeObservedAt is when this connection's close was observed, in unix
 	// nanoseconds, recorded by the same transition that makes the Will owed. It is
@@ -4315,24 +4356,29 @@ func (c *client) mqttParse(buf []byte) error {
 				// override rather than fail an already-closing connection.
 				if props != nil && props.present[mqttPropSessionExpiry] {
 					c.mu.Lock()
-					sess := c.mqtt.sess
 					// The connection's own copy moves with it, whether or not it still
 					// owns the session below: it is what classifies this connection's
 					// Will. Same Protocol Error rule, applied to its own value.
 					if c.mqtt.sessionExpiry != 0 || props.sessionExpiry == 0 {
 						c.mqtt.sessionExpiry = props.sessionExpiry
+						// The client's explicit instruction for how this session ends,
+						// recorded as an OBLIGATION of this accepted connection rather
+						// than applied to the session here -- which is what the code
+						// this replaced did, under sess.c == c, leaving sess.clean
+						// behind and reaching $MQTT_sess never (F-041). The close
+						// applies it under the ownership gate, inside a record
+						// transaction, and every park carries it. nil means this
+						// connection ends on whatever the session was granted.
+						//
+						// Nothing session-scoped is written here any more, so no
+						// ownership test is needed: a late DISCONNECT from a displaced
+						// connection records an obligation on ITS OWN client struct,
+						// and its close then finds the session rebound and does nothing
+						// with it. Spec5 [3.14.2.2.2].
+						overridden := props.sessionExpiry
+						c.mqtt.lifetimeOverride = &overridden
 					}
 					c.mu.Unlock()
-					if sess != nil {
-						sess.mu.Lock()
-						// Only if this client still owns the session: after a takeover
-						// sess.c is the new client, and a late DISCONNECT from the old
-						// connection must not clobber the live session's interval.
-						if sess.c == c && (sess.expiryInterval != 0 || props.sessionExpiry == 0) {
-							sess.expiryInterval = props.sessionExpiry
-						}
-						sess.mu.Unlock()
-					}
 				}
 			}
 			if trace {
@@ -4531,6 +4577,80 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 	if sess.isSeqUncertain() {
 		s.mqttDeferDisconnectOwned(c, asm, sess)
 		return
+	}
+
+	// THE DISCONNECT OVERRIDE, made durable before any teardown decision reads the
+	// lifetime. A v5 DISCONNECT may replace the Session Expiry Interval (Spec5
+	// [3.14.2.2.2]), and until F-041 that replacement reached memory only: the
+	// record kept the pre-override interval AND its old Clean, so a discard that
+	// did not complete left a record a later CONNECT resumes -- reporting Session
+	// Present true for a session the DISCONNECT ended -- while an override RAISING
+	// the interval to never-expire left a finite record the expiry sweep stamps and
+	// deletes. Opposite directions, one cause, which is why this is not conditioned
+	// on the override being zero.
+	//
+	// Clean and the interval are ONE fact (mqttSessionIsCleanForExpiry): this is
+	// the writer that used to move the interval without Clean, and persisting the
+	// interval alone would be strictly worse than not persisting at all -- the
+	// resume decision reads Clean, `overdue` needs a positive interval, and the
+	// expiry sweep skips zero, so the record would be both resumable and
+	// unreapable.
+	//
+	// It runs in its OWN record transaction, closed before the stamp block below
+	// opens its own: the fence is not re-entrant. And it uses the blocking
+	// beginRecordTx, which the stamp block deliberately does not -- that block's
+	// non-blocking acquisition is the record of two defects a wait there caused,
+	// and this transaction is closed before it, so it does not convert one into
+	// the other.
+	if ov := c.mqttLifetimeOverride(); ov != nil {
+		tok := sess.beginRecordTx()
+		// Re-checked WITH THE FENCE HELD. The entry check above is a check-then-act:
+		// an off-readLoop writer can arm uncertainty while this waits, after which
+		// the classifier sees wasUncertain already true and reports a definite
+		// failure for a write that was never issued -- concluding "nothing was
+		// stored" about somebody else's outstanding proposal.
+		if sess.isSeqUncertain() {
+			if err := sess.endRecordTx(tok); err != nil {
+				c.Errorf("MQTT: %v", err)
+			}
+			s.mqttDeferDisconnectOwned(c, asm, sess)
+			return
+		}
+		g := sess.applyRequestedLifetime(tok, *ov,
+			mqttSessionIsCleanForExpiry(*ov), mqttLifetimeFinal)
+		if err := sess.endRecordTx(tok); err != nil {
+			c.Errorf("MQTT: %v", err)
+		}
+		switch g.outcome {
+		case mqttPreConnackProceed:
+			// Applied, or unchanged, or contention resolved as landed. Continue on
+			// the applied terms -- and note equality alone proves no new durability,
+			// which is why the classifier and not a comparison decides this.
+		case mqttPreConnackUnresolved:
+			// Nothing below may run on a sequence nobody has classified. The park
+			// carries the override (see mqttDeferDisconnectEx), so the obligation
+			// survives even though the session is back on its confirmed terms.
+			s.mqttDeferDisconnectOwned(c, asm, sess)
+			return
+		case mqttPreConnackDisposingNonForked, mqttPreConnackDisposingForked:
+			// An OWNERSHIP verdict, not a persistence failure. Continuing would run
+			// purgeSharedPending -- which performs register operations independently
+			// of the later teardown CAS -- and a second finite save, against a record
+			// that is no longer ours. Terminate through the existing disposal, which
+			// discharges the owed Will, and keep the classifier's minted grant and
+			// vocabulary on the forked arm. Nonforked does NOT prove a successor
+			// exists (F-084).
+			sess.disposeForeignSessionLocked(asm, c, g.voc)
+			return
+		default: // mqttPreConnackLocal
+			// Under Final the terms STAND, so the teardown below does what the client
+			// asked; only the durable backstop is lost. Whether the record has moved
+			// is not concluded here -- that is the disposing arms' verdict -- and
+			// clearInner's own CAS still arbitrates (errMQTTClearSuperseded).
+			c.Warnf("MQTT: unable to persist the lifetime session %q ends on; "+
+				"a discard that does not complete will leave a resumable record: %v",
+				sess.id, g.err)
+		}
 	}
 
 	// A NEVER-EXPIRING session makes no disconnect save below, so nothing else ever
@@ -14270,7 +14390,7 @@ CHECK:
 			expiry = cp.props.sessionExpiry
 		}
 	}
-	sessClean := expiry == 0
+	sessClean := mqttSessionIsCleanForExpiry(expiry)
 	// Session present? Assume false, will be set to true only when applicable.
 	sessp := false
 	// The QoS 1/2 deliveries this session already had in flight when it was bound
@@ -15400,7 +15520,7 @@ restoreSession:
 	// forked record — where 0x89 "try again" is both legal and exactly right — from
 	// anything else. It now reports its verdict and this frame runs the one sequence.
 	if sessp {
-		if g := es.grantRequestedLifetime(acceptTok, expiry, sessClean); g.outcome != mqttPreConnackProceed {
+		if g := es.applyRequestedLifetime(acceptTok, expiry, sessClean, mqttLifetimeSpeculative); g.outcome != mqttPreConnackProceed {
 			c.Errorf("MQTT: refusing to resume session %q: could not grant the requested session lifetime: %v", cid, g.err)
 			if g.outcome.disposes() {
 				refuseDisposing(g.outcome, g.voc)

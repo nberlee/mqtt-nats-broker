@@ -2518,7 +2518,7 @@ func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
 // the next restore-from-record discarded it as a clean session, losing
 // subscriptions and durables the client still believed it had.
 //
-// Mutation check: make the refusing phase run AFTER grantRequestedLifetime, so the
+// Mutation check: make the refusing phase run AFTER applyRequestedLifetime, so the
 // refused CONNECT's Clean=true / ExpiryInterval=0 is applied and persisted before the
 // refusal — the restarted broker then reports Session Present 0 here. (An earlier
 // version named "skip the save in restoreRefusedResumeLifetime"; no such function
@@ -2699,7 +2699,7 @@ func TestMQTTReconcileFailedRepairStrandsNoDeferredMarker(t *testing.T) {
 // continuations reconciled only the consumer replacements, never the lifetime. A
 // restart in between would read the wrong one and discard the session. (The finding
 // was once written against a "restoreRefusedResumeLifetime" helper, which does not
-// exist; what carries the lifetime is grantRequestedLifetime and its landed
+// exist; what carries the lifetime is applyRequestedLifetime and its landed
 // continuation.)
 //
 // Mutation check: drop the lifetime restore's save and the record still carries the
