@@ -4087,9 +4087,58 @@ takeover.
   zero relaunched, plus two scope consults. Rounds 1-6 were planned against `a8635fe` and
   never approved; the re-anchoring to `2231651` cost rounds 7-10 and one deletion.
 
-- [ ] [F-039: Restore shared membership during SUBSCRIBE rollback](findings/runtime-correctness.md#f-039).
-  **Small.** Independent of the F-030 term-fence work: this is a missing in-memory
-  `sharedSubs` restoration, not a JetStream CAS failure.
+- [x] [F-039: Restore shared membership during SUBSCRIBE rollback](findings/runtime-correctness.md#f-039).
+  **CLOSED by restoring both maps, which is one of the two courses the bullet offered.**
+  "Make the release walk both" is refuted — not as useless, but as leaving a **permanent
+  hole**: a broker restart or a record-derived expiry has no second map to consult, because
+  the close save has already removed the record's claim and group configs are excluded from
+  the persisted `Cons` by construction. Restoring the membership closes it at the source,
+  and a union would have been a second derivation of a fact `sharedSubs` already states.
+
+  **What landed.** `rollbackSubscribePacket`'s **definite-failure arm only** restores
+  `sharedSubs`, `rapSubs` and `subIDs` for the shared keys it dropped, captured immediately
+  before the compensation — the same sample `rollbackSharedSub` takes for one filter. The
+  pre-packet snapshot is the wrong value because the eager per-filter membership write goes
+  to the record **before** its group consumer exists, so the packet already made a durable
+  attempt the final save's failure did not undo. Without the restoration the next routine
+  save — the disconnect stamp, or `clear()`'s teardown scan — dropped a holder whose group
+  durable was live, and **no sweep reclaims that**: `$MQTT_msgs` is interest-retained and
+  the only route that deleted a consumer from a candidate listing there is gone. "Small"
+  described the diff, not the blast radius.
+
+  **The producer survey found `readd()` the only site producing a PERSISTENT mismatch**
+  across an enumerated close set — every membership mutation and every `cons` insertion,
+  with the transient ones listed and their owners named. **No exhaustive sole-producer
+  proof is claimed**, and the sweeps, unions and derivations that reasoned from this defect
+  as a tolerated fact are all **kept**: only their justifications are corrected, because
+  closing one producer says nothing about the rest.
+
+  **Three details of the restoration are load-bearing.** The capture is **filtered by
+  membership and copied** — `rapSubs`/`subIDs` carry plain filters too, so a wholesale
+  copy leaks a plain filter's option into a record whose subscription was rolled back. The
+  restoration **writes through the `snap.shared` alias**, which is safe because the
+  survivor set is copied before the alias is installed and the only other reader of that
+  snapshot is unreachable on this arm — structurally, not by timing. And it is the
+  **definite arm only**: an ambiguous rollback's bytes may be what landed, and the
+  resolver settles them by re-attempting them.
+
+  **The downgrade lifecycle is orthogonal by DISPATCH, not by survey.** Both
+  `stageDeferredDel` call sites sit inside the non-shared branch, so no shared filter can
+  ever become a QoS 0 conversion candidate and the un-conversion machinery cannot meet this
+  fix; its own critical section also closes before the rollback is entered.
+
+  **One claim this item proposed and then withdrew:** a "pre-existing" successor-connection
+  alias race on the ambiguous arm. It is **not established** — CONNECT resolves an uncertain
+  resident session before proceeding — and the aliasing comment it was inferred from
+  establishes the aliasing, not that interleaving.
+
+  **What it does NOT fix:** unreclaimable group durables across every crash window. The
+  release still runs after record removal, an indeterminate last-holder scan still fails
+  closed, and the scan and the delete remain separate operations. Residuals in
+  `docs/CONFORMANCE.md`, including a **truth correction** to one whose "cleanup falls to the
+  orphan-consumer sweep" was false for a `$MQTT_msgs` durable; mechanism in
+  `docs/ARCHITECTURE.md` under "A SUBSCRIBE rollback restores the shared state it
+  attempted".
 
 - [x] [F-045: Release stranded shared pending state at membership removal](findings/runtime-correctness.md#f-045).
   **Closed by TWO items, and the joint provenance is the point — neither one changed both

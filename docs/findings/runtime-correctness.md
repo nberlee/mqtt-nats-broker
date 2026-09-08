@@ -92,7 +92,9 @@ Will's `FireAt` to the close instead of to consumption, and the `subsBarrier` bo
 
 ### Original finding record
 
-- [ ] Make `readd` restore `sharedSubs` alongside `cons`, or release from both.
+- [x] Make `readd` restore `sharedSubs` alongside `cons`, or release from both.
+  **Done by restoring both maps** on the definite-failure arm; "release from both" was
+  refuted as leaving a permanent hole after a broker restart or a record-derived expiry.
   `rollbackSubscribePacket`'s `readd` (`mqtt.go`) restores the packet's added
   `cons` entries and reopens their delivery, but not the `sharedSubs` key, so a
   session can end in a state where a live shared consumer is outside the

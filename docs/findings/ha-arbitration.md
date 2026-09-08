@@ -471,10 +471,16 @@ gap is its own `docs/ROADMAP.md` §0.2 item, and it is why the session record's
 authored-fork machinery was retained by the write-lineage audit.
 
 F-039 is explicitly outside this finding. It is a local rollback invariant: the inner
-`readd` closure on `rollbackSubscribePacket`'s save-failure path restores the packet's
+`readd` closure on `rollbackSubscribePacket`'s save-failure path restored the packet's
 `cons` entries without restoring their `sharedSubs` membership. The main rollback
 snapshot restores both maps correctly. No JetStream proposal fence can reconstruct the
 missing entry in the `readd` arm.
+
+**Reachability as of this writing, since superseded:** F-039 is now CLOSED — that arm
+restores the shared membership beside `cons`. The paragraph above is kept as the analysis
+that held when F-078 was filed, because it is what F-078's own reasoning rested on; the
+chain it describes is no longer live, and `processSharedJSConsumer`'s comment records why
+the branch is nonetheless retained.
 
 ## F-031
 

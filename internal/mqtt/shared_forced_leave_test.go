@@ -423,8 +423,13 @@ func TestVoidVerdictsDurableIgnoresRetirement(t *testing.T) {
 //
 //   - a membership with NO config — every record-restored resume, since shared configs are not
 //     persisted and only processSubs rebuilds them. The `cons` half is blind to it.
-//   - a config no surviving key names — the `readd` shapes F-083 documents. The membership half
-//     is blind to it.
+//   - a config no surviving key names — the shape F-083 documents. The membership half is
+//     blind to it. This fixture is a SYNTHETIC BACKSTOP: the SUBSCRIBE rollback used to be
+//     its production producer and no longer is (F-039 restores the membership beside cons).
+//     The population it seeds is not shown to be reachable by another production route at
+//     this operation's boundary, so the provenance is stated as synthetic rather than
+//     replaced with a route this test does not establish. The assertion stays: the union's
+//     cons half is what sees it, whoever produced it.
 //
 // The pending maps do not substitute for either: a target found only there is purged and never
 // offered for deletion, because pending state is not evidence of last-holder status.
@@ -469,6 +474,6 @@ func TestForcedLeaveStructuralUnionNeedsBothHalves(t *testing.T) {
 	}
 	if _, ok := structural[consOnlyDur]; !ok {
 		t.Fatalf("the config-only durable %q is not a release candidate: dropping the cons half "+
-			"of the union loses the readd shapes, whose durable no surviving key names", consOnlyDur)
+			"of the union loses every config-only shape, whose durable no surviving key names", consOnlyDur)
 	}
 }

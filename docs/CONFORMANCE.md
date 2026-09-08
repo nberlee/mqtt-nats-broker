@@ -2212,6 +2212,15 @@ it does *not* promise:
   the session at that close even though the CONNECT was refused, which is the
   grant-at-durability rule this broker already followed whenever the write happened to
   land.
+  **A shared membership can survive a failed SUBSCRIBE on a second route, and it is not a
+  resolution verdict.** Its eager per-filter write goes to the record BEFORE its group
+  consumer exists, so that write may have succeeded while the packet's final update AND its
+  compensation both failed definitely. The rollback then restores the membership rather
+  than discarding it, so a resume restores a filter the client was never acknowledged for.
+  This does **not** mean every definite failure establishes retained remote membership: the
+  restored value is local state as it stood before the compensation, and whether the record
+  agrees is the arbitration question. The alternative was worse — dropping the holder while
+  its group durable stayed live, which no sweep reclaims.
   The shared QoS 2 affine provisioning is NOT a second acknowledged caller either: its
   save runs BEFORE the loop that persists shared memberships, and that later save is
   refused while the session is unresolved — so the per-filter SUBACK failure it reports
@@ -4192,10 +4201,16 @@ outcomes rather than prose. **What a refused reap leaves**, in the order
 
 **And a successful attempt is not atomic either.** `releaseTeardown` removes the record
 BEFORE the shared release loop runs, so if that loop deletes some durables and then fails,
-the marker is already gone and no adoption retry can re-run it — cleanup falls to the
-orphan-consumer sweep. A durable another member still holds is deliberately retained, not
-deleted: the last-holder scan decides, and for a group with other members the answer is to
-keep it. An earlier draft's "released once the register can be read" was simply wrong.
+the marker is already gone and no adoption retry can re-run it. **Cleanup does NOT fall to
+the orphan-consumer sweep** — an earlier statement here said it did, and that is false for
+a `$MQTT_msgs` group durable: the only route that deleted a consumer from a candidate
+listing on that stream was removed, and the sole surviving delete there targets
+`$MQTT_out`. The real disposition is that the durable **survives until a member rejoins
+that `$share` group and adopts it**, retaining every matching publish meanwhile because
+`$MQTT_msgs` is interest-retained. A durable another member still holds is deliberately
+retained, not deleted: the last-holder scan decides, and for a group with other members
+the answer is to keep it. An earlier draft's "released once the register can be read" was
+simply wrong.
 
 **The cost, stated.** If the register is *permanently* unreadable — a shape no broker in
 this tree writes, which is what makes it unreadable — that client ID's teardown never

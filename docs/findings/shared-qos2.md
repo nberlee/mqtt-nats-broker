@@ -956,20 +956,23 @@ Since `b659236` the scan also reports held for an indeterminate walk and for a r
 cannot interpret, so one unreadable record anywhere in the account suppressed this session's
 cleanup indefinitely. The other four callers of the scan withhold only the delete.
 
-**D2 — the release was keyed on `sess.cons`, which the failing attempt has not written to.**
-The half the roadmap bullet did not state, and the larger one. `addJSConsToSess` runs only
-once the WHOLE filter has succeeded, so a `cons` walk cannot see the join a failing filter
-just made, which makes the no-config branch the COMMON shape of this route rather than a
-corner. **That is not the same as "there is never an entry", and the difference is
-load-bearing:** a PRE-EXISTING entry for the same durable can be resident — F-078's `readd`
-shape leaves one with no membership behind it — which is why the release sweeps every matching
-entry instead of treating absence as given, and why one test arm seeds two of them. What that
-branch left behind was created by the failing packet itself: the `sharedCharged`/`tmaxack`
-charge (taken at create time, before the failing exit), the pending deliveries under that
-durable, and the deliver-subject subscription. `refundSharedCharges` deliberately skips the
-SUBSCRIBE path because "it disposes of the consumer through `releaseSharedConsumer`, which
-refunds as part of the release" — true of the INLINE cleanup, which passes the join's
-returned config, and false of this continuation.
+**D2 — the release was keyed on `sess.cons`, which the failing attempt has not written
+to.** The half the roadmap bullet did not state, and the larger one. `addJSConsToSess`
+runs only once the WHOLE filter has succeeded, so a `cons` walk cannot see the join a
+failing filter just made, which makes the no-config branch the COMMON shape of this route
+rather than a corner. **That is not the same as "there is never an entry", and the
+difference is load-bearing:** a PRE-EXISTING entry for the same durable can be resident,
+which is why the release sweeps every matching entry instead of treating absence as given,
+and why one test arm seeds two of them. (The illustration used to be F-078's rollback
+shape, where the definite arm restored `cons` and left the membership behind; that
+producer is closed — F-039 restores both — and the sweep is kept regardless, since closing
+one producer establishes nothing about the rest.) What that branch left behind was created
+by the failing packet itself: the `sharedCharged`/`tmaxack` charge (taken at create time,
+before the failing exit), the pending deliveries under that durable, and the
+deliver-subject subscription. `refundSharedCharges` deliberately skips the SUBSCRIBE path
+because "it disposes of the consumer through `releaseSharedConsumer`, which refunds as
+part of the release" — true of the INLINE cleanup, which passes the join's returned
+config, and false of this continuation.
 
 **The consequence is stated from the code, not from that comment.** There is **no double
 count**: `processSharedJSConsumer` samples `alreadyCharged` and does not re-charge a durable

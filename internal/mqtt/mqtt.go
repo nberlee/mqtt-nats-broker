@@ -10226,8 +10226,13 @@ func (sess *mqttSession) releaseFailedSharedFilter(c *client, tok recordTx, f *m
 	held := sess.sharedDurablesHeldByOthers(durs)
 	for _, t := range owed {
 		// EVERY matching entry, not the first: a durable can be named by more than one
-		// stale cons entry (two `readd` shapes), and stopping at one would leave the other
-		// as a strand with no membership to reach it by.
+		// stale cons entry, and stopping at one would leave the other as a strand with no
+		// membership to reach it by.
+		//
+		// The SUBSCRIBE rollback's definite arm is no longer one of the shapes that
+		// produces such an entry — it restores the shared membership beside cons (F-039) —
+		// but the sweep stays, because that closes one producer and does not establish
+		// that no stale entry can exist.
 		sess.mu.Lock()
 		for csid, cfg := range sess.cons {
 			if cfg != nil && cfg.Durable == t.durable {
@@ -10379,6 +10384,89 @@ func (sess *mqttSession) restoreSharedKeyInMemory(sid string, existed bool, qos 
 	sess.subIDs, _ = mqttUpdateFilterSubID(sess.subIDs, sid, mqttZeroIf(!existed, subID))
 }
 
+// mqttAttemptedShared is one SUBSCRIBE packet's shared membership as it stood
+// immediately BEFORE the packet's compensation, with the option entries belonging to
+// those keys.
+//
+// rapSubs and subIDs are keyed by session key and carry PLAIN filters too, whose state
+// the pre-packet snapshot owns — so only the keys the membership names are carried,
+// never the whole map. Copying a whole option map here would let a plain filter's
+// identifier survive a rollback that removed its subscription. F-039.
+type mqttAttemptedShared struct {
+	qos    map[string]byte
+	rap    map[string]struct{}
+	subIDs map[string]int
+}
+
+// mqttCaptureAttemptedSharedLocked samples the shared state as it stands NOW — the same
+// sample rollbackSharedSub takes for one filter, taken here for the packet.
+//
+// The pre-packet snapshot is NOT a substitute: the packet's eager per-filter writes may
+// already have made a DIFFERENT state durable, because a shared membership is persisted
+// before its group consumer exists and the final save's failure did not undo that. This
+// is NOT a claim that every key here was written by this packet, nor that the record
+// currently agrees — a CAS-rejected eager write leaves this session continuing against a
+// record another broker moved, which is facts.recordCASRejected's question and not this
+// one's.
+//
+// The maps are COPIED. snap.shared is assigned by reference into sess.sharedSubs by the
+// restoration below, so aliasing the live map would leave this capture pointing at
+// whichever map that assignment detaches.
+//
+// sess.mu must be held.
+func mqttCaptureAttemptedSharedLocked(sess *mqttSession) *mqttAttemptedShared {
+	if len(sess.sharedSubs) == 0 {
+		return nil
+	}
+	a := &mqttAttemptedShared{
+		qos:    make(map[string]byte, len(sess.sharedSubs)),
+		rap:    make(map[string]struct{}),
+		subIDs: make(map[string]int),
+	}
+	for key, qos := range sess.sharedSubs {
+		a.qos[key] = qos
+		if _, ok := sess.rapSubs[key]; ok {
+			a.rap[key] = struct{}{}
+		}
+		if id, ok := sess.subIDs[key]; ok {
+			a.subIDs[key] = id
+		}
+	}
+	return a
+}
+
+// restoreAttemptedShared puts back the shared membership captured before the packet's
+// compensation, on the DEFINITE-failure arm only.
+//
+// Without this the compensation's own failure discards shared state nothing undid, and
+// the next save from this session — the disconnect stamp, or clear()'s teardown scan —
+// writes a record that has dropped a holder whose group durable is still live. No sweep
+// reclaims that durable: the only route that deleted a consumer from a candidate listing
+// on $MQTT_msgs was removed, and $MQTT_msgs is interest-retained, so the orphan retains
+// every matching publish until another session joins that exact $share group.
+//
+// Each key is restored through the same two helpers restoreSharedKeyInMemory uses, which
+// CLEAR as well as set — so a restore to "no RAP" or "identifier 0" expresses itself
+// rather than only an addition. F-039.
+//
+// No lock held on entry.
+func (sess *mqttSession) restoreAttemptedShared(a *mqttAttemptedShared) {
+	if a == nil {
+		return
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for key, qos := range a.qos {
+		if sess.sharedSubs == nil {
+			sess.sharedSubs = make(map[string]byte)
+		}
+		sess.sharedSubs[key] = qos
+		_, rap := a.rap[key]
+		sess.rapSubs, _ = mqttUpdateFilterOptSet(sess.rapSubs, key, rap)
+		sess.subIDs, _ = mqttUpdateFilterSubID(sess.subIDs, key, a.subIDs[key])
+	}
+}
+
 // mqttRestoreDrainMap copies one snapshot drain map, omitting terminally retired objects.
 // nil in, nil out, and an all-retired map collapses to nil so the session's own
 // "empty means nil" convention is preserved.
@@ -10458,6 +10546,11 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// below is whole-durable, so acting on it would close a SURVIVING filter's delivery and
 	// withdraw its registrations. F-083.
 	rollbackSurv := mqttSharedSurvivorsOf(snap.shared)
+	// The shared membership as it stands NOW, before the reset below replaces it with the
+	// pre-packet snapshot. The definite-failure arm puts it back; nothing else in this
+	// function reads it. Taken AFTER rollbackSurv deliberately: that set is the PRE-PACKET
+	// membership and must stay so. See mqttCaptureAttemptedSharedLocked. F-039.
+	attemptedShared := mqttCaptureAttemptedSharedLocked(sess)
 	for _, a := range added {
 		if a.cc == nil {
 			continue
@@ -10542,6 +10635,13 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 			// Same reasoning for the affine path: nothing was deleted, so the session
 			// must go back to describing the resources that are still live.
 			sess.restoreQ2AffineUnwind(q2AffUnwind)
+			// And the shared membership, LAST — after the affine unwind, because a shared
+			// QoS 2 membership with no affine generation is a record shape
+			// mqttValidateRecordAffinePair refuses, so this order keeps the in-memory
+			// pairing that shape rests on. Only on THIS arm: an ambiguous rollback may
+			// have stored exactly the rolled-back record, and the resolver settles it by
+			// re-attempting those bytes. See restoreAttemptedShared. F-039.
+			sess.restoreAttemptedShared(attemptedShared)
 		}
 		switch outcome {
 		case saveDefinitelyFailed:
@@ -21720,17 +21820,29 @@ func buildSharedGroupConsumerConfig(group, subject string, ackWait time.Duration
 // create path either way, which proves the durable by creating it.
 //
 // F-076 justified the nil with "a live SUBSCRIBE cannot reach the resume arm, because a
-// connected session with a cons entry already has its deliver subscription". THAT IS FALSE,
-// and F-078 records the chain: a SUBSCRIBE whose rollback save fails DEFINITELY has
-// `readd` restore cons[sid] while sharedSubs stays at the pre-packet snapshot; the client
-// reconnects; the CONNECT builds its filters from sharedSubs, which lacks the key, so the
-// sid is never collected; and the resident cons entry then survives with no deliver
-// subscription. A later live SUBSCRIBE reaches this arm with nil verdicts and verifies
-// nothing — no pre-pass classified that sid, and this arm issues no verify of its own — so
-// it subscribes on a remembered config. What it no longer does is serve unarbitrated: the
-// packet proves ownership after its last record write and withholds transmission until it
-// lands (F-078, sub_operation_gate.go). The verification gap is local and stands; the
-// arbitration gap does not. Do not restore the old justification.
+// connected session with a cons entry already has its deliver subscription". THAT IS FALSE
+// and is not reinstated. F-078 recorded the chain it was false about: a SUBSCRIBE whose
+// rollback save failed DEFINITELY had `readd` restore cons[sid] while sharedSubs stayed at
+// the pre-packet snapshot, so a reconnect built its filters from a sharedSubs that lacked
+// the key, never collected the sid, and left the resident cons entry with no deliver
+// subscription.
+//
+// THAT CHAIN IS CLOSED. The rollback's definite arm now restores the shared membership
+// beside cons (restoreAttemptedShared, F-039), so the reconnect's filters do carry the key
+// and the sid is collected. What closed it is the membership restoration, NOT F-076's
+// claim, which remains false for the reason above.
+//
+// The branch is retained anyway, because no positive proof of unreachability exists: a
+// post-resume live SUBSCRIBE takes the refresh arm, UNSUBSCRIBE's ambiguous window leaves
+// the subscription present-but-closed rather than absent (its own roadmap item), and a
+// failed CONNECT restore refuses the CONNECT (F-050). That is a survey of the routes we
+// know, not a demonstration that none remains — an absence is not a fact. So this arm
+// still verifies nothing when it is reached with nil verdicts, and it still subscribes on
+// a remembered config. What it does not do is serve unarbitrated: the packet proves
+// ownership after its last record write and withholds transmission until it lands (F-078,
+// sub_operation_gate.go). The verification gap is local and stands; the arbitration gap
+// does not, and F-078's trigger — interest touched — is unchanged. Do not restore the old
+// justification.
 func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
 	qos byte, retainAsPublished bool, subID int, fromSubProto bool,
 	verdicts map[string]mqttSharedGroupVerdict) (mqttSharedJoinResult, error) {
@@ -22110,10 +22222,12 @@ func (sess *mqttSession) deleteSharedGroupTargetIfUnheld(c *client, durable stri
 // from its record has membership without configs — shared configs are excluded from
 // the persisted Cons (buildPersistedSessionLocked) and rebuilt only by processSubs —
 // while recoverInflightRegisters has already rebuilt its pending entries under the
-// deterministic group durable names, so a cons walk purges nothing. A SUBSCRIBE whose
-// rolled-back save failed leaves a config outside the membership (rollbackSubscribePacket's
-// readd restores cons, not sharedSubs), so a sharedSubs walk misses it. Transmitted entries
-// with NEITHER view left are reachable, which is why even the union is not enough.
+// deterministic group durable names, so a cons walk purges nothing. (The SUBSCRIBE
+// rollback used to supply the mirror case — a config outside the membership, because its
+// definite arm restored cons and not sharedSubs — and no longer does: F-039 restores both.
+// The derivation below is unchanged, and must be: it never rested on that shape alone.)
+// Transmitted entries with NEITHER view left are reachable, which is why even the union is
+// not enough.
 //
 // Both operations that used to STRAND that shape now discharge it at the membership removal
 // rather than leaving it to this close: UNSUBSCRIBE's no-cons branch (F-083) and the 3.1.1
@@ -22163,9 +22277,11 @@ func (sess *mqttSession) purgeSharedPendingStaged(c *client) bool {
 // caller that needs the target NAMES before it has decided to drop anything.
 //
 // The two structural views provably miss real shapes, which is why this exists: a session
-// restored from its record has membership without configs, so a cons walk names nothing, and a
-// rolled-back SUBSCRIBE leaves a config outside the membership, so a sharedSubs walk misses
-// that one. The 3.1.1 forced leave needs the union of all three, and it needs it BEFORE its
+// restored from its record has membership without configs, so a cons walk names nothing.
+// (A rolled-back SUBSCRIBE used to supply the mirror shape — a config outside the
+// membership — and no longer does, since its definite arm restores the shared membership
+// beside cons, F-039. The derivation is unchanged and never rested on that shape alone.)
+// The 3.1.1 forced leave needs the union of all three, and it needs it BEFORE its
 // record write rather than after — the write that removes the membership is the write that
 // must carry "these allocations were never transmitted" (see voidRegistrationsLocked).
 //
@@ -22362,8 +22478,10 @@ func mqttSharedDurablesForKey(key string) []string {
 // subject names this session's subscription to it. Deriving one and rediscovering the other
 // through sess.cons is what F-082 had to fix: addJSConsToSess runs only once the whole filter
 // succeeds, so a cons walk cannot see the join a FAILING filter just made. It may still find a
-// PRE-EXISTING entry for that durable — the readd shape — which is why the caller sweeps every
-// match rather than treating absence as given.
+// PRE-EXISTING entry for that durable, which is why the caller sweeps every match rather than
+// treating absence as given. The SUBSCRIBE rollback's definite arm was the illustration here
+// and is no longer one (F-039 restores the membership beside cons); the sweep is kept, since
+// closing one producer proves nothing about the rest.
 type mqttSharedGroupNames struct {
 	durable string
 	deliver string
@@ -22977,9 +23095,13 @@ func (sess *mqttSession) releaseUnsubSharedTargets(c *client, tok recordTx, shar
 	held := sess.sharedDurablesHeldByOthers(durs)
 	for _, t := range owed {
 		// (3) Every REMAINING config naming an owed durable, not the first: a durable can be
-		// named by more than one stale entry (two `readd` shapes), and one left behind has no
-		// membership to reach it by. After (1) any such entry is stale by definition, since
-		// no surviving key reaches an owed durable.
+		// named by more than one stale entry, and one left behind has no membership to reach
+		// it by. After (1) any such entry is stale by definition, since no surviving key
+		// reaches an owed durable.
+		//
+		// The SUBSCRIBE rollback's definite arm no longer produces that shape (F-039), and
+		// this backstop is kept regardless: it is a superset sweep, and narrowing it to the
+		// producers we can currently name is how a sweep boundary stops converging.
 		sess.mu.Lock()
 		for csid, cfg := range sess.cons {
 			if cfg != nil && cfg.Durable == t.durable {

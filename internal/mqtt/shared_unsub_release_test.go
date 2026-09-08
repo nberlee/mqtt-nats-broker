@@ -288,7 +288,7 @@ func TestUnsubSweepsEveryConsEntryNamingADoomedDurable(t *testing.T) {
 	sess.mu.Unlock()
 
 	// Two entries naming the durable, NEITHER of them one of mqttUnsubSids(key).
-	sub := x.seedJoin(t, target, 5, "n-sweep", key+"-readd-a", key+"-readd-b")
+	sub := x.seedJoin(t, target, 5, "n-sweep", key+"-stale-a", key+"-stale-b")
 	x.removeMembership(t, key)
 
 	tok := sess.beginRecordTx()

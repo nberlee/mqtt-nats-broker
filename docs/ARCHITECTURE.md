@@ -3992,14 +3992,71 @@ committed-read backstop's to converge.
 interest by different routes and needs a packet-scoped transmission gate this path does not,
 because the restore gate is already open on a live connection.
 
+## A SUBSCRIBE rollback restores the shared state it attempted
+
+`rollbackSubscribePacket` undoes a SUBSCRIBE whose final record save failed. On its
+**definite-failure** arm it puts back `sess.cons`, the delivery subscriptions it closed,
+the register nonces it voided and the affine QoS 2 path it unwound — and now also
+`sess.sharedSubs`, `sess.rapSubs` and `sess.subIDs` for the shared keys it dropped. (The
+drain maps are not part of that arm: they are put back at the reset itself, on every arm,
+before the rollback's own save.)
+
+**Why the pre-packet snapshot is not the right value.** A shared filter's membership is
+persisted **eagerly, per filter, before its group consumer is created**, so a concurrent
+leaver's last-holder scan on another broker can see the joiner. That means the packet has
+already made a separate durable attempt at the membership under its own record CAS, and the
+final save's failure did not undo it. Replacing the live map with the pre-packet snapshot
+therefore discards state nothing reverted, and the next routine save from the session — the
+disconnect stamp, or `clear()`'s teardown scan — rewrites the record **without** a holder
+whose group durable is still live. Nothing reclaims that durable: the only route that
+deleted a consumer from a candidate listing on `$MQTT_msgs` was removed, and `$MQTT_msgs`
+is interest-retained, so the orphan retains every matching publish until another session
+joins that exact `$share` group.
+
+The invariant is therefore **the local shared state as it stood immediately before the
+packet's compensation** — the same sample `rollbackSharedSub` takes for a single filter,
+taken for the packet. It is deliberately **not** a claim that the map equals the record's
+`SharedSubs`: a CAS-rejected eager write leaves the session continuing against a record
+another broker moved, which is the arbitration question and not this one's. This change
+improves membership bookkeeping and **binds nothing atomically**.
+
+**Three things are load-bearing.**
+
+- **The capture is filtered by membership and copied.** `rapSubs` and `subIDs` are keyed by
+  session key and carry plain filters too, whose state the pre-packet snapshot owns — so
+  only the keys the membership names are carried. Copying a whole option map would let a
+  plain filter's identifier survive a rollback that removed its subscription.
+- **The restoration writes through an alias, and that is safe for a reason.** The reset
+  assigns `snap.shared` into `sess.sharedSubs` **by reference**, so the restoration mutates
+  the snapshot object. The survivor set is copied off `snap.shared` *before* the reset, and
+  the only other reader of it — the "existed before this packet" test inside
+  `finishSubscribeRollback` — is reachable only on the confirmed arm and the landed
+  continuation, never on the arm that writes. The exclusion is structural, not a matter of
+  timing. Do not "simplify" the survivor set to read the live map.
+- **The definite arm only.** On an ambiguous rollback the rolled-back record may be exactly
+  what is stored and the resolver settles it forward by re-attempting those bytes, so the
+  rolled-back view must stand. Restoring there would also write into the map that the
+  "existed before" test consults from the resolver, and could leave a raw subscription the
+  packet *added* installed as though it predated the packet.
+
+**Ordering.** The restoration runs last in the definite arm, after the affine unwind, so a
+shared QoS 2 membership is never in memory without its affine generation — the pairing a
+record-shape validator refuses. Both restorations are synchronous and neither saves.
+
+**What it does not fix.** Unreclaimable group durables across every crash window: the
+release still runs after record removal, an indeterminate last-holder scan still fails
+closed, and the scan and the delete are still separate operations. Those remain stated
+residuals. What this removes is the one window where the broker *itself* destroyed the
+holder evidence with a routine save.
+
 ## A live SUBSCRIBE arbitrates its shared interest before it serves
 
 The section above proves ownership for the CONNECT/resume path. A live SUBSCRIBE reaches the
 same interest and, until F-078, revalidated nothing — so the consequence above was reachable
 on a connection that was never restoring at all. Three routes get there: the `!exists`
-create and its post-subscribe verify `CreateOrUpdate`; the resume fall-through, whose
-resident consumer entry survives a rollback that reset the membership map, so a later
-SUBSCRIBE subscribes on a remembered config having verified nothing; and the **refresh** arm,
+create and its post-subscribe verify `CreateOrUpdate`; the resume fall-through, reached with
+nil verdicts on a live SUBSCRIBE, so it subscribes on a remembered config having verified
+nothing; and the **refresh** arm,
 which revives delivery interest on an existing subscription by updating its mutable fields.
 All three are the same fact — *interest was touched* — which is why the trigger is that
 rather than "a durable was created".
@@ -4217,7 +4274,7 @@ on. It now uses **two authorities, for two different obligations**:
 
 | Obligation | Authority | What only it can see |
 |---|---|---|
-| the doomed configs, and the CANDIDATES for a consumer release | the membership keys **plus** the `cons` entries | a membership with no config (every record-restored resume), and a config no surviving key names (the `readd` shapes) |
+| the doomed configs, and the CANDIDATES for a consumer release | the membership keys **plus** the `cons` entries | a membership with no config (every record-restored resume), and a config no surviving key names |
 | the pending-state purge | the **pending maps** — `cpending`, `deferred`, `srcAckOwed`, filtered by the shared durable prefix | pending state named by *neither* structural view |
 
 For this caller the two questions F-083 separates — is this config doomed, is this
@@ -5547,9 +5604,12 @@ The invariants, in the order they matter:
   subscription restoration, which runs later in the CONNECT than register recovery (and,
   since F-050, still before the CONNACK) — while register recovery has already rebuilt
   its pending entries under the deterministic group durable names, so a config walk finds
-  nothing. A SUBSCRIBE whose rolled-back save definitely failed leaves the opposite: the
-  re-added configs are live and their group key is not back in the membership, so a
-  membership walk misses them. And a 3.1.1 forced leave and an UNSUBSCRIBE with no config
+  nothing. A SUBSCRIBE whose rolled-back save definitely failed used to leave the
+  opposite — re-added configs live with their group key not back in the membership — and
+  no longer does,
+  because that arm now restores the shared membership beside `cons` (see "A SUBSCRIBE
+  rollback restores the shared state it attempted"). The derivation below never rested on
+  that shape alone and is unchanged. And a 3.1.1 forced leave and an UNSUBSCRIBE with no config
   to tear down each strand a TRANSMITTED delivery's entries
   on purpose — the staging records the verdict and leaves the entry "for the teardown's
   purge" — with NEITHER view left naming the durable, which is why even the union of the
